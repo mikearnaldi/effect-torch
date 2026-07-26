@@ -172,6 +172,34 @@ device mismatch at graph-build time; backend errors at evaluation time).
 Interruption is structured: interrupting the fiber running `evaluate` or
 `toTypedArray` cancels the native work.
 
+## Benchmarks
+
+Measured on an Apple Silicon MacBook, f32, median over iterations; each
+iteration builds a fresh graph of 10 chained matmuls and evaluates it once.
+`pnpm bench` and `pnpm bench:mlx` reproduce these.
+
+**matmul 512×512 @ 512×512 (50 iterations, 10 chained per iteration)**
+
+| Backend | ms/op | GFLOP/s |
+| --- | ---: | ---: |
+| effect-torch CPU | 0.152 | 1,766 |
+| effect-torch Metal | 0.133 | 2,023 |
+
+**matmul 2048×2048 @ 2048×2048 (50 iterations, 10 chained per iteration)**
+
+| Backend | ms/op | GFLOP/s |
+| --- | ---: | ---: |
+| effect-torch CPU | 7.831 | 2,194 |
+| effect-torch Metal | 1.371 | 12,527 |
+
+**Head-to-head with [MLX](https://github.com/frost-beta/node-mlx), 512×512,
+10 chained matmuls (median of 5 runs)**
+
+| Framework | ms/op |
+| --- | ---: |
+| effect-torch | 0.061 |
+| node-mlx | 0.071 |
+
 ## Development
 
 ```bash
