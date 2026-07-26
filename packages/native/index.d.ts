@@ -8,21 +8,48 @@ export declare class CancellationToken {
 
 export declare class LazyTensor {
   static zeros(shape: Array<number>, dtype?: NativeDType | undefined | null, device?: string | undefined | null): LazyTensor
+  static ones(shape: Array<number>, dtype?: NativeDType | undefined | null, device?: string | undefined | null): LazyTensor
+  static full(shape: Array<number>, value: number, dtype?: NativeDType | undefined | null, device?: string | undefined | null): LazyTensor
   static randn(shape: Array<number>, dtype?: NativeDType | undefined | null, device?: string | undefined | null): LazyTensor
+  static arange(start: number, end: number, step: number, dtype?: NativeDType | undefined | null, device?: string | undefined | null): LazyTensor
+  static eye(n: number, dtype?: NativeDType | undefined | null, device?: string | undefined | null): LazyTensor
+  static fromBytes(data: Uint8Array, shape: Array<number>, dtype?: NativeDType | undefined | null, device?: string | undefined | null): LazyTensor
   static fromMaterialized(tensor: NativeTensor): LazyTensor
   add(other: LazyTensor): LazyTensor
+  sub(other: LazyTensor): LazyTensor
+  mul(other: LazyTensor): LazyTensor
+  div(other: LazyTensor): LazyTensor
+  eq(other: LazyTensor): LazyTensor
+  gt(other: LazyTensor): LazyTensor
+  lt(other: LazyTensor): LazyTensor
+  ge(other: LazyTensor): LazyTensor
+  le(other: LazyTensor): LazyTensor
   matmul(other: LazyTensor): LazyTensor
+  neg(): LazyTensor
+  abs(): LazyTensor
+  sqrt(): LazyTensor
+  exp(): LazyTensor
+  log(): LazyTensor
+  sin(): LazyTensor
+  cos(): LazyTensor
+  pow(exp: number): LazyTensor
+  cast(dtype: NativeDType): LazyTensor
+  sum(dims: Array<number>, keepdims: boolean): LazyTensor
+  mean(dims: Array<number>, keepdims: boolean): LazyTensor
+  max(dims: Array<number>, keepdims: boolean): LazyTensor
+  min(dims: Array<number>, keepdims: boolean): LazyTensor
+  reshape(shape: Array<number>): LazyTensor
+  permute(dims: Array<number>): LazyTensor
+  slice(ranges: Array<Array<number>>): LazyTensor
+  concat(other: LazyTensor, dim: number): LazyTensor
+  broadcastTo(shape: Array<number>): LazyTensor
 }
 
 export declare class NativeTensor {
-  static zeros(shape: Array<number>, dtype?: NativeDType | undefined | null, device?: string | undefined | null): Promise<NativeTensor>
-  static randn(shape: Array<number>, dtype?: NativeDType | undefined | null, device?: string | undefined | null): Promise<NativeTensor>
-  add(other: NativeTensor): Promise<NativeTensor>
-  matmul(other: NativeTensor, token?: CancellationToken | undefined | null): Promise<NativeTensor>
   get shape(): Array<number>
   get dtype(): string
   get device(): string
-  readback(): Promise<ArrayBuffer>
+  readback(token?: CancellationToken | undefined | null): Promise<ArrayBuffer>
 }
 
 export declare function evalLazy(tensor: LazyTensor, token?: CancellationToken | undefined | null): Promise<NativeTensor>
@@ -31,5 +58,8 @@ export declare function isDeviceAvailable(device: string): boolean
 
 export declare const enum NativeDType {
   F32 = 'f32',
-  F64 = 'f64'
+  F64 = 'f64',
+  I64 = 'i64',
+  U8 = 'u8',
+  U32 = 'u32'
 }

@@ -4,7 +4,9 @@
     "noEmit": true,
     "types": ["node"],
     "paths": {
-      "@frost-beta/mlx": ["./mlx.d.ts"]
+      "@frost-beta/mlx": ["./mlx.d.ts"],
+      "@effect-torch/core": ["../core/src/index.ts"],
+      "@effect-torch/native": ["../native/index.d.ts"]
     }
   },
   "include": ["*.ts", "*.d.ts"]
