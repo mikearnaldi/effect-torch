@@ -1,6 +1,6 @@
 import { performance } from "node:perf_hooks"
 import { Console, Effect } from "effect"
-import { Tensor } from "@effect-torch/core"
+import { Device, Tensor } from "@effect-torch/core"
 import mlx from "@frost-beta/mlx"
 
 const mx = mlx.core
@@ -33,8 +33,8 @@ const timed = <E>(effect: Effect.Effect<unknown, E>): Effect.Effect<number, E> =
 const median = (values: ReadonlyArray<number>): number => [...values].sort((x, y) => x - y)[Math.floor(values.length / 2)]
 
 const program = Effect.gen(function* () {
-  const am = yield* Effect.flatMap(Tensor.randn([N, N], { device: "metal" }), Tensor.evaluate)
-  const bm = yield* Effect.flatMap(Tensor.randn([N, N], { device: "metal" }), Tensor.evaluate)
+  const am = yield* Effect.flatMap(Tensor.randn([N, N]), Tensor.evaluate)
+  const bm = yield* Effect.flatMap(Tensor.randn([N, N]), Tensor.evaluate)
 
   const xa = yield* Effect.sync(() => mx.random.normal([N, N]))
   const xb = yield* Effect.sync(() => mx.random.normal([N, N]))
@@ -60,4 +60,4 @@ const program = Effect.gen(function* () {
   yield* Console.log(`node-mlx:     ${median(theirs).toFixed(4)}  (all: ${theirs.map((x) => x.toFixed(3)).join(" ")})`)
 })
 
-Effect.runPromise(program)
+Effect.runPromise(Effect.provide(program, Device.Metal))

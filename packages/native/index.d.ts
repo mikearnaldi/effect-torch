@@ -27,6 +27,8 @@ export declare class NativeTensor {
 
 export declare function evalLazy(tensor: LazyTensor, token?: CancellationToken | undefined | null): Promise<NativeTensor>
 
+export declare function isDeviceAvailable(device: string): boolean
+
 export declare const enum NativeDType {
   F32 = 'f32',
   F64 = 'f64'

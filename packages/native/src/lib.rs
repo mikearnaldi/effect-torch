@@ -475,6 +475,11 @@ fn eval_node(
 }
 
 #[napi]
+pub fn is_device_available(device: String) -> bool {
+    get_device(Some(device)).is_ok()
+}
+
+#[napi]
 pub async fn eval_lazy(
     tensor: &LazyTensor,
     token: Option<&CancellationToken>,

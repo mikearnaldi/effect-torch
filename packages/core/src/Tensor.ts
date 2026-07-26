@@ -6,16 +6,16 @@ import native, {
   type NativeDType,
   type NativeTensor as NativeTensorType
 } from "@effect-torch/native"
+import { CurrentDevice, type DeviceKind } from "./Device.js"
+
+export type { DeviceKind } from "./Device.js"
 
 const { CancellationToken, evalLazy, LazyTensor: NativeLazyTensor } = native
 
 export type DType = "f32" | "f64"
 
-export type DeviceKind = "cpu" | "metal" | "cuda"
-
 export interface TensorOptions {
   readonly dtype?: DType
-  readonly device?: DeviceKind
 }
 
 export class TensorError extends Data.TaggedError("TensorError")<{
@@ -137,37 +137,43 @@ const checkCompatible = (op: string, a: GenericTensor, b: GenericTensor): void =
 export const zeros = (
   shape: ReadonlyArray<number>,
   options: TensorOptions = {}
-): Effect.Effect<LazyTensor, TensorError> =>
-  Effect.try({
-    try: () => {
-      const validShape = validateShape("zeros", shape)
-      return makeLazy(
-        NativeLazyTensor.zeros(validShape, options.dtype as NativeDType, options.device),
-        validShape,
-        options.dtype ?? "f32",
-        options.device ?? "cpu"
-      )
-    },
-    catch: (error) =>
-      new TensorError({ op: "zeros", message: error instanceof Error ? error.message : String(error) })
+): Effect.Effect<LazyTensor, TensorError, CurrentDevice> =>
+  Effect.gen(function* () {
+    const device = yield* CurrentDevice
+    return yield* Effect.try({
+      try: () => {
+        const validShape = validateShape("zeros", shape)
+        return makeLazy(
+          NativeLazyTensor.zeros(validShape, options.dtype as NativeDType, device),
+          validShape,
+          options.dtype ?? "f32",
+          device
+        )
+      },
+      catch: (error) =>
+        new TensorError({ op: "zeros", message: error instanceof Error ? error.message : String(error) })
+    })
   })
 
 export const randn = (
   shape: ReadonlyArray<number>,
   options: TensorOptions = {}
-): Effect.Effect<LazyTensor, TensorError> =>
-  Effect.try({
-    try: () => {
-      const validShape = validateShape("randn", shape)
-      return makeLazy(
-        NativeLazyTensor.randn(validShape, options.dtype as NativeDType, options.device),
-        validShape,
-        options.dtype ?? "f32",
-        options.device ?? "cpu"
-      )
-    },
-    catch: (error) =>
-      new TensorError({ op: "randn", message: error instanceof Error ? error.message : String(error) })
+): Effect.Effect<LazyTensor, TensorError, CurrentDevice> =>
+  Effect.gen(function* () {
+    const device = yield* CurrentDevice
+    return yield* Effect.try({
+      try: () => {
+        const validShape = validateShape("randn", shape)
+        return makeLazy(
+          NativeLazyTensor.randn(validShape, options.dtype as NativeDType, device),
+          validShape,
+          options.dtype ?? "f32",
+          device
+        )
+      },
+      catch: (error) =>
+        new TensorError({ op: "randn", message: error instanceof Error ? error.message : String(error) })
+    })
   })
 
 export const shape = (self: GenericTensor): ReadonlyArray<number> => self.shape
