@@ -194,5 +194,18 @@ layer(Device.Cpu)("Tensor", (it) => {
         expect(Array.from<number | bigint>(yield* Tensor.toTypedArray(d))).toEqual([14])
       })
     )
+
+    it.effect("batched matmul broadcasts batch dims", () =>
+      Effect.gen(function* () {
+        const a = yield* Tensor.fromTypedArray(
+          new Float64Array([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]),
+          [2, 2, 3]
+        )
+        const b = yield* Tensor.fromTypedArray(new Float64Array([1, 2, 3, 4, 5, 6]), [3, 2])
+        const out = yield* Tensor.matmul(a, b)
+        assert.deepStrictEqual(out.shape, [2, 2, 2])
+        assert.deepStrictEqual(yield* values(out), [22, 28, 49, 64, 76, 100, 103, 136])
+      })
+    )
   })
 })

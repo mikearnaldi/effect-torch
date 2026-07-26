@@ -2,7 +2,7 @@ use candle_core::{CpuStorage, DType, Device, Storage, Tensor};
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
 use std::collections::HashSet;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 fn to_napi_err(err: candle_core::Error) -> Error {
@@ -332,7 +332,7 @@ fn readback_blocking(inner: &Tensor) -> Result<Readback> {
     })
 }
 
-enum LazyNode {
+enum NodeKind {
     Leaf(Tensor),
     FromBytes {
         data: Vec<u8>,
@@ -374,120 +374,364 @@ enum LazyNode {
         device: Device,
     },
     Add {
-        a: Arc<LazyNode>,
-        b: Arc<LazyNode>,
+        a: Arc<Node>,
+        b: Arc<Node>,
     },
     Sub {
-        a: Arc<LazyNode>,
-        b: Arc<LazyNode>,
+        a: Arc<Node>,
+        b: Arc<Node>,
     },
     Mul {
-        a: Arc<LazyNode>,
-        b: Arc<LazyNode>,
+        a: Arc<Node>,
+        b: Arc<Node>,
     },
     Div {
-        a: Arc<LazyNode>,
-        b: Arc<LazyNode>,
+        a: Arc<Node>,
+        b: Arc<Node>,
     },
     Eq {
-        a: Arc<LazyNode>,
-        b: Arc<LazyNode>,
+        a: Arc<Node>,
+        b: Arc<Node>,
     },
     Gt {
-        a: Arc<LazyNode>,
-        b: Arc<LazyNode>,
+        a: Arc<Node>,
+        b: Arc<Node>,
     },
     Lt {
-        a: Arc<LazyNode>,
-        b: Arc<LazyNode>,
+        a: Arc<Node>,
+        b: Arc<Node>,
     },
     Ge {
-        a: Arc<LazyNode>,
-        b: Arc<LazyNode>,
+        a: Arc<Node>,
+        b: Arc<Node>,
     },
     Le {
-        a: Arc<LazyNode>,
-        b: Arc<LazyNode>,
+        a: Arc<Node>,
+        b: Arc<Node>,
     },
     Neg {
-        a: Arc<LazyNode>,
+        a: Arc<Node>,
     },
     Abs {
-        a: Arc<LazyNode>,
+        a: Arc<Node>,
     },
     Sqrt {
-        a: Arc<LazyNode>,
+        a: Arc<Node>,
     },
     Exp {
-        a: Arc<LazyNode>,
+        a: Arc<Node>,
     },
     Log {
-        a: Arc<LazyNode>,
+        a: Arc<Node>,
     },
     Sin {
-        a: Arc<LazyNode>,
+        a: Arc<Node>,
     },
     Cos {
-        a: Arc<LazyNode>,
+        a: Arc<Node>,
     },
     Pow {
-        a: Arc<LazyNode>,
+        a: Arc<Node>,
         exp: f64,
     },
     Cast {
-        a: Arc<LazyNode>,
+        a: Arc<Node>,
         dtype: DType,
     },
     Sum {
-        a: Arc<LazyNode>,
+        a: Arc<Node>,
         dims: Vec<usize>,
         keepdims: bool,
     },
     Mean {
-        a: Arc<LazyNode>,
+        a: Arc<Node>,
         dims: Vec<usize>,
         keepdims: bool,
     },
     Max {
-        a: Arc<LazyNode>,
+        a: Arc<Node>,
         dims: Vec<usize>,
         keepdims: bool,
     },
     Min {
-        a: Arc<LazyNode>,
+        a: Arc<Node>,
         dims: Vec<usize>,
         keepdims: bool,
     },
     Reshape {
-        a: Arc<LazyNode>,
+        a: Arc<Node>,
         shape: Vec<usize>,
     },
     Permute {
-        a: Arc<LazyNode>,
+        a: Arc<Node>,
         dims: Vec<usize>,
     },
     Slice {
-        a: Arc<LazyNode>,
+        a: Arc<Node>,
         ranges: Vec<(usize, usize, usize)>,
     },
     Concat {
-        a: Arc<LazyNode>,
-        b: Arc<LazyNode>,
+        a: Arc<Node>,
+        b: Arc<Node>,
         dim: usize,
     },
     BroadcastTo {
-        a: Arc<LazyNode>,
+        a: Arc<Node>,
         shape: Vec<usize>,
     },
     Matmul {
-        a: Arc<LazyNode>,
-        b: Arc<LazyNode>,
+        a: Arc<Node>,
+        b: Arc<Node>,
     },
+    StopGradient {
+        a: Arc<Node>,
+    },
+}
+
+pub struct Node {
+    id: u64,
+    shape: Vec<usize>,
+    dtype: DType,
+    device: Device,
+    kind: NodeKind,
+}
+
+static NEXT_ID: AtomicU64 = AtomicU64::new(0);
+
+fn broadcast_shapes(a: &[usize], b: &[usize]) -> std::result::Result<Vec<usize>, String> {
+    let rank = a.len().max(b.len());
+    let mut out = Vec::with_capacity(rank);
+    for i in 0..rank {
+        let da = if i < rank - a.len() { 1 } else { a[i - (rank - a.len())] };
+        let db = if i < rank - b.len() { 1 } else { b[i - (rank - b.len())] };
+        if da != db && da != 1 && db != 1 {
+            return Err(format!("shapes {a:?} and {b:?} are not broadcastable"));
+        }
+        out.push(da.max(db));
+    }
+    Ok(out)
+}
+
+fn reduced_shape(shape: &[usize], dims: &[usize], keepdims: bool) -> Vec<usize> {
+    if keepdims {
+        shape
+            .iter()
+            .enumerate()
+            .map(|(i, &d)| if dims.contains(&i) { 1 } else { d })
+            .collect()
+    } else {
+        shape
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| !dims.contains(i))
+            .map(|(_, &d)| d)
+            .collect()
+    }
+}
+
+impl Node {
+    fn new(kind: NodeKind) -> std::result::Result<Arc<Node>, String> {
+        let (shape, dtype, device) = match &kind {
+            NodeKind::Leaf(tensor) => (
+                tensor.dims().to_vec(),
+                tensor.dtype(),
+                tensor.device().clone(),
+            ),
+            NodeKind::FromBytes {
+                shape,
+                dtype,
+                device,
+                ..
+            }
+            | NodeKind::Zeros {
+                shape,
+                dtype,
+                device,
+            }
+            | NodeKind::Ones {
+                shape,
+                dtype,
+                device,
+            }
+            | NodeKind::Randn {
+                shape,
+                dtype,
+                device,
+            } => (shape.clone(), *dtype, device.clone()),
+            NodeKind::Full {
+                shape,
+                dtype,
+                device,
+                ..
+            } => (shape.clone(), *dtype, device.clone()),
+            NodeKind::Arange {
+                start,
+                end,
+                step,
+                dtype,
+                device,
+            } => {
+                let n = ((end - start) / step).ceil().max(0.0) as usize;
+                (vec![n], *dtype, device.clone())
+            }
+            NodeKind::Eye { n, dtype, device } => (vec![*n, *n], *dtype, device.clone()),
+            NodeKind::Add { a, b }
+            | NodeKind::Sub { a, b }
+            | NodeKind::Mul { a, b }
+            | NodeKind::Div { a, b } => (
+                broadcast_shapes(&a.shape, &b.shape)?,
+                a.dtype,
+                a.device.clone(),
+            ),
+            NodeKind::Eq { a, b }
+            | NodeKind::Gt { a, b }
+            | NodeKind::Lt { a, b }
+            | NodeKind::Ge { a, b }
+            | NodeKind::Le { a, b } => (
+                broadcast_shapes(&a.shape, &b.shape)?,
+                DType::U8,
+                a.device.clone(),
+            ),
+            NodeKind::Neg { a }
+            | NodeKind::Abs { a }
+            | NodeKind::Sqrt { a }
+            | NodeKind::Exp { a }
+            | NodeKind::Log { a }
+            | NodeKind::Sin { a }
+            | NodeKind::Cos { a }
+            | NodeKind::StopGradient { a } => (a.shape.clone(), a.dtype, a.device.clone()),
+            NodeKind::Pow { a, .. } => (a.shape.clone(), a.dtype, a.device.clone()),
+            NodeKind::Cast { a, dtype } => (a.shape.clone(), *dtype, a.device.clone()),
+            NodeKind::Sum { a, dims, keepdims }
+            | NodeKind::Mean { a, dims, keepdims }
+            | NodeKind::Max { a, dims, keepdims }
+            | NodeKind::Min { a, dims, keepdims } => (
+                reduced_shape(&a.shape, dims, *keepdims),
+                a.dtype,
+                a.device.clone(),
+            ),
+            NodeKind::Reshape { a, shape } => {
+                let before: usize = a.shape.iter().product();
+                let after: usize = shape.iter().product();
+                if before != after {
+                    return Err(format!(
+                        "reshape: cannot reshape {:?} ({before} elements) to {shape:?} ({after} elements)",
+                        a.shape
+                    ));
+                }
+                (shape.clone(), a.dtype, a.device.clone())
+            }
+            NodeKind::Permute { a, dims } => {
+                if dims.len() != a.shape.len()
+                    || dims.iter().any(|&d| d >= a.shape.len())
+                    || (1..dims.len()).any(|i| dims[..i].contains(&dims[i]))
+                {
+                    return Err(format!(
+                        "permute: dims {dims:?} are not a permutation of rank {}",
+                        a.shape.len()
+                    ));
+                }
+                (
+                    dims.iter().map(|&d| a.shape[d]).collect(),
+                    a.dtype,
+                    a.device.clone(),
+                )
+            }
+            NodeKind::Slice { a, ranges } => {
+                if ranges.len() != a.shape.len() {
+                    return Err(format!(
+                        "slice: expected {} ranges, got {}",
+                        a.shape.len(),
+                        ranges.len()
+                    ));
+                }
+                let shape = ranges
+                    .iter()
+                    .map(|&(start, stop, stride)| stop.saturating_sub(start).div_ceil(stride))
+                    .collect();
+                (shape, a.dtype, a.device.clone())
+            }
+            NodeKind::Concat { a, b, dim } => {
+                if a.shape.len() != b.shape.len() || *dim >= a.shape.len() {
+                    return Err(format!(
+                        "concat: rank/dim mismatch, {:?} vs {:?} along dim {dim}",
+                        a.shape, b.shape
+                    ));
+                }
+                let mut shape = a.shape.clone();
+                for i in 0..shape.len() {
+                    if i == *dim {
+                        shape[i] += b.shape[i];
+                    } else if a.shape[i] != b.shape[i] {
+                        return Err(format!(
+                            "concat: shape mismatch at dim {i}, {:?} vs {:?}",
+                            a.shape, b.shape
+                        ));
+                    }
+                }
+                (shape, a.dtype, a.device.clone())
+            }
+            NodeKind::BroadcastTo { a, shape } => {
+                if shape.len() < a.shape.len() {
+                    return Err(format!(
+                        "broadcast_to: cannot broadcast {:?} to lower rank {shape:?}",
+                        a.shape
+                    ));
+                }
+                let offset = shape.len() - a.shape.len();
+                for (i, &d) in a.shape.iter().enumerate() {
+                    if d != shape[offset + i] && d != 1 {
+                        return Err(format!(
+                            "broadcast_to: cannot broadcast {:?} to {shape:?}",
+                            a.shape
+                        ));
+                    }
+                }
+                (shape.clone(), a.dtype, a.device.clone())
+            }
+            NodeKind::Matmul { a, b } => {
+                if a.shape.len() < 2 || b.shape.len() < 2 {
+                    return Err(format!(
+                        "matmul: expected tensors of rank >= 2, got {:?} and {:?}",
+                        a.shape, b.shape
+                    ));
+                }
+                let ar = a.shape.len();
+                let br = b.shape.len();
+                if a.shape[ar - 1] != b.shape[br - 2] {
+                    return Err(format!(
+                        "matmul: inner dimensions mismatch, got {:?} and {:?}",
+                        a.shape, b.shape
+                    ));
+                }
+                let mut shape = broadcast_shapes(&a.shape[..ar - 2], &b.shape[..br - 2])?;
+                shape.push(a.shape[ar - 2]);
+                shape.push(b.shape[br - 1]);
+                (shape, a.dtype, a.device.clone())
+            }
+        };
+        Ok(Arc::new(Node {
+            id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
+            shape,
+            dtype,
+            device,
+            kind,
+        }))
+    }
 }
 
 #[napi]
 pub struct LazyTensor {
-    node: Arc<LazyNode>,
+    node: Arc<Node>,
+}
+
+macro_rules! lazy_ctor {
+    ($body:expr) => {
+        match $body {
+            Ok(node) => Ok(Self { node }),
+            Err(message) => Err(Error::new(Status::InvalidArg, message)),
+        }
+    };
 }
 
 #[napi]
@@ -498,13 +742,11 @@ impl LazyTensor {
         dtype: Option<NativeDType>,
         device: Option<String>,
     ) -> Result<Self> {
-        Ok(Self {
-            node: Arc::new(LazyNode::Zeros {
-                shape: shape.iter().map(|&d| d as usize).collect(),
-                dtype: dtype.unwrap_or(NativeDType::F32).into(),
-                device: get_device(device)?,
-            }),
-        })
+        lazy_ctor!(Node::new(NodeKind::Zeros {
+            shape: shape.iter().map(|&d| d as usize).collect(),
+            dtype: dtype.unwrap_or(NativeDType::F32).into(),
+            device: get_device(device)?,
+        }))
     }
 
     #[napi(factory)]
@@ -513,13 +755,11 @@ impl LazyTensor {
         dtype: Option<NativeDType>,
         device: Option<String>,
     ) -> Result<Self> {
-        Ok(Self {
-            node: Arc::new(LazyNode::Ones {
-                shape: shape.iter().map(|&d| d as usize).collect(),
-                dtype: dtype.unwrap_or(NativeDType::F32).into(),
-                device: get_device(device)?,
-            }),
-        })
+        lazy_ctor!(Node::new(NodeKind::Ones {
+            shape: shape.iter().map(|&d| d as usize).collect(),
+            dtype: dtype.unwrap_or(NativeDType::F32).into(),
+            device: get_device(device)?,
+        }))
     }
 
     #[napi(factory)]
@@ -529,14 +769,12 @@ impl LazyTensor {
         dtype: Option<NativeDType>,
         device: Option<String>,
     ) -> Result<Self> {
-        Ok(Self {
-            node: Arc::new(LazyNode::Full {
-                shape: shape.iter().map(|&d| d as usize).collect(),
-                value,
-                dtype: dtype.unwrap_or(NativeDType::F32).into(),
-                device: get_device(device)?,
-            }),
-        })
+        lazy_ctor!(Node::new(NodeKind::Full {
+            shape: shape.iter().map(|&d| d as usize).collect(),
+            value,
+            dtype: dtype.unwrap_or(NativeDType::F32).into(),
+            device: get_device(device)?,
+        }))
     }
 
     #[napi(factory)]
@@ -545,13 +783,11 @@ impl LazyTensor {
         dtype: Option<NativeDType>,
         device: Option<String>,
     ) -> Result<Self> {
-        Ok(Self {
-            node: Arc::new(LazyNode::Randn {
-                shape: shape.iter().map(|&d| d as usize).collect(),
-                dtype: dtype.unwrap_or(NativeDType::F32).into(),
-                device: get_device(device)?,
-            }),
-        })
+        lazy_ctor!(Node::new(NodeKind::Randn {
+            shape: shape.iter().map(|&d| d as usize).collect(),
+            dtype: dtype.unwrap_or(NativeDType::F32).into(),
+            device: get_device(device)?,
+        }))
     }
 
     #[napi(factory)]
@@ -568,26 +804,22 @@ impl LazyTensor {
                 "arange: step must be non-zero".to_string(),
             ));
         }
-        Ok(Self {
-            node: Arc::new(LazyNode::Arange {
-                start,
-                end,
-                step,
-                dtype: dtype.unwrap_or(NativeDType::F32).into(),
-                device: get_device(device)?,
-            }),
-        })
+        lazy_ctor!(Node::new(NodeKind::Arange {
+            start,
+            end,
+            step,
+            dtype: dtype.unwrap_or(NativeDType::F32).into(),
+            device: get_device(device)?,
+        }))
     }
 
     #[napi(factory)]
     pub fn eye(n: u32, dtype: Option<NativeDType>, device: Option<String>) -> Result<Self> {
-        Ok(Self {
-            node: Arc::new(LazyNode::Eye {
-                n: n as usize,
-                dtype: dtype.unwrap_or(NativeDType::F32).into(),
-                device: get_device(device)?,
-            }),
-        })
+        lazy_ctor!(Node::new(NodeKind::Eye {
+            n: n as usize,
+            dtype: dtype.unwrap_or(NativeDType::F32).into(),
+            device: get_device(device)?,
+        }))
     }
 
     #[napi(factory)]
@@ -597,310 +829,259 @@ impl LazyTensor {
         dtype: Option<NativeDType>,
         device: Option<String>,
     ) -> Result<Self> {
-        Ok(Self {
-            node: Arc::new(LazyNode::FromBytes {
-                data: data.to_vec(),
-                shape: shape.iter().map(|&d| d as usize).collect(),
-                dtype: dtype.unwrap_or(NativeDType::F32).into(),
-                device: get_device(device)?,
-            }),
-        })
+        lazy_ctor!(Node::new(NodeKind::FromBytes {
+            data: data.to_vec(),
+            shape: shape.iter().map(|&d| d as usize).collect(),
+            dtype: dtype.unwrap_or(NativeDType::F32).into(),
+            device: get_device(device)?,
+        }))
     }
 
     #[napi(factory)]
-    pub fn from_materialized(tensor: &NativeTensor) -> Self {
-        Self {
-            node: Arc::new(LazyNode::Leaf(tensor.inner.clone())),
-        }
+    pub fn from_materialized(tensor: &NativeTensor) -> Result<Self> {
+        lazy_ctor!(Node::new(NodeKind::Leaf(tensor.inner.clone())))
     }
 
     #[napi]
-    pub fn add(&self, other: &LazyTensor) -> Self {
-        Self {
-            node: Arc::new(LazyNode::Add {
-                a: self.node.clone(),
-                b: other.node.clone(),
-            }),
-        }
+    pub fn add(&self, other: &LazyTensor) -> Result<Self> {
+        lazy_ctor!(Node::new(NodeKind::Add {
+            a: self.node.clone(),
+            b: other.node.clone(),
+        }))
     }
 
     #[napi]
-    pub fn sub(&self, other: &LazyTensor) -> Self {
-        Self {
-            node: Arc::new(LazyNode::Sub {
-                a: self.node.clone(),
-                b: other.node.clone(),
-            }),
-        }
+    pub fn sub(&self, other: &LazyTensor) -> Result<Self> {
+        lazy_ctor!(Node::new(NodeKind::Sub {
+            a: self.node.clone(),
+            b: other.node.clone(),
+        }))
     }
 
     #[napi]
-    pub fn mul(&self, other: &LazyTensor) -> Self {
-        Self {
-            node: Arc::new(LazyNode::Mul {
-                a: self.node.clone(),
-                b: other.node.clone(),
-            }),
-        }
+    pub fn mul(&self, other: &LazyTensor) -> Result<Self> {
+        lazy_ctor!(Node::new(NodeKind::Mul {
+            a: self.node.clone(),
+            b: other.node.clone(),
+        }))
     }
 
     #[napi]
-    pub fn div(&self, other: &LazyTensor) -> Self {
-        Self {
-            node: Arc::new(LazyNode::Div {
-                a: self.node.clone(),
-                b: other.node.clone(),
-            }),
-        }
+    pub fn div(&self, other: &LazyTensor) -> Result<Self> {
+        lazy_ctor!(Node::new(NodeKind::Div {
+            a: self.node.clone(),
+            b: other.node.clone(),
+        }))
     }
 
     #[napi]
-    pub fn eq(&self, other: &LazyTensor) -> Self {
-        Self {
-            node: Arc::new(LazyNode::Eq {
-                a: self.node.clone(),
-                b: other.node.clone(),
-            }),
-        }
+    pub fn eq(&self, other: &LazyTensor) -> Result<Self> {
+        lazy_ctor!(Node::new(NodeKind::Eq {
+            a: self.node.clone(),
+            b: other.node.clone(),
+        }))
     }
 
     #[napi]
-    pub fn gt(&self, other: &LazyTensor) -> Self {
-        Self {
-            node: Arc::new(LazyNode::Gt {
-                a: self.node.clone(),
-                b: other.node.clone(),
-            }),
-        }
+    pub fn gt(&self, other: &LazyTensor) -> Result<Self> {
+        lazy_ctor!(Node::new(NodeKind::Gt {
+            a: self.node.clone(),
+            b: other.node.clone(),
+        }))
     }
 
     #[napi]
-    pub fn lt(&self, other: &LazyTensor) -> Self {
-        Self {
-            node: Arc::new(LazyNode::Lt {
-                a: self.node.clone(),
-                b: other.node.clone(),
-            }),
-        }
+    pub fn lt(&self, other: &LazyTensor) -> Result<Self> {
+        lazy_ctor!(Node::new(NodeKind::Lt {
+            a: self.node.clone(),
+            b: other.node.clone(),
+        }))
     }
 
     #[napi]
-    pub fn ge(&self, other: &LazyTensor) -> Self {
-        Self {
-            node: Arc::new(LazyNode::Ge {
-                a: self.node.clone(),
-                b: other.node.clone(),
-            }),
-        }
+    pub fn ge(&self, other: &LazyTensor) -> Result<Self> {
+        lazy_ctor!(Node::new(NodeKind::Ge {
+            a: self.node.clone(),
+            b: other.node.clone(),
+        }))
     }
 
     #[napi]
-    pub fn le(&self, other: &LazyTensor) -> Self {
-        Self {
-            node: Arc::new(LazyNode::Le {
-                a: self.node.clone(),
-                b: other.node.clone(),
-            }),
-        }
+    pub fn le(&self, other: &LazyTensor) -> Result<Self> {
+        lazy_ctor!(Node::new(NodeKind::Le {
+            a: self.node.clone(),
+            b: other.node.clone(),
+        }))
     }
 
     #[napi]
-    pub fn matmul(&self, other: &LazyTensor) -> Self {
-        Self {
-            node: Arc::new(LazyNode::Matmul {
-                a: self.node.clone(),
-                b: other.node.clone(),
-            }),
-        }
+    pub fn matmul(&self, other: &LazyTensor) -> Result<Self> {
+        lazy_ctor!(Node::new(NodeKind::Matmul {
+            a: self.node.clone(),
+            b: other.node.clone(),
+        }))
     }
 
     #[napi]
-    pub fn neg(&self) -> Self {
-        Self {
-            node: Arc::new(LazyNode::Neg {
-                a: self.node.clone(),
-            }),
-        }
+    pub fn neg(&self) -> Result<Self> {
+        lazy_ctor!(Node::new(NodeKind::Neg {
+            a: self.node.clone(),
+        }))
     }
 
     #[napi]
-    pub fn abs(&self) -> Self {
-        Self {
-            node: Arc::new(LazyNode::Abs {
-                a: self.node.clone(),
-            }),
-        }
+    pub fn abs(&self) -> Result<Self> {
+        lazy_ctor!(Node::new(NodeKind::Abs {
+            a: self.node.clone(),
+        }))
     }
 
     #[napi]
-    pub fn sqrt(&self) -> Self {
-        Self {
-            node: Arc::new(LazyNode::Sqrt {
-                a: self.node.clone(),
-            }),
-        }
+    pub fn sqrt(&self) -> Result<Self> {
+        lazy_ctor!(Node::new(NodeKind::Sqrt {
+            a: self.node.clone(),
+        }))
     }
 
     #[napi]
-    pub fn exp(&self) -> Self {
-        Self {
-            node: Arc::new(LazyNode::Exp {
-                a: self.node.clone(),
-            }),
-        }
+    pub fn exp(&self) -> Result<Self> {
+        lazy_ctor!(Node::new(NodeKind::Exp {
+            a: self.node.clone(),
+        }))
     }
 
     #[napi]
-    pub fn log(&self) -> Self {
-        Self {
-            node: Arc::new(LazyNode::Log {
-                a: self.node.clone(),
-            }),
-        }
+    pub fn log(&self) -> Result<Self> {
+        lazy_ctor!(Node::new(NodeKind::Log {
+            a: self.node.clone(),
+        }))
     }
 
     #[napi]
-    pub fn sin(&self) -> Self {
-        Self {
-            node: Arc::new(LazyNode::Sin {
-                a: self.node.clone(),
-            }),
-        }
+    pub fn sin(&self) -> Result<Self> {
+        lazy_ctor!(Node::new(NodeKind::Sin {
+            a: self.node.clone(),
+        }))
     }
 
     #[napi]
-    pub fn cos(&self) -> Self {
-        Self {
-            node: Arc::new(LazyNode::Cos {
-                a: self.node.clone(),
-            }),
-        }
+    pub fn cos(&self) -> Result<Self> {
+        lazy_ctor!(Node::new(NodeKind::Cos {
+            a: self.node.clone(),
+        }))
     }
 
     #[napi]
-    pub fn pow(&self, exp: f64) -> Self {
-        Self {
-            node: Arc::new(LazyNode::Pow {
-                a: self.node.clone(),
-                exp,
-            }),
-        }
+    pub fn pow(&self, exp: f64) -> Result<Self> {
+        lazy_ctor!(Node::new(NodeKind::Pow {
+            a: self.node.clone(),
+            exp,
+        }))
     }
 
     #[napi]
-    pub fn cast(&self, dtype: NativeDType) -> Self {
-        Self {
-            node: Arc::new(LazyNode::Cast {
-                a: self.node.clone(),
-                dtype: dtype.into(),
-            }),
-        }
+    pub fn cast(&self, dtype: NativeDType) -> Result<Self> {
+        lazy_ctor!(Node::new(NodeKind::Cast {
+            a: self.node.clone(),
+            dtype: dtype.into(),
+        }))
     }
 
     #[napi]
-    pub fn sum(&self, dims: Vec<u32>, keepdims: bool) -> Self {
-        Self {
-            node: Arc::new(LazyNode::Sum {
-                a: self.node.clone(),
-                dims: dims.iter().map(|&d| d as usize).collect(),
-                keepdims,
-            }),
-        }
+    pub fn sum(&self, dims: Vec<u32>, keepdims: bool) -> Result<Self> {
+        lazy_ctor!(Node::new(NodeKind::Sum {
+            a: self.node.clone(),
+            dims: dims.iter().map(|&d| d as usize).collect(),
+            keepdims,
+        }))
     }
 
     #[napi]
-    pub fn mean(&self, dims: Vec<u32>, keepdims: bool) -> Self {
-        Self {
-            node: Arc::new(LazyNode::Mean {
-                a: self.node.clone(),
-                dims: dims.iter().map(|&d| d as usize).collect(),
-                keepdims,
-            }),
-        }
+    pub fn mean(&self, dims: Vec<u32>, keepdims: bool) -> Result<Self> {
+        lazy_ctor!(Node::new(NodeKind::Mean {
+            a: self.node.clone(),
+            dims: dims.iter().map(|&d| d as usize).collect(),
+            keepdims,
+        }))
     }
 
     #[napi]
-    pub fn max(&self, dims: Vec<u32>, keepdims: bool) -> Self {
-        Self {
-            node: Arc::new(LazyNode::Max {
-                a: self.node.clone(),
-                dims: dims.iter().map(|&d| d as usize).collect(),
-                keepdims,
-            }),
-        }
+    pub fn max(&self, dims: Vec<u32>, keepdims: bool) -> Result<Self> {
+        lazy_ctor!(Node::new(NodeKind::Max {
+            a: self.node.clone(),
+            dims: dims.iter().map(|&d| d as usize).collect(),
+            keepdims,
+        }))
     }
 
     #[napi]
-    pub fn min(&self, dims: Vec<u32>, keepdims: bool) -> Self {
-        Self {
-            node: Arc::new(LazyNode::Min {
-                a: self.node.clone(),
-                dims: dims.iter().map(|&d| d as usize).collect(),
-                keepdims,
-            }),
-        }
+    pub fn min(&self, dims: Vec<u32>, keepdims: bool) -> Result<Self> {
+        lazy_ctor!(Node::new(NodeKind::Min {
+            a: self.node.clone(),
+            dims: dims.iter().map(|&d| d as usize).collect(),
+            keepdims,
+        }))
     }
 
     #[napi]
-    pub fn reshape(&self, shape: Vec<u32>) -> Self {
-        Self {
-            node: Arc::new(LazyNode::Reshape {
-                a: self.node.clone(),
-                shape: shape.iter().map(|&d| d as usize).collect(),
-            }),
-        }
+    pub fn reshape(&self, shape: Vec<u32>) -> Result<Self> {
+        lazy_ctor!(Node::new(NodeKind::Reshape {
+            a: self.node.clone(),
+            shape: shape.iter().map(|&d| d as usize).collect(),
+        }))
     }
 
     #[napi]
-    pub fn permute(&self, dims: Vec<u32>) -> Self {
-        Self {
-            node: Arc::new(LazyNode::Permute {
-                a: self.node.clone(),
-                dims: dims.iter().map(|&d| d as usize).collect(),
-            }),
-        }
+    pub fn permute(&self, dims: Vec<u32>) -> Result<Self> {
+        lazy_ctor!(Node::new(NodeKind::Permute {
+            a: self.node.clone(),
+            dims: dims.iter().map(|&d| d as usize).collect(),
+        }))
     }
 
     #[napi]
-    pub fn slice(&self, ranges: Vec<Vec<u32>>) -> Self {
-        Self {
-            node: Arc::new(LazyNode::Slice {
-                a: self.node.clone(),
-                ranges: ranges
-                    .iter()
-                    .map(|r| (r[0] as usize, r[1] as usize, r[2] as usize))
-                    .collect(),
-            }),
-        }
+    pub fn slice(&self, ranges: Vec<Vec<u32>>) -> Result<Self> {
+        lazy_ctor!(Node::new(NodeKind::Slice {
+            a: self.node.clone(),
+            ranges: ranges
+                .iter()
+                .map(|r| (r[0] as usize, r[1] as usize, r[2] as usize))
+                .collect(),
+        }))
     }
 
     #[napi]
-    pub fn concat(&self, other: &LazyTensor, dim: u32) -> Self {
-        Self {
-            node: Arc::new(LazyNode::Concat {
-                a: self.node.clone(),
-                b: other.node.clone(),
-                dim: dim as usize,
-            }),
-        }
+    pub fn concat(&self, other: &LazyTensor, dim: u32) -> Result<Self> {
+        lazy_ctor!(Node::new(NodeKind::Concat {
+            a: self.node.clone(),
+            b: other.node.clone(),
+            dim: dim as usize,
+        }))
     }
 
     #[napi]
-    pub fn broadcast_to(&self, shape: Vec<u32>) -> Self {
-        Self {
-            node: Arc::new(LazyNode::BroadcastTo {
-                a: self.node.clone(),
-                shape: shape.iter().map(|&d| d as usize).collect(),
-            }),
-        }
+    pub fn broadcast_to(&self, shape: Vec<u32>) -> Result<Self> {
+        lazy_ctor!(Node::new(NodeKind::BroadcastTo {
+            a: self.node.clone(),
+            shape: shape.iter().map(|&d| d as usize).collect(),
+        }))
+    }
+
+    #[napi]
+    pub fn stop_gradient(&self) -> Result<Self> {
+        lazy_ctor!(Node::new(NodeKind::StopGradient {
+            a: self.node.clone(),
+        }))
     }
 }
 
+type Cache = std::collections::HashMap<u64, Tensor>;
+
 fn eval_cmp(
-    a: &Arc<LazyNode>,
-    b: &Arc<LazyNode>,
+    a: &Arc<Node>,
+    b: &Arc<Node>,
     cancelled: &AtomicBool,
-    cache: &mut std::collections::HashMap<*const LazyNode, Tensor>,
+    cache: &mut Cache,
     f: impl Fn(&Tensor, &Tensor) -> candle_core::Result<Tensor>,
 ) -> candle_core::Result<Tensor> {
     let a = eval_node(a, cancelled, cache)?;
@@ -930,19 +1111,19 @@ fn reduce_dims(
 }
 
 fn eval_node(
-    node: &Arc<LazyNode>,
+    node: &Arc<Node>,
     cancelled: &AtomicBool,
-    cache: &mut std::collections::HashMap<*const LazyNode, Tensor>,
+    cache: &mut Cache,
 ) -> candle_core::Result<Tensor> {
     if cancelled.load(Ordering::Relaxed) {
         return Err(candle_core::Error::Msg("operation aborted".to_string()));
     }
-    if let Some(cached) = cache.get(&Arc::as_ptr(node)) {
+    if let Some(cached) = cache.get(&node.id) {
         return Ok(cached.clone());
     }
-    let output = match &**node {
-        LazyNode::Leaf(tensor) => tensor.clone(),
-        LazyNode::FromBytes {
+    let output = match &node.kind {
+        NodeKind::Leaf(tensor) => tensor.clone(),
+        NodeKind::FromBytes {
             data,
             shape,
             dtype,
@@ -983,17 +1164,17 @@ fn eval_node(
                 )))
             }
         },
-        LazyNode::Zeros {
+        NodeKind::Zeros {
             shape,
             dtype,
             device,
         } => Tensor::zeros(shape.clone(), *dtype, device)?,
-        LazyNode::Ones {
+        NodeKind::Ones {
             shape,
             dtype,
             device,
         } => Tensor::ones(shape.clone(), *dtype, device)?,
-        LazyNode::Full {
+        NodeKind::Full {
             shape,
             value,
             dtype,
@@ -1010,12 +1191,12 @@ fn eval_node(
                 )))
             }
         },
-        LazyNode::Randn {
+        NodeKind::Randn {
             shape,
             dtype,
             device,
         } => Tensor::randn(0f32, 1f32, shape.clone(), device)?.to_dtype(*dtype)?,
-        LazyNode::Arange {
+        NodeKind::Arange {
             start,
             end,
             step,
@@ -1027,64 +1208,64 @@ fn eval_node(
             let scaled = (base * *step)?;
             (scaled + *start)?.to_dtype(*dtype)?
         }
-        LazyNode::Eye { n, dtype, device } => {
+        NodeKind::Eye { n, dtype, device } => {
             let i = Tensor::arange(0u32, *n as u32, device)?.reshape((*n, 1))?;
             let j = Tensor::arange(0u32, *n as u32, device)?.reshape((1, *n))?;
             i.broadcast_eq(&j)?.to_dtype(*dtype)?
         }
-        LazyNode::Add { a, b } => {
+        NodeKind::Add { a, b } => {
             let a = eval_node(a, cancelled, cache)?;
             let b = eval_node(b, cancelled, cache)?;
             a.broadcast_add(&b)?
         }
-        LazyNode::Sub { a, b } => {
+        NodeKind::Sub { a, b } => {
             let a = eval_node(a, cancelled, cache)?;
             let b = eval_node(b, cancelled, cache)?;
             a.broadcast_sub(&b)?
         }
-        LazyNode::Mul { a, b } => {
+        NodeKind::Mul { a, b } => {
             let a = eval_node(a, cancelled, cache)?;
             let b = eval_node(b, cancelled, cache)?;
             a.broadcast_mul(&b)?
         }
-        LazyNode::Div { a, b } => {
+        NodeKind::Div { a, b } => {
             let a = eval_node(a, cancelled, cache)?;
             let b = eval_node(b, cancelled, cache)?;
             a.broadcast_div(&b)?
         }
-        LazyNode::Eq { a, b } => eval_cmp(a, b, cancelled, cache, |a, b| a.eq(b))?,
-        LazyNode::Gt { a, b } => eval_cmp(a, b, cancelled, cache, |a, b| a.gt(b))?,
-        LazyNode::Lt { a, b } => eval_cmp(a, b, cancelled, cache, |a, b| a.lt(b))?,
-        LazyNode::Ge { a, b } => eval_cmp(a, b, cancelled, cache, |a, b| a.ge(b))?,
-        LazyNode::Le { a, b } => eval_cmp(a, b, cancelled, cache, |a, b| a.le(b))?,
-        LazyNode::Neg { a } => eval_node(a, cancelled, cache)?.neg()?,
-        LazyNode::Abs { a } => eval_node(a, cancelled, cache)?.abs()?,
-        LazyNode::Sqrt { a } => eval_node(a, cancelled, cache)?.sqrt()?,
-        LazyNode::Exp { a } => eval_node(a, cancelled, cache)?.exp()?,
-        LazyNode::Log { a } => eval_node(a, cancelled, cache)?.log()?,
-        LazyNode::Sin { a } => eval_node(a, cancelled, cache)?.sin()?,
-        LazyNode::Cos { a } => eval_node(a, cancelled, cache)?.cos()?,
-        LazyNode::Pow { a, exp } => eval_node(a, cancelled, cache)?.powf(*exp)?,
-        LazyNode::Cast { a, dtype } => eval_node(a, cancelled, cache)?.to_dtype(*dtype)?,
-        LazyNode::Sum { a, dims, keepdims } => {
+        NodeKind::Eq { a, b } => eval_cmp(a, b, cancelled, cache, |a, b| a.eq(b))?,
+        NodeKind::Gt { a, b } => eval_cmp(a, b, cancelled, cache, |a, b| a.gt(b))?,
+        NodeKind::Lt { a, b } => eval_cmp(a, b, cancelled, cache, |a, b| a.lt(b))?,
+        NodeKind::Ge { a, b } => eval_cmp(a, b, cancelled, cache, |a, b| a.ge(b))?,
+        NodeKind::Le { a, b } => eval_cmp(a, b, cancelled, cache, |a, b| a.le(b))?,
+        NodeKind::Neg { a } => eval_node(a, cancelled, cache)?.neg()?,
+        NodeKind::Abs { a } => eval_node(a, cancelled, cache)?.abs()?,
+        NodeKind::Sqrt { a } => eval_node(a, cancelled, cache)?.sqrt()?,
+        NodeKind::Exp { a } => eval_node(a, cancelled, cache)?.exp()?,
+        NodeKind::Log { a } => eval_node(a, cancelled, cache)?.log()?,
+        NodeKind::Sin { a } => eval_node(a, cancelled, cache)?.sin()?,
+        NodeKind::Cos { a } => eval_node(a, cancelled, cache)?.cos()?,
+        NodeKind::Pow { a, exp } => eval_node(a, cancelled, cache)?.powf(*exp)?,
+        NodeKind::Cast { a, dtype } => eval_node(a, cancelled, cache)?.to_dtype(*dtype)?,
+        NodeKind::Sum { a, dims, keepdims } => {
             let t = eval_node(a, cancelled, cache)?;
             reduce_dims(&t, dims, *keepdims, |t, d| t.sum(d))?
         }
-        LazyNode::Mean { a, dims, keepdims } => {
+        NodeKind::Mean { a, dims, keepdims } => {
             let t = eval_node(a, cancelled, cache)?;
             reduce_dims(&t, dims, *keepdims, |t, d| t.mean(d))?
         }
-        LazyNode::Max { a, dims, keepdims } => {
+        NodeKind::Max { a, dims, keepdims } => {
             let t = eval_node(a, cancelled, cache)?;
             reduce_dims(&t, dims, *keepdims, |t, d| t.max(d))?
         }
-        LazyNode::Min { a, dims, keepdims } => {
+        NodeKind::Min { a, dims, keepdims } => {
             let t = eval_node(a, cancelled, cache)?;
             reduce_dims(&t, dims, *keepdims, |t, d| t.min(d))?
         }
-        LazyNode::Reshape { a, shape } => eval_node(a, cancelled, cache)?.reshape(shape.clone())?,
-        LazyNode::Permute { a, dims } => eval_node(a, cancelled, cache)?.permute(dims.clone())?,
-        LazyNode::Slice { a, ranges } => {
+        NodeKind::Reshape { a, shape } => eval_node(a, cancelled, cache)?.reshape(shape.clone())?,
+        NodeKind::Permute { a, dims } => eval_node(a, cancelled, cache)?.permute(dims.clone())?,
+        NodeKind::Slice { a, ranges } => {
             let mut t = eval_node(a, cancelled, cache)?;
             for (dim, &(start, stop, stride)) in ranges.iter().enumerate() {
                 let len = stop.saturating_sub(start).div_ceil(stride);
@@ -1101,22 +1282,489 @@ fn eval_node(
             }
             t
         }
-        LazyNode::Concat { a, b, dim } => {
+        NodeKind::Concat { a, b, dim } => {
             let a = eval_node(a, cancelled, cache)?;
             let b = eval_node(b, cancelled, cache)?;
             Tensor::cat(&[&a, &b], *dim)?
         }
-        LazyNode::BroadcastTo { a, shape } => {
+        NodeKind::BroadcastTo { a, shape } => {
             eval_node(a, cancelled, cache)?.broadcast_as(shape.clone())?
         }
-        LazyNode::Matmul { a, b } => {
+        NodeKind::Matmul { a, b } => {
             let a = eval_node(a, cancelled, cache)?;
             let b = eval_node(b, cancelled, cache)?;
-            a.matmul(&b)?
+            // candle's matmul requires contiguous operands; permuted or
+            // broadcast layouts (common in backward graphs) must be
+            // materialized first.
+            let a = if a.is_contiguous() { a } else { a.contiguous()? };
+            let b = if b.is_contiguous() { b } else { b.contiguous()? };
+            a.broadcast_matmul(&b)?
         }
+        NodeKind::StopGradient { a } => eval_node(a, cancelled, cache)?,
     };
-    cache.insert(Arc::as_ptr(node), output.clone());
+    cache.insert(node.id, output.clone());
     Ok(output)
+}
+
+// Reverse-mode automatic differentiation: adjoints are built from the same
+// node vocabulary as the forward graph, so gradients can be differentiated
+// again and executor optimizations apply uniformly.
+mod autodiff {
+    use super::*;
+    use std::collections::HashMap;
+
+    fn mk(kind: NodeKind) -> std::result::Result<Arc<Node>, String> {
+        Node::new(kind)
+    }
+
+    fn full(value: f64, dtype: DType, device: &Device) -> std::result::Result<Arc<Node>, String> {
+        mk(NodeKind::Full {
+            shape: vec![],
+            value,
+            dtype,
+            device: device.clone(),
+        })
+    }
+
+    fn zeros_like(target: &Node) -> std::result::Result<Arc<Node>, String> {
+        mk(NodeKind::Zeros {
+            shape: target.shape.clone(),
+            dtype: target.dtype,
+            device: target.device.clone(),
+        })
+    }
+
+    fn ones(dtype: DType, device: &Device) -> std::result::Result<Arc<Node>, String> {
+        mk(NodeKind::Ones {
+            shape: vec![],
+            dtype,
+            device: device.clone(),
+        })
+    }
+
+    fn add(a: Arc<Node>, b: Arc<Node>) -> std::result::Result<Arc<Node>, String> {
+        mk(NodeKind::Add { a, b })
+    }
+
+    fn mul(a: Arc<Node>, b: Arc<Node>) -> std::result::Result<Arc<Node>, String> {
+        mk(NodeKind::Mul { a, b })
+    }
+
+    fn div(a: Arc<Node>, b: Arc<Node>) -> std::result::Result<Arc<Node>, String> {
+        mk(NodeKind::Div { a, b })
+    }
+
+    fn neg(a: Arc<Node>) -> std::result::Result<Arc<Node>, String> {
+        mk(NodeKind::Neg { a })
+    }
+
+    fn cast(a: Arc<Node>, dtype: DType) -> std::result::Result<Arc<Node>, String> {
+        if a.dtype == dtype {
+            return Ok(a);
+        }
+        mk(NodeKind::Cast { a, dtype })
+    }
+
+    fn reshape(a: Arc<Node>, shape: Vec<usize>) -> std::result::Result<Arc<Node>, String> {
+        if a.shape == shape {
+            return Ok(a);
+        }
+        mk(NodeKind::Reshape { a, shape })
+    }
+
+    fn broadcast_to(a: Arc<Node>, shape: &[usize]) -> std::result::Result<Arc<Node>, String> {
+        if a.shape == shape {
+            return Ok(a);
+        }
+        mk(NodeKind::BroadcastTo {
+            a,
+            shape: shape.to_vec(),
+        })
+    }
+
+    fn transpose2(a: &Arc<Node>) -> std::result::Result<Arc<Node>, String> {
+        let rank = a.shape.len();
+        let mut dims: Vec<usize> = (0..rank).collect();
+        dims.swap(rank - 2, rank - 1);
+        mk(NodeKind::Permute {
+            a: a.clone(),
+            dims,
+        })
+    }
+
+    // Sum g over the dims that broadcasting expanded, then reshape to target.
+    fn sum_to_shape(g: &Arc<Node>, target: &[usize]) -> std::result::Result<Arc<Node>, String> {
+        if g.shape == target {
+            return Ok(g.clone());
+        }
+        if g.shape.len() < target.len() {
+            return Err(format!(
+                "grad: cannot reduce {:?} to higher-rank shape {target:?}",
+                g.shape
+            ));
+        }
+        let extra = g.shape.len() - target.len();
+        let mut dims: Vec<usize> = (0..extra).collect();
+        for i in extra..g.shape.len() {
+            if target[i - extra] == 1 && g.shape[i] != 1 {
+                dims.push(i);
+            }
+        }
+        let out = if dims.is_empty() {
+            g.clone()
+        } else {
+            mk(NodeKind::Sum {
+                a: g.clone(),
+                dims,
+                keepdims: true,
+            })?
+        };
+        reshape(out, target.to_vec())
+    }
+
+    // Broadcast a reduced cotangent (and output) back to the input shape,
+    // re-inserting size-1 dims when keepdims was false.
+    fn expand_reduced(
+        g: &Arc<Node>,
+        dims: &[usize],
+        keepdims: bool,
+        target: &[usize],
+    ) -> std::result::Result<Arc<Node>, String> {
+        let g = if keepdims {
+            g.clone()
+        } else {
+            let kept: Vec<usize> = target
+                .iter()
+                .enumerate()
+                .map(|(i, &d)| if dims.contains(&i) { 1 } else { d })
+                .collect();
+            reshape(g.clone(), kept)?
+        };
+        broadcast_to(g, target)
+    }
+
+    fn children(kind: &NodeKind) -> Vec<Arc<Node>> {
+        match kind {
+            NodeKind::Leaf(_)
+            | NodeKind::FromBytes { .. }
+            | NodeKind::Zeros { .. }
+            | NodeKind::Ones { .. }
+            | NodeKind::Full { .. }
+            | NodeKind::Randn { .. }
+            | NodeKind::Arange { .. }
+            | NodeKind::Eye { .. } => vec![],
+            NodeKind::Add { a, b }
+            | NodeKind::Sub { a, b }
+            | NodeKind::Mul { a, b }
+            | NodeKind::Div { a, b }
+            | NodeKind::Eq { a, b }
+            | NodeKind::Gt { a, b }
+            | NodeKind::Lt { a, b }
+            | NodeKind::Ge { a, b }
+            | NodeKind::Le { a, b }
+            | NodeKind::Concat { a, b, .. }
+            | NodeKind::Matmul { a, b } => vec![a.clone(), b.clone()],
+            NodeKind::Neg { a }
+            | NodeKind::Abs { a }
+            | NodeKind::Sqrt { a }
+            | NodeKind::Exp { a }
+            | NodeKind::Log { a }
+            | NodeKind::Sin { a }
+            | NodeKind::Cos { a }
+            | NodeKind::Pow { a, .. }
+            | NodeKind::Cast { a, .. }
+            | NodeKind::Sum { a, .. }
+            | NodeKind::Mean { a, .. }
+            | NodeKind::Max { a, .. }
+            | NodeKind::Min { a, .. }
+            | NodeKind::Reshape { a, .. }
+            | NodeKind::Permute { a, .. }
+            | NodeKind::Slice { a, .. }
+            | NodeKind::BroadcastTo { a, .. }
+            | NodeKind::StopGradient { a } => vec![a.clone()],
+        }
+    }
+
+    fn topo(loss: &Arc<Node>) -> Vec<Arc<Node>> {
+        let mut visited = HashSet::new();
+        let mut order = Vec::new();
+        let mut stack = vec![(loss.clone(), false)];
+        while let Some((node, processed)) = stack.pop() {
+            if processed {
+                order.push(node);
+                continue;
+            }
+            if !visited.insert(node.id) {
+                continue;
+            }
+            stack.push((node.clone(), true));
+            for child in children(&node.kind) {
+                stack.push((child, false));
+            }
+        }
+        order
+    }
+
+    pub fn grad(
+        loss: &Arc<Node>,
+        wrt: &[Arc<Node>],
+    ) -> std::result::Result<Vec<Arc<Node>>, String> {
+        if !loss.shape.is_empty() {
+            return Err(format!(
+                "grad: expected a scalar (0-d) loss, got shape {:?}",
+                loss.shape
+            ));
+        }
+        if !loss.dtype.is_float() {
+            return Err(format!(
+                "grad: loss dtype must be floating point, got {:?}",
+                loss.dtype
+            ));
+        }
+        for target in wrt {
+            if !target.dtype.is_float() {
+                return Err(format!(
+                    "grad: cannot differentiate with respect to non-float dtype {:?}",
+                    target.dtype
+                ));
+            }
+        }
+        let order = topo(loss);
+        let mut cotangents: HashMap<u64, Arc<Node>> = HashMap::new();
+        cotangents.insert(loss.id, ones(loss.dtype, &loss.device)?);
+        for node in order.iter().rev() {
+            let Some(g) = cotangents.get(&node.id).cloned() else {
+                continue;
+            };
+            // Gradients do not flow through non-float nodes (comparisons,
+            // integer arithmetic): their mathematical gradient is zero
+            // almost everywhere, so the cotangent is dropped here.
+            if !node.dtype.is_float() {
+                continue;
+            }
+            let mut accumulate = |input: &Arc<Node>,
+                                  contribution: std::result::Result<Arc<Node>, String>| {
+                let contribution = contribution?;
+                cotangents
+                    .entry(input.id)
+                    .and_modify(|existing| {
+                        *existing = add(existing.clone(), contribution.clone())
+                            .expect("grad accumulation broadcast")
+                    })
+                    .or_insert(contribution);
+                Ok::<(), String>(())
+            };
+            match &node.kind {
+                NodeKind::Add { a, b } => {
+                    accumulate(a, sum_to_shape(&g, &a.shape))?;
+                    accumulate(b, sum_to_shape(&g, &b.shape))?;
+                }
+                NodeKind::Sub { a, b } => {
+                    accumulate(a, sum_to_shape(&g, &a.shape))?;
+                    accumulate(b, sum_to_shape(&neg(g)?, &b.shape))?;
+                }
+                NodeKind::Mul { a, b } => {
+                    accumulate(a, sum_to_shape(&mul(g.clone(), b.clone())?, &a.shape))?;
+                    accumulate(b, sum_to_shape(&mul(g.clone(), a.clone())?, &b.shape))?;
+                }
+                NodeKind::Div { a, b } => {
+                    accumulate(a, sum_to_shape(&div(g.clone(), b.clone())?, &a.shape))?;
+                    let gb = neg(div(mul(g.clone(), a.clone())?, mul(b.clone(), b.clone())?)?)?;
+                    accumulate(b, sum_to_shape(&gb, &b.shape))?;
+                }
+                NodeKind::Neg { a } => {
+                    accumulate(a, neg(g))?;
+                }
+                NodeKind::Abs { a } => {
+                    let zero = full(0.0, a.dtype, &a.device)?;
+                    let sign = mk(NodeKind::Sub {
+                        a: cast(mk(NodeKind::Gt { a: a.clone(), b: zero.clone() })?, a.dtype)?,
+                        b: cast(mk(NodeKind::Lt { a: a.clone(), b: zero })?, a.dtype)?,
+                    })?;
+                    accumulate(a, mul(g, sign))?;
+                }
+                NodeKind::Sqrt { a } => {
+                    let half = full(0.5, node.dtype, &node.device)?;
+                    accumulate(a, div(mul(g, half)?, node.clone()))?;
+                }
+                NodeKind::Exp { a } => {
+                    accumulate(a, mul(g, node.clone()))?;
+                }
+                NodeKind::Log { a } => {
+                    accumulate(a, div(g, a.clone()))?;
+                }
+                NodeKind::Sin { a } => {
+                    accumulate(a, mul(g, mk(NodeKind::Cos { a: a.clone() })?))?;
+                }
+                NodeKind::Cos { a } => {
+                    accumulate(a, neg(mul(g, mk(NodeKind::Sin { a: a.clone() })?)?))?;
+                }
+                NodeKind::Pow { a, exp } => {
+                    let c = full(*exp, a.dtype, &a.device)?;
+                    let base = mk(NodeKind::Pow {
+                        a: a.clone(),
+                        exp: exp - 1.0,
+                    })?;
+                    accumulate(a, mul(mul(g, c)?, base))?;
+                }
+                NodeKind::Cast { a, .. } => {
+                    if a.dtype.is_float() {
+                        accumulate(a, cast(g, a.dtype))?;
+                    }
+                }
+                NodeKind::Sum { a, dims, keepdims } => {
+                    accumulate(a, expand_reduced(&g, dims, *keepdims, &a.shape))?;
+                }
+                NodeKind::Mean { a, dims, keepdims } => {
+                    let count: usize = dims.iter().map(|&d| a.shape[d]).product();
+                    let scaled = div(g, full(count as f64, a.dtype, &a.device)?)?;
+                    accumulate(a, expand_reduced(&scaled, dims, *keepdims, &a.shape))?;
+                }
+                NodeKind::Max { a, dims, keepdims } | NodeKind::Min { a, dims, keepdims } => {
+                    let kept: Vec<usize> = a
+                        .shape
+                        .iter()
+                        .enumerate()
+                        .map(|(i, &d)| if dims.contains(&i) { 1 } else { d })
+                        .collect();
+                    let out_r = if *keepdims {
+                        node.clone()
+                    } else {
+                        reshape(node.clone(), kept.clone())?
+                    };
+                    let g_r = if *keepdims { g.clone() } else { reshape(g, kept)? };
+                    let out_b = broadcast_to(out_r, &a.shape)?;
+                    let mask = cast(
+                        mk(NodeKind::Eq {
+                            a: a.clone(),
+                            b: out_b,
+                        })?,
+                        a.dtype,
+                    )?;
+                    let denom = broadcast_to(
+                        mk(NodeKind::Sum {
+                            a: mask.clone(),
+                            dims: dims.clone(),
+                            keepdims: true,
+                        })?,
+                        &a.shape,
+                    )?;
+                    accumulate(a, div(mul(broadcast_to(g_r, &a.shape)?, mask)?, denom))?;
+                }
+                NodeKind::Reshape { a, .. } => {
+                    accumulate(a, reshape(g, a.shape.clone()))?;
+                }
+                NodeKind::Permute { a, dims } => {
+                    let mut inverse = vec![0usize; dims.len()];
+                    for (i, &d) in dims.iter().enumerate() {
+                        inverse[d] = i;
+                    }
+                    accumulate(a, mk(NodeKind::Permute { a: g, dims: inverse }))?;
+                }
+                NodeKind::Slice { a, ranges } => {
+                    let mut cur = g;
+                    for (dim, &(start, stop, stride)) in ranges.iter().enumerate() {
+                        if stride != 1 {
+                            return Err(
+                                "grad: slice with stride > 1 is not differentiable".to_string()
+                            );
+                        }
+                        let n = a.shape[dim];
+                        if start > 0 {
+                            let mut zshape = cur.shape.clone();
+                            zshape[dim] = start;
+                            cur = mk(NodeKind::Concat {
+                                a: mk(NodeKind::Zeros {
+                                    shape: zshape,
+                                    dtype: cur.dtype,
+                                    device: cur.device.clone(),
+                                })?,
+                                b: cur.clone(),
+                                dim,
+                            })?;
+                        }
+                        if stop < n {
+                            let mut zshape = cur.shape.clone();
+                            zshape[dim] = n - stop;
+                            cur = mk(NodeKind::Concat {
+                                a: cur.clone(),
+                                b: mk(NodeKind::Zeros {
+                                    shape: zshape,
+                                    dtype: cur.dtype,
+                                    device: cur.device.clone(),
+                                })?,
+                                dim,
+                            })?;
+                        }
+                    }
+                    accumulate(a, Ok(cur))?;
+                }
+                NodeKind::Concat { a, b, dim } => {
+                    let mut offset = 0usize;
+                    for input in [a, b] {
+                        let len = input.shape[*dim];
+                        let ranges: Vec<(usize, usize, usize)> = (0..g.shape.len())
+                            .map(|i| {
+                                if i == *dim {
+                                    (offset, offset + len, 1)
+                                } else {
+                                    (0, g.shape[i], 1)
+                                }
+                            })
+                            .collect();
+                        accumulate(input, mk(NodeKind::Slice { a: g.clone(), ranges }))?;
+                        offset += len;
+                    }
+                }
+                NodeKind::BroadcastTo { a, .. } => {
+                    accumulate(a, sum_to_shape(&g, &a.shape))?;
+                }
+                NodeKind::Matmul { a, b } => {
+                    let ga = mk(NodeKind::Matmul {
+                        a: g.clone(),
+                        b: transpose2(b)?,
+                    })?;
+                    accumulate(a, sum_to_shape(&ga, &a.shape))?;
+                    let gb = mk(NodeKind::Matmul {
+                        a: transpose2(a)?,
+                        b: g.clone(),
+                    })?;
+                    accumulate(b, sum_to_shape(&gb, &b.shape))?;
+                }
+                NodeKind::StopGradient { .. } => {}
+                NodeKind::Leaf(_)
+                | NodeKind::FromBytes { .. }
+                | NodeKind::Zeros { .. }
+                | NodeKind::Ones { .. }
+                | NodeKind::Full { .. }
+                | NodeKind::Randn { .. }
+                | NodeKind::Arange { .. }
+                | NodeKind::Eye { .. } => {}
+                NodeKind::Eq { .. }
+                | NodeKind::Gt { .. }
+                | NodeKind::Lt { .. }
+                | NodeKind::Ge { .. }
+                | NodeKind::Le { .. } => {
+                    unreachable!("comparison nodes have u8 dtype and are filtered above")
+                }
+            }
+        }
+        Ok(wrt
+            .iter()
+            .map(|target| match cotangents.get(&target.id) {
+                Some(g) => g.clone(),
+                None => zeros_like(target).expect("zeros_like"),
+            })
+            .collect())
+    }
+}
+
+#[napi]
+pub fn grad(loss: &LazyTensor, wrt: Vec<&LazyTensor>) -> Result<Vec<LazyTensor>> {
+    let targets: Vec<Arc<Node>> = wrt.iter().map(|t| t.node.clone()).collect();
+    let grads = autodiff::grad(&loss.node, &targets)
+        .map_err(|message| Error::new(Status::GenericFailure, message))?;
+    Ok(grads.into_iter().map(|node| LazyTensor { node }).collect())
 }
 
 #[napi]
@@ -1124,19 +1772,14 @@ pub fn is_device_available(device: String) -> bool {
     get_device(Some(device)).is_ok()
 }
 
-#[napi]
-pub async fn eval_lazy(
-    tensor: &LazyTensor,
+async fn run_compute<T: Send + 'static>(
     token: Option<&CancellationToken>,
-) -> Result<NativeTensor> {
-    let node = tensor.node.clone();
+    compute: impl FnOnce(&AtomicBool) -> Result<T> + Send + 'static,
+) -> Result<T> {
     let flag = token.map(|t| t.cancelled.clone());
-    let compute = tokio::task::spawn_blocking(move || {
+    let handle = tokio::task::spawn_blocking(move || {
         let cancelled = flag.unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
-        let mut cache = std::collections::HashMap::new();
-        let output = eval_node(&node, &cancelled, &mut cache).map_err(to_napi_err)?;
-        output.device().synchronize().map_err(to_napi_err)?;
-        Ok(NativeTensor::wrap(output))
+        compute(&cancelled)
     });
     match token {
         Some(token) => {
@@ -1148,13 +1791,47 @@ pub async fn eval_lazy(
             }
             let notify = token.notify.clone();
             tokio::select! {
-                result = compute => result.map_err(to_join_err)?,
+                result = handle => result.map_err(to_join_err)?,
                 _ = notify.notified() => Err(Error::new(
                     Status::Cancelled,
                     "operation aborted".to_string(),
                 )),
             }
         }
-        None => compute.await.map_err(to_join_err)?,
+        None => handle.await.map_err(to_join_err)?,
     }
+}
+
+#[napi]
+pub async fn eval_lazy(
+    tensor: &LazyTensor,
+    token: Option<&CancellationToken>,
+) -> Result<NativeTensor> {
+    let node = tensor.node.clone();
+    run_compute(token, move |cancelled| {
+        let mut cache = Cache::new();
+        let output = eval_node(&node, cancelled, &mut cache).map_err(to_napi_err)?;
+        output.device().synchronize().map_err(to_napi_err)?;
+        Ok(NativeTensor::wrap(output))
+    })
+    .await
+}
+
+#[napi]
+pub async fn eval_lazy_all(
+    tensors: Vec<&LazyTensor>,
+    token: Option<&CancellationToken>,
+) -> Result<Vec<NativeTensor>> {
+    let nodes: Vec<Arc<Node>> = tensors.iter().map(|t| t.node.clone()).collect();
+    run_compute(token, move |cancelled| {
+        let mut cache = Cache::new();
+        let mut outputs = Vec::with_capacity(nodes.len());
+        for node in &nodes {
+            let output = eval_node(node, cancelled, &mut cache).map_err(to_napi_err)?;
+            output.device().synchronize().map_err(to_napi_err)?;
+            outputs.push(NativeTensor::wrap(output));
+        }
+        Ok(outputs)
+    })
+    .await
 }

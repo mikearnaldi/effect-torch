@@ -4,3 +4,4 @@ target/
 *.node
 .direnv/
 Cargo.lock
+docs/

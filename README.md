@@ -165,7 +165,33 @@ dimensions; negative dims count from the end.
 | Export | Description |
 | --- | --- |
 | `evaluate(t)` | `Effect<Tensor, TensorError>` — runs the graph, interruptible |
+| `evaluateAll(roots)` | `Effect<Tensor[], TensorError>` — one shared graph walk: shared subgraphs computed once, single `randn` draw across roots |
 | `toTypedArray(t)` | `Effect<TypedArray, TensorError>` — evaluate + zero-copy readback where possible |
+
+### `Tensor` — autodiff
+
+Reverse-mode automatic differentiation: `grad` operates directly
+on the lazy graph — there is no tracing and no function transformation. The
+backward transform runs natively in Rust; adjoints are ordinary lazy nodes,
+so gradients can be differentiated again.
+
+| Export | Description |
+| --- | --- |
+| `grad(loss, wrt)` | gradients of a scalar `loss` w.r.t. the given tensors; tensors not influencing the loss get zeros |
+| `stopGradient(t)` | blocks gradient flow through `t` |
+| `GradError` | typed error: non-scalar output, non-float dtype, or non-differentiable op |
+
+```ts
+const step = Effect.gen(function* () {
+  const pred = yield* Tensor.add(yield* Tensor.matmul(x, w), b)
+  const err = yield* Tensor.sub(pred, y)
+  const loss = yield* Tensor.mean(yield* Tensor.mul(err, err))
+  const [gw, gb] = yield* Tensor.grad(loss, [w, b])
+  // loss and grads share the forward graph: evaluate them in one walk
+  const [l, gW, gB] = yield* Tensor.evaluateAll([loss, gw, gb])
+  // ...optimizer step...
+})
+```
 
 Errors are typed: every operation fails with `TensorError` (shape, dtype, or
 device mismatch at graph-build time; backend errors at evaluation time).

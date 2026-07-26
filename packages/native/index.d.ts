@@ -43,6 +43,7 @@ export declare class LazyTensor {
   slice(ranges: Array<Array<number>>): LazyTensor
   concat(other: LazyTensor, dim: number): LazyTensor
   broadcastTo(shape: Array<number>): LazyTensor
+  stopGradient(): LazyTensor
 }
 
 export declare class NativeTensor {
@@ -53,6 +54,10 @@ export declare class NativeTensor {
 }
 
 export declare function evalLazy(tensor: LazyTensor, token?: CancellationToken | undefined | null): Promise<NativeTensor>
+
+export declare function evalLazyAll(tensors: Array<LazyTensor>, token?: CancellationToken | undefined | null): Promise<Array<NativeTensor>>
+
+export declare function grad(loss: LazyTensor, wrt: Array<LazyTensor>): Array<LazyTensor>
 
 export declare function isDeviceAvailable(device: string): boolean
 

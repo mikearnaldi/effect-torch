@@ -8,9 +8,7 @@ import native, {
 } from "@effect-torch/native"
 import { CurrentDevice, type DeviceKind } from "./Device.js"
 
-export type { DeviceKind } from "./Device.js"
-
-const { CancellationToken, evalLazy, LazyTensor: NativeLazyTensor } = native
+const { CancellationToken, evalLazy, evalLazyAll, LazyTensor: NativeLazyTensor } = native
 
 /**
  * Element data types supported by the native backend.
@@ -997,6 +995,98 @@ export const cast: {
   })
 )
 
+/**
+ * Error raised by {@link grad} when the graph violates the autodiff
+ * contract.
+ *
+ * @since 0.1.0
+ * @category errors
+ */
+export class GradError extends Data.TaggedError("GradError")<{
+  readonly reason: "non-scalar-output" | "non-float-dtype" | "not-differentiable"
+  readonly detail: string
+}> {}
+
+const isFloatDtype = (dtype: string): boolean => dtype === "f32" || dtype === "f64"
+
+const toGradError = (error: unknown): GradError => {
+  const detail = error instanceof Error ? error.message : String(error)
+  return new GradError({
+    // the scalar and float-dtype contracts are validated above, so a native
+    // error here means the graph contains a non-differentiable construct
+    reason: "not-differentiable",
+    detail
+  })
+}
+
+/**
+ * Computes the gradients of a scalar loss with respect to the given tensors.
+ * The loss is an ordinary lazy graph value — there is no tracing and no
+ * function transformation, the backward transform runs natively on the
+ * graph itself: one walk, with adjoints expressed in the same node
+ * vocabulary as the forward pass, so higher-order derivatives work by
+ * applying `grad` again.
+ *
+ * Gradients are lazy tensors sharing the forward graph; a `wrt` tensor that
+ * does not influence the loss yields a zero gradient. Because the loss and
+ * its gradients share the forward graph, evaluate them together with
+ * {@link evaluateAll}: evaluating them separately recomputes the forward
+ * pass and, if the graph contains `randn`, produces values from different
+ * random draws.
+ *
+ * @since 0.1.0
+ * @category autodiff
+ */
+export const grad = (
+  loss: GenericTensor,
+  wrt: ReadonlyArray<GenericTensor>
+): Effect.Effect<Array<LazyTensor>, GradError> =>
+  Effect.gen(function* () {
+    if (loss.shape.length !== 0) {
+      return yield* new GradError({
+        reason: "non-scalar-output",
+        detail: `grad: expected a scalar (0-d) loss, got shape [${loss.shape}], reduce it first (e.g. with sum or mean)`
+      })
+    }
+    if (!isFloatDtype(loss.dtype)) {
+      return yield* new GradError({
+        reason: "non-float-dtype",
+        detail: `grad: loss dtype must be f32 or f64, got ${loss.dtype}`
+      })
+    }
+    for (const target of wrt) {
+      if (!isFloatDtype(target.dtype)) {
+        return yield* new GradError({
+          reason: "non-float-dtype",
+          detail: `grad: cannot differentiate with respect to ${target.dtype} tensor, only f32 and f64 are differentiable`
+        })
+      }
+    }
+    const grads = yield* Effect.try({
+      try: () => native.grad(loss.lazy, wrt.map((target) => target.lazy)),
+      catch: toGradError
+    })
+    return grads.map((handle, i) => makeLazy(handle, wrt[i].shape, wrt[i].dtype, wrt[i].device))
+  })
+
+/**
+ * Stops gradient flow: the returned tensor has the same value as the input,
+ * but the backward walk does not continue past it, so ancestors of the input
+ * receive no gradient through this path.
+ *
+ * @since 0.1.0
+ * @category autodiff
+ */
+export const stopGradient = (self: GenericTensor): Effect.Effect<LazyTensor, TensorError> =>
+  Effect.try({
+    try: () => makeLazy(self.lazy.stopGradient(), self.shape, self.dtype, self.device),
+    catch: (error) =>
+      new TensorError({
+        op: "stopGradient",
+        message: error instanceof Error ? error.message : String(error)
+      })
+  })
+
 type CancellationTokenType = InstanceType<typeof CancellationToken>
 
 const isCancelled = (token: CancellationTokenType, error: unknown): boolean =>
@@ -1039,6 +1129,24 @@ export const evaluate = (self: GenericTensor): Effect.Effect<Tensor, TensorError
         fromNative("evaluate", (token) => evalLazy(self.lazy, token)),
         fromHandle
       )
+
+/**
+ * Evaluates several lazy tensors in a single graph walk, sharing one
+ * deduplication cache: subgraphs shared between the roots are computed only
+ * once, and `randn` nodes produce a single set of draws across all roots.
+ * This matters for gradients: the loss and its gradients share the forward
+ * graph, so they must be evaluated together to be consistent.
+ *
+ * @since 0.1.0
+ * @category destructors
+ */
+export const evaluateAll = (
+  roots: ReadonlyArray<GenericTensor>
+): Effect.Effect<Array<Tensor>, TensorError> =>
+  Effect.map(
+    fromNative("evaluateAll", (token) => evalLazyAll(roots.map((root) => root.lazy), token)),
+    (handles) => handles.map(fromHandle)
+  )
 
 const typedArrayConstructor = (dtype: DType) => {
   switch (dtype) {
