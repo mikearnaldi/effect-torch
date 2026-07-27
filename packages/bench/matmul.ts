@@ -37,8 +37,10 @@ const chain = (
 const suite: Effect.Effect<void, Tensor.TensorError, Device.CurrentDevice> =
   Effect.gen(function* () {
     const device = yield* Device.CurrentDevice
-    const a = yield* Effect.flatMap(Tensor.randn([N, N]), Tensor.evaluate)
-    const b = yield* Effect.flatMap(Tensor.randn([N, N]), Tensor.evaluate)
+    const [a, b] = yield* Effect.flatMap(
+      Effect.zip(Tensor.randn([N, N]), Tensor.randn([N, N])),
+      ([ra, rb]) => Tensor.evaluate([ra, rb])
+    )
     yield* bench(`effect-torch ${device}`, Effect.flatMap(chain(a, b, BATCH), Tensor.toTypedArray), BATCH)
   })
 

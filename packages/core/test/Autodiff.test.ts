@@ -195,14 +195,14 @@ layer(Device.Cpu)("Autodiff", (it) => {
     )
   })
 
-  describe("grad + evaluateAll", () => {
+  describe("grad + evaluate", () => {
     it.effect("loss and gradients come from the same randn draw", () =>
       Effect.gen(function* () {
         const x = yield* f64([1, 2, 3])
         const r = yield* Tensor.randn([3], { dtype: "f64" })
         const loss = yield* Tensor.sum(yield* Tensor.mul(x, r))
         const [gx] = yield* Tensor.grad(loss, [x])
-        const [l, g] = yield* Tensor.evaluateAll([loss, gx])
+        const [l, g] = yield* Tensor.evaluate([loss, gx])
         const lv = yield* scalar(l)
         const gv = yield* values(g)
         const reconstructed = gv[0] * 1 + gv[1] * 2 + gv[2] * 3
@@ -230,7 +230,7 @@ layer(Device.Cpu)("Autodiff", (it) => {
           const err = yield* Tensor.sub(pred, y)
           const loss = yield* Tensor.mean(yield* Tensor.mul(err, err))
           const [gw, gb] = yield* Tensor.grad(loss, [w, b])
-          const [lt, gwt, gbt] = yield* Tensor.evaluateAll([loss, gw, gb])
+          const [lt, gwt, gbt] = yield* Tensor.evaluate([loss, gw, gb])
           const l = yield* scalar(lt)
           const gwv = yield* values(gwt)
           const gbv = yield* values(gbt)

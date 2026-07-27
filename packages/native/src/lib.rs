@@ -1804,21 +1804,6 @@ async fn run_compute<T: Send + 'static>(
 
 #[napi]
 pub async fn eval_lazy(
-    tensor: &LazyTensor,
-    token: Option<&CancellationToken>,
-) -> Result<NativeTensor> {
-    let node = tensor.node.clone();
-    run_compute(token, move |cancelled| {
-        let mut cache = Cache::new();
-        let output = eval_node(&node, cancelled, &mut cache).map_err(to_napi_err)?;
-        output.device().synchronize().map_err(to_napi_err)?;
-        Ok(NativeTensor::wrap(output))
-    })
-    .await
-}
-
-#[napi]
-pub async fn eval_lazy_all(
     tensors: Vec<&LazyTensor>,
     token: Option<&CancellationToken>,
 ) -> Result<Vec<NativeTensor>> {

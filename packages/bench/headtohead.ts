@@ -33,8 +33,10 @@ const timed = <E>(effect: Effect.Effect<unknown, E>): Effect.Effect<number, E> =
 const median = (values: ReadonlyArray<number>): number => [...values].sort((x, y) => x - y)[Math.floor(values.length / 2)]
 
 const program = Effect.gen(function* () {
-  const am = yield* Effect.flatMap(Tensor.randn([N, N]), Tensor.evaluate)
-  const bm = yield* Effect.flatMap(Tensor.randn([N, N]), Tensor.evaluate)
+  const [am, bm] = yield* Effect.flatMap(
+    Effect.zip(Tensor.randn([N, N]), Tensor.randn([N, N])),
+    ([ra, rb]) => Tensor.evaluate([ra, rb])
+  )
 
   const xa = yield* Effect.sync(() => mx.random.normal([N, N]))
   const xb = yield* Effect.sync(() => mx.random.normal([N, N]))

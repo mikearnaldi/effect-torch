@@ -53,9 +53,7 @@ export declare class NativeTensor {
   readback(token?: CancellationToken | undefined | null): Promise<ArrayBuffer>
 }
 
-export declare function evalLazy(tensor: LazyTensor, token?: CancellationToken | undefined | null): Promise<NativeTensor>
-
-export declare function evalLazyAll(tensors: Array<LazyTensor>, token?: CancellationToken | undefined | null): Promise<Array<NativeTensor>>
+export declare function evalLazy(tensors: Array<LazyTensor>, token?: CancellationToken | undefined | null): Promise<Array<NativeTensor>>
 
 export declare function grad(loss: LazyTensor, wrt: Array<LazyTensor>): Array<LazyTensor>
 

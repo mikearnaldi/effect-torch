@@ -8,7 +8,7 @@ import native, {
 } from "@effect-torch/native"
 import { CurrentDevice, type DeviceKind } from "./Device.js"
 
-const { CancellationToken, evalLazy, evalLazyAll, LazyTensor: NativeLazyTensor } = native
+const { CancellationToken, evalLazy, LazyTensor: NativeLazyTensor } = native
 
 /**
  * Element data types supported by the native backend.
@@ -1030,7 +1030,7 @@ const toGradError = (error: unknown): GradError => {
  * Gradients are lazy tensors sharing the forward graph; a `wrt` tensor that
  * does not influence the loss yields a zero gradient. Because the loss and
  * its gradients share the forward graph, evaluate them together with
- * {@link evaluateAll}: evaluating them separately recomputes the forward
+ * {@link evaluate}: evaluating them separately recomputes the forward
  * pass and, if the graph contains `randn`, produces values from different
  * random draws.
  *
@@ -1114,39 +1114,28 @@ const fromNative = <A>(
   })
 
 /**
- * Evaluates a lazy tensor, running the whole computation graph on the device
- * and returning a materialized {@link Tensor}. The computation runs off the
- * JavaScript thread and can be interrupted: interrupting the fiber aborts the
- * native evaluation. Already materialized tensors are returned as-is.
+ * Evaluates one or more lazy tensors in a single graph walk, running the
+ * computation off the JavaScript thread, and returns the materialized
+ * tensors in the same order. All roots share one deduplication cache:
+ * subgraphs shared between the roots are computed only once, and `randn`
+ * nodes produce a single set of draws across all roots. This matters for
+ * gradients: the loss and its gradients share the forward graph, so they
+ * must be evaluated together to be consistent. Interrupting the fiber
+ * aborts the native evaluation. Already materialized roots are returned
+ * as-is.
  *
  * @since 0.1.0
  * @category destructors
  */
-export const evaluate = (self: GenericTensor): Effect.Effect<Tensor, TensorError> =>
-  isTensor(self)
-    ? Effect.succeed(self)
-    : Effect.map(
-        fromNative("evaluate", (token) => evalLazy(self.lazy, token)),
-        fromHandle
-      )
-
-/**
- * Evaluates several lazy tensors in a single graph walk, sharing one
- * deduplication cache: subgraphs shared between the roots are computed only
- * once, and `randn` nodes produce a single set of draws across all roots.
- * This matters for gradients: the loss and its gradients share the forward
- * graph, so they must be evaluated together to be consistent.
- *
- * @since 0.1.0
- * @category destructors
- */
-export const evaluateAll = (
+export const evaluate = (
   roots: ReadonlyArray<GenericTensor>
 ): Effect.Effect<Array<Tensor>, TensorError> =>
-  Effect.map(
-    fromNative("evaluateAll", (token) => evalLazyAll(roots.map((root) => root.lazy), token)),
-    (handles) => handles.map(fromHandle)
-  )
+  roots.every(isTensor)
+    ? Effect.succeed(roots as Array<Tensor>)
+    : Effect.map(
+        fromNative("evaluate", (token) => evalLazy(roots.map((root) => root.lazy), token)),
+        (handles) => handles.map(fromHandle)
+      )
 
 const typedArrayConstructor = (dtype: DType) => {
   switch (dtype) {
@@ -1172,7 +1161,7 @@ const typedArrayConstructor = (dtype: DType) => {
  * @category destructors
  */
 export const toTypedArray = (self: GenericTensor): Effect.Effect<TypedArray, TensorError> =>
-  Effect.flatMap(evaluate(self), (evaluated) =>
+  Effect.flatMap(evaluate([self]), ([evaluated]) =>
     fromNative<TypedArray>("toTypedArray", (token) =>
       evaluated.materialized.readback(token).then((buffer) => {
         const Ctor = typedArrayConstructor(evaluated.dtype)

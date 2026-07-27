@@ -164,8 +164,7 @@ dimensions; negative dims count from the end.
 
 | Export | Description |
 | --- | --- |
-| `evaluate(t)` | `Effect<Tensor, TensorError>` — runs the graph, interruptible |
-| `evaluateAll(roots)` | `Effect<Tensor[], TensorError>` — one shared graph walk: shared subgraphs computed once, single `randn` draw across roots |
+| `evaluate([t1, t2, ...])` | `Effect<Tensor[], TensorError>` — runs the graph in one shared walk: shared subgraphs computed once, single `randn` draw across roots; interruptible |
 | `toTypedArray(t)` | `Effect<TypedArray, TensorError>` — evaluate + zero-copy readback where possible |
 
 ### `Tensor` — autodiff
@@ -188,7 +187,7 @@ const step = Effect.gen(function* () {
   const loss = yield* Tensor.mean(yield* Tensor.mul(err, err))
   const [gw, gb] = yield* Tensor.grad(loss, [w, b])
   // loss and grads share the forward graph: evaluate them in one walk
-  const [l, gW, gB] = yield* Tensor.evaluateAll([loss, gw, gb])
+  const [l, gW, gB] = yield* Tensor.evaluate([loss, gw, gb])
   // ...optimizer step...
 })
 ```
