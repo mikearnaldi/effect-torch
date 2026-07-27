@@ -192,6 +192,43 @@ const step = Effect.gen(function* () {
 })
 ```
 
+### `Optimizer`
+
+Optimizers are pure graph transforms: `step` takes parameters, gradients,
+and state and returns updated parameters and state as lazy values — nothing
+is mutated or materialized inside. The convenience `Optimizer.step` runs a
+full training step (gradients + update + evaluation) in a **single graph
+walk**: one forward pass, one backward pass, one async boundary, and
+gradient tensors are freed as soon as their update consumes them. Formulas
+match PyTorch/candle exactly.
+
+| Export | Description |
+| --- | --- |
+| `sgd({ lr, momentum?, dampening?, nesterov?, weightDecay? })` | SGD with optional momentum and coupled L2 decay |
+| `adam({ lr?, beta1?, beta2?, eps? })` | Adam, standard defaults (`1e-3`, `0.9`, `0.999`, `1e-8`) |
+| `adamW({ ..., weightDecay? })` | Adam with decoupled weight decay (default `0.01`) |
+| `step(optimizer, loss, params, state)` | `Effect<{ loss, params, state }>` — full step in one walk |
+| `optimizer.init(params)` | zero-initialized state, validates float dtypes |
+| `optimizer.step(params, grads, state)` | the raw graph transform, for custom loops |
+
+```ts
+const optimizer = Optimizer.adam({ lr: 0.1 })
+
+const trained = Effect.gen(function* () {
+  let params = [w, b]
+  let state = yield* optimizer.init(params)
+  for (let i = 0; i < steps; i++) {
+    const pred = yield* Tensor.add(yield* Tensor.matmul(x, params[0]), params[1])
+    const err = yield* Tensor.sub(pred, y)
+    const loss = yield* Tensor.mean(yield* Tensor.mul(err, err))
+    const result = yield* Optimizer.step(optimizer, loss, params, state)
+    params = result.params // materialized leaves of the next step's graph
+    state = result.state
+  }
+  return params
+})
+```
+
 Errors are typed: every operation fails with `TensorError` (shape, dtype, or
 device mismatch at graph-build time; backend errors at evaluation time).
 Interruption is structured: interrupting the fiber running `evaluate` or
