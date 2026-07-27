@@ -403,6 +403,13 @@ enum NodeKind {
         dtype: DType,
         device: Device,
     },
+    Uniform {
+        lo: f64,
+        hi: f64,
+        shape: Vec<usize>,
+        dtype: DType,
+        device: Device,
+    },
     Arange {
         start: f64,
         end: f64,
@@ -451,6 +458,14 @@ enum NodeKind {
         a: Arc<Node>,
         b: Arc<Node>,
     },
+    Maximum {
+        a: Arc<Node>,
+        b: Arc<Node>,
+    },
+    Minimum {
+        a: Arc<Node>,
+        b: Arc<Node>,
+    },
     Neg {
         a: Arc<Node>,
     },
@@ -474,6 +489,29 @@ enum NodeKind {
     },
     Tanh {
         a: Arc<Node>,
+    },
+    Relu {
+        a: Arc<Node>,
+    },
+    Erf {
+        a: Arc<Node>,
+    },
+    Floor {
+        a: Arc<Node>,
+    },
+    Ceil {
+        a: Arc<Node>,
+    },
+    Round {
+        a: Arc<Node>,
+    },
+    Sign {
+        a: Arc<Node>,
+    },
+    Where {
+        cond: Arc<Node>,
+        a: Arc<Node>,
+        b: Arc<Node>,
     },
     Pow {
         a: Arc<Node>,
@@ -502,6 +540,23 @@ enum NodeKind {
         a: Arc<Node>,
         dims: Vec<usize>,
         keepdims: bool,
+    },
+    Argmax {
+        a: Arc<Node>,
+        dim: usize,
+    },
+    Argmin {
+        a: Arc<Node>,
+        dim: usize,
+    },
+    Cumsum {
+        a: Arc<Node>,
+        dim: usize,
+    },
+    IndexSelect {
+        a: Arc<Node>,
+        dim: usize,
+        indexes: Arc<Node>,
     },
     Reshape {
         a: Arc<Node>,
@@ -598,11 +653,26 @@ impl Node {
                 dtype,
                 device,
             }
-            | NodeKind::Randn {
+            |             NodeKind::Randn {
                 shape,
                 dtype,
                 device,
             } => (shape.clone(), *dtype, device.clone()),
+            NodeKind::Uniform {
+                lo,
+                hi,
+                shape,
+                dtype,
+                device,
+            } => {
+                if !dtype.is_float() {
+                    return Err(format!("uniform: dtype must be floating point, got {dtype:?}"));
+                }
+                if hi <= lo {
+                    return Err(format!("uniform: expected lo < hi, got lo={lo} hi={hi}"));
+                }
+                (shape.clone(), *dtype, device.clone())
+            }
             NodeKind::Full {
                 shape,
                 dtype,
@@ -623,7 +693,9 @@ impl Node {
             NodeKind::Add { a, b }
             | NodeKind::Sub { a, b }
             | NodeKind::Mul { a, b }
-            | NodeKind::Div { a, b } => (
+            | NodeKind::Div { a, b }
+            | NodeKind::Maximum { a, b }
+            | NodeKind::Minimum { a, b } => (
                 broadcast_shapes(&a.shape, &b.shape)?,
                 a.dtype,
                 a.device.clone(),
@@ -645,8 +717,71 @@ impl Node {
             | NodeKind::Sin { a }
             | NodeKind::Cos { a }
             | NodeKind::Tanh { a }
+            | NodeKind::Relu { a }
+            | NodeKind::Erf { a }
+            | NodeKind::Floor { a }
+            | NodeKind::Ceil { a }
+            | NodeKind::Round { a }
+            | NodeKind::Sign { a }
             | NodeKind::StopGradient { a } => (a.shape.clone(), a.dtype, a.device.clone()),
             NodeKind::Pow { a, .. } => (a.shape.clone(), a.dtype, a.device.clone()),
+            NodeKind::Where { cond, a, b } => {
+                if cond.dtype != DType::U8 {
+                    return Err(format!("where: condition must be u8, got {:?}", cond.dtype));
+                }
+                if a.dtype != b.dtype {
+                    return Err(format!(
+                        "where: dtype mismatch, got {:?} and {:?}",
+                        a.dtype, b.dtype
+                    ));
+                }
+                let shape = broadcast_shapes(&cond.shape, &a.shape)?;
+                let shape = broadcast_shapes(&shape, &b.shape)?;
+                (shape, a.dtype, a.device.clone())
+            }
+            NodeKind::Argmax { a, dim } | NodeKind::Argmin { a, dim } => {
+                if a.shape.is_empty() || *dim >= a.shape.len() {
+                    return Err(format!(
+                        "argmax/argmin: dim {dim} out of range for rank {}",
+                        a.shape.len()
+                    ));
+                }
+                let mut shape = a.shape.clone();
+                shape.remove(*dim);
+                (shape, DType::I64, a.device.clone())
+            }
+            NodeKind::Cumsum { a, dim } => {
+                if a.shape.is_empty() || *dim >= a.shape.len() {
+                    return Err(format!(
+                        "cumsum: dim {dim} out of range for rank {}",
+                        a.shape.len()
+                    ));
+                }
+                (a.shape.clone(), a.dtype, a.device.clone())
+            }
+            NodeKind::IndexSelect { a, dim, indexes } => {
+                if a.shape.is_empty() || *dim >= a.shape.len() {
+                    return Err(format!(
+                        "index_select: dim {dim} out of range for rank {}",
+                        a.shape.len()
+                    ));
+                }
+                if indexes.dtype != DType::I64 {
+                    return Err(format!(
+                        "index_select: indexes must be i64, got {:?}",
+                        indexes.dtype
+                    ));
+                }
+                if indexes.shape.len() != 1 {
+                    return Err(format!(
+                        "index_select: indexes must be 1-D, got shape {:?}",
+                        indexes.shape
+                    ));
+                }
+                let mut shape = a.shape.clone();
+                shape[*dim] = indexes.shape[0];
+                (shape, a.dtype, a.device.clone())
+            }
             NodeKind::Cast { a, dtype } => (a.shape.clone(), *dtype, a.device.clone()),
             NodeKind::Sum { a, dims, keepdims }
             | NodeKind::Mean { a, dims, keepdims }
@@ -853,6 +988,23 @@ impl LazyTensor {
     }
 
     #[napi(factory)]
+    pub fn uniform(
+        shape: Vec<u32>,
+        lo: f64,
+        hi: f64,
+        dtype: Option<NativeDType>,
+        device: Option<String>,
+    ) -> Result<Self> {
+        lazy_ctor!(Node::new(NodeKind::Uniform {
+            lo,
+            hi,
+            shape: shape.iter().map(|&d| d as usize).collect(),
+            dtype: dtype.unwrap_or(NativeDType::F32).into(),
+            device: get_device(device)?,
+        }))
+    }
+
+    #[napi(factory)]
     pub fn arange(
         start: f64,
         end: f64,
@@ -931,6 +1083,22 @@ impl LazyTensor {
     #[napi]
     pub fn div(&self, other: &LazyTensor) -> Result<Self> {
         lazy_ctor!(Node::new(NodeKind::Div {
+            a: self.node.clone(),
+            b: other.node.clone(),
+        }))
+    }
+
+    #[napi]
+    pub fn maximum(&self, other: &LazyTensor) -> Result<Self> {
+        lazy_ctor!(Node::new(NodeKind::Maximum {
+            a: self.node.clone(),
+            b: other.node.clone(),
+        }))
+    }
+
+    #[napi]
+    pub fn minimum(&self, other: &LazyTensor) -> Result<Self> {
+        lazy_ctor!(Node::new(NodeKind::Minimum {
             a: self.node.clone(),
             b: other.node.clone(),
         }))
@@ -1016,6 +1184,90 @@ impl LazyTensor {
     pub fn tanh(&self) -> Result<Self> {
         lazy_ctor!(Node::new(NodeKind::Tanh {
             a: self.node.clone(),
+        }))
+    }
+
+    #[napi]
+    pub fn relu(&self) -> Result<Self> {
+        lazy_ctor!(Node::new(NodeKind::Relu {
+            a: self.node.clone(),
+        }))
+    }
+
+    #[napi]
+    pub fn erf(&self) -> Result<Self> {
+        lazy_ctor!(Node::new(NodeKind::Erf {
+            a: self.node.clone(),
+        }))
+    }
+
+    #[napi]
+    pub fn floor(&self) -> Result<Self> {
+        lazy_ctor!(Node::new(NodeKind::Floor {
+            a: self.node.clone(),
+        }))
+    }
+
+    #[napi]
+    pub fn ceil(&self) -> Result<Self> {
+        lazy_ctor!(Node::new(NodeKind::Ceil {
+            a: self.node.clone(),
+        }))
+    }
+
+    #[napi]
+    pub fn round(&self) -> Result<Self> {
+        lazy_ctor!(Node::new(NodeKind::Round {
+            a: self.node.clone(),
+        }))
+    }
+
+    #[napi]
+    pub fn sign(&self) -> Result<Self> {
+        lazy_ctor!(Node::new(NodeKind::Sign {
+            a: self.node.clone(),
+        }))
+    }
+
+    #[napi]
+    pub fn where_cond(&self, a: &LazyTensor, b: &LazyTensor) -> Result<Self> {
+        lazy_ctor!(Node::new(NodeKind::Where {
+            cond: self.node.clone(),
+            a: a.node.clone(),
+            b: b.node.clone(),
+        }))
+    }
+
+    #[napi]
+    pub fn argmax(&self, dim: u32) -> Result<Self> {
+        lazy_ctor!(Node::new(NodeKind::Argmax {
+            a: self.node.clone(),
+            dim: dim as usize,
+        }))
+    }
+
+    #[napi]
+    pub fn argmin(&self, dim: u32) -> Result<Self> {
+        lazy_ctor!(Node::new(NodeKind::Argmin {
+            a: self.node.clone(),
+            dim: dim as usize,
+        }))
+    }
+
+    #[napi]
+    pub fn cumsum(&self, dim: u32) -> Result<Self> {
+        lazy_ctor!(Node::new(NodeKind::Cumsum {
+            a: self.node.clone(),
+            dim: dim as usize,
+        }))
+    }
+
+    #[napi]
+    pub fn index_select(&self, dim: u32, indexes: &LazyTensor) -> Result<Self> {
+        lazy_ctor!(Node::new(NodeKind::IndexSelect {
+            a: self.node.clone(),
+            dim: dim as usize,
+            indexes: indexes.node.clone(),
         }))
     }
 
@@ -1209,6 +1461,7 @@ fn node_children(kind: &NodeKind) -> Vec<Arc<Node>> {
         | NodeKind::Ones { .. }
         | NodeKind::Full { .. }
         | NodeKind::Randn { .. }
+        | NodeKind::Uniform { .. }
         | NodeKind::Arange { .. }
         | NodeKind::Eye { .. } => vec![],
         NodeKind::Add { a, b }
@@ -1220,6 +1473,8 @@ fn node_children(kind: &NodeKind) -> Vec<Arc<Node>> {
         | NodeKind::Lt { a, b }
         | NodeKind::Ge { a, b }
         | NodeKind::Le { a, b }
+        | NodeKind::Maximum { a, b }
+        | NodeKind::Minimum { a, b }
         | NodeKind::Concat { a, b, .. }
         | NodeKind::Matmul { a, b } => vec![a.clone(), b.clone()],
         NodeKind::Neg { a }
@@ -1230,6 +1485,15 @@ fn node_children(kind: &NodeKind) -> Vec<Arc<Node>> {
         | NodeKind::Sin { a }
         | NodeKind::Cos { a }
         | NodeKind::Tanh { a }
+        | NodeKind::Relu { a }
+        | NodeKind::Erf { a }
+        | NodeKind::Floor { a }
+        | NodeKind::Ceil { a }
+        | NodeKind::Round { a }
+        | NodeKind::Sign { a }
+        | NodeKind::Argmax { a, .. }
+        | NodeKind::Argmin { a, .. }
+        | NodeKind::Cumsum { a, .. }
         | NodeKind::Pow { a, .. }
         | NodeKind::Cast { a, .. }
         | NodeKind::Sum { a, .. }
@@ -1241,10 +1505,12 @@ fn node_children(kind: &NodeKind) -> Vec<Arc<Node>> {
         | NodeKind::Slice { a, .. }
         | NodeKind::BroadcastTo { a, .. }
         | NodeKind::StopGradient { a } => vec![a.clone()],
+        NodeKind::Where { cond, a, b } => vec![cond.clone(), a.clone(), b.clone()],
+        NodeKind::IndexSelect { a, indexes, .. } => vec![a.clone(), indexes.clone()],
     }
 }
 
-fn eval_cmp(
+fn eval_broadcast_binary(
     a: &Arc<Node>,
     b: &Arc<Node>,
     ev: &Evaluator,
@@ -1389,6 +1655,13 @@ fn eval_uncached(node: &Arc<Node>, ev: &Evaluator) -> candle_core::Result<Tensor
             dtype,
             device,
         } => Tensor::randn(0f32, 1f32, shape.clone(), device)?.to_dtype(*dtype)?,
+        NodeKind::Uniform {
+            lo,
+            hi,
+            shape,
+            dtype,
+            device,
+        } => Tensor::rand(*lo, *hi, shape.clone(), device)?.to_dtype(*dtype)?,
         NodeKind::Arange {
             start,
             end,
@@ -1426,11 +1699,13 @@ fn eval_uncached(node: &Arc<Node>, ev: &Evaluator) -> candle_core::Result<Tensor
             let b = ev.value(b.id)?;
             a.broadcast_div(&b)?
         }
-        NodeKind::Eq { a, b } => eval_cmp(a, b, ev, |a, b| a.eq(b))?,
-        NodeKind::Gt { a, b } => eval_cmp(a, b, ev, |a, b| a.gt(b))?,
-        NodeKind::Lt { a, b } => eval_cmp(a, b, ev, |a, b| a.lt(b))?,
-        NodeKind::Ge { a, b } => eval_cmp(a, b, ev, |a, b| a.ge(b))?,
-        NodeKind::Le { a, b } => eval_cmp(a, b, ev, |a, b| a.le(b))?,
+        NodeKind::Eq { a, b } => eval_broadcast_binary(a, b, ev, |a, b| a.eq(b))?,
+        NodeKind::Gt { a, b } => eval_broadcast_binary(a, b, ev, |a, b| a.gt(b))?,
+        NodeKind::Lt { a, b } => eval_broadcast_binary(a, b, ev, |a, b| a.lt(b))?,
+        NodeKind::Ge { a, b } => eval_broadcast_binary(a, b, ev, |a, b| a.ge(b))?,
+        NodeKind::Le { a, b } => eval_broadcast_binary(a, b, ev, |a, b| a.le(b))?,
+        NodeKind::Maximum { a, b } => eval_broadcast_binary(a, b, ev, |a, b| a.maximum(b))?,
+        NodeKind::Minimum { a, b } => eval_broadcast_binary(a, b, ev, |a, b| a.minimum(b))?,
         NodeKind::Neg { a } => ev.value(a.id)?.neg()?,
         NodeKind::Abs { a } => ev.value(a.id)?.abs()?,
         NodeKind::Sqrt { a } => ev.value(a.id)?.sqrt()?,
@@ -1439,6 +1714,40 @@ fn eval_uncached(node: &Arc<Node>, ev: &Evaluator) -> candle_core::Result<Tensor
         NodeKind::Sin { a } => ev.value(a.id)?.sin()?,
         NodeKind::Cos { a } => ev.value(a.id)?.cos()?,
         NodeKind::Tanh { a } => ev.value(a.id)?.tanh()?,
+        NodeKind::Relu { a } => {
+            let a = ev.value(a.id)?;
+            a.maximum(&a.zeros_like()?)?
+        }
+        NodeKind::Erf { a } => ev.value(a.id)?.erf()?,
+        NodeKind::Floor { a } => ev.value(a.id)?.floor()?,
+        NodeKind::Ceil { a } => ev.value(a.id)?.ceil()?,
+        NodeKind::Round { a } => ev.value(a.id)?.round()?,
+        NodeKind::Sign { a } => ev.value(a.id)?.sign()?,
+        NodeKind::Where { cond, a, b } => {
+            let cond = ev.value(cond.id)?;
+            let a = ev.value(a.id)?;
+            let b = ev.value(b.id)?;
+            let shape = cond
+                .shape()
+                .broadcast_shape_binary_op(a.shape(), "where")?
+                .broadcast_shape_binary_op(b.shape(), "where")?;
+            let cond = cond.broadcast_as(shape.clone())?;
+            let a = a.broadcast_as(shape.clone())?;
+            let b = b.broadcast_as(shape)?;
+            cond.where_cond(&a, &b)?
+        }
+        NodeKind::Argmax { a, dim } => ev.value(a.id)?.argmax(*dim)?.to_dtype(DType::I64)?,
+        NodeKind::Argmin { a, dim } => ev.value(a.id)?.argmin(*dim)?.to_dtype(DType::I64)?,
+        NodeKind::Cumsum { a, dim } => {
+            // cumsum is implemented as a matmul internally and chokes on
+            // stride-0 broadcast inputs
+            ev.value(a.id)?.contiguous()?.cumsum(*dim)?
+        }
+        NodeKind::IndexSelect { a, dim, indexes } => {
+            let a = ev.value(a.id)?;
+            let indexes = ev.value(indexes.id)?;
+            a.index_select(&indexes, *dim)?
+        }
         NodeKind::Pow { a, exp } => ev.value(a.id)?.powf(*exp)?,
         NodeKind::Cast { a, dtype } => ev.value(a.id)?.to_dtype(*dtype)?,
         NodeKind::Sum { a, dims, keepdims } => {
@@ -1471,7 +1780,7 @@ fn eval_uncached(node: &Arc<Node>, ev: &Evaluator) -> candle_core::Result<Tensor
                 if stride > 1 {
                     let idx: Vec<u32> = (0..len as u32).map(|i| i * stride as u32).collect();
                     let idx = Tensor::from_vec(idx, len, t.device())?;
-                    t = t.index_select(&idx, dim)?;
+                    t = t.contiguous()?.index_select(&idx, dim)?;
                 }
             }
             t
@@ -1537,6 +1846,10 @@ mod autodiff {
 
     fn add(a: Arc<Node>, b: Arc<Node>) -> std::result::Result<Arc<Node>, String> {
         mk(NodeKind::Add { a, b })
+    }
+
+    fn sub(a: Arc<Node>, b: Arc<Node>) -> std::result::Result<Arc<Node>, String> {
+        mk(NodeKind::Sub { a, b })
     }
 
     fn mul(a: Arc<Node>, b: Arc<Node>) -> std::result::Result<Arc<Node>, String> {
@@ -1726,6 +2039,26 @@ mod autodiff {
                 NodeKind::Neg { a } => {
                     accumulate(a, neg(g))?;
                 }
+                NodeKind::Maximum { a, b } | NodeKind::Minimum { a, b } => {
+                    let is_max = matches!(&node.kind, NodeKind::Maximum { .. });
+                    // ties route the gradient to the left operand
+                    let (mask_a, mask_b) = if is_max {
+                        (
+                            mk(NodeKind::Ge { a: a.clone(), b: b.clone() })?,
+                            mk(NodeKind::Lt { a: a.clone(), b: b.clone() })?,
+                        )
+                    } else {
+                        (
+                            mk(NodeKind::Le { a: a.clone(), b: b.clone() })?,
+                            mk(NodeKind::Gt { a: a.clone(), b: b.clone() })?,
+                        )
+                    };
+                    let dtype = node.dtype;
+                    let ga = mul(g.clone(), cast(mask_a, dtype)?)?;
+                    let gb = mul(g, cast(mask_b, dtype)?)?;
+                    accumulate(a, sum_to_shape(&ga, &a.shape))?;
+                    accumulate(b, sum_to_shape(&gb, &b.shape))?;
+                }
                 NodeKind::Abs { a } => {
                     let zero = full(0.0, a.dtype, &a.device)?;
                     let sign = mk(NodeKind::Sub {
@@ -1753,6 +2086,62 @@ mod autodiff {
                 NodeKind::Tanh { a } => {
                     let one = full(1.0, node.dtype, &node.device)?;
                     accumulate(a, mul(g, add(one, neg(mul(node.clone(), node.clone())?)?)?))?;
+                }
+                NodeKind::Relu { a } => {
+                    let zero = full(0.0, a.dtype, &a.device)?;
+                    let mask = cast(mk(NodeKind::Gt { a: a.clone(), b: zero })?, a.dtype)?;
+                    accumulate(a, mul(g, mask))?;
+                }
+                NodeKind::Erf { a } => {
+                    let c = full(2.0 / std::f64::consts::PI.sqrt(), a.dtype, &a.device)?;
+                    let e = mk(NodeKind::Exp {
+                        a: neg(mul(a.clone(), a.clone())?)?,
+                    })?;
+                    accumulate(a, mul(mul(g, c)?, e))?;
+                }
+                // zero almost everywhere; the cotangent is an explicit zero
+                // rather than a drop so higher-order walks stay total
+                NodeKind::Floor { a }
+                | NodeKind::Ceil { a }
+                | NodeKind::Round { a }
+                | NodeKind::Sign { a } => {
+                    accumulate(a, zeros_like(a))?;
+                }
+                NodeKind::Where { cond, a, b } => {
+                    let zero = full(0.0, node.dtype, &node.device)?;
+                    let ga = mk(NodeKind::Where {
+                        cond: cond.clone(),
+                        a: g.clone(),
+                        b: zero.clone(),
+                    })?;
+                    let gb = mk(NodeKind::Where {
+                        cond: cond.clone(),
+                        a: zero,
+                        b: g.clone(),
+                    })?;
+                    accumulate(a, sum_to_shape(&ga, &a.shape))?;
+                    accumulate(b, sum_to_shape(&gb, &b.shape))?;
+                }
+                NodeKind::Cumsum { a, dim } => {
+                    // d out[i] / d x[j] = 1 when i >= j, so the adjoint is the
+                    // reverse cumulative sum: total - cumsum(g) + g
+                    let total = mk(NodeKind::Sum {
+                        a: g.clone(),
+                        dims: vec![*dim],
+                        keepdims: true,
+                    })?;
+                    let total = broadcast_to(total, &a.shape)?;
+                    let cs = mk(NodeKind::Cumsum {
+                        a: g.clone(),
+                        dim: *dim,
+                    })?;
+                    accumulate(a, add(g.clone(), sub(total, cs)?))?;
+                }
+                NodeKind::IndexSelect { .. } => {
+                    return Err(
+                        "grad: index_select is not differentiable (scatter-add not implemented)"
+                            .to_string(),
+                    );
                 }
                 NodeKind::Pow { a, exp } => {
                     let c = full(*exp, a.dtype, &a.device)?;
@@ -1819,12 +2208,48 @@ mod autodiff {
                 NodeKind::Slice { a, ranges } => {
                     let mut cur = g;
                     for (dim, &(start, stop, stride)) in ranges.iter().enumerate() {
-                        if stride != 1 {
-                            return Err(
-                                "grad: slice with stride > 1 is not differentiable".to_string()
-                            );
-                        }
                         let n = a.shape[dim];
+                        if stride != 1 && cur.shape[dim] > 0 {
+                            // dilate the cotangent along the sliced dim by
+                            // interleaving stride-1 zeros, so it lines up with
+                            // the positions the forward pass actually read
+                            let len = cur.shape[dim];
+                            let mut g_shape = cur.shape.clone();
+                            g_shape.insert(dim + 1, 1);
+                            let mut z_shape = cur.shape.clone();
+                            z_shape.insert(dim + 1, stride - 1);
+                            let mut expanded = cur.shape.clone();
+                            expanded[dim] = len * stride;
+                            let g_r = reshape(cur, g_shape)?;
+                            let z = mk(NodeKind::Zeros {
+                                shape: z_shape,
+                                dtype: g_r.dtype,
+                                device: g_r.device.clone(),
+                            })?;
+                            let cat = mk(NodeKind::Concat {
+                                a: g_r,
+                                b: z,
+                                dim: dim + 1,
+                            })?;
+                            let mut wide = reshape(cat, expanded)?;
+                            let keep = (len - 1) * stride + 1;
+                            if keep < len * stride {
+                                let trim: Vec<(usize, usize, usize)> = (0..wide.shape.len())
+                                    .map(|i| {
+                                        if i == dim {
+                                            (0, keep, 1)
+                                        } else {
+                                            (0, wide.shape[i], 1)
+                                        }
+                                    })
+                                    .collect();
+                                wide = mk(NodeKind::Slice {
+                                    a: wide,
+                                    ranges: trim,
+                                })?;
+                            }
+                            cur = wide;
+                        }
                         if start > 0 {
                             let mut zshape = cur.shape.clone();
                             zshape[dim] = start;
@@ -1893,14 +2318,17 @@ mod autodiff {
                 | NodeKind::Ones { .. }
                 | NodeKind::Full { .. }
                 | NodeKind::Randn { .. }
+                | NodeKind::Uniform { .. }
                 | NodeKind::Arange { .. }
                 | NodeKind::Eye { .. } => {}
                 NodeKind::Eq { .. }
                 | NodeKind::Gt { .. }
                 | NodeKind::Lt { .. }
                 | NodeKind::Ge { .. }
-                | NodeKind::Le { .. } => {
-                    unreachable!("comparison nodes have u8 dtype and are filtered above")
+                | NodeKind::Le { .. }
+                | NodeKind::Argmax { .. }
+                | NodeKind::Argmin { .. } => {
+                    unreachable!("non-float nodes are filtered above")
                 }
             }
         }

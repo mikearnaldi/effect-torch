@@ -128,8 +128,10 @@ accept an optional `{ dtype }`.
 | `full(shape, value, options?)` | Tensor filled with a constant |
 | `randn(shape, options?)` | Standard normal samples (float dtypes) |
 | `arange(start, end?, options?)` | Evenly spaced 1-d range, optional `step` |
+| `linspace(start, end, steps, options?)` | Evenly spaced inclusive range, float dtypes |
 | `eye(n, options?)` | Identity matrix |
 | `fromTypedArray(data, shape?)` | From a JS typed array, dtype inferred |
+| `zerosLike` / `onesLike` / `fullLike(t, value)` | Filled tensors matching shape and dtype |
 
 ### `Tensor` — elementwise operations
 
@@ -140,28 +142,75 @@ dtype/device) and broadcast like NumPy. Mixed dtypes or devices fail.
 | Export | Description |
 | --- | --- |
 | `add` / `sub` / `mul` / `div` | Arithmetic with broadcasting |
-| `eq` / `gt` / `lt` / `ge` / `le` | Comparisons, return a `u8` tensor |
-| `neg` / `abs` / `sqrt` / `exp` / `log` / `sin` / `cos` / `tanh` / `sigmoid` | Unary math |
-| `pow(t, exponent)` | Constant exponent |
-| `matmul(a, b)` | Batched matmul over the last two dims |
+| `maximum` / `minimum` | Elementwise max/min with broadcasting |
+| `remainder(t, other)` | Floor-based remainder (PyTorch semantics) |
+| `eq` / `ne` / `gt` / `lt` / `ge` / `le` | Comparisons, return a `u8` tensor |
+| `logicalAnd` / `logicalOr` / `logicalNot` | Boolean ops on `u8` tensors |
+| `where(cond, a, b)` | Elementwise select on a `u8` condition, 3-way broadcasting |
+| `clamp(t, { min?, max? })` | Clamp into a range |
+| `neg` / `abs` / `sign` | Sign operations (`sign` has zero gradient) |
+| `sqrt` / `rsqrt` / `square` / `reciprocal` / `pow(t, exponent)` | Powers and roots |
+| `exp` / `expm1` / `log` / `log1p` / `log2` / `log10` | Exponentials and logarithms |
+| `sin` / `cos` / `tan` / `sinh` / `cosh` / `tanh` | Trigonometric and hyperbolic |
+| `erf` / `floor` / `ceil` / `round` | Error function and rounding (zero gradient a.e.) |
+| `sigmoid` / `relu` | Basic activations |
+| `silu` / `gelu` / `mish` / `elu` / `leakyRelu` / `softplus` / `hardtanh` | Neural network activations |
+| `matmul(a, b)` / `dot(a, b)` | Batched matmul over the last two dims; `dot` reduces rank-1 |
 | `cast(t, dtype)` | Explicit dtype conversion |
 
 ### `Tensor` — reductions
 
-`sum` / `mean` / `max` / `min`, each taking
-`{ dims?: number[], keepdims?: boolean }`. Defaults to reducing all
-dimensions; negative dims count from the end. `mse(pred, target)` is the
-mean squared error `mean((pred - target)^2)`, reduced to a scalar.
+`sum` / `mean` / `max` / `min` / `variance` / `std` / `norm` / `prod` /
+`logsumexp` / `all` / `any`, each taking
+`{ dims?: number[], keepdims?: boolean }` (`variance`/`std` add
+`correction`, `norm` adds `ord`). Defaults to reducing all dimensions;
+negative dims count from the end. `prod` is a naive slice fold (no backend
+product kernel). Also `argmax` / `argmin` (indices along a dim, `i64`) and
+`cumsum(dim)`.
+
+### `Tensor` — neural network
+
+| Export | Description |
+| --- | --- |
+| `softmax(t, { dims? })` / `logSoftmax` | Stable, last dim by default |
+| `dropout(t, { p? })` | Functional inverted dropout; mask drawn at evaluation time |
+| `conv1d` / `conv2d(t, weight, { stride?, padding?, dilation?, groups? })` | Convolution via im2col + matmul — all backends, fully differentiable |
+| `maxPool2d` / `avgPool2d(t, { kernelSize, stride?, padding? })` | Pooling via window slices |
 
 ### `Tensor` — shape operations
 
 | Export | Description |
 | --- | --- |
 | `reshape(t, shape)` | Same element count, new shape |
+| `flatten(t, { startDim?, endDim? })` | Collapse a dim range |
+| `squeeze(t, { dims? })` / `unsqueeze(t, dim)` | Remove/insert size-1 dims |
 | `transpose(t, dims)` | Permute dimensions |
 | `slice(t, { start?, end?, stride? })` | Per-dim ranges, negative indices |
+| `split(t, sections, { dim? })` / `chunk(t, chunks, { dim? })` | Split into parts along a dim |
 | `concat([t1, t2, ...], { dim? })` | Concatenate along an existing dim |
+| `stack([t1, t2, ...], { dim? })` | Stack along a new dim |
 | `broadcastTo(t, shape)` | Broadcast to a larger shape |
+| `tile(t, reps)` | Repeat the tensor per dim |
+| `pad(t, [[before, after], ...])` | Zero-pad per dim |
+| `take(t, indexes, { dim? })` | Gather rows by `i64` indexes (not differentiable yet) |
+| `oneHot(indexes, depth, { dtype? })` | Class indexes to one-hot |
+| `triu(t, { diagonal? })` / `tril(t, { diagonal? })` | Triangular masks |
+| `trace(t)` | Sum of the diagonal of a square matrix |
+
+### `Loss` — loss functions
+
+All take the prediction first and accept `{ reduction?: "mean" | "sum" | "none" }`
+(default `"mean"`, producing a scalar ready for `Tensor.grad`):
+
+| Export | Description |
+| --- | --- |
+| `mse(pred, target)` / `l1` / `huber(pred, target, { delta? })` | Regression losses |
+| `binaryCrossEntropy(pred, target, { fromLogits? })` | BCE from probabilities or logits |
+| `crossEntropy(logits, targets)` | Log-softmax + NLL, `i64` class targets |
+| `nll(logProbs, targets)` | Negative log likelihood |
+| `klDiv(logPred, target)` | KL divergence from log-probabilities |
+| `hinge(pred, target)` | Hinge loss for ±1 targets |
+| `cosineEmbeddingLoss(a, b, targets, { margin? })` | Cosine embedding loss for ±1 targets |
 
 ### `Tensor` — evaluation
 

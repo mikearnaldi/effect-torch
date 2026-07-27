@@ -12,6 +12,7 @@ export declare class LazyTensor {
   static ones(shape: Array<number>, dtype?: NativeDType | undefined | null, device?: string | undefined | null): LazyTensor
   static full(shape: Array<number>, value: number, dtype?: NativeDType | undefined | null, device?: string | undefined | null): LazyTensor
   static randn(shape: Array<number>, dtype?: NativeDType | undefined | null, device?: string | undefined | null): LazyTensor
+  static uniform(shape: Array<number>, lo: number, hi: number, dtype?: NativeDType | undefined | null, device?: string | undefined | null): LazyTensor
   static arange(start: number, end: number, step: number, dtype?: NativeDType | undefined | null, device?: string | undefined | null): LazyTensor
   static eye(n: number, dtype?: NativeDType | undefined | null, device?: string | undefined | null): LazyTensor
   static fromBytes(data: Uint8Array, shape: Array<number>, dtype?: NativeDType | undefined | null, device?: string | undefined | null): LazyTensor
@@ -20,6 +21,8 @@ export declare class LazyTensor {
   sub(other: LazyTensor): LazyTensor
   mul(other: LazyTensor): LazyTensor
   div(other: LazyTensor): LazyTensor
+  maximum(other: LazyTensor): LazyTensor
+  minimum(other: LazyTensor): LazyTensor
   eq(other: LazyTensor): LazyTensor
   gt(other: LazyTensor): LazyTensor
   lt(other: LazyTensor): LazyTensor
@@ -31,6 +34,17 @@ export declare class LazyTensor {
   sqrt(): LazyTensor
   exp(): LazyTensor
   tanh(): LazyTensor
+  relu(): LazyTensor
+  erf(): LazyTensor
+  floor(): LazyTensor
+  ceil(): LazyTensor
+  round(): LazyTensor
+  sign(): LazyTensor
+  whereCond(a: LazyTensor, b: LazyTensor): LazyTensor
+  argmax(dim: number): LazyTensor
+  argmin(dim: number): LazyTensor
+  cumsum(dim: number): LazyTensor
+  indexSelect(dim: number, indexes: LazyTensor): LazyTensor
   log(): LazyTensor
   sin(): LazyTensor
   cos(): LazyTensor

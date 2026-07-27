@@ -1,6 +1,6 @@
 import { describe, expect, layer } from "@effect/vitest"
 import { Effect } from "effect"
-import { Device, Optimizer, Tensor } from "../src/index.ts"
+import { Device, Loss, Optimizer, Tensor } from "../src/index.ts"
 
 const f64 = (data: ReadonlyArray<number>, shape?: ReadonlyArray<number>) =>
   Tensor.fromTypedArray(new Float64Array(data), shape)
@@ -178,7 +178,7 @@ layer(Device.Cpu)("Optimizer", (it) => {
         const lossOf = (w: Tensor.GenericTensor, b: Tensor.GenericTensor) =>
           Effect.gen(function* () {
             const pred = yield* Tensor.add(yield* Tensor.matmul(x, w), b)
-            return yield* Tensor.mse(pred, y)
+            return yield* Loss.mse(pred, y)
           })
         let params: ReadonlyArray<Tensor.GenericTensor> = [yield* f64([0, 0], [2, 1]), yield* f64([0], [1, 1])]
         let state = yield* optimizer.init(params)

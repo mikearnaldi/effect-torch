@@ -1,7 +1,7 @@
 import { describe, expect, layer } from "@effect/vitest"
 import * as assert from "@effect/vitest/utils"
 import { Effect, Exit } from "effect"
-import { Device, Tensor } from "../src/index.ts"
+import { Device, Loss, Tensor } from "../src/index.ts"
 
 const f64 = (data: ReadonlyArray<number>, shape?: ReadonlyArray<number>) =>
   Tensor.fromTypedArray(new Float64Array(data), shape)
@@ -10,10 +10,12 @@ const values = (t: Tensor.GenericTensor) => Tensor.toNumberArray(t)
 
 const scalar = (t: Tensor.GenericTensor) => Effect.map(values(t), (v) => v[0])
 
-type ScalarFn = (x: Tensor.LazyTensor) => Effect.Effect<Tensor.LazyTensor, Tensor.TensorError>
+type ScalarFn = (
+  x: Tensor.LazyTensor
+) => Effect.Effect<Tensor.LazyTensor, Tensor.TensorError, Device.CurrentDevice>
 
 const sumOf = (
-  op: (x: Tensor.LazyTensor) => Effect.Effect<Tensor.LazyTensor, Tensor.TensorError>
+  op: (x: Tensor.LazyTensor) => Effect.Effect<Tensor.LazyTensor, Tensor.TensorError, Device.CurrentDevice>
 ): ScalarFn => (x) => Effect.flatMap(op(x), (t) => Tensor.sum(t))
 
 const EPS = 1e-6
@@ -57,9 +59,133 @@ layer(Device.Cpu)("Autodiff", (it) => {
         yield* gradcheck(sumOf((x) => Tensor.sin(x)), [0.5, 1, 2], [3])
         yield* gradcheck(sumOf((x) => Tensor.cos(x)), [0.5, 1, 2], [3])
         yield* gradcheck(sumOf((x) => Tensor.tanh(x)), [0.5, -1, 2], [3])
+        yield* gradcheck(sumOf((x) => Tensor.relu(x)), [0.5, -1, 2], [3])
+        yield* gradcheck(sumOf((x) => Tensor.maximum(x, 0.25)), [0.5, -1, 2], [3])
+        yield* gradcheck(sumOf((x) => Tensor.minimum(x, 0.25)), [0.5, -1, 2], [3])
         yield* gradcheck(sumOf((x) => Tensor.sigmoid(x)), [0.5, -1, 2], [3])
-        yield* gradcheck(sumOf((x) => Tensor.mse(x, 1)), [0.5, -1, 2], [3])
+        yield* gradcheck(sumOf((x) => Loss.mse(x, 1)), [0.5, -1, 2], [3])
         yield* gradcheck(sumOf((x) => Tensor.pow(x, 3)), [0.5, 1, 2], [3])
+        yield* gradcheck(sumOf((x) => Tensor.erf(x)), [0.5, -1, 2], [3])
+        yield* gradcheck(sumOf((x) => Tensor.floor(x)), [0.5, -1.3, 2.7], [3])
+        yield* gradcheck(sumOf((x) => Tensor.ceil(x)), [0.5, -1.3, 2.7], [3])
+        yield* gradcheck(sumOf((x) => Tensor.round(x)), [0.6, -1.3, 2.7], [3])
+        yield* gradcheck(sumOf((x) => Tensor.sign(x)), [0.5, -1.3, 2.7], [3])
+        yield* gradcheck(sumOf((x) => Tensor.square(x)), [0.5, -1, 2], [3])
+        yield* gradcheck(sumOf((x) => Tensor.rsqrt(x)), [0.5, 1, 2], [3])
+        yield* gradcheck(sumOf((x) => Tensor.reciprocal(x)), [0.5, -1, 2], [3])
+        yield* gradcheck(sumOf((x) => Tensor.expm1(x)), [0.5, -1, 2], [3])
+        yield* gradcheck(sumOf((x) => Tensor.log1p(x)), [0.5, 1, 2], [3])
+        yield* gradcheck(sumOf((x) => Tensor.log2(x)), [0.5, 1, 2], [3])
+        yield* gradcheck(sumOf((x) => Tensor.log10(x)), [0.5, 1, 2], [3])
+        yield* gradcheck(sumOf((x) => Tensor.sinh(x)), [0.5, -1, 2], [3])
+        yield* gradcheck(sumOf((x) => Tensor.cosh(x)), [0.5, -1, 2], [3])
+        yield* gradcheck(sumOf((x) => Tensor.tan(x)), [0.5, -1, 1.2], [3])
+        yield* gradcheck(sumOf((x) => Tensor.remainder(x, 3)), [0.5, -1.3, 2.7], [3])
+      })
+    )
+
+    it.effect("neural network ops", () =>
+      Effect.gen(function* () {
+        yield* gradcheck(sumOf((x) => Tensor.silu(x)), [0.5, -1, 2], [3])
+        yield* gradcheck(sumOf((x) => Tensor.softplus(x)), [0.5, -1, 2], [3])
+        yield* gradcheck(sumOf((x) => Tensor.elu(x)), [0.5, -1, 2], [3])
+        yield* gradcheck(sumOf((x) => Tensor.leakyRelu(x)), [0.5, -1, 2], [3])
+        yield* gradcheck(sumOf((x) => Tensor.gelu(x)), [0.5, -1, 2], [3])
+        yield* gradcheck(sumOf((x) => Tensor.gelu(x, { approximate: "tanh" })), [0.5, -1, 2], [3])
+        yield* gradcheck(sumOf((x) => Tensor.mish(x)), [0.5, -1, 2], [3])
+        yield* gradcheck(sumOf((x) => Tensor.clamp(x, { min: -0.5, max: 1.5 })), [0.5, -1, 2], [3])
+        yield* gradcheck(sumOf((x) => Tensor.hardtanh(x)), [0.5, -2, 0.3], [3])
+        const w = yield* f64([0.5, -1, 2])
+        yield* gradcheck(sumOf((x) => Effect.flatMap(Tensor.softmax(x), (s) => Tensor.mul(s, w))), [0.5, -1, 2], [3])
+        yield* gradcheck(
+          sumOf((x) => Effect.flatMap(Tensor.logSoftmax(x), (s) => Tensor.mul(s, w))),
+          [0.5, -1, 2],
+          [3]
+        )
+      })
+    )
+
+    it.effect("extended reductions and where", () =>
+      Effect.gen(function* () {
+        yield* gradcheck(sumOf((x) => Tensor.variance(x)), [1, 2, 3, 4], [4])
+        yield* gradcheck(sumOf((x) => Tensor.std(x)), [1, 2, 3, 4], [4])
+        yield* gradcheck(sumOf((x) => Tensor.norm(x, { ord: 2 })), [0.5, -1, 2], [3])
+        yield* gradcheck(sumOf((x) => Tensor.norm(x, { ord: 3 })), [0.5, -1, 2], [3])
+        yield* gradcheck(sumOf((x) => Tensor.logsumexp(x)), [0.5, -1, 2], [3])
+        yield* gradcheck(sumOf((x) => Tensor.prod(x)), [0.5, 1.5, 2], [3])
+        yield* gradcheck(sumOf((x) => Tensor.cumsum(x, 0)), [0.5, -1, 2], [3])
+        const cond = yield* Tensor.fromTypedArray(new Uint8Array([1, 0, 1]))
+        const other = yield* f64([10, 20, 30])
+        yield* gradcheck(sumOf((x) => Tensor.where(cond, x, other)), [0.5, -1, 2], [3])
+        yield* gradcheck(sumOf((x) => Tensor.where(cond, other, x)), [0.5, -1, 2], [3])
+      })
+    )
+
+    it.effect("shape ops", () =>
+      Effect.gen(function* () {
+        yield* gradcheck(sumOf((x) => Tensor.flatten(x, { startDim: 1 })), [1, 2, 3, 4, 5, 6, 7, 8], [2, 2, 2])
+        yield* gradcheck(sumOf((x) => Tensor.tile(x, [2, 2])), [1, 2, 3, 4], [2, 2])
+        yield* gradcheck(sumOf((x) => Tensor.pad(x, [[1, 1], [0, 2]])), [1, 2, 3, 4], [2, 2])
+        yield* gradcheck(sumOf((x) => Tensor.triu(x)), [1, 2, 3, 4], [2, 2])
+        yield* gradcheck(sumOf((x) => Tensor.tril(x)), [1, 2, 3, 4], [2, 2])
+        yield* gradcheck(sumOf((x) => Tensor.trace(x)), [1, 2, 3, 4], [2, 2])
+        const b = yield* f64([4, 5, 6])
+        yield* gradcheck(sumOf((x) => Tensor.dot(x, b)), [1, 2, 3], [3])
+        const parts = yield* Tensor.split(yield* f64([1, 2, 3, 4]), 2)
+        assert.strictEqual(parts.length, 2)
+      })
+    )
+
+    it.effect("take is not differentiable", () =>
+      Effect.gen(function* () {
+        const x = yield* f64([1, 2, 3, 4, 5, 6], [3, 2])
+        const idx = yield* Tensor.fromTypedArray(new BigInt64Array([2n, 0n]))
+        const loss = yield* Tensor.sum(yield* Tensor.take(x, idx))
+        const error = yield* Effect.flip(Tensor.grad(loss, [x]))
+        expect(error.reason).toBe("not-differentiable")
+      })
+    )
+
+    it.effect("strided slice", () =>
+      Effect.gen(function* () {
+        yield* gradcheck(
+          sumOf((x) => Tensor.slice(x, { start: [1], end: [7], stride: [2] })),
+          [1, 2, 3, 4, 5, 6, 7, 8],
+          [8]
+        )
+      })
+    )
+
+    it.effect("convolution and pooling", () =>
+      Effect.gen(function* () {
+        const w = yield* f64([1, 0, 0, 1], [1, 1, 2, 2])
+        yield* gradcheck(sumOf((x) => Tensor.conv2d(x, w)), [1, 2, 3, 4, 5, 6, 7, 8, 9], [1, 1, 3, 3])
+        const x = yield* f64([1, 2, 3, 4, 5, 6, 7, 8, 9], [1, 1, 3, 3])
+        yield* gradcheck(sumOf((w2) => Tensor.conv2d(x, w2)), [1, 2, 3, 4], [1, 1, 2, 2])
+        const w2s = yield* f64([1, 0, 0, 1], [1, 1, 2, 2])
+        yield* gradcheck(
+          sumOf((xs) => Tensor.conv2d(xs, w2s, { stride: 2, padding: 1 })),
+          [1, 2, 3, 4, 5, 6, 7, 8, 9],
+          [1, 1, 3, 3]
+        )
+        const wg = yield* f64([1, 0, 0, 1, 0, 1, 1, 0], [2, 1, 2, 2])
+        yield* gradcheck(
+          sumOf((xg) => Tensor.conv2d(xg, wg, { groups: 2 })),
+          [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18],
+          [1, 2, 3, 3]
+        )
+        const w1 = yield* f64([1, 1], [1, 1, 2])
+        yield* gradcheck(sumOf((x1) => Tensor.conv1d(x1, w1)), [1, 2, 3, 4], [1, 1, 4])
+        yield* gradcheck(
+          sumOf((xp) => Tensor.maxPool2d(xp, { kernelSize: 2, stride: 1 })),
+          [1, 3, 2, 4, 5, 7, 6, 8, 9],
+          [1, 1, 3, 3]
+        )
+        yield* gradcheck(
+          sumOf((xp) => Tensor.avgPool2d(xp, { kernelSize: 2, stride: 1 })),
+          [1, 3, 2, 4, 5, 7, 6, 8, 9],
+          [1, 1, 3, 3]
+        )
       })
     )
 
@@ -165,13 +291,13 @@ layer(Device.Cpu)("Autodiff", (it) => {
       })
     )
 
-    it.effect("rejects slice with stride > 1", () =>
+    it.effect("strided slice is differentiable", () =>
       Effect.gen(function* () {
-        const x = yield* f64([1, 2, 3, 4], [4])
+        const x = yield* f64([1, 2, 3, 4, 5, 6, 7], [7])
         const sliced = yield* Tensor.slice(x, { stride: [2] })
         const loss = yield* Tensor.sum(sliced)
-        const error = yield* Effect.flip(Tensor.grad(loss, [x]))
-        assert.strictEqual(error.reason, "not-differentiable")
+        const [g] = yield* Tensor.grad(loss, [x])
+        assert.deepStrictEqual(yield* values(g), [1, 0, 1, 0, 1, 0, 1])
       })
     )
 
@@ -229,7 +355,7 @@ layer(Device.Cpu)("Autodiff", (it) => {
         const losses: Array<number> = []
         for (let step = 0; step < 200; step++) {
           const pred = yield* Tensor.add(yield* Tensor.matmul(x, w), b)
-          const loss = yield* Tensor.mse(pred, y)
+          const loss = yield* Loss.mse(pred, y)
           const [gw, gb] = yield* Tensor.grad(loss, [w, b])
           const [lt, gwt, gbt] = yield* Tensor.evaluate([loss, gw, gb])
           const l = yield* scalar(lt)

@@ -1,6 +1,6 @@
 import { Data, Effect } from "effect"
 import { NodeRuntime } from "@effect/platform-node"
-import { Device, Optimizer, Tensor } from "@effect-torch/core"
+import { Device, Loss, Optimizer, Tensor } from "@effect-torch/core"
 
 class MispredictionError extends Data.TaggedError("MispredictionError")<{
   readonly input: readonly [number, number]
@@ -57,7 +57,7 @@ const train = (params: Params, x: Tensor.GenericTensor, y: Tensor.GenericTensor)
     let current = params
     let state = yield* optimizer.init(current)
     for (let i = 1; i <= STEPS; i++) {
-      const loss = yield* Tensor.mse(yield* forward(current, x), y)
+      const loss = yield* Loss.mse(yield* forward(current, x), y)
       const result = yield* Optimizer.step(optimizer, loss, current, state)
       const [value] = yield* Tensor.toNumberArray(result.loss)
       if (i % 250 === 0) {
