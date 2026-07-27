@@ -416,6 +416,69 @@ export const adamW = (config: AdamWConfig = {}): Optimizer<AdamState> =>
   })
 
 /**
+ * Clips every gradient elementwise into `[min, max]`. A pure graph
+ * transform, applied between {@link Gradient.grad} and
+ * {@link Optimizer.step}.
+ *
+ * @since 0.1.0
+ * @category transforms
+ */
+export const clipByValue = (
+  grads: ReadonlyArray<Tensor.GenericTensor>,
+  options: { readonly min?: number; readonly max?: number }
+): Effect.Effect<Array<Tensor.LazyTensor>, Tensor.TensorError> =>
+  Effect.gen(function* () {
+    if (options.min === undefined && options.max === undefined) {
+      return yield* new Tensor.TensorError({
+        op: "clipByValue",
+        message: "clipByValue: at least one of min and max is required"
+      })
+    }
+    const out: Array<Tensor.LazyTensor> = []
+    for (const g of grads) {
+      out.push(yield* Tensor.clamp(g, options))
+    }
+    return out
+  })
+
+/**
+ * Clips gradients by global norm (PyTorch semantics): the total norm is the
+ * square root of the sum of squares over *all* gradients, and every
+ * gradient is scaled by `maxNorm / (totalNorm + 1e-6)` when that factor is
+ * below `1`. A pure graph transform, applied between
+ * {@link Gradient.grad} and {@link Optimizer.step}.
+ *
+ * @since 0.1.0
+ * @category transforms
+ */
+export const clipByGlobalNorm = (
+  grads: ReadonlyArray<Tensor.GenericTensor>,
+  maxNorm: number
+): Effect.Effect<Array<Tensor.LazyTensor>, Tensor.TensorError> =>
+  Effect.gen(function* () {
+    if (maxNorm <= 0) {
+      return yield* new Tensor.TensorError({
+        op: "clipByGlobalNorm",
+        message: `clipByGlobalNorm: maxNorm must be positive, got ${maxNorm}`
+      })
+    }
+    if (grads.length === 0) {
+      return []
+    }
+    let total: Tensor.GenericTensor = yield* Tensor.sum(yield* Tensor.square(grads[0]))
+    for (const g of grads.slice(1)) {
+      total = yield* Tensor.add(total, yield* Tensor.sum(yield* Tensor.square(g)))
+    }
+    const norm = yield* Tensor.sqrt(total)
+    const scale = yield* Tensor.minimum(yield* Tensor.mul(yield* Tensor.reciprocal(yield* Tensor.add(norm, 1e-6)), maxNorm), 1)
+    const out: Array<Tensor.LazyTensor> = []
+    for (const g of grads) {
+      out.push(yield* Tensor.mul(g, scale))
+    }
+    return out
+  })
+
+/**
  * Maps a parameter tuple/array to the same structure with materialized
  * tensors — tuple in, tuple out.
  *

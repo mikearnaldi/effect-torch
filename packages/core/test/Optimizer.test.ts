@@ -1,6 +1,7 @@
 import { describe, expect, layer } from "@effect/vitest"
+import * as assert from "@effect/vitest/utils"
 import { Effect } from "effect"
-import { Device, Gradient, Loss, Optimizer, Tensor } from "../src/index.ts"
+import { Device, Gradient, Loss, Optimizer, Schedule, Tensor } from "../src/index.ts"
 
 const f64 = (data: ReadonlyArray<number>, shape?: ReadonlyArray<number>) =>
   Tensor.fromTypedArray(new Float64Array(data), shape)
@@ -320,6 +321,84 @@ layer(Device.Cpu)("Optimizer", (it) => {
         )
         expect(() => Optimizer.adam({ beta1: 1.5 })).toThrow("beta1 and beta2")
         expect(() => Optimizer.adam({ eps: 0 })).toThrow("eps must be positive")
+      })
+    )
+  })
+
+  describe("gradient clipping", () => {
+    it.effect("clipByValue clamps elementwise", () =>
+      Effect.gen(function* () {
+        const g = yield* Tensor.fromTypedArray(new Float64Array([-5, 0.5, 10]))
+        const [clipped] = yield* Optimizer.clipByValue([g], { min: -1, max: 1 })
+        assert.deepStrictEqual(yield* values(clipped), [-1, 0.5, 1])
+      })
+    )
+
+    it.effect("clipByGlobalNorm scales down only above the norm", () =>
+      Effect.gen(function* () {
+        const g1 = yield* Tensor.fromTypedArray(new Float64Array([3, 4]))
+        const g2 = yield* Tensor.fromTypedArray(new Float64Array([0, 12]))
+        // total norm = 13, maxNorm 6.5 -> scale 0.5
+        const [c1, c2] = yield* Optimizer.clipByGlobalNorm([g1, g2], 6.5)
+        const v1 = yield* values(c1)
+        const v2 = yield* values(c2)
+        for (let i = 0; i < 2; i++) {
+          expect(Math.abs(v1[i] - [1.5, 2][i])).toBeLessThan(1e-6)
+        }
+        expect(Math.abs(v2[0])).toBeLessThan(1e-9)
+        expect(Math.abs(v2[1] - 6)).toBeLessThan(1e-6)
+        // below the norm: unchanged
+        const [u1] = yield* Optimizer.clipByGlobalNorm([g1], 100)
+        assert.deepStrictEqual(yield* values(u1), [3, 4])
+      })
+    )
+  })
+
+  describe("schedules", () => {
+    it.effect("schedule values", () =>
+      Effect.sync(() => {
+        expect(Schedule.constant(0.1)(42)).toBe(0.1)
+        const exp = Schedule.exponential(1, { decayRate: 0.5, decaySteps: 10 })
+        expect(exp(0)).toBe(1)
+        expect(Math.abs(exp(10) - 0.5)).toBeLessThan(1e-12)
+        expect(Math.abs(exp(20) - 0.25)).toBeLessThan(1e-12)
+        const step = Schedule.stepwise(1, { dropFactor: 0.1, dropEvery: 5 })
+        expect(step(4)).toBe(1)
+        expect(Math.abs(step(5) - 0.1)).toBeLessThan(1e-12)
+        const cos = Schedule.cosine(1, { totalSteps: 100 })
+        expect(Math.abs(cos(0) - 1)).toBeLessThan(1e-12)
+        expect(Math.abs(cos(50) - 0.5)).toBeLessThan(1e-12)
+        expect(Math.abs(cos(100))).toBeLessThan(1e-12)
+        expect(Math.abs(cos(200))).toBeLessThan(1e-12)
+        const warm = Schedule.withWarmup(Schedule.constant(0.5), 10)
+        expect(Math.abs(warm(0) - 0.05)).toBeLessThan(1e-12)
+        expect(Math.abs(warm(9) - 0.5)).toBeLessThan(1e-12)
+        expect(warm(10)).toBe(0.5)
+        expect(() => Schedule.cosine(0, { totalSteps: 10 })).toThrow()
+      })
+    )
+
+    it.effect("a scheduled adam converges", () =>
+      Effect.gen(function* () {
+        const schedule = Schedule.withWarmup(Schedule.cosine(0.1, { totalSteps: 200 }), 20)
+        const w = yield* Tensor.fromTypedArray(new Float64Array([0, 0]))
+        const x = yield* Tensor.fromTypedArray(new Float64Array([1, 1, 2, 1, 3, 1, 4, 1]), [4, 2])
+        const y = yield* Tensor.fromTypedArray(new Float64Array([2, 3, 4, 5]), [4, 1])
+        let params: ReadonlyArray<Tensor.GenericTensor> = [w]
+        let state: Optimizer.AdamState | undefined
+        for (let t = 0; t < 200; t++) {
+          const optimizer = Optimizer.adam({ lr: schedule(t) })
+          state = state ?? (yield* optimizer.init(params))
+          const pred = yield* Tensor.matmul(x, yield* Tensor.reshape(params[0], [2, 1]))
+          const loss = yield* Loss.mse(pred, y)
+          const next = yield* Optimizer.step(optimizer, loss, params, state)
+          params = next.params
+          state = next.state
+        }
+        const finalLoss = yield* values(
+          yield* Loss.mse(yield* Tensor.matmul(x, yield* Tensor.reshape(params[0], [2, 1])), y)
+        )
+        expect(finalLoss[0]).toBeLessThan(1e-3)
       })
     )
   })
