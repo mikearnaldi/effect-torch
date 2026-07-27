@@ -3,7 +3,7 @@ import { Effect } from "effect"
 import * as fs from "node:fs"
 import * as os from "node:os"
 import * as path from "node:path"
-import { Device, Optimizer, Tensor } from "../src/index.ts"
+import { Device, Gradient, Optimizer, Tensor } from "../src/index.ts"
 
 const tmpdir = Effect.sync(() => fs.mkdtempSync(path.join(os.tmpdir(), "effect-torch-")))
 
@@ -75,7 +75,7 @@ layer(Device.Cpu)("Checkpoint", (it) => {
       const p = yield* Tensor.fromTypedArray(new Float64Array([1, -1]), [2])
       const state = yield* optimizer.init([p])
       const loss = yield* Tensor.sum(yield* Tensor.mul(p, p))
-      const [gp] = yield* Tensor.grad(loss, [p])
+      const [gp] = yield* Gradient.grad(loss, [p])
       const next = yield* optimizer.step([p], [gp], state)
       const [m, v] = yield* Tensor.evaluate(next.stateRoots)
       yield* Tensor.save(file, { "m.0": m, "v.0": v })

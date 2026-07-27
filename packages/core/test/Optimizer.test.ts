@@ -1,6 +1,6 @@
 import { describe, expect, layer } from "@effect/vitest"
 import { Effect } from "effect"
-import { Device, Loss, Optimizer, Tensor } from "../src/index.ts"
+import { Device, Gradient, Loss, Optimizer, Tensor } from "../src/index.ts"
 
 const f64 = (data: ReadonlyArray<number>, shape?: ReadonlyArray<number>) =>
   Tensor.fromTypedArray(new Float64Array(data), shape)

@@ -1,7 +1,7 @@
 import { describe, expect, layer } from "@effect/vitest"
 import * as assert from "@effect/vitest/utils"
 import { Effect, Exit } from "effect"
-import { Device, Loss, Tensor } from "../src/index.ts"
+import { Device, Gradient, Loss, Tensor } from "../src/index.ts"
 
 const f64 = (data: ReadonlyArray<number>, shape?: ReadonlyArray<number>) =>
   Tensor.fromTypedArray(new Float64Array(data), shape)
@@ -24,7 +24,7 @@ const TOL = 1e-4
 const gradcheck = (f: ScalarFn, input: ReadonlyArray<number>, shape: ReadonlyArray<number>) =>
   Effect.gen(function* () {
     const x = yield* f64(input, shape)
-    const [analytic] = yield* Tensor.grad(yield* f(x), [x])
+    const [analytic] = yield* Gradient.grad(yield* f(x), [x])
     const analyticValues = yield* values(analytic)
     for (let i = 0; i < input.length; i++) {
       const plus = input.map((v, j) => (j === i ? v + EPS : v))
@@ -141,12 +141,12 @@ layer(Device.Cpu)("Autodiff", (it) => {
         const x = yield* f64([1, 2, 3, 4, 5, 6], [3, 2])
         const idx = yield* Tensor.fromTypedArray(new BigInt64Array([2n, 0n, 2n]))
         const loss = yield* Tensor.sum(yield* Tensor.take(x, idx))
-        const [g] = yield* Tensor.grad(loss, [x])
+        const [g] = yield* Gradient.grad(loss, [x])
         assert.deepStrictEqual(yield* values(g), [1, 1, 0, 0, 2, 2])
 
         const idx2 = yield* Tensor.fromTypedArray(new BigInt64Array([1n, 0n, 0n, 1n]), [2, 2])
         const g2 = yield* Tensor.sum(yield* Tensor.gather(x, idx2, { dim: 1 }))
-        const [dg] = yield* Tensor.grad(g2, [x])
+        const [dg] = yield* Gradient.grad(g2, [x])
         assert.deepStrictEqual(yield* values(dg), [1, 1, 1, 1, 0, 0])
       })
     )
@@ -242,11 +242,11 @@ layer(Device.Cpu)("Autodiff", (it) => {
           })
         const x = yield* f64([0.5, 1])
         const plain = yield* f(x)
-        const wrapped = yield* Tensor.checkpoint(yield* f(x))
+        const wrapped = yield* Gradient.checkpoint(yield* f(x))
         const plainLoss = yield* Tensor.sum(plain)
         const wrappedLoss = yield* Tensor.sum(wrapped)
-        const [plainGrad] = yield* Tensor.grad(plainLoss, [x])
-        const [wrappedGrad] = yield* Tensor.grad(wrappedLoss, [x])
+        const [plainGrad] = yield* Gradient.grad(plainLoss, [x])
+        const [wrappedGrad] = yield* Gradient.grad(wrappedLoss, [x])
         assert.deepStrictEqual(yield* values(wrappedLoss), yield* values(plainLoss))
         const pg = yield* values(plainGrad)
         const wg = yield* values(wrappedGrad)
@@ -260,9 +260,9 @@ layer(Device.Cpu)("Autodiff", (it) => {
             return yield* Tensor.mul(x, yield* Tensor.randn([2], { dtype: "f64" }))
           })
         const x2 = yield* f64([2, 4])
-        const out2 = yield* Tensor.checkpoint(yield* stochastic(x2))
+        const out2 = yield* Gradient.checkpoint(yield* stochastic(x2))
         const loss2 = yield* Tensor.sum(out2)
-        const [g2] = yield* Tensor.grad(loss2, [x2])
+        const [g2] = yield* Gradient.grad(loss2, [x2])
         const [outM, gM] = yield* Tensor.evaluate([out2, g2])
         const outValues = yield* Tensor.toNumberArray(outM)
         const gradValues = yield* Tensor.toNumberArray(gM)
@@ -278,27 +278,27 @@ layer(Device.Cpu)("Autodiff", (it) => {
         const f = (x: Tensor.GenericTensor) => Tensor.matmul(a, x)
         const x = yield* f64([1, 1, 1], [3, 1])
         const v = yield* f64([1, 2], [2, 1])
-        const { output, pullback } = yield* Tensor.vjp(f, x, v)
+        const { output, pullback } = yield* Gradient.vjp(f, x, v)
         assert.deepStrictEqual(yield* values(output), [6, 15])
         // J^T v = A^T v
         assert.deepStrictEqual(yield* values(pullback), [1 * 1 + 4 * 2, 2 * 1 + 5 * 2, 3 * 1 + 6 * 2])
 
         const t = yield* f64([1, 0, 0], [3, 1])
-        const { tangent } = yield* Tensor.jvp(f, x, t)
+        const { tangent } = yield* Gradient.jvp(f, x, t)
         assert.deepStrictEqual(yield* values(tangent), [1, 4])
 
         const nonlinear = (x: Tensor.GenericTensor) => Tensor.sin(x)
         const xn = yield* f64([0.5, 1])
         const vn = yield* f64([2, 3])
-        const { tangent: tn } = yield* Tensor.jvp(nonlinear, xn, vn)
+        const { tangent: tn } = yield* Gradient.jvp(nonlinear, xn, vn)
         const tnValues = yield* values(tn)
         expect(Math.abs(tnValues[0] - Math.cos(0.5) * 2)).toBeLessThan(1e-12)
         expect(Math.abs(tnValues[1] - Math.cos(1) * 3)).toBeLessThan(1e-12)
 
         const m = yield* f64([1, 2, 3, 4, 5, 6], [2, 3])
-        const rowSums = yield* Tensor.vmap((row) => Tensor.sum(row))(m)
+        const rowSums = yield* Gradient.vmap((row) => Tensor.sum(row))(m)
         assert.deepStrictEqual(yield* values(rowSums), [6, 15])
-        const mapped = yield* Tensor.vmap((row) => Tensor.relu(row))(m)
+        const mapped = yield* Gradient.vmap((row) => Tensor.relu(row))(m)
         assert.deepStrictEqual(mapped.shape, [2, 3])
       })
     )
@@ -337,12 +337,12 @@ layer(Device.Cpu)("Autodiff", (it) => {
     it.effect("max/min split gradients evenly across ties", () =>
       Effect.gen(function* () {
         const x = yield* f64([1, 3, 3, 2], [4])
-        const [gmax] = yield* Tensor.grad(yield* Tensor.max(x, { dims: [0] }), [x])
+        const [gmax] = yield* Gradient.grad(yield* Tensor.max(x, { dims: [0] }), [x])
         assert.deepStrictEqual(yield* values(gmax), [0, 0.5, 0.5, 0])
-        const [gmin] = yield* Tensor.grad(yield* Tensor.min(x, { dims: [0] }), [x])
+        const [gmin] = yield* Gradient.grad(yield* Tensor.min(x, { dims: [0] }), [x])
         assert.deepStrictEqual(yield* values(gmin), [1, 0, 0, 0])
         const y = yield* f64([2, 1, 1, 3], [4])
-        const [gymin] = yield* Tensor.grad(yield* Tensor.min(y, { dims: [0] }), [y])
+        const [gymin] = yield* Gradient.grad(yield* Tensor.min(y, { dims: [0] }), [y])
         assert.deepStrictEqual(yield* values(gymin), [0, 0.5, 0.5, 0])
       })
     )
@@ -365,7 +365,7 @@ layer(Device.Cpu)("Autodiff", (it) => {
       Effect.gen(function* () {
         const x = yield* f64([1, 2, 3])
         const loss = yield* Effect.flatMap(Tensor.cast(x, "f32"), (t) => Tensor.cast(t, "f64"))
-        const [gx] = yield* Tensor.grad(yield* Tensor.sum(loss), [x])
+        const [gx] = yield* Gradient.grad(yield* Tensor.sum(loss), [x])
         assert.deepStrictEqual(yield* values(gx), [1, 1, 1])
       })
     )
@@ -391,7 +391,7 @@ layer(Device.Cpu)("Autodiff", (it) => {
     it.effect("rejects non-scalar output", () =>
       Effect.gen(function* () {
         const x = yield* f64([1, 2, 3])
-        const exit = yield* Effect.exit(Tensor.grad(x, [x]))
+        const exit = yield* Effect.exit(Gradient.grad(x, [x]))
         assert.assertTrue(Exit.isFailure(exit))
       })
     )
@@ -400,7 +400,7 @@ layer(Device.Cpu)("Autodiff", (it) => {
       Effect.gen(function* () {
         const x = yield* Tensor.fromTypedArray(new BigInt64Array([1n, 2n]))
         const loss = yield* Effect.flatMap(Tensor.cast(x, "f64"), (t) => Tensor.sum(t))
-        const exit = yield* Effect.exit(Tensor.grad(loss, [x]))
+        const exit = yield* Effect.exit(Gradient.grad(loss, [x]))
         assert.assertTrue(Exit.isFailure(exit))
       })
     )
@@ -410,7 +410,7 @@ layer(Device.Cpu)("Autodiff", (it) => {
         const x = yield* f64([1, 2, 3, 4, 5, 6, 7], [7])
         const sliced = yield* Tensor.slice(x, { stride: [2] })
         const loss = yield* Tensor.sum(sliced)
-        const [g] = yield* Tensor.grad(loss, [x])
+        const [g] = yield* Gradient.grad(loss, [x])
         assert.deepStrictEqual(yield* values(g), [1, 0, 1, 0, 1, 0, 1])
       })
     )
@@ -420,7 +420,7 @@ layer(Device.Cpu)("Autodiff", (it) => {
         const x = yield* f64([1, 2, 3])
         const y = yield* f64([4, 5, 6])
         const loss = yield* Effect.flatMap(Tensor.mul(x, x), (t) => Tensor.sum(t))
-        const [gx, gy] = yield* Tensor.grad(loss, [x, y])
+        const [gx, gy] = yield* Gradient.grad(loss, [x, y])
         assert.deepStrictEqual(yield* values(gx), [2, 4, 6])
         assert.deepStrictEqual(yield* values(gy), [0, 0, 0])
       })
@@ -429,9 +429,9 @@ layer(Device.Cpu)("Autodiff", (it) => {
     it.effect("stopGradient blocks gradient flow", () =>
       Effect.gen(function* () {
         const x = yield* f64([2, 3])
-        const stopped = yield* Tensor.stopGradient(x)
+        const stopped = yield* Gradient.stopGradient(x)
         const loss = yield* Tensor.sum(yield* Tensor.mul(stopped, x))
-        const [gx] = yield* Tensor.grad(loss, [x])
+        const [gx] = yield* Gradient.grad(loss, [x])
         assert.deepStrictEqual(yield* values(gx), [2, 3])
       })
     )
@@ -443,7 +443,7 @@ layer(Device.Cpu)("Autodiff", (it) => {
         const x = yield* f64([1, 2, 3])
         const r = yield* Tensor.randn([3], { dtype: "f64" })
         const loss = yield* Tensor.sum(yield* Tensor.mul(x, r))
-        const [gx] = yield* Tensor.grad(loss, [x])
+        const [gx] = yield* Gradient.grad(loss, [x])
         const [l, g] = yield* Tensor.evaluate([loss, gx])
         const lv = yield* scalar(l)
         const gv = yield* values(g)
@@ -470,7 +470,7 @@ layer(Device.Cpu)("Autodiff", (it) => {
         for (let step = 0; step < 200; step++) {
           const pred = yield* Tensor.add(yield* Tensor.matmul(x, w), b)
           const loss = yield* Loss.mse(pred, y)
-          const [gw, gb] = yield* Tensor.grad(loss, [w, b])
+          const [gw, gb] = yield* Gradient.grad(loss, [w, b])
           const [lt, gwt, gbt] = yield* Tensor.evaluate([loss, gw, gb])
           const l = yield* scalar(lt)
           const gwv = yield* values(gwt)

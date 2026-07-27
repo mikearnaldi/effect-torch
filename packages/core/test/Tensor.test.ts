@@ -1,7 +1,7 @@
 import { describe, expect, layer } from "@effect/vitest"
 import * as assert from "@effect/vitest/utils"
 import { Effect, Exit } from "effect"
-import { Device, Loss, Tensor } from "../src/index.ts"
+import { Device, Gradient, Loss, Tensor } from "../src/index.ts"
 
 const values = (t: Tensor.GenericTensor) =>
   Effect.map(Tensor.toTypedArray(t), (arr) => Array.from<number | bigint>(arr).map(Number))

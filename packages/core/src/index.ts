@@ -1,4 +1,5 @@
 export * as Device from "./Device.ts"
+export * as Gradient from "./Gradient.ts"
 export * as Loss from "./Loss.ts"
 export * as Optimizer from "./Optimizer.ts"
 export * as Tensor from "./Tensor.ts"

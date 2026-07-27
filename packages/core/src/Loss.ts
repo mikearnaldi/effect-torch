@@ -1,7 +1,7 @@
 /**
  * Loss functions. Every loss takes the prediction and the target and
  * returns a lazy graph value; with the default `reduction: "mean"` (or
- * `"sum"`) the result is a scalar ready for {@link Tensor.grad}, while
+ * `"sum"`) the result is a scalar ready for {@link Gradient.grad}, while
  * `reduction: "none"` returns the unreduced per-element loss for custom
  * weighting or masking.
  *

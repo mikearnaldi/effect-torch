@@ -30,6 +30,7 @@
  */
 import { Effect } from "effect"
 import type { CurrentDevice } from "./Device.ts"
+import * as Gradient from "./Gradient.ts"
 import * as Tensor from "./Tensor.ts"
 
 /**
@@ -447,10 +448,10 @@ export const step = <S, P extends ReadonlyArray<Tensor.GenericTensor>>(
   state: S
 ): Effect.Effect<
   { readonly loss: Tensor.Tensor; readonly params: Materialized<P>; readonly state: S },
-  Tensor.GradError | Tensor.TensorError
+  Gradient.GradError | Tensor.TensorError
 > =>
   Effect.gen(function* () {
-    const grads = yield* Tensor.grad(loss, params)
+    const grads = yield* Gradient.grad(loss, params)
     const next = yield* optimizer.step(params, grads, state)
     const evaluated = yield* Tensor.evaluate([loss, ...next.params, ...next.stateRoots])
     const [evaluatedLoss, ...rest] = evaluated

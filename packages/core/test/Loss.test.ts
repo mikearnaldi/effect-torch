@@ -1,7 +1,7 @@
 import { describe, expect, layer } from "@effect/vitest"
 import * as assert from "@effect/vitest/utils"
 import { Effect } from "effect"
-import { Device, Loss, Tensor } from "../src/index.ts"
+import { Device, Gradient, Loss, Tensor } from "../src/index.ts"
 
 const f64 = (data: ReadonlyArray<number>, shape?: ReadonlyArray<number>) =>
   Tensor.fromTypedArray(new Float64Array(data), shape)
@@ -23,7 +23,7 @@ const gradcheck = (
 ) =>
   Effect.gen(function* () {
     const x = yield* f64(input, shape)
-    const [analytic] = yield* Tensor.grad(yield* f(x), [x])
+    const [analytic] = yield* Gradient.grad(yield* f(x), [x])
     const analyticValues = yield* values(analytic)
     for (let i = 0; i < input.length; i++) {
       const plus = input.map((v, j) => (j === i ? v + EPS : v))

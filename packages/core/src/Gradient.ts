@@ -1,0 +1,252 @@
+/**
+ * Reverse-mode autodiff and graph transforms. The backward transform runs
+ * natively on the graph itself — there is no tracing and no function
+ * transformation: the loss is an ordinary lazy graph value and adjoints are
+ * expressed in the same node vocabulary as the forward pass, so
+ * higher-order derivatives work by applying {@link grad} again.
+ *
+ * @since 0.1.0
+ */
+import { Data, Effect } from "effect"
+import native from "@effect-torch/native"
+import type { CurrentDevice } from "./Device.ts"
+import * as Tensor from "./Tensor.ts"
+
+/**
+ * Error raised by {@link grad} when the graph violates the autodiff
+ * contract.
+ *
+ * @since 0.1.0
+ * @category errors
+ */
+export class GradError extends Data.TaggedError("GradError")<{
+  readonly reason: "non-scalar-output" | "non-float-dtype" | "not-differentiable"
+  readonly detail: string
+}> {}
+
+const isFloatDtype = (dtype: string): boolean => dtype === "f32" || dtype === "f64"
+
+const toGradError = (error: unknown): GradError => {
+  const detail = error instanceof Error ? error.message : String(error)
+  return new GradError({
+    // the scalar and float-dtype contracts are validated above, so a native
+    // error here means the graph contains a non-differentiable construct
+    reason: "not-differentiable",
+    detail
+  })
+}
+
+/**
+ * Computes the gradients of a scalar loss with respect to the given tensors.
+ * The loss is an ordinary lazy graph value — there is no tracing and no
+ * function transformation, the backward transform runs natively on the
+ * graph itself: one walk, with adjoints expressed in the same node
+ * vocabulary as the forward pass, so higher-order derivatives work by
+ * applying `grad` again.
+ *
+ * Gradients are lazy tensors sharing the forward graph; a `wrt` tensor that
+ * does not influence the loss yields a zero gradient. Because the loss and
+ * its gradients share the forward graph, evaluate them together with
+ * {@link Tensor.evaluate}: evaluating them separately recomputes the forward
+ * pass and, if the graph contains `randn`, produces values from different
+ * random draws.
+ *
+ * @since 0.1.0
+ * @category autodiff
+ */
+export const grad = (
+  loss: Tensor.GenericTensor,
+  wrt: ReadonlyArray<Tensor.GenericTensor>
+): Effect.Effect<Array<Tensor.LazyTensor>, GradError> =>
+  Effect.gen(function* () {
+    if (loss.shape.length !== 0) {
+      return yield* new GradError({
+        reason: "non-scalar-output",
+        detail: `grad: expected a scalar (0-d) loss, got shape [${loss.shape}], reduce it first (e.g. with sum or mean)`
+      })
+    }
+    if (!isFloatDtype(loss.dtype)) {
+      return yield* new GradError({
+        reason: "non-float-dtype",
+        detail: `grad: loss dtype must be f32 or f64, got ${loss.dtype}`
+      })
+    }
+    for (const target of wrt) {
+      if (!isFloatDtype(target.dtype)) {
+        return yield* new GradError({
+          reason: "non-float-dtype",
+          detail: `grad: cannot differentiate with respect to ${target.dtype} tensor, only f32 and f64 are differentiable`
+        })
+      }
+    }
+    const grads = yield* Effect.try({
+      try: () => native.grad(loss.lazy, wrt.map((target) => target.lazy)),
+      catch: toGradError
+    })
+    return grads.map((handle, i) => Tensor.makeLazy(handle, wrt[i].shape, wrt[i].dtype, wrt[i].device))
+  })
+
+/**
+ * Stops gradient flow: the returned tensor has the same value as the input,
+ * but the backward walk does not continue past it, so ancestors of the input
+ * receive no gradient through this path.
+ *
+ * @since 0.1.0
+ * @category autodiff
+ */
+export const stopGradient = (
+  self: Tensor.GenericTensor
+): Effect.Effect<Tensor.LazyTensor, Tensor.TensorError> =>
+  Effect.try({
+    try: () => Tensor.makeLazy(self.lazy.stopGradient(), self.shape, self.dtype, self.device),
+    catch: (error) =>
+      new Tensor.TensorError({
+        op: "stopGradient",
+        message: error instanceof Error ? error.message : String(error)
+      })
+  })
+
+/**
+ * Gradient checkpointing: the returned tensor has the same value as the
+ * input, but during the backward pass the forward intermediates of the
+ * subgraph that produced it are recomputed from a fresh copy instead of
+ * being retained — trading one extra forward evaluation of the region for
+ * its peak memory. Region inputs (nodes also reachable from outside the
+ * checkpoint) and constructor leaves (including `randn` draws) are shared,
+ * so recomputation is consistent with the forward pass.
+ *
+ * @since 0.1.0
+ * @category autodiff
+ */
+export const checkpoint = (
+  self: Tensor.GenericTensor
+): Effect.Effect<Tensor.LazyTensor, Tensor.TensorError> =>
+  Effect.try({
+    try: () => Tensor.makeLazy(self.lazy.checkpoint(), self.shape, self.dtype, self.device),
+    catch: (error) =>
+      new Tensor.TensorError({
+        op: "checkpoint",
+        message: error instanceof Error ? error.message : String(error)
+      })
+  })
+
+const checkSameShapeDtype = (
+  op: string,
+  a: Tensor.GenericTensor,
+  b: Tensor.GenericTensor,
+  bName: string
+): Effect.Effect<void, Tensor.TensorError> =>
+  Effect.gen(function* () {
+    if (a.shape.length !== b.shape.length || !a.shape.every((d, i) => d === b.shape[i])) {
+      return yield* new Tensor.TensorError({
+        op,
+        message: `${op}: ${bName} shape [${b.shape}] does not match [${a.shape}]`
+      })
+    }
+    if (a.dtype !== b.dtype) {
+      return yield* new Tensor.TensorError({
+        op,
+        message: `${op}: ${bName} dtype ${b.dtype} does not match ${a.dtype}`
+      })
+    }
+  })
+
+/**
+ * Vector-Jacobian product (reverse-mode pullback): given `f`, a primal `x`,
+ * and a cotangent `v` with the output's shape, returns `f(x)` together with
+ * `J(x)ᵀ v` — the gradient of `sum(f(x) * v)` with respect to `x`.
+ *
+ * @since 0.1.0
+ * @category autodiff
+ */
+export const vjp = (
+  f: (x: Tensor.GenericTensor) => Effect.Effect<Tensor.GenericTensor, Tensor.TensorError, CurrentDevice>,
+  x: Tensor.GenericTensor,
+  v: Tensor.GenericTensor
+): Effect.Effect<
+  { readonly output: Tensor.GenericTensor; readonly pullback: Tensor.LazyTensor },
+  Tensor.TensorError | GradError,
+  CurrentDevice
+> =>
+  Effect.gen(function* () {
+    const output = yield* f(x)
+    yield* checkSameShapeDtype("vjp", output, v, "cotangent")
+    const loss = yield* Tensor.sum(yield* Tensor.mul(output, yield* stopGradient(v)))
+    const [pullback] = yield* grad(loss, [x])
+    return { output, pullback }
+  })
+
+/**
+ * Jacobian-vector product (forward-mode pushforward via
+ * forward-over-reverse): given `f`, a primal `x`, and a tangent `v` with
+ * `x`'s shape, returns `f(x)` together with `J(x) v`. Uses second-order
+ * adjoints, so `f` must be twice differentiable through the ops it uses.
+ *
+ * @since 0.1.0
+ * @category autodiff
+ */
+export const jvp = (
+  f: (x: Tensor.GenericTensor) => Effect.Effect<Tensor.GenericTensor, Tensor.TensorError, CurrentDevice>,
+  x: Tensor.GenericTensor,
+  v: Tensor.GenericTensor
+): Effect.Effect<
+  { readonly output: Tensor.GenericTensor; readonly tangent: Tensor.LazyTensor },
+  Tensor.TensorError | GradError,
+  CurrentDevice
+> =>
+  Effect.gen(function* () {
+    yield* checkSameShapeDtype("jvp", x, v, "tangent")
+    const output = yield* f(x)
+    // u is a free linearization point: g(u) = J(x)ᵀ u is linear in u, and
+    // its own vjp at u = 0 with cotangent v is J(x) v
+    const u = yield* Tensor.zerosLike(output)
+    const loss1 = yield* Tensor.sum(yield* Tensor.mul(output, u))
+    const [gradX] = yield* grad(loss1, [x])
+    const loss2 = yield* Tensor.sum(yield* Tensor.mul(gradX, yield* stopGradient(v)))
+    const [tangent] = yield* grad(loss2, [u])
+    return { output, tangent }
+  })
+
+/**
+ * Maps `f` over a leading dimension (default `0`): slices the input along
+ * `dim`, applies `f` to each slice with that dimension removed, and stacks
+ * the results along `dim`. Every slice must produce the same shape. This is
+ * the simple graph form — the graph grows linearly with the mapped
+ * dimension.
+ *
+ * @since 0.1.0
+ * @category autodiff
+ */
+export const vmap = (
+  f: (x: Tensor.GenericTensor) => Effect.Effect<Tensor.GenericTensor, Tensor.TensorError, CurrentDevice>,
+  options: { readonly dim?: number } = {}
+) =>
+(
+  self: Tensor.GenericTensor
+): Effect.Effect<Tensor.LazyTensor, Tensor.TensorError, CurrentDevice> =>
+  Effect.gen(function* () {
+    const rank = self.shape.length
+    const dim = options.dim ?? 0
+    const d = dim < 0 ? dim + rank : dim
+    if (!Number.isInteger(d) || d < 0 || d >= rank) {
+      return yield* new Tensor.TensorError({
+        op: "vmap",
+        message: `vmap: dimension ${dim} out of range for rank ${rank}`
+      })
+    }
+    const slices = yield* Tensor.split(self, 1, { dim: d })
+    const outs: Array<Tensor.GenericTensor> = []
+    for (const s of slices) {
+      outs.push(yield* f(yield* Tensor.squeeze(s, { dims: [d] })))
+    }
+    const first = outs[0].shape
+    for (const out of outs) {
+      if (out.shape.length !== first.length || !out.shape.every((s, i) => s === first[i])) {
+        return yield* new Tensor.TensorError({
+          op: "vmap",
+          message: `vmap: function returned inconsistent shapes [${first}] and [${out.shape}] across the mapped dimension`
+        })
+      }
+    }
+    return yield* Tensor.stack(outs as [Tensor.GenericTensor, Tensor.GenericTensor, ...Array<Tensor.GenericTensor>], { dim: d })
+  })

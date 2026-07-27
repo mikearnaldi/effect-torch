@@ -214,7 +214,7 @@ the host); all three are differentiable.
 ### `Loss` — loss functions
 
 All take the prediction first and accept `{ reduction?: "mean" | "sum" | "none" }`
-(default `"mean"`, producing a scalar ready for `Tensor.grad`):
+(default `"mean"`, producing a scalar ready for `Gradient.grad`):
 
 | Export | Description |
 | --- | --- |
@@ -234,7 +234,7 @@ All take the prediction first and accept `{ reduction?: "mean" | "sum" | "none" 
 | `toTypedArray(t)` | `Effect<TypedArray, TensorError>` — evaluate + zero-copy readback where possible |
 | `toNumberArray(t)` | `Effect<number[], TensorError>` — fails for `i64` tensors instead of silently coercing bigints |
 
-### `Tensor` — autodiff
+### `Gradient` — autodiff
 
 Reverse-mode automatic differentiation: `grad` operates directly
 on the lazy graph — there is no tracing and no function transformation. The
