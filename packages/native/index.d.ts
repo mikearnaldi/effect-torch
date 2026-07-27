@@ -50,10 +50,13 @@ export declare class NativeTensor {
   get shape(): Array<number>
   get dtype(): string
   get device(): string
+  get bytes(): number
   readback(token?: CancellationToken | undefined | null): Promise<ArrayBuffer>
 }
 
 export declare function evalLazy(tensors: Array<LazyTensor>, token?: CancellationToken | undefined | null): Promise<Array<NativeTensor>>
+
+export declare function externalMemoryBytes(): number
 
 export declare function grad(loss: LazyTensor, wrt: Array<LazyTensor>): Array<LazyTensor>
 
@@ -66,3 +69,5 @@ export declare const enum NativeDType {
   U8 = 'u8',
   U32 = 'u32'
 }
+
+export declare function reportExternalMemory(bytes: number): void

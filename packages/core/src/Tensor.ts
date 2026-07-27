@@ -8,7 +8,7 @@ import native, {
 } from "@effect-torch/native"
 import { CurrentDevice, type DeviceKind } from "./Device.js"
 
-const { CancellationToken, evalLazy, LazyTensor: NativeLazyTensor } = native
+const { CancellationToken, evalLazy, LazyTensor: NativeLazyTensor, reportExternalMemory } = native
 
 /**
  * Element data types supported by the native backend.
@@ -1134,7 +1134,10 @@ export const evaluate = (
     ? Effect.succeed(roots as Array<Tensor>)
     : Effect.map(
         fromNative("evaluate", (token) => evalLazy(roots.map((root) => root.lazy), token)),
-        (handles) => handles.map(fromHandle)
+        (handles) => {
+          reportExternalMemory(handles.reduce((total, handle) => total + handle.bytes, 0))
+          return handles.map(fromHandle)
+        }
       )
 
 const typedArrayConstructor = (dtype: DType) => {

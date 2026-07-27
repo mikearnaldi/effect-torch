@@ -2,7 +2,7 @@ use candle_core::{CpuStorage, DType, Device, Storage, Tensor};
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
 use std::collections::HashSet;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 fn to_napi_err(err: candle_core::Error) -> Error {
@@ -192,14 +192,28 @@ fn get_device(device: Option<String>) -> Result<Device> {
     }
 }
 
-#[napi]
+#[napi(custom_finalize)]
 pub struct NativeTensor {
     pub(crate) inner: Tensor,
+    bytes: i64,
 }
 
 impl NativeTensor {
     fn wrap(inner: Tensor) -> Self {
-        Self { inner }
+        let bytes = (inner.elem_count() * inner.dtype().size_in_bytes()) as i64;
+        Self { inner, bytes }
+    }
+}
+
+static EXTERNAL_MEMORY_BYTES: AtomicI64 = AtomicI64::new(0);
+
+// V8's GC only sees the small JS handle; report the native buffer size so
+// collection is scheduled with knowledge of native memory pressure.
+impl ObjectFinalize for NativeTensor {
+    fn finalize(self, env: Env) -> Result<()> {
+        EXTERNAL_MEMORY_BYTES.fetch_sub(self.bytes, Ordering::Relaxed);
+        env.adjust_external_memory(-self.bytes)?;
+        Ok(())
     }
 }
 
@@ -250,6 +264,11 @@ impl NativeTensor {
             Device::Cuda(_) => "cuda".to_string(),
             Device::Metal(_) => "metal".to_string(),
         }
+    }
+
+    #[napi(getter)]
+    pub fn bytes(&self) -> i64 {
+        self.bytes
     }
 
     #[napi(ts_return_type = "Promise<ArrayBuffer>")]
@@ -1075,17 +1094,109 @@ impl LazyTensor {
     }
 }
 
-type Cache = std::collections::HashMap<u64, Tensor>;
+// Evaluation holds intermediate results in a cache keyed by node id. A node
+// is freed from the cache as soon as its last in-graph consumer has been
+// evaluated (roots are pinned: they are returned to the caller), so peak
+// memory tracks the maximum live range rather than the whole graph. Dropping
+// a cache entry only releases the evaluator's reference: `Leaf` tensors
+// owned by JS handles stay alive through candle's refcounting.
+struct Evaluator {
+    cache: std::collections::HashMap<u64, Tensor>,
+    consumers: std::collections::HashMap<u64, usize>,
+    roots: HashSet<u64>,
+}
+
+impl Evaluator {
+    fn new(roots: &[Arc<Node>]) -> Self {
+        let mut consumers = std::collections::HashMap::new();
+        let mut visited = HashSet::new();
+        for root in roots {
+            count_consumers(root, &mut visited, &mut consumers);
+        }
+        Self {
+            cache: std::collections::HashMap::new(),
+            consumers,
+            roots: roots.iter().map(|root| root.id).collect(),
+        }
+    }
+
+    fn release_children(&mut self, node: &Arc<Node>) {
+        for child in node_children(&node.kind) {
+            if let Some(count) = self.consumers.get_mut(&child.id) {
+                *count -= 1;
+                if *count == 0 && !self.roots.contains(&child.id) {
+                    self.cache.remove(&child.id);
+                }
+            }
+        }
+    }
+}
+
+fn count_consumers(
+    node: &Arc<Node>,
+    visited: &mut HashSet<u64>,
+    consumers: &mut std::collections::HashMap<u64, usize>,
+) {
+    if !visited.insert(node.id) {
+        return;
+    }
+    for child in node_children(&node.kind) {
+        *consumers.entry(child.id).or_insert(0) += 1;
+        count_consumers(&child, visited, consumers);
+    }
+}
+
+fn node_children(kind: &NodeKind) -> Vec<Arc<Node>> {
+    match kind {
+        NodeKind::Leaf(_)
+        | NodeKind::FromBytes { .. }
+        | NodeKind::Zeros { .. }
+        | NodeKind::Ones { .. }
+        | NodeKind::Full { .. }
+        | NodeKind::Randn { .. }
+        | NodeKind::Arange { .. }
+        | NodeKind::Eye { .. } => vec![],
+        NodeKind::Add { a, b }
+        | NodeKind::Sub { a, b }
+        | NodeKind::Mul { a, b }
+        | NodeKind::Div { a, b }
+        | NodeKind::Eq { a, b }
+        | NodeKind::Gt { a, b }
+        | NodeKind::Lt { a, b }
+        | NodeKind::Ge { a, b }
+        | NodeKind::Le { a, b }
+        | NodeKind::Concat { a, b, .. }
+        | NodeKind::Matmul { a, b } => vec![a.clone(), b.clone()],
+        NodeKind::Neg { a }
+        | NodeKind::Abs { a }
+        | NodeKind::Sqrt { a }
+        | NodeKind::Exp { a }
+        | NodeKind::Log { a }
+        | NodeKind::Sin { a }
+        | NodeKind::Cos { a }
+        | NodeKind::Pow { a, .. }
+        | NodeKind::Cast { a, .. }
+        | NodeKind::Sum { a, .. }
+        | NodeKind::Mean { a, .. }
+        | NodeKind::Max { a, .. }
+        | NodeKind::Min { a, .. }
+        | NodeKind::Reshape { a, .. }
+        | NodeKind::Permute { a, .. }
+        | NodeKind::Slice { a, .. }
+        | NodeKind::BroadcastTo { a, .. }
+        | NodeKind::StopGradient { a } => vec![a.clone()],
+    }
+}
 
 fn eval_cmp(
     a: &Arc<Node>,
     b: &Arc<Node>,
     cancelled: &AtomicBool,
-    cache: &mut Cache,
+    ev: &mut Evaluator,
     f: impl Fn(&Tensor, &Tensor) -> candle_core::Result<Tensor>,
 ) -> candle_core::Result<Tensor> {
-    let a = eval_node(a, cancelled, cache)?;
-    let b = eval_node(b, cancelled, cache)?;
+    let a = eval_node(a, cancelled, ev)?;
+    let b = eval_node(b, cancelled, ev)?;
     let shape = a.shape().broadcast_shape_binary_op(b.shape(), "cmp")?;
     let a = a.broadcast_as(shape.clone())?;
     let b = b.broadcast_as(shape)?;
@@ -1113,14 +1224,25 @@ fn reduce_dims(
 fn eval_node(
     node: &Arc<Node>,
     cancelled: &AtomicBool,
-    cache: &mut Cache,
+    ev: &mut Evaluator,
 ) -> candle_core::Result<Tensor> {
     if cancelled.load(Ordering::Relaxed) {
         return Err(candle_core::Error::Msg("operation aborted".to_string()));
     }
-    if let Some(cached) = cache.get(&node.id) {
+    if let Some(cached) = ev.cache.get(&node.id) {
         return Ok(cached.clone());
     }
+    let output = eval_uncached(node, cancelled, ev)?;
+    ev.cache.insert(node.id, output.clone());
+    ev.release_children(node);
+    Ok(output)
+}
+
+fn eval_uncached(
+    node: &Arc<Node>,
+    cancelled: &AtomicBool,
+    ev: &mut Evaluator,
+) -> candle_core::Result<Tensor> {
     let output = match &node.kind {
         NodeKind::Leaf(tensor) => tensor.clone(),
         NodeKind::FromBytes {
@@ -1214,59 +1336,59 @@ fn eval_node(
             i.broadcast_eq(&j)?.to_dtype(*dtype)?
         }
         NodeKind::Add { a, b } => {
-            let a = eval_node(a, cancelled, cache)?;
-            let b = eval_node(b, cancelled, cache)?;
+            let a = eval_node(a, cancelled, ev)?;
+            let b = eval_node(b, cancelled, ev)?;
             a.broadcast_add(&b)?
         }
         NodeKind::Sub { a, b } => {
-            let a = eval_node(a, cancelled, cache)?;
-            let b = eval_node(b, cancelled, cache)?;
+            let a = eval_node(a, cancelled, ev)?;
+            let b = eval_node(b, cancelled, ev)?;
             a.broadcast_sub(&b)?
         }
         NodeKind::Mul { a, b } => {
-            let a = eval_node(a, cancelled, cache)?;
-            let b = eval_node(b, cancelled, cache)?;
+            let a = eval_node(a, cancelled, ev)?;
+            let b = eval_node(b, cancelled, ev)?;
             a.broadcast_mul(&b)?
         }
         NodeKind::Div { a, b } => {
-            let a = eval_node(a, cancelled, cache)?;
-            let b = eval_node(b, cancelled, cache)?;
+            let a = eval_node(a, cancelled, ev)?;
+            let b = eval_node(b, cancelled, ev)?;
             a.broadcast_div(&b)?
         }
-        NodeKind::Eq { a, b } => eval_cmp(a, b, cancelled, cache, |a, b| a.eq(b))?,
-        NodeKind::Gt { a, b } => eval_cmp(a, b, cancelled, cache, |a, b| a.gt(b))?,
-        NodeKind::Lt { a, b } => eval_cmp(a, b, cancelled, cache, |a, b| a.lt(b))?,
-        NodeKind::Ge { a, b } => eval_cmp(a, b, cancelled, cache, |a, b| a.ge(b))?,
-        NodeKind::Le { a, b } => eval_cmp(a, b, cancelled, cache, |a, b| a.le(b))?,
-        NodeKind::Neg { a } => eval_node(a, cancelled, cache)?.neg()?,
-        NodeKind::Abs { a } => eval_node(a, cancelled, cache)?.abs()?,
-        NodeKind::Sqrt { a } => eval_node(a, cancelled, cache)?.sqrt()?,
-        NodeKind::Exp { a } => eval_node(a, cancelled, cache)?.exp()?,
-        NodeKind::Log { a } => eval_node(a, cancelled, cache)?.log()?,
-        NodeKind::Sin { a } => eval_node(a, cancelled, cache)?.sin()?,
-        NodeKind::Cos { a } => eval_node(a, cancelled, cache)?.cos()?,
-        NodeKind::Pow { a, exp } => eval_node(a, cancelled, cache)?.powf(*exp)?,
-        NodeKind::Cast { a, dtype } => eval_node(a, cancelled, cache)?.to_dtype(*dtype)?,
+        NodeKind::Eq { a, b } => eval_cmp(a, b, cancelled, ev, |a, b| a.eq(b))?,
+        NodeKind::Gt { a, b } => eval_cmp(a, b, cancelled, ev, |a, b| a.gt(b))?,
+        NodeKind::Lt { a, b } => eval_cmp(a, b, cancelled, ev, |a, b| a.lt(b))?,
+        NodeKind::Ge { a, b } => eval_cmp(a, b, cancelled, ev, |a, b| a.ge(b))?,
+        NodeKind::Le { a, b } => eval_cmp(a, b, cancelled, ev, |a, b| a.le(b))?,
+        NodeKind::Neg { a } => eval_node(a, cancelled, ev)?.neg()?,
+        NodeKind::Abs { a } => eval_node(a, cancelled, ev)?.abs()?,
+        NodeKind::Sqrt { a } => eval_node(a, cancelled, ev)?.sqrt()?,
+        NodeKind::Exp { a } => eval_node(a, cancelled, ev)?.exp()?,
+        NodeKind::Log { a } => eval_node(a, cancelled, ev)?.log()?,
+        NodeKind::Sin { a } => eval_node(a, cancelled, ev)?.sin()?,
+        NodeKind::Cos { a } => eval_node(a, cancelled, ev)?.cos()?,
+        NodeKind::Pow { a, exp } => eval_node(a, cancelled, ev)?.powf(*exp)?,
+        NodeKind::Cast { a, dtype } => eval_node(a, cancelled, ev)?.to_dtype(*dtype)?,
         NodeKind::Sum { a, dims, keepdims } => {
-            let t = eval_node(a, cancelled, cache)?;
+            let t = eval_node(a, cancelled, ev)?;
             reduce_dims(&t, dims, *keepdims, |t, d| t.sum(d))?
         }
         NodeKind::Mean { a, dims, keepdims } => {
-            let t = eval_node(a, cancelled, cache)?;
+            let t = eval_node(a, cancelled, ev)?;
             reduce_dims(&t, dims, *keepdims, |t, d| t.mean(d))?
         }
         NodeKind::Max { a, dims, keepdims } => {
-            let t = eval_node(a, cancelled, cache)?;
+            let t = eval_node(a, cancelled, ev)?;
             reduce_dims(&t, dims, *keepdims, |t, d| t.max(d))?
         }
         NodeKind::Min { a, dims, keepdims } => {
-            let t = eval_node(a, cancelled, cache)?;
+            let t = eval_node(a, cancelled, ev)?;
             reduce_dims(&t, dims, *keepdims, |t, d| t.min(d))?
         }
-        NodeKind::Reshape { a, shape } => eval_node(a, cancelled, cache)?.reshape(shape.clone())?,
-        NodeKind::Permute { a, dims } => eval_node(a, cancelled, cache)?.permute(dims.clone())?,
+        NodeKind::Reshape { a, shape } => eval_node(a, cancelled, ev)?.reshape(shape.clone())?,
+        NodeKind::Permute { a, dims } => eval_node(a, cancelled, ev)?.permute(dims.clone())?,
         NodeKind::Slice { a, ranges } => {
-            let mut t = eval_node(a, cancelled, cache)?;
+            let mut t = eval_node(a, cancelled, ev)?;
             for (dim, &(start, stop, stride)) in ranges.iter().enumerate() {
                 let len = stop.saturating_sub(start).div_ceil(stride);
                 if len == 0 {
@@ -1283,16 +1405,16 @@ fn eval_node(
             t
         }
         NodeKind::Concat { a, b, dim } => {
-            let a = eval_node(a, cancelled, cache)?;
-            let b = eval_node(b, cancelled, cache)?;
+            let a = eval_node(a, cancelled, ev)?;
+            let b = eval_node(b, cancelled, ev)?;
             Tensor::cat(&[&a, &b], *dim)?
         }
         NodeKind::BroadcastTo { a, shape } => {
-            eval_node(a, cancelled, cache)?.broadcast_as(shape.clone())?
+            eval_node(a, cancelled, ev)?.broadcast_as(shape.clone())?
         }
         NodeKind::Matmul { a, b } => {
-            let a = eval_node(a, cancelled, cache)?;
-            let b = eval_node(b, cancelled, cache)?;
+            let a = eval_node(a, cancelled, ev)?;
+            let b = eval_node(b, cancelled, ev)?;
             // candle's matmul requires contiguous operands; permuted or
             // broadcast layouts (common in backward graphs) must be
             // materialized first.
@@ -1300,9 +1422,8 @@ fn eval_node(
             let b = if b.is_contiguous() { b } else { b.contiguous()? };
             a.broadcast_matmul(&b)?
         }
-        NodeKind::StopGradient { a } => eval_node(a, cancelled, cache)?,
+        NodeKind::StopGradient { a } => eval_node(a, cancelled, ev)?,
     };
-    cache.insert(node.id, output.clone());
     Ok(output)
 }
 
@@ -1443,48 +1564,6 @@ mod autodiff {
         broadcast_to(g, target)
     }
 
-    fn children(kind: &NodeKind) -> Vec<Arc<Node>> {
-        match kind {
-            NodeKind::Leaf(_)
-            | NodeKind::FromBytes { .. }
-            | NodeKind::Zeros { .. }
-            | NodeKind::Ones { .. }
-            | NodeKind::Full { .. }
-            | NodeKind::Randn { .. }
-            | NodeKind::Arange { .. }
-            | NodeKind::Eye { .. } => vec![],
-            NodeKind::Add { a, b }
-            | NodeKind::Sub { a, b }
-            | NodeKind::Mul { a, b }
-            | NodeKind::Div { a, b }
-            | NodeKind::Eq { a, b }
-            | NodeKind::Gt { a, b }
-            | NodeKind::Lt { a, b }
-            | NodeKind::Ge { a, b }
-            | NodeKind::Le { a, b }
-            | NodeKind::Concat { a, b, .. }
-            | NodeKind::Matmul { a, b } => vec![a.clone(), b.clone()],
-            NodeKind::Neg { a }
-            | NodeKind::Abs { a }
-            | NodeKind::Sqrt { a }
-            | NodeKind::Exp { a }
-            | NodeKind::Log { a }
-            | NodeKind::Sin { a }
-            | NodeKind::Cos { a }
-            | NodeKind::Pow { a, .. }
-            | NodeKind::Cast { a, .. }
-            | NodeKind::Sum { a, .. }
-            | NodeKind::Mean { a, .. }
-            | NodeKind::Max { a, .. }
-            | NodeKind::Min { a, .. }
-            | NodeKind::Reshape { a, .. }
-            | NodeKind::Permute { a, .. }
-            | NodeKind::Slice { a, .. }
-            | NodeKind::BroadcastTo { a, .. }
-            | NodeKind::StopGradient { a } => vec![a.clone()],
-        }
-    }
-
     fn topo(loss: &Arc<Node>) -> Vec<Arc<Node>> {
         let mut visited = HashSet::new();
         let mut order = Vec::new();
@@ -1498,7 +1577,7 @@ mod autodiff {
                 continue;
             }
             stack.push((node.clone(), true));
-            for child in children(&node.kind) {
+            for child in node_children(&node.kind) {
                 stack.push((child, false));
             }
         }
@@ -1777,10 +1856,28 @@ async fn run_compute<T: Send + 'static>(
     compute: impl FnOnce(&AtomicBool) -> Result<T> + Send + 'static,
 ) -> Result<T> {
     let flag = token.map(|t| t.cancelled.clone());
-    let handle = tokio::task::spawn_blocking(move || {
-        let cancelled = flag.unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
-        compute(&cancelled)
-    });
+    // The evaluator recurses per graph node; tokio's blocking threads use the
+    // default 2 MiB stack, which overflows on chains of a few thousand nodes.
+    // Run on a dedicated thread with a stack sized for realistic model depths
+    // (reserved virtually, committed lazily by the OS).
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    std::thread::Builder::new()
+        .name("effect-torch-compute".to_string())
+        .stack_size(256 << 20)
+        .spawn(move || {
+            let cancelled = flag.unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
+            let _ = tx.send(compute(&cancelled));
+        })
+        .map_err(|err| Error::new(Status::GenericFailure, err.to_string()))?;
+    let handle = async move {
+        match rx.await {
+            Ok(result) => result,
+            Err(_) => Err(Error::new(
+                Status::GenericFailure,
+                "compute thread panicked".to_string(),
+            )),
+        }
+    };
     match token {
         Some(token) => {
             if token.cancelled.load(Ordering::Relaxed) {
@@ -1791,14 +1888,14 @@ async fn run_compute<T: Send + 'static>(
             }
             let notify = token.notify.clone();
             tokio::select! {
-                result = handle => result.map_err(to_join_err)?,
+                result = handle => result,
                 _ = notify.notified() => Err(Error::new(
                     Status::Cancelled,
                     "operation aborted".to_string(),
                 )),
             }
         }
-        None => handle.await.map_err(to_join_err)?,
+        None => handle.await,
     }
 }
 
@@ -1809,14 +1906,34 @@ pub async fn eval_lazy(
 ) -> Result<Vec<NativeTensor>> {
     let nodes: Vec<Arc<Node>> = tensors.iter().map(|t| t.node.clone()).collect();
     run_compute(token, move |cancelled| {
-        let mut cache = Cache::new();
+        let mut ev = Evaluator::new(&nodes);
         let mut outputs = Vec::with_capacity(nodes.len());
         for node in &nodes {
-            let output = eval_node(node, cancelled, &mut cache).map_err(to_napi_err)?;
+            let output = eval_node(node, cancelled, &mut ev).map_err(to_napi_err)?;
             output.device().synchronize().map_err(to_napi_err)?;
             outputs.push(NativeTensor::wrap(output));
         }
         Ok(outputs)
     })
     .await
+}
+
+// Positive half of the external-memory accounting (the negative half runs in
+// NativeTensor's finalizer). A sync call so it executes on the main thread:
+// async napi functions run their body on the tokio runtime, where touching
+// the env is not allowed.
+#[napi]
+pub fn report_external_memory(env: Env, bytes: i64) -> Result<()> {
+    EXTERNAL_MEMORY_BYTES.fetch_add(bytes, Ordering::Relaxed);
+    env.adjust_external_memory(bytes)?;
+    Ok(())
+}
+
+// Native bytes currently retained by JS-reachable tensors. Exposed so tests
+// can verify the accounting returns to baseline: Node's
+// `process.memoryUsage().external` does not reflect
+// `napi_adjust_external_memory`.
+#[napi]
+pub fn external_memory_bytes() -> i64 {
+    EXTERNAL_MEMORY_BYTES.load(Ordering::Relaxed)
 }
