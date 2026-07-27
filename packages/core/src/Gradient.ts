@@ -198,3 +198,58 @@ export const jvp = (
     const [tangent] = yield* grad(loss2, [u])
     return tangent
   })
+
+/**
+ * Maps the function implicit in a graph over a batch dimension: given an
+ * output graph `y` built from the unbatched input `x`, and `batchedX`
+ * equal to `x` with a batch dimension inserted at `dim`, returns the graph
+ * of `y` applied elementwise along that dimension (the output carries the
+ * batch at `dim` too). This is a native graph rewrite with per-op batching
+ * rules — not a slice-and-restack loop — so the batched graph is the same
+ * size as the original. Elementwise ops and matmul batch by broadcasting;
+ * reductions and shape ops shift their metadata; `randn`/`uniform` draw
+ * per batch element; indexing with data-dependent indexes, `gather`,
+ * `scatterAdd`, and rank-2 linalg are not supported.
+ *
+ * @since 0.1.0
+ * @category autodiff
+ */
+export const vmap = (
+  y: Tensor.GenericTensor,
+  x: Tensor.GenericTensor,
+  batchedX: Tensor.GenericTensor,
+  options: { readonly dim?: number } = {}
+): Effect.Effect<Tensor.LazyTensor, Tensor.TensorError> =>
+  Effect.try({
+    try: () => {
+      const dim = options.dim ?? 0
+      if (batchedX.shape.length !== x.shape.length + 1 || dim < 0 || dim >= batchedX.shape.length) {
+        throw new Error(
+          `vmap: batched input shape [${batchedX.shape}] must be the input shape [${x.shape}] with one dimension inserted`
+        )
+      }
+      for (let i = 0; i < x.shape.length; i++) {
+        const at = i < dim ? i : i + 1
+        if (batchedX.shape[at] !== x.shape[i]) {
+          throw new Error(
+            `vmap: batched input shape [${batchedX.shape}] does not match input shape [${x.shape}] outside dim ${dim}`
+          )
+        }
+      }
+      if (batchedX.dtype !== x.dtype) {
+        throw new Error(`vmap: dtype mismatch, got ${batchedX.dtype} and ${x.dtype}`)
+      }
+      if (batchedX.device !== x.device) {
+        throw new Error(`vmap: device mismatch, got ${batchedX.device} and ${x.device}`)
+      }
+      const batch = batchedX.shape[dim]
+      const outShape = [...y.shape]
+      outShape.splice(Math.min(dim, outShape.length), 0, batch)
+      return Tensor.makeLazy(y.lazy.vmap(x.lazy, batchedX.lazy, dim), outShape, y.dtype, y.device)
+    },
+    catch: (error) =>
+      new Tensor.TensorError({
+        op: "vmap",
+        message: error instanceof Error ? error.message : String(error)
+      })
+  })

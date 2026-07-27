@@ -246,6 +246,7 @@ so gradients can be differentiated again.
 | `grad(loss, wrt)` | gradients of a scalar `loss` w.r.t. the given tensors; tensors not influencing the loss get zeros |
 | `vjp(y, x, v)` | pullback `J(x)ᵀ v` of an output graph `y` built from `x` |
 | `jvp(y, x, v)` | pushforward `J(x) v` (forward-over-reverse) |
+| `vmap(y, x, batchedX, { dim? })` | batch the function implicit in `y` over `dim` of `batchedX` — a native graph rewrite with per-op batching rules, not a slice loop |
 | `stopGradient(t)` | blocks gradient flow through `t` |
 | `checkpoint(t)` | recomputes the subgraph's intermediates in backward instead of retaining them |
 | `GradError` | typed error: non-scalar output, non-float dtype, or non-differentiable op |

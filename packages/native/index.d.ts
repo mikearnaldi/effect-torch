@@ -67,6 +67,7 @@ export declare class LazyTensor {
   broadcastTo(shape: Array<number>): LazyTensor
   stopGradient(): LazyTensor
   checkpoint(): LazyTensor
+  vmap(x: LazyTensor, batchedX: LazyTensor, dim: number): LazyTensor
 }
 
 export declare class NativeTensor {

@@ -1578,6 +1578,11 @@ impl LazyTensor {
             a: self.node.clone(),
         }))
     }
+
+    #[napi]
+    pub fn vmap(&self, x: &LazyTensor, batched_x: &LazyTensor, dim: u32) -> Result<Self> {
+        lazy_ctor!(autodiff::vmap(&self.node, &x.node, &batched_x.node, dim as usize))
+    }
 }
 
 // Evaluation holds intermediate results in a cache keyed by node id. A node
@@ -2539,6 +2544,200 @@ mod autodiff {
             }
         }
         order
+    }
+
+    // Nodes of `root`'s graph whose subtree contains `x_id` — the subgraph
+    // that must be rebuilt under vmap.
+    fn descendants_of(root: &Arc<Node>, x_id: u64) -> HashSet<u64> {
+        let mut set = HashSet::new();
+        for node in topo(root) {
+            if node.id == x_id || node_children(&node.kind).iter().any(|c| set.contains(&c.id)) {
+                set.insert(node.id);
+            }
+        }
+        set
+    }
+
+    fn shift_dim(d: usize, batch_dim: usize) -> usize {
+        if d >= batch_dim { d + 1 } else { d }
+    }
+
+    fn insert_batch(shape: &[usize], dim: usize, batch: usize) -> Vec<usize> {
+        let mut out = shape.to_vec();
+        out.insert(dim.min(out.len()), batch);
+        out
+    }
+
+    // Per-op batching rules: rebuild a node for a graph whose input gained
+    // a leading-dim-style batch axis at `dim`. Elementwise ops, matmul and
+    // wrappers are unchanged (broadcasting carries the batch); shape and
+    // reduction metadata shifts around the inserted axis; random sources
+    // draw per batch element; indexing with data-dependent indexes and
+    // gather/scatter are rejected for now.
+    fn vmap_rebuild(
+        node: &Node,
+        dim: usize,
+        batch: usize,
+        f: &dyn Fn(&Arc<Node>) -> Arc<Node>,
+        is_batched: &dyn Fn(u64) -> bool,
+    ) -> std::result::Result<NodeKind, String> {
+        let shift_dims = |dims: &[usize]| dims.iter().map(|&d| shift_dim(d, dim)).collect();
+        match &node.kind {
+            NodeKind::Randn {
+                shape,
+                dtype,
+                device,
+            } => Ok(NodeKind::Randn {
+                shape: insert_batch(shape, dim, batch),
+                dtype: *dtype,
+                device: device.clone(),
+            }),
+            NodeKind::Uniform {
+                lo,
+                hi,
+                shape,
+                dtype,
+                device,
+            } => Ok(NodeKind::Uniform {
+                lo: *lo,
+                hi: *hi,
+                shape: insert_batch(shape, dim, batch),
+                dtype: *dtype,
+                device: device.clone(),
+            }),
+            NodeKind::Sum { a, dims, keepdims } => Ok(NodeKind::Sum {
+                a: f(a),
+                dims: shift_dims(dims),
+                keepdims: *keepdims,
+            }),
+            NodeKind::Mean { a, dims, keepdims } => Ok(NodeKind::Mean {
+                a: f(a),
+                dims: shift_dims(dims),
+                keepdims: *keepdims,
+            }),
+            NodeKind::Max { a, dims, keepdims } => Ok(NodeKind::Max {
+                a: f(a),
+                dims: shift_dims(dims),
+                keepdims: *keepdims,
+            }),
+            NodeKind::Min { a, dims, keepdims } => Ok(NodeKind::Min {
+                a: f(a),
+                dims: shift_dims(dims),
+                keepdims: *keepdims,
+            }),
+            NodeKind::Prod { a, dims, keepdims } => Ok(NodeKind::Prod {
+                a: f(a),
+                dims: shift_dims(dims),
+                keepdims: *keepdims,
+            }),
+            NodeKind::Argmax { a, dim: d } => Ok(NodeKind::Argmax {
+                a: f(a),
+                dim: shift_dim(*d, dim),
+            }),
+            NodeKind::Argmin { a, dim: d } => Ok(NodeKind::Argmin {
+                a: f(a),
+                dim: shift_dim(*d, dim),
+            }),
+            NodeKind::Cumsum { a, dim: d } => Ok(NodeKind::Cumsum {
+                a: f(a),
+                dim: shift_dim(*d, dim),
+            }),
+            NodeKind::Reshape { a, shape } => Ok(NodeKind::Reshape {
+                a: f(a),
+                shape: insert_batch(shape, dim, batch),
+            }),
+            NodeKind::Permute { a, dims } => {
+                let mut out: Vec<usize> = dims.iter().map(|&d| shift_dim(d, dim)).collect();
+                out.insert(dim, dim);
+                Ok(NodeKind::Permute { a: f(a), dims: out })
+            }
+            NodeKind::Slice { a, ranges } => {
+                let mut out = ranges.clone();
+                out.insert(dim, (0, batch, 1));
+                Ok(NodeKind::Slice { a: f(a), ranges: out })
+            }
+            NodeKind::Concat { a, b, dim: d } => Ok(NodeKind::Concat {
+                a: f(a),
+                b: f(b),
+                dim: shift_dim(*d, dim),
+            }),
+            NodeKind::BroadcastTo { a, shape } => Ok(NodeKind::BroadcastTo {
+                a: f(a),
+                shape: insert_batch(shape, dim, batch),
+            }),
+            NodeKind::IndexSelect { a, dim: d, indexes } => {
+                if is_batched(indexes.id) {
+                    return Err(
+                        "vmap: index_select with data-dependent indexes is not supported"
+                            .to_string(),
+                    );
+                }
+                Ok(NodeKind::IndexSelect {
+                    a: f(a),
+                    dim: shift_dim(*d, dim),
+                    indexes: indexes.clone(),
+                })
+            }
+            NodeKind::Gather { .. } | NodeKind::ScatterAdd { .. } => Err(
+                "vmap: gather and scatterAdd are not supported under vmap".to_string(),
+            ),
+            _ => Ok(remap_children(&node.kind, f)),
+        }
+    }
+
+    pub fn vmap(
+        y: &Arc<Node>,
+        x: &Arc<Node>,
+        batched: &Arc<Node>,
+        dim: usize,
+    ) -> std::result::Result<Arc<Node>, String> {
+        if batched.shape.len() != x.shape.len() + 1 || dim >= batched.shape.len() {
+            return Err(format!(
+                "vmap: batched input shape {:?} must be the input shape {:?} with one dimension inserted",
+                batched.shape, x.shape
+            ));
+        }
+        for (i, &d) in x.shape.iter().enumerate() {
+            let at = if i < dim { i } else { i + 1 };
+            if batched.shape[at] != d {
+                return Err(format!(
+                    "vmap: batched input shape {:?} does not match input shape {:?} outside dim {dim}",
+                    batched.shape, x.shape
+                ));
+            }
+        }
+        if batched.dtype != x.dtype {
+            return Err(format!(
+                "vmap: dtype mismatch, got {:?} and {:?}",
+                batched.dtype, x.dtype
+            ));
+        }
+        let batch = batched.shape[dim];
+        let descendants = descendants_of(y, x.id);
+        if !descendants.contains(&y.id) {
+            return Err("vmap: the output does not depend on the input".to_string());
+        }
+        let mut map: HashMap<u64, Arc<Node>> = HashMap::new();
+        map.insert(x.id, batched.clone());
+        for node in topo(y) {
+            // random sources inside the mapped graph draw per batch element
+            // even when they do not depend on the input; everything else is
+            // rebuilt only when it descends from the input
+            let is_random = matches!(node.kind, NodeKind::Randn { .. } | NodeKind::Uniform { .. });
+            if node.id == x.id || (!is_random && !descendants.contains(&node.id)) {
+                continue;
+            }
+            let kind = vmap_rebuild(
+                &node,
+                dim,
+                batch,
+                &|child: &Arc<Node>| map.get(&child.id).cloned().unwrap_or_else(|| child.clone()),
+                &|id: u64| map.contains_key(&id),
+            )?;
+            let rebuilt = mk(kind)?;
+            map.insert(node.id, rebuilt);
+        }
+        Ok(map.get(&y.id).expect("vmap root").clone())
     }
 
     pub fn grad(

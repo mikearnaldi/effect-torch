@@ -296,6 +296,58 @@ layer(Device.Cpu)("Autodiff", (it) => {
       })
     )
 
+    it.effect("vmap rewrites the graph with per-op batching rules", () =>
+      Effect.gen(function* () {
+        // elementwise + reduction: per-row sum of squares
+        const x1 = yield* f64([1, 2, 3])
+        const y1 = yield* Tensor.sum(yield* Tensor.square(x1))
+        const bx1 = yield* f64([1, 2, 3, 4, 5, 6], [2, 3])
+        const out1 = yield* Gradient.vmap(y1, x1, bx1)
+        assert.deepStrictEqual(out1.shape, [2])
+        assert.deepStrictEqual(yield* values(out1), [14, 77])
+
+        // matmul: per-example A @ x
+        const a = yield* f64([1, 2, 3, 4, 5, 6], [2, 3])
+        const x2 = yield* f64([1, 1, 1], [3, 1])
+        const y2 = yield* Tensor.matmul(a, x2)
+        const bx2 = yield* f64([1, 0, 0, 0, 1, 0, 0, 0, 1], [3, 3, 1])
+        const out2 = yield* Gradient.vmap(y2, x2, bx2)
+        assert.deepStrictEqual(out2.shape, [3, 2, 1])
+        assert.deepStrictEqual(yield* values(out2), [1, 4, 2, 5, 3, 6])
+
+        // softmax + reshape + transpose + slice: matches slice-restack reference
+        const x3 = yield* f64([0.5, -1, 2])
+        const y3 = yield* Tensor.softmax(x3)
+        const bx3 = yield* f64([0.5, -1, 2, 1, 0.5, -0.5], [2, 3])
+        const out3 = yield* Gradient.vmap(y3, x3, bx3)
+        const ref0 = yield* values(yield* Tensor.softmax(yield* f64([0.5, -1, 2])))
+        const ref1 = yield* values(yield* Tensor.softmax(yield* f64([1, 0.5, -0.5])))
+        const actual3 = yield* values(out3)
+        for (let i = 0; i < 6; i++) {
+          expect(Math.abs(actual3[i] - [...ref0, ...ref1][i])).toBeLessThan(1e-12)
+        }
+
+        // randn draws per batch element
+        const x4 = yield* f64([1, 1])
+        const y4 = yield* Tensor.mul(x4, yield* Tensor.randn([2], { dtype: "f64" }))
+        const bx4 = yield* f64([1, 1, 1, 1, 1, 1], [3, 2])
+        const out4 = yield* values(yield* Gradient.vmap(y4, x4, bx4))
+        const rows = [out4.slice(0, 2), out4.slice(2, 4), out4.slice(4, 6)]
+        const distinct = new Set(rows.map((r) => r.map((v) => v.toFixed(6)).join(",")))
+        assert.assertTrue(distinct.size > 1)
+
+        // gradients flow through the rewritten graph
+        const loss = yield* Tensor.sum(out1)
+        const [g] = yield* Gradient.grad(loss, [bx1])
+        assert.deepStrictEqual(yield* values(g), [2, 4, 6, 8, 10, 12])
+
+        // output that does not depend on the input fails
+        const constant = yield* Tensor.ones([2])
+        const error = yield* Effect.flip(Gradient.vmap(constant, x1, bx1))
+        expect(error.message).toContain("does not depend")
+      })
+    )
+
     it.effect("matmul", () =>
       Effect.gen(function* () {
         const b = yield* f64([1, 2, 3, 4, 5, 6], [3, 2])
