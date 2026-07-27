@@ -6,7 +6,7 @@
  * result to the optimizer factory:
  *
  * ```ts
- * const lr = Schedule.withWarmup(Schedule.cosine(1e-3, { totalSteps }), 100)
+ * const lr = LrSchedule.withWarmup(LrSchedule.cosine(1e-3, { totalSteps }), 100)
  * for (let t = 0; t < totalSteps; t++) {
  *   const optimizer = Optimizer.adam({ lr: lr(t) })
  *   ...
