@@ -60,7 +60,9 @@ export interface SgdState {
 
 /**
  * Configuration for Adam. All fields default to the standard values
- * (`lr = 1e-3`, `beta1 = 0.9`, `beta2 = 0.999`, `eps = 1e-8`).
+ * (`lr = 1e-3`, `beta1 = 0.9`, `beta2 = 0.999`, `eps = 1e-8`). `fused`
+ * (default `true`) computes each parameter's update as a single native
+ * node instead of ~10 graph nodes — identical numerics, smaller graphs.
  *
  * @since 0.1.0
  * @category models
@@ -70,6 +72,7 @@ export interface AdamConfig {
   readonly beta1?: number
   readonly beta2?: number
   readonly eps?: number
+  readonly fused?: boolean
 }
 
 /**
@@ -298,10 +301,11 @@ interface ResolvedAdamConfig {
   readonly beta2: number
   readonly eps: number
   readonly weightDecay: number
+  readonly fused: boolean
 }
 
 const makeAdam = (op: string, config: ResolvedAdamConfig): Optimizer<AdamState> => {
-  const { lr, beta1, beta2, eps, weightDecay } = config
+  const { lr, beta1, beta2, eps, weightDecay, fused } = config
   if (lr <= 0) {
     throw new Error(`${op}: lr must be positive, got ${lr}`)
   }
@@ -327,6 +331,22 @@ const makeAdam = (op: string, config: ResolvedAdamConfig): Optimizer<AdamState> 
     Tensor.TensorError
   > =>
     Effect.gen(function* () {
+      if (fused) {
+        const step = yield* Effect.try({
+          try: () =>
+            param.lazy.adamwStep(grad.lazy, m.lazy, v.lazy, lr, beta1, beta2, eps, weightDecay, t),
+          catch: (error) =>
+            new Tensor.TensorError({
+              op,
+              message: error instanceof Error ? error.message : String(error)
+            })
+        })
+        const makeOut = (index: number): Tensor.LazyTensor => {
+          const handle = step.adamwOut(index)
+          return Tensor.makeLazy(handle, param.shape, param.dtype, param.device)
+        }
+        return { param: makeOut(0), m: makeOut(1), v: makeOut(2) }
+      }
       const nextM = yield* Tensor.add(yield* Tensor.mul(m, beta1), yield* Tensor.mul(grad, 1 - beta1))
       const nextV = yield* Tensor.add(
         yield* Tensor.mul(v, beta2),
@@ -395,7 +415,8 @@ export const adam = (config: AdamConfig = {}): Optimizer<AdamState> =>
     beta1: config.beta1 ?? 0.9,
     beta2: config.beta2 ?? 0.999,
     eps: config.eps ?? 1e-8,
-    weightDecay: 0
+    weightDecay: 0,
+    fused: config.fused ?? true
   })
 
 /**
@@ -412,7 +433,8 @@ export const adamW = (config: AdamWConfig = {}): Optimizer<AdamState> =>
     beta1: config.beta1 ?? 0.9,
     beta2: config.beta2 ?? 0.999,
     eps: config.eps ?? 1e-8,
-    weightDecay: config.weightDecay ?? 0.01
+    weightDecay: config.weightDecay ?? 0.01,
+    fused: config.fused ?? true
   })
 
 /**

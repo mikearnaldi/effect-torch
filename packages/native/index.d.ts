@@ -68,6 +68,8 @@ export declare class LazyTensor {
   stopGradient(): LazyTensor
   checkpoint(): LazyTensor
   vmap(x: LazyTensor, batchedX: LazyTensor, dim: number): LazyTensor
+  adamwStep(grad: LazyTensor, m: LazyTensor, v: LazyTensor, lr: number, beta1: number, beta2: number, eps: number, weightDecay: number, t: number): LazyTensor
+  adamwOut(index: number): LazyTensor
 }
 
 export declare class NativeTensor {

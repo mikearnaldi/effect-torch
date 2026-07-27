@@ -323,6 +323,40 @@ layer(Device.Cpu)("Optimizer", (it) => {
         expect(() => Optimizer.adam({ eps: 0 })).toThrow("eps must be positive")
       })
     )
+
+    it.effect("fused and composed adamW produce identical trajectories", () =>
+      Effect.gen(function* () {
+        const x = yield* Tensor.fromTypedArray(new Float64Array([1, 1, 2, 1, 3, 1, 4, 1]), [4, 2])
+        const y = yield* Tensor.fromTypedArray(new Float64Array([2, 3, 4, 5]), [4, 1])
+        const run = (fused: boolean) =>
+          Effect.gen(function* () {
+            let params: ReadonlyArray<Tensor.GenericTensor> = [
+              yield* Tensor.fromTypedArray(new Float64Array([0, 0]))
+            ]
+            const optimizer = Optimizer.adamW({ lr: 0.05, fused })
+            let state = yield* optimizer.init(params)
+            for (let i = 0; i < 20; i++) {
+              const pred = yield* Tensor.matmul(x, yield* Tensor.reshape(params[0], [2, 1]))
+              const loss = yield* Loss.mse(pred, y)
+              const next = yield* Optimizer.step(optimizer, loss, params, state)
+              params = next.params
+              state = next.state
+            }
+            return {
+              w: yield* values(params[0]),
+              m: yield* values(state.m[0]),
+              v: yield* values(state.v[0])
+            }
+          })
+        const fusedRun = yield* run(true)
+        const composedRun = yield* run(false)
+        for (let i = 0; i < 2; i++) {
+          expect(Math.abs(fusedRun.w[i] - composedRun.w[i])).toBeLessThan(1e-9)
+          expect(Math.abs(fusedRun.m[i] - composedRun.m[i])).toBeLessThan(1e-9)
+          expect(Math.abs(fusedRun.v[i] - composedRun.v[i])).toBeLessThan(1e-9)
+        }
+      })
+    )
   })
 
   describe("gradient clipping", () => {

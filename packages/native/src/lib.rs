@@ -609,6 +609,22 @@ enum NodeKind {
         a: Arc<Node>,
         b: Arc<Node>,
     },
+    AdamWStep {
+        param: Arc<Node>,
+        grad: Arc<Node>,
+        m: Arc<Node>,
+        v: Arc<Node>,
+        lr: f64,
+        beta1: f64,
+        beta2: f64,
+        eps: f64,
+        weight_decay: f64,
+        t: f64,
+    },
+    AdamWOut {
+        step: Arc<Node>,
+        index: u8,
+    },
     StopGradient {
         a: Arc<Node>,
     },
@@ -1016,6 +1032,34 @@ impl Node {
                     ));
                 }
                 (b.shape.clone(), a.dtype, a.device.clone())
+            }
+            NodeKind::AdamWStep {
+                param,
+                grad,
+                m,
+                v,
+                ..
+            } => {
+                if !param.dtype.is_float() {
+                    return Err(format!(
+                        "adamw_step: dtype must be floating point, got {:?}",
+                        param.dtype
+                    ));
+                }
+                for (name, t) in [("grad", grad), ("m", m), ("v", v)] {
+                    if t.shape != param.shape || t.dtype != param.dtype {
+                        return Err(format!(
+                            "adamw_step: {name} must match the parameter shape and dtype"
+                        ));
+                    }
+                }
+                (param.shape.clone(), param.dtype, param.device.clone())
+            }
+            NodeKind::AdamWOut { step, index } => {
+                if *index > 2 {
+                    return Err(format!("adamw_out: index must be 0, 1 or 2, got {index}"));
+                }
+                (step.shape.clone(), step.dtype, step.device.clone())
             }
         };
         Ok(Arc::new(Node {
@@ -1583,6 +1627,42 @@ impl LazyTensor {
     pub fn vmap(&self, x: &LazyTensor, batched_x: &LazyTensor, dim: u32) -> Result<Self> {
         lazy_ctor!(autodiff::vmap(&self.node, &x.node, &batched_x.node, dim as usize))
     }
+
+    #[napi]
+    #[allow(clippy::too_many_arguments)]
+    pub fn adamw_step(
+        &self,
+        grad: &LazyTensor,
+        m: &LazyTensor,
+        v: &LazyTensor,
+        lr: f64,
+        beta1: f64,
+        beta2: f64,
+        eps: f64,
+        weight_decay: f64,
+        t: f64,
+    ) -> Result<Self> {
+        lazy_ctor!(Node::new(NodeKind::AdamWStep {
+            param: self.node.clone(),
+            grad: grad.node.clone(),
+            m: m.node.clone(),
+            v: v.node.clone(),
+            lr,
+            beta1,
+            beta2,
+            eps,
+            weight_decay,
+            t,
+        }))
+    }
+
+    #[napi]
+    pub fn adamw_out(&self, index: u8) -> Result<Self> {
+        lazy_ctor!(Node::new(NodeKind::AdamWOut {
+            step: self.node.clone(),
+            index,
+        }))
+    }
 }
 
 // Evaluation holds intermediate results in a cache keyed by node id. A node
@@ -1593,6 +1673,9 @@ impl LazyTensor {
 // owned by JS handles stay alive through candle's refcounting.
 struct Evaluator {
     cache: std::collections::HashMap<u64, Tensor>,
+    // AdamW step id -> (next m, next v); the step node's own value is the
+    // updated parameter, stored in the regular cache
+    adamw: std::collections::HashMap<u64, [Tensor; 2]>,
     consumers: std::collections::HashMap<u64, usize>,
     roots: HashSet<u64>,
 }
@@ -1605,6 +1688,7 @@ impl Evaluator {
         }
         Self {
             cache: std::collections::HashMap::new(),
+            adamw: std::collections::HashMap::new(),
             consumers,
             roots: roots.iter().map(|root| root.id).collect(),
         }
@@ -1622,6 +1706,7 @@ impl Evaluator {
                 *count -= 1;
                 if *count == 0 && !self.roots.contains(&child.id) {
                     self.cache.remove(&child.id);
+                    self.adamw.remove(&child.id);
                 }
             }
         }
@@ -1708,6 +1793,14 @@ fn node_children(kind: &NodeKind) -> Vec<Arc<Node>> {
             src,
             ..
         } => vec![a.clone(), indexes.clone(), src.clone()],
+        NodeKind::AdamWStep {
+            param,
+            grad,
+            m,
+            v,
+            ..
+        } => vec![param.clone(), grad.clone(), m.clone(), v.clone()],
+        NodeKind::AdamWOut { step, .. } => vec![step.clone()],
     }
 }
 
@@ -1907,6 +2000,33 @@ fn remap_children(kind: &NodeKind, f: &dyn Fn(&Arc<Node>) -> Arc<Node>) -> NodeK
         },
         NodeKind::Checkpoint { a } => NodeKind::Checkpoint { a: f(a) },
         NodeKind::StopGradient { a } => NodeKind::StopGradient { a: f(a) },
+        NodeKind::AdamWStep {
+            param,
+            grad,
+            m,
+            v,
+            lr,
+            beta1,
+            beta2,
+            eps,
+            weight_decay,
+            t,
+        } => NodeKind::AdamWStep {
+            param: f(param),
+            grad: f(grad),
+            m: f(m),
+            v: f(v),
+            lr: *lr,
+            beta1: *beta1,
+            beta2: *beta2,
+            eps: *eps,
+            weight_decay: *weight_decay,
+            t: *t,
+        },
+        NodeKind::AdamWOut { step, index } => NodeKind::AdamWOut {
+            step: f(step),
+            index: *index,
+        },
     }
 }
 
@@ -2090,7 +2210,7 @@ fn eval_node(
         .clone())
 }
 
-fn eval_uncached(node: &Arc<Node>, ev: &Evaluator) -> candle_core::Result<Tensor> {
+fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> candle_core::Result<Tensor> {
     let output = match &node.kind {
         NodeKind::Leaf(tensor) => tensor.clone(),
         NodeKind::FromBytes {
@@ -2381,6 +2501,49 @@ fn eval_uncached(node: &Arc<Node>, ev: &Evaluator) -> candle_core::Result<Tensor
         }
         NodeKind::StopGradient { a } => ev.value(a.id)?,
         NodeKind::Checkpoint { a } => ev.value(a.id)?,
+        NodeKind::AdamWStep {
+            param,
+            grad,
+            m,
+            v,
+            lr,
+            beta1,
+            beta2,
+            eps,
+            weight_decay,
+            t,
+        } => {
+            let p = ev.value(param.id)?;
+            let g = ev.value(grad.id)?;
+            let m_t = ev.value(m.id)?;
+            let v_t = ev.value(v.id)?;
+            let one_minus_beta1 = 1.0 - *beta1;
+            let one_minus_beta2 = 1.0 - *beta2;
+            let next_m = ((m_t * *beta1)? + (&g * one_minus_beta1)?)?;
+            let next_v = ((v_t * *beta2)? + ((&g * &g)? * one_minus_beta2)?)?;
+            let m_hat = (&next_m / (1.0 - beta1.powf(*t)))?;
+            let v_hat = (&next_v / (1.0 - beta2.powf(*t)))?;
+            let adjusted = ((m_hat / (v_hat.sqrt()? + *eps)?)? * *lr)?;
+            let next_p = if *weight_decay == 0.0 {
+                (p - adjusted)?
+            } else {
+                ((p * (1.0 - lr * weight_decay))? - adjusted)?
+            };
+            ev.adamw.insert(node.id, [next_m, next_v]);
+            next_p
+        }
+        NodeKind::AdamWOut { step, index } => {
+            // the step is evaluated before its projections; make sure of it
+            let _ = ev.value(step.id)?;
+            let outputs = ev.adamw.get(&step.id).ok_or_else(|| {
+                candle_core::Error::Msg("adamw_out: step has no stored moments".to_string())
+            })?;
+            match index {
+                0 => ev.value(step.id)?,
+                1 => outputs[0].clone(),
+                _ => outputs[1].clone(),
+            }
+        }
     };
     Ok(output)
 }
@@ -3232,6 +3395,11 @@ mod autodiff {
                     )?;
                 }
                 NodeKind::StopGradient { .. } => {}
+                NodeKind::AdamWStep { .. } | NodeKind::AdamWOut { .. } => {
+                    return Err(
+                        "grad: optimizer update nodes are not differentiable".to_string(),
+                    );
+                }
                 NodeKind::Checkpoint { a } => {
                     // Deep-copy the region's interior with fresh node ids and
                     // build the adjoint over the copy: forward intermediates
