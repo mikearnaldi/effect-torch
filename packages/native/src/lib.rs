@@ -200,7 +200,14 @@ pub struct NativeTensor {
 
 impl NativeTensor {
     fn wrap(inner: Tensor) -> Self {
-        let bytes = (inner.elem_count() * inner.dtype().size_in_bytes()) as i64;
+        // Buffers cost at least a memory page regardless of the tensor's
+        // logical size (Metal allocates 4KB-granular, malloc similar). Without
+        // reporting that floor, a stream of tiny tensors looks free to V8 and
+        // collection is deferred indefinitely — the backend allocator then
+        // can't reuse the pooled buffers (candle's Metal pool requires
+        // strong_count == 1) and both memory and per-allocation cost grow
+        // without bound.
+        let bytes = (inner.elem_count() * inner.dtype().size_in_bytes()).max(4096) as i64;
         Self { inner, bytes }
     }
 }
@@ -269,6 +276,22 @@ impl NativeTensor {
     #[napi(getter)]
     pub fn bytes(&self) -> i64 {
         self.bytes
+    }
+
+    // Explicitly releases the underlying buffer: the tensor is replaced by an
+    // empty CPU scalar, dropping the last strong reference to the real buffer
+    // (unless graph leaves still share it) so the backend allocator can reuse
+    // it immediately instead of waiting for GC. Using the tensor afterwards
+    // fails at evaluation time.
+    #[napi]
+    pub fn dispose(&mut self, env: Env) -> Result<()> {
+        let bytes = std::mem::take(&mut self.bytes);
+        if bytes != 0 {
+            EXTERNAL_MEMORY_BYTES.fetch_sub(bytes, Ordering::Relaxed);
+            env.adjust_external_memory(-bytes)?;
+        }
+        self.inner = Tensor::zeros(&[], DType::F32, &Device::Cpu).map_err(to_napi_err)?;
+        Ok(())
     }
 
     #[napi(ts_return_type = "Promise<ArrayBuffer>")]
@@ -449,6 +472,9 @@ enum NodeKind {
     Cos {
         a: Arc<Node>,
     },
+    Tanh {
+        a: Arc<Node>,
+    },
     Pow {
         a: Arc<Node>,
         exp: f64,
@@ -618,6 +644,7 @@ impl Node {
             | NodeKind::Log { a }
             | NodeKind::Sin { a }
             | NodeKind::Cos { a }
+            | NodeKind::Tanh { a }
             | NodeKind::StopGradient { a } => (a.shape.clone(), a.dtype, a.device.clone()),
             NodeKind::Pow { a, .. } => (a.shape.clone(), a.dtype, a.device.clone()),
             NodeKind::Cast { a, dtype } => (a.shape.clone(), *dtype, a.device.clone()),
@@ -755,6 +782,22 @@ macro_rules! lazy_ctor {
 
 #[napi]
 impl LazyTensor {
+    // Replaces the node with an empty constant, dropping the reference to the
+    // subgraph (including any materialized leaf buffer) so it can be freed
+    // immediately instead of waiting for GC. Using the tensor afterwards
+    // fails at evaluation time.
+    #[napi]
+    pub fn dispose(&mut self) -> Result<()> {
+        self.node = Node::new(NodeKind::Full {
+            shape: vec![],
+            value: 0.0,
+            dtype: DType::F32,
+            device: Device::Cpu,
+        })
+        .map_err(|message| Error::new(Status::GenericFailure, message))?;
+        Ok(())
+    }
+
     #[napi(factory)]
     pub fn zeros(
         shape: Vec<u32>,
@@ -970,6 +1013,13 @@ impl LazyTensor {
     }
 
     #[napi]
+    pub fn tanh(&self) -> Result<Self> {
+        lazy_ctor!(Node::new(NodeKind::Tanh {
+            a: self.node.clone(),
+        }))
+    }
+
+    #[napi]
     pub fn log(&self) -> Result<Self> {
         lazy_ctor!(Node::new(NodeKind::Log {
             a: self.node.clone(),
@@ -1179,6 +1229,7 @@ fn node_children(kind: &NodeKind) -> Vec<Arc<Node>> {
         | NodeKind::Log { a }
         | NodeKind::Sin { a }
         | NodeKind::Cos { a }
+        | NodeKind::Tanh { a }
         | NodeKind::Pow { a, .. }
         | NodeKind::Cast { a, .. }
         | NodeKind::Sum { a, .. }
@@ -1387,6 +1438,7 @@ fn eval_uncached(node: &Arc<Node>, ev: &Evaluator) -> candle_core::Result<Tensor
         NodeKind::Log { a } => ev.value(a.id)?.log()?,
         NodeKind::Sin { a } => ev.value(a.id)?.sin()?,
         NodeKind::Cos { a } => ev.value(a.id)?.cos()?,
+        NodeKind::Tanh { a } => ev.value(a.id)?.tanh()?,
         NodeKind::Pow { a, exp } => ev.value(a.id)?.powf(*exp)?,
         NodeKind::Cast { a, dtype } => ev.value(a.id)?.to_dtype(*dtype)?,
         NodeKind::Sum { a, dims, keepdims } => {
@@ -1698,6 +1750,10 @@ mod autodiff {
                 NodeKind::Cos { a } => {
                     accumulate(a, neg(mul(g, mk(NodeKind::Sin { a: a.clone() })?)?))?;
                 }
+                NodeKind::Tanh { a } => {
+                    let one = full(1.0, node.dtype, &node.device)?;
+                    accumulate(a, mul(g, add(one, neg(mul(node.clone(), node.clone())?)?)?))?;
+                }
                 NodeKind::Pow { a, exp } => {
                     let c = full(*exp, a.dtype, &a.device)?;
                     let base = mk(NodeKind::Pow {
@@ -1878,7 +1934,20 @@ async fn run_compute<T: Send + 'static>(
     let flag = token.map(|t| t.cancelled.clone());
     let handle = tokio::task::spawn_blocking(move || {
         let cancelled = flag.unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
-        compute(&cancelled)
+        // Metal command buffers, encoders, and their temporaries are
+        // autoreleased Objective-C objects. tokio blocking threads have no
+        // run loop, so without an explicit pool those objects accumulate for
+        // the thread's lifetime and every subsequent Metal driver call gets
+        // slower (candle issue #2271). Draining per compute keeps both
+        // memory and per-call cost flat across long training loops.
+        #[cfg(target_os = "macos")]
+        {
+            objc2::rc::autoreleasepool(|_| compute(&cancelled))
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            compute(&cancelled)
+        }
     });
     match token {
         Some(token) => {
@@ -2000,3 +2069,4 @@ pub fn report_external_memory(env: Env, bytes: i64) -> Result<()> {
 pub fn external_memory_bytes() -> i64 {
     EXTERNAL_MEMORY_BYTES.load(Ordering::Relaxed)
 }
+

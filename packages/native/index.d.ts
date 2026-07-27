@@ -7,6 +7,7 @@ export declare class CancellationToken {
 }
 
 export declare class LazyTensor {
+  dispose(): void
   static zeros(shape: Array<number>, dtype?: NativeDType | undefined | null, device?: string | undefined | null): LazyTensor
   static ones(shape: Array<number>, dtype?: NativeDType | undefined | null, device?: string | undefined | null): LazyTensor
   static full(shape: Array<number>, value: number, dtype?: NativeDType | undefined | null, device?: string | undefined | null): LazyTensor
@@ -29,6 +30,7 @@ export declare class LazyTensor {
   abs(): LazyTensor
   sqrt(): LazyTensor
   exp(): LazyTensor
+  tanh(): LazyTensor
   log(): LazyTensor
   sin(): LazyTensor
   cos(): LazyTensor
@@ -51,6 +53,7 @@ export declare class NativeTensor {
   get dtype(): string
   get device(): string
   get bytes(): number
+  dispose(): void
   readback(token?: CancellationToken | undefined | null): Promise<ArrayBuffer>
 }
 
