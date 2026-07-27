@@ -192,6 +192,23 @@ const step = Effect.gen(function* () {
 })
 ```
 
+### `Tensor` — serialization
+
+Tensors are saved and loaded in the [safetensors](https://github.com/huggingface/safetensors)
+format. All file I/O, graph evaluation, and serialization happen on the
+native side — tensor data never crosses the JavaScript thread.
+
+| Export | Description |
+| --- | --- |
+| `save(path, { name: tensor, ... })` | `Effect<void, TensorError>` — evaluates all entries in one shared graph walk and writes the file natively |
+| `load(path)` | `Effect<Record<string, Tensor>, TensorError, CurrentDevice>` — reads the file straight into materialized tensors on the current device |
+
+```ts
+yield* Tensor.save("checkpoint.safetensors", { "model.w": w, "model.b": b })
+const loaded = yield* Tensor.load("checkpoint.safetensors")
+const w = loaded["model.w"] // ordinary materialized tensor
+```
+
 ### `Optimizer`
 
 Optimizers are pure graph transforms: `step` takes parameters, gradients,

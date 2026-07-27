@@ -62,6 +62,8 @@ export declare function grad(loss: LazyTensor, wrt: Array<LazyTensor>): Array<La
 
 export declare function isDeviceAvailable(device: string): boolean
 
+export declare function loadTensors(path: string, device?: string | undefined | null, token?: CancellationToken | undefined | null): Promise<[Array<string>, Array<NativeTensor>]>
+
 export declare const enum NativeDType {
   F32 = 'f32',
   F64 = 'f64',
@@ -71,3 +73,5 @@ export declare const enum NativeDType {
 }
 
 export declare function reportExternalMemory(bytes: number): void
+
+export declare function saveTensors(path: string, names: Array<string>, tensors: Array<LazyTensor>, token?: CancellationToken | undefined | null): Promise<void>

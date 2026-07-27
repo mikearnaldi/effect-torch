@@ -1920,6 +1920,67 @@ pub async fn eval_lazy(
     .await
 }
 
+// Saves tensors to a safetensors file without the data ever touching the JS
+// thread: all entries are evaluated in one shared walk (subgraphs shared
+// between entries are computed once) and serialized in Rust.
+#[napi]
+pub async fn save_tensors(
+    path: String,
+    names: Vec<String>,
+    tensors: Vec<&LazyTensor>,
+    token: Option<&CancellationToken>,
+) -> Result<()> {
+    if names.len() != tensors.len() {
+        return Err(Error::new(
+            Status::InvalidArg,
+            format!(
+                "save_tensors: got {} names for {} tensors",
+                names.len(),
+                tensors.len()
+            ),
+        ));
+    }
+    let nodes: Vec<Arc<Node>> = tensors.iter().map(|t| t.node.clone()).collect();
+    run_compute(token, move |cancelled| {
+        let mut ev = Evaluator::new(&nodes);
+        let mut map = std::collections::HashMap::with_capacity(names.len());
+        for (name, node) in names.iter().zip(nodes.iter()) {
+            let output = eval_node(node, cancelled, &mut ev).map_err(to_napi_err)?;
+            output.device().synchronize().map_err(to_napi_err)?;
+            map.insert(name.clone(), output);
+        }
+        candle_core::safetensors::save(&map, &path).map_err(to_napi_err)
+    })
+    .await
+}
+
+// Loads a safetensors file straight into native tensors on the given device;
+// JS only receives opaque handles and names. Entries are sorted by name so
+// the result is deterministic.
+#[napi]
+pub async fn load_tensors(
+    path: String,
+    device: Option<String>,
+    token: Option<&CancellationToken>,
+) -> Result<(Vec<String>, Vec<NativeTensor>)> {
+    let dev = get_device(device)?;
+    run_compute(token, move |_cancelled| {
+        let mut entries: Vec<(String, Tensor)> = candle_core::safetensors::load(&path, &dev)
+            .map_err(to_napi_err)?
+            .into_iter()
+            .collect();
+        entries.sort_by(|a, b| a.0.cmp(&b.0));
+        Ok((
+            entries.iter().map(|(name, _)| name.clone()).collect(),
+            entries
+                .into_iter()
+                .map(|(_, tensor)| NativeTensor::wrap(tensor))
+                .collect(),
+        ))
+    })
+    .await
+}
+
 // Positive half of the external-memory accounting (the negative half runs in
 // NativeTensor's finalizer). A sync call so it executes on the main thread:
 // async napi functions run their body on the tokio runtime, where touching

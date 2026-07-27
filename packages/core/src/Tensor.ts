@@ -8,7 +8,14 @@ import native, {
 } from "@effect-torch/native"
 import { CurrentDevice, type DeviceKind } from "./Device.js"
 
-const { CancellationToken, evalLazy, LazyTensor: NativeLazyTensor, reportExternalMemory } = native
+const {
+  CancellationToken,
+  evalLazy,
+  LazyTensor: NativeLazyTensor,
+  loadTensors,
+  reportExternalMemory,
+  saveTensors
+} = native
 
 /**
  * Element data types supported by the native backend.
@@ -1172,3 +1179,47 @@ export const toTypedArray = (self: GenericTensor): Effect.Effect<TypedArray, Ten
       })
     )
   )
+
+/**
+ * Saves tensors to a safetensors file. The tensors are evaluated and
+ * serialized entirely on the native side — all entries share a single graph
+ * walk (shared subgraphs are computed once, `randn` draws are consistent
+ * across entries) and tensor data never crosses the JavaScript thread.
+ * Interrupting the fiber aborts the native work.
+ *
+ * @since 0.1.0
+ * @category destructors
+ */
+export const save = (
+  path: string,
+  tensors: Readonly<Record<string, GenericTensor>>
+): Effect.Effect<void, TensorError> => {
+  const entries = Object.entries(tensors)
+  return fromNative<void>("save", (token) =>
+    saveTensors(
+      path,
+      entries.map(([name]) => name),
+      entries.map(([, tensor]) => tensor.lazy),
+      token
+    )
+  )
+}
+
+/**
+ * Loads a safetensors file straight into materialized tensors on the
+ * current device; the file is read and deserialized entirely on the native
+ * side, so tensor data never crosses the JavaScript thread. Interrupting
+ * the fiber aborts the native work.
+ *
+ * @since 0.1.0
+ * @category constructors
+ */
+export const load = (
+  path: string
+): Effect.Effect<Record<string, Tensor>, TensorError, CurrentDevice> =>
+  Effect.gen(function* () {
+    const device = yield* CurrentDevice
+    const [names, handles] = yield* fromNative("load", (token) => loadTensors(path, device, token))
+    reportExternalMemory(handles.reduce((total, handle) => total + handle.bytes, 0))
+    return Object.fromEntries(names.map((name, i) => [name, fromHandle(handles[i])]))
+  })
