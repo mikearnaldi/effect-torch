@@ -22,7 +22,7 @@
  * @since 0.1.0
  * @category models
  */
-export type Schedule = (step: number) => number
+export type LrSchedule = (step: number) => number
 
 /**
  * A constant rate.
@@ -30,7 +30,7 @@ export type Schedule = (step: number) => number
  * @since 0.1.0
  * @category constructors
  */
-export const constant = (lr: number): Schedule => () => lr
+export const constant = (lr: number): LrSchedule => () => lr
 
 /**
  * Exponential decay: `initial * decayRate ^ (step / decaySteps)`.
@@ -41,7 +41,7 @@ export const constant = (lr: number): Schedule => () => lr
 export const exponential = (
   initial: number,
   options: { readonly decayRate: number; readonly decaySteps: number }
-): Schedule => {
+): LrSchedule => {
   if (initial <= 0 || options.decayRate <= 0 || options.decaySteps < 1) {
     throw new Error(
       `exponential: expected initial > 0, decayRate > 0, decaySteps >= 1, got ${initial}, ${options.decayRate}, ${options.decaySteps}`
@@ -59,7 +59,7 @@ export const exponential = (
 export const stepwise = (
   initial: number,
   options: { readonly dropFactor: number; readonly dropEvery: number }
-): Schedule => {
+): LrSchedule => {
   if (initial <= 0 || options.dropFactor <= 0 || options.dropEvery < 1) {
     throw new Error(
       `stepwise: expected initial > 0, dropFactor > 0, dropEvery >= 1, got ${initial}, ${options.dropFactor}, ${options.dropEvery}`
@@ -78,7 +78,7 @@ export const stepwise = (
 export const cosine = (
   initial: number,
   options: { readonly totalSteps: number; readonly minLr?: number }
-): Schedule => {
+): LrSchedule => {
   const minLr = options.minLr ?? 0
   if (initial <= 0 || minLr < 0 || minLr >= initial || options.totalSteps < 1) {
     throw new Error(
@@ -98,7 +98,7 @@ export const cosine = (
  * @since 0.1.0
  * @category combinators
  */
-export const withWarmup = (base: Schedule, warmupSteps: number): Schedule => {
+export const withWarmup = (base: LrSchedule, warmupSteps: number): LrSchedule => {
   if (!Number.isInteger(warmupSteps) || warmupSteps < 1) {
     throw new Error(`withWarmup: warmupSteps must be a positive integer, got ${warmupSteps}`)
   }
