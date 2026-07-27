@@ -152,101 +152,49 @@ const checkSameShapeDtype = (
   })
 
 /**
- * Vector-Jacobian product (reverse-mode pullback): given `f`, a primal `x`,
- * and a cotangent `v` with the output's shape, returns `f(x)` together with
- * `J(x)ᵀ v` — the gradient of `sum(f(x) * v)` with respect to `x`.
+ * Vector-Jacobian product (reverse-mode pullback): given an output graph
+ * `y` (built from `x` however you like), the primal `x`, and a cotangent
+ * `v` with `y`'s shape, returns `J(x)ᵀ v` — the gradient of `sum(y * v)`
+ * with respect to `x`.
  *
  * @since 0.1.0
  * @category autodiff
  */
 export const vjp = (
-  f: (x: Tensor.GenericTensor) => Effect.Effect<Tensor.GenericTensor, Tensor.TensorError, CurrentDevice>,
+  y: Tensor.GenericTensor,
   x: Tensor.GenericTensor,
   v: Tensor.GenericTensor
-): Effect.Effect<
-  { readonly output: Tensor.GenericTensor; readonly pullback: Tensor.LazyTensor },
-  Tensor.TensorError | GradError,
-  CurrentDevice
-> =>
+): Effect.Effect<Tensor.LazyTensor, Tensor.TensorError | GradError> =>
   Effect.gen(function* () {
-    const output = yield* f(x)
-    yield* checkSameShapeDtype("vjp", output, v, "cotangent")
-    const loss = yield* Tensor.sum(yield* Tensor.mul(output, yield* stopGradient(v)))
+    yield* checkSameShapeDtype("vjp", y, v, "cotangent")
+    const loss = yield* Tensor.sum(yield* Tensor.mul(y, yield* stopGradient(v)))
     const [pullback] = yield* grad(loss, [x])
-    return { output, pullback }
+    return pullback
   })
 
 /**
  * Jacobian-vector product (forward-mode pushforward via
- * forward-over-reverse): given `f`, a primal `x`, and a tangent `v` with
- * `x`'s shape, returns `f(x)` together with `J(x) v`. Uses second-order
- * adjoints, so `f` must be twice differentiable through the ops it uses.
+ * forward-over-reverse): given an output graph `y` built from `x`, the
+ * primal `x`, and a tangent `v` with `x`'s shape, returns `J(x) v`. Uses
+ * second-order adjoints, so the graph must be twice differentiable through
+ * the ops it uses.
  *
  * @since 0.1.0
  * @category autodiff
  */
 export const jvp = (
-  f: (x: Tensor.GenericTensor) => Effect.Effect<Tensor.GenericTensor, Tensor.TensorError, CurrentDevice>,
+  y: Tensor.GenericTensor,
   x: Tensor.GenericTensor,
   v: Tensor.GenericTensor
-): Effect.Effect<
-  { readonly output: Tensor.GenericTensor; readonly tangent: Tensor.LazyTensor },
-  Tensor.TensorError | GradError,
-  CurrentDevice
-> =>
+): Effect.Effect<Tensor.LazyTensor, Tensor.TensorError | GradError, CurrentDevice> =>
   Effect.gen(function* () {
     yield* checkSameShapeDtype("jvp", x, v, "tangent")
-    const output = yield* f(x)
     // u is a free linearization point: g(u) = J(x)ᵀ u is linear in u, and
     // its own vjp at u = 0 with cotangent v is J(x) v
-    const u = yield* Tensor.zerosLike(output)
-    const loss1 = yield* Tensor.sum(yield* Tensor.mul(output, u))
+    const u = yield* Tensor.zerosLike(y)
+    const loss1 = yield* Tensor.sum(yield* Tensor.mul(y, u))
     const [gradX] = yield* grad(loss1, [x])
     const loss2 = yield* Tensor.sum(yield* Tensor.mul(gradX, yield* stopGradient(v)))
     const [tangent] = yield* grad(loss2, [u])
-    return { output, tangent }
-  })
-
-/**
- * Maps `f` over a leading dimension (default `0`): slices the input along
- * `dim`, applies `f` to each slice with that dimension removed, and stacks
- * the results along `dim`. Every slice must produce the same shape. This is
- * the simple graph form — the graph grows linearly with the mapped
- * dimension.
- *
- * @since 0.1.0
- * @category autodiff
- */
-export const vmap = (
-  f: (x: Tensor.GenericTensor) => Effect.Effect<Tensor.GenericTensor, Tensor.TensorError, CurrentDevice>,
-  options: { readonly dim?: number } = {}
-) =>
-(
-  self: Tensor.GenericTensor
-): Effect.Effect<Tensor.LazyTensor, Tensor.TensorError, CurrentDevice> =>
-  Effect.gen(function* () {
-    const rank = self.shape.length
-    const dim = options.dim ?? 0
-    const d = dim < 0 ? dim + rank : dim
-    if (!Number.isInteger(d) || d < 0 || d >= rank) {
-      return yield* new Tensor.TensorError({
-        op: "vmap",
-        message: `vmap: dimension ${dim} out of range for rank ${rank}`
-      })
-    }
-    const slices = yield* Tensor.split(self, 1, { dim: d })
-    const outs: Array<Tensor.GenericTensor> = []
-    for (const s of slices) {
-      outs.push(yield* f(yield* Tensor.squeeze(s, { dims: [d] })))
-    }
-    const first = outs[0].shape
-    for (const out of outs) {
-      if (out.shape.length !== first.length || !out.shape.every((s, i) => s === first[i])) {
-        return yield* new Tensor.TensorError({
-          op: "vmap",
-          message: `vmap: function returned inconsistent shapes [${first}] and [${out.shape}] across the mapped dimension`
-        })
-      }
-    }
-    return yield* Tensor.stack(outs as [Tensor.GenericTensor, Tensor.GenericTensor, ...Array<Tensor.GenericTensor>], { dim: d })
+    return tangent
   })

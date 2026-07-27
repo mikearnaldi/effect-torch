@@ -272,34 +272,27 @@ layer(Device.Cpu)("Autodiff", (it) => {
       })
     )
 
-    it.effect("vjp / jvp / vmap", () =>
+    it.effect("vjp / jvp", () =>
       Effect.gen(function* () {
         const a = yield* f64([1, 2, 3, 4, 5, 6], [2, 3])
-        const f = (x: Tensor.GenericTensor) => Tensor.matmul(a, x)
         const x = yield* f64([1, 1, 1], [3, 1])
+        const y = yield* Tensor.matmul(a, x)
         const v = yield* f64([1, 2], [2, 1])
-        const { output, pullback } = yield* Gradient.vjp(f, x, v)
-        assert.deepStrictEqual(yield* values(output), [6, 15])
+        const pullback = yield* Gradient.vjp(y, x, v)
         // J^T v = A^T v
         assert.deepStrictEqual(yield* values(pullback), [1 * 1 + 4 * 2, 2 * 1 + 5 * 2, 3 * 1 + 6 * 2])
 
         const t = yield* f64([1, 0, 0], [3, 1])
-        const { tangent } = yield* Gradient.jvp(f, x, t)
+        const tangent = yield* Gradient.jvp(y, x, t)
         assert.deepStrictEqual(yield* values(tangent), [1, 4])
 
-        const nonlinear = (x: Tensor.GenericTensor) => Tensor.sin(x)
         const xn = yield* f64([0.5, 1])
+        const yn = yield* Tensor.sin(xn)
         const vn = yield* f64([2, 3])
-        const { tangent: tn } = yield* Gradient.jvp(nonlinear, xn, vn)
+        const tn = yield* Gradient.jvp(yn, xn, vn)
         const tnValues = yield* values(tn)
         expect(Math.abs(tnValues[0] - Math.cos(0.5) * 2)).toBeLessThan(1e-12)
         expect(Math.abs(tnValues[1] - Math.cos(1) * 3)).toBeLessThan(1e-12)
-
-        const m = yield* f64([1, 2, 3, 4, 5, 6], [2, 3])
-        const rowSums = yield* Gradient.vmap((row) => Tensor.sum(row))(m)
-        assert.deepStrictEqual(yield* values(rowSums), [6, 15])
-        const mapped = yield* Gradient.vmap((row) => Tensor.relu(row))(m)
-        assert.deepStrictEqual(mapped.shape, [2, 3])
       })
     )
 

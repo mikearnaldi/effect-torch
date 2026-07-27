@@ -244,9 +244,8 @@ so gradients can be differentiated again.
 | Export | Description |
 | --- | --- |
 | `grad(loss, wrt)` | gradients of a scalar `loss` w.r.t. the given tensors; tensors not influencing the loss get zeros |
-| `vjp(f, x, v)` | `f(x)` plus the pullback `J(x)ᵀ v` |
-| `jvp(f, x, v)` | `f(x)` plus the pushforward `J(x) v` (forward-over-reverse) |
-| `vmap(f, { dim? })(t)` | map `f` over a dimension, stacking results |
+| `vjp(y, x, v)` | pullback `J(x)ᵀ v` of an output graph `y` built from `x` |
+| `jvp(y, x, v)` | pushforward `J(x) v` (forward-over-reverse) |
 | `stopGradient(t)` | blocks gradient flow through `t` |
 | `checkpoint(t)` | recomputes the subgraph's intermediates in backward instead of retaining them |
 | `GradError` | typed error: non-scalar output, non-float dtype, or non-differentiable op |
