@@ -255,7 +255,7 @@ so gradients can be differentiated again.
 const step = Effect.gen(function* () {
   const pred = yield* Tensor.add(yield* Tensor.matmul(x, w), b)
   const loss = yield* Tensor.mse(pred, y)
-  const [gw, gb] = yield* Tensor.grad(loss, [w, b])
+  const [gw, gb] = yield* Gradient.grad(loss, [w, b])
   // loss and grads share the forward graph: evaluate them in one walk
   const [l, gW, gB] = yield* Tensor.evaluate([loss, gw, gb])
   // ...optimizer step...
