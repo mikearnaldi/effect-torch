@@ -1109,15 +1109,20 @@ struct Evaluator {
 impl Evaluator {
     fn new(roots: &[Arc<Node>]) -> Self {
         let mut consumers = std::collections::HashMap::new();
-        let mut visited = HashSet::new();
         for root in roots {
-            count_consumers(root, &mut visited, &mut consumers);
+            count_consumers(root, &mut consumers);
         }
         Self {
             cache: std::collections::HashMap::new(),
             consumers,
             roots: roots.iter().map(|root| root.id).collect(),
         }
+    }
+
+    fn value(&self, id: u64) -> candle_core::Result<Tensor> {
+        self.cache.get(&id).cloned().ok_or_else(|| {
+            candle_core::Error::Msg("internal error: child evaluated out of order".to_string())
+        })
     }
 
     fn release_children(&mut self, node: &Arc<Node>) {
@@ -1132,17 +1137,17 @@ impl Evaluator {
     }
 }
 
-fn count_consumers(
-    node: &Arc<Node>,
-    visited: &mut HashSet<u64>,
-    consumers: &mut std::collections::HashMap<u64, usize>,
-) {
-    if !visited.insert(node.id) {
-        return;
-    }
-    for child in node_children(&node.kind) {
-        *consumers.entry(child.id).or_insert(0) += 1;
-        count_consumers(&child, visited, consumers);
+fn count_consumers(root: &Arc<Node>, consumers: &mut std::collections::HashMap<u64, usize>) {
+    let mut visited = HashSet::new();
+    let mut stack = vec![root.clone()];
+    while let Some(node) = stack.pop() {
+        if !visited.insert(node.id) {
+            continue;
+        }
+        for child in node_children(&node.kind) {
+            *consumers.entry(child.id).or_insert(0) += 1;
+            stack.push(child);
+        }
     }
 }
 
@@ -1191,12 +1196,11 @@ fn node_children(kind: &NodeKind) -> Vec<Arc<Node>> {
 fn eval_cmp(
     a: &Arc<Node>,
     b: &Arc<Node>,
-    cancelled: &AtomicBool,
-    ev: &mut Evaluator,
+    ev: &Evaluator,
     f: impl Fn(&Tensor, &Tensor) -> candle_core::Result<Tensor>,
 ) -> candle_core::Result<Tensor> {
-    let a = eval_node(a, cancelled, ev)?;
-    let b = eval_node(b, cancelled, ev)?;
+    let a = ev.value(a.id)?;
+    let b = ev.value(b.id)?;
     let shape = a.shape().broadcast_shape_binary_op(b.shape(), "cmp")?;
     let a = a.broadcast_as(shape.clone())?;
     let b = b.broadcast_as(shape)?;
@@ -1221,28 +1225,44 @@ fn reduce_dims(
     Ok(out)
 }
 
+// Iterative post-order evaluation: recursion depth is independent of graph
+// depth, so chains of arbitrary length evaluate on a fixed stack. Children
+// are always computed before their parents, and `eval_uncached` reads their
+// values straight from the cache.
 fn eval_node(
-    node: &Arc<Node>,
+    root: &Arc<Node>,
     cancelled: &AtomicBool,
     ev: &mut Evaluator,
 ) -> candle_core::Result<Tensor> {
-    if cancelled.load(Ordering::Relaxed) {
-        return Err(candle_core::Error::Msg("operation aborted".to_string()));
+    let mut stack: Vec<(Arc<Node>, bool)> = vec![(root.clone(), false)];
+    while let Some((node, processed)) = stack.pop() {
+        if cancelled.load(Ordering::Relaxed) {
+            return Err(candle_core::Error::Msg("operation aborted".to_string()));
+        }
+        if ev.cache.contains_key(&node.id) {
+            continue;
+        }
+        if processed {
+            let output = eval_uncached(&node, ev)?;
+            ev.cache.insert(node.id, output);
+            ev.release_children(&node);
+            continue;
+        }
+        stack.push((node.clone(), true));
+        for child in node_children(&node.kind) {
+            if !ev.cache.contains_key(&child.id) {
+                stack.push((child, false));
+            }
+        }
     }
-    if let Some(cached) = ev.cache.get(&node.id) {
-        return Ok(cached.clone());
-    }
-    let output = eval_uncached(node, cancelled, ev)?;
-    ev.cache.insert(node.id, output.clone());
-    ev.release_children(node);
-    Ok(output)
+    Ok(ev
+        .cache
+        .get(&root.id)
+        .expect("root is evaluated before its consumers")
+        .clone())
 }
 
-fn eval_uncached(
-    node: &Arc<Node>,
-    cancelled: &AtomicBool,
-    ev: &mut Evaluator,
-) -> candle_core::Result<Tensor> {
+fn eval_uncached(node: &Arc<Node>, ev: &Evaluator) -> candle_core::Result<Tensor> {
     let output = match &node.kind {
         NodeKind::Leaf(tensor) => tensor.clone(),
         NodeKind::FromBytes {
@@ -1336,59 +1356,59 @@ fn eval_uncached(
             i.broadcast_eq(&j)?.to_dtype(*dtype)?
         }
         NodeKind::Add { a, b } => {
-            let a = eval_node(a, cancelled, ev)?;
-            let b = eval_node(b, cancelled, ev)?;
+            let a = ev.value(a.id)?;
+            let b = ev.value(b.id)?;
             a.broadcast_add(&b)?
         }
         NodeKind::Sub { a, b } => {
-            let a = eval_node(a, cancelled, ev)?;
-            let b = eval_node(b, cancelled, ev)?;
+            let a = ev.value(a.id)?;
+            let b = ev.value(b.id)?;
             a.broadcast_sub(&b)?
         }
         NodeKind::Mul { a, b } => {
-            let a = eval_node(a, cancelled, ev)?;
-            let b = eval_node(b, cancelled, ev)?;
+            let a = ev.value(a.id)?;
+            let b = ev.value(b.id)?;
             a.broadcast_mul(&b)?
         }
         NodeKind::Div { a, b } => {
-            let a = eval_node(a, cancelled, ev)?;
-            let b = eval_node(b, cancelled, ev)?;
+            let a = ev.value(a.id)?;
+            let b = ev.value(b.id)?;
             a.broadcast_div(&b)?
         }
-        NodeKind::Eq { a, b } => eval_cmp(a, b, cancelled, ev, |a, b| a.eq(b))?,
-        NodeKind::Gt { a, b } => eval_cmp(a, b, cancelled, ev, |a, b| a.gt(b))?,
-        NodeKind::Lt { a, b } => eval_cmp(a, b, cancelled, ev, |a, b| a.lt(b))?,
-        NodeKind::Ge { a, b } => eval_cmp(a, b, cancelled, ev, |a, b| a.ge(b))?,
-        NodeKind::Le { a, b } => eval_cmp(a, b, cancelled, ev, |a, b| a.le(b))?,
-        NodeKind::Neg { a } => eval_node(a, cancelled, ev)?.neg()?,
-        NodeKind::Abs { a } => eval_node(a, cancelled, ev)?.abs()?,
-        NodeKind::Sqrt { a } => eval_node(a, cancelled, ev)?.sqrt()?,
-        NodeKind::Exp { a } => eval_node(a, cancelled, ev)?.exp()?,
-        NodeKind::Log { a } => eval_node(a, cancelled, ev)?.log()?,
-        NodeKind::Sin { a } => eval_node(a, cancelled, ev)?.sin()?,
-        NodeKind::Cos { a } => eval_node(a, cancelled, ev)?.cos()?,
-        NodeKind::Pow { a, exp } => eval_node(a, cancelled, ev)?.powf(*exp)?,
-        NodeKind::Cast { a, dtype } => eval_node(a, cancelled, ev)?.to_dtype(*dtype)?,
+        NodeKind::Eq { a, b } => eval_cmp(a, b, ev, |a, b| a.eq(b))?,
+        NodeKind::Gt { a, b } => eval_cmp(a, b, ev, |a, b| a.gt(b))?,
+        NodeKind::Lt { a, b } => eval_cmp(a, b, ev, |a, b| a.lt(b))?,
+        NodeKind::Ge { a, b } => eval_cmp(a, b, ev, |a, b| a.ge(b))?,
+        NodeKind::Le { a, b } => eval_cmp(a, b, ev, |a, b| a.le(b))?,
+        NodeKind::Neg { a } => ev.value(a.id)?.neg()?,
+        NodeKind::Abs { a } => ev.value(a.id)?.abs()?,
+        NodeKind::Sqrt { a } => ev.value(a.id)?.sqrt()?,
+        NodeKind::Exp { a } => ev.value(a.id)?.exp()?,
+        NodeKind::Log { a } => ev.value(a.id)?.log()?,
+        NodeKind::Sin { a } => ev.value(a.id)?.sin()?,
+        NodeKind::Cos { a } => ev.value(a.id)?.cos()?,
+        NodeKind::Pow { a, exp } => ev.value(a.id)?.powf(*exp)?,
+        NodeKind::Cast { a, dtype } => ev.value(a.id)?.to_dtype(*dtype)?,
         NodeKind::Sum { a, dims, keepdims } => {
-            let t = eval_node(a, cancelled, ev)?;
+            let t = ev.value(a.id)?;
             reduce_dims(&t, dims, *keepdims, |t, d| t.sum(d))?
         }
         NodeKind::Mean { a, dims, keepdims } => {
-            let t = eval_node(a, cancelled, ev)?;
+            let t = ev.value(a.id)?;
             reduce_dims(&t, dims, *keepdims, |t, d| t.mean(d))?
         }
         NodeKind::Max { a, dims, keepdims } => {
-            let t = eval_node(a, cancelled, ev)?;
+            let t = ev.value(a.id)?;
             reduce_dims(&t, dims, *keepdims, |t, d| t.max(d))?
         }
         NodeKind::Min { a, dims, keepdims } => {
-            let t = eval_node(a, cancelled, ev)?;
+            let t = ev.value(a.id)?;
             reduce_dims(&t, dims, *keepdims, |t, d| t.min(d))?
         }
-        NodeKind::Reshape { a, shape } => eval_node(a, cancelled, ev)?.reshape(shape.clone())?,
-        NodeKind::Permute { a, dims } => eval_node(a, cancelled, ev)?.permute(dims.clone())?,
+        NodeKind::Reshape { a, shape } => ev.value(a.id)?.reshape(shape.clone())?,
+        NodeKind::Permute { a, dims } => ev.value(a.id)?.permute(dims.clone())?,
         NodeKind::Slice { a, ranges } => {
-            let mut t = eval_node(a, cancelled, ev)?;
+            let mut t = ev.value(a.id)?;
             for (dim, &(start, stop, stride)) in ranges.iter().enumerate() {
                 let len = stop.saturating_sub(start).div_ceil(stride);
                 if len == 0 {
@@ -1405,16 +1425,16 @@ fn eval_uncached(
             t
         }
         NodeKind::Concat { a, b, dim } => {
-            let a = eval_node(a, cancelled, ev)?;
-            let b = eval_node(b, cancelled, ev)?;
+            let a = ev.value(a.id)?;
+            let b = ev.value(b.id)?;
             Tensor::cat(&[&a, &b], *dim)?
         }
         NodeKind::BroadcastTo { a, shape } => {
-            eval_node(a, cancelled, ev)?.broadcast_as(shape.clone())?
+            ev.value(a.id)?.broadcast_as(shape.clone())?
         }
         NodeKind::Matmul { a, b } => {
-            let a = eval_node(a, cancelled, ev)?;
-            let b = eval_node(b, cancelled, ev)?;
+            let a = ev.value(a.id)?;
+            let b = ev.value(b.id)?;
             // candle's matmul requires contiguous operands; permuted or
             // broadcast layouts (common in backward graphs) must be
             // materialized first.
@@ -1422,7 +1442,7 @@ fn eval_uncached(
             let b = if b.is_contiguous() { b } else { b.contiguous()? };
             a.broadcast_matmul(&b)?
         }
-        NodeKind::StopGradient { a } => eval_node(a, cancelled, ev)?,
+        NodeKind::StopGradient { a } => ev.value(a.id)?,
     };
     Ok(output)
 }
@@ -1856,28 +1876,10 @@ async fn run_compute<T: Send + 'static>(
     compute: impl FnOnce(&AtomicBool) -> Result<T> + Send + 'static,
 ) -> Result<T> {
     let flag = token.map(|t| t.cancelled.clone());
-    // The evaluator recurses per graph node; tokio's blocking threads use the
-    // default 2 MiB stack, which overflows on chains of a few thousand nodes.
-    // Run on a dedicated thread with a stack sized for realistic model depths
-    // (reserved virtually, committed lazily by the OS).
-    let (tx, rx) = tokio::sync::oneshot::channel();
-    std::thread::Builder::new()
-        .name("effect-torch-compute".to_string())
-        .stack_size(256 << 20)
-        .spawn(move || {
-            let cancelled = flag.unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
-            let _ = tx.send(compute(&cancelled));
-        })
-        .map_err(|err| Error::new(Status::GenericFailure, err.to_string()))?;
-    let handle = async move {
-        match rx.await {
-            Ok(result) => result,
-            Err(_) => Err(Error::new(
-                Status::GenericFailure,
-                "compute thread panicked".to_string(),
-            )),
-        }
-    };
+    let handle = tokio::task::spawn_blocking(move || {
+        let cancelled = flag.unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
+        compute(&cancelled)
+    });
     match token {
         Some(token) => {
             if token.cancelled.load(Ordering::Relaxed) {
@@ -1888,14 +1890,14 @@ async fn run_compute<T: Send + 'static>(
             }
             let notify = token.notify.clone();
             tokio::select! {
-                result = handle => result,
+                result = handle => result.map_err(to_join_err)?,
                 _ = notify.notified() => Err(Error::new(
                     Status::Cancelled,
                     "operation aborted".to_string(),
                 )),
             }
         }
-        None => handle.await,
+        None => handle.await.map_err(to_join_err)?,
     }
 }
 
