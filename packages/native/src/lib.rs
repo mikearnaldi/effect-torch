@@ -541,6 +541,11 @@ enum NodeKind {
         dims: Vec<usize>,
         keepdims: bool,
     },
+    Prod {
+        a: Arc<Node>,
+        dims: Vec<usize>,
+        keepdims: bool,
+    },
     Argmax {
         a: Arc<Node>,
         dim: usize,
@@ -554,6 +559,17 @@ enum NodeKind {
         dim: usize,
     },
     IndexSelect {
+        a: Arc<Node>,
+        dim: usize,
+        indexes: Arc<Node>,
+    },
+    ScatterAdd {
+        a: Arc<Node>,
+        dim: usize,
+        indexes: Arc<Node>,
+        src: Arc<Node>,
+    },
+    Gather {
         a: Arc<Node>,
         dim: usize,
         indexes: Arc<Node>,
@@ -583,7 +599,20 @@ enum NodeKind {
         a: Arc<Node>,
         b: Arc<Node>,
     },
+    Inverse {
+        a: Arc<Node>,
+    },
+    Det {
+        a: Arc<Node>,
+    },
+    Solve {
+        a: Arc<Node>,
+        b: Arc<Node>,
+    },
     StopGradient {
+        a: Arc<Node>,
+    },
+    Checkpoint {
         a: Arc<Node>,
     },
 }
@@ -723,6 +752,7 @@ impl Node {
             | NodeKind::Ceil { a }
             | NodeKind::Round { a }
             | NodeKind::Sign { a }
+            | NodeKind::Checkpoint { a }
             | NodeKind::StopGradient { a } => (a.shape.clone(), a.dtype, a.device.clone()),
             NodeKind::Pow { a, .. } => (a.shape.clone(), a.dtype, a.device.clone()),
             NodeKind::Where { cond, a, b } => {
@@ -782,11 +812,71 @@ impl Node {
                 shape[*dim] = indexes.shape[0];
                 (shape, a.dtype, a.device.clone())
             }
+            NodeKind::ScatterAdd {
+                a,
+                dim,
+                indexes,
+                src,
+            } => {
+                if a.shape.is_empty() || *dim >= a.shape.len() {
+                    return Err(format!(
+                        "scatter_add: dim {dim} out of range for rank {}",
+                        a.shape.len()
+                    ));
+                }
+                if indexes.dtype != DType::I64 {
+                    return Err(format!(
+                        "scatter_add: indexes must be i64, got {:?}",
+                        indexes.dtype
+                    ));
+                }
+                if indexes.shape != src.shape {
+                    return Err(format!(
+                        "scatter_add: indexes shape {:?} must match src shape {:?}",
+                        indexes.shape, src.shape
+                    ));
+                }
+                if src.dtype != a.dtype {
+                    return Err(format!(
+                        "scatter_add: src dtype {:?} does not match target dtype {:?}",
+                        src.dtype, a.dtype
+                    ));
+                }
+                (a.shape.clone(), a.dtype, a.device.clone())
+            }
+            NodeKind::Gather { a, dim, indexes } => {
+                if a.shape.is_empty() || *dim >= a.shape.len() {
+                    return Err(format!(
+                        "gather: dim {dim} out of range for rank {}",
+                        a.shape.len()
+                    ));
+                }
+                if indexes.dtype != DType::I64 {
+                    return Err(format!("gather: indexes must be i64, got {:?}", indexes.dtype));
+                }
+                if indexes.shape.len() != a.shape.len() {
+                    return Err(format!(
+                        "gather: indexes rank {} must match input rank {}",
+                        indexes.shape.len(),
+                        a.shape.len()
+                    ));
+                }
+                for i in 0..a.shape.len() {
+                    if i != *dim && indexes.shape[i] > a.shape[i] {
+                        return Err(format!(
+                            "gather: indexes shape {:?} exceeds input shape {:?} at dim {i}",
+                            indexes.shape, a.shape
+                        ));
+                    }
+                }
+                (indexes.shape.clone(), a.dtype, a.device.clone())
+            }
             NodeKind::Cast { a, dtype } => (a.shape.clone(), *dtype, a.device.clone()),
             NodeKind::Sum { a, dims, keepdims }
             | NodeKind::Mean { a, dims, keepdims }
             | NodeKind::Max { a, dims, keepdims }
-            | NodeKind::Min { a, dims, keepdims } => (
+            | NodeKind::Min { a, dims, keepdims }
+            | NodeKind::Prod { a, dims, keepdims } => (
                 reduced_shape(&a.shape, dims, *keepdims),
                 a.dtype,
                 a.device.clone(),
@@ -889,6 +979,43 @@ impl Node {
                 shape.push(a.shape[ar - 2]);
                 shape.push(b.shape[br - 1]);
                 (shape, a.dtype, a.device.clone())
+            }
+            NodeKind::Inverse { a } | NodeKind::Det { a } => {
+                if a.shape.len() != 2 || a.shape[0] != a.shape[1] {
+                    return Err(format!(
+                        "linalg: expected a square rank-2 tensor, got shape {:?}",
+                        a.shape
+                    ));
+                }
+                if !a.dtype.is_float() {
+                    return Err(format!("linalg: dtype must be floating point, got {:?}", a.dtype));
+                }
+                if matches!(&kind, NodeKind::Det { .. }) {
+                    (vec![], a.dtype, a.device.clone())
+                } else {
+                    (a.shape.clone(), a.dtype, a.device.clone())
+                }
+            }
+            NodeKind::Solve { a, b } => {
+                if a.shape.len() != 2 || a.shape[0] != a.shape[1] {
+                    return Err(format!(
+                        "solve: expected a square rank-2 coefficient matrix, got shape {:?}",
+                        a.shape
+                    ));
+                }
+                if b.shape.len() != 2 || b.shape[0] != a.shape[0] {
+                    return Err(format!(
+                        "solve: expected a rank-2 right-hand side with {} rows, got shape {:?}",
+                        a.shape[0], b.shape
+                    ));
+                }
+                if !a.dtype.is_float() || a.dtype != b.dtype {
+                    return Err(format!(
+                        "solve: dtypes must be floating point and match, got {:?} and {:?}",
+                        a.dtype, b.dtype
+                    ));
+                }
+                (b.shape.clone(), a.dtype, a.device.clone())
             }
         };
         Ok(Arc::new(Node {
@@ -1153,6 +1280,28 @@ impl LazyTensor {
     }
 
     #[napi]
+    pub fn inverse(&self) -> Result<Self> {
+        lazy_ctor!(Node::new(NodeKind::Inverse {
+            a: self.node.clone(),
+        }))
+    }
+
+    #[napi]
+    pub fn det(&self) -> Result<Self> {
+        lazy_ctor!(Node::new(NodeKind::Det {
+            a: self.node.clone(),
+        }))
+    }
+
+    #[napi]
+    pub fn solve(&self, other: &LazyTensor) -> Result<Self> {
+        lazy_ctor!(Node::new(NodeKind::Solve {
+            a: self.node.clone(),
+            b: other.node.clone(),
+        }))
+    }
+
+    #[napi]
     pub fn neg(&self) -> Result<Self> {
         lazy_ctor!(Node::new(NodeKind::Neg {
             a: self.node.clone(),
@@ -1272,6 +1421,25 @@ impl LazyTensor {
     }
 
     #[napi]
+    pub fn scatter_add(&self, dim: u32, indexes: &LazyTensor, src: &LazyTensor) -> Result<Self> {
+        lazy_ctor!(Node::new(NodeKind::ScatterAdd {
+            a: self.node.clone(),
+            dim: dim as usize,
+            indexes: indexes.node.clone(),
+            src: src.node.clone(),
+        }))
+    }
+
+    #[napi]
+    pub fn gather(&self, dim: u32, indexes: &LazyTensor) -> Result<Self> {
+        lazy_ctor!(Node::new(NodeKind::Gather {
+            a: self.node.clone(),
+            dim: dim as usize,
+            indexes: indexes.node.clone(),
+        }))
+    }
+
+    #[napi]
     pub fn log(&self) -> Result<Self> {
         lazy_ctor!(Node::new(NodeKind::Log {
             a: self.node.clone(),
@@ -1311,6 +1479,15 @@ impl LazyTensor {
     #[napi]
     pub fn sum(&self, dims: Vec<u32>, keepdims: bool) -> Result<Self> {
         lazy_ctor!(Node::new(NodeKind::Sum {
+            a: self.node.clone(),
+            dims: dims.iter().map(|&d| d as usize).collect(),
+            keepdims,
+        }))
+    }
+
+    #[napi]
+    pub fn prod(&self, dims: Vec<u32>, keepdims: bool) -> Result<Self> {
+        lazy_ctor!(Node::new(NodeKind::Prod {
             a: self.node.clone(),
             dims: dims.iter().map(|&d| d as usize).collect(),
             keepdims,
@@ -1391,6 +1568,13 @@ impl LazyTensor {
     #[napi]
     pub fn stop_gradient(&self) -> Result<Self> {
         lazy_ctor!(Node::new(NodeKind::StopGradient {
+            a: self.node.clone(),
+        }))
+    }
+
+    #[napi]
+    pub fn checkpoint(&self) -> Result<Self> {
+        lazy_ctor!(Node::new(NodeKind::Checkpoint {
             a: self.node.clone(),
         }))
     }
@@ -1477,6 +1661,7 @@ fn node_children(kind: &NodeKind) -> Vec<Arc<Node>> {
         | NodeKind::Minimum { a, b }
         | NodeKind::Concat { a, b, .. }
         | NodeKind::Matmul { a, b } => vec![a.clone(), b.clone()],
+        NodeKind::Solve { a, b } => vec![a.clone(), b.clone()],
         NodeKind::Neg { a }
         | NodeKind::Abs { a }
         | NodeKind::Sqrt { a }
@@ -1493,6 +1678,8 @@ fn node_children(kind: &NodeKind) -> Vec<Arc<Node>> {
         | NodeKind::Sign { a }
         | NodeKind::Argmax { a, .. }
         | NodeKind::Argmin { a, .. }
+        | NodeKind::Inverse { a }
+        | NodeKind::Det { a }
         | NodeKind::Cumsum { a, .. }
         | NodeKind::Pow { a, .. }
         | NodeKind::Cast { a, .. }
@@ -1500,13 +1687,221 @@ fn node_children(kind: &NodeKind) -> Vec<Arc<Node>> {
         | NodeKind::Mean { a, .. }
         | NodeKind::Max { a, .. }
         | NodeKind::Min { a, .. }
+        | NodeKind::Prod { a, .. }
         | NodeKind::Reshape { a, .. }
         | NodeKind::Permute { a, .. }
         | NodeKind::Slice { a, .. }
         | NodeKind::BroadcastTo { a, .. }
+        | NodeKind::Checkpoint { a }
         | NodeKind::StopGradient { a } => vec![a.clone()],
         NodeKind::Where { cond, a, b } => vec![cond.clone(), a.clone(), b.clone()],
         NodeKind::IndexSelect { a, indexes, .. } => vec![a.clone(), indexes.clone()],
+        NodeKind::Gather { a, indexes, .. } => vec![a.clone(), indexes.clone()],
+        NodeKind::ScatterAdd {
+            a,
+            indexes,
+            src,
+            ..
+        } => vec![a.clone(), indexes.clone(), src.clone()],
+    }
+}
+
+// Rebuilds a node kind with its children mapped through `f`. Used to
+// deep-copy subgraphs with fresh node ids (checkpoint recompute).
+fn remap_children(kind: &NodeKind, f: &dyn Fn(&Arc<Node>) -> Arc<Node>) -> NodeKind {
+    match kind {
+        NodeKind::Leaf(t) => NodeKind::Leaf(t.clone()),
+        NodeKind::FromBytes {
+            data,
+            shape,
+            dtype,
+            device,
+        } => NodeKind::FromBytes {
+            data: data.clone(),
+            shape: shape.clone(),
+            dtype: *dtype,
+            device: device.clone(),
+        },
+        NodeKind::Zeros {
+            shape,
+            dtype,
+            device,
+        } => NodeKind::Zeros {
+            shape: shape.clone(),
+            dtype: *dtype,
+            device: device.clone(),
+        },
+        NodeKind::Ones {
+            shape,
+            dtype,
+            device,
+        } => NodeKind::Ones {
+            shape: shape.clone(),
+            dtype: *dtype,
+            device: device.clone(),
+        },
+        NodeKind::Full {
+            shape,
+            value,
+            dtype,
+            device,
+        } => NodeKind::Full {
+            shape: shape.clone(),
+            value: *value,
+            dtype: *dtype,
+            device: device.clone(),
+        },
+        NodeKind::Randn {
+            shape,
+            dtype,
+            device,
+        } => NodeKind::Randn {
+            shape: shape.clone(),
+            dtype: *dtype,
+            device: device.clone(),
+        },
+        NodeKind::Uniform {
+            lo,
+            hi,
+            shape,
+            dtype,
+            device,
+        } => NodeKind::Uniform {
+            lo: *lo,
+            hi: *hi,
+            shape: shape.clone(),
+            dtype: *dtype,
+            device: device.clone(),
+        },
+        NodeKind::Arange {
+            start,
+            end,
+            step,
+            dtype,
+            device,
+        } => NodeKind::Arange {
+            start: *start,
+            end: *end,
+            step: *step,
+            dtype: *dtype,
+            device: device.clone(),
+        },
+        NodeKind::Eye { n, dtype, device } => NodeKind::Eye {
+            n: *n,
+            dtype: *dtype,
+            device: device.clone(),
+        },
+        NodeKind::Add { a, b } => NodeKind::Add { a: f(a), b: f(b) },
+        NodeKind::Sub { a, b } => NodeKind::Sub { a: f(a), b: f(b) },
+        NodeKind::Mul { a, b } => NodeKind::Mul { a: f(a), b: f(b) },
+        NodeKind::Div { a, b } => NodeKind::Div { a: f(a), b: f(b) },
+        NodeKind::Eq { a, b } => NodeKind::Eq { a: f(a), b: f(b) },
+        NodeKind::Gt { a, b } => NodeKind::Gt { a: f(a), b: f(b) },
+        NodeKind::Lt { a, b } => NodeKind::Lt { a: f(a), b: f(b) },
+        NodeKind::Ge { a, b } => NodeKind::Ge { a: f(a), b: f(b) },
+        NodeKind::Le { a, b } => NodeKind::Le { a: f(a), b: f(b) },
+        NodeKind::Maximum { a, b } => NodeKind::Maximum { a: f(a), b: f(b) },
+        NodeKind::Minimum { a, b } => NodeKind::Minimum { a: f(a), b: f(b) },
+        NodeKind::Concat { a, b, dim } => NodeKind::Concat {
+            a: f(a),
+            b: f(b),
+            dim: *dim,
+        },
+        NodeKind::Matmul { a, b } => NodeKind::Matmul { a: f(a), b: f(b) },
+        NodeKind::Solve { a, b } => NodeKind::Solve { a: f(a), b: f(b) },
+        NodeKind::Where { cond, a, b } => NodeKind::Where {
+            cond: f(cond),
+            a: f(a),
+            b: f(b),
+        },
+        NodeKind::IndexSelect { a, dim, indexes } => NodeKind::IndexSelect {
+            a: f(a),
+            dim: *dim,
+            indexes: f(indexes),
+        },
+        NodeKind::Gather { a, dim, indexes } => NodeKind::Gather {
+            a: f(a),
+            dim: *dim,
+            indexes: f(indexes),
+        },
+        NodeKind::ScatterAdd {
+            a,
+            dim,
+            indexes,
+            src,
+        } => NodeKind::ScatterAdd {
+            a: f(a),
+            dim: *dim,
+            indexes: f(indexes),
+            src: f(src),
+        },
+        NodeKind::Neg { a } => NodeKind::Neg { a: f(a) },
+        NodeKind::Abs { a } => NodeKind::Abs { a: f(a) },
+        NodeKind::Sqrt { a } => NodeKind::Sqrt { a: f(a) },
+        NodeKind::Exp { a } => NodeKind::Exp { a: f(a) },
+        NodeKind::Log { a } => NodeKind::Log { a: f(a) },
+        NodeKind::Sin { a } => NodeKind::Sin { a: f(a) },
+        NodeKind::Cos { a } => NodeKind::Cos { a: f(a) },
+        NodeKind::Tanh { a } => NodeKind::Tanh { a: f(a) },
+        NodeKind::Relu { a } => NodeKind::Relu { a: f(a) },
+        NodeKind::Erf { a } => NodeKind::Erf { a: f(a) },
+        NodeKind::Floor { a } => NodeKind::Floor { a: f(a) },
+        NodeKind::Ceil { a } => NodeKind::Ceil { a: f(a) },
+        NodeKind::Round { a } => NodeKind::Round { a: f(a) },
+        NodeKind::Sign { a } => NodeKind::Sign { a: f(a) },
+        NodeKind::Argmax { a, dim } => NodeKind::Argmax { a: f(a), dim: *dim },
+        NodeKind::Argmin { a, dim } => NodeKind::Argmin { a: f(a), dim: *dim },
+        NodeKind::Inverse { a } => NodeKind::Inverse { a: f(a) },
+        NodeKind::Det { a } => NodeKind::Det { a: f(a) },
+        NodeKind::Cumsum { a, dim } => NodeKind::Cumsum { a: f(a), dim: *dim },
+        NodeKind::Pow { a, exp } => NodeKind::Pow { a: f(a), exp: *exp },
+        NodeKind::Cast { a, dtype } => NodeKind::Cast {
+            a: f(a),
+            dtype: *dtype,
+        },
+        NodeKind::Sum { a, dims, keepdims } => NodeKind::Sum {
+            a: f(a),
+            dims: dims.clone(),
+            keepdims: *keepdims,
+        },
+        NodeKind::Mean { a, dims, keepdims } => NodeKind::Mean {
+            a: f(a),
+            dims: dims.clone(),
+            keepdims: *keepdims,
+        },
+        NodeKind::Max { a, dims, keepdims } => NodeKind::Max {
+            a: f(a),
+            dims: dims.clone(),
+            keepdims: *keepdims,
+        },
+        NodeKind::Min { a, dims, keepdims } => NodeKind::Min {
+            a: f(a),
+            dims: dims.clone(),
+            keepdims: *keepdims,
+        },
+        NodeKind::Prod { a, dims, keepdims } => NodeKind::Prod {
+            a: f(a),
+            dims: dims.clone(),
+            keepdims: *keepdims,
+        },
+        NodeKind::Reshape { a, shape } => NodeKind::Reshape {
+            a: f(a),
+            shape: shape.clone(),
+        },
+        NodeKind::Permute { a, dims } => NodeKind::Permute {
+            a: f(a),
+            dims: dims.clone(),
+        },
+        NodeKind::Slice { a, ranges } => NodeKind::Slice {
+            a: f(a),
+            ranges: ranges.clone(),
+        },
+        NodeKind::BroadcastTo { a, shape } => NodeKind::BroadcastTo {
+            a: f(a),
+            shape: shape.clone(),
+        },
+        NodeKind::Checkpoint { a } => NodeKind::Checkpoint { a: f(a) },
+        NodeKind::StopGradient { a } => NodeKind::StopGradient { a: f(a) },
     }
 }
 
@@ -1524,11 +1919,122 @@ fn eval_broadcast_binary(
     f(&a, &b)
 }
 
+macro_rules! linalg_impls {
+    ($ty:ty, $inverse:ident, $det:ident) => {
+        fn $inverse(t: &Tensor) -> candle_core::Result<Tensor> {
+            let n = t.dims()[0];
+            let mut a = t.to_vec2::<$ty>()?;
+            let mut inv: Vec<Vec<$ty>> = (0..n)
+                .map(|i| {
+                    (0..n)
+                        .map(|j| if i == j { 1.0 as $ty } else { 0.0 as $ty })
+                        .collect()
+                })
+                .collect();
+            for col in 0..n {
+                let mut pivot = col;
+                let mut best = a[col][col].abs();
+                for (r, row) in a.iter().enumerate().skip(col + 1) {
+                    let v = row[col].abs();
+                    if v > best {
+                        best = v;
+                        pivot = r;
+                    }
+                }
+                if best == 0.0 as $ty {
+                    return Err(candle_core::Error::Msg(
+                        "inverse: matrix is singular".to_string(),
+                    ));
+                }
+                if pivot != col {
+                    a.swap(col, pivot);
+                    inv.swap(col, pivot);
+                }
+                let d = a[col][col];
+                for j in 0..n {
+                    a[col][j] /= d;
+                    inv[col][j] /= d;
+                }
+                for r in 0..n {
+                    if r == col {
+                        continue;
+                    }
+                    let f = a[r][col];
+                    if f == 0.0 as $ty {
+                        continue;
+                    }
+                    for j in 0..n {
+                        a[r][j] -= f * a[col][j];
+                        inv[r][j] -= f * inv[col][j];
+                    }
+                }
+            }
+            let flat: Vec<$ty> = inv.into_iter().flatten().collect();
+            Tensor::from_vec(flat, (n, n), &Device::Cpu)
+        }
+
+        fn $det(t: &Tensor) -> candle_core::Result<Tensor> {
+            let n = t.dims()[0];
+            let mut a = t.to_vec2::<$ty>()?;
+            let mut sign = 1.0 as $ty;
+            let mut det = 1.0 as $ty;
+            for col in 0..n {
+                let mut pivot = col;
+                let mut best = a[col][col].abs();
+                for (r, row) in a.iter().enumerate().skip(col + 1) {
+                    let v = row[col].abs();
+                    if v > best {
+                        best = v;
+                        pivot = r;
+                    }
+                }
+                if best == 0.0 as $ty {
+                    return Tensor::from_vec(vec![0.0 as $ty], (), &Device::Cpu);
+                }
+                if pivot != col {
+                    a.swap(col, pivot);
+                    sign = -sign;
+                }
+                det *= a[col][col];
+                for r in col + 1..n {
+                    let f = a[r][col] / a[col][col];
+                    for j in col..n {
+                        a[r][j] -= f * a[col][j];
+                    }
+                }
+            }
+            Tensor::from_vec(vec![sign * det], (), &Device::Cpu)
+        }
+    };
+}
+
+linalg_impls!(f32, inverse_f32, det_f32);
+linalg_impls!(f64, inverse_f64, det_f64);
+
+fn cpu_inverse(t: &Tensor) -> candle_core::Result<Tensor> {
+    match t.dtype() {
+        DType::F32 => inverse_f32(t),
+        DType::F64 => inverse_f64(t),
+        other => Err(candle_core::Error::Msg(format!(
+            "linalg: unsupported dtype {other:?}"
+        ))),
+    }
+}
+
+fn cpu_det(t: &Tensor) -> candle_core::Result<Tensor> {
+    match t.dtype() {
+        DType::F32 => det_f32(t),
+        DType::F64 => det_f64(t),
+        other => Err(candle_core::Error::Msg(format!(
+            "linalg: unsupported dtype {other:?}"
+        ))),
+    }
+}
+
 fn reduce_dims(
     t: &Tensor,
     dims: &[usize],
-    keepdims: bool,
-    f: impl Fn(&Tensor, usize) -> candle_core::Result<Tensor>,
+    keepdims: bool,    f: impl Fn(&Tensor, usize) -> candle_core::Result<Tensor>,
 ) -> candle_core::Result<Tensor> {
     let mut out = t.clone();
     for &d in dims.iter().rev() {
@@ -1746,7 +2252,24 @@ fn eval_uncached(node: &Arc<Node>, ev: &Evaluator) -> candle_core::Result<Tensor
         NodeKind::IndexSelect { a, dim, indexes } => {
             let a = ev.value(a.id)?;
             let indexes = ev.value(indexes.id)?;
-            a.index_select(&indexes, *dim)?
+            a.contiguous()?.index_select(&indexes, *dim)?
+        }
+        NodeKind::ScatterAdd {
+            a,
+            dim,
+            indexes,
+            src,
+        } => {
+            let a = ev.value(a.id)?;
+            let indexes = ev.value(indexes.id)?;
+            let src = ev.value(src.id)?;
+            a.contiguous()?
+                .scatter_add(&indexes.contiguous()?, &src.contiguous()?, *dim)?
+        }
+        NodeKind::Gather { a, dim, indexes } => {
+            let a = ev.value(a.id)?;
+            let indexes = ev.value(indexes.id)?;
+            a.contiguous()?.gather(&indexes.contiguous()?, *dim)?
         }
         NodeKind::Pow { a, exp } => ev.value(a.id)?.powf(*exp)?,
         NodeKind::Cast { a, dtype } => ev.value(a.id)?.to_dtype(*dtype)?,
@@ -1765,6 +2288,36 @@ fn eval_uncached(node: &Arc<Node>, ev: &Evaluator) -> candle_core::Result<Tensor
         NodeKind::Min { a, dims, keepdims } => {
             let t = ev.value(a.id)?;
             reduce_dims(&t, dims, *keepdims, |t, d| t.min(d))?
+        }
+        NodeKind::Prod { a, dims, keepdims } => {
+            // no product kernel in candle: fold narrow+mul per reduced dim,
+            // keeping reduced dims as size 1 so later indices stay valid
+            let mut t = ev.value(a.id)?;
+            for &d in dims {
+                let n = t.dims()[d];
+                if n == 0 {
+                    let mut shape = t.dims().to_vec();
+                    shape[d] = 1;
+                    t = Tensor::ones(shape, t.dtype(), t.device())?;
+                    continue;
+                }
+                let mut acc = t.narrow(d, 0, 1)?;
+                for i in 1..n {
+                    acc = acc.mul(&t.narrow(d, i, 1)?)?;
+                }
+                t = acc;
+            }
+            if !keepdims {
+                let shape: Vec<usize> = t
+                    .dims()
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, _)| !dims.contains(i))
+                    .map(|(_, &d)| d)
+                    .collect();
+                t = t.reshape(shape)?;
+            }
+            t
         }
         NodeKind::Reshape { a, shape } => ev.value(a.id)?.reshape(shape.clone())?,
         NodeKind::Permute { a, dims } => ev.value(a.id)?.permute(dims.clone())?,
@@ -1803,7 +2356,26 @@ fn eval_uncached(node: &Arc<Node>, ev: &Evaluator) -> candle_core::Result<Tensor
             let b = if b.is_contiguous() { b } else { b.contiguous()? };
             a.broadcast_matmul(&b)?
         }
+        NodeKind::Inverse { a } => {
+            // linalg is CPU-only: round-trip to the host
+            let t = ev.value(a.id)?;
+            let cpu = t.to_device(&Device::Cpu)?;
+            cpu_inverse(&cpu)?.to_device(t.device())?
+        }
+        NodeKind::Det { a } => {
+            let t = ev.value(a.id)?;
+            let cpu = t.to_device(&Device::Cpu)?;
+            cpu_det(&cpu)?.to_device(t.device())?
+        }
+        NodeKind::Solve { a, b } => {
+            let a = ev.value(a.id)?;
+            let b = ev.value(b.id)?;
+            let a_cpu = a.to_device(&Device::Cpu)?;
+            let b_cpu = b.to_device(&Device::Cpu)?;
+            cpu_inverse(&a_cpu)?.matmul(&b_cpu)?.to_device(a.device())?
+        }
         NodeKind::StopGradient { a } => ev.value(a.id)?,
+        NodeKind::Checkpoint { a } => ev.value(a.id)?,
     };
     Ok(output)
 }
@@ -1996,6 +2568,41 @@ mod autodiff {
         let order = topo(loss);
         let mut cotangents: HashMap<u64, Arc<Node>> = HashMap::new();
         cotangents.insert(loss.id, ones(loss.dtype, &loss.device)?);
+        backward(&order, &mut cotangents)?;
+        Ok(wrt
+            .iter()
+            .map(|target| match cotangents.get(&target.id) {
+                Some(g) => g.clone(),
+                None => zeros_like(target).expect("zeros_like"),
+            })
+            .collect())
+    }
+
+    // Nodes reachable from the walk's root without passing through the
+    // checkpoint — these are the region's inputs and stay shared.
+    fn outside_set(order: &[Arc<Node>], checkpoint_id: u64) -> HashSet<u64> {
+        let mut visited = HashSet::new();
+        if let Some(root) = order.last() {
+            let mut stack = vec![root.clone()];
+            while let Some(node) = stack.pop() {
+                if node.id == checkpoint_id {
+                    continue;
+                }
+                if !visited.insert(node.id) {
+                    continue;
+                }
+                for child in node_children(&node.kind) {
+                    stack.push(child);
+                }
+            }
+        }
+        visited
+    }
+
+    fn backward(
+        order: &[Arc<Node>],
+        cotangents: &mut HashMap<u64, Arc<Node>>,
+    ) -> std::result::Result<(), String> {
         for node in order.iter().rev() {
             let Some(g) = cotangents.get(&node.id).cloned() else {
                 continue;
@@ -2137,15 +2744,94 @@ mod autodiff {
                     })?;
                     accumulate(a, add(g.clone(), sub(total, cs)?))?;
                 }
-                NodeKind::IndexSelect { .. } => {
-                    return Err(
-                        "grad: index_select is not differentiable (scatter-add not implemented)"
-                            .to_string(),
-                    );
+                NodeKind::IndexSelect { a, dim, indexes } => {
+                    // scatter the cotangent back into a zero tensor of the
+                    // input shape at the selected positions
+                    let mut ishape = vec![1usize; a.shape.len()];
+                    ishape[*dim] = indexes.shape[0];
+                    let idx = reshape(indexes.clone(), ishape)?;
+                    let idx = broadcast_to(idx, &g.shape)?;
+                    accumulate(
+                        a,
+                        mk(NodeKind::ScatterAdd {
+                            a: zeros_like(a.as_ref())?,
+                            dim: *dim,
+                            indexes: idx,
+                            src: g,
+                        }),
+                    )?;
+                }
+                NodeKind::ScatterAdd {
+                    a,
+                    dim,
+                    indexes,
+                    src,
+                } => {
+                    accumulate(a, Ok(g.clone()))?;
+                    accumulate(
+                        src,
+                        mk(NodeKind::Gather {
+                            a: g,
+                            dim: *dim,
+                            indexes: indexes.clone(),
+                        }),
+                    )?;
+                }
+                NodeKind::Gather { a, dim, indexes } => {
+                    // the scatter kernel requires src to match the target
+                    // outside dim, so pad the cotangent and the indexes with
+                    // harmless zeros (index 0, value 0) where they are smaller
+                    let mut g_padded = g;
+                    let mut idx_padded = indexes.clone();
+                    for i in 0..a.shape.len() {
+                        if i == *dim {
+                            continue;
+                        }
+                        let missing = a.shape[i].saturating_sub(g_padded.shape[i]);
+                        if missing > 0 {
+                            let mut zshape = g_padded.shape.clone();
+                            zshape[i] = missing;
+                            let mut ishape = idx_padded.shape.clone();
+                            ishape[i] = missing;
+                            g_padded = mk(NodeKind::Concat {
+                                a: g_padded.clone(),
+                                b: mk(NodeKind::Zeros {
+                                    shape: zshape,
+                                    dtype: g_padded.dtype,
+                                    device: g_padded.device.clone(),
+                                })?,
+                                dim: i,
+                            })?;
+                            idx_padded = mk(NodeKind::Concat {
+                                a: idx_padded.clone(),
+                                b: mk(NodeKind::Zeros {
+                                    shape: ishape,
+                                    dtype: DType::I64,
+                                    device: idx_padded.device.clone(),
+                                })?,
+                                dim: i,
+                            })?;
+                        }
+                    }
+                    accumulate(
+                        a,
+                        mk(NodeKind::ScatterAdd {
+                            a: zeros_like(a.as_ref())?,
+                            dim: *dim,
+                            indexes: idx_padded,
+                            src: g_padded,
+                        }),
+                    )?;
+                }
+                NodeKind::Prod { a, dims, keepdims } => {
+                    // d prod / d x_i = prod / x_i; undefined when any factor
+                    // is zero (the true adjoint needs the zero-free subproducts)
+                    let out_b = expand_reduced(&node.clone(), dims, *keepdims, &a.shape)?;
+                    let g_b = expand_reduced(&g, dims, *keepdims, &a.shape)?;
+                    accumulate(a, div(mul(g_b, out_b)?, a.clone()))?;
                 }
                 NodeKind::Pow { a, exp } => {
-                    let c = full(*exp, a.dtype, &a.device)?;
-                    let base = mk(NodeKind::Pow {
+                    let c = full(*exp, a.dtype, &a.device)?;                    let base = mk(NodeKind::Pow {
                         a: a.clone(),
                         exp: exp - 1.0,
                     })?;
@@ -2311,7 +2997,85 @@ mod autodiff {
                     })?;
                     accumulate(b, sum_to_shape(&gb, &b.shape))?;
                 }
+                NodeKind::Inverse { a } => {
+                    // d inv = -inv^T @ g @ inv^T
+                    let t = transpose2(&node)?;
+                    accumulate(
+                        a,
+                        neg(mk(NodeKind::Matmul {
+                            a: mk(NodeKind::Matmul {
+                                a: t.clone(),
+                                b: g,
+                            })?,
+                            b: t,
+                        })?),
+                    )?;
+                }
+                NodeKind::Det { a } => {
+                    // d det = det * inv^T
+                    let inv_t = transpose2(&mk(NodeKind::Inverse { a: a.clone() })?)?;
+                    accumulate(a, mul(g, mul(node.clone(), inv_t)?))?;
+                }
+                NodeKind::Solve { a, b } => {
+                    // out = a^-1 b; g_b = a^-T g; g_a = -g_b @ out^T
+                    let inv_t = transpose2(&mk(NodeKind::Inverse { a: a.clone() })?)?;
+                    let gb = mk(NodeKind::Matmul {
+                        a: inv_t,
+                        b: g.clone(),
+                    })?;
+                    accumulate(b, Ok(gb.clone()))?;
+                    accumulate(
+                        a,
+                        neg(mk(NodeKind::Matmul {
+                            a: gb,
+                            b: transpose2(&node)?,
+                        })?),
+                    )?;
+                }
                 NodeKind::StopGradient { .. } => {}
+                NodeKind::Checkpoint { a } => {
+                    // Deep-copy the region's interior with fresh node ids and
+                    // build the adjoint over the copy: forward intermediates
+                    // are recomputed in the backward phase instead of being
+                    // retained. Region inputs (nodes also reachable from
+                    // outside the checkpoint) and constructor leaves are
+                    // shared, so randn draws and constants are not re-run.
+                    let outside = outside_set(order, node.id);
+                    let region_topo = topo(a);
+                    let mut map: HashMap<u64, Arc<Node>> = HashMap::new();
+                    let mut shared: HashMap<u64, Arc<Node>> = HashMap::new();
+                    for rn in &region_topo {
+                        if outside.contains(&rn.id) || node_children(&rn.kind).is_empty() {
+                            shared.insert(rn.id, rn.clone());
+                            continue;
+                        }
+                        let kind = remap_children(&rn.kind, &|child: &Arc<Node>| {
+                            map.get(&child.id).cloned().unwrap_or_else(|| child.clone())
+                        });
+                        let copied = Node::new(kind)?;
+                        map.insert(rn.id, copied);
+                    }
+                    if let Some(copied_root) = map.get(&a.id).cloned() {
+                        let copied_order: Vec<Arc<Node>> = region_topo
+                            .iter()
+                            .filter_map(|rn| map.get(&rn.id).cloned())
+                            .collect();
+                        let copy_ids: HashSet<u64> = map.values().map(|n| n.id).collect();
+                        let mut sub: HashMap<u64, Arc<Node>> = HashMap::new();
+                        sub.insert(copied_root.id, g.clone());
+                        backward(&copied_order, &mut sub)?;
+                        for (id, contribution) in sub {
+                            if copy_ids.contains(&id) {
+                                continue;
+                            }
+                            if let Some(input) = shared.get(&id) {
+                                accumulate(input, Ok(contribution))?;
+                            }
+                        }
+                    } else {
+                        accumulate(a, Ok(g.clone()))?;
+                    }
+                }
                 NodeKind::Leaf(_)
                 | NodeKind::FromBytes { .. }
                 | NodeKind::Zeros { .. }
@@ -2332,13 +3096,7 @@ mod autodiff {
                 }
             }
         }
-        Ok(wrt
-            .iter()
-            .map(|target| match cotangents.get(&target.id) {
-                Some(g) => g.clone(),
-                None => zeros_like(target).expect("zeros_like"),
-            })
-            .collect())
+        Ok(())
     }
 }
 

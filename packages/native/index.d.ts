@@ -29,6 +29,9 @@ export declare class LazyTensor {
   ge(other: LazyTensor): LazyTensor
   le(other: LazyTensor): LazyTensor
   matmul(other: LazyTensor): LazyTensor
+  inverse(): LazyTensor
+  det(): LazyTensor
+  solve(other: LazyTensor): LazyTensor
   neg(): LazyTensor
   abs(): LazyTensor
   sqrt(): LazyTensor
@@ -45,12 +48,15 @@ export declare class LazyTensor {
   argmin(dim: number): LazyTensor
   cumsum(dim: number): LazyTensor
   indexSelect(dim: number, indexes: LazyTensor): LazyTensor
+  scatterAdd(dim: number, indexes: LazyTensor, src: LazyTensor): LazyTensor
+  gather(dim: number, indexes: LazyTensor): LazyTensor
   log(): LazyTensor
   sin(): LazyTensor
   cos(): LazyTensor
   pow(exp: number): LazyTensor
   cast(dtype: NativeDType): LazyTensor
   sum(dims: Array<number>, keepdims: boolean): LazyTensor
+  prod(dims: Array<number>, keepdims: boolean): LazyTensor
   mean(dims: Array<number>, keepdims: boolean): LazyTensor
   max(dims: Array<number>, keepdims: boolean): LazyTensor
   min(dims: Array<number>, keepdims: boolean): LazyTensor
@@ -60,6 +66,7 @@ export declare class LazyTensor {
   concat(other: LazyTensor, dim: number): LazyTensor
   broadcastTo(shape: Array<number>): LazyTensor
   stopGradient(): LazyTensor
+  checkpoint(): LazyTensor
 }
 
 export declare class NativeTensor {

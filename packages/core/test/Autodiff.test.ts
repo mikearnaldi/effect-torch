@@ -136,13 +136,38 @@ layer(Device.Cpu)("Autodiff", (it) => {
       })
     )
 
-    it.effect("take is not differentiable", () =>
+    it.effect("take and gather scatter gradients back", () =>
       Effect.gen(function* () {
         const x = yield* f64([1, 2, 3, 4, 5, 6], [3, 2])
-        const idx = yield* Tensor.fromTypedArray(new BigInt64Array([2n, 0n]))
+        const idx = yield* Tensor.fromTypedArray(new BigInt64Array([2n, 0n, 2n]))
         const loss = yield* Tensor.sum(yield* Tensor.take(x, idx))
-        const error = yield* Effect.flip(Tensor.grad(loss, [x]))
-        expect(error.reason).toBe("not-differentiable")
+        const [g] = yield* Tensor.grad(loss, [x])
+        assert.deepStrictEqual(yield* values(g), [1, 1, 0, 0, 2, 2])
+
+        const idx2 = yield* Tensor.fromTypedArray(new BigInt64Array([1n, 0n, 0n, 1n]), [2, 2])
+        const g2 = yield* Tensor.sum(yield* Tensor.gather(x, idx2, { dim: 1 }))
+        const [dg] = yield* Tensor.grad(g2, [x])
+        assert.deepStrictEqual(yield* values(dg), [1, 1, 1, 1, 0, 0])
+      })
+    )
+
+    it.effect("scatterAdd", () =>
+      Effect.gen(function* () {
+        yield* gradcheck(
+          sumOf((x) => Effect.gen(function* () {
+            const idx = yield* Tensor.fromTypedArray(new BigInt64Array([2n, 0n, 2n]))
+            return yield* Tensor.take(x, idx)
+          })),
+          [1, 2, 3, 4, 5, 6],
+          [3, 2]
+        )
+        const base = yield* f64([1, 1, 1, 1, 1, 1], [3, 2])
+        const idx = yield* Tensor.fromTypedArray(new BigInt64Array([0n, 2n, 2n, 0n]), [2, 2])
+        yield* gradcheck(
+          sumOf((src) => Tensor.scatterAdd(base, idx, src)),
+          [1, 2, 3, 4],
+          [2, 2]
+        )
       })
     )
 
@@ -186,6 +211,95 @@ layer(Device.Cpu)("Autodiff", (it) => {
           [1, 3, 2, 4, 5, 7, 6, 8, 9],
           [1, 1, 3, 3]
         )
+        const wt = yield* f64([1, 0, 0, 1], [1, 1, 2, 2])
+        yield* gradcheck(sumOf((xt) => Tensor.convTranspose2d(xt, wt)), [1, 2, 3, 4], [1, 1, 2, 2])
+        yield* gradcheck(
+          sumOf((xt) => Tensor.convTranspose2d(xt, wt, { stride: 2 })),
+          [1, 2, 3, 4],
+          [1, 1, 2, 2]
+        )
+        const xt = yield* f64([1, 2, 3, 4], [1, 1, 2, 2])
+        yield* gradcheck(sumOf((w2) => Tensor.convTranspose2d(xt, w2)), [1, 2, 3, 4], [1, 1, 2, 2])
+      })
+    )
+
+    it.effect("linalg", () =>
+      Effect.gen(function* () {
+        yield* gradcheck(sumOf((x) => Tensor.det(x)), [4, 1, 1, 3], [2, 2])
+        yield* gradcheck(sumOf((x) => Tensor.inverse(x)), [4, 1, 1, 3], [2, 2])
+        const b = yield* f64([9, 8], [2, 1])
+        yield* gradcheck(sumOf((x) => Tensor.solve(x, b)), [4, 1, 1, 3], [2, 2])
+        const a = yield* f64([4, 1, 1, 3], [2, 2])
+        yield* gradcheck(sumOf((x) => Tensor.solve(a, x)), [9, 8], [2, 1])
+      })
+    )
+
+    it.effect("checkpoint preserves values and gradients, sharing randn draws", () =>
+      Effect.gen(function* () {
+        const f = (x: Tensor.GenericTensor) =>
+          Effect.gen(function* () {
+            return yield* Tensor.mul(yield* Tensor.sin(x), yield* Tensor.add(x, 1))
+          })
+        const x = yield* f64([0.5, 1])
+        const plain = yield* f(x)
+        const wrapped = yield* Tensor.checkpoint(yield* f(x))
+        const plainLoss = yield* Tensor.sum(plain)
+        const wrappedLoss = yield* Tensor.sum(wrapped)
+        const [plainGrad] = yield* Tensor.grad(plainLoss, [x])
+        const [wrappedGrad] = yield* Tensor.grad(wrappedLoss, [x])
+        assert.deepStrictEqual(yield* values(wrappedLoss), yield* values(plainLoss))
+        const pg = yield* values(plainGrad)
+        const wg = yield* values(wrappedGrad)
+        for (let i = 0; i < 2; i++) {
+          expect(Math.abs(pg[i] - wg[i])).toBeLessThan(1e-12)
+        }
+
+        // the backward recompute must see the same randn draw as the forward
+        const stochastic = (x: Tensor.GenericTensor) =>
+          Effect.gen(function* () {
+            return yield* Tensor.mul(x, yield* Tensor.randn([2], { dtype: "f64" }))
+          })
+        const x2 = yield* f64([2, 4])
+        const out2 = yield* Tensor.checkpoint(yield* stochastic(x2))
+        const loss2 = yield* Tensor.sum(out2)
+        const [g2] = yield* Tensor.grad(loss2, [x2])
+        const [outM, gM] = yield* Tensor.evaluate([out2, g2])
+        const outValues = yield* Tensor.toNumberArray(outM)
+        const gradValues = yield* Tensor.toNumberArray(gM)
+        for (let i = 0; i < 2; i++) {
+          expect(Math.abs(outValues[i] / [2, 4][i] - gradValues[i])).toBeLessThan(1e-12)
+        }
+      })
+    )
+
+    it.effect("vjp / jvp / vmap", () =>
+      Effect.gen(function* () {
+        const a = yield* f64([1, 2, 3, 4, 5, 6], [2, 3])
+        const f = (x: Tensor.GenericTensor) => Tensor.matmul(a, x)
+        const x = yield* f64([1, 1, 1], [3, 1])
+        const v = yield* f64([1, 2], [2, 1])
+        const { output, pullback } = yield* Tensor.vjp(f, x, v)
+        assert.deepStrictEqual(yield* values(output), [6, 15])
+        // J^T v = A^T v
+        assert.deepStrictEqual(yield* values(pullback), [1 * 1 + 4 * 2, 2 * 1 + 5 * 2, 3 * 1 + 6 * 2])
+
+        const t = yield* f64([1, 0, 0], [3, 1])
+        const { tangent } = yield* Tensor.jvp(f, x, t)
+        assert.deepStrictEqual(yield* values(tangent), [1, 4])
+
+        const nonlinear = (x: Tensor.GenericTensor) => Tensor.sin(x)
+        const xn = yield* f64([0.5, 1])
+        const vn = yield* f64([2, 3])
+        const { tangent: tn } = yield* Tensor.jvp(nonlinear, xn, vn)
+        const tnValues = yield* values(tn)
+        expect(Math.abs(tnValues[0] - Math.cos(0.5) * 2)).toBeLessThan(1e-12)
+        expect(Math.abs(tnValues[1] - Math.cos(1) * 3)).toBeLessThan(1e-12)
+
+        const m = yield* f64([1, 2, 3, 4, 5, 6], [2, 3])
+        const rowSums = yield* Tensor.vmap((row) => Tensor.sum(row))(m)
+        assert.deepStrictEqual(yield* values(rowSums), [6, 15])
+        const mapped = yield* Tensor.vmap((row) => Tensor.relu(row))(m)
+        assert.deepStrictEqual(mapped.shape, [2, 3])
       })
     )
 

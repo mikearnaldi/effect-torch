@@ -1671,48 +1671,14 @@ export const logsumexp = dualOptions(
 
 /**
  * Computes the product of elements over the given dimensions (all of them
- * by default). The product of an empty set of elements is `1`.
- *
- * Implemented as a fold of per-index slices — the backend has no product
- * kernel — so the graph grows linearly with the reduced dimension sizes.
+ * by default). The product of an empty set of elements is `1`. The
+ * gradient is computed as `g * prod / x`, so it is undefined when any
+ * factor is `0`.
  *
  * @since 0.1.0
  * @category reductions
  */
-export const prod = dualOptions<ReduceOptions, CurrentDevice>(
-  (
-    self: GenericTensor,
-    options: ReduceOptions = {}
-  ): Effect.Effect<LazyTensor, TensorError, CurrentDevice> =>
-    Effect.gen(function* () {
-      const dims = options.dims ?? self.shape.map((_, i) => i)
-      const keepdims = options.keepdims ?? false
-      const normalized = normalizeDims("prod", self.shape.length, dims)
-      let cur: GenericTensor = self
-      for (const d of normalized) {
-        const n = cur.shape[d]
-        if (n === 0) {
-          const shape = cur.shape.map((size, i) => (i === d ? 1 : size))
-          cur = yield* ones(shape, { dtype: cur.dtype })
-          continue
-        }
-        let acc: GenericTensor = yield* slice(cur, {
-          end: cur.shape.map((size, i) => (i === d ? 1 : size))
-        })
-        for (let i = 1; i < n; i++) {
-          const next = yield* slice(cur, {
-            start: cur.shape.map((_, j) => (j === d ? i : 0)),
-            end: cur.shape.map((size, j) => (j === d ? i + 1 : size))
-          })
-          acc = yield* mul(acc, next)
-        }
-        cur = acc
-      }
-      return keepdims
-        ? yield* reshape(cur, self.shape.map((size, i) => (normalized.includes(i) ? 1 : size)))
-        : yield* reshape(cur, reducedShape("prod", self.shape, dims, false))
-    })
-)
+export const prod = reduceOp("prod", (a, dims, keepdims) => a.prod(dims, keepdims))
 
 /**
  * Reshapes a tensor. The total number of elements must stay the same.
@@ -2175,8 +2141,7 @@ export const pad = (
 /**
  * Gathers rows (or slices along `dim`) by `i64` indexes: the inverse of
  * one-hot. `indexes` must be a 1-D `i64` tensor on the same device.
- * Not differentiable (scatter-add is not implemented yet), so use it for
- * embeddings only in evaluation graphs for now.
+ * Differentiable: gradients scatter-add back into the input positions.
  *
  * @since 0.1.0
  * @category shape operations
@@ -2218,6 +2183,126 @@ export const take: {
         new TensorError({ op: "take", message: error instanceof Error ? error.message : String(error) })
     })
 )
+
+/**
+ * Gathers elements along `dim` at the given `i64` indexes, which must have
+ * the same rank as the input; the output shape is the indexes shape. This
+ * is the general take-along-dim (unlike {@link take}, which selects whole
+ * slices with a 1-D index).
+ *
+ * @since 0.1.0
+ * @category shape operations
+ */
+export const gather: {
+  (
+    indexes: GenericTensor,
+    options?: { readonly dim?: number }
+  ): (self: GenericTensor) => Effect.Effect<LazyTensor, TensorError>
+  (
+    self: GenericTensor,
+    indexes: GenericTensor,
+    options?: { readonly dim?: number }
+  ): Effect.Effect<LazyTensor, TensorError>
+} = dual(
+  (args) => args.length === 3 || (args.length === 2 && TensorTypeId in (args[1] as object)),
+  (
+    self: GenericTensor,
+    indexes: GenericTensor,
+    options: { readonly dim?: number } = {}
+  ): Effect.Effect<LazyTensor, TensorError> =>
+    Effect.try({
+      try: () => {
+        const d = normalizeDim("gather", self.shape.length, options.dim ?? 0)
+        if (indexes.dtype !== "i64") {
+          throw new Error(`gather: indexes must be i64, got ${indexes.dtype}`)
+        }
+        if (indexes.shape.length !== self.shape.length) {
+          throw new Error(
+            `gather: indexes rank ${indexes.shape.length} must match input rank ${self.shape.length}`
+          )
+        }
+        for (let i = 0; i < self.shape.length; i++) {
+          if (i !== d && indexes.shape[i] > self.shape[i]) {
+            throw new Error(
+              `gather: indexes shape [${indexes.shape}] exceeds input shape [${self.shape}] at dim ${i}`
+            )
+          }
+        }
+        if (indexes.device !== self.device) {
+          throw new Error(`gather: device mismatch, got ${indexes.device} and ${self.device}`)
+        }
+        return makeLazy(self.lazy.gather(d, indexes.lazy), indexes.shape, self.dtype, self.device)
+      },
+      catch: (error) =>
+        new TensorError({ op: "gather", message: error instanceof Error ? error.message : String(error) })
+    })
+)
+
+/**
+ * Adds `src` into `self` at positions given by `indexes` along `dim`
+ * (accumulating duplicates): the differentiable inverse of {@link gather}.
+ * `indexes` must be `i64` with the same shape as `src`.
+ *
+ * @since 0.1.0
+ * @category shape operations
+ */
+export const scatterAdd = (
+  self: GenericTensor,
+  indexes: GenericTensor,
+  src: GenericTensor,
+  options: { readonly dim?: number } = {}
+): Effect.Effect<LazyTensor, TensorError> =>
+  Effect.try({
+    try: () => {
+      const d = normalizeDim("scatterAdd", self.shape.length, options.dim ?? 0)
+      if (indexes.dtype !== "i64") {
+        throw new Error(`scatterAdd: indexes must be i64, got ${indexes.dtype}`)
+      }
+      if (indexes.shape.length !== src.shape.length || !indexes.shape.every((s, i) => s === src.shape[i])) {
+        throw new Error(
+          `scatterAdd: indexes shape [${indexes.shape}] must match src shape [${src.shape}]`
+        )
+      }
+      if (src.shape.length !== self.shape.length) {
+        throw new Error(`scatterAdd: src rank ${src.shape.length} must match input rank ${self.shape.length}`)
+      }
+      for (let i = 0; i < self.shape.length; i++) {
+        if (i !== d && src.shape[i] !== self.shape[i]) {
+          throw new Error(
+            `scatterAdd: src shape [${src.shape}] must match input shape [${self.shape}] outside dim ${d}`
+          )
+        }
+      }
+      checkCompatible("scatterAdd", self, src)
+      if (indexes.device !== self.device) {
+        throw new Error(`scatterAdd: device mismatch, got ${indexes.device} and ${self.device}`)
+      }
+      return makeLazy(self.lazy.scatterAdd(d, indexes.lazy, src.lazy), self.shape, self.dtype, self.device)
+    },
+    catch: (error) =>
+      new TensorError({ op: "scatterAdd", message: error instanceof Error ? error.message : String(error) })
+  })
+
+/**
+ * Reverses the order of elements along the given dimensions.
+ *
+ * @since 0.1.0
+ * @category shape operations
+ */
+export const flip = (
+  self: GenericTensor,
+  dims: ReadonlyArray<number>
+): Effect.Effect<LazyTensor, TensorError, CurrentDevice> =>
+  Effect.gen(function* () {
+    const normalized = normalizeDims("flip", self.shape.length, dims)
+    let cur: GenericTensor = self
+    for (const d of normalized) {
+      const n = self.shape[d]
+      const idx = yield* add(yield* mul(yield* arange(n, undefined, { dtype: "i64" }), -1), n - 1)
+      cur = yield* take(cur, idx, { dim: d })
+    }
+    return cur as LazyTensor
+  })
 
 /**
  * Expands `i64` class indexes of any shape into one-hot vectors of the
@@ -2527,6 +2612,203 @@ export const conv1d: {
     })
 )
 
+const dilateDim = (
+  self: GenericTensor,
+  dim: number,
+  factor: number
+): Effect.Effect<LazyTensor, TensorError, CurrentDevice> =>
+  Effect.gen(function* () {
+    if (factor === 1) {
+      return yield* add(self, 0)
+    }
+    const n = self.shape[dim]
+    const widened = yield* unsqueeze(self, dim + 1)
+    const zshape = [...self.shape]
+    zshape.splice(dim + 1, 0, factor - 1)
+    const cat = yield* concat([widened, yield* zeros(zshape, { dtype: self.dtype })], { dim: dim + 1 })
+    const merged = [...cat.shape]
+    merged[dim] = n * factor
+    merged.splice(dim + 1, 1)
+    const wide = yield* reshape(cat, merged)
+    const keep = (n - 1) * factor + 1
+    return yield* slice(wide, { end: wide.shape.map((s, i) => (i === dim ? keep : s)) })
+  })
+
+/**
+ * Options for {@link convTranspose2d} and {@link convTranspose1d}.
+ * `outputPadding` appends zeros to the bottom/right of the result to
+ * resolve stride ambiguity (must be smaller than `stride`).
+ *
+ * @since 0.1.0
+ * @category models
+ */
+export interface ConvTransposeOptions extends ConvOptions {
+  readonly outputPadding?: number
+}
+
+const convTranspose2dImpl = (
+  op: string,
+  self: GenericTensor,
+  weight: GenericTensor,
+  options: ConvTransposeOptions,
+  userPadding: readonly [number, number],
+  outputPads: readonly [number, number]
+): Effect.Effect<LazyTensor, TensorError, CurrentDevice> =>
+  Effect.gen(function* () {
+    const opts = yield* checkConvOptions(op, self, weight, options, 2)
+    const outputPadding = options.outputPadding ?? 0
+    if (!Number.isInteger(outputPadding) || outputPadding < 0) {
+      return yield* new TensorError({
+        op,
+        message: `${op}: outputPadding must be a non-negative integer, got ${outputPadding}`
+      })
+    }
+    if (outputPadding >= opts.stride) {
+      return yield* new TensorError({
+        op,
+        message: `${op}: outputPadding ${outputPadding} must be smaller than stride ${opts.stride}`
+      })
+    }
+    yield* Effect.try({
+      try: () => checkCompatible(op, self, weight),
+      catch: (error) =>
+        new TensorError({
+          op,
+          message: error instanceof Error ? error.message : String(error)
+        })
+    })
+    const cIn = self.shape[1]
+    const [wIn, cOutPerGroup, kh, kw] = weight.shape
+    const groups = opts.groups
+    if (wIn !== cIn) {
+      return yield* new TensorError({
+        op,
+        message: `${op}: weight has ${wIn} input channels, expected ${cIn}`
+      })
+    }
+    if (cIn % groups !== 0) {
+      return yield* new TensorError({
+        op,
+        message: `${op}: ${cIn} input channels are not divisible into ${groups} groups`
+      })
+    }
+    // equivalent conv: dilated input, flipped channel-swapped kernel,
+    // padding' = dilation * (k - 1) - padding
+    const padY = opts.dilation * (kh - 1) - userPadding[0]
+    const padX = opts.dilation * (kw - 1) - userPadding[1]
+    if (padY < 0 || padX < 0) {
+      return yield* new TensorError({
+        op,
+        message: `${op}: padding [${userPadding}] is too large for kernel [${kh}, ${kw}] with dilation ${opts.dilation}`
+      })
+    }
+    const convGroup = (x: GenericTensor, w: GenericTensor): Effect.Effect<LazyTensor, TensorError, CurrentDevice> =>
+      Effect.gen(function* () {
+        const dilated = yield* dilateDim(yield* dilateDim(x, 2, opts.stride), 3, opts.stride)
+        const kernel = yield* flip(yield* transpose(w, [1, 0, 2, 3]), [2, 3])
+        const padded = padY > 0 || padX > 0
+          ? yield* pad(dilated, [[0, 0], [0, 0], [padY, padY], [padX, padX]])
+          : dilated
+        return yield* conv2d(padded, kernel, { dilation: opts.dilation })
+      })
+    let out: LazyTensor
+    if (groups === 1) {
+      out = yield* convGroup(self, weight)
+    } else {
+      const xs = yield* split(self, Array<number>(groups).fill(cIn / groups), { dim: 1 })
+      const ws = yield* split(weight, Array<number>(groups).fill(wIn / groups), { dim: 0 })
+      const outs: Array<LazyTensor> = []
+      for (let i = 0; i < groups; i++) {
+        outs.push(yield* convGroup(xs[i], ws[i]))
+      }
+      out = yield* concat(outs as [GenericTensor, GenericTensor, ...Array<GenericTensor>], { dim: 1 })
+    }
+    if (outputPads[0] > 0 || outputPads[1] > 0) {
+      out = yield* pad(out, [[0, 0], [0, 0], [0, outputPads[0]], [0, outputPads[1]]])
+    }
+    return out
+  })
+
+/**
+ * 2-D transposed convolution ("deconvolution", the gradient of conv2d):
+ * `self` is `[N, C_in, H, W]`, `weight` is `[C_in, C_out/groups, KH, KW]`.
+ * Composed as input dilation (zero-interleave) followed by a regular
+ * {@link conv2d} with the spatially flipped, channel-swapped kernel — so
+ * it runs on every backend and differentiates through ordinary adjoints.
+ *
+ * @since 0.1.0
+ * @category neural network
+ */
+export const convTranspose2d: {
+  (
+    weight: GenericTensor,
+    options?: ConvTransposeOptions
+  ): (self: GenericTensor) => Effect.Effect<LazyTensor, TensorError, CurrentDevice>
+  (
+    self: GenericTensor,
+    weight: GenericTensor,
+    options?: ConvTransposeOptions
+  ): Effect.Effect<LazyTensor, TensorError, CurrentDevice>
+} = dual(
+  (args) => args.length === 3 || (args.length === 2 && TensorTypeId in (args[1] as object)),
+  (
+    self: GenericTensor,
+    weight: GenericTensor,
+    options: ConvTransposeOptions = {}
+  ): Effect.Effect<LazyTensor, TensorError, CurrentDevice> =>
+    convTranspose2dImpl("convTranspose2d", self, weight, options, [
+      options.padding ?? 0,
+      options.padding ?? 0
+    ], [
+      options.outputPadding ?? 0,
+      options.outputPadding ?? 0
+    ])
+)
+
+/**
+ * 1-D transposed convolution over `[N, C_in, L]` with `weight`
+ * `[C_in, C_out/groups, K]`, implemented as a rank-4
+ * {@link convTranspose2d}.
+ *
+ * @since 0.1.0
+ * @category neural network
+ */
+export const convTranspose1d: {
+  (
+    weight: GenericTensor,
+    options?: ConvTransposeOptions
+  ): (self: GenericTensor) => Effect.Effect<LazyTensor, TensorError, CurrentDevice>
+  (
+    self: GenericTensor,
+    weight: GenericTensor,
+    options?: ConvTransposeOptions
+  ): Effect.Effect<LazyTensor, TensorError, CurrentDevice>
+} = dual(
+  (args) => args.length === 3 || (args.length === 2 && TensorTypeId in (args[1] as object)),
+  (
+    self: GenericTensor,
+    weight: GenericTensor,
+    options: ConvTransposeOptions = {}
+  ): Effect.Effect<LazyTensor, TensorError, CurrentDevice> =>
+    Effect.gen(function* () {
+      if (self.shape.length !== 3 || weight.shape.length !== 3) {
+        return yield* new TensorError({
+          op: "convTranspose1d",
+          message: `convTranspose1d: expected rank-3 input and weight, got ranks ${self.shape.length} and ${weight.shape.length}`
+        })
+      }
+      const out = yield* convTranspose2dImpl(
+        "convTranspose1d",
+        yield* unsqueeze(self, 2),
+        yield* unsqueeze(weight, 2),
+        options,
+        [0, options.padding ?? 0],
+        [0, options.outputPadding ?? 0]
+      )
+      return yield* squeeze(out, { dims: [2] })
+    })
+)
+
 /**
  * Options for {@link maxPool2d} and {@link avgPool2d}. `kernelSize` is the
  * window `[KH, KW]` (a number for square windows); `stride` defaults to the
@@ -2622,6 +2904,88 @@ export const avgPool2d = (
 ): Effect.Effect<LazyTensor, TensorError, CurrentDevice> =>
   pool2d("avgPool2d", (t) => mean(t, { dims: [0] }), self, options)
 
+const checkSquare = (op: string, self: GenericTensor): Effect.Effect<void, TensorError> =>
+  Effect.gen(function* () {
+    if (self.shape.length !== 2 || self.shape[0] !== self.shape[1]) {
+      return yield* new TensorError({
+        op,
+        message: `${op}: expected a square rank-2 tensor, got shape [${self.shape}]`
+      })
+    }
+    if (!isFloatDtype(self.dtype)) {
+      return yield* new TensorError({ op, message: `${op}: dtype must be f32 or f64, got ${self.dtype}` })
+    }
+  })
+
+/**
+ * Matrix inverse of a square rank-2 tensor. Linear algebra runs on the
+ * CPU — on other devices the matrix round-trips through the host.
+ *
+ * @since 0.1.0
+ * @category linalg
+ */
+export const inverse = (self: GenericTensor): Effect.Effect<LazyTensor, TensorError> =>
+  Effect.gen(function* () {
+    yield* checkSquare("inverse", self)
+    return yield* Effect.try({
+      try: () => makeLazy(self.lazy.inverse(), self.shape, self.dtype, self.device),
+      catch: (error) =>
+        new TensorError({ op: "inverse", message: error instanceof Error ? error.message : String(error) })
+    })
+  })
+
+/**
+ * Determinant of a square rank-2 tensor, as a scalar. Linear algebra runs
+ * on the CPU — on other devices the matrix round-trips through the host.
+ *
+ * @since 0.1.0
+ * @category linalg
+ */
+export const det = (self: GenericTensor): Effect.Effect<LazyTensor, TensorError> =>
+  Effect.gen(function* () {
+    yield* checkSquare("det", self)
+    return yield* Effect.try({
+      try: () => makeLazy(self.lazy.det(), [], self.dtype, self.device),
+      catch: (error) =>
+        new TensorError({ op: "det", message: error instanceof Error ? error.message : String(error) })
+    })
+  })
+
+/**
+ * Solves the linear system `a @ x = b` for `x`, with square rank-2 `a` and
+ * rank-2 `b`. Linear algebra runs on the CPU — on other devices the
+ * matrices round-trip through the host.
+ *
+ * @since 0.1.0
+ * @category linalg
+ */
+export const solve: {
+  (b: GenericTensor): (self: GenericTensor) => Effect.Effect<LazyTensor, TensorError>
+  (self: GenericTensor, b: GenericTensor): Effect.Effect<LazyTensor, TensorError>
+} = dual(
+  2,
+  (self: GenericTensor, b: GenericTensor): Effect.Effect<LazyTensor, TensorError> =>
+    Effect.gen(function* () {
+      yield* checkSquare("solve", self)
+      if (b.shape.length !== 2 || b.shape[0] !== self.shape[0]) {
+        return yield* new TensorError({
+          op: "solve",
+          message: `solve: expected a rank-2 right-hand side with ${self.shape[0]} rows, got shape [${b.shape}]`
+        })
+      }
+      yield* Effect.try({
+        try: () => checkCompatible("solve", self, b),
+        catch: (error) =>
+          new TensorError({ op: "solve", message: error instanceof Error ? error.message : String(error) })
+      })
+      return yield* Effect.try({
+        try: () => makeLazy(self.lazy.solve(b.lazy), b.shape, self.dtype, self.device),
+        catch: (error) =>
+          new TensorError({ op: "solve", message: error instanceof Error ? error.message : String(error) })
+      })
+    })
+)
+
 /**
  * Converts a tensor to a different dtype. Dtypes are strict in this library:
  * no implicit promotion happens anywhere, so `cast` is the only way to mix
@@ -2664,6 +3028,28 @@ const toGradError = (error: unknown): GradError => {
     detail
   })
 }
+
+/**
+ * Gradient checkpointing: the returned tensor has the same value as the
+ * input, but during the backward pass the forward intermediates of the
+ * subgraph that produced it are recomputed from a fresh copy instead of
+ * being retained — trading one extra forward evaluation of the region for
+ * its peak memory. Region inputs (nodes also reachable from outside the
+ * checkpoint) and constructor leaves (including `randn` draws) are shared,
+ * so recomputation is consistent with the forward pass.
+ *
+ * @since 0.1.0
+ * @category autodiff
+ */
+export const checkpoint = (self: GenericTensor): Effect.Effect<LazyTensor, TensorError> =>
+  Effect.try({
+    try: () => makeLazy(self.lazy.checkpoint(), self.shape, self.dtype, self.device),
+    catch: (error) =>
+      new TensorError({
+        op: "checkpoint",
+        message: error instanceof Error ? error.message : String(error)
+      })
+  })
 
 /**
  * Computes the gradients of a scalar loss with respect to the given tensors.
@@ -2731,6 +3117,119 @@ export const stopGradient = (self: GenericTensor): Effect.Effect<LazyTensor, Ten
         op: "stopGradient",
         message: error instanceof Error ? error.message : String(error)
       })
+  })
+
+const checkSameShapeDtype = (
+  op: string,
+  a: GenericTensor,
+  b: GenericTensor,
+  bName: string
+): Effect.Effect<void, TensorError> =>
+  Effect.gen(function* () {
+    if (a.shape.length !== b.shape.length || !a.shape.every((d, i) => d === b.shape[i])) {
+      return yield* new TensorError({
+        op,
+        message: `${op}: ${bName} shape [${b.shape}] does not match [${a.shape}]`
+      })
+    }
+    if (a.dtype !== b.dtype) {
+      return yield* new TensorError({
+        op,
+        message: `${op}: ${bName} dtype ${b.dtype} does not match ${a.dtype}`
+      })
+    }
+  })
+
+/**
+ * Vector-Jacobian product (reverse-mode pullback): given `f`, a primal `x`,
+ * and a cotangent `v` with the output's shape, returns `f(x)` together with
+ * `J(x)ᵀ v` — the gradient of `sum(f(x) * v)` with respect to `x`.
+ *
+ * @since 0.1.0
+ * @category autodiff
+ */
+export const vjp = (
+  f: (x: GenericTensor) => Effect.Effect<GenericTensor, TensorError, CurrentDevice>,
+  x: GenericTensor,
+  v: GenericTensor
+): Effect.Effect<
+  { readonly output: GenericTensor; readonly pullback: LazyTensor },
+  TensorError | GradError,
+  CurrentDevice
+> =>
+  Effect.gen(function* () {
+    const output = yield* f(x)
+    yield* checkSameShapeDtype("vjp", output, v, "cotangent")
+    const loss = yield* sum(yield* mul(output, yield* stopGradient(v)))
+    const [pullback] = yield* grad(loss, [x])
+    return { output, pullback }
+  })
+
+/**
+ * Jacobian-vector product (forward-mode pushforward via
+ * forward-over-reverse): given `f`, a primal `x`, and a tangent `v` with
+ * `x`'s shape, returns `f(x)` together with `J(x) v`. Uses second-order
+ * adjoints, so `f` must be twice differentiable through the ops it uses.
+ *
+ * @since 0.1.0
+ * @category autodiff
+ */
+export const jvp = (
+  f: (x: GenericTensor) => Effect.Effect<GenericTensor, TensorError, CurrentDevice>,
+  x: GenericTensor,
+  v: GenericTensor
+): Effect.Effect<
+  { readonly output: GenericTensor; readonly tangent: LazyTensor },
+  TensorError | GradError,
+  CurrentDevice
+> =>
+  Effect.gen(function* () {
+    yield* checkSameShapeDtype("jvp", x, v, "tangent")
+    const output = yield* f(x)
+    // u is a free linearization point: g(u) = J(x)ᵀ u is linear in u, and
+    // its own vjp at u = 0 with cotangent v is J(x) v
+    const u = yield* zerosLike(output)
+    const loss1 = yield* sum(yield* mul(output, u))
+    const [gradX] = yield* grad(loss1, [x])
+    const loss2 = yield* sum(yield* mul(gradX, yield* stopGradient(v)))
+    const [tangent] = yield* grad(loss2, [u])
+    return { output, tangent }
+  })
+
+/**
+ * Maps `f` over a leading dimension (default `0`): slices the input along
+ * `dim`, applies `f` to each slice with that dimension removed, and stacks
+ * the results along `dim`. Every slice must produce the same shape. This is
+ * the simple graph form — the graph grows linearly with the mapped
+ * dimension.
+ *
+ * @since 0.1.0
+ * @category autodiff
+ */
+export const vmap = (
+  f: (x: GenericTensor) => Effect.Effect<GenericTensor, TensorError, CurrentDevice>,
+  options: { readonly dim?: number } = {}
+) =>
+(
+  self: GenericTensor
+): Effect.Effect<LazyTensor, TensorError, CurrentDevice> =>
+  Effect.gen(function* () {
+    const d = normalizeDim("vmap", self.shape.length, options.dim ?? 0)
+    const slices = yield* split(self, 1, { dim: d })
+    const outs: Array<GenericTensor> = []
+    for (const s of slices) {
+      outs.push(yield* f(yield* squeeze(s, { dims: [d] })))
+    }
+    const first = outs[0].shape
+    for (const out of outs) {
+      if (out.shape.length !== first.length || !out.shape.every((s, i) => s === first[i])) {
+        return yield* new TensorError({
+          op: "vmap",
+          message: `vmap: function returned inconsistent shapes [${first}] and [${out.shape}] across the mapped dimension`
+        })
+      }
+    }
+    return yield* stack(outs as [GenericTensor, GenericTensor, ...Array<GenericTensor>], { dim: d })
   })
 
 type CancellationTokenType = InstanceType<typeof CancellationToken>

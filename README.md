@@ -175,6 +175,7 @@ product kernel). Also `argmax` / `argmin` (indices along a dim, `i64`) and
 | `softmax(t, { dims? })` / `logSoftmax` | Stable, last dim by default |
 | `dropout(t, { p? })` | Functional inverted dropout; mask drawn at evaluation time |
 | `conv1d` / `conv2d(t, weight, { stride?, padding?, dilation?, groups? })` | Convolution via im2col + matmul — all backends, fully differentiable |
+| `convTranspose1d` / `convTranspose2d(t, weight, { stride?, padding?, outputPadding?, groups? })` | Transposed convolution, composed from dilation + conv |
 | `maxPool2d` / `avgPool2d(t, { kernelSize, stride?, padding? })` | Pooling via window slices |
 
 ### `Tensor` — shape operations
@@ -192,10 +193,23 @@ product kernel). Also `argmax` / `argmin` (indices along a dim, `i64`) and
 | `broadcastTo(t, shape)` | Broadcast to a larger shape |
 | `tile(t, reps)` | Repeat the tensor per dim |
 | `pad(t, [[before, after], ...])` | Zero-pad per dim |
-| `take(t, indexes, { dim? })` | Gather rows by `i64` indexes (not differentiable yet) |
+| `take(t, indexes, { dim? })` | Gather rows by `i64` indexes (differentiable) |
+| `gather(t, indexes, { dim? })` / `scatterAdd(t, indexes, src, { dim? })` | Take-along-dim and its differentiable inverse |
 | `oneHot(indexes, depth, { dtype? })` | Class indexes to one-hot |
 | `triu(t, { diagonal? })` / `tril(t, { diagonal? })` | Triangular masks |
+| `flip(t, dims)` | Reverse element order along dims |
 | `trace(t)` | Sum of the diagonal of a square matrix |
+
+### `Tensor` — linear algebra
+
+Rank-2, square, float. Runs on the CPU (other devices round-trip through
+the host); all three are differentiable.
+
+| Export | Description |
+| --- | --- |
+| `inverse(t)` | Matrix inverse |
+| `det(t)` | Determinant (scalar) |
+| `solve(a, b)` | Solve `a @ x = b` |
 
 ### `Loss` — loss functions
 
@@ -230,7 +244,11 @@ so gradients can be differentiated again.
 | Export | Description |
 | --- | --- |
 | `grad(loss, wrt)` | gradients of a scalar `loss` w.r.t. the given tensors; tensors not influencing the loss get zeros |
+| `vjp(f, x, v)` | `f(x)` plus the pullback `J(x)ᵀ v` |
+| `jvp(f, x, v)` | `f(x)` plus the pushforward `J(x) v` (forward-over-reverse) |
+| `vmap(f, { dim? })(t)` | map `f` over a dimension, stacking results |
 | `stopGradient(t)` | blocks gradient flow through `t` |
+| `checkpoint(t)` | recomputes the subgraph's intermediates in backward instead of retaining them |
 | `GradError` | typed error: non-scalar output, non-float dtype, or non-differentiable op |
 
 ```ts

@@ -593,6 +593,33 @@ layer(Device.Cpu)("Tensor", (it) => {
       })
     )
 
+    it.effect("gather and scatterAdd", () =>
+      Effect.gen(function* () {
+        const x = yield* Tensor.fromTypedArray(new Float64Array([1, 2, 3, 4, 5, 6]), [3, 2])
+        const idx = yield* Tensor.fromTypedArray(new BigInt64Array([1n, 0n, 0n, 1n]), [2, 2])
+        const g = yield* Tensor.gather(x, idx, { dim: 1 })
+        assert.deepStrictEqual(g.shape, [2, 2])
+        assert.deepStrictEqual(yield* values(g), [2, 1, 3, 4])
+        const base = yield* Tensor.zeros([3, 2], { dtype: "f64" })
+        const s = yield* Tensor.scatterAdd(
+          base,
+          yield* Tensor.fromTypedArray(new BigInt64Array([1n, 0n, 0n, 1n, 1n, 0n]), [3, 2]),
+          yield* Tensor.fromTypedArray(new Float64Array([10, 20, 30, 40, 50, 60]), [3, 2]),
+          { dim: 1 }
+        )
+        assert.deepStrictEqual(yield* values(s), [20, 10, 30, 40, 60, 50])
+      })
+    )
+
+    it.effect("flip", () =>
+      Effect.gen(function* () {
+        const x = yield* Tensor.fromTypedArray(new Float64Array([1, 2, 3, 4, 5, 6]), [2, 3])
+        assert.deepStrictEqual(yield* values(yield* Tensor.flip(x, [0])), [4, 5, 6, 1, 2, 3])
+        assert.deepStrictEqual(yield* values(yield* Tensor.flip(x, [1])), [3, 2, 1, 6, 5, 4])
+        assert.deepStrictEqual(yield* values(yield* Tensor.flip(x, [0, 1])), [6, 5, 4, 3, 2, 1])
+      })
+    )
+
     it.effect("oneHot", () =>
       Effect.gen(function* () {
         const idx = yield* Tensor.fromTypedArray(new BigInt64Array([0n, 2n, 1n]))
@@ -618,6 +645,26 @@ layer(Device.Cpu)("Tensor", (it) => {
         assert.deepStrictEqual(yield* values(yield* Tensor.dot(a, b)), [32])
         const m = yield* Tensor.fromTypedArray(new Float64Array([1, 2, 3, 4]), [2, 2])
         assert.deepStrictEqual(yield* values(yield* Tensor.trace(m)), [5])
+      })
+    )
+    it.effect("inverse/det/solve", () =>
+      Effect.gen(function* () {
+        const a = yield* Tensor.fromTypedArray(new Float64Array([4, 1, 1, 3]), [2, 2])
+        const inv = yield* Tensor.inverse(a)
+        const identity = yield* values(yield* Tensor.matmul(a, inv))
+        for (let i = 0; i < 4; i++) {
+          expect(Math.abs(identity[i] - [1, 0, 0, 1][i])).toBeLessThan(1e-9)
+        }
+        const [d] = yield* values(yield* Tensor.det(a))
+        expect(Math.abs(d - 11)).toBeLessThan(1e-9)
+        const b = yield* Tensor.fromTypedArray(new Float64Array([9, 8]), [2, 1])
+        const x = yield* Tensor.solve(a, b)
+        const xValues = yield* values(x)
+        expect(Math.abs(xValues[0] - 19 / 11)).toBeLessThan(1e-9)
+        expect(Math.abs(xValues[1] - 23 / 11)).toBeLessThan(1e-9)
+        const singular = yield* Tensor.fromTypedArray(new Float64Array([1, 2, 2, 4]), [2, 2])
+        const error = yield* Effect.flip(Effect.flatMap(Tensor.inverse(singular), (t) => values(t)))
+        expect(error.message).toContain("singular")
       })
     )
   })
@@ -715,6 +762,75 @@ layer(Device.Cpu)("Tensor", (it) => {
         const padded = yield* Tensor.maxPool2d(x, { kernelSize: 3, stride: 1, padding: 1 })
         assert.deepStrictEqual(padded.shape, [1, 1, 3, 3])
         assert.deepStrictEqual(yield* values(padded), [5, 7, 7, 8, 9, 9, 8, 9, 9])
+      })
+    )
+
+    it.effect("convTranspose2d matches a scatter-form reference across configs", () =>
+      Effect.gen(function* () {
+        const ref = (
+          x: Array<number>,
+          xShape: [number, number, number, number],
+          w: Array<number>,
+          wShape: [number, number, number, number],
+          stride: number,
+          padding: number,
+          outputPadding: number
+        ) => {
+          const [n, cIn, h, wid] = xShape
+          const [, cOut, kh, kw] = wShape
+          const oh = (h - 1) * stride - 2 * padding + kh + outputPadding
+          const ow = (wid - 1) * stride - 2 * padding + kw + outputPadding
+          const out = new Array<number>(n * cOut * oh * ow).fill(0)
+          for (let b = 0; b < n; b++) {
+            for (let ci = 0; ci < cIn; ci++) {
+              for (let iy = 0; iy < h; iy++) {
+                for (let iz = 0; iz < wid; iz++) {
+                  for (let co = 0; co < cOut; co++) {
+                    for (let ky = 0; ky < kh; ky++) {
+                      for (let kz = 0; kz < kw; kz++) {
+                        const oy = iy * stride - padding + ky
+                        const oz = iz * stride - padding + kz
+                        if (oy >= 0 && oy < oh && oz >= 0 && oz < ow) {
+                          out[((b * cOut + co) * oh + oy) * ow + oz] += x[((b * cIn + ci) * h + iy) * wid + iz] *
+                            w[((ci * cOut + co) * kh + ky) * kw + kz]
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+          return { out, shape: [n, cOut, oh, ow] }
+        }
+        const xData = Array.from({ length: 1 * 2 * 3 * 4 }, (_, i) => ((i * 7) % 11) - 5)
+        const wData = Array.from({ length: 2 * 3 * 2 * 3 }, (_, i) => ((i * 5) % 7) - 3)
+        const configs = [
+          { stride: 1, padding: 0, outputPadding: 0 },
+          { stride: 2, padding: 0, outputPadding: 1 },
+          { stride: 2, padding: 1, outputPadding: 0 }
+        ] as const
+        for (const cfg of configs) {
+          const x = yield* Tensor.fromTypedArray(new Float64Array(xData), [1, 2, 3, 4])
+          const w = yield* Tensor.fromTypedArray(new Float64Array(wData), [2, 3, 2, 3])
+          const out = yield* Tensor.convTranspose2d(x, w, cfg)
+          const expected = ref(xData, [1, 2, 3, 4], wData, [2, 3, 2, 3], cfg.stride, cfg.padding, cfg.outputPadding)
+          assert.deepStrictEqual([...out.shape], expected.shape)
+          const actual = yield* values(out)
+          for (let i = 0; i < expected.out.length; i++) {
+            expect(Math.abs(actual[i] - expected.out[i])).toBeLessThan(1e-9)
+          }
+        }
+      })
+    )
+
+    it.effect("convTranspose1d", () =>
+      Effect.gen(function* () {
+        const x = yield* Tensor.fromTypedArray(new Float64Array([1, 2]), [1, 1, 2])
+        const w = yield* Tensor.fromTypedArray(new Float64Array([1, 1, 1]), [1, 1, 3])
+        assert.deepStrictEqual(yield* values(yield* Tensor.convTranspose1d(x, w)), [1, 3, 3, 2])
+        const strided = yield* Tensor.convTranspose1d(x, w, { stride: 2 })
+        assert.deepStrictEqual(yield* values(strided), [1, 1, 3, 2, 2])
       })
     )
   })
