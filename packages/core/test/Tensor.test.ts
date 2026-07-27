@@ -1,7 +1,7 @@
 import { describe, expect, layer } from "@effect/vitest"
 import * as assert from "@effect/vitest/utils"
 import { Effect, Exit } from "effect"
-import { Device, Tensor } from "../src/index.js"
+import { Device, Tensor } from "../src/index.ts"
 
 const values = (t: Tensor.GenericTensor) =>
   Effect.map(Tensor.toTypedArray(t), (arr) => Array.from<number | bigint>(arr).map(Number))
@@ -102,6 +102,19 @@ layer(Device.Cpu)("Tensor", (it) => {
         )
       })
     )
+
+    it.effect("tanh and sigmoid", () =>
+      Effect.gen(function* () {
+        const x = yield* Tensor.fromTypedArray(new Float64Array([-1, 0, 1, 10]))
+        const tanhValues = yield* values(yield* Tensor.tanh(x))
+        const sigmoidValues = yield* values(yield* Tensor.sigmoid(x))
+        for (let i = 0; i < 4; i++) {
+          const v = [-1, 0, 1, 10][i]
+          expect(Math.abs(tanhValues[i] - Math.tanh(v))).toBeLessThan(1e-12)
+          expect(Math.abs(sigmoidValues[i] - 1 / (1 + Math.exp(-v)))).toBeLessThan(1e-12)
+        }
+      })
+    )
   })
 
   describe("reductions", () => {
@@ -130,6 +143,17 @@ layer(Device.Cpu)("Tensor", (it) => {
         assert.deepStrictEqual(yield* values(yield* Tensor.mean(m)), [3.5])
         assert.deepStrictEqual(yield* values(yield* Tensor.max(m, { dims: [0] })), [4, 5, 6])
         assert.deepStrictEqual(yield* values(yield* Tensor.min(m, { dims: [-1] })), [1, 4])
+      })
+    )
+
+    it.effect("mse", () =>
+      Effect.gen(function* () {
+        const pred = yield* Tensor.fromTypedArray(new Float64Array([1, 2, 4]), [3])
+        const target = yield* Tensor.fromTypedArray(new Float64Array([1, 1, 1]), [3])
+        for (const loss of [yield* Tensor.mse(pred, target), yield* Tensor.mse(pred, 1)]) {
+          const [value] = yield* values(loss)
+          expect(Math.abs(value - 10 / 3)).toBeLessThan(1e-12)
+        }
       })
     )
   })
@@ -179,6 +203,16 @@ layer(Device.Cpu)("Tensor", (it) => {
         const t = yield* Tensor.broadcastTo(yield* Tensor.ones([1, 3]), [2, 3])
         assert.deepStrictEqual(t.shape, [2, 3])
         assert.deepStrictEqual(yield* values(t), [1, 1, 1, 1, 1, 1])
+      })
+    )
+
+    it.effect("toNumberArray returns numbers and fails on i64", () =>
+      Effect.gen(function* () {
+        const t = yield* Tensor.fromTypedArray(new Float64Array([1, 2]), [2])
+        assert.deepStrictEqual(yield* Tensor.toNumberArray(t), [1, 2])
+        const ints = yield* Tensor.fromTypedArray(new BigInt64Array([1n]), [1])
+        const error = yield* Effect.flip(Tensor.toNumberArray(ints))
+        expect(error.message).toContain("i64")
       })
     )
   })

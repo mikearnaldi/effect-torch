@@ -53,14 +53,15 @@ open, with an API surface small enough to read end to end:
 
 ## Installation
 
-This is a pnpm monorepo. With [Nix](https://nixos.org/) and
-[direnv](https://direnv.net/) installed, `direnv allow` provides Node, pnpm,
-and Rust; otherwise install them manually.
+This is a pnpm monorepo; TypeScript runs directly through
+[tsx](https://tsx.is), so no build step is needed for local development.
+With [Nix](https://nixos.org/) and [direnv](https://direnv.net/) installed,
+`direnv allow` provides Node, pnpm, and Rust; otherwise install them
+manually.
 
 ```bash
 pnpm install
 pnpm --filter @effect-torch/native build   # builds the Rust native module
-pnpm --filter @effect-torch/core build     # builds the TypeScript core
 ```
 
 ## Usage
@@ -99,6 +100,7 @@ Everything is exported through two namespaces: `Tensor` and `Device`.
 | `DeviceKind` | `"cpu" \| "metal" \| "cuda"` |
 | `CurrentDevice` | `Context.Service` holding the device used by constructors |
 | `Cpu` / `Metal` / `Cuda` / `layer(device)` | Layers providing `CurrentDevice` |
+| `Best` | Layer providing the best available device — probes CUDA, then Metal, falls back to CPU |
 | `isAvailable(device)` | `Effect<boolean>` — checks device availability at runtime |
 
 ### `Tensor` — types
@@ -139,7 +141,7 @@ dtype/device) and broadcast like NumPy. Mixed dtypes or devices fail.
 | --- | --- |
 | `add` / `sub` / `mul` / `div` | Arithmetic with broadcasting |
 | `eq` / `gt` / `lt` / `ge` / `le` | Comparisons, return a `u8` tensor |
-| `neg` / `abs` / `sqrt` / `exp` / `log` / `sin` / `cos` | Unary math |
+| `neg` / `abs` / `sqrt` / `exp` / `log` / `sin` / `cos` / `tanh` / `sigmoid` | Unary math |
 | `pow(t, exponent)` | Constant exponent |
 | `matmul(a, b)` | Batched matmul over the last two dims |
 | `cast(t, dtype)` | Explicit dtype conversion |
@@ -148,7 +150,8 @@ dtype/device) and broadcast like NumPy. Mixed dtypes or devices fail.
 
 `sum` / `mean` / `max` / `min`, each taking
 `{ dims?: number[], keepdims?: boolean }`. Defaults to reducing all
-dimensions; negative dims count from the end.
+dimensions; negative dims count from the end. `mse(pred, target)` is the
+mean squared error `mean((pred - target)^2)`, reduced to a scalar.
 
 ### `Tensor` — shape operations
 
@@ -166,6 +169,7 @@ dimensions; negative dims count from the end.
 | --- | --- |
 | `evaluate([t1, t2, ...])` | `Effect<Tensor[], TensorError>` — runs the graph in one shared walk: shared subgraphs computed once, single `randn` draw across roots; interruptible |
 | `toTypedArray(t)` | `Effect<TypedArray, TensorError>` — evaluate + zero-copy readback where possible |
+| `toNumberArray(t)` | `Effect<number[], TensorError>` — fails for `i64` tensors instead of silently coercing bigints |
 
 ### `Tensor` — autodiff
 
@@ -183,8 +187,7 @@ so gradients can be differentiated again.
 ```ts
 const step = Effect.gen(function* () {
   const pred = yield* Tensor.add(yield* Tensor.matmul(x, w), b)
-  const err = yield* Tensor.sub(pred, y)
-  const loss = yield* Tensor.mean(yield* Tensor.mul(err, err))
+  const loss = yield* Tensor.mse(pred, y)
   const [gw, gb] = yield* Tensor.grad(loss, [w, b])
   // loss and grads share the forward graph: evaluate them in one walk
   const [l, gW, gB] = yield* Tensor.evaluate([loss, gw, gb])
@@ -236,8 +239,7 @@ const trained = Effect.gen(function* () {
   let state = yield* optimizer.init(params)
   for (let i = 0; i < steps; i++) {
     const pred = yield* Tensor.add(yield* Tensor.matmul(x, params[0]), params[1])
-    const err = yield* Tensor.sub(pred, y)
-    const loss = yield* Tensor.mean(yield* Tensor.mul(err, err))
+    const loss = yield* Tensor.mse(pred, y)
     const result = yield* Optimizer.step(optimizer, loss, params, state)
     params = result.params // materialized leaves of the next step's graph
     state = result.state
@@ -282,14 +284,16 @@ iteration builds a fresh graph of 10 chained matmuls and evaluates it once.
 ## Development
 
 ```bash
-pnpm -r typecheck     # typecheck all packages (against sources, no build needed)
+pnpm -r typecheck                        # typecheck all packages (against sources, no build needed)
 pnpm --filter @effect-torch/core test    # @effect/vitest suite
-pnpm bench            # matmul benchmark (cpu + metal)
-pnpm bench:mlx        # head-to-head against MLX
+pnpm bench                               # matmul benchmark (cpu + metal)
+pnpm bench:mlx                           # head-to-head against MLX
+pnpm --filter @effect-torch/examples xor # train the XOR example
 ```
 
 Layout:
 
 - `packages/native` — Rust backend (candle, napi-rs), lazy graph + evaluator
-- `packages/core` — public TypeScript API (`Tensor`, `Device`)
+- `packages/core` — public TypeScript API (`Tensor`, `Device`, `Optimizer`)
+- `packages/examples` — runnable examples (`xor.ts`)
 - `packages/bench` — benchmarks, including an MLX comparison

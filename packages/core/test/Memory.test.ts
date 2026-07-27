@@ -4,7 +4,7 @@ import { Effect } from "effect"
 import { setFlagsFromString } from "node:v8"
 import { runInNewContext } from "node:vm"
 import native from "@effect-torch/native"
-import { Device, Tensor } from "../src/index.js"
+import { Device, Tensor } from "../src/index.ts"
 
 setFlagsFromString("--expose-gc")
 const collectGarbage = runInNewContext("gc") as () => void

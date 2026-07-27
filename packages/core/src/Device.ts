@@ -63,3 +63,19 @@ export const Cuda: Layer.Layer<CurrentDevice> = layer("cuda")
  */
 export const isAvailable = (device: DeviceKind): Effect.Effect<boolean> =>
   Effect.sync(() => native.isDeviceAvailable(device))
+
+/**
+ * Provides {@link CurrentDevice} with the best available device, probing in
+ * priority order: CUDA, then Metal, falling back to CPU.
+ *
+ * @since 0.1.0
+ * @category layers
+ */
+export const Best: Layer.Layer<CurrentDevice> = Layer.effect(
+  CurrentDevice,
+  Effect.gen(function* () {
+    if (yield* isAvailable("cuda")) return "cuda" as const
+    if (yield* isAvailable("metal")) return "metal" as const
+    return "cpu" as const
+  })
+)

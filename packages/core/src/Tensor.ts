@@ -6,7 +6,7 @@ import native, {
   type NativeDType,
   type NativeTensor as NativeTensorType
 } from "@effect-torch/native"
-import { CurrentDevice, type DeviceKind } from "./Device.js"
+import { CurrentDevice, type DeviceKind } from "./Device.ts"
 
 const {
   CancellationToken,
@@ -216,15 +216,30 @@ const numel = (shape: ReadonlyArray<number>): number => shape.reduce((a, b) => a
  */
 export type TensorOrScalar = GenericTensor | number
 
+// Scalar operands are pure values: the same (value, dtype, device) triple
+// can share one leaf node forever instead of allocating a fresh device
+// buffer per use. On backends with a scanning allocator (Metal) unbounded
+// tiny-buffer churn is expensive, so the cache is size-bounded — hot
+// constants (lr, betas, eps, 0.5, 1, 2) stay resident; per-step varying
+// scalars (bias-correction factors) rotate through.
+const scalarLeafCache = new Map<string, NativeLazyTensorType>()
+const SCALAR_LEAF_CACHE_LIMIT = 4096
+
 const liftOperand = (
   self: GenericTensor,
   other: GenericTensor | number
 ): { readonly lazy: NativeLazyTensorType; readonly shape: ReadonlyArray<number> } => {
   if (typeof other === "number") {
-    return {
-      lazy: NativeLazyTensor.full([], other, self.dtype as NativeDType, self.device),
-      shape: []
+    const key = `${self.device}:${self.dtype}:${other}`
+    let lazy = scalarLeafCache.get(key)
+    if (lazy === undefined) {
+      lazy = NativeLazyTensor.full([], other, self.dtype as NativeDType, self.device)
+      if (scalarLeafCache.size >= SCALAR_LEAF_CACHE_LIMIT) {
+        scalarLeafCache.delete(scalarLeafCache.keys().next().value!)
+      }
+      scalarLeafCache.set(key, lazy)
     }
+    return { lazy, shape: [] }
   }
   return { lazy: other.lazy, shape: other.shape }
 }
@@ -640,6 +655,27 @@ export const sin = unaryOp("sin", (a) => a.sin())
 export const cos = unaryOp("cos", (a) => a.cos())
 
 /**
+ * Elementwise hyperbolic tangent.
+ *
+ * @since 0.1.0
+ * @category elementwise
+ */
+export const tanh = unaryOp("tanh", (a) => a.tanh())
+
+/**
+ * Elementwise logistic sigmoid, `1 / (1 + exp(-x))`, computed as the
+ * numerically stable `tanh(x / 2) / 2 + 1/2`.
+ *
+ * @since 0.1.0
+ * @category elementwise
+ */
+export const sigmoid = (self: GenericTensor): Effect.Effect<LazyTensor, TensorError> =>
+  Effect.gen(function* () {
+    const t = yield* tanh(yield* div(self, 2))
+    return yield* add(yield* div(t, 2), 0.5)
+  })
+
+/**
  * Elementwise exponentiation to a constant power.
  *
  * @since 0.1.0
@@ -783,6 +819,25 @@ export const max = reduceOp("max", (a, dims, keepdims) => a.max(dims, keepdims))
  * @category reductions
  */
 export const min = reduceOp("min", (a, dims, keepdims) => a.min(dims, keepdims))
+
+/**
+ * Mean squared error between two tensors: `mean((self - target)^2)`,
+ * reduced to a scalar.
+ *
+ * @since 0.1.0
+ * @category reductions
+ */
+export const mse: {
+  (target: TensorOrScalar): (self: GenericTensor) => Effect.Effect<LazyTensor, TensorError>
+  (self: GenericTensor, target: TensorOrScalar): Effect.Effect<LazyTensor, TensorError>
+} = dual(
+  2,
+  (self: GenericTensor, target: TensorOrScalar): Effect.Effect<LazyTensor, TensorError> =>
+    Effect.gen(function* () {
+      const err = yield* sub(self, target)
+      return yield* mean(yield* mul(err, err))
+    })
+)
 
 /**
  * Reshapes a tensor. The total number of elements must stay the same.
@@ -1179,6 +1234,49 @@ export const toTypedArray = (self: GenericTensor): Effect.Effect<TypedArray, Ten
       })
     )
   )
+
+/**
+ * Evaluates a tensor and reads its values back as a plain JavaScript number
+ * array. Fails with a `TensorError` for `i64` tensors, whose values may not
+ * be representable as numbers — use {@link toTypedArray} there and handle
+ * bigints explicitly.
+ *
+ * @since 0.1.0
+ * @category destructors
+ */
+export const toNumberArray = (self: GenericTensor): Effect.Effect<Array<number>, TensorError> =>
+  self.dtype === "i64"
+    ? new TensorError({
+        op: "toNumberArray",
+        message: "toNumberArray: i64 tensors may contain values not representable as numbers"
+      })
+    : Effect.map(toTypedArray(self), (arr) =>
+        Array.from(arr as Float32Array | Float64Array | Uint8Array | Uint32Array)
+      )
+
+/**
+ * Explicitly releases the native buffer of a materialized tensor instead of
+ * waiting for GC. In workloads that replace device-resident values every
+ * iteration (like training loops replacing parameters and optimizer state),
+ * prompt release lets the backend allocator reuse the buffers immediately —
+ * on backends with a scanning allocator (Metal) this keeps per-iteration
+ * cost flat. Using the tensor afterwards fails at evaluation time.
+ *
+ * @since 0.1.0
+ * @category destructors
+ */
+export const dispose = (self: Tensor): Effect.Effect<void, TensorError> =>
+  Effect.try({
+    try: () => {
+      self.materialized.dispose()
+      self.lazy.dispose()
+    },
+    catch: (error) =>
+      new TensorError({
+        op: "dispose",
+        message: error instanceof Error ? error.message : String(error)
+      })
+  })
 
 /**
  * Saves tensors to a safetensors file. The tensors are evaluated and

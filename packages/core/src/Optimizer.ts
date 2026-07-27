@@ -29,8 +29,8 @@
  * @since 0.1.0
  */
 import { Effect } from "effect"
-import type { CurrentDevice } from "./Device.js"
-import * as Tensor from "./Tensor.js"
+import type { CurrentDevice } from "./Device.ts"
+import * as Tensor from "./Tensor.ts"
 
 /**
  * Configuration for stochastic gradient descent.
@@ -105,8 +105,8 @@ export interface AdamState {
  *   before the state is fed into another `step` call (state is always
  *   re-materialized into graph leaves between steps, so graph depth stays
  *   O(model depth) no matter how many steps run).
- * - `rebuildState` repacks the evaluated `stateRoots` (in the same order)
- *   into a new state value.
+ * - `rebuildState` repacks the evaluated `stateRoots` (in the same order,
+ *   always materialized) into a new state value.
  *
  * User-land optimizers implement the same contract: return your new state
  * alongside the list of tensors it contains and a function that rebuilds
@@ -415,23 +415,38 @@ export const adamW = (config: AdamWConfig = {}): Optimizer<AdamState> =>
   })
 
 /**
+ * Maps a parameter tuple/array to the same structure with materialized
+ * tensors — tuple in, tuple out.
+ *
+ * @since 0.1.0
+ * @category models
+ */
+export type Materialized<P extends ReadonlyArray<Tensor.GenericTensor>> = {
+  readonly [K in keyof P]: Tensor.Tensor
+}
+
+/**
  * Runs one full training step: computes the gradients of a scalar loss
  * with respect to the parameters, extends the graph with the optimizer
- * update, and evaluates loss, updated parameters, and updated state in a
- * single walk — one forward pass, one backward pass, one async boundary.
- * The returned parameters and state are materialized tensors, ready to be
- * used as the leaves of the next step's graph.
+ * update, and evaluates loss, updated parameters, and every tensor inside
+ * the updated state in a single walk — one forward pass, one backward
+ * pass, one async boundary. The returned parameters are materialized
+ * tensors with the same length, order, shapes, and dtypes as the input
+ * parameters (a tuple in, the same tuple out), and the state is rebuilt
+ * from materialized tensors via the update's `rebuildState`: both are
+ * plain leaves of the next step's graph, so graph depth stays
+ * O(model depth) no matter how many steps run.
  *
  * @since 0.1.0
  * @category destructors
  */
-export const step = <S>(
+export const step = <S, P extends ReadonlyArray<Tensor.GenericTensor>>(
   optimizer: Optimizer<S>,
   loss: Tensor.GenericTensor,
-  params: ReadonlyArray<Tensor.GenericTensor>,
+  params: P,
   state: S
 ): Effect.Effect<
-  { readonly loss: Tensor.Tensor; readonly params: Array<Tensor.Tensor>; readonly state: S },
+  { readonly loss: Tensor.Tensor; readonly params: Materialized<P>; readonly state: S },
   Tensor.GradError | Tensor.TensorError
 > =>
   Effect.gen(function* () {
@@ -441,7 +456,7 @@ export const step = <S>(
     const [evaluatedLoss, ...rest] = evaluated
     return {
       loss: evaluatedLoss,
-      params: rest.slice(0, next.params.length),
+      params: rest.slice(0, next.params.length) as Materialized<P>,
       state: next.rebuildState(rest.slice(next.params.length))
     }
   })

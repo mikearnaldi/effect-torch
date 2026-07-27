@@ -1,12 +1,11 @@
 import { describe, expect, layer } from "@effect/vitest"
 import { Effect } from "effect"
-import { Device, Optimizer, Tensor } from "../src/index.js"
+import { Device, Optimizer, Tensor } from "../src/index.ts"
 
 const f64 = (data: ReadonlyArray<number>, shape?: ReadonlyArray<number>) =>
   Tensor.fromTypedArray(new Float64Array(data), shape)
 
-const values = (t: Tensor.GenericTensor) =>
-  Effect.map(Tensor.toTypedArray(t), (arr) => Array.from<number | bigint>(arr).map(Number))
+const values = (t: Tensor.GenericTensor) => Tensor.toNumberArray(t)
 
 const scalar = (t: Tensor.GenericTensor) => Effect.map(values(t), (v) => v[0])
 
@@ -179,8 +178,7 @@ layer(Device.Cpu)("Optimizer", (it) => {
         const lossOf = (w: Tensor.GenericTensor, b: Tensor.GenericTensor) =>
           Effect.gen(function* () {
             const pred = yield* Tensor.add(yield* Tensor.matmul(x, w), b)
-            const residual = yield* Tensor.sub(pred, y)
-            return yield* Tensor.mean(yield* Tensor.mul(residual, residual))
+            return yield* Tensor.mse(pred, y)
           })
         let params: ReadonlyArray<Tensor.GenericTensor> = [yield* f64([0, 0], [2, 1]), yield* f64([0], [1, 1])]
         let state = yield* optimizer.init(params)
@@ -211,6 +209,27 @@ layer(Device.Cpu)("Optimizer", (it) => {
         const jointLoss = yield* scalar(result.loss)
         const aloneLoss = yield* scalar(loss)
         expect(jointLoss).toBe(aloneLoss)
+      })
+    )
+
+    it.effect("returned params and state tensors are materialized leaves, across steps", () =>
+      Effect.gen(function* () {
+        const optimizer = Optimizer.adam({ lr: 0.1 })
+        const p = yield* f64([1, 2])
+        let params: ReadonlyArray<Tensor.GenericTensor> = [p]
+        let state = yield* optimizer.init(params)
+        for (let i = 0; i < 3; i++) {
+          const loss = yield* Tensor.sum(yield* Tensor.mul(params[0], params[0]))
+          const result = yield* Optimizer.step(optimizer, loss, params, state)
+          for (const param of result.params) {
+            expect(Tensor.isTensor(param)).toBe(true)
+          }
+          for (const t of [...result.state.m, ...result.state.v]) {
+            expect(Tensor.isTensor(t)).toBe(true)
+          }
+          params = result.params
+          state = result.state
+        }
       })
     )
   })

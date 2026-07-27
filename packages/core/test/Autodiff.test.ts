@@ -1,13 +1,12 @@
 import { describe, expect, layer } from "@effect/vitest"
 import * as assert from "@effect/vitest/utils"
 import { Effect, Exit } from "effect"
-import { Device, Tensor } from "../src/index.js"
+import { Device, Tensor } from "../src/index.ts"
 
 const f64 = (data: ReadonlyArray<number>, shape?: ReadonlyArray<number>) =>
   Tensor.fromTypedArray(new Float64Array(data), shape)
 
-const values = (t: Tensor.GenericTensor) =>
-  Effect.map(Tensor.toTypedArray(t), (arr) => Array.from<number | bigint>(arr).map(Number))
+const values = (t: Tensor.GenericTensor) => Tensor.toNumberArray(t)
 
 const scalar = (t: Tensor.GenericTensor) => Effect.map(values(t), (v) => v[0])
 
@@ -57,6 +56,9 @@ layer(Device.Cpu)("Autodiff", (it) => {
         yield* gradcheck(sumOf((x) => Tensor.log(x)), [1, 2, 3], [3])
         yield* gradcheck(sumOf((x) => Tensor.sin(x)), [0.5, 1, 2], [3])
         yield* gradcheck(sumOf((x) => Tensor.cos(x)), [0.5, 1, 2], [3])
+        yield* gradcheck(sumOf((x) => Tensor.tanh(x)), [0.5, -1, 2], [3])
+        yield* gradcheck(sumOf((x) => Tensor.sigmoid(x)), [0.5, -1, 2], [3])
+        yield* gradcheck(sumOf((x) => Tensor.mse(x, 1)), [0.5, -1, 2], [3])
         yield* gradcheck(sumOf((x) => Tensor.pow(x, 3)), [0.5, 1, 2], [3])
       })
     )
@@ -227,8 +229,7 @@ layer(Device.Cpu)("Autodiff", (it) => {
         const losses: Array<number> = []
         for (let step = 0; step < 200; step++) {
           const pred = yield* Tensor.add(yield* Tensor.matmul(x, w), b)
-          const err = yield* Tensor.sub(pred, y)
-          const loss = yield* Tensor.mean(yield* Tensor.mul(err, err))
+          const loss = yield* Tensor.mse(pred, y)
           const [gw, gb] = yield* Tensor.grad(loss, [w, b])
           const [lt, gwt, gbt] = yield* Tensor.evaluate([loss, gw, gb])
           const l = yield* scalar(lt)
