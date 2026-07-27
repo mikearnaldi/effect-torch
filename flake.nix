@@ -34,10 +34,6 @@
             ] ++ pkgs.lib.optionals pkgs.stdenv.isDarwin [
               libiconv
             ];
-
-            shellHook = ''
-              corepack enable 2>/dev/null || true
-            '';
           };
         });
     };

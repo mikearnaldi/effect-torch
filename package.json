@@ -4,8 +4,10 @@
   "packageManager": "pnpm@10.13.1",
   "scripts": {
     "build": "pnpm -r build",
+    "test": "pnpm -r test",
     "typecheck": "pnpm -r typecheck",
-    "bench": "pnpm -r build && pnpm --filter @effect-torch/bench bench",
-    "bench:mlx": "pnpm -r build && pnpm --filter @effect-torch/bench bench:mlx"
+    "bench": "pnpm --filter @effect-torch/bench bench",
+    "bench:mlx": "pnpm --filter @effect-torch/bench bench:mlx"
   }
 }
+

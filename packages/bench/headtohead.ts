@@ -1,9 +1,20 @@
+import { createRequire } from "node:module"
 import { performance } from "node:perf_hooks"
 import { Console, Effect } from "effect"
 import { Device, Tensor } from "@effect-torch/core"
-import mlx from "@frost-beta/mlx"
 
-const mx = mlx.core
+// @frost-beta/mlx ships its .ts sources, which do not compile under this
+// repo's strict tsconfig — so the package is kept out of the type program
+// and typed minimally by hand. Runtime resolution is unaffected.
+interface MlxArray {
+  readonly shape: Array<number>
+}
+interface Mlx {
+  readonly random: { normal(shape: Array<number>): MlxArray }
+  matmul(a: MlxArray, b: MlxArray): MlxArray
+  eval(...tensors: Array<MlxArray>): void
+}
+const mx = (createRequire(import.meta.url)("@frost-beta/mlx") as { core: Mlx }).core
 const N = Number(process.env.N ?? 512)
 const TRIALS = 5
 const INNER = 20

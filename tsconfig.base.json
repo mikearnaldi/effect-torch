@@ -8,6 +8,7 @@
     "declaration": true,
     "skipLibCheck": true,
     "verbatimModuleSyntax": true,
+    "rewriteRelativeImportExtensions": true,
     "forceConsistentCasingInFileNames": true
   }
 }

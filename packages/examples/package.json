@@ -1,21 +1,18 @@
 {
-  "name": "@effect-torch/bench",
+  "name": "@effect-torch/examples",
   "version": "0.1.0",
   "private": true,
   "type": "module",
   "scripts": {
-    "bench": "tsx matmul.ts",
-    "bench:mlx": "tsx headtohead.ts",
+    "xor": "tsx xor.ts",
     "typecheck": "tsc -p tsconfig.json"
   },
   "dependencies": {
     "@effect-torch/core": "workspace:*",
+    "@effect/platform-node": "4.0.0-beta.101",
     "@types/node": "^22.0.0",
     "effect": "^4.0.0-beta.101",
     "tsx": "^4.20.0",
     "typescript": "^5.8.0"
-  },
-  "optionalDependencies": {
-    "@frost-beta/mlx": "^0.0.10"
   }
 }
