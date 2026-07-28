@@ -2595,63 +2595,29 @@ const checkConvOptions = (
     return { stride, padding, dilation, groups }
   })
 
-const conv2dGroup = (
+const convOutDim = (
   op: string,
-  x: GenericTensor,
-  weight: GenericTensor,
-  options: { readonly stride: number; readonly padding: number; readonly dilation: number },
-  outChannels: number
-): Effect.Effect<LazyTensor, TensorError, CurrentDevice> =>
-  Effect.gen(function* () {
-    const { stride, padding, dilation } = options
-    const [n, cIn, kh, kw] = [x.shape[0], weight.shape[1], weight.shape[2], weight.shape[3]]
-    const padded = padding > 0
-      ? yield* pad(x, [[0, 0], [0, 0], [padding, padding], [padding, padding]])
-      : x
-    const oh = Math.floor((padded.shape[2] - dilation * (kh - 1) - 1) / stride) + 1
-    const ow = Math.floor((padded.shape[3] - dilation * (kw - 1) - 1) / stride) + 1
-    if (oh < 1 || ow < 1) {
-      return yield* new TensorError({
-        op,
-        message: `${op}: kernel [${kh}, ${kw}] with dilation ${dilation} is larger than the padded input [${padded.shape[2]}, ${padded.shape[3]}]`
-      })
-    }
-    const windows: Array<LazyTensor> = []
-    for (let ky = 0; ky < kh; ky++) {
-      for (let kx = 0; kx < kw; kx++) {
-        windows.push(yield* slice(padded, {
-          start: [0, 0, ky * dilation, kx * dilation],
-          end: [
-            padded.shape[0],
-            cIn,
-            ky * dilation + (oh - 1) * stride + 1,
-            kx * dilation + (ow - 1) * stride + 1
-          ],
-          stride: [1, 1, stride, stride]
-        }))
-      }
-    }
-    // im2col: [kh*kw, n, c, oh, ow] -> [n, oh, ow, c*kh*kw] @ [c*kh*kw, cOut]
-    const stacked = yield* stack(
-      windows as unknown as [GenericTensor, GenericTensor, ...Array<GenericTensor>],
-      { dim: 0 }
-    )
-    const cols = yield* reshape(yield* transpose(stacked, [1, 3, 4, 2, 0]), [
-      n,
-      oh,
-      ow,
-      cIn * kh * kw
-    ])
-    const wFlat = yield* transpose(yield* reshape(weight, [outChannels, cIn * kh * kw]), [1, 0])
-    return yield* transpose(yield* matmul(cols, wFlat), [0, 3, 1, 2])
-  })
+  input: number,
+  kernel: number,
+  stride: number,
+  padding: number,
+  dilation: number
+): Effect.Effect<number, TensorError> => {
+  const effective = dilation * (kernel - 1) + 1
+  if (input + 2 * padding < effective) {
+    return new TensorError({
+      op,
+      message: `${op}: kernel of effective size ${effective} exceeds the padded input size ${input + 2 * padding}`
+    })
+  }
+  return Effect.succeed(Math.floor((input + 2 * padding - effective) / stride) + 1)
+}
 
 /**
- * 2-D convolution via im2col: the input is unfolded into kernel windows and
- * contracted with the weight in a single matmul, expressed entirely in the
- * standard op vocabulary — so it runs on every backend and differentiates
- * through the ordinary adjoints. `self` is `[N, C_in, H, W]`, `weight` is
- * `[C_out, C_in/groups, KH, KW]`; a bias is added separately with `add`.
+ * 2-D convolution as a single native node (candle's kernel on every
+ * backend), differentiable through native adjoints. `self` is
+ * `[N, C_in, H, W]`, `weight` is `[C_out, C_in/groups, KH, KW]`; a bias is
+ * added separately with `add`.
  *
  * @since 0.1.0
  * @category neural network
@@ -2660,19 +2626,19 @@ export const conv2d: {
   (
     weight: GenericTensor,
     options?: ConvOptions
-  ): (self: GenericTensor) => Effect.Effect<LazyTensor, TensorError, CurrentDevice>
+  ): (self: GenericTensor) => Effect.Effect<LazyTensor, TensorError>
   (
     self: GenericTensor,
     weight: GenericTensor,
     options?: ConvOptions
-  ): Effect.Effect<LazyTensor, TensorError, CurrentDevice>
+  ): Effect.Effect<LazyTensor, TensorError>
 } = dual(
   (args) => args.length === 3 || (args.length === 2 && TensorTypeId in (args[1] as object)),
   (
     self: GenericTensor,
     weight: GenericTensor,
     options: ConvOptions = {}
-  ): Effect.Effect<LazyTensor, TensorError, CurrentDevice> =>
+  ): Effect.Effect<LazyTensor, TensorError> =>
     Effect.gen(function* () {
       const opts = yield* checkConvOptions("conv2d", self, weight, options, 2)
       yield* Effect.try({
@@ -2694,22 +2660,25 @@ export const conv2d: {
           message: `conv2d: weight has ${cPerGroup} input channels per group, expected ${cIn / opts.groups}`
         })
       }
-      if (opts.groups === 1) {
-        return yield* conv2dGroup("conv2d", self, weight, opts, cOut)
-      }
-      const xs = yield* split(self, Array<number>(opts.groups).fill(cIn / opts.groups), { dim: 1 })
-      const ws = yield* split(weight, Array<number>(opts.groups).fill(cOut / opts.groups), { dim: 0 })
-      const outs: Array<LazyTensor> = []
-      for (let i = 0; i < opts.groups; i++) {
-        outs.push(yield* conv2dGroup("conv2d", xs[i], ws[i], opts, cOut / opts.groups))
-      }
-      return yield* concat(outs as [GenericTensor, GenericTensor, ...Array<GenericTensor>], { dim: 1 })
+      const oh = yield* convOutDim("conv2d", self.shape[2], weight.shape[2], opts.stride, opts.padding, opts.dilation)
+      const ow = yield* convOutDim("conv2d", self.shape[3], weight.shape[3], opts.stride, opts.padding, opts.dilation)
+      return yield* Effect.try({
+        try: () =>
+          makeLazy(
+            self.lazy.conv2d(weight.lazy, opts.stride, opts.padding, opts.dilation, opts.groups),
+            [self.shape[0], cOut, oh, ow],
+            self.dtype,
+            self.device
+          ),
+        catch: (error) =>
+          new TensorError({ op: "conv2d", message: error instanceof Error ? error.message : String(error) })
+      })
     })
 )
 
 /**
  * 1-D convolution over `[N, C_in, L]` with `weight` `[C_out, C_in/groups, K]`,
- * implemented as a rank-4 {@link conv2d}.
+ * as a single native node.
  *
  * @since 0.1.0
  * @category neural network
@@ -2718,28 +2687,52 @@ export const conv1d: {
   (
     weight: GenericTensor,
     options?: ConvOptions
-  ): (self: GenericTensor) => Effect.Effect<LazyTensor, TensorError, CurrentDevice>
+  ): (self: GenericTensor) => Effect.Effect<LazyTensor, TensorError>
   (
     self: GenericTensor,
     weight: GenericTensor,
     options?: ConvOptions
-  ): Effect.Effect<LazyTensor, TensorError, CurrentDevice>
+  ): Effect.Effect<LazyTensor, TensorError>
 } = dual(
   (args) => args.length === 3 || (args.length === 2 && TensorTypeId in (args[1] as object)),
   (
     self: GenericTensor,
     weight: GenericTensor,
     options: ConvOptions = {}
-  ): Effect.Effect<LazyTensor, TensorError, CurrentDevice> =>
+  ): Effect.Effect<LazyTensor, TensorError> =>
     Effect.gen(function* () {
-      if (self.shape.length !== 3 || weight.shape.length !== 3) {
+      const opts = yield* checkConvOptions("conv1d", self, weight, options, 1)
+      yield* Effect.try({
+        try: () => checkCompatible("conv1d", self, weight),
+        catch: (error) =>
+          new TensorError({ op: "conv1d", message: error instanceof Error ? error.message : String(error) })
+      })
+      const cIn = self.shape[1]
+      const [cOut, cPerGroup] = [weight.shape[0], weight.shape[1]]
+      if (cIn % opts.groups !== 0 || cOut % opts.groups !== 0) {
         return yield* new TensorError({
           op: "conv1d",
-          message: `conv1d: expected rank-3 input and weight, got ranks ${self.shape.length} and ${weight.shape.length}`
+          message: `conv1d: channels [${cIn}, ${cOut}] are not divisible into ${opts.groups} groups`
         })
       }
-      const out = yield* conv2d(yield* unsqueeze(self, 2), yield* unsqueeze(weight, 2), options)
-      return yield* squeeze(out, { dims: [2] })
+      if (cPerGroup !== cIn / opts.groups) {
+        return yield* new TensorError({
+          op: "conv1d",
+          message: `conv1d: weight has ${cPerGroup} input channels per group, expected ${cIn / opts.groups}`
+        })
+      }
+      const ol = yield* convOutDim("conv1d", self.shape[2], weight.shape[2], opts.stride, opts.padding, opts.dilation)
+      return yield* Effect.try({
+        try: () =>
+          makeLazy(
+            self.lazy.conv1d(weight.lazy, opts.stride, opts.padding, opts.dilation, opts.groups),
+            [self.shape[0], cOut, ol],
+            self.dtype,
+            self.device
+          ),
+        catch: (error) =>
+          new TensorError({ op: "conv1d", message: error instanceof Error ? error.message : String(error) })
+      })
     })
 )
 

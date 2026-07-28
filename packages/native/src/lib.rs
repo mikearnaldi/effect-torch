@@ -60,6 +60,128 @@ fn batch_solve(a: &Tensor, b: &Tensor) -> candle_core::Result<Tensor> {
     Tensor::stack(&outs, 0)?.reshape(b.shape())
 }
 
+fn conv_out_dim(
+    input: usize,
+    kernel: usize,
+    stride: usize,
+    padding: usize,
+    dilation: usize,
+) -> std::result::Result<usize, String> {
+    let effective = dilation * (kernel - 1) + 1;
+    if input + 2 * padding < effective {
+        return Err(format!(
+            "conv: kernel of effective size {effective} exceeds the padded input size {}",
+            input + 2 * padding
+        ));
+    }
+    Ok((input + 2 * padding - effective) / stride + 1)
+}
+
+// dW for a 2-D convolution: im2col of the (padded) input contracted with
+// the flattened cotangent, computed per group with on-device candle ops.
+fn conv2d_backward_w(
+    x: &Tensor,
+    g: &Tensor,
+    kernel: [usize; 2],
+    out_channels: usize,
+    stride: usize,
+    padding: usize,
+    dilation: usize,
+    groups: usize,
+) -> candle_core::Result<Tensor> {
+    let (n, c_in, _, _) = x.dims4()?;
+    let (_, _, oh, ow) = g.dims4()?;
+    let (kh, kw) = (kernel[0], kernel[1]);
+    let c_per = c_in / groups;
+    let cout_per = out_channels / groups;
+    let mut group_outs = Vec::with_capacity(groups);
+    for gi in 0..groups {
+        let xg = x.narrow(1, gi * c_per, c_per)?;
+        let gg = g.narrow(1, gi * cout_per, cout_per)?;
+        let xp = if padding > 0 {
+            xg.pad_with_zeros(2, padding, padding)?
+                .pad_with_zeros(3, padding, padding)?
+        } else {
+            xg
+        };
+        let mut windows = Vec::with_capacity(kh * kw);
+        for ky in 0..kh {
+            for kx in 0..kw {
+                let mut win = xp
+                    .narrow(2, ky * dilation, (oh - 1) * stride + 1)?
+                    .narrow(3, kx * dilation, (ow - 1) * stride + 1)?;
+                if stride > 1 {
+                    let idx_h = Tensor::arange_step(
+                        0u32,
+                        ((oh - 1) * stride + 1) as u32,
+                        stride as u32,
+                        win.device(),
+                    )?;
+                    let idx_w = Tensor::arange_step(
+                        0u32,
+                        ((ow - 1) * stride + 1) as u32,
+                        stride as u32,
+                        win.device(),
+                    )?;
+                    win = win.index_select(&idx_h, 2)?.index_select(&idx_w, 3)?;
+                }
+                windows.push(win);
+            }
+        }
+        let stacked = Tensor::stack(&windows, 0)?;
+        let cols = stacked
+            .permute([1usize, 3, 4, 2, 0])?
+            .contiguous()?
+            .reshape((n * oh * ow, c_per * kh * kw))?;
+        let g2 = gg
+            .permute([1usize, 0, 2, 3])?
+            .contiguous()?
+            .reshape((cout_per, n * oh * ow))?;
+        group_outs.push(g2.matmul(&cols)?.reshape((cout_per, c_per, kh, kw))?);
+    }
+    Tensor::cat(&group_outs, 0)
+}
+
+fn conv_check(
+    op: &str,
+    x: &Node,
+    w: &Node,
+    stride: usize,
+    _padding: usize,
+    dilation: usize,
+    groups: usize,
+) -> std::result::Result<(), String> {
+    if stride < 1 || dilation < 1 || groups < 1 {
+        return Err(format!(
+            "{op}: stride, dilation and groups must be >= 1, got {stride}, {dilation}, {groups}"
+        ));
+    }
+    let c_in = x.shape[1];
+    let c_out = w.shape[0];
+    if c_in % groups != 0 || c_out % groups != 0 {
+        return Err(format!(
+            "{op}: channels [{c_in}, {c_out}] are not divisible into {groups} groups"
+        ));
+    }
+    if w.shape[1] != c_in / groups {
+        return Err(format!(
+            "{op}: weight has {} input channels per group, expected {}",
+            w.shape[1],
+            c_in / groups
+        ));
+    }
+    if !x.dtype.is_float() || x.dtype != w.dtype {
+        return Err(format!(
+            "{op}: dtypes must be floating point and match, got {:?} and {:?}",
+            x.dtype, w.dtype
+        ));
+    }
+    if !x.device.same_device(&w.device) {
+        return Err(format!("{op}: input and weight must be on the same device"));
+    }
+    Ok(())
+}
+
 // u8 mask that is 1 where target == ignore_index. A negative ignore_index
 // can never match a u32 target, so u32 targets are all active in that case.
 fn cross_entropy_ignored_mask(target: &Tensor, ignore_index: i64) -> candle_core::Result<Tensor> {
@@ -719,6 +841,60 @@ enum NodeKind {
         target: Arc<Node>,
         ignore_index: i64,
     },
+    Conv1d {
+        x: Arc<Node>,
+        w: Arc<Node>,
+        stride: usize,
+        padding: usize,
+        dilation: usize,
+        groups: usize,
+    },
+    Conv2d {
+        x: Arc<Node>,
+        w: Arc<Node>,
+        stride: usize,
+        padding: usize,
+        dilation: usize,
+        groups: usize,
+    },
+    ConvTranspose1d {
+        x: Arc<Node>,
+        w: Arc<Node>,
+        stride: usize,
+        padding: usize,
+        output_padding: usize,
+        dilation: usize,
+        groups: usize,
+    },
+    ConvTranspose2d {
+        x: Arc<Node>,
+        w: Arc<Node>,
+        stride: usize,
+        padding: usize,
+        output_padding: usize,
+        dilation: usize,
+        groups: usize,
+    },
+    Conv1dBackwardW {
+        x: Arc<Node>,
+        g: Arc<Node>,
+        kernel: usize,
+        out_channels: usize,
+        stride: usize,
+        padding: usize,
+        dilation: usize,
+        groups: usize,
+    },
+    Conv2dBackwardW {
+        x: Arc<Node>,
+        g: Arc<Node>,
+        kernel: [usize; 2],
+        out_channels: usize,
+        stride: usize,
+        padding: usize,
+        dilation: usize,
+        groups: usize,
+    },
     Reshape {
         a: Arc<Node>,
         shape: Vec<usize>,
@@ -1086,6 +1262,104 @@ impl Node {
             NodeKind::CrossEntropyBackward { logits, .. } => {
                 (logits.shape.clone(), logits.dtype, logits.device.clone())
             }
+            NodeKind::Conv1d {
+                x,
+                w,
+                stride,
+                padding,
+                dilation,
+                groups,
+            } => {
+                if x.shape.len() != 3 || w.shape.len() != 3 {
+                    return Err(format!(
+                        "conv1d: expected rank-3 input and weight, got ranks {} and {}",
+                        x.shape.len(),
+                        w.shape.len()
+                    ));
+                }
+                conv_check("conv1d", x, w, *stride, *padding, *dilation, *groups)?;
+                let out = conv_out_dim(x.shape[2], w.shape[2], *stride, *padding, *dilation)?;
+                (vec![x.shape[0], w.shape[0], out], x.dtype, x.device.clone())
+            }
+            NodeKind::Conv2d {
+                x,
+                w,
+                stride,
+                padding,
+                dilation,
+                groups,
+            } => {
+                if x.shape.len() != 4 || w.shape.len() != 4 {
+                    return Err(format!(
+                        "conv2d: expected rank-4 input and weight, got ranks {} and {}",
+                        x.shape.len(),
+                        w.shape.len()
+                    ));
+                }
+                conv_check("conv2d", x, w, *stride, *padding, *dilation, *groups)?;
+                let oh = conv_out_dim(x.shape[2], w.shape[2], *stride, *padding, *dilation)?;
+                let ow = conv_out_dim(x.shape[3], w.shape[3], *stride, *padding, *dilation)?;
+                (vec![x.shape[0], w.shape[0], oh, ow], x.dtype, x.device.clone())
+            }
+            NodeKind::ConvTranspose1d {
+                x,
+                w,
+                stride,
+                padding,
+                output_padding,
+                dilation,
+                ..
+            } => {
+                if x.shape.len() != 3 || w.shape.len() != 3 {
+                    return Err("conv_transpose1d: expected rank-3 input and weight".to_string());
+                }
+                let out = (x.shape[2] - 1) * stride + dilation * (w.shape[2] - 1) + output_padding
+                    + 1
+                    - 2 * padding;
+                (vec![x.shape[0], w.shape[1], out], x.dtype, x.device.clone())
+            }
+            NodeKind::ConvTranspose2d {
+                x,
+                w,
+                stride,
+                padding,
+                output_padding,
+                dilation,
+                ..
+            } => {
+                if x.shape.len() != 4 || w.shape.len() != 4 {
+                    return Err("conv_transpose2d: expected rank-4 input and weight".to_string());
+                }
+                let oh = (x.shape[2] - 1) * stride + dilation * (w.shape[2] - 1) + output_padding
+                    + 1
+                    - 2 * padding;
+                let ow = (x.shape[3] - 1) * stride + dilation * (w.shape[3] - 1) + output_padding
+                    + 1
+                    - 2 * padding;
+                (vec![x.shape[0], w.shape[1], oh, ow], x.dtype, x.device.clone())
+            }
+            NodeKind::Conv1dBackwardW {
+                x,
+                kernel,
+                out_channels,
+                groups,
+                ..
+            } => (
+                vec![*out_channels, x.shape[1] / groups, *kernel],
+                x.dtype,
+                x.device.clone(),
+            ),
+            NodeKind::Conv2dBackwardW {
+                x,
+                kernel,
+                out_channels,
+                groups,
+                ..
+            } => (
+                vec![*out_channels, x.shape[1] / groups, kernel[0], kernel[1]],
+                x.dtype,
+                x.device.clone(),
+            ),
             NodeKind::Cast { a, dtype } => (a.shape.clone(), *dtype, a.device.clone()),
             NodeKind::Sum { a, dims, keepdims }
             | NodeKind::Mean { a, dims, keepdims }
@@ -1725,6 +1999,44 @@ impl LazyTensor {
         }))
     }
 
+    #[napi(js_name = "conv1d")]
+    pub fn conv_1d(
+        &self,
+        w: &LazyTensor,
+        stride: u32,
+        padding: u32,
+        dilation: u32,
+        groups: u32,
+    ) -> Result<Self> {
+        lazy_ctor!(Node::new(NodeKind::Conv1d {
+            x: self.node.clone(),
+            w: w.node.clone(),
+            stride: stride as usize,
+            padding: padding as usize,
+            dilation: dilation as usize,
+            groups: groups as usize,
+        }))
+    }
+
+    #[napi(js_name = "conv2d")]
+    pub fn conv_2d(
+        &self,
+        w: &LazyTensor,
+        stride: u32,
+        padding: u32,
+        dilation: u32,
+        groups: u32,
+    ) -> Result<Self> {
+        lazy_ctor!(Node::new(NodeKind::Conv2d {
+            x: self.node.clone(),
+            w: w.node.clone(),
+            stride: stride as usize,
+            padding: padding as usize,
+            dilation: dilation as usize,
+            groups: groups as usize,
+        }))
+    }
+
     #[napi]
     pub fn log(&self) -> Result<Self> {
         lazy_ctor!(Node::new(NodeKind::Log {
@@ -2071,6 +2383,13 @@ fn node_children(kind: &NodeKind) -> Vec<Arc<Node>> {
         | NodeKind::CrossEntropyBackward {
             logits, target, ..
         } => vec![logits.clone(), target.clone()],
+        NodeKind::Conv1d { x, w, .. }
+        | NodeKind::Conv2d { x, w, .. }
+        | NodeKind::ConvTranspose1d { x, w, .. }
+        | NodeKind::ConvTranspose2d { x, w, .. } => vec![x.clone(), w.clone()],
+        NodeKind::Conv1dBackwardW { x, g, .. } | NodeKind::Conv2dBackwardW { x, g, .. } => {
+            vec![x.clone(), g.clone()]
+        }
         NodeKind::ScatterAdd {
             a,
             indexes,
@@ -2230,6 +2549,108 @@ fn remap_children(kind: &NodeKind, f: &dyn Fn(&Arc<Node>) -> Arc<Node>) -> NodeK
             logits: f(logits),
             target: f(target),
             ignore_index: *ignore_index,
+        },
+        NodeKind::Conv1d {
+            x,
+            w,
+            stride,
+            padding,
+            dilation,
+            groups,
+        } => NodeKind::Conv1d {
+            x: f(x),
+            w: f(w),
+            stride: *stride,
+            padding: *padding,
+            dilation: *dilation,
+            groups: *groups,
+        },
+        NodeKind::Conv2d {
+            x,
+            w,
+            stride,
+            padding,
+            dilation,
+            groups,
+        } => NodeKind::Conv2d {
+            x: f(x),
+            w: f(w),
+            stride: *stride,
+            padding: *padding,
+            dilation: *dilation,
+            groups: *groups,
+        },
+        NodeKind::ConvTranspose1d {
+            x,
+            w,
+            stride,
+            padding,
+            output_padding,
+            dilation,
+            groups,
+        } => NodeKind::ConvTranspose1d {
+            x: f(x),
+            w: f(w),
+            stride: *stride,
+            padding: *padding,
+            output_padding: *output_padding,
+            dilation: *dilation,
+            groups: *groups,
+        },
+        NodeKind::ConvTranspose2d {
+            x,
+            w,
+            stride,
+            padding,
+            output_padding,
+            dilation,
+            groups,
+        } => NodeKind::ConvTranspose2d {
+            x: f(x),
+            w: f(w),
+            stride: *stride,
+            padding: *padding,
+            output_padding: *output_padding,
+            dilation: *dilation,
+            groups: *groups,
+        },
+        NodeKind::Conv1dBackwardW {
+            x,
+            g,
+            kernel,
+            out_channels,
+            stride,
+            padding,
+            dilation,
+            groups,
+        } => NodeKind::Conv1dBackwardW {
+            x: f(x),
+            g: f(g),
+            kernel: *kernel,
+            out_channels: *out_channels,
+            stride: *stride,
+            padding: *padding,
+            dilation: *dilation,
+            groups: *groups,
+        },
+        NodeKind::Conv2dBackwardW {
+            x,
+            g,
+            kernel,
+            out_channels,
+            stride,
+            padding,
+            dilation,
+            groups,
+        } => NodeKind::Conv2dBackwardW {
+            x: f(x),
+            g: f(g),
+            kernel: *kernel,
+            out_channels: *out_channels,
+            stride: *stride,
+            padding: *padding,
+            dilation: *dilation,
+            groups: *groups,
         },
         NodeKind::ScatterAdd {
             a,
@@ -2740,6 +3161,135 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> candle_core::Result<Te
             target,
             ignore_index,
         } => cross_entropy_backward(&ev.value(logits.id)?, &ev.value(target.id)?, *ignore_index)?,
+        NodeKind::Conv1d {
+            x,
+            w,
+            stride,
+            padding,
+            dilation,
+            groups,
+        } => {
+            let x = ev.value(x.id)?;
+            let w = ev.value(w.id)?;
+            x.contiguous()?
+                .conv1d(&w.contiguous()?, *padding, *stride, *dilation, *groups)?
+        }
+        NodeKind::Conv2d {
+            x,
+            w,
+            stride,
+            padding,
+            dilation,
+            groups,
+        } => {
+            let x = ev.value(x.id)?;
+            let w = ev.value(w.id)?;
+            x.contiguous()?
+                .conv2d(&w.contiguous()?, *padding, *stride, *dilation, *groups)?
+        }
+        NodeKind::ConvTranspose1d {
+            x,
+            w,
+            stride,
+            padding,
+            output_padding,
+            dilation,
+            groups,
+        } => {
+            let x = ev.value(x.id)?;
+            let w = ev.value(w.id)?;
+            x.contiguous()?.conv_transpose1d(
+                &w.contiguous()?,
+                *padding,
+                *output_padding,
+                *stride,
+                *dilation,
+                *groups,
+            )?
+        }
+        NodeKind::ConvTranspose2d {
+            x,
+            w,
+            stride,
+            padding,
+            output_padding,
+            dilation,
+            groups,
+        } => {
+            let x = ev.value(x.id)?;
+            let w = ev.value(w.id)?;
+            if *groups == 1 {
+                x.contiguous()?.conv_transpose2d(
+                    &w.contiguous()?,
+                    *padding,
+                    *output_padding,
+                    *stride,
+                    *dilation,
+                )?
+            } else {
+                // candle's conv_transpose2d has no groups parameter
+                let xs = x.chunk(*groups, 1)?;
+                let ws = w.chunk(*groups, 0)?;
+                let mut outs = Vec::with_capacity(*groups);
+                for (xb, wb) in xs.iter().zip(&ws) {
+                    outs.push(xb.contiguous()?.conv_transpose2d(
+                        &wb.contiguous()?,
+                        *padding,
+                        *output_padding,
+                        *stride,
+                        *dilation,
+                    )?);
+                }
+                Tensor::cat(&outs, 1)?
+            }
+        }
+        NodeKind::Conv1dBackwardW {
+            x,
+            g,
+            kernel,
+            out_channels,
+            stride,
+            padding,
+            dilation,
+            groups,
+        } => {
+            let x = ev.value(x.id)?.unsqueeze(3)?;
+            let g = ev.value(g.id)?.unsqueeze(3)?;
+            conv2d_backward_w(
+                &x,
+                &g,
+                [*kernel, 1],
+                *out_channels,
+                *stride,
+                *padding,
+                *dilation,
+                *groups,
+            )?
+            .squeeze(3)?
+        }
+        NodeKind::Conv2dBackwardW {
+            x,
+            g,
+            kernel,
+            out_channels,
+            stride,
+            padding,
+            dilation,
+            groups,
+        } => {
+            let x = ev.value(x.id)?;
+            let g = ev.value(g.id)?;
+            conv2d_backward_w(
+                &x,
+                &g,
+                *kernel,
+                *out_channels,
+                *stride,
+                *padding,
+                *dilation,
+                *groups,
+            )?
+        }
         NodeKind::Pow { a, exp } => ev.value(a.id)?.powf(*exp)?,
         NodeKind::Cast { a, dtype } => ev.value(a.id)?.to_dtype(*dtype)?,
         NodeKind::Sum { a, dims, keepdims } => {
@@ -3234,6 +3784,14 @@ mod autodiff {
                 "vmap: crossEntropy uses data-dependent indexing and is not supported under vmap"
                     .to_string(),
             ),
+            NodeKind::Conv1d { .. }
+            | NodeKind::Conv2d { .. }
+            | NodeKind::ConvTranspose1d { .. }
+            | NodeKind::ConvTranspose2d { .. }
+            | NodeKind::Conv1dBackwardW { .. }
+            | NodeKind::Conv2dBackwardW { .. } => {
+                Err("vmap: convolution nodes are not supported under vmap".to_string())
+            }
             _ => Ok(remap_children(&node.kind, f)),
         }
     }
@@ -3805,6 +4363,103 @@ mod autodiff {
                 NodeKind::CrossEntropyBackward { .. } => {
                     return Err(
                         "grad: cross-entropy backward nodes are not differentiable (no second-order)"
+                            .to_string(),
+                    );
+                }
+                NodeKind::Conv1d {
+                    x,
+                    w,
+                    stride,
+                    padding,
+                    dilation,
+                    groups,
+                } => {
+                    // dX is the full convolution of the cotangent with the
+                    // weight: a transposed convolution whose output_padding
+                    // fills the stride remainder; since our forward is a
+                    // correlation, the same unflipped weight is the adjoint
+                    // kernel.
+                    let out_pad =
+                        x.shape[2] - ((g.shape[2] - 1) * stride + dilation * (w.shape[2] - 1) + 1
+                            - 2 * padding);
+                    accumulate(
+                        x,
+                        mk(NodeKind::ConvTranspose1d {
+                            x: g.clone(),
+                            w: w.clone(),
+                            stride: *stride,
+                            padding: *padding,
+                            output_padding: out_pad,
+                            dilation: *dilation,
+                            groups: *groups,
+                        }),
+                    )?;
+                    accumulate(
+                        w,
+                        mk(NodeKind::Conv1dBackwardW {
+                            x: x.clone(),
+                            g,
+                            kernel: w.shape[2],
+                            out_channels: w.shape[0],
+                            stride: *stride,
+                            padding: *padding,
+                            dilation: *dilation,
+                            groups: *groups,
+                        }),
+                    )?;
+                }
+                NodeKind::Conv2d {
+                    x,
+                    w,
+                    stride,
+                    padding,
+                    dilation,
+                    groups,
+                } => {
+                    let out_pad_h =
+                        x.shape[2] - ((g.shape[2] - 1) * stride + dilation * (w.shape[2] - 1) + 1
+                            - 2 * padding);
+                    let out_pad_w =
+                        x.shape[3] - ((g.shape[3] - 1) * stride + dilation * (w.shape[3] - 1) + 1
+                            - 2 * padding);
+                    if out_pad_h != out_pad_w {
+                        return Err(
+                            "grad: conv2d with non-uniform stride remainders is not differentiable"
+                                .to_string(),
+                        );
+                    }
+                    accumulate(
+                        x,
+                        mk(NodeKind::ConvTranspose2d {
+                            x: g.clone(),
+                            w: w.clone(),
+                            stride: *stride,
+                            padding: *padding,
+                            output_padding: out_pad_h,
+                            dilation: *dilation,
+                            groups: *groups,
+                        }),
+                    )?;
+                    accumulate(
+                        w,
+                        mk(NodeKind::Conv2dBackwardW {
+                            x: x.clone(),
+                            g,
+                            kernel: [w.shape[2], w.shape[3]],
+                            out_channels: w.shape[0],
+                            stride: *stride,
+                            padding: *padding,
+                            dilation: *dilation,
+                            groups: *groups,
+                        }),
+                    )?;
+                }
+                NodeKind::ConvTranspose1d { .. }
+                | NodeKind::ConvTranspose2d { .. }
+                | NodeKind::Conv1dBackwardW { .. }
+                | NodeKind::Conv2dBackwardW { .. } => {
+                    return Err(
+                        "grad: convolution backward nodes are not differentiable (no second-order)"
                             .to_string(),
                     );
                 }
