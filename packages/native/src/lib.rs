@@ -123,7 +123,10 @@ fn conv2d_backward_w(
                         stride as u32,
                         win.device(),
                     )?;
-                    win = win.index_select(&idx_h, 2)?.index_select(&idx_w, 3)?;
+                    win = win
+                        .contiguous()?
+                        .index_select(&idx_h, 2)?
+                        .index_select(&idx_w, 3)?;
                 }
                 windows.push(win);
             }
@@ -4481,24 +4484,37 @@ mod autodiff {
                     let out_pad_w =
                         x.shape[3] - ((g.shape[3] - 1) * stride + dilation * (w.shape[3] - 1) + 1
                             - 2 * padding);
-                    if out_pad_h != out_pad_w {
-                        return Err(
-                            "grad: conv2d with non-uniform stride remainders is not differentiable"
-                                .to_string(),
-                        );
+                    // candle's conv_transpose2d takes a single output_padding;
+                    // when the per-dim stride remainders differ, compute with
+                    // the smaller one and append the missing strip explicitly
+                    // — remainder strips beyond the full convolution are
+                    // always zeros, so this is exact
+                    let min_pad = out_pad_h.min(out_pad_w);
+                    let mut dx = mk(NodeKind::ConvTranspose2d {
+                        x: g.clone(),
+                        w: w.clone(),
+                        stride: *stride,
+                        padding: *padding,
+                        output_padding: min_pad,
+                        dilation: *dilation,
+                        groups: *groups,
+                    })?;
+                    for (dim, out_pad) in [(2usize, out_pad_h), (3usize, out_pad_w)] {
+                        if out_pad > min_pad {
+                            let mut zshape = dx.shape.clone();
+                            zshape[dim] = out_pad - min_pad;
+                            dx = mk(NodeKind::Concat {
+                                a: dx,
+                                b: mk(NodeKind::Zeros {
+                                    shape: zshape,
+                                    dtype: g.dtype,
+                                    device: g.device.clone(),
+                                })?,
+                                dim,
+                            })?;
+                        }
                     }
-                    accumulate(
-                        x,
-                        mk(NodeKind::ConvTranspose2d {
-                            x: g.clone(),
-                            w: w.clone(),
-                            stride: *stride,
-                            padding: *padding,
-                            output_padding: out_pad_h,
-                            dilation: *dilation,
-                            groups: *groups,
-                        }),
-                    )?;
+                    accumulate(x, Ok(dx))?;
                     accumulate(
                         w,
                         mk(NodeKind::Conv2dBackwardW {

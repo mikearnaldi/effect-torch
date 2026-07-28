@@ -199,6 +199,20 @@ layer(Device.Cpu)("Autodiff", (it) => {
           [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18],
           [1, 2, 3, 3]
         )
+        // non-uniform stride remainders: 5 % 2 != 6 % 2 with kernel 2
+        const wnr = yield* f64([1, 0, 0, 1], [1, 1, 2, 2])
+        const xnr = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30]
+        yield* gradcheck(
+          sumOf((xr) => Tensor.conv2d(xr, wnr, { stride: 2 })),
+          xnr,
+          [1, 1, 5, 6]
+        )
+        const xnrT = yield* f64(xnr, [1, 1, 5, 6])
+        yield* gradcheck(
+          sumOf((wr) => Tensor.conv2d(xnrT, wr, { stride: 2 })),
+          [1, 0, 0, 1],
+          [1, 1, 2, 2]
+        )
         const w1 = yield* f64([1, 1], [1, 1, 2])
         yield* gradcheck(sumOf((x1) => Tensor.conv1d(x1, w1)), [1, 2, 3, 4], [1, 1, 4])
         yield* gradcheck(
