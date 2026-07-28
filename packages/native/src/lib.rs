@@ -3667,6 +3667,23 @@ mod autodiff {
         out
     }
 
+    // Unsqueezes shared indexes at the batch dim and broadcasts them across
+    // it, so rank-matched indexing kernels apply per batch element.
+    fn broadcast_batch_indexes(
+        indexes: &Arc<Node>,
+        dim: usize,
+        batch: usize,
+    ) -> std::result::Result<Arc<Node>, String> {
+        let unsqueezed = mk(NodeKind::Reshape {
+            a: indexes.clone(),
+            shape: insert_batch(&indexes.shape, dim, 1),
+        })?;
+        mk(NodeKind::BroadcastTo {
+            a: unsqueezed,
+            shape: insert_batch(&indexes.shape, dim, batch),
+        })
+    }
+
     // Per-op batching rules: rebuild a node for a graph whose input gained
     // a leading-dim-style batch axis at `dim`. Elementwise ops, matmul and
     // wrappers are unchanged (broadcasting carries the batch); shape and
@@ -3777,9 +3794,19 @@ mod autodiff {
                     indexes: indexes.clone(),
                 })
             }
-            NodeKind::Gather { .. } | NodeKind::ScatterAdd { .. } => Err(
-                "vmap: gather and scatterAdd are not supported under vmap".to_string(),
-            ),
+            NodeKind::Gather { indexes, .. } | NodeKind::ScatterAdd { indexes, .. } => {
+                if is_batched(indexes.id) {
+                    Err(
+                        "vmap: gather and scatterAdd with data-dependent indexes are not supported"
+                            .to_string(),
+                    )
+                } else {
+                    Err(
+                        "vmap: gather and scatterAdd with shared indexes are not supported under vmap (requires a batched-gather kernel)"
+                            .to_string(),
+                    )
+                }
+            }
             NodeKind::CrossEntropy { .. } | NodeKind::CrossEntropyBackward { .. } => Err(
                 "vmap: crossEntropy uses data-dependent indexing and is not supported under vmap"
                     .to_string(),
@@ -3838,14 +3865,46 @@ mod autodiff {
             if node.id == x.id || (!is_random && !descendants.contains(&node.id)) {
                 continue;
             }
-            let kind = vmap_rebuild(
-                &node,
-                dim,
-                batch,
-                &|child: &Arc<Node>| map.get(&child.id).cloned().unwrap_or_else(|| child.clone()),
-                &|id: u64| map.contains_key(&id),
-            )?;
-            let rebuilt = mk(kind)?;
+            let child_of = |child: &Arc<Node>| map.get(&child.id).cloned().unwrap_or_else(|| child.clone());
+            let rebuilt = match &node.kind {
+                // shared indexes are reshaped and broadcast across the batch
+                // dim so the rank-matched gather/scatter kernels apply per
+                // batch element
+                NodeKind::Gather { a, dim: d, indexes }
+                    if !descendants.contains(&indexes.id) && !is_random =>
+                {
+                    let idx = broadcast_batch_indexes(indexes, dim, batch)?;
+                    mk(NodeKind::Gather {
+                        a: child_of(a),
+                        dim: shift_dim(*d, dim),
+                        indexes: idx,
+                    })?
+                }
+                NodeKind::ScatterAdd {
+                    a,
+                    dim: d,
+                    indexes,
+                    src,
+                } if !descendants.contains(&indexes.id)
+                    && descendants.contains(&a.id)
+                    && !is_random =>
+                {
+                    let idx = broadcast_batch_indexes(indexes, dim, batch)?;
+                    mk(NodeKind::ScatterAdd {
+                        a: child_of(a),
+                        dim: shift_dim(*d, dim),
+                        indexes: idx,
+                        src: child_of(src),
+                    })?
+                }
+                _ => mk(vmap_rebuild(
+                    &node,
+                    dim,
+                    batch,
+                    &child_of,
+                    &|id: u64| map.contains_key(&id),
+                )?)?,
+            };
             map.insert(node.id, rebuilt);
         }
         Ok(map.get(&y.id).expect("vmap root").clone())

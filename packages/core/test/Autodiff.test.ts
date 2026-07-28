@@ -359,6 +359,59 @@ layer(Device.Cpu)("Autodiff", (it) => {
       })
     )
 
+    it.effect("vmap supports shared-index take, gather and scatterAdd", () =>
+      Effect.gen(function* () {
+        const x = yield* f64([1, 2, 3, 4, 5, 6], [3, 2])
+        const bx = yield* f64([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12], [2, 3, 2])
+        const perBatch = (
+          f: (slice: Tensor.GenericTensor) => Effect.Effect<Tensor.GenericTensor, Tensor.TensorError>
+        ) =>
+          Effect.gen(function* () {
+            const outs: Array<Array<number>> = []
+            for (const b of [0, 1]) {
+              const slice = yield* Tensor.reshape(
+                yield* Tensor.slice(bx, { start: [b, 0, 0], end: [b + 1, 3, 2] }),
+                [3, 2]
+              )
+              outs.push(yield* values(yield* f(slice)))
+            }
+            return outs.flat()
+          })
+
+        const rowIdx = yield* Tensor.fromTypedArray(new BigInt64Array([2n, 0n]))
+        const taken = yield* Gradient.vmap(yield* Tensor.take(x, rowIdx), x, bx)
+        assert.deepStrictEqual(taken.shape, [2, 2, 2])
+        assert.deepStrictEqual(
+          yield* values(taken),
+          yield* perBatch((s) => Tensor.take(s, rowIdx))
+        )
+
+        const gatherIdx = yield* Tensor.fromTypedArray(new BigInt64Array([1n, 0n, 0n, 1n, 1n, 1n]), [3, 2])
+        const gathered = yield* Gradient.vmap(yield* Tensor.gather(x, gatherIdx, { dim: 1 }), x, bx)
+        assert.deepStrictEqual(gathered.shape, [2, 3, 2])
+        assert.deepStrictEqual(
+          yield* values(gathered),
+          yield* perBatch((s) => Tensor.gather(s, gatherIdx, { dim: 1 }))
+        )
+
+        const src = yield* Tensor.mul(x, 2)
+        const scattered = yield* Gradient.vmap(
+          yield* Tensor.scatterAdd(x, gatherIdx, src, { dim: 1 }),
+          x,
+          bx
+        )
+        assert.deepStrictEqual(scattered.shape, [2, 3, 2])
+        assert.deepStrictEqual(
+          yield* values(scattered),
+          yield* perBatch((s) =>
+            Effect.gen(function* () {
+              return yield* Tensor.scatterAdd(s, gatherIdx, yield* Tensor.mul(s, 2), { dim: 1 })
+            })
+          )
+        )
+      })
+    )
+
     it.effect("matmul", () =>
       Effect.gen(function* () {
         const b = yield* f64([1, 2, 3, 4, 5, 6], [3, 2])
