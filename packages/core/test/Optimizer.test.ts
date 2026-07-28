@@ -330,6 +330,46 @@ layer(Device.Cpu)("Optimizer", (it) => {
       })
     )
 
+    it.effect("fused and composed momentum sgd produce identical trajectories", () =>
+      Effect.gen(function* () {
+        const x = yield* Tensor.fromTypedArray(new Float64Array([1, 1, 2, 1, 3, 1, 4, 1]), [4, 2])
+        const y = yield* Tensor.fromTypedArray(new Float64Array([2, 3, 4, 5]), [4, 1])
+        const run = (fused: boolean, config: { dampening?: number; nesterov?: boolean; weightDecay?: number }) =>
+          Effect.gen(function* () {
+            let params: ReadonlyArray<Tensor.GenericTensor> = [
+              yield* Tensor.fromTypedArray(new Float64Array([0.5, -0.5]))
+            ]
+            const optimizer = Optimizer.sgd({ lr: 0.05, momentum: 0.9, fused, ...config })
+            let state = yield* optimizer.init(params)
+            for (let i = 0; i < 20; i++) {
+              const pred = yield* Tensor.matmul(x, yield* Tensor.reshape(params[0], [2, 1]))
+              const loss = yield* Loss.mse(pred, y)
+              const next = yield* Optimizer.step(optimizer, loss, params, state)
+              params = next.params
+              state = next.state
+            }
+            return {
+              w: yield* values(params[0]),
+              velocity: yield* values(state.velocity![0])
+            }
+          })
+        for (const config of [
+          {},
+          { dampening: 0.3 },
+          { nesterov: true },
+          { weightDecay: 0.01 },
+          { dampening: 0.1, weightDecay: 0.01 }
+        ]) {
+          const fusedRun = yield* run(true, config)
+          const composedRun = yield* run(false, config)
+          for (let i = 0; i < 2; i++) {
+            expect(Math.abs(fusedRun.w[i] - composedRun.w[i])).toBeLessThan(1e-9)
+            expect(Math.abs(fusedRun.velocity[i] - composedRun.velocity[i])).toBeLessThan(1e-9)
+          }
+        }
+      })
+    )
+
     it.effect("fused and composed adamW produce identical trajectories", () =>
       Effect.gen(function* () {
         const x = yield* Tensor.fromTypedArray(new Float64Array([1, 1, 2, 1, 3, 1, 4, 1]), [4, 2])

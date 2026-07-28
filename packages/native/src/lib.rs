@@ -723,6 +723,21 @@ enum NodeKind {
         step: Arc<Node>,
         index: u8,
     },
+    SgdStep {
+        param: Arc<Node>,
+        grad: Arc<Node>,
+        velocity: Arc<Node>,
+        first_step: bool,
+        lr: f64,
+        momentum: f64,
+        dampening: f64,
+        nesterov: bool,
+        weight_decay: f64,
+    },
+    SgdOut {
+        step: Arc<Node>,
+        index: u8,
+    },
     StopGradient {
         a: Arc<Node>,
     },
@@ -1195,6 +1210,33 @@ impl Node {
             NodeKind::AdamWOut { step, index } => {
                 if *index > 2 {
                     return Err(format!("adamw_out: index must be 0, 1 or 2, got {index}"));
+                }
+                (step.shape.clone(), step.dtype, step.device.clone())
+            }
+            NodeKind::SgdStep {
+                param,
+                grad,
+                velocity,
+                ..
+            } => {
+                if !param.dtype.is_float() {
+                    return Err(format!(
+                        "sgd_step: dtype must be floating point, got {:?}",
+                        param.dtype
+                    ));
+                }
+                for (name, t) in [("grad", grad), ("velocity", velocity)] {
+                    if t.shape != param.shape || t.dtype != param.dtype {
+                        return Err(format!(
+                            "sgd_step: {name} must match the parameter shape and dtype"
+                        ));
+                    }
+                }
+                (param.shape.clone(), param.dtype, param.device.clone())
+            }
+            NodeKind::SgdOut { step, index } => {
+                if *index > 1 {
+                    return Err(format!("sgd_out: index must be 0 or 1, got {index}"));
                 }
                 (step.shape.clone(), step.dtype, step.device.clone())
             }
@@ -1809,6 +1851,39 @@ impl LazyTensor {
             index,
         }))
     }
+
+    #[napi]
+    pub fn sgd_step(
+        &self,
+        grad: &LazyTensor,
+        velocity: &LazyTensor,
+        first_step: bool,
+        lr: f64,
+        momentum: f64,
+        dampening: f64,
+        nesterov: bool,
+        weight_decay: f64,
+    ) -> Result<Self> {
+        lazy_ctor!(Node::new(NodeKind::SgdStep {
+            param: self.node.clone(),
+            grad: grad.node.clone(),
+            velocity: velocity.node.clone(),
+            first_step,
+            lr,
+            momentum,
+            dampening,
+            nesterov,
+            weight_decay,
+        }))
+    }
+
+    #[napi]
+    pub fn sgd_out(&self, index: u8) -> Result<Self> {
+        lazy_ctor!(Node::new(NodeKind::SgdOut {
+            step: self.node.clone(),
+            index,
+        }))
+    }
 }
 
 // Evaluation holds intermediate results in a cache keyed by node id. A node
@@ -1822,6 +1897,7 @@ struct Evaluator {
     // AdamW step id -> (next m, next v); the step node's own value is the
     // updated parameter, stored in the regular cache
     adamw: std::collections::HashMap<u64, [Tensor; 2]>,
+    sgd: std::collections::HashMap<u64, Tensor>,
     consumers: std::collections::HashMap<u64, usize>,
     roots: HashSet<u64>,
 }
@@ -1835,6 +1911,7 @@ impl Evaluator {
         Self {
             cache: std::collections::HashMap::new(),
             adamw: std::collections::HashMap::new(),
+            sgd: std::collections::HashMap::new(),
             consumers,
             roots: roots.iter().map(|root| root.id).collect(),
         }
@@ -1853,6 +1930,7 @@ impl Evaluator {
                 if *count == 0 && !self.roots.contains(&child.id) {
                     self.cache.remove(&child.id);
                     self.adamw.remove(&child.id);
+                    self.sgd.remove(&child.id);
                 }
             }
         }
@@ -1953,6 +2031,13 @@ fn node_children(kind: &NodeKind) -> Vec<Arc<Node>> {
             ..
         } => vec![param.clone(), grad.clone(), m.clone(), v.clone()],
         NodeKind::AdamWOut { step, .. } => vec![step.clone()],
+        NodeKind::SgdStep {
+            param,
+            grad,
+            velocity,
+            ..
+        } => vec![param.clone(), grad.clone(), velocity.clone()],
+        NodeKind::SgdOut { step, .. } => vec![step.clone()],
     }
 }
 
@@ -2194,6 +2279,31 @@ fn remap_children(kind: &NodeKind, f: &dyn Fn(&Arc<Node>) -> Arc<Node>) -> NodeK
             t: *t,
         },
         NodeKind::AdamWOut { step, index } => NodeKind::AdamWOut {
+            step: f(step),
+            index: *index,
+        },
+        NodeKind::SgdStep {
+            param,
+            grad,
+            velocity,
+            first_step,
+            lr,
+            momentum,
+            dampening,
+            nesterov,
+            weight_decay,
+        } => NodeKind::SgdStep {
+            param: f(param),
+            grad: f(grad),
+            velocity: f(velocity),
+            first_step: *first_step,
+            lr: *lr,
+            momentum: *momentum,
+            dampening: *dampening,
+            nesterov: *nesterov,
+            weight_decay: *weight_decay,
+        },
+        NodeKind::SgdOut { step, index } => NodeKind::SgdOut {
             step: f(step),
             index: *index,
         },
@@ -2722,6 +2832,48 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> candle_core::Result<Te
                 0 => ev.value(step.id)?,
                 1 => outputs[0].clone(),
                 _ => outputs[1].clone(),
+            }
+        }
+        NodeKind::SgdStep {
+            param,
+            grad,
+            velocity,
+            first_step,
+            lr,
+            momentum,
+            dampening,
+            nesterov,
+            weight_decay,
+        } => {
+            let p = ev.value(param.id)?;
+            let g = ev.value(grad.id)?;
+            let g = if *weight_decay == 0.0 {
+                g
+            } else {
+                (&g + (&p * *weight_decay)?)?
+            };
+            let next_v = if *first_step {
+                g.clone()
+            } else {
+                let v = ev.value(velocity.id)?;
+                ((v * *momentum)? + (&g * (1.0 - dampening))?)?
+            };
+            let used = if *nesterov {
+                (&g + (&next_v * *momentum)?)?
+            } else {
+                next_v.clone()
+            };
+            let next_p = (p - (&used * *lr)?)?;
+            ev.sgd.insert(node.id, next_v);
+            next_p
+        }
+        NodeKind::SgdOut { step, index } => {
+            let _ = ev.value(step.id)?;
+            match index {
+                0 => ev.value(step.id)?,
+                _ => ev.sgd.get(&step.id).cloned().ok_or_else(|| {
+                    candle_core::Error::Msg("sgd_out: step has no stored velocity".to_string())
+                })?,
             }
         }
     };
@@ -3597,7 +3749,10 @@ mod autodiff {
                             .to_string(),
                     );
                 }
-                NodeKind::AdamWStep { .. } | NodeKind::AdamWOut { .. } => {
+                NodeKind::AdamWStep { .. }
+                | NodeKind::AdamWOut { .. }
+                | NodeKind::SgdStep { .. }
+                | NodeKind::SgdOut { .. } => {
                     return Err(
                         "grad: optimizer update nodes are not differentiable".to_string(),
                     );

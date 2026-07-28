@@ -71,6 +71,8 @@ export declare class LazyTensor {
   vmap(x: LazyTensor, batchedX: LazyTensor, dim: number): LazyTensor
   adamwStep(grad: LazyTensor, m: LazyTensor, v: LazyTensor, lr: number, beta1: number, beta2: number, eps: number, weightDecay: number, t: number): LazyTensor
   adamwOut(index: number): LazyTensor
+  sgdStep(grad: LazyTensor, velocity: LazyTensor, firstStep: boolean, lr: number, momentum: number, dampening: number, nesterov: boolean, weightDecay: number): LazyTensor
+  sgdOut(index: number): LazyTensor
 }
 
 export declare class NativeTensor {

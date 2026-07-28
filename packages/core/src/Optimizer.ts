@@ -34,7 +34,9 @@ import * as Gradient from "./Gradient.ts"
 import * as Tensor from "./Tensor.ts"
 
 /**
- * Configuration for stochastic gradient descent.
+ * Configuration for stochastic gradient descent. `fused` (default `true`)
+ * computes each momentum update as a single native node instead of several
+ * graph nodes — identical numerics, smaller graphs.
  *
  * @since 0.1.0
  * @category models
@@ -45,6 +47,7 @@ export interface SgdConfig {
   readonly dampening?: number
   readonly nesterov?: boolean
   readonly weightDecay?: number
+  readonly fused?: boolean
 }
 
 /**
@@ -230,6 +233,7 @@ export const sgd = (config: SgdConfig): Optimizer<SgdState> => {
   const dampening = config.dampening ?? 0
   const nesterov = config.nesterov ?? false
   const weightDecay = config.weightDecay ?? 0
+  const fused = config.fused ?? true
   if (!Number.isFinite(lr) || lr <= 0) {
     throw new Error(`sgd: lr must be positive, got ${lr}`)
   }
@@ -255,6 +259,31 @@ export const sgd = (config: SgdConfig): Optimizer<SgdState> => {
       }
       if (momentum === 0) {
         return { param: yield* Tensor.sub(param, yield* Tensor.mul(g, lr)), velocity: null }
+      }
+      if (fused) {
+        const step = yield* Effect.try({
+          try: () =>
+            param.lazy.sgdStep(
+              grad.lazy,
+              (velocity ?? param).lazy,
+              velocity === null,
+              lr,
+              momentum,
+              dampening,
+              nesterov,
+              weightDecay
+            ),
+          catch: (error) =>
+            new Tensor.TensorError({
+              op: "sgd",
+              message: error instanceof Error ? error.message : String(error)
+            })
+        })
+        const makeOut = (index: number): Tensor.LazyTensor => {
+          const handle = step.sgdOut(index)
+          return Tensor.makeLazy(handle, param.shape, param.dtype, param.device)
+        }
+        return { param: makeOut(0), velocity: makeOut(1) }
       }
       const nextVelocity = velocity === null
         ? g
