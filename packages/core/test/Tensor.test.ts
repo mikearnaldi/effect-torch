@@ -637,6 +637,53 @@ layer(Device.Cpu)("Tensor", (it) => {
       })
     )
 
+    it.effect("embedding", () =>
+      Effect.gen(function* () {
+        const weight = yield* Tensor.fromTypedArray(
+          new Float64Array([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]),
+          [4, 3]
+        )
+        const out = yield* Tensor.embedding(
+          yield* Tensor.fromTypedArray(new BigInt64Array([2n, 0n, 1n, 3n]), [2, 2]),
+          { weight }
+        )
+        assert.deepStrictEqual(out.shape, [2, 2, 3])
+        assert.deepStrictEqual(yield* values(out), [7, 8, 9, 1, 2, 3, 4, 5, 6, 10, 11, 12])
+      })
+    )
+
+    it.effect("embedding with paddingIndex returns the stored row but masks its gradient", () =>
+      Effect.gen(function* () {
+        const weight = yield* Tensor.fromTypedArray(
+          new Float64Array([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]),
+          [4, 3]
+        )
+        const indexes = yield* Tensor.fromTypedArray(new BigInt64Array([2n, 0n, 2n]))
+        const out = yield* Tensor.embedding(indexes, { paddingIndex: 0, weight })
+        assert.deepStrictEqual(yield* values(out), [7, 8, 9, 1, 2, 3, 7, 8, 9])
+        const [gradW] = yield* Gradient.grad(yield* Tensor.sum(out), [weight])
+        assert.deepStrictEqual(yield* values(gradW), [0, 0, 0, 0, 0, 0, 2, 2, 2, 0, 0, 0])
+      })
+    )
+
+    it.effect("embedding validates its arguments", () =>
+      Effect.gen(function* () {
+        const weight = yield* Tensor.fromTypedArray(new Float64Array([1, 2, 3, 4]), [2, 2])
+        const indexes = yield* Tensor.fromTypedArray(new BigInt64Array([0n]))
+        const badRank = yield* Effect.flip(Tensor.embedding(indexes, {
+          weight: yield* Tensor.reshape(weight, [1, 2, 2])
+        }))
+        assert.deepStrictEqual(badRank.op, "embedding")
+        const badPadding = yield* Effect.flip(Tensor.embedding(indexes, { paddingIndex: 2, weight }))
+        assert.deepStrictEqual(badPadding.op, "embedding")
+        const badDtype = yield* Effect.flip(Tensor.embedding(
+          yield* Tensor.cast(indexes, "f32"),
+          { weight }
+        ))
+        assert.deepStrictEqual(badDtype.op, "embedding")
+      })
+    )
+
     it.effect("flip", () =>
       Effect.gen(function* () {
         const x = yield* Tensor.fromTypedArray(new Float64Array([1, 2, 3, 4, 5, 6]), [2, 3])

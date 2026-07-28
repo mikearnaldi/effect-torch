@@ -2308,7 +2308,7 @@ export const flip = (
   })
 
 /**
- * Expands `i64` class indexes of any shape into one-hot vectors of the
+ * Expands `i64` or `u32` class indexes of any shape into one-hot vectors of the
  * given depth, appended as a new last dimension.
  *
  * @since 0.1.0
@@ -2320,15 +2320,85 @@ export const oneHot = (
   options: { readonly dtype?: "f32" | "f64" } = {}
 ): Effect.Effect<LazyTensor, TensorError, CurrentDevice> =>
   Effect.gen(function* () {
-    if (indexes.dtype !== "i64") {
-      return yield* new TensorError({ op: "oneHot", message: `oneHot: indexes must be i64, got ${indexes.dtype}` })
+    if (indexes.dtype !== "i64" && indexes.dtype !== "u32") {
+      return yield* new TensorError({
+        op: "oneHot",
+        message: `oneHot: indexes must be i64 or u32, got ${indexes.dtype}`
+      })
     }
     if (!Number.isInteger(depth) || depth < 1) {
       return yield* new TensorError({ op: "oneHot", message: `oneHot: depth must be a positive integer, got ${depth}` })
     }
-    const classes = yield* arange(depth, undefined, { dtype: "i64" })
+    const classes = yield* arange(depth, undefined, { dtype: indexes.dtype })
     const expanded = yield* reshape(indexes, [...indexes.shape, 1])
     return yield* cast(yield* eq(expanded, classes), options.dtype ?? "f32")
+  })
+
+/**
+ * Embedding lookup: selects rows from a `[vocab, hidden]` weight matrix by
+ * integer indexes of any shape, giving output shape `[...indexes.shape,
+ * hidden]`. Repeated indexes accumulate weight gradients. With
+ * `paddingIndex`, the stored padding row is returned in the forward pass but
+ * receives zero gradient (the `torch.nn.functional.embedding` contract).
+ *
+ * @since 0.1.0
+ * @category shape operations
+ */
+export const embedding = (
+  indexes: GenericTensor,
+  options: {
+    readonly weight: GenericTensor
+    readonly paddingIndex?: number
+  }
+): Effect.Effect<LazyTensor, TensorError> =>
+  Effect.gen(function* () {
+    const { paddingIndex, weight } = options
+    if (weight.shape.length !== 2) {
+      return yield* new TensorError({
+        op: "embedding",
+        message: `embedding: weight must be rank 2 [vocab, hidden], got shape [${weight.shape}]`
+      })
+    }
+    if (weight.dtype !== "f32" && weight.dtype !== "f64") {
+      return yield* new TensorError({
+        op: "embedding",
+        message: `embedding: weight must be f32 or f64, got ${weight.dtype}`
+      })
+    }
+    if (indexes.dtype !== "i64" && indexes.dtype !== "u32") {
+      return yield* new TensorError({
+        op: "embedding",
+        message: `embedding: indexes must be i64 or u32, got ${indexes.dtype}`
+      })
+    }
+    if (indexes.device !== weight.device) {
+      return yield* new TensorError({
+        op: "embedding",
+        message: `embedding: device mismatch, got ${indexes.device} and ${weight.device}`
+      })
+    }
+    const [vocab, hidden] = weight.shape
+    if (
+      paddingIndex !== undefined &&
+      (!Number.isInteger(paddingIndex) || paddingIndex < 0 || paddingIndex >= vocab)
+    ) {
+      return yield* new TensorError({
+        op: "embedding",
+        message: `embedding: paddingIndex must be an integer in [0, ${vocab}), got ${paddingIndex}`
+      })
+    }
+    const n = indexes.shape.reduce((acc, d) => acc * d, 1)
+    const flat = indexes.shape.length === 1 ? indexes : yield* reshape(indexes, [n])
+    let out: GenericTensor = yield* take(weight, flat, { dim: 0 })
+    if (paddingIndex !== undefined) {
+      const mask = yield* broadcastTo(
+        yield* reshape(yield* cast(yield* eq(flat, paddingIndex), weight.dtype), [n, 1]),
+        [n, hidden]
+      )
+      const stopped = makeLazy(out.lazy.stopGradient(), out.shape, out.dtype, out.device)
+      out = yield* add(yield* sub(out, yield* mul(mask, out)), yield* mul(mask, stopped))
+    }
+    return yield* reshape(out, [...indexes.shape, hidden])
   })
 
 const triangleMask = (
