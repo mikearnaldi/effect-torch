@@ -3037,10 +3037,11 @@ export const avgPool2d = (
 
 const checkSquare = (op: string, self: GenericTensor): Effect.Effect<void, TensorError> =>
   Effect.gen(function* () {
-    if (self.shape.length !== 2 || self.shape[0] !== self.shape[1]) {
+    const rank = self.shape.length
+    if (rank < 2 || self.shape[rank - 2] !== self.shape[rank - 1]) {
       return yield* new TensorError({
         op,
-        message: `${op}: expected a square rank-2 tensor, got shape [${self.shape}]`
+        message: `${op}: expected a tensor square on its last two dimensions, got shape [${self.shape}]`
       })
     }
     if (!isFloatDtype(self.dtype)) {
@@ -3049,8 +3050,9 @@ const checkSquare = (op: string, self: GenericTensor): Effect.Effect<void, Tenso
   })
 
 /**
- * Matrix inverse of a square rank-2 tensor. Linear algebra runs on the
- * CPU — on other devices the matrix round-trips through the host.
+ * Matrix inverse of a tensor that is square on its last two dimensions;
+ * leading dimensions are treated as batch. Linear algebra runs on the
+ * CPU — on other devices the matrices round-trip through the host.
  *
  * @since 0.1.0
  * @category linalg
@@ -3066,8 +3068,9 @@ export const inverse = (self: GenericTensor): Effect.Effect<LazyTensor, TensorEr
   })
 
 /**
- * Determinant of a square rank-2 tensor, as a scalar. Linear algebra runs
- * on the CPU — on other devices the matrix round-trips through the host.
+ * Determinant of a tensor that is square on its last two dimensions, with
+ * the leading (batch) dimensions as the output shape. Linear algebra runs
+ * on the CPU — on other devices the matrices round-trip through the host.
  *
  * @since 0.1.0
  * @category linalg
@@ -3076,15 +3079,16 @@ export const det = (self: GenericTensor): Effect.Effect<LazyTensor, TensorError>
   Effect.gen(function* () {
     yield* checkSquare("det", self)
     return yield* Effect.try({
-      try: () => makeLazy(self.lazy.det(), [], self.dtype, self.device),
+      try: () => makeLazy(self.lazy.det(), self.shape.slice(0, -2), self.dtype, self.device),
       catch: (error) =>
         new TensorError({ op: "det", message: error instanceof Error ? error.message : String(error) })
     })
   })
 
 /**
- * Solves the linear system `a @ x = b` for `x`, with square rank-2 `a` and
- * rank-2 `b`. Linear algebra runs on the CPU — on other devices the
+ * Solves the linear system `a @ x = b` for `x`, with `a` square on its last
+ * two dimensions and `b` of matching rank whose leading dimensions equal
+ * `a`'s. Linear algebra runs on the CPU — on other devices the
  * matrices round-trip through the host.
  *
  * @since 0.1.0
@@ -3098,10 +3102,15 @@ export const solve: {
   (self: GenericTensor, b: GenericTensor): Effect.Effect<LazyTensor, TensorError> =>
     Effect.gen(function* () {
       yield* checkSquare("solve", self)
-      if (b.shape.length !== 2 || b.shape[0] !== self.shape[0]) {
+      const rank = self.shape.length
+      if (
+        b.shape.length !== rank ||
+        !self.shape.slice(0, -2).every((d, i) => d === b.shape[i]) ||
+        b.shape[rank - 2] !== self.shape[rank - 1]
+      ) {
         return yield* new TensorError({
           op: "solve",
-          message: `solve: expected a rank-2 right-hand side with ${self.shape[0]} rows, got shape [${b.shape}]`
+          message: `solve: expected a right-hand side of matching rank with leading shape [${self.shape.slice(0, -1)}], got shape [${b.shape}]`
         })
       }
       yield* Effect.try({

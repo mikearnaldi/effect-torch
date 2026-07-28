@@ -13,6 +13,53 @@ fn to_join_err(err: tokio::task::JoinError) -> Error {
     Error::new(Status::GenericFailure, err.to_string())
 }
 
+// Applies a rank-2 linalg kernel to each matrix of a batched [..., n, m]
+// tensor and stacks the results back into the leading shape.
+fn batch_linalg(
+    t: &Tensor,
+    f: &dyn Fn(&Tensor) -> candle_core::Result<Tensor>,
+) -> candle_core::Result<Tensor> {
+    let dims = t.dims();
+    let rank = dims.len();
+    if rank == 2 {
+        return f(t);
+    }
+    let (n, m) = (dims[rank - 2], dims[rank - 1]);
+    let batch: usize = dims[..rank - 2].iter().product();
+    if batch == 0 {
+        return Err(candle_core::Error::Msg("linalg: empty batch".to_string()));
+    }
+    let flat = t.reshape((batch, n, m))?;
+    let mut outs = Vec::with_capacity(batch);
+    for i in 0..batch {
+        outs.push(f(&flat.get(i)?)?);
+    }
+    let mut out_shape: Vec<usize> = dims[..rank - 2].to_vec();
+    out_shape.extend_from_slice(outs[0].dims());
+    Tensor::stack(&outs, 0)?.reshape(out_shape)
+}
+
+fn batch_solve(a: &Tensor, b: &Tensor) -> candle_core::Result<Tensor> {
+    let dims = a.dims();
+    let rank = dims.len();
+    if rank == 2 {
+        return cpu_inverse(a)?.matmul(b);
+    }
+    let n = dims[rank - 2];
+    let k = b.dims()[rank - 1];
+    let batch: usize = dims[..rank - 2].iter().product();
+    if batch == 0 {
+        return Err(candle_core::Error::Msg("linalg: empty batch".to_string()));
+    }
+    let a_flat = a.reshape((batch, n, n))?;
+    let b_flat = b.reshape((batch, n, k))?;
+    let mut outs = Vec::with_capacity(batch);
+    for i in 0..batch {
+        outs.push(cpu_inverse(&a_flat.get(i)?)?.matmul(&b_flat.get(i)?)?);
+    }
+    Tensor::stack(&outs, 0)?.reshape(b.shape())
+}
+
 // u8 mask that is 1 where target == ignore_index. A negative ignore_index
 // can never match a u32 target, so u32 targets are all active in that case.
 fn cross_entropy_ignored_mask(target: &Tensor, ignore_index: i64) -> candle_core::Result<Tensor> {
@@ -1149,9 +1196,10 @@ impl Node {
                 (shape, a.dtype, a.device.clone())
             }
             NodeKind::Inverse { a } | NodeKind::Det { a } => {
-                if a.shape.len() != 2 || a.shape[0] != a.shape[1] {
+                let rank = a.shape.len();
+                if rank < 2 || a.shape[rank - 2] != a.shape[rank - 1] {
                     return Err(format!(
-                        "linalg: expected a square rank-2 tensor, got shape {:?}",
+                        "linalg: expected a tensor square on its last two dimensions, got shape {:?}",
                         a.shape
                     ));
                 }
@@ -1159,22 +1207,28 @@ impl Node {
                     return Err(format!("linalg: dtype must be floating point, got {:?}", a.dtype));
                 }
                 if matches!(&kind, NodeKind::Det { .. }) {
-                    (vec![], a.dtype, a.device.clone())
+                    (a.shape[..rank - 2].to_vec(), a.dtype, a.device.clone())
                 } else {
                     (a.shape.clone(), a.dtype, a.device.clone())
                 }
             }
             NodeKind::Solve { a, b } => {
-                if a.shape.len() != 2 || a.shape[0] != a.shape[1] {
+                let rank = a.shape.len();
+                if rank < 2 || a.shape[rank - 2] != a.shape[rank - 1] {
                     return Err(format!(
-                        "solve: expected a square rank-2 coefficient matrix, got shape {:?}",
+                        "solve: expected a coefficient tensor square on its last two dimensions, got shape {:?}",
                         a.shape
                     ));
                 }
-                if b.shape.len() != 2 || b.shape[0] != a.shape[0] {
+                if b.shape.len() != rank
+                    || b.shape[..rank - 2] != a.shape[..rank - 2]
+                    || b.shape[rank - 2] != a.shape[rank - 1]
+                {
                     return Err(format!(
-                        "solve: expected a rank-2 right-hand side with {} rows, got shape {:?}",
-                        a.shape[0], b.shape
+                        "solve: expected a right-hand side of shape {:?} with {} rows, got shape {:?}",
+                        &a.shape[..rank - 1],
+                        a.shape[rank - 1],
+                        b.shape
                     ));
                 }
                 if !a.dtype.is_float() || a.dtype != b.dtype {
@@ -2775,19 +2829,19 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> candle_core::Result<Te
             // linalg is CPU-only: round-trip to the host
             let t = ev.value(a.id)?;
             let cpu = t.to_device(&Device::Cpu)?;
-            cpu_inverse(&cpu)?.to_device(t.device())?
+            batch_linalg(&cpu, &cpu_inverse)?.to_device(t.device())?
         }
         NodeKind::Det { a } => {
             let t = ev.value(a.id)?;
             let cpu = t.to_device(&Device::Cpu)?;
-            cpu_det(&cpu)?.to_device(t.device())?
+            batch_linalg(&cpu, &cpu_det)?.to_device(t.device())?
         }
         NodeKind::Solve { a, b } => {
             let a = ev.value(a.id)?;
             let b = ev.value(b.id)?;
             let a_cpu = a.to_device(&Device::Cpu)?;
             let b_cpu = b.to_device(&Device::Cpu)?;
-            cpu_inverse(&a_cpu)?.matmul(&b_cpu)?.to_device(a.device())?
+            batch_solve(&a_cpu, &b_cpu)?.to_device(a.device())?
         }
         NodeKind::StopGradient { a } => ev.value(a.id)?,
         NodeKind::Checkpoint { a } => ev.value(a.id)?,
@@ -3710,9 +3764,14 @@ mod autodiff {
                     )?;
                 }
                 NodeKind::Det { a } => {
-                    // d det = det * inv^T
+                    // d det = det * inv^T; the batch-shaped det and cotangent
+                    // are expanded across the matrix dimensions
                     let inv_t = transpose2(&mk(NodeKind::Inverse { a: a.clone() })?)?;
-                    accumulate(a, mul(g, mul(node.clone(), inv_t)?))?;
+                    let rank = a.shape.len();
+                    let dims = vec![rank - 2, rank - 1];
+                    let det_b = expand_reduced(&node.clone(), &dims, false, &a.shape)?;
+                    let g_b = expand_reduced(&g, &dims, false, &a.shape)?;
+                    accumulate(a, mul(g_b, mul(det_b, inv_t)?))?;
                 }
                 NodeKind::Solve { a, b } => {
                     // out = a^-1 b; g_b = a^-T g; g_a = -g_b @ out^T

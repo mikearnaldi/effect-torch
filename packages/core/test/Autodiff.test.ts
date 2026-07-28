@@ -234,6 +234,17 @@ layer(Device.Cpu)("Autodiff", (it) => {
       })
     )
 
+    it.effect("batched linalg", () =>
+      Effect.gen(function* () {
+        yield* gradcheck(sumOf((x) => Tensor.det(x)), [4, 1, 1, 3, 2, 1, 1, 2], [2, 2, 2])
+        yield* gradcheck(sumOf((x) => Tensor.inverse(x)), [4, 1, 1, 3, 2, 1, 1, 2], [2, 2, 2])
+        const b = yield* f64([9, 8, 5, 4], [2, 2, 1])
+        yield* gradcheck(sumOf((x) => Tensor.solve(x, b)), [4, 1, 1, 3, 2, 1, 1, 2], [2, 2, 2])
+        const a = yield* f64([4, 1, 1, 3, 2, 1, 1, 2], [2, 2, 2])
+        yield* gradcheck(sumOf((x) => Tensor.solve(a, x)), [9, 8, 5, 4], [2, 2, 1])
+      })
+    )
+
     it.effect("checkpoint preserves values and gradients, sharing randn draws", () =>
       Effect.gen(function* () {
         const f = (x: Tensor.GenericTensor) =>

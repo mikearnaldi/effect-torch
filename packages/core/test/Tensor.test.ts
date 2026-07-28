@@ -845,6 +845,31 @@ layer(Device.Cpu)("Tensor", (it) => {
         expect(error.message).toContain("singular")
       })
     )
+
+    it.effect("batched inverse/det/solve", () =>
+      Effect.gen(function* () {
+        const a = yield* Tensor.fromTypedArray(new Float64Array([4, 1, 1, 3, 1, 2, 3, 4]), [2, 2, 2])
+        const inv = yield* Tensor.inverse(a)
+        assert.deepStrictEqual(inv.shape, [2, 2, 2])
+        const identity = yield* values(yield* Tensor.matmul(a, inv))
+        const expectedIdentity = [1, 0, 0, 1, 1, 0, 0, 1]
+        for (let i = 0; i < 8; i++) {
+          expect(Math.abs(identity[i] - expectedIdentity[i])).toBeLessThan(1e-9)
+        }
+        const dets = yield* values(yield* Tensor.det(a))
+        assert.deepStrictEqual(dets.length, 2)
+        expect(Math.abs(dets[0] - 11)).toBeLessThan(1e-9)
+        expect(Math.abs(dets[1] - -2)).toBeLessThan(1e-9)
+        const b = yield* Tensor.fromTypedArray(new Float64Array([9, 8, 1, 1]), [2, 2, 1])
+        const x = yield* Tensor.solve(a, b)
+        assert.deepStrictEqual(x.shape, [2, 2, 1])
+        const xValues = yield* values(x)
+        expect(Math.abs(xValues[0] - 19 / 11)).toBeLessThan(1e-9)
+        expect(Math.abs(xValues[1] - 23 / 11)).toBeLessThan(1e-9)
+        expect(Math.abs(xValues[2] - -1)).toBeLessThan(1e-9)
+        expect(Math.abs(xValues[3] - 1)).toBeLessThan(1e-9)
+      })
+    )
   })
 
   describe("convolution and pooling", () => {
