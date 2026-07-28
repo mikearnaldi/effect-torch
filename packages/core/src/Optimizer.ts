@@ -230,10 +230,10 @@ export const sgd = (config: SgdConfig): Optimizer<SgdState> => {
   const dampening = config.dampening ?? 0
   const nesterov = config.nesterov ?? false
   const weightDecay = config.weightDecay ?? 0
-  if (lr <= 0) {
+  if (!Number.isFinite(lr) || lr <= 0) {
     throw new Error(`sgd: lr must be positive, got ${lr}`)
   }
-  if (momentum < 0) {
+  if (!Number.isFinite(momentum) || momentum < 0) {
     throw new Error(`sgd: momentum must be non-negative, got ${momentum}`)
   }
   if (nesterov && (momentum <= 0 || dampening !== 0)) {
@@ -306,13 +306,16 @@ interface ResolvedAdamConfig {
 
 const makeAdam = (op: string, config: ResolvedAdamConfig): Optimizer<AdamState> => {
   const { lr, beta1, beta2, eps, weightDecay, fused } = config
-  if (lr <= 0) {
+  if (!Number.isFinite(lr) || lr <= 0) {
     throw new Error(`${op}: lr must be positive, got ${lr}`)
   }
-  if (beta1 < 0 || beta1 >= 1 || beta2 < 0 || beta2 >= 1) {
+  if (
+    !Number.isFinite(beta1) || !Number.isFinite(beta2) || beta1 < 0 || beta1 >= 1 || beta2 < 0 ||
+    beta2 >= 1
+  ) {
     throw new Error(`${op}: beta1 and beta2 must be in [0, 1), got ${beta1} and ${beta2}`)
   }
-  if (eps <= 0) {
+  if (!Number.isFinite(eps) || eps <= 0) {
     throw new Error(`${op}: eps must be positive, got ${eps}`)
   }
 

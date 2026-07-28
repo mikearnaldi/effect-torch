@@ -316,11 +316,17 @@ layer(Device.Cpu)("Optimizer", (it) => {
     it.effect("rejects invalid configuration", () =>
       Effect.sync(() => {
         expect(() => Optimizer.sgd({ lr: 0 })).toThrow("lr must be positive")
+        expect(() => Optimizer.sgd({ lr: Number.NaN })).toThrow("lr must be positive")
+        expect(() => Optimizer.sgd({ lr: 0.1, momentum: Number.NaN })).toThrow("momentum")
         expect(() => Optimizer.sgd({ lr: 0.1, momentum: 0.9, nesterov: true, dampening: 0.1 })).toThrow(
           "nesterov"
         )
         expect(() => Optimizer.adam({ beta1: 1.5 })).toThrow("beta1 and beta2")
+        expect(() => Optimizer.adam({ beta1: Number.NaN })).toThrow("beta1 and beta2")
+        expect(() => Optimizer.adam({ beta2: Number.NaN })).toThrow("beta1 and beta2")
+        expect(() => Optimizer.adam({ lr: Number.NaN })).toThrow("lr must be positive")
         expect(() => Optimizer.adam({ eps: 0 })).toThrow("eps must be positive")
+        expect(() => Optimizer.adam({ eps: Number.NaN })).toThrow("eps must be positive")
       })
     )
 

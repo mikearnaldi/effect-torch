@@ -611,6 +611,32 @@ layer(Device.Cpu)("Tensor", (it) => {
       })
     )
 
+    it.effect("take, gather and scatterAdd accept u32 indexes", () =>
+      Effect.gen(function* () {
+        const x = yield* Tensor.fromTypedArray(new Float64Array([1, 2, 3, 4, 5, 6]), [3, 2])
+        const idx = yield* Tensor.fromTypedArray(new Uint32Array([2, 0]))
+        const t = yield* Tensor.take(x, idx)
+        assert.deepStrictEqual(t.shape, [2, 2])
+        assert.deepStrictEqual(yield* values(t), [5, 6, 1, 2])
+        const g = yield* Tensor.gather(
+          x,
+          yield* Tensor.fromTypedArray(new Uint32Array([1, 0, 0, 1]), [2, 2]),
+          { dim: 1 }
+        )
+        assert.deepStrictEqual(yield* values(g), [2, 1, 3, 4])
+        const s = yield* Tensor.scatterAdd(
+          yield* Tensor.zeros([3, 2], { dtype: "f64" }),
+          yield* Tensor.fromTypedArray(new Uint32Array([1, 0, 0, 1, 1, 0]), [3, 2]),
+          yield* Tensor.fromTypedArray(new Float64Array([10, 20, 30, 40, 50, 60]), [3, 2]),
+          { dim: 1 }
+        )
+        assert.deepStrictEqual(yield* values(s), [20, 10, 30, 40, 60, 50])
+        const loss = yield* Tensor.sum(yield* Tensor.take(x, idx))
+        const [gradX] = yield* Gradient.grad(loss, [x])
+        assert.deepStrictEqual(yield* values(gradX), [1, 1, 0, 0, 1, 1])
+      })
+    )
+
     it.effect("flip", () =>
       Effect.gen(function* () {
         const x = yield* Tensor.fromTypedArray(new Float64Array([1, 2, 3, 4, 5, 6]), [2, 3])

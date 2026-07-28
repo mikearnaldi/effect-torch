@@ -2142,8 +2142,8 @@ export const pad = (
   })
 
 /**
- * Gathers rows (or slices along `dim`) by `i64` indexes: the inverse of
- * one-hot. `indexes` must be a 1-D `i64` tensor on the same device.
+ * Gathers rows (or slices along `dim`) by integer indexes: the inverse of
+ * one-hot. `indexes` must be a 1-D `i64` or `u32` tensor on the same device.
  * Differentiable: gradients scatter-add back into the input positions.
  *
  * @since 0.1.0
@@ -2169,8 +2169,8 @@ export const take: {
     Effect.try({
       try: () => {
         const d = normalizeDim("take", self.shape.length, options.dim ?? 0)
-        if (indexes.dtype !== "i64") {
-          throw new Error(`take: indexes must be i64, got ${indexes.dtype}`)
+        if (indexes.dtype !== "i64" && indexes.dtype !== "u32") {
+          throw new Error(`take: indexes must be i64 or u32, got ${indexes.dtype}`)
         }
         if (indexes.shape.length !== 1) {
           throw new Error(`take: indexes must be 1-D, got shape [${indexes.shape}]`)
@@ -2188,7 +2188,7 @@ export const take: {
 )
 
 /**
- * Gathers elements along `dim` at the given `i64` indexes, which must have
+ * Gathers elements along `dim` at the given integer indexes, which must have
  * the same rank as the input; the output shape is the indexes shape. This
  * is the general take-along-dim (unlike {@link take}, which selects whole
  * slices with a 1-D index).
@@ -2216,8 +2216,8 @@ export const gather: {
     Effect.try({
       try: () => {
         const d = normalizeDim("gather", self.shape.length, options.dim ?? 0)
-        if (indexes.dtype !== "i64") {
-          throw new Error(`gather: indexes must be i64, got ${indexes.dtype}`)
+        if (indexes.dtype !== "i64" && indexes.dtype !== "u32") {
+          throw new Error(`gather: indexes must be i64 or u32, got ${indexes.dtype}`)
         }
         if (indexes.shape.length !== self.shape.length) {
           throw new Error(
@@ -2244,7 +2244,7 @@ export const gather: {
 /**
  * Adds `src` into `self` at positions given by `indexes` along `dim`
  * (accumulating duplicates): the differentiable inverse of {@link gather}.
- * `indexes` must be `i64` with the same shape as `src`.
+ * `indexes` must be `i64` or `u32` with the same shape as `src`.
  *
  * @since 0.1.0
  * @category shape operations
@@ -2258,8 +2258,8 @@ export const scatterAdd = (
   Effect.try({
     try: () => {
       const d = normalizeDim("scatterAdd", self.shape.length, options.dim ?? 0)
-      if (indexes.dtype !== "i64") {
-        throw new Error(`scatterAdd: indexes must be i64, got ${indexes.dtype}`)
+      if (indexes.dtype !== "i64" && indexes.dtype !== "u32") {
+        throw new Error(`scatterAdd: indexes must be i64 or u32, got ${indexes.dtype}`)
       }
       if (indexes.shape.length !== src.shape.length || !indexes.shape.every((s, i) => s === src.shape[i])) {
         throw new Error(

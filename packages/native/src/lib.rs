@@ -812,9 +812,9 @@ impl Node {
                         a.shape.len()
                     ));
                 }
-                if indexes.dtype != DType::I64 {
+                if !matches!(indexes.dtype, DType::I64 | DType::U32) {
                     return Err(format!(
-                        "index_select: indexes must be i64, got {:?}",
+                        "index_select: indexes must be i64 or u32, got {:?}",
                         indexes.dtype
                     ));
                 }
@@ -840,9 +840,9 @@ impl Node {
                         a.shape.len()
                     ));
                 }
-                if indexes.dtype != DType::I64 {
+                if !matches!(indexes.dtype, DType::I64 | DType::U32) {
                     return Err(format!(
-                        "scatter_add: indexes must be i64, got {:?}",
+                        "scatter_add: indexes must be i64 or u32, got {:?}",
                         indexes.dtype
                     ));
                 }
@@ -867,8 +867,8 @@ impl Node {
                         a.shape.len()
                     ));
                 }
-                if indexes.dtype != DType::I64 {
-                    return Err(format!("gather: indexes must be i64, got {:?}", indexes.dtype));
+                if !matches!(indexes.dtype, DType::I64 | DType::U32) {
+                    return Err(format!("gather: indexes must be i64 or u32, got {:?}", indexes.dtype));
                 }
                 if indexes.shape.len() != a.shape.len() {
                     return Err(format!(
