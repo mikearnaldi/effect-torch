@@ -13,6 +13,94 @@ fn to_join_err(err: tokio::task::JoinError) -> Error {
     Error::new(Status::GenericFailure, err.to_string())
 }
 
+// u8 mask that is 1 where target == ignore_index. A negative ignore_index
+// can never match a u32 target, so u32 targets are all active in that case.
+fn cross_entropy_ignored_mask(target: &Tensor, ignore_index: i64) -> candle_core::Result<Tensor> {
+    match target.dtype() {
+        DType::I64 => target.eq(ignore_index),
+        DType::U32 => {
+            if ignore_index < 0 || ignore_index > u32::MAX as i64 {
+                target.zeros_like()
+            } else {
+                target.eq(ignore_index as u32)
+            }
+        }
+        dtype => Err(candle_core::Error::UnsupportedDTypeForOp(dtype, "cross_entropy").bt()),
+    }
+}
+
+fn cross_entropy_active_count(target: &Tensor, ignored: &Tensor) -> candle_core::Result<f64> {
+    let total = target.elem_count() as f64;
+    let ignored_count = ignored.to_dtype(DType::F64)?.sum_all()?.to_vec0::<f64>()?;
+    Ok(total - ignored_count)
+}
+
+fn cross_entropy_check_labels(target: &Tensor, ignored: &Tensor, classes: usize) -> candle_core::Result<()> {
+    let invalid = match target.dtype() {
+        DType::I64 => (target.lt(0i64)? + target.ge(classes as i64)?)?,
+        DType::U32 => target.ge(classes as u32)?,
+        dtype => {
+            return Err(candle_core::Error::UnsupportedDTypeForOp(dtype, "cross_entropy").bt())
+        }
+    };
+    let active = ignored.eq(&ignored.zeros_like()?)?;
+    let invalid_active = (invalid * active)?.to_dtype(DType::F64)?.sum_all()?.to_vec0::<f64>()?;
+    if invalid_active > 0.0 {
+        return Err(candle_core::Error::Msg(format!(
+            "cross_entropy: target out of range [0, {classes}) at an active position"
+        )));
+    }
+    Ok(())
+}
+
+fn cross_entropy_forward(logits: &Tensor, target: &Tensor, ignore_index: i64) -> candle_core::Result<Tensor> {
+    let rank = logits.rank();
+    let classes = logits.dim(rank - 1)?;
+    let ignored = cross_entropy_ignored_mask(target, ignore_index)?;
+    let count = cross_entropy_active_count(target, &ignored)?;
+    if count == 0.0 {
+        return Err(candle_core::Error::Msg(
+            "cross_entropy: no active targets (all positions are ignored)".to_string(),
+        ));
+    }
+    cross_entropy_check_labels(target, &ignored, classes)?;
+    let lse = logits.log_sum_exp(rank - 1)?;
+    // ignored positions may hold out-of-range values (e.g. -100); gather at 0
+    // there instead and mask the result below
+    let safe_target = ignored.where_cond(&target.zeros_like()?, target)?;
+    let picked = logits
+        .gather(&safe_target.unsqueeze(rank - 1)?.contiguous()?, rank - 1)?
+        .reshape(target.shape())?;
+    let per_position = (lse - picked)?;
+    let masked = ignored.where_cond(&per_position.zeros_like()?, &per_position)?;
+    (masked.sum_all()? * (1.0 / count))
+}
+
+fn cross_entropy_backward(logits: &Tensor, target: &Tensor, ignore_index: i64) -> candle_core::Result<Tensor> {
+    let rank = logits.rank();
+    let classes = logits.dim(rank - 1)?;
+    let ignored = cross_entropy_ignored_mask(target, ignore_index)?;
+    let count = cross_entropy_active_count(target, &ignored)?;
+    if count == 0.0 {
+        return Err(candle_core::Error::Msg(
+            "cross_entropy: no active targets (all positions are ignored)".to_string(),
+        ));
+    }
+    // p = softmax(logits) computed as exp(z - logsumexp(z))
+    let lse = logits.log_sum_exp(rank - 1)?.unsqueeze(rank - 1)?;
+    let probs = (logits - &lse.broadcast_as(logits.shape())?)?.exp()?;
+    // one-hot at the target positions, zeroed where ignored
+    let classes_ix = Tensor::arange(0u32, classes as u32, logits.device())?
+        .to_dtype(target.dtype())?
+        .broadcast_as(logits.shape())?;
+    let one_hot = target.unsqueeze(rank - 1)?.broadcast_as(logits.shape())?.eq(&classes_ix)?;
+    let ignored_b = ignored.unsqueeze(rank - 1)?.broadcast_as(one_hot.shape())?;
+    let one_hot = ignored_b.where_cond(&one_hot.zeros_like()?, &one_hot)?;
+    let grad = (probs - one_hot.to_dtype(logits.dtype())?)? * (1.0 / count);
+    let grad = grad?;
+    ignored_b.where_cond(&grad.zeros_like()?, &grad)
+}
+
 fn exported_buffers() -> &'static Mutex<HashSet<usize>> {
     static EXPORTED: OnceLock<Mutex<HashSet<usize>>> = OnceLock::new();
     EXPORTED.get_or_init(|| Mutex::new(HashSet::new()))
@@ -574,6 +662,16 @@ enum NodeKind {
         dim: usize,
         indexes: Arc<Node>,
     },
+    CrossEntropy {
+        logits: Arc<Node>,
+        target: Arc<Node>,
+        ignore_index: i64,
+    },
+    CrossEntropyBackward {
+        logits: Arc<Node>,
+        target: Arc<Node>,
+        ignore_index: i64,
+    },
     Reshape {
         a: Arc<Node>,
         shape: Vec<usize>,
@@ -886,6 +984,45 @@ impl Node {
                     }
                 }
                 (indexes.shape.clone(), a.dtype, a.device.clone())
+            }
+            NodeKind::CrossEntropy {
+                logits,
+                target,
+                ignore_index: _,
+            } => {
+                let rank = logits.shape.len();
+                if rank < 1 {
+                    return Err("cross_entropy: logits must have rank >= 1".to_string());
+                }
+                if logits.shape[rank - 1] == 0 {
+                    return Err("cross_entropy: class dimension must be non-empty".to_string());
+                }
+                if !matches!(logits.dtype, DType::F32 | DType::F64) {
+                    return Err(format!(
+                        "cross_entropy: logits must be f32 or f64, got {:?}",
+                        logits.dtype
+                    ));
+                }
+                if !matches!(target.dtype, DType::I64 | DType::U32) {
+                    return Err(format!(
+                        "cross_entropy: targets must be i64 or u32, got {:?}",
+                        target.dtype
+                    ));
+                }
+                if target.shape != logits.shape[..rank - 1] {
+                    return Err(format!(
+                        "cross_entropy: targets shape {:?} does not match logits leading shape {:?}",
+                        target.shape,
+                        &logits.shape[..rank - 1]
+                    ));
+                }
+                if !target.device.same_device(&logits.device) {
+                    return Err("cross_entropy: logits and targets must be on the same device".to_string());
+                }
+                (Vec::new(), logits.dtype, logits.device.clone())
+            }
+            NodeKind::CrossEntropyBackward { logits, .. } => {
+                (logits.shape.clone(), logits.dtype, logits.device.clone())
             }
             NodeKind::Cast { a, dtype } => (a.shape.clone(), *dtype, a.device.clone()),
             NodeKind::Sum { a, dims, keepdims }
@@ -1484,6 +1621,15 @@ impl LazyTensor {
     }
 
     #[napi]
+    pub fn cross_entropy(&self, target: &LazyTensor, ignore_index: i64) -> Result<Self> {
+        lazy_ctor!(Node::new(NodeKind::CrossEntropy {
+            logits: self.node.clone(),
+            target: target.node.clone(),
+            ignore_index,
+        }))
+    }
+
+    #[napi]
     pub fn log(&self) -> Result<Self> {
         lazy_ctor!(Node::new(NodeKind::Log {
             a: self.node.clone(),
@@ -1787,6 +1933,12 @@ fn node_children(kind: &NodeKind) -> Vec<Arc<Node>> {
         NodeKind::Where { cond, a, b } => vec![cond.clone(), a.clone(), b.clone()],
         NodeKind::IndexSelect { a, indexes, .. } => vec![a.clone(), indexes.clone()],
         NodeKind::Gather { a, indexes, .. } => vec![a.clone(), indexes.clone()],
+        NodeKind::CrossEntropy {
+            logits, target, ..
+        }
+        | NodeKind::CrossEntropyBackward {
+            logits, target, ..
+        } => vec![logits.clone(), target.clone()],
         NodeKind::ScatterAdd {
             a,
             indexes,
@@ -1921,6 +2073,24 @@ fn remap_children(kind: &NodeKind, f: &dyn Fn(&Arc<Node>) -> Arc<Node>) -> NodeK
             a: f(a),
             dim: *dim,
             indexes: f(indexes),
+        },
+        NodeKind::CrossEntropy {
+            logits,
+            target,
+            ignore_index,
+        } => NodeKind::CrossEntropy {
+            logits: f(logits),
+            target: f(target),
+            ignore_index: *ignore_index,
+        },
+        NodeKind::CrossEntropyBackward {
+            logits,
+            target,
+            ignore_index,
+        } => NodeKind::CrossEntropyBackward {
+            logits: f(logits),
+            target: f(target),
+            ignore_index: *ignore_index,
         },
         NodeKind::ScatterAdd {
             a,
@@ -2396,6 +2566,16 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> candle_core::Result<Te
             let indexes = ev.value(indexes.id)?;
             a.contiguous()?.gather(&indexes.contiguous()?, *dim)?
         }
+        NodeKind::CrossEntropy {
+            logits,
+            target,
+            ignore_index,
+        } => cross_entropy_forward(&ev.value(logits.id)?, &ev.value(target.id)?, *ignore_index)?,
+        NodeKind::CrossEntropyBackward {
+            logits,
+            target,
+            ignore_index,
+        } => cross_entropy_backward(&ev.value(logits.id)?, &ev.value(target.id)?, *ignore_index)?,
         NodeKind::Pow { a, exp } => ev.value(a.id)?.powf(*exp)?,
         NodeKind::Cast { a, dtype } => ev.value(a.id)?.to_dtype(*dtype)?,
         NodeKind::Sum { a, dims, keepdims } => {
@@ -2843,6 +3023,10 @@ mod autodiff {
             }
             NodeKind::Gather { .. } | NodeKind::ScatterAdd { .. } => Err(
                 "vmap: gather and scatterAdd are not supported under vmap".to_string(),
+            ),
+            NodeKind::CrossEntropy { .. } | NodeKind::CrossEntropyBackward { .. } => Err(
+                "vmap: crossEntropy uses data-dependent indexing and is not supported under vmap"
+                    .to_string(),
             ),
             _ => Ok(remap_children(&node.kind, f)),
         }
@@ -3395,6 +3579,24 @@ mod autodiff {
                     )?;
                 }
                 NodeKind::StopGradient { .. } => {}
+                NodeKind::CrossEntropy {
+                    logits,
+                    target,
+                    ignore_index,
+                } => {
+                    let gb = mk(NodeKind::CrossEntropyBackward {
+                        logits: logits.clone(),
+                        target: target.clone(),
+                        ignore_index: *ignore_index,
+                    })?;
+                    accumulate(logits, mul(g, gb))?;
+                }
+                NodeKind::CrossEntropyBackward { .. } => {
+                    return Err(
+                        "grad: cross-entropy backward nodes are not differentiable (no second-order)"
+                            .to_string(),
+                    );
+                }
                 NodeKind::AdamWStep { .. } | NodeKind::AdamWOut { .. } => {
                     return Err(
                         "grad: optimizer update nodes are not differentiable".to_string(),

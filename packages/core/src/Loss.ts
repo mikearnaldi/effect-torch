@@ -196,6 +196,8 @@ const checkClassTargets = (
 /**
  * Cross entropy between class logits and `i64` class-index targets:
  * `nll(logSoftmax(logits), targets)`. The class dimension is the last one.
+ * The default `mean` reduction delegates to the fused {@link Tensor.crossEntropy}
+ * kernel; `sum` and `none` use a composed log-softmax computation.
  *
  * @since 0.1.0
  * @category losses
@@ -208,6 +210,9 @@ export const crossEntropy = dualLoss<Tensor.GenericTensor, LossOptions, CurrentD
         op: "crossEntropy",
         message: `crossEntropy: logits must be f32 or f64, got ${logits.dtype}`
       })
+    }
+    if ((options?.reduction ?? "mean") === "mean") {
+      return yield* Tensor.crossEntropy(logits, { target: targets })
     }
     const oneHot = yield* Tensor.oneHot(targets, depth, { dtype: logits.dtype })
     const logProbs = yield* Tensor.logSoftmax(logits, { dims: [-1] })

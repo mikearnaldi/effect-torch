@@ -684,6 +684,111 @@ layer(Device.Cpu)("Tensor", (it) => {
       })
     )
 
+    it.effect("crossEntropy matches a stable JS reference and differentiates", () =>
+      Effect.gen(function* () {
+        const rows = [[1, 2, 3], [0.5, -1, 2]]
+        const targets = [2, 1]
+        const logits = yield* Tensor.fromTypedArray(new Float64Array(rows.flat()), [2, 3])
+        const target = yield* Tensor.fromTypedArray(new BigInt64Array(targets.map(BigInt)), [2])
+        const loss = yield* Tensor.crossEntropy(logits, { target })
+        const lse = (r: Array<number>) => {
+          const m = Math.max(...r)
+          return m + Math.log(r.reduce((acc, v) => acc + Math.exp(v - m), 0))
+        }
+        const expected = (lse(rows[0]) - rows[0][2] + lse(rows[1]) - rows[1][1]) / 2
+        const [lossValue] = yield* values(loss)
+        expect(Math.abs(lossValue - expected)).toBeLessThan(1e-9)
+        const [grad] = yield* Gradient.grad(loss, [logits])
+        const softmax = (r: Array<number>) => {
+          const m = Math.max(...r)
+          const e = r.map((v) => Math.exp(v - m))
+          const s = e.reduce((a, b) => a + b, 0)
+          return e.map((v) => v / s)
+        }
+        const expectedGrad = [
+          ...softmax(rows[0]).map((p, c) => (p - (c === 2 ? 1 : 0)) / 2),
+          ...softmax(rows[1]).map((p, c) => (p - (c === 1 ? 1 : 0)) / 2)
+        ]
+        const gradValues = yield* values(grad)
+        gradValues.forEach((g, i) => expect(Math.abs(g - expectedGrad[i])).toBeLessThan(1e-9))
+      })
+    )
+
+    it.effect("crossEntropy ignores positions matching ignoreIndex", () =>
+      Effect.gen(function* () {
+        const logits = yield* Tensor.fromTypedArray(new Float64Array([1, 2, 3, 0.5, -1, 2]), [2, 3])
+        const target = yield* Tensor.fromTypedArray(new BigInt64Array([2n, -100n]), [2])
+        const loss = yield* Tensor.crossEntropy(logits, { target })
+        const m = 3
+        const expected = m + Math.log(Math.exp(1 - m) + Math.exp(2 - m) + 1) - 3
+        const [lossValue] = yield* values(loss)
+        expect(Math.abs(lossValue - expected)).toBeLessThan(1e-9)
+        const [grad] = yield* Gradient.grad(loss, [logits])
+        const gradValues = yield* values(grad)
+        gradValues.slice(3).forEach((g) => expect(g).toBe(0))
+        expect(gradValues[0]).toBeGreaterThan(0)
+      })
+    )
+
+    it.effect("crossEntropy supports higher-rank logits and u32 targets", () =>
+      Effect.gen(function* () {
+        const logits = yield* Tensor.fromTypedArray(new Float64Array([1, 2, 3, 4, 5, 6, 7, 8]), [2, 2, 2])
+        const target = yield* Tensor.fromTypedArray(new Uint32Array([1, 0, 0, 1]), [2, 2])
+        const loss = yield* Tensor.crossEntropy(logits, { target })
+        const lse = (a: number, b: number) => {
+          const m = Math.max(a, b)
+          return m + Math.log(Math.exp(a - m) + Math.exp(b - m))
+        }
+        const expected = (lse(1, 2) - 2 + lse(3, 4) - 3 + lse(5, 6) - 5 + lse(7, 8) - 8) / 4
+        const [lossValue] = yield* values(loss)
+        expect(Math.abs(lossValue - expected)).toBeLessThan(1e-9)
+      })
+    )
+
+    it.effect("crossEntropy stays finite for large-magnitude logits", () =>
+      Effect.gen(function* () {
+        const logits = yield* Tensor.fromTypedArray(new Float64Array([1e4, 1e4 + 1, 1e4 - 1]), [1, 3])
+        const target = yield* Tensor.fromTypedArray(new BigInt64Array([0n]), [1])
+        const loss = yield* Tensor.crossEntropy(logits, { target })
+        const [lossValue] = yield* values(loss)
+        expect(Number.isFinite(lossValue)).toBe(true)
+        const expected = Math.log(1 + Math.exp(1) + Math.exp(-1))
+        expect(Math.abs(lossValue - expected)).toBeLessThan(1e-6)
+        const [grad] = yield* Gradient.grad(loss, [logits])
+        ;(yield* values(grad)).forEach((g) => expect(Number.isFinite(g)).toBe(true))
+      })
+    )
+
+    it.effect("crossEntropy fails at evaluation on an empty active set or out-of-range target", () =>
+      Effect.gen(function* () {
+        const logits = yield* Tensor.fromTypedArray(new Float64Array([1, 2, 3, 4, 5, 6]), [2, 3])
+        const allIgnored = yield* Tensor.crossEntropy(logits, {
+          target: yield* Tensor.fromTypedArray(new BigInt64Array([-100n, -100n]), [2])
+        })
+        const emptyError = yield* Effect.flip(Tensor.toTypedArray(allIgnored))
+        expect(emptyError.message).toContain("no active targets")
+        const outOfRange = yield* Tensor.crossEntropy(logits, {
+          target: yield* Tensor.fromTypedArray(new BigInt64Array([5n, 0n]), [2])
+        })
+        const rangeError = yield* Effect.flip(Tensor.toTypedArray(outOfRange))
+        expect(rangeError.message).toContain("out of range")
+      })
+    )
+
+    it.effect("crossEntropy validates its arguments at construction", () =>
+      Effect.gen(function* () {
+        const logits = yield* Tensor.fromTypedArray(new Float64Array([1, 2, 3, 4, 5, 6]), [2, 3])
+        const badShape = yield* Effect.flip(Tensor.crossEntropy(logits, {
+          target: yield* Tensor.fromTypedArray(new BigInt64Array([0n, 1n, 2n]), [3])
+        }))
+        assert.deepStrictEqual(badShape.op, "crossEntropy")
+        const badDtype = yield* Effect.flip(Tensor.crossEntropy(logits, {
+          target: yield* Tensor.fromTypedArray(new Float64Array([0, 1]), [2])
+        }))
+        assert.deepStrictEqual(badDtype.op, "crossEntropy")
+      })
+    )
+
     it.effect("flip", () =>
       Effect.gen(function* () {
         const x = yield* Tensor.fromTypedArray(new Float64Array([1, 2, 3, 4, 5, 6]), [2, 3])

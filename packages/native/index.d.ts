@@ -50,6 +50,7 @@ export declare class LazyTensor {
   indexSelect(dim: number, indexes: LazyTensor): LazyTensor
   scatterAdd(dim: number, indexes: LazyTensor, src: LazyTensor): LazyTensor
   gather(dim: number, indexes: LazyTensor): LazyTensor
+  crossEntropy(target: LazyTensor, ignoreIndex: number): LazyTensor
   log(): LazyTensor
   sin(): LazyTensor
   cos(): LazyTensor

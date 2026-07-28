@@ -2335,6 +2335,64 @@ export const oneHot = (
   })
 
 /**
+ * Fused cross entropy between class logits of shape `[..., classes]` and
+ * integer class-index targets of the leading shape: the scalar mean of
+ * `logsumexp(logits) - logits[target]` over active positions, computed
+ * stably (max subtraction) without materializing softmax intermediates or a
+ * one-hot tensor in the graph. Positions where the target equals
+ * `ignoreIndex` (default `-100`) contribute zero loss and zero gradient and
+ * are excluded from the mean. Evaluation fails when every position is
+ * ignored or an active target is out of range. The fused backward node is
+ * not second-order differentiable.
+ *
+ * @since 0.1.0
+ * @category losses
+ */
+export const crossEntropy: {
+  (
+    options: { readonly target: GenericTensor; readonly ignoreIndex?: number }
+  ): (self: GenericTensor) => Effect.Effect<LazyTensor, TensorError>
+  (
+    self: GenericTensor,
+    options: { readonly target: GenericTensor; readonly ignoreIndex?: number }
+  ): Effect.Effect<LazyTensor, TensorError>
+} = dual(2, (
+  self: GenericTensor,
+  options: { readonly target: GenericTensor; readonly ignoreIndex?: number }
+): Effect.Effect<LazyTensor, TensorError> =>
+  Effect.try({
+    try: () => {
+      const { target } = options
+      const ignoreIndex = options.ignoreIndex ?? -100
+      if (self.shape.length < 1) {
+        throw new Error("crossEntropy: logits must have rank >= 1")
+      }
+      if (self.dtype !== "f32" && self.dtype !== "f64") {
+        throw new Error(`crossEntropy: logits must be f32 or f64, got ${self.dtype}`)
+      }
+      if (target.dtype !== "i64" && target.dtype !== "u32") {
+        throw new Error(`crossEntropy: targets must be i64 or u32, got ${target.dtype}`)
+      }
+      const leading = self.shape.slice(0, -1)
+      if (target.shape.length !== leading.length || !leading.every((d, i) => d === target.shape[i])) {
+        throw new Error(
+          `crossEntropy: targets shape [${target.shape}] does not match logits leading shape [${leading}]`
+        )
+      }
+      if (!Number.isInteger(ignoreIndex)) {
+        throw new Error(`crossEntropy: ignoreIndex must be an integer, got ${ignoreIndex}`)
+      }
+      if (target.device !== self.device) {
+        throw new Error(`crossEntropy: device mismatch, got ${target.device} and ${self.device}`)
+      }
+      return makeLazy(self.lazy.crossEntropy(target.lazy, ignoreIndex), [], self.dtype, self.device)
+    },
+    catch: (error) =>
+      new TensorError({ op: "crossEntropy", message: error instanceof Error ? error.message : String(error) })
+  })
+)
+
+/**
  * Embedding lookup: selects rows from a `[vocab, hidden]` weight matrix by
  * integer indexes of any shape, giving output shape `[...indexes.shape,
  * hidden]`. Repeated indexes accumulate weight gradients. With
