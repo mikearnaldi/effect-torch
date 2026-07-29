@@ -1,6 +1,7 @@
 export * as Device from "./Device.ts"
 export * as Gradient from "./Gradient.ts"
 export * as Loss from "./Loss.ts"
+export * as Model from "./Model.ts"
 export * as Optimizer from "./Optimizer.ts"
 export * as LearningRate from "./LearningRate.ts"
 export * as Tensor from "./Tensor.ts"

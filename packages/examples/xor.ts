@@ -1,6 +1,6 @@
 import { Data, Effect } from "effect"
 import { NodeRuntime } from "@effect/platform-node"
-import { Device, Loss, Optimizer, Tensor } from "@effect-torch/core"
+import { Device, Loss, Model, Optimizer, Tensor } from "@effect-torch/core"
 
 class MispredictionError extends Data.TaggedError("MispredictionError")<{
   readonly input: readonly [number, number]
@@ -16,71 +16,62 @@ const HIDDEN = 8
 const STEPS = 3000
 const LR = 0.1
 
-type Params = readonly [
-  w1: Tensor.GenericTensor,
-  b1: Tensor.GenericTensor,
-  w2: Tensor.GenericTensor,
-  b2: Tensor.GenericTensor
-]
+const program = Effect.gen(function* () {
+  const device = yield* Device.CurrentDevice
+  const x = yield* Tensor.fromTypedArray(new Float32Array([0, 0, 0, 1, 1, 0, 1, 1]), [4, 2])
+  const y = yield* Tensor.fromTypedArray(new Float32Array([0, 1, 1, 0]), [4, 1])
 
-// A 2 -> HIDDEN (tanh) -> 1 (sigmoid) MLP. `x` is a batch of rows, so any
-// batch size works — including a single input of shape [1, 2].
-const forward = ([w1, b1, w2, b2]: Params, x: Tensor.GenericTensor) =>
-  Effect.gen(function* () {
-    const h = yield* Tensor.tanh(yield* Tensor.add(yield* Tensor.matmul(x, w1), b1))
-    return yield* Tensor.sigmoid(yield* Tensor.add(yield* Tensor.matmul(h, w2), b2))
-  })
-
-// 1) model creation: randomly initialized parameters, materialized once so
-// they become plain leaves of every later graph
-const createModel: Effect.Effect<Params, Tensor.TensorError, Device.CurrentDevice> = Effect.gen(
-  function* () {
-    const [w1, w2] = yield* Tensor.evaluate([
-      yield* Tensor.randn([2, HIDDEN]),
-      yield* Tensor.randn([HIDDEN, 1])
-    ])
-    const [b1, b2] = yield* Tensor.evaluate([
-      yield* Tensor.zeros([1, HIDDEN]),
-      yield* Tensor.zeros([1, 1])
-    ])
-    for (const [name, t] of [["w1", w1], ["b1", b1], ["w2", w2], ["b2", b2]] as const) {
-      yield* Effect.log(`  ${name} [${t.shape}] ${t.dtype} initialized`)
-    }
-    return [w1, b1, w2, b2]
+  // A 2 -> HIDDEN (tanh) -> 1 (sigmoid) MLP, composed from primitive models.
+  // `Model.Params<typeof model>` computes the parameter tuple at the type
+  // level: readonly [fc1.weight, fc1.bias, fc2.weight, fc2.bias].
+  yield* Effect.log(`1) creating model: 2 -> ${HIDDEN} (tanh) -> 1 (sigmoid) on ${device}`)
+  const model = yield* Model.chain(
+    yield* Model.linear("fc1", 2, HIDDEN),
+    yield* Model.tanh,
+    yield* Model.linear("fc2", HIDDEN, 1),
+    yield* Model.sigmoid
+  )
+  const params = yield* Tensor.evaluate(yield* model.init)
+  for (const [i, name] of model.names.entries()) {
+    yield* Effect.log(`  ${name} [${params[i].shape}] ${params[i].dtype} initialized`)
   }
-)
 
-// 2) model training: full-batch Adam on the MSE loss, one graph walk per step
-const train = (params: Params, x: Tensor.GenericTensor, y: Tensor.GenericTensor) =>
-  Effect.gen(function* () {
-    const optimizer = Optimizer.adam({ lr: LR })
-    let current = params
-    let state = yield* optimizer.init(current)
-    for (let i = 1; i <= STEPS; i++) {
-      const loss = yield* Loss.mse(yield* forward(current, x), y)
-      const result = yield* Optimizer.step(optimizer, loss, current, state)
-      const [value] = yield* Tensor.toNumberArray(result.loss)
-      if (i % 250 === 0) {
-        const mem = process.memoryUsage()
-        yield* Effect.log(
-          `step ${String(i).padStart(4)}  loss ${value.toFixed(6)}  rss ${(mem.rss / 1e6).toFixed(0)}MB  ext ${(mem.external / 1e6).toFixed(1)}MB  heap ${(mem.heapUsed / 1e6).toFixed(0)}MB`
-        )
-      }
-      current = result.params
-      state = result.state
-    }
-    return current
+  // Full-batch Adam on the MSE loss, one graph walk per step
+  yield* Effect.log(`2) training: adam lr=${LR}, ${STEPS} steps`)
+  const trained = yield* Model.train(model, {
+    optimizer: Optimizer.adam({ lr: LR }),
+    loss: Loss.mse,
+    data: { input: x, target: y },
+    stop: ({ loss }) => loss < 1e-6,
+    params,
+    onStep: ({ step, loss }) =>
+      Effect.gen(function* () {
+        if (step % 250 === 0) {
+          const mem = process.memoryUsage()
+          yield* Effect.log(
+            `step ${String(step).padStart(4)}  loss ${loss.toFixed(6)}  rss ${(mem.rss / 1e6).toFixed(0)}MB  ext ${(mem.external / 1e6).toFixed(1)}MB  heap ${(mem.heapUsed / 1e6).toFixed(0)}MB`
+          )
+        }
+      })
   })
 
-// 3) model evaluation: one forward pass per input, failing on the first
-// misprediction
-const evaluate = (params: Params, x: Tensor.GenericTensor, y: Tensor.GenericTensor) =>
+  yield* Effect.log("3) evaluating")
+  yield* evaluate(model, trained.params, x, y)
+})
+
+// One forward pass per input, failing on the first misprediction
+const evaluate = <P extends ReadonlyArray<Tensor.GenericTensor>>(
+  model: Model.Model<P>,
+  params: P,
+  x: Tensor.GenericTensor,
+  y: Tensor.GenericTensor
+) =>
   Effect.gen(function* () {
     const inputs = yield* Tensor.toNumberArray(x)
     const targets = yield* Tensor.toNumberArray(y)
     for (let i = 0; i < targets.length; i++) {
       const single = yield* Tensor.fromTypedArray(new Float32Array([inputs[i * 2], inputs[i * 2 + 1]]), [1, 2])
-      const [pred] = yield* Tensor.evaluate([yield* forward(params, single)])
+      const [pred] = yield* Tensor.evaluate([yield* model.forward(params, single)])
       const [value] = yield* Tensor.toNumberArray(pred)
       const rounded = value > 0.5 ? 1 : 0
       const ok = rounded === targets[i]
@@ -97,20 +88,5 @@ const evaluate = (params: Params, x: Tensor.GenericTensor, y: Tensor.GenericTens
     }
     yield* Effect.log(`${targets.length}/${targets.length} correct`)
   })
-
-const program = Effect.gen(function* () {
-  const device = yield* Device.CurrentDevice
-  const x = yield* Tensor.fromTypedArray(new Float32Array([0, 0, 0, 1, 1, 0, 1, 1]), [4, 2])
-  const y = yield* Tensor.fromTypedArray(new Float32Array([0, 1, 1, 0]), [4, 1])
-
-  yield* Effect.log(`1) creating model: 2 -> ${HIDDEN} (tanh) -> 1 (sigmoid) on ${device}`)
-  const params = yield* createModel
-
-  yield* Effect.log(`2) training: adam lr=${LR}, ${STEPS} steps`)
-  const trained = yield* train(params, x, y)
-
-  yield* Effect.log("3) evaluating")
-  yield* evaluate(trained, x, y)
-})
 
 NodeRuntime.runMain(program.pipe(Effect.provide(Device.Best)))

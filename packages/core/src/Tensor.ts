@@ -3208,21 +3208,21 @@ const fromNative = <A>(
  * gradients: the loss and its gradients share the forward graph, so they
  * must be evaluated together to be consistent. Interrupting the fiber
  * aborts the native evaluation. Already materialized roots are returned
- * as-is.
+ * as-is. A tuple in gives the same tuple out, each element materialized.
  *
  * @since 0.1.0
  * @category destructors
  */
-export const evaluate = (
-  roots: ReadonlyArray<GenericTensor>
-): Effect.Effect<Array<Tensor>, TensorError> =>
+export const evaluate = <Roots extends ReadonlyArray<GenericTensor>>(
+  roots: Roots
+): Effect.Effect<{ readonly [K in keyof Roots]: Tensor }, TensorError> =>
   roots.every(isTensor)
-    ? Effect.succeed(roots as Array<Tensor>)
+    ? Effect.succeed(roots as { readonly [K in keyof Roots]: Tensor })
     : Effect.map(
         fromNative("evaluate", (token) => evalLazy(roots.map((root) => root.lazy), token)),
         (handles) => {
           reportExternalMemory(handles.reduce((total, handle) => total + handle.bytes, 0))
-          return handles.map(fromHandle)
+          return handles.map(fromHandle) as { readonly [K in keyof Roots]: Tensor }
         }
       )
 

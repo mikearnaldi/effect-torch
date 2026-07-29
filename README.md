@@ -315,6 +315,45 @@ const trained = Effect.gen(function* () {
 })
 ```
 
+### `Model`
+
+Models are pure values pairing parameter construction with a parameterised
+forward graph — the Flax/Haiku design, flattened: parameters are a plain
+tuple of tensors, so `Gradient.grad` and `Optimizer.step` work on any
+model with zero adapter code. There is no mutable module state. Everything
+that can fail returns an `Effect`: constructors validate into a
+`ModelError`, and `Model.train` runs the full training loop.
+
+| Export | Description |
+| --- | --- |
+| `Model.linear(name, in, out)` | `Effect` of a fully-connected layer, `randn * 1/√in` weight, zero bias |
+| `Model.tanh` / `Model.sigmoid` / `Model.relu` | `Effect`s of activations as parameterless models |
+| `Model.chain(...models)` | `Effect` of sequential composition; parameter tuple computed at the type level |
+| `Model.train(model, { optimizer, loss, data, stop, params?, onStep? })` | the training loop: init → forward → loss → grad → update, one walk per step; `stop: (info) => boolean` ends it (step count, loss target, anything) |
+| `Model.Params<typeof model>` | extracts a model's parameter tuple type |
+| `Model.save(model, params, path)` / `Model.load(model, path)` | named checkpoints via safetensors |
+
+```ts
+const program = Effect.gen(function* () {
+  const model = yield* Model.chain(
+    yield* Model.linear("fc1", 2, 8),
+    yield* Model.tanh,
+    yield* Model.linear("fc2", 8, 1),
+    yield* Model.sigmoid
+  )
+  // Model.Params<typeof model> = readonly [fc1.weight, fc1.bias, fc2.weight, fc2.bias]
+
+  const trained = yield* Model.train(model, {
+    optimizer: Optimizer.adam({ lr: 0.1 }),
+    loss: Loss.mse,
+    data: { input: x, target: y },
+    stop: ({ step, loss }) => step >= 3000 || loss < 1e-4,
+    onStep: ({ step, loss }) => (step % 250 === 0 ? Effect.log(`step ${step} loss ${loss}`) : Effect.void)
+  })
+  // trained.params: materialized leaves, ready for forward / save / more training
+})
+```
+
 Errors are typed: every operation fails with `TensorError` (shape, dtype, or
 device mismatch at graph-build time; backend errors at evaluation time).
 Interruption is structured: interrupting the fiber running `evaluate` or
