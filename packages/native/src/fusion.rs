@@ -624,9 +624,9 @@ pub fn is_supported(device: &Device, dtype: DType) -> bool {
         Device::Metal(_) => dtype == DType::F32,
         #[cfg(not(target_os = "macos"))]
         Device::Metal(_) => false,
-        #[cfg(feature = "cuda")]
-        Device::Cuda(_) => dtype == DType::F32,
-        #[cfg(not(feature = "cuda"))]
+        // CUDA is disabled until the ug-cuda path can be tested on real
+        // hardware; the region pass treats these nodes as unfusable and
+        // they keep their composed candle-op eval.
         Device::Cuda(_) => false,
     }
 }
