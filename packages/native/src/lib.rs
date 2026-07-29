@@ -4839,6 +4839,9 @@ fn fuse_roots(roots: &[Arc<Node>]) -> std::result::Result<Vec<Arc<Node>>, String
     enum OpT {
         Unary(Box<dyn Fn(E) -> E>),
         Binary(Box<dyn Fn(E, E) -> E>),
+        // where(cmp(x, y), a, b): the comparison constructor, applied to
+        // the comparison's two inputs. Logical children are [x, y, a, b].
+        Select(Box<dyn Fn(E, E) -> E>),
     }
     // An input qualifies when it matches the output shape exactly, or is a
     // uniform constant that folds into the IR (scalar or output-shaped).
@@ -4892,6 +4895,56 @@ fn fuse_roots(roots: &[Arc<Node>]) -> std::result::Result<Vec<Arc<Node>>, String
             NodeKind::Pow { exp, .. } => {
                 let exp = *exp;
                 Some(OpT::Unary(Box::new(move |a| fusion::pow_expr(a, exp))))
+            }
+            // where(cond, a, b) fuses only when cond is a comparison with
+            // no other consumer: the comparison lowers to a float mask
+            // feeding a true select, so the u8 mask never materializes.
+            // A cond shared with another consumer must stay a real u8
+            // tensor, which a float region cannot produce.
+            NodeKind::Where { cond, a, b }
+                if consumers.get(&cond.id).copied().unwrap_or(0) == 1
+                    && input_ok(a, &node.shape)
+                    && input_ok(b, &node.shape) =>
+            {
+                let cmp: Option<Box<dyn Fn(E, E) -> E>> = match &cond.kind {
+                    NodeKind::Eq { a: x, b: y }
+                        if input_ok(x, &node.shape)
+                            && input_ok(y, &node.shape)
+                            && fusion::is_supported(&x.device, x.dtype) =>
+                    {
+                        Some(Box::new(|a, b| E::Eq(Box::new(a), Box::new(b))))
+                    }
+                    NodeKind::Gt { a: x, b: y }
+                        if input_ok(x, &node.shape)
+                            && input_ok(y, &node.shape)
+                            && fusion::is_supported(&x.device, x.dtype) =>
+                    {
+                        Some(Box::new(|a, b| E::Gt(Box::new(a), Box::new(b))))
+                    }
+                    NodeKind::Lt { a: x, b: y }
+                        if input_ok(x, &node.shape)
+                            && input_ok(y, &node.shape)
+                            && fusion::is_supported(&x.device, x.dtype) =>
+                    {
+                        Some(Box::new(|a, b| E::Lt(Box::new(a), Box::new(b))))
+                    }
+                    NodeKind::Ge { a: x, b: y }
+                        if input_ok(x, &node.shape)
+                            && input_ok(y, &node.shape)
+                            && fusion::is_supported(&x.device, x.dtype) =>
+                    {
+                        Some(Box::new(|a, b| E::Ge(Box::new(a), Box::new(b))))
+                    }
+                    NodeKind::Le { a: x, b: y }
+                        if input_ok(x, &node.shape)
+                            && input_ok(y, &node.shape)
+                            && fusion::is_supported(&x.device, x.dtype) =>
+                    {
+                        Some(Box::new(|a, b| E::Le(Box::new(a), Box::new(b))))
+                    }
+                    _ => None,
+                };
+                cmp.map(OpT::Select)
             }
             _ => None,
         }
@@ -5010,6 +5063,82 @@ fn fuse_roots(roots: &[Arc<Node>]) -> std::result::Result<Vec<Arc<Node>>, String
                 region.expr = expr;
                 region.ops += 1;
                 open.insert(node.id, region);
+            }
+            Some(OpT::Select(cmpf)) => {
+                let (ca, cb, a, b) = match &node.kind {
+                    NodeKind::Where { cond, a, b } => match &cond.kind {
+                        NodeKind::Eq { a: x, b: y }
+                        | NodeKind::Gt { a: x, b: y }
+                        | NodeKind::Lt { a: x, b: y }
+                        | NodeKind::Ge { a: x, b: y }
+                        | NodeKind::Le { a: x, b: y } => (x, y, a, b),
+                        _ => unreachable!("fusion: select guard"),
+                    },
+                    _ => unreachable!("fusion: select guard"),
+                };
+                // Fold the four logical children into one region. The
+                // comparison's inputs never have open regions (the
+                // non-fusable comparison closed them when it was visited);
+                // the branches may. On lane-cap overflow with nothing left
+                // to give, abandon: dropped regions are still covered by
+                // the original subgraphs, and the node rebuilds plain.
+                let logical: [&Arc<Node>; 4] = [ca, cb, a, b];
+                let mut region = Region::empty();
+                let mut exprs: Vec<E> = Vec::with_capacity(4);
+                let mut abandon = false;
+                for child in logical {
+                    if abandon {
+                        break;
+                    }
+                    if let Some(r) = open.remove(&child.id) {
+                        if region.inputs.len() + r.inputs.len() > MAX_LANES {
+                            emit_region(child.id, r, &child.kind, &mut map)?;
+                            let resolved = map.get(&child.id).cloned().unwrap();
+                            if region.inputs.len() >= MAX_LANES
+                                && !region.lane_of.contains_key(&resolved.id)
+                            {
+                                abandon = true;
+                            } else {
+                                exprs.push(region.lane(&resolved));
+                            }
+                        } else {
+                            exprs.push(region.absorb(r));
+                        }
+                    } else if let Some(v) = const_value(child, &node.shape) {
+                        exprs.push(E::cst(v));
+                    } else {
+                        let resolved =
+                            map.get(&child.id).cloned().unwrap_or_else(|| child.clone());
+                        if region.inputs.len() >= MAX_LANES
+                            && !region.lane_of.contains_key(&resolved.id)
+                        {
+                            abandon = true;
+                        } else {
+                            exprs.push(region.lane(&resolved));
+                        }
+                    }
+                }
+                if abandon {
+                    let rebuilt = remap_children(&node.kind, &|ch| {
+                        map.get(&ch.id).cloned().unwrap_or_else(|| ch.clone())
+                    });
+                    map.insert(node.id, Node::new(rebuilt)?);
+                } else {
+                    let mut it = exprs.into_iter();
+                    let (e0, e1, e2, e3) = (
+                        it.next().unwrap(),
+                        it.next().unwrap(),
+                        it.next().unwrap(),
+                        it.next().unwrap(),
+                    );
+                    region.expr = E::Select(
+                        Box::new(cmpf(e0, e1)),
+                        Box::new(e2),
+                        Box::new(e3),
+                    );
+                    region.ops += 1;
+                    open.insert(node.id, region);
+                }
             }
             Some(OpT::Binary(f)) => {
                 let a = children[0].clone();

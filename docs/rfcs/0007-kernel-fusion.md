@@ -4,13 +4,18 @@
 
 **Implementation notes (updated)**: the elementwise op set covers
 `Add/Sub/Mul/Div/Min/Max/Neg/Sqrt/Exp/Log/Sin/Cos/Tanh/Abs/Erf/Floor/Ceil/Round`
-plus constant-exponent `Pow` (small exponents lower to multiplies/sqrt).
-`Log/Tanh/Abs/Floor/Ceil/Round/Pow` required extending `ug` itself —
-`ug`, `ug-metal`, and `ug-cuda` are patched to the `mikearnaldi/ug` fork,
-which lowers them to the platform math library (`Erf` stays an
+plus constant-exponent `Pow` (small exponents lower to multiplies/sqrt)
+and `where(cmp, a, b)`: a comparison with a single consumer lowers to a
+float mask feeding a true `select` ternary (an arithmetic mask would
+propagate NaN from the unselected side — klDiv relies on masking
+`log(0)`). `Log/Tanh/Abs/Floor/Ceil/Round/Pow`, the six comparisons, and
+`Select` required extending `ug` itself — `ug`, `ug-metal`, and `ug-cuda`
+are patched to the `mikearnaldi/ug` fork (`Erf` stays an
 Abramowitz–Stegun expansion; Metal has no `erf`). Regions are capped at
 30 input lanes (Metal allows 31 buffer arguments per kernel; one slot is
 the output) — overflow materializes the region and starts a new one.
+CUDA fusion is disabled until the `ug-cuda` path can be tested on real
+hardware.
 - **Author**: Michael Arnaldi
 - **Date**: 2026-07-28
 - **Depends on**: RFC 0004 (optimizers — the fused update nodes this replaces

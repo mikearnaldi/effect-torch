@@ -19,9 +19,9 @@ libm = "0.2"
 # cuda, and cpu codegens. candle-core depends on ug/ug-metal/ug-cuda too,
 # so all three crates are patched to the same rev.
 [patch.crates-io]
-ug = { git = "https://github.com/mikearnaldi/ug", rev = "11d427f18a438ffb70d3337f1a430333d3a2c294" }
-ug-metal = { git = "https://github.com/mikearnaldi/ug", rev = "11d427f18a438ffb70d3337f1a430333d3a2c294" }
-ug-cuda = { git = "https://github.com/mikearnaldi/ug", rev = "11d427f18a438ffb70d3337f1a430333d3a2c294" }
+ug = { git = "https://github.com/mikearnaldi/ug", rev = "4ab08865e2e9c31b1b81a132085945b50b4587b7" }
+ug-metal = { git = "https://github.com/mikearnaldi/ug", rev = "4ab08865e2e9c31b1b81a132085945b50b4587b7" }
+ug-cuda = { git = "https://github.com/mikearnaldi/ug", rev = "4ab08865e2e9c31b1b81a132085945b50b4587b7" }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 candle-core = { git = "https://github.com/mikearnaldi/candle", rev = "3403a5a82cc5f72e906d87de43c2609651f1c1ab", features = ["metal", "accelerate", "ug"] }

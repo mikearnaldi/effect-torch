@@ -29,6 +29,16 @@ pub enum Expr {
     Div(Box<Expr>, Box<Expr>),
     Min(Box<Expr>, Box<Expr>),
     Max(Box<Expr>, Box<Expr>),
+    // Comparisons yield 1.0 / 0.0; they exist to feed Select.
+    Lt(Box<Expr>, Box<Expr>),
+    Le(Box<Expr>, Box<Expr>),
+    Gt(Box<Expr>, Box<Expr>),
+    Ge(Box<Expr>, Box<Expr>),
+    Eq(Box<Expr>, Box<Expr>),
+    Ne(Box<Expr>, Box<Expr>),
+    // cond != 0 ? lhs : rhs — a true select that does not propagate NaN
+    // from the unselected side (unlike an arithmetic mask).
+    Select(Box<Expr>, Box<Expr>, Box<Expr>),
     Neg(Box<Expr>),
     Sqrt(Box<Expr>),
     Exp(Box<Expr>),
@@ -85,6 +95,17 @@ impl Expr {
             Expr::Div(a, b) => Expr::Div(Box::new(a.shift_inputs(base)), Box::new(b.shift_inputs(base))),
             Expr::Min(a, b) => Expr::Min(Box::new(a.shift_inputs(base)), Box::new(b.shift_inputs(base))),
             Expr::Max(a, b) => Expr::Max(Box::new(a.shift_inputs(base)), Box::new(b.shift_inputs(base))),
+            Expr::Lt(a, b) => Expr::Lt(Box::new(a.shift_inputs(base)), Box::new(b.shift_inputs(base))),
+            Expr::Le(a, b) => Expr::Le(Box::new(a.shift_inputs(base)), Box::new(b.shift_inputs(base))),
+            Expr::Gt(a, b) => Expr::Gt(Box::new(a.shift_inputs(base)), Box::new(b.shift_inputs(base))),
+            Expr::Ge(a, b) => Expr::Ge(Box::new(a.shift_inputs(base)), Box::new(b.shift_inputs(base))),
+            Expr::Eq(a, b) => Expr::Eq(Box::new(a.shift_inputs(base)), Box::new(b.shift_inputs(base))),
+            Expr::Ne(a, b) => Expr::Ne(Box::new(a.shift_inputs(base)), Box::new(b.shift_inputs(base))),
+            Expr::Select(c, a, b) => Expr::Select(
+                Box::new(c.shift_inputs(base)),
+                Box::new(a.shift_inputs(base)),
+                Box::new(b.shift_inputs(base)),
+            ),
             Expr::Neg(a) => Expr::Neg(Box::new(a.shift_inputs(base))),
             Expr::Sqrt(a) => Expr::Sqrt(Box::new(a.shift_inputs(base))),
             Expr::Exp(a) => Expr::Exp(Box::new(a.shift_inputs(base))),
@@ -124,6 +145,13 @@ pub trait Scalar: Copy {
     fn round(self) -> Self;
     fn powf(self, e: f64) -> Self;
     fn erf(self) -> Self;
+    fn pick(cond: Self, lhs: Self, rhs: Self) -> Self;
+    fn lt(self, o: Self) -> Self;
+    fn le(self, o: Self) -> Self;
+    fn gt(self, o: Self) -> Self;
+    fn ge(self, o: Self) -> Self;
+    fn eq(self, o: Self) -> Self;
+    fn ne(self, o: Self) -> Self;
 }
 
 macro_rules! impl_scalar {
@@ -189,6 +217,27 @@ macro_rules! impl_scalar {
             fn erf(self) -> Self {
                 $erf(self)
             }
+            fn pick(cond: Self, lhs: Self, rhs: Self) -> Self {
+                if cond != 0.0 as $ty { lhs } else { rhs }
+            }
+            fn lt(self, o: Self) -> Self {
+                if self < o { 1.0 as $ty } else { 0.0 as $ty }
+            }
+            fn le(self, o: Self) -> Self {
+                if self <= o { 1.0 as $ty } else { 0.0 as $ty }
+            }
+            fn gt(self, o: Self) -> Self {
+                if self > o { 1.0 as $ty } else { 0.0 as $ty }
+            }
+            fn ge(self, o: Self) -> Self {
+                if self >= o { 1.0 as $ty } else { 0.0 as $ty }
+            }
+            fn eq(self, o: Self) -> Self {
+                if self == o { 1.0 as $ty } else { 0.0 as $ty }
+            }
+            fn ne(self, o: Self) -> Self {
+                if self != o { 1.0 as $ty } else { 0.0 as $ty }
+            }
         }
     };
 }
@@ -206,6 +255,17 @@ fn eval_at<T: Scalar>(e: &Expr, i: usize, inputs: &[&[T]], scalars: &[T]) -> T {
         Expr::Div(a, b) => eval_at(a, i, inputs, scalars).div(eval_at(b, i, inputs, scalars)),
         Expr::Min(a, b) => eval_at(a, i, inputs, scalars).min(eval_at(b, i, inputs, scalars)),
         Expr::Max(a, b) => eval_at(a, i, inputs, scalars).max(eval_at(b, i, inputs, scalars)),
+        Expr::Lt(a, b) => eval_at(a, i, inputs, scalars).lt(eval_at(b, i, inputs, scalars)),
+        Expr::Le(a, b) => eval_at(a, i, inputs, scalars).le(eval_at(b, i, inputs, scalars)),
+        Expr::Gt(a, b) => eval_at(a, i, inputs, scalars).gt(eval_at(b, i, inputs, scalars)),
+        Expr::Ge(a, b) => eval_at(a, i, inputs, scalars).ge(eval_at(b, i, inputs, scalars)),
+        Expr::Eq(a, b) => eval_at(a, i, inputs, scalars).eq(eval_at(b, i, inputs, scalars)),
+        Expr::Ne(a, b) => eval_at(a, i, inputs, scalars).ne(eval_at(b, i, inputs, scalars)),
+        Expr::Select(c, a, b) => T::pick(
+            eval_at(c, i, inputs, scalars),
+            eval_at(a, i, inputs, scalars),
+            eval_at(b, i, inputs, scalars),
+        ),
         Expr::Neg(a) => eval_at(a, i, inputs, scalars).neg(),
         Expr::Sqrt(a) => eval_at(a, i, inputs, scalars).sqrt(),
         Expr::Exp(a) => eval_at(a, i, inputs, scalars).exp(),
@@ -390,6 +450,26 @@ fn build_kernel(
                 let a = lower(a, b, lanes, num_inputs, lowered_lanes, offset, zero, dtype)?;
                 let x = lower(x, b, lanes, num_inputs, lowered_lanes, offset, zero, dtype)?;
                 b.binary(BinaryOp::Max, a, x, dtype)
+            }
+            Expr::Lt(a, x) | Expr::Le(a, x) | Expr::Gt(a, x) | Expr::Ge(a, x) | Expr::Eq(a, x)
+            | Expr::Ne(a, x) => {
+                let op = match e {
+                    Expr::Lt(..) => BinaryOp::Lt,
+                    Expr::Le(..) => BinaryOp::Le,
+                    Expr::Gt(..) => BinaryOp::Gt,
+                    Expr::Ge(..) => BinaryOp::Ge,
+                    Expr::Eq(..) => BinaryOp::Eq,
+                    _ => BinaryOp::Ne,
+                };
+                let a = lower(a, b, lanes, num_inputs, lowered_lanes, offset, zero, dtype)?;
+                let x = lower(x, b, lanes, num_inputs, lowered_lanes, offset, zero, dtype)?;
+                b.binary(op, a, x, ug::DType::I32)
+            }
+            Expr::Select(c, a, x) => {
+                let c = lower(c, b, lanes, num_inputs, lowered_lanes, offset, zero, dtype)?;
+                let a = lower(a, b, lanes, num_inputs, lowered_lanes, offset, zero, dtype)?;
+                let x = lower(x, b, lanes, num_inputs, lowered_lanes, offset, zero, dtype)?;
+                b.select(c, a, x, dtype)
             }
             Expr::Neg(a) => {
                 let a = lower(a, b, lanes, num_inputs, lowered_lanes, offset, zero, dtype)?;

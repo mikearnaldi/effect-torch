@@ -211,5 +211,85 @@ layer(Device.Cpu)("Fusion", (it) => {
         }
       })
     )
+    it.effect("where with a single-consumer comparison fuses as a true select (elu)", () =>
+      Effect.gen(function* () {
+        const build = Effect.gen(function* () {
+          const x = yield* Tensor.fromTypedArray(new Float64Array([0.5, -1, 2, -3, 0.25, 1.5]), [2, 3])
+          const y = yield* Tensor.elu(x, { alpha: 0.7 })
+          const loss = yield* Tensor.sum(y)
+          const [gx] = yield* Gradient.grad(loss, [x])
+          return { y: yield* values(y), gx: yield* values(gx) }
+        })
+        const fused = yield* withFusion(true, build)
+        const unfused = yield* withFusion(false, build)
+        for (const key of ["y", "gx"] as const) {
+          fused[key].forEach((v, i) => {
+            assert.assertTrue(Math.abs(v - unfused[key][i]) < 1e-12, `${key}[${i}]: ${v} != ${unfused[key][i]}`)
+          })
+        }
+      })
+    )
+
+    it.effect("select does not propagate NaN from the unselected side (klDiv with zero targets)", () =>
+      Effect.gen(function* () {
+        const build = Effect.gen(function* () {
+          // log(0) = -inf and 0 * -inf = NaN in the masked branch: an
+          // arithmetic mask would poison the result, a true select must not
+          const probs = yield* Tensor.fromTypedArray(new Float64Array([0, 0.3, 0, 0.1, 0, 0.25]), [2, 3])
+          const logPred = yield* Tensor.log(yield* Tensor.fromTypedArray(
+            new Float64Array([0.2, 0.3, 0.5, 0.1, 0.4, 0.25]),
+            [2, 3]
+          ))
+          const kl = yield* Loss.klDiv(logPred, probs, { reduction: "none" })
+          return yield* values(kl)
+        })
+        const fused = yield* withFusion(true, build)
+        const unfused = yield* withFusion(false, build)
+        fused.forEach((v, i) => {
+          assert.assertTrue(Number.isFinite(v), `fused[${i}] is not finite: ${v}`)
+          assert.assertTrue(Math.abs(v - unfused[i]) < 1e-12, `[${i}]: ${v} != ${unfused[i]}`)
+        })
+      })
+    )
+
+    it.effect("dropout's mask and scale fuse; survivors are exactly x / (1 - p)", () =>
+      Effect.gen(function* () {
+        const build = Effect.gen(function* () {
+          const x = yield* Tensor.fromTypedArray(new Float64Array([0.5, -1, 2, -3, 0.25, 1.5, 4, -0.75]), [2, 4])
+          const y = yield* Tensor.dropout(x, { p: 0.5 })
+          return yield* values(y)
+        })
+        for (const fusion of [true, false]) {
+          const out = yield* withFusion(fusion, build)
+          const xs = [0.5, -1, 2, -3, 0.25, 1.5, 4, -0.75]
+          out.forEach((v, i) => {
+            assert.assertTrue(
+              v === 0 || Math.abs(v - xs[i] / 0.5) < 1e-12,
+              `[${i}]: ${v} is neither 0 nor ${xs[i] / 0.5} (fusion ${fusion})`
+            )
+          })
+        }
+      })
+    )
+
+    it.effect("where with a shared condition stays correct", () =>
+      Effect.gen(function* () {
+        const build = Effect.gen(function* () {
+          const x = yield* Tensor.fromTypedArray(new Float64Array([0.5, -1, 2, -3, 0.25, 1.5]), [2, 3])
+          // the condition has two consumers, so it must materialize as u8
+          const cond = yield* Tensor.gt(x, 0)
+          const a = yield* Tensor.where(cond, x, 0)
+          const b = yield* Tensor.where(cond, 0, x)
+          return { a: yield* values(a), b: yield* values(b) }
+        })
+        const fused = yield* withFusion(true, build)
+        const unfused = yield* withFusion(false, build)
+        for (const key of ["a", "b"] as const) {
+          fused[key].forEach((v, i) => {
+            assert.assertTrue(Math.abs(v - unfused[key][i]) < 1e-12, `${key}[${i}]: ${v} != ${unfused[key][i]}`)
+          })
+        }
+      })
+    )
   })
 })
