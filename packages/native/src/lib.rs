@@ -983,9 +983,13 @@ enum NodeKind {
     },
     // Created only by the evaluation-time fusion rewrite (RFC 0007 phase
     // 2): a maximal chain of elementwise ops compiled to one kernel. Never
-    // appears in user graphs, so autodiff and vmap reject it.
+    // appears in user graphs, so autodiff and vmap reject it. Input lanes
+    // may be broadcast-smaller than the output: `strides` gives each
+    // lane's strides in output-dim space (0 = broadcast along that dim).
     FusedElementwise {
         inputs: Vec<Arc<Node>>,
+        strides: Vec<Vec<usize>>,
+        shape: Vec<usize>,
         expr: fusion::Expr,
     },
     StopGradient {
@@ -1595,16 +1599,34 @@ impl Node {
                 }
                 (step.shape.clone(), step.dtype, step.device.clone())
             }
-            NodeKind::FusedElementwise { inputs, .. } => {
+            NodeKind::FusedElementwise {
+                inputs,
+                strides,
+                shape,
+                ..
+            } => {
+                if inputs.is_empty() {
+                    return Err("fused: at least one input lane is required".to_string());
+                }
+                if strides.len() != inputs.len() {
+                    return Err(format!(
+                        "fused: got {} stride entries for {} inputs",
+                        strides.len(),
+                        inputs.len()
+                    ));
+                }
                 let first = &inputs[0];
-                for input in &inputs[1..] {
-                    if input.shape != first.shape
-                        || input.dtype != first.dtype
-                        || !input.device.same_device(&first.device)
-                    {
+                for (input, stride) in inputs.iter().zip(strides.iter()) {
+                    if input.dtype != first.dtype || !input.device.same_device(&first.device) {
                         return Err(
-                            "fused: all inputs must share shape, dtype and device".to_string()
+                            "fused: all inputs must share dtype and device".to_string()
                         );
+                    }
+                    if fusion::lane_strides(&input.shape, shape).as_ref() != Some(stride) {
+                        return Err(format!(
+                            "fused: input shape {:?} does not broadcast to {:?} with strides {stride:?}",
+                            input.shape, shape
+                        ));
                     }
                 }
                 if !first.dtype.is_float() {
@@ -1613,7 +1635,7 @@ impl Node {
                         first.dtype
                     ));
                 }
-                (first.shape.clone(), first.dtype, first.device.clone())
+                (shape.clone(), first.dtype, first.device.clone())
             }
         };
         Ok(Arc::new(Node {
@@ -2830,8 +2852,15 @@ fn remap_children(kind: &NodeKind, f: &dyn Fn(&Arc<Node>) -> Arc<Node>) -> NodeK
             step: f(step),
             index: *index,
         },
-        NodeKind::FusedElementwise { inputs, expr } => NodeKind::FusedElementwise {
+        NodeKind::FusedElementwise {
+            inputs,
+            strides,
+            shape,
+            expr,
+        } => NodeKind::FusedElementwise {
             inputs: inputs.iter().map(|i| f(i)).collect(),
+            strides: strides.clone(),
+            shape: shape.clone(),
             expr: expr.clone(),
         },
     }
@@ -3489,6 +3518,7 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> candle_core::Result<Te
                         fusion::run(
                             &exprs,
                             &[p.clone(), g.clone(), m_t.clone(), v_t.clone()],
+                            None,
                             &[lr_t, c1, c2],
                             p.elem_count(),
                             p.dims(),
@@ -3571,6 +3601,7 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> candle_core::Result<Te
                         fusion::run(
                             &exprs,
                             &[p.clone(), g.clone(), v_placeholder],
+                            None,
                             &[lr_t],
                             p.elem_count(),
                             p.dims(),
@@ -3623,7 +3654,12 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> candle_core::Result<Te
                 })?,
             }
         }
-        NodeKind::FusedElementwise { inputs, expr } => {
+        NodeKind::FusedElementwise {
+            inputs,
+            strides,
+            shape,
+            expr,
+        } => {
             let ts: Vec<Tensor> = inputs
                 .iter()
                 .map(|i| ev.value(i.id))
@@ -3632,9 +3668,10 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> candle_core::Result<Te
             let outs = fusion::run(
                 std::slice::from_ref(expr),
                 &ts,
+                Some(strides),
                 &[],
-                first.elem_count(),
-                first.dims(),
+                shape.iter().product(),
+                shape,
                 first.dtype(),
                 &first.device(),
             )?;
@@ -4872,16 +4909,12 @@ fn fuse_roots(roots: &[Arc<Node>]) -> std::result::Result<Vec<Arc<Node>>, String
         // the comparison's two inputs. Logical children are [x, y, a, b].
         Select(Box<dyn Fn(E, E) -> E>),
     }
-    // An input qualifies when it matches the output shape exactly, or is a
-    // uniform constant that folds into the IR (scalar or output-shaped).
+    // An input qualifies when it broadcasts into the output shape
+    // (right-aligned dims equal or 1; scalars included). Broadcast lanes
+    // are read through stride-0 dims inside the region instead of being
+    // materialized at the output shape.
     fn input_ok(c: &Node, out: &[usize]) -> bool {
-        c.shape == out
-            || match &c.kind {
-                NodeKind::Full { shape, .. } | NodeKind::Zeros { shape, .. } => {
-                    shape.is_empty() || shape == out
-                }
-                _ => false,
-            }
+        fusion::broadcast_compatible(&c.shape, out)
     }
     let fusable = |node: &Node| -> Option<OpT> {
         if !fusion::is_supported(&node.device, node.dtype) {
@@ -4924,6 +4957,25 @@ fn fuse_roots(roots: &[Arc<Node>]) -> std::result::Result<Vec<Arc<Node>>, String
             NodeKind::Pow { exp, .. } => {
                 let exp = *exp;
                 Some(OpT::Unary(Box::new(move |a| fusion::pow_expr(a, exp))))
+            }
+            // sign(x) = (x > 0) ? 1 : ((x < 0) ? -1 : 0); NaN yields 0,
+            // matching candle's CPU and Metal kernels.
+            NodeKind::Sign { .. } => Some(OpT::Unary(Box::new(|a| {
+                E::Select(
+                    Box::new(E::Gt(Box::new(a.clone()), Box::new(E::cst(0.0)))),
+                    Box::new(E::cst(1.0)),
+                    Box::new(E::Select(
+                        Box::new(E::Lt(Box::new(a), Box::new(E::cst(0.0)))),
+                        Box::new(E::cst(-1.0)),
+                        Box::new(E::cst(0.0)),
+                    )),
+                )
+            }))),
+            // A dtype-preserving cast is the identity inside a region.
+            // Cross-dtype casts stay region boundaries: lanes are loaded in
+            // the region's single dtype.
+            NodeKind::Cast { a, dtype } if a.dtype == *dtype => {
+                Some(OpT::Unary(Box::new(|a| a)))
             }
             // where(cond, a, b) fuses only when cond is a comparison with
             // no other consumer: the comparison lowers to a float mask
@@ -4978,14 +5030,18 @@ fn fuse_roots(roots: &[Arc<Node>]) -> std::result::Result<Vec<Arc<Node>>, String
             _ => None,
         }
     };
-    // A uniform-value child folds into an IR constant when it is a scalar
-    // or already matches the output shape (no broadcasting inside a region).
+    // A uniform-value child folds into an IR constant when it broadcasts
+    // into the output shape (scalar, broadcast-smaller, or output-shaped).
     let const_value = |child: &Node, out_shape: &[usize]| -> Option<f64> {
         match &child.kind {
-            NodeKind::Full { shape, value, .. } if shape.is_empty() || shape == out_shape => {
+            NodeKind::Full { shape, value, .. }
+                if fusion::broadcast_compatible(shape, out_shape) =>
+            {
                 Some(*value)
             }
-            NodeKind::Zeros { shape, .. } if shape.is_empty() || shape == out_shape => Some(0.0),
+            NodeKind::Zeros { shape, .. } if fusion::broadcast_compatible(shape, out_shape) => {
+                Some(0.0)
+            }
             _ => None,
         }
     };
@@ -5032,23 +5088,41 @@ fn fuse_roots(roots: &[Arc<Node>]) -> std::result::Result<Vec<Arc<Node>>, String
     // region (it materializes as a fused node) and the op continues with
     // that fused node as a plain input lane.
     const MAX_LANES: usize = 30;
+    // Emits a closed region as a FusedElementwise node, or rebuilds the
+    // node plainly (children already emitted) when fusion does not apply:
+    // single-op regions, lane-less constant regions, regions too large for
+    // the Metal kernel's i32 indexing, or a lane that fails to broadcast
+    // (unreachable by construction, handled defensively).
     fn emit_region(
-        id: u64,
+        node: &Node,
         region: Region,
-        kind: &NodeKind,
         map: &mut HashMap<u64, Arc<Node>>,
     ) -> std::result::Result<(), String> {
-        let fused = if region.ops >= 2 {
-            Node::new(NodeKind::FusedElementwise {
-                inputs: region.inputs,
-                expr: region.expr,
-            })?
-        } else {
-            Node::new(remap_children(kind, &|ch| {
+        let n: usize = node.shape.iter().product();
+        let strides: Option<Vec<Vec<usize>>> = region
+            .inputs
+            .iter()
+            .map(|lane| fusion::lane_strides(&lane.shape, &node.shape))
+            .collect();
+        let fused = match strides {
+            Some(strides)
+                if region.ops >= 2
+                    && !region.inputs.is_empty()
+                    && !(matches!(node.device, candle_core::Device::Metal(_))
+                        && n > i32::MAX as usize) =>
+            {
+                Node::new(NodeKind::FusedElementwise {
+                    inputs: region.inputs,
+                    strides,
+                    shape: node.shape.clone(),
+                    expr: region.expr,
+                })?
+            }
+            _ => Node::new(remap_children(&node.kind, &|ch| {
                 map.get(&ch.id).cloned().unwrap_or_else(|| ch.clone())
-            }))?
+            }))?,
         };
-        map.insert(id, fused);
+        map.insert(node.id, fused);
         Ok(())
     }
     let mut open: HashMap<u64, Region> = HashMap::new();
@@ -5062,7 +5136,7 @@ fn fuse_roots(roots: &[Arc<Node>]) -> std::result::Result<Vec<Arc<Node>>, String
                 && (opt.is_none() || consumers.get(&c.id).copied().unwrap_or(0) != 1)
             {
                 let region = open.remove(&c.id).unwrap();
-                emit_region(c.id, region, &c.kind, &mut map)?;
+                emit_region(c, region, &mut map)?;
             }
         }
         match opt {
@@ -5121,7 +5195,7 @@ fn fuse_roots(roots: &[Arc<Node>]) -> std::result::Result<Vec<Arc<Node>>, String
                     }
                     if let Some(r) = open.remove(&child.id) {
                         if region.inputs.len() + r.inputs.len() > MAX_LANES {
-                            emit_region(child.id, r, &child.kind, &mut map)?;
+                            emit_region(child, r, &mut map)?;
                             let resolved = map.get(&child.id).cloned().unwrap();
                             if region.inputs.len() >= MAX_LANES
                                 && !region.lane_of.contains_key(&resolved.id)
@@ -5178,7 +5252,7 @@ fn fuse_roots(roots: &[Arc<Node>]) -> std::result::Result<Vec<Arc<Node>>, String
                 // the smaller side materializes first.
                 if let (Some(r1), Some(r2)) = (&ra, &rb) {
                     if r1.inputs.len() + r2.inputs.len() > MAX_LANES {
-                        emit_region(b.id, rb.take().unwrap(), &b.kind, &mut map)?;
+                        emit_region(&b, rb.take().unwrap(), &mut map)?;
                     }
                 }
                 // Extending a region with a brand-new lane must stay within
@@ -5192,7 +5266,7 @@ fn fuse_roots(roots: &[Arc<Node>]) -> std::result::Result<Vec<Arc<Node>>, String
                             && r.inputs.len() >= MAX_LANES
                         {
                             let region = ra.take().unwrap();
-                            emit_region(a.id, region, &a.kind, &mut map)?;
+                            emit_region(&a, region, &mut map)?;
                         }
                     }
                 }
@@ -5204,7 +5278,7 @@ fn fuse_roots(roots: &[Arc<Node>]) -> std::result::Result<Vec<Arc<Node>>, String
                             && r.inputs.len() >= MAX_LANES
                         {
                             let region = rb.take().unwrap();
-                            emit_region(b.id, region, &b.kind, &mut map)?;
+                            emit_region(&b, region, &mut map)?;
                         }
                     }
                 }
@@ -5256,17 +5330,7 @@ fn fuse_roots(roots: &[Arc<Node>]) -> std::result::Result<Vec<Arc<Node>>, String
     // close regions whose end has no consumer in the graph (graph roots)
     for (id, region) in open.drain() {
         let node = order.iter().find(|n| n.id == id).unwrap();
-        let fused = if region.ops >= 2 {
-            Node::new(NodeKind::FusedElementwise {
-                inputs: region.inputs,
-                expr: region.expr,
-            })?
-        } else {
-            Node::new(remap_children(&node.kind, &|ch| {
-                map.get(&ch.id).cloned().unwrap_or_else(|| ch.clone())
-            }))?
-        };
-        map.insert(id, fused);
+        emit_region(node, region, &mut map)?;
     }
     Ok(roots
         .iter()

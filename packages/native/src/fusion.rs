@@ -13,6 +13,44 @@ use std::collections::HashMap;
 
 const BLOCK: usize = 256;
 
+/// Row-major contiguous strides of `shape`, in elements.
+pub fn contiguous_strides(shape: &[usize]) -> Vec<usize> {
+    let mut strides = vec![1usize; shape.len()];
+    for d in (0..shape.len().saturating_sub(1)).rev() {
+        strides[d] = strides[d + 1] * shape[d + 1];
+    }
+    strides
+}
+
+/// Strides with which a lane of shape `lane` is read when the region's
+/// output has shape `out`: right-aligned broadcasting, where a lane dim of
+/// 1 (or a missing leading dim) gets stride 0. `None` when the shapes are
+/// not broadcast-compatible.
+pub fn lane_strides(lane: &[usize], out: &[usize]) -> Option<Vec<usize>> {
+    if lane.len() > out.len() {
+        return None;
+    }
+    let offset = out.len() - lane.len();
+    let own = contiguous_strides(lane);
+    let mut strides = vec![0usize; out.len()];
+    for (i, &ld) in lane.iter().enumerate() {
+        let od = out[offset + i];
+        if ld == od {
+            strides[offset + i] = own[i];
+        } else if ld == 1 {
+            strides[offset + i] = 0;
+        } else {
+            return None;
+        }
+    }
+    Some(strides)
+}
+
+/// Whether `lane` broadcasts into `out` (right-aligned, dims equal or 1).
+pub fn broadcast_compatible(lane: &[usize], out: &[usize]) -> bool {
+    lane_strides(lane, out).is_some()
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Expr {
     // per-element input lane k
@@ -245,40 +283,46 @@ impl_scalar!(f32, libm::erff);
 impl_scalar!(f64, libm::erf);
 
 fn eval_at<T: Scalar>(e: &Expr, i: usize, inputs: &[&[T]], scalars: &[T]) -> T {
+    eval(e, &|k| inputs[k as usize][i], scalars)
+}
+
+// The scalar evaluator shared by the contiguous path (lane accessor reads
+// lane[k][i]) and the strided path (lane values pre-gathered per element).
+fn eval<T: Scalar, F: Fn(u32) -> T>(e: &Expr, lane: &F, scalars: &[T]) -> T {
     match e {
-        Expr::Input(k) => inputs[*k as usize][i],
+        Expr::Input(k) => lane(*k),
         Expr::Scalar(k) => scalars[*k as usize],
         Expr::Const(bits) => T::from_f64(f64::from_bits(*bits)),
-        Expr::Add(a, b) => eval_at(a, i, inputs, scalars).add(eval_at(b, i, inputs, scalars)),
-        Expr::Sub(a, b) => eval_at(a, i, inputs, scalars).sub(eval_at(b, i, inputs, scalars)),
-        Expr::Mul(a, b) => eval_at(a, i, inputs, scalars).mul(eval_at(b, i, inputs, scalars)),
-        Expr::Div(a, b) => eval_at(a, i, inputs, scalars).div(eval_at(b, i, inputs, scalars)),
-        Expr::Min(a, b) => eval_at(a, i, inputs, scalars).min(eval_at(b, i, inputs, scalars)),
-        Expr::Max(a, b) => eval_at(a, i, inputs, scalars).max(eval_at(b, i, inputs, scalars)),
-        Expr::Lt(a, b) => eval_at(a, i, inputs, scalars).lt(eval_at(b, i, inputs, scalars)),
-        Expr::Le(a, b) => eval_at(a, i, inputs, scalars).le(eval_at(b, i, inputs, scalars)),
-        Expr::Gt(a, b) => eval_at(a, i, inputs, scalars).gt(eval_at(b, i, inputs, scalars)),
-        Expr::Ge(a, b) => eval_at(a, i, inputs, scalars).ge(eval_at(b, i, inputs, scalars)),
-        Expr::Eq(a, b) => eval_at(a, i, inputs, scalars).eq(eval_at(b, i, inputs, scalars)),
-        Expr::Ne(a, b) => eval_at(a, i, inputs, scalars).ne(eval_at(b, i, inputs, scalars)),
+        Expr::Add(a, b) => eval(a, lane, scalars).add(eval(b, lane, scalars)),
+        Expr::Sub(a, b) => eval(a, lane, scalars).sub(eval(b, lane, scalars)),
+        Expr::Mul(a, b) => eval(a, lane, scalars).mul(eval(b, lane, scalars)),
+        Expr::Div(a, b) => eval(a, lane, scalars).div(eval(b, lane, scalars)),
+        Expr::Min(a, b) => eval(a, lane, scalars).min(eval(b, lane, scalars)),
+        Expr::Max(a, b) => eval(a, lane, scalars).max(eval(b, lane, scalars)),
+        Expr::Lt(a, b) => eval(a, lane, scalars).lt(eval(b, lane, scalars)),
+        Expr::Le(a, b) => eval(a, lane, scalars).le(eval(b, lane, scalars)),
+        Expr::Gt(a, b) => eval(a, lane, scalars).gt(eval(b, lane, scalars)),
+        Expr::Ge(a, b) => eval(a, lane, scalars).ge(eval(b, lane, scalars)),
+        Expr::Eq(a, b) => eval(a, lane, scalars).eq(eval(b, lane, scalars)),
+        Expr::Ne(a, b) => eval(a, lane, scalars).ne(eval(b, lane, scalars)),
         Expr::Select(c, a, b) => T::pick(
-            eval_at(c, i, inputs, scalars),
-            eval_at(a, i, inputs, scalars),
-            eval_at(b, i, inputs, scalars),
+            eval(c, lane, scalars),
+            eval(a, lane, scalars),
+            eval(b, lane, scalars),
         ),
-        Expr::Neg(a) => eval_at(a, i, inputs, scalars).neg(),
-        Expr::Sqrt(a) => eval_at(a, i, inputs, scalars).sqrt(),
-        Expr::Exp(a) => eval_at(a, i, inputs, scalars).exp(),
-        Expr::Sin(a) => eval_at(a, i, inputs, scalars).sin(),
-        Expr::Cos(a) => eval_at(a, i, inputs, scalars).cos(),
-        Expr::Tanh(a) => eval_at(a, i, inputs, scalars).tanh(),
-        Expr::Abs(a) => eval_at(a, i, inputs, scalars).abs(),
-        Expr::Log(a) => eval_at(a, i, inputs, scalars).log(),
-        Expr::Floor(a) => eval_at(a, i, inputs, scalars).floor(),
-        Expr::Ceil(a) => eval_at(a, i, inputs, scalars).ceil(),
-        Expr::Round(a) => eval_at(a, i, inputs, scalars).round(),
-        Expr::Powf(a, e) => eval_at(a, i, inputs, scalars).powf(f64::from_bits(*e)),
-        Expr::Erf(a) => eval_at(a, i, inputs, scalars).erf(),
+        Expr::Neg(a) => eval(a, lane, scalars).neg(),
+        Expr::Sqrt(a) => eval(a, lane, scalars).sqrt(),
+        Expr::Exp(a) => eval(a, lane, scalars).exp(),
+        Expr::Sin(a) => eval(a, lane, scalars).sin(),
+        Expr::Cos(a) => eval(a, lane, scalars).cos(),
+        Expr::Tanh(a) => eval(a, lane, scalars).tanh(),
+        Expr::Abs(a) => eval(a, lane, scalars).abs(),
+        Expr::Log(a) => eval(a, lane, scalars).log(),
+        Expr::Floor(a) => eval(a, lane, scalars).floor(),
+        Expr::Ceil(a) => eval(a, lane, scalars).ceil(),
+        Expr::Round(a) => eval(a, lane, scalars).round(),
+        Expr::Powf(a, e) => eval(a, lane, scalars).powf(f64::from_bits(*e)),
+        Expr::Erf(a) => eval(a, lane, scalars).erf(),
     }
 }
 
@@ -297,13 +341,14 @@ fn cpu_input_slices<'a, T: candle_core::WithDType>(
 fn interpret_cpu<T: candle_core::WithDType + Scalar>(
     exprs: &[Expr],
     inputs: &[Tensor],
+    strides: Option<&[Vec<usize>]>,
     scalars: &[Tensor],
     n: usize,
     shape: &[usize],
 ) -> candle_core::Result<Vec<Tensor>> {
     let guards = cpu_input_slices::<T>(inputs)?;
     let mut slices: Vec<&[T]> = Vec::with_capacity(guards.len());
-    for (storage, offset) in &guards {
+    for ((storage, offset), input) in guards.iter().zip(inputs.iter()) {
         let cpu = match &**storage {
             Storage::Cpu(cpu) => cpu,
             _ => {
@@ -313,7 +358,7 @@ fn interpret_cpu<T: candle_core::WithDType + Scalar>(
             }
         };
         let data = cpu.as_slice::<T>()?;
-        slices.push(&data[*offset..*offset + n]);
+        slices.push(&data[*offset..*offset + input.elem_count()]);
     }
     let scalar_guards = cpu_input_slices::<T>(scalars)?;
     let mut scalar_values: Vec<T> = Vec::with_capacity(scalar_guards.len());
@@ -328,15 +373,56 @@ fn interpret_cpu<T: candle_core::WithDType + Scalar>(
         };
         scalar_values.push(cpu.as_slice::<T>()?[*offset]);
     }
-    let mut outs = Vec::with_capacity(exprs.len());
-    for expr in exprs {
-        let mut out = vec![<T as Scalar>::from_f64(0.0); n];
-        for (i, o) in out.iter_mut().enumerate() {
-            *o = eval_at(expr, i, &slices, &scalar_values);
+    let contig = contiguous_strides(shape);
+    let strided = match strides {
+        Some(ss) if ss.iter().any(|s| s != &contig) => Some(ss),
+        _ => None,
+    };
+    let mut outs: Vec<Vec<T>> = exprs
+        .iter()
+        .map(|_| vec![<T as Scalar>::from_f64(0.0); n])
+        .collect();
+    match strided {
+        None => {
+            for i in 0..n {
+                for (out, expr) in outs.iter_mut().zip(exprs.iter()) {
+                    out[i] = eval_at(expr, i, &slices, &scalar_values);
+                }
+            }
         }
-        outs.push(Tensor::from_vec(out, shape, &Device::Cpu)?);
+        // Broadcast lanes: walk the output coordinates with an odometer so
+        // each lane's element offset is incremental (no per-element div/mod).
+        Some(ss) => {
+            let rank = shape.len();
+            let mut coord = vec![0usize; rank];
+            let mut offs = vec![0usize; inputs.len()];
+            let mut lane_vals = vec![<T as Scalar>::from_f64(0.0); inputs.len()];
+            for i in 0..n {
+                for (v, (slice, off)) in lane_vals.iter_mut().zip(slices.iter().zip(offs.iter())) {
+                    *v = slice[*off];
+                }
+                for (out, expr) in outs.iter_mut().zip(exprs.iter()) {
+                    out[i] = eval(expr, &|k| lane_vals[k as usize], &scalar_values);
+                }
+                for d in (0..rank).rev() {
+                    coord[d] += 1;
+                    for (off, s) in offs.iter_mut().zip(ss.iter()) {
+                        *off += s[d];
+                    }
+                    if coord[d] < shape[d] {
+                        break;
+                    }
+                    coord[d] = 0;
+                    for (off, s) in offs.iter_mut().zip(ss.iter()) {
+                        *off -= shape[d] * s[d];
+                    }
+                }
+            }
+        }
     }
-    Ok(outs)
+    outs.into_iter()
+        .map(|out| Tensor::from_vec(out, shape, &Device::Cpu))
+        .collect()
 }
 
 #[cfg(any(target_os = "macos", feature = "cuda"))]
@@ -346,21 +432,26 @@ fn f32_cst(v: f32) -> candle_core::Result<ug::Const> {
 }
 
 // Lowers the IR to a ug SSA kernel with one store per output expression.
-// Lane k reads from pointer argument k. The element count is baked in as a
-// constant (the pipeline cache is keyed by it): Metal kernel functions
-// cannot take plain scalar arguments, and baking enables constant folding.
-// Loads are clamped to n-1 so the trailing partial block recomputes the
-// last element harmlessly instead of reading out of bounds.
+// Lane k reads from pointer argument k at an offset computed from the
+// flattened output index and the lane's strides (broadcast lanes re-read
+// elements; contiguous lanes read at the index itself). The element count
+// and lane strides are baked in as constants (the pipeline cache is keyed
+// by them): Metal kernel functions cannot take plain scalar arguments, and
+// baking enables constant folding. Loads are clamped to n-1 so the
+// trailing partial block recomputes the last element harmlessly instead of
+// reading out of bounds.
 #[cfg(any(target_os = "macos", feature = "cuda"))]
 fn build_kernel(
     exprs: &[Expr],
-    num_inputs: usize,
+    lane_strides: &[Vec<usize>],
+    out_shape: &[usize],
     num_scalars: usize,
     n: usize,
     dtype: ug::DType,
 ) -> candle_core::Result<ug::lang::ssa::Kernel> {
     use ug::lang::ssa::{BinaryOp, Instr as I, Special};
 
+    let num_inputs = lane_strides.len();
     let mut b = ug::block::Block::empty();
     let mut lanes = Vec::with_capacity(num_inputs + num_scalars);
     for k in 0..(num_inputs + num_scalars) {
@@ -383,14 +474,56 @@ fn build_kernel(
     let clamped = b.binary(BinaryOp::Min, off.to_a(), last.to_a(), ug::DType::I32);
     let zero = b.push(I::Const(ug::Const::I32(0)));
 
+    // Per-lane read offsets. Contiguous lanes read at the clamped index;
+    // broadcast lanes decompose it into coordinates and recombine with
+    // their strides (stride 0 dims and size-1 dims contribute nothing).
+    let i32c = |v: usize, b: &mut ug::block::Block| b.push(I::Const(ug::Const::I32(v as i32)));
+    let contig = contiguous_strides(out_shape);
+    let rank = out_shape.len();
+    let mut lane_offsets: Vec<ug::block::Id> = Vec::with_capacity(num_inputs);
+    for strides in lane_strides {
+        if strides == &contig {
+            lane_offsets.push(clamped);
+            continue;
+        }
+        let mut acc: Option<ug::block::Id> = None;
+        for d in 0..rank {
+            if out_shape[d] == 1 || strides[d] == 0 {
+                continue;
+            }
+            let coord = if d == rank - 1 {
+                let dim = i32c(out_shape[d], &mut b);
+                b.binary(BinaryOp::Mod, clamped, dim.to_a(), ug::DType::I32)
+            } else {
+                let stride = i32c(contig[d], &mut b);
+                let q = b.binary(BinaryOp::Div, clamped, stride.to_a(), ug::DType::I32);
+                let dim = i32c(out_shape[d], &mut b);
+                b.binary(BinaryOp::Mod, q.to_a(), dim.to_a(), ug::DType::I32)
+            };
+            let term = if strides[d] == 1 {
+                coord
+            } else {
+                let s = i32c(strides[d], &mut b);
+                b.binary(BinaryOp::Mul, coord.to_a(), s.to_a(), ug::DType::I32)
+            };
+            acc = Some(match acc {
+                None => term,
+                Some(prev) => b.binary(BinaryOp::Add, prev.to_a(), term.to_a(), ug::DType::I32),
+            });
+        }
+        // A lane with no contributing dims (a broadcast scalar) reads offset 0.
+        lane_offsets.push(acc.unwrap_or(zero));
+    }
+
     let mut lowered_lanes: HashMap<u32, ug::block::Id> = HashMap::new();
+    #[allow(clippy::too_many_arguments)]
     fn lower(
         e: &Expr,
         b: &mut ug::block::Block,
         lanes: &[ug::block::Id],
         num_inputs: usize,
         lowered_lanes: &mut HashMap<u32, ug::block::Id>,
-        offset: ug::block::Id,
+        lane_offsets: &[ug::block::Id],
         zero: ug::block::Id,
         dtype: ug::DType,
     ) -> candle_core::Result<ug::block::Id> {
@@ -402,7 +535,7 @@ fn build_kernel(
                 } else {
                     let id = b.push(I::Load {
                         src: lanes[*k as usize].to_varid(),
-                        offset: offset.to_a(),
+                        offset: lane_offsets[*k as usize].to_a(),
                         dtype,
                     });
                     lowered_lanes.insert(*k, id);
@@ -422,33 +555,33 @@ fn build_kernel(
                 b.push(I::Const(cst))
             }
             Expr::Add(a, x) => {
-                let a = lower(a, b, lanes, num_inputs, lowered_lanes, offset, zero, dtype)?;
-                let x = lower(x, b, lanes, num_inputs, lowered_lanes, offset, zero, dtype)?;
+                let a = lower(a, b, lanes, num_inputs, lowered_lanes, lane_offsets, zero, dtype)?;
+                let x = lower(x, b, lanes, num_inputs, lowered_lanes, lane_offsets, zero, dtype)?;
                 b.binary(BinaryOp::Add, a, x, dtype)
             }
             Expr::Sub(a, x) => {
-                let a = lower(a, b, lanes, num_inputs, lowered_lanes, offset, zero, dtype)?;
-                let x = lower(x, b, lanes, num_inputs, lowered_lanes, offset, zero, dtype)?;
+                let a = lower(a, b, lanes, num_inputs, lowered_lanes, lane_offsets, zero, dtype)?;
+                let x = lower(x, b, lanes, num_inputs, lowered_lanes, lane_offsets, zero, dtype)?;
                 b.binary(BinaryOp::Sub, a, x, dtype)
             }
             Expr::Mul(a, x) => {
-                let a = lower(a, b, lanes, num_inputs, lowered_lanes, offset, zero, dtype)?;
-                let x = lower(x, b, lanes, num_inputs, lowered_lanes, offset, zero, dtype)?;
+                let a = lower(a, b, lanes, num_inputs, lowered_lanes, lane_offsets, zero, dtype)?;
+                let x = lower(x, b, lanes, num_inputs, lowered_lanes, lane_offsets, zero, dtype)?;
                 b.binary(BinaryOp::Mul, a, x, dtype)
             }
             Expr::Div(a, x) => {
-                let a = lower(a, b, lanes, num_inputs, lowered_lanes, offset, zero, dtype)?;
-                let x = lower(x, b, lanes, num_inputs, lowered_lanes, offset, zero, dtype)?;
+                let a = lower(a, b, lanes, num_inputs, lowered_lanes, lane_offsets, zero, dtype)?;
+                let x = lower(x, b, lanes, num_inputs, lowered_lanes, lane_offsets, zero, dtype)?;
                 b.binary(BinaryOp::Div, a, x, dtype)
             }
             Expr::Min(a, x) => {
-                let a = lower(a, b, lanes, num_inputs, lowered_lanes, offset, zero, dtype)?;
-                let x = lower(x, b, lanes, num_inputs, lowered_lanes, offset, zero, dtype)?;
+                let a = lower(a, b, lanes, num_inputs, lowered_lanes, lane_offsets, zero, dtype)?;
+                let x = lower(x, b, lanes, num_inputs, lowered_lanes, lane_offsets, zero, dtype)?;
                 b.binary(BinaryOp::Min, a, x, dtype)
             }
             Expr::Max(a, x) => {
-                let a = lower(a, b, lanes, num_inputs, lowered_lanes, offset, zero, dtype)?;
-                let x = lower(x, b, lanes, num_inputs, lowered_lanes, offset, zero, dtype)?;
+                let a = lower(a, b, lanes, num_inputs, lowered_lanes, lane_offsets, zero, dtype)?;
+                let x = lower(x, b, lanes, num_inputs, lowered_lanes, lane_offsets, zero, dtype)?;
                 b.binary(BinaryOp::Max, a, x, dtype)
             }
             Expr::Lt(a, x) | Expr::Le(a, x) | Expr::Gt(a, x) | Expr::Ge(a, x) | Expr::Eq(a, x)
@@ -461,62 +594,62 @@ fn build_kernel(
                     Expr::Eq(..) => BinaryOp::Eq,
                     _ => BinaryOp::Ne,
                 };
-                let a = lower(a, b, lanes, num_inputs, lowered_lanes, offset, zero, dtype)?;
-                let x = lower(x, b, lanes, num_inputs, lowered_lanes, offset, zero, dtype)?;
+                let a = lower(a, b, lanes, num_inputs, lowered_lanes, lane_offsets, zero, dtype)?;
+                let x = lower(x, b, lanes, num_inputs, lowered_lanes, lane_offsets, zero, dtype)?;
                 b.binary(op, a, x, ug::DType::I32)
             }
             Expr::Select(c, a, x) => {
-                let c = lower(c, b, lanes, num_inputs, lowered_lanes, offset, zero, dtype)?;
-                let a = lower(a, b, lanes, num_inputs, lowered_lanes, offset, zero, dtype)?;
-                let x = lower(x, b, lanes, num_inputs, lowered_lanes, offset, zero, dtype)?;
+                let c = lower(c, b, lanes, num_inputs, lowered_lanes, lane_offsets, zero, dtype)?;
+                let a = lower(a, b, lanes, num_inputs, lowered_lanes, lane_offsets, zero, dtype)?;
+                let x = lower(x, b, lanes, num_inputs, lowered_lanes, lane_offsets, zero, dtype)?;
                 b.select(c, a, x, dtype)
             }
             Expr::Neg(a) => {
-                let a = lower(a, b, lanes, num_inputs, lowered_lanes, offset, zero, dtype)?;
+                let a = lower(a, b, lanes, num_inputs, lowered_lanes, lane_offsets, zero, dtype)?;
                 b.unary(UnaryOp::Neg, a, dtype)
             }
             Expr::Sqrt(a) => {
-                let a = lower(a, b, lanes, num_inputs, lowered_lanes, offset, zero, dtype)?;
+                let a = lower(a, b, lanes, num_inputs, lowered_lanes, lane_offsets, zero, dtype)?;
                 b.unary(UnaryOp::Sqrt, a, dtype)
             }
             Expr::Exp(a) => {
-                let a = lower(a, b, lanes, num_inputs, lowered_lanes, offset, zero, dtype)?;
+                let a = lower(a, b, lanes, num_inputs, lowered_lanes, lane_offsets, zero, dtype)?;
                 b.unary(UnaryOp::Exp, a, dtype)
             }
             Expr::Sin(a) => {
-                let a = lower(a, b, lanes, num_inputs, lowered_lanes, offset, zero, dtype)?;
+                let a = lower(a, b, lanes, num_inputs, lowered_lanes, lane_offsets, zero, dtype)?;
                 b.unary(UnaryOp::Sin, a, dtype)
             }
             Expr::Cos(a) => {
-                let a = lower(a, b, lanes, num_inputs, lowered_lanes, offset, zero, dtype)?;
+                let a = lower(a, b, lanes, num_inputs, lowered_lanes, lane_offsets, zero, dtype)?;
                 b.unary(UnaryOp::Cos, a, dtype)
             }
             Expr::Tanh(a) => {
-                let x = lower(a, b, lanes, num_inputs, lowered_lanes, offset, zero, dtype)?;
+                let x = lower(a, b, lanes, num_inputs, lowered_lanes, lane_offsets, zero, dtype)?;
                 b.unary(UnaryOp::Tanh, x, dtype)
             }
             Expr::Abs(a) => {
-                let x = lower(a, b, lanes, num_inputs, lowered_lanes, offset, zero, dtype)?;
+                let x = lower(a, b, lanes, num_inputs, lowered_lanes, lane_offsets, zero, dtype)?;
                 b.unary(UnaryOp::Abs, x, dtype)
             }
             Expr::Log(a) => {
-                let x = lower(a, b, lanes, num_inputs, lowered_lanes, offset, zero, dtype)?;
+                let x = lower(a, b, lanes, num_inputs, lowered_lanes, lane_offsets, zero, dtype)?;
                 b.unary(UnaryOp::Log, x, dtype)
             }
             Expr::Floor(a) => {
-                let x = lower(a, b, lanes, num_inputs, lowered_lanes, offset, zero, dtype)?;
+                let x = lower(a, b, lanes, num_inputs, lowered_lanes, lane_offsets, zero, dtype)?;
                 b.unary(UnaryOp::Floor, x, dtype)
             }
             Expr::Ceil(a) => {
-                let x = lower(a, b, lanes, num_inputs, lowered_lanes, offset, zero, dtype)?;
+                let x = lower(a, b, lanes, num_inputs, lowered_lanes, lane_offsets, zero, dtype)?;
                 b.unary(UnaryOp::Ceil, x, dtype)
             }
             Expr::Round(a) => {
-                let x = lower(a, b, lanes, num_inputs, lowered_lanes, offset, zero, dtype)?;
+                let x = lower(a, b, lanes, num_inputs, lowered_lanes, lane_offsets, zero, dtype)?;
                 b.unary(UnaryOp::Round, x, dtype)
             }
             Expr::Powf(a, e) => {
-                let x = lower(a, b, lanes, num_inputs, lowered_lanes, offset, zero, dtype)?;
+                let x = lower(a, b, lanes, num_inputs, lowered_lanes, lane_offsets, zero, dtype)?;
                 let exp = b.push(I::Const(f32_cst(f64::from_bits(*e) as f32)?));
                 b.binary(BinaryOp::Pow, x, exp, dtype)
             }
@@ -524,7 +657,7 @@ fn build_kernel(
             // sign(x) = x / max(|x|, 1e-30); the CPU interpreter uses the
             // exact libm erf instead
             Expr::Erf(a) => {
-                let x = lower(a, b, lanes, num_inputs, lowered_lanes, offset, zero, dtype)?;
+                let x = lower(a, b, lanes, num_inputs, lowered_lanes, lane_offsets, zero, dtype)?;
                 let c = |v: f64, b: &mut ug::block::Block| -> candle_core::Result<ug::block::Id> {
                     Ok(b.push(I::Const(f32_cst(v as f32)?)))
                 };
@@ -573,7 +706,7 @@ fn build_kernel(
     }
 
     for (j, expr) in exprs.iter().enumerate() {
-        let value = lower(expr, &mut b, &lanes, num_inputs, &mut lowered_lanes, clamped, zero, dtype)?;
+        let value = lower(expr, &mut b, &lanes, num_inputs, &mut lowered_lanes, &lane_offsets, zero, dtype)?;
         b.push(I::Store {
             dst: outs[j].to_varid(),
             offset: off.to_a(),
@@ -604,6 +737,7 @@ mod metal {
     pub fn run(
         exprs: &[Expr],
         inputs: &[Tensor],
+        lane_strides: &[Vec<usize>],
         scalars: &[Tensor],
         n: usize,
         shape: &[usize],
@@ -625,6 +759,10 @@ mod metal {
         inputs.len().hash(&mut hasher);
         scalars.len().hash(&mut hasher);
         n.hash(&mut hasher);
+        // Strides are baked into the kernel as constants, so they must key
+        // the pipeline cache.
+        shape.hash(&mut hasher);
+        lane_strides.hash(&mut hasher);
         let key = hasher.finish();
         let pipeline = {
             let mut cache = pipelines().lock().unwrap();
@@ -632,7 +770,7 @@ mod metal {
                 Some(p) => p.clone(),
                 None => {
                     let kernel =
-                        build_kernel(exprs, inputs.len(), scalars.len(), n, ug::DType::F32)?;
+                        build_kernel(exprs, lane_strides, shape, scalars.len(), n, ug::DType::F32)?;
                     let p = mdev.compile("effect_torch_fused", kernel)?;
                     if std::env::var_os("EFFECT_TORCH_FUSION_DEBUG").is_some() {
                         eprintln!("[fusion] compiled kernel #{} (key {key:x})", cache.len() + 1);
@@ -788,18 +926,30 @@ pub fn sgd_exprs(momentum: f64, dampening: f64, nesterov: bool, weight_decay: f6
     ]
 }
 
-/// Evaluates each expression over the flattened inputs (all the same
-/// element count) and returns one tensor per expression. `scalars` are
-/// one-element tensors read at offset 0.
+/// Evaluates each expression over the flattened inputs (broadcast to the
+/// output element count) and returns one tensor per expression. `strides`
+/// gives each input lane's strides in output-dim space (`None` means every
+/// lane is contiguous and output-shaped). `scalars` are one-element tensors
+/// read at offset 0.
 pub fn run(
     exprs: &[Expr],
     inputs: &[Tensor],
+    strides: Option<&[Vec<usize>]>,
     scalars: &[Tensor],
     n: usize,
     shape: &[usize],
     dtype: DType,
     device: &Device,
 ) -> candle_core::Result<Vec<Tensor>> {
+    if let Some(ss) = strides {
+        if ss.len() != inputs.len() {
+            return Err(candle_core::Error::Msg(format!(
+                "fusion: got {} stride entries for {} inputs",
+                ss.len(),
+                inputs.len()
+            )));
+        }
+    }
     let mut owned = Vec::with_capacity(inputs.len() + scalars.len());
     for t in inputs.iter().chain(scalars.iter()) {
         owned.push(if t.is_contiguous() { t.clone() } else { t.contiguous()? });
@@ -820,11 +970,21 @@ pub fn run(
             .map(|_| Tensor::zeros(shape, dtype, device))
             .collect();
     }
+    let contig;
+    let lane_strides = match strides {
+        Some(ss) => ss,
+        None => {
+            contig = vec![contiguous_strides(shape); inputs.len()];
+            &contig
+        }
+    };
     match (device, dtype) {
-        (Device::Cpu, DType::F32) => interpret_cpu::<f32>(exprs, inputs, scalars, n, shape),
-        (Device::Cpu, DType::F64) => interpret_cpu::<f64>(exprs, inputs, scalars, n, shape),
+        (Device::Cpu, DType::F32) => interpret_cpu::<f32>(exprs, inputs, strides, scalars, n, shape),
+        (Device::Cpu, DType::F64) => interpret_cpu::<f64>(exprs, inputs, strides, scalars, n, shape),
         #[cfg(target_os = "macos")]
-        (Device::Metal(_), DType::F32) => metal::run(exprs, inputs, scalars, n, shape, device),
+        (Device::Metal(_), DType::F32) => {
+            metal::run(exprs, inputs, lane_strides, scalars, n, shape, device)
+        }
         _ => Err(candle_core::Error::Msg(format!(
             "fusion: unsupported device/dtype {device:?} {dtype:?}"
         ))),
