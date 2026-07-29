@@ -30,9 +30,9 @@ const withFusion = <A, E, R>(enabled: boolean, effect: Effect.Effect<A, E, R>): 
   )
 
 onDevices("Fusion", (device: TestDevice) => (it) => {
-  // fused and unfused paths agree up to float rounding plus two
-  // deliberate algorithmic differences: erf's A&S expansion (~1.5e-7)
-  // and pow's special-case expansions (x*x, sqrt) vs the platform powf
+  // fused and unfused paths agree up to float rounding, except erf (an
+  // A&S approximation, ~1.5e-7: Metal has no erf) and pow with common
+  // exponents (lowered to multiplies/sqrt instead of powf)
   const close = (a: number, b: number): boolean => Math.abs(a - b) <= TOL * Math.max(1, Math.abs(a), Math.abs(b))
   describe("region fusion", () => {
     it.effect("fused and unfused evaluation agree on values and gradients", () =>
