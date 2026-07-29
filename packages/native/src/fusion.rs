@@ -41,6 +41,27 @@ impl Expr {
         Expr::Const(v.to_bits())
     }
 
+    /// Adds `base` to every per-element lane index (used when merging two
+    /// regions whose lane lists are concatenated).
+    pub fn shift_inputs(&self, base: u32) -> Self {
+        match self {
+            Expr::Input(k) => Expr::Input(k + base),
+            Expr::Scalar(k) => Expr::Scalar(*k),
+            Expr::Const(b) => Expr::Const(*b),
+            Expr::Add(a, b) => Expr::Add(Box::new(a.shift_inputs(base)), Box::new(b.shift_inputs(base))),
+            Expr::Sub(a, b) => Expr::Sub(Box::new(a.shift_inputs(base)), Box::new(b.shift_inputs(base))),
+            Expr::Mul(a, b) => Expr::Mul(Box::new(a.shift_inputs(base)), Box::new(b.shift_inputs(base))),
+            Expr::Div(a, b) => Expr::Div(Box::new(a.shift_inputs(base)), Box::new(b.shift_inputs(base))),
+            Expr::Min(a, b) => Expr::Min(Box::new(a.shift_inputs(base)), Box::new(b.shift_inputs(base))),
+            Expr::Max(a, b) => Expr::Max(Box::new(a.shift_inputs(base)), Box::new(b.shift_inputs(base))),
+            Expr::Neg(a) => Expr::Neg(Box::new(a.shift_inputs(base))),
+            Expr::Sqrt(a) => Expr::Sqrt(Box::new(a.shift_inputs(base))),
+            Expr::Exp(a) => Expr::Exp(Box::new(a.shift_inputs(base))),
+            Expr::Sin(a) => Expr::Sin(Box::new(a.shift_inputs(base))),
+            Expr::Cos(a) => Expr::Cos(Box::new(a.shift_inputs(base))),
+        }
+    }
+
     pub fn const_value(&self) -> Option<f64> {
         match self {
             Expr::Const(bits) => Some(f64::from_bits(*bits)),

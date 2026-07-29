@@ -1,7 +1,7 @@
 use candle_core::{CpuStorage, DType, Device, Storage, Tensor};
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -966,6 +966,13 @@ enum NodeKind {
         step: Arc<Node>,
         index: u8,
     },
+    // Created only by the evaluation-time fusion rewrite (RFC 0007 phase
+    // 2): a maximal chain of elementwise ops compiled to one kernel. Never
+    // appears in user graphs, so autodiff and vmap reject it.
+    FusedElementwise {
+        inputs: Vec<Arc<Node>>,
+        expr: fusion::Expr,
+    },
     StopGradient {
         a: Arc<Node>,
     },
@@ -1572,6 +1579,26 @@ impl Node {
                     return Err(format!("sgd_out: index must be 0 or 1, got {index}"));
                 }
                 (step.shape.clone(), step.dtype, step.device.clone())
+            }
+            NodeKind::FusedElementwise { inputs, .. } => {
+                let first = &inputs[0];
+                for input in &inputs[1..] {
+                    if input.shape != first.shape
+                        || input.dtype != first.dtype
+                        || !input.device.same_device(&first.device)
+                    {
+                        return Err(
+                            "fused: all inputs must share shape, dtype and device".to_string()
+                        );
+                    }
+                }
+                if !first.dtype.is_float() {
+                    return Err(format!(
+                        "fused: dtype must be floating point, got {:?}",
+                        first.dtype
+                    ));
+                }
+                (first.shape.clone(), first.dtype, first.device.clone())
             }
         };
         Ok(Arc::new(Node {
@@ -2416,6 +2443,7 @@ fn node_children(kind: &NodeKind) -> Vec<Arc<Node>> {
             ..
         } => vec![param.clone(), grad.clone(), velocity.clone()],
         NodeKind::SgdOut { step, .. } => vec![step.clone()],
+        NodeKind::FusedElementwise { inputs, .. } => inputs.clone(),
     }
 }
 
@@ -2786,6 +2814,10 @@ fn remap_children(kind: &NodeKind, f: &dyn Fn(&Arc<Node>) -> Arc<Node>) -> NodeK
         NodeKind::SgdOut { step, index } => NodeKind::SgdOut {
             step: f(step),
             index: *index,
+        },
+        NodeKind::FusedElementwise { inputs, expr } => NodeKind::FusedElementwise {
+            inputs: inputs.iter().map(|i| f(i)).collect(),
+            expr: expr.clone(),
         },
     }
 }
@@ -3562,6 +3594,23 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> candle_core::Result<Te
                 })?,
             }
         }
+        NodeKind::FusedElementwise { inputs, expr } => {
+            let ts: Vec<Tensor> = inputs
+                .iter()
+                .map(|i| ev.value(i.id))
+                .collect::<candle_core::Result<Vec<_>>>()?;
+            let first = &ts[0];
+            let outs = fusion::run(
+                std::slice::from_ref(expr),
+                &ts,
+                &[],
+                first.elem_count(),
+                first.dims(),
+                first.dtype(),
+                &first.device(),
+            )?;
+            outs.into_iter().next().unwrap()
+        }
     };
     Ok(output)
 }
@@ -3900,6 +3949,9 @@ mod autodiff {
             | NodeKind::Conv1dBackwardW { .. }
             | NodeKind::Conv2dBackwardW { .. } => {
                 Err("vmap: convolution nodes are not supported under vmap".to_string())
+            }
+            NodeKind::FusedElementwise { .. } => {
+                Err("vmap: fused elementwise nodes are internal to evaluation".to_string())
             }
             _ => Ok(remap_children(&node.kind, f)),
         }
@@ -4625,6 +4677,11 @@ mod autodiff {
                         "grad: optimizer update nodes are not differentiable".to_string(),
                     );
                 }
+                NodeKind::FusedElementwise { .. } => {
+                    return Err(
+                        "grad: fused elementwise nodes are internal to evaluation".to_string(),
+                    );
+                }
                 NodeKind::Checkpoint { a } => {
                     // Deep-copy the region's interior with fresh node ids and
                     // build the adjoint over the copy: forward intermediates
@@ -4748,12 +4805,263 @@ async fn run_compute<T: Send + 'static>(
     }
 }
 
+// RFC 0007 phase 2: folds maximal single-consumer chains of elementwise
+// ops into FusedElementwise nodes, each evaluated as one kernel. Runs on a
+// throwaway rewrite at evaluation time, so autodiff, vmap and checkpoint
+// always see the unfused graph. EFFECT_TORCH_NO_FUSION disables it.
+fn fuse_roots(roots: &[Arc<Node>]) -> std::result::Result<Vec<Arc<Node>>, String> {
+    if std::env::var_os("EFFECT_TORCH_NO_FUSION").is_some() {
+        return Ok(roots.to_vec());
+    }
+    use fusion::Expr as E;
+
+    let mut order: Vec<Arc<Node>> = Vec::new();
+    let mut visited = HashSet::new();
+    fn visit(n: &Arc<Node>, visited: &mut HashSet<u64>, order: &mut Vec<Arc<Node>>) {
+        if !visited.insert(n.id) {
+            return;
+        }
+        for c in node_children(&n.kind) {
+            visit(&c, visited, order);
+        }
+        order.push(n.clone());
+    }
+    for r in roots {
+        visit(r, &mut visited, &mut order);
+    }
+    let mut consumers: HashMap<u64, usize> = HashMap::new();
+    for n in &order {
+        for c in node_children(&n.kind) {
+            *consumers.entry(c.id).or_insert(0) += 1;
+        }
+    }
+
+    enum OpT {
+        Unary(fn(E) -> E),
+        Binary(fn(E, E) -> E),
+    }
+    // An input qualifies when it matches the output shape exactly, or is a
+    // uniform constant that folds into the IR (scalar or output-shaped).
+    fn input_ok(c: &Node, out: &[usize]) -> bool {
+        c.shape == out
+            || match &c.kind {
+                NodeKind::Full { shape, .. } | NodeKind::Zeros { shape, .. } => {
+                    shape.is_empty() || shape == out
+                }
+                _ => false,
+            }
+    }
+    let fusable = |node: &Node| -> Option<OpT> {
+        if !fusion::is_supported(&node.device, node.dtype) {
+            return None;
+        }
+        match &node.kind {
+            NodeKind::Add { a, b } if input_ok(a, &node.shape) && input_ok(b, &node.shape) => {
+                Some(OpT::Binary(|a, b| E::Add(Box::new(a), Box::new(b))))
+            }
+            NodeKind::Sub { a, b } if input_ok(a, &node.shape) && input_ok(b, &node.shape) => {
+                Some(OpT::Binary(|a, b| E::Sub(Box::new(a), Box::new(b))))
+            }
+            NodeKind::Mul { a, b } if input_ok(a, &node.shape) && input_ok(b, &node.shape) => {
+                Some(OpT::Binary(|a, b| E::Mul(Box::new(a), Box::new(b))))
+            }
+            NodeKind::Div { a, b } if input_ok(a, &node.shape) && input_ok(b, &node.shape) => {
+                Some(OpT::Binary(|a, b| E::Div(Box::new(a), Box::new(b))))
+            }
+            NodeKind::Maximum { a, b } if input_ok(a, &node.shape) && input_ok(b, &node.shape) => {
+                Some(OpT::Binary(|a, b| E::Max(Box::new(a), Box::new(b))))
+            }
+            NodeKind::Minimum { a, b } if input_ok(a, &node.shape) && input_ok(b, &node.shape) => {
+                Some(OpT::Binary(|a, b| E::Min(Box::new(a), Box::new(b))))
+            }
+            NodeKind::Neg { .. } => Some(OpT::Unary(|a| E::Neg(Box::new(a)))),
+            NodeKind::Sqrt { .. } => Some(OpT::Unary(|a| E::Sqrt(Box::new(a)))),
+            NodeKind::Exp { .. } => Some(OpT::Unary(|a| E::Exp(Box::new(a)))),
+            NodeKind::Sin { .. } => Some(OpT::Unary(|a| E::Sin(Box::new(a)))),
+            NodeKind::Cos { .. } => Some(OpT::Unary(|a| E::Cos(Box::new(a)))),
+            NodeKind::Relu { .. } => {
+                Some(OpT::Unary(|a| E::Max(Box::new(a), Box::new(E::cst(0.0)))))
+            }
+            _ => None,
+        }
+    };
+    // A uniform-value child folds into an IR constant when it is a scalar
+    // or already matches the output shape (no broadcasting inside a region).
+    let const_value = |child: &Node, out_shape: &[usize]| -> Option<f64> {
+        match &child.kind {
+            NodeKind::Full { shape, value, .. } if shape.is_empty() || shape == out_shape => {
+                Some(*value)
+            }
+            NodeKind::Zeros { shape, .. } if shape.is_empty() || shape == out_shape => Some(0.0),
+            _ => None,
+        }
+    };
+
+    struct Region {
+        expr: E,
+        inputs: Vec<Arc<Node>>,
+        lane_of: HashMap<u64, u32>,
+        ops: usize,
+    }
+    impl Region {
+        fn empty() -> Self {
+            Region {
+                expr: E::cst(0.0),
+                inputs: Vec::new(),
+                lane_of: HashMap::new(),
+                ops: 0,
+            }
+        }
+        fn lane(&mut self, n: &Arc<Node>) -> E {
+            if let Some(&k) = self.lane_of.get(&n.id) {
+                return E::Input(k);
+            }
+            let k = self.inputs.len() as u32;
+            self.inputs.push(n.clone());
+            self.lane_of.insert(n.id, k);
+            E::Input(k)
+        }
+        // Takes ownership of another region's lanes; returns its expr with
+        // lane indices shifted into this region's namespace.
+        fn absorb(&mut self, other: Region) -> E {
+            let base = self.inputs.len() as u32;
+            for (id, k) in other.lane_of {
+                self.lane_of.insert(id, base + k);
+            }
+            self.inputs.extend(other.inputs);
+            self.ops += other.ops;
+            other.expr.shift_inputs(base)
+        }
+    }
+
+    let mut open: HashMap<u64, Region> = HashMap::new();
+    let mut map: HashMap<u64, Arc<Node>> = HashMap::new();
+    for node in &order {
+        let children = node_children(&node.kind);
+        let opt = fusable(node);
+        // close regions this node will not extend
+        for c in &children {
+            if open.contains_key(&c.id)
+                && (opt.is_none() || consumers.get(&c.id).copied().unwrap_or(0) != 1)
+            {
+                let region = open.remove(&c.id).unwrap();
+                let fused = if region.ops >= 2 {
+                    Node::new(NodeKind::FusedElementwise {
+                        inputs: region.inputs,
+                        expr: region.expr,
+                    })?
+                } else {
+                    Node::new(remap_children(&c.kind, &|ch| {
+                        map.get(&ch.id).cloned().unwrap_or_else(|| ch.clone())
+                    }))?
+                };
+                map.insert(c.id, fused);
+            }
+        }
+        match opt {
+            None => {
+                let rebuilt = remap_children(&node.kind, &|ch| {
+                    map.get(&ch.id).cloned().unwrap_or_else(|| ch.clone())
+                });
+                map.insert(node.id, Node::new(rebuilt)?);
+            }
+            Some(OpT::Unary(f)) => {
+                let c = children[0].clone();
+                let (mut region, expr) = match open.remove(&c.id) {
+                    Some(r) => {
+                        let e = f(r.expr.clone());
+                        (r, e)
+                    }
+                    None => {
+                        let mut r = Region::empty();
+                        let l = if let Some(v) = const_value(&c, &node.shape) {
+                            E::cst(v)
+                        } else {
+                            r.lane(&map.get(&c.id).cloned().unwrap_or_else(|| c.clone()))
+                        };
+                        (r, f(l))
+                    }
+                };
+                region.expr = expr;
+                region.ops += 1;
+                open.insert(node.id, region);
+            }
+            Some(OpT::Binary(f)) => {
+                let a = children[0].clone();
+                let b = children[1].clone();
+                let (mut region, expr) = match (open.remove(&a.id), open.remove(&b.id)) {
+                    (Some(mut r1), Some(r2)) => {
+                        let b_expr = r1.absorb(r2);
+                        let e = f(r1.expr.clone(), b_expr);
+                        (r1, e)
+                    }
+                    (Some(mut r), None) => {
+                        let l = if let Some(v) = const_value(&b, &node.shape) {
+                            E::cst(v)
+                        } else {
+                            r.lane(&map.get(&b.id).cloned().unwrap_or_else(|| b.clone()))
+                        };
+                        let e = f(r.expr.clone(), l);
+                        (r, e)
+                    }
+                    (None, Some(mut r)) => {
+                        let l = if let Some(v) = const_value(&a, &node.shape) {
+                            E::cst(v)
+                        } else {
+                            r.lane(&map.get(&a.id).cloned().unwrap_or_else(|| a.clone()))
+                        };
+                        let e = f(l, r.expr.clone());
+                        (r, e)
+                    }
+                    (None, None) => {
+                        let mut r = Region::empty();
+                        let la = if let Some(v) = const_value(&a, &node.shape) {
+                            E::cst(v)
+                        } else {
+                            r.lane(&map.get(&a.id).cloned().unwrap_or_else(|| a.clone()))
+                        };
+                        let lb = if let Some(v) = const_value(&b, &node.shape) {
+                            E::cst(v)
+                        } else {
+                            r.lane(&map.get(&b.id).cloned().unwrap_or_else(|| b.clone()))
+                        };
+                        (r, f(la, lb))
+                    }
+                };
+                region.expr = expr;
+                region.ops += 1;
+                open.insert(node.id, region);
+            }
+        }
+    }
+    // close regions whose end has no consumer in the graph (graph roots)
+    for (id, region) in open.drain() {
+        let node = order.iter().find(|n| n.id == id).unwrap();
+        let fused = if region.ops >= 2 {
+            Node::new(NodeKind::FusedElementwise {
+                inputs: region.inputs,
+                expr: region.expr,
+            })?
+        } else {
+            Node::new(remap_children(&node.kind, &|ch| {
+                map.get(&ch.id).cloned().unwrap_or_else(|| ch.clone())
+            }))?
+        };
+        map.insert(id, fused);
+    }
+    Ok(roots
+        .iter()
+        .map(|r| map.get(&r.id).cloned().unwrap_or_else(|| r.clone()))
+        .collect())
+}
+
 #[napi]
 pub async fn eval_lazy(
     tensors: Vec<&LazyTensor>,
     token: Option<&CancellationToken>,
 ) -> Result<Vec<NativeTensor>> {
     let nodes: Vec<Arc<Node>> = tensors.iter().map(|t| t.node.clone()).collect();
+    let nodes = fuse_roots(&nodes).map_err(|e| Error::new(Status::GenericFailure, e))?;
     run_compute(token, move |cancelled| {
         let mut ev = Evaluator::new(&nodes);
         let mut outputs = Vec::with_capacity(nodes.len());

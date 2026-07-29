@@ -1,6 +1,6 @@
 # RFC 0007: True Kernel Fusion
 
-- **Status**: Draft
+- **Status**: Implemented (phases 1–2; phase 3 recorded, not scheduled)
 - **Author**: Michael Arnaldi
 - **Date**: 2026-07-28
 - **Depends on**: RFC 0004 (optimizers — the fused update nodes this replaces
