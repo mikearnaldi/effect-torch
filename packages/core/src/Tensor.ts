@@ -18,6 +18,25 @@ const {
 } = native
 
 /**
+ * The native backend's computation-graph handle type, as stored in
+ * {@link GenericTensor.lazy}. Named here so userland operations can type
+ * their signatures.
+ *
+ * @since 0.1.0
+ * @category models
+ */
+export type NativeLazyTensor = NativeLazyTensorType
+
+/**
+ * The native backend's device-buffer handle type, as stored in
+ * {@link Tensor.materialized}.
+ *
+ * @since 0.1.0
+ * @category models
+ */
+export type NativeTensor = NativeTensorType
+
+/**
  * Element data types supported by the native backend.
  *
  * @since 0.1.0
@@ -66,7 +85,12 @@ export class TensorError extends Data.TaggedError("TensorError")<{
 export interface GenericTensor extends Pipeable {
   readonly [TensorTypeId]: TensorTypeId
   readonly _tag: "LazyTensor" | "Tensor"
-  /** @internal */
+  /**
+   * The native computation-graph handle. This is the library's extension
+   * seam: userland operations call native methods on it and wrap the result
+   * with {@link makeLazy}, which is how the Gradient and Optimizer modules
+   * themselves are implemented.
+   */
   readonly lazy: NativeLazyTensorType
   readonly shape: ReadonlyArray<number>
   readonly dtype: DType
@@ -93,7 +117,10 @@ export interface LazyTensor extends GenericTensor {
  */
 export interface Tensor extends GenericTensor {
   readonly _tag: "Tensor"
-  /** @internal */
+  /**
+   * The native device-buffer handle, for userland code that needs direct
+   * access to the materialized data (custom kernels, interop).
+   */
   readonly materialized: NativeTensorType
 }
 
@@ -112,7 +139,16 @@ const TensorProto = {
   }
 }
 
-/** @internal */
+/**
+ * Wraps a native graph handle as a {@link LazyTensor}. The native graph does
+ * not track shapes, so the caller owns the `shape`, `dtype` and `device`
+ * metadata: it must exactly describe the handle's result, or every
+ * downstream operation reads wrong shapes. This is the supported way to
+ * build custom native-backed operations in userland.
+ *
+ * @since 0.1.0
+ * @category constructors
+ */
 export const makeLazy = (
   lazy: NativeLazyTensorType,
   shape: ReadonlyArray<number>,
