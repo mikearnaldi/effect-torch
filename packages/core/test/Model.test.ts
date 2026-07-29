@@ -119,10 +119,10 @@ onDevices("Model", (device: TestDevice) => (it) => {
     it.effect("chained forward matches the hand-written forward on the same parameters", () =>
       Effect.gen(function* () {
         const model = yield* mlp
-        const params = yield* Tensor.evaluate(yield* model.init)
+        const params = yield* Tensor.compute(yield* model.init)
         const x = yield* Tensor.fromTypedArray(floats([0, 0, 0, 1, 1, 0, 1, 1]), [4, 2])
-        const viaModel = yield* Tensor.evaluate([yield* model.forward(params, x)])
-        const byHand = yield* Tensor.evaluate([yield* handForward(params, x)])
+        const viaModel = yield* Tensor.compute([yield* model.forward(params, x)])
+        const byHand = yield* Tensor.compute([yield* handForward(params, x)])
         deep(yield* values(viaModel[0]), yield* values(byHand[0]))
       })
     )
@@ -130,12 +130,12 @@ onDevices("Model", (device: TestDevice) => (it) => {
     it.effect("chained gradients match the hand-written gradients", () =>
       Effect.gen(function* () {
         const model = yield* mlp
-        const params = yield* Tensor.evaluate(yield* model.init)
+        const params = yield* Tensor.compute(yield* model.init)
         const x = yield* Tensor.fromTypedArray(floats([0, 0, 0, 1, 1, 0, 1, 1]), [4, 2])
         const lossModel = yield* Tensor.sum(yield* model.forward(params, x))
         const lossHand = yield* Tensor.sum(yield* handForward(params, x))
-        const gradsModel = yield* Tensor.evaluate(yield* Gradient.grad(lossModel, params))
-        const gradsHand = yield* Tensor.evaluate(yield* Gradient.grad(lossHand, params))
+        const gradsModel = yield* Tensor.compute(yield* Gradient.grad(lossModel, params))
+        const gradsHand = yield* Tensor.compute(yield* Gradient.grad(lossHand, params))
         for (let i = 0; i < gradsModel.length; i++) {
           deep(yield* values(gradsModel[i]), yield* values(gradsHand[i]))
         }
@@ -150,16 +150,236 @@ onDevices("Model", (device: TestDevice) => (it) => {
           yield* Model.relu,
           yield* Model.linear("b", 3, 1)
         )
-        const [wa, ba, wb, bb] = yield* Tensor.evaluate(yield* model.init)
+        const [wa, ba, wb, bb] = yield* Tensor.compute(yield* model.init)
         const x = yield* Tensor.fromTypedArray(floats([1, 2, 3, 4]), [2, 2])
         const manual = Effect.gen(function* () {
           const h1 = yield* Tensor.relu(yield* Tensor.add(yield* Tensor.matmul(x, wa), ba))
           const h2 = yield* Tensor.relu(h1)
           return yield* Tensor.add(yield* Tensor.matmul(h2, wb), bb)
         })
-        const [viaModel] = yield* Tensor.evaluate([yield* model.forward([wa, ba, wb, bb], x)])
-        const [byHand] = yield* Tensor.evaluate([yield* manual])
+        const [viaModel] = yield* Tensor.compute([yield* model.forward([wa, ba, wb, bb], x)])
+        const [byHand] = yield* Tensor.compute([yield* manual])
         deep(yield* values(viaModel), yield* values(byHand))
+      })
+    )
+  })
+
+  describe("layers", () => {
+    it.effect("conv2d forward matches a manual conv + bias", () =>
+      Effect.gen(function* () {
+        const model = yield* Model.conv2d("c", 2, 4, 3, { padding: 1 })
+        expect(model.names).toEqual(["c.weight", "c.bias"])
+        const [w, b] = yield* Tensor.compute(yield* model.init)
+        expect(w.shape).toEqual([4, 2, 3, 3])
+        expect(b.shape).toEqual([4])
+        const x = yield* Tensor.fromTypedArray(floats(Array.from({ length: 32 }, (_, i) => i / 32)), [1, 2, 4, 4])
+        const [viaModel] = yield* Tensor.compute([yield* model.forward([w, b], x)])
+        const [byHand] = yield* Tensor.compute([
+          yield* Tensor.add(yield* Tensor.conv2d(x, w, { padding: 1 }), yield* Tensor.reshape(b, [1, 4, 1, 1]))
+        ])
+        expect(viaModel.shape).toEqual([1, 4, 4, 4])
+        deep(yield* values(viaModel), yield* values(byHand))
+      })
+    )
+
+    it.effect("conv2d supports grouped convolutions", () =>
+      Effect.gen(function* () {
+        const model = yield* Model.conv2d("c", 4, 4, [3, 3], { groups: 2 })
+        const [w, b] = yield* Tensor.compute(yield* model.init)
+        expect(w.shape).toEqual([4, 2, 3, 3])
+        const x = yield* Tensor.fromTypedArray(floats(Array.from({ length: 4 * 5 * 5 }, (_, i) => i / 100)), [1, 4, 5, 5])
+        const [out] = yield* Tensor.compute([yield* model.forward([w, b], x)])
+        expect(out.shape).toEqual([1, 4, 3, 3])
+      })
+    )
+
+    it.effect("conv2d rejects invalid configuration", () =>
+      Effect.gen(function* () {
+        expect((yield* Effect.flip(Model.conv2d("", 2, 4, 3))).op).toBe("conv2d")
+        expect((yield* Effect.flip(Model.conv2d("c", 0, 4, 3))).op).toBe("conv2d")
+        expect((yield* Effect.flip(Model.conv2d("c", 2, 4, 0))).op).toBe("conv2d")
+        const grouped = yield* Effect.flip(Model.conv2d("c", 3, 4, 3, { groups: 2 }))
+        expect(grouped.message).toContain("groups")
+      })
+    )
+
+    it.effect("conv1d forward matches a manual conv + bias", () =>
+      Effect.gen(function* () {
+        const model = yield* Model.conv1d("c", 2, 3, 3, { stride: 2 })
+        expect(model.names).toEqual(["c.weight", "c.bias"])
+        const [w, b] = yield* Tensor.compute(yield* model.init)
+        expect(w.shape).toEqual([3, 2, 3])
+        const x = yield* Tensor.fromTypedArray(floats(Array.from({ length: 16 }, (_, i) => i / 16)), [1, 2, 8])
+        const [viaModel] = yield* Tensor.compute([yield* model.forward([w, b], x)])
+        const [byHand] = yield* Tensor.compute([
+          yield* Tensor.add(yield* Tensor.conv1d(x, w, { stride: 2 }), yield* Tensor.reshape(b, [1, 3, 1]))
+        ])
+        expect(viaModel.shape).toEqual([1, 3, 3])
+        deep(yield* values(viaModel), yield* values(byHand))
+      })
+    )
+
+    it.effect("embedding looks up rows and accumulates gradients", () =>
+      Effect.gen(function* () {
+        const model = yield* Model.embedding("emb", 3, 2)
+        expect(model.names).toEqual(["emb.weight"])
+        const [w] = yield* Tensor.compute(yield* model.init)
+        expect(w.shape).toEqual([3, 2])
+        const indexes = yield* Tensor.fromTypedArray(new BigInt64Array([0n, 1n, 0n]), [3])
+        const [viaModel] = yield* Tensor.compute([yield* model.forward([w], indexes)])
+        const [byHand] = yield* Tensor.compute([yield* Tensor.embedding(indexes, { weight: w })])
+        deep(yield* values(viaModel), yield* values(byHand))
+        const loss = yield* Tensor.sum(yield* model.forward([w], indexes))
+        const [grad] = yield* Tensor.compute(yield* Gradient.grad(loss, [w]))
+        deep(yield* values(grad), [2, 2, 1, 1, 0, 0])
+      })
+    )
+
+    it.effect("embedding rejects an out-of-range paddingIndex", () =>
+      Effect.gen(function* () {
+        const error = yield* Effect.flip(Model.embedding("emb", 3, 2, { paddingIndex: 3 }))
+        expect(error.message).toContain("paddingIndex")
+      })
+    )
+
+    it.effect("layerNorm normalizes the trailing dimensions to unit statistics", () =>
+      Effect.gen(function* () {
+        const model = yield* Model.layerNorm("ln", 4)
+        expect(model.names).toEqual(["ln.weight", "ln.bias"])
+        const params = yield* Tensor.compute(yield* model.init)
+        expect(params[0].shape).toEqual([4])
+        const x = yield* Tensor.fromTypedArray(floats([1, 2, 3, 10, -5, 0, 7, 3]), [2, 4])
+        const [out] = yield* Tensor.compute([yield* model.forward(params, x)])
+        const means = yield* values(yield* Tensor.mean(out, { dims: [-1] }))
+        const variances = yield* values(yield* Tensor.variance(out, { dims: [-1], correction: 0 }))
+        deep(means, [0, 0])
+        deep(variances, [1, 1])
+      })
+    )
+
+    it.effect("layerNorm normalizes multi-dimension shapes and applies weight and bias", () =>
+      Effect.gen(function* () {
+        const model = yield* Model.layerNorm("ln", [2, 3])
+        const [w, b] = yield* Tensor.compute(yield* model.init)
+        expect(w.shape).toEqual([2, 3])
+        const x = yield* Tensor.fromTypedArray(floats(Array.from({ length: 12 }, (_, i) => i - 5)), [2, 2, 3])
+        const [out] = yield* Tensor.compute([yield* model.forward([w, b], x)])
+        const means = yield* values(yield* Tensor.mean(out, { dims: [-2, -1] }))
+        deep(means, [0, 0])
+        const two = yield* Tensor.fromTypedArray(floats([2, 2, 2, 2, 2, 2]), [2, 3])
+        const one = yield* Tensor.fromTypedArray(floats([1, 1, 1, 1, 1, 1]), [2, 3])
+        const [scaled] = yield* Tensor.compute([yield* model.forward([two, one], x)])
+        deep(yield* values(scaled), (yield* values(out)).map((v) => v * 2 + 1))
+      })
+    )
+
+    it.effect("layerNorm rejects invalid configuration", () =>
+      Effect.gen(function* () {
+        expect((yield* Effect.flip(Model.layerNorm("ln", []))).message).toContain("empty")
+        expect((yield* Effect.flip(Model.layerNorm("ln", 0))).message).toContain("positive")
+        expect((yield* Effect.flip(Model.layerNorm("ln", 4, { eps: 0 }))).message).toContain("eps")
+      })
+    )
+
+    it.effect("activation models apply the corresponding tensor operations", () =>
+      Effect.gen(function* () {
+        const x = yield* Tensor.fromTypedArray(floats([-2, -0.5, 0, 0.5, 2]), [5])
+        const cases: Array<[Model.Model<readonly []>, (x: Tensor.GenericTensor) => Effect.Effect<Tensor.LazyTensor, Tensor.TensorError>]> = [
+          [yield* Model.gelu(), (x) => Tensor.gelu(x)],
+          [yield* Model.gelu({ approximate: "tanh" }), (x) => Tensor.gelu(x, { approximate: "tanh" })],
+          [yield* Model.silu, Tensor.silu],
+          [yield* Model.mish, Tensor.mish],
+          [yield* Model.softplus, Tensor.softplus],
+          [yield* Model.elu(), (x) => Tensor.elu(x)],
+          [yield* Model.elu({ alpha: 2 }), (x) => Tensor.elu(x, { alpha: 2 })],
+          [yield* Model.leakyRelu(), (x) => Tensor.leakyRelu(x)],
+          [yield* Model.leakyRelu({ negativeSlope: 0.2 }), (x) => Tensor.leakyRelu(x, { negativeSlope: 0.2 })],
+          [yield* Model.softmax(), (x) => Tensor.softmax(x)],
+          [yield* Model.logSoftmax(), (x) => Tensor.logSoftmax(x)]
+        ]
+        for (const [model, op] of cases) {
+          const [viaModel] = yield* Tensor.compute([yield* model.forward([], x)])
+          const [byHand] = yield* Tensor.compute([yield* op(x)])
+          deep(yield* values(viaModel), yield* values(byHand))
+        }
+      })
+    )
+
+    it.effect("flatten collapses all but the batch dimension by default", () =>
+      Effect.gen(function* () {
+        const model = yield* Model.flatten()
+        const x = yield* Tensor.fromTypedArray(floats(Array.from({ length: 120 }, (_, i) => i)), [2, 3, 4, 5])
+        const [out] = yield* Tensor.compute([yield* model.forward([], x)])
+        expect(out.shape).toEqual([2, 60])
+        const full = yield* Model.flatten({ startDim: 0 })
+        const [vector] = yield* Tensor.compute([yield* full.forward([], x)])
+        expect(vector.shape).toEqual([120])
+      })
+    )
+
+    it.effect("dropout with p = 0 is the identity and validates p", () =>
+      Effect.gen(function* () {
+        const model = yield* Model.dropout({ p: 0 })
+        const x = yield* Tensor.fromTypedArray(floats([1, 2, 3]), [3])
+        const [out] = yield* Tensor.compute([yield* model.forward([], x)])
+        deep(yield* values(out), [1, 2, 3])
+        expect((yield* Effect.flip(Model.dropout({ p: 1 }))).message).toContain("[0, 1)")
+        expect((yield* Effect.flip(Model.dropout({ p: -0.1 }))).message).toContain("[0, 1)")
+      })
+    )
+
+    it.effect("pool models apply the corresponding tensor operations", () =>
+      Effect.gen(function* () {
+        const x = yield* Tensor.fromTypedArray(floats(Array.from({ length: 16 }, (_, i) => i)), [1, 1, 4, 4])
+        const maxPool = yield* Model.maxPool2d({ kernelSize: 2 })
+        const [viaMax] = yield* Tensor.compute([yield* maxPool.forward([], x)])
+        const [handMax] = yield* Tensor.compute([yield* Tensor.maxPool2d(x, { kernelSize: 2 })])
+        deep(yield* values(viaMax), yield* values(handMax))
+        const avgPool = yield* Model.avgPool2d({ kernelSize: [2, 2], stride: 2 })
+        const [viaAvg] = yield* Tensor.compute([yield* avgPool.forward([], x)])
+        const [handAvg] = yield* Tensor.compute([yield* Tensor.avgPool2d(x, { kernelSize: [2, 2], stride: 2 })])
+        deep(yield* values(viaAvg), yield* values(handAvg))
+        expect((yield* Effect.flip(Model.maxPool2d({ kernelSize: 0 }))).message).toContain("kernelSize")
+        expect((yield* Effect.flip(Model.avgPool2d({ kernelSize: 2, stride: 0 }))).message).toContain("stride")
+        expect((yield* Effect.flip(Model.maxPool2d({ kernelSize: 2, padding: -1 }))).message).toContain("padding")
+      })
+    )
+
+    it.effect("a conv net chain flows end to end", () =>
+      Effect.gen(function* () {
+        const model = yield* Model.chain(
+          yield* Model.conv2d("conv", 3, 4, 3, { padding: 1 }),
+          yield* Model.relu,
+          yield* Model.maxPool2d({ kernelSize: 2 }),
+          yield* Model.flatten(),
+          yield* Model.linear("fc", 64, 10)
+        )
+        expect(model.names).toEqual(["conv.weight", "conv.bias", "fc.weight", "fc.bias"])
+        const params = yield* model.init
+        const x = yield* Tensor.fromTypedArray(floats(Array.from({ length: 2 * 3 * 8 * 8 }, (_, i) => i / 384)), [2, 3, 8, 8])
+        const [out] = yield* Tensor.compute([yield* model.forward(params, x)])
+        expect(out.shape).toEqual([2, 10])
+      })
+    )
+
+    it.effect("a dropout stage drops out of the eval chain with the same parameter tuple", () =>
+      Effect.gen(function* () {
+        const trainNet = yield* Model.chain(
+          yield* Model.linear("fc1", 2, 4),
+          yield* Model.relu,
+          yield* Model.dropout({ p: 0 }),
+          yield* Model.linear("fc2", 4, 1)
+        )
+        const evalNet = yield* Model.chain(
+          yield* Model.linear("fc1", 2, 4),
+          yield* Model.relu,
+          yield* Model.linear("fc2", 4, 1)
+        )
+        const params = yield* Tensor.compute(yield* trainNet.init)
+        const x = yield* Tensor.fromTypedArray(floats([0, 1, 1, 0]), [2, 2])
+        const [viaTrain] = yield* Tensor.compute([yield* trainNet.forward(params, x)])
+        const [viaEval] = yield* Tensor.compute([yield* evalNet.forward(params, x)])
+        deep(yield* values(viaTrain), yield* values(viaEval))
       })
     )
   })
@@ -170,7 +390,7 @@ onDevices("Model", (device: TestDevice) => (it) => {
         const dir = yield* tmpdir
         const file = path.join(dir, "mlp.safetensors")
         const model = yield* mlp
-        const params = yield* Tensor.evaluate(yield* model.init)
+        const params = yield* Tensor.compute(yield* model.init)
         yield* Model.save(model, params, file)
         const loaded = yield* Model.load(model, file)
         expect(loaded.length).toBe(model.names.length)
@@ -179,8 +399,8 @@ onDevices("Model", (device: TestDevice) => (it) => {
           deep(yield* values(loaded[i]), yield* values(params[i]))
         }
         const x = yield* Tensor.fromTypedArray(floats([0, 1, 1, 0]), [2, 2])
-        const [before] = yield* Tensor.evaluate([yield* model.forward(params, x)])
-        const [after] = yield* Tensor.evaluate([yield* model.forward(loaded, x)])
+        const [before] = yield* Tensor.compute([yield* model.forward(params, x)])
+        const [after] = yield* Tensor.compute([yield* model.forward(loaded, x)])
         deep(yield* values(after), yield* values(before))
       })
     )
@@ -189,7 +409,7 @@ onDevices("Model", (device: TestDevice) => (it) => {
       Effect.gen(function* () {
         const dir = yield* tmpdir
         const model = yield* mlp
-        const params = yield* Tensor.evaluate(yield* model.init)
+        const params = yield* Tensor.compute(yield* model.init)
         const error = yield* Effect.flip(Model.save(model, params.slice(0, 3), path.join(dir, "x.safetensors")))
         expect(error._tag).toBe("ModelError")
         expect(error.op).toBe("save")
@@ -202,7 +422,7 @@ onDevices("Model", (device: TestDevice) => (it) => {
         const dir = yield* tmpdir
         const file = path.join(dir, "partial.safetensors")
         const small = yield* Model.linear("fc1", 2, 8)
-        const params = yield* Tensor.evaluate(yield* small.init)
+        const params = yield* Tensor.compute(yield* small.init)
         yield* Model.save(small, params, file)
         const error = yield* Effect.flip(Model.load(yield* mlp, file))
         expect(error._tag).toBe("ModelError")
@@ -220,7 +440,7 @@ onDevices("Model", (device: TestDevice) => (it) => {
           yield* Model.tanh,
           yield* Model.linear("fc2", 8, 1)
         )
-        yield* Model.save(wide, yield* Tensor.evaluate(yield* wide.init), file)
+        yield* Model.save(wide, yield* Tensor.compute(yield* wide.init), file)
         const narrow = yield* Model.chain(
           yield* Model.linear("fc1", 2, 8),
           yield* Model.tanh,
@@ -285,7 +505,7 @@ onDevices("Model", (device: TestDevice) => (it) => {
           stop: ({ step }) => step >= 2500
         })
         expect(loss).toBeLessThan(0.05)
-        const [pred] = yield* Tensor.evaluate([yield* model.forward(params, x)])
+        const [pred] = yield* Tensor.compute([yield* model.forward(params, x)])
         expect((yield* values(pred)).map((v) => (v > 0.5 ? 1 : 0))).toEqual([0, 1, 1, 0])
       })
     )
@@ -313,10 +533,10 @@ onDevices("Model", (device: TestDevice) => (it) => {
         const model = yield* mlp
         const x = yield* Tensor.fromTypedArray(floats([0, 0, 0, 1, 1, 0, 1, 1]), [4, 2])
         const y = yield* Tensor.fromTypedArray(floats([0, 1, 1, 0]), [4, 1])
-        const initial = yield* Tensor.evaluate(yield* model.init)
+        const initial = yield* Tensor.compute(yield* model.init)
         const lossOf = (params: Model.Params<typeof model>) =>
           Effect.gen(function* () {
-            const [value] = yield* Tensor.evaluate([
+            const [value] = yield* Tensor.compute([
               yield* Loss.mse(yield* model.forward(params, x), y)
             ])
             return (yield* values(value))[0]

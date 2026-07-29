@@ -16,7 +16,7 @@ open, with an API surface small enough to read end to end:
 
 - **Tensors and dtypes** — the raw data of AI models
 - **A lazy computation graph** — operations describe *what* to compute, a
-  single `evaluate` decides *when*
+  single `compute` decides *when*
 - **Device abstraction** — the same program runs on CPU, Metal, or CUDA
 - **Typed errors and cancellation** — because correctness and resource
   control matter as much as speed
@@ -38,11 +38,11 @@ open, with an API surface small enough to read end to end:
 ```
 
 - **Lazy by design.** Every operation appends a node to a computation graph.
-  Nothing runs until `evaluate`, which compiles the whole graph in one FFI
+  Nothing runs until `compute`, which compiles the whole graph in one FFI
   call, deduplicates shared subexpressions, and frees intermediates when done.
 - **Never blocks JavaScript.** Graph evaluation and data readback run on a
   Rust blocking thread pool; the JS event loop stays free.
-- **Interruptible.** `evaluate` and `toTypedArray` wire Effect fiber
+- **Interruptible.** `compute` and `toTypedArray` wire Effect fiber
   interruption into a native cancellation token — interrupting the fiber
   aborts the native computation.
 - **Strict dtypes.** No implicit promotion: mixing `f32` with `i64` fails with
@@ -257,7 +257,7 @@ const step = Effect.gen(function* () {
   const loss = yield* Tensor.mse(pred, y)
   const [gw, gb] = yield* Gradient.grad(loss, [w, b])
   // loss and grads share the forward graph: evaluate them in one walk
-  const [l, gW, gB] = yield* Tensor.evaluate([loss, gw, gb])
+  const [l, gW, gB] = yield* Tensor.compute([loss, gw, gb])
   // ...optimizer step...
 })
 ```
@@ -327,7 +327,14 @@ that can fail returns an `Effect`: constructors validate into a
 | Export | Description |
 | --- | --- |
 | `Model.linear(name, in, out)` | `Effect` of a fully-connected layer, `randn * 1/√in` weight, zero bias |
-| `Model.tanh` / `Model.sigmoid` / `Model.relu` | `Effect`s of activations as parameterless models |
+| `Model.conv1d` / `Model.conv2d(name, in, out, k, opts?)` | `Effect`s of convolution layers, fan-in-scaled weight, per-channel bias |
+| `Model.embedding(name, num, dim, opts?)` | `Effect` of an embedding lookup layer, unit-normal weight |
+| `Model.layerNorm(name, shape, { eps? })` | `Effect` of layer normalization over the trailing `shape` dims |
+| `Model.tanh` / `sigmoid` / `relu` / `silu` / `mish` / `softplus` | `Effect`s of activations as parameterless models |
+| `Model.gelu(opts?)` / `elu(opts?)` / `leakyRelu(opts?)` | `Effect`s of option-taking activations |
+| `Model.softmax(dim?)` / `logSoftmax(dim?)` / `flatten(opts?)` | `Effect`s of shape/reduction stages (`flatten` preserves the batch dim) |
+| `Model.dropout({ p? })` | `Effect` of inverted dropout — always applies; build the eval chain without it |
+| `Model.maxPool2d(opts)` / `avgPool2d(opts)` | `Effect`s of pooling stages |
 | `Model.chain(...models)` | `Effect` of sequential composition; parameter tuple computed at the type level |
 | `Model.train(model, { optimizer, loss, data, stop, params?, onStep? })` | the training loop: init → forward → loss → grad → update, one walk per step; `stop: (info) => boolean` ends it (step count, loss target, anything) |
 | `Model.Params<typeof model>` | extracts a model's parameter tuple type |
@@ -356,7 +363,7 @@ const program = Effect.gen(function* () {
 
 Errors are typed: every operation fails with `TensorError` (shape, dtype, or
 device mismatch at graph-build time; backend errors at evaluation time).
-Interruption is structured: interrupting the fiber running `evaluate` or
+Interruption is structured: interrupting the fiber running `compute` or
 `toTypedArray` cancels the native work.
 
 ## Benchmarks

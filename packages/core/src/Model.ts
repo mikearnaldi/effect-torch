@@ -14,13 +14,23 @@
  * init, forward, loss, gradients, update, one graph walk per step — with
  * the tensor, gradient, and callback error channels in the union.
  *
- * Primitives ({@link linear}, {@link tanh}, {@link sigmoid},
- * {@link relu}) are models; {@link chain} composes models into a model
- * with the same interface, computing the concatenated parameter tuple at
- * the type level ({@link ParamsOf}). `names` gives every parameter a
- * stable, checkpoint-friendly identity that maps directly onto
- * {@link Tensor.save} / {@link Tensor.load} via {@link save} and
- * {@link load}.
+ * The layer catalog covers the standard MLP / CNN / embedding stack:
+ * parameterised layers ({@link linear}, {@link conv1d}, {@link conv2d},
+ * {@link embedding}, {@link layerNorm}) and parameterless ones (the
+ * activations, {@link softmax}, {@link logSoftmax}, {@link flatten},
+ * {@link dropout}, {@link maxPool2d}, {@link avgPool2d}). {@link chain}
+ * composes models into a model with the same interface, computing the
+ * concatenated parameter tuple at the type level ({@link ParamsOf}).
+ * `names` gives every parameter a stable, checkpoint-friendly identity
+ * that maps directly onto {@link Tensor.save} / {@link Tensor.load} via
+ * {@link save} and {@link load}.
+ *
+ * Stateful layers (batchnorm running stats) are deliberately absent: the
+ * pure design keeps non-trainable state out of the parameter tuple until
+ * the `stateRoots`/`rebuildState` contract generalizes to models. Note
+ * that {@link dropout} is the functional form — it always applies; build
+ * the evaluation chain without it (parameterless stages add nothing to
+ * the tuple, so one checkpoint serves both chains).
  *
  * @since 0.1.0
  */
@@ -68,19 +78,20 @@ export interface Model<P extends ReadonlyArray<Tensor.GenericTensor>> {
   /**
    * Builds the initial parameters as lazy graph values. Materialization
    * happens in the first `Optimizer.step` walk (or an explicit
-   * `Tensor.evaluate`), so initial `randn` draws are consistent with the
+   * `Tensor.compute`), so initial `randn` draws are consistent with the
    * first loss within that walk.
    */
   readonly init: Effect.Effect<P, Tensor.TensorError, CurrentDevice>
   /**
    * Extends the graph: parameters and input in, lazy output out.
    * Single-input, single-output; differentiated as-is by
-   * `Gradient.grad`.
+   * `Gradient.grad`. May require the current device (layers that draw
+   * randomness or reshape on-device, like `dropout` and the pools).
    */
   readonly forward: (
     params: P,
     input: Tensor.GenericTensor
-  ) => Effect.Effect<Tensor.LazyTensor, Tensor.TensorError>
+  ) => Effect.Effect<Tensor.LazyTensor, Tensor.TensorError, CurrentDevice>
 }
 
 /**
@@ -117,6 +128,23 @@ export type ParamsOf<Ms extends ReadonlyArray<Any>> = Ms extends readonly [infer
  */
 export type Params<M extends Any> = M extends Model<infer P> ? P : never
 
+const checkName = (op: string, name: string): Effect.Effect<void, ModelError> =>
+  name.length === 0 ? new ModelError({ op, message: "name must not be empty" }) : Effect.void
+
+const checkPositiveInt = (op: string, field: string, value: number): Effect.Effect<void, ModelError> =>
+  Number.isInteger(value) && value >= 1
+    ? Effect.void
+    : new ModelError({ op, message: `${field} must be a positive integer, got ${value}` })
+
+const parameterless = (
+  apply: (self: Tensor.GenericTensor) => Effect.Effect<Tensor.LazyTensor, Tensor.TensorError, CurrentDevice>
+): Effect.Effect<Model<readonly []>> =>
+  Effect.succeed({
+    names: [],
+    init: Effect.succeed<readonly []>([]),
+    forward: (_, input) => apply(input)
+  })
+
 /**
  * A fully-connected layer `add(matmul(input, weight), bias)` with
  * `names = ["<name>.weight", "<name>.bias"]`. The weight is initialized to
@@ -134,46 +162,236 @@ export const linear = (
 ): Effect.Effect<
   Model<readonly [weight: Tensor.GenericTensor, bias: Tensor.GenericTensor]>,
   ModelError
-> => {
-  if (name.length === 0) {
-    return new ModelError({ op: "linear", message: "name must not be empty" })
-  }
-  if (!Number.isInteger(inFeatures) || inFeatures < 1) {
-    return new ModelError({
-      op: "linear",
-      message: `inFeatures must be a positive integer, got ${inFeatures}`
-    })
-  }
-  if (!Number.isInteger(outFeatures) || outFeatures < 1) {
-    return new ModelError({
-      op: "linear",
-      message: `outFeatures must be a positive integer, got ${outFeatures}`
-    })
-  }
-  return Effect.succeed({
-    names: [`${name}.weight`, `${name}.bias`],
-    init: Effect.gen(function* () {
-      const weight = yield* Tensor.mul(
-        yield* Tensor.randn([inFeatures, outFeatures]),
-        1 / Math.sqrt(inFeatures)
-      )
-      const bias = yield* Tensor.zeros([1, outFeatures])
-      return [weight, bias] as const
-    }),
-    forward: ([weight, bias], input) =>
-      Effect.gen(function* () {
-        return yield* Tensor.add(yield* Tensor.matmul(input, weight), bias)
-      })
+> =>
+  Effect.gen(function* () {
+    yield* checkName("linear", name)
+    yield* checkPositiveInt("linear", "inFeatures", inFeatures)
+    yield* checkPositiveInt("linear", "outFeatures", outFeatures)
+    return {
+      names: [`${name}.weight`, `${name}.bias`],
+      init: Effect.gen(function* () {
+        const weight = yield* Tensor.mul(
+          yield* Tensor.randn([inFeatures, outFeatures]),
+          1 / Math.sqrt(inFeatures)
+        )
+        const bias = yield* Tensor.zeros([1, outFeatures])
+        return [weight, bias] as const
+      }),
+      forward: ([weight, bias], input) =>
+        Effect.gen(function* () {
+          return yield* Tensor.add(yield* Tensor.matmul(input, weight), bias)
+        })
+    }
   })
-}
 
-const parameterless = (
-  apply: (self: Tensor.GenericTensor) => Effect.Effect<Tensor.LazyTensor, Tensor.TensorError>
-): Effect.Effect<Model<readonly []>> =>
-  Effect.succeed({
-    names: [],
-    init: Effect.succeed<readonly []>([]),
-    forward: (_, input) => apply(input)
+/**
+ * A 1-D convolution layer over `[N, C_in, L]` inputs with
+ * `names = ["<name>.weight", "<name>.bias"]`. The weight is
+ * `[C_out, C_in/groups, K]` initialized to `randn * (1 / sqrt(fan_in))`
+ * with `fan_in = (C_in/groups) * K`; the bias is `zeros([C_out])`, added
+ * per channel. Stride, padding, dilation, and groups come from
+ * `options`. Fails with a {@link ModelError} on an empty name,
+ * non-positive channels/kernel/groups, or channels not divisible into
+ * groups.
+ *
+ * @since 0.1.0
+ * @category constructors
+ */
+export const conv1d = (
+  name: string,
+  inChannels: number,
+  outChannels: number,
+  kernelSize: number,
+  options: Tensor.ConvOptions = {}
+): Effect.Effect<
+  Model<readonly [weight: Tensor.GenericTensor, bias: Tensor.GenericTensor]>,
+  ModelError
+> =>
+  Effect.gen(function* () {
+    yield* checkName("conv1d", name)
+    yield* checkPositiveInt("conv1d", "inChannels", inChannels)
+    yield* checkPositiveInt("conv1d", "outChannels", outChannels)
+    yield* checkPositiveInt("conv1d", "kernelSize", kernelSize)
+    const groups = options.groups ?? 1
+    yield* checkPositiveInt("conv1d", "groups", groups)
+    if (inChannels % groups !== 0 || outChannels % groups !== 0) {
+      return yield* new ModelError({
+        op: "conv1d",
+        message: `channels [${inChannels}, ${outChannels}] are not divisible into ${groups} groups`
+      })
+    }
+    const fanIn = (inChannels / groups) * kernelSize
+    return {
+      names: [`${name}.weight`, `${name}.bias`],
+      init: Effect.gen(function* () {
+        const weight = yield* Tensor.mul(
+          yield* Tensor.randn([outChannels, inChannels / groups, kernelSize]),
+          1 / Math.sqrt(fanIn)
+        )
+        const bias = yield* Tensor.zeros([outChannels])
+        return [weight, bias] as const
+      }),
+      forward: ([weight, bias], input) =>
+        Effect.gen(function* () {
+          const out = yield* Tensor.conv1d(input, weight, options)
+          return yield* Tensor.add(out, yield* Tensor.reshape(bias, [1, outChannels, 1]))
+        })
+    }
+  })
+
+/**
+ * A 2-D convolution layer over `[N, C_in, H, W]` inputs with
+ * `names = ["<name>.weight", "<name>.bias"]`. The weight is
+ * `[C_out, C_in/groups, KH, KW]` initialized to `randn * (1 / sqrt(fan_in))`
+ * with `fan_in = (C_in/groups) * KH * KW`; the bias is `zeros([C_out])`,
+ * added per channel. `kernelSize` is a square size or a `[KH, KW]` pair;
+ * stride, padding, dilation, and groups come from `options`. Fails with a
+ * {@link ModelError} on an empty name, non-positive channels/kernel/groups,
+ * or channels not divisible into groups.
+ *
+ * @since 0.1.0
+ * @category constructors
+ */
+export const conv2d = (
+  name: string,
+  inChannels: number,
+  outChannels: number,
+  kernelSize: number | readonly [number, number],
+  options: Tensor.ConvOptions = {}
+): Effect.Effect<
+  Model<readonly [weight: Tensor.GenericTensor, bias: Tensor.GenericTensor]>,
+  ModelError
+> =>
+  Effect.gen(function* () {
+    yield* checkName("conv2d", name)
+    yield* checkPositiveInt("conv2d", "inChannels", inChannels)
+    yield* checkPositiveInt("conv2d", "outChannels", outChannels)
+    const [kh, kw] = typeof kernelSize === "number" ? [kernelSize, kernelSize] as const : kernelSize
+    yield* checkPositiveInt("conv2d", "kernelSize", kh)
+    yield* checkPositiveInt("conv2d", "kernelSize", kw)
+    const groups = options.groups ?? 1
+    yield* checkPositiveInt("conv2d", "groups", groups)
+    if (inChannels % groups !== 0 || outChannels % groups !== 0) {
+      return yield* new ModelError({
+        op: "conv2d",
+        message: `channels [${inChannels}, ${outChannels}] are not divisible into ${groups} groups`
+      })
+    }
+    const fanIn = (inChannels / groups) * kh * kw
+    return {
+      names: [`${name}.weight`, `${name}.bias`],
+      init: Effect.gen(function* () {
+        const weight = yield* Tensor.mul(
+          yield* Tensor.randn([outChannels, inChannels / groups, kh, kw]),
+          1 / Math.sqrt(fanIn)
+        )
+        const bias = yield* Tensor.zeros([outChannels])
+        return [weight, bias] as const
+      }),
+      forward: ([weight, bias], input) =>
+        Effect.gen(function* () {
+          const out = yield* Tensor.conv2d(input, weight, options)
+          return yield* Tensor.add(out, yield* Tensor.reshape(bias, [1, outChannels, 1, 1]))
+        })
+    }
+  })
+
+/**
+ * An embedding layer: looks up rows of a `[numEmbeddings, embeddingDim]`
+ * weight by integer indexes of any shape, giving
+ * `[...indexes.shape, embeddingDim]`. `names = ["<name>.weight"]`; the
+ * weight is initialized to `randn` (unit normal, matching PyTorch).
+ * Repeated indexes accumulate weight gradients. Fails with a
+ * {@link ModelError} on an empty name, non-positive counts, or a
+ * `paddingIndex` outside `[0, numEmbeddings)`.
+ *
+ * @since 0.1.0
+ * @category constructors
+ */
+export const embedding = (
+  name: string,
+  numEmbeddings: number,
+  embeddingDim: number,
+  options: { readonly paddingIndex?: number } = {}
+): Effect.Effect<Model<readonly [weight: Tensor.GenericTensor]>, ModelError> =>
+  Effect.gen(function* () {
+    yield* checkName("embedding", name)
+    yield* checkPositiveInt("embedding", "numEmbeddings", numEmbeddings)
+    yield* checkPositiveInt("embedding", "embeddingDim", embeddingDim)
+    if (
+      options.paddingIndex !== undefined &&
+      (!Number.isInteger(options.paddingIndex) || options.paddingIndex < 0 ||
+        options.paddingIndex >= numEmbeddings)
+    ) {
+      return yield* new ModelError({
+        op: "embedding",
+        message: `paddingIndex must be an integer in [0, ${numEmbeddings}), got ${options.paddingIndex}`
+      })
+    }
+    return {
+      names: [`${name}.weight`],
+      init: Effect.gen(function* () {
+        const weight = yield* Tensor.randn([numEmbeddings, embeddingDim])
+        return [weight] as const
+      }),
+      forward: ([weight], input) =>
+        Tensor.embedding(input, {
+          weight,
+          ...(options.paddingIndex !== undefined ? { paddingIndex: options.paddingIndex } : {})
+        })
+    }
+  })
+
+/**
+ * A layer-normalization layer over the trailing `normalizedShape`
+ * dimensions: `(x - mean) / sqrt(var + eps) * weight + bias` with the
+ * biased variance and `eps` defaulting to `1e-5`.
+ * `names = ["<name>.weight", "<name>.bias"]`, initialized to ones and
+ * zeros of `normalizedShape` (a single feature count or a shape). Fails
+ * with a {@link ModelError} on an empty name, an empty or non-positive
+ * shape, or a non-positive `eps`.
+ *
+ * @since 0.1.0
+ * @category constructors
+ */
+export const layerNorm = (
+  name: string,
+  normalizedShape: number | ReadonlyArray<number>,
+  options: { readonly eps?: number } = {}
+): Effect.Effect<
+  Model<readonly [weight: Tensor.GenericTensor, bias: Tensor.GenericTensor]>,
+  ModelError
+> =>
+  Effect.gen(function* () {
+    yield* checkName("layerNorm", name)
+    const shape: ReadonlyArray<number> = typeof normalizedShape === "number" ? [normalizedShape] : normalizedShape
+    if (shape.length === 0) {
+      return yield* new ModelError({ op: "layerNorm", message: "normalizedShape must not be empty" })
+    }
+    for (const dim of shape) {
+      yield* checkPositiveInt("layerNorm", "normalizedShape", dim)
+    }
+    const eps = options.eps ?? 1e-5
+    if (!(eps > 0)) {
+      return yield* new ModelError({ op: "layerNorm", message: `eps must be positive, got ${eps}` })
+    }
+    const dims = shape.map((_, i) => i - shape.length)
+    return {
+      names: [`${name}.weight`, `${name}.bias`],
+      init: Effect.gen(function* () {
+        const weight = yield* Tensor.ones(shape)
+        const bias = yield* Tensor.zeros(shape)
+        return [weight, bias] as const
+      }),
+      forward: ([weight, bias], input) =>
+        Effect.gen(function* () {
+          const mu = yield* Tensor.mean(input, { dims, keepdims: true })
+          const centered = yield* Tensor.sub(input, mu)
+          const variance = yield* Tensor.variance(input, { dims, keepdims: true, correction: 0 })
+          const inv = yield* Tensor.rsqrt(yield* Tensor.add(variance, eps))
+          return yield* Tensor.add(yield* Tensor.mul(yield* Tensor.mul(centered, inv), weight), bias)
+        })
+    }
   })
 
 /**
@@ -199,6 +417,184 @@ export const sigmoid: Effect.Effect<Model<readonly []>> = parameterless(Tensor.s
  * @category constructors
  */
 export const relu: Effect.Effect<Model<readonly []>> = parameterless(Tensor.relu)
+
+/**
+ * The SiLU / swish activation `x * sigmoid(x)` as a parameterless model.
+ *
+ * @since 0.1.0
+ * @category constructors
+ */
+export const silu: Effect.Effect<Model<readonly []>> = parameterless(Tensor.silu)
+
+/**
+ * The mish activation `x * tanh(softplus(x))` as a parameterless model.
+ *
+ * @since 0.1.0
+ * @category constructors
+ */
+export const mish: Effect.Effect<Model<readonly []>> = parameterless(Tensor.mish)
+
+/**
+ * The softplus activation `log(1 + exp(x))` as a parameterless model.
+ *
+ * @since 0.1.0
+ * @category constructors
+ */
+export const softplus: Effect.Effect<Model<readonly []>> = parameterless(Tensor.softplus)
+
+/**
+ * The GELU activation as a parameterless model; `approximate` (`"none"`,
+ * the erf form, or `"tanh"`) comes from `options`.
+ *
+ * @since 0.1.0
+ * @category constructors
+ */
+export const gelu = (options: Tensor.GeluOptions = {}): Effect.Effect<Model<readonly []>> =>
+  parameterless((input) => Tensor.gelu(input, options))
+
+/**
+ * The ELU activation as a parameterless model; `alpha` comes from
+ * `options`.
+ *
+ * @since 0.1.0
+ * @category constructors
+ */
+export const elu = (options: Tensor.EluOptions = {}): Effect.Effect<Model<readonly []>> =>
+  parameterless((input) => Tensor.elu(input, options))
+
+/**
+ * The leaky-ReLU activation as a parameterless model; `negativeSlope`
+ * comes from `options`.
+ *
+ * @since 0.1.0
+ * @category constructors
+ */
+export const leakyRelu = (
+  options: Tensor.LeakyReluOptions = {}
+): Effect.Effect<Model<readonly []>> => parameterless((input) => Tensor.leakyRelu(input, options))
+
+/**
+ * Softmax over `dim` (the last dimension by default) as a parameterless
+ * model.
+ *
+ * @since 0.1.0
+ * @category constructors
+ */
+export const softmax = (dim: number = -1): Effect.Effect<Model<readonly []>> =>
+  parameterless((input) => Tensor.softmax(input, { dims: [dim] }))
+
+/**
+ * Log-softmax over `dim` (the last dimension by default) as a
+ * parameterless model.
+ *
+ * @since 0.1.0
+ * @category constructors
+ */
+export const logSoftmax = (dim: number = -1): Effect.Effect<Model<readonly []>> =>
+  parameterless((input) => Tensor.logSoftmax(input, { dims: [dim] }))
+
+/**
+ * Flattens the input into `[batch, features]` as a parameterless model:
+ * `startDim` defaults to **1** (the batch dimension is preserved, the
+ * common case between the convolutional and the fully-connected part of a
+ * network) and `endDim` to the last dimension.
+ *
+ * @since 0.1.0
+ * @category constructors
+ */
+export const flatten = (
+  options: { readonly startDim?: number; readonly endDim?: number } = {}
+): Effect.Effect<Model<readonly []>> =>
+  parameterless((input) =>
+    Tensor.flatten(input, {
+      startDim: options.startDim ?? 1,
+      ...(options.endDim !== undefined ? { endDim: options.endDim } : {})
+    })
+  )
+
+/**
+ * Inverted dropout as a parameterless model: zeroes elements with
+ * probability `p` (default `0.5`) and scales survivors by `1 / (1 - p)`.
+ * This is the functional form — it **always applies**; build the
+ * evaluation chain without it (dropout adds nothing to the parameter
+ * tuple, so one checkpoint serves both chains). The mask is drawn at
+ * evaluation time, so the usual `randn` rule applies: evaluate the loss
+ * and its gradients together in one walk. Fails with a {@link ModelError}
+ * if `p` is outside `[0, 1)`.
+ *
+ * @since 0.1.0
+ * @category constructors
+ */
+export const dropout = (
+  options: Tensor.DropoutOptions = {}
+): Effect.Effect<Model<readonly []>, ModelError> =>
+  Effect.gen(function* () {
+    const p = options.p ?? 0.5
+    if (p < 0 || p >= 1) {
+      return yield* new ModelError({ op: "dropout", message: `p must be in [0, 1), got ${p}` })
+    }
+    return {
+      names: [],
+      init: Effect.succeed<readonly []>([]),
+      forward: (_, input) => Tensor.dropout(input, { p })
+    }
+  })
+
+const pool = (
+  op: string,
+  apply: (
+    self: Tensor.GenericTensor,
+    options: Tensor.PoolOptions
+  ) => Effect.Effect<Tensor.LazyTensor, Tensor.TensorError, CurrentDevice>,
+  options: Tensor.PoolOptions
+): Effect.Effect<Model<readonly []>, ModelError> =>
+  Effect.gen(function* () {
+    const [kh, kw] = typeof options.kernelSize === "number"
+      ? [options.kernelSize, options.kernelSize] as const
+      : options.kernelSize
+    yield* checkPositiveInt(op, "kernelSize", kh)
+    yield* checkPositiveInt(op, "kernelSize", kw)
+    if (options.stride !== undefined) {
+      const [sh, sw] = typeof options.stride === "number" ? [options.stride, options.stride] as const : options.stride
+      yield* checkPositiveInt(op, "stride", sh)
+      yield* checkPositiveInt(op, "stride", sw)
+    }
+    if (options.padding !== undefined && (!Number.isInteger(options.padding) || options.padding < 0)) {
+      return yield* new ModelError({
+        op,
+        message: `padding must be a non-negative integer, got ${options.padding}`
+      })
+    }
+    return {
+      names: [],
+      init: Effect.succeed<readonly []>([]),
+      forward: (_, input) => apply(input, options)
+    }
+  })
+
+/**
+ * 2-D max pooling as a parameterless model; `kernelSize` (a square size
+ * or a `[KH, KW]` pair), `stride`, and `padding` come from `options`.
+ * Fails with a {@link ModelError} on non-positive sizes or negative
+ * padding.
+ *
+ * @since 0.1.0
+ * @category constructors
+ */
+export const maxPool2d = (options: Tensor.PoolOptions): Effect.Effect<Model<readonly []>, ModelError> =>
+  pool("maxPool2d", Tensor.maxPool2d, options)
+
+/**
+ * 2-D average pooling as a parameterless model; `kernelSize` (a square
+ * size or a `[KH, KW]` pair), `stride`, and `padding` come from
+ * `options`. Fails with a {@link ModelError} on non-positive sizes or
+ * negative padding.
+ *
+ * @since 0.1.0
+ * @category constructors
+ */
+export const avgPool2d = (options: Tensor.PoolOptions): Effect.Effect<Model<readonly []>, ModelError> =>
+  pool("avgPool2d", Tensor.avgPool2d, options)
 
 /**
  * Composes models into a single model that threads its input through each

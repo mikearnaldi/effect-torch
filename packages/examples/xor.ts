@@ -31,7 +31,7 @@ const program = Effect.gen(function* () {
     yield* Model.linear("fc2", HIDDEN, 1),
     yield* Model.sigmoid
   )
-  const params = yield* Tensor.evaluate(yield* model.init)
+  const params = yield* model.init
   for (const [i, name] of model.names.entries()) {
     yield* Effect.log(`  ${name} [${params[i].shape}] ${params[i].dtype} initialized`)
   }
@@ -71,7 +71,7 @@ const evaluate = <P extends ReadonlyArray<Tensor.GenericTensor>>(
     const targets = yield* Tensor.toNumberArray(y)
     for (let i = 0; i < targets.length; i++) {
       const single = yield* Tensor.fromTypedArray(new Float32Array([inputs[i * 2], inputs[i * 2 + 1]]), [1, 2])
-      const [pred] = yield* Tensor.evaluate([yield* model.forward(params, single)])
+      const pred = yield* model.forward(params, single)
       const [value] = yield* Tensor.toNumberArray(pred)
       const rounded = value > 0.5 ? 1 : 0
       const ok = rounded === targets[i]
