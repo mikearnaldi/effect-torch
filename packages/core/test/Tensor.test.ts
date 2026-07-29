@@ -2,7 +2,7 @@ import { describe, expect } from "@effect/vitest"
 import * as assert from "@effect/vitest/utils"
 import { Effect, Exit } from "effect"
 import { Gradient, Loss, Tensor } from "../src/index.ts"
-import { deep, floatDtype, floats, onDevices, type TestDevice } from "./devices.ts"
+import { deep, floatDtype, floats, onDevices, type TestDevice } from "./utils/devices.ts"
 
 const values = (t: Tensor.GenericTensor) =>
   Effect.map(Tensor.toTypedArray(t), (arr) => Array.from<number | bigint>(arr).map(Number))

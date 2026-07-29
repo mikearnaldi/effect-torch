@@ -2,7 +2,7 @@ import { describe, expect } from "@effect/vitest"
 import * as assert from "@effect/vitest/utils"
 import { Effect } from "effect"
 import { Device, Gradient, Loss, Tensor } from "../src/index.ts"
-import { floats, onDevices, type TestDevice } from "./devices.ts"
+import { floats, onDevices, type TestDevice } from "./utils/devices.ts"
 
 type F64 = (data: ReadonlyArray<number>, shape?: ReadonlyArray<number>) => ReturnType<typeof Tensor.fromTypedArray>
 

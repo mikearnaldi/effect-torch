@@ -1,7 +1,7 @@
 import { layer } from "@effect/vitest"
 import * as assert from "@effect/vitest/utils"
 import native from "@effect-torch/native"
-import { Device } from "../src/index.ts"
+import { Device } from "../../src/index.ts"
 
 export type TestDevice = "cpu" | "metal"
 

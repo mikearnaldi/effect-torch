@@ -4,7 +4,7 @@ import * as fs from "node:fs"
 import * as os from "node:os"
 import * as path from "node:path"
 import { Gradient, Optimizer, Tensor } from "../src/index.ts"
-import { floats, onDevices, type TestDevice } from "./devices.ts"
+import { floats, onDevices, type TestDevice } from "./utils/devices.ts"
 
 const tmpdir = Effect.sync(() => fs.mkdtempSync(path.join(os.tmpdir(), "effect-torch-")))
 
