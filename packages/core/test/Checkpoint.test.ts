@@ -1,37 +1,44 @@
-import { expect, layer } from "@effect/vitest"
+import { expect } from "@effect/vitest"
 import { Effect } from "effect"
 import * as fs from "node:fs"
 import * as os from "node:os"
 import * as path from "node:path"
-import { Device, Gradient, Optimizer, Tensor } from "../src/index.ts"
+import { Gradient, Optimizer, Tensor } from "../src/index.ts"
+import { floats, onDevices, type TestDevice } from "./devices.ts"
 
 const tmpdir = Effect.sync(() => fs.mkdtempSync(path.join(os.tmpdir(), "effect-torch-")))
 
 const values = (t: Tensor.GenericTensor) =>
   Effect.map(Tensor.toTypedArray(t), (arr) => Array.from<number | bigint>(arr).map(Number))
 
-layer(Device.Cpu)("Checkpoint", (it) => {
+onDevices("Checkpoint", (device: TestDevice) => (it) => {
   it.effect("round-trips tensors of every dtype", () =>
     Effect.gen(function* () {
       const dir = yield* tmpdir
       const file = path.join(dir, "model.safetensors")
-      yield* Tensor.save(file, {
+      const entries: Record<string, Tensor.GenericTensor> = {
         "w.f32": yield* Tensor.fromTypedArray(new Float32Array([1, 2, 3, 4]), [2, 2]),
-        "w.f64": yield* Tensor.fromTypedArray(new Float64Array([5, 6]), [2]),
         "w.i64": yield* Tensor.fromTypedArray(new BigInt64Array([7n, 8n, 9n]), [3]),
         "w.u8": yield* Tensor.fromTypedArray(new Uint8Array([10, 11]), [2]),
         "w.u32": yield* Tensor.fromTypedArray(new Uint32Array([12]), [1])
-      })
+      }
+      // f64 tensors cannot be created on Metal
+      if (device === "cpu") {
+        entries["w.f64"] = yield* Tensor.fromTypedArray(floats(device, [5, 6]), [2])
+      }
+      yield* Tensor.save(file, entries)
       const loaded = yield* Tensor.load(file)
-      expect(Object.keys(loaded).sort()).toEqual(["w.f32", "w.f64", "w.i64", "w.u32", "w.u8"])
+      const expectedKeys = ["w.f32", "w.i64", "w.u32", "w.u8"]
+      if (device === "cpu") expectedKeys.push("w.f64")
+      expect(Object.keys(loaded).sort()).toEqual(expectedKeys.sort())
       expect(loaded["w.f32"].dtype).toBe("f32")
       expect(loaded["w.f32"].shape).toEqual([2, 2])
-      expect(loaded["w.f64"].dtype).toBe("f64")
+      if (device === "cpu") expect(loaded["w.f64"].dtype).toBe("f64")
       expect(loaded["w.i64"].dtype).toBe("i64")
       expect(loaded["w.u8"].dtype).toBe("u8")
       expect(loaded["w.u32"].dtype).toBe("u32")
       expect(yield* values(loaded["w.f32"])).toEqual([1, 2, 3, 4])
-      expect(yield* values(loaded["w.f64"])).toEqual([5, 6])
+      if (device === "cpu") expect(yield* values(loaded["w.f64"])).toEqual([5, 6])
       expect(yield* values(loaded["w.i64"])).toEqual([7, 8, 9])
       expect(yield* values(loaded["w.u8"])).toEqual([10, 11])
       expect(yield* values(loaded["w.u32"])).toEqual([12])
@@ -42,8 +49,8 @@ layer(Device.Cpu)("Checkpoint", (it) => {
     Effect.gen(function* () {
       const dir = yield* tmpdir
       const file = path.join(dir, "lazy.safetensors")
-      const x = yield* Tensor.fromTypedArray(new Float64Array([1, 2, 3]), [3])
-      const y = yield* Tensor.fromTypedArray(new Float64Array([4, 5, 6]), [3])
+      const x = yield* Tensor.fromTypedArray(floats(device, [1, 2, 3]), [3])
+      const y = yield* Tensor.fromTypedArray(floats(device, [4, 5, 6]), [3])
       yield* Tensor.save(file, {
         sum: yield* Tensor.add(x, y),
         product: yield* Tensor.mul(x, y)
@@ -59,7 +66,7 @@ layer(Device.Cpu)("Checkpoint", (it) => {
       const dir = yield* tmpdir
       const file = path.join(dir, "ops.safetensors")
       yield* Tensor.save(file, {
-        x: yield* Tensor.fromTypedArray(new Float64Array([1, 2]), [2])
+        x: yield* Tensor.fromTypedArray(floats(device, [1, 2]), [2])
       })
       const loaded = yield* Tensor.load(file)
       const doubled = yield* Tensor.add(loaded["x"], loaded["x"])
@@ -72,7 +79,7 @@ layer(Device.Cpu)("Checkpoint", (it) => {
       const dir = yield* tmpdir
       const file = path.join(dir, "state.safetensors")
       const optimizer = Optimizer.adam({ lr: 0.1 })
-      const p = yield* Tensor.fromTypedArray(new Float64Array([1, -1]), [2])
+      const p = yield* Tensor.fromTypedArray(floats(device, [1, -1]), [2])
       const state = yield* optimizer.init([p])
       const loss = yield* Tensor.sum(yield* Tensor.mul(p, p))
       const [gp] = yield* Gradient.grad(loss, [p])
@@ -97,7 +104,7 @@ layer(Device.Cpu)("Checkpoint", (it) => {
     Effect.gen(function* () {
       const error = yield* Effect.flip(
         Tensor.save("/nonexistent/dir/model.safetensors", {
-          x: yield* Tensor.fromTypedArray(new Float64Array([1]), [1])
+          x: yield* Tensor.fromTypedArray(floats(device, [1]), [1])
         })
       )
       expect(error._tag).toBe("TensorError")

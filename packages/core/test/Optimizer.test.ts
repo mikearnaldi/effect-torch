@@ -1,10 +1,8 @@
-import { describe, expect, layer } from "@effect/vitest"
+import { describe, expect } from "@effect/vitest"
 import * as assert from "@effect/vitest/utils"
 import { Effect } from "effect"
-import { Device, Gradient, Loss, Optimizer, LrSchedule, Tensor } from "../src/index.ts"
-
-const f64 = (data: ReadonlyArray<number>, shape?: ReadonlyArray<number>) =>
-  Tensor.fromTypedArray(new Float64Array(data), shape)
+import { Gradient, Loss, Optimizer, LrSchedule, Tensor } from "../src/index.ts"
+import { floats, onDevices, type TestDevice } from "./devices.ts"
 
 const values = (t: Tensor.GenericTensor) => Tensor.toNumberArray(t)
 
@@ -25,14 +23,18 @@ const runStep = <S>(
     }
   })
 
-const closeTo = (actual: Array<number>, expected: ReadonlyArray<number>, tol = 1e-9) => {
-  expect(actual.length).toBe(expected.length)
-  for (let i = 0; i < actual.length; i++) {
-    expect(Math.abs(actual[i] - expected[i])).toBeLessThan(tol)
+onDevices("Optimizer", (device: TestDevice) => (it) => {
+  const f64 = (data: ReadonlyArray<number>, shape?: ReadonlyArray<number>) =>
+    Tensor.fromTypedArray(floats(device, data), shape)
+  // f32 on Metal needs looser numerical bounds than f64 on CPU
+  const tol = device === "metal" ? 1e-4 : 1e-9
+  const tol6 = device === "metal" ? 1e-4 : 1e-6
+  const closeTo = (actual: Array<number>, expected: ReadonlyArray<number>, t = tol) => {
+    expect(actual.length).toBe(expected.length)
+    for (let i = 0; i < actual.length; i++) {
+      expect(Math.abs(actual[i] - expected[i])).toBeLessThan(t)
+    }
   }
-}
-
-layer(Device.Cpu)("Optimizer", (it) => {
   describe("sgd", () => {
     it.effect("plain update matches hand computation", () =>
       Effect.gen(function* () {
@@ -165,7 +167,7 @@ layer(Device.Cpu)("Optimizer", (it) => {
         const r2 = yield* runStep(decayed, [p2], [g2], s2)
         const [a] = yield* values(r1.params[0])
         const [b] = yield* values(r2.params[0])
-        expect(Math.abs(a - b - 0.1)).toBeLessThan(1e-9)
+        expect(Math.abs(a - b - 0.1)).toBeLessThan(tol)
       })
     )
   })
@@ -332,12 +334,12 @@ layer(Device.Cpu)("Optimizer", (it) => {
 
     it.effect("fused and composed momentum sgd produce identical trajectories", () =>
       Effect.gen(function* () {
-        const x = yield* Tensor.fromTypedArray(new Float64Array([1, 1, 2, 1, 3, 1, 4, 1]), [4, 2])
-        const y = yield* Tensor.fromTypedArray(new Float64Array([2, 3, 4, 5]), [4, 1])
+        const x = yield* Tensor.fromTypedArray(floats(device, [1, 1, 2, 1, 3, 1, 4, 1]), [4, 2])
+        const y = yield* Tensor.fromTypedArray(floats(device, [2, 3, 4, 5]), [4, 1])
         const run = (fused: boolean, config: { dampening?: number; nesterov?: boolean; weightDecay?: number }) =>
           Effect.gen(function* () {
             let params: ReadonlyArray<Tensor.GenericTensor> = [
-              yield* Tensor.fromTypedArray(new Float64Array([0.5, -0.5]))
+              yield* Tensor.fromTypedArray(floats(device, [0.5, -0.5]))
             ]
             const optimizer = Optimizer.sgd({ lr: 0.05, momentum: 0.9, fused, ...config })
             let state = yield* optimizer.init(params)
@@ -363,8 +365,8 @@ layer(Device.Cpu)("Optimizer", (it) => {
           const fusedRun = yield* run(true, config)
           const composedRun = yield* run(false, config)
           for (let i = 0; i < 2; i++) {
-            expect(Math.abs(fusedRun.w[i] - composedRun.w[i])).toBeLessThan(1e-9)
-            expect(Math.abs(fusedRun.velocity[i] - composedRun.velocity[i])).toBeLessThan(1e-9)
+            expect(Math.abs(fusedRun.w[i] - composedRun.w[i])).toBeLessThan(tol)
+            expect(Math.abs(fusedRun.velocity[i] - composedRun.velocity[i])).toBeLessThan(tol)
           }
         }
       })
@@ -372,12 +374,12 @@ layer(Device.Cpu)("Optimizer", (it) => {
 
     it.effect("fused and composed adamW produce identical trajectories", () =>
       Effect.gen(function* () {
-        const x = yield* Tensor.fromTypedArray(new Float64Array([1, 1, 2, 1, 3, 1, 4, 1]), [4, 2])
-        const y = yield* Tensor.fromTypedArray(new Float64Array([2, 3, 4, 5]), [4, 1])
+        const x = yield* Tensor.fromTypedArray(floats(device, [1, 1, 2, 1, 3, 1, 4, 1]), [4, 2])
+        const y = yield* Tensor.fromTypedArray(floats(device, [2, 3, 4, 5]), [4, 1])
         const run = (fused: boolean) =>
           Effect.gen(function* () {
             let params: ReadonlyArray<Tensor.GenericTensor> = [
-              yield* Tensor.fromTypedArray(new Float64Array([0, 0]))
+              yield* Tensor.fromTypedArray(floats(device, [0, 0]))
             ]
             const optimizer = Optimizer.adamW({ lr: 0.05, fused })
             let state = yield* optimizer.init(params)
@@ -397,9 +399,9 @@ layer(Device.Cpu)("Optimizer", (it) => {
         const fusedRun = yield* run(true)
         const composedRun = yield* run(false)
         for (let i = 0; i < 2; i++) {
-          expect(Math.abs(fusedRun.w[i] - composedRun.w[i])).toBeLessThan(1e-9)
-          expect(Math.abs(fusedRun.m[i] - composedRun.m[i])).toBeLessThan(1e-9)
-          expect(Math.abs(fusedRun.v[i] - composedRun.v[i])).toBeLessThan(1e-9)
+          expect(Math.abs(fusedRun.w[i] - composedRun.w[i])).toBeLessThan(tol)
+          expect(Math.abs(fusedRun.m[i] - composedRun.m[i])).toBeLessThan(tol)
+          expect(Math.abs(fusedRun.v[i] - composedRun.v[i])).toBeLessThan(tol)
         }
       })
     )
@@ -408,7 +410,7 @@ layer(Device.Cpu)("Optimizer", (it) => {
   describe("gradient clipping", () => {
     it.effect("clipByValue clamps elementwise", () =>
       Effect.gen(function* () {
-        const g = yield* Tensor.fromTypedArray(new Float64Array([-5, 0.5, 10]))
+        const g = yield* Tensor.fromTypedArray(floats(device, [-5, 0.5, 10]))
         const [clipped] = yield* Optimizer.clipByValue([g], { min: -1, max: 1 })
         assert.deepStrictEqual(yield* values(clipped), [-1, 0.5, 1])
       })
@@ -416,17 +418,17 @@ layer(Device.Cpu)("Optimizer", (it) => {
 
     it.effect("clipByGlobalNorm scales down only above the norm", () =>
       Effect.gen(function* () {
-        const g1 = yield* Tensor.fromTypedArray(new Float64Array([3, 4]))
-        const g2 = yield* Tensor.fromTypedArray(new Float64Array([0, 12]))
+        const g1 = yield* Tensor.fromTypedArray(floats(device, [3, 4]))
+        const g2 = yield* Tensor.fromTypedArray(floats(device, [0, 12]))
         // total norm = 13, maxNorm 6.5 -> scale 0.5
         const [c1, c2] = yield* Optimizer.clipByGlobalNorm([g1, g2], 6.5)
         const v1 = yield* values(c1)
         const v2 = yield* values(c2)
         for (let i = 0; i < 2; i++) {
-          expect(Math.abs(v1[i] - [1.5, 2][i])).toBeLessThan(1e-6)
+          expect(Math.abs(v1[i] - [1.5, 2][i])).toBeLessThan(tol6)
         }
-        expect(Math.abs(v2[0])).toBeLessThan(1e-9)
-        expect(Math.abs(v2[1] - 6)).toBeLessThan(1e-6)
+        expect(Math.abs(v2[0])).toBeLessThan(tol6)
+        expect(Math.abs(v2[1] - 6)).toBeLessThan(tol6)
         // below the norm: unchanged
         const [u1] = yield* Optimizer.clipByGlobalNorm([g1], 100)
         assert.deepStrictEqual(yield* values(u1), [3, 4])
@@ -461,9 +463,9 @@ layer(Device.Cpu)("Optimizer", (it) => {
     it.effect("a scheduled adam converges", () =>
       Effect.gen(function* () {
         const schedule = LrSchedule.withWarmup(LrSchedule.cosine(0.1, { totalSteps: 200 }), 20)
-        const w = yield* Tensor.fromTypedArray(new Float64Array([0, 0]))
-        const x = yield* Tensor.fromTypedArray(new Float64Array([1, 1, 2, 1, 3, 1, 4, 1]), [4, 2])
-        const y = yield* Tensor.fromTypedArray(new Float64Array([2, 3, 4, 5]), [4, 1])
+        const w = yield* Tensor.fromTypedArray(floats(device, [0, 0]))
+        const x = yield* Tensor.fromTypedArray(floats(device, [1, 1, 2, 1, 3, 1, 4, 1]), [4, 2])
+        const y = yield* Tensor.fromTypedArray(floats(device, [2, 3, 4, 5]), [4, 1])
         let params: ReadonlyArray<Tensor.GenericTensor> = [w]
         let state: Optimizer.AdamState | undefined
         for (let t = 0; t < 200; t++) {

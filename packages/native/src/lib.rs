@@ -194,7 +194,8 @@ fn cross_entropy_ignored_mask(target: &Tensor, ignore_index: i64) -> candle_core
         DType::I64 => target.eq(ignore_index),
         DType::U32 => {
             if ignore_index < 0 || ignore_index > u32::MAX as i64 {
-                target.zeros_like()
+                // u8 zeros, not zeros_like: Metal has no u32-cond where_cond
+                Tensor::zeros(target.shape(), DType::U8, target.device())
             } else {
                 target.eq(ignore_index as u32)
             }
@@ -205,7 +206,8 @@ fn cross_entropy_ignored_mask(target: &Tensor, ignore_index: i64) -> candle_core
 
 fn cross_entropy_active_count(target: &Tensor, ignored: &Tensor) -> candle_core::Result<f64> {
     let total = target.elem_count() as f64;
-    let ignored_count = ignored.to_dtype(DType::F64)?.sum_all()?.to_vec0::<f64>()?;
+    // f32: counts are small integers, exact, and Metal has no u8 -> f64 cast
+    let ignored_count = ignored.to_dtype(DType::F32)?.sum_all()?.to_vec0::<f32>()? as f64;
     Ok(total - ignored_count)
 }
 
@@ -218,7 +220,7 @@ fn cross_entropy_check_labels(target: &Tensor, ignored: &Tensor, classes: usize)
         }
     };
     let active = ignored.eq(&ignored.zeros_like()?)?;
-    let invalid_active = (invalid * active)?.to_dtype(DType::F64)?.sum_all()?.to_vec0::<f64>()?;
+    let invalid_active = (invalid * active)?.to_dtype(DType::F32)?.sum_all()?.to_vec0::<f32>()?;
     if invalid_active > 0.0 {
         return Err(candle_core::Error::Msg(format!(
             "cross_entropy: target out of range [0, {classes}) at an active position"
@@ -584,6 +586,9 @@ impl NativeTensor {
 
 fn readback_blocking(inner: &Tensor) -> Result<Readback> {
     let flat = inner.flatten_all().map_err(to_napi_err)?;
+    // flatten_all materializes non-contiguous views (transpose, broadcast)
+    // with an async device copy; wait for it before reading the buffer.
+    flat.device().synchronize().map_err(to_napi_err)?;
     let elem_size = flat.dtype().size_in_bytes();
     let elem_count = flat.elem_count();
     let byte_len = elem_count * elem_size;
@@ -3084,7 +3089,7 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> candle_core::Result<Te
             shape,
             dtype,
             device,
-        } => Tensor::rand(*lo, *hi, shape.clone(), device)?.to_dtype(*dtype)?,
+        } => Tensor::rand(*lo as f32, *hi as f32, shape.clone(), device)?.to_dtype(*dtype)?,
         NodeKind::Arange {
             start,
             end,
