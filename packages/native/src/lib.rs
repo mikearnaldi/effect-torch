@@ -5,6 +5,8 @@ use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
+mod fusion;
+
 fn to_napi_err(err: candle_core::Error) -> Error {
     Error::new(Status::GenericFailure, err.to_string())
 }
@@ -3414,20 +3416,56 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> candle_core::Result<Te
             let g = ev.value(grad.id)?;
             let m_t = ev.value(m.id)?;
             let v_t = ev.value(v.id)?;
-            let one_minus_beta1 = 1.0 - *beta1;
-            let one_minus_beta2 = 1.0 - *beta2;
-            let next_m = ((m_t * *beta1)? + (&g * one_minus_beta1)?)?;
-            let next_v = ((v_t * *beta2)? + ((&g * &g)? * one_minus_beta2)?)?;
-            let m_hat = (&next_m / (1.0 - beta1.powf(*t)))?;
-            let v_hat = (&next_v / (1.0 - beta2.powf(*t)))?;
-            let adjusted = ((m_hat / (v_hat.sqrt()? + *eps)?)? * *lr)?;
-            let next_p = if *weight_decay == 0.0 {
-                (p - adjusted)?
+            let fused = if fusion::is_supported(&p.device(), p.dtype()) {
+                let scalars = [
+                    fusion::scalar_tensor(*lr, p.dtype(), &p.device()),
+                    fusion::scalar_tensor(1.0 - beta1.powf(*t), p.dtype(), &p.device()),
+                    fusion::scalar_tensor(1.0 - beta2.powf(*t), p.dtype(), &p.device()),
+                ];
+                match scalars {
+                    [Ok(lr_t), Ok(c1), Ok(c2)] => {
+                        let exprs = fusion::adamw_exprs(*beta1, *beta2, *eps, *weight_decay);
+                        fusion::run(
+                            &exprs,
+                            &[p.clone(), g.clone(), m_t.clone(), v_t.clone()],
+                            &[lr_t, c1, c2],
+                            p.elem_count(),
+                            p.dims(),
+                            p.dtype(),
+                            &p.device(),
+                        )
+                        .ok()
+                    }
+                    _ => None,
+                }
             } else {
-                ((p * (1.0 - lr * weight_decay))? - adjusted)?
+                None
             };
-            ev.adamw.insert(node.id, [next_m, next_v]);
-            next_p
+            match fused {
+                Some(outs) => {
+                    let mut it = outs.into_iter();
+                    let next_p = it.next().unwrap();
+                    ev.adamw
+                        .insert(node.id, [it.next().unwrap(), it.next().unwrap()]);
+                    next_p
+                }
+                None => {
+                    let one_minus_beta1 = 1.0 - *beta1;
+                    let one_minus_beta2 = 1.0 - *beta2;
+                    let next_m = ((m_t * *beta1)? + (&g * one_minus_beta1)?)?;
+                    let next_v = ((v_t * *beta2)? + ((&g * &g)? * one_minus_beta2)?)?;
+                    let m_hat = (&next_m / (1.0 - beta1.powf(*t)))?;
+                    let v_hat = (&next_v / (1.0 - beta2.powf(*t)))?;
+                    let adjusted = ((m_hat / (v_hat.sqrt()? + *eps)?)? * *lr)?;
+                    let next_p = if *weight_decay == 0.0 {
+                        (p - adjusted)?
+                    } else {
+                        ((p * (1.0 - lr * weight_decay))? - adjusted)?
+                    };
+                    ev.adamw.insert(node.id, [next_m, next_v]);
+                    next_p
+                }
+            }
         }
         NodeKind::AdamWOut { step, index } => {
             // the step is evaluated before its projections; make sure of it
@@ -3454,25 +3492,66 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> candle_core::Result<Te
         } => {
             let p = ev.value(param.id)?;
             let g = ev.value(grad.id)?;
-            let g = if *weight_decay == 0.0 {
-                g
+            let fused = if fusion::is_supported(&p.device(), p.dtype()) {
+                let v_placeholder = if *first_step {
+                    p.clone()
+                } else {
+                    ev.value(velocity.id)?
+                };
+                match fusion::scalar_tensor(*lr, p.dtype(), &p.device()) {
+                    Ok(lr_t) => {
+                        let exprs = fusion::sgd_exprs(
+                            *momentum,
+                            *dampening,
+                            *nesterov,
+                            *weight_decay,
+                            *first_step,
+                        );
+                        fusion::run(
+                            &exprs,
+                            &[p.clone(), g.clone(), v_placeholder],
+                            &[lr_t],
+                            p.elem_count(),
+                            p.dims(),
+                            p.dtype(),
+                            &p.device(),
+                        )
+                        .ok()
+                    }
+                    Err(_) => None,
+                }
             } else {
-                (&g + (&p * *weight_decay)?)?
+                None
             };
-            let next_v = if *first_step {
-                g.clone()
-            } else {
-                let v = ev.value(velocity.id)?;
-                ((v * *momentum)? + (&g * (1.0 - dampening))?)?
-            };
-            let used = if *nesterov {
-                (&g + (&next_v * *momentum)?)?
-            } else {
-                next_v.clone()
-            };
-            let next_p = (p - (&used * *lr)?)?;
-            ev.sgd.insert(node.id, next_v);
-            next_p
+            match fused {
+                Some(outs) => {
+                    let mut it = outs.into_iter();
+                    let next_p = it.next().unwrap();
+                    ev.sgd.insert(node.id, it.next().unwrap());
+                    next_p
+                }
+                None => {
+                    let g = if *weight_decay == 0.0 {
+                        g
+                    } else {
+                        (&g + (&p * *weight_decay)?)?
+                    };
+                    let next_v = if *first_step {
+                        g.clone()
+                    } else {
+                        let v = ev.value(velocity.id)?;
+                        ((v * *momentum)? + (&g * (1.0 - dampening))?)?
+                    };
+                    let used = if *nesterov {
+                        (&g + (&next_v * *momentum)?)?
+                    } else {
+                        next_v.clone()
+                    };
+                    let next_p = (p - (&used * *lr)?)?;
+                    ev.sgd.insert(node.id, next_v);
+                    next_p
+                }
+            }
         }
         NodeKind::SgdOut { step, index } => {
             let _ = ev.value(step.id)?;
