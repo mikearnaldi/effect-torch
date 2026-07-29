@@ -1,6 +1,16 @@
 # RFC 0007: True Kernel Fusion
 
 - **Status**: Implemented (phases 1–2; phase 3 recorded, not scheduled)
+
+**Implementation notes (updated)**: the elementwise op set covers
+`Add/Sub/Mul/Div/Min/Max/Neg/Sqrt/Exp/Log/Sin/Cos/Tanh/Abs/Erf/Floor/Ceil/Round`
+plus constant-exponent `Pow` (small exponents lower to multiplies/sqrt).
+`Log/Tanh/Abs/Floor/Ceil/Round/Pow` required extending `ug` itself —
+`ug`, `ug-metal`, and `ug-cuda` are patched to the `mikearnaldi/ug` fork,
+which lowers them to the platform math library (`Erf` stays an
+Abramowitz–Stegun expansion; Metal has no `erf`). Regions are capped at
+30 input lanes (Metal allows 31 buffer arguments per kernel; one slot is
+the output) — overflow materializes the region and starts a new one.
 - **Author**: Michael Arnaldi
 - **Date**: 2026-07-28
 - **Depends on**: RFC 0004 (optimizers — the fused update nodes this replaces

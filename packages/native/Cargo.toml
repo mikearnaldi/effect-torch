@@ -14,6 +14,15 @@ tokio = { version = "1", features = ["rt", "sync", "macros"] }
 ug = "0.5.0"
 libm = "0.2"
 
+# Fork of LaurentMazare/ug adding Log/Tanh/Abs/Floor/Ceil/Round unary ops
+# and a Pow binary op, lowered to the platform math library in the metal,
+# cuda, and cpu codegens. candle-core depends on ug/ug-metal/ug-cuda too,
+# so all three crates are patched to the same rev.
+[patch.crates-io]
+ug = { git = "https://github.com/mikearnaldi/ug", rev = "11d427f18a438ffb70d3337f1a430333d3a2c294" }
+ug-metal = { git = "https://github.com/mikearnaldi/ug", rev = "11d427f18a438ffb70d3337f1a430333d3a2c294" }
+ug-cuda = { git = "https://github.com/mikearnaldi/ug", rev = "11d427f18a438ffb70d3337f1a430333d3a2c294" }
+
 [target.'cfg(target_os = "macos")'.dependencies]
 candle-core = { git = "https://github.com/mikearnaldi/candle", rev = "3403a5a82cc5f72e906d87de43c2609651f1c1ab", features = ["metal", "accelerate", "ug"] }
 candle-metal-kernels = { git = "https://github.com/mikearnaldi/candle", rev = "3403a5a82cc5f72e906d87de43c2609651f1c1ab" }

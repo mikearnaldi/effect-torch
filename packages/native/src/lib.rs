@@ -247,7 +247,7 @@ fn cross_entropy_forward(logits: &Tensor, target: &Tensor, ignore_index: i64) ->
         .reshape(target.shape())?;
     let per_position = (lse - picked)?;
     let masked = ignored.where_cond(&per_position.zeros_like()?, &per_position)?;
-    (masked.sum_all()? * (1.0 / count))
+    masked.sum_all()? * (1.0 / count)
 }
 
 fn cross_entropy_backward(logits: &Tensor, target: &Tensor, ignore_index: i64) -> candle_core::Result<Tensor> {
@@ -4837,8 +4837,8 @@ fn fuse_roots(roots: &[Arc<Node>]) -> std::result::Result<Vec<Arc<Node>>, String
     }
 
     enum OpT {
-        Unary(fn(E) -> E),
-        Binary(fn(E, E) -> E),
+        Unary(Box<dyn Fn(E) -> E>),
+        Binary(Box<dyn Fn(E, E) -> E>),
     }
     // An input qualifies when it matches the output shape exactly, or is a
     // uniform constant that folds into the IR (scalar or output-shaped).
@@ -4857,34 +4857,42 @@ fn fuse_roots(roots: &[Arc<Node>]) -> std::result::Result<Vec<Arc<Node>>, String
         }
         match &node.kind {
             NodeKind::Add { a, b } if input_ok(a, &node.shape) && input_ok(b, &node.shape) => {
-                Some(OpT::Binary(|a, b| E::Add(Box::new(a), Box::new(b))))
+                Some(OpT::Binary(Box::new(|a, b| E::Add(Box::new(a), Box::new(b)))))
             }
             NodeKind::Sub { a, b } if input_ok(a, &node.shape) && input_ok(b, &node.shape) => {
-                Some(OpT::Binary(|a, b| E::Sub(Box::new(a), Box::new(b))))
+                Some(OpT::Binary(Box::new(|a, b| E::Sub(Box::new(a), Box::new(b)))))
             }
             NodeKind::Mul { a, b } if input_ok(a, &node.shape) && input_ok(b, &node.shape) => {
-                Some(OpT::Binary(|a, b| E::Mul(Box::new(a), Box::new(b))))
+                Some(OpT::Binary(Box::new(|a, b| E::Mul(Box::new(a), Box::new(b)))))
             }
             NodeKind::Div { a, b } if input_ok(a, &node.shape) && input_ok(b, &node.shape) => {
-                Some(OpT::Binary(|a, b| E::Div(Box::new(a), Box::new(b))))
+                Some(OpT::Binary(Box::new(|a, b| E::Div(Box::new(a), Box::new(b)))))
             }
             NodeKind::Maximum { a, b } if input_ok(a, &node.shape) && input_ok(b, &node.shape) => {
-                Some(OpT::Binary(|a, b| E::Max(Box::new(a), Box::new(b))))
+                Some(OpT::Binary(Box::new(|a, b| E::Max(Box::new(a), Box::new(b)))))
             }
             NodeKind::Minimum { a, b } if input_ok(a, &node.shape) && input_ok(b, &node.shape) => {
-                Some(OpT::Binary(|a, b| E::Min(Box::new(a), Box::new(b))))
+                Some(OpT::Binary(Box::new(|a, b| E::Min(Box::new(a), Box::new(b)))))
             }
-            NodeKind::Neg { .. } => Some(OpT::Unary(|a| E::Neg(Box::new(a)))),
-            NodeKind::Sqrt { .. } => Some(OpT::Unary(|a| E::Sqrt(Box::new(a)))),
-            NodeKind::Exp { .. } => Some(OpT::Unary(|a| E::Exp(Box::new(a)))),
-            NodeKind::Sin { .. } => Some(OpT::Unary(|a| E::Sin(Box::new(a)))),
-            NodeKind::Cos { .. } => Some(OpT::Unary(|a| E::Cos(Box::new(a)))),
+            NodeKind::Neg { .. } => Some(OpT::Unary(Box::new(|a| E::Neg(Box::new(a))))),
+            NodeKind::Sqrt { .. } => Some(OpT::Unary(Box::new(|a| E::Sqrt(Box::new(a))))),
+            NodeKind::Exp { .. } => Some(OpT::Unary(Box::new(|a| E::Exp(Box::new(a))))),
+            NodeKind::Log { .. } => Some(OpT::Unary(Box::new(|a| E::Log(Box::new(a))))),
+            NodeKind::Sin { .. } => Some(OpT::Unary(Box::new(|a| E::Sin(Box::new(a))))),
+            NodeKind::Cos { .. } => Some(OpT::Unary(Box::new(|a| E::Cos(Box::new(a))))),
             NodeKind::Relu { .. } => {
-                Some(OpT::Unary(|a| E::Max(Box::new(a), Box::new(E::cst(0.0)))))
+                Some(OpT::Unary(Box::new(|a| E::Max(Box::new(a), Box::new(E::cst(0.0))))))
             }
-            NodeKind::Tanh { .. } => Some(OpT::Unary(|a| E::Tanh(Box::new(a)))),
-            NodeKind::Abs { .. } => Some(OpT::Unary(|a| E::Abs(Box::new(a)))),
-            NodeKind::Erf { .. } => Some(OpT::Unary(|a| E::Erf(Box::new(a)))),
+            NodeKind::Tanh { .. } => Some(OpT::Unary(Box::new(|a| E::Tanh(Box::new(a))))),
+            NodeKind::Abs { .. } => Some(OpT::Unary(Box::new(|a| E::Abs(Box::new(a))))),
+            NodeKind::Erf { .. } => Some(OpT::Unary(Box::new(|a| E::Erf(Box::new(a))))),
+            NodeKind::Floor { .. } => Some(OpT::Unary(Box::new(|a| E::Floor(Box::new(a))))),
+            NodeKind::Ceil { .. } => Some(OpT::Unary(Box::new(|a| E::Ceil(Box::new(a))))),
+            NodeKind::Round { .. } => Some(OpT::Unary(Box::new(|a| E::Round(Box::new(a))))),
+            NodeKind::Pow { exp, .. } => {
+                let exp = *exp;
+                Some(OpT::Unary(Box::new(move |a| fusion::pow_expr(a, exp))))
+            }
             _ => None,
         }
     };
@@ -4937,6 +4945,30 @@ fn fuse_roots(roots: &[Arc<Node>]) -> std::result::Result<Vec<Arc<Node>>, String
         }
     }
 
+    // Metal kernels accept at most 31 buffer arguments; one slot is the
+    // output, so regions are capped at 30 input lanes. Overflow closes the
+    // region (it materializes as a fused node) and the op continues with
+    // that fused node as a plain input lane.
+    const MAX_LANES: usize = 30;
+    fn emit_region(
+        id: u64,
+        region: Region,
+        kind: &NodeKind,
+        map: &mut HashMap<u64, Arc<Node>>,
+    ) -> std::result::Result<(), String> {
+        let fused = if region.ops >= 2 {
+            Node::new(NodeKind::FusedElementwise {
+                inputs: region.inputs,
+                expr: region.expr,
+            })?
+        } else {
+            Node::new(remap_children(kind, &|ch| {
+                map.get(&ch.id).cloned().unwrap_or_else(|| ch.clone())
+            }))?
+        };
+        map.insert(id, fused);
+        Ok(())
+    }
     let mut open: HashMap<u64, Region> = HashMap::new();
     let mut map: HashMap<u64, Arc<Node>> = HashMap::new();
     for node in &order {
@@ -4948,17 +4980,7 @@ fn fuse_roots(roots: &[Arc<Node>]) -> std::result::Result<Vec<Arc<Node>>, String
                 && (opt.is_none() || consumers.get(&c.id).copied().unwrap_or(0) != 1)
             {
                 let region = open.remove(&c.id).unwrap();
-                let fused = if region.ops >= 2 {
-                    Node::new(NodeKind::FusedElementwise {
-                        inputs: region.inputs,
-                        expr: region.expr,
-                    })?
-                } else {
-                    Node::new(remap_children(&c.kind, &|ch| {
-                        map.get(&ch.id).cloned().unwrap_or_else(|| ch.clone())
-                    }))?
-                };
-                map.insert(c.id, fused);
+                emit_region(c.id, region, &c.kind, &mut map)?;
             }
         }
         match opt {
@@ -4992,7 +5014,43 @@ fn fuse_roots(roots: &[Arc<Node>]) -> std::result::Result<Vec<Arc<Node>>, String
             Some(OpT::Binary(f)) => {
                 let a = children[0].clone();
                 let b = children[1].clone();
-                let (mut region, expr) = match (open.remove(&a.id), open.remove(&b.id)) {
+                let mut ra = open.remove(&a.id);
+                let mut rb = open.remove(&b.id);
+                // A merged region must stay within the lane cap; otherwise
+                // the smaller side materializes first.
+                if let (Some(r1), Some(r2)) = (&ra, &rb) {
+                    if r1.inputs.len() + r2.inputs.len() > MAX_LANES {
+                        emit_region(b.id, rb.take().unwrap(), &b.kind, &mut map)?;
+                    }
+                }
+                // Extending a region with a brand-new lane must stay within
+                // the cap; otherwise that region materializes first and the
+                // op reads it back as a plain lane.
+                if let Some(r) = &ra {
+                    if rb.is_none() {
+                        let resolved = map.get(&b.id).map(|n| n.id).unwrap_or(b.id);
+                        if const_value(&b, &node.shape).is_none()
+                            && !r.lane_of.contains_key(&resolved)
+                            && r.inputs.len() >= MAX_LANES
+                        {
+                            let region = ra.take().unwrap();
+                            emit_region(a.id, region, &a.kind, &mut map)?;
+                        }
+                    }
+                }
+                if let Some(r) = &rb {
+                    if ra.is_none() {
+                        let resolved = map.get(&a.id).map(|n| n.id).unwrap_or(a.id);
+                        if const_value(&a, &node.shape).is_none()
+                            && !r.lane_of.contains_key(&resolved)
+                            && r.inputs.len() >= MAX_LANES
+                        {
+                            let region = rb.take().unwrap();
+                            emit_region(b.id, region, &b.kind, &mut map)?;
+                        }
+                    }
+                }
+                let (mut region, expr) = match (ra, rb) {
                     (Some(mut r1), Some(r2)) => {
                         let b_expr = r1.absorb(r2);
                         let e = f(r1.expr.clone(), b_expr);

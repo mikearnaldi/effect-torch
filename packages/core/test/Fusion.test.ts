@@ -1,7 +1,7 @@
 import { describe, layer } from "@effect/vitest"
 import * as assert from "@effect/vitest/utils"
 import { Effect } from "effect"
-import { Device, Gradient, Tensor } from "../src/index.ts"
+import { Device, Gradient, Loss, Tensor } from "../src/index.ts"
 
 const values = (t: Tensor.GenericTensor) =>
   Effect.map(Tensor.toTypedArray(t), (arr) => Array.from<number | bigint>(arr).map(Number))
@@ -96,6 +96,119 @@ layer(Device.Cpu)("Fusion", (it) => {
         const fused = yield* withFusion(true, build)
         const unfused = yield* withFusion(false, build)
         fused.forEach((v, i) => assert.assertTrue(Math.abs(v - unfused[i]) < 1e-12))
+      })
+    )
+
+    it.effect("log chains (softplus, mish, logSoftmax) fuse and agree with unfused evaluation", () =>
+      Effect.gen(function* () {
+        const build = Effect.gen(function* () {
+          const x = yield* Tensor.fromTypedArray(new Float64Array([0.5, -1, 2, -3, 0.25, 1.5]), [2, 3])
+          const a = yield* Tensor.softplus(x)
+          const b = yield* Tensor.mish(x)
+          const c = yield* Tensor.logSoftmax(x)
+          const y = yield* Tensor.add(yield* Tensor.add(a, b), c)
+          const loss = yield* Tensor.sum(y)
+          const [gx] = yield* Gradient.grad(loss, [x])
+          return { y: yield* values(y), gx: yield* values(gx) }
+        })
+        const fused = yield* withFusion(true, build)
+        const unfused = yield* withFusion(false, build)
+        for (const key of ["y", "gx"] as const) {
+          fused[key].forEach((v, i) => {
+            assert.assertTrue(Math.abs(v - unfused[key][i]) < 1e-12, `${key}[${i}]: ${v} != ${unfused[key][i]}`)
+          })
+        }
+      })
+    )
+
+    it.effect("binary cross entropy chains fuse and agree with unfused evaluation", () =>
+      Effect.gen(function* () {
+        const build = Effect.gen(function* () {
+          const logits = yield* Tensor.fromTypedArray(new Float64Array([1.5, -2, 0.25, 3, -0.5, 0.75]), [2, 3])
+          const target = yield* Tensor.fromTypedArray(new Float64Array([1, 0, 1, 1, 0, 1]), [2, 3])
+          const fromLogits = yield* Loss.binaryCrossEntropy(logits, target, { fromLogits: true })
+          const probs = yield* Tensor.sigmoid(logits)
+          const fromProbs = yield* Loss.binaryCrossEntropy(probs, target)
+          const loss = yield* Tensor.add(fromLogits, fromProbs)
+          const [g] = yield* Gradient.grad(loss, [logits])
+          return {
+            fromLogits: yield* values(fromLogits),
+            fromProbs: yield* values(fromProbs),
+            g: yield* values(g)
+          }
+        })
+        const fused = yield* withFusion(true, build)
+        const unfused = yield* withFusion(false, build)
+        for (const key of ["fromLogits", "fromProbs", "g"] as const) {
+          fused[key].forEach((v, i) => {
+            assert.assertTrue(Math.abs(v - unfused[key][i]) < 1e-12, `${key}[${i}]: ${v} != ${unfused[key][i]}`)
+          })
+        }
+      })
+    )
+
+    it.effect("pow exponents fuse (square, cube, sqrt forms, generic) and agree with unfused evaluation", () =>
+      Effect.gen(function* () {
+        const build = Effect.gen(function* () {
+          const x = yield* Tensor.fromTypedArray(new Float64Array([0.5, 1, 2, 3, 0.25, 1.5]), [2, 3])
+          const a = yield* Tensor.rsqrt(x)
+          const b = yield* Tensor.reciprocal(x)
+          const c = yield* Tensor.gelu(x, { approximate: "tanh" })
+          const d = yield* Tensor.pow(x, 1.7)
+          const y = yield* Tensor.add(yield* Tensor.add(a, b), yield* Tensor.add(c, d))
+          const loss = yield* Tensor.sum(y)
+          const [gx] = yield* Gradient.grad(loss, [x])
+          return { y: yield* values(y), gx: yield* values(gx) }
+        })
+        const fused = yield* withFusion(true, build)
+        const unfused = yield* withFusion(false, build)
+        for (const key of ["y", "gx"] as const) {
+          fused[key].forEach((v, i) => {
+            assert.assertTrue(Math.abs(v - unfused[key][i]) < 1e-9, `${key}[${i}]: ${v} != ${unfused[key][i]}`)
+          })
+        }
+      })
+    )
+
+    it.effect("floor, ceil and round fuse and agree with unfused evaluation", () =>
+      Effect.gen(function* () {
+        const build = Effect.gen(function* () {
+          const x = yield* Tensor.fromTypedArray(new Float64Array([0.5, -1.5, 2.25, -3.75, 0.4, 1.6]), [2, 3])
+          const y = yield* Tensor.add(
+            yield* Tensor.add(yield* Tensor.floor(x), yield* Tensor.ceil(x)),
+            yield* Tensor.mul(yield* Tensor.round(x), 2)
+          )
+          return yield* values(y)
+        })
+        const fused = yield* withFusion(true, build)
+        const unfused = yield* withFusion(false, build)
+        fused.forEach((v, i) => assert.assertTrue(Math.abs(v - unfused[i]) < 1e-12, `[${i}]: ${v} != ${unfused[i]}`))
+      })
+    )
+
+    it.effect("huber, hinge and klDiv elementwise chains fuse and agree with unfused evaluation", () =>
+      Effect.gen(function* () {
+        const build = Effect.gen(function* () {
+          const pred = yield* Tensor.fromTypedArray(new Float64Array([1.5, -2, 0.25, 3, -0.5, 0.75]), [2, 3])
+          const target = yield* Tensor.fromTypedArray(new Float64Array([1, 0.5, -1, 2.5, 0, 1.25]), [2, 3])
+          const h1 = yield* Loss.huber(pred, target, { reduction: "none" })
+          const h2 = yield* Loss.hinge(pred, target, { reduction: "none" })
+          const probs = yield* Tensor.fromTypedArray(new Float64Array([0.2, 0.3, 0.5, 0.1, 0.4, 0.25]), [2, 3])
+          const logPred = yield* Tensor.log(probs)
+          const kl = yield* Loss.klDiv(logPred, probs, { reduction: "none" })
+          return {
+            h1: yield* values(h1),
+            h2: yield* values(h2),
+            kl: yield* values(kl)
+          }
+        })
+        const fused = yield* withFusion(true, build)
+        const unfused = yield* withFusion(false, build)
+        for (const key of ["h1", "h2", "kl"] as const) {
+          fused[key].forEach((v, i) => {
+            assert.assertTrue(Math.abs(v - unfused[key][i]) < 1e-12, `${key}[${i}]: ${v} != ${unfused[key][i]}`)
+          })
+        }
       })
     )
   })

@@ -34,11 +34,37 @@ pub enum Expr {
     Exp(Box<Expr>),
     Sin(Box<Expr>),
     Cos(Box<Expr>),
-    // Exact in the CPU interpreter; lowered to stable expansions in ug
-    // ops for GPU kernels (ug's op set has no transcendental beyond exp)
     Tanh(Box<Expr>),
     Abs(Box<Expr>),
+    Log(Box<Expr>),
+    Floor(Box<Expr>),
+    Ceil(Box<Expr>),
+    Round(Box<Expr>),
+    // constant exponent (f64 bits, keeping the IR Eq + Hash). Common
+    // exponents lower to multiplies/sqrt; the rest lower to the platform
+    // pow.
+    Powf(Box<Expr>, u64),
+    // Exact in the CPU interpreter; lowered to a stable expansion in ug
+    // ops for GPU kernels (Metal has no erf).
     Erf(Box<Expr>),
+}
+
+/// `x^e` with special cases for the common exponents: exact multiplies
+/// and sqrt are faster and more accurate than the platform pow.
+pub fn pow_expr(x: Expr, e: f64) -> Expr {
+    match e {
+        0.0 => Expr::cst(1.0),
+        1.0 => x,
+        -1.0 => Expr::Div(Box::new(Expr::cst(1.0)), Box::new(x)),
+        2.0 => Expr::Mul(Box::new(x.clone()), Box::new(x)),
+        3.0 => Expr::Mul(
+            Box::new(Expr::Mul(Box::new(x.clone()), Box::new(x.clone()))),
+            Box::new(x),
+        ),
+        0.5 => Expr::Sqrt(Box::new(x)),
+        -0.5 => Expr::Div(Box::new(Expr::cst(1.0)), Box::new(Expr::Sqrt(Box::new(x)))),
+        _ => Expr::Powf(Box::new(x), e.to_bits()),
+    }
 }
 
 impl Expr {
@@ -66,40 +92,15 @@ impl Expr {
             Expr::Cos(a) => Expr::Cos(Box::new(a.shift_inputs(base))),
             Expr::Tanh(a) => Expr::Tanh(Box::new(a.shift_inputs(base))),
             Expr::Abs(a) => Expr::Abs(Box::new(a.shift_inputs(base))),
+            Expr::Log(a) => Expr::Log(Box::new(a.shift_inputs(base))),
+            Expr::Floor(a) => Expr::Floor(Box::new(a.shift_inputs(base))),
+            Expr::Ceil(a) => Expr::Ceil(Box::new(a.shift_inputs(base))),
+            Expr::Round(a) => Expr::Round(Box::new(a.shift_inputs(base))),
+            Expr::Powf(a, e) => Expr::Powf(Box::new(a.shift_inputs(base)), *e),
             Expr::Erf(a) => Expr::Erf(Box::new(a.shift_inputs(base))),
         }
     }
 
-    pub fn const_value(&self) -> Option<f64> {
-        match self {
-            Expr::Const(bits) => Some(f64::from_bits(*bits)),
-            _ => None,
-        }
-    }
-
-    pub fn num_inputs(&self) -> usize {
-        fn max_input(e: &Expr) -> u32 {
-            match e {
-                Expr::Input(k) => *k + 1,
-                Expr::Scalar(_) | Expr::Const(_) => 0,
-                Expr::Add(a, b)
-                | Expr::Sub(a, b)
-                | Expr::Mul(a, b)
-                | Expr::Div(a, b)
-                | Expr::Min(a, b)
-                | Expr::Max(a, b) => max_input(a).max(max_input(b)),
-                Expr::Neg(a)
-                | Expr::Sqrt(a)
-                | Expr::Exp(a)
-                | Expr::Sin(a)
-                | Expr::Cos(a)
-                | Expr::Tanh(a)
-                | Expr::Abs(a)
-                | Expr::Erf(a) => max_input(a),
-            }
-        }
-        max_input(self) as usize
-    }
 }
 
 pub trait Scalar: Copy {
@@ -117,6 +118,11 @@ pub trait Scalar: Copy {
     fn cos(self) -> Self;
     fn tanh(self) -> Self;
     fn abs(self) -> Self;
+    fn log(self) -> Self;
+    fn floor(self) -> Self;
+    fn ceil(self) -> Self;
+    fn round(self) -> Self;
+    fn powf(self, e: f64) -> Self;
     fn erf(self) -> Self;
 }
 
@@ -165,6 +171,21 @@ macro_rules! impl_scalar {
             fn abs(self) -> Self {
                 self.abs()
             }
+            fn log(self) -> Self {
+                self.ln()
+            }
+            fn floor(self) -> Self {
+                self.floor()
+            }
+            fn ceil(self) -> Self {
+                self.ceil()
+            }
+            fn round(self) -> Self {
+                self.round()
+            }
+            fn powf(self, e: f64) -> Self {
+                self.powf(e as $ty)
+            }
             fn erf(self) -> Self {
                 $erf(self)
             }
@@ -192,6 +213,11 @@ fn eval_at<T: Scalar>(e: &Expr, i: usize, inputs: &[&[T]], scalars: &[T]) -> T {
         Expr::Cos(a) => eval_at(a, i, inputs, scalars).cos(),
         Expr::Tanh(a) => eval_at(a, i, inputs, scalars).tanh(),
         Expr::Abs(a) => eval_at(a, i, inputs, scalars).abs(),
+        Expr::Log(a) => eval_at(a, i, inputs, scalars).log(),
+        Expr::Floor(a) => eval_at(a, i, inputs, scalars).floor(),
+        Expr::Ceil(a) => eval_at(a, i, inputs, scalars).ceil(),
+        Expr::Round(a) => eval_at(a, i, inputs, scalars).round(),
+        Expr::Powf(a, e) => eval_at(a, i, inputs, scalars).powf(f64::from_bits(*e)),
         Expr::Erf(a) => eval_at(a, i, inputs, scalars).erf(),
     }
 }
@@ -385,22 +411,34 @@ fn build_kernel(
                 let a = lower(a, b, lanes, num_inputs, lowered_lanes, offset, zero, dtype)?;
                 b.unary(UnaryOp::Cos, a, dtype)
             }
-            // tanh(x) = 1 - 2 / (exp(2x) + 1): stable in both directions
-            // (exp overflows to +inf for large x, giving exactly 1)
             Expr::Tanh(a) => {
                 let x = lower(a, b, lanes, num_inputs, lowered_lanes, offset, zero, dtype)?;
-                let two = b.push(I::Const(f32_cst(2.0)?));
-                let one = b.push(I::Const(f32_cst(1.0)?));
-                let x2 = b.binary(BinaryOp::Mul, two, x, dtype);
-                let e = b.unary(UnaryOp::Exp, x2, dtype);
-                let denom = b.binary(BinaryOp::Add, e, one, dtype);
-                let frac = b.binary(BinaryOp::Div, two, denom, dtype);
-                b.binary(BinaryOp::Sub, one, frac, dtype)
+                b.unary(UnaryOp::Tanh, x, dtype)
             }
             Expr::Abs(a) => {
                 let x = lower(a, b, lanes, num_inputs, lowered_lanes, offset, zero, dtype)?;
-                let neg = b.unary(UnaryOp::Neg, x, dtype);
-                b.binary(BinaryOp::Max, x, neg, dtype)
+                b.unary(UnaryOp::Abs, x, dtype)
+            }
+            Expr::Log(a) => {
+                let x = lower(a, b, lanes, num_inputs, lowered_lanes, offset, zero, dtype)?;
+                b.unary(UnaryOp::Log, x, dtype)
+            }
+            Expr::Floor(a) => {
+                let x = lower(a, b, lanes, num_inputs, lowered_lanes, offset, zero, dtype)?;
+                b.unary(UnaryOp::Floor, x, dtype)
+            }
+            Expr::Ceil(a) => {
+                let x = lower(a, b, lanes, num_inputs, lowered_lanes, offset, zero, dtype)?;
+                b.unary(UnaryOp::Ceil, x, dtype)
+            }
+            Expr::Round(a) => {
+                let x = lower(a, b, lanes, num_inputs, lowered_lanes, offset, zero, dtype)?;
+                b.unary(UnaryOp::Round, x, dtype)
+            }
+            Expr::Powf(a, e) => {
+                let x = lower(a, b, lanes, num_inputs, lowered_lanes, offset, zero, dtype)?;
+                let exp = b.push(I::Const(f32_cst(f64::from_bits(*e) as f32)?));
+                b.binary(BinaryOp::Pow, x, exp, dtype)
             }
             // Abramowitz & Stegun 7.1.26 (max error ~1.5e-7) with
             // sign(x) = x / max(|x|, 1e-30); the CPU interpreter uses the
@@ -495,6 +533,13 @@ mod metal {
         use std::hash::{Hash, Hasher};
 
         let mdev = device.as_metal_device()?;
+        // Metal exposes at most 31 buffer argument slots per kernel.
+        if inputs.len() + scalars.len() + exprs.len() > 31 {
+            return Err(candle_core::Error::Msg(format!(
+                "fusion: {} buffer arguments exceed Metal's limit of 31",
+                inputs.len() + scalars.len() + exprs.len()
+            )));
+        }
         let mut hasher = DefaultHasher::new();
         exprs.hash(&mut hasher);
         inputs.len().hash(&mut hasher);
