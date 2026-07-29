@@ -1,7 +1,7 @@
 import { describe, expect } from "@effect/vitest"
 import * as assert from "@effect/vitest/utils"
 import { Effect } from "effect"
-import { Gradient, Loss, Optimizer, LrSchedule, Tensor } from "../src/index.ts"
+import { Gradient, Loss, Optimizer, LearningRate, Tensor } from "../src/index.ts"
 import { floats, onDevices, TOL, type TestDevice } from "./utils/devices.ts"
 
 const values = (t: Tensor.GenericTensor) => Tensor.toNumberArray(t)
@@ -436,30 +436,30 @@ onDevices("Optimizer", (device: TestDevice) => (it) => {
   describe("schedules", () => {
     it.effect("schedule values", () =>
       Effect.sync(() => {
-        expect(LrSchedule.constant(0.1)(42)).toBe(0.1)
-        const exp = LrSchedule.exponential(1, { decayRate: 0.5, decaySteps: 10 })
+        expect(LearningRate.constant(0.1)(42)).toBe(0.1)
+        const exp = LearningRate.exponential(1, { decayRate: 0.5, decaySteps: 10 })
         expect(exp(0)).toBe(1)
         expect(Math.abs(exp(10) - 0.5)).toBeLessThan(1e-12)
         expect(Math.abs(exp(20) - 0.25)).toBeLessThan(1e-12)
-        const step = LrSchedule.stepwise(1, { dropFactor: 0.1, dropEvery: 5 })
+        const step = LearningRate.stepwise(1, { dropFactor: 0.1, dropEvery: 5 })
         expect(step(4)).toBe(1)
         expect(Math.abs(step(5) - 0.1)).toBeLessThan(1e-12)
-        const cos = LrSchedule.cosine(1, { totalSteps: 100 })
+        const cos = LearningRate.cosine(1, { totalSteps: 100 })
         expect(Math.abs(cos(0) - 1)).toBeLessThan(1e-12)
         expect(Math.abs(cos(50) - 0.5)).toBeLessThan(1e-12)
         expect(Math.abs(cos(100))).toBeLessThan(1e-12)
         expect(Math.abs(cos(200))).toBeLessThan(1e-12)
-        const warm = LrSchedule.withWarmup(LrSchedule.constant(0.5), 10)
+        const warm = LearningRate.withWarmup(LearningRate.constant(0.5), 10)
         expect(Math.abs(warm(0) - 0.05)).toBeLessThan(1e-12)
         expect(Math.abs(warm(9) - 0.5)).toBeLessThan(1e-12)
         expect(warm(10)).toBe(0.5)
-        expect(() => LrSchedule.cosine(0, { totalSteps: 10 })).toThrow()
+        expect(() => LearningRate.cosine(0, { totalSteps: 10 })).toThrow()
       })
     )
 
     it.effect("a scheduled adam converges", () =>
       Effect.gen(function* () {
-        const schedule = LrSchedule.withWarmup(LrSchedule.cosine(0.1, { totalSteps: 200 }), 20)
+        const schedule = LearningRate.withWarmup(LearningRate.cosine(0.1, { totalSteps: 200 }), 20)
         const w = yield* Tensor.fromTypedArray(floats([0, 0]))
         const x = yield* Tensor.fromTypedArray(floats([1, 1, 2, 1, 3, 1, 4, 1]), [4, 2])
         const y = yield* Tensor.fromTypedArray(floats([2, 3, 4, 5]), [4, 1])

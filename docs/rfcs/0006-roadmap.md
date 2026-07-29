@@ -31,7 +31,7 @@ re-derived per session.
 - `Optimizer`: pure graph-transform SGD/Adam/AdamW, one `evaluate` walk
   per training step, fused native AdamW update node (default),
   `clipByValue`/`clipByGlobalNorm`.
-- `LrSchedule`: constant/exponential/stepwise/cosine/warmup schedules.
+- `LearningRate`: constant/exponential/stepwise/cosine/warmup schedules.
 - Metal allocator degradation fixed via a patched candle fork, pinned by
   revision.
 
