@@ -509,6 +509,9 @@ mod metal {
                     let kernel =
                         build_kernel(exprs, inputs.len(), scalars.len(), n, ug::DType::F32)?;
                     let p = mdev.compile("effect_torch_fused", kernel)?;
+                    if std::env::var_os("EFFECT_TORCH_FUSION_DEBUG").is_some() {
+                        eprintln!("[fusion] compiled kernel #{} (key {key:x})", cache.len() + 1);
+                    }
                     cache.insert(key, p.clone());
                     p
                 }

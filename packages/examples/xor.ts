@@ -13,7 +13,7 @@ class MispredictionError extends Data.TaggedError("MispredictionError")<{
 }
 
 const HIDDEN = 8
-const STEPS = 3000
+const STEPS = 3*3000
 const LR = 0.1
 
 type Params = readonly [
