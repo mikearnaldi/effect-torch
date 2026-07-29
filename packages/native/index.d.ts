@@ -101,7 +101,8 @@ export declare const enum NativeDType {
   F64 = 'f64',
   I64 = 'i64',
   U8 = 'u8',
-  U32 = 'u32'
+  U32 = 'u32',
+  F16 = 'f16'
 }
 
 export declare function reportExternalMemory(bytes: number): void

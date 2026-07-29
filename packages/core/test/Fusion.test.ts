@@ -2,7 +2,7 @@ import { describe } from "@effect/vitest"
 import * as assert from "@effect/vitest/utils"
 import { Effect } from "effect"
 import { Gradient, Loss, Tensor } from "../src/index.ts"
-import { floats, onDevices, type TestDevice } from "./utils/devices.ts"
+import { floats, onDevices, TOL, type TestDevice } from "./utils/devices.ts"
 
 const values = (t: Tensor.GenericTensor) =>
   Effect.map(Tensor.toTypedArray(t), (arr) => Array.from<number | bigint>(arr).map(Number))
@@ -30,16 +30,14 @@ const withFusion = <A, E, R>(enabled: boolean, effect: Effect.Effect<A, E, R>): 
   )
 
 onDevices("Fusion", (device: TestDevice) => (it) => {
-  // fused and unfused paths differ only by float rounding; f32 on Metal
-  // needs a looser bound than f64 on CPU
-  const tol = device === "metal" ? 1e-4 : 1e-12
-  const close = (a: number, b: number): boolean => Math.abs(a - b) <= tol * Math.max(1, Math.abs(a), Math.abs(b))
+  // fused and unfused paths differ only by float rounding
+  const close = (a: number, b: number): boolean => Math.abs(a - b) <= TOL * Math.max(1, Math.abs(a), Math.abs(b))
   describe("region fusion", () => {
     it.effect("fused and unfused evaluation agree on values and gradients", () =>
       Effect.gen(function* () {
         const build = Effect.gen(function* () {
-          const a = yield* Tensor.fromTypedArray(floats(device, [1, 2, 3, 4, 5, 6]), [2, 3])
-          const b = yield* Tensor.fromTypedArray(floats(device, [0.5, 1.5, 2.5, 3.5, 4.5, 5.5]), [2, 3])
+          const a = yield* Tensor.fromTypedArray(floats([1, 2, 3, 4, 5, 6]), [2, 3])
+          const b = yield* Tensor.fromTypedArray(floats([0.5, 1.5, 2.5, 3.5, 4.5, 5.5]), [2, 3])
           // a fused chain with a scalar constant fold and a two-region merge:
           // mul and add each open a region, the outer add merges them
           const left = yield* Tensor.mul(a, b)
@@ -70,7 +68,7 @@ onDevices("Fusion", (device: TestDevice) => (it) => {
     it.effect("tanh, abs and erf chains fuse and agree with unfused evaluation", () =>
       Effect.gen(function* () {
         const build = Effect.gen(function* () {
-          const x = yield* Tensor.fromTypedArray(floats(device, [0.5, -1, 2, -3, 0.25, 1.5]), [2, 3])
+          const x = yield* Tensor.fromTypedArray(floats([0.5, -1, 2, -3, 0.25, 1.5]), [2, 3])
           // sigmoid and silu are composed from tanh; gelu from erf — all
           // should ride the same fused regions
           const y = yield* Tensor.silu(yield* Tensor.tanh(x))
@@ -92,9 +90,9 @@ onDevices("Fusion", (device: TestDevice) => (it) => {
     it.effect("broadcasting boundaries stay unfused but still correct", () =>
       Effect.gen(function* () {
         const build = Effect.gen(function* () {
-          const x = yield* Tensor.fromTypedArray(floats(device, [1, 2, 3, 4, 5, 6]), [2, 3])
+          const x = yield* Tensor.fromTypedArray(floats([1, 2, 3, 4, 5, 6]), [2, 3])
           // [2, 3] - [1, 3] is a broadcasting boundary: not fusable
-          const row = yield* Tensor.fromTypedArray(floats(device, [0.5, 0.5, 0.5]), [1, 3])
+          const row = yield* Tensor.fromTypedArray(floats([0.5, 0.5, 0.5]), [1, 3])
           const y = yield* Tensor.sqrt(yield* Tensor.mul(yield* Tensor.sub(x, row), 2))
           return yield* values(y)
         })
@@ -107,7 +105,7 @@ onDevices("Fusion", (device: TestDevice) => (it) => {
     it.effect("log chains (softplus, mish, logSoftmax) fuse and agree with unfused evaluation", () =>
       Effect.gen(function* () {
         const build = Effect.gen(function* () {
-          const x = yield* Tensor.fromTypedArray(floats(device, [0.5, -1, 2, -3, 0.25, 1.5]), [2, 3])
+          const x = yield* Tensor.fromTypedArray(floats([0.5, -1, 2, -3, 0.25, 1.5]), [2, 3])
           const a = yield* Tensor.softplus(x)
           const b = yield* Tensor.mish(x)
           const c = yield* Tensor.logSoftmax(x)
@@ -129,8 +127,8 @@ onDevices("Fusion", (device: TestDevice) => (it) => {
     it.effect("binary cross entropy chains fuse and agree with unfused evaluation", () =>
       Effect.gen(function* () {
         const build = Effect.gen(function* () {
-          const logits = yield* Tensor.fromTypedArray(floats(device, [1.5, -2, 0.25, 3, -0.5, 0.75]), [2, 3])
-          const target = yield* Tensor.fromTypedArray(floats(device, [1, 0, 1, 1, 0, 1]), [2, 3])
+          const logits = yield* Tensor.fromTypedArray(floats([1.5, -2, 0.25, 3, -0.5, 0.75]), [2, 3])
+          const target = yield* Tensor.fromTypedArray(floats([1, 0, 1, 1, 0, 1]), [2, 3])
           const fromLogits = yield* Loss.binaryCrossEntropy(logits, target, { fromLogits: true })
           const probs = yield* Tensor.sigmoid(logits)
           const fromProbs = yield* Loss.binaryCrossEntropy(probs, target)
@@ -155,7 +153,7 @@ onDevices("Fusion", (device: TestDevice) => (it) => {
     it.effect("pow exponents fuse (square, cube, sqrt forms, generic) and agree with unfused evaluation", () =>
       Effect.gen(function* () {
         const build = Effect.gen(function* () {
-          const x = yield* Tensor.fromTypedArray(floats(device, [0.5, 1, 2, 3, 0.25, 1.5]), [2, 3])
+          const x = yield* Tensor.fromTypedArray(floats([0.5, 1, 2, 3, 0.25, 1.5]), [2, 3])
           const a = yield* Tensor.rsqrt(x)
           const b = yield* Tensor.reciprocal(x)
           const c = yield* Tensor.gelu(x, { approximate: "tanh" })
@@ -178,7 +176,7 @@ onDevices("Fusion", (device: TestDevice) => (it) => {
     it.effect("floor, ceil and round fuse and agree with unfused evaluation", () =>
       Effect.gen(function* () {
         const build = Effect.gen(function* () {
-          const x = yield* Tensor.fromTypedArray(floats(device, [0.5, -1.5, 2.25, -3.75, 0.4, 1.6]), [2, 3])
+          const x = yield* Tensor.fromTypedArray(floats([0.5, -1.5, 2.25, -3.75, 0.4, 1.6]), [2, 3])
           const y = yield* Tensor.add(
             yield* Tensor.add(yield* Tensor.floor(x), yield* Tensor.ceil(x)),
             yield* Tensor.mul(yield* Tensor.round(x), 2)
@@ -194,11 +192,11 @@ onDevices("Fusion", (device: TestDevice) => (it) => {
     it.effect("huber, hinge and klDiv elementwise chains fuse and agree with unfused evaluation", () =>
       Effect.gen(function* () {
         const build = Effect.gen(function* () {
-          const pred = yield* Tensor.fromTypedArray(floats(device, [1.5, -2, 0.25, 3, -0.5, 0.75]), [2, 3])
-          const target = yield* Tensor.fromTypedArray(floats(device, [1, 0.5, -1, 2.5, 0, 1.25]), [2, 3])
+          const pred = yield* Tensor.fromTypedArray(floats([1.5, -2, 0.25, 3, -0.5, 0.75]), [2, 3])
+          const target = yield* Tensor.fromTypedArray(floats([1, 0.5, -1, 2.5, 0, 1.25]), [2, 3])
           const h1 = yield* Loss.huber(pred, target, { reduction: "none" })
           const h2 = yield* Loss.hinge(pred, target, { reduction: "none" })
-          const probs = yield* Tensor.fromTypedArray(floats(device, [0.2, 0.3, 0.5, 0.1, 0.4, 0.25]), [2, 3])
+          const probs = yield* Tensor.fromTypedArray(floats([0.2, 0.3, 0.5, 0.1, 0.4, 0.25]), [2, 3])
           const logPred = yield* Tensor.log(probs)
           const kl = yield* Loss.klDiv(logPred, probs, { reduction: "none" })
           return {
@@ -219,7 +217,7 @@ onDevices("Fusion", (device: TestDevice) => (it) => {
     it.effect("where with a single-consumer comparison fuses as a true select (elu)", () =>
       Effect.gen(function* () {
         const build = Effect.gen(function* () {
-          const x = yield* Tensor.fromTypedArray(floats(device, [0.5, -1, 2, -3, 0.25, 1.5]), [2, 3])
+          const x = yield* Tensor.fromTypedArray(floats([0.5, -1, 2, -3, 0.25, 1.5]), [2, 3])
           const y = yield* Tensor.elu(x, { alpha: 0.7 })
           const loss = yield* Tensor.sum(y)
           const [gx] = yield* Gradient.grad(loss, [x])
@@ -240,9 +238,9 @@ onDevices("Fusion", (device: TestDevice) => (it) => {
         const build = Effect.gen(function* () {
           // log(0) = -inf and 0 * -inf = NaN in the masked branch: an
           // arithmetic mask would poison the result, a true select must not
-          const probs = yield* Tensor.fromTypedArray(floats(device, [0, 0.3, 0, 0.1, 0, 0.25]), [2, 3])
+          const probs = yield* Tensor.fromTypedArray(floats([0, 0.3, 0, 0.1, 0, 0.25]), [2, 3])
           const logPred = yield* Tensor.log(yield* Tensor.fromTypedArray(
-            floats(device, [0.2, 0.3, 0.5, 0.1, 0.4, 0.25]),
+            floats([0.2, 0.3, 0.5, 0.1, 0.4, 0.25]),
             [2, 3]
           ))
           const kl = yield* Loss.klDiv(logPred, probs, { reduction: "none" })
@@ -260,7 +258,7 @@ onDevices("Fusion", (device: TestDevice) => (it) => {
     it.effect("dropout's mask and scale fuse; survivors are exactly x / (1 - p)", () =>
       Effect.gen(function* () {
         const build = Effect.gen(function* () {
-          const x = yield* Tensor.fromTypedArray(floats(device, [0.5, -1, 2, -3, 0.25, 1.5, 4, -0.75]), [2, 4])
+          const x = yield* Tensor.fromTypedArray(floats([0.5, -1, 2, -3, 0.25, 1.5, 4, -0.75]), [2, 4])
           const y = yield* Tensor.dropout(x, { p: 0.5 })
           return yield* values(y)
         })
@@ -280,7 +278,7 @@ onDevices("Fusion", (device: TestDevice) => (it) => {
     it.effect("where with a shared condition stays correct", () =>
       Effect.gen(function* () {
         const build = Effect.gen(function* () {
-          const x = yield* Tensor.fromTypedArray(floats(device, [0.5, -1, 2, -3, 0.25, 1.5]), [2, 3])
+          const x = yield* Tensor.fromTypedArray(floats([0.5, -1, 2, -3, 0.25, 1.5]), [2, 3])
           // the condition has two consumers, so it must materialize as u8
           const cond = yield* Tensor.gt(x, 0)
           const a = yield* Tensor.where(cond, x, 0)

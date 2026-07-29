@@ -13,6 +13,7 @@ napi-derive = "3"
 tokio = { version = "1", features = ["rt", "sync", "macros"] }
 ug = "0.5.0"
 libm = "0.2"
+half = "2"
 
 # Fork of LaurentMazare/ug adding Log/Tanh/Abs/Floor/Ceil/Round unary ops
 # and a Pow binary op, lowered to the platform math library in the metal,

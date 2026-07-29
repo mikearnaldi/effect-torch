@@ -16,29 +16,24 @@ onDevices("Checkpoint", (device: TestDevice) => (it) => {
     Effect.gen(function* () {
       const dir = yield* tmpdir
       const file = path.join(dir, "model.safetensors")
-      const entries: Record<string, Tensor.GenericTensor> = {
+      // every dtype that runs on every device (f64 is CPU-only hardware-wise)
+      yield* Tensor.save(file, {
         "w.f32": yield* Tensor.fromTypedArray(new Float32Array([1, 2, 3, 4]), [2, 2]),
+        "w.f16": yield* Tensor.cast(yield* Tensor.fromTypedArray(new Float32Array([5, 6]), [2]), "f16"),
         "w.i64": yield* Tensor.fromTypedArray(new BigInt64Array([7n, 8n, 9n]), [3]),
         "w.u8": yield* Tensor.fromTypedArray(new Uint8Array([10, 11]), [2]),
         "w.u32": yield* Tensor.fromTypedArray(new Uint32Array([12]), [1])
-      }
-      // f64 tensors cannot be created on Metal
-      if (device === "cpu") {
-        entries["w.f64"] = yield* Tensor.fromTypedArray(floats(device, [5, 6]), [2])
-      }
-      yield* Tensor.save(file, entries)
+      })
       const loaded = yield* Tensor.load(file)
-      const expectedKeys = ["w.f32", "w.i64", "w.u32", "w.u8"]
-      if (device === "cpu") expectedKeys.push("w.f64")
-      expect(Object.keys(loaded).sort()).toEqual(expectedKeys.sort())
+      expect(Object.keys(loaded).sort()).toEqual(["w.f16", "w.f32", "w.i64", "w.u32", "w.u8"])
       expect(loaded["w.f32"].dtype).toBe("f32")
       expect(loaded["w.f32"].shape).toEqual([2, 2])
-      if (device === "cpu") expect(loaded["w.f64"].dtype).toBe("f64")
+      expect(loaded["w.f16"].dtype).toBe("f16")
       expect(loaded["w.i64"].dtype).toBe("i64")
       expect(loaded["w.u8"].dtype).toBe("u8")
       expect(loaded["w.u32"].dtype).toBe("u32")
       expect(yield* values(loaded["w.f32"])).toEqual([1, 2, 3, 4])
-      if (device === "cpu") expect(yield* values(loaded["w.f64"])).toEqual([5, 6])
+      expect(yield* values(loaded["w.f16"])).toEqual([5, 6])
       expect(yield* values(loaded["w.i64"])).toEqual([7, 8, 9])
       expect(yield* values(loaded["w.u8"])).toEqual([10, 11])
       expect(yield* values(loaded["w.u32"])).toEqual([12])
@@ -49,8 +44,8 @@ onDevices("Checkpoint", (device: TestDevice) => (it) => {
     Effect.gen(function* () {
       const dir = yield* tmpdir
       const file = path.join(dir, "lazy.safetensors")
-      const x = yield* Tensor.fromTypedArray(floats(device, [1, 2, 3]), [3])
-      const y = yield* Tensor.fromTypedArray(floats(device, [4, 5, 6]), [3])
+      const x = yield* Tensor.fromTypedArray(floats([1, 2, 3]), [3])
+      const y = yield* Tensor.fromTypedArray(floats([4, 5, 6]), [3])
       yield* Tensor.save(file, {
         sum: yield* Tensor.add(x, y),
         product: yield* Tensor.mul(x, y)
@@ -66,7 +61,7 @@ onDevices("Checkpoint", (device: TestDevice) => (it) => {
       const dir = yield* tmpdir
       const file = path.join(dir, "ops.safetensors")
       yield* Tensor.save(file, {
-        x: yield* Tensor.fromTypedArray(floats(device, [1, 2]), [2])
+        x: yield* Tensor.fromTypedArray(floats([1, 2]), [2])
       })
       const loaded = yield* Tensor.load(file)
       const doubled = yield* Tensor.add(loaded["x"], loaded["x"])
@@ -79,7 +74,7 @@ onDevices("Checkpoint", (device: TestDevice) => (it) => {
       const dir = yield* tmpdir
       const file = path.join(dir, "state.safetensors")
       const optimizer = Optimizer.adam({ lr: 0.1 })
-      const p = yield* Tensor.fromTypedArray(floats(device, [1, -1]), [2])
+      const p = yield* Tensor.fromTypedArray(floats([1, -1]), [2])
       const state = yield* optimizer.init([p])
       const loss = yield* Tensor.sum(yield* Tensor.mul(p, p))
       const [gp] = yield* Gradient.grad(loss, [p])
@@ -104,7 +99,7 @@ onDevices("Checkpoint", (device: TestDevice) => (it) => {
     Effect.gen(function* () {
       const error = yield* Effect.flip(
         Tensor.save("/nonexistent/dir/model.safetensors", {
-          x: yield* Tensor.fromTypedArray(floats(device, [1]), [1])
+          x: yield* Tensor.fromTypedArray(floats([1]), [1])
         })
       )
       expect(error._tag).toBe("TensorError")

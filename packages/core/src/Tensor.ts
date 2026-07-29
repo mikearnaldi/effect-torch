@@ -42,7 +42,7 @@ export type NativeTensor = NativeTensorType
  * @since 0.1.0
  * @category models
  */
-export type DType = "f32" | "f64" | "i64" | "u8" | "u32"
+export type DType = "f32" | "f64" | "f16" | "i64" | "u8" | "u32"
 
 /**
  * JavaScript typed arrays accepted by {@link fromTypedArray} and returned by
@@ -3229,6 +3229,9 @@ export const evaluate = (
 const typedArrayConstructor = (dtype: DType) => {
   switch (dtype) {
     case "f32":
+    // f16 reads back as f32: the native side converts before the readback
+    // since JS has no f16 typed array on Node 22
+    case "f16":
       return Float32Array
     case "f64":
       return Float64Array

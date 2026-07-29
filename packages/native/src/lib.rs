@@ -379,6 +379,8 @@ pub enum NativeDType {
     U8,
     #[napi(value = "u32")]
     U32,
+    #[napi(value = "f16")]
+    F16,
 }
 
 impl From<NativeDType> for DType {
@@ -389,6 +391,7 @@ impl From<NativeDType> for DType {
             NativeDType::I64 => DType::I64,
             NativeDType::U8 => DType::U8,
             NativeDType::U32 => DType::U32,
+            NativeDType::F16 => DType::F16,
         }
     }
 }
@@ -585,9 +588,16 @@ impl NativeTensor {
 }
 
 fn readback_blocking(inner: &Tensor) -> Result<Readback> {
-    let flat = inner.flatten_all().map_err(to_napi_err)?;
-    // flatten_all materializes non-contiguous views (transpose, broadcast)
-    // with an async device copy; wait for it before reading the buffer.
+    // f16 reads back as f32: JS has no f16 typed array on Node 22, and the
+    // conversion keeps the destructor surface to the five shared dtypes
+    let flat = if inner.dtype() == DType::F16 {
+        inner.to_dtype(DType::F32).map_err(to_napi_err)?
+    } else {
+        inner.clone()
+    };
+    let flat = flat.flatten_all().map_err(to_napi_err)?;
+    // flatten_all (and the f16 conversion) materialize with an async device
+    // copy; wait for it before reading the buffer.
     flat.device().synchronize().map_err(to_napi_err)?;
     let elem_size = flat.dtype().size_in_bytes();
     let elem_count = flat.elem_count();
@@ -2960,7 +2970,20 @@ fn reduce_dims(
 ) -> candle_core::Result<Tensor> {
     let mut out = t.clone();
     for &d in dims.iter().rev() {
-        out = f(&out, d)?;
+        if matches!(out.device(), Device::Metal(_)) && out.rank() > 4 {
+            // candle's Metal reduce kernel miscomputes non-trailing dims at
+            // rank > 4; collapse the untouched dims so each single-dim
+            // reduce runs at rank 3
+            let shape = out.dims().to_vec();
+            let before: usize = shape[..d].iter().product();
+            let after: usize = shape[d + 1..].iter().product();
+            let collapsed = out.contiguous()?.reshape((before, shape[d], after))?;
+            let mut reduced_shape: Vec<usize> = shape[..d].to_vec();
+            reduced_shape.extend_from_slice(&shape[d + 1..]);
+            out = f(&collapsed, 1)?.reshape(reduced_shape)?;
+        } else {
+            out = f(&out, d)?;
+        }
     }
     if keepdims {
         for &d in dims {
@@ -3072,6 +3095,7 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> candle_core::Result<Te
             DType::I64 => Tensor::full(*value as i64, shape.clone(), device)?,
             DType::U8 => Tensor::full(*value as u8, shape.clone(), device)?,
             DType::U32 => Tensor::full(*value as u32, shape.clone(), device)?,
+            DType::F16 => Tensor::full(half::f16::from_f64(*value), shape.clone(), device)?,
             dtype => {
                 return Err(candle_core::Error::Msg(format!(
                     "full not supported for dtype {dtype:?}"

@@ -13,25 +13,31 @@ export const metalAvailable: boolean = (() => {
   }
 })()
 
-/** Device-dependent float array: f64 on CPU, f32 on Metal (no f64 there). */
-export const floats = (device: TestDevice, values: ReadonlyArray<number>): Float32Array | Float64Array =>
-  device === "metal" ? new Float32Array(values) : new Float64Array(values)
+/** Tests settle on f32: it runs on every device, so one dtype and one set
+ * of tolerances covers CPU and Metal alike. */
+export const floats = (values: ReadonlyArray<number>): Float32Array => new Float32Array(values)
 
-/** The dtype that {@link floats} produces, for explicit dtype options. */
-export const floatDtype = (device: TestDevice): "f32" | "f64" => (device === "metal" ? "f32" : "f64")
+export const floatDtype = "f32" as const
 
-const eps = (device: TestDevice): number => (device === "metal" ? 1e-4 : 1e-12)
+/** Default numerical tolerance for f32 results. */
+export const TOL = 1e-4
 
-const closeEnough = (device: TestDevice, a: number, b: number): boolean =>
-  a === b || (Number.isNaN(a) && Number.isNaN(b)) || Math.abs(a - b) <= eps(device)
+/** Finite-difference step and tolerance for gradient checks in f32:
+ * large enough that f(x±eps) clears f32 rounding, small enough that the
+ * central-difference truncation stays well below the tolerance. */
+export const GRADCHECK_EPS = 2e-3
+export const GRADCHECK_TOL = 2e-2
+
+const closeEnough = (a: number, b: number): boolean =>
+  a === b || (Number.isNaN(a) && Number.isNaN(b)) || Math.abs(a - b) <= TOL
 
 /**
- * deepStrictEqual with a device-dependent tolerance for numeric content:
- * exact for shapes, dtypes and strings; elementwise-close for numbers.
+ * deepStrictEqual with the f32 tolerance for numeric content: exact for
+ * shapes, dtypes and strings; elementwise-close for numbers.
  */
-export const deep = (device: TestDevice, actual: unknown, expected: unknown): void => {
+export const deep = (actual: unknown, expected: unknown): void => {
   if (typeof actual === "number" && typeof expected === "number") {
-    assert.assertTrue(closeEnough(device, actual, expected), `${actual} != ${expected}`)
+    assert.assertTrue(closeEnough(actual, expected), `${actual} != ${expected}`)
     return
   }
   if (Array.isArray(actual) && Array.isArray(expected)) {
@@ -40,7 +46,7 @@ export const deep = (device: TestDevice, actual: unknown, expected: unknown): vo
     if (numeric(actual) && numeric(expected)) {
       assert.deepStrictEqual(actual.length, expected.length)
       actual.forEach((v, i) => {
-        assert.assertTrue(closeEnough(device, v, expected[i]), `[${i}]: ${v} != ${expected[i]}`)
+        assert.assertTrue(closeEnough(v, expected[i]), `[${i}]: ${v} != ${expected[i]}`)
       })
       return
     }
@@ -52,9 +58,7 @@ type SuiteFn = Parameters<ReturnType<typeof layer<Device.CurrentDevice, never>>>
 
 /**
  * Registers the same suite once per device: always on CPU, and on Metal
- * when the machine has one. The suite body receives the device and can
- * pick dtypes/tolerances with {@link floats}/{@link floatDtype} and skip
- * unsupported sections with a plain `if (device === "cpu")`.
+ * when the machine has one.
  */
 export const onDevices = (name: string, make: (device: TestDevice) => SuiteFn): void => {
   layer(Device.Cpu)(`${name} (cpu)`, make("cpu"))
