@@ -34,6 +34,11 @@ pub enum Expr {
     Exp(Box<Expr>),
     Sin(Box<Expr>),
     Cos(Box<Expr>),
+    // Exact in the CPU interpreter; lowered to stable expansions in ug
+    // ops for GPU kernels (ug's op set has no transcendental beyond exp)
+    Tanh(Box<Expr>),
+    Abs(Box<Expr>),
+    Erf(Box<Expr>),
 }
 
 impl Expr {
@@ -59,6 +64,9 @@ impl Expr {
             Expr::Exp(a) => Expr::Exp(Box::new(a.shift_inputs(base))),
             Expr::Sin(a) => Expr::Sin(Box::new(a.shift_inputs(base))),
             Expr::Cos(a) => Expr::Cos(Box::new(a.shift_inputs(base))),
+            Expr::Tanh(a) => Expr::Tanh(Box::new(a.shift_inputs(base))),
+            Expr::Abs(a) => Expr::Abs(Box::new(a.shift_inputs(base))),
+            Expr::Erf(a) => Expr::Erf(Box::new(a.shift_inputs(base))),
         }
     }
 
@@ -80,9 +88,14 @@ impl Expr {
                 | Expr::Div(a, b)
                 | Expr::Min(a, b)
                 | Expr::Max(a, b) => max_input(a).max(max_input(b)),
-                Expr::Neg(a) | Expr::Sqrt(a) | Expr::Exp(a) | Expr::Sin(a) | Expr::Cos(a) => {
-                    max_input(a)
-                }
+                Expr::Neg(a)
+                | Expr::Sqrt(a)
+                | Expr::Exp(a)
+                | Expr::Sin(a)
+                | Expr::Cos(a)
+                | Expr::Tanh(a)
+                | Expr::Abs(a)
+                | Expr::Erf(a) => max_input(a),
             }
         }
         max_input(self) as usize
@@ -102,10 +115,13 @@ pub trait Scalar: Copy {
     fn exp(self) -> Self;
     fn sin(self) -> Self;
     fn cos(self) -> Self;
+    fn tanh(self) -> Self;
+    fn abs(self) -> Self;
+    fn erf(self) -> Self;
 }
 
 macro_rules! impl_scalar {
-    ($ty:ty) => {
+    ($ty:ty, $erf:path) => {
         impl Scalar for $ty {
             fn from_f64(v: f64) -> Self {
                 v as $ty
@@ -143,11 +159,20 @@ macro_rules! impl_scalar {
             fn cos(self) -> Self {
                 self.cos()
             }
+            fn tanh(self) -> Self {
+                self.tanh()
+            }
+            fn abs(self) -> Self {
+                self.abs()
+            }
+            fn erf(self) -> Self {
+                $erf(self)
+            }
         }
     };
 }
-impl_scalar!(f32);
-impl_scalar!(f64);
+impl_scalar!(f32, libm::erff);
+impl_scalar!(f64, libm::erf);
 
 fn eval_at<T: Scalar>(e: &Expr, i: usize, inputs: &[&[T]], scalars: &[T]) -> T {
     match e {
@@ -165,6 +190,9 @@ fn eval_at<T: Scalar>(e: &Expr, i: usize, inputs: &[&[T]], scalars: &[T]) -> T {
         Expr::Exp(a) => eval_at(a, i, inputs, scalars).exp(),
         Expr::Sin(a) => eval_at(a, i, inputs, scalars).sin(),
         Expr::Cos(a) => eval_at(a, i, inputs, scalars).cos(),
+        Expr::Tanh(a) => eval_at(a, i, inputs, scalars).tanh(),
+        Expr::Abs(a) => eval_at(a, i, inputs, scalars).abs(),
+        Expr::Erf(a) => eval_at(a, i, inputs, scalars).erf(),
     }
 }
 
@@ -223,6 +251,12 @@ fn interpret_cpu<T: candle_core::WithDType + Scalar>(
         outs.push(Tensor::from_vec(out, shape, &Device::Cpu)?);
     }
     Ok(outs)
+}
+
+#[cfg(any(target_os = "macos", feature = "cuda"))]
+fn f32_cst(v: f32) -> candle_core::Result<ug::Const> {
+    v.try_into()
+        .map_err(|e| candle_core::Error::Msg(format!("fusion: {e}")))
 }
 
 // Lowers the IR to a ug SSA kernel with one store per output expression.
@@ -350,6 +384,72 @@ fn build_kernel(
             Expr::Cos(a) => {
                 let a = lower(a, b, lanes, num_inputs, lowered_lanes, offset, zero, dtype)?;
                 b.unary(UnaryOp::Cos, a, dtype)
+            }
+            // tanh(x) = 1 - 2 / (exp(2x) + 1): stable in both directions
+            // (exp overflows to +inf for large x, giving exactly 1)
+            Expr::Tanh(a) => {
+                let x = lower(a, b, lanes, num_inputs, lowered_lanes, offset, zero, dtype)?;
+                let two = b.push(I::Const(f32_cst(2.0)?));
+                let one = b.push(I::Const(f32_cst(1.0)?));
+                let x2 = b.binary(BinaryOp::Mul, two, x, dtype);
+                let e = b.unary(UnaryOp::Exp, x2, dtype);
+                let denom = b.binary(BinaryOp::Add, e, one, dtype);
+                let frac = b.binary(BinaryOp::Div, two, denom, dtype);
+                b.binary(BinaryOp::Sub, one, frac, dtype)
+            }
+            Expr::Abs(a) => {
+                let x = lower(a, b, lanes, num_inputs, lowered_lanes, offset, zero, dtype)?;
+                let neg = b.unary(UnaryOp::Neg, x, dtype);
+                b.binary(BinaryOp::Max, x, neg, dtype)
+            }
+            // Abramowitz & Stegun 7.1.26 (max error ~1.5e-7) with
+            // sign(x) = x / max(|x|, 1e-30); the CPU interpreter uses the
+            // exact libm erf instead
+            Expr::Erf(a) => {
+                let x = lower(a, b, lanes, num_inputs, lowered_lanes, offset, zero, dtype)?;
+                let c = |v: f64, b: &mut ug::block::Block| -> candle_core::Result<ug::block::Id> {
+                    Ok(b.push(I::Const(f32_cst(v as f32)?)))
+                };
+                let one = c(1.0, b)?;
+                let ax = {
+                    let neg = b.unary(UnaryOp::Neg, x, dtype);
+                    b.binary(BinaryOp::Max, x, neg, dtype)
+                };
+                let t = {
+                    let k = c(0.3275911, b)?;
+                    let kx = b.binary(BinaryOp::Mul, k, ax, dtype);
+                    let denom = b.binary(BinaryOp::Add, one, kx, dtype);
+                    b.binary(BinaryOp::Div, one, denom, dtype)
+                };
+                let poly = {
+                    let a1 = c(0.254829592, b)?;
+                    let a2 = c(-0.284496736, b)?;
+                    let a3 = c(1.421413741, b)?;
+                    let a4 = c(-1.453152027, b)?;
+                    let a5 = c(1.061405429, b)?;
+                    let p = b.binary(BinaryOp::Mul, a5, t, dtype);
+                    let p = b.binary(BinaryOp::Add, p, a4, dtype);
+                    let p = b.binary(BinaryOp::Mul, p, t, dtype);
+                    let p = b.binary(BinaryOp::Add, p, a3, dtype);
+                    let p = b.binary(BinaryOp::Mul, p, t, dtype);
+                    let p = b.binary(BinaryOp::Add, p, a2, dtype);
+                    let p = b.binary(BinaryOp::Mul, p, t, dtype);
+                    b.binary(BinaryOp::Add, p, a1, dtype)
+                };
+                let tail = {
+                    let x2 = b.binary(BinaryOp::Mul, x, x, dtype);
+                    let nx2 = b.unary(UnaryOp::Neg, x2, dtype);
+                    let e = b.unary(UnaryOp::Exp, nx2, dtype);
+                    let pt = b.binary(BinaryOp::Mul, poly, t, dtype);
+                    let pte = b.binary(BinaryOp::Mul, pt, e, dtype);
+                    b.binary(BinaryOp::Sub, one, pte, dtype)
+                };
+                let sign = {
+                    let eps = c(1e-30, b)?;
+                    let denom = b.binary(BinaryOp::Max, ax, eps, dtype);
+                    b.binary(BinaryOp::Div, x, denom, dtype)
+                };
+                b.binary(BinaryOp::Mul, sign, tail, dtype)
             }
         })
     }

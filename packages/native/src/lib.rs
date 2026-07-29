@@ -4882,6 +4882,9 @@ fn fuse_roots(roots: &[Arc<Node>]) -> std::result::Result<Vec<Arc<Node>>, String
             NodeKind::Relu { .. } => {
                 Some(OpT::Unary(|a| E::Max(Box::new(a), Box::new(E::cst(0.0)))))
             }
+            NodeKind::Tanh { .. } => Some(OpT::Unary(|a| E::Tanh(Box::new(a)))),
+            NodeKind::Abs { .. } => Some(OpT::Unary(|a| E::Abs(Box::new(a)))),
+            NodeKind::Erf { .. } => Some(OpT::Unary(|a| E::Erf(Box::new(a)))),
             _ => None,
         }
     };

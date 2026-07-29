@@ -62,6 +62,28 @@ layer(Device.Cpu)("Fusion", (it) => {
       })
     )
 
+    it.effect("tanh, abs and erf chains fuse and agree with unfused evaluation", () =>
+      Effect.gen(function* () {
+        const build = Effect.gen(function* () {
+          const x = yield* Tensor.fromTypedArray(new Float64Array([0.5, -1, 2, -3, 0.25, 1.5]), [2, 3])
+          // sigmoid and silu are composed from tanh; gelu from erf — all
+          // should ride the same fused regions
+          const y = yield* Tensor.silu(yield* Tensor.tanh(x))
+          const z = yield* Tensor.gelu(yield* Tensor.abs(y))
+          const loss = yield* Tensor.sum(yield* Tensor.mul(z, y))
+          const [gx] = yield* Gradient.grad(loss, [x])
+          return { y: yield* values(y), z: yield* values(z), gx: yield* values(gx) }
+        })
+        const fused = yield* withFusion(true, build)
+        const unfused = yield* withFusion(false, build)
+        for (const key of ["y", "z", "gx"] as const) {
+          fused[key].forEach((v, i) => {
+            assert.assertTrue(Math.abs(v - unfused[key][i]) < 1e-9, `${key}[${i}]: ${v} != ${unfused[key][i]}`)
+          })
+        }
+      })
+    )
+
     it.effect("broadcasting boundaries stay unfused but still correct", () =>
       Effect.gen(function* () {
         const build = Effect.gen(function* () {
