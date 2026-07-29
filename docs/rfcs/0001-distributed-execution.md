@@ -290,11 +290,11 @@ compiler-oriented layer and deliberately **not** in Phase 1.
 
 - Collectives block on the ring backend; they run on `spawn_blocking` and
   poll the existing `CancellationToken` between chunk transfers, so fiber
-  interruption works as with `evaluate` today.
+  interruption works as with `compute` today.
 - NCCL collectives are device-synchronous; interruption is checked before
   launch and after completion (mid-collective abort requires `commAbort`,
   deferred).
-- Rank failure semantics: v1 fails the whole `evaluate` with a
+- Rank failure semantics: v1 fails the whole `compute` with a
   `ProcessGroupError`; no elastic restart.
 
 ## Scope

@@ -98,7 +98,7 @@ Notes:
   closure of the factory, never in `P`.
 - `init` returns **lazy** tensors: it is pure graph-building, consistent
   with every other constructor. Materialization happens in the first
-  `Optimizer.step` walk (or an explicit `Tensor.evaluate`), so initial
+  `Optimizer.step` walk (or an explicit `Tensor.compute`), so initial
   `randn` draws are consistent with the first loss within that walk.
 - `forward` is single-input, single-output. DAGs (skip connections,
   multi-head) are explicitly out of scope (see Future work).

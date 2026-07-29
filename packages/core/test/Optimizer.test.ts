@@ -16,7 +16,7 @@ const runStep = <S>(
 ) =>
   Effect.gen(function* () {
     const next = yield* optimizer.step(params, grads, state)
-    const evaluated = yield* Tensor.evaluate([...next.params, ...next.stateRoots])
+    const evaluated = yield* Tensor.compute([...next.params, ...next.stateRoots])
     return {
       params: evaluated.slice(0, params.length),
       state: next.rebuildState(evaluated.slice(params.length))

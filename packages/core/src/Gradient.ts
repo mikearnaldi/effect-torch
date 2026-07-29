@@ -47,7 +47,7 @@ const toGradError = (error: unknown): GradError => {
  * Gradients are lazy tensors sharing the forward graph; a `wrt` tensor that
  * does not influence the loss yields a zero gradient. Because the loss and
  * its gradients share the forward graph, evaluate them together with
- * {@link Tensor.evaluate}: evaluating them separately recomputes the forward
+ * {@link Tensor.compute}: evaluating them separately recomputes the forward
  * pass and, if the graph contains `randn`, produces values from different
  * random draws.
  *

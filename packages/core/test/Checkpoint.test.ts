@@ -79,7 +79,7 @@ onDevices("Checkpoint", (device: TestDevice) => (it) => {
       const loss = yield* Tensor.sum(yield* Tensor.mul(p, p))
       const [gp] = yield* Gradient.grad(loss, [p])
       const next = yield* optimizer.step([p], [gp], state)
-      const [m, v] = yield* Tensor.evaluate(next.stateRoots)
+      const [m, v] = yield* Tensor.compute(next.stateRoots)
       yield* Tensor.save(file, { "m.0": m, "v.0": v })
       const loaded = yield* Tensor.load(file)
       expect(yield* values(loaded["m.0"])).toEqual(yield* values(m))

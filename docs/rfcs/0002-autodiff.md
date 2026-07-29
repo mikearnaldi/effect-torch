@@ -221,7 +221,7 @@ together with the gradients is what `evaluateAll` is for.
 
 ### Single evaluation, and the `randn` hazard
 
-`randn` re-randomizes per `evaluate` call by design. Therefore the loss and
+`randn` re-randomizes per `compute` call by design. Therefore the loss and
 all gradients returned by `grad` must be evaluated together with the loss in **one**
 executor walk, or the reported loss and the gradients would come from
 different random draws. `grad` returns lazy roots;

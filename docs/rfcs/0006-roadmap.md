@@ -28,7 +28,7 @@ re-derived per session.
   batching rules).
 - `Loss`: regression and classification losses with mean/sum/none
   reduction.
-- `Optimizer`: pure graph-transform SGD/Adam/AdamW, one `evaluate` walk
+- `Optimizer`: pure graph-transform SGD/Adam/AdamW, one `compute` walk
   per training step, fused native AdamW update node (default),
   `clipByValue`/`clipByGlobalNorm`.
 - `LearningRate`: constant/exponential/stepwise/cosine/warmup schedules.

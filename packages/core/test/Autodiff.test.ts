@@ -285,7 +285,7 @@ onDevices("Autodiff", (device: TestDevice) => (it) => {
         const out2 = yield* Gradient.checkpoint(yield* stochastic(x2))
         const loss2 = yield* Tensor.sum(out2)
         const [g2] = yield* Gradient.grad(loss2, [x2])
-        const [outM, gM] = yield* Tensor.evaluate([out2, g2])
+        const [outM, gM] = yield* Tensor.compute([out2, g2])
         const outValues = yield* Tensor.toNumberArray(outM)
         const gradValues = yield* Tensor.toNumberArray(gM)
         for (let i = 0; i < 2; i++) {
@@ -557,14 +557,14 @@ onDevices("Autodiff", (device: TestDevice) => (it) => {
     )
   })
 
-  describe("grad + evaluate", () => {
+  describe("grad + compute", () => {
     it.effect("loss and gradients come from the same randn draw", () =>
       Effect.gen(function* () {
         const x = yield* f32([1, 2, 3])
         const r = yield* Tensor.randn([3], { dtype: floatDtype })
         const loss = yield* Tensor.sum(yield* Tensor.mul(x, r))
         const [gx] = yield* Gradient.grad(loss, [x])
-        const [l, g] = yield* Tensor.evaluate([loss, gx])
+        const [l, g] = yield* Tensor.compute([loss, gx])
         const lv = yield* scalar(l)
         const gv = yield* values(g)
         const reconstructed = gv[0] * 1 + gv[1] * 2 + gv[2] * 3
@@ -591,7 +591,7 @@ onDevices("Autodiff", (device: TestDevice) => (it) => {
           const pred = yield* Tensor.add(yield* Tensor.matmul(x, w), b)
           const loss = yield* Loss.mse(pred, y)
           const [gw, gb] = yield* Gradient.grad(loss, [w, b])
-          const [lt, gwt, gbt] = yield* Tensor.evaluate([loss, gw, gb])
+          const [lt, gwt, gbt] = yield* Tensor.compute([loss, gw, gb])
           const l = yield* scalar(lt)
           const gwv = yield* values(gwt)
           const gbv = yield* values(gbt)

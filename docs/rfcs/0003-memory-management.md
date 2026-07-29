@@ -187,7 +187,7 @@ Notes:
   async napi function (running on the tokio runtime) cannot call
   `adjust_external_memory` after evaluation. Instead the native side exposes
   `reportExternalMemory(bytes)` (sync, main thread) plus a `bytes` getter on
-  `NativeTensor`; `Tensor.evaluate` reports the total right after the
+  `NativeTensor`; `Tensor.compute` reports the total right after the
   handles resolve. The negative half runs in `ObjectFinalize::finalize`
   (`#[napi(custom_finalize)]`).
 - **Observability via our own counter.** Node's
@@ -207,5 +207,5 @@ Notes:
   children are computed before their parents and read straight from the
   cache, `count_consumers` is iterative as well, and compute stays on the
   tokio blocking pool. Chains of 200k+ nodes evaluate on a fixed stack.
-- Consumer counting shares one reachability walk per `evaluate` call;
+- Consumer counting shares one reachability walk per `compute` call;
   `node_children` was hoisted out of the autodiff module for reuse.

@@ -99,7 +99,7 @@ export interface GenericTensor extends Pipeable {
 
 /**
  * A tensor described by a lazy computation graph. Operations on lazy tensors
- * only extend the graph; nothing is computed until {@link evaluate} is called.
+ * only extend the graph; nothing is computed until {@link compute} is called.
  *
  * @since 0.1.0
  * @category models
@@ -110,7 +110,7 @@ export interface LazyTensor extends GenericTensor {
 
 /**
  * A materialized tensor whose data resides on the device, obtained through
- * {@link evaluate}.
+ * {@link compute}.
  *
  * @since 0.1.0
  * @category models
@@ -3213,7 +3213,7 @@ const fromNative = <A>(
  * @since 0.1.0
  * @category destructors
  */
-export const evaluate = <Roots extends ReadonlyArray<GenericTensor>>(
+export const compute = <Roots extends ReadonlyArray<GenericTensor>>(
   roots: Roots
 ): Effect.Effect<{ readonly [K in keyof Roots]: Tensor }, TensorError> =>
   roots.every(isTensor)
@@ -3253,7 +3253,7 @@ const typedArrayConstructor = (dtype: DType) => {
  * @category destructors
  */
 export const toTypedArray = (self: GenericTensor): Effect.Effect<TypedArray, TensorError> =>
-  Effect.flatMap(evaluate([self]), ([evaluated]) =>
+  Effect.flatMap(compute([self]), ([evaluated]) =>
     fromNative<TypedArray>("toTypedArray", (token) =>
       evaluated.materialized.readback(token).then((buffer) => {
         const Ctor = typedArrayConstructor(evaluated.dtype)

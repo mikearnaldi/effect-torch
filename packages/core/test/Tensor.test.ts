@@ -237,7 +237,7 @@ onDevices("Tensor", (device: TestDevice) => (it) => {
   })
 
   describe("composition", () => {
-    it.effect("matmul(eye) roundtrip and deep chains evaluate once", () =>
+    it.effect("matmul(eye) roundtrip and deep chains compute once", () =>
       Effect.gen(function* () {
         const a = yield* Tensor.fromTypedArray(new Float32Array([1, 2, 3, 4]), [2, 2])
         const id = yield* Tensor.eye(2)

@@ -46,7 +46,7 @@ const median = (values: ReadonlyArray<number>): number => [...values].sort((x, y
 const program = Effect.gen(function* () {
   const [am, bm] = yield* Effect.flatMap(
     Effect.zip(Tensor.randn([N, N]), Tensor.randn([N, N])),
-    ([ra, rb]) => Tensor.evaluate([ra, rb])
+    ([ra, rb]) => Tensor.compute([ra, rb])
   )
 
   const xa = yield* Effect.sync(() => mx.random.normal([N, N]))

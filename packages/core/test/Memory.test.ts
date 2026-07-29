@@ -11,12 +11,12 @@ const collectGarbage = runInNewContext("gc") as () => void
 
 layer(Device.Cpu)("Memory", (it) => {
   describe("external memory accounting", () => {
-    it.effect("native tensor bytes are reported on evaluate and released on GC", () =>
+    it.effect("native tensor bytes are reported on compute and released on GC", () =>
       Effect.gen(function* () {
         const bytes = 4096 * 4096 * 4
 
         const allocate = Effect.gen(function* () {
-          const [t] = yield* Tensor.evaluate([yield* Tensor.zeros([4096, 4096])])
+          const [t] = yield* Tensor.compute([yield* Tensor.zeros([4096, 4096])])
           return t.shape
         })
 
@@ -48,7 +48,7 @@ layer(Device.Cpu)("Memory", (it) => {
           for (let i = 0; i < 2000; i++) {
             x = yield* Tensor.add(x, 1)
           }
-          const [result] = yield* Tensor.evaluate([x])
+          const [result] = yield* Tensor.compute([x])
           return result
         })
 

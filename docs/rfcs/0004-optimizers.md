@@ -13,7 +13,7 @@ optional momentum), Adam, and AdamW. Optimizers are **pure graph
 transforms**: given the current parameters, their gradients, and optimizer
 state, `step` returns new parameters and new state as lazy graph values.
 Nothing is mutated and nothing is materialized inside the optimizer; the
-caller evaluates the updates — normally in the **same** `Tensor.evaluate`
+caller evaluates the updates — normally in the **same** `Tensor.compute`
 walk as the loss and gradients, so one training step costs exactly one
 forward and one backward pass.
 
@@ -175,7 +175,7 @@ numerically, both are provided for API clarity and config compatibility.
 
 The load-bearing property: because `grad` shares the forward graph and the
 update ops extend the same graph further, **loss, updates, and new state
-can all be roots of a single `evaluate` walk**. Per-walk dedup computes
+can all be roots of a single `compute` walk**. Per-walk dedup computes
 the forward pass once, the backward pass once, and the update arithmetic
 once.
 
@@ -191,7 +191,7 @@ const program = Effect.gen(function* () {
     const next = opt.step(params, grads, state)
     // state tensors are flattened into the same walk:
     const roots = [loss, ...next.params, ...stateTensors(next.state)]
-    const evaluated = yield* Tensor.evaluate(roots)
+    const evaluated = yield* Tensor.compute(roots)
     // partition: [loss] | params | state; next step uses the materialized
     // tensors as leaves — graph depth stays O(one step)
     ...
@@ -199,7 +199,7 @@ const program = Effect.gen(function* () {
 })
 ```
 
-Because `evaluate` returns materialized `Tensor`s and every materialized
+Because `compute` returns materialized `Tensor`s and every materialized
 tensor wraps back into a lazy leaf (`fromMaterialized`), the next step's
 graph references *values*, not the previous step's *nodes*. Graph depth
 per walk is O(model depth), not O(step count) — this is what keeps RFC
@@ -219,7 +219,7 @@ export const step: <S>(
 >
 ```
 
-which composes `grad` + `Optimizer.step` + one `evaluate` + state
+which composes `grad` + `Optimizer.step` + one `compute` + state
 repacking. The low-level pieces remain public for custom loops
 (gradient accumulation, clipping, multi-loss).
 
@@ -262,7 +262,7 @@ Following the strict-dtype rule (no promotion):
    - Training loop of N=50 steps: graph depth of the loss at step N equals
      depth at step 1 (state is re-materialized, no chaining).
    - RSS bounded across steps (relies on RFC 0003 early free).
-   - Loss and updates evaluated in a single `evaluate` call produce
+   - Loss and updates evaluated in a single `compute` call produce
      identical loss values to the loss-only walk (dedup determinism).
 4. **Errors**: non-float param → build-time error; mismatched params/grads
    lengths → build-time error; state from a different-shaped param set →
@@ -323,7 +323,7 @@ Deviations from the design above, forced by the existing API:
   constraining state to a flat record and materializing it generically —
   was tried and rejected: identical runtime behavior, worse ergonomics.)
 - Everything else is as designed: formulas (verified against hand-computed
-  recurrences in the test suite), one `evaluate` walk per training step via
+  recurrences in the test suite), one `compute` walk per training step via
   the `step` helper, materialized state re-leafed each step, no native
   changes.
 

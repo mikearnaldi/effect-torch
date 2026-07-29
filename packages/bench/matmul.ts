@@ -39,7 +39,7 @@ const suite: Effect.Effect<void, Tensor.TensorError, Device.CurrentDevice> =
     const device = yield* Device.CurrentDevice
     const [a, b] = yield* Effect.flatMap(
       Effect.zip(Tensor.randn([N, N]), Tensor.randn([N, N])),
-      ([ra, rb]) => Tensor.evaluate([ra, rb])
+      ([ra, rb]) => Tensor.compute([ra, rb])
     )
     yield* bench(`effect-torch ${device}`, Effect.flatMap(chain(a, b, BATCH), Tensor.toTypedArray), BATCH)
   })

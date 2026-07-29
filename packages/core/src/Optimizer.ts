@@ -5,7 +5,7 @@
  * nothing is mutated and nothing is materialized inside the optimizer.
  * Because gradients share the loss's forward graph and the updates extend
  * the same graphs further, the loss, the updated parameters, and the
- * updated state can all be roots of a single {@link Tensor.evaluate} walk:
+ * updated state can all be roots of a single {@link Tensor.compute} walk:
  * one training step costs exactly one forward and one backward pass, and
  * intermediate gradient tensors are freed as soon as their update consumes
  * them.
@@ -570,7 +570,7 @@ export const step = <S, P extends ReadonlyArray<Tensor.GenericTensor>>(
   Effect.gen(function* () {
     const grads = yield* Gradient.grad(loss, params)
     const next = yield* optimizer.step(params, grads, state)
-    const evaluated = yield* Tensor.evaluate([loss, ...next.params, ...next.stateRoots])
+    const evaluated = yield* Tensor.compute([loss, ...next.params, ...next.stateRoots])
     const [evaluatedLoss, ...rest] = evaluated
     return {
       loss: evaluatedLoss,
