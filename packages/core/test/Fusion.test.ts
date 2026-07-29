@@ -89,18 +89,146 @@ onDevices("Fusion", (device: TestDevice) => (it) => {
       })
     )
 
-    it.effect("broadcasting boundaries stay unfused but still correct", () =>
+    it.effect("broadcast lanes fuse (bias add, row subtract) and agree with unfused evaluation", () =>
       Effect.gen(function* () {
         const build = Effect.gen(function* () {
           const x = yield* Tensor.fromTypedArray(floats([1, 2, 3, 4, 5, 6]), [2, 3])
-          // [2, 3] - [1, 3] is a broadcasting boundary: not fusable
+          // [2, 3] - [1, 3] rides the region as a broadcast lane
           const row = yield* Tensor.fromTypedArray(floats([0.5, 0.5, 0.5]), [1, 3])
           const y = yield* Tensor.sqrt(yield* Tensor.mul(yield* Tensor.sub(x, row), 2))
+          const loss = yield* Tensor.sum(y)
+          const [gx] = yield* Gradient.grad(loss, [x])
+          return { y: yield* values(y), gx: yield* values(gx) }
+        })
+        const fused = yield* withFusion(true, build)
+        const unfused = yield* withFusion(false, build)
+        for (const key of ["y", "gx"] as const) {
+          fused[key].forEach((v, i) => assert.assertTrue(close(v, unfused[key][i])))
+        }
+      })
+    )
+
+    it.effect("softmax-style broadcast chains (row-max subtract, computed scalar) fuse", () =>
+      Effect.gen(function* () {
+        const build = Effect.gen(function* () {
+          const x = yield* Tensor.fromTypedArray(
+            floats([1, -2, 3, -4, 0.5, -0.5, 2, -1, 0.1, 0.2, 0.3, 0.4, -3, 2.5, 1.5, -0.7]),
+            [4, 4]
+          )
+          // [4,4] - [4,1] keepdims broadcast, the fused region crosses it
+          const m = yield* Tensor.max(x, { dims: [1], keepdims: true })
+          const y = yield* Tensor.tanh(yield* Tensor.exp(yield* Tensor.sub(x, m)))
+          // a computed rank-0 scalar lane (not a constructor constant)
+          const s = yield* Tensor.mean(y)
+          const z = yield* Tensor.mul(y, yield* Tensor.exp(s))
+          const loss = yield* Tensor.sum(z)
+          const [gx] = yield* Gradient.grad(loss, [x])
+          return { y: yield* values(y), z: yield* values(z), gx: yield* values(gx) }
+        })
+        const fused = yield* withFusion(true, build)
+        const unfused = yield* withFusion(false, build)
+        for (const key of ["y", "z", "gx"] as const) {
+          fused[key].forEach((v, i) => {
+            assert.assertTrue(close(v, unfused[key][i]), `${key}[${i}]: ${v} != ${unfused[key][i]}`)
+          })
+        }
+      })
+    )
+
+    it.effect("rank-3 broadcast lanes fuse (middle-dim and trailing-dim strides)", () =>
+      Effect.gen(function* () {
+        const build = Effect.gen(function* () {
+          const a = yield* Tensor.fromTypedArray(
+            floats(Array.from({ length: 24 }, (_, i) => (i % 7) - 3)),
+            [2, 3, 4]
+          )
+          const b = yield* Tensor.fromTypedArray(floats([0.5, -1.5, 2]), [1, 3, 1])
+          const c = yield* Tensor.fromTypedArray(floats([1, 2, 3, 4]), [4])
+          const y = yield* Tensor.relu(yield* Tensor.add(yield* Tensor.mul(a, b), c))
+          const loss = yield* Tensor.sum(y)
+          const [ga] = yield* Gradient.grad(loss, [a])
+          return { y: yield* values(y), ga: yield* values(ga) }
+        })
+        const fused = yield* withFusion(true, build)
+        const unfused = yield* withFusion(false, build)
+        for (const key of ["y", "ga"] as const) {
+          fused[key].forEach((v, i) => assert.assertTrue(close(v, unfused[key][i])))
+        }
+      })
+    )
+
+    it.effect("sign fuses through comparisons and agrees with unfused evaluation", () =>
+      Effect.gen(function* () {
+        const build = Effect.gen(function* () {
+          const x = yield* Tensor.fromTypedArray(floats([-2, -0.5, 0, 0.5, 2, -1.5]), [2, 3])
+          const y = yield* Tensor.mul(yield* Tensor.sign(yield* Tensor.sub(x, 0.25)), 3)
+          const loss = yield* Tensor.sum(y)
+          const [gx] = yield* Gradient.grad(loss, [x])
+          return { y: yield* values(y), gx: yield* values(gx) }
+        })
+        const fused = yield* withFusion(true, build)
+        const unfused = yield* withFusion(false, build)
+        for (const key of ["y", "gx"] as const) {
+          fused[key].forEach((v, i) => assert.assertTrue(close(v, unfused[key][i])))
+        }
+      })
+    )
+
+    it.effect("identity casts are transparent inside a region", () =>
+      Effect.gen(function* () {
+        const build = Effect.gen(function* () {
+          const x = yield* Tensor.fromTypedArray(floats([1, 2, 3, 4]), [2, 2])
+          const y = yield* Tensor.sqrt(yield* Tensor.cast(yield* Tensor.mul(x, 2), "f32"))
           return yield* values(y)
         })
         const fused = yield* withFusion(true, build)
         const unfused = yield* withFusion(false, build)
         fused.forEach((v, i) => assert.assertTrue(close(v, unfused[i])))
+      })
+    )
+
+    it.effect("a shared fused prefix compiles to one multi-output kernel", () =>
+      Effect.gen(function* () {
+        const build = Effect.gen(function* () {
+          // y is a fused region with several consumers: the fused
+          // continuations (z, w) merge with it into one multi-output
+          // kernel, while the unfused consumer (sum) keeps y materialized.
+          // Small magnitudes: sin of a large argument would amplify the
+          // (valid) rounding difference between inlined and materialized y
+          const a = yield* Tensor.fromTypedArray(floats([0.1, 0.2, 0.3, 0.4, 0.5, 0.6]), [2, 3])
+          const b = yield* Tensor.fromTypedArray(floats([0.5, 1.5, 2.5, 3.5, 4.5, 5.5]), [2, 3])
+          const y = yield* Tensor.exp(yield* Tensor.sqrt(yield* Tensor.add(yield* Tensor.mul(a, b), 2)))
+          const z = yield* Tensor.sin(y)
+          const w = yield* Tensor.cos(y)
+          const loss = yield* Tensor.sum(yield* Tensor.add(yield* Tensor.mul(y, z), w))
+          const [ga, gb] = yield* Gradient.grad(loss, [a, b])
+          return {
+            y: yield* values(y),
+            z: yield* values(z),
+            w: yield* values(w),
+            ga: yield* values(ga),
+            gb: yield* values(gb)
+          }
+        })
+        const fused = yield* withFusion(true, build)
+        const unfused = yield* withFusion(false, build)
+        for (const key of ["y", "z", "w", "ga", "gb"] as const) {
+          fused[key].forEach((v, i) => {
+            assert.assertTrue(close(v, unfused[key][i]), `${key}[${i}]: ${v} != ${unfused[key][i]}`)
+          })
+        }
+      })
+    )
+
+    it.effect("regions folding to zero lanes evaluate plainly", () =>
+      Effect.gen(function* () {
+        // relu(full + full): both operands fold to constants, leaving a
+        // region with no input lanes — it must not reach the fused node
+        const y = yield* Tensor.relu(yield* Tensor.add(yield* Tensor.full([], 1), yield* Tensor.full([], 2)))
+        const fused = yield* withFusion(true, values(y))
+        const unfused = yield* withFusion(false, values(y))
+        assert.deepStrictEqual(fused, unfused)
+        assert.deepStrictEqual(fused, [3])
       })
     )
 

@@ -120,44 +120,135 @@ impl Expr {
         Expr::Const(v.to_bits())
     }
 
-    /// Adds `base` to every per-element lane index (used when merging two
-    /// regions whose lane lists are concatenated).
-    pub fn shift_inputs(&self, base: u32) -> Self {
+    /// Remaps per-element lane indices through `remap` (which must cover
+    /// every lane the expression references).
+    pub fn remap_lanes(&self, remap: &std::collections::HashMap<u32, u32>) -> Self {
+        self.remap_inputs(&mut |k| remap[&k])
+    }
+
+    /// Number of nodes in the expression tree (shared subtrees count per
+    /// occurrence: this bounds emitted kernel size, not SSA values).
+    pub fn ops(&self) -> usize {
         match self {
-            Expr::Input(k) => Expr::Input(k + base),
+            Expr::Input(_) | Expr::Scalar(_) | Expr::Const(_) => 1,
+            Expr::Select(c, a, b) => 1 + c.ops() + a.ops() + b.ops(),
+            Expr::Add(a, b)
+            | Expr::Sub(a, b)
+            | Expr::Mul(a, b)
+            | Expr::Div(a, b)
+            | Expr::Min(a, b)
+            | Expr::Max(a, b)
+            | Expr::Lt(a, b)
+            | Expr::Le(a, b)
+            | Expr::Gt(a, b)
+            | Expr::Ge(a, b)
+            | Expr::Eq(a, b)
+            | Expr::Ne(a, b) => 1 + a.ops() + b.ops(),
+            Expr::Neg(a)
+            | Expr::Sqrt(a)
+            | Expr::Exp(a)
+            | Expr::Sin(a)
+            | Expr::Cos(a)
+            | Expr::Tanh(a)
+            | Expr::Abs(a)
+            | Expr::Log(a)
+            | Expr::Floor(a)
+            | Expr::Ceil(a)
+            | Expr::Round(a)
+            | Expr::Powf(a, _)
+            | Expr::Erf(a) => 1 + a.ops(),
+        }
+    }
+
+    fn remap_inputs(&self, f: &mut dyn FnMut(u32) -> u32) -> Self {
+        match self {
+            Expr::Input(k) => Expr::Input(f(*k)),
             Expr::Scalar(k) => Expr::Scalar(*k),
             Expr::Const(b) => Expr::Const(*b),
-            Expr::Add(a, b) => Expr::Add(Box::new(a.shift_inputs(base)), Box::new(b.shift_inputs(base))),
-            Expr::Sub(a, b) => Expr::Sub(Box::new(a.shift_inputs(base)), Box::new(b.shift_inputs(base))),
-            Expr::Mul(a, b) => Expr::Mul(Box::new(a.shift_inputs(base)), Box::new(b.shift_inputs(base))),
-            Expr::Div(a, b) => Expr::Div(Box::new(a.shift_inputs(base)), Box::new(b.shift_inputs(base))),
-            Expr::Min(a, b) => Expr::Min(Box::new(a.shift_inputs(base)), Box::new(b.shift_inputs(base))),
-            Expr::Max(a, b) => Expr::Max(Box::new(a.shift_inputs(base)), Box::new(b.shift_inputs(base))),
-            Expr::Lt(a, b) => Expr::Lt(Box::new(a.shift_inputs(base)), Box::new(b.shift_inputs(base))),
-            Expr::Le(a, b) => Expr::Le(Box::new(a.shift_inputs(base)), Box::new(b.shift_inputs(base))),
-            Expr::Gt(a, b) => Expr::Gt(Box::new(a.shift_inputs(base)), Box::new(b.shift_inputs(base))),
-            Expr::Ge(a, b) => Expr::Ge(Box::new(a.shift_inputs(base)), Box::new(b.shift_inputs(base))),
-            Expr::Eq(a, b) => Expr::Eq(Box::new(a.shift_inputs(base)), Box::new(b.shift_inputs(base))),
-            Expr::Ne(a, b) => Expr::Ne(Box::new(a.shift_inputs(base)), Box::new(b.shift_inputs(base))),
+            Expr::Add(a, b) => Expr::Add(Box::new(a.remap_inputs(f)), Box::new(b.remap_inputs(f))),
+            Expr::Sub(a, b) => Expr::Sub(Box::new(a.remap_inputs(f)), Box::new(b.remap_inputs(f))),
+            Expr::Mul(a, b) => Expr::Mul(Box::new(a.remap_inputs(f)), Box::new(b.remap_inputs(f))),
+            Expr::Div(a, b) => Expr::Div(Box::new(a.remap_inputs(f)), Box::new(b.remap_inputs(f))),
+            Expr::Min(a, b) => Expr::Min(Box::new(a.remap_inputs(f)), Box::new(b.remap_inputs(f))),
+            Expr::Max(a, b) => Expr::Max(Box::new(a.remap_inputs(f)), Box::new(b.remap_inputs(f))),
+            Expr::Lt(a, b) => Expr::Lt(Box::new(a.remap_inputs(f)), Box::new(b.remap_inputs(f))),
+            Expr::Le(a, b) => Expr::Le(Box::new(a.remap_inputs(f)), Box::new(b.remap_inputs(f))),
+            Expr::Gt(a, b) => Expr::Gt(Box::new(a.remap_inputs(f)), Box::new(b.remap_inputs(f))),
+            Expr::Ge(a, b) => Expr::Ge(Box::new(a.remap_inputs(f)), Box::new(b.remap_inputs(f))),
+            Expr::Eq(a, b) => Expr::Eq(Box::new(a.remap_inputs(f)), Box::new(b.remap_inputs(f))),
+            Expr::Ne(a, b) => Expr::Ne(Box::new(a.remap_inputs(f)), Box::new(b.remap_inputs(f))),
             Expr::Select(c, a, b) => Expr::Select(
-                Box::new(c.shift_inputs(base)),
-                Box::new(a.shift_inputs(base)),
-                Box::new(b.shift_inputs(base)),
+                Box::new(c.remap_inputs(f)),
+                Box::new(a.remap_inputs(f)),
+                Box::new(b.remap_inputs(f)),
             ),
-            Expr::Neg(a) => Expr::Neg(Box::new(a.shift_inputs(base))),
-            Expr::Sqrt(a) => Expr::Sqrt(Box::new(a.shift_inputs(base))),
-            Expr::Exp(a) => Expr::Exp(Box::new(a.shift_inputs(base))),
-            Expr::Sin(a) => Expr::Sin(Box::new(a.shift_inputs(base))),
-            Expr::Cos(a) => Expr::Cos(Box::new(a.shift_inputs(base))),
-            Expr::Tanh(a) => Expr::Tanh(Box::new(a.shift_inputs(base))),
-            Expr::Abs(a) => Expr::Abs(Box::new(a.shift_inputs(base))),
-            Expr::Log(a) => Expr::Log(Box::new(a.shift_inputs(base))),
-            Expr::Floor(a) => Expr::Floor(Box::new(a.shift_inputs(base))),
-            Expr::Ceil(a) => Expr::Ceil(Box::new(a.shift_inputs(base))),
-            Expr::Round(a) => Expr::Round(Box::new(a.shift_inputs(base))),
-            Expr::Powf(a, e) => Expr::Powf(Box::new(a.shift_inputs(base)), *e),
-            Expr::Erf(a) => Expr::Erf(Box::new(a.shift_inputs(base))),
+            Expr::Neg(a) => Expr::Neg(Box::new(a.remap_inputs(f))),
+            Expr::Sqrt(a) => Expr::Sqrt(Box::new(a.remap_inputs(f))),
+            Expr::Exp(a) => Expr::Exp(Box::new(a.remap_inputs(f))),
+            Expr::Sin(a) => Expr::Sin(Box::new(a.remap_inputs(f))),
+            Expr::Cos(a) => Expr::Cos(Box::new(a.remap_inputs(f))),
+            Expr::Tanh(a) => Expr::Tanh(Box::new(a.remap_inputs(f))),
+            Expr::Abs(a) => Expr::Abs(Box::new(a.remap_inputs(f))),
+            Expr::Log(a) => Expr::Log(Box::new(a.remap_inputs(f))),
+            Expr::Floor(a) => Expr::Floor(Box::new(a.remap_inputs(f))),
+            Expr::Ceil(a) => Expr::Ceil(Box::new(a.remap_inputs(f))),
+            Expr::Round(a) => Expr::Round(Box::new(a.remap_inputs(f))),
+            Expr::Powf(a, e) => Expr::Powf(Box::new(a.remap_inputs(f)), *e),
+            Expr::Erf(a) => Expr::Erf(Box::new(a.remap_inputs(f))),
         }
+    }
+
+    /// Inlines `replacement` for `lane` and remaps the remaining lanes
+    /// through `remap` (used by the multi-output merge to absorb a shared
+    /// prefix into its continuations). Each occurrence is decided by its
+    /// original index in a single pass, so a remapped index that collides
+    /// with `lane` cannot be mistaken for the inlined one. The
+    /// replacement's own indices must already be in the merged namespace.
+    pub fn merge_lane(
+        &self,
+        lane: u32,
+        replacement: &Expr,
+        remap: &std::collections::HashMap<u32, u32>,
+    ) -> Self {
+        fn go(e: &Expr, lane: u32, r: &Expr, remap: &std::collections::HashMap<u32, u32>) -> Expr {
+            match e {
+                Expr::Input(k) if *k == lane => r.clone(),
+                Expr::Input(k) => Expr::Input(remap[k]),
+                Expr::Scalar(k) => Expr::Scalar(*k),
+                Expr::Const(b) => Expr::Const(*b),
+                Expr::Add(a, b) => Expr::Add(Box::new(go(a, lane, r, remap)), Box::new(go(b, lane, r, remap))),
+                Expr::Sub(a, b) => Expr::Sub(Box::new(go(a, lane, r, remap)), Box::new(go(b, lane, r, remap))),
+                Expr::Mul(a, b) => Expr::Mul(Box::new(go(a, lane, r, remap)), Box::new(go(b, lane, r, remap))),
+                Expr::Div(a, b) => Expr::Div(Box::new(go(a, lane, r, remap)), Box::new(go(b, lane, r, remap))),
+                Expr::Min(a, b) => Expr::Min(Box::new(go(a, lane, r, remap)), Box::new(go(b, lane, r, remap))),
+                Expr::Max(a, b) => Expr::Max(Box::new(go(a, lane, r, remap)), Box::new(go(b, lane, r, remap))),
+                Expr::Lt(a, b) => Expr::Lt(Box::new(go(a, lane, r, remap)), Box::new(go(b, lane, r, remap))),
+                Expr::Le(a, b) => Expr::Le(Box::new(go(a, lane, r, remap)), Box::new(go(b, lane, r, remap))),
+                Expr::Gt(a, b) => Expr::Gt(Box::new(go(a, lane, r, remap)), Box::new(go(b, lane, r, remap))),
+                Expr::Ge(a, b) => Expr::Ge(Box::new(go(a, lane, r, remap)), Box::new(go(b, lane, r, remap))),
+                Expr::Eq(a, b) => Expr::Eq(Box::new(go(a, lane, r, remap)), Box::new(go(b, lane, r, remap))),
+                Expr::Ne(a, b) => Expr::Ne(Box::new(go(a, lane, r, remap)), Box::new(go(b, lane, r, remap))),
+                Expr::Select(c, a, b) => Expr::Select(
+                    Box::new(go(c, lane, r, remap)),
+                    Box::new(go(a, lane, r, remap)),
+                    Box::new(go(b, lane, r, remap)),
+                ),
+                Expr::Neg(a) => Expr::Neg(Box::new(go(a, lane, r, remap))),
+                Expr::Sqrt(a) => Expr::Sqrt(Box::new(go(a, lane, r, remap))),
+                Expr::Exp(a) => Expr::Exp(Box::new(go(a, lane, r, remap))),
+                Expr::Sin(a) => Expr::Sin(Box::new(go(a, lane, r, remap))),
+                Expr::Cos(a) => Expr::Cos(Box::new(go(a, lane, r, remap))),
+                Expr::Tanh(a) => Expr::Tanh(Box::new(go(a, lane, r, remap))),
+                Expr::Abs(a) => Expr::Abs(Box::new(go(a, lane, r, remap))),
+                Expr::Log(a) => Expr::Log(Box::new(go(a, lane, r, remap))),
+                Expr::Floor(a) => Expr::Floor(Box::new(go(a, lane, r, remap))),
+                Expr::Ceil(a) => Expr::Ceil(Box::new(go(a, lane, r, remap))),
+                Expr::Round(a) => Expr::Round(Box::new(go(a, lane, r, remap))),
+                Expr::Powf(a, e) => Expr::Powf(Box::new(go(a, lane, r, remap)), *e),
+                Expr::Erf(a) => Expr::Erf(Box::new(go(a, lane, r, remap))),
+            }
+        }
+        go(self, lane, replacement, remap)
     }
 
 }

@@ -4,18 +4,34 @@
 
 **Implementation notes (updated)**: the elementwise op set covers
 `Add/Sub/Mul/Div/Min/Max/Neg/Sqrt/Exp/Log/Sin/Cos/Tanh/Abs/Erf/Floor/Ceil/Round`
-plus constant-exponent `Pow` (small exponents lower to multiplies/sqrt)
-and `where(cmp, a, b)`: a comparison with a single consumer lowers to a
-float mask feeding a true `select` ternary (an arithmetic mask would
-propagate NaN from the unselected side — klDiv relies on masking
-`log(0)`). `Log/Tanh/Abs/Floor/Ceil/Round/Pow`, the six comparisons, and
-`Select` required extending `ug` itself — `ug`, `ug-metal`, and `ug-cuda`
-are patched to the `mikearnaldi/ug` fork (`Erf` stays an
-Abramowitz–Stegun expansion; Metal has no `erf`). Regions are capped at
-30 input lanes (Metal allows 31 buffer arguments per kernel; one slot is
-the output) — overflow materializes the region and starts a new one.
-CUDA fusion is disabled until the `ug-cuda` path can be tested on real
-hardware.
+plus constant-exponent `Pow` (small exponents lower to multiplies/sqrt),
+`sign` (lowered to `(x > 0) ? 1 : (x < 0) ? -1 : 0`, matching candle on
+NaN), identity casts, and `where(cmp, a, b)`: a comparison with a single
+consumer lowers to a float mask feeding a true `select` ternary (an
+arithmetic mask would propagate NaN from the unselected side — klDiv
+relies on masking `log(0)`). `Log/Tanh/Abs/Floor/Ceil/Round/Pow`, the six
+comparisons, and `Select` required extending `ug` itself — `ug`,
+`ug-metal`, and `ug-cuda` are patched to the `mikearnaldi/ug` fork (`Erf`
+stays an Abramowitz–Stegun expansion; Metal has no `erf`). Region inputs
+need not match the output shape: any broadcast-compatible tensor becomes
+a lane read through stride-0 dims (bias adds, softmax max-subtracts and
+computed scalars fuse instead of materializing), with per-lane strides
+baked into the Metal kernel (and keying its pipeline cache) and an
+odometer walk in the CPU interpreter. Uniform constructors fold to
+constants at any broadcast-compatible shape; a region that folds to zero
+lanes evaluates plainly. Regions are capped at 30 input lanes (Metal
+allows 31 buffer arguments per kernel; one slot is the output) — overflow
+materializes the region and starts a new one. A multi-output post-pass
+merges a materialized shared prefix with its fused continuations into one
+kernel (the prefix's expression is inlined into each continuation;
+unfused consumers keep it materialized as an extra output) — kernel
+signatures are fixed at compile time, so the merge runs on the finished
+rewrite where the full consumer set is known, and repeats to a fixpoint.
+A broadcast-smaller prefix is only ever inlined, never emitted (its
+materialized value would be computed at the wrong shape). CUDA fusion is
+disabled until the `ug-cuda` path can be tested on real hardware.
+`EFFECT_TORCH_NO_FUSION` disables the whole pass,
+`EFFECT_TORCH_NO_MULTI_FUSION` only the multi-output merge.
 - **Author**: Michael Arnaldi
 - **Date**: 2026-07-28
 - **Depends on**: RFC 0004 (optimizers — the fused update nodes this replaces

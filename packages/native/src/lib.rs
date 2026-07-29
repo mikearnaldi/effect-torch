@@ -992,6 +992,20 @@ enum NodeKind {
         shape: Vec<usize>,
         expr: fusion::Expr,
     },
+    // Created by the multi-output post-pass (RFC 0007): a shared fused
+    // prefix and its fused continuations compiled to one kernel with one
+    // store per output. Consumers are FusedPick nodes.
+    FusedElementwiseMulti {
+        inputs: Vec<Arc<Node>>,
+        strides: Vec<Vec<usize>>,
+        shape: Vec<usize>,
+        exprs: Vec<fusion::Expr>,
+    },
+    // Reads one output of a FusedElementwiseMulti.
+    FusedPick {
+        of: Arc<Node>,
+        index: u8,
+    },
     StopGradient {
         a: Arc<Node>,
     },
@@ -1637,6 +1651,46 @@ impl Node {
                 }
                 (shape.clone(), first.dtype, first.device.clone())
             }
+            NodeKind::FusedElementwiseMulti {
+                inputs,
+                strides,
+                shape,
+                exprs,
+            } => {
+                if exprs.is_empty() {
+                    return Err("fused multi: at least one output is required".to_string());
+                }
+                if inputs.is_empty() {
+                    return Err("fused multi: at least one input lane is required".to_string());
+                }
+                if strides.len() != inputs.len() {
+                    return Err(format!(
+                        "fused multi: got {} stride entries for {} inputs",
+                        strides.len(),
+                        inputs.len()
+                    ));
+                }
+                let first = &inputs[0];
+                for (input, stride) in inputs.iter().zip(strides.iter()) {
+                    if input.dtype != first.dtype || !input.device.same_device(&first.device) {
+                        return Err("fused multi: all inputs must share dtype and device".to_string());
+                    }
+                    if fusion::lane_strides(&input.shape, shape).as_ref() != Some(stride) {
+                        return Err(format!(
+                            "fused multi: input shape {:?} does not broadcast to {:?} with strides {stride:?}",
+                            input.shape, shape
+                        ));
+                    }
+                }
+                if !first.dtype.is_float() {
+                    return Err(format!(
+                        "fused multi: dtype must be floating point, got {:?}",
+                        first.dtype
+                    ));
+                }
+                (shape.clone(), first.dtype, first.device.clone())
+            }
+            NodeKind::FusedPick { of, .. } => (of.shape.clone(), of.dtype, of.device.clone()),
         };
         Ok(Arc::new(Node {
             id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
@@ -2333,6 +2387,9 @@ struct Evaluator {
     // updated parameter, stored in the regular cache
     adamw: std::collections::HashMap<u64, [Tensor; 2]>,
     sgd: std::collections::HashMap<u64, Tensor>,
+    // FusedElementwiseMulti id -> all outputs; the node's own cache entry
+    // holds output 0 so the evaluator's single-value invariant holds
+    multi: std::collections::HashMap<u64, Vec<Tensor>>,
     consumers: std::collections::HashMap<u64, usize>,
     roots: HashSet<u64>,
 }
@@ -2347,6 +2404,7 @@ impl Evaluator {
             cache: std::collections::HashMap::new(),
             adamw: std::collections::HashMap::new(),
             sgd: std::collections::HashMap::new(),
+            multi: std::collections::HashMap::new(),
             consumers,
             roots: roots.iter().map(|root| root.id).collect(),
         }
@@ -2366,6 +2424,7 @@ impl Evaluator {
                     self.cache.remove(&child.id);
                     self.adamw.remove(&child.id);
                     self.sgd.remove(&child.id);
+                    self.multi.remove(&child.id);
                 }
             }
         }
@@ -2481,6 +2540,8 @@ fn node_children(kind: &NodeKind) -> Vec<Arc<Node>> {
         } => vec![param.clone(), grad.clone(), velocity.clone()],
         NodeKind::SgdOut { step, .. } => vec![step.clone()],
         NodeKind::FusedElementwise { inputs, .. } => inputs.clone(),
+        NodeKind::FusedElementwiseMulti { inputs, .. } => inputs.clone(),
+        NodeKind::FusedPick { of, .. } => vec![of.clone()],
     }
 }
 
@@ -2862,6 +2923,21 @@ fn remap_children(kind: &NodeKind, f: &dyn Fn(&Arc<Node>) -> Arc<Node>) -> NodeK
             strides: strides.clone(),
             shape: shape.clone(),
             expr: expr.clone(),
+        },
+        NodeKind::FusedElementwiseMulti {
+            inputs,
+            strides,
+            shape,
+            exprs,
+        } => NodeKind::FusedElementwiseMulti {
+            inputs: inputs.iter().map(|i| f(i)).collect(),
+            strides: strides.clone(),
+            shape: shape.clone(),
+            exprs: exprs.clone(),
+        },
+        NodeKind::FusedPick { of, index } => NodeKind::FusedPick {
+            of: f(of),
+            index: *index,
         },
     }
 }
@@ -3677,6 +3753,39 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> candle_core::Result<Te
             )?;
             outs.into_iter().next().unwrap()
         }
+        NodeKind::FusedElementwiseMulti {
+            inputs,
+            strides,
+            shape,
+            exprs,
+        } => {
+            let ts: Vec<Tensor> = inputs
+                .iter()
+                .map(|i| ev.value(i.id))
+                .collect::<candle_core::Result<Vec<_>>>()?;
+            let first = &ts[0];
+            let outs = fusion::run(
+                exprs,
+                &ts,
+                Some(strides),
+                &[],
+                shape.iter().product(),
+                shape,
+                first.dtype(),
+                &first.device(),
+            )?;
+            let head = outs[0].clone();
+            ev.multi.insert(node.id, outs);
+            head
+        }
+        NodeKind::FusedPick { of, index } => ev
+            .multi
+            .get(&of.id)
+            .and_then(|outs| outs.get(*index as usize))
+            .cloned()
+            .ok_or_else(|| {
+                candle_core::Error::Msg("fused pick: multi output missing".to_string())
+            })?,
     };
     Ok(output)
 }
@@ -4016,7 +4125,9 @@ mod autodiff {
             | NodeKind::Conv2dBackwardW { .. } => {
                 Err("vmap: convolution nodes are not supported under vmap".to_string())
             }
-            NodeKind::FusedElementwise { .. } => {
+            NodeKind::FusedElementwise { .. }
+            | NodeKind::FusedElementwiseMulti { .. }
+            | NodeKind::FusedPick { .. } => {
                 Err("vmap: fused elementwise nodes are internal to evaluation".to_string())
             }
             _ => Ok(remap_children(&node.kind, f)),
@@ -4743,7 +4854,9 @@ mod autodiff {
                         "grad: optimizer update nodes are not differentiable".to_string(),
                     );
                 }
-                NodeKind::FusedElementwise { .. } => {
+                NodeKind::FusedElementwise { .. }
+                | NodeKind::FusedElementwiseMulti { .. }
+                | NodeKind::FusedPick { .. } => {
                     return Err(
                         "grad: fused elementwise nodes are internal to evaluation".to_string(),
                     );
@@ -5071,15 +5184,24 @@ fn fuse_roots(roots: &[Arc<Node>]) -> std::result::Result<Vec<Arc<Node>>, String
             E::Input(k)
         }
         // Takes ownership of another region's lanes; returns its expr with
-        // lane indices shifted into this region's namespace.
+        // lane indices remapped into this region's namespace. Lanes the
+        // two regions share are reused, not duplicated.
         fn absorb(&mut self, other: Region) -> E {
-            let base = self.inputs.len() as u32;
-            for (id, k) in other.lane_of {
-                self.lane_of.insert(id, base + k);
+            let mut remap: HashMap<u32, u32> = HashMap::new();
+            for (k, input) in other.inputs.iter().enumerate() {
+                let idx = match self.lane_of.get(&input.id) {
+                    Some(&existing) => existing,
+                    None => {
+                        let idx = self.inputs.len() as u32;
+                        self.lane_of.insert(input.id, idx);
+                        self.inputs.push(input.clone());
+                        idx
+                    }
+                };
+                remap.insert(k as u32, idx);
             }
-            self.inputs.extend(other.inputs);
             self.ops += other.ops;
-            other.expr.shift_inputs(base)
+            other.expr.remap_lanes(&remap)
         }
     }
 
@@ -5335,7 +5457,256 @@ fn fuse_roots(roots: &[Arc<Node>]) -> std::result::Result<Vec<Arc<Node>>, String
     Ok(roots
         .iter()
         .map(|r| map.get(&r.id).cloned().unwrap_or_else(|| r.clone()))
-        .collect())
+        .collect::<Vec<_>>())
+        .and_then(|roots| merge_shared_regions(&roots))
+}
+
+// RFC 0007 multi-output merge: when a fused region materializes because
+// its value has several consumers, and some of those consumers are
+// themselves fused regions of one common shape, compile the prefix and
+// the continuations as a single multi-output kernel (the prefix's
+// expression is inlined into each continuation, so the shared
+// intermediate stays in registers instead of round-tripping through a
+// buffer). Runs as a post-pass on the rewritten graph: kernel signatures
+// are fixed at compile time, so the merge needs the full consumer set,
+// which only exists once the region sweep has finished. Repeats to a
+// fixpoint; each merge removes at least one FusedElementwise node, so it
+// terminates.
+fn merge_shared_regions(roots: &[Arc<Node>]) -> std::result::Result<Vec<Arc<Node>>, String> {
+    if std::env::var_os("EFFECT_TORCH_NO_MULTI_FUSION").is_some() {
+        return Ok(roots.to_vec());
+    }
+    // Total expression size bound for one merged kernel: keeps register
+    // pressure and shader compile time sane on pathological shares.
+    const MAX_MERGED_OPS: usize = 512;
+
+    struct Plan {
+        // the shared prefix node (a FusedElementwise)
+        prefix: u64,
+        // fused continuations (FusedElementwise nodes of one common shape)
+        group: Vec<u64>,
+        // whether the prefix must stay materialized for unfused consumers
+        keep_prefix: bool,
+        multi: NodeKind,
+    }
+
+    fn analyze(roots: &[Arc<Node>]) -> (Vec<Arc<Node>>, HashMap<u64, Vec<u64>>) {
+        let mut order: Vec<Arc<Node>> = Vec::new();
+        let mut visited = HashSet::new();
+        fn visit(n: &Arc<Node>, visited: &mut HashSet<u64>, order: &mut Vec<Arc<Node>>) {
+            if !visited.insert(n.id) {
+                return;
+            }
+            for c in node_children(&n.kind) {
+                visit(&c, visited, order);
+            }
+            order.push(n.clone());
+        }
+        for r in roots {
+            visit(r, &mut visited, &mut order);
+        }
+        let mut consumers: HashMap<u64, Vec<u64>> = HashMap::new();
+        for n in &order {
+            for c in node_children(&n.kind) {
+                consumers.entry(c.id).or_default().push(n.id);
+            }
+        }
+        (order, consumers)
+    }
+
+    fn find_merge(order: &[Arc<Node>], consumers: &HashMap<u64, Vec<u64>>) -> Option<Plan> {
+        let by_id: HashMap<u64, &Arc<Node>> = order.iter().map(|n| (n.id, n)).collect();
+        for node in order {
+            let NodeKind::FusedElementwise {
+                inputs,
+                strides,
+                shape,
+                expr,
+            } = &node.kind
+            else {
+                continue;
+            };
+            let Some(cons) = consumers.get(&node.id) else {
+                continue;
+            };
+            if cons.len() < 2 {
+                continue;
+            }
+            // group fused consumers by common output shape, keeping the
+            // largest group (encounter order breaks ties deterministically)
+            let mut groups: Vec<(Vec<usize>, Vec<&Arc<Node>>)> = Vec::new();
+            for cid in cons {
+                let c = by_id[cid];
+                if let NodeKind::FusedElementwise { .. } = &c.kind {
+                    match groups.iter_mut().find(|(s, _)| s == &c.shape) {
+                        Some((_, g)) => g.push(c),
+                        None => groups.push((c.shape.clone(), vec![c])),
+                    }
+                }
+            }
+            groups.sort_by_key(|(_, g)| std::cmp::Reverse(g.len()));
+            for (out_shape, group) in groups {
+                let group_ids: HashSet<u64> = group.iter().map(|g| g.id).collect();
+                // a continuation that reads another group member would need
+                // nested inlining; skip the whole group in that case
+                if group.iter().any(|g| {
+                    node_children(&g.kind).iter().any(|ch| group_ids.contains(&ch.id))
+                }) {
+                    continue;
+                }
+                let keep_prefix = cons.iter().any(|cid| !group_ids.contains(cid));
+                if group.len() + usize::from(keep_prefix) < 2 {
+                    continue;
+                }
+                // A materialized prefix output is evaluated at the group's
+                // coordinates, so it only equals the prefix's own value
+                // when the shapes match; a broadcast-smaller prefix is
+                // only safe to inline (never to emit).
+                if keep_prefix && shape != &out_shape {
+                    continue;
+                }
+                let Some(f_as_lane) = fusion::lane_strides(shape, &out_shape) else {
+                    continue;
+                };
+                let offset = out_shape.len() - shape.len();
+                // merged lanes: the prefix's lanes first (strides composed
+                // through the prefix's own broadcast into out_shape), then
+                // each continuation's extra lanes
+                let mut lanes: Vec<Arc<Node>> = Vec::new();
+                let mut lane_strides_out: Vec<Vec<usize>> = Vec::new();
+                let mut lane_index: HashMap<u64, u32> = HashMap::new();
+                for (input, s) in inputs.iter().zip(strides.iter()) {
+                    lane_index.insert(input.id, lanes.len() as u32);
+                    lanes.push(input.clone());
+                    lane_strides_out.push(
+                        f_as_lane
+                            .iter()
+                            .enumerate()
+                            .map(|(d, &fs)| if fs == 0 { 0 } else { s[d - offset] })
+                            .collect(),
+                    );
+                }
+                let mut exprs: Vec<fusion::Expr> = Vec::new();
+                if keep_prefix {
+                    exprs.push(expr.clone());
+                }
+                let mut total_ops: usize = expr.ops();
+                let mut ok = true;
+                for g in &group {
+                    let NodeKind::FusedElementwise {
+                        inputs: g_inputs,
+                        strides: g_strides,
+                        expr: g_expr,
+                        ..
+                    } = &g.kind
+                    else {
+                        unreachable!()
+                    };
+                    let f_lane = g_inputs
+                        .iter()
+                        .position(|i| i.id == node.id)
+                        .expect("fusion: group member must read the prefix")
+                        as u32;
+                    let mut remap: HashMap<u32, u32> = HashMap::new();
+                    for (j, (input, s)) in g_inputs.iter().zip(g_strides.iter()).enumerate() {
+                        if input.id == node.id {
+                            continue;
+                        }
+                        let idx = match lane_index.get(&input.id) {
+                            Some(&k) => k,
+                            None => {
+                                let k = lanes.len() as u32;
+                                lane_index.insert(input.id, k);
+                                lanes.push(input.clone());
+                                lane_strides_out.push(s.clone());
+                                k
+                            }
+                        };
+                        remap.insert(j as u32, idx);
+                    }
+                    let merged = g_expr.merge_lane(f_lane, expr, &remap);
+                    total_ops += merged.ops();
+                    exprs.push(merged);
+                }
+                // Metal allows 31 buffer arguments per kernel; every lane
+                // and every output takes one
+                ok &= lanes.len() + exprs.len() <= 31;
+                ok &= total_ops <= MAX_MERGED_OPS;
+                ok &= !group.iter().any(|g| {
+                    g.dtype != node.dtype || !g.device.same_device(&node.device)
+                });
+                if matches!(node.device, candle_core::Device::Metal(_)) {
+                    ok &= out_shape.iter().product::<usize>() <= i32::MAX as usize;
+                }
+                if !ok {
+                    continue;
+                }
+                return Some(Plan {
+                    prefix: node.id,
+                    group: group.iter().map(|g| g.id).collect(),
+                    keep_prefix,
+                    multi: NodeKind::FusedElementwiseMulti {
+                        inputs: lanes,
+                        strides: lane_strides_out,
+                        shape: out_shape.clone(),
+                        exprs,
+                    },
+                });
+            }
+        }
+        None
+    }
+
+    let mut current = roots.to_vec();
+    loop {
+        let (order, consumers) = analyze(&current);
+        let Some(plan) = find_merge(&order, &consumers) else {
+            return Ok(current);
+        };
+        if std::env::var_os("EFFECT_TORCH_FUSION_DEBUG").is_some() {
+            eprintln!(
+                "[fusion] multi-merge: prefix {} -> group {:?} (keep {})",
+                plan.prefix, plan.group, plan.keep_prefix
+            );
+        }
+        let multi = Node::new(plan.multi)?;
+        let mut pick_index = u8::from(plan.keep_prefix);
+        let mut picks: HashMap<u64, Arc<Node>> = HashMap::new();
+        if plan.keep_prefix {
+            picks.insert(
+                plan.prefix,
+                Node::new(NodeKind::FusedPick {
+                    of: multi.clone(),
+                    index: 0,
+                })?,
+            );
+        }
+        for gid in &plan.group {
+            picks.insert(
+                *gid,
+                Node::new(NodeKind::FusedPick {
+                    of: multi.clone(),
+                    index: pick_index,
+                })?,
+            );
+            pick_index += 1;
+        }
+        let mut map: HashMap<u64, Arc<Node>> = HashMap::new();
+        for node in &order {
+            if let Some(pick) = picks.get(&node.id) {
+                map.insert(node.id, pick.clone());
+                continue;
+            }
+            let rebuilt = remap_children(&node.kind, &|ch| {
+                map.get(&ch.id).cloned().unwrap_or_else(|| ch.clone())
+            });
+            map.insert(node.id, Node::new(rebuilt)?);
+        }
+        current = current
+            .iter()
+            .map(|r| map.get(&r.id).cloned().unwrap_or_else(|| r.clone()))
+            .collect();
+    }
 }
 
 #[napi]
