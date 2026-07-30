@@ -51,6 +51,7 @@ export declare class LazyTensor {
   scatterAdd(dim: number, indexes: LazyTensor, src: LazyTensor): LazyTensor
   gather(dim: number, indexes: LazyTensor): LazyTensor
   crossEntropy(target: LazyTensor, ignoreIndex: number): LazyTensor
+  scaledDotProductAttention(k: LazyTensor, v: LazyTensor, scale: number, causal: boolean): LazyTensor
   conv1d(w: LazyTensor, stride: number, padding: number, dilation: number, groups: number): LazyTensor
   conv2d(w: LazyTensor, stride: number, padding: number, dilation: number, groups: number): LazyTensor
   log(): LazyTensor

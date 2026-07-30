@@ -300,6 +300,92 @@ onDevices("Model", (device: TestDevice) => (it) => {
       })
     )
 
+    it.effect("multiHeadAttention matches a manual head-split composition (values and gradients)", () =>
+      Effect.gen(function* () {
+        const embedDim = 8
+        const numHeads = 2
+        const headDim = embedDim / numHeads
+        const model = yield* Model.multiHeadAttention("attn", embedDim, numHeads)
+        expect(model.names).toEqual([
+          "attn.wq.weight",
+          "attn.wq.bias",
+          "attn.wk.weight",
+          "attn.wk.bias",
+          "attn.wv.weight",
+          "attn.wv.bias",
+          "attn.wo.weight",
+          "attn.wo.bias"
+        ])
+        const params = yield* Tensor.compute(yield* model.init)
+        const x = yield* Tensor.fromTypedArray(
+          floats(Array.from({ length: 2 * 3 * 8 }, (_, i) => ((i * 5 + 1) % 11 - 5) / 5)),
+          [2, 3, 8]
+        )
+        const manual = Effect.gen(function* () {
+          const project = (t: Tensor.Any, w: Tensor.Any, b: Tensor.Any) =>
+            Effect.gen(function* () {
+              return yield* Tensor.add(yield* Tensor.matmul(t, w), b)
+            })
+          const split = (t: Tensor.Any) =>
+            Effect.gen(function* () {
+              const r = yield* Tensor.reshape(t, [2, 3, numHeads, headDim])
+              return yield* Tensor.transpose(r, [0, 2, 1, 3])
+            })
+          const q = yield* split(yield* project(x, params[0], params[1]))
+          const k = yield* split(yield* project(x, params[2], params[3]))
+          const v = yield* split(yield* project(x, params[4], params[5]))
+          const attended = yield* Tensor.scaledDotProductAttention(q, k, v)
+          const merged = yield* Tensor.reshape(yield* Tensor.transpose(attended, [0, 2, 1, 3]), [2, 3, embedDim])
+          return yield* project(merged, params[6], params[7])
+        })
+        const [viaModel] = yield* Tensor.compute([yield* model.forward(params, x)])
+        expect(viaModel.shape).toEqual([2, 3, 8])
+        const [byHand] = yield* Tensor.compute([yield* manual])
+        deep(yield* values(viaModel), yield* values(byHand))
+        const lossModel = yield* Tensor.sum(yield* model.forward(params, x))
+        const lossManual = yield* Tensor.sum(yield* manual)
+        const gradsModel = yield* Tensor.compute(yield* Gradient.grad(lossModel, params))
+        const gradsManual = yield* Tensor.compute(yield* Gradient.grad(lossManual, params))
+        for (let i = 0; i < params.length; i++) {
+          deep(yield* values(gradsModel[i]), yield* values(gradsManual[i]))
+        }
+      })
+    )
+
+    it.effect("multiHeadAttention with causal masking changes the output and trains", () =>
+      Effect.gen(function* () {
+        const plain = yield* Model.multiHeadAttention("attn", 8, 2)
+        const causal = yield* Model.multiHeadAttention("attn", 8, 2, { causal: true })
+        expect(causal.names).toEqual(plain.names)
+        const params = yield* Tensor.compute(yield* plain.init)
+        const x = yield* Tensor.fromTypedArray(
+          floats(Array.from({ length: 2 * 3 * 8 }, (_, i) => ((i * 5 + 1) % 11 - 5) / 5)),
+          [2, 3, 8]
+        )
+        const [a] = yield* Tensor.compute([yield* plain.forward(params, x)])
+        const [b] = yield* Tensor.compute([yield* causal.forward(params, x)])
+        expect(yield* values(a)).not.toEqual(yield* values(b))
+        // causal attention preserves the first position's output: position
+        // 0 attends only to itself in both variants' first row
+        const loss = yield* Tensor.sum(yield* causal.forward(params, x))
+        const grads = yield* Tensor.compute(yield* Gradient.grad(loss, params))
+        expect(grads.length).toBe(8)
+      })
+    )
+
+    it.effect("multiHeadAttention rejects invalid configuration and arity", () =>
+      Effect.gen(function* () {
+        expect((yield* Effect.flip(Model.multiHeadAttention("", 8, 2))).op).toBe("multiHeadAttention")
+        expect((yield* Effect.flip(Model.multiHeadAttention("a", 0, 2))).op).toBe("multiHeadAttention")
+        expect((yield* Effect.flip(Model.multiHeadAttention("a", 8, 0))).op).toBe("multiHeadAttention")
+        expect((yield* Effect.flip(Model.multiHeadAttention("a", 7, 2))).message).toContain("divisible")
+        const model = yield* Model.multiHeadAttention("a", 8, 2)
+        const x = yield* Tensor.fromTypedArray(floats(Array.from({ length: 8 }, (_, i) => i / 8)), [1, 1, 8])
+        const error = yield* Effect.flip(model.forward([], x))
+        expect(error._tag).toBe("ModelError")
+      })
+    )
+
     it.effect("activation models apply the corresponding tensor operations", () =>
       Effect.gen(function* () {
         const x = yield* Tensor.fromTypedArray(floats([-2, -0.5, 0, 0.5, 2]), [5])
@@ -435,6 +521,47 @@ onDevices("Model", (device: TestDevice) => (it) => {
         if (error._tag === "ModelError") {
           expect(error.message).toContain("fc1")
         }
+      })
+    )
+
+    it.effect("residual adds the block input to its output (values and gradients)", () =>
+      Effect.gen(function* () {
+        const block = Model.chain(yield* Model.linear("fc", 2, 2), yield* Model.tanh)
+        const plain = yield* block
+        const skip = yield* Model.residual(yield* block)
+        expect(skip.names).toEqual(plain.names)
+        const params = yield* Tensor.compute(yield* plain.init)
+        const x = yield* Tensor.fromTypedArray(floats([0, 1, 1, 0, 1, 1]), [3, 2])
+        const [inner] = yield* Tensor.compute([yield* plain.forward(params, x)])
+        const [out] = yield* Tensor.compute([yield* skip.forward(params, x)])
+        const xv = yield* values(x)
+        deep(yield* values(out), (yield* values(inner)).map((v, i) => v + xv[i]))
+        const lossSkip = yield* Tensor.sum(yield* skip.forward(params, x))
+        const grads = yield* Tensor.compute(yield* Gradient.grad(lossSkip, params))
+        // d/dw sum(x + f(x)) = d/dw sum(f(x)): the skip path adds no
+        // parameter gradient; compare against the plain block's grads
+        const lossPlain = yield* Tensor.sum(yield* plain.forward(params, x))
+        const gradsPlain = yield* Tensor.compute(yield* Gradient.grad(lossPlain, params))
+        for (let i = 0; i < grads.length; i++) {
+          deep(yield* values(grads[i]), yield* values(gradsPlain[i]))
+        }
+      })
+    )
+
+    it.effect("residual composes with checkpoint inside a chain", () =>
+      Effect.gen(function* () {
+        const block = Model.chain(yield* Model.linear("fc", 2, 2), yield* Model.relu)
+        const net = yield* Model.chain(
+          yield* Model.checkpoint(yield* Model.residual(yield* block)),
+          yield* Model.linear("head", 2, 1)
+        )
+        const params = yield* Tensor.compute(yield* net.init)
+        const x = yield* Tensor.fromTypedArray(floats([0, 1, 1, 0]), [2, 2])
+        const [out] = yield* Tensor.compute([yield* net.forward(params, x)])
+        expect(out.shape).toEqual([2, 1])
+        const loss = yield* Tensor.sum(yield* net.forward(params, x))
+        const grads = yield* Tensor.compute(yield* Gradient.grad(loss, params))
+        expect(grads.length).toBe(net.names.length)
       })
     )
   })

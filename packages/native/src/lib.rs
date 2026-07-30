@@ -1,4 +1,5 @@
 use candle_core::{CpuStorage, DType, Device, Storage, Tensor};
+use candle_core::D;
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
 use std::collections::{HashMap, HashSet};
@@ -185,6 +186,141 @@ fn conv_check(
         return Err(format!("{op}: input and weight must be on the same device"));
     }
     Ok(())
+}
+
+// Validates q [.., T, D], k [.., S, D], v [.., S, Dv] and returns the
+// attention output shape [.., T, Dv]. Leading dims must match exactly.
+fn sdpa_check(op: &str, q: &Node, k: &Node, v: &Node) -> std::result::Result<Vec<usize>, String> {
+    let rank = q.shape.len();
+    if rank < 2 || k.shape.len() != rank || v.shape.len() != rank {
+        return Err(format!(
+            "{op}: q, k and v must share a rank >= 2, got {:?}, {:?} and {:?}",
+            q.shape, k.shape, v.shape
+        ));
+    }
+    if q.shape[..rank - 2] != k.shape[..rank - 2] || q.shape[..rank - 2] != v.shape[..rank - 2] {
+        return Err(format!(
+            "{op}: leading dims must match, got {:?}, {:?} and {:?}",
+            q.shape, k.shape, v.shape
+        ));
+    }
+    if q.shape[rank - 1] != k.shape[rank - 1] {
+        return Err(format!(
+            "{op}: q and k head dims mismatch, got {:?} and {:?}",
+            q.shape, k.shape
+        ));
+    }
+    if k.shape[rank - 2] != v.shape[rank - 2] {
+        return Err(format!(
+            "{op}: k and v sequence lengths mismatch, got {:?} and {:?}",
+            k.shape, v.shape
+        ));
+    }
+    if !matches!(q.dtype, DType::F32 | DType::F64) {
+        return Err(format!("{op}: dtype must be f32 or f64, got {:?}", q.dtype));
+    }
+    if k.dtype != q.dtype || v.dtype != q.dtype {
+        return Err(format!("{op}: q, k and v must share a dtype, got {:?}, {:?} and {:?}", q.dtype, k.dtype, v.dtype));
+    }
+    if !k.device.same_device(&q.device) || !v.device.same_device(&q.device) {
+        return Err(format!("{op}: q, k and v must be on the same device"));
+    }
+    let mut out = q.shape[..rank - 1].to_vec();
+    out.push(v.shape[rank - 1]);
+    Ok(out)
+}
+
+// The additive causal mask [T, S]: 0 where j <= i + (S - T) (the offset
+// right-aligns the window, so single-row queries against a longer cache
+// attend to everything up to the current position), -inf elsewhere.
+fn sdpa_causal_additive_mask(t: usize, s: usize, dtype: DType, device: &Device) -> candle_core::Result<Tensor> {
+    let i = Tensor::arange(0u32, t as u32, device)?.reshape((t, 1))?;
+    let j = Tensor::arange(0u32, s as u32, device)?.reshape((1, s))?;
+    let allowed = j.broadcast_le(&(i + s.saturating_sub(t) as f64)?)?;
+    let zeros = Tensor::zeros((t, s), dtype, device)?;
+    let neg = match dtype {
+        DType::F32 => Tensor::full(f32::NEG_INFINITY, (t, s), device)?,
+        DType::F64 => Tensor::full(f64::NEG_INFINITY, (t, s), device)?,
+        dtype => return Err(candle_core::Error::UnsupportedDTypeForOp(dtype, "sdpa").bt()),
+    };
+    allowed.where_cond(&zeros, &neg)
+}
+
+// The multiplicative gate [T, S]: 1 where attention is allowed, 0
+// elsewhere — masks the score gradients in the backward pass.
+fn sdpa_causal_gate(t: usize, s: usize, dtype: DType, device: &Device) -> candle_core::Result<Tensor> {
+    let i = Tensor::arange(0u32, t as u32, device)?.reshape((t, 1))?;
+    let j = Tensor::arange(0u32, s as u32, device)?.reshape((1, s))?;
+    let allowed = j.broadcast_le(&(i + s.saturating_sub(t) as f64)?)?;
+    let ones = Tensor::ones((t, s), dtype, device)?;
+    allowed.where_cond(&ones, &ones.zeros_like()?)
+}
+
+// Softmax over the last dim with max-subtraction (matching the composed
+// Tensor.softmax path op for op).
+fn sdpa_softmax(t: &Tensor) -> candle_core::Result<Tensor> {
+    let m = t.max(D::Minus1)?.unsqueeze(D::Minus1)?;
+    let e = t.broadcast_sub(&m)?.exp()?;
+    let s = e.sum(D::Minus1)?.unsqueeze(D::Minus1)?;
+    e.broadcast_div(&s)
+}
+
+fn sdpa_scores(q: &Tensor, k: &Tensor, scale: f64, causal: bool) -> candle_core::Result<Tensor> {
+    let rank = q.rank();
+    let kt = k.transpose(rank - 2, rank - 1)?.contiguous()?;
+    let s = q.contiguous()?.broadcast_matmul(&kt)?;
+    let s = (s * scale)?;
+    if causal {
+        let dims = s.dims();
+        let (t, sq) = (dims[rank - 2], dims[rank - 1]);
+        s.broadcast_add(&sdpa_causal_additive_mask(t, sq, s.dtype(), s.device())?)
+    } else {
+        Ok(s)
+    }
+}
+
+// The reference implementation: composed candle ops. A fused flash
+// kernel replaces this arm (and only this arm) when it lands.
+fn sdpa_forward(q: &Tensor, k: &Tensor, v: &Tensor, scale: f64, causal: bool) -> candle_core::Result<Tensor> {
+    let s = sdpa_scores(q, k, scale, causal)?;
+    let p = sdpa_softmax(&s)?;
+    p.broadcast_matmul(&v.contiguous()?)
+}
+
+// Closed-form backward, recomputing P from q/k (retains nothing beyond
+// the caller's tensors): dV = Pᵀ·g, dP = g·Vᵀ, dS = P ∘ (dP − Σ(P∘dP)),
+// dQ = dS·K·scale, dK = dSᵀ·Q·scale.
+fn sdpa_backward(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    g: &Tensor,
+    scale: f64,
+    causal: bool,
+) -> candle_core::Result<(Tensor, Tensor, Tensor)> {
+    let rank = q.rank();
+    let s = sdpa_scores(q, k, scale, causal)?;
+    let p = sdpa_softmax(&s)?;
+    let g = g.contiguous()?;
+    let dv = p
+        .transpose(rank - 2, rank - 1)?
+        .contiguous()?
+        .broadcast_matmul(&g)?;
+    let dp = g.broadcast_matmul(&v.transpose(rank - 2, rank - 1)?.contiguous()?)?;
+    let dp_sum = (&p * &dp)?.sum(D::Minus1)?.unsqueeze(D::Minus1)?;
+    let mut ds = (&p * &dp.broadcast_sub(&dp_sum)?)?;
+    if causal {
+        let dims = ds.dims();
+        let (t, sq) = (dims[rank - 2], dims[rank - 1]);
+        ds = ds.broadcast_mul(&sdpa_causal_gate(t, sq, ds.dtype(), ds.device())?)?;
+    }
+    let dq = (ds.broadcast_matmul(&k.contiguous()?)? * scale)?;
+    let dk = (ds
+        .transpose(rank - 2, rank - 1)?
+        .contiguous()?
+        .broadcast_matmul(&q.contiguous()?)?
+        * scale)?;
+    Ok((dq, dk, dv))
 }
 
 // u8 mask that is 1 where target == ignore_index. A negative ignore_index
@@ -861,6 +997,34 @@ enum NodeKind {
         target: Arc<Node>,
         ignore_index: i64,
     },
+    // Scaled dot-product attention as one semantic node (the SgdStep
+    // precedent: semantics in the graph, execution strategy native). The
+    // eval arms compose candle ops as the reference implementation; a
+    // fused flash kernel can replace them without touching the graph or
+    // its adjoints. Shapes: q [.., T, D], k [.., S, D], v [.., S, Dv]
+    // with equal leading dims; the output is [.., T, Dv].
+    Sdpa {
+        q: Arc<Node>,
+        k: Arc<Node>,
+        v: Arc<Node>,
+        scale: f64,
+        causal: bool,
+    },
+    // Closed-form backward: recomputes P = softmax(scores) from q/k and
+    // produces (dq, dk, dv) in one eval; consumers read them through
+    // SdpaBackwardOut. Not differentiable (no second-order).
+    SdpaBackward {
+        q: Arc<Node>,
+        k: Arc<Node>,
+        v: Arc<Node>,
+        g: Arc<Node>,
+        scale: f64,
+        causal: bool,
+    },
+    SdpaBackwardOut {
+        of: Arc<Node>,
+        index: u8,
+    },
     Conv1d {
         x: Arc<Node>,
         w: Arc<Node>,
@@ -1322,6 +1486,35 @@ impl Node {
             }
             NodeKind::CrossEntropyBackward { logits, .. } => {
                 (logits.shape.clone(), logits.dtype, logits.device.clone())
+            }
+            NodeKind::Sdpa { q, k, v, .. } => {
+                let out = sdpa_check("sdpa", q, k, v)?;
+                (out, q.dtype, q.device.clone())
+            }
+            NodeKind::SdpaBackward { q, k, v, g, .. } => {
+                let out = sdpa_check("sdpa", q, k, v)?;
+                if g.shape != out {
+                    return Err(format!(
+                        "sdpa backward: grad shape {:?} does not match the attention output shape {out:?}",
+                        g.shape
+                    ));
+                }
+                if g.dtype != q.dtype || !g.device.same_device(&q.device) {
+                    return Err("sdpa backward: grad must share dtype and device with q".to_string());
+                }
+                (q.shape.clone(), q.dtype, q.device.clone())
+            }
+            NodeKind::SdpaBackwardOut { of, index } => {
+                let NodeKind::SdpaBackward { q, k, v, .. } = &of.kind else {
+                    return Err("sdpa backward out: source must be an sdpa backward node".to_string());
+                };
+                let source = match index {
+                    0 => q,
+                    1 => k,
+                    2 => v,
+                    i => return Err(format!("sdpa backward out: index must be 0..=2, got {i}")),
+                };
+                (source.shape.clone(), source.dtype, source.device.clone())
             }
             NodeKind::Conv1d {
                 x,
@@ -2192,6 +2385,23 @@ impl LazyTensor {
         }))
     }
 
+    #[napi]
+    pub fn scaled_dot_product_attention(
+        &self,
+        k: &LazyTensor,
+        v: &LazyTensor,
+        scale: f64,
+        causal: bool,
+    ) -> Result<Self> {
+        lazy_ctor!(Node::new(NodeKind::Sdpa {
+            q: self.node.clone(),
+            k: k.node.clone(),
+            v: v.node.clone(),
+            scale,
+            causal,
+        }))
+    }
+
     #[napi(js_name = "conv1d")]
     pub fn conv_1d(
         &self,
@@ -2581,6 +2791,11 @@ fn node_children(kind: &NodeKind) -> Vec<Arc<Node>> {
         | NodeKind::CrossEntropyBackward {
             logits, target, ..
         } => vec![logits.clone(), target.clone()],
+        NodeKind::Sdpa { q, k, v, .. } => vec![q.clone(), k.clone(), v.clone()],
+        NodeKind::SdpaBackward { q, k, v, g, .. } => {
+            vec![q.clone(), k.clone(), v.clone(), g.clone()]
+        }
+        NodeKind::SdpaBackwardOut { of, .. } => vec![of.clone()],
         NodeKind::Conv1d { x, w, .. }
         | NodeKind::Conv2d { x, w, .. }
         | NodeKind::ConvTranspose1d { x, w, .. }
@@ -2751,6 +2966,38 @@ fn remap_children(kind: &NodeKind, f: &dyn Fn(&Arc<Node>) -> Arc<Node>) -> NodeK
             logits: f(logits),
             target: f(target),
             ignore_index: *ignore_index,
+        },
+        NodeKind::Sdpa {
+            q,
+            k,
+            v,
+            scale,
+            causal,
+        } => NodeKind::Sdpa {
+            q: f(q),
+            k: f(k),
+            v: f(v),
+            scale: *scale,
+            causal: *causal,
+        },
+        NodeKind::SdpaBackward {
+            q,
+            k,
+            v,
+            g,
+            scale,
+            causal,
+        } => NodeKind::SdpaBackward {
+            q: f(q),
+            k: f(k),
+            v: f(v),
+            g: f(g),
+            scale: *scale,
+            causal: *causal,
+        },
+        NodeKind::SdpaBackwardOut { of, index } => NodeKind::SdpaBackwardOut {
+            of: f(of),
+            index: *index,
         },
         NodeKind::Conv1d {
             x,
@@ -3422,6 +3669,46 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> candle_core::Result<Te
             target,
             ignore_index,
         } => cross_entropy_backward(&ev.value(logits.id)?, &ev.value(target.id)?, *ignore_index)?,
+        NodeKind::Sdpa {
+            q,
+            k,
+            v,
+            scale,
+            causal,
+        } => sdpa_forward(
+            &ev.value(q.id)?,
+            &ev.value(k.id)?,
+            &ev.value(v.id)?,
+            *scale,
+            *causal,
+        )?,
+        NodeKind::SdpaBackward {
+            q,
+            k,
+            v,
+            g,
+            scale,
+            causal,
+        } => {
+            let (dq, dk, dv) = sdpa_backward(
+                &ev.value(q.id)?,
+                &ev.value(k.id)?,
+                &ev.value(v.id)?,
+                &ev.value(g.id)?,
+                *scale,
+                *causal,
+            )?;
+            ev.multi.insert(node.id, vec![dq.clone(), dk, dv]);
+            dq
+        }
+        NodeKind::SdpaBackwardOut { of, index } => ev
+            .multi
+            .get(&of.id)
+            .and_then(|outs| outs.get(*index as usize))
+            .cloned()
+            .ok_or_else(|| {
+                candle_core::Error::Msg("sdpa backward out: outputs missing".to_string())
+            })?,
         NodeKind::Conv1d {
             x,
             w,
@@ -4235,6 +4522,9 @@ mod autodiff {
                 "vmap: crossEntropy uses data-dependent indexing and is not supported under vmap"
                     .to_string(),
             ),
+            NodeKind::SdpaBackward { .. } | NodeKind::SdpaBackwardOut { .. } => Err(
+                "vmap: sdpa backward nodes are internal to autodiff".to_string(),
+            ),
             NodeKind::Conv1d { .. }
             | NodeKind::Conv2d { .. }
             | NodeKind::ConvTranspose1d { .. }
@@ -4852,6 +5142,35 @@ mod autodiff {
                 NodeKind::CrossEntropyBackward { .. } => {
                     return Err(
                         "grad: cross-entropy backward nodes are not differentiable (no second-order)"
+                            .to_string(),
+                    );
+                }
+                NodeKind::Sdpa {
+                    q,
+                    k,
+                    v,
+                    scale,
+                    causal,
+                } => {
+                    let bw = mk(NodeKind::SdpaBackward {
+                        q: q.clone(),
+                        k: k.clone(),
+                        v: v.clone(),
+                        g: g.clone(),
+                        scale: *scale,
+                        causal: *causal,
+                    })?;
+                    for (input, index) in [(q, 0u8), (k, 1u8), (v, 2u8)] {
+                        let out = mk(NodeKind::SdpaBackwardOut {
+                            of: bw.clone(),
+                            index,
+                        })?;
+                        accumulate(input, Ok(out))?;
+                    }
+                }
+                NodeKind::SdpaBackward { .. } | NodeKind::SdpaBackwardOut { .. } => {
+                    return Err(
+                        "grad: sdpa backward nodes are not differentiable (no second-order)"
                             .to_string(),
                     );
                 }

@@ -389,6 +389,107 @@ export const layerNorm = (
   })
 
 /**
+ * Options for {@link multiHeadAttention}.
+ *
+ * @since 0.1.0
+ * @category constructors
+ */
+export interface MultiHeadAttentionOptions {
+  /** Mask the attention scores causally (autoregressive transformers). */
+  readonly causal?: boolean
+}
+
+/**
+ * Multi-head scaled dot-product attention over `[..., T, embedDim]`
+ * inputs (GPT-2 style): learned `wq`, `wk`, `wv` and `wo` projections,
+ * the head dim split across `numHeads` heads, and
+ * {@link Tensor.scaledDotProductAttention} per head. Names are
+ * `["<name>.wq.weight", "<name>.wq.bias", "<name>.wk.weight", ...]` —
+ * each projection follows the {@link linear} conventions (weight
+ * `[embedDim, embedDim]` initialized to `randn * (1 / sqrt(embedDim))`,
+ * bias `zeros([1, embedDim])`). Fails with a {@link ModelError} on an
+ * empty name, non-positive counts, or `embedDim` not divisible by
+ * `numHeads`.
+ *
+ * @since 0.1.0
+ * @category constructors
+ */
+export const multiHeadAttention = (
+  name: string,
+  embedDim: number,
+  numHeads: number,
+  options: MultiHeadAttentionOptions = {}
+): Effect.Effect<Model, ModelError> =>
+  Effect.gen(function* () {
+    yield* checkName("multiHeadAttention", name)
+    yield* checkPositiveInt("multiHeadAttention", "embedDim", embedDim)
+    yield* checkPositiveInt("multiHeadAttention", "numHeads", numHeads)
+    if (embedDim % numHeads !== 0) {
+      return yield* new ModelError({
+        op: "multiHeadAttention",
+        message: `embedDim ${embedDim} must be divisible by numHeads ${numHeads}`
+      })
+    }
+    const headDim = embedDim / numHeads
+    const projections = ["wq", "wk", "wv", "wo"] as const
+    const names = projections.flatMap((p) => [`${name}.${p}.weight`, `${name}.${p}.bias`])
+    const causal = options.causal ?? false
+    return {
+      names,
+      init: Effect.gen(function* () {
+        const params: Array<Tensor.Any> = []
+        for (const _ of projections) {
+          params.push(
+            yield* Tensor.mul(yield* Tensor.randn([embedDim, embedDim]), 1 / Math.sqrt(embedDim)),
+            yield* Tensor.zeros([1, embedDim])
+          )
+        }
+        return params
+      }),
+      forward: (params, input) =>
+        Effect.gen(function* () {
+          yield* checkArity(name, names, params)
+          const rank = input.shape.length
+          const t = input.shape[rank - 2]
+          const leading = input.shape.slice(0, -2)
+          // [..., T, E] -> [..., T, H, Dh] -> [..., H, T, Dh]
+          const splitHeads = (x: Tensor.Any) =>
+            Effect.gen(function* () {
+              const reshaped = yield* Tensor.reshape(x, [...leading, t, numHeads, headDim])
+              const perm = Array.from({ length: rank + 1 }, (_, i) => i)
+              perm[rank - 2] = rank - 1
+              perm[rank - 1] = rank - 2
+              return yield* Tensor.transpose(reshaped, perm)
+            })
+          // [..., H, T, Dh] -> [..., T, H, Dh] -> [..., T, E]
+          const mergeHeads = (x: Tensor.Any) =>
+            Effect.gen(function* () {
+              const perm = Array.from({ length: rank + 1 }, (_, i) => i)
+              perm[rank - 2] = rank - 1
+              perm[rank - 1] = rank - 2
+              const transposed = yield* Tensor.transpose(x, perm)
+              return yield* Tensor.reshape(transposed, [...leading, t, embedDim])
+            })
+          const project = (x: Tensor.Any, weight: Tensor.Any, bias: Tensor.Any) =>
+            Effect.gen(function* () {
+              return yield* Tensor.add(yield* Tensor.matmul(x, weight), bias)
+            })
+          const projected: Array<Tensor.Any> = []
+          for (let p = 0; p < 3; p++) {
+            projected.push(yield* project(input, params[p * 2], params[p * 2 + 1]))
+          }
+          const attended = yield* Tensor.scaledDotProductAttention(
+            yield* splitHeads(projected[0]),
+            yield* splitHeads(projected[1]),
+            yield* splitHeads(projected[2]),
+            { causal }
+          )
+          return yield* project(yield* mergeHeads(attended), params[6], params[7])
+        })
+    }
+  })
+
+/**
  * The hyperbolic tangent activation as a parameterless model.
  *
  * @since 0.1.0
@@ -618,6 +719,27 @@ export const checkpoint = (model: Model): Effect.Effect<Model> =>
     names: model.names,
     init: model.init,
     forward: (params, input) => Effect.flatMap(model.forward(params, input), Gradient.checkpoint)
+  })
+
+/**
+ * Adds a residual (skip) connection around a sub-model: the forward is
+ * `input + block(input)`. Names and init are the sub-model's; the
+ * sub-model's output must be broadcast-compatible with its input (an
+ * equal shape in the standard usage — transformer blocks, ResNet
+ * stages).
+ *
+ * @since 0.1.0
+ * @category combinators
+ */
+export const residual = (model: Model): Effect.Effect<Model> =>
+  Effect.succeed({
+    names: model.names,
+    init: model.init,
+    forward: (params, input) =>
+      Effect.gen(function* () {
+        const out = yield* model.forward(params, input)
+        return yield* Tensor.add(input, out)
+      })
   })
 
 /**

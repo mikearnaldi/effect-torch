@@ -1125,6 +1125,84 @@ export const logSoftmax = dualOptions(
 )
 
 /**
+ * Options for {@link scaledDotProductAttention}.
+ *
+ * @since 0.1.0
+ * @category neural network
+ */
+export interface ScaledDotProductAttentionOptions {
+  /** Score multiplier; defaults to `1 / sqrt(headDim)`. */
+  readonly scale?: number
+  /** Mask the scores causally: query `i` attends to keys `j <= i` (right-aligned when the key sequence is longer than the query sequence). */
+  readonly causal?: boolean
+}
+
+/**
+ * Scaled dot-product attention `softmax(q·kᵀ · scale) · v` as a single
+ * semantic operation: `q` is `[..., T, D]`, `k` is `[..., S, D]` and `v`
+ * is `[..., S, Dv]` with equal leading (batch/head) dimensions, giving an
+ * output of `[..., T, Dv]`. The backward is closed-form and recomputes
+ * the attention probabilities instead of retaining them; it is not
+ * second-order differentiable.
+ *
+ * @since 0.1.0
+ * @category neural network
+ */
+export const scaledDotProductAttention = (
+  q: Any,
+  k: Any,
+  v: Any,
+  options: ScaledDotProductAttentionOptions = {}
+): Effect.Effect<Lazy, TensorError> =>
+  Effect.try({
+    try: () => {
+      const op = "scaledDotProductAttention"
+      const rank = q.shape.length
+      if (rank < 2 || k.shape.length !== rank || v.shape.length !== rank) {
+        throw new Error(
+          `${op}: q, k and v must share a rank >= 2, got [${q.shape}], [${k.shape}] and [${v.shape}]`
+        )
+      }
+      const leading = q.shape.slice(0, -2)
+      if (
+        !leading.every((d, i) => d === k.shape[i]) ||
+        !leading.every((d, i) => d === v.shape[i])
+      ) {
+        throw new Error(
+          `${op}: leading dims must match, got [${q.shape}], [${k.shape}] and [${v.shape}]`
+        )
+      }
+      if (q.shape[rank - 1] !== k.shape[rank - 1]) {
+        throw new Error(`${op}: q and k head dims mismatch, got [${q.shape}] and [${k.shape}]`)
+      }
+      if (k.shape[rank - 2] !== v.shape[rank - 2]) {
+        throw new Error(`${op}: k and v sequence lengths mismatch, got [${k.shape}] and [${v.shape}]`)
+      }
+      if (q.dtype !== "f32" && q.dtype !== "f64") {
+        throw new Error(`${op}: dtype must be f32 or f64, got ${q.dtype}`)
+      }
+      if (k.dtype !== q.dtype || v.dtype !== q.dtype) {
+        throw new Error(`${op}: q, k and v must share a dtype, got ${q.dtype}, ${k.dtype} and ${v.dtype}`)
+      }
+      if (k.device !== q.device || v.device !== q.device) {
+        throw new Error(`${op}: q, k and v must be on the same device`)
+      }
+      const scale = options.scale ?? 1 / Math.sqrt(q.shape[rank - 1])
+      return makeLazy(
+        q.lazy.scaledDotProductAttention(k.lazy, v.lazy, scale, options.causal ?? false),
+        [...q.shape.slice(0, -1), v.shape[rank - 1]],
+        q.dtype,
+        q.device
+      )
+    },
+    catch: (error) =>
+      new TensorError({
+        op: "scaledDotProductAttention",
+        message: error instanceof Error ? error.message : String(error)
+      })
+  })
+
+/**
  * SiLU / swish activation, `x * sigmoid(x)`.
  *
  * @since 0.1.0
