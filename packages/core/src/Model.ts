@@ -38,7 +38,7 @@
  */
 import { Data, Effect } from "effect"
 import type { CurrentDevice } from "./Device.ts"
-import type * as Gradient from "./Gradient.ts"
+import * as Gradient from "./Gradient.ts"
 import * as Optimizer from "./Optimizer.ts"
 import * as Tensor from "./Tensor.ts"
 
@@ -586,6 +586,39 @@ export const maxPool2d = (options: Tensor.PoolOptions): Effect.Effect<Model, Mod
  */
 export const avgPool2d = (options: Tensor.PoolOptions): Effect.Effect<Model, ModelError> =>
   pool("avgPool2d", Tensor.avgPool2d, options)
+
+/**
+ * Wraps a sub-model in a gradient-checkpoint boundary: the forward value
+ * is unchanged, but during the backward pass the sub-model's forward
+ * intermediates are recomputed from a fresh copy instead of being
+ * retained — trading one extra forward evaluation of the block for its
+ * peak activation memory. Region inputs (parameters, the incoming
+ * activation, constructor draws) stay shared, so recomputation is
+ * consistent with the forward pass.
+ *
+ * Apply it per block, not to the whole model: checkpointing the full
+ * network just moves the peak into the backward pass. The standard
+ * recipe is one boundary per expensive stage:
+ *
+ * ```ts
+ * Model.chain(
+ *   yield* Model.checkpoint(yield* block1),
+ *   yield* Model.checkpoint(yield* block2),
+ *   head
+ * )
+ * ```
+ *
+ * This is the recompute mechanism — meaningful on every target.
+ *
+ * @since 0.1.0
+ * @category combinators
+ */
+export const checkpoint = (model: Model): Effect.Effect<Model> =>
+  Effect.succeed({
+    names: model.names,
+    init: model.init,
+    forward: (params, input) => Effect.flatMap(model.forward(params, input), Gradient.checkpoint)
+  })
 
 /**
  * Composes models into a single model that threads its input through each

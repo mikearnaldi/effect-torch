@@ -401,6 +401,42 @@ onDevices("Model", (device: TestDevice) => (it) => {
         deep(yield* values(viaTrain), yield* values(viaEval))
       })
     )
+
+    it.effect("checkpoint preserves names, outputs, and gradients", () =>
+      Effect.gen(function* () {
+        const block = Model.chain(yield* Model.linear("fc", 2, 8), yield* Model.tanh)
+        const plain = yield* Model.chain(yield* block, yield* Model.linear("head", 8, 1))
+        const wrapped = yield* Model.chain(
+          yield* Model.checkpoint(yield* block),
+          yield* Model.linear("head", 8, 1)
+        )
+        expect(wrapped.names).toEqual(plain.names)
+        const params = yield* Tensor.compute(yield* plain.init)
+        const x = yield* Tensor.fromTypedArray(floats([0, 1, 1, 0, 1, 1, 0, 0]), [4, 2])
+        const [outPlain] = yield* Tensor.compute([yield* plain.forward(params, x)])
+        const [outWrapped] = yield* Tensor.compute([yield* wrapped.forward(params, x)])
+        deep(yield* values(outWrapped), yield* values(outPlain))
+        const lossPlain = yield* Tensor.sum(yield* plain.forward(params, x))
+        const lossWrapped = yield* Tensor.sum(yield* wrapped.forward(params, x))
+        const gradsPlain = yield* Tensor.compute(yield* Gradient.grad(lossPlain, params))
+        const gradsWrapped = yield* Tensor.compute(yield* Gradient.grad(lossWrapped, params))
+        for (let i = 0; i < gradsPlain.length; i++) {
+          deep(yield* values(gradsWrapped[i]), yield* values(gradsPlain[i]))
+        }
+      })
+    )
+
+    it.effect("a checkpointed sub-model still checks its own arity", () =>
+      Effect.gen(function* () {
+        const wrapped = yield* Model.checkpoint(yield* Model.linear("fc1", 2, 8))
+        const x = yield* Tensor.fromTypedArray(floats([0, 1]), [1, 2])
+        const error = yield* Effect.flip(wrapped.forward([], x))
+        expect(error._tag).toBe("ModelError")
+        if (error._tag === "ModelError") {
+          expect(error.message).toContain("fc1")
+        }
+      })
+    )
   })
 
   describe("serialization", () => {
