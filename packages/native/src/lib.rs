@@ -6208,6 +6208,25 @@ fn merge_shared_regions(roots: &[Arc<Node>]) -> std::result::Result<Vec<Arc<Node
     let mut current = roots.to_vec();
     loop {
         let (order, consumers) = analyze(&current);
+        if std::env::var_os("EFFECT_TORCH_FUSION_DEBUG").is_some() {
+            let mut fe = 0;
+            let mut multi = 0;
+            let mut pick = 0;
+            let mut red = 0;
+            for n in &order {
+                match &n.kind {
+                    NodeKind::FusedElementwise { .. } => fe += 1,
+                    NodeKind::FusedElementwiseMulti { .. } => multi += 1,
+                    NodeKind::FusedPick { .. } => pick += 1,
+                    NodeKind::FusedReduce { .. } => red += 1,
+                    _ => {}
+                }
+            }
+            eprintln!(
+                "[fusion] analyze: {} nodes (fe {fe}, multi {multi}, pick {pick}, reduce {red})",
+                order.len()
+            );
+        }
         let Some(plan) = find_merge(&order, &consumers) else {
             return Ok(current);
         };
@@ -6217,7 +6236,57 @@ fn merge_shared_regions(roots: &[Arc<Node>]) -> std::result::Result<Vec<Arc<Node
                 plan.prefix, plan.group, plan.keep_prefix
             );
         }
-        let multi = Node::new(plan.multi)?;
+        // Remaps a node depth-first through rebuilt subtrees, memoized
+        // into `map`. The multi's lanes are remapped this way BEFORE the
+        // main rewrite so the multi never references the original lane
+        // nodes: keeping the originals would retain their whole
+        // ancestry (fused regions included), which the next fixpoint
+        // round would see and merge again — duplicating a generation of
+        // the subgraph per round. A lane's ancestry can include the
+        // prefix itself (a continuation's extra lane descending from
+        // it); that path rebuilds the prefix plainly — single-consumer,
+        // so it cannot be re-merged and the duplication is bounded.
+        fn remap_deep(
+            n: &Arc<Node>,
+            map: &mut HashMap<u64, Arc<Node>>,
+        ) -> std::result::Result<Arc<Node>, String> {
+            if let Some(r) = map.get(&n.id) {
+                return Ok(r.clone());
+            }
+            let children = node_children(&n.kind);
+            let mut resolved: HashMap<u64, Arc<Node>> = HashMap::with_capacity(children.len());
+            for ch in &children {
+                resolved.insert(ch.id, remap_deep(ch, map)?);
+            }
+            let kind = remap_children(&n.kind, &|ch| {
+                resolved.get(&ch.id).cloned().unwrap_or_else(|| ch.clone())
+            });
+            let rebuilt = Node::new(kind)?;
+            map.insert(n.id, rebuilt.clone());
+            Ok(rebuilt)
+        }
+        let mut map: HashMap<u64, Arc<Node>> = HashMap::new();
+        let multi = {
+            let NodeKind::FusedElementwiseMulti {
+                inputs,
+                strides,
+                shape,
+                exprs,
+            } = &plan.multi
+            else {
+                unreachable!("fusion: merge plan must build a multi node")
+            };
+            let mut remapped_inputs = Vec::with_capacity(inputs.len());
+            for lane in inputs {
+                remapped_inputs.push(remap_deep(lane, &mut map)?);
+            }
+            Node::new(NodeKind::FusedElementwiseMulti {
+                inputs: remapped_inputs,
+                strides: strides.clone(),
+                shape: shape.clone(),
+                exprs: exprs.clone(),
+            })?
+        };
         let mut pick_index = u8::from(plan.keep_prefix);
         let mut picks: HashMap<u64, Arc<Node>> = HashMap::new();
         if plan.keep_prefix {
@@ -6239,8 +6308,10 @@ fn merge_shared_regions(roots: &[Arc<Node>]) -> std::result::Result<Vec<Arc<Node
             );
             pick_index += 1;
         }
-        let mut map: HashMap<u64, Arc<Node>> = HashMap::new();
         for node in &order {
+            if map.contains_key(&node.id) {
+                continue;
+            }
             if let Some(pick) = picks.get(&node.id) {
                 map.insert(node.id, pick.clone());
                 continue;

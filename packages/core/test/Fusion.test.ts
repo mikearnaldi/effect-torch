@@ -568,6 +568,44 @@ onDevices("Fusion", (device: TestDevice) => (it) => {
       })
     )
 
+    it.effect("nested shared prefixes with deep lane ancestry merge and terminate", () =>
+      Effect.gen(function* () {
+        // Regression: the multi-output merge used to keep the original
+        // lane nodes alive in the merged kernel's inputs, so every round
+        // retained and re-merged the old subgraph — the rewrite grew
+        // without bound on graphs with nested sharing (deep lane
+        // ancestry). Each level here shares a fused prefix between fused
+        // continuations and a reduce consumer, which is exactly the
+        // shape that blew up.
+        const build = Effect.gen(function* () {
+          const x = yield* Tensor.fromTypedArray(floats([0.5, -1, 2, -3, 0.25, 1.5]), [2, 3])
+          let acc = x as Tensor.Any
+          const terms: Array<Tensor.Any> = []
+          for (let level = 0; level < 6; level++) {
+            const shared = yield* Tensor.tanh(yield* Tensor.exp(yield* Tensor.add(acc, level)))
+            const left = yield* Tensor.sin(yield* Tensor.mul(shared, 2))
+            const right = yield* Tensor.cos(yield* Tensor.add(shared, 1))
+            const reduced = yield* Tensor.sum(yield* Tensor.sqrt(yield* Tensor.abs(shared)), { dims: [1] })
+            terms.push(yield* Tensor.sum(left), yield* Tensor.sum(right), yield* Tensor.sum(reduced))
+            acc = yield* Tensor.add(shared, level + 1)
+          }
+          let loss = terms[0]
+          for (const t of terms.slice(1)) {
+            loss = yield* Tensor.add(loss, t)
+          }
+          const [gx] = yield* Gradient.grad(loss, [x])
+          return { loss: yield* values(loss), gx: yield* values(gx) }
+        })
+        const fused = yield* withFusion(true, build)
+        const unfused = yield* withFusion(false, build)
+        for (const key of ["loss", "gx"] as const) {
+          fused[key].forEach((v, i) => {
+            assert.assertTrue(close(v, unfused[key][i]), `${key}[${i}]: ${v} != ${unfused[key][i]}`)
+          })
+        }
+      })
+    )
+
     it.effect("a reduce over a materialized prefix stays unfused but correct", () =>
       Effect.gen(function* () {
         const build = Effect.gen(function* () {

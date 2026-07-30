@@ -5,6 +5,7 @@
   "type": "module",
   "scripts": {
     "xor": "tsx xor.ts",
+    "nano-gpt": "tsx nano-gpt.ts",
     "typecheck": "tsc -p tsconfig.json"
   },
   "dependencies": {

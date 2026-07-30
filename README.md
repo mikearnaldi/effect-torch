@@ -173,6 +173,7 @@ product kernel). Also `argmax` / `argmin` (indices along a dim, `i64`) and
 | Export | Description |
 | --- | --- |
 | `softmax(t, { dims? })` / `logSoftmax` | Stable, last dim by default |
+| `scaledDotProductAttention(q, k, v, { scale?, causal? })` | Flash attention: single-kernel online-softmax forward on Metal, chunked-recompute backward; composed candle reference elsewhere |
 | `dropout(t, { p? })` | Functional inverted dropout; mask drawn at evaluation time |
 | `conv1d` / `conv2d(t, weight, { stride?, padding?, dilation?, groups? })` | Convolution via im2col + matmul — all backends, fully differentiable |
 | `convTranspose1d` / `convTranspose2d(t, weight, { stride?, padding?, outputPadding?, groups? })` | Transposed convolution, composed from dilation + conv |
@@ -330,6 +331,7 @@ that can fail returns an `Effect`: constructors validate into a
 | `Model.conv1d` / `Model.conv2d(name, in, out, k, opts?)` | `Effect`s of convolution layers, fan-in-scaled weight, per-channel bias |
 | `Model.embedding(name, num, dim, opts?)` | `Effect` of an embedding lookup layer, unit-normal weight |
 | `Model.layerNorm(name, shape, { eps? })` | `Effect` of layer normalization over the trailing `shape` dims |
+| `Model.multiHeadAttention(name, embedDim, numHeads, { causal? })` | `Effect` of multi-head attention: wq/wk/wv/wo projections over `scaledDotProductAttention` |
 | `Model.tanh` / `sigmoid` / `relu` / `silu` / `mish` / `softplus` | `Effect`s of activations as parameterless models |
 | `Model.gelu(opts?)` / `elu(opts?)` / `leakyRelu(opts?)` | `Effect`s of option-taking activations |
 | `Model.softmax(dim?)` / `logSoftmax(dim?)` / `flatten(opts?)` | `Effect`s of shape/reduction stages (`flatten` preserves the batch dim) |
@@ -337,6 +339,7 @@ that can fail returns an `Effect`: constructors validate into a
 | `Model.maxPool2d(opts)` / `avgPool2d(opts)` | `Effect`s of pooling stages |
 | `Model.chain(...models)` | `Effect` of sequential composition; parameter arrays concatenated in order, arity checked in `forward` |
 | `Model.checkpoint(block)` | gradient-checkpoint a sub-model: recompute its forward during backward, trading FLOPs for peak memory |
+| `Model.residual(block)` | add a skip connection: `forward = input + block(input)` |
 | `Model.train(model, { optimizer, loss, data, stop, params?, onStep? })` | the training loop: init → forward → loss → grad → update, one walk per step; `stop: (info) => boolean` ends it (step count, loss target, anything) |
 | `Model.save(model, params, path)` / `Model.load(model, path)` | named checkpoints via safetensors |
 
@@ -400,12 +403,13 @@ pnpm -r typecheck                        # typecheck all packages (against sourc
 pnpm --filter @effect-torch/core test    # @effect/vitest suite
 pnpm bench                               # matmul benchmark (cpu + metal)
 pnpm bench:mlx                           # head-to-head against MLX
-pnpm --filter @effect-torch/examples xor # train the XOR example
+pnpm --filter @effect-torch/examples xor      # train the XOR example
+pnpm --filter @effect-torch/examples nano-gpt # char-level GPT (attention, flash kernel on Metal)
 ```
 
 Layout:
 
 - `packages/native` — Rust backend (candle, napi-rs), lazy graph + evaluator
 - `packages/core` — public TypeScript API (`Tensor`, `Device`, `Optimizer`)
-- `packages/examples` — runnable examples (`xor.ts`)
+- `packages/examples` — runnable examples (`xor.ts`, `nano-gpt.ts`)
 - `packages/bench` — benchmarks, including an MLX comparison
