@@ -743,11 +743,11 @@ export const residual = (model: Model): Effect.Effect<Model> =>
   })
 
 /**
- * Transforms a model's input before it enters the sub-model
- * (contramap): `forward(params, input) = model.forward(params,
- * f(input))`. Names and init are the sub-model's. Use it for input
- * derived from the raw input's shape or values — position indexes from a
- * sequence length, patches from an image.
+ * Transforms a model's input before it enters the sub-model:
+ * `forward(params, input) = model.forward(params, f(input))`. Names and
+ * init are the sub-model's. Use it for input derived from the raw
+ * input's shape or values — position indexes from a sequence length,
+ * patches from an image.
  *
  * @since 0.1.0
  * @category combinators
@@ -763,26 +763,30 @@ export const mapInput = (
   })
 
 /**
- * Fans one input into two sub-models and combines their outputs:
- * `forward(params, input) = f(a.forward(aParams, input),
- * b.forward(bParams, input))`. `names` is the concatenation of the two
- * models' names (a's first), sliced by arity in `forward`; `init` runs
- * both inits in order. Fails with a {@link ModelError} when parameter
- * names collide.
+ * Fans one input into several sub-models and combines their outputs:
+ * `forward(params, input) = f(...models.map(m => m.forward(mParams,
+ * input)))`. `names` is the concatenation of the models' names (in
+ * order), sliced by arity in `forward`; `init` runs each model's `init`
+ * in order. The combiner is variadic with one argument per model, in
+ * the same order (inferred from the tuple). Fails with a
+ * {@link ModelError} when the array is empty or when parameter names
+ * collide.
  *
  * The pattern for non-sequential tops: token + position embeddings is
- * `zipWith(wte, mapInput(wpe, positions), Tensor.add)`, and
- * {@link residual} is `zipWith(identity, block, Tensor.add)`.
+ * `merge([wte, mapInput(wpe, positions)], (x, y) => Tensor.add(x, y))`,
+ * and {@link residual} is `merge([identity, block], ...)`.
  *
  * @since 0.1.0
  * @category combinators
  */
-export const zipWith = (
-  a: Model,
-  b: Model,
-  f: (x: Tensor.Any, y: Tensor.Any) => Effect.Effect<Tensor.Lazy, Tensor.TensorError, CurrentDevice>
+export const merge = <const M extends ReadonlyArray<Model>>(
+  models: M,
+  f: (...outputs: { [K in keyof M]: Tensor.Lazy }) => Effect.Effect<Tensor.Lazy, Tensor.TensorError, CurrentDevice>
 ): Effect.Effect<Model, ModelError> => {
-  const names = [...a.names, ...b.names]
+  if (models.length === 0) {
+    return new ModelError({ op: "merge", message: "at least one model is required" })
+  }
+  const names = models.flatMap((model) => model.names)
   const seen = new Set<string>()
   const duplicates = new Set<string>()
   for (const name of names) {
@@ -793,22 +797,30 @@ export const zipWith = (
   }
   if (duplicates.size > 0) {
     return new ModelError({
-      op: "zipWith",
+      op: "merge",
       message: `duplicate parameter names: [${[...duplicates].join(", ")}]`
     })
   }
-  const arityA = a.names.length
+  const arities = models.map((model) => model.names.length)
   return Effect.succeed({
     names,
     init: Effect.gen(function* () {
-      return [...(yield* a.init), ...(yield* b.init)]
+      const params: Array<Tensor.Any> = []
+      for (const model of models) {
+        params.push(...(yield* model.init))
+      }
+      return params
     }),
     forward: (params, input) =>
       Effect.gen(function* () {
-        yield* checkArity("zipWith", names, params)
-        const x = yield* a.forward(params.slice(0, arityA), input)
-        const y = yield* b.forward(params.slice(arityA), input)
-        return yield* f(x, y)
+        yield* checkArity("merge", names, params)
+        const outputs: Array<Tensor.Lazy> = []
+        let offset = 0
+        for (let i = 0; i < models.length; i++) {
+          outputs.push(yield* models[i].forward(params.slice(offset, offset + arities[i]), input))
+          offset += arities[i]
+        }
+        return yield* f(...(outputs as { [K in keyof M]: Tensor.Lazy }))
       })
   })
 }

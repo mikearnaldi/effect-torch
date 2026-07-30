@@ -565,13 +565,13 @@ onDevices("Model", () => (it) => {
       })
     )
 
-    it.effect("zipWith fans one input into two models and combines outputs (values and gradients)", () =>
+    it.effect("merge fans one input into several models and combines outputs (values and gradients)", () =>
       Effect.gen(function* () {
         const a = yield* Model.linear("a", 2, 2)
         const b = yield* Model.linear("b", 2, 2)
-        const zipped = yield* Model.zipWith(a, b, (x, y) => Tensor.add(x, y))
-        expect(zipped.names).toEqual(["a.weight", "a.bias", "b.weight", "b.bias"])
-        const params = yield* Tensor.compute(yield* zipped.init)
+        const merged = yield* Model.merge([a, b], (x, y) => Tensor.add(x, y))
+        expect(merged.names).toEqual(["a.weight", "a.bias", "b.weight", "b.bias"])
+        const params = yield* Tensor.compute(yield* merged.init)
         const x = yield* Tensor.fromTypedArray(floats([0, 1, 1, 0]), [2, 2])
         const hand = Effect.gen(function* () {
           return yield* Tensor.add(
@@ -579,25 +579,54 @@ onDevices("Model", () => (it) => {
             yield* b.forward(params.slice(2), x)
           )
         })
-        const [viaZipped] = yield* Tensor.compute([yield* zipped.forward(params, x)])
+        const [viaMerge] = yield* Tensor.compute([yield* merged.forward(params, x)])
         const [byHand] = yield* Tensor.compute([yield* hand])
-        deep(yield* values(viaZipped), yield* values(byHand))
-        const lossZipped = yield* Tensor.sum(yield* zipped.forward(params, x))
-        const grads = yield* Tensor.compute(yield* Gradient.grad(lossZipped, params))
+        deep(yield* values(viaMerge), yield* values(byHand))
+        const lossMerged = yield* Tensor.sum(yield* merged.forward(params, x))
+        const grads = yield* Tensor.compute(yield* Gradient.grad(lossMerged, params))
         const lossHand = yield* Tensor.sum(yield* hand)
         const gradsHand = yield* Tensor.compute(yield* Gradient.grad(lossHand, params))
         for (let i = 0; i < grads.length; i++) {
           deep(yield* values(grads[i]), yield* values(gradsHand[i]))
         }
-        const error = yield* Effect.flip(zipped.forward(params.slice(0, 3), x))
+        const error = yield* Effect.flip(merged.forward(params.slice(0, 3), x))
         expect(error._tag).toBe("ModelError")
       })
     )
 
-    it.effect("zipWith rejects duplicate parameter names", () =>
+    it.effect("merge is variadic: three models merge with per-model combiner arguments", () =>
       Effect.gen(function* () {
+        const a = yield* Model.linear("a", 2, 2)
+        const b = yield* Model.linear("b", 2, 2)
+        const c = yield* Model.linear("c", 2, 2)
+        const merged = yield* Model.merge([a, b, c], (x, y, z) =>
+          Effect.gen(function* () {
+            return yield* Tensor.add(x, yield* Tensor.add(y, z))
+          })
+        )
+        expect(merged.names).toEqual(["a.weight", "a.bias", "b.weight", "b.bias", "c.weight", "c.bias"])
+        const params = yield* Tensor.compute(yield* merged.init)
+        const x = yield* Tensor.fromTypedArray(floats([0, 1, 1, 0]), [2, 2])
+        const [viaMerge] = yield* Tensor.compute([yield* merged.forward(params, x)])
+        const [byHand] = yield* Tensor.compute([
+          yield* Tensor.add(
+            yield* a.forward(params.slice(0, 2), x),
+            yield* Tensor.add(
+              yield* b.forward(params.slice(2, 4), x),
+              yield* c.forward(params.slice(4), x)
+            )
+          )
+        ])
+        deep(yield* values(viaMerge), yield* values(byHand))
+      })
+    )
+
+    it.effect("merge rejects an empty array and duplicate parameter names", () =>
+      Effect.gen(function* () {
+        const empty = yield* Effect.flip(Model.merge([], () => Tensor.zeros([1])))
+        expect(empty.message).toContain("at least one")
         const error = yield* Effect.flip(
-          Model.zipWith(yield* Model.linear("fc", 2, 2), yield* Model.linear("fc", 2, 2), (x, y) =>
+          Model.merge([yield* Model.linear("fc", 2, 2), yield* Model.linear("fc", 2, 2)], (x, y) =>
             Tensor.add(x, y)
           )
         )
