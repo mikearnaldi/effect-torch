@@ -564,6 +564,68 @@ onDevices("Model", () => (it) => {
         expect(grads.length).toBe(net.names.length)
       })
     )
+
+    it.effect("zipWith fans one input into two models and combines outputs (values and gradients)", () =>
+      Effect.gen(function* () {
+        const a = yield* Model.linear("a", 2, 2)
+        const b = yield* Model.linear("b", 2, 2)
+        const zipped = yield* Model.zipWith(a, b, (x, y) => Tensor.add(x, y))
+        expect(zipped.names).toEqual(["a.weight", "a.bias", "b.weight", "b.bias"])
+        const params = yield* Tensor.compute(yield* zipped.init)
+        const x = yield* Tensor.fromTypedArray(floats([0, 1, 1, 0]), [2, 2])
+        const hand = Effect.gen(function* () {
+          return yield* Tensor.add(
+            yield* a.forward(params.slice(0, 2), x),
+            yield* b.forward(params.slice(2), x)
+          )
+        })
+        const [viaZipped] = yield* Tensor.compute([yield* zipped.forward(params, x)])
+        const [byHand] = yield* Tensor.compute([yield* hand])
+        deep(yield* values(viaZipped), yield* values(byHand))
+        const lossZipped = yield* Tensor.sum(yield* zipped.forward(params, x))
+        const grads = yield* Tensor.compute(yield* Gradient.grad(lossZipped, params))
+        const lossHand = yield* Tensor.sum(yield* hand)
+        const gradsHand = yield* Tensor.compute(yield* Gradient.grad(lossHand, params))
+        for (let i = 0; i < grads.length; i++) {
+          deep(yield* values(grads[i]), yield* values(gradsHand[i]))
+        }
+        const error = yield* Effect.flip(zipped.forward(params.slice(0, 3), x))
+        expect(error._tag).toBe("ModelError")
+      })
+    )
+
+    it.effect("zipWith rejects duplicate parameter names", () =>
+      Effect.gen(function* () {
+        const error = yield* Effect.flip(
+          Model.zipWith(yield* Model.linear("fc", 2, 2), yield* Model.linear("fc", 2, 2), (x, y) =>
+            Tensor.add(x, y)
+          )
+        )
+        expect(error._tag).toBe("ModelError")
+        expect(error.message).toContain("duplicate")
+      })
+    )
+
+    it.effect("mapInput transforms the input before the sub-model", () =>
+      Effect.gen(function* () {
+        const emb = yield* Model.embedding("pos", 4, 2)
+        const positioned = yield* Model.mapInput(emb, (idx) =>
+          Tensor.arange(idx.shape[idx.shape.length - 1], undefined, { dtype: "i64" })
+        )
+        expect(positioned.names).toEqual(["pos.weight"])
+        const [w] = yield* Tensor.compute(yield* positioned.init)
+        const ids = yield* Tensor.fromTypedArray(new BigInt64Array([2n, 3n]), [1, 2])
+        const [viaMapped] = yield* Tensor.compute([yield* positioned.forward([w], ids)])
+        // the mapped input is arange(2) = [0, 1]: rows 0 and 1 of the table
+        const [byHand] = yield* Tensor.compute([
+          yield* emb.forward(
+            [w],
+            yield* Tensor.fromTypedArray(new BigInt64Array([0n, 1n]), [2])
+          )
+        ])
+        deep(yield* values(viaMapped), yield* values(byHand))
+      })
+    )
   })
 
   describe("serialization", () => {

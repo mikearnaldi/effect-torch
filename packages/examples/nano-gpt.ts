@@ -3,10 +3,11 @@ import { NodeRuntime } from "@effect/platform-node"
 import { Device, Loss, Model, Optimizer, Tensor } from "@effect-torch/core"
 
 // A character-level GPT trained on a few KB of public-domain verse:
-// token and position embeddings, pre-norm transformer blocks (causal
-// multi-head attention + MLP, each under a residual connection), a final
-// layer norm and a vocabulary head. Everything is the stock Model
-// combinators; attention is the fused flash kernel on Metal.
+// token and position embeddings fanned into one stream, pre-norm
+// transformer blocks (causal multi-head attention + MLP, each under a
+// residual connection), a final layer norm and a vocabulary head.
+// Everything is the stock Model combinators; attention is the fused
+// flash kernel on Metal.
 
 const CORPUS = `Shall I compare thee to a summer's day?
 Thou art more lovely and more temperate:
@@ -79,67 +80,17 @@ const vocabSize = chars.length
 const encode = (text: string): Array<number> => text.split("").map((c) => chars.indexOf(c))
 const data = encode(CORPUS)
 
-interface Gpt {
-  readonly model: Model.Model
-  readonly arities: ReadonlyArray<number>
-}
-
-// The GPT topology is not a chain (embeddings add, logits head off a
-// sequence), so the model slices the parameter array by hand and
-// delegates to the sub-models' forwards.
-const gpt = (parts: {
-  readonly wte: Model.Model
-  readonly wpe: Model.Model
-  readonly blocks: ReadonlyArray<Model.Model>
-  readonly lnF: Model.Model
-  readonly head: Model.Model
-}): Gpt => {
-  const subModels = [parts.wte, parts.wpe, ...parts.blocks, parts.lnF, parts.head]
-  const names = subModels.flatMap((m) => m.names)
-  const arities = subModels.map((m) => m.names.length)
-  const model: Model.Model = {
-    names,
-    init: Effect.gen(function* () {
-      const params: Array<Tensor.Any> = []
-      for (const m of subModels) {
-        params.push(...(yield* m.init))
-      }
-      return params
-    }),
-    forward: (params, idx) =>
-      Effect.gen(function* () {
-        if (params.length !== names.length) {
-          return yield* new Model.ModelError({
-            op: "forward",
-            message: `gpt: expected ${names.length} parameters, got ${params.length}`
-          })
-        }
-        const slices: Array<Model.Params> = []
-        let offset = 0
-        for (const arity of arities) {
-          slices.push(params.slice(offset, offset + arity))
-          offset += arity
-        }
-        const t = idx.shape[idx.shape.length - 1]
-        const tok = yield* parts.wte.forward(slices[0], idx)
-        const pos = yield* parts.wpe.forward(
-          slices[1],
-          yield* Tensor.arange(t, undefined, { dtype: "i64" })
-        )
-        let x = yield* Tensor.add(tok, pos)
-        for (let i = 0; i < parts.blocks.length; i++) {
-          x = yield* parts.blocks[i].forward(slices[2 + i], x)
-        }
-        x = yield* parts.lnF.forward(slices[2 + parts.blocks.length], x)
-        return yield* parts.head.forward(slices[slices.length - 1], x)
-      })
-  }
-  return { model, arities }
-}
-
 const createGpt = Effect.gen(function* () {
-  const wte = yield* Model.embedding("wte", vocabSize, EMBED)
-  const wpe = yield* Model.embedding("wpe", BLOCK, EMBED)
+  // token + position embeddings share the input: the position side maps
+  // token ids to their positions first
+  const embeddings = yield* Model.zipWith(
+    yield* Model.embedding("wte", vocabSize, EMBED),
+    yield* Model.mapInput(
+      yield* Model.embedding("wpe", BLOCK, EMBED),
+      (idx) => Tensor.arange(idx.shape[idx.shape.length - 1], undefined, { dtype: "i64" })
+    ),
+    (x, y) => Tensor.add(x, y)
+  )
   const blocks: Array<Model.Model> = []
   for (let i = 0; i < LAYERS; i++) {
     const attn = yield* Model.chain(
@@ -154,9 +105,12 @@ const createGpt = Effect.gen(function* () {
     )
     blocks.push(yield* Model.chain(yield* Model.residual(attn), yield* Model.residual(mlp)))
   }
-  const lnF = yield* Model.layerNorm("lnf", EMBED)
-  const head = yield* Model.linear("head", EMBED, vocabSize)
-  return gpt({ wte, wpe, blocks, lnF, head })
+  return yield* Model.chain(
+    embeddings,
+    ...blocks,
+    yield* Model.layerNorm("lnf", EMBED),
+    yield* Model.linear("head", EMBED, vocabSize)
+  )
 })
 
 const ids = (values: ReadonlyArray<number>, shape: ReadonlyArray<number>) =>
@@ -183,7 +137,7 @@ const program = Effect.gen(function* () {
   yield* Effect.log(
     `nano-gpt: vocab ${vocabSize}, block ${BLOCK}, embed ${EMBED}, ${HEADS} heads, ${LAYERS} layers on ${device}`
   )
-  const { model } = yield* createGpt
+  const model = yield* createGpt
   yield* Effect.log(`${model.names.length} tensors of parameters`)
 
   const optimizer = Optimizer.adamW({ lr: LR })

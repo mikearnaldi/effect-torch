@@ -743,6 +743,77 @@ export const residual = (model: Model): Effect.Effect<Model> =>
   })
 
 /**
+ * Transforms a model's input before it enters the sub-model
+ * (contramap): `forward(params, input) = model.forward(params,
+ * f(input))`. Names and init are the sub-model's. Use it for input
+ * derived from the raw input's shape or values — position indexes from a
+ * sequence length, patches from an image.
+ *
+ * @since 0.1.0
+ * @category combinators
+ */
+export const mapInput = (
+  model: Model,
+  f: (input: Tensor.Any) => Effect.Effect<Tensor.Any, Tensor.TensorError, CurrentDevice>
+): Effect.Effect<Model> =>
+  Effect.succeed({
+    names: model.names,
+    init: model.init,
+    forward: (params, input) => Effect.flatMap(f(input), (mapped) => model.forward(params, mapped))
+  })
+
+/**
+ * Fans one input into two sub-models and combines their outputs:
+ * `forward(params, input) = f(a.forward(aParams, input),
+ * b.forward(bParams, input))`. `names` is the concatenation of the two
+ * models' names (a's first), sliced by arity in `forward`; `init` runs
+ * both inits in order. Fails with a {@link ModelError} when parameter
+ * names collide.
+ *
+ * The pattern for non-sequential tops: token + position embeddings is
+ * `zipWith(wte, mapInput(wpe, positions), Tensor.add)`, and
+ * {@link residual} is `zipWith(identity, block, Tensor.add)`.
+ *
+ * @since 0.1.0
+ * @category combinators
+ */
+export const zipWith = (
+  a: Model,
+  b: Model,
+  f: (x: Tensor.Any, y: Tensor.Any) => Effect.Effect<Tensor.Lazy, Tensor.TensorError, CurrentDevice>
+): Effect.Effect<Model, ModelError> => {
+  const names = [...a.names, ...b.names]
+  const seen = new Set<string>()
+  const duplicates = new Set<string>()
+  for (const name of names) {
+    if (seen.has(name)) {
+      duplicates.add(name)
+    }
+    seen.add(name)
+  }
+  if (duplicates.size > 0) {
+    return new ModelError({
+      op: "zipWith",
+      message: `duplicate parameter names: [${[...duplicates].join(", ")}]`
+    })
+  }
+  const arityA = a.names.length
+  return Effect.succeed({
+    names,
+    init: Effect.gen(function* () {
+      return [...(yield* a.init), ...(yield* b.init)]
+    }),
+    forward: (params, input) =>
+      Effect.gen(function* () {
+        yield* checkArity("zipWith", names, params)
+        const x = yield* a.forward(params.slice(0, arityA), input)
+        const y = yield* b.forward(params.slice(arityA), input)
+        return yield* f(x, y)
+      })
+  })
+}
+
+/**
  * Composes models into a single model that threads its input through each
  * child in order, slicing each child's share of the concatenated
  * parameter array by its arity (`names.length`). `names` is the
