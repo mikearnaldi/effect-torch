@@ -425,4 +425,170 @@ onDevices("Fusion", (device: TestDevice) => (it) => {
       })
     )
   })
+
+  describe("reduction fusion", () => {
+    it.effect("a sum over an elementwise chain fuses into the reduce loop", () =>
+      Effect.gen(function* () {
+        const build = Effect.gen(function* () {
+          const x = yield* Tensor.fromTypedArray(floats([0.5, -1, 2, -3, 0.25, 1.5, 0.75, -0.5]), [2, 4])
+          // the exp/mul chain must not materialize: sum folds it in-loop
+          const keep = yield* Tensor.sum(yield* Tensor.mul(yield* Tensor.exp(x), 2), {
+            dims: [1],
+            keepdims: true
+          })
+          const drop = yield* Tensor.sum(yield* Tensor.mul(yield* Tensor.exp(x), 2), { dims: [1] })
+          const loss = yield* Tensor.sum(keep)
+          const [gx] = yield* Gradient.grad(loss, [x])
+          return { keep: yield* values(keep), drop: yield* values(drop), gx: yield* values(gx) }
+        })
+        const fused = yield* withFusion(true, build)
+        const unfused = yield* withFusion(false, build)
+        for (const key of ["keep", "drop", "gx"] as const) {
+          fused[key].forEach((v, i) => {
+            assert.assertTrue(close(v, unfused[key][i]), `${key}[${i}]: ${v} != ${unfused[key][i]}`)
+          })
+        }
+      })
+    )
+
+    it.effect("softmax fuses its max/sum reduces with the exp chains (values and gradients)", () =>
+      Effect.gen(function* () {
+        const build = Effect.gen(function* () {
+          const x = yield* Tensor.fromTypedArray(
+            floats([1, -2, 3, -4, 0.5, -0.5, 2, -1, 0.1, 0.2, 0.3, 0.4, -3, 2.5, 1.5, -0.7]),
+            [4, 4]
+          )
+          const y = yield* Tensor.softmax(x)
+          const loss = yield* Tensor.sum(yield* Tensor.mul(y, yield* Tensor.fromTypedArray(
+            floats(Array.from({ length: 16 }, (_, i) => i * 0.25 - 2)),
+            [4, 4]
+          )))
+          const [gx] = yield* Gradient.grad(loss, [x])
+          return { y: yield* values(y), gx: yield* values(gx) }
+        })
+        const fused = yield* withFusion(true, build)
+        const unfused = yield* withFusion(false, build)
+        for (const key of ["y", "gx"] as const) {
+          fused[key].forEach((v, i) => {
+            assert.assertTrue(close(v, unfused[key][i]), `${key}[${i}]: ${v} != ${unfused[key][i]}`)
+          })
+        }
+      })
+    )
+
+    it.effect("mean over multiple dims (the variance pattern) fuses", () =>
+      Effect.gen(function* () {
+        const build = Effect.gen(function* () {
+          const x = yield* Tensor.fromTypedArray(
+            floats(Array.from({ length: 24 }, (_, i) => (i % 7) - 3)),
+            [2, 3, 4]
+          )
+          const mu = yield* Tensor.mean(x, { dims: [1, 2], keepdims: true })
+          const centered = yield* Tensor.sub(x, mu)
+          const variance = yield* Tensor.mean(yield* Tensor.mul(centered, centered), { dims: [1, 2] })
+          const loss = yield* Tensor.sum(variance)
+          const [gx] = yield* Gradient.grad(loss, [x])
+          return {
+            mu: yield* values(mu),
+            variance: yield* values(variance),
+            gx: yield* values(gx)
+          }
+        })
+        const fused = yield* withFusion(true, build)
+        const unfused = yield* withFusion(false, build)
+        for (const key of ["mu", "variance", "gx"] as const) {
+          fused[key].forEach((v, i) => {
+            assert.assertTrue(close(v, unfused[key][i]), `${key}[${i}]: ${v} != ${unfused[key][i]}`)
+          })
+        }
+      })
+    )
+
+    it.effect("max and min over a chain fuse", () =>
+      Effect.gen(function* () {
+        const build = Effect.gen(function* () {
+          const x = yield* Tensor.fromTypedArray(floats([0.5, -1, 2, -3, 0.25, 1.5, 0.75, -0.5, 1.25, -2.5, 3, 0.1]), [4, 3])
+          const hi = yield* Tensor.max(yield* Tensor.tanh(x), { dims: [0] })
+          const lo = yield* Tensor.min(yield* Tensor.tanh(x), { dims: [0] })
+          return { hi: yield* values(hi), lo: yield* values(lo) }
+        })
+        const fused = yield* withFusion(true, build)
+        const unfused = yield* withFusion(false, build)
+        for (const key of ["hi", "lo"] as const) {
+          fused[key].forEach((v, i) => {
+            assert.assertTrue(close(v, unfused[key][i]), `${key}[${i}]: ${v} != ${unfused[key][i]}`)
+          })
+        }
+      })
+    )
+
+    it.effect("non-trailing dims at rank 5 fuse without touching candle's reduce", () =>
+      Effect.gen(function* () {
+        const build = Effect.gen(function* () {
+          const x = yield* Tensor.fromTypedArray(
+            floats(Array.from({ length: 2 * 3 * 2 * 3 * 2 }, (_, i) => ((i * 7) % 11) - 5)),
+            [2, 3, 2, 3, 2]
+          )
+          const y = yield* Tensor.sum(yield* Tensor.exp(yield* Tensor.mul(x, 0.25)), { dims: [1, 3] })
+          const loss = yield* Tensor.sum(y)
+          const [gx] = yield* Gradient.grad(loss, [x])
+          return { y: yield* values(y), gx: yield* values(gx) }
+        })
+        const fused = yield* withFusion(true, build)
+        const unfused = yield* withFusion(false, build)
+        for (const key of ["y", "gx"] as const) {
+          fused[key].forEach((v, i) => {
+            assert.assertTrue(close(v, unfused[key][i]), `${key}[${i}]: ${v} != ${unfused[key][i]}`)
+          })
+        }
+      })
+    )
+
+    it.effect("broadcast lanes inside a fused reduce read through stride-0 dims", () =>
+      Effect.gen(function* () {
+        const build = Effect.gen(function* () {
+          const x = yield* Tensor.fromTypedArray(
+            floats([1, -2, 3, -4, 0.5, -0.5, 2, -1, 0.1, 0.2, 0.3, 0.4, -3, 2.5, 1.5, -0.7]),
+            [4, 4]
+          )
+          const row = yield* Tensor.fromTypedArray(floats([0.5, -1, 2, 0.25]), [4, 1])
+          const col = yield* Tensor.fromTypedArray(floats([1, 2, 3, 4]), [4])
+          const y = yield* Tensor.sum(yield* Tensor.mul(yield* Tensor.sub(x, row), col), { dims: [1] })
+          const loss = yield* Tensor.sum(y)
+          const [gx] = yield* Gradient.grad(loss, [x])
+          return { y: yield* values(y), gx: yield* values(gx) }
+        })
+        const fused = yield* withFusion(true, build)
+        const unfused = yield* withFusion(false, build)
+        for (const key of ["y", "gx"] as const) {
+          fused[key].forEach((v, i) => {
+            assert.assertTrue(close(v, unfused[key][i]), `${key}[${i}]: ${v} != ${unfused[key][i]}`)
+          })
+        }
+      })
+    )
+
+    it.effect("a reduce over a materialized prefix stays unfused but correct", () =>
+      Effect.gen(function* () {
+        const build = Effect.gen(function* () {
+          const x = yield* Tensor.fromTypedArray(floats([0.5, -1, 2, -3, 0.25, 1.5, 0.75, -0.5]), [2, 4])
+          // e has two consumers (the sum and the product): it materializes
+          // and the reduce reads it as a plain input
+          const e = yield* Tensor.exp(x)
+          const s = yield* Tensor.sum(e, { dims: [1], keepdims: true })
+          const y = yield* Tensor.div(e, s)
+          const loss = yield* Tensor.sum(y)
+          const [gx] = yield* Gradient.grad(loss, [x])
+          return { y: yield* values(y), gx: yield* values(gx) }
+        })
+        const fused = yield* withFusion(true, build)
+        const unfused = yield* withFusion(false, build)
+        for (const key of ["y", "gx"] as const) {
+          fused[key].forEach((v, i) => {
+            assert.assertTrue(close(v, unfused[key][i]), `${key}[${i}]: ${v} != ${unfused[key][i]}`)
+          })
+        }
+      })
+    )
+  })
 })

@@ -1006,6 +1006,22 @@ enum NodeKind {
         of: Arc<Node>,
         index: u8,
     },
+    // Created only by the evaluation-time fusion rewrite (RFC 0007 phase
+    // 3a): an elementwise chain terminated by a single reduce, compiled to
+    // one kernel that evaluates the chain inside the reduce loop — the
+    // chain's intermediate never materializes. `strides` are per-lane in
+    // input-dim space; `dims` sorted ascending; `shape` is the reduced
+    // shape with keepdims applied.
+    FusedReduce {
+        inputs: Vec<Arc<Node>>,
+        strides: Vec<Vec<usize>>,
+        in_shape: Vec<usize>,
+        expr: fusion::Expr,
+        op: fusion::ReduceOp,
+        dims: Vec<usize>,
+        keepdims: bool,
+        shape: Vec<usize>,
+    },
     StopGradient {
         a: Arc<Node>,
     },
@@ -1691,6 +1707,60 @@ impl Node {
                 (shape.clone(), first.dtype, first.device.clone())
             }
             NodeKind::FusedPick { of, .. } => (of.shape.clone(), of.dtype, of.device.clone()),
+            NodeKind::FusedReduce {
+                inputs,
+                strides,
+                in_shape,
+                dims,
+                keepdims,
+                shape,
+                ..
+            } => {
+                if inputs.is_empty() {
+                    return Err("fused reduce: at least one input lane is required".to_string());
+                }
+                if strides.len() != inputs.len() {
+                    return Err(format!(
+                        "fused reduce: got {} stride entries for {} inputs",
+                        strides.len(),
+                        inputs.len()
+                    ));
+                }
+                if dims.is_empty()
+                    || dims.iter().any(|&d| d >= in_shape.len())
+                    || !dims.windows(2).all(|w| w[0] < w[1])
+                {
+                    return Err(format!(
+                        "fused reduce: dims {dims:?} are not sorted unique dims of {in_shape:?}"
+                    ));
+                }
+                if &reduced_shape(in_shape, dims, *keepdims) != shape {
+                    return Err(format!(
+                        "fused reduce: shape {shape:?} is not {in_shape:?} reduced over {dims:?} (keepdims {keepdims})"
+                    ));
+                }
+                let first = &inputs[0];
+                for (input, stride) in inputs.iter().zip(strides.iter()) {
+                    if input.dtype != first.dtype || !input.device.same_device(&first.device) {
+                        return Err(
+                            "fused reduce: all inputs must share dtype and device".to_string()
+                        );
+                    }
+                    if fusion::lane_strides(&input.shape, in_shape).as_ref() != Some(stride) {
+                        return Err(format!(
+                            "fused reduce: input shape {:?} does not broadcast to {:?} with strides {stride:?}",
+                            input.shape, in_shape
+                        ));
+                    }
+                }
+                if !first.dtype.is_float() {
+                    return Err(format!(
+                        "fused reduce: dtype must be floating point, got {:?}",
+                        first.dtype
+                    ));
+                }
+                (shape.clone(), first.dtype, first.device.clone())
+            }
         };
         Ok(Arc::new(Node {
             id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
@@ -2541,6 +2611,7 @@ fn node_children(kind: &NodeKind) -> Vec<Arc<Node>> {
         NodeKind::SgdOut { step, .. } => vec![step.clone()],
         NodeKind::FusedElementwise { inputs, .. } => inputs.clone(),
         NodeKind::FusedElementwiseMulti { inputs, .. } => inputs.clone(),
+        NodeKind::FusedReduce { inputs, .. } => inputs.clone(),
         NodeKind::FusedPick { of, .. } => vec![of.clone()],
     }
 }
@@ -2938,6 +3009,25 @@ fn remap_children(kind: &NodeKind, f: &dyn Fn(&Arc<Node>) -> Arc<Node>) -> NodeK
         NodeKind::FusedPick { of, index } => NodeKind::FusedPick {
             of: f(of),
             index: *index,
+        },
+        NodeKind::FusedReduce {
+            inputs,
+            strides,
+            in_shape,
+            expr,
+            op,
+            dims,
+            keepdims,
+            shape,
+        } => NodeKind::FusedReduce {
+            inputs: inputs.iter().map(|i| f(i)).collect(),
+            strides: strides.clone(),
+            in_shape: in_shape.clone(),
+            expr: expr.clone(),
+            op: *op,
+            dims: dims.clone(),
+            keepdims: *keepdims,
+            shape: shape.clone(),
         },
     }
 }
@@ -3786,6 +3876,34 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> candle_core::Result<Te
             .ok_or_else(|| {
                 candle_core::Error::Msg("fused pick: multi output missing".to_string())
             })?,
+        NodeKind::FusedReduce {
+            inputs,
+            strides,
+            in_shape,
+            expr,
+            op,
+            dims,
+            keepdims,
+            shape,
+        } => {
+            let ts: Vec<Tensor> = inputs
+                .iter()
+                .map(|i| ev.value(i.id))
+                .collect::<candle_core::Result<Vec<_>>>()?;
+            let first = &ts[0];
+            fusion::run_reduce(
+                *op,
+                expr,
+                &ts,
+                strides,
+                in_shape,
+                dims,
+                *keepdims,
+                shape,
+                first.dtype(),
+                &first.device(),
+            )?
+        }
     };
     Ok(output)
 }
@@ -4127,7 +4245,8 @@ mod autodiff {
             }
             NodeKind::FusedElementwise { .. }
             | NodeKind::FusedElementwiseMulti { .. }
-            | NodeKind::FusedPick { .. } => {
+            | NodeKind::FusedPick { .. }
+            | NodeKind::FusedReduce { .. } => {
                 Err("vmap: fused elementwise nodes are internal to evaluation".to_string())
             }
             _ => Ok(remap_children(&node.kind, f)),
@@ -4856,7 +4975,8 @@ mod autodiff {
                 }
                 NodeKind::FusedElementwise { .. }
                 | NodeKind::FusedElementwiseMulti { .. }
-                | NodeKind::FusedPick { .. } => {
+                | NodeKind::FusedPick { .. }
+                | NodeKind::FusedReduce { .. } => {
                     return Err(
                         "grad: fused elementwise nodes are internal to evaluation".to_string(),
                     );
@@ -5021,6 +5141,10 @@ fn fuse_roots(roots: &[Arc<Node>]) -> std::result::Result<Vec<Arc<Node>>, String
         // where(cmp(x, y), a, b): the comparison constructor, applied to
         // the comparison's two inputs. Logical children are [x, y, a, b].
         Select(Box<dyn Fn(E, E) -> E>),
+        // A reduce terminates the region feeding it (RFC 0007 phase 3a):
+        // the chain compiles into the reduce loop instead of
+        // materializing. Carries (op, dims, keepdims).
+        Reduce(fusion::ReduceOp, Vec<usize>, bool),
     }
     // An input qualifies when it broadcasts into the output shape
     // (right-aligned dims equal or 1; scalars included). Broadcast lanes
@@ -5139,6 +5263,18 @@ fn fuse_roots(roots: &[Arc<Node>]) -> std::result::Result<Vec<Arc<Node>>, String
                     _ => None,
                 };
                 cmp.map(OpT::Select)
+            }
+            NodeKind::Sum { dims, keepdims, .. } if !dims.is_empty() => {
+                Some(OpT::Reduce(fusion::ReduceOp::Sum, dims.clone(), *keepdims))
+            }
+            NodeKind::Mean { dims, keepdims, .. } if !dims.is_empty() => {
+                Some(OpT::Reduce(fusion::ReduceOp::Mean, dims.clone(), *keepdims))
+            }
+            NodeKind::Max { dims, keepdims, .. } if !dims.is_empty() => {
+                Some(OpT::Reduce(fusion::ReduceOp::Max, dims.clone(), *keepdims))
+            }
+            NodeKind::Min { dims, keepdims, .. } if !dims.is_empty() => {
+                Some(OpT::Reduce(fusion::ReduceOp::Min, dims.clone(), *keepdims))
             }
             _ => None,
         }
@@ -5446,6 +5582,65 @@ fn fuse_roots(roots: &[Arc<Node>]) -> std::result::Result<Vec<Arc<Node>>, String
                 region.expr = expr;
                 region.ops += 1;
                 open.insert(node.id, region);
+            }
+            Some(OpT::Reduce(op, mut dims, keepdims)) => {
+                let a = children[0].clone();
+                let in_shape = a.shape.clone();
+                dims.sort_unstable();
+                dims.dedup();
+                let rank = in_shape.len();
+                let guards_ok = !dims.is_empty()
+                    && dims.iter().all(|&d| d < rank)
+                    && dims.iter().map(|&d| in_shape[d]).product::<usize>() > 0
+                    && !(matches!(node.device, candle_core::Device::Metal(_)) && {
+                        let in_n: usize = in_shape.iter().product();
+                        let out_n: usize =
+                            reduced_shape(&in_shape, &dims, keepdims).iter().product();
+                        in_n > i32::MAX as usize || out_n > i32::MAX as usize
+                    });
+                match open.remove(&a.id) {
+                    Some(region) if guards_ok && !region.inputs.is_empty() => {
+                        let strides: Option<Vec<Vec<usize>>> = region
+                            .inputs
+                            .iter()
+                            .map(|lane| fusion::lane_strides(&lane.shape, &in_shape))
+                            .collect();
+                        match strides {
+                            Some(strides) => {
+                                let fused = Node::new(NodeKind::FusedReduce {
+                                    inputs: region.inputs,
+                                    strides,
+                                    in_shape: in_shape.clone(),
+                                    expr: region.expr,
+                                    op,
+                                    dims: dims.clone(),
+                                    keepdims,
+                                    shape: reduced_shape(&in_shape, &dims, keepdims),
+                                })?;
+                                map.insert(node.id, fused);
+                            }
+                            None => {
+                                emit_region(&a, region, &mut map)?;
+                                let rebuilt = remap_children(&node.kind, &|ch| {
+                                    map.get(&ch.id).cloned().unwrap_or_else(|| ch.clone())
+                                });
+                                map.insert(node.id, Node::new(rebuilt)?);
+                            }
+                        }
+                    }
+                    region => {
+                        // No single-consumer region to compile into the
+                        // reduce loop (or a degenerate reduce): emit the
+                        // region plainly if one stayed open and rebuild.
+                        if let Some(r) = region {
+                            emit_region(&a, r, &mut map)?;
+                        }
+                        let rebuilt = remap_children(&node.kind, &|ch| {
+                            map.get(&ch.id).cloned().unwrap_or_else(|| ch.clone())
+                        });
+                        map.insert(node.id, Node::new(rebuilt)?);
+                    }
+                }
             }
         }
     }

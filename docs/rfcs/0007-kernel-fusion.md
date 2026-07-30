@@ -1,6 +1,6 @@
 # RFC 0007: True Kernel Fusion
 
-- **Status**: Implemented (phases 1–2; phase 3 recorded, not scheduled)
+- **Status**: Implemented (phases 1–2; phase 3a in progress, 3b recorded)
 
 **Implementation notes (updated)**: the elementwise op set covers
 `Add/Sub/Mul/Div/Min/Max/Neg/Sqrt/Exp/Log/Sin/Cos/Tanh/Abs/Erf/Floor/Ceil/Round`
@@ -106,12 +106,54 @@ the IR, sharing common subexpressions), so `backward` emits another
 forward intermediates retained for backward beyond the region inputs
 (this is also the memory win for activation-function chains).
 
-### Phase 3 (recorded, not scheduled): reduction fusion
+### Phase 3: reduction fusion
 
-Fused softmax/layernorm-style kernels (elementwise + reduction in one
-kernel) need different machinery (tile/shared-memory codegen) and are
-out of scope here. Matmul-adjacent fusion (XLA territory) is a
-non-goal.
+Split into a general mechanism (3a) and optional specializations (3b).
+
+**Phase 3a: fused-reduce regions (the general mechanism).** Reductions
+(`Sum`/`Mean`/`Max`/`Min`) stop being hard barriers and become region
+*terminators*: a region is an elementwise chain with an optional single
+trailing reduce over fixed dims. `sum(exp(x - max(x)))` compiles to one
+kernel — one thread per output element running a `Range` loop over the
+reduce extent, evaluating the elementwise expression per step through the
+existing broadcast-lane stride machinery, folding into an accumulator
+(ug SSA `DefineAcc`/`Range`; CPU interpreter gets a nested loop).
+Consumers of the reduced result read it as a broadcast lane (phase-2
+machinery unchanged), so shared elementwise prefixes are *recomputed*
+through lanes rather than materialized: softmax forward runs three
+kernels with zero full-size intermediates, and the same holds for any
+`Reduce(elementwise-chain)` pattern — `sum(x*y)`, variance, logsumexp,
+the `sum(g*y)` adjoints in backward graphs. Autodiff needs no new
+machinery: the adjoint of `reduce(f(lanes))` is an elementwise
+expression per lane (`g * f'_i(lanes)` for sum/mean; a masked select for
+max/min), i.e. an ordinary fused region over the broadcast gradient.
+A cooperative `ReduceLocal` lowering (threadgroup-per-row tree reduce)
+is a follow-up optimization for the few-rows/large-extent shape; the
+scalar loop is the correct-by-construction baseline. Once the region
+reduce covers all dims/keepdims combinations, routing *all* reductions
+through it retires the candle Metal reduce path (and its rank>4
+non-trailing-dim bug class). Numerics: tree/sequential fold order
+differs from candle's reduce, so parity tests use tolerances rather than
+bitwise equality.
+
+**Phase 3b (recorded, not scheduled): single-kernel specializations.**
+Softmax/layernorm in *one* kernel needs multi-stage tile codegen
+(reduce, barrier, recompute from registers/shared, reduce again, write —
+the flash-attention staging). The ug SSA vocabulary (`ReduceLocal`,
+`DefineLocal`, `Barrier`, `Range`) already expresses it; what does not
+exist is an optimizer that *chooses* the staging. ug's own
+`LazyBuffer`/`Schedule` was evaluated and rejected as a shortcut: its
+launch heuristic ignores reduce dims (explicit TODO upstream), the
+cooperative path has no strided loop for extents beyond the block width
+(large-vocab softmax degrades to O(V²) per row), and its multi-consumer
+dedup rule materializes exactly the shared subtrees single-kernel
+fusion must inline. If profiling after 3a shows launch overhead
+dominating, handwritten `Softmax`/`LayerNorm` kernels (written directly
+against the SSA, the `SgdStep` precedent: semantic op in TS, execution
+strategy native) are the targeted fix — and the same staging is the core
+loop of any future flash-attention kernel.
+
+Matmul-adjacent fusion (XLA territory) remains a non-goal.
 
 ## Numerics
 
@@ -140,6 +182,7 @@ dependency. The fallback path is tested by forcing the cache to miss.
 
 - Automatic discovery of fusion regions in user graphs (phase 2 is a
   defined pass, not a heuristic search).
-- Fusing across reductions or matmuls (phase 3 / never).
+- Fusing *across* reductions (multi-stage tile codegen — phase 3b is the
+  recorded exception) or matmuls (never).
 - Exposing the IR in the TypeScript API — fusion is an implementation
   detail of the native backend.
