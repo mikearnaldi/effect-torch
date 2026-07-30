@@ -4,7 +4,7 @@ import * as fs from "node:fs"
 import * as os from "node:os"
 import * as path from "node:path"
 import { Gradient, Loss, Model, Optimizer, Tensor } from "../src/index.ts"
-import { deep, floats, onDevices, type TestDevice } from "./utils/devices.ts"
+import { deep, floats, onDevices } from "./utils/devices.ts"
 
 const tmpdir = Effect.sync(() => fs.mkdtempSync(path.join(os.tmpdir(), "effect-torch-")))
 
@@ -28,7 +28,7 @@ const handForward = (
     return yield* Tensor.sigmoid(yield* Tensor.add(yield* Tensor.matmul(h, w2), b2))
   })
 
-onDevices("Model", (device: TestDevice) => (it) => {
+onDevices("Model", () => (it) => {
   describe("validation", () => {
     it.effect("linear rejects an empty name", () =>
       Effect.gen(function* () {

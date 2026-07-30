@@ -2,7 +2,7 @@ import { describe, expect } from "@effect/vitest"
 import * as assert from "@effect/vitest/utils"
 import { Effect } from "effect"
 import { Device, Gradient, Loss, Tensor } from "../src/index.ts"
-import { floats, GRADCHECK_EPS, GRADCHECK_TOL, onDevices, TOL, type TestDevice } from "./utils/devices.ts"
+import { floats, GRADCHECK_EPS, GRADCHECK_TOL, onDevices, TOL } from "./utils/devices.ts"
 
 const i64 = (data: ReadonlyArray<bigint>, shape?: ReadonlyArray<number>) =>
   Tensor.fromTypedArray(new BigInt64Array(data), shape)
@@ -30,7 +30,7 @@ const gradcheck = (
     }
   })
 
-onDevices("Loss", (device: TestDevice) => (it) => {
+onDevices("Loss", () => (it) => {
   const f32 = (data: ReadonlyArray<number>, shape?: ReadonlyArray<number>) =>
     Tensor.fromTypedArray(floats(data), shape)
   describe("values", () => {

@@ -2,7 +2,7 @@ import { describe, expect } from "@effect/vitest"
 import * as assert from "@effect/vitest/utils"
 import { Effect } from "effect"
 import { Gradient, Loss, Optimizer, LearningRate, Tensor } from "../src/index.ts"
-import { floats, onDevices, TOL, type TestDevice } from "./utils/devices.ts"
+import { floats, onDevices, TOL } from "./utils/devices.ts"
 
 const values = (t: Tensor.Any) => Tensor.toNumberArray(t)
 
@@ -23,7 +23,7 @@ const runStep = <S>(
     }
   })
 
-onDevices("Optimizer", (device: TestDevice) => (it) => {
+onDevices("Optimizer", () => (it) => {
   const f32 = (data: ReadonlyArray<number>, shape?: ReadonlyArray<number>) =>
     Tensor.fromTypedArray(floats(data), shape)
   const closeTo = (actual: Array<number>, expected: ReadonlyArray<number>, t = TOL) => {

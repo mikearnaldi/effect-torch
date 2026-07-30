@@ -2,7 +2,7 @@ import { describe, expect } from "@effect/vitest"
 import * as assert from "@effect/vitest/utils"
 import { Effect } from "effect"
 import { Gradient, Tensor } from "../src/index.ts"
-import { floats, GRADCHECK_EPS, GRADCHECK_TOL, onDevices, TOL, type TestDevice } from "./utils/devices.ts"
+import { floats, GRADCHECK_EPS, GRADCHECK_TOL, onDevices, TOL } from "./utils/devices.ts"
 
 const values = (t: Tensor.Any) => Tensor.toNumberArray(t)
 
@@ -41,7 +41,7 @@ const reference = (
 // deterministic, asymmetric values
 const pattern = (n: number): Array<number> => Array.from({ length: n }, (_, i) => ((i * 7 + 3) % 13 - 6) / 4)
 
-onDevices("Attention", (device: TestDevice) => (it) => {
+onDevices("Attention", () => (it) => {
   const f32 = (data: ReadonlyArray<number>, shape: ReadonlyArray<number>) =>
     Tensor.fromTypedArray(floats(data), shape)
 

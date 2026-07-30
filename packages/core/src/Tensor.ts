@@ -2902,7 +2902,7 @@ const convTranspose2dImpl = (
         })
     })
     const cIn = self.shape[1]
-    const [wIn, cOutPerGroup, kh, kw] = weight.shape
+    const [wIn, , kh, kw] = weight.shape
     const groups = opts.groups
     if (wIn !== cIn) {
       return yield* new TensorError({

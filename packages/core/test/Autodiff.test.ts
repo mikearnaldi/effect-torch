@@ -2,7 +2,7 @@ import { describe, expect } from "@effect/vitest"
 import * as assert from "@effect/vitest/utils"
 import { Effect, Exit } from "effect"
 import { Device, Gradient, Loss, Tensor } from "../src/index.ts"
-import { deep, floatDtype, floats, GRADCHECK_EPS, GRADCHECK_TOL, onDevices, TOL, type TestDevice } from "./utils/devices.ts"
+import { deep, floatDtype, floats, GRADCHECK_EPS, GRADCHECK_TOL, onDevices, TOL } from "./utils/devices.ts"
 
 const values = (t: Tensor.Any) => Tensor.toNumberArray(t)
 
@@ -31,7 +31,7 @@ const gradcheck = (f: ScalarFn, input: ReadonlyArray<number>, shape: ReadonlyArr
     }
   })
 
-onDevices("Autodiff", (device: TestDevice) => (it) => {
+onDevices("Autodiff", () => (it) => {
   const f32 = (data: ReadonlyArray<number>, shape?: ReadonlyArray<number>) =>
     Tensor.fromTypedArray(floats(data), shape)
   describe("gradcheck (finite differences)", () => {

@@ -77,7 +77,6 @@ const TEMPERATURE = 0.8
 const chars = [...new Set(CORPUS)].sort()
 const vocabSize = chars.length
 const encode = (text: string): Array<number> => text.split("").map((c) => chars.indexOf(c))
-const decode = (ids: ReadonlyArray<number>): string => ids.map((i) => chars[i]).join("")
 const data = encode(CORPUS)
 
 interface Gpt {

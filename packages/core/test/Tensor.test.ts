@@ -2,12 +2,12 @@ import { describe, expect } from "@effect/vitest"
 import * as assert from "@effect/vitest/utils"
 import { Effect, Exit } from "effect"
 import { Gradient, Loss, Tensor } from "../src/index.ts"
-import { deep, floatDtype, floats, onDevices, TOL, type TestDevice } from "./utils/devices.ts"
+import { deep, floatDtype, floats, onDevices, TOL } from "./utils/devices.ts"
 
 const values = (t: Tensor.Any) =>
   Effect.map(Tensor.toTypedArray(t), (arr) => Array.from<number | bigint>(arr).map(Number))
 
-onDevices("Tensor", (device: TestDevice) => (it) => {
+onDevices("Tensor", () => (it) => {
   describe("constructors", () => {
     it.effect("zeros/ones/full produce the right values and dtype", () =>
       Effect.gen(function* () {

@@ -4,14 +4,14 @@ import * as fs from "node:fs"
 import * as os from "node:os"
 import * as path from "node:path"
 import { Gradient, Optimizer, Tensor } from "../src/index.ts"
-import { floats, onDevices, type TestDevice } from "./utils/devices.ts"
+import { floats, onDevices } from "./utils/devices.ts"
 
 const tmpdir = Effect.sync(() => fs.mkdtempSync(path.join(os.tmpdir(), "effect-torch-")))
 
 const values = (t: Tensor.Any) =>
   Effect.map(Tensor.toTypedArray(t), (arr) => Array.from<number | bigint>(arr).map(Number))
 
-onDevices("Checkpoint", (device: TestDevice) => (it) => {
+onDevices("Checkpoint", () => (it) => {
   it.effect("round-trips tensors of every dtype", () =>
     Effect.gen(function* () {
       const dir = yield* tmpdir

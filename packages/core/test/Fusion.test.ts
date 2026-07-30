@@ -2,7 +2,7 @@ import { describe } from "@effect/vitest"
 import * as assert from "@effect/vitest/utils"
 import { Effect } from "effect"
 import { Gradient, Loss, Tensor } from "../src/index.ts"
-import { floats, onDevices, TOL, type TestDevice } from "./utils/devices.ts"
+import { floats, onDevices, TOL } from "./utils/devices.ts"
 
 const values = (t: Tensor.Any) =>
   Effect.map(Tensor.toTypedArray(t), (arr) => Array.from<number | bigint>(arr).map(Number))
@@ -29,7 +29,7 @@ const withFusion = <A, E, R>(enabled: boolean, effect: Effect.Effect<A, E, R>): 
       })
   )
 
-onDevices("Fusion", (device: TestDevice) => (it) => {
+onDevices("Fusion", () => (it) => {
   // fused and unfused paths agree up to float rounding, except erf (an
   // A&S approximation, ~1.5e-7: Metal has no erf) and pow with common
   // exponents (lowered to multiplies/sqrt instead of powf)
