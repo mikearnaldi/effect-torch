@@ -2357,15 +2357,15 @@ export const oneHot = (
   })
 
 /**
- * Fused cross entropy between class logits of shape `[..., classes]` and
+ * Cross entropy between class logits of shape `[..., classes]` and
  * integer class-index targets of the leading shape: the scalar mean of
  * `logsumexp(logits) - logits[target]` over active positions, computed
  * stably (max subtraction) without materializing softmax intermediates or a
  * one-hot tensor in the graph. Positions where the target equals
  * `ignoreIndex` (default `-100`) contribute zero loss and zero gradient and
  * are excluded from the mean. Evaluation fails when every position is
- * ignored or an active target is out of range. The fused backward node is
- * not second-order differentiable.
+ * ignored or an active target is out of range. The backward is not
+ * second-order differentiable.
  *
  * @since 0.1.0
  * @category losses

@@ -329,16 +329,18 @@ onDevices("Optimizer", (device: TestDevice) => (it) => {
       })
     )
 
-    it.effect("fused and composed momentum sgd produce identical trajectories", () =>
+    it.effect("sgd matches a reference update composed from tensor ops", () =>
       Effect.gen(function* () {
         const x = yield* Tensor.fromTypedArray(floats([1, 1, 2, 1, 3, 1, 4, 1]), [4, 2])
         const y = yield* Tensor.fromTypedArray(floats([2, 3, 4, 5]), [4, 1])
-        const run = (fused: boolean, config: { dampening?: number; nesterov?: boolean; weightDecay?: number }) =>
+        const lr = 0.05
+        const momentum = 0.9
+        const run = (config: { dampening?: number; nesterov?: boolean; weightDecay?: number }) =>
           Effect.gen(function* () {
             let params: ReadonlyArray<Tensor.Any> = [
               yield* Tensor.fromTypedArray(floats([0.5, -0.5]))
             ]
-            const optimizer = Optimizer.sgd({ lr: 0.05, momentum: 0.9, fused, ...config })
+            const optimizer = Optimizer.sgd({ lr, momentum, ...config })
             let state = yield* optimizer.init(params)
             for (let i = 0; i < 20; i++) {
               const pred = yield* Tensor.matmul(x, yield* Tensor.reshape(params[0], [2, 1]))
@@ -352,6 +354,44 @@ onDevices("Optimizer", (device: TestDevice) => (it) => {
               velocity: yield* values(state.velocity![0])
             }
           })
+        const reference = (config: { dampening?: number; nesterov?: boolean; weightDecay?: number }) =>
+          Effect.gen(function* () {
+            const dampening = config.dampening ?? 0
+            const nesterov = config.nesterov ?? false
+            const weightDecay = config.weightDecay ?? 0
+            let params: ReadonlyArray<Tensor.Any> = [
+              yield* Tensor.fromTypedArray(floats([0.5, -0.5]))
+            ]
+            let velocity: Tensor.Any | null = null
+            for (let i = 0; i < 20; i++) {
+              const pred = yield* Tensor.matmul(x, yield* Tensor.reshape(params[0], [2, 1]))
+              const loss = yield* Loss.mse(pred, y)
+              const [grad] = yield* Gradient.grad(loss, params)
+              let g: Tensor.Any = grad
+              if (weightDecay !== 0) {
+                g = yield* Tensor.add(g, yield* Tensor.mul(params[0], weightDecay))
+              }
+              const nextVelocity: Tensor.Any = velocity === null
+                ? g
+                : yield* Tensor.add(
+                    yield* Tensor.mul(velocity, momentum),
+                    yield* Tensor.mul(g, 1 - dampening)
+                  )
+              const used: Tensor.Any = nesterov
+                ? yield* Tensor.add(g, yield* Tensor.mul(nextVelocity, momentum))
+                : nextVelocity
+              const [nextParam, v] = yield* Tensor.compute([
+                yield* Tensor.sub(params[0], yield* Tensor.mul(used, lr)),
+                nextVelocity
+              ])
+              params = [nextParam]
+              velocity = v
+            }
+            return {
+              w: yield* values(params[0]),
+              velocity: yield* values(velocity!)
+            }
+          })
         for (const config of [
           {},
           { dampening: 0.3 },
@@ -359,26 +399,26 @@ onDevices("Optimizer", (device: TestDevice) => (it) => {
           { weightDecay: 0.01 },
           { dampening: 0.1, weightDecay: 0.01 }
         ]) {
-          const fusedRun = yield* run(true, config)
-          const composedRun = yield* run(false, config)
+          const optimizerRun = yield* run(config)
+          const referenceRun = yield* reference(config)
           for (let i = 0; i < 2; i++) {
-            expect(Math.abs(fusedRun.w[i] - composedRun.w[i])).toBeLessThan(TOL)
-            expect(Math.abs(fusedRun.velocity[i] - composedRun.velocity[i])).toBeLessThan(TOL)
+            expect(Math.abs(optimizerRun.w[i] - referenceRun.w[i])).toBeLessThan(TOL)
+            expect(Math.abs(optimizerRun.velocity[i] - referenceRun.velocity[i])).toBeLessThan(TOL)
           }
         }
       })
     )
 
-    it.effect("fused and composed adamW produce identical trajectories", () =>
+    it.effect("adamW matches a reference update composed from tensor ops", () =>
       Effect.gen(function* () {
         const x = yield* Tensor.fromTypedArray(floats([1, 1, 2, 1, 3, 1, 4, 1]), [4, 2])
         const y = yield* Tensor.fromTypedArray(floats([2, 3, 4, 5]), [4, 1])
-        const run = (fused: boolean) =>
+        const run = () =>
           Effect.gen(function* () {
             let params: ReadonlyArray<Tensor.Any> = [
               yield* Tensor.fromTypedArray(floats([0, 0]))
             ]
-            const optimizer = Optimizer.adamW({ lr: 0.05, fused })
+            const optimizer = Optimizer.adamW({ lr: 0.05 })
             let state = yield* optimizer.init(params)
             for (let i = 0; i < 20; i++) {
               const pred = yield* Tensor.matmul(x, yield* Tensor.reshape(params[0], [2, 1]))
@@ -393,12 +433,56 @@ onDevices("Optimizer", (device: TestDevice) => (it) => {
               v: yield* values(state.v[0])
             }
           })
-        const fusedRun = yield* run(true)
-        const composedRun = yield* run(false)
+        const reference = () =>
+          Effect.gen(function* () {
+            const lr = 0.05
+            const beta1 = 0.9
+            const beta2 = 0.999
+            const eps = 1e-8
+            const weightDecay = 0.01
+            let params: ReadonlyArray<Tensor.Any> = [
+              yield* Tensor.fromTypedArray(floats([0, 0]))
+            ]
+            let m: Tensor.Any = yield* Tensor.zeros([2])
+            let v: Tensor.Any = yield* Tensor.zeros([2])
+            for (let t = 1; t <= 20; t++) {
+              const pred = yield* Tensor.matmul(x, yield* Tensor.reshape(params[0], [2, 1]))
+              const loss = yield* Loss.mse(pred, y)
+              const [grad] = yield* Gradient.grad(loss, params)
+              const nextM = yield* Tensor.add(
+                yield* Tensor.mul(m, beta1),
+                yield* Tensor.mul(grad, 1 - beta1)
+              )
+              const nextV = yield* Tensor.add(
+                yield* Tensor.mul(v, beta2),
+                yield* Tensor.mul(yield* Tensor.mul(grad, grad), 1 - beta2)
+              )
+              const mHat = yield* Tensor.mul(nextM, 1 / (1 - Math.pow(beta1, t)))
+              const vHat = yield* Tensor.mul(nextV, 1 / (1 - Math.pow(beta2, t)))
+              const denom = yield* Tensor.add(yield* Tensor.sqrt(vHat), eps)
+              const adjusted = yield* Tensor.mul(yield* Tensor.div(mHat, denom), lr)
+              const base = yield* Tensor.mul(params[0], 1 - lr * weightDecay)
+              const [nextParam, mOut, vOut] = yield* Tensor.compute([
+                yield* Tensor.sub(base, adjusted),
+                nextM,
+                nextV
+              ])
+              params = [nextParam]
+              m = mOut
+              v = vOut
+            }
+            return {
+              w: yield* values(params[0]),
+              m: yield* values(m),
+              v: yield* values(v)
+            }
+          })
+        const optimizerRun = yield* run()
+        const referenceRun = yield* reference()
         for (let i = 0; i < 2; i++) {
-          expect(Math.abs(fusedRun.w[i] - composedRun.w[i])).toBeLessThan(TOL)
-          expect(Math.abs(fusedRun.m[i] - composedRun.m[i])).toBeLessThan(TOL)
-          expect(Math.abs(fusedRun.v[i] - composedRun.v[i])).toBeLessThan(TOL)
+          expect(Math.abs(optimizerRun.w[i] - referenceRun.w[i])).toBeLessThan(TOL)
+          expect(Math.abs(optimizerRun.m[i] - referenceRun.m[i])).toBeLessThan(TOL)
+          expect(Math.abs(optimizerRun.v[i] - referenceRun.v[i])).toBeLessThan(TOL)
         }
       })
     )

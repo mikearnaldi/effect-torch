@@ -34,9 +34,7 @@ import * as Gradient from "./Gradient.ts"
 import * as Tensor from "./Tensor.ts"
 
 /**
- * Configuration for stochastic gradient descent. `fused` (default `true`)
- * computes each momentum update as a single native node instead of several
- * graph nodes — identical numerics, smaller graphs.
+ * Configuration for stochastic gradient descent.
  *
  * @since 0.1.0
  * @category models
@@ -47,7 +45,6 @@ export interface SgdConfig {
   readonly dampening?: number
   readonly nesterov?: boolean
   readonly weightDecay?: number
-  readonly fused?: boolean
 }
 
 /**
@@ -63,9 +60,7 @@ export interface SgdState {
 
 /**
  * Configuration for Adam. All fields default to the standard values
- * (`lr = 1e-3`, `beta1 = 0.9`, `beta2 = 0.999`, `eps = 1e-8`). `fused`
- * (default `true`) computes each parameter's update as a single native
- * node instead of ~10 graph nodes — identical numerics, smaller graphs.
+ * (`lr = 1e-3`, `beta1 = 0.9`, `beta2 = 0.999`, `eps = 1e-8`).
  *
  * @since 0.1.0
  * @category models
@@ -75,7 +70,6 @@ export interface AdamConfig {
   readonly beta1?: number
   readonly beta2?: number
   readonly eps?: number
-  readonly fused?: boolean
 }
 
 /**
@@ -233,7 +227,6 @@ export const sgd = (config: SgdConfig): Optimizer<SgdState> => {
   const dampening = config.dampening ?? 0
   const nesterov = config.nesterov ?? false
   const weightDecay = config.weightDecay ?? 0
-  const fused = config.fused ?? true
   if (!Number.isFinite(lr) || lr <= 0) {
     throw new Error(`sgd: lr must be positive, got ${lr}`)
   }
@@ -260,38 +253,29 @@ export const sgd = (config: SgdConfig): Optimizer<SgdState> => {
       if (momentum === 0) {
         return { param: yield* Tensor.sub(param, yield* Tensor.mul(g, lr)), velocity: null }
       }
-      if (fused) {
-        const step = yield* Effect.try({
-          try: () =>
-            param.lazy.sgdStep(
-              grad.lazy,
-              (velocity ?? param).lazy,
-              velocity === null,
-              lr,
-              momentum,
-              dampening,
-              nesterov,
-              weightDecay
-            ),
-          catch: (error) =>
-            new Tensor.TensorError({
-              op: "sgd",
-              message: error instanceof Error ? error.message : String(error)
-            })
-        })
-        const makeOut = (index: number): Tensor.Lazy => {
-          const handle = step.sgdOut(index)
-          return Tensor.makeLazy(handle, param.shape, param.dtype, param.device)
-        }
-        return { param: makeOut(0), velocity: makeOut(1) }
+      const step = yield* Effect.try({
+        try: () =>
+          param.lazy.sgdStep(
+            grad.lazy,
+            (velocity ?? param).lazy,
+            velocity === null,
+            lr,
+            momentum,
+            dampening,
+            nesterov,
+            weightDecay
+          ),
+        catch: (error) =>
+          new Tensor.TensorError({
+            op: "sgd",
+            message: error instanceof Error ? error.message : String(error)
+          })
+      })
+      const makeOut = (index: number): Tensor.Lazy => {
+        const handle = step.sgdOut(index)
+        return Tensor.makeLazy(handle, param.shape, param.dtype, param.device)
       }
-      const nextVelocity = velocity === null
-        ? g
-        : yield* Tensor.add(yield* Tensor.mul(velocity, momentum), yield* Tensor.mul(g, 1 - dampening))
-      const used = nesterov
-        ? yield* Tensor.add(g, yield* Tensor.mul(nextVelocity, momentum))
-        : nextVelocity
-      return { param: yield* Tensor.sub(param, yield* Tensor.mul(used, lr)), velocity: nextVelocity }
+      return { param: makeOut(0), velocity: makeOut(1) }
     })
 
   return {
@@ -330,11 +314,10 @@ interface ResolvedAdamConfig {
   readonly beta2: number
   readonly eps: number
   readonly weightDecay: number
-  readonly fused: boolean
 }
 
 const makeAdam = (op: string, config: ResolvedAdamConfig): Optimizer<AdamState> => {
-  const { lr, beta1, beta2, eps, weightDecay, fused } = config
+  const { lr, beta1, beta2, eps, weightDecay } = config
   if (!Number.isFinite(lr) || lr <= 0) {
     throw new Error(`${op}: lr must be positive, got ${lr}`)
   }
@@ -363,33 +346,20 @@ const makeAdam = (op: string, config: ResolvedAdamConfig): Optimizer<AdamState> 
     Tensor.TensorError
   > =>
     Effect.gen(function* () {
-      if (fused) {
-        const step = yield* Effect.try({
-          try: () =>
-            param.lazy.adamwStep(grad.lazy, m.lazy, v.lazy, lr, beta1, beta2, eps, weightDecay, t),
-          catch: (error) =>
-            new Tensor.TensorError({
-              op,
-              message: error instanceof Error ? error.message : String(error)
-            })
-        })
-        const makeOut = (index: number): Tensor.Lazy => {
-          const handle = step.adamwOut(index)
-          return Tensor.makeLazy(handle, param.shape, param.dtype, param.device)
-        }
-        return { param: makeOut(0), m: makeOut(1), v: makeOut(2) }
+      const step = yield* Effect.try({
+        try: () =>
+          param.lazy.adamwStep(grad.lazy, m.lazy, v.lazy, lr, beta1, beta2, eps, weightDecay, t),
+        catch: (error) =>
+          new Tensor.TensorError({
+            op,
+            message: error instanceof Error ? error.message : String(error)
+          })
+      })
+      const makeOut = (index: number): Tensor.Lazy => {
+        const handle = step.adamwOut(index)
+        return Tensor.makeLazy(handle, param.shape, param.dtype, param.device)
       }
-      const nextM = yield* Tensor.add(yield* Tensor.mul(m, beta1), yield* Tensor.mul(grad, 1 - beta1))
-      const nextV = yield* Tensor.add(
-        yield* Tensor.mul(v, beta2),
-        yield* Tensor.mul(yield* Tensor.mul(grad, grad), 1 - beta2)
-      )
-      const mHat = yield* Tensor.mul(nextM, 1 / (1 - Math.pow(beta1, t)))
-      const vHat = yield* Tensor.mul(nextV, 1 / (1 - Math.pow(beta2, t)))
-      const denom = yield* Tensor.add(yield* Tensor.sqrt(vHat), eps)
-      const adjusted = yield* Tensor.mul(yield* Tensor.div(mHat, denom), lr)
-      const base = weightDecay === 0 ? param : yield* Tensor.mul(param, 1 - lr * weightDecay)
-      return { param: yield* Tensor.sub(base, adjusted), m: nextM, v: nextV }
+      return { param: makeOut(0), m: makeOut(1), v: makeOut(2) }
     })
 
   return {
@@ -447,8 +417,7 @@ export const adam = (config: AdamConfig = {}): Optimizer<AdamState> =>
     beta1: config.beta1 ?? 0.9,
     beta2: config.beta2 ?? 0.999,
     eps: config.eps ?? 1e-8,
-    weightDecay: 0,
-    fused: config.fused ?? true
+    weightDecay: 0
   })
 
 /**
@@ -465,8 +434,7 @@ export const adamW = (config: AdamWConfig = {}): Optimizer<AdamState> =>
     beta1: config.beta1 ?? 0.9,
     beta2: config.beta2 ?? 0.999,
     eps: config.eps ?? 1e-8,
-    weightDecay: config.weightDecay ?? 0.01,
-    fused: config.fused ?? true
+    weightDecay: config.weightDecay ?? 0.01
   })
 
 /**
