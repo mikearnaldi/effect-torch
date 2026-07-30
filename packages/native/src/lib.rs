@@ -7,6 +7,7 @@ use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 mod fusion;
+mod flash;
 
 fn to_napi_err(err: candle_core::Error) -> Error {
     Error::new(Status::GenericFailure, err.to_string())
@@ -1012,12 +1013,18 @@ enum NodeKind {
     },
     // Closed-form backward: recomputes P = softmax(scores) from q/k and
     // produces (dq, dk, dv) in one eval; consumers read them through
-    // SdpaBackwardOut. Not differentiable (no second-order).
+    // SdpaBackwardOut. On Metal the forward's flash kernel stashes the
+    // per-row logsumexp in the evaluator, and this node runs the
+    // chunked-recompute backward against it (bounded memory); elsewhere
+    // it recomputes P with composed candle ops. `fwd` is the Sdpa node
+    // this is the adjoint of (reads its output and stashed L). Not
+    // differentiable (no second-order).
     SdpaBackward {
         q: Arc<Node>,
         k: Arc<Node>,
         v: Arc<Node>,
         g: Arc<Node>,
+        fwd: Arc<Node>,
         scale: f64,
         causal: bool,
     },
@@ -1491,8 +1498,11 @@ impl Node {
                 let out = sdpa_check("sdpa", q, k, v)?;
                 (out, q.dtype, q.device.clone())
             }
-            NodeKind::SdpaBackward { q, k, v, g, .. } => {
+            NodeKind::SdpaBackward { q, k, v, g, fwd, .. } => {
                 let out = sdpa_check("sdpa", q, k, v)?;
+                if !matches!(&fwd.kind, NodeKind::Sdpa { .. }) {
+                    return Err("sdpa backward: fwd must be an sdpa node".to_string());
+                }
                 if g.shape != out {
                     return Err(format!(
                         "sdpa backward: grad shape {:?} does not match the attention output shape {out:?}",
@@ -2792,8 +2802,8 @@ fn node_children(kind: &NodeKind) -> Vec<Arc<Node>> {
             logits, target, ..
         } => vec![logits.clone(), target.clone()],
         NodeKind::Sdpa { q, k, v, .. } => vec![q.clone(), k.clone(), v.clone()],
-        NodeKind::SdpaBackward { q, k, v, g, .. } => {
-            vec![q.clone(), k.clone(), v.clone(), g.clone()]
+        NodeKind::SdpaBackward { q, k, v, g, fwd, .. } => {
+            vec![q.clone(), k.clone(), v.clone(), g.clone(), fwd.clone()]
         }
         NodeKind::SdpaBackwardOut { of, .. } => vec![of.clone()],
         NodeKind::Conv1d { x, w, .. }
@@ -2985,6 +2995,7 @@ fn remap_children(kind: &NodeKind, f: &dyn Fn(&Arc<Node>) -> Arc<Node>) -> NodeK
             k,
             v,
             g,
+            fwd,
             scale,
             causal,
         } => NodeKind::SdpaBackward {
@@ -2992,6 +3003,7 @@ fn remap_children(kind: &NodeKind, f: &dyn Fn(&Arc<Node>) -> Arc<Node>) -> NodeK
             k: f(k),
             v: f(v),
             g: f(g),
+            fwd: f(fwd),
             scale: *scale,
             causal: *causal,
         },
@@ -3675,29 +3687,50 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> candle_core::Result<Te
             v,
             scale,
             causal,
-        } => sdpa_forward(
-            &ev.value(q.id)?,
-            &ev.value(k.id)?,
-            &ev.value(v.id)?,
-            *scale,
-            *causal,
-        )?,
+        } => {
+            let q = ev.value(q.id)?;
+            if flash::is_supported(&q) {
+                let (o, l) = flash::forward(&q, &ev.value(k.id)?, &ev.value(v.id)?, *scale, *causal)?;
+                // L rides the evaluator for the chunked backward; the
+                // node's own cache entry holds O.
+                ev.multi.insert(node.id, vec![o.clone(), l]);
+                o
+            } else {
+                sdpa_forward(&q, &ev.value(k.id)?, &ev.value(v.id)?, *scale, *causal)?
+            }
+        }
         NodeKind::SdpaBackward {
             q,
             k,
             v,
             g,
+            fwd,
             scale,
             causal,
         } => {
-            let (dq, dk, dv) = sdpa_backward(
-                &ev.value(q.id)?,
-                &ev.value(k.id)?,
-                &ev.value(v.id)?,
-                &ev.value(g.id)?,
-                *scale,
-                *causal,
-            )?;
+            let q = ev.value(q.id)?;
+            let o = ev.value(fwd.id)?;
+            let l = ev.multi.get(&fwd.id).and_then(|outs| outs.get(1)).cloned();
+            let (dq, dk, dv) = match l {
+                Some(l) if flash::is_supported(&q) => flash::backward(
+                    &q,
+                    &ev.value(k.id)?,
+                    &ev.value(v.id)?,
+                    &o,
+                    &l,
+                    &ev.value(g.id)?,
+                    *scale,
+                    *causal,
+                )?,
+                _ => sdpa_backward(
+                    &q,
+                    &ev.value(k.id)?,
+                    &ev.value(v.id)?,
+                    &ev.value(g.id)?,
+                    *scale,
+                    *causal,
+                )?,
+            };
             ev.multi.insert(node.id, vec![dq.clone(), dk, dv]);
             dq
         }
@@ -5157,6 +5190,7 @@ mod autodiff {
                         k: k.clone(),
                         v: v.clone(),
                         g: g.clone(),
+                        fwd: node.clone(),
                         scale: *scale,
                         causal: *causal,
                     })?;

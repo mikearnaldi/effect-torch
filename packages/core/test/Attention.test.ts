@@ -190,5 +190,74 @@ onDevices("Attention", (device: TestDevice) => (it) => {
         expect(e3._tag).toBe("TensorError")
       })
     )
+
+    it.effect("large multi-tile shapes with non-divisible dims match the reference (values and gradients)", () =>
+      Effect.gen(function* () {
+        const shape = [2, 4, 100, 64]
+        const n = shape.reduce((a, b) => a * b, 1)
+        const q = yield* f32(pattern(n), shape)
+        const k = yield* f32(pattern(n).map((x) => x * 0.7 + 0.1), shape)
+        const v = yield* f32(pattern(n).map((x) => x * -0.5 + 0.2), shape)
+        const scale = 1 / Math.sqrt(64)
+        for (const causal of [false, true]) {
+          const out = yield* Tensor.scaledDotProductAttention(q, k, v, { causal })
+          const expected = yield* reference(q, k, v, { scale, causal })
+          const [a, b] = [yield* values(out), yield* values(expected)]
+          a.forEach((x, i) =>
+            assert.assertTrue(close(x, b[i]), `out[${i}] (causal ${causal}): ${x} != ${b[i]}`))
+          const loss = yield* Tensor.sum(yield* Tensor.mul(out, v))
+          const grads = yield* Tensor.compute(yield* Gradient.grad(loss, [q, k, v]))
+          const lossRef = yield* Tensor.sum(
+            yield* Tensor.mul(yield* reference(q, k, v, { scale, causal }), v)
+          )
+          const expected_ = yield* Tensor.compute(yield* Gradient.grad(lossRef, [q, k, v]))
+          for (let j = 0; j < 3; j++) {
+            const gv = yield* values(grads[j])
+            const ev = yield* values(expected_[j])
+            gv.forEach((x, i) =>
+              assert.assertTrue(close(x, ev[i]), `grad[${j}][${i}] (causal ${causal}): ${x} != ${ev[i]}`))
+          }
+        }
+      })
+    )
+
+    it.effect("value head dim differing from the key head dim", () =>
+      Effect.gen(function* () {
+        const q = yield* f32(pattern(2 * 5 * 8), [1, 2, 5, 8])
+        const k = yield* f32(pattern(2 * 5 * 8).map((x) => x * 0.7), [1, 2, 5, 8])
+        const v = yield* f32(pattern(2 * 5 * 6).map((x) => x * -0.5), [1, 2, 5, 6])
+        const scale = 1 / Math.sqrt(8)
+        for (const causal of [false, true]) {
+          const out = yield* Tensor.scaledDotProductAttention(q, k, v, { causal })
+          expect(out.shape).toEqual([1, 2, 5, 6])
+          const expected = yield* reference(q, k, v, { scale, causal })
+          const [a, b] = [yield* values(out), yield* values(expected)]
+          a.forEach((x, i) =>
+            assert.assertTrue(close(x, b[i]), `out[${i}] (causal ${causal}): ${x} != ${b[i]}`))
+        }
+      })
+    )
+
+    it.effect("large-magnitude scores exercise the online rescaling", () =>
+      Effect.gen(function* () {
+        // scores up to ~±60: exp overflow without max subtraction, and the
+        // running max must rescale across key tiles
+        const shape = [1, 2, 40, 16]
+        const n = shape.reduce((a, b) => a * b, 1)
+        const q = yield* f32(pattern(n).map((x) => x * 8), shape)
+        const k = yield* f32(pattern(n).map((x) => x * 8), shape)
+        const v = yield* f32(pattern(n).map((x) => x * -0.5 + 0.2), shape)
+        const scale = 1 / Math.sqrt(16)
+        for (const causal of [false, true]) {
+          const out = yield* Tensor.scaledDotProductAttention(q, k, v, { causal })
+          const expected = yield* reference(q, k, v, { scale, causal })
+          const [a, b] = [yield* values(out), yield* values(expected)]
+          a.forEach((x, i) => {
+            assert.assertTrue(Number.isFinite(x), `out[${i}] (causal ${causal}) is not finite: ${x}`)
+            assert.assertTrue(close(x, b[i]), `out[${i}] (causal ${causal}): ${x} != ${b[i]}`)
+          })
+        }
+      })
+    )
   })
 })
