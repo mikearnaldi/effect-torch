@@ -261,6 +261,31 @@ onDevices("Model", () => (it) => {
       })
     )
 
+    it.effect("positionEmbedding looks up rows 0..t-1 and ignores the input values", () =>
+      Effect.gen(function* () {
+        const model = yield* Model.positionEmbedding("wpe", 4, 2)
+        expect(model.names).toEqual(["wpe.weight"])
+        const [w] = yield* Tensor.compute(yield* model.init)
+        expect(w.shape).toEqual([4, 2])
+        const ids = yield* Tensor.fromTypedArray(new BigInt64Array([9n, 9n, 9n]), [1, 3])
+        const [out] = yield* Tensor.compute([yield* model.forward([w], ids)])
+        expect(out.shape).toEqual([3, 2])
+        const [byHand] = yield* Tensor.compute([
+          yield* Tensor.embedding(yield* Tensor.fromTypedArray(new BigInt64Array([0n, 1n, 2n]), [3]), {
+            weight: w
+          })
+        ])
+        deep(yield* values(out), yield* values(byHand))
+        const loss = yield* Tensor.sum(yield* model.forward([w], ids))
+        const [grad] = yield* Tensor.compute(yield* Gradient.grad(loss, [w]))
+        deep(yield* values(grad), [1, 1, 1, 1, 1, 1, 0, 0])
+        const tooLong = yield* Tensor.fromTypedArray(new BigInt64Array([0n, 0n, 0n, 0n, 0n]), [5])
+        const error = yield* Effect.flip(model.forward([w], tooLong))
+        expect(error._tag).toBe("ModelError")
+        expect(error.message).toContain("exceeds maxPositions")
+      })
+    )
+
     it.effect("layerNorm normalizes the trailing dimensions to unit statistics", () =>
       Effect.gen(function* () {
         const model = yield* Model.layerNorm("ln", 4)

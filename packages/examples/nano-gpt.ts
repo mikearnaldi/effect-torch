@@ -81,15 +81,12 @@ const encode = (text: string): Array<number> => text.split("").map((c) => chars.
 const data = encode(CORPUS)
 
 const createGpt = Effect.gen(function* () {
-  // token + position embeddings share the input: the position side maps
-  // token ids to their positions first
+  // token + position embeddings share the input (the position side
+  // reads only its length)
   const embeddings = yield* Model.merge(
     [
       yield* Model.embedding("wte", vocabSize, EMBED),
-      yield* Model.mapInput(
-        yield* Model.embedding("wpe", BLOCK, EMBED),
-        (idx) => Tensor.arange(idx.shape[idx.shape.length - 1], undefined, { dtype: "i64" })
-      )
+      yield* Model.positionEmbedding("wpe", BLOCK, EMBED)
     ],
     (x, y) => Tensor.add(x, y)
   )

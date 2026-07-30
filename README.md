@@ -330,6 +330,7 @@ that can fail returns an `Effect`: constructors validate into a
 | `Model.linear(name, in, out)` | `Effect` of a fully-connected layer, `randn * 1/√in` weight, zero bias |
 | `Model.conv1d` / `Model.conv2d(name, in, out, k, opts?)` | `Effect`s of convolution layers, fan-in-scaled weight, per-channel bias |
 | `Model.embedding(name, num, dim, opts?)` | `Effect` of an embedding lookup layer, unit-normal weight |
+| `Model.positionEmbedding(name, max, dim)` | `Effect` of a learned absolute position embedding; reads only the input's sequence length |
 | `Model.layerNorm(name, shape, { eps? })` | `Effect` of layer normalization over the trailing `shape` dims |
 | `Model.multiHeadAttention(name, embedDim, numHeads, { causal? })` | `Effect` of multi-head attention: wq/wk/wv/wo projections over `scaledDotProductAttention` |
 | `Model.tanh` / `sigmoid` / `relu` / `silu` / `mish` / `softplus` | `Effect`s of activations as parameterless models |

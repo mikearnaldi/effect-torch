@@ -337,6 +337,52 @@ export const embedding = (
   })
 
 /**
+ * A learned absolute position embedding (GPT-style `wpe`): looks up rows
+ * `0..t-1` of a `[maxPositions, embeddingDim]` table, where `t` is the
+ * input's last dimension — the input's values are ignored, only its
+ * sequence length matters. `names = ["<name>.weight"]`, initialized
+ * unit-normal. Fails with a {@link ModelError} on an empty name,
+ * non-positive counts, or an input whose sequence length exceeds
+ * `maxPositions`.
+ *
+ * @since 0.1.0
+ * @category constructors
+ */
+export const positionEmbedding = (
+  name: string,
+  maxPositions: number,
+  embeddingDim: number
+): Effect.Effect<Model, ModelError> =>
+  Effect.gen(function* () {
+    yield* checkName("positionEmbedding", name)
+    yield* checkPositiveInt("positionEmbedding", "maxPositions", maxPositions)
+    yield* checkPositiveInt("positionEmbedding", "embeddingDim", embeddingDim)
+    const names = [`${name}.weight`]
+    return {
+      names,
+      init: Effect.gen(function* () {
+        const weight = yield* Tensor.randn([maxPositions, embeddingDim])
+        return [weight] as const
+      }),
+      forward: (params, input) =>
+        Effect.gen(function* () {
+          yield* checkArity(name, names, params)
+          const t = input.shape.length === 0 ? 0 : input.shape[input.shape.length - 1]
+          if (t > maxPositions) {
+            return yield* new ModelError({
+              op: "positionEmbedding",
+              message: `${name}: sequence length ${t} exceeds maxPositions ${maxPositions}`
+            })
+          }
+          return yield* Tensor.embedding(
+            yield* Tensor.arange(t, undefined, { dtype: "i64" }),
+            { weight: params[0] }
+          )
+        })
+    }
+  })
+
+/**
  * A layer-normalization layer over the trailing `normalizedShape`
  * dimensions: `(x - mean) / sqrt(var + eps) * weight + bias` with the
  * biased variance and `eps` defaulting to `1e-5`.
@@ -746,8 +792,8 @@ export const residual = (model: Model): Effect.Effect<Model> =>
  * Transforms a model's input before it enters the sub-model:
  * `forward(params, input) = model.forward(params, f(input))`. Names and
  * init are the sub-model's. Use it for input derived from the raw
- * input's shape or values — position indexes from a sequence length,
- * patches from an image.
+ * input's shape or values when no dedicated layer covers the case
+ * (position embeddings have their own: {@link positionEmbedding}).
  *
  * @since 0.1.0
  * @category combinators
