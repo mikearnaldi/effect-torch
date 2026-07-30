@@ -174,7 +174,7 @@ const sampleBatch = Effect.gen(function* () {
   }
   return {
     input: yield* ids(inputs, [BATCH, BLOCK]),
-    target: yield* ids(targets, [BATCH * BLOCK])
+    target: yield* ids(targets, [BATCH, BLOCK])
   }
 })
 
@@ -187,23 +187,22 @@ const program = Effect.gen(function* () {
   yield* Effect.log(`${model.names.length} tensors of parameters`)
 
   const optimizer = Optimizer.adamW({ lr: LR })
-  let params: Model.Params = yield* model.init
-  let state = yield* optimizer.init(params)
+  const params0 = yield* model.init
   const started = Date.now()
-  for (let step = 1; step <= STEPS; step++) {
-    const batch = yield* sampleBatch
-    const flat = yield* model.forward(params, batch.input)
-    const logits = yield* Tensor.reshape(flat, [BATCH * BLOCK, vocabSize])
-    const loss = yield* Loss.crossEntropy(logits, batch.target)
-    const result = yield* Optimizer.step(optimizer, loss, params, state)
-    params = result.params
-    state = result.state
-    if (step % 25 === 0 || step === 1) {
-      const [value] = yield* Tensor.toNumberArray(result.loss)
-      const elapsed = ((Date.now() - started) / 1000).toFixed(1)
-      yield* Effect.log(`step ${String(step).padStart(4)}  loss ${value.toFixed(4)}  ${elapsed}s`)
-    }
-  }
+  const trained = yield* Model.train(model, {
+    optimizer,
+    loss: Loss.crossEntropy,
+    data: () => sampleBatch,
+    stop: ({ step }) => step >= STEPS,
+    params: params0,
+    onStep: ({ step, loss }) =>
+      step % 25 === 0 || step === 1
+        ? Effect.log(
+          `step ${String(step).padStart(4)}  loss ${loss.toFixed(4)}  ${((Date.now() - started) / 1000).toFixed(1)}s`
+        )
+        : Effect.void
+  })
+  const params = trained.params
 
   // Greedy-windowed sampling with temperature: re-run the model on the
   // last BLOCK tokens and draw the next character from the final

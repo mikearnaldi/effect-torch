@@ -340,7 +340,7 @@ that can fail returns an `Effect`: constructors validate into a
 | `Model.chain(...models)` | `Effect` of sequential composition; parameter arrays concatenated in order, arity checked in `forward` |
 | `Model.checkpoint(block)` | gradient-checkpoint a sub-model: recompute its forward during backward, trading FLOPs for peak memory |
 | `Model.residual(block)` | add a skip connection: `forward = input + block(input)` |
-| `Model.train(model, { optimizer, loss, data, stop, params?, onStep? })` | the training loop: init → forward → loss → grad → update, one walk per step; `stop: (info) => boolean` ends it (step count, loss target, anything) |
+| `Model.train(model, { optimizer, loss, data, stop, params?, onStep? })` | the training loop: init → forward → loss → grad → update, one walk per step; `data` is a fixed batch or a per-step sampler; `stop: (info) => boolean` ends it (step count, loss target, anything) |
 | `Model.save(model, params, path)` / `Model.load(model, path)` | named checkpoints via safetensors |
 
 ```ts

@@ -866,6 +866,19 @@ export interface TrainData {
 }
 
 /**
+ * The batches {@link train} consumes: either a fixed `(input, target)`
+ * pair (full-batch — the same tensors every step) or a sampler called
+ * with the 1-based step number to produce that step's batch (mini-batch
+ * training).
+ *
+ * @since 0.1.0
+ * @category training
+ */
+export type TrainDataSource<E = never, R = never> =
+  | TrainData
+  | ((step: number) => Effect.Effect<TrainData, E, R>)
+
+/**
  * Per-step progress reported to {@link TrainConfig.onStep} and
  * {@link TrainConfig.stop}: the 1-based step number and the step's loss
  * value.
@@ -892,6 +905,9 @@ export interface TrainStep {
  * `({ loss }) => loss < 0.01` stops on a loss target, and the two compose
  * with `||` — or close over any other state you track.
  *
+ * `data` is either a fixed `(input, target)` pair used every step
+ * (full-batch) or a sampler producing each step's batch (mini-batch).
+ *
  * @since 0.1.0
  * @category training
  */
@@ -900,8 +916,8 @@ export interface TrainConfig<S, E, R> {
   readonly loss: (
     prediction: Tensor.Any,
     target: Tensor.Any
-  ) => Effect.Effect<Tensor.Lazy, Tensor.TensorError>
-  readonly data: TrainData
+  ) => Effect.Effect<Tensor.Lazy, Tensor.TensorError, R>
+  readonly data: TrainDataSource<E, R>
   readonly stop: (info: TrainStep) => boolean
   readonly params?: Params
   readonly onStep?: (info: TrainStep) => Effect.Effect<void, E, R>
@@ -951,8 +967,11 @@ export const train = <S, E = never, R = never>(
     let trained: ReadonlyArray<Tensor.Concrete>
     do {
       step++
-      const prediction = yield* model.forward(params, config.data.input)
-      const lossTensor = yield* config.loss(prediction, config.data.target)
+      const data: TrainData = typeof config.data === "function"
+        ? yield* config.data(step)
+        : config.data
+      const prediction = yield* model.forward(params, data.input)
+      const lossTensor = yield* config.loss(prediction, data.target)
       const result = yield* Optimizer.step(config.optimizer, lossTensor, params, state)
       loss = (yield* Tensor.toNumberArray(result.loss))[0]
       trained = result.params

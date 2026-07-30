@@ -710,6 +710,33 @@ onDevices("Model", () => (it) => {
       })
     )
 
+    it.effect("a data sampler is re-drawn with the step number every step", () =>
+      Effect.gen(function* () {
+        const model = yield* mlp
+        const batches = [
+          [[0, 1, 1, 0], [1, 0]],
+          [[1, 1, 0, 0], [0, 1]],
+          [[0, 0, 1, 1], [0, 1]]
+        ] as const
+        const drawn: Array<number> = []
+        yield* Model.train(model, {
+          optimizer: Optimizer.sgd({ lr: 0.1 }),
+          loss: Loss.mse,
+          data: (step) =>
+            Effect.gen(function* () {
+              drawn.push(step)
+              const [xs, ys] = batches[(step - 1) % batches.length]
+              return {
+                input: yield* Tensor.fromTypedArray(floats([...xs]), [2, 2]),
+                target: yield* Tensor.fromTypedArray(floats([...ys]), [2, 1])
+              }
+            }),
+          stop: ({ step }) => step >= 7
+        })
+        expect(drawn).toEqual([1, 2, 3, 4, 5, 6, 7])
+      })
+    )
+
     it.effect("trains from explicit initial parameters", () =>
       Effect.gen(function* () {
         const model = yield* mlp
