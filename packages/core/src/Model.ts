@@ -908,19 +908,33 @@ export interface TrainStep {
  * `data` is either a fixed `(input, target)` pair used every step
  * (full-batch) or a sampler producing each step's batch (mini-batch).
  *
+ * The effectful fields carry their own error and requirement channels
+ * (`EL`/`RL` for `loss`, `ED`/`RD` for `data`, `EO`/`RO` for `onStep`),
+ * inferred at the call site, so a loss needing the current device, a
+ * sampler hitting a dataset, and a logging `onStep` compose without
+ * being pre-widened to a common environment.
+ *
  * @since 0.1.0
  * @category training
  */
-export interface TrainConfig<S, E, R> {
+export interface TrainConfig<
+  S,
+  EL = never,
+  RL = never,
+  ED = never,
+  RD = never,
+  EO = never,
+  RO = never
+> {
   readonly optimizer: Optimizer.Optimizer<S>
   readonly loss: (
     prediction: Tensor.Any,
     target: Tensor.Any
-  ) => Effect.Effect<Tensor.Lazy, Tensor.TensorError, R>
-  readonly data: TrainDataSource<E, R>
+  ) => Effect.Effect<Tensor.Lazy, EL, RL>
+  readonly data: TrainDataSource<ED, RD>
   readonly stop: (info: TrainStep) => boolean
   readonly params?: Params
-  readonly onStep?: (info: TrainStep) => Effect.Effect<void, E, R>
+  readonly onStep?: (info: TrainStep) => Effect.Effect<void, EO, RO>
 }
 
 /**
@@ -949,13 +963,13 @@ export interface Trained<S> {
  * @since 0.1.0
  * @category training
  */
-export const train = <S, E = never, R = never>(
+export const train = <S, EL = never, RL = never, ED = never, RD = never, EO = never, RO = never>(
   model: Model,
-  config: TrainConfig<S, E, R>
+  config: TrainConfig<S, EL, RL, ED, RD, EO, RO>
 ): Effect.Effect<
   Trained<S>,
-  ModelError | Tensor.TensorError | Gradient.GradError | E,
-  CurrentDevice | R
+  ModelError | Tensor.TensorError | Gradient.GradError | EL | ED | EO,
+  CurrentDevice | RL | RD | RO
 > =>
   Effect.gen(function* () {
     let params: Params = config.params !== undefined
