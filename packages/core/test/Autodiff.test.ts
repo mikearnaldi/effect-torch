@@ -4,16 +4,16 @@ import { Effect, Exit } from "effect"
 import { Device, Gradient, Loss, Tensor } from "../src/index.ts"
 import { deep, floatDtype, floats, GRADCHECK_EPS, GRADCHECK_TOL, onDevices, TOL, type TestDevice } from "./utils/devices.ts"
 
-const values = (t: Tensor.GenericTensor) => Tensor.toNumberArray(t)
+const values = (t: Tensor.Any) => Tensor.toNumberArray(t)
 
-const scalar = (t: Tensor.GenericTensor) => Effect.map(values(t), (v) => v[0])
+const scalar = (t: Tensor.Any) => Effect.map(values(t), (v) => v[0])
 
 type ScalarFn = (
-  x: Tensor.LazyTensor
-) => Effect.Effect<Tensor.LazyTensor, Tensor.TensorError, Device.CurrentDevice>
+  x: Tensor.Lazy
+) => Effect.Effect<Tensor.Lazy, Tensor.TensorError, Device.CurrentDevice>
 
 const sumOf = (
-  op: (x: Tensor.LazyTensor) => Effect.Effect<Tensor.LazyTensor, Tensor.TensorError, Device.CurrentDevice>
+  op: (x: Tensor.Lazy) => Effect.Effect<Tensor.Lazy, Tensor.TensorError, Device.CurrentDevice>
 ): ScalarFn => (x) => Effect.flatMap(op(x), (t) => Tensor.sum(t))
 
 const gradcheck = (f: ScalarFn, input: ReadonlyArray<number>, shape: ReadonlyArray<number>) =>
@@ -258,7 +258,7 @@ onDevices("Autodiff", (device: TestDevice) => (it) => {
 
     it.effect("checkpoint preserves values and gradients, sharing randn draws", () =>
       Effect.gen(function* () {
-        const f = (x: Tensor.GenericTensor) =>
+        const f = (x: Tensor.Any) =>
           Effect.gen(function* () {
             return yield* Tensor.mul(yield* Tensor.sin(x), yield* Tensor.add(x, 1))
           })
@@ -277,7 +277,7 @@ onDevices("Autodiff", (device: TestDevice) => (it) => {
         }
 
         // the backward recompute must see the same randn draw as the forward
-        const stochastic = (x: Tensor.GenericTensor) =>
+        const stochastic = (x: Tensor.Any) =>
           Effect.gen(function* () {
             return yield* Tensor.mul(x, yield* Tensor.randn([2], { dtype: floatDtype }))
           })
@@ -375,7 +375,7 @@ onDevices("Autodiff", (device: TestDevice) => (it) => {
         const x = yield* f32([1, 2, 3, 4, 5, 6], [3, 2])
         const bx = yield* f32([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12], [2, 3, 2])
         const perBatch = (
-          f: (slice: Tensor.GenericTensor) => Effect.Effect<Tensor.GenericTensor, Tensor.TensorError>
+          f: (slice: Tensor.Any) => Effect.Effect<Tensor.Any, Tensor.TensorError>
         ) =>
           Effect.gen(function* () {
             const outs: Array<Array<number>> = []

@@ -4,14 +4,14 @@ import { Effect } from "effect"
 import { Gradient, Loss, Optimizer, LearningRate, Tensor } from "../src/index.ts"
 import { floats, onDevices, TOL, type TestDevice } from "./utils/devices.ts"
 
-const values = (t: Tensor.GenericTensor) => Tensor.toNumberArray(t)
+const values = (t: Tensor.Any) => Tensor.toNumberArray(t)
 
-const scalar = (t: Tensor.GenericTensor) => Effect.map(values(t), (v) => v[0])
+const scalar = (t: Tensor.Any) => Effect.map(values(t), (v) => v[0])
 
 const runStep = <S>(
   optimizer: Optimizer.Optimizer<S>,
-  params: ReadonlyArray<Tensor.GenericTensor>,
-  grads: ReadonlyArray<Tensor.GenericTensor>,
+  params: ReadonlyArray<Tensor.Any>,
+  grads: ReadonlyArray<Tensor.Any>,
   state: S
 ) =>
   Effect.gen(function* () {
@@ -49,7 +49,7 @@ onDevices("Optimizer", (device: TestDevice) => (it) => {
       Effect.gen(function* () {
         const optimizer = Optimizer.sgd({ lr: 0.1, momentum: 0.9 })
         const g = yield* f32([0.5, -0.5])
-        let params = [yield* f32([1, 2])] as ReadonlyArray<Tensor.GenericTensor>
+        let params = [yield* f32([1, 2])] as ReadonlyArray<Tensor.Any>
         let state = yield* optimizer.init(params)
         const expected = [
           [0.95, 2.05],
@@ -105,7 +105,7 @@ onDevices("Optimizer", (device: TestDevice) => (it) => {
       Effect.gen(function* () {
         const optimizer = Optimizer.adam({ lr: 0.1 })
         const g = yield* f32([0.1])
-        let params = [yield* f32([1])] as ReadonlyArray<Tensor.GenericTensor>
+        let params = [yield* f32([1])] as ReadonlyArray<Tensor.Any>
         let state = yield* optimizer.init(params)
         for (let i = 0; i < 2; i++) {
           const next = yield* runStep(optimizer, params, [g], state)
@@ -175,12 +175,12 @@ onDevices("Optimizer", (device: TestDevice) => (it) => {
         const x = yield* f32([1, 2, 2, 5, 4, 3, 5, 8], [4, 2])
         const y = yield* f32([7, 18, 16, 33], [4, 1])
         const optimizer = Optimizer.adam({ lr: 0.1 })
-        const lossOf = (w: Tensor.GenericTensor, b: Tensor.GenericTensor) =>
+        const lossOf = (w: Tensor.Any, b: Tensor.Any) =>
           Effect.gen(function* () {
             const pred = yield* Tensor.add(yield* Tensor.matmul(x, w), b)
             return yield* Loss.mse(pred, y)
           })
-        let params: ReadonlyArray<Tensor.GenericTensor> = [yield* f32([0, 0], [2, 1]), yield* f32([0], [1, 1])]
+        let params: ReadonlyArray<Tensor.Any> = [yield* f32([0, 0], [2, 1]), yield* f32([0], [1, 1])]
         let state = yield* optimizer.init(params)
         let first = 0
         let last = 0
@@ -216,7 +216,7 @@ onDevices("Optimizer", (device: TestDevice) => (it) => {
       Effect.gen(function* () {
         const optimizer = Optimizer.adam({ lr: 0.1 })
         const p = yield* f32([1, 2])
-        let params: ReadonlyArray<Tensor.GenericTensor> = [p]
+        let params: ReadonlyArray<Tensor.Any> = [p]
         let state = yield* optimizer.init(params)
         for (let i = 0; i < 3; i++) {
           const loss = yield* Tensor.sum(yield* Tensor.mul(params[0], params[0]))
@@ -238,7 +238,7 @@ onDevices("Optimizer", (device: TestDevice) => (it) => {
     it.effect("a custom optimizer with tensor state implements the same contract", () =>
       Effect.gen(function* () {
         interface AvgState {
-          readonly prev: ReadonlyArray<Tensor.GenericTensor>
+          readonly prev: ReadonlyArray<Tensor.Any>
         }
         const avgGradSgd = (lr: number): Optimizer.Optimizer<AvgState> => ({
           init: (params) =>
@@ -248,8 +248,8 @@ onDevices("Optimizer", (device: TestDevice) => (it) => {
             ),
           step: (params, grads, state) =>
             Effect.gen(function* () {
-              const updates: Array<Tensor.LazyTensor> = []
-              const used: Array<Tensor.LazyTensor> = []
+              const updates: Array<Tensor.Lazy> = []
+              const used: Array<Tensor.Lazy> = []
               for (let i = 0; i < params.length; i++) {
                 const g = yield* Tensor.mul(yield* Tensor.add(grads[i], state.prev[i]), 0.5)
                 updates.push(yield* Tensor.sub(params[i], yield* Tensor.mul(g, lr)))
@@ -266,7 +266,7 @@ onDevices("Optimizer", (device: TestDevice) => (it) => {
 
         const optimizer = avgGradSgd(0.1)
         const g = yield* f32([0.5])
-        let params: ReadonlyArray<Tensor.GenericTensor> = [yield* f32([1])]
+        let params: ReadonlyArray<Tensor.Any> = [yield* f32([1])]
         let state = yield* optimizer.init(params)
         const expected = [0.975, 0.9375]
         for (const wanted of expected) {
@@ -335,7 +335,7 @@ onDevices("Optimizer", (device: TestDevice) => (it) => {
         const y = yield* Tensor.fromTypedArray(floats([2, 3, 4, 5]), [4, 1])
         const run = (fused: boolean, config: { dampening?: number; nesterov?: boolean; weightDecay?: number }) =>
           Effect.gen(function* () {
-            let params: ReadonlyArray<Tensor.GenericTensor> = [
+            let params: ReadonlyArray<Tensor.Any> = [
               yield* Tensor.fromTypedArray(floats([0.5, -0.5]))
             ]
             const optimizer = Optimizer.sgd({ lr: 0.05, momentum: 0.9, fused, ...config })
@@ -375,7 +375,7 @@ onDevices("Optimizer", (device: TestDevice) => (it) => {
         const y = yield* Tensor.fromTypedArray(floats([2, 3, 4, 5]), [4, 1])
         const run = (fused: boolean) =>
           Effect.gen(function* () {
-            let params: ReadonlyArray<Tensor.GenericTensor> = [
+            let params: ReadonlyArray<Tensor.Any> = [
               yield* Tensor.fromTypedArray(floats([0, 0]))
             ]
             const optimizer = Optimizer.adamW({ lr: 0.05, fused })
@@ -463,7 +463,7 @@ onDevices("Optimizer", (device: TestDevice) => (it) => {
         const w = yield* Tensor.fromTypedArray(floats([0, 0]))
         const x = yield* Tensor.fromTypedArray(floats([1, 1, 2, 1, 3, 1, 4, 1]), [4, 2])
         const y = yield* Tensor.fromTypedArray(floats([2, 3, 4, 5]), [4, 1])
-        let params: ReadonlyArray<Tensor.GenericTensor> = [w]
+        let params: ReadonlyArray<Tensor.Any> = [w]
         let state: Optimizer.AdamState | undefined
         for (let t = 0; t < 200; t++) {
           const optimizer = Optimizer.adam({ lr: schedule(t) })

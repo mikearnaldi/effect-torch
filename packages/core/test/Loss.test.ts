@@ -7,12 +7,12 @@ import { floats, GRADCHECK_EPS, GRADCHECK_TOL, onDevices, TOL, type TestDevice }
 const i64 = (data: ReadonlyArray<bigint>, shape?: ReadonlyArray<number>) =>
   Tensor.fromTypedArray(new BigInt64Array(data), shape)
 
-const values = (t: Tensor.GenericTensor) => Tensor.toNumberArray(t)
+const values = (t: Tensor.Any) => Tensor.toNumberArray(t)
 
-const scalar = (t: Tensor.GenericTensor) => Effect.map(values(t), (v) => v[0])
+const scalar = (t: Tensor.Any) => Effect.map(values(t), (v) => v[0])
 
 const gradcheck = (
-  f: (x: Tensor.LazyTensor) => Effect.Effect<Tensor.LazyTensor, Tensor.TensorError, Device.CurrentDevice>,
+  f: (x: Tensor.Lazy) => Effect.Effect<Tensor.Lazy, Tensor.TensorError, Device.CurrentDevice>,
   input: ReadonlyArray<number>,
   shape: ReadonlyArray<number>
 ) =>

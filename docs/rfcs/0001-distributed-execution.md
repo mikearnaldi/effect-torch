@@ -233,31 +233,31 @@ Following the existing op combinator pattern, collectives take the ambient
 
 ```ts
 export const allSum: (
-  self: GenericTensor
-) => Effect<LazyTensor, TensorError, ProcessGroup>
+  self: Tensor.Any
+) => Effect<Tensor.Lazy, TensorError, ProcessGroup>
 
 export const allMax: (
-  self: GenericTensor
-) => Effect<LazyTensor, TensorError, ProcessGroup>
+  self: Tensor.Any
+) => Effect<Tensor.Lazy, TensorError, ProcessGroup>
 
 export const allGather: (
-  self: GenericTensor
-) => Effect<LazyTensor, TensorError, ProcessGroup>
+  self: Tensor.Any
+) => Effect<Tensor.Lazy, TensorError, ProcessGroup>
 
 export const broadcast: (
-  self: GenericTensor,
+  self: Tensor.Any,
   options: { src?: number } // default 0
-) => Effect<LazyTensor, TensorError, ProcessGroup>
+) => Effect<Tensor.Lazy, TensorError, ProcessGroup>
 
 export const send: (
-  self: GenericTensor,
+  self: Tensor.Any,
   options: { dst: number }
-) => Effect<LazyTensor, TensorError, ProcessGroup>
+) => Effect<Tensor.Lazy, TensorError, ProcessGroup>
 
 export const recv: (
   shape: ReadonlyArray<number>,
   options: { src: number; dtype?: DType }
-) => Effect<LazyTensor, TensorError, ProcessGroup | CurrentDevice>
+) => Effect<Tensor.Lazy, TensorError, ProcessGroup | CurrentDevice>
 ```
 
 World-size-1 fast path returns `self` without a graph node.
@@ -278,9 +278,9 @@ export const shardLinearRow: ...
 // FSDP: weight lives sharded; all-gather before the op
 // (with autodiff, gradients are reduce-scattered back to shards)
 export const withGatheredWeight: (
-  shardedWeight: GenericTensor,
-  f: (full: LazyTensor) => Effect<LazyTensor, TensorError, ProcessGroup>
-) => Effect<LazyTensor, TensorError, ProcessGroup>
+  shardedWeight: Tensor.Any,
+  f: (full: Tensor.Lazy) => Effect<Tensor.Lazy, TensorError, ProcessGroup>
+) => Effect<Tensor.Lazy, TensorError, ProcessGroup>
 ```
 
 JAX's `Mesh`/`PartitionSpec` vocabulary is reserved for a future

@@ -55,9 +55,9 @@ const toGradError = (error: unknown): GradError => {
  * @category autodiff
  */
 export const grad = (
-  loss: Tensor.GenericTensor,
-  wrt: ReadonlyArray<Tensor.GenericTensor>
-): Effect.Effect<Array<Tensor.LazyTensor>, GradError> =>
+  loss: Tensor.Any,
+  wrt: ReadonlyArray<Tensor.Any>
+): Effect.Effect<Array<Tensor.Lazy>, GradError> =>
   Effect.gen(function* () {
     if (loss.shape.length !== 0) {
       return yield* new GradError({
@@ -95,8 +95,8 @@ export const grad = (
  * @category autodiff
  */
 export const stopGradient = (
-  self: Tensor.GenericTensor
-): Effect.Effect<Tensor.LazyTensor, Tensor.TensorError> =>
+  self: Tensor.Any
+): Effect.Effect<Tensor.Lazy, Tensor.TensorError> =>
   Effect.try({
     try: () => Tensor.makeLazy(self.lazy.stopGradient(), self.shape, self.dtype, self.device),
     catch: (error) =>
@@ -119,8 +119,8 @@ export const stopGradient = (
  * @category autodiff
  */
 export const checkpoint = (
-  self: Tensor.GenericTensor
-): Effect.Effect<Tensor.LazyTensor, Tensor.TensorError> =>
+  self: Tensor.Any
+): Effect.Effect<Tensor.Lazy, Tensor.TensorError> =>
   Effect.try({
     try: () => Tensor.makeLazy(self.lazy.checkpoint(), self.shape, self.dtype, self.device),
     catch: (error) =>
@@ -132,8 +132,8 @@ export const checkpoint = (
 
 const checkSameShapeDtype = (
   op: string,
-  a: Tensor.GenericTensor,
-  b: Tensor.GenericTensor,
+  a: Tensor.Any,
+  b: Tensor.Any,
   bName: string
 ): Effect.Effect<void, Tensor.TensorError> =>
   Effect.gen(function* () {
@@ -161,10 +161,10 @@ const checkSameShapeDtype = (
  * @category autodiff
  */
 export const vjp = (
-  y: Tensor.GenericTensor,
-  x: Tensor.GenericTensor,
-  v: Tensor.GenericTensor
-): Effect.Effect<Tensor.LazyTensor, Tensor.TensorError | GradError> =>
+  y: Tensor.Any,
+  x: Tensor.Any,
+  v: Tensor.Any
+): Effect.Effect<Tensor.Lazy, Tensor.TensorError | GradError> =>
   Effect.gen(function* () {
     yield* checkSameShapeDtype("vjp", y, v, "cotangent")
     const loss = yield* Tensor.sum(yield* Tensor.mul(y, yield* stopGradient(v)))
@@ -183,10 +183,10 @@ export const vjp = (
  * @category autodiff
  */
 export const jvp = (
-  y: Tensor.GenericTensor,
-  x: Tensor.GenericTensor,
-  v: Tensor.GenericTensor
-): Effect.Effect<Tensor.LazyTensor, Tensor.TensorError | GradError, CurrentDevice> =>
+  y: Tensor.Any,
+  x: Tensor.Any,
+  v: Tensor.Any
+): Effect.Effect<Tensor.Lazy, Tensor.TensorError | GradError, CurrentDevice> =>
   Effect.gen(function* () {
     yield* checkSameShapeDtype("jvp", x, v, "tangent")
     // u is a free linearization point: g(u) = J(x)ᵀ u is linear in u, and
@@ -215,11 +215,11 @@ export const jvp = (
  * @category autodiff
  */
 export const vmap = (
-  y: Tensor.GenericTensor,
-  x: Tensor.GenericTensor,
-  batchedX: Tensor.GenericTensor,
+  y: Tensor.Any,
+  x: Tensor.Any,
+  batchedX: Tensor.Any,
   options: { readonly dim?: number } = {}
-): Effect.Effect<Tensor.LazyTensor, Tensor.TensorError> =>
+): Effect.Effect<Tensor.Lazy, Tensor.TensorError> =>
   Effect.try({
     try: () => {
       const dim = options.dim ?? 0

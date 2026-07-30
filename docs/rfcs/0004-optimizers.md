@@ -95,13 +95,13 @@ compatibility target) and express them as lazy graph ops in TypeScript.
 ```ts
 export interface Optimizer<S> {
   /** Zero-initialized (or null) state for a parameter set. */
-  readonly init: (params: ReadonlyArray<GenericTensor>) => S
+  readonly init: (params: ReadonlyArray<Tensor.Any>) => S
   /** Pure graph transform: returns updated params and state as lazy values. */
   readonly step: (
-    params: ReadonlyArray<GenericTensor>,
-    grads: ReadonlyArray<GenericTensor>,
+    params: ReadonlyArray<Tensor.Any>,
+    grads: ReadonlyArray<Tensor.Any>,
     state: S
-  ) => { readonly params: Array<LazyTensor>; readonly state: S }
+  ) => { readonly params: Array<Tensor.Lazy>; readonly state: S }
 }
 ```
 
@@ -129,7 +129,7 @@ export interface SgdConfig {
   readonly weightDecay?: number   // default 0; coupled L2: g += wd * param
 }
 export interface SgdState {
-  readonly velocity: ReadonlyArray<GenericTensor> | null // null until 2nd step
+  readonly velocity: ReadonlyArray<Tensor.Any> | null // null until 2nd step
 }
 
 export interface AdamConfig {
@@ -142,8 +142,8 @@ export interface AdamWConfig extends AdamConfig {
   readonly weightDecay?: number   // default 0.01 (candle/PyTorch default)
 }
 export interface AdamState {
-  readonly m: ReadonlyArray<GenericTensor>
-  readonly v: ReadonlyArray<GenericTensor>
+  readonly m: ReadonlyArray<Tensor.Any>
+  readonly v: ReadonlyArray<Tensor.Any>
   readonly t: number              // step count; JS number, used for bias
                                   // correction scalars embedded in the graph
 }
@@ -210,8 +210,8 @@ For convenience, a helper will be provided:
 ```ts
 export const step: <S>(
   optimizer: Optimizer<S>,
-  loss: GenericTensor,
-  params: ReadonlyArray<GenericTensor>,
+  loss: Tensor.Any,
+  params: ReadonlyArray<Tensor.Any>,
   state: S
 ) => Effect.Effect<
   { loss: Tensor; params: Array<Tensor>; state: S },
@@ -272,7 +272,7 @@ Following the strict-dtype rule (no promotion):
 
 - **Mutable parameter slots (PyTorch-style in-place `param.copy_`)**: one
   fewer materialization boundary per step and slightly less garbage, but it
-  punches a hole in graph immutability — a `LazyTensor` would silently
+  punches a hole in graph immutability — a `Tensor.Lazy` would silently
   change value between evaluations, breaking the "same graph, same result"
   property and complicating RFC 0003's consumer-counting (a slot is a root
   that changes identity). Rejected; can be revisited as an optimization if
@@ -304,7 +304,7 @@ Following the strict-dtype rule (no promotion):
 Deviations from the design above, forced by the existing API:
 
 - **`init` and `step` return `Effect`s, they are not synchronous.** All
-  tensor ops in the codebase return `Effect<LazyTensor, TensorError>` (and
+  tensor ops in the codebase return `Effect<Tensor.Lazy, TensorError>` (and
   `zeros` requires the `CurrentDevice` service), so
   `init: (params) => Effect<S, TensorError, CurrentDevice>` and
   `step: (...) => Effect<OptimizerUpdate<S>, TensorError>`. Validation

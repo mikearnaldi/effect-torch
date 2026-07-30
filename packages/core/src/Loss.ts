@@ -32,9 +32,9 @@ export interface LossOptions {
 }
 
 const applyReduction = (
-  self: Tensor.GenericTensor,
+  self: Tensor.Any,
   reduction: Reduction
-): Effect.Effect<Tensor.LazyTensor, Tensor.TensorError> => {
+): Effect.Effect<Tensor.Lazy, Tensor.TensorError> => {
   switch (reduction) {
     case "mean":
       return Tensor.mean(self)
@@ -50,21 +50,21 @@ const isTarget = (value: unknown): boolean =>
 
 const dualLoss = <T, O, R = never>(
   impl: (
-    pred: Tensor.GenericTensor,
+    pred: Tensor.Any,
     target: T,
     options: O | undefined
-  ) => Effect.Effect<Tensor.LazyTensor, Tensor.TensorError, R>
+  ) => Effect.Effect<Tensor.Lazy, Tensor.TensorError, R>
 ): {
-  (target: T, options?: O): (pred: Tensor.GenericTensor) => Effect.Effect<
-    Tensor.LazyTensor,
+  (target: T, options?: O): (pred: Tensor.Any) => Effect.Effect<
+    Tensor.Lazy,
     Tensor.TensorError,
     R
   >
   (
-    pred: Tensor.GenericTensor,
+    pred: Tensor.Any,
     target: T,
     options?: O
-  ): Effect.Effect<Tensor.LazyTensor, Tensor.TensorError, R>
+  ): Effect.Effect<Tensor.Lazy, Tensor.TensorError, R>
 } =>
   dual(
     (args) => args.length === 3 || (args.length === 2 && isTarget(args[1])),
@@ -173,8 +173,8 @@ export const binaryCrossEntropy = dualLoss<Tensor.TensorOrScalar, BinaryCrossEnt
 
 const checkClassTargets = (
   op: string,
-  input: Tensor.GenericTensor,
-  targets: Tensor.GenericTensor
+  input: Tensor.Any,
+  targets: Tensor.Any
 ): Effect.Effect<number, Tensor.TensorError> =>
   Effect.gen(function* () {
     if (input.shape.length < 1) {
@@ -202,7 +202,7 @@ const checkClassTargets = (
  * @since 0.1.0
  * @category losses
  */
-export const crossEntropy = dualLoss<Tensor.GenericTensor, LossOptions, CurrentDevice>((logits, targets, options) =>
+export const crossEntropy = dualLoss<Tensor.Any, LossOptions, CurrentDevice>((logits, targets, options) =>
   Effect.gen(function* () {
     const depth = yield* checkClassTargets("crossEntropy", logits, targets)
     if (logits.dtype !== "f32" && logits.dtype !== "f64") {
@@ -228,7 +228,7 @@ export const crossEntropy = dualLoss<Tensor.GenericTensor, LossOptions, CurrentD
  * @since 0.1.0
  * @category losses
  */
-export const nll = dualLoss<Tensor.GenericTensor, LossOptions, CurrentDevice>((logProbs, targets, options) =>
+export const nll = dualLoss<Tensor.Any, LossOptions, CurrentDevice>((logProbs, targets, options) =>
   Effect.gen(function* () {
     const depth = yield* checkClassTargets("nll", logProbs, targets)
     if (logProbs.dtype !== "f32" && logProbs.dtype !== "f64") {
@@ -299,11 +299,11 @@ export interface CosineEmbeddingOptions extends LossOptions {
  * @category losses
  */
 export const cosineEmbeddingLoss = (
-  a: Tensor.GenericTensor,
-  b: Tensor.GenericTensor,
-  targets: Tensor.GenericTensor,
+  a: Tensor.Any,
+  b: Tensor.Any,
+  targets: Tensor.Any,
   options: CosineEmbeddingOptions = {}
-): Effect.Effect<Tensor.LazyTensor, Tensor.TensorError> =>
+): Effect.Effect<Tensor.Lazy, Tensor.TensorError> =>
   Effect.gen(function* () {
     const margin = options.margin ?? 0
     const dot = yield* Tensor.sum(yield* Tensor.mul(a, b), { dims: [-1] })

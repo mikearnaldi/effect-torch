@@ -18,25 +18,6 @@ const {
 } = native
 
 /**
- * The native backend's computation-graph handle type, as stored in
- * {@link GenericTensor.lazy}. Named here so userland operations can type
- * their signatures.
- *
- * @since 0.1.0
- * @category models
- */
-export type NativeLazyTensor = NativeLazyTensorType
-
-/**
- * The native backend's device-buffer handle type, as stored in
- * {@link Tensor.materialized}.
- *
- * @since 0.1.0
- * @category models
- */
-export type NativeTensor = NativeTensorType
-
-/**
  * Element data types supported by the native backend.
  *
  * @since 0.1.0
@@ -76,20 +57,22 @@ export class TensorError extends Data.TaggedError("TensorError")<{
 }> {}
 
 /**
- * Common supertype of {@link LazyTensor} and {@link Tensor}. Every operation
+ * Common supertype of {@link Lazy} and {@link Concrete}. Every operation
  * accepts this type, so lazy and evaluated tensors can be mixed freely.
  *
  * @since 0.1.0
  * @category models
  */
-export interface GenericTensor extends Pipeable {
+export interface Any extends Pipeable {
   readonly [TensorTypeId]: TensorTypeId
   readonly _tag: "LazyTensor" | "Tensor"
   /**
-   * The native computation-graph handle. This is the library's extension
-   * seam: userland operations call native methods on it and wrap the result
-   * with {@link makeLazy}, which is how the Gradient and Optimizer modules
-   * themselves are implemented.
+   * The native computation-graph handle. Internal to the library: the
+   * Gradient and Optimizer modules call native methods on it and wrap
+   * the result with {@link makeLazy}; the handle's methods are the
+   * native op set, which userland cannot extend.
+   *
+   * @internal
    */
   readonly lazy: NativeLazyTensorType
   readonly shape: ReadonlyArray<number>
@@ -104,7 +87,7 @@ export interface GenericTensor extends Pipeable {
  * @since 0.1.0
  * @category models
  */
-export interface LazyTensor extends GenericTensor {
+export interface Lazy extends Any {
   readonly _tag: "LazyTensor"
 }
 
@@ -115,11 +98,12 @@ export interface LazyTensor extends GenericTensor {
  * @since 0.1.0
  * @category models
  */
-export interface Tensor extends GenericTensor {
+export interface Concrete extends Any {
   readonly _tag: "Tensor"
   /**
-   * The native device-buffer handle, for userland code that needs direct
-   * access to the materialized data (custom kernels, interop).
+   * The native device-buffer handle.
+   *
+   * @internal
    */
   readonly materialized: NativeTensorType
 }
@@ -134,27 +118,29 @@ export type TensorTypeId = typeof TensorTypeId
 
 const TensorProto = {
   [TensorTypeId]: TensorTypeId,
-  pipe(this: GenericTensor) {
+  pipe(this: Any) {
     return pipeArguments(this, arguments)
   }
 }
 
 /**
- * Wraps a native graph handle as a {@link LazyTensor}. The native graph does
+ * Wraps a native graph handle as a {@link Lazy}. The native graph does
  * not track shapes, so the caller owns the `shape`, `dtype` and `device`
  * metadata: it must exactly describe the handle's result, or every
- * downstream operation reads wrong shapes. This is the supported way to
- * build custom native-backed operations in userland.
+ * downstream operation reads wrong shapes. Internal to the library —
+ * used by the Gradient and Optimizer modules to wrap native adjoints
+ * and fused update nodes.
  *
  * @since 0.1.0
  * @category constructors
+ * @internal
  */
 export const makeLazy = (
   lazy: NativeLazyTensorType,
   shape: ReadonlyArray<number>,
   dtype: DType,
   device: DeviceKind
-): LazyTensor => {
+): Lazy => {
   const self = Object.create(TensorProto)
   self._tag = "LazyTensor"
   self.lazy = lazy
@@ -164,7 +150,7 @@ export const makeLazy = (
   return self
 }
 
-const fromHandle = (handle: NativeTensorType): Tensor => {
+const fromHandle = (handle: NativeTensorType): Concrete => {
   const self = Object.create(TensorProto)
   self._tag = "Tensor"
   self.lazy = NativeLazyTensor.fromMaterialized(handle)
@@ -181,7 +167,7 @@ const fromHandle = (handle: NativeTensorType): Tensor => {
  * @since 0.1.0
  * @category refinements
  */
-export const isLazyTensor = (self: GenericTensor): self is LazyTensor => self._tag === "LazyTensor"
+export const isLazyTensor = (self: Any): self is Lazy => self._tag === "LazyTensor"
 
 /**
  * Returns `true` if the tensor has been materialized on the device.
@@ -189,7 +175,7 @@ export const isLazyTensor = (self: GenericTensor): self is LazyTensor => self._t
  * @since 0.1.0
  * @category refinements
  */
-export const isTensor = (self: GenericTensor): self is Tensor => self._tag === "Tensor"
+export const isTensor = (self: Any): self is Concrete => self._tag === "Tensor"
 
 const validateShape = (op: string, shape: ReadonlyArray<number>): Array<number> =>
   shape.map((dim) => {
@@ -232,7 +218,7 @@ const matmulShape = (a: ReadonlyArray<number>, b: ReadonlyArray<number>): Array<
   return [...batch, m, n]
 }
 
-const checkCompatible = (op: string, a: GenericTensor, b: GenericTensor): void => {
+const checkCompatible = (op: string, a: Any, b: Any): void => {
   if (a.dtype !== b.dtype) {
     throw new Error(`${op}: dtype mismatch, got ${a.dtype} and ${b.dtype}, use cast for explicit conversion`)
   }
@@ -253,7 +239,7 @@ const isFloatDtype = (dtype: string): boolean => dtype === "f32" || dtype === "f
  * @since 0.1.0
  * @category models
  */
-export type TensorOrScalar = GenericTensor | number
+export type TensorOrScalar = Any | number
 
 // Scalar operands are pure values: the same (value, dtype, device) triple
 // can share one leaf node forever instead of allocating a fresh device
@@ -265,8 +251,8 @@ const scalarLeafCache = new Map<string, NativeLazyTensorType>()
 const SCALAR_LEAF_CACHE_LIMIT = 4096
 
 const liftOperand = (
-  self: GenericTensor,
-  other: GenericTensor | number
+  self: Any,
+  other: Any | number
 ): { readonly lazy: NativeLazyTensorType; readonly shape: ReadonlyArray<number> } => {
   if (typeof other === "number") {
     const key = `${self.device}:${self.dtype}:${other}`
@@ -288,12 +274,12 @@ const binaryOp = (
   native: (a: NativeLazyTensorType, b: NativeLazyTensorType) => NativeLazyTensorType,
   outDtype: (dtype: DType) => DType = (dtype) => dtype
 ): {
-  (other: TensorOrScalar): (self: GenericTensor) => Effect.Effect<LazyTensor, TensorError>
-  (self: GenericTensor, other: TensorOrScalar): Effect.Effect<LazyTensor, TensorError>
+  (other: TensorOrScalar): (self: Any) => Effect.Effect<Lazy, TensorError>
+  (self: Any, other: TensorOrScalar): Effect.Effect<Lazy, TensorError>
 } =>
   dual(
     2,
-    (self: GenericTensor, other: TensorOrScalar): Effect.Effect<LazyTensor, TensorError> =>
+    (self: Any, other: TensorOrScalar): Effect.Effect<Lazy, TensorError> =>
       Effect.try({
         try: () => {
           if (typeof other !== "number") checkCompatible(op, self, other)
@@ -313,7 +299,7 @@ const binaryOp = (
 const unaryOp = (
   op: string,
   native: (a: NativeLazyTensorType) => NativeLazyTensorType
-): (self: GenericTensor) => Effect.Effect<LazyTensor, TensorError> =>
+): (self: Any) => Effect.Effect<Lazy, TensorError> =>
 (self) =>
   Effect.try({
     try: () => makeLazy(native(self.lazy), self.shape, self.dtype, self.device),
@@ -330,10 +316,10 @@ const normalizeDim = (op: string, rank: number, dim: number): number => {
 }
 
 const dualOptions = <O, R = never>(
-  impl: (self: GenericTensor, options: O | undefined) => Effect.Effect<LazyTensor, TensorError, R>
+  impl: (self: Any, options: O | undefined) => Effect.Effect<Lazy, TensorError, R>
 ): {
-  (options?: O): (self: GenericTensor) => Effect.Effect<LazyTensor, TensorError, R>
-  (self: GenericTensor, options?: O): Effect.Effect<LazyTensor, TensorError, R>
+  (options?: O): (self: Any) => Effect.Effect<Lazy, TensorError, R>
+  (self: Any, options?: O): Effect.Effect<Lazy, TensorError, R>
 } =>
   dual(
     (args) =>
@@ -350,7 +336,7 @@ const dualOptions = <O, R = never>(
 export const zeros = (
   shape: ReadonlyArray<number>,
   options: TensorOptions = {}
-): Effect.Effect<LazyTensor, TensorError, CurrentDevice> =>
+): Effect.Effect<Lazy, TensorError, CurrentDevice> =>
   Effect.gen(function* () {
     const device = yield* CurrentDevice
     return yield* Effect.try({
@@ -377,7 +363,7 @@ export const zeros = (
 export const ones = (
   shape: ReadonlyArray<number>,
   options: TensorOptions = {}
-): Effect.Effect<LazyTensor, TensorError, CurrentDevice> =>
+): Effect.Effect<Lazy, TensorError, CurrentDevice> =>
   Effect.gen(function* () {
     const device = yield* CurrentDevice
     return yield* Effect.try({
@@ -405,7 +391,7 @@ export const full = (
   shape: ReadonlyArray<number>,
   value: number,
   options: TensorOptions = {}
-): Effect.Effect<LazyTensor, TensorError, CurrentDevice> =>
+): Effect.Effect<Lazy, TensorError, CurrentDevice> =>
   Effect.gen(function* () {
     const device = yield* CurrentDevice
     return yield* Effect.try({
@@ -433,7 +419,7 @@ export const full = (
 export const randn = (
   shape: ReadonlyArray<number>,
   options: { readonly dtype?: "f32" | "f64" } = {}
-): Effect.Effect<LazyTensor, TensorError, CurrentDevice> =>
+): Effect.Effect<Lazy, TensorError, CurrentDevice> =>
   Effect.gen(function* () {
     const device = yield* CurrentDevice
     return yield* Effect.try({
@@ -462,7 +448,7 @@ export const randn = (
 export const uniform = (
   shape: ReadonlyArray<number>,
   options: { readonly min?: number; readonly max?: number; readonly dtype?: "f32" | "f64" } = {}
-): Effect.Effect<LazyTensor, TensorError, CurrentDevice> =>
+): Effect.Effect<Lazy, TensorError, CurrentDevice> =>
   Effect.gen(function* () {
     const device = yield* CurrentDevice
     return yield* Effect.try({
@@ -498,7 +484,7 @@ export const linspace = (
   end: number,
   steps: number,
   options: TensorOptions = {}
-): Effect.Effect<LazyTensor, TensorError, CurrentDevice> =>
+): Effect.Effect<Lazy, TensorError, CurrentDevice> =>
   Effect.gen(function* () {
     if (!Number.isInteger(steps) || steps < 1) {
       return yield* new TensorError({
@@ -530,7 +516,7 @@ export const arange = (
   start: number,
   end?: number,
   options: { readonly step?: number; readonly dtype?: DType } = {}
-): Effect.Effect<LazyTensor, TensorError, CurrentDevice> =>
+): Effect.Effect<Lazy, TensorError, CurrentDevice> =>
   Effect.gen(function* () {
     const device = yield* CurrentDevice
     return yield* Effect.try({
@@ -560,7 +546,7 @@ export const arange = (
 export const eye = (
   n: number,
   options: TensorOptions = {}
-): Effect.Effect<LazyTensor, TensorError, CurrentDevice> =>
+): Effect.Effect<Lazy, TensorError, CurrentDevice> =>
   Effect.gen(function* () {
     const device = yield* CurrentDevice
     return yield* Effect.try({
@@ -598,7 +584,7 @@ const dtypeOfTypedArray = (data: TypedArray): DType => {
 export const fromTypedArray = (
   data: TypedArray,
   shape?: ReadonlyArray<number>
-): Effect.Effect<LazyTensor, TensorError, CurrentDevice> =>
+): Effect.Effect<Lazy, TensorError, CurrentDevice> =>
   Effect.gen(function* () {
     const device = yield* CurrentDevice
     return yield* Effect.try({
@@ -632,7 +618,7 @@ export const fromTypedArray = (
  * @since 0.1.0
  * @category constructors
  */
-export const zerosLike = (self: GenericTensor): Effect.Effect<LazyTensor, TensorError, CurrentDevice> =>
+export const zerosLike = (self: Any): Effect.Effect<Lazy, TensorError, CurrentDevice> =>
   zeros(self.shape, { dtype: self.dtype })
 
 /**
@@ -641,7 +627,7 @@ export const zerosLike = (self: GenericTensor): Effect.Effect<LazyTensor, Tensor
  * @since 0.1.0
  * @category constructors
  */
-export const onesLike = (self: GenericTensor): Effect.Effect<LazyTensor, TensorError, CurrentDevice> =>
+export const onesLike = (self: Any): Effect.Effect<Lazy, TensorError, CurrentDevice> =>
   ones(self.shape, { dtype: self.dtype })
 
 /**
@@ -652,9 +638,9 @@ export const onesLike = (self: GenericTensor): Effect.Effect<LazyTensor, TensorE
  * @category constructors
  */
 export const fullLike = (
-  self: GenericTensor,
+  self: Any,
   value: number
-): Effect.Effect<LazyTensor, TensorError, CurrentDevice> => full(self.shape, value, { dtype: self.dtype })
+): Effect.Effect<Lazy, TensorError, CurrentDevice> => full(self.shape, value, { dtype: self.dtype })
 
 /**
  * Returns the shape of a tensor.
@@ -662,7 +648,7 @@ export const fullLike = (
  * @since 0.1.0
  * @category getters
  */
-export const shape = (self: GenericTensor): ReadonlyArray<number> => self.shape
+export const shape = (self: Any): ReadonlyArray<number> => self.shape
 
 /**
  * Returns the dtype of a tensor.
@@ -670,7 +656,7 @@ export const shape = (self: GenericTensor): ReadonlyArray<number> => self.shape
  * @since 0.1.0
  * @category getters
  */
-export const dtype = (self: GenericTensor): DType => self.dtype
+export const dtype = (self: Any): DType => self.dtype
 
 /**
  * Returns the device a tensor lives on.
@@ -678,7 +664,7 @@ export const dtype = (self: GenericTensor): DType => self.dtype
  * @since 0.1.0
  * @category getters
  */
-export const device = (self: GenericTensor): DeviceKind => self.device
+export const device = (self: Any): DeviceKind => self.device
 
 /**
  * Elementwise addition with broadcasting. Fails with {@link TensorError} if
@@ -895,7 +881,7 @@ export const sign = unaryOp("sign", (a) => a.sign())
  * @since 0.1.0
  * @category elementwise
  */
-export const square = (self: GenericTensor): Effect.Effect<LazyTensor, TensorError> => mul(self, self)
+export const square = (self: Any): Effect.Effect<Lazy, TensorError> => mul(self, self)
 
 /**
  * Elementwise reciprocal square root, `x ** -0.5`.
@@ -903,7 +889,7 @@ export const square = (self: GenericTensor): Effect.Effect<LazyTensor, TensorErr
  * @since 0.1.0
  * @category elementwise
  */
-export const rsqrt = (self: GenericTensor): Effect.Effect<LazyTensor, TensorError> => pow(self, -0.5)
+export const rsqrt = (self: Any): Effect.Effect<Lazy, TensorError> => pow(self, -0.5)
 
 /**
  * Elementwise reciprocal, `1 / x`.
@@ -911,7 +897,7 @@ export const rsqrt = (self: GenericTensor): Effect.Effect<LazyTensor, TensorErro
  * @since 0.1.0
  * @category elementwise
  */
-export const reciprocal = (self: GenericTensor): Effect.Effect<LazyTensor, TensorError> => pow(self, -1)
+export const reciprocal = (self: Any): Effect.Effect<Lazy, TensorError> => pow(self, -1)
 
 /**
  * Elementwise `exp(x) - 1`.
@@ -919,7 +905,7 @@ export const reciprocal = (self: GenericTensor): Effect.Effect<LazyTensor, Tenso
  * @since 0.1.0
  * @category elementwise
  */
-export const expm1 = (self: GenericTensor): Effect.Effect<LazyTensor, TensorError> =>
+export const expm1 = (self: Any): Effect.Effect<Lazy, TensorError> =>
   Effect.flatMap(exp(self), (e) => sub(e, 1))
 
 /**
@@ -928,7 +914,7 @@ export const expm1 = (self: GenericTensor): Effect.Effect<LazyTensor, TensorErro
  * @since 0.1.0
  * @category elementwise
  */
-export const log1p = (self: GenericTensor): Effect.Effect<LazyTensor, TensorError> =>
+export const log1p = (self: Any): Effect.Effect<Lazy, TensorError> =>
   Effect.flatMap(add(self, 1), (t) => log(t))
 
 /**
@@ -937,7 +923,7 @@ export const log1p = (self: GenericTensor): Effect.Effect<LazyTensor, TensorErro
  * @since 0.1.0
  * @category elementwise
  */
-export const log2 = (self: GenericTensor): Effect.Effect<LazyTensor, TensorError> =>
+export const log2 = (self: Any): Effect.Effect<Lazy, TensorError> =>
   Effect.flatMap(log(self), (t) => div(t, Math.LN2))
 
 /**
@@ -946,7 +932,7 @@ export const log2 = (self: GenericTensor): Effect.Effect<LazyTensor, TensorError
  * @since 0.1.0
  * @category elementwise
  */
-export const log10 = (self: GenericTensor): Effect.Effect<LazyTensor, TensorError> =>
+export const log10 = (self: Any): Effect.Effect<Lazy, TensorError> =>
   Effect.flatMap(log(self), (t) => div(t, Math.LN10))
 
 /**
@@ -955,7 +941,7 @@ export const log10 = (self: GenericTensor): Effect.Effect<LazyTensor, TensorErro
  * @since 0.1.0
  * @category elementwise
  */
-export const sinh = (self: GenericTensor): Effect.Effect<LazyTensor, TensorError> =>
+export const sinh = (self: Any): Effect.Effect<Lazy, TensorError> =>
   Effect.gen(function* () {
     const e = yield* exp(self)
     const ne = yield* exp(yield* neg(self))
@@ -968,7 +954,7 @@ export const sinh = (self: GenericTensor): Effect.Effect<LazyTensor, TensorError
  * @since 0.1.0
  * @category elementwise
  */
-export const cosh = (self: GenericTensor): Effect.Effect<LazyTensor, TensorError> =>
+export const cosh = (self: Any): Effect.Effect<Lazy, TensorError> =>
   Effect.gen(function* () {
     const e = yield* exp(self)
     const ne = yield* exp(yield* neg(self))
@@ -981,7 +967,7 @@ export const cosh = (self: GenericTensor): Effect.Effect<LazyTensor, TensorError
  * @since 0.1.0
  * @category elementwise
  */
-export const tan = (self: GenericTensor): Effect.Effect<LazyTensor, TensorError> =>
+export const tan = (self: Any): Effect.Effect<Lazy, TensorError> =>
   Effect.gen(function* () {
     return yield* div(yield* sin(self), yield* cos(self))
   })
@@ -993,11 +979,11 @@ export const tan = (self: GenericTensor): Effect.Effect<LazyTensor, TensorError>
  * @category elementwise
  */
 export const ne: {
-  (other: TensorOrScalar): (self: GenericTensor) => Effect.Effect<LazyTensor, TensorError>
-  (self: GenericTensor, other: TensorOrScalar): Effect.Effect<LazyTensor, TensorError>
+  (other: TensorOrScalar): (self: Any) => Effect.Effect<Lazy, TensorError>
+  (self: Any, other: TensorOrScalar): Effect.Effect<Lazy, TensorError>
 } = dual(
   2,
-  (self: GenericTensor, other: TensorOrScalar): Effect.Effect<LazyTensor, TensorError> =>
+  (self: Any, other: TensorOrScalar): Effect.Effect<Lazy, TensorError> =>
     Effect.gen(function* () {
       return yield* maximum(yield* lt(self, other), yield* gt(self, other))
     })
@@ -1026,7 +1012,7 @@ export const logicalOr = binaryOp("logicalOr", (a, b) => a.maximum(b))
  * @since 0.1.0
  * @category elementwise
  */
-export const logicalNot = (self: GenericTensor): Effect.Effect<LazyTensor, TensorError> => eq(self, 0)
+export const logicalNot = (self: Any): Effect.Effect<Lazy, TensorError> => eq(self, 0)
 
 /**
  * Elementwise remainder of the division `self / other`, following the sign
@@ -1036,11 +1022,11 @@ export const logicalNot = (self: GenericTensor): Effect.Effect<LazyTensor, Tenso
  * @category elementwise
  */
 export const remainder: {
-  (other: TensorOrScalar): (self: GenericTensor) => Effect.Effect<LazyTensor, TensorError>
-  (self: GenericTensor, other: TensorOrScalar): Effect.Effect<LazyTensor, TensorError>
+  (other: TensorOrScalar): (self: Any) => Effect.Effect<Lazy, TensorError>
+  (self: Any, other: TensorOrScalar): Effect.Effect<Lazy, TensorError>
 } = dual(
   2,
-  (self: GenericTensor, other: TensorOrScalar): Effect.Effect<LazyTensor, TensorError> =>
+  (self: Any, other: TensorOrScalar): Effect.Effect<Lazy, TensorError> =>
     Effect.gen(function* () {
       const q = yield* floor(yield* div(self, other))
       return yield* sub(self, yield* mul(q, other))
@@ -1056,11 +1042,11 @@ export const remainder: {
  * @category elementwise
  */
 export const where: {
-  (a: TensorOrScalar, b: TensorOrScalar): (cond: GenericTensor) => Effect.Effect<LazyTensor, TensorError>
-  (cond: GenericTensor, a: TensorOrScalar, b: TensorOrScalar): Effect.Effect<LazyTensor, TensorError>
+  (a: TensorOrScalar, b: TensorOrScalar): (cond: Any) => Effect.Effect<Lazy, TensorError>
+  (cond: Any, a: TensorOrScalar, b: TensorOrScalar): Effect.Effect<Lazy, TensorError>
 } = dual(
   3,
-  (cond: GenericTensor, a: TensorOrScalar, b: TensorOrScalar): Effect.Effect<LazyTensor, TensorError> =>
+  (cond: Any, a: TensorOrScalar, b: TensorOrScalar): Effect.Effect<Lazy, TensorError> =>
     Effect.try({
       try: () => {
         if (cond.dtype !== "u8") {
@@ -1097,7 +1083,7 @@ export const where: {
  * @since 0.1.0
  * @category elementwise
  */
-export const sigmoid = (self: GenericTensor): Effect.Effect<LazyTensor, TensorError> =>
+export const sigmoid = (self: Any): Effect.Effect<Lazy, TensorError> =>
   Effect.gen(function* () {
     const t = yield* tanh(yield* div(self, 2))
     return yield* add(yield* div(t, 2), 0.5)
@@ -1111,7 +1097,7 @@ export const sigmoid = (self: GenericTensor): Effect.Effect<LazyTensor, TensorEr
  * @category neural network
  */
 export const softmax = dualOptions(
-  (self: GenericTensor, options: ReduceOptions = {}): Effect.Effect<LazyTensor, TensorError> =>
+  (self: Any, options: ReduceOptions = {}): Effect.Effect<Lazy, TensorError> =>
     Effect.gen(function* () {
       const dims = normalizeDims("softmax", self.shape.length, options.dims ?? [self.shape.length - 1])
       const m = yield* max(self, { dims, keepdims: true })
@@ -1128,7 +1114,7 @@ export const softmax = dualOptions(
  * @category neural network
  */
 export const logSoftmax = dualOptions(
-  (self: GenericTensor, options: ReduceOptions = {}): Effect.Effect<LazyTensor, TensorError> =>
+  (self: Any, options: ReduceOptions = {}): Effect.Effect<Lazy, TensorError> =>
     Effect.gen(function* () {
       const dims = normalizeDims("logSoftmax", self.shape.length, options.dims ?? [self.shape.length - 1])
       const m = yield* max(self, { dims, keepdims: true })
@@ -1144,7 +1130,7 @@ export const logSoftmax = dualOptions(
  * @since 0.1.0
  * @category neural network
  */
-export const silu = (self: GenericTensor): Effect.Effect<LazyTensor, TensorError> =>
+export const silu = (self: Any): Effect.Effect<Lazy, TensorError> =>
   Effect.gen(function* () {
     return yield* mul(self, yield* sigmoid(self))
   })
@@ -1156,7 +1142,7 @@ export const silu = (self: GenericTensor): Effect.Effect<LazyTensor, TensorError
  * @since 0.1.0
  * @category neural network
  */
-export const softplus = (self: GenericTensor): Effect.Effect<LazyTensor, TensorError> =>
+export const softplus = (self: Any): Effect.Effect<Lazy, TensorError> =>
   Effect.gen(function* () {
     const head = yield* maximum(self, 0)
     const tail = yield* log1p(yield* exp(yield* neg(yield* abs(self))))
@@ -1182,7 +1168,7 @@ export interface EluOptions {
  * @category neural network
  */
 export const elu = dualOptions(
-  (self: GenericTensor, options: EluOptions = {}): Effect.Effect<LazyTensor, TensorError> =>
+  (self: Any, options: EluOptions = {}): Effect.Effect<Lazy, TensorError> =>
     Effect.gen(function* () {
       const alpha = options.alpha ?? 1
       const negative = yield* mul(yield* expm1(self), alpha)
@@ -1207,7 +1193,7 @@ export interface LeakyReluOptions {
  * @category neural network
  */
 export const leakyRelu = dualOptions(
-  (self: GenericTensor, options: LeakyReluOptions = {}): Effect.Effect<LazyTensor, TensorError> =>
+  (self: Any, options: LeakyReluOptions = {}): Effect.Effect<Lazy, TensorError> =>
     Effect.gen(function* () {
       return yield* maximum(self, yield* mul(self, options.negativeSlope ?? 0.01))
     })
@@ -1233,7 +1219,7 @@ export interface GeluOptions {
  * @category neural network
  */
 export const gelu = dualOptions(
-  (self: GenericTensor, options: GeluOptions = {}): Effect.Effect<LazyTensor, TensorError> =>
+  (self: Any, options: GeluOptions = {}): Effect.Effect<Lazy, TensorError> =>
     Effect.gen(function* () {
       if (options.approximate === "tanh") {
         const c = Math.sqrt(2 / Math.PI)
@@ -1250,7 +1236,7 @@ export const gelu = dualOptions(
  * @since 0.1.0
  * @category neural network
  */
-export const mish = (self: GenericTensor): Effect.Effect<LazyTensor, TensorError> =>
+export const mish = (self: Any): Effect.Effect<Lazy, TensorError> =>
   Effect.gen(function* () {
     return yield* mul(self, yield* tanh(yield* softplus(self)))
   })
@@ -1273,15 +1259,15 @@ export interface ClampOptions {
  * @category elementwise
  */
 export const clamp = dualOptions(
-  (self: GenericTensor, options: ClampOptions = {}): Effect.Effect<LazyTensor, TensorError> =>
+  (self: Any, options: ClampOptions = {}): Effect.Effect<Lazy, TensorError> =>
     Effect.gen(function* () {
       if (options.min === undefined && options.max === undefined) {
         return yield* new TensorError({ op: "clamp", message: "clamp: at least one of min and max is required" })
       }
-      let out: GenericTensor = self
+      let out: Any = self
       if (options.min !== undefined) out = yield* maximum(out, options.min)
       if (options.max !== undefined) out = yield* minimum(out, options.max)
-      return out as LazyTensor
+      return out as Lazy
     })
 )
 
@@ -1291,7 +1277,7 @@ export const clamp = dualOptions(
  * @since 0.1.0
  * @category neural network
  */
-export const hardtanh = (self: GenericTensor): Effect.Effect<LazyTensor, TensorError> =>
+export const hardtanh = (self: Any): Effect.Effect<Lazy, TensorError> =>
   clamp(self, { min: -1, max: 1 })
 
 /**
@@ -1317,9 +1303,9 @@ export interface DropoutOptions {
  */
 export const dropout = dualOptions(
   (
-    self: GenericTensor,
+    self: Any,
     options: DropoutOptions = {}
-  ): Effect.Effect<LazyTensor, TensorError, CurrentDevice> =>
+  ): Effect.Effect<Lazy, TensorError, CurrentDevice> =>
     Effect.gen(function* () {
       const p = options.p ?? 0.5
       if (p < 0 || p >= 1) {
@@ -1346,9 +1332,9 @@ export const dropout = dualOptions(
  * @category elementwise
  */
 export const pow: {
-  (exponent: number): (self: GenericTensor) => Effect.Effect<LazyTensor, TensorError>
-  (self: GenericTensor, exponent: number): Effect.Effect<LazyTensor, TensorError>
-} = dual(2, (self: GenericTensor, exponent: number): Effect.Effect<LazyTensor, TensorError> =>
+  (exponent: number): (self: Any) => Effect.Effect<Lazy, TensorError>
+  (self: Any, exponent: number): Effect.Effect<Lazy, TensorError>
+} = dual(2, (self: Any, exponent: number): Effect.Effect<Lazy, TensorError> =>
   Effect.try({
     try: () => makeLazy(self.lazy.pow(exponent), self.shape, self.dtype, self.device),
     catch: (error) =>
@@ -1364,9 +1350,9 @@ export const pow: {
  * @category operations
  */
 export const matmul: {
-  (other: GenericTensor): (self: GenericTensor) => Effect.Effect<LazyTensor, TensorError>
-  (self: GenericTensor, other: GenericTensor): Effect.Effect<LazyTensor, TensorError>
-} = dual(2, (self: GenericTensor, other: GenericTensor): Effect.Effect<LazyTensor, TensorError> =>
+  (other: Any): (self: Any) => Effect.Effect<Lazy, TensorError>
+  (self: Any, other: Any): Effect.Effect<Lazy, TensorError>
+} = dual(2, (self: Any, other: Any): Effect.Effect<Lazy, TensorError> =>
   Effect.try({
     try: () => {
       checkCompatible("matmul", self, other)
@@ -1425,12 +1411,12 @@ const reduceOp = (
   op: string,
   native: (a: NativeLazyTensorType, dims: Array<number>, keepdims: boolean) => NativeLazyTensorType
 ): {
-  (options?: ReduceOptions): (self: GenericTensor) => Effect.Effect<LazyTensor, TensorError>
-  (self: GenericTensor, options?: ReduceOptions): Effect.Effect<LazyTensor, TensorError>
+  (options?: ReduceOptions): (self: Any) => Effect.Effect<Lazy, TensorError>
+  (self: Any, options?: ReduceOptions): Effect.Effect<Lazy, TensorError>
 } =>
   dual(
     (args) => args.length === 2 || (args.length === 1 && args[0] !== undefined && TensorTypeId in (args[0] as object)),
-    (self: GenericTensor, options: ReduceOptions = {}): Effect.Effect<LazyTensor, TensorError> =>
+    (self: Any, options: ReduceOptions = {}): Effect.Effect<Lazy, TensorError> =>
       Effect.try({
         try: () => {
           const dims = options.dims ?? self.shape.map((_, i) => i)
@@ -1492,9 +1478,9 @@ export const min = reduceOp("min", (a, dims, keepdims) => a.min(dims, keepdims))
  * @category reductions
  */
 export const argmax: {
-  (dim: number): (self: GenericTensor) => Effect.Effect<LazyTensor, TensorError>
-  (self: GenericTensor, dim: number): Effect.Effect<LazyTensor, TensorError>
-} = dual(2, (self: GenericTensor, dim: number): Effect.Effect<LazyTensor, TensorError> =>
+  (dim: number): (self: Any) => Effect.Effect<Lazy, TensorError>
+  (self: Any, dim: number): Effect.Effect<Lazy, TensorError>
+} = dual(2, (self: Any, dim: number): Effect.Effect<Lazy, TensorError> =>
   Effect.try({
     try: () => {
       const d = normalizeDim("argmax", self.shape.length, dim)
@@ -1518,9 +1504,9 @@ export const argmax: {
  * @category reductions
  */
 export const argmin: {
-  (dim: number): (self: GenericTensor) => Effect.Effect<LazyTensor, TensorError>
-  (self: GenericTensor, dim: number): Effect.Effect<LazyTensor, TensorError>
-} = dual(2, (self: GenericTensor, dim: number): Effect.Effect<LazyTensor, TensorError> =>
+  (dim: number): (self: Any) => Effect.Effect<Lazy, TensorError>
+  (self: Any, dim: number): Effect.Effect<Lazy, TensorError>
+} = dual(2, (self: Any, dim: number): Effect.Effect<Lazy, TensorError> =>
   Effect.try({
     try: () => {
       const d = normalizeDim("argmin", self.shape.length, dim)
@@ -1543,9 +1529,9 @@ export const argmin: {
  * @category reductions
  */
 export const cumsum: {
-  (dim: number): (self: GenericTensor) => Effect.Effect<LazyTensor, TensorError>
-  (self: GenericTensor, dim: number): Effect.Effect<LazyTensor, TensorError>
-} = dual(2, (self: GenericTensor, dim: number): Effect.Effect<LazyTensor, TensorError> =>
+  (dim: number): (self: Any) => Effect.Effect<Lazy, TensorError>
+  (self: Any, dim: number): Effect.Effect<Lazy, TensorError>
+} = dual(2, (self: Any, dim: number): Effect.Effect<Lazy, TensorError> =>
   Effect.try({
     try: () => {
       const d = normalizeDim("cumsum", self.shape.length, dim)
@@ -1575,7 +1561,7 @@ export interface VarianceOptions extends ReduceOptions {
  * @category reductions
  */
 export const variance = dualOptions(
-  (self: GenericTensor, options: VarianceOptions = {}): Effect.Effect<LazyTensor, TensorError> =>
+  (self: Any, options: VarianceOptions = {}): Effect.Effect<Lazy, TensorError> =>
     Effect.gen(function* () {
       const dims = options.dims ?? self.shape.map((_, i) => i)
       const keepdims = options.keepdims ?? false
@@ -1603,7 +1589,7 @@ export const variance = dualOptions(
  * @category reductions
  */
 export const std = dualOptions(
-  (self: GenericTensor, options: VarianceOptions = {}): Effect.Effect<LazyTensor, TensorError> =>
+  (self: Any, options: VarianceOptions = {}): Effect.Effect<Lazy, TensorError> =>
     Effect.flatMap(variance(self, options), (v) => sqrt(v))
 )
 
@@ -1626,7 +1612,7 @@ export interface NormOptions extends ReduceOptions {
  * @category reductions
  */
 export const norm = dualOptions(
-  (self: GenericTensor, options: NormOptions = {}): Effect.Effect<LazyTensor, TensorError> =>
+  (self: Any, options: NormOptions = {}): Effect.Effect<Lazy, TensorError> =>
     Effect.gen(function* () {
       const ord = options.ord ?? 2
       const dims = options.dims ?? self.shape.map((_, i) => i)
@@ -1662,7 +1648,7 @@ export const norm = dualOptions(
  * @category reductions
  */
 export const all = dualOptions(
-  (self: GenericTensor, options: ReduceOptions = {}): Effect.Effect<LazyTensor, TensorError> =>
+  (self: Any, options: ReduceOptions = {}): Effect.Effect<Lazy, TensorError> =>
     Effect.gen(function* () {
       if (self.dtype !== "u8") {
         return yield* new TensorError({ op: "all", message: `all: expected a u8 tensor, got ${self.dtype}` })
@@ -1679,7 +1665,7 @@ export const all = dualOptions(
  * @category reductions
  */
 export const any = dualOptions(
-  (self: GenericTensor, options: ReduceOptions = {}): Effect.Effect<LazyTensor, TensorError> =>
+  (self: Any, options: ReduceOptions = {}): Effect.Effect<Lazy, TensorError> =>
     Effect.gen(function* () {
       if (self.dtype !== "u8") {
         return yield* new TensorError({ op: "any", message: `any: expected a u8 tensor, got ${self.dtype}` })
@@ -1696,7 +1682,7 @@ export const any = dualOptions(
  * @category reductions
  */
 export const logsumexp = dualOptions(
-  (self: GenericTensor, options: ReduceOptions = {}): Effect.Effect<LazyTensor, TensorError> =>
+  (self: Any, options: ReduceOptions = {}): Effect.Effect<Lazy, TensorError> =>
     Effect.gen(function* () {
       const dims = options.dims ?? self.shape.map((_, i) => i)
       const keepdims = options.keepdims ?? false
@@ -1726,11 +1712,11 @@ export const prod = reduceOp("prod", (a, dims, keepdims) => a.prod(dims, keepdim
  * @category shape operations
  */
 export const reshape: {
-  (shape: ReadonlyArray<number>): (self: GenericTensor) => Effect.Effect<LazyTensor, TensorError>
-  (self: GenericTensor, shape: ReadonlyArray<number>): Effect.Effect<LazyTensor, TensorError>
+  (shape: ReadonlyArray<number>): (self: Any) => Effect.Effect<Lazy, TensorError>
+  (self: Any, shape: ReadonlyArray<number>): Effect.Effect<Lazy, TensorError>
 } = dual(
   2,
-  (self: GenericTensor, newShape: ReadonlyArray<number>): Effect.Effect<LazyTensor, TensorError> =>
+  (self: Any, newShape: ReadonlyArray<number>): Effect.Effect<Lazy, TensorError> =>
     Effect.try({
       try: () => {
         const validShape = validateShape("reshape", newShape)
@@ -1754,11 +1740,11 @@ export const reshape: {
  * @category shape operations
  */
 export const transpose: {
-  (dims: ReadonlyArray<number>): (self: GenericTensor) => Effect.Effect<LazyTensor, TensorError>
-  (self: GenericTensor, dims: ReadonlyArray<number>): Effect.Effect<LazyTensor, TensorError>
+  (dims: ReadonlyArray<number>): (self: Any) => Effect.Effect<Lazy, TensorError>
+  (self: Any, dims: ReadonlyArray<number>): Effect.Effect<Lazy, TensorError>
 } = dual(
   2,
-  (self: GenericTensor, dims: ReadonlyArray<number>): Effect.Effect<LazyTensor, TensorError> =>
+  (self: Any, dims: ReadonlyArray<number>): Effect.Effect<Lazy, TensorError> =>
     Effect.try({
       try: () => {
         if (dims.length !== self.shape.length) {
@@ -1805,11 +1791,11 @@ export interface SliceOptions {
  * @category shape operations
  */
 export const slice: {
-  (options: SliceOptions): (self: GenericTensor) => Effect.Effect<LazyTensor, TensorError>
-  (self: GenericTensor, options: SliceOptions): Effect.Effect<LazyTensor, TensorError>
+  (options: SliceOptions): (self: Any) => Effect.Effect<Lazy, TensorError>
+  (self: Any, options: SliceOptions): Effect.Effect<Lazy, TensorError>
 } = dual(
   2,
-  (self: GenericTensor, options: SliceOptions): Effect.Effect<LazyTensor, TensorError> =>
+  (self: Any, options: SliceOptions): Effect.Effect<Lazy, TensorError> =>
     Effect.try({
       try: () => {
         const rank = self.shape.length
@@ -1851,9 +1837,9 @@ export const slice: {
  * @category shape operations
  */
 export const concat = (
-  tensors: readonly [GenericTensor, GenericTensor, ...ReadonlyArray<GenericTensor>],
+  tensors: readonly [Any, Any, ...ReadonlyArray<Any>],
   options: { readonly dim?: number } = {}
-): Effect.Effect<LazyTensor, TensorError> =>
+): Effect.Effect<Lazy, TensorError> =>
   Effect.try({
     try: () => {
       const [first, ...rest] = tensors
@@ -1893,11 +1879,11 @@ export const concat = (
  * @category shape operations
  */
 export const broadcastTo: {
-  (shape: ReadonlyArray<number>): (self: GenericTensor) => Effect.Effect<LazyTensor, TensorError>
-  (self: GenericTensor, shape: ReadonlyArray<number>): Effect.Effect<LazyTensor, TensorError>
+  (shape: ReadonlyArray<number>): (self: Any) => Effect.Effect<Lazy, TensorError>
+  (self: Any, shape: ReadonlyArray<number>): Effect.Effect<Lazy, TensorError>
 } = dual(
   2,
-  (self: GenericTensor, target: ReadonlyArray<number>): Effect.Effect<LazyTensor, TensorError> =>
+  (self: Any, target: ReadonlyArray<number>): Effect.Effect<Lazy, TensorError> =>
     Effect.try({
       try: () => {
         const validShape = validateShape("broadcastTo", target)
@@ -1927,9 +1913,9 @@ export const broadcastTo: {
  */
 export const flatten = dualOptions(
   (
-    self: GenericTensor,
+    self: Any,
     options: { readonly startDim?: number; readonly endDim?: number } = {}
-  ): Effect.Effect<LazyTensor, TensorError> =>
+  ): Effect.Effect<Lazy, TensorError> =>
     Effect.gen(function* () {
       const rank = self.shape.length
       const start = options.startDim ?? 0
@@ -1962,9 +1948,9 @@ export const flatten = dualOptions(
  */
 export const squeeze = dualOptions(
   (
-    self: GenericTensor,
+    self: Any,
     options: { readonly dims?: ReadonlyArray<number> } = {}
-  ): Effect.Effect<LazyTensor, TensorError> =>
+  ): Effect.Effect<Lazy, TensorError> =>
     Effect.gen(function* () {
       if (options.dims === undefined) {
         return yield* reshape(self, self.shape.filter((d) => d !== 1))
@@ -1989,9 +1975,9 @@ export const squeeze = dualOptions(
  * @category shape operations
  */
 export const unsqueeze: {
-  (dim: number): (self: GenericTensor) => Effect.Effect<LazyTensor, TensorError>
-  (self: GenericTensor, dim: number): Effect.Effect<LazyTensor, TensorError>
-} = dual(2, (self: GenericTensor, dim: number): Effect.Effect<LazyTensor, TensorError> =>
+  (dim: number): (self: Any) => Effect.Effect<Lazy, TensorError>
+  (self: Any, dim: number): Effect.Effect<Lazy, TensorError>
+} = dual(2, (self: Any, dim: number): Effect.Effect<Lazy, TensorError> =>
   Effect.gen(function* () {
     const rank = self.shape.length
     const d = dim < 0 ? dim + rank + 1 : dim
@@ -2015,9 +2001,9 @@ export const unsqueeze: {
  * @category shape operations
  */
 export const stack = (
-  tensors: readonly [GenericTensor, GenericTensor, ...ReadonlyArray<GenericTensor>],
+  tensors: readonly [Any, Any, ...ReadonlyArray<Any>],
   options: { readonly dim?: number } = {}
-): Effect.Effect<LazyTensor, TensorError> =>
+): Effect.Effect<Lazy, TensorError> =>
   Effect.gen(function* () {
     const rank = tensors[0].shape.length
     const dim = options.dim ?? 0
@@ -2028,11 +2014,11 @@ export const stack = (
         message: `stack: dimension ${dim} out of range for rank ${rank}`
       })
     }
-    const expanded: Array<LazyTensor> = []
+    const expanded: Array<Lazy> = []
     for (const t of tensors) {
       expanded.push(yield* unsqueeze(t, d))
     }
-    return yield* concat(expanded as [GenericTensor, GenericTensor, ...Array<GenericTensor>], { dim: d })
+    return yield* concat(expanded as [Any, Any, ...Array<Any>], { dim: d })
   })
 
 /**
@@ -2045,10 +2031,10 @@ export const stack = (
  * @category shape operations
  */
 export const split = (
-  self: GenericTensor,
+  self: Any,
   sections: number | ReadonlyArray<number>,
   options: { readonly dim?: number } = {}
-): Effect.Effect<Array<LazyTensor>, TensorError> =>
+): Effect.Effect<Array<Lazy>, TensorError> =>
   Effect.gen(function* () {
     const dim = options.dim ?? 0
     const d = normalizeDim("split", self.shape.length, dim)
@@ -2068,7 +2054,7 @@ export const split = (
       }
       sizes = sections
     }
-    const out: Array<LazyTensor> = []
+    const out: Array<Lazy> = []
     let offset = 0
     for (const size of sizes) {
       out.push(yield* slice(self, {
@@ -2088,10 +2074,10 @@ export const split = (
  * @category shape operations
  */
 export const chunk = (
-  self: GenericTensor,
+  self: Any,
   chunks: number,
   options: { readonly dim?: number } = {}
-): Effect.Effect<Array<LazyTensor>, TensorError> => {
+): Effect.Effect<Array<Lazy>, TensorError> => {
   const dim = options.dim ?? 0
   const d = dim < 0 ? dim + self.shape.length : dim
   const n = Number.isInteger(d) && d >= 0 && d < self.shape.length ? self.shape[d] : 0
@@ -2107,16 +2093,16 @@ export const chunk = (
  * @category shape operations
  */
 export const tile = (
-  self: GenericTensor,
+  self: Any,
   reps: ReadonlyArray<number>
-): Effect.Effect<LazyTensor, TensorError> =>
+): Effect.Effect<Lazy, TensorError> =>
   Effect.gen(function* () {
     for (const r of reps) {
       if (!Number.isInteger(r) || r < 1) {
         return yield* new TensorError({ op: "tile", message: `tile: reps must be positive integers, got [${reps}]` })
       }
     }
-    let cur: GenericTensor = self
+    let cur: Any = self
     if (reps.length > self.shape.length) {
       const extra = reps.length - self.shape.length
       cur = yield* reshape(cur, [...Array<number>(extra).fill(1), ...self.shape])
@@ -2136,7 +2122,7 @@ export const tile = (
       merged.splice(i + 1, 1)
       cur = yield* reshape(wide, merged)
     }
-    return cur as LazyTensor
+    return cur as Lazy
   })
 
 /**
@@ -2147,9 +2133,9 @@ export const tile = (
  * @category shape operations
  */
 export const pad = (
-  self: GenericTensor,
+  self: Any,
   pads: ReadonlyArray<readonly [before: number, after: number]>
-): Effect.Effect<LazyTensor, TensorError, CurrentDevice> =>
+): Effect.Effect<Lazy, TensorError, CurrentDevice> =>
   Effect.gen(function* () {
     if (pads.length > self.shape.length) {
       return yield* new TensorError({
@@ -2157,7 +2143,7 @@ export const pad = (
         message: `pad: ${pads.length} pad specs for a rank-${self.shape.length} tensor`
       })
     }
-    let cur: GenericTensor = self
+    let cur: Any = self
     for (let d = 0; d < pads.length; d++) {
       const [before, after] = pads[d]
       if (before < 0 || after < 0) {
@@ -2174,7 +2160,7 @@ export const pad = (
         cur = yield* concat([cur, yield* zeros(shape, { dtype: cur.dtype })], { dim: d })
       }
     }
-    return cur as LazyTensor
+    return cur as Lazy
   })
 
 /**
@@ -2187,21 +2173,21 @@ export const pad = (
  */
 export const take: {
   (
-    indexes: GenericTensor,
+    indexes: Any,
     options?: { readonly dim?: number }
-  ): (self: GenericTensor) => Effect.Effect<LazyTensor, TensorError>
+  ): (self: Any) => Effect.Effect<Lazy, TensorError>
   (
-    self: GenericTensor,
-    indexes: GenericTensor,
+    self: Any,
+    indexes: Any,
     options?: { readonly dim?: number }
-  ): Effect.Effect<LazyTensor, TensorError>
+  ): Effect.Effect<Lazy, TensorError>
 } = dual(
   (args) => args.length === 3 || (args.length === 2 && TensorTypeId in (args[1] as object)),
   (
-    self: GenericTensor,
-    indexes: GenericTensor,
+    self: Any,
+    indexes: Any,
     options: { readonly dim?: number } = {}
-  ): Effect.Effect<LazyTensor, TensorError> =>
+  ): Effect.Effect<Lazy, TensorError> =>
     Effect.try({
       try: () => {
         const d = normalizeDim("take", self.shape.length, options.dim ?? 0)
@@ -2234,21 +2220,21 @@ export const take: {
  */
 export const gather: {
   (
-    indexes: GenericTensor,
+    indexes: Any,
     options?: { readonly dim?: number }
-  ): (self: GenericTensor) => Effect.Effect<LazyTensor, TensorError>
+  ): (self: Any) => Effect.Effect<Lazy, TensorError>
   (
-    self: GenericTensor,
-    indexes: GenericTensor,
+    self: Any,
+    indexes: Any,
     options?: { readonly dim?: number }
-  ): Effect.Effect<LazyTensor, TensorError>
+  ): Effect.Effect<Lazy, TensorError>
 } = dual(
   (args) => args.length === 3 || (args.length === 2 && TensorTypeId in (args[1] as object)),
   (
-    self: GenericTensor,
-    indexes: GenericTensor,
+    self: Any,
+    indexes: Any,
     options: { readonly dim?: number } = {}
-  ): Effect.Effect<LazyTensor, TensorError> =>
+  ): Effect.Effect<Lazy, TensorError> =>
     Effect.try({
       try: () => {
         const d = normalizeDim("gather", self.shape.length, options.dim ?? 0)
@@ -2286,11 +2272,11 @@ export const gather: {
  * @category shape operations
  */
 export const scatterAdd = (
-  self: GenericTensor,
-  indexes: GenericTensor,
-  src: GenericTensor,
+  self: Any,
+  indexes: Any,
+  src: Any,
   options: { readonly dim?: number } = {}
-): Effect.Effect<LazyTensor, TensorError> =>
+): Effect.Effect<Lazy, TensorError> =>
   Effect.try({
     try: () => {
       const d = normalizeDim("scatterAdd", self.shape.length, options.dim ?? 0)
@@ -2329,18 +2315,18 @@ export const scatterAdd = (
  * @category shape operations
  */
 export const flip = (
-  self: GenericTensor,
+  self: Any,
   dims: ReadonlyArray<number>
-): Effect.Effect<LazyTensor, TensorError, CurrentDevice> =>
+): Effect.Effect<Lazy, TensorError, CurrentDevice> =>
   Effect.gen(function* () {
     const normalized = normalizeDims("flip", self.shape.length, dims)
-    let cur: GenericTensor = self
+    let cur: Any = self
     for (const d of normalized) {
       const n = self.shape[d]
       const idx = yield* add(yield* mul(yield* arange(n, undefined, { dtype: "i64" }), -1), n - 1)
       cur = yield* take(cur, idx, { dim: d })
     }
-    return cur as LazyTensor
+    return cur as Lazy
   })
 
 /**
@@ -2351,10 +2337,10 @@ export const flip = (
  * @category shape operations
  */
 export const oneHot = (
-  indexes: GenericTensor,
+  indexes: Any,
   depth: number,
   options: { readonly dtype?: "f32" | "f64" } = {}
-): Effect.Effect<LazyTensor, TensorError, CurrentDevice> =>
+): Effect.Effect<Lazy, TensorError, CurrentDevice> =>
   Effect.gen(function* () {
     if (indexes.dtype !== "i64" && indexes.dtype !== "u32") {
       return yield* new TensorError({
@@ -2386,16 +2372,16 @@ export const oneHot = (
  */
 export const crossEntropy: {
   (
-    options: { readonly target: GenericTensor; readonly ignoreIndex?: number }
-  ): (self: GenericTensor) => Effect.Effect<LazyTensor, TensorError>
+    options: { readonly target: Any; readonly ignoreIndex?: number }
+  ): (self: Any) => Effect.Effect<Lazy, TensorError>
   (
-    self: GenericTensor,
-    options: { readonly target: GenericTensor; readonly ignoreIndex?: number }
-  ): Effect.Effect<LazyTensor, TensorError>
+    self: Any,
+    options: { readonly target: Any; readonly ignoreIndex?: number }
+  ): Effect.Effect<Lazy, TensorError>
 } = dual(2, (
-  self: GenericTensor,
-  options: { readonly target: GenericTensor; readonly ignoreIndex?: number }
-): Effect.Effect<LazyTensor, TensorError> =>
+  self: Any,
+  options: { readonly target: Any; readonly ignoreIndex?: number }
+): Effect.Effect<Lazy, TensorError> =>
   Effect.try({
     try: () => {
       const { target } = options
@@ -2439,12 +2425,12 @@ export const crossEntropy: {
  * @category shape operations
  */
 export const embedding = (
-  indexes: GenericTensor,
+  indexes: Any,
   options: {
-    readonly weight: GenericTensor
+    readonly weight: Any
     readonly paddingIndex?: number
   }
-): Effect.Effect<LazyTensor, TensorError> =>
+): Effect.Effect<Lazy, TensorError> =>
   Effect.gen(function* () {
     const { paddingIndex, weight } = options
     if (weight.shape.length !== 2) {
@@ -2483,7 +2469,7 @@ export const embedding = (
     }
     const n = indexes.shape.reduce((acc, d) => acc * d, 1)
     const flat = indexes.shape.length === 1 ? indexes : yield* reshape(indexes, [n])
-    let out: GenericTensor = yield* take(weight, flat, { dim: 0 })
+    let out: Any = yield* take(weight, flat, { dim: 0 })
     if (paddingIndex !== undefined) {
       const mask = yield* broadcastTo(
         yield* reshape(yield* cast(yield* eq(flat, paddingIndex), weight.dtype), [n, 1]),
@@ -2497,10 +2483,10 @@ export const embedding = (
 
 const triangleMask = (
   op: string,
-  self: GenericTensor,
+  self: Any,
   diagonal: number,
   keepUpper: boolean
-): Effect.Effect<LazyTensor, TensorError, CurrentDevice> =>
+): Effect.Effect<Lazy, TensorError, CurrentDevice> =>
   Effect.gen(function* () {
     if (self.shape.length < 2) {
       return yield* new TensorError({ op, message: `${op}: expected rank >= 2, got rank ${self.shape.length}` })
@@ -2523,9 +2509,9 @@ const triangleMask = (
  */
 export const triu = dualOptions(
   (
-    self: GenericTensor,
+    self: Any,
     options: { readonly diagonal?: number } = {}
-  ): Effect.Effect<LazyTensor, TensorError, CurrentDevice> => triangleMask("triu", self, options.diagonal ?? 0, true)
+  ): Effect.Effect<Lazy, TensorError, CurrentDevice> => triangleMask("triu", self, options.diagonal ?? 0, true)
 )
 
 /**
@@ -2537,9 +2523,9 @@ export const triu = dualOptions(
  */
 export const tril = dualOptions(
   (
-    self: GenericTensor,
+    self: Any,
     options: { readonly diagonal?: number } = {}
-  ): Effect.Effect<LazyTensor, TensorError, CurrentDevice> => triangleMask("tril", self, options.diagonal ?? 0, false)
+  ): Effect.Effect<Lazy, TensorError, CurrentDevice> => triangleMask("tril", self, options.diagonal ?? 0, false)
 )
 
 /**
@@ -2550,11 +2536,11 @@ export const tril = dualOptions(
  * @category operations
  */
 export const dot: {
-  (other: GenericTensor): (self: GenericTensor) => Effect.Effect<LazyTensor, TensorError>
-  (self: GenericTensor, other: GenericTensor): Effect.Effect<LazyTensor, TensorError>
+  (other: Any): (self: Any) => Effect.Effect<Lazy, TensorError>
+  (self: Any, other: Any): Effect.Effect<Lazy, TensorError>
 } = dual(
   2,
-  (self: GenericTensor, other: GenericTensor): Effect.Effect<LazyTensor, TensorError> =>
+  (self: Any, other: Any): Effect.Effect<Lazy, TensorError> =>
     Effect.gen(function* () {
       if (self.shape.length === 1 && other.shape.length === 1) {
         return yield* sum(yield* mul(self, other))
@@ -2570,8 +2556,8 @@ export const dot: {
  * @category operations
  */
 export const trace = (
-  self: GenericTensor
-): Effect.Effect<LazyTensor, TensorError, CurrentDevice> =>
+  self: Any
+): Effect.Effect<Lazy, TensorError, CurrentDevice> =>
   Effect.gen(function* () {
     if (self.shape.length !== 2 || self.shape[0] !== self.shape[1]) {
       return yield* new TensorError({
@@ -2600,8 +2586,8 @@ export interface ConvOptions {
 
 const checkConvOptions = (
   op: string,
-  self: GenericTensor,
-  weight: GenericTensor,
+  self: Any,
+  weight: Any,
   options: ConvOptions,
   rank: number
 ): Effect.Effect<
@@ -2660,21 +2646,21 @@ const convOutDim = (
  */
 export const conv2d: {
   (
-    weight: GenericTensor,
+    weight: Any,
     options?: ConvOptions
-  ): (self: GenericTensor) => Effect.Effect<LazyTensor, TensorError>
+  ): (self: Any) => Effect.Effect<Lazy, TensorError>
   (
-    self: GenericTensor,
-    weight: GenericTensor,
+    self: Any,
+    weight: Any,
     options?: ConvOptions
-  ): Effect.Effect<LazyTensor, TensorError>
+  ): Effect.Effect<Lazy, TensorError>
 } = dual(
   (args) => args.length === 3 || (args.length === 2 && TensorTypeId in (args[1] as object)),
   (
-    self: GenericTensor,
-    weight: GenericTensor,
+    self: Any,
+    weight: Any,
     options: ConvOptions = {}
-  ): Effect.Effect<LazyTensor, TensorError> =>
+  ): Effect.Effect<Lazy, TensorError> =>
     Effect.gen(function* () {
       const opts = yield* checkConvOptions("conv2d", self, weight, options, 2)
       yield* Effect.try({
@@ -2721,21 +2707,21 @@ export const conv2d: {
  */
 export const conv1d: {
   (
-    weight: GenericTensor,
+    weight: Any,
     options?: ConvOptions
-  ): (self: GenericTensor) => Effect.Effect<LazyTensor, TensorError>
+  ): (self: Any) => Effect.Effect<Lazy, TensorError>
   (
-    self: GenericTensor,
-    weight: GenericTensor,
+    self: Any,
+    weight: Any,
     options?: ConvOptions
-  ): Effect.Effect<LazyTensor, TensorError>
+  ): Effect.Effect<Lazy, TensorError>
 } = dual(
   (args) => args.length === 3 || (args.length === 2 && TensorTypeId in (args[1] as object)),
   (
-    self: GenericTensor,
-    weight: GenericTensor,
+    self: Any,
+    weight: Any,
     options: ConvOptions = {}
-  ): Effect.Effect<LazyTensor, TensorError> =>
+  ): Effect.Effect<Lazy, TensorError> =>
     Effect.gen(function* () {
       const opts = yield* checkConvOptions("conv1d", self, weight, options, 1)
       yield* Effect.try({
@@ -2773,10 +2759,10 @@ export const conv1d: {
 )
 
 const dilateDim = (
-  self: GenericTensor,
+  self: Any,
   dim: number,
   factor: number
-): Effect.Effect<LazyTensor, TensorError, CurrentDevice> =>
+): Effect.Effect<Lazy, TensorError, CurrentDevice> =>
   Effect.gen(function* () {
     if (factor === 1) {
       return yield* add(self, 0)
@@ -2808,12 +2794,12 @@ export interface ConvTransposeOptions extends ConvOptions {
 
 const convTranspose2dImpl = (
   op: string,
-  self: GenericTensor,
-  weight: GenericTensor,
+  self: Any,
+  weight: Any,
   options: ConvTransposeOptions,
   userPadding: readonly [number, number],
   outputPads: readonly [number, number]
-): Effect.Effect<LazyTensor, TensorError, CurrentDevice> =>
+): Effect.Effect<Lazy, TensorError, CurrentDevice> =>
   Effect.gen(function* () {
     const opts = yield* checkConvOptions(op, self, weight, options, 2)
     const outputPadding = options.outputPadding ?? 0
@@ -2862,7 +2848,7 @@ const convTranspose2dImpl = (
         message: `${op}: padding [${userPadding}] is too large for kernel [${kh}, ${kw}] with dilation ${opts.dilation}`
       })
     }
-    const convGroup = (x: GenericTensor, w: GenericTensor): Effect.Effect<LazyTensor, TensorError, CurrentDevice> =>
+    const convGroup = (x: Any, w: Any): Effect.Effect<Lazy, TensorError, CurrentDevice> =>
       Effect.gen(function* () {
         const dilated = yield* dilateDim(yield* dilateDim(x, 2, opts.stride), 3, opts.stride)
         const kernel = yield* flip(yield* transpose(w, [1, 0, 2, 3]), [2, 3])
@@ -2871,17 +2857,17 @@ const convTranspose2dImpl = (
           : dilated
         return yield* conv2d(padded, kernel, { dilation: opts.dilation })
       })
-    let out: LazyTensor
+    let out: Lazy
     if (groups === 1) {
       out = yield* convGroup(self, weight)
     } else {
       const xs = yield* split(self, Array<number>(groups).fill(cIn / groups), { dim: 1 })
       const ws = yield* split(weight, Array<number>(groups).fill(wIn / groups), { dim: 0 })
-      const outs: Array<LazyTensor> = []
+      const outs: Array<Lazy> = []
       for (let i = 0; i < groups; i++) {
         outs.push(yield* convGroup(xs[i], ws[i]))
       }
-      out = yield* concat(outs as [GenericTensor, GenericTensor, ...Array<GenericTensor>], { dim: 1 })
+      out = yield* concat(outs as [Any, Any, ...Array<Any>], { dim: 1 })
     }
     if (outputPads[0] > 0 || outputPads[1] > 0) {
       out = yield* pad(out, [[0, 0], [0, 0], [0, outputPads[0]], [0, outputPads[1]]])
@@ -2901,21 +2887,21 @@ const convTranspose2dImpl = (
  */
 export const convTranspose2d: {
   (
-    weight: GenericTensor,
+    weight: Any,
     options?: ConvTransposeOptions
-  ): (self: GenericTensor) => Effect.Effect<LazyTensor, TensorError, CurrentDevice>
+  ): (self: Any) => Effect.Effect<Lazy, TensorError, CurrentDevice>
   (
-    self: GenericTensor,
-    weight: GenericTensor,
+    self: Any,
+    weight: Any,
     options?: ConvTransposeOptions
-  ): Effect.Effect<LazyTensor, TensorError, CurrentDevice>
+  ): Effect.Effect<Lazy, TensorError, CurrentDevice>
 } = dual(
   (args) => args.length === 3 || (args.length === 2 && TensorTypeId in (args[1] as object)),
   (
-    self: GenericTensor,
-    weight: GenericTensor,
+    self: Any,
+    weight: Any,
     options: ConvTransposeOptions = {}
-  ): Effect.Effect<LazyTensor, TensorError, CurrentDevice> =>
+  ): Effect.Effect<Lazy, TensorError, CurrentDevice> =>
     convTranspose2dImpl("convTranspose2d", self, weight, options, [
       options.padding ?? 0,
       options.padding ?? 0
@@ -2935,21 +2921,21 @@ export const convTranspose2d: {
  */
 export const convTranspose1d: {
   (
-    weight: GenericTensor,
+    weight: Any,
     options?: ConvTransposeOptions
-  ): (self: GenericTensor) => Effect.Effect<LazyTensor, TensorError, CurrentDevice>
+  ): (self: Any) => Effect.Effect<Lazy, TensorError, CurrentDevice>
   (
-    self: GenericTensor,
-    weight: GenericTensor,
+    self: Any,
+    weight: Any,
     options?: ConvTransposeOptions
-  ): Effect.Effect<LazyTensor, TensorError, CurrentDevice>
+  ): Effect.Effect<Lazy, TensorError, CurrentDevice>
 } = dual(
   (args) => args.length === 3 || (args.length === 2 && TensorTypeId in (args[1] as object)),
   (
-    self: GenericTensor,
-    weight: GenericTensor,
+    self: Any,
+    weight: Any,
     options: ConvTransposeOptions = {}
-  ): Effect.Effect<LazyTensor, TensorError, CurrentDevice> =>
+  ): Effect.Effect<Lazy, TensorError, CurrentDevice> =>
     Effect.gen(function* () {
       if (self.shape.length !== 3 || weight.shape.length !== 3) {
         return yield* new TensorError({
@@ -2985,10 +2971,10 @@ export interface PoolOptions {
 
 const pool2d = (
   op: string,
-  reduce: (t: GenericTensor) => Effect.Effect<LazyTensor, TensorError>,
-  self: GenericTensor,
+  reduce: (t: Any) => Effect.Effect<Lazy, TensorError>,
+  self: Any,
   options: PoolOptions
-): Effect.Effect<LazyTensor, TensorError, CurrentDevice> =>
+): Effect.Effect<Lazy, TensorError, CurrentDevice> =>
   Effect.gen(function* () {
     if (self.shape.length !== 4) {
       return yield* new TensorError({
@@ -3022,7 +3008,7 @@ const pool2d = (
         message: `${op}: kernel [${kh}, ${kw}] is larger than the padded input [${padded.shape[2]}, ${padded.shape[3]}]`
       })
     }
-    const windows: Array<LazyTensor> = []
+    const windows: Array<Lazy> = []
     for (let ky = 0; ky < kh; ky++) {
       for (let kx = 0; kx < kw; kx++) {
         windows.push(yield* slice(padded, {
@@ -3033,7 +3019,7 @@ const pool2d = (
       }
     }
     const stacked = yield* stack(
-      windows as unknown as [GenericTensor, GenericTensor, ...Array<GenericTensor>],
+      windows as unknown as [Any, Any, ...Array<Any>],
       { dim: 0 }
     )
     return yield* reduce(stacked)
@@ -3047,9 +3033,9 @@ const pool2d = (
  * @category neural network
  */
 export const maxPool2d = (
-  self: GenericTensor,
+  self: Any,
   options: PoolOptions
-): Effect.Effect<LazyTensor, TensorError, CurrentDevice> =>
+): Effect.Effect<Lazy, TensorError, CurrentDevice> =>
   pool2d("maxPool2d", (t) => max(t, { dims: [0] }), self, options)
 
 /**
@@ -3059,12 +3045,12 @@ export const maxPool2d = (
  * @category neural network
  */
 export const avgPool2d = (
-  self: GenericTensor,
+  self: Any,
   options: PoolOptions
-): Effect.Effect<LazyTensor, TensorError, CurrentDevice> =>
+): Effect.Effect<Lazy, TensorError, CurrentDevice> =>
   pool2d("avgPool2d", (t) => mean(t, { dims: [0] }), self, options)
 
-const checkSquare = (op: string, self: GenericTensor): Effect.Effect<void, TensorError> =>
+const checkSquare = (op: string, self: Any): Effect.Effect<void, TensorError> =>
   Effect.gen(function* () {
     const rank = self.shape.length
     if (rank < 2 || self.shape[rank - 2] !== self.shape[rank - 1]) {
@@ -3086,7 +3072,7 @@ const checkSquare = (op: string, self: GenericTensor): Effect.Effect<void, Tenso
  * @since 0.1.0
  * @category linalg
  */
-export const inverse = (self: GenericTensor): Effect.Effect<LazyTensor, TensorError> =>
+export const inverse = (self: Any): Effect.Effect<Lazy, TensorError> =>
   Effect.gen(function* () {
     yield* checkSquare("inverse", self)
     return yield* Effect.try({
@@ -3104,7 +3090,7 @@ export const inverse = (self: GenericTensor): Effect.Effect<LazyTensor, TensorEr
  * @since 0.1.0
  * @category linalg
  */
-export const det = (self: GenericTensor): Effect.Effect<LazyTensor, TensorError> =>
+export const det = (self: Any): Effect.Effect<Lazy, TensorError> =>
   Effect.gen(function* () {
     yield* checkSquare("det", self)
     return yield* Effect.try({
@@ -3124,11 +3110,11 @@ export const det = (self: GenericTensor): Effect.Effect<LazyTensor, TensorError>
  * @category linalg
  */
 export const solve: {
-  (b: GenericTensor): (self: GenericTensor) => Effect.Effect<LazyTensor, TensorError>
-  (self: GenericTensor, b: GenericTensor): Effect.Effect<LazyTensor, TensorError>
+  (b: Any): (self: Any) => Effect.Effect<Lazy, TensorError>
+  (self: Any, b: Any): Effect.Effect<Lazy, TensorError>
 } = dual(
   2,
-  (self: GenericTensor, b: GenericTensor): Effect.Effect<LazyTensor, TensorError> =>
+  (self: Any, b: Any): Effect.Effect<Lazy, TensorError> =>
     Effect.gen(function* () {
       yield* checkSquare("solve", self)
       const rank = self.shape.length
@@ -3164,9 +3150,9 @@ export const solve: {
  * @category operations
  */
 export const cast: {
-  (dtype: DType): (self: GenericTensor) => Effect.Effect<LazyTensor, TensorError>
-  (self: GenericTensor, dtype: DType): Effect.Effect<LazyTensor, TensorError>
-} = dual(2, (self: GenericTensor, dtype: DType): Effect.Effect<LazyTensor, TensorError> =>
+  (dtype: DType): (self: Any) => Effect.Effect<Lazy, TensorError>
+  (self: Any, dtype: DType): Effect.Effect<Lazy, TensorError>
+} = dual(2, (self: Any, dtype: DType): Effect.Effect<Lazy, TensorError> =>
   Effect.try({
     try: () => makeLazy(self.lazy.cast(dtype as NativeDType), self.shape, dtype, self.device),
     catch: (error) =>
@@ -3213,16 +3199,16 @@ const fromNative = <A>(
  * @since 0.1.0
  * @category destructors
  */
-export const compute = <Roots extends ReadonlyArray<GenericTensor>>(
+export const compute = <Roots extends ReadonlyArray<Any>>(
   roots: Roots
-): Effect.Effect<{ readonly [K in keyof Roots]: Tensor }, TensorError> =>
+): Effect.Effect<{ readonly [K in keyof Roots]: Concrete }, TensorError> =>
   roots.every(isTensor)
-    ? Effect.succeed(roots as { readonly [K in keyof Roots]: Tensor })
+    ? Effect.succeed(roots as { readonly [K in keyof Roots]: Concrete })
     : Effect.map(
         fromNative("evaluate", (token) => evalLazy(roots.map((root) => root.lazy), token)),
         (handles) => {
           reportExternalMemory(handles.reduce((total, handle) => total + handle.bytes, 0))
-          return handles.map(fromHandle) as { readonly [K in keyof Roots]: Tensor }
+          return handles.map(fromHandle) as { readonly [K in keyof Roots]: Concrete }
         }
       )
 
@@ -3252,7 +3238,7 @@ const typedArrayConstructor = (dtype: DType) => {
  * @since 0.1.0
  * @category destructors
  */
-export const toTypedArray = (self: GenericTensor): Effect.Effect<TypedArray, TensorError> =>
+export const toTypedArray = (self: Any): Effect.Effect<TypedArray, TensorError> =>
   Effect.flatMap(compute([self]), ([evaluated]) =>
     fromNative<TypedArray>("toTypedArray", (token) =>
       evaluated.materialized.readback(token).then((buffer) => {
@@ -3271,7 +3257,7 @@ export const toTypedArray = (self: GenericTensor): Effect.Effect<TypedArray, Ten
  * @since 0.1.0
  * @category destructors
  */
-export const toNumberArray = (self: GenericTensor): Effect.Effect<Array<number>, TensorError> =>
+export const toNumberArray = (self: Any): Effect.Effect<Array<number>, TensorError> =>
   self.dtype === "i64"
     ? new TensorError({
         op: "toNumberArray",
@@ -3292,7 +3278,7 @@ export const toNumberArray = (self: GenericTensor): Effect.Effect<Array<number>,
  * @since 0.1.0
  * @category destructors
  */
-export const dispose = (self: Tensor): Effect.Effect<void, TensorError> =>
+export const dispose = (self: Concrete): Effect.Effect<void, TensorError> =>
   Effect.try({
     try: () => {
       self.materialized.dispose()
@@ -3317,7 +3303,7 @@ export const dispose = (self: Tensor): Effect.Effect<void, TensorError> =>
  */
 export const save = (
   path: string,
-  tensors: Readonly<Record<string, GenericTensor>>
+  tensors: Readonly<Record<string, Any>>
 ): Effect.Effect<void, TensorError> => {
   const entries = Object.entries(tensors)
   return fromNative<void>("save", (token) =>
@@ -3341,7 +3327,7 @@ export const save = (
  */
 export const load = (
   path: string
-): Effect.Effect<Record<string, Tensor>, TensorError, CurrentDevice> =>
+): Effect.Effect<Record<string, Concrete>, TensorError, CurrentDevice> =>
   Effect.gen(function* () {
     const device = yield* CurrentDevice
     const [names, handles] = yield* fromNative("load", (token) => loadTensors(path, device, token))

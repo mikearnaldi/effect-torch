@@ -21,10 +21,10 @@ const INNER = 20
 const BATCH = 10
 
 const chain = (
-  a: Tensor.GenericTensor,
-  b: Tensor.GenericTensor,
+  a: Tensor.Any,
+  b: Tensor.Any,
   n: number
-): Effect.Effect<Tensor.LazyTensor, Tensor.TensorError> =>
+): Effect.Effect<Tensor.Lazy, Tensor.TensorError> =>
   Effect.gen(function* () {
     let r = yield* Tensor.matmul(a, b)
     for (let i = 1; i < n; i++) {

@@ -4,7 +4,7 @@ import { Effect } from "effect"
 import { Gradient, Loss, Tensor } from "../src/index.ts"
 import { floats, onDevices, TOL, type TestDevice } from "./utils/devices.ts"
 
-const values = (t: Tensor.GenericTensor) =>
+const values = (t: Tensor.Any) =>
   Effect.map(Tensor.toTypedArray(t), (arr) => Array.from<number | bigint>(arr).map(Number))
 
 const withFusion = <A, E, R>(enabled: boolean, effect: Effect.Effect<A, E, R>): Effect.Effect<A, E, R> =>

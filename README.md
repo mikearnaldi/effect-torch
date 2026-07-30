@@ -26,7 +26,7 @@ open, with an API surface small enough to read end to end:
 ```
 ┌─────────────────────────────────────────────┐
 │ @effect-torch/core (TypeScript)             │
-│   Tensor ops → Effect<LazyTensor, TensorError> │
+│   Tensor ops → Effect<Tensor.Lazy, TensorError> │
 │   shape/dtype/device checked at graph build  │
 └──────────────────┬──────────────────────────┘
                    │ napi-rs (one FFI hop per evaluate)
@@ -107,18 +107,18 @@ Everything is exported through two namespaces: `Tensor` and `Device`.
 
 | Export | Description |
 | --- | --- |
-| `GenericTensor` | Supertype accepted by every operation |
-| `LazyTensor` | A tensor described by a lazy computation graph |
-| `Tensor` | A materialized tensor living on the device |
+| `Any` | Supertype accepted by every operation |
+| `Lazy` | A tensor described by a lazy computation graph |
+| `Concrete` | A materialized tensor living on the device |
 | `DType` | `"f32" \| "f64" \| "i64" \| "u8" \| "u32"` |
 | `TypedArray` | The JS typed arrays matching each `DType` |
 | `TensorError` | Tagged error raised by every operation |
-| `isLazyTensor` / `isTensor` | Refinements on `GenericTensor` |
+| `isLazyTensor` / `isTensor` | Refinements on `Any` |
 | `shape` / `dtype` / `device` | Getters |
 
 ### `Tensor` — constructors
 
-All constructors return `Effect<LazyTensor, TensorError, CurrentDevice>` and
+All constructors return `Effect<Tensor.Lazy, TensorError, CurrentDevice>` and
 accept an optional `{ dtype }`.
 
 | Export | Description |
@@ -136,7 +136,7 @@ accept an optional `{ dtype }`.
 ### `Tensor` — elementwise operations
 
 All dual (data-first and data-last), all lazy. Binary operations accept
-`GenericTensor | number` (a number is lifted to a scalar of the same
+`Tensor.Any | number` (a number is lifted to a scalar of the same
 dtype/device) and broadcast like NumPy. Mixed dtypes or devices fail.
 
 | Export | Description |
@@ -318,8 +318,8 @@ const trained = Effect.gen(function* () {
 ### `Model`
 
 Models are pure values pairing parameter construction with a parameterised
-forward graph — the Flax/Haiku design, flattened: parameters are a plain
-tuple of tensors, so `Gradient.grad` and `Optimizer.step` work on any
+forward graph — the Flax/Haiku design, flattened: parameters are a flat
+array of tensors, so `Gradient.grad` and `Optimizer.step` work on any
 model with zero adapter code. There is no mutable module state. Everything
 that can fail returns an `Effect`: constructors validate into a
 `ModelError`, and `Model.train` runs the full training loop.
@@ -335,9 +335,8 @@ that can fail returns an `Effect`: constructors validate into a
 | `Model.softmax(dim?)` / `logSoftmax(dim?)` / `flatten(opts?)` | `Effect`s of shape/reduction stages (`flatten` preserves the batch dim) |
 | `Model.dropout({ p? })` | `Effect` of inverted dropout — always applies; build the eval chain without it |
 | `Model.maxPool2d(opts)` / `avgPool2d(opts)` | `Effect`s of pooling stages |
-| `Model.chain(...models)` | `Effect` of sequential composition; parameter tuple computed at the type level |
+| `Model.chain(...models)` | `Effect` of sequential composition; parameter arrays concatenated in order, arity checked in `forward` |
 | `Model.train(model, { optimizer, loss, data, stop, params?, onStep? })` | the training loop: init → forward → loss → grad → update, one walk per step; `stop: (info) => boolean` ends it (step count, loss target, anything) |
-| `Model.Params<typeof model>` | extracts a model's parameter tuple type |
 | `Model.save(model, params, path)` / `Model.load(model, path)` | named checkpoints via safetensors |
 
 ```ts
@@ -348,7 +347,6 @@ const program = Effect.gen(function* () {
     yield* Model.linear("fc2", 8, 1),
     yield* Model.sigmoid
   )
-  // Model.Params<typeof model> = readonly [fc1.weight, fc1.bias, fc2.weight, fc2.bias]
 
   const trained = yield* Model.train(model, {
     optimizer: Optimizer.adam({ lr: 0.1 }),

@@ -8,7 +8,7 @@ import { deep, floats, onDevices, type TestDevice } from "./utils/devices.ts"
 
 const tmpdir = Effect.sync(() => fs.mkdtempSync(path.join(os.tmpdir(), "effect-torch-")))
 
-const values = (t: Tensor.GenericTensor) => Tensor.toNumberArray(t)
+const values = (t: Tensor.Any) => Tensor.toNumberArray(t)
 
 const mlp = Effect.gen(function* () {
   return yield* Model.chain(
@@ -20,8 +20,8 @@ const mlp = Effect.gen(function* () {
 })
 
 const handForward = (
-  [w1, b1, w2, b2]: ReadonlyArray<Tensor.GenericTensor>,
-  x: Tensor.GenericTensor
+  [w1, b1, w2, b2]: ReadonlyArray<Tensor.Any>,
+  x: Tensor.Any
 ) =>
   Effect.gen(function* () {
     const h = yield* Tensor.tanh(yield* Tensor.add(yield* Tensor.matmul(x, w1), b1))
@@ -84,32 +84,51 @@ onDevices("Model", (device: TestDevice) => (it) => {
     )
   })
 
-  describe("types", () => {
-    it.effect("chain infers the concatenated parameter tuple", () =>
+  describe("arity", () => {
+    it.effect("init produces one parameter per name", () =>
       Effect.gen(function* () {
-        const params: readonly [
-          Tensor.GenericTensor,
-          Tensor.GenericTensor,
-          Tensor.GenericTensor,
-          Tensor.GenericTensor
-        ] = yield* (yield* mlp).init
-        expect(params.length).toBe(4)
+        const model = yield* mlp
+        const params = yield* model.init
+        expect(params.length).toBe(model.names.length)
       })
     )
 
-    it.effect("nested chains flatten to one tuple", () =>
+    it.effect("forward fails with ModelError on the wrong parameter count", () =>
+      Effect.gen(function* () {
+        const model = yield* mlp
+        const params = yield* model.init
+        const x = yield* Tensor.fromTypedArray(floats([0, 1]), [1, 2])
+        const error = yield* Effect.flip(model.forward(params.slice(0, 3), x))
+        expect(error._tag).toBe("ModelError")
+        if (error._tag === "ModelError") {
+          expect(error.op).toBe("forward")
+          expect(error.message).toContain("4 parameters")
+          expect(error.message).toContain("got 3")
+        }
+      })
+    )
+
+    it.effect("a layer called directly checks its own arity", () =>
+      Effect.gen(function* () {
+        const fc = yield* Model.linear("fc1", 2, 8)
+        const x = yield* Tensor.fromTypedArray(floats([0, 1]), [1, 2])
+        const error = yield* Effect.flip(fc.forward([], x))
+        expect(error._tag).toBe("ModelError")
+        if (error._tag === "ModelError") {
+          expect(error.message).toContain("fc1")
+          expect(error.message).toContain("[fc1.weight, fc1.bias]")
+        }
+      })
+    )
+
+    it.effect("nested chains flatten to one array", () =>
       Effect.gen(function* () {
         const nested = yield* Model.chain(
           yield* Model.chain(yield* Model.linear("a", 2, 3), yield* Model.relu),
           yield* Model.chain(yield* Model.relu, yield* Model.linear("b", 3, 1))
         )
         expect(nested.names).toEqual(["a.weight", "a.bias", "b.weight", "b.bias"])
-        const params: readonly [
-          Tensor.GenericTensor,
-          Tensor.GenericTensor,
-          Tensor.GenericTensor,
-          Tensor.GenericTensor
-        ] = yield* nested.init
+        const params = yield* nested.init
         expect(params.length).toBe(4)
       })
     )
@@ -142,7 +161,7 @@ onDevices("Model", (device: TestDevice) => (it) => {
       })
     )
 
-    it.effect("slices the parameter tuple across mixed parameterless and parameterised stages", () =>
+    it.effect("slices the parameter array across mixed parameterless and parameterised stages", () =>
       Effect.gen(function* () {
         const model = yield* Model.chain(
           yield* Model.linear("a", 2, 3),
@@ -284,7 +303,7 @@ onDevices("Model", (device: TestDevice) => (it) => {
     it.effect("activation models apply the corresponding tensor operations", () =>
       Effect.gen(function* () {
         const x = yield* Tensor.fromTypedArray(floats([-2, -0.5, 0, 0.5, 2]), [5])
-        const cases: Array<[Model.Model<readonly []>, (x: Tensor.GenericTensor) => Effect.Effect<Tensor.LazyTensor, Tensor.TensorError>]> = [
+        const cases: Array<[Model.Model, (x: Tensor.Any) => Effect.Effect<Tensor.Lazy, Tensor.TensorError>]> = [
           [yield* Model.gelu(), (x) => Tensor.gelu(x)],
           [yield* Model.gelu({ approximate: "tanh" }), (x) => Tensor.gelu(x, { approximate: "tanh" })],
           [yield* Model.silu, Tensor.silu],
@@ -362,7 +381,7 @@ onDevices("Model", (device: TestDevice) => (it) => {
       })
     )
 
-    it.effect("a dropout stage drops out of the eval chain with the same parameter tuple", () =>
+    it.effect("a dropout stage drops out of the eval chain with the same parameter array", () =>
       Effect.gen(function* () {
         const trainNet = yield* Model.chain(
           yield* Model.linear("fc1", 2, 4),
@@ -534,7 +553,7 @@ onDevices("Model", (device: TestDevice) => (it) => {
         const x = yield* Tensor.fromTypedArray(floats([0, 0, 0, 1, 1, 0, 1, 1]), [4, 2])
         const y = yield* Tensor.fromTypedArray(floats([0, 1, 1, 0]), [4, 1])
         const initial = yield* Tensor.compute(yield* model.init)
-        const lossOf = (params: Model.Params<typeof model>) =>
+        const lossOf = (params: Model.Params) =>
           Effect.gen(function* () {
             const [value] = yield* Tensor.compute([
               yield* Loss.mse(yield* model.forward(params, x), y)

@@ -23,7 +23,7 @@ Both are transparent to the public API.
 
 ### GC blindness
 
-Every JS-side handle (`LazyTensor`, `NativeTensor`, zero-copy readback
+Every JS-side handle (`Tensor.Lazy`, `NativeTensor`, zero-copy readback
 `ArrayBuffer`) is a few dozen bytes of JS object wrapping potentially
 megabytes of native/device memory. V8's GC decides when to collect based on
 JS-heap pressure only; it cannot see the native side. Under a training loop

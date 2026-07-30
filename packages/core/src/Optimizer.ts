@@ -58,7 +58,7 @@ export interface SgdConfig {
  * @category models
  */
 export interface SgdState {
-  readonly velocity: ReadonlyArray<Tensor.GenericTensor> | null
+  readonly velocity: ReadonlyArray<Tensor.Any> | null
 }
 
 /**
@@ -98,8 +98,8 @@ export interface AdamWConfig extends AdamConfig {
  * @category models
  */
 export interface AdamState {
-  readonly m: ReadonlyArray<Tensor.GenericTensor>
-  readonly v: ReadonlyArray<Tensor.GenericTensor>
+  readonly m: ReadonlyArray<Tensor.Any>
+  readonly v: ReadonlyArray<Tensor.Any>
   readonly t: number
 }
 
@@ -123,10 +123,10 @@ export interface AdamState {
  * @category models
  */
 export interface OptimizerUpdate<S> {
-  readonly params: Array<Tensor.LazyTensor>
+  readonly params: Array<Tensor.Lazy>
   readonly state: S
-  readonly stateRoots: ReadonlyArray<Tensor.GenericTensor>
-  readonly rebuildState: (evaluated: ReadonlyArray<Tensor.Tensor>) => S
+  readonly stateRoots: ReadonlyArray<Tensor.Any>
+  readonly rebuildState: (evaluated: ReadonlyArray<Tensor.Concrete>) => S
 }
 
 /**
@@ -139,11 +139,11 @@ export interface OptimizerUpdate<S> {
  */
 export interface Optimizer<S> {
   readonly init: (
-    params: ReadonlyArray<Tensor.GenericTensor>
+    params: ReadonlyArray<Tensor.Any>
   ) => Effect.Effect<S, Tensor.TensorError, CurrentDevice>
   readonly step: (
-    params: ReadonlyArray<Tensor.GenericTensor>,
-    grads: ReadonlyArray<Tensor.GenericTensor>,
+    params: ReadonlyArray<Tensor.Any>,
+    grads: ReadonlyArray<Tensor.Any>,
     state: S
   ) => Effect.Effect<OptimizerUpdate<S>, Tensor.TensorError>
 }
@@ -152,7 +152,7 @@ const isFloat = (dtype: Tensor.DType): boolean => dtype === "f32" || dtype === "
 
 const checkParams = (
   op: string,
-  params: ReadonlyArray<Tensor.GenericTensor>
+  params: ReadonlyArray<Tensor.Any>
 ): Effect.Effect<void, Tensor.TensorError> => {
   for (const param of params) {
     if (!isFloat(param.dtype)) {
@@ -170,8 +170,8 @@ const sameShape = (a: ReadonlyArray<number>, b: ReadonlyArray<number>): boolean 
 
 const checkGrads = (
   op: string,
-  params: ReadonlyArray<Tensor.GenericTensor>,
-  grads: ReadonlyArray<Tensor.GenericTensor>
+  params: ReadonlyArray<Tensor.Any>,
+  grads: ReadonlyArray<Tensor.Any>
 ): Effect.Effect<void, Tensor.TensorError> => {
   if (params.length !== grads.length) {
     return new Tensor.TensorError({
@@ -199,8 +199,8 @@ const checkGrads = (
 const checkStateLength = (
   op: string,
   kind: string,
-  state: ReadonlyArray<Tensor.GenericTensor>,
-  params: ReadonlyArray<Tensor.GenericTensor>
+  state: ReadonlyArray<Tensor.Any>,
+  params: ReadonlyArray<Tensor.Any>
 ): Effect.Effect<void, Tensor.TensorError> => {
   if (state.length !== params.length) {
     return new Tensor.TensorError({
@@ -245,15 +245,15 @@ export const sgd = (config: SgdConfig): Optimizer<SgdState> => {
   }
 
   const updateParam = (
-    param: Tensor.GenericTensor,
-    grad: Tensor.GenericTensor,
-    velocity: Tensor.GenericTensor | null
+    param: Tensor.Any,
+    grad: Tensor.Any,
+    velocity: Tensor.Any | null
   ): Effect.Effect<
-    { readonly param: Tensor.LazyTensor; readonly velocity: Tensor.GenericTensor | null },
+    { readonly param: Tensor.Lazy; readonly velocity: Tensor.Any | null },
     Tensor.TensorError
   > =>
     Effect.gen(function* () {
-      let g: Tensor.GenericTensor = grad
+      let g: Tensor.Any = grad
       if (weightDecay !== 0) {
         g = yield* Tensor.add(g, yield* Tensor.mul(param, weightDecay))
       }
@@ -279,7 +279,7 @@ export const sgd = (config: SgdConfig): Optimizer<SgdState> => {
               message: error instanceof Error ? error.message : String(error)
             })
         })
-        const makeOut = (index: number): Tensor.LazyTensor => {
+        const makeOut = (index: number): Tensor.Lazy => {
           const handle = step.sgdOut(index)
           return Tensor.makeLazy(handle, param.shape, param.dtype, param.device)
         }
@@ -304,8 +304,8 @@ export const sgd = (config: SgdConfig): Optimizer<SgdState> => {
         if (momentum !== 0 && state.velocity !== null) {
           yield* checkStateLength("sgd", "velocity", state.velocity, params)
         }
-        const updates: Array<Tensor.LazyTensor> = []
-        const velocities: Array<Tensor.GenericTensor> = []
+        const updates: Array<Tensor.Lazy> = []
+        const velocities: Array<Tensor.Any> = []
         for (let i = 0; i < params.length; i++) {
           const update = yield* updateParam(params[i], grads[i], state.velocity?.[i] ?? null)
           updates.push(update.param)
@@ -349,16 +349,16 @@ const makeAdam = (op: string, config: ResolvedAdamConfig): Optimizer<AdamState> 
   }
 
   const updateParam = (
-    param: Tensor.GenericTensor,
-    grad: Tensor.GenericTensor,
-    m: Tensor.GenericTensor,
-    v: Tensor.GenericTensor,
+    param: Tensor.Any,
+    grad: Tensor.Any,
+    m: Tensor.Any,
+    v: Tensor.Any,
     t: number
   ): Effect.Effect<
     {
-      readonly param: Tensor.LazyTensor
-      readonly m: Tensor.LazyTensor
-      readonly v: Tensor.LazyTensor
+      readonly param: Tensor.Lazy
+      readonly m: Tensor.Lazy
+      readonly v: Tensor.Lazy
     },
     Tensor.TensorError
   > =>
@@ -373,7 +373,7 @@ const makeAdam = (op: string, config: ResolvedAdamConfig): Optimizer<AdamState> 
               message: error instanceof Error ? error.message : String(error)
             })
         })
-        const makeOut = (index: number): Tensor.LazyTensor => {
+        const makeOut = (index: number): Tensor.Lazy => {
           const handle = step.adamwOut(index)
           return Tensor.makeLazy(handle, param.shape, param.dtype, param.device)
         }
@@ -396,8 +396,8 @@ const makeAdam = (op: string, config: ResolvedAdamConfig): Optimizer<AdamState> 
     init: (params) =>
       Effect.gen(function* () {
         yield* checkParams(op, params)
-        const m: Array<Tensor.GenericTensor> = []
-        const v: Array<Tensor.GenericTensor> = []
+        const m: Array<Tensor.Any> = []
+        const v: Array<Tensor.Any> = []
         for (const param of params) {
           m.push(yield* Tensor.zeros(param.shape, { dtype: param.dtype }))
           v.push(yield* Tensor.zeros(param.shape, { dtype: param.dtype }))
@@ -411,9 +411,9 @@ const makeAdam = (op: string, config: ResolvedAdamConfig): Optimizer<AdamState> 
         yield* checkStateLength(op, "first-moment", state.m, params)
         yield* checkStateLength(op, "second-moment", state.v, params)
         const t = state.t + 1
-        const updates: Array<Tensor.LazyTensor> = []
-        const m: Array<Tensor.LazyTensor> = []
-        const v: Array<Tensor.LazyTensor> = []
+        const updates: Array<Tensor.Lazy> = []
+        const m: Array<Tensor.Lazy> = []
+        const v: Array<Tensor.Lazy> = []
         for (let i = 0; i < params.length; i++) {
           const update = yield* updateParam(params[i], grads[i], state.m[i], state.v[i], t)
           updates.push(update.param)
@@ -478,9 +478,9 @@ export const adamW = (config: AdamWConfig = {}): Optimizer<AdamState> =>
  * @category transforms
  */
 export const clipByValue = (
-  grads: ReadonlyArray<Tensor.GenericTensor>,
+  grads: ReadonlyArray<Tensor.Any>,
   options: { readonly min?: number; readonly max?: number }
-): Effect.Effect<Array<Tensor.LazyTensor>, Tensor.TensorError> =>
+): Effect.Effect<Array<Tensor.Lazy>, Tensor.TensorError> =>
   Effect.gen(function* () {
     if (options.min === undefined && options.max === undefined) {
       return yield* new Tensor.TensorError({
@@ -488,7 +488,7 @@ export const clipByValue = (
         message: "clipByValue: at least one of min and max is required"
       })
     }
-    const out: Array<Tensor.LazyTensor> = []
+    const out: Array<Tensor.Lazy> = []
     for (const g of grads) {
       out.push(yield* Tensor.clamp(g, options))
     }
@@ -506,9 +506,9 @@ export const clipByValue = (
  * @category transforms
  */
 export const clipByGlobalNorm = (
-  grads: ReadonlyArray<Tensor.GenericTensor>,
+  grads: ReadonlyArray<Tensor.Any>,
   maxNorm: number
-): Effect.Effect<Array<Tensor.LazyTensor>, Tensor.TensorError> =>
+): Effect.Effect<Array<Tensor.Lazy>, Tensor.TensorError> =>
   Effect.gen(function* () {
     if (maxNorm <= 0) {
       return yield* new Tensor.TensorError({
@@ -519,13 +519,13 @@ export const clipByGlobalNorm = (
     if (grads.length === 0) {
       return []
     }
-    let total: Tensor.GenericTensor = yield* Tensor.sum(yield* Tensor.square(grads[0]))
+    let total: Tensor.Any = yield* Tensor.sum(yield* Tensor.square(grads[0]))
     for (const g of grads.slice(1)) {
       total = yield* Tensor.add(total, yield* Tensor.sum(yield* Tensor.square(g)))
     }
     const norm = yield* Tensor.sqrt(total)
     const scale = yield* Tensor.minimum(yield* Tensor.mul(yield* Tensor.reciprocal(yield* Tensor.add(norm, 1e-6)), maxNorm), 1)
-    const out: Array<Tensor.LazyTensor> = []
+    const out: Array<Tensor.Lazy> = []
     for (const g of grads) {
       out.push(yield* Tensor.mul(g, scale))
     }
@@ -539,8 +539,8 @@ export const clipByGlobalNorm = (
  * @since 0.1.0
  * @category models
  */
-export type Materialized<P extends ReadonlyArray<Tensor.GenericTensor>> = {
-  readonly [K in keyof P]: Tensor.Tensor
+export type Materialized<P extends ReadonlyArray<Tensor.Any>> = {
+  readonly [K in keyof P]: Tensor.Concrete
 }
 
 /**
@@ -558,13 +558,13 @@ export type Materialized<P extends ReadonlyArray<Tensor.GenericTensor>> = {
  * @since 0.1.0
  * @category destructors
  */
-export const step = <S, P extends ReadonlyArray<Tensor.GenericTensor>>(
+export const step = <S, P extends ReadonlyArray<Tensor.Any>>(
   optimizer: Optimizer<S>,
-  loss: Tensor.GenericTensor,
+  loss: Tensor.Any,
   params: P,
   state: S
 ): Effect.Effect<
-  { readonly loss: Tensor.Tensor; readonly params: Materialized<P>; readonly state: S },
+  { readonly loss: Tensor.Concrete; readonly params: Materialized<P>; readonly state: S },
   Gradient.GradError | Tensor.TensorError
 > =>
   Effect.gen(function* () {

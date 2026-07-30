@@ -100,7 +100,7 @@ would see only individual kernel launches, not our graph.
 
 The transform needs shapes and dtypes **at graph-build time** (broadcast
 adjoints must know the target shape; dtype checks must reject integer
-paths). Today shapes are tracked in TS (`GenericTensor.shape`) and computed
+paths). Today shapes are tracked in TS (`Tensor.Any.shape`) and computed
 in Rust only during evaluation. Change:
 
 ```rust
@@ -116,7 +116,7 @@ pub struct Node {
   constructors, which validate (defense in depth) and store them.
 - `id` gives every node a stable identity for cotangent accumulation
   (`HashMap<u64, Arc<Node>>`) and lets TS name the `wrt` leaves.
-- Constructors keep returning `LazyTensor`; the wrapper gains cheap `id` /
+- Constructors keep returning `Tensor.Lazy`; the wrapper gains cheap `id` /
   `shape` / `dtype` getters (TS already carries shape/dtype; `id` is new).
 
 This refactor is independently valuable: shape errors surface at graph-build
@@ -195,14 +195,14 @@ no currying.
 ```ts
 // Gradients of a scalar (0-d) float `loss` w.r.t. the given tensors.
 export const grad: (
-  loss: GenericTensor,
-  wrt: ReadonlyArray<GenericTensor>
-) => Effect<Array<LazyTensor>, GradError>
+  loss: Tensor.Any,
+  wrt: ReadonlyArray<Tensor.Any>
+) => Effect<Array<Tensor.Lazy>, GradError>
 
 // Barrier: adjoint is dropped, reverse walk stops here
 export const stopGradient: (
-  self: GenericTensor
-) => Effect<LazyTensor, TensorError>
+  self: Tensor.Any
+) => Effect<Tensor.Lazy, TensorError>
 
 export class GradError extends Data.TaggedError("GradError")<{
   readonly reason:
@@ -229,7 +229,7 @@ the required destructor is a multi-root evaluate:
 
 ```ts
 export const evaluateAll: (
-  roots: ReadonlyArray<GenericTensor>
+  roots: ReadonlyArray<Tensor.Any>
 ) => Effect<Array<Tensor>, TensorError>
 ```
 

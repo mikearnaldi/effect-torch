@@ -13,13 +13,13 @@ pairing parameter *construction* with a parameterised *forward* graph
 builder:
 
 ```ts
-export interface Model<P extends ReadonlyArray<Tensor.GenericTensor>> {
+export interface Model<P extends ReadonlyArray<Tensor.Any>> {
   readonly names: ReadonlyArray<string>
   readonly init: Effect.Effect<P, Tensor.TensorError, Device.CurrentDevice>
   readonly forward: (
     params: P,
-    input: Tensor.GenericTensor
-  ) => Effect.Effect<Tensor.LazyTensor, Tensor.TensorError>
+    input: Tensor.Any
+  ) => Effect.Effect<Tensor.Lazy, Tensor.TensorError>
 }
 ```
 
@@ -74,7 +74,7 @@ Flax/Haiku design — but without a library form:
 ### The `Model` interface
 
 ```ts
-export interface Model<P extends ReadonlyArray<Tensor.GenericTensor>> {
+export interface Model<P extends ReadonlyArray<Tensor.Any>> {
   /** Stable parameter identities, one per tensor in `P`, in the same
       order. Also serves as the arity of `P` at runtime. */
   readonly names: ReadonlyArray<string>
@@ -83,8 +83,8 @@ export interface Model<P extends ReadonlyArray<Tensor.GenericTensor>> {
   /** Extends the graph: parameters and input in, lazy output out. */
   readonly forward: (
     params: P,
-    input: Tensor.GenericTensor
-  ) => Effect.Effect<Tensor.LazyTensor, Tensor.TensorError>
+    input: Tensor.Any
+  ) => Effect.Effect<Tensor.Lazy, Tensor.TensorError>
 }
 
 /** Any model, for constraints. */
@@ -112,7 +112,7 @@ export const linear: (
   name: string,
   inFeatures: number,
   outFeatures: number
-) => Model<readonly [weight: Tensor.GenericTensor, bias: Tensor.GenericTensor]>
+) => Model<readonly [weight: Tensor.Any, bias: Tensor.Any]>
 
 export const tanh: Model<readonly []>
 export const sigmoid: Model<readonly []>
@@ -200,14 +200,14 @@ feed directly back into `model.forward`. There is deliberately **no**
 ```ts
 export const save: (
   model: Any,
-  params: ReadonlyArray<Tensor.GenericTensor>,
+  params: ReadonlyArray<Tensor.Any>,
   path: string
 ) => Effect.Effect<void, Tensor.TensorError>
 
 export const load: (
   model: Any,
   path: string
-) => Effect.Effect<Array<Tensor.Tensor>, Tensor.TensorError, Device.CurrentDevice>
+) => Effect.Effect<Array<Tensor.Concrete>, Tensor.TensorError, Device.CurrentDevice>
 ```
 
 `save` zips `model.names` with the param tuple into the record

@@ -8,7 +8,7 @@ import { floats, onDevices, type TestDevice } from "./utils/devices.ts"
 
 const tmpdir = Effect.sync(() => fs.mkdtempSync(path.join(os.tmpdir(), "effect-torch-")))
 
-const values = (t: Tensor.GenericTensor) =>
+const values = (t: Tensor.Any) =>
   Effect.map(Tensor.toTypedArray(t), (arr) => Array.from<number | bigint>(arr).map(Number))
 
 onDevices("Checkpoint", (device: TestDevice) => (it) => {

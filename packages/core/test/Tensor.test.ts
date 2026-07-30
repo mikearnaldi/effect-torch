@@ -4,7 +4,7 @@ import { Effect, Exit } from "effect"
 import { Gradient, Loss, Tensor } from "../src/index.ts"
 import { deep, floatDtype, floats, onDevices, TOL, type TestDevice } from "./utils/devices.ts"
 
-const values = (t: Tensor.GenericTensor) =>
+const values = (t: Tensor.Any) =>
   Effect.map(Tensor.toTypedArray(t), (arr) => Array.from<number | bigint>(arr).map(Number))
 
 onDevices("Tensor", (device: TestDevice) => (it) => {

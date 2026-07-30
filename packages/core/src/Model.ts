@@ -1,7 +1,7 @@
 /**
  * Models as pure values pairing parameter construction with a
  * parameterised forward graph builder — the Flax/Haiku design, flattened:
- * parameters are always a plain tuple of tensors, configuration lives in
+ * parameters are always a flat array of tensors, configuration lives in
  * the factory's closure, and the forward graph is an ordinary lazy graph,
  * so {@link Gradient.grad} differentiates it and {@link Optimizer.step}
  * updates it with zero model-specific code. There is no mutable module
@@ -9,28 +9,30 @@
  *
  * Everything that can fail returns an `Effect`: factories validate their
  * configuration (positive feature counts, unique parameter names) into a
- * {@link ModelError}, checkpoints report arity and missing-key problems in
- * the error channel, and {@link train} runs the whole training loop —
- * init, forward, loss, gradients, update, one graph walk per step — with
- * the tensor, gradient, and callback error channels in the union.
+ * {@link ModelError}, `forward` checks the parameter array's length
+ * against the model's arity, checkpoints report arity and missing-key
+ * problems in the error channel, and {@link train} runs the whole
+ * training loop — init, forward, loss, gradients, update, one graph walk
+ * per step — with the tensor, gradient, and callback error channels in
+ * the union.
  *
  * The layer catalog covers the standard MLP / CNN / embedding stack:
  * parameterised layers ({@link linear}, {@link conv1d}, {@link conv2d},
  * {@link embedding}, {@link layerNorm}) and parameterless ones (the
  * activations, {@link softmax}, {@link logSoftmax}, {@link flatten},
  * {@link dropout}, {@link maxPool2d}, {@link avgPool2d}). {@link chain}
- * composes models into a model with the same interface, computing the
- * concatenated parameter tuple at the type level ({@link ParamsOf}).
- * `names` gives every parameter a stable, checkpoint-friendly identity
- * that maps directly onto {@link Tensor.save} / {@link Tensor.load} via
- * {@link save} and {@link load}.
+ * composes models into a model with the same interface, concatenating
+ * the parameter arrays in order. `names` gives every parameter a stable,
+ * checkpoint-friendly identity that maps directly onto
+ * {@link Tensor.save} / {@link Tensor.load} via {@link save} and
+ * {@link load}.
  *
  * Stateful layers (batchnorm running stats) are deliberately absent: the
- * pure design keeps non-trainable state out of the parameter tuple until
+ * pure design keeps non-trainable state out of the parameter array until
  * the `stateRoots`/`rebuildState` contract generalizes to models. Note
  * that {@link dropout} is the functional form — it always applies; build
  * the evaluation chain without it (parameterless stages add nothing to
- * the tuple, so one checkpoint serves both chains).
+ * the array, so one checkpoint serves both chains).
  *
  * @since 0.1.0
  */
@@ -43,7 +45,7 @@ import * as Tensor from "./Tensor.ts"
 /**
  * A failure in model construction, checkpointing, or training:
  * invalid layer configuration, duplicate parameter names, parameter
- * tuple arity mismatches, missing checkpoint keys, or an invalid step
+ * array arity mismatches, missing checkpoint keys, or an invalid step
  * count. Failures from the underlying tensor operations stay
  * {@link Tensor.TensorError}s.
  *
@@ -56,23 +58,31 @@ export class ModelError extends Data.TaggedError("ModelError")<{
 }> {}
 
 /**
- * A model: stable parameter identities, an initializer that builds the
- * initial parameters as lazy graph values, and a forward function that
- * extends the graph — parameters and input in, lazy output out.
- *
- * `P` is constrained to a tuple of tensors — "expect a tuple, ask for a
- * tuple" — so the existing training path (`Gradient.grad`,
- * `Optimizer.step`) works on any model with zero adapter code.
- * Configuration (feature counts, activation choice) lives in the closure
- * of the factory, never in `P`.
+ * A model's parameters: a flat array of tensors in `names` order.
  *
  * @since 0.1.0
  * @category models
  */
-export interface Model<P extends ReadonlyArray<Tensor.GenericTensor>> {
+export type Params = ReadonlyArray<Tensor.Any>
+
+/**
+ * A model: stable parameter identities, an initializer that builds the
+ * initial parameters as lazy graph values, and a forward function that
+ * extends the graph — parameters and input in, lazy output out.
+ *
+ * Parameters are a flat array of tensors in `names` order, so the
+ * existing training path (`Gradient.grad`, `Optimizer.step`) works on
+ * any model with zero adapter code. Configuration (feature counts,
+ * activation choice) lives in the closure of the factory, never in the
+ * parameters.
+ *
+ * @since 0.1.0
+ * @category models
+ */
+export interface Model {
   /**
-   * Stable parameter identities, one per tensor in `P`, in the same
-   * order. Also serves as the arity of `P` at runtime.
+   * Stable parameter identities, one per parameter, in the same order
+   * as the parameter array. Also serves as the model's arity.
    */
   readonly names: ReadonlyArray<string>
   /**
@@ -81,52 +91,20 @@ export interface Model<P extends ReadonlyArray<Tensor.GenericTensor>> {
    * `Tensor.compute`), so initial `randn` draws are consistent with the
    * first loss within that walk.
    */
-  readonly init: Effect.Effect<P, Tensor.TensorError, CurrentDevice>
+  readonly init: Effect.Effect<Params, Tensor.TensorError, CurrentDevice>
   /**
    * Extends the graph: parameters and input in, lazy output out.
    * Single-input, single-output; differentiated as-is by
-   * `Gradient.grad`. May require the current device (layers that draw
-   * randomness or reshape on-device, like `dropout` and the pools).
+   * `Gradient.grad`. Fails with a {@link ModelError} if `params.length`
+   * does not match the model's arity. May require the current device
+   * (layers that draw randomness or reshape on-device, like `dropout`
+   * and the pools).
    */
   readonly forward: (
-    params: P,
-    input: Tensor.GenericTensor
-  ) => Effect.Effect<Tensor.LazyTensor, Tensor.TensorError, CurrentDevice>
+    params: Params,
+    input: Tensor.Any
+  ) => Effect.Effect<Tensor.Lazy, ModelError | Tensor.TensorError, CurrentDevice>
 }
-
-/**
- * Any model, for constraints.
- *
- * @since 0.1.0
- * @category models
- */
-export type Any = Model<any>
-
-/**
- * Computes the concatenated parameter tuple of a list of models at the
- * type level: `ParamsOf<[Linear, Tanh, Linear]>` is
- * `readonly [w1, b1, w2, b2]`.
- *
- * @since 0.1.0
- * @category models
- */
-export type ParamsOf<Ms extends ReadonlyArray<Any>> = Ms extends readonly [infer H, ...infer T]
-  ? H extends Model<infer P>
-    ? T extends ReadonlyArray<Any>
-      ? readonly [...P, ...ParamsOf<T>]
-    : readonly [...P]
-  : readonly []
-  : readonly []
-
-/**
- * Extracts the parameter tuple of a model: `Params<typeof model>` is the
- * tuple `init` returns and `forward` takes. Useful for naming the type of
- * a chained model's parameters.
- *
- * @since 0.1.0
- * @category models
- */
-export type Params<M extends Any> = M extends Model<infer P> ? P : never
 
 const checkName = (op: string, name: string): Effect.Effect<void, ModelError> =>
   name.length === 0 ? new ModelError({ op, message: "name must not be empty" }) : Effect.void
@@ -136,12 +114,24 @@ const checkPositiveInt = (op: string, field: string, value: number): Effect.Effe
     ? Effect.void
     : new ModelError({ op, message: `${field} must be a positive integer, got ${value}` })
 
+const checkArity = (
+  who: string,
+  names: ReadonlyArray<string>,
+  params: Params
+): Effect.Effect<void, ModelError> =>
+  params.length === names.length
+    ? Effect.void
+    : new ModelError({
+        op: "forward",
+        message: `${who}: expected ${names.length} parameters [${names.join(", ")}], got ${params.length}`
+      })
+
 const parameterless = (
-  apply: (self: Tensor.GenericTensor) => Effect.Effect<Tensor.LazyTensor, Tensor.TensorError, CurrentDevice>
-): Effect.Effect<Model<readonly []>> =>
+  apply: (self: Tensor.Any) => Effect.Effect<Tensor.Lazy, Tensor.TensorError, CurrentDevice>
+): Effect.Effect<Model> =>
   Effect.succeed({
     names: [],
-    init: Effect.succeed<readonly []>([]),
+    init: Effect.succeed<Params>([]),
     forward: (_, input) => apply(input)
   })
 
@@ -159,16 +149,14 @@ export const linear = (
   name: string,
   inFeatures: number,
   outFeatures: number
-): Effect.Effect<
-  Model<readonly [weight: Tensor.GenericTensor, bias: Tensor.GenericTensor]>,
-  ModelError
-> =>
+): Effect.Effect<Model, ModelError> =>
   Effect.gen(function* () {
     yield* checkName("linear", name)
     yield* checkPositiveInt("linear", "inFeatures", inFeatures)
     yield* checkPositiveInt("linear", "outFeatures", outFeatures)
+    const names = [`${name}.weight`, `${name}.bias`]
     return {
-      names: [`${name}.weight`, `${name}.bias`],
+      names,
       init: Effect.gen(function* () {
         const weight = yield* Tensor.mul(
           yield* Tensor.randn([inFeatures, outFeatures]),
@@ -177,8 +165,10 @@ export const linear = (
         const bias = yield* Tensor.zeros([1, outFeatures])
         return [weight, bias] as const
       }),
-      forward: ([weight, bias], input) =>
+      forward: (params, input) =>
         Effect.gen(function* () {
+          yield* checkArity(name, names, params)
+          const [weight, bias] = params
           return yield* Tensor.add(yield* Tensor.matmul(input, weight), bias)
         })
     }
@@ -203,10 +193,7 @@ export const conv1d = (
   outChannels: number,
   kernelSize: number,
   options: Tensor.ConvOptions = {}
-): Effect.Effect<
-  Model<readonly [weight: Tensor.GenericTensor, bias: Tensor.GenericTensor]>,
-  ModelError
-> =>
+): Effect.Effect<Model, ModelError> =>
   Effect.gen(function* () {
     yield* checkName("conv1d", name)
     yield* checkPositiveInt("conv1d", "inChannels", inChannels)
@@ -220,9 +207,10 @@ export const conv1d = (
         message: `channels [${inChannels}, ${outChannels}] are not divisible into ${groups} groups`
       })
     }
+    const names = [`${name}.weight`, `${name}.bias`]
     const fanIn = (inChannels / groups) * kernelSize
     return {
-      names: [`${name}.weight`, `${name}.bias`],
+      names,
       init: Effect.gen(function* () {
         const weight = yield* Tensor.mul(
           yield* Tensor.randn([outChannels, inChannels / groups, kernelSize]),
@@ -231,8 +219,10 @@ export const conv1d = (
         const bias = yield* Tensor.zeros([outChannels])
         return [weight, bias] as const
       }),
-      forward: ([weight, bias], input) =>
+      forward: (params, input) =>
         Effect.gen(function* () {
+          yield* checkArity(name, names, params)
+          const [weight, bias] = params
           const out = yield* Tensor.conv1d(input, weight, options)
           return yield* Tensor.add(out, yield* Tensor.reshape(bias, [1, outChannels, 1]))
         })
@@ -258,10 +248,7 @@ export const conv2d = (
   outChannels: number,
   kernelSize: number | readonly [number, number],
   options: Tensor.ConvOptions = {}
-): Effect.Effect<
-  Model<readonly [weight: Tensor.GenericTensor, bias: Tensor.GenericTensor]>,
-  ModelError
-> =>
+): Effect.Effect<Model, ModelError> =>
   Effect.gen(function* () {
     yield* checkName("conv2d", name)
     yield* checkPositiveInt("conv2d", "inChannels", inChannels)
@@ -277,9 +264,10 @@ export const conv2d = (
         message: `channels [${inChannels}, ${outChannels}] are not divisible into ${groups} groups`
       })
     }
+    const names = [`${name}.weight`, `${name}.bias`]
     const fanIn = (inChannels / groups) * kh * kw
     return {
-      names: [`${name}.weight`, `${name}.bias`],
+      names,
       init: Effect.gen(function* () {
         const weight = yield* Tensor.mul(
           yield* Tensor.randn([outChannels, inChannels / groups, kh, kw]),
@@ -288,8 +276,10 @@ export const conv2d = (
         const bias = yield* Tensor.zeros([outChannels])
         return [weight, bias] as const
       }),
-      forward: ([weight, bias], input) =>
+      forward: (params, input) =>
         Effect.gen(function* () {
+          yield* checkArity(name, names, params)
+          const [weight, bias] = params
           const out = yield* Tensor.conv2d(input, weight, options)
           return yield* Tensor.add(out, yield* Tensor.reshape(bias, [1, outChannels, 1, 1]))
         })
@@ -313,7 +303,7 @@ export const embedding = (
   numEmbeddings: number,
   embeddingDim: number,
   options: { readonly paddingIndex?: number } = {}
-): Effect.Effect<Model<readonly [weight: Tensor.GenericTensor]>, ModelError> =>
+): Effect.Effect<Model, ModelError> =>
   Effect.gen(function* () {
     yield* checkName("embedding", name)
     yield* checkPositiveInt("embedding", "numEmbeddings", numEmbeddings)
@@ -328,16 +318,20 @@ export const embedding = (
         message: `paddingIndex must be an integer in [0, ${numEmbeddings}), got ${options.paddingIndex}`
       })
     }
+    const names = [`${name}.weight`]
     return {
-      names: [`${name}.weight`],
+      names,
       init: Effect.gen(function* () {
         const weight = yield* Tensor.randn([numEmbeddings, embeddingDim])
         return [weight] as const
       }),
-      forward: ([weight], input) =>
-        Tensor.embedding(input, {
-          weight,
-          ...(options.paddingIndex !== undefined ? { paddingIndex: options.paddingIndex } : {})
+      forward: (params, input) =>
+        Effect.gen(function* () {
+          yield* checkArity(name, names, params)
+          return yield* Tensor.embedding(input, {
+            weight: params[0],
+            ...(options.paddingIndex !== undefined ? { paddingIndex: options.paddingIndex } : {})
+          })
         })
     }
   })
@@ -358,10 +352,7 @@ export const layerNorm = (
   name: string,
   normalizedShape: number | ReadonlyArray<number>,
   options: { readonly eps?: number } = {}
-): Effect.Effect<
-  Model<readonly [weight: Tensor.GenericTensor, bias: Tensor.GenericTensor]>,
-  ModelError
-> =>
+): Effect.Effect<Model, ModelError> =>
   Effect.gen(function* () {
     yield* checkName("layerNorm", name)
     const shape: ReadonlyArray<number> = typeof normalizedShape === "number" ? [normalizedShape] : normalizedShape
@@ -375,16 +366,19 @@ export const layerNorm = (
     if (!(eps > 0)) {
       return yield* new ModelError({ op: "layerNorm", message: `eps must be positive, got ${eps}` })
     }
+    const names = [`${name}.weight`, `${name}.bias`]
     const dims = shape.map((_, i) => i - shape.length)
     return {
-      names: [`${name}.weight`, `${name}.bias`],
+      names,
       init: Effect.gen(function* () {
         const weight = yield* Tensor.ones(shape)
         const bias = yield* Tensor.zeros(shape)
         return [weight, bias] as const
       }),
-      forward: ([weight, bias], input) =>
+      forward: (params, input) =>
         Effect.gen(function* () {
+          yield* checkArity(name, names, params)
+          const [weight, bias] = params
           const mu = yield* Tensor.mean(input, { dims, keepdims: true })
           const centered = yield* Tensor.sub(input, mu)
           const variance = yield* Tensor.variance(input, { dims, keepdims: true, correction: 0 })
@@ -400,7 +394,7 @@ export const layerNorm = (
  * @since 0.1.0
  * @category constructors
  */
-export const tanh: Effect.Effect<Model<readonly []>> = parameterless(Tensor.tanh)
+export const tanh: Effect.Effect<Model> = parameterless(Tensor.tanh)
 
 /**
  * The sigmoid activation as a parameterless model.
@@ -408,7 +402,7 @@ export const tanh: Effect.Effect<Model<readonly []>> = parameterless(Tensor.tanh
  * @since 0.1.0
  * @category constructors
  */
-export const sigmoid: Effect.Effect<Model<readonly []>> = parameterless(Tensor.sigmoid)
+export const sigmoid: Effect.Effect<Model> = parameterless(Tensor.sigmoid)
 
 /**
  * The rectified linear unit activation as a parameterless model.
@@ -416,7 +410,7 @@ export const sigmoid: Effect.Effect<Model<readonly []>> = parameterless(Tensor.s
  * @since 0.1.0
  * @category constructors
  */
-export const relu: Effect.Effect<Model<readonly []>> = parameterless(Tensor.relu)
+export const relu: Effect.Effect<Model> = parameterless(Tensor.relu)
 
 /**
  * The SiLU / swish activation `x * sigmoid(x)` as a parameterless model.
@@ -424,7 +418,7 @@ export const relu: Effect.Effect<Model<readonly []>> = parameterless(Tensor.relu
  * @since 0.1.0
  * @category constructors
  */
-export const silu: Effect.Effect<Model<readonly []>> = parameterless(Tensor.silu)
+export const silu: Effect.Effect<Model> = parameterless(Tensor.silu)
 
 /**
  * The mish activation `x * tanh(softplus(x))` as a parameterless model.
@@ -432,7 +426,7 @@ export const silu: Effect.Effect<Model<readonly []>> = parameterless(Tensor.silu
  * @since 0.1.0
  * @category constructors
  */
-export const mish: Effect.Effect<Model<readonly []>> = parameterless(Tensor.mish)
+export const mish: Effect.Effect<Model> = parameterless(Tensor.mish)
 
 /**
  * The softplus activation `log(1 + exp(x))` as a parameterless model.
@@ -440,7 +434,7 @@ export const mish: Effect.Effect<Model<readonly []>> = parameterless(Tensor.mish
  * @since 0.1.0
  * @category constructors
  */
-export const softplus: Effect.Effect<Model<readonly []>> = parameterless(Tensor.softplus)
+export const softplus: Effect.Effect<Model> = parameterless(Tensor.softplus)
 
 /**
  * The GELU activation as a parameterless model; `approximate` (`"none"`,
@@ -449,7 +443,7 @@ export const softplus: Effect.Effect<Model<readonly []>> = parameterless(Tensor.
  * @since 0.1.0
  * @category constructors
  */
-export const gelu = (options: Tensor.GeluOptions = {}): Effect.Effect<Model<readonly []>> =>
+export const gelu = (options: Tensor.GeluOptions = {}): Effect.Effect<Model> =>
   parameterless((input) => Tensor.gelu(input, options))
 
 /**
@@ -459,7 +453,7 @@ export const gelu = (options: Tensor.GeluOptions = {}): Effect.Effect<Model<read
  * @since 0.1.0
  * @category constructors
  */
-export const elu = (options: Tensor.EluOptions = {}): Effect.Effect<Model<readonly []>> =>
+export const elu = (options: Tensor.EluOptions = {}): Effect.Effect<Model> =>
   parameterless((input) => Tensor.elu(input, options))
 
 /**
@@ -469,9 +463,8 @@ export const elu = (options: Tensor.EluOptions = {}): Effect.Effect<Model<readon
  * @since 0.1.0
  * @category constructors
  */
-export const leakyRelu = (
-  options: Tensor.LeakyReluOptions = {}
-): Effect.Effect<Model<readonly []>> => parameterless((input) => Tensor.leakyRelu(input, options))
+export const leakyRelu = (options: Tensor.LeakyReluOptions = {}): Effect.Effect<Model> =>
+  parameterless((input) => Tensor.leakyRelu(input, options))
 
 /**
  * Softmax over `dim` (the last dimension by default) as a parameterless
@@ -480,7 +473,7 @@ export const leakyRelu = (
  * @since 0.1.0
  * @category constructors
  */
-export const softmax = (dim: number = -1): Effect.Effect<Model<readonly []>> =>
+export const softmax = (dim: number = -1): Effect.Effect<Model> =>
   parameterless((input) => Tensor.softmax(input, { dims: [dim] }))
 
 /**
@@ -490,7 +483,7 @@ export const softmax = (dim: number = -1): Effect.Effect<Model<readonly []>> =>
  * @since 0.1.0
  * @category constructors
  */
-export const logSoftmax = (dim: number = -1): Effect.Effect<Model<readonly []>> =>
+export const logSoftmax = (dim: number = -1): Effect.Effect<Model> =>
   parameterless((input) => Tensor.logSoftmax(input, { dims: [dim] }))
 
 /**
@@ -504,7 +497,7 @@ export const logSoftmax = (dim: number = -1): Effect.Effect<Model<readonly []>> 
  */
 export const flatten = (
   options: { readonly startDim?: number; readonly endDim?: number } = {}
-): Effect.Effect<Model<readonly []>> =>
+): Effect.Effect<Model> =>
   parameterless((input) =>
     Tensor.flatten(input, {
       startDim: options.startDim ?? 1,
@@ -517,7 +510,7 @@ export const flatten = (
  * probability `p` (default `0.5`) and scales survivors by `1 / (1 - p)`.
  * This is the functional form — it **always applies**; build the
  * evaluation chain without it (dropout adds nothing to the parameter
- * tuple, so one checkpoint serves both chains). The mask is drawn at
+ * array, so one checkpoint serves both chains). The mask is drawn at
  * evaluation time, so the usual `randn` rule applies: evaluate the loss
  * and its gradients together in one walk. Fails with a {@link ModelError}
  * if `p` is outside `[0, 1)`.
@@ -525,9 +518,7 @@ export const flatten = (
  * @since 0.1.0
  * @category constructors
  */
-export const dropout = (
-  options: Tensor.DropoutOptions = {}
-): Effect.Effect<Model<readonly []>, ModelError> =>
+export const dropout = (options: Tensor.DropoutOptions = {}): Effect.Effect<Model, ModelError> =>
   Effect.gen(function* () {
     const p = options.p ?? 0.5
     if (p < 0 || p >= 1) {
@@ -535,7 +526,7 @@ export const dropout = (
     }
     return {
       names: [],
-      init: Effect.succeed<readonly []>([]),
+      init: Effect.succeed<Params>([]),
       forward: (_, input) => Tensor.dropout(input, { p })
     }
   })
@@ -543,11 +534,11 @@ export const dropout = (
 const pool = (
   op: string,
   apply: (
-    self: Tensor.GenericTensor,
+    self: Tensor.Any,
     options: Tensor.PoolOptions
-  ) => Effect.Effect<Tensor.LazyTensor, Tensor.TensorError, CurrentDevice>,
+  ) => Effect.Effect<Tensor.Lazy, Tensor.TensorError, CurrentDevice>,
   options: Tensor.PoolOptions
-): Effect.Effect<Model<readonly []>, ModelError> =>
+): Effect.Effect<Model, ModelError> =>
   Effect.gen(function* () {
     const [kh, kw] = typeof options.kernelSize === "number"
       ? [options.kernelSize, options.kernelSize] as const
@@ -567,7 +558,7 @@ const pool = (
     }
     return {
       names: [],
-      init: Effect.succeed<readonly []>([]),
+      init: Effect.succeed<Params>([]),
       forward: (_, input) => apply(input, options)
     }
   })
@@ -581,7 +572,7 @@ const pool = (
  * @since 0.1.0
  * @category constructors
  */
-export const maxPool2d = (options: Tensor.PoolOptions): Effect.Effect<Model<readonly []>, ModelError> =>
+export const maxPool2d = (options: Tensor.PoolOptions): Effect.Effect<Model, ModelError> =>
   pool("maxPool2d", Tensor.maxPool2d, options)
 
 /**
@@ -593,13 +584,13 @@ export const maxPool2d = (options: Tensor.PoolOptions): Effect.Effect<Model<read
  * @since 0.1.0
  * @category constructors
  */
-export const avgPool2d = (options: Tensor.PoolOptions): Effect.Effect<Model<readonly []>, ModelError> =>
+export const avgPool2d = (options: Tensor.PoolOptions): Effect.Effect<Model, ModelError> =>
   pool("avgPool2d", Tensor.avgPool2d, options)
 
 /**
  * Composes models into a single model that threads its input through each
  * child in order, slicing each child's share of the concatenated
- * parameter tuple by its arity (`names.length`). `names` is the
+ * parameter array by its arity (`names.length`). `names` is the
  * concatenation of the children's names and `init` runs each child's
  * `init` in order.
  *
@@ -610,9 +601,7 @@ export const avgPool2d = (options: Tensor.PoolOptions): Effect.Effect<Model<read
  * @since 0.1.0
  * @category combinators
  */
-export const chain = <Ms extends ReadonlyArray<Any>>(
-  ...models: Ms
-): Effect.Effect<Model<ParamsOf<Ms>>, ModelError> => {
+export const chain = (...models: ReadonlyArray<Model>): Effect.Effect<Model, ModelError> => {
   if (models.length === 0) {
     return new ModelError({ op: "chain", message: "at least one model is required" })
   }
@@ -635,40 +624,38 @@ export const chain = <Ms extends ReadonlyArray<Any>>(
   return Effect.succeed({
     names,
     init: Effect.gen(function* () {
-      const params: Array<Tensor.GenericTensor> = []
+      const params: Array<Tensor.Any> = []
       for (const model of models) {
         params.push(...(yield* model.init))
       }
-      return params as unknown as ParamsOf<Ms>
+      return params
     }),
     forward: (params, input) =>
       Effect.gen(function* () {
-        let current: Tensor.GenericTensor = input
+        yield* checkArity("chain", names, params)
+        let current: Tensor.Any = input
         let offset = 0
         for (let i = 0; i < models.length; i++) {
-          current = yield* models[i].forward(
-            params.slice(offset, offset + arities[i]) as ReadonlyArray<Tensor.GenericTensor>,
-            current
-          )
+          current = yield* models[i].forward(params.slice(offset, offset + arities[i]), current)
           offset += arities[i]
         }
-        return current as Tensor.LazyTensor
+        return current as Tensor.Lazy
       })
   })
 }
 
 /**
  * Saves a model's parameters to a safetensors file, zipping `model.names`
- * with the parameter tuple into the record {@link Tensor.save} takes.
- * Fails with a {@link ModelError} if the parameter tuple's length does
+ * with the parameter array into the record {@link Tensor.save} takes.
+ * Fails with a {@link ModelError} if the parameter array's length does
  * not match the model's arity.
  *
  * @since 0.1.0
  * @category destructors
  */
 export const save = (
-  model: Any,
-  params: ReadonlyArray<Tensor.GenericTensor>,
+  model: Model,
+  params: Params,
   path: string
 ): Effect.Effect<void, ModelError | Tensor.TensorError> =>
   params.length !== model.names.length
@@ -684,20 +671,20 @@ export const save = (
 /**
  * Loads a model's parameters from a safetensors file written by
  * {@link save}, returning the materialized tensors in `model.names` order
- * — the same tuple `forward` and `Optimizer.step` expect. A missing key
+ * — the same array `forward` and `Optimizer.step` expect. A missing key
  * fails with a {@link ModelError}; shape/dtype mismatches against the
  * architecture surface as graph-build errors on first use.
  *
  * @since 0.1.0
  * @category destructors
  */
-export const load = <P extends ReadonlyArray<Tensor.GenericTensor>>(
-  model: Model<P>,
+export const load = (
+  model: Model,
   path: string
-): Effect.Effect<Optimizer.Materialized<P>, ModelError | Tensor.TensorError, CurrentDevice> =>
+): Effect.Effect<ReadonlyArray<Tensor.Concrete>, ModelError | Tensor.TensorError, CurrentDevice> =>
   Effect.gen(function* () {
     const record = yield* Tensor.load(path)
-    const params: Array<Tensor.Tensor> = []
+    const params: Array<Tensor.Concrete> = []
     for (const name of model.names) {
       const param = record[name]
       if (param === undefined) {
@@ -708,7 +695,7 @@ export const load = <P extends ReadonlyArray<Tensor.GenericTensor>>(
       }
       params.push(param)
     }
-    return params as Optimizer.Materialized<P>
+    return params
   })
 
 /**
@@ -719,8 +706,8 @@ export const load = <P extends ReadonlyArray<Tensor.GenericTensor>>(
  * @category training
  */
 export interface TrainData {
-  readonly input: Tensor.GenericTensor
-  readonly target: Tensor.GenericTensor
+  readonly input: Tensor.Any
+  readonly target: Tensor.Any
 }
 
 /**
@@ -753,15 +740,15 @@ export interface TrainStep {
  * @since 0.1.0
  * @category training
  */
-export interface TrainConfig<P extends ReadonlyArray<Tensor.GenericTensor>, S, E, R> {
+export interface TrainConfig<S, E, R> {
   readonly optimizer: Optimizer.Optimizer<S>
   readonly loss: (
-    prediction: Tensor.GenericTensor,
-    target: Tensor.GenericTensor
-  ) => Effect.Effect<Tensor.LazyTensor, Tensor.TensorError>
+    prediction: Tensor.Any,
+    target: Tensor.Any
+  ) => Effect.Effect<Tensor.Lazy, Tensor.TensorError>
   readonly data: TrainData
   readonly stop: (info: TrainStep) => boolean
-  readonly params?: P
+  readonly params?: Params
   readonly onStep?: (info: TrainStep) => Effect.Effect<void, E, R>
 }
 
@@ -773,8 +760,8 @@ export interface TrainConfig<P extends ReadonlyArray<Tensor.GenericTensor>, S, E
  * @since 0.1.0
  * @category training
  */
-export interface Trained<P extends ReadonlyArray<Tensor.GenericTensor>, S> {
-  readonly params: Optimizer.Materialized<P>
+export interface Trained<S> {
+  readonly params: ReadonlyArray<Tensor.Concrete>
   readonly state: S
   readonly loss: number
 }
@@ -782,7 +769,7 @@ export interface Trained<P extends ReadonlyArray<Tensor.GenericTensor>, S> {
 /**
  * Runs the training loop: initialize (or take `config.params`), then
  * repeatedly build `loss(forward(params, input), target)`, differentiate
- * it, extend the graph with the optimizer update, and evaluate loss,
+ * it, extend the graph with the optimizer update, and compute loss,
  * parameters, and state in a single walk — one forward pass, one backward
  * pass, one async boundary per step, with graph depth staying O(model
  * depth). After each step `onStep` runs and `stop` decides whether the
@@ -791,33 +778,34 @@ export interface Trained<P extends ReadonlyArray<Tensor.GenericTensor>, S> {
  * @since 0.1.0
  * @category training
  */
-export const train = <P extends ReadonlyArray<Tensor.GenericTensor>, S, E = never, R = never>(
-  model: Model<P>,
-  config: TrainConfig<P, S, E, R>
+export const train = <S, E = never, R = never>(
+  model: Model,
+  config: TrainConfig<S, E, R>
 ): Effect.Effect<
-  Trained<P, S>,
-  Tensor.TensorError | Gradient.GradError | E,
+  Trained<S>,
+  ModelError | Tensor.TensorError | Gradient.GradError | E,
   CurrentDevice | R
 > =>
   Effect.gen(function* () {
-    let params: P = config.params !== undefined ? config.params : yield* model.init
+    let params: Params = config.params !== undefined
+      ? config.params
+      : yield* model.init
     let state = yield* config.optimizer.init(params)
     let step = 0
     let loss = Number.NaN
-    while (true) {
+    let trained: ReadonlyArray<Tensor.Concrete>
+    do {
       step++
       const prediction = yield* model.forward(params, config.data.input)
       const lossTensor = yield* config.loss(prediction, config.data.target)
       const result = yield* Optimizer.step(config.optimizer, lossTensor, params, state)
       loss = (yield* Tensor.toNumberArray(result.loss))[0]
-      params = result.params as P
+      trained = result.params
+      params = result.params
       state = result.state
       if (config.onStep !== undefined) {
         yield* config.onStep({ step, loss })
       }
-      if (config.stop({ step, loss })) {
-        break
-      }
-    }
-    return { params: params as unknown as Optimizer.Materialized<P>, state, loss }
+    } while (!config.stop({ step, loss }))
+    return { params: trained, state, loss }
   })
