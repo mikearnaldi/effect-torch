@@ -6528,6 +6528,22 @@ fn merge_shared_regions(roots: &[Arc<Node>]) -> std::result::Result<Vec<Arc<Node
     }
 }
 
+// The vendored Metal backend keeps one shared "current" command buffer per
+// device (candle-metal-kernels `Commands`): concurrent evaluation walks on
+// the same device interleave their kernels into each other's buffers, and a
+// walk can read back outputs whose producing kernels were committed — and
+// only awaited — by another walk. Serialize Metal walks process-wide; GPU
+// work serializes on the command queue anyway, so this costs nothing.
+static METAL_EVAL_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
+fn metal_eval_guard(nodes: &[Arc<Node>]) -> Option<std::sync::MutexGuard<'static, ()>> {
+    if nodes.iter().any(|node| matches!(node.device, Device::Metal(_))) {
+        Some(METAL_EVAL_LOCK.lock().unwrap_or_else(|e| e.into_inner()))
+    } else {
+        None
+    }
+}
+
 #[napi]
 pub async fn eval_lazy(
     tensors: Vec<&LazyTensor>,
@@ -6536,6 +6552,7 @@ pub async fn eval_lazy(
     let nodes: Vec<Arc<Node>> = tensors.iter().map(|t| t.node.clone()).collect();
     let nodes = fuse_roots(&nodes).map_err(|e| Error::new(Status::GenericFailure, e))?;
     run_compute(token, move |cancelled| {
+        let _guard = metal_eval_guard(&nodes);
         let mut ev = Evaluator::new(&nodes);
         let mut outputs = Vec::with_capacity(nodes.len());
         for node in &nodes {
@@ -6763,12 +6780,13 @@ impl CompiledProgram {
         }
         let roots = inner.roots.clone();
         let leaves = inner.leaves.clone();
-        run_compute(token, move |cancelled| {
-            let by_id: std::collections::HashMap<u64, Tensor> = leaves
-                .iter()
-                .map(|(id, slot)| (*id, bindings[&(*slot as u64)].clone()))
-                .collect();
-            let mut ev = Evaluator::with_slots(&roots, by_id);
+    run_compute(token, move |cancelled| {
+        let _guard = metal_eval_guard(&roots);
+        let by_id: std::collections::HashMap<u64, Tensor> = leaves
+            .iter()
+            .map(|(id, slot)| (*id, bindings[&(*slot as u64)].clone()))
+            .collect();
+        let mut ev = Evaluator::with_slots(&roots, by_id);
             let mut outputs = Vec::with_capacity(roots.len());
             for node in &roots {
                 let output = eval_node(node, cancelled, &mut ev).map_err(to_napi_err)?;
@@ -6833,6 +6851,7 @@ pub async fn save_tensors(
     }
     let nodes: Vec<Arc<Node>> = tensors.iter().map(|t| t.node.clone()).collect();
     run_compute(token, move |cancelled| {
+        let _guard = metal_eval_guard(&nodes);
         let mut ev = Evaluator::new(&nodes);
         let mut map = std::collections::HashMap::with_capacity(names.len());
         for (name, node) in names.iter().zip(nodes.iter()) {
