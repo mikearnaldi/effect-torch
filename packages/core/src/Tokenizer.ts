@@ -11,7 +11,7 @@
  * ids unless the tokenizer is configured with `specialTokens: "Always"` —
  * the tiktoken `allowed_special` discipline.
  */
-import { Data, Effect, Option, Scope } from "effect"
+import { Data, Effect, Option } from "effect"
 import { pipeArguments, type Pipeable } from "effect/Pipeable"
 import native, {
   type NativePadding as NativePaddingType,
@@ -168,9 +168,9 @@ export interface TrainConfig {
 }
 
 /**
- * A text tokenizer. Values are immutable and safe for concurrent use;
- * the native handle is released by `dispose` (constructors use
- * `Effect.acquireRelease`, so scoped usage finalizes automatically).
+ * A text tokenizer. Values are immutable and safe for concurrent use; the
+ * native handle owns only CPU heap (vocab tables, merges, regexes), so it
+ * is reclaimed by ordinary GC finalization — no explicit disposal.
  *
  * @since 0.1.0
  * @category models
@@ -210,10 +210,6 @@ export interface Tokenizer extends Pipeable {
    * Saves the tokenizer as a self-contained `tokenizer.json`.
    */
   readonly save: (path: string) => Effect.Effect<void, TokenizerError>
-  /**
-   * Releases the native handle. Using the tokenizer afterwards fails.
-   */
-  readonly dispose: Effect.Effect<void>
 }
 
 const toNativePadding = (padding: Padding): NativePaddingType => {
@@ -308,14 +304,12 @@ const make = (handle: NativeTokenizerType, config: TokenizerConfig): Tokenizer =
       try: () => handle.save(path),
       catch: toTokenizerError("save")
     })
-  self.dispose = Effect.sync(() => handle.dispose())
   return self
 }
 
 /**
  * Loads a tokenizer from a `tokenizer.json` file (the format every
- * HuggingFace Hub tokenizer ships). The handle is finalized when the
- * enclosing scope closes.
+ * HuggingFace Hub tokenizer ships).
  *
  * @since 0.1.0
  * @category constructors
@@ -323,14 +317,11 @@ const make = (handle: NativeTokenizerType, config: TokenizerConfig): Tokenizer =
 export const fromFile = (
   path: string,
   config: TokenizerConfig
-): Effect.Effect<Tokenizer, TokenizerError, Scope.Scope> =>
-  Effect.acquireRelease(
-    Effect.try({
-      try: () => make(NativeTokenizer.fromFile(path, config.specialTokens === "Always"), config),
-      catch: toTokenizerError("fromFile")
-    }),
-    (tokenizer) => tokenizer.dispose
-  )
+): Effect.Effect<Tokenizer, TokenizerError> =>
+  Effect.try({
+    try: () => make(NativeTokenizer.fromFile(path, config.specialTokens === "Always"), config),
+    catch: toTokenizerError("fromFile")
+  })
 
 /**
  * Loads a tokenizer from an in-memory `tokenizer.json` document.
@@ -341,14 +332,11 @@ export const fromFile = (
 export const fromJson = (
   json: string,
   config: TokenizerConfig
-): Effect.Effect<Tokenizer, TokenizerError, Scope.Scope> =>
-  Effect.acquireRelease(
-    Effect.try({
-      try: () => make(NativeTokenizer.fromJson(json, config.specialTokens === "Always"), config),
-      catch: toTokenizerError("fromJson")
-    }),
-    (tokenizer) => tokenizer.dispose
-  )
+): Effect.Effect<Tokenizer, TokenizerError> =>
+  Effect.try({
+    try: () => make(NativeTokenizer.fromJson(json, config.specialTokens === "Always"), config),
+    catch: toTokenizerError("fromJson")
+  })
 
 /**
  * Trains a tokenizer from raw text files. Runs natively off the JS thread;
@@ -360,27 +348,24 @@ export const fromJson = (
 export const train = (
   trainConfig: TrainConfig,
   config: TokenizerConfig
-): Effect.Effect<Tokenizer, TokenizerError, Scope.Scope> =>
-  Effect.acquireRelease(
-    Effect.tryPromise({
-      try: async () =>
-        make(
-          await NativeTokenizer.train(
-            {
-              model: trainConfig.model,
-              vocabSize: trainConfig.vocabSize,
-              minFrequency: trainConfig.minFrequency,
-              specialTokens: trainConfig.specialTokens as Array<string>,
-              files: trainConfig.files as Array<string>
-            },
-            config.specialTokens === "Always"
-          ),
-          config
+): Effect.Effect<Tokenizer, TokenizerError> =>
+  Effect.tryPromise({
+    try: async () =>
+      make(
+        await NativeTokenizer.train(
+          {
+            model: trainConfig.model,
+            vocabSize: trainConfig.vocabSize,
+            minFrequency: trainConfig.minFrequency,
+            specialTokens: trainConfig.specialTokens as Array<string>,
+            files: trainConfig.files as Array<string>
+          },
+          config.specialTokens === "Always"
         ),
-      catch: toTokenizerError("train")
-    }),
-    (tokenizer) => tokenizer.dispose
-  )
+        config
+      ),
+    catch: toTokenizerError("train")
+  })
 
 /**
  * Returns `true` if the value is a {@link Tokenizer}.

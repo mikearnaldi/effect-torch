@@ -4,8 +4,7 @@
 - **Author**: Michael Arnaldi
 - **Date**: 2026-07-31
 - **Depends on**: nothing architecturally; consumes the `Tensor` module
-  (constructor leaves, `CurrentDevice`) and follows RFC 0008's conventions
-  for native handle lifecycle (`dispose`, Effect-managed acquisition)
+  (constructor leaves, `CurrentDevice`)
 
 ## Summary
 
@@ -100,7 +99,6 @@ NativeTokenizer {
   id_to_token(id: u32) -> Option<String>
   vocab_size: u32  (getter)
   save(path: String)
-  dispose()
 }
 ```
 
@@ -159,7 +157,6 @@ export interface Tokenizer extends Pipeable {
   readonly tokenToId: (token: string) => Option<number>
   readonly idToToken: (id: number) => Option<string>
   readonly save: (path: string) => Effect<void, TokenizerError>
-  readonly dispose: Effect<void>
 }
 ```
 
@@ -167,6 +164,14 @@ export interface Tokenizer extends Pipeable {
   `fromJson(json, config)`, `train(trainConfig, config)`), per the
   backend-service rule: a remote tokenizer service can later satisfy the
   same interface.
+- **No explicit disposal.** The native handle owns only CPU heap — vocab
+  tables, merge lists, regexes — with no device buffers, file handles or
+  threads, so it is reclaimed by ordinary napi finalization when the JS
+  wrapper is garbage-collected. This deliberately differs from
+  `CompiledProgram` (RFC 0008), whose `dispose` exists because it
+  references device memory the GC cannot account for; pushing `Scope`
+  onto every tokenizer constructor would tax every call site for a
+  resource that is not scarce.
 - **Config is explicit and total** — `padding`, `truncation` and
   `specialTokens` are required fields with explicit `None`/`Never`
   variants. No optional-parameter defaults that silently pad with id 0 or
@@ -174,9 +179,6 @@ export interface Tokenizer extends Pipeable {
 - **Ragged batches are an error**, not an implicit decision: with
   `padding: { _tag: "None" }`, `encodeBatch` on unequal-length encodings
   fails with `TokenizerError`.
-- **Lifecycle** mirrors `CompiledProgram` (RFC 0008): an explicit `dispose`
-  effect, with `Effect.acquireRelease` used internally by constructors so
-  scoped usage finalizes the native handle.
 - **`decode` accepts tensors or raw ids**: generation loops hold tensors;
   tests and tooling hold arrays. Tensor inputs are materialized natively.
 

@@ -247,22 +247,23 @@ impl TokenizerInner {
 
 #[napi]
 pub struct NativeTokenizer {
-    inner: Option<Arc<TokenizerInner>>,
+    // CPU-heap only (vocab tables, merges, regexes): reclaimed by napi
+    // finalization when the JS wrapper is garbage-collected, so there is no
+    // explicit dispose — unlike device-buffer handles.
+    inner: Arc<TokenizerInner>,
 }
 
 #[napi]
 impl NativeTokenizer {
-    fn inner(&self) -> Result<&Arc<TokenizerInner>> {
-        self.inner
-            .as_ref()
-            .ok_or_else(|| Error::new(Status::GenericFailure, "tokenizer is disposed".to_string()))
+    fn inner(&self) -> &Arc<TokenizerInner> {
+        &self.inner
     }
 
     #[napi(factory)]
     pub fn from_file(path: String, parse_specials: bool) -> Result<Self> {
         let tokenizer = Tokenizer::from_file(path).map_err(to_napi_error)?;
         Ok(Self {
-            inner: Some(Arc::new(TokenizerInner::new(tokenizer, parse_specials))),
+            inner: Arc::new(TokenizerInner::new(tokenizer, parse_specials)),
         })
     }
 
@@ -270,7 +271,7 @@ impl NativeTokenizer {
     pub fn from_json(json: String, parse_specials: bool) -> Result<Self> {
         let tokenizer = Tokenizer::from_bytes(json.as_bytes()).map_err(to_napi_error)?;
         Ok(Self {
-            inner: Some(Arc::new(TokenizerInner::new(tokenizer, parse_specials))),
+            inner: Arc::new(TokenizerInner::new(tokenizer, parse_specials)),
         })
     }
 
@@ -280,33 +281,28 @@ impl NativeTokenizer {
             .await
             .map_err(crate::to_join_err)??;
         Ok(Self {
-            inner: Some(Arc::new(TokenizerInner::new(tokenizer, parse_specials))),
+            inner: Arc::new(TokenizerInner::new(tokenizer, parse_specials)),
         })
-    }
-
-    #[napi]
-    pub fn dispose(&mut self) {
-        self.inner = None;
     }
 
     #[napi(getter)]
     pub fn vocab_size(&self) -> Result<u32> {
-        Ok(self.inner()?.tokenizer.get_vocab_size(true) as u32)
+        Ok(self.inner().tokenizer.get_vocab_size(true) as u32)
     }
 
     #[napi]
     pub fn token_to_id(&self, token: String) -> Result<Option<u32>> {
-        Ok(self.inner()?.tokenizer.token_to_id(&token))
+        Ok(self.inner().tokenizer.token_to_id(&token))
     }
 
     #[napi]
     pub fn id_to_token(&self, id: u32) -> Result<Option<String>> {
-        Ok(self.inner()?.tokenizer.id_to_token(id))
+        Ok(self.inner().tokenizer.id_to_token(id))
     }
 
     #[napi]
     pub fn save(&self, path: String) -> Result<()> {
-        self.inner()?
+        self.inner()
             .tokenizer
             .save(path, false)
             .map_err(to_napi_error)
@@ -314,12 +310,12 @@ impl NativeTokenizer {
 
     #[napi]
     pub fn encode(&self, text: String) -> Result<Uint32Array> {
-        Ok(self.inner()?.encode_ids(&text)?.into())
+        Ok(self.inner().encode_ids(&text)?.into())
     }
 
     #[napi]
     pub async fn encode_batch(&self, texts: Vec<String>) -> Result<Vec<Uint32Array>> {
-        let inner = self.inner()?.clone();
+        let inner = self.inner().clone();
         tokio::task::spawn_blocking(move || {
             texts
                 .par_iter()
@@ -332,7 +328,7 @@ impl NativeTokenizer {
 
     #[napi]
     pub fn encode_tensor(&self, text: String, device: Option<String>) -> Result<LazyTensor> {
-        let ids = self.inner()?.encode_ids(&text)?;
+        let ids = self.inner().encode_ids(&text)?;
         let len = ids.len();
         ids_to_tensor(ids, vec![len], device)
     }
@@ -345,7 +341,7 @@ impl NativeTokenizer {
         truncation: NativeTruncation,
         device: Option<String>,
     ) -> Result<LazyTensor> {
-        let inner = self.inner()?.clone();
+        let inner = self.inner().clone();
         let batch = tokio::task::spawn_blocking(move || {
             texts
                 .par_iter()
@@ -365,7 +361,7 @@ impl NativeTokenizer {
 
     #[napi]
     pub fn decode(&self, ids: Vec<u32>) -> Result<String> {
-        self.inner()?
+        self.inner()
             .tokenizer
             .decode(&ids, false)
             .map_err(to_napi_error)
@@ -374,7 +370,7 @@ impl NativeTokenizer {
     #[napi]
     pub fn decode_batch(&self, ids: Vec<Vec<u32>>) -> Result<Vec<String>> {
         let refs: Vec<&[u32]> = ids.iter().map(|v| v.as_slice()).collect();
-        self.inner()?
+        self.inner()
             .tokenizer
             .decode_batch(&refs, false)
             .map_err(to_napi_error)

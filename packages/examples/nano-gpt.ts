@@ -164,7 +164,7 @@ const init = (model: Model.Model) =>
     return params
   })
 
-const program = Effect.scoped(Effect.gen(function* () {
+const program = Effect.gen(function* () {
   const device = yield* Device.CurrentDevice
 
   yield* Effect.log(`0) training BPE tokenizer (target vocab ${VOCAB})`)
@@ -223,6 +223,6 @@ const program = Effect.scoped(Effect.gen(function* () {
   }
   const generated = yield* tokenizer.decode(context.slice(1))
   yield* Effect.log(`\n${generated}`)
-}))
+})
 
 NodeRuntime.runMain(program.pipe(Effect.provide(Device.Best)))

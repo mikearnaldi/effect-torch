@@ -102,7 +102,6 @@ export declare class NativeTokenizer {
   static fromFile(path: string, parseSpecials: boolean): NativeTokenizer
   static fromJson(json: string, parseSpecials: boolean): NativeTokenizer
   static train(config: NativeTrainConfig, parseSpecials: boolean): Promise<NativeTokenizer>
-  dispose(): void
   get vocabSize(): number
   tokenToId(token: string): number | null
   idToToken(id: number): string | null
