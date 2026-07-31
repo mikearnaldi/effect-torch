@@ -451,6 +451,7 @@ fn train_tokenizer(config: NativeTrainConfig) -> Result<Tokenizer> {
             tokenizer.with_decoder(Some(ByteLevelDecoder::default()));
             let mut trainer = TrainerWrapper::from(
                 tokenizers::models::bpe::BpeTrainer::builder()
+                    .show_progress(false)
                     .vocab_size(vocab_size)
                     .min_frequency(min_frequency as u64)
                     .special_tokens(special_tokens.clone())
@@ -475,6 +476,7 @@ fn train_tokenizer(config: NativeTrainConfig) -> Result<Tokenizer> {
             specials.extend(special_tokens);
             let mut trainer = TrainerWrapper::from(
                 tokenizers::models::wordpiece::WordPieceTrainer::builder()
+                    .show_progress(false)
                     .vocab_size(vocab_size)
                     .min_frequency(min_frequency as u64)
                     .special_tokens(specials.clone())
@@ -490,6 +492,7 @@ fn train_tokenizer(config: NativeTrainConfig) -> Result<Tokenizer> {
             tokenizer.with_decoder(Some(MetaspaceDecoder::default()));
             let mut trainer = TrainerWrapper::from(
                 tokenizers::models::unigram::UnigramTrainer::builder()
+                    .show_progress(false)
                     .vocab_size(vocab_size as u32)
                     .special_tokens(special_tokens.clone())
                     .build()
@@ -504,6 +507,7 @@ fn train_tokenizer(config: NativeTrainConfig) -> Result<Tokenizer> {
             tokenizer.with_pre_tokenizer(Some(Whitespace));
             let mut trainer = TrainerWrapper::from(
                 tokenizers::models::wordlevel::WordLevelTrainer::builder()
+                    .show_progress(false)
                     .vocab_size(vocab_size)
                     .min_frequency(min_frequency as u64)
                     .special_tokens(special_tokens.clone())
