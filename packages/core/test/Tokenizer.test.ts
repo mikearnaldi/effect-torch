@@ -204,7 +204,9 @@ onDevices("Tokenizer", () => (it) => {
             vocabSize: 300,
             minFrequency: 2,
             specialTokens: [],
-            progress: Tokenizer.trainProgressReport((processed, total) => events.push([processed, total]))
+            progress: Tokenizer.trainProgressReport((processed, total) =>
+              Effect.sync(() => events.push([processed, total]))
+            )
           },
           Tokenizer.strictConfig
         )

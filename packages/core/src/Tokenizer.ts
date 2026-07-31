@@ -1,7 +1,7 @@
 /**
  * RFC 0009: tokenizers. A `Tokenizer` turns text into id tensors — the entry
  * point of the text data plane. Encoding, batch encoding and training run
- * natively (the HuggingFace `tokenizers` crate over napi); `encode` and
+ * natively (the HuggingFace `tokenizers` crate over napi) `encode` and
  * `encodeBatch` return `u32` tensors built in Rust, so the id buffer never
  * round-trips through JS. Loading is `tokenizer.json`-compatible, so every
  * HuggingFace Hub tokenizer works out of the box, and `train` builds BPE,
@@ -11,13 +11,19 @@
  * ids unless the tokenizer is configured with `specialTokens: "Always"` —
  * the tiktoken `allowed_special` discipline.
  */
-import { Data, Effect, Option } from "effect"
-import { pipeArguments, type Pipeable } from "effect/Pipeable"
 import native, {
   type NativePadding as NativePaddingType,
   type NativeTokenizer as NativeTokenizerType,
   type NativeTruncation as NativeTruncationType
 } from "@effect-torch/native"
+import {
+  Data,
+  Effect,
+  Option,
+  Queue,
+  Stream
+} from "effect"
+import { pipeArguments, type Pipeable } from "effect/Pipeable"
 import { CurrentDevice } from "./Device.ts"
 import * as Tensor from "./Tensor.ts"
 
@@ -27,7 +33,9 @@ const { NativeTokenizer } = native
  * @since 0.1.0
  * @category symbols
  */
-export const TokenizerTypeId: unique symbol = Symbol.for("@effect-torch/core/Tokenizer")
+export const TokenizerTypeId: unique symbol = Symbol.for(
+  "@effect-torch/core/Tokenizer"
+)
 
 /**
  * @since 0.1.0
@@ -57,7 +65,11 @@ export class TokenizerError extends Data.TaggedError("TokenizerError")<{
 export type Padding =
   | { readonly _tag: "None" }
   | { readonly _tag: "Longest"; readonly padId: number }
-  | { readonly _tag: "MaxLength"; readonly maxLength: number; readonly padId: number }
+  | {
+      readonly _tag: "MaxLength"
+      readonly maxLength: number
+      readonly padId: number
+    }
 
 /**
  * @since 0.1.0
@@ -69,13 +81,19 @@ export const paddingNone: Padding = { _tag: "None" }
  * @since 0.1.0
  * @category constructors
  */
-export const paddingLongest = (padId: number): Padding => ({ _tag: "Longest", padId })
+export const paddingLongest = (padId: number): Padding => ({
+  _tag: "Longest",
+  padId
+})
 
 /**
  * @since 0.1.0
  * @category constructors
  */
-export const paddingMaxLength = (maxLength: number, padId: number): Padding => ({
+export const paddingMaxLength = (
+  maxLength: number,
+  padId: number,
+): Padding => ({
   _tag: "MaxLength",
   maxLength,
   padId
@@ -101,7 +119,10 @@ export const truncationNone: Truncation = { _tag: "None" }
  * @since 0.1.0
  * @category constructors
  */
-export const truncationMaxLength = (maxLength: number): Truncation => ({ _tag: "MaxLength", maxLength })
+export const truncationMaxLength = (maxLength: number): Truncation => ({
+  _tag: "MaxLength",
+  maxLength
+})
 
 /**
  * Whether special-token strings occurring in input text are parsed into
@@ -166,18 +187,24 @@ export type TrainSource =
  * @since 0.1.0
  * @category constructors
  */
-export const trainFiles = (paths: ReadonlyArray<string>): TrainSource => ({ _tag: "Files", paths })
+export const trainFiles = (paths: ReadonlyArray<string>): TrainSource => ({
+  _tag: "Files",
+  paths
+})
 
 /**
  * @since 0.1.0
  * @category constructors
  */
-export const trainTexts = (texts: ReadonlyArray<string>): TrainSource => ({ _tag: "Texts", texts })
+export const trainTexts = (texts: ReadonlyArray<string>): TrainSource => ({
+  _tag: "Texts",
+  texts
+})
 
 /**
  * Training progress reporting. The corpus feed is the dominant cost on
  * large corpora and is reported as `(processed, total)` corpus bytes,
- * throttled natively; one final `(total, total)` event signals that the
+ * throttled natively one final `(total, total)` event signals that the
  * feed is complete and the (indeterminate) merge computation has begun.
  * The callback runs on the JS thread — what to do with the events (log,
  * render, ignore) is the caller's decision.
@@ -187,7 +214,13 @@ export const trainTexts = (texts: ReadonlyArray<string>): TrainSource => ({ _tag
  */
 export type TrainProgress<E, R> =
   | { readonly _tag: "None" }
-  | { readonly _tag: "Report"; readonly report: (processed: number, total: number) => Effect.Effect<void, E, R> }
+  | {
+      readonly _tag: "Report"
+      readonly report: (
+        processed: number,
+        total: number,
+      ) => Effect.Effect<void, E, R>
+    }
 
 /**
  * @since 0.1.0
@@ -199,9 +232,9 @@ export const trainProgressNone: TrainProgress<never, never> = { _tag: "None" }
  * @since 0.1.0
  * @category constructors
  */
-export const trainProgressReport = (
-  report: (processed: number, total: number) => void
-): TrainProgress => ({ _tag: "Report", report })
+export const trainProgressReport = <E, R>(
+  report: (processed: number, total: number) => Effect.Effect<void, E, R>,
+): TrainProgress<E, R> => ({ _tag: "Report", report })
 
 /**
  * Configuration for {@link train}. Training is deterministic and streams
@@ -212,17 +245,17 @@ export const trainProgressReport = (
  * @since 0.1.0
  * @category models
  */
-export interface TrainConfig {
+export interface TrainConfig<E, R> {
   readonly source: TrainSource
   readonly model: TrainModel
   readonly vocabSize: number
   readonly minFrequency: number
   readonly specialTokens: ReadonlyArray<string>
-  readonly progress: TrainProgress
+  readonly progress: TrainProgress<E, R>
 }
 
 /**
- * A text tokenizer. Values are immutable and safe for concurrent use; the
+ * A text tokenizer. Values are immutable and safe for concurrent use the
  * native handle owns only CPU heap (vocab tables, merges, regexes), so it
  * is reclaimed by ordinary GC finalization — no explicit disposal.
  *
@@ -238,25 +271,29 @@ export interface Tokenizer extends Pipeable {
   /**
    * Encodes text into a `[T]` `u32` tensor of token ids.
    */
-  readonly encode: (text: string) => Effect.Effect<Tensor.Lazy, TokenizerError, CurrentDevice>
+  readonly encode: (
+    text: string,
+  ) => Effect.Effect<Tensor.Lazy, TokenizerError, CurrentDevice>
   /**
    * Encodes a batch into a `[B, T]` `u32` tensor, padded per the
-   * tokenizer's {@link Padding} config; with `paddingNone`, ragged
+   * tokenizer's {@link Padding} config with `paddingNone`, ragged
    * encodings fail with {@link TokenizerError}.
    */
   readonly encodeBatch: (
-    texts: ReadonlyArray<string>
+    texts: ReadonlyArray<string>,
   ) => Effect.Effect<Tensor.Lazy, TokenizerError, CurrentDevice>
   /**
    * Decodes ids back to text, losslessly (special tokens are not skipped).
    * Tensor inputs are materialized natively.
    */
-  readonly decode: (ids: Tensor.Any | ReadonlyArray<number>) => Effect.Effect<string, TokenizerError>
+  readonly decode: (
+    ids: Tensor.Any | ReadonlyArray<number>,
+  ) => Effect.Effect<string, TokenizerError>
   /**
    * Batch counterpart of {@link Tokenizer.decode}.
    */
   readonly decodeBatch: (
-    ids: ReadonlyArray<Tensor.Any | ReadonlyArray<number>>
+    ids: ReadonlyArray<Tensor.Any | ReadonlyArray<number>>,
   ) => Effect.Effect<ReadonlyArray<string>, TokenizerError>
   readonly tokenToId: (token: string) => Option.Option<number>
   readonly idToToken: (id: number) => Option.Option<string>
@@ -273,7 +310,11 @@ const toNativePadding = (padding: Padding): NativePaddingType => {
     case "Longest":
       return { tag: "Longest", padId: padding.padId }
     case "MaxLength":
-      return { tag: "MaxLength", maxLength: padding.maxLength, padId: padding.padId }
+      return {
+        tag: "MaxLength",
+        maxLength: padding.maxLength,
+        padId: padding.padId
+      }
   }
 }
 
@@ -287,17 +328,23 @@ const toNativeTruncation = (truncation: Truncation): NativeTruncationType => {
 }
 
 const toTokenizerError = (op: string) => (error: unknown) =>
-  new TokenizerError({ op, message: error instanceof Error ? error.message : String(error) })
+  new TokenizerError({
+    op,
+    message: error instanceof Error ? error.message : String(error),
+  })
 
 const idsOf = (
-  ids: Tensor.Any | ReadonlyArray<number>
+  ids: Tensor.Any | ReadonlyArray<number>,
 ): Effect.Effect<ReadonlyArray<number>, TokenizerError> =>
   Array.isArray(ids)
     ? Effect.succeed(ids as ReadonlyArray<number>)
     : Effect.map(
-      Effect.mapError(Tensor.toTypedArray(ids as Tensor.Any), toTokenizerError("decode")),
-      (data) => Array.from(data, Number)
-    )
+        Effect.mapError(
+          Tensor.toTypedArray(ids as Tensor.Any),
+          toTokenizerError("decode"),
+        ),
+        (data) => Array.from(data, Number)
+      )
 
 const TokenizerProto = {
   pipe() {
@@ -305,7 +352,10 @@ const TokenizerProto = {
   }
 }
 
-const make = (handle: NativeTokenizerType, config: TokenizerConfig): Tokenizer => {
+const make = (
+  handle: NativeTokenizerType,
+  config: TokenizerConfig,
+): Tokenizer => {
   const self = Object.create(TokenizerProto)
   self[TokenizerTypeId] = TokenizerTypeId
   self.vocabSize = handle.vocabSize
@@ -340,18 +390,23 @@ const make = (handle: NativeTokenizerType, config: TokenizerConfig): Tokenizer =
     Effect.flatMap(idsOf(ids), (resolved) =>
       Effect.try({
         try: () => handle.decode(resolved as Array<number>),
-        catch: toTokenizerError("decode")
-      }))
-  self.decodeBatch = (batch: ReadonlyArray<Tensor.Any | ReadonlyArray<number>>) =>
+        catch: toTokenizerError("decode"),
+      })
+    )
+  self.decodeBatch = (
+    batch: ReadonlyArray<Tensor.Any | ReadonlyArray<number>>,
+  ) =>
     Effect.flatMap(
       Effect.forEach(batch, idsOf, { concurrency: "unbounded" }),
       (resolved) =>
         Effect.try({
-          try: () => handle.decodeBatch(resolved.map((row) => row as Array<number>)),
+          try: () =>
+            handle.decodeBatch(resolved.map((row) => row as Array<number>)),
           catch: toTokenizerError("decodeBatch")
-        })
-      )
-  self.tokenToId = (token: string) => Option.fromNullishOr(handle.tokenToId(token))
+        }),
+    )
+  self.tokenToId = (token: string) =>
+    Option.fromNullishOr(handle.tokenToId(token))
   self.idToToken = (id: number) => Option.fromNullishOr(handle.idToToken(id))
   self.save = (path: string) =>
     Effect.try({
@@ -370,10 +425,14 @@ const make = (handle: NativeTokenizerType, config: TokenizerConfig): Tokenizer =
  */
 export const fromFile = (
   path: string,
-  config: TokenizerConfig
+  config: TokenizerConfig,
 ): Effect.Effect<Tokenizer, TokenizerError> =>
   Effect.try({
-    try: () => make(NativeTokenizer.fromFile(path, config.specialTokens === "Always"), config),
+    try: () =>
+      make(
+        NativeTokenizer.fromFile(path, config.specialTokens === "Always"),
+        config,
+      ),
     catch: toTokenizerError("fromFile")
   })
 
@@ -385,50 +444,82 @@ export const fromFile = (
  */
 export const fromJson = (
   json: string,
-  config: TokenizerConfig
+  config: TokenizerConfig,
 ): Effect.Effect<Tokenizer, TokenizerError> =>
   Effect.try({
-    try: () => make(NativeTokenizer.fromJson(json, config.specialTokens === "Always"), config),
+    try: () =>
+      make(
+        NativeTokenizer.fromJson(json, config.specialTokens === "Always"),
+        config,
+      ),
     catch: toTokenizerError("fromJson")
   })
 
 /**
  * Trains a tokenizer from a corpus ({@link TrainSource}): raw text files
  * streamed from disk, or texts already in memory. Runs natively off the
- * JS thread; the result is immediately usable and `save`-able as
+ * JS thread the result is immediately usable and `save`-able as
  * `tokenizer.json`.
  *
  * @since 0.1.0
  * @category constructors
  */
-export const train = (
-  trainConfig: TrainConfig,
-  config: TokenizerConfig
-): Effect.Effect<Tokenizer, TokenizerError> => {
-  const progress = trainConfig.progress
-  const onProgress = progress._tag === "Report"
-    ? (event: [number, number]) => progress.report(event[0], event[1])
-    : () => {}
-  return Effect.tryPromise({
-    try: async () =>
-      make(
-        await NativeTokenizer.train(
-          {
-            model: trainConfig.model,
-            vocabSize: trainConfig.vocabSize,
-            minFrequency: trainConfig.minFrequency,
-            specialTokens: trainConfig.specialTokens as Array<string>,
-            source: trainConfig.source._tag === "Files"
-              ? { tag: "Files", paths: trainConfig.source.paths as Array<string> }
-              : { tag: "Texts", texts: trainConfig.source.texts as Array<string> }
-          },
-          config.specialTokens === "Always",
-          onProgress
-        ),
-        config
-      ),
-    catch: toTokenizerError("train")
-  })
+export const train = <E = never, R = never>(
+  trainConfig: TrainConfig<E, R>,
+  config: TokenizerConfig,
+): Effect.Effect<Tokenizer, TokenizerError | E, R> => {
+  return Stream.callback<
+    Effect.Effect<undefined | NativeTokenizerType, E | TokenizerError, R>
+  >((queue) =>
+    Effect.gen(function* () {
+      const progress = trainConfig.progress
+      const onProgress =
+        progress._tag === "Report"
+          ? (event: [number, number]) => {
+              Queue.offerUnsafe(
+                queue,
+                Effect.as(undefined)(progress.report(event[0], event[1])),
+              )
+            }
+          : () => {}
+      NativeTokenizer.train(
+        {
+          model: trainConfig.model,
+          vocabSize: trainConfig.vocabSize,
+          minFrequency: trainConfig.minFrequency,
+          specialTokens: trainConfig.specialTokens as Array<string>,
+          source:
+            trainConfig.source._tag === "Files"
+              ? {
+                  tag: "Files",
+                  paths: trainConfig.source.paths as Array<string>,
+                }
+              : {
+                  tag: "Texts",
+                  texts: trainConfig.source.texts as Array<string>,
+                },
+        },
+        config.specialTokens === "Always",
+        onProgress,
+      )
+        .then((tensor) => {
+          Queue.offerUnsafe(queue, Effect.succeed(tensor))
+          Queue.endUnsafe(queue)
+        })
+        .catch((e) => {
+          Queue.offerUnsafe(queue, Effect.fail(toTokenizerError("train")(e)))
+          Queue.endUnsafe(queue)
+        })
+    }),
+  ).pipe(
+    Stream.mapEffect((_) => _),
+    Stream.filter((_) => _ !== undefined),
+    Stream.runLast,
+    Effect.flatMap((_) => Effect.try({
+      try: () => make(Option.getOrThrow(_), config),
+      catch: toTokenizerError("train")
+    }))
+  )
 }
 
 /**
