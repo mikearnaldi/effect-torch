@@ -158,6 +158,8 @@ const init = (model: Model.Model) =>
     for (const [i, name] of model.names.entries()) {
       yield* Effect.log(`  ${name} [${params[i].shape}] ${params[i].dtype} initialized`)
     }
+    const total = params.reduce((sum, param) => sum + param.shape.reduce((a, b) => a * b, 1), 0)
+    yield* Effect.log(`  total: ${total.toLocaleString()} parameters`)
     return params
   })
 
