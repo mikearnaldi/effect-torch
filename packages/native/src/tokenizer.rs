@@ -7,10 +7,13 @@ use rayon::prelude::*;
 use std::io::BufRead;
 use std::sync::Arc;
 use tokenizers::decoders::{
-    byte_level::ByteLevel as ByteLevelDecoder, metaspace::Metaspace as MetaspaceDecoder,
+    byte_fallback::ByteFallback as ByteFallbackDecoder, byte_level::ByteLevel as ByteLevelDecoder,
+    metaspace::Metaspace as MetaspaceDecoder, sequence::Sequence as SequenceDecoder,
     wordpiece::WordPiece as WordPieceDecoder,
 };
-use tokenizers::models::{bpe::BPE, unigram::Unigram, wordlevel::WordLevel, wordpiece::WordPiece};
+use tokenizers::models::{
+    bpe::BPE, unigram::Unigram, wordlevel::WordLevel, wordpiece::WordPiece, ModelWrapper,
+};
 use tokenizers::normalizers::bert::BertNormalizer;
 use tokenizers::pre_tokenizers::{
     byte_level::ByteLevel, metaspace::Metaspace, whitespace::Whitespace,
@@ -532,6 +535,41 @@ fn run_trainer(
     Ok(())
 }
 
+// Rebuilds a trained Unigram model with byte_fallback enabled: the 256
+// `<0xXX>` byte pieces are appended to the trained vocab (existing ids are
+// stable) so text the trained pieces cannot cover — newlines, emoji,
+// scripts absent from the corpus — encodes as byte pieces and decodes back
+// losslessly, instead of collapsing to <unk>. The trainer's unk token
+// stays at id 0 for anything even bytes cannot rescue.
+fn enable_byte_fallback(tokenizer: &mut Tokenizer) -> Result<()> {
+    let ModelWrapper::Unigram(unigram) = tokenizer.get_model() else {
+        return Err(Error::new(
+            Status::GenericFailure,
+            "train: expected a Unigram model".to_string(),
+        ));
+    };
+    let mut pieces: Vec<(String, f64)> = unigram
+        .iter()
+        .map(|(token, score)| (token.clone(), *score))
+        .collect();
+    // Byte pieces get the lowest score: last-resort tokens, never chosen
+    // over a trained piece.
+    let byte_score = pieces
+        .iter()
+        .map(|(_, score)| *score)
+        .fold(f64::INFINITY, f64::min)
+        - 1.0;
+    for byte in 0u8..=255 {
+        let piece = format!("<0x{byte:02X}>");
+        if !pieces.iter().any(|(token, _)| token == &piece) {
+            pieces.push((piece, byte_score));
+        }
+    }
+    let model = Unigram::from(pieces, Some(0), true).map_err(to_napi_error)?;
+    tokenizer.with_model(model);
+    Ok(())
+}
+
 fn train_tokenizer(
     config: NativeTrainConfig,
     report: Option<ProgressCallback>,
@@ -589,17 +627,28 @@ fn train_tokenizer(
         "Unigram" => {
             let mut tokenizer = Tokenizer::new(Unigram::default());
             tokenizer.with_pre_tokenizer(Some(Metaspace::default()));
-            tokenizer.with_decoder(Some(MetaspaceDecoder::default()));
+            // LLaMA-style decoding: byte-fallback pieces back to bytes,
+            // then ▁ → space.
+            tokenizer.with_decoder(Some(SequenceDecoder::new(vec![
+                ByteFallbackDecoder::default().into(),
+                MetaspaceDecoder::default().into(),
+            ])));
+            // SentencePiece convention: <unk> at id 0 with model.unk_id set
+            // (the builder defaults unk_token to None).
+            let mut specials = vec![AddedToken::from("<unk>".to_string(), true)];
+            specials.extend(special_tokens);
             let mut trainer = TrainerWrapper::from(
                 tokenizers::models::unigram::UnigramTrainer::builder()
                     .show_progress(false)
                     .vocab_size(vocab_size as u32)
-                    .special_tokens(special_tokens.clone())
+                    .special_tokens(specials.clone())
+                    .unk_token(Some("<unk>".to_string()))
                     .build()
                     .map_err(to_napi_error)?,
             );
             run_trainer(&mut tokenizer, &mut trainer, source, report, progress_step)?;
-            tokenizer.add_special_tokens(&special_tokens);
+            tokenizer.add_special_tokens(&specials);
+            enable_byte_fallback(&mut tokenizer)?;
             Ok(tokenizer)
         }
         "WordLevel" => {

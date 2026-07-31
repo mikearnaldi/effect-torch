@@ -1,4 +1,4 @@
-import { Effect } from "effect"
+import { Effect, Option } from "effect"
 import { NodeRuntime } from "@effect/platform-node"
 import { Device, LearningRate, Loss, Model, Optimizer, Tensor, Tokenizer, Trainer } from "@effect-torch/core"
 
@@ -75,6 +75,8 @@ const LR = 3e-3
 const GENERATE = 240
 const TEMPERATURE = 0.8
 const VOCAB = 300
+const TOKENIZER_MODEL: Tokenizer.TrainModel = "Unigram"
+const BOS = "<|bos|>"
 
 const createGpt = (vocabSize: number) =>
   Effect.gen(function* () {
@@ -164,20 +166,23 @@ const init = (model: Model.Model) =>
 const program = Effect.gen(function* () {
   const device = yield* Device.CurrentDevice
 
-  yield* Effect.log(`0) training BPE tokenizer (target vocab ${VOCAB})`)
+  yield* Effect.log(`0) training ${TOKENIZER_MODEL} tokenizer (target vocab ${VOCAB})`)
   const tokenizer = yield* Tokenizer.train(
-    { 
-      source: Tokenizer.trainTexts(CORPUS.split("\n")),
-      model: "BPE",
+    {
+      source: Tokenizer.trainTexts(CORPUS.split(/(?<=\n)/)),
+      model: TOKENIZER_MODEL,
       vocabSize: VOCAB,
       minFrequency: 2,
-      specialTokens: [],
+      specialTokens: [BOS],
       progress: Tokenizer.trainProgressReport(256, (processed, total) => Effect.log(`tokenizer feed ${processed}/${total}`))
     },
     Tokenizer.strictConfig
   )
   const vocabSize = tokenizer.vocabSize
-  const data = yield* Tensor.toNumberArray(yield* tokenizer.encode(CORPUS))
+  const bosId = Option.getOrThrow(tokenizer.tokenToId(BOS))
+  // The corpus is one document: prepend BOS so the model learns
+  // P(first tokens | BOS) and generation can start from it.
+  const data = [bosId, ...(yield* Tensor.toNumberArray(yield* tokenizer.encode(CORPUS)))]
   yield* Effect.log(
     `nano-gpt: vocab ${vocabSize} (${data.length} tokens), block ${BLOCK}, embed ${EMBED}, ${HEADS} heads, ${LAYERS} layers on ${device}`
   )
@@ -201,7 +206,7 @@ const program = Effect.gen(function* () {
   // logits are unchanged; the next-token logits are the row at the true
   // last token, not the padded last row.
   yield* Effect.log(`3) generating ${GENERATE} tokens (temperature ${TEMPERATURE}):`)
-  const context = yield* Tensor.toNumberArray(yield* tokenizer.encode("\n"))
+  const context = [bosId]
   for (let n = 0; n < GENERATE; n++) {
     const window = context.slice(-BLOCK)
     const idx = yield* ids([...window, ...new Array(BLOCK - window.length).fill(0)], [1, BLOCK])

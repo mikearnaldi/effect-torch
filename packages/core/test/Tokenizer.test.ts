@@ -296,6 +296,18 @@ onDevices("Tokenizer", () => (it) => {
       })
     )
 
+    it.effect("Unigram byte fallback round-trips out-of-vocabulary text losslessly", () =>
+      Effect.gen(function* () {
+        const tokenizer = yield* train("Unigram", 100)
+        expect(Option.getOrElse(tokenizer.tokenToId("<unk>"), () => -1)).toBe(0)
+        const text = "the quick\nbrown fox 😁 こんにちは"
+        const ids = yield* numbers(yield* tokenizer.encode(text))
+        expect(ids).not.toContain(0)
+        const decoded = yield* tokenizer.decode(ids)
+        expect(decoded).toBe(text)
+      })
+    )
+
     it.effect("WordLevel round-trips whitespace-separated words", () =>
       Effect.gen(function* () {
         const tokenizer = yield* train("WordLevel", 200)
