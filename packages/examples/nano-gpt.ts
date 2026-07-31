@@ -152,6 +152,15 @@ const createTrainer = (model: Model.Model) =>
     return yield* Trainer.compile(trainer)
   })
 
+const init = (model: Model.Model) =>
+  Effect.gen(function* () {
+    const params = yield* model.init
+    for (const [i, name] of model.names.entries()) {
+      yield* Effect.log(`  ${name} [${params[i].shape}] ${params[i].dtype} initialized`)
+    }
+    return params
+  })
+
 const program = Effect.gen(function* () {
   const device = yield* Device.CurrentDevice
   yield* Effect.log(
@@ -161,7 +170,7 @@ const program = Effect.gen(function* () {
   yield* Effect.log("1) creating model")
   const model = yield* createGpt
   yield* Effect.log(`${model.names.length} tensors of parameters`)
-  const params0 = yield* model.init
+  const params0 = yield* init(model)
 
   yield* Effect.log(`2) training: adamW lr=${LR}, ${STEPS} steps (compiled)`)
   const trainer = yield* createTrainer(model)
