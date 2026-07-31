@@ -14,6 +14,8 @@ export declare class CompiledProgram {
 
 export declare class LazyTensor {
   dispose(): void
+  get shape(): Array<number>
+  get dtype(): string
   static zeros(shape: Array<number>, dtype?: NativeDType | undefined | null, device?: string | undefined | null): LazyTensor
   static ones(shape: Array<number>, dtype?: NativeDType | undefined | null, device?: string | undefined | null): LazyTensor
   static full(shape: Array<number>, value: number, dtype?: NativeDType | undefined | null, device?: string | undefined | null): LazyTensor
@@ -96,6 +98,23 @@ export declare class NativeTensor {
   readback(token?: CancellationToken | undefined | null): Promise<ArrayBuffer>
 }
 
+export declare class NativeTokenizer {
+  static fromFile(path: string, parseSpecials: boolean): NativeTokenizer
+  static fromJson(json: string, parseSpecials: boolean): NativeTokenizer
+  static train(config: NativeTrainConfig, parseSpecials: boolean): Promise<NativeTokenizer>
+  dispose(): void
+  get vocabSize(): number
+  tokenToId(token: string): number | null
+  idToToken(id: number): string | null
+  save(path: string): void
+  encode(text: string): Uint32Array
+  encodeBatch(texts: Array<string>): Promise<Array<Uint32Array>>
+  encodeTensor(text: string, device?: string | undefined | null): LazyTensor
+  encodeBatchTensor(texts: Array<string>, padding: NativePadding, truncation: NativeTruncation, device?: string | undefined | null): Promise<LazyTensor>
+  decode(ids: Array<number>): string
+  decodeBatch(ids: Array<Array<number>>): Array<string>
+}
+
 export declare function compile(roots: Array<LazyTensor>): CompiledProgram
 
 export declare function evalLazy(tensors: Array<LazyTensor>, token?: CancellationToken | undefined | null): Promise<Array<NativeTensor>>
@@ -115,6 +134,25 @@ export declare const enum NativeDType {
   U8 = 'u8',
   U32 = 'u32',
   F16 = 'f16'
+}
+
+export interface NativePadding {
+  tag: string
+  padId?: number
+  maxLength?: number
+}
+
+export interface NativeTrainConfig {
+  model: string
+  vocabSize: number
+  minFrequency: number
+  specialTokens: Array<string>
+  files: Array<string>
+}
+
+export interface NativeTruncation {
+  tag: string
+  maxLength?: number
 }
 
 export declare function reportExternalMemory(bytes: number): void

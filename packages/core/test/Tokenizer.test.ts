@@ -1,0 +1,250 @@
+import { describe, expect } from "@effect/vitest"
+import { Effect, Option } from "effect"
+import * as fs from "node:fs"
+import * as os from "node:os"
+import * as path from "node:path"
+import { Tensor, Tokenizer } from "../src/index.ts"
+import { onDevices } from "./utils/devices.ts"
+
+const tmpdir = Effect.sync(() => fs.mkdtempSync(path.join(os.tmpdir(), "effect-torch-tok-")))
+
+const corpusLines = [
+  "the quick brown fox jumps over the lazy dog",
+  "the lazy dog sleeps while the quick brown fox runs",
+  "hello world hello tokenizer hello effect torch",
+  "tokenizers turn text into tensors and tensors into models",
+  "a library for building models needs a real data plane",
+  "byte pair encoding merges the most frequent pairs first"
+]
+
+const writeCorpus = (dir: string, lines: ReadonlyArray<string>, repeats = 20) =>
+  Effect.sync(() => {
+    const file = path.join(dir, "corpus.txt")
+    fs.writeFileSync(file, Array.from({ length: repeats }, () => lines.join("\n")).join("\n"))
+    return file
+  })
+
+const trainBpe = (
+  file: string,
+  config: Tokenizer.TokenizerConfig = Tokenizer.strictConfig,
+  specialTokens: ReadonlyArray<string> = ["<|endoftext|>"]
+) =>
+  Tokenizer.train(
+    { files: [file], model: "BPE", vocabSize: 300, minFrequency: 2, specialTokens },
+    config
+  )
+
+const numbers = (t: Tensor.Any) => Tensor.toNumberArray(t)
+
+onDevices("Tokenizer", () => (it) => {
+  describe("BPE", () => {
+    it.effect("encodes to a [T] u32 tensor and decodes losslessly, including unicode", () =>
+      Effect.scoped(Effect.gen(function* () {
+        const dir = yield* tmpdir
+        const file = yield* writeCorpus(dir, corpusLines)
+        const tokenizer = yield* trainBpe(file)
+        const text = "hello world — こんにちは 😁 café, naïve"
+        const ids = yield* tokenizer.encode(text)
+        expect(ids.dtype).toBe("u32")
+        expect(ids.shape.length).toBe(1)
+        expect(ids.shape[0]).toBeGreaterThan(0)
+        const decoded = yield* tokenizer.decode(ids)
+        expect(decoded).toBe(text)
+      }))
+    )
+
+    it.effect("decodeBatch round-trips raw id arrays; vocab lookups are Options", () =>
+      Effect.scoped(Effect.gen(function* () {
+        const dir = yield* tmpdir
+        const file = yield* writeCorpus(dir, corpusLines)
+        const tokenizer = yield* trainBpe(file)
+        const texts = ["hello world", "the lazy dog"]
+        const batch = yield* tokenizer.encodeBatch(texts)
+        expect(batch.shape.length).toBe(2)
+        expect(batch.shape[0]).toBe(2)
+        const flat = yield* numbers(batch)
+        const cols = batch.shape[1]
+        const rows = [flat.slice(0, cols), flat.slice(cols)]
+        const decoded = yield* tokenizer.decodeBatch(rows)
+        expect(decoded).toEqual(texts)
+        expect(Option.isSome(tokenizer.tokenToId("<|endoftext|>"))).toBe(true)
+        const id = Option.getOrElse(tokenizer.tokenToId("<|endoftext|>"), () => -1)
+        expect(tokenizer.idToToken(id)).toEqual(Option.some("<|endoftext|>"))
+        expect(tokenizer.tokenToId("not a token")).toEqual(Option.none())
+        expect(tokenizer.vocabSize).toBeGreaterThan(256)
+      }))
+    )
+
+    it.effect("save and fromFile/fromJson preserve encoding exactly", () =>
+      Effect.scoped(Effect.gen(function* () {
+        const dir = yield* tmpdir
+        const file = yield* writeCorpus(dir, corpusLines)
+        const tokenizer = yield* trainBpe(file)
+        const saved = path.join(dir, "tokenizer.json")
+        yield* tokenizer.save(saved)
+        const text = "tokenizers turn text into tensors 😁"
+        const expected = yield* numbers(yield* tokenizer.encode(text))
+
+        const fromFile = yield* Tokenizer.fromFile(saved, Tokenizer.strictConfig)
+        expect(yield* numbers(yield* fromFile.encode(text))).toEqual(expected)
+
+        const fromJson = yield* Tokenizer.fromJson(fs.readFileSync(saved, "utf8"), Tokenizer.strictConfig)
+        expect(yield* numbers(yield* fromJson.encode(text))).toEqual(expected)
+      }))
+    )
+  })
+
+  describe("padding and truncation", () => {
+    const texts = ["hello world", "tokenizers turn text into tensors and tensors into models"]
+
+    it.effect("Longest pads to the longest encoding with padId", () =>
+      Effect.scoped(Effect.gen(function* () {
+        const dir = yield* tmpdir
+        const file = yield* writeCorpus(dir, corpusLines)
+        const tokenizer = yield* trainBpe(file, {
+          padding: Tokenizer.paddingLongest(0),
+          truncation: Tokenizer.truncationNone,
+          specialTokens: "Never"
+        })
+        const batch = yield* tokenizer.encodeBatch(texts)
+        expect(batch.shape.length).toBe(2)
+        const flat = yield* numbers(batch)
+        const [cols] = batch.shape.slice(1)
+        const shortRow = flat.slice(0, cols)
+        const longRow = flat.slice(cols)
+        expect(shortRow.length).toBe(longRow.length)
+        expect(shortRow.some((id, i) => id === 0 && longRow[i] !== 0)).toBe(true)
+        expect(yield* tokenizer.decode(longRow)).toBe(texts[1])
+      }))
+    )
+
+    it.effect("MaxLength pads and truncation caps overlong encodings", () =>
+      Effect.scoped(Effect.gen(function* () {
+        const dir = yield* tmpdir
+        const file = yield* writeCorpus(dir, corpusLines)
+        const tokenizer = yield* trainBpe(file, {
+          padding: Tokenizer.paddingMaxLength(8, 0),
+          truncation: Tokenizer.truncationMaxLength(8),
+          specialTokens: "Never"
+        })
+        const batch = yield* tokenizer.encodeBatch(texts)
+        expect(batch.shape).toEqual([2, 8])
+      }))
+    )
+
+    it.effect("MaxLength padding without truncation fails on overlong encodings", () =>
+      Effect.scoped(Effect.gen(function* () {
+        const dir = yield* tmpdir
+        const file = yield* writeCorpus(dir, corpusLines)
+        const tokenizer = yield* trainBpe(file, {
+          padding: Tokenizer.paddingMaxLength(4, 0),
+          truncation: Tokenizer.truncationNone,
+          specialTokens: "Never"
+        })
+        const error = yield* Effect.flip(tokenizer.encodeBatch(texts))
+        expect(error.message).toContain("truncation")
+      }))
+    )
+
+    it.effect("padding None fails on ragged encodings and on empty batches", () =>
+      Effect.scoped(Effect.gen(function* () {
+        const dir = yield* tmpdir
+        const file = yield* writeCorpus(dir, corpusLines)
+        const tokenizer = yield* trainBpe(file)
+        const ragged = yield* Effect.flip(tokenizer.encodeBatch(texts))
+        expect(ragged.message).toContain("ragged")
+        const empty = yield* Effect.flip(tokenizer.encodeBatch([]))
+        expect(empty.message).toContain("at least one text")
+      }))
+    )
+  })
+
+  describe("special token policy", () => {
+    it.effect("Never tokenizes special strings as ordinary text; Always parses them", () =>
+      Effect.gen(function* () {
+        const dir = yield* tmpdir
+        const file = yield* writeCorpus(dir, corpusLines)
+        const saved = path.join(dir, "tokenizer.json")
+        const specialId = yield* Effect.scoped(Effect.gen(function* () {
+          const tokenizer = yield* trainBpe(file)
+          yield* tokenizer.save(saved)
+          return Option.getOrNull(tokenizer.tokenToId("<|endoftext|>"))
+        }))
+
+        const text = "<|endoftext|> hello world"
+        const neverIds = yield* Effect.scoped(Effect.gen(function* () {
+          const tokenizer = yield* Tokenizer.fromFile(saved, {
+            padding: Tokenizer.paddingNone,
+            truncation: Tokenizer.truncationNone,
+            specialTokens: "Never"
+          })
+          return yield* numbers(yield* tokenizer.encode(text))
+        }))
+        expect(neverIds).not.toContain(specialId)
+        expect(neverIds.length).toBeGreaterThan(2)
+
+        const alwaysIds = yield* Effect.scoped(Effect.gen(function* () {
+          const tokenizer = yield* Tokenizer.fromFile(saved, {
+            padding: Tokenizer.paddingNone,
+            truncation: Tokenizer.truncationNone,
+            specialTokens: "Always"
+          })
+          return yield* numbers(yield* tokenizer.encode(text))
+        }))
+        expect(alwaysIds).toContain(specialId)
+      })
+    )
+  })
+
+  describe("model families", () => {
+    const train = (model: Tokenizer.TrainModel, vocabSize: number) =>
+      Effect.gen(function* () {
+        const dir = yield* tmpdir
+        const file = yield* writeCorpus(dir, corpusLines)
+        const tokenizer = yield* Tokenizer.train(
+          { files: [file], model, vocabSize, minFrequency: 2, specialTokens: [] },
+          Tokenizer.strictConfig
+        )
+        return tokenizer
+      })
+
+    it.effect("WordPiece round-trips in-corpus text", () =>
+      Effect.scoped(Effect.gen(function* () {
+        const tokenizer = yield* train("WordPiece", 200)
+        const text = "the quick brown fox jumps over the lazy dog"
+        const decoded = yield* tokenizer.decode(yield* tokenizer.encode(text))
+        expect(decoded).toBe(text)
+      }))
+    )
+
+    it.effect("Unigram round-trips in-corpus text", () =>
+      Effect.scoped(Effect.gen(function* () {
+        const tokenizer = yield* train("Unigram", 100)
+        const text = "the quick brown fox"
+        const decoded = yield* tokenizer.decode(yield* tokenizer.encode(text))
+        expect(decoded).toBe(text)
+      }))
+    )
+
+    it.effect("WordLevel round-trips whitespace-separated words", () =>
+      Effect.scoped(Effect.gen(function* () {
+        const tokenizer = yield* train("WordLevel", 200)
+        const text = "hello world hello tokenizer"
+        const decoded = yield* tokenizer.decode(yield* tokenizer.encode(text))
+        expect(decoded).toBe(text)
+      }))
+    )
+  })
+
+  describe("lifecycle", () => {
+    it.effect("using a tokenizer after its scope closed fails", () =>
+      Effect.gen(function* () {
+        const dir = yield* tmpdir
+        const file = yield* writeCorpus(dir, corpusLines)
+        const tokenizer = yield* Effect.scoped(trainBpe(file))
+        const error = yield* Effect.flip(tokenizer.encode("hello world"))
+        expect(error.message).toContain("disposed")
+      })
+    )
+  })
+})

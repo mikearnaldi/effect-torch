@@ -8,6 +8,7 @@ use std::sync::{Arc, LazyLock, Mutex, OnceLock};
 
 mod fusion;
 mod flash;
+mod tokenizer;
 
 fn to_napi_err(err: candle_core::Error) -> Error {
     Error::new(Status::GenericFailure, err.to_string())
@@ -2067,6 +2068,12 @@ pub struct LazyTensor {
     node: Arc<Node>,
 }
 
+impl LazyTensor {
+    pub(crate) fn from_node(node: Arc<Node>) -> Self {
+        Self { node }
+    }
+}
+
 macro_rules! lazy_ctor {
     ($body:expr) => {
         match $body {
@@ -2092,6 +2099,16 @@ impl LazyTensor {
         })
         .map_err(|message| Error::new(Status::GenericFailure, message))?;
         Ok(())
+    }
+
+    #[napi(getter)]
+    pub fn shape(&self) -> Vec<u32> {
+        self.node.shape.iter().map(|&d| d as u32).collect()
+    }
+
+    #[napi(getter)]
+    pub fn dtype(&self) -> String {
+        dtype_name(self.node.dtype).to_string()
     }
 
     #[napi(factory)]

@@ -1,13 +1,16 @@
 import { Effect } from "effect"
 import { NodeRuntime } from "@effect/platform-node"
-import { Device, LearningRate, Loss, Model, Optimizer, Tensor, Trainer } from "@effect-torch/core"
+import * as fs from "node:fs"
+import * as os from "node:os"
+import * as path from "node:path"
+import { Device, LearningRate, Loss, Model, Optimizer, Tensor, Tokenizer, Trainer } from "@effect-torch/core"
 
-// A character-level GPT trained on a few KB of public-domain verse:
-// token and position embeddings fanned into one stream, pre-norm
-// transformer blocks (causal multi-head attention + MLP, each under a
-// residual connection), a final layer norm and a vocabulary head.
-// Everything is the stock Model combinators; attention is the fused
-// flash kernel on Metal.
+// A GPT with a byte-level BPE tokenizer (trained on the fly, RFC 0009)
+// on a few KB of public-domain verse: token and position embeddings
+// fanned into one stream, pre-norm transformer blocks (causal multi-head
+// attention + MLP, each under a residual connection), a final layer norm
+// and a vocabulary head. Everything is the stock Model combinators;
+// attention is the fused flash kernel on Metal.
 
 const CORPUS = `Shall I compare thee to a summer's day?
 Thou art more lovely and more temperate:
@@ -74,73 +77,71 @@ const STEPS = 400
 const LR = 3e-3
 const GENERATE = 240
 const TEMPERATURE = 0.8
+const VOCAB = 300
 
-const chars = [...new Set(CORPUS)].sort()
-const vocabSize = chars.length
-const encode = (text: string): Array<number> => text.split("").map((c) => chars.indexOf(c))
-const data = encode(CORPUS)
-
-const createGpt = Effect.gen(function* () {
-  // token + position embeddings share the input (the position side
-  // reads only its length)
-  const embeddings = yield* Model.add(
-    yield* Model.embedding("wte", vocabSize, EMBED),
-    yield* Model.positionEmbedding("wpe", BLOCK, EMBED)
-  )
-  const blocks: Array<Model.Model> = []
-  for (let i = 0; i < LAYERS; i++) {
-    const attn = yield* Model.chain(
-      yield* Model.layerNorm(`b${i}.ln1`, EMBED),
-      yield* Model.multiHeadAttention(`b${i}.attn`, EMBED, HEADS, { causal: true })
+const createGpt = (vocabSize: number) =>
+  Effect.gen(function* () {
+    // token + position embeddings share the input (the position side
+    // reads only its length)
+    const embeddings = yield* Model.add(
+      yield* Model.embedding("wte", vocabSize, EMBED),
+      yield* Model.positionEmbedding("wpe", BLOCK, EMBED)
     )
-    const mlp = yield* Model.chain(
-      yield* Model.layerNorm(`b${i}.ln2`, EMBED),
-      yield* Model.linear(`b${i}.fc`, EMBED, 4 * EMBED),
-      yield* Model.gelu(),
-      yield* Model.linear(`b${i}.proj`, 4 * EMBED, EMBED)
+    const blocks: Array<Model.Model> = []
+    for (let i = 0; i < LAYERS; i++) {
+      const attn = yield* Model.chain(
+        yield* Model.layerNorm(`b${i}.ln1`, EMBED),
+        yield* Model.multiHeadAttention(`b${i}.attn`, EMBED, HEADS, { causal: true })
+      )
+      const mlp = yield* Model.chain(
+        yield* Model.layerNorm(`b${i}.ln2`, EMBED),
+        yield* Model.linear(`b${i}.fc`, EMBED, 4 * EMBED),
+        yield* Model.gelu(),
+        yield* Model.linear(`b${i}.proj`, 4 * EMBED, EMBED)
+      )
+      blocks.push(yield* Model.chain(yield* Model.residual(attn), yield* Model.residual(mlp)))
+    }
+    const model = yield* Model.chain(
+      embeddings,
+      ...blocks,
+      yield* Model.layerNorm("lnf", EMBED),
+      yield* Model.linear("head", EMBED, vocabSize)
     )
-    blocks.push(yield* Model.chain(yield* Model.residual(attn), yield* Model.residual(mlp)))
-  }
-  const model = yield* Model.chain(
-    embeddings,
-    ...blocks,
-    yield* Model.layerNorm("lnf", EMBED),
-    yield* Model.linear("head", EMBED, vocabSize)
-  )
-  return yield* Model.compile(model)
-})
+    return yield* Model.compile(model)
+  })
 
 const ids = (values: ReadonlyArray<number>, shape: ReadonlyArray<number>) =>
   Tensor.fromTypedArray(new BigInt64Array(values.map(BigInt)), shape)
 
-const sampleBatch = Effect.gen(function* () {
-  const inputs: Array<number> = []
-  const targets: Array<number> = []
-  for (let b = 0; b < BATCH; b++) {
-    const start = Math.floor(Math.random() * (data.length - BLOCK - 1))
-    for (let t = 0; t < BLOCK; t++) {
-      inputs.push(data[start + t])
-      targets.push(data[start + t + 1])
+const sampleBatch = (data: ReadonlyArray<number>) =>
+  Effect.gen(function* () {
+    const inputs: Array<number> = []
+    const targets: Array<number> = []
+    for (let b = 0; b < BATCH; b++) {
+      const start = Math.floor(Math.random() * (data.length - BLOCK - 1))
+      for (let t = 0; t < BLOCK; t++) {
+        inputs.push(data[start + t])
+        targets.push(data[start + t + 1])
+      }
     }
-  }
-  return {
-    input: yield* ids(inputs, [BATCH, BLOCK]),
-    target: yield* ids(targets, [BATCH, BLOCK])
-  }
-})
+    return {
+      input: yield* ids(inputs, [BATCH, BLOCK]),
+      target: yield* ids(targets, [BATCH, BLOCK])
+    }
+  })
 
 const started = Date.now()
 
 // Create the trainer for the model, compiled. The batch shape is fixed,
 // so the whole run is served by one frozen step program; the first step
 // pays the trace.
-const createTrainer = (model: Model.Model) =>
+const createTrainer = (model: Model.Model, data: ReadonlyArray<number>) =>
   Effect.gen(function* () {
     const trainer = yield* Trainer.make(model, {
       optimizer: yield* Optimizer.adamW(),
       lr: LearningRate.constant(LR),
       loss: Loss.crossEntropy,
-      data: () => sampleBatch,
+      data: () => sampleBatch(data),
       stop: ({ step }) => step >= STEPS,
       onStep: ({ step, loss }) =>
         step % 25 === 0 || step === 1
@@ -163,33 +164,43 @@ const init = (model: Model.Model) =>
     return params
   })
 
-const program = Effect.gen(function* () {
+const program = Effect.scoped(Effect.gen(function* () {
   const device = yield* Device.CurrentDevice
+
+  yield* Effect.log(`0) training BPE tokenizer (target vocab ${VOCAB})`)
+  const dir = yield* Effect.sync(() => fs.mkdtempSync(path.join(os.tmpdir(), "nano-gpt-")))
+  const corpusFile = path.join(dir, "corpus.txt")
+  yield* Effect.sync(() => fs.writeFileSync(corpusFile, CORPUS))
+  const tokenizer = yield* Tokenizer.train(
+    { files: [corpusFile], model: "BPE", vocabSize: VOCAB, minFrequency: 2, specialTokens: [] },
+    Tokenizer.strictConfig
+  )
+  const vocabSize = tokenizer.vocabSize
+  const data = yield* Tensor.toNumberArray(yield* tokenizer.encode(CORPUS))
   yield* Effect.log(
-    `nano-gpt: vocab ${vocabSize}, block ${BLOCK}, embed ${EMBED}, ${HEADS} heads, ${LAYERS} layers on ${device}`
+    `nano-gpt: vocab ${vocabSize} (${data.length} tokens), block ${BLOCK}, embed ${EMBED}, ${HEADS} heads, ${LAYERS} layers on ${device}`
   )
 
   yield* Effect.log("1) creating model")
-  const model = yield* createGpt
+  const model = yield* createGpt(vocabSize)
   yield* Effect.log(`${model.names.length} tensors of parameters`)
   const params0 = yield* init(model)
 
   yield* Effect.log(`2) training: adamW lr=${LR}, ${STEPS} steps (compiled)`)
-  const trainer = yield* createTrainer(model)
+  const trainer = yield* createTrainer(model, data)
   const trained = yield* trainer.train(params0)
   const params = trained.params
 
   // Greedy-windowed sampling with temperature: re-run the model on the
-  // last BLOCK tokens and draw the next character from the final
+  // last BLOCK tokens and draw the next token from the final
   // position's softmax. The window is right-padded to a fixed [1, BLOCK]
   // shape so generation is served by a single program: positions are
   // window-relative (every window restarts at 0) and attention is
   // causal, so the real tokens never attend to the padding and their
   // logits are unchanged; the next-token logits are the row at the true
   // last token, not the padded last row.
-  yield* Effect.log(`3) generating ${GENERATE} characters (temperature ${TEMPERATURE}):`)
-  let context = encode("\n")
-  let generated = ""
+  yield* Effect.log(`3) generating ${GENERATE} tokens (temperature ${TEMPERATURE}):`)
+  const context = yield* Tensor.toNumberArray(yield* tokenizer.encode("\n"))
   for (let n = 0; n < GENERATE; n++) {
     const window = context.slice(-BLOCK)
     const idx = yield* ids([...window, ...new Array(BLOCK - window.length).fill(0)], [1, BLOCK])
@@ -209,9 +220,9 @@ const program = Effect.gen(function* () {
       }
     }
     context.push(next)
-    generated += chars[next]
   }
+  const generated = yield* tokenizer.decode(context.slice(1))
   yield* Effect.log(`\n${generated}`)
-})
+}))
 
 NodeRuntime.runMain(program.pipe(Effect.provide(Device.Best)))
