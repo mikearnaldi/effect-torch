@@ -152,15 +152,39 @@ export const strictConfig: TokenizerConfig = {
 export type TrainModel = "BPE" | "WordPiece" | "Unigram" | "WordLevel"
 
 /**
+ * Where {@link train} reads its corpus from: raw text `Files` streamed
+ * from disk, or `Texts` already in memory.
+ *
+ * @since 0.1.0
+ * @category models
+ */
+export type TrainSource =
+  | { readonly _tag: "Files"; readonly paths: ReadonlyArray<string> }
+  | { readonly _tag: "Texts"; readonly texts: ReadonlyArray<string> }
+
+/**
+ * @since 0.1.0
+ * @category constructors
+ */
+export const trainFiles = (paths: ReadonlyArray<string>): TrainSource => ({ _tag: "Files", paths })
+
+/**
+ * @since 0.1.0
+ * @category constructors
+ */
+export const trainTexts = (texts: ReadonlyArray<string>): TrainSource => ({ _tag: "Texts", texts })
+
+/**
  * Configuration for {@link train}. Training is deterministic and streams
- * from `files`. Ids are allocated alphabet/bytes first, then merges (or
- * pieces) in rank order, then `specialTokens` appended.
+ * from the given source. Ids are allocated special tokens first, then the
+ * alphabet (BPE seeds the full 256-byte alphabet), then merges or pieces
+ * in rank order.
  *
  * @since 0.1.0
  * @category models
  */
 export interface TrainConfig {
-  readonly files: ReadonlyArray<string>
+  readonly source: TrainSource
   readonly model: TrainModel
   readonly vocabSize: number
   readonly minFrequency: number
@@ -339,8 +363,10 @@ export const fromJson = (
   })
 
 /**
- * Trains a tokenizer from raw text files. Runs natively off the JS thread;
- * the result is immediately usable and `save`-able as `tokenizer.json`.
+ * Trains a tokenizer from a corpus ({@link TrainSource}): raw text files
+ * streamed from disk, or texts already in memory. Runs natively off the
+ * JS thread; the result is immediately usable and `save`-able as
+ * `tokenizer.json`.
  *
  * @since 0.1.0
  * @category constructors
@@ -358,7 +384,9 @@ export const train = (
             vocabSize: trainConfig.vocabSize,
             minFrequency: trainConfig.minFrequency,
             specialTokens: trainConfig.specialTokens as Array<string>,
-            files: trainConfig.files as Array<string>
+            source: trainConfig.source._tag === "Files"
+              ? { tag: "Files", paths: trainConfig.source.paths as Array<string> }
+              : { tag: "Texts", texts: trainConfig.source.texts as Array<string> }
           },
           config.specialTokens === "Always"
         ),

@@ -187,14 +187,22 @@ export interface Tokenizer extends Pipeable {
 ```ts
 export type TrainModel = "BPE" | "WordPiece" | "Unigram" | "WordLevel"
 
+export type TrainSource =
+  | { readonly _tag: "Files"; readonly paths: ReadonlyArray<string> }
+  | { readonly _tag: "Texts"; readonly texts: ReadonlyArray<string> }
+
 export interface TrainConfig {
-  readonly files: ReadonlyArray<string>
+  readonly source: TrainSource
   readonly model: TrainModel
   readonly vocabSize: number
   readonly minFrequency: number
   readonly specialTokens: ReadonlyArray<string>
 }
 ```
+
+The corpus comes from raw text `Files` streamed from disk (dataset scale)
+or `Texts` already in memory (small corpora, generated data) — an
+explicit union, never a file written just to satisfy the API.
 
 Pipeline defaults follow the canonical setups: BPE trains byte-level
 (GPT-2 style: no prefix space, regex splitting, full 256-byte alphabet

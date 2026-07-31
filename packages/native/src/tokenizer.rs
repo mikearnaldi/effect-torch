@@ -17,12 +17,19 @@ use tokenizers::models::TrainerWrapper;
 use tokenizers::{AddedToken, Encoding, PostProcessor, Tokenizer};
 
 #[napi(object)]
+pub struct NativeTrainSource {
+    pub tag: String,
+    pub paths: Option<Vec<String>>,
+    pub texts: Option<Vec<String>>,
+}
+
+#[napi(object)]
 pub struct NativeTrainConfig {
     pub model: String,
     pub vocab_size: u32,
     pub min_frequency: u32,
     pub special_tokens: Vec<String>,
-    pub files: Vec<String>,
+    pub source: NativeTrainSource,
 }
 
 #[napi(object)]
@@ -384,10 +391,56 @@ fn added_specials(special_tokens: &[String]) -> Vec<AddedToken> {
         .collect()
 }
 
+fn run_trainer(
+    tokenizer: &mut Tokenizer,
+    trainer: &mut TrainerWrapper,
+    source: NativeTrainSource,
+) -> Result<()> {
+    match source.tag.as_str() {
+        "Files" => {
+            tokenizer
+                .train_from_files(
+                    trainer,
+                    source.paths.ok_or_else(|| {
+                        Error::new(
+                            Status::InvalidArg,
+                            "train: Files source requires paths".to_string(),
+                        )
+                    })?,
+                )
+                .map_err(to_napi_error)?;
+        }
+        "Texts" => {
+            tokenizer
+                .train(
+                    trainer,
+                    source
+                        .texts
+                        .ok_or_else(|| {
+                            Error::new(
+                                Status::InvalidArg,
+                                "train: Texts source requires texts".to_string(),
+                            )
+                        })?
+                        .into_iter(),
+                )
+                .map_err(to_napi_error)?;
+        }
+        tag => {
+            return Err(Error::new(
+                Status::InvalidArg,
+                format!("train: unknown source tag {tag}"),
+            ))
+        }
+    }
+    Ok(())
+}
+
 fn train_tokenizer(config: NativeTrainConfig) -> Result<Tokenizer> {
     let special_tokens = added_specials(&config.special_tokens);
     let vocab_size = config.vocab_size as usize;
     let min_frequency = config.min_frequency;
+    let source = config.source;
     match config.model.as_str() {
         "BPE" => {
             let mut tokenizer = Tokenizer::new(BPE::default());
@@ -404,9 +457,7 @@ fn train_tokenizer(config: NativeTrainConfig) -> Result<Tokenizer> {
                     .initial_alphabet(ByteLevel::alphabet().into_iter().collect())
                     .build(),
             );
-            tokenizer
-                .train_from_files(&mut trainer, config.files)
-                .map_err(to_napi_error)?;
+            run_trainer(&mut tokenizer, &mut trainer, source)?;
             tokenizer.add_special_tokens(&special_tokens);
             Ok(tokenizer)
         }
@@ -429,9 +480,7 @@ fn train_tokenizer(config: NativeTrainConfig) -> Result<Tokenizer> {
                     .special_tokens(specials.clone())
                     .build(),
             );
-            tokenizer
-                .train_from_files(&mut trainer, config.files)
-                .map_err(to_napi_error)?;
+            run_trainer(&mut tokenizer, &mut trainer, source)?;
             tokenizer.add_special_tokens(&specials);
             Ok(tokenizer)
         }
@@ -446,9 +495,7 @@ fn train_tokenizer(config: NativeTrainConfig) -> Result<Tokenizer> {
                     .build()
                     .map_err(to_napi_error)?,
             );
-            tokenizer
-                .train_from_files(&mut trainer, config.files)
-                .map_err(to_napi_error)?;
+            run_trainer(&mut tokenizer, &mut trainer, source)?;
             tokenizer.add_special_tokens(&special_tokens);
             Ok(tokenizer)
         }
@@ -463,9 +510,7 @@ fn train_tokenizer(config: NativeTrainConfig) -> Result<Tokenizer> {
                     .build()
                     .map_err(to_napi_error)?,
             );
-            tokenizer
-                .train_from_files(&mut trainer, config.files)
-                .map_err(to_napi_error)?;
+            run_trainer(&mut tokenizer, &mut trainer, source)?;
             tokenizer.add_special_tokens(&special_tokens);
             Ok(tokenizer)
         }

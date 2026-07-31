@@ -146,7 +146,13 @@ export interface NativeTrainConfig {
   vocabSize: number
   minFrequency: number
   specialTokens: Array<string>
-  files: Array<string>
+  source: NativeTrainSource
+}
+
+export interface NativeTrainSource {
+  tag: string
+  paths?: Array<string>
+  texts?: Array<string>
 }
 
 export interface NativeTruncation {

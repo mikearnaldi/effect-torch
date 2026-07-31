@@ -1,8 +1,5 @@
 import { Effect } from "effect"
 import { NodeRuntime } from "@effect/platform-node"
-import * as fs from "node:fs"
-import * as os from "node:os"
-import * as path from "node:path"
 import { Device, LearningRate, Loss, Model, Optimizer, Tensor, Tokenizer, Trainer } from "@effect-torch/core"
 
 // A GPT with a byte-level BPE tokenizer (trained on the fly, RFC 0009)
@@ -168,11 +165,8 @@ const program = Effect.gen(function* () {
   const device = yield* Device.CurrentDevice
 
   yield* Effect.log(`0) training BPE tokenizer (target vocab ${VOCAB})`)
-  const dir = yield* Effect.sync(() => fs.mkdtempSync(path.join(os.tmpdir(), "nano-gpt-")))
-  const corpusFile = path.join(dir, "corpus.txt")
-  yield* Effect.sync(() => fs.writeFileSync(corpusFile, CORPUS))
   const tokenizer = yield* Tokenizer.train(
-    { files: [corpusFile], model: "BPE", vocabSize: VOCAB, minFrequency: 2, specialTokens: [] },
+    { source: Tokenizer.trainTexts([CORPUS]), model: "BPE", vocabSize: VOCAB, minFrequency: 2, specialTokens: [] },
     Tokenizer.strictConfig
   )
   const vocabSize = tokenizer.vocabSize
