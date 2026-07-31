@@ -41,12 +41,12 @@ const applyReduction = (
     case "sum":
       return Tensor.sum(self)
     case "none":
-      return Tensor.add(self, 0)
+      return Effect.flatMap(Tensor.constantLike(self, 0), (zero) => Tensor.add(self, zero))
   }
 }
 
 const isTarget = (value: unknown): boolean =>
-  typeof value === "number" || (value !== undefined && value !== null && typeof value === "object" && "_tag" in value)
+  value !== undefined && value !== null && typeof value === "object" && "_tag" in value
 
 const dualLoss = <T, O, R = never>(
   impl: (
@@ -77,7 +77,7 @@ const dualLoss = <T, O, R = never>(
  * @since 0.1.0
  * @category losses
  */
-export const mse = dualLoss<Tensor.TensorOrScalar, LossOptions>((pred, target, options) =>
+export const mse = dualLoss<Tensor.Any, LossOptions>((pred, target, options) =>
   Effect.gen(function* () {
     const err = yield* Tensor.sub(pred, target)
     return yield* applyReduction(yield* Tensor.square(err), options?.reduction ?? "mean")
@@ -90,7 +90,7 @@ export const mse = dualLoss<Tensor.TensorOrScalar, LossOptions>((pred, target, o
  * @since 0.1.0
  * @category losses
  */
-export const l1 = dualLoss<Tensor.TensorOrScalar, LossOptions>((pred, target, options) =>
+export const l1 = dualLoss<Tensor.Any, LossOptions>((pred, target, options) =>
   Effect.gen(function* () {
     const err = yield* Tensor.sub(pred, target)
     return yield* applyReduction(yield* Tensor.abs(err), options?.reduction ?? "mean")
@@ -115,16 +115,19 @@ export interface HuberOptions extends LossOptions {
  * @since 0.1.0
  * @category losses
  */
-export const huber = dualLoss<Tensor.TensorOrScalar, HuberOptions>((pred, target, options) =>
+export const huber = dualLoss<Tensor.Any, HuberOptions>((pred, target, options) =>
   Effect.gen(function* () {
     const delta = options?.delta ?? 1
     if (delta <= 0) {
       return yield* new Tensor.TensorError({ op: "huber", message: `huber: delta must be positive, got ${delta}` })
     }
     const e = yield* Tensor.abs(yield* Tensor.sub(pred, target))
-    const quad = yield* Tensor.minimum(e, delta)
+    const quad = yield* Tensor.minimum(e, yield* Tensor.constantLike(e, delta))
     const lin = yield* Tensor.sub(e, quad)
-    const loss = yield* Tensor.add(yield* Tensor.mul(yield* Tensor.square(quad), 0.5), yield* Tensor.mul(lin, delta))
+    const loss = yield* Tensor.add(
+      yield* Tensor.mul(yield* Tensor.square(quad), yield* Tensor.constantLike(quad, 0.5)),
+      yield* Tensor.mul(lin, yield* Tensor.constantLike(lin, delta))
+    )
     return yield* applyReduction(loss, options?.reduction ?? "mean")
   })
 )
@@ -149,7 +152,7 @@ export interface BinaryCrossEntropyOptions extends LossOptions {
  * @since 0.1.0
  * @category losses
  */
-export const binaryCrossEntropy = dualLoss<Tensor.TensorOrScalar, BinaryCrossEntropyOptions>(
+export const binaryCrossEntropy = dualLoss<Tensor.Any, BinaryCrossEntropyOptions>(
   (pred, target, options) =>
     Effect.gen(function* () {
       if (options?.fromLogits === true) {
@@ -160,10 +163,8 @@ export const binaryCrossEntropy = dualLoss<Tensor.TensorOrScalar, BinaryCrossEnt
         return yield* applyReduction(loss, options?.reduction ?? "mean")
       }
       const p = yield* Tensor.clamp(pred, { min: 1e-12, max: 1 - 1e-12 })
-      const oneMinusP = yield* Tensor.add(yield* Tensor.neg(p), 1)
-      const oneMinusY = typeof target === "number"
-        ? 1 - target
-        : yield* Tensor.add(yield* Tensor.neg(target), 1)
+      const oneMinusP = yield* Tensor.add(yield* Tensor.neg(p), yield* Tensor.constantLike(p, 1))
+      const oneMinusY = yield* Tensor.add(yield* Tensor.neg(target), yield* Tensor.constantLike(target, 1))
       const pos = yield* Tensor.mul(yield* Tensor.log(p), target)
       const neg = yield* Tensor.mul(yield* Tensor.log(oneMinusP), oneMinusY)
       const loss = yield* Tensor.neg(yield* Tensor.add(pos, neg))
@@ -252,15 +253,13 @@ export const nll = dualLoss<Tensor.Any, LossOptions, CurrentDevice>((logProbs, t
  * @since 0.1.0
  * @category losses
  */
-export const klDiv = dualLoss<Tensor.TensorOrScalar, LossOptions>((logPred, target, options) =>
+export const klDiv = dualLoss<Tensor.Any, LossOptions>((logPred, target, options) =>
   Effect.gen(function* () {
-    if (typeof target === "number") {
-      return yield* new Tensor.TensorError({ op: "klDiv", message: "klDiv: target must be a tensor of probabilities" })
-    }
+    const zero = yield* Tensor.constantLike(target, 0)
     const elements = yield* Tensor.where(
-      yield* Tensor.gt(target, 0),
+      yield* Tensor.gt(target, zero),
       yield* Tensor.mul(target, yield* Tensor.sub(yield* Tensor.log(target), logPred)),
-      0
+      zero
     )
     return yield* applyReduction(elements, options?.reduction ?? "mean")
   })
@@ -272,10 +271,16 @@ export const klDiv = dualLoss<Tensor.TensorOrScalar, LossOptions>((logPred, targ
  * @since 0.1.0
  * @category losses
  */
-export const hinge = dualLoss<Tensor.TensorOrScalar, LossOptions>((pred, target, options) =>
+export const hinge = dualLoss<Tensor.Any, LossOptions>((pred, target, options) =>
   Effect.gen(function* () {
-    const margin = yield* Tensor.add(yield* Tensor.neg(yield* Tensor.mul(pred, target)), 1)
-    return yield* applyReduction(yield* Tensor.maximum(margin, 0), options?.reduction ?? "mean")
+    const margin = yield* Tensor.add(
+      yield* Tensor.neg(yield* Tensor.mul(pred, target)),
+      yield* Tensor.constantLike(pred, 1)
+    )
+    return yield* applyReduction(
+      yield* Tensor.maximum(margin, yield* Tensor.constantLike(margin, 0)),
+      options?.reduction ?? "mean"
+    )
   })
 )
 
@@ -310,9 +315,12 @@ export const cosineEmbeddingLoss = (
     const dot = yield* Tensor.sum(yield* Tensor.mul(a, b), { dims: [-1] })
     const na = yield* Tensor.sqrt(yield* Tensor.sum(yield* Tensor.square(a), { dims: [-1] }))
     const nb = yield* Tensor.sqrt(yield* Tensor.sum(yield* Tensor.square(b), { dims: [-1] }))
-    const cos = yield* Tensor.div(dot, yield* Tensor.add(yield* Tensor.mul(na, nb), 1e-12))
-    const positive = yield* Tensor.add(yield* Tensor.neg(cos), 1)
-    const negative = yield* Tensor.maximum(yield* Tensor.add(cos, -margin), 0)
-    const loss = yield* Tensor.where(yield* Tensor.gt(targets, 0), positive, negative)
+    const cos = yield* Tensor.div(dot, yield* Tensor.add(yield* Tensor.mul(na, nb), yield* Tensor.constantLike(dot, 1e-12)))
+    const positive = yield* Tensor.add(yield* Tensor.neg(cos), yield* Tensor.constantLike(cos, 1))
+    const negative = yield* Tensor.maximum(
+      yield* Tensor.add(cos, yield* Tensor.constantLike(cos, -margin)),
+      yield* Tensor.constantLike(cos, 0)
+    )
+    const loss = yield* Tensor.where(yield* Tensor.gt(targets, yield* Tensor.constantLike(targets, 0)), positive, negative)
     return yield* applyReduction(loss, options.reduction ?? "mean")
   })

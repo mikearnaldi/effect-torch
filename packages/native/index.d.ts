@@ -15,6 +15,7 @@ export declare class LazyTensor {
   static uniform(shape: Array<number>, lo: number, hi: number, dtype?: NativeDType | undefined | null, device?: string | undefined | null): LazyTensor
   static arange(start: number, end: number, step: number, dtype?: NativeDType | undefined | null, device?: string | undefined | null): LazyTensor
   static eye(n: number, dtype?: NativeDType | undefined | null, device?: string | undefined | null): LazyTensor
+  static constant(value: number, dtype?: NativeDType | undefined | null, device?: string | undefined | null): LazyTensor
   static fromBytes(data: Uint8Array, shape: Array<number>, dtype?: NativeDType | undefined | null, device?: string | undefined | null): LazyTensor
   static fromMaterialized(tensor: NativeTensor): LazyTensor
   add(other: LazyTensor): LazyTensor
@@ -72,9 +73,9 @@ export declare class LazyTensor {
   stopGradient(): LazyTensor
   checkpoint(): LazyTensor
   vmap(x: LazyTensor, batchedX: LazyTensor, dim: number): LazyTensor
-  adamwStep(grad: LazyTensor, m: LazyTensor, v: LazyTensor, lr: number, beta1: number, beta2: number, eps: number, weightDecay: number, t: number): LazyTensor
+  adamwStep(grad: LazyTensor, m: LazyTensor, v: LazyTensor, lr: LazyTensor, c1: LazyTensor, c2: LazyTensor, beta1: number, beta2: number, eps: number, weightDecay: number): LazyTensor
   adamwOut(index: number): LazyTensor
-  sgdStep(grad: LazyTensor, velocity: LazyTensor, firstStep: boolean, lr: number, momentum: number, dampening: number, nesterov: boolean, weightDecay: number): LazyTensor
+  sgdStep(grad: LazyTensor, velocity: LazyTensor, first: LazyTensor, lr: LazyTensor, momentum: number, dampening: number, nesterov: boolean, weightDecay: number): LazyTensor
   sgdOut(index: number): LazyTensor
 }
 

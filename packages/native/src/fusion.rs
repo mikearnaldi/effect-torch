@@ -1367,24 +1367,25 @@ pub fn adamw_exprs(beta1: f64, beta2: f64, eps: f64, weight_decay: f64) -> [Expr
 }
 
 // The fused momentum-SGD update over lanes [param, grad, velocity] with
-// scalar lane [lr], mirroring the composed update including the first-step
-// v = g initialization.
-pub fn sgd_exprs(momentum: f64, dampening: f64, nesterov: bool, weight_decay: f64, first_step: bool) -> [Expr; 2] {
+// scalar lanes [lr, first], mirroring the composed update including the
+// first-step v = g initialization as a select on the 0-d `first` flag.
+pub fn sgd_exprs(momentum: f64, dampening: f64, nesterov: bool, weight_decay: f64) -> [Expr; 2] {
     let (p, g, v) = (Expr::Input(0), Expr::Input(1), Expr::Input(2));
-    let lr = Expr::Scalar(0);
+    let (lr, first) = (Expr::Scalar(0), Expr::Scalar(1));
     let gp = if weight_decay == 0.0 {
         g
     } else {
         Expr::Add(Box::new(g), Box::new(Expr::Mul(Box::new(p.clone()), Box::new(Expr::cst(weight_decay)))))
     };
-    let next_v = if first_step {
-        gp.clone()
-    } else {
-        Expr::Add(
-            Box::new(Expr::Mul(Box::new(v), Box::new(Expr::cst(momentum)))),
-            Box::new(Expr::Mul(Box::new(gp.clone()), Box::new(Expr::cst(1.0 - dampening)))),
-        )
-    };
+    let continued = Expr::Add(
+        Box::new(Expr::Mul(Box::new(v), Box::new(Expr::cst(momentum)))),
+        Box::new(Expr::Mul(Box::new(gp.clone()), Box::new(Expr::cst(1.0 - dampening)))),
+    );
+    let next_v = Expr::Select(
+        Box::new(Expr::Gt(Box::new(first), Box::new(Expr::cst(0.5)))),
+        Box::new(gp.clone()),
+        Box::new(continued),
+    );
     let used = if nesterov {
         Expr::Add(
             Box::new(gp),
@@ -1461,15 +1462,6 @@ pub fn run(
         _ => Err(candle_core::Error::Msg(format!(
             "fusion: unsupported device/dtype {device:?} {dtype:?}"
         ))),
-    }
-}
-
-/// A one-element tensor holding a scalar lane value.
-pub fn scalar_tensor(v: f64, dtype: DType, device: &Device) -> candle_core::Result<Tensor> {
-    match dtype {
-        DType::F32 => Tensor::full(v as f32, (), device),
-        DType::F64 => Tensor::full(v, (), device),
-        dtype => Err(candle_core::Error::UnsupportedDTypeForOp(dtype, "fusion").bt()),
     }
 }
 

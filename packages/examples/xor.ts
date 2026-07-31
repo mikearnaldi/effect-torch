@@ -1,6 +1,6 @@
 import { Data, Effect } from "effect"
 import { NodeRuntime } from "@effect/platform-node"
-import { Device, Loss, Model, Optimizer, Tensor } from "@effect-torch/core"
+import { Device, LearningRate, Loss, Model, Optimizer, Tensor } from "@effect-torch/core"
 
 const HIDDEN = 8
 const STEPS = 3000
@@ -52,10 +52,11 @@ const train = (
   y: Tensor.Any
 ) =>
   Model.train(model, {
-    optimizer: Optimizer.adam({ lr: LR }),
+    optimizer: Optimizer.adam(),
+    lr: LearningRate.constant(LR),
     loss: Loss.mse,
     data: { input: x, target: y },
-    stop: ({ loss }) => loss < 1e-6,
+    stop: ({ step }) => step >= STEPS,
     params,
     onStep: ({ step, loss }) =>
       Effect.gen(function* () {

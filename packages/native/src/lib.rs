@@ -4,7 +4,7 @@ use napi::bindgen_prelude::*;
 use napi_derive::napi;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, LazyLock, Mutex, OnceLock};
 
 mod fusion;
 mod flash;
@@ -1121,28 +1121,35 @@ enum NodeKind {
         a: Arc<Node>,
         b: Arc<Node>,
     },
+    // lr, c1 (1 - beta1^t) and c2 (1 - beta2^t) are 0-d tensor children:
+    // step-varying values flow through the graph so a frozen graph (RFC
+    // 0008) never replays a stale step count or learning rate.
     AdamWStep {
         param: Arc<Node>,
         grad: Arc<Node>,
         m: Arc<Node>,
         v: Arc<Node>,
-        lr: f64,
+        lr: Arc<Node>,
+        c1: Arc<Node>,
+        c2: Arc<Node>,
         beta1: f64,
         beta2: f64,
         eps: f64,
         weight_decay: f64,
-        t: f64,
     },
     AdamWOut {
         step: Arc<Node>,
         index: u8,
     },
+    // `first` is a 0-d flag (1.0 on the first step, 0.0 after) selecting
+    // v = g over v = momentum * v + (1 - dampening) * g; velocity is always
+    // a real buffer (zeros at init), so no placeholder is needed.
     SgdStep {
         param: Arc<Node>,
         grad: Arc<Node>,
         velocity: Arc<Node>,
-        first_step: bool,
-        lr: f64,
+        first: Arc<Node>,
+        lr: Arc<Node>,
         momentum: f64,
         dampening: f64,
         nesterov: bool,
@@ -1210,6 +1217,50 @@ pub struct Node {
 }
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(0);
+
+struct ConstantCache {
+    map: HashMap<(u64, DType, &'static str), Arc<Node>>,
+    order: std::collections::VecDeque<(u64, DType, &'static str)>,
+}
+
+static CONSTANT_CACHE: LazyLock<Mutex<ConstantCache>> = LazyLock::new(|| {
+    Mutex::new(ConstantCache {
+        map: HashMap::new(),
+        order: std::collections::VecDeque::new(),
+    })
+});
+
+const CONSTANT_CACHE_LIMIT: usize = 4096;
+
+fn device_key(device: &Device) -> &'static str {
+    match device {
+        Device::Cpu => "cpu",
+        Device::Cuda(_) => "cuda",
+        Device::Metal(_) => "metal",
+    }
+}
+
+fn cached_constant(value: f64, dtype: DType, device: Device) -> std::result::Result<Arc<Node>, String> {
+    let key = (value.to_bits(), dtype, device_key(&device));
+    let mut cache = CONSTANT_CACHE.lock().unwrap();
+    if let Some(node) = cache.map.get(&key) {
+        return Ok(node.clone());
+    }
+    let node = Node::new(NodeKind::Full {
+        shape: vec![],
+        value,
+        dtype,
+        device,
+    })?;
+    if cache.order.len() >= CONSTANT_CACHE_LIMIT {
+        if let Some(old) = cache.order.pop_front() {
+            cache.map.remove(&old);
+        }
+    }
+    cache.map.insert(key, node.clone());
+    cache.order.push_back(key);
+    Ok(node)
+}
 
 fn broadcast_shapes(a: &[usize], b: &[usize]) -> std::result::Result<Vec<usize>, String> {
     let rank = a.len().max(b.len());
@@ -1782,6 +1833,9 @@ impl Node {
                 grad,
                 m,
                 v,
+                lr,
+                c1,
+                c2,
                 ..
             } => {
                 if !param.dtype.is_float() {
@@ -1797,6 +1851,11 @@ impl Node {
                         ));
                     }
                 }
+                for (name, t) in [("lr", lr), ("c1", c1), ("c2", c2)] {
+                    if !t.shape.is_empty() {
+                        return Err(format!("adamw_step: {name} must be a scalar (0-d) tensor"));
+                    }
+                }
                 (param.shape.clone(), param.dtype, param.device.clone())
             }
             NodeKind::AdamWOut { step, index } => {
@@ -1809,6 +1868,8 @@ impl Node {
                 param,
                 grad,
                 velocity,
+                first,
+                lr,
                 ..
             } => {
                 if !param.dtype.is_float() {
@@ -1822,6 +1883,11 @@ impl Node {
                         return Err(format!(
                             "sgd_step: {name} must match the parameter shape and dtype"
                         ));
+                    }
+                }
+                for (name, t) in [("first", first), ("lr", lr)] {
+                    if !t.shape.is_empty() {
+                        return Err(format!("sgd_step: {name} must be a scalar (0-d) tensor"));
                     }
                 }
                 (param.shape.clone(), param.dtype, param.device.clone())
@@ -2108,6 +2174,21 @@ impl LazyTensor {
             dtype: dtype.unwrap_or(NativeDType::F32).into(),
             device: get_device(device)?,
         }))
+    }
+
+    // A shared 0-d constant: the same (value, dtype, device) triple maps to
+    // one graph node forever instead of allocating a fresh node per use.
+    // Nodes hold no buffers, so the cache is cheap; it is size-bounded so
+    // cold values rotate through. Devices are process singletons, so the
+    // device kind is the whole key.
+    #[napi(factory)]
+    pub fn constant(value: f64, dtype: Option<NativeDType>, device: Option<String>) -> Result<Self> {
+        let device = get_device(device)?;
+        let dtype: DType = dtype.unwrap_or(NativeDType::F32).into();
+        match cached_constant(value, dtype, device) {
+            Ok(node) => Ok(Self { node }),
+            Err(message) => Err(Error::new(Status::InvalidArg, message)),
+        }
     }
 
     #[napi(factory)]
@@ -2602,24 +2683,26 @@ impl LazyTensor {
         grad: &LazyTensor,
         m: &LazyTensor,
         v: &LazyTensor,
-        lr: f64,
+        lr: &LazyTensor,
+        c1: &LazyTensor,
+        c2: &LazyTensor,
         beta1: f64,
         beta2: f64,
         eps: f64,
         weight_decay: f64,
-        t: f64,
     ) -> Result<Self> {
         lazy_ctor!(Node::new(NodeKind::AdamWStep {
             param: self.node.clone(),
             grad: grad.node.clone(),
             m: m.node.clone(),
             v: v.node.clone(),
-            lr,
+            lr: lr.node.clone(),
+            c1: c1.node.clone(),
+            c2: c2.node.clone(),
             beta1,
             beta2,
             eps,
             weight_decay,
-            t,
         }))
     }
 
@@ -2632,12 +2715,13 @@ impl LazyTensor {
     }
 
     #[napi]
+    #[allow(clippy::too_many_arguments)]
     pub fn sgd_step(
         &self,
         grad: &LazyTensor,
         velocity: &LazyTensor,
-        first_step: bool,
-        lr: f64,
+        first: &LazyTensor,
+        lr: &LazyTensor,
         momentum: f64,
         dampening: f64,
         nesterov: bool,
@@ -2647,8 +2731,8 @@ impl LazyTensor {
             param: self.node.clone(),
             grad: grad.node.clone(),
             velocity: velocity.node.clone(),
-            first_step,
-            lr,
+            first: first.node.clone(),
+            lr: lr.node.clone(),
             momentum,
             dampening,
             nesterov,
@@ -2824,15 +2908,34 @@ fn node_children(kind: &NodeKind) -> Vec<Arc<Node>> {
             grad,
             m,
             v,
+            lr,
+            c1,
+            c2,
             ..
-        } => vec![param.clone(), grad.clone(), m.clone(), v.clone()],
+        } => vec![
+            param.clone(),
+            grad.clone(),
+            m.clone(),
+            v.clone(),
+            lr.clone(),
+            c1.clone(),
+            c2.clone(),
+        ],
         NodeKind::AdamWOut { step, .. } => vec![step.clone()],
         NodeKind::SgdStep {
             param,
             grad,
             velocity,
+            first,
+            lr,
             ..
-        } => vec![param.clone(), grad.clone(), velocity.clone()],
+        } => vec![
+            param.clone(),
+            grad.clone(),
+            velocity.clone(),
+            first.clone(),
+            lr.clone(),
+        ],
         NodeKind::SgdOut { step, .. } => vec![step.clone()],
         NodeKind::FusedElementwise { inputs, .. } => inputs.clone(),
         NodeKind::FusedElementwiseMulti { inputs, .. } => inputs.clone(),
@@ -3197,22 +3300,24 @@ fn remap_children(kind: &NodeKind, f: &dyn Fn(&Arc<Node>) -> Arc<Node>) -> NodeK
             m,
             v,
             lr,
+            c1,
+            c2,
             beta1,
             beta2,
             eps,
             weight_decay,
-            t,
         } => NodeKind::AdamWStep {
             param: f(param),
             grad: f(grad),
             m: f(m),
             v: f(v),
-            lr: *lr,
+            lr: f(lr),
+            c1: f(c1),
+            c2: f(c2),
             beta1: *beta1,
             beta2: *beta2,
             eps: *eps,
             weight_decay: *weight_decay,
-            t: *t,
         },
         NodeKind::AdamWOut { step, index } => NodeKind::AdamWOut {
             step: f(step),
@@ -3222,7 +3327,7 @@ fn remap_children(kind: &NodeKind, f: &dyn Fn(&Arc<Node>) -> Arc<Node>) -> NodeK
             param,
             grad,
             velocity,
-            first_step,
+            first,
             lr,
             momentum,
             dampening,
@@ -3232,8 +3337,8 @@ fn remap_children(kind: &NodeKind, f: &dyn Fn(&Arc<Node>) -> Arc<Node>) -> NodeK
             param: f(param),
             grad: f(grad),
             velocity: f(velocity),
-            first_step: *first_step,
-            lr: *lr,
+            first: f(first),
+            lr: f(lr),
             momentum: *momentum,
             dampening: *dampening,
             nesterov: *nesterov,
@@ -3982,39 +4087,37 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> candle_core::Result<Te
             m,
             v,
             lr,
+            c1,
+            c2,
             beta1,
             beta2,
             eps,
             weight_decay,
-            t,
         } => {
             let p = ev.value(param.id)?;
             let g = ev.value(grad.id)?;
             let m_t = ev.value(m.id)?;
             let v_t = ev.value(v.id)?;
+            // The step-varying scalars arrive as 0-d tensors; cast to the
+            // parameter dtype and copy to its device (they may be CPU f64 —
+            // the bias corrections are computed in f64 to avoid
+            // cancellation — and 0-d copies are free).
+            let lr_t = ev.value(lr.id)?.to_dtype(p.dtype())?.to_device(p.device())?;
+            let c1_t = ev.value(c1.id)?.to_dtype(p.dtype())?.to_device(p.device())?;
+            let c2_t = ev.value(c2.id)?.to_dtype(p.dtype())?.to_device(p.device())?;
             let fused = if fusion::is_supported(&p.device(), p.dtype()) {
-                let scalars = [
-                    fusion::scalar_tensor(*lr, p.dtype(), &p.device()),
-                    fusion::scalar_tensor(1.0 - beta1.powf(*t), p.dtype(), &p.device()),
-                    fusion::scalar_tensor(1.0 - beta2.powf(*t), p.dtype(), &p.device()),
-                ];
-                match scalars {
-                    [Ok(lr_t), Ok(c1), Ok(c2)] => {
-                        let exprs = fusion::adamw_exprs(*beta1, *beta2, *eps, *weight_decay);
-                        fusion::run(
-                            &exprs,
-                            &[p.clone(), g.clone(), m_t.clone(), v_t.clone()],
-                            None,
-                            &[lr_t, c1, c2],
-                            p.elem_count(),
-                            p.dims(),
-                            p.dtype(),
-                            &p.device(),
-                        )
-                        .ok()
-                    }
-                    _ => None,
-                }
+                let exprs = fusion::adamw_exprs(*beta1, *beta2, *eps, *weight_decay);
+                fusion::run(
+                    &exprs,
+                    &[p.clone(), g.clone(), m_t.clone(), v_t.clone()],
+                    None,
+                    &[lr_t.clone(), c1_t.clone(), c2_t.clone()],
+                    p.elem_count(),
+                    p.dims(),
+                    p.dtype(),
+                    &p.device(),
+                )
+                .ok()
             } else {
                 None
             };
@@ -4031,13 +4134,18 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> candle_core::Result<Te
                     let one_minus_beta2 = 1.0 - *beta2;
                     let next_m = ((m_t * *beta1)? + (&g * one_minus_beta1)?)?;
                     let next_v = ((v_t * *beta2)? + ((&g * &g)? * one_minus_beta2)?)?;
-                    let m_hat = (&next_m / (1.0 - beta1.powf(*t)))?;
-                    let v_hat = (&next_v / (1.0 - beta2.powf(*t)))?;
-                    let adjusted = ((m_hat / (v_hat.sqrt()? + *eps)?)? * *lr)?;
+                    let m_hat = next_m.broadcast_div(&c1_t)?;
+                    let v_hat = next_v.broadcast_div(&c2_t)?;
+                    let adjusted = (m_hat.broadcast_div(&(v_hat.sqrt()? + *eps)?)?)
+                        .broadcast_mul(&lr_t)?;
                     let next_p = if *weight_decay == 0.0 {
                         (p - adjusted)?
                     } else {
-                        ((p * (1.0 - lr * weight_decay))? - adjusted)?
+                        // p * (1 - lr * weight_decay) - adjusted, factored as
+                        // p - p * (lr * weight_decay) - adjusted to keep the
+                        // decay a tensor op.
+                        let decay = p.broadcast_mul(&(&lr_t * *weight_decay)?)?;
+                        ((p - decay)? - adjusted)?
                     };
                     ev.adamw.insert(node.id, [next_m, next_v]);
                     next_p
@@ -4060,7 +4168,7 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> candle_core::Result<Te
             param,
             grad,
             velocity,
-            first_step,
+            first,
             lr,
             momentum,
             dampening,
@@ -4069,35 +4177,22 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> candle_core::Result<Te
         } => {
             let p = ev.value(param.id)?;
             let g = ev.value(grad.id)?;
+            let v_t = ev.value(velocity.id)?;
+            let first_t = ev.value(first.id)?.to_dtype(p.dtype())?.to_device(p.device())?;
+            let lr_t = ev.value(lr.id)?.to_dtype(p.dtype())?.to_device(p.device())?;
             let fused = if fusion::is_supported(&p.device(), p.dtype()) {
-                let v_placeholder = if *first_step {
-                    p.clone()
-                } else {
-                    ev.value(velocity.id)?
-                };
-                match fusion::scalar_tensor(*lr, p.dtype(), &p.device()) {
-                    Ok(lr_t) => {
-                        let exprs = fusion::sgd_exprs(
-                            *momentum,
-                            *dampening,
-                            *nesterov,
-                            *weight_decay,
-                            *first_step,
-                        );
-                        fusion::run(
-                            &exprs,
-                            &[p.clone(), g.clone(), v_placeholder],
-                            None,
-                            &[lr_t],
-                            p.elem_count(),
-                            p.dims(),
-                            p.dtype(),
-                            &p.device(),
-                        )
-                        .ok()
-                    }
-                    Err(_) => None,
-                }
+                let exprs = fusion::sgd_exprs(*momentum, *dampening, *nesterov, *weight_decay);
+                fusion::run(
+                    &exprs,
+                    &[p.clone(), g.clone(), v_t.clone()],
+                    None,
+                    &[lr_t.clone(), first_t.clone()],
+                    p.elem_count(),
+                    p.dims(),
+                    p.dtype(),
+                    &p.device(),
+                )
+                .ok()
             } else {
                 None
             };
@@ -4114,18 +4209,18 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> candle_core::Result<Te
                     } else {
                         (&g + (&p * *weight_decay)?)?
                     };
-                    let next_v = if *first_step {
-                        g.clone()
-                    } else {
-                        let v = ev.value(velocity.id)?;
-                        ((v * *momentum)? + (&g * (1.0 - dampening))?)?
-                    };
+                    // next_v = first ? g : momentum * v + (1 - dampening) * g,
+                    // as tensor arithmetic: velocity is zeros on the first
+                    // step, so the (1 - first) branch contributes nothing.
+                    let continued = ((v_t * *momentum)? + (&g * (1.0 - dampening))?)?;
+                    let not_first = ((&first_t * -1.0)? + 1.0)?;
+                    let next_v = (first_t.broadcast_mul(&g)? + not_first.broadcast_mul(&continued)?)?;
                     let used = if *nesterov {
                         (&g + (&next_v * *momentum)?)?
                     } else {
                         next_v.clone()
                     };
-                    let next_p = (p - (&used * *lr)?)?;
+                    let next_p = p.broadcast_sub(&used.broadcast_mul(&lr_t)?)?;
                     ev.sgd.insert(node.id, next_v);
                     next_p
                 }

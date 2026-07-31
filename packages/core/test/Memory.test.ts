@@ -46,7 +46,7 @@ layer(Device.Cpu)("Memory", (it) => {
         const chain = Effect.gen(function* () {
           let x = yield* Tensor.ones([512, 512])
           for (let i = 0; i < 2000; i++) {
-            x = yield* Tensor.add(x, 1)
+            x = yield* Tensor.add(x, yield* Tensor.constantLike(x, 1))
           }
           const [result] = yield* Tensor.compute([x])
           return result

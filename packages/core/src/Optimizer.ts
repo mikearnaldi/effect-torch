@@ -12,35 +12,45 @@
  *
  * State is re-materialized into graph leaves at every step (that is what
  * {@link step} does), so the graph depth stays O(model depth) no matter how
- * many steps run.
+ * many steps run. Optimizer state is *all tensors* — the Adam step count
+ * `t` is a 0-d tensor, not a JS number — so every piece of step-varying
+ * data flows through the graph and a frozen graph (a compiled step) never
+ * replays a stale count, flag, or rate. The learning rate is not part of
+ * the configuration: it is a per-step input to {@link Optimizer.step}, so
+ * learning-rate schedules are ordinary data flowing through the same
+ * graph instead of a reason to rebuild the optimizer (or its graph) every
+ * step.
  *
  * Update formulas match PyTorch / candle-nn exactly:
  *
  * - SGD: `g += weightDecay * p`; `v = momentum * v + (1 - dampening) * g`
- *   (with `v = g` on the first step); `p -= lr * g'` where
- *   `g' = g + momentum * v` when `nesterov`, else `g' = v`. With no
- *   momentum, `p -= lr * g`.
+ *   (with `v = g` on the first step, selected by the 0-d `first` flag in
+ *   the state); `p -= lr * g'` where `g' = g + momentum * v` when
+ *   `nesterov`, else `g' = v`. With no momentum, `p -= lr * g`.
  * - Adam / AdamW: `m = beta1 * m + (1 - beta1) * g`,
  *   `v = beta2 * v + (1 - beta2) * g^2`, bias-corrected
  *   `m_hat = m / (1 - beta1^t)`, `v_hat = v / (1 - beta2^t)`,
  *   `p = p * (1 - lr * weightDecay) - lr * m_hat / (sqrt(v_hat) + eps)`.
- *   The decay term is decoupled (AdamW) and zero for plain Adam.
+ *   The decay term is decoupled (AdamW) and zero for plain Adam. The
+ *   correction denominators `1 - beta1^t` / `1 - beta2^t` are computed as
+ *   tensor ops from the state's `t`, once per step, shared by every
+ *   parameter's update node.
  *
  * @since 0.1.0
  */
 import { Effect } from "effect"
-import type { CurrentDevice } from "./Device.ts"
+import { CurrentDevice } from "./Device.ts"
 import * as Gradient from "./Gradient.ts"
 import * as Tensor from "./Tensor.ts"
 
 /**
- * Configuration for stochastic gradient descent.
+ * Configuration for stochastic gradient descent. The learning rate is a
+ * per-step input to {@link Optimizer.step}, not configuration.
  *
  * @since 0.1.0
  * @category models
  */
 export interface SgdConfig {
-  readonly lr: number
   readonly momentum?: number
   readonly dampening?: number
   readonly nesterov?: boolean
@@ -48,25 +58,27 @@ export interface SgdConfig {
 }
 
 /**
- * State carried between SGD steps: one velocity tensor per parameter when
- * momentum is enabled, `null` otherwise.
+ * State carried between SGD steps: one velocity tensor per parameter
+ * (empty when momentum is disabled) and the 0-d `first` flag (1 on the
+ * first step, 0 after) that selects `v = g` over the momentum recurrence.
  *
  * @since 0.1.0
  * @category models
  */
 export interface SgdState {
-  readonly velocity: ReadonlyArray<Tensor.Any> | null
+  readonly velocity: ReadonlyArray<Tensor.Any>
+  readonly first: Tensor.Any
 }
 
 /**
- * Configuration for Adam. All fields default to the standard values
- * (`lr = 1e-3`, `beta1 = 0.9`, `beta2 = 0.999`, `eps = 1e-8`).
+ * Configuration for Adam (`beta1 = 0.9`, `beta2 = 0.999`, `eps = 1e-8` by
+ * default). The learning rate is a per-step input to
+ * {@link Optimizer.step}, not configuration.
  *
  * @since 0.1.0
  * @category models
  */
 export interface AdamConfig {
-  readonly lr?: number
   readonly beta1?: number
   readonly beta2?: number
   readonly eps?: number
@@ -86,7 +98,9 @@ export interface AdamWConfig extends AdamConfig {
 /**
  * State carried between Adam-family steps: first and second moment
  * estimates, one per parameter, plus the step count `t` used for bias
- * correction.
+ * correction. Every field is a tensor: `t` is a 0-d CPU f64 tensor (the
+ * bias corrections derived from it cancel catastrophically in f32), so
+ * the count flows through the graph like any other state.
  *
  * @since 0.1.0
  * @category models
@@ -94,24 +108,21 @@ export interface AdamWConfig extends AdamConfig {
 export interface AdamState {
   readonly m: ReadonlyArray<Tensor.Any>
   readonly v: ReadonlyArray<Tensor.Any>
-  readonly t: number
+  readonly t: Tensor.Any
 }
 
 /**
  * The result of {@link Optimizer.step}: updated parameters and updated
  * state as lazy graph values, in the same order as the input parameters,
- * plus everything needed to materialize the state for the next step:
- *
- * - `stateRoots` lists the tensors inside `state` that must be evaluated
- *   before the state is fed into another `step` call (state is always
- *   re-materialized into graph leaves between steps, so graph depth stays
- *   O(model depth) no matter how many steps run).
- * - `rebuildState` repacks the evaluated `stateRoots` (in the same order,
- *   always materialized) into a new state value.
+ * plus `stateRoots` listing the tensors inside `state` that must be
+ * evaluated before the state is fed into another `step` call (state is
+ * always re-materialized into graph leaves between steps, so graph depth
+ * stays O(model depth) no matter how many steps run). Repack the
+ * evaluated roots into a new state value with
+ * `optimizer.rebuildState(state, evaluated)`.
  *
  * User-land optimizers implement the same contract: return your new state
- * alongside the list of tensors it contains and a function that rebuilds
- * it from their materialized counterparts.
+ * alongside the list of tensors it contains.
  *
  * @since 0.1.0
  * @category models
@@ -120,13 +131,21 @@ export interface OptimizerUpdate<S> {
   readonly params: Array<Tensor.Lazy>
   readonly state: S
   readonly stateRoots: ReadonlyArray<Tensor.Any>
-  readonly rebuildState: (evaluated: ReadonlyArray<Tensor.Concrete>) => S
 }
 
 /**
  * A stateful optimizer as a pure graph transform. `init` validates the
  * parameters and builds zero-initialized state; `step` extends the graph
  * with the update arithmetic. Neither evaluates anything.
+ *
+ * The learning rate is a per-step input: a 0-d float tensor on the same
+ * device as the parameters. Pass a different value every step (a
+ * `LearningRate` schedule evaluated by the training loop) without
+ * rebuilding the optimizer — the rate flows through the graph as data.
+ *
+ * {@link Optimizer.stateRoots} / {@link Optimizer.rebuildState} are the
+ * canonical extraction and injection of a state's tensor leaves, in one
+ * stable order — the boundary a compiled training step rebinds per call.
  *
  * @since 0.1.0
  * @category models
@@ -138,11 +157,35 @@ export interface Optimizer<S> {
   readonly step: (
     params: ReadonlyArray<Tensor.Any>,
     grads: ReadonlyArray<Tensor.Any>,
-    state: S
+    state: S,
+    lr: Tensor.Any
   ) => Effect.Effect<OptimizerUpdate<S>, Tensor.TensorError>
+  readonly stateRoots: (state: S) => ReadonlyArray<Tensor.Any>
+  readonly rebuildState: (state: S, roots: ReadonlyArray<Tensor.Any>) => S
 }
 
 const isFloat = (dtype: Tensor.DType): boolean => dtype === "f32" || dtype === "f64"
+
+// Step-count and correction tensors live on the CPU in f64 regardless of
+// the parameter device: 1 - beta^t catastrophically cancels in f32 when
+// the result is small (c2 starts at 1e-3), so the corrections are computed
+// in f64 exactly as the host-side formula would be, and the step nodes'
+// eval arms cast (and copy, for 0-d scalars the copy is free) to the
+// parameter dtype/device. The sgd `first` flag is precision-irrelevant and
+// stays on the parameter device in the parameter's precision family.
+const scalarDtype = (params: ReadonlyArray<Tensor.Any>): Tensor.DType =>
+  params[0]?.dtype === "f64" ? "f64" : "f32"
+
+const stepCount = (value: number): Effect.Effect<Tensor.Lazy, Tensor.TensorError> =>
+  Effect.provideService(Tensor.full([], value, { dtype: "f64" }), CurrentDevice, "cpu")
+
+const checkLr = (op: string, lr: Tensor.Any): Effect.Effect<void, Tensor.TensorError> =>
+  lr.shape.length === 0 && isFloat(lr.dtype)
+    ? Effect.void
+    : new Tensor.TensorError({
+        op,
+        message: `${op}: lr must be a 0-d float tensor, got shape [${lr.shape}] ${lr.dtype}`
+      })
 
 const checkParams = (
   op: string,
@@ -221,15 +264,11 @@ const checkStateLength = (
  * @since 0.1.0
  * @category constructors
  */
-export const sgd = (config: SgdConfig): Optimizer<SgdState> => {
-  const lr = config.lr
+export const sgd = (config: SgdConfig = {}): Optimizer<SgdState> => {
   const momentum = config.momentum ?? 0
   const dampening = config.dampening ?? 0
   const nesterov = config.nesterov ?? false
   const weightDecay = config.weightDecay ?? 0
-  if (!Number.isFinite(lr) || lr <= 0) {
-    throw new Error(`sgd: lr must be positive, got ${lr}`)
-  }
   if (!Number.isFinite(momentum) || momentum < 0) {
     throw new Error(`sgd: momentum must be non-negative, got ${momentum}`)
   }
@@ -237,79 +276,86 @@ export const sgd = (config: SgdConfig): Optimizer<SgdState> => {
     throw new Error("sgd: nesterov requires momentum > 0 and dampening = 0")
   }
 
-  const updateParam = (
-    param: Tensor.Any,
-    grad: Tensor.Any,
-    velocity: Tensor.Any | null
-  ): Effect.Effect<
-    { readonly param: Tensor.Lazy; readonly velocity: Tensor.Any | null },
-    Tensor.TensorError
-  > =>
-    Effect.gen(function* () {
-      let g: Tensor.Any = grad
-      if (weightDecay !== 0) {
-        g = yield* Tensor.add(g, yield* Tensor.mul(param, weightDecay))
-      }
-      if (momentum === 0) {
-        return { param: yield* Tensor.sub(param, yield* Tensor.mul(g, lr)), velocity: null }
-      }
-      const step = yield* Effect.try({
-        try: () =>
-          param.lazy.sgdStep(
-            grad.lazy,
-            (velocity ?? param).lazy,
-            velocity === null,
-            lr,
-            momentum,
-            dampening,
-            nesterov,
-            weightDecay
-          ),
-        catch: (error) =>
-          new Tensor.TensorError({
-            op: "sgd",
-            message: error instanceof Error ? error.message : String(error)
-          })
-      })
-      const makeOut = (index: number): Tensor.Lazy => {
-        const handle = step.sgdOut(index)
-        return Tensor.makeLazy(handle, param.shape, param.dtype, param.device)
-      }
-      return { param: makeOut(0), velocity: makeOut(1) }
-    })
-
   return {
     init: (params) =>
-      Effect.map(checkParams("sgd", params), (): SgdState => ({ velocity: null })),
-    step: (params, grads, state) =>
+      Effect.gen(function* () {
+        yield* checkParams("sgd", params)
+        const velocity: Array<Tensor.Any> = []
+        if (momentum !== 0) {
+          for (const param of params) {
+            velocity.push(yield* Tensor.zeros(param.shape, { dtype: param.dtype }))
+          }
+        }
+        const first = yield* Tensor.ones([], { dtype: scalarDtype(params) })
+        return { velocity, first } satisfies SgdState
+      }),
+    step: (params, grads, state, lr) =>
       Effect.gen(function* () {
         yield* checkParams("sgd", params)
         yield* checkGrads("sgd", params, grads)
-        if (momentum !== 0 && state.velocity !== null) {
+        yield* checkLr("sgd", lr)
+        if (momentum !== 0) {
           yield* checkStateLength("sgd", "velocity", state.velocity, params)
         }
         const updates: Array<Tensor.Lazy> = []
         const velocities: Array<Tensor.Any> = []
         for (let i = 0; i < params.length; i++) {
-          const update = yield* updateParam(params[i], grads[i], state.velocity?.[i] ?? null)
-          updates.push(update.param)
-          if (update.velocity !== null) velocities.push(update.velocity)
+          if (momentum === 0) {
+            let g: Tensor.Any = grads[i]
+            if (weightDecay !== 0) {
+              g = yield* Tensor.add(g, yield* Tensor.mul(params[i], yield* Tensor.constantLike(params[i], weightDecay)))
+            }
+            updates.push(yield* Tensor.sub(params[i], yield* Tensor.mul(g, lr)))
+            continue
+          }
+          const step = yield* Effect.try({
+            try: () =>
+              params[i].lazy.sgdStep(
+                grads[i].lazy,
+                state.velocity[i].lazy,
+                state.first.lazy,
+                lr.lazy,
+                momentum,
+                dampening,
+                nesterov,
+                weightDecay
+              ),
+            catch: (error) =>
+              new Tensor.TensorError({
+                op: "sgd",
+                message: error instanceof Error ? error.message : String(error)
+              })
+          })
+          const makeOut = (index: number): Tensor.Lazy => {
+            const handle = step.sgdOut(index)
+            return Tensor.makeLazy(handle, params[i].shape, params[i].dtype, params[i].device)
+          }
+          updates.push(makeOut(0))
+          velocities.push(makeOut(1))
         }
-        const roots = momentum === 0 ? [] : velocities
+        if (momentum === 0) {
+          return {
+            params: updates,
+            state: { velocity: [], first: state.first },
+            stateRoots: []
+          }
+        }
+        const first = yield* Tensor.mul(state.first, yield* Tensor.constantLike(state.first, 0))
         return {
           params: updates,
-          state: { velocity: momentum === 0 ? null : roots },
-          stateRoots: roots,
-          rebuildState: (evaluated): SgdState => ({
-            velocity: momentum === 0 ? null : [...evaluated]
-          })
+          state: { velocity: velocities, first },
+          stateRoots: [...velocities, first]
         }
-      })
+      }),
+    stateRoots: (state) => momentum === 0 ? [] : [...state.velocity, state.first],
+    rebuildState: (state, roots) =>
+      momentum === 0
+        ? state
+        : { velocity: roots.slice(0, state.velocity.length), first: roots[state.velocity.length] }
   }
 }
 
 interface ResolvedAdamConfig {
-  readonly lr: number
   readonly beta1: number
   readonly beta2: number
   readonly eps: number
@@ -317,10 +363,7 @@ interface ResolvedAdamConfig {
 }
 
 const makeAdam = (op: string, config: ResolvedAdamConfig): Optimizer<AdamState> => {
-  const { lr, beta1, beta2, eps, weightDecay } = config
-  if (!Number.isFinite(lr) || lr <= 0) {
-    throw new Error(`${op}: lr must be positive, got ${lr}`)
-  }
+  const { beta1, beta2, eps, weightDecay } = config
   if (
     !Number.isFinite(beta1) || !Number.isFinite(beta2) || beta1 < 0 || beta1 >= 1 || beta2 < 0 ||
     beta2 >= 1
@@ -330,37 +373,6 @@ const makeAdam = (op: string, config: ResolvedAdamConfig): Optimizer<AdamState> 
   if (!Number.isFinite(eps) || eps <= 0) {
     throw new Error(`${op}: eps must be positive, got ${eps}`)
   }
-
-  const updateParam = (
-    param: Tensor.Any,
-    grad: Tensor.Any,
-    m: Tensor.Any,
-    v: Tensor.Any,
-    t: number
-  ): Effect.Effect<
-    {
-      readonly param: Tensor.Lazy
-      readonly m: Tensor.Lazy
-      readonly v: Tensor.Lazy
-    },
-    Tensor.TensorError
-  > =>
-    Effect.gen(function* () {
-      const step = yield* Effect.try({
-        try: () =>
-          param.lazy.adamwStep(grad.lazy, m.lazy, v.lazy, lr, beta1, beta2, eps, weightDecay, t),
-        catch: (error) =>
-          new Tensor.TensorError({
-            op,
-            message: error instanceof Error ? error.message : String(error)
-          })
-      })
-      const makeOut = (index: number): Tensor.Lazy => {
-        const handle = step.adamwOut(index)
-        return Tensor.makeLazy(handle, param.shape, param.dtype, param.device)
-      }
-      return { param: makeOut(0), m: makeOut(1), v: makeOut(2) }
-    })
 
   return {
     init: (params) =>
@@ -372,48 +384,90 @@ const makeAdam = (op: string, config: ResolvedAdamConfig): Optimizer<AdamState> 
           m.push(yield* Tensor.zeros(param.shape, { dtype: param.dtype }))
           v.push(yield* Tensor.zeros(param.shape, { dtype: param.dtype }))
         }
-        return { m, v, t: 0 } satisfies AdamState
+        const t = yield* stepCount(0)
+        return { m, v, t } satisfies AdamState
       }),
-    step: (params, grads, state) =>
+    step: (params, grads, state, lr) =>
       Effect.gen(function* () {
         yield* checkParams(op, params)
         yield* checkGrads(op, params, grads)
+        yield* checkLr(op, lr)
         yield* checkStateLength(op, "first-moment", state.m, params)
         yield* checkStateLength(op, "second-moment", state.v, params)
-        const t = state.t + 1
+        // The bias corrections 1 - beta^t are tensor ops over the state's
+        // step count, built once per step and shared by every parameter's
+        // update node (the evaluator dedups them into one kernel each).
+        const t = yield* Tensor.add(state.t, yield* Tensor.constantLike(state.t, 1))
+        const one = yield* Tensor.constantLike(t, 1)
+        const c1 = yield* Tensor.add(
+          yield* Tensor.neg(
+            yield* Tensor.exp(yield* Tensor.mul(t, yield* Tensor.constantLike(t, Math.log(beta1))))
+          ),
+          one
+        )
+        const c2 = yield* Tensor.add(
+          yield* Tensor.neg(
+            yield* Tensor.exp(yield* Tensor.mul(t, yield* Tensor.constantLike(t, Math.log(beta2))))
+          ),
+          one
+        )
         const updates: Array<Tensor.Lazy> = []
         const m: Array<Tensor.Lazy> = []
         const v: Array<Tensor.Lazy> = []
         for (let i = 0; i < params.length; i++) {
-          const update = yield* updateParam(params[i], grads[i], state.m[i], state.v[i], t)
-          updates.push(update.param)
-          m.push(update.m)
-          v.push(update.v)
+          const step = yield* Effect.try({
+            try: () =>
+              params[i].lazy.adamwStep(
+                grads[i].lazy,
+                state.m[i].lazy,
+                state.v[i].lazy,
+                lr.lazy,
+                c1.lazy,
+                c2.lazy,
+                beta1,
+                beta2,
+                eps,
+                weightDecay
+              ),
+            catch: (error) =>
+              new Tensor.TensorError({
+                op,
+                message: error instanceof Error ? error.message : String(error)
+              })
+          })
+          const makeOut = (index: number): Tensor.Lazy => {
+            const handle = step.adamwOut(index)
+            return Tensor.makeLazy(handle, params[i].shape, params[i].dtype, params[i].device)
+          }
+          updates.push(makeOut(0))
+          m.push(makeOut(1))
+          v.push(makeOut(2))
         }
         return {
           params: updates,
           state: { m, v, t },
-          stateRoots: [...m, ...v],
-          rebuildState: (evaluated): AdamState => ({
-            m: evaluated.slice(0, m.length),
-            v: evaluated.slice(m.length),
-            t
-          })
+          stateRoots: [...m, ...v, t]
         }
-      })
+      }),
+    stateRoots: (state) => [...state.m, ...state.v, state.t],
+    rebuildState: (state, roots) => ({
+      m: roots.slice(0, state.m.length),
+      v: roots.slice(state.m.length, state.m.length * 2),
+      t: roots[state.m.length * 2]
+    })
   }
 }
 
 /**
- * Creates an Adam optimizer with the standard defaults (`lr = 1e-3`,
- * `beta1 = 0.9`, `beta2 = 0.999`, `eps = 1e-8`).
+ * Creates an Adam optimizer with the standard defaults (`beta1 = 0.9`,
+ * `beta2 = 0.999`, `eps = 1e-8`). The learning rate is a per-step input
+ * to `step`.
  *
  * @since 0.1.0
  * @category constructors
  */
 export const adam = (config: AdamConfig = {}): Optimizer<AdamState> =>
   makeAdam("adam", {
-    lr: config.lr ?? 1e-3,
     beta1: config.beta1 ?? 0.9,
     beta2: config.beta2 ?? 0.999,
     eps: config.eps ?? 1e-8,
@@ -423,14 +477,13 @@ export const adam = (config: AdamConfig = {}): Optimizer<AdamState> =>
 /**
  * Creates an AdamW optimizer: Adam with decoupled weight decay (default
  * `0.01`), applied as `p *= (1 - lr * weightDecay)` before the adaptive
- * update.
+ * update. The learning rate is a per-step input to `step`.
  *
  * @since 0.1.0
  * @category constructors
  */
 export const adamW = (config: AdamWConfig = {}): Optimizer<AdamState> =>
   makeAdam("adamW", {
-    lr: config.lr ?? 1e-3,
     beta1: config.beta1 ?? 0.9,
     beta2: config.beta2 ?? 0.999,
     eps: config.eps ?? 1e-8,
@@ -492,7 +545,13 @@ export const clipByGlobalNorm = (
       total = yield* Tensor.add(total, yield* Tensor.sum(yield* Tensor.square(g)))
     }
     const norm = yield* Tensor.sqrt(total)
-    const scale = yield* Tensor.minimum(yield* Tensor.mul(yield* Tensor.reciprocal(yield* Tensor.add(norm, 1e-6)), maxNorm), 1)
+    const scale = yield* Tensor.minimum(
+      yield* Tensor.mul(
+        yield* Tensor.reciprocal(yield* Tensor.add(norm, yield* Tensor.constantLike(norm, 1e-6))),
+        yield* Tensor.constantLike(norm, maxNorm)
+      ),
+      yield* Tensor.constantLike(norm, 1)
+    )
     const out: Array<Tensor.Lazy> = []
     for (const g of grads) {
       out.push(yield* Tensor.mul(g, scale))
@@ -519,9 +578,13 @@ export type Materialized<P extends ReadonlyArray<Tensor.Any>> = {
  * pass, one async boundary. The returned parameters are materialized
  * tensors with the same length, order, shapes, and dtypes as the input
  * parameters (a tuple in, the same tuple out), and the state is rebuilt
- * from materialized tensors via the update's `rebuildState`: both are
+ * from materialized tensors via `optimizer.rebuildState`: both are
  * plain leaves of the next step's graph, so graph depth stays
  * O(model depth) no matter how many steps run.
+ *
+ * `lr` is the step's learning rate as a 0-d float tensor on the
+ * parameters' device — lift the step's scheduled value with
+ * `Tensor.full([], schedule(step), { dtype: params[0].dtype })`.
  *
  * @since 0.1.0
  * @category destructors
@@ -530,19 +593,20 @@ export const step = <S, P extends ReadonlyArray<Tensor.Any>>(
   optimizer: Optimizer<S>,
   loss: Tensor.Any,
   params: P,
-  state: S
+  state: S,
+  lr: Tensor.Any
 ): Effect.Effect<
   { readonly loss: Tensor.Concrete; readonly params: Materialized<P>; readonly state: S },
   Gradient.GradError | Tensor.TensorError
 > =>
   Effect.gen(function* () {
     const grads = yield* Gradient.grad(loss, params)
-    const next = yield* optimizer.step(params, grads, state)
+    const next = yield* optimizer.step(params, grads, state, lr)
     const evaluated = yield* Tensor.compute([loss, ...next.params, ...next.stateRoots])
     const [evaluatedLoss, ...rest] = evaluated
     return {
       loss: evaluatedLoss,
       params: rest.slice(0, next.params.length) as Materialized<P>,
-      state: next.rebuildState(rest.slice(next.params.length))
+      state: optimizer.rebuildState(next.state, rest.slice(next.params.length))
     }
   })

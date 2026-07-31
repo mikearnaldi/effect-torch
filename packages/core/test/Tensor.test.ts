@@ -24,6 +24,18 @@ onDevices("Tensor", () => (it) => {
       })
     )
 
+    it.effect("constant is a shared 0-d leaf equivalent across calls", () =>
+      Effect.gen(function* () {
+        const a = yield* Tensor.constant(0.5, { dtype: floatDtype })
+        const b = yield* Tensor.constant(0.5, { dtype: floatDtype })
+        assert.deepStrictEqual(a.shape, [])
+        deep(yield* values(a), yield* values(b))
+        const x = yield* Tensor.fromTypedArray(floats([2, 4]), [2])
+        deep(yield* values(yield* Tensor.mul(x, a)), [1, 2])
+        deep(yield* values(yield* Tensor.mul(x, b)), [1, 2])
+      })
+    )
+
     it.effect("eye", () =>
       Effect.gen(function* () {
         deep(yield* values(yield* Tensor.eye(2)), [1, 0, 0, 1])
@@ -47,10 +59,10 @@ onDevices("Tensor", () => (it) => {
     it.effect("scalar union and broadcasting", () =>
       Effect.gen(function* () {
         const t = yield* Tensor.arange(4)
-        deep(yield* values(yield* Tensor.add(t, 10)), [10, 11, 12, 13])
-        deep(yield* values(yield* Tensor.mul(t, 2)), [0, 2, 4, 6])
-        deep(yield* values(yield* Tensor.sub(t, 1)), [-1, 0, 1, 2])
-        deep(yield* values(yield* Tensor.div(t, 2)), [0, 0.5, 1, 1.5])
+        deep(yield* values(yield* Tensor.add(t, yield* Tensor.constantLike(t, 10))), [10, 11, 12, 13])
+        deep(yield* values(yield* Tensor.mul(t, yield* Tensor.constantLike(t, 2))), [0, 2, 4, 6])
+        deep(yield* values(yield* Tensor.sub(t, yield* Tensor.constantLike(t, 1))), [-1, 0, 1, 2])
+        deep(yield* values(yield* Tensor.div(t, yield* Tensor.constantLike(t, 2))), [0, 0.5, 1, 1.5])
       })
     )
 
@@ -81,7 +93,8 @@ onDevices("Tensor", () => (it) => {
 
     it.effect("comparisons return u8", () =>
       Effect.gen(function* () {
-        const t = yield* Tensor.gt(yield* Tensor.arange(4), 1)
+        const r = yield* Tensor.arange(4)
+        const t = yield* Tensor.gt(r, yield* Tensor.constantLike(r, 1))
         assert.strictEqual(t.dtype, "u8")
         deep(yield* values(t), [0, 0, 1, 1])
       })
@@ -130,8 +143,8 @@ onDevices("Tensor", () => (it) => {
         const b = yield* Tensor.fromTypedArray(floats([3, 4]), [1, 2])
         deep(yield* values(yield* Tensor.maximum(a, b)), [3, 5, 3, 4])
         deep(yield* values(yield* Tensor.minimum(a, b)), [1, 4, -2, 0])
-        deep(yield* values(yield* Tensor.maximum(a, 2)), [2, 5, 2, 2])
-        deep(yield* values(yield* Tensor.minimum(a, 2)), [1, 2, -2, 0])
+        deep(yield* values(yield* Tensor.maximum(a, yield* Tensor.constantLike(a, 2))), [2, 5, 2, 2])
+        deep(yield* values(yield* Tensor.minimum(a, yield* Tensor.constantLike(a, 2))), [1, 2, -2, 0])
       })
     )
   })
@@ -169,7 +182,7 @@ onDevices("Tensor", () => (it) => {
       Effect.gen(function* () {
         const pred = yield* Tensor.fromTypedArray(floats([1, 2, 4]), [3])
         const target = yield* Tensor.fromTypedArray(floats([1, 1, 1]), [3])
-        for (const loss of [yield* Loss.mse(pred, target), yield* Loss.mse(pred, 1)]) {
+        for (const loss of [yield* Loss.mse(pred, target), yield* Loss.mse(pred, yield* Tensor.constantLike(pred, 1))]) {
           const [value] = yield* values(loss)
           expect(Math.abs(value - 10 / 3)).toBeLessThan(TOL)
         }
@@ -242,7 +255,7 @@ onDevices("Tensor", () => (it) => {
         const a = yield* Tensor.fromTypedArray(new Float32Array([1, 2, 3, 4]), [2, 2])
         const id = yield* Tensor.eye(2)
         const b = yield* Tensor.matmul(a, id)
-        const c = yield* Tensor.add(b, 1)
+        const c = yield* Tensor.add(b, yield* Tensor.constantLike(b, 1))
         const d = yield* Tensor.sum(c)
         expect(Array.from<number | bigint>(yield* Tensor.toTypedArray(d))).toEqual([14])
       })
@@ -357,14 +370,14 @@ onDevices("Tensor", () => (it) => {
     it.effect("ne/logicalAnd/logicalOr/logicalNot/remainder", () =>
       Effect.gen(function* () {
         const a = yield* Tensor.fromTypedArray(floats([1, 2, 3]))
-        deep(yield* values(yield* Tensor.ne(a, 2)), [1, 0, 1])
+        deep(yield* values(yield* Tensor.ne(a, yield* Tensor.constantLike(a, 2))), [1, 0, 1])
         const c1 = yield* Tensor.fromTypedArray(new Uint8Array([1, 1, 0, 0]))
         const c2 = yield* Tensor.fromTypedArray(new Uint8Array([1, 0, 1, 0]))
         deep(yield* values(yield* Tensor.logicalAnd(c1, c2)), [1, 0, 0, 0])
         deep(yield* values(yield* Tensor.logicalOr(c1, c2)), [1, 1, 1, 0])
         deep(yield* values(yield* Tensor.logicalNot(c1)), [0, 0, 1, 1])
         const b = yield* Tensor.fromTypedArray(floats([5.5, -5.5, 7]))
-        const r = yield* values(yield* Tensor.remainder(b, 3))
+        const r = yield* values(yield* Tensor.remainder(b, yield* Tensor.constantLike(b, 3)))
         for (let i = 0; i < 3; i++) {
           const v = [5.5, -5.5, 7][i]
           expect(Math.abs(r[i] - ((v % 3) + 3) % 3)).toBeLessThan(TOL)
@@ -378,7 +391,7 @@ onDevices("Tensor", () => (it) => {
         const x = yield* Tensor.fromTypedArray(floats([1, 2, 3]))
         const y = yield* Tensor.fromTypedArray(floats([10, 20, 30]))
         deep(yield* values(yield* Tensor.where(cond, x, y)), [1, 20, 3])
-        deep(yield* values(yield* Tensor.where(cond, x, 0)), [1, 0, 3])
+        deep(yield* values(yield* Tensor.where(cond, x, yield* Tensor.constantLike(x, 0))), [1, 0, 3])
         const bad = yield* Tensor.fromTypedArray(new BigInt64Array([1n]))
         const error = yield* Effect.flip(Tensor.where(cond, x, bad))
         expect(error.message).toContain("dtype")

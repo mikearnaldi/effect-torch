@@ -39,6 +39,7 @@
 import { Data, Effect } from "effect"
 import type { CurrentDevice } from "./Device.ts"
 import * as Gradient from "./Gradient.ts"
+import type { LearningRate } from "./LearningRate.ts"
 import * as Optimizer from "./Optimizer.ts"
 import * as Tensor from "./Tensor.ts"
 
@@ -158,10 +159,8 @@ export const linear = (
     return {
       names,
       init: Effect.gen(function* () {
-        const weight = yield* Tensor.mul(
-          yield* Tensor.randn([inFeatures, outFeatures]),
-          1 / Math.sqrt(inFeatures)
-        )
+        const drawn = yield* Tensor.randn([inFeatures, outFeatures])
+        const weight = yield* Tensor.mul(drawn, yield* Tensor.constantLike(drawn, 1 / Math.sqrt(inFeatures)))
         const bias = yield* Tensor.zeros([1, outFeatures])
         return [weight, bias] as const
       }),
@@ -212,10 +211,8 @@ export const conv1d = (
     return {
       names,
       init: Effect.gen(function* () {
-        const weight = yield* Tensor.mul(
-          yield* Tensor.randn([outChannels, inChannels / groups, kernelSize]),
-          1 / Math.sqrt(fanIn)
-        )
+        const drawn = yield* Tensor.randn([outChannels, inChannels / groups, kernelSize])
+        const weight = yield* Tensor.mul(drawn, yield* Tensor.constantLike(drawn, 1 / Math.sqrt(fanIn)))
         const bias = yield* Tensor.zeros([outChannels])
         return [weight, bias] as const
       }),
@@ -269,10 +266,8 @@ export const conv2d = (
     return {
       names,
       init: Effect.gen(function* () {
-        const weight = yield* Tensor.mul(
-          yield* Tensor.randn([outChannels, inChannels / groups, kh, kw]),
-          1 / Math.sqrt(fanIn)
-        )
+        const drawn = yield* Tensor.randn([outChannels, inChannels / groups, kh, kw])
+        const weight = yield* Tensor.mul(drawn, yield* Tensor.constantLike(drawn, 1 / Math.sqrt(fanIn)))
         const bias = yield* Tensor.zeros([outChannels])
         return [weight, bias] as const
       }),
@@ -428,7 +423,7 @@ export const layerNorm = (
           const mu = yield* Tensor.mean(input, { dims, keepdims: true })
           const centered = yield* Tensor.sub(input, mu)
           const variance = yield* Tensor.variance(input, { dims, keepdims: true, correction: 0 })
-          const inv = yield* Tensor.rsqrt(yield* Tensor.add(variance, eps))
+          const inv = yield* Tensor.rsqrt(yield* Tensor.add(variance, yield* Tensor.constantLike(variance, eps)))
           return yield* Tensor.add(yield* Tensor.mul(yield* Tensor.mul(centered, inv), weight), bias)
         })
     }
@@ -485,8 +480,9 @@ export const multiHeadAttention = (
       init: Effect.gen(function* () {
         const params: Array<Tensor.Any> = []
         for (const _ of projections) {
+          const drawn = yield* Tensor.randn([embedDim, embedDim])
           params.push(
-            yield* Tensor.mul(yield* Tensor.randn([embedDim, embedDim]), 1 / Math.sqrt(embedDim)),
+            yield* Tensor.mul(drawn, yield* Tensor.constantLike(drawn, 1 / Math.sqrt(embedDim))),
             yield* Tensor.zeros([1, embedDim])
           )
         }
@@ -1023,10 +1019,14 @@ export interface TrainStep {
 /**
  * Configuration for {@link train}. `loss` is any loss function in the
  * shape of {@link Loss.mse} — `(prediction, target) => Effect<Lazy>` —
- * so the `Loss` module's exports slot in directly. `params` overrides the
- * initial parameters (continued training, fine-tuning from a checkpoint);
- * when omitted, `model.init` runs. `onStep` runs after every step with
- * the step's loss value — throttle inside the callback.
+ * so the `Loss` module's exports slot in directly. `lr` is the
+ * learning-rate schedule (see the `LearningRate` module): it is evaluated
+ * with the 0-based step number on every step and the value flows into the
+ * update as a 0-d tensor — `LearningRate.constant(0.1)` is the fixed-rate
+ * case. `params` overrides the initial parameters (continued training,
+ * fine-tuning from a checkpoint); when omitted, `model.init` runs.
+ * `onStep` runs after every step with the step's loss value — throttle
+ * inside the callback.
  *
  * `stop` decides when training ends; it is checked after every step (at
  * least one step always runs), so any policy is a plain function:
@@ -1056,6 +1056,7 @@ export interface TrainConfig<
   RO = never
 > {
   readonly optimizer: Optimizer.Optimizer<S>
+  readonly lr: LearningRate
   readonly loss: (
     prediction: Tensor.Any,
     target: Tensor.Any
@@ -1115,7 +1116,8 @@ export const train = <S, EL = never, RL = never, ED = never, RD = never, EO = ne
         : config.data
       const prediction = yield* model.forward(params, data.input)
       const lossTensor = yield* config.loss(prediction, data.target)
-      const result = yield* Optimizer.step(config.optimizer, lossTensor, params, state)
+      const lr = yield* Tensor.constant(config.lr(step - 1), { dtype: params[0].dtype })
+      const result = yield* Optimizer.step(config.optimizer, lossTensor, params, state, lr)
       loss = (yield* Tensor.toNumberArray(result.loss))[0]
       trained = result.params
       params = result.params

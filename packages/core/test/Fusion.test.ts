@@ -43,10 +43,10 @@ onDevices("Fusion", () => (it) => {
           // a fused chain with a scalar constant fold and a two-region merge:
           // mul and add each open a region, the outer add merges them
           const left = yield* Tensor.mul(a, b)
-          const right = yield* Tensor.add(a, 2)
+          const right = yield* Tensor.add(a, yield* Tensor.constantLike(a, 2))
           const merged = yield* Tensor.add(left, right)
           const y = yield* Tensor.exp(yield* Tensor.sqrt(merged))
-          const z = yield* Tensor.relu(yield* Tensor.sub(y, 2))
+          const z = yield* Tensor.relu(yield* Tensor.sub(y, yield* Tensor.constantLike(y, 2)))
           const loss = yield* Tensor.sum(yield* Tensor.mul(y, yield* Tensor.sin(z)))
           const [ga, gb] = yield* Gradient.grad(loss, [a, b])
           return {
@@ -95,7 +95,7 @@ onDevices("Fusion", () => (it) => {
           const x = yield* Tensor.fromTypedArray(floats([1, 2, 3, 4, 5, 6]), [2, 3])
           // [2, 3] - [1, 3] rides the region as a broadcast lane
           const row = yield* Tensor.fromTypedArray(floats([0.5, 0.5, 0.5]), [1, 3])
-          const y = yield* Tensor.sqrt(yield* Tensor.mul(yield* Tensor.sub(x, row), 2))
+          const y = yield* Tensor.sqrt(yield* Tensor.mul(yield* Tensor.sub(x, row), yield* Tensor.constantLike(x, 2)))
           const loss = yield* Tensor.sum(y)
           const [gx] = yield* Gradient.grad(loss, [x])
           return { y: yield* values(y), gx: yield* values(gx) }
@@ -161,7 +161,7 @@ onDevices("Fusion", () => (it) => {
       Effect.gen(function* () {
         const build = Effect.gen(function* () {
           const x = yield* Tensor.fromTypedArray(floats([-2, -0.5, 0, 0.5, 2, -1.5]), [2, 3])
-          const y = yield* Tensor.mul(yield* Tensor.sign(yield* Tensor.sub(x, 0.25)), 3)
+          const y = yield* Tensor.mul(yield* Tensor.sign(yield* Tensor.sub(x, yield* Tensor.constantLike(x, 0.25))), yield* Tensor.constantLike(x, 3))
           const loss = yield* Tensor.sum(y)
           const [gx] = yield* Gradient.grad(loss, [x])
           return { y: yield* values(y), gx: yield* values(gx) }
@@ -178,7 +178,7 @@ onDevices("Fusion", () => (it) => {
       Effect.gen(function* () {
         const build = Effect.gen(function* () {
           const x = yield* Tensor.fromTypedArray(floats([1, 2, 3, 4]), [2, 2])
-          const y = yield* Tensor.sqrt(yield* Tensor.cast(yield* Tensor.mul(x, 2), "f32"))
+          const y = yield* Tensor.sqrt(yield* Tensor.cast(yield* Tensor.mul(x, yield* Tensor.constantLike(x, 2)), "f32"))
           return yield* values(y)
         })
         const fused = yield* withFusion(true, build)
@@ -197,7 +197,7 @@ onDevices("Fusion", () => (it) => {
           // (valid) rounding difference between inlined and materialized y
           const a = yield* Tensor.fromTypedArray(floats([0.1, 0.2, 0.3, 0.4, 0.5, 0.6]), [2, 3])
           const b = yield* Tensor.fromTypedArray(floats([0.5, 1.5, 2.5, 3.5, 4.5, 5.5]), [2, 3])
-          const y = yield* Tensor.exp(yield* Tensor.sqrt(yield* Tensor.add(yield* Tensor.mul(a, b), 2)))
+          const y = yield* Tensor.exp(yield* Tensor.sqrt(yield* Tensor.add(yield* Tensor.mul(a, b), yield* Tensor.constantLike(a, 2))))
           const z = yield* Tensor.sin(y)
           const w = yield* Tensor.cos(y)
           const loss = yield* Tensor.sum(yield* Tensor.add(yield* Tensor.mul(y, z), w))
@@ -309,7 +309,7 @@ onDevices("Fusion", () => (it) => {
           const x = yield* Tensor.fromTypedArray(floats([0.5, -1.5, 2.25, -3.75, 0.4, 1.6]), [2, 3])
           const y = yield* Tensor.add(
             yield* Tensor.add(yield* Tensor.floor(x), yield* Tensor.ceil(x)),
-            yield* Tensor.mul(yield* Tensor.round(x), 2)
+            yield* Tensor.mul(yield* Tensor.round(x), yield* Tensor.constantLike(x, 2))
           )
           return yield* values(y)
         })
@@ -410,9 +410,10 @@ onDevices("Fusion", () => (it) => {
         const build = Effect.gen(function* () {
           const x = yield* Tensor.fromTypedArray(floats([0.5, -1, 2, -3, 0.25, 1.5]), [2, 3])
           // the condition has two consumers, so it must materialize as u8
-          const cond = yield* Tensor.gt(x, 0)
-          const a = yield* Tensor.where(cond, x, 0)
-          const b = yield* Tensor.where(cond, 0, x)
+          const cond = yield* Tensor.gt(x, yield* Tensor.constantLike(x, 0))
+          const zero = yield* Tensor.constantLike(x, 0)
+          const a = yield* Tensor.where(cond, x, zero)
+          const b = yield* Tensor.where(cond, zero, x)
           return { a: yield* values(a), b: yield* values(b) }
         })
         const fused = yield* withFusion(true, build)
@@ -432,11 +433,12 @@ onDevices("Fusion", () => (it) => {
         const build = Effect.gen(function* () {
           const x = yield* Tensor.fromTypedArray(floats([0.5, -1, 2, -3, 0.25, 1.5, 0.75, -0.5]), [2, 4])
           // the exp/mul chain must not materialize: sum folds it in-loop
-          const keep = yield* Tensor.sum(yield* Tensor.mul(yield* Tensor.exp(x), 2), {
+          const two = yield* Tensor.constantLike(x, 2)
+          const keep = yield* Tensor.sum(yield* Tensor.mul(yield* Tensor.exp(x), two), {
             dims: [1],
             keepdims: true
           })
-          const drop = yield* Tensor.sum(yield* Tensor.mul(yield* Tensor.exp(x), 2), { dims: [1] })
+          const drop = yield* Tensor.sum(yield* Tensor.mul(yield* Tensor.exp(x), two), { dims: [1] })
           const loss = yield* Tensor.sum(keep)
           const [gx] = yield* Gradient.grad(loss, [x])
           return { keep: yield* values(keep), drop: yield* values(drop), gx: yield* values(gx) }
@@ -529,7 +531,7 @@ onDevices("Fusion", () => (it) => {
             floats(Array.from({ length: 2 * 3 * 2 * 3 * 2 }, (_, i) => ((i * 7) % 11) - 5)),
             [2, 3, 2, 3, 2]
           )
-          const y = yield* Tensor.sum(yield* Tensor.exp(yield* Tensor.mul(x, 0.25)), { dims: [1, 3] })
+          const y = yield* Tensor.sum(yield* Tensor.exp(yield* Tensor.mul(x, yield* Tensor.constantLike(x, 0.25))), { dims: [1, 3] })
           const loss = yield* Tensor.sum(y)
           const [gx] = yield* Gradient.grad(loss, [x])
           return { y: yield* values(y), gx: yield* values(gx) }
@@ -582,12 +584,12 @@ onDevices("Fusion", () => (it) => {
           let acc = x as Tensor.Any
           const terms: Array<Tensor.Any> = []
           for (let level = 0; level < 6; level++) {
-            const shared = yield* Tensor.tanh(yield* Tensor.exp(yield* Tensor.add(acc, level)))
-            const left = yield* Tensor.sin(yield* Tensor.mul(shared, 2))
-            const right = yield* Tensor.cos(yield* Tensor.add(shared, 1))
+            const shared = yield* Tensor.tanh(yield* Tensor.exp(yield* Tensor.add(acc, yield* Tensor.constantLike(acc, level))))
+            const left = yield* Tensor.sin(yield* Tensor.mul(shared, yield* Tensor.constantLike(shared, 2)))
+            const right = yield* Tensor.cos(yield* Tensor.add(shared, yield* Tensor.constantLike(shared, 1)))
             const reduced = yield* Tensor.sum(yield* Tensor.sqrt(yield* Tensor.abs(shared)), { dims: [1] })
             terms.push(yield* Tensor.sum(left), yield* Tensor.sum(right), yield* Tensor.sum(reduced))
-            acc = yield* Tensor.add(shared, level + 1)
+            acc = yield* Tensor.add(shared, yield* Tensor.constantLike(shared, level + 1))
           }
           let loss = terms[0]
           for (const t of terms.slice(1)) {

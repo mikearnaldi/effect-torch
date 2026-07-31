@@ -104,7 +104,7 @@ onDevices("Loss", () => (it) => {
     it.effect("reduction none returns the unreduced loss", () =>
       Effect.gen(function* () {
         const pred = yield* f32([1, 2, 4])
-        const none = yield* Loss.mse(pred, 0, { reduction: "none" })
+        const none = yield* Loss.mse(pred, yield* Tensor.constantLike(pred, 0), { reduction: "none" })
         assert.deepStrictEqual(none.shape, [3])
         assert.deepStrictEqual(yield* values(none), [1, 4, 16])
       })
@@ -123,10 +123,10 @@ onDevices("Loss", () => (it) => {
   describe("gradcheck (finite differences)", () => {
     it.effect("regression losses", () =>
       Effect.gen(function* () {
-        yield* gradcheck((x) => Loss.mse(x, 1), [0.5, -1, 2], [3])
-        yield* gradcheck((x) => Loss.l1(x, 0.25), [0.5, -1, 2], [3])
-        yield* gradcheck((x) => Loss.huber(x, 0), [0.5, -1, 2], [3])
-        yield* gradcheck((x) => Loss.huber(x, 0, { delta: 0.75 }), [0.5, -1, 2], [3])
+        yield* gradcheck((x) => Effect.flatMap(Tensor.constantLike(x, 1), (t) => Loss.mse(x, t)), [0.5, -1, 2], [3])
+        yield* gradcheck((x) => Effect.flatMap(Tensor.constantLike(x, 0.25), (t) => Loss.l1(x, t)), [0.5, -1, 2], [3])
+        yield* gradcheck((x) => Effect.flatMap(Tensor.constantLike(x, 0), (t) => Loss.huber(x, t)), [0.5, -1, 2], [3])
+        yield* gradcheck((x) => Effect.flatMap(Tensor.constantLike(x, 0), (t) => Loss.huber(x, t, { delta: 0.75 })), [0.5, -1, 2], [3])
       })
     )
 

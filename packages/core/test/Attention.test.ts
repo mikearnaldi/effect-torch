@@ -26,14 +26,14 @@ const reference = (
     perm[rank - 1] = rank - 2
     let scores = yield* Tensor.mul(
       yield* Tensor.matmul(q, yield* Tensor.transpose(k, perm)),
-      options.scale
+      yield* Tensor.constantLike(q, options.scale)
     )
     if (options.causal) {
       const i = yield* Tensor.reshape(yield* Tensor.arange(t), [t, 1])
       const j = yield* Tensor.reshape(yield* Tensor.arange(s), [1, s])
-      const allowed = yield* Tensor.le(j, yield* Tensor.add(i, Math.max(0, s - t)))
+      const allowed = yield* Tensor.le(j, yield* Tensor.add(i, yield* Tensor.constantLike(i, Math.max(0, s - t))))
       const negInf = yield* Tensor.full([t, s], -Infinity)
-      scores = yield* Tensor.add(scores, yield* Tensor.where(allowed, 0, negInf))
+      scores = yield* Tensor.add(scores, yield* Tensor.where(allowed, yield* Tensor.constantLike(negInf, 0), negInf))
     }
     return yield* Tensor.matmul(yield* Tensor.softmax(scores), v)
   })

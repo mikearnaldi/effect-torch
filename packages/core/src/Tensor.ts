@@ -232,61 +232,74 @@ const numel = (shape: ReadonlyArray<number>): number => shape.reduce((a, b) => a
 const isFloatDtype = (dtype: string): boolean => dtype === "f32" || dtype === "f64"
 
 /**
- * Right-hand operand accepted by arithmetic and comparison operations. A
- * `number` is lifted to a scalar tensor with the same dtype and device as the
- * left operand.
+ * Creates a shared 0-d constant tensor. The native runtime pools constant
+ * leaves, so repeated calls with the same (value, dtype, device) triple
+ * are backed by the same graph node — hot constants cost one native node
+ * total instead of one per use. Use it for constants referenced many
+ * times (a learning rate lifted per step, a scale applied in a loop); use
+ * {@link full} for a fresh node or a non-scalar shape. A constant is
+ * exactly that: never route a value that changes meaning per step through
+ * one.
  *
  * @since 0.1.0
- * @category models
+ * @category constructors
  */
-export type TensorOrScalar = Any | number
+export const constant = (
+  value: number,
+  options: TensorOptions = {}
+): Effect.Effect<Lazy, TensorError, CurrentDevice> =>
+  Effect.gen(function* () {
+    const device = yield* CurrentDevice
+    const dtype = options.dtype ?? "f32"
+    return yield* Effect.try({
+      try: () => makeLazy(NativeLazyTensor.constant(value, dtype as NativeDType, device), [], dtype, device),
+      catch: (error) =>
+        new TensorError({ op: "constant", message: error instanceof Error ? error.message : String(error) })
+    })
+  })
 
-// Scalar operands are pure values: the same (value, dtype, device) triple
-// can share one leaf node forever instead of allocating a fresh device
-// buffer per use. On backends with a scanning allocator (Metal) unbounded
-// tiny-buffer churn is expensive, so the cache is size-bounded — hot
-// constants (lr, betas, eps, 0.5, 1, 2) stay resident; per-step varying
-// scalars (bias-correction factors) rotate through.
-const scalarLeafCache = new Map<string, NativeLazyTensorType>()
-const SCALAR_LEAF_CACHE_LIMIT = 4096
-
-const liftOperand = (
-  self: Any,
-  other: Any | number
-): { readonly lazy: NativeLazyTensorType; readonly shape: ReadonlyArray<number> } => {
-  if (typeof other === "number") {
-    const key = `${self.device}:${self.dtype}:${other}`
-    let lazy = scalarLeafCache.get(key)
-    if (lazy === undefined) {
-      lazy = NativeLazyTensor.full([], other, self.dtype as NativeDType, self.device)
-      if (scalarLeafCache.size >= SCALAR_LEAF_CACHE_LIMIT) {
-        scalarLeafCache.delete(scalarLeafCache.keys().next().value!)
-      }
-      scalarLeafCache.set(key, lazy)
-    }
-    return { lazy, shape: [] }
-  }
-  return { lazy: other.lazy, shape: other.shape }
-}
+/**
+ * Creates a shared 0-d constant tensor with the same dtype and device as
+ * `self` — the scalar counterpart of {@link zerosLike} / {@link onesLike}
+ * / {@link fullLike}, and the way to lift a numeric constant next to an
+ * existing tensor (custom losses, optimizer updates) without threading a
+ * device through the environment. The native runtime pools constant
+ * leaves (see {@link constant}). A constant is exactly that: never route
+ * a value that changes meaning per step through one.
+ *
+ * @since 0.1.0
+ * @category constructors
+ */
+export const constantLike = (self: Any, value: number): Effect.Effect<Lazy, TensorError> =>
+  Effect.try({
+    try: () =>
+      makeLazy(
+        NativeLazyTensor.constant(value, self.dtype as NativeDType, self.device),
+        [],
+        self.dtype,
+        self.device
+      ),
+    catch: (error) =>
+      new TensorError({ op: "constantLike", message: error instanceof Error ? error.message : String(error) })
+  })
 
 const binaryOp = (
   op: string,
   native: (a: NativeLazyTensorType, b: NativeLazyTensorType) => NativeLazyTensorType,
   outDtype: (dtype: DType) => DType = (dtype) => dtype
 ): {
-  (other: TensorOrScalar): (self: Any) => Effect.Effect<Lazy, TensorError>
-  (self: Any, other: TensorOrScalar): Effect.Effect<Lazy, TensorError>
+  (other: Any): (self: Any) => Effect.Effect<Lazy, TensorError>
+  (self: Any, other: Any): Effect.Effect<Lazy, TensorError>
 } =>
   dual(
     2,
-    (self: Any, other: TensorOrScalar): Effect.Effect<Lazy, TensorError> =>
+    (self: Any, other: Any): Effect.Effect<Lazy, TensorError> =>
       Effect.try({
         try: () => {
-          if (typeof other !== "number") checkCompatible(op, self, other)
-          const rhs = liftOperand(self, other)
+          checkCompatible(op, self, other)
           return makeLazy(
-            native(self.lazy, rhs.lazy),
-            broadcastShapes(op, self.shape, rhs.shape),
+            native(self.lazy, other.lazy),
+            broadcastShapes(op, self.shape, other.shape),
             outDtype(self.dtype),
             self.device
           )
@@ -502,7 +515,10 @@ export const linspace = (
       return yield* full([1], start, options)
     }
     const base = yield* arange(steps, undefined, { dtype: options.dtype ?? "f32" })
-    return yield* add(yield* mul(base, (end - start) / (steps - 1)), start)
+    return yield* add(
+      yield* mul(base, yield* constantLike(base, (end - start) / (steps - 1))),
+      yield* constantLike(base, start)
+    )
   })
 
 /**
@@ -906,7 +922,10 @@ export const reciprocal = (self: Any): Effect.Effect<Lazy, TensorError> => pow(s
  * @category elementwise
  */
 export const expm1 = (self: Any): Effect.Effect<Lazy, TensorError> =>
-  Effect.flatMap(exp(self), (e) => sub(e, 1))
+  Effect.gen(function* () {
+    const e = yield* exp(self)
+    return yield* sub(e, yield* constantLike(e, 1))
+  })
 
 /**
  * Elementwise `log(1 + x)`.
@@ -915,7 +934,10 @@ export const expm1 = (self: Any): Effect.Effect<Lazy, TensorError> =>
  * @category elementwise
  */
 export const log1p = (self: Any): Effect.Effect<Lazy, TensorError> =>
-  Effect.flatMap(add(self, 1), (t) => log(t))
+  Effect.gen(function* () {
+    const t = yield* add(self, yield* constantLike(self, 1))
+    return yield* log(t)
+  })
 
 /**
  * Elementwise base-2 logarithm.
@@ -924,7 +946,10 @@ export const log1p = (self: Any): Effect.Effect<Lazy, TensorError> =>
  * @category elementwise
  */
 export const log2 = (self: Any): Effect.Effect<Lazy, TensorError> =>
-  Effect.flatMap(log(self), (t) => div(t, Math.LN2))
+  Effect.gen(function* () {
+    const t = yield* log(self)
+    return yield* div(t, yield* constantLike(t, Math.LN2))
+  })
 
 /**
  * Elementwise base-10 logarithm.
@@ -933,7 +958,10 @@ export const log2 = (self: Any): Effect.Effect<Lazy, TensorError> =>
  * @category elementwise
  */
 export const log10 = (self: Any): Effect.Effect<Lazy, TensorError> =>
-  Effect.flatMap(log(self), (t) => div(t, Math.LN10))
+  Effect.gen(function* () {
+    const t = yield* log(self)
+    return yield* div(t, yield* constantLike(t, Math.LN10))
+  })
 
 /**
  * Elementwise hyperbolic sine, `(exp(x) - exp(-x)) / 2`.
@@ -945,7 +973,7 @@ export const sinh = (self: Any): Effect.Effect<Lazy, TensorError> =>
   Effect.gen(function* () {
     const e = yield* exp(self)
     const ne = yield* exp(yield* neg(self))
-    return yield* div(yield* sub(e, ne), 2)
+    return yield* div(yield* sub(e, ne), yield* constantLike(e, 2))
   })
 
 /**
@@ -958,7 +986,7 @@ export const cosh = (self: Any): Effect.Effect<Lazy, TensorError> =>
   Effect.gen(function* () {
     const e = yield* exp(self)
     const ne = yield* exp(yield* neg(self))
-    return yield* div(yield* add(e, ne), 2)
+    return yield* div(yield* add(e, ne), yield* constantLike(e, 2))
   })
 
 /**
@@ -979,11 +1007,11 @@ export const tan = (self: Any): Effect.Effect<Lazy, TensorError> =>
  * @category elementwise
  */
 export const ne: {
-  (other: TensorOrScalar): (self: Any) => Effect.Effect<Lazy, TensorError>
-  (self: Any, other: TensorOrScalar): Effect.Effect<Lazy, TensorError>
+  (other: Any): (self: Any) => Effect.Effect<Lazy, TensorError>
+  (self: Any, other: Any): Effect.Effect<Lazy, TensorError>
 } = dual(
   2,
-  (self: Any, other: TensorOrScalar): Effect.Effect<Lazy, TensorError> =>
+  (self: Any, other: Any): Effect.Effect<Lazy, TensorError> =>
     Effect.gen(function* () {
       return yield* maximum(yield* lt(self, other), yield* gt(self, other))
     })
@@ -1012,7 +1040,8 @@ export const logicalOr = binaryOp("logicalOr", (a, b) => a.maximum(b))
  * @since 0.1.0
  * @category elementwise
  */
-export const logicalNot = (self: Any): Effect.Effect<Lazy, TensorError> => eq(self, 0)
+export const logicalNot = (self: Any): Effect.Effect<Lazy, TensorError> =>
+  Effect.flatMap(constantLike(self, 0), (zero) => eq(self, zero))
 
 /**
  * Elementwise remainder of the division `self / other`, following the sign
@@ -1022,11 +1051,11 @@ export const logicalNot = (self: Any): Effect.Effect<Lazy, TensorError> => eq(se
  * @category elementwise
  */
 export const remainder: {
-  (other: TensorOrScalar): (self: Any) => Effect.Effect<Lazy, TensorError>
-  (self: Any, other: TensorOrScalar): Effect.Effect<Lazy, TensorError>
+  (other: Any): (self: Any) => Effect.Effect<Lazy, TensorError>
+  (self: Any, other: Any): Effect.Effect<Lazy, TensorError>
 } = dual(
   2,
-  (self: Any, other: TensorOrScalar): Effect.Effect<Lazy, TensorError> =>
+  (self: Any, other: Any): Effect.Effect<Lazy, TensorError> =>
     Effect.gen(function* () {
       const q = yield* floor(yield* div(self, other))
       return yield* sub(self, yield* mul(q, other))
@@ -1042,34 +1071,26 @@ export const remainder: {
  * @category elementwise
  */
 export const where: {
-  (a: TensorOrScalar, b: TensorOrScalar): (cond: Any) => Effect.Effect<Lazy, TensorError>
-  (cond: Any, a: TensorOrScalar, b: TensorOrScalar): Effect.Effect<Lazy, TensorError>
+  (a: Any, b: Any): (cond: Any) => Effect.Effect<Lazy, TensorError>
+  (cond: Any, a: Any, b: Any): Effect.Effect<Lazy, TensorError>
 } = dual(
   3,
-  (cond: Any, a: TensorOrScalar, b: TensorOrScalar): Effect.Effect<Lazy, TensorError> =>
+  (cond: Any, a: Any, b: Any): Effect.Effect<Lazy, TensorError> =>
     Effect.try({
       try: () => {
         if (cond.dtype !== "u8") {
           throw new Error(`where: condition must be u8, got ${cond.dtype}`)
         }
-        const ref = typeof a === "number" ? (typeof b === "number" ? undefined : b) : a
-        if (ref === undefined) {
-          throw new Error("where: at least one of a and b must be a tensor")
+        checkCompatible("where", a, b)
+        if (cond.device !== a.device) {
+          throw new Error(`where: device mismatch, got ${cond.device} and ${a.device}`)
         }
-        if (cond.device !== ref.device) {
-          throw new Error(`where: device mismatch, got ${cond.device} and ${ref.device}`)
-        }
-        if (typeof a !== "number" && typeof b !== "number") {
-          checkCompatible("where", a, b)
-        }
-        const lhs = liftOperand(ref, a)
-        const rhs = liftOperand(ref, b)
         const shape = broadcastShapes(
           "where",
-          broadcastShapes("where", cond.shape, lhs.shape),
-          rhs.shape
+          broadcastShapes("where", cond.shape, a.shape),
+          b.shape
         )
-        return makeLazy(cond.lazy.whereCond(lhs.lazy, rhs.lazy), shape, ref.dtype, ref.device)
+        return makeLazy(cond.lazy.whereCond(a.lazy, b.lazy), shape, a.dtype, a.device)
       },
       catch: (error) =>
         new TensorError({ op: "where", message: error instanceof Error ? error.message : String(error) })
@@ -1085,8 +1106,9 @@ export const where: {
  */
 export const sigmoid = (self: Any): Effect.Effect<Lazy, TensorError> =>
   Effect.gen(function* () {
-    const t = yield* tanh(yield* div(self, 2))
-    return yield* add(yield* div(t, 2), 0.5)
+    const half = yield* constantLike(self, 2)
+    const t = yield* tanh(yield* div(self, half))
+    return yield* add(yield* div(t, half), yield* constantLike(self, 0.5))
   })
 
 /**
@@ -1222,7 +1244,7 @@ export const silu = (self: Any): Effect.Effect<Lazy, TensorError> =>
  */
 export const softplus = (self: Any): Effect.Effect<Lazy, TensorError> =>
   Effect.gen(function* () {
-    const head = yield* maximum(self, 0)
+    const head = yield* maximum(self, yield* constantLike(self, 0))
     const tail = yield* log1p(yield* exp(yield* neg(yield* abs(self))))
     return yield* add(head, tail)
   })
@@ -1249,8 +1271,8 @@ export const elu = dualOptions(
   (self: Any, options: EluOptions = {}): Effect.Effect<Lazy, TensorError> =>
     Effect.gen(function* () {
       const alpha = options.alpha ?? 1
-      const negative = yield* mul(yield* expm1(self), alpha)
-      return yield* where(yield* gt(self, 0), self, negative)
+      const negative = yield* mul(yield* expm1(self), yield* constantLike(self, alpha))
+      return yield* where(yield* gt(self, yield* constantLike(self, 0)), self, negative)
     })
 )
 
@@ -1273,7 +1295,7 @@ export interface LeakyReluOptions {
 export const leakyRelu = dualOptions(
   (self: Any, options: LeakyReluOptions = {}): Effect.Effect<Lazy, TensorError> =>
     Effect.gen(function* () {
-      return yield* maximum(self, yield* mul(self, options.negativeSlope ?? 0.01))
+      return yield* maximum(self, yield* mul(self, yield* constantLike(self, options.negativeSlope ?? 0.01)))
     })
 )
 
@@ -1301,10 +1323,19 @@ export const gelu = dualOptions(
     Effect.gen(function* () {
       if (options.approximate === "tanh") {
         const c = Math.sqrt(2 / Math.PI)
-        const inner = yield* mul(yield* add(self, yield* mul(yield* pow(self, 3), 0.044715)), c)
-        return yield* mul(yield* mul(self, 0.5), yield* add(yield* tanh(inner), 1))
+        const inner = yield* mul(
+          yield* add(self, yield* mul(yield* pow(self, 3), yield* constantLike(self, 0.044715))),
+          yield* constantLike(self, c)
+        )
+        return yield* mul(
+          yield* mul(self, yield* constantLike(self, 0.5)),
+          yield* add(yield* tanh(inner), yield* constantLike(self, 1))
+        )
       }
-      return yield* mul(yield* mul(self, 0.5), yield* add(yield* erf(yield* div(self, Math.SQRT2)), 1))
+      return yield* mul(
+        yield* mul(self, yield* constantLike(self, 0.5)),
+        yield* add(yield* erf(yield* div(self, yield* constantLike(self, Math.SQRT2))), yield* constantLike(self, 1))
+      )
     })
 )
 
@@ -1343,8 +1374,8 @@ export const clamp = dualOptions(
         return yield* new TensorError({ op: "clamp", message: "clamp: at least one of min and max is required" })
       }
       let out: Any = self
-      if (options.min !== undefined) out = yield* maximum(out, options.min)
-      if (options.max !== undefined) out = yield* minimum(out, options.max)
+      if (options.min !== undefined) out = yield* maximum(out, yield* constantLike(self, options.min))
+      if (options.max !== undefined) out = yield* minimum(out, yield* constantLike(self, options.max))
       return out as Lazy
     })
 )
@@ -1396,10 +1427,17 @@ export const dropout = dualOptions(
         })
       }
       if (p === 0) {
-        return yield* add(self, 0)
+        return yield* add(self, yield* constantLike(self, 0))
       }
-      const mask = yield* ge(yield* uniform(self.shape, { dtype: self.dtype === "f64" ? "f64" : "f32" }), p)
-      return yield* where(mask, yield* div(self, 1 - p), 0)
+      const mask = yield* ge(
+        yield* uniform(self.shape, { dtype: self.dtype === "f64" ? "f64" : "f32" }),
+        yield* constantLike(self, p)
+      )
+      return yield* where(
+        mask,
+        yield* div(self, yield* constantLike(self, 1 - p)),
+        yield* constantLike(self, 0)
+      )
     })
 )
 
@@ -1655,7 +1693,7 @@ export const variance = dualOptions(
       const m = yield* mean(self, { dims: normalized, keepdims: true })
       const centered = yield* sub(self, m)
       const ss = yield* sum(yield* square(centered), { dims: normalized, keepdims })
-      return yield* div(ss, count - correction)
+      return yield* div(ss, yield* constantLike(ss, count - correction))
     })
 )
 
@@ -2401,7 +2439,8 @@ export const flip = (
     let cur: Any = self
     for (const d of normalized) {
       const n = self.shape[d]
-      const idx = yield* add(yield* mul(yield* arange(n, undefined, { dtype: "i64" }), -1), n - 1)
+      const r = yield* arange(n, undefined, { dtype: "i64" })
+      const idx = yield* add(yield* mul(r, yield* constantLike(r, -1)), yield* constantLike(r, n - 1))
       cur = yield* take(cur, idx, { dim: d })
     }
     return cur as Lazy
@@ -2550,7 +2589,7 @@ export const embedding = (
     let out: Any = yield* take(weight, flat, { dim: 0 })
     if (paddingIndex !== undefined) {
       const mask = yield* broadcastTo(
-        yield* reshape(yield* cast(yield* eq(flat, paddingIndex), weight.dtype), [n, 1]),
+        yield* reshape(yield* cast(yield* eq(flat, yield* constantLike(flat, paddingIndex)), weight.dtype), [n, 1]),
         [n, hidden]
       )
       const stopped = makeLazy(out.lazy.stopGradient(), out.shape, out.dtype, out.device)
@@ -2573,9 +2612,9 @@ const triangleMask = (
     const n = self.shape[self.shape.length - 1]
     const rows = yield* reshape(yield* arange(m, undefined, { dtype: "i64" }), [m, 1])
     const cols = yield* reshape(yield* arange(n, undefined, { dtype: "i64" }), [1, n])
-    const shifted = yield* add(rows, diagonal)
+    const shifted = yield* add(rows, yield* constantLike(rows, diagonal))
     const mask = keepUpper ? yield* ge(cols, shifted) : yield* le(cols, shifted)
-    return yield* where(mask, self, 0)
+    return yield* where(mask, self, yield* constantLike(self, 0))
   })
 
 /**
@@ -2843,7 +2882,7 @@ const dilateDim = (
 ): Effect.Effect<Lazy, TensorError, CurrentDevice> =>
   Effect.gen(function* () {
     if (factor === 1) {
-      return yield* add(self, 0)
+      return yield* add(self, yield* constantLike(self, 0))
     }
     const n = self.shape[dim]
     const widened = yield* unsqueeze(self, dim + 1)

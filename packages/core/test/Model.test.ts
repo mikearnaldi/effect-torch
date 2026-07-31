@@ -3,7 +3,7 @@ import { Effect } from "effect"
 import * as fs from "node:fs"
 import * as os from "node:os"
 import * as path from "node:path"
-import { Gradient, Loss, Model, Optimizer, Tensor } from "../src/index.ts"
+import { Gradient, LearningRate, Loss, Model, Optimizer, Tensor } from "../src/index.ts"
 import { deep, floats, onDevices } from "./utils/devices.ts"
 
 const tmpdir = Effect.sync(() => fs.mkdtempSync(path.join(os.tmpdir(), "effect-torch-")))
@@ -761,7 +761,8 @@ onDevices("Model", () => (it) => {
         const y = yield* Tensor.fromTypedArray(floats([0, 1, 1, 0]), [4, 1])
         let steps = 0
         const { loss } = yield* Model.train(model, {
-          optimizer: Optimizer.adam({ lr: 0.1 }),
+          optimizer: Optimizer.adam(),
+          lr: LearningRate.constant(0.1),
           loss: Loss.mse,
           data: { input: x, target: y },
           stop: ({ step, loss }) => loss < 0.2 || step >= 2500,
@@ -779,7 +780,8 @@ onDevices("Model", () => (it) => {
         const y = yield* Tensor.fromTypedArray(floats([1, 0]), [2, 1])
         let patience = 3
         const { loss } = yield* Model.train(model, {
-          optimizer: Optimizer.sgd({ lr: 0.1 }),
+          optimizer: Optimizer.sgd(),
+          lr: LearningRate.constant(0.1),
           loss: Loss.mse,
           data: { input: x, target: y },
           stop: () => --patience === 0
@@ -797,7 +799,8 @@ onDevices("Model", () => (it) => {
         const x = yield* Tensor.fromTypedArray(floats([0, 0, 0, 1, 1, 0, 1, 1]), [4, 2])
         const y = yield* Tensor.fromTypedArray(floats([0, 1, 1, 0]), [4, 1])
         const { params, loss } = yield* Model.train(model, {
-          optimizer: Optimizer.adam({ lr: 0.1 }),
+          optimizer: Optimizer.adam(),
+          lr: LearningRate.constant(0.1),
           loss: Loss.mse,
           data: { input: x, target: y },
           stop: ({ step }) => step >= 2500
@@ -815,7 +818,8 @@ onDevices("Model", () => (it) => {
         const y = yield* Tensor.fromTypedArray(floats([1, 0]), [2, 1])
         const seen: Array<Model.TrainStep> = []
         yield* Model.train(model, {
-          optimizer: Optimizer.sgd({ lr: 0.1 }),
+          optimizer: Optimizer.sgd(),
+          lr: LearningRate.constant(0.1),
           loss: Loss.mse,
           data: { input: x, target: y },
           stop: ({ step }) => step >= 10,
@@ -836,7 +840,8 @@ onDevices("Model", () => (it) => {
         ] as const
         const drawn: Array<number> = []
         yield* Model.train(model, {
-          optimizer: Optimizer.sgd({ lr: 0.1 }),
+          optimizer: Optimizer.sgd(),
+          lr: LearningRate.constant(0.1),
           loss: Loss.mse,
           data: (step) =>
             Effect.gen(function* () {
@@ -868,7 +873,8 @@ onDevices("Model", () => (it) => {
           })
         const before = yield* lossOf(initial)
         const { params, loss } = yield* Model.train(model, {
-          optimizer: Optimizer.adam({ lr: 0.1 }),
+          optimizer: Optimizer.adam(),
+          lr: LearningRate.constant(0.1),
           loss: Loss.mse,
           data: { input: x, target: y },
           stop: ({ step }) => step >= 200,

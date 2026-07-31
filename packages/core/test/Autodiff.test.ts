@@ -57,10 +57,10 @@ onDevices("Autodiff", () => (it) => {
         yield* gradcheck(sumOf((x) => Tensor.cos(x)), [0.5, 1, 2], [3])
         yield* gradcheck(sumOf((x) => Tensor.tanh(x)), [0.5, -1, 2], [3])
         yield* gradcheck(sumOf((x) => Tensor.relu(x)), [0.5, -1, 2], [3])
-        yield* gradcheck(sumOf((x) => Tensor.maximum(x, 0.25)), [0.5, -1, 2], [3])
-        yield* gradcheck(sumOf((x) => Tensor.minimum(x, 0.25)), [0.5, -1, 2], [3])
+        yield* gradcheck(sumOf((x) => Effect.flatMap(Tensor.constantLike(x, 0.25), (c) => Tensor.maximum(x, c))), [0.5, -1, 2], [3])
+        yield* gradcheck(sumOf((x) => Effect.flatMap(Tensor.constantLike(x, 0.25), (c) => Tensor.minimum(x, c))), [0.5, -1, 2], [3])
         yield* gradcheck(sumOf((x) => Tensor.sigmoid(x)), [0.5, -1, 2], [3])
-        yield* gradcheck(sumOf((x) => Loss.mse(x, 1)), [0.5, -1, 2], [3])
+        yield* gradcheck(sumOf((x) => Effect.flatMap(Tensor.constantLike(x, 1), (t) => Loss.mse(x, t))), [0.5, -1, 2], [3])
         yield* gradcheck(sumOf((x) => Tensor.pow(x, 3)), [0.5, 1, 2], [3])
         yield* gradcheck(sumOf((x) => Tensor.erf(x)), [0.5, -1, 2], [3])
         yield* gradcheck(sumOf((x) => Tensor.floor(x)), [0.5, -1.3, 2.7], [3])
@@ -77,7 +77,7 @@ onDevices("Autodiff", () => (it) => {
         yield* gradcheck(sumOf((x) => Tensor.sinh(x)), [0.5, -1, 2], [3])
         yield* gradcheck(sumOf((x) => Tensor.cosh(x)), [0.5, -1, 2], [3])
         yield* gradcheck(sumOf((x) => Tensor.tan(x)), [0.5, -1, 1.2], [3])
-        yield* gradcheck(sumOf((x) => Tensor.remainder(x, 3)), [0.5, -1.3, 2.7], [3])
+        yield* gradcheck(sumOf((x) => Effect.flatMap(Tensor.constantLike(x, 3), (c) => Tensor.remainder(x, c))), [0.5, -1.3, 2.7], [3])
       })
     )
 
@@ -260,7 +260,7 @@ onDevices("Autodiff", () => (it) => {
       Effect.gen(function* () {
         const f = (x: Tensor.Any) =>
           Effect.gen(function* () {
-            return yield* Tensor.mul(yield* Tensor.sin(x), yield* Tensor.add(x, 1))
+            return yield* Tensor.mul(yield* Tensor.sin(x), yield* Tensor.add(x, yield* Tensor.constantLike(x, 1)))
           })
         const x = yield* f32([0.5, 1])
         const plain = yield* f(x)
@@ -405,7 +405,7 @@ onDevices("Autodiff", () => (it) => {
           yield* perBatch((s) => Tensor.gather(s, gatherIdx, { dim: 1 }))
         )
 
-        const src = yield* Tensor.mul(x, 2)
+        const src = yield* Tensor.mul(x, yield* Tensor.constantLike(x, 2))
         const scattered = yield* Gradient.vmap(
           yield* Tensor.scatterAdd(x, gatherIdx, src, { dim: 1 }),
           x,
@@ -416,7 +416,7 @@ onDevices("Autodiff", () => (it) => {
           yield* values(scattered),
           yield* perBatch((s) =>
             Effect.gen(function* () {
-              return yield* Tensor.scatterAdd(s, gatherIdx, yield* Tensor.mul(s, 2), { dim: 1 })
+              return yield* Tensor.scatterAdd(s, gatherIdx, yield* Tensor.mul(s, yield* Tensor.constantLike(s, 2)), { dim: 1 })
             })
           )
         )

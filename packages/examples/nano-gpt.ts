@@ -1,6 +1,6 @@
 import { Effect } from "effect"
 import { NodeRuntime } from "@effect/platform-node"
-import { Device, Loss, Model, Optimizer, Tensor } from "@effect-torch/core"
+import { Device, LearningRate, Loss, Model, Optimizer, Tensor } from "@effect-torch/core"
 
 // A character-level GPT trained on a few KB of public-domain verse:
 // token and position embeddings fanned into one stream, pre-norm
@@ -139,11 +139,12 @@ const program = Effect.gen(function* () {
   const model = yield* createGpt
   yield* Effect.log(`${model.names.length} tensors of parameters`)
 
-  const optimizer = Optimizer.adamW({ lr: LR })
+  const optimizer = Optimizer.adamW()
   const params0 = yield* model.init
   const started = Date.now()
   const trained = yield* Model.train(model, {
     optimizer,
+    lr: LearningRate.constant(LR),
     loss: Loss.crossEntropy,
     data: () => sampleBatch,
     stop: ({ step }) => step >= STEPS,
