@@ -3,7 +3,7 @@ import { Effect } from "effect"
 import * as fs from "node:fs"
 import * as os from "node:os"
 import * as path from "node:path"
-import { Gradient, LearningRate, Loss, Model, Optimizer, Tensor } from "../src/index.ts"
+import { Gradient, Model, Tensor } from "../src/index.ts"
 import { deep, floats, onDevices } from "./utils/devices.ts"
 
 const tmpdir = Effect.sync(() => fs.mkdtempSync(path.join(os.tmpdir(), "effect-torch-")))
@@ -749,139 +749,6 @@ onDevices("Model", () => (it) => {
         const error = yield* Effect.flip(narrow.forward(params, x))
         expect(error._tag).toBe("TensorError")
         expect(error.op).toBe("matmul")
-      })
-    )
-  })
-
-  describe("stop policy", () => {
-    it.effect("stops on a loss target", () =>
-      Effect.gen(function* () {
-        const model = yield* mlp
-        const x = yield* Tensor.fromTypedArray(floats([0, 0, 0, 1, 1, 0, 1, 1]), [4, 2])
-        const y = yield* Tensor.fromTypedArray(floats([0, 1, 1, 0]), [4, 1])
-        let steps = 0
-        const { loss } = yield* Model.train(model, {
-          optimizer: Optimizer.adam(),
-          lr: LearningRate.constant(0.1),
-          loss: Loss.mse,
-          data: { input: x, target: y },
-          stop: ({ step, loss }) => loss < 0.2 || step >= 2500,
-          onStep: () => Effect.sync(() => steps++)
-        })
-        expect(loss).toBeLessThan(0.2)
-        expect(steps).toBeLessThan(2500)
-      })
-    )
-
-    it.effect("stops on any condition — a step count, a loss target, or external state", () =>
-      Effect.gen(function* () {
-        const model = yield* mlp
-        const x = yield* Tensor.fromTypedArray(floats([0, 1, 1, 0]), [2, 2])
-        const y = yield* Tensor.fromTypedArray(floats([1, 0]), [2, 1])
-        let patience = 3
-        const { loss } = yield* Model.train(model, {
-          optimizer: Optimizer.sgd(),
-          lr: LearningRate.constant(0.1),
-          loss: Loss.mse,
-          data: { input: x, target: y },
-          stop: () => --patience === 0
-        })
-        expect(patience).toBe(0)
-        expect(Number.isFinite(loss)).toBe(true)
-      })
-    )
-  })
-
-  describe("train", () => {
-    it.effect("trains a chained MLP on xor to convergence", () =>
-      Effect.gen(function* () {
-        const model = yield* mlp
-        const x = yield* Tensor.fromTypedArray(floats([0, 0, 0, 1, 1, 0, 1, 1]), [4, 2])
-        const y = yield* Tensor.fromTypedArray(floats([0, 1, 1, 0]), [4, 1])
-        const { params, loss } = yield* Model.train(model, {
-          optimizer: Optimizer.adam(),
-          lr: LearningRate.constant(0.1),
-          loss: Loss.mse,
-          data: { input: x, target: y },
-          stop: ({ step }) => step >= 2500
-        })
-        expect(loss).toBeLessThan(0.05)
-        const [pred] = yield* Tensor.compute([yield* model.forward(params, x)])
-        expect((yield* values(pred)).map((v) => (v > 0.5 ? 1 : 0))).toEqual([0, 1, 1, 0])
-      })
-    )
-
-    it.effect("reports every step to onStep in order", () =>
-      Effect.gen(function* () {
-        const model = yield* mlp
-        const x = yield* Tensor.fromTypedArray(floats([0, 1, 1, 0]), [2, 2])
-        const y = yield* Tensor.fromTypedArray(floats([1, 0]), [2, 1])
-        const seen: Array<Model.TrainStep> = []
-        yield* Model.train(model, {
-          optimizer: Optimizer.sgd(),
-          lr: LearningRate.constant(0.1),
-          loss: Loss.mse,
-          data: { input: x, target: y },
-          stop: ({ step }) => step >= 10,
-          onStep: (info) => Effect.sync(() => seen.push(info))
-        })
-        expect(seen.map(({ step }) => step)).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10])
-        expect(seen.every(({ loss }) => Number.isFinite(loss))).toBe(true)
-      })
-    )
-
-    it.effect("a data sampler is re-drawn with the step number every step", () =>
-      Effect.gen(function* () {
-        const model = yield* mlp
-        const batches = [
-          [[0, 1, 1, 0], [1, 0]],
-          [[1, 1, 0, 0], [0, 1]],
-          [[0, 0, 1, 1], [0, 1]]
-        ] as const
-        const drawn: Array<number> = []
-        yield* Model.train(model, {
-          optimizer: Optimizer.sgd(),
-          lr: LearningRate.constant(0.1),
-          loss: Loss.mse,
-          data: (step) =>
-            Effect.gen(function* () {
-              drawn.push(step)
-              const [xs, ys] = batches[(step - 1) % batches.length]
-              return {
-                input: yield* Tensor.fromTypedArray(floats([...xs]), [2, 2]),
-                target: yield* Tensor.fromTypedArray(floats([...ys]), [2, 1])
-              }
-            }),
-          stop: ({ step }) => step >= 7
-        })
-        expect(drawn).toEqual([1, 2, 3, 4, 5, 6, 7])
-      })
-    )
-
-    it.effect("trains from explicit initial parameters", () =>
-      Effect.gen(function* () {
-        const model = yield* mlp
-        const x = yield* Tensor.fromTypedArray(floats([0, 0, 0, 1, 1, 0, 1, 1]), [4, 2])
-        const y = yield* Tensor.fromTypedArray(floats([0, 1, 1, 0]), [4, 1])
-        const initial = yield* Tensor.compute(yield* model.init)
-        const lossOf = (params: Model.Params) =>
-          Effect.gen(function* () {
-            const [value] = yield* Tensor.compute([
-              yield* Loss.mse(yield* model.forward(params, x), y)
-            ])
-            return (yield* values(value))[0]
-          })
-        const before = yield* lossOf(initial)
-        const { params, loss } = yield* Model.train(model, {
-          optimizer: Optimizer.adam(),
-          lr: LearningRate.constant(0.1),
-          loss: Loss.mse,
-          data: { input: x, target: y },
-          stop: ({ step }) => step >= 200,
-          params: initial
-        })
-        expect(loss).toBeLessThan(before)
-        expect(yield* lossOf(params)).toBeLessThan(before)
       })
     )
   })

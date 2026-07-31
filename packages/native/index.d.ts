@@ -6,6 +6,12 @@ export declare class CancellationToken {
   get cancelled(): boolean
 }
 
+export declare class CompiledProgram {
+  get signature(): string
+  dispose(): void
+  run(inputs: Array<NativeTensor>, scalars: Array<number>, token?: CancellationToken | undefined | null): Promise<Array<NativeTensor>>
+}
+
 export declare class LazyTensor {
   dispose(): void
   static zeros(shape: Array<number>, dtype?: NativeDType | undefined | null, device?: string | undefined | null): LazyTensor
@@ -18,6 +24,8 @@ export declare class LazyTensor {
   static constant(value: number, dtype?: NativeDType | undefined | null, device?: string | undefined | null): LazyTensor
   static fromBytes(data: Uint8Array, shape: Array<number>, dtype?: NativeDType | undefined | null, device?: string | undefined | null): LazyTensor
   static fromMaterialized(tensor: NativeTensor): LazyTensor
+  static input(slot: number, shape: Array<number>, dtype?: NativeDType | undefined | null, device?: string | undefined | null): LazyTensor
+  static scalarInput(slot: number, dtype?: NativeDType | undefined | null, device?: string | undefined | null): LazyTensor
   add(other: LazyTensor): LazyTensor
   sub(other: LazyTensor): LazyTensor
   mul(other: LazyTensor): LazyTensor
@@ -87,6 +95,8 @@ export declare class NativeTensor {
   dispose(): void
   readback(token?: CancellationToken | undefined | null): Promise<ArrayBuffer>
 }
+
+export declare function compile(roots: Array<LazyTensor>): CompiledProgram
 
 export declare function evalLazy(tensors: Array<LazyTensor>, token?: CancellationToken | undefined | null): Promise<Array<NativeTensor>>
 

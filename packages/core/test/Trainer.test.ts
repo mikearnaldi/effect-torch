@@ -1,0 +1,284 @@
+import { describe, expect } from "@effect/vitest"
+import { Effect } from "effect"
+import { LearningRate, Loss, Model, Optimizer, Tensor, Trainer } from "../src/index.ts"
+import { floats, onDevices } from "./utils/devices.ts"
+
+const values = (t: Tensor.Any) => Tensor.toNumberArray(t)
+
+const mlp = Effect.gen(function* () {
+  return yield* Model.chain(
+    yield* Model.linear("fc1", 2, 8),
+    yield* Model.tanh,
+    yield* Model.linear("fc2", 8, 1),
+    yield* Model.sigmoid
+  )
+})
+
+const xor = Effect.gen(function* () {
+  const input = yield* Tensor.fromTypedArray(floats([0, 0, 0, 1, 1, 0, 1, 1]), [4, 2])
+  const target = yield* Tensor.fromTypedArray(floats([0, 1, 1, 0]), [4, 1])
+  return { input, target } as const
+})
+
+onDevices("Trainer", () => (it) => {
+  describe("stop policy", () => {
+    it.effect("stops on a loss target", () =>
+      Effect.gen(function* () {
+        const model = yield* mlp
+        const data = yield* xor
+        let steps = 0
+        const trainer = yield* Trainer.make(model, {
+          optimizer: yield* Optimizer.adam(),
+          lr: LearningRate.constant(0.1),
+          loss: Loss.mse,
+          data,
+          stop: ({ step, loss }) => loss < 0.2 || step >= 2500,
+          onStep: () => Effect.sync(() => steps++)
+        })
+        const { loss } = yield* trainer.train()
+        expect(loss).toBeLessThan(0.2)
+        expect(steps).toBeLessThan(2500)
+      })
+    )
+
+    it.effect("stops on any condition — a step count, a loss target, or external state", () =>
+      Effect.gen(function* () {
+        const model = yield* mlp
+        const input = yield* Tensor.fromTypedArray(floats([0, 1, 1, 0]), [2, 2])
+        const target = yield* Tensor.fromTypedArray(floats([1, 0]), [2, 1])
+        let patience = 3
+        const trainer = yield* Trainer.make(model, {
+          optimizer: yield* Optimizer.sgd(),
+          lr: LearningRate.constant(0.1),
+          loss: Loss.mse,
+          data: { input, target },
+          stop: () => --patience === 0
+        })
+        const { loss } = yield* trainer.train()
+        expect(patience).toBe(0)
+        expect(Number.isFinite(loss)).toBe(true)
+      })
+    )
+  })
+
+  describe("train", () => {
+    it.effect("trains a chained MLP on xor to convergence", () =>
+      Effect.gen(function* () {
+        const model = yield* mlp
+        const data = yield* xor
+        const trainer = yield* Trainer.make(model, {
+          optimizer: yield* Optimizer.adam(),
+          lr: LearningRate.constant(0.1),
+          loss: Loss.mse,
+          data,
+          stop: ({ step }) => step >= 2500
+        })
+        const { params, loss } = yield* trainer.train()
+        expect(loss).toBeLessThan(0.05)
+        const [pred] = yield* Tensor.compute([yield* model.forward(params, data.input)])
+        expect((yield* values(pred)).map((v) => (v > 0.5 ? 1 : 0))).toEqual([0, 1, 1, 0])
+      })
+    )
+
+    it.effect("reports every step to onStep in order", () =>
+      Effect.gen(function* () {
+        const model = yield* mlp
+        const input = yield* Tensor.fromTypedArray(floats([0, 1, 1, 0]), [2, 2])
+        const target = yield* Tensor.fromTypedArray(floats([1, 0]), [2, 1])
+        const seen: Array<Trainer.TrainStep> = []
+        const trainer = yield* Trainer.make(model, {
+          optimizer: yield* Optimizer.sgd(),
+          lr: LearningRate.constant(0.1),
+          loss: Loss.mse,
+          data: { input, target },
+          stop: ({ step }) => step >= 10,
+          onStep: (info) => Effect.sync(() => seen.push(info))
+        })
+        yield* trainer.train()
+        expect(seen.map(({ step }) => step)).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10])
+        expect(seen.every(({ loss }) => Number.isFinite(loss))).toBe(true)
+      })
+    )
+
+    it.effect("a data sampler is re-drawn with the step number every step", () =>
+      Effect.gen(function* () {
+        const model = yield* mlp
+        const batches = [
+          [[0, 1, 1, 0], [1, 0]],
+          [[1, 1, 0, 0], [0, 1]],
+          [[0, 0, 1, 1], [0, 1]]
+        ] as const
+        const drawn: Array<number> = []
+        const trainer = yield* Trainer.make(model, {
+          optimizer: yield* Optimizer.sgd(),
+          lr: LearningRate.constant(0.1),
+          loss: Loss.mse,
+          data: (step) =>
+            Effect.gen(function* () {
+              drawn.push(step)
+              const [xs, ys] = batches[(step - 1) % batches.length]
+              return {
+                input: yield* Tensor.fromTypedArray(floats([...xs]), [2, 2]),
+                target: yield* Tensor.fromTypedArray(floats([...ys]), [2, 1])
+              }
+            }),
+          stop: ({ step }) => step >= 7
+        })
+        yield* trainer.train()
+        expect(drawn).toEqual([1, 2, 3, 4, 5, 6, 7])
+      })
+    )
+
+    it.effect("trains from explicit initial parameters", () =>
+      Effect.gen(function* () {
+        const model = yield* mlp
+        const data = yield* xor
+        const initial = yield* Tensor.compute(yield* model.init)
+        const lossOf = (params: Model.Params) =>
+          Effect.gen(function* () {
+            const [value] = yield* Tensor.compute([
+              yield* Loss.mse(yield* model.forward(params, data.input), data.target)
+            ])
+            return (yield* values(value))[0]
+          })
+        const before = yield* lossOf(initial)
+        const trainer = yield* Trainer.make(model, {
+          optimizer: yield* Optimizer.adam(),
+          lr: LearningRate.constant(0.1),
+          loss: Loss.mse,
+          data,
+          stop: ({ step }) => step >= 200
+        })
+        const { params, loss } = yield* trainer.train(initial)
+        expect(loss).toBeLessThan(before)
+        expect(yield* lossOf(params)).toBeLessThan(before)
+      })
+    )
+  })
+
+  describe("compiled", () => {
+    it.effect("agrees with the uncompiled loop step-for-step on a deterministic graph", () =>
+      Effect.gen(function* () {
+        const model = yield* mlp
+        const input = yield* Tensor.fromTypedArray(floats([0, 1, 1, 0]), [2, 2])
+        const target = yield* Tensor.fromTypedArray(floats([1, 0]), [2, 1])
+        const initial = yield* Tensor.compute(yield* model.init)
+        const config: Trainer.TrainConfig<Optimizer.SgdState, Tensor.TensorError> = {
+          optimizer: yield* Optimizer.sgd({ momentum: 0.9 }),
+          lr: LearningRate.constant(0.05),
+          loss: Loss.mse,
+          data: { input, target },
+          stop: ({ step }) => step >= 20
+        }
+        const reference = yield* (yield* Trainer.make(model, config)).train(initial)
+        const compiled = yield* Trainer.compile(yield* Trainer.make(model, config))
+        expect(Trainer.isCompiled(compiled)).toBe(true)
+        expect(Trainer.isCompiled(yield* Trainer.make(model, config))).toBe(false)
+        const traced = yield* compiled.train(initial)
+        expect(traced.loss).toBe(reference.loss)
+        for (let i = 0; i < reference.params.length; i++) {
+          expect(yield* values(traced.params[i])).toEqual(yield* values(reference.params[i]))
+        }
+        expect(compiled.stats()).toEqual({ cached: 1, compiled: 1 })
+      })
+    )
+
+    it.effect("agrees with the uncompiled loop under a learning-rate schedule", () =>
+      Effect.gen(function* () {
+        const model = yield* mlp
+        const data = yield* xor
+        const initial = yield* Tensor.compute(yield* model.init)
+        const config: Trainer.TrainConfig<Optimizer.AdamState, Tensor.TensorError> = {
+          optimizer: yield* Optimizer.adam(),
+          lr: LearningRate.cosine(0.1, { totalSteps: 30 }),
+          loss: Loss.mse,
+          data,
+          stop: ({ step }) => step >= 30
+        }
+        const reference = yield* (yield* Trainer.make(model, config)).train(initial)
+        const traced = yield* (yield* Trainer.compile(yield* Trainer.make(model, config))).train(initial)
+        expect(traced.loss).toBe(reference.loss)
+        for (let i = 0; i < reference.params.length; i++) {
+          expect(yield* values(traced.params[i])).toEqual(yield* values(reference.params[i]))
+        }
+      })
+    )
+
+    it.effect("trains xor to convergence through the compiled loop", () =>
+      Effect.gen(function* () {
+        const model = yield* mlp
+        const data = yield* xor
+        const trainer = yield* Trainer.compile(yield* Trainer.make(model, {
+          optimizer: yield* Optimizer.adam(),
+          lr: LearningRate.constant(0.1),
+          loss: Loss.mse,
+          data,
+          stop: ({ step }) => step >= 2500
+        }))
+        const { params, loss } = yield* trainer.train()
+        expect(loss).toBeLessThan(0.05)
+        const [pred] = yield* Tensor.compute([yield* model.forward(params, data.input)])
+        expect((yield* values(pred)).map((v) => (v > 0.5 ? 1 : 0))).toEqual([0, 1, 1, 0])
+        expect(trainer.stats()).toEqual({ cached: 1, compiled: 1 })
+      })
+    )
+
+    it.effect("recompiles when the batch signature changes", () =>
+      Effect.gen(function* () {
+        const model = yield* mlp
+        const small = {
+          input: yield* Tensor.fromTypedArray(floats([0, 1, 1, 0]), [2, 2]),
+          target: yield* Tensor.fromTypedArray(floats([1, 0]), [2, 1])
+        }
+        const large = yield* xor
+        const trainer = yield* Trainer.compile(yield* Trainer.make(model, {
+          optimizer: yield* Optimizer.sgd(),
+          lr: LearningRate.constant(0.1),
+          loss: Loss.mse,
+          data: (step) => Effect.succeed(step % 2 === 1 ? small : large),
+          stop: ({ step }) => step >= 6
+        }))
+        const { loss } = yield* trainer.train()
+        expect(Number.isFinite(loss)).toBe(true)
+        expect(trainer.stats()).toEqual({ cached: 2, compiled: 2 })
+      })
+    )
+
+    it.effect("reports every step to onStep, drawn fresh per step", () =>
+      Effect.gen(function* () {
+        const model = yield* mlp
+        const data = yield* xor
+        const seen: Array<Trainer.TrainStep> = []
+        const trainer = yield* Trainer.compile(yield* Trainer.make(model, {
+          optimizer: yield* Optimizer.sgd(),
+          lr: LearningRate.constant(0.1),
+          loss: Loss.mse,
+          data,
+          stop: ({ step }) => step >= 10,
+          onStep: (info) => Effect.sync(() => seen.push(info))
+        }))
+        yield* trainer.train()
+        expect(seen.map(({ step }) => step)).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10])
+        expect(seen.every(({ loss }) => Number.isFinite(loss))).toBe(true)
+      })
+    )
+
+    it.effect("dispose releases the cached programs", () =>
+      Effect.gen(function* () {
+        const model = yield* mlp
+        const data = yield* xor
+        const trainer = yield* Trainer.compile(yield* Trainer.make(model, {
+          optimizer: yield* Optimizer.sgd(),
+          lr: LearningRate.constant(0.1),
+          loss: Loss.mse,
+          data,
+          stop: ({ step }) => step >= 3
+        }))
+        yield* trainer.train()
+        expect(trainer.stats().cached).toBe(1)
+        yield* trainer.dispose()
+        expect(trainer.stats()).toEqual({ cached: 0, compiled: 1 })
+      })
+    )
+  })
+})

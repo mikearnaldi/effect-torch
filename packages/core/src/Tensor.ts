@@ -1,7 +1,8 @@
-import { Data, Effect } from "effect"
+import { Deferred, Data, Effect, Exit } from "effect"
 import { dual } from "effect/Function"
 import { pipeArguments, type Pipeable } from "effect/Pipeable"
 import native, {
+  type CompiledProgram as NativeCompiledProgramType,
   type LazyTensor as NativeLazyTensorType,
   type NativeDType,
   type NativeTensor as NativeTensorType
@@ -10,6 +11,7 @@ import { CurrentDevice, type DeviceKind } from "./Device.ts"
 
 const {
   CancellationToken,
+  compile: nativeCompile,
   evalLazy,
   LazyTensor: NativeLazyTensor,
   loadTensors,
@@ -109,6 +111,16 @@ export interface Concrete extends Any {
 }
 
 const TensorTypeId: unique symbol = Symbol.for("@effect-torch/core/Tensor")
+
+/**
+ * The native frozen-program handle behind compiled functions, models,
+ * and trainers. Internal to the library.
+ *
+ * @since 0.1.0
+ * @category compilation
+ * @internal
+ */
+export type NativeCompiledProgram = NativeCompiledProgramType
 
 /**
  * @since 0.1.0
@@ -3450,4 +3462,353 @@ export const load = (
     const [names, handles] = yield* fromNative("load", (token) => loadTensors(path, device, token))
     reportExternalMemory(handles.reduce((total, handle) => total + handle.bytes, 0))
     return Object.fromEntries(names.map((name, i) => [name, fromHandle(handles[i])]))
+  })
+
+/**
+ * Diagnostics over a compiled function's shape-keyed program cache: the
+ * number of programs currently cached and the total number of traces
+ * performed. A `compiled` count that grows without bound signals
+ * accidental shape polymorphism (feeding unbounded shape variants).
+ *
+ * @since 0.1.0
+ * @category compilation
+ */
+export interface CompileStats {
+  readonly cached: number
+  readonly compiled: number
+}
+
+/**
+ * Options for {@link compile}.
+ *
+ * @since 0.1.0
+ * @category compilation
+ */
+export interface CompileOptions {
+  /**
+   * Number of runtime scalar slots (a learning rate, a flag) declared
+   * after the tensor inputs. Scalars arrive as plain numbers at call
+   * time and appear inside the graph as 0-d f32 placeholder tensors.
+   * Defaults to 0.
+   */
+  readonly scalars?: number
+  /**
+   * Shape-cache capacity in programs. The first call with a new input
+   * signature (shapes, dtypes, device) traces and freezes a program;
+   * later calls with the same signature reuse it. Defaults to 32.
+   */
+  readonly cacheCapacity?: number
+}
+
+/**
+ * A traced graph builder frozen into a native program, called with
+ * materialized inputs and runtime scalars. The first call per input
+ * signature pays the trace; subsequent calls are a single async native
+ * evaluation each — no graph construction, no differentiation, no fusion
+ * rewrite. Concurrent calls are safe: the frozen graph is immutable and
+ * every call runs its own evaluator.
+ *
+ * @since 0.1.0
+ * @category compilation
+ */
+export interface CompiledFn<E = never, R = never> {
+  readonly call: (
+    inputs: ReadonlyArray<Any>,
+    scalars?: ReadonlyArray<number>
+  ) => Effect.Effect<Array<Concrete>, TensorError | E, R>
+  readonly stats: () => CompileStats
+  readonly dispose: () => Effect.Effect<void>
+}
+
+/**
+ * The shape-keyed program cache behind a compiled function or trainer.
+ * A bounded LRU (programs evicted past `capacity` are disposed) with
+ * single-flight tracing: concurrent misses on the same signature trace
+ * once and every waiter receives the same program. Owned by the compiled
+ * value — dropping the last reference makes the whole cache collectable.
+ * Internal to the library: the Trainer and Model modules share it with
+ * {@link compile}.
+ *
+ * @since 0.1.0
+ * @category compilation
+ * @internal
+ */
+export interface ProgramCache {
+  readonly capacity: number
+  readonly entries: Map<string, ProgramCacheEntry>
+  keys: Set<string>
+  compiled: number
+  warned: boolean
+}
+
+type ProgramCacheEntry =
+  | { readonly _tag: "ready"; readonly program: NativeCompiledProgramType }
+  | { readonly _tag: "pending"; readonly deferred: Deferred.Deferred<NativeCompiledProgramType, unknown> }
+
+/**
+ * @since 0.1.0
+ * @category compilation
+ * @internal
+ */
+export const makeProgramCache = (capacity: number = 32): ProgramCache => ({
+  capacity,
+  entries: new Map(),
+  keys: new Set(),
+  compiled: 0,
+  warned: false
+})
+
+/**
+ * @since 0.1.0
+ * @category compilation
+ * @internal
+ */
+export const programCacheStats = (cache: ProgramCache): CompileStats => ({
+  cached: cache.entries.size,
+  compiled: cache.compiled
+})
+
+/**
+ * @since 0.1.0
+ * @category compilation
+ * @internal
+ */
+export const disposeProgramCache = (cache: ProgramCache): Effect.Effect<void> =>
+  Effect.sync(() => {
+    for (const entry of cache.entries.values()) {
+      if (entry._tag === "ready") {
+        entry.program.dispose()
+      }
+    }
+    cache.entries.clear()
+    cache.keys.clear()
+  })
+
+const evictProgramCache = (cache: ProgramCache): void => {
+    while (cache.entries.size > cache.capacity) {
+      let oldest: string | undefined
+      for (const [key, entry] of cache.entries) {
+        if (entry._tag === "ready") {
+          oldest = key
+          break
+        }
+      }
+      if (oldest === undefined) {
+        return
+      }
+      const entry = cache.entries.get(oldest)
+      cache.entries.delete(oldest)
+      if (entry?._tag === "ready") {
+        entry.program.dispose()
+      }
+    }
+}
+
+/**
+ * Looks up the program for `key`, running `trace` once on a miss.
+ * Concurrent misses on the same key share one trace (single-flight): the
+ * first caller traces, the rest await the same deferred. A failed trace
+ * is not cached.
+ *
+ * @since 0.1.0
+ * @category compilation
+ * @internal
+ */
+export const cachedProgram = <E, R>(
+  cache: ProgramCache,
+  key: string,
+  trace: Effect.Effect<NativeCompiledProgramType, E, R>
+): Effect.Effect<NativeCompiledProgramType, TensorError | E, R> =>
+  Effect.suspend(() => {
+    const hit = cache.entries.get(key)
+    if (hit !== undefined) {
+      cache.entries.delete(key)
+      cache.entries.set(key, hit)
+      return hit._tag === "ready"
+        ? Effect.succeed(hit.program)
+        : Deferred.await(hit.deferred) as Effect.Effect<NativeCompiledProgramType, E>
+    }
+    return Effect.gen(function* () {
+      const deferred = yield* Deferred.make<NativeCompiledProgramType, unknown>()
+      cache.entries.set(key, { _tag: "pending", deferred })
+      cache.compiled++
+      const isNewSignature = !cache.keys.has(key)
+      if (isNewSignature) {
+        cache.keys.add(key)
+        if (!cache.warned && cache.keys.size > cache.capacity) {
+          cache.warned = true
+          yield* Effect.logWarning(
+            `compile: more than ${cache.capacity} distinct input signatures seen; programs will be re-traced on every cache eviction (check for accidental shape polymorphism)`
+          )
+        }
+      }
+      const exit = yield* Effect.exit(trace)
+      yield* Deferred.done(deferred, exit)
+      if (Exit.isFailure(exit)) {
+        cache.entries.delete(key)
+        return yield* Effect.failCause(exit.cause)
+      }
+      cache.entries.set(key, { _tag: "ready", program: exit.value })
+      evictProgramCache(cache)
+      return exit.value
+    })
+  })
+
+/**
+ * The cache key of a call: shapes, dtypes, and devices of the input
+ * tensors. Any change re-traces against the new signature.
+ *
+ * @since 0.1.0
+ * @category compilation
+ * @internal
+ */
+export const signatureOf = (inputs: ReadonlyArray<Any>): string =>
+  inputs.map((input) => `${input.shape.join("x")}:${input.dtype}:${input.device}`).join("|")
+
+/**
+ * Creates the placeholder leaf for one tensor argument of a traced graph,
+ * carrying the exemplar's shape, dtype, and device. Slot indexes are
+ * shared with scalar slots: every slot number is declared exactly once.
+ * Internal to the library — the Trainer module traces its step graph
+ * against these.
+ *
+ * @since 0.1.0
+ * @category compilation
+ * @internal
+ */
+export const makeInput = (slot: number, exemplar: Any): Effect.Effect<Lazy, TensorError> =>
+  Effect.try({
+    try: () =>
+      makeLazy(
+        NativeLazyTensor.input(slot, [...exemplar.shape], exemplar.dtype as NativeDType, exemplar.device),
+        exemplar.shape,
+        exemplar.dtype,
+        exemplar.device
+      ),
+    catch: (error) =>
+      new TensorError({ op: "input", message: error instanceof Error ? error.message : String(error) })
+  })
+
+/**
+ * Creates the placeholder leaf for one runtime scalar of a traced graph:
+ * a 0-d tensor whose value arrives as a plain number at call time.
+ * Internal to the library.
+ *
+ * @since 0.1.0
+ * @category compilation
+ * @internal
+ */
+export const makeScalarInput = (
+  slot: number,
+  dtype: DType,
+  device: DeviceKind
+): Effect.Effect<Lazy, TensorError> =>
+  Effect.try({
+    try: () => makeLazy(NativeLazyTensor.scalarInput(slot, dtype as NativeDType, device), [], dtype, device),
+    catch: (error) =>
+      new TensorError({ op: "scalarInput", message: error instanceof Error ? error.message : String(error) })
+  })
+
+/**
+ * Freezes traced roots into a native program: validates the slot
+ * declarations and runs the fusion rewrite once. The returned program is
+ * an immutable, concurrently callable executable.
+ *
+ * @since 0.1.0
+ * @category compilation
+ * @internal
+ */
+export const freezeProgram = (
+  roots: ReadonlyArray<Any>
+): Effect.Effect<NativeCompiledProgramType, TensorError> =>
+  Effect.try({
+    try: () => nativeCompile(roots.map((root) => root.lazy)),
+    catch: (error) =>
+      new TensorError({ op: "compile", message: error instanceof Error ? error.message : String(error) })
+  })
+
+/**
+ * Runs a frozen program: lazy inputs are materialized first, then one
+ * async native call binds the argument buffers and scalar values to the
+ * declared slots and evaluates the frozen graph in a single walk.
+ *
+ * @since 0.1.0
+ * @category compilation
+ * @internal
+ */
+export const runProgram = (
+  program: NativeCompiledProgramType,
+  inputs: ReadonlyArray<Any>,
+  scalars: ReadonlyArray<number> = []
+): Effect.Effect<Array<Concrete>, TensorError> =>
+  Effect.gen(function* () {
+    const concrete = yield* compute(inputs)
+    const handles = yield* fromNative("run", (token) =>
+      program.run(concrete.map((input) => input.materialized), [...scalars], token)
+    )
+    reportExternalMemory(handles.reduce((total, handle) => total + handle.bytes, 0))
+    return handles.map(fromHandle)
+  })
+
+/**
+ * Compiles a graph builder into a reusable executable, JAX-style. The
+ * builder runs once per input signature against placeholder leaves, and
+ * the traced graph — including any differentiation or optimizer update
+ * the builder performed — is frozen into a native program; calling the
+ * result binds materialized inputs and runtime scalars to the declared
+ * slots and evaluates the frozen graph in one walk, with exactly the
+ * observable behaviour of evaluating the builder's graph directly
+ * (shared subgraphs dedup, `randn`/`dropout` draw fresh per call).
+ *
+ * Recompilation is automatic and shape-keyed: a call whose inputs differ
+ * in shape, dtype, or device from every cached signature traces a new
+ * program, up to `cacheCapacity` programs (least-recently-used eviction).
+ * Materializing a tensor inside `build` fails at trace time — a compiled
+ * builder is a pure graph builder over its placeholders.
+ *
+ * @since 0.1.0
+ * @category compilation
+ */
+export const compile = <E = never, R = never>(
+  build: (
+    inputs: ReadonlyArray<Lazy>,
+    scalars: ReadonlyArray<Lazy>
+  ) => Effect.Effect<ReadonlyArray<Any>, E, R>,
+  options: CompileOptions = {}
+): Effect.Effect<CompiledFn<E, R>, never, CurrentDevice> =>
+  Effect.gen(function* () {
+    const device = yield* CurrentDevice
+    const scalarCount = options.scalars ?? 0
+    const cache = makeProgramCache(options.cacheCapacity)
+    const trace = (
+      inputs: ReadonlyArray<Any>
+    ): Effect.Effect<NativeCompiledProgramType, TensorError | E, R> =>
+      Effect.gen(function* () {
+        const placeholders: Array<Lazy> = []
+        for (let i = 0; i < inputs.length; i++) {
+          placeholders.push(yield* makeInput(i, inputs[i]))
+        }
+        const scalarPlaceholders: Array<Lazy> = []
+        for (let j = 0; j < scalarCount; j++) {
+          scalarPlaceholders.push(yield* makeScalarInput(inputs.length + j, "f32", device))
+        }
+        const roots = yield* build(placeholders, scalarPlaceholders)
+        return yield* freezeProgram(roots)
+      })
+    const self: CompiledFn<E, R> = {
+      call: (inputs, scalars = []) =>
+        Effect.gen(function* () {
+          if (scalars.length !== scalarCount) {
+            return yield* new TensorError({
+              op: "call",
+              message: `expected ${scalarCount} scalars, got ${scalars.length}`
+            })
+          }
+          const program = yield* cachedProgram(cache, signatureOf(inputs), trace(inputs))
+          return yield* runProgram(program, inputs, scalars)
+        }),
+      stats: () => programCacheStats(cache),
+      dispose: () => disposeProgramCache(cache)
+    }
+    return self
   })

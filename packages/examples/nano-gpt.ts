@@ -1,6 +1,6 @@
 import { Effect } from "effect"
 import { NodeRuntime } from "@effect/platform-node"
-import { Device, LearningRate, Loss, Model, Optimizer, Tensor } from "@effect-torch/core"
+import { Device, LearningRate, Loss, Model, Optimizer, Tensor, Trainer } from "@effect-torch/core"
 
 // A character-level GPT trained on a few KB of public-domain verse:
 // token and position embeddings fanned into one stream, pre-norm
@@ -104,12 +104,13 @@ const createGpt = Effect.gen(function* () {
     )
     blocks.push(yield* Model.chain(yield* Model.residual(attn), yield* Model.residual(mlp)))
   }
-  return yield* Model.chain(
+  const model = yield* Model.chain(
     embeddings,
     ...blocks,
     yield* Model.layerNorm("lnf", EMBED),
     yield* Model.linear("head", EMBED, vocabSize)
   )
+  return yield* Model.compile(model)
 })
 
 const ids = (values: ReadonlyArray<number>, shape: ReadonlyArray<number>) =>
@@ -131,44 +132,62 @@ const sampleBatch = Effect.gen(function* () {
   }
 })
 
+const started = Date.now()
+
+// Create the trainer for the model, compiled. The batch shape is fixed,
+// so the whole run is served by one frozen step program; the first step
+// pays the trace.
+const createTrainer = (model: Model.Model) =>
+  Effect.gen(function* () {
+    const trainer = yield* Trainer.make(model, {
+      optimizer: yield* Optimizer.adamW(),
+      lr: LearningRate.constant(LR),
+      loss: Loss.crossEntropy,
+      data: () => sampleBatch,
+      stop: ({ step }) => step >= STEPS,
+      onStep: ({ step, loss }) =>
+        step % 25 === 0 || step === 1
+          ? Effect.log(
+            `step ${String(step).padStart(4)}  loss ${loss.toFixed(4)}  ${((Date.now() - started) / 1000).toFixed(1)}s`
+          )
+          : Effect.void
+    })
+    return yield* Trainer.compile(trainer)
+  })
+
 const program = Effect.gen(function* () {
   const device = yield* Device.CurrentDevice
   yield* Effect.log(
     `nano-gpt: vocab ${vocabSize}, block ${BLOCK}, embed ${EMBED}, ${HEADS} heads, ${LAYERS} layers on ${device}`
   )
+
+  yield* Effect.log("1) creating model")
   const model = yield* createGpt
   yield* Effect.log(`${model.names.length} tensors of parameters`)
-
-  const optimizer = Optimizer.adamW()
   const params0 = yield* model.init
-  const started = Date.now()
-  const trained = yield* Model.train(model, {
-    optimizer,
-    lr: LearningRate.constant(LR),
-    loss: Loss.crossEntropy,
-    data: () => sampleBatch,
-    stop: ({ step }) => step >= STEPS,
-    params: params0,
-    onStep: ({ step, loss }) =>
-      step % 25 === 0 || step === 1
-        ? Effect.log(
-          `step ${String(step).padStart(4)}  loss ${loss.toFixed(4)}  ${((Date.now() - started) / 1000).toFixed(1)}s`
-        )
-        : Effect.void
-  })
+
+  yield* Effect.log(`2) training: adamW lr=${LR}, ${STEPS} steps (compiled)`)
+  const trainer = yield* createTrainer(model)
+  const trained = yield* trainer.train(params0)
   const params = trained.params
 
   // Greedy-windowed sampling with temperature: re-run the model on the
   // last BLOCK tokens and draw the next character from the final
-  // position's softmax.
-  yield* Effect.log(`generating ${GENERATE} characters (temperature ${TEMPERATURE}):`)
+  // position's softmax. The window is right-padded to a fixed [1, BLOCK]
+  // shape so generation is served by a single program: positions are
+  // window-relative (every window restarts at 0) and attention is
+  // causal, so the real tokens never attend to the padding and their
+  // logits are unchanged; the next-token logits are the row at the true
+  // last token, not the padded last row.
+  yield* Effect.log(`3) generating ${GENERATE} characters (temperature ${TEMPERATURE}):`)
   let context = encode("\n")
   let generated = ""
   for (let n = 0; n < GENERATE; n++) {
     const window = context.slice(-BLOCK)
-    const idx = yield* ids(window, [1, window.length])
-    const [logits] = yield* Tensor.compute([yield* model.forward(params, idx)])
-    const row = (yield* Tensor.toNumberArray(logits)).slice(-vocabSize)
+    const idx = yield* ids([...window, ...new Array(BLOCK - window.length).fill(0)], [1, BLOCK])
+    const logits = yield* model.execute(params, idx)
+    const all = yield* Tensor.toNumberArray(logits)
+    const row = all.slice((window.length - 1) * vocabSize, window.length * vocabSize)
     const max = Math.max(...row)
     const exps = row.map((x) => Math.exp((x - max) / TEMPERATURE))
     const total = exps.reduce((a, b) => a + b, 0)

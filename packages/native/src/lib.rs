@@ -790,6 +790,20 @@ fn readback_blocking(inner: &Tensor) -> Result<Readback> {
 
 enum NodeKind {
     Leaf(Tensor),
+    // RFC 0008: placeholder leaves for compiled programs. An Input carries
+    // the declared signature of one call argument; it evaluates only inside
+    // CompiledProgram::run, which binds the slot to an argument buffer.
+    Input {
+        slot: u32,
+        shape: Vec<usize>,
+        dtype: DType,
+        device: Device,
+    },
+    ScalarInput {
+        slot: u32,
+        dtype: DType,
+        device: Device,
+    },
     FromBytes {
         data: Vec<u8>,
         shape: Vec<usize>,
@@ -1301,6 +1315,13 @@ impl Node {
                 tensor.dtype(),
                 tensor.device().clone(),
             ),
+            NodeKind::Input {
+                shape,
+                dtype,
+                device,
+                ..
+            } => (shape.clone(), *dtype, device.clone()),
+            NodeKind::ScalarInput { dtype, device, .. } => (vec![], *dtype, device.clone()),
             NodeKind::FromBytes {
                 shape,
                 dtype,
@@ -2211,6 +2232,34 @@ impl LazyTensor {
         lazy_ctor!(Node::new(NodeKind::Leaf(tensor.inner.clone())))
     }
 
+    // RFC 0008: placeholder leaves. `input` declares one tensor argument of a
+    // compiled program; `scalar_input` declares one 0-d runtime scalar (lr,
+    // step counts, ...). Both carry their declared signature so the rest of
+    // the graph validates shapes at trace time.
+    #[napi(factory)]
+    pub fn input(
+        slot: u32,
+        shape: Vec<u32>,
+        dtype: Option<NativeDType>,
+        device: Option<String>,
+    ) -> Result<Self> {
+        lazy_ctor!(Node::new(NodeKind::Input {
+            slot,
+            shape: shape.iter().map(|&d| d as usize).collect(),
+            dtype: dtype.unwrap_or(NativeDType::F32).into(),
+            device: get_device(device)?,
+        }))
+    }
+
+    #[napi(factory)]
+    pub fn scalar_input(slot: u32, dtype: Option<NativeDType>, device: Option<String>) -> Result<Self> {
+        lazy_ctor!(Node::new(NodeKind::ScalarInput {
+            slot,
+            dtype: dtype.unwrap_or(NativeDType::F64).into(),
+            device: get_device(device)?,
+        }))
+    }
+
     #[napi]
     pub fn add(&self, other: &LazyTensor) -> Result<Self> {
         lazy_ctor!(Node::new(NodeKind::Add {
@@ -2766,10 +2815,17 @@ struct Evaluator {
     multi: std::collections::HashMap<u64, Vec<Tensor>>,
     consumers: std::collections::HashMap<u64, usize>,
     roots: HashSet<u64>,
+    // RFC 0008: Input/ScalarInput node id -> argument buffer, populated by
+    // CompiledProgram::run. Empty for ordinary eval_lazy walks.
+    slots: std::collections::HashMap<u64, Tensor>,
 }
 
 impl Evaluator {
     fn new(roots: &[Arc<Node>]) -> Self {
+        Self::with_slots(roots, std::collections::HashMap::new())
+    }
+
+    fn with_slots(roots: &[Arc<Node>], slots: std::collections::HashMap<u64, Tensor>) -> Self {
         let mut consumers = std::collections::HashMap::new();
         for root in roots {
             count_consumers(root, &mut consumers);
@@ -2781,6 +2837,7 @@ impl Evaluator {
             multi: std::collections::HashMap::new(),
             consumers,
             roots: roots.iter().map(|root| root.id).collect(),
+            slots,
         }
     }
 
@@ -2822,6 +2879,8 @@ fn count_consumers(root: &Arc<Node>, consumers: &mut std::collections::HashMap<u
 fn node_children(kind: &NodeKind) -> Vec<Arc<Node>> {
     match kind {
         NodeKind::Leaf(_)
+        | NodeKind::Input { .. }
+        | NodeKind::ScalarInput { .. }
         | NodeKind::FromBytes { .. }
         | NodeKind::Zeros { .. }
         | NodeKind::Ones { .. }
@@ -2949,6 +3008,26 @@ fn node_children(kind: &NodeKind) -> Vec<Arc<Node>> {
 fn remap_children(kind: &NodeKind, f: &dyn Fn(&Arc<Node>) -> Arc<Node>) -> NodeKind {
     match kind {
         NodeKind::Leaf(t) => NodeKind::Leaf(t.clone()),
+        NodeKind::Input {
+            slot,
+            shape,
+            dtype,
+            device,
+        } => NodeKind::Input {
+            slot: *slot,
+            shape: shape.clone(),
+            dtype: *dtype,
+            device: device.clone(),
+        },
+        NodeKind::ScalarInput {
+            slot,
+            dtype,
+            device,
+        } => NodeKind::ScalarInput {
+            slot: *slot,
+            dtype: *dtype,
+            device: device.clone(),
+        },
         NodeKind::FromBytes {
             data,
             shape,
@@ -3592,6 +3671,13 @@ fn eval_node(
 fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> candle_core::Result<Tensor> {
     let output = match &node.kind {
         NodeKind::Leaf(tensor) => tensor.clone(),
+        NodeKind::Input { slot, .. } | NodeKind::ScalarInput { slot, .. } => {
+            ev.slots.get(&node.id).cloned().ok_or_else(|| {
+                candle_core::Error::Msg(format!(
+                    "input slot {slot} is unbound: placeholder leaves evaluate only inside a compiled program run"
+                ))
+            })?
+        }
         NodeKind::FromBytes {
             data,
             shape,
@@ -5473,6 +5559,8 @@ mod autodiff {
                     }
                 }
                 NodeKind::Leaf(_)
+                | NodeKind::Input { .. }
+                | NodeKind::ScalarInput { .. }
                 | NodeKind::FromBytes { .. }
                 | NodeKind::Zeros { .. }
                 | NodeKind::Ones { .. }
@@ -6441,6 +6529,269 @@ pub async fn eval_lazy(
         Ok(outputs)
     })
     .await
+}
+
+// RFC 0008: a frozen, reusable graph executable. `compile` traces slot
+// declarations out of the root DAG, fuses once, and stores the immutable
+// post-fusion roots; `run` rebinds Input/ScalarInput leaves to call
+// arguments and evaluates with the same per-call Evaluator as eval_lazy.
+// A program holds no device buffers beyond the constant/parameter leaves
+// the traced graph already referenced.
+
+struct ProgramSlot {
+    scalar: bool,
+    shape: Vec<usize>,
+    dtype: DType,
+    device: Device,
+}
+
+impl ProgramSlot {
+    fn signature(&self) -> String {
+        let shape = if self.scalar {
+            "scalar".to_string()
+        } else {
+            self.shape
+                .iter()
+                .map(|d| d.to_string())
+                .collect::<Vec<_>>()
+                .join("x")
+        };
+        format!("{}:{}@{}", shape, dtype_name(self.dtype), device_key(&self.device))
+    }
+}
+
+struct ProgramInner {
+    roots: Vec<Arc<Node>>,
+    slots: Vec<ProgramSlot>,
+    // Placeholder node id -> slot index, collected once at freeze time.
+    leaves: Vec<(u64, u32)>,
+    signature: String,
+}
+
+#[napi]
+pub struct CompiledProgram {
+    inner: Option<ProgramInner>,
+}
+
+fn collect_program_slots(
+    roots: &[Arc<Node>],
+) -> std::result::Result<(Vec<ProgramSlot>, Vec<(u64, u32)>), String> {
+    let mut slots: Vec<Option<ProgramSlot>> = Vec::new();
+    let mut leaves: Vec<(u64, u32)> = Vec::new();
+    let mut visited = HashSet::new();
+    let mut stack: Vec<Arc<Node>> = roots.to_vec();
+    while let Some(node) = stack.pop() {
+        if !visited.insert(node.id) {
+            continue;
+        }
+        let declared = match &node.kind {
+            NodeKind::Input {
+                slot,
+                shape,
+                dtype,
+                device,
+            } => Some((
+                *slot,
+                ProgramSlot {
+                    scalar: false,
+                    shape: shape.clone(),
+                    dtype: *dtype,
+                    device: device.clone(),
+                },
+            )),
+            NodeKind::ScalarInput {
+                slot,
+                dtype,
+                device,
+            } => Some((
+                *slot,
+                ProgramSlot {
+                    scalar: true,
+                    shape: vec![],
+                    dtype: *dtype,
+                    device: device.clone(),
+                },
+            )),
+            _ => None,
+        };
+        if let Some((slot, declared)) = declared {
+            leaves.push((node.id, slot));
+            let slot = slot as usize;
+            if slot >= slots.len() {
+                slots.resize_with(slot + 1, || None);
+            }
+            match &slots[slot] {
+                Some(existing) => {
+                    if existing.scalar != declared.scalar
+                        || existing.shape != declared.shape
+                        || existing.dtype != declared.dtype
+                        || device_key(&existing.device) != device_key(&declared.device)
+                    {
+                        return Err(format!(
+                            "compile: slot {slot} is used with conflicting signatures ({} vs {})",
+                            existing.signature(),
+                            declared.signature()
+                        ));
+                    }
+                }
+                None => slots[slot] = Some(declared),
+            }
+        }
+        stack.extend(node_children(&node.kind));
+    }
+    let mut out = Vec::with_capacity(slots.len());
+    for (slot, declared) in slots.into_iter().enumerate() {
+        out.push(declared.ok_or_else(|| format!("compile: slot {slot} is declared but never used"))?);
+    }
+    Ok((out, leaves))
+}
+
+fn scalar_binding(value: f64, dtype: DType, device: &Device) -> candle_core::Result<Tensor> {
+    match dtype {
+        DType::F32 => Tensor::full(value as f32, vec![], device),
+        DType::F64 => Tensor::full(value, vec![], device),
+        DType::I64 => Tensor::full(value as i64, vec![], device),
+        DType::U8 => Tensor::full(value as u8, vec![], device),
+        DType::U32 => Tensor::full(value as u32, vec![], device),
+        DType::F16 => Tensor::full(half::f16::from_f64(value), vec![], device),
+        dtype => Err(candle_core::Error::Msg(format!(
+            "scalar input not supported for dtype {dtype:?}"
+        ))),
+    }
+}
+
+#[napi]
+impl CompiledProgram {
+    #[napi(getter)]
+    pub fn signature(&self) -> Result<String> {
+        self.inner
+            .as_ref()
+            .map(|inner| inner.signature.clone())
+            .ok_or_else(|| Error::new(Status::GenericFailure, "program is disposed".to_string()))
+    }
+
+    // Drops the frozen graphs; constant/parameter leaf buffers stay alive
+    // through any NativeTensor handles that share them. Running a disposed
+    // program is an error.
+    #[napi]
+    pub fn dispose(&mut self) {
+        self.inner = None;
+    }
+
+    #[napi]
+    pub async fn run(
+        &self,
+        inputs: Vec<&NativeTensor>,
+        scalars: Vec<f64>,
+        token: Option<&CancellationToken>,
+    ) -> Result<Vec<NativeTensor>> {
+        let inner = self
+            .inner
+            .as_ref()
+            .ok_or_else(|| Error::new(Status::GenericFailure, "program is disposed".to_string()))?;
+        let tensor_count = inner.slots.iter().filter(|s| !s.scalar).count();
+        let scalar_count = inner.slots.len() - tensor_count;
+        if inputs.len() != tensor_count {
+            return Err(Error::new(
+                Status::InvalidArg,
+                format!(
+                    "program expected {tensor_count} tensor inputs, got {}",
+                    inputs.len()
+                ),
+            ));
+        }
+        if scalars.len() != scalar_count {
+            return Err(Error::new(
+                Status::InvalidArg,
+                format!(
+                    "program expected {scalar_count} scalar inputs, got {}",
+                    scalars.len()
+                ),
+            ));
+        }
+        let mut bindings = std::collections::HashMap::new();
+        let mut tensors = inputs.iter();
+        let mut scalars_iter = scalars.iter();
+        // Slots are indexed by declaration order; tensor and scalar
+        // arguments arrive as separate vectors in slot order.
+        for (slot, declared) in inner.slots.iter().enumerate() {
+            let binding = if declared.scalar {
+                let value = scalars_iter.next().expect("scalar count checked");
+                scalar_binding(*value, declared.dtype, &declared.device).map_err(to_napi_err)?
+            } else {
+                let input = tensors.next().expect("tensor count checked");
+                let got = &input.inner;
+                if got.dims() != declared.shape.as_slice()
+                    || got.dtype() != declared.dtype
+                    || device_key(got.device()) != device_key(&declared.device)
+                {
+                    return Err(Error::new(
+                        Status::InvalidArg,
+                        format!(
+                            "input slot {slot}: expected {}, got {}:{}@{}",
+                            declared.signature(),
+                            got.dims()
+                                .iter()
+                                .map(|d| d.to_string())
+                                .collect::<Vec<_>>()
+                                .join("x"),
+                            dtype_name(got.dtype()),
+                            device_key(got.device())
+                        ),
+                    ));
+                }
+                got.clone()
+            };
+            bindings.insert(slot as u64, binding);
+        }
+        let roots = inner.roots.clone();
+        let leaves = inner.leaves.clone();
+        run_compute(token, move |cancelled| {
+            let by_id: std::collections::HashMap<u64, Tensor> = leaves
+                .iter()
+                .map(|(id, slot)| (*id, bindings[&(*slot as u64)].clone()))
+                .collect();
+            let mut ev = Evaluator::with_slots(&roots, by_id);
+            let mut outputs = Vec::with_capacity(roots.len());
+            for node in &roots {
+                let output = eval_node(node, cancelled, &mut ev).map_err(to_napi_err)?;
+                output.device().synchronize().map_err(to_napi_err)?;
+                outputs.push(NativeTensor::wrap(output));
+            }
+            Ok(outputs)
+        })
+        .await
+    }
+}
+
+#[napi]
+pub fn compile(roots: Vec<&LazyTensor>) -> Result<CompiledProgram> {
+    let nodes: Vec<Arc<Node>> = roots.iter().map(|t| t.node.clone()).collect();
+    if nodes.is_empty() {
+        return Err(Error::new(
+            Status::InvalidArg,
+            "compile: expected at least one root".to_string(),
+        ));
+    }
+    // Slots are collected from the fused DAG: the fusion rewrite rebuilds
+    // nodes with fresh ids, so declarations taken from the unfused graph
+    // would bind against node ids the program no longer contains.
+    let nodes = fuse_roots(&nodes).map_err(|e| Error::new(Status::GenericFailure, e))?;
+    let (slots, leaves) =
+        collect_program_slots(&nodes).map_err(|e| Error::new(Status::InvalidArg, e))?;
+    let signature = slots
+        .iter()
+        .map(|slot| slot.signature())
+        .collect::<Vec<_>>()
+        .join(",");
+    Ok(CompiledProgram {
+        inner: Some(ProgramInner {
+            roots: nodes,
+            slots,
+            leaves,
+            signature,
+        }),
+    })
 }
 
 // Saves tensors to a safetensors file without the data ever touching the JS

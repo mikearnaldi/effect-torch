@@ -1,6 +1,6 @@
 # RFC 0008: Compilation — Frozen, Reusable Graph Executables
 
-- **Status**: Draft
+- **Status**: Implemented
 - **Author**: Michael Arnaldi
 - **Date**: 2026-07-31
 - **Depends on**: RFC 0002 (autodiff — `grad` runs at trace time), RFC 0003
@@ -93,18 +93,23 @@ contains `Input` leaves wherever the arguments were read. Constants
 captured by the builder (constructor leaves, checkpoint-loaded tensors)
 stay ordinary leaves shared by the program.
 
-**Freeze.** One synchronous napi call
-`compile(roots, inputCount, scalarCount) -> CompiledProgram`:
+**Freeze.** One synchronous napi call `compile(roots) -> CompiledProgram`:
 
-1. Validates that every `Input`/`ScalarInput` reachable from the roots
-   has `slot < inputCount` / `slot < scalarCount`, and that no `Input`
-   node is aliased to two different declared signatures.
+1. Collects the slot declarations from the root DAG (slot indexes are one
+   unified space across tensor and scalar inputs), validating that slots
+   are contiguous from 0, that no slot is declared but unused, and that
+   no slot is aliased to two different declared signatures.
 2. Runs `fuse_roots` + `merge_shared_regions` **once** and stores the
    fused root DAG (`Arc<Node>`, immutable) with the per-root
-   shape/dtype metadata.
-3. Returns a napi handle (`CompiledProgram`) with `dispose()` and an
-   `ObjectFinalize` finalizer — the same lifecycle as `NativeTensor`
-   (explicit release plus GC safety net, RFC 0003).
+   shape/dtype metadata. The slot declarations are collected from the
+   **fused** DAG: the fusion rewrite rebuilds nodes with fresh ids, so
+   declarations taken from the unfused graph would bind against node ids
+   the program no longer contains.
+3. Returns a napi handle (`CompiledProgram`) with `dispose()`; dropping
+   the handle releases the Rust-side `Arc` graphs. A program holds no
+   device buffers of its own: the constant/parameter leaves it references
+   stay alive through their `NativeTensor` handles' accounting (the same
+   sharing discipline as ordinary lazy graphs, RFC 0003).
 
 A program holds **no device buffers**: inputs are rebound per call and
 intermediates live only inside a call's walk. Its footprint is CPU graph
@@ -139,24 +144,29 @@ export interface CompileOptions {
   readonly cacheCapacity?: number
 }
 
-export interface CompiledFn<Ins extends ReadonlyArray<Tensor.Any>> {
+export interface CompiledFn<E, R> {
   /** One async napi call per invocation, after the first call per
       input signature pays the trace+freeze. */
   readonly call: (
-    inputs: Ins,
+    inputs: ReadonlyArray<Tensor.Any>,
     scalars?: ReadonlyArray<number>
-  ) => Effect.Effect<ReadonlyArray<Tensor.Concrete>, Tensor.TensorError>
+  ) => Effect.Effect<Array<Tensor.Concrete>, Tensor.TensorError | E, R>
   /** Diagnostics: programs cached, traces performed. */
-  readonly stats: () => { readonly cached: number; readonly compiled: number }
+  readonly stats: () => CompileStats
   readonly dispose: () => Effect.Effect<void>
 }
 
-export const compile = <Ins extends ReadonlyArray<Tensor.Any>, E, R>(
-  build: (inputs: { [K in keyof Ins]: Tensor.Lazy }, scalars: ReadonlyArray<number>) =>
-    Effect.Effect<ReadonlyArray<Tensor.Any>, E, R>,
+export const compile: <E, R>(
+  build: (
+    inputs: ReadonlyArray<Tensor.Lazy>,
+    scalars: ReadonlyArray<Tensor.Lazy>
+  ) => Effect.Effect<ReadonlyArray<Tensor.Any>, E, R>,
   options?: CompileOptions
-): Effect.Effect<CompiledFn<Ins>, E, CurrentDevice | R>
+) => Effect.Effect<CompiledFn<E, R>, never, CurrentDevice>
 ```
+
+The builder receives tensor placeholders and one 0-d placeholder per
+declared scalar slot; scalar values arrive as plain numbers at call time.
 
 **Automatic shape-keyed recompilation (JAX-style).** `call` keys a
 per-`CompiledFn` cache on the full input signature — shapes, dtypes,
@@ -184,24 +194,34 @@ trace and all receive the same program.
 ### `Model.compile`
 
 ```ts
-export interface CompiledModel {
-  readonly model: Model.Model
-  readonly forward: (
-    params: Model.Params,
-    input: Tensor.Concrete
-  ) => Effect.Effect<Tensor.Concrete, Tensor.TensorError | Model.ModelError>
-  readonly stats: CompiledFn<...>["stats"]
+export interface CompiledModel extends Model {
+  /** Runs the frozen forward program: params and input in,
+      materialized output out. */
+  readonly execute: (
+    params: Params,
+    input: Tensor.Any
+  ) => Effect.Effect<Tensor.Concrete, ModelError | Tensor.TensorError, CurrentDevice>
+  readonly stats: () => Tensor.CompileStats
   readonly dispose: () => Effect.Effect<void>
 }
 
-export const compile: (model: Model) => Effect.Effect<CompiledModel, ...>
+export const compile: (
+  model: Model,
+  options?: { readonly cacheCapacity?: number }
+) => Effect.Effect<CompiledModel, never, CurrentDevice>
+
+export const isCompiled: (model: Model) => model is CompiledModel
 ```
 
-A thin wrapper over `Tensor.compile`: the input vector is
+A thin wrapper over `Tensor.compile`: the program's input vector is
 `[...params, input]` (param shapes are fixed by the architecture, so in
 practice the cache key varies only on the data shape), the output is the
-single forward root. The uncompiled `model.forward` remains for
-one-off evaluation; `Model` itself is otherwise unchanged.
+single forward root. **A compiled model is still a `Model`** — crucially,
+`forward` keeps the graph-builder contract (the original builder,
+composable and differentiable), and the frozen program is exposed as a
+separate `execute` method for evaluation loops. Substitution is total:
+a compiled model composes, differentiates, trains, and checkpoints
+exactly like the original.
 
 ### The `Trainer` module
 
@@ -210,56 +230,58 @@ Training configuration moves out of `Model` wholesale — `TrainData`,
 into a new `Trainer` module whose value encapsulates the configuration:
 
 ```ts
-export interface Trainer<S, EL, RL, ED, RD, EO, RO> { /* encapsulated config */ }
+export interface Trainer<S, EL, RL, ED, RD, EO, RO> {
+  readonly model: Model.Model
+  readonly config: TrainConfig<S, EL, RL, ED, RD, EO, RO>
+  /** The training loop, identical semantics for both forms. The initial
+      parameters are the argument — omitted means `model.init`. */
+  readonly train: (
+    params?: Model.Params
+  ) => Effect.Effect<Trained<S>, ...>
+}
 
-export const make: <S, ...>(config: TrainConfig<S, ...>) => Trainer<S, ...>
-
-/** The uncompiled loop: today's Model.train, unchanged semantics. */
-export const train: <S, ...>(
-  trainer: Trainer<S, ...>,
-  model: Model.Model
-) => Effect.Effect<Trained<S>, ...>
-
-export interface CompiledTrainer<S> {
-  /** One napi call per step: (params, stateRoots, input, target) in,
-      (loss, newParams, newStateRoots) out. */
-  readonly step: (
-    params: ReadonlyArray<Tensor.Concrete>,
-    state: S,
-    batch: TrainData
-  ) => Effect.Effect<{ loss: number; params: ReadonlyArray<Tensor.Concrete>; state: S }, ...>
-  /** The full loop over `step`, with data sampling, onStep, and stop. */
-  readonly train: (options?: { params?: Params }) => Effect.Effect<Trained<S>, ...>
-  readonly stats: CompiledFn<...>["stats"]
+export interface CompiledTrainer<S, ...> extends Trainer<S, ...> {
+  readonly stats: () => Tensor.CompileStats
   readonly dispose: () => Effect.Effect<void>
 }
 
+export const make: <S, ...>(
+  model: Model.Model,
+  config: TrainConfig<S, ...>
+) => Effect.Effect<Trainer<S, ...>>
+
 export const compile: <S, ...>(
   trainer: Trainer<S, ...>,
-  model: Model.Model
-) => Effect.Effect<CompiledTrainer<S>, ...>
+  options?: { readonly cacheCapacity?: number }
+) => Effect.Effect<CompiledTrainer<S, ...>>
+
+export const isCompiled: <S, ...>(
+  trainer: Trainer<S, ...>
+) => trainer is CompiledTrainer<S, ...>
 ```
 
-The compiled step's trace is exactly today's `Optimizer.step` graph
-transform: placeholder params, state roots, input, and target in;
-`[loss, ...nextParams, ...nextStateRoots]` out — the
-`stateRoots`/`rebuildState` contract (RFC 0004) is the program's
-input/output boundary. `CompiledTrainer.train` runs the same loop as
-`Trainer.train` (sampler per step, `onStep`, `stop`, at least one step)
-but each step is one `program.run` instead of a full rebuild. Since
-there is one semantic definition of a step, compiled and uncompiled
-loops agree step-for-step on deterministic graphs and in distribution on
-stochastic ones.
+The model is part of the trainer's configuration — the trainer traces
+and compiles against its architecture — so `train` takes the one thing
+that varies per run: the initial parameters. **A compiled trainer is
+still a `Trainer`** (a `CompiledTrainer`, with `stats`/`dispose`
+required; `isCompiled` narrows): its `train` method runs the same loop
+with each step as one `program.run`: (params, stateRoots, input, target)
+tensors in plus the step's scheduled learning rate as a runtime scalar,
+(loss, newParams, newStateRoots) out — the `stateRoots`/`rebuildState`
+contract (RFC 0004) is the program's input/output boundary. The compiled
+step's trace is exactly the uncompiled step's graph transform:
+placeholder params, state roots, input, and target in;
+`[loss, ...nextParams, ...nextStateRoots]` out. Since there is one
+semantic definition of a step, compiled and uncompiled loops agree
+step-for-step on deterministic graphs and in distribution on stochastic
+ones.
 
-**Optimizer scalars.** In phase 1 the optimizer's configuration (lr,
-betas, eps) is captured at trace time like any other constant; a
-`CompiledTrainer` reflects the configuration it was compiled from.
-Threading per-step scalars (learning-rate schedules from the
-`LearningRate` module) through `ScalarInput` slots requires the
-`Optimizer` interface to *declare* runtime scalars — a small, separable
-extension recorded as phase 2, designed so that a scalar-taking
-optimizer compiles to the same program shape with the schedule values
-passed per call rather than baked.
+**Optimizer scalars.** Because the optimizer redesign (RFC 0004 follow-up)
+made every step-varying value a tensor — the Adam step count, the SGD
+`first` flag, and the per-step learning rate — a compiled trainer needs
+exactly one runtime scalar slot (the learning rate); schedules from the
+`LearningRate` module evaluate per step and flow through the frozen
+program as data, so one program serves the whole schedule.
 
 ### Concurrency
 
@@ -324,7 +346,6 @@ one walk" discipline as today.
 - **Native-side step loops** (crossing the async boundary once per N
   steps, with `onStep` as a batched callback): a further overhead
   reduction, separable from program execution.
-- **Optimizer-declared runtime scalar slots** (phase 2, see above).
 - **CUDA**: no change to its fusion status.
 
 ## Acceptance
@@ -334,8 +355,8 @@ one walk" discipline as today.
   training to the same tolerances as the uncompiled path.
 - Parity tests: compiled vs. uncompiled forward outputs bitwise-equal on
   deterministic graphs; compiled vs. uncompiled training trajectories
-  equal under seeded draws (same walk discipline); `Trainer.train` and
-  `CompiledTrainer.train` agree step-for-step.
+  equal under seeded draws (same walk discipline); uncompiled and
+  compiled `Trainer.train` agree step-for-step.
 - Concurrency tests: N parallel `forward` calls equal N sequential
   calls; single-flight verified (one trace per signature under parallel
   first-calls).

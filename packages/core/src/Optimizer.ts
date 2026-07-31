@@ -264,7 +264,7 @@ const checkStateLength = (
  * @since 0.1.0
  * @category constructors
  */
-export const sgd = (config: SgdConfig = {}): Optimizer<SgdState> => {
+export const sgd = (config: SgdConfig = {}): Effect.Effect<Optimizer<SgdState>> => {
   const momentum = config.momentum ?? 0
   const dampening = config.dampening ?? 0
   const nesterov = config.nesterov ?? false
@@ -276,7 +276,7 @@ export const sgd = (config: SgdConfig = {}): Optimizer<SgdState> => {
     throw new Error("sgd: nesterov requires momentum > 0 and dampening = 0")
   }
 
-  return {
+  return Effect.succeed({
     init: (params) =>
       Effect.gen(function* () {
         yield* checkParams("sgd", params)
@@ -352,7 +352,7 @@ export const sgd = (config: SgdConfig = {}): Optimizer<SgdState> => {
       momentum === 0
         ? state
         : { velocity: roots.slice(0, state.velocity.length), first: roots[state.velocity.length] }
-  }
+  })
 }
 
 interface ResolvedAdamConfig {
@@ -362,7 +362,7 @@ interface ResolvedAdamConfig {
   readonly weightDecay: number
 }
 
-const makeAdam = (op: string, config: ResolvedAdamConfig): Optimizer<AdamState> => {
+const makeAdam = (op: string, config: ResolvedAdamConfig): Effect.Effect<Optimizer<AdamState>> => {
   const { beta1, beta2, eps, weightDecay } = config
   if (
     !Number.isFinite(beta1) || !Number.isFinite(beta2) || beta1 < 0 || beta1 >= 1 || beta2 < 0 ||
@@ -374,7 +374,7 @@ const makeAdam = (op: string, config: ResolvedAdamConfig): Optimizer<AdamState> 
     throw new Error(`${op}: eps must be positive, got ${eps}`)
   }
 
-  return {
+  return Effect.succeed({
     init: (params) =>
       Effect.gen(function* () {
         yield* checkParams(op, params)
@@ -455,7 +455,7 @@ const makeAdam = (op: string, config: ResolvedAdamConfig): Optimizer<AdamState> 
       v: roots.slice(state.m.length, state.m.length * 2),
       t: roots[state.m.length * 2]
     })
-  }
+  })
 }
 
 /**
@@ -466,7 +466,7 @@ const makeAdam = (op: string, config: ResolvedAdamConfig): Optimizer<AdamState> 
  * @since 0.1.0
  * @category constructors
  */
-export const adam = (config: AdamConfig = {}): Optimizer<AdamState> =>
+export const adam = (config: AdamConfig = {}): Effect.Effect<Optimizer<AdamState>> =>
   makeAdam("adam", {
     beta1: config.beta1 ?? 0.9,
     beta2: config.beta2 ?? 0.999,
@@ -482,7 +482,7 @@ export const adam = (config: AdamConfig = {}): Optimizer<AdamState> =>
  * @since 0.1.0
  * @category constructors
  */
-export const adamW = (config: AdamWConfig = {}): Optimizer<AdamState> =>
+export const adamW = (config: AdamWConfig = {}): Effect.Effect<Optimizer<AdamState>> =>
   makeAdam("adamW", {
     beta1: config.beta1 ?? 0.9,
     beta2: config.beta2 ?? 0.999,

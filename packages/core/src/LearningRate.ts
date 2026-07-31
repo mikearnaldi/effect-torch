@@ -1,17 +1,18 @@
 /**
  * Learning-rate schedules. A schedule is a plain function from the step
  * number (0-based) to the learning rate for that step. The training loop
- * ({@link Model.train}) evaluates it every step and lifts the value to a
+ * ({@link Trainer.train}) evaluates it every step and lifts the value to a
  * 0-d tensor that flows into the optimizer update as graph data — the
  * rate is never baked into the optimizer or its graph, so one optimizer
  * (and one compiled step) serves the whole schedule:
  *
  * ```ts
- * Model.train(model, {
- *   optimizer: Optimizer.adam(),
+ * const trainer = yield* Trainer.make(model, {
+ *   optimizer: yield* Optimizer.adam(),
  *   lr: LearningRate.withWarmup(LearningRate.cosine(1e-3, { totalSteps }), 100),
  *   ...
  * })
+ * yield* trainer.train()
  * ```
  *
  * @since 0.1.0

@@ -1,6 +1,6 @@
 import { Data, Effect } from "effect"
 import { NodeRuntime } from "@effect/platform-node"
-import { Device, LearningRate, Loss, Model, Optimizer, Tensor } from "@effect-torch/core"
+import { Device, LearningRate, Loss, Model, Optimizer, Tensor, Trainer } from "@effect-torch/core"
 
 const HIDDEN = 8
 const STEPS = 3000
@@ -16,9 +16,10 @@ const program = Effect.gen(function* () {
   const model = yield* createModel
   const params = yield* init(model)
 
-  // Full-batch Adam on the MSE loss, one graph walk per step
-  yield* Effect.log(`2) training: adam lr=${LR}, ${STEPS} steps`)
-  const trained = yield* train(model, params, x, y)
+  // Full-batch Adam on the MSE loss, one compiled program call per step
+  yield* Effect.log(`2) training: adam lr=${LR}, ${STEPS} steps (compiled)`)
+  const trainer = yield* createTrainer(model, x, y)
+  const trained = yield* trainer.train(params)
 
   yield* Effect.log("3) evaluating")
   yield* evaluate(model, trained.params, x, y)
@@ -26,12 +27,13 @@ const program = Effect.gen(function* () {
 
 // Create the model
 const createModel = Effect.gen(function* () {
-  return yield* Model.chain(
+  const model = yield* Model.chain(
     yield* Model.linear("fc1", 2, HIDDEN),
     yield* Model.tanh,
     yield* Model.linear("fc2", HIDDEN, 1),
     yield* Model.sigmoid
   )
+  return yield* Model.compile(model)
 })
 
 // Initialize the parameters
@@ -44,29 +46,30 @@ const init = (model: Model.Model) =>
     return params
   })
 
-// Train the model
-const train = (
+// Create the trainer for the model, compiled
+const createTrainer = (
   model: Model.Model,
-  params: Model.Params,
   x: Tensor.Any,
   y: Tensor.Any
 ) =>
-  Model.train(model, {
-    optimizer: Optimizer.adam(),
-    lr: LearningRate.constant(LR),
-    loss: Loss.mse,
-    data: { input: x, target: y },
-    stop: ({ step }) => step >= STEPS,
-    params,
-    onStep: ({ step, loss }) =>
-      Effect.gen(function* () {
-        if (step % 250 === 0) {
-          const mem = process.memoryUsage()
-          yield* Effect.log(
-            `step ${String(step).padStart(4)}  loss ${loss.toFixed(6)}  rss ${(mem.rss / 1e6).toFixed(0)}MB  ext ${(mem.external / 1e6).toFixed(1)}MB  heap ${(mem.heapUsed / 1e6).toFixed(0)}MB`
-          )
-        }
-      })
+  Effect.gen(function* () {
+    const trainer = yield* Trainer.make(model, {
+      optimizer: yield* Optimizer.adam(),
+      lr: LearningRate.constant(LR),
+      loss: Loss.mse,
+      data: { input: x, target: y },
+      stop: ({ step }) => step >= STEPS,
+      onStep: ({ step, loss }) =>
+        Effect.gen(function* () {
+          if (step % 250 === 0) {
+            const mem = process.memoryUsage()
+            yield* Effect.log(
+              `step ${String(step).padStart(4)}  loss ${loss.toFixed(6)}  rss ${(mem.rss / 1e6).toFixed(0)}MB  ext ${(mem.external / 1e6).toFixed(1)}MB  heap ${(mem.heapUsed / 1e6).toFixed(0)}MB`
+            )
+          }
+        })
+    })
+    return yield* Trainer.compile(trainer)
   })
 
 class MispredictionError extends Data.TaggedError("MispredictionError")<{
@@ -81,7 +84,7 @@ class MispredictionError extends Data.TaggedError("MispredictionError")<{
 
 // One forward pass per input, failing on the first misprediction
 const evaluate = (
-  model: Model.Model,
+  model: Model.CompiledModel,
   params: Model.Params,
   x: Tensor.Any,
   y: Tensor.Any
@@ -91,7 +94,7 @@ const evaluate = (
     const targets = yield* Tensor.toNumberArray(y)
     for (let i = 0; i < targets.length; i++) {
       const single = yield* Tensor.fromTypedArray(new Float32Array([inputs[i * 2], inputs[i * 2 + 1]]), [1, 2])
-      const pred = yield* model.forward(params, single)
+      const pred = yield* model.execute(params, single)
       const [value] = yield* Tensor.toNumberArray(pred)
       const rounded = value > 0.5 ? 1 : 0
       const ok = rounded === targets[i]

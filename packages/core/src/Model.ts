@@ -10,11 +10,9 @@
  * Everything that can fail returns an `Effect`: factories validate their
  * configuration (positive feature counts, unique parameter names) into a
  * {@link ModelError}, `forward` checks the parameter array's length
- * against the model's arity, checkpoints report arity and missing-key
- * problems in the error channel, and {@link train} runs the whole
- * training loop — init, forward, loss, gradients, update, one graph walk
- * per step — with the tensor, gradient, and callback error channels in
- * the union.
+ * against the model's arity, and checkpoints report arity and
+ * missing-key problems in the error channel. Training lives in the
+ * `Trainer` module.
  *
  * The layer catalog covers the standard MLP / CNN / embedding stack:
  * parameterised layers ({@link linear}, {@link conv1d}, {@link conv2d},
@@ -25,7 +23,8 @@
  * the parameter arrays in order. `names` gives every parameter a stable,
  * checkpoint-friendly identity that maps directly onto
  * {@link Tensor.save} / {@link Tensor.load} via {@link save} and
- * {@link load}.
+ * {@link load}. {@link compile} freezes the forward graph into a cached
+ * native program — a compiled model is still a `Model`.
  *
  * Stateful layers (batchnorm running stats) are deliberately absent: the
  * pure design keeps non-trainable state out of the parameter array until
@@ -39,8 +38,6 @@
 import { Data, Effect } from "effect"
 import type { CurrentDevice } from "./Device.ts"
 import * as Gradient from "./Gradient.ts"
-import type { LearningRate } from "./LearningRate.ts"
-import * as Optimizer from "./Optimizer.ts"
 import * as Tensor from "./Tensor.ts"
 
 /**
@@ -106,6 +103,58 @@ export interface Model {
     input: Tensor.Any
   ) => Effect.Effect<Tensor.Lazy, ModelError | Tensor.TensorError, CurrentDevice>
 }
+
+const CompiledTypeId: unique symbol = Symbol.for("@effect-torch/core/Model/Compiled")
+
+/**
+ * @since 0.1.0
+ * @category symbols
+ */
+export type CompiledTypeId = typeof CompiledTypeId
+
+/**
+ * A model with a compiled execution path (see {@link compile}): the
+ * `forward` contract is unchanged — it is still the original graph
+ * builder, composable and differentiable like any other model — and the
+ * frozen forward program is exposed as {@link CompiledModel.execute},
+ * the fast materialized path for evaluation, with the shape-keyed
+ * program cache's diagnostics and release added as required members.
+ *
+ * @since 0.1.0
+ * @category models
+ */
+export interface CompiledModel extends Model {
+  readonly [CompiledTypeId]: CompiledTypeId
+  /**
+   * Runs the frozen forward program: parameters and input in,
+   * materialized output out — one native call per invocation after the
+   * first call per input signature pays the trace. A new input shape
+   * traces a new program automatically. Use it for evaluation loops;
+   * use `forward` wherever a graph is being built (training,
+   * composition, differentiation).
+   */
+  readonly execute: (
+    params: Params,
+    input: Tensor.Any
+  ) => Effect.Effect<Tensor.Concrete, ModelError | Tensor.TensorError, CurrentDevice>
+  /**
+   * Shape-cache diagnostics: programs cached, traces performed.
+   */
+  readonly stats: () => Tensor.CompileStats
+  /**
+   * Releases the cached forward programs.
+   */
+  readonly dispose: () => Effect.Effect<void>
+}
+
+/**
+ * Returns `true` if the model was produced by {@link compile} and
+ * narrows it to {@link CompiledModel}.
+ *
+ * @since 0.1.0
+ * @category refinements
+ */
+export const isCompiled = (model: Model): model is CompiledModel => CompiledTypeId in model
 
 const checkName = (op: string, name: string): Effect.Effect<void, ModelError> =>
   name.length === 0 ? new ModelError({ op, message: "name must not be empty" }) : Effect.void
@@ -979,152 +1028,64 @@ export const load = (
   })
 
 /**
- * The training data for {@link train}: a full-batch input and its target.
- * (A `Dataset` module with batching is future work.)
+ * Options for {@link compile}.
  *
  * @since 0.1.0
- * @category training
+ * @category compilation
  */
-export interface TrainData {
-  readonly input: Tensor.Any
-  readonly target: Tensor.Any
+export interface CompileOptions {
+  /**
+   * Shape-cache capacity in programs. The first forward with a new input
+   * signature traces and freezes a program; later calls with the same
+   * signature reuse it. Defaults to 32.
+   */
+  readonly cacheCapacity?: number
 }
 
 /**
- * The batches {@link train} consumes: either a fixed `(input, target)`
- * pair (full-batch — the same tensors every step) or a sampler called
- * with the 1-based step number to produce that step's batch (mini-batch
- * training).
+ * Returns a model with a compiled execution path: same `names`, `init`,
+ * and `forward` (the graph-builder contract is untouched — the compiled
+ * model composes, differentiates, and trains exactly like the original),
+ * plus {@link CompiledModel.execute}, which runs the forward as a frozen
+ * native program — parameters and input in, materialized output out, in
+ * one native call per invocation after the first call per input
+ * signature pays the trace. Parameter shapes are fixed by the
+ * architecture, so in practice the cache key varies only on the data
+ * shape; a new input shape traces a new program automatically, up to
+ * `cacheCapacity` programs with least-recently-used eviction.
+ *
+ * The compiled model is still a {@link Model} — a {@link CompiledModel},
+ * to be precise (`isCompiled` narrows a `Model` to one). Use `execute`
+ * for evaluation loops; use `forward` wherever a graph is being built.
  *
  * @since 0.1.0
- * @category training
+ * @category compilation
  */
-export type TrainDataSource<E = never, R = never> =
-  | TrainData
-  | ((step: number) => Effect.Effect<TrainData, E, R>)
-
-/**
- * Per-step progress reported to {@link TrainConfig.onStep} and
- * {@link TrainConfig.stop}: the 1-based step number and the step's loss
- * value.
- *
- * @since 0.1.0
- * @category training
- */
-export interface TrainStep {
-  readonly step: number
-  readonly loss: number
-}
-
-/**
- * Configuration for {@link train}. `loss` is any loss function in the
- * shape of {@link Loss.mse} — `(prediction, target) => Effect<Lazy>` —
- * so the `Loss` module's exports slot in directly. `lr` is the
- * learning-rate schedule (see the `LearningRate` module): it is evaluated
- * with the 0-based step number on every step and the value flows into the
- * update as a 0-d tensor — `LearningRate.constant(0.1)` is the fixed-rate
- * case. `params` overrides the initial parameters (continued training,
- * fine-tuning from a checkpoint); when omitted, `model.init` runs.
- * `onStep` runs after every step with the step's loss value — throttle
- * inside the callback.
- *
- * `stop` decides when training ends; it is checked after every step (at
- * least one step always runs), so any policy is a plain function:
- * `({ step }) => step >= 3000` stops on a step count,
- * `({ loss }) => loss < 0.01` stops on a loss target, and the two compose
- * with `||` — or close over any other state you track.
- *
- * `data` is either a fixed `(input, target)` pair used every step
- * (full-batch) or a sampler producing each step's batch (mini-batch).
- *
- * The effectful fields carry their own error and requirement channels
- * (`EL`/`RL` for `loss`, `ED`/`RD` for `data`, `EO`/`RO` for `onStep`),
- * inferred at the call site, so a loss needing the current device, a
- * sampler hitting a dataset, and a logging `onStep` compose without
- * being pre-widened to a common environment.
- *
- * @since 0.1.0
- * @category training
- */
-export interface TrainConfig<
-  S,
-  EL = never,
-  RL = never,
-  ED = never,
-  RD = never,
-  EO = never,
-  RO = never
-> {
-  readonly optimizer: Optimizer.Optimizer<S>
-  readonly lr: LearningRate
-  readonly loss: (
-    prediction: Tensor.Any,
-    target: Tensor.Any
-  ) => Effect.Effect<Tensor.Lazy, EL, RL>
-  readonly data: TrainDataSource<ED, RD>
-  readonly stop: (info: TrainStep) => boolean
-  readonly params?: Params
-  readonly onStep?: (info: TrainStep) => Effect.Effect<void, EO, RO>
-}
-
-/**
- * The result of {@link train}: the trained parameters (materialized
- * leaves, ready for `forward`, `save`, or more training), the final
- * optimizer state, and the final step's loss.
- *
- * @since 0.1.0
- * @category training
- */
-export interface Trained<S> {
-  readonly params: ReadonlyArray<Tensor.Concrete>
-  readonly state: S
-  readonly loss: number
-}
-
-/**
- * Runs the training loop: initialize (or take `config.params`), then
- * repeatedly build `loss(forward(params, input), target)`, differentiate
- * it, extend the graph with the optimizer update, and compute loss,
- * parameters, and state in a single walk — one forward pass, one backward
- * pass, one async boundary per step, with graph depth staying O(model
- * depth). After each step `onStep` runs and `stop` decides whether the
- * loop ends (at least one step always runs).
- *
- * @since 0.1.0
- * @category training
- */
-export const train = <S, EL = never, RL = never, ED = never, RD = never, EO = never, RO = never>(
+export const compile = (
   model: Model,
-  config: TrainConfig<S, EL, RL, ED, RD, EO, RO>
-): Effect.Effect<
-  Trained<S>,
-  ModelError | Tensor.TensorError | Gradient.GradError | EL | ED | EO,
-  CurrentDevice | RL | RD | RO
-> =>
-  Effect.gen(function* () {
-    let params: Params = config.params !== undefined
-      ? config.params
-      : yield* model.init
-    let state = yield* config.optimizer.init(params)
-    let step = 0
-    let loss = Number.NaN
-    let trained: ReadonlyArray<Tensor.Concrete>
-    do {
-      step++
-      const data: TrainData = typeof config.data === "function"
-        ? yield* config.data(step)
-        : config.data
-      const prediction = yield* model.forward(params, data.input)
-      const lossTensor = yield* config.loss(prediction, data.target)
-      const lr = yield* Tensor.constant(config.lr(step - 1), { dtype: params[0].dtype })
-      const result = yield* Optimizer.step(config.optimizer, lossTensor, params, state, lr)
-      loss = (yield* Tensor.toNumberArray(result.loss))[0]
-      trained = result.params
-      params = result.params
-      state = result.state
-      if (config.onStep !== undefined) {
-        yield* config.onStep({ step, loss })
-      }
-    } while (!config.stop({ step, loss }))
-    return { params: trained, state, loss }
-  })
+  options: CompileOptions = {}
+): Effect.Effect<CompiledModel, never, CurrentDevice> =>
+  Effect.map(
+    Tensor.compile<ModelError | Tensor.TensorError, CurrentDevice>(
+      (inputs) =>
+        Effect.map(
+          model.forward(inputs.slice(0, -1), inputs[inputs.length - 1]),
+          (output) => [output]
+        ),
+      { ...(options.cacheCapacity !== undefined ? { cacheCapacity: options.cacheCapacity } : {}) }
+    ),
+    (fn): CompiledModel => ({
+      [CompiledTypeId]: CompiledTypeId,
+      names: model.names,
+      init: model.init,
+      forward: model.forward,
+      execute: (params, input) =>
+        Effect.gen(function* () {
+          yield* checkArity("execute", model.names, params)
+          const [output] = yield* fn.call([...params, input])
+          return output
+        }),
+      stats: fn.stats,
+      dispose: fn.dispose
+    })
+  )

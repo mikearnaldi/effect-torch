@@ -37,7 +37,7 @@ onDevices("Optimizer", () => (it) => {
   describe("sgd", () => {
     it.effect("plain update matches hand computation", () =>
       Effect.gen(function* () {
-        const optimizer = Optimizer.sgd()
+        const optimizer = yield* Optimizer.sgd()
         const p = yield* f32([1, 2])
         const g = yield* f32([0.5, -0.5])
         const state = yield* optimizer.init([p])
@@ -49,7 +49,7 @@ onDevices("Optimizer", () => (it) => {
 
     it.effect("momentum recurrence matches hand computation over 3 steps", () =>
       Effect.gen(function* () {
-        const optimizer = Optimizer.sgd({ momentum: 0.9 })
+        const optimizer = yield* Optimizer.sgd({ momentum: 0.9 })
         const g = yield* f32([0.5, -0.5])
         let params = [yield* f32([1, 2])] as ReadonlyArray<Tensor.Any>
         let state = yield* optimizer.init(params)
@@ -69,7 +69,7 @@ onDevices("Optimizer", () => (it) => {
 
     it.effect("weight decay adds coupled L2 to the gradient", () =>
       Effect.gen(function* () {
-        const optimizer = Optimizer.sgd({ weightDecay: 1 })
+        const optimizer = yield* Optimizer.sgd({ weightDecay: 1 })
         const p = yield* f32([1, 2])
         const g = yield* f32([0.5, -0.5])
         const state = yield* optimizer.init([p])
@@ -80,7 +80,7 @@ onDevices("Optimizer", () => (it) => {
 
     it.effect("nesterov uses the lookahead velocity", () =>
       Effect.gen(function* () {
-        const optimizer = Optimizer.sgd({ momentum: 0.9, nesterov: true })
+        const optimizer = yield* Optimizer.sgd({ momentum: 0.9, nesterov: true })
         const p = yield* f32([1])
         const g = yield* f32([0.5])
         const state = yield* optimizer.init([p])
@@ -93,7 +93,7 @@ onDevices("Optimizer", () => (it) => {
   describe("adam", () => {
     it.effect("first step matches the reference formula", () =>
       Effect.gen(function* () {
-        const optimizer = Optimizer.adam()
+        const optimizer = yield* Optimizer.adam()
         const p = yield* f32([1, -1])
         const g = yield* f32([0.1, 0.2])
         const state = yield* optimizer.init([p])
@@ -105,7 +105,7 @@ onDevices("Optimizer", () => (it) => {
 
     it.effect("bias correction uses the step count", () =>
       Effect.gen(function* () {
-        const optimizer = Optimizer.adam()
+        const optimizer = yield* Optimizer.adam()
         const g = yield* f32([0.1])
         let params = [yield* f32([1])] as ReadonlyArray<Tensor.Any>
         let state = yield* optimizer.init(params)
@@ -125,7 +125,7 @@ onDevices("Optimizer", () => (it) => {
 
     it.effect("zero gradients decay the moments while the parameter follows m_hat", () =>
       Effect.gen(function* () {
-        const optimizer = Optimizer.adam()
+        const optimizer = yield* Optimizer.adam()
         const p = yield* f32([1])
         const state = yield* optimizer.init([p])
         const step1 = yield* runStep(optimizer, [p], [yield* f32([0.5])], state, 0.1)
@@ -143,7 +143,7 @@ onDevices("Optimizer", () => (it) => {
   describe("adamW", () => {
     it.effect("applies decoupled weight decay", () =>
       Effect.gen(function* () {
-        const optimizer = Optimizer.adamW({ weightDecay: 0.01 })
+        const optimizer = yield* Optimizer.adamW({ weightDecay: 0.01 })
         const p = yield* f32([1, -1])
         const g = yield* f32([0.1, 0.2])
         const state = yield* optimizer.init([p])
@@ -154,8 +154,8 @@ onDevices("Optimizer", () => (it) => {
 
     it.effect("weight decay scales with lr", () =>
       Effect.gen(function* () {
-        const plain = Optimizer.adam()
-        const decayed = Optimizer.adamW({ weightDecay: 1 })
+        const plain = yield* Optimizer.adam()
+        const decayed = yield* Optimizer.adamW({ weightDecay: 1 })
         const p1 = yield* f32([1])
         const p2 = yield* f32([1])
         const g1 = yield* f32([0.5])
@@ -176,7 +176,7 @@ onDevices("Optimizer", () => (it) => {
       Effect.gen(function* () {
         const x = yield* f32([1, 2, 2, 5, 4, 3, 5, 8], [4, 2])
         const y = yield* f32([7, 18, 16, 33], [4, 1])
-        const optimizer = Optimizer.adam()
+        const optimizer = yield* Optimizer.adam()
         const lossOf = (w: Tensor.Any, b: Tensor.Any) =>
           Effect.gen(function* () {
             const pred = yield* Tensor.add(yield* Tensor.matmul(x, w), b)
@@ -204,7 +204,7 @@ onDevices("Optimizer", () => (it) => {
 
     it.effect("the joint walk computes the same loss as a loss-only walk", () =>
       Effect.gen(function* () {
-        const optimizer = Optimizer.sgd()
+        const optimizer = yield* Optimizer.sgd()
         const p = yield* f32([1, 2, 3])
         const state = yield* optimizer.init([p])
         const loss = yield* Tensor.sum(yield* Tensor.mul(p, p))
@@ -218,7 +218,7 @@ onDevices("Optimizer", () => (it) => {
 
     it.effect("returned params and state tensors are materialized leaves, across steps", () =>
       Effect.gen(function* () {
-        const optimizer = Optimizer.adam()
+        const optimizer = yield* Optimizer.adam()
         const p = yield* f32([1, 2])
         let params: ReadonlyArray<Tensor.Any> = [p]
         let state = yield* optimizer.init(params)
@@ -289,7 +289,7 @@ onDevices("Optimizer", () => (it) => {
     it.effect("rejects non-float parameters at init", () =>
       Effect.gen(function* () {
         const p = yield* Tensor.fromTypedArray(new BigInt64Array([1n]))
-        const optimizer = Optimizer.sgd()
+        const optimizer = yield* Optimizer.sgd()
         const error = yield* Effect.flip(optimizer.init([p]))
         expect(error.message).toContain("f32 or f64")
       })
@@ -297,7 +297,7 @@ onDevices("Optimizer", () => (it) => {
 
     it.effect("rejects mismatched params/grads lengths", () =>
       Effect.gen(function* () {
-        const optimizer = Optimizer.sgd()
+        const optimizer = yield* Optimizer.sgd()
         const p = yield* f32([1])
         const g = yield* f32([1])
         const state = yield* optimizer.init([p])
@@ -309,7 +309,7 @@ onDevices("Optimizer", () => (it) => {
 
     it.effect("rejects state built for different parameters", () =>
       Effect.gen(function* () {
-        const optimizer = Optimizer.adam()
+        const optimizer = yield* Optimizer.adam()
         const a = yield* f32([1])
         const b = yield* f32([1, 2])
         const g = yield* f32([0.5, 0.5])
@@ -336,7 +336,7 @@ onDevices("Optimizer", () => (it) => {
 
     it.effect("rejects a non-scalar learning rate at step", () =>
       Effect.gen(function* () {
-        const optimizer = Optimizer.adam()
+        const optimizer = yield* Optimizer.adam()
         const p = yield* f32([1])
         const g = yield* f32([0.5])
         const state = yield* optimizer.init([p])
@@ -357,7 +357,7 @@ onDevices("Optimizer", () => (it) => {
             let params: ReadonlyArray<Tensor.Any> = [
               yield* Tensor.fromTypedArray(floats([0.5, -0.5]))
             ]
-            const optimizer = Optimizer.sgd({ momentum, ...config })
+            const optimizer = yield* Optimizer.sgd({ momentum, ...config })
             let state = yield* optimizer.init(params)
             const lrT = yield* Tensor.full([], lr, { dtype: "f32" })
             for (let i = 0; i < 20; i++) {
@@ -436,7 +436,7 @@ onDevices("Optimizer", () => (it) => {
             let params: ReadonlyArray<Tensor.Any> = [
               yield* Tensor.fromTypedArray(floats([0, 0]))
             ]
-            const optimizer = Optimizer.adamW()
+            const optimizer = yield* Optimizer.adamW()
             let state = yield* optimizer.init(params)
             const lr = yield* Tensor.full([], 0.05, { dtype: "f32" })
             for (let i = 0; i < 20; i++) {
@@ -566,7 +566,7 @@ onDevices("Optimizer", () => (it) => {
         const w = yield* Tensor.fromTypedArray(floats([0, 0]))
         const x = yield* Tensor.fromTypedArray(floats([1, 1, 2, 1, 3, 1, 4, 1]), [4, 2])
         const y = yield* Tensor.fromTypedArray(floats([2, 3, 4, 5]), [4, 1])
-        const optimizer = Optimizer.adam()
+        const optimizer = yield* Optimizer.adam()
         let params: ReadonlyArray<Tensor.Any> = [w]
         let state = yield* optimizer.init(params)
         for (let t = 0; t < 200; t++) {

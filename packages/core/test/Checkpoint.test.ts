@@ -73,7 +73,7 @@ onDevices("Checkpoint", () => (it) => {
     Effect.gen(function* () {
       const dir = yield* tmpdir
       const file = path.join(dir, "state.safetensors")
-      const optimizer = Optimizer.adam()
+      const optimizer = yield* Optimizer.adam()
       const p = yield* Tensor.fromTypedArray(floats([1, -1]), [2])
       const state = yield* optimizer.init([p])
       const loss = yield* Tensor.sum(yield* Tensor.mul(p, p))
