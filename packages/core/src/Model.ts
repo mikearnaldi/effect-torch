@@ -863,9 +863,9 @@ export const mapInput = (
  * {@link ModelError} when the array is empty or when parameter names
  * collide.
  *
- * The pattern for non-sequential tops: token + position embeddings is
- * `merge([wte, mapInput(wpe, positions)], (x, y) => Tensor.add(x, y))`,
- * and {@link residual} is `merge([identity, block], ...)`.
+ * The common case — adding the branches, as in token + position
+ * embeddings — has its own combinator: {@link add}. {@link residual} is
+ * the special case where one branch is the identity.
  *
  * @since 0.1.0
  * @category combinators
@@ -915,6 +915,29 @@ export const merge = <const M extends ReadonlyArray<Model>>(
       })
   })
 }
+
+/**
+ * Adds the outputs of several models over a shared input elementwise:
+ * `forward(params, input) = Σᵢ models[i].forward(paramsᵢ, input)` with
+ * each model's parameters sliced by arity from the concatenated array.
+ * The standard non-sequential top — token + position embeddings is
+ * `add(wte, wpe)`; {@link residual} is the special case where one branch
+ * is the identity. `names` and `init` follow {@link merge}. Fails with a
+ * {@link ModelError} when the chain is empty or parameter names collide.
+ *
+ * @since 0.1.0
+ * @category combinators
+ */
+export const add = (...models: ReadonlyArray<Model>): Effect.Effect<Model, ModelError> =>
+  merge(models, (first, ...rest) =>
+    Effect.gen(function* () {
+      let acc: Tensor.Any = first
+      for (const output of rest) {
+        acc = yield* Tensor.add(acc, output)
+      }
+      return acc as Tensor.Lazy
+    })
+  )
 
 /**
  * Composes models into a single model that threads its input through each

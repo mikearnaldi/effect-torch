@@ -181,6 +181,39 @@ onDevices("Model", () => (it) => {
         deep(yield* values(viaModel), yield* values(byHand))
       })
     )
+
+    it.effect("add sums the branches' outputs over a shared input", () =>
+      Effect.gen(function* () {
+        const model = yield* Model.add(
+          yield* Model.linear("a", 2, 2),
+          yield* Model.linear("b", 2, 2),
+          yield* Model.relu
+        )
+        const params = yield* Tensor.compute(yield* model.init)
+        const x = yield* Tensor.fromTypedArray(floats([1, 2, 3, 4]), [2, 2])
+        const manual = Effect.gen(function* () {
+          const [wa, ba, wb, bb] = params
+          const a = yield* Tensor.add(yield* Tensor.matmul(x, wa), ba)
+          const b = yield* Tensor.add(yield* Tensor.matmul(x, wb), bb)
+          return yield* Tensor.add(yield* Tensor.add(a, b), yield* Tensor.relu(x))
+        })
+        const [viaModel] = yield* Tensor.compute([yield* model.forward(params, x)])
+        const [byHand] = yield* Tensor.compute([yield* manual])
+        deep(yield* values(viaModel), yield* values(byHand))
+      })
+    )
+
+    it.effect("add fails on an empty chain and on colliding parameter names", () =>
+      Effect.gen(function* () {
+        const empty = yield* Effect.flip(Model.add())
+        expect(empty._tag).toBe("ModelError")
+        const colliding = yield* Effect.flip(Model.add(
+          yield* Model.linear("a", 2, 2),
+          yield* Model.linear("a", 2, 2)
+        ))
+        expect(colliding._tag).toBe("ModelError")
+      })
+    )
   })
 
   describe("layers", () => {
