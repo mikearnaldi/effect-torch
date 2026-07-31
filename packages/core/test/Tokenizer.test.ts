@@ -204,7 +204,7 @@ onDevices("Tokenizer", () => (it) => {
             vocabSize: 300,
             minFrequency: 2,
             specialTokens: [],
-            progress: Tokenizer.trainProgressReport((processed, total) =>
+            progress: Tokenizer.trainProgressReport(128, (processed, total) =>
               Effect.sync(() => events.push([processed, total]))
             )
           },
@@ -218,6 +218,48 @@ onDevices("Tokenizer", () => (it) => {
         expect(events.at(-1)).toEqual([total, total])
         const processed = events.map(([p]) => p)
         expect([...processed].sort((a, b) => a - b)).toEqual(processed)
+        expect(events.length).toBeLessThanOrEqual(Math.ceil(total / 128) + 1)
+      })
+    )
+
+    it.effect("everyBytes 0 disables reporting entirely", () =>
+      Effect.gen(function* () {
+        const events: Array<[number, number]> = []
+        yield* Tokenizer.train(
+          {
+            source: Tokenizer.trainTexts(corpusTexts),
+            model: "BPE",
+            vocabSize: 300,
+            minFrequency: 2,
+            specialTokens: [],
+            progress: Tokenizer.trainProgressReport(0, (processed, total) =>
+              Effect.sync(() => events.push([processed, total]))
+            )
+          },
+          Tokenizer.strictConfig
+        )
+        expect(events).toEqual([])
+      })
+    )
+
+    it.effect("everyBytes bounds the report frequency", () =>
+      Effect.gen(function* () {
+        const events: Array<[number, number]> = []
+        const total = corpusTexts.reduce((sum, text) => sum + text.length, 0)
+        yield* Tokenizer.train(
+          {
+            source: Tokenizer.trainTexts(corpusTexts),
+            model: "BPE",
+            vocabSize: 300,
+            minFrequency: 2,
+            specialTokens: [],
+            progress: Tokenizer.trainProgressReport(total, (processed, total) =>
+              Effect.sync(() => events.push([processed, total]))
+            )
+          },
+          Tokenizer.strictConfig
+        )
+        expect(events).toEqual([[total, total]])
       })
     )
   })

@@ -284,16 +284,18 @@ impl NativeTokenizer {
         })
     }
 
-    #[napi(factory, ts_args_type = "config: NativeTrainConfig, parseSpecials: boolean, progress: (event: [number, number]) => void")]
+    #[napi(factory, ts_args_type = "config: NativeTrainConfig, parseSpecials: boolean, progress: (event: [number, number]) => void, progressEveryBytes: number")]
     pub async fn train(
         config: NativeTrainConfig,
         parse_specials: bool,
         progress: ProgressCallback,
+        progress_every_bytes: f64,
     ) -> Result<Self> {
-        let tokenizer =
-            tokio::task::spawn_blocking(move || train_tokenizer(config, Some(progress)))
-                .await
-                .map_err(crate::to_join_err)??;
+        let tokenizer = tokio::task::spawn_blocking(move || {
+            train_tokenizer(config, Some(progress), progress_every_bytes as u64)
+        })
+        .await
+        .map_err(crate::to_join_err)??;
         Ok(Self {
             inner: Arc::new(TokenizerInner::new(tokenizer, parse_specials)),
         })
@@ -410,6 +412,7 @@ struct ProgressFeed<I> {
     inner: I,
     processed: u64,
     total: u64,
+    step: u64,
     report: Option<ProgressCallback>,
     last_reported: u64,
     finished: bool,
@@ -423,9 +426,8 @@ impl<I: Iterator<Item = String>> Iterator for ProgressFeed<I> {
             Some(item) => {
                 self.processed += item.len() as u64;
                 if let Some(callback) = &self.report {
-                    // Throttle to ~64 reports per feed plus completion.
-                    let step = (self.total / 64).max(1);
-                    if self.processed - self.last_reported >= step {
+                    // step 0 disables reporting entirely.
+                    if self.step > 0 && self.processed - self.last_reported >= self.step {
                         self.last_reported = self.processed;
                         let _ = callback.call(
                             (self.processed as f64, self.total as f64),
@@ -438,11 +440,16 @@ impl<I: Iterator<Item = String>> Iterator for ProgressFeed<I> {
             None => {
                 if !self.finished {
                     self.finished = true;
-                    if let Some(callback) = &self.report {
-                        let _ = callback.call(
-                            (self.total as f64, self.total as f64),
-                            ThreadsafeFunctionCallMode::NonBlocking,
-                        );
+                    // Completion pins (total, total): Texts reach it exactly
+                    // (skip if already reported), Files undershoot by the
+                    // stripped newlines and need the pin.
+                    if self.step > 0 && self.last_reported != self.total {
+                        if let Some(callback) = &self.report {
+                            let _ = callback.call(
+                                (self.total as f64, self.total as f64),
+                                ThreadsafeFunctionCallMode::NonBlocking,
+                            );
+                        }
                     }
                 }
                 None
@@ -461,6 +468,7 @@ impl<I: Iterator<Item = String>> Iterator for ProgressFeed<I> {
 fn corpus_iter(
     source: NativeTrainSource,
     report: Option<ProgressCallback>,
+    step: u64,
 ) -> Result<ProgressFeed<Box<dyn Iterator<Item = String> + Send>>> {
     let (inner, total): (Box<dyn Iterator<Item = String> + Send>, u64) = match source.tag.as_str() {
         "Files" => {
@@ -503,6 +511,7 @@ fn corpus_iter(
         inner,
         processed: 0,
         total,
+        step,
         report,
         last_reported: 0,
         finished: false,
@@ -514,15 +523,20 @@ fn run_trainer(
     trainer: &mut TrainerWrapper,
     source: NativeTrainSource,
     report: Option<ProgressCallback>,
+    step: u64,
 ) -> Result<()> {
-    let feed = corpus_iter(source, report)?;
+    let feed = corpus_iter(source, report, step)?;
     tokenizer
         .train(trainer, feed)
         .map_err(to_napi_error)?;
     Ok(())
 }
 
-fn train_tokenizer(config: NativeTrainConfig, report: Option<ProgressCallback>) -> Result<Tokenizer> {
+fn train_tokenizer(
+    config: NativeTrainConfig,
+    report: Option<ProgressCallback>,
+    progress_step: u64,
+) -> Result<Tokenizer> {
     let special_tokens = added_specials(&config.special_tokens);
     let vocab_size = config.vocab_size as usize;
     let min_frequency = config.min_frequency;
@@ -544,7 +558,7 @@ fn train_tokenizer(config: NativeTrainConfig, report: Option<ProgressCallback>) 
                     .initial_alphabet(ByteLevel::alphabet().into_iter().collect())
                     .build(),
             );
-            run_trainer(&mut tokenizer, &mut trainer, source, report)?;
+            run_trainer(&mut tokenizer, &mut trainer, source, report, progress_step)?;
             tokenizer.add_special_tokens(&special_tokens);
             Ok(tokenizer)
         }
@@ -568,7 +582,7 @@ fn train_tokenizer(config: NativeTrainConfig, report: Option<ProgressCallback>) 
                     .special_tokens(specials.clone())
                     .build(),
             );
-            run_trainer(&mut tokenizer, &mut trainer, source, report)?;
+            run_trainer(&mut tokenizer, &mut trainer, source, report, progress_step)?;
             tokenizer.add_special_tokens(&specials);
             Ok(tokenizer)
         }
@@ -584,7 +598,7 @@ fn train_tokenizer(config: NativeTrainConfig, report: Option<ProgressCallback>) 
                     .build()
                     .map_err(to_napi_error)?,
             );
-            run_trainer(&mut tokenizer, &mut trainer, source, report)?;
+            run_trainer(&mut tokenizer, &mut trainer, source, report, progress_step)?;
             tokenizer.add_special_tokens(&special_tokens);
             Ok(tokenizer)
         }
@@ -600,7 +614,7 @@ fn train_tokenizer(config: NativeTrainConfig, report: Option<ProgressCallback>) 
                     .build()
                     .map_err(to_napi_error)?,
             );
-            run_trainer(&mut tokenizer, &mut trainer, source, report)?;
+            run_trainer(&mut tokenizer, &mut trainer, source, report, progress_step)?;
             tokenizer.add_special_tokens(&special_tokens);
             Ok(tokenizer)
         }

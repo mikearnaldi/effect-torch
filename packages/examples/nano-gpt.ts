@@ -166,7 +166,14 @@ const program = Effect.gen(function* () {
 
   yield* Effect.log(`0) training BPE tokenizer (target vocab ${VOCAB})`)
   const tokenizer = yield* Tokenizer.train(
-    { source: Tokenizer.trainTexts([CORPUS]), model: "BPE", vocabSize: VOCAB, minFrequency: 2, specialTokens: [], progress: Tokenizer.trainProgressNone },
+    { 
+      source: Tokenizer.trainTexts(CORPUS.split("\n")),
+      model: "BPE",
+      vocabSize: VOCAB,
+      minFrequency: 2,
+      specialTokens: [],
+      progress: Tokenizer.trainProgressReport(256, (processed, total) => Effect.log(`tokenizer feed ${processed}/${total}`))
+    },
     Tokenizer.strictConfig
   )
   const vocabSize = tokenizer.vocabSize

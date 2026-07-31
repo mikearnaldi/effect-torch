@@ -203,11 +203,17 @@ export const trainTexts = (texts: ReadonlyArray<string>): TrainSource => ({
 
 /**
  * Training progress reporting. The corpus feed is the dominant cost on
- * large corpora and is reported as `(processed, total)` corpus bytes,
- * throttled natively one final `(total, total)` event signals that the
- * feed is complete and the (indeterminate) merge computation has begun.
- * The callback runs on the JS thread — what to do with the events (log,
- * render, ignore) is the caller's decision.
+ * large corpora and is reported as `(processed, total)` corpus bytes; one
+ * final `(total, total)` event signals that the feed is complete and the
+ * (indeterminate) merge computation has begun. Reports are throttled by
+ * `everyBytes`: the callback fires at most once per `everyBytes` corpus
+ * bytes consumed; `everyBytes: 0` disables reporting (including the
+ * completion event) entirely. Granularity is per sequence: progress
+ * advances as
+ * corpus sequences are pulled, so a corpus of many short sequences (e.g.
+ * lines) reports smoothly while a single huge sequence reports once. The
+ * callback runs on the JS thread and returns an Effect — what to do with
+ * the events (log, render, ignore) is the caller's decision.
  *
  * @since 0.1.0
  * @category models
@@ -215,12 +221,10 @@ export const trainTexts = (texts: ReadonlyArray<string>): TrainSource => ({
 export type TrainProgress<E, R> =
   | { readonly _tag: "None" }
   | {
-      readonly _tag: "Report"
-      readonly report: (
-        processed: number,
-        total: number,
-      ) => Effect.Effect<void, E, R>
-    }
+    readonly _tag: "Report"
+    readonly everyBytes: number
+    readonly report: (processed: number, total: number) => Effect.Effect<void, E, R>
+  }
 
 /**
  * @since 0.1.0
@@ -229,12 +233,15 @@ export type TrainProgress<E, R> =
 export const trainProgressNone: TrainProgress<never, never> = { _tag: "None" }
 
 /**
+ * Reports at most once per `everyBytes` corpus bytes consumed.
+ *
  * @since 0.1.0
  * @category constructors
  */
 export const trainProgressReport = <E, R>(
-  report: (processed: number, total: number) => Effect.Effect<void, E, R>,
-): TrainProgress<E, R> => ({ _tag: "Report", report })
+  everyBytes: number,
+  report: (processed: number, total: number) => Effect.Effect<void, E, R>
+): TrainProgress<E, R> => ({ _tag: "Report", everyBytes, report })
 
 /**
  * Configuration for {@link train}. Training is deterministic and streams
@@ -482,6 +489,8 @@ export const train = <E = never, R = never>(
               )
             }
           : () => {}
+      const progressEveryBytes =
+        progress._tag === "Report" ? Math.max(0, Math.floor(progress.everyBytes)) : 0
       NativeTokenizer.train(
         {
           model: trainConfig.model,
@@ -501,6 +510,7 @@ export const train = <E = never, R = never>(
         },
         config.specialTokens === "Always",
         onProgress,
+        progressEveryBytes,
       )
         .then((tensor) => {
           Queue.offerUnsafe(queue, Effect.succeed(tensor))

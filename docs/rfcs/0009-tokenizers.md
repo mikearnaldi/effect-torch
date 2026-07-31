@@ -191,9 +191,13 @@ export type TrainSource =
   | { readonly _tag: "Files"; readonly paths: ReadonlyArray<string> }
   | { readonly _tag: "Texts"; readonly texts: ReadonlyArray<string> }
 
-export type TrainProgress =
+export type TrainProgress<E, R> =
   | { readonly _tag: "None" }
-  | { readonly _tag: "Report"; readonly report: (processed: number, total: number) => void }
+  | {
+    readonly _tag: "Report"
+    readonly everyBytes: number
+    readonly report: (processed: number, total: number) => Effect<void, E, R>
+  }
 
 export interface TrainConfig {
   readonly source: TrainSource
@@ -225,14 +229,19 @@ immediately usable and `save`-able as `tokenizer.json`.
 disabled (`show_progress(false)`) — a library never prints unprompted.
 Instead the corpus iterator is instrumented: the crate consumes sequences
 through an iterator owned by the native layer, which counts corpus bytes
-as they are pulled and forwards throttled `(processed, total)` reports to
-JS over a napi `ThreadsafeFunction`. Totals are byte-exact (`Texts`:
-summed lengths; `Files`: summed file metadata). The feed phase is the
-dominant cost at dataset scale; the merge phase afterwards is a crate
-black box, so the protocol is determinate feed progress followed by one
-final `(total, total)` report when the iterator exhausts, then
-indeterminate until `train` resolves. What to do with the events — log,
-render, ignore — is the caller's decision.
+as they are pulled and forwards `(processed, total)` reports to JS over a
+napi `ThreadsafeFunction`, throttled by the caller's `everyBytes`
+interval (at most one report per `everyBytes` corpus bytes consumed;
+`0` disables reporting, including the completion event).
+Totals are byte-exact (`Texts`: summed lengths; `Files`: summed file
+metadata). The feed phase is the dominant cost at dataset scale; the
+merge phase afterwards is a crate black box, so the protocol is
+determinate feed progress followed by one final `(total, total)` report
+when the iterator exhausts, then indeterminate until `train` resolves.
+Report handlers are Effect-returning: `train` runs them in order through
+a `Stream.callback` queue and yields the tokenizer as the stream's last
+element, so logging, rendering or ignoring events is an ordinary Effect
+composition.
 
 ### Tensor integration
 
