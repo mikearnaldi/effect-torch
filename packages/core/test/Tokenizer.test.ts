@@ -29,7 +29,8 @@ const trainBpe = (
       model: "BPE",
       vocabSize: 300,
       minFrequency: 2,
-      specialTokens
+      specialTokens,
+      progress: Tokenizer.trainProgressNone
     },
     config
   )
@@ -82,7 +83,8 @@ onDevices("Tokenizer", () => (it) => {
             model: "BPE",
             vocabSize: 300,
             minFrequency: 2,
-            specialTokens: ["<|endoftext|>"]
+            specialTokens: ["<|endoftext|>"],
+            progress: Tokenizer.trainProgressNone
           },
           Tokenizer.strictConfig
         )
@@ -187,6 +189,37 @@ onDevices("Tokenizer", () => (it) => {
     )
   })
 
+  describe("training progress", () => {
+    // No waiting needed: the final (total, total) event is posted when the
+    // feed iterator exhausts — before the merge phase, so all progress
+    // callbacks are queued on the event loop ahead of train's resolution.
+    it.effect("reports throttled byte progress ending at (total, total)", () =>
+      Effect.gen(function* () {
+        const events: Array<[number, number]> = []
+        const total = corpusTexts.reduce((sum, text) => sum + text.length, 0)
+        yield* Tokenizer.train(
+          {
+            source: Tokenizer.trainTexts(corpusTexts),
+            model: "BPE",
+            vocabSize: 300,
+            minFrequency: 2,
+            specialTokens: [],
+            progress: Tokenizer.trainProgressReport((processed, total) => events.push([processed, total]))
+          },
+          Tokenizer.strictConfig
+        )
+        expect(events.length).toBeGreaterThan(0)
+        for (const [processed, reported] of events) {
+          expect(reported).toBe(total)
+          expect(processed).toBeLessThanOrEqual(total)
+        }
+        expect(events.at(-1)).toEqual([total, total])
+        const processed = events.map(([p]) => p)
+        expect([...processed].sort((a, b) => a - b)).toEqual(processed)
+      })
+    )
+  })
+
   describe("model families", () => {
     const train = (model: Tokenizer.TrainModel, vocabSize: number) =>
       Tokenizer.train(
@@ -195,7 +228,8 @@ onDevices("Tokenizer", () => (it) => {
           model,
           vocabSize,
           minFrequency: 2,
-          specialTokens: []
+          specialTokens: [],
+          progress: Tokenizer.trainProgressNone
         },
         Tokenizer.strictConfig
       )

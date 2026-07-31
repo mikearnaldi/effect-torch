@@ -191,30 +191,48 @@ export type TrainSource =
   | { readonly _tag: "Files"; readonly paths: ReadonlyArray<string> }
   | { readonly _tag: "Texts"; readonly texts: ReadonlyArray<string> }
 
+export type TrainProgress =
+  | { readonly _tag: "None" }
+  | { readonly _tag: "Report"; readonly report: (processed: number, total: number) => void }
+
 export interface TrainConfig {
   readonly source: TrainSource
   readonly model: TrainModel
   readonly vocabSize: number
   readonly minFrequency: number
   readonly specialTokens: ReadonlyArray<string>
+  readonly progress: TrainProgress
 }
 ```
 
-The corpus comes from raw text `Files` streamed from disk (dataset scale)
-or `Texts` already in memory (small corpora, generated data) — an
-explicit union, never a file written just to satisfy the API.
+The corpus comes from raw text `Files` streamed line-by-line from disk
+(dataset scale — feeding GBs never loads them) or `Texts` already in
+memory (small corpora, generated data) — an explicit union, never a file
+written just to satisfy the API.
 
 Pipeline defaults follow the canonical setups: BPE trains byte-level
 (GPT-2 style: no prefix space, regex splitting, full 256-byte alphabet
 seeded), WordPiece with the BERT normalizer and `##` continuations,
 Unigram with the SentencePiece `▁` metaspace convention, WordLevel on
-whitespace-split words. Training is deterministic and streams from
-files. Id allocation follows the `tokenizers` crate convention: special
-tokens first, then the alphabet, then merges or pieces in rank order;
-trained special tokens are registered as added tokens so they persist in
-`tokenizer.json` and are visible to the special-token policy. The
-resulting tokenizer is immediately usable and `save`-able as
-`tokenizer.json`.
+whitespace-split words. Training is deterministic. Id allocation follows
+the `tokenizers` crate convention: special tokens first, then the
+alphabet, then merges or pieces in rank order; trained special tokens
+are registered as added tokens so they persist in `tokenizer.json` and
+are visible to the special-token policy. The resulting tokenizer is
+immediately usable and `save`-able as `tokenizer.json`.
+
+**Progress reporting.** The crate's built-in indicatif progress bars are
+disabled (`show_progress(false)`) — a library never prints unprompted.
+Instead the corpus iterator is instrumented: the crate consumes sequences
+through an iterator owned by the native layer, which counts corpus bytes
+as they are pulled and forwards throttled `(processed, total)` reports to
+JS over a napi `ThreadsafeFunction`. Totals are byte-exact (`Texts`:
+summed lengths; `Files`: summed file metadata). The feed phase is the
+dominant cost at dataset scale; the merge phase afterwards is a crate
+black box, so the protocol is determinate feed progress followed by one
+final `(total, total)` report when the iterator exhausts, then
+indeterminate until `train` resolves. What to do with the events — log,
+render, ignore — is the caller's decision.
 
 ### Tensor integration
 

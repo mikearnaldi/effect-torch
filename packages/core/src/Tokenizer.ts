@@ -175,6 +175,35 @@ export const trainFiles = (paths: ReadonlyArray<string>): TrainSource => ({ _tag
 export const trainTexts = (texts: ReadonlyArray<string>): TrainSource => ({ _tag: "Texts", texts })
 
 /**
+ * Training progress reporting. The corpus feed is the dominant cost on
+ * large corpora and is reported as `(processed, total)` corpus bytes,
+ * throttled natively; one final `(total, total)` event signals that the
+ * feed is complete and the (indeterminate) merge computation has begun.
+ * The callback runs on the JS thread — what to do with the events (log,
+ * render, ignore) is the caller's decision.
+ *
+ * @since 0.1.0
+ * @category models
+ */
+export type TrainProgress<E, R> =
+  | { readonly _tag: "None" }
+  | { readonly _tag: "Report"; readonly report: (processed: number, total: number) => Effect.Effect<void, E, R> }
+
+/**
+ * @since 0.1.0
+ * @category constructors
+ */
+export const trainProgressNone: TrainProgress<never, never> = { _tag: "None" }
+
+/**
+ * @since 0.1.0
+ * @category constructors
+ */
+export const trainProgressReport = (
+  report: (processed: number, total: number) => void
+): TrainProgress => ({ _tag: "Report", report })
+
+/**
  * Configuration for {@link train}. Training is deterministic and streams
  * from the given source. Ids are allocated special tokens first, then the
  * alphabet (BPE seeds the full 256-byte alphabet), then merges or pieces
@@ -189,6 +218,7 @@ export interface TrainConfig {
   readonly vocabSize: number
   readonly minFrequency: number
   readonly specialTokens: ReadonlyArray<string>
+  readonly progress: TrainProgress
 }
 
 /**
@@ -374,8 +404,12 @@ export const fromJson = (
 export const train = (
   trainConfig: TrainConfig,
   config: TokenizerConfig
-): Effect.Effect<Tokenizer, TokenizerError> =>
-  Effect.tryPromise({
+): Effect.Effect<Tokenizer, TokenizerError> => {
+  const progress = trainConfig.progress
+  const onProgress = progress._tag === "Report"
+    ? (event: [number, number]) => progress.report(event[0], event[1])
+    : () => {}
+  return Effect.tryPromise({
     try: async () =>
       make(
         await NativeTokenizer.train(
@@ -388,12 +422,14 @@ export const train = (
               ? { tag: "Files", paths: trainConfig.source.paths as Array<string> }
               : { tag: "Texts", texts: trainConfig.source.texts as Array<string> }
           },
-          config.specialTokens === "Always"
+          config.specialTokens === "Always",
+          onProgress
         ),
         config
       ),
     catch: toTokenizerError("train")
   })
+}
 
 /**
  * Returns `true` if the value is a {@link Tokenizer}.

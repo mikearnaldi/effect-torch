@@ -101,7 +101,7 @@ export declare class NativeTensor {
 export declare class NativeTokenizer {
   static fromFile(path: string, parseSpecials: boolean): NativeTokenizer
   static fromJson(json: string, parseSpecials: boolean): NativeTokenizer
-  static train(config: NativeTrainConfig, parseSpecials: boolean): Promise<NativeTokenizer>
+  static train(config: NativeTrainConfig, parseSpecials: boolean, progress: (event: [number, number]) => void): Promise<NativeTokenizer>
   get vocabSize(): number
   tokenToId(token: string): number | null
   idToToken(id: number): string | null

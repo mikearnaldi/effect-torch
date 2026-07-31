@@ -1,8 +1,10 @@
 use crate::{get_device, LazyTensor};
 use crate::{DType, Node, NodeKind};
 use napi::bindgen_prelude::*;
+use napi::threadsafe_function::{ThreadsafeFunction, ThreadsafeFunctionCallMode};
 use napi_derive::napi;
 use rayon::prelude::*;
+use std::io::BufRead;
 use std::sync::Arc;
 use tokenizers::decoders::{
     byte_level::ByteLevel as ByteLevelDecoder, metaspace::Metaspace as MetaspaceDecoder,
@@ -282,11 +284,16 @@ impl NativeTokenizer {
         })
     }
 
-    #[napi(factory)]
-    pub async fn train(config: NativeTrainConfig, parse_specials: bool) -> Result<Self> {
-        let tokenizer = tokio::task::spawn_blocking(move || train_tokenizer(config))
-            .await
-            .map_err(crate::to_join_err)??;
+    #[napi(factory, ts_args_type = "config: NativeTrainConfig, parseSpecials: boolean, progress: (event: [number, number]) => void")]
+    pub async fn train(
+        config: NativeTrainConfig,
+        parse_specials: bool,
+        progress: ProgressCallback,
+    ) -> Result<Self> {
+        let tokenizer =
+            tokio::task::spawn_blocking(move || train_tokenizer(config, Some(progress)))
+                .await
+                .map_err(crate::to_join_err)??;
         Ok(Self {
             inner: Arc::new(TokenizerInner::new(tokenizer, parse_specials)),
         })
@@ -391,40 +398,99 @@ fn added_specials(special_tokens: &[String]) -> Vec<AddedToken> {
         .collect()
 }
 
-fn run_trainer(
-    tokenizer: &mut Tokenizer,
-    trainer: &mut TrainerWrapper,
+type ProgressCallback = ThreadsafeFunction<(f64, f64), Unknown<'static>, (f64, f64), Status, false>;
+
+// The crate offers no progress hook (its indicatif bars are internal and
+// disabled above), but it consumes the corpus through an iterator we own:
+// count corpus bytes as they are pulled and forward (processed, total) to
+// JS. The feed phase is the dominant cost on large corpora; the merge phase
+// afterwards is a black box, so completion of the feed is signalled by one
+// final (total, total) report when the iterator is exhausted.
+struct ProgressFeed<I> {
+    inner: I,
+    processed: u64,
+    total: u64,
+    report: Option<ProgressCallback>,
+    last_reported: u64,
+    finished: bool,
+}
+
+impl<I: Iterator<Item = String>> Iterator for ProgressFeed<I> {
+    type Item = String;
+
+    fn next(&mut self) -> Option<String> {
+        match self.inner.next() {
+            Some(item) => {
+                self.processed += item.len() as u64;
+                if let Some(callback) = &self.report {
+                    // Throttle to ~64 reports per feed plus completion.
+                    let step = (self.total / 64).max(1);
+                    if self.processed - self.last_reported >= step {
+                        self.last_reported = self.processed;
+                        let _ = callback.call(
+                            (self.processed as f64, self.total as f64),
+                            ThreadsafeFunctionCallMode::NonBlocking,
+                        );
+                    }
+                }
+                Some(item)
+            }
+            None => {
+                if !self.finished {
+                    self.finished = true;
+                    if let Some(callback) = &self.report {
+                        let _ = callback.call(
+                            (self.total as f64, self.total as f64),
+                            ThreadsafeFunctionCallMode::NonBlocking,
+                        );
+                    }
+                }
+                None
+            }
+        }
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.inner.size_hint()
+    }
+}
+
+// Streams the corpus as an iterator of sequences with a byte-exact total:
+// Texts from memory, Files line-by-line (so feeding GBs does not load them)
+// with totals from file metadata. Both sources share one training path.
+fn corpus_iter(
     source: NativeTrainSource,
-) -> Result<()> {
-    match source.tag.as_str() {
+    report: Option<ProgressCallback>,
+) -> Result<ProgressFeed<Box<dyn Iterator<Item = String> + Send>>> {
+    let (inner, total): (Box<dyn Iterator<Item = String> + Send>, u64) = match source.tag.as_str() {
         "Files" => {
-            tokenizer
-                .train_from_files(
-                    trainer,
-                    source.paths.ok_or_else(|| {
-                        Error::new(
-                            Status::InvalidArg,
-                            "train: Files source requires paths".to_string(),
-                        )
-                    })?,
-                )
-                .map_err(to_napi_error)?;
+            let paths = source.paths.ok_or_else(|| {
+                Error::new(Status::InvalidArg, "train: Files source requires paths".to_string())
+            })?;
+            let mut readers = Vec::with_capacity(paths.len());
+            let mut total = 0u64;
+            for path in &paths {
+                total += std::fs::metadata(path)
+                    .map_err(|e| Error::new(Status::GenericFailure, format!("train: {path}: {e}")))?
+                    .len();
+                readers.push(std::io::BufReader::new(std::fs::File::open(path).map_err(
+                    |e| Error::new(Status::GenericFailure, format!("train: {path}: {e}")),
+                )?));
+            }
+            // Line lengths exclude the stripped newline; +1 per line
+            // approximates raw bytes and the completion event pins total.
+            let lines = readers
+                .into_iter()
+                .flat_map(|reader| reader.lines().map_while(|line| line.ok()))
+                .map(|line| line);
+            (Box::new(lines), total)
         }
         "Texts" => {
-            tokenizer
-                .train(
-                    trainer,
-                    source
-                        .texts
-                        .ok_or_else(|| {
-                            Error::new(
-                                Status::InvalidArg,
-                                "train: Texts source requires texts".to_string(),
-                            )
-                        })?
-                        .into_iter(),
-                )
-                .map_err(to_napi_error)?;
+            let texts = source.texts.ok_or_else(|| {
+                Error::new(Status::InvalidArg, "train: Texts source requires texts".to_string())
+            })?;
+            let total = texts.iter().map(|text| text.len() as u64).sum();
+            (Box::new(texts.into_iter()), total)
         }
         tag => {
             return Err(Error::new(
@@ -432,11 +498,31 @@ fn run_trainer(
                 format!("train: unknown source tag {tag}"),
             ))
         }
-    }
+    };
+    Ok(ProgressFeed {
+        inner,
+        processed: 0,
+        total,
+        report,
+        last_reported: 0,
+        finished: false,
+    })
+}
+
+fn run_trainer(
+    tokenizer: &mut Tokenizer,
+    trainer: &mut TrainerWrapper,
+    source: NativeTrainSource,
+    report: Option<ProgressCallback>,
+) -> Result<()> {
+    let feed = corpus_iter(source, report)?;
+    tokenizer
+        .train(trainer, feed)
+        .map_err(to_napi_error)?;
     Ok(())
 }
 
-fn train_tokenizer(config: NativeTrainConfig) -> Result<Tokenizer> {
+fn train_tokenizer(config: NativeTrainConfig, report: Option<ProgressCallback>) -> Result<Tokenizer> {
     let special_tokens = added_specials(&config.special_tokens);
     let vocab_size = config.vocab_size as usize;
     let min_frequency = config.min_frequency;
@@ -458,7 +544,7 @@ fn train_tokenizer(config: NativeTrainConfig) -> Result<Tokenizer> {
                     .initial_alphabet(ByteLevel::alphabet().into_iter().collect())
                     .build(),
             );
-            run_trainer(&mut tokenizer, &mut trainer, source)?;
+            run_trainer(&mut tokenizer, &mut trainer, source, report)?;
             tokenizer.add_special_tokens(&special_tokens);
             Ok(tokenizer)
         }
@@ -482,7 +568,7 @@ fn train_tokenizer(config: NativeTrainConfig) -> Result<Tokenizer> {
                     .special_tokens(specials.clone())
                     .build(),
             );
-            run_trainer(&mut tokenizer, &mut trainer, source)?;
+            run_trainer(&mut tokenizer, &mut trainer, source, report)?;
             tokenizer.add_special_tokens(&specials);
             Ok(tokenizer)
         }
@@ -498,7 +584,7 @@ fn train_tokenizer(config: NativeTrainConfig) -> Result<Tokenizer> {
                     .build()
                     .map_err(to_napi_error)?,
             );
-            run_trainer(&mut tokenizer, &mut trainer, source)?;
+            run_trainer(&mut tokenizer, &mut trainer, source, report)?;
             tokenizer.add_special_tokens(&special_tokens);
             Ok(tokenizer)
         }
@@ -514,7 +600,7 @@ fn train_tokenizer(config: NativeTrainConfig) -> Result<Tokenizer> {
                     .build()
                     .map_err(to_napi_error)?,
             );
-            run_trainer(&mut tokenizer, &mut trainer, source)?;
+            run_trainer(&mut tokenizer, &mut trainer, source, report)?;
             tokenizer.add_special_tokens(&special_tokens);
             Ok(tokenizer)
         }
