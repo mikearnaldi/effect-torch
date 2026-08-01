@@ -2,15 +2,16 @@ import { Duration, Effect, Option } from "effect"
 import { NodeRuntime } from "@effect/platform-node"
 import { Device, LearningRate, Loss, Model, Optimizer, Tensor, Tokenizer, Trainer } from "@effect-torch/core"
 
-// A GPT with a byte-level BPE tokenizer (trained on the fly, RFC 0009)
-// on a few KB of public-domain verse: token embeddings, pre-norm
-// transformer blocks (causal multi-head attention with RoPE + MLP, each
-// under a residual connection), a final layer norm and a vocabulary
-// head. Everything is the stock Model combinators; attention is the
-// fused flash kernel on Metal. Generation runs through the compiled
-// inference artifact (RFC 0010): paged kv cache, prefill once, one
-// pooled step per token, sliding-window attention over the last BLOCK
-// positions — RoPE makes positions relative, so generation is unbounded.
+// A GPT with a Unigram tokenizer (byte fallback, trained on the fly,
+// RFC 0009) on a few KB of public-domain verse: token embeddings,
+// pre-norm transformer blocks (causal multi-head attention with RoPE +
+// MLP, each under a residual connection), a final layer norm and a
+// vocabulary head. Everything is the stock Model combinators; training
+// attention is the fused flash kernel on Metal. Generation runs through
+// the compiled inference artifact (RFC 0010): paged kv cache, chunked
+// prefill, one pooled step per token, sliding-window attention over the
+// last BLOCK positions with dead blocks evicted — RoPE makes positions
+// relative, so generation is unbounded at O(BLOCK) footprint.
 
 const CORPUS = `Shall I compare thee to a summer's day?
 Thou art more lovely and more temperate:
