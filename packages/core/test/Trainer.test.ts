@@ -1,5 +1,5 @@
 import { describe, expect } from "@effect/vitest"
-import { Effect } from "effect"
+import { Duration, Effect } from "effect"
 import { LearningRate, Loss, Model, Optimizer, Tensor, Trainer } from "../src/index.ts"
 import { floats, onDevices } from "./utils/devices.ts"
 
@@ -97,6 +97,31 @@ onDevices("Trainer", () => (it) => {
         yield* trainer.train()
         expect(seen.map(({ step }) => step)).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10])
         expect(seen.every(({ loss }) => Number.isFinite(loss))).toBe(true)
+        expect(seen.every(({ elapsed }) => Duration.toMillis(elapsed) >= 0)).toBe(true)
+        const millis = seen.map(({ elapsed }) => Duration.toMillis(elapsed))
+        expect([...millis].sort((a, b) => a - b)).toEqual(millis)
+      })
+    )
+
+    it.effect("each train run starts its own clock", () =>
+      Effect.gen(function* () {
+        const model = yield* mlp
+        const input = yield* Tensor.fromTypedArray(floats([0, 1, 1, 0]), [2, 2])
+        const target = yield* Tensor.fromTypedArray(floats([1, 0]), [2, 1])
+        const runs: Array<Array<number>> = []
+        const trainer = yield* Trainer.make(model, {
+          optimizer: yield* Optimizer.sgd(),
+          lr: LearningRate.constant(0.1),
+          loss: Loss.mse,
+          data: { input, target },
+          stop: ({ step }) => step >= 3,
+          onStep: ({ elapsed }) => Effect.sync(() => runs.at(-1)!.push(Duration.toMillis(elapsed)))
+        })
+        runs.push([])
+        yield* trainer.train()
+        runs.push([])
+        yield* trainer.train()
+        expect(runs[1][0]).toBeLessThanOrEqual(runs[0][2])
       })
     )
 

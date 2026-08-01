@@ -1,4 +1,4 @@
-import { Effect, Option } from "effect"
+import { Duration, Effect, Option } from "effect"
 import { NodeRuntime } from "@effect/platform-node"
 import { Device, LearningRate, Loss, Model, Optimizer, Tensor, Tokenizer, Trainer } from "@effect-torch/core"
 
@@ -72,11 +72,16 @@ const LAYERS = 2
 const BATCH = 16
 const STEPS = 400
 const LR = 3e-3
-const GENERATE = 240
 const TEMPERATURE = 0.8
 const VOCAB = 300
 const TOKENIZER_MODEL: Tokenizer.TrainModel = "Unigram"
 const BOS = "<|bos|>"
+const EOS = "<|eos|>"
+
+// The corpus is three poems: train and sample them as separate documents
+// wrapped in BOS/EOS, so the model learns both how texts start and how
+// they end (generation then stops at EOS instead of mid-sentence).
+const DOCUMENTS = CORPUS.split("\n\n").map((poem) => poem.trim() + "\n")
 
 const createGpt = (vocabSize: number) =>
   Effect.gen(function* () {
@@ -129,8 +134,6 @@ const sampleBatch = (data: ReadonlyArray<number>) =>
     }
   })
 
-const started = Date.now()
-
 // Create the trainer for the model, compiled. The batch shape is fixed,
 // so the whole run is served by one frozen step program; the first step
 // pays the trace.
@@ -142,10 +145,10 @@ const createTrainer = (model: Model.Model, data: ReadonlyArray<number>) =>
       loss: Loss.crossEntropy,
       data: () => sampleBatch(data),
       stop: ({ step }) => step >= STEPS,
-      onStep: ({ step, loss }) =>
+      onStep: ({ step, loss, elapsed }) =>
         step % 25 === 0 || step === 1
           ? Effect.log(
-            `step ${String(step).padStart(4)}  loss ${loss.toFixed(4)}  ${((Date.now() - started) / 1000).toFixed(1)}s`
+            `step ${String(step).padStart(4)}  loss ${loss.toFixed(4)}  ${(Duration.toMillis(elapsed) / 1000).toFixed(1)}s`
           )
           : Effect.void
     })
@@ -163,28 +166,75 @@ const init = (model: Model.Model) =>
     return params
   })
 
+// Generates a document from a prompt: seeds the context with BOS plus the
+// encoded prompt, then samples token by token until EOS — documents end
+// when the model says they end, not on a token budget. Each step re-runs the model on
+// the last BLOCK tokens: the window is right-padded to a fixed [1, BLOCK]
+// shape so generation is served by a single compiled program — positions
+// are window-relative (every window restarts at 0) and attention is
+// causal, so the real tokens never attend to the padding and their logits
+// are unchanged; the next-token logits are the row at the true last
+// token, not the padded last row.
+const generate = (
+  model: Model.CompiledModel,
+  tokenizer: Tokenizer.Tokenizer,
+  params: Model.Params,
+  prompt: string
+) =>
+  Effect.gen(function* () {
+    const vocabSize = tokenizer.vocabSize
+    const bosId = Option.getOrThrow(tokenizer.tokenToId(BOS))
+    const eosId = Option.getOrThrow(tokenizer.tokenToId(EOS))
+    const promptIds = yield* Tensor.toNumberArray(yield* tokenizer.encode(prompt))
+    const context = [bosId, ...promptIds]
+    for (;;) {
+      const window = context.slice(-BLOCK)
+      const idx = yield* ids([...window, ...new Array(BLOCK - window.length).fill(0)], [1, BLOCK])
+      const logits = yield* model.execute(params, idx)
+      const all = yield* Tensor.toNumberArray(logits)
+      const row = all.slice((window.length - 1) * vocabSize, window.length * vocabSize)
+      const max = Math.max(...row)
+      const exps = row.map((x) => Math.exp((x - max) / TEMPERATURE))
+      const total = exps.reduce((a, b) => a + b, 0)
+      let draw = Math.random() * total
+      let next = exps.length - 1
+      for (let i = 0; i < exps.length; i++) {
+        draw -= exps[i]
+        if (draw <= 0) {
+          next = i
+          break
+        }
+      }
+      if (next === eosId) break
+      context.push(next)
+    }
+    return yield* tokenizer.decode(context.slice(1 + promptIds.length))
+  })
+
 const program = Effect.gen(function* () {
   const device = yield* Device.CurrentDevice
 
   yield* Effect.log(`0) training ${TOKENIZER_MODEL} tokenizer (target vocab ${VOCAB})`)
   const tokenizer = yield* Tokenizer.train(
     {
-      source: Tokenizer.trainTexts(CORPUS.split(/(?<=\n)/)),
+      source: Tokenizer.trainTexts(DOCUMENTS.flatMap((poem) => poem.split(/(?<=\n)/))),
       model: TOKENIZER_MODEL,
       vocabSize: VOCAB,
       minFrequency: 2,
-      specialTokens: [BOS],
+      specialTokens: [BOS, EOS],
       progress: Tokenizer.trainProgressReport(256, (processed, total) => Effect.log(`tokenizer feed ${processed}/${total}`))
     },
     Tokenizer.strictConfig
   )
   const vocabSize = tokenizer.vocabSize
   const bosId = Option.getOrThrow(tokenizer.tokenToId(BOS))
-  // The corpus is one document: prepend BOS so the model learns
-  // P(first tokens | BOS) and generation can start from it.
-  const data = [bosId, ...(yield* Tensor.toNumberArray(yield* tokenizer.encode(CORPUS)))]
+  const eosId = Option.getOrThrow(tokenizer.tokenToId(EOS))
+  const data: Array<number> = []
+  for (const poem of DOCUMENTS) {
+    data.push(bosId, ...(yield* Tensor.toNumberArray(yield* tokenizer.encode(poem))), eosId)
+  }
   yield* Effect.log(
-    `nano-gpt: vocab ${vocabSize} (${data.length} tokens), block ${BLOCK}, embed ${EMBED}, ${HEADS} heads, ${LAYERS} layers on ${device}`
+    `nano-gpt: vocab ${vocabSize} (${data.length} tokens in ${DOCUMENTS.length} documents), block ${BLOCK}, embed ${EMBED}, ${HEADS} heads, ${LAYERS} layers on ${device}`
   )
 
   yield* Effect.log("1) creating model")
@@ -197,38 +247,17 @@ const program = Effect.gen(function* () {
   const trained = yield* trainer.train(params0)
   const params = trained.params
 
-  // Greedy-windowed sampling with temperature: re-run the model on the
-  // last BLOCK tokens and draw the next token from the final
-  // position's softmax. The window is right-padded to a fixed [1, BLOCK]
-  // shape so generation is served by a single program: positions are
-  // window-relative (every window restarts at 0) and attention is
-  // causal, so the real tokens never attend to the padding and their
-  // logits are unchanged; the next-token logits are the row at the true
-  // last token, not the padded last row.
-  yield* Effect.log(`3) generating ${GENERATE} tokens (temperature ${TEMPERATURE}):`)
-  const context = [bosId]
-  for (let n = 0; n < GENERATE; n++) {
-    const window = context.slice(-BLOCK)
-    const idx = yield* ids([...window, ...new Array(BLOCK - window.length).fill(0)], [1, BLOCK])
-    const logits = yield* model.execute(params, idx)
-    const all = yield* Tensor.toNumberArray(logits)
-    const row = all.slice((window.length - 1) * vocabSize, window.length * vocabSize)
-    const max = Math.max(...row)
-    const exps = row.map((x) => Math.exp((x - max) / TEMPERATURE))
-    const total = exps.reduce((a, b) => a + b, 0)
-    let draw = Math.random() * total
-    let next = exps.length - 1
-    for (let i = 0; i < exps.length; i++) {
-      draw -= exps[i]
-      if (draw <= 0) {
-        next = i
-        break
-      }
-    }
-    context.push(next)
+  yield* Effect.log(`3) generating from prompts (temperature ${TEMPERATURE}), stopping at EOS:`)
+  const prompts = [
+    "Shall I compare thee",
+    "To be, or not to be",
+    "Beware the Jabberwock"
+  ]
+  for (const prompt of prompts) {
+    yield* Effect.log(`promt: ${prompt}`)
+    const text = yield* generate(model, tokenizer, params, prompt)
+    yield* Effect.log(`answer:\n${text}`)
   }
-  const generated = yield* tokenizer.decode(context.slice(1))
-  yield* Effect.log(`\n${generated}`)
 })
 
 NodeRuntime.runMain(program.pipe(Effect.provide(Device.Best)))

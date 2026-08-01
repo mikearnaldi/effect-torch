@@ -29,7 +29,7 @@
  *
  * @since 0.1.0
  */
-import { Effect } from "effect"
+import { Duration, Effect } from "effect"
 import { CurrentDevice, type DeviceKind } from "./Device.ts"
 import * as Gradient from "./Gradient.ts"
 import type { LearningRate } from "./LearningRate.ts"
@@ -64,8 +64,10 @@ export type TrainDataSource<E = never, R = never> =
 
 /**
  * Per-step progress reported to {@link TrainConfig.onStep} and
- * {@link TrainConfig.stop}: the 1-based step number and the step's loss
- * value.
+ * {@link TrainConfig.stop}: the 1-based step number, the step's loss
+ * value, and the time elapsed since this `train` run began — each
+ * invocation of `train` starts its own clock, so continued training and
+ * re-runs never share a start time.
  *
  * @since 0.1.0
  * @category models
@@ -73,6 +75,7 @@ export type TrainDataSource<E = never, R = never> =
 export interface TrainStep {
   readonly step: number
   readonly loss: number
+  readonly elapsed: Duration.Duration
 }
 
 /**
@@ -88,8 +91,10 @@ export interface TrainStep {
  * `stop` decides when training ends; it is checked after every step (at
  * least one step always runs), so any policy is a plain function:
  * `({ step }) => step >= 3000` stops on a step count,
- * `({ loss }) => loss < 0.01` stops on a loss target, and the two compose
- * with `||` — or close over any other state you track.
+ * `({ loss }) => loss < 0.01` stops on a loss target,
+ * `({ elapsed }) => Duration.toSeconds(elapsed) > 60` stops on a
+ * wall-clock budget, and the three compose with `||` — or close over any
+ * other state you track.
  *
  * `data` is either a fixed `(input, target)` pair used every step
  * (full-batch) or a sampler producing each step's batch (mini-batch).
@@ -417,6 +422,7 @@ const trainLoop = <S, EL = never, RL = never, ED = never, RD = never, EO = never
     let step = 0
     let loss = Number.NaN
     let trained: ReadonlyArray<Tensor.Concrete>
+    const started = yield* Effect.sync(() => Date.now())
     do {
       step++
       const data: TrainData = typeof config.data === "function"
@@ -429,9 +435,15 @@ const trainLoop = <S, EL = never, RL = never, ED = never, RD = never, EO = never
       trained = result.params
       params = result.params
       state = result.state
-      if (config.onStep !== undefined) {
-        yield* config.onStep({ step, loss })
+      const info: TrainStep = {
+        step,
+        loss,
+        elapsed: Duration.millis(yield* Effect.sync(() => Date.now() - started))
       }
-    } while (!config.stop({ step, loss }))
+      if (config.onStep !== undefined) {
+        yield* config.onStep(info)
+      }
+      if (config.stop(info)) break
+    } while (true)
     return { params: trained, state, loss }
   })
