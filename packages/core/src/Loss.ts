@@ -181,8 +181,8 @@ const checkClassTargets = (
     if (input.shape.length < 1) {
       return yield* new Tensor.TensorError({ op, message: `${op}: expected rank >= 1, got rank ${input.shape.length}` })
     }
-    if (targets.dtype !== "i64") {
-      return yield* new Tensor.TensorError({ op, message: `${op}: targets must be i64 class indexes, got ${targets.dtype}` })
+    if (targets.dtype !== "i64" && targets.dtype !== "u32") {
+      return yield* new Tensor.TensorError({ op, message: `${op}: targets must be i64 or u32 class indexes, got ${targets.dtype}` })
     }
     const expected = input.shape.slice(0, -1)
     if (expected.length !== targets.shape.length || expected.some((d, i) => d !== targets.shape[i])) {

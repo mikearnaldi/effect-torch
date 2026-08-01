@@ -12,6 +12,15 @@ export declare class CompiledProgram {
   run(inputs: Array<NativeTensor>, scalars: Array<number>, token?: CancellationToken | undefined | null): Promise<Array<NativeTensor>>
 }
 
+export declare class DecodeProgram {
+  get signature(): string
+  get layers(): number
+  get kvHeads(): number
+  get headDim(): number
+  dispose(): void
+  run(inputs: Array<NativeTensor>, seq: NativeKvSequence, advance: number, token?: CancellationToken | undefined | null): Promise<Array<NativeTensor>>
+}
+
 export declare class LazyTensor {
   dispose(): void
   get shape(): Array<number>
@@ -63,6 +72,8 @@ export declare class LazyTensor {
   gather(dim: number, indexes: LazyTensor): LazyTensor
   crossEntropy(target: LazyTensor, ignoreIndex: number): LazyTensor
   scaledDotProductAttention(k: LazyTensor, v: LazyTensor, scale: number, causal: boolean): LazyTensor
+  positionEmbedding(seqLen: number): LazyTensor
+  rotaryEmbedding(seqLen: number, theta: number): LazyTensor
   conv1d(w: LazyTensor, stride: number, padding: number, dilation: number, groups: number): LazyTensor
   conv2d(w: LazyTensor, stride: number, padding: number, dilation: number, groups: number): LazyTensor
   log(): LazyTensor
@@ -87,6 +98,18 @@ export declare class LazyTensor {
   adamwOut(index: number): LazyTensor
   sgdStep(grad: LazyTensor, velocity: LazyTensor, first: LazyTensor, lr: LazyTensor, momentum: number, dampening: number, nesterov: boolean, weightDecay: number): LazyTensor
   sgdOut(index: number): LazyTensor
+}
+
+export declare class NativeKvPool {
+  constructor(layers: number, kvHeads: number, headDim: number, maxTokens: number, blockSize?: number | undefined | null, device?: string | undefined | null)
+  get capacity(): number
+  get freeBlocks(): number
+  makeSequence(): NativeKvSequence
+}
+
+export declare class NativeKvSequence {
+  get cursor(): number
+  release(): void
 }
 
 export declare class NativeTensor {
@@ -115,6 +138,8 @@ export declare class NativeTokenizer {
 }
 
 export declare function compile(roots: Array<LazyTensor>): CompiledProgram
+
+export declare function compileDecode(roots: Array<LazyTensor>, window?: number | undefined | null): DecodeProgram
 
 export declare function evalLazy(tensors: Array<LazyTensor>, token?: CancellationToken | undefined | null): Promise<Array<NativeTensor>>
 

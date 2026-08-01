@@ -35,8 +35,8 @@
  *
  * @since 0.1.0
  */
-import { Data, Effect } from "effect"
-import type { CurrentDevice } from "./Device.ts"
+import { Data, Effect, Scope, Semaphore } from "effect"
+import { CurrentDevice } from "./Device.ts"
 import * as Gradient from "./Gradient.ts"
 import * as Tensor from "./Tensor.ts"
 
@@ -418,10 +418,7 @@ export const positionEmbedding = (
               message: `${name}: sequence length ${t} exceeds maxPositions ${maxPositions}`
             })
           }
-          return yield* Tensor.embedding(
-            yield* Tensor.arange(t, undefined, { dtype: "i64" }),
-            { weight: params[0] }
-          )
+          return yield* Tensor.positionEmbedding(params[0], t)
         })
     }
   })
@@ -487,6 +484,14 @@ export const layerNorm = (
 export interface MultiHeadAttentionOptions {
   /** Mask the attention scores causally (autoregressive transformers). */
   readonly causal?: boolean
+  /**
+   * Apply rotary position embeddings (RoPE) to q and k per head with the
+   * given theta base (e.g. 10000). Attention then sees only relative
+   * offsets: cached K/V stay valid as the context grows and generation
+   * is unbounded (RFC 0010) — unlike learned absolute positions, which
+   * bake a fixed table into the K/V.
+   */
+  readonly rope?: number
 }
 
 /**
@@ -569,9 +574,11 @@ export const multiHeadAttention = (
           for (let p = 0; p < 3; p++) {
             projected.push(yield* project(input, params[p * 2], params[p * 2 + 1]))
           }
+          const maybeRope = (x: Tensor.Any) =>
+            options.rope !== undefined ? Tensor.rotaryEmbedding(x, t, options.rope) : Effect.succeed(x as Tensor.Any)
           const attended = yield* Tensor.scaledDotProductAttention(
-            yield* splitHeads(projected[0]),
-            yield* splitHeads(projected[1]),
+            yield* maybeRope(yield* splitHeads(projected[0])),
+            yield* maybeRope(yield* splitHeads(projected[1])),
             yield* splitHeads(projected[2]),
             { causal }
           )
@@ -1112,3 +1119,265 @@ export const compile = (
       dispose: fn.dispose
     })
   )
+
+/**
+ * A failure in inference-artifact construction or generation (RFC
+ * 0010): a model without cacheable attention, an invalid pool
+ * configuration, or an input that does not fit the prefill/decode
+ * calling convention. Pool-capacity and context-overflow failures from
+ * the native runtime stay {@link Tensor.TensorError}s.
+ *
+ * @since 0.1.0
+ * @category errors
+ */
+export class InferenceError extends Data.TaggedError("InferenceError")<{
+  readonly op: string
+  readonly message: string
+}> {}
+
+/**
+ * Configuration for {@link inference}. `maxTokens` is the pool's total
+ * key/value capacity in tokens, shared by all live sequences;
+ * `blockSize` is the paging granularity (tokens per block, default 16)
+ * and must divide `maxTokens`. `attentionWindow` bounds each step to
+ * the last W cached positions (sliding-window attention): with
+ * relative positions (RoPE) this exactly matches training on W-token
+ * windows while the context grows unboundedly. Omit for full attention.
+ * `prefillChunk` is the fixed prompt-chunk length (default
+ * `blockSize`): one `[1, prefillChunk]` program serves every prompt
+ * length — prompts are processed in chunks, the last one zero-padded
+ * with only its real rows scattered into the cache — so a whole
+ * deployment compiles two programs (one prefill, one decode). Pads
+ * compute positions too: with a learned position table the chunk must
+ * not exceed `maxPositions`. `tokenDtype` is the id dtype of
+ * prefill/step inputs (default `"u32"`, the tokenizer's output).
+ *
+ * @since 0.1.0
+ * @category compilation
+ */
+export interface InferenceConfig {
+  readonly maxTokens: number
+  readonly blockSize?: number
+  readonly attentionWindow?: number
+  readonly prefillChunk?: number
+  readonly tokenDtype?: "u32" | "i64"
+}
+
+/**
+ * One generation sequence over an {@link InferenceProgram}'s pool: a
+ * block table and a cursor, acquired from
+ * {@link InferenceProgram.sequence} and released with its scope (the
+ * blocks return to the pool). `prefill` forwards a `[1, T]` prompt and
+ * returns the final-position logits `[vocab]`; `step` appends one token
+ * (`[1, 1]`) and returns the next position's logits. Calls on one
+ * sequence serialize; sequences run concurrently (their pool blocks are
+ * disjoint).
+ *
+ * @since 0.1.0
+ * @category compilation
+ */
+export interface Sequence {
+  readonly prefill: (
+    tokens: Tensor.Any
+  ) => Effect.Effect<Tensor.Concrete, InferenceError | ModelError | Tensor.TensorError, CurrentDevice>
+  readonly step: (
+    token: Tensor.Any
+  ) => Effect.Effect<Tensor.Concrete, InferenceError | ModelError | Tensor.TensorError, CurrentDevice>
+  readonly cursor: () => Effect.Effect<number>
+}
+
+/**
+ * A compiled inference artifact (RFC 0010): the two frozen programs
+ * (chunked prefill, decode) plus the kv pool they run against, derived
+ * from the model's structure and compiled eagerly at construction. Not
+ * a {@link Model}: the calling convention is `sequence`/`prefill`/
+ * `step`, not `forward`. The artifact is immutable and parallel-safe;
+ * per-sequence state lives in {@link Sequence}s (Scope-managed). The
+ * artifact itself has no explicit lifetime — native finalizers release
+ * programs and pool when it is unreachable.
+ *
+ * @since 0.1.0
+ * @category compilation
+ */
+export interface InferenceProgram {
+  readonly sequence: () => Effect.Effect<Sequence, InferenceError, Scope.Scope>
+}
+
+/**
+ * Compiles a model for generation (RFC 0010). The same `forward` graph
+ * builder is traced with placeholders and rewritten natively — causal
+ * attention becomes paged kv attention over a shared pool, position
+ * embeddings become cursor-offset gathers — then frozen: exactly two
+ * programs (chunked prefill, decode), compiled eagerly at construction.
+ * A model whose forward contains no causal `scaledDotProductAttention`
+ * fails with an {@link InferenceError} (there is nothing to cache);
+ * non-causal attention and runtime scalar inputs are rejected likewise.
+ * Parameters close over the artifact (they are still program inputs
+ * natively), so callers thread nothing.
+ *
+ * The artifact needs no explicit lifetime: the two programs are static
+ * (no shape-keyed growth, unlike the JIT caches of RFC 0008) and the
+ * pool is device memory of the same kind tensors are — all of it is
+ * released by the native finalizers when the artifact is unreachable.
+ * {@link Sequence}s, by contrast, hold pool blocks — a capacity
+ * resource with no GC-visible pressure signal — so they are
+ * Scope-managed.
+ *
+ * @since 0.1.0
+ * @category compilation
+ */
+export const inference = (
+  model: Model,
+  params: Params,
+  config: InferenceConfig
+): Effect.Effect<InferenceProgram, InferenceError | ModelError | Tensor.TensorError, CurrentDevice> =>
+  Effect.gen(function* () {
+    yield* checkArity("inference", model.names, params)
+    const device = yield* CurrentDevice
+    // Freeze the weights: params may be lazy graphs (init draws), and a
+    // compiled run materializes its inputs per call — without a single
+    // up-front materialization every prefill/step would re-draw.
+    const frozenParams = yield* Tensor.compute(params)
+    const blockSize = config.blockSize ?? 16
+    if (
+      !Number.isInteger(config.maxTokens) || config.maxTokens <= 0 || config.maxTokens % blockSize !== 0
+    ) {
+      return yield* new InferenceError({
+        op: "inference",
+        message: `maxTokens must be a positive multiple of blockSize ${blockSize}, got ${config.maxTokens}`
+      })
+    }
+    if (
+      config.attentionWindow !== undefined &&
+      (!Number.isInteger(config.attentionWindow) || config.attentionWindow <= 0)
+    ) {
+      return yield* new InferenceError({
+        op: "inference",
+        message: `attentionWindow must be a positive integer, got ${config.attentionWindow}`
+      })
+    }
+    const prefillChunk = config.prefillChunk ?? blockSize
+    if (!Number.isInteger(prefillChunk) || prefillChunk <= 0) {
+      return yield* new InferenceError({
+        op: "inference",
+        message: `prefillChunk must be a positive integer, got ${config.prefillChunk}`
+      })
+    }
+    const tokenDtype = config.tokenDtype ?? "u32"
+    // Eager: exactly two signatures exist ([1, prefillChunk] and [1, 1]),
+    // and dtype/device are config — so both programs and the pool are
+    // built now, and construction errors (no cacheable attention,
+    // non-causal attention) surface here rather than on first use.
+    const trace = (inputShape: ReadonlyArray<number>) =>
+      Effect.gen(function* () {
+        const exemplar = yield* Tensor.zeros(inputShape, { dtype: tokenDtype })
+        const placeholders: Array<Tensor.Lazy> = []
+        for (let i = 0; i < frozenParams.length; i++) {
+          placeholders.push(yield* Tensor.makeInput(i, frozenParams[i]))
+        }
+        placeholders.push(yield* Tensor.makeInput(frozenParams.length, exemplar))
+        const output = yield* model.forward(placeholders.slice(0, -1), placeholders[placeholders.length - 1])
+        return yield* Tensor.compileDecodeProgram(
+          [output],
+          ...(config.attentionWindow !== undefined ? [config.attentionWindow] : [])
+        ).pipe(
+          Effect.mapError((error) => new InferenceError({ op: "inference", message: error.message }))
+        )
+      })
+    const prefillProgram = yield* trace([1, prefillChunk])
+    const decodeProgram = yield* trace([1, 1])
+    if (
+      prefillProgram.layers !== decodeProgram.layers ||
+      prefillProgram.kvHeads !== decodeProgram.kvHeads ||
+      prefillProgram.headDim !== decodeProgram.headDim
+    ) {
+      return yield* new InferenceError({
+        op: "inference",
+        message: "prefill and decode traces disagree on attention geometry"
+      })
+    }
+    const pool = yield* Tensor.makeKvPool(
+      prefillProgram.layers,
+      prefillProgram.kvHeads,
+      prefillProgram.headDim,
+      config.maxTokens,
+      blockSize,
+      device
+    ).pipe(Effect.mapError((error) => new InferenceError({ op: "inference", message: error.message })))
+    const self: InferenceProgram = {
+      sequence: () =>
+        Effect.gen(function* () {
+          const native = pool.makeSequence()
+          const runLock = yield* Semaphore.make(1)
+          yield* Effect.addFinalizer(() => Effect.sync(() => native.release()))
+          const runChunk = (program: Tensor.NativeDecodeProgram, input: Tensor.Any, advance: number) =>
+            runLock.withPermits(1)(
+              Effect.map(
+                Tensor.runDecodeProgram(program, [...frozenParams, input], native, advance),
+                ([output]) => output
+              )
+            )
+          const lastLogits = (op: "prefill" | "step", output: Tensor.Concrete, row: number) =>
+            Effect.gen(function* () {
+              const rank = output.shape.length
+              if (rank < 2) {
+                return yield* new InferenceError({
+                  op,
+                  message: `model output must be [..., T, vocab], got [${output.shape}]`
+                })
+              }
+              const vocab = output.shape[rank - 1]
+              const leading = output.shape.slice(0, -2)
+              const last = yield* Tensor.slice(output, {
+                start: [...leading.map(() => 0), row, 0],
+                end: [...leading.map((d: number) => d), row + 1, vocab]
+              })
+              const reshaped = yield* Tensor.reshape(last, [vocab])
+              const [result] = yield* Tensor.compute([reshaped])
+              return result
+            })
+          const prefill = (tokens: Tensor.Any) =>
+            Effect.gen(function* () {
+              if (tokens.shape.length !== 2 || tokens.shape[0] !== 1 || tokens.shape[1] < 1) {
+                return yield* new InferenceError({
+                  op: "prefill",
+                  message: `prefill expects tokens of shape [1, T] with T >= 1, got [${tokens.shape}]`
+                })
+              }
+              const t = tokens.shape[1]
+              let result: Tensor.Concrete | undefined
+              for (let offset = 0; offset < t; offset += prefillChunk) {
+                const real = Math.min(prefillChunk, t - offset)
+                let input = yield* Tensor.slice(tokens, { start: [0, offset], end: [1, offset + real] })
+                if (real < prefillChunk) {
+                  const pad = yield* Tensor.zeros([1, prefillChunk - real], { dtype: tokens.dtype })
+                  input = yield* Tensor.concat([input, pad], { dim: 1 })
+                }
+                const output = yield* runChunk(prefillProgram, input, real)
+                if (offset + real === t) {
+                  result = yield* lastLogits("prefill", output, real - 1)
+                }
+              }
+              return result as Tensor.Concrete
+            })
+          const step = (token: Tensor.Any) =>
+            Effect.gen(function* () {
+              if (token.shape.length !== 2 || token.shape[0] !== 1 || token.shape[1] !== 1) {
+                return yield* new InferenceError({
+                  op: "step",
+                  message: `step expects a single token of shape [1, 1], got [${token.shape}]`
+                })
+              }
+              const output = yield* runChunk(decodeProgram, token, 1)
+              return yield* lastLogits("step", output, 0)
+            })
+          const sequence: Sequence = {
+            prefill,
+            step,
+            cursor: () => Effect.sync(() => native.cursor)
+          }
+          return sequence
+        })
+    }
+    return self
+  })

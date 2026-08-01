@@ -789,6 +789,14 @@ fn readback_blocking(inner: &Tensor) -> Result<Readback> {
     })
 }
 
+// Where a position-indexed semantic node reads its base position:
+// zero in user graphs, the sequence cursor in decode-rewritten ones.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PositionOffset {
+    Absolute,
+    Cursor,
+}
+
 enum NodeKind {
     Leaf(Tensor),
     // RFC 0008: placeholder leaves for compiled programs. An Input carries
@@ -1046,6 +1054,47 @@ enum NodeKind {
     SdpaBackwardOut {
         of: Arc<Node>,
         index: u8,
+    },
+    // Absolute position embedding as one semantic node: rows 0..seq_len
+    // of the [max_positions, E] weight table (the Sdpa precedent —
+    // semantics in the graph, execution strategy native). Semantic so
+    // the RFC 0010 decode rewrite can offset the positions by the
+    // runtime cursor instead of re-deriving "this gather is a position
+    // embedding" from composed ops.
+    PositionEmbedding {
+        weight: Arc<Node>,
+        seq_len: usize,
+    },
+    // RFC 0010: paged KV attention, the decode/prefill semantic node
+    // produced by the decode rewrite (never written by user code —
+    // `compile_decode` turns each causal Sdpa into one). Scatters the
+    // new tokens' k/v into the sequence's pool blocks at the cursor,
+    // then attends q causally over the last `window` cached positions
+    // (None: the whole context). q, k and v are [1, H, T, D]/[1, H, T, Dv]
+    // with a shared T (the new tokens); the pool, block table and
+    // cursor arrive via the run's kv context, keeping the graph a pure
+    // function of its inputs. Not differentiable.
+    KvAttention {
+        q: Arc<Node>,
+        k: Arc<Node>,
+        v: Arc<Node>,
+        scale: f64,
+        layer: u32,
+        window: Option<usize>,
+    },
+    // RoPE (GPT-NeoX half-split rotary) as one semantic node: x is
+    // [.., T, D] with D even; the last dim rotates in half pairs by
+    // (offset + position) * theta^(-2j/D). Absolute positions ride the
+    // tensor, attention sees only offsets — so cached K/V stay valid as
+    // the context grows, which learned absolute embeddings cannot do.
+    // `offset` is Absolute in user graphs; the decode rewrite flips it
+    // to Cursor (the run's kv cursor) instead of re-deriving "this
+    // arange is a position" from composed ops.
+    RotaryEmbedding {
+        x: Arc<Node>,
+        seq_len: usize,
+        theta: f64,
+        offset: PositionOffset,
     },
     Conv1d {
         x: Arc<Node>,
@@ -1598,6 +1647,75 @@ impl Node {
                     i => return Err(format!("sdpa backward out: index must be 0..=2, got {i}")),
                 };
                 (source.shape.clone(), source.dtype, source.device.clone())
+            }
+            NodeKind::PositionEmbedding { weight, seq_len } => {
+                if weight.shape.len() != 2 {
+                    return Err(format!(
+                        "position_embedding: weight must be [maxPositions, E], got {:?}",
+                        weight.shape
+                    ));
+                }
+                if *seq_len == 0 || *seq_len > weight.shape[0] {
+                    return Err(format!(
+                        "position_embedding: seq_len {seq_len} out of range for {} positions",
+                        weight.shape[0]
+                    ));
+                }
+                if !weight.dtype.is_float() {
+                    return Err(format!(
+                        "position_embedding: weight must be a float dtype, got {:?}",
+                        weight.dtype
+                    ));
+                }
+                (
+                    vec![*seq_len, weight.shape[1]],
+                    weight.dtype,
+                    weight.device.clone(),
+                )
+            }
+            NodeKind::KvAttention { q, k, v, .. } => {
+                let out = sdpa_check("kv_attention", q, k, v)?;
+                let rank = q.shape.len();
+                if q.shape[rank - 2] != k.shape[rank - 2] {
+                    return Err(format!(
+                        "kv_attention: q, k and v must share the new-token length, got {:?}, {:?} and {:?}",
+                        q.shape, k.shape, v.shape
+                    ));
+                }
+                if rank < 3 || q.shape[..rank - 3].iter().product::<usize>() != 1 {
+                    // The pool is per-sequence: leading dims must be
+                    // [1..., H] (a single batch of heads).
+                    return Err(format!(
+                        "kv_attention: expected leading dims [1..., H], got {:?}",
+                        q.shape
+                    ));
+                }
+                (out, q.dtype, q.device.clone())
+            }
+            NodeKind::RotaryEmbedding { x, seq_len, .. } => {
+                let rank = x.shape.len();
+                if rank < 2 {
+                    return Err(format!(
+                        "rotary_embedding: expected [.., T, D], got {:?}",
+                        x.shape
+                    ));
+                }
+                let (t, d) = (x.shape[rank - 2], x.shape[rank - 1]);
+                if *seq_len != t {
+                    return Err(format!(
+                        "rotary_embedding: seq_len {seq_len} does not match the input's T {t}"
+                    ));
+                }
+                if d % 2 != 0 {
+                    return Err(format!("rotary_embedding: head dim must be even, got {d}"));
+                }
+                if x.dtype != DType::F32 {
+                    return Err(format!(
+                        "rotary_embedding: dtype must be f32, got {:?}",
+                        x.dtype
+                    ));
+                }
+                (x.shape.clone(), x.dtype, x.device.clone())
             }
             NodeKind::Conv1d {
                 x,
@@ -2559,6 +2677,24 @@ impl LazyTensor {
         }))
     }
 
+    #[napi]
+    pub fn position_embedding(&self, seq_len: u32) -> Result<Self> {
+        lazy_ctor!(Node::new(NodeKind::PositionEmbedding {
+            weight: self.node.clone(),
+            seq_len: seq_len as usize,
+        }))
+    }
+
+    #[napi]
+    pub fn rotary_embedding(&self, seq_len: u32, theta: f64) -> Result<Self> {
+        lazy_ctor!(Node::new(NodeKind::RotaryEmbedding {
+            x: self.node.clone(),
+            seq_len: seq_len as usize,
+            theta,
+            offset: PositionOffset::Absolute,
+        }))
+    }
+
     #[napi(js_name = "conv1d")]
     pub fn conv_1d(
         &self,
@@ -2835,6 +2971,10 @@ struct Evaluator {
     // RFC 0008: Input/ScalarInput node id -> argument buffer, populated by
     // CompiledProgram::run. Empty for ordinary eval_lazy walks.
     slots: std::collections::HashMap<u64, Tensor>,
+    // RFC 0010: the pool + sequence a kv program runs against. None for
+    // ordinary and non-kv compiled walks; KvAttention nodes error without
+    // it.
+    kv: Option<Arc<KvContext>>,
 }
 
 impl Evaluator {
@@ -2843,6 +2983,14 @@ impl Evaluator {
     }
 
     fn with_slots(roots: &[Arc<Node>], slots: std::collections::HashMap<u64, Tensor>) -> Self {
+        Self::with_kv(roots, slots, None)
+    }
+
+    fn with_kv(
+        roots: &[Arc<Node>],
+        slots: std::collections::HashMap<u64, Tensor>,
+        kv: Option<Arc<KvContext>>,
+    ) -> Self {
         let mut consumers = std::collections::HashMap::new();
         for root in roots {
             count_consumers(root, &mut consumers);
@@ -2855,6 +3003,7 @@ impl Evaluator {
             consumers,
             roots: roots.iter().map(|root| root.id).collect(),
             slots,
+            kv,
         }
     }
 
@@ -2962,6 +3111,9 @@ fn node_children(kind: &NodeKind) -> Vec<Arc<Node>> {
             logits, target, ..
         } => vec![logits.clone(), target.clone()],
         NodeKind::Sdpa { q, k, v, .. } => vec![q.clone(), k.clone(), v.clone()],
+        NodeKind::KvAttention { q, k, v, .. } => vec![q.clone(), k.clone(), v.clone()],
+        NodeKind::PositionEmbedding { weight, .. } => vec![weight.clone()],
+        NodeKind::RotaryEmbedding { x, .. } => vec![x.clone()],
         NodeKind::SdpaBackward { q, k, v, g, fwd, .. } => {
             vec![q.clone(), k.clone(), v.clone(), g.clone(), fwd.clone()]
         }
@@ -3209,6 +3361,36 @@ fn remap_children(kind: &NodeKind, f: &dyn Fn(&Arc<Node>) -> Arc<Node>) -> NodeK
         NodeKind::SdpaBackwardOut { of, index } => NodeKind::SdpaBackwardOut {
             of: f(of),
             index: *index,
+        },
+        NodeKind::PositionEmbedding { weight, seq_len } => NodeKind::PositionEmbedding {
+            weight: f(weight),
+            seq_len: *seq_len,
+        },
+        NodeKind::KvAttention {
+            q,
+            k,
+            v,
+            scale,
+            layer,
+            window,
+        } => NodeKind::KvAttention {
+            q: f(q),
+            k: f(k),
+            v: f(v),
+            scale: *scale,
+            layer: *layer,
+            window: *window,
+        },
+        NodeKind::RotaryEmbedding {
+            x,
+            seq_len,
+            theta,
+            offset,
+        } => NodeKind::RotaryEmbedding {
+            x: f(x),
+            seq_len: *seq_len,
+            theta: *theta,
+            offset: *offset,
         },
         NodeKind::Conv1d {
             x,
@@ -3950,6 +4132,54 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> candle_core::Result<Te
             .ok_or_else(|| {
                 candle_core::Error::Msg("sdpa backward out: outputs missing".to_string())
             })?,
+        NodeKind::PositionEmbedding { weight, seq_len } => ev
+            .value(weight.id)?
+            .narrow(0, 0, *seq_len)?
+            .contiguous()?,
+        NodeKind::KvAttention {
+            q,
+            k,
+            v,
+            scale,
+            layer,
+            window,
+        } => {
+            let kv = ev.kv.clone().ok_or_else(|| {
+                candle_core::Error::Msg(
+                    "kv attention: node evaluates only inside a kv program run".to_string(),
+                )
+            })?;
+            kv_attention(
+                &kv,
+                *layer,
+                &ev.value(q.id)?,
+                &ev.value(k.id)?,
+                &ev.value(v.id)?,
+                *scale,
+                *window,
+            )?
+        }
+        NodeKind::RotaryEmbedding { x, theta, offset, .. } => {
+            let x = ev.value(x.id)?;
+            let base = match offset {
+                PositionOffset::Absolute => 0usize,
+                PositionOffset::Cursor => ev
+                    .kv
+                    .as_ref()
+                    .ok_or_else(|| {
+                        candle_core::Error::Msg(
+                            "rotary embedding: cursor offset outside a kv program run".to_string(),
+                        )
+                    })?
+                    .state
+                    .lock()
+                    .map_err(|e| {
+                        candle_core::Error::Msg(format!("rotary embedding: sequence lock poisoned: {e}"))
+                    })?
+                    .cursor,
+            };
+            rotary_forward(&x, base, *theta)?
+        }
         NodeKind::Conv1d {
             x,
             w,
@@ -4756,6 +4986,13 @@ mod autodiff {
             NodeKind::SdpaBackward { .. } | NodeKind::SdpaBackwardOut { .. } => Err(
                 "vmap: sdpa backward nodes are internal to autodiff".to_string(),
             ),
+            NodeKind::PositionEmbedding { .. } | NodeKind::KvAttention { .. } => Err(
+                "vmap: position embedding and kv attention nodes are not supported under vmap"
+                    .to_string(),
+            ),
+            NodeKind::RotaryEmbedding { .. } => {
+                Err("vmap: rotary embedding nodes are not supported under vmap".to_string())
+            }
             NodeKind::Conv1d { .. }
             | NodeKind::Conv2d { .. }
             | NodeKind::ConvTranspose1d { .. }
@@ -5405,6 +5642,128 @@ mod autodiff {
                         "grad: sdpa backward nodes are not differentiable (no second-order)"
                             .to_string(),
                     );
+                }
+                NodeKind::PositionEmbedding { weight, seq_len } => {
+                    // dW: rows 0..seq_len-1 accumulate the cotangent, the
+                    // rest stay zero — scatter-add of g into zeros_like(W)
+                    // at rows arange(seq_len) (indexes padded to g's shape
+                    // per the scatter contract).
+                    let t = *seq_len;
+                    let e = weight.shape[1];
+                    let rows = mk(NodeKind::Arange {
+                        start: 0.0,
+                        end: t as f64,
+                        step: 1.0,
+                        dtype: DType::I64,
+                        device: weight.device.clone(),
+                    })?;
+                    let rows = mk(NodeKind::Reshape {
+                        a: rows,
+                        shape: vec![t, 1],
+                    })?;
+                    let indexes = mk(NodeKind::BroadcastTo {
+                        a: rows,
+                        shape: vec![t, e],
+                    })?;
+                    accumulate(
+                        weight,
+                        mk(NodeKind::ScatterAdd {
+                            a: zeros_like(weight.as_ref())?,
+                            dim: 0,
+                            indexes,
+                            src: g.clone(),
+                        }),
+                    )?;
+                }
+                NodeKind::KvAttention { .. } => {
+                    return Err(
+                        "grad: kv attention is an inference-only node and is not differentiable"
+                            .to_string(),
+                    );
+                }
+                NodeKind::RotaryEmbedding { x, seq_len, theta, offset } => {
+                    if *offset != PositionOffset::Absolute {
+                        return Err(
+                            "grad: cursor-offset rotary embedding is not differentiable".to_string(),
+                        );
+                    }
+                    // y = R x with R orthogonal per position: dx = Rᵀ g,
+                    // the same rotation with negated angles — composed
+                    // from the same tables (Absolute positions, so they
+                    // are graph-static).
+                    let rank = x.shape.len();
+                    let (t, d) = (*seq_len, x.shape[rank - 1]);
+                    let half = d / 2;
+                    let device = x.device.clone();
+                    let inv_freq: Vec<f32> = (0..half)
+                        .map(|j| theta.powf(-2.0 * j as f64 / d as f64) as f32)
+                        .collect();
+                    let inv_freq_bytes: Vec<u8> =
+                        inv_freq.iter().flat_map(|f| f.to_le_bytes()).collect();
+                    let inv_freq = mk(NodeKind::FromBytes {
+                        data: inv_freq_bytes,
+                        shape: vec![1, half],
+                        dtype: DType::F32,
+                        device: device.clone(),
+                    })?;
+                    let positions = mk(NodeKind::Arange {
+                        start: 0.0,
+                        end: t as f64,
+                        step: 1.0,
+                        dtype: DType::F32,
+                        device: device.clone(),
+                    })?;
+                    let positions = mk(NodeKind::Reshape {
+                        a: positions,
+                        shape: vec![t, 1],
+                    })?;
+                    let angles = mk(NodeKind::Matmul {
+                        a: positions,
+                        b: inv_freq,
+                    })?;
+                    let mut table_shape = vec![1usize; rank - 2];
+                    table_shape.extend([t, half]);
+                    let angles = mk(NodeKind::Reshape {
+                        a: angles,
+                        shape: table_shape,
+                    })?;
+                    let cos = mk(NodeKind::Cos { a: angles.clone() })?;
+                    let sin = mk(NodeKind::Sin { a: angles })?;
+                    let g_first = mk(NodeKind::Slice {
+                        a: g.clone(),
+                        ranges: {
+                            let mut ranges: Vec<(usize, usize, usize)> =
+                                x.shape.iter().map(|&d| (0, d, 1)).collect();
+                            ranges[rank - 1] = (0, half, 1);
+                            ranges
+                        },
+                    })?;
+                    let g_second = mk(NodeKind::Slice {
+                        a: g.clone(),
+                        ranges: {
+                            let mut ranges: Vec<(usize, usize, usize)> =
+                                x.shape.iter().map(|&d| (0, d, 1)).collect();
+                            ranges[rank - 1] = (half, d, 1);
+                            ranges
+                        },
+                    })?;
+                    // x1_g = c·g1 + s·g2 ; x2_g = c·g2 − s·g1
+                    let out_first = add(
+                        mul(g_first.clone(), cos.clone())?,
+                        mul(g_second.clone(), sin.clone())?,
+                    )?;
+                    let out_second = sub(
+                        mul(g_second, cos)?,
+                        mul(g_first, sin)?,
+                    )?;
+                    accumulate(
+                        x,
+                        mk(NodeKind::Concat {
+                            a: out_first,
+                            b: out_second,
+                            dim: rank - 1,
+                        }),
+                    )?;
                 }
                 NodeKind::Conv1d {
                     x,
@@ -6565,6 +6924,735 @@ pub async fn eval_lazy(
     .await
 }
 
+// RFC 0010: paged KV inference. A `NativeKvPool` is a fixed-capacity// arena of key/value rows per attention layer, allocated once per
+// inference artifact; a `NativeKvSequence` is a block table and cursor
+// over the pool (the OS paging model: blocks are pages, sequences are
+// processes). `compile_decode` rewrites a traced forward graph for
+// generation — causal Sdpa becomes KvAttention (scatter the new tokens
+// into the pool, attend over the cached context), PositionEmbedding
+// becomes a cursor-offset gather — and freezes the result like
+// `compile`. The frozen graph stays a pure function of its inputs: the
+// pool and sequence travel through the run's kv context, parallel runs
+// of one program write disjoint blocks, and per-sequence runs serialize
+// on the sequence's run lock.
+
+struct PoolInner {
+    // Per layer, flat [max_tokens, kv_heads, head_dim] slabs; block b
+    // occupies rows b*block_size..(b+1)*block_size.
+    k: Vec<Tensor>,
+    v: Vec<Tensor>,
+    kv_heads: usize,
+    head_dim: usize,
+    block_size: usize,
+    max_tokens: usize,
+    free: Mutex<Vec<u32>>,
+    device: Device,
+}
+
+struct SeqState {
+    // Absolute block table: blocks[i] holds positions [i*bs, (i+1)*bs).
+    blocks: Vec<u32>,
+    // Blocks below `head` are dead (fully below the attention window
+    // frontier) and already returned to the pool.
+    head: usize,
+    cursor: usize,
+    // Real new-token count of the current run (chunked prefill passes
+    // padded chunks: q carries the chunk length, only `advance` rows
+    // are real). Set by the run, consumed by KvAttention, added to the
+    // cursor on completion.
+    advance: usize,
+}
+
+struct KvContext {
+    pool: Arc<PoolInner>,
+    state: Arc<Mutex<SeqState>>,
+}
+
+// RoPE forward: x [.., T, D] (D even), positions offset..offset+T,
+// GPT-NeoX half-split rotation with theta^(-2j/D).
+fn rotary_forward(x: &Tensor, offset: usize, theta: f64) -> candle_core::Result<Tensor> {
+    let dims = x.dims();
+    let rank = dims.len();
+    let (t, d) = (dims[rank - 2], dims[rank - 1]);
+    let half = d / 2;
+    let device = x.device();
+    let inv_freq: Vec<f32> = (0..half)
+        .map(|j| theta.powf(-2.0 * j as f64 / d as f64) as f32)
+        .collect();
+    let inv_freq = Tensor::from_vec(inv_freq, (1, half), device)?;
+    let positions: Vec<f32> = (0..t).map(|p| (offset + p) as f32).collect();
+    let positions = Tensor::from_vec(positions, (t, 1), device)?;
+    let angles = positions.matmul(&inv_freq)?; // [T, half]
+    let mut table_shape = vec![1usize; rank - 2];
+    table_shape.extend([t, half]);
+    let cos = angles.cos()?.reshape(table_shape.as_slice())?;
+    let sin = angles.sin()?.reshape(table_shape.as_slice())?;
+    let first = x.narrow(rank - 1, 0, half)?;
+    let second = x.narrow(rank - 1, half, half)?;
+    let out_first = (first.broadcast_mul(&cos)? - second.broadcast_mul(&sin)?)?;
+    let out_second = (second.broadcast_mul(&cos)? + first.broadcast_mul(&sin)?)?;
+    Tensor::cat(&[&out_first, &out_second], rank - 1)?.contiguous()
+}
+
+// The KvAttention eval: scatter q's companion k/v at [cursor, cursor+t)
+// (allocating blocks as the frontier crosses them), then attend q
+// causally over the last `window` positions of the gathered context
+// (None: the whole context). The gather feeds the composed sdpa path —
+// shape-polymorphic kernels, so no pipeline recompile as the context
+// grows (a dedicated paged kernel is the throughput follow-up).
+fn kv_attention(
+    kv: &KvContext,
+    layer: u32,
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    scale: f64,
+    window: Option<usize>,
+) -> candle_core::Result<Tensor> {
+    let pool = &kv.pool;
+    let layer = layer as usize;
+    let dims = q.dims();
+    let rank = dims.len();
+    let (t, h, d) = (dims[rank - 2], dims[rank - 3], dims[rank - 1]);
+    if layer >= pool.k.len() {
+        return Err(candle_core::Error::Msg(format!(
+            "kv attention: layer {layer} out of range for {} pool layers",
+            pool.k.len()
+        )));
+    }
+    if h != pool.kv_heads || d != pool.head_dim {
+        return Err(candle_core::Error::Msg(format!(
+            "kv attention: layer {layer} shape [{h}, {d}] does not match pool geometry [{}, {}]",
+            pool.kv_heads, pool.head_dim
+        )));
+    }
+    if q.dtype() != DType::F32 {
+        return Err(candle_core::Error::Msg(format!(
+            "kv attention: dtype must be f32, got {:?}",
+            q.dtype()
+        )));
+    }
+    let mut state = kv.state.lock().map_err(|e| {
+        candle_core::Error::Msg(format!("kv attention: sequence lock poisoned: {e}"))
+    })?;
+    let cursor = state.cursor;
+    // Chunked prefill: q carries the chunk length t, only `advance`
+    // rows are real; the rest are pads whose outputs the caller
+    // discards (causality keeps real rows from ever attending to them).
+    let advance = state.advance;
+    if advance == 0 || advance > t {
+        return Err(candle_core::Error::Msg(format!(
+            "kv attention: advance {advance} out of range for chunk length {t}"
+        )));
+    }
+    let needed = cursor + advance;
+    // Live rows after this step: everything from the attention window
+    // frontier on. Blocks fully below the frontier are dead and their
+    // capacity is reclaimed, so a windowed sequence's footprint is
+    // O(window) however long it generates.
+    let full = cursor + t;
+    let start = window.map_or(0, |w| full.saturating_sub(w));
+    if needed - start > pool.max_tokens {
+        return Err(candle_core::Error::Msg(format!(
+            "kv attention: live context {} exceeds pool capacity {}",
+            needed - start,
+            pool.max_tokens
+        )));
+    }
+    while state.blocks.len() * pool.block_size < needed {
+        let block = pool
+            .free
+            .lock()
+            .map_err(|e| candle_core::Error::Msg(format!("kv attention: pool lock poisoned: {e}")))?
+            .pop()
+            .ok_or_else(|| {
+                candle_core::Error::Msg(format!(
+                    "kv attention: pool exhausted ({} tokens across live sequences)",
+                    pool.max_tokens
+                ))
+            })?;
+        state.blocks.push(block);
+    }
+    // [1, H, T, D] -> [T, H, D], real rows only
+    let new_rows = |x: &Tensor| -> candle_core::Result<Tensor> {
+        x.permute((0, 2, 1, 3))?
+            .contiguous()?
+            .narrow(1, 0, advance)?
+            .reshape((advance, h, d))
+    };
+    // row indexes [T] broadcast to the scatter/gather contract [T, H, D]
+    let row_index = |rows: Vec<u32>| -> candle_core::Result<Tensor> {
+        let n = rows.len();
+        Tensor::from_vec(rows, (n, 1, 1), &pool.device)?.broadcast_as((n, h, d))?.contiguous()
+    };
+    // Logical position -> physical row, through the sequence's block
+    // table. The table is append-only: entries below `head` are dead
+    // (already freed) and never queried, since gathers start at the
+    // window frontier.
+    let physical = |p: usize| -> u32 {
+        state.blocks[p / pool.block_size] * pool.block_size as u32
+            + (p % pool.block_size) as u32
+    };
+    let write_rows: Vec<u32> = (cursor..needed).map(&physical).collect();
+    let write_index = row_index(write_rows)?;
+    pool.k[layer].scatter_set(&write_index, &new_rows(k)?, 0)?;
+    pool.v[layer].scatter_set(&write_index, &new_rows(v)?, 0)?;
+    // Gather the attended context through the block table: positions
+    // [start, needed) are real; rows past the real frontier are
+    // zero-padded (only pad q rows, whose outputs are discarded, can
+    // attend to them). The gather spans [start, cursor+t) so the
+    // causal mask aligns for every q row.
+    let ctx_rows: Vec<u32> = (start..needed).map(&physical).collect();
+    let ctx = full - start;
+    let ctx_index = row_index(ctx_rows)?;
+    let zeros = (ctx > needed - start)
+        .then(|| Tensor::zeros((ctx - (needed - start), h, d), DType::F32, &pool.device))
+        .transpose()?;
+    let gather_rows = |slab: &Tensor| -> candle_core::Result<Tensor> {
+        let real = slab.gather(&ctx_index, 0)?;
+        let full = match &zeros {
+            Some(pad) => Tensor::cat(&[&real, pad], 0)?,
+            None => real,
+        };
+        full.permute((1, 0, 2))?.unsqueeze(0)?.contiguous()
+    };
+    let out = sdpa_forward(
+        q,
+        &gather_rows(&pool.k[layer])?,
+        &gather_rows(&pool.v[layer])?,
+        scale,
+        true,
+    )?;
+    // Evict dead blocks: fully below the window frontier, never
+    // attended again.
+    while (state.head + 1) * pool.block_size <= start {
+        let dead = state.blocks[state.head];
+        pool.free
+            .lock()
+            .map_err(|e| candle_core::Error::Msg(format!("kv attention: pool lock poisoned: {e}")))?
+            .push(dead);
+        state.head += 1;
+    }
+    Ok(out)
+}
+
+struct DecodeGeometry {
+    layers: usize,
+    kv_heads: usize,
+    head_dim: usize,
+    cursor_slot: u32,
+}
+
+// The decode rewrite: same traced forward graph, cache-relevant nodes
+// reinterpreted. Deterministic — the layer ordinal of each Sdpa is its
+// order of first encounter in a post-order walk from the roots, so the
+// prefill and decode traces of one model agree.
+fn decode_rewrite(
+    roots: &[Arc<Node>],
+    window: Option<usize>,
+) -> std::result::Result<(Vec<Arc<Node>>, DecodeGeometry), String> {
+    let mut max_slot: Option<u32> = None;
+    {
+        let mut visited = HashSet::new();
+        let mut stack: Vec<Arc<Node>> = roots.to_vec();
+        while let Some(node) = stack.pop() {
+            if !visited.insert(node.id) {
+                continue;
+            }
+            match &node.kind {
+                NodeKind::Input { slot, .. } => {
+                    max_slot = Some(max_slot.map_or(*slot, |m: u32| m.max(*slot)))
+                }
+                NodeKind::ScalarInput { .. } => {
+                    return Err(
+                        "decode: runtime scalar inputs are not supported in inference graphs"
+                            .to_string(),
+                    )
+                }
+                _ => {}
+            }
+            stack.extend(node_children(&node.kind));
+        }
+    }
+    let cursor_slot = max_slot.map_or(0, |m| m + 1);
+    let mut visited = HashSet::new();
+    let mut order = Vec::new();
+    let mut stack: Vec<(Arc<Node>, bool)> = roots.iter().map(|r| (r.clone(), false)).collect();
+    while let Some((node, processed)) = stack.pop() {
+        if processed {
+            order.push(node);
+            continue;
+        }
+        if !visited.insert(node.id) {
+            continue;
+        }
+        stack.push((node.clone(), true));
+        for child in node_children(&node.kind) {
+            stack.push((child, false));
+        }
+    }
+    let mut map: HashMap<u64, Arc<Node>> = HashMap::new();
+    let mut layers = 0usize;
+    let mut geometry: Option<(usize, usize)> = None;
+    for node in &order {
+        let remap = |child: &Arc<Node>| map.get(&child.id).cloned().unwrap_or_else(|| child.clone());
+        let rebuilt = match &node.kind {
+            NodeKind::Sdpa {
+                q,
+                k,
+                v,
+                scale,
+                causal,
+            } => {
+                if !causal {
+                    return Err(
+                        "decode: only causal attention is cacheable, found a non-causal sdpa"
+                            .to_string(),
+                    );
+                }
+                let rank = k.shape.len();
+                if rank != 4 || k.shape[..rank - 3].iter().product::<usize>() != 1 {
+                    return Err(format!(
+                        "decode: kv caching expects attention of shape [1, H, T, D], got {:?}",
+                        k.shape
+                    ));
+                }
+                let (heads, dim) = (k.shape[rank - 3], k.shape[rank - 1]);
+                match geometry {
+                    Some((h0, d0)) if h0 != heads || d0 != dim => {
+                        return Err(format!(
+                            "decode: attention layers disagree on head geometry ([{h0}, {d0}] vs [{heads}, {dim}])"
+                        ));
+                    }
+                    None => geometry = Some((heads, dim)),
+                    _ => {}
+                }
+                let layer = layers;
+                layers += 1;
+                NodeKind::KvAttention {
+                    q: remap(q),
+                    k: remap(k),
+                    v: remap(v),
+                    scale: *scale,
+                    layer: layer as u32,
+                    window,
+                }
+            }
+            NodeKind::RotaryEmbedding {
+                x,
+                seq_len,
+                theta,
+                offset,
+            } => NodeKind::RotaryEmbedding {
+                x: remap(x),
+                seq_len: *seq_len,
+                theta: *theta,
+                offset: match offset {
+                    PositionOffset::Absolute => PositionOffset::Cursor,
+                    PositionOffset::Cursor => PositionOffset::Cursor,
+                },
+            },
+            NodeKind::PositionEmbedding { weight, seq_len } => {
+                let t = *seq_len;
+                let e = weight.shape[1];
+                let device = weight.device.clone();
+                let positions = Node::new(NodeKind::Add {
+                    a: Node::new(NodeKind::Arange {
+                        start: 0.0,
+                        end: t as f64,
+                        step: 1.0,
+                        dtype: DType::I64,
+                        device: device.clone(),
+                    })?,
+                    b: Node::new(NodeKind::ScalarInput {
+                        slot: cursor_slot,
+                        dtype: DType::I64,
+                        device: device.clone(),
+                    })?,
+                })?;
+                let indexes = Node::new(NodeKind::BroadcastTo {
+                    a: Node::new(NodeKind::Reshape {
+                        a: positions,
+                        shape: vec![t, 1],
+                    })?,
+                    shape: vec![t, e],
+                })?;
+                NodeKind::Gather {
+                    a: remap(weight),
+                    dim: 0,
+                    indexes,
+                }
+            }
+            kind => remap_children(kind, &remap),
+        };
+        map.insert(node.id, Node::new(rebuilt)?);
+    }
+    if layers == 0 {
+        return Err(
+            "decode: model has no cacheable attention (no causal sdpa node in the forward graph)"
+                .to_string(),
+        );
+    }
+    let (kv_heads, head_dim) = geometry.expect("layers > 0 implies geometry");
+    let roots = roots
+        .iter()
+        .map(|r| map.get(&r.id).cloned().unwrap_or_else(|| r.clone()))
+        .collect();
+    Ok((
+        roots,
+        DecodeGeometry {
+            layers,
+            kv_heads,
+            head_dim,
+            cursor_slot,
+        },
+    ))
+}
+
+#[napi]
+pub struct NativeKvPool {
+    inner: Arc<PoolInner>,
+}
+
+#[napi]
+impl NativeKvPool {
+    #[napi(constructor)]
+    pub fn new(
+        layers: u32,
+        kv_heads: u32,
+        head_dim: u32,
+        max_tokens: u32,
+        block_size: Option<u32>,
+        device: Option<String>,
+    ) -> Result<Self> {
+        let device = get_device(device)?;
+        let (layers, kv_heads, head_dim, max_tokens) = (
+            layers as usize,
+            kv_heads as usize,
+            head_dim as usize,
+            max_tokens as usize,
+        );
+        let block_size = block_size.unwrap_or(16) as usize;
+        if layers == 0 || kv_heads == 0 || head_dim == 0 {
+            return Err(Error::new(
+                Status::InvalidArg,
+                "kv pool: layers, kv heads and head dim must be positive",
+            ));
+        }
+        if max_tokens == 0 || max_tokens % block_size != 0 {
+            return Err(Error::new(
+                Status::InvalidArg,
+                format!("kv pool: capacity {max_tokens} must be a positive multiple of block size {block_size}"),
+            ));
+        }
+        let num_blocks = max_tokens / block_size;
+        let mut k = Vec::with_capacity(layers);
+        let mut v = Vec::with_capacity(layers);
+        for _ in 0..layers {
+            k.push(
+                Tensor::zeros((max_tokens, kv_heads, head_dim), DType::F32, &device)
+                    .map_err(to_napi_err)?,
+            );
+            v.push(
+                Tensor::zeros((max_tokens, kv_heads, head_dim), DType::F32, &device)
+                    .map_err(to_napi_err)?,
+            );
+        }
+        Ok(Self {
+            inner: Arc::new(PoolInner {
+                k,
+                v,
+                kv_heads,
+                head_dim,
+                block_size,
+                max_tokens,
+                free: Mutex::new((0..num_blocks as u32).rev().collect()),
+                device,
+            }),
+        })
+    }
+
+    #[napi(getter)]
+    pub fn capacity(&self) -> u32 {
+        self.inner.max_tokens as u32
+    }
+
+    #[napi(getter)]
+    pub fn free_blocks(&self) -> u32 {
+        self.inner.free.lock().map(|free| free.len() as u32).unwrap_or(0)
+    }
+
+    #[napi]
+    pub fn make_sequence(&self) -> NativeKvSequence {
+        NativeKvSequence {
+            pool: self.inner.clone(),
+            state: Arc::new(Mutex::new(SeqState {
+                blocks: Vec::new(),
+                head: 0,
+                cursor: 0,
+                advance: 0,
+            })),
+            run_lock: Arc::new(Mutex::new(())),
+            released: AtomicBool::new(false),
+        }
+    }
+}
+
+#[napi]
+pub struct NativeKvSequence {
+    pool: Arc<PoolInner>,
+    state: Arc<Mutex<SeqState>>,
+    // Serializes runs of this sequence; other sequences run concurrently
+    // (their blocks are disjoint by allocation).
+    run_lock: Arc<Mutex<()>>,
+    released: AtomicBool,
+}
+
+impl NativeKvSequence {
+    fn return_blocks(&self) {
+        if self.released.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        if let (Ok(mut state), Ok(mut free)) = (self.state.lock(), self.pool.free.lock()) {
+            // Blocks below head were evicted already; draining them
+            // again would double-free.
+            let head = state.head;
+            free.extend(state.blocks.split_off(head));
+            state.cursor = 0;
+            state.advance = 0;
+        }
+    }
+}
+
+impl Drop for NativeKvSequence {
+    fn drop(&mut self) {
+        self.return_blocks();
+    }
+}
+
+#[napi]
+impl NativeKvSequence {
+    #[napi(getter)]
+    pub fn cursor(&self) -> u32 {
+        self.state.lock().map(|state| state.cursor as u32).unwrap_or(0)
+    }
+
+    // Returns the sequence's blocks to the pool. Running a released
+    // sequence is an error; releasing twice is a no-op.
+    #[napi]
+    pub fn release(&self) {
+        self.return_blocks();
+    }
+}
+
+#[napi]
+pub struct DecodeProgram {
+    inner: Option<ProgramInner>,
+    cursor_slot: u32,
+    layers: u32,
+    kv_heads: u32,
+    head_dim: u32,
+}
+
+#[napi]
+impl DecodeProgram {
+    #[napi(getter)]
+    pub fn signature(&self) -> Result<String> {
+        self.inner
+            .as_ref()
+            .map(|inner| inner.signature.clone())
+            .ok_or_else(|| Error::new(Status::GenericFailure, "program is disposed".to_string()))
+    }
+
+    #[napi(getter)]
+    pub fn layers(&self) -> u32 {
+        self.layers
+    }
+
+    #[napi(getter)]
+    pub fn kv_heads(&self) -> u32 {
+        self.kv_heads
+    }
+
+    #[napi(getter)]
+    pub fn head_dim(&self) -> u32 {
+        self.head_dim
+    }
+
+    #[napi]
+    pub fn dispose(&mut self) {
+        self.inner = None;
+    }
+
+    // Runs the frozen decode/prefill graph against a sequence: the
+    // cursor scalar binds from the sequence state, the kv context
+    // carries the pool and block table, and the cursor advances by
+    // `advance` on completion — the count of REAL new tokens in this
+    // run (1 for decode; the un-padded length of each chunk for
+    // prefill, whose inputs are padded to the fixed chunk shape).
+    #[napi]
+    pub async fn run(
+        &self,
+        inputs: Vec<&NativeTensor>,
+        seq: &NativeKvSequence,
+        advance: u32,
+        token: Option<&CancellationToken>,
+    ) -> Result<Vec<NativeTensor>> {
+        if seq.released.load(Ordering::SeqCst) {
+            return Err(Error::new(
+                Status::GenericFailure,
+                "kv sequence is released".to_string(),
+            ));
+        }
+        if advance == 0 {
+            return Err(Error::new(
+                Status::InvalidArg,
+                "kv run: advance must be positive".to_string(),
+            ));
+        }
+        let inner = self
+            .inner
+            .as_ref()
+            .ok_or_else(|| Error::new(Status::GenericFailure, "program is disposed".to_string()))?;
+        let tensor_count = inner.slots.iter().filter(|s| !s.scalar).count();
+        if inputs.len() != tensor_count {
+            return Err(Error::new(
+                Status::InvalidArg,
+                format!("program expected {tensor_count} tensor inputs, got {}", inputs.len()),
+            ));
+        }
+        for (slot, declared) in inner.slots.iter().enumerate() {
+            if !declared.scalar {
+                let got = &inputs[slot - inner.slots.iter().take(slot).filter(|s| s.scalar).count()].inner;
+                if got.dims() != declared.shape.as_slice()
+                    || got.dtype() != declared.dtype
+                    || device_key(got.device()) != device_key(&declared.device)
+                {
+                    return Err(Error::new(
+                        Status::InvalidArg,
+                        format!("input slot {slot}: expected {}, got {:?}", declared.signature(), got.dims()),
+                    ));
+                }
+            }
+        }
+        let slots = inner.slots.clone();
+        let roots = inner.roots.clone();
+        let leaves = inner.leaves.clone();
+        let inputs: Vec<Tensor> = inputs.iter().map(|input| input.inner.clone()).collect();
+        let kv = Arc::new(KvContext {
+            pool: seq.pool.clone(),
+            state: seq.state.clone(),
+        });
+        let run_lock = seq.run_lock.clone();
+        let state = seq.state.clone();
+        let cursor_slot = self.cursor_slot;
+        run_compute(token, move |cancelled| {
+            let _run_guard = run_lock.lock().map_err(|e| {
+                Error::new(Status::GenericFailure, format!("kv sequence lock poisoned: {e}"))
+            })?;
+            let _guard = metal_eval_guard(&roots);
+            {
+                let mut state = state.lock().map_err(|e| {
+                    Error::new(Status::GenericFailure, format!("kv sequence lock poisoned: {e}"))
+                })?;
+                state.advance = advance as usize;
+            }
+            // Bindings are built inside the eval guard: scalar_binding
+            // allocates on the device, which is not safe to do
+            // concurrently with another walk on Metal.
+            let mut bindings = std::collections::HashMap::new();
+            let mut tensors = inputs.iter();
+            for (slot, declared) in slots.iter().enumerate() {
+                let binding = if declared.scalar {
+                    if slot as u32 != cursor_slot {
+                        return Err(Error::new(
+                            Status::GenericFailure,
+                            format!("decode: unexpected scalar slot {slot}"),
+                        ));
+                    }
+                    let cursor = state.lock().map_err(|e| {
+                        Error::new(Status::GenericFailure, format!("kv sequence lock poisoned: {e}"))
+                    })?.cursor;
+                    scalar_binding(cursor as f64, declared.dtype, &declared.device).map_err(to_napi_err)?
+                } else {
+                    tensors.next().expect("tensor count checked").clone()
+                };
+                bindings.insert(slot as u64, binding);
+            }
+            let by_id: std::collections::HashMap<u64, Tensor> = leaves
+                .iter()
+                .map(|(id, slot)| (*id, bindings[&(*slot as u64)].clone()))
+                .collect();
+            // Blocks allocated by a failed run roll back: the cursor did
+            // not advance, so every block beyond the pre-run frontier is
+            // unreferenced and returns to the pool (a poisoned sequence
+            // must not take the pool down with it).
+            let frontier = state.lock().map(|s| s.blocks.len()).unwrap_or(0);
+            let mut ev = Evaluator::with_kv(&roots, by_id, Some(kv.clone()));
+            let mut outputs = Vec::with_capacity(roots.len());
+            for node in &roots {
+                let output = match eval_node(node, cancelled, &mut ev) {
+                    Ok(output) => output,
+                    Err(error) => {
+                        if let (Ok(mut state), Ok(mut free)) = (state.lock(), kv.pool.free.lock()) {
+                            free.extend(state.blocks.split_off(frontier));
+                            state.advance = 0;
+                        }
+                        return Err(to_napi_err(error));
+                    }
+                };
+                output.device().synchronize().map_err(to_napi_err)?;
+                outputs.push(NativeTensor::wrap(output));
+            }
+            if let Ok(mut state) = state.lock() {
+                state.cursor += state.advance;
+                state.advance = 0;
+            }
+            Ok(outputs)
+        })
+        .await
+    }
+}
+
+// RFC 0010: compiles a traced forward graph for generation: rewrites
+// causal attention into paged kv attention (optionally sliding-window
+// over the last `window` positions) and position embeddings into
+// cursor-offset gathers (adding one cursor scalar slot), fuses, and
+// freezes. Fails when the graph has no causal sdpa node (nothing to
+// cache) or uses runtime scalars (unsupported in inference graphs).
+#[napi]
+pub fn compile_decode(roots: Vec<&LazyTensor>, window: Option<u32>) -> Result<DecodeProgram> {
+    let nodes: Vec<Arc<Node>> = roots.iter().map(|t| t.node.clone()).collect();
+    if nodes.is_empty() {
+        return Err(Error::new(
+            Status::InvalidArg,
+            "compile_decode: expected at least one root".to_string(),
+        ));
+    }
+    let (nodes, geometry) =
+        decode_rewrite(&nodes, window.map(|w| w as usize)).map_err(|e| Error::new(Status::GenericFailure, e))?;
+    let nodes = fuse_roots(&nodes).map_err(|e| Error::new(Status::GenericFailure, e))?;
+    let (slots, leaves) =
+        collect_program_slots(&nodes).map_err(|e| Error::new(Status::InvalidArg, e))?;
+    let signature = slots
+        .iter()
+        .map(|slot| slot.signature())
+        .collect::<Vec<_>>()
+        .join(",");
+    Ok(DecodeProgram {
+        inner: Some(ProgramInner {
+            roots: nodes,
+            slots,
+            leaves,
+            signature,
+        }),
+        cursor_slot: geometry.cursor_slot,
+        layers: geometry.layers as u32,
+        kv_heads: geometry.kv_heads as u32,
+        head_dim: geometry.head_dim as u32,
+    })
+}
+
 // RFC 0008: a frozen, reusable graph executable. `compile` traces slot
 // declarations out of the root DAG, fuses once, and stores the immutable
 // post-fusion roots; `run` rebinds Input/ScalarInput leaves to call
@@ -6572,6 +7660,7 @@ pub async fn eval_lazy(
 // A program holds no device buffers beyond the constant/parameter leaves
 // the traced graph already referenced.
 
+#[derive(Clone)]
 struct ProgramSlot {
     scalar: bool,
     shape: Vec<usize>,
@@ -6743,45 +7832,56 @@ impl CompiledProgram {
                 ),
             ));
         }
-        let mut bindings = std::collections::HashMap::new();
         let mut tensors = inputs.iter();
-        let mut scalars_iter = scalars.iter();
         // Slots are indexed by declaration order; tensor and scalar
         // arguments arrive as separate vectors in slot order.
         for (slot, declared) in inner.slots.iter().enumerate() {
+            if declared.scalar {
+                continue;
+            }
+            let input = tensors.next().expect("tensor count checked");
+            let got = &input.inner;
+            if got.dims() != declared.shape.as_slice()
+                || got.dtype() != declared.dtype
+                || device_key(got.device()) != device_key(&declared.device)
+            {
+                return Err(Error::new(
+                    Status::InvalidArg,
+                    format!(
+                        "input slot {slot}: expected {}, got {}:{}@{}",
+                        declared.signature(),
+                        got.dims()
+                            .iter()
+                            .map(|d| d.to_string())
+                            .collect::<Vec<_>>()
+                            .join("x"),
+                        dtype_name(got.dtype()),
+                        device_key(got.device())
+                    ),
+                ));
+            }
+        }
+        let slots = inner.slots.clone();
+        let roots = inner.roots.clone();
+        let leaves = inner.leaves.clone();
+        let inputs: Vec<Tensor> = inputs.iter().map(|input| input.inner.clone()).collect();
+    run_compute(token, move |cancelled| {
+        let _guard = metal_eval_guard(&roots);
+        // Bindings are built inside the eval guard: scalar_binding
+        // allocates on the device, which is not safe to do concurrently
+        // with another walk on Metal.
+        let mut bindings = std::collections::HashMap::new();
+        let mut tensors = inputs.iter();
+        let mut scalars_iter = scalars.iter();
+        for (slot, declared) in slots.iter().enumerate() {
             let binding = if declared.scalar {
                 let value = scalars_iter.next().expect("scalar count checked");
                 scalar_binding(*value, declared.dtype, &declared.device).map_err(to_napi_err)?
             } else {
-                let input = tensors.next().expect("tensor count checked");
-                let got = &input.inner;
-                if got.dims() != declared.shape.as_slice()
-                    || got.dtype() != declared.dtype
-                    || device_key(got.device()) != device_key(&declared.device)
-                {
-                    return Err(Error::new(
-                        Status::InvalidArg,
-                        format!(
-                            "input slot {slot}: expected {}, got {}:{}@{}",
-                            declared.signature(),
-                            got.dims()
-                                .iter()
-                                .map(|d| d.to_string())
-                                .collect::<Vec<_>>()
-                                .join("x"),
-                            dtype_name(got.dtype()),
-                            device_key(got.device())
-                        ),
-                    ));
-                }
-                got.clone()
+                tensors.next().expect("tensor count checked").clone()
             };
             bindings.insert(slot as u64, binding);
         }
-        let roots = inner.roots.clone();
-        let leaves = inner.leaves.clone();
-    run_compute(token, move |cancelled| {
-        let _guard = metal_eval_guard(&roots);
         let by_id: std::collections::HashMap<u64, Tensor> = leaves
             .iter()
             .map(|(id, slot)| (*id, bindings[&(*slot as u64)].clone()))
@@ -6911,3 +8011,63 @@ pub fn external_memory_bytes() -> i64 {
     EXTERNAL_MEMORY_BYTES.load(Ordering::Relaxed)
 }
 
+
+#[cfg(test)]
+mod kv_tests {
+    use super::*;
+
+    #[test]
+    fn scatter_gather_roundtrip() {
+        let device = Device::Cpu;
+        let slab = Tensor::zeros((8, 2, 3), DType::F32, &device).unwrap();
+        let src = Tensor::arange(0f32, 12f32, &device).unwrap().reshape((2, 2, 3)).unwrap();
+        let idx = Tensor::from_vec(vec![4u32, 5u32], (2, 1, 1), &device)
+            .unwrap()
+            .broadcast_as((2, 2, 3))
+            .unwrap()
+            .contiguous()
+            .unwrap();
+        slab.scatter_set(&idx, &src, 0).unwrap();
+        let got = slab.gather(&idx, 0).unwrap();
+        assert_eq!(got.to_vec3::<f32>().unwrap(), src.to_vec3::<f32>().unwrap());
+    }
+
+    #[test]
+    fn kv_attention_matches_sdpa() {
+        let device = Device::Cpu;
+        let pool = Arc::new(PoolInner {
+            k: vec![Tensor::zeros((8, 2, 4), DType::F32, &device).unwrap()],
+            v: vec![Tensor::zeros((8, 2, 4), DType::F32, &device).unwrap()],
+            kv_heads: 2,
+            head_dim: 4,
+            block_size: 4,
+            max_tokens: 8,
+            free: Mutex::new(vec![1u32, 0u32]),
+            device: device.clone(),
+        });
+        let state = Arc::new(Mutex::new(SeqState { blocks: Vec::new(), head: 0, cursor: 0, advance: 0 }));
+        let kv = KvContext { pool: pool.clone(), state: state.clone() };
+        let q = Tensor::arange(0f32, 24f32, &device).unwrap().reshape((1, 2, 3, 4)).unwrap();
+        let k = (Tensor::arange(24f32, 48f32, &device).unwrap() * 0.01).unwrap().reshape((1, 2, 3, 4)).unwrap();
+        let v = (Tensor::arange(48f32, 72f32, &device).unwrap() * 0.01).unwrap().reshape((1, 2, 3, 4)).unwrap();
+        state.lock().unwrap().advance = 3;
+        let got = kv_attention(&kv, 0, &q, &k, &v, 0.5, None).unwrap();
+        let want = sdpa_forward(&q, &k, &v, 0.5, true).unwrap();
+        let got = got.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        let want = want.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        assert_eq!(got, want);
+        assert_eq!(state.lock().unwrap().advance, 3);
+    }
+
+    #[test]
+    fn sdpa_single_token() {
+        let device = Device::Cpu;
+        let q = Tensor::arange(0f32, 8f32, &device).unwrap().reshape((1, 2, 1, 4)).unwrap();
+        let k = Tensor::ones((1, 2, 1, 4), DType::F32, &device).unwrap();
+        let v = Tensor::arange(8f32, 16f32, &device).unwrap().reshape((1, 2, 1, 4)).unwrap();
+        let out = sdpa_forward(&q, &k, &v, 0.5, true).unwrap();
+        let got = out.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        let want = v.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        assert_eq!(got, want);
+    }
+}

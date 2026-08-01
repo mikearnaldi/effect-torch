@@ -3,8 +3,11 @@ import { dual } from "effect/Function"
 import { pipeArguments, type Pipeable } from "effect/Pipeable"
 import native, {
   type CompiledProgram as NativeCompiledProgramType,
+  type DecodeProgram as NativeDecodeProgramType,
   type LazyTensor as NativeLazyTensorType,
   type NativeDType,
+  type NativeKvPool as NativeKvPoolType,
+  type NativeKvSequence as NativeKvSequenceType,
   type NativeTensor as NativeTensorType
 } from "@effect-torch/native"
 import { CurrentDevice, type DeviceKind } from "./Device.ts"
@@ -12,9 +15,11 @@ import { CurrentDevice, type DeviceKind } from "./Device.ts"
 const {
   CancellationToken,
   compile: nativeCompile,
+  compileDecode: nativeCompileDecode,
   evalLazy,
   LazyTensor: NativeLazyTensor,
   loadTensors,
+  NativeKvPool,
   reportExternalMemory,
   saveTensors
 } = native
@@ -3748,6 +3753,174 @@ export const runProgram = (
     )
     reportExternalMemory(handles.reduce((total, handle) => total + handle.bytes, 0))
     return handles.map(fromHandle)
+  })
+
+/**
+ * The native decode-program handle behind inference artifacts (RFC
+ * 0010). Internal to the library.
+ *
+ * @since 0.1.0
+ * @category compilation
+ * @internal
+ */
+export type NativeDecodeProgram = NativeDecodeProgramType
+
+/**
+ * The native kv-sequence handle (block table + cursor over a pool).
+ * Internal to the library.
+ *
+ * @since 0.1.0
+ * @category compilation
+ * @internal
+ */
+export type NativeKvSequence = NativeKvSequenceType
+
+/**
+ * The native kv-pool handle (the per-layer key/value arena). Internal
+ * to the library.
+ *
+ * @since 0.1.0
+ * @category compilation
+ * @internal
+ */
+export type NativeKvPool = NativeKvPoolType
+
+/**
+ * Allocates a kv pool (RFC 0010): `layers` per-layer `[maxTokens,
+ * kvHeads, headDim]` key/value slabs with `blockSize`-token blocks.
+ * Internal to the library.
+ *
+ * @since 0.1.0
+ * @category compilation
+ * @internal
+ */
+export const makeKvPool = (
+  layers: number,
+  kvHeads: number,
+  headDim: number,
+  maxTokens: number,
+  blockSize: number,
+  device: DeviceKind
+): Effect.Effect<NativeKvPoolType, TensorError> =>
+  Effect.try({
+    try: () => new NativeKvPool(layers, kvHeads, headDim, maxTokens, blockSize, device),
+    catch: (error) =>
+      new TensorError({
+        op: "makeKvPool",
+        message: error instanceof Error ? error.message : String(error)
+      })
+  })
+
+/**
+ * Rewrites a traced forward graph for generation (causal attention to
+ * paged kv attention, position embeddings to cursor-offset gathers) and
+ * freezes it. Internal to the library.
+ *
+ * @since 0.1.0
+ * @category compilation
+ * @internal
+ */
+export const compileDecodeProgram = (
+  roots: ReadonlyArray<Any>,
+  window?: number
+): Effect.Effect<NativeDecodeProgramType, TensorError> =>
+  Effect.try({
+    try: () => nativeCompileDecode(roots.map((root) => root.lazy), window),
+    catch: (error) =>
+      new TensorError({ op: "compileDecode", message: error instanceof Error ? error.message : String(error) })
+  })
+
+/**
+ * Runs a frozen decode program against a kv sequence: lazy inputs are
+ * materialized first, then one async native call binds the argument
+ * buffers, evaluates against the sequence's pool blocks, and advances
+ * the cursor.
+ *
+ * @since 0.1.0
+ * @category compilation
+ * @internal
+ */
+export const runDecodeProgram = (
+  program: NativeDecodeProgramType,
+  inputs: ReadonlyArray<Any>,
+  seq: NativeKvSequenceType,
+  advance: number
+): Effect.Effect<Array<Concrete>, TensorError> =>
+  Effect.gen(function* () {
+    const concrete = yield* compute(inputs)
+    const handles = yield* fromNative("run", (token) =>
+      program.run(concrete.map((input) => input.materialized), seq, advance, token)
+    )
+    reportExternalMemory(handles.reduce((total, handle) => total + handle.bytes, 0))
+    return handles.map(fromHandle)
+  })
+
+/**
+ * Rows `0..seqLen-1` of a `[maxPositions, embeddingDim]` position
+ * embedding table, as a single semantic operation (the graph equivalent
+ * of gathering `arange(seqLen)`). Internal to the library — the semantic
+ * node exists so decode compilation (RFC 0010) can offset the positions
+ * by the runtime cursor.
+ *
+ * @since 0.1.0
+ * @category neural network
+ * @internal
+ */
+export const positionEmbedding = (
+  weight: Any,
+  seqLen: number
+): Effect.Effect<Lazy, TensorError> =>
+  Effect.try({
+    try: () => {
+      if (weight.shape.length !== 2) {
+        throw new Error(
+          `positionEmbedding: weight must be [maxPositions, E], got [${weight.shape}]`
+        )
+      }
+      return makeLazy(
+        weight.lazy.positionEmbedding(seqLen),
+        [seqLen, weight.shape[1]],
+        weight.dtype,
+        weight.device
+      )
+    },
+    catch: (error) =>
+      new TensorError({
+        op: "positionEmbedding",
+        message: error instanceof Error ? error.message : String(error)
+      })
+  })
+
+/**
+ * Rotary position embedding (RoPE, GPT-NeoX half-split) over the last
+ * dimension of a `[..., seqLen, D]` input (D even): positions
+ * `0..seqLen-1` rotated by `theta^(-2j/D)`. Internal to the library —
+ * the semantic node exists so decode compilation (RFC 0010) can rebase
+ * the positions on the runtime cursor; attention then sees only
+ * relative offsets, which is what makes cached generation unbounded.
+ *
+ * @since 0.1.0
+ * @category neural network
+ * @internal
+ */
+export const rotaryEmbedding = (
+  self: Any,
+  seqLen: number,
+  theta: number
+): Effect.Effect<Lazy, TensorError> =>
+  Effect.try({
+    try: () =>
+      makeLazy(
+        self.lazy.rotaryEmbedding(seqLen, theta),
+        self.shape,
+        self.dtype,
+        self.device
+      ),
+    catch: (error) =>
+      new TensorError({
+        op: "rotaryEmbedding",
+        message: error instanceof Error ? error.message : String(error)
+      })
   })
 
 /**

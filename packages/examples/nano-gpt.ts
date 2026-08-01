@@ -3,11 +3,14 @@ import { NodeRuntime } from "@effect/platform-node"
 import { Device, LearningRate, Loss, Model, Optimizer, Tensor, Tokenizer, Trainer } from "@effect-torch/core"
 
 // A GPT with a byte-level BPE tokenizer (trained on the fly, RFC 0009)
-// on a few KB of public-domain verse: token and position embeddings
-// fanned into one stream, pre-norm transformer blocks (causal multi-head
-// attention + MLP, each under a residual connection), a final layer norm
-// and a vocabulary head. Everything is the stock Model combinators;
-// attention is the fused flash kernel on Metal.
+// on a few KB of public-domain verse: token embeddings, pre-norm
+// transformer blocks (causal multi-head attention with RoPE + MLP, each
+// under a residual connection), a final layer norm and a vocabulary
+// head. Everything is the stock Model combinators; attention is the
+// fused flash kernel on Metal. Generation runs through the compiled
+// inference artifact (RFC 0010): paged kv cache, prefill once, one
+// pooled step per token, sliding-window attention over the last BLOCK
+// positions — RoPE makes positions relative, so generation is unbounded.
 
 const CORPUS = `Shall I compare thee to a summer's day?
 Thou art more lovely and more temperate:
@@ -85,17 +88,14 @@ const DOCUMENTS = CORPUS.split("\n\n").map((poem) => poem.trim() + "\n")
 
 const createGpt = (vocabSize: number) =>
   Effect.gen(function* () {
-    // token + position embeddings share the input (the position side
-    // reads only its length)
-    const embeddings = yield* Model.add(
-      yield* Model.embedding("wte", vocabSize, EMBED),
-      yield* Model.positionEmbedding("wpe", BLOCK, EMBED)
-    )
+    // Token embeddings; positions are relative (RoPE inside attention),
+    // so generation is unbounded — no position table to outgrow.
+    const embeddings = yield* Model.embedding("wte", vocabSize, EMBED)
     const blocks: Array<Model.Model> = []
     for (let i = 0; i < LAYERS; i++) {
       const attn = yield* Model.chain(
         yield* Model.layerNorm(`b${i}.ln1`, EMBED),
-        yield* Model.multiHeadAttention(`b${i}.attn`, EMBED, HEADS, { causal: true })
+        yield* Model.multiHeadAttention(`b${i}.attn`, EMBED, HEADS, { causal: true, rope: 10000 })
       )
       const mlp = yield* Model.chain(
         yield* Model.layerNorm(`b${i}.ln2`, EMBED),
@@ -115,7 +115,7 @@ const createGpt = (vocabSize: number) =>
   })
 
 const ids = (values: ReadonlyArray<number>, shape: ReadonlyArray<number>) =>
-  Tensor.fromTypedArray(new BigInt64Array(values.map(BigInt)), shape)
+  Tensor.fromTypedArray(new Uint32Array(values), shape)
 
 const sampleBatch = (data: ReadonlyArray<number>) =>
   Effect.gen(function* () {
@@ -166,50 +166,45 @@ const init = (model: Model.Model) =>
     return params
   })
 
-// Generates a document from a prompt: seeds the context with BOS plus the
-// encoded prompt, then samples token by token until EOS — documents end
-// when the model says they end, not on a token budget. Each step re-runs the model on
-// the last BLOCK tokens: the window is right-padded to a fixed [1, BLOCK]
-// shape so generation is served by a single compiled program — positions
-// are window-relative (every window restarts at 0) and attention is
-// causal, so the real tokens never attend to the padding and their logits
-// are unchanged; the next-token logits are the row at the true last
-// token, not the padded last row.
+// Generates a document from a prompt through the compiled inference
+// artifact (RFC 0010): the prompt is prefilled once into the sequence's
+// kv blocks, then each step appends one token, attending over the last
+// BLOCK cached positions (sliding window — exactly the distribution the
+// model trained on, since RoPE sees only relative offsets). Sampling
+// stops at EOS: documents end when the model says they end.
 const generate = (
-  model: Model.CompiledModel,
+  program: Model.InferenceProgram,
   tokenizer: Tokenizer.Tokenizer,
-  params: Model.Params,
   prompt: string
 ) =>
-  Effect.gen(function* () {
-    const vocabSize = tokenizer.vocabSize
+  Effect.scoped(Effect.gen(function* () {
     const bosId = Option.getOrThrow(tokenizer.tokenToId(BOS))
     const eosId = Option.getOrThrow(tokenizer.tokenToId(EOS))
     const promptIds = yield* Tensor.toNumberArray(yield* tokenizer.encode(prompt))
-    const context = [bosId, ...promptIds]
-    for (;;) {
-      const window = context.slice(-BLOCK)
-      const idx = yield* ids([...window, ...new Array(BLOCK - window.length).fill(0)], [1, BLOCK])
-      const logits = yield* model.execute(params, idx)
-      const all = yield* Tensor.toNumberArray(logits)
-      const row = all.slice((window.length - 1) * vocabSize, window.length * vocabSize)
-      const max = Math.max(...row)
-      const exps = row.map((x) => Math.exp((x - max) / TEMPERATURE))
-      const total = exps.reduce((a, b) => a + b, 0)
-      let draw = Math.random() * total
-      let next = exps.length - 1
-      for (let i = 0; i < exps.length; i++) {
-        draw -= exps[i]
-        if (draw <= 0) {
-          next = i
-          break
+    const seq = yield* program.sequence()
+    const sample = (logits: Tensor.Any) =>
+      Effect.gen(function* () {
+        const row = yield* Tensor.toNumberArray(logits)
+        const max = Math.max(...row)
+        const exps = row.map((x) => Math.exp((x - max) / TEMPERATURE))
+        const total = exps.reduce((a, b) => a + b, 0)
+        let draw = Math.random() * total
+        for (let i = 0; i < exps.length; i++) {
+          draw -= exps[i]
+          if (draw <= 0) return i
         }
-      }
+        return exps.length - 1
+      })
+    let logits = yield* seq.prefill(yield* ids([bosId, ...promptIds], [1, 1 + promptIds.length]))
+    const generated: Array<number> = []
+    for (;;) {
+      const next = yield* sample(logits)
       if (next === eosId) break
-      context.push(next)
+      generated.push(next)
+      logits = yield* seq.step(yield* ids([next], [1, 1]))
     }
-    return yield* tokenizer.decode(context.slice(1 + promptIds.length))
-  })
+    return yield* tokenizer.decode(generated)
+  }))
 
 const program = Effect.gen(function* () {
   const device = yield* Device.CurrentDevice
@@ -248,16 +243,21 @@ const program = Effect.gen(function* () {
   const params = trained.params
 
   yield* Effect.log(`3) generating from prompts (temperature ${TEMPERATURE}), stopping at EOS:`)
+  const inference = yield* Model.inference(model, params, {
+    maxTokens: 4096,
+    blockSize: 16,
+    attentionWindow: BLOCK
+  })
   const prompts = [
     "Shall I compare thee",
     "To be, or not to be",
     "Beware the Jabberwock"
   ]
   for (const prompt of prompts) {
-    yield* Effect.log(`promt: ${prompt}`)
-    const text = yield* generate(model, tokenizer, params, prompt)
+    const text = yield* generate(inference, tokenizer, prompt)
+    yield* Effect.log(`prompt: ${prompt}`)
     yield* Effect.log(`answer:\n${text}`)
   }
 })
 
-NodeRuntime.runMain(program.pipe(Effect.provide(Device.Best)))
+NodeRuntime.runMain(Effect.scoped(program).pipe(Effect.provide(Device.Best)))
