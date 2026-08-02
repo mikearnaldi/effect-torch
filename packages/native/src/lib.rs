@@ -8,6 +8,7 @@ use std::sync::{Arc, LazyLock, Mutex, OnceLock};
 
 mod fusion;
 mod flash;
+mod paged;
 mod tokenizer;
 
 fn to_napi_err(err: candle_core::Error) -> Error {
@@ -6945,8 +6946,33 @@ pub async fn eval_lazy(
     token: Option<&CancellationToken>,
 ) -> Result<Vec<NativeTensor>> {
     let nodes: Vec<Arc<Node>> = tensors.iter().map(|t| t.node.clone()).collect();
-    let nodes = fuse_roots(&nodes).map_err(|e| Error::new(Status::GenericFailure, e))?;
+    let walk_timing = std::env::var_os("EFFECT_TORCH_WALK_TIMING").is_some();
+    let t0 = std::time::Instant::now();
+    let nodes = fuse_roots_cached(&nodes)?;
+    if walk_timing {
+        eprintln!("[walk] fuse_roots {:.1}us ({} nodes)", t0.elapsed().as_micros(), nodes.len());
+    }
+    if std::env::var_os("EFFECT_TORCH_EVAL_STATS").is_some() {
+        let mut counts: HashMap<&'static str, usize> = HashMap::new();
+        let mut seen = std::collections::HashSet::new();
+        let mut stack: Vec<Arc<Node>> = nodes.clone();
+        while let Some(node) = stack.pop() {
+            if !seen.insert(node.id) {
+                continue;
+            }
+            *counts.entry(node_kind_name(&node.kind)).or_insert(0) += 1;
+            stack.extend(node_children(&node.kind));
+        }
+        let mut entries: Vec<_> = counts.into_iter().collect();
+        entries.sort_by_key(|(_, n)| std::cmp::Reverse(*n));
+        eprintln!(
+            "[eval-stats] {} nodes: {}",
+            seen.len(),
+            entries.iter().map(|(k, n)| format!("{k}×{n}")).collect::<Vec<_>>().join(" ")
+        );
+    }
     run_compute(token, move |cancelled| {
+        let t1 = std::time::Instant::now();
         let _guard = metal_eval_guard(&nodes);
         let mut ev = Evaluator::new(&nodes);
         let mut outputs = Vec::with_capacity(nodes.len());
@@ -6955,9 +6981,88 @@ pub async fn eval_lazy(
             output.device().synchronize().map_err(to_napi_err)?;
             outputs.push(NativeTensor::wrap(output));
         }
+        if walk_timing {
+            eprintln!("[walk] eval {:.1}us ({} nodes)", t1.elapsed().as_micros(), nodes.len());
+        }
         Ok(outputs)
     })
     .await
+}
+
+// Fusion is a deterministic pure function of the graph, and graphs are
+// immutable (stable node ids), so eval-time fusion is memoized by root
+// ids — re-walking the same graph (training loops, repeated computes)
+// pays fuse_roots once, not 2.4ms per eval. Bounded: 32 entries, evict
+// oldest.
+fn fuse_roots_cached(roots: &[Arc<Node>]) -> Result<Vec<Arc<Node>>> {
+    if std::env::var_os("EFFECT_TORCH_NO_FUSION").is_some() {
+        return Ok(roots.to_vec());
+    }
+    static CACHE: LazyLock<Mutex<(u64, HashMap<Vec<u64>, (u64, Vec<Arc<Node>>)>)>> =
+        LazyLock::new(|| Mutex::new((0, HashMap::new())));
+    let key: Vec<u64> = roots.iter().map(|r| r.id).collect();
+    {
+        let mut cache = CACHE.lock().map_err(|e| {
+            Error::new(Status::GenericFailure, format!("fusion cache lock poisoned: {e}"))
+        })?;
+        cache.0 += 1;
+        let tick = cache.0;
+        if let Some((entry_tick, fused)) = cache.1.get_mut(&key) {
+            *entry_tick = tick;
+            return Ok(fused.clone());
+        }
+    }
+    let fused = fuse_roots(roots).map_err(|e| Error::new(Status::GenericFailure, e))?;
+    let mut cache = CACHE.lock().map_err(|e| {
+        Error::new(Status::GenericFailure, format!("fusion cache lock poisoned: {e}"))
+    })?;
+    cache.0 += 1;
+    let tick = cache.0;
+    if cache.1.len() >= 32 {
+        if let Some(oldest) = cache
+            .1
+            .iter()
+            .min_by_key(|(_, (tick, _))| *tick)
+            .map(|(k, _)| k.clone())
+        {
+            cache.1.remove(&oldest);
+        }
+    }
+    cache.1.insert(key, (tick, fused.clone()));
+    Ok(fused)
+}
+
+// Coarse node-kind names for EFFECT_TORCH_EVAL_STATS.
+fn node_kind_name(kind: &NodeKind) -> &'static str {
+    match kind {
+        NodeKind::FusedElementwise { .. } => "Fused",
+        NodeKind::FusedElementwiseMulti { .. } => "FusedMulti",
+        NodeKind::FusedReduce { .. } => "FusedReduce",
+        NodeKind::FusedPick { .. } => "FusedPick",
+        NodeKind::Add { .. } => "Add",
+        NodeKind::Sub { .. } => "Sub",
+        NodeKind::Mul { .. } => "Mul",
+        NodeKind::Div { .. } => "Div",
+        NodeKind::Matmul { .. } => "Matmul",
+        NodeKind::Sdpa { .. } => "Sdpa",
+        NodeKind::SdpaBackward { .. } | NodeKind::SdpaBackwardOut { .. } => "SdpaBwd",
+        NodeKind::Concat { .. } => "Concat",
+        NodeKind::Slice { .. } => "Slice",
+        NodeKind::Permute { .. } => "Permute",
+        NodeKind::Reshape { .. } => "Reshape",
+        NodeKind::BroadcastTo { .. } => "Broadcast",
+        NodeKind::Cast { .. } => "Cast",
+        NodeKind::Gather { .. } | NodeKind::IndexSelect { .. } => "Gather",
+        NodeKind::ScatterAdd { .. } => "ScatterAdd",
+        NodeKind::RotaryEmbedding { .. } => "Rope",
+        NodeKind::PositionEmbedding { .. } => "PosEmb",
+        NodeKind::KvAttention { .. } => "KvAttention",
+        NodeKind::Sum { .. } | NodeKind::Mean { .. } | NodeKind::Max { .. } | NodeKind::Min { .. } | NodeKind::Prod { .. } => "Reduce",
+        NodeKind::CrossEntropy { .. } | NodeKind::CrossEntropyBackward { .. } => "CE",
+        NodeKind::Leaf(_) | NodeKind::Input { .. } | NodeKind::ScalarInput { .. } => "Input",
+        NodeKind::FromBytes { .. } | NodeKind::Zeros { .. } | NodeKind::Ones { .. } | NodeKind::Full { .. } | NodeKind::Randn { .. } | NodeKind::Uniform { .. } | NodeKind::Arange { .. } | NodeKind::Eye { .. } => "Const",
+        _ => "Other",
+    }
 }
 
 // RFC 0010: paged KV inference. A `NativeKvPool` is a fixed-capacity// arena of key/value rows per attention layer, allocated once per
@@ -7189,6 +7294,10 @@ struct KvContext {
     // table, cursor, window, advance. Single-sequence runs have one
     // slot (RFC 0013).
     slots: Vec<Arc<Mutex<SeqState>>>,
+    // Block tables + context lengths for the paged kernel, built once
+    // per run (identical across layers: blocks settle at layer 0's
+    // prepare, the cursor advances only at run end).
+    paged_tables: Mutex<Option<(Tensor, Tensor)>>,
 }
 
 // RoPE forward: x [.., T, D] (D even), one position offset per leading
@@ -7263,6 +7372,15 @@ fn kv_attention(
             kv.slots.len()
         )));
     }
+    // Metal: one fused scatter + one kernel launch attend all slots
+    // over the pool slabs in place — no gather copy, decode and
+    // chunked prefill alike (RFC 0013, stage 2). Everything else
+    // falls back to the composed per-slot path.
+    let rank = dims.len();
+    let (t, h, d) = (dims[rank - 2], dims[rank - 3], dims[rank - 1]);
+    if paged::is_supported(q, kv.pool.k[layer as usize].dtype(), d) {
+        return kv_attention_paged(kv, layer, q, k, v, scale, window, batch, t, h, d);
+    }
     if batch == 1 {
         let mut state = kv.slots[0].lock().map_err(|e| {
             candle_core::Error::Msg(format!("kv attention: sequence lock poisoned: {e}"))
@@ -7288,6 +7406,107 @@ fn kv_attention(
     Tensor::cat(&outs.iter().collect::<Vec<_>>(), 0)
 }
 
+// Metal paged attention (RFC 0013, stage 2): per-slot prepare
+// (validate, allocate), one fused scatter of every slot's new rows,
+// one kernel launch attending over the slabs in place (per-row causal
+// lengths cover decode and chunked prefill), then per-slot eviction.
+#[allow(clippy::too_many_arguments)]
+fn kv_attention_paged(
+    kv: &KvContext,
+    layer: u32,
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    scale: f64,
+    window: Option<usize>,
+    batch: usize,
+    t: usize,
+    h: usize,
+    d: usize,
+) -> candle_core::Result<Tensor> {
+    let pool = &kv.pool;
+    let layer = layer as usize;
+    let mut ctxlens = Vec::with_capacity(batch);
+    let mut starts = Vec::with_capacity(batch);
+    let mut advance = 0usize;
+    for slot in kv.slots.iter() {
+        let mut state = slot.lock().map_err(|e| {
+            candle_core::Error::Msg(format!("kv attention: sequence lock poisoned: {e}"))
+        })?;
+        advance = state.advance;
+        let (_cursor, needed, start) = kv_prepare(pool, &mut state, layer, window, h, d, t)?;
+        ctxlens.push(needed as u32);
+        starts.push(start);
+    }
+    // Tables/ctxlens settle at layer 0; later layers reuse them.
+    let mut cache = kv.paged_tables.lock().map_err(|e| {
+        candle_core::Error::Msg(format!("kv attention: table cache lock poisoned: {e}"))
+    })?;
+    if cache.is_none() {
+        let mut tables: Vec<u32> = Vec::new();
+        let mut max_blocks = 0usize;
+        for slot in &kv.slots {
+            let state = slot.lock().map_err(|e| {
+                candle_core::Error::Msg(format!("kv attention: sequence lock poisoned: {e}"))
+            })?;
+            max_blocks = max_blocks.max(state.blocks.len());
+        }
+        for slot in &kv.slots {
+            let state = slot.lock().map_err(|e| {
+                candle_core::Error::Msg(format!("kv attention: sequence lock poisoned: {e}"))
+            })?;
+            tables.extend_from_slice(&state.blocks);
+            tables.resize(tables.len() + (max_blocks - state.blocks.len()), 0);
+        }
+        *cache = Some((
+            Tensor::from_vec(tables, (batch, max_blocks), &pool.device)?,
+            Tensor::from_vec(ctxlens.clone(), batch, &pool.device)?,
+        ));
+    }
+    let (tables, ctxlens) = cache.as_ref().expect("populated above");
+    let slab_dtype = pool.k[layer].dtype();
+    let (k_scales, v_scales) = match slab_dtype {
+        DType::U8 => (
+            Some(&pool.scales[2 * layer]),
+            Some(&pool.scales[2 * layer + 1]),
+        ),
+        _ => (None, None),
+    };
+    // One fused scatter for all slots, one attention kernel launch.
+    paged::scatter(
+        k,
+        v,
+        &pool.k[layer],
+        &pool.v[layer],
+        k_scales,
+        v_scales,
+        tables,
+        ctxlens,
+        pool.block_size,
+        advance,
+    )?;
+    let out = paged::decode(
+        q,
+        &pool.k[layer],
+        &pool.v[layer],
+        k_scales,
+        v_scales,
+        tables,
+        ctxlens,
+        window,
+        scale,
+        pool.block_size,
+        advance,
+    )?;
+    for (b, slot) in kv.slots.iter().enumerate() {
+        let mut state = slot.lock().map_err(|e| {
+            candle_core::Error::Msg(format!("kv attention: sequence lock poisoned: {e}"))
+        })?;
+        kv_evict(pool, &mut state, starts[b]);
+    }
+    Ok(out)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn kv_attention_slot(
     pool: &Arc<PoolInner>,
@@ -7299,77 +7518,29 @@ fn kv_attention_slot(
     scale: f64,
     window: Option<usize>,
 ) -> candle_core::Result<Tensor> {
-    let pool = pool;
-    let layer = layer as usize;
-    let dims = q.dims();
-    let rank = dims.len();
-    let (t, h, d) = (dims[rank - 2], dims[rank - 3], dims[rank - 1]);
-    if layer >= pool.k.len() {
-        return Err(candle_core::Error::Msg(format!(
-            "kv attention: layer {layer} out of range for {} pool layers",
-            pool.k.len()
-        )));
-    }
-    if h != pool.kv_heads || d != pool.head_dim {
-        return Err(candle_core::Error::Msg(format!(
-            "kv attention: layer {layer} shape [{h}, {d}] does not match pool geometry [{}, {}]",
-            pool.kv_heads, pool.head_dim
-        )));
-    }
     if q.dtype() != DType::F32 {
         return Err(candle_core::Error::Msg(format!(
             "kv attention: dtype must be f32, got {:?}",
             q.dtype()
         )));
     }
-    // The pool slabs may be narrower than the compute dtype (RFC 0012,
-    // kvDtype): rows are quantized on scatter and widened back on
-    // gather — attention itself always computes in f32.
+    let layer = layer as usize;
+    let dims = q.dims();
+    let rank = dims.len();
+    let (t, h, d) = (dims[rank - 2], dims[rank - 3], dims[rank - 1]);
+    let (cursor, needed, start) = kv_prepare(pool, state, layer, window, h, d, t)?;
+    kv_scatter_rows(pool, state, layer, k, v, h, d)?;
     let slab_dtype = pool.k[layer].dtype();
-    let cursor = state.cursor;
-    // Chunked prefill: q carries the chunk length t, only `advance`
-    // rows are real; the rest are pads whose outputs the caller
-    // discards (causality keeps real rows from ever attending to them).
-    let advance = state.advance;
-    if advance == 0 || advance > t {
-        return Err(candle_core::Error::Msg(format!(
-            "kv attention: advance {advance} out of range for chunk length {t}"
-        )));
-    }
-    let needed = cursor + advance;
-    // Live rows after this step: everything from the attention window
-    // frontier on. Blocks fully below the frontier are dead and their
-    // capacity is reclaimed, so a windowed sequence's footprint is
-    // O(window) however long it generates.
     let full = cursor + t;
-    let start = window.map_or(0, |w| full.saturating_sub(w));
-    if needed - start > pool.max_tokens {
-        return Err(candle_core::Error::Msg(format!(
-            "kv attention: live context {} exceeds pool capacity {}",
-            needed - start,
-            pool.max_tokens
-        )));
-    }
-    while state.blocks.len() * pool.block_size < needed {
-        let block = pool.alloc_block().ok_or_else(|| {
-            candle_core::Error::Msg(format!(
-                "kv attention: pool exhausted ({} tokens across live sequences)",
-                pool.max_tokens
-            ))
-        })?;
-        state.blocks.push(block);
-    }
-    // [1, H, T, D] -> [T, H, D], real rows only
-    let new_rows = |x: &Tensor| -> candle_core::Result<Tensor> {
-        x.permute((0, 2, 1, 3))?
-            .contiguous()?
-            .narrow(1, 0, advance)?
-            .reshape((advance, h, d))
-    };
     // row indexes [T] broadcast to the scatter/gather contract [T, H, D]
     let row_index = |rows: Vec<u32>| -> candle_core::Result<Tensor> {
         let n = rows.len();
         Tensor::from_vec(rows, (n, 1, 1), &pool.device)?.broadcast_as((n, h, d))?.contiguous()
+    };
+    // Row indexes [T] broadcast to the scale contract [T, H].
+    let scale_index = |rows: Vec<u32>| -> candle_core::Result<Tensor> {
+        let n = rows.len();
+        Tensor::from_vec(rows, (n, 1), &pool.device)?.broadcast_as((n, h))?.contiguous()
     };
     // Logical position -> physical row, through the sequence's block
     // table. The table is append-only: entries below `head` are dead
@@ -7379,39 +7550,6 @@ fn kv_attention_slot(
         state.blocks[p / pool.block_size] * pool.block_size as u32
             + (p % pool.block_size) as u32
     };
-    let write_rows: Vec<u32> = (cursor..needed).map(&physical).collect();
-    let write_index = row_index(write_rows.clone())?;
-    // Row indexes [T] broadcast to the scale contract [T, H].
-    let scale_index = |rows: Vec<u32>| -> candle_core::Result<Tensor> {
-        let n = rows.len();
-        Tensor::from_vec(rows, (n, 1), &pool.device)?.broadcast_as((n, h))?.contiguous()
-    };
-    let write_scales = |layer: usize, slot: usize, scale: &Tensor| -> candle_core::Result<()> {
-        pool.scales[2 * layer + slot].scatter_set(&scale_index(write_rows.clone())?, scale, 0)
-    };
-    if slab_dtype == DType::U8 {
-        // int8 storage tier: symmetric quantization on a ±127 grid
-        // (offset 128 for the u8 layout) with a per-(token, head)
-        // absmax scale. The grid is deliberately not arithmetic — only
-        // this kernel quantizes on write and dequantizes on read.
-        let quantize = |x: &Tensor| -> candle_core::Result<(Tensor, Tensor)> {
-            let scale = (x.abs()?.max(candle_core::D::Minus1)? / 127.0)?;
-            let scale = (scale + 1e-12)?; // zero rows stay finite
-            let q = ((x.broadcast_div(&scale.unsqueeze(candle_core::D::Minus1)?)? + 128.0)?
-                .round()?
-                .to_dtype(DType::U8))?;
-            Ok((q, scale))
-        };
-        let (qk, sk) = quantize(&new_rows(k)?)?;
-        let (qv, sv) = quantize(&new_rows(v)?)?;
-        pool.k[layer].scatter_set(&write_index, &qk, 0)?;
-        pool.v[layer].scatter_set(&write_index, &qv, 0)?;
-        write_scales(layer, 0, &sk)?;
-        write_scales(layer, 1, &sv)?;
-    } else {
-        pool.k[layer].scatter_set(&write_index, &new_rows(k)?.to_dtype(slab_dtype)?, 0)?;
-        pool.v[layer].scatter_set(&write_index, &new_rows(v)?.to_dtype(slab_dtype)?, 0)?;
-    }
     // Gather the attended context through the block table: positions
     // [start, needed) are real; rows past the real frontier are
     // zero-padded (only pad q rows, whose outputs are discarded, can
@@ -7449,15 +7587,152 @@ fn kv_attention_slot(
         scale,
         true,
     )?;
-    // Evict dead blocks: fully below the window frontier, never
-    // attended again. The last reference lands them in the prefix
-    // cache — their content is still valid for a matching prompt.
+    kv_evict(pool, state, start);
+    Ok(out)
+}
+
+// Validates the slot and allocates blocks up to the new frontier.
+// Returns (cursor, needed, start): the pre-run cursor, the post-run
+// frontier, and the attention window's start. Scatter of the new rows
+// is `kv_scatter_rows` (composed path) or the fused kernel (paged).
+#[allow(clippy::too_many_arguments)]
+fn kv_prepare(
+    pool: &Arc<PoolInner>,
+    state: &mut SeqState,
+    layer: usize,
+    window: Option<usize>,
+    h: usize,
+    d: usize,
+    t: usize,
+) -> candle_core::Result<(usize, usize, usize)> {
+    if layer >= pool.k.len() {
+        return Err(candle_core::Error::Msg(format!(
+            "kv attention: layer {layer} out of range for {} pool layers",
+            pool.k.len()
+        )));
+    }
+    if h != pool.kv_heads || d != pool.head_dim {
+        return Err(candle_core::Error::Msg(format!(
+            "kv attention: layer {layer} shape [{h}, {d}] does not match pool geometry [{}, {}]",
+            pool.kv_heads, pool.head_dim
+        )));
+    }
+    let cursor = state.cursor;
+    // Chunked prefill: q carries the chunk length t, only `advance`
+    // rows are real; the rest are pads whose outputs the caller
+    // discards (causality keeps real rows from ever attending to them).
+    let advance = state.advance;
+    if advance == 0 || advance > t {
+        return Err(candle_core::Error::Msg(format!(
+            "kv attention: advance {advance} out of range for chunk length {t}"
+        )));
+    }
+    let needed = cursor + advance;
+    // Live rows after this step: everything from the attention window
+    // frontier on. Blocks fully below the frontier are dead and their
+    // capacity is reclaimed, so a windowed sequence's footprint is
+    // O(window) however long it generates.
+    let full = cursor + t;
+    let start = window.map_or(0, |w| full.saturating_sub(w));
+    if needed - start > pool.max_tokens {
+        return Err(candle_core::Error::Msg(format!(
+            "kv attention: live context {} exceeds pool capacity {}",
+            needed - start,
+            pool.max_tokens
+        )));
+    }
+    while state.blocks.len() * pool.block_size < needed {
+        let block = pool.alloc_block().ok_or_else(|| {
+            candle_core::Error::Msg(format!(
+                "kv attention: pool exhausted ({} tokens across live sequences)",
+                pool.max_tokens
+            ))
+        })?;
+        state.blocks.push(block);
+    }
+    Ok((cursor, needed, start))
+}
+
+// Composed scatter of the run's real new rows into the pool slabs
+// (quantized when the slabs are int8). The paged path uses the fused
+// scatter kernel instead.
+fn kv_scatter_rows(
+    pool: &Arc<PoolInner>,
+    state: &mut SeqState,
+    layer: usize,
+    k: &Tensor,
+    v: &Tensor,
+    h: usize,
+    d: usize,
+) -> candle_core::Result<()> {
+    let slab_dtype = pool.k[layer].dtype();
+    let cursor = state.cursor;
+    let advance = state.advance;
+    let needed = cursor + advance;
+    // [1, H, T, D] -> [T, H, D], real rows only
+    let new_rows = |x: &Tensor| -> candle_core::Result<Tensor> {
+        x.permute((0, 2, 1, 3))?
+            .contiguous()?
+            .narrow(1, 0, advance)?
+            .reshape((advance, h, d))
+    };
+    // row indexes [T] broadcast to the scatter contract [T, H, D]
+    let row_index = |rows: Vec<u32>| -> candle_core::Result<Tensor> {
+        let n = rows.len();
+        Tensor::from_vec(rows, (n, 1, 1), &pool.device)?.broadcast_as((n, h, d))?.contiguous()
+    };
+    // Logical position -> physical row, through the sequence's block
+    // table (append-only; entries below `head` are dead and never
+    // written).
+    let physical = |p: usize| -> u32 {
+        state.blocks[p / pool.block_size] * pool.block_size as u32
+            + (p % pool.block_size) as u32
+    };
+    let write_rows: Vec<u32> = (cursor..needed).map(&physical).collect();
+    let write_index = row_index(write_rows.clone())?;
+    // Row indexes [T] broadcast to the scale contract [T, H].
+    let scale_index = |rows: Vec<u32>| -> candle_core::Result<Tensor> {
+        let n = rows.len();
+        Tensor::from_vec(rows, (n, 1), &pool.device)?.broadcast_as((n, h))?.contiguous()
+    };
+    let write_scales = |layer: usize, slot: usize, scale: &Tensor| -> candle_core::Result<()> {
+        pool.scales[2 * layer + slot].scatter_set(&scale_index(write_rows.clone())?, scale, 0)
+    };
+    if slab_dtype == DType::U8 {
+        // int8 storage tier: symmetric quantization on a ±127 grid
+        // (offset 128 for the u8 layout) with a per-(token, head)
+        // absmax scale. The grid is deliberately not arithmetic — only
+        // this kernel quantizes on write and dequantizes on read.
+        let quantize = |x: &Tensor| -> candle_core::Result<(Tensor, Tensor)> {
+            let scale = (x.abs()?.max(candle_core::D::Minus1)? / 127.0)?;
+            let scale = (scale + 1e-12)?; // zero rows stay finite
+            let q = ((x.broadcast_div(&scale.unsqueeze(candle_core::D::Minus1)?)? + 128.0)?
+                .round()?
+                .to_dtype(DType::U8))?;
+            Ok((q, scale))
+        };
+        let (qk, sk) = quantize(&new_rows(k)?)?;
+        let (qv, sv) = quantize(&new_rows(v)?)?;
+        pool.k[layer].scatter_set(&write_index, &qk, 0)?;
+        pool.v[layer].scatter_set(&write_index, &qv, 0)?;
+        write_scales(layer, 0, &sk)?;
+        write_scales(layer, 1, &sv)?;
+    } else {
+        pool.k[layer].scatter_set(&write_index, &new_rows(k)?.to_dtype(slab_dtype)?, 0)?;
+        pool.v[layer].scatter_set(&write_index, &new_rows(v)?.to_dtype(slab_dtype)?, 0)?;
+    }
+    Ok(())
+}
+
+// Evicts dead blocks: fully below the window frontier, never attended
+// again. The last reference lands them in the prefix cache — their
+// content is still valid for a matching prompt.
+fn kv_evict(pool: &PoolInner, state: &mut SeqState, start: usize) {
     while (state.head + 1) * pool.block_size <= start {
         let dead = state.blocks[state.head];
         pool.unref_block(dead);
         state.head += 1;
     }
-    Ok(out)
 }
 
 struct DecodeGeometry {
@@ -8092,6 +8367,7 @@ impl DecodeProgram {
         let kv = Arc::new(KvContext {
             pool: seqs[0].pool.clone(),
             slots: seqs.iter().map(|seq| seq.state.clone()).collect(),
+            paged_tables: Mutex::new(None),
         });
         // Lock every sequence in address order; overlapping batches
         // acquire the same locks in the same order, so no deadlock.
@@ -8647,7 +8923,7 @@ mod kv_tests {
             last_hash: HASH_SEED,
             pending: Vec::new(),
         }));
-        let kv = KvContext { pool: pool.clone(), slots: vec![state.clone()] };
+        let kv = KvContext { pool: pool.clone(), slots: vec![state.clone()], paged_tables: Mutex::new(None) };
         let q = Tensor::arange(0f32, 24f32, &device).unwrap().reshape((1, 2, 3, 4)).unwrap();
         let k = (Tensor::arange(24f32, 48f32, &device).unwrap() * 0.01).unwrap().reshape((1, 2, 3, 4)).unwrap();
         let v = (Tensor::arange(48f32, 72f32, &device).unwrap() * 0.01).unwrap().reshape((1, 2, 3, 4)).unwrap();

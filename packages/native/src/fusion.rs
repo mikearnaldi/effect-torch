@@ -1093,9 +1093,42 @@ fn build_reduce_kernel(
         .map_err(|e| candle_core::Error::Msg(format!("fusion: {e}")))
 }
 
+// Env-gated phase accounting for fusion::run (EFFECT_TORCH_FUSION_TIMING):
+// [hash, pipeline-cache+compile, buffers+encoder, bind+dispatch]. Prints
+// aggregates every 2048 calls.
+#[cfg(target_os = "macos")]
+fn fusion_phase_nanos(phase: usize, nanos: u64) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static PHASES: [AtomicU64; 4] = [
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+    ];
+    static CALLS: AtomicU64 = AtomicU64::new(0);
+    const NAMES: [&str; 4] = ["hash", "pipeline", "buffers", "dispatch"];
+    PHASES[phase].fetch_add(nanos, Ordering::Relaxed);
+    let calls = CALLS.fetch_add(1, Ordering::Relaxed) + 1;
+    if phase == 3 && calls % 2048 == 0 {
+        let totals: Vec<u64> = PHASES.iter().map(|p| p.load(Ordering::Relaxed)).collect();
+        eprintln!(
+            "[fusion-timing] {calls} calls: {}",
+            NAMES
+                .iter()
+                .zip(totals.iter())
+                .map(|(n, t)| format!("{n} {:.1}ms", *t as f64 / 1e6))
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn fusion_phase_nanos(_phase: usize, _nanos: u64) {}
+
 #[cfg(target_os = "macos")]
 mod metal {
-    use super::{build_kernel, build_reduce_kernel, Expr, ReduceOp, BLOCK};
+    use super::{build_kernel, build_reduce_kernel, fusion_phase_nanos, Expr, ReduceOp, BLOCK};
     use candle_core::{DType, Device, MetalStorage, Storage, Tensor};
     use std::collections::HashMap;
     use std::sync::{Mutex, OnceLock};
@@ -1119,6 +1152,8 @@ mod metal {
         use std::hash::{Hash, Hasher};
 
         let mdev = device.as_metal_device()?;
+        let phase_timing = std::env::var_os("EFFECT_TORCH_FUSION_TIMING").is_some();
+        let t_start = std::time::Instant::now();
         // Metal exposes at most 31 buffer argument slots per kernel.
         if inputs.len() + scalars.len() + exprs.len() > 31 {
             return Err(candle_core::Error::Msg(format!(
@@ -1136,6 +1171,10 @@ mod metal {
         shape.hash(&mut hasher);
         lane_strides.hash(&mut hasher);
         let key = hasher.finish();
+        if phase_timing {
+            fusion_phase_nanos(0, t_start.elapsed().as_nanos() as u64);
+        }
+        let t_phase = std::time::Instant::now();
         let pipeline = {
             let mut cache = pipelines().lock().unwrap();
             match cache.get(&key) {
@@ -1152,12 +1191,20 @@ mod metal {
                 }
             }
         };
+        if phase_timing {
+            fusion_phase_nanos(1, t_phase.elapsed().as_nanos() as u64);
+        }
+        let t_phase = std::time::Instant::now();
         let padded = n.div_ceil(BLOCK) * BLOCK;
         let mut out_bufs = Vec::with_capacity(exprs.len());
         for _ in exprs {
             out_bufs.push(mdev.new_buffer(padded.max(1), DType::F32, "fused")?);
         }
         let encoder = mdev.command_encoder()?;
+        if phase_timing {
+            fusion_phase_nanos(2, t_phase.elapsed().as_nanos() as u64);
+        }
+        let t_phase = std::time::Instant::now();
         encoder.set_compute_pipeline_state(&pipeline);
         for (i, t) in inputs.iter().chain(scalars.iter()).enumerate() {
             let (storage, layout) = t.storage_and_layout();
@@ -1191,6 +1238,9 @@ mod metal {
             },
         );
         // no end_encoding: candle's Commands owns the encoder lifecycle
+        if phase_timing {
+            fusion_phase_nanos(3, t_phase.elapsed().as_nanos() as u64);
+        }
         out_bufs
             .into_iter()
             .map(|buf| {

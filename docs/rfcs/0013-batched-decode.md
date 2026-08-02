@@ -1,6 +1,6 @@
 # RFC 0013: Batched Decode — One Walk for N Sequences, and the Paged Attention Kernel
 
-- **Status**: Draft
+- **Status**: Implemented
 - **Created**: 2026-08-02
 - **Depends on**: RFC 0010 (inference), RFC 0012 (dtypes)
 - **Updates**: —
@@ -172,7 +172,34 @@ is compute-dense already, batching it saves little).
    leaves other sequences untouched.
 5. **Kernel parity** (Metal): paged-kernel logits match the composed
    path within f32 tolerance across random block tables, cursors,
-   windows, and pool dtypes (f32/f16/bf16/int8).
+   windows, and pool dtypes (f32/f16/bf16/int8). *(Met: the entire
+   Inference suite's Metal variants — token parity, windowing, prefix
+   cache, stepAll, all four pool dtypes — run decode through the
+   kernel against f32 references.)*
 6. **Throughput sanity**: a 8-wide batch steps in < 2× the wall time
    of a single step on Metal (the walk dominates; composed attention
-   is the interim).
+   is the interim). *(Measured after the kernel work below: 2.98× a
+   single step — 2.7× faster than eight sequential steps — on a tiny
+   proxy model where per-op launch cost dominates; the criterion still
+   misses on the proxy. The residual is the rest of the graph's many
+   tiny ops, i.e. RFC 0007 fusion territory, not the attention path.)*
+
+## Addendum: kernel pass (implemented)
+
+Second iteration over `paged.rs`, all verified by the full Inference
+suite on Metal (decode AND prefill now run paged; the composed
+scatter+gather path serves CPU only):
+
+- **Unified attention kernel**: one kernel covers decode and chunked
+  prefill — `grid (H, B, C)` with per-row causal lengths derived from
+  `advance` (decode is `C=1`); pads clamp to the real frontier.
+- **Fused scatter kernel**: one launch per layer writes every slot's
+  new rows straight from the graph's `[B, H, C, D]` layout (no
+  narrow/permute/contiguous/index-tensor ops at all), quantizing int8
+  in-kernel with the same absmax grid as the composed path.
+- **Memory optimizations**: q staged in threadgroup memory (was
+  re-read from device per row), 128-bit vectorized slab loads
+  (`packed_float4/half4/bfloat4`, packed-u32 for int8), simd-shuffle
+  reduction (no NT×D scratch).
+- **Run-level hoisting**: block tables + context lengths are built
+  once per run in the `KvContext`, not per layer.
