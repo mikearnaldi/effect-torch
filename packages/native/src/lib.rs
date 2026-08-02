@@ -1254,6 +1254,30 @@ enum NodeKind {
         step: Arc<Node>,
         index: u8,
     },
+    // Freeze-time grouping of same-shape AdamW steps (the endgame for
+    // the optimizer: one fused launch per group instead of one per
+    // parameter — ≤4 params, Metal's 31-buffer limit: 4 lanes + 3
+    // outputs each plus 3 scalars).
+    AdamWStepGroup {
+        params: Vec<Arc<Node>>,
+        grads: Vec<Arc<Node>>,
+        ms: Vec<Arc<Node>>,
+        vs: Vec<Arc<Node>>,
+        lr: Arc<Node>,
+        c1: Arc<Node>,
+        c2: Arc<Node>,
+        beta1: f64,
+        beta2: f64,
+        eps: f64,
+        weight_decay: f64,
+    },
+    // One output of a grouped step: `param`-th parameter's updated
+    // param (0), m (1), or v (2).
+    AdamWGroupOut {
+        of: Arc<Node>,
+        param: u32,
+        index: u8,
+    },
     // `first` is a 0-d flag (1.0 on the first step, 0.0 after) selecting
     // v = g over v = momentum * v + (1 - dampening) * g; velocity is always
     // a real buffer (zeros at init), so no placeholder is needed.
@@ -2114,6 +2138,59 @@ impl Node {
                     return Err(format!("adamw_out: index must be 0, 1 or 2, got {index}"));
                 }
                 (step.shape.clone(), step.dtype, step.device.clone())
+            }
+            NodeKind::AdamWStepGroup {
+                params,
+                grads,
+                ms,
+                vs,
+                lr,
+                c1,
+                c2,
+                ..
+            } => {
+                let n = params.len();
+                if n == 0 || n > 4 {
+                    return Err(format!(
+                        "adamw_step_group: groups hold 1..=4 params (the 31-buffer limit: 4 lanes + 3 outputs each plus 3 scalars), got {n}"
+                    ));
+                }
+                if grads.len() != n || ms.len() != n || vs.len() != n {
+                    return Err("adamw_step_group: params, grads, ms and vs must be equally long".to_string());
+                }
+                let first = &params[0];
+                if !first.dtype.is_float() {
+                    return Err(format!(
+                        "adamw_step_group: dtype must be floating point, got {:?}",
+                        first.dtype
+                    ));
+                }
+                for (name, tensors) in [("param", params), ("grad", grads), ("m", ms), ("v", vs)] {
+                    for t in tensors {
+                        if t.shape != first.shape || t.dtype != first.dtype {
+                            return Err(format!(
+                                "adamw_step_group: {name} must share the group's shape and dtype"
+                            ));
+                        }
+                    }
+                }
+                for (name, t) in [("lr", lr), ("c1", c1), ("c2", c2)] {
+                    if !t.shape.is_empty() {
+                        return Err(format!("adamw_step_group: {name} must be a scalar (0-d) tensor"));
+                    }
+                }
+                (first.shape.clone(), first.dtype, first.device.clone())
+            }
+            NodeKind::AdamWGroupOut { of, param, index } => {
+                let NodeKind::AdamWStepGroup { params, .. } = &of.kind else {
+                    return Err("adamw_group_out: parent is not a step group".to_string());
+                };
+                if *index > 2 || *param as usize >= params.len() {
+                    return Err(format!(
+                        "adamw_group_out: param {param} or index {index} out of range"
+                    ));
+                }
+                (of.shape.clone(), of.dtype, of.device.clone())
             }
             NodeKind::SgdStep {
                 param,
@@ -3364,6 +3441,24 @@ fn node_children(kind: &NodeKind) -> Vec<Arc<Node>> {
             c2.clone(),
         ],
         NodeKind::AdamWOut { step, .. } => vec![step.clone()],
+        NodeKind::AdamWStepGroup {
+            params,
+            grads,
+            ms,
+            vs,
+            lr,
+            c1,
+            c2,
+            ..
+        } => params
+            .iter()
+            .chain(grads.iter())
+            .chain(ms.iter())
+            .chain(vs.iter())
+            .cloned()
+            .chain([lr.clone(), c1.clone(), c2.clone()])
+            .collect(),
+        NodeKind::AdamWGroupOut { of, .. } => vec![of.clone()],
         NodeKind::SgdStep {
             param,
             grad,
@@ -3845,6 +3940,36 @@ fn remap_children(kind: &NodeKind, f: &dyn Fn(&Arc<Node>) -> Arc<Node>) -> NodeK
         },
         NodeKind::AdamWOut { step, index } => NodeKind::AdamWOut {
             step: f(step),
+            index: *index,
+        },
+        NodeKind::AdamWStepGroup {
+            params,
+            grads,
+            ms,
+            vs,
+            lr,
+            c1,
+            c2,
+            beta1,
+            beta2,
+            eps,
+            weight_decay,
+        } => NodeKind::AdamWStepGroup {
+            params: params.iter().map(|p| f(p)).collect(),
+            grads: grads.iter().map(|g| f(g)).collect(),
+            ms: ms.iter().map(|m| f(m)).collect(),
+            vs: vs.iter().map(|v| f(v)).collect(),
+            lr: f(lr),
+            c1: f(c1),
+            c2: f(c2),
+            beta1: *beta1,
+            beta2: *beta2,
+            eps: *eps,
+            weight_decay: *weight_decay,
+        },
+        NodeKind::AdamWGroupOut { of, param, index } => NodeKind::AdamWGroupOut {
+            of: f(of),
+            param: *param,
             index: *index,
         },
         NodeKind::SgdStep {
@@ -4838,6 +4963,64 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> candle_core::Result<Te
                 1 => outputs[0].clone(),
                 _ => outputs[1].clone(),
             }
+        }
+        NodeKind::AdamWStepGroup {
+            params,
+            grads,
+            ms,
+            vs,
+            lr,
+            c1,
+            c2,
+            beta1,
+            beta2,
+            eps,
+            weight_decay,
+        } => {
+            let first_p = ev.value(params[0].id)?;
+            let lr_t = ev.step_scalar(lr.id, first_p.dtype(), first_p.device())?;
+            let c1_t = ev.step_scalar(c1.id, first_p.dtype(), first_p.device())?;
+            let c2_t = ev.step_scalar(c2.id, first_p.dtype(), first_p.device())?;
+            let mut inputs = Vec::with_capacity(params.len() * 4);
+            for i in 0..params.len() {
+                inputs.push(ev.value(params[i].id)?);
+                inputs.push(ev.value(grads[i].id)?);
+                inputs.push(ev.value(ms[i].id)?);
+                inputs.push(ev.value(vs[i].id)?);
+            }
+            let base = fusion::adamw_exprs(*beta1, *beta2, *eps, *weight_decay);
+            let mut exprs = Vec::with_capacity(params.len() * 3);
+            for i in 0..params.len() {
+                let remap: std::collections::HashMap<u32, u32> = (0u32..4)
+                    .map(|k| (k, (i * 4) as u32 + k))
+                    .collect();
+                for expr in &base {
+                    exprs.push(expr.remap_lanes(&remap));
+                }
+            }
+            let outs = fusion::run(
+                &exprs,
+                &inputs,
+                None,
+                &[lr_t, c1_t, c2_t],
+                first_p.elem_count(),
+                first_p.dims(),
+                first_p.dtype(),
+                &first_p.device(),
+            )?;
+            let head = outs[0].clone();
+            ev.multi.insert(node.id, outs);
+            head
+        }
+        NodeKind::AdamWGroupOut { of, param, index } => {
+            let _ = ev.value(of.id)?;
+            ev.multi
+                .get(&of.id)
+                .and_then(|outs| outs.get(*param as usize * 3 + *index as usize))
+                .cloned()
+                .ok_or_else(|| {
+                    candle_core::Error::Msg("adamw_group_out: group has no stored outputs".to_string())
+                })?
         }
         NodeKind::SgdStep {
             param,
@@ -6287,6 +6470,8 @@ mod autodiff {
                 }
                 NodeKind::AdamWStep { .. }
                 | NodeKind::AdamWOut { .. }
+                | NodeKind::AdamWStepGroup { .. }
+                | NodeKind::AdamWGroupOut { .. }
                 | NodeKind::SgdStep { .. }
                 | NodeKind::SgdOut { .. } => {
                     return Err(
@@ -6430,7 +6615,163 @@ async fn run_compute<T: Send + 'static>(
 // ops into FusedElementwise nodes, each evaluated as one kernel. Runs on a
 // throwaway rewrite at evaluation time, so autodiff, vmap and checkpoint
 // always see the unfused graph. EFFECT_TORCH_NO_FUSION disables it.
+// Freeze-time optimizer grouping: same-shape AdamW steps collapse
+// into AdamWStepGroup nodes of ≤4 params (one fused launch per group,
+// 4 lanes + 3 outputs per param + 3 scalars against Metal's
+// 31-buffer limit). DISABLED by default: measured at GPT-scale
+// (≤64K-element params), the 28-lane mega-kernel's per-element cost
+// is ~10× a single-param fused step and outweighs the saved launches
+// (12.9ms vs 11.5ms per step). Set EFFECT_TORCH_OPT_GROUPS=1 to
+// enable — it should win once parameters are large enough that kernel
+// efficiency dominates launch count.
+fn group_optimizer_steps(roots: &[Arc<Node>]) -> std::result::Result<Vec<Arc<Node>>, String> {
+    if std::env::var_os("EFFECT_TORCH_OPT_GROUPS").is_none() {
+        return Ok(roots.to_vec());
+    }
+    let mut order: Vec<Arc<Node>> = Vec::new();
+    let mut visited = HashSet::new();
+    fn visit(n: &Arc<Node>, visited: &mut HashSet<u64>, order: &mut Vec<Arc<Node>>) {
+        if !visited.insert(n.id) {
+            return;
+        }
+        for c in node_children(&n.kind) {
+            visit(&c, visited, order);
+        }
+        order.push(n.clone());
+    }
+    for r in roots {
+        visit(r, &mut visited, &mut order);
+    }
+    // Bucket steps by (shape, dtype, hyperparameters).
+    type Key = (Vec<usize>, DType, u64, u64, u64, u64);
+    let mut buckets: HashMap<Key, Vec<Arc<Node>>> = HashMap::new();
+    let mut bucket_order: Vec<Key> = Vec::new();
+    for node in &order {
+        if let NodeKind::AdamWStep {
+            param,
+            beta1,
+            beta2,
+            eps,
+            weight_decay,
+            ..
+        } = &node.kind
+        {
+            let key: Key = (
+                param.shape.clone(),
+                param.dtype,
+                beta1.to_bits(),
+                beta2.to_bits(),
+                eps.to_bits(),
+                weight_decay.to_bits(),
+            );
+            buckets.entry(key.clone()).or_insert_with(|| {
+                bucket_order.push(key);
+                Vec::new()
+            }).push(node.clone());
+        }
+    }
+    if bucket_order.iter().all(|k| buckets[k].len() < 2) {
+        return Ok(roots.to_vec());
+    }
+    // step id -> (group node, param index)
+    let mut grouped: HashMap<u64, (Arc<Node>, u32)> = HashMap::new();
+    for key in &bucket_order {
+        let steps = &buckets[key];
+        for chunk in steps.chunks(4) {
+            if chunk.len() < 2 {
+                continue;
+            }
+            let first = &chunk[0];
+            let NodeKind::AdamWStep {
+                lr,
+                c1,
+                c2,
+                beta1,
+                beta2,
+                eps,
+                weight_decay,
+                ..
+            } = &first.kind
+            else {
+                unreachable!()
+            };
+            let group = Node::new(NodeKind::AdamWStepGroup {
+                params: chunk
+                    .iter()
+                    .map(|s| match &s.kind {
+                        NodeKind::AdamWStep { param, .. } => param.clone(),
+                        _ => unreachable!(),
+                    })
+                    .collect(),
+                grads: chunk
+                    .iter()
+                    .map(|s| match &s.kind {
+                        NodeKind::AdamWStep { grad, .. } => grad.clone(),
+                        _ => unreachable!(),
+                    })
+                    .collect(),
+                ms: chunk
+                    .iter()
+                    .map(|s| match &s.kind {
+                        NodeKind::AdamWStep { m, .. } => m.clone(),
+                        _ => unreachable!(),
+                    })
+                    .collect(),
+                vs: chunk
+                    .iter()
+                    .map(|s| match &s.kind {
+                        NodeKind::AdamWStep { v, .. } => v.clone(),
+                        _ => unreachable!(),
+                    })
+                    .collect(),
+                lr: lr.clone(),
+                c1: c1.clone(),
+                c2: c2.clone(),
+                beta1: *beta1,
+                beta2: *beta2,
+                eps: *eps,
+                weight_decay: *weight_decay,
+            })?;
+            for (i, step) in chunk.iter().enumerate() {
+                grouped.insert(step.id, (group.clone(), i as u32));
+            }
+        }
+    }
+    // Rebuild bottom-up: outs and direct references remap to the group.
+    let mut map: HashMap<u64, Arc<Node>> = HashMap::new();
+    for node in &order {
+        let rebuilt = match &node.kind {
+            NodeKind::AdamWStep { .. } if grouped.contains_key(&node.id) => {
+                let (group, param) = &grouped[&node.id];
+                NodeKind::AdamWGroupOut {
+                    of: group.clone(),
+                    param: *param,
+                    index: 0,
+                }
+            }
+            NodeKind::AdamWOut { step, index } if grouped.contains_key(&step.id) => {
+                let (group, param) = &grouped[&step.id];
+                NodeKind::AdamWGroupOut {
+                    of: group.clone(),
+                    param: *param,
+                    index: *index,
+                }
+            }
+            kind => {
+                let remap = |child: &Arc<Node>| map.get(&child.id).cloned().unwrap_or_else(|| child.clone());
+                remap_children(kind, &remap)
+            }
+        };
+        map.insert(node.id, Node::new(rebuilt)?);
+    }
+    Ok(roots
+        .iter()
+        .map(|r| map.get(&r.id).cloned().unwrap_or_else(|| r.clone()))
+        .collect())
+}
+
 fn fuse_roots(roots: &[Arc<Node>]) -> std::result::Result<Vec<Arc<Node>>, String> {
+    let roots = &group_optimizer_steps(roots)?;
     if std::env::var_os("EFFECT_TORCH_NO_FUSION").is_some() {
         return Ok(roots.to_vec());
     }
@@ -7474,6 +7815,8 @@ fn node_kind_name(kind: &NodeKind) -> &'static str {
         NodeKind::Sum { .. } | NodeKind::Mean { .. } | NodeKind::Max { .. } | NodeKind::Min { .. } | NodeKind::Prod { .. } => "Reduce",
         NodeKind::CrossEntropy { .. } | NodeKind::CrossEntropyBackward { .. } => "CE",
         NodeKind::AdamWStep { .. } | NodeKind::AdamWOut { .. } => "AdamW",
+        NodeKind::AdamWStepGroup { .. } => "AdamWGroup",
+        NodeKind::AdamWGroupOut { .. } => "AdamWGroupOut",
         NodeKind::SgdStep { .. } | NodeKind::SgdOut { .. } => "Sgd",
         NodeKind::Exp { .. }
         | NodeKind::Log { .. }
@@ -9203,6 +9546,25 @@ impl CompiledProgram {
             .map(|(id, slot)| (*id, bindings[&(*slot as u64)].clone()))
             .collect();
         let mut ev = Evaluator::with_slots(&roots, by_id);
+            if std::env::var_os("EFFECT_TORCH_EVAL_STATS").is_some() {
+                let mut counts: HashMap<&'static str, usize> = HashMap::new();
+                let mut seen = std::collections::HashSet::new();
+                let mut stack: Vec<Arc<Node>> = roots.clone();
+                while let Some(node) = stack.pop() {
+                    if !seen.insert(node.id) {
+                        continue;
+                    }
+                    *counts.entry(node_kind_name(&node.kind)).or_insert(0) += 1;
+                    stack.extend(node_children(&node.kind));
+                }
+                let mut entries: Vec<_> = counts.into_iter().collect();
+                entries.sort_by_key(|(_, n)| std::cmp::Reverse(*n));
+                eprintln!(
+                    "[program-stats] {} nodes: {}",
+                    seen.len(),
+                    entries.iter().map(|(k, n)| format!("{k}×{n}")).collect::<Vec<_>>().join(" ")
+                );
+            }
             let walk_timing = std::env::var_os("EFFECT_TORCH_WALK_TIMING").is_some();
             let t1 = std::time::Instant::now();
             let mut outputs = Vec::with_capacity(roots.len());
