@@ -2,7 +2,7 @@ use candle_core::{CpuStorage, DType, Device, Storage, Tensor};
 use candle_core::D;
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, OnceLock};
 
@@ -6936,6 +6936,89 @@ pub async fn eval_lazy(
 // of one program write disjoint blocks, and per-sequence runs serialize
 // on the sequence's run lock.
 
+// Chained FNV-1a over a token block: the hash of block i covers the
+// whole prefix through block i, so equal hashes imply equal tokens at
+// equal absolute positions — with RoPE that makes the cached rows
+// bit-identical to a recompute.
+const HASH_SEED: u64 = 0xcbf2_9ce4_8422_2325;
+const HASH_PRIME: u64 = 0x0000_0100_0000_01b3;
+
+fn chain_hash(prev: u64, tokens: &[u32]) -> u64 {
+    let mut hash = prev;
+    for token in tokens {
+        for byte in token.to_le_bytes() {
+            hash ^= byte as u64;
+            hash = hash.wrapping_mul(HASH_PRIME);
+        }
+    }
+    hash
+}
+
+// Block ownership and the prefix cache. Blocks carry a refcount and,
+// once fully written, a chained content hash. Sharing is
+// content-addressed and works across LIVE sequences: a prompt whose
+// prefix is resident — held by a running sequence or unreferenced in
+// the cache — takes a reference instead of recomputing. Unreferenced
+// hashed blocks form the LRU cache, reclaimed under pressure.
+struct BlockStore {
+    free: Vec<u32>,
+    refcounts: Vec<u32>,
+    // Content hash of each completed block; a block is hashed when its
+    // last row is written, so partial tail blocks are unhashable.
+    hashes: Vec<Option<u64>>,
+    // Every completed block by content hash, owned or not (duplicates
+    // arise when two sequences compute the same prefix concurrently).
+    // The cached subset is exactly the entries with refcount 0.
+    by_hash: HashMap<u64, Vec<u32>>,
+    // LRU order of cached (unreferenced) blocks, most recent at the
+    // back; entries go stale when the block is taken or evicted and
+    // are skipped.
+    lru: VecDeque<u32>,
+}
+
+impl BlockStore {
+    fn new(num_blocks: usize) -> Self {
+        Self {
+            free: (0..num_blocks as u32).rev().collect(),
+            refcounts: vec![0; num_blocks],
+            hashes: vec![None; num_blocks],
+            by_hash: HashMap::new(),
+            lru: VecDeque::new(),
+        }
+    }
+
+    // A block is reclaimable cache content only while unreferenced,
+    // hashed, and still listed under its hash.
+    fn is_cached(&self, block: u32) -> bool {
+        self.refcounts[block as usize] == 0
+            && match self.hashes[block as usize] {
+                Some(hash) => self
+                    .by_hash
+                    .get(&hash)
+                    .is_some_and(|ids| ids.contains(&block)),
+                None => false,
+            }
+    }
+
+    fn uncache(&mut self, block: u32, hash: u64) {
+        if let Some(ids) = self.by_hash.get_mut(&hash) {
+            if let Some(at) = ids.iter().position(|&id| id == block) {
+                ids.swap_remove(at);
+            }
+            if ids.is_empty() {
+                self.by_hash.remove(&hash);
+            }
+        }
+    }
+
+    fn cached(&self) -> usize {
+        self.by_hash
+            .values()
+            .map(|ids| ids.iter().filter(|&&id| self.refcounts[id as usize] == 0).count())
+            .sum()
+    }
+}
+
 struct PoolInner {
     // Per layer, flat [max_tokens, kv_heads, head_dim] slabs; block b
     // occupies rows b*block_size..(b+1)*block_size.
@@ -6945,8 +7028,76 @@ struct PoolInner {
     head_dim: usize,
     block_size: usize,
     max_tokens: usize,
-    free: Mutex<Vec<u32>>,
+    blocks: Mutex<BlockStore>,
     device: Device,
+}
+
+impl PoolInner {
+    // Takes a fresh block with refcount 1: free list first, then LRU
+    // eviction of unreferenced cached blocks.
+    fn alloc_block(&self) -> Option<u32> {
+        let mut store = self.blocks.lock().ok()?;
+        if let Some(block) = store.free.pop() {
+            store.refcounts[block as usize] = 1;
+            store.hashes[block as usize] = None;
+            return Some(block);
+        }
+        while let Some(candidate) = store.lru.pop_front() {
+            if !store.is_cached(candidate) {
+                continue;
+            }
+            let hash = store.hashes[candidate as usize].expect("cached implies hashed");
+            store.uncache(candidate, hash);
+            store.hashes[candidate as usize] = None;
+            store.refcounts[candidate as usize] = 1;
+            return Some(candidate);
+        }
+        None
+    }
+
+    // Takes a reference to a resident block by content hash (a
+    // prefix-cache hit), whether it is held by a live sequence or
+    // unreferenced in the cache.
+    fn take_block(&self, hash: u64) -> Option<u32> {
+        let mut store = self.blocks.lock().ok()?;
+        let block = *store.by_hash.get(&hash)?.first()?;
+        store.refcounts[block as usize] += 1;
+        Some(block)
+    }
+
+    // Drops a reference: the last one makes the block cache content
+    // (hashed, reclaimable) or returns it to the free list.
+    fn unref_block(&self, block: u32) {
+        if let Ok(mut store) = self.blocks.lock() {
+            let count = &mut store.refcounts[block as usize];
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                match store.hashes[block as usize] {
+                    Some(_) => store.lru.push_back(block),
+                    None => store.free.push(block),
+                }
+            }
+        }
+    }
+
+    fn set_hash(&self, block: u32, hash: u64) {
+        if let Ok(mut store) = self.blocks.lock() {
+            store.hashes[block as usize] = Some(hash);
+            store.by_hash.entry(hash).or_default().push(block);
+        }
+    }
+
+    // Blocks available for new content: free plus reclaimable cached.
+    fn available(&self) -> usize {
+        self.blocks
+            .lock()
+            .map(|store| store.free.len() + store.cached())
+            .unwrap_or(0)
+    }
+
+    fn cached_count(&self) -> usize {
+        self.blocks.lock().map(|store| store.cached()).unwrap_or(0)
+    }
 }
 
 struct SeqState {
@@ -6961,6 +7112,33 @@ struct SeqState {
     // are real). Set by the run, consumed by KvAttention, added to the
     // cursor on completion.
     advance: usize,
+    // Rolling chained hash of the last completed block, and the tokens
+    // of the incomplete tail block accumulating toward the next one.
+    last_hash: u64,
+    pending: Vec<u32>,
+}
+
+impl SeqState {
+    // Records a run's real tokens, hashing each block whose final row
+    // they complete. Runs only append, so a single rolling hash chains
+    // correctly across prefill chunks and decode steps. Called with the
+    // cursor still at its pre-run value.
+    fn note_tokens(&mut self, pool: &PoolInner, tokens: &[u32]) {
+        for (i, &token) in tokens.iter().enumerate() {
+            self.pending.push(token);
+            if self.pending.len() == pool.block_size {
+                let hash = chain_hash(self.last_hash, &self.pending);
+                self.last_hash = hash;
+                self.pending.clear();
+                // The block holding this token completed; it was
+                // allocated by the run that wrote its first row.
+                let block_index = (self.cursor + i) / pool.block_size;
+                if let Some(&block) = self.blocks.get(block_index) {
+                    pool.set_hash(block, hash);
+                }
+            }
+        }
+    }
 }
 
 struct KvContext {
@@ -7060,17 +7238,12 @@ fn kv_attention(
         )));
     }
     while state.blocks.len() * pool.block_size < needed {
-        let block = pool
-            .free
-            .lock()
-            .map_err(|e| candle_core::Error::Msg(format!("kv attention: pool lock poisoned: {e}")))?
-            .pop()
-            .ok_or_else(|| {
-                candle_core::Error::Msg(format!(
-                    "kv attention: pool exhausted ({} tokens across live sequences)",
-                    pool.max_tokens
-                ))
-            })?;
+        let block = pool.alloc_block().ok_or_else(|| {
+            candle_core::Error::Msg(format!(
+                "kv attention: pool exhausted ({} tokens across live sequences)",
+                pool.max_tokens
+            ))
+        })?;
         state.blocks.push(block);
     }
     // [1, H, T, D] -> [T, H, D], real rows only
@@ -7124,13 +7297,11 @@ fn kv_attention(
         true,
     )?;
     // Evict dead blocks: fully below the window frontier, never
-    // attended again.
+    // attended again. The last reference lands them in the prefix
+    // cache — their content is still valid for a matching prompt.
     while (state.head + 1) * pool.block_size <= start {
         let dead = state.blocks[state.head];
-        pool.free
-            .lock()
-            .map_err(|e| candle_core::Error::Msg(format!("kv attention: pool lock poisoned: {e}")))?
-            .push(dead);
+        pool.unref_block(dead);
         state.head += 1;
     }
     Ok(out)
@@ -7366,7 +7537,7 @@ impl NativeKvPool {
                 head_dim,
                 block_size,
                 max_tokens,
-                free: Mutex::new((0..num_blocks as u32).rev().collect()),
+                blocks: Mutex::new(BlockStore::new(num_blocks)),
                 device,
             }),
         })
@@ -7377,9 +7548,17 @@ impl NativeKvPool {
         self.inner.max_tokens as u32
     }
 
+    // Blocks available for new content: free plus reclaimable cached.
     #[napi(getter)]
     pub fn free_blocks(&self) -> u32 {
-        self.inner.free.lock().map(|free| free.len() as u32).unwrap_or(0)
+        self.inner.available() as u32
+    }
+
+    // Unreferenced blocks held by the prefix cache, reusable by a
+    // prompt with a matching prefix and evictable under pressure.
+    #[napi(getter)]
+    pub fn cached_blocks(&self) -> u32 {
+        self.inner.cached_count() as u32
     }
 
     #[napi]
@@ -7391,6 +7570,8 @@ impl NativeKvPool {
                 head: 0,
                 cursor: 0,
                 advance: 0,
+                last_hash: HASH_SEED,
+                pending: Vec::new(),
             })),
             run_lock: Arc::new(Mutex::new(())),
             released: AtomicBool::new(false),
@@ -7413,13 +7594,25 @@ impl NativeKvSequence {
         if self.released.swap(true, Ordering::SeqCst) {
             return;
         }
-        if let (Ok(mut state), Ok(mut free)) = (self.state.lock(), self.pool.free.lock()) {
+        // Drain under the run lock: a run holds the sequence's blocks
+        // for its whole duration, so releasing must wait for an
+        // in-flight run rather than unref blocks it still scatters
+        // into. Lock order stays run_lock -> state -> pool blocks.
+        let Ok(_run_guard) = self.run_lock.lock() else {
+            return;
+        };
+        if let Ok(mut state) = self.state.lock() {
             // Blocks below head were evicted already; draining them
             // again would double-free.
             let head = state.head;
-            free.extend(state.blocks.split_off(head));
+            let blocks = state.blocks.split_off(head);
+            for block in blocks {
+                self.pool.unref_block(block);
+            }
             state.cursor = 0;
             state.advance = 0;
+            state.last_hash = HASH_SEED;
+            state.pending.clear();
         }
     }
 }
@@ -7442,6 +7635,51 @@ impl NativeKvSequence {
     #[napi]
     pub fn release(&self) {
         self.return_blocks();
+    }
+
+    // Claims the longest resident prefix of the prompt from the pool's
+    // prefix cache and returns its token length; the caller prefills
+    // only the remaining suffix. Only whole blocks match (a partial
+    // tail block's content is not final), and the block holding the
+    // last prompt token is always computed — its logits are prefill's
+    // result. Sharing is content-addressed: two prompts that merely
+    // begin alike share; nothing about the match is visible to callers.
+    #[napi]
+    pub fn prefill_match(&self, tokens: Vec<u32>) -> Result<u32> {
+        if self.released.load(Ordering::SeqCst) {
+            return Err(Error::new(
+                Status::GenericFailure,
+                "kv sequence is released".to_string(),
+            ));
+        }
+        let mut state = self.state.lock().map_err(|e| {
+            Error::new(
+                Status::GenericFailure,
+                format!("kv sequence lock poisoned: {e}"),
+            )
+        })?;
+        if state.cursor > 0 || !state.blocks.is_empty() {
+            return Err(Error::new(
+                Status::GenericFailure,
+                "prefill match: sequence already holds tokens".to_string(),
+            ));
+        }
+        let block_size = self.pool.block_size;
+        let matchable = tokens.len().saturating_sub(1) / block_size;
+        let mut hash = HASH_SEED;
+        for i in 0..matchable {
+            let next = chain_hash(hash, &tokens[i * block_size..(i + 1) * block_size]);
+            match self.pool.take_block(next) {
+                Some(block) => {
+                    state.blocks.push(block);
+                    hash = next;
+                }
+                None => break,
+            }
+        }
+        state.last_hash = hash;
+        state.cursor = state.blocks.len() * block_size;
+        Ok(state.cursor as u32)
     }
 }
 
@@ -7486,16 +7724,17 @@ impl DecodeProgram {
 
     // Runs the frozen decode/prefill graph against a sequence: the
     // cursor scalar binds from the sequence state, the kv context
-    // carries the pool and block table, and the cursor advances by
-    // `advance` on completion — the count of REAL new tokens in this
-    // run (1 for decode; the un-padded length of each chunk for
-    // prefill, whose inputs are padded to the fixed chunk shape).
+    // carries the pool and block table, and the cursor advances by the
+    // real token count on completion — `tokens` carries the REAL new
+    // tokens of this run (1 for decode; the un-padded tokens of each
+    // chunk for prefill, whose inputs are padded to the fixed chunk
+    // shape). The tokens also feed the prefix cache's block hashes.
     #[napi]
     pub async fn run(
         &self,
         inputs: Vec<&NativeTensor>,
         seq: &NativeKvSequence,
-        advance: u32,
+        tokens: Vec<u32>,
         token: Option<&CancellationToken>,
     ) -> Result<Vec<NativeTensor>> {
         if seq.released.load(Ordering::SeqCst) {
@@ -7504,12 +7743,13 @@ impl DecodeProgram {
                 "kv sequence is released".to_string(),
             ));
         }
-        if advance == 0 {
+        if tokens.is_empty() {
             return Err(Error::new(
                 Status::InvalidArg,
-                "kv run: advance must be positive".to_string(),
+                "kv run: expected at least one token".to_string(),
             ));
         }
+        let advance = tokens.len();
         let inner = self
             .inner
             .as_ref()
@@ -7555,7 +7795,7 @@ impl DecodeProgram {
                 let mut state = state.lock().map_err(|e| {
                     Error::new(Status::GenericFailure, format!("kv sequence lock poisoned: {e}"))
                 })?;
-                state.advance = advance as usize;
+                state.advance = advance;
             }
             // Bindings are built inside the eval guard: scalar_binding
             // allocates on the device, which is not safe to do
@@ -7594,8 +7834,10 @@ impl DecodeProgram {
                 let output = match eval_node(node, cancelled, &mut ev) {
                     Ok(output) => output,
                     Err(error) => {
-                        if let (Ok(mut state), Ok(mut free)) = (state.lock(), kv.pool.free.lock()) {
-                            free.extend(state.blocks.split_off(frontier));
+                        if let Ok(mut state) = state.lock() {
+                            for block in state.blocks.split_off(frontier) {
+                                kv.pool.unref_block(block);
+                            }
                             state.advance = 0;
                         }
                         return Err(to_napi_err(error));
@@ -7605,6 +7847,7 @@ impl DecodeProgram {
                 outputs.push(NativeTensor::wrap(output));
             }
             if let Ok(mut state) = state.lock() {
+                state.note_tokens(&kv.pool, &tokens);
                 state.cursor += state.advance;
                 state.advance = 0;
             }
@@ -8042,10 +8285,17 @@ mod kv_tests {
             head_dim: 4,
             block_size: 4,
             max_tokens: 8,
-            free: Mutex::new(vec![1u32, 0u32]),
+            blocks: Mutex::new(BlockStore::new(2)),
             device: device.clone(),
         });
-        let state = Arc::new(Mutex::new(SeqState { blocks: Vec::new(), head: 0, cursor: 0, advance: 0 }));
+        let state = Arc::new(Mutex::new(SeqState {
+            blocks: Vec::new(),
+            head: 0,
+            cursor: 0,
+            advance: 0,
+            last_hash: HASH_SEED,
+            pending: Vec::new(),
+        }));
         let kv = KvContext { pool: pool.clone(), state: state.clone() };
         let q = Tensor::arange(0f32, 24f32, &device).unwrap().reshape((1, 2, 3, 4)).unwrap();
         let k = (Tensor::arange(24f32, 48f32, &device).unwrap() * 0.01).unwrap().reshape((1, 2, 3, 4)).unwrap();
@@ -8069,5 +8319,67 @@ mod kv_tests {
         let got = out.flatten_all().unwrap().to_vec1::<f32>().unwrap();
         let want = v.flatten_all().unwrap().to_vec1::<f32>().unwrap();
         assert_eq!(got, want);
+    }
+
+    fn block_store_pool(blocks: usize) -> PoolInner {
+        let device = Device::Cpu;
+        PoolInner {
+            k: vec![],
+            v: vec![],
+            kv_heads: 1,
+            head_dim: 1,
+            block_size: 2,
+            max_tokens: blocks * 2,
+            blocks: Mutex::new(BlockStore::new(blocks)),
+            device,
+        }
+    }
+
+    #[test]
+    fn prefix_cache_take_and_reclaim() {
+        let pool = block_store_pool(2);
+        let a = pool.alloc_block().unwrap();
+        let b = pool.alloc_block().unwrap();
+        assert!(pool.alloc_block().is_none(), "pool of two is exhausted");
+        pool.set_hash(a, 42);
+        pool.unref_block(a);
+        assert_eq!(pool.cached_count(), 1);
+        assert_eq!(pool.available(), 1, "the cached block is reclaimable");
+        // A matching prompt takes the resident block.
+        assert_eq!(pool.take_block(42), Some(a));
+        assert_eq!(pool.cached_count(), 0);
+        pool.unref_block(a);
+        // A different allocation reclaims the cached block via LRU.
+        let c = pool.alloc_block().unwrap();
+        assert_eq!(c, a);
+        assert_eq!(pool.cached_count(), 0);
+        // Unhashed blocks go straight back to the free list.
+        pool.unref_block(c);
+        pool.unref_block(b);
+        assert_eq!(pool.available(), 2);
+    }
+
+    #[test]
+    fn note_tokens_hashes_completed_blocks() {
+        let pool = block_store_pool(2);
+        let mut state = SeqState {
+            blocks: vec![pool.alloc_block().unwrap(), pool.alloc_block().unwrap()],
+            head: 0,
+            cursor: 0,
+            advance: 0,
+            last_hash: HASH_SEED,
+            pending: Vec::new(),
+        };
+        state.note_tokens(&pool, &[7, 8, 9]);
+        let first = chain_hash(HASH_SEED, &[7, 8]);
+        let second = chain_hash(first, &[9, 5]);
+        let store = pool.blocks.lock().unwrap();
+        assert_eq!(store.hashes[state.blocks[0] as usize], Some(first));
+        assert_eq!(store.hashes[state.blocks[1] as usize], None, "partial tail");
+        drop(store);
+        state.cursor = 3; // the first run advanced past its tokens
+        state.note_tokens(&pool, &[5]);
+        let store = pool.blocks.lock().unwrap();
+        assert_eq!(store.hashes[state.blocks[1] as usize], Some(second));
     }
 }

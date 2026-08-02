@@ -1171,7 +1171,10 @@ export interface InferenceConfig {
  * returns the final-position logits `[vocab]`; `step` appends one token
  * (`[1, 1]`) and returns the next position's logits. Calls on one
  * sequence serialize; sequences run concurrently (their pool blocks are
- * disjoint).
+ * disjoint). The pool keeps a content-addressed prefix cache: a prompt
+ * whose leading blocks are already resident (computed by an earlier,
+ * since-released or still-running sequence) reuses them and computes
+ * only its suffix — sharing is automatic and invisible to callers.
  *
  * @since 0.1.0
  * @category compilation
@@ -1310,10 +1313,14 @@ export const inference = (
           const native = pool.makeSequence()
           const runLock = yield* Semaphore.make(1)
           yield* Effect.addFinalizer(() => Effect.sync(() => native.release()))
-          const runChunk = (program: Tensor.NativeDecodeProgram, input: Tensor.Any, advance: number) =>
+          const runChunk = (
+            program: Tensor.NativeDecodeProgram,
+            input: Tensor.Any,
+            tokens: ReadonlyArray<number>
+          ) =>
             runLock.withPermits(1)(
               Effect.map(
-                Tensor.runDecodeProgram(program, [...frozenParams, input], native, advance),
+                Tensor.runDecodeProgram(program, [...frozenParams, input], native, tokens),
                 ([output]) => output
               )
             )
@@ -1336,6 +1343,15 @@ export const inference = (
               const [result] = yield* Tensor.compute([reshaped])
               return result
             })
+          const tokenIds = (op: "prefill" | "step", tokens: Tensor.Any) =>
+            Effect.mapError(
+              Effect.flatMap(
+                tokens.dtype === "u32" ? Effect.succeed(tokens) : Tensor.cast(tokens, "u32"),
+                Tensor.toNumberArray
+              ),
+              (error) =>
+                new InferenceError({ op, message: `token ids must be readable integers: ${error.message}` })
+            )
           const prefill = (tokens: Tensor.Any) =>
             Effect.gen(function* () {
               if (tokens.shape.length !== 2 || tokens.shape[0] !== 1 || tokens.shape[1] < 1) {
@@ -1344,16 +1360,27 @@ export const inference = (
                   message: `prefill expects tokens of shape [1, T] with T >= 1, got [${tokens.shape}]`
                 })
               }
-              const t = tokens.shape[1]
+              const ids = yield* tokenIds("prefill", tokens)
+              const t = ids.length
+              // The pool's prefix cache supplies the longest resident
+              // prefix (whole blocks only); only the suffix is computed.
+              const matched = yield* Effect.try({
+                try: () => native.prefillMatch(ids),
+                catch: (error) =>
+                  new InferenceError({
+                    op: "prefill",
+                    message: error instanceof Error ? error.message : String(error)
+                  })
+              })
               let result: Tensor.Concrete | undefined
-              for (let offset = 0; offset < t; offset += prefillChunk) {
+              for (let offset = matched; offset < t; offset += prefillChunk) {
                 const real = Math.min(prefillChunk, t - offset)
                 let input = yield* Tensor.slice(tokens, { start: [0, offset], end: [1, offset + real] })
                 if (real < prefillChunk) {
                   const pad = yield* Tensor.zeros([1, prefillChunk - real], { dtype: tokens.dtype })
                   input = yield* Tensor.concat([input, pad], { dim: 1 })
                 }
-                const output = yield* runChunk(prefillProgram, input, real)
+                const output = yield* runChunk(prefillProgram, input, ids.slice(offset, offset + real))
                 if (offset + real === t) {
                   result = yield* lastLogits("prefill", output, real - 1)
                 }
@@ -1368,7 +1395,8 @@ export const inference = (
                   message: `step expects a single token of shape [1, 1], got [${token.shape}]`
                 })
               }
-              const output = yield* runChunk(decodeProgram, token, 1)
+              const id = yield* tokenIds("step", token)
+              const output = yield* runChunk(decodeProgram, token, id)
               return yield* lastLogits("step", output, 0)
             })
           const sequence: Sequence = {

@@ -18,7 +18,7 @@ export declare class DecodeProgram {
   get kvHeads(): number
   get headDim(): number
   dispose(): void
-  run(inputs: Array<NativeTensor>, seq: NativeKvSequence, advance: number, token?: CancellationToken | undefined | null): Promise<Array<NativeTensor>>
+  run(inputs: Array<NativeTensor>, seq: NativeKvSequence, tokens: Array<number>, token?: CancellationToken | undefined | null): Promise<Array<NativeTensor>>
 }
 
 export declare class LazyTensor {
@@ -104,12 +104,14 @@ export declare class NativeKvPool {
   constructor(layers: number, kvHeads: number, headDim: number, maxTokens: number, blockSize?: number | undefined | null, device?: string | undefined | null)
   get capacity(): number
   get freeBlocks(): number
+  get cachedBlocks(): number
   makeSequence(): NativeKvSequence
 }
 
 export declare class NativeKvSequence {
   get cursor(): number
   release(): void
+  prefillMatch(tokens: Array<number>): number
 }
 
 export declare class NativeTensor {

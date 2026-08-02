@@ -249,10 +249,12 @@ backend.
   block table and runs composed sdpa; correct and shape-stable, ~2× the
   memory traffic of a fused kernel. The kernel (runtime context length,
   block-table indirection baked, q_len = 1 fast path) is the follow-up.
-- **Continuous batching** (one run stepping many sequences), **prefix
-  sharing / parallel sampling / beam search** (block-table aliasing,
-  refcounts, copy-on-write), **cross-request KV reuse** (LMCache-style
-  content addressing, tiered offload, P/D disaggregation).
+- **Continuous batching** (one run stepping many sequences), **parallel
+  sampling / beam search** (explicit block-table forking with
+  copy-on-write — the prefix cache below covers content-addressed
+  sharing; explicit forks serve search-shaped workloads, where the
+  caller knows the lineage), **cross-process KV reuse** (LMCache-style
+  tiered offload, P/D disaggregation).
 - **Sampling**: argmax/temperature/top-k stay in user code over the
   returned logits.
 - **Cache quantization** (f16/f8 KV), **GQA/MQA**, **CUDA**.
@@ -325,3 +327,53 @@ All met, in `packages/core/test/Inference.test.ts` (CPU and Metal):
    prefill once per prompt, one pooled step per token, sliding-window
    attention over the last `BLOCK` positions, EOS-terminated — with
    output quality matching the pre-RFC recompute loop.
+
+## Addendum: automatic prefix caching (implemented)
+
+Prompts arrive at a server independently — some share a prefix, most do
+not, and none declares lineage. Sharing therefore falls out of the
+pool, not the API: blocks are content-addressed, and a prefill whose
+prefix is already resident reuses it (vLLM's automatic prefix
+caching). Always on; there is no configuration.
+
+- **Chained block hashes.** A block's hash is FNV-1a over the previous
+  block's hash and its own token ids, so an equal hash implies equal
+  tokens at equal absolute positions. With causal attention and RoPE,
+  the cached K/V rows are then bit-identical to a recompute — no
+  staleness, no invalidation, and model identity is implicit (the pool
+  belongs to one artifact).
+- **Full blocks only.** A block becomes hashable when its last row is
+  written; a partial tail block's content is not final. Prefix matches
+  truncate to whole blocks, and the block holding the prompt's last
+  token is always computed — its logits are prefill's result.
+- **Refcounted sharing across live sequences.** Every completed block
+  is indexed by hash, owned or not. `prefill` walks the chain from the
+  prompt's first block and takes references (refcount bumps) while
+  resident; the first miss ends the match, and chunked prefill
+  continues from the block-aligned cursor. Taken blocks are read-only:
+  divergence always allocates fresh blocks.
+- **The cache is the unreferenced subset.** Window eviction and
+  `release` decrement refcounts; a block reaching zero with a known
+  hash stays indexed and joins the LRU. Allocation takes from the free
+  list first, then evicts the least-recently-used cached block — so
+  cached prefixes cost nothing under pressure, and `freeBlocks`
+  reports free + reclaimable.
+- **Rollback stays exact.** A failed run unrefs the blocks it
+  allocated (unhashed — hashes are recorded only on success), which
+  return to the free list; shared blocks below the run's frontier are
+  untouched.
+
+What this deliberately is not: `Sequence.fork`. Forking assumes the
+caller knows the lineage — true for tree search, n-best sampling, and
+speculative draft/verify, false for HTTP traffic. Content addressing
+subsumes the server case with zero API surface; an explicit fork with
+copy-on-write tail blocks remains the mechanism for search-shaped
+workloads, unimplemented until one exists.
+
+Acceptance (in `Inference.test.ts`, CPU and Metal): a second live
+sequence fits a pool smaller than two independent prompts only by
+sharing; divergent suffixes after a shared prefix match an ordinary
+forward exactly; a cached prefix is reclaimed under pressure and the
+new tenant matches its naive reference; window-evicted blocks are
+reused from the cache with exact parity; a second prefill on a used
+sequence fails typed.

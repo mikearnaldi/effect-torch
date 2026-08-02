@@ -3834,7 +3834,9 @@ export const compileDecodeProgram = (
  * Runs a frozen decode program against a kv sequence: lazy inputs are
  * materialized first, then one async native call binds the argument
  * buffers, evaluates against the sequence's pool blocks, and advances
- * the cursor.
+ * the cursor. `tokens` carries the real new tokens of the run (one for
+ * decode, the un-padded chunk for prefill) — the native side records
+ * them for the prefix cache's block hashes.
  *
  * @since 0.1.0
  * @category compilation
@@ -3844,12 +3846,12 @@ export const runDecodeProgram = (
   program: NativeDecodeProgramType,
   inputs: ReadonlyArray<Any>,
   seq: NativeKvSequenceType,
-  advance: number
+  tokens: ReadonlyArray<number>
 ): Effect.Effect<Array<Concrete>, TensorError> =>
   Effect.gen(function* () {
     const concrete = yield* compute(inputs)
     const handles = yield* fromNative("run", (token) =>
-      program.run(concrete.map((input) => input.materialized), seq, advance, token)
+      program.run(concrete.map((input) => input.materialized), seq, Array.from(tokens), token)
     )
     reportExternalMemory(handles.reduce((total, handle) => total + handle.bytes, 0))
     return handles.map(fromHandle)

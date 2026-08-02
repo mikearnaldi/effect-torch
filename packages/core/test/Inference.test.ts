@@ -223,6 +223,141 @@ onDevices("Inference", () => (it) => {
       })
     )
 
+    it.effect("prefix cache: a resident prefix is shared, not recomputed", () =>
+      Effect.gen(function* () {
+        const model = yield* makeGpt()
+        const params = yield* Tensor.compute(yield* model.init)
+        // 5 blocks: two independent 3-block prompts would need 6 — the
+        // second prefill fits only by sharing its 2 full prefix blocks.
+        const program = yield* Model.inference(model, params, { maxTokens: 20, blockSize: 4 })
+        const prompt = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 0]
+        const seqA = yield* program.sequence()
+        const logitsA = yield* seqA.prefill(yield* ids(prompt))
+        const seqB = yield* program.sequence()
+        const logitsB = yield* seqB.prefill(yield* ids(prompt))
+        deep(yield* Tensor.toNumberArray(logitsB), yield* Tensor.toNumberArray(logitsA))
+      })
+    )
+
+    it.effect("prefix cache: divergent suffixes after a shared prefix stay correct", () =>
+      Effect.gen(function* () {
+        const model = yield* makeGpt()
+        const params = yield* Tensor.compute(yield* model.init)
+        const program = yield* Model.inference(model, params, { maxTokens: 64, blockSize: 4 })
+        const shared = [1, 2, 3, 4, 5, 6, 7, 8] // 2 full blocks
+        const promptA = [...shared, 9, 10, 11, 0]
+        const promptB = [...shared, 3, 4, 5, 6]
+        const seqA = yield* program.sequence()
+        yield* seqA.prefill(yield* ids(promptA))
+        const seqB = yield* program.sequence()
+        const logitsB = yield* seqB.prefill(yield* ids(promptB))
+        // The reference: an ordinary forward over B's whole prompt.
+        const input = yield* ids(promptB)
+        const output = yield* model.forward(params, input)
+        const [expected] = yield* Tensor.compute([
+          yield* Tensor.reshape(
+            yield* Tensor.slice(output, { start: [0, promptB.length - 1, 0], end: [1, promptB.length, VOCAB] }),
+            [VOCAB]
+          )
+        ])
+        deep(yield* Tensor.toNumberArray(logitsB), yield* Tensor.toNumberArray(expected))
+      })
+    )
+
+    it.effect("prefix cache: cached blocks are reclaimed under pressure", () =>
+      Effect.gen(function* () {
+        const model = yield* makeGpt()
+        const params = yield* Tensor.compute(yield* model.init)
+        // Exactly one 3-block prompt fits; a second, different prompt
+        // succeeds only by evicting the first's cached blocks.
+        const program = yield* Model.inference(model, params, { maxTokens: 12, blockSize: 4 })
+        yield* Effect.scoped(Effect.gen(function* () {
+          const seq = yield* program.sequence()
+          yield* seq.prefill(yield* ids([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 0]))
+        }))
+        const prompt = [2, 4, 6, 8, 10, 0, 1, 3, 5, 7, 9, 11]
+        const seq = yield* program.sequence()
+        const logits = yield* seq.prefill(yield* ids(prompt))
+        const input = yield* ids(prompt)
+        const output = yield* model.forward(params, input)
+        const [expected] = yield* Tensor.compute([
+          yield* Tensor.reshape(
+            yield* Tensor.slice(output, { start: [0, prompt.length - 1, 0], end: [1, prompt.length, VOCAB] }),
+            [VOCAB]
+          )
+        ])
+        deep(yield* Tensor.toNumberArray(logits), yield* Tensor.toNumberArray(expected))
+      })
+    )
+
+    it.effect("prefix cache: window-evicted blocks stay reusable", () =>
+      Effect.gen(function* () {
+        const model = yield* makeRopeGpt
+        const params = yield* Tensor.compute(yield* model.init)
+        const prompt = [1, 3, 5, 7, 9, 11, 2, 4]
+        const program = yield* Model.inference(model, params, {
+          maxTokens: 32,
+          blockSize: 4,
+          attentionWindow: 8
+        })
+        // Generate past the window: the prompt's first block leaves the
+        // window, lands in the prefix cache, and the sequence releases
+        // the rest of the prompt's blocks into the cache as well.
+        yield* Effect.scoped(Effect.gen(function* () {
+          const seq = yield* program.sequence()
+          let logits = yield* seq.prefill(yield* ids(prompt))
+          for (let i = 0; i < 4; i++) {
+            logits = yield* seq.step(yield* ids([yield* argmaxOf(logits)]))
+          }
+        }))
+        const seq = yield* program.sequence()
+        const logits = yield* seq.prefill(yield* ids(prompt))
+        const input = yield* ids(prompt)
+        const output = yield* model.forward(params, input)
+        const [expected] = yield* Tensor.compute([
+          yield* Tensor.reshape(
+            yield* Tensor.slice(output, { start: [0, prompt.length - 1, 0], end: [1, prompt.length, VOCAB] }),
+            [VOCAB]
+          )
+        ])
+        deep(yield* Tensor.toNumberArray(logits), yield* Tensor.toNumberArray(expected))
+      })
+    )
+
+    it.effect("prefix cache: a second prefill on a used sequence is an error", () =>
+      Effect.gen(function* () {
+        const model = yield* makeGpt()
+        const params = yield* Tensor.compute(yield* model.init)
+        const program = yield* Model.inference(model, params, { maxTokens: 16, blockSize: 4 })
+        const seq = yield* program.sequence()
+        yield* seq.prefill(yield* ids([1, 2, 3]))
+        const error = yield* Effect.flip(seq.prefill(yield* ids([4, 5, 6])))
+        expect(error._tag).toBe("InferenceError")
+        expect(error.message).toMatch(/already holds tokens/)
+      })
+    )
+
+    it.effect("prefix cache: concurrent same-prefix prefills stay exact", () =>
+      Effect.gen(function* () {
+        const model = yield* makeGpt()
+        const params = yield* Tensor.compute(yield* model.init)
+        const program = yield* Model.inference(model, params, { maxTokens: 64, blockSize: 4 })
+        const prompt = [1, 2, 3, 4, 5, 6, 7, 8] // 1 matchable block; +6 steps stays within BLOCK
+        // However the two prefills interleave — one takes the other's
+        // blocks mid-flight, or both miss and compute — greedy
+        // generation must match the sequential runs token-for-token.
+        const sequentialA = yield* cachedGenerate(program, prompt, 6)
+        const sequentialB = yield* cachedGenerate(program, prompt, 6)
+        const [concurrentA, concurrentB] = yield* Effect.all(
+          [cachedGenerate(program, prompt, 6), cachedGenerate(program, prompt, 6)],
+          { concurrency: "unbounded" }
+        )
+        expect(concurrentA).toEqual(sequentialA)
+        expect(concurrentB).toEqual(sequentialB)
+        expect(sequentialA).toEqual(sequentialB)
+      })
+    )
+
     it.effect("rejects a model without cacheable attention at construction", () =>
       Effect.gen(function* () {
         const model = yield* Model.chain(
