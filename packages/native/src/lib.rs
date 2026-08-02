@@ -8,7 +8,9 @@ use std::sync::{Arc, LazyLock, Mutex, OnceLock};
 
 mod fusion;
 mod flash;
+mod loss;
 mod paged;
+mod rotary;
 mod tokenizer;
 
 fn to_napi_err(err: candle_core::Error) -> Error {
@@ -1100,6 +1102,15 @@ enum NodeKind {
         theta: f64,
         offset: PositionOffset,
     },
+    // Backward of RotaryEmbedding (absolute positions only): the
+    // transpose rotation, evaluated by the same fused kernel with
+    // negated angles. Carries the input's shape/seq_len for metadata.
+    RotaryEmbeddingBackward {
+        g: Arc<Node>,
+        shape: Vec<usize>,
+        seq_len: usize,
+        theta: f64,
+    },
     Conv1d {
         x: Arc<Node>,
         w: Arc<Node>,
@@ -1720,6 +1731,16 @@ impl Node {
                     ));
                 }
                 (x.shape.clone(), x.dtype, x.device.clone())
+            }
+            NodeKind::RotaryEmbeddingBackward { g, shape, seq_len, .. } => {
+                let rank = shape.len();
+                if rank < 2 || shape[rank - 2] != *seq_len || g.shape != *shape {
+                    return Err(format!(
+                        "rotary_embedding_backward: expected grad of shape {shape:?}, got {:?}",
+                        g.shape
+                    ));
+                }
+                (shape.clone(), g.dtype, g.device.clone())
             }
             NodeKind::Conv1d {
                 x,
@@ -2995,6 +3016,13 @@ struct Evaluator {
     // ordinary and non-kv compiled walks; KvAttention nodes error without
     // it.
     kv: Option<Arc<KvContext>>,
+    // Deferred cross-entropy status checks (fused CE): (buffer,
+    // forward?, classes). Reading the status requires a device sync,
+    // which would split the walk's encode/execute pipeline mid-graph —
+    // so the fused kernels record their status here and the walk
+    // validates them after its final synchronize, preserving the exact
+    // error semantics.
+    ce_checks: Vec<(Tensor, bool, usize)>,
 }
 
 impl Evaluator {
@@ -3024,7 +3052,36 @@ impl Evaluator {
             roots: roots.iter().map(|root| root.id).collect(),
             slots,
             kv,
+            ce_checks: Vec::new(),
         }
+    }
+
+    // Runs the deferred fused-CE status checks after the walk's final
+    // synchronize: forward statuses are [loss, active, invalid],
+    // backward counts are [active]. Errors are exactly the composed
+    // path's, raised from the same eval call.
+    fn run_ce_checks(&self) -> candle_core::Result<()> {
+        for (buffer, forward, classes) in &self.ce_checks {
+            let values = buffer.to_vec1::<f32>()?;
+            if *forward {
+                let (active, invalid) = (values[1] as usize, values[2] as usize);
+                if active == 0 {
+                    return Err(candle_core::Error::Msg(
+                        "cross_entropy: no active targets (all positions are ignored)".to_string(),
+                    ));
+                }
+                if invalid > 0 {
+                    return Err(candle_core::Error::Msg(format!(
+                        "cross_entropy: target out of range [0, {classes}) at an active position"
+                    )));
+                }
+            } else if values[0] == 0.0 {
+                return Err(candle_core::Error::Msg(
+                    "cross_entropy: no active targets (all positions are ignored)".to_string(),
+                ));
+            }
+        }
+        Ok(())
     }
 
     fn value(&self, id: u64) -> candle_core::Result<Tensor> {
@@ -3134,6 +3191,7 @@ fn node_children(kind: &NodeKind) -> Vec<Arc<Node>> {
         NodeKind::KvAttention { q, k, v, .. } => vec![q.clone(), k.clone(), v.clone()],
         NodeKind::PositionEmbedding { weight, .. } => vec![weight.clone()],
         NodeKind::RotaryEmbedding { x, .. } => vec![x.clone()],
+        NodeKind::RotaryEmbeddingBackward { g, .. } => vec![g.clone()],
         NodeKind::SdpaBackward { q, k, v, g, fwd, .. } => {
             vec![q.clone(), k.clone(), v.clone(), g.clone(), fwd.clone()]
         }
@@ -3411,6 +3469,17 @@ fn remap_children(kind: &NodeKind, f: &dyn Fn(&Arc<Node>) -> Arc<Node>) -> NodeK
             seq_len: *seq_len,
             theta: *theta,
             offset: *offset,
+        },
+        NodeKind::RotaryEmbeddingBackward {
+            g,
+            shape,
+            seq_len,
+            theta,
+        } => NodeKind::RotaryEmbeddingBackward {
+            g: f(g),
+            shape: shape.clone(),
+            seq_len: *seq_len,
+            theta: *theta,
         },
         NodeKind::Conv1d {
             x,
@@ -3868,7 +3937,12 @@ fn eval_node(
             continue;
         }
         if processed {
+            let kind_timing = std::env::var_os("EFFECT_TORCH_KIND_TIMING").is_some();
+            let t0 = kind_timing.then(std::time::Instant::now);
             let output = eval_uncached(&node, ev)?;
+            if let Some(t0) = t0 {
+                kind_timing_nanos(node_kind_name(&node.kind), t0.elapsed().as_nanos() as u64);
+            }
             ev.cache.insert(node.id, output);
             ev.release_children(&node);
             continue;
@@ -4100,12 +4174,32 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> candle_core::Result<Te
             logits,
             target,
             ignore_index,
-        } => cross_entropy_forward(&ev.value(logits.id)?, &ev.value(target.id)?, *ignore_index)?,
+        } => {
+            let logits_t = ev.value(logits.id)?;
+            let target_t = ev.value(target.id)?;
+            if loss::is_supported(&logits_t, &target_t) {
+                let (loss_t, status) = loss::ce_forward(&logits_t, &target_t, *ignore_index)?;
+                ev.ce_checks.push((status, true, logits_t.elem_count() / logits_t.dim(logits_t.rank() - 1)?));
+                loss_t
+            } else {
+                cross_entropy_forward(&logits_t, &target_t, *ignore_index)?
+            }
+        }
         NodeKind::CrossEntropyBackward {
             logits,
             target,
             ignore_index,
-        } => cross_entropy_backward(&ev.value(logits.id)?, &ev.value(target.id)?, *ignore_index)?,
+        } => {
+            let logits_t = ev.value(logits.id)?;
+            let target_t = ev.value(target.id)?;
+            if loss::is_supported(&logits_t, &target_t) {
+                let (grad, count) = loss::ce_backward(&logits_t, &target_t, *ignore_index)?;
+                ev.ce_checks.push((count, false, 0));
+                grad
+            } else {
+                cross_entropy_backward(&logits_t, &target_t, *ignore_index)?
+            }
+        }
         NodeKind::Sdpa {
             q,
             k,
@@ -4196,8 +4290,8 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> candle_core::Result<Te
         }
         NodeKind::RotaryEmbedding { x, theta, offset, .. } => {
             let x = ev.value(x.id)?;
-            match offset {
-                PositionOffset::Absolute => rotary_forward(&x, &[0usize], *theta)?,
+            let offsets = match offset {
+                PositionOffset::Absolute => vec![0usize],
                 PositionOffset::Cursor => {
                     let kv = ev.kv.as_ref().ok_or_else(|| {
                         candle_core::Error::Msg(
@@ -4213,8 +4307,22 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> candle_core::Result<Te
                             ))
                         })?.cursor);
                     }
-                    rotary_forward(&x, &offsets, *theta)?
+                    offsets
                 }
+            };
+            if rotary::is_supported(&x) {
+                rotary::rotary(&x, &offsets, *theta, 1.0)?
+            } else {
+                rotary_forward(&x, &offsets, *theta, 1.0)?
+            }
+        }
+        NodeKind::RotaryEmbeddingBackward { g, theta, .. } => {
+            let g = ev.value(g.id)?;
+            if rotary::is_supported(&g) {
+                rotary::rotary(&g, &[0usize], *theta, -1.0)?
+            } else {
+                // Transpose rotation == forward with negated angles.
+                rotary_forward(&g, &[0usize], *theta, -1.0)?
             }
         }
         NodeKind::Conv1d {
@@ -4671,10 +4779,15 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> candle_core::Result<Te
             keepdims,
             shape,
         } => {
+            let fine = std::env::var_os("EFFECT_TORCH_FUSION_TIMING").is_some();
+            let t0 = std::time::Instant::now();
             let ts: Vec<Tensor> = inputs
                 .iter()
                 .map(|i| ev.value(i.id))
                 .collect::<candle_core::Result<Vec<_>>>()?;
+            if fine {
+                eprintln!("[fine] reduce collect {:.1}us ({} inputs)", t0.elapsed().as_micros(), ts.len());
+            }
             let first = &ts[0];
             fusion::run_reduce(
                 *op,
@@ -5650,6 +5763,12 @@ mod autodiff {
                             .to_string(),
                     );
                 }
+                NodeKind::RotaryEmbeddingBackward { .. } => {
+                    return Err(
+                        "grad: rotary backward nodes are not differentiable (no second-order)"
+                            .to_string(),
+                    );
+                }
                 NodeKind::Sdpa {
                     q,
                     k,
@@ -5725,80 +5844,15 @@ mod autodiff {
                         );
                     }
                     // y = R x with R orthogonal per position: dx = Rᵀ g,
-                    // the same rotation with negated angles — composed
-                    // from the same tables (Absolute positions, so they
-                    // are graph-static).
-                    let rank = x.shape.len();
-                    let (t, d) = (*seq_len, x.shape[rank - 1]);
-                    let half = d / 2;
-                    let device = x.device.clone();
-                    let inv_freq: Vec<f32> = (0..half)
-                        .map(|j| theta.powf(-2.0 * j as f64 / d as f64) as f32)
-                        .collect();
-                    let inv_freq_bytes: Vec<u8> =
-                        inv_freq.iter().flat_map(|f| f.to_le_bytes()).collect();
-                    let inv_freq = mk(NodeKind::FromBytes {
-                        data: inv_freq_bytes,
-                        shape: vec![1, half],
-                        dtype: DType::F32,
-                        device: device.clone(),
-                    })?;
-                    let positions = mk(NodeKind::Arange {
-                        start: 0.0,
-                        end: t as f64,
-                        step: 1.0,
-                        dtype: DType::F32,
-                        device: device.clone(),
-                    })?;
-                    let positions = mk(NodeKind::Reshape {
-                        a: positions,
-                        shape: vec![t, 1],
-                    })?;
-                    let angles = mk(NodeKind::Matmul {
-                        a: positions,
-                        b: inv_freq,
-                    })?;
-                    let mut table_shape = vec![1usize; rank - 2];
-                    table_shape.extend([t, half]);
-                    let angles = mk(NodeKind::Reshape {
-                        a: angles,
-                        shape: table_shape,
-                    })?;
-                    let cos = mk(NodeKind::Cos { a: angles.clone() })?;
-                    let sin = mk(NodeKind::Sin { a: angles })?;
-                    let g_first = mk(NodeKind::Slice {
-                        a: g.clone(),
-                        ranges: {
-                            let mut ranges: Vec<(usize, usize, usize)> =
-                                x.shape.iter().map(|&d| (0, d, 1)).collect();
-                            ranges[rank - 1] = (0, half, 1);
-                            ranges
-                        },
-                    })?;
-                    let g_second = mk(NodeKind::Slice {
-                        a: g.clone(),
-                        ranges: {
-                            let mut ranges: Vec<(usize, usize, usize)> =
-                                x.shape.iter().map(|&d| (0, d, 1)).collect();
-                            ranges[rank - 1] = (half, d, 1);
-                            ranges
-                        },
-                    })?;
-                    // x1_g = c·g1 + s·g2 ; x2_g = c·g2 − s·g1
-                    let out_first = add(
-                        mul(g_first.clone(), cos.clone())?,
-                        mul(g_second.clone(), sin.clone())?,
-                    )?;
-                    let out_second = sub(
-                        mul(g_second, cos)?,
-                        mul(g_first, sin)?,
-                    )?;
+                    // the same rotation with negated angles — a single
+                    // semantic node (the fused kernel's sign flip).
                     accumulate(
                         x,
-                        mk(NodeKind::Concat {
-                            a: out_first,
-                            b: out_second,
-                            dim: rank - 1,
+                        mk(NodeKind::RotaryEmbeddingBackward {
+                            g: g.clone(),
+                            shape: x.shape.clone(),
+                            seq_len: *seq_len,
+                            theta: *theta,
                         }),
                     )?;
                 }
@@ -6985,6 +7039,9 @@ pub async fn eval_lazy(
         for output in &outputs {
             output.inner.device().synchronize().map_err(to_napi_err)?;
         }
+        // Deferred fused-CE status checks (would have split the
+        // pipeline mid-walk).
+        ev.run_ce_checks().map_err(to_napi_err)?;
         if walk_timing {
             eprintln!("[walk] eval {:.1}us ({} nodes)", t1.elapsed().as_micros(), nodes.len());
         }
@@ -7036,6 +7093,35 @@ fn fuse_roots_cached(roots: &[Arc<Node>]) -> Result<Vec<Arc<Node>>> {
     Ok(fused)
 }
 
+// Per-kind self-time accounting for EFFECT_TORCH_KIND_TIMING: prints
+// aggregates every 20000 node evals.
+fn kind_timing_nanos(kind: &'static str, nanos: u64) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static LOCK: LazyLock<Mutex<HashMap<&'static str, (u64, u64)>>> =
+        LazyLock::new(|| Mutex::new(HashMap::new()));
+    static CALLS: AtomicU64 = AtomicU64::new(0);
+    if let Ok(mut map) = LOCK.lock() {
+        let entry = map.entry(kind).or_insert((0, 0));
+        entry.0 += nanos;
+        entry.1 += 1;
+    }
+    let calls = CALLS.fetch_add(1, Ordering::Relaxed) + 1;
+    if calls % 4096 == 0 {
+        if let Ok(map) = LOCK.lock() {
+            let mut entries: Vec<_> = map.iter().collect();
+            entries.sort_by_key(|(_, (nanos, _))| std::cmp::Reverse(*nanos));
+            eprintln!(
+                "[kind-timing] {}",
+                entries
+                    .iter()
+                    .map(|(k, (nanos, count))| format!("{k} {:.1}ms/{count}", *nanos as f64 / 1e6))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            );
+        }
+    }
+}
+
 // Coarse node-kind names for EFFECT_TORCH_EVAL_STATS.
 fn node_kind_name(kind: &NodeKind) -> &'static str {
     match kind {
@@ -7059,6 +7145,7 @@ fn node_kind_name(kind: &NodeKind) -> &'static str {
         NodeKind::Gather { .. } | NodeKind::IndexSelect { .. } => "Gather",
         NodeKind::ScatterAdd { .. } => "ScatterAdd",
         NodeKind::RotaryEmbedding { .. } => "Rope",
+        NodeKind::RotaryEmbeddingBackward { .. } => "RopeBwd",
         NodeKind::PositionEmbedding { .. } => "PosEmb",
         NodeKind::KvAttention { .. } => "KvAttention",
         NodeKind::Sum { .. } | NodeKind::Mean { .. } | NodeKind::Max { .. } | NodeKind::Min { .. } | NodeKind::Prod { .. } => "Reduce",
@@ -7336,7 +7423,7 @@ struct KvContext {
 // batch element (a single offset for unbatched graphs, one per slot in
 // batched kv runs, RFC 0013). GPT-NeoX half-split rotation with
 // theta^(-2j/D).
-fn rotary_forward(x: &Tensor, offsets: &[usize], theta: f64) -> candle_core::Result<Tensor> {
+pub(crate) fn rotary_forward(x: &Tensor, offsets: &[usize], theta: f64, sign: f64) -> candle_core::Result<Tensor> {
     let dims = x.dims();
     let rank = dims.len();
     let (t, d) = (dims[rank - 2], dims[rank - 1]);
@@ -7363,7 +7450,7 @@ fn rotary_forward(x: &Tensor, offsets: &[usize], theta: f64) -> candle_core::Res
     };
     let rows = if offsets.len() == 1 { 1 } else { batch };
     let positions = Tensor::from_vec(positions, (rows * t, 1), device)?;
-    let angles = positions.matmul(&inv_freq)?; // [R*T, half]
+    let angles = (positions.matmul(&inv_freq)? * sign)?; // [R*T, half]
     let mut table_shape = vec![1usize; rank - 2];
     if offsets.len() != 1 {
         table_shape[0] = batch;
@@ -8493,6 +8580,7 @@ impl DecodeProgram {
             for output in &outputs {
                 output.inner.device().synchronize().map_err(to_napi_err)?;
             }
+            ev.run_ce_checks().map_err(to_napi_err)?;
             for (i, state) in slot_states.iter().enumerate() {
                 if let Ok(mut state) = state.lock() {
                     state.note_tokens(&kv.pool, &tokens[i]);
@@ -8806,6 +8894,7 @@ impl CompiledProgram {
             for output in &outputs {
                 output.inner.device().synchronize().map_err(to_napi_err)?;
             }
+            ev.run_ce_checks().map_err(to_napi_err)?;
             if walk_timing {
                 eprintln!("[walk] program eval {:.1}us ({} roots)", t1.elapsed().as_micros(), roots.len());
             }

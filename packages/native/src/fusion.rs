@@ -1278,6 +1278,8 @@ mod metal {
             )));
         }
         let out_n: usize = out_shape.iter().product();
+        let phase_timing = std::env::var_os("EFFECT_TORCH_FUSION_TIMING").is_some();
+        let t_start = std::time::Instant::now();
         let mut hasher = DefaultHasher::new();
         op.hash(&mut hasher);
         expr.hash(&mut hasher);
@@ -1313,6 +1315,10 @@ mod metal {
                 }
             }
         };
+        if phase_timing {
+            fusion_phase_nanos(0, t_start.elapsed().as_nanos() as u64);
+        }
+        let t_phase = std::time::Instant::now();
         let padded = out_n.div_ceil(BLOCK) * BLOCK;
         let out_buf = mdev.new_buffer(padded.max(1), DType::F32, "fused_reduce")?;
         let encoder = mdev.command_encoder()?;
@@ -1347,6 +1353,10 @@ mod metal {
             },
         );
         // no end_encoding: candle's Commands owns the encoder lifecycle
+        if phase_timing {
+            fusion_phase_nanos(2, t_phase.elapsed().as_nanos() as u64);
+            fusion_phase_nanos(3, 0);
+        }
         Ok(Tensor::from_storage(
             Storage::Metal(MetalStorage::new(out_buf, mdev.clone(), out_n, DType::F32)),
             out_shape,
