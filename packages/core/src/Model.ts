@@ -217,7 +217,7 @@ export const linear = (
         Effect.gen(function* () {
           yield* checkArity(name, names, params)
           const [weight, bias] = params
-          return yield* Tensor.add(yield* Tensor.matmul(input, weight), bias)
+          return yield* Tensor.linear(input, weight, bias)
         })
     }
   })
@@ -563,7 +563,7 @@ export const multiHeadAttention = (
             })
           const project = (x: Tensor.Any, weight: Tensor.Any, bias: Tensor.Any) =>
             Effect.gen(function* () {
-              return yield* Tensor.add(yield* Tensor.matmul(x, weight), bias)
+              return yield* Tensor.linear(x, weight, bias)
             })
           const projected: Array<Tensor.Any> = []
           for (let p = 0; p < 3; p++) {

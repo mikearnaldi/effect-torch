@@ -8,6 +8,7 @@ use std::sync::{Arc, LazyLock, Mutex, OnceLock};
 
 mod fusion;
 mod flash;
+mod gemm;
 mod layer_norm;
 mod loss;
 mod paged;
@@ -1136,6 +1137,14 @@ enum NodeKind {
         of: Arc<Node>,
         index: u8,
     },
+    // Fused linear layer: y = x·W + b in one gemm launch (addmm
+    // epilogue on Metal). Semantic node — Model.linear and attention
+    // projections build it directly.
+    Linear {
+        x: Arc<Node>,
+        weight: Arc<Node>,
+        bias: Arc<Node>,
+    },
     Conv1d {
         x: Arc<Node>,
         w: Arc<Node>,
@@ -1766,6 +1775,22 @@ impl Node {
                     ));
                 }
                 (shape.clone(), g.dtype, g.device.clone())
+            }
+            NodeKind::Linear { x, weight, bias } => {
+                let rank = x.shape.len();
+                if rank < 2
+                    || weight.shape.len() != 2
+                    || x.shape[rank - 1] != weight.shape[0]
+                    || bias.shape != [weight.shape[1]]
+                {
+                    return Err(format!(
+                        "linear: expected x [.., K], weight [K, N], bias [N], got {:?} x {:?} + {:?}",
+                        x.shape, weight.shape, bias.shape
+                    ));
+                }
+                let mut out = x.shape.clone();
+                out[rank - 1] = weight.shape[1];
+                (out, x.dtype, x.device.clone())
             }
             NodeKind::LayerNorm { x, weight, bias, .. } => {
                 let rank = x.shape.len();
@@ -2807,6 +2832,15 @@ impl LazyTensor {
         }))
     }
 
+    #[napi]
+    pub fn linear(&self, weight: &LazyTensor, bias: &LazyTensor) -> Result<Self> {
+        lazy_ctor!(Node::new(NodeKind::Linear {
+            x: self.node.clone(),
+            weight: weight.node.clone(),
+            bias: bias.node.clone(),
+        }))
+    }
+
     #[napi(js_name = "conv1d")]
     pub fn conv_1d(
         &self,
@@ -3293,6 +3327,7 @@ fn node_children(kind: &NodeKind) -> Vec<Arc<Node>> {
             vec![x.clone(), weight.clone(), g.clone()]
         }
         NodeKind::LayerNormBackwardOut { of, .. } => vec![of.clone()],
+        NodeKind::Linear { x, weight, bias } => vec![x.clone(), weight.clone(), bias.clone()],
         NodeKind::SdpaBackward { q, k, v, g, fwd, .. } => {
             vec![q.clone(), k.clone(), v.clone(), g.clone(), fwd.clone()]
         }
@@ -3597,6 +3632,11 @@ fn remap_children(kind: &NodeKind, f: &dyn Fn(&Arc<Node>) -> Arc<Node>) -> NodeK
         NodeKind::LayerNormBackwardOut { of, index } => NodeKind::LayerNormBackwardOut {
             of: f(of),
             index: *index,
+        },
+        NodeKind::Linear { x, weight, bias } => NodeKind::Linear {
+            x: f(x),
+            weight: f(weight),
+            bias: f(bias),
         },
         NodeKind::Conv1d {
             x,
@@ -4440,6 +4480,16 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> candle_core::Result<Te
             } else {
                 // Transpose rotation == forward with negated angles.
                 rotary_forward(&g, &[0usize], *theta, -1.0)?
+            }
+        }
+        NodeKind::Linear { x, weight, bias } => {
+            let x = ev.value(x.id)?;
+            let weight = ev.value(weight.id)?;
+            let bias = ev.value(bias.id)?;
+            if gemm::is_supported(&x, &weight) {
+                gemm::linear_forward(&x, &weight, &bias)?
+            } else {
+                x.broadcast_matmul(&weight)?.broadcast_add(&bias)?
             }
         }
         NodeKind::LayerNorm { x, weight, bias, eps } => {
@@ -5998,6 +6048,46 @@ mod autodiff {
                             .to_string(),
                     );
                 }
+                NodeKind::Linear { x, weight, bias } => {
+                    // y = x·W + b over the last dim: dx = g·Wᵀ,
+                    // dw = xᵀ·g (reduced over leading dims), db = Σ g.
+                    let wt = mk(NodeKind::Permute {
+                        a: weight.clone(),
+                        dims: vec![1, 0],
+                    })?;
+                    accumulate(x, mk(NodeKind::Matmul { a: g.clone(), b: wt }))?;
+                    let rank = x.shape.len();
+                    let (k, n) = (weight.shape[0], weight.shape[1]);
+                    let rows: usize = x.shape[..rank - 1].iter().product();
+                    let x2d = mk(NodeKind::Reshape {
+                        a: x.clone(),
+                        shape: vec![rows, k],
+                    })?;
+                    let x2d_t = mk(NodeKind::Permute {
+                        a: x2d,
+                        dims: vec![1, 0],
+                    })?;
+                    let g2d = mk(NodeKind::Reshape {
+                        a: g.clone(),
+                        shape: vec![rows, n],
+                    })?;
+                    accumulate(
+                        weight,
+                        mk(NodeKind::Matmul {
+                            a: x2d_t,
+                            b: g2d.clone(),
+                        }),
+                    )?;
+                    let reduce_dims: Vec<usize> = (0..rank - 1).collect();
+                    accumulate(
+                        bias,
+                        mk(NodeKind::Sum {
+                            a: g.clone(),
+                            dims: reduce_dims,
+                            keepdims: false,
+                        }),
+                    )?;
+                }
                 NodeKind::Sdpa {
                     q,
                     k,
@@ -6085,7 +6175,7 @@ mod autodiff {
                         }),
                     )?;
                 }
-                NodeKind::Conv1d {
+            NodeKind::Conv1d {
                     x,
                     w,
                     stride,
@@ -7363,6 +7453,7 @@ fn node_kind_name(kind: &NodeKind) -> &'static str {
         NodeKind::Mul { .. } => "Mul",
         NodeKind::Div { .. } => "Div",
         NodeKind::Matmul { .. } => "Matmul",
+        NodeKind::Linear { .. } => "Linear",
         NodeKind::Sdpa { .. } => "Sdpa",
         NodeKind::SdpaBackward { .. } | NodeKind::SdpaBackwardOut { .. } => "SdpaBwd",
         NodeKind::Concat { .. } => "Concat",

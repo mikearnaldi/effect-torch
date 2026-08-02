@@ -781,7 +781,7 @@ onDevices("Model", () => (it) => {
         const x = yield* Tensor.fromTypedArray(floats([0, 1, 1, 0]), [2, 2])
         const error = yield* Effect.flip(narrow.forward(params, x))
         expect(error._tag).toBe("TensorError")
-        expect(error.op).toBe("matmul")
+        expect(error.op).toBe("linear")
       })
     )
   })

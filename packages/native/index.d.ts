@@ -77,6 +77,7 @@ export declare class LazyTensor {
   positionEmbedding(seqLen: number): LazyTensor
   rotaryEmbedding(seqLen: number, theta: number): LazyTensor
   layerNorm(weight: LazyTensor, bias: LazyTensor, eps: number): LazyTensor
+  linear(weight: LazyTensor, bias: LazyTensor): LazyTensor
   conv1d(w: LazyTensor, stride: number, padding: number, dilation: number, groups: number): LazyTensor
   conv2d(w: LazyTensor, stride: number, padding: number, dilation: number, groups: number): LazyTensor
   log(): LazyTensor

@@ -3893,6 +3893,58 @@ export const runBatchedDecodeProgram = (
   })
 
 /**
+ * Fused linear layer as a single semantic operation: `y = x · weight +
+ * bias` over the last dim (the addmm epilogue — one gemm launch on
+ * Metal).
+ *
+ * @since 0.1.0
+ * @category neural network
+ */
+export const linear = (
+  self: Any,
+  weight: Any,
+  bias: Any
+): Effect.Effect<Lazy, TensorError> =>
+  Effect.gen(function* () {
+    const k = self.shape[self.shape.length - 1]
+    if (
+      self.shape.length < 2 ||
+      weight.shape.length !== 2 ||
+      weight.shape[0] !== k
+    ) {
+      return yield* new TensorError({
+        op: "linear",
+        message: `linear: expected input [.., K] and weight [K, N], got [${self.shape}] x [${weight.shape}]`
+      })
+    }
+    const n = weight.shape[1]
+    const flatBias = yield* (
+      bias.shape.length === 1 && bias.shape[0] === n
+        ? Effect.succeed(bias)
+        : bias.shape.length === 2 && bias.shape[0] === 1 && bias.shape[1] === n
+          ? reshape(bias, [n])
+          : new TensorError({
+              op: "linear",
+              message: `linear: bias must be [N] or [1, N], got [${bias.shape}] for N ${n}`
+            })
+    )
+    return yield* Effect.try({
+      try: () =>
+        makeLazy(
+          self.lazy.linear(weight.lazy, flatBias.lazy),
+          [...self.shape.slice(0, -1), n],
+          self.dtype,
+          self.device
+        ),
+      catch: (error) =>
+        new TensorError({
+          op: "linear",
+          message: error instanceof Error ? error.message : String(error)
+        })
+    })
+  })
+
+/**
  * Layer normalization over the last dim as a single semantic operation:
  * `y = (x − μ)/√(σ² + eps) · weight + bias`. The semantic node lets the
  * fused Metal kernel evaluate it in one launch (RFC 0007).
