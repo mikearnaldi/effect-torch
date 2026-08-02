@@ -3080,6 +3080,10 @@ struct Evaluator {
     multi: std::collections::HashMap<u64, Vec<Tensor>>,
     // LayerNormBackward id -> (dw, db); the node's own cache entry is dx.
     ln: std::collections::HashMap<u64, [Tensor; 2]>,
+    // Optimizer step scalars (lr, bias corrections) cast to a given
+    // dtype/device, memoized per walk: identical for every parameter,
+    // and the naive path copies each scalar per parameter per step.
+    step_scalars: std::collections::HashMap<(u64, DType, u8), Tensor>,
     consumers: std::collections::HashMap<u64, usize>,
     roots: HashSet<u64>,
     // RFC 0008: Input/ScalarInput node id -> argument buffer, populated by
@@ -3122,6 +3126,7 @@ impl Evaluator {
             sgd: std::collections::HashMap::new(),
             multi: std::collections::HashMap::new(),
             ln: std::collections::HashMap::new(),
+            step_scalars: std::collections::HashMap::new(),
             consumers,
             roots: roots.iter().map(|root| root.id).collect(),
             slots,
@@ -3160,8 +3165,25 @@ impl Evaluator {
 
     fn value(&self, id: u64) -> candle_core::Result<Tensor> {
         self.cache.get(&id).cloned().ok_or_else(|| {
-            candle_core::Error::Msg("internal error: child evaluated out of order".to_string())
+            candle_core::Error::Msg(format!("internal error: unevaluated node {id}"))
         })
+    }
+
+    // A step scalar cast to the target dtype/device, memoized per walk
+    // (one copy per distinct dtype instead of one per parameter).
+    fn step_scalar(&mut self, id: u64, dtype: DType, device: &Device) -> candle_core::Result<Tensor> {
+        let device_key = match device {
+            Device::Cpu => 0u8,
+            Device::Cuda(_) => 1,
+            Device::Metal(_) => 2,
+        };
+        let key = (id, dtype, device_key);
+        if let Some(cached) = self.step_scalars.get(&key) {
+            return Ok(cached.clone());
+        }
+        let cast = self.value(id)?.to_dtype(dtype)?.to_device(device)?;
+        self.step_scalars.insert(key, cast.clone());
+        Ok(cast)
     }
 
     fn release_children(&mut self, node: &Arc<Node>) {
@@ -4705,9 +4727,9 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> candle_core::Result<Te
             // parameter dtype and copy to its device (they may be CPU f64 —
             // the bias corrections are computed in f64 to avoid
             // cancellation — and 0-d copies are free).
-            let lr_t = ev.value(lr.id)?.to_dtype(p.dtype())?.to_device(p.device())?;
-            let c1_t = ev.value(c1.id)?.to_dtype(p.dtype())?.to_device(p.device())?;
-            let c2_t = ev.value(c2.id)?.to_dtype(p.dtype())?.to_device(p.device())?;
+            let lr_t = ev.step_scalar(lr.id, p.dtype(), p.device())?;
+            let c1_t = ev.step_scalar(c1.id, p.dtype(), p.device())?;
+            let c2_t = ev.step_scalar(c2.id, p.dtype(), p.device())?;
             let fused = if fusion::is_supported(&p.device(), p.dtype()) {
                 let exprs = fusion::adamw_exprs(*beta1, *beta2, *eps, *weight_decay);
                 fusion::run(
@@ -4781,8 +4803,8 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> candle_core::Result<Te
             let p = ev.value(param.id)?;
             let g = ev.value(grad.id)?;
             let v_t = ev.value(velocity.id)?;
-            let first_t = ev.value(first.id)?.to_dtype(p.dtype())?.to_device(p.device())?;
-            let lr_t = ev.value(lr.id)?.to_dtype(p.dtype())?.to_device(p.device())?;
+            let first_t = ev.step_scalar(first.id, p.dtype(), p.device())?;
+            let lr_t = ev.step_scalar(lr.id, p.dtype(), p.device())?;
             let fused = if fusion::is_supported(&p.device(), p.dtype()) {
                 let exprs = fusion::sgd_exprs(*momentum, *dampening, *nesterov, *weight_decay);
                 fusion::run(
