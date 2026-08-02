@@ -3893,6 +3893,43 @@ export const runBatchedDecodeProgram = (
   })
 
 /**
+ * Layer normalization over the last dim as a single semantic operation:
+ * `y = (x − μ)/√(σ² + eps) · weight + bias`. The semantic node lets the
+ * fused Metal kernel evaluate it in one launch (RFC 0007).
+ *
+ * @since 0.1.0
+ * @category neural network
+ */
+export const layerNorm = (
+  self: Any,
+  weight: Any,
+  bias: Any,
+  eps = 1e-5
+): Effect.Effect<Lazy, TensorError> =>
+  Effect.try({
+    try: () => {
+      const k = weight.shape.length
+      const suffix = self.shape.slice(self.shape.length - k)
+      if (
+        self.shape.length < k ||
+        weight.shape.some((dim, i) => suffix[i] !== dim) ||
+        bias.shape.length !== k ||
+        bias.shape.some((dim, i) => weight.shape[i] !== dim)
+      ) {
+        throw new Error(
+          `layerNorm: weight and bias must match the input's trailing dims [${self.shape}], got [${weight.shape}] and [${bias.shape}]`
+        )
+      }
+      return makeLazy(self.lazy.layerNorm(weight.lazy, bias.lazy, eps), self.shape, self.dtype, self.device)
+    },
+    catch: (error) =>
+      new TensorError({
+        op: "layerNorm",
+        message: error instanceof Error ? error.message : String(error)
+      })
+  })
+
+/**
  * Rows `0..seqLen-1` of a `[maxPositions, embeddingDim]` position
  * embedding table, as a single semantic operation (the graph equivalent
  * of gathering `arange(seqLen)`). Internal to the library — the semantic

@@ -454,7 +454,6 @@ export const layerNorm = (
       return yield* new ModelError({ op: "layerNorm", message: `eps must be positive, got ${eps}` })
     }
     const names = [`${name}.weight`, `${name}.bias`]
-    const dims = shape.map((_, i) => i - shape.length)
     return {
       names,
       init: Effect.gen(function* () {
@@ -466,11 +465,7 @@ export const layerNorm = (
         Effect.gen(function* () {
           yield* checkArity(name, names, params)
           const [weight, bias] = params
-          const mu = yield* Tensor.mean(input, { dims, keepdims: true })
-          const centered = yield* Tensor.sub(input, mu)
-          const variance = yield* Tensor.variance(input, { dims, keepdims: true, correction: 0 })
-          const inv = yield* Tensor.rsqrt(yield* Tensor.add(variance, yield* Tensor.constantLike(variance, eps)))
-          return yield* Tensor.add(yield* Tensor.mul(yield* Tensor.mul(centered, inv), weight), bias)
+          return yield* Tensor.layerNorm(input, weight, bias, eps)
         })
     }
   })

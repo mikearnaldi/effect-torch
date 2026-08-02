@@ -8,6 +8,7 @@ use std::sync::{Arc, LazyLock, Mutex, OnceLock};
 
 mod fusion;
 mod flash;
+mod layer_norm;
 mod loss;
 mod paged;
 mod rotary;
@@ -1111,6 +1112,30 @@ enum NodeKind {
         seq_len: usize,
         theta: f64,
     },
+    // Layer normalization over the last dim: y = (x − μ)/√(σ² + eps) ·
+    // weight + bias. Semantic node (like RotaryEmbedding) so the fused
+    // Metal kernel handles it as one launch and decode compilation can
+    // pass it through.
+    LayerNorm {
+        x: Arc<Node>,
+        weight: Arc<Node>,
+        bias: Arc<Node>,
+        eps: f64,
+    },
+    // Backward of LayerNorm: evaluates dx (its own value) and stores
+    // (dw, db) for LayerNormBackwardOut, like the optimizer steps.
+    LayerNormBackward {
+        x: Arc<Node>,
+        weight: Arc<Node>,
+        g: Arc<Node>,
+        eps: f64,
+    },
+    // Reads one weight-side output of a LayerNormBackward (1 = dw,
+    // 2 = db).
+    LayerNormBackwardOut {
+        of: Arc<Node>,
+        index: u8,
+    },
     Conv1d {
         x: Arc<Node>,
         w: Arc<Node>,
@@ -1741,6 +1766,42 @@ impl Node {
                     ));
                 }
                 (shape.clone(), g.dtype, g.device.clone())
+            }
+            NodeKind::LayerNorm { x, weight, bias, .. } => {
+                let rank = x.shape.len();
+                let k = weight.shape.len();
+                if rank < k
+                    || x.shape[rank - k..] != weight.shape[..]
+                    || bias.shape != weight.shape
+                {
+                    return Err(format!(
+                        "layer_norm: weight and bias must match the input's trailing dims {:?}, got {:?} and {:?}",
+                        x.shape, weight.shape, bias.shape
+                    ));
+                }
+                (x.shape.clone(), x.dtype, x.device.clone())
+            }
+            NodeKind::LayerNormBackward { x, weight, g, .. } => {
+                let rank = x.shape.len();
+                let k = weight.shape.len();
+                if rank < k || x.shape[rank - k..] != weight.shape[..] || g.shape != x.shape {
+                    return Err(format!(
+                        "layer_norm_backward: expected grad of shape {:?}, got {:?}",
+                        x.shape, g.shape
+                    ));
+                }
+                (x.shape.clone(), x.dtype, x.device.clone())
+            }
+            NodeKind::LayerNormBackwardOut { of, index } => {
+                let NodeKind::LayerNormBackward { weight, .. } = &of.kind else {
+                    return Err("layer_norm_backward_out: parent is not a backward node".to_string());
+                };
+                if *index == 0 || *index > 2 {
+                    return Err(format!(
+                        "layer_norm_backward_out: index must be 1 (dw) or 2 (db), got {index}"
+                    ));
+                }
+                (weight.shape.clone(), weight.dtype, weight.device.clone())
             }
             NodeKind::Conv1d {
                 x,
@@ -2736,6 +2797,16 @@ impl LazyTensor {
         }))
     }
 
+    #[napi]
+    pub fn layer_norm(&self, weight: &LazyTensor, bias: &LazyTensor, eps: f64) -> Result<Self> {
+        lazy_ctor!(Node::new(NodeKind::LayerNorm {
+            x: self.node.clone(),
+            weight: weight.node.clone(),
+            bias: bias.node.clone(),
+            eps,
+        }))
+    }
+
     #[napi(js_name = "conv1d")]
     pub fn conv_1d(
         &self,
@@ -3007,6 +3078,8 @@ struct Evaluator {
     // FusedElementwiseMulti id -> all outputs; the node's own cache entry
     // holds output 0 so the evaluator's single-value invariant holds
     multi: std::collections::HashMap<u64, Vec<Tensor>>,
+    // LayerNormBackward id -> (dw, db); the node's own cache entry is dx.
+    ln: std::collections::HashMap<u64, [Tensor; 2]>,
     consumers: std::collections::HashMap<u64, usize>,
     roots: HashSet<u64>,
     // RFC 0008: Input/ScalarInput node id -> argument buffer, populated by
@@ -3048,6 +3121,7 @@ impl Evaluator {
             adamw: std::collections::HashMap::new(),
             sgd: std::collections::HashMap::new(),
             multi: std::collections::HashMap::new(),
+            ln: std::collections::HashMap::new(),
             consumers,
             roots: roots.iter().map(|root| root.id).collect(),
             slots,
@@ -3192,6 +3266,11 @@ fn node_children(kind: &NodeKind) -> Vec<Arc<Node>> {
         NodeKind::PositionEmbedding { weight, .. } => vec![weight.clone()],
         NodeKind::RotaryEmbedding { x, .. } => vec![x.clone()],
         NodeKind::RotaryEmbeddingBackward { g, .. } => vec![g.clone()],
+        NodeKind::LayerNorm { x, weight, bias, .. } => vec![x.clone(), weight.clone(), bias.clone()],
+        NodeKind::LayerNormBackward { x, weight, g, .. } => {
+            vec![x.clone(), weight.clone(), g.clone()]
+        }
+        NodeKind::LayerNormBackwardOut { of, .. } => vec![of.clone()],
         NodeKind::SdpaBackward { q, k, v, g, fwd, .. } => {
             vec![q.clone(), k.clone(), v.clone(), g.clone(), fwd.clone()]
         }
@@ -3480,6 +3559,22 @@ fn remap_children(kind: &NodeKind, f: &dyn Fn(&Arc<Node>) -> Arc<Node>) -> NodeK
             shape: shape.clone(),
             seq_len: *seq_len,
             theta: *theta,
+        },
+        NodeKind::LayerNorm { x, weight, bias, eps } => NodeKind::LayerNorm {
+            x: f(x),
+            weight: f(weight),
+            bias: f(bias),
+            eps: *eps,
+        },
+        NodeKind::LayerNormBackward { x, weight, g, eps } => NodeKind::LayerNormBackward {
+            x: f(x),
+            weight: f(weight),
+            g: f(g),
+            eps: *eps,
+        },
+        NodeKind::LayerNormBackwardOut { of, index } => NodeKind::LayerNormBackwardOut {
+            of: f(of),
+            index: *index,
         },
         NodeKind::Conv1d {
             x,
@@ -4325,6 +4420,36 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> candle_core::Result<Te
                 rotary_forward(&g, &[0usize], *theta, -1.0)?
             }
         }
+        NodeKind::LayerNorm { x, weight, bias, eps } => {
+            let x = ev.value(x.id)?;
+            let weight = ev.value(weight.id)?;
+            let bias = ev.value(bias.id)?;
+            if layer_norm::is_supported(&x, &weight) {
+                layer_norm::ln_forward(&x, &weight, &bias, *eps)?
+            } else {
+                layer_norm_composed(&x, &weight, &bias, *eps)?
+            }
+        }
+        NodeKind::LayerNormBackward { x, weight, g, eps } => {
+            let x = ev.value(x.id)?;
+            let weight = ev.value(weight.id)?;
+            let g = ev.value(g.id)?;
+            let (dx, dw, db) = layer_norm_backward(&x, &weight, &g, *eps)?;
+            ev.ln.insert(node.id, [dw, db]);
+            dx
+        }
+        NodeKind::LayerNormBackwardOut { of, index } => {
+            let _ = ev.value(of.id)?;
+            ev.ln
+                .get(&of.id)
+                .and_then(|outs| outs.get(*index as usize - 1))
+                .cloned()
+                .ok_or_else(|| {
+                    candle_core::Error::Msg(
+                        "layer_norm_backward_out: backward node has no stored outputs".to_string(),
+                    )
+                })?
+        }
         NodeKind::Conv1d {
             x,
             w,
@@ -4804,6 +4929,59 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> candle_core::Result<Te
         }
     };
     Ok(output)
+}
+
+// Layer normalization, composed of candle ops (CPU path and the
+// reference for the fused Metal kernels in layer_norm.rs).
+fn layer_norm_composed(
+    x: &Tensor,
+    weight: &Tensor,
+    bias: &Tensor,
+    eps: f64,
+) -> candle_core::Result<Tensor> {
+    let rank = x.rank();
+    let dims: Vec<usize> = (rank - weight.dims().len()..rank).collect();
+    let mean = x.mean_keepdim(dims.clone())?;
+    let centered = x.broadcast_sub(&mean)?;
+    let var = centered.sqr()?.mean_keepdim(dims.clone())?;
+    let inv = (var + eps)?.sqrt()?.recip()?;
+    centered
+        .broadcast_mul(&inv)?
+        .broadcast_mul(weight)?
+        .broadcast_add(bias)
+}
+
+// Layer-norm backward: dx plus (dw, db). The fused Metal kernel emits
+// dx and x̂ in one launch; dw/db are plain row reduces either way.
+fn layer_norm_backward(
+    x: &Tensor,
+    weight: &Tensor,
+    g: &Tensor,
+    eps: f64,
+) -> candle_core::Result<(Tensor, Tensor, Tensor)> {
+    let rank = x.rank();
+    let k = weight.dims().len();
+    let reduce_dims: Vec<usize> = (0..rank - k).collect();
+    if layer_norm::is_supported(x, weight) {
+        let (dx, xh) = layer_norm::ln_backward(x, weight, g, eps)?;
+        let dw = g.mul(&xh)?.sum(reduce_dims.clone())?;
+        let db = g.sum(reduce_dims)?;
+        return Ok((dx, dw, db));
+    }
+    let dims: Vec<usize> = (rank - k..rank).collect();
+    let mean = x.mean_keepdim(dims.clone())?;
+    let centered = x.broadcast_sub(&mean)?;
+    let var = centered.sqr()?.mean_keepdim(dims.clone())?;
+    let rstd = (var + eps)?.sqrt()?.recip()?;
+    let xh = centered.broadcast_mul(&rstd)?;
+    // dx = (dyw − mean(dyw) − x̂·mean(dyw·x̂)) · rstd
+    let dyw = g.broadcast_mul(weight)?;
+    let m1 = dyw.mean_keepdim(dims.clone())?;
+    let m2 = dyw.broadcast_mul(&xh)?.mean_keepdim(dims)?;
+    let dx = ((dyw.broadcast_sub(&m1)? - xh.broadcast_mul(&m2)?)?).broadcast_mul(&rstd)?;
+    let dw = g.mul(&xh)?.sum(reduce_dims.clone())?;
+    let db = g.sum(reduce_dims)?;
+    Ok((dx, dw, db))
 }
 
 // Reverse-mode automatic differentiation: adjoints are built from the same
@@ -5766,6 +5944,35 @@ mod autodiff {
                 NodeKind::RotaryEmbeddingBackward { .. } => {
                     return Err(
                         "grad: rotary backward nodes are not differentiable (no second-order)"
+                            .to_string(),
+                    );
+                }
+                NodeKind::LayerNorm { x, weight, bias, eps } => {
+                    let bwd = mk(NodeKind::LayerNormBackward {
+                        x: x.clone(),
+                        weight: weight.clone(),
+                        g: g.clone(),
+                        eps: *eps,
+                    })?;
+                    accumulate(x, Ok(bwd.clone()))?;
+                    accumulate(
+                        weight,
+                        mk(NodeKind::LayerNormBackwardOut {
+                            of: bwd.clone(),
+                            index: 1,
+                        }),
+                    )?;
+                    accumulate(
+                        bias,
+                        mk(NodeKind::LayerNormBackwardOut {
+                            of: bwd,
+                            index: 2,
+                        }),
+                    )?;
+                }
+                NodeKind::LayerNormBackward { .. } | NodeKind::LayerNormBackwardOut { .. } => {
+                    return Err(
+                        "grad: layer norm backward nodes are not differentiable (no second-order)"
                             .to_string(),
                     );
                 }
@@ -7146,6 +7353,9 @@ fn node_kind_name(kind: &NodeKind) -> &'static str {
         NodeKind::ScatterAdd { .. } => "ScatterAdd",
         NodeKind::RotaryEmbedding { .. } => "Rope",
         NodeKind::RotaryEmbeddingBackward { .. } => "RopeBwd",
+        NodeKind::LayerNorm { .. } => "LayerNorm",
+        NodeKind::LayerNormBackward { .. } => "LayerNormBwd",
+        NodeKind::LayerNormBackwardOut { .. } => "LayerNormOut",
         NodeKind::PositionEmbedding { .. } => "PosEmb",
         NodeKind::KvAttention { .. } => "KvAttention",
         NodeKind::Sum { .. } | NodeKind::Mean { .. } | NodeKind::Max { .. } | NodeKind::Min { .. } | NodeKind::Prod { .. } => "Reduce",
