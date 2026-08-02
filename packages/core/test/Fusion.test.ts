@@ -35,6 +35,38 @@ onDevices("Fusion", () => (it) => {
   // exponents (lowered to multiplies/sqrt instead of powf)
   const close = (a: number, b: number): boolean => Math.abs(a - b) <= TOL * Math.max(1, Math.abs(a), Math.abs(b))
   describe("region fusion", () => {
+    it.effect("strided lanes: permuted and narrowed views fuse with correct storage strides", () =>
+      Effect.gen(function* () {
+        const build = Effect.gen(function* () {
+          const a = yield* Tensor.fromTypedArray(floats([1, 2, 3, 4, 5, 6]), [2, 3])
+          const b = yield* Tensor.fromTypedArray(floats([0.5, 1.5, 2.5, 3.5, 4.5, 5.5]), [2, 3])
+          // Permuted and narrowed views feeding a fused elementwise
+          // chain: lanes must be read through their storage strides,
+          // not as if dense.
+          const ap = yield* Tensor.transpose(a, [1, 0])
+          const bp = yield* Tensor.transpose(b, [1, 0])
+          const sliced = yield* Tensor.slice(bp, { start: [0, 0], end: [3, 1] })
+          const chain = yield* Tensor.tanh(
+            yield* Tensor.mul(yield* Tensor.add(ap, sliced), yield* Tensor.add(ap, sliced))
+          )
+          return yield* values(chain)
+        })
+        const fused = yield* withFusion(true, build)
+        const unfused = yield* withFusion(false, build)
+        assert.deepStrictEqual(fused, unfused)
+        // and the values are the true tanh((a^T + b^T[.., :1])²):
+        const aT = [1, 4, 2, 5, 3, 6]
+        const bTs = [0.5, 3.5, 0.5, 3.5, 0.5, 3.5]
+        const expected = aT.map((a, i) => {
+          const s = a + bTs[i]!
+          return Math.tanh(s * s)
+        })
+        for (let i = 0; i < expected.length; i++) {
+          assert.assertTrue(Math.abs(fused[i]! - expected[i]!) < 1e-5, `${fused[i]} != ${expected[i]}`)
+        }
+      })
+    )
+
     it.effect("fused and unfused evaluation agree on values and gradients", () =>
       Effect.gen(function* () {
         const build = Effect.gen(function* () {

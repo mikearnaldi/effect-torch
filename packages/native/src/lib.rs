@@ -5103,11 +5103,12 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> candle_core::Result<Te
                 .iter()
                 .map(|i| ev.value(i.id))
                 .collect::<candle_core::Result<Vec<_>>>()?;
+            let strides: Vec<Vec<usize>> = strides.to_vec();
             let first = &ts[0];
             let outs = fusion::run(
                 std::slice::from_ref(expr),
                 &ts,
-                Some(strides),
+                Some(&strides),
                 &[],
                 shape.iter().product(),
                 shape,
@@ -5126,11 +5127,12 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> candle_core::Result<Te
                 .iter()
                 .map(|i| ev.value(i.id))
                 .collect::<candle_core::Result<Vec<_>>>()?;
+            let strides: Vec<Vec<usize>> = strides.to_vec();
             let first = &ts[0];
             let outs = fusion::run(
                 exprs,
                 &ts,
-                Some(strides),
+                Some(&strides),
                 &[],
                 shape.iter().product(),
                 shape,
@@ -5169,11 +5171,12 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> candle_core::Result<Te
                 eprintln!("[fine] reduce collect {:.1}us ({} inputs)", t0.elapsed().as_micros(), ts.len());
             }
             let first = &ts[0];
+            let strides: Vec<Vec<usize>> = strides.to_vec();
             fusion::run_reduce(
                 *op,
                 expr,
                 &ts,
-                strides,
+                &strides,
                 in_shape,
                 dims,
                 *keepdims,
