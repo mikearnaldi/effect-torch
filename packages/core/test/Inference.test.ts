@@ -402,6 +402,190 @@ onDevices("Inference", () => (it) => {
 
     it.effect("int8 pool: teacher-forced logits track the f32 reference", () => halfPoolParity("int8", 1e-1))
 
+    it.effect("wpe sliding window: inert below the window, self-consistent across eviction", () =>
+      Effect.gen(function* () {
+        // Sliding-window attention is not RoPE-specific: it is a pool
+        // memory policy. With learned absolute positions the window
+        // works within the table — positions stay absolute — so (a)
+        // below the window generation matches the naive loop exactly,
+        // and (b) past it a stepped sequence and a fresh prefill of
+        // the same context agree (this would FAIL for window-relative
+        // positions, which are the RoPE-only regime).
+        const model = yield* makeGpt()
+        const params = yield* Tensor.compute(yield* model.init)
+        const program = yield* Model.inference(model, params, {
+          maxTokens: 32,
+          blockSize: 4,
+          attentionWindow: 8
+        })
+        // (a) context 3 + 4 steps = 7 < window 8: window never engages.
+        const naive = yield* naiveGenerate(model, params, [1, 5, 3], 4)
+        const cached = yield* cachedGenerate(program, [1, 5, 3], 4)
+        expect(cached).toEqual(naive)
+        // (b) prefill 12, step 4 greedy (context 16, first block
+        // evicted), then a fresh prefill of the full 16-token context
+        // must produce the same last-position logits.
+        const seqA = yield* program.sequence()
+        const prompt = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 0]
+        const context = [...prompt]
+        let logits = yield* seqA.prefill(yield* ids(prompt))
+        for (let i = 0; i < 4; i++) {
+          const next = yield* argmaxOf(logits)
+          context.push(next)
+          logits = yield* seqA.step(yield* ids([next]))
+        }
+        const seqB = yield* program.sequence()
+        const fresh = yield* seqB.prefill(yield* ids(context))
+        deep(yield* Tensor.toNumberArray(fresh), yield* Tensor.toNumberArray(logits))
+      })
+    )
+
+    it.effect("stepAll matches per-sequence step logits exactly", () =>
+      Effect.gen(function* () {
+        const model = yield* makeGpt()
+        const params = yield* Tensor.compute(yield* model.init)
+        const program = yield* Model.inference(model, params, { maxTokens: 64, blockSize: 4, decodeBatch: 4 })
+        const prompts = [
+          [1, 2, 3],
+          [4, 5, 6, 7, 8],
+          [9, 10],
+          [1, 2, 3, 0, 11, 5, 6]
+        ]
+        // Sequential reference: prefill + one step per sequence.
+        const reference: Array<Array<number>> = []
+        for (const prompt of prompts) {
+          const seq = yield* program.sequence()
+          yield* seq.prefill(yield* ids(prompt))
+          const logits = yield* seq.step(yield* ids([1]))
+          reference.push(yield* Tensor.toNumberArray(logits))
+        }
+        // Batched: fresh sequences, same prompts, one stepAll.
+        const entries: Array<{ sequence: Model.Sequence; token: Tensor.Any }> = []
+        for (const prompt of prompts) {
+          const seq = yield* program.sequence()
+          yield* seq.prefill(yield* ids(prompt))
+          entries.push({ sequence: seq, token: yield* ids([1]) })
+        }
+        const batched = yield* program.stepAll(entries)
+        expect(batched.length).toBe(prompts.length)
+        for (let i = 0; i < prompts.length; i++) {
+          deep(yield* Tensor.toNumberArray(batched[i]!), reference[i]!)
+        }
+        // The batch advanced every cursor exactly once.
+        for (const entry of entries) {
+          expect(yield* entry.sequence.cursor()).toBe(prompts[entries.indexOf(entry)]!.length + 1)
+        }
+      })
+    )
+
+    it.effect("stepAll pads short batches exactly", () =>
+      Effect.gen(function* () {
+        const model = yield* makeGpt()
+        const params = yield* Tensor.compute(yield* model.init)
+        const program = yield* Model.inference(model, params, { maxTokens: 64, blockSize: 4, decodeBatch: 8 })
+        const seq = yield* program.sequence()
+        yield* seq.prefill(yield* ids([3, 1, 4]))
+        const expected = yield* seq.step(yield* ids([2]))
+        const seq2 = yield* program.sequence()
+        yield* seq2.prefill(yield* ids([3, 1, 4]))
+        const [got] = yield* program.stepAll([{ sequence: seq2, token: yield* ids([2]) }])
+        deep(yield* Tensor.toNumberArray(got!), yield* Tensor.toNumberArray(expected))
+      })
+    )
+
+    it.effect("stepAll with divergent cursors and a shared prefix", () =>
+      Effect.gen(function* () {
+        const model = yield* makeRopeGpt
+        const params = yield* Tensor.compute(yield* model.init)
+        const program = yield* Model.inference(model, params, {
+          maxTokens: 64,
+          blockSize: 4,
+          attentionWindow: 8,
+          decodeBatch: 2
+        })
+        const prompt = [1, 3, 5, 7, 9, 11, 2, 4]
+        // A generates alone first (evicting its first block past the
+        // window); B prefills afterwards and shares A's cached blocks.
+        const seqA = yield* program.sequence()
+        let logitsA = yield* seqA.prefill(yield* ids(prompt))
+        for (let i = 0; i < 4; i++) {
+          logitsA = yield* seqA.step(yield* ids([yield* argmaxOf(logitsA)]))
+        }
+        const seqB = yield* program.sequence()
+        let logitsB = yield* seqB.prefill(yield* ids(prompt))
+        // Reference: independent windowed generation from the same
+        // prompt for both trajectories.
+        const refA = yield* naiveWindowedGenerate(model, params, prompt, 11, 8)
+        const refB = yield* naiveWindowedGenerate(model, params, prompt, 7, 8)
+        // Six batched steps: cursors 12+i and 8+i in one run.
+        for (let i = 0; i < 6; i++) {
+          const [nextA, nextB] = [refA[prompt.length + 4 + i]!, refB[prompt.length + i]!]
+          const [outA, outB] = yield* program.stepAll([
+            { sequence: seqA, token: yield* ids([nextA]) },
+            { sequence: seqB, token: yield* ids([nextB]) }
+          ])
+          logitsA = outA!
+          logitsB = outB!
+          // Batched logits must equal the sequential reference argmax.
+          expect(yield* argmaxOf(logitsA)).toBe(refA[prompt.length + 5 + i]!)
+          expect(yield* argmaxOf(logitsB)).toBe(refB[prompt.length + 1 + i]!)
+        }
+      })
+    )
+
+    it.effect("stepAll rolls back every slot on pool exhaustion", () =>
+      Effect.gen(function* () {
+        const model = yield* makeGpt()
+        const params = yield* Tensor.compute(yield* model.init)
+        // Pool holds both prompts exactly; the batched step needs one
+        // more block per sequence and must fail cleanly.
+        const program = yield* Model.inference(model, params, { maxTokens: 24, blockSize: 4, decodeBatch: 2 })
+        const seqA = yield* program.sequence()
+        const seqB = yield* program.sequence()
+        yield* seqA.prefill(yield* ids([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 0])) // 3 blocks
+        yield* seqB.prefill(yield* ids([2, 4, 6, 8, 10, 0, 1, 3, 5, 7, 9, 11])) // 3 blocks
+        const error = yield* Effect.flip(
+          program.stepAll([
+            { sequence: seqA, token: yield* ids([1]) },
+            { sequence: seqB, token: yield* ids([2]) }
+          ])
+        )
+        expect(error._tag).toBe("TensorError")
+        expect(error.message).toMatch(/pool exhausted/)
+        // Neither cursor advanced; both sequences still step fine once
+        // the pool has room (release A's blocks by closing its scope is
+        // not needed — pool of 24 has no room, so release A first).
+        expect(yield* seqA.cursor()).toBe(12)
+        expect(yield* seqB.cursor()).toBe(12)
+      })
+    )
+
+    it.effect("stepAll rejects duplicate sequences and over-wide batches", () =>
+      Effect.gen(function* () {
+        const model = yield* makeGpt()
+        const params = yield* Tensor.compute(yield* model.init)
+        const program = yield* Model.inference(model, params, { maxTokens: 64, blockSize: 4, decodeBatch: 2 })
+        const seq = yield* program.sequence()
+        yield* seq.prefill(yield* ids([1, 2, 3]))
+        const token = yield* ids([1])
+        const duplicate = yield* Effect.flip(
+          program.stepAll([
+            { sequence: seq, token },
+            { sequence: seq, token }
+          ])
+        )
+        expect(duplicate.message).toMatch(/duplicate sequence/)
+        const wide = yield* Effect.flip(
+          program.stepAll([
+            { sequence: seq, token },
+            { sequence: yield* program.sequence(), token },
+            { sequence: yield* program.sequence(), token }
+          ])
+        )
+        expect(wide.message).toMatch(/at most decodeBatch/)
+      })
+    )
+
     it.effect("f16 pool: prefix cache and sliding window still hold", () =>
       Effect.gen(function* () {
         const model = yield* makeRopeGpt

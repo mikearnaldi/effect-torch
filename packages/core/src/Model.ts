@@ -1157,6 +1157,9 @@ export class InferenceError extends Data.TaggedError("InferenceError")<{
  * computes in f32 (RFC 0012). `"int8"` is the storage tier: symmetric
  * per-(token, head) quantization on a ±127 grid with f32 scales —
  * a 4× footprint reduction in exchange for coarser cached rows.
+ * `decodeBatch` is the fixed width of the batched decode program
+ * (default 8, RFC 0013): {@link InferenceProgram.stepAll} steps that
+ * many sequences per run, padding short batches internally.
  *
  * @since 0.1.0
  * @category compilation
@@ -1168,6 +1171,7 @@ export interface InferenceConfig {
   readonly prefillChunk?: number
   readonly tokenDtype?: "u32" | "i64"
   readonly kvDtype?: "f32" | "f16" | "bf16" | "int8"
+  readonly decodeBatch?: number
 }
 
 /**
@@ -1187,6 +1191,8 @@ export interface InferenceConfig {
  * @category compilation
  */
 export interface Sequence {
+  /** @internal the native handle (block table + cursor) — used by stepAll */
+  readonly _native: Tensor.NativeKvSequence
   readonly prefill: (
     tokens: Tensor.Any
   ) => Effect.Effect<Tensor.Concrete, InferenceError | ModelError | Tensor.TensorError, CurrentDevice>
@@ -1211,6 +1217,24 @@ export interface Sequence {
  */
 export interface InferenceProgram {
   readonly sequence: () => Effect.Effect<Sequence, InferenceError, Scope.Scope>
+  /**
+   * Steps each entry's sequence one token in a single batched run
+   * (RFC 0013): one eval walk for the whole batch, results identical
+   * to per-sequence `step` calls, in entry order. Entries are
+   * independent sequences of this program (they may share pool blocks
+   * via the prefix cache); at most `decodeBatch` entries per call —
+   * admission and scheduling stay with the caller.
+   */
+  readonly stepAll: (
+    entries: ReadonlyArray<{
+      readonly sequence: Sequence
+      readonly token: Tensor.Any
+    }>
+  ) => Effect.Effect<
+    ReadonlyArray<Tensor.Concrete>,
+    InferenceError | ModelError | Tensor.TensorError,
+    CurrentDevice
+  >
 }
 
 /**
@@ -1274,11 +1298,19 @@ export const inference = (
       })
     }
     const tokenDtype = config.tokenDtype ?? "u32"
-    // Eager: exactly two signatures exist ([1, prefillChunk] and [1, 1]),
-    // and dtype/device are config — so both programs and the pool are
-    // built now, and construction errors (no cacheable attention,
-    // non-causal attention) surface here rather than on first use.
-    const trace = (inputShape: ReadonlyArray<number>) =>
+    const decodeBatch = config.decodeBatch ?? 8
+    if (!Number.isInteger(decodeBatch) || decodeBatch <= 0) {
+      return yield* new InferenceError({
+        op: "inference",
+        message: `decodeBatch must be a positive integer, got ${config.decodeBatch}`
+      })
+    }
+    // Eager: exactly three signatures exist ([1, prefillChunk], [1, 1]
+    // and [decodeBatch, 1]), and dtype/device are config — so all
+    // programs and the pool are built now, and construction errors (no
+    // cacheable attention, non-causal attention) surface here rather
+    // than on first use.
+    const trace = (inputShape: ReadonlyArray<number>, batch?: number) =>
       Effect.gen(function* () {
         const exemplar = yield* Tensor.zeros(inputShape, { dtype: tokenDtype })
         const placeholders: Array<Tensor.Lazy> = []
@@ -1287,19 +1319,21 @@ export const inference = (
         }
         placeholders.push(yield* Tensor.makeInput(frozenParams.length, exemplar))
         const output = yield* model.forward(placeholders.slice(0, -1), placeholders[placeholders.length - 1])
-        return yield* Tensor.compileDecodeProgram(
-          [output],
-          ...(config.attentionWindow !== undefined ? [config.attentionWindow] : [])
-        ).pipe(
+        return yield* Tensor.compileDecodeProgram([output], config.attentionWindow, batch).pipe(
           Effect.mapError((error) => new InferenceError({ op: "inference", message: error.message }))
         )
       })
     const prefillProgram = yield* trace([1, prefillChunk])
     const decodeProgram = yield* trace([1, 1])
+    const batchedProgram = decodeBatch > 1 ? yield* trace([decodeBatch, 1], decodeBatch) : undefined
     if (
       prefillProgram.layers !== decodeProgram.layers ||
       prefillProgram.kvHeads !== decodeProgram.kvHeads ||
-      prefillProgram.headDim !== decodeProgram.headDim
+      prefillProgram.headDim !== decodeProgram.headDim ||
+      (batchedProgram !== undefined &&
+        (batchedProgram.layers !== decodeProgram.layers ||
+          batchedProgram.kvHeads !== decodeProgram.kvHeads ||
+          batchedProgram.headDim !== decodeProgram.headDim))
     ) {
       return yield* new InferenceError({
         op: "inference",
@@ -1315,6 +1349,15 @@ export const inference = (
       device,
       config.kvDtype === "int8" ? "u8" : (config.kvDtype ?? "f32")
     ).pipe(Effect.mapError((error) => new InferenceError({ op: "inference", message: error.message })))
+    const tokenIds = (op: "prefill" | "step", tokens: Tensor.Any) =>
+      Effect.mapError(
+        Effect.flatMap(
+          tokens.dtype === "u32" ? Effect.succeed(tokens) : Tensor.cast(tokens, "u32"),
+          Tensor.toNumberArray
+        ),
+        (error) =>
+          new InferenceError({ op, message: `token ids must be readable integers: ${error.message}` })
+      )
     const self: InferenceProgram = {
       sequence: () =>
         Effect.gen(function* () {
@@ -1351,15 +1394,6 @@ export const inference = (
               const [result] = yield* Tensor.compute([reshaped])
               return result
             })
-          const tokenIds = (op: "prefill" | "step", tokens: Tensor.Any) =>
-            Effect.mapError(
-              Effect.flatMap(
-                tokens.dtype === "u32" ? Effect.succeed(tokens) : Tensor.cast(tokens, "u32"),
-                Tensor.toNumberArray
-              ),
-              (error) =>
-                new InferenceError({ op, message: `token ids must be readable integers: ${error.message}` })
-            )
           const prefill = (tokens: Tensor.Any) =>
             Effect.gen(function* () {
               if (tokens.shape.length !== 2 || tokens.shape[0] !== 1 || tokens.shape[1] < 1) {
@@ -1408,11 +1442,74 @@ export const inference = (
               return yield* lastLogits("step", output, 0)
             })
           const sequence: Sequence = {
+            _native: native,
             prefill,
             step,
             cursor: () => Effect.sync(() => native.cursor)
           }
           return sequence
+        }),
+      stepAll: (entries) =>
+        Effect.gen(function* () {
+          if (batchedProgram === undefined) {
+            return yield* new InferenceError({
+              op: "stepAll",
+              message: "stepAll needs decodeBatch > 1 (single-sequence steps use step)"
+            })
+          }
+          if (entries.length === 0) {
+            return []
+          }
+          if (entries.length > decodeBatch) {
+            return yield* new InferenceError({
+              op: "stepAll",
+              message: `stepAll accepts at most decodeBatch (${decodeBatch}) entries, got ${entries.length}`
+            })
+          }
+          const ids: Array<number> = []
+          for (const entry of entries) {
+            if (entry.token.shape.length !== 2 || entry.token.shape[0] !== 1 || entry.token.shape[1] !== 1) {
+              return yield* new InferenceError({
+                op: "stepAll",
+                message: `stepAll expects tokens of shape [1, 1], got [${entry.token.shape}]`
+              })
+            }
+            const [id] = yield* tokenIds("step", entry.token)
+            ids.push(id!)
+          }
+          // Short batches pad with throwaway sequences (token 0,
+          // outputs discarded); they are released after the run, so
+          // their blocks never outlive the call.
+          const pads = Array.from({ length: decodeBatch - entries.length }, () => pool.makeSequence())
+          const seqs = [...entries.map((entry) => entry.sequence._native), ...pads]
+          const tokens = [...ids.map((id) => [id]), ...pads.map(() => [0])]
+          let input: Tensor.Any = entries[0]!.token
+          for (let i = 1; i < entries.length; i++) {
+            input = yield* Tensor.concat([input, entries[i]!.token], { dim: 0 })
+          }
+          if (pads.length > 0) {
+            input = yield* Tensor.concat(
+              [input, yield* Tensor.zeros([pads.length, 1], { dtype: tokenDtype })],
+              { dim: 0 }
+            )
+          }
+          const [output] = yield* Effect.ensuring(
+            Tensor.runBatchedDecodeProgram(batchedProgram, [...frozenParams, input], seqs, tokens),
+            Effect.sync(() => {
+              for (const pad of pads) pad.release()
+            })
+          )
+          const vocab = output.shape[output.shape.length - 1]!
+          const results: Array<Tensor.Concrete> = []
+          for (let i = 0; i < entries.length; i++) {
+            const row = yield* Tensor.slice(output, {
+              start: [i, 0, 0],
+              end: [i + 1, 1, vocab]
+            })
+            const [concrete] = yield* Tensor.compute([yield* Tensor.reshape(row, [vocab])])
+            results.push(concrete)
+          }
+          return results
         })
     }
     return self

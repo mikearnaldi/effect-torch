@@ -3825,10 +3825,11 @@ export const makeKvPool = (
  */
 export const compileDecodeProgram = (
   roots: ReadonlyArray<Any>,
-  window?: number
+  window?: number,
+  batch?: number
 ): Effect.Effect<NativeDecodeProgramType, TensorError> =>
   Effect.try({
-    try: () => nativeCompileDecode(roots.map((root) => root.lazy), window),
+    try: () => nativeCompileDecode(roots.map((root) => root.lazy), window, batch),
     catch: (error) =>
       new TensorError({ op: "compileDecode", message: error instanceof Error ? error.message : String(error) })
   })
@@ -3855,6 +3856,37 @@ export const runDecodeProgram = (
     const concrete = yield* compute(inputs)
     const handles = yield* fromNative("run", (token) =>
       program.run(concrete.map((input) => input.materialized), seq, Array.from(tokens), token)
+    )
+    reportExternalMemory(handles.reduce((total, handle) => total + handle.bytes, 0))
+    return handles.map(fromHandle)
+  })
+
+/**
+ * Runs a frozen batched decode program against one kv sequence per
+ * batch slot (RFC 0013): slot b owns batch row b, the cursors bind as
+ * a `[batch]` tensor, and every sequence advances by the same count
+ * (1 for decode). `tokens` carries one real token list per slot.
+ * Internal to the library.
+ *
+ * @since 0.1.0
+ * @category compilation
+ * @internal
+ */
+export const runBatchedDecodeProgram = (
+  program: NativeDecodeProgramType,
+  inputs: ReadonlyArray<Any>,
+  seqs: ReadonlyArray<NativeKvSequenceType>,
+  tokens: ReadonlyArray<ReadonlyArray<number>>
+): Effect.Effect<Array<Concrete>, TensorError> =>
+  Effect.gen(function* () {
+    const concrete = yield* compute(inputs)
+    const handles = yield* fromNative("run", (token) =>
+      program.runBatched(
+        concrete.map((input) => input.materialized),
+        [...seqs],
+        tokens.map((list) => Array.from(list)),
+        token
+      )
     )
     reportExternalMemory(handles.reduce((total, handle) => total + handle.bytes, 0))
     return handles.map(fromHandle)

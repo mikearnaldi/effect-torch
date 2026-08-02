@@ -13,12 +13,14 @@ export declare class CompiledProgram {
 }
 
 export declare class DecodeProgram {
+  get batch(): number
   get signature(): string
   get layers(): number
   get kvHeads(): number
   get headDim(): number
   dispose(): void
   run(inputs: Array<NativeTensor>, seq: NativeKvSequence, tokens: Array<number>, token?: CancellationToken | undefined | null): Promise<Array<NativeTensor>>
+  runBatched(inputs: Array<NativeTensor>, seqs: Array<NativeKvSequence>, tokens: Array<Array<number>>, token?: CancellationToken | undefined | null): Promise<Array<NativeTensor>>
 }
 
 export declare class LazyTensor {
@@ -141,7 +143,7 @@ export declare class NativeTokenizer {
 
 export declare function compile(roots: Array<LazyTensor>): CompiledProgram
 
-export declare function compileDecode(roots: Array<LazyTensor>, window?: number | undefined | null): DecodeProgram
+export declare function compileDecode(roots: Array<LazyTensor>, window?: number | undefined | null, batch?: number | undefined | null): DecodeProgram
 
 export declare function evalLazy(tensors: Array<LazyTensor>, token?: CancellationToken | undefined | null): Promise<Array<NativeTensor>>
 
