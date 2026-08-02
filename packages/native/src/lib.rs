@@ -6978,8 +6978,12 @@ pub async fn eval_lazy(
         let mut outputs = Vec::with_capacity(nodes.len());
         for node in &nodes {
             let output = eval_node(node, cancelled, &mut ev).map_err(to_napi_err)?;
-            output.device().synchronize().map_err(to_napi_err)?;
             outputs.push(NativeTensor::wrap(output));
+        }
+        // Synchronize once: per-root syncs would fully serialize CPU
+        // encoding and GPU execution (readback synchronizes itself).
+        for output in &outputs {
+            output.inner.device().synchronize().map_err(to_napi_err)?;
         }
         if walk_timing {
             eprintln!("[walk] eval {:.1}us ({} nodes)", t1.elapsed().as_micros(), nodes.len());
@@ -7059,6 +7063,34 @@ fn node_kind_name(kind: &NodeKind) -> &'static str {
         NodeKind::KvAttention { .. } => "KvAttention",
         NodeKind::Sum { .. } | NodeKind::Mean { .. } | NodeKind::Max { .. } | NodeKind::Min { .. } | NodeKind::Prod { .. } => "Reduce",
         NodeKind::CrossEntropy { .. } | NodeKind::CrossEntropyBackward { .. } => "CE",
+        NodeKind::AdamWStep { .. } | NodeKind::AdamWOut { .. } => "AdamW",
+        NodeKind::SgdStep { .. } | NodeKind::SgdOut { .. } => "Sgd",
+        NodeKind::Exp { .. }
+        | NodeKind::Log { .. }
+        | NodeKind::Sin { .. }
+        | NodeKind::Cos { .. }
+        | NodeKind::Tanh { .. }
+        | NodeKind::Erf { .. }
+        | NodeKind::Sqrt { .. }
+        | NodeKind::Abs { .. }
+        | NodeKind::Sign { .. }
+        | NodeKind::Neg { .. }
+        | NodeKind::Relu { .. }
+        | NodeKind::Pow { .. }
+        | NodeKind::Floor { .. }
+        | NodeKind::Ceil { .. }
+        | NodeKind::Round { .. } => "Unary",
+        NodeKind::Maximum { .. } | NodeKind::Minimum { .. } => "MaxMin",
+        NodeKind::Eq { .. }
+
+        | NodeKind::Lt { .. }
+        | NodeKind::Le { .. }
+        | NodeKind::Gt { .. }
+        | NodeKind::Ge { .. } => "Cmp",
+        NodeKind::Where { .. } => "Where",
+        NodeKind::Checkpoint { .. } | NodeKind::StopGradient { .. } => "Passthrough",
+        NodeKind::Argmax { .. } | NodeKind::Argmin { .. } | NodeKind::Cumsum { .. } => "Scan",
+        NodeKind::Inverse { .. } | NodeKind::Det { .. } | NodeKind::Solve { .. } => "Linalg",
         NodeKind::Leaf(_) | NodeKind::Input { .. } | NodeKind::ScalarInput { .. } => "Input",
         NodeKind::FromBytes { .. } | NodeKind::Zeros { .. } | NodeKind::Ones { .. } | NodeKind::Full { .. } | NodeKind::Randn { .. } | NodeKind::Uniform { .. } | NodeKind::Arange { .. } | NodeKind::Eye { .. } => "Const",
         _ => "Other",
@@ -8454,8 +8486,12 @@ impl DecodeProgram {
                         return Err(to_napi_err(error));
                     }
                 };
-                output.device().synchronize().map_err(to_napi_err)?;
                 outputs.push(NativeTensor::wrap(output));
+            }
+            // Synchronize once: per-root syncs would fully serialize
+            // CPU encoding and GPU execution.
+            for output in &outputs {
+                output.inner.device().synchronize().map_err(to_napi_err)?;
             }
             for (i, state) in slot_states.iter().enumerate() {
                 if let Ok(mut state) = state.lock() {
@@ -8756,11 +8792,22 @@ impl CompiledProgram {
             .map(|(id, slot)| (*id, bindings[&(*slot as u64)].clone()))
             .collect();
         let mut ev = Evaluator::with_slots(&roots, by_id);
+            let walk_timing = std::env::var_os("EFFECT_TORCH_WALK_TIMING").is_some();
+            let t1 = std::time::Instant::now();
             let mut outputs = Vec::with_capacity(roots.len());
             for node in &roots {
                 let output = eval_node(node, cancelled, &mut ev).map_err(to_napi_err)?;
-                output.device().synchronize().map_err(to_napi_err)?;
                 outputs.push(NativeTensor::wrap(output));
+            }
+            // Synchronize once: per-root syncs would fully serialize CPU
+            // encoding and GPU execution. Consumers that need values on
+            // the host synchronize at readback; device-side reuse needs
+            // no host round-trip.
+            for output in &outputs {
+                output.inner.device().synchronize().map_err(to_napi_err)?;
+            }
+            if walk_timing {
+                eprintln!("[walk] program eval {:.1}us ({} roots)", t1.elapsed().as_micros(), roots.len());
             }
             Ok(outputs)
         })
