@@ -186,3 +186,42 @@ dependency. The fallback path is tested by forcing the cache to miss.
   recorded exception) or matmuls (never).
 - Exposing the IR in the TypeScript API — fusion is an implementation
   detail of the native backend.
+
+## Addendum: semantic-node kernels and the walk pipeline (implemented)
+
+Two lessons fell out of measuring the fused path end to end
+(EFFECT_TORCH_KIND_TIMING / FUSION_TIMING / WALK_TIMING, all kept as
+env-gated instrumentation):
+
+- **Fusion must be memoized.** fuse_roots is a pure function of the
+  immutable graph but ran per walk at ~5µs/node — a 2.4ms tax that
+  made fusion a net regression. It is now cached by root node ids
+  (bounded LRU). Compile/freeze paths always fused once and were
+  unaffected.
+- **Synchronize once per walk.** Per-root device syncs serialized CPU
+  encoding against GPU execution (a 209-root step walked in 32ms);
+  the walk now syncs at the end (host readback syncs itself). The
+  same walk: 11.6ms.
+
+Beyond fused regions, the biggest eval-time costs were composed
+implementations of semantic ops with synchronous host readbacks or
+long op chains. These are now single-kernel execution strategies
+behind semantic nodes, CPU fallbacks intact:
+
+- **CrossEntropy** (loss.rs): one-pass forward (online logsumexp +
+  nll + status flags) and backward (probs − one_hot, device-side
+  count). The label/count error semantics require host reads, which
+  would split the walk's pipeline — they are deferred through the
+  evaluator's ce_checks to the walk's final sync. 1.1ms → 12µs.
+- **RotaryEmbedding** (rotary.rs): angles in-register, one kernel for
+  forward and the RotaryEmbeddingBackward node (transpose rotation =
+  negated angles).
+- **LayerNorm** (layer_norm.rs): semantic node (single/multi-dim
+  trailing normalization), one launch forward, one backward (dx + x̂;
+  dw/db are plain reduces). Grad is hand-derived like other semantic
+  nodes.
+
+Combined effect on the reference GPT training step (4 layers, E 128,
+T 64, compiled trainer): 53ms → 12.5ms per step. Optimizer step
+scalars (lr, bias corrections) are also memoized per walk instead of
+copied per parameter.
