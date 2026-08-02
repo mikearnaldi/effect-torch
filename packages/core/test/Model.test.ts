@@ -365,12 +365,8 @@ onDevices("Model", () => (it) => {
         const headDim = embedDim / numHeads
         const model = yield* Model.multiHeadAttention("attn", embedDim, numHeads)
         expect(model.names).toEqual([
-          "attn.wq.weight",
-          "attn.wq.bias",
-          "attn.wk.weight",
-          "attn.wk.bias",
-          "attn.wv.weight",
-          "attn.wv.bias",
+          "attn.qkv.weight",
+          "attn.qkv.bias",
           "attn.wo.weight",
           "attn.wo.bias"
         ])
@@ -380,21 +376,18 @@ onDevices("Model", () => (it) => {
           [2, 3, 8]
         )
         const manual = Effect.gen(function* () {
-          const project = (t: Tensor.Any, w: Tensor.Any, b: Tensor.Any) =>
-            Effect.gen(function* () {
-              return yield* Tensor.add(yield* Tensor.matmul(t, w), b)
-            })
           const split = (t: Tensor.Any) =>
             Effect.gen(function* () {
               const r = yield* Tensor.reshape(t, [2, 3, numHeads, headDim])
               return yield* Tensor.transpose(r, [0, 2, 1, 3])
             })
-          const q = yield* split(yield* project(x, params[0], params[1]))
-          const k = yield* split(yield* project(x, params[2], params[3]))
-          const v = yield* split(yield* project(x, params[4], params[5]))
+          const qkv = yield* Tensor.add(yield* Tensor.matmul(x, params[0]), params[1])
+          const q = yield* split(yield* Tensor.slice(qkv, { start: [0, 0, 0], end: [2, 3, embedDim] }))
+          const k = yield* split(yield* Tensor.slice(qkv, { start: [0, 0, embedDim], end: [2, 3, 2 * embedDim] }))
+          const v = yield* split(yield* Tensor.slice(qkv, { start: [0, 0, 2 * embedDim], end: [2, 3, 3 * embedDim] }))
           const attended = yield* Tensor.scaledDotProductAttention(q, k, v)
           const merged = yield* Tensor.reshape(yield* Tensor.transpose(attended, [0, 2, 1, 3]), [2, 3, embedDim])
-          return yield* project(merged, params[6], params[7])
+          return yield* Tensor.add(yield* Tensor.matmul(merged, params[2]), params[3])
         })
         const [viaModel] = yield* Tensor.compute([yield* model.forward(params, x)])
         expect(viaModel.shape).toEqual([2, 3, 8])
@@ -427,7 +420,7 @@ onDevices("Model", () => (it) => {
         // 0 attends only to itself in both variants' first row
         const loss = yield* Tensor.sum(yield* causal.forward(params, x))
         const grads = yield* Tensor.compute(yield* Gradient.grad(loss, params))
-        expect(grads.length).toBe(8)
+        expect(grads.length).toBe(4)
       })
     )
 

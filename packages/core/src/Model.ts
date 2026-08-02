@@ -521,25 +521,31 @@ export const multiHeadAttention = (
       })
     }
     const headDim = embedDim / numHeads
-    const projections = ["wq", "wk", "wv", "wo"] as const
-    const names = projections.flatMap((p) => [`${name}.${p}.weight`, `${name}.${p}.bias`])
+    // Fused QKV projection: one [E, 3E] gemm+epilogue instead of three
+    // [E, E] linears — one launch forward, one per gradient direction
+    // backward, at 1/3 the matmul count.
+    const names = [
+      `${name}.qkv.weight`,
+      `${name}.qkv.bias`,
+      `${name}.wo.weight`,
+      `${name}.wo.bias`
+    ]
     const causal = options.causal ?? false
     return {
       names,
       init: Effect.gen(function* () {
-        const params: Array<Tensor.Any> = []
-        for (const _ of projections) {
-          const drawn = yield* Tensor.randn([embedDim, embedDim])
-          params.push(
-            yield* Tensor.mul(drawn, yield* Tensor.constantLike(drawn, 1 / Math.sqrt(embedDim))),
-            yield* Tensor.zeros([1, embedDim])
-          )
-        }
-        return params
+        const qkvDrawn = yield* Tensor.randn([embedDim, 3 * embedDim])
+        const qkvWeight = yield* Tensor.mul(qkvDrawn, yield* Tensor.constantLike(qkvDrawn, 1 / Math.sqrt(embedDim)))
+        const qkvBias = yield* Tensor.zeros([1, 3 * embedDim])
+        const woDrawn = yield* Tensor.randn([embedDim, embedDim])
+        const woWeight = yield* Tensor.mul(woDrawn, yield* Tensor.constantLike(woDrawn, 1 / Math.sqrt(embedDim)))
+        const woBias = yield* Tensor.zeros([1, embedDim])
+        return [qkvWeight, qkvBias, woWeight, woBias] as const
       }),
       forward: (params, input) =>
         Effect.gen(function* () {
           yield* checkArity(name, names, params)
+          const [qkvWeight, qkvBias, woWeight, woBias] = params
           const rank = input.shape.length
           const t = input.shape[rank - 2]
           const leading = input.shape.slice(0, -2)
@@ -561,23 +567,28 @@ export const multiHeadAttention = (
               const transposed = yield* Tensor.transpose(x, perm)
               return yield* Tensor.reshape(transposed, [...leading, t, embedDim])
             })
-          const project = (x: Tensor.Any, weight: Tensor.Any, bias: Tensor.Any) =>
-            Effect.gen(function* () {
-              return yield* Tensor.linear(x, weight, bias)
-            })
-          const projected: Array<Tensor.Any> = []
-          for (let p = 0; p < 3; p++) {
-            projected.push(yield* project(input, params[p * 2], params[p * 2 + 1]))
-          }
+          const qkv = yield* Tensor.linear(input, qkvWeight, qkvBias)
+          const q = yield* Tensor.slice(qkv, {
+            start: [...leading.map(() => 0), 0, 0],
+            end: [...leading.map((d) => d), t, embedDim]
+          })
+          const k = yield* Tensor.slice(qkv, {
+            start: [...leading.map(() => 0), 0, embedDim],
+            end: [...leading.map((d) => d), t, 2 * embedDim]
+          })
+          const v = yield* Tensor.slice(qkv, {
+            start: [...leading.map(() => 0), 0, 2 * embedDim],
+            end: [...leading.map((d) => d), t, 3 * embedDim]
+          })
           const maybeRope = (x: Tensor.Any) =>
             options.rope !== undefined ? Tensor.rotaryEmbedding(x, t, options.rope) : Effect.succeed(x as Tensor.Any)
           const attended = yield* Tensor.scaledDotProductAttention(
-            yield* maybeRope(yield* splitHeads(projected[0])),
-            yield* maybeRope(yield* splitHeads(projected[1])),
-            yield* splitHeads(projected[2]),
+            yield* maybeRope(yield* splitHeads(q)),
+            yield* maybeRope(yield* splitHeads(k)),
+            yield* splitHeads(v),
             { causal }
           )
-          return yield* project(yield* mergeHeads(attended), params[6], params[7])
+          return yield* Tensor.linear(yield* mergeHeads(attended), woWeight, woBias)
         })
     }
   })
