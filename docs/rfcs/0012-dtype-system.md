@@ -155,6 +155,21 @@ op-internal f32 accumulation is a numerics decision revisited with the
 paged kernel (flash pipelines are dtype-specialized anyway). The
 guards' errors are already clean and typed.
 
+## Addendum: the first storage dtype — int8 kv pools (implemented)
+
+`InferenceConfig.kvDtype` accepts `"f32" | "f16" | "bf16" | "int8"`.
+The halves store rows as-is (widen on gather); `"int8"` is the first
+*storage-tier* dtype: pool slabs are u8 bytes (no generic op may touch
+them) plus per-(token, head) f32 absmax scales, symmetric-quantized on
+a ±127 grid (offset 128) inside `kv_attention` — quantize on scatter,
+dequantize on gather, attention always in f32. 4× footprint reduction.
+
+Honest matrix note: candle's Metal backend originally lacked u8
+scatter/gather kernel instantiations; the fork gained `s_u32_u8` and
+`gather_u32_u8` (`mikearnaldi/candle` d6f2056c), so int8 pools run on
+both devices. fp8-e4m3 (bit-level encoding, fused dequant) waits for
+the paged attention kernel.
+
 ## API surface
 
 - `DType` gains `"bf16"` (native `NativeDType` enum + core union).

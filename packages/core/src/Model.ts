@@ -1154,7 +1154,9 @@ export class InferenceError extends Data.TaggedError("InferenceError")<{
  * `kvDtype` is the pool slabs' element type (default `"f32"`): `"f16"`
  * or `"bf16"` halve cache memory (doubling token capacity per byte) —
  * rows are quantized on write and widened on read, attention always
- * computes in f32 (RFC 0012).
+ * computes in f32 (RFC 0012). `"int8"` is the storage tier: symmetric
+ * per-(token, head) quantization on a ±127 grid with f32 scales —
+ * a 4× footprint reduction in exchange for coarser cached rows.
  *
  * @since 0.1.0
  * @category compilation
@@ -1165,7 +1167,7 @@ export interface InferenceConfig {
   readonly attentionWindow?: number
   readonly prefillChunk?: number
   readonly tokenDtype?: "u32" | "i64"
-  readonly kvDtype?: "f32" | "f16" | "bf16"
+  readonly kvDtype?: "f32" | "f16" | "bf16" | "int8"
 }
 
 /**
@@ -1311,7 +1313,7 @@ export const inference = (
       config.maxTokens,
       blockSize,
       device,
-      config.kvDtype ?? "f32"
+      config.kvDtype === "int8" ? "u8" : (config.kvDtype ?? "f32")
     ).pipe(Effect.mapError((error) => new InferenceError({ op: "inference", message: error.message })))
     const self: InferenceProgram = {
       sequence: () =>

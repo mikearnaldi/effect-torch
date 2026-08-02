@@ -361,7 +361,7 @@ onDevices("Inference", () => (it) => {
     // Half-precision pools (RFC 0012): rows quantized on write, widened
     // on read. Teacher-forced — both sides see the same context — so
     // the comparison is logits closeness, not argmax luck.
-    const halfPoolParity = (kvDtype: "f16" | "bf16", tol: number) =>
+    const halfPoolParity = (kvDtype: "f16" | "bf16" | "int8", tol: number) =>
       Effect.gen(function* () {
         const model = yield* makeGpt()
         const params = yield* Tensor.compute(yield* model.init)
@@ -399,6 +399,8 @@ onDevices("Inference", () => (it) => {
     it.effect("f16 pool: teacher-forced logits track the f32 reference", () => halfPoolParity("f16", 2e-2))
 
     it.effect("bf16 pool: teacher-forced logits track the f32 reference", () => halfPoolParity("bf16", 6e-2))
+
+    it.effect("int8 pool: teacher-forced logits track the f32 reference", () => halfPoolParity("int8", 1e-1))
 
     it.effect("f16 pool: prefix cache and sliding window still hold", () =>
       Effect.gen(function* () {
