@@ -261,4 +261,4 @@ const program = Effect.gen(function* () {
   }
 })
 
-NodeRuntime.runMain(Effect.scoped(program).pipe(Effect.provide(Device.Best)))
+NodeRuntime.runMain(program.pipe(Effect.provide(Device.Best)))
