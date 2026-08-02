@@ -30,7 +30,7 @@ const {
  * @since 0.1.0
  * @category models
  */
-export type DType = "f32" | "f64" | "f16" | "i64" | "u8" | "u32"
+export type DType = "f32" | "f64" | "f16" | "bf16" | "i64" | "u8" | "u32"
 
 /**
  * JavaScript typed arrays accepted by {@link fromTypedArray} and returned by
@@ -39,7 +39,7 @@ export type DType = "f32" | "f64" | "f16" | "i64" | "u8" | "u32"
  * @since 0.1.0
  * @category models
  */
-export type TypedArray = Float32Array | Float64Array | BigInt64Array | Uint8Array | Uint32Array
+export type TypedArray = Float32Array | Float64Array | Float16Array | BigInt64Array | Uint8Array | Uint32Array
 
 /**
  * Common options for tensor constructors.
@@ -448,7 +448,7 @@ export const full = (
  */
 export const randn = (
   shape: ReadonlyArray<number>,
-  options: { readonly dtype?: "f32" | "f64" } = {}
+  options: { readonly dtype?: "f32" | "f64" | "f16" | "bf16" } = {}
 ): Effect.Effect<Lazy, TensorError, CurrentDevice> =>
   Effect.gen(function* () {
     const device = yield* CurrentDevice
@@ -477,7 +477,7 @@ export const randn = (
  */
 export const uniform = (
   shape: ReadonlyArray<number>,
-  options: { readonly min?: number; readonly max?: number; readonly dtype?: "f32" | "f64" } = {}
+  options: { readonly min?: number; readonly max?: number; readonly dtype?: "f32" | "f64" | "f16" | "bf16" } = {}
 ): Effect.Effect<Lazy, TensorError, CurrentDevice> =>
   Effect.gen(function* () {
     const device = yield* CurrentDevice
@@ -601,6 +601,7 @@ export const eye = (
 const dtypeOfTypedArray = (data: TypedArray): DType => {
   if (data instanceof Float32Array) return "f32"
   if (data instanceof Float64Array) return "f64"
+  if (typeof Float16Array !== "undefined" && data instanceof Float16Array) return "f16"
   if (data instanceof BigInt64Array) return "i64"
   if (data instanceof Uint8Array) return "u8"
   if (data instanceof Uint32Array) return "u32"
@@ -2473,7 +2474,7 @@ export const flip = (
 export const oneHot = (
   indexes: Any,
   depth: number,
-  options: { readonly dtype?: "f32" | "f64" } = {}
+  options: { readonly dtype?: "f32" | "f64" | "f16" | "bf16" } = {}
 ): Effect.Effect<Lazy, TensorError, CurrentDevice> =>
   Effect.gen(function* () {
     if (indexes.dtype !== "i64" && indexes.dtype !== "u32") {
@@ -3349,9 +3350,10 @@ export const compute = <Roots extends ReadonlyArray<Any>>(
 const typedArrayConstructor = (dtype: DType) => {
   switch (dtype) {
     case "f32":
-    // f16 reads back as f32: the native side converts before the readback
-    // since JS has no f16 typed array on Node 22
+    // f16/bf16 read back as f32: the native side converts before the
+    // readback since JS has no half typed arrays we can rely on
     case "f16":
+    case "bf16":
       return Float32Array
     case "f64":
       return Float64Array
@@ -3800,10 +3802,11 @@ export const makeKvPool = (
   headDim: number,
   maxTokens: number,
   blockSize: number,
-  device: DeviceKind
+  device: DeviceKind,
+  dtype: DType = "f32"
 ): Effect.Effect<NativeKvPoolType, TensorError> =>
   Effect.try({
-    try: () => new NativeKvPool(layers, kvHeads, headDim, maxTokens, blockSize, device),
+    try: () => new NativeKvPool(layers, kvHeads, headDim, maxTokens, blockSize, device, dtype as NativeDType),
     catch: (error) =>
       new TensorError({
         op: "makeKvPool",

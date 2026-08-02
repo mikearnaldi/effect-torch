@@ -519,6 +519,8 @@ pub enum NativeDType {
     U32,
     #[napi(value = "f16")]
     F16,
+    #[napi(value = "bf16")]
+    BF16,
 }
 
 impl From<NativeDType> for DType {
@@ -530,6 +532,7 @@ impl From<NativeDType> for DType {
             NativeDType::U8 => DType::U8,
             NativeDType::U32 => DType::U32,
             NativeDType::F16 => DType::F16,
+            NativeDType::BF16 => DType::BF16,
         }
     }
 }
@@ -726,9 +729,9 @@ impl NativeTensor {
 }
 
 fn readback_blocking(inner: &Tensor) -> Result<Readback> {
-    // f16 reads back as f32: JS has no f16 typed array on Node 22, and the
-    // conversion keeps the destructor surface to the five shared dtypes
-    let flat = if inner.dtype() == DType::F16 {
+    // f16/bf16 read back as f32: JS has no half typed arrays we can
+    // rely on, and the conversion keeps the destructor surface small.
+    let flat = if matches!(inner.dtype(), DType::F16 | DType::BF16) {
         inner.to_dtype(DType::F32).map_err(to_napi_err)?
     } else {
         inner.clone()
@@ -2171,6 +2174,7 @@ impl Node {
                 (shape.clone(), first.dtype, first.device.clone())
             }
         };
+        check_dtype_device(dtype, &device)?;
         Ok(Arc::new(Node {
             id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
             shape,
@@ -2179,6 +2183,21 @@ impl Node {
             kind,
         }))
     }
+}
+
+// RFC 0012: device dtype capabilities, enforced at graph construction
+// (Node::new is the single choke point — every lazy node, including
+// from-bytes leaves and nodes rebuilt by compile/fuse rewrites, passes
+// through here). Metal's shading language has no f64. Never a silent
+// downcast, never deferred to compute time.
+fn check_dtype_device(dtype: DType, device: &Device) -> std::result::Result<(), String> {
+    if matches!(dtype, DType::F64) && matches!(device, Device::Metal(_)) {
+        return Err(
+            "dtype f64 is not supported on device metal (supported: f32, f16, bf16, i64, u32, u8); cast explicitly or use device cpu"
+                .to_string(),
+        );
+    }
+    Ok(())
 }
 
 #[napi]
@@ -3912,6 +3931,20 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> candle_core::Result<Te
                     .collect();
                 Tensor::from_vec(v, shape.clone(), device)?
             }
+            DType::F16 => {
+                let v: Vec<half::f16> = data
+                    .chunks_exact(2)
+                    .map(|c| half::f16::from_le_bytes([c[0], c[1]]))
+                    .collect();
+                Tensor::from_vec(v, shape.clone(), device)?
+            }
+            DType::BF16 => {
+                let v: Vec<half::bf16> = data
+                    .chunks_exact(2)
+                    .map(|c| half::bf16::from_le_bytes([c[0], c[1]]))
+                    .collect();
+                Tensor::from_vec(v, shape.clone(), device)?
+            }
             dtype => {
                 return Err(candle_core::Error::Msg(format!(
                     "fromBytes not supported for dtype {dtype:?}"
@@ -3940,6 +3973,7 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> candle_core::Result<Te
             DType::U8 => Tensor::full(*value as u8, shape.clone(), device)?,
             DType::U32 => Tensor::full(*value as u32, shape.clone(), device)?,
             DType::F16 => Tensor::full(half::f16::from_f64(*value), shape.clone(), device)?,
+            DType::BF16 => Tensor::full(half::bf16::from_f64(*value), shape.clone(), device)?,
             dtype => {
                 return Err(candle_core::Error::Msg(format!(
                     "full not supported for dtype {dtype:?}"
@@ -7210,6 +7244,10 @@ fn kv_attention(
             q.dtype()
         )));
     }
+    // The pool slabs may be narrower than the compute dtype (RFC 0012,
+    // kvDtype): rows are quantized on scatter and widened back on
+    // gather — attention itself always computes in f32.
+    let slab_dtype = pool.k[layer].dtype();
     let mut state = kv.state.lock().map_err(|e| {
         candle_core::Error::Msg(format!("kv attention: sequence lock poisoned: {e}"))
     })?;
@@ -7268,8 +7306,8 @@ fn kv_attention(
     };
     let write_rows: Vec<u32> = (cursor..needed).map(&physical).collect();
     let write_index = row_index(write_rows)?;
-    pool.k[layer].scatter_set(&write_index, &new_rows(k)?, 0)?;
-    pool.v[layer].scatter_set(&write_index, &new_rows(v)?, 0)?;
+    pool.k[layer].scatter_set(&write_index, &new_rows(k)?.to_dtype(slab_dtype)?, 0)?;
+    pool.v[layer].scatter_set(&write_index, &new_rows(v)?.to_dtype(slab_dtype)?, 0)?;
     // Gather the attended context through the block table: positions
     // [start, needed) are real; rows past the real frontier are
     // zero-padded (only pad q rows, whose outputs are discarded, can
@@ -7279,7 +7317,7 @@ fn kv_attention(
     let ctx = full - start;
     let ctx_index = row_index(ctx_rows)?;
     let zeros = (ctx > needed - start)
-        .then(|| Tensor::zeros((ctx - (needed - start), h, d), DType::F32, &pool.device))
+        .then(|| Tensor::zeros((ctx - (needed - start), h, d), slab_dtype, &pool.device))
         .transpose()?;
     let gather_rows = |slab: &Tensor| -> candle_core::Result<Tensor> {
         let real = slab.gather(&ctx_index, 0)?;
@@ -7287,7 +7325,7 @@ fn kv_attention(
             Some(pad) => Tensor::cat(&[&real, pad], 0)?,
             None => real,
         };
-        full.permute((1, 0, 2))?.unsqueeze(0)?.contiguous()
+        full.permute((1, 0, 2))?.unsqueeze(0)?.contiguous()?.to_dtype(DType::F32)
     };
     let out = sdpa_forward(
         q,
@@ -7495,8 +7533,16 @@ impl NativeKvPool {
         max_tokens: u32,
         block_size: Option<u32>,
         device: Option<String>,
+        dtype: Option<NativeDType>,
     ) -> Result<Self> {
         let device = get_device(device)?;
+        let dtype: DType = dtype.unwrap_or(NativeDType::F32).into();
+        if !matches!(dtype, DType::F32 | DType::F16 | DType::BF16) {
+            return Err(Error::new(
+                Status::InvalidArg,
+                format!("kv pool: dtype must be f32, f16 or bf16, got {}", dtype_name(dtype)),
+            ));
+        }
         let (layers, kv_heads, head_dim, max_tokens) = (
             layers as usize,
             kv_heads as usize,
@@ -7521,11 +7567,11 @@ impl NativeKvPool {
         let mut v = Vec::with_capacity(layers);
         for _ in 0..layers {
             k.push(
-                Tensor::zeros((max_tokens, kv_heads, head_dim), DType::F32, &device)
+                Tensor::zeros((max_tokens, kv_heads, head_dim), dtype, &device)
                     .map_err(to_napi_err)?,
             );
             v.push(
-                Tensor::zeros((max_tokens, kv_heads, head_dim), DType::F32, &device)
+                Tensor::zeros((max_tokens, kv_heads, head_dim), dtype, &device)
                     .map_err(to_napi_err)?,
             );
         }
@@ -8020,6 +8066,7 @@ fn scalar_binding(value: f64, dtype: DType, device: &Device) -> candle_core::Res
         DType::U8 => Tensor::full(value as u8, vec![], device),
         DType::U32 => Tensor::full(value as u32, vec![], device),
         DType::F16 => Tensor::full(half::f16::from_f64(value), vec![], device),
+        DType::BF16 => Tensor::full(half::bf16::from_f64(value), vec![], device),
         dtype => Err(candle_core::Error::Msg(format!(
             "scalar input not supported for dtype {dtype:?}"
         ))),

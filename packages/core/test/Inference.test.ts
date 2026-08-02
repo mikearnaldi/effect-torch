@@ -358,6 +358,94 @@ onDevices("Inference", () => (it) => {
       })
     )
 
+    // Half-precision pools (RFC 0012): rows quantized on write, widened
+    // on read. Teacher-forced — both sides see the same context — so
+    // the comparison is logits closeness, not argmax luck.
+    const halfPoolParity = (kvDtype: "f16" | "bf16", tol: number) =>
+      Effect.gen(function* () {
+        const model = yield* makeGpt()
+        const params = yield* Tensor.compute(yield* model.init)
+        const program = yield* Model.inference(model, params, { maxTokens: 64, blockSize: 4, kvDtype })
+        const prompt = [1, 5, 3, 8, 2]
+        const trajectory = [4, 9, 0, 7, 6]
+        const seq = yield* program.sequence()
+        const context = [...prompt]
+        let logits = yield* seq.prefill(yield* ids(prompt))
+        const check = (actual: Tensor.Any, ctx: ReadonlyArray<number>) =>
+          Effect.gen(function* () {
+            const input = yield* ids(ctx.slice(-BLOCK))
+            const output = yield* model.forward(params, input)
+            const t = input.shape[1]
+            const [expected] = yield* Tensor.compute([
+              yield* Tensor.reshape(
+                yield* Tensor.slice(output, { start: [0, t - 1, 0], end: [1, t, VOCAB] }),
+                [VOCAB]
+              )
+            ])
+            const got = yield* Tensor.toNumberArray(actual)
+            const want = yield* Tensor.toNumberArray(expected)
+            for (let i = 0; i < VOCAB; i++) {
+              expect(Math.abs(got[i]! - want[i]!)).toBeLessThan(tol)
+            }
+          })
+        yield* check(logits, context)
+        for (const next of trajectory) {
+          context.push(next)
+          logits = yield* seq.step(yield* ids([next]))
+          yield* check(logits, context)
+        }
+      })
+
+    it.effect("f16 pool: teacher-forced logits track the f32 reference", () => halfPoolParity("f16", 2e-2))
+
+    it.effect("bf16 pool: teacher-forced logits track the f32 reference", () => halfPoolParity("bf16", 6e-2))
+
+    it.effect("f16 pool: prefix cache and sliding window still hold", () =>
+      Effect.gen(function* () {
+        const model = yield* makeRopeGpt
+        const params = yield* Tensor.compute(yield* model.init)
+        const prompt = [1, 3, 5, 7, 9, 11, 2, 4]
+        const program = yield* Model.inference(model, params, {
+          maxTokens: 32,
+          blockSize: 4,
+          attentionWindow: 8,
+          kvDtype: "f16"
+        })
+        // A resident prefix is shared in the half-precision pool too:
+        // two independent 2-block prompts would need 4 of 8 blocks plus
+        // B's private suffix block — fits either way, so assert exact
+        // equality of the shared computation instead.
+        const seqA = yield* program.sequence()
+        const logitsA = yield* seqA.prefill(yield* ids(prompt))
+        const seqB = yield* program.sequence()
+        const logitsB = yield* seqB.prefill(yield* ids(prompt))
+        deep(yield* Tensor.toNumberArray(logitsB), yield* Tensor.toNumberArray(logitsA))
+        // And windowed generation past eviction stays close to the
+        // window-relative f32 recompute.
+        const context = [...prompt]
+        let logits = logitsA
+        for (let i = 0; i < 6; i++) {
+          const next = yield* argmaxOf(logits)
+          context.push(next)
+          logits = yield* seqA.step(yield* ids([next]))
+          const input = yield* ids(context.slice(-8))
+          const output = yield* model.forward(params, input)
+          const t = input.shape[1]
+          const [expected] = yield* Tensor.compute([
+            yield* Tensor.reshape(
+              yield* Tensor.slice(output, { start: [0, t - 1, 0], end: [1, t, VOCAB] }),
+              [VOCAB]
+            )
+          ])
+          const got = yield* Tensor.toNumberArray(logits)
+          const want = yield* Tensor.toNumberArray(expected)
+          for (let j = 0; j < VOCAB; j++) {
+            expect(Math.abs(got[j]! - want[j]!)).toBeLessThan(2e-2)
+          }
+        }
+      })
+    )
+
     it.effect("rejects a model without cacheable attention at construction", () =>
       Effect.gen(function* () {
         const model = yield* Model.chain(

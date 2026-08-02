@@ -1151,6 +1151,10 @@ export class InferenceError extends Data.TaggedError("InferenceError")<{
  * compute positions too: with a learned position table the chunk must
  * not exceed `maxPositions`. `tokenDtype` is the id dtype of
  * prefill/step inputs (default `"u32"`, the tokenizer's output).
+ * `kvDtype` is the pool slabs' element type (default `"f32"`): `"f16"`
+ * or `"bf16"` halve cache memory (doubling token capacity per byte) —
+ * rows are quantized on write and widened on read, attention always
+ * computes in f32 (RFC 0012).
  *
  * @since 0.1.0
  * @category compilation
@@ -1161,6 +1165,7 @@ export interface InferenceConfig {
   readonly attentionWindow?: number
   readonly prefillChunk?: number
   readonly tokenDtype?: "u32" | "i64"
+  readonly kvDtype?: "f32" | "f16" | "bf16"
 }
 
 /**
@@ -1305,7 +1310,8 @@ export const inference = (
       prefillProgram.headDim,
       config.maxTokens,
       blockSize,
-      device
+      device,
+      config.kvDtype ?? "f32"
     ).pipe(Effect.mapError((error) => new InferenceError({ op: "inference", message: error.message })))
     const self: InferenceProgram = {
       sequence: () =>

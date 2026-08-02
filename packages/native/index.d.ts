@@ -101,7 +101,7 @@ export declare class LazyTensor {
 }
 
 export declare class NativeKvPool {
-  constructor(layers: number, kvHeads: number, headDim: number, maxTokens: number, blockSize?: number | undefined | null, device?: string | undefined | null)
+  constructor(layers: number, kvHeads: number, headDim: number, maxTokens: number, blockSize?: number | undefined | null, device?: string | undefined | null, dtype?: NativeDType | undefined | null)
   get capacity(): number
   get freeBlocks(): number
   get cachedBlocks(): number
@@ -159,7 +159,8 @@ export declare const enum NativeDType {
   I64 = 'i64',
   U8 = 'u8',
   U32 = 'u32',
-  F16 = 'f16'
+  F16 = 'f16',
+  BF16 = 'bf16'
 }
 
 export interface NativePadding {
