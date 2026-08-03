@@ -1,17 +1,37 @@
 # RFC 0015 Phase 0: Backend Op Surface Inventory
 
-- **Status**: Phase 1 (CPU) complete except KvAttention; Phase 2 (Metal) not started
+- **Status**: Phase 1 (CPU) complete; Phase 2 (Metal) ~95% — all training-critical paths native; boundary flip (phase 3) not started
 - **Source**: `NodeKind` in `packages/native/src/lib.rs:808` (85 variants)
-- **Date**: 2026-08-03 (updated after phase 1)
+- **Date**: 2026-08-03 (updated after phase 2 bulk)
 
-Phase 1 landed: `runtime/` (dtype, layout, cpu, ops, reduce, matmul,
-indexing, random, linalg, conv, composed) + `bridge.rs`; every CPU
-eval arm computes natively. **KvAttention CPU stays composed via
-candle deliberately**: the kv pool slabs are shared cross-device
-storage (the Metal paged kernels read them as candle Metal buffers),
-so the pool flips with the Metal device work in phase 2/3, not here.
-Optimizer steps: fused path (fusion interpreter, native) covers
-f32/f64; f16/bf16 CPU uses native composed twins.
+## Landed
+
+- `runtime/`: dtype, layout, cpu/ (tensor, ops, reduce, matmul,
+  indexing, linalg, conv, composed, pool, random), metal/ (device,
+  emit, run, gemm, kernels, indexing).
+- **CPU: every eval arm computes natively**, including kv attention
+  (first-party mutable pool slabs).
+- **Metal: all training-critical paths native** — fusion emitter
+  (ug deleted entirely, dependency + fork patches gone), gemm with
+  bias epilogue (fork's call_mlx_gemm_bias dead), flash fwd/bwd, CE
+  fwd/bwd, LayerNorm fwd/bwd, rotary, paged scatter/decode + native
+  Metal pool slabs, indexing, cast, creation, seeded random,
+  unfused elementwise/comparisons/where/reduces/views via the
+  emitter.
+- The candle boundary is now transport-only: zero-copy MTLBuffer
+  wraps (bridge::metal) + CPU tensor conversions (bridge). Every
+  crossing carries a boundary sync that dies with the boundary.
+
+## Remaining before deletion
+
+- Metal stragglers on candle: argmax/argmin, cumsum, prod, conv
+  (compose or kernel them); Slice's strided-index_select path is
+  native but narrow() views remain candle-shaped (free, no compute).
+- Phase 3 — the Value flip: eval produces Cpu/Metal native tensors
+  directly (arm-level bridge calls collapse), Leaf/NativeTensor/napi
+  flip, batch_linalg and composed fallbacks' last candle calls, then
+  delete candle-core/candle-metal-kernels + the fork rev pins.
+- Phase 4 — CUDA (later).
 
 Every op the evaluator can dispatch, its current dispatch path, and
 what the native backend must provide. Layout notes cover only what the
