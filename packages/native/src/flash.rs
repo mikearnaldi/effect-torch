@@ -32,14 +32,25 @@ pub fn backward_supported(q: &Tensor, v: &Tensor) -> bool {
 #[cfg(target_os = "macos")]
 mod metal {
     use super::{THREADS, TILE_K, TILE_Q};
-    use candle_core::{DType, MetalStorage, Storage, Tensor};
-    use candle_metal_kernels::metal::ComputePipeline;
-    use std::collections::HashMap;
-    use std::sync::{Mutex, OnceLock};
+    use crate::bridge;
+    use crate::runtime::metal::device::{set_buffer, MetalDevice, Pipeline};
+    use crate::runtime::metal::run::MetalTensor;
+    use candle_core::{DType, Tensor};
+    use objc2_metal::MTLComputeCommandEncoder;
+    use std::sync::Arc;
 
-    fn pipelines() -> &'static Mutex<HashMap<u64, ComputePipeline>> {
-        static CACHE: OnceLock<Mutex<HashMap<u64, ComputePipeline>>> = OnceLock::new();
-        CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+    fn wrap_contig(t: &Tensor) -> candle_core::Result<MetalTensor> {
+        let w = bridge::metal::wrap(t)?;
+        if w.layout.is_contiguous() {
+            Ok(w)
+        } else {
+            crate::runtime::metal::kernels::strided_copy(MetalDevice::get(), &w)
+                .map_err(candle_core::Error::Msg)
+        }
+    }
+
+    fn alloc_f32(n: usize) -> Arc<crate::runtime::metal::device::Buffer> {
+        MetalDevice::get().alloc(n.max(1), crate::runtime::dtype::DType::F32)
     }
 
     // The forward kernel: one threadgroup per (query tile, batch*head).
@@ -178,57 +189,24 @@ kernel void et_sdpa_fwd(
     }
 
     fn pipeline(
-        mdev: &candle_core::MetalDevice,
+        _mdev: &candle_core::MetalDevice,
         t: usize,
         s: usize,
         d: usize,
         dv: usize,
         scale: f64,
         causal: bool,
-    ) -> candle_core::Result<ComputePipeline> {
+    ) -> candle_core::Result<Pipeline> {
         use std::collections::hash_map::DefaultHasher;
         use std::hash::{Hash, Hasher};
 
         let mut hasher = DefaultHasher::new();
         (t, s, d, dv, scale.to_bits(), causal).hash(&mut hasher);
         let key = hasher.finish();
-        let mut cache = pipelines().lock().unwrap();
-        if let Some(p) = cache.get(&key) {
-            return Ok(p.clone());
-        }
         let src = kernel_source(t, s, d, dv, scale, causal);
-        #[allow(deprecated)]
-        let opts = {
-            let o = objc2_metal::MTLCompileOptions::new();
-            o.setFastMathEnabled(false);
-            o
-        };
-        let lib = mdev
-            .device()
-            .new_library_with_source(&src, Some(&opts))
-            .map_err(|e| candle_core::Error::Msg(format!("sdpa flash: {e}")))?;
-        let func = lib
-            .get_function("et_sdpa_fwd", None)
-            .map_err(|e| candle_core::Error::Msg(format!("sdpa flash: {e}")))?;
-        let p = mdev
-            .device()
-            .new_compute_pipeline_state_with_function(&func)
-            .map_err(|e| candle_core::Error::Msg(format!("sdpa flash: {e}")))?;
-        if std::env::var_os("EFFECT_TORCH_FUSION_DEBUG").is_some() {
-            eprintln!("[sdpa] compiled flash kernel #{} (key {key:x})", cache.len() + 1);
-        }
-        cache.insert(key, p.clone());
-        Ok(p)
-    }
-
-    fn buffer_of(t: &Tensor) -> candle_core::Result<(candle_metal_kernels::metal::Buffer, usize)> {
-        let (storage, layout) = t.storage_and_layout();
-        match &*storage {
-            Storage::Metal(m) => Ok((m.buffer().clone(), layout.start_offset())),
-            _ => Err(candle_core::Error::Msg(
-                "sdpa flash: expected Metal storage".to_string(),
-            )),
-        }
+        MetalDevice::get()
+            .compile(key, &src, "et_sdpa_fwd")
+            .map_err(candle_core::Error::Msg)
     }
 
     pub fn forward(
@@ -246,49 +224,38 @@ kernel void et_sdpa_fwd(
         let l_shape: Vec<usize> = q.dims()[..rank - 1].to_vec();
         let device = q.device();
         let mdev = device.as_metal_device()?;
+        device.synchronize()?;
         // Flatten leading dims: [BH, T, D] — free on contiguous tensors.
-        let q = q.reshape((bh, t, d))?.contiguous()?;
-        let k = k.reshape((bh, s, d))?.contiguous()?;
-        let v = v.reshape((bh, s, dv))?.contiguous()?;
+        let q = wrap_contig(&q.reshape((bh, t, d))?)?;
+        let k = wrap_contig(&k.reshape((bh, s, d))?)?;
+        let v = wrap_contig(&v.reshape((bh, s, dv))?)?;
         let pipe = pipeline(mdev, t, s, d, dv, scale, causal)?;
-        let o_buf = mdev.new_buffer(bh * t * dv, DType::F32, "sdpa_o")?;
-        let l_buf = mdev.new_buffer(bh * t, DType::F32, "sdpa_l")?;
-        let encoder = mdev.command_encoder()?;
-        let encoder = encoder.as_ref();
-        encoder.set_compute_pipeline_state(&pipe);
+        let o_buf = alloc_f32(bh * t * dv);
+        let l_buf = alloc_f32(bh * t);
         let byte_offset = |off: usize| off * DType::F32.size_in_bytes();
-        let (qb, qo) = buffer_of(&q)?;
-        let (kb, ko) = buffer_of(&k)?;
-        let (vb, vo) = buffer_of(&v)?;
-        encoder.set_input_buffer(0, Some(&qb), byte_offset(qo));
-        encoder.set_input_buffer(1, Some(&kb), byte_offset(ko));
-        encoder.set_input_buffer(2, Some(&vb), byte_offset(vo));
-        encoder.set_output_buffer(3, Some(&o_buf), 0);
-        encoder.set_output_buffer(4, Some(&l_buf), 0);
-        let q_tiles = t.div_ceil(TILE_Q);
-        encoder.dispatch_thread_groups(
-            objc2_metal::MTLSize {
-                width: q_tiles,
-                height: bh,
-                depth: 1,
-            },
-            objc2_metal::MTLSize {
-                width: THREADS,
-                height: 1,
-                depth: 1,
-            },
-        );
-        // no end_encoding: candle's Commands owns the encoder lifecycle
-        let mk = |buf, n, shape: Vec<usize>| {
-            Tensor::from_storage(
-                Storage::Metal(MetalStorage::new(buf, mdev.clone(), n, DType::F32)),
-                shape,
-                candle_core::op::BackpropOp::none(),
-                false,
-            )
-        };
-        let o = mk(o_buf, bh * t * dv, vec![bh, t, dv]).reshape(out_shape)?;
-        let l = mk(l_buf, bh * t, vec![bh, t]).reshape(l_shape)?;
+        MetalDevice::get().with_encoder(|e| {
+            e.setComputePipelineState(pipe.as_raw());
+            set_buffer(e, 0, &q.buffer, byte_offset(q.layout.offset()));
+            set_buffer(e, 1, &k.buffer, byte_offset(k.layout.offset()));
+            set_buffer(e, 2, &v.buffer, byte_offset(v.layout.offset()));
+            set_buffer(e, 3, &o_buf, 0);
+            set_buffer(e, 4, &l_buf, 0);
+            e.dispatchThreadgroups_threadsPerThreadgroup(
+                objc2_metal::MTLSize {
+                    width: t.div_ceil(TILE_Q),
+                    height: bh,
+                    depth: 1,
+                },
+                objc2_metal::MTLSize {
+                    width: THREADS,
+                    height: 1,
+                    depth: 1,
+                },
+            );
+        });
+        MetalDevice::get().synchronize();
+        let o = bridge::metal::unwrap(&o_buf, vec![bh, t, dv], DType::F32, mdev)?.reshape(out_shape)?;
+        let l = bridge::metal::unwrap(&l_buf, vec![bh, t], DType::F32, mdev)?.reshape(l_shape)?;
         Ok((o, l))
     }
     // The fused backward: two kernels, no atomics. Pass A (key-tiled)
@@ -534,7 +501,7 @@ kernel void et_sdpa_bwd_q(
     }
 
     fn bwd_pipeline(
-        mdev: &candle_core::MetalDevice,
+        _mdev: &candle_core::MetalDevice,
         name: &'static str,
         t: usize,
         s: usize,
@@ -542,37 +509,17 @@ kernel void et_sdpa_bwd_q(
         dv: usize,
         scale: f64,
         causal: bool,
-    ) -> candle_core::Result<ComputePipeline> {
+    ) -> candle_core::Result<Pipeline> {
         use std::collections::hash_map::DefaultHasher;
         use std::hash::{Hash, Hasher};
 
         let mut hasher = DefaultHasher::new();
         (name, t, s, d, dv, scale.to_bits(), causal).hash(&mut hasher);
         let key = hasher.finish();
-        let mut cache = pipelines().lock().unwrap();
-        if let Some(p) = cache.get(&key) {
-            return Ok(p.clone());
-        }
         let src = bwd_source(t, s, d, dv, scale, causal);
-        #[allow(deprecated)]
-        let opts = {
-            let o = objc2_metal::MTLCompileOptions::new();
-            o.setFastMathEnabled(false);
-            o
-        };
-        let lib = mdev
-            .device()
-            .new_library_with_source(&src, Some(&opts))
-            .map_err(|e| candle_core::Error::Msg(format!("sdpa flash backward: {e}")))?;
-        let func = lib
-            .get_function(name, None)
-            .map_err(|e| candle_core::Error::Msg(format!("sdpa flash backward: {e}")))?;
-        let p = mdev
-            .device()
-            .new_compute_pipeline_state_with_function(&func)
-            .map_err(|e| candle_core::Error::Msg(format!("sdpa flash backward: {e}")))?;
-        cache.insert(key, p.clone());
-        Ok(p)
+        MetalDevice::get()
+            .compile(key, &src, name)
+            .map_err(candle_core::Error::Msg)
     }
 
     // The fused backward: d_vec via candle (one small op), then two
@@ -594,91 +541,80 @@ kernel void et_sdpa_bwd_q(
         let (q_shape, k_shape, v_shape) = (q.dims().to_vec(), k.dims().to_vec(), v.dims().to_vec());
         let device = q.device();
         let mdev = device.as_metal_device()?;
-        let q = q.reshape((bh, t, d))?.contiguous()?;
-        let k = k.reshape((bh, s, d))?.contiguous()?;
-        let v = v.reshape((bh, s, dv))?.contiguous()?;
-        let o = o.reshape((bh, t, dv))?.contiguous()?;
-        let g = g.reshape((bh, t, dv))?.contiguous()?;
-        let l = l.reshape(bh * t)?.contiguous()?;
-        let d_vec = ((&g * &o)?.sum(candle_core::D::Minus1)?).contiguous()?;
-        let dq_buf = mdev.new_buffer(bh * t * d, DType::F32, "sdpa_dq")?;
-        let dk_buf = mdev.new_buffer(bh * s * d, DType::F32, "sdpa_dk")?;
-        let dv_buf = mdev.new_buffer(bh * s * dv, DType::F32, "sdpa_dv")?;
+        let qr = q.reshape((bh, t, d))?;
+        let kr = k.reshape((bh, s, d))?;
+        let vr = v.reshape((bh, s, dv))?;
+        let or_ = o.reshape((bh, t, dv))?;
+        let gr = g.reshape((bh, t, dv))?;
+        // d_vec = rowsum(g ∘ o): one small op through the migrated arms.
+        let d_vec = (&gr * &or_)?.sum(candle_core::D::Minus1)?;
+        device.synchronize()?;
+        let q = wrap_contig(&qr)?;
+        let k = wrap_contig(&kr)?;
+        let v = wrap_contig(&vr)?;
+        let o = wrap_contig(&or_)?;
+        let g = wrap_contig(&gr)?;
+        let l = wrap_contig(&l.reshape(bh * t)?)?;
+        let d_vec = wrap_contig(&d_vec)?;
+        let dq_buf = alloc_f32(bh * t * d);
+        let dk_buf = alloc_f32(bh * s * d);
+        let dv_buf = alloc_f32(bh * s * dv);
         let off = |o: usize| o * DType::F32.size_in_bytes();
         {
             let pipe = bwd_pipeline(mdev, "et_sdpa_bwd_kv", t, s, d, dv, scale, causal)?;
-            let encoder = mdev.command_encoder()?;
-            let encoder = encoder.as_ref();
-            encoder.set_compute_pipeline_state(&pipe);
-            let (qb, qo) = buffer_of(&q)?;
-            let (kb, ko) = buffer_of(&k)?;
-            let (vb, vo) = buffer_of(&v)?;
-            let (gb, go) = buffer_of(&g)?;
-            let (lb, lo) = buffer_of(&l)?;
-            let (db, do_) = buffer_of(&d_vec)?;
-            encoder.set_input_buffer(0, Some(&qb), off(qo));
-            encoder.set_input_buffer(1, Some(&kb), off(ko));
-            encoder.set_input_buffer(2, Some(&vb), off(vo));
-            encoder.set_input_buffer(3, Some(&gb), off(go));
-            encoder.set_input_buffer(4, Some(&lb), off(lo));
-            encoder.set_input_buffer(5, Some(&db), off(do_));
-            encoder.set_output_buffer(6, Some(&dk_buf), 0);
-            encoder.set_output_buffer(7, Some(&dv_buf), 0);
-            encoder.dispatch_thread_groups(
-                objc2_metal::MTLSize {
-                    width: s.div_ceil(TILE_K),
-                    height: bh,
-                    depth: 1,
-                },
-                objc2_metal::MTLSize {
-                    width: THREADS,
-                    height: 1,
-                    depth: 1,
-                },
-            );
+            MetalDevice::get().with_encoder(|e| {
+                e.setComputePipelineState(pipe.as_raw());
+                set_buffer(e, 0, &q.buffer, off(q.layout.offset()));
+                set_buffer(e, 1, &k.buffer, off(k.layout.offset()));
+                set_buffer(e, 2, &v.buffer, off(v.layout.offset()));
+                set_buffer(e, 3, &g.buffer, off(g.layout.offset()));
+                set_buffer(e, 4, &l.buffer, off(l.layout.offset()));
+                set_buffer(e, 5, &d_vec.buffer, off(d_vec.layout.offset()));
+                set_buffer(e, 6, &dk_buf, 0);
+                set_buffer(e, 7, &dv_buf, 0);
+                e.dispatchThreadgroups_threadsPerThreadgroup(
+                    objc2_metal::MTLSize {
+                        width: s.div_ceil(TILE_K),
+                        height: bh,
+                        depth: 1,
+                    },
+                    objc2_metal::MTLSize {
+                        width: THREADS,
+                        height: 1,
+                        depth: 1,
+                    },
+                );
+            });
         }
         {
             let pipe = bwd_pipeline(mdev, "et_sdpa_bwd_q", t, s, d, dv, scale, causal)?;
-            let encoder = mdev.command_encoder()?;
-            let encoder = encoder.as_ref();
-            encoder.set_compute_pipeline_state(&pipe);
-            let (qb, qo) = buffer_of(&q)?;
-            let (kb, ko) = buffer_of(&k)?;
-            let (vb, vo) = buffer_of(&v)?;
-            let (gb, go) = buffer_of(&g)?;
-            let (lb, lo) = buffer_of(&l)?;
-            let (db, do_) = buffer_of(&d_vec)?;
-            encoder.set_input_buffer(0, Some(&qb), off(qo));
-            encoder.set_input_buffer(1, Some(&kb), off(ko));
-            encoder.set_input_buffer(2, Some(&vb), off(vo));
-            encoder.set_input_buffer(3, Some(&gb), off(go));
-            encoder.set_input_buffer(4, Some(&lb), off(lo));
-            encoder.set_input_buffer(5, Some(&db), off(do_));
-            encoder.set_output_buffer(6, Some(&dq_buf), 0);
-            encoder.dispatch_thread_groups(
-                objc2_metal::MTLSize {
-                    width: t.div_ceil(TILE_Q),
-                    height: bh,
-                    depth: 1,
-                },
-                objc2_metal::MTLSize {
-                    width: THREADS,
-                    height: 1,
-                    depth: 1,
-                },
-            );
+            MetalDevice::get().with_encoder(|e| {
+                e.setComputePipelineState(pipe.as_raw());
+                set_buffer(e, 0, &q.buffer, off(q.layout.offset()));
+                set_buffer(e, 1, &k.buffer, off(k.layout.offset()));
+                set_buffer(e, 2, &v.buffer, off(v.layout.offset()));
+                set_buffer(e, 3, &g.buffer, off(g.layout.offset()));
+                set_buffer(e, 4, &l.buffer, off(l.layout.offset()));
+                set_buffer(e, 5, &d_vec.buffer, off(d_vec.layout.offset()));
+                set_buffer(e, 6, &dq_buf, 0);
+                e.dispatchThreadgroups_threadsPerThreadgroup(
+                    objc2_metal::MTLSize {
+                        width: t.div_ceil(TILE_Q),
+                        height: bh,
+                        depth: 1,
+                    },
+                    objc2_metal::MTLSize {
+                        width: THREADS,
+                        height: 1,
+                        depth: 1,
+                    },
+                );
+            });
         }
-        let mk = |buf, n, shape: Vec<usize>| {
-            Tensor::from_storage(
-                Storage::Metal(MetalStorage::new(buf, mdev.clone(), n, DType::F32)),
-                shape,
-                candle_core::op::BackpropOp::none(),
-                false,
-            )
-        };
-        let dq = mk(dq_buf, bh * t * d, vec![bh, t, d]).reshape(q_shape)?;
-        let dk = mk(dk_buf, bh * s * d, vec![bh, s, d]).reshape(k_shape)?;
-        let dv = mk(dv_buf, bh * s * dv, vec![bh, s, dv]).reshape(v_shape)?;
+        MetalDevice::get().synchronize();
+        let dq = bridge::metal::unwrap(&dq_buf, vec![bh, t, d], DType::F32, mdev)?.reshape(q_shape)?;
+        let dk = bridge::metal::unwrap(&dk_buf, vec![bh, s, d], DType::F32, mdev)?.reshape(k_shape)?;
+        let dv = bridge::metal::unwrap(&dv_buf, vec![bh, s, dv], DType::F32, mdev)?.reshape(v_shape)?;
         Ok((dq, dk, dv))
     }
 }
