@@ -314,4 +314,29 @@ mod tests {
         let b = dev.alloc(64, DType::F32);
         assert_eq!(ptr1, b.contents_ptr() as usize);
     }
+
+    const ZSRC: &str = r#"
+        #include <metal_stdlib>
+        using namespace metal;
+        kernel void zprobe(device float* out [[buffer(0)]], uint3 tgid [[threadgroup_position_in_grid]]) {
+            out[tgid.z] = (float)tgid.z + 1.0f;
+        }
+    "#;
+
+    #[test]
+    fn z_dispatch() {
+        let dev = MetalDevice::get();
+        let out = dev.alloc(4, DType::F32);
+        let pipeline = dev.compile(0x2222, ZSRC, "zprobe").unwrap();
+        dev.with_encoder(|e| {
+            e.setComputePipelineState(pipeline.as_raw());
+            set_buffer(e, 0, &out, 0);
+            e.dispatchThreadgroups_threadsPerThreadgroup(
+                MetalDevice::grid(1, 1, 4),
+                MetalDevice::grid(32, 1, 1),
+            );
+        });
+        dev.synchronize();
+        assert_eq!(out.read_f32(0, 4), vec![1.0, 2.0, 3.0, 4.0]);
+    }
 }
