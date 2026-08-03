@@ -45,6 +45,7 @@ pub trait Elem: Copy + Default + 'static {
     fn dtype() -> DType;
     fn to_f64(self) -> f64;
     fn from_f64(x: f64) -> Self;
+    fn slice_of(t: &Tensor) -> Option<&[Self]>;
 }
 
 macro_rules! impl_elem {
@@ -65,6 +66,14 @@ macro_rules! impl_elem {
                 #[allow(clippy::redundant_closure_call)]
                 let f: fn(f64) -> $t = $from;
                 f(x)
+            }
+            fn slice_of(t: &Tensor) -> Option<&[Self]> {
+                let CpuBuffer::$variant(v) = &t.buffer else { return None };
+                if !t.layout.is_contiguous() {
+                    return None;
+                }
+                let start = t.layout.offset();
+                Some(&v[start..start + t.numel()])
             }
         }
     };

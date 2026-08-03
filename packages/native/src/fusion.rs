@@ -459,41 +459,14 @@ fn cpu_input_slices<'a, T: candle_core::WithDType>(
         .collect()
 }
 
-fn interpret_cpu<T: candle_core::WithDType + Scalar>(
+fn interpret_core<T: Scalar>(
     exprs: &[Expr],
-    inputs: &[Tensor],
+    slices: &[&[T]],
     strides: Option<&[Vec<usize>]>,
-    scalars: &[Tensor],
+    scalar_values: &[T],
     n: usize,
     shape: &[usize],
-) -> candle_core::Result<Vec<Tensor>> {
-    let guards = cpu_input_slices::<T>(inputs)?;
-    let mut slices: Vec<&[T]> = Vec::with_capacity(guards.len());
-    for ((storage, offset), input) in guards.iter().zip(inputs.iter()) {
-        let cpu = match &**storage {
-            Storage::Cpu(cpu) => cpu,
-            _ => {
-                return Err(candle_core::Error::Msg(
-                    "fusion: expected CPU storage".to_string(),
-                ))
-            }
-        };
-        let data = cpu.as_slice::<T>()?;
-        slices.push(&data[*offset..*offset + input.elem_count()]);
-    }
-    let scalar_guards = cpu_input_slices::<T>(scalars)?;
-    let mut scalar_values: Vec<T> = Vec::with_capacity(scalar_guards.len());
-    for (storage, offset) in &scalar_guards {
-        let cpu = match &**storage {
-            Storage::Cpu(cpu) => cpu,
-            _ => {
-                return Err(candle_core::Error::Msg(
-                    "fusion: expected CPU storage".to_string(),
-                ))
-            }
-        };
-        scalar_values.push(cpu.as_slice::<T>()?[*offset]);
-    }
+) -> Vec<Vec<T>> {
     let contig = contiguous_strides(shape);
     let strided = match strides {
         Some(ss) if ss.iter().any(|s| s != &contig) => Some(ss),
@@ -507,7 +480,7 @@ fn interpret_cpu<T: candle_core::WithDType + Scalar>(
         None => {
             for i in 0..n {
                 for (out, expr) in outs.iter_mut().zip(exprs.iter()) {
-                    out[i] = eval_at(expr, i, &slices, &scalar_values);
+                    out[i] = eval_at(expr, i, slices, scalar_values);
                 }
             }
         }
@@ -516,14 +489,14 @@ fn interpret_cpu<T: candle_core::WithDType + Scalar>(
         Some(ss) => {
             let rank = shape.len();
             let mut coord = vec![0usize; rank];
-            let mut offs = vec![0usize; inputs.len()];
-            let mut lane_vals = vec![<T as Scalar>::from_f64(0.0); inputs.len()];
+            let mut offs = vec![0usize; slices.len()];
+            let mut lane_vals = vec![<T as Scalar>::from_f64(0.0); slices.len()];
             for i in 0..n {
                 for (v, (slice, off)) in lane_vals.iter_mut().zip(slices.iter().zip(offs.iter())) {
                     *v = slice[*off];
                 }
                 for (out, expr) in outs.iter_mut().zip(exprs.iter()) {
-                    out[i] = eval(expr, &|k| lane_vals[k as usize], &scalar_values);
+                    out[i] = eval(expr, &|k| lane_vals[k as usize], scalar_values);
                 }
                 for d in (0..rank).rev() {
                     coord[d] += 1;
@@ -541,41 +514,20 @@ fn interpret_cpu<T: candle_core::WithDType + Scalar>(
             }
         }
     }
-    outs.into_iter()
-        .map(|out| Tensor::from_vec(out, shape, &Device::Cpu))
-        .collect()
+    outs
 }
 
-// The fused-reduce interpreter: one pass over the input with an odometer
-// walk, evaluating the expression once per input element and folding into
-// the accumulator of its output element. Lane offsets and the output
-// offset are maintained incrementally, so reduced dims (output stride 0)
-// and broadcast lanes (lane stride 0) cost nothing.
 #[allow(clippy::too_many_arguments)]
-fn interpret_reduce_cpu<T: candle_core::WithDType + Scalar>(
+fn interpret_reduce_core<T: Scalar>(
     op: ReduceOp,
     expr: &Expr,
-    inputs: &[Tensor],
+    slices: &[&[T]],
     strides: &[Vec<usize>],
     in_shape: &[usize],
     dims: &[usize],
     keepdims: bool,
     out_shape: &[usize],
-) -> candle_core::Result<Tensor> {
-    let guards = cpu_input_slices::<T>(inputs)?;
-    let mut slices: Vec<&[T]> = Vec::with_capacity(guards.len());
-    for ((storage, offset), input) in guards.iter().zip(inputs.iter()) {
-        let cpu = match &**storage {
-            Storage::Cpu(cpu) => cpu,
-            _ => {
-                return Err(candle_core::Error::Msg(
-                    "fusion: expected CPU storage".to_string(),
-                ))
-            }
-        };
-        let data = cpu.as_slice::<T>()?;
-        slices.push(&data[*offset..*offset + input.elem_count()]);
-    }
+) -> Vec<T> {
     let in_n: usize = in_shape.iter().product();
     let out_n: usize = out_shape.iter().product();
     // Output strides in input-dim space: reduced dims get stride 0;
@@ -596,8 +548,8 @@ fn interpret_reduce_cpu<T: candle_core::WithDType + Scalar>(
     let init = <T as Scalar>::from_f64(op.init());
     let mut acc = vec![init; out_n];
     let mut coord = vec![0usize; rank];
-    let mut offs = vec![0usize; inputs.len()];
-    let mut lane_vals = vec![init; inputs.len()];
+    let mut offs = vec![0usize; slices.len()];
+    let mut lane_vals = vec![init; slices.len()];
     let mut out_off = 0usize;
     for _ in 0..in_n {
         for (v, (slice, off)) in lane_vals.iter_mut().zip(slices.iter().zip(offs.iter())) {
@@ -628,9 +580,8 @@ fn interpret_reduce_cpu<T: candle_core::WithDType + Scalar>(
             *a = Scalar::div(*a, e);
         }
     }
-    Tensor::from_vec(acc, out_shape, &Device::Cpu)
+    acc
 }
-
 #[cfg(any(target_os = "macos", feature = "cuda"))]
 fn f32_cst(v: f32) -> candle_core::Result<ug::Const> {
     v.try_into()
@@ -1515,8 +1466,8 @@ pub fn run(
         }
     };
     match (device, dtype) {
-        (Device::Cpu, DType::F32) => interpret_cpu::<f32>(exprs, inputs, strides, scalars, n, shape),
-        (Device::Cpu, DType::F64) => interpret_cpu::<f64>(exprs, inputs, strides, scalars, n, shape),
+        (Device::Cpu, DType::F32) => cpu_bridge_elementwise::<f32>(exprs, inputs, strides, scalars, n, shape),
+        (Device::Cpu, DType::F64) => cpu_bridge_elementwise::<f64>(exprs, inputs, strides, scalars, n, shape),
         #[cfg(target_os = "macos")]
         (Device::Metal(_), DType::F32) => {
             metal::run(exprs, inputs, lane_strides, scalars, n, shape, device)
@@ -1525,6 +1476,71 @@ pub fn run(
             "fusion: unsupported device/dtype {device:?} {dtype:?}"
         ))),
     }
+}
+
+fn cpu_bridge_elementwise<T: Scalar + crate::runtime::cpu::Elem>(
+    exprs: &[Expr],
+    inputs: &[Tensor],
+    strides: Option<&[Vec<usize>]>,
+    scalars: &[Tensor],
+    n: usize,
+    shape: &[usize],
+) -> candle_core::Result<Vec<Tensor>> {
+    let native_inputs: Vec<crate::runtime::cpu::Tensor> = inputs
+        .iter()
+        .map(crate::bridge::from_candle)
+        .collect::<candle_core::Result<_>>()?;
+    let native_scalars: Vec<crate::runtime::cpu::Tensor> = scalars
+        .iter()
+        .map(crate::bridge::from_candle)
+        .collect::<candle_core::Result<_>>()?;
+    let mut slices: Vec<&[T]> = Vec::with_capacity(native_inputs.len());
+    for t in &native_inputs {
+        slices.push(native_slice::<T>(t)?);
+    }
+    let mut scalar_values: Vec<T> = Vec::with_capacity(native_scalars.len());
+    for t in &native_scalars {
+        scalar_values.push(native_slice::<T>(t)?[0]);
+    }
+    let outs = interpret_core::<T>(exprs, &slices, strides, &scalar_values, n, shape);
+    outs.into_iter()
+        .map(|out| {
+            let t = crate::runtime::cpu::Tensor::from_vec(out, shape.to_vec());
+            crate::bridge::to_candle(&t)
+        })
+        .collect()
+}
+
+fn native_slice<'a, T: crate::runtime::cpu::Elem>(t: &'a crate::runtime::cpu::Tensor) -> candle_core::Result<&'a [T]> {
+    T::slice_of(t).ok_or_else(|| {
+        candle_core::Error::Msg(
+            "fusion: native bridge expects contiguous inputs of matching dtype".to_string(),
+        )
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn cpu_bridge_reduce<T: Scalar + crate::runtime::cpu::Elem>(
+    op: ReduceOp,
+    expr: &Expr,
+    inputs: &[Tensor],
+    strides: &[Vec<usize>],
+    in_shape: &[usize],
+    dims: &[usize],
+    keepdims: bool,
+    out_shape: &[usize],
+) -> candle_core::Result<Tensor> {
+    let native_inputs: Vec<crate::runtime::cpu::Tensor> = inputs
+        .iter()
+        .map(crate::bridge::from_candle)
+        .collect::<candle_core::Result<_>>()?;
+    let mut slices: Vec<&[T]> = Vec::with_capacity(native_inputs.len());
+    for t in &native_inputs {
+        slices.push(native_slice::<T>(t)?);
+    }
+    let acc = interpret_reduce_core::<T>(op, expr, &slices, strides, in_shape, dims, keepdims, out_shape);
+    let t = crate::runtime::cpu::Tensor::from_vec(acc, out_shape.to_vec());
+    crate::bridge::to_candle(&t)
 }
 
 /// Evaluates a fused-reduce region: `expr` is computed per input element
@@ -1564,10 +1580,10 @@ pub fn run_reduce(
     }
     match (device, dtype) {
         (Device::Cpu, DType::F32) => {
-            interpret_reduce_cpu::<f32>(op, expr, inputs, strides, in_shape, dims, keepdims, out_shape)
+            cpu_bridge_reduce::<f32>(op, expr, inputs, strides, in_shape, dims, keepdims, out_shape)
         }
         (Device::Cpu, DType::F64) => {
-            interpret_reduce_cpu::<f64>(op, expr, inputs, strides, in_shape, dims, keepdims, out_shape)
+            cpu_bridge_reduce::<f64>(op, expr, inputs, strides, in_shape, dims, keepdims, out_shape)
         }
         #[cfg(target_os = "macos")]
         (Device::Metal(_), DType::F32) => {
