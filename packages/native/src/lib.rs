@@ -4320,6 +4320,11 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> candle_core::Result<Te
                 let r = runtime::cpu::Tensor::zeros(shape, bridge::dtype_to_native(*dtype));
                 return bridge::to_candle(&r);
             }
+            if device.is_metal() {
+                if let Ok(t) = metal_eval::fill(shape, 0.0, bridge::dtype_to_native(*dtype), device) {
+                    return Ok(t);
+                }
+            }
             Tensor::zeros(shape.clone(), *dtype, device)?
         }
         NodeKind::Ones {
@@ -4330,6 +4335,11 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> candle_core::Result<Te
             if device.is_cpu() {
                 let r = runtime::cpu::Tensor::ones(shape, bridge::dtype_to_native(*dtype));
                 return bridge::to_candle(&r);
+            }
+            if device.is_metal() {
+                if let Ok(t) = metal_eval::fill(shape, 1.0, bridge::dtype_to_native(*dtype), device) {
+                    return Ok(t);
+                }
             }
             Tensor::ones(shape.clone(), *dtype, device)?
         }
@@ -4342,6 +4352,11 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> candle_core::Result<Te
             if device.is_cpu() {
                 let r = runtime::cpu::Tensor::full(shape, *value, bridge::dtype_to_native(*dtype));
                 return bridge::to_candle(&r);
+            }
+            if device.is_metal() {
+                if let Ok(t) = metal_eval::fill(shape, *value, bridge::dtype_to_native(*dtype), device) {
+                    return Ok(t);
+                }
             }
             match dtype {
                 DType::F32 => Tensor::full(*value as f32, shape.clone(), device)?,
@@ -4367,6 +4382,14 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> candle_core::Result<Te
                 let r = runtime::cpu::Tensor::randn(shape, bridge::dtype_to_native(*dtype));
                 return bridge::to_candle(&r);
             }
+            if device.is_metal() {
+                static SEED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(299792458);
+                let seed = SEED.fetch_add(1, Ordering::Relaxed);
+                if let Ok(t) = metal_eval::randn(shape, seed, device) {
+                    let t = t.to_dtype(*dtype)?;
+                    return Ok(t);
+                }
+            }
             Tensor::randn(0f32, 1f32, shape.clone(), device)?.to_dtype(*dtype)?
         }
         NodeKind::Uniform {
@@ -4379,6 +4402,14 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> candle_core::Result<Te
             if device.is_cpu() {
                 let r = runtime::cpu::Tensor::uniform(*lo, *hi, shape, bridge::dtype_to_native(*dtype));
                 return bridge::to_candle(&r);
+            }
+            if device.is_metal() {
+                static SEED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(78778899);
+                let seed = SEED.fetch_add(1, Ordering::Relaxed);
+                if let Ok(t) = metal_eval::uniform(*lo, *hi, shape, seed, device) {
+                    let t = t.to_dtype(*dtype)?;
+                    return Ok(t);
+                }
             }
             Tensor::rand(*lo as f32, *hi as f32, shape.clone(), device)?.to_dtype(*dtype)?
         }
@@ -4393,6 +4424,11 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> candle_core::Result<Te
                 let r = runtime::cpu::Tensor::arange(*start, *end, *step, bridge::dtype_to_native(*dtype));
                 return bridge::to_candle(&r);
             }
+            if device.is_metal() {
+                if let Ok(t) = metal_eval::arange(*start, *end, *step, bridge::dtype_to_native(*dtype), device) {
+                    return Ok(t);
+                }
+            }
             let n = ((end - start) / step).ceil().max(0.0) as usize;
             let base = Tensor::arange(0u32, n as u32, device)?;
             let scaled = (base * *step)?;
@@ -4402,6 +4438,11 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> candle_core::Result<Te
             if device.is_cpu() {
                 let r = runtime::cpu::Tensor::eye(*n, bridge::dtype_to_native(*dtype));
                 return bridge::to_candle(&r);
+            }
+            if device.is_metal() {
+                if let Ok(t) = metal_eval::eye(*n, bridge::dtype_to_native(*dtype), device) {
+                    return Ok(t);
+                }
             }
             let i = Tensor::arange(0u32, *n as u32, device)?.reshape((*n, 1))?;
             let j = Tensor::arange(0u32, *n as u32, device)?.reshape((1, *n))?;
@@ -4644,6 +4685,11 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> candle_core::Result<Te
             if a.device().is_cpu() {
                 return bridge::to_candle(&bridge::from_candle(&a)?.relu());
             }
+            if a.device().is_metal() {
+                if let Ok(t) = metal_eval::relu(&a) {
+                    return Ok(t);
+                }
+            }
             a.maximum(&a.zeros_like()?)?
         }
         NodeKind::Erf { a } => {
@@ -4715,6 +4761,11 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> candle_core::Result<Te
                     &bridge::from_candle(&a)?.where_(&bridge::from_candle(&cond)?, &bridge::from_candle(&b)?),
                 );
             }
+            if a.device().is_metal() {
+                if let Ok(t) = metal_eval::where_(&cond, &a, &b) {
+                    return Ok(t);
+                }
+            }
             let shape = cond
                 .shape()
                 .broadcast_shape_binary_op(a.shape(), "where")?
@@ -4766,6 +4817,11 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> candle_core::Result<Te
                 );
                 return bridge::to_candle(&r);
             }
+            if a.device().is_metal() {
+                if let Ok(t) = metal_eval::scatter_add(&a, *dim, &indexes, &src) {
+                    return Ok(t);
+                }
+            }
             a.contiguous()?
                 .scatter_add(&indexes.contiguous()?, &src.contiguous()?, *dim)?
         }
@@ -4776,6 +4832,11 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> candle_core::Result<Te
                 let r = bridge::from_candle(&a)?.gather(*dim, &bridge::from_candle(&indexes)?);
                 return bridge::to_candle(&r);
             }
+            if a.device().is_metal() {
+                if let Ok(t) = metal_eval::gather(&a, *dim, &indexes) {
+                    return Ok(t);
+                }
+            }
             a.contiguous()?.gather(&indexes.contiguous()?, *dim)?
         }
         NodeKind::IndexSelect { a, dim, indexes } => {
@@ -4784,6 +4845,11 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> candle_core::Result<Te
             if a.device().is_cpu() {
                 let r = bridge::from_candle(&a)?.index_select(*dim, &bridge::from_candle(&indexes)?);
                 return bridge::to_candle(&r);
+            }
+            if a.device().is_metal() {
+                if let Ok(t) = metal_eval::index_select(&a, *dim, &indexes) {
+                    return Ok(t);
+                }
             }
             a.contiguous()?.index_select(&indexes, *dim)?
         }
@@ -5269,12 +5335,22 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> candle_core::Result<Te
             if x.device().is_cpu() {
                 return bridge::to_candle(&bridge::from_candle(&x)?.powf(*exp));
             }
+            if x.device().is_metal() {
+                if let Ok(t) = metal_eval::powf(&x, *exp) {
+                    return Ok(t);
+                }
+            }
             x.powf(*exp)?
         }
         NodeKind::Cast { a, dtype } => {
             let x = ev.value(a.id)?;
             if x.device().is_cpu() {
                 return bridge::to_candle(&bridge::from_candle(&x)?.cast(bridge::dtype_to_native(*dtype)));
+            }
+            if x.device().is_metal() {
+                if let Ok(t) = metal_eval::cast(&x, bridge::dtype_to_native(*dtype)) {
+                    return Ok(t);
+                }
             }
             x.to_dtype(*dtype)?
         }
@@ -5285,6 +5361,11 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> candle_core::Result<Te
                 let r = if *keepdims { r } else { r.squeeze_dims(dims) };
                 return bridge::to_candle(&r);
             }
+            if t.device().is_metal() {
+                if let Ok(out) = metal_eval::reduce(&t, dims, *keepdims, crate::fusion::ReduceOp::Sum) {
+                    return Ok(out);
+                }
+            }
             reduce_dims(&t, dims, *keepdims, |t, d| t.sum(d))?
         }
         NodeKind::Mean { a, dims, keepdims } => {
@@ -5293,6 +5374,11 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> candle_core::Result<Te
                 let r = bridge::from_candle(&t)?.mean(dims);
                 let r = if *keepdims { r } else { r.squeeze_dims(dims) };
                 return bridge::to_candle(&r);
+            }
+            if t.device().is_metal() {
+                if let Ok(out) = metal_eval::reduce(&t, dims, *keepdims, crate::fusion::ReduceOp::Mean) {
+                    return Ok(out);
+                }
             }
             reduce_dims(&t, dims, *keepdims, |t, d| t.mean(d))?
         }
@@ -5303,6 +5389,11 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> candle_core::Result<Te
                 let r = if *keepdims { r } else { r.squeeze_dims(dims) };
                 return bridge::to_candle(&r);
             }
+            if t.device().is_metal() {
+                if let Ok(out) = metal_eval::reduce(&t, dims, *keepdims, crate::fusion::ReduceOp::Max) {
+                    return Ok(out);
+                }
+            }
             reduce_dims(&t, dims, *keepdims, |t, d| t.max(d))?
         }
         NodeKind::Min { a, dims, keepdims } => {
@@ -5311,6 +5402,11 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> candle_core::Result<Te
                 let r = bridge::from_candle(&t)?.min(dims);
                 let r = if *keepdims { r } else { r.squeeze_dims(dims) };
                 return bridge::to_candle(&r);
+            }
+            if t.device().is_metal() {
+                if let Ok(out) = metal_eval::reduce(&t, dims, *keepdims, crate::fusion::ReduceOp::Min) {
+                    return Ok(out);
+                }
             }
             reduce_dims(&t, dims, *keepdims, |t, d| t.min(d))?
         }
@@ -5357,6 +5453,12 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> candle_core::Result<Te
                 let r = r.contiguous().view(runtime::layout::Layout::contiguous(shape.clone()));
                 return bridge::to_candle(&r);
             }
+            if x.device().is_metal() {
+                let w = bridge::metal::wrap(&x)?;
+                let r = runtime::metal::kernels::strided_copy(runtime::metal::device::MetalDevice::get(), &w)
+                    .map_err(candle_core::Error::Msg)?;
+                return bridge::metal::unwrap(&r.buffer, shape.clone(), x.dtype(), x.device().as_metal_device()?);
+            }
             x.reshape(shape.clone())?
         }
         NodeKind::Permute { a, dims } => {
@@ -5365,6 +5467,17 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> candle_core::Result<Te
                 let r = bridge::from_candle(&x)?;
                 let r = r.view(r.layout.permute(dims)).contiguous();
                 return bridge::to_candle(&r);
+            }
+            if x.device().is_metal() {
+                let w = bridge::metal::wrap(&x)?;
+                let p = runtime::metal::run::MetalTensor {
+                    buffer: w.buffer.clone(),
+                    layout: w.layout.permute(dims),
+                    dtype: w.dtype,
+                };
+                let r = runtime::metal::kernels::strided_copy(runtime::metal::device::MetalDevice::get(), &p)
+                    .map_err(candle_core::Error::Msg)?;
+                return bridge::metal::unwrap(&r.buffer, r.layout.shape().to_vec(), x.dtype(), x.device().as_metal_device()?);
             }
             x.permute(dims.clone())?
         }
@@ -5415,6 +5528,11 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> candle_core::Result<Te
                 );
                 return bridge::to_candle(&r);
             }
+            if a.device().is_metal() {
+                if let Ok(t) = metal_eval::cat(&a, &b, *dim) {
+                    return Ok(t);
+                }
+            }
             Tensor::cat(&[&a, &b], *dim)?
         }
         NodeKind::BroadcastTo { a, shape } => {
@@ -5424,6 +5542,17 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> candle_core::Result<Te
                 let r = r.view(r.layout.broadcast_to(shape)).contiguous();
                 return bridge::to_candle(&r);
             }
+            if x.device().is_metal() {
+                let w = bridge::metal::wrap(&x)?;
+                let b = runtime::metal::run::MetalTensor {
+                    buffer: w.buffer.clone(),
+                    layout: w.layout.broadcast_to(shape),
+                    dtype: w.dtype,
+                };
+                let r = runtime::metal::kernels::strided_copy(runtime::metal::device::MetalDevice::get(), &b)
+                    .map_err(candle_core::Error::Msg)?;
+                return bridge::metal::unwrap(&r.buffer, r.layout.shape().to_vec(), x.dtype(), x.device().as_metal_device()?);
+            }
             x.broadcast_as(shape.clone())?
         }
         NodeKind::Matmul { a, b } => {
@@ -5431,6 +5560,11 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> candle_core::Result<Te
             let b = ev.value(b.id)?;
             if a.device().is_cpu() {
                 return bridge::to_candle(&bridge::from_candle(&a)?.matmul(&bridge::from_candle(&b)?));
+            }
+            if a.device().is_metal() {
+                if let Ok(t) = metal_eval::matmul(&a, &b) {
+                    return Ok(t);
+                }
             }
             // candle's matmul requires contiguous operands; permuted or
             // broadcast layouts (common in backward graphs) must be

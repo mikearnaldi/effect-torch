@@ -101,6 +101,58 @@ fn require_f32(t: &Tensor) -> candle_core::Result<()> {
     Ok(())
 }
 
+pub fn where_(cond: &Tensor, a: &Tensor, b: &Tensor) -> candle_core::Result<Tensor> {
+    require_f32(a)?;
+    require_f32(b)?;
+    a.device().synchronize()?;
+    let cond_f32 = if cond.dtype() != DType::F32 {
+        cond.to_dtype(DType::F32)?
+    } else {
+        cond.clone()
+    };
+    let shape = broadcast_shape_pub(&broadcast_shape_pub(cond.shape().dims(), a.shape().dims())?, b.shape().dims())?;
+    let cn = wrap_contig(&cond_f32)?;
+    let an = wrap_contig(a)?;
+    let bn = wrap_contig(b)?;
+    let sc = bridge_strides(cond, &shape)?;
+    let sa = bridge_strides(a, &shape)?;
+    let sb = bridge_strides(b, &shape)?;
+    let n: usize = shape.iter().product();
+    let exprs = vec![Expr::Select(Box::new(Expr::Input(0)), Box::new(Expr::Input(1)), Box::new(Expr::Input(2)))];
+    let outs = crate::runtime::metal::run::run_elementwise(
+        MetalDevice::get(),
+        &exprs,
+        &[&cn, &an, &bn],
+        &[sc, sa, sb],
+        &[],
+        n,
+        &shape,
+    )
+    .map_err(candle_core::Error::Msg)?;
+    bridge::metal::unwrap(&outs[0].buffer, shape, DType::F32, &mdev(a)?)
+}
+
+pub fn relu(a: &Tensor) -> candle_core::Result<Tensor> {
+    require_f32(a)?;
+    a.device().synchronize()?;
+    let an = wrap_contig(a)?;
+    let shape = a.shape().dims().to_vec();
+    let n: usize = shape.iter().product();
+    let contig = crate::runtime::layout::Layout::contiguous(shape.clone());
+    let exprs = vec![Expr::Max(Box::new(Expr::Input(0)), Box::new(Expr::Const(0.0f64.to_bits())))];
+    let outs = crate::runtime::metal::run::run_elementwise(
+        MetalDevice::get(),
+        &exprs,
+        &[&an],
+        &[contig.strides().to_vec()],
+        &[],
+        n,
+        &shape,
+    )
+    .map_err(candle_core::Error::Msg)?;
+    bridge::metal::unwrap(&outs[0].buffer, shape, DType::F32, &mdev(a)?)
+}
+
 pub fn compare(a: &Tensor, b: &Tensor, op: BinOp) -> candle_core::Result<Tensor> {
     let f = binary(a, b, op)?;
     cast(&f, crate::runtime::dtype::DType::U8)
