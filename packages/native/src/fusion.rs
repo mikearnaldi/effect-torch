@@ -1201,6 +1201,7 @@ mod metal {
             out_bufs.push(mdev.new_buffer(padded.max(1), DType::F32, "fused")?);
         }
         let encoder = mdev.command_encoder()?;
+        let encoder = encoder.as_ref();
         if phase_timing {
             fusion_phase_nanos(2, t_phase.elapsed().as_nanos() as u64);
         }
@@ -1216,14 +1217,14 @@ mod metal {
                     ))
                 }
             };
-            encoder.set_buffer(
+            encoder.set_input_buffer(
                 i,
                 Some(metal.buffer()),
                 layout.start_offset() * DType::F32.size_in_bytes(),
             );
         }
         for (j, buf) in out_bufs.iter().enumerate() {
-            encoder.set_buffer(inputs.len() + scalars.len() + j, Some(buf), 0);
+            encoder.set_output_buffer(inputs.len() + scalars.len() + j, Some(buf), 0);
         }
         encoder.dispatch_threads(
             objc2_metal::MTLSize {
@@ -1322,6 +1323,7 @@ mod metal {
         let padded = out_n.div_ceil(BLOCK) * BLOCK;
         let out_buf = mdev.new_buffer(padded.max(1), DType::F32, "fused_reduce")?;
         let encoder = mdev.command_encoder()?;
+        let encoder = encoder.as_ref();
         encoder.set_compute_pipeline_state(&pipeline);
         for (i, t) in inputs.iter().enumerate() {
             let (storage, layout) = t.storage_and_layout();
@@ -1333,13 +1335,13 @@ mod metal {
                     ))
                 }
             };
-            encoder.set_buffer(
+            encoder.set_input_buffer(
                 i,
                 Some(metal.buffer()),
                 layout.start_offset() * DType::F32.size_in_bytes(),
             );
         }
-        encoder.set_buffer(inputs.len(), Some(&out_buf), 0);
+        encoder.set_output_buffer(inputs.len(), Some(&out_buf), 0);
         encoder.dispatch_threads(
             objc2_metal::MTLSize {
                 width: padded,

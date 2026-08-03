@@ -306,27 +306,29 @@ kernel void et_ce_bwd(
         let status_buf = mdev.new_buffer(3, DType::F32, "ce_status")?;
         {
             let encoder = mdev.command_encoder()?;
+            let encoder = encoder.as_ref();
             encoder.set_compute_pipeline_state(&pipeline(mdev, tgt, "et_ce_fwd")?);
             let (zb, zo) = buffer_of(&logits)?;
             let (tb, to) = buffer_of(&target)?;
             let f32_off = |off: usize| off * DType::F32.size_in_bytes();
             let tgt_off = |off: usize| off * tgt.size_in_bytes();
-            encoder.set_buffer(0, Some(&zb), f32_off(zo));
-            encoder.set_buffer(1, Some(&tb), tgt_off(to));
-            encoder.set_buffer(2, Some(&nll_buf), 0);
-            encoder.set_buffer(3, Some(&flags_buf), 0);
+            encoder.set_input_buffer(0, Some(&zb), f32_off(zo));
+            encoder.set_input_buffer(1, Some(&tb), tgt_off(to));
+            encoder.set_output_buffer(2, Some(&nll_buf), 0);
+            encoder.set_output_buffer(3, Some(&flags_buf), 0);
             encoder.set_bytes(4, &(v as u32));
             encoder.set_bytes(5, &ignore_index);
-            dispatch_grid(&encoder, n, NT);
+            dispatch_grid(encoder, n, NT);
         }
         {
             let encoder = mdev.command_encoder()?;
+            let encoder = encoder.as_ref();
             encoder.set_compute_pipeline_state(&pipeline(mdev, tgt, "et_ce_status")?);
-            encoder.set_buffer(0, Some(&nll_buf), 0);
-            encoder.set_buffer(1, Some(&flags_buf), 0);
-            encoder.set_buffer(2, Some(&status_buf), 0);
+            encoder.set_input_buffer(0, Some(&nll_buf), 0);
+            encoder.set_input_buffer(1, Some(&flags_buf), 0);
+            encoder.set_output_buffer(2, Some(&status_buf), 0);
             encoder.set_bytes(3, &(n as u32));
-            dispatch_grid(&encoder, 1, NT);
+            dispatch_grid(encoder, 1, NT);
         }
         let status = wrap(status_buf, mdev, 3, vec![3]);
         let loss = status.narrow(0, 0, 1)?.reshape(())?;
@@ -349,26 +351,28 @@ kernel void et_ce_bwd(
         let grad_buf = mdev.new_buffer(n * v, DType::F32, "ce_grad")?;
         {
             let encoder = mdev.command_encoder()?;
+            let encoder = encoder.as_ref();
             encoder.set_compute_pipeline_state(&pipeline(mdev, tgt, "et_ce_count")?);
             let (tb, to) = buffer_of(&target)?;
-            encoder.set_buffer(0, Some(&tb), to * tgt.size_in_bytes());
-            encoder.set_buffer(1, Some(&count_buf), 0);
+            encoder.set_input_buffer(0, Some(&tb), to * tgt.size_in_bytes());
+            encoder.set_output_buffer(1, Some(&count_buf), 0);
             encoder.set_bytes(2, &(n as u32));
             encoder.set_bytes(3, &ignore_index);
-            dispatch_grid(&encoder, 1, NT);
+            dispatch_grid(encoder, 1, NT);
         }
         {
             let encoder = mdev.command_encoder()?;
+            let encoder = encoder.as_ref();
             encoder.set_compute_pipeline_state(&pipeline(mdev, tgt, "et_ce_bwd")?);
             let (zb, zo) = buffer_of(&logits)?;
             let (tb, to) = buffer_of(&target)?;
-            encoder.set_buffer(0, Some(&zb), zo * DType::F32.size_in_bytes());
-            encoder.set_buffer(1, Some(&tb), to * tgt.size_in_bytes());
-            encoder.set_buffer(2, Some(&count_buf), 0);
-            encoder.set_buffer(3, Some(&grad_buf), 0);
+            encoder.set_input_buffer(0, Some(&zb), zo * DType::F32.size_in_bytes());
+            encoder.set_input_buffer(1, Some(&tb), to * tgt.size_in_bytes());
+            encoder.set_input_buffer(2, Some(&count_buf), 0);
+            encoder.set_output_buffer(3, Some(&grad_buf), 0);
             encoder.set_bytes(4, &(v as u32));
             encoder.set_bytes(5, &ignore_index);
-            dispatch_grid(&encoder, n, NT);
+            dispatch_grid(encoder, n, NT);
         }
         // The zero-active check is deferred to the walk's end (see
         // ce_forward); the count buffer is returned for it.

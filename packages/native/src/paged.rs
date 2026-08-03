@@ -195,6 +195,7 @@ kernel void et_paged_scatter(
         let k_new = k_new.contiguous()?;
         let v_new = v_new.contiguous()?;
         let encoder = mdev.command_encoder()?;
+        let encoder = encoder.as_ref();
         encoder.set_compute_pipeline_state(&pipe);
         let (knb, kno) = buffer_of(&k_new)?;
         let (vnb, vno) = buffer_of(&v_new)?;
@@ -205,10 +206,10 @@ kernel void et_paged_scatter(
         let f32_off = |off: usize| off * DType::F32.size_in_bytes();
         let u32_off = |off: usize| off * DType::U32.size_in_bytes();
         let elem_off = |off: usize| off * slab_dtype.size_in_bytes();
-        encoder.set_buffer(0, Some(&knb), f32_off(kno));
-        encoder.set_buffer(1, Some(&vnb), f32_off(vno));
-        encoder.set_buffer(2, Some(&kb), elem_off(ko));
-        encoder.set_buffer(3, Some(&vb), elem_off(vo));
+        encoder.set_input_buffer(0, Some(&knb), f32_off(kno));
+        encoder.set_input_buffer(1, Some(&vnb), f32_off(vno));
+        encoder.set_output_buffer(2, Some(&kb), elem_off(ko));
+        encoder.set_output_buffer(3, Some(&vb), elem_off(vo));
         let (ksb, kso) = match k_scales {
             Some(t) => buffer_of(t)?,
             None => (kb.clone(), ko),
@@ -217,10 +218,10 @@ kernel void et_paged_scatter(
             Some(t) => buffer_of(t)?,
             None => (vb.clone(), vo),
         };
-        encoder.set_buffer(4, Some(&ksb), f32_off(kso));
-        encoder.set_buffer(5, Some(&vsb), f32_off(vso));
-        encoder.set_buffer(6, Some(&tb), u32_off(to));
-        encoder.set_buffer(7, Some(&cb), u32_off(co));
+        encoder.set_output_buffer(4, Some(&ksb), f32_off(kso));
+        encoder.set_output_buffer(5, Some(&vsb), f32_off(vso));
+        encoder.set_input_buffer(6, Some(&tb), u32_off(to));
+        encoder.set_input_buffer(7, Some(&cb), u32_off(co));
         encoder.set_bytes(8, &(block_size as u32));
         encoder.set_bytes(9, &(tables.dim(1)? as u32));
         encoder.set_bytes(10, &(h as u32));
@@ -476,6 +477,7 @@ kernel void et_paged_decode(
         let out_buf = mdev.new_buffer(b * h * c * d, DType::F32, "paged_o")?;
         let max_blocks = tables.dim(1)?;
         let encoder = mdev.command_encoder()?;
+        let encoder = encoder.as_ref();
         encoder.set_compute_pipeline_state(&pipe);
         let (qb, qo) = buffer_of(&q)?;
         let (kb, ko) = buffer_of(k_slab)?;
@@ -486,12 +488,12 @@ kernel void et_paged_decode(
         let u32_off = |off: usize| off * DType::U32.size_in_bytes();
 
         let elem_off = |off: usize| off * slab_dtype.size_in_bytes();
-        encoder.set_buffer(0, Some(&qb), f32_off(qo));
-        encoder.set_buffer(1, Some(&kb), elem_off(ko));
-        encoder.set_buffer(2, Some(&vb), elem_off(vo));
-        encoder.set_buffer(3, Some(&tb), u32_off(to));
-        encoder.set_buffer(4, Some(&cb), u32_off(co));
-        encoder.set_buffer(5, Some(&out_buf), 0);
+        encoder.set_input_buffer(0, Some(&qb), f32_off(qo));
+        encoder.set_input_buffer(1, Some(&kb), elem_off(ko));
+        encoder.set_input_buffer(2, Some(&vb), elem_off(vo));
+        encoder.set_input_buffer(3, Some(&tb), u32_off(to));
+        encoder.set_input_buffer(4, Some(&cb), u32_off(co));
+        encoder.set_output_buffer(5, Some(&out_buf), 0);
         // Scale buffers are always bound; point at K when unused.
         let (ksb, kso) = match k_scales {
             Some(t) => buffer_of(t)?,
@@ -502,8 +504,8 @@ kernel void et_paged_decode(
             None => (vb.clone(), vo),
         };
 
-        encoder.set_buffer(6, Some(&ksb), f32_off(kso));
-        encoder.set_buffer(7, Some(&vsb), f32_off(vso));
+        encoder.set_input_buffer(6, Some(&ksb), f32_off(kso));
+        encoder.set_input_buffer(7, Some(&vsb), f32_off(vso));
         encoder.set_bytes(8, &(block_size as u32));
         encoder.set_bytes(9, &(max_blocks as u32));
         encoder.set_bytes(10, &(window.unwrap_or(0) as u32));

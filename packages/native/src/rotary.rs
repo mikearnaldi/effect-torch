@@ -127,6 +127,7 @@ kernel void et_rotary(
         let offsets = Tensor::from_vec(offsets_vec.clone(), offsets_vec.len(), device)?;
         let out_buf = mdev.new_buffer(x.elem_count(), DType::F32, "rotary")?;
         let encoder = mdev.command_encoder()?;
+        let encoder = encoder.as_ref();
         encoder.set_compute_pipeline_state(&pipeline(mdev)?);
         {
             let (storage, layout) = x.storage_and_layout();
@@ -138,7 +139,7 @@ kernel void et_rotary(
                     ))
                 }
             };
-            encoder.set_buffer(0, Some(metal.buffer()), layout.start_offset() * DType::F32.size_in_bytes());
+            encoder.set_input_buffer(0, Some(metal.buffer()), layout.start_offset() * DType::F32.size_in_bytes());
         }
         {
             let (storage, layout) = offsets.storage_and_layout();
@@ -150,9 +151,9 @@ kernel void et_rotary(
                     ))
                 }
             };
-            encoder.set_buffer(2, Some(metal.buffer()), layout.start_offset() * DType::F32.size_in_bytes());
+            encoder.set_input_buffer(2, Some(metal.buffer()), layout.start_offset() * DType::F32.size_in_bytes());
         }
-        encoder.set_buffer(1, Some(&out_buf), 0);
+        encoder.set_output_buffer(1, Some(&out_buf), 0);
         encoder.set_bytes(3, &(t as u32));
         encoder.set_bytes(4, &(d as u32));
         encoder.set_bytes(5, &(rows_per_batch as u32));

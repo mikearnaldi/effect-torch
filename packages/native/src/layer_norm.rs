@@ -211,15 +211,16 @@ kernel void et_ln_bwd(
         let bias = bias.contiguous()?;
         let out_buf = mdev.new_buffer(x.elem_count(), DType::F32, "ln_fwd")?;
         let encoder = mdev.command_encoder()?;
+        let encoder = encoder.as_ref();
         encoder.set_compute_pipeline_state(&pipeline(mdev, "et_ln_fwd")?);
         let (xb, xo) = buffer_of(&x)?;
         let (wb, wo) = buffer_of(&weight)?;
         let (bb, bo) = buffer_of(&bias)?;
         let off = |o: usize| o * DType::F32.size_in_bytes();
-        encoder.set_buffer(0, Some(&xb), off(xo));
-        encoder.set_buffer(1, Some(&wb), off(wo));
-        encoder.set_buffer(2, Some(&bb), off(bo));
-        encoder.set_buffer(3, Some(&out_buf), 0);
+        encoder.set_input_buffer(0, Some(&xb), off(xo));
+        encoder.set_input_buffer(1, Some(&wb), off(wo));
+        encoder.set_input_buffer(2, Some(&bb), off(bo));
+        encoder.set_output_buffer(3, Some(&out_buf), 0);
         encoder.set_bytes(4, &(d as u32));
         encoder.set_bytes(5, &(eps as f32));
         encoder.dispatch_thread_groups(
@@ -242,16 +243,17 @@ kernel void et_ln_bwd(
         let dx_buf = mdev.new_buffer(x.elem_count(), DType::F32, "ln_dx")?;
         let xh_buf = mdev.new_buffer(x.elem_count(), DType::F32, "ln_xh")?;
         let encoder = mdev.command_encoder()?;
+        let encoder = encoder.as_ref();
         encoder.set_compute_pipeline_state(&pipeline(mdev, "et_ln_bwd")?);
         let (xb, xo) = buffer_of(&x)?;
         let (wb, wo) = buffer_of(&weight)?;
         let (gb, go) = buffer_of(&g)?;
         let off = |o: usize| o * DType::F32.size_in_bytes();
-        encoder.set_buffer(0, Some(&xb), off(xo));
-        encoder.set_buffer(1, Some(&wb), off(wo));
-        encoder.set_buffer(2, Some(&gb), off(go));
-        encoder.set_buffer(3, Some(&dx_buf), 0);
-        encoder.set_buffer(4, Some(&xh_buf), 0);
+        encoder.set_input_buffer(0, Some(&xb), off(xo));
+        encoder.set_input_buffer(1, Some(&wb), off(wo));
+        encoder.set_input_buffer(2, Some(&gb), off(go));
+        encoder.set_output_buffer(3, Some(&dx_buf), 0);
+        encoder.set_output_buffer(4, Some(&xh_buf), 0);
         encoder.set_bytes(5, &(d as u32));
         encoder.set_bytes(6, &(eps as f32));
         encoder.dispatch_thread_groups(

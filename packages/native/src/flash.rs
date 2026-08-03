@@ -254,16 +254,17 @@ kernel void et_sdpa_fwd(
         let o_buf = mdev.new_buffer(bh * t * dv, DType::F32, "sdpa_o")?;
         let l_buf = mdev.new_buffer(bh * t, DType::F32, "sdpa_l")?;
         let encoder = mdev.command_encoder()?;
+        let encoder = encoder.as_ref();
         encoder.set_compute_pipeline_state(&pipe);
         let byte_offset = |off: usize| off * DType::F32.size_in_bytes();
         let (qb, qo) = buffer_of(&q)?;
         let (kb, ko) = buffer_of(&k)?;
         let (vb, vo) = buffer_of(&v)?;
-        encoder.set_buffer(0, Some(&qb), byte_offset(qo));
-        encoder.set_buffer(1, Some(&kb), byte_offset(ko));
-        encoder.set_buffer(2, Some(&vb), byte_offset(vo));
-        encoder.set_buffer(3, Some(&o_buf), 0);
-        encoder.set_buffer(4, Some(&l_buf), 0);
+        encoder.set_input_buffer(0, Some(&qb), byte_offset(qo));
+        encoder.set_input_buffer(1, Some(&kb), byte_offset(ko));
+        encoder.set_input_buffer(2, Some(&vb), byte_offset(vo));
+        encoder.set_output_buffer(3, Some(&o_buf), 0);
+        encoder.set_output_buffer(4, Some(&l_buf), 0);
         let q_tiles = t.div_ceil(TILE_Q);
         encoder.dispatch_thread_groups(
             objc2_metal::MTLSize {
@@ -607,6 +608,7 @@ kernel void et_sdpa_bwd_q(
         {
             let pipe = bwd_pipeline(mdev, "et_sdpa_bwd_kv", t, s, d, dv, scale, causal)?;
             let encoder = mdev.command_encoder()?;
+            let encoder = encoder.as_ref();
             encoder.set_compute_pipeline_state(&pipe);
             let (qb, qo) = buffer_of(&q)?;
             let (kb, ko) = buffer_of(&k)?;
@@ -614,14 +616,14 @@ kernel void et_sdpa_bwd_q(
             let (gb, go) = buffer_of(&g)?;
             let (lb, lo) = buffer_of(&l)?;
             let (db, do_) = buffer_of(&d_vec)?;
-            encoder.set_buffer(0, Some(&qb), off(qo));
-            encoder.set_buffer(1, Some(&kb), off(ko));
-            encoder.set_buffer(2, Some(&vb), off(vo));
-            encoder.set_buffer(3, Some(&gb), off(go));
-            encoder.set_buffer(4, Some(&lb), off(lo));
-            encoder.set_buffer(5, Some(&db), off(do_));
-            encoder.set_buffer(6, Some(&dk_buf), 0);
-            encoder.set_buffer(7, Some(&dv_buf), 0);
+            encoder.set_input_buffer(0, Some(&qb), off(qo));
+            encoder.set_input_buffer(1, Some(&kb), off(ko));
+            encoder.set_input_buffer(2, Some(&vb), off(vo));
+            encoder.set_input_buffer(3, Some(&gb), off(go));
+            encoder.set_input_buffer(4, Some(&lb), off(lo));
+            encoder.set_input_buffer(5, Some(&db), off(do_));
+            encoder.set_output_buffer(6, Some(&dk_buf), 0);
+            encoder.set_output_buffer(7, Some(&dv_buf), 0);
             encoder.dispatch_thread_groups(
                 objc2_metal::MTLSize {
                     width: s.div_ceil(TILE_K),
@@ -638,6 +640,7 @@ kernel void et_sdpa_bwd_q(
         {
             let pipe = bwd_pipeline(mdev, "et_sdpa_bwd_q", t, s, d, dv, scale, causal)?;
             let encoder = mdev.command_encoder()?;
+            let encoder = encoder.as_ref();
             encoder.set_compute_pipeline_state(&pipe);
             let (qb, qo) = buffer_of(&q)?;
             let (kb, ko) = buffer_of(&k)?;
@@ -645,13 +648,13 @@ kernel void et_sdpa_bwd_q(
             let (gb, go) = buffer_of(&g)?;
             let (lb, lo) = buffer_of(&l)?;
             let (db, do_) = buffer_of(&d_vec)?;
-            encoder.set_buffer(0, Some(&qb), off(qo));
-            encoder.set_buffer(1, Some(&kb), off(ko));
-            encoder.set_buffer(2, Some(&vb), off(vo));
-            encoder.set_buffer(3, Some(&gb), off(go));
-            encoder.set_buffer(4, Some(&lb), off(lo));
-            encoder.set_buffer(5, Some(&db), off(do_));
-            encoder.set_buffer(6, Some(&dq_buf), 0);
+            encoder.set_input_buffer(0, Some(&qb), off(qo));
+            encoder.set_input_buffer(1, Some(&kb), off(ko));
+            encoder.set_input_buffer(2, Some(&vb), off(vo));
+            encoder.set_input_buffer(3, Some(&gb), off(go));
+            encoder.set_input_buffer(4, Some(&lb), off(lo));
+            encoder.set_input_buffer(5, Some(&db), off(do_));
+            encoder.set_output_buffer(6, Some(&dq_buf), 0);
             encoder.dispatch_thread_groups(
                 objc2_metal::MTLSize {
                     width: t.div_ceil(TILE_Q),
