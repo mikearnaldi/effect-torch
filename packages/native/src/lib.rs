@@ -8447,16 +8447,49 @@ impl BlockStore {
     }
 }
 
+enum PoolSlab {
+    Native(runtime::pool::Slab),
+    Candle(Tensor),
+}
+
+impl PoolSlab {
+    fn dtype(&self) -> DType {
+        match self {
+            PoolSlab::Native(s) => bridge::dtype_from_native(s.dtype),
+            PoolSlab::Candle(t) => t.dtype(),
+        }
+    }
+
+    fn candle(&self) -> candle_core::Result<&Tensor> {
+        match self {
+            PoolSlab::Candle(t) => Ok(t),
+            PoolSlab::Native(_) => Err(candle_core::Error::Msg(
+                "kv pool: paged Metal path requires candle-backed slabs".to_string(),
+            )),
+        }
+    }
+
+    fn native(&self) -> candle_core::Result<&runtime::pool::Slab> {
+        match self {
+            PoolSlab::Native(s) => Ok(s),
+            PoolSlab::Candle(_) => Err(candle_core::Error::Msg(
+                "kv pool: native CPU path requires native-backed slabs".to_string(),
+            )),
+        }
+    }
+}
+
 struct PoolInner {
     // Per layer, flat [max_tokens, kv_heads, head_dim] slabs; block b
     // occupies rows b*block_size..(b+1)*block_size. Slab dtype u8 means
     // int8-quantized storage (RFC 0012 storage tier): rows are
     // symmetric-quantized with a per-(token, head) absmax scale held in
     // `scales` — two slabs per layer (k then v) when the data slabs are
-    // u8, empty otherwise.
-    k: Vec<Tensor>,
-    v: Vec<Tensor>,
-    scales: Vec<Tensor>,
+    // u8, empty otherwise. CPU pools hold first-party mutable slabs;
+    // Metal pools hold candle buffers until the phase-2 device lands.
+    k: Vec<PoolSlab>,
+    v: Vec<PoolSlab>,
+    scales: Vec<PoolSlab>,
     kv_heads: usize,
     head_dim: usize,
     block_size: usize,
@@ -8754,8 +8787,8 @@ fn kv_attention_paged(
     let slab_dtype = pool.k[layer].dtype();
     let (k_scales, v_scales) = match slab_dtype {
         DType::U8 => (
-            Some(&pool.scales[2 * layer]),
-            Some(&pool.scales[2 * layer + 1]),
+            Some(pool.scales[2 * layer].candle()?),
+            Some(pool.scales[2 * layer + 1].candle()?),
         ),
         _ => (None, None),
     };
@@ -8763,8 +8796,8 @@ fn kv_attention_paged(
     paged::scatter(
         k,
         v,
-        &pool.k[layer],
-        &pool.v[layer],
+        pool.k[layer].candle()?,
+        pool.v[layer].candle()?,
         k_scales,
         v_scales,
         tables,
@@ -8774,8 +8807,8 @@ fn kv_attention_paged(
     )?;
     let out = paged::decode(
         q,
-        &pool.k[layer],
-        &pool.v[layer],
+        pool.k[layer].candle()?,
+        pool.v[layer].candle()?,
         k_scales,
         v_scales,
         tables,
@@ -8819,16 +8852,6 @@ fn kv_attention_slot(
     kv_scatter_rows(pool, state, layer, k, v, h, d)?;
     let slab_dtype = pool.k[layer].dtype();
     let full = cursor + t;
-    // row indexes [T] broadcast to the scatter/gather contract [T, H, D]
-    let row_index = |rows: Vec<u32>| -> candle_core::Result<Tensor> {
-        let n = rows.len();
-        Tensor::from_vec(rows, (n, 1, 1), &pool.device)?.broadcast_as((n, h, d))?.contiguous()
-    };
-    // Row indexes [T] broadcast to the scale contract [T, H].
-    let scale_index = |rows: Vec<u32>| -> candle_core::Result<Tensor> {
-        let n = rows.len();
-        Tensor::from_vec(rows, (n, 1), &pool.device)?.broadcast_as((n, h))?.contiguous()
-    };
     // Logical position -> physical row, through the sequence's block
     // table. The table is append-only: entries below `head` are dead
     // (already freed) and never queried, since gathers start at the
@@ -8844,17 +8867,65 @@ fn kv_attention_slot(
     // causal mask aligns for every q row.
     let ctx_rows: Vec<u32> = (start..needed).map(&physical).collect();
     let ctx = full - start;
+    if pool.device.is_cpu() {
+        let gather_rows = |slab: &PoolSlab, scale: Option<&PoolSlab>| -> candle_core::Result<runtime::cpu::Tensor> {
+            let raw = slab.native()?.read_rows_f32(&ctx_rows);
+            let real = match scale {
+                Some(scale) => {
+                    let scales = scale.native()?.read_rows_f32(&ctx_rows);
+                    runtime::pool::dequantize_int8(&raw, &scales, ctx_rows.len(), h, d)
+                }
+                None => raw,
+            };
+            let pad = ctx - ctx_rows.len();
+            let mut full = real;
+            full.resize(ctx * h * d, 0.0);
+            let _ = pad;
+            // [ctx, H, D] -> [1, H, ctx, D]
+            let rows = ctx;
+            let mut perm = vec![0f32; rows * h * d];
+            for r in 0..rows {
+                for hh in 0..h {
+                    for dd in 0..d {
+                        perm[(hh * rows + r) * d + dd] = full[(r * h + hh) * d + dd];
+                    }
+                }
+            }
+            Ok(runtime::cpu::Tensor::from_vec(perm, vec![1, h, ctx, d]))
+        };
+        let (k_scale, v_scale) = match slab_dtype {
+            DType::U8 => (Some(&pool.scales[2 * layer]), Some(&pool.scales[2 * layer + 1])),
+            _ => (None, None),
+        };
+        let kn = gather_rows(&pool.k[layer], k_scale)?;
+        let vn = gather_rows(&pool.v[layer], v_scale)?;
+        let qn = bridge::from_candle(q)?;
+        let out = runtime::composed::sdpa_forward(&qn, &kn, &vn, scale, true);
+        kv_evict(pool, state, start);
+        return bridge::to_candle(&out);
+    }
+    // row indexes [T] broadcast to the scatter/gather contract [T, H, D]
+    let row_index = |rows: Vec<u32>| -> candle_core::Result<Tensor> {
+        let n = rows.len();
+        Tensor::from_vec(rows, (n, 1, 1), &pool.device)?.broadcast_as((n, h, d))?.contiguous()
+    };
+    // Row indexes [T] broadcast to the scale contract [T, H].
+    let scale_index = |rows: Vec<u32>| -> candle_core::Result<Tensor> {
+        let n = rows.len();
+        Tensor::from_vec(rows, (n, 1), &pool.device)?.broadcast_as((n, h))?.contiguous()
+    };
     let ctx_index = row_index(ctx_rows.clone())?;
     let ctx_scale_index = scale_index(ctx_rows)?;
     let zeros = (ctx > needed - start)
         .then(|| Tensor::zeros((ctx - (needed - start), h, d), DType::F32, &pool.device))
         .transpose()?;
-    let gather_rows = |slab: &Tensor, scale: Option<&Tensor>| -> candle_core::Result<Tensor> {
+    let gather_rows = |slab: &PoolSlab, scale: Option<&PoolSlab>| -> candle_core::Result<Tensor> {
+        let slab = slab.candle()?;
         let gathered = slab.gather(&ctx_index, 0)?;
         let real = match scale {
             // Dequantize: (q - 128) * scale, per (token, head).
             Some(scale) => ((gathered.to_dtype(DType::F32)? - 128.0)?
-                .broadcast_mul(&scale.gather(&ctx_scale_index, 0)?.unsqueeze(candle_core::D::Minus1)?))?,
+                .broadcast_mul(&scale.candle()?.gather(&ctx_scale_index, 0)?.unsqueeze(candle_core::D::Minus1)?))?,
             None => gathered.to_dtype(DType::F32)?,
         };
         let full = match &zeros {
@@ -8956,6 +9027,42 @@ fn kv_scatter_rows(
     let cursor = state.cursor;
     let advance = state.advance;
     let needed = cursor + advance;
+    // Logical position -> physical row, through the sequence's block
+    // table (append-only; entries below `head` are dead and never
+    // written).
+    let physical = |p: usize| -> u32 {
+        state.blocks[p / pool.block_size] * pool.block_size as u32
+            + (p % pool.block_size) as u32
+    };
+    let write_rows: Vec<u32> = (cursor..needed).map(&physical).collect();
+    if pool.device.is_cpu() {
+        // [1, H, T, D] -> [T, H, D], real rows only, as flat f32.
+        let new_rows = |x: &Tensor| -> candle_core::Result<Vec<f32>> {
+            let x = x
+                .permute((0, 2, 1, 3))?
+                .contiguous()?
+                .narrow(1, 0, advance)?
+                .reshape((advance, h, d))?;
+            let n = bridge::from_candle(&x)?;
+            let n = n.cast(runtime::dtype::DType::F32).contiguous();
+            let runtime::cpu::CpuBuffer::F32(v) = &n.buffer else { unreachable!() };
+            Ok(v.as_slice().to_vec())
+        };
+        let k_rows = new_rows(k)?;
+        let v_rows = new_rows(v)?;
+        if slab_dtype == DType::U8 {
+            let (qk, sk) = runtime::pool::quantize_int8(&k_rows, advance, h, d);
+            let (qv, sv) = runtime::pool::quantize_int8(&v_rows, advance, h, d);
+            pool.k[layer].native()?.write_rows_u8(&write_rows, &qk);
+            pool.v[layer].native()?.write_rows_u8(&write_rows, &qv);
+            pool.scales[2 * layer].native()?.write_rows_f32(&write_rows, &sk);
+            pool.scales[2 * layer + 1].native()?.write_rows_f32(&write_rows, &sv);
+        } else {
+            pool.k[layer].native()?.write_rows_f32(&write_rows, &k_rows);
+            pool.v[layer].native()?.write_rows_f32(&write_rows, &v_rows);
+        }
+        return Ok(());
+    }
     // [1, H, T, D] -> [T, H, D], real rows only
     let new_rows = |x: &Tensor| -> candle_core::Result<Tensor> {
         x.permute((0, 2, 1, 3))?
@@ -8968,14 +9075,6 @@ fn kv_scatter_rows(
         let n = rows.len();
         Tensor::from_vec(rows, (n, 1, 1), &pool.device)?.broadcast_as((n, h, d))?.contiguous()
     };
-    // Logical position -> physical row, through the sequence's block
-    // table (append-only; entries below `head` are dead and never
-    // written).
-    let physical = |p: usize| -> u32 {
-        state.blocks[p / pool.block_size] * pool.block_size as u32
-            + (p % pool.block_size) as u32
-    };
-    let write_rows: Vec<u32> = (cursor..needed).map(&physical).collect();
     let write_index = row_index(write_rows.clone())?;
     // Row indexes [T] broadcast to the scale contract [T, H].
     let scale_index = |rows: Vec<u32>| -> candle_core::Result<Tensor> {
@@ -8983,7 +9082,7 @@ fn kv_scatter_rows(
         Tensor::from_vec(rows, (n, 1), &pool.device)?.broadcast_as((n, h))?.contiguous()
     };
     let write_scales = |layer: usize, slot: usize, scale: &Tensor| -> candle_core::Result<()> {
-        pool.scales[2 * layer + slot].scatter_set(&scale_index(write_rows.clone())?, scale, 0)
+        pool.scales[2 * layer + slot].candle()?.scatter_set(&scale_index(write_rows.clone())?, scale, 0)
     };
     if slab_dtype == DType::U8 {
         // int8 storage tier: symmetric quantization on a ±127 grid
@@ -9000,13 +9099,13 @@ fn kv_scatter_rows(
         };
         let (qk, sk) = quantize(&new_rows(k)?)?;
         let (qv, sv) = quantize(&new_rows(v)?)?;
-        pool.k[layer].scatter_set(&write_index, &qk, 0)?;
-        pool.v[layer].scatter_set(&write_index, &qv, 0)?;
+        pool.k[layer].candle()?.scatter_set(&write_index, &qk, 0)?;
+        pool.v[layer].candle()?.scatter_set(&write_index, &qv, 0)?;
         write_scales(layer, 0, &sk)?;
         write_scales(layer, 1, &sv)?;
     } else {
-        pool.k[layer].scatter_set(&write_index, &new_rows(k)?.to_dtype(slab_dtype)?, 0)?;
-        pool.v[layer].scatter_set(&write_index, &new_rows(v)?.to_dtype(slab_dtype)?, 0)?;
+        pool.k[layer].candle()?.scatter_set(&write_index, &new_rows(k)?.to_dtype(slab_dtype)?, 0)?;
+        pool.v[layer].candle()?.scatter_set(&write_index, &new_rows(v)?.to_dtype(slab_dtype)?, 0)?;
     }
     Ok(())
 }
@@ -9306,20 +9405,42 @@ impl NativeKvPool {
         let mut v = Vec::with_capacity(layers);
         let mut scales = Vec::with_capacity(layers);
         for _ in 0..layers {
-            k.push(
+            if device.is_cpu() {
+                k.push(PoolSlab::Native(runtime::pool::Slab::new(
+                    max_tokens,
+                    kv_heads * head_dim,
+                    bridge::dtype_to_native(dtype),
+                )));
+                v.push(PoolSlab::Native(runtime::pool::Slab::new(
+                    max_tokens,
+                    kv_heads * head_dim,
+                    bridge::dtype_to_native(dtype),
+                )));
+                if dtype == DType::U8 {
+                    for _ in 0..2 {
+                        scales.push(PoolSlab::Native(runtime::pool::Slab::new(
+                            max_tokens,
+                            kv_heads,
+                            runtime::dtype::DType::F32,
+                        )));
+                    }
+                }
+                continue;
+            }
+            k.push(PoolSlab::Candle(
                 Tensor::zeros((max_tokens, kv_heads, head_dim), dtype, &device)
                     .map_err(to_napi_err)?,
-            );
-            v.push(
+            ));
+            v.push(PoolSlab::Candle(
                 Tensor::zeros((max_tokens, kv_heads, head_dim), dtype, &device)
                     .map_err(to_napi_err)?,
-            );
+            ));
             if dtype == DType::U8 {
                 for _ in 0..2 {
-                    scales.push(
+                    scales.push(PoolSlab::Candle(
                         Tensor::zeros((max_tokens, kv_heads), DType::F32, &device)
                             .map_err(to_napi_err)?,
-                    );
+                    ));
                 }
             }
         }
@@ -10230,8 +10351,8 @@ mod kv_tests {
     fn kv_attention_matches_sdpa() {
         let device = Device::Cpu;
         let pool = Arc::new(PoolInner {
-            k: vec![Tensor::zeros((8, 2, 4), DType::F32, &device).unwrap()],
-            v: vec![Tensor::zeros((8, 2, 4), DType::F32, &device).unwrap()],
+            k: vec![PoolSlab::Native(runtime::pool::Slab::new(8, 2 * 4, runtime::dtype::DType::F32))],
+            v: vec![PoolSlab::Native(runtime::pool::Slab::new(8, 2 * 4, runtime::dtype::DType::F32))],
             scales: vec![],
             kv_heads: 2,
             head_dim: 4,
@@ -10257,7 +10378,9 @@ mod kv_tests {
         let want = sdpa_forward(&q, &k, &v, 0.5, true).unwrap();
         let got = got.flatten_all().unwrap().to_vec1::<f32>().unwrap();
         let want = want.flatten_all().unwrap().to_vec1::<f32>().unwrap();
-        assert_eq!(got, want);
+        for (g, w) in got.iter().zip(&want) {
+            assert!((g - w).abs() < 1e-6, "{g} vs {w}");
+        }
         assert_eq!(state.lock().unwrap().advance, 3);
     }
 
