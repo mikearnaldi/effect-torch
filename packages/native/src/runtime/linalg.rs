@@ -54,62 +54,81 @@ fn lu_solve(lu: &[f64], perm: &[usize], b: &[f64], n: usize) -> Vec<f64> {
 }
 
 impl Tensor {
-    fn square_f64(&self) -> (Vec<f64>, usize) {
+    fn batched_square_f64(&self) -> (Vec<f64>, usize, usize) {
         let shape = self.shape();
-        assert_eq!(shape.len(), 2);
-        assert_eq!(shape[0], shape[1], "linalg requires a square matrix");
-        let n = shape[0];
+        assert!(shape.len() >= 2);
+        let n = shape[shape.len() - 1];
+        assert_eq!(shape[shape.len() - 2], n, "linalg requires square matrices");
+        let batch: usize = shape[..shape.len() - 2].iter().product();
         let c = self.cast(DType::F64).contiguous();
         let CpuBuffer::F64(v) = &c.buffer else { unreachable!() };
-        (v.as_slice().to_vec(), n)
+        (v.as_slice().to_vec(), n, batch)
     }
 
     pub fn det(&self) -> Tensor {
-        let (a, n) = self.square_f64();
-        let Some((lu, _, sign)) = lu_decompose(&a, n) else {
-            return Tensor::full(&[1], 0.0, self.dtype());
-        };
-        let mut d = sign as f64;
-        for i in 0..n {
-            d *= lu[i * n + i];
+        let (a, n, batch) = self.batched_square_f64();
+        let mut out = Vec::with_capacity(batch);
+        for b in 0..batch {
+            let m = &a[b * n * n..(b + 1) * n * n];
+            match lu_decompose(m, n) {
+                Some((lu, _, sign)) => {
+                    let mut d = sign as f64;
+                    for i in 0..n {
+                        d *= lu[i * n + i];
+                    }
+                    out.push(d);
+                }
+                None => out.push(0.0),
+            }
         }
-        Tensor::full(&[1], d, self.dtype())
+        let mut shape = self.shape()[..self.shape().len() - 2].to_vec();
+        if shape.is_empty() {
+            shape.push(1);
+        }
+        Tensor::from_vec(out, shape).cast(self.dtype())
     }
 
     pub fn inverse(&self) -> Tensor {
-        let (a, n) = self.square_f64();
-        let (lu, perm, _) = lu_decompose(&a, n).expect("matrix is singular");
-        let mut inv = vec![0f64; n * n];
-        for col in 0..n {
-            let mut e = vec![0f64; n];
-            e[col] = 1.0;
-            let x = lu_solve(&lu, &perm, &e, n);
-            for r in 0..n {
-                inv[r * n + col] = x[r];
+        let (a, n, batch) = self.batched_square_f64();
+        let mut out = vec![0f64; batch * n * n];
+        for b in 0..batch {
+            let m = &a[b * n * n..(b + 1) * n * n];
+            let (lu, perm, _) = lu_decompose(m, n).expect("matrix is singular");
+            for col in 0..n {
+                let mut e = vec![0f64; n];
+                e[col] = 1.0;
+                let x = lu_solve(&lu, &perm, &e, n);
+                for r in 0..n {
+                    out[b * n * n + r * n + col] = x[r];
+                }
             }
         }
-        let out = Tensor::from_vec(inv, vec![n, n]);
-        out.cast(self.dtype())
+        Tensor::from_vec(out, self.shape().to_vec()).cast(self.dtype())
     }
 
     pub fn solve(&self, rhs: &Tensor) -> Tensor {
-        let (a, n) = self.square_f64();
-        let shape = rhs.shape();
-        assert_eq!(shape.len(), 2);
-        assert_eq!(shape[0], n);
-        let nrhs = shape[1];
+        let (a, n, batch) = self.batched_square_f64();
+        let rshape = rhs.shape();
+        assert!(rshape.len() >= 2);
+        assert_eq!(rshape[rshape.len() - 2], n);
+        let nrhs = rshape[rshape.len() - 1];
+        let rbatch: usize = rshape[..rshape.len() - 2].iter().product();
+        assert_eq!(rbatch, batch, "solve batch mismatch");
         let rc = rhs.cast(DType::F64).contiguous();
         let CpuBuffer::F64(bv) = &rc.buffer else { unreachable!() };
-        let (lu, perm, _) = lu_decompose(&a, n).expect("matrix is singular");
-        let mut out = vec![0f64; n * nrhs];
-        for col in 0..nrhs {
-            let b: Vec<f64> = (0..n).map(|r| bv[r * nrhs + col]).collect();
-            let x = lu_solve(&lu, &perm, &b, n);
-            for r in 0..n {
-                out[r * nrhs + col] = x[r];
+        let mut out = vec![0f64; batch * n * nrhs];
+        for b in 0..batch {
+            let m = &a[b * n * n..(b + 1) * n * n];
+            let (lu, perm, _) = lu_decompose(m, n).expect("matrix is singular");
+            for col in 0..nrhs {
+                let colv: Vec<f64> = (0..n).map(|r| bv[b * n * nrhs + r * nrhs + col]).collect();
+                let x = lu_solve(&lu, &perm, &colv, n);
+                for r in 0..n {
+                    out[b * n * nrhs + r * nrhs + col] = x[r];
+                }
             }
         }
-        Tensor::from_vec(out, shape.to_vec()).cast(self.dtype())
+        Tensor::from_vec(out, rshape.to_vec()).cast(self.dtype())
     }
 }
 

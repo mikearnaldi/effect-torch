@@ -4314,43 +4314,73 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> candle_core::Result<Te
             shape,
             dtype,
             device,
-        } => Tensor::zeros(shape.clone(), *dtype, device)?,
+        } => {
+            if device.is_cpu() {
+                let r = runtime::cpu::Tensor::zeros(shape, bridge::dtype_to_native(*dtype));
+                return bridge::to_candle(&r);
+            }
+            Tensor::zeros(shape.clone(), *dtype, device)?
+        }
         NodeKind::Ones {
             shape,
             dtype,
             device,
-        } => Tensor::ones(shape.clone(), *dtype, device)?,
+        } => {
+            if device.is_cpu() {
+                let r = runtime::cpu::Tensor::ones(shape, bridge::dtype_to_native(*dtype));
+                return bridge::to_candle(&r);
+            }
+            Tensor::ones(shape.clone(), *dtype, device)?
+        }
         NodeKind::Full {
             shape,
             value,
             dtype,
             device,
-        } => match dtype {
-            DType::F32 => Tensor::full(*value as f32, shape.clone(), device)?,
-            DType::F64 => Tensor::full(*value, shape.clone(), device)?,
-            DType::I64 => Tensor::full(*value as i64, shape.clone(), device)?,
-            DType::U8 => Tensor::full(*value as u8, shape.clone(), device)?,
-            DType::U32 => Tensor::full(*value as u32, shape.clone(), device)?,
-            DType::F16 => Tensor::full(half::f16::from_f64(*value), shape.clone(), device)?,
-            DType::BF16 => Tensor::full(half::bf16::from_f64(*value), shape.clone(), device)?,
-            dtype => {
-                return Err(candle_core::Error::Msg(format!(
-                    "full not supported for dtype {dtype:?}"
-                )))
+        } => {
+            if device.is_cpu() {
+                let r = runtime::cpu::Tensor::full(shape, *value, bridge::dtype_to_native(*dtype));
+                return bridge::to_candle(&r);
             }
-        },
+            match dtype {
+                DType::F32 => Tensor::full(*value as f32, shape.clone(), device)?,
+                DType::F64 => Tensor::full(*value, shape.clone(), device)?,
+                DType::I64 => Tensor::full(*value as i64, shape.clone(), device)?,
+                DType::U8 => Tensor::full(*value as u8, shape.clone(), device)?,
+                DType::U32 => Tensor::full(*value as u32, shape.clone(), device)?,
+                DType::F16 => Tensor::full(half::f16::from_f64(*value), shape.clone(), device)?,
+                DType::BF16 => Tensor::full(half::bf16::from_f64(*value), shape.clone(), device)?,
+                dtype => {
+                    return Err(candle_core::Error::Msg(format!(
+                        "full not supported for dtype {dtype:?}"
+                    )))
+                }
+            }
+        }
         NodeKind::Randn {
             shape,
             dtype,
             device,
-        } => Tensor::randn(0f32, 1f32, shape.clone(), device)?.to_dtype(*dtype)?,
+        } => {
+            if device.is_cpu() {
+                let r = runtime::cpu::Tensor::randn(shape, bridge::dtype_to_native(*dtype));
+                return bridge::to_candle(&r);
+            }
+            Tensor::randn(0f32, 1f32, shape.clone(), device)?.to_dtype(*dtype)?
+        }
         NodeKind::Uniform {
             lo,
             hi,
             shape,
             dtype,
             device,
-        } => Tensor::rand(*lo as f32, *hi as f32, shape.clone(), device)?.to_dtype(*dtype)?,
+        } => {
+            if device.is_cpu() {
+                let r = runtime::cpu::Tensor::uniform(*lo, *hi, shape, bridge::dtype_to_native(*dtype));
+                return bridge::to_candle(&r);
+            }
+            Tensor::rand(*lo as f32, *hi as f32, shape.clone(), device)?.to_dtype(*dtype)?
+        }
         NodeKind::Arange {
             start,
             end,
@@ -4358,12 +4388,20 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> candle_core::Result<Te
             dtype,
             device,
         } => {
+            if device.is_cpu() {
+                let r = runtime::cpu::Tensor::arange(*start, *end, *step, bridge::dtype_to_native(*dtype));
+                return bridge::to_candle(&r);
+            }
             let n = ((end - start) / step).ceil().max(0.0) as usize;
             let base = Tensor::arange(0u32, n as u32, device)?;
             let scaled = (base * *step)?;
             (scaled + *start)?.to_dtype(*dtype)?
         }
         NodeKind::Eye { n, dtype, device } => {
+            if device.is_cpu() {
+                let r = runtime::cpu::Tensor::eye(*n, bridge::dtype_to_native(*dtype));
+                return bridge::to_candle(&r);
+            }
             let i = Tensor::arange(0u32, *n as u32, device)?.reshape((*n, 1))?;
             let j = Tensor::arange(0u32, *n as u32, device)?.reshape((1, *n))?;
             i.broadcast_eq(&j)?.to_dtype(*dtype)?
@@ -4565,17 +4603,30 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> candle_core::Result<Te
             let b = b.broadcast_as(shape)?;
             cond.where_cond(&a, &b)?
         }
-        NodeKind::Argmax { a, dim } => ev.value(a.id)?.argmax(*dim)?.to_dtype(DType::I64)?,
-        NodeKind::Argmin { a, dim } => ev.value(a.id)?.argmin(*dim)?.to_dtype(DType::I64)?,
+        NodeKind::Argmax { a, dim } => {
+            let x = ev.value(a.id)?;
+            if x.device().is_cpu() {
+                let r = bridge::from_candle(&x)?.argmax(*dim).cast(runtime::dtype::DType::I64);
+                return bridge::to_candle(&r);
+            }
+            x.argmax(*dim)?.to_dtype(DType::I64)?
+        }
+        NodeKind::Argmin { a, dim } => {
+            let x = ev.value(a.id)?;
+            if x.device().is_cpu() {
+                let r = bridge::from_candle(&x)?.argmin(*dim).cast(runtime::dtype::DType::I64);
+                return bridge::to_candle(&r);
+            }
+            x.argmin(*dim)?.to_dtype(DType::I64)?
+        }
         NodeKind::Cumsum { a, dim } => {
+            let x = ev.value(a.id)?;
+            if x.device().is_cpu() {
+                return bridge::to_candle(&bridge::from_candle(&x)?.cumsum(*dim));
+            }
             // cumsum is implemented as a matmul internally and chokes on
             // stride-0 broadcast inputs
-            ev.value(a.id)?.contiguous()?.cumsum(*dim)?
-        }
-        NodeKind::IndexSelect { a, dim, indexes } => {
-            let a = ev.value(a.id)?;
-            let indexes = ev.value(indexes.id)?;
-            a.contiguous()?.index_select(&indexes, *dim)?
+            x.contiguous()?.cumsum(*dim)?
         }
         NodeKind::ScatterAdd {
             a,
@@ -4586,13 +4637,34 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> candle_core::Result<Te
             let a = ev.value(a.id)?;
             let indexes = ev.value(indexes.id)?;
             let src = ev.value(src.id)?;
+            if a.device().is_cpu() {
+                let r = bridge::from_candle(&a)?.scatter_add(
+                    *dim,
+                    &bridge::from_candle(&indexes)?,
+                    &bridge::from_candle(&src)?,
+                );
+                return bridge::to_candle(&r);
+            }
             a.contiguous()?
                 .scatter_add(&indexes.contiguous()?, &src.contiguous()?, *dim)?
         }
         NodeKind::Gather { a, dim, indexes } => {
             let a = ev.value(a.id)?;
             let indexes = ev.value(indexes.id)?;
+            if a.device().is_cpu() {
+                let r = bridge::from_candle(&a)?.gather(*dim, &bridge::from_candle(&indexes)?);
+                return bridge::to_candle(&r);
+            }
             a.contiguous()?.gather(&indexes.contiguous()?, *dim)?
+        }
+        NodeKind::IndexSelect { a, dim, indexes } => {
+            let a = ev.value(a.id)?;
+            let indexes = ev.value(indexes.id)?;
+            if a.device().is_cpu() {
+                let r = bridge::from_candle(&a)?.index_select(*dim, &bridge::from_candle(&indexes)?);
+                return bridge::to_candle(&r);
+            }
+            a.contiguous()?.index_select(&indexes, *dim)?
         }
         NodeKind::CrossEntropy {
             logits,
@@ -4918,28 +4990,66 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> candle_core::Result<Te
                 *groups,
             )?
         }
-        NodeKind::Pow { a, exp } => ev.value(a.id)?.powf(*exp)?,
-        NodeKind::Cast { a, dtype } => ev.value(a.id)?.to_dtype(*dtype)?,
+        NodeKind::Pow { a, exp } => {
+            let x = ev.value(a.id)?;
+            if x.device().is_cpu() {
+                return bridge::to_candle(&bridge::from_candle(&x)?.powf(*exp));
+            }
+            x.powf(*exp)?
+        }
+        NodeKind::Cast { a, dtype } => {
+            let x = ev.value(a.id)?;
+            if x.device().is_cpu() {
+                return bridge::to_candle(&bridge::from_candle(&x)?.cast(bridge::dtype_to_native(*dtype)));
+            }
+            x.to_dtype(*dtype)?
+        }
         NodeKind::Sum { a, dims, keepdims } => {
             let t = ev.value(a.id)?;
+            if t.device().is_cpu() {
+                let r = bridge::from_candle(&t)?.sum(dims);
+                let r = if *keepdims { r } else { r.squeeze_dims(dims) };
+                return bridge::to_candle(&r);
+            }
             reduce_dims(&t, dims, *keepdims, |t, d| t.sum(d))?
         }
         NodeKind::Mean { a, dims, keepdims } => {
             let t = ev.value(a.id)?;
+            if t.device().is_cpu() {
+                let r = bridge::from_candle(&t)?.mean(dims);
+                let r = if *keepdims { r } else { r.squeeze_dims(dims) };
+                return bridge::to_candle(&r);
+            }
             reduce_dims(&t, dims, *keepdims, |t, d| t.mean(d))?
         }
         NodeKind::Max { a, dims, keepdims } => {
             let t = ev.value(a.id)?;
+            if t.device().is_cpu() {
+                let r = bridge::from_candle(&t)?.max(dims);
+                let r = if *keepdims { r } else { r.squeeze_dims(dims) };
+                return bridge::to_candle(&r);
+            }
             reduce_dims(&t, dims, *keepdims, |t, d| t.max(d))?
         }
         NodeKind::Min { a, dims, keepdims } => {
             let t = ev.value(a.id)?;
+            if t.device().is_cpu() {
+                let r = bridge::from_candle(&t)?.min(dims);
+                let r = if *keepdims { r } else { r.squeeze_dims(dims) };
+                return bridge::to_candle(&r);
+            }
             reduce_dims(&t, dims, *keepdims, |t, d| t.min(d))?
         }
         NodeKind::Prod { a, dims, keepdims } => {
+            let t = ev.value(a.id)?;
+            if t.device().is_cpu() {
+                let r = bridge::from_candle(&t)?.prod(dims);
+                let r = if *keepdims { r } else { r.squeeze_dims(dims) };
+                return bridge::to_candle(&r);
+            }
             // no product kernel in candle: fold narrow+mul per reduced dim,
             // keeping reduced dims as size 1 so later indices stay valid
-            let mut t = ev.value(a.id)?;
+            let mut t = t;
             for &d in dims {
                 let n = t.dims()[d];
                 if n == 0 {
@@ -4966,10 +5076,46 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> candle_core::Result<Te
             }
             t
         }
-        NodeKind::Reshape { a, shape } => ev.value(a.id)?.reshape(shape.clone())?,
-        NodeKind::Permute { a, dims } => ev.value(a.id)?.permute(dims.clone())?,
+        NodeKind::Reshape { a, shape } => {
+            let x = ev.value(a.id)?;
+            if x.device().is_cpu() {
+                let r = bridge::from_candle(&x)?;
+                let r = r.contiguous().view(runtime::layout::Layout::contiguous(shape.clone()));
+                return bridge::to_candle(&r);
+            }
+            x.reshape(shape.clone())?
+        }
+        NodeKind::Permute { a, dims } => {
+            let x = ev.value(a.id)?;
+            if x.device().is_cpu() {
+                let r = bridge::from_candle(&x)?;
+                let r = r.view(r.layout.permute(dims)).contiguous();
+                return bridge::to_candle(&r);
+            }
+            x.permute(dims.clone())?
+        }
         NodeKind::Slice { a, ranges } => {
-            let mut t = ev.value(a.id)?;
+            let t = ev.value(a.id)?;
+            if t.device().is_cpu() {
+                let mut r = bridge::from_candle(&t)?;
+                for (dim, &(start, stop, stride)) in ranges.iter().enumerate() {
+                    let len = stop.saturating_sub(start).div_ceil(stride);
+                    if len == 0 {
+                        let mut shape = r.shape().to_vec();
+                        shape[dim] = 0;
+                        r = runtime::cpu::Tensor::zeros(&shape, r.dtype());
+                        continue;
+                    }
+                    r = r.view(r.layout.narrow(dim, start, (len - 1) * stride + 1)).contiguous();
+                    if stride > 1 {
+                        let idx: Vec<u32> = (0..len as u32).map(|i| i * stride as u32).collect();
+                        let idx = runtime::cpu::Tensor::from_vec(idx, vec![len]);
+                        r = r.index_select(dim, &idx);
+                    }
+                }
+                return bridge::to_candle(&r);
+            }
+            let mut t = t;
             for (dim, &(start, stop, stride)) in ranges.iter().enumerate() {
                 let len = stop.saturating_sub(start).div_ceil(stride);
                 if len == 0 {
@@ -4988,14 +5134,30 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> candle_core::Result<Te
         NodeKind::Concat { a, b, dim } => {
             let a = ev.value(a.id)?;
             let b = ev.value(b.id)?;
+            if a.device().is_cpu() {
+                let r = runtime::cpu::Tensor::cat(
+                    &[&bridge::from_candle(&a)?, &bridge::from_candle(&b)?],
+                    *dim,
+                );
+                return bridge::to_candle(&r);
+            }
             Tensor::cat(&[&a, &b], *dim)?
         }
         NodeKind::BroadcastTo { a, shape } => {
-            ev.value(a.id)?.broadcast_as(shape.clone())?
+            let x = ev.value(a.id)?;
+            if x.device().is_cpu() {
+                let r = bridge::from_candle(&x)?;
+                let r = r.view(r.layout.broadcast_to(shape)).contiguous();
+                return bridge::to_candle(&r);
+            }
+            x.broadcast_as(shape.clone())?
         }
         NodeKind::Matmul { a, b } => {
             let a = ev.value(a.id)?;
             let b = ev.value(b.id)?;
+            if a.device().is_cpu() {
+                return bridge::to_candle(&bridge::from_candle(&a)?.matmul(&bridge::from_candle(&b)?));
+            }
             // candle's matmul requires contiguous operands; permuted or
             // broadcast layouts (common in backward graphs) must be
             // materialized first.
@@ -5004,19 +5166,28 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> candle_core::Result<Te
             a.broadcast_matmul(&b)?
         }
         NodeKind::Inverse { a } => {
-            // linalg is CPU-only: round-trip to the host
             let t = ev.value(a.id)?;
+            if t.device().is_cpu() {
+                return bridge::to_candle(&bridge::from_candle(&t)?.inverse());
+            }
+            // linalg is CPU-only: round-trip to the host
             let cpu = t.to_device(&Device::Cpu)?;
             batch_linalg(&cpu, &cpu_inverse)?.to_device(t.device())?
         }
         NodeKind::Det { a } => {
             let t = ev.value(a.id)?;
+            if t.device().is_cpu() {
+                return bridge::to_candle(&bridge::from_candle(&t)?.det());
+            }
             let cpu = t.to_device(&Device::Cpu)?;
             batch_linalg(&cpu, &cpu_det)?.to_device(t.device())?
         }
         NodeKind::Solve { a, b } => {
             let a = ev.value(a.id)?;
             let b = ev.value(b.id)?;
+            if a.device().is_cpu() {
+                return bridge::to_candle(&bridge::from_candle(&a)?.solve(&bridge::from_candle(&b)?));
+            }
             let a_cpu = a.to_device(&Device::Cpu)?;
             let b_cpu = b.to_device(&Device::Cpu)?;
             batch_solve(&a_cpu, &b_cpu)?.to_device(a.device())?

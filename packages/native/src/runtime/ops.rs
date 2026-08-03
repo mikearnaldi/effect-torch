@@ -202,6 +202,27 @@ impl Tensor {
         }
     }
 
+    pub fn powf(&self, e: f64) -> Tensor {
+        dispatch_float_unary!(
+            self,
+            |x: f32| x.powf(e as f32),
+            |x: f64| x.powf(e),
+            |x: f16| f16::from_f32(x.to_f32().powf(e as f32)),
+            |x: bf16| bf16::from_f32(x.to_f32().powf(e as f32))
+        )
+    }
+
+    pub fn squeeze_dims(&self, dims: &[usize]) -> Tensor {
+        let shape: Vec<usize> = self
+            .shape()
+            .iter()
+            .enumerate()
+            .filter(|(d, &s)| !dims.contains(d) || s != 1)
+            .map(|(_, &s)| s)
+            .collect();
+        self.contiguous().view(Layout::contiguous(shape))
+    }
+
     float_ops!(sqrt, |x: f32| x.sqrt(), |x: f64| x.sqrt());
     float_ops!(exp, |x: f32| x.exp(), |x: f64| x.exp());
     float_ops!(log, |x: f32| x.ln(), |x: f64| x.ln());
