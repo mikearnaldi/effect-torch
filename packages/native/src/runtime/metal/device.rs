@@ -221,6 +221,20 @@ impl MetalDevice {
         Arc::new(Buffer { raw, size: bucket_size })
     }
 
+    pub fn alloc_with_data_u32(&self, data: &[u32]) -> Arc<Buffer> {
+        let size = data.len() * 4;
+        let bucket_size = size.next_power_of_two().max(16);
+        let raw = unsafe {
+            self.raw.newBufferWithBytes_length_options(
+                NonNull::new(data.as_ptr() as *const std::ffi::c_void as *mut std::ffi::c_void).unwrap(),
+                bucket_size,
+                SHARED_OPTIONS,
+            )
+        }
+        .expect("metal buffer allocation failed");
+        Arc::new(Buffer { raw, size: bucket_size })
+    }
+
     pub fn compile(&self, key: u64, source: &str, name: &str) -> Result<Pipeline, String> {
         let mut cache = self.pipelines.lock().unwrap();
         if let Some(p) = cache.get(&key) {
