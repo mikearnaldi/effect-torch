@@ -1,0 +1,326 @@
+use super::device::{set_buffer, set_bytes, MetalDevice};
+use objc2_metal::MTLComputeCommandEncoder;
+use super::run::MetalTensor;
+use crate::runtime::dtype::DType;
+
+fn msl_type(d: DType) -> &'static str {
+    match d {
+        DType::F32 => "float",
+        DType::F64 => "double",
+        DType::F16 => "half",
+        DType::BF16 => "bfloat",
+        DType::U8 => "uchar",
+        DType::U32 => "uint",
+        DType::I64 => "long",
+    }
+}
+
+fn key(parts: &[u64]) -> u64 {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut h = DefaultHasher::new();
+    for p in parts {
+        p.hash(&mut h);
+    }
+    h.finish()
+}
+
+pub fn fill(dev: &MetalDevice, out: &MetalTensor, value: f64) -> Result<(), String> {
+    let n = out.numel();
+    if n == 0 {
+        return Ok(());
+    }
+    let ty = msl_type(out.dtype);
+    let src = format!(
+        r#"
+#include <metal_stdlib>
+using namespace metal;
+kernel void et_fill(device {ty}* out [[buffer(0)]], constant float& v [[buffer(1)]], uint i [[thread_position_in_grid]]) {{
+    if (i < {n}u) out[i] = ({ty})v;
+}}
+"#
+    );
+    let pipeline = dev.compile(key(&[0xF111, out.dtype as u64]), &src, "et_fill")?;
+    let v = value as f32;
+    let padded = n.div_ceil(256) * 256;
+    dev.with_encoder(|e| {
+        e.setComputePipelineState(pipeline.as_raw());
+        set_buffer(e, 0, &out.buffer, out.layout.offset() * out.dtype.size_in_bytes());
+        set_bytes(e, 1, &v);
+        e.dispatchThreads_threadsPerThreadgroup(MetalDevice::grid(padded, 1, 1), MetalDevice::grid(256, 1, 1));
+    });
+    Ok(())
+}
+
+pub fn cast(dev: &MetalDevice, x: &MetalTensor, dtype: DType) -> Result<MetalTensor, String> {
+    if x.dtype == dtype {
+        return Ok(MetalTensor {
+            buffer: x.buffer.clone(),
+            layout: x.layout.clone(),
+            dtype,
+        });
+    }
+    let n = x.numel();
+    let out = MetalTensor::zeros(dev, x.layout.shape().to_vec(), dtype);
+    if n == 0 {
+        return Ok(out);
+    }
+    let (src_ty, dst_ty) = (msl_type(x.dtype), msl_type(dtype));
+    let src = format!(
+        r#"
+#include <metal_stdlib>
+using namespace metal;
+kernel void et_cast(device const {src_ty}* a [[buffer(0)]], device {dst_ty}* out [[buffer(1)]], uint i [[thread_position_in_grid]]) {{
+    if (i < {n}u) out[i] = ({dst_ty})a[i];
+}}
+"#
+    );
+    let pipeline = dev.compile(key(&[0xCA57, x.dtype as u64, dtype as u64]), &src, "et_cast")?;
+    let padded = n.div_ceil(256) * 256;
+    dev.with_encoder(|e| {
+        e.setComputePipelineState(pipeline.as_raw());
+        set_buffer(e, 0, &x.buffer, x.layout.offset() * x.dtype.size_in_bytes());
+        set_buffer(e, 1, &out.buffer, 0);
+        e.dispatchThreads_threadsPerThreadgroup(MetalDevice::grid(padded, 1, 1), MetalDevice::grid(256, 1, 1));
+    });
+    Ok(out)
+}
+
+pub fn strided_copy(dev: &MetalDevice, x: &MetalTensor) -> Result<MetalTensor, String> {
+    if x.layout.is_contiguous() && x.layout.offset() == 0 {
+        return Ok(x.clone());
+    }
+    let n = x.numel();
+    let out = MetalTensor::zeros(dev, x.layout.shape().to_vec(), x.dtype);
+    if n == 0 {
+        return Ok(out);
+    }
+    let shape = x.layout.shape();
+    let strides = x.layout.strides();
+    let ty = msl_type(x.dtype);
+    let rank = shape.len();
+    let contig = crate::runtime::layout::Layout::contiguous(shape.to_vec());
+    let cs = contig.strides().to_vec();
+    let mut decompose = String::new();
+    for d in 0..rank {
+        if strides[d] == 0 || shape[d] == 1 {
+            continue;
+        }
+        let coord = if d == rank - 1 {
+            format!("(i % {})", shape[d])
+        } else {
+            format!("((i / {}) % {})", cs[d], shape[d])
+        };
+        if strides[d] == 1 {
+            decompose.push_str(&format!("            src_off += {coord};\n"));
+        } else {
+            decompose.push_str(&format!("            src_off += {coord} * {};\n", strides[d]));
+        }
+    }
+    let src = format!(
+        r#"
+#include <metal_stdlib>
+using namespace metal;
+kernel void et_scopy(device const {ty}* a [[buffer(0)]], device {ty}* out [[buffer(1)]], uint i [[thread_position_in_grid]]) {{
+    if (i < {n}u) {{
+        uint src_off = 0u;
+{decompose}        out[i] = a[src_off];
+    }}
+}}
+"#
+    );
+    let pipeline = dev.compile(key(&[0x5C09, x.dtype as u64, key(&[shape.iter().map(|&v| v as u64).sum::<u64>(), strides.iter().map(|&v| v as u64).sum::<u64>()])]), &src, "et_scopy")?;
+    let padded = n.div_ceil(256) * 256;
+    dev.with_encoder(|e| {
+        e.setComputePipelineState(pipeline.as_raw());
+        set_buffer(e, 0, &x.buffer, x.layout.offset() * x.dtype.size_in_bytes());
+        set_buffer(e, 1, &out.buffer, 0);
+        e.dispatchThreads_threadsPerThreadgroup(MetalDevice::grid(padded, 1, 1), MetalDevice::grid(256, 1, 1));
+    });
+    Ok(out)
+}
+
+const RNG_SRC: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+inline ulong xoro_next(thread ulong& s0, thread ulong& s1) {
+    ulong r = s0 + s1;
+    s1 ^= s0;
+    s0 = (s0 << 55 | s0 >> 9) ^ s1 ^ (s1 << 14);
+    s1 = (s1 << 36 | s1 >> 28);
+    return r;
+}
+
+inline void xoro_seed(thread ulong& s0, thread ulong& s1, ulong seed) {
+    ulong s = seed + 0x9E3779B97F4A7C15ul;
+    s ^= s << 13; s ^= s >> 7; s ^= s << 17;
+    s0 = s;
+    s ^= s << 13; s ^= s >> 7; s ^= s << 17;
+    s1 = s;
+}
+
+inline float xoro_f32(thread ulong& s0, thread ulong& s1) {
+    return (float)(xoro_next(s0, s1) >> 40) * (1.0f / 16777216.0f);
+}
+"#;
+
+pub fn randn(dev: &MetalDevice, shape: &[usize], seed: u64) -> Result<MetalTensor, String> {
+    let n: usize = shape.iter().product();
+    let out = MetalTensor::zeros(dev, shape.to_vec(), DType::F32);
+    if n == 0 {
+        return Ok(out);
+    }
+    let src = format!(
+        r#"{RNG_SRC}
+kernel void et_randn(device float* out [[buffer(0)]], uint i [[thread_position_in_grid]]) {{
+    if (i < {n}u) {{
+        ulong s0, s1;
+        xoro_seed(s0, s1, {seed}ul + (ulong)i * 0x9E3779B97F4A7C15ul);
+        float u1 = max(xoro_f32(s0, s1), 1e-12f);
+        float u2 = xoro_f32(s0, s1);
+        out[i] = sqrt(-2.0f * log(u1)) * cos(2.0f * M_PI_F * u2);
+    }}
+}}
+"#
+    );
+    let pipeline = dev.compile(key(&[0x8A11, seed, n as u64]), &src, "et_randn")?;
+    let padded = n.div_ceil(256) * 256;
+    dev.with_encoder(|e| {
+        e.setComputePipelineState(pipeline.as_raw());
+        set_buffer(e, 0, &out.buffer, 0);
+        e.dispatchThreads_threadsPerThreadgroup(MetalDevice::grid(padded, 1, 1), MetalDevice::grid(256, 1, 1));
+    });
+    Ok(out)
+}
+
+pub fn uniform(dev: &MetalDevice, lo: f64, hi: f64, shape: &[usize], seed: u64) -> Result<MetalTensor, String> {
+    let n: usize = shape.iter().product();
+    let out = MetalTensor::zeros(dev, shape.to_vec(), DType::F32);
+    if n == 0 {
+        return Ok(out);
+    }
+    let src = format!(
+        r#"{RNG_SRC}
+kernel void et_uniform(device float* out [[buffer(0)]], uint i [[thread_position_in_grid]]) {{
+    if (i < {n}u) {{
+        ulong s0, s1;
+        xoro_seed(s0, s1, {seed}ul + (ulong)i * 0x9E3779B97F4A7C15ul);
+        out[i] = {:?}f + ({:?}f - {:?}f) * xoro_f32(s0, s1);
+    }}
+}}
+"#,
+        lo as f32, hi as f32, lo as f32
+    );
+    let pipeline = dev.compile(key(&[0x0B1F, seed, n as u64, lo.to_bits() as u64, hi.to_bits() as u64]), &src, "et_uniform")?;
+    let padded = n.div_ceil(256) * 256;
+    dev.with_encoder(|e| {
+        e.setComputePipelineState(pipeline.as_raw());
+        set_buffer(e, 0, &out.buffer, 0);
+        e.dispatchThreads_threadsPerThreadgroup(MetalDevice::grid(padded, 1, 1), MetalDevice::grid(256, 1, 1));
+    });
+    Ok(out)
+}
+
+pub fn arange(dev: &MetalDevice, start: f64, end: f64, step: f64, dtype: DType) -> Result<MetalTensor, String> {
+    let n = ((end - start) / step).ceil().max(0.0) as usize;
+    let out = MetalTensor::zeros(dev, vec![n], dtype);
+    if n == 0 {
+        return Ok(out);
+    }
+    let ty = msl_type(dtype);
+    let src = format!(
+        r#"
+#include <metal_stdlib>
+using namespace metal;
+kernel void et_arange(device {ty}* out [[buffer(0)]], uint i [[thread_position_in_grid]]) {{
+    if (i < {n}u) out[i] = ({ty})((float)i * {:?}f + {:?}f);
+}}
+"#,
+        step, start
+    );
+    let pipeline = dev.compile(key(&[0xA26E, dtype as u64, start.to_bits(), step.to_bits()]), &src, "et_arange")?;
+    let padded = n.div_ceil(256) * 256;
+    dev.with_encoder(|e| {
+        e.setComputePipelineState(pipeline.as_raw());
+        set_buffer(e, 0, &out.buffer, 0);
+        e.dispatchThreads_threadsPerThreadgroup(MetalDevice::grid(padded, 1, 1), MetalDevice::grid(256, 1, 1));
+    });
+    Ok(out)
+}
+
+pub fn eye(dev: &MetalDevice, n: usize, dtype: DType) -> Result<MetalTensor, String> {
+    let out = MetalTensor::zeros(dev, vec![n, n], dtype);
+    fill(dev, &out, 0.0)?;
+    if n == 0 {
+        return Ok(out);
+    }
+    let ty = msl_type(dtype);
+    let src = format!(
+        r#"
+#include <metal_stdlib>
+using namespace metal;
+kernel void et_eye(device {ty}* out [[buffer(0)]], uint i [[thread_position_in_grid]]) {{
+    if (i < {n}u) out[i * {n}u + i] = ({ty})1;
+}}
+"#
+    );
+    let pipeline = dev.compile(key(&[0xE7E, dtype as u64, n as u64]), &src, "et_eye")?;
+    dev.with_encoder(|e| {
+        e.setComputePipelineState(pipeline.as_raw());
+        set_buffer(e, 0, &out.buffer, 0);
+        e.dispatchThreads_threadsPerThreadgroup(MetalDevice::grid(n, 1, 1), MetalDevice::grid(n.min(256), 1, 1));
+    });
+    Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cast_f16_roundtrip() {
+        let dev = MetalDevice::get();
+        let x = MetalTensor::from_f32(dev, vec![1.5, -2.25, 100.0], vec![3]);
+        let h = cast(dev, &x, DType::F16).unwrap();
+        let back = cast(dev, &h, DType::F32).unwrap();
+        dev.synchronize();
+        assert_eq!(back.read_f32(), vec![1.5, -2.25, 100.0]);
+    }
+
+    #[test]
+    fn strided_copy_permuted() {
+        let dev = MetalDevice::get();
+        let x = MetalTensor::from_f32(dev, (0..6).map(|v| v as f32).collect(), vec![2, 3]);
+        let p = MetalTensor {
+            buffer: x.buffer.clone(),
+            layout: x.layout.permute(&[1, 0]),
+            dtype: x.dtype,
+        };
+        let c = strided_copy(dev, &p).unwrap();
+        dev.synchronize();
+        assert_eq!(c.read_f32(), vec![0., 3., 1., 4., 2., 5.]);
+    }
+
+    #[test]
+    fn randn_deterministic_per_seed() {
+        let dev = MetalDevice::get();
+        let a = randn(dev, &[8], 42).unwrap();
+        let b = randn(dev, &[8], 42).unwrap();
+        dev.synchronize();
+        assert_eq!(a.read_f32(), b.read_f32());
+        let m: f32 = a.read_f32().iter().sum::<f32>() / 8.0;
+        assert!(m.abs() < 2.0);
+    }
+
+    #[test]
+    fn arange_eye_fill() {
+        let dev = MetalDevice::get();
+        let a = arange(dev, 0.0, 5.0, 2.0, DType::F32).unwrap();
+        dev.synchronize();
+        assert_eq!(a.read_f32(), vec![0., 2., 4.]);
+        let e = eye(dev, 2, DType::F32).unwrap();
+        dev.synchronize();
+        assert_eq!(e.read_f32(), vec![1., 0., 0., 1.]);
+    }
+}

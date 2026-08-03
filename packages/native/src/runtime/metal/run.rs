@@ -5,6 +5,7 @@ use crate::fusion::{Expr, ReduceOp};
 use crate::runtime::dtype::DType;
 use std::sync::Arc;
 
+#[derive(Clone)]
 pub struct MetalTensor {
     pub buffer: Arc<super::device::Buffer>,
     pub layout: crate::runtime::layout::Layout,
