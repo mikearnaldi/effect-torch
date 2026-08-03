@@ -17,17 +17,12 @@ pub use metal::rotary;
 
 #[cfg(target_os = "macos")]
 mod metal {
-    use candle_core::{DType, MetalStorage, Storage, Tensor};
-    use candle_metal_kernels::metal::ComputePipeline;
-    use std::collections::HashMap;
-    use std::sync::{Mutex, OnceLock};
+    use crate::bridge;
+    use crate::runtime::metal::device::{set_buffer, set_bytes, MetalDevice, Pipeline};
+    use candle_core::{DType, Tensor};
+    use objc2_metal::MTLComputeCommandEncoder;
 
     const NT: usize = 256;
-
-    fn pipelines() -> &'static Mutex<HashMap<u64, ComputePipeline>> {
-        static CACHE: OnceLock<Mutex<HashMap<u64, ComputePipeline>>> = OnceLock::new();
-        CACHE.get_or_init(|| Mutex::new(HashMap::new()))
-    }
 
     // One thread per (row, t, j): angle = (offset + t) * theta^(-2j/D);
     // GPT-NeoX half-split rotation. sign = -1 gives the transpose
@@ -67,36 +62,16 @@ kernel void et_rotary(
 "#
     }
 
-    fn pipeline(mdev: &candle_core::MetalDevice) -> candle_core::Result<ComputePipeline> {
+    fn pipeline(_mdev: &candle_core::MetalDevice) -> candle_core::Result<Pipeline> {
         use std::collections::hash_map::DefaultHasher;
         use std::hash::{Hash, Hasher};
 
         let mut hasher = DefaultHasher::new();
         "et_rotary".hash(&mut hasher);
         let key = hasher.finish();
-        let mut cache = pipelines().lock().unwrap();
-        if let Some(p) = cache.get(&key) {
-            return Ok(p.clone());
-        }
-        #[allow(deprecated)]
-        let opts = {
-            let o = objc2_metal::MTLCompileOptions::new();
-            o.setFastMathEnabled(false);
-            o
-        };
-        let lib = mdev
-            .device()
-            .new_library_with_source(source(), Some(&opts))
-            .map_err(|e| candle_core::Error::Msg(format!("rotary: {e}")))?;
-        let func = lib
-            .get_function("et_rotary", None)
-            .map_err(|e| candle_core::Error::Msg(format!("rotary: {e}")))?;
-        let p = mdev
-            .device()
-            .new_compute_pipeline_state_with_function(&func)
-            .map_err(|e| candle_core::Error::Msg(format!("rotary: {e}")))?;
-        cache.insert(key, p.clone());
-        Ok(p)
+        MetalDevice::get()
+            .compile(key, source(), "et_rotary")
+            .map_err(candle_core::Error::Msg)
     }
 
     /// x [.., T, D] -> R(sign·angles) x. `offsets` is one position
@@ -123,62 +98,44 @@ kernel void et_rotary(
         };
         let device = x.device();
         let mdev = device.as_metal_device()?;
-        let x = x.contiguous()?;
-        let offsets = Tensor::from_vec(offsets_vec.clone(), offsets_vec.len(), device)?;
-        let out_buf = mdev.new_buffer(x.elem_count(), DType::F32, "rotary")?;
-        let encoder = mdev.command_encoder()?;
-        let encoder = encoder.as_ref();
-        encoder.set_compute_pipeline_state(&pipeline(mdev)?);
-        {
-            let (storage, layout) = x.storage_and_layout();
-            let metal = match &*storage {
-                Storage::Metal(m) => m,
-                _ => {
-                    return Err(candle_core::Error::Msg(
-                        "rotary: expected Metal storage".to_string(),
-                    ))
-                }
-            };
-            encoder.set_input_buffer(0, Some(metal.buffer()), layout.start_offset() * DType::F32.size_in_bytes());
-        }
-        {
-            let (storage, layout) = offsets.storage_and_layout();
-            let metal = match &*storage {
-                Storage::Metal(m) => m,
-                _ => {
-                    return Err(candle_core::Error::Msg(
-                        "rotary: expected Metal storage".to_string(),
-                    ))
-                }
-            };
-            encoder.set_input_buffer(2, Some(metal.buffer()), layout.start_offset() * DType::F32.size_in_bytes());
-        }
-        encoder.set_output_buffer(1, Some(&out_buf), 0);
-        encoder.set_bytes(3, &(t as u32));
-        encoder.set_bytes(4, &(d as u32));
-        encoder.set_bytes(5, &(rows_per_batch as u32));
-        encoder.set_bytes(6, &(theta as f32));
-        encoder.set_bytes(7, &sign);
-        encoder.set_bytes(8, &(rows as u32));
-        let total = rows * t * (d / 2);
-        encoder.dispatch_threads(
-            objc2_metal::MTLSize {
-                width: total.div_ceil(NT) * NT,
-                height: 1,
-                depth: 1,
-            },
-            objc2_metal::MTLSize {
-                width: NT,
-                height: 1,
-                depth: 1,
-            },
-        );
-        Ok(Tensor::from_storage(
-            Storage::Metal(MetalStorage::new(out_buf, mdev.clone(), x.elem_count(), DType::F32)),
-            x.dims(),
-            candle_core::op::BackpropOp::none(),
-            false,
-        ))
+        let xn = bridge::metal::wrap(x)?;
+        let xn = if xn.layout.is_contiguous() {
+            xn
+        } else {
+            crate::runtime::metal::kernels::strided_copy(MetalDevice::get(), &xn)
+                .map_err(candle_core::Error::Msg)?
+        };
+        device.synchronize()?;
+        let offsets_buf = MetalDevice::get().alloc_with_data(&offsets_vec);
+        let out_buf = MetalDevice::get().alloc(xn.numel().max(1), crate::runtime::dtype::DType::F32);
+        let pipe = pipeline(mdev)?;
+        MetalDevice::get().with_encoder(|e| {
+            e.setComputePipelineState(pipe.as_raw());
+            set_buffer(e, 0, &xn.buffer, xn.layout.offset() * DType::F32.size_in_bytes());
+            set_buffer(e, 2, &offsets_buf, 0);
+            set_buffer(e, 1, &out_buf, 0);
+            set_bytes(e, 3, &(t as u32));
+            set_bytes(e, 4, &(d as u32));
+            set_bytes(e, 5, &(rows_per_batch as u32));
+            set_bytes(e, 6, &(theta as f32));
+            set_bytes(e, 7, &sign);
+            set_bytes(e, 8, &(rows as u32));
+            let total = rows * t * (d / 2);
+            e.dispatchThreads_threadsPerThreadgroup(
+                objc2_metal::MTLSize {
+                    width: total.div_ceil(NT) * NT,
+                    height: 1,
+                    depth: 1,
+                },
+                objc2_metal::MTLSize {
+                    width: NT,
+                    height: 1,
+                    depth: 1,
+                },
+            );
+        });
+        MetalDevice::get().synchronize();
+        bridge::metal::unwrap(&out_buf, x.dims().to_vec(), DType::F32, mdev)
     }
 }
 
