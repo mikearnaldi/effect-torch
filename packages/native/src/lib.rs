@@ -5396,6 +5396,23 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> candle_core::Result<Te
                     next_p
                 }
                 None => {
+                    if p.device().is_cpu() {
+                        let (next_p, next_m, next_v) = runtime::composed::adamw_step(
+                            &bridge::from_candle(&p)?,
+                            &bridge::from_candle(&g)?,
+                            &bridge::from_candle(&m_t)?,
+                            &bridge::from_candle(&v_t)?,
+                            &bridge::from_candle(&lr_t)?,
+                            &bridge::from_candle(&c1_t)?,
+                            &bridge::from_candle(&c2_t)?,
+                            *beta1,
+                            *beta2,
+                            *eps,
+                            *weight_decay,
+                        );
+                        ev.adamw.insert(node.id, [bridge::to_candle(&next_m)?, bridge::to_candle(&next_v)?]);
+                        return bridge::to_candle(&next_p);
+                    }
                     let one_minus_beta1 = 1.0 - *beta1;
                     let one_minus_beta2 = 1.0 - *beta2;
                     let next_m = ((m_t * *beta1)? + (&g * one_minus_beta1)?)?;
@@ -5528,6 +5545,21 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> candle_core::Result<Te
                     next_p
                 }
                 None => {
+                    if p.device().is_cpu() {
+                        let (next_p, next_v) = runtime::composed::sgd_step(
+                            &bridge::from_candle(&p)?,
+                            &bridge::from_candle(&g)?,
+                            &bridge::from_candle(&v_t)?,
+                            &bridge::from_candle(&lr_t)?,
+                            &bridge::from_candle(&first_t)?,
+                            *momentum,
+                            *dampening,
+                            *nesterov,
+                            *weight_decay,
+                        );
+                        ev.sgd.insert(node.id, bridge::to_candle(&next_v)?);
+                        return bridge::to_candle(&next_p);
+                    }
                     let g = if *weight_decay == 0.0 {
                         g
                     } else {

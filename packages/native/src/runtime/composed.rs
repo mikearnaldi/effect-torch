@@ -269,6 +269,68 @@ pub fn cross_entropy_backward(
     Ok(masked.mul(&scale))
 }
 
+#[allow(clippy::too_many_arguments)]
+pub fn adamw_step(
+    p: &Tensor,
+    g: &Tensor,
+    m: &Tensor,
+    v: &Tensor,
+    lr: &Tensor,
+    c1: &Tensor,
+    c2: &Tensor,
+    beta1: f64,
+    beta2: f64,
+    eps: f64,
+    weight_decay: f64,
+) -> (Tensor, Tensor, Tensor) {
+    let fl = |t: &Tensor, x: f64| full_like(t, x);
+    let next_m = m.mul(&fl(m, beta1)).add(&g.mul(&fl(g, 1.0 - beta1)));
+    let gg = g.mul(g);
+    let next_v = v.mul(&fl(v, beta2)).add(&gg.mul(&fl(&gg, 1.0 - beta2)));
+    let m_hat = next_m.div(c1);
+    let v_hat = next_v.div(c2);
+    let adjusted = m_hat.div(&v_hat.sqrt().add(&fl(&v_hat, eps))).mul(lr);
+    let next_p = if weight_decay == 0.0 {
+        p.sub(&adjusted)
+    } else {
+        let decay = p.mul(&lr.mul(&fl(lr, weight_decay)));
+        p.sub(&decay).sub(&adjusted)
+    };
+    (next_p, next_m, next_v)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn sgd_step(
+    p: &Tensor,
+    g: &Tensor,
+    v: &Tensor,
+    lr: &Tensor,
+    first: &Tensor,
+    momentum: f64,
+    dampening: f64,
+    nesterov: bool,
+    weight_decay: f64,
+) -> (Tensor, Tensor) {
+    let fl = |t: &Tensor, x: f64| full_like(t, x);
+    let g = if weight_decay == 0.0 {
+        g.clone()
+    } else {
+        g.add(&p.mul(&fl(p, weight_decay)))
+    };
+    // next_v = first ? g : momentum * v + (1 - dampening) * g, as
+    // arithmetic selection (velocity is zeros on the first step).
+    let continued = v.mul(&fl(v, momentum)).add(&g.mul(&fl(&g, 1.0 - dampening)));
+    let not_first = first.mul(&fl(first, -1.0)).add(&fl(first, 1.0));
+    let next_v = first.mul(&g).add(&not_first.mul(&continued));
+    let used = if nesterov {
+        g.add(&next_v.mul(&fl(&next_v, momentum)))
+    } else {
+        next_v.clone()
+    };
+    let next_p = p.sub(&used.mul(lr));
+    (next_p, next_v)
+}
+
 pub fn rotary_forward(x: &Tensor, offsets: &[usize], theta: f64, sign: f64) -> Result<Tensor, String> {
     let dims = x.shape();
     let r = dims.len();
