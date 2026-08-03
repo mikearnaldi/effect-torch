@@ -7,6 +7,7 @@ use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, OnceLock};
 
 mod bridge;
+mod metal_eval;
 mod fusion;
 mod flash;
 mod gemm;
@@ -4412,6 +4413,11 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> candle_core::Result<Te
             if a.device().is_cpu() {
                 return bridge::to_candle(&bridge::from_candle(&a)?.add(&bridge::from_candle(&b)?));
             }
+            if a.device().is_metal() {
+                if let Ok(t) = metal_eval::binary(&a, &b, metal_eval::BinOp::Add) {
+                    return Ok(t);
+                }
+            }
             a.broadcast_add(&b)?
         }
         NodeKind::Sub { a, b } => {
@@ -4419,6 +4425,11 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> candle_core::Result<Te
             let b = ev.value(b.id)?;
             if a.device().is_cpu() {
                 return bridge::to_candle(&bridge::from_candle(&a)?.sub(&bridge::from_candle(&b)?));
+            }
+            if a.device().is_metal() {
+                if let Ok(t) = metal_eval::binary(&a, &b, metal_eval::BinOp::Sub) {
+                    return Ok(t);
+                }
             }
             a.broadcast_sub(&b)?
         }
@@ -4428,6 +4439,11 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> candle_core::Result<Te
             if a.device().is_cpu() {
                 return bridge::to_candle(&bridge::from_candle(&a)?.mul(&bridge::from_candle(&b)?));
             }
+            if a.device().is_metal() {
+                if let Ok(t) = metal_eval::binary(&a, &b, metal_eval::BinOp::Mul) {
+                    return Ok(t);
+                }
+            }
             a.broadcast_mul(&b)?
         }
         NodeKind::Div { a, b } => {
@@ -4436,12 +4452,22 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> candle_core::Result<Te
             if a.device().is_cpu() {
                 return bridge::to_candle(&bridge::from_candle(&a)?.div(&bridge::from_candle(&b)?));
             }
+            if a.device().is_metal() {
+                if let Ok(t) = metal_eval::binary(&a, &b, metal_eval::BinOp::Div) {
+                    return Ok(t);
+                }
+            }
             a.broadcast_div(&b)?
         }
         NodeKind::Eq { a, b } => {
             let (x, y) = (ev.value(a.id)?, ev.value(b.id)?);
             if x.device().is_cpu() {
                 return bridge::to_candle(&bridge::from_candle(&x)?.eq(&bridge::from_candle(&y)?));
+            }
+            if x.device().is_metal() {
+                if let Ok(t) = metal_eval::compare(&x, &y, metal_eval::BinOp::Eq) {
+                    return Ok(t);
+                }
             }
             eval_broadcast_binary(a, b, ev, |a, b| a.eq(b))?
         }
@@ -4450,12 +4476,22 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> candle_core::Result<Te
             if x.device().is_cpu() {
                 return bridge::to_candle(&bridge::from_candle(&x)?.gt(&bridge::from_candle(&y)?));
             }
+            if x.device().is_metal() {
+                if let Ok(t) = metal_eval::compare(&x, &y, metal_eval::BinOp::Gt) {
+                    return Ok(t);
+                }
+            }
             eval_broadcast_binary(a, b, ev, |a, b| a.gt(b))?
         }
         NodeKind::Lt { a, b } => {
             let (x, y) = (ev.value(a.id)?, ev.value(b.id)?);
             if x.device().is_cpu() {
                 return bridge::to_candle(&bridge::from_candle(&x)?.lt(&bridge::from_candle(&y)?));
+            }
+            if x.device().is_metal() {
+                if let Ok(t) = metal_eval::compare(&x, &y, metal_eval::BinOp::Lt) {
+                    return Ok(t);
+                }
             }
             eval_broadcast_binary(a, b, ev, |a, b| a.lt(b))?
         }
@@ -4464,12 +4500,22 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> candle_core::Result<Te
             if x.device().is_cpu() {
                 return bridge::to_candle(&bridge::from_candle(&x)?.ge(&bridge::from_candle(&y)?));
             }
+            if x.device().is_metal() {
+                if let Ok(t) = metal_eval::compare(&x, &y, metal_eval::BinOp::Ge) {
+                    return Ok(t);
+                }
+            }
             eval_broadcast_binary(a, b, ev, |a, b| a.ge(b))?
         }
         NodeKind::Le { a, b } => {
             let (x, y) = (ev.value(a.id)?, ev.value(b.id)?);
             if x.device().is_cpu() {
                 return bridge::to_candle(&bridge::from_candle(&x)?.le(&bridge::from_candle(&y)?));
+            }
+            if x.device().is_metal() {
+                if let Ok(t) = metal_eval::compare(&x, &y, metal_eval::BinOp::Le) {
+                    return Ok(t);
+                }
             }
             eval_broadcast_binary(a, b, ev, |a, b| a.le(b))?
         }
@@ -4478,12 +4524,22 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> candle_core::Result<Te
             if x.device().is_cpu() {
                 return bridge::to_candle(&bridge::from_candle(&x)?.maximum(&bridge::from_candle(&y)?));
             }
+            if x.device().is_metal() {
+                if let Ok(t) = metal_eval::binary(&x, &y, metal_eval::BinOp::Max) {
+                    return Ok(t);
+                }
+            }
             eval_broadcast_binary(a, b, ev, |a, b| a.maximum(b))?
         }
         NodeKind::Minimum { a, b } => {
             let (x, y) = (ev.value(a.id)?, ev.value(b.id)?);
             if x.device().is_cpu() {
                 return bridge::to_candle(&bridge::from_candle(&x)?.minimum(&bridge::from_candle(&y)?));
+            }
+            if x.device().is_metal() {
+                if let Ok(t) = metal_eval::binary(&x, &y, metal_eval::BinOp::Min) {
+                    return Ok(t);
+                }
             }
             eval_broadcast_binary(a, b, ev, |a, b| a.minimum(b))?
         }
@@ -4492,12 +4548,22 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> candle_core::Result<Te
             if x.device().is_cpu() {
                 return bridge::to_candle(&bridge::from_candle(&x)?.neg());
             }
+            if x.device().is_metal() {
+                if let Ok(t) = metal_eval::unary(&x, metal_eval::UnOp::Neg) {
+                    return Ok(t);
+                }
+            }
             x.neg()?
         }
         NodeKind::Abs { a } => {
             let x = ev.value(a.id)?;
             if x.device().is_cpu() {
                 return bridge::to_candle(&bridge::from_candle(&x)?.abs());
+            }
+            if x.device().is_metal() {
+                if let Ok(t) = metal_eval::unary(&x, metal_eval::UnOp::Abs) {
+                    return Ok(t);
+                }
             }
             x.abs()?
         }
@@ -4506,12 +4572,22 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> candle_core::Result<Te
             if x.device().is_cpu() {
                 return bridge::to_candle(&bridge::from_candle(&x)?.sqrt());
             }
+            if x.device().is_metal() {
+                if let Ok(t) = metal_eval::unary(&x, metal_eval::UnOp::Sqrt) {
+                    return Ok(t);
+                }
+            }
             x.sqrt()?
         }
         NodeKind::Exp { a } => {
             let x = ev.value(a.id)?;
             if x.device().is_cpu() {
                 return bridge::to_candle(&bridge::from_candle(&x)?.exp());
+            }
+            if x.device().is_metal() {
+                if let Ok(t) = metal_eval::unary(&x, metal_eval::UnOp::Exp) {
+                    return Ok(t);
+                }
             }
             x.exp()?
         }
@@ -4520,12 +4596,22 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> candle_core::Result<Te
             if x.device().is_cpu() {
                 return bridge::to_candle(&bridge::from_candle(&x)?.log());
             }
+            if x.device().is_metal() {
+                if let Ok(t) = metal_eval::unary(&x, metal_eval::UnOp::Log) {
+                    return Ok(t);
+                }
+            }
             x.log()?
         }
         NodeKind::Sin { a } => {
             let x = ev.value(a.id)?;
             if x.device().is_cpu() {
                 return bridge::to_candle(&bridge::from_candle(&x)?.sin());
+            }
+            if x.device().is_metal() {
+                if let Ok(t) = metal_eval::unary(&x, metal_eval::UnOp::Sin) {
+                    return Ok(t);
+                }
             }
             x.sin()?
         }
@@ -4534,12 +4620,22 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> candle_core::Result<Te
             if x.device().is_cpu() {
                 return bridge::to_candle(&bridge::from_candle(&x)?.cos());
             }
+            if x.device().is_metal() {
+                if let Ok(t) = metal_eval::unary(&x, metal_eval::UnOp::Cos) {
+                    return Ok(t);
+                }
+            }
             x.cos()?
         }
         NodeKind::Tanh { a } => {
             let x = ev.value(a.id)?;
             if x.device().is_cpu() {
                 return bridge::to_candle(&bridge::from_candle(&x)?.tanh());
+            }
+            if x.device().is_metal() {
+                if let Ok(t) = metal_eval::unary(&x, metal_eval::UnOp::Tanh) {
+                    return Ok(t);
+                }
             }
             x.tanh()?
         }
@@ -4555,12 +4651,22 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> candle_core::Result<Te
             if x.device().is_cpu() {
                 return bridge::to_candle(&bridge::from_candle(&x)?.erf());
             }
+            if x.device().is_metal() {
+                if let Ok(t) = metal_eval::unary(&x, metal_eval::UnOp::Erf) {
+                    return Ok(t);
+                }
+            }
             x.erf()?
         }
         NodeKind::Floor { a } => {
             let x = ev.value(a.id)?;
             if x.device().is_cpu() {
                 return bridge::to_candle(&bridge::from_candle(&x)?.floor());
+            }
+            if x.device().is_metal() {
+                if let Ok(t) = metal_eval::unary(&x, metal_eval::UnOp::Floor) {
+                    return Ok(t);
+                }
             }
             x.floor()?
         }
@@ -4569,6 +4675,11 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> candle_core::Result<Te
             if x.device().is_cpu() {
                 return bridge::to_candle(&bridge::from_candle(&x)?.ceil());
             }
+            if x.device().is_metal() {
+                if let Ok(t) = metal_eval::unary(&x, metal_eval::UnOp::Ceil) {
+                    return Ok(t);
+                }
+            }
             x.ceil()?
         }
         NodeKind::Round { a } => {
@@ -4576,12 +4687,22 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> candle_core::Result<Te
             if x.device().is_cpu() {
                 return bridge::to_candle(&bridge::from_candle(&x)?.round());
             }
+            if x.device().is_metal() {
+                if let Ok(t) = metal_eval::unary(&x, metal_eval::UnOp::Round) {
+                    return Ok(t);
+                }
+            }
             x.round()?
         }
         NodeKind::Sign { a } => {
             let x = ev.value(a.id)?;
             if x.device().is_cpu() {
                 return bridge::to_candle(&bridge::from_candle(&x)?.sign());
+            }
+            if x.device().is_metal() {
+                if let Ok(t) = metal_eval::unary(&x, metal_eval::UnOp::Sign) {
+                    return Ok(t);
+                }
             }
             x.sign()?
         }
