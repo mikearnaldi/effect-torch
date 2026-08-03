@@ -7699,8 +7699,9 @@ pub async fn eval_lazy(
         }
         // Synchronize once: per-root syncs would fully serialize CPU
         // encoding and GPU execution (readback synchronizes itself).
-        for output in &outputs {
-            output.inner.device().synchronize().map_err(to_napi_err)?;
+        // The sync is device-global; one call covers every output.
+        if let Some(first) = outputs.first() {
+            first.inner.device().synchronize().map_err(to_napi_err)?;
         }
         // Deferred fused-CE status checks (would have split the
         // pipeline mid-walk).
@@ -9245,9 +9246,9 @@ impl DecodeProgram {
                 outputs.push(NativeTensor::wrap(output));
             }
             // Synchronize once: per-root syncs would fully serialize
-            // CPU encoding and GPU execution.
-            for output in &outputs {
-                output.inner.device().synchronize().map_err(to_napi_err)?;
+            // CPU encoding and GPU execution. Device-global: one call.
+            if let Some(first) = outputs.first() {
+                first.inner.device().synchronize().map_err(to_napi_err)?;
             }
             ev.run_ce_checks().map_err(to_napi_err)?;
             for (i, state) in slot_states.iter().enumerate() {
@@ -9575,16 +9576,18 @@ impl CompiledProgram {
                 let output = eval_node(node, cancelled, &mut ev).map_err(to_napi_err)?;
                 outputs.push(NativeTensor::wrap(output));
             }
+            let t_encode = t1.elapsed();
             // Synchronize once: per-root syncs would fully serialize CPU
             // encoding and GPU execution. Consumers that need values on
             // the host synchronize at readback; device-side reuse needs
-            // no host round-trip.
-            for output in &outputs {
-                output.inner.device().synchronize().map_err(to_napi_err)?;
+            // no host round-trip. Device-global: one call.
+            if let Some(first) = outputs.first() {
+                first.inner.device().synchronize().map_err(to_napi_err)?;
             }
+            let t_sync = t1.elapsed() - t_encode;
             ev.run_ce_checks().map_err(to_napi_err)?;
             if walk_timing {
-                eprintln!("[walk] program eval {:.1}us ({} roots)", t1.elapsed().as_micros(), roots.len());
+                eprintln!("[walk] program eval {:.1}us ({} roots) encode {:.1}us sync {:.1}us", t1.elapsed().as_micros(), roots.len(), t_encode.as_micros(), t_sync.as_micros());
             }
             Ok(outputs)
         })
