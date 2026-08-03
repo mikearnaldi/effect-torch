@@ -4677,6 +4677,14 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> candle_core::Result<Te
                 let (loss_t, status) = loss::ce_forward(&logits_t, &target_t, *ignore_index)?;
                 ev.ce_checks.push((status, true, logits_t.elem_count() / logits_t.dim(logits_t.rank() - 1)?));
                 loss_t
+            } else if logits_t.device().is_cpu() {
+                let r = runtime::composed::cross_entropy_forward(
+                    &bridge::from_candle(&logits_t)?,
+                    &bridge::from_candle(&target_t)?,
+                    *ignore_index,
+                )
+                .map_err(candle_core::Error::Msg)?;
+                return bridge::to_candle(&r);
             } else {
                 cross_entropy_forward(&logits_t, &target_t, *ignore_index)?
             }
@@ -4692,6 +4700,14 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> candle_core::Result<Te
                 let (grad, count) = loss::ce_backward(&logits_t, &target_t, *ignore_index)?;
                 ev.ce_checks.push((count, false, 0));
                 grad
+            } else if logits_t.device().is_cpu() {
+                let r = runtime::composed::cross_entropy_backward(
+                    &bridge::from_candle(&logits_t)?,
+                    &bridge::from_candle(&target_t)?,
+                    *ignore_index,
+                )
+                .map_err(candle_core::Error::Msg)?;
+                return bridge::to_candle(&r);
             } else {
                 cross_entropy_backward(&logits_t, &target_t, *ignore_index)?
             }
@@ -4710,6 +4726,15 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> candle_core::Result<Te
                 // node's own cache entry holds O.
                 ev.multi.insert(node.id, vec![o.clone(), l]);
                 o
+            } else if q.device().is_cpu() {
+                let r = runtime::composed::sdpa_forward(
+                    &bridge::from_candle(&q)?,
+                    &bridge::from_candle(&ev.value(k.id)?)?,
+                    &bridge::from_candle(&ev.value(v.id)?)?,
+                    *scale,
+                    *causal,
+                );
+                return bridge::to_candle(&r);
             } else {
                 sdpa_forward(&q, &ev.value(k.id)?, &ev.value(v.id)?, *scale, *causal)?
             }
@@ -4737,14 +4762,22 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> candle_core::Result<Te
                     *scale,
                     *causal,
                 )?,
-                _ => sdpa_backward(
-                    &q,
-                    &ev.value(k.id)?,
-                    &ev.value(v.id)?,
-                    &ev.value(g.id)?,
-                    *scale,
-                    *causal,
-                )?,
+                _ => {
+                    let (kk, kv_, kg) = (ev.value(k.id)?, ev.value(v.id)?, ev.value(g.id)?);
+                    if q.device().is_cpu() {
+                        let (dq, dk, dv) = runtime::composed::sdpa_backward(
+                            &bridge::from_candle(&q)?,
+                            &bridge::from_candle(&kk)?,
+                            &bridge::from_candle(&kv_)?,
+                            &bridge::from_candle(&kg)?,
+                            *scale,
+                            *causal,
+                        );
+                        (bridge::to_candle(&dq)?, bridge::to_candle(&dk)?, bridge::to_candle(&dv)?)
+                    } else {
+                        sdpa_backward(&q, &kk, &kv_, &kg, *scale, *causal)?
+                    }
+                }
             };
             ev.multi.insert(node.id, vec![dq.clone(), dk, dv]);
             dq
@@ -4757,10 +4790,15 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> candle_core::Result<Te
             .ok_or_else(|| {
                 candle_core::Error::Msg("sdpa backward out: outputs missing".to_string())
             })?,
-        NodeKind::PositionEmbedding { weight, seq_len } => ev
-            .value(weight.id)?
-            .narrow(0, 0, *seq_len)?
-            .contiguous()?,
+        NodeKind::PositionEmbedding { weight, seq_len } => {
+            let w = ev.value(weight.id)?;
+            if w.device().is_cpu() {
+                let r = bridge::from_candle(&w)?;
+                let r = r.view(r.layout.narrow(0, 0, *seq_len)).contiguous();
+                return bridge::to_candle(&r);
+            }
+            w.narrow(0, 0, *seq_len)?.contiguous()?
+        },
         NodeKind::KvAttention {
             q,
             k,
@@ -4808,6 +4846,10 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> candle_core::Result<Te
             };
             if rotary::is_supported(&x) {
                 rotary::rotary(&x, &offsets, *theta, 1.0)?
+            } else if x.device().is_cpu() {
+                let r = runtime::composed::rotary_forward(&bridge::from_candle(&x)?, &offsets, *theta, 1.0)
+                    .map_err(candle_core::Error::Msg)?;
+                return bridge::to_candle(&r);
             } else {
                 rotary_forward(&x, &offsets, *theta, 1.0)?
             }
@@ -4816,6 +4858,10 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> candle_core::Result<Te
             let g = ev.value(g.id)?;
             if rotary::is_supported(&g) {
                 rotary::rotary(&g, &[0usize], *theta, -1.0)?
+            } else if g.device().is_cpu() {
+                let r = runtime::composed::rotary_forward(&bridge::from_candle(&g)?, &[0usize], *theta, -1.0)
+                    .map_err(candle_core::Error::Msg)?;
+                return bridge::to_candle(&r);
             } else {
                 // Transpose rotation == forward with negated angles.
                 rotary_forward(&g, &[0usize], *theta, -1.0)?
@@ -4827,6 +4873,11 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> candle_core::Result<Te
             let bias = ev.value(bias.id)?;
             if gemm::is_supported(&x, &weight) {
                 gemm::linear_forward(&x, &weight, &bias)?
+            } else if x.device().is_cpu() {
+                let r = bridge::from_candle(&x)?
+                    .matmul(&bridge::from_candle(&weight)?)
+                    .add(&bridge::from_candle(&bias)?);
+                return bridge::to_candle(&r);
             } else {
                 x.broadcast_matmul(&weight)?.broadcast_add(&bias)?
             }
@@ -4837,6 +4888,14 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> candle_core::Result<Te
             let bias = ev.value(bias.id)?;
             if layer_norm::is_supported(&x, &weight) {
                 layer_norm::ln_forward(&x, &weight, &bias, *eps)?
+            } else if x.device().is_cpu() {
+                let r = runtime::composed::layer_norm_forward(
+                    &bridge::from_candle(&x)?,
+                    &bridge::from_candle(&weight)?,
+                    &bridge::from_candle(&bias)?,
+                    *eps,
+                );
+                return bridge::to_candle(&r);
             } else {
                 layer_norm_composed(&x, &weight, &bias, *eps)?
             }
@@ -4845,6 +4904,16 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> candle_core::Result<Te
             let x = ev.value(x.id)?;
             let weight = ev.value(weight.id)?;
             let g = ev.value(g.id)?;
+            if x.device().is_cpu() {
+                let (dx, dw, db) = runtime::composed::layer_norm_backward(
+                    &bridge::from_candle(&x)?,
+                    &bridge::from_candle(&weight)?,
+                    &bridge::from_candle(&g)?,
+                    *eps,
+                );
+                ev.ln.insert(node.id, [bridge::to_candle(&dw)?, bridge::to_candle(&db)?]);
+                return bridge::to_candle(&dx);
+            }
             let (dx, dw, db) = layer_norm_backward(&x, &weight, &g, *eps)?;
             ev.ln.insert(node.id, [dw, db]);
             dx
