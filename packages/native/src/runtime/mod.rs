@@ -1,6 +1,7 @@
 #![allow(dead_code)]
 
 pub mod composed;
+pub mod conv;
 pub mod cpu;
 pub mod dtype;
 pub mod indexing;

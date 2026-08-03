@@ -4940,6 +4940,17 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> candle_core::Result<Te
         } => {
             let x = ev.value(x.id)?;
             let w = ev.value(w.id)?;
+            if x.device().is_cpu() {
+                let r = runtime::conv::conv1d(
+                    &bridge::from_candle(&x)?,
+                    &bridge::from_candle(&w)?,
+                    *stride,
+                    *padding,
+                    *dilation,
+                    *groups,
+                );
+                return bridge::to_candle(&r);
+            }
             x.contiguous()?
                 .conv1d(&w.contiguous()?, *padding, *stride, *dilation, *groups)?
         }
@@ -4953,6 +4964,17 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> candle_core::Result<Te
         } => {
             let x = ev.value(x.id)?;
             let w = ev.value(w.id)?;
+            if x.device().is_cpu() {
+                let r = runtime::conv::conv2d(
+                    &bridge::from_candle(&x)?,
+                    &bridge::from_candle(&w)?,
+                    *stride,
+                    *padding,
+                    *dilation,
+                    *groups,
+                );
+                return bridge::to_candle(&r);
+            }
             x.contiguous()?
                 .conv2d(&w.contiguous()?, *padding, *stride, *dilation, *groups)?
         }
@@ -4967,6 +4989,18 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> candle_core::Result<Te
         } => {
             let x = ev.value(x.id)?;
             let w = ev.value(w.id)?;
+            if x.device().is_cpu() {
+                let r = runtime::conv::conv_transpose1d(
+                    &bridge::from_candle(&x)?,
+                    &bridge::from_candle(&w)?,
+                    *stride,
+                    *padding,
+                    *output_padding,
+                    *dilation,
+                    *groups,
+                );
+                return bridge::to_candle(&r);
+            }
             x.contiguous()?.conv_transpose1d(
                 &w.contiguous()?,
                 *padding,
@@ -4987,6 +5021,18 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> candle_core::Result<Te
         } => {
             let x = ev.value(x.id)?;
             let w = ev.value(w.id)?;
+            if x.device().is_cpu() {
+                let r = runtime::conv::conv_transpose2d(
+                    &bridge::from_candle(&x)?,
+                    &bridge::from_candle(&w)?,
+                    *stride,
+                    *padding,
+                    *output_padding,
+                    *dilation,
+                    *groups,
+                );
+                return bridge::to_candle(&r);
+            }
             if *groups == 1 {
                 x.contiguous()?.conv_transpose2d(
                     &w.contiguous()?,
@@ -5022,8 +5068,33 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> candle_core::Result<Te
             dilation,
             groups,
         } => {
-            let x = ev.value(x.id)?.unsqueeze(3)?;
-            let g = ev.value(g.id)?.unsqueeze(3)?;
+            let x = ev.value(x.id)?;
+            let g = ev.value(g.id)?;
+            if x.device().is_cpu() {
+                let xn = bridge::from_candle(&x)?;
+                let gn = bridge::from_candle(&g)?;
+                let squeeze = |t: &runtime::cpu::Tensor| {
+                    let s = t.shape();
+                    t.contiguous().view(runtime::layout::Layout::contiguous(vec![s[0], s[1], s[2], 1]))
+                };
+                let x2 = squeeze(&xn);
+                let g2 = squeeze(&gn);
+                let dw = runtime::conv::conv2d_backward_w(
+                    &x2,
+                    &g2,
+                    [*kernel, 1],
+                    *out_channels,
+                    *stride,
+                    *padding,
+                    *dilation,
+                    *groups,
+                );
+                let s = dw.shape();
+                let dw = dw.contiguous().view(runtime::layout::Layout::contiguous(vec![s[0], s[1], s[2]]));
+                return bridge::to_candle(&dw);
+            }
+            let x = x.unsqueeze(3)?;
+            let g = g.unsqueeze(3)?;
             conv2d_backward_w(
                 &x,
                 &g,
@@ -5048,6 +5119,19 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> candle_core::Result<Te
         } => {
             let x = ev.value(x.id)?;
             let g = ev.value(g.id)?;
+            if x.device().is_cpu() {
+                let dw = runtime::conv::conv2d_backward_w(
+                    &bridge::from_candle(&x)?,
+                    &bridge::from_candle(&g)?,
+                    *kernel,
+                    *out_channels,
+                    *stride,
+                    *padding,
+                    *dilation,
+                    *groups,
+                );
+                return bridge::to_candle(&dw);
+            }
             conv2d_backward_w(
                 &x,
                 &g,
