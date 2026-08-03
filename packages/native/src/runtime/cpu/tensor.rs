@@ -1,5 +1,5 @@
-use super::dtype::DType;
-use super::layout::Layout;
+use crate::runtime::dtype::DType;
+use crate::runtime::layout::Layout;
 use half::{bf16, f16};
 use std::sync::Arc;
 

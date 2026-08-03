@@ -1,6 +1,6 @@
-use super::cpu::{CpuBuffer, Tensor};
-use super::dtype::DType;
-use super::layout::Layout;
+use super::tensor::{CpuBuffer, Tensor};
+use crate::runtime::dtype::DType;
+use crate::runtime::layout::Layout;
 
 fn indices_vec(t: &Tensor) -> Vec<usize> {
     let c = t.contiguous();
@@ -12,7 +12,7 @@ fn indices_vec(t: &Tensor) -> Vec<usize> {
     }
 }
 
-fn gather_impl<T: super::cpu::Elem>(
+fn gather_impl<T: super::tensor::Elem>(
     x: &[T],
     xl: &Layout,
     ids: &[usize],
@@ -41,7 +41,7 @@ fn gather_impl<T: super::cpu::Elem>(
     Tensor::from_vec(out, ids_shape.to_vec())
 }
 
-fn scatter_add_impl<T: super::cpu::Elem + std::ops::Add<Output = T>>(
+fn scatter_add_impl<T: super::tensor::Elem + std::ops::Add<Output = T>>(
     x: &[T],
     xl: &Layout,
     ids: &[usize],
@@ -53,7 +53,7 @@ fn scatter_add_impl<T: super::cpu::Elem + std::ops::Add<Output = T>>(
     let rank = shape.len();
     let total: usize = ids_shape.iter().product();
     let mut out = vec![T::default(); xl.numel()];
-    super::cpu::copy_strided(x, xl, &mut out);
+    super::tensor::copy_strided(x, xl, &mut out);
     let out_strides = Layout::contiguous(shape.to_vec());
     let os = out_strides.strides().to_vec();
     for lin in 0..total {
@@ -73,7 +73,7 @@ fn scatter_add_impl<T: super::cpu::Elem + std::ops::Add<Output = T>>(
     Tensor::from_vec(out, shape.to_vec())
 }
 
-fn index_select_impl<T: super::cpu::Elem>(x: &[T], xl: &Layout, ids: &[usize], dim: usize) -> Tensor {
+fn index_select_impl<T: super::tensor::Elem>(x: &[T], xl: &Layout, ids: &[usize], dim: usize) -> Tensor {
     let shape = xl.shape();
     let rank = shape.len();
     let dstride = xl.strides()[dim];

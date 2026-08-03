@@ -1,6 +1,6 @@
-use super::cpu::{CpuBuffer, Tensor};
-use super::dtype::DType;
-use super::layout::Layout;
+use super::tensor::{CpuBuffer, Tensor};
+use crate::runtime::dtype::DType;
+use crate::runtime::layout::Layout;
 
 fn rank(t: &Tensor) -> usize {
     t.shape().len()

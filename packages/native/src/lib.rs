@@ -4678,7 +4678,7 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> candle_core::Result<Te
                 ev.ce_checks.push((status, true, logits_t.elem_count() / logits_t.dim(logits_t.rank() - 1)?));
                 loss_t
             } else if logits_t.device().is_cpu() {
-                let r = runtime::composed::cross_entropy_forward(
+                let r = runtime::cpu::composed::cross_entropy_forward(
                     &bridge::from_candle(&logits_t)?,
                     &bridge::from_candle(&target_t)?,
                     *ignore_index,
@@ -4701,7 +4701,7 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> candle_core::Result<Te
                 ev.ce_checks.push((count, false, 0));
                 grad
             } else if logits_t.device().is_cpu() {
-                let r = runtime::composed::cross_entropy_backward(
+                let r = runtime::cpu::composed::cross_entropy_backward(
                     &bridge::from_candle(&logits_t)?,
                     &bridge::from_candle(&target_t)?,
                     *ignore_index,
@@ -4727,7 +4727,7 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> candle_core::Result<Te
                 ev.multi.insert(node.id, vec![o.clone(), l]);
                 o
             } else if q.device().is_cpu() {
-                let r = runtime::composed::sdpa_forward(
+                let r = runtime::cpu::composed::sdpa_forward(
                     &bridge::from_candle(&q)?,
                     &bridge::from_candle(&ev.value(k.id)?)?,
                     &bridge::from_candle(&ev.value(v.id)?)?,
@@ -4765,7 +4765,7 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> candle_core::Result<Te
                 _ => {
                     let (kk, kv_, kg) = (ev.value(k.id)?, ev.value(v.id)?, ev.value(g.id)?);
                     if q.device().is_cpu() {
-                        let (dq, dk, dv) = runtime::composed::sdpa_backward(
+                        let (dq, dk, dv) = runtime::cpu::composed::sdpa_backward(
                             &bridge::from_candle(&q)?,
                             &bridge::from_candle(&kk)?,
                             &bridge::from_candle(&kv_)?,
@@ -4847,7 +4847,7 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> candle_core::Result<Te
             if rotary::is_supported(&x) {
                 rotary::rotary(&x, &offsets, *theta, 1.0)?
             } else if x.device().is_cpu() {
-                let r = runtime::composed::rotary_forward(&bridge::from_candle(&x)?, &offsets, *theta, 1.0)
+                let r = runtime::cpu::composed::rotary_forward(&bridge::from_candle(&x)?, &offsets, *theta, 1.0)
                     .map_err(candle_core::Error::Msg)?;
                 return bridge::to_candle(&r);
             } else {
@@ -4859,7 +4859,7 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> candle_core::Result<Te
             if rotary::is_supported(&g) {
                 rotary::rotary(&g, &[0usize], *theta, -1.0)?
             } else if g.device().is_cpu() {
-                let r = runtime::composed::rotary_forward(&bridge::from_candle(&g)?, &[0usize], *theta, -1.0)
+                let r = runtime::cpu::composed::rotary_forward(&bridge::from_candle(&g)?, &[0usize], *theta, -1.0)
                     .map_err(candle_core::Error::Msg)?;
                 return bridge::to_candle(&r);
             } else {
@@ -4889,7 +4889,7 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> candle_core::Result<Te
             if layer_norm::is_supported(&x, &weight) {
                 layer_norm::ln_forward(&x, &weight, &bias, *eps)?
             } else if x.device().is_cpu() {
-                let r = runtime::composed::layer_norm_forward(
+                let r = runtime::cpu::composed::layer_norm_forward(
                     &bridge::from_candle(&x)?,
                     &bridge::from_candle(&weight)?,
                     &bridge::from_candle(&bias)?,
@@ -4905,7 +4905,7 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> candle_core::Result<Te
             let weight = ev.value(weight.id)?;
             let g = ev.value(g.id)?;
             if x.device().is_cpu() {
-                let (dx, dw, db) = runtime::composed::layer_norm_backward(
+                let (dx, dw, db) = runtime::cpu::composed::layer_norm_backward(
                     &bridge::from_candle(&x)?,
                     &bridge::from_candle(&weight)?,
                     &bridge::from_candle(&g)?,
@@ -4941,7 +4941,7 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> candle_core::Result<Te
             let x = ev.value(x.id)?;
             let w = ev.value(w.id)?;
             if x.device().is_cpu() {
-                let r = runtime::conv::conv1d(
+                let r = runtime::cpu::conv::conv1d(
                     &bridge::from_candle(&x)?,
                     &bridge::from_candle(&w)?,
                     *stride,
@@ -4965,7 +4965,7 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> candle_core::Result<Te
             let x = ev.value(x.id)?;
             let w = ev.value(w.id)?;
             if x.device().is_cpu() {
-                let r = runtime::conv::conv2d(
+                let r = runtime::cpu::conv::conv2d(
                     &bridge::from_candle(&x)?,
                     &bridge::from_candle(&w)?,
                     *stride,
@@ -4990,7 +4990,7 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> candle_core::Result<Te
             let x = ev.value(x.id)?;
             let w = ev.value(w.id)?;
             if x.device().is_cpu() {
-                let r = runtime::conv::conv_transpose1d(
+                let r = runtime::cpu::conv::conv_transpose1d(
                     &bridge::from_candle(&x)?,
                     &bridge::from_candle(&w)?,
                     *stride,
@@ -5022,7 +5022,7 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> candle_core::Result<Te
             let x = ev.value(x.id)?;
             let w = ev.value(w.id)?;
             if x.device().is_cpu() {
-                let r = runtime::conv::conv_transpose2d(
+                let r = runtime::cpu::conv::conv_transpose2d(
                     &bridge::from_candle(&x)?,
                     &bridge::from_candle(&w)?,
                     *stride,
@@ -5079,7 +5079,7 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> candle_core::Result<Te
                 };
                 let x2 = squeeze(&xn);
                 let g2 = squeeze(&gn);
-                let dw = runtime::conv::conv2d_backward_w(
+                let dw = runtime::cpu::conv::conv2d_backward_w(
                     &x2,
                     &g2,
                     [*kernel, 1],
@@ -5120,7 +5120,7 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> candle_core::Result<Te
             let x = ev.value(x.id)?;
             let g = ev.value(g.id)?;
             if x.device().is_cpu() {
-                let dw = runtime::conv::conv2d_backward_w(
+                let dw = runtime::cpu::conv::conv2d_backward_w(
                     &bridge::from_candle(&x)?,
                     &bridge::from_candle(&g)?,
                     *kernel,
@@ -5397,7 +5397,7 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> candle_core::Result<Te
                 }
                 None => {
                     if p.device().is_cpu() {
-                        let (next_p, next_m, next_v) = runtime::composed::adamw_step(
+                        let (next_p, next_m, next_v) = runtime::cpu::composed::adamw_step(
                             &bridge::from_candle(&p)?,
                             &bridge::from_candle(&g)?,
                             &bridge::from_candle(&m_t)?,
@@ -5546,7 +5546,7 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> candle_core::Result<Te
                 }
                 None => {
                     if p.device().is_cpu() {
-                        let (next_p, next_v) = runtime::composed::sgd_step(
+                        let (next_p, next_v) = runtime::cpu::composed::sgd_step(
                             &bridge::from_candle(&p)?,
                             &bridge::from_candle(&g)?,
                             &bridge::from_candle(&v_t)?,
@@ -8448,7 +8448,7 @@ impl BlockStore {
 }
 
 enum PoolSlab {
-    Native(runtime::pool::Slab),
+    Native(runtime::cpu::pool::Slab),
     Candle(Tensor),
 }
 
@@ -8469,7 +8469,7 @@ impl PoolSlab {
         }
     }
 
-    fn native(&self) -> candle_core::Result<&runtime::pool::Slab> {
+    fn native(&self) -> candle_core::Result<&runtime::cpu::pool::Slab> {
         match self {
             PoolSlab::Native(s) => Ok(s),
             PoolSlab::Candle(_) => Err(candle_core::Error::Msg(
@@ -8873,7 +8873,7 @@ fn kv_attention_slot(
             let real = match scale {
                 Some(scale) => {
                     let scales = scale.native()?.read_rows_f32(&ctx_rows);
-                    runtime::pool::dequantize_int8(&raw, &scales, ctx_rows.len(), h, d)
+                    runtime::cpu::pool::dequantize_int8(&raw, &scales, ctx_rows.len(), h, d)
                 }
                 None => raw,
             };
@@ -8900,7 +8900,7 @@ fn kv_attention_slot(
         let kn = gather_rows(&pool.k[layer], k_scale)?;
         let vn = gather_rows(&pool.v[layer], v_scale)?;
         let qn = bridge::from_candle(q)?;
-        let out = runtime::composed::sdpa_forward(&qn, &kn, &vn, scale, true);
+        let out = runtime::cpu::composed::sdpa_forward(&qn, &kn, &vn, scale, true);
         kv_evict(pool, state, start);
         return bridge::to_candle(&out);
     }
@@ -9051,8 +9051,8 @@ fn kv_scatter_rows(
         let k_rows = new_rows(k)?;
         let v_rows = new_rows(v)?;
         if slab_dtype == DType::U8 {
-            let (qk, sk) = runtime::pool::quantize_int8(&k_rows, advance, h, d);
-            let (qv, sv) = runtime::pool::quantize_int8(&v_rows, advance, h, d);
+            let (qk, sk) = runtime::cpu::pool::quantize_int8(&k_rows, advance, h, d);
+            let (qv, sv) = runtime::cpu::pool::quantize_int8(&v_rows, advance, h, d);
             pool.k[layer].native()?.write_rows_u8(&write_rows, &qk);
             pool.v[layer].native()?.write_rows_u8(&write_rows, &qv);
             pool.scales[2 * layer].native()?.write_rows_f32(&write_rows, &sk);
@@ -9406,19 +9406,19 @@ impl NativeKvPool {
         let mut scales = Vec::with_capacity(layers);
         for _ in 0..layers {
             if device.is_cpu() {
-                k.push(PoolSlab::Native(runtime::pool::Slab::new(
+                k.push(PoolSlab::Native(runtime::cpu::pool::Slab::new(
                     max_tokens,
                     kv_heads * head_dim,
                     bridge::dtype_to_native(dtype),
                 )));
-                v.push(PoolSlab::Native(runtime::pool::Slab::new(
+                v.push(PoolSlab::Native(runtime::cpu::pool::Slab::new(
                     max_tokens,
                     kv_heads * head_dim,
                     bridge::dtype_to_native(dtype),
                 )));
                 if dtype == DType::U8 {
                     for _ in 0..2 {
-                        scales.push(PoolSlab::Native(runtime::pool::Slab::new(
+                        scales.push(PoolSlab::Native(runtime::cpu::pool::Slab::new(
                             max_tokens,
                             kv_heads,
                             runtime::dtype::DType::F32,
@@ -10351,8 +10351,8 @@ mod kv_tests {
     fn kv_attention_matches_sdpa() {
         let device = Device::Cpu;
         let pool = Arc::new(PoolInner {
-            k: vec![PoolSlab::Native(runtime::pool::Slab::new(8, 2 * 4, runtime::dtype::DType::F32))],
-            v: vec![PoolSlab::Native(runtime::pool::Slab::new(8, 2 * 4, runtime::dtype::DType::F32))],
+            k: vec![PoolSlab::Native(runtime::cpu::pool::Slab::new(8, 2 * 4, runtime::dtype::DType::F32))],
+            v: vec![PoolSlab::Native(runtime::cpu::pool::Slab::new(8, 2 * 4, runtime::dtype::DType::F32))],
             scales: vec![],
             kv_heads: 2,
             head_dim: 4,

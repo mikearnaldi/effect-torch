@@ -1,5 +1,5 @@
-use super::cpu::{CpuBuffer, Elem, Tensor};
-use super::layout::Layout;
+use super::tensor::{CpuBuffer, Elem, Tensor};
+use crate::runtime::layout::Layout;
 use half::{bf16, f16};
 
 fn kept_shape(shape: &[usize], dims: &[usize]) -> Vec<usize> {

@@ -1,4 +1,4 @@
-use super::cpu::Tensor;
+use super::tensor::Tensor;
 
 fn pad1(x: &Tensor, padding: usize) -> Tensor {
     if padding == 0 {
@@ -30,10 +30,10 @@ pub fn conv1d(x: &Tensor, w: &Tensor, stride: usize, padding: usize, dilation: u
     let xc = x.contiguous();
     let wc = w.contiguous();
     let mut out = vec![0f64; n * c_out * l_out];
-    let xf = xc.cast(super::dtype::DType::F64);
-    let wf = wc.cast(super::dtype::DType::F64);
-    let super::cpu::CpuBuffer::F64(xd) = &xf.buffer else { unreachable!() };
-    let super::cpu::CpuBuffer::F64(wd) = &wf.buffer else { unreachable!() };
+    let xf = xc.cast(crate::runtime::dtype::DType::F64);
+    let wf = wc.cast(crate::runtime::dtype::DType::F64);
+    let super::tensor::CpuBuffer::F64(xd) = &xf.buffer else { unreachable!() };
+    let super::tensor::CpuBuffer::F64(wd) = &wf.buffer else { unreachable!() };
     let lp = l + 2 * padding;
     for b in 0..n {
         for g in 0..groups {
@@ -66,10 +66,10 @@ pub fn conv2d(x: &Tensor, w: &Tensor, stride: usize, padding: usize, dilation: u
     let x = pad2(x, padding);
     let oh = (h + 2 * padding - dilation * (kh - 1) - 1) / stride + 1;
     let ow = (wd + 2 * padding - dilation * (kw - 1) - 1) / stride + 1;
-    let xc = x.contiguous().cast(super::dtype::DType::F64);
-    let wc = w.contiguous().cast(super::dtype::DType::F64);
-    let super::cpu::CpuBuffer::F64(xd) = &xc.buffer else { unreachable!() };
-    let super::cpu::CpuBuffer::F64(wgt) = &wc.buffer else { unreachable!() };
+    let xc = x.contiguous().cast(crate::runtime::dtype::DType::F64);
+    let wc = w.contiguous().cast(crate::runtime::dtype::DType::F64);
+    let super::tensor::CpuBuffer::F64(xd) = &xc.buffer else { unreachable!() };
+    let super::tensor::CpuBuffer::F64(wgt) = &wc.buffer else { unreachable!() };
     let (hp, wp) = (h + 2 * padding, wd + 2 * padding);
     let mut out = vec![0f64; n * c_out * oh * ow];
     for b in 0..n {
@@ -119,10 +119,10 @@ pub fn conv_transpose1d(
     assert_eq!(c_in, cin_per * groups);
     let c_out = c_out_per_g * groups;
     let l_out = (l - 1) * stride - 2 * padding + dilation * (k - 1) + output_padding + 1;
-    let xc = x.contiguous().cast(super::dtype::DType::F64);
-    let wc = w.contiguous().cast(super::dtype::DType::F64);
-    let super::cpu::CpuBuffer::F64(xd) = &xc.buffer else { unreachable!() };
-    let super::cpu::CpuBuffer::F64(wgt) = &wc.buffer else { unreachable!() };
+    let xc = x.contiguous().cast(crate::runtime::dtype::DType::F64);
+    let wc = w.contiguous().cast(crate::runtime::dtype::DType::F64);
+    let super::tensor::CpuBuffer::F64(xd) = &xc.buffer else { unreachable!() };
+    let super::tensor::CpuBuffer::F64(wgt) = &wc.buffer else { unreachable!() };
     let mut out = vec![0f64; n * c_out * l_out];
     for b in 0..n {
         for g in 0..groups {
@@ -165,10 +165,10 @@ pub fn conv_transpose2d(
     let c_out = c_out_per_g * groups;
     let oh = (h - 1) * stride - 2 * padding + dilation * (kh - 1) + output_padding + 1;
     let ow = (wd - 1) * stride - 2 * padding + dilation * (kw - 1) + output_padding + 1;
-    let xc = x.contiguous().cast(super::dtype::DType::F64);
-    let wc = w.contiguous().cast(super::dtype::DType::F64);
-    let super::cpu::CpuBuffer::F64(xd) = &xc.buffer else { unreachable!() };
-    let super::cpu::CpuBuffer::F64(wgt) = &wc.buffer else { unreachable!() };
+    let xc = x.contiguous().cast(crate::runtime::dtype::DType::F64);
+    let wc = w.contiguous().cast(crate::runtime::dtype::DType::F64);
+    let super::tensor::CpuBuffer::F64(xd) = &xc.buffer else { unreachable!() };
+    let super::tensor::CpuBuffer::F64(wgt) = &wc.buffer else { unreachable!() };
     let mut out = vec![0f64; n * c_out * oh * ow];
     for b in 0..n {
         for g in 0..groups {
@@ -222,10 +222,10 @@ pub fn conv2d_backward_w(
     let cout_per = out_channels / groups;
     let x = pad2(x, padding);
     let (hp, wp) = (x.shape()[2], x.shape()[3]);
-    let xc = x.contiguous().cast(super::dtype::DType::F64);
-    let gc = g.contiguous().cast(super::dtype::DType::F64);
-    let super::cpu::CpuBuffer::F64(xd) = &xc.buffer else { unreachable!() };
-    let super::cpu::CpuBuffer::F64(gd) = &gc.buffer else { unreachable!() };
+    let xc = x.contiguous().cast(crate::runtime::dtype::DType::F64);
+    let gc = g.contiguous().cast(crate::runtime::dtype::DType::F64);
+    let super::tensor::CpuBuffer::F64(xd) = &xc.buffer else { unreachable!() };
+    let super::tensor::CpuBuffer::F64(gd) = &gc.buffer else { unreachable!() };
     let mut out = vec![0f64; out_channels * c_per * kh * kw];
     for gidx in 0..groups {
         for co in 0..cout_per {

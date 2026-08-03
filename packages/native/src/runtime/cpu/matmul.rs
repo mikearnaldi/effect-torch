@@ -1,5 +1,5 @@
-use super::cpu::{CpuBuffer, Elem, Tensor};
-use super::layout::broadcast_shape;
+use super::tensor::{CpuBuffer, Elem, Tensor};
+use crate::runtime::layout::broadcast_shape;
 use half::{bf16, f16};
 
 fn naive_gemm<T: Elem + std::ops::Add<Output = T> + std::ops::Mul<Output = T>>(

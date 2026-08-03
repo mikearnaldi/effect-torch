@@ -1,4 +1,4 @@
-use super::dtype::DType;
+use crate::runtime::dtype::DType;
 use half::{bf16, f16};
 use std::sync::RwLock;
 

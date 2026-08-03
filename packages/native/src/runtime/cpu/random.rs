@@ -1,5 +1,5 @@
-use super::cpu::Tensor;
-use super::dtype::DType;
+use super::tensor::Tensor;
+use crate::runtime::dtype::DType;
 use std::sync::Mutex;
 
 struct Xoroshiro128Plus {
@@ -87,7 +87,7 @@ impl Tensor {
         assert_eq!(data.len(), self.numel());
         macro_rules! go {
             ($variant:ident, $t:ty) => {
-                Tensor::from_vec(data.iter().map(|&x| <$t as super::cpu::Elem>::from_f64(x)).collect::<Vec<$t>>(), self.shape().to_vec())
+                Tensor::from_vec(data.iter().map(|&x| <$t as super::tensor::Elem>::from_f64(x)).collect::<Vec<$t>>(), self.shape().to_vec())
             };
         }
         match self.dtype() {

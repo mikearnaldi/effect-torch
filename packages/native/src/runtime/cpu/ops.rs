@@ -1,5 +1,5 @@
-use super::cpu::{CpuBuffer, Elem, Tensor};
-use super::layout::{broadcast_shape, Layout};
+use super::tensor::{CpuBuffer, Elem, Tensor};
+use crate::runtime::layout::{broadcast_shape, Layout};
 use half::{bf16, f16};
 
 fn strided_offsets(la: &Layout, lb: &Layout, out_i: usize) -> (usize, usize) {
@@ -158,7 +158,7 @@ impl Tensor {
     }
 
     pub fn where_(&self, cond: &Tensor, other: &Tensor) -> Tensor {
-        assert_eq!(cond.dtype(), super::dtype::DType::U8, "where condition must be u8");
+        assert_eq!(cond.dtype(), crate::runtime::dtype::DType::U8, "where condition must be u8");
         assert_eq!(self.dtype(), other.dtype(), "mixed dtypes");
         let CpuBuffer::U8(c) = &cond.buffer else { unreachable!() };
         let shape = broadcast_shape(&broadcast_shape(cond.shape(), self.shape()), other.shape());
@@ -190,7 +190,7 @@ impl Tensor {
     }
 
     pub fn neg(&self) -> Tensor {
-        assert!(self.dtype() != super::dtype::DType::U8, "neg on u8");
+        assert!(self.dtype() != crate::runtime::dtype::DType::U8, "neg on u8");
         match &self.buffer {
             CpuBuffer::F32(v) => unary_impl(v, &self.layout, |x: f32| -x),
             CpuBuffer::F64(v) => unary_impl(v, &self.layout, |x: f64| -x),
@@ -282,6 +282,6 @@ mod tests {
         let e = a.exp();
         assert!((f32_data(&e)[1] - std::f32::consts::E).abs() < 1e-6);
         let h = Tensor::from_vec(vec![f16::ONE], vec![1]).exp();
-        assert_eq!(h.dtype(), super::super::dtype::DType::F16);
+        assert_eq!(h.dtype(), crate::runtime::dtype::DType::F16);
     }
 }

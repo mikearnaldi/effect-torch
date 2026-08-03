@@ -1,5 +1,5 @@
-use super::cpu::{CpuBuffer, Tensor};
-use super::dtype::DType;
+use super::tensor::{CpuBuffer, Tensor};
+use crate::runtime::dtype::DType;
 
 fn lu_decompose(a: &[f64], n: usize) -> Option<(Vec<f64>, Vec<usize>, i32)> {
     let mut lu = a.to_vec();

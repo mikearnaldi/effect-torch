@@ -32,6 +32,7 @@ candle-core = { git = "https://github.com/mikearnaldi/candle", rev = "8f384d8d04
 candle-metal-kernels = { git = "https://github.com/mikearnaldi/candle", rev = "8f384d8d04f885243312b001c1a72bea6c5c11b1" }
 objc2 = "0.6"
 objc2-metal = "0.3.2"
+objc2-foundation = "0.3"
 
 [build-dependencies]
 napi-build = "1"
