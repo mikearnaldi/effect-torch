@@ -33,16 +33,27 @@ mod metal {
 
 #[cfg(target_os = "macos")]
 mod metal {
-    use candle_core::{DType, MetalStorage, Storage, Tensor};
-    use candle_metal_kernels::metal::ComputePipeline;
-    use std::collections::HashMap;
-    use std::sync::{Mutex, OnceLock};
+    use crate::bridge;
+    use crate::runtime::metal::device::{set_buffer, set_bytes, MetalDevice, Pipeline};
+    use crate::runtime::metal::run::MetalTensor;
+    use candle_core::{DType, Tensor};
+    use objc2_metal::MTLComputeCommandEncoder;
+    use std::sync::Arc;
 
     const NT: usize = 128;
 
-    fn pipelines() -> &'static Mutex<HashMap<u64, ComputePipeline>> {
-        static CACHE: OnceLock<Mutex<HashMap<u64, ComputePipeline>>> = OnceLock::new();
-        CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+    fn wrap_contig(t: &Tensor) -> candle_core::Result<MetalTensor> {
+        let w = bridge::metal::wrap(t)?;
+        if w.layout.is_contiguous() {
+            Ok(w)
+        } else {
+            crate::runtime::metal::kernels::strided_copy(MetalDevice::get(), &w)
+                .map_err(candle_core::Error::Msg)
+        }
+    }
+
+    fn alloc(n: usize, dtype: crate::runtime::dtype::DType) -> Arc<crate::runtime::metal::device::Buffer> {
+        MetalDevice::get().alloc(n.max(1), dtype)
     }
 
     fn source(tgt: DType) -> String {
@@ -229,58 +240,26 @@ kernel void et_ce_bwd(
         )
     }
 
-    fn pipeline(mdev: &candle_core::MetalDevice, tgt: DType, name: &'static str) -> candle_core::Result<ComputePipeline> {
+    fn pipeline(_mdev: &candle_core::MetalDevice, tgt: DType, name: &'static str) -> candle_core::Result<Pipeline> {
         use std::collections::hash_map::DefaultHasher;
         use std::hash::{Hash, Hasher};
 
         let mut hasher = DefaultHasher::new();
         (tgt, name).hash(&mut hasher);
         let key = hasher.finish();
-        let mut cache = pipelines().lock().unwrap();
-        if let Some(p) = cache.get(&key) {
-            return Ok(p.clone());
-        }
         let src = source(tgt);
-        #[allow(deprecated)]
-        let opts = {
-            let o = objc2_metal::MTLCompileOptions::new();
-            o.setFastMathEnabled(false);
-            o
-        };
-        let lib = mdev
-            .device()
-            .new_library_with_source(&src, Some(&opts))
-            .map_err(|e| candle_core::Error::Msg(format!("ce: {e}")))?;
-        let func = lib
-            .get_function(name, None)
-            .map_err(|e| candle_core::Error::Msg(format!("ce: {e}")))?;
-        let p = mdev
-            .device()
-            .new_compute_pipeline_state_with_function(&func)
-            .map_err(|e| candle_core::Error::Msg(format!("ce: {e}")))?;
-        cache.insert(key, p.clone());
-        Ok(p)
+        MetalDevice::get()
+            .compile(key, &src, name)
+            .map_err(candle_core::Error::Msg)
     }
 
-    fn buffer_of(t: &Tensor) -> candle_core::Result<(candle_metal_kernels::metal::Buffer, usize)> {
-        let (storage, layout) = t.storage_and_layout();
-        match &*storage {
-            Storage::Metal(m) => Ok((m.buffer().clone(), layout.start_offset())),
-            _ => Err(candle_core::Error::Msg("ce: expected Metal storage".to_string())),
-        }
+    fn wrap(buf: Arc<crate::runtime::metal::device::Buffer>, mdev: &candle_core::MetalDevice, n: usize, shape: Vec<usize>) -> candle_core::Result<Tensor> {
+        let _ = n;
+        bridge::metal::unwrap(&buf, shape, DType::F32, mdev)
     }
 
-    fn wrap(buf: std::sync::Arc<candle_metal_kernels::metal::Buffer>, mdev: &candle_core::MetalDevice, n: usize, shape: Vec<usize>) -> Tensor {
-        Tensor::from_storage(
-            Storage::Metal(MetalStorage::new(buf, mdev.clone(), n, DType::F32)),
-            shape,
-            candle_core::op::BackpropOp::none(),
-            false,
-        )
-    }
-
-    fn dispatch_grid(encoder: &candle_metal_kernels::metal::ComputeCommandEncoder, width: usize, threads: usize) {
-        encoder.dispatch_thread_groups(
+    fn dispatch_grid(encoder: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTLComputeCommandEncoder>, width: usize, threads: usize) {
+        encoder.dispatchThreadgroups_threadsPerThreadgroup(
             objc2_metal::MTLSize { width, height: 1, depth: 1 },
             objc2_metal::MTLSize { width: threads, height: 1, depth: 1 },
         );
@@ -299,38 +278,40 @@ kernel void et_ce_bwd(
         let device = logits.device();
         let mdev = device.as_metal_device()?;
         let tgt = target.dtype();
-        let logits = logits.reshape((n, v))?.contiguous()?;
-        let target = target.reshape(n)?.contiguous()?;
-        let nll_buf = mdev.new_buffer(n, DType::F32, "ce_nll")?;
-        let flags_buf = mdev.new_buffer(n, DType::U32, "ce_flags")?;
-        let status_buf = mdev.new_buffer(3, DType::F32, "ce_status")?;
+        let logits = wrap_contig(&logits.reshape((n, v))?)?;
+        let target = wrap_contig(&target.reshape(n)?)?;
+        device.synchronize()?;
+        let nll_buf = alloc(n, crate::runtime::dtype::DType::F32);
+        let flags_buf = alloc(n, crate::runtime::dtype::DType::U32);
+        let status_buf = alloc(3, crate::runtime::dtype::DType::F32);
         {
-            let encoder = mdev.command_encoder()?;
-            let encoder = encoder.as_ref();
-            encoder.set_compute_pipeline_state(&pipeline(mdev, tgt, "et_ce_fwd")?);
-            let (zb, zo) = buffer_of(&logits)?;
-            let (tb, to) = buffer_of(&target)?;
+            let pipe = pipeline(mdev, tgt, "et_ce_fwd")?;
             let f32_off = |off: usize| off * DType::F32.size_in_bytes();
             let tgt_off = |off: usize| off * tgt.size_in_bytes();
-            encoder.set_input_buffer(0, Some(&zb), f32_off(zo));
-            encoder.set_input_buffer(1, Some(&tb), tgt_off(to));
-            encoder.set_output_buffer(2, Some(&nll_buf), 0);
-            encoder.set_output_buffer(3, Some(&flags_buf), 0);
-            encoder.set_bytes(4, &(v as u32));
-            encoder.set_bytes(5, &ignore_index);
-            dispatch_grid(encoder, n, NT);
+            MetalDevice::get().with_encoder(|e| {
+                e.setComputePipelineState(pipe.as_raw());
+                set_buffer(e, 0, &logits.buffer, f32_off(logits.layout.offset()));
+                set_buffer(e, 1, &target.buffer, tgt_off(target.layout.offset()));
+                set_buffer(e, 2, &nll_buf, 0);
+                set_buffer(e, 3, &flags_buf, 0);
+                set_bytes(e, 4, &(v as u32));
+                set_bytes(e, 5, &ignore_index);
+                dispatch_grid(e, n, NT);
+            });
         }
         {
-            let encoder = mdev.command_encoder()?;
-            let encoder = encoder.as_ref();
-            encoder.set_compute_pipeline_state(&pipeline(mdev, tgt, "et_ce_status")?);
-            encoder.set_input_buffer(0, Some(&nll_buf), 0);
-            encoder.set_input_buffer(1, Some(&flags_buf), 0);
-            encoder.set_output_buffer(2, Some(&status_buf), 0);
-            encoder.set_bytes(3, &(n as u32));
-            dispatch_grid(encoder, 1, NT);
+            let pipe = pipeline(mdev, tgt, "et_ce_status")?;
+            MetalDevice::get().with_encoder(|e| {
+                e.setComputePipelineState(pipe.as_raw());
+                set_buffer(e, 0, &nll_buf, 0);
+                set_buffer(e, 1, &flags_buf, 0);
+                set_buffer(e, 2, &status_buf, 0);
+                set_bytes(e, 3, &(n as u32));
+                dispatch_grid(e, 1, NT);
+            });
         }
-        let status = wrap(status_buf, mdev, 3, vec![3]);
+        MetalDevice::get().synchronize();
+        let status = wrap(status_buf, mdev, 3, vec![3])?;
         let loss = status.narrow(0, 0, 1)?.reshape(())?;
         Ok((loss, status))
     }
@@ -345,39 +326,40 @@ kernel void et_ce_bwd(
         let device = logits.device();
         let mdev = device.as_metal_device()?;
         let tgt = target.dtype();
-        let logits = logits.reshape((n, v))?.contiguous()?;
-        let target = target.reshape(n)?.contiguous()?;
-        let count_buf = mdev.new_buffer(1, DType::F32, "ce_count")?;
-        let grad_buf = mdev.new_buffer(n * v, DType::F32, "ce_grad")?;
+        let logits = wrap_contig(&logits.reshape((n, v))?)?;
+        let target = wrap_contig(&target.reshape(n)?)?;
+        device.synchronize()?;
+        let count_buf = alloc(1, crate::runtime::dtype::DType::F32);
+        let grad_buf = alloc(n * v, crate::runtime::dtype::DType::F32);
         {
-            let encoder = mdev.command_encoder()?;
-            let encoder = encoder.as_ref();
-            encoder.set_compute_pipeline_state(&pipeline(mdev, tgt, "et_ce_count")?);
-            let (tb, to) = buffer_of(&target)?;
-            encoder.set_input_buffer(0, Some(&tb), to * tgt.size_in_bytes());
-            encoder.set_output_buffer(1, Some(&count_buf), 0);
-            encoder.set_bytes(2, &(n as u32));
-            encoder.set_bytes(3, &ignore_index);
-            dispatch_grid(encoder, 1, NT);
+            let pipe = pipeline(mdev, tgt, "et_ce_count")?;
+            MetalDevice::get().with_encoder(|e| {
+                e.setComputePipelineState(pipe.as_raw());
+                set_buffer(e, 0, &target.buffer, target.layout.offset() * tgt.size_in_bytes());
+                set_buffer(e, 1, &count_buf, 0);
+                set_bytes(e, 2, &(n as u32));
+                set_bytes(e, 3, &ignore_index);
+                dispatch_grid(e, 1, NT);
+            });
         }
         {
-            let encoder = mdev.command_encoder()?;
-            let encoder = encoder.as_ref();
-            encoder.set_compute_pipeline_state(&pipeline(mdev, tgt, "et_ce_bwd")?);
-            let (zb, zo) = buffer_of(&logits)?;
-            let (tb, to) = buffer_of(&target)?;
-            encoder.set_input_buffer(0, Some(&zb), zo * DType::F32.size_in_bytes());
-            encoder.set_input_buffer(1, Some(&tb), to * tgt.size_in_bytes());
-            encoder.set_input_buffer(2, Some(&count_buf), 0);
-            encoder.set_output_buffer(3, Some(&grad_buf), 0);
-            encoder.set_bytes(4, &(v as u32));
-            encoder.set_bytes(5, &ignore_index);
-            dispatch_grid(encoder, n, NT);
+            let pipe = pipeline(mdev, tgt, "et_ce_bwd")?;
+            MetalDevice::get().with_encoder(|e| {
+                e.setComputePipelineState(pipe.as_raw());
+                set_buffer(e, 0, &logits.buffer, logits.layout.offset() * DType::F32.size_in_bytes());
+                set_buffer(e, 1, &target.buffer, target.layout.offset() * tgt.size_in_bytes());
+                set_buffer(e, 2, &count_buf, 0);
+                set_buffer(e, 3, &grad_buf, 0);
+                set_bytes(e, 4, &(v as u32));
+                set_bytes(e, 5, &ignore_index);
+                dispatch_grid(e, n, NT);
+            });
         }
+        MetalDevice::get().synchronize();
         // The zero-active check is deferred to the walk's end (see
         // ce_forward); the count buffer is returned for it.
-        let count = wrap(count_buf.clone(), mdev, 1, vec![1]);
-        let grad = wrap(grad_buf, mdev, n * v, vec![n, v]);
+        let count = wrap(count_buf.clone(), mdev, 1, vec![1])?;
+        let grad = wrap(grad_buf, mdev, n * v, vec![n, v])?;
         Ok((grad.reshape(out_shape)?, count))
     }
 }
