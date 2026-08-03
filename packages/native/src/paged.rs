@@ -26,57 +26,37 @@ pub use metal::{decode, scatter};
 
 #[cfg(target_os = "macos")]
 mod metal {
-    use candle_core::{DType, MetalStorage, Storage, Tensor};
-    use candle_metal_kernels::metal::ComputePipeline;
-    use std::collections::HashMap;
-    use std::sync::{Mutex, OnceLock};
+    use crate::bridge;
+    use crate::runtime::metal::device::{set_buffer, set_bytes, MetalDevice, Pipeline};
+    use crate::runtime::metal::run::MetalTensor;
+    use candle_core::{DType, Tensor};
+    use objc2_metal::MTLComputeCommandEncoder;
 
     const THREADS: usize = 128;
 
-    fn pipelines() -> &'static Mutex<HashMap<u64, ComputePipeline>> {
-        static CACHE: OnceLock<Mutex<HashMap<u64, ComputePipeline>>> = OnceLock::new();
-        CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+    fn wrap_contig(t: &Tensor) -> candle_core::Result<MetalTensor> {
+        let w = bridge::metal::wrap(t)?;
+        if w.layout.is_contiguous() {
+            Ok(w)
+        } else {
+            crate::runtime::metal::kernels::strided_copy(MetalDevice::get(), &w)
+                .map_err(candle_core::Error::Msg)
+        }
     }
 
     fn compile(
-        mdev: &candle_core::MetalDevice,
+        _mdev: &candle_core::MetalDevice,
         key: u64,
         src: &str,
         name: &'static str,
-    ) -> candle_core::Result<ComputePipeline> {
-        let mut cache = pipelines().lock().unwrap();
-        if let Some(p) = cache.get(&key) {
-            return Ok(p.clone());
-        }
-        #[allow(deprecated)]
-        let opts = {
-            let o = objc2_metal::MTLCompileOptions::new();
-            o.setFastMathEnabled(false);
-            o
-        };
-        let lib = mdev
-            .device()
-            .new_library_with_source(src, Some(&opts))
-            .map_err(|e| candle_core::Error::Msg(format!("paged {name}: {e}")))?;
-        let func = lib
-            .get_function(name, None)
-            .map_err(|e| candle_core::Error::Msg(format!("paged {name}: {e}")))?;
-        let p = mdev
-            .device()
-            .new_compute_pipeline_state_with_function(&func)
-            .map_err(|e| candle_core::Error::Msg(format!("paged {name}: {e}")))?;
-        cache.insert(key, p.clone());
-        Ok(p)
+    ) -> candle_core::Result<Pipeline> {
+        MetalDevice::get()
+            .compile(key, src, name)
+            .map_err(candle_core::Error::Msg)
     }
 
-    fn buffer_of(t: &Tensor) -> candle_core::Result<(candle_metal_kernels::metal::Buffer, usize)> {
-        let (storage, layout) = t.storage_and_layout();
-        match &*storage {
-            Storage::Metal(m) => Ok((m.buffer().clone(), layout.start_offset())),
-            _ => Err(candle_core::Error::Msg(
-                "paged decode: expected Metal storage".to_string(),
-            )),
-        }
+    fn slab_dtype(t: &MetalTensor) -> DType {
+        crate::bridge::dtype_from_native(t.dtype)
     }
 
     // Writes the new-token row of every slot into the slabs in one
@@ -172,12 +152,12 @@ kernel void et_paged_scatter(
     pub fn scatter(
         k_new: &Tensor,
         v_new: &Tensor,
-        k_slab: &Tensor,
-        v_slab: &Tensor,
-        k_scales: Option<&Tensor>,
-        v_scales: Option<&Tensor>,
-        tables: &Tensor,
-        ctxlens: &Tensor,
+        k_slab: &MetalTensor,
+        v_slab: &MetalTensor,
+        k_scales: Option<&MetalTensor>,
+        v_scales: Option<&MetalTensor>,
+        tables: &MetalTensor,
+        ctxlens: &MetalTensor,
         block_size: usize,
         advance: usize,
     ) -> candle_core::Result<()> {
@@ -187,57 +167,54 @@ kernel void et_paged_scatter(
         let (b, h, c, d) = k_new.dims4()?;
         let device = k_new.device();
         let mdev = device.as_metal_device()?;
-        let slab_dtype = k_slab.dtype();
+        let slab_dtype = slab_dtype(k_slab);
         let mut hasher = DefaultHasher::new();
         (0x5CA7u32, d, slab_dtype).hash(&mut hasher);
         let src = scatter_source(d, slab_dtype);
         let pipe = compile(mdev, hasher.finish(), &src, "et_paged_scatter")?;
-        let k_new = k_new.contiguous()?;
-        let v_new = v_new.contiguous()?;
-        let encoder = mdev.command_encoder()?;
-        let encoder = encoder.as_ref();
-        encoder.set_compute_pipeline_state(&pipe);
-        let (knb, kno) = buffer_of(&k_new)?;
-        let (vnb, vno) = buffer_of(&v_new)?;
-        let (kb, ko) = buffer_of(k_slab)?;
-        let (vb, vo) = buffer_of(v_slab)?;
-        let (tb, to) = buffer_of(tables)?;
-        let (cb, co) = buffer_of(ctxlens)?;
+        let k_new = wrap_contig(k_new)?;
+        let v_new = wrap_contig(v_new)?;
+        device.synchronize()?;
         let f32_off = |off: usize| off * DType::F32.size_in_bytes();
         let u32_off = |off: usize| off * DType::U32.size_in_bytes();
         let elem_off = |off: usize| off * slab_dtype.size_in_bytes();
-        encoder.set_input_buffer(0, Some(&knb), f32_off(kno));
-        encoder.set_input_buffer(1, Some(&vnb), f32_off(vno));
-        encoder.set_output_buffer(2, Some(&kb), elem_off(ko));
-        encoder.set_output_buffer(3, Some(&vb), elem_off(vo));
-        let (ksb, kso) = match k_scales {
-            Some(t) => buffer_of(t)?,
-            None => (kb.clone(), ko),
-        };
-        let (vsb, vso) = match v_scales {
-            Some(t) => buffer_of(t)?,
-            None => (vb.clone(), vo),
-        };
-        encoder.set_output_buffer(4, Some(&ksb), f32_off(kso));
-        encoder.set_output_buffer(5, Some(&vsb), f32_off(vso));
-        encoder.set_input_buffer(6, Some(&tb), u32_off(to));
-        encoder.set_input_buffer(7, Some(&cb), u32_off(co));
-        encoder.set_bytes(8, &(block_size as u32));
-        encoder.set_bytes(9, &(tables.dim(1)? as u32));
-        encoder.set_bytes(10, &(h as u32));
-        encoder.set_bytes(11, &(advance as u32));
-        encoder.dispatch_thread_groups(
-            objc2_metal::MTLSize {
-                width: h,
-                height: b,
-                depth: c,
-            },
-            objc2_metal::MTLSize {
-                width: 32,
-                height: 1,
-                depth: 1,
-            },
-        );
+        let max_blocks = tables.layout.shape()[1] as u32;
+        MetalDevice::get().with_encoder(|e| {
+            e.setComputePipelineState(pipe.as_raw());
+            set_buffer(e, 0, &k_new.buffer, f32_off(k_new.layout.offset()));
+            set_buffer(e, 1, &v_new.buffer, f32_off(v_new.layout.offset()));
+            set_buffer(e, 2, &k_slab.buffer, elem_off(k_slab.layout.offset()));
+            set_buffer(e, 3, &v_slab.buffer, elem_off(v_slab.layout.offset()));
+            let (ksb, kso) = match k_scales {
+                Some(t) => (&t.buffer, t.layout.offset()),
+                None => (&k_slab.buffer, k_slab.layout.offset()),
+            };
+            let (vsb, vso) = match v_scales {
+                Some(t) => (&t.buffer, t.layout.offset()),
+                None => (&v_slab.buffer, v_slab.layout.offset()),
+            };
+            set_buffer(e, 4, ksb, f32_off(kso));
+            set_buffer(e, 5, vsb, f32_off(vso));
+            set_buffer(e, 6, &tables.buffer, u32_off(tables.layout.offset()));
+            set_buffer(e, 7, &ctxlens.buffer, u32_off(ctxlens.layout.offset()));
+            set_bytes(e, 8, &(block_size as u32));
+            set_bytes(e, 9, &max_blocks);
+            set_bytes(e, 10, &(h as u32));
+            set_bytes(e, 11, &(advance as u32));
+            e.dispatchThreadgroups_threadsPerThreadgroup(
+                objc2_metal::MTLSize {
+                    width: h,
+                    height: b,
+                    depth: c,
+                },
+                objc2_metal::MTLSize {
+                    width: 32,
+                    height: 1,
+                    depth: 1,
+                },
+            );
+        });
+        MetalDevice::get().synchronize();
         Ok(())
     }
 
@@ -439,7 +416,7 @@ kernel void et_paged_decode(
         d: usize,
         slab_dtype: DType,
         scale: f64,
-    ) -> candle_core::Result<ComputePipeline> {
+    ) -> candle_core::Result<Pipeline> {
         use std::collections::hash_map::DefaultHasher;
         use std::hash::{Hash, Hasher};
 
@@ -457,12 +434,12 @@ kernel void et_paged_decode(
     #[allow(clippy::too_many_arguments)]
     pub fn decode(
         q: &Tensor,
-        k_slab: &Tensor,
-        v_slab: &Tensor,
-        k_scales: Option<&Tensor>,
-        v_scales: Option<&Tensor>,
-        tables: &Tensor,
-        ctxlens: &Tensor,
+        k_slab: &MetalTensor,
+        v_slab: &MetalTensor,
+        k_scales: Option<&MetalTensor>,
+        v_scales: Option<&MetalTensor>,
+        tables: &MetalTensor,
+        ctxlens: &MetalTensor,
         window: Option<usize>,
         scale: f64,
         block_size: usize,
@@ -471,64 +448,52 @@ kernel void et_paged_decode(
         let (b, h, c, d) = q.dims4()?;
         let device = q.device();
         let mdev = device.as_metal_device()?;
-        let slab_dtype = k_slab.dtype();
-        let q = q.contiguous()?;
+        let slab_dtype = slab_dtype(k_slab);
+        let q = wrap_contig(q)?;
         let pipe = pipeline(mdev, d, slab_dtype, scale)?;
-        let out_buf = mdev.new_buffer(b * h * c * d, DType::F32, "paged_o")?;
-        let max_blocks = tables.dim(1)?;
-        let encoder = mdev.command_encoder()?;
-        let encoder = encoder.as_ref();
-        encoder.set_compute_pipeline_state(&pipe);
-        let (qb, qo) = buffer_of(&q)?;
-        let (kb, ko) = buffer_of(k_slab)?;
-        let (vb, vo) = buffer_of(v_slab)?;
-        let (tb, to) = buffer_of(tables)?;
-        let (cb, co) = buffer_of(ctxlens)?;
+        let out_buf = MetalDevice::get().alloc((b * h * c * d).max(1), crate::runtime::dtype::DType::F32);
+        let max_blocks = tables.layout.shape()[1];
+        device.synchronize()?;
         let f32_off = |off: usize| off * DType::F32.size_in_bytes();
         let u32_off = |off: usize| off * DType::U32.size_in_bytes();
-
         let elem_off = |off: usize| off * slab_dtype.size_in_bytes();
-        encoder.set_input_buffer(0, Some(&qb), f32_off(qo));
-        encoder.set_input_buffer(1, Some(&kb), elem_off(ko));
-        encoder.set_input_buffer(2, Some(&vb), elem_off(vo));
-        encoder.set_input_buffer(3, Some(&tb), u32_off(to));
-        encoder.set_input_buffer(4, Some(&cb), u32_off(co));
-        encoder.set_output_buffer(5, Some(&out_buf), 0);
-        // Scale buffers are always bound; point at K when unused.
-        let (ksb, kso) = match k_scales {
-            Some(t) => buffer_of(t)?,
-            None => (kb.clone(), ko),
-        };
-        let (vsb, vso) = match v_scales {
-            Some(t) => buffer_of(t)?,
-            None => (vb.clone(), vo),
-        };
-
-        encoder.set_input_buffer(6, Some(&ksb), f32_off(kso));
-        encoder.set_input_buffer(7, Some(&vsb), f32_off(vso));
-        encoder.set_bytes(8, &(block_size as u32));
-        encoder.set_bytes(9, &(max_blocks as u32));
-        encoder.set_bytes(10, &(window.unwrap_or(0) as u32));
-        encoder.set_bytes(11, &(h as u32));
-        encoder.set_bytes(12, &(advance as u32));
-        encoder.dispatch_thread_groups(
-            objc2_metal::MTLSize {
-                width: h,
-                height: b,
-                depth: c,
-            },
-            objc2_metal::MTLSize {
-                width: THREADS,
-                height: 1,
-                depth: 1,
-            },
-        );
-        // no end_encoding: candle's Commands owns the encoder lifecycle
-        Ok(Tensor::from_storage(
-            Storage::Metal(MetalStorage::new(out_buf, mdev.clone(), b * h * c * d, DType::F32)),
-            (b, h, c, d),
-            candle_core::op::BackpropOp::none(),
-            false,
-        ))
+        MetalDevice::get().with_encoder(|e| {
+            e.setComputePipelineState(pipe.as_raw());
+            set_buffer(e, 0, &q.buffer, f32_off(q.layout.offset()));
+            set_buffer(e, 1, &k_slab.buffer, elem_off(k_slab.layout.offset()));
+            set_buffer(e, 2, &v_slab.buffer, elem_off(v_slab.layout.offset()));
+            set_buffer(e, 3, &tables.buffer, u32_off(tables.layout.offset()));
+            set_buffer(e, 4, &ctxlens.buffer, u32_off(ctxlens.layout.offset()));
+            set_buffer(e, 5, &out_buf, 0);
+            let (ksb, kso) = match k_scales {
+                Some(t) => (&t.buffer, t.layout.offset()),
+                None => (&k_slab.buffer, k_slab.layout.offset()),
+            };
+            let (vsb, vso) = match v_scales {
+                Some(t) => (&t.buffer, t.layout.offset()),
+                None => (&v_slab.buffer, v_slab.layout.offset()),
+            };
+            set_buffer(e, 6, ksb, f32_off(kso));
+            set_buffer(e, 7, vsb, f32_off(vso));
+            set_bytes(e, 8, &(block_size as u32));
+            set_bytes(e, 9, &(max_blocks as u32));
+            set_bytes(e, 10, &(window.unwrap_or(0) as u32));
+            set_bytes(e, 11, &(h as u32));
+            set_bytes(e, 12, &(advance as u32));
+            e.dispatchThreadgroups_threadsPerThreadgroup(
+                objc2_metal::MTLSize {
+                    width: h,
+                    height: b,
+                    depth: c,
+                },
+                objc2_metal::MTLSize {
+                    width: THREADS,
+                    height: 1,
+                    depth: 1,
+                },
+            );
+        });
+        MetalDevice::get().synchronize();
+        bridge::metal::unwrap(&out_buf, vec![b, h, c, d], DType::F32, mdev)
     }
 }

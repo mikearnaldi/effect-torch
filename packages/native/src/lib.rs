@@ -8704,22 +8704,36 @@ impl BlockStore {
 
 enum PoolSlab {
     Native(runtime::cpu::pool::Slab),
-    Candle(Tensor),
+    NativeMetal(runtime::metal::run::MetalTensor),
 }
 
 impl PoolSlab {
     fn dtype(&self) -> DType {
         match self {
             PoolSlab::Native(s) => bridge::dtype_from_native(s.dtype),
-            PoolSlab::Candle(t) => t.dtype(),
+            PoolSlab::NativeMetal(t) => bridge::dtype_from_native(t.dtype),
         }
     }
 
-    fn candle(&self) -> candle_core::Result<&Tensor> {
+    fn candle(&self, device: &Device) -> candle_core::Result<Tensor> {
         match self {
-            PoolSlab::Candle(t) => Ok(t),
+            PoolSlab::NativeMetal(t) => bridge::metal::unwrap(
+                &t.buffer,
+                t.layout.shape().to_vec(),
+                bridge::dtype_from_native(t.dtype),
+                device.as_metal_device()?,
+            ),
             PoolSlab::Native(_) => Err(candle_core::Error::Msg(
-                "kv pool: paged Metal path requires candle-backed slabs".to_string(),
+                "kv pool: paged/composed Metal path requires native Metal slabs".to_string(),
+            )),
+        }
+    }
+
+    fn metal(&self) -> candle_core::Result<&runtime::metal::run::MetalTensor> {
+        match self {
+            PoolSlab::NativeMetal(t) => Ok(t),
+            PoolSlab::Native(_) => Err(candle_core::Error::Msg(
+                "kv pool: paged Metal path requires native Metal slabs".to_string(),
             )),
         }
     }
@@ -8727,7 +8741,7 @@ impl PoolSlab {
     fn native(&self) -> candle_core::Result<&runtime::cpu::pool::Slab> {
         match self {
             PoolSlab::Native(s) => Ok(s),
-            PoolSlab::Candle(_) => Err(candle_core::Error::Msg(
+            PoolSlab::NativeMetal(_) => Err(candle_core::Error::Msg(
                 "kv pool: native CPU path requires native-backed slabs".to_string(),
             )),
         }
@@ -8872,7 +8886,7 @@ struct KvContext {
     // Block tables + context lengths for the paged kernel, built once
     // per run (identical across layers: blocks settle at layer 0's
     // prepare, the cursor advances only at run end).
-    paged_tables: Mutex<Option<(Tensor, Tensor)>>,
+    paged_tables: Mutex<Option<(runtime::metal::run::MetalTensor, runtime::metal::run::MetalTensor)>>,
 }
 
 // RoPE forward: x [.., T, D] (D even), one position offset per leading
@@ -9034,16 +9048,24 @@ fn kv_attention_paged(
             tables.resize(tables.len() + (max_blocks - state.blocks.len()), 0);
         }
         *cache = Some((
-            Tensor::from_vec(tables, (batch, max_blocks), &pool.device)?,
-            Tensor::from_vec(ctxlens.clone(), batch, &pool.device)?,
+            runtime::metal::run::MetalTensor {
+                buffer: runtime::metal::device::MetalDevice::get().alloc_with_data_u32(&tables),
+                layout: runtime::layout::Layout::contiguous(vec![batch, max_blocks]),
+                dtype: crate::runtime::dtype::DType::U32,
+            },
+            runtime::metal::run::MetalTensor {
+                buffer: runtime::metal::device::MetalDevice::get().alloc_with_data_u32(&ctxlens),
+                layout: runtime::layout::Layout::contiguous(vec![batch]),
+                dtype: crate::runtime::dtype::DType::U32,
+            },
         ));
     }
     let (tables, ctxlens) = cache.as_ref().expect("populated above");
     let slab_dtype = pool.k[layer].dtype();
     let (k_scales, v_scales) = match slab_dtype {
         DType::U8 => (
-            Some(pool.scales[2 * layer].candle()?),
-            Some(pool.scales[2 * layer + 1].candle()?),
+            Some(pool.scales[2 * layer].metal()?),
+            Some(pool.scales[2 * layer + 1].metal()?),
         ),
         _ => (None, None),
     };
@@ -9051,8 +9073,8 @@ fn kv_attention_paged(
     paged::scatter(
         k,
         v,
-        pool.k[layer].candle()?,
-        pool.v[layer].candle()?,
+        pool.k[layer].metal()?,
+        pool.v[layer].metal()?,
         k_scales,
         v_scales,
         tables,
@@ -9062,8 +9084,8 @@ fn kv_attention_paged(
     )?;
     let out = paged::decode(
         q,
-        pool.k[layer].candle()?,
-        pool.v[layer].candle()?,
+        pool.k[layer].metal()?,
+        pool.v[layer].metal()?,
         k_scales,
         v_scales,
         tables,
@@ -9175,12 +9197,12 @@ fn kv_attention_slot(
         .then(|| Tensor::zeros((ctx - (needed - start), h, d), DType::F32, &pool.device))
         .transpose()?;
     let gather_rows = |slab: &PoolSlab, scale: Option<&PoolSlab>| -> candle_core::Result<Tensor> {
-        let slab = slab.candle()?;
+        let slab = slab.candle(&pool.device)?;
         let gathered = slab.gather(&ctx_index, 0)?;
         let real = match scale {
             // Dequantize: (q - 128) * scale, per (token, head).
             Some(scale) => ((gathered.to_dtype(DType::F32)? - 128.0)?
-                .broadcast_mul(&scale.candle()?.gather(&ctx_scale_index, 0)?.unsqueeze(candle_core::D::Minus1)?))?,
+                .broadcast_mul(&scale.candle(&pool.device)?.gather(&ctx_scale_index, 0)?.unsqueeze(candle_core::D::Minus1)?))?,
             None => gathered.to_dtype(DType::F32)?,
         };
         let full = match &zeros {
@@ -9337,7 +9359,7 @@ fn kv_scatter_rows(
         Tensor::from_vec(rows, (n, 1), &pool.device)?.broadcast_as((n, h))?.contiguous()
     };
     let write_scales = |layer: usize, slot: usize, scale: &Tensor| -> candle_core::Result<()> {
-        pool.scales[2 * layer + slot].candle()?.scatter_set(&scale_index(write_rows.clone())?, scale, 0)
+        pool.scales[2 * layer + slot].candle(&pool.device)?.scatter_set(&scale_index(write_rows.clone())?, scale, 0)
     };
     if slab_dtype == DType::U8 {
         // int8 storage tier: symmetric quantization on a ±127 grid
@@ -9354,13 +9376,13 @@ fn kv_scatter_rows(
         };
         let (qk, sk) = quantize(&new_rows(k)?)?;
         let (qv, sv) = quantize(&new_rows(v)?)?;
-        pool.k[layer].candle()?.scatter_set(&write_index, &qk, 0)?;
-        pool.v[layer].candle()?.scatter_set(&write_index, &qv, 0)?;
+        pool.k[layer].candle(&pool.device)?.scatter_set(&write_index, &qk, 0)?;
+        pool.v[layer].candle(&pool.device)?.scatter_set(&write_index, &qv, 0)?;
         write_scales(layer, 0, &sk)?;
         write_scales(layer, 1, &sv)?;
     } else {
-        pool.k[layer].candle()?.scatter_set(&write_index, &new_rows(k)?.to_dtype(slab_dtype)?, 0)?;
-        pool.v[layer].candle()?.scatter_set(&write_index, &new_rows(v)?.to_dtype(slab_dtype)?, 0)?;
+        pool.k[layer].candle(&pool.device)?.scatter_set(&write_index, &new_rows(k)?.to_dtype(slab_dtype)?, 0)?;
+        pool.v[layer].candle(&pool.device)?.scatter_set(&write_index, &new_rows(v)?.to_dtype(slab_dtype)?, 0)?;
     }
     Ok(())
 }
@@ -9682,22 +9704,29 @@ impl NativeKvPool {
                 }
                 continue;
             }
-            k.push(PoolSlab::Candle(
-                Tensor::zeros((max_tokens, kv_heads, head_dim), dtype, &device)
-                    .map_err(to_napi_err)?,
-            ));
-            v.push(PoolSlab::Candle(
-                Tensor::zeros((max_tokens, kv_heads, head_dim), dtype, &device)
-                    .map_err(to_napi_err)?,
-            ));
-            if dtype == DType::U8 {
-                for _ in 0..2 {
-                    scales.push(PoolSlab::Candle(
-                        Tensor::zeros((max_tokens, kv_heads), DType::F32, &device)
-                            .map_err(to_napi_err)?,
-                    ));
+            if device.is_metal() {
+                let nd = bridge::dtype_to_native(dtype);
+                let mslab = |row_width: usize, dt: crate::runtime::dtype::DType| {
+                    PoolSlab::NativeMetal(runtime::metal::run::MetalTensor {
+                        buffer: runtime::metal::device::MetalDevice::get()
+                            .alloc((max_tokens * row_width).max(1), dt),
+                        layout: runtime::layout::Layout::contiguous(vec![max_tokens, row_width]),
+                        dtype: dt,
+                    })
+                };
+                k.push(mslab(kv_heads * head_dim, nd));
+                v.push(mslab(kv_heads * head_dim, nd));
+                if dtype == DType::U8 {
+                    for _ in 0..2 {
+                        scales.push(mslab(kv_heads, crate::runtime::dtype::DType::F32));
+                    }
                 }
+                continue;
             }
+            return Err(Error::new(
+                Status::InvalidArg,
+                "kv pool: device must be Cpu or Metal",
+            ));
         }
         Ok(Self {
             inner: Arc::new(PoolInner {
