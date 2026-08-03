@@ -24,13 +24,28 @@
 
 ## Remaining before deletion
 
-- Metal stragglers on candle: argmax/argmin, cumsum, prod, conv
-  (compose or kernel them); Slice's strided-index_select path is
-  native but narrow() views remain candle-shaped (free, no compute).
-- Phase 3 — the Value flip: eval produces Cpu/Metal native tensors
-  directly (arm-level bridge calls collapse), Leaf/NativeTensor/napi
-  flip, batch_linalg and composed fallbacks' last candle calls, then
-  delete candle-core/candle-metal-kernels + the fork rev pins.
+- ~~Metal stragglers on candle~~: argmax/argmin, cumsum, prod,
+  conv — all native as of this update (conv = one-thread-per-output
+  naive MSL; prod = ReduceOp extension).
+- Phase 3 — the Value flip, one atomic pass (the Evaluator signature
+  change breaks every arm simultaneously; do not start it without
+  finishing): `Val = Cpu(cpu::Tensor) | Metal(MetalTensor)` as the
+  eval value type. Specifically:
+  1. Evaluator cache + slots + adamw/sgd/multi/ln/step_scalars side
+     tables: candle Tensor → Val.
+  2. metal_native module: metal_eval fns minus wrap/unwrap/sync
+     (inputs already native; outputs MetalTensor).
+  3. All ~80 arms: bridge calls collapse to direct Val consumption;
+     f16/bf16 fallbacks become typed errors or f16 emitter support.
+  4. napi boundary: NativeTensor holds Val; Leaf/Input/FromBytes/
+     Const produce Val; readbacks native.
+  5. Fallbacks that still call candle compute: eval_broadcast_binary
+     (f16), batch_linalg (becomes CPU-native + upload), kv composed
+     Metal fallback scatter/gather (native indexing kernels),
+     sdpa/ce/ln/rotary composed Metal fallbacks (route through
+     native arms — keep as-is, they're candle-shaped but native).
+  6. Delete candle-core, candle-metal-kernels, the fork rev pins,
+     and bridge.rs/metal_eval.rs (sync wrappers die).
 - Phase 4 — CUDA (later).
 
 Every op the evaluator can dispatch, its current dispatch path, and
