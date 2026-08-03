@@ -13,6 +13,7 @@ mod layer_norm;
 mod loss;
 mod paged;
 mod rotary;
+mod runtime;
 mod tokenizer;
 
 fn to_napi_err(err: candle_core::Error) -> Error {
