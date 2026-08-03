@@ -3,7 +3,7 @@ use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_metal::{
     MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder,
-    MTLComputePipelineState, MTLDevice, MTLFunction, MTLLibrary, MTLResourceOptions, MTLSize,
+    MTLComputePipelineState, MTLDevice, MTLLibrary, MTLResourceOptions, MTLSize,
 };
 use std::collections::HashMap;
 use std::ptr::NonNull;
@@ -20,6 +20,10 @@ pub struct Buffer {
 }
 
 impl Buffer {
+    pub fn from_raw(raw: Retained<ProtocolObject<dyn MTLBuffer>>, size: usize) -> Self {
+        Buffer { raw, size }
+    }
+
     pub fn contents_ptr(&self) -> *mut std::ffi::c_void {
         self.raw.contents().as_ptr()
     }

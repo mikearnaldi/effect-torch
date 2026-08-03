@@ -18,7 +18,7 @@ fn f32_lit(v: f64) -> String {
 fn emit_expr(e: &Expr, lane: &dyn Fn(u32) -> String, num_inputs: usize) -> String {
     match e {
         Expr::Input(k) => lane(*k),
-        Expr::Scalar(k) => format!("sc{}[0]", num_inputs + *k as usize),
+        Expr::Scalar(k) => format!("scs[{}]", *k as usize),
         Expr::Const(bits) => f32_lit(f64::from_bits(*bits)),
         Expr::Add(a, b) => format!("({} + {})", emit_expr(a, lane, num_inputs), emit_expr(b, lane, num_inputs)),
         Expr::Sub(a, b) => format!("({} - {})", emit_expr(a, lane, num_inputs), emit_expr(b, lane, num_inputs)),
@@ -129,8 +129,8 @@ pub fn emit_elementwise(
         params.push(format!("    device const float* in{k} [[buffer({idx})]]"));
         idx += 1;
     }
-    for k in 0..num_scalars {
-        params.push(format!("    device const float* sc{} [[buffer({idx})]]", num_inputs + k));
+    if num_scalars > 0 {
+        params.push(format!("    device const float* scs [[buffer({idx})]]"));
         idx += 1;
     }
     for j in 0..num_outputs {

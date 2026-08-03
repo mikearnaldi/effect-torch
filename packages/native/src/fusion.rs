@@ -7,9 +7,8 @@
 //! is f32-only (the `ug` SSA has no f64 constants and Metal has no f64);
 //! the CPU interpreter covers f32 and f64.
 
-use candle_core::{DType, Device, Storage, Tensor};
+use candle_core::{DType, Device, Tensor};
 #[cfg(any(target_os = "macos", feature = "cuda"))]
-use std::collections::HashMap;
 
 const BLOCK: usize = 256;
 
@@ -447,18 +446,6 @@ fn eval<T: Scalar, F: Fn(u32) -> T>(e: &Expr, lane: &F, scalars: &[T]) -> T {
     }
 }
 
-fn cpu_input_slices<'a, T: candle_core::WithDType>(
-    inputs: &'a [Tensor],
-) -> candle_core::Result<Vec<(std::sync::RwLockReadGuard<'a, Storage>, usize)>> {
-    inputs
-        .iter()
-        .map(|t| {
-            let (storage, layout) = t.storage_and_layout();
-            Ok((storage, layout.start_offset()))
-        })
-        .collect()
-}
-
 pub(crate) fn interpret_core<T: Scalar>(
     exprs: &[Expr],
     slices: &[&[T]],
@@ -582,467 +569,6 @@ pub(crate) fn interpret_reduce_core<T: Scalar>(
     }
     acc
 }
-#[cfg(any(target_os = "macos", feature = "cuda"))]
-fn f32_cst(v: f32) -> candle_core::Result<ug::Const> {
-    v.try_into()
-        .map_err(|e| candle_core::Error::Msg(format!("fusion: {e}")))
-}
-
-#[cfg(any(target_os = "macos", feature = "cuda"))]
-#[allow(clippy::too_many_arguments)]
-fn lower_expr(
-    e: &Expr,
-    b: &mut ug::block::Block,
-    lanes: &[ug::block::Id],
-    num_inputs: usize,
-    lowered_lanes: &mut HashMap<u32, ug::block::Id>,
-    lane_offsets: &[ug::block::Id],
-    zero: ug::block::Id,
-    dtype: ug::DType,
-) -> candle_core::Result<ug::block::Id> {
-    use ug::lang::ssa::{BinaryOp, Instr as I, UnaryOp};
-    Ok(match e {
-        Expr::Input(k) => {
-            if let Some(id) = lowered_lanes.get(k) {
-                *id
-            } else {
-                let id = b.push(I::Load {
-                    src: lanes[*k as usize].to_varid(),
-                    offset: lane_offsets[*k as usize].to_a(),
-                    dtype,
-                });
-                lowered_lanes.insert(*k, id);
-                id
-            }
-        }
-        Expr::Scalar(k) => b.push(I::Load {
-            src: lanes[num_inputs + *k as usize].to_varid(),
-            offset: zero.to_a(),
-            dtype,
-        }),
-        Expr::Const(bits) => {
-            let v = f64::from_bits(*bits) as f32;
-            let cst: ug::Const = v
-                .try_into()
-                .map_err(|e| candle_core::Error::Msg(format!("fusion: {e}")))?;
-            b.push(I::Const(cst))
-        }
-        Expr::Add(a, x) => {
-            let a = lower_expr(a, b, lanes, num_inputs, lowered_lanes, lane_offsets, zero, dtype)?;
-            let x = lower_expr(x, b, lanes, num_inputs, lowered_lanes, lane_offsets, zero, dtype)?;
-            b.binary(BinaryOp::Add, a, x, dtype)
-        }
-        Expr::Sub(a, x) => {
-            let a = lower_expr(a, b, lanes, num_inputs, lowered_lanes, lane_offsets, zero, dtype)?;
-            let x = lower_expr(x, b, lanes, num_inputs, lowered_lanes, lane_offsets, zero, dtype)?;
-            b.binary(BinaryOp::Sub, a, x, dtype)
-        }
-        Expr::Mul(a, x) => {
-            let a = lower_expr(a, b, lanes, num_inputs, lowered_lanes, lane_offsets, zero, dtype)?;
-            let x = lower_expr(x, b, lanes, num_inputs, lowered_lanes, lane_offsets, zero, dtype)?;
-            b.binary(BinaryOp::Mul, a, x, dtype)
-        }
-        Expr::Div(a, x) => {
-            let a = lower_expr(a, b, lanes, num_inputs, lowered_lanes, lane_offsets, zero, dtype)?;
-            let x = lower_expr(x, b, lanes, num_inputs, lowered_lanes, lane_offsets, zero, dtype)?;
-            b.binary(BinaryOp::Div, a, x, dtype)
-        }
-        Expr::Min(a, x) => {
-            let a = lower_expr(a, b, lanes, num_inputs, lowered_lanes, lane_offsets, zero, dtype)?;
-            let x = lower_expr(x, b, lanes, num_inputs, lowered_lanes, lane_offsets, zero, dtype)?;
-            b.binary(BinaryOp::Min, a, x, dtype)
-        }
-        Expr::Max(a, x) => {
-            let a = lower_expr(a, b, lanes, num_inputs, lowered_lanes, lane_offsets, zero, dtype)?;
-            let x = lower_expr(x, b, lanes, num_inputs, lowered_lanes, lane_offsets, zero, dtype)?;
-            b.binary(BinaryOp::Max, a, x, dtype)
-        }
-        Expr::Lt(a, x) | Expr::Le(a, x) | Expr::Gt(a, x) | Expr::Ge(a, x) | Expr::Eq(a, x)
-        | Expr::Ne(a, x) => {
-            let op = match e {
-                Expr::Lt(..) => BinaryOp::Lt,
-                Expr::Le(..) => BinaryOp::Le,
-                Expr::Gt(..) => BinaryOp::Gt,
-                Expr::Ge(..) => BinaryOp::Ge,
-                Expr::Eq(..) => BinaryOp::Eq,
-                _ => BinaryOp::Ne,
-            };
-            let a = lower_expr(a, b, lanes, num_inputs, lowered_lanes, lane_offsets, zero, dtype)?;
-            let x = lower_expr(x, b, lanes, num_inputs, lowered_lanes, lane_offsets, zero, dtype)?;
-            b.binary(op, a, x, ug::DType::I32)
-        }
-        Expr::Select(c, a, x) => {
-            let c = lower_expr(c, b, lanes, num_inputs, lowered_lanes, lane_offsets, zero, dtype)?;
-            let a = lower_expr(a, b, lanes, num_inputs, lowered_lanes, lane_offsets, zero, dtype)?;
-            let x = lower_expr(x, b, lanes, num_inputs, lowered_lanes, lane_offsets, zero, dtype)?;
-            b.select(c, a, x, dtype)
-        }
-        Expr::Neg(a) => {
-            let a = lower_expr(a, b, lanes, num_inputs, lowered_lanes, lane_offsets, zero, dtype)?;
-            b.unary(UnaryOp::Neg, a, dtype)
-        }
-        Expr::Sqrt(a) => {
-            let a = lower_expr(a, b, lanes, num_inputs, lowered_lanes, lane_offsets, zero, dtype)?;
-            b.unary(UnaryOp::Sqrt, a, dtype)
-        }
-        Expr::Exp(a) => {
-            let a = lower_expr(a, b, lanes, num_inputs, lowered_lanes, lane_offsets, zero, dtype)?;
-            b.unary(UnaryOp::Exp, a, dtype)
-        }
-        Expr::Sin(a) => {
-            let a = lower_expr(a, b, lanes, num_inputs, lowered_lanes, lane_offsets, zero, dtype)?;
-            b.unary(UnaryOp::Sin, a, dtype)
-        }
-        Expr::Cos(a) => {
-            let a = lower_expr(a, b, lanes, num_inputs, lowered_lanes, lane_offsets, zero, dtype)?;
-            b.unary(UnaryOp::Cos, a, dtype)
-        }
-        Expr::Tanh(a) => {
-            let x = lower_expr(a, b, lanes, num_inputs, lowered_lanes, lane_offsets, zero, dtype)?;
-            b.unary(UnaryOp::Tanh, x, dtype)
-        }
-        Expr::Abs(a) => {
-            let x = lower_expr(a, b, lanes, num_inputs, lowered_lanes, lane_offsets, zero, dtype)?;
-            b.unary(UnaryOp::Abs, x, dtype)
-        }
-        Expr::Log(a) => {
-            let x = lower_expr(a, b, lanes, num_inputs, lowered_lanes, lane_offsets, zero, dtype)?;
-            b.unary(UnaryOp::Log, x, dtype)
-        }
-        Expr::Floor(a) => {
-            let x = lower_expr(a, b, lanes, num_inputs, lowered_lanes, lane_offsets, zero, dtype)?;
-            b.unary(UnaryOp::Floor, x, dtype)
-        }
-        Expr::Ceil(a) => {
-            let x = lower_expr(a, b, lanes, num_inputs, lowered_lanes, lane_offsets, zero, dtype)?;
-            b.unary(UnaryOp::Ceil, x, dtype)
-        }
-        Expr::Round(a) => {
-            let x = lower_expr(a, b, lanes, num_inputs, lowered_lanes, lane_offsets, zero, dtype)?;
-            b.unary(UnaryOp::Round, x, dtype)
-        }
-        Expr::Powf(a, e) => {
-            let x = lower_expr(a, b, lanes, num_inputs, lowered_lanes, lane_offsets, zero, dtype)?;
-            let exp = b.push(I::Const(f32_cst(f64::from_bits(*e) as f32)?));
-            b.binary(BinaryOp::Pow, x, exp, dtype)
-        }
-        // Abramowitz & Stegun 7.1.26 (max error ~1.5e-7) with
-        // sign(x) = x / max(|x|, 1e-30); the CPU interpreter uses the
-        // exact libm erf instead
-        Expr::Erf(a) => {
-            let x = lower_expr(a, b, lanes, num_inputs, lowered_lanes, lane_offsets, zero, dtype)?;
-            let c = |v: f64, b: &mut ug::block::Block| -> candle_core::Result<ug::block::Id> {
-                Ok(b.push(I::Const(f32_cst(v as f32)?)))
-            };
-            let one = c(1.0, b)?;
-            let ax = {
-                let neg = b.unary(UnaryOp::Neg, x, dtype);
-                b.binary(BinaryOp::Max, x, neg, dtype)
-            };
-            let t = {
-                let k = c(0.3275911, b)?;
-                let kx = b.binary(BinaryOp::Mul, k, ax, dtype);
-                let denom = b.binary(BinaryOp::Add, one, kx, dtype);
-                b.binary(BinaryOp::Div, one, denom, dtype)
-            };
-            let poly = {
-                let a1 = c(0.254829592, b)?;
-                let a2 = c(-0.284496736, b)?;
-                let a3 = c(1.421413741, b)?;
-                let a4 = c(-1.453152027, b)?;
-                let a5 = c(1.061405429, b)?;
-                let p = b.binary(BinaryOp::Mul, a5, t, dtype);
-                let p = b.binary(BinaryOp::Add, p, a4, dtype);
-                let p = b.binary(BinaryOp::Mul, p, t, dtype);
-                let p = b.binary(BinaryOp::Add, p, a3, dtype);
-                let p = b.binary(BinaryOp::Mul, p, t, dtype);
-                let p = b.binary(BinaryOp::Add, p, a2, dtype);
-                let p = b.binary(BinaryOp::Mul, p, t, dtype);
-                b.binary(BinaryOp::Add, p, a1, dtype)
-            };
-            let tail = {
-                let x2 = b.binary(BinaryOp::Mul, x, x, dtype);
-                let nx2 = b.unary(UnaryOp::Neg, x2, dtype);
-                let e = b.unary(UnaryOp::Exp, nx2, dtype);
-                let pt = b.binary(BinaryOp::Mul, poly, t, dtype);
-                let pte = b.binary(BinaryOp::Mul, pt, e, dtype);
-                b.binary(BinaryOp::Sub, one, pte, dtype)
-            };
-            let sign = {
-                let eps = c(1e-30, b)?;
-                let denom = b.binary(BinaryOp::Max, ax, eps, dtype);
-                b.binary(BinaryOp::Div, x, denom, dtype)
-            };
-            b.binary(BinaryOp::Mul, sign, tail, dtype)
-        }
-    })
-}
-
-// Lowers the IR to a ug SSA kernel with one store per output expression.
-// Lane k reads from pointer argument k at an offset computed from the
-// flattened output index and the lane's strides (broadcast lanes re-read
-// elements; contiguous lanes read at the index itself). The element count
-// and lane strides are baked in as constants (the pipeline cache is keyed
-// by them): Metal kernel functions cannot take plain scalar arguments, and
-// baking enables constant folding. Loads are clamped to n-1 so the
-// trailing partial block recomputes the last element harmlessly instead of
-// reading out of bounds.
-#[cfg(any(target_os = "macos", feature = "cuda"))]
-fn build_kernel(
-    exprs: &[Expr],
-    lane_strides: &[Vec<usize>],
-    out_shape: &[usize],
-    num_scalars: usize,
-    n: usize,
-    dtype: ug::DType,
-) -> candle_core::Result<ug::lang::ssa::Kernel> {
-    use ug::lang::ssa::{BinaryOp, Instr as I, Special};
-
-    let num_inputs = lane_strides.len();
-    let mut b = ug::block::Block::empty();
-    let mut lanes = Vec::with_capacity(num_inputs + num_scalars);
-    for k in 0..(num_inputs + num_scalars) {
-        lanes.push(b.push(I::DefineGlobal { index: k, dtype }));
-    }
-    let num_outputs = exprs.len();
-    let mut outs = Vec::with_capacity(num_outputs);
-    for j in 0..num_outputs {
-        outs.push(b.push(I::DefineGlobal {
-            index: num_inputs + num_scalars + j,
-            dtype,
-        }));
-    }
-
-    let gi = b.push(I::Special(Special::BlockIdx));
-    let ti = b.push(I::Special(Special::ThreadIdx));
-    let off = b.mul(gi, BLOCK as i32);
-    let off = b.binary(BinaryOp::Add, off, ti, ug::DType::I32);
-    let last = b.push(I::Const(ug::Const::I32(n as i32 - 1)));
-    let clamped = b.binary(BinaryOp::Min, off.to_a(), last.to_a(), ug::DType::I32);
-    let zero = b.push(I::Const(ug::Const::I32(0)));
-
-    // Per-lane read offsets. Contiguous lanes read at the clamped index;
-    // broadcast lanes decompose it into coordinates and recombine with
-    // their strides (stride 0 dims and size-1 dims contribute nothing).
-    let i32c = |v: usize, b: &mut ug::block::Block| b.push(I::Const(ug::Const::I32(v as i32)));
-    let contig = contiguous_strides(out_shape);
-    let rank = out_shape.len();
-    let mut lane_offsets: Vec<ug::block::Id> = Vec::with_capacity(num_inputs);
-    for strides in lane_strides {
-        if strides == &contig {
-            lane_offsets.push(clamped);
-            continue;
-        }
-        let mut acc: Option<ug::block::Id> = None;
-        for d in 0..rank {
-            if out_shape[d] == 1 || strides[d] == 0 {
-                continue;
-            }
-            let coord = if d == rank - 1 {
-                let dim = i32c(out_shape[d], &mut b);
-                b.binary(BinaryOp::Mod, clamped, dim.to_a(), ug::DType::I32)
-            } else {
-                let stride = i32c(contig[d], &mut b);
-                let q = b.binary(BinaryOp::Div, clamped, stride.to_a(), ug::DType::I32);
-                let dim = i32c(out_shape[d], &mut b);
-                b.binary(BinaryOp::Mod, q.to_a(), dim.to_a(), ug::DType::I32)
-            };
-            let term = if strides[d] == 1 {
-                coord
-            } else {
-                let s = i32c(strides[d], &mut b);
-                b.binary(BinaryOp::Mul, coord.to_a(), s.to_a(), ug::DType::I32)
-            };
-            acc = Some(match acc {
-                None => term,
-                Some(prev) => b.binary(BinaryOp::Add, prev.to_a(), term.to_a(), ug::DType::I32),
-            });
-        }
-        // A lane with no contributing dims (a broadcast scalar) reads offset 0.
-        lane_offsets.push(acc.unwrap_or(zero));
-    }
-
-    let mut lowered_lanes: HashMap<u32, ug::block::Id> = HashMap::new();
-
-    for (j, expr) in exprs.iter().enumerate() {
-        let value = lower_expr(expr, &mut b, &lanes, num_inputs, &mut lowered_lanes, &lane_offsets, zero, dtype)?;
-        b.push(I::Store {
-            dst: outs[j].to_varid(),
-            offset: off.to_a(),
-            value: value.to_a(),
-            dtype,
-        });
-    }
-    let instrs = b
-        .relocate()
-        .map_err(|e| candle_core::Error::Msg(format!("fusion: {e}")))?;
-    ug::lang::ssa::Kernel::from_instrs(instrs)
-        .map_err(|e| candle_core::Error::Msg(format!("fusion: {e}")))
-}
-
-// Lowers a fused-reduce region to a ug SSA kernel: one thread per output
-// element decomposes its flat index into the non-reduced coordinates
-// (the loop-invariant base offset of each lane), then walks a Range loop
-// over the reduce extent, recomputing per-lane offsets from the reduce
-// coordinates and folding the expression value into an accumulator.
-// Everything shape-dependent is baked in as constants (keying the
-// pipeline cache): dim sizes, lane strides, the extent.
-#[cfg(any(target_os = "macos", feature = "cuda"))]
-#[allow(clippy::too_many_arguments)]
-fn build_reduce_kernel(
-    op: ReduceOp,
-    expr: &Expr,
-    lane_strides: &[Vec<usize>],
-    in_shape: &[usize],
-    dims: &[usize],
-    keepdims: bool,
-    out_shape: &[usize],
-    out_n: usize,
-    dtype: ug::DType,
-) -> candle_core::Result<ug::lang::ssa::Kernel> {
-    use ug::lang::ssa::{BinaryOp, Instr as I, Special};
-
-    let rank = in_shape.len();
-    let num_inputs = lane_strides.len();
-    let mut b = ug::block::Block::empty();
-    let mut lanes = Vec::with_capacity(num_inputs + 1);
-    for k in 0..=num_inputs {
-        lanes.push(b.push(I::DefineGlobal { index: k, dtype }));
-    }
-    let out = lanes[num_inputs];
-
-    let gi = b.push(I::Special(Special::BlockIdx));
-    let ti = b.push(I::Special(Special::ThreadIdx));
-    let off = b.mul(gi, BLOCK as i32);
-    let off = b.binary(BinaryOp::Add, off, ti, ug::DType::I32);
-    let last = b.push(I::Const(ug::Const::I32(out_n as i32 - 1)));
-    let clamped = b.binary(BinaryOp::Min, off.to_a(), last.to_a(), ug::DType::I32);
-    let zero = b.push(I::Const(ug::Const::I32(0)));
-
-    let i32c = |v: usize, b: &mut ug::block::Block| b.push(I::Const(ug::Const::I32(v as i32)));
-    // Loop-invariant per-lane base offsets from the non-reduced
-    // coordinates of the (clamped) flat output index.
-    let contig_out = contiguous_strides(out_shape);
-    let mut base_offsets: Vec<ug::block::Id> = Vec::with_capacity(num_inputs);
-    for strides in lane_strides {
-        let mut acc: Option<ug::block::Id> = None;
-        let mut o = 0;
-        for d in 0..rank {
-            if dims.contains(&d) {
-                continue;
-            }
-            let out_d = if keepdims { d } else { o };
-            o += 1;
-            if out_shape[out_d] == 1 || strides[d] == 0 {
-                continue;
-            }
-            let coord = if out_d == out_shape.len() - 1 {
-                let dim = i32c(out_shape[out_d], &mut b);
-                b.binary(BinaryOp::Mod, clamped, dim.to_a(), ug::DType::I32)
-            } else {
-                let stride = i32c(contig_out[out_d], &mut b);
-                let q = b.binary(BinaryOp::Div, clamped, stride.to_a(), ug::DType::I32);
-                let dim = i32c(out_shape[out_d], &mut b);
-                b.binary(BinaryOp::Mod, q.to_a(), dim.to_a(), ug::DType::I32)
-            };
-            let term = if strides[d] == 1 {
-                coord
-            } else {
-                let s = i32c(strides[d], &mut b);
-                b.binary(BinaryOp::Mul, coord.to_a(), s.to_a(), ug::DType::I32)
-            };
-            acc = Some(match acc {
-                None => term,
-                Some(prev) => b.binary(BinaryOp::Add, prev.to_a(), term.to_a(), ug::DType::I32),
-            });
-        }
-        base_offsets.push(acc.unwrap_or(zero));
-    }
-
-    // The reduce loop: r walks the extent; its decomposition into reduce
-    // coordinates (row-major over the reduced dims) advances each lane's
-    // offset by coord * stride along the reduced dims.
-    let red_sizes: Vec<usize> = dims.iter().map(|&d| in_shape[d]).collect();
-    let red_contig = contiguous_strides(&red_sizes);
-    let extent: usize = red_sizes.iter().product();
-    let init = match op {
-        ReduceOp::Sum | ReduceOp::Mean => 0.0f32,
-        ReduceOp::Max => f32::NEG_INFINITY,
-        ReduceOp::Min => f32::INFINITY,
-    };
-    let fold_op = match op {
-        ReduceOp::Sum | ReduceOp::Mean => BinaryOp::Add,
-        ReduceOp::Max => BinaryOp::Max,
-        ReduceOp::Min => BinaryOp::Min,
-    };
-    let acc = b.push(I::DefineAcc(f32_cst(init)?));
-    let range = b.range(0, extent as i32, 1);
-    let r = range.id();
-    let mut lane_offsets = base_offsets.clone();
-    for (j, &d) in dims.iter().enumerate() {
-        if red_sizes[j] == 1 {
-            continue;
-        }
-        let rcoord = if j == dims.len() - 1 {
-            let dim = i32c(red_sizes[j], &mut b);
-            b.binary(BinaryOp::Mod, r, dim.to_a(), ug::DType::I32)
-        } else {
-            let stride = i32c(red_contig[j], &mut b);
-            let q = b.binary(BinaryOp::Div, r, stride.to_a(), ug::DType::I32);
-            let dim = i32c(red_sizes[j], &mut b);
-            b.binary(BinaryOp::Mod, q.to_a(), dim.to_a(), ug::DType::I32)
-        };
-        for (k, strides) in lane_strides.iter().enumerate() {
-            if strides[d] == 0 {
-                continue;
-            }
-            let term = if strides[d] == 1 {
-                rcoord
-            } else {
-                let s = i32c(strides[d], &mut b);
-                b.binary(BinaryOp::Mul, rcoord.to_a(), s.to_a(), ug::DType::I32)
-            };
-            lane_offsets[k] =
-                b.binary(BinaryOp::Add, lane_offsets[k].to_a(), term.to_a(), ug::DType::I32);
-        }
-    }
-    let mut lowered_lanes: HashMap<u32, ug::block::Id> = HashMap::new();
-    let v = lower_expr(
-        expr,
-        &mut b,
-        &lanes,
-        num_inputs,
-        &mut lowered_lanes,
-        &lane_offsets,
-        zero,
-        dtype,
-    )?;
-    let folded = b.binary(fold_op, acc.to_a(), v.to_a(), dtype);
-    b.push(I::Assign {
-        dst: acc.to_varid(),
-        src: folded.to_a(),
-    });
-    b.end_range(range)
-        .map_err(|e| candle_core::Error::Msg(format!("fusion: {e}")))?;
-
-    let value = if op == ReduceOp::Mean {
-        let e = b.push(I::Const(f32_cst(extent as f32)?));
-        b.binary(BinaryOp::Div, acc.to_a(), e.to_a(), dtype)
-    } else {
-        acc
-    };
-    b.push(I::Store {
-        dst: out.to_varid(),
-        offset: off.to_a(),
-        value: value.to_a(),
-        dtype,
-    });
-    let instrs = b
-        .relocate()
-        .map_err(|e| candle_core::Error::Msg(format!("fusion: {e}")))?;
-    ug::lang::ssa::Kernel::from_instrs(instrs)
-        .map_err(|e| candle_core::Error::Msg(format!("fusion: {e}")))
-}
 
 // Env-gated phase accounting for fusion::run (EFFECT_TORCH_FUSION_TIMING):
 // [hash, pipeline-cache+compile, buffers+encoder, bind+dispatch]. Prints
@@ -1079,16 +605,11 @@ fn fusion_phase_nanos(_phase: usize, _nanos: u64) {}
 
 #[cfg(target_os = "macos")]
 mod metal {
-    use super::{build_kernel, build_reduce_kernel, fusion_phase_nanos, Expr, ReduceOp, BLOCK};
-    use candle_core::{DType, Device, MetalStorage, Storage, Tensor};
-    use std::collections::HashMap;
-    use std::sync::{Mutex, OnceLock};
-
-    fn pipelines() -> &'static Mutex<HashMap<u64, candle_metal_kernels::metal::ComputePipeline>> {
-        static CACHE: OnceLock<Mutex<HashMap<u64, candle_metal_kernels::metal::ComputePipeline>>> =
-            OnceLock::new();
-        CACHE.get_or_init(|| Mutex::new(HashMap::new()))
-    }
+    use super::{fusion_phase_nanos, Expr, ReduceOp};
+    use candle_core::{DType, Device, Tensor};
+    use crate::bridge;
+    use crate::runtime::metal::device::MetalDevice;
+    use crate::runtime::metal::run::MetalTensor;
 
     pub fn run(
         exprs: &[Expr],
@@ -1099,110 +620,44 @@ mod metal {
         shape: &[usize],
         device: &Device,
     ) -> candle_core::Result<Vec<Tensor>> {
-        use std::collections::hash_map::DefaultHasher;
-        use std::hash::{Hash, Hasher};
-
         let mdev = device.as_metal_device()?;
-        let phase_timing = std::env::var_os("EFFECT_TORCH_FUSION_TIMING").is_some();
-        let t_start = std::time::Instant::now();
-        // Metal exposes at most 31 buffer argument slots per kernel.
-        if inputs.len() + scalars.len() + exprs.len() > 31 {
+        // Metal exposes at most 31 buffer argument slots per kernel
+        // (scalars share one packed slot).
+        if inputs.len() + exprs.len() + 1 > 31 {
             return Err(candle_core::Error::Msg(format!(
                 "fusion: {} buffer arguments exceed Metal's limit of 31",
-                inputs.len() + scalars.len() + exprs.len()
+                inputs.len() + exprs.len() + 1
             )));
         }
-        let mut hasher = DefaultHasher::new();
-        exprs.hash(&mut hasher);
-        inputs.len().hash(&mut hasher);
-        scalars.len().hash(&mut hasher);
-        n.hash(&mut hasher);
-        // Strides are baked into the kernel as constants, so they must key
-        // the pipeline cache.
-        shape.hash(&mut hasher);
-        lane_strides.hash(&mut hasher);
-        let key = hasher.finish();
+        let phase_timing = std::env::var_os("EFFECT_TORCH_FUSION_TIMING").is_some();
+        let t_start = std::time::Instant::now();
+        // Ordering: candle's queue must finish producing the inputs
+        // before the native queue reads them (zero-copy wrap).
+        device.synchronize()?;
+        let native: Vec<MetalTensor> = inputs
+            .iter()
+            .map(bridge::metal::wrap)
+            .collect::<candle_core::Result<_>>()?;
+        let refs: Vec<&MetalTensor> = native.iter().collect();
+        let scalar_values: Vec<f32> = scalars
+            .iter()
+            .map(|t| t.to_vec0::<f32>())
+            .collect::<candle_core::Result<_>>()?;
         if phase_timing {
             fusion_phase_nanos(0, t_start.elapsed().as_nanos() as u64);
         }
-        let t_phase = std::time::Instant::now();
-        let pipeline = {
-            let mut cache = pipelines().lock().unwrap();
-            match cache.get(&key) {
-                Some(p) => p.clone(),
-                None => {
-                    let kernel =
-                        build_kernel(exprs, lane_strides, shape, scalars.len(), n, ug::DType::F32)?;
-                    let p = mdev.compile("effect_torch_fused", kernel)?;
-                    if std::env::var_os("EFFECT_TORCH_FUSION_DEBUG").is_some() {
-                        eprintln!("[fusion] compiled kernel #{} (key {key:x})", cache.len() + 1);
-                    }
-                    cache.insert(key, p.clone());
-                    p
-                }
-            }
-        };
-        if phase_timing {
-            fusion_phase_nanos(1, t_phase.elapsed().as_nanos() as u64);
-        }
-        let t_phase = std::time::Instant::now();
-        let padded = n.div_ceil(BLOCK) * BLOCK;
-        let mut out_bufs = Vec::with_capacity(exprs.len());
-        for _ in exprs {
-            out_bufs.push(mdev.new_buffer(padded.max(1), DType::F32, "fused")?);
-        }
-        let encoder = mdev.command_encoder()?;
-        let encoder = encoder.as_ref();
-        if phase_timing {
-            fusion_phase_nanos(2, t_phase.elapsed().as_nanos() as u64);
-        }
-        let t_phase = std::time::Instant::now();
-        encoder.set_compute_pipeline_state(&pipeline);
-        for (i, t) in inputs.iter().chain(scalars.iter()).enumerate() {
-            let (storage, layout) = t.storage_and_layout();
-            let metal = match &*storage {
-                Storage::Metal(m) => m,
-                _ => {
-                    return Err(candle_core::Error::Msg(
-                        "fusion: expected Metal storage".to_string(),
-                    ))
-                }
-            };
-            encoder.set_input_buffer(
-                i,
-                Some(metal.buffer()),
-                layout.start_offset() * DType::F32.size_in_bytes(),
-            );
-        }
-        for (j, buf) in out_bufs.iter().enumerate() {
-            encoder.set_output_buffer(inputs.len() + scalars.len() + j, Some(buf), 0);
-        }
-        encoder.dispatch_threads(
-            objc2_metal::MTLSize {
-                width: padded,
-                height: 1,
-                depth: 1,
-            },
-            objc2_metal::MTLSize {
-                width: BLOCK,
-                height: 1,
-                depth: 1,
-            },
-        );
-        // no end_encoding: candle's Commands owns the encoder lifecycle
-        if phase_timing {
-            fusion_phase_nanos(3, t_phase.elapsed().as_nanos() as u64);
-        }
-        out_bufs
-            .into_iter()
-            .map(|buf| {
-                Ok(Tensor::from_storage(
-                    Storage::Metal(MetalStorage::new(buf, mdev.clone(), n, DType::F32)),
-                    shape,
-                    candle_core::op::BackpropOp::none(),
-                    false,
-                ))
-            })
+        let outs = crate::runtime::metal::run::run_elementwise(
+            MetalDevice::get(),
+            exprs,
+            &refs,
+            lane_strides,
+            &scalar_values,
+            n,
+            shape,
+        )
+        .map_err(candle_core::Error::Msg)?;
+        outs.iter()
+            .map(|t| bridge::metal::unwrap(&t.buffer, shape.to_vec(), DType::F32, mdev))
             .collect()
     }
 
@@ -1218,104 +673,32 @@ mod metal {
         out_shape: &[usize],
         device: &Device,
     ) -> candle_core::Result<Tensor> {
-        use std::collections::hash_map::DefaultHasher;
-        use std::hash::{Hash, Hasher};
-
         let mdev = device.as_metal_device()?;
-        // inputs + the single output must fit Metal's 31 buffer slots.
         if inputs.len() + 1 > 31 {
             return Err(candle_core::Error::Msg(format!(
                 "fusion: {} buffer arguments exceed Metal's limit of 31",
                 inputs.len() + 1
             )));
         }
-        let out_n: usize = out_shape.iter().product();
-        let phase_timing = std::env::var_os("EFFECT_TORCH_FUSION_TIMING").is_some();
-        let t_start = std::time::Instant::now();
-        let mut hasher = DefaultHasher::new();
-        op.hash(&mut hasher);
-        expr.hash(&mut hasher);
-        inputs.len().hash(&mut hasher);
-        in_shape.hash(&mut hasher);
-        dims.hash(&mut hasher);
-        keepdims.hash(&mut hasher);
-        out_shape.hash(&mut hasher);
-        lane_strides.hash(&mut hasher);
-        let key = hasher.finish();
-        let pipeline = {
-            let mut cache = pipelines().lock().unwrap();
-            match cache.get(&key) {
-                Some(p) => p.clone(),
-                None => {
-                    let kernel = build_reduce_kernel(
-                        op,
-                        expr,
-                        lane_strides,
-                        in_shape,
-                        dims,
-                        keepdims,
-                        out_shape,
-                        out_n,
-                        ug::DType::F32,
-                    )?;
-                    let p = mdev.compile("effect_torch_fused_reduce", kernel)?;
-                    if std::env::var_os("EFFECT_TORCH_FUSION_DEBUG").is_some() {
-                        eprintln!("[fusion] compiled reduce kernel #{} (key {key:x})", cache.len() + 1);
-                    }
-                    cache.insert(key, p.clone());
-                    p
-                }
-            }
-        };
-        if phase_timing {
-            fusion_phase_nanos(0, t_start.elapsed().as_nanos() as u64);
-        }
-        let t_phase = std::time::Instant::now();
-        let padded = out_n.div_ceil(BLOCK) * BLOCK;
-        let out_buf = mdev.new_buffer(padded.max(1), DType::F32, "fused_reduce")?;
-        let encoder = mdev.command_encoder()?;
-        let encoder = encoder.as_ref();
-        encoder.set_compute_pipeline_state(&pipeline);
-        for (i, t) in inputs.iter().enumerate() {
-            let (storage, layout) = t.storage_and_layout();
-            let metal = match &*storage {
-                Storage::Metal(m) => m,
-                _ => {
-                    return Err(candle_core::Error::Msg(
-                        "fusion: expected Metal storage".to_string(),
-                    ))
-                }
-            };
-            encoder.set_input_buffer(
-                i,
-                Some(metal.buffer()),
-                layout.start_offset() * DType::F32.size_in_bytes(),
-            );
-        }
-        encoder.set_output_buffer(inputs.len(), Some(&out_buf), 0);
-        encoder.dispatch_threads(
-            objc2_metal::MTLSize {
-                width: padded,
-                height: 1,
-                depth: 1,
-            },
-            objc2_metal::MTLSize {
-                width: BLOCK,
-                height: 1,
-                depth: 1,
-            },
-        );
-        // no end_encoding: candle's Commands owns the encoder lifecycle
-        if phase_timing {
-            fusion_phase_nanos(2, t_phase.elapsed().as_nanos() as u64);
-            fusion_phase_nanos(3, 0);
-        }
-        Ok(Tensor::from_storage(
-            Storage::Metal(MetalStorage::new(out_buf, mdev.clone(), out_n, DType::F32)),
+        device.synchronize()?;
+        let native: Vec<MetalTensor> = inputs
+            .iter()
+            .map(bridge::metal::wrap)
+            .collect::<candle_core::Result<_>>()?;
+        let refs: Vec<&MetalTensor> = native.iter().collect();
+        let out = crate::runtime::metal::run::run_reduce(
+            MetalDevice::get(),
+            op,
+            expr,
+            &refs,
+            lane_strides,
+            in_shape,
+            dims,
+            keepdims,
             out_shape,
-            candle_core::op::BackpropOp::none(),
-            false,
-        ))
+        )
+        .map_err(candle_core::Error::Msg)?;
+        bridge::metal::unwrap(&out.buffer, out_shape.to_vec(), DType::F32, mdev)
     }
 }
 

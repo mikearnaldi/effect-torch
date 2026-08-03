@@ -7,28 +7,18 @@ edition = "2021"
 crate-type = ["cdylib"]
 
 [dependencies]
-candle-core = { git = "https://github.com/mikearnaldi/candle", rev = "8f384d8d04f885243312b001c1a72bea6c5c11b1", features = ["ug"] }
+candle-core = { git = "https://github.com/mikearnaldi/candle", rev = "8f384d8d04f885243312b001c1a72bea6c5c11b1" }
 napi = { version = "3", features = ["async"] }
 napi-derive = "3"
 tokio = { version = "1", features = ["rt", "sync", "macros"] }
-ug = "0.5.0"
 libm = "0.2"
 half = "2"
 matrixmultiply = "0.3"
 tokenizers = "0.22"
 rayon = "1"
 
-# Fork of LaurentMazare/ug adding Log/Tanh/Abs/Floor/Ceil/Round unary ops
-# and a Pow binary op, lowered to the platform math library in the metal,
-# cuda, and cpu codegens. candle-core depends on ug/ug-metal/ug-cuda too,
-# so all three crates are patched to the same rev.
-[patch.crates-io]
-ug = { git = "https://github.com/mikearnaldi/ug", rev = "4ab08865e2e9c31b1b81a132085945b50b4587b7" }
-ug-metal = { git = "https://github.com/mikearnaldi/ug", rev = "4ab08865e2e9c31b1b81a132085945b50b4587b7" }
-ug-cuda = { git = "https://github.com/mikearnaldi/ug", rev = "4ab08865e2e9c31b1b81a132085945b50b4587b7" }
-
 [target.'cfg(target_os = "macos")'.dependencies]
-candle-core = { git = "https://github.com/mikearnaldi/candle", rev = "8f384d8d04f885243312b001c1a72bea6c5c11b1", features = ["metal", "accelerate", "ug"] }
+candle-core = { git = "https://github.com/mikearnaldi/candle", rev = "8f384d8d04f885243312b001c1a72bea6c5c11b1", features = ["metal", "accelerate"] }
 candle-metal-kernels = { git = "https://github.com/mikearnaldi/candle", rev = "8f384d8d04f885243312b001c1a72bea6c5c11b1" }
 objc2 = "0.6"
 objc2-metal = "0.3.2"

@@ -1,6 +1,73 @@
 use crate::runtime;
 use candle_core::{DType, Tensor};
 
+#[cfg(target_os = "macos")]
+pub mod metal {
+    use candle_core::{DType, MetalStorage, Storage, Tensor};
+    use objc2::rc::Retained;
+    use objc2::runtime::ProtocolObject;
+    use objc2_metal::MTLBuffer;
+    use std::sync::Arc;
+
+    pub fn wrap(t: &Tensor) -> candle_core::Result<crate::runtime::metal::run::MetalTensor> {
+        let (storage, layout) = t.storage_and_layout();
+        let Storage::Metal(m) = &*storage else {
+            return Err(candle_core::Error::Msg(
+                "bridge::metal: expected Metal storage".to_string(),
+            ));
+        };
+        let buf = m.buffer();
+        let raw: &ProtocolObject<dyn MTLBuffer> = buf.as_ref();
+        let retained = unsafe { Retained::retain(raw as *const _ as *mut _) }
+            .ok_or_else(|| candle_core::Error::Msg("bridge::metal: null buffer".to_string()))?;
+        let dtype = crate::bridge::dtype_to_native(t.dtype());
+        let buffer = crate::runtime::metal::device::Buffer::from_raw(retained, buf.length());
+        Ok(crate::runtime::metal::run::MetalTensor {
+            buffer: Arc::new(buffer),
+            layout: crate::runtime::layout::Layout::new(
+                t.shape().dims().to_vec(),
+                layout.stride().to_vec(),
+                layout.start_offset(),
+            ),
+            dtype,
+        })
+    }
+
+    pub fn unwrap(
+        buffer: &Arc<crate::runtime::metal::device::Buffer>,
+        shape: Vec<usize>,
+        dtype: DType,
+        device: &candle_core::MetalDevice,
+    ) -> candle_core::Result<Tensor> {
+        let raw: &ProtocolObject<dyn MTLBuffer> = buffer.as_raw();
+        let retained = unsafe { Retained::retain(raw as *const _ as *mut _) }
+            .ok_or_else(|| candle_core::Error::Msg("bridge::metal: null buffer".to_string()))?;
+        let buf = candle_metal_kernels::metal::Buffer::new(retained);
+        let count: usize = shape.iter().product();
+        let storage = MetalStorage::new(std::sync::Arc::new(buf), device.clone(), count, dtype);
+        Ok(Tensor::from_storage(
+            Storage::Metal(storage),
+            shape,
+            candle_core::op::BackpropOp::none(),
+            false,
+        ))
+    }
+
+    fn raw_of(t: &Tensor) -> candle_core::Result<(Retained<ProtocolObject<dyn MTLBuffer>>, usize, usize)> {
+        let (storage, layout) = t.storage_and_layout();
+        let Storage::Metal(m) = &*storage else {
+            return Err(candle_core::Error::Msg(
+                "bridge::metal: expected Metal storage".to_string(),
+            ));
+        };
+        let buf = m.buffer();
+        let raw: &ProtocolObject<dyn MTLBuffer> = buf.as_ref();
+        let retained = unsafe { Retained::retain(raw as *const _ as *mut _) }
+            .ok_or_else(|| candle_core::Error::Msg("bridge::metal: null buffer".to_string()))?;
+        Ok((retained, layout.start_offset(), buf.length()))
+    }
+}
+
 pub fn dtype_to_native(d: DType) -> runtime::dtype::DType {
     match d {
         DType::F32 => runtime::dtype::DType::F32,
