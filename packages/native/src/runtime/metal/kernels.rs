@@ -274,6 +274,128 @@ kernel void et_eye(device {ty}* out [[buffer(0)]], uint i [[thread_position_in_g
     Ok(out)
 }
 
+pub fn argreduce(dev: &MetalDevice, x: &MetalTensor, dim: usize, pick_max: bool) -> Result<MetalTensor, String> {
+    let shape = x.layout.shape();
+    let rank = shape.len();
+    let n = shape[dim];
+    let dstride = x.layout.strides()[dim];
+    let kept: Vec<usize> = (0..rank).filter(|&d| d != dim).collect();
+    let kept_dims: Vec<usize> = kept.iter().map(|&d| shape[d]).collect();
+    let kept_strides: Vec<usize> = kept.iter().map(|&d| x.layout.strides()[d]).collect();
+    let kept_n: usize = kept_dims.iter().product();
+    let mut out_shape = shape.to_vec();
+    out_shape[dim] = 1;
+    let out = MetalTensor::zeros(dev, out_shape, DType::U32);
+    if kept_n == 0 {
+        return Ok(out);
+    }
+    let ty = msl_type(x.dtype);
+    let cmp = if pick_max { ">" } else { "<" };
+    let kept_rank = kept.len();
+    let mut decompose = String::new();
+    for k in (0..kept_rank).rev() {
+        let c = kept_dims[k];
+        let s = kept_strides[k];
+        if k == kept_rank - 1 {
+            decompose.push_str(&format!("        base += (gid % {c}u) * {s}u;\n"));
+        } else {
+            let div: usize = kept_dims[k + 1..].iter().product();
+            decompose.push_str(&format!("        base += ((gid / {div}u) % {c}u) * {s}u;\n"));
+        }
+    }
+    let src = format!(
+        r#"
+#include <metal_stdlib>
+using namespace metal;
+kernel void et_argred(
+    device const {ty}* x [[buffer(0)]],
+    device uint* out [[buffer(1)]],
+    uint gid [[thread_position_in_grid]]
+) {{
+    if (gid >= {kept_n}u) return;
+    uint base = 0u;
+{decompose}    uint best = 0u;
+    {ty} best_v = x[base];
+    for (uint i = 1u; i < {n}u; ++i) {{
+        {ty} v = x[base + i * {dstride}u];
+        if (v {cmp} best_v) {{ best_v = v; best = i; }}
+    }}
+    out[gid] = best;
+}}
+"#
+    );
+    let pipeline = dev.compile(key(&[0xA26D, x.dtype as u64, dim as u64, pick_max as u64, n as u64, kept_n as u64]), &src, "et_argred")?;
+    let padded = kept_n.div_ceil(256) * 256;
+    dev.with_encoder(|e| {
+        e.setComputePipelineState(pipeline.as_raw());
+        set_buffer(e, 0, &x.buffer, x.layout.offset() * x.dtype.size_in_bytes());
+        set_buffer(e, 1, &out.buffer, 0);
+        e.dispatchThreads_threadsPerThreadgroup(MetalDevice::grid(padded, 1, 1), MetalDevice::grid(256, 1, 1));
+    });
+    Ok(out)
+}
+
+pub fn cumsum(dev: &MetalDevice, x: &MetalTensor, dim: usize) -> Result<MetalTensor, String> {
+    let shape = x.layout.shape();
+    let rank = shape.len();
+    let n = shape[dim];
+    let dstride = x.layout.strides()[dim];
+    let kept: Vec<usize> = (0..rank).filter(|&d| d != dim).collect();
+    let kept_dims: Vec<usize> = kept.iter().map(|&d| shape[d]).collect();
+    let kept_strides: Vec<usize> = kept.iter().map(|&d| x.layout.strides()[d]).collect();
+    let kept_n: usize = kept_dims.iter().product();
+    let out = MetalTensor::zeros(dev, shape.to_vec(), x.dtype);
+    if kept_n == 0 {
+        return Ok(out);
+    }
+    let ty = msl_type(x.dtype);
+    let out_strides = crate::runtime::layout::Layout::contiguous(shape.to_vec());
+    let os = out_strides.strides().to_vec();
+    let kept_rank = kept.len();
+    let mut decompose = String::new();
+    for k in (0..kept_rank).rev() {
+        let c = kept_dims[k];
+        let s = kept_strides[k];
+        let o = os[kept[k]];
+        if k == kept_rank - 1 {
+            decompose.push_str(&format!("        base += (gid % {c}u) * {s}u;\n        obase += (gid % {c}u) * {o}u;\n"));
+        } else {
+            let div: usize = kept_dims[k + 1..].iter().product();
+            decompose.push_str(&format!("        base += ((gid / {div}u) % {c}u) * {s}u;\n        obase += ((gid / {div}u) % {c}u) * {o}u;\n"));
+        }
+    }
+    let src = format!(
+        r#"
+#include <metal_stdlib>
+using namespace metal;
+kernel void et_cumsum(
+    device const {ty}* x [[buffer(0)]],
+    device {ty}* out [[buffer(1)]],
+    uint gid [[thread_position_in_grid]]
+) {{
+    if (gid >= {kept_n}u) return;
+    uint base = 0u;
+    uint obase = 0u;
+{decompose}    {ty} acc = ({ty})0;
+    for (uint i = 0u; i < {n}u; ++i) {{
+        acc += x[base + i * {dstride}u];
+        out[obase + i * {os_dim}u] = acc;
+    }}
+}}
+"#,
+        os_dim = os[dim]
+    );
+    let pipeline = dev.compile(key(&[0xC50A, x.dtype as u64, dim as u64, n as u64, kept_n as u64]), &src, "et_cumsum")?;
+    let padded = kept_n.div_ceil(256) * 256;
+    dev.with_encoder(|e| {
+        e.setComputePipelineState(pipeline.as_raw());
+        set_buffer(e, 0, &x.buffer, x.layout.offset() * x.dtype.size_in_bytes());
+        set_buffer(e, 1, &out.buffer, 0);
+        e.dispatchThreads_threadsPerThreadgroup(MetalDevice::grid(padded, 1, 1), MetalDevice::grid(256, 1, 1));
+    });
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

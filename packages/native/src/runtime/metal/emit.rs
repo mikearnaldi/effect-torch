@@ -218,6 +218,7 @@ pub fn emit_reduce(
     let init = match op {
         ReduceOp::Sum | ReduceOp::Mean => "0.0f",
         ReduceOp::Max => "(-INFINITY)",
+        ReduceOp::Prod => "1.0f",
         ReduceOp::Min => "(INFINITY)",
     };
     src.push_str(&format!("    float acc = {init};\n"));
@@ -249,6 +250,7 @@ pub fn emit_reduce(
     let fold = match op {
         ReduceOp::Sum | ReduceOp::Mean => format!("acc += {v};"),
         ReduceOp::Max => format!("acc = fmax(acc, {v});"),
+        ReduceOp::Prod => format!("acc *= {v};"),
         ReduceOp::Min => format!("acc = fmin(acc, {v});"),
     };
     src.push_str(&format!("        {fold}\n"));

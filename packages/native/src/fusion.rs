@@ -124,12 +124,14 @@ pub enum ReduceOp {
     Mean,
     Max,
     Min,
+    Prod,
 }
 
 impl ReduceOp {
     fn init(&self) -> f64 {
         match self {
             ReduceOp::Sum | ReduceOp::Mean => 0.0,
+            ReduceOp::Prod => 1.0,
             ReduceOp::Max => f64::NEG_INFINITY,
             ReduceOp::Min => f64::INFINITY,
         }
@@ -138,6 +140,7 @@ impl ReduceOp {
     fn fold<T: Scalar>(&self, acc: T, v: T) -> T {
         match self {
             ReduceOp::Sum | ReduceOp::Mean => acc.add(v),
+            ReduceOp::Prod => acc.mul(v),
             ReduceOp::Max => acc.max(v),
             ReduceOp::Min => acc.min(v),
         }
