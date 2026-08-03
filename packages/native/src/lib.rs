@@ -6,6 +6,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, OnceLock};
 
+mod bridge;
 mod fusion;
 mod flash;
 mod gemm;
@@ -4370,51 +4371,191 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> candle_core::Result<Te
         NodeKind::Add { a, b } => {
             let a = ev.value(a.id)?;
             let b = ev.value(b.id)?;
+            if a.device().is_cpu() {
+                return bridge::to_candle(&bridge::from_candle(&a)?.add(&bridge::from_candle(&b)?));
+            }
             a.broadcast_add(&b)?
         }
         NodeKind::Sub { a, b } => {
             let a = ev.value(a.id)?;
             let b = ev.value(b.id)?;
+            if a.device().is_cpu() {
+                return bridge::to_candle(&bridge::from_candle(&a)?.sub(&bridge::from_candle(&b)?));
+            }
             a.broadcast_sub(&b)?
         }
         NodeKind::Mul { a, b } => {
             let a = ev.value(a.id)?;
             let b = ev.value(b.id)?;
+            if a.device().is_cpu() {
+                return bridge::to_candle(&bridge::from_candle(&a)?.mul(&bridge::from_candle(&b)?));
+            }
             a.broadcast_mul(&b)?
         }
         NodeKind::Div { a, b } => {
             let a = ev.value(a.id)?;
             let b = ev.value(b.id)?;
+            if a.device().is_cpu() {
+                return bridge::to_candle(&bridge::from_candle(&a)?.div(&bridge::from_candle(&b)?));
+            }
             a.broadcast_div(&b)?
         }
-        NodeKind::Eq { a, b } => eval_broadcast_binary(a, b, ev, |a, b| a.eq(b))?,
-        NodeKind::Gt { a, b } => eval_broadcast_binary(a, b, ev, |a, b| a.gt(b))?,
-        NodeKind::Lt { a, b } => eval_broadcast_binary(a, b, ev, |a, b| a.lt(b))?,
-        NodeKind::Ge { a, b } => eval_broadcast_binary(a, b, ev, |a, b| a.ge(b))?,
-        NodeKind::Le { a, b } => eval_broadcast_binary(a, b, ev, |a, b| a.le(b))?,
-        NodeKind::Maximum { a, b } => eval_broadcast_binary(a, b, ev, |a, b| a.maximum(b))?,
-        NodeKind::Minimum { a, b } => eval_broadcast_binary(a, b, ev, |a, b| a.minimum(b))?,
-        NodeKind::Neg { a } => ev.value(a.id)?.neg()?,
-        NodeKind::Abs { a } => ev.value(a.id)?.abs()?,
-        NodeKind::Sqrt { a } => ev.value(a.id)?.sqrt()?,
-        NodeKind::Exp { a } => ev.value(a.id)?.exp()?,
-        NodeKind::Log { a } => ev.value(a.id)?.log()?,
-        NodeKind::Sin { a } => ev.value(a.id)?.sin()?,
-        NodeKind::Cos { a } => ev.value(a.id)?.cos()?,
-        NodeKind::Tanh { a } => ev.value(a.id)?.tanh()?,
+        NodeKind::Eq { a, b } => {
+            let (x, y) = (ev.value(a.id)?, ev.value(b.id)?);
+            if x.device().is_cpu() {
+                return bridge::to_candle(&bridge::from_candle(&x)?.eq(&bridge::from_candle(&y)?));
+            }
+            eval_broadcast_binary(a, b, ev, |a, b| a.eq(b))?
+        }
+        NodeKind::Gt { a, b } => {
+            let (x, y) = (ev.value(a.id)?, ev.value(b.id)?);
+            if x.device().is_cpu() {
+                return bridge::to_candle(&bridge::from_candle(&x)?.gt(&bridge::from_candle(&y)?));
+            }
+            eval_broadcast_binary(a, b, ev, |a, b| a.gt(b))?
+        }
+        NodeKind::Lt { a, b } => {
+            let (x, y) = (ev.value(a.id)?, ev.value(b.id)?);
+            if x.device().is_cpu() {
+                return bridge::to_candle(&bridge::from_candle(&x)?.lt(&bridge::from_candle(&y)?));
+            }
+            eval_broadcast_binary(a, b, ev, |a, b| a.lt(b))?
+        }
+        NodeKind::Ge { a, b } => {
+            let (x, y) = (ev.value(a.id)?, ev.value(b.id)?);
+            if x.device().is_cpu() {
+                return bridge::to_candle(&bridge::from_candle(&x)?.ge(&bridge::from_candle(&y)?));
+            }
+            eval_broadcast_binary(a, b, ev, |a, b| a.ge(b))?
+        }
+        NodeKind::Le { a, b } => {
+            let (x, y) = (ev.value(a.id)?, ev.value(b.id)?);
+            if x.device().is_cpu() {
+                return bridge::to_candle(&bridge::from_candle(&x)?.le(&bridge::from_candle(&y)?));
+            }
+            eval_broadcast_binary(a, b, ev, |a, b| a.le(b))?
+        }
+        NodeKind::Maximum { a, b } => {
+            let (x, y) = (ev.value(a.id)?, ev.value(b.id)?);
+            if x.device().is_cpu() {
+                return bridge::to_candle(&bridge::from_candle(&x)?.maximum(&bridge::from_candle(&y)?));
+            }
+            eval_broadcast_binary(a, b, ev, |a, b| a.maximum(b))?
+        }
+        NodeKind::Minimum { a, b } => {
+            let (x, y) = (ev.value(a.id)?, ev.value(b.id)?);
+            if x.device().is_cpu() {
+                return bridge::to_candle(&bridge::from_candle(&x)?.minimum(&bridge::from_candle(&y)?));
+            }
+            eval_broadcast_binary(a, b, ev, |a, b| a.minimum(b))?
+        }
+        NodeKind::Neg { a } => {
+            let x = ev.value(a.id)?;
+            if x.device().is_cpu() {
+                return bridge::to_candle(&bridge::from_candle(&x)?.neg());
+            }
+            x.neg()?
+        }
+        NodeKind::Abs { a } => {
+            let x = ev.value(a.id)?;
+            if x.device().is_cpu() {
+                return bridge::to_candle(&bridge::from_candle(&x)?.abs());
+            }
+            x.abs()?
+        }
+        NodeKind::Sqrt { a } => {
+            let x = ev.value(a.id)?;
+            if x.device().is_cpu() {
+                return bridge::to_candle(&bridge::from_candle(&x)?.sqrt());
+            }
+            x.sqrt()?
+        }
+        NodeKind::Exp { a } => {
+            let x = ev.value(a.id)?;
+            if x.device().is_cpu() {
+                return bridge::to_candle(&bridge::from_candle(&x)?.exp());
+            }
+            x.exp()?
+        }
+        NodeKind::Log { a } => {
+            let x = ev.value(a.id)?;
+            if x.device().is_cpu() {
+                return bridge::to_candle(&bridge::from_candle(&x)?.log());
+            }
+            x.log()?
+        }
+        NodeKind::Sin { a } => {
+            let x = ev.value(a.id)?;
+            if x.device().is_cpu() {
+                return bridge::to_candle(&bridge::from_candle(&x)?.sin());
+            }
+            x.sin()?
+        }
+        NodeKind::Cos { a } => {
+            let x = ev.value(a.id)?;
+            if x.device().is_cpu() {
+                return bridge::to_candle(&bridge::from_candle(&x)?.cos());
+            }
+            x.cos()?
+        }
+        NodeKind::Tanh { a } => {
+            let x = ev.value(a.id)?;
+            if x.device().is_cpu() {
+                return bridge::to_candle(&bridge::from_candle(&x)?.tanh());
+            }
+            x.tanh()?
+        }
         NodeKind::Relu { a } => {
             let a = ev.value(a.id)?;
+            if a.device().is_cpu() {
+                return bridge::to_candle(&bridge::from_candle(&a)?.relu());
+            }
             a.maximum(&a.zeros_like()?)?
         }
-        NodeKind::Erf { a } => ev.value(a.id)?.erf()?,
-        NodeKind::Floor { a } => ev.value(a.id)?.floor()?,
-        NodeKind::Ceil { a } => ev.value(a.id)?.ceil()?,
-        NodeKind::Round { a } => ev.value(a.id)?.round()?,
-        NodeKind::Sign { a } => ev.value(a.id)?.sign()?,
+        NodeKind::Erf { a } => {
+            let x = ev.value(a.id)?;
+            if x.device().is_cpu() {
+                return bridge::to_candle(&bridge::from_candle(&x)?.erf());
+            }
+            x.erf()?
+        }
+        NodeKind::Floor { a } => {
+            let x = ev.value(a.id)?;
+            if x.device().is_cpu() {
+                return bridge::to_candle(&bridge::from_candle(&x)?.floor());
+            }
+            x.floor()?
+        }
+        NodeKind::Ceil { a } => {
+            let x = ev.value(a.id)?;
+            if x.device().is_cpu() {
+                return bridge::to_candle(&bridge::from_candle(&x)?.ceil());
+            }
+            x.ceil()?
+        }
+        NodeKind::Round { a } => {
+            let x = ev.value(a.id)?;
+            if x.device().is_cpu() {
+                return bridge::to_candle(&bridge::from_candle(&x)?.round());
+            }
+            x.round()?
+        }
+        NodeKind::Sign { a } => {
+            let x = ev.value(a.id)?;
+            if x.device().is_cpu() {
+                return bridge::to_candle(&bridge::from_candle(&x)?.sign());
+            }
+            x.sign()?
+        }
         NodeKind::Where { cond, a, b } => {
             let cond = ev.value(cond.id)?;
             let a = ev.value(a.id)?;
             let b = ev.value(b.id)?;
+            if a.device().is_cpu() {
+                return bridge::to_candle(
+                    &bridge::from_candle(&a)?.where_(&bridge::from_candle(&cond)?, &bridge::from_candle(&b)?),
+                );
+            }
             let shape = cond
                 .shape()
                 .broadcast_shape_binary_op(a.shape(), "where")?
