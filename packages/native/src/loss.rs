@@ -8,47 +8,33 @@
 //! host round trip beyond the same zero-count check. CPU keeps the
 //! composed reference path.
 
-use candle_core::{DType, Device, Tensor};
+use crate::runtime::dtype::DType;
+use crate::runtime::metal::run::MetalTensor;
 
 /// Whether the fused CE path can run: Metal, f32 logits, integer targets.
-pub fn is_supported(logits: &Tensor, target: &Tensor) -> bool {
-    matches!(logits.device(), Device::Metal(_))
-        && logits.dtype() == DType::F32
-        && matches!(target.dtype(), DType::U32 | DType::I64)
+pub fn is_supported(logits: &MetalTensor, target: &MetalTensor) -> bool {
+    logits.dtype == DType::F32 && matches!(target.dtype, DType::U32 | DType::I64)
 }
 
 #[cfg(target_os = "macos")]
 pub use metal::{ce_backward, ce_forward};
 
-#[cfg(not(target_os = "macos"))]
-mod metal {
-    use candle_core::Tensor;
-    pub fn ce_forward(_l: &Tensor, _t: &Tensor, _i: i64) -> candle_core::Result<(Tensor, Tensor)> {
-        unreachable!("fused cross-entropy is Metal-only")
-    }
-    pub fn ce_backward(_l: &Tensor, _t: &Tensor, _i: i64) -> candle_core::Result<(Tensor, Tensor)> {
-        unreachable!("fused cross-entropy is Metal-only")
-    }
-}
-
 #[cfg(target_os = "macos")]
 mod metal {
-    use crate::bridge;
     use crate::runtime::metal::device::{set_buffer, set_bytes, MetalDevice, Pipeline};
     use crate::runtime::metal::run::MetalTensor;
-    use candle_core::{DType, Tensor};
+    use crate::runtime::dtype::DType;
+
     use objc2_metal::MTLComputeCommandEncoder;
     use std::sync::Arc;
 
     const NT: usize = 128;
 
-    fn wrap_contig(t: &Tensor) -> candle_core::Result<MetalTensor> {
-        let w = bridge::metal::wrap(t)?;
-        if w.layout.is_contiguous() {
-            Ok(w)
+    fn wrap_contig(t: &MetalTensor) -> crate::err::Res<MetalTensor> {
+        if t.layout.is_contiguous() {
+            Ok(t.clone())
         } else {
-            crate::runtime::metal::kernels::strided_copy(MetalDevice::get(), &w)
-                .map_err(candle_core::Error::Msg)
+            crate::runtime::metal::kernels::strided_copy(MetalDevice::get(), t)
         }
     }
 
@@ -56,7 +42,7 @@ mod metal {
         MetalDevice::get().alloc(n.max(1), dtype)
     }
 
-    fn source(tgt: DType) -> String {
+    fn source(tgt: crate::runtime::dtype::DType) -> String {
         let tgt_ty = match tgt {
             DType::U32 => "uint",
             DType::I64 => "long",
@@ -240,7 +226,7 @@ kernel void et_ce_bwd(
         )
     }
 
-    fn pipeline(_mdev: &candle_core::MetalDevice, tgt: DType, name: &'static str) -> candle_core::Result<Pipeline> {
+    fn pipeline(tgt: crate::runtime::dtype::DType, name: &'static str) -> crate::err::Res<Pipeline> {
         use std::collections::hash_map::DefaultHasher;
         use std::hash::{Hash, Hasher};
 
@@ -248,14 +234,16 @@ kernel void et_ce_bwd(
         (tgt, name).hash(&mut hasher);
         let key = hasher.finish();
         let src = source(tgt);
-        MetalDevice::get()
-            .compile(key, &src, name)
-            .map_err(candle_core::Error::Msg)
+        MetalDevice::get().compile(key, &src, name)
     }
 
-    fn wrap(buf: Arc<crate::runtime::metal::device::Buffer>, mdev: &candle_core::MetalDevice, n: usize, shape: Vec<usize>) -> candle_core::Result<Tensor> {
+    fn wrap(buf: Arc<crate::runtime::metal::device::Buffer>, n: usize, shape: Vec<usize>) -> crate::err::Res<MetalTensor> {
         let _ = n;
-        bridge::metal::unwrap(&buf, shape, DType::F32, mdev)
+        Ok(MetalTensor {
+            buffer: buf,
+            layout: crate::runtime::layout::Layout::contiguous(shape),
+            dtype: crate::runtime::dtype::DType::F32,
+        })
     }
 
     fn dispatch_grid(encoder: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTLComputeCommandEncoder>, width: usize, threads: usize) {
@@ -268,24 +256,26 @@ kernel void et_ce_bwd(
     // Returns (loss scalar, status [3]) — the status is NOT read here:
     // checking it requires a device sync, which would split the walk's
     // encode pipeline. The evaluator defers it to the walk's end.
-    pub fn ce_forward(logits: &Tensor, target: &Tensor, ignore_index: i64) -> candle_core::Result<(Tensor, Tensor)> {
+    pub fn ce_forward(logits: &MetalTensor, target: &MetalTensor, ignore_index: i64) -> crate::err::Res<(MetalTensor, MetalTensor)> {
         if std::env::var_os("EFFECT_TORCH_FUSION_DEBUG").is_some() {
             eprintln!("[ce] fused forward");
         }
-        let rank = logits.rank();
-        let v = logits.dim(rank - 1)?;
-        let n = logits.elem_count() / v;
-        let device = logits.device();
-        let mdev = device.as_metal_device()?;
-        let tgt = target.dtype();
-        let logits = wrap_contig(&logits.reshape((n, v))?)?;
-        let target = wrap_contig(&target.reshape(n)?)?;
-        device.synchronize()?;
+        let rank = logits.layout.shape().len();
+        let v = logits.layout.shape()[rank - 1];
+        let n = logits.numel() / v;
+        let tgt = target.dtype;
+        let flat = |x: &MetalTensor, shape: Vec<usize>| MetalTensor {
+            buffer: x.buffer.clone(),
+            layout: crate::runtime::layout::Layout::contiguous(shape),
+            dtype: x.dtype,
+        };
+        let logits = wrap_contig(&flat(logits, vec![n, v]))?;
+        let target = wrap_contig(&flat(target, vec![n]))?;
         let nll_buf = alloc(n, crate::runtime::dtype::DType::F32);
         let flags_buf = alloc(n, crate::runtime::dtype::DType::U32);
         let status_buf = alloc(3, crate::runtime::dtype::DType::F32);
         {
-            let pipe = pipeline(mdev, tgt, "et_ce_fwd")?;
+            let pipe = pipeline(tgt, "et_ce_fwd")?;
             let f32_off = |off: usize| off * DType::F32.size_in_bytes();
             let tgt_off = |off: usize| off * tgt.size_in_bytes();
             MetalDevice::get().with_encoder(|e| {
@@ -300,7 +290,7 @@ kernel void et_ce_bwd(
             });
         }
         {
-            let pipe = pipeline(mdev, tgt, "et_ce_status")?;
+            let pipe = pipeline(tgt, "et_ce_status")?;
             MetalDevice::get().with_encoder(|e| {
                 e.setComputePipelineState(pipe.as_raw());
                 set_buffer(e, 0, &nll_buf, 0);
@@ -311,28 +301,35 @@ kernel void et_ce_bwd(
             });
         }
         MetalDevice::get().synchronize();
-        let status = wrap(status_buf, mdev, 3, vec![3])?;
-        let loss = status.narrow(0, 0, 1)?.reshape(())?;
+        let status = wrap(status_buf, 3, vec![3])?;
+        let loss = MetalTensor {
+            buffer: status.buffer.clone(),
+            layout: crate::runtime::layout::Layout::contiguous(vec![]),
+            dtype: status.dtype,
+        };
         Ok((loss, status))
     }
 
     // Returns (grad, count [1]) — the count check is deferred like the
     // forward's status (see ce_forward).
-    pub fn ce_backward(logits: &Tensor, target: &Tensor, ignore_index: i64) -> candle_core::Result<(Tensor, Tensor)> {
-        let rank = logits.rank();
-        let v = logits.dim(rank - 1)?;
-        let n = logits.elem_count() / v;
-        let out_shape = logits.dims().to_vec();
-        let device = logits.device();
-        let mdev = device.as_metal_device()?;
-        let tgt = target.dtype();
-        let logits = wrap_contig(&logits.reshape((n, v))?)?;
-        let target = wrap_contig(&target.reshape(n)?)?;
-        device.synchronize()?;
+    pub fn ce_backward(logits: &MetalTensor, target: &MetalTensor, ignore_index: i64) -> crate::err::Res<(MetalTensor, MetalTensor)> {
+        let rank = logits.layout.shape().len();
+        let v = logits.layout.shape()[rank - 1];
+        let n = logits.numel() / v;
+        let out_shape = logits.layout.shape().to_vec();
+        let tgt = target.dtype;
+        let flat = |x: &MetalTensor, shape: Vec<usize>| MetalTensor {
+            buffer: x.buffer.clone(),
+            layout: crate::runtime::layout::Layout::contiguous(shape),
+            dtype: x.dtype,
+        };
+        let logits = wrap_contig(&flat(logits, vec![n, v]))?;
+        let target = wrap_contig(&flat(target, vec![n]))?;
+        let _ = out_shape;
         let count_buf = alloc(1, crate::runtime::dtype::DType::F32);
         let grad_buf = alloc(n * v, crate::runtime::dtype::DType::F32);
         {
-            let pipe = pipeline(mdev, tgt, "et_ce_count")?;
+            let pipe = pipeline(tgt, "et_ce_count")?;
             MetalDevice::get().with_encoder(|e| {
                 e.setComputePipelineState(pipe.as_raw());
                 set_buffer(e, 0, &target.buffer, target.layout.offset() * tgt.size_in_bytes());
@@ -343,7 +340,7 @@ kernel void et_ce_bwd(
             });
         }
         {
-            let pipe = pipeline(mdev, tgt, "et_ce_bwd")?;
+            let pipe = pipeline(tgt, "et_ce_bwd")?;
             MetalDevice::get().with_encoder(|e| {
                 e.setComputePipelineState(pipe.as_raw());
                 set_buffer(e, 0, &logits.buffer, logits.layout.offset() * DType::F32.size_in_bytes());
@@ -358,8 +355,13 @@ kernel void et_ce_bwd(
         MetalDevice::get().synchronize();
         // The zero-active check is deferred to the walk's end (see
         // ce_forward); the count buffer is returned for it.
-        let count = wrap(count_buf.clone(), mdev, 1, vec![1])?;
-        let grad = wrap(grad_buf, mdev, n * v, vec![n, v])?;
-        Ok((grad.reshape(out_shape)?, count))
+        let count = wrap(count_buf.clone(), 1, vec![1])?;
+        let grad = wrap(grad_buf, n * v, vec![n, v])?;
+        let grad = MetalTensor {
+            buffer: grad.buffer,
+            layout: crate::runtime::layout::Layout::contiguous(out_shape),
+            dtype: grad.dtype,
+        };
+        Ok((grad, count))
     }
 }

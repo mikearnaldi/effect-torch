@@ -1,51 +1,67 @@
 # RFC 0015 Phase 0: Backend Op Surface Inventory
 
-- **Status**: Phase 1 (CPU) complete; Phase 2 (Metal) ~95% — all training-critical paths native; boundary flip (phase 3) not started
+- **Status**: Phases 1-3 landed. candle and ug are fully deleted —
+  dependency tree, source, and fork pins. 65/65 rust tests, 601/601
+  vitest on the first-party CPU+Metal backend. Phase 4 = CUDA.
 - **Source**: `NodeKind` in `packages/native/src/lib.rs:808` (85 variants)
-- **Date**: 2026-08-03 (updated after phase 2 bulk)
+- **Date**: 2026-08-04 (updated after the Value flip + candle deletion)
 
 ## Landed
 
 - `runtime/`: dtype, layout, cpu/ (tensor, ops, reduce, matmul,
   indexing, linalg, conv, composed, pool, random), metal/ (device,
-  emit, run, gemm, kernels, indexing).
+  emit, run, gemm, kernels, indexing, conv).
 - **CPU: every eval arm computes natively**, including kv attention
   (first-party mutable pool slabs).
-- **Metal: all training-critical paths native** — fusion emitter
-  (ug deleted entirely, dependency + fork patches gone), gemm with
-  bias epilogue (fork's call_mlx_gemm_bias dead), flash fwd/bwd, CE
-  fwd/bwd, LayerNorm fwd/bwd, rotary, paged scatter/decode + native
-  Metal pool slabs, indexing, cast, creation, seeded random,
-  unfused elementwise/comparisons/where/reduces/views via the
-  emitter.
-- The candle boundary is now transport-only: zero-copy MTLBuffer
-  wraps (bridge::metal) + CPU tensor conversions (bridge). Every
-  crossing carries a boundary sync that dies with the boundary.
+- **Metal: every eval arm computes natively** — first-party IR→MSL
+  emitter (SSA form, no bracket-depth limit), dtype-generic gemm
+  (f32/f16/bf16, bias epilogue), flash fwd/bwd, CE fwd/bwd,
+  LayerNorm fwd/bwd, rotary, paged scatter/decode + native Metal
+  pool slabs, indexing, cast, creation, seeded random, conv family,
+  fusion runner (elementwise + reduce) on the native emitter.
+- **The Value flip (phase 3)**: `val.rs` (`Val = Cpu | Metal`) is
+  the eval/napi value type end to end — Evaluator cache, slots,
+  side tables, Leaf, NativeTensor, program bindings. `dev.rs` and
+  `err.rs` replace candle Device/Error; `safetensors.rs` is a native
+  implementation. `bridge.rs` and `metal_eval.rs` deleted.
+- **candle-core, candle-metal-kernels, and the cuda/cudnn/mkl/nccl
+  feature flags deleted from Cargo.toml**; `cargo tree` is
+  candle-free.
 
-## Remaining before deletion
+## Hard-won correctness notes (do not regress)
 
-- ~~Metal stragglers on candle~~: argmax/argmin, cumsum, prod,
-  conv — all native as of this update (conv = one-thread-per-output
-  naive MSL; prod = ReduceOp extension).
-- Phase 3 — the Value flip, one atomic pass (the Evaluator signature
-  change breaks every arm simultaneously; do not start it without
-  finishing): `Val = Cpu(cpu::Tensor) | Metal(MetalTensor)` as the
-  eval value type. Specifically:
-  1. Evaluator cache + slots + adamw/sgd/multi/ln/step_scalars side
-     tables: candle Tensor → Val.
-  2. metal_native module: metal_eval fns minus wrap/unwrap/sync
-     (inputs already native; outputs MetalTensor).
-  3. All ~80 arms: bridge calls collapse to direct Val consumption;
-     f16/bf16 fallbacks become typed errors or f16 emitter support.
-  4. napi boundary: NativeTensor holds Val; Leaf/Input/FromBytes/
-     Const produce Val; readbacks native.
-  5. Fallbacks that still call candle compute: eval_broadcast_binary
-     (f16), batch_linalg (becomes CPU-native + upload), kv composed
-     Metal fallback scatter/gather (native indexing kernels),
-     sdpa/ce/ln/rotary composed Metal fallbacks (route through
-     native arms — keep as-is, they're candle-shaped but native).
-  6. Delete candle-core, candle-metal-kernels, the fork rev pins,
-     and bridge.rs/metal_eval.rs (sync wrappers die).
+- **Cache-key discipline**: every constant baked into a generated
+  kernel must be in the pipeline-cache key (fill n, arange n, cast n,
+  cat outdim, gather/scatter/index-select shapes AND strides,
+  argreduce/cumsum kept shapes, strided_copy full shape+strides).
+- **MetalTensor layout offsets**: `contig`/`to_f32_vec`/`to_u32_vec`/
+  `to_u8_vec` must honor nonzero offsets (strided_copy short-circuit
+  requires `offset == 0`, not just `is_contiguous`).
+- **CPU `contiguous()`** short-circuit requires buffer length ==
+  numel (a leading narrow of a larger buffer is contiguous-looking).
+- **CPU index_select** writes row-major over the output shape, not
+  kept-major.
+- **erf** Horner coefficients (no extra `t` factor); MSL `round` is
+  half-away-from-zero (JS semantics), `rint` is banker's.
+- **conv padding bounds** compare against input extents, not padded.
+- **conv_transpose** weight convention is `[c_in, c_out/groups, ...]`
+  (matches the conv2d-backward call site).
+- **GPU lifetime**: pooled buffers recycle freely (serial encoder
+  orders writes after reads), but deallocation is deferred to the
+  retire list and released at `synchronize()` — freeing an in-flight
+  buffer corrupts nondeterministically.
+- **Execution ordering**: untracked hazards mean Metal may overlap
+  adjacent dispatches in one command buffer AND concurrent command
+  buffers — a buffer-scope `memoryBarrier` follows every dispatch and
+  a command buffer covers up to 4096 dispatches.
+- **No host fences on the hot path**: `MetalTensor::zeros` is
+  alloc + async fill; readbacks synchronize themselves; fusion
+  batches scalar readbacks behind one fence.
+- **Emitter**: SSA temporaries (see `emit_expr_ssa`) — nested-parens
+  emission breaks at MSL's 256 bracket depth on long fused chains.
+
+## Remaining
+
 - Phase 4 — CUDA (later).
 
 Every op the evaluator can dispatch, its current dispatch path, and

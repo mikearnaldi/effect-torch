@@ -5,11 +5,11 @@
 //! negated angles (Rᵀ = R(−θ) for orthogonal rotations). CPU keeps the
 //! composed reference path in lib.rs.
 
-use candle_core::{DType, Device, Tensor};
+use crate::runtime::metal::run::MetalTensor;
 
 /// Whether the fused rotary path can run: Metal, f32, even head dim.
-pub fn is_supported(x: &Tensor) -> bool {
-    matches!(x.device(), Device::Metal(_)) && x.dtype() == DType::F32 && x.dim(candle_core::D::Minus1).unwrap_or(1) % 2 == 0
+pub fn is_supported(x: &MetalTensor) -> bool {
+    x.dtype == crate::runtime::dtype::DType::F32 && x.layout.shape().last().unwrap_or(&1) % 2 == 0
 }
 
 #[cfg(target_os = "macos")]
@@ -17,9 +17,9 @@ pub use metal::rotary;
 
 #[cfg(target_os = "macos")]
 mod metal {
-    use crate::bridge;
     use crate::runtime::metal::device::{set_buffer, set_bytes, MetalDevice, Pipeline};
-    use candle_core::{DType, Tensor};
+    use crate::runtime::metal::run::MetalTensor;
+
     use objc2_metal::MTLComputeCommandEncoder;
 
     const NT: usize = 256;
@@ -62,23 +62,21 @@ kernel void et_rotary(
 "#
     }
 
-    fn pipeline(_mdev: &candle_core::MetalDevice) -> candle_core::Result<Pipeline> {
+    fn pipeline() -> crate::err::Res<Pipeline> {
         use std::collections::hash_map::DefaultHasher;
         use std::hash::{Hash, Hasher};
 
         let mut hasher = DefaultHasher::new();
         "et_rotary".hash(&mut hasher);
         let key = hasher.finish();
-        MetalDevice::get()
-            .compile(key, source(), "et_rotary")
-            .map_err(candle_core::Error::Msg)
+        MetalDevice::get().compile(key, source(), "et_rotary")
     }
 
     /// x [.., T, D] -> R(sign·angles) x. `offsets` is one position
     /// offset per leading-dim-0 batch element (a single [0] for
     /// absolute positions).
-    pub fn rotary(x: &Tensor, offsets: &[usize], theta: f64, sign: f32) -> candle_core::Result<Tensor> {
-        let dims = x.dims();
+    pub fn rotary(x: &MetalTensor, offsets: &[usize], theta: f64, sign: f32) -> crate::err::Res<MetalTensor> {
+        let dims = x.layout.shape();
         let rank = dims.len();
         let (t, d) = (dims[rank - 2], dims[rank - 1]);
         let batch = dims[0];
@@ -89,29 +87,24 @@ kernel void et_rotary(
             vec![offsets[0] as f32; batch]
         } else {
             if offsets.len() != batch {
-                return Err(candle_core::Error::Msg(format!(
+                return Err(format!(
                     "rotary: {} offsets for batch {batch}",
                     offsets.len()
-                )));
+                ));
             }
             offsets.iter().map(|&o| o as f32).collect()
         };
-        let device = x.device();
-        let mdev = device.as_metal_device()?;
-        let xn = bridge::metal::wrap(x)?;
-        let xn = if xn.layout.is_contiguous() {
-            xn
+        let xn = if x.layout.is_contiguous() {
+            x.clone()
         } else {
-            crate::runtime::metal::kernels::strided_copy(MetalDevice::get(), &xn)
-                .map_err(candle_core::Error::Msg)?
+            crate::runtime::metal::kernels::strided_copy(MetalDevice::get(), x)?
         };
-        device.synchronize()?;
         let offsets_buf = MetalDevice::get().alloc_with_data(&offsets_vec);
         let out_buf = MetalDevice::get().alloc(xn.numel().max(1), crate::runtime::dtype::DType::F32);
-        let pipe = pipeline(mdev)?;
+        let pipe = pipeline()?;
         MetalDevice::get().with_encoder(|e| {
             e.setComputePipelineState(pipe.as_raw());
-            set_buffer(e, 0, &xn.buffer, xn.layout.offset() * DType::F32.size_in_bytes());
+            set_buffer(e, 0, &xn.buffer, xn.layout.offset() * 4);
             set_buffer(e, 2, &offsets_buf, 0);
             set_buffer(e, 1, &out_buf, 0);
             set_bytes(e, 3, &(t as u32));
@@ -135,43 +128,38 @@ kernel void et_rotary(
             );
         });
         MetalDevice::get().synchronize();
-        bridge::metal::unwrap(&out_buf, x.dims().to_vec(), DType::F32, mdev)
-    }
-}
-
-#[cfg(not(target_os = "macos"))]
-mod metal {
-    use candle_core::Tensor;
-    pub fn rotary(_x: &Tensor, _offsets: &[usize], _theta: f64, _sign: f32) -> candle_core::Result<Tensor> {
-        unreachable!("fused rotary is Metal-only")
+        Ok(MetalTensor {
+            buffer: out_buf,
+            layout: crate::runtime::layout::Layout::contiguous(dims.to_vec()),
+            dtype: crate::runtime::dtype::DType::F32,
+        })
     }
 }
 
 #[cfg(all(test, target_os = "macos"))]
 mod tests {
-    use candle_core::{Device, Tensor};
+    use crate::runtime::metal::device::MetalDevice;
+    use crate::runtime::metal::run::MetalTensor as MT;
 
     #[test]
     fn kernel_matches_composed() {
-        let device = Device::new_metal(0).unwrap();
+        let dev = MetalDevice::get();
         for shape in [(1usize, 1usize, 2usize, 8usize), (1, 2, 4, 4), (2, 3, 5, 16)] {
             let (b, h, t, d) = shape;
-            let x = Tensor::arange(0f32, (b * h * t * d) as f32, &device)
-                .unwrap()
-                .reshape((b, h, t, d))
-                .unwrap();
-            let composed = crate::rotary_forward(&x, &[0], 10000.0, 1.0).unwrap();
+            let data: Vec<f32> = (0..b * h * t * d).map(|i| i as f32).collect();
+            let x = MT::from_f32(dev, data, vec![b, h, t, d]);
+            let composed = crate::metal_native::composed::rotary_forward(&x, &[0], 10000.0, 1.0).unwrap();
             let fused = super::metal::rotary(&x, &[0], 10000.0, 1.0).unwrap();
-            device.synchronize().unwrap();
-            let a = composed.flatten_all().unwrap().to_vec1::<f32>().unwrap();
-            let bb = fused.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+            dev.synchronize();
+            let a = composed.read_f32();
+            let bb = fused.read_f32();
             let max_diff = a.iter().zip(bb.iter()).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
             assert!(max_diff < 1e-3, "shape {shape:?} max diff {max_diff}");
             // Backward: transpose rotation inverts the forward.
             let back = super::metal::rotary(&fused, &[0], 10000.0, -1.0).unwrap();
-            device.synchronize().unwrap();
-            let x_vals = x.flatten_all().unwrap().to_vec1::<f32>().unwrap();
-            let rt = back.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+            dev.synchronize();
+            let x_vals = x.read_f32();
+            let rt = back.read_f32();
             let max_diff = x_vals.iter().zip(rt.iter()).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
             assert!(max_diff < 1e-3, "shape {shape:?} roundtrip max diff {max_diff}");
         }

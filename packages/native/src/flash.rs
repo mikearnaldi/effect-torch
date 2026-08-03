@@ -7,45 +7,30 @@
 //! lib.rs remains the reference and the fallback for other device/dtype
 //! pairs.
 
-use candle_core::{D, DType, Device, Tensor};
+
 
 const TILE_Q: usize = 16;
 const TILE_K: usize = 32;
 const THREADS: usize = 128;
 const BACKWARD_CHUNK: usize = 64;
 
-/// Whether the flash path can run this forward: Metal f32, any shapes.
-pub fn is_supported(q: &Tensor) -> bool {
-    matches!(q.device(), Device::Metal(_)) && q.dtype() == DType::F32
-}
-
-/// Whether the fused two-kernel backward can run: Metal f32, head dims
-/// within the threadgroup tile budget (D ≤ 64 covers the nano regime;
-/// larger falls back to the composed recompute).
-pub fn backward_supported(q: &Tensor, v: &Tensor) -> bool {
-    let rank = q.rank();
-    let d = q.dim(rank - 1).unwrap_or(usize::MAX);
-    let dv = v.dim(rank - 1).unwrap_or(usize::MAX);
-    is_supported(q) && d == dv && d <= 64
-}
+#[cfg(target_os = "macos")]
+pub use metal::{backward_fused, forward};
 
 #[cfg(target_os = "macos")]
 mod metal {
     use super::{THREADS, TILE_K, TILE_Q};
-    use crate::bridge;
     use crate::runtime::metal::device::{set_buffer, MetalDevice, Pipeline};
     use crate::runtime::metal::run::MetalTensor;
-    use candle_core::{DType, Tensor};
+
     use objc2_metal::MTLComputeCommandEncoder;
     use std::sync::Arc;
 
-    fn wrap_contig(t: &Tensor) -> candle_core::Result<MetalTensor> {
-        let w = bridge::metal::wrap(t)?;
-        if w.layout.is_contiguous() {
-            Ok(w)
+    fn contig(t: &MetalTensor) -> crate::err::Res<MetalTensor> {
+        if t.layout.is_contiguous() {
+            Ok(t.clone())
         } else {
-            crate::runtime::metal::kernels::strided_copy(MetalDevice::get(), &w)
-                .map_err(candle_core::Error::Msg)
+            crate::runtime::metal::kernels::strided_copy(MetalDevice::get(), t)
         }
     }
 
@@ -189,14 +174,13 @@ kernel void et_sdpa_fwd(
     }
 
     fn pipeline(
-        _mdev: &candle_core::MetalDevice,
         t: usize,
         s: usize,
         d: usize,
         dv: usize,
         scale: f64,
         causal: bool,
-    ) -> candle_core::Result<Pipeline> {
+    ) -> crate::err::Res<Pipeline> {
         use std::collections::hash_map::DefaultHasher;
         use std::hash::{Hash, Hasher};
 
@@ -204,35 +188,36 @@ kernel void et_sdpa_fwd(
         (t, s, d, dv, scale.to_bits(), causal).hash(&mut hasher);
         let key = hasher.finish();
         let src = kernel_source(t, s, d, dv, scale, causal);
-        MetalDevice::get()
-            .compile(key, &src, "et_sdpa_fwd")
-            .map_err(candle_core::Error::Msg)
+        MetalDevice::get().compile(key, &src, "et_sdpa_fwd")
     }
 
     pub fn forward(
-        q: &Tensor,
-        k: &Tensor,
-        v: &Tensor,
+        q: &MetalTensor,
+        k: &MetalTensor,
+        v: &MetalTensor,
         scale: f64,
         causal: bool,
-    ) -> candle_core::Result<(Tensor, Tensor)> {
-        let rank = q.rank();
-        let (t, d) = (q.dim(rank - 2)?, q.dim(rank - 1)?);
-        let (s, dv) = (v.dim(rank - 2)?, v.dim(rank - 1)?);
-        let bh: usize = q.dims()[..rank - 2].iter().product();
-        let out_shape: Vec<usize> = q.dims()[..rank - 1].iter().copied().chain([dv]).collect();
-        let l_shape: Vec<usize> = q.dims()[..rank - 1].to_vec();
-        let device = q.device();
-        let mdev = device.as_metal_device()?;
-        device.synchronize()?;
-        // Flatten leading dims: [BH, T, D] — free on contiguous tensors.
-        let q = wrap_contig(&q.reshape((bh, t, d))?)?;
-        let k = wrap_contig(&k.reshape((bh, s, d))?)?;
-        let v = wrap_contig(&v.reshape((bh, s, dv))?)?;
-        let pipe = pipeline(mdev, t, s, d, dv, scale, causal)?;
+    ) -> crate::err::Res<(MetalTensor, MetalTensor)> {
+        let rank = q.layout.shape().len();
+        let (t, d) = (q.layout.shape()[rank - 2], q.layout.shape()[rank - 1]);
+        let (s, dv) = (v.layout.shape()[rank - 2], v.layout.shape()[rank - 1]);
+        let bh: usize = q.layout.shape()[..rank - 2].iter().product();
+        let out_shape: Vec<usize> = q.layout.shape()[..rank - 1].iter().copied().chain([dv]).collect();
+        let l_shape: Vec<usize> = q.layout.shape()[..rank - 1].to_vec();
+        let flat = |x: &MetalTensor, a: usize, b: usize, c: usize| -> MetalTensor {
+            MetalTensor {
+                buffer: x.buffer.clone(),
+                layout: crate::runtime::layout::Layout::contiguous(vec![a, b, c]),
+                dtype: x.dtype,
+            }
+        };
+        let q = contig(&flat(q, bh, t, d))?;
+        let k = contig(&flat(k, bh, s, d))?;
+        let v = contig(&flat(v, bh, s, dv))?;
+        let pipe = pipeline(t, s, d, dv, scale, causal)?;
         let o_buf = alloc_f32(bh * t * dv);
         let l_buf = alloc_f32(bh * t);
-        let byte_offset = |off: usize| off * DType::F32.size_in_bytes();
+        let byte_offset = |off: usize| off * 4;
         MetalDevice::get().with_encoder(|e| {
             e.setComputePipelineState(pipe.as_raw());
             set_buffer(e, 0, &q.buffer, byte_offset(q.layout.offset()));
@@ -254,8 +239,17 @@ kernel void et_sdpa_fwd(
             );
         });
         MetalDevice::get().synchronize();
-        let o = bridge::metal::unwrap(&o_buf, vec![bh, t, dv], DType::F32, mdev)?.reshape(out_shape)?;
-        let l = bridge::metal::unwrap(&l_buf, vec![bh, t], DType::F32, mdev)?.reshape(l_shape)?;
+        MetalDevice::get().synchronize();
+        let o = MetalTensor {
+            buffer: o_buf,
+            layout: crate::runtime::layout::Layout::contiguous(out_shape),
+            dtype: crate::runtime::dtype::DType::F32,
+        };
+        let l = MetalTensor {
+            buffer: l_buf,
+            layout: crate::runtime::layout::Layout::contiguous(l_shape),
+            dtype: crate::runtime::dtype::DType::F32,
+        };
         Ok((o, l))
     }
     // The fused backward: two kernels, no atomics. Pass A (key-tiled)
@@ -501,7 +495,6 @@ kernel void et_sdpa_bwd_q(
     }
 
     fn bwd_pipeline(
-        _mdev: &candle_core::MetalDevice,
         name: &'static str,
         t: usize,
         s: usize,
@@ -509,7 +502,7 @@ kernel void et_sdpa_bwd_q(
         dv: usize,
         scale: f64,
         causal: bool,
-    ) -> candle_core::Result<Pipeline> {
+    ) -> crate::err::Res<Pipeline> {
         use std::collections::hash_map::DefaultHasher;
         use std::hash::{Hash, Hasher};
 
@@ -517,51 +510,63 @@ kernel void et_sdpa_bwd_q(
         (name, t, s, d, dv, scale.to_bits(), causal).hash(&mut hasher);
         let key = hasher.finish();
         let src = bwd_source(t, s, d, dv, scale, causal);
-        MetalDevice::get()
-            .compile(key, &src, name)
-            .map_err(candle_core::Error::Msg)
+        MetalDevice::get().compile(key, &src, name)
     }
 
     // The fused backward: d_vec via candle (one small op), then two
     // kernel launches. Returns (dq, dk, dv) [BH, T/S, D].
     #[allow(clippy::too_many_arguments)]
     pub fn backward_fused(
-        q: &Tensor,
-        k: &Tensor,
-        v: &Tensor,
-        o: &Tensor,
-        l: &Tensor,
-        g: &Tensor,
+        q: &MetalTensor,
+        k: &MetalTensor,
+        v: &MetalTensor,
+        o: &MetalTensor,
+        l: &MetalTensor,
+        g: &MetalTensor,
         scale: f64,
         causal: bool,
-    ) -> candle_core::Result<(Tensor, Tensor, Tensor)> {
-        let rank = q.rank();
-        let (t, s, d, dv) = (q.dim(rank - 2)?, k.dim(rank - 2)?, q.dim(rank - 1)?, v.dim(rank - 1)?);
-        let bh: usize = q.dims()[..rank - 2].iter().product();
-        let (q_shape, k_shape, v_shape) = (q.dims().to_vec(), k.dims().to_vec(), v.dims().to_vec());
-        let device = q.device();
-        let mdev = device.as_metal_device()?;
-        let qr = q.reshape((bh, t, d))?;
-        let kr = k.reshape((bh, s, d))?;
-        let vr = v.reshape((bh, s, dv))?;
-        let or_ = o.reshape((bh, t, dv))?;
-        let gr = g.reshape((bh, t, dv))?;
-        // d_vec = rowsum(g ∘ o): one small op through the migrated arms.
-        let d_vec = (&gr * &or_)?.sum(candle_core::D::Minus1)?;
-        device.synchronize()?;
-        let q = wrap_contig(&qr)?;
-        let k = wrap_contig(&kr)?;
-        let v = wrap_contig(&vr)?;
-        let o = wrap_contig(&or_)?;
-        let g = wrap_contig(&gr)?;
-        let l = wrap_contig(&l.reshape(bh * t)?)?;
-        let d_vec = wrap_contig(&d_vec)?;
+    ) -> crate::err::Res<(MetalTensor, MetalTensor, MetalTensor)> {
+        let rank = q.layout.shape().len();
+        let (t, s, d, dv) = (
+            q.layout.shape()[rank - 2],
+            k.layout.shape()[rank - 2],
+            q.layout.shape()[rank - 1],
+            v.layout.shape()[rank - 1],
+        );
+        let bh: usize = q.layout.shape()[..rank - 2].iter().product();
+        let (q_shape, k_shape, v_shape) = (
+            q.layout.shape().to_vec(),
+            k.layout.shape().to_vec(),
+            v.layout.shape().to_vec(),
+        );
+        let flat = |x: &MetalTensor, a: usize, b: usize, c: usize| -> MetalTensor {
+            MetalTensor {
+                buffer: x.buffer.clone(),
+                layout: crate::runtime::layout::Layout::contiguous(vec![a, b, c]),
+                dtype: x.dtype,
+            }
+        };
+        let q = contig(&flat(q, bh, t, d))?;
+        let k = contig(&flat(k, bh, s, d))?;
+        let v = contig(&flat(v, bh, s, dv))?;
+        let o = contig(&flat(o, bh, t, dv))?;
+        let g = contig(&flat(g, bh, t, dv))?;
+        let l = contig(&MetalTensor {
+            buffer: l.buffer.clone(),
+            layout: crate::runtime::layout::Layout::contiguous(vec![bh * t]),
+            dtype: l.dtype,
+        })?;
+        // d_vec = rowsum(g ∘ o) through the native mul + reduce.
+        let prod = crate::metal_native::binary(&g, &o, crate::metal_native::BinOp::Mul)?;
+        // prod is flattened [BH, T, Dv]; reduce its last dim.
+        let d_vec = crate::metal_native::reduce(&prod, &[2], true, crate::fusion::ReduceOp::Sum)?;
+        let d_vec = contig(&d_vec)?;
         let dq_buf = alloc_f32(bh * t * d);
         let dk_buf = alloc_f32(bh * s * d);
         let dv_buf = alloc_f32(bh * s * dv);
-        let off = |o: usize| o * DType::F32.size_in_bytes();
+        let off = |o: usize| o * 4;
         {
-            let pipe = bwd_pipeline(mdev, "et_sdpa_bwd_kv", t, s, d, dv, scale, causal)?;
+            let pipe = bwd_pipeline("et_sdpa_bwd_kv", t, s, d, dv, scale, causal)?;
             MetalDevice::get().with_encoder(|e| {
                 e.setComputePipelineState(pipe.as_raw());
                 set_buffer(e, 0, &q.buffer, off(q.layout.offset()));
@@ -587,7 +592,7 @@ kernel void et_sdpa_bwd_q(
             });
         }
         {
-            let pipe = bwd_pipeline(mdev, "et_sdpa_bwd_q", t, s, d, dv, scale, causal)?;
+            let pipe = bwd_pipeline("et_sdpa_bwd_q", t, s, d, dv, scale, causal)?;
             MetalDevice::get().with_encoder(|e| {
                 e.setComputePipelineState(pipe.as_raw());
                 set_buffer(e, 0, &q.buffer, off(q.layout.offset()));
@@ -612,144 +617,52 @@ kernel void et_sdpa_bwd_q(
             });
         }
         MetalDevice::get().synchronize();
-        let dq = bridge::metal::unwrap(&dq_buf, vec![bh, t, d], DType::F32, mdev)?.reshape(q_shape)?;
-        let dk = bridge::metal::unwrap(&dk_buf, vec![bh, s, d], DType::F32, mdev)?.reshape(k_shape)?;
-        let dv = bridge::metal::unwrap(&dv_buf, vec![bh, s, dv], DType::F32, mdev)?.reshape(v_shape)?;
+        MetalDevice::get().synchronize();
+        let dq = MetalTensor {
+            buffer: dq_buf,
+            layout: crate::runtime::layout::Layout::contiguous(q_shape),
+            dtype: crate::runtime::dtype::DType::F32,
+        };
+        let dk = MetalTensor {
+            buffer: dk_buf,
+            layout: crate::runtime::layout::Layout::contiguous(k_shape),
+            dtype: crate::runtime::dtype::DType::F32,
+        };
+        let dv = MetalTensor {
+            buffer: dv_buf,
+            layout: crate::runtime::layout::Layout::contiguous(v_shape),
+            dtype: crate::runtime::dtype::DType::F32,
+        };
         Ok((dq, dk, dv))
     }
 }
 
-#[cfg(not(target_os = "macos"))]
-mod metal {
-    use candle_core::Tensor;
-    pub fn forward(
-        _q: &Tensor,
-        _k: &Tensor,
-        _v: &Tensor,
-        _scale: f64,
-        _causal: bool,
-    ) -> candle_core::Result<(Tensor, Tensor)> {
-        Err(candle_core::Error::Msg(
-            "sdpa flash: Metal is only available on macOS".to_string(),
-        ))
-    }
-    #[allow(clippy::too_many_arguments)]
-    pub fn backward_fused(
-        _q: &Tensor,
-        _k: &Tensor,
-        _v: &Tensor,
-        _o: &Tensor,
-        _l: &Tensor,
-        _g: &Tensor,
-        _scale: f64,
-        _causal: bool,
-    ) -> candle_core::Result<(Tensor, Tensor, Tensor)> {
-        unreachable!("fused sdpa backward is Metal-only")
-    }
-}
+#[cfg(test)]
+mod attn_probe {
+    use crate::runtime::metal::device::MetalDevice;
+    use crate::runtime::metal::run::MetalTensor as MT;
 
-/// The flash forward: O and the per-row logsumexp L (consumed by the
-/// chunked backward). Caller checks `is_supported` first.
-pub fn forward(
-    q: &Tensor,
-    k: &Tensor,
-    v: &Tensor,
-    scale: f64,
-    causal: bool,
-) -> candle_core::Result<(Tensor, Tensor)> {
-    metal::forward(q, k, v, scale, causal)
-}
-
-// The additive causal mask [T, C] for the key chunk starting at `jt`:
-// 0 where jt + j <= i + (S - T) (the right-aligned window the forward
-// kernel uses), -inf elsewhere. Applied before exp, so masked
-// probabilities are exactly 0 (never inf × 0 = NaN).
-fn chunk_additive_mask(
-    t: usize,
-    jt: usize,
-    c: usize,
-    offset: usize,
-    dtype: DType,
-    device: &Device,
-) -> candle_core::Result<Tensor> {
-    let i = (Tensor::arange(0u32, t as u32, device)? + offset as f64)?.reshape((t, 1))?;
-    let j = Tensor::arange(jt as u32, (jt + c) as u32, device)?.reshape((1, c))?;
-    let allowed = j.broadcast_le(&i)?;
-    let zeros = Tensor::zeros((t, c), dtype, device)?;
-    let neg = match dtype {
-        DType::F32 => Tensor::full(f32::NEG_INFINITY, (t, c), device)?,
-        DType::F64 => Tensor::full(f64::NEG_INFINITY, (t, c), device)?,
-        dtype => return Err(candle_core::Error::UnsupportedDTypeForOp(dtype, "sdpa").bt()),
-    };
-    allowed.where_cond(&zeros, &neg)
-}
-
-/// The chunked backward (flash-2 recomputation structure): with L from
-/// the forward, P = exp(S − L) is rebuilt one key chunk at a time, so
-/// the full [T, S] matrix never materializes. dV and dK are direct
-/// per-chunk writes (concatenated at the end); dQ accumulates across
-/// chunks. D = rowsum(dO ∘ O) is computed once.
-pub fn backward(
-    q: &Tensor,
-    k: &Tensor,
-    v: &Tensor,
-    o: &Tensor,
-    l: &Tensor,
-    g: &Tensor,
-    scale: f64,
-    causal: bool,
-) -> candle_core::Result<(Tensor, Tensor, Tensor)> {
-    if backward_supported(q, v) {
-        return metal::backward_fused(q, k, v, o, l, g, scale, causal);
+    fn pattern(n: usize) -> Vec<f32> {
+        (0..n).map(|i| ((i * 7 + 3) % 13) as f32 / 4.0 - 1.5).collect()
     }
-    let rank = q.rank();
-    let (t, s) = (q.dim(rank - 2)?, k.dim(rank - 2)?);
-    let q = q.contiguous()?;
-    let k = k.contiguous()?;
-    let v = v.contiguous()?;
-    let g = g.contiguous()?;
-    let d_vec = ((&g * o)?).sum(D::Minus1)?.unsqueeze(D::Minus1)?;
-    let l_col = l.unsqueeze(D::Minus1)?;
-    let mut dq: Option<Tensor> = None;
-    let mut dvs = Vec::new();
-    let mut dks = Vec::new();
-    let mut jt = 0;
-    while jt < s {
-        let c = BACKWARD_CHUNK.min(s - jt);
-        let kj = k.narrow(rank - 2, jt, c)?.contiguous()?;
-        let vj = v.narrow(rank - 2, jt, c)?.contiguous()?;
-        let mut sj = (q.broadcast_matmul(&kj.transpose(rank - 2, rank - 1)?.contiguous()?)? * scale)?;
-        if causal {
-            sj = sj.broadcast_add(&chunk_additive_mask(
-                t,
-                jt,
-                c,
-                s.saturating_sub(t),
-                sj.dtype(),
-                sj.device(),
-            )?)?;
+
+    #[test]
+    fn probe() {
+        let dev = MetalDevice::get();
+        let q = MT::from_f32(dev, pattern(8), vec![1, 1, 2, 4]);
+        let k = MT::from_f32(dev, pattern(20).iter().map(|x| x * 0.7).collect(), vec![1, 1, 5, 4]);
+        let v = MT::from_f32(dev, pattern(20).iter().map(|x| x * -0.5).collect(), vec![1, 1, 5, 4]);
+        let scale = 0.5;
+        let (o, _l) = crate::flash::forward(&q, &k, &v, scale, true).unwrap();
+        dev.synchronize();
+        let qc = crate::runtime::cpu::Tensor::from_vec(pattern(8), vec![1, 1, 2, 4]);
+        let kc = crate::runtime::cpu::Tensor::from_vec(pattern(20).iter().map(|x| x * 0.7).collect(), vec![1, 1, 5, 4]);
+        let vc = crate::runtime::cpu::Tensor::from_vec(pattern(20).iter().map(|x| x * -0.5).collect(), vec![1, 1, 5, 4]);
+        let oc = crate::runtime::cpu::composed::sdpa_forward(&qc, &kc, &vc, scale, true);
+        let gpu = o.read_f32();
+        let cpu = crate::val::Val::Cpu(oc).to_f32_vec().unwrap();
+        for (g, c) in gpu.iter().zip(&cpu) {
+            assert!((g - c).abs() < 1e-5, "flash {g} vs composed {c}");
         }
-        let pj = sj.broadcast_sub(&l_col)?.exp()?;
-        dvs.push(
-            pj.transpose(rank - 2, rank - 1)?
-                .contiguous()?
-                .broadcast_matmul(&g)?,
-        );
-        let dpj = g.broadcast_matmul(&vj.transpose(rank - 2, rank - 1)?.contiguous()?)?;
-        let dsj = ((&pj * &dpj.broadcast_sub(&d_vec)?)? * scale)?;
-        dks.push(
-            dsj.transpose(rank - 2, rank - 1)?
-                .contiguous()?
-                .broadcast_matmul(&q)?,
-        );
-        let dqj = dsj.broadcast_matmul(&kj)?;
-        dq = Some(match dq {
-            None => dqj,
-            Some(acc) => (acc + dqj)?,
-        });
-        jt += c;
     }
-    let dv = Tensor::cat(&dvs, rank - 2)?;
-    let dk = Tensor::cat(&dks, rank - 2)?;
-    Ok((dq.expect("sdpa backward: empty key sequence"), dk, dv))
 }

@@ -77,28 +77,28 @@ fn index_select_impl<T: super::tensor::Elem>(x: &[T], xl: &Layout, ids: &[usize]
     let shape = xl.shape();
     let rank = shape.len();
     let dstride = xl.strides()[dim];
-    let kept: Vec<usize> = (0..rank).filter(|&d| d != dim).collect();
-    let kept_dims: Vec<usize> = kept.iter().map(|&d| shape[d]).collect();
-    let kept_strides: Vec<usize> = kept.iter().map(|&d| xl.strides()[d]).collect();
-    let kept_n: usize = kept_dims.iter().product();
     let l = ids.len();
-    let mut out = vec![T::default(); kept_n * l];
-    for kept_i in 0..kept_n {
-        let mut base = xl.offset();
-        let mut rem = kept_i;
-        for k in (0..kept.len()).rev() {
-            let c = kept_dims[k].max(1);
-            let i = rem % c;
-            rem /= c;
-            base += i * kept_strides[k];
-        }
-        for (j, &id) in ids.iter().enumerate() {
-            assert!(id < shape[dim], "index_select index out of bounds");
-            out[kept_i * l + j] = x[base + id * dstride];
-        }
-    }
     let mut out_shape = shape.to_vec();
     out_shape[dim] = l;
+    let total: usize = out_shape.iter().product();
+    let mut out = vec![T::default(); total];
+    for lin in 0..total {
+        let mut rem = lin;
+        let mut src = xl.offset();
+        for d in (0..rank).rev() {
+            let c = out_shape[d].max(1);
+            let i = rem % c;
+            rem /= c;
+            src += if d == dim {
+                let id = ids[i];
+                assert!(id < shape[dim], "index_select index out of bounds");
+                id * dstride
+            } else {
+                i * xl.strides()[d]
+            };
+        }
+        out[lin] = x[src];
+    }
     Tensor::from_vec(out, out_shape)
 }
 

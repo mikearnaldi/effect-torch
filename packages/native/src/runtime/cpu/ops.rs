@@ -235,7 +235,17 @@ impl Tensor {
     float_ops!(round, |x: f32| x.round(), |x: f64| x.round());
     float_ops!(abs, |x: f32| x.abs(), |x: f64| x.abs());
     float_ops!(sign, |x: f32| if x > 0.0 { 1.0 } else if x < 0.0 { -1.0 } else { 0.0 }, |x: f64| if x > 0.0 { 1.0 } else if x < 0.0 { -1.0 } else { 0.0 });
-    float_ops!(relu, |x: f32| x.max(0.0), |x: f64| x.max(0.0));
+    pub fn relu(&self) -> Tensor {
+        match &self.buffer {
+            CpuBuffer::F32(v) => unary_impl(v, &self.layout, |x: f32| x.max(0.0)),
+            CpuBuffer::F64(v) => unary_impl(v, &self.layout, |x: f64| x.max(0.0)),
+            CpuBuffer::F16(v) => unary_impl(v, &self.layout, |x: f16| f16::from_f32(x.to_f32().max(0.0))),
+            CpuBuffer::BF16(v) => unary_impl(v, &self.layout, |x: bf16| bf16::from_f32(x.to_f32().max(0.0))),
+            CpuBuffer::U8(v) => unary_impl(v, &self.layout, |x: u8| x),
+            CpuBuffer::U32(v) => unary_impl(v, &self.layout, |x: u32| x),
+            CpuBuffer::I64(v) => unary_impl(v, &self.layout, |x: i64| x.max(0)),
+        }
+    }
 }
 
 #[cfg(test)]

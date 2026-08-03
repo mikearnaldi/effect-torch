@@ -7,7 +7,6 @@ edition = "2021"
 crate-type = ["cdylib"]
 
 [dependencies]
-candle-core = { git = "https://github.com/mikearnaldi/candle", rev = "8f384d8d04f885243312b001c1a72bea6c5c11b1" }
 napi = { version = "3", features = ["async"] }
 napi-derive = "3"
 tokio = { version = "1", features = ["rt", "sync", "macros"] }
@@ -18,8 +17,6 @@ tokenizers = "0.22"
 rayon = "1"
 
 [target.'cfg(target_os = "macos")'.dependencies]
-candle-core = { git = "https://github.com/mikearnaldi/candle", rev = "8f384d8d04f885243312b001c1a72bea6c5c11b1", features = ["metal", "accelerate"] }
-candle-metal-kernels = { git = "https://github.com/mikearnaldi/candle", rev = "8f384d8d04f885243312b001c1a72bea6c5c11b1" }
 objc2 = "0.6"
 objc2-metal = "0.3.2"
 objc2-foundation = "0.3"
@@ -29,10 +26,6 @@ napi-build = "1"
 
 [features]
 default = []
-cuda = ["candle-core/cuda"]
-cudnn = ["cuda", "candle-core/cudnn"]
-mkl = ["candle-core/mkl"]
-nccl = ["cuda", "candle-core/nccl"]
 
 [profile.release]
 lto = true

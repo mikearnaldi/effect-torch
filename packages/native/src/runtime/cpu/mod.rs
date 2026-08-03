@@ -9,4 +9,4 @@ pub mod random;
 pub mod reduce;
 pub mod tensor;
 
-pub use tensor::{copy_strided, CpuBuffer, Elem, Tensor};
+pub use tensor::{CpuBuffer, Elem, Tensor};

@@ -4,7 +4,7 @@ fn pad1(x: &Tensor, padding: usize) -> Tensor {
     if padding == 0 {
         return x.clone();
     }
-    let (n, c, l) = (x.shape()[0], x.shape()[1], x.shape()[2]);
+    let (n, c, _) = (x.shape()[0], x.shape()[1], x.shape()[2]);
     let zeros = Tensor::zeros(&[n, c, padding], x.dtype());
     Tensor::cat(&[&zeros, x, &zeros], 2)
 }
@@ -115,8 +115,9 @@ pub fn conv_transpose1d(
     groups: usize,
 ) -> Tensor {
     let (n, c_in, l) = (x.shape()[0], x.shape()[1], x.shape()[2]);
-    let (c_out_per_g, cin_per, k) = (w.shape()[1], w.shape()[0], w.shape()[2]);
-    assert_eq!(c_in, cin_per * groups);
+    let (c_out_per_g, k) = (w.shape()[1], w.shape()[2]);
+    assert_eq!(c_in, w.shape()[0], "conv_transpose1d: weight dim 0 must equal input channels");
+    let cin_per = c_in / groups;
     let c_out = c_out_per_g * groups;
     let l_out = (l - 1) * stride - 2 * padding + dilation * (k - 1) + output_padding + 1;
     let xc = x.contiguous().cast(crate::runtime::dtype::DType::F64);
@@ -160,8 +161,9 @@ pub fn conv_transpose2d(
     groups: usize,
 ) -> Tensor {
     let (n, c_in, h, wd) = (x.shape()[0], x.shape()[1], x.shape()[2], x.shape()[3]);
-    let (c_out_per_g, cin_per, kh, kw) = (w.shape()[1], w.shape()[0], w.shape()[2], w.shape()[3]);
-    assert_eq!(c_in, cin_per * groups);
+    let (c_out_per_g, kh, kw) = (w.shape()[1], w.shape()[2], w.shape()[3]);
+    assert_eq!(c_in, w.shape()[0], "conv_transpose2d: weight dim 0 must equal input channels");
+    let cin_per = c_in / groups;
     let c_out = c_out_per_g * groups;
     let oh = (h - 1) * stride - 2 * padding + dilation * (kh - 1) + output_padding + 1;
     let ow = (wd - 1) * stride - 2 * padding + dilation * (kw - 1) + output_padding + 1;

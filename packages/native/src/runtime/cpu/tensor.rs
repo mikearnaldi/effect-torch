@@ -144,7 +144,7 @@ impl Tensor {
     }
 
     pub fn contiguous(&self) -> Self {
-        if self.layout.is_contiguous() && self.layout.offset() == 0 {
+        if self.layout.is_contiguous() && self.layout.offset() == 0 && self.buffer.len() == self.layout.numel() {
             return self.clone();
         }
         match &self.buffer {

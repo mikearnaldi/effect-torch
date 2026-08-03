@@ -9,14 +9,14 @@
 //! head) scale slab (RFC 0012). The composed scatter+gather path in
 //! lib.rs remains the reference and the CPU fallback.
 
-use candle_core::{DType, Device, Tensor};
 
-/// Whether the paged kernel can run this decode step: Metal, f32
-/// compute, head dim within the kernel's register budget, slabs in a
+
+/// Whether the paged kernel can run this decode step: Metal, f32/// compute, head dim within the kernel's register budget, slabs in a
 /// supported storage dtype.
-pub fn is_supported(q: &Tensor, slab_dtype: DType, head_dim: usize) -> bool {
-    matches!(q.device(), Device::Metal(_))
-        && q.dtype() == DType::F32
+use crate::runtime::dtype::DType;
+
+pub fn is_supported(q: &crate::runtime::metal::run::MetalTensor, slab_dtype: DType, head_dim: usize) -> bool {
+    q.dtype == crate::runtime::dtype::DType::F32
         && head_dim <= 128
         && matches!(slab_dtype, DType::F32 | DType::F16 | DType::BF16 | DType::U8)
 }
@@ -26,37 +26,32 @@ pub use metal::{decode, scatter};
 
 #[cfg(target_os = "macos")]
 mod metal {
-    use crate::bridge;
     use crate::runtime::metal::device::{set_buffer, set_bytes, MetalDevice, Pipeline};
     use crate::runtime::metal::run::MetalTensor;
-    use candle_core::{DType, Tensor};
+    use crate::runtime::dtype::DType;
+
     use objc2_metal::MTLComputeCommandEncoder;
 
     const THREADS: usize = 128;
 
-    fn wrap_contig(t: &Tensor) -> candle_core::Result<MetalTensor> {
-        let w = bridge::metal::wrap(t)?;
-        if w.layout.is_contiguous() {
-            Ok(w)
+    fn wrap_contig(t: &MetalTensor) -> crate::err::Res<MetalTensor> {
+        if t.layout.is_contiguous() {
+            Ok(t.clone())
         } else {
-            crate::runtime::metal::kernels::strided_copy(MetalDevice::get(), &w)
-                .map_err(candle_core::Error::Msg)
+            crate::runtime::metal::kernels::strided_copy(MetalDevice::get(), t)
         }
     }
 
     fn compile(
-        _mdev: &candle_core::MetalDevice,
         key: u64,
         src: &str,
         name: &'static str,
-    ) -> candle_core::Result<Pipeline> {
-        MetalDevice::get()
-            .compile(key, src, name)
-            .map_err(candle_core::Error::Msg)
+    ) -> crate::err::Res<Pipeline> {
+        MetalDevice::get().compile(key, src, name)
     }
 
     fn slab_dtype(t: &MetalTensor) -> DType {
-        crate::bridge::dtype_from_native(t.dtype)
+        t.dtype
     }
 
     // Writes the new-token row of every slot into the slabs in one
@@ -150,8 +145,8 @@ kernel void et_paged_scatter(
     // ctxlens[b] - advance .. ctxlens[b].
     #[allow(clippy::too_many_arguments)]
     pub fn scatter(
-        k_new: &Tensor,
-        v_new: &Tensor,
+        k_new: &MetalTensor,
+        v_new: &MetalTensor,
         k_slab: &MetalTensor,
         v_slab: &MetalTensor,
         k_scales: Option<&MetalTensor>,
@@ -160,23 +155,25 @@ kernel void et_paged_scatter(
         ctxlens: &MetalTensor,
         block_size: usize,
         advance: usize,
-    ) -> candle_core::Result<()> {
+    ) -> crate::err::Res<()> {
         use std::collections::hash_map::DefaultHasher;
         use std::hash::{Hash, Hasher};
 
-        let (b, h, c, d) = k_new.dims4()?;
-        let device = k_new.device();
-        let mdev = device.as_metal_device()?;
+        let (b, h, c, d) = (
+            k_new.layout.shape()[0],
+            k_new.layout.shape()[1],
+            k_new.layout.shape()[2],
+            k_new.layout.shape()[3],
+        );
         let slab_dtype = slab_dtype(k_slab);
         let mut hasher = DefaultHasher::new();
         (0x5CA7u32, d, slab_dtype).hash(&mut hasher);
         let src = scatter_source(d, slab_dtype);
-        let pipe = compile(mdev, hasher.finish(), &src, "et_paged_scatter")?;
+        let pipe = compile(hasher.finish(), &src, "et_paged_scatter")?;
         let k_new = wrap_contig(k_new)?;
         let v_new = wrap_contig(v_new)?;
-        device.synchronize()?;
-        let f32_off = |off: usize| off * DType::F32.size_in_bytes();
-        let u32_off = |off: usize| off * DType::U32.size_in_bytes();
+        let f32_off = |off: usize| off * 4;
+        let u32_off = |off: usize| off * 4;
         let elem_off = |off: usize| off * slab_dtype.size_in_bytes();
         let max_blocks = tables.layout.shape()[1] as u32;
         MetalDevice::get().with_encoder(|e| {
@@ -412,18 +409,17 @@ kernel void et_paged_decode(
     }
 
     fn pipeline(
-        mdev: &candle_core::MetalDevice,
         d: usize,
         slab_dtype: DType,
         scale: f64,
-    ) -> candle_core::Result<Pipeline> {
+    ) -> crate::err::Res<Pipeline> {
         use std::collections::hash_map::DefaultHasher;
         use std::hash::{Hash, Hasher};
 
         let mut hasher = DefaultHasher::new();
         (d, slab_dtype, scale.to_bits()).hash(&mut hasher);
         let src = kernel_source(d, slab_dtype, scale);
-        compile(mdev, hasher.finish(), &src, "et_paged_decode")
+        compile(hasher.finish(), &src, "et_paged_decode")
     }
 
     // One launch for the whole batch: q [B, H, C, D] contiguous
@@ -433,7 +429,7 @@ kernel void et_paged_decode(
     // [B, H, C, D] f32.
     #[allow(clippy::too_many_arguments)]
     pub fn decode(
-        q: &Tensor,
+        q: &MetalTensor,
         k_slab: &MetalTensor,
         v_slab: &MetalTensor,
         k_scales: Option<&MetalTensor>,
@@ -444,16 +440,18 @@ kernel void et_paged_decode(
         scale: f64,
         block_size: usize,
         advance: usize,
-    ) -> candle_core::Result<Tensor> {
-        let (b, h, c, d) = q.dims4()?;
-        let device = q.device();
-        let mdev = device.as_metal_device()?;
+    ) -> crate::err::Res<MetalTensor> {
+        let (b, h, c, d) = (
+            q.layout.shape()[0],
+            q.layout.shape()[1],
+            q.layout.shape()[2],
+            q.layout.shape()[3],
+        );
         let slab_dtype = slab_dtype(k_slab);
         let q = wrap_contig(q)?;
-        let pipe = pipeline(mdev, d, slab_dtype, scale)?;
+        let pipe = pipeline(d, slab_dtype, scale)?;
         let out_buf = MetalDevice::get().alloc((b * h * c * d).max(1), crate::runtime::dtype::DType::F32);
         let max_blocks = tables.layout.shape()[1];
-        device.synchronize()?;
         let f32_off = |off: usize| off * DType::F32.size_in_bytes();
         let u32_off = |off: usize| off * DType::U32.size_in_bytes();
         let elem_off = |off: usize| off * slab_dtype.size_in_bytes();
@@ -494,6 +492,11 @@ kernel void et_paged_decode(
             );
         });
         MetalDevice::get().synchronize();
-        bridge::metal::unwrap(&out_buf, vec![b, h, c, d], DType::F32, mdev)
+        MetalDevice::get().synchronize();
+        Ok(MetalTensor {
+            buffer: out_buf,
+            layout: crate::runtime::layout::Layout::contiguous(vec![b, h, c, d]),
+            dtype: crate::runtime::dtype::DType::F32,
+        })
     }
 }

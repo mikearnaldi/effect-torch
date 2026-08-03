@@ -40,7 +40,7 @@ kernel void et_fill(device {ty}* out [[buffer(0)]], constant float& v [[buffer(1
 }}
 "#
     );
-    let pipeline = dev.compile(key(&[0xF111, out.dtype as u64]), &src, "et_fill")?;
+    let pipeline = dev.compile(key(&[0xF111, out.dtype as u64, n as u64]), &src, "et_fill")?;
     let v = value as f32;
     let padded = n.div_ceil(256) * 256;
     dev.with_encoder(|e| {
@@ -50,6 +50,33 @@ kernel void et_fill(device {ty}* out [[buffer(0)]], constant float& v [[buffer(1
         e.dispatchThreads_threadsPerThreadgroup(MetalDevice::grid(padded, 1, 1), MetalDevice::grid(256, 1, 1));
     });
     Ok(())
+}
+
+pub fn relu_i64(dev: &MetalDevice, x: &MetalTensor) -> Result<MetalTensor, String> {
+    assert_eq!(x.dtype, DType::I64);
+    let n = x.numel();
+    let out = MetalTensor::zeros(dev, x.layout.shape().to_vec(), DType::I64);
+    if n == 0 {
+        return Ok(out);
+    }
+    let src = format!(
+        r#"
+#include <metal_stdlib>
+using namespace metal;
+kernel void et_relu_i64(device const long* a [[buffer(0)]], device long* out [[buffer(1)]], uint i [[thread_position_in_grid]]) {{
+    if (i < {n}u) out[i] = max(a[i], 0L);
+}}
+"#
+    );
+    let pipeline = dev.compile(key(&[0x8E10, n as u64]), &src, "et_relu_i64")?;
+    let padded = n.div_ceil(256) * 256;
+    dev.with_encoder(|e| {
+        e.setComputePipelineState(pipeline.as_raw());
+        set_buffer(e, 0, &x.buffer, x.layout.offset() * 8);
+        set_buffer(e, 1, &out.buffer, 0);
+        e.dispatchThreads_threadsPerThreadgroup(MetalDevice::grid(padded, 1, 1), MetalDevice::grid(256, 1, 1));
+    });
+    Ok(out)
 }
 
 pub fn cast(dev: &MetalDevice, x: &MetalTensor, dtype: DType) -> Result<MetalTensor, String> {
@@ -75,7 +102,7 @@ kernel void et_cast(device const {src_ty}* a [[buffer(0)]], device {dst_ty}* out
 }}
 "#
     );
-    let pipeline = dev.compile(key(&[0xCA57, x.dtype as u64, dtype as u64]), &src, "et_cast")?;
+    let pipeline = dev.compile(key(&[0xCA57, x.dtype as u64, dtype as u64, n as u64]), &src, "et_cast")?;
     let padded = n.div_ceil(256) * 256;
     dev.with_encoder(|e| {
         e.setComputePipelineState(pipeline.as_raw());
@@ -129,7 +156,8 @@ kernel void et_scopy(device const {ty}* a [[buffer(0)]], device {ty}* out [[buff
 }}
 "#
     );
-    let pipeline = dev.compile(key(&[0x5C09, x.dtype as u64, key(&[shape.iter().map(|&v| v as u64).sum::<u64>(), strides.iter().map(|&v| v as u64).sum::<u64>()])]), &src, "et_scopy")?;
+    let shape_key = key(&shape.iter().map(|&v| v as u64).chain(strides.iter().map(|&v| v as u64)).collect::<Vec<_>>());
+    let pipeline = dev.compile(key(&[0x5C09, x.dtype as u64, shape_key]), &src, "et_scopy")?;
     let padded = n.div_ceil(256) * 256;
     dev.with_encoder(|e| {
         e.setComputePipelineState(pipeline.as_raw());
@@ -239,7 +267,7 @@ kernel void et_arange(device {ty}* out [[buffer(0)]], uint i [[thread_position_i
 "#,
         step, start
     );
-    let pipeline = dev.compile(key(&[0xA26E, dtype as u64, start.to_bits(), step.to_bits()]), &src, "et_arange")?;
+    let pipeline = dev.compile(key(&[0xA26E, dtype as u64, start.to_bits(), step.to_bits(), n as u64]), &src, "et_arange")?;
     let padded = n.div_ceil(256) * 256;
     dev.with_encoder(|e| {
         e.setComputePipelineState(pipeline.as_raw());
@@ -324,7 +352,7 @@ kernel void et_argred(
 }}
 "#
     );
-    let pipeline = dev.compile(key(&[0xA26D, x.dtype as u64, dim as u64, pick_max as u64, n as u64, kept_n as u64]), &src, "et_argred")?;
+    let pipeline = dev.compile(key(&[0xA26D, x.dtype as u64, dim as u64, pick_max as u64, n as u64, key(&kept_dims.iter().map(|&v| v as u64).collect::<Vec<_>>())]), &src, "et_argred")?;
     let padded = kept_n.div_ceil(256) * 256;
     dev.with_encoder(|e| {
         e.setComputePipelineState(pipeline.as_raw());
@@ -385,7 +413,7 @@ kernel void et_cumsum(
 "#,
         os_dim = os[dim]
     );
-    let pipeline = dev.compile(key(&[0xC50A, x.dtype as u64, dim as u64, n as u64, kept_n as u64]), &src, "et_cumsum")?;
+    let pipeline = dev.compile(key(&[0xC50A, x.dtype as u64, dim as u64, n as u64, key(&kept_dims.iter().map(|&v| v as u64).collect::<Vec<_>>())]), &src, "et_cumsum")?;
     let padded = kept_n.div_ceil(256) * 256;
     dev.with_encoder(|e| {
         e.setComputePipelineState(pipeline.as_raw());

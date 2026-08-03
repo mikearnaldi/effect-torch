@@ -24,12 +24,17 @@ impl MetalTensor {
     pub fn zeros(dev: &MetalDevice, shape: Vec<usize>, dtype: DType) -> Self {
         let n: usize = shape.iter().product();
         let buffer = dev.alloc(n.max(1), dtype);
-        dev.synchronize();
-        MetalTensor {
+        let out = MetalTensor {
             buffer,
             layout: crate::runtime::layout::Layout::contiguous(shape),
             dtype,
+        };
+        if n > 0 {
+            // Async fill on the serial encoder: ordered before any consumer
+            // dispatch, no host fence required.
+            let _ = super::kernels::fill(dev, &out, 0.0);
         }
+        out
     }
 
     pub fn numel(&self) -> usize {
@@ -37,7 +42,26 @@ impl MetalTensor {
     }
 
     pub fn read_f32(&self) -> Vec<f32> {
+        crate::runtime::metal::device::MetalDevice::get().synchronize();
         self.buffer.read_f32(self.layout.offset(), self.numel())
+    }
+
+    pub fn to_u32_vec(&self) -> crate::err::Res<Vec<u32>> {
+        crate::runtime::metal::device::MetalDevice::get().synchronize();
+        let n = self.numel();
+        let size = self.dtype.size_in_bytes();
+        let ptr = unsafe { self.buffer.contents_ptr().cast::<u8>().add(self.layout.offset() * size) };
+        let bytes = unsafe { std::slice::from_raw_parts(ptr, n * size) };
+        let mut out = Vec::with_capacity(n);
+        match self.dtype {
+            DType::U32 => out.extend(bytes.chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))),
+            DType::U8 => out.extend(bytes.iter().map(|&b| b as u32)),
+            DType::I64 => out.extend(bytes.chunks_exact(8).map(|c| {
+                i64::from_le_bytes([c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]]) as u32
+            })),
+            _ => return crate::err::err("to_u32_vec: dtype must be u8/u32/i64"),
+        }
+        Ok(out)
     }
 }
 
@@ -99,7 +123,6 @@ pub fn run_elementwise(
             MetalDevice::grid(emit::BLOCK, 1, 1),
         );
     });
-    dev.synchronize();
     Ok(out_bufs)
 }
 
@@ -145,7 +168,6 @@ pub fn run_reduce(
             MetalDevice::grid(emit::BLOCK, 1, 1),
         );
     });
-    dev.synchronize();
     Ok(out)
 }
 

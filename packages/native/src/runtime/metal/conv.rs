@@ -1,6 +1,5 @@
 use super::device::{set_buffer, MetalDevice};
 use super::run::MetalTensor;
-use crate::runtime::dtype::DType;
 use objc2_metal::MTLComputeCommandEncoder;
 
 fn key(parts: &[u64]) -> u64 {
@@ -49,7 +48,6 @@ pub fn conv1d(dev: &MetalDevice, x: &MetalTensor, w: &MetalTensor, stride: usize
     if total == 0 {
         return Ok(out);
     }
-    let lp = l + 2 * padding;
     let src = format!(
         r#"{HEADER}
 kernel void et_conv1d(
@@ -68,7 +66,7 @@ kernel void et_conv1d(
         const uint ic = g * {c_per}u + ci;
         for (uint kk = 0u; kk < {k}u; ++kk) {{
             const long pos = (long)(i * {stride}u + kk * {dilation}u) - {padding}l;
-            if (pos >= 0 && pos < {lp}l) {{
+            if (pos >= 0 && pos < {l}l) {{
                 acc += x[(b * {c_in}u + ic) * {l}u + (uint)pos] * w[(oc * {c_per}u + ci) * {k}u + kk];
             }}
         }}
@@ -97,7 +95,6 @@ pub fn conv2d(dev: &MetalDevice, x: &MetalTensor, w: &MetalTensor, stride: usize
     if total == 0 {
         return Ok(out);
     }
-    let (hp, wp) = (h + 2 * padding, wd + 2 * padding);
     let src = format!(
         r#"{HEADER}
 kernel void et_conv2d(
@@ -117,10 +114,10 @@ kernel void et_conv2d(
         const uint ic = g * {c_per}u + ci;
         for (uint ky = 0u; ky < {kh}u; ++ky) {{
             const long py = (long)(i * {stride}u + ky * {dilation}u) - {padding}l;
-            if (py < 0 || py >= {hp}l) continue;
+            if (py < 0 || py >= {h}l) continue;
             for (uint kx = 0u; kx < {kw}u; ++kx) {{
                 const long px = (long)(j * {stride}u + kx * {dilation}u) - {padding}l;
-                if (px < 0 || px >= {wp}l) continue;
+                if (px < 0 || px >= {wd}l) continue;
                 acc += x[((b * {c_in}u + ic) * {h}u + (uint)py) * {wd}u + (uint)px]
                        * w[((oc * {c_per}u + ci) * {kh}u + ky) * {kw}u + kx];
             }}
@@ -141,7 +138,9 @@ kernel void et_conv2d(
 
 pub fn conv_transpose1d(dev: &MetalDevice, x: &MetalTensor, w: &MetalTensor, stride: usize, padding: usize, output_padding: usize, dilation: usize, groups: usize) -> Result<MetalTensor, String> {
     let (n, c_in, l) = dims3(x);
-    let (c_out_per_g, cin_per, k) = (w.layout.shape()[1], w.layout.shape()[0], w.layout.shape()[2]);
+    assert_eq!(c_in, w.layout.shape()[0], "conv_transpose1d: weight dim 0 must equal input channels");
+    let (c_out_per_g, k) = (w.layout.shape()[1], w.layout.shape()[2]);
+    let cin_per = c_in / groups;
     let c_out = c_out_per_g * groups;
     let l_out = (l - 1) * stride - 2 * padding + dilation * (k - 1) + output_padding + 1;
     let out = MetalTensor::zeros(dev, vec![n, c_out, l_out], x.dtype);
@@ -190,7 +189,9 @@ kernel void et_convt1d(
 
 pub fn conv_transpose2d(dev: &MetalDevice, x: &MetalTensor, w: &MetalTensor, stride: usize, padding: usize, output_padding: usize, dilation: usize, groups: usize) -> Result<MetalTensor, String> {
     let (n, c_in, h, wd) = dims4(x);
-    let (c_out_per_g, cin_per, kh, kw) = (w.layout.shape()[1], w.layout.shape()[0], w.layout.shape()[2], w.layout.shape()[3]);
+    assert_eq!(c_in, w.layout.shape()[0], "conv_transpose2d: weight dim 0 must equal input channels");
+    let (c_out_per_g, kh, kw) = (w.layout.shape()[1], w.layout.shape()[2], w.layout.shape()[3]);
+    let cin_per = c_in / groups;
     let c_out = c_out_per_g * groups;
     let oh = (h - 1) * stride - 2 * padding + dilation * (kh - 1) + output_padding + 1;
     let ow = (wd - 1) * stride - 2 * padding + dilation * (kw - 1) + output_padding + 1;
@@ -256,7 +257,6 @@ pub fn conv2d_backward_w(dev: &MetalDevice, x: &MetalTensor, g: &MetalTensor, ke
     if total == 0 {
         return Ok(out);
     }
-    let (hp, wp) = (x.layout.shape()[2] + 2 * padding, x.layout.shape()[3] + 2 * padding);
     let src = format!(
         r#"{HEADER}
 kernel void et_conv2d_bw(
@@ -276,10 +276,10 @@ kernel void et_conv2d_bw(
     for (uint b = 0u; b < {n}u; ++b) {{
         for (uint i = 0u; i < {oh}u; ++i) {{
             const long py = (long)(i * {stride}u + ky * {dilation}u) - {padding}l;
-            if (py < 0 || py >= {hp}l) continue;
+            if (py < 0 || py >= {h_dim}l) continue;
             for (uint j = 0u; j < {ow}u; ++j) {{
                 const long px = (long)(j * {stride}u + kx * {dilation}u) - {padding}l;
-                if (px < 0 || px >= {wp}l) continue;
+                if (px < 0 || px >= {w_dim}l) continue;
                 acc += g[((b * {out_channels}u + oc) * {oh}u + i) * {ow}u + j]
                        * x[((b * {c_in}u + ic) * {h_dim}u + (uint)py) * {w_dim}u + (uint)px];
             }}

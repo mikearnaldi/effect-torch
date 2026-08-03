@@ -7,7 +7,8 @@
 //! is f32-only (the `ug` SSA has no f64 constants and Metal has no f64);
 //! the CPU interpreter covers f32 and f64.
 
-use candle_core::{DType, Device, Tensor};
+use crate::dev::Device;
+use crate::runtime::dtype::DType;
 #[cfg(any(target_os = "macos", feature = "cuda"))]
 
 const BLOCK: usize = 256;
@@ -609,43 +610,39 @@ fn fusion_phase_nanos(_phase: usize, _nanos: u64) {}
 #[cfg(target_os = "macos")]
 mod metal {
     use super::{fusion_phase_nanos, Expr, ReduceOp};
-    use candle_core::{DType, Device, Tensor};
-    use crate::bridge;
+    use crate::dev::Device;
     use crate::runtime::metal::device::MetalDevice;
     use crate::runtime::metal::run::MetalTensor;
 
     pub fn run(
         exprs: &[Expr],
-        inputs: &[Tensor],
+        inputs: &[crate::val::Val],
         lane_strides: &[Vec<usize>],
-        scalars: &[Tensor],
+        scalars: &[crate::val::Val],
         n: usize,
         shape: &[usize],
         device: &Device,
-    ) -> candle_core::Result<Vec<Tensor>> {
-        let mdev = device.as_metal_device()?;
+    ) -> crate::err::Res<Vec<crate::val::Val>> {
+        let _ = device;
         // Metal exposes at most 31 buffer argument slots per kernel
         // (scalars share one packed slot).
         if inputs.len() + exprs.len() + 1 > 31 {
-            return Err(candle_core::Error::Msg(format!(
+            return Err(format!(
                 "fusion: {} buffer arguments exceed Metal's limit of 31",
                 inputs.len() + exprs.len() + 1
-            )));
+            ));
         }
         let phase_timing = std::env::var_os("EFFECT_TORCH_FUSION_TIMING").is_some();
         let t_start = std::time::Instant::now();
-        // Ordering: candle's queue must finish producing the inputs
-        // before the native queue reads them (zero-copy wrap).
-        device.synchronize()?;
         let native: Vec<MetalTensor> = inputs
             .iter()
-            .map(bridge::metal::wrap)
-            .collect::<candle_core::Result<_>>()?;
+            .map(|v| v.as_metal().cloned())
+            .collect::<crate::err::Res<_>>()?;
         let refs: Vec<&MetalTensor> = native.iter().collect();
         let scalar_values: Vec<f32> = scalars
             .iter()
-            .map(|t| t.to_vec0::<f32>())
-            .collect::<candle_core::Result<_>>()?;
+            .map(|v| v.to_f32_vec().map(|x| x[0]))
+            .collect::<crate::err::Res<_>>()?;
         if phase_timing {
             fusion_phase_nanos(0, t_start.elapsed().as_nanos() as u64);
         }
@@ -657,10 +654,10 @@ mod metal {
             &scalar_values,
             n,
             shape,
-        )
-        .map_err(candle_core::Error::Msg)?;
-        outs.iter()
-            .map(|t| bridge::metal::unwrap(&t.buffer, shape.to_vec(), DType::F32, mdev))
+        )?;
+        outs.into_iter()
+            .map(crate::val::Val::Metal)
+            .map(Ok)
             .collect()
     }
 
@@ -668,26 +665,25 @@ mod metal {
     pub fn run_reduce(
         op: ReduceOp,
         expr: &Expr,
-        inputs: &[Tensor],
+        inputs: &[crate::val::Val],
         lane_strides: &[Vec<usize>],
         in_shape: &[usize],
         dims: &[usize],
         keepdims: bool,
         out_shape: &[usize],
         device: &Device,
-    ) -> candle_core::Result<Tensor> {
-        let mdev = device.as_metal_device()?;
+    ) -> crate::err::Res<crate::val::Val> {
+        let _ = device;
         if inputs.len() + 1 > 31 {
-            return Err(candle_core::Error::Msg(format!(
+            return Err(format!(
                 "fusion: {} buffer arguments exceed Metal's limit of 31",
                 inputs.len() + 1
-            )));
+            ));
         }
-        device.synchronize()?;
         let native: Vec<MetalTensor> = inputs
             .iter()
-            .map(bridge::metal::wrap)
-            .collect::<candle_core::Result<_>>()?;
+            .map(|v| v.as_metal().cloned())
+            .collect::<crate::err::Res<_>>()?;
         let refs: Vec<&MetalTensor> = native.iter().collect();
         let out = crate::runtime::metal::run::run_reduce(
             MetalDevice::get(),
@@ -699,9 +695,8 @@ mod metal {
             dims,
             keepdims,
             out_shape,
-        )
-        .map_err(candle_core::Error::Msg)?;
-        bridge::metal::unwrap(&out.buffer, out_shape.to_vec(), DType::F32, mdev)
+        )?;
+        Ok(crate::val::Val::Metal(out))
     }
 }
 
@@ -711,13 +706,9 @@ pub fn is_supported(device: &Device, dtype: DType) -> bool {
     match device {
         Device::Cpu => matches!(dtype, DType::F32 | DType::F64),
         #[cfg(target_os = "macos")]
-        Device::Metal(_) => dtype == DType::F32,
+        Device::Metal => dtype == DType::F32,
         #[cfg(not(target_os = "macos"))]
-        Device::Metal(_) => false,
-        // CUDA is disabled until the ug-cuda path can be tested on real
-        // hardware; the region pass treats these nodes as unfusable and
-        // they keep their composed candle-op eval.
-        Device::Cuda(_) => false,
+        Device::Metal => false,
     }
 }
 
@@ -806,33 +797,47 @@ pub fn sgd_exprs(momentum: f64, dampening: f64, nesterov: bool, weight_decay: f6
 /// read at offset 0.
 pub fn run(
     exprs: &[Expr],
-    inputs: &[Tensor],
+    inputs: &[crate::val::Val],
     strides: Option<&[Vec<usize>]>,
-    scalars: &[Tensor],
+    scalars: &[crate::val::Val],
     n: usize,
     shape: &[usize],
     dtype: DType,
     device: &Device,
-) -> candle_core::Result<Vec<Tensor>> {
+) -> crate::err::Res<Vec<crate::val::Val>> {
     if let Some(ss) = strides {
         if ss.len() != inputs.len() {
-            return Err(candle_core::Error::Msg(format!(
+            return Err(format!(
                 "fusion: got {} stride entries for {} inputs",
                 ss.len(),
                 inputs.len()
-            )));
+            ));
         }
     }
     let mut owned = Vec::with_capacity(inputs.len() + scalars.len());
-    for t in inputs.iter().chain(scalars.iter()) {
-        owned.push(if t.is_contiguous() { t.clone() } else { t.contiguous()? });
+    for v in inputs.iter().chain(scalars.iter()) {
+        owned.push(match v {
+            crate::val::Val::Cpu(t) => crate::val::Val::Cpu(t.contiguous()),
+            crate::val::Val::Metal(t) => {
+                if t.layout.is_contiguous() {
+                    v.clone()
+                } else {
+                    crate::val::Val::Metal(
+                        crate::runtime::metal::kernels::strided_copy(
+                            crate::runtime::metal::device::MetalDevice::get(),
+                            t,
+                        )?,
+                    )
+                }
+            }
+        });
     }
     for s in scalars.iter() {
-        if s.elem_count() != 1 {
-            return Err(candle_core::Error::Msg(format!(
+        if s.numel() != 1 {
+            return Err(format!(
                 "fusion: scalar lanes must have exactly one element, got {}",
-                s.elem_count()
-            )));
+                s.numel()
+            ));
         }
     }
     let inputs = &owned[..inputs.len()];
@@ -840,7 +845,14 @@ pub fn run(
     if n == 0 {
         return exprs
             .iter()
-            .map(|_| Tensor::zeros(shape, dtype, device))
+            .map(|_| match device {
+                Device::Cpu => Ok(crate::val::Val::Cpu(crate::runtime::cpu::Tensor::zeros(shape, dtype))),
+                Device::Metal => Ok(crate::val::Val::Metal(crate::runtime::metal::run::MetalTensor::zeros(
+                    crate::runtime::metal::device::MetalDevice::get(),
+                    shape.to_vec(),
+                    dtype,
+                ))),
+            })
             .collect();
     }
     let contig;
@@ -855,78 +867,61 @@ pub fn run(
         (Device::Cpu, DType::F32) => cpu_bridge_elementwise::<f32>(exprs, inputs, strides, scalars, n, shape),
         (Device::Cpu, DType::F64) => cpu_bridge_elementwise::<f64>(exprs, inputs, strides, scalars, n, shape),
         #[cfg(target_os = "macos")]
-        (Device::Metal(_), DType::F32) => {
+        (Device::Metal, DType::F32) => {
             metal::run(exprs, inputs, lane_strides, scalars, n, shape, device)
         }
-        _ => Err(candle_core::Error::Msg(format!(
-            "fusion: unsupported device/dtype {device:?} {dtype:?}"
-        ))),
+        _ => Err(format!("fusion: unsupported device/dtype {device:?} {dtype:?}")),
     }
 }
 
 fn cpu_bridge_elementwise<T: Scalar + crate::runtime::cpu::Elem>(
     exprs: &[Expr],
-    inputs: &[Tensor],
+    inputs: &[crate::val::Val],
     strides: Option<&[Vec<usize>]>,
-    scalars: &[Tensor],
+    scalars: &[crate::val::Val],
     n: usize,
     shape: &[usize],
-) -> candle_core::Result<Vec<Tensor>> {
-    let native_inputs: Vec<crate::runtime::cpu::Tensor> = inputs
-        .iter()
-        .map(crate::bridge::from_candle)
-        .collect::<candle_core::Result<_>>()?;
-    let native_scalars: Vec<crate::runtime::cpu::Tensor> = scalars
-        .iter()
-        .map(crate::bridge::from_candle)
-        .collect::<candle_core::Result<_>>()?;
-    let mut slices: Vec<&[T]> = Vec::with_capacity(native_inputs.len());
-    for t in &native_inputs {
-        slices.push(native_slice::<T>(t)?);
+) -> crate::err::Res<Vec<crate::val::Val>> {
+    let mut slices: Vec<&[T]> = Vec::with_capacity(inputs.len());
+    for v in inputs {
+        slices.push(native_slice::<T>(v)?);
     }
-    let mut scalar_values: Vec<T> = Vec::with_capacity(native_scalars.len());
-    for t in &native_scalars {
-        scalar_values.push(native_slice::<T>(t)?[0]);
+    let mut scalar_values: Vec<T> = Vec::with_capacity(scalars.len());
+    for v in scalars {
+        scalar_values.push(native_slice::<T>(v)?[0]);
     }
     let outs = interpret_core::<T>(exprs, &slices, strides, &scalar_values, n, shape);
     outs.into_iter()
         .map(|out| {
-            let t = crate::runtime::cpu::Tensor::from_vec(out, shape.to_vec());
-            crate::bridge::to_candle(&t)
+            Ok(crate::val::Val::Cpu(crate::runtime::cpu::Tensor::from_vec(out, shape.to_vec())))
         })
         .collect()
 }
 
-fn native_slice<'a, T: crate::runtime::cpu::Elem>(t: &'a crate::runtime::cpu::Tensor) -> candle_core::Result<&'a [T]> {
-    T::slice_of(t).ok_or_else(|| {
-        candle_core::Error::Msg(
-            "fusion: native bridge expects contiguous inputs of matching dtype".to_string(),
-        )
-    })
+fn native_slice<'a, T: crate::runtime::cpu::Elem>(v: &'a crate::val::Val) -> crate::err::Res<&'a [T]> {
+    let crate::val::Val::Cpu(t) = v else {
+        return Err("fusion: expected a CPU value".to_string());
+    };
+    T::slice_of(t).ok_or_else(|| "fusion: native bridge expects contiguous inputs of matching dtype".to_string())
 }
 
 #[allow(clippy::too_many_arguments)]
 fn cpu_bridge_reduce<T: Scalar + crate::runtime::cpu::Elem>(
     op: ReduceOp,
     expr: &Expr,
-    inputs: &[Tensor],
+    inputs: &[crate::val::Val],
     strides: &[Vec<usize>],
     in_shape: &[usize],
     dims: &[usize],
     keepdims: bool,
     out_shape: &[usize],
-) -> candle_core::Result<Tensor> {
-    let native_inputs: Vec<crate::runtime::cpu::Tensor> = inputs
-        .iter()
-        .map(crate::bridge::from_candle)
-        .collect::<candle_core::Result<_>>()?;
-    let mut slices: Vec<&[T]> = Vec::with_capacity(native_inputs.len());
-    for t in &native_inputs {
-        slices.push(native_slice::<T>(t)?);
+) -> crate::err::Res<crate::val::Val> {
+    let mut slices: Vec<&[T]> = Vec::with_capacity(inputs.len());
+    for v in inputs {
+        slices.push(native_slice::<T>(v)?);
     }
     let acc = interpret_reduce_core::<T>(op, expr, &slices, strides, in_shape, dims, keepdims, out_shape);
-    let t = crate::runtime::cpu::Tensor::from_vec(acc, out_shape.to_vec());
-    crate::bridge::to_candle(&t)
+    Ok(crate::val::Val::Cpu(crate::runtime::cpu::Tensor::from_vec(acc, out_shape.to_vec())))
 }
 
 /// Evaluates a fused-reduce region: `expr` is computed per input element
@@ -939,7 +934,7 @@ fn cpu_bridge_reduce<T: Scalar + crate::runtime::cpu::Elem>(
 pub fn run_reduce(
     op: ReduceOp,
     expr: &Expr,
-    inputs: &[Tensor],
+    inputs: &[crate::val::Val],
     strides: &[Vec<usize>],
     in_shape: &[usize],
     dims: &[usize],
@@ -947,22 +942,43 @@ pub fn run_reduce(
     out_shape: &[usize],
     dtype: DType,
     device: &Device,
-) -> candle_core::Result<Tensor> {
+) -> crate::err::Res<crate::val::Val> {
     if strides.len() != inputs.len() {
-        return Err(candle_core::Error::Msg(format!(
+        return Err(format!(
             "fusion: got {} stride entries for {} inputs",
             strides.len(),
             inputs.len()
-        )));
+        ));
     }
     let mut owned = Vec::with_capacity(inputs.len());
-    for t in inputs {
-        owned.push(if t.is_contiguous() { t.clone() } else { t.contiguous()? });
+    for v in inputs {
+        owned.push(match v {
+            crate::val::Val::Cpu(t) => crate::val::Val::Cpu(t.contiguous()),
+            crate::val::Val::Metal(t) => {
+                if t.layout.is_contiguous() {
+                    v.clone()
+                } else {
+                    crate::val::Val::Metal(
+                        crate::runtime::metal::kernels::strided_copy(
+                            crate::runtime::metal::device::MetalDevice::get(),
+                            t,
+                        )?,
+                    )
+                }
+            }
+        });
     }
     let inputs = &owned[..];
     let out_n: usize = out_shape.iter().product();
     if out_n == 0 {
-        return Tensor::zeros(out_shape, dtype, device);
+        return match device {
+            Device::Cpu => Ok(crate::val::Val::Cpu(crate::runtime::cpu::Tensor::zeros(out_shape, dtype))),
+            Device::Metal => Ok(crate::val::Val::Metal(crate::runtime::metal::run::MetalTensor::zeros(
+                crate::runtime::metal::device::MetalDevice::get(),
+                out_shape.to_vec(),
+                dtype,
+            ))),
+        };
     }
     match (device, dtype) {
         (Device::Cpu, DType::F32) => {
@@ -972,11 +988,9 @@ pub fn run_reduce(
             cpu_bridge_reduce::<f64>(op, expr, inputs, strides, in_shape, dims, keepdims, out_shape)
         }
         #[cfg(target_os = "macos")]
-        (Device::Metal(_), DType::F32) => {
+        (Device::Metal, DType::F32) => {
             metal::run_reduce(op, expr, inputs, strides, in_shape, dims, keepdims, out_shape, device)
         }
-        _ => Err(candle_core::Error::Msg(format!(
-            "fusion: unsupported device/dtype {device:?} {dtype:?}"
-        ))),
+        _ => Err(format!("fusion: unsupported device/dtype {device:?} {dtype:?}")),
     }
 }

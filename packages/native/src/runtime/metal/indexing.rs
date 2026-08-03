@@ -28,30 +28,31 @@ fn key(parts: &[u64]) -> u64 {
 pub fn index_select(dev: &MetalDevice, x: &MetalTensor, dim: usize, ids: &[u32]) -> Result<MetalTensor, String> {
     let shape = x.layout.shape();
     let rank = shape.len();
-    let dstride = x.layout.strides()[dim];
-    let kept: Vec<usize> = (0..rank).filter(|&d| d != dim).collect();
-    let kept_dims: Vec<usize> = kept.iter().map(|&d| shape[d]).collect();
-    let kept_strides: Vec<usize> = kept.iter().map(|&d| x.layout.strides()[d]).collect();
-    let kept_n: usize = kept_dims.iter().product();
     let l = ids.len();
     let mut out_shape = shape.to_vec();
     out_shape[dim] = l;
-    let out = MetalTensor::zeros(dev, out_shape, x.dtype);
-    let total = kept_n * l;
+    let total: usize = out_shape.iter().product();
+    let out = MetalTensor::zeros(dev, out_shape.clone(), x.dtype);
     if total == 0 {
         return Ok(out);
     }
     let ty = msl_type(x.dtype);
-    let kept_rank = kept.len();
+    let offset = x.layout.offset();
+    let strides = x.layout.strides();
     let mut decompose = String::new();
-    for k in (0..kept_rank).rev() {
-        let c = kept_dims[k];
-        let s = kept_strides[k];
-        if k == kept_rank - 1 {
-            decompose.push_str(&format!("        base += (kept_i % {c}u) * {s}u;\n"));
+    for d in (0..rank).rev() {
+        let c = out_shape[d];
+        let s = strides[d];
+        let coord = if d == rank - 1 {
+            format!("gid % {c}u")
         } else {
-            let div: usize = kept_dims[k + 1..].iter().product();
-            decompose.push_str(&format!("        base += ((kept_i / {div}u) % {c}u) * {s}u;\n"));
+            let div: usize = out_shape[d + 1..].iter().product();
+            format!("(gid / {div}u) % {c}u")
+        };
+        if d == dim {
+            decompose.push_str(&format!("        base += ids[{coord}] * {s}u;\n"));
+        } else {
+            decompose.push_str(&format!("        base += ({coord}) * {s}u;\n"));
         }
     }
     let src = format!(
@@ -64,16 +65,13 @@ kernel void et_isel(
     device {ty}* out [[buffer(2)]],
     uint gid [[thread_position_in_grid]]
 ) {{
-    const uint L = {l}u;
-    const uint kept_i = gid / L;
-    const uint j = gid % L;
     if (gid >= {total}u) return;
-    uint base = 0u;
-{decompose}    out[gid] = x[base + ids[j] * {dstride}u];
+    uint base = {offset}u;
+{decompose}    out[gid] = x[base];
 }}
 "#
     );
-    let pipeline = dev.compile(key(&[0x15E1, x.dtype as u64, dim as u64, l as u64, kept_n as u64]), &src, "et_isel")?;
+    let pipeline = dev.compile(key(&[0x15E1, x.dtype as u64, dim as u64, l as u64, key(&out_shape.iter().map(|&v| v as u64).collect::<Vec<_>>()), key(&strides.iter().map(|&v| v as u64).collect::<Vec<_>>())]), &src, "et_isel")?;
     let ids_buf = dev.alloc_with_data_u32(ids);
     let padded = total.div_ceil(256) * 256;
     dev.with_encoder(|e| {
@@ -129,7 +127,7 @@ kernel void et_gather(
 }}
 "#
     );
-    let pipeline = dev.compile(key(&[0x6A7E, x.dtype as u64, dim as u64, total as u64]), &src, "et_gather")?;
+    let pipeline = dev.compile(key(&[0x6A7E, x.dtype as u64, dim as u64, key(&ids_shape.iter().map(|&v| v as u64).collect::<Vec<_>>()), key(&strides.iter().map(|&v| v as u64).collect::<Vec<_>>())]), &src, "et_gather")?;
     let ids_buf = dev.alloc_with_data_u32(ids);
     let padded = total.div_ceil(256) * 256;
     dev.with_encoder(|e| {
@@ -157,7 +155,6 @@ pub fn scatter_add(dev: &MetalDevice, x: &MetalTensor, dim: usize, ids: &[u32], 
     if total == 0 {
         return Ok(out);
     }
-    let ty = msl_type(x.dtype);
     let out_strides = crate::runtime::layout::Layout::contiguous(shape.to_vec());
     let os = out_strides.strides().to_vec();
     let src_strides = src_t.layout.strides().to_vec();
@@ -196,7 +193,7 @@ kernel void et_sadd(
 }}
 "#
     );
-    let pipeline = dev.compile(key(&[0x5ADD, x.dtype as u64, dim as u64, total as u64]), &src, "et_sadd")?;
+    let pipeline = dev.compile(key(&[0x5ADD, x.dtype as u64, dim as u64, key(&ids_shape.iter().map(|&v| v as u64).collect::<Vec<_>>()), key(&os.iter().map(|&v| v as u64).collect::<Vec<_>>()), key(&src_strides.iter().map(|&v| v as u64).collect::<Vec<_>>())]), &src, "et_sadd")?;
     let ids_buf = dev.alloc_with_data_u32(ids);
     let padded = total.div_ceil(256) * 256;
     dev.with_encoder(|e| {
@@ -250,7 +247,7 @@ kernel void et_cat(
 "#,
         outdim = out_shape[dim]
     );
-    let pipeline = dev.compile(key(&[0xCA7, dtype as u64, dim as u64, inner as u64]), &src, "et_cat")?;
+    let pipeline = dev.compile(key(&[0xCA7, dtype as u64, dim as u64, inner as u64, outer as u64, out_shape[dim] as u64]), &src, "et_cat")?;
     let mut dim_off = 0usize;
     for t in tensors {
         let tc = super::kernels::strided_copy(dev, t)?;
@@ -271,6 +268,66 @@ kernel void et_cat(
         dim_off += tdim;
     }
     Ok(out)
+}
+
+pub fn scatter_set(dev: &MetalDevice, x: &MetalTensor, dim: usize, ids: &[u32], src_t: &MetalTensor) -> Result<(), String> {
+    let shape = x.layout.shape();
+    let rank = shape.len();
+    let ids_shape = src_t.layout.shape().to_vec();
+    let total: usize = ids_shape.iter().product();
+    if total == 0 {
+        return Ok(());
+    }
+    let ty = msl_type(x.dtype);
+    let out_strides = crate::runtime::layout::Layout::contiguous(shape.to_vec());
+    let os = out_strides.strides().to_vec();
+    let src_strides = src_t.layout.strides().to_vec();
+    let mut decompose = String::new();
+    let mut src_decompose = String::new();
+    for d in (0..rank).rev() {
+        let c = ids_shape[d];
+        let div: usize = ids_shape[d + 1..].iter().product::<usize>().max(1);
+        let coord = format!("((gid / {div}u) % {c}u)");
+        if d == dim {
+            decompose.push_str(&format!("        base += ids[gid] * {}u;\n", os[d]));
+        } else {
+            decompose.push_str(&format!("        base += {coord} * {}u;\n", os[d]));
+        }
+        let ss = src_strides[d];
+        if ss == 1 {
+            src_decompose.push_str(&format!("        src_off += {coord};\n"));
+        } else {
+            src_decompose.push_str(&format!("        src_off += {coord} * {ss}u;\n"));
+        }
+    }
+    let src = format!(
+        r#"
+#include <metal_stdlib>
+using namespace metal;
+kernel void et_sset(
+    device {ty}* out [[buffer(0)]],
+    device const uint* ids [[buffer(1)]],
+    device const {ty}* src [[buffer(2)]],
+    uint gid [[thread_position_in_grid]]
+) {{
+    if (gid >= {total}u) return;
+    uint base = 0u;
+{decompose}    uint src_off = 0u;
+{src_decompose}    out[base] = src[src_off];
+}}
+"#
+    );
+    let pipeline = dev.compile(key(&[0x55E7, x.dtype as u64, dim as u64, key(&ids_shape.iter().map(|&v| v as u64).collect::<Vec<_>>()), key(&os.iter().map(|&v| v as u64).collect::<Vec<_>>()), key(&src_strides.iter().map(|&v| v as u64).collect::<Vec<_>>())]), &src, "et_sset")?;
+    let ids_buf = dev.alloc_with_data_u32(ids);
+    let padded = total.div_ceil(256) * 256;
+    dev.with_encoder(|e| {
+        e.setComputePipelineState(pipeline.as_raw());
+        set_buffer(e, 0, &x.buffer, x.layout.offset() * x.dtype.size_in_bytes());
+        set_buffer(e, 1, &ids_buf, 0);
+        set_buffer(e, 2, &src_t.buffer, src_t.layout.offset() * src_t.dtype.size_in_bytes());
+        e.dispatchThreads_threadsPerThreadgroup(MetalDevice::grid(padded, 1, 1), MetalDevice::grid(256, 1, 1));
+    });
+    Ok(())
 }
 
 #[cfg(test)]

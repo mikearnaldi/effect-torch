@@ -4,14 +4,11 @@
 //! plain reduce ops host-side instead of another kernel family. CPU
 //! keeps the composed path in lib.rs.
 
-use candle_core::{DType, Device, Tensor};
+use crate::runtime::metal::run::MetalTensor;
 
 /// Whether the fused layer-norm path can run: Metal, f32, last-dim norm.
-pub fn is_supported(x: &Tensor, weight: &Tensor) -> bool {
-    matches!(x.device(), Device::Metal(_))
-        && x.dtype() == DType::F32
-        && weight.dtype() == DType::F32
-        && x.dim(candle_core::D::Minus1).is_ok()
+pub fn is_supported(x: &MetalTensor, weight: &MetalTensor) -> bool {
+    x.dtype == crate::runtime::dtype::DType::F32 && weight.dtype == crate::runtime::dtype::DType::F32
 }
 
 #[cfg(target_os = "macos")]
@@ -19,22 +16,19 @@ pub use metal::{ln_backward, ln_forward};
 
 #[cfg(target_os = "macos")]
 mod metal {
-    use crate::bridge;
     use crate::runtime::metal::device::{set_buffer, set_bytes, MetalDevice, Pipeline};
     use crate::runtime::metal::run::MetalTensor;
-    use candle_core::{DType, Tensor};
+
     use objc2_metal::MTLComputeCommandEncoder;
     use std::sync::Arc;
 
     const NT: usize = 128;
 
-    fn wrap_contig(t: &Tensor) -> candle_core::Result<MetalTensor> {
-        let w = bridge::metal::wrap(t)?;
-        if w.layout.is_contiguous() {
-            Ok(w)
+    fn wrap_contig(t: &MetalTensor) -> crate::err::Res<MetalTensor> {
+        if t.layout.is_contiguous() {
+            Ok(t.clone())
         } else {
-            crate::runtime::metal::kernels::strided_copy(MetalDevice::get(), &w)
-                .map_err(candle_core::Error::Msg)
+            crate::runtime::metal::kernels::strided_copy(MetalDevice::get(), t)
         }
     }
 
@@ -160,36 +154,34 @@ kernel void et_ln_bwd(
 "#
     }
 
-    fn pipeline(_mdev: &candle_core::MetalDevice, name: &'static str) -> candle_core::Result<Pipeline> {
+    fn pipeline(name: &'static str) -> crate::err::Res<Pipeline> {
         use std::collections::hash_map::DefaultHasher;
         use std::hash::{Hash, Hasher};
 
         let mut hasher = DefaultHasher::new();
         name.hash(&mut hasher);
         let key = hasher.finish();
-        MetalDevice::get()
-            .compile(key, source(), name)
-            .map_err(candle_core::Error::Msg)
+        MetalDevice::get().compile(key, source(), name)
     }
 
-    fn wrap(buf: Arc<crate::runtime::metal::device::Buffer>, mdev: &candle_core::MetalDevice, n: usize, shape: Vec<usize>) -> candle_core::Result<Tensor> {
+    fn wrap(buf: Arc<crate::runtime::metal::device::Buffer>, n: usize, shape: Vec<usize>) -> crate::err::Res<MetalTensor> {
         let _ = n;
-        bridge::metal::unwrap(&buf, shape, DType::F32, mdev)
+        Ok(MetalTensor {
+            buffer: buf,
+            layout: crate::runtime::layout::Layout::contiguous(shape),
+            dtype: crate::runtime::dtype::DType::F32,
+        })
     }
 
-    pub fn ln_forward(x: &Tensor, weight: &Tensor, bias: &Tensor, eps: f64) -> candle_core::Result<Tensor> {
-        let rank = x.rank();
-        let d = weight.elem_count();
-        let rows = x.elem_count() / d;
-        let device = x.device();
-        let mdev = device.as_metal_device()?;
+    pub fn ln_forward(x: &MetalTensor, weight: &MetalTensor, bias: &MetalTensor, eps: f64) -> crate::err::Res<MetalTensor> {
+        let d = weight.numel();
+        let rows = x.numel() / d;
         let x = wrap_contig(x)?;
         let weight = wrap_contig(weight)?;
         let bias = wrap_contig(bias)?;
-        device.synchronize()?;
         let out_buf = alloc_f32(x.numel());
-        let pipe = pipeline(mdev, "et_ln_fwd")?;
-        let off = |o: usize| o * DType::F32.size_in_bytes();
+        let pipe = pipeline("et_ln_fwd")?;
+        let off = |o: usize| o * 4;
         MetalDevice::get().with_encoder(|e| {
             e.setComputePipelineState(pipe.as_raw());
             set_buffer(e, 0, &x.buffer, off(x.layout.offset()));
@@ -204,24 +196,20 @@ kernel void et_ln_bwd(
             );
         });
         MetalDevice::get().synchronize();
-        wrap(out_buf, mdev, x.numel(), x.layout.shape().to_vec())
+        wrap(out_buf, x.numel(), x.layout.shape().to_vec())
     }
 
     // Returns (dx, x̂) — dw/db are computed host-side from x̂.
-    pub fn ln_backward(x: &Tensor, weight: &Tensor, g: &Tensor, eps: f64) -> candle_core::Result<(Tensor, Tensor)> {
-        let rank = x.rank();
-        let d = weight.elem_count();
-        let rows = x.elem_count() / d;
-        let device = x.device();
-        let mdev = device.as_metal_device()?;
+    pub fn ln_backward(x: &MetalTensor, weight: &MetalTensor, g: &MetalTensor, eps: f64) -> crate::err::Res<(MetalTensor, MetalTensor)> {
+        let d = weight.numel();
+        let rows = x.numel() / d;
         let x = wrap_contig(x)?;
         let weight = wrap_contig(weight)?;
         let g = wrap_contig(g)?;
-        device.synchronize()?;
         let dx_buf = alloc_f32(x.numel());
         let xh_buf = alloc_f32(x.numel());
-        let pipe = pipeline(mdev, "et_ln_bwd")?;
-        let off = |o: usize| o * DType::F32.size_in_bytes();
+        let pipe = pipeline("et_ln_bwd")?;
+        let off = |o: usize| o * 4;
         MetalDevice::get().with_encoder(|e| {
             e.setComputePipelineState(pipe.as_raw());
             set_buffer(e, 0, &x.buffer, off(x.layout.offset()));
@@ -238,19 +226,9 @@ kernel void et_ln_bwd(
         });
         MetalDevice::get().synchronize();
         Ok((
-            wrap(dx_buf, mdev, x.numel(), x.layout.shape().to_vec())?,
-            wrap(xh_buf, mdev, x.numel(), x.layout.shape().to_vec())?,
+            wrap(dx_buf, x.numel(), x.layout.shape().to_vec())?,
+            wrap(xh_buf, x.numel(), x.layout.shape().to_vec())?,
         ))
     }
 }
 
-#[cfg(not(target_os = "macos"))]
-mod metal {
-    use candle_core::Tensor;
-    pub fn ln_forward(_x: &Tensor, _w: &Tensor, _b: &Tensor, _eps: f64) -> candle_core::Result<Tensor> {
-        unreachable!("fused layer norm is Metal-only")
-    }
-    pub fn ln_backward(_x: &Tensor, _w: &Tensor, _g: &Tensor, _eps: f64) -> candle_core::Result<(Tensor, Tensor)> {
-        unreachable!("fused layer norm is Metal-only")
-    }
-}

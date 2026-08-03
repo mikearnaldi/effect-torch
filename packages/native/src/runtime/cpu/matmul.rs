@@ -1,6 +1,5 @@
 use super::tensor::{CpuBuffer, Elem, Tensor};
 use crate::runtime::layout::broadcast_shape;
-use half::{bf16, f16};
 
 fn naive_gemm<T: Elem + std::ops::Add<Output = T> + std::ops::Mul<Output = T>>(
     a: &[T],
@@ -97,8 +96,12 @@ impl Tensor {
         match (&a_c.buffer, &b_c.buffer) {
             (CpuBuffer::F32(a), CpuBuffer::F32(b)) => go!(a, b, f32, |a, b, o, m, n, k| sgemm(a, b, o, m, n, k)),
             (CpuBuffer::F64(a), CpuBuffer::F64(b)) => go!(a, b, f64, |a, b, o, m, n, k| dgemm(a, b, o, m, n, k)),
-            (CpuBuffer::F16(a), CpuBuffer::F16(b)) => go!(a, b, f16, |a, b, o, m, n, k| half_gemm_f32(a, b, o, m, n, k, |x: f16| x.to_f32(), f16::from_f32)),
-            (CpuBuffer::BF16(a), CpuBuffer::BF16(b)) => go!(a, b, bf16, |a, b, o, m, n, k| half_gemm_f32(a, b, o, m, n, k, |x: bf16| x.to_f32(), bf16::from_f32)),
+            (CpuBuffer::F16(_), CpuBuffer::F16(_)) => {
+                panic!("f16 matmul is not supported on the CPU backend")
+            }
+            (CpuBuffer::BF16(_), CpuBuffer::BF16(_)) => {
+                panic!("bf16 matmul is not supported on the CPU backend")
+            }
             (CpuBuffer::U8(a), CpuBuffer::U8(b)) => go!(a, b, u8, naive_gemm),
             (CpuBuffer::U32(a), CpuBuffer::U32(b)) => go!(a, b, u32, naive_gemm),
             (CpuBuffer::I64(a), CpuBuffer::I64(b)) => go!(a, b, i64, naive_gemm),

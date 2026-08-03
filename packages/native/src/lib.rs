@@ -1,13 +1,17 @@
-use candle_core::{CpuStorage, DType, Device, Storage, Tensor};
-use candle_core::D;
+use runtime::dtype::DType;
+use dev::Device;
+
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, OnceLock};
 
-mod bridge;
-mod metal_eval;
+mod dev;
+mod safetensors;
+mod err;
+mod metal_native;
+mod val;
 mod fusion;
 mod flash;
 mod gemm;
@@ -18,144 +22,12 @@ mod rotary;
 mod runtime;
 mod tokenizer;
 
-fn to_napi_err(err: candle_core::Error) -> Error {
-    Error::new(Status::GenericFailure, err.to_string())
+fn to_napi_err(err: String) -> Error {
+    Error::new(Status::GenericFailure, err)
 }
 
 fn to_join_err(err: tokio::task::JoinError) -> Error {
     Error::new(Status::GenericFailure, err.to_string())
-}
-
-// Applies a rank-2 linalg kernel to each matrix of a batched [..., n, m]
-// tensor and stacks the results back into the leading shape.
-fn batch_linalg(
-    t: &Tensor,
-    f: &dyn Fn(&Tensor) -> candle_core::Result<Tensor>,
-) -> candle_core::Result<Tensor> {
-    let dims = t.dims();
-    let rank = dims.len();
-    if rank == 2 {
-        return f(t);
-    }
-    let (n, m) = (dims[rank - 2], dims[rank - 1]);
-    let batch: usize = dims[..rank - 2].iter().product();
-    if batch == 0 {
-        return Err(candle_core::Error::Msg("linalg: empty batch".to_string()));
-    }
-    let flat = t.reshape((batch, n, m))?;
-    let mut outs = Vec::with_capacity(batch);
-    for i in 0..batch {
-        outs.push(f(&flat.get(i)?)?);
-    }
-    let mut out_shape: Vec<usize> = dims[..rank - 2].to_vec();
-    out_shape.extend_from_slice(outs[0].dims());
-    Tensor::stack(&outs, 0)?.reshape(out_shape)
-}
-
-fn batch_solve(a: &Tensor, b: &Tensor) -> candle_core::Result<Tensor> {
-    let dims = a.dims();
-    let rank = dims.len();
-    if rank == 2 {
-        return cpu_inverse(a)?.matmul(b);
-    }
-    let n = dims[rank - 2];
-    let k = b.dims()[rank - 1];
-    let batch: usize = dims[..rank - 2].iter().product();
-    if batch == 0 {
-        return Err(candle_core::Error::Msg("linalg: empty batch".to_string()));
-    }
-    let a_flat = a.reshape((batch, n, n))?;
-    let b_flat = b.reshape((batch, n, k))?;
-    let mut outs = Vec::with_capacity(batch);
-    for i in 0..batch {
-        outs.push(cpu_inverse(&a_flat.get(i)?)?.matmul(&b_flat.get(i)?)?);
-    }
-    Tensor::stack(&outs, 0)?.reshape(b.shape())
-}
-
-fn conv_out_dim(
-    input: usize,
-    kernel: usize,
-    stride: usize,
-    padding: usize,
-    dilation: usize,
-) -> std::result::Result<usize, String> {
-    let effective = dilation * (kernel - 1) + 1;
-    if input + 2 * padding < effective {
-        return Err(format!(
-            "conv: kernel of effective size {effective} exceeds the padded input size {}",
-            input + 2 * padding
-        ));
-    }
-    Ok((input + 2 * padding - effective) / stride + 1)
-}
-
-// dW for a 2-D convolution: im2col of the (padded) input contracted with
-// the flattened cotangent, computed per group with on-device candle ops.
-fn conv2d_backward_w(
-    x: &Tensor,
-    g: &Tensor,
-    kernel: [usize; 2],
-    out_channels: usize,
-    stride: usize,
-    padding: usize,
-    dilation: usize,
-    groups: usize,
-) -> candle_core::Result<Tensor> {
-    let (n, c_in, _, _) = x.dims4()?;
-    let (_, _, oh, ow) = g.dims4()?;
-    let (kh, kw) = (kernel[0], kernel[1]);
-    let c_per = c_in / groups;
-    let cout_per = out_channels / groups;
-    let mut group_outs = Vec::with_capacity(groups);
-    for gi in 0..groups {
-        let xg = x.narrow(1, gi * c_per, c_per)?;
-        let gg = g.narrow(1, gi * cout_per, cout_per)?;
-        let xp = if padding > 0 {
-            xg.pad_with_zeros(2, padding, padding)?
-                .pad_with_zeros(3, padding, padding)?
-        } else {
-            xg
-        };
-        let mut windows = Vec::with_capacity(kh * kw);
-        for ky in 0..kh {
-            for kx in 0..kw {
-                let mut win = xp
-                    .narrow(2, ky * dilation, (oh - 1) * stride + 1)?
-                    .narrow(3, kx * dilation, (ow - 1) * stride + 1)?;
-                if stride > 1 {
-                    let idx_h = Tensor::arange_step(
-                        0u32,
-                        ((oh - 1) * stride + 1) as u32,
-                        stride as u32,
-                        win.device(),
-                    )?;
-                    let idx_w = Tensor::arange_step(
-                        0u32,
-                        ((ow - 1) * stride + 1) as u32,
-                        stride as u32,
-                        win.device(),
-                    )?;
-                    win = win
-                        .contiguous()?
-                        .index_select(&idx_h, 2)?
-                        .index_select(&idx_w, 3)?;
-                }
-                windows.push(win);
-            }
-        }
-        let stacked = Tensor::stack(&windows, 0)?;
-        let cols = stacked
-            .permute([1usize, 3, 4, 2, 0])?
-            .contiguous()?
-            .reshape((n * oh * ow, c_per * kh * kw))?;
-        let g2 = gg
-            .permute([1usize, 0, 2, 3])?
-            .contiguous()?
-            .reshape((cout_per, n * oh * ow))?;
-        group_outs.push(g2.matmul(&cols)?.reshape((cout_per, c_per, kh, kw))?);
-    }
-    Tensor::cat(&group_outs, 0)
 }
 
 fn conv_check(
@@ -240,192 +112,27 @@ fn sdpa_check(op: &str, q: &Node, k: &Node, v: &Node) -> std::result::Result<Vec
     Ok(out)
 }
 
-// The additive causal mask [T, S]: 0 where j <= i + (S - T) (the offset
-// right-aligns the window, so single-row queries against a longer cache
-// attend to everything up to the current position), -inf elsewhere.
-fn sdpa_causal_additive_mask(t: usize, s: usize, dtype: DType, device: &Device) -> candle_core::Result<Tensor> {
-    let i = Tensor::arange(0u32, t as u32, device)?.reshape((t, 1))?;
-    let j = Tensor::arange(0u32, s as u32, device)?.reshape((1, s))?;
-    let allowed = j.broadcast_le(&(i + s.saturating_sub(t) as f64)?)?;
-    let zeros = Tensor::zeros((t, s), dtype, device)?;
-    let neg = match dtype {
-        DType::F32 => Tensor::full(f32::NEG_INFINITY, (t, s), device)?,
-        DType::F64 => Tensor::full(f64::NEG_INFINITY, (t, s), device)?,
-        dtype => return Err(candle_core::Error::UnsupportedDTypeForOp(dtype, "sdpa").bt()),
-    };
-    allowed.where_cond(&zeros, &neg)
-}
-
-// The multiplicative gate [T, S]: 1 where attention is allowed, 0
-// elsewhere — masks the score gradients in the backward pass.
-fn sdpa_causal_gate(t: usize, s: usize, dtype: DType, device: &Device) -> candle_core::Result<Tensor> {
-    let i = Tensor::arange(0u32, t as u32, device)?.reshape((t, 1))?;
-    let j = Tensor::arange(0u32, s as u32, device)?.reshape((1, s))?;
-    let allowed = j.broadcast_le(&(i + s.saturating_sub(t) as f64)?)?;
-    let ones = Tensor::ones((t, s), dtype, device)?;
-    allowed.where_cond(&ones, &ones.zeros_like()?)
-}
-
-// Softmax over the last dim with max-subtraction (matching the composed
-// Tensor.softmax path op for op).
-fn sdpa_softmax(t: &Tensor) -> candle_core::Result<Tensor> {
-    let m = t.max(D::Minus1)?.unsqueeze(D::Minus1)?;
-    let e = t.broadcast_sub(&m)?.exp()?;
-    let s = e.sum(D::Minus1)?.unsqueeze(D::Minus1)?;
-    e.broadcast_div(&s)
-}
-
-fn sdpa_scores(q: &Tensor, k: &Tensor, scale: f64, causal: bool) -> candle_core::Result<Tensor> {
-    let rank = q.rank();
-    let kt = k.transpose(rank - 2, rank - 1)?.contiguous()?;
-    let s = q.contiguous()?.broadcast_matmul(&kt)?;
-    let s = (s * scale)?;
-    if causal {
-        let dims = s.dims();
-        let (t, sq) = (dims[rank - 2], dims[rank - 1]);
-        s.broadcast_add(&sdpa_causal_additive_mask(t, sq, s.dtype(), s.device())?)
-    } else {
-        Ok(s)
-    }
-}
-
-// The reference implementation: composed candle ops. A fused flash
-// kernel replaces this arm (and only this arm) when it lands.
-fn sdpa_forward(q: &Tensor, k: &Tensor, v: &Tensor, scale: f64, causal: bool) -> candle_core::Result<Tensor> {
-    let s = sdpa_scores(q, k, scale, causal)?;
-    let p = sdpa_softmax(&s)?;
-    p.broadcast_matmul(&v.contiguous()?)
-}
-
-// Closed-form backward, recomputing P from q/k (retains nothing beyond
-// the caller's tensors): dV = Pᵀ·g, dP = g·Vᵀ, dS = P ∘ (dP − Σ(P∘dP)),
-// dQ = dS·K·scale, dK = dSᵀ·Q·scale.
-fn sdpa_backward(
-    q: &Tensor,
-    k: &Tensor,
-    v: &Tensor,
-    g: &Tensor,
-    scale: f64,
-    causal: bool,
-) -> candle_core::Result<(Tensor, Tensor, Tensor)> {
-    let rank = q.rank();
-    let s = sdpa_scores(q, k, scale, causal)?;
-    let p = sdpa_softmax(&s)?;
-    let g = g.contiguous()?;
-    let dv = p
-        .transpose(rank - 2, rank - 1)?
-        .contiguous()?
-        .broadcast_matmul(&g)?;
-    let dp = g.broadcast_matmul(&v.transpose(rank - 2, rank - 1)?.contiguous()?)?;
-    let dp_sum = (&p * &dp)?.sum(D::Minus1)?.unsqueeze(D::Minus1)?;
-    let mut ds = (&p * &dp.broadcast_sub(&dp_sum)?)?;
-    if causal {
-        let dims = ds.dims();
-        let (t, sq) = (dims[rank - 2], dims[rank - 1]);
-        ds = ds.broadcast_mul(&sdpa_causal_gate(t, sq, ds.dtype(), ds.device())?)?;
-    }
-    let dq = (ds.broadcast_matmul(&k.contiguous()?)? * scale)?;
-    let dk = (ds
-        .transpose(rank - 2, rank - 1)?
-        .contiguous()?
-        .broadcast_matmul(&q.contiguous()?)?
-        * scale)?;
-    Ok((dq, dk, dv))
-}
-
-// u8 mask that is 1 where target == ignore_index. A negative ignore_index
-// can never match a u32 target, so u32 targets are all active in that case.
-fn cross_entropy_ignored_mask(target: &Tensor, ignore_index: i64) -> candle_core::Result<Tensor> {
-    match target.dtype() {
-        DType::I64 => target.eq(ignore_index),
-        DType::U32 => {
-            if ignore_index < 0 || ignore_index > u32::MAX as i64 {
-                // u8 zeros, not zeros_like: Metal has no u32-cond where_cond
-                Tensor::zeros(target.shape(), DType::U8, target.device())
-            } else {
-                target.eq(ignore_index as u32)
-            }
-        }
-        dtype => Err(candle_core::Error::UnsupportedDTypeForOp(dtype, "cross_entropy").bt()),
-    }
-}
-
-fn cross_entropy_active_count(target: &Tensor, ignored: &Tensor) -> candle_core::Result<f64> {
-    let total = target.elem_count() as f64;
-    // f32: counts are small integers, exact, and Metal has no u8 -> f64 cast
-    let ignored_count = ignored.to_dtype(DType::F32)?.sum_all()?.to_vec0::<f32>()? as f64;
-    Ok(total - ignored_count)
-}
-
-fn cross_entropy_check_labels(target: &Tensor, ignored: &Tensor, classes: usize) -> candle_core::Result<()> {
-    let invalid = match target.dtype() {
-        DType::I64 => (target.lt(0i64)? + target.ge(classes as i64)?)?,
-        DType::U32 => target.ge(classes as u32)?,
-        dtype => {
-            return Err(candle_core::Error::UnsupportedDTypeForOp(dtype, "cross_entropy").bt())
-        }
-    };
-    let active = ignored.eq(&ignored.zeros_like()?)?;
-    let invalid_active = (invalid * active)?.to_dtype(DType::F32)?.sum_all()?.to_vec0::<f32>()?;
-    if invalid_active > 0.0 {
-        return Err(candle_core::Error::Msg(format!(
-            "cross_entropy: target out of range [0, {classes}) at an active position"
-        )));
-    }
-    Ok(())
-}
-
-fn cross_entropy_forward(logits: &Tensor, target: &Tensor, ignore_index: i64) -> candle_core::Result<Tensor> {
-    let rank = logits.rank();
-    let classes = logits.dim(rank - 1)?;
-    let ignored = cross_entropy_ignored_mask(target, ignore_index)?;
-    let count = cross_entropy_active_count(target, &ignored)?;
-    if count == 0.0 {
-        return Err(candle_core::Error::Msg(
-            "cross_entropy: no active targets (all positions are ignored)".to_string(),
+fn conv_out_dim(
+    input: usize,
+    kernel: usize,
+    stride: usize,
+    padding: usize,
+    dilation: usize,
+) -> std::result::Result<usize, String> {
+    let effective = dilation * (kernel - 1) + 1;
+    if input + 2 * padding < effective {
+        return Err(format!(
+            "conv: kernel of effective size {effective} exceeds the padded input size {}",
+            input + 2 * padding
         ));
     }
-    cross_entropy_check_labels(target, &ignored, classes)?;
-    let lse = logits.log_sum_exp(rank - 1)?;
-    // ignored positions may hold out-of-range values (e.g. -100); gather at 0
-    // there instead and mask the result below
-    let safe_target = ignored.where_cond(&target.zeros_like()?, target)?;
-    let picked = logits
-        .gather(&safe_target.unsqueeze(rank - 1)?.contiguous()?, rank - 1)?
-        .reshape(target.shape())?;
-    let per_position = (lse - picked)?;
-    let masked = ignored.where_cond(&per_position.zeros_like()?, &per_position)?;
-    masked.sum_all()? * (1.0 / count)
+    Ok((input + 2 * padding - effective) / stride + 1)
 }
 
-fn cross_entropy_backward(logits: &Tensor, target: &Tensor, ignore_index: i64) -> candle_core::Result<Tensor> {
-    let rank = logits.rank();
-    let classes = logits.dim(rank - 1)?;
-    let ignored = cross_entropy_ignored_mask(target, ignore_index)?;
-    let count = cross_entropy_active_count(target, &ignored)?;
-    if count == 0.0 {
-        return Err(candle_core::Error::Msg(
-            "cross_entropy: no active targets (all positions are ignored)".to_string(),
-        ));
-    }
-    // p = softmax(logits) computed as exp(z - logsumexp(z))
-    let lse = logits.log_sum_exp(rank - 1)?.unsqueeze(rank - 1)?;
-    let probs = (logits - &lse.broadcast_as(logits.shape())?)?.exp()?;
-    // one-hot at the target positions, zeroed where ignored
-    let classes_ix = Tensor::arange(0u32, classes as u32, logits.device())?
-        .to_dtype(target.dtype())?
-        .broadcast_as(logits.shape())?;
-    let one_hot = target.unsqueeze(rank - 1)?.broadcast_as(logits.shape())?.eq(&classes_ix)?;
-    let ignored_b = ignored.unsqueeze(rank - 1)?.broadcast_as(one_hot.shape())?;
-    let one_hot = ignored_b.where_cond(&one_hot.zeros_like()?, &one_hot)?;
-    let grad = (probs - one_hot.to_dtype(logits.dtype())?)? * (1.0 / count);
-    let grad = grad?;
-    ignored_b.where_cond(&grad.zeros_like()?, &grad)
-}
-
-fn exported_buffers() -> &'static Mutex<HashSet<usize>> {
-    static EXPORTED: OnceLock<Mutex<HashSet<usize>>> = OnceLock::new();
-    EXPORTED.get_or_init(|| Mutex::new(HashSet::new()))
+#[cfg(debug_assertions)]
+fn exported_buffers() -> &'static Mutex<std::collections::HashSet<usize>> {
+    static BUFFERS: OnceLock<Mutex<std::collections::HashSet<usize>>> = OnceLock::new();
+    BUFFERS.get_or_init(|| Mutex::new(std::collections::HashSet::new()))
 }
 
 #[cfg(debug_assertions)]
@@ -445,7 +152,7 @@ fn unregister_export(#[allow(unused)] addr: usize) {
 
 enum FinalizeHint {
     ZeroCopy {
-        tensor: Tensor,
+        tensor: val::Val,
         addr: usize,
     },
     Owned {
@@ -546,16 +253,7 @@ impl From<NativeDType> for DType {
 }
 
 fn dtype_name(dtype: DType) -> &'static str {
-    match dtype {
-        DType::U8 => "u8",
-        DType::U32 => "u32",
-        DType::I64 => "i64",
-        DType::BF16 => "bf16",
-        DType::F16 => "f16",
-        DType::F32 => "f32",
-        DType::F64 => "f64",
-        _ => "unknown",
-    }
+    dtype.name()
 }
 
 fn get_device(device: Option<String>) -> Result<Device> {
@@ -564,14 +262,8 @@ fn get_device(device: Option<String>) -> Result<Device> {
         "metal" => {
             #[cfg(target_os = "macos")]
             {
-                static METAL: OnceLock<Device> = OnceLock::new();
-                match METAL.get() {
-                    Some(device) => Ok(device.clone()),
-                    None => {
-                        let device = Device::new_metal(0).map_err(to_napi_err)?;
-                        Ok(METAL.get_or_init(|| device).clone())
-                    }
-                }
+                static METAL: OnceLock<dev::Device> = OnceLock::new();
+                Ok(METAL.get_or_init(|| dev::Device::Metal).clone())
             }
             #[cfg(not(target_os = "macos"))]
             {
@@ -610,20 +302,20 @@ fn get_device(device: Option<String>) -> Result<Device> {
 
 #[napi(custom_finalize)]
 pub struct NativeTensor {
-    pub(crate) inner: Tensor,
+    pub(crate) inner: val::Val,
     bytes: i64,
 }
 
 impl NativeTensor {
-    fn wrap(inner: Tensor) -> Self {
+    fn wrap(inner: val::Val) -> Self {
         // Buffers cost at least a memory page regardless of the tensor's
         // logical size (Metal allocates 4KB-granular, malloc similar). Without
         // reporting that floor, a stream of tiny tensors looks free to V8 and
         // collection is deferred indefinitely — the backend allocator then
-        // can't reuse the pooled buffers (candle's Metal pool requires
+        // can't reuse the pooled buffers (the pool requires
         // strong_count == 1) and both memory and per-allocation cost grow
         // without bound.
-        let bytes = (inner.elem_count() * inner.dtype().size_in_bytes()).max(4096) as i64;
+        let bytes = inner.byte_size().max(4096) as i64;
         Self { inner, bytes }
     }
 }
@@ -672,21 +364,17 @@ impl CancellationToken {
 impl NativeTensor {
     #[napi(getter)]
     pub fn shape(&self) -> Vec<u32> {
-        self.inner.dims().iter().map(|&d| d as u32).collect()
+        self.inner.shape().iter().map(|&d| d as u32).collect()
     }
 
     #[napi(getter)]
     pub fn dtype(&self) -> String {
-        dtype_name(self.inner.dtype()).to_string()
+        self.inner.dtype().name().to_string()
     }
 
     #[napi(getter)]
     pub fn device(&self) -> String {
-        match self.inner.device() {
-            Device::Cpu => "cpu".to_string(),
-            Device::Cuda(_) => "cuda".to_string(),
-            Device::Metal(_) => "metal".to_string(),
-        }
+        self.inner.device().name().to_string()
     }
 
     #[napi(getter)]
@@ -706,7 +394,7 @@ impl NativeTensor {
             EXTERNAL_MEMORY_BYTES.fetch_sub(bytes, Ordering::Relaxed);
             env.adjust_external_memory(-bytes)?;
         }
-        self.inner = Tensor::zeros(&[], DType::F32, &Device::Cpu).map_err(to_napi_err)?;
+        self.inner = val::Val::Cpu(runtime::cpu::Tensor::zeros(&[], runtime::dtype::DType::F32));
         Ok(())
     }
 
@@ -736,37 +424,65 @@ impl NativeTensor {
     }
 }
 
-fn readback_blocking(inner: &Tensor) -> Result<Readback> {
+fn readback_blocking(inner: &val::Val) -> Result<Readback> {
     // f16/bf16 read back as f32: JS has no half typed arrays we can
     // rely on, and the conversion keeps the destructor surface small.
-    let flat = if matches!(inner.dtype(), DType::F16 | DType::BF16) {
-        inner.to_dtype(DType::F32).map_err(to_napi_err)?
+    let flat = if matches!(inner.dtype(), runtime::dtype::DType::F16 | runtime::dtype::DType::BF16) {
+        match inner {
+            val::Val::Cpu(t) => val::Val::Cpu(t.cast(runtime::dtype::DType::F32)),
+            val::Val::Metal(t) => val::Val::Metal(
+                runtime::metal::kernels::cast(
+                    runtime::metal::device::MetalDevice::get(),
+                    t,
+                    runtime::dtype::DType::F32,
+                )
+                .map_err(to_napi_err)?,
+            ),
+        }
     } else {
         inner.clone()
     };
-    let flat = flat.flatten_all().map_err(to_napi_err)?;
-    // flatten_all (and the f16 conversion) materialize with an async device
-    // copy; wait for it before reading the buffer.
-    flat.device().synchronize().map_err(to_napi_err)?;
-    let elem_size = flat.dtype().size_in_bytes();
-    let elem_count = flat.elem_count();
-    let byte_len = elem_count * elem_size;
-    let base: *const u8 = {
-        let (storage, _) = flat.storage_and_layout();
-        match &*storage {
-            Storage::Cpu(CpuStorage::U8(data)) => data.as_ptr() as *const u8,
-            Storage::Cpu(CpuStorage::U32(data)) => data.as_ptr() as *const u8,
-            Storage::Cpu(CpuStorage::I64(data)) => data.as_ptr() as *const u8,
-            Storage::Cpu(CpuStorage::BF16(data)) => data.as_ptr() as *const u8,
-            Storage::Cpu(CpuStorage::F16(data)) => data.as_ptr() as *const u8,
-            Storage::Cpu(CpuStorage::F32(data)) => data.as_ptr() as *const u8,
-            Storage::Cpu(CpuStorage::F64(data)) => data.as_ptr() as *const u8,
-            #[cfg(target_os = "macos")]
-            Storage::Metal(storage) => storage.buffer().contents() as *const u8,
-            _ => std::ptr::null(),
+    // Contiguous layout for the flat read; Metal reads synchronize first.
+    let (base, offset, _dtype, elem_count) = match &flat {
+        val::Val::Cpu(t) => {
+            let t = t.contiguous();
+            let elem_size = t.dtype().size_in_bytes();
+            let base = match &t.buffer {
+                runtime::cpu::CpuBuffer::U8(v) => v.as_ptr() as *const u8,
+                runtime::cpu::CpuBuffer::U32(v) => v.as_ptr() as *const u8,
+                runtime::cpu::CpuBuffer::I64(v) => v.as_ptr() as *const u8,
+                runtime::cpu::CpuBuffer::BF16(v) => v.as_ptr() as *const u8,
+                runtime::cpu::CpuBuffer::F16(v) => v.as_ptr() as *const u8,
+                runtime::cpu::CpuBuffer::F32(v) => v.as_ptr() as *const u8,
+                runtime::cpu::CpuBuffer::F64(v) => v.as_ptr() as *const u8,
+            };
+            let offset = t.layout.offset() * elem_size;
+            let keep = val::Val::Cpu(t);
+            (base, offset, keep, 0usize)
+        }
+        val::Val::Metal(t) => {
+            let t = if t.layout.is_contiguous() {
+                t.clone()
+            } else {
+                val::Val::Metal(
+                    runtime::metal::kernels::strided_copy(runtime::metal::device::MetalDevice::get(), t)
+                        .map_err(to_napi_err)?,
+                )
+                .as_metal()
+                .map_err(to_napi_err)?
+                .clone()
+            };
+            runtime::metal::device::MetalDevice::get().synchronize();
+            let base = t.buffer.contents_ptr() as *const u8;
+            let offset = t.layout.offset() * t.dtype.size_in_bytes();
+            let keep = val::Val::Metal(t);
+            (base, offset, keep, 0usize)
         }
     };
-    let offset = flat.storage_and_layout().1.start_offset() * elem_size;
+    let _ = elem_count;
+    let elem_size = flat.dtype().size_in_bytes();
+    let count = flat.numel();
+    let byte_len = count * elem_size;
     if !base.is_null() {
         let addr = base as usize + offset;
         if try_register_export(addr) {
@@ -781,15 +497,15 @@ fn readback_blocking(inner: &Tensor) -> Result<Readback> {
         }
     }
     let (_, ptr, len, cap) = match flat.dtype() {
-        DType::F32 => vec_to_bytes(flat.to_vec1::<f32>().map_err(to_napi_err)?),
-        DType::F64 => vec_to_bytes(flat.to_vec1::<f64>().map_err(to_napi_err)?),
-        DType::I64 => vec_to_bytes(flat.to_vec1::<i64>().map_err(to_napi_err)?),
-        DType::U8 => vec_to_bytes(flat.to_vec1::<u8>().map_err(to_napi_err)?),
-        DType::U32 => vec_to_bytes(flat.to_vec1::<u32>().map_err(to_napi_err)?),
+        runtime::dtype::DType::F32 => vec_to_bytes(flat.to_f32_vec().map_err(to_napi_err)?),
+        runtime::dtype::DType::F64 => vec_to_bytes(flat.to_f64_vec().map_err(to_napi_err)?),
+        runtime::dtype::DType::I64 => vec_to_bytes(flat.to_i64_vec().map_err(to_napi_err)?),
+        runtime::dtype::DType::U8 => vec_to_bytes(flat.to_u8_vec().map_err(to_napi_err)?),
+        runtime::dtype::DType::U32 => vec_to_bytes(flat.to_u32_vec().map_err(to_napi_err)?),
         dtype => {
             return Err(Error::new(
                 Status::InvalidArg,
-                format!("readback not implemented for dtype: {dtype:?}"),
+                format!("readback not implemented for dtype: {}", dtype.name()),
             ))
         }
     };
@@ -809,66 +525,66 @@ enum PositionOffset {
 }
 
 enum NodeKind {
-    Leaf(Tensor),
+    Leaf(val::Val),
     // RFC 0008: placeholder leaves for compiled programs. An Input carries
     // the declared signature of one call argument; it evaluates only inside
     // CompiledProgram::run, which binds the slot to an argument buffer.
     Input {
         slot: u32,
         shape: Vec<usize>,
-        dtype: DType,
-        device: Device,
+        dtype: runtime::dtype::DType,
+        device: dev::Device,
     },
     ScalarInput {
         slot: u32,
-        dtype: DType,
-        device: Device,
+        dtype: runtime::dtype::DType,
+        device: dev::Device,
     },
     FromBytes {
         data: Vec<u8>,
         shape: Vec<usize>,
-        dtype: DType,
-        device: Device,
+        dtype: runtime::dtype::DType,
+        device: dev::Device,
     },
     Zeros {
         shape: Vec<usize>,
-        dtype: DType,
-        device: Device,
+        dtype: runtime::dtype::DType,
+        device: dev::Device,
     },
     Ones {
         shape: Vec<usize>,
-        dtype: DType,
-        device: Device,
+        dtype: runtime::dtype::DType,
+        device: dev::Device,
     },
     Full {
         shape: Vec<usize>,
         value: f64,
-        dtype: DType,
-        device: Device,
+        dtype: runtime::dtype::DType,
+        device: dev::Device,
     },
     Randn {
         shape: Vec<usize>,
-        dtype: DType,
-        device: Device,
+        dtype: runtime::dtype::DType,
+        device: dev::Device,
     },
     Uniform {
         lo: f64,
         hi: f64,
         shape: Vec<usize>,
-        dtype: DType,
-        device: Device,
+        dtype: runtime::dtype::DType,
+        device: dev::Device,
     },
     Arange {
         start: f64,
         end: f64,
         step: f64,
-        dtype: DType,
-        device: Device,
+        dtype: runtime::dtype::DType,
+        device: dev::Device,
     },
     Eye {
         n: usize,
-        dtype: DType,
-        device: Device,
+        dtype: runtime::dtype::DType,
+        device: dev::Device,
     },
     Add {
         a: Arc<Node>,
@@ -967,7 +683,7 @@ enum NodeKind {
     },
     Cast {
         a: Arc<Node>,
-        dtype: DType,
+        dtype: runtime::dtype::DType,
     },
     Sum {
         a: Arc<Node>,
@@ -1351,8 +1067,8 @@ enum NodeKind {
 pub struct Node {
     id: u64,
     shape: Vec<usize>,
-    dtype: DType,
-    device: Device,
+    dtype: runtime::dtype::DType,
+    device: dev::Device,
     kind: NodeKind,
 }
 
@@ -1372,11 +1088,10 @@ static CONSTANT_CACHE: LazyLock<Mutex<ConstantCache>> = LazyLock::new(|| {
 
 const CONSTANT_CACHE_LIMIT: usize = 4096;
 
-fn device_key(device: &Device) -> &'static str {
+fn device_key(device: &dev::Device) -> &'static str {
     match device {
-        Device::Cpu => "cpu",
-        Device::Cuda(_) => "cuda",
-        Device::Metal(_) => "metal",
+        dev::Device::Cpu => "cpu",
+        dev::Device::Metal => "metal",
     }
 }
 
@@ -1437,9 +1152,12 @@ impl Node {
     fn new(kind: NodeKind) -> std::result::Result<Arc<Node>, String> {
         let (shape, dtype, device) = match &kind {
             NodeKind::Leaf(tensor) => (
-                tensor.dims().to_vec(),
+                tensor.shape(),
                 tensor.dtype(),
-                tensor.device().clone(),
+                match tensor.device() {
+                    dev::Device::Cpu => dev::Device::Cpu,
+                    dev::Device::Metal => dev::Device::Metal,
+                },
             ),
             NodeKind::Input {
                 shape,
@@ -2379,7 +2097,7 @@ impl Node {
 // through here). Metal's shading language has no f64. Never a silent
 // downcast, never deferred to compute time.
 fn check_dtype_device(dtype: DType, device: &Device) -> std::result::Result<(), String> {
-    if matches!(dtype, DType::F64) && matches!(device, Device::Metal(_)) {
+    if matches!(dtype, DType::F64) && matches!(device, Device::Metal) {
         return Err(
             "dtype f64 is not supported on device metal (supported: f32, f16, bf16, i64, u32, u8); cast explicitly or use device cpu"
                 .to_string(),
@@ -3184,25 +2902,25 @@ impl LazyTensor {
 // a cache entry only releases the evaluator's reference: `Leaf` tensors
 // owned by JS handles stay alive through candle's refcounting.
 struct Evaluator {
-    cache: std::collections::HashMap<u64, Tensor>,
+    cache: std::collections::HashMap<u64, val::Val>,
     // AdamW step id -> (next m, next v); the step node's own value is the
     // updated parameter, stored in the regular cache
-    adamw: std::collections::HashMap<u64, [Tensor; 2]>,
-    sgd: std::collections::HashMap<u64, Tensor>,
+    adamw: std::collections::HashMap<u64, [val::Val; 2]>,
+    sgd: std::collections::HashMap<u64, val::Val>,
     // FusedElementwiseMulti id -> all outputs; the node's own cache entry
     // holds output 0 so the evaluator's single-value invariant holds
-    multi: std::collections::HashMap<u64, Vec<Tensor>>,
+    multi: std::collections::HashMap<u64, Vec<val::Val>>,
     // LayerNormBackward id -> (dw, db); the node's own cache entry is dx.
-    ln: std::collections::HashMap<u64, [Tensor; 2]>,
+    ln: std::collections::HashMap<u64, [val::Val; 2]>,
     // Optimizer step scalars (lr, bias corrections) cast to a given
     // dtype/device, memoized per walk: identical for every parameter,
     // and the naive path copies each scalar per parameter per step.
-    step_scalars: std::collections::HashMap<(u64, DType, u8), Tensor>,
+    step_scalars: std::collections::HashMap<(u64, DType, u8), val::Val>,
     consumers: std::collections::HashMap<u64, usize>,
     roots: HashSet<u64>,
     // RFC 0008: Input/ScalarInput node id -> argument buffer, populated by
     // CompiledProgram::run. Empty for ordinary eval_lazy walks.
-    slots: std::collections::HashMap<u64, Tensor>,
+    slots: std::collections::HashMap<u64, val::Val>,
     // RFC 0010: the pool + sequence a kv program runs against. None for
     // ordinary and non-kv compiled walks; KvAttention nodes error without
     // it.
@@ -3213,7 +2931,7 @@ struct Evaluator {
     // so the fused kernels record their status here and the walk
     // validates them after its final synchronize, preserving the exact
     // error semantics.
-    ce_checks: Vec<(Tensor, bool, usize)>,
+    ce_checks: Vec<(val::Val, bool, usize)>,
 }
 
 impl Evaluator {
@@ -3221,13 +2939,13 @@ impl Evaluator {
         Self::with_slots(roots, std::collections::HashMap::new())
     }
 
-    fn with_slots(roots: &[Arc<Node>], slots: std::collections::HashMap<u64, Tensor>) -> Self {
+    fn with_slots(roots: &[Arc<Node>], slots: std::collections::HashMap<u64, val::Val>) -> Self {
         Self::with_kv(roots, slots, None)
     }
 
     fn with_kv(
         roots: &[Arc<Node>],
-        slots: std::collections::HashMap<u64, Tensor>,
+        slots: std::collections::HashMap<u64, val::Val>,
         kv: Option<Arc<KvContext>>,
     ) -> Self {
         let mut consumers = std::collections::HashMap::new();
@@ -3253,49 +2971,49 @@ impl Evaluator {
     // synchronize: forward statuses are [loss, active, invalid],
     // backward counts are [active]. Errors are exactly the composed
     // path's, raised from the same eval call.
-    fn run_ce_checks(&self) -> candle_core::Result<()> {
+    fn run_ce_checks(&self) -> crate::err::Res<()> {
         for (buffer, forward, classes) in &self.ce_checks {
-            let values = buffer.to_vec1::<f32>()?;
+            let values = buffer.to_f32_vec()?;
             if *forward {
                 let (active, invalid) = (values[1] as usize, values[2] as usize);
                 if active == 0 {
-                    return Err(candle_core::Error::Msg(
+                    return Err(
                         "cross_entropy: no active targets (all positions are ignored)".to_string(),
-                    ));
+                    );
                 }
                 if invalid > 0 {
-                    return Err(candle_core::Error::Msg(format!(
+                    return Err(format!(
                         "cross_entropy: target out of range [0, {classes}) at an active position"
-                    )));
+                    ));
                 }
             } else if values[0] == 0.0 {
-                return Err(candle_core::Error::Msg(
+                return Err(
                     "cross_entropy: no active targets (all positions are ignored)".to_string(),
-                ));
+                );
             }
         }
         Ok(())
     }
 
-    fn value(&self, id: u64) -> candle_core::Result<Tensor> {
-        self.cache.get(&id).cloned().ok_or_else(|| {
-            candle_core::Error::Msg(format!("internal error: unevaluated node {id}"))
-        })
+    fn value(&self, id: u64) -> crate::err::Res<val::Val> {
+        self.cache.get(&id).cloned().ok_or_else(|| format!("internal error: unevaluated node {id}"))
     }
 
     // A step scalar cast to the target dtype/device, memoized per walk
     // (one copy per distinct dtype instead of one per parameter).
-    fn step_scalar(&mut self, id: u64, dtype: DType, device: &Device) -> candle_core::Result<Tensor> {
+    fn step_scalar(&mut self, id: u64, dtype: DType, device: &Device) -> crate::err::Res<val::Val> {
         let device_key = match device {
             Device::Cpu => 0u8,
-            Device::Cuda(_) => 1,
-            Device::Metal(_) => 2,
+            Device::Metal => 2,
         };
         let key = (id, dtype, device_key);
         if let Some(cached) = self.step_scalars.get(&key) {
             return Ok(cached.clone());
         }
-        let cast = self.value(id)?.to_dtype(dtype)?.to_device(device)?;
+        let cast = match self.value(id)? {
+            val::Val::Cpu(t) => val::Val::Cpu(t.cast(dtype)),
+            val::Val::Metal(t) => val::Val::Metal(metal_native::cast(&t, dtype)?),
+        };
         self.step_scalars.insert(key, cast.clone());
         Ok(cast)
     }
@@ -4048,175 +3766,104 @@ fn remap_children(kind: &NodeKind, f: &dyn Fn(&Arc<Node>) -> Arc<Node>) -> NodeK
     }
 }
 
-fn eval_broadcast_binary(
-    a: &Arc<Node>,
-    b: &Arc<Node>,
-    ev: &Evaluator,
-    f: impl Fn(&Tensor, &Tensor) -> candle_core::Result<Tensor>,
-) -> candle_core::Result<Tensor> {
-    let a = ev.value(a.id)?;
-    let b = ev.value(b.id)?;
-    let shape = a.shape().broadcast_shape_binary_op(b.shape(), "cmp")?;
-    let a = a.broadcast_as(shape.clone())?;
-    let b = b.broadcast_as(shape)?;
-    f(&a, &b)
-}
 
-macro_rules! linalg_impls {
-    ($ty:ty, $inverse:ident, $det:ident) => {
-        fn $inverse(t: &Tensor) -> candle_core::Result<Tensor> {
-            let n = t.dims()[0];
-            let mut a = t.to_vec2::<$ty>()?;
-            let mut inv: Vec<Vec<$ty>> = (0..n)
-                .map(|i| {
-                    (0..n)
-                        .map(|j| if i == j { 1.0 as $ty } else { 0.0 as $ty })
-                        .collect()
-                })
-                .collect();
-            for col in 0..n {
-                let mut pivot = col;
-                let mut best = a[col][col].abs();
-                for (r, row) in a.iter().enumerate().skip(col + 1) {
-                    let v = row[col].abs();
-                    if v > best {
-                        best = v;
-                        pivot = r;
-                    }
-                }
-                if best == 0.0 as $ty {
-                    return Err(candle_core::Error::Msg(
-                        "inverse: matrix is singular".to_string(),
-                    ));
-                }
-                if pivot != col {
-                    a.swap(col, pivot);
-                    inv.swap(col, pivot);
-                }
-                let d = a[col][col];
-                for j in 0..n {
-                    a[col][j] /= d;
-                    inv[col][j] /= d;
-                }
-                for r in 0..n {
-                    if r == col {
-                        continue;
-                    }
-                    let f = a[r][col];
-                    if f == 0.0 as $ty {
-                        continue;
-                    }
-                    for j in 0..n {
-                        a[r][j] -= f * a[col][j];
-                        inv[r][j] -= f * inv[col][j];
-                    }
-                }
-            }
-            let flat: Vec<$ty> = inv.into_iter().flatten().collect();
-            Tensor::from_vec(flat, (n, n), &Device::Cpu)
-        }
-
-        fn $det(t: &Tensor) -> candle_core::Result<Tensor> {
-            let n = t.dims()[0];
-            let mut a = t.to_vec2::<$ty>()?;
-            let mut sign = 1.0 as $ty;
-            let mut det = 1.0 as $ty;
-            for col in 0..n {
-                let mut pivot = col;
-                let mut best = a[col][col].abs();
-                for (r, row) in a.iter().enumerate().skip(col + 1) {
-                    let v = row[col].abs();
-                    if v > best {
-                        best = v;
-                        pivot = r;
-                    }
-                }
-                if best == 0.0 as $ty {
-                    return Tensor::from_vec(vec![0.0 as $ty], (), &Device::Cpu);
-                }
-                if pivot != col {
-                    a.swap(col, pivot);
-                    sign = -sign;
-                }
-                det *= a[col][col];
-                for r in col + 1..n {
-                    let f = a[r][col] / a[col][col];
-                    for j in col..n {
-                        a[r][j] -= f * a[col][j];
-                    }
-                }
-            }
-            Tensor::from_vec(vec![sign * det], (), &Device::Cpu)
-        }
-    };
-}
-
-linalg_impls!(f32, inverse_f32, det_f32);
-linalg_impls!(f64, inverse_f64, det_f64);
-
-fn cpu_inverse(t: &Tensor) -> candle_core::Result<Tensor> {
-    match t.dtype() {
-        DType::F32 => inverse_f32(t),
-        DType::F64 => inverse_f64(t),
-        other => Err(candle_core::Error::Msg(format!(
-            "linalg: unsupported dtype {other:?}"
-        ))),
-    }
-}
-
-fn cpu_det(t: &Tensor) -> candle_core::Result<Tensor> {
-    match t.dtype() {
-        DType::F32 => det_f32(t),
-        DType::F64 => det_f64(t),
-        other => Err(candle_core::Error::Msg(format!(
-            "linalg: unsupported dtype {other:?}"
-        ))),
-    }
-}
-
-fn reduce_dims(
-    t: &Tensor,
-    dims: &[usize],
-    keepdims: bool,    f: impl Fn(&Tensor, usize) -> candle_core::Result<Tensor>,
-) -> candle_core::Result<Tensor> {
-    let mut out = t.clone();
-    for &d in dims.iter().rev() {
-        if matches!(out.device(), Device::Metal(_)) && out.rank() > 4 {
-            // candle's Metal reduce kernel miscomputes non-trailing dims at
-            // rank > 4; collapse the untouched dims so each single-dim
-            // reduce runs at rank 3
-            let shape = out.dims().to_vec();
-            let before: usize = shape[..d].iter().product();
-            let after: usize = shape[d + 1..].iter().product();
-            let collapsed = out.contiguous()?.reshape((before, shape[d], after))?;
-            let mut reduced_shape: Vec<usize> = shape[..d].to_vec();
-            reduced_shape.extend_from_slice(&shape[d + 1..]);
-            out = f(&collapsed, 1)?.reshape(reduced_shape)?;
-        } else {
-            out = f(&out, d)?;
-        }
-    }
-    if keepdims {
-        for &d in dims {
-            out = out.unsqueeze(d)?;
-        }
-    }
-    Ok(out)
-}
-
-// Iterative post-order evaluation: recursion depth is independent of graph
 // depth, so chains of arbitrary length evaluate on a fixed stack. Children
 // are always computed before their parents, and `eval_uncached` reads their
 // values straight from the cache.
+fn metal_to_cpu(t: &runtime::metal::run::MetalTensor) -> err::Res<runtime::cpu::Tensor> {
+    let shape = t.layout.shape().to_vec();
+    let values = val::Val::Metal(t.clone()).to_f32_vec()?;
+    Ok(runtime::cpu::Tensor::from_vec(values, shape))
+}
+
+fn cpu_to_metal(t: &runtime::cpu::Tensor) -> err::Res<runtime::metal::run::MetalTensor> {
+    let t = t.contiguous();
+    let bytes: Vec<u8> = match &t.buffer {
+        runtime::cpu::CpuBuffer::F32(v) => v.iter().flat_map(|x| x.to_le_bytes()).collect(),
+        runtime::cpu::CpuBuffer::F64(v) => v.iter().flat_map(|x| x.to_le_bytes()).collect(),
+        runtime::cpu::CpuBuffer::F16(v) => v.iter().flat_map(|x| x.to_le_bytes()).collect(),
+        runtime::cpu::CpuBuffer::BF16(v) => v.iter().flat_map(|x| x.to_le_bytes()).collect(),
+        runtime::cpu::CpuBuffer::U8(v) => v.as_slice().to_vec(),
+        runtime::cpu::CpuBuffer::U32(v) => v.iter().flat_map(|x| x.to_le_bytes()).collect(),
+        runtime::cpu::CpuBuffer::I64(v) => v.iter().flat_map(|x| x.to_le_bytes()).collect(),
+    };
+    Ok(runtime::metal::run::MetalTensor {
+        buffer: runtime::metal::device::MetalDevice::get().upload_bytes(&bytes),
+        layout: runtime::layout::Layout::contiguous(t.shape().to_vec()),
+        dtype: t.dtype(),
+    })
+}
+
+fn index_ids_u32(indexes: &val::Val) -> crate::err::Res<Vec<u32>> {
+    indexes.to_u32_vec()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn adamw_native(
+    p: &runtime::metal::run::MetalTensor,
+    g: &runtime::metal::run::MetalTensor,
+    m: &runtime::metal::run::MetalTensor,
+    v: &runtime::metal::run::MetalTensor,
+    lr: &runtime::metal::run::MetalTensor,
+    c1: &runtime::metal::run::MetalTensor,
+    c2: &runtime::metal::run::MetalTensor,
+    beta1: f64,
+    beta2: f64,
+    eps: f64,
+    weight_decay: f64,
+) -> crate::err::Res<(runtime::metal::run::MetalTensor, runtime::metal::run::MetalTensor, runtime::metal::run::MetalTensor)> {
+    let b1 = metal_native::fill(m.layout.shape(), beta1, m.dtype)?;
+    let ob1 = metal_native::fill(g.layout.shape(), 1.0 - beta1, g.dtype)?;
+    let next_m = metal_native::binary(
+        &metal_native::binary(m, &b1, metal_native::BinOp::Mul)?,
+        &metal_native::binary(g, &ob1, metal_native::BinOp::Mul)?,
+        metal_native::BinOp::Add,
+    )?;
+    let b2 = metal_native::fill(v.layout.shape(), beta2, v.dtype)?;
+    let ob2 = metal_native::fill(g.layout.shape(), 1.0 - beta2, g.dtype)?;
+    let gg = metal_native::binary(g, g, metal_native::BinOp::Mul)?;
+    let next_v = metal_native::binary(
+        &metal_native::binary(v, &b2, metal_native::BinOp::Mul)?,
+        &metal_native::binary(&gg, &ob2, metal_native::BinOp::Mul)?,
+        metal_native::BinOp::Add,
+    )?;
+    let m_hat = metal_native::binary(&next_m, c1, metal_native::BinOp::Div)?;
+    let v_hat = metal_native::binary(&next_v, c2, metal_native::BinOp::Div)?;
+    let denom = metal_native::binary(
+        &metal_native::unary(&v_hat, metal_native::UnOp::Sqrt)?,
+        &metal_native::fill(v_hat.layout.shape(), eps, v_hat.dtype)?,
+        metal_native::BinOp::Add,
+    )?;
+    let adjusted = metal_native::binary(
+        &metal_native::binary(&m_hat, &denom, metal_native::BinOp::Div)?,
+        lr,
+        metal_native::BinOp::Mul,
+    )?;
+    // p * (1 - lr * weight_decay) - adjusted, factored as
+    // p - p * (lr * weight_decay) - adjusted.
+    let next_p = if weight_decay == 0.0 {
+        metal_native::binary(p, &adjusted, metal_native::BinOp::Sub)?
+    } else {
+        let wd = metal_native::fill(lr.layout.shape(), weight_decay, lr.dtype)?;
+        let decay = metal_native::binary(p, &metal_native::binary(lr, &wd, metal_native::BinOp::Mul)?, metal_native::BinOp::Mul)?;
+        metal_native::binary(
+            &metal_native::binary(p, &decay, metal_native::BinOp::Sub)?,
+            &adjusted,
+            metal_native::BinOp::Sub,
+        )?
+    };
+    Ok((next_p, next_m, next_v))
+}
+
 fn eval_node(
     root: &Arc<Node>,
     cancelled: &AtomicBool,
     ev: &mut Evaluator,
-) -> candle_core::Result<Tensor> {
+) -> crate::err::Res<val::Val> {
     let mut stack: Vec<(Arc<Node>, bool)> = vec![(root.clone(), false)];
     while let Some((node, processed)) = stack.pop() {
         if cancelled.load(Ordering::Relaxed) {
-            return Err(candle_core::Error::Msg("operation aborted".to_string()));
+            return Err("operation aborted".to_string());
         }
         if ev.cache.contains_key(&node.id) {
             continue;
@@ -4246,14 +3893,14 @@ fn eval_node(
         .clone())
 }
 
-fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> candle_core::Result<Tensor> {
+fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> crate::err::Res<val::Val> {
     let output = match &node.kind {
-        NodeKind::Leaf(tensor) => tensor.clone(),
+        NodeKind::Leaf(v) => v.clone(),
         NodeKind::Input { slot, .. } | NodeKind::ScalarInput { slot, .. } => {
             ev.slots.get(&node.id).cloned().ok_or_else(|| {
-                candle_core::Error::Msg(format!(
+                format!(
                     "input slot {slot} is unbound: placeholder leaves evaluate only inside a compiled program run"
-                ))
+                )
             })?
         }
         NodeKind::FromBytes {
@@ -4261,71 +3908,56 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> candle_core::Result<Te
             shape,
             dtype,
             device,
-        } => match dtype {
-            DType::F32 => {
-                let v: Vec<f32> = data
-                    .chunks_exact(4)
-                    .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-                    .collect();
-                Tensor::from_vec(v, shape.clone(), device)?
+        } => {
+            let nd = *dtype;
+            if device.is_cpu() {
+                let t = match nd {
+                    runtime::dtype::DType::F32 => runtime::cpu::Tensor::from_vec(
+                        data.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect(),
+                        shape.clone(),
+                    ),
+                    runtime::dtype::DType::F64 => runtime::cpu::Tensor::from_vec(
+                        data.chunks_exact(8).map(|c| f64::from_le_bytes([c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]])).collect(),
+                        shape.clone(),
+                    ),
+                    runtime::dtype::DType::I64 => runtime::cpu::Tensor::from_vec(
+                        data.chunks_exact(8).map(|c| i64::from_le_bytes([c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]])).collect(),
+                        shape.clone(),
+                    ),
+                    runtime::dtype::DType::U8 => runtime::cpu::Tensor::from_vec(data.clone(), shape.clone()),
+                    runtime::dtype::DType::U32 => runtime::cpu::Tensor::from_vec(
+                        data.chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect(),
+                        shape.clone(),
+                    ),
+                    runtime::dtype::DType::F16 => runtime::cpu::Tensor::from_vec(
+                        data.chunks_exact(2).map(|c| half::f16::from_le_bytes([c[0], c[1]])).collect(),
+                        shape.clone(),
+                    ),
+                    runtime::dtype::DType::BF16 => runtime::cpu::Tensor::from_vec(
+                        data.chunks_exact(2).map(|c| half::bf16::from_le_bytes([c[0], c[1]])).collect(),
+                        shape.clone(),
+                    ),
+                };
+                val::Val::Cpu(t)
+            } else {
+                let buffer = runtime::metal::device::MetalDevice::get().upload_bytes(data);
+                val::Val::Metal(runtime::metal::run::MetalTensor {
+                    buffer,
+                    layout: runtime::layout::Layout::contiguous(shape.clone()),
+                    dtype: nd,
+                })
             }
-            DType::F64 => {
-                let v: Vec<f64> = data
-                    .chunks_exact(8)
-                    .map(|c| f64::from_le_bytes([c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]]))
-                    .collect();
-                Tensor::from_vec(v, shape.clone(), device)?
-            }
-            DType::I64 => {
-                let v: Vec<i64> = data
-                    .chunks_exact(8)
-                    .map(|c| i64::from_le_bytes([c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]]))
-                    .collect();
-                Tensor::from_vec(v, shape.clone(), device)?
-            }
-            DType::U8 => Tensor::from_vec(data.clone(), shape.clone(), device)?,
-            DType::U32 => {
-                let v: Vec<u32> = data
-                    .chunks_exact(4)
-                    .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-                    .collect();
-                Tensor::from_vec(v, shape.clone(), device)?
-            }
-            DType::F16 => {
-                let v: Vec<half::f16> = data
-                    .chunks_exact(2)
-                    .map(|c| half::f16::from_le_bytes([c[0], c[1]]))
-                    .collect();
-                Tensor::from_vec(v, shape.clone(), device)?
-            }
-            DType::BF16 => {
-                let v: Vec<half::bf16> = data
-                    .chunks_exact(2)
-                    .map(|c| half::bf16::from_le_bytes([c[0], c[1]]))
-                    .collect();
-                Tensor::from_vec(v, shape.clone(), device)?
-            }
-            dtype => {
-                return Err(candle_core::Error::Msg(format!(
-                    "fromBytes not supported for dtype {dtype:?}"
-                )))
-            }
-        },
+        }
         NodeKind::Zeros {
             shape,
             dtype,
             device,
         } => {
             if device.is_cpu() {
-                let r = runtime::cpu::Tensor::zeros(shape, bridge::dtype_to_native(*dtype));
-                return bridge::to_candle(&r);
+                val::Val::Cpu(runtime::cpu::Tensor::zeros(shape, *dtype))
+            } else {
+                val::Val::Metal(metal_native::fill(shape, 0.0, *dtype)?)
             }
-            if device.is_metal() {
-                if let Ok(t) = metal_eval::fill(shape, 0.0, bridge::dtype_to_native(*dtype), device) {
-                    return Ok(t);
-                }
-            }
-            Tensor::zeros(shape.clone(), *dtype, device)?
         }
         NodeKind::Ones {
             shape,
@@ -4333,15 +3965,10 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> candle_core::Result<Te
             device,
         } => {
             if device.is_cpu() {
-                let r = runtime::cpu::Tensor::ones(shape, bridge::dtype_to_native(*dtype));
-                return bridge::to_candle(&r);
+                val::Val::Cpu(runtime::cpu::Tensor::ones(shape, *dtype))
+            } else {
+                val::Val::Metal(metal_native::fill(shape, 1.0, *dtype)?)
             }
-            if device.is_metal() {
-                if let Ok(t) = metal_eval::fill(shape, 1.0, bridge::dtype_to_native(*dtype), device) {
-                    return Ok(t);
-                }
-            }
-            Tensor::ones(shape.clone(), *dtype, device)?
         }
         NodeKind::Full {
             shape,
@@ -4350,27 +3977,9 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> candle_core::Result<Te
             device,
         } => {
             if device.is_cpu() {
-                let r = runtime::cpu::Tensor::full(shape, *value, bridge::dtype_to_native(*dtype));
-                return bridge::to_candle(&r);
-            }
-            if device.is_metal() {
-                if let Ok(t) = metal_eval::fill(shape, *value, bridge::dtype_to_native(*dtype), device) {
-                    return Ok(t);
-                }
-            }
-            match dtype {
-                DType::F32 => Tensor::full(*value as f32, shape.clone(), device)?,
-                DType::F64 => Tensor::full(*value, shape.clone(), device)?,
-                DType::I64 => Tensor::full(*value as i64, shape.clone(), device)?,
-                DType::U8 => Tensor::full(*value as u8, shape.clone(), device)?,
-                DType::U32 => Tensor::full(*value as u32, shape.clone(), device)?,
-                DType::F16 => Tensor::full(half::f16::from_f64(*value), shape.clone(), device)?,
-                DType::BF16 => Tensor::full(half::bf16::from_f64(*value), shape.clone(), device)?,
-                dtype => {
-                    return Err(candle_core::Error::Msg(format!(
-                        "full not supported for dtype {dtype:?}"
-                    )))
-                }
+                val::Val::Cpu(runtime::cpu::Tensor::full(shape, *value, *dtype))
+            } else {
+                val::Val::Metal(metal_native::fill(shape, *value, *dtype)?)
             }
         }
         NodeKind::Randn {
@@ -4379,18 +3988,13 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> candle_core::Result<Te
             device,
         } => {
             if device.is_cpu() {
-                let r = runtime::cpu::Tensor::randn(shape, bridge::dtype_to_native(*dtype));
-                return bridge::to_candle(&r);
-            }
-            if device.is_metal() {
+                val::Val::Cpu(runtime::cpu::Tensor::randn(shape, *dtype))
+            } else {
                 static SEED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(299792458);
                 let seed = SEED.fetch_add(1, Ordering::Relaxed);
-                if let Ok(t) = metal_eval::randn(shape, seed, device) {
-                    let t = t.to_dtype(*dtype)?;
-                    return Ok(t);
-                }
+                let t = metal_native::randn(shape, seed)?;
+                val::Val::Metal(metal_native::cast(&t, *dtype)?)
             }
-            Tensor::randn(0f32, 1f32, shape.clone(), device)?.to_dtype(*dtype)?
         }
         NodeKind::Uniform {
             lo,
@@ -4400,18 +4004,13 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> candle_core::Result<Te
             device,
         } => {
             if device.is_cpu() {
-                let r = runtime::cpu::Tensor::uniform(*lo, *hi, shape, bridge::dtype_to_native(*dtype));
-                return bridge::to_candle(&r);
-            }
-            if device.is_metal() {
+                val::Val::Cpu(runtime::cpu::Tensor::uniform(*lo, *hi, shape, *dtype))
+            } else {
                 static SEED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(78778899);
                 let seed = SEED.fetch_add(1, Ordering::Relaxed);
-                if let Ok(t) = metal_eval::uniform(*lo, *hi, shape, seed, device) {
-                    let t = t.to_dtype(*dtype)?;
-                    return Ok(t);
-                }
+                let t = metal_native::uniform(*lo, *hi, shape, seed)?;
+                val::Val::Metal(metal_native::cast(&t, *dtype)?)
             }
-            Tensor::rand(*lo as f32, *hi as f32, shape.clone(), device)?.to_dtype(*dtype)?
         }
         NodeKind::Arange {
             start,
@@ -4421,409 +4020,270 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> candle_core::Result<Te
             device,
         } => {
             if device.is_cpu() {
-                let r = runtime::cpu::Tensor::arange(*start, *end, *step, bridge::dtype_to_native(*dtype));
-                return bridge::to_candle(&r);
+                val::Val::Cpu(runtime::cpu::Tensor::arange(*start, *end, *step, *dtype))
+            } else {
+                val::Val::Metal(metal_native::arange(*start, *end, *step, *dtype)?)
             }
-            if device.is_metal() {
-                if let Ok(t) = metal_eval::arange(*start, *end, *step, bridge::dtype_to_native(*dtype), device) {
-                    return Ok(t);
-                }
-            }
-            let n = ((end - start) / step).ceil().max(0.0) as usize;
-            let base = Tensor::arange(0u32, n as u32, device)?;
-            let scaled = (base * *step)?;
-            (scaled + *start)?.to_dtype(*dtype)?
         }
         NodeKind::Eye { n, dtype, device } => {
             if device.is_cpu() {
-                let r = runtime::cpu::Tensor::eye(*n, bridge::dtype_to_native(*dtype));
-                return bridge::to_candle(&r);
+                val::Val::Cpu(runtime::cpu::Tensor::eye(*n, *dtype))
+            } else {
+                val::Val::Metal(metal_native::eye(*n, *dtype)?)
             }
-            if device.is_metal() {
-                if let Ok(t) = metal_eval::eye(*n, bridge::dtype_to_native(*dtype), device) {
-                    return Ok(t);
-                }
-            }
-            let i = Tensor::arange(0u32, *n as u32, device)?.reshape((*n, 1))?;
-            let j = Tensor::arange(0u32, *n as u32, device)?.reshape((1, *n))?;
-            i.broadcast_eq(&j)?.to_dtype(*dtype)?
         }
         NodeKind::Add { a, b } => {
             let a = ev.value(a.id)?;
             let b = ev.value(b.id)?;
-            if a.device().is_cpu() {
-                return bridge::to_candle(&bridge::from_candle(&a)?.add(&bridge::from_candle(&b)?));
-            }
-            if a.device().is_metal() {
-                if let Ok(t) = metal_eval::binary(&a, &b, metal_eval::BinOp::Add) {
-                    return Ok(t);
+            match (&a, &b) {
+                (val::Val::Cpu(x), val::Val::Cpu(y)) => val::Val::Cpu(x.add(y)),
+                (val::Val::Metal(x), val::Val::Metal(y)) => {
+                    val::Val::Metal(metal_native::binary_promote(x, y, metal_native::BinOp::Add)?)
                 }
+                _ => return Err("device mismatch".to_string()),
             }
-            a.broadcast_add(&b)?
         }
         NodeKind::Sub { a, b } => {
             let a = ev.value(a.id)?;
             let b = ev.value(b.id)?;
-            if a.device().is_cpu() {
-                return bridge::to_candle(&bridge::from_candle(&a)?.sub(&bridge::from_candle(&b)?));
-            }
-            if a.device().is_metal() {
-                if let Ok(t) = metal_eval::binary(&a, &b, metal_eval::BinOp::Sub) {
-                    return Ok(t);
+            match (&a, &b) {
+                (val::Val::Cpu(x), val::Val::Cpu(y)) => val::Val::Cpu(x.sub(y)),
+                (val::Val::Metal(x), val::Val::Metal(y)) => {
+                    val::Val::Metal(metal_native::binary_promote(x, y, metal_native::BinOp::Sub)?)
                 }
+                _ => return Err("device mismatch".to_string()),
             }
-            a.broadcast_sub(&b)?
         }
         NodeKind::Mul { a, b } => {
             let a = ev.value(a.id)?;
             let b = ev.value(b.id)?;
-            if a.device().is_cpu() {
-                return bridge::to_candle(&bridge::from_candle(&a)?.mul(&bridge::from_candle(&b)?));
-            }
-            if a.device().is_metal() {
-                if let Ok(t) = metal_eval::binary(&a, &b, metal_eval::BinOp::Mul) {
-                    return Ok(t);
+            match (&a, &b) {
+                (val::Val::Cpu(x), val::Val::Cpu(y)) => val::Val::Cpu(x.mul(y)),
+                (val::Val::Metal(x), val::Val::Metal(y)) => {
+                    val::Val::Metal(metal_native::binary_promote(x, y, metal_native::BinOp::Mul)?)
                 }
+                _ => return Err("device mismatch".to_string()),
             }
-            a.broadcast_mul(&b)?
         }
         NodeKind::Div { a, b } => {
             let a = ev.value(a.id)?;
             let b = ev.value(b.id)?;
-            if a.device().is_cpu() {
-                return bridge::to_candle(&bridge::from_candle(&a)?.div(&bridge::from_candle(&b)?));
-            }
-            if a.device().is_metal() {
-                if let Ok(t) = metal_eval::binary(&a, &b, metal_eval::BinOp::Div) {
-                    return Ok(t);
+            match (&a, &b) {
+                (val::Val::Cpu(x), val::Val::Cpu(y)) => val::Val::Cpu(x.div(y)),
+                (val::Val::Metal(x), val::Val::Metal(y)) => {
+                    val::Val::Metal(metal_native::binary_promote(x, y, metal_native::BinOp::Div)?)
                 }
+                _ => return Err("device mismatch".to_string()),
             }
-            a.broadcast_div(&b)?
         }
         NodeKind::Eq { a, b } => {
             let (x, y) = (ev.value(a.id)?, ev.value(b.id)?);
-            if x.device().is_cpu() {
-                return bridge::to_candle(&bridge::from_candle(&x)?.eq(&bridge::from_candle(&y)?));
-            }
-            if x.device().is_metal() {
-                if let Ok(t) = metal_eval::compare(&x, &y, metal_eval::BinOp::Eq) {
-                    return Ok(t);
+            match (&x, &y) {
+                (val::Val::Cpu(a), val::Val::Cpu(b)) => val::Val::Cpu(a.eq(b)),
+                (val::Val::Metal(a), val::Val::Metal(b)) => {
+                    val::Val::Metal(metal_native::compare(a, b, metal_native::BinOp::Eq)?)
                 }
+                _ => return Err("device mismatch".to_string()),
             }
-            eval_broadcast_binary(a, b, ev, |a, b| a.eq(b))?
         }
         NodeKind::Gt { a, b } => {
             let (x, y) = (ev.value(a.id)?, ev.value(b.id)?);
-            if x.device().is_cpu() {
-                return bridge::to_candle(&bridge::from_candle(&x)?.gt(&bridge::from_candle(&y)?));
-            }
-            if x.device().is_metal() {
-                if let Ok(t) = metal_eval::compare(&x, &y, metal_eval::BinOp::Gt) {
-                    return Ok(t);
+            match (&x, &y) {
+                (val::Val::Cpu(a), val::Val::Cpu(b)) => val::Val::Cpu(a.gt(b)),
+                (val::Val::Metal(a), val::Val::Metal(b)) => {
+                    val::Val::Metal(metal_native::compare(a, b, metal_native::BinOp::Gt)?)
                 }
+                _ => return Err("device mismatch".to_string()),
             }
-            eval_broadcast_binary(a, b, ev, |a, b| a.gt(b))?
         }
         NodeKind::Lt { a, b } => {
             let (x, y) = (ev.value(a.id)?, ev.value(b.id)?);
-            if x.device().is_cpu() {
-                return bridge::to_candle(&bridge::from_candle(&x)?.lt(&bridge::from_candle(&y)?));
-            }
-            if x.device().is_metal() {
-                if let Ok(t) = metal_eval::compare(&x, &y, metal_eval::BinOp::Lt) {
-                    return Ok(t);
+            match (&x, &y) {
+                (val::Val::Cpu(a), val::Val::Cpu(b)) => val::Val::Cpu(a.lt(b)),
+                (val::Val::Metal(a), val::Val::Metal(b)) => {
+                    val::Val::Metal(metal_native::compare(a, b, metal_native::BinOp::Lt)?)
                 }
+                _ => return Err("device mismatch".to_string()),
             }
-            eval_broadcast_binary(a, b, ev, |a, b| a.lt(b))?
         }
         NodeKind::Ge { a, b } => {
             let (x, y) = (ev.value(a.id)?, ev.value(b.id)?);
-            if x.device().is_cpu() {
-                return bridge::to_candle(&bridge::from_candle(&x)?.ge(&bridge::from_candle(&y)?));
-            }
-            if x.device().is_metal() {
-                if let Ok(t) = metal_eval::compare(&x, &y, metal_eval::BinOp::Ge) {
-                    return Ok(t);
+            match (&x, &y) {
+                (val::Val::Cpu(a), val::Val::Cpu(b)) => val::Val::Cpu(a.ge(b)),
+                (val::Val::Metal(a), val::Val::Metal(b)) => {
+                    val::Val::Metal(metal_native::compare(a, b, metal_native::BinOp::Ge)?)
                 }
+                _ => return Err("device mismatch".to_string()),
             }
-            eval_broadcast_binary(a, b, ev, |a, b| a.ge(b))?
         }
         NodeKind::Le { a, b } => {
             let (x, y) = (ev.value(a.id)?, ev.value(b.id)?);
-            if x.device().is_cpu() {
-                return bridge::to_candle(&bridge::from_candle(&x)?.le(&bridge::from_candle(&y)?));
-            }
-            if x.device().is_metal() {
-                if let Ok(t) = metal_eval::compare(&x, &y, metal_eval::BinOp::Le) {
-                    return Ok(t);
+            match (&x, &y) {
+                (val::Val::Cpu(a), val::Val::Cpu(b)) => val::Val::Cpu(a.le(b)),
+                (val::Val::Metal(a), val::Val::Metal(b)) => {
+                    val::Val::Metal(metal_native::compare(a, b, metal_native::BinOp::Le)?)
                 }
+                _ => return Err("device mismatch".to_string()),
             }
-            eval_broadcast_binary(a, b, ev, |a, b| a.le(b))?
         }
         NodeKind::Maximum { a, b } => {
             let (x, y) = (ev.value(a.id)?, ev.value(b.id)?);
-            if x.device().is_cpu() {
-                return bridge::to_candle(&bridge::from_candle(&x)?.maximum(&bridge::from_candle(&y)?));
-            }
-            if x.device().is_metal() {
-                if let Ok(t) = metal_eval::binary(&x, &y, metal_eval::BinOp::Max) {
-                    return Ok(t);
+            match (&x, &y) {
+                (val::Val::Cpu(a), val::Val::Cpu(b)) => val::Val::Cpu(a.maximum(b)),
+                (val::Val::Metal(a), val::Val::Metal(b)) => {
+                    val::Val::Metal(metal_native::binary_promote(a, b, metal_native::BinOp::Max)?)
                 }
+                _ => return Err("device mismatch".to_string()),
             }
-            eval_broadcast_binary(a, b, ev, |a, b| a.maximum(b))?
         }
         NodeKind::Minimum { a, b } => {
             let (x, y) = (ev.value(a.id)?, ev.value(b.id)?);
-            if x.device().is_cpu() {
-                return bridge::to_candle(&bridge::from_candle(&x)?.minimum(&bridge::from_candle(&y)?));
-            }
-            if x.device().is_metal() {
-                if let Ok(t) = metal_eval::binary(&x, &y, metal_eval::BinOp::Min) {
-                    return Ok(t);
+            match (&x, &y) {
+                (val::Val::Cpu(a), val::Val::Cpu(b)) => val::Val::Cpu(a.minimum(b)),
+                (val::Val::Metal(a), val::Val::Metal(b)) => {
+                    val::Val::Metal(metal_native::binary_promote(a, b, metal_native::BinOp::Min)?)
                 }
+                _ => return Err("device mismatch".to_string()),
             }
-            eval_broadcast_binary(a, b, ev, |a, b| a.minimum(b))?
         }
         NodeKind::Neg { a } => {
             let x = ev.value(a.id)?;
-            if x.device().is_cpu() {
-                return bridge::to_candle(&bridge::from_candle(&x)?.neg());
+            match &x {
+                val::Val::Cpu(t) => val::Val::Cpu(t.neg()),
+                val::Val::Metal(t) => val::Val::Metal(metal_native::unary_promote(t, metal_native::UnOp::Neg)?),
             }
-            if x.device().is_metal() {
-                if let Ok(t) = metal_eval::unary(&x, metal_eval::UnOp::Neg) {
-                    return Ok(t);
-                }
-            }
-            x.neg()?
         }
         NodeKind::Abs { a } => {
             let x = ev.value(a.id)?;
-            if x.device().is_cpu() {
-                return bridge::to_candle(&bridge::from_candle(&x)?.abs());
+            match &x {
+                val::Val::Cpu(t) => val::Val::Cpu(t.abs()),
+                val::Val::Metal(t) => val::Val::Metal(metal_native::unary_promote(t, metal_native::UnOp::Abs)?),
             }
-            if x.device().is_metal() {
-                if let Ok(t) = metal_eval::unary(&x, metal_eval::UnOp::Abs) {
-                    return Ok(t);
-                }
-            }
-            x.abs()?
         }
         NodeKind::Sqrt { a } => {
             let x = ev.value(a.id)?;
-            if x.device().is_cpu() {
-                return bridge::to_candle(&bridge::from_candle(&x)?.sqrt());
+            match &x {
+                val::Val::Cpu(t) => val::Val::Cpu(t.sqrt()),
+                val::Val::Metal(t) => val::Val::Metal(metal_native::unary_promote(t, metal_native::UnOp::Sqrt)?),
             }
-            if x.device().is_metal() {
-                if let Ok(t) = metal_eval::unary(&x, metal_eval::UnOp::Sqrt) {
-                    return Ok(t);
-                }
-            }
-            x.sqrt()?
         }
         NodeKind::Exp { a } => {
             let x = ev.value(a.id)?;
-            if x.device().is_cpu() {
-                return bridge::to_candle(&bridge::from_candle(&x)?.exp());
+            match &x {
+                val::Val::Cpu(t) => val::Val::Cpu(t.exp()),
+                val::Val::Metal(t) => val::Val::Metal(metal_native::unary_promote(t, metal_native::UnOp::Exp)?),
             }
-            if x.device().is_metal() {
-                if let Ok(t) = metal_eval::unary(&x, metal_eval::UnOp::Exp) {
-                    return Ok(t);
-                }
-            }
-            x.exp()?
         }
         NodeKind::Log { a } => {
             let x = ev.value(a.id)?;
-            if x.device().is_cpu() {
-                return bridge::to_candle(&bridge::from_candle(&x)?.log());
+            match &x {
+                val::Val::Cpu(t) => val::Val::Cpu(t.log()),
+                val::Val::Metal(t) => val::Val::Metal(metal_native::unary_promote(t, metal_native::UnOp::Log)?),
             }
-            if x.device().is_metal() {
-                if let Ok(t) = metal_eval::unary(&x, metal_eval::UnOp::Log) {
-                    return Ok(t);
-                }
-            }
-            x.log()?
         }
         NodeKind::Sin { a } => {
             let x = ev.value(a.id)?;
-            if x.device().is_cpu() {
-                return bridge::to_candle(&bridge::from_candle(&x)?.sin());
+            match &x {
+                val::Val::Cpu(t) => val::Val::Cpu(t.sin()),
+                val::Val::Metal(t) => val::Val::Metal(metal_native::unary_promote(t, metal_native::UnOp::Sin)?),
             }
-            if x.device().is_metal() {
-                if let Ok(t) = metal_eval::unary(&x, metal_eval::UnOp::Sin) {
-                    return Ok(t);
-                }
-            }
-            x.sin()?
         }
         NodeKind::Cos { a } => {
             let x = ev.value(a.id)?;
-            if x.device().is_cpu() {
-                return bridge::to_candle(&bridge::from_candle(&x)?.cos());
+            match &x {
+                val::Val::Cpu(t) => val::Val::Cpu(t.cos()),
+                val::Val::Metal(t) => val::Val::Metal(metal_native::unary_promote(t, metal_native::UnOp::Cos)?),
             }
-            if x.device().is_metal() {
-                if let Ok(t) = metal_eval::unary(&x, metal_eval::UnOp::Cos) {
-                    return Ok(t);
-                }
-            }
-            x.cos()?
         }
         NodeKind::Tanh { a } => {
             let x = ev.value(a.id)?;
-            if x.device().is_cpu() {
-                return bridge::to_candle(&bridge::from_candle(&x)?.tanh());
+            match &x {
+                val::Val::Cpu(t) => val::Val::Cpu(t.tanh()),
+                val::Val::Metal(t) => val::Val::Metal(metal_native::unary_promote(t, metal_native::UnOp::Tanh)?),
             }
-            if x.device().is_metal() {
-                if let Ok(t) = metal_eval::unary(&x, metal_eval::UnOp::Tanh) {
-                    return Ok(t);
-                }
-            }
-            x.tanh()?
         }
         NodeKind::Relu { a } => {
             let a = ev.value(a.id)?;
-            if a.device().is_cpu() {
-                return bridge::to_candle(&bridge::from_candle(&a)?.relu());
+            match &a {
+                val::Val::Cpu(t) => val::Val::Cpu(t.relu()),
+                val::Val::Metal(t) => val::Val::Metal(metal_native::relu(t)?),
             }
-            if a.device().is_metal() {
-                if let Ok(t) = metal_eval::relu(&a) {
-                    return Ok(t);
-                }
-            }
-            a.maximum(&a.zeros_like()?)?
         }
         NodeKind::Erf { a } => {
             let x = ev.value(a.id)?;
-            if x.device().is_cpu() {
-                return bridge::to_candle(&bridge::from_candle(&x)?.erf());
+            match &x {
+                val::Val::Cpu(t) => val::Val::Cpu(t.erf()),
+                val::Val::Metal(t) => val::Val::Metal(metal_native::unary_promote(t, metal_native::UnOp::Erf)?),
             }
-            if x.device().is_metal() {
-                if let Ok(t) = metal_eval::unary(&x, metal_eval::UnOp::Erf) {
-                    return Ok(t);
-                }
-            }
-            x.erf()?
         }
         NodeKind::Floor { a } => {
             let x = ev.value(a.id)?;
-            if x.device().is_cpu() {
-                return bridge::to_candle(&bridge::from_candle(&x)?.floor());
+            match &x {
+                val::Val::Cpu(t) => val::Val::Cpu(t.floor()),
+                val::Val::Metal(t) => val::Val::Metal(metal_native::unary_promote(t, metal_native::UnOp::Floor)?),
             }
-            if x.device().is_metal() {
-                if let Ok(t) = metal_eval::unary(&x, metal_eval::UnOp::Floor) {
-                    return Ok(t);
-                }
-            }
-            x.floor()?
         }
         NodeKind::Ceil { a } => {
             let x = ev.value(a.id)?;
-            if x.device().is_cpu() {
-                return bridge::to_candle(&bridge::from_candle(&x)?.ceil());
+            match &x {
+                val::Val::Cpu(t) => val::Val::Cpu(t.ceil()),
+                val::Val::Metal(t) => val::Val::Metal(metal_native::unary_promote(t, metal_native::UnOp::Ceil)?),
             }
-            if x.device().is_metal() {
-                if let Ok(t) = metal_eval::unary(&x, metal_eval::UnOp::Ceil) {
-                    return Ok(t);
-                }
-            }
-            x.ceil()?
         }
         NodeKind::Round { a } => {
             let x = ev.value(a.id)?;
-            if x.device().is_cpu() {
-                return bridge::to_candle(&bridge::from_candle(&x)?.round());
+            match &x {
+                val::Val::Cpu(t) => val::Val::Cpu(t.round()),
+                val::Val::Metal(t) => val::Val::Metal(metal_native::unary_promote(t, metal_native::UnOp::Round)?),
             }
-            if x.device().is_metal() {
-                if let Ok(t) = metal_eval::unary(&x, metal_eval::UnOp::Round) {
-                    return Ok(t);
-                }
-            }
-            x.round()?
         }
         NodeKind::Sign { a } => {
             let x = ev.value(a.id)?;
-            if x.device().is_cpu() {
-                return bridge::to_candle(&bridge::from_candle(&x)?.sign());
+            match &x {
+                val::Val::Cpu(t) => val::Val::Cpu(t.sign()),
+                val::Val::Metal(t) => val::Val::Metal(metal_native::unary_promote(t, metal_native::UnOp::Sign)?),
             }
-            if x.device().is_metal() {
-                if let Ok(t) = metal_eval::unary(&x, metal_eval::UnOp::Sign) {
-                    return Ok(t);
-                }
-            }
-            x.sign()?
         }
         NodeKind::Where { cond, a, b } => {
             let cond = ev.value(cond.id)?;
             let a = ev.value(a.id)?;
             let b = ev.value(b.id)?;
-            if a.device().is_cpu() {
-                return bridge::to_candle(
-                    &bridge::from_candle(&a)?.where_(&bridge::from_candle(&cond)?, &bridge::from_candle(&b)?),
-                );
-            }
-            if a.device().is_metal() {
-                if let Ok(t) = metal_eval::where_(&cond, &a, &b) {
-                    return Ok(t);
+            match (&a, &b, &cond) {
+                (val::Val::Cpu(x), val::Val::Cpu(y), val::Val::Cpu(c)) => {
+                    val::Val::Cpu(x.where_(c, y))
                 }
+                (val::Val::Metal(x), val::Val::Metal(y), val::Val::Metal(c)) => {
+                    val::Val::Metal(metal_native::where_(c, x, y)?)
+                }
+                _ => return Err("device mismatch".to_string()),
             }
-            let shape = cond
-                .shape()
-                .broadcast_shape_binary_op(a.shape(), "where")?
-                .broadcast_shape_binary_op(b.shape(), "where")?;
-            let cond = cond.broadcast_as(shape.clone())?;
-            let a = a.broadcast_as(shape.clone())?;
-            let b = b.broadcast_as(shape)?;
-            cond.where_cond(&a, &b)?
         }
         NodeKind::Argmax { a, dim } => {
             let x = ev.value(a.id)?;
-            if x.device().is_cpu() {
-                let r = bridge::from_candle(&x)?.argmax(*dim).cast(runtime::dtype::DType::I64);
-                return bridge::to_candle(&r);
+            match &x {
+                val::Val::Cpu(t) => val::Val::Cpu(t.argmax(*dim).cast(runtime::dtype::DType::I64)),
+                val::Val::Metal(t) => {
+                    let r = metal_native::argreduce(t, *dim, true)?;
+                    val::Val::Metal(metal_native::cast(&r, crate::runtime::dtype::DType::I64)?)
+                }
             }
-            if x.device().is_metal() {
-                let w = bridge::metal::wrap(&x)?;
-                let w = if w.layout.is_contiguous() { w } else { runtime::metal::kernels::strided_copy(runtime::metal::device::MetalDevice::get(), &w).map_err(candle_core::Error::Msg)? };
-                let r = runtime::metal::kernels::argreduce(runtime::metal::device::MetalDevice::get(), &w, *dim, true)
-                    .map_err(candle_core::Error::Msg)?;
-                let r = runtime::metal::kernels::cast(runtime::metal::device::MetalDevice::get(), &r, crate::runtime::dtype::DType::I64)
-                    .map_err(candle_core::Error::Msg)?;
-                return bridge::metal::unwrap(&r.buffer, r.layout.shape().to_vec(), DType::I64, x.device().as_metal_device()?);
-            }
-            x.argmax(*dim)?.to_dtype(DType::I64)?
         }
         NodeKind::Argmin { a, dim } => {
             let x = ev.value(a.id)?;
-            if x.device().is_cpu() {
-                let r = bridge::from_candle(&x)?.argmin(*dim).cast(runtime::dtype::DType::I64);
-                return bridge::to_candle(&r);
+            match &x {
+                val::Val::Cpu(t) => val::Val::Cpu(t.argmin(*dim).cast(runtime::dtype::DType::I64)),
+                val::Val::Metal(t) => {
+                    let r = metal_native::argreduce(t, *dim, false)?;
+                    val::Val::Metal(metal_native::cast(&r, crate::runtime::dtype::DType::I64)?)
+                }
             }
-            if x.device().is_metal() {
-                let w = bridge::metal::wrap(&x)?;
-                let w = if w.layout.is_contiguous() { w } else { runtime::metal::kernels::strided_copy(runtime::metal::device::MetalDevice::get(), &w).map_err(candle_core::Error::Msg)? };
-                let r = runtime::metal::kernels::argreduce(runtime::metal::device::MetalDevice::get(), &w, *dim, false)
-                    .map_err(candle_core::Error::Msg)?;
-                let r = runtime::metal::kernels::cast(runtime::metal::device::MetalDevice::get(), &r, crate::runtime::dtype::DType::I64)
-                    .map_err(candle_core::Error::Msg)?;
-                return bridge::metal::unwrap(&r.buffer, r.layout.shape().to_vec(), DType::I64, x.device().as_metal_device()?);
-            }
-            x.argmin(*dim)?.to_dtype(DType::I64)?
         }
         NodeKind::Cumsum { a, dim } => {
             let x = ev.value(a.id)?;
-            if x.device().is_cpu() {
-                return bridge::to_candle(&bridge::from_candle(&x)?.cumsum(*dim));
+            match &x {
+                val::Val::Cpu(t) => val::Val::Cpu(t.cumsum(*dim)),
+                val::Val::Metal(t) => val::Val::Metal(metal_native::cumsum(t, *dim)?),
             }
-            if x.device().is_metal() {
-                let w = bridge::metal::wrap(&x)?;
-                let w = if w.layout.is_contiguous() { w } else { runtime::metal::kernels::strided_copy(runtime::metal::device::MetalDevice::get(), &w).map_err(candle_core::Error::Msg)? };
-                let r = runtime::metal::kernels::cumsum(runtime::metal::device::MetalDevice::get(), &w, *dim)
-                    .map_err(candle_core::Error::Msg)?;
-                return bridge::metal::unwrap(&r.buffer, r.layout.shape().to_vec(), x.dtype(), x.device().as_metal_device()?);
-            }
-            // cumsum is implemented as a matmul internally and chokes on
-            // stride-0 broadcast inputs
-            x.contiguous()?.cumsum(*dim)?
         }
         NodeKind::ScatterAdd {
             a,
@@ -4834,49 +4294,42 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> candle_core::Result<Te
             let a = ev.value(a.id)?;
             let indexes = ev.value(indexes.id)?;
             let src = ev.value(src.id)?;
-            if a.device().is_cpu() {
-                let r = bridge::from_candle(&a)?.scatter_add(
-                    *dim,
-                    &bridge::from_candle(&indexes)?,
-                    &bridge::from_candle(&src)?,
-                );
-                return bridge::to_candle(&r);
-            }
-            if a.device().is_metal() {
-                if let Ok(t) = metal_eval::scatter_add(&a, *dim, &indexes, &src) {
-                    return Ok(t);
+            match (&a, &src) {
+                (val::Val::Cpu(x), val::Val::Cpu(s)) => {
+                    val::Val::Cpu(x.scatter_add(*dim, indexes.as_cpu()?, s))
                 }
+                (val::Val::Metal(x), val::Val::Metal(s)) => {
+                    let ids = index_ids_u32(&indexes)?;
+                    val::Val::Metal(metal_native::scatter_add(x, *dim, &ids, s)?)
+                }
+                _ => return Err("device mismatch".to_string()),
             }
-            a.contiguous()?
-                .scatter_add(&indexes.contiguous()?, &src.contiguous()?, *dim)?
         }
         NodeKind::Gather { a, dim, indexes } => {
             let a = ev.value(a.id)?;
             let indexes = ev.value(indexes.id)?;
-            if a.device().is_cpu() {
-                let r = bridge::from_candle(&a)?.gather(*dim, &bridge::from_candle(&indexes)?);
-                return bridge::to_candle(&r);
-            }
-            if a.device().is_metal() {
-                if let Ok(t) = metal_eval::gather(&a, *dim, &indexes) {
-                    return Ok(t);
+            match &a {
+                val::Val::Cpu(x) => {
+                    val::Val::Cpu(x.gather(*dim, indexes.as_cpu()?))
+                }
+                val::Val::Metal(x) => {
+                    let ids = index_ids_u32(&indexes)?;
+                    val::Val::Metal(metal_native::gather(x, *dim, &ids, &indexes.shape())?)
                 }
             }
-            a.contiguous()?.gather(&indexes.contiguous()?, *dim)?
         }
         NodeKind::IndexSelect { a, dim, indexes } => {
             let a = ev.value(a.id)?;
             let indexes = ev.value(indexes.id)?;
-            if a.device().is_cpu() {
-                let r = bridge::from_candle(&a)?.index_select(*dim, &bridge::from_candle(&indexes)?);
-                return bridge::to_candle(&r);
-            }
-            if a.device().is_metal() {
-                if let Ok(t) = metal_eval::index_select(&a, *dim, &indexes) {
-                    return Ok(t);
+            match &a {
+                val::Val::Cpu(x) => {
+                    val::Val::Cpu(x.index_select(*dim, indexes.as_cpu()?))
+                }
+                val::Val::Metal(x) => {
+                    let ids = index_ids_u32(&indexes)?;
+                    val::Val::Metal(metal_native::index_select(x, *dim, &ids)?)
                 }
             }
-            a.contiguous()?.index_select(&indexes, *dim)?
         }
         NodeKind::CrossEntropy {
             logits,
@@ -4885,20 +4338,24 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> candle_core::Result<Te
         } => {
             let logits_t = ev.value(logits.id)?;
             let target_t = ev.value(target.id)?;
-            if loss::is_supported(&logits_t, &target_t) {
-                let (loss_t, status) = loss::ce_forward(&logits_t, &target_t, *ignore_index)?;
-                ev.ce_checks.push((status, true, logits_t.elem_count() / logits_t.dim(logits_t.rank() - 1)?));
-                loss_t
-            } else if logits_t.device().is_cpu() {
-                let r = runtime::cpu::composed::cross_entropy_forward(
-                    &bridge::from_candle(&logits_t)?,
-                    &bridge::from_candle(&target_t)?,
-                    *ignore_index,
-                )
-                .map_err(candle_core::Error::Msg)?;
-                return bridge::to_candle(&r);
-            } else {
-                cross_entropy_forward(&logits_t, &target_t, *ignore_index)?
+            match (&logits_t, &target_t) {
+                (val::Val::Cpu(l), val::Val::Cpu(t)) => {
+                    let r = runtime::cpu::composed::cross_entropy_forward(l, t, *ignore_index)?;
+                    val::Val::Cpu(r)
+                }
+                (val::Val::Metal(l), val::Val::Metal(t)) => {
+                    if loss::is_supported(l, t) {
+                        let (loss_t, status) = loss::ce_forward(l, t, *ignore_index)?;
+                        let classes = l.layout.shape()[l.layout.shape().len() - 1];
+                        ev.ce_checks.push((val::Val::Metal(status), true, l.numel() / classes));
+                        val::Val::Metal(loss_t)
+                    } else {
+                        let l32 = metal_native::to_f32(l)?;
+                        let r = metal_native::composed::cross_entropy_forward(&l32, t, *ignore_index)?;
+                        val::Val::Metal(r)
+                    }
+                }
+                _ => return Err("device mismatch".to_string()),
             }
         }
         NodeKind::CrossEntropyBackward {
@@ -4908,20 +4365,23 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> candle_core::Result<Te
         } => {
             let logits_t = ev.value(logits.id)?;
             let target_t = ev.value(target.id)?;
-            if loss::is_supported(&logits_t, &target_t) {
-                let (grad, count) = loss::ce_backward(&logits_t, &target_t, *ignore_index)?;
-                ev.ce_checks.push((count, false, 0));
-                grad
-            } else if logits_t.device().is_cpu() {
-                let r = runtime::cpu::composed::cross_entropy_backward(
-                    &bridge::from_candle(&logits_t)?,
-                    &bridge::from_candle(&target_t)?,
-                    *ignore_index,
-                )
-                .map_err(candle_core::Error::Msg)?;
-                return bridge::to_candle(&r);
-            } else {
-                cross_entropy_backward(&logits_t, &target_t, *ignore_index)?
+            match (&logits_t, &target_t) {
+                (val::Val::Cpu(l), val::Val::Cpu(t)) => {
+                    let r = runtime::cpu::composed::cross_entropy_backward(l, t, *ignore_index)?;
+                    val::Val::Cpu(r)
+                }
+                (val::Val::Metal(l), val::Val::Metal(t)) => {
+                    if loss::is_supported(l, t) {
+                        let (grad, count) = loss::ce_backward(l, t, *ignore_index)?;
+                        ev.ce_checks.push((val::Val::Metal(count), false, 0));
+                        val::Val::Metal(grad)
+                    } else {
+                        let l32 = metal_native::to_f32(l)?;
+                        let r = metal_native::composed::cross_entropy_backward(&l32, t, *ignore_index)?;
+                        val::Val::Metal(r)
+                    }
+                }
+                _ => return Err("device mismatch".to_string()),
             }
         }
         NodeKind::Sdpa {
@@ -4932,23 +4392,28 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> candle_core::Result<Te
             causal,
         } => {
             let q = ev.value(q.id)?;
-            if flash::is_supported(&q) {
-                let (o, l) = flash::forward(&q, &ev.value(k.id)?, &ev.value(v.id)?, *scale, *causal)?;
-                // L rides the evaluator for the chunked backward; the
-                // node's own cache entry holds O.
-                ev.multi.insert(node.id, vec![o.clone(), l]);
-                o
-            } else if q.device().is_cpu() {
-                let r = runtime::cpu::composed::sdpa_forward(
-                    &bridge::from_candle(&q)?,
-                    &bridge::from_candle(&ev.value(k.id)?)?,
-                    &bridge::from_candle(&ev.value(v.id)?)?,
-                    *scale,
-                    *causal,
-                );
-                return bridge::to_candle(&r);
-            } else {
-                sdpa_forward(&q, &ev.value(k.id)?, &ev.value(v.id)?, *scale, *causal)?
+            let k = ev.value(k.id)?;
+            let v = ev.value(v.id)?;
+            match (&q, &k, &v) {
+                (val::Val::Cpu(q), val::Val::Cpu(k), val::Val::Cpu(v)) => {
+                    val::Val::Cpu(runtime::cpu::composed::sdpa_forward(q, k, v, *scale, *causal))
+                }
+                (val::Val::Metal(q), val::Val::Metal(k), val::Val::Metal(v)) => {
+                    if q.dtype == runtime::dtype::DType::F32 {
+                        let (o, l) = flash::forward(q, k, v, *scale, *causal)?;
+                        // L rides the evaluator for the chunked backward; the
+                        // node's own cache entry holds O.
+                        ev.multi.insert(node.id, vec![val::Val::Metal(o.clone()), val::Val::Metal(l)]);
+                        val::Val::Metal(o)
+                    } else {
+                        let q32 = metal_native::to_f32(q)?;
+                        let k32 = metal_native::to_f32(k)?;
+                        let v32 = metal_native::to_f32(v)?;
+                        let r = metal_native::composed::sdpa_forward(&q32, &k32, &v32, *scale, *causal)?;
+                        val::Val::Metal(metal_native::from_f32(&r, q.dtype)?)
+                    }
+                }
+                _ => return Err("device mismatch".to_string()),
             }
         }
         NodeKind::SdpaBackward {
@@ -4961,35 +4426,44 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> candle_core::Result<Te
             causal,
         } => {
             let q = ev.value(q.id)?;
+            let k = ev.value(k.id)?;
+            let v = ev.value(v.id)?;
+            let g = ev.value(g.id)?;
             let o = ev.value(fwd.id)?;
             let l = ev.multi.get(&fwd.id).and_then(|outs| outs.get(1)).cloned();
-            let (dq, dk, dv) = match l {
-                Some(l) if flash::is_supported(&q) => flash::backward(
-                    &q,
-                    &ev.value(k.id)?,
-                    &ev.value(v.id)?,
-                    &o,
-                    &l,
-                    &ev.value(g.id)?,
-                    *scale,
-                    *causal,
-                )?,
-                _ => {
-                    let (kk, kv_, kg) = (ev.value(k.id)?, ev.value(v.id)?, ev.value(g.id)?);
-                    if q.device().is_cpu() {
-                        let (dq, dk, dv) = runtime::cpu::composed::sdpa_backward(
-                            &bridge::from_candle(&q)?,
-                            &bridge::from_candle(&kk)?,
-                            &bridge::from_candle(&kv_)?,
-                            &bridge::from_candle(&kg)?,
-                            *scale,
-                            *causal,
-                        );
-                        (bridge::to_candle(&dq)?, bridge::to_candle(&dk)?, bridge::to_candle(&dv)?)
+            let (dq, dk, dv) = match (&q, &k, &v, &g) {
+                (val::Val::Cpu(q), val::Val::Cpu(k), val::Val::Cpu(v), val::Val::Cpu(g)) => {
+                    let (dq, dk, dv) = runtime::cpu::composed::sdpa_backward(q, k, v, g, *scale, *causal);
+                    (
+                        val::Val::Cpu(dq),
+                        val::Val::Cpu(dk),
+                        val::Val::Cpu(dv),
+                    )
+                }
+                (val::Val::Metal(q), val::Val::Metal(k), val::Val::Metal(v), val::Val::Metal(g)) => {
+                    if let (Some(val::Val::Metal(l)), true) = (&l, q.dtype == runtime::dtype::DType::F32) {
+                        let o = o.as_metal()?;
+                        let (dq, dk, dv) = flash::backward_fused(q, k, v, o, l, g, *scale, *causal)?;
+                        (
+                            val::Val::Metal(dq),
+                            val::Val::Metal(dk),
+                            val::Val::Metal(dv),
+                        )
                     } else {
-                        sdpa_backward(&q, &kk, &kv_, &kg, *scale, *causal)?
+                        let q32 = metal_native::to_f32(q)?;
+                        let k32 = metal_native::to_f32(k)?;
+                        let v32 = metal_native::to_f32(v)?;
+                        let g32 = metal_native::to_f32(g)?;
+                        let (dq, dk, dv) =
+                            metal_native::composed::sdpa_backward(&q32, &k32, &v32, &g32, *scale, *causal)?;
+                        (
+                            val::Val::Metal(metal_native::from_f32(&dq, q.dtype)?),
+                            val::Val::Metal(metal_native::from_f32(&dk, q.dtype)?),
+                            val::Val::Metal(metal_native::from_f32(&dv, q.dtype)?),
+                        )
                     }
                 }
+                _ => return Err("device mismatch".to_string()),
             };
             ev.multi.insert(node.id, vec![dq.clone(), dk, dv]);
             dq
@@ -5000,16 +4474,23 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> candle_core::Result<Te
             .and_then(|outs| outs.get(*index as usize))
             .cloned()
             .ok_or_else(|| {
-                candle_core::Error::Msg("sdpa backward out: outputs missing".to_string())
+                err::err_str("sdpa backward out: outputs missing".to_string())
             })?,
         NodeKind::PositionEmbedding { weight, seq_len } => {
             let w = ev.value(weight.id)?;
-            if w.device().is_cpu() {
-                let r = bridge::from_candle(&w)?;
-                let r = r.view(r.layout.narrow(0, 0, *seq_len)).contiguous();
-                return bridge::to_candle(&r);
+            match &w {
+                val::Val::Cpu(w) => {
+                    val::Val::Cpu(w.view(w.layout.narrow(0, 0, *seq_len)).contiguous())
+                }
+                val::Val::Metal(w) => {
+                    let n = runtime::metal::run::MetalTensor {
+                        buffer: w.buffer.clone(),
+                        layout: w.layout.narrow(0, 0, *seq_len),
+                        dtype: w.dtype,
+                    };
+                    val::Val::Metal(metal_native::contiguous(&n)?)
+                }
             }
-            w.narrow(0, 0, *seq_len)?.contiguous()?
         },
         NodeKind::KvAttention {
             q,
@@ -5020,7 +4501,7 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> candle_core::Result<Te
             window,
         } => {
             let kv = ev.kv.clone().ok_or_else(|| {
-                candle_core::Error::Msg(
+                err::err_str(
                     "kv attention: node evaluates only inside a kv program run".to_string(),
                 )
             })?;
@@ -5040,7 +4521,7 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> candle_core::Result<Te
                 PositionOffset::Absolute => vec![0usize],
                 PositionOffset::Cursor => {
                     let kv = ev.kv.as_ref().ok_or_else(|| {
-                        candle_core::Error::Msg(
+                        err::err_str(
                             "rotary embedding: cursor offset outside a kv program run".to_string(),
                         )
                     })?;
@@ -5048,7 +4529,7 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> candle_core::Result<Te
                     let mut offsets = Vec::with_capacity(kv.slots.len());
                     for slot in &kv.slots {
                         offsets.push(slot.lock().map_err(|e| {
-                            candle_core::Error::Msg(format!(
+                            err::err_str(format!(
                                 "rotary embedding: sequence lock poisoned: {e}"
                             ))
                         })?.cursor);
@@ -5056,79 +4537,133 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> candle_core::Result<Te
                     offsets
                 }
             };
-            if rotary::is_supported(&x) {
-                rotary::rotary(&x, &offsets, *theta, 1.0)?
-            } else if x.device().is_cpu() {
-                let r = runtime::cpu::composed::rotary_forward(&bridge::from_candle(&x)?, &offsets, *theta, 1.0)
-                    .map_err(candle_core::Error::Msg)?;
-                return bridge::to_candle(&r);
-            } else {
-                rotary_forward(&x, &offsets, *theta, 1.0)?
+            match &x {
+                val::Val::Cpu(x) => {
+                    let r = runtime::cpu::composed::rotary_forward(x, &offsets, *theta, 1.0)
+                        .map_err(|e| e)?;
+                    val::Val::Cpu(r)
+                }
+                val::Val::Metal(x) => {
+                    if x.dtype == runtime::dtype::DType::F32 {
+                        val::Val::Metal(rotary::rotary(x, &offsets, *theta, 1.0)?)
+                    } else {
+                        let x32 = metal_native::to_f32(x)?;
+                        let r = metal_native::composed::rotary_forward(&x32, &offsets, *theta, 1.0)?;
+                        val::Val::Metal(metal_native::from_f32(&r, x.dtype)?)
+                    }
+                }
             }
         }
         NodeKind::RotaryEmbeddingBackward { g, theta, .. } => {
             let g = ev.value(g.id)?;
-            if rotary::is_supported(&g) {
-                rotary::rotary(&g, &[0usize], *theta, -1.0)?
-            } else if g.device().is_cpu() {
-                let r = runtime::cpu::composed::rotary_forward(&bridge::from_candle(&g)?, &[0usize], *theta, -1.0)
-                    .map_err(candle_core::Error::Msg)?;
-                return bridge::to_candle(&r);
-            } else {
-                // Transpose rotation == forward with negated angles.
-                rotary_forward(&g, &[0usize], *theta, -1.0)?
+            match &g {
+                val::Val::Cpu(g) => {
+                    let r = runtime::cpu::composed::rotary_forward(g, &[0usize], *theta, -1.0)
+                        .map_err(|e| e)?;
+                    val::Val::Cpu(r)
+                }
+                val::Val::Metal(g) => {
+                    if g.dtype == runtime::dtype::DType::F32 {
+                        // Transpose rotation == forward with negated angles.
+                        val::Val::Metal(rotary::rotary(g, &[0usize], *theta, -1.0)?)
+                    } else {
+                        let g32 = metal_native::to_f32(g)?;
+                        let r = metal_native::composed::rotary_forward(&g32, &[0usize], *theta, -1.0)?;
+                        val::Val::Metal(metal_native::from_f32(&r, g.dtype)?)
+                    }
+                }
             }
         }
         NodeKind::Linear { x, weight, bias } => {
             let x = ev.value(x.id)?;
             let weight = ev.value(weight.id)?;
             let bias = ev.value(bias.id)?;
-            if gemm::is_supported(&x, &weight) {
-                gemm::linear_forward(&x, &weight, &bias)?
-            } else if x.device().is_cpu() {
-                let r = bridge::from_candle(&x)?
-                    .matmul(&bridge::from_candle(&weight)?)
-                    .add(&bridge::from_candle(&bias)?);
-                return bridge::to_candle(&r);
-            } else {
-                x.broadcast_matmul(&weight)?.broadcast_add(&bias)?
+            match (&x, &weight, &bias) {
+                (val::Val::Cpu(x), val::Val::Cpu(w), val::Val::Cpu(b)) => {
+                    val::Val::Cpu(x.matmul(w).add(b))
+                }
+                (val::Val::Metal(x), val::Val::Metal(w), val::Val::Metal(b)) => {
+                    if x.dtype == runtime::dtype::DType::F32 {
+                        val::Val::Metal(gemm::linear_forward(x, w, b)?)
+                    } else {
+                        let x32 = metal_native::to_f32(x)?;
+                        let w32 = metal_native::to_f32(w)?;
+                        let b32 = metal_native::to_f32(b)?;
+                        let r = metal_native::binary(
+                            &metal_native::matmul(&x32, &w32)?,
+                            &b32,
+                            metal_native::BinOp::Add,
+                        )?;
+                        val::Val::Metal(metal_native::from_f32(&r, x.dtype)?)
+                    }
+                }
+                _ => return Err("device mismatch".to_string()),
             }
         }
         NodeKind::LayerNorm { x, weight, bias, eps } => {
             let x = ev.value(x.id)?;
             let weight = ev.value(weight.id)?;
             let bias = ev.value(bias.id)?;
-            if layer_norm::is_supported(&x, &weight) {
-                layer_norm::ln_forward(&x, &weight, &bias, *eps)?
-            } else if x.device().is_cpu() {
-                let r = runtime::cpu::composed::layer_norm_forward(
-                    &bridge::from_candle(&x)?,
-                    &bridge::from_candle(&weight)?,
-                    &bridge::from_candle(&bias)?,
-                    *eps,
-                );
-                return bridge::to_candle(&r);
-            } else {
-                layer_norm_composed(&x, &weight, &bias, *eps)?
+            match (&x, &weight, &bias) {
+                (val::Val::Cpu(x), val::Val::Cpu(w), val::Val::Cpu(b)) => {
+                    val::Val::Cpu(runtime::cpu::composed::layer_norm_forward(x, w, b, *eps))
+                }
+                (val::Val::Metal(x), val::Val::Metal(w), val::Val::Metal(b)) => {
+                    if layer_norm::is_supported(x, w) {
+                        val::Val::Metal(layer_norm::ln_forward(x, w, b, *eps)?)
+                    } else {
+                        let x32 = metal_native::to_f32(x)?;
+                        let w32 = metal_native::to_f32(w)?;
+                        let b32 = metal_native::to_f32(b)?;
+                        let r = metal_native::composed::layer_norm_forward(&x32, &w32, &b32, *eps)?;
+                        val::Val::Metal(metal_native::from_f32(&r, x.dtype)?)
+                    }
+                }
+                _ => return Err("device mismatch".to_string()),
             }
         }
         NodeKind::LayerNormBackward { x, weight, g, eps } => {
             let x = ev.value(x.id)?;
             let weight = ev.value(weight.id)?;
             let g = ev.value(g.id)?;
-            if x.device().is_cpu() {
-                let (dx, dw, db) = runtime::cpu::composed::layer_norm_backward(
-                    &bridge::from_candle(&x)?,
-                    &bridge::from_candle(&weight)?,
-                    &bridge::from_candle(&g)?,
-                    *eps,
-                );
-                ev.ln.insert(node.id, [bridge::to_candle(&dw)?, bridge::to_candle(&db)?]);
-                return bridge::to_candle(&dx);
+            match (&x, &weight, &g) {
+                (val::Val::Cpu(x), val::Val::Cpu(w), val::Val::Cpu(g)) => {
+                    let (dx, dw, db) = runtime::cpu::composed::layer_norm_backward(x, w, g, *eps);
+                    ev.ln.insert(node.id, [val::Val::Cpu(dw), val::Val::Cpu(db)]);
+                    val::Val::Cpu(dx)
+                }
+                (val::Val::Metal(x), val::Val::Metal(w), val::Val::Metal(g)) => {
+                    if layer_norm::is_supported(x, w) {
+                        let (dx, xh) = layer_norm::ln_backward(x, w, g, *eps)?;
+                        let dw = metal_native::reduce(
+                            &metal_native::binary(g, &xh, metal_native::BinOp::Mul)?,
+                            &(0..x.layout.shape().len() - w.layout.shape().len()).collect::<Vec<_>>(),
+                            false,
+                            crate::fusion::ReduceOp::Sum,
+                        )?;
+                        let db = metal_native::reduce(
+                            g,
+                            &(0..x.layout.shape().len() - w.layout.shape().len()).collect::<Vec<_>>(),
+                            false,
+                            crate::fusion::ReduceOp::Sum,
+                        )?;
+                        ev.ln.insert(node.id, [val::Val::Metal(dw), val::Val::Metal(db)]);
+                        val::Val::Metal(dx)
+                    } else {
+                        let x32 = metal_native::to_f32(x)?;
+                        let w32 = metal_native::to_f32(w)?;
+                        let g32 = metal_native::to_f32(g)?;
+                        let (dx, dw, db) =
+                            metal_native::composed::layer_norm_backward(&x32, &w32, &g32, *eps)?;
+                        ev.ln.insert(node.id, [
+                            val::Val::Metal(metal_native::from_f32(&dw, w.dtype)?),
+                            val::Val::Metal(metal_native::from_f32(&db, w.dtype)?),
+                        ]);
+                        val::Val::Metal(metal_native::from_f32(&dx, x.dtype)?)
+                    }
+                }
+                _ => return Err("device mismatch".to_string()),
             }
-            let (dx, dw, db) = layer_norm_backward(&x, &weight, &g, *eps)?;
-            ev.ln.insert(node.id, [dw, db]);
-            dx
         }
         NodeKind::LayerNormBackwardOut { of, index } => {
             let _ = ev.value(of.id)?;
@@ -5137,7 +4672,7 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> candle_core::Result<Te
                 .and_then(|outs| outs.get(*index as usize - 1))
                 .cloned()
                 .ok_or_else(|| {
-                    candle_core::Error::Msg(
+                    err::err_str(
                         "layer_norm_backward_out: backward node has no stored outputs".to_string(),
                     )
                 })?
@@ -5152,28 +4687,25 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> candle_core::Result<Te
         } => {
             let x = ev.value(x.id)?;
             let w = ev.value(w.id)?;
-            if x.device().is_cpu() {
-                let r = runtime::cpu::conv::conv1d(
-                    &bridge::from_candle(&x)?,
-                    &bridge::from_candle(&w)?,
-                    *stride,
-                    *padding,
-                    *dilation,
-                    *groups,
-                );
-                return bridge::to_candle(&r);
+            match (&x, &w) {
+                (val::Val::Cpu(x), val::Val::Cpu(w)) => {
+                    val::Val::Cpu(runtime::cpu::conv::conv1d(x, w, *stride, *padding, *dilation, *groups))
+                }
+                (val::Val::Metal(x), val::Val::Metal(w)) => {
+                    let xn = metal_native::contiguous(x)?;
+                    let wn = metal_native::contiguous(w)?;
+                    val::Val::Metal(runtime::metal::conv::conv1d(
+                        runtime::metal::device::MetalDevice::get(),
+                        &xn,
+                        &wn,
+                        *stride,
+                        *padding,
+                        *dilation,
+                        *groups,
+                    )?)
+                }
+                _ => return Err("device mismatch".to_string()),
             }
-            if x.device().is_metal() {
-                let xn = bridge::metal::wrap(&x)?;
-                let xn = if xn.layout.is_contiguous() { xn } else { runtime::metal::kernels::strided_copy(runtime::metal::device::MetalDevice::get(), &xn).map_err(candle_core::Error::Msg)? };
-                let wn = bridge::metal::wrap(&w)?;
-                let wn = if wn.layout.is_contiguous() { wn } else { runtime::metal::kernels::strided_copy(runtime::metal::device::MetalDevice::get(), &wn).map_err(candle_core::Error::Msg)? };
-                let r = runtime::metal::conv::conv1d(runtime::metal::device::MetalDevice::get(), &xn, &wn, *stride, *padding, *dilation, *groups)
-                    .map_err(candle_core::Error::Msg)?;
-                return bridge::metal::unwrap(&r.buffer, r.layout.shape().to_vec(), x.dtype(), x.device().as_metal_device()?);
-            }
-            x.contiguous()?
-                .conv1d(&w.contiguous()?, *padding, *stride, *dilation, *groups)?
         }
         NodeKind::Conv2d {
             x,
@@ -5185,28 +4717,25 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> candle_core::Result<Te
         } => {
             let x = ev.value(x.id)?;
             let w = ev.value(w.id)?;
-            if x.device().is_cpu() {
-                let r = runtime::cpu::conv::conv2d(
-                    &bridge::from_candle(&x)?,
-                    &bridge::from_candle(&w)?,
-                    *stride,
-                    *padding,
-                    *dilation,
-                    *groups,
-                );
-                return bridge::to_candle(&r);
+            match (&x, &w) {
+                (val::Val::Cpu(x), val::Val::Cpu(w)) => {
+                    val::Val::Cpu(runtime::cpu::conv::conv2d(x, w, *stride, *padding, *dilation, *groups))
+                }
+                (val::Val::Metal(x), val::Val::Metal(w)) => {
+                    let xn = metal_native::contiguous(x)?;
+                    let wn = metal_native::contiguous(w)?;
+                    val::Val::Metal(runtime::metal::conv::conv2d(
+                        runtime::metal::device::MetalDevice::get(),
+                        &xn,
+                        &wn,
+                        *stride,
+                        *padding,
+                        *dilation,
+                        *groups,
+                    )?)
+                }
+                _ => return Err("device mismatch".to_string()),
             }
-            if x.device().is_metal() {
-                let xn = bridge::metal::wrap(&x)?;
-                let xn = if xn.layout.is_contiguous() { xn } else { runtime::metal::kernels::strided_copy(runtime::metal::device::MetalDevice::get(), &xn).map_err(candle_core::Error::Msg)? };
-                let wn = bridge::metal::wrap(&w)?;
-                let wn = if wn.layout.is_contiguous() { wn } else { runtime::metal::kernels::strided_copy(runtime::metal::device::MetalDevice::get(), &wn).map_err(candle_core::Error::Msg)? };
-                let r = runtime::metal::conv::conv2d(runtime::metal::device::MetalDevice::get(), &xn, &wn, *stride, *padding, *dilation, *groups)
-                    .map_err(candle_core::Error::Msg)?;
-                return bridge::metal::unwrap(&r.buffer, r.layout.shape().to_vec(), x.dtype(), x.device().as_metal_device()?);
-            }
-            x.contiguous()?
-                .conv2d(&w.contiguous()?, *padding, *stride, *dilation, *groups)?
         }
         NodeKind::ConvTranspose1d {
             x,
@@ -5219,35 +4748,34 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> candle_core::Result<Te
         } => {
             let x = ev.value(x.id)?;
             let w = ev.value(w.id)?;
-            if x.device().is_cpu() {
-                let r = runtime::cpu::conv::conv_transpose1d(
-                    &bridge::from_candle(&x)?,
-                    &bridge::from_candle(&w)?,
-                    *stride,
-                    *padding,
-                    *output_padding,
-                    *dilation,
-                    *groups,
-                );
-                return bridge::to_candle(&r);
+            match (&x, &w) {
+                (val::Val::Cpu(x), val::Val::Cpu(w)) => {
+                    val::Val::Cpu(runtime::cpu::conv::conv_transpose1d(
+                        x,
+                        w,
+                        *stride,
+                        *padding,
+                        *output_padding,
+                        *dilation,
+                        *groups,
+                    ))
+                }
+                (val::Val::Metal(x), val::Val::Metal(w)) => {
+                    let xn = metal_native::contiguous(x)?;
+                    let wn = metal_native::contiguous(w)?;
+                    val::Val::Metal(runtime::metal::conv::conv_transpose1d(
+                        runtime::metal::device::MetalDevice::get(),
+                        &xn,
+                        &wn,
+                        *stride,
+                        *padding,
+                        *output_padding,
+                        *dilation,
+                        *groups,
+                    )?)
+                }
+                _ => return Err("device mismatch".to_string()),
             }
-            if x.device().is_metal() {
-                let xn = bridge::metal::wrap(&x)?;
-                let xn = if xn.layout.is_contiguous() { xn } else { runtime::metal::kernels::strided_copy(runtime::metal::device::MetalDevice::get(), &xn).map_err(candle_core::Error::Msg)? };
-                let wn = bridge::metal::wrap(&w)?;
-                let wn = if wn.layout.is_contiguous() { wn } else { runtime::metal::kernels::strided_copy(runtime::metal::device::MetalDevice::get(), &wn).map_err(candle_core::Error::Msg)? };
-                let r = runtime::metal::conv::conv_transpose1d(runtime::metal::device::MetalDevice::get(), &xn, &wn, *stride, *padding, *output_padding, *dilation, *groups)
-                    .map_err(candle_core::Error::Msg)?;
-                return bridge::metal::unwrap(&r.buffer, r.layout.shape().to_vec(), x.dtype(), x.device().as_metal_device()?);
-            }
-            x.contiguous()?.conv_transpose1d(
-                &w.contiguous()?,
-                *padding,
-                *output_padding,
-                *stride,
-                *dilation,
-                *groups,
-            )?
         }
         NodeKind::ConvTranspose2d {
             x,
@@ -5260,50 +4788,33 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> candle_core::Result<Te
         } => {
             let x = ev.value(x.id)?;
             let w = ev.value(w.id)?;
-            if x.device().is_cpu() {
-                let r = runtime::cpu::conv::conv_transpose2d(
-                    &bridge::from_candle(&x)?,
-                    &bridge::from_candle(&w)?,
-                    *stride,
-                    *padding,
-                    *output_padding,
-                    *dilation,
-                    *groups,
-                );
-                return bridge::to_candle(&r);
-            }
-            if *groups == 1 {
-                if x.device().is_metal() {
-                    let xn = bridge::metal::wrap(&x)?;
-                    let xn = if xn.layout.is_contiguous() { xn } else { runtime::metal::kernels::strided_copy(runtime::metal::device::MetalDevice::get(), &xn).map_err(candle_core::Error::Msg)? };
-                    let wn = bridge::metal::wrap(&w)?;
-                    let wn = if wn.layout.is_contiguous() { wn } else { runtime::metal::kernels::strided_copy(runtime::metal::device::MetalDevice::get(), &wn).map_err(candle_core::Error::Msg)? };
-                    let r = runtime::metal::conv::conv_transpose2d(runtime::metal::device::MetalDevice::get(), &xn, &wn, *stride, *padding, *output_padding, *dilation, *groups)
-                        .map_err(candle_core::Error::Msg)?;
-                    return bridge::metal::unwrap(&r.buffer, r.layout.shape().to_vec(), x.dtype(), x.device().as_metal_device()?);
-                }
-                x.contiguous()?.conv_transpose2d(
-                    &w.contiguous()?,
-                    *padding,
-                    *output_padding,
-                    *stride,
-                    *dilation,
-                )?
-            } else {
-                // candle's conv_transpose2d has no groups parameter
-                let xs = x.chunk(*groups, 1)?;
-                let ws = w.chunk(*groups, 0)?;
-                let mut outs = Vec::with_capacity(*groups);
-                for (xb, wb) in xs.iter().zip(&ws) {
-                    outs.push(xb.contiguous()?.conv_transpose2d(
-                        &wb.contiguous()?,
+            match (&x, &w) {
+                (val::Val::Cpu(x), val::Val::Cpu(w)) => {
+                    val::Val::Cpu(runtime::cpu::conv::conv_transpose2d(
+                        x,
+                        w,
+                        *stride,
                         *padding,
                         *output_padding,
-                        *stride,
                         *dilation,
-                    )?);
+                        *groups,
+                    ))
                 }
-                Tensor::cat(&outs, 1)?
+                (val::Val::Metal(x), val::Val::Metal(w)) => {
+                    let xn = metal_native::contiguous(x)?;
+                    let wn = metal_native::contiguous(w)?;
+                    val::Val::Metal(runtime::metal::conv::conv_transpose2d(
+                        runtime::metal::device::MetalDevice::get(),
+                        &xn,
+                        &wn,
+                        *stride,
+                        *padding,
+                        *output_padding,
+                        *dilation,
+                        *groups,
+                    )?)
+                }
+                _ => return Err("device mismatch".to_string()),
             }
         }
         NodeKind::Conv1dBackwardW {
@@ -5318,71 +4829,59 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> candle_core::Result<Te
         } => {
             let x = ev.value(x.id)?;
             let g = ev.value(g.id)?;
-            if x.device().is_metal() {
-                let sq = |t: &Tensor| -> candle_core::Result<Tensor> {
-                    let s = t.dims();
-                    t.reshape((s[0], s[1], s[2], 1))
-                };
-                let xn = bridge::metal::wrap(&sq(&x)?)?;
-                let xn = if xn.layout.is_contiguous() { xn } else { runtime::metal::kernels::strided_copy(runtime::metal::device::MetalDevice::get(), &xn).map_err(candle_core::Error::Msg)? };
-                let gn = bridge::metal::wrap(&sq(&g)?)?;
-                let gn = if gn.layout.is_contiguous() { gn } else { runtime::metal::kernels::strided_copy(runtime::metal::device::MetalDevice::get(), &gn).map_err(candle_core::Error::Msg)? };
-                let dw = runtime::metal::conv::conv2d_backward_w(
-                    runtime::metal::device::MetalDevice::get(),
-                    &xn,
-                    &gn,
-                    [*kernel, 1],
-                    *out_channels,
-                    *stride,
-                    *padding,
-                    *dilation,
-                    *groups,
-                )
-                .map_err(candle_core::Error::Msg)?;
-                let s = dw.layout.shape().to_vec();
-                let dw3 = runtime::metal::run::MetalTensor {
-                    buffer: dw.buffer,
+            let squeeze4 = |t: &runtime::metal::run::MetalTensor| -> runtime::metal::run::MetalTensor {
+                let s = t.layout.shape();
+                runtime::metal::run::MetalTensor {
+                    buffer: t.buffer.clone(),
+                    layout: runtime::layout::Layout::contiguous(vec![s[0], s[1], s[2], 1]),
+                    dtype: t.dtype,
+                }
+            };
+            let squeeze3 = |t: &runtime::metal::run::MetalTensor| -> runtime::metal::run::MetalTensor {
+                let s = t.layout.shape();
+                runtime::metal::run::MetalTensor {
+                    buffer: t.buffer.clone(),
                     layout: runtime::layout::Layout::contiguous(vec![s[0], s[1], s[2]]),
-                    dtype: dw.dtype,
-                };
-                return bridge::metal::unwrap(&dw3.buffer, dw3.layout.shape().to_vec(), x.dtype(), x.device().as_metal_device()?);
+                    dtype: t.dtype,
+                }
+            };
+            match (&x, &g) {
+                (val::Val::Cpu(x), val::Val::Cpu(g)) => {
+                    let sq = |t: &runtime::cpu::Tensor| {
+                        let s = t.shape();
+                        t.contiguous().view(runtime::layout::Layout::contiguous(vec![s[0], s[1], s[2], 1]))
+                    };
+                    let dw = runtime::cpu::conv::conv2d_backward_w(
+                        &sq(x),
+                        &sq(g),
+                        [*kernel, 1],
+                        *out_channels,
+                        *stride,
+                        *padding,
+                        *dilation,
+                        *groups,
+                    );
+                    let s = dw.shape();
+                    val::Val::Cpu(dw.contiguous().view(runtime::layout::Layout::contiguous(vec![s[0], s[1], s[2]])))
+                }
+                (val::Val::Metal(x), val::Val::Metal(g)) => {
+                    let xn = metal_native::contiguous(&squeeze4(x))?;
+                    let gn = metal_native::contiguous(&squeeze4(g))?;
+                    let dw = runtime::metal::conv::conv2d_backward_w(
+                        runtime::metal::device::MetalDevice::get(),
+                        &xn,
+                        &gn,
+                        [*kernel, 1],
+                        *out_channels,
+                        *stride,
+                        *padding,
+                        *dilation,
+                        *groups,
+                    )?;
+                    val::Val::Metal(squeeze3(&dw))
+                }
+                _ => return Err("device mismatch".to_string()),
             }
-            if x.device().is_cpu() {
-                let xn = bridge::from_candle(&x)?;
-                let gn = bridge::from_candle(&g)?;
-                let squeeze = |t: &runtime::cpu::Tensor| {
-                    let s = t.shape();
-                    t.contiguous().view(runtime::layout::Layout::contiguous(vec![s[0], s[1], s[2], 1]))
-                };
-                let x2 = squeeze(&xn);
-                let g2 = squeeze(&gn);
-                let dw = runtime::cpu::conv::conv2d_backward_w(
-                    &x2,
-                    &g2,
-                    [*kernel, 1],
-                    *out_channels,
-                    *stride,
-                    *padding,
-                    *dilation,
-                    *groups,
-                );
-                let s = dw.shape();
-                let dw = dw.contiguous().view(runtime::layout::Layout::contiguous(vec![s[0], s[1], s[2]]));
-                return bridge::to_candle(&dw);
-            }
-            let x = x.unsqueeze(3)?;
-            let g = g.unsqueeze(3)?;
-            conv2d_backward_w(
-                &x,
-                &g,
-                [*kernel, 1],
-                *out_channels,
-                *stride,
-                *padding,
-                *dilation,
-                *groups,
-            )?
-            .squeeze(3)?
         }
         NodeKind::Conv2dBackwardW {
             x,
@@ -5396,323 +4895,263 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> candle_core::Result<Te
         } => {
             let x = ev.value(x.id)?;
             let g = ev.value(g.id)?;
-            if x.device().is_cpu() {
-                let dw = runtime::cpu::conv::conv2d_backward_w(
-                    &bridge::from_candle(&x)?,
-                    &bridge::from_candle(&g)?,
-                    *kernel,
-                    *out_channels,
-                    *stride,
-                    *padding,
-                    *dilation,
-                    *groups,
-                );
-                return bridge::to_candle(&dw);
+            match (&x, &g) {
+                (val::Val::Cpu(x), val::Val::Cpu(g)) => {
+                    val::Val::Cpu(runtime::cpu::conv::conv2d_backward_w(
+                        x,
+                        g,
+                        *kernel,
+                        *out_channels,
+                        *stride,
+                        *padding,
+                        *dilation,
+                        *groups,
+                    ))
+                }
+                (val::Val::Metal(x), val::Val::Metal(g)) => {
+                    let xn = metal_native::contiguous(x)?;
+                    let gn = metal_native::contiguous(g)?;
+                    val::Val::Metal(runtime::metal::conv::conv2d_backward_w(
+                        runtime::metal::device::MetalDevice::get(),
+                        &xn,
+                        &gn,
+                        *kernel,
+                        *out_channels,
+                        *stride,
+                        *padding,
+                        *dilation,
+                        *groups,
+                    )?)
+                }
+                _ => return Err("device mismatch".to_string()),
             }
-            if x.device().is_metal() {
-                let xn = bridge::metal::wrap(&x)?;
-                let xn = if xn.layout.is_contiguous() { xn } else { runtime::metal::kernels::strided_copy(runtime::metal::device::MetalDevice::get(), &xn).map_err(candle_core::Error::Msg)? };
-                let gn = bridge::metal::wrap(&g)?;
-                let gn = if gn.layout.is_contiguous() { gn } else { runtime::metal::kernels::strided_copy(runtime::metal::device::MetalDevice::get(), &gn).map_err(candle_core::Error::Msg)? };
-                let dw = runtime::metal::conv::conv2d_backward_w(
-                    runtime::metal::device::MetalDevice::get(),
-                    &xn,
-                    &gn,
-                    *kernel,
-                    *out_channels,
-                    *stride,
-                    *padding,
-                    *dilation,
-                    *groups,
-                )
-                .map_err(candle_core::Error::Msg)?;
-                return bridge::metal::unwrap(&dw.buffer, dw.layout.shape().to_vec(), x.dtype(), x.device().as_metal_device()?);
-            }
-            conv2d_backward_w(
-                &x,
-                &g,
-                *kernel,
-                *out_channels,
-                *stride,
-                *padding,
-                *dilation,
-                *groups,
-            )?
         }
         NodeKind::Pow { a, exp } => {
             let x = ev.value(a.id)?;
-            if x.device().is_cpu() {
-                return bridge::to_candle(&bridge::from_candle(&x)?.powf(*exp));
+            match &x {
+                val::Val::Cpu(t) => val::Val::Cpu(t.powf(*exp)),
+                val::Val::Metal(t) => val::Val::Metal(metal_native::powf(&metal_native::to_f32(t)?, *exp)?),
             }
-            if x.device().is_metal() {
-                if let Ok(t) = metal_eval::powf(&x, *exp) {
-                    return Ok(t);
-                }
-            }
-            x.powf(*exp)?
         }
         NodeKind::Cast { a, dtype } => {
             let x = ev.value(a.id)?;
-            if x.device().is_cpu() {
-                return bridge::to_candle(&bridge::from_candle(&x)?.cast(bridge::dtype_to_native(*dtype)));
-            }
-            if x.device().is_metal() {
-                if let Ok(t) = metal_eval::cast(&x, bridge::dtype_to_native(*dtype)) {
-                    return Ok(t);
+            match &x {
+                val::Val::Cpu(t) => val::Val::Cpu(t.cast(*dtype)),
+                val::Val::Metal(t) => {
+                    val::Val::Metal(metal_native::cast(t, *dtype)?)
                 }
             }
-            x.to_dtype(*dtype)?
         }
         NodeKind::Sum { a, dims, keepdims } => {
             let t = ev.value(a.id)?;
-            if t.device().is_cpu() {
-                let r = bridge::from_candle(&t)?.sum(dims);
-                let r = if *keepdims { r } else { r.squeeze_dims(dims) };
-                return bridge::to_candle(&r);
-            }
-            if t.device().is_metal() {
-                if let Ok(out) = metal_eval::reduce(&t, dims, *keepdims, crate::fusion::ReduceOp::Sum) {
-                    return Ok(out);
+            match &t {
+                val::Val::Cpu(x) => {
+                    let r = x.sum(dims);
+                    let r = if *keepdims { r } else { r.squeeze_dims(dims) };
+                    val::Val::Cpu(r)
+                }
+                val::Val::Metal(x) => {
+                    val::Val::Metal(metal_native::reduce(&metal_native::to_f32(x)?, dims, *keepdims, crate::fusion::ReduceOp::Sum)?)
                 }
             }
-            reduce_dims(&t, dims, *keepdims, |t, d| t.sum(d))?
         }
         NodeKind::Mean { a, dims, keepdims } => {
             let t = ev.value(a.id)?;
-            if t.device().is_cpu() {
-                let r = bridge::from_candle(&t)?.mean(dims);
-                let r = if *keepdims { r } else { r.squeeze_dims(dims) };
-                return bridge::to_candle(&r);
-            }
-            if t.device().is_metal() {
-                if let Ok(out) = metal_eval::reduce(&t, dims, *keepdims, crate::fusion::ReduceOp::Mean) {
-                    return Ok(out);
+            match &t {
+                val::Val::Cpu(x) => {
+                    let r = x.mean(dims);
+                    let r = if *keepdims { r } else { r.squeeze_dims(dims) };
+                    val::Val::Cpu(r)
+                }
+                val::Val::Metal(x) => {
+                    val::Val::Metal(metal_native::reduce(&metal_native::to_f32(x)?, dims, *keepdims, crate::fusion::ReduceOp::Mean)?)
                 }
             }
-            reduce_dims(&t, dims, *keepdims, |t, d| t.mean(d))?
         }
         NodeKind::Max { a, dims, keepdims } => {
             let t = ev.value(a.id)?;
-            if t.device().is_cpu() {
-                let r = bridge::from_candle(&t)?.max(dims);
-                let r = if *keepdims { r } else { r.squeeze_dims(dims) };
-                return bridge::to_candle(&r);
-            }
-            if t.device().is_metal() {
-                if let Ok(out) = metal_eval::reduce(&t, dims, *keepdims, crate::fusion::ReduceOp::Max) {
-                    return Ok(out);
+            match &t {
+                val::Val::Cpu(x) => {
+                    let r = x.max(dims);
+                    let r = if *keepdims { r } else { r.squeeze_dims(dims) };
+                    val::Val::Cpu(r)
+                }
+                val::Val::Metal(x) => {
+                    val::Val::Metal(metal_native::reduce(&metal_native::to_f32(x)?, dims, *keepdims, crate::fusion::ReduceOp::Max)?)
                 }
             }
-            reduce_dims(&t, dims, *keepdims, |t, d| t.max(d))?
         }
         NodeKind::Min { a, dims, keepdims } => {
             let t = ev.value(a.id)?;
-            if t.device().is_cpu() {
-                let r = bridge::from_candle(&t)?.min(dims);
-                let r = if *keepdims { r } else { r.squeeze_dims(dims) };
-                return bridge::to_candle(&r);
-            }
-            if t.device().is_metal() {
-                if let Ok(out) = metal_eval::reduce(&t, dims, *keepdims, crate::fusion::ReduceOp::Min) {
-                    return Ok(out);
+            match &t {
+                val::Val::Cpu(x) => {
+                    let r = x.min(dims);
+                    let r = if *keepdims { r } else { r.squeeze_dims(dims) };
+                    val::Val::Cpu(r)
+                }
+                val::Val::Metal(x) => {
+                    val::Val::Metal(metal_native::reduce(&metal_native::to_f32(x)?, dims, *keepdims, crate::fusion::ReduceOp::Min)?)
                 }
             }
-            reduce_dims(&t, dims, *keepdims, |t, d| t.min(d))?
         }
         NodeKind::Prod { a, dims, keepdims } => {
             let t = ev.value(a.id)?;
-            if t.device().is_cpu() {
-                let r = bridge::from_candle(&t)?.prod(dims);
-                let r = if *keepdims { r } else { r.squeeze_dims(dims) };
-                return bridge::to_candle(&r);
-            }
-            if t.device().is_metal() {
-                if let Ok(out) = metal_eval::reduce(&t, dims, *keepdims, crate::fusion::ReduceOp::Prod) {
-                    return Ok(out);
+            match &t {
+                val::Val::Cpu(x) => {
+                    let r = x.prod(dims);
+                    let r = if *keepdims { r } else { r.squeeze_dims(dims) };
+                    val::Val::Cpu(r)
+                }
+                val::Val::Metal(x) => {
+                    val::Val::Metal(metal_native::reduce(&metal_native::to_f32(x)?, dims, *keepdims, crate::fusion::ReduceOp::Prod)?)
                 }
             }
-            // no product kernel in candle: fold narrow+mul per reduced dim,
-            // keeping reduced dims as size 1 so later indices stay valid
-            let mut t = t;
-            for &d in dims {
-                let n = t.dims()[d];
-                if n == 0 {
-                    let mut shape = t.dims().to_vec();
-                    shape[d] = 1;
-                    t = Tensor::ones(shape, t.dtype(), t.device())?;
-                    continue;
-                }
-                let mut acc = t.narrow(d, 0, 1)?;
-                for i in 1..n {
-                    acc = acc.mul(&t.narrow(d, i, 1)?)?;
-                }
-                t = acc;
-            }
-            if !keepdims {
-                let shape: Vec<usize> = t
-                    .dims()
-                    .iter()
-                    .enumerate()
-                    .filter(|(i, _)| !dims.contains(i))
-                    .map(|(_, &d)| d)
-                    .collect();
-                t = t.reshape(shape)?;
-            }
-            t
         }
         NodeKind::Reshape { a, shape } => {
             let x = ev.value(a.id)?;
-            if x.device().is_cpu() {
-                let r = bridge::from_candle(&x)?;
-                let r = r.contiguous().view(runtime::layout::Layout::contiguous(shape.clone()));
-                return bridge::to_candle(&r);
+            match &x {
+                val::Val::Cpu(t) => {
+                    val::Val::Cpu(t.contiguous().view(runtime::layout::Layout::contiguous(shape.clone())))
+                }
+                val::Val::Metal(t) => {
+                    let r = metal_native::contiguous(t)?;
+                    val::Val::Metal(runtime::metal::run::MetalTensor {
+                        buffer: r.buffer,
+                        layout: runtime::layout::Layout::contiguous(shape.clone()),
+                        dtype: r.dtype,
+                    })
+                }
             }
-            if x.device().is_metal() {
-                let w = bridge::metal::wrap(&x)?;
-                let r = runtime::metal::kernels::strided_copy(runtime::metal::device::MetalDevice::get(), &w)
-                    .map_err(candle_core::Error::Msg)?;
-                return bridge::metal::unwrap(&r.buffer, shape.clone(), x.dtype(), x.device().as_metal_device()?);
-            }
-            x.reshape(shape.clone())?
         }
         NodeKind::Permute { a, dims } => {
             let x = ev.value(a.id)?;
-            if x.device().is_cpu() {
-                let r = bridge::from_candle(&x)?;
-                let r = r.view(r.layout.permute(dims)).contiguous();
-                return bridge::to_candle(&r);
+            match &x {
+                val::Val::Cpu(t) => {
+                    val::Val::Cpu(t.view(t.layout.permute(dims)).contiguous())
+                }
+                val::Val::Metal(t) => {
+                    val::Val::Metal(metal_native::permute(t, dims)?)
+                }
             }
-            if x.device().is_metal() {
-                let w = bridge::metal::wrap(&x)?;
-                let p = runtime::metal::run::MetalTensor {
-                    buffer: w.buffer.clone(),
-                    layout: w.layout.permute(dims),
-                    dtype: w.dtype,
-                };
-                let r = runtime::metal::kernels::strided_copy(runtime::metal::device::MetalDevice::get(), &p)
-                    .map_err(candle_core::Error::Msg)?;
-                return bridge::metal::unwrap(&r.buffer, r.layout.shape().to_vec(), x.dtype(), x.device().as_metal_device()?);
-            }
-            x.permute(dims.clone())?
         }
         NodeKind::Slice { a, ranges } => {
             let t = ev.value(a.id)?;
-            if t.device().is_cpu() {
-                let mut r = bridge::from_candle(&t)?;
-                for (dim, &(start, stop, stride)) in ranges.iter().enumerate() {
-                    let len = stop.saturating_sub(start).div_ceil(stride);
-                    if len == 0 {
-                        let mut shape = r.shape().to_vec();
-                        shape[dim] = 0;
-                        r = runtime::cpu::Tensor::zeros(&shape, r.dtype());
-                        continue;
+            match &t {
+                val::Val::Cpu(x) => {
+                    let mut r = x.clone();
+                    for (dim, &(start, stop, stride)) in ranges.iter().enumerate() {
+                        let len = stop.saturating_sub(start).div_ceil(stride);
+                        if len == 0 {
+                            let mut shape = r.shape().to_vec();
+                            shape[dim] = 0;
+                            r = runtime::cpu::Tensor::zeros(&shape, r.dtype());
+                            continue;
+                        }
+                        r = r.view(r.layout.narrow(dim, start, (len - 1) * stride + 1)).contiguous();
+                        if stride > 1 {
+                            let idx: Vec<u32> = (0..len as u32).map(|i| i * stride as u32).collect();
+                            let idx = runtime::cpu::Tensor::from_vec(idx, vec![len]);
+                            r = r.index_select(dim, &idx);
+                        }
                     }
-                    r = r.view(r.layout.narrow(dim, start, (len - 1) * stride + 1)).contiguous();
-                    if stride > 1 {
-                        let idx: Vec<u32> = (0..len as u32).map(|i| i * stride as u32).collect();
-                        let idx = runtime::cpu::Tensor::from_vec(idx, vec![len]);
-                        r = r.index_select(dim, &idx);
+                    val::Val::Cpu(r)
+                }
+                val::Val::Metal(x) => {
+                    let mut r = x.clone();
+                    for (dim, &(start, stop, stride)) in ranges.iter().enumerate() {
+                        let len = stop.saturating_sub(start).div_ceil(stride);
+                        if len == 0 {
+                            let mut shape = r.layout.shape().to_vec();
+                            shape[dim] = 0;
+                            r = runtime::metal::run::MetalTensor::zeros(
+                                runtime::metal::device::MetalDevice::get(),
+                                shape,
+                                r.dtype,
+                            );
+                            continue;
+                        }
+                        r = runtime::metal::run::MetalTensor {
+                            buffer: r.buffer.clone(),
+                            layout: r.layout.narrow(dim, start, (len - 1) * stride + 1),
+                            dtype: r.dtype,
+                        };
+                        r = metal_native::contiguous(&r)?;
+                        if stride > 1 {
+                            let idx: Vec<u32> = (0..len as u32).map(|i| i * stride as u32).collect();
+                            r = metal_native::index_select(&r, dim, &idx)?;
+                        }
                     }
-                }
-                return bridge::to_candle(&r);
-            }
-            let mut t = t;
-            for (dim, &(start, stop, stride)) in ranges.iter().enumerate() {
-                let len = stop.saturating_sub(start).div_ceil(stride);
-                if len == 0 {
-                    t = t.narrow(dim, 0, 0)?;
-                    continue;
-                }
-                t = t.narrow(dim, start, (len - 1) * stride + 1)?;
-                if stride > 1 {
-                    let idx: Vec<u32> = (0..len as u32).map(|i| i * stride as u32).collect();
-                    let idx = Tensor::from_vec(idx, len, t.device())?;
-                    t = t.contiguous()?.index_select(&idx, dim)?;
+                    val::Val::Metal(r)
                 }
             }
-            t
         }
         NodeKind::Concat { a, b, dim } => {
             let a = ev.value(a.id)?;
             let b = ev.value(b.id)?;
-            if a.device().is_cpu() {
-                let r = runtime::cpu::Tensor::cat(
-                    &[&bridge::from_candle(&a)?, &bridge::from_candle(&b)?],
-                    *dim,
-                );
-                return bridge::to_candle(&r);
-            }
-            if a.device().is_metal() {
-                if let Ok(t) = metal_eval::cat(&a, &b, *dim) {
-                    return Ok(t);
+            match (&a, &b) {
+                (val::Val::Cpu(x), val::Val::Cpu(y)) => {
+                    val::Val::Cpu(runtime::cpu::Tensor::cat(&[x, y], *dim))
                 }
+                (val::Val::Metal(x), val::Val::Metal(y)) => {
+                    val::Val::Metal(metal_native::cat(x, y, *dim)?)
+                }
+                _ => return Err("device mismatch".to_string()),
             }
-            Tensor::cat(&[&a, &b], *dim)?
         }
         NodeKind::BroadcastTo { a, shape } => {
             let x = ev.value(a.id)?;
-            if x.device().is_cpu() {
-                let r = bridge::from_candle(&x)?;
-                let r = r.view(r.layout.broadcast_to(shape)).contiguous();
-                return bridge::to_candle(&r);
+            match &x {
+                val::Val::Cpu(t) => {
+                    val::Val::Cpu(t.view(t.layout.broadcast_to(shape)).contiguous())
+                }
+                val::Val::Metal(t) => {
+                    val::Val::Metal(metal_native::broadcast_to(t, shape)?)
+                }
             }
-            if x.device().is_metal() {
-                let w = bridge::metal::wrap(&x)?;
-                let b = runtime::metal::run::MetalTensor {
-                    buffer: w.buffer.clone(),
-                    layout: w.layout.broadcast_to(shape),
-                    dtype: w.dtype,
-                };
-                let r = runtime::metal::kernels::strided_copy(runtime::metal::device::MetalDevice::get(), &b)
-                    .map_err(candle_core::Error::Msg)?;
-                return bridge::metal::unwrap(&r.buffer, r.layout.shape().to_vec(), x.dtype(), x.device().as_metal_device()?);
-            }
-            x.broadcast_as(shape.clone())?
         }
         NodeKind::Matmul { a, b } => {
             let a = ev.value(a.id)?;
             let b = ev.value(b.id)?;
-            if a.device().is_cpu() {
-                return bridge::to_candle(&bridge::from_candle(&a)?.matmul(&bridge::from_candle(&b)?));
-            }
-            if a.device().is_metal() {
-                if let Ok(t) = metal_eval::matmul(&a, &b) {
-                    return Ok(t);
+            match (&a, &b) {
+                (val::Val::Cpu(x), val::Val::Cpu(y)) => val::Val::Cpu(x.matmul(y)),
+                (val::Val::Metal(x), val::Val::Metal(y)) => {
+                    val::Val::Metal(metal_native::matmul(x, y)?)
                 }
+                _ => return Err("device mismatch".to_string()),
             }
-            // candle's matmul requires contiguous operands; permuted or
-            // broadcast layouts (common in backward graphs) must be
-            // materialized first.
-            let a = if a.is_contiguous() { a } else { a.contiguous()? };
-            let b = if b.is_contiguous() { b } else { b.contiguous()? };
-            a.broadcast_matmul(&b)?
         }
         NodeKind::Inverse { a } => {
             let t = ev.value(a.id)?;
-            if t.device().is_cpu() {
-                return bridge::to_candle(&bridge::from_candle(&t)?.inverse());
+            match &t {
+                val::Val::Cpu(x) => val::Val::Cpu(x.inverse()),
+                val::Val::Metal(x) => {
+                    let cpu = metal_to_cpu(x)?;
+                    val::Val::Metal(cpu_to_metal(&cpu.inverse())?)
+                }
             }
-            // linalg is CPU-only: round-trip to the host
-            let cpu = t.to_device(&Device::Cpu)?;
-            batch_linalg(&cpu, &cpu_inverse)?.to_device(t.device())?
         }
         NodeKind::Det { a } => {
             let t = ev.value(a.id)?;
-            if t.device().is_cpu() {
-                return bridge::to_candle(&bridge::from_candle(&t)?.det());
+            match &t {
+                val::Val::Cpu(x) => val::Val::Cpu(x.det()),
+                val::Val::Metal(x) => {
+                    let cpu = metal_to_cpu(x)?;
+                    val::Val::Metal(cpu_to_metal(&cpu.det())?)
+                }
             }
-            let cpu = t.to_device(&Device::Cpu)?;
-            batch_linalg(&cpu, &cpu_det)?.to_device(t.device())?
         }
         NodeKind::Solve { a, b } => {
             let a = ev.value(a.id)?;
             let b = ev.value(b.id)?;
-            if a.device().is_cpu() {
-                return bridge::to_candle(&bridge::from_candle(&a)?.solve(&bridge::from_candle(&b)?));
+            match (&a, &b) {
+                (val::Val::Cpu(x), val::Val::Cpu(y)) => val::Val::Cpu(x.solve(y)),
+                (val::Val::Metal(x), val::Val::Metal(y)) => {
+                    let xc = metal_to_cpu(x)?;
+                    let yc = metal_to_cpu(y)?;
+                    val::Val::Metal(cpu_to_metal(&xc.solve(&yc))?)
+                }
+                _ => return Err("device mismatch".to_string()),
             }
-            let a_cpu = a.to_device(&Device::Cpu)?;
-            let b_cpu = b.to_device(&Device::Cpu)?;
-            batch_solve(&a_cpu, &b_cpu)?.to_device(a.device())?
         }
         NodeKind::StopGradient { a } => ev.value(a.id)?,
         NodeKind::Checkpoint { a } => ev.value(a.id)?,
@@ -5737,9 +5176,9 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> candle_core::Result<Te
             // parameter dtype and copy to its device (they may be CPU f64 —
             // the bias corrections are computed in f64 to avoid
             // cancellation — and 0-d copies are free).
-            let lr_t = ev.step_scalar(lr.id, p.dtype(), p.device())?;
-            let c1_t = ev.step_scalar(c1.id, p.dtype(), p.device())?;
-            let c2_t = ev.step_scalar(c2.id, p.dtype(), p.device())?;
+            let lr_t = ev.step_scalar(lr.id, p.dtype(), &p.device())?;
+            let c1_t = ev.step_scalar(c1.id, p.dtype(), &p.device())?;
+            let c2_t = ev.step_scalar(c2.id, p.dtype(), &p.device())?;
             let fused = if fusion::is_supported(&p.device(), p.dtype()) {
                 let exprs = fusion::adamw_exprs(*beta1, *beta2, *eps, *weight_decay);
                 fusion::run(
@@ -5747,8 +5186,8 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> candle_core::Result<Te
                     &[p.clone(), g.clone(), m_t.clone(), v_t.clone()],
                     None,
                     &[lr_t.clone(), c1_t.clone(), c2_t.clone()],
-                    p.elem_count(),
-                    p.dims(),
+                    p.numel(),
+                    &p.shape(),
                     p.dtype(),
                     &p.device(),
                 )
@@ -5764,51 +5203,52 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> candle_core::Result<Te
                         .insert(node.id, [it.next().unwrap(), it.next().unwrap()]);
                     next_p
                 }
-                None => {
-                    if p.device().is_cpu() {
+                None => match &p {
+                    val::Val::Cpu(p) => {
                         let (next_p, next_m, next_v) = runtime::cpu::composed::adamw_step(
-                            &bridge::from_candle(&p)?,
-                            &bridge::from_candle(&g)?,
-                            &bridge::from_candle(&m_t)?,
-                            &bridge::from_candle(&v_t)?,
-                            &bridge::from_candle(&lr_t)?,
-                            &bridge::from_candle(&c1_t)?,
-                            &bridge::from_candle(&c2_t)?,
+                            p,
+                            g.as_cpu()?,
+                            m_t.as_cpu()?,
+                            v_t.as_cpu()?,
+                            lr_t.as_cpu()?,
+                            c1_t.as_cpu()?,
+                            c2_t.as_cpu()?,
                             *beta1,
                             *beta2,
                             *eps,
                             *weight_decay,
                         );
-                        ev.adamw.insert(node.id, [bridge::to_candle(&next_m)?, bridge::to_candle(&next_v)?]);
-                        return bridge::to_candle(&next_p);
+                        ev.adamw.insert(node.id, [val::Val::Cpu(next_m), val::Val::Cpu(next_v)]);
+                        val::Val::Cpu(next_p)
                     }
-                    let one_minus_beta1 = 1.0 - *beta1;
-                    let one_minus_beta2 = 1.0 - *beta2;
-                    let next_m = ((m_t * *beta1)? + (&g * one_minus_beta1)?)?;
-                    let next_v = ((v_t * *beta2)? + ((&g * &g)? * one_minus_beta2)?)?;
-                    let m_hat = next_m.broadcast_div(&c1_t)?;
-                    let v_hat = next_v.broadcast_div(&c2_t)?;
-                    let adjusted = (m_hat.broadcast_div(&(v_hat.sqrt()? + *eps)?)?)
-                        .broadcast_mul(&lr_t)?;
-                    let next_p = if *weight_decay == 0.0 {
-                        (p - adjusted)?
-                    } else {
-                        // p * (1 - lr * weight_decay) - adjusted, factored as
-                        // p - p * (lr * weight_decay) - adjusted to keep the
-                        // decay a tensor op.
-                        let decay = p.broadcast_mul(&(&lr_t * *weight_decay)?)?;
-                        ((p - decay)? - adjusted)?
-                    };
-                    ev.adamw.insert(node.id, [next_m, next_v]);
-                    next_p
-                }
+                    val::Val::Metal(p) => {
+                        let g32 = metal_native::to_f32(g.as_metal()?)?;
+                        let m32 = metal_native::to_f32(m_t.as_metal()?)?;
+                        let v32 = metal_native::to_f32(v_t.as_metal()?)?;
+                        let (np, nm, nv) = adamw_native(
+                            p,
+                            &g32,
+                            &m32,
+                            &v32,
+                            &metal_native::to_f32(lr_t.as_metal()?)?,
+                            &metal_native::to_f32(c1_t.as_metal()?)?,
+                            &metal_native::to_f32(c2_t.as_metal()?)?,
+                            *beta1,
+                            *beta2,
+                            *eps,
+                            *weight_decay,
+                        )?;
+                        ev.adamw.insert(node.id, [val::Val::Metal(nm), val::Val::Metal(nv)]);
+                        val::Val::Metal(np)
+                    }
+                },
             }
         }
         NodeKind::AdamWOut { step, index } => {
             // the step is evaluated before its projections; make sure of it
             let _ = ev.value(step.id)?;
             let outputs = ev.adamw.get(&step.id).ok_or_else(|| {
-                candle_core::Error::Msg("adamw_out: step has no stored moments".to_string())
+                err::err_str("adamw_out: step has no stored moments".to_string())
             })?;
             match index {
                 0 => ev.value(step.id)?,
@@ -5830,9 +5270,9 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> candle_core::Result<Te
             weight_decay,
         } => {
             let first_p = ev.value(params[0].id)?;
-            let lr_t = ev.step_scalar(lr.id, first_p.dtype(), first_p.device())?;
-            let c1_t = ev.step_scalar(c1.id, first_p.dtype(), first_p.device())?;
-            let c2_t = ev.step_scalar(c2.id, first_p.dtype(), first_p.device())?;
+            let lr_t = ev.step_scalar(lr.id, first_p.dtype(), &first_p.device())?;
+            let c1_t = ev.step_scalar(c1.id, first_p.dtype(), &first_p.device())?;
+            let c2_t = ev.step_scalar(c2.id, first_p.dtype(), &first_p.device())?;
             let mut inputs = Vec::with_capacity(params.len() * 4);
             for i in 0..params.len() {
                 inputs.push(ev.value(params[i].id)?);
@@ -5855,8 +5295,8 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> candle_core::Result<Te
                 &inputs,
                 None,
                 &[lr_t, c1_t, c2_t],
-                first_p.elem_count(),
-                first_p.dims(),
+                first_p.numel(),
+                &first_p.shape(),
                 first_p.dtype(),
                 &first_p.device(),
             )?;
@@ -5871,7 +5311,7 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> candle_core::Result<Te
                 .and_then(|outs| outs.get(*param as usize * 3 + *index as usize))
                 .cloned()
                 .ok_or_else(|| {
-                    candle_core::Error::Msg("adamw_group_out: group has no stored outputs".to_string())
+                    err::err_str("adamw_group_out: group has no stored outputs".to_string())
                 })?
         }
         NodeKind::SgdStep {
@@ -5888,8 +5328,8 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> candle_core::Result<Te
             let p = ev.value(param.id)?;
             let g = ev.value(grad.id)?;
             let v_t = ev.value(velocity.id)?;
-            let first_t = ev.step_scalar(first.id, p.dtype(), p.device())?;
-            let lr_t = ev.step_scalar(lr.id, p.dtype(), p.device())?;
+            let first_t = ev.step_scalar(first.id, p.dtype(), &p.device())?;
+            let lr_t = ev.step_scalar(lr.id, p.dtype(), &p.device())?;
             let fused = if fusion::is_supported(&p.device(), p.dtype()) {
                 let exprs = fusion::sgd_exprs(*momentum, *dampening, *nesterov, *weight_decay);
                 fusion::run(
@@ -5897,8 +5337,8 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> candle_core::Result<Te
                     &[p.clone(), g.clone(), v_t.clone()],
                     None,
                     &[lr_t.clone(), first_t.clone()],
-                    p.elem_count(),
-                    p.dims(),
+                    p.numel(),
+                    &p.shape(),
                     p.dtype(),
                     &p.device(),
                 )
@@ -5913,42 +5353,72 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> candle_core::Result<Te
                     ev.sgd.insert(node.id, it.next().unwrap());
                     next_p
                 }
-                None => {
-                    if p.device().is_cpu() {
+                None => match &p {
+                    val::Val::Cpu(p) => {
                         let (next_p, next_v) = runtime::cpu::composed::sgd_step(
-                            &bridge::from_candle(&p)?,
-                            &bridge::from_candle(&g)?,
-                            &bridge::from_candle(&v_t)?,
-                            &bridge::from_candle(&lr_t)?,
-                            &bridge::from_candle(&first_t)?,
+                            p,
+                            g.as_cpu()?,
+                            v_t.as_cpu()?,
+                            lr_t.as_cpu()?,
+                            first_t.as_cpu()?,
                             *momentum,
                             *dampening,
                             *nesterov,
                             *weight_decay,
                         );
-                        ev.sgd.insert(node.id, bridge::to_candle(&next_v)?);
-                        return bridge::to_candle(&next_p);
+                        ev.sgd.insert(node.id, val::Val::Cpu(next_v));
+                        val::Val::Cpu(next_p)
                     }
-                    let g = if *weight_decay == 0.0 {
-                        g
-                    } else {
-                        (&g + (&p * *weight_decay)?)?
-                    };
-                    // next_v = first ? g : momentum * v + (1 - dampening) * g,
-                    // as tensor arithmetic: velocity is zeros on the first
-                    // step, so the (1 - first) branch contributes nothing.
-                    let continued = ((v_t * *momentum)? + (&g * (1.0 - dampening))?)?;
-                    let not_first = ((&first_t * -1.0)? + 1.0)?;
-                    let next_v = (first_t.broadcast_mul(&g)? + not_first.broadcast_mul(&continued)?)?;
-                    let used = if *nesterov {
-                        (&g + (&next_v * *momentum)?)?
-                    } else {
-                        next_v.clone()
-                    };
-                    let next_p = p.broadcast_sub(&used.broadcast_mul(&lr_t)?)?;
-                    ev.sgd.insert(node.id, next_v);
-                    next_p
-                }
+                    val::Val::Metal(p) => {
+                        let g = if *weight_decay == 0.0 {
+                            g.as_metal()?.clone()
+                        } else {
+                            let wd = metal_native::fill(p.layout.shape(), *weight_decay, p.dtype)?;
+                            metal_native::binary(
+                                g.as_metal()?,
+                                &metal_native::binary(p, &wd, metal_native::BinOp::Mul)?,
+                                metal_native::BinOp::Add,
+                            )?
+                        };
+                        // next_v = first ? g : momentum * v + (1 - dampening) * g,
+                        // as tensor arithmetic: velocity is zeros on the first
+                        // step, so the (1 - first) branch contributes nothing.
+                        let mom = metal_native::fill(p.layout.shape(), *momentum, p.dtype)?;
+                        let damp = metal_native::fill(p.layout.shape(), 1.0 - dampening, p.dtype)?;
+                        let continued = metal_native::binary(
+                            &metal_native::binary(v_t.as_metal()?, &mom, metal_native::BinOp::Mul)?,
+                            &metal_native::binary(&g, &damp, metal_native::BinOp::Mul)?,
+                            metal_native::BinOp::Add,
+                        )?;
+                        let first32 = metal_native::to_f32(first_t.as_metal()?)?;
+                        let not_first = metal_native::binary(
+                            &metal_native::fill(first32.layout.shape(), 1.0, first32.dtype)?,
+                            &first32,
+                            metal_native::BinOp::Sub,
+                        )?;
+                        let next_v = metal_native::binary(
+                            &metal_native::binary(&first32, &g, metal_native::BinOp::Mul)?,
+                            &metal_native::binary(&not_first, &continued, metal_native::BinOp::Mul)?,
+                            metal_native::BinOp::Add,
+                        )?;
+                        let used = if *nesterov {
+                            metal_native::binary(
+                                &g,
+                                &metal_native::binary(&next_v, &mom, metal_native::BinOp::Mul)?,
+                                metal_native::BinOp::Add,
+                            )?
+                        } else {
+                            next_v.clone()
+                        };
+                        let next_p = metal_native::binary(
+                            p,
+                            &metal_native::binary(&used, &metal_native::to_f32(lr_t.as_metal()?)?, metal_native::BinOp::Mul)?,
+                            metal_native::BinOp::Sub,
+                        )?;
+                        ev.sgd.insert(node.id, val::Val::Metal(next_v));
+                        val::Val::Metal(next_p)
+                    }
+                },
             }
         }
         NodeKind::SgdOut { step, index } => {
@@ -5956,7 +5426,7 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> candle_core::Result<Te
             match index {
                 0 => ev.value(step.id)?,
                 _ => ev.sgd.get(&step.id).cloned().ok_or_else(|| {
-                    candle_core::Error::Msg("sgd_out: step has no stored velocity".to_string())
+                    err::err_str("sgd_out: step has no stored velocity".to_string())
                 })?,
             }
         }
@@ -5966,10 +5436,10 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> candle_core::Result<Te
             shape,
             expr,
         } => {
-            let ts: Vec<Tensor> = inputs
+            let ts: Vec<val::Val> = inputs
                 .iter()
                 .map(|i| ev.value(i.id))
-                .collect::<candle_core::Result<Vec<_>>>()?;
+                .collect::<crate::err::Res<Vec<_>>>()?;
             let strides: Vec<Vec<usize>> = strides.to_vec();
             let first = &ts[0];
             let outs = fusion::run(
@@ -5990,10 +5460,10 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> candle_core::Result<Te
             shape,
             exprs,
         } => {
-            let ts: Vec<Tensor> = inputs
+            let ts: Vec<val::Val> = inputs
                 .iter()
                 .map(|i| ev.value(i.id))
-                .collect::<candle_core::Result<Vec<_>>>()?;
+                .collect::<crate::err::Res<Vec<_>>>()?;
             let strides: Vec<Vec<usize>> = strides.to_vec();
             let first = &ts[0];
             let outs = fusion::run(
@@ -6016,7 +5486,7 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> candle_core::Result<Te
             .and_then(|outs| outs.get(*index as usize))
             .cloned()
             .ok_or_else(|| {
-                candle_core::Error::Msg("fused pick: multi output missing".to_string())
+                err::err_str("fused pick: multi output missing".to_string())
             })?,
         NodeKind::FusedReduce {
             inputs,
@@ -6030,10 +5500,10 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> candle_core::Result<Te
         } => {
             let fine = std::env::var_os("EFFECT_TORCH_FUSION_TIMING").is_some();
             let t0 = std::time::Instant::now();
-            let ts: Vec<Tensor> = inputs
+            let ts: Vec<val::Val> = inputs
                 .iter()
                 .map(|i| ev.value(i.id))
-                .collect::<candle_core::Result<Vec<_>>>()?;
+                .collect::<crate::err::Res<Vec<_>>>()?;
             if fine {
                 eprintln!("[fine] reduce collect {:.1}us ({} inputs)", t0.elapsed().as_micros(), ts.len());
             }
@@ -6058,56 +5528,6 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> candle_core::Result<Te
 
 // Layer normalization, composed of candle ops (CPU path and the
 // reference for the fused Metal kernels in layer_norm.rs).
-fn layer_norm_composed(
-    x: &Tensor,
-    weight: &Tensor,
-    bias: &Tensor,
-    eps: f64,
-) -> candle_core::Result<Tensor> {
-    let rank = x.rank();
-    let dims: Vec<usize> = (rank - weight.dims().len()..rank).collect();
-    let mean = x.mean_keepdim(dims.clone())?;
-    let centered = x.broadcast_sub(&mean)?;
-    let var = centered.sqr()?.mean_keepdim(dims.clone())?;
-    let inv = (var + eps)?.sqrt()?.recip()?;
-    centered
-        .broadcast_mul(&inv)?
-        .broadcast_mul(weight)?
-        .broadcast_add(bias)
-}
-
-// Layer-norm backward: dx plus (dw, db). The fused Metal kernel emits
-// dx and x̂ in one launch; dw/db are plain row reduces either way.
-fn layer_norm_backward(
-    x: &Tensor,
-    weight: &Tensor,
-    g: &Tensor,
-    eps: f64,
-) -> candle_core::Result<(Tensor, Tensor, Tensor)> {
-    let rank = x.rank();
-    let k = weight.dims().len();
-    let reduce_dims: Vec<usize> = (0..rank - k).collect();
-    if layer_norm::is_supported(x, weight) {
-        let (dx, xh) = layer_norm::ln_backward(x, weight, g, eps)?;
-        let dw = g.mul(&xh)?.sum(reduce_dims.clone())?;
-        let db = g.sum(reduce_dims)?;
-        return Ok((dx, dw, db));
-    }
-    let dims: Vec<usize> = (rank - k..rank).collect();
-    let mean = x.mean_keepdim(dims.clone())?;
-    let centered = x.broadcast_sub(&mean)?;
-    let var = centered.sqr()?.mean_keepdim(dims.clone())?;
-    let rstd = (var + eps)?.sqrt()?.recip()?;
-    let xh = centered.broadcast_mul(&rstd)?;
-    // dx = (dyw − mean(dyw) − x̂·mean(dyw·x̂)) · rstd
-    let dyw = g.broadcast_mul(weight)?;
-    let m1 = dyw.mean_keepdim(dims.clone())?;
-    let m2 = dyw.broadcast_mul(&xh)?.mean_keepdim(dims)?;
-    let dx = ((dyw.broadcast_sub(&m1)? - xh.broadcast_mul(&m2)?)?).broadcast_mul(&rstd)?;
-    let dw = g.mul(&xh)?.sum(reduce_dims.clone())?;
-    let db = g.sum(reduce_dims)?;
-    Ok((dx, dw, db))
-}
 
 // Reverse-mode automatic differentiation: adjoints are built from the same
 // node vocabulary as the forward graph, so gradients can be differentiated
@@ -7899,7 +7319,7 @@ fn fuse_roots(roots: &[Arc<Node>]) -> std::result::Result<Vec<Arc<Node>>, String
             Some(strides)
                 if region.ops >= 2
                     && !region.inputs.is_empty()
-                    && !(matches!(node.device, candle_core::Device::Metal(_))
+                    && !(matches!(node.device, dev::Device::Metal)
                         && n > i32::MAX as usize) =>
             {
                 Node::new(NodeKind::FusedElementwise {
@@ -8125,7 +7545,7 @@ fn fuse_roots(roots: &[Arc<Node>]) -> std::result::Result<Vec<Arc<Node>>, String
                 let guards_ok = !dims.is_empty()
                     && dims.iter().all(|&d| d < rank)
                     && dims.iter().map(|&d| in_shape[d]).product::<usize>() > 0
-                    && !(matches!(node.device, candle_core::Device::Metal(_)) && {
+                    && !(matches!(node.device, dev::Device::Metal) && {
                         let in_n: usize = in_shape.iter().product();
                         let out_n: usize =
                             reduced_shape(&in_shape, &dims, keepdims).iter().product();
@@ -8363,7 +7783,7 @@ fn merge_shared_regions(roots: &[Arc<Node>]) -> std::result::Result<Vec<Arc<Node
                 ok &= !group.iter().any(|g| {
                     g.dtype != node.dtype || !g.device.same_device(&node.device)
                 });
-                if matches!(node.device, candle_core::Device::Metal(_)) {
+                if matches!(node.device, dev::Device::Metal) {
                     ok &= out_shape.iter().product::<usize>() <= i32::MAX as usize;
                 }
                 if !ok {
@@ -8517,7 +7937,7 @@ fn merge_shared_regions(roots: &[Arc<Node>]) -> std::result::Result<Vec<Arc<Node
 static METAL_EVAL_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
 fn metal_eval_guard(nodes: &[Arc<Node>]) -> Option<std::sync::MutexGuard<'static, ()>> {
-    if nodes.iter().any(|node| matches!(node.device, Device::Metal(_))) {
+    if nodes.iter().any(|node| matches!(node.device, Device::Metal)) {
         Some(METAL_EVAL_LOCK.lock().unwrap_or_else(|e| e.into_inner()))
     } else {
         None
@@ -8568,7 +7988,7 @@ pub async fn eval_lazy(
         // encoding and GPU execution (readback synchronizes itself).
         // The sync is device-global; one call covers every output.
         if let Some(first) = outputs.first() {
-            first.inner.device().synchronize().map_err(to_napi_err)?;
+            first.inner.synchronize();
         }
         // Deferred fused-CE status checks (would have split the
         // pipeline mid-walk).
@@ -8824,38 +8244,24 @@ enum PoolSlab {
 impl PoolSlab {
     fn dtype(&self) -> DType {
         match self {
-            PoolSlab::Native(s) => bridge::dtype_from_native(s.dtype),
-            PoolSlab::NativeMetal(t) => bridge::dtype_from_native(t.dtype),
+            PoolSlab::Native(s) => s.dtype,
+            PoolSlab::NativeMetal(t) => t.dtype,
         }
     }
 
-    fn candle(&self, device: &Device) -> candle_core::Result<Tensor> {
-        match self {
-            PoolSlab::NativeMetal(t) => bridge::metal::unwrap(
-                &t.buffer,
-                t.layout.shape().to_vec(),
-                bridge::dtype_from_native(t.dtype),
-                device.as_metal_device()?,
-            ),
-            PoolSlab::Native(_) => Err(candle_core::Error::Msg(
-                "kv pool: paged/composed Metal path requires native Metal slabs".to_string(),
-            )),
-        }
-    }
-
-    fn metal(&self) -> candle_core::Result<&runtime::metal::run::MetalTensor> {
+    fn metal(&self) -> crate::err::Res<&runtime::metal::run::MetalTensor> {
         match self {
             PoolSlab::NativeMetal(t) => Ok(t),
-            PoolSlab::Native(_) => Err(candle_core::Error::Msg(
+            PoolSlab::Native(_) => Err(err::err_str(
                 "kv pool: paged Metal path requires native Metal slabs".to_string(),
             )),
         }
     }
 
-    fn native(&self) -> candle_core::Result<&runtime::cpu::pool::Slab> {
+    fn native(&self) -> crate::err::Res<&runtime::cpu::pool::Slab> {
         match self {
             PoolSlab::Native(s) => Ok(s),
-            PoolSlab::NativeMetal(_) => Err(candle_core::Error::Msg(
+            PoolSlab::NativeMetal(_) => Err(err::err_str(
                 "kv pool: native CPU path requires native-backed slabs".to_string(),
             )),
         }
@@ -8878,7 +8284,7 @@ struct PoolInner {
     block_size: usize,
     max_tokens: usize,
     blocks: Mutex<BlockStore>,
-    device: Device,
+    device: dev::Device,
 }
 
 impl PoolInner {
@@ -9007,47 +8413,6 @@ struct KvContext {
 // batch element (a single offset for unbatched graphs, one per slot in
 // batched kv runs, RFC 0013). GPT-NeoX half-split rotation with
 // theta^(-2j/D).
-pub(crate) fn rotary_forward(x: &Tensor, offsets: &[usize], theta: f64, sign: f64) -> candle_core::Result<Tensor> {
-    let dims = x.dims();
-    let rank = dims.len();
-    let (t, d) = (dims[rank - 2], dims[rank - 1]);
-    let batch = dims[0];
-    if offsets.len() != 1 && offsets.len() != batch {
-        return Err(candle_core::Error::Msg(format!(
-            "rotary embedding: {} offsets for batch {batch}",
-            offsets.len()
-        )));
-    }
-    let half = d / 2;
-    let device = x.device();
-    let inv_freq: Vec<f32> = (0..half)
-        .map(|j| theta.powf(-2.0 * j as f64 / d as f64) as f32)
-        .collect();
-    let inv_freq = Tensor::from_vec(inv_freq, (1, half), device)?;
-    let positions: Vec<f32> = if offsets.len() == 1 {
-        (0..t).map(|p| (offsets[0] + p) as f32).collect()
-    } else {
-        offsets
-            .iter()
-            .flat_map(|base| (0..t).map(move |p| (*base + p) as f32))
-            .collect()
-    };
-    let rows = if offsets.len() == 1 { 1 } else { batch };
-    let positions = Tensor::from_vec(positions, (rows * t, 1), device)?;
-    let angles = (positions.matmul(&inv_freq)? * sign)?; // [R*T, half]
-    let mut table_shape = vec![1usize; rank - 2];
-    if offsets.len() != 1 {
-        table_shape[0] = batch;
-    }
-    table_shape.extend([t, half]);
-    let cos = angles.cos()?.reshape(table_shape.as_slice())?;
-    let sin = angles.sin()?.reshape(table_shape.as_slice())?;
-    let first = x.narrow(rank - 1, 0, half)?;
-    let second = x.narrow(rank - 1, half, half)?;
-    let out_first = (first.broadcast_mul(&cos)? - second.broadcast_mul(&sin)?)?;
-    let out_second = (second.broadcast_mul(&cos)? + first.broadcast_mul(&sin)?)?;
-    Tensor::cat(&[&out_first, &out_second], rank - 1)?.contiguous()
-}
 
 // The KvAttention eval: scatter q's companion k/v at [cursor, cursor+t)
 // (allocating blocks as the frontier crosses them), then attend q
@@ -9061,19 +8426,19 @@ pub(crate) fn rotary_forward(x: &Tensor, offsets: &[usize], theta: f64, sign: f6
 fn kv_attention(
     kv: &KvContext,
     layer: u32,
-    q: &Tensor,
-    k: &Tensor,
-    v: &Tensor,
+    q: &val::Val,
+    k: &val::Val,
+    v: &val::Val,
     scale: f64,
     window: Option<usize>,
-) -> candle_core::Result<Tensor> {
-    let dims = q.dims();
+) -> crate::err::Res<val::Val> {
+    let dims = q.shape();
     let batch: usize = dims[..dims.len() - 3].iter().product();
     if batch != kv.slots.len() {
-        return Err(candle_core::Error::Msg(format!(
+        return Err(format!(
             "kv attention: batch {batch} does not match {} kv slots",
             kv.slots.len()
-        )));
+        ));
     }
     // Metal: one fused scatter + one kernel launch attend all slots
     // over the pool slabs in place — no gather copy, decode and
@@ -9081,32 +8446,54 @@ fn kv_attention(
     // falls back to the composed per-slot path.
     let rank = dims.len();
     let (t, h, d) = (dims[rank - 2], dims[rank - 3], dims[rank - 1]);
-    if paged::is_supported(q, kv.pool.k[layer as usize].dtype(), d) {
-        return kv_attention_paged(kv, layer, q, k, v, scale, window, batch, t, h, d);
+    if q.is_metal() && paged::is_supported(q.as_metal()?, kv.pool.k[layer as usize].dtype(), d) {
+        return kv_attention_paged(kv, layer, q.as_metal()?, k.as_metal()?, v.as_metal()?, scale, window, batch, t, h, d);
     }
     if batch == 1 {
         let mut state = kv.slots[0].lock().map_err(|e| {
-            candle_core::Error::Msg(format!("kv attention: sequence lock poisoned: {e}"))
+            err::err_str(format!("kv attention: sequence lock poisoned: {e}"))
         })?;
         return kv_attention_slot(&kv.pool, &mut state, layer, q, k, v, scale, window);
     }
     let mut outs = Vec::with_capacity(batch);
     for (b, slot) in kv.slots.iter().enumerate() {
         let mut state = slot.lock().map_err(|e| {
-            candle_core::Error::Msg(format!("kv attention: sequence lock poisoned: {e}"))
+            err::err_str(format!("kv attention: sequence lock poisoned: {e}"))
         })?;
+        let narrow = |x: &val::Val| -> crate::err::Res<val::Val> {
+            match x {
+                val::Val::Cpu(x) => Ok(val::Val::Cpu(x.view(x.layout.narrow(0, b, 1)).contiguous())),
+                val::Val::Metal(x) => {
+                    let n = runtime::metal::run::MetalTensor {
+                        buffer: x.buffer.clone(),
+                        layout: x.layout.narrow(0, b, 1),
+                        dtype: x.dtype,
+                    };
+                    Ok(val::Val::Metal(metal_native::contiguous(&n)?))
+                }
+            }
+        };
         outs.push(kv_attention_slot(
             &kv.pool,
             &mut state,
             layer,
-            &q.narrow(0, b, 1)?,
-            &k.narrow(0, b, 1)?,
-            &v.narrow(0, b, 1)?,
+            &narrow(q)?,
+            &narrow(k)?,
+            &narrow(v)?,
             scale,
             window,
         )?);
     }
-    Tensor::cat(&outs.iter().collect::<Vec<_>>(), 0)
+    match &outs[0] {
+        val::Val::Cpu(_) => {
+            let refs: Vec<&runtime::cpu::Tensor> = outs.iter().map(|o| o.as_cpu().unwrap()).collect();
+            Ok(val::Val::Cpu(runtime::cpu::Tensor::cat(&refs, 0)))
+        }
+        val::Val::Metal(_) => {
+            let refs: Vec<&runtime::metal::run::MetalTensor> = outs.iter().map(|o| o.as_metal().unwrap()).collect();
+            metal_native::cat(refs[0], refs[1], 0).map(val::Val::Metal)
+        }
+    }
 }
 
 // Metal paged attention (RFC 0013, stage 2): per-slot prepare
@@ -9117,16 +8504,16 @@ fn kv_attention(
 fn kv_attention_paged(
     kv: &KvContext,
     layer: u32,
-    q: &Tensor,
-    k: &Tensor,
-    v: &Tensor,
+    q: &runtime::metal::run::MetalTensor,
+    k: &runtime::metal::run::MetalTensor,
+    v: &runtime::metal::run::MetalTensor,
     scale: f64,
     window: Option<usize>,
     batch: usize,
     t: usize,
     h: usize,
     d: usize,
-) -> candle_core::Result<Tensor> {
+) -> crate::err::Res<val::Val> {
     let pool = &kv.pool;
     let layer = layer as usize;
     let mut ctxlens = Vec::with_capacity(batch);
@@ -9134,7 +8521,7 @@ fn kv_attention_paged(
     let mut advance = 0usize;
     for slot in kv.slots.iter() {
         let mut state = slot.lock().map_err(|e| {
-            candle_core::Error::Msg(format!("kv attention: sequence lock poisoned: {e}"))
+            err::err_str(format!("kv attention: sequence lock poisoned: {e}"))
         })?;
         advance = state.advance;
         let (_cursor, needed, start) = kv_prepare(pool, &mut state, layer, window, h, d, t)?;
@@ -9143,20 +8530,20 @@ fn kv_attention_paged(
     }
     // Tables/ctxlens settle at layer 0; later layers reuse them.
     let mut cache = kv.paged_tables.lock().map_err(|e| {
-        candle_core::Error::Msg(format!("kv attention: table cache lock poisoned: {e}"))
+        err::err_str(format!("kv attention: table cache lock poisoned: {e}"))
     })?;
     if cache.is_none() {
         let mut tables: Vec<u32> = Vec::new();
         let mut max_blocks = 0usize;
         for slot in &kv.slots {
             let state = slot.lock().map_err(|e| {
-                candle_core::Error::Msg(format!("kv attention: sequence lock poisoned: {e}"))
+                err::err_str(format!("kv attention: sequence lock poisoned: {e}"))
             })?;
             max_blocks = max_blocks.max(state.blocks.len());
         }
         for slot in &kv.slots {
             let state = slot.lock().map_err(|e| {
-                candle_core::Error::Msg(format!("kv attention: sequence lock poisoned: {e}"))
+                err::err_str(format!("kv attention: sequence lock poisoned: {e}"))
             })?;
             tables.extend_from_slice(&state.blocks);
             tables.resize(tables.len() + (max_blocks - state.blocks.len()), 0);
@@ -9211,11 +8598,11 @@ fn kv_attention_paged(
     )?;
     for (b, slot) in kv.slots.iter().enumerate() {
         let mut state = slot.lock().map_err(|e| {
-            candle_core::Error::Msg(format!("kv attention: sequence lock poisoned: {e}"))
+            err::err_str(format!("kv attention: sequence lock poisoned: {e}"))
         })?;
         kv_evict(pool, &mut state, starts[b]);
     }
-    Ok(out)
+    Ok(val::Val::Metal(out))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -9223,20 +8610,20 @@ fn kv_attention_slot(
     pool: &Arc<PoolInner>,
     state: &mut SeqState,
     layer: u32,
-    q: &Tensor,
-    k: &Tensor,
-    v: &Tensor,
+    q: &val::Val,
+    k: &val::Val,
+    v: &val::Val,
     scale: f64,
     window: Option<usize>,
-) -> candle_core::Result<Tensor> {
-    if q.dtype() != DType::F32 {
-        return Err(candle_core::Error::Msg(format!(
+) -> crate::err::Res<val::Val> {
+    if q.dtype() != runtime::dtype::DType::F32 {
+        return Err(format!(
             "kv attention: dtype must be f32, got {:?}",
             q.dtype()
-        )));
+        ));
     }
     let layer = layer as usize;
-    let dims = q.dims();
+    let dims = q.shape();
     let rank = dims.len();
     let (t, h, d) = (dims[rank - 2], dims[rank - 3], dims[rank - 1]);
     let (cursor, needed, start) = kv_prepare(pool, state, layer, window, h, d, t)?;
@@ -9259,7 +8646,7 @@ fn kv_attention_slot(
     let ctx_rows: Vec<u32> = (start..needed).map(&physical).collect();
     let ctx = full - start;
     if pool.device.is_cpu() {
-        let gather_rows = |slab: &PoolSlab, scale: Option<&PoolSlab>| -> candle_core::Result<runtime::cpu::Tensor> {
+        let gather_rows = |slab: &PoolSlab, scale: Option<&PoolSlab>| -> crate::err::Res<runtime::cpu::Tensor> {
             let raw = slab.native()?.read_rows_f32(&ctx_rows);
             let real = match scale {
                 Some(scale) => {
@@ -9290,54 +8677,70 @@ fn kv_attention_slot(
         };
         let kn = gather_rows(&pool.k[layer], k_scale)?;
         let vn = gather_rows(&pool.v[layer], v_scale)?;
-        let qn = bridge::from_candle(q)?;
-        let out = runtime::cpu::composed::sdpa_forward(&qn, &kn, &vn, scale, true);
+        let qn = q.as_cpu()?;
+        let out = runtime::cpu::composed::sdpa_forward(qn, &kn, &vn, scale, true);
         kv_evict(pool, state, start);
-        return bridge::to_candle(&out);
+        return Ok(val::Val::Cpu(out));
     }
-    // row indexes [T] broadcast to the scatter/gather contract [T, H, D]
-    let row_index = |rows: Vec<u32>| -> candle_core::Result<Tensor> {
-        let n = rows.len();
-        Tensor::from_vec(rows, (n, 1, 1), &pool.device)?.broadcast_as((n, h, d))?.contiguous()
-    };
-    // Row indexes [T] broadcast to the scale contract [T, H].
-    let scale_index = |rows: Vec<u32>| -> candle_core::Result<Tensor> {
-        let n = rows.len();
-        Tensor::from_vec(rows, (n, 1), &pool.device)?.broadcast_as((n, h))?.contiguous()
-    };
-    let ctx_index = row_index(ctx_rows.clone())?;
-    let ctx_scale_index = scale_index(ctx_rows)?;
-    let zeros = (ctx > needed - start)
-        .then(|| Tensor::zeros((ctx - (needed - start), h, d), DType::F32, &pool.device))
-        .transpose()?;
-    let gather_rows = |slab: &PoolSlab, scale: Option<&PoolSlab>| -> candle_core::Result<Tensor> {
-        let slab = slab.candle(&pool.device)?;
-        let gathered = slab.gather(&ctx_index, 0)?;
-        let real = match scale {
-            // Dequantize: (q - 128) * scale, per (token, head).
-            Some(scale) => ((gathered.to_dtype(DType::F32)? - 128.0)?
-                .broadcast_mul(&scale.candle(&pool.device)?.gather(&ctx_scale_index, 0)?.unsqueeze(candle_core::D::Minus1)?))?,
-            None => gathered.to_dtype(DType::F32)?,
+    if pool.device.is_metal() {
+        // Native Metal fallback: gather the context rows through the
+        // block table, dequantize when int8, attend via the composed
+        // native sdpa.
+        let gather_rows = |slab: &PoolSlab, scale: Option<&PoolSlab>| -> crate::err::Res<runtime::metal::run::MetalTensor> {
+            let gathered = runtime::metal::indexing::index_select(
+                runtime::metal::device::MetalDevice::get(),
+                slab.metal()?,
+                0,
+                &ctx_rows,
+            )?;
+            let real = match scale {
+                Some(scale) => {
+                    let g32 = metal_native::cast(&gathered, crate::runtime::dtype::DType::F32)?;
+                    let off = metal_native::fill(g32.layout.shape(), 128.0, g32.dtype)?;
+                    let centered = metal_native::binary(&g32, &off, metal_native::BinOp::Sub)?;
+                    let scales = runtime::metal::indexing::index_select(
+                        runtime::metal::device::MetalDevice::get(),
+                        scale.metal()?,
+                        0,
+                        &ctx_rows,
+                    )?;
+                    let scales = runtime::metal::run::MetalTensor {
+                        buffer: scales.buffer.clone(),
+                        layout: runtime::layout::Layout::contiguous(vec![ctx_rows.len(), h, 1]),
+                        dtype: scales.dtype,
+                    };
+                    metal_native::binary(&centered, &scales, metal_native::BinOp::Mul)?
+                }
+                None => metal_native::cast(&gathered, crate::runtime::dtype::DType::F32)?,
+            };
+            let pad = ctx - ctx_rows.len();
+            let full = if pad > 0 {
+                let zeros = metal_native::fill(&[pad, h, d], 0.0, real.dtype)?;
+                metal_native::cat(&real, &zeros, 0)?
+            } else {
+                real
+            };
+            let permuted = metal_native::permute(&full, &[1, 0, 2])?;
+            let expanded = runtime::metal::run::MetalTensor {
+                buffer: permuted.buffer.clone(),
+                layout: runtime::layout::Layout::contiguous(vec![1, h, ctx, d]),
+                dtype: permuted.dtype,
+            };
+            metal_native::contiguous(&expanded)
         };
-        let full = match &zeros {
-            Some(pad) => Tensor::cat(&[&real, pad], 0)?,
-            None => real,
+        let (k_scale, v_scale) = match slab_dtype {
+            DType::U8 => (Some(&pool.scales[2 * layer]), Some(&pool.scales[2 * layer + 1])),
+            _ => (None, None),
         };
-        full.permute((1, 0, 2))?.unsqueeze(0)?.contiguous()
-    };
-    let (k_scale, v_scale) = match slab_dtype {
-        DType::U8 => (Some(&pool.scales[2 * layer]), Some(&pool.scales[2 * layer + 1])),
-        _ => (None, None),
-    };
-    let out = sdpa_forward(
-        q,
-        &gather_rows(&pool.k[layer], k_scale)?,
-        &gather_rows(&pool.v[layer], v_scale)?,
-        scale,
-        true,
-    )?;
-    kv_evict(pool, state, start);
-    Ok(out)
+        let kn = gather_rows(&pool.k[layer], k_scale)?;
+        let vn = gather_rows(&pool.v[layer], v_scale)?;
+        let qn = q.as_metal()?;
+        let q32 = metal_native::to_f32(qn)?;
+        let out = metal_native::composed::sdpa_forward(&q32, &kn, &vn, scale, true)?;
+        kv_evict(pool, state, start);
+        return Ok(val::Val::Metal(out));
+    }
+    unreachable!("kv attention slot: no composed fallback remains");
 }
 
 // Validates the slot and allocates blocks up to the new frontier.
@@ -9353,18 +8756,18 @@ fn kv_prepare(
     h: usize,
     d: usize,
     t: usize,
-) -> candle_core::Result<(usize, usize, usize)> {
+) -> crate::err::Res<(usize, usize, usize)> {
     if layer >= pool.k.len() {
-        return Err(candle_core::Error::Msg(format!(
+        return Err(format!(
             "kv attention: layer {layer} out of range for {} pool layers",
             pool.k.len()
-        )));
+        ));
     }
     if h != pool.kv_heads || d != pool.head_dim {
-        return Err(candle_core::Error::Msg(format!(
+        return Err(format!(
             "kv attention: layer {layer} shape [{h}, {d}] does not match pool geometry [{}, {}]",
             pool.kv_heads, pool.head_dim
-        )));
+        ));
     }
     let cursor = state.cursor;
     // Chunked prefill: q carries the chunk length t, only `advance`
@@ -9372,9 +8775,9 @@ fn kv_prepare(
     // discards (causality keeps real rows from ever attending to them).
     let advance = state.advance;
     if advance == 0 || advance > t {
-        return Err(candle_core::Error::Msg(format!(
+        return Err(format!(
             "kv attention: advance {advance} out of range for chunk length {t}"
-        )));
+        ));
     }
     let needed = cursor + advance;
     // Live rows after this step: everything from the attention window
@@ -9384,15 +8787,15 @@ fn kv_prepare(
     let full = cursor + t;
     let start = window.map_or(0, |w| full.saturating_sub(w));
     if needed - start > pool.max_tokens {
-        return Err(candle_core::Error::Msg(format!(
+        return Err(format!(
             "kv attention: live context {} exceeds pool capacity {}",
             needed - start,
             pool.max_tokens
-        )));
+        ));
     }
     while state.blocks.len() * pool.block_size < needed {
         let block = pool.alloc_block().ok_or_else(|| {
-            candle_core::Error::Msg(format!(
+            err::err_str(format!(
                 "kv attention: pool exhausted ({} tokens across live sequences)",
                 pool.max_tokens
             ))
@@ -9409,11 +8812,11 @@ fn kv_scatter_rows(
     pool: &Arc<PoolInner>,
     state: &mut SeqState,
     layer: usize,
-    k: &Tensor,
-    v: &Tensor,
+    k: &val::Val,
+    v: &val::Val,
     h: usize,
     d: usize,
-) -> candle_core::Result<()> {
+) -> crate::err::Res<()> {
     let slab_dtype = pool.k[layer].dtype();
     let cursor = state.cursor;
     let advance = state.advance;
@@ -9428,13 +8831,11 @@ fn kv_scatter_rows(
     let write_rows: Vec<u32> = (cursor..needed).map(&physical).collect();
     if pool.device.is_cpu() {
         // [1, H, T, D] -> [T, H, D], real rows only, as flat f32.
-        let new_rows = |x: &Tensor| -> candle_core::Result<Vec<f32>> {
-            let x = x
-                .permute((0, 2, 1, 3))?
-                .contiguous()?
-                .narrow(1, 0, advance)?
-                .reshape((advance, h, d))?;
-            let n = bridge::from_candle(&x)?;
+        let new_rows = |x: &val::Val| -> crate::err::Res<Vec<f32>> {
+            let x = x.as_cpu()?;
+            let p = x.view(x.layout.permute(&[0, 2, 1, 3])).contiguous();
+            let n = p.view(p.layout.narrow(1, 0, advance)).contiguous();
+            let n = n.view(runtime::layout::Layout::contiguous(vec![advance, h, d]));
             let n = n.cast(runtime::dtype::DType::F32).contiguous();
             let runtime::cpu::CpuBuffer::F32(v) = &n.buffer else { unreachable!() };
             Ok(v.as_slice().to_vec())
@@ -9454,54 +8855,90 @@ fn kv_scatter_rows(
         }
         return Ok(());
     }
-    // [1, H, T, D] -> [T, H, D], real rows only
-    let new_rows = |x: &Tensor| -> candle_core::Result<Tensor> {
-        x.permute((0, 2, 1, 3))?
-            .contiguous()?
-            .narrow(1, 0, advance)?
-            .reshape((advance, h, d))
-    };
-    // row indexes [T] broadcast to the scatter contract [T, H, D]
-    let row_index = |rows: Vec<u32>| -> candle_core::Result<Tensor> {
-        let n = rows.len();
-        Tensor::from_vec(rows, (n, 1, 1), &pool.device)?.broadcast_as((n, h, d))?.contiguous()
-    };
-    let write_index = row_index(write_rows.clone())?;
-    // Row indexes [T] broadcast to the scale contract [T, H].
-    let scale_index = |rows: Vec<u32>| -> candle_core::Result<Tensor> {
-        let n = rows.len();
-        Tensor::from_vec(rows, (n, 1), &pool.device)?.broadcast_as((n, h))?.contiguous()
-    };
-    let write_scales = |layer: usize, slot: usize, scale: &Tensor| -> candle_core::Result<()> {
-        pool.scales[2 * layer + slot].candle(&pool.device)?.scatter_set(&scale_index(write_rows.clone())?, scale, 0)
-    };
-    if slab_dtype == DType::U8 {
-        // int8 storage tier: symmetric quantization on a ±127 grid
-        // (offset 128 for the u8 layout) with a per-(token, head)
-        // absmax scale. The grid is deliberately not arithmetic — only
-        // this kernel quantizes on write and dequantizes on read.
-        let quantize = |x: &Tensor| -> candle_core::Result<(Tensor, Tensor)> {
-            let scale = (x.abs()?.max(candle_core::D::Minus1)? / 127.0)?;
-            let scale = (scale + 1e-12)?; // zero rows stay finite
-            let q = ((x.broadcast_div(&scale.unsqueeze(candle_core::D::Minus1)?)? + 128.0)?
-                .round()?
-                .to_dtype(DType::U8))?;
-            Ok((q, scale))
+    if pool.device.is_metal() {
+        // Native Metal fallback (paged unsupported): compute rows on
+        // device, scatter into slabs with computed physical indices.
+        let new_rows = |x: &val::Val| -> crate::err::Res<runtime::metal::run::MetalTensor> {
+            let x = x.as_metal()?;
+            let p = metal_native::permute(x, &[0, 2, 1, 3])?;
+            let n = runtime::metal::run::MetalTensor {
+                buffer: p.buffer.clone(),
+                layout: p.layout.narrow(1, 0, advance),
+                dtype: p.dtype,
+            };
+            let r = metal_native::contiguous(&n)?;
+            Ok(runtime::metal::run::MetalTensor {
+                buffer: r.buffer,
+                layout: runtime::layout::Layout::contiguous(vec![advance, h, d]),
+                dtype: r.dtype,
+            })
         };
-        let (qk, sk) = quantize(&new_rows(k)?)?;
-        let (qv, sv) = quantize(&new_rows(v)?)?;
-        pool.k[layer].candle(&pool.device)?.scatter_set(&write_index, &qk, 0)?;
-        pool.v[layer].candle(&pool.device)?.scatter_set(&write_index, &qv, 0)?;
-        write_scales(layer, 0, &sk)?;
-        write_scales(layer, 1, &sv)?;
-    } else {
-        pool.k[layer].candle(&pool.device)?.scatter_set(&write_index, &new_rows(k)?.to_dtype(slab_dtype)?, 0)?;
-        pool.v[layer].candle(&pool.device)?.scatter_set(&write_index, &new_rows(v)?.to_dtype(slab_dtype)?, 0)?;
+        if slab_dtype == DType::U8 {
+            let quantize = |x: &runtime::metal::run::MetalTensor| -> crate::err::Res<(runtime::metal::run::MetalTensor, runtime::metal::run::MetalTensor)> {
+                let abs = metal_native::unary(x, metal_native::UnOp::Abs)?;
+                let amax = metal_native::reduce(&abs, &[2], true, crate::fusion::ReduceOp::Max)?;
+                let scale = metal_native::binary(&amax, &metal_native::fill(amax.layout.shape(), 127.0, amax.dtype)?, metal_native::BinOp::Div)?;
+                let scale = metal_native::binary(&scale, &metal_native::fill(scale.layout.shape(), 1e-12, scale.dtype)?, metal_native::BinOp::Add)?;
+                let q = metal_native::binary(x, &scale, metal_native::BinOp::Div)?;
+                let q = metal_native::binary(&q, &metal_native::fill(q.layout.shape(), 128.0, q.dtype)?, metal_native::BinOp::Add)?;
+                let q = metal_native::unary(&q, metal_native::UnOp::Round)?;
+                let q = metal_native::cast(&q, crate::runtime::dtype::DType::U8)?;
+                Ok((q, scale))
+            };
+            let (qk, sk) = quantize(&new_rows(k)?)?;
+            let (qv, sv) = quantize(&new_rows(v)?)?;
+            runtime::metal::indexing::scatter_set(
+                runtime::metal::device::MetalDevice::get(),
+                pool.k[layer].metal()?,
+                0,
+                &write_rows,
+                &qk,
+            )?;
+            runtime::metal::indexing::scatter_set(
+                runtime::metal::device::MetalDevice::get(),
+                pool.v[layer].metal()?,
+                0,
+                &write_rows,
+                &qv,
+            )?;
+            runtime::metal::indexing::scatter_set(
+                runtime::metal::device::MetalDevice::get(),
+                pool.scales[2 * layer].metal()?,
+                0,
+                &write_rows,
+                &sk,
+            )?;
+            runtime::metal::indexing::scatter_set(
+                runtime::metal::device::MetalDevice::get(),
+                pool.scales[2 * layer + 1].metal()?,
+                0,
+                &write_rows,
+                &sv,
+            )?;
+        } else {
+            let nd = slab_dtype;
+            let kr = metal_native::cast(&new_rows(k)?, nd)?;
+            let vr = metal_native::cast(&new_rows(v)?, nd)?;
+            runtime::metal::indexing::scatter_set(
+                runtime::metal::device::MetalDevice::get(),
+                pool.k[layer].metal()?,
+                0,
+                &write_rows,
+                &kr,
+            )?;
+            runtime::metal::indexing::scatter_set(
+                runtime::metal::device::MetalDevice::get(),
+                pool.v[layer].metal()?,
+                0,
+                &write_rows,
+                &vr,
+            )?;
+        }
+        return Ok(());
     }
     Ok(())
 }
 
-// Evicts dead blocks: fully below the window frontier, never attended
 // again. The last reference lands them in the prefix cache — their
 // content is still valid for a matching prompt.
 fn kv_evict(pool: &PoolInner, state: &mut SeqState, start: usize) {
@@ -9797,29 +9234,17 @@ impl NativeKvPool {
         let mut scales = Vec::with_capacity(layers);
         for _ in 0..layers {
             if device.is_cpu() {
-                k.push(PoolSlab::Native(runtime::cpu::pool::Slab::new(
-                    max_tokens,
-                    kv_heads * head_dim,
-                    bridge::dtype_to_native(dtype),
-                )));
-                v.push(PoolSlab::Native(runtime::cpu::pool::Slab::new(
-                    max_tokens,
-                    kv_heads * head_dim,
-                    bridge::dtype_to_native(dtype),
-                )));
+                k.push(PoolSlab::Native(runtime::cpu::pool::Slab::new(max_tokens, kv_heads * head_dim, dtype)));
+                v.push(PoolSlab::Native(runtime::cpu::pool::Slab::new(max_tokens, kv_heads * head_dim, dtype)));
                 if dtype == DType::U8 {
                     for _ in 0..2 {
-                        scales.push(PoolSlab::Native(runtime::cpu::pool::Slab::new(
-                            max_tokens,
-                            kv_heads,
-                            runtime::dtype::DType::F32,
-                        )));
+                        scales.push(PoolSlab::Native(runtime::cpu::pool::Slab::new(max_tokens, kv_heads, runtime::dtype::DType::F32)));
                     }
                 }
                 continue;
             }
             if device.is_metal() {
-                let nd = bridge::dtype_to_native(dtype);
+                let nd = dtype;
                 let mslab = |row_width: usize, dt: crate::runtime::dtype::DType| {
                     PoolSlab::NativeMetal(runtime::metal::run::MetalTensor {
                         buffer: runtime::metal::device::MetalDevice::get()
@@ -10156,20 +9581,20 @@ impl DecodeProgram {
                 - inner.slots.iter().take(slot).filter(|s| s.scalar).count()
                 - usize::from(self.cursor_tensor && (slot as u32) > self.cursor_slot);
             let got = &inputs[input_index].inner;
-            if got.dims() != declared.shape.as_slice()
+            if got.shape() != declared.shape.as_slice()
                 || got.dtype() != declared.dtype
-                || device_key(got.device()) != device_key(&declared.device)
+                || device_key(&got.device()) != device_key(&declared.device)
             {
                 return Err(Error::new(
                     Status::InvalidArg,
-                    format!("input slot {slot}: expected {}, got {:?}", declared.signature(), got.dims()),
+                    format!("input slot {slot}: expected {}, got {:?}", declared.signature(), got.shape()),
                 ));
             }
         }
         let slots = inner.slots.clone();
         let roots = inner.roots.clone();
         let leaves = inner.leaves.clone();
-        let inputs: Vec<Tensor> = inputs.iter().map(|input| input.inner.clone()).collect();
+        let inputs: Vec<val::Val> = inputs.iter().map(|input| input.inner.clone()).collect();
         let kv = Arc::new(KvContext {
             pool: seqs[0].pool.clone(),
             slots: seqs.iter().map(|seq| seq.state.clone()).collect(),
@@ -10225,16 +9650,27 @@ impl DecodeProgram {
                             Error::new(Status::GenericFailure, format!("kv sequence lock poisoned: {e}"))
                         })?.cursor as i64);
                     }
-                    Tensor::from_vec(cursors, batch, &declared.device).map_err(to_napi_err)?
+                    if declared.device.is_cpu() {
+                        val::Val::Cpu(runtime::cpu::Tensor::from_vec(cursors, vec![batch]))
+                    } else {
+                        let data: Vec<u8> = cursors.iter().flat_map(|c| c.to_le_bytes()).collect();
+                        val::Val::Metal(runtime::metal::run::MetalTensor {
+                            buffer: runtime::metal::device::MetalDevice::get().upload_bytes(&data),
+                            layout: runtime::layout::Layout::contiguous(vec![batch]),
+                            dtype: runtime::dtype::DType::I64,
+                        })
+                    }
                 } else {
                     tensors.next().expect("tensor count checked").clone()
                 };
                 bindings.insert(slot as u64, binding);
             }
-            let by_id: std::collections::HashMap<u64, Tensor> = leaves
+            let by_id: std::collections::HashMap<u64, val::Val> = leaves
                 .iter()
-                .map(|(id, slot)| (*id, bindings[&(*slot as u64)].clone()))
-                .collect();
+                .map(|(id, slot)| {
+                    Ok((*id, bindings[&(*slot as u64)].clone()))
+                })
+                .collect::<crate::err::Res<_>>().map_err(to_napi_err)?;
             // Blocks allocated by a failed run roll back: the cursor did
             // not advance, so every block beyond the pre-run frontier is
             // unreferenced and returns to the pool (a poisoned sequence
@@ -10265,7 +9701,7 @@ impl DecodeProgram {
             // Synchronize once: per-root syncs would fully serialize
             // CPU encoding and GPU execution. Device-global: one call.
             if let Some(first) = outputs.first() {
-                first.inner.device().synchronize().map_err(to_napi_err)?;
+                first.inner.synchronize();
             }
             ev.run_ce_checks().map_err(to_napi_err)?;
             for (i, state) in slot_states.iter().enumerate() {
@@ -10343,8 +9779,8 @@ pub fn compile_decode(roots: Vec<&LazyTensor>, window: Option<u32>, batch: Optio
 struct ProgramSlot {
     scalar: bool,
     shape: Vec<usize>,
-    dtype: DType,
-    device: Device,
+    dtype: runtime::dtype::DType,
+    device: dev::Device,
 }
 
 impl ProgramSlot {
@@ -10448,18 +9884,12 @@ fn collect_program_slots(
     Ok((out, leaves))
 }
 
-fn scalar_binding(value: f64, dtype: DType, device: &Device) -> candle_core::Result<Tensor> {
-    match dtype {
-        DType::F32 => Tensor::full(value as f32, vec![], device),
-        DType::F64 => Tensor::full(value, vec![], device),
-        DType::I64 => Tensor::full(value as i64, vec![], device),
-        DType::U8 => Tensor::full(value as u8, vec![], device),
-        DType::U32 => Tensor::full(value as u32, vec![], device),
-        DType::F16 => Tensor::full(half::f16::from_f64(value), vec![], device),
-        DType::BF16 => Tensor::full(half::bf16::from_f64(value), vec![], device),
-        dtype => Err(candle_core::Error::Msg(format!(
-            "scalar input not supported for dtype {dtype:?}"
-        ))),
+fn scalar_binding(value: f64, dtype: DType, device: &Device) -> err::Res<val::Val> {
+    let nd = dtype;
+    if device.is_cpu() {
+        Ok(val::Val::Cpu(runtime::cpu::Tensor::full(&[], value, nd)))
+    } else {
+        Ok(val::Val::Metal(metal_native::fill(&[], value, nd)?))
     }
 }
 
@@ -10521,22 +9951,22 @@ impl CompiledProgram {
             }
             let input = tensors.next().expect("tensor count checked");
             let got = &input.inner;
-            if got.dims() != declared.shape.as_slice()
+            if got.shape() != declared.shape.as_slice()
                 || got.dtype() != declared.dtype
-                || device_key(got.device()) != device_key(&declared.device)
+                || device_key(&got.device()) != device_key(&declared.device)
             {
                 return Err(Error::new(
                     Status::InvalidArg,
                     format!(
                         "input slot {slot}: expected {}, got {}:{}@{}",
                         declared.signature(),
-                        got.dims()
+                        got.shape()
                             .iter()
                             .map(|d| d.to_string())
                             .collect::<Vec<_>>()
                             .join("x"),
-                        dtype_name(got.dtype()),
-                        device_key(got.device())
+                        got.dtype().name(),
+                        device_key(&got.device())
                     ),
                 ));
             }
@@ -10544,7 +9974,7 @@ impl CompiledProgram {
         let slots = inner.slots.clone();
         let roots = inner.roots.clone();
         let leaves = inner.leaves.clone();
-        let inputs: Vec<Tensor> = inputs.iter().map(|input| input.inner.clone()).collect();
+        let inputs: Vec<val::Val> = inputs.iter().map(|input| input.inner.clone()).collect();
     run_compute(token, move |cancelled| {
         let _guard = metal_eval_guard(&roots);
         // Bindings are built inside the eval guard: scalar_binding
@@ -10562,10 +9992,12 @@ impl CompiledProgram {
             };
             bindings.insert(slot as u64, binding);
         }
-        let by_id: std::collections::HashMap<u64, Tensor> = leaves
+        let by_id: std::collections::HashMap<u64, val::Val> = leaves
             .iter()
-            .map(|(id, slot)| (*id, bindings[&(*slot as u64)].clone()))
-            .collect();
+            .map(|(id, slot)| {
+                Ok((*id, bindings[&(*slot as u64)].clone()))
+            })
+            .collect::<crate::err::Res<_>>().map_err(to_napi_err)?;
         let mut ev = Evaluator::with_slots(&roots, by_id);
             if std::env::var_os("EFFECT_TORCH_EVAL_STATS").is_some() {
                 let mut counts: HashMap<&'static str, usize> = HashMap::new();
@@ -10599,7 +10031,7 @@ impl CompiledProgram {
             // the host synchronize at readback; device-side reuse needs
             // no host round-trip. Device-global: one call.
             if let Some(first) = outputs.first() {
-                first.inner.device().synchronize().map_err(to_napi_err)?;
+                first.inner.synchronize();
             }
             let t_sync = t1.elapsed() - t_encode;
             ev.run_ce_checks().map_err(to_napi_err)?;
@@ -10669,10 +10101,10 @@ pub async fn save_tensors(
         let mut map = std::collections::HashMap::with_capacity(names.len());
         for (name, node) in names.iter().zip(nodes.iter()) {
             let output = eval_node(node, cancelled, &mut ev).map_err(to_napi_err)?;
-            output.device().synchronize().map_err(to_napi_err)?;
+            output.synchronize();
             map.insert(name.clone(), output);
         }
-        candle_core::safetensors::save(&map, &path).map_err(to_napi_err)
+        safetensors::save(&map, &path).map_err(to_napi_err)
     })
     .await
 }
@@ -10688,10 +10120,7 @@ pub async fn load_tensors(
 ) -> Result<(Vec<String>, Vec<NativeTensor>)> {
     let dev = get_device(device)?;
     run_compute(token, move |_cancelled| {
-        let mut entries: Vec<(String, Tensor)> = candle_core::safetensors::load(&path, &dev)
-            .map_err(to_napi_err)?
-            .into_iter()
-            .collect();
+        let mut entries = safetensors::load(&path, &dev).map_err(to_napi_err)?;
         entries.sort_by(|a, b| a.0.cmp(&b.0));
         Ok((
             entries.iter().map(|(name, _)| name.clone()).collect(),
@@ -10731,18 +10160,11 @@ mod kv_tests {
 
     #[test]
     fn scatter_gather_roundtrip() {
-        let device = Device::Cpu;
-        let slab = Tensor::zeros((8, 2, 3), DType::F32, &device).unwrap();
-        let src = Tensor::arange(0f32, 12f32, &device).unwrap().reshape((2, 2, 3)).unwrap();
-        let idx = Tensor::from_vec(vec![4u32, 5u32], (2, 1, 1), &device)
-            .unwrap()
-            .broadcast_as((2, 2, 3))
-            .unwrap()
-            .contiguous()
-            .unwrap();
-        slab.scatter_set(&idx, &src, 0).unwrap();
-        let got = slab.gather(&idx, 0).unwrap();
-        assert_eq!(got.to_vec3::<f32>().unwrap(), src.to_vec3::<f32>().unwrap());
+        let slab = runtime::cpu::pool::Slab::new(8, 2 * 3, runtime::dtype::DType::F32);
+        let src: Vec<f32> = (0..12).map(|v| v as f32).collect();
+        slab.write_rows_f32(&[4, 5], &src);
+        let got = slab.read_rows_f32(&[4, 5]);
+        assert_eq!(got, src);
     }
 
     #[test]
@@ -10768,14 +10190,29 @@ mod kv_tests {
             pending: Vec::new(),
         }));
         let kv = KvContext { pool: pool.clone(), slots: vec![state.clone()], paged_tables: Mutex::new(None) };
-        let q = Tensor::arange(0f32, 24f32, &device).unwrap().reshape((1, 2, 3, 4)).unwrap();
-        let k = (Tensor::arange(24f32, 48f32, &device).unwrap() * 0.01).unwrap().reshape((1, 2, 3, 4)).unwrap();
-        let v = (Tensor::arange(48f32, 72f32, &device).unwrap() * 0.01).unwrap().reshape((1, 2, 3, 4)).unwrap();
+        let q = val::Val::Cpu(runtime::cpu::Tensor::from_vec(
+            (0..24).map(|v| v as f32).collect(),
+            vec![1, 2, 3, 4],
+        ));
+        let k = val::Val::Cpu(runtime::cpu::Tensor::from_vec(
+            (24..48).map(|v| v as f32 * 0.01).collect(),
+            vec![1, 2, 3, 4],
+        ));
+        let v = val::Val::Cpu(runtime::cpu::Tensor::from_vec(
+            (48..72).map(|v| v as f32 * 0.01).collect(),
+            vec![1, 2, 3, 4],
+        ));
         state.lock().unwrap().advance = 3;
         let got = kv_attention(&kv, 0, &q, &k, &v, 0.5, None).unwrap();
-        let want = sdpa_forward(&q, &k, &v, 0.5, true).unwrap();
-        let got = got.flatten_all().unwrap().to_vec1::<f32>().unwrap();
-        let want = want.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        let want = val::Val::Cpu(runtime::cpu::composed::sdpa_forward(
+            q.as_cpu().unwrap(),
+            k.as_cpu().unwrap(),
+            v.as_cpu().unwrap(),
+            0.5,
+            true,
+        ));
+        let got = got.to_f32_vec().unwrap();
+        let want = want.to_f32_vec().unwrap();
         for (g, w) in got.iter().zip(&want) {
             assert!((g - w).abs() < 1e-6, "{g} vs {w}");
         }
@@ -10784,13 +10221,12 @@ mod kv_tests {
 
     #[test]
     fn sdpa_single_token() {
-        let device = Device::Cpu;
-        let q = Tensor::arange(0f32, 8f32, &device).unwrap().reshape((1, 2, 1, 4)).unwrap();
-        let k = Tensor::ones((1, 2, 1, 4), DType::F32, &device).unwrap();
-        let v = Tensor::arange(8f32, 16f32, &device).unwrap().reshape((1, 2, 1, 4)).unwrap();
-        let out = sdpa_forward(&q, &k, &v, 0.5, true).unwrap();
-        let got = out.flatten_all().unwrap().to_vec1::<f32>().unwrap();
-        let want = v.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        let q = runtime::cpu::Tensor::from_vec((0..8).map(|v| v as f32).collect(), vec![1, 2, 1, 4]);
+        let k = runtime::cpu::Tensor::ones(&[1, 2, 1, 4], runtime::dtype::DType::F32);
+        let v = runtime::cpu::Tensor::from_vec((8..16).map(|v| v as f32).collect(), vec![1, 2, 1, 4]);
+        let out = runtime::cpu::composed::sdpa_forward(&q, &k, &v, 0.5, true);
+        let got = val::Val::Cpu(out).to_f32_vec().unwrap();
+        let want = val::Val::Cpu(v).to_f32_vec().unwrap();
         assert_eq!(got, want);
     }
 

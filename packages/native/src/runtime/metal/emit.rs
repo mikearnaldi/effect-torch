@@ -15,8 +15,7 @@ fn f32_lit(v: f64) -> String {
     format!("({s}f)")
 }
 
-fn emit_expr(e: &Expr, lane: &dyn Fn(u32) -> String, num_inputs: usize) -> String {
-    match e {
+fn emit_expr(e: &Expr, lane: &dyn Fn(u32) -> String, num_inputs: usize) -> String {    match e {
         Expr::Input(k) => lane(*k),
         Expr::Scalar(k) => format!("scs[{}]", *k as usize),
         Expr::Const(bits) => f32_lit(f64::from_bits(*bits)),
@@ -48,7 +47,7 @@ fn emit_expr(e: &Expr, lane: &dyn Fn(u32) -> String, num_inputs: usize) -> Strin
         Expr::Log(a) => format!("log({})", emit_expr(a, lane, num_inputs)),
         Expr::Floor(a) => format!("floor({})", emit_expr(a, lane, num_inputs)),
         Expr::Ceil(a) => format!("ceil({})", emit_expr(a, lane, num_inputs)),
-        Expr::Round(a) => format!("rint({})", emit_expr(a, lane, num_inputs)),
+        Expr::Round(a) => format!("round({})", emit_expr(a, lane, num_inputs)),
         Expr::Powf(a, e) => format!("pow({}, {})", emit_expr(a, lane, num_inputs), f32_lit(f64::from_bits(*e))),
         Expr::Erf(a) => format!("erf_as({})", emit_expr(a, lane, num_inputs)),
     }
@@ -62,6 +61,71 @@ fn contiguous_strides(shape: &[usize]) -> Vec<usize> {
         acc *= shape[d];
     }
     strides
+}
+
+// SSA form: long fused chains (thousands of ops) exceed MSL's bracket
+// nesting limit when emitted as nested parentheses; flat temporaries also
+// compile dramatically faster and dedupe shared subtrees.
+fn emit_expr_ssa(
+    e: &Expr,
+    lane: &dyn Fn(u32) -> String,
+    num_inputs: usize,
+    body: &mut String,
+    next: &mut usize,
+    memo: &mut std::collections::HashMap<usize, String>,
+) -> String {
+    let ptr = e as *const Expr as usize;
+    if let Some(t) = memo.get(&ptr) {
+        return t.clone();
+    }
+    match e {
+        Expr::Input(k) => return lane(*k),
+        Expr::Scalar(k) => return format!("scs[{}]", *k as usize),
+        Expr::Const(bits) => return f32_lit(f64::from_bits(*bits)),
+        _ => {}
+    }
+    let mut s = |x: &Expr, body: &mut String, next: &mut usize, memo: &mut std::collections::HashMap<usize, String>| {
+        emit_expr_ssa(x, lane, num_inputs, body, next, memo)
+    };
+    let rhs = match e {
+        Expr::Input(_) | Expr::Scalar(_) | Expr::Const(_) => unreachable!(),
+        Expr::Add(a, b) => format!("({} + {})", s(a, body, next, memo), s(b, body, next, memo)),
+        Expr::Sub(a, b) => format!("({} - {})", s(a, body, next, memo), s(b, body, next, memo)),
+        Expr::Mul(a, b) => format!("({} * {})", s(a, body, next, memo), s(b, body, next, memo)),
+        Expr::Div(a, b) => format!("({} / {})", s(a, body, next, memo), s(b, body, next, memo)),
+        Expr::Min(a, b) => format!("fmin({}, {})", s(a, body, next, memo), s(b, body, next, memo)),
+        Expr::Max(a, b) => format!("fmax({}, {})", s(a, body, next, memo), s(b, body, next, memo)),
+        Expr::Lt(a, b) => format!("({} < {} ? 1.0f : 0.0f)", s(a, body, next, memo), s(b, body, next, memo)),
+        Expr::Le(a, b) => format!("({} <= {} ? 1.0f : 0.0f)", s(a, body, next, memo), s(b, body, next, memo)),
+        Expr::Gt(a, b) => format!("({} > {} ? 1.0f : 0.0f)", s(a, body, next, memo), s(b, body, next, memo)),
+        Expr::Ge(a, b) => format!("({} >= {} ? 1.0f : 0.0f)", s(a, body, next, memo), s(b, body, next, memo)),
+        Expr::Eq(a, b) => format!("({} == {} ? 1.0f : 0.0f)", s(a, body, next, memo), s(b, body, next, memo)),
+        Expr::Ne(a, b) => format!("({} != {} ? 1.0f : 0.0f)", s(a, body, next, memo), s(b, body, next, memo)),
+        Expr::Select(c, a, b) => format!(
+            "({} != 0.0f ? {} : {})",
+            s(c, body, next, memo),
+            s(a, body, next, memo),
+            s(b, body, next, memo)
+        ),
+        Expr::Neg(a) => format!("(-{})", s(a, body, next, memo)),
+        Expr::Sqrt(a) => format!("sqrt({})", s(a, body, next, memo)),
+        Expr::Exp(a) => format!("exp({})", s(a, body, next, memo)),
+        Expr::Sin(a) => format!("sin({})", s(a, body, next, memo)),
+        Expr::Cos(a) => format!("cos({})", s(a, body, next, memo)),
+        Expr::Tanh(a) => format!("tanh({})", s(a, body, next, memo)),
+        Expr::Abs(a) => format!("fabs({})", s(a, body, next, memo)),
+        Expr::Log(a) => format!("log({})", s(a, body, next, memo)),
+        Expr::Floor(a) => format!("floor({})", s(a, body, next, memo)),
+        Expr::Ceil(a) => format!("ceil({})", s(a, body, next, memo)),
+        Expr::Round(a) => format!("round({})", s(a, body, next, memo)),
+        Expr::Powf(a, e) => format!("pow({}, {})", s(a, body, next, memo), f32_lit(f64::from_bits(*e))),
+        Expr::Erf(a) => format!("erf_as({})", s(a, body, next, memo)),
+    };
+    let name = format!("t{}", *next);
+    *next += 1;
+    body.push_str(&format!("    float {name} = {rhs};\n"));
+    memo.insert(ptr, name.clone());
+    name
 }
 
 fn lane_offset_expr(strides: &[usize], out_shape: &[usize], index: &str) -> String {
@@ -100,7 +164,7 @@ using namespace metal;
 inline float erf_as(float x) {
     float ax = fabs(x);
     float t = 1.0f / (1.0f + 0.3275911f * ax);
-    float p = 1.061405429f * t;
+    float p = 1.061405429f;
     p = p * t - 1.453152027f;
     p = p * t + 1.421413741f;
     p = p * t - 0.284496736f;
@@ -146,8 +210,12 @@ pub fn emit_elementwise(
         .map(|s| lane_offset_expr(s, out_shape, "clamped"))
         .collect();
     let lane = |k: u32| -> String { format!("in{}[{}]", k, lanes[k as usize]) };
+    let mut next = 0usize;
+    let mut memo = std::collections::HashMap::new();
     for (j, expr) in exprs.iter().enumerate() {
-        let v = emit_expr(expr, &lane, num_inputs);
+        let mut body = String::new();
+        let v = emit_expr_ssa(expr, &lane, num_inputs, &mut body, &mut next, &mut memo);
+        src.push_str(&body);
         src.push_str(&format!("    out{j}[clamped] = {v};\n"));
     }
     src.push_str("}\n");

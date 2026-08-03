@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 const PROBES: usize = 8;
 const MAX_BUCKET: usize = 4096;
-const DISPATCHES_PER_BUFFER: usize = 50;
+const DISPATCHES_PER_BUFFER: usize = 4096;
 const SWEEP_MS: u64 = 100;
 
 pub struct Buffer {
@@ -71,13 +71,25 @@ impl Allocator {
         }
     }
 
-    fn sweep(&mut self) {
+    // Buffers whose only reference is the bucket's may still be read by
+    // in-flight GPU dispatches (the serial encoder orders execution, not
+    // completion). The caller moves them to the device's retire list instead
+    // of deallocating; they are released at the next synchronize, when the
+    // GPU is drained.
+    fn sweep(&mut self, retired: &mut Vec<Arc<Buffer>>) {
         if self.last_sweep.elapsed() < std::time::Duration::from_millis(SWEEP_MS) {
             return;
         }
         self.last_sweep = std::time::Instant::now();
         for bucket in self.buckets.values_mut() {
-            bucket.retain(|b| Arc::strong_count(b) > 1);
+            bucket.retain(|b| {
+                if Arc::strong_count(b) > 1 {
+                    true
+                } else {
+                    retired.push(b.clone());
+                    false
+                }
+            });
         }
     }
 }
@@ -106,6 +118,13 @@ impl EncoderManager {
     }
 
     fn finish_dispatch(&mut self) {
+        // Untracked hazards: without a barrier, Metal may overlap adjacent
+        // compute dispatches in the same command buffer. Our allocator
+        // recycles buffers across dispatches, so every dispatch must be
+        // ordered after the previous one.
+        if let Some((_, encoder)) = &self.current {
+            unsafe { encoder.memoryBarrierWithScope(objc2_metal::MTLBarrierScope::Buffers) };
+        }
         self.count += 1;
         if self.count >= DISPATCHES_PER_BUFFER {
             self.commit();
@@ -135,6 +154,7 @@ pub struct MetalDevice {
     allocator: Mutex<Allocator>,
     encoder: Mutex<EncoderManager>,
     pipelines: Mutex<HashMap<u64, Pipeline>>,
+    retired: Mutex<Vec<Arc<Buffer>>>,
 }
 
 // Metal command queues serialize command buffer execution; our encoder
@@ -168,6 +188,7 @@ impl MetalDevice {
             allocator: Mutex::new(Allocator::new()),
             encoder: Mutex::new(EncoderManager::new(queue)),
             pipelines: Mutex::new(HashMap::new()),
+            retired: Mutex::new(Vec::new()),
         })
     }
 
@@ -179,7 +200,10 @@ impl MetalDevice {
         let size = elements * dtype.size_in_bytes();
         let bucket_size = size.next_power_of_two().max(16);
         let mut alloc = self.allocator.lock().unwrap();
-        alloc.sweep();
+        {
+            let mut retired = self.retired.lock().unwrap();
+            alloc.sweep(&mut retired);
+        }
         let cursor = alloc.cursor;
         alloc.cursor = alloc.cursor.wrapping_add(1);
         let bucket = alloc.buckets.entry(bucket_size).or_default();
@@ -208,22 +232,15 @@ impl MetalDevice {
     }
 
     pub fn alloc_with_data(&self, data: &[f32]) -> Arc<Buffer> {
-        let size = data.len() * 4;
-        let bucket_size = size.next_power_of_two().max(16);
-        let raw = unsafe {
-            self.raw.newBufferWithBytes_length_options(
-                NonNull::new(data.as_ptr() as *const std::ffi::c_void as *mut std::ffi::c_void).unwrap(),
-                bucket_size,
-                SHARED_OPTIONS,
-            )
-        }
-        .expect("metal buffer allocation failed");
-        Arc::new(Buffer { raw, size: bucket_size })
+        self.upload_bytes(unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 4) })
     }
 
     pub fn alloc_with_data_u32(&self, data: &[u32]) -> Arc<Buffer> {
-        let size = data.len() * 4;
-        let bucket_size = size.next_power_of_two().max(16);
+        self.upload_bytes(unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 4) })
+    }
+
+    pub fn upload_bytes(&self, data: &[u8]) -> Arc<Buffer> {
+        let bucket_size = data.len().next_power_of_two().max(16);
         let raw = unsafe {
             self.raw.newBufferWithBytes_length_options(
                 NonNull::new(data.as_ptr() as *const std::ffi::c_void as *mut std::ffi::c_void).unwrap(),
@@ -232,7 +249,13 @@ impl MetalDevice {
             )
         }
         .expect("metal buffer allocation failed");
-        Arc::new(Buffer { raw, size: bucket_size })
+        let buffer = Arc::new(Buffer { raw, size: bucket_size });
+        // Host uploads retire only at the next synchronize. Uploads are
+        // NEVER pooled: the only strong refs are the caller's and this
+        // list's, so nothing can recycle the bytes before the GPU has
+        // consumed them (concurrent walks/tests share the device).
+        self.retired.lock().unwrap().push(buffer.clone());
+        buffer
     }
 
     pub fn compile(&self, key: u64, source: &str, name: &str) -> Result<Pipeline, String> {
@@ -271,6 +294,9 @@ impl MetalDevice {
 
     pub fn synchronize(&self) {
         self.encoder.lock().unwrap().synchronize();
+        // The GPU has consumed everything submitted so far; retired
+        // uploads may return to the pool.
+        self.retired.lock().unwrap().clear();
     }
 
     pub fn grid(width: usize, height: usize, depth: usize) -> MTLSize {
