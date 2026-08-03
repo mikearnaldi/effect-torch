@@ -4781,6 +4781,15 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> candle_core::Result<Te
                 let r = bridge::from_candle(&x)?.argmax(*dim).cast(runtime::dtype::DType::I64);
                 return bridge::to_candle(&r);
             }
+            if x.device().is_metal() {
+                let w = bridge::metal::wrap(&x)?;
+                let w = if w.layout.is_contiguous() { w } else { runtime::metal::kernels::strided_copy(runtime::metal::device::MetalDevice::get(), &w).map_err(candle_core::Error::Msg)? };
+                let r = runtime::metal::kernels::argreduce(runtime::metal::device::MetalDevice::get(), &w, *dim, true)
+                    .map_err(candle_core::Error::Msg)?;
+                let r = runtime::metal::kernels::cast(runtime::metal::device::MetalDevice::get(), &r, crate::runtime::dtype::DType::I64)
+                    .map_err(candle_core::Error::Msg)?;
+                return bridge::metal::unwrap(&r.buffer, r.layout.shape().to_vec(), DType::I64, x.device().as_metal_device()?);
+            }
             x.argmax(*dim)?.to_dtype(DType::I64)?
         }
         NodeKind::Argmin { a, dim } => {
@@ -4789,12 +4798,28 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> candle_core::Result<Te
                 let r = bridge::from_candle(&x)?.argmin(*dim).cast(runtime::dtype::DType::I64);
                 return bridge::to_candle(&r);
             }
+            if x.device().is_metal() {
+                let w = bridge::metal::wrap(&x)?;
+                let w = if w.layout.is_contiguous() { w } else { runtime::metal::kernels::strided_copy(runtime::metal::device::MetalDevice::get(), &w).map_err(candle_core::Error::Msg)? };
+                let r = runtime::metal::kernels::argreduce(runtime::metal::device::MetalDevice::get(), &w, *dim, false)
+                    .map_err(candle_core::Error::Msg)?;
+                let r = runtime::metal::kernels::cast(runtime::metal::device::MetalDevice::get(), &r, crate::runtime::dtype::DType::I64)
+                    .map_err(candle_core::Error::Msg)?;
+                return bridge::metal::unwrap(&r.buffer, r.layout.shape().to_vec(), DType::I64, x.device().as_metal_device()?);
+            }
             x.argmin(*dim)?.to_dtype(DType::I64)?
         }
         NodeKind::Cumsum { a, dim } => {
             let x = ev.value(a.id)?;
             if x.device().is_cpu() {
                 return bridge::to_candle(&bridge::from_candle(&x)?.cumsum(*dim));
+            }
+            if x.device().is_metal() {
+                let w = bridge::metal::wrap(&x)?;
+                let w = if w.layout.is_contiguous() { w } else { runtime::metal::kernels::strided_copy(runtime::metal::device::MetalDevice::get(), &w).map_err(candle_core::Error::Msg)? };
+                let r = runtime::metal::kernels::cumsum(runtime::metal::device::MetalDevice::get(), &w, *dim)
+                    .map_err(candle_core::Error::Msg)?;
+                return bridge::metal::unwrap(&r.buffer, r.layout.shape().to_vec(), x.dtype(), x.device().as_metal_device()?);
             }
             // cumsum is implemented as a matmul internally and chokes on
             // stride-0 broadcast inputs
@@ -5138,6 +5163,15 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> candle_core::Result<Te
                 );
                 return bridge::to_candle(&r);
             }
+            if x.device().is_metal() {
+                let xn = bridge::metal::wrap(&x)?;
+                let xn = if xn.layout.is_contiguous() { xn } else { runtime::metal::kernels::strided_copy(runtime::metal::device::MetalDevice::get(), &xn).map_err(candle_core::Error::Msg)? };
+                let wn = bridge::metal::wrap(&w)?;
+                let wn = if wn.layout.is_contiguous() { wn } else { runtime::metal::kernels::strided_copy(runtime::metal::device::MetalDevice::get(), &wn).map_err(candle_core::Error::Msg)? };
+                let r = runtime::metal::conv::conv1d(runtime::metal::device::MetalDevice::get(), &xn, &wn, *stride, *padding, *dilation, *groups)
+                    .map_err(candle_core::Error::Msg)?;
+                return bridge::metal::unwrap(&r.buffer, r.layout.shape().to_vec(), x.dtype(), x.device().as_metal_device()?);
+            }
             x.contiguous()?
                 .conv1d(&w.contiguous()?, *padding, *stride, *dilation, *groups)?
         }
@@ -5161,6 +5195,15 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> candle_core::Result<Te
                     *groups,
                 );
                 return bridge::to_candle(&r);
+            }
+            if x.device().is_metal() {
+                let xn = bridge::metal::wrap(&x)?;
+                let xn = if xn.layout.is_contiguous() { xn } else { runtime::metal::kernels::strided_copy(runtime::metal::device::MetalDevice::get(), &xn).map_err(candle_core::Error::Msg)? };
+                let wn = bridge::metal::wrap(&w)?;
+                let wn = if wn.layout.is_contiguous() { wn } else { runtime::metal::kernels::strided_copy(runtime::metal::device::MetalDevice::get(), &wn).map_err(candle_core::Error::Msg)? };
+                let r = runtime::metal::conv::conv2d(runtime::metal::device::MetalDevice::get(), &xn, &wn, *stride, *padding, *dilation, *groups)
+                    .map_err(candle_core::Error::Msg)?;
+                return bridge::metal::unwrap(&r.buffer, r.layout.shape().to_vec(), x.dtype(), x.device().as_metal_device()?);
             }
             x.contiguous()?
                 .conv2d(&w.contiguous()?, *padding, *stride, *dilation, *groups)?
@@ -5187,6 +5230,15 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> candle_core::Result<Te
                     *groups,
                 );
                 return bridge::to_candle(&r);
+            }
+            if x.device().is_metal() {
+                let xn = bridge::metal::wrap(&x)?;
+                let xn = if xn.layout.is_contiguous() { xn } else { runtime::metal::kernels::strided_copy(runtime::metal::device::MetalDevice::get(), &xn).map_err(candle_core::Error::Msg)? };
+                let wn = bridge::metal::wrap(&w)?;
+                let wn = if wn.layout.is_contiguous() { wn } else { runtime::metal::kernels::strided_copy(runtime::metal::device::MetalDevice::get(), &wn).map_err(candle_core::Error::Msg)? };
+                let r = runtime::metal::conv::conv_transpose1d(runtime::metal::device::MetalDevice::get(), &xn, &wn, *stride, *padding, *output_padding, *dilation, *groups)
+                    .map_err(candle_core::Error::Msg)?;
+                return bridge::metal::unwrap(&r.buffer, r.layout.shape().to_vec(), x.dtype(), x.device().as_metal_device()?);
             }
             x.contiguous()?.conv_transpose1d(
                 &w.contiguous()?,
@@ -5221,6 +5273,15 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> candle_core::Result<Te
                 return bridge::to_candle(&r);
             }
             if *groups == 1 {
+                if x.device().is_metal() {
+                    let xn = bridge::metal::wrap(&x)?;
+                    let xn = if xn.layout.is_contiguous() { xn } else { runtime::metal::kernels::strided_copy(runtime::metal::device::MetalDevice::get(), &xn).map_err(candle_core::Error::Msg)? };
+                    let wn = bridge::metal::wrap(&w)?;
+                    let wn = if wn.layout.is_contiguous() { wn } else { runtime::metal::kernels::strided_copy(runtime::metal::device::MetalDevice::get(), &wn).map_err(candle_core::Error::Msg)? };
+                    let r = runtime::metal::conv::conv_transpose2d(runtime::metal::device::MetalDevice::get(), &xn, &wn, *stride, *padding, *output_padding, *dilation, *groups)
+                        .map_err(candle_core::Error::Msg)?;
+                    return bridge::metal::unwrap(&r.buffer, r.layout.shape().to_vec(), x.dtype(), x.device().as_metal_device()?);
+                }
                 x.contiguous()?.conv_transpose2d(
                     &w.contiguous()?,
                     *padding,
@@ -5257,6 +5318,35 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> candle_core::Result<Te
         } => {
             let x = ev.value(x.id)?;
             let g = ev.value(g.id)?;
+            if x.device().is_metal() {
+                let sq = |t: &Tensor| -> candle_core::Result<Tensor> {
+                    let s = t.dims();
+                    t.reshape((s[0], s[1], s[2], 1))
+                };
+                let xn = bridge::metal::wrap(&sq(&x)?)?;
+                let xn = if xn.layout.is_contiguous() { xn } else { runtime::metal::kernels::strided_copy(runtime::metal::device::MetalDevice::get(), &xn).map_err(candle_core::Error::Msg)? };
+                let gn = bridge::metal::wrap(&sq(&g)?)?;
+                let gn = if gn.layout.is_contiguous() { gn } else { runtime::metal::kernels::strided_copy(runtime::metal::device::MetalDevice::get(), &gn).map_err(candle_core::Error::Msg)? };
+                let dw = runtime::metal::conv::conv2d_backward_w(
+                    runtime::metal::device::MetalDevice::get(),
+                    &xn,
+                    &gn,
+                    [*kernel, 1],
+                    *out_channels,
+                    *stride,
+                    *padding,
+                    *dilation,
+                    *groups,
+                )
+                .map_err(candle_core::Error::Msg)?;
+                let s = dw.layout.shape().to_vec();
+                let dw3 = runtime::metal::run::MetalTensor {
+                    buffer: dw.buffer,
+                    layout: runtime::layout::Layout::contiguous(vec![s[0], s[1], s[2]]),
+                    dtype: dw.dtype,
+                };
+                return bridge::metal::unwrap(&dw3.buffer, dw3.layout.shape().to_vec(), x.dtype(), x.device().as_metal_device()?);
+            }
             if x.device().is_cpu() {
                 let xn = bridge::from_candle(&x)?;
                 let gn = bridge::from_candle(&g)?;
@@ -5318,6 +5408,25 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> candle_core::Result<Te
                     *groups,
                 );
                 return bridge::to_candle(&dw);
+            }
+            if x.device().is_metal() {
+                let xn = bridge::metal::wrap(&x)?;
+                let xn = if xn.layout.is_contiguous() { xn } else { runtime::metal::kernels::strided_copy(runtime::metal::device::MetalDevice::get(), &xn).map_err(candle_core::Error::Msg)? };
+                let gn = bridge::metal::wrap(&g)?;
+                let gn = if gn.layout.is_contiguous() { gn } else { runtime::metal::kernels::strided_copy(runtime::metal::device::MetalDevice::get(), &gn).map_err(candle_core::Error::Msg)? };
+                let dw = runtime::metal::conv::conv2d_backward_w(
+                    runtime::metal::device::MetalDevice::get(),
+                    &xn,
+                    &gn,
+                    *kernel,
+                    *out_channels,
+                    *stride,
+                    *padding,
+                    *dilation,
+                    *groups,
+                )
+                .map_err(candle_core::Error::Msg)?;
+                return bridge::metal::unwrap(&dw.buffer, dw.layout.shape().to_vec(), x.dtype(), x.device().as_metal_device()?);
             }
             conv2d_backward_w(
                 &x,
@@ -5416,6 +5525,11 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> candle_core::Result<Te
                 let r = bridge::from_candle(&t)?.prod(dims);
                 let r = if *keepdims { r } else { r.squeeze_dims(dims) };
                 return bridge::to_candle(&r);
+            }
+            if t.device().is_metal() {
+                if let Ok(out) = metal_eval::reduce(&t, dims, *keepdims, crate::fusion::ReduceOp::Prod) {
+                    return Ok(out);
+                }
             }
             // no product kernel in candle: fold narrow+mul per reduced dim,
             // keeping reduced dims as size 1 so later indices stay valid
