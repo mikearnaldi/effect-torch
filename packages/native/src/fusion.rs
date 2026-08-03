@@ -459,7 +459,7 @@ fn cpu_input_slices<'a, T: candle_core::WithDType>(
         .collect()
 }
 
-fn interpret_core<T: Scalar>(
+pub(crate) fn interpret_core<T: Scalar>(
     exprs: &[Expr],
     slices: &[&[T]],
     strides: Option<&[Vec<usize>]>,
@@ -518,7 +518,7 @@ fn interpret_core<T: Scalar>(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn interpret_reduce_core<T: Scalar>(
+pub(crate) fn interpret_reduce_core<T: Scalar>(
     op: ReduceOp,
     expr: &Expr,
     slices: &[&[T]],
