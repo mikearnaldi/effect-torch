@@ -29,9 +29,9 @@ const VAL_BIN = new URL("../data/fineweb-val.bin", import.meta.url).pathname
 const CKPT = new URL("../data/fineweb-epoch-ckpt.safetensors", import.meta.url).pathname
 
 const BATCH = 64
-const PEAK_LR = 6e-4
-const MIN_LR = 6e-5
-const WARMUP_FRACTION = 0.02
+const PEAK_LR = 3e-4
+const MIN_LR = 3e-5
+const WARMUP_FRACTION = 0.005
 const CHECKPOINT_EVERY = Number(process.env.FINEWEB_CHECKPOINT_EVERY ?? 2000)
 const VAL_BATCHES = 40
 
