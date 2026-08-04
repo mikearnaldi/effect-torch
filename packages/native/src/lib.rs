@@ -293,18 +293,35 @@ impl NativeTensor {
         // strong_count == 1) and both memory and per-allocation cost grow
         // without bound.
         let bytes = inner.byte_size().max(4096) as i64;
+        // Accounting is native-only: every handle that reaches JS is counted
+        // here at creation and subtracted in the finalizer/dispose. V8 is
+        // told the delta at the next main-thread touchpoint (see sync_v8);
+        // no JS-side involvement, so no missed sites and no drift.
+        EXTERNAL_MEMORY_BYTES.fetch_add(bytes, Ordering::Relaxed);
         Self { inner, bytes }
     }
 }
 
+// Native bytes currently retained by JS-reachable tensors.
 static EXTERNAL_MEMORY_BYTES: AtomicI64 = AtomicI64::new(0);
+// What V8 has been told so far (adjust_external_memory is main-thread only).
+static V8_REPORTED: AtomicI64 = AtomicI64::new(0);
+
+fn sync_v8(env: &Env) {
+    let accounted = EXTERNAL_MEMORY_BYTES.load(Ordering::Relaxed);
+    let reported = V8_REPORTED.swap(accounted, Ordering::Relaxed);
+    let delta = accounted - reported;
+    if delta != 0 {
+        let _ = env.adjust_external_memory(delta);
+    }
+}
 
 // V8's GC only sees the small JS handle; report the native buffer size so
 // collection is scheduled with knowledge of native memory pressure.
 impl ObjectFinalize for NativeTensor {
     fn finalize(self, env: Env) -> Result<()> {
         EXTERNAL_MEMORY_BYTES.fetch_sub(self.bytes, Ordering::Relaxed);
-        env.adjust_external_memory(-self.bytes)?;
+        sync_v8(&env);
         Ok(())
     }
 }
@@ -318,7 +335,11 @@ pub struct CancellationToken {
 #[napi]
 impl CancellationToken {
     #[napi(constructor)]
-    pub fn new() -> Self {
+    pub fn new(env: Env) -> Self {
+        // Every async evaluation allocates a token on the main thread just
+        // before spawning; syncing V8's external-memory view here keeps the
+        // GC's pressure signal within one evaluation of reality.
+        sync_v8(&env);
         Self {
             cancelled: Arc::new(AtomicBool::new(false)),
             notify: Arc::new(tokio::sync::Notify::new()),
@@ -354,11 +375,6 @@ impl NativeTensor {
         self.inner.device().name().to_string()
     }
 
-    #[napi(getter)]
-    pub fn bytes(&self) -> i64 {
-        self.bytes
-    }
-
     // Explicitly releases the underlying buffer: the tensor is replaced by an
     // empty CPU scalar, dropping the last strong reference to the real buffer
     // (unless graph leaves still share it) so the backend allocator can reuse
@@ -369,7 +385,7 @@ impl NativeTensor {
         let bytes = std::mem::take(&mut self.bytes);
         if bytes != 0 {
             EXTERNAL_MEMORY_BYTES.fetch_sub(bytes, Ordering::Relaxed);
-            env.adjust_external_memory(-bytes)?;
+            sync_v8(&env);
         }
         self.inner = val::Val::Cpu(runtime::cpu::Tensor::zeros(&[], runtime::dtype::DType::F32));
         Ok(())
@@ -10135,17 +10151,6 @@ pub async fn load_tensors(
         ))
     })
     .await
-}
-
-// Positive half of the external-memory accounting (the negative half runs in
-// NativeTensor's finalizer). A sync call so it executes on the main thread:
-// async napi functions run their body on the tokio runtime, where touching
-// the env is not allowed.
-#[napi]
-pub fn report_external_memory(env: Env, bytes: i64) -> Result<()> {
-    EXTERNAL_MEMORY_BYTES.fetch_add(bytes, Ordering::Relaxed);
-    env.adjust_external_memory(bytes)?;
-    Ok(())
 }
 
 // Native bytes currently retained by JS-reachable tensors. Exposed so tests

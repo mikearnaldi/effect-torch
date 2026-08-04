@@ -20,7 +20,6 @@ const {
   LazyTensor: NativeLazyTensor,
   loadTensors,
   NativeKvPool,
-  reportExternalMemory,
   saveTensors
 } = native
 
@@ -3341,10 +3340,7 @@ export const compute = <Roots extends ReadonlyArray<Any>>(
     ? Effect.succeed(roots as { readonly [K in keyof Roots]: Concrete })
     : Effect.map(
         fromNative("evaluate", (token) => evalLazy(roots.map((root) => root.lazy), token)),
-        (handles) => {
-          reportExternalMemory(handles.reduce((total, handle) => total + handle.bytes, 0))
-          return handles.map(fromHandle) as { readonly [K in keyof Roots]: Concrete }
-        }
+        (handles) => handles.map(fromHandle) as { readonly [K in keyof Roots]: Concrete }
       )
 
 const typedArrayConstructor = (dtype: DType) => {
@@ -3467,7 +3463,6 @@ export const load = (
   Effect.gen(function* () {
     const device = yield* CurrentDevice
     const [names, handles] = yield* fromNative("load", (token) => loadTensors(path, device, token))
-    reportExternalMemory(handles.reduce((total, handle) => total + handle.bytes, 0))
     return Object.fromEntries(names.map((name, i) => [name, fromHandle(handles[i])]))
   })
 
@@ -3753,7 +3748,6 @@ export const runProgram = (
     const handles = yield* fromNative("run", (token) =>
       program.run(concrete.map((input) => input.materialized), [...scalars], token)
     )
-    reportExternalMemory(handles.reduce((total, handle) => total + handle.bytes, 0))
     return handles.map(fromHandle)
   })
 
@@ -3857,7 +3851,6 @@ export const runDecodeProgram = (
     const handles = yield* fromNative("run", (token) =>
       program.run(concrete.map((input) => input.materialized), seq, Array.from(tokens), token)
     )
-    reportExternalMemory(handles.reduce((total, handle) => total + handle.bytes, 0))
     return handles.map(fromHandle)
   })
 
@@ -3888,7 +3881,6 @@ export const runBatchedDecodeProgram = (
         token
       )
     )
-    reportExternalMemory(handles.reduce((total, handle) => total + handle.bytes, 0))
     return handles.map(fromHandle)
   })
 

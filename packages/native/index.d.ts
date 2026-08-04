@@ -122,7 +122,6 @@ export declare class NativeTensor {
   get shape(): Array<number>
   get dtype(): string
   get device(): string
-  get bytes(): number
   dispose(): void
   readback(token?: CancellationToken | undefined | null): Promise<ArrayBuffer>
 }
@@ -191,7 +190,5 @@ export interface NativeTruncation {
   tag: string
   maxLength?: number
 }
-
-export declare function reportExternalMemory(bytes: number): void
 
 export declare function saveTensors(path: string, names: Array<string>, tensors: Array<LazyTensor>, token?: CancellationToken | undefined | null): Promise<void>
