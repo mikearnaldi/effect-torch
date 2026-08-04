@@ -3,7 +3,7 @@ import { Effect } from "effect"
 import * as fs from "node:fs"
 import * as os from "node:os"
 import * as path from "node:path"
-import { Gradient, Optimizer, Tensor } from "../src/index.ts"
+import { Checkpoint, Device, Gradient, LearningRate, Loss, Model, Optimizer, Sampler, Tensor, Trainer } from "../src/index.ts"
 import { floats, onDevices } from "./utils/devices.ts"
 
 const tmpdir = Effect.sync(() => fs.mkdtempSync(path.join(os.tmpdir(), "effect-torch-")))
@@ -85,6 +85,88 @@ onDevices("Checkpoint", () => (it) => {
       const loaded = yield* Tensor.load(file)
       expect(yield* values(loaded["m.0"])).toEqual(yield* values(m))
       expect(yield* values(loaded["v.0"])).toEqual(yield* values(v))
+    })
+  )
+
+  it.effect("trainer checkpoint resumes bit-exactly (params, state, step)", () =>
+    Effect.gen(function* () {
+      const dir = yield* tmpdir
+      const file = path.join(dir, "trainer.safetensors")
+      const model = yield* Model.chain(
+        yield* Model.linear("fc1", 2, 8),
+        yield* Model.tanh,
+        yield* Model.linear("fc2", 8, 1),
+        yield* Model.sigmoid
+      )
+      const input = yield* Tensor.fromTypedArray(floats([0, 1, 1, 0]), [2, 2])
+      const target = yield* Tensor.fromTypedArray(floats([1, 0]), [2, 1])
+      const optimizer = yield* Optimizer.adam()
+      const initial = yield* Tensor.compute(yield* model.init)
+      const makeTrainer = (stopStep: number) =>
+        Effect.gen(function* () {
+          const config: Trainer.TrainConfig<Optimizer.AdamState, Tensor.TensorError> = {
+            optimizer,
+            lr: LearningRate.constant(0.05),
+            loss: Loss.mse,
+            data: { input, target },
+            stop: ({ step }) => step >= stopStep
+          }
+          return yield* Trainer.compile(yield* Trainer.make(model, config))
+        })
+      const trainer = yield* makeTrainer(8)
+      const uninterrupted = yield* (yield* makeTrainer(20)).train(initial)
+      const first = yield* trainer.train(initial)
+      expect(first.step).toBe(8)
+      yield* Checkpoint.save(file, trainer, first)
+      const checkpoint = yield* Checkpoint.load(file, trainer)
+      expect(checkpoint.resume.step).toBe(8)
+      const resumed = yield* (yield* makeTrainer(20)).train(checkpoint.params, checkpoint.resume)
+      expect(resumed.step).toBe(20)
+      expect(resumed.loss).toBe(uninterrupted.loss)
+      for (let i = 0; i < uninterrupted.params.length; i++) {
+        expect(yield* values(resumed.params[i])).toEqual(yield* values(uninterrupted.params[i]))
+      }
+    })
+  )
+
+  it.effect("sampler state round-trips: resume continues the permutation", () =>
+    Effect.gen(function* () {
+      const dir = yield* tmpdir
+      const file = path.join(dir, "trainer-sampler.safetensors")
+      const model = yield* Model.chain(yield* Model.linear("fc1", 2, 4), yield* Model.linear("fc2", 4, 1))
+      const input = yield* Tensor.fromTypedArray(floats([0, 1, 1, 0]), [2, 2])
+      const target = yield* Tensor.fromTypedArray(floats([1, 0]), [2, 1])
+      const optimizer = yield* Optimizer.sgd()
+      const config: Trainer.TrainConfig<Optimizer.SgdState, Tensor.TensorError> = {
+        optimizer,
+        lr: LearningRate.constant(0.1),
+        loss: Loss.mse,
+        data: { input, target },
+        stop: ({ step }) => step >= 2
+      }
+      const trainer = yield* Trainer.compile(yield* Trainer.make(model, config))
+      const samplerConfig = { length: 4 * 8 + 1, block: 8, batch: 2 }
+      const sampler = yield* Sampler.make(samplerConfig)
+      sampler.next()
+      const trained = yield* trainer.train()
+      yield* Checkpoint.saveWithSampler(file, trainer, trained, sampler)
+      const expected = sampler.next()
+      const checkpoint = yield* Checkpoint.loadWithSampler(file, trainer)
+      const restored = yield* Sampler.restore(samplerConfig, checkpoint.sampler)
+      expect(restored.next()).toEqual(expected)
+      expect(checkpoint.resume.step).toBe(2)
+    })
+  )
+
+  it.effect("optimizer state lives on the ambient device, never a hidden override", () =>
+    Effect.gen(function* () {
+      const device = yield* Device.CurrentDevice
+      const optimizer = yield* Optimizer.adamW()
+      const p = yield* Tensor.fromTypedArray(floats([1, -1]), [2])
+      const state = yield* optimizer.init([p])
+      for (const root of optimizer.stateRoots(state)) {
+        expect(root.device).toBe(device)
+      }
     })
   )
 

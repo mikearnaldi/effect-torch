@@ -1,19 +1,23 @@
 import { Duration, Effect } from "effect"
 import { NodeRuntime } from "@effect/platform-node"
-import { Device, LearningRate, Loss, Optimizer, Tensor, Trainer } from "@effect-torch/core"
+import { Checkpoint, Device, LearningRate, Loss, Optimizer, Sampler, Tensor, Trainer } from "@effect-torch/core"
 import fs from "node:fs"
 import { BLOCK, CHECKPOINT, createGpt, loadTokenizer, saveParams } from "./model.js"
 
 // FineWeb pre-training: trains the shared GPT on the token bins produced
-// by prepare.ts (~745M GPT-2 BPE tokens, u16), reports a held-out
-// loss estimate, and saves the trained parameters to a safetensors
-// checkpoint for infer.ts.
+// by prepare.ts (~745M GPT-2 BPE tokens, u16), reports a held-out loss
+// estimate, and saves the trained parameters to a safetensors checkpoint
+// for infer.ts.
+//
+// Training checkpoints every CHECKPOINT_EVERY steps: one safetensors
+// file holding the parameters, the AdamW state, the global step, and the
+// data sampler's permutation (see Checkpoint), so an interrupted run
+// resumes bit-exactly — same optimizer moments, same step numbering,
+// same data layout.
 
 const TRAIN_BIN = new URL("../data/fineweb-train.bin", import.meta.url).pathname
 const VAL_BIN = new URL("../data/fineweb-val.bin", import.meta.url).pathname
-const CKPT_BIN = new URL("../data/fineweb-ckpt.safetensors", import.meta.url).pathname
-const CKPT_META = new URL("../data/fineweb-ckpt.json", import.meta.url).pathname
-const CKPT_ORDER = new URL("../data/fineweb-ckpt-order.bin", import.meta.url).pathname
+const CKPT = new URL("../data/fineweb-ckpt.safetensors", import.meta.url).pathname
 
 const BATCH = 64
 const STEPS = Number(process.env.FINEWEB_STEPS ?? 5000)
@@ -27,80 +31,24 @@ const loadBin = (path: string) => {
   return new Uint16Array(buffer.buffer, buffer.byteOffset, buffer.byteLength / 2)
 }
 
-// Epoch-based batching: all non-overlapping BLOCK-windows in a shuffled
-// permutation, so every window is seen exactly once per epoch (no
-// replacement); the permutation is reshuffled at each epoch boundary.
-// The full sampler state (permutation, cursor, epoch) is restorable, so
-// a checkpoint resumes the data layout exactly where it stopped.
-export interface SamplerState {
-  readonly order: Uint32Array
-  readonly cursor: number
-  readonly epoch: number
-}
-
-const shuffle = (order: Uint32Array) => {
-  for (let i = order.length - 1; i > 0; i--) {
-    const j = Math.floor(Math.random() * (i + 1))
-    const t = order[i]
-    order[i] = order[j]
-    order[j] = t
-  }
-}
-
-const makeTrainSampler = (
-  data: Uint16Array,
-  onEpoch: (epoch: number) => void,
-  restored?: SamplerState
-) => {
-  const windowCount = Math.floor((data.length - 1) / BLOCK)
-  let order: Uint32Array
-  let cursor: number
-  let epoch: number
-  if (restored !== undefined && restored.order.length === windowCount) {
-    order = restored.order
-    cursor = restored.cursor
-    epoch = restored.epoch
-  } else {
-    order = new Uint32Array(windowCount)
-    for (let i = 0; i < windowCount; i++) order[i] = i
-    shuffle(order)
-    cursor = 0
-    epoch = 1
-  }
-  const next = () => {
-    if (cursor + BATCH > windowCount) {
-      shuffle(order)
-      cursor = 0
-      epoch += 1
-      onEpoch(epoch)
+const windows = (data: Uint16Array, starts: ReadonlyArray<number>) => {
+  const inputs = new Uint32Array(BATCH * BLOCK)
+  const targets = new Uint32Array(BATCH * BLOCK)
+  for (const [b, start] of starts.entries()) {
+    for (let t = 0; t < BLOCK; t++) {
+      inputs[b * BLOCK + t] = data[start + t]
+      targets[b * BLOCK + t] = data[start + t + 1]
     }
-    const inputs = new Uint32Array(BATCH * BLOCK)
-    const targets = new Uint32Array(BATCH * BLOCK)
-    for (let b = 0; b < BATCH; b++) {
-      const start = order[cursor + b] * BLOCK
-      for (let t = 0; t < BLOCK; t++) {
-        inputs[b * BLOCK + t] = data[start + t]
-        targets[b * BLOCK + t] = data[start + t + 1]
-      }
-    }
-    cursor += BATCH
-    return { inputs, targets }
   }
-  const state = (): SamplerState => ({ order, cursor, epoch })
-  return { next, state }
+  return { inputs, targets }
 }
 
 const sampleBatch = (data: Uint16Array) =>
   Effect.gen(function* () {
-    const inputs = new Uint32Array(BATCH * BLOCK)
-    const targets = new Uint32Array(BATCH * BLOCK)
-    for (let b = 0; b < BATCH; b++) {
-      const start = Math.floor(Math.random() * (data.length - BLOCK - 1))
-      for (let t = 0; t < BLOCK; t++) {
-        inputs[b * BLOCK + t] = data[start + t]
-        targets[b * BLOCK + t] = data[start + t + 1]
-      }
-    }
+    const { inputs, targets } = windows(
+      data,
+      Array.from({ length: BATCH }, () => Math.floor(Math.random() * (data.length - BLOCK - 1)))
+    )
     return {
       input: yield* Tensor.fromTypedArray(inputs, [BATCH, BLOCK]),
       target: yield* Tensor.fromTypedArray(targets, [BATCH, BLOCK])
@@ -122,26 +70,14 @@ const program = Effect.gen(function* () {
   yield* Effect.log(`  total: ${total.toLocaleString()} parameters`)
 
   yield* Effect.log(`2) training: adamW lr=${LR}, ${STEPS} steps (checkpoint every ${CHECKPOINT_EVERY})`)
-  // A checkpoint holds the trainer (params + optimizer state + step) AND
-  // the data layout (permutation + cursor + epoch), so resuming
-  // continues the epoch exactly where it stopped.
-  const meta = fs.existsSync(CKPT_BIN) && fs.existsSync(CKPT_META) && fs.existsSync(CKPT_ORDER)
-    ? JSON.parse(fs.readFileSync(CKPT_META, "utf8"))
-    : undefined
-  const restored = meta === undefined ? undefined : {
-    order: new Uint32Array(fs.readFileSync(CKPT_ORDER).buffer.slice(0)),
-    cursor: meta.cursor as number,
-    epoch: meta.epoch as number
-  }
-  const sampler = makeTrainSampler(train, (epoch) => console.log(`epoch ${epoch}`), restored)
-  const optimizer = yield* Optimizer.adamW()
+  let sampler: Sampler.Sampler
   const trainer = yield* Trainer.compile(yield* Trainer.make(model, {
-    optimizer,
+    optimizer: yield* Optimizer.adamW(),
     lr: LearningRate.constant(LR),
     loss: Loss.crossEntropy,
     data: () =>
       Effect.gen(function* () {
-        const { inputs, targets } = sampler.next()
+        const { inputs, targets } = windows(train, sampler.next())
         return {
           input: yield* Tensor.fromTypedArray(inputs, [BATCH, BLOCK]),
           target: yield* Tensor.fromTypedArray(targets, [BATCH, BLOCK])
@@ -156,30 +92,23 @@ const program = Effect.gen(function* () {
         : Effect.void
   }))
 
-  // Resume when a checkpoint exists: params by name, optimizer state by
-  // state-roots order, global step from the meta file. 0-d state roots
-  // (AdamW's step count) live in the meta as numbers — the optimizer's
-  // own f64 CPU encoding can't ride the safetensors onto the device —
-  // and are rebuilt as f32 on the ambient device (AdamW casts the count
-  // per use, so its storage dtype is immaterial).
+  // Resume when a checkpoint exists: parameters, optimizer state, global
+  // step, and the sampler's permutation all come back exactly as saved.
+  const samplerConfig = { length: train.length, block: BLOCK, batch: BATCH }
   let params = params0
   let step = 0
   let resume: Trainer.Resume<Optimizer.AdamState> | undefined
-  if (meta !== undefined) {
-    const tensors = yield* Tensor.load(CKPT_BIN)
-    params = model.names.map((name) => tensors[`param:${name}`])
-    const fresh = yield* optimizer.init(params)
-    const roots: Array<Tensor.Any> = []
-    for (const [i, root] of optimizer.stateRoots(fresh).entries()) {
-      roots.push(
-        root.shape.length === 0
-          ? yield* Tensor.full([], meta.scalars[i], { dtype: "f32" })
-          : tensors[`state:${i}`]
-      )
-    }
-    step = meta.step
-    resume = { state: optimizer.rebuildState(fresh, roots), step }
-    yield* Effect.log(`resuming from step ${step}`)
+  let epoch = 1
+  if (fs.existsSync(CKPT)) {
+    const checkpoint = yield* Checkpoint.loadWithSampler(CKPT, trainer)
+    sampler = yield* Sampler.restore(samplerConfig, checkpoint.sampler)
+    params = checkpoint.params
+    resume = checkpoint.resume
+    step = checkpoint.resume.step
+    epoch = checkpoint.sampler.epoch
+    yield* Effect.log(`resuming from step ${step} (epoch ${epoch})`)
+  } else {
+    sampler = yield* Sampler.make(samplerConfig)
   }
 
   let chunkTarget = Math.min(step + CHECKPOINT_EVERY, STEPS)
@@ -188,26 +117,12 @@ const program = Effect.gen(function* () {
     params = trained.params
     step = trained.step
     resume = { state: trained.state, step }
-    const tensors: Record<string, Tensor.Any> = Object.fromEntries(
-      model.names.map((name, i) => [`param:${name}`, params[i]])
-    )
-    const scalars: Record<number, number> = {}
-    for (const [i, root] of optimizer.stateRoots(trained.state).entries()) {
-      if (root.shape.length === 0) {
-        const [materialized] = yield* Tensor.compute([root])
-        const [value] = yield* Tensor.toNumberArray(materialized)
-        scalars[i] = value
-      } else {
-        tensors[`state:${i}`] = root
-      }
+    yield* Checkpoint.saveWithSampler(CKPT, trainer, trained, sampler)
+    const currentEpoch = sampler.state().epoch
+    if (currentEpoch !== epoch) {
+      epoch = currentEpoch
+      yield* Effect.log(`epoch ${epoch}`)
     }
-    yield* Tensor.save(CKPT_BIN, tensors)
-    const samplerState = sampler.state()
-    fs.writeFileSync(CKPT_ORDER, Buffer.from(samplerState.order.buffer, samplerState.order.byteOffset, samplerState.order.byteLength))
-    fs.writeFileSync(
-      CKPT_META,
-      JSON.stringify({ step, scalars, cursor: samplerState.cursor, epoch: samplerState.epoch })
-    )
     yield* Effect.log(`checkpoint at step ${step}`)
     chunkTarget = Math.min(step + CHECKPOINT_EVERY, STEPS)
   }

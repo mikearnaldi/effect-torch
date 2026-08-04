@@ -176,8 +176,15 @@ const isFloat = (dtype: Tensor.DType): boolean => dtype === "f32" || dtype === "
 const scalarDtype = (params: ReadonlyArray<Tensor.Any>): Tensor.DType =>
   params[0]?.dtype === "f64" ? "f64" : "f32"
 
-const stepCount = (value: number): Effect.Effect<Tensor.Lazy, Tensor.TensorError> =>
-  Effect.provideService(Tensor.full([], value, { dtype: "f64" }), CurrentDevice, "cpu")
+// The step count lives on the ambient device like every other state
+// tensor — never a hidden device override. Its dtype follows the
+// params' float width; f32 counts exactly to 2^24 (~16.7M steps),
+// beyond which bias correction is a no-op anyway.
+const stepCount = (
+  value: number,
+  params: ReadonlyArray<Tensor.Any>
+): Effect.Effect<Tensor.Lazy, Tensor.TensorError, CurrentDevice> =>
+  Tensor.full([], value, { dtype: scalarDtype(params) })
 
 const checkLr = (op: string, lr: Tensor.Any): Effect.Effect<void, Tensor.TensorError> =>
   lr.shape.length === 0 && isFloat(lr.dtype)
@@ -384,7 +391,7 @@ const makeAdam = (op: string, config: ResolvedAdamConfig): Effect.Effect<Optimiz
           m.push(yield* Tensor.zeros(param.shape, { dtype: param.dtype }))
           v.push(yield* Tensor.zeros(param.shape, { dtype: param.dtype }))
         }
-        const t = yield* stepCount(0)
+        const t = yield* stepCount(0, params)
         return { m, v, t } satisfies AdamState
       }),
     step: (params, grads, state, lr) =>

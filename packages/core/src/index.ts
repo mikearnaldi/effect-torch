@@ -1,3 +1,5 @@
+export * as Checkpoint from "./Checkpoint.ts"
+export * as Sampler from "./Sampler.ts"
 export * as Device from "./Device.ts"
 export * as Gradient from "./Gradient.ts"
 export * as Loss from "./Loss.ts"

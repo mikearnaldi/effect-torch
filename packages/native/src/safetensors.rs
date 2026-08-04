@@ -193,8 +193,14 @@ pub fn load(path: &str, device: &Device) -> Res<Vec<(String, Val)>> {
                 bytes.len()
             ));
         }
+        // The file's dtype is ground truth; a device that cannot
+        // represent it (f64 on Metal) falls back to CPU for that
+        // tensor rather than failing or silently downcasting.
         let val = match device {
             Device::Cpu => cpu_from_bytes(bytes, &shape, dtype)?,
+            Device::Metal if matches!(dtype, runtime::dtype::DType::F64) => {
+                cpu_from_bytes(bytes, &shape, dtype)?
+            }
             Device::Metal => Val::Metal(runtime::metal::run::MetalTensor {
                 buffer: runtime::metal::device::MetalDevice::get().upload_bytes(bytes),
                 layout: runtime::layout::Layout::contiguous(shape),
