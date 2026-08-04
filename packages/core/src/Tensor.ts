@@ -3517,7 +3517,14 @@ export interface ProgramCache {
   keys: Set<string>
   compiled: number
   warned: boolean
+  /** Programs cached, traces performed. */
+  readonly stats: () => CompileStats
+  /** Clears every cached program early (they are otherwise GC-collected). */
+  readonly clear: () => Effect.Effect<void>
 }
+
+/** Mutable internals — the public surface is {@link ProgramCache}. */
+type ProgramCacheState = ProgramCache
 
 type ProgramCacheEntry =
   | { readonly _tag: "ready"; readonly program: NativeCompiledProgramType }
@@ -3528,38 +3535,26 @@ type ProgramCacheEntry =
  * @category compilation
  * @internal
  */
-export const makeProgramCache = (capacity: number = 32): ProgramCache => ({
-  capacity,
-  entries: new Map(),
-  keys: new Set(),
-  compiled: 0,
-  warned: false
-})
+export const makeProgramCache = (capacity: number = 32): ProgramCache => {
+  const cache: ProgramCacheState = {
+    capacity,
+    entries: new Map(),
+    keys: new Set(),
+    compiled: 0,
+    warned: false,
+    stats: () => ({ cached: cache.entries.size, compiled: cache.compiled }),
+    clear: () =>
+      Effect.sync(() => {
+        // Dropping the last JS reference makes the native program
+        // collectable; its finalizer releases the frozen graph.
+        cache.entries.clear()
+        cache.keys.clear()
+      })
+  }
+  return cache
+}
 
-/**
- * @since 0.1.0
- * @category compilation
- * @internal
- */
-export const programCacheStats = (cache: ProgramCache): CompileStats => ({
-  cached: cache.entries.size,
-  compiled: cache.compiled
-})
-
-/**
- * @since 0.1.0
- * @category compilation
- * @internal
- */
-export const clearProgramCache = (cache: ProgramCache): Effect.Effect<void> =>
-  Effect.sync(() => {
-    // Dropping the last JS reference makes the native program collectable;
-    // its finalizer releases the frozen graph.
-    cache.entries.clear()
-    cache.keys.clear()
-  })
-
-const evictProgramCache = (cache: ProgramCache): void => {
+const evictProgramCache = (cache: ProgramCacheState): void => {
     while (cache.entries.size > cache.capacity) {
       let oldest: string | undefined
       for (const [key, entry] of cache.entries) {
@@ -3586,7 +3581,7 @@ const evictProgramCache = (cache: ProgramCache): void => {
  * @internal
  */
 export const cachedProgram = <E, R>(
-  cache: ProgramCache,
+  cache: ProgramCacheState,
   key: string,
   trace: Effect.Effect<NativeCompiledProgramType, E, R>
 ): Effect.Effect<NativeCompiledProgramType, TensorError | E, R> =>
@@ -4067,8 +4062,8 @@ export const compile = <E = never, R = never>(
           const program = yield* cachedProgram(cache, signatureOf(inputs), trace(inputs))
           return yield* runProgram(program, inputs, scalars)
         }),
-      stats: () => programCacheStats(cache),
-      clear: () => clearProgramCache(cache)
+      stats: cache.stats,
+      clear: cache.clear
     }
     return self
   })

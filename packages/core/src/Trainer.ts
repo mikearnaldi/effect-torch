@@ -279,8 +279,8 @@ export const compile = <S, EL = never, RL = never, ED = never, RD = never, EO = 
       [CompiledTypeId]: CompiledTypeId,
       ...trainer,
       train: (params) => trainLoop(trainer.model, trainer.config, params, cache),
-      stats: () => Tensor.programCacheStats(cache),
-      clear: () => Tensor.clearProgramCache(cache)
+      stats: cache.stats,
+      clear: cache.clear
     }
   })
 
