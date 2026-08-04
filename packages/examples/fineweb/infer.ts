@@ -1,9 +1,9 @@
 import { Effect, Option } from "effect"
 import { NodeRuntime } from "@effect/platform-node"
 import { Device, Model, Tensor } from "@effect-torch/core"
-import { BLOCK, CHECKPOINT, createGpt, EOT, loadParams, loadTokenizer } from "./fineweb-model.js"
+import { BLOCK, CHECKPOINT, createGpt, EOT, loadParams, loadTokenizer } from "./model.js"
 
-// FineWeb inference: loads the checkpoint saved by fineweb-train.ts and
+// FineWeb inference: loads the checkpoint saved by train.ts and
 // generates from prompts through the compiled inference artifact (paged
 // kv cache, chunked prefill, sliding-window attention over the last
 // BLOCK positions), sampling with temperature and stopping at

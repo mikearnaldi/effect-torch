@@ -13,10 +13,10 @@ import fs from "node:fs"
 // first 99% of rows is train, the last 1% val (the shard is a random
 // sample, so position is an unbiased cut).
 
-const PARQUET = new URL("./data/fineweb-10BT-000.parquet", import.meta.url).pathname
-const TOKENIZER_JSON = new URL("./data/gpt2-tokenizer.json", import.meta.url).pathname
-const TRAIN_BIN = new URL("./data/fineweb-train.bin", import.meta.url).pathname
-const VAL_BIN = new URL("./data/fineweb-val.bin", import.meta.url).pathname
+const PARQUET = new URL("../data/fineweb-10BT-000.parquet", import.meta.url).pathname
+const TOKENIZER_JSON = new URL("../data/gpt2-tokenizer.json", import.meta.url).pathname
+const TRAIN_BIN = new URL("../data/fineweb-train.bin", import.meta.url).pathname
+const VAL_BIN = new URL("../data/fineweb-val.bin", import.meta.url).pathname
 const EOT = "<|endoftext|>"
 const VAL_FRACTION = 0.01
 

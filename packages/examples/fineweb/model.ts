@@ -1,13 +1,13 @@
 import { Effect } from "effect"
 import { Device, Model, Tensor, Tokenizer } from "@effect-torch/core"
 
-// Shared pieces of the FineWeb pre-training pilot (see fineweb-train.ts
-// and fineweb-infer.ts): the GPT-2-architecture model, its size
+// Shared pieces of the FineWeb pre-training pilot (see train.ts
+// and infer.ts): the GPT-2-architecture model, its size
 // constants, the pretrained GPT-2 BPE tokenizer, and checkpoint
 // save/load (safetensors, keyed by model.names).
 
-export const TOKENIZER_JSON = new URL("./data/gpt2-tokenizer.json", import.meta.url).pathname
-export const CHECKPOINT = new URL("./data/fineweb-model.safetensors", import.meta.url).pathname
+export const TOKENIZER_JSON = new URL("../data/gpt2-tokenizer.json", import.meta.url).pathname
+export const CHECKPOINT = new URL("../data/fineweb-model.safetensors", import.meta.url).pathname
 export const EOT = "<|endoftext|>"
 
 export const BLOCK = 256

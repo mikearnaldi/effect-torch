@@ -2,15 +2,15 @@ import { Duration, Effect } from "effect"
 import { NodeRuntime } from "@effect/platform-node"
 import { Device, LearningRate, Loss, Optimizer, Tensor, Trainer } from "@effect-torch/core"
 import fs from "node:fs"
-import { BLOCK, CHECKPOINT, createGpt, loadTokenizer, saveParams } from "./fineweb-model.js"
+import { BLOCK, CHECKPOINT, createGpt, loadTokenizer, saveParams } from "./model.js"
 
 // FineWeb pre-training: trains the shared GPT on the token bins produced
-// by fineweb-prepare.ts (~745M GPT-2 BPE tokens, u16), reports a held-out
+// by prepare.ts (~745M GPT-2 BPE tokens, u16), reports a held-out
 // loss estimate, and saves the trained parameters to a safetensors
-// checkpoint for fineweb-infer.ts.
+// checkpoint for infer.ts.
 
-const TRAIN_BIN = new URL("./data/fineweb-train.bin", import.meta.url).pathname
-const VAL_BIN = new URL("./data/fineweb-val.bin", import.meta.url).pathname
+const TRAIN_BIN = new URL("../data/fineweb-train.bin", import.meta.url).pathname
+const VAL_BIN = new URL("../data/fineweb-val.bin", import.meta.url).pathname
 
 const BATCH = 32
 const STEPS = 5000
