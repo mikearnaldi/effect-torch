@@ -1,5 +1,5 @@
 import { describe, expect } from "@effect/vitest"
-import { Effect } from "effect"
+import { Effect, Option } from "effect"
 import { LearningRate, Loss, Model, Optimizer, Tensor, Trainer } from "../src/index.ts"
 import { deep, onDevices, TOL } from "./utils/devices.ts"
 
@@ -90,22 +90,24 @@ const naiveWindowedGenerate = (
     return context
   })
 
-// Greedy generation through the inference artifact: prefill once, one
-// pooled step per token.
+// Greedy generation through the inference artifact: add the prompt once,
+// then one round per token with an argmax chooser.
 const cachedGenerate = (
   program: Model.InferenceProgram,
   prompt: ReadonlyArray<number>,
   steps: number
 ) =>
   Effect.gen(function* () {
-    const seq = yield* program.sequence()
+    const gen = yield* program.generation()
     const context = [...prompt]
-    let logits = yield* seq.prefill(yield* ids(prompt))
+    const entry = yield* gen.add(yield* ids(prompt))
+    let logits = entry.logits
     for (let i = 0; i < steps; i++) {
       const next = yield* argmaxOf(logits)
       context.push(next)
       if (i < steps - 1) {
-        logits = yield* seq.step(yield* ids([next]))
+        const out = yield* gen.step(() => Effect.succeed(Option.some(next)))
+        logits = out.get(entry.seq)!
       }
     }
     return context
@@ -154,7 +156,7 @@ onDevices("Inference", () => (it) => {
       })
     )
 
-    it.effect("runs concurrent sequences exactly like sequential ones", () =>
+    it.effect("runs concurrent sessions exactly like sequential ones", () =>
       Effect.gen(function* () {
         const model = yield* makeGpt()
         const params = yield* Tensor.compute(yield* model.init)
@@ -170,26 +172,19 @@ onDevices("Inference", () => (it) => {
       })
     )
 
-    it.effect("pool exhaustion fails one sequence and leaves others unaffected", () =>
+    it.effect("pool exhaustion fails an add and finish frees the room", () =>
       Effect.gen(function* () {
         const model = yield* makeGpt()
         const params = yield* Tensor.compute(yield* model.init)
         const program = yield* Model.inference(model, params, { maxTokens: 16, blockSize: 4 })
-        const seq1 = yield* program.sequence()
-        yield* seq1.prefill(yield* ids(Array.from({ length: 16 }, (_, i) => i % VOCAB))) // all 4 blocks
-        expect(yield* seq1.cursor()).toBe(16)
-        const seq2 = yield* program.sequence()
-        const error = yield* Effect.flip(seq2.prefill(yield* ids([1, 2, 3, 4, 5, 6, 7, 8])))
-        expect(error._tag).toBe("TensorError")
+        const gen = yield* program.generation()
+        yield* gen.add(yield* ids(Array.from({ length: 16 }, (_, i) => i % VOCAB))) // all 4 blocks
+        expect(yield* gen.live()).toBe(1)
+        // The failed run allocated nothing; after finishing the first
+        // sequence, the same prompt fits the pool.
+        const error = yield* Effect.flip(gen.add(yield* ids([1, 2, 3, 4, 5, 6, 7, 8])))
         expect(error.message).toMatch(/pool exhausted/)
-        // The failed run allocated nothing: after seq1 releases, the
-        // same prefill fits the pool.
-        expect(yield* seq2.cursor()).toBe(0)
-        yield* Effect.scoped(Effect.gen(function* () {
-          const seq3 = yield* program.sequence()
-          const stillFull = yield* Effect.flip(seq3.prefill(yield* ids([1, 2, 3, 4, 5, 6, 7, 8])))
-          expect(stillFull.message).toMatch(/pool exhausted/)
-        }))
+        expect(yield* gen.live()).toBe(1)
       })
     )
 
@@ -198,28 +193,27 @@ onDevices("Inference", () => (it) => {
         const model = yield* makeGpt()
         const params = yield* Tensor.compute(yield* model.init)
         const program = yield* Model.inference(model, params, { maxTokens: 8, blockSize: 4 })
-        const seq = yield* program.sequence()
-        yield* seq.prefill(yield* ids([1, 2, 3, 4, 5, 6, 7, 8]))
-        expect(yield* seq.cursor()).toBe(8)
-        const error = yield* Effect.flip(seq.step(yield* ids([1])))
+        const gen = yield* program.generation()
+        const entry = yield* gen.add(yield* ids([1, 2, 3, 4, 5, 6, 7, 8]))
+        expect(yield* entry.seq.cursor()).toBe(8)
+        const error = yield* Effect.flip(gen.step(() => Effect.succeed(Option.some(1))))
         expect(error._tag).toBe("TensorError")
         expect(error.message).toMatch(/exceeds pool capacity/)
       })
     )
 
-    it.effect("returns a released sequence's blocks to the pool", () =>
+    it.effect("returns a finished sequence's blocks to the pool", () =>
       Effect.gen(function* () {
         const model = yield* makeGpt()
         const params = yield* Tensor.compute(yield* model.init)
         const program = yield* Model.inference(model, params, { maxTokens: 16, blockSize: 4 })
-        yield* Effect.scoped(Effect.gen(function* () {
-          const seq = yield* program.sequence()
-          yield* seq.prefill(yield* ids([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 0])) // 3 of 4 blocks
-        }))
-        // Only possible if the released blocks came back.
-        const seq = yield* program.sequence()
-        yield* seq.prefill(yield* ids(Array.from({ length: 16 }, (_, i) => i % VOCAB)))
-        expect(yield* seq.cursor()).toBe(16)
+        const gen = yield* program.generation()
+        const entry = yield* gen.add(yield* ids([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 0])) // 3 of 4 blocks
+        yield* entry.seq.finish()
+        expect(yield* gen.live()).toBe(0)
+        // Only possible if the finished blocks came back.
+        const full = yield* gen.add(yield* ids(Array.from({ length: 16 }, (_, i) => i % VOCAB)))
+        expect(yield* full.seq.cursor()).toBe(16)
       })
     )
 
@@ -231,11 +225,10 @@ onDevices("Inference", () => (it) => {
         // second prefill fits only by sharing its 2 full prefix blocks.
         const program = yield* Model.inference(model, params, { maxTokens: 20, blockSize: 4 })
         const prompt = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 0]
-        const seqA = yield* program.sequence()
-        const logitsA = yield* seqA.prefill(yield* ids(prompt))
-        const seqB = yield* program.sequence()
-        const logitsB = yield* seqB.prefill(yield* ids(prompt))
-        deep(yield* Tensor.toNumberArray(logitsB), yield* Tensor.toNumberArray(logitsA))
+        const gen = yield* program.generation()
+        const a = yield* gen.add(yield* ids(prompt))
+        const b = yield* gen.add(yield* ids(prompt))
+        deep(yield* Tensor.toNumberArray(b.logits), yield* Tensor.toNumberArray(a.logits))
       })
     )
 
@@ -247,10 +240,9 @@ onDevices("Inference", () => (it) => {
         const shared = [1, 2, 3, 4, 5, 6, 7, 8] // 2 full blocks
         const promptA = [...shared, 9, 10, 11, 0]
         const promptB = [...shared, 3, 4, 5, 6]
-        const seqA = yield* program.sequence()
-        yield* seqA.prefill(yield* ids(promptA))
-        const seqB = yield* program.sequence()
-        const logitsB = yield* seqB.prefill(yield* ids(promptB))
+        const gen = yield* program.generation()
+        yield* gen.add(yield* ids(promptA))
+        const b = yield* gen.add(yield* ids(promptB))
         // The reference: an ordinary forward over B's whole prompt.
         const input = yield* ids(promptB)
         const output = yield* model.forward(params, input)
@@ -260,7 +252,7 @@ onDevices("Inference", () => (it) => {
             [VOCAB]
           )
         ])
-        deep(yield* Tensor.toNumberArray(logitsB), yield* Tensor.toNumberArray(expected))
+        deep(yield* Tensor.toNumberArray(b.logits), yield* Tensor.toNumberArray(expected))
       })
     )
 
@@ -272,12 +264,12 @@ onDevices("Inference", () => (it) => {
         // succeeds only by evicting the first's cached blocks.
         const program = yield* Model.inference(model, params, { maxTokens: 12, blockSize: 4 })
         yield* Effect.scoped(Effect.gen(function* () {
-          const seq = yield* program.sequence()
-          yield* seq.prefill(yield* ids([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 0]))
+          const gen = yield* program.generation()
+          yield* gen.add(yield* ids([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 0]))
         }))
         const prompt = [2, 4, 6, 8, 10, 0, 1, 3, 5, 7, 9, 11]
-        const seq = yield* program.sequence()
-        const logits = yield* seq.prefill(yield* ids(prompt))
+        const gen = yield* program.generation()
+        const entry = yield* gen.add(yield* ids(prompt))
         const input = yield* ids(prompt)
         const output = yield* model.forward(params, input)
         const [expected] = yield* Tensor.compute([
@@ -286,7 +278,7 @@ onDevices("Inference", () => (it) => {
             [VOCAB]
           )
         ])
-        deep(yield* Tensor.toNumberArray(logits), yield* Tensor.toNumberArray(expected))
+        deep(yield* Tensor.toNumberArray(entry.logits), yield* Tensor.toNumberArray(expected))
       })
     )
 
@@ -301,17 +293,20 @@ onDevices("Inference", () => (it) => {
           attentionWindow: 8
         })
         // Generate past the window: the prompt's first block leaves the
-        // window, lands in the prefix cache, and the sequence releases
+        // window, lands in the prefix cache, and the sequence finishes
         // the rest of the prompt's blocks into the cache as well.
         yield* Effect.scoped(Effect.gen(function* () {
-          const seq = yield* program.sequence()
-          let logits = yield* seq.prefill(yield* ids(prompt))
+          const gen = yield* program.generation()
+          const entry = yield* gen.add(yield* ids(prompt))
+          let logits = entry.logits
           for (let i = 0; i < 4; i++) {
-            logits = yield* seq.step(yield* ids([yield* argmaxOf(logits)]))
+            const out = yield* gen.step(() => Effect.succeed(Option.some(0)))
+            logits = out.get(entry.seq)!
+            void logits
           }
         }))
-        const seq = yield* program.sequence()
-        const logits = yield* seq.prefill(yield* ids(prompt))
+        const gen = yield* program.generation()
+        const entry = yield* gen.add(yield* ids(prompt))
         const input = yield* ids(prompt)
         const output = yield* model.forward(params, input)
         const [expected] = yield* Tensor.compute([
@@ -320,20 +315,21 @@ onDevices("Inference", () => (it) => {
             [VOCAB]
           )
         ])
-        deep(yield* Tensor.toNumberArray(logits), yield* Tensor.toNumberArray(expected))
+        deep(yield* Tensor.toNumberArray(entry.logits), yield* Tensor.toNumberArray(expected))
       })
     )
 
-    it.effect("prefix cache: a second prefill on a used sequence is an error", () =>
+    it.effect("each add starts a fresh, independent sequence", () =>
       Effect.gen(function* () {
         const model = yield* makeGpt()
         const params = yield* Tensor.compute(yield* model.init)
         const program = yield* Model.inference(model, params, { maxTokens: 16, blockSize: 4 })
-        const seq = yield* program.sequence()
-        yield* seq.prefill(yield* ids([1, 2, 3]))
-        const error = yield* Effect.flip(seq.prefill(yield* ids([4, 5, 6])))
-        expect(error._tag).toBe("InferenceError")
-        expect(error.message).toMatch(/already holds tokens/)
+        const gen = yield* program.generation()
+        const a = yield* gen.add(yield* ids([1, 2, 3]))
+        const b = yield* gen.add(yield* ids([1, 2, 3]))
+        expect(yield* a.seq.cursor()).toBe(3)
+        expect(yield* b.seq.cursor()).toBe(3)
+        deep(yield* Tensor.toNumberArray(b.logits), yield* Tensor.toNumberArray(a.logits))
       })
     )
 
@@ -368,9 +364,10 @@ onDevices("Inference", () => (it) => {
         const program = yield* Model.inference(model, params, { maxTokens: 64, blockSize: 4, kvDtype })
         const prompt = [1, 5, 3, 8, 2]
         const trajectory = [4, 9, 0, 7, 6]
-        const seq = yield* program.sequence()
+        const gen = yield* program.generation()
         const context = [...prompt]
-        let logits = yield* seq.prefill(yield* ids(prompt))
+        const entry = yield* gen.add(yield* ids(prompt))
+        let logits = entry.logits
         const check = (actual: Tensor.Any, ctx: ReadonlyArray<number>) =>
           Effect.gen(function* () {
             const input = yield* ids(ctx.slice(-BLOCK))
@@ -391,7 +388,8 @@ onDevices("Inference", () => (it) => {
         yield* check(logits, context)
         for (const next of trajectory) {
           context.push(next)
-          logits = yield* seq.step(yield* ids([next]))
+          const out = yield* gen.step(() => Effect.succeed(Option.some(next)))
+          logits = out.get(entry.seq)!
           yield* check(logits, context)
         }
       })
@@ -423,24 +421,25 @@ onDevices("Inference", () => (it) => {
         const cached = yield* cachedGenerate(program, [1, 5, 3], 4)
         expect(cached).toEqual(naive)
         // (b) prefill 12, step 4 greedy (context 16, first block
-        // evicted), then a fresh prefill of the full 16-token context
+        // evicted), then a fresh add of the full 16-token context
         // must produce the same last-position logits.
-        const seqA = yield* program.sequence()
+        const gen = yield* program.generation()
         const prompt = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 0]
         const context = [...prompt]
-        let logits = yield* seqA.prefill(yield* ids(prompt))
+        const a = yield* gen.add(yield* ids(prompt))
+        let logits = a.logits
         for (let i = 0; i < 4; i++) {
           const next = yield* argmaxOf(logits)
           context.push(next)
-          logits = yield* seqA.step(yield* ids([next]))
+          const out = yield* gen.step(() => Effect.succeed(Option.some(next)))
+          logits = out.get(a.seq)!
         }
-        const seqB = yield* program.sequence()
-        const fresh = yield* seqB.prefill(yield* ids(context))
-        deep(yield* Tensor.toNumberArray(fresh), yield* Tensor.toNumberArray(logits))
+        const fresh = yield* gen.add(yield* ids(context))
+        deep(yield* Tensor.toNumberArray(fresh.logits), yield* Tensor.toNumberArray(logits))
       })
     )
 
-    it.effect("stepAll matches per-sequence step logits exactly", () =>
+    it.effect("batched step matches per-sequence step logits exactly", () =>
       Effect.gen(function* () {
         const model = yield* makeGpt()
         const params = yield* Tensor.compute(yield* model.init)
@@ -451,49 +450,54 @@ onDevices("Inference", () => (it) => {
           [9, 10],
           [1, 2, 3, 0, 11, 5, 6]
         ]
-        // Sequential reference: prefill + one step per sequence.
+        // Sequential reference: one session per prompt, one step each.
         const reference: Array<Array<number>> = []
         for (const prompt of prompts) {
-          const seq = yield* program.sequence()
-          yield* seq.prefill(yield* ids(prompt))
-          const logits = yield* seq.step(yield* ids([1]))
-          reference.push(yield* Tensor.toNumberArray(logits))
+          const gen = yield* program.generation()
+          const entry = yield* gen.add(yield* ids(prompt))
+          const out = yield* gen.step(() => Effect.succeed(Option.some(1)))
+          reference.push(yield* Tensor.toNumberArray(out.get(entry.seq)!))
         }
-        // Batched: fresh sequences, same prompts, one stepAll.
-        const entries: Array<{ sequence: Model.Sequence; token: Tensor.Any }> = []
+        // Batched: one session, all prompts, one round stepping all four.
+        const gen = yield* program.generation()
+        const entries: Array<Model.GenerationEntry> = []
         for (const prompt of prompts) {
-          const seq = yield* program.sequence()
-          yield* seq.prefill(yield* ids(prompt))
-          entries.push({ sequence: seq, token: yield* ids([1]) })
+          entries.push(yield* gen.add(yield* ids(prompt)))
         }
-        const batched = yield* program.stepAll(entries)
-        expect(batched.length).toBe(prompts.length)
+        const batched = yield* gen.step(() => Effect.succeed(Option.some(1)))
+        expect(batched.size).toBe(prompts.length)
         for (let i = 0; i < prompts.length; i++) {
-          deep(yield* Tensor.toNumberArray(batched[i]!), reference[i]!)
+          deep(yield* Tensor.toNumberArray(batched.get(entries[i]!.seq)!), reference[i]!)
         }
-        // The batch advanced every cursor exactly once.
-        for (const entry of entries) {
-          expect(yield* entry.sequence.cursor()).toBe(prompts[entries.indexOf(entry)]!.length + 1)
+        // The round advanced every cursor exactly once.
+        for (let i = 0; i < prompts.length; i++) {
+          expect(yield* entries[i]!.seq.cursor()).toBe(prompts[i]!.length + 1)
         }
       })
     )
 
-    it.effect("stepAll pads short batches exactly", () =>
+    it.effect("ragged batches pad internally and stay exact", () =>
       Effect.gen(function* () {
         const model = yield* makeGpt()
         const params = yield* Tensor.compute(yield* model.init)
         const program = yield* Model.inference(model, params, { maxTokens: 64, blockSize: 4, decodeBatch: 8 })
-        const seq = yield* program.sequence()
-        yield* seq.prefill(yield* ids([3, 1, 4]))
-        const expected = yield* seq.step(yield* ids([2]))
-        const seq2 = yield* program.sequence()
-        yield* seq2.prefill(yield* ids([3, 1, 4]))
-        const [got] = yield* program.stepAll([{ sequence: seq2, token: yield* ids([2]) }])
-        deep(yield* Tensor.toNumberArray(got!), yield* Tensor.toNumberArray(expected))
+        // Sequential reference, single-sequence path.
+        const ref = yield* program.generation()
+        const r1 = yield* ref.add(yield* ids([3, 1, 4]))
+        const refOut = yield* ref.step(() => Effect.succeed(Option.some(2)))
+        const expected = refOut.get(r1.seq)!
+        // Two live sequences in one round: 6 slots pad internally.
+        const gen = yield* program.generation()
+        const a = yield* gen.add(yield* ids([3, 1, 4]))
+        const b = yield* gen.add(yield* ids([7, 7, 7]))
+        const out = yield* gen.step(() => Effect.succeed(Option.some(2)))
+        deep(yield* Tensor.toNumberArray(out.get(a.seq)!), yield* Tensor.toNumberArray(expected))
+        expect(yield* a.seq.cursor()).toBe(4)
+        expect(yield* b.seq.cursor()).toBe(4)
       })
     )
 
-    it.effect("stepAll with divergent cursors and a shared prefix", () =>
+    it.effect("batched step with divergent cursors and a shared prefix", () =>
       Effect.gen(function* () {
         const model = yield* makeRopeGpt
         const params = yield* Tensor.compute(yield* model.init)
@@ -505,27 +509,30 @@ onDevices("Inference", () => (it) => {
         })
         const prompt = [1, 3, 5, 7, 9, 11, 2, 4]
         // A generates alone first (evicting its first block past the
-        // window); B prefills afterwards and shares A's cached blocks.
-        const seqA = yield* program.sequence()
-        let logitsA = yield* seqA.prefill(yield* ids(prompt))
+        // window); B is added afterwards and shares A's cached blocks.
+        const gen = yield* program.generation()
+        const a = yield* gen.add(yield* ids(prompt))
+        let logitsA = a.logits
         for (let i = 0; i < 4; i++) {
-          logitsA = yield* seqA.step(yield* ids([yield* argmaxOf(logitsA)]))
+          const next = yield* argmaxOf(logitsA)
+          const out = yield* gen.step(() => Effect.succeed(Option.some(next)))
+          logitsA = out.get(a.seq)!
         }
-        const seqB = yield* program.sequence()
-        let logitsB = yield* seqB.prefill(yield* ids(prompt))
+        const b = yield* gen.add(yield* ids(prompt))
+        let logitsB = b.logits
         // Reference: independent windowed generation from the same
         // prompt for both trajectories.
         const refA = yield* naiveWindowedGenerate(model, params, prompt, 11, 8)
         const refB = yield* naiveWindowedGenerate(model, params, prompt, 7, 8)
-        // Six batched steps: cursors 12+i and 8+i in one run.
+        // Six batched rounds: cursors 12+i and 8+i in one run.
         for (let i = 0; i < 6; i++) {
-          const [nextA, nextB] = [refA[prompt.length + 4 + i]!, refB[prompt.length + i]!]
-          const [outA, outB] = yield* program.stepAll([
-            { sequence: seqA, token: yield* ids([nextA]) },
-            { sequence: seqB, token: yield* ids([nextB]) }
-          ])
-          logitsA = outA!
-          logitsB = outB!
+          const nextA = refA[prompt.length + 4 + i]!
+          const nextB = refB[prompt.length + i]!
+          const out = yield* gen.step((seq) =>
+            Effect.succeed(Option.some(seq === a.seq ? nextA : nextB))
+          )
+          logitsA = out.get(a.seq)!
+          logitsB = out.get(b.seq)!
           // Batched logits must equal the sequential reference argmax.
           expect(yield* argmaxOf(logitsA)).toBe(refA[prompt.length + 5 + i]!)
           expect(yield* argmaxOf(logitsB)).toBe(refB[prompt.length + 1 + i]!)
@@ -533,56 +540,53 @@ onDevices("Inference", () => (it) => {
       })
     )
 
-    it.effect("stepAll rolls back every slot on pool exhaustion", () =>
+    it.effect("batched step rolls back every slot on pool exhaustion", () =>
       Effect.gen(function* () {
         const model = yield* makeGpt()
         const params = yield* Tensor.compute(yield* model.init)
         // Pool holds both prompts exactly; the batched step needs one
         // more block per sequence and must fail cleanly.
         const program = yield* Model.inference(model, params, { maxTokens: 24, blockSize: 4, decodeBatch: 2 })
-        const seqA = yield* program.sequence()
-        const seqB = yield* program.sequence()
-        yield* seqA.prefill(yield* ids([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 0])) // 3 blocks
-        yield* seqB.prefill(yield* ids([2, 4, 6, 8, 10, 0, 1, 3, 5, 7, 9, 11])) // 3 blocks
-        const error = yield* Effect.flip(
-          program.stepAll([
-            { sequence: seqA, token: yield* ids([1]) },
-            { sequence: seqB, token: yield* ids([2]) }
-          ])
-        )
+        const gen = yield* program.generation()
+        const a = yield* gen.add(yield* ids([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 0])) // 3 blocks
+        const b = yield* gen.add(yield* ids([2, 4, 6, 8, 10, 0, 1, 3, 5, 7, 9, 11])) // 3 blocks
+        const error = yield* Effect.flip(gen.step(() => Effect.succeed(Option.some(1))))
         expect(error._tag).toBe("TensorError")
         expect(error.message).toMatch(/pool exhausted/)
-        // Neither cursor advanced; both sequences still step fine once
-        // the pool has room (release A's blocks by closing its scope is
-        // not needed — pool of 24 has no room, so release A first).
-        expect(yield* seqA.cursor()).toBe(12)
-        expect(yield* seqB.cursor()).toBe(12)
+        // Neither cursor advanced.
+        expect(yield* a.seq.cursor()).toBe(12)
+        expect(yield* b.seq.cursor()).toBe(12)
       })
     )
 
-    it.effect("stepAll rejects duplicate sequences and over-wide batches", () =>
+    it.effect("add beyond decodeBatch fails typed", () =>
       Effect.gen(function* () {
         const model = yield* makeGpt()
         const params = yield* Tensor.compute(yield* model.init)
         const program = yield* Model.inference(model, params, { maxTokens: 64, blockSize: 4, decodeBatch: 2 })
-        const seq = yield* program.sequence()
-        yield* seq.prefill(yield* ids([1, 2, 3]))
-        const token = yield* ids([1])
-        const duplicate = yield* Effect.flip(
-          program.stepAll([
-            { sequence: seq, token },
-            { sequence: seq, token }
-          ])
-        )
-        expect(duplicate.message).toMatch(/duplicate sequence/)
-        const wide = yield* Effect.flip(
-          program.stepAll([
-            { sequence: seq, token },
-            { sequence: yield* program.sequence(), token },
-            { sequence: yield* program.sequence(), token }
-          ])
-        )
-        expect(wide.message).toMatch(/at most decodeBatch/)
+        const gen = yield* program.generation()
+        yield* gen.add(yield* ids([1, 2, 3]))
+        yield* gen.add(yield* ids([4, 5, 6]))
+        const error = yield* Effect.flip(gen.add(yield* ids([7, 8, 9])))
+        expect(error._tag).toBe("InferenceError")
+        expect(error.message).toMatch(/at most decodeBatch/)
+      })
+    )
+
+    it.effect("finishing a sequence mid-session removes it from the round", () =>
+      Effect.gen(function* () {
+        const model = yield* makeGpt()
+        const params = yield* Tensor.compute(yield* model.init)
+        const program = yield* Model.inference(model, params, { maxTokens: 64, blockSize: 4, decodeBatch: 2 })
+        const gen = yield* program.generation()
+        const a = yield* gen.add(yield* ids([1, 2, 3]))
+        const b = yield* gen.add(yield* ids([4, 5, 6]))
+        yield* a.seq.finish()
+        const out = yield* gen.step(() => Effect.succeed(Option.some(1)))
+        expect(out.size).toBe(1)
+        expect(out.has(b.seq)).toBe(true)
+        expect(yield* gen.live()).toBe(1)
+        expect(yield* b.seq.cursor()).toBe(4)
       })
     )
 
@@ -601,19 +605,22 @@ onDevices("Inference", () => (it) => {
         // two independent 2-block prompts would need 4 of 8 blocks plus
         // B's private suffix block — fits either way, so assert exact
         // equality of the shared computation instead.
-        const seqA = yield* program.sequence()
-        const logitsA = yield* seqA.prefill(yield* ids(prompt))
-        const seqB = yield* program.sequence()
-        const logitsB = yield* seqB.prefill(yield* ids(prompt))
-        deep(yield* Tensor.toNumberArray(logitsB), yield* Tensor.toNumberArray(logitsA))
+        const gen = yield* program.generation()
+        const a = yield* gen.add(yield* ids(prompt))
+        const b = yield* gen.add(yield* ids(prompt))
+        deep(yield* Tensor.toNumberArray(b.logits), yield* Tensor.toNumberArray(a.logits))
         // And windowed generation past eviction stays close to the
-        // window-relative f32 recompute.
+        // window-relative f32 recompute (a steps alone; b stays live
+        // holding the shared prefix).
         const context = [...prompt]
-        let logits = logitsA
+        let logits = a.logits
         for (let i = 0; i < 6; i++) {
           const next = yield* argmaxOf(logits)
           context.push(next)
-          logits = yield* seqA.step(yield* ids([next]))
+          const out = yield* gen.step((seq) =>
+            Effect.succeed(seq === a.seq ? Option.some(next) : Option.none<number>())
+          )
+          logits = out.get(a.seq)!
           const input = yield* ids(context.slice(-8))
           const output = yield* model.forward(params, input)
           const t = input.shape[1]
@@ -655,18 +662,15 @@ onDevices("Inference", () => (it) => {
       })
     )
 
-    it.effect("validates the prefill/step calling convention", () =>
+    it.effect("validates the add calling convention", () =>
       Effect.gen(function* () {
         const model = yield* makeGpt()
         const params = yield* Tensor.compute(yield* model.init)
         const program = yield* Model.inference(model, params, { maxTokens: 16, blockSize: 4 })
-        const seq = yield* program.sequence()
-        const batched = yield* Effect.flip(seq.prefill(yield* Tensor.fromTypedArray(new Uint32Array(6), [2, 3])))
+        const gen = yield* program.generation()
+        const batched = yield* Effect.flip(gen.add(yield* Tensor.fromTypedArray(new Uint32Array(6), [2, 3])))
         expect(batched._tag).toBe("InferenceError")
-        expect(batched.message).toMatch(/expects tokens of shape \[1, T\]/)
-        const wide = yield* Effect.flip(seq.step(yield* ids([1, 2])))
-        expect(wide._tag).toBe("InferenceError")
-        expect(wide.message).toMatch(/expects a single token/)
+        expect(batched.message).toMatch(/expects a prompt of shape \[1, T\]/)
         const badPool = yield* Effect.flip(Model.inference(model, params, { maxTokens: 15, blockSize: 4 }))
         expect(badPool._tag).toBe("InferenceError")
         expect(badPool.message).toMatch(/multiple of blockSize/)
@@ -678,15 +682,15 @@ onDevices("Inference", () => (it) => {
         const model = yield* makeGpt()
         const params = yield* Tensor.compute(yield* model.init)
         const program = yield* Model.inference(model, params, { maxTokens: 32, blockSize: 4 })
-        const seq = yield* program.sequence()
-        const cached = yield* seq.prefill(yield* ids([1, 5, 3]))
+        const gen = yield* program.generation()
+        const entry = yield* gen.add(yield* ids([1, 5, 3]))
         const output = yield* model.forward(params, yield* ids([1, 5, 3]))
         const [naive] = yield* Tensor.compute([
           yield* Tensor.reshape(yield* Tensor.slice(output, { start: [0, 2, 0], end: [1, 3, VOCAB] }), [
             VOCAB
           ])
         ])
-        deep(yield* Tensor.toNumberArray(cached), yield* Tensor.toNumberArray(naive))
+        deep(yield* Tensor.toNumberArray(entry.logits), yield* Tensor.toNumberArray(naive))
         void TOL
       })
     )

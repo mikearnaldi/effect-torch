@@ -1,6 +1,11 @@
 # RFC 0013: Batched Decode — One Walk for N Sequences, and the Paged Attention Kernel
 
-- **Status**: Implemented
+- **Status**: Implemented — API revised: the public surface is the
+  `Generation` session (`InferenceProgram.generation()`), not
+  `stepAll`. Ragged batches pad internally in native (`run_batched`
+  accepts 1..=B sequences, pads with throwaway slots, pads the ids
+  input to width); per-sequence `step`/`sequence` is gone — the
+  session is the single way to run sequences, batched by default.
 - **Created**: 2026-08-02
 - **Depends on**: RFC 0010 (inference), RFC 0012 (dtypes)
 - **Updates**: —

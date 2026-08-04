@@ -9326,6 +9326,24 @@ impl ObjectFinalize for NativeKvSequence {
 }
 
 impl NativeKvSequence {
+    // A fresh empty sequence on this sequence's pool (used for internal
+    // pad slots in ragged batched runs).
+    fn new_sequence_like(&self) -> Self {
+        NativeKvSequence {
+            pool: self.pool.clone(),
+            state: Arc::new(Mutex::new(SeqState {
+                blocks: Vec::new(),
+                head: 0,
+                cursor: 0,
+                advance: 0,
+                last_hash: HASH_SEED,
+                pending: Vec::new(),
+            })),
+            run_lock: Arc::new(Mutex::new(())),
+            released: AtomicBool::new(false),
+        }
+    }
+
     fn return_blocks(&self) {
         if self.released.swap(true, Ordering::SeqCst) {
             return;
@@ -9494,17 +9512,59 @@ impl DecodeProgram {
         tokens: Vec<Vec<u32>>,
         token: Option<&CancellationToken>,
     ) -> Result<Vec<NativeTensor>> {
-        if seqs.len() != self.batch as usize {
+        // Ragged batches pad internally: throwaway sequences (token 0,
+        // outputs discarded) fill the program's fixed width, and their
+        // blocks are released before the call returns — callers never see
+        // the padding.
+        if seqs.is_empty() || seqs.len() > self.batch as usize {
             return Err(Error::new(
                 Status::InvalidArg,
                 format!(
-                    "kv run: program expects exactly {} sequences, got {}",
+                    "kv run: program accepts 1..={} sequences, got {}",
                     self.batch,
                     seqs.len()
                 ),
             ));
         }
-        self.run_inner(inputs, seqs, tokens, token).await
+        let pad: Vec<NativeKvSequence> = (seqs.len()..self.batch as usize)
+            .map(|_| seqs[0].new_sequence_like())
+            .collect();
+        let mut all: Vec<&NativeKvSequence> = seqs;
+        all.extend(pad.iter());
+        let mut all_tokens = tokens;
+        let advance = all_tokens.first().map(|t| t.len()).unwrap_or(1);
+        all_tokens.extend(std::iter::repeat(vec![0u32; advance]).take(pad.len()));
+        // The ids input is fixed-width too: pad the caller's last input
+        // ([n, T] decode ids) with zero rows up to the program width.
+        let mut owned_inputs: Vec<NativeTensor> = inputs.iter().map(|t| NativeTensor::wrap(t.inner.clone())).collect();
+        if let Some(last) = owned_inputs.last_mut() {
+            let shape = last.inner.shape();
+            if shape.len() == 2 && shape[0] < self.batch as usize {
+                let pad_rows = self.batch as usize - shape[0];
+                let zeros = match &last.inner {
+                    val::Val::Cpu(_) => val::Val::Cpu(runtime::cpu::Tensor::zeros(
+                        &[pad_rows, shape[1]],
+                        last.inner.dtype(),
+                    )),
+                    val::Val::Metal(_) => val::Val::Metal(
+                        metal_ops::fill(&[pad_rows, shape[1]], 0.0, last.inner.dtype())
+                            .map_err(to_napi_err)?,
+                    ),
+                };
+                last.inner = match (&last.inner, &zeros) {
+                    (val::Val::Cpu(a), val::Val::Cpu(b)) => val::Val::Cpu(runtime::cpu::Tensor::cat(&[a, b], 0)),
+                    (val::Val::Metal(a), val::Val::Metal(b)) =>
+                        val::Val::Metal(metal_ops::cat(a, b, 0).map_err(to_napi_err)?),
+                    _ => return Err(Error::new(Status::GenericFailure, "device mismatch".to_string())),
+                };
+            }
+        }
+        let refs: Vec<&NativeTensor> = owned_inputs.iter().collect();
+        let out = self.run_inner(refs, all, all_tokens, token).await;
+        for p in &pad {
+            p.release();
+        }
+        out
     }
 }
 
