@@ -35,7 +35,7 @@
  *
  * @since 0.1.0
  */
-import { Data, Effect, Option, Scope, Semaphore } from "effect"
+import { Data, Effect, Scope, Semaphore } from "effect"
 import { CurrentDevice } from "./Device.ts"
 import * as Gradient from "./Gradient.ts"
 import * as Tensor from "./Tensor.ts"
@@ -1214,13 +1214,14 @@ export interface GenerationEntry {
  * A generation session over an {@link InferenceProgram}'s pool (RFC
  * 0010, RFC 0013): the one and only way to run sequences. Sequences
  * are added individually with {@link Generation.add} (its chunked
- * prefill runs internally); every {@link Generation.step} then advances
- * ALL live sequences one token in a single batched run — slot
- * management, short-batch padding and per-slot eviction are internal.
- * The pool keeps a content-addressed prefix cache: prompts whose
- * leading blocks are already resident (computed by an earlier, since
- * finished or still-live sequence) reuse them and compute only their
- * suffix — sharing is automatic and invisible to callers.
+ * prefill runs internally); {@link Generation.step} advances one or
+ * more of them in a single run — the entries ARE the batch: one call
+ * is one forward pass, `[1, 1]` for a single entry, one ragged batched
+ * run (native pads internally) for more. The pool keeps a
+ * content-addressed prefix cache: prompts whose leading blocks are
+ * already resident (computed by an earlier, since finished or
+ * still-live sequence) reuse them and compute only their suffix —
+ * sharing is automatic and invisible to callers.
  *
  * @since 0.1.0
  * @category compilation
@@ -1235,24 +1236,23 @@ export interface Generation {
     prompt: Tensor.Any
   ) => Effect.Effect<GenerationEntry, InferenceError | ModelError | Tensor.TensorError, CurrentDevice>
   /**
-   * Advances sequences one token: the `choose` callback maps each live
-   * sequence and its latest logits to the next token id — or
-   * `Option.none()` to leave that sequence out of this round (it stays
-   * live; evict it early with {@link GenerationSeq.finish}). All
-   * stepped sequences advance in ONE run — a `[1, 1]` decode run for a
-   * single stepped sequence, one ragged batched run (native pads
-   * internally) for more. Returns the new logits keyed by sequence.
-   * Results are identical to stepping sequences individually.
+   * Advances each entry's sequence one token in one run and returns
+   * the new logits `[vocab]` in entry order. Single entry: the `[1, 1]`
+   * decode program. More: one ragged batched run (native pads
+   * internally), results identical to stepping individually. Entries
+   * must be distinct live sequences of this session; at most
+   * `decodeBatch` per call — admission and scheduling stay with the
+   * caller.
    */
-  readonly step: <E = never, R = never>(
-    choose: (
-      seq: GenerationSeq,
-      logits: Tensor.Concrete
-    ) => Effect.Effect<Option.Option<number>, E, R>
+  readonly step: (
+    entries: ReadonlyArray<{
+      readonly seq: GenerationSeq
+      readonly token: number
+    }>
   ) => Effect.Effect<
-    ReadonlyMap<GenerationSeq, Tensor.Concrete>,
-    InferenceError | ModelError | Tensor.TensorError | E,
-    CurrentDevice | R
+    ReadonlyArray<Tensor.Concrete>,
+    InferenceError | ModelError | Tensor.TensorError,
+    CurrentDevice
   >
   /** The number of live sequences. */
   readonly live: () => Effect.Effect<number>
@@ -1399,7 +1399,6 @@ export const inference = (
     interface LiveEntry {
       readonly seq: GenerationSeq
       readonly native: Tensor.NativeKvSequence
-      lastLogits: Tensor.Concrete
     }
     const lastLogits = (op: "prefill" | "step", output: Tensor.Concrete, row: number) =>
       Effect.gen(function* () {
@@ -1493,68 +1492,83 @@ export const inference = (
                     }
                   })
               }
-              live.push({ seq, native, lastLogits: logits as Tensor.Concrete })
+              live.push({ seq, native })
               const result: GenerationEntry = { seq, logits: logits as Tensor.Concrete }
               return result
             })
           const generation: Generation = {
             add,
-            step: (choose) =>
+            step: (entries) =>
               roundLock.withPermits(1)(
                 Effect.gen(function* () {
-                  // One chooser call per live sequence per round: a
-                  // token steps the sequence, Option.none skips it this
-                  // round (it stays live).
-                  const stepped: Array<{ readonly entry: LiveEntry; readonly id: number }> = []
-                  for (const entry of [...live]) {
-                    const token = yield* choose(entry.seq, entry.lastLogits)
-                    if (Option.isSome(token)) {
-                      stepped.push({ entry, id: token.value })
+                  if (entries.length === 0) {
+                    return yield* new InferenceError({
+                      op: "step",
+                      message: "step expects at least one entry"
+                    })
+                  }
+                  if (entries.length > decodeBatch) {
+                    return yield* new InferenceError({
+                      op: "step",
+                      message: `step accepts at most decodeBatch (${decodeBatch}) entries, got ${entries.length}`
+                    })
+                  }
+                  for (const [i, entry] of entries.entries()) {
+                    if (!Number.isInteger(entry.token) || entry.token < 0) {
+                      return yield* new InferenceError({
+                        op: "step",
+                        message: `step expects token ids (non-negative integers), got ${entry.token}`
+                      })
+                    }
+                    if (!live.some((e) => e.seq === entry.seq)) {
+                      return yield* new InferenceError({
+                        op: "step",
+                        message: `entry ${i} is not a live sequence of this session`
+                      })
+                    }
+                    if (entries.findIndex((other) => other.seq === entry.seq) !== i) {
+                      return yield* new InferenceError({
+                        op: "step",
+                        message: "step entries must be distinct sequences"
+                      })
                     }
                   }
-                  const out = new Map<GenerationSeq, Tensor.Concrete>()
-                  if (stepped.length === 0) {
-                    return out
-                  }
-                  if (stepped.length === 1) {
-                    const { entry, id } = stepped[0]!
-                    const input = yield* idTensor([id], [1, 1])
+                  if (entries.length === 1) {
+                    const entry = entries[0]!
+                    const input = yield* idTensor([entry.token], [1, 1])
                     const [output] = yield* Tensor.runDecodeProgram(
                       decodeProgram,
                       [...frozenParams, input],
-                      entry.native,
-                      [id]
+                      entry.seq._native,
+                      [entry.token]
                     )
-                    entry.lastLogits = yield* lastLogits("step", output, 0)
-                    out.set(entry.seq, entry.lastLogits)
-                    return out
+                    return [yield* lastLogits("step", output, 0)]
                   }
                   if (batchedProgram === undefined) {
                     return yield* new InferenceError({
                       op: "step",
-                      message: `stepping ${stepped.length} live sequences needs decodeBatch > 1`
+                      message: `stepping ${entries.length} sequences needs decodeBatch > 1`
                     })
                   }
-                  const ids = stepped.map(({ id }) => id)
-                  const input = yield* idTensor(ids, [stepped.length, 1])
+                  const ids = entries.map((entry) => entry.token)
+                  const input = yield* idTensor(ids, [entries.length, 1])
                   const [output] = yield* Tensor.runBatchedDecodeProgram(
                     batchedProgram,
                     [...frozenParams, input],
-                    stepped.map(({ entry }) => entry.native),
+                    entries.map((entry) => entry.seq._native),
                     ids.map((id) => [id])
                   )
                   const vocab = output.shape[output.shape.length - 1]!
-                  for (let i = 0; i < stepped.length; i++) {
-                    const entry = stepped[i]!.entry
+                  const results: Array<Tensor.Concrete> = []
+                  for (let i = 0; i < entries.length; i++) {
                     const row = yield* Tensor.slice(output, {
                       start: [i, 0, 0],
                       end: [i + 1, 1, vocab]
                     })
                     const [concrete] = yield* Tensor.compute([yield* Tensor.reshape(row, [vocab])])
-                    entry.lastLogits = concrete
-                    out.set(entry.seq, concrete)
+                    results.push(concrete)
                   }
-                  return out
+                  return results
                 })
               ),
             live: () => Effect.sync(() => live.length)

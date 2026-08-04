@@ -1,5 +1,5 @@
 import { describe, expect } from "@effect/vitest"
-import { Effect, Option } from "effect"
+import { Effect } from "effect"
 import { LearningRate, Loss, Model, Optimizer, Tensor, Trainer } from "../src/index.ts"
 import { deep, onDevices, TOL } from "./utils/devices.ts"
 
@@ -106,8 +106,8 @@ const cachedGenerate = (
       const next = yield* argmaxOf(logits)
       context.push(next)
       if (i < steps - 1) {
-        const out = yield* gen.step(() => Effect.succeed(Option.some(next)))
-        logits = out.get(entry.seq)!
+        const [nextLogits] = yield* gen.step([{ seq: entry.seq, token: next }])
+        logits = nextLogits
       }
     }
     return context
@@ -196,7 +196,7 @@ onDevices("Inference", () => (it) => {
         const gen = yield* program.generation()
         const entry = yield* gen.add(yield* ids([1, 2, 3, 4, 5, 6, 7, 8]))
         expect(yield* entry.seq.cursor()).toBe(8)
-        const error = yield* Effect.flip(gen.step(() => Effect.succeed(Option.some(1))))
+        const error = yield* Effect.flip(gen.step([{ seq: entry.seq, token: 1 }]))
         expect(error._tag).toBe("TensorError")
         expect(error.message).toMatch(/exceeds pool capacity/)
       })
@@ -300,8 +300,8 @@ onDevices("Inference", () => (it) => {
           const entry = yield* gen.add(yield* ids(prompt))
           let logits = entry.logits
           for (let i = 0; i < 4; i++) {
-            const out = yield* gen.step(() => Effect.succeed(Option.some(0)))
-            logits = out.get(entry.seq)!
+            const [stepped] = yield* gen.step([{ seq: entry.seq, token: 0 }])
+            logits = stepped
             void logits
           }
         }))
@@ -388,8 +388,8 @@ onDevices("Inference", () => (it) => {
         yield* check(logits, context)
         for (const next of trajectory) {
           context.push(next)
-          const out = yield* gen.step(() => Effect.succeed(Option.some(next)))
-          logits = out.get(entry.seq)!
+          const [nextLogits] = yield* gen.step([{ seq: entry.seq, token: next }])
+          logits = nextLogits
           yield* check(logits, context)
         }
       })
@@ -431,8 +431,8 @@ onDevices("Inference", () => (it) => {
         for (let i = 0; i < 4; i++) {
           const next = yield* argmaxOf(logits)
           context.push(next)
-          const out = yield* gen.step(() => Effect.succeed(Option.some(next)))
-          logits = out.get(a.seq)!
+          const [nextLogits] = yield* gen.step([{ seq: a.seq, token: next }])
+          logits = nextLogits
         }
         const fresh = yield* gen.add(yield* ids(context))
         deep(yield* Tensor.toNumberArray(fresh.logits), yield* Tensor.toNumberArray(logits))
@@ -455,8 +455,8 @@ onDevices("Inference", () => (it) => {
         for (const prompt of prompts) {
           const gen = yield* program.generation()
           const entry = yield* gen.add(yield* ids(prompt))
-          const out = yield* gen.step(() => Effect.succeed(Option.some(1)))
-          reference.push(yield* Tensor.toNumberArray(out.get(entry.seq)!))
+          const [logits] = yield* gen.step([{ seq: entry.seq, token: 1 }])
+          reference.push(yield* Tensor.toNumberArray(logits))
         }
         // Batched: one session, all prompts, one round stepping all four.
         const gen = yield* program.generation()
@@ -464,10 +464,10 @@ onDevices("Inference", () => (it) => {
         for (const prompt of prompts) {
           entries.push(yield* gen.add(yield* ids(prompt)))
         }
-        const batched = yield* gen.step(() => Effect.succeed(Option.some(1)))
-        expect(batched.size).toBe(prompts.length)
+        const batched = yield* gen.step(entries.map(({ seq }) => ({ seq, token: 1 })))
+        expect(batched.length).toBe(prompts.length)
         for (let i = 0; i < prompts.length; i++) {
-          deep(yield* Tensor.toNumberArray(batched.get(entries[i]!.seq)!), reference[i]!)
+          deep(yield* Tensor.toNumberArray(batched[i]!), reference[i]!)
         }
         // The round advanced every cursor exactly once.
         for (let i = 0; i < prompts.length; i++) {
@@ -484,14 +484,16 @@ onDevices("Inference", () => (it) => {
         // Sequential reference, single-sequence path.
         const ref = yield* program.generation()
         const r1 = yield* ref.add(yield* ids([3, 1, 4]))
-        const refOut = yield* ref.step(() => Effect.succeed(Option.some(2)))
-        const expected = refOut.get(r1.seq)!
+        const [expected] = yield* ref.step([{ seq: r1.seq, token: 2 }])
         // Two live sequences in one round: 6 slots pad internally.
         const gen = yield* program.generation()
         const a = yield* gen.add(yield* ids([3, 1, 4]))
         const b = yield* gen.add(yield* ids([7, 7, 7]))
-        const out = yield* gen.step(() => Effect.succeed(Option.some(2)))
-        deep(yield* Tensor.toNumberArray(out.get(a.seq)!), yield* Tensor.toNumberArray(expected))
+        const [gotA] = yield* gen.step([
+          { seq: a.seq, token: 2 },
+          { seq: b.seq, token: 2 }
+        ])
+        deep(yield* Tensor.toNumberArray(gotA!), yield* Tensor.toNumberArray(expected))
         expect(yield* a.seq.cursor()).toBe(4)
         expect(yield* b.seq.cursor()).toBe(4)
       })
@@ -515,8 +517,8 @@ onDevices("Inference", () => (it) => {
         let logitsA = a.logits
         for (let i = 0; i < 4; i++) {
           const next = yield* argmaxOf(logitsA)
-          const out = yield* gen.step(() => Effect.succeed(Option.some(next)))
-          logitsA = out.get(a.seq)!
+          const [nextLogits] = yield* gen.step([{ seq: a.seq, token: next }])
+          logitsA = nextLogits
         }
         const b = yield* gen.add(yield* ids(prompt))
         let logitsB = b.logits
@@ -528,11 +530,12 @@ onDevices("Inference", () => (it) => {
         for (let i = 0; i < 6; i++) {
           const nextA = refA[prompt.length + 4 + i]!
           const nextB = refB[prompt.length + i]!
-          const out = yield* gen.step((seq) =>
-            Effect.succeed(Option.some(seq === a.seq ? nextA : nextB))
-          )
-          logitsA = out.get(a.seq)!
-          logitsB = out.get(b.seq)!
+          const [outA, outB] = yield* gen.step([
+            { seq: a.seq, token: nextA },
+            { seq: b.seq, token: nextB }
+          ])
+          logitsA = outA!
+          logitsB = outB!
           // Batched logits must equal the sequential reference argmax.
           expect(yield* argmaxOf(logitsA)).toBe(refA[prompt.length + 5 + i]!)
           expect(yield* argmaxOf(logitsB)).toBe(refB[prompt.length + 1 + i]!)
@@ -550,7 +553,12 @@ onDevices("Inference", () => (it) => {
         const gen = yield* program.generation()
         const a = yield* gen.add(yield* ids([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 0])) // 3 blocks
         const b = yield* gen.add(yield* ids([2, 4, 6, 8, 10, 0, 1, 3, 5, 7, 9, 11])) // 3 blocks
-        const error = yield* Effect.flip(gen.step(() => Effect.succeed(Option.some(1))))
+        const error = yield* Effect.flip(
+          gen.step([
+            { seq: a.seq, token: 1 },
+            { seq: b.seq, token: 2 }
+          ])
+        )
         expect(error._tag).toBe("TensorError")
         expect(error.message).toMatch(/pool exhausted/)
         // Neither cursor advanced.
@@ -582,9 +590,8 @@ onDevices("Inference", () => (it) => {
         const a = yield* gen.add(yield* ids([1, 2, 3]))
         const b = yield* gen.add(yield* ids([4, 5, 6]))
         yield* a.seq.finish()
-        const out = yield* gen.step(() => Effect.succeed(Option.some(1)))
-        expect(out.size).toBe(1)
-        expect(out.has(b.seq)).toBe(true)
+        const out = yield* gen.step([{ seq: b.seq, token: 1 }])
+        expect(out.length).toBe(1)
         expect(yield* gen.live()).toBe(1)
         expect(yield* b.seq.cursor()).toBe(4)
       })
@@ -617,10 +624,8 @@ onDevices("Inference", () => (it) => {
         for (let i = 0; i < 6; i++) {
           const next = yield* argmaxOf(logits)
           context.push(next)
-          const out = yield* gen.step((seq) =>
-            Effect.succeed(seq === a.seq ? Option.some(next) : Option.none<number>())
-          )
-          logits = out.get(a.seq)!
+          const [nextLogits] = yield* gen.step([{ seq: a.seq, token: next }])
+          logits = nextLogits
           const input = yield* ids(context.slice(-8))
           const output = yield* model.forward(params, input)
           const t = input.shape[1]

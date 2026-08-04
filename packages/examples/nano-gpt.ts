@@ -196,14 +196,15 @@ const generate = (
         }
         return exps.length - 1
       })
-    let logits = (yield* gen.add(yield* ids([bosId, ...promptIds], [1, 1 + promptIds.length]))).logits
+    const entry = yield* gen.add(yield* ids([bosId, ...promptIds], [1, 1 + promptIds.length]))
+    let logits = entry.logits
     const generated: Array<number> = []
     for (;;) {
       const next = yield* sample(logits)
       if (next === eosId) break
       generated.push(next)
-      const out = yield* gen.step(() => Effect.succeed(Option.some(next)))
-      logits = [...out.values()][0]!
+      const [nextLogits] = yield* gen.step([{ seq: entry.seq, token: next }])
+      logits = nextLogits
     }
     return yield* tokenizer.decode(generated)
   }))
