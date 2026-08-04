@@ -379,6 +379,33 @@ impl NativeTokenizer {
     }
 
     #[napi]
+    pub async fn encode_batch_concat_tensor(
+        &self,
+        texts: Vec<String>,
+        device: Option<String>,
+    ) -> Result<LazyTensor> {
+        let inner = self.inner().clone();
+        let flat = tokio::task::spawn_blocking(move || {
+            texts
+                .par_iter()
+                .map(|text| inner.encode_ids(text))
+                .collect::<Result<Vec<Vec<u32>>>>()
+                .map(|batch| {
+                    let total: usize = batch.iter().map(|ids| ids.len()).sum();
+                    let mut flat = Vec::with_capacity(total);
+                    for ids in batch {
+                        flat.extend_from_slice(&ids);
+                    }
+                    flat
+                })
+        })
+        .await
+        .map_err(crate::to_join_err)??;
+        let len = flat.len();
+        ids_to_tensor(flat, vec![len], device)
+    }
+
+    #[napi]
     pub fn decode(&self, ids: Vec<u32>) -> Result<String> {
         self.inner()
             .tokenizer

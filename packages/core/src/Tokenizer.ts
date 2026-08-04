@@ -290,6 +290,14 @@ export interface Tokenizer extends Pipeable {
     texts: ReadonlyArray<string>,
   ) => Effect.Effect<Tensor.Lazy, TokenizerError, CurrentDevice>
   /**
+   * Encodes a batch into one flat `[ΣT]` `u32` tensor — the ragged
+   * encodings concatenated in order, no padding. The document-stream
+   * counterpart of {@link encodeBatch} for corpus tokenization.
+   */
+  readonly encodeBatchConcat: (
+    texts: ReadonlyArray<string>,
+  ) => Effect.Effect<Tensor.Lazy, TokenizerError, CurrentDevice>
+  /**
    * Decodes ids back to text, losslessly (special tokens are not skipped).
    * Tensor inputs are materialized natively.
    */
@@ -391,6 +399,17 @@ const make = (
           return Tensor.makeLazy(lazy, lazy.shape, "u32", device)
         },
         catch: toTokenizerError("encodeBatch")
+      })
+    })
+  self.encodeBatchConcat = (texts: ReadonlyArray<string>) =>
+    Effect.gen(function* () {
+      const device = yield* CurrentDevice
+      return yield* Effect.tryPromise({
+        try: async () => {
+          const lazy = await handle.encodeBatchConcatTensor(texts as Array<string>, device)
+          return Tensor.makeLazy(lazy, lazy.shape, "u32", device)
+        },
+        catch: toTokenizerError("encodeBatchConcat")
       })
     })
   self.decode = (ids: Tensor.Any | ReadonlyArray<number>) =>

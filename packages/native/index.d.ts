@@ -134,6 +134,7 @@ export declare class NativeTokenizer {
   encodeBatch(texts: Array<string>): Promise<Array<Uint32Array>>
   encodeTensor(text: string, device?: string | undefined | null): LazyTensor
   encodeBatchTensor(texts: Array<string>, padding: NativePadding, truncation: NativeTruncation, device?: string | undefined | null): Promise<LazyTensor>
+  encodeBatchConcatTensor(texts: Array<string>, device?: string | undefined | null): Promise<LazyTensor>
   decode(ids: Array<number>): string
   decodeBatch(ids: Array<Array<number>>): Array<string>
 }

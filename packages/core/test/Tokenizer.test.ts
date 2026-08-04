@@ -52,6 +52,18 @@ onDevices("Tokenizer", () => (it) => {
       })
     )
 
+    it.effect("encodeBatchConcat flattens ragged encodings in order, no padding", () =>
+      Effect.gen(function* () {
+        const tokenizer = yield* trainBpe()
+        const texts = ["hello world", "the lazy dog"]
+        const flat = yield* tokenizer.encodeBatchConcat(texts)
+        expect(flat.dtype).toBe("u32")
+        expect(flat.shape.length).toBe(1)
+        const singles = yield* Effect.forEach(texts, (text) => Effect.flatMap(tokenizer.encode(text), numbers))
+        expect(yield* numbers(flat)).toEqual(singles.flat())
+      })
+    )
+
     it.effect("decodeBatch round-trips raw id arrays; vocab lookups are Options", () =>
       Effect.gen(function* () {
         const tokenizer = yield* trainBpe()
