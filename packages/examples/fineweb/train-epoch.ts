@@ -65,11 +65,7 @@ const program = Effect.gen(function* () {
       }),
     stop: ({ step }) => step >= chunkTarget,
     onStep: ({ step, loss, elapsed }) =>
-      step % 100 === 0 || step === 1
-        ? Effect.log(
-          `step ${String(step).padStart(5)}/${totalSteps}  loss ${loss.toFixed(4)}  ${(Duration.toMillis(elapsed) / 1000).toFixed(1)}s`
-        )
-        : Effect.void
+      Effect.log(`step ${String(step).padStart(5)}/${totalSteps}  loss ${loss.toFixed(4)}  ${(Duration.toMillis(elapsed) / 1000).toFixed(1)}s`)
   }))
 
   // A saved epoch checkpoint resumes bit-exactly; otherwise warm-start
