@@ -215,8 +215,8 @@ fn to_f32_vec(t: &MetalTensor) -> crate::err::Res<Vec<f32>> {
     } else {
         cast(&tc, DType::F32)?
     };
-    dev.synchronize();
-    Ok(t32.read_f32())
+    dev.synchronize()?;
+    Ok(t32.read_f32()?)
 }
 
 fn scalar_f64(t: &MetalTensor) -> crate::err::Res<f64> {

@@ -12,7 +12,7 @@ import { BLOCK, CHECKPOINT, createGpt, loadTokenizer, saveParams } from "./model
 const TRAIN_BIN = new URL("../data/fineweb-train.bin", import.meta.url).pathname
 const VAL_BIN = new URL("../data/fineweb-val.bin", import.meta.url).pathname
 
-const BATCH = 32
+const BATCH = 64
 const STEPS = 5000
 const LR = 6e-4
 const VAL_BATCHES = 20
@@ -62,11 +62,7 @@ const program = Effect.gen(function* () {
     data: () => sampleBatch(train),
     stop: ({ step }) => step >= STEPS,
     onStep: ({ step, loss, elapsed }) =>
-      step % 50 === 0 || step === 1
-        ? Effect.log(
-          `step ${String(step).padStart(4)}  loss ${loss.toFixed(4)}  ${(Duration.toMillis(elapsed) / 1000).toFixed(1)}s`
-        )
-        : Effect.void
+      Effect.log(`step ${String(step).padStart(4)}  loss ${loss.toFixed(4)}  ${(Duration.toMillis(elapsed) / 1000).toFixed(1)}s`)
   }))
   const trained = yield* trainer.train(params0)
   const params = trained.params

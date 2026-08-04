@@ -653,7 +653,7 @@ mod attn_probe {
         let kc = crate::runtime::cpu::Tensor::from_vec(pattern(20).iter().map(|x| x * 0.7).collect(), vec![1, 1, 5, 4]);
         let vc = crate::runtime::cpu::Tensor::from_vec(pattern(20).iter().map(|x| x * -0.5).collect(), vec![1, 1, 5, 4]);
         let oc = crate::runtime::cpu::composed::sdpa_forward(&qc, &kc, &vc, scale, true);
-        let gpu = o.read_f32();
+        let gpu = o.read_f32().unwrap();
         let cpu = crate::val::Val::Cpu(oc).to_f32_vec().unwrap();
         for (g, c) in gpu.iter().zip(&cpu) {
             assert!((g - c).abs() < 1e-5, "flash {g} vs composed {c}");

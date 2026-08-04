@@ -435,7 +435,7 @@ mod tests {
         let h = cast(dev, &x, DType::F16).unwrap();
         let back = cast(dev, &h, DType::F32).unwrap();
         dev.synchronize();
-        assert_eq!(back.read_f32(), vec![1.5, -2.25, 100.0]);
+        assert_eq!(back.read_f32().unwrap(), vec![1.5, -2.25, 100.0]);
     }
 
     #[test]
@@ -449,7 +449,7 @@ mod tests {
         };
         let c = strided_copy(dev, &p).unwrap();
         dev.synchronize();
-        assert_eq!(c.read_f32(), vec![0., 3., 1., 4., 2., 5.]);
+        assert_eq!(c.read_f32().unwrap(), vec![0., 3., 1., 4., 2., 5.]);
     }
 
     #[test]
@@ -458,8 +458,8 @@ mod tests {
         let a = randn(dev, &[8], 42).unwrap();
         let b = randn(dev, &[8], 42).unwrap();
         dev.synchronize();
-        assert_eq!(a.read_f32(), b.read_f32());
-        let m: f32 = a.read_f32().iter().sum::<f32>() / 8.0;
+        assert_eq!(a.read_f32().unwrap(), b.read_f32().unwrap());
+        let m: f32 = a.read_f32().unwrap().iter().sum::<f32>() / 8.0;
         assert!(m.abs() < 2.0);
     }
 
@@ -468,9 +468,9 @@ mod tests {
         let dev = MetalDevice::get();
         let a = arange(dev, 0.0, 5.0, 2.0, DType::F32).unwrap();
         dev.synchronize();
-        assert_eq!(a.read_f32(), vec![0., 2., 4.]);
+        assert_eq!(a.read_f32().unwrap(), vec![0., 2., 4.]);
         let e = eye(dev, 2, DType::F32).unwrap();
         dev.synchronize();
-        assert_eq!(e.read_f32(), vec![1., 0., 0., 1.]);
+        assert_eq!(e.read_f32().unwrap(), vec![1., 0., 0., 1.]);
     }
 }

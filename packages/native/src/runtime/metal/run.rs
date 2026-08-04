@@ -53,13 +53,13 @@ impl MetalTensor {
         self.layout.numel()
     }
 
-    pub fn read_f32(&self) -> Vec<f32> {
-        crate::runtime::metal::device::MetalDevice::get().synchronize();
-        self.buffer.read_f32(self.layout.offset(), self.numel())
+    pub fn read_f32(&self) -> crate::err::Res<Vec<f32>> {
+        crate::runtime::metal::device::MetalDevice::get().synchronize()?;
+        Ok(self.buffer.read_f32(self.layout.offset(), self.numel()))
     }
 
     pub fn to_u32_vec(&self) -> crate::err::Res<Vec<u32>> {
-        crate::runtime::metal::device::MetalDevice::get().synchronize();
+        crate::runtime::metal::device::MetalDevice::get().synchronize()?;
         let n = self.numel();
         let size = self.dtype.size_in_bytes();
         let ptr = unsafe { self.buffer.contents_ptr().cast::<u8>().add(self.layout.offset() * size) };
@@ -257,7 +257,7 @@ mod tests {
         let outs = run_elementwise(dev, &exprs, &[&ta, &tb], &[vec![6, 1], vec![6, 1]], &[], 24, &[4, 6]).unwrap();
         let expected = interpret_core::<f32>(&exprs, &[&a, &b], None, &[], 24, &[4, 6]);
         for (got, want) in outs.iter().zip(&expected) {
-            let g = got.read_f32();
+            let g = got.read_f32().unwrap();
             for (x, y) in g.iter().zip(want) {
                 assert!((x - y).abs() < 1e-5, "{x} vs {y}");
             }
@@ -275,7 +275,7 @@ mod tests {
         let strides = vec![vec![3, 1], vec![1, 0]];
         let outs = run_elementwise(dev, &exprs, &[&ta, &tb], &strides, &[], 6, &[2, 3]).unwrap();
         let expected = interpret_core::<f32>(&exprs, &[&a, &b], Some(&strides), &[], 6, &[2, 3]);
-        let g = outs[0].read_f32();
+        let g = outs[0].read_f32().unwrap();
         for (x, y) in g.iter().zip(&expected[0]) {
             assert!((x - y).abs() < 1e-5, "{x} vs {y}");
         }
@@ -290,7 +290,7 @@ mod tests {
         let expr = Expr::Mul(Box::new(Expr::Input(0)), Box::new(Expr::Input(0)));
         let out = run_reduce(dev, ReduceOp::Sum, &expr, &[&ta], &[vec![6, 1]], &[4, 6], &[1], false, &[4]).unwrap();
         let want = interpret_reduce_core::<f32>(ReduceOp::Sum, &expr, &[&a], &[vec![6, 1]], &[4, 6], &[1], false, &[4]);
-        let g = out.read_f32();
+        let g = out.read_f32().unwrap();
         for (x, y) in g.iter().zip(&want) {
             assert!((x - y).abs() / y.abs().max(1.0) < 1e-4, "{x} vs {y}");
         }

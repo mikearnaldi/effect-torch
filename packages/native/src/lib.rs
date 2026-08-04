@@ -449,7 +449,7 @@ fn readback_blocking(inner: &val::Val) -> Result<Readback> {
                 .map_err(to_napi_err)?
                 .clone()
             };
-            runtime::metal::device::MetalDevice::get().synchronize();
+            runtime::metal::device::MetalDevice::get().synchronize().map_err(to_napi_err)?;
             let base = t.buffer.contents_ptr() as *const u8;
             let offset = t.layout.offset() * t.dtype.size_in_bytes();
             let keep = val::Val::Metal(t);
@@ -7976,7 +7976,7 @@ pub async fn eval_lazy(
         // encoding and GPU execution (readback synchronizes itself).
         // The sync is device-global; one call covers every output.
         if let Some(first) = outputs.first() {
-            first.inner.synchronize();
+            first.inner.synchronize().map_err(to_napi_err)?;
         }
         // Deferred fused-CE status checks (would have split the
         // pipeline mid-walk).
@@ -9747,7 +9747,7 @@ impl DecodeProgram {
             // Synchronize once: per-root syncs would fully serialize
             // CPU encoding and GPU execution. Device-global: one call.
             if let Some(first) = outputs.first() {
-                first.inner.synchronize();
+                first.inner.synchronize().map_err(to_napi_err)?;
             }
             ev.run_ce_checks().map_err(to_napi_err)?;
             for (i, state) in slot_states.iter().enumerate() {
@@ -10066,7 +10066,7 @@ impl CompiledProgram {
             // the host synchronize at readback; device-side reuse needs
             // no host round-trip. Device-global: one call.
             if let Some(first) = outputs.first() {
-                first.inner.synchronize();
+                first.inner.synchronize().map_err(to_napi_err)?;
             }
             let t_sync = t1.elapsed() - t_encode;
             ev.run_ce_checks().map_err(to_napi_err)?;
@@ -10137,7 +10137,7 @@ pub async fn save_tensors(
         let mut map = std::collections::HashMap::with_capacity(names.len());
         for (name, node) in names.iter().zip(nodes.iter()) {
             let output = eval_node(node, cancelled, &mut ev).map_err(to_napi_err)?;
-            output.synchronize();
+            output.synchronize().map_err(to_napi_err)?;
             map.insert(name.clone(), output);
         }
         safetensors::save(&map, &path).map_err(to_napi_err)

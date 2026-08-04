@@ -150,15 +150,15 @@ mod tests {
             let composed = crate::runtime::metal::composed::rotary_forward(&x, &[0], 10000.0, 1.0).unwrap();
             let fused = super::metal::rotary(&x, &[0], 10000.0, 1.0).unwrap();
             dev.synchronize();
-            let a = composed.read_f32();
-            let bb = fused.read_f32();
+            let a = composed.read_f32().unwrap();
+            let bb = fused.read_f32().unwrap();
             let max_diff = a.iter().zip(bb.iter()).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
             assert!(max_diff < 1e-3, "shape {shape:?} max diff {max_diff}");
             // Backward: transpose rotation inverts the forward.
             let back = super::metal::rotary(&fused, &[0], 10000.0, -1.0).unwrap();
             dev.synchronize();
-            let x_vals = x.read_f32();
-            let rt = back.read_f32();
+            let x_vals = x.read_f32().unwrap();
+            let rt = back.read_f32().unwrap();
             let max_diff = x_vals.iter().zip(rt.iter()).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
             assert!(max_diff < 1e-3, "shape {shape:?} roundtrip max diff {max_diff}");
         }

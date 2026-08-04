@@ -311,7 +311,7 @@ mod tests {
         let w = MetalTensor::from_f32(dev, vec![1f32, 1.], vec![1, 1, 2]);
         let y = conv1d(dev, &x, &w, 1, 0, 1, 1).unwrap();
         dev.synchronize();
-        assert_eq!(y.read_f32(), vec![3., 5., 7.]);
+        assert_eq!(y.read_f32().unwrap(), vec![3., 5., 7.]);
     }
 
     #[test]
@@ -321,7 +321,7 @@ mod tests {
         let w = MetalTensor::from_f32(dev, vec![1f32, 0., 0., 1.], vec![1, 1, 2, 2]);
         let y = conv2d(dev, &x, &w, 1, 0, 1, 1).unwrap();
         dev.synchronize();
-        assert_eq!(y.read_f32(), vec![6., 8., 12., 14.]);
+        assert_eq!(y.read_f32().unwrap(), vec![6., 8., 12., 14.]);
     }
 
     #[test]
@@ -331,7 +331,7 @@ mod tests {
         let w = MetalTensor::from_f32(dev, vec![1f32, 1.], vec![1, 1, 2]);
         let y = conv_transpose1d(dev, &x, &w, 2, 0, 0, 1, 1).unwrap();
         dev.synchronize();
-        assert_eq!(y.read_f32(), vec![1., 1., 2., 2.]);
+        assert_eq!(y.read_f32().unwrap(), vec![1., 1., 2., 2.]);
     }
 
     #[test]
@@ -341,6 +341,6 @@ mod tests {
         let g = MetalTensor::from_f32(dev, vec![1f32, 1., 1., 1.], vec![1, 1, 2, 2]);
         let dw = conv2d_backward_w(dev, &x, &g, [2, 2], 1, 1, 0, 1, 1).unwrap();
         dev.synchronize();
-        assert_eq!(dw.read_f32(), vec![12., 16., 24., 28.]);
+        assert_eq!(dw.read_f32().unwrap(), vec![12., 16., 24., 28.]);
     }
 }

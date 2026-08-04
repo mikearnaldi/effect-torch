@@ -59,7 +59,7 @@ fn tensor_bytes(t: &Val) -> Res<Vec<u8>> {
             Ok(out)
         }
         Val::Metal(t) => {
-            runtime::metal::device::MetalDevice::get().synchronize();
+            runtime::metal::device::MetalDevice::get().synchronize()?;
             let n = t.numel();
             let size = t.dtype.size_in_bytes();
             let ptr = unsafe { t.buffer.contents_ptr().cast::<u8>().add(t.layout.offset() * size) };

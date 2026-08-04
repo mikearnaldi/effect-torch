@@ -59,10 +59,11 @@ impl Val {
         self.numel() * self.dtype().size_in_bytes()
     }
 
-    pub fn synchronize(&self) {
+    pub fn synchronize(&self) -> Res<()> {
         if self.is_metal() {
-            runtime::metal::device::MetalDevice::get().synchronize();
+            runtime::metal::device::MetalDevice::get().synchronize()?;
         }
+        Ok(())
     }
 
     pub fn to_f32_vec(&self) -> Res<Vec<f32>> {
@@ -80,8 +81,8 @@ impl Val {
                 } else {
                     runtime::metal::kernels::cast(dev, t, runtime::dtype::DType::F32)?
                 };
-                dev.synchronize();
-                Ok(t.read_f32())
+                dev.synchronize()?;
+                Ok(t.read_f32()?)
             }
         }
     }
@@ -110,7 +111,7 @@ impl Val {
             Val::Metal(t) => {
                 let dev = runtime::metal::device::MetalDevice::get();
                 let t = &runtime::metal::kernels::strided_copy(dev, t)?;
-                dev.synchronize();
+                dev.synchronize()?;
                 let n = t.numel();
                 let size = t.dtype.size_in_bytes();
                 let mut out = Vec::with_capacity(n);
@@ -154,7 +155,7 @@ impl Val {
             Val::Metal(t) => {
                 let dev = runtime::metal::device::MetalDevice::get();
                 let t = &runtime::metal::kernels::strided_copy(dev, t)?;
-                dev.synchronize();
+                dev.synchronize()?;
                 let n = t.numel();
                 let ptr = unsafe { t.buffer.contents_ptr().cast::<u8>().add(t.layout.offset() * t.dtype.size_in_bytes()) };
                 let bytes = unsafe { std::slice::from_raw_parts(ptr, n * t.dtype.size_in_bytes()) };

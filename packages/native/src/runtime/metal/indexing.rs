@@ -340,7 +340,7 @@ mod tests {
         let x = MetalTensor::from_f32(dev, (0..6).map(|v| v as f32).collect(), vec![2, 3]);
         let out = index_select(dev, &x, 1, &[2, 0]).unwrap();
         dev.synchronize();
-        assert_eq!(out.read_f32(), vec![2., 0., 5., 3.]);
+        assert_eq!(out.read_f32().unwrap(), vec![2., 0., 5., 3.]);
     }
 
     #[test]
@@ -349,7 +349,7 @@ mod tests {
         let x = MetalTensor::from_f32(dev, (0..6).map(|v| v as f32).collect(), vec![2, 3]);
         let out = gather(dev, &x, 0, &[1, 1, 1, 0, 0, 0, 1, 1, 1], &[3, 3]).unwrap();
         dev.synchronize();
-        assert_eq!(out.read_f32(), vec![3., 4., 5., 0., 1., 2., 3., 4., 5.]);
+        assert_eq!(out.read_f32().unwrap(), vec![3., 4., 5., 0., 1., 2., 3., 4., 5.]);
     }
 
     #[test]
@@ -359,7 +359,7 @@ mod tests {
         let src = MetalTensor::from_f32(dev, vec![1f32, 2., 3., 4.], vec![2, 2]);
         let out = scatter_add(dev, &table, 0, &[1, 1, 3, 3], &src).unwrap();
         dev.synchronize();
-        assert_eq!(out.read_f32(), vec![0., 0., 1., 2., 0., 0., 3., 4.]);
+        assert_eq!(out.read_f32().unwrap(), vec![0., 0., 1., 2., 0., 0., 3., 4.]);
     }
 
     #[test]
@@ -369,9 +369,9 @@ mod tests {
         let b = MetalTensor::from_f32(dev, vec![3f32, 4.], vec![1, 2]);
         let c = cat(dev, &[&a, &b], 0).unwrap();
         dev.synchronize();
-        assert_eq!(c.read_f32(), vec![1., 2., 3., 4.]);
+        assert_eq!(c.read_f32().unwrap(), vec![1., 2., 3., 4.]);
         let d = cat(dev, &[&a, &a], 1).unwrap();
         dev.synchronize();
-        assert_eq!(d.read_f32(), vec![1., 2., 1., 2.]);
+        assert_eq!(d.read_f32().unwrap(), vec![1., 2., 1., 2.]);
     }
 }

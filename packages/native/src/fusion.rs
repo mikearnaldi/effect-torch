@@ -668,7 +668,7 @@ mod metal {
             let packed = crate::runtime::metal::indexing::cat(dev, &refs, 0)?;
             (Some(packed.buffer.clone()), scalars.len())
         } else {
-            dev.synchronize();
+            dev.synchronize()?;
             let vals: Vec<f32> = scalars
                 .iter()
                 .map(|v| v.to_f32_vec().map(|x| x[0]))

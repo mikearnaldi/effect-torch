@@ -152,12 +152,24 @@ impl EncoderManager {
         }
     }
 
-    fn synchronize(&mut self) {
+    fn synchronize(&mut self) -> crate::err::Res<()> {
         self.commit();
         if let Some(last) = self.in_flight.last() {
             last.waitUntilCompleted();
+            let status = last.status();
+            if status != objc2_metal::MTLCommandBufferStatus::Completed {
+                let description = last
+                    .error()
+                    .map(|e| e.localizedDescription().to_string())
+                    .unwrap_or_else(|| "unknown error".to_string());
+                self.in_flight.clear();
+                return Err(format!(
+                    "metal: GPU command buffer failed ({description}) — GPU work was lost; this is usually device memory exhaustion"
+                ));
+            }
         }
         self.in_flight.clear();
+        Ok(())
     }
 }
 
@@ -327,17 +339,18 @@ impl MetalDevice {
     }
 
     #[track_caller]
-    pub fn synchronize(&self) {
+    pub fn synchronize(&self) -> crate::err::Res<()> {
         let t = std::time::Instant::now();
         if std::env::var_os("EFFECT_TORCH_SYNC_TRACE").is_some() {
             eprintln!("[sync] {}", std::panic::Location::caller());
         }
-        self.encoder.lock().unwrap().synchronize();
+        self.encoder.lock().unwrap().synchronize()?;
         // The GPU has consumed everything submitted so far; retired
         // uploads may return to the pool.
         self.retired.lock().unwrap().clear();
         SYNCS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         SYNC_NANOS.fetch_add(t.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+        Ok(())
     }
 
     pub fn grid(width: usize, height: usize, depth: usize) -> MTLSize {

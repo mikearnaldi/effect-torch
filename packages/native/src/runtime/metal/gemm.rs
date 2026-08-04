@@ -173,7 +173,7 @@ mod tests {
         let tb = MetalTensor::from_f32(dev, b.clone(), vec![k, n]);
         let out = gemm(dev, &ta, &tb, None, 1, m, n, k, m * k, k * n).unwrap();
         dev.synchronize();
-        let got = out.read_f32();
+        let got = out.read_f32().unwrap();
         let mut want = vec![0f32; m * n];
         unsafe {
             matrixmultiply::sgemm(m, k, n, 1.0, a.as_ptr(), k as isize, 1, b.as_ptr(), n as isize, 1, 0.0, want.as_mut_ptr(), n as isize, 1);
@@ -195,7 +195,7 @@ mod tests {
         let tbias = MetalTensor::from_f32(dev, bias, vec![n]);
         let out = gemm(dev, &ta, &tb, Some(&tbias), batch, m, n, k, m * k, 0).unwrap();
         dev.synchronize();
-        let got = out.read_f32();
+        let got = out.read_f32().unwrap();
         for (i, v) in got.iter().enumerate() {
             let j = i % n;
             assert_eq!(*v, 8.0 * 0.5 + j as f32, "index {i}");
