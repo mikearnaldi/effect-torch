@@ -13,7 +13,6 @@ use crate::runtime::dtype::DType;
 use crate::runtime::metal::device::MetalDevice;
 #[cfg(target_os = "macos")]
 use crate::runtime::metal::run::MetalTensor;
-#[cfg(any(target_os = "macos", feature = "cuda"))]
 
 /// Row-major contiguous strides of `shape`, in elements.
 pub fn contiguous_strides(shape: &[usize]) -> Vec<usize> {

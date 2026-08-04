@@ -266,26 +266,10 @@ fn get_device(device: Option<String>) -> Result<Device> {
                 ))
             }
         }
-        "cuda" => {
-            #[cfg(feature = "cuda")]
-            {
-                static CUDA: OnceLock<Device> = OnceLock::new();
-                match CUDA.get() {
-                    Some(device) => Ok(device.clone()),
-                    None => {
-                        let device = Device::new_cuda(0).map_err(to_napi_err)?;
-                        Ok(CUDA.get_or_init(|| device).clone())
-                    }
-                }
-            }
-            #[cfg(not(feature = "cuda"))]
-            {
-                Err(Error::new(
-                    Status::InvalidArg,
-                    "cuda support is not compiled in, rebuild with --features cuda".to_string(),
-                ))
-            }
-        }
+        "cuda" => Err(Error::new(
+            Status::InvalidArg,
+            "cuda is not a supported device (supported: cpu, metal)".to_string(),
+        )),
         other => Err(Error::new(
             Status::InvalidArg,
             format!("unsupported device: {other}"),

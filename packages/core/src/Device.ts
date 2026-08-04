@@ -7,7 +7,7 @@ import native from "@effect-torch/native"
  * @since 0.1.0
  * @category models
  */
-export type DeviceKind = "cpu" | "metal" | "cuda"
+export type DeviceKind = "cpu" | "metal"
 
 /**
  * The device on which new tensors are created. Every tensor constructor
@@ -47,15 +47,6 @@ export const Cpu: Layer.Layer<CurrentDevice> = layer("cpu")
 export const Metal: Layer.Layer<CurrentDevice> = layer("metal")
 
 /**
- * Provides {@link CurrentDevice} with the CUDA device (requires a build with
- * the `cuda` feature).
- *
- * @since 0.1.0
- * @category layers
- */
-export const Cuda: Layer.Layer<CurrentDevice> = layer("cuda")
-
-/**
  * Checks whether a device is available on this machine and build.
  *
  * @since 0.1.0
@@ -66,7 +57,7 @@ export const isAvailable = (device: DeviceKind): Effect.Effect<boolean> =>
 
 /**
  * Provides {@link CurrentDevice} with the best available device, probing in
- * priority order: CUDA, then Metal, falling back to CPU.
+ * priority order: Metal, falling back to CPU.
  *
  * @since 0.1.0
  * @category layers
@@ -74,7 +65,6 @@ export const isAvailable = (device: DeviceKind): Effect.Effect<boolean> =>
 export const Best: Layer.Layer<CurrentDevice> = Layer.effect(
   CurrentDevice,
   Effect.gen(function* () {
-    if (yield* isAvailable("cuda")) return "cuda" as const
     if (yield* isAvailable("metal")) return "metal" as const
     return "cpu" as const
   })
