@@ -1,10 +1,10 @@
 //! Elementwise expression IR and single-kernel fusion (RFC 0007).
 //!
 //! A fused region is a small scalar expression DAG over named input lanes.
-//! On Metal it is lowered to a `ug` SSA kernel, compiled once per distinct
-//! expression (cached) and launched over the flattened input buffers; on
-//! CPU the same IR is interpreted per element in a single pass. GPU fusion
-//! is f32-only (the `ug` SSA has no f64 constants and Metal has no f64);
+//! On Metal it is lowered to an SSA-form MSL kernel by the first-party
+//! emitter (`runtime::metal::emit`), compiled once per distinct expression
+//! (cached) and launched over the flattened input buffers; on CPU the same
+//! IR is interpreted per element in a single pass. GPU fusion is f32-only;
 //! the CPU interpreter covers f32 and f64.
 
 use crate::dev::Device;
@@ -14,8 +14,6 @@ use crate::runtime::metal::device::MetalDevice;
 #[cfg(target_os = "macos")]
 use crate::runtime::metal::run::MetalTensor;
 #[cfg(any(target_os = "macos", feature = "cuda"))]
-
-const BLOCK: usize = 256;
 
 /// Row-major contiguous strides of `shape`, in elements.
 pub fn contiguous_strides(shape: &[usize]) -> Vec<usize> {

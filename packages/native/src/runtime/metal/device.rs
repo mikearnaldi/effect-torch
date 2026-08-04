@@ -134,7 +134,7 @@ impl EncoderManager {
         // recycles buffers across dispatches, so every dispatch must be
         // ordered after the previous one.
         if let Some((_, encoder)) = &self.current {
-            unsafe { encoder.memoryBarrierWithScope(objc2_metal::MTLBarrierScope::Buffers) };
+            encoder.memoryBarrierWithScope(objc2_metal::MTLBarrierScope::Buffers);
         }
         self.count += 1;
         DISPATCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -297,6 +297,7 @@ impl MetalDevice {
             return Ok(p.clone());
         }
         let opts = objc2_metal::MTLCompileOptions::new();
+        #[allow(deprecated)]
         opts.setFastMathEnabled(false);
         let src_ns = objc2_foundation::NSString::from_str(source);
         let lib = self

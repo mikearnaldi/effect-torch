@@ -9,10 +9,6 @@ pub enum Val {
 }
 
 impl Val {
-    pub fn is_cpu(&self) -> bool {
-        matches!(self, Val::Cpu(_))
-    }
-
     pub fn is_metal(&self) -> bool {
         matches!(self, Val::Metal(_))
     }
@@ -57,10 +53,6 @@ impl Val {
             Val::Cpu(t) => t.numel(),
             Val::Metal(t) => t.numel(),
         }
-    }
-
-    pub fn rank(&self) -> usize {
-        self.shape().len()
     }
 
     pub fn byte_size(&self) -> usize {

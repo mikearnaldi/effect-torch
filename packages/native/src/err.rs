@@ -11,3 +11,4 @@ pub fn err_str(msg: impl Into<String>) -> String {
 pub fn to_napi_err(e: String) -> napi::Error {
     napi::Error::new(napi::Status::GenericFailure, e)
 }
+

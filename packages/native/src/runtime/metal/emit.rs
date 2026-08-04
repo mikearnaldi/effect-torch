@@ -84,7 +84,7 @@ fn emit_expr_ssa(
         Expr::Const(bits) => return f32_lit(f64::from_bits(*bits)),
         _ => {}
     }
-    let mut s = |x: &Expr, body: &mut String, next: &mut usize, memo: &mut std::collections::HashMap<usize, String>| {
+    let s = |x: &Expr, body: &mut String, next: &mut usize, memo: &mut std::collections::HashMap<usize, String>| {
         emit_expr_ssa(x, lane, num_inputs, body, next, memo)
     };
     let rhs = match e {

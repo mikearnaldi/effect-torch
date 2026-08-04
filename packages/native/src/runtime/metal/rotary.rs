@@ -147,7 +147,7 @@ mod tests {
             let (b, h, t, d) = shape;
             let data: Vec<f32> = (0..b * h * t * d).map(|i| i as f32).collect();
             let x = MT::from_f32(dev, data, vec![b, h, t, d]);
-            let composed = crate::metal_native::composed::rotary_forward(&x, &[0], 10000.0, 1.0).unwrap();
+            let composed = crate::runtime::metal::composed::rotary_forward(&x, &[0], 10000.0, 1.0).unwrap();
             let fused = super::metal::rotary(&x, &[0], 10000.0, 1.0).unwrap();
             dev.synchronize();
             let a = composed.read_f32();

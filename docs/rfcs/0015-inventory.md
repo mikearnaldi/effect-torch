@@ -67,7 +67,23 @@
 Every op the evaluator can dispatch, its current dispatch path, and
 what the native backend must provide. Layout notes cover only what the
 evaluator actually produces (view ops emit arbitrary strided layouts;
-semantic kernels pre-flatten).
+semantic kernels pre-flatten). The per-section "Today:" lines are the
+phase-0 snapshot (pre-deletion) and are kept for reference.
+
+## File map (post-deletion)
+
+- `src/`: `lib.rs` (graph + evaluator + dispatch arms), `val.rs`
+  (eval value type), `dev.rs`, `err.rs`, `fusion.rs` (fusion IR +
+  CPU interpreter + Metal runner glue), `safetensors.rs`,
+  `tokenizer.rs`.
+- `src/runtime/cpu/`: the CPU backend (tensor, ops, reduce, matmul,
+  indexing, linalg, conv, composed, pool, random).
+- `src/runtime/metal/`: the Metal backend — `device` (allocator,
+  encoder manager, pipeline cache), `emit` (IR→MSL emitter), `run`
+  (MetalTensor + fused runners), `kernels`/`indexing`/`conv`/`gemm`
+  (primitive kernels), `ops` (evaluator dispatch helpers), `composed`
+  (composite fallbacks), `flash`/`loss`/`layer_norm`/`rotary`/`paged`/
+  `linear` (semantic fused kernels).
 
 ## 1. No kernel needed (graph/metadata)
 
@@ -93,7 +109,7 @@ Backend: fill kernels (Metal), host writes (CPU), seeded RNG
 `Neg`, `Abs`, `Sqrt`, `Exp`, `Log`, `Sin`, `Cos`, `Tanh`, `Relu`,
 `Erf`, `Floor`, `Ceil`, `Round`, `Sign`, `Cast`.
 
-- Today: unfused → candle binary/unary kernels; fused → ug via fusion.rs.
+
 - Native: fusion IR → MSL emitter (Metal), IR interpreter (CPU —
   already first-party). Unfused singletons lower to the same emitter
   (a 1-op region), so there is exactly one elementwise code path.
@@ -159,7 +175,7 @@ strided copies (§6) + matmul (§5). No conv kernels, matching the
 
 `FusedElementwise`, `FusedElementwiseMulti`, `FusedReduce`.
 
-- Today: IR → ug → MSL / CPU interpreter.
+
 - Native: IR → first-party MSL emitter (unchanged IR, unchanged CPU
   interpreter). The emitter is the only genuinely new compiler piece:
   expression ops ≈ 30, vectorized 128-bit loads, f16/bf16 lanes,

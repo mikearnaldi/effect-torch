@@ -1,4 +1,3 @@
-pub mod composed;
 
 use crate::fusion::{Expr, ReduceOp};
 use crate::runtime::dtype::DType;

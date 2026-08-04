@@ -10,21 +10,14 @@ use std::sync::{Arc, LazyLock, Mutex, OnceLock};
 mod dev;
 mod safetensors;
 mod err;
-mod metal_native;
 mod val;
 mod fusion;
-mod flash;
-mod gemm;
-mod layer_norm;
-mod loss;
-mod paged;
-mod rotary;
 mod runtime;
 mod tokenizer;
 
-fn to_napi_err(err: String) -> Error {
-    Error::new(Status::GenericFailure, err)
-}
+use runtime::metal::{composed, flash, layer_norm, linear, loss, paged, rotary};
+use runtime::metal::ops as metal_ops;
+use err::to_napi_err;
 
 fn to_join_err(err: tokio::task::JoinError) -> Error {
     Error::new(Status::GenericFailure, err.to_string())
@@ -3016,7 +3009,7 @@ impl Evaluator {
         }
         let cast = match self.value(id)? {
             val::Val::Cpu(t) => val::Val::Cpu(t.cast(dtype)),
-            val::Val::Metal(t) => val::Val::Metal(metal_native::cast(&t, dtype)?),
+            val::Val::Metal(t) => val::Val::Metal(metal_ops::cast(&t, dtype)?),
         };
         self.step_scalars.insert(key, cast.clone());
         Ok(cast)
@@ -3816,44 +3809,44 @@ fn adamw_native(
     eps: f64,
     weight_decay: f64,
 ) -> crate::err::Res<(runtime::metal::run::MetalTensor, runtime::metal::run::MetalTensor, runtime::metal::run::MetalTensor)> {
-    let b1 = metal_native::fill(m.layout.shape(), beta1, m.dtype)?;
-    let ob1 = metal_native::fill(g.layout.shape(), 1.0 - beta1, g.dtype)?;
-    let next_m = metal_native::binary(
-        &metal_native::binary(m, &b1, metal_native::BinOp::Mul)?,
-        &metal_native::binary(g, &ob1, metal_native::BinOp::Mul)?,
-        metal_native::BinOp::Add,
+    let b1 = metal_ops::fill(m.layout.shape(), beta1, m.dtype)?;
+    let ob1 = metal_ops::fill(g.layout.shape(), 1.0 - beta1, g.dtype)?;
+    let next_m = metal_ops::binary(
+        &metal_ops::binary(m, &b1, metal_ops::BinOp::Mul)?,
+        &metal_ops::binary(g, &ob1, metal_ops::BinOp::Mul)?,
+        metal_ops::BinOp::Add,
     )?;
-    let b2 = metal_native::fill(v.layout.shape(), beta2, v.dtype)?;
-    let ob2 = metal_native::fill(g.layout.shape(), 1.0 - beta2, g.dtype)?;
-    let gg = metal_native::binary(g, g, metal_native::BinOp::Mul)?;
-    let next_v = metal_native::binary(
-        &metal_native::binary(v, &b2, metal_native::BinOp::Mul)?,
-        &metal_native::binary(&gg, &ob2, metal_native::BinOp::Mul)?,
-        metal_native::BinOp::Add,
+    let b2 = metal_ops::fill(v.layout.shape(), beta2, v.dtype)?;
+    let ob2 = metal_ops::fill(g.layout.shape(), 1.0 - beta2, g.dtype)?;
+    let gg = metal_ops::binary(g, g, metal_ops::BinOp::Mul)?;
+    let next_v = metal_ops::binary(
+        &metal_ops::binary(v, &b2, metal_ops::BinOp::Mul)?,
+        &metal_ops::binary(&gg, &ob2, metal_ops::BinOp::Mul)?,
+        metal_ops::BinOp::Add,
     )?;
-    let m_hat = metal_native::binary(&next_m, c1, metal_native::BinOp::Div)?;
-    let v_hat = metal_native::binary(&next_v, c2, metal_native::BinOp::Div)?;
-    let denom = metal_native::binary(
-        &metal_native::unary(&v_hat, metal_native::UnOp::Sqrt)?,
-        &metal_native::fill(v_hat.layout.shape(), eps, v_hat.dtype)?,
-        metal_native::BinOp::Add,
+    let m_hat = metal_ops::binary(&next_m, c1, metal_ops::BinOp::Div)?;
+    let v_hat = metal_ops::binary(&next_v, c2, metal_ops::BinOp::Div)?;
+    let denom = metal_ops::binary(
+        &metal_ops::unary(&v_hat, metal_ops::UnOp::Sqrt)?,
+        &metal_ops::fill(v_hat.layout.shape(), eps, v_hat.dtype)?,
+        metal_ops::BinOp::Add,
     )?;
-    let adjusted = metal_native::binary(
-        &metal_native::binary(&m_hat, &denom, metal_native::BinOp::Div)?,
+    let adjusted = metal_ops::binary(
+        &metal_ops::binary(&m_hat, &denom, metal_ops::BinOp::Div)?,
         lr,
-        metal_native::BinOp::Mul,
+        metal_ops::BinOp::Mul,
     )?;
     // p * (1 - lr * weight_decay) - adjusted, factored as
     // p - p * (lr * weight_decay) - adjusted.
     let next_p = if weight_decay == 0.0 {
-        metal_native::binary(p, &adjusted, metal_native::BinOp::Sub)?
+        metal_ops::binary(p, &adjusted, metal_ops::BinOp::Sub)?
     } else {
-        let wd = metal_native::fill(lr.layout.shape(), weight_decay, lr.dtype)?;
-        let decay = metal_native::binary(p, &metal_native::binary(lr, &wd, metal_native::BinOp::Mul)?, metal_native::BinOp::Mul)?;
-        metal_native::binary(
-            &metal_native::binary(p, &decay, metal_native::BinOp::Sub)?,
+        let wd = metal_ops::fill(lr.layout.shape(), weight_decay, lr.dtype)?;
+        let decay = metal_ops::binary(p, &metal_ops::binary(lr, &wd, metal_ops::BinOp::Mul)?, metal_ops::BinOp::Mul)?;
+        metal_ops::binary(
+            &metal_ops::binary(p, &decay, metal_ops::BinOp::Sub)?,
             &adjusted,
-            metal_native::BinOp::Sub,
+            metal_ops::BinOp::Sub,
         )?
     };
     Ok((next_p, next_m, next_v))
@@ -3960,7 +3953,7 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> crate::err::Res<val::V
             if device.is_cpu() {
                 val::Val::Cpu(runtime::cpu::Tensor::zeros(shape, *dtype))
             } else {
-                val::Val::Metal(metal_native::fill(shape, 0.0, *dtype)?)
+                val::Val::Metal(metal_ops::fill(shape, 0.0, *dtype)?)
             }
         }
         NodeKind::Ones {
@@ -3971,7 +3964,7 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> crate::err::Res<val::V
             if device.is_cpu() {
                 val::Val::Cpu(runtime::cpu::Tensor::ones(shape, *dtype))
             } else {
-                val::Val::Metal(metal_native::fill(shape, 1.0, *dtype)?)
+                val::Val::Metal(metal_ops::fill(shape, 1.0, *dtype)?)
             }
         }
         NodeKind::Full {
@@ -3983,7 +3976,7 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> crate::err::Res<val::V
             if device.is_cpu() {
                 val::Val::Cpu(runtime::cpu::Tensor::full(shape, *value, *dtype))
             } else {
-                val::Val::Metal(metal_native::fill(shape, *value, *dtype)?)
+                val::Val::Metal(metal_ops::fill(shape, *value, *dtype)?)
             }
         }
         NodeKind::Randn {
@@ -3996,8 +3989,8 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> crate::err::Res<val::V
             } else {
                 static SEED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(299792458);
                 let seed = SEED.fetch_add(1, Ordering::Relaxed);
-                let t = metal_native::randn(shape, seed)?;
-                val::Val::Metal(metal_native::cast(&t, *dtype)?)
+                let t = metal_ops::randn(shape, seed)?;
+                val::Val::Metal(metal_ops::cast(&t, *dtype)?)
             }
         }
         NodeKind::Uniform {
@@ -4012,8 +4005,8 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> crate::err::Res<val::V
             } else {
                 static SEED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(78778899);
                 let seed = SEED.fetch_add(1, Ordering::Relaxed);
-                let t = metal_native::uniform(*lo, *hi, shape, seed)?;
-                val::Val::Metal(metal_native::cast(&t, *dtype)?)
+                let t = metal_ops::uniform(*lo, *hi, shape, seed)?;
+                val::Val::Metal(metal_ops::cast(&t, *dtype)?)
             }
         }
         NodeKind::Arange {
@@ -4026,14 +4019,14 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> crate::err::Res<val::V
             if device.is_cpu() {
                 val::Val::Cpu(runtime::cpu::Tensor::arange(*start, *end, *step, *dtype))
             } else {
-                val::Val::Metal(metal_native::arange(*start, *end, *step, *dtype)?)
+                val::Val::Metal(metal_ops::arange(*start, *end, *step, *dtype)?)
             }
         }
         NodeKind::Eye { n, dtype, device } => {
             if device.is_cpu() {
                 val::Val::Cpu(runtime::cpu::Tensor::eye(*n, *dtype))
             } else {
-                val::Val::Metal(metal_native::eye(*n, *dtype)?)
+                val::Val::Metal(metal_ops::eye(*n, *dtype)?)
             }
         }
         NodeKind::Add { a, b } => {
@@ -4042,7 +4035,7 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> crate::err::Res<val::V
             match (&a, &b) {
                 (val::Val::Cpu(x), val::Val::Cpu(y)) => val::Val::Cpu(x.add(y)),
                 (val::Val::Metal(x), val::Val::Metal(y)) => {
-                    val::Val::Metal(metal_native::binary_promote(x, y, metal_native::BinOp::Add)?)
+                    val::Val::Metal(metal_ops::binary_promote(x, y, metal_ops::BinOp::Add)?)
                 }
                 _ => return Err("device mismatch".to_string()),
             }
@@ -4053,7 +4046,7 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> crate::err::Res<val::V
             match (&a, &b) {
                 (val::Val::Cpu(x), val::Val::Cpu(y)) => val::Val::Cpu(x.sub(y)),
                 (val::Val::Metal(x), val::Val::Metal(y)) => {
-                    val::Val::Metal(metal_native::binary_promote(x, y, metal_native::BinOp::Sub)?)
+                    val::Val::Metal(metal_ops::binary_promote(x, y, metal_ops::BinOp::Sub)?)
                 }
                 _ => return Err("device mismatch".to_string()),
             }
@@ -4064,7 +4057,7 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> crate::err::Res<val::V
             match (&a, &b) {
                 (val::Val::Cpu(x), val::Val::Cpu(y)) => val::Val::Cpu(x.mul(y)),
                 (val::Val::Metal(x), val::Val::Metal(y)) => {
-                    val::Val::Metal(metal_native::binary_promote(x, y, metal_native::BinOp::Mul)?)
+                    val::Val::Metal(metal_ops::binary_promote(x, y, metal_ops::BinOp::Mul)?)
                 }
                 _ => return Err("device mismatch".to_string()),
             }
@@ -4075,7 +4068,7 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> crate::err::Res<val::V
             match (&a, &b) {
                 (val::Val::Cpu(x), val::Val::Cpu(y)) => val::Val::Cpu(x.div(y)),
                 (val::Val::Metal(x), val::Val::Metal(y)) => {
-                    val::Val::Metal(metal_native::binary_promote(x, y, metal_native::BinOp::Div)?)
+                    val::Val::Metal(metal_ops::binary_promote(x, y, metal_ops::BinOp::Div)?)
                 }
                 _ => return Err("device mismatch".to_string()),
             }
@@ -4085,7 +4078,7 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> crate::err::Res<val::V
             match (&x, &y) {
                 (val::Val::Cpu(a), val::Val::Cpu(b)) => val::Val::Cpu(a.eq(b)),
                 (val::Val::Metal(a), val::Val::Metal(b)) => {
-                    val::Val::Metal(metal_native::compare(a, b, metal_native::BinOp::Eq)?)
+                    val::Val::Metal(metal_ops::compare(a, b, metal_ops::BinOp::Eq)?)
                 }
                 _ => return Err("device mismatch".to_string()),
             }
@@ -4095,7 +4088,7 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> crate::err::Res<val::V
             match (&x, &y) {
                 (val::Val::Cpu(a), val::Val::Cpu(b)) => val::Val::Cpu(a.gt(b)),
                 (val::Val::Metal(a), val::Val::Metal(b)) => {
-                    val::Val::Metal(metal_native::compare(a, b, metal_native::BinOp::Gt)?)
+                    val::Val::Metal(metal_ops::compare(a, b, metal_ops::BinOp::Gt)?)
                 }
                 _ => return Err("device mismatch".to_string()),
             }
@@ -4105,7 +4098,7 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> crate::err::Res<val::V
             match (&x, &y) {
                 (val::Val::Cpu(a), val::Val::Cpu(b)) => val::Val::Cpu(a.lt(b)),
                 (val::Val::Metal(a), val::Val::Metal(b)) => {
-                    val::Val::Metal(metal_native::compare(a, b, metal_native::BinOp::Lt)?)
+                    val::Val::Metal(metal_ops::compare(a, b, metal_ops::BinOp::Lt)?)
                 }
                 _ => return Err("device mismatch".to_string()),
             }
@@ -4115,7 +4108,7 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> crate::err::Res<val::V
             match (&x, &y) {
                 (val::Val::Cpu(a), val::Val::Cpu(b)) => val::Val::Cpu(a.ge(b)),
                 (val::Val::Metal(a), val::Val::Metal(b)) => {
-                    val::Val::Metal(metal_native::compare(a, b, metal_native::BinOp::Ge)?)
+                    val::Val::Metal(metal_ops::compare(a, b, metal_ops::BinOp::Ge)?)
                 }
                 _ => return Err("device mismatch".to_string()),
             }
@@ -4125,7 +4118,7 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> crate::err::Res<val::V
             match (&x, &y) {
                 (val::Val::Cpu(a), val::Val::Cpu(b)) => val::Val::Cpu(a.le(b)),
                 (val::Val::Metal(a), val::Val::Metal(b)) => {
-                    val::Val::Metal(metal_native::compare(a, b, metal_native::BinOp::Le)?)
+                    val::Val::Metal(metal_ops::compare(a, b, metal_ops::BinOp::Le)?)
                 }
                 _ => return Err("device mismatch".to_string()),
             }
@@ -4135,7 +4128,7 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> crate::err::Res<val::V
             match (&x, &y) {
                 (val::Val::Cpu(a), val::Val::Cpu(b)) => val::Val::Cpu(a.maximum(b)),
                 (val::Val::Metal(a), val::Val::Metal(b)) => {
-                    val::Val::Metal(metal_native::binary_promote(a, b, metal_native::BinOp::Max)?)
+                    val::Val::Metal(metal_ops::binary_promote(a, b, metal_ops::BinOp::Max)?)
                 }
                 _ => return Err("device mismatch".to_string()),
             }
@@ -4145,7 +4138,7 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> crate::err::Res<val::V
             match (&x, &y) {
                 (val::Val::Cpu(a), val::Val::Cpu(b)) => val::Val::Cpu(a.minimum(b)),
                 (val::Val::Metal(a), val::Val::Metal(b)) => {
-                    val::Val::Metal(metal_native::binary_promote(a, b, metal_native::BinOp::Min)?)
+                    val::Val::Metal(metal_ops::binary_promote(a, b, metal_ops::BinOp::Min)?)
                 }
                 _ => return Err("device mismatch".to_string()),
             }
@@ -4154,98 +4147,98 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> crate::err::Res<val::V
             let x = ev.value(a.id)?;
             match &x {
                 val::Val::Cpu(t) => val::Val::Cpu(t.neg()),
-                val::Val::Metal(t) => val::Val::Metal(metal_native::unary_promote(t, metal_native::UnOp::Neg)?),
+                val::Val::Metal(t) => val::Val::Metal(metal_ops::unary_promote(t, metal_ops::UnOp::Neg)?),
             }
         }
         NodeKind::Abs { a } => {
             let x = ev.value(a.id)?;
             match &x {
                 val::Val::Cpu(t) => val::Val::Cpu(t.abs()),
-                val::Val::Metal(t) => val::Val::Metal(metal_native::unary_promote(t, metal_native::UnOp::Abs)?),
+                val::Val::Metal(t) => val::Val::Metal(metal_ops::unary_promote(t, metal_ops::UnOp::Abs)?),
             }
         }
         NodeKind::Sqrt { a } => {
             let x = ev.value(a.id)?;
             match &x {
                 val::Val::Cpu(t) => val::Val::Cpu(t.sqrt()),
-                val::Val::Metal(t) => val::Val::Metal(metal_native::unary_promote(t, metal_native::UnOp::Sqrt)?),
+                val::Val::Metal(t) => val::Val::Metal(metal_ops::unary_promote(t, metal_ops::UnOp::Sqrt)?),
             }
         }
         NodeKind::Exp { a } => {
             let x = ev.value(a.id)?;
             match &x {
                 val::Val::Cpu(t) => val::Val::Cpu(t.exp()),
-                val::Val::Metal(t) => val::Val::Metal(metal_native::unary_promote(t, metal_native::UnOp::Exp)?),
+                val::Val::Metal(t) => val::Val::Metal(metal_ops::unary_promote(t, metal_ops::UnOp::Exp)?),
             }
         }
         NodeKind::Log { a } => {
             let x = ev.value(a.id)?;
             match &x {
                 val::Val::Cpu(t) => val::Val::Cpu(t.log()),
-                val::Val::Metal(t) => val::Val::Metal(metal_native::unary_promote(t, metal_native::UnOp::Log)?),
+                val::Val::Metal(t) => val::Val::Metal(metal_ops::unary_promote(t, metal_ops::UnOp::Log)?),
             }
         }
         NodeKind::Sin { a } => {
             let x = ev.value(a.id)?;
             match &x {
                 val::Val::Cpu(t) => val::Val::Cpu(t.sin()),
-                val::Val::Metal(t) => val::Val::Metal(metal_native::unary_promote(t, metal_native::UnOp::Sin)?),
+                val::Val::Metal(t) => val::Val::Metal(metal_ops::unary_promote(t, metal_ops::UnOp::Sin)?),
             }
         }
         NodeKind::Cos { a } => {
             let x = ev.value(a.id)?;
             match &x {
                 val::Val::Cpu(t) => val::Val::Cpu(t.cos()),
-                val::Val::Metal(t) => val::Val::Metal(metal_native::unary_promote(t, metal_native::UnOp::Cos)?),
+                val::Val::Metal(t) => val::Val::Metal(metal_ops::unary_promote(t, metal_ops::UnOp::Cos)?),
             }
         }
         NodeKind::Tanh { a } => {
             let x = ev.value(a.id)?;
             match &x {
                 val::Val::Cpu(t) => val::Val::Cpu(t.tanh()),
-                val::Val::Metal(t) => val::Val::Metal(metal_native::unary_promote(t, metal_native::UnOp::Tanh)?),
+                val::Val::Metal(t) => val::Val::Metal(metal_ops::unary_promote(t, metal_ops::UnOp::Tanh)?),
             }
         }
         NodeKind::Relu { a } => {
             let a = ev.value(a.id)?;
             match &a {
                 val::Val::Cpu(t) => val::Val::Cpu(t.relu()),
-                val::Val::Metal(t) => val::Val::Metal(metal_native::relu(t)?),
+                val::Val::Metal(t) => val::Val::Metal(metal_ops::relu(t)?),
             }
         }
         NodeKind::Erf { a } => {
             let x = ev.value(a.id)?;
             match &x {
                 val::Val::Cpu(t) => val::Val::Cpu(t.erf()),
-                val::Val::Metal(t) => val::Val::Metal(metal_native::unary_promote(t, metal_native::UnOp::Erf)?),
+                val::Val::Metal(t) => val::Val::Metal(metal_ops::unary_promote(t, metal_ops::UnOp::Erf)?),
             }
         }
         NodeKind::Floor { a } => {
             let x = ev.value(a.id)?;
             match &x {
                 val::Val::Cpu(t) => val::Val::Cpu(t.floor()),
-                val::Val::Metal(t) => val::Val::Metal(metal_native::unary_promote(t, metal_native::UnOp::Floor)?),
+                val::Val::Metal(t) => val::Val::Metal(metal_ops::unary_promote(t, metal_ops::UnOp::Floor)?),
             }
         }
         NodeKind::Ceil { a } => {
             let x = ev.value(a.id)?;
             match &x {
                 val::Val::Cpu(t) => val::Val::Cpu(t.ceil()),
-                val::Val::Metal(t) => val::Val::Metal(metal_native::unary_promote(t, metal_native::UnOp::Ceil)?),
+                val::Val::Metal(t) => val::Val::Metal(metal_ops::unary_promote(t, metal_ops::UnOp::Ceil)?),
             }
         }
         NodeKind::Round { a } => {
             let x = ev.value(a.id)?;
             match &x {
                 val::Val::Cpu(t) => val::Val::Cpu(t.round()),
-                val::Val::Metal(t) => val::Val::Metal(metal_native::unary_promote(t, metal_native::UnOp::Round)?),
+                val::Val::Metal(t) => val::Val::Metal(metal_ops::unary_promote(t, metal_ops::UnOp::Round)?),
             }
         }
         NodeKind::Sign { a } => {
             let x = ev.value(a.id)?;
             match &x {
                 val::Val::Cpu(t) => val::Val::Cpu(t.sign()),
-                val::Val::Metal(t) => val::Val::Metal(metal_native::unary_promote(t, metal_native::UnOp::Sign)?),
+                val::Val::Metal(t) => val::Val::Metal(metal_ops::unary_promote(t, metal_ops::UnOp::Sign)?),
             }
         }
         NodeKind::Where { cond, a, b } => {
@@ -4257,7 +4250,7 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> crate::err::Res<val::V
                     val::Val::Cpu(x.where_(c, y))
                 }
                 (val::Val::Metal(x), val::Val::Metal(y), val::Val::Metal(c)) => {
-                    val::Val::Metal(metal_native::where_(c, x, y)?)
+                    val::Val::Metal(metal_ops::where_(c, x, y)?)
                 }
                 _ => return Err("device mismatch".to_string()),
             }
@@ -4267,8 +4260,8 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> crate::err::Res<val::V
             match &x {
                 val::Val::Cpu(t) => val::Val::Cpu(t.argmax(*dim).cast(runtime::dtype::DType::I64)),
                 val::Val::Metal(t) => {
-                    let r = metal_native::argreduce(t, *dim, true)?;
-                    val::Val::Metal(metal_native::cast(&r, crate::runtime::dtype::DType::I64)?)
+                    let r = metal_ops::argreduce(t, *dim, true)?;
+                    val::Val::Metal(metal_ops::cast(&r, crate::runtime::dtype::DType::I64)?)
                 }
             }
         }
@@ -4277,8 +4270,8 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> crate::err::Res<val::V
             match &x {
                 val::Val::Cpu(t) => val::Val::Cpu(t.argmin(*dim).cast(runtime::dtype::DType::I64)),
                 val::Val::Metal(t) => {
-                    let r = metal_native::argreduce(t, *dim, false)?;
-                    val::Val::Metal(metal_native::cast(&r, crate::runtime::dtype::DType::I64)?)
+                    let r = metal_ops::argreduce(t, *dim, false)?;
+                    val::Val::Metal(metal_ops::cast(&r, crate::runtime::dtype::DType::I64)?)
                 }
             }
         }
@@ -4286,7 +4279,7 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> crate::err::Res<val::V
             let x = ev.value(a.id)?;
             match &x {
                 val::Val::Cpu(t) => val::Val::Cpu(t.cumsum(*dim)),
-                val::Val::Metal(t) => val::Val::Metal(metal_native::cumsum(t, *dim)?),
+                val::Val::Metal(t) => val::Val::Metal(metal_ops::cumsum(t, *dim)?),
             }
         }
         NodeKind::ScatterAdd {
@@ -4304,7 +4297,7 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> crate::err::Res<val::V
                 }
                 (val::Val::Metal(x), val::Val::Metal(s)) => {
                     let ids = index_ids_u32(&indexes)?;
-                    val::Val::Metal(metal_native::scatter_add(x, *dim, &ids, s)?)
+                    val::Val::Metal(metal_ops::scatter_add(x, *dim, &ids, s)?)
                 }
                 _ => return Err("device mismatch".to_string()),
             }
@@ -4318,7 +4311,7 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> crate::err::Res<val::V
                 }
                 val::Val::Metal(x) => {
                     let ids = index_ids_u32(&indexes)?;
-                    val::Val::Metal(metal_native::gather(x, *dim, &ids, &indexes.shape())?)
+                    val::Val::Metal(metal_ops::gather(x, *dim, &ids, &indexes.shape())?)
                 }
             }
         }
@@ -4331,7 +4324,7 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> crate::err::Res<val::V
                 }
                 val::Val::Metal(x) => {
                     let ids = index_ids_u32(&indexes)?;
-                    val::Val::Metal(metal_native::index_select(x, *dim, &ids)?)
+                    val::Val::Metal(metal_ops::index_select(x, *dim, &ids)?)
                 }
             }
         }
@@ -4354,8 +4347,8 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> crate::err::Res<val::V
                         ev.ce_checks.push((val::Val::Metal(status), true, l.numel() / classes));
                         val::Val::Metal(loss_t)
                     } else {
-                        let l32 = metal_native::to_f32(l)?;
-                        let r = metal_native::composed::cross_entropy_forward(&l32, t, *ignore_index)?;
+                        let l32 = metal_ops::to_f32(l)?;
+                        let r = composed::cross_entropy_forward(&l32, t, *ignore_index)?;
                         val::Val::Metal(r)
                     }
                 }
@@ -4380,8 +4373,8 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> crate::err::Res<val::V
                         ev.ce_checks.push((val::Val::Metal(count), false, 0));
                         val::Val::Metal(grad)
                     } else {
-                        let l32 = metal_native::to_f32(l)?;
-                        let r = metal_native::composed::cross_entropy_backward(&l32, t, *ignore_index)?;
+                        let l32 = metal_ops::to_f32(l)?;
+                        let r = composed::cross_entropy_backward(&l32, t, *ignore_index)?;
                         val::Val::Metal(r)
                     }
                 }
@@ -4410,11 +4403,11 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> crate::err::Res<val::V
                         ev.multi.insert(node.id, vec![val::Val::Metal(o.clone()), val::Val::Metal(l)]);
                         val::Val::Metal(o)
                     } else {
-                        let q32 = metal_native::to_f32(q)?;
-                        let k32 = metal_native::to_f32(k)?;
-                        let v32 = metal_native::to_f32(v)?;
-                        let r = metal_native::composed::sdpa_forward(&q32, &k32, &v32, *scale, *causal)?;
-                        val::Val::Metal(metal_native::from_f32(&r, q.dtype)?)
+                        let q32 = metal_ops::to_f32(q)?;
+                        let k32 = metal_ops::to_f32(k)?;
+                        let v32 = metal_ops::to_f32(v)?;
+                        let r = composed::sdpa_forward(&q32, &k32, &v32, *scale, *causal)?;
+                        val::Val::Metal(metal_ops::from_f32(&r, q.dtype)?)
                     }
                 }
                 _ => return Err("device mismatch".to_string()),
@@ -4454,16 +4447,16 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> crate::err::Res<val::V
                             val::Val::Metal(dv),
                         )
                     } else {
-                        let q32 = metal_native::to_f32(q)?;
-                        let k32 = metal_native::to_f32(k)?;
-                        let v32 = metal_native::to_f32(v)?;
-                        let g32 = metal_native::to_f32(g)?;
+                        let q32 = metal_ops::to_f32(q)?;
+                        let k32 = metal_ops::to_f32(k)?;
+                        let v32 = metal_ops::to_f32(v)?;
+                        let g32 = metal_ops::to_f32(g)?;
                         let (dq, dk, dv) =
-                            metal_native::composed::sdpa_backward(&q32, &k32, &v32, &g32, *scale, *causal)?;
+                            composed::sdpa_backward(&q32, &k32, &v32, &g32, *scale, *causal)?;
                         (
-                            val::Val::Metal(metal_native::from_f32(&dq, q.dtype)?),
-                            val::Val::Metal(metal_native::from_f32(&dk, q.dtype)?),
-                            val::Val::Metal(metal_native::from_f32(&dv, q.dtype)?),
+                            val::Val::Metal(metal_ops::from_f32(&dq, q.dtype)?),
+                            val::Val::Metal(metal_ops::from_f32(&dk, q.dtype)?),
+                            val::Val::Metal(metal_ops::from_f32(&dv, q.dtype)?),
                         )
                     }
                 }
@@ -4492,7 +4485,7 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> crate::err::Res<val::V
                         layout: w.layout.narrow(0, 0, *seq_len),
                         dtype: w.dtype,
                     };
-                    val::Val::Metal(metal_native::contiguous(&n)?)
+                    val::Val::Metal(metal_ops::contiguous(&n)?)
                 }
             }
         },
@@ -4551,9 +4544,9 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> crate::err::Res<val::V
                     if x.dtype == runtime::dtype::DType::F32 {
                         val::Val::Metal(rotary::rotary(x, &offsets, *theta, 1.0)?)
                     } else {
-                        let x32 = metal_native::to_f32(x)?;
-                        let r = metal_native::composed::rotary_forward(&x32, &offsets, *theta, 1.0)?;
-                        val::Val::Metal(metal_native::from_f32(&r, x.dtype)?)
+                        let x32 = metal_ops::to_f32(x)?;
+                        let r = composed::rotary_forward(&x32, &offsets, *theta, 1.0)?;
+                        val::Val::Metal(metal_ops::from_f32(&r, x.dtype)?)
                     }
                 }
             }
@@ -4571,9 +4564,9 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> crate::err::Res<val::V
                         // Transpose rotation == forward with negated angles.
                         val::Val::Metal(rotary::rotary(g, &[0usize], *theta, -1.0)?)
                     } else {
-                        let g32 = metal_native::to_f32(g)?;
-                        let r = metal_native::composed::rotary_forward(&g32, &[0usize], *theta, -1.0)?;
-                        val::Val::Metal(metal_native::from_f32(&r, g.dtype)?)
+                        let g32 = metal_ops::to_f32(g)?;
+                        let r = composed::rotary_forward(&g32, &[0usize], *theta, -1.0)?;
+                        val::Val::Metal(metal_ops::from_f32(&r, g.dtype)?)
                     }
                 }
             }
@@ -4588,17 +4581,17 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> crate::err::Res<val::V
                 }
                 (val::Val::Metal(x), val::Val::Metal(w), val::Val::Metal(b)) => {
                     if x.dtype == runtime::dtype::DType::F32 {
-                        val::Val::Metal(gemm::linear_forward(x, w, b)?)
+                        val::Val::Metal(linear::linear_forward(x, w, b)?)
                     } else {
-                        let x32 = metal_native::to_f32(x)?;
-                        let w32 = metal_native::to_f32(w)?;
-                        let b32 = metal_native::to_f32(b)?;
-                        let r = metal_native::binary(
-                            &metal_native::matmul(&x32, &w32)?,
+                        let x32 = metal_ops::to_f32(x)?;
+                        let w32 = metal_ops::to_f32(w)?;
+                        let b32 = metal_ops::to_f32(b)?;
+                        let r = metal_ops::binary(
+                            &metal_ops::matmul(&x32, &w32)?,
                             &b32,
-                            metal_native::BinOp::Add,
+                            metal_ops::BinOp::Add,
                         )?;
-                        val::Val::Metal(metal_native::from_f32(&r, x.dtype)?)
+                        val::Val::Metal(metal_ops::from_f32(&r, x.dtype)?)
                     }
                 }
                 _ => return Err("device mismatch".to_string()),
@@ -4616,11 +4609,11 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> crate::err::Res<val::V
                     if layer_norm::is_supported(x, w) {
                         val::Val::Metal(layer_norm::ln_forward(x, w, b, *eps)?)
                     } else {
-                        let x32 = metal_native::to_f32(x)?;
-                        let w32 = metal_native::to_f32(w)?;
-                        let b32 = metal_native::to_f32(b)?;
-                        let r = metal_native::composed::layer_norm_forward(&x32, &w32, &b32, *eps)?;
-                        val::Val::Metal(metal_native::from_f32(&r, x.dtype)?)
+                        let x32 = metal_ops::to_f32(x)?;
+                        let w32 = metal_ops::to_f32(w)?;
+                        let b32 = metal_ops::to_f32(b)?;
+                        let r = composed::layer_norm_forward(&x32, &w32, &b32, *eps)?;
+                        val::Val::Metal(metal_ops::from_f32(&r, x.dtype)?)
                     }
                 }
                 _ => return Err("device mismatch".to_string()),
@@ -4639,13 +4632,13 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> crate::err::Res<val::V
                 (val::Val::Metal(x), val::Val::Metal(w), val::Val::Metal(g)) => {
                     if layer_norm::is_supported(x, w) {
                         let (dx, xh) = layer_norm::ln_backward(x, w, g, *eps)?;
-                        let dw = metal_native::reduce(
-                            &metal_native::binary(g, &xh, metal_native::BinOp::Mul)?,
+                        let dw = metal_ops::reduce(
+                            &metal_ops::binary(g, &xh, metal_ops::BinOp::Mul)?,
                             &(0..x.layout.shape().len() - w.layout.shape().len()).collect::<Vec<_>>(),
                             false,
                             crate::fusion::ReduceOp::Sum,
                         )?;
-                        let db = metal_native::reduce(
+                        let db = metal_ops::reduce(
                             g,
                             &(0..x.layout.shape().len() - w.layout.shape().len()).collect::<Vec<_>>(),
                             false,
@@ -4654,16 +4647,16 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> crate::err::Res<val::V
                         ev.ln.insert(node.id, [val::Val::Metal(dw), val::Val::Metal(db)]);
                         val::Val::Metal(dx)
                     } else {
-                        let x32 = metal_native::to_f32(x)?;
-                        let w32 = metal_native::to_f32(w)?;
-                        let g32 = metal_native::to_f32(g)?;
+                        let x32 = metal_ops::to_f32(x)?;
+                        let w32 = metal_ops::to_f32(w)?;
+                        let g32 = metal_ops::to_f32(g)?;
                         let (dx, dw, db) =
-                            metal_native::composed::layer_norm_backward(&x32, &w32, &g32, *eps)?;
+                            composed::layer_norm_backward(&x32, &w32, &g32, *eps)?;
                         ev.ln.insert(node.id, [
-                            val::Val::Metal(metal_native::from_f32(&dw, w.dtype)?),
-                            val::Val::Metal(metal_native::from_f32(&db, w.dtype)?),
+                            val::Val::Metal(metal_ops::from_f32(&dw, w.dtype)?),
+                            val::Val::Metal(metal_ops::from_f32(&db, w.dtype)?),
                         ]);
-                        val::Val::Metal(metal_native::from_f32(&dx, x.dtype)?)
+                        val::Val::Metal(metal_ops::from_f32(&dx, x.dtype)?)
                     }
                 }
                 _ => return Err("device mismatch".to_string()),
@@ -4696,8 +4689,8 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> crate::err::Res<val::V
                     val::Val::Cpu(runtime::cpu::conv::conv1d(x, w, *stride, *padding, *dilation, *groups))
                 }
                 (val::Val::Metal(x), val::Val::Metal(w)) => {
-                    let xn = metal_native::contiguous(x)?;
-                    let wn = metal_native::contiguous(w)?;
+                    let xn = metal_ops::contiguous(x)?;
+                    let wn = metal_ops::contiguous(w)?;
                     val::Val::Metal(runtime::metal::conv::conv1d(
                         runtime::metal::device::MetalDevice::get(),
                         &xn,
@@ -4726,8 +4719,8 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> crate::err::Res<val::V
                     val::Val::Cpu(runtime::cpu::conv::conv2d(x, w, *stride, *padding, *dilation, *groups))
                 }
                 (val::Val::Metal(x), val::Val::Metal(w)) => {
-                    let xn = metal_native::contiguous(x)?;
-                    let wn = metal_native::contiguous(w)?;
+                    let xn = metal_ops::contiguous(x)?;
+                    let wn = metal_ops::contiguous(w)?;
                     val::Val::Metal(runtime::metal::conv::conv2d(
                         runtime::metal::device::MetalDevice::get(),
                         &xn,
@@ -4765,8 +4758,8 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> crate::err::Res<val::V
                     ))
                 }
                 (val::Val::Metal(x), val::Val::Metal(w)) => {
-                    let xn = metal_native::contiguous(x)?;
-                    let wn = metal_native::contiguous(w)?;
+                    let xn = metal_ops::contiguous(x)?;
+                    let wn = metal_ops::contiguous(w)?;
                     val::Val::Metal(runtime::metal::conv::conv_transpose1d(
                         runtime::metal::device::MetalDevice::get(),
                         &xn,
@@ -4805,8 +4798,8 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> crate::err::Res<val::V
                     ))
                 }
                 (val::Val::Metal(x), val::Val::Metal(w)) => {
-                    let xn = metal_native::contiguous(x)?;
-                    let wn = metal_native::contiguous(w)?;
+                    let xn = metal_ops::contiguous(x)?;
+                    let wn = metal_ops::contiguous(w)?;
                     val::Val::Metal(runtime::metal::conv::conv_transpose2d(
                         runtime::metal::device::MetalDevice::get(),
                         &xn,
@@ -4869,8 +4862,8 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> crate::err::Res<val::V
                     val::Val::Cpu(dw.contiguous().view(runtime::layout::Layout::contiguous(vec![s[0], s[1], s[2]])))
                 }
                 (val::Val::Metal(x), val::Val::Metal(g)) => {
-                    let xn = metal_native::contiguous(&squeeze4(x))?;
-                    let gn = metal_native::contiguous(&squeeze4(g))?;
+                    let xn = metal_ops::contiguous(&squeeze4(x))?;
+                    let gn = metal_ops::contiguous(&squeeze4(g))?;
                     let dw = runtime::metal::conv::conv2d_backward_w(
                         runtime::metal::device::MetalDevice::get(),
                         &xn,
@@ -4913,8 +4906,8 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> crate::err::Res<val::V
                     ))
                 }
                 (val::Val::Metal(x), val::Val::Metal(g)) => {
-                    let xn = metal_native::contiguous(x)?;
-                    let gn = metal_native::contiguous(g)?;
+                    let xn = metal_ops::contiguous(x)?;
+                    let gn = metal_ops::contiguous(g)?;
                     val::Val::Metal(runtime::metal::conv::conv2d_backward_w(
                         runtime::metal::device::MetalDevice::get(),
                         &xn,
@@ -4934,7 +4927,7 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> crate::err::Res<val::V
             let x = ev.value(a.id)?;
             match &x {
                 val::Val::Cpu(t) => val::Val::Cpu(t.powf(*exp)),
-                val::Val::Metal(t) => val::Val::Metal(metal_native::powf(&metal_native::to_f32(t)?, *exp)?),
+                val::Val::Metal(t) => val::Val::Metal(metal_ops::powf(&metal_ops::to_f32(t)?, *exp)?),
             }
         }
         NodeKind::Cast { a, dtype } => {
@@ -4942,7 +4935,7 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> crate::err::Res<val::V
             match &x {
                 val::Val::Cpu(t) => val::Val::Cpu(t.cast(*dtype)),
                 val::Val::Metal(t) => {
-                    val::Val::Metal(metal_native::cast(t, *dtype)?)
+                    val::Val::Metal(metal_ops::cast(t, *dtype)?)
                 }
             }
         }
@@ -4955,7 +4948,7 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> crate::err::Res<val::V
                     val::Val::Cpu(r)
                 }
                 val::Val::Metal(x) => {
-                    val::Val::Metal(metal_native::reduce(&metal_native::to_f32(x)?, dims, *keepdims, crate::fusion::ReduceOp::Sum)?)
+                    val::Val::Metal(metal_ops::reduce(&metal_ops::to_f32(x)?, dims, *keepdims, crate::fusion::ReduceOp::Sum)?)
                 }
             }
         }
@@ -4968,7 +4961,7 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> crate::err::Res<val::V
                     val::Val::Cpu(r)
                 }
                 val::Val::Metal(x) => {
-                    val::Val::Metal(metal_native::reduce(&metal_native::to_f32(x)?, dims, *keepdims, crate::fusion::ReduceOp::Mean)?)
+                    val::Val::Metal(metal_ops::reduce(&metal_ops::to_f32(x)?, dims, *keepdims, crate::fusion::ReduceOp::Mean)?)
                 }
             }
         }
@@ -4981,7 +4974,7 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> crate::err::Res<val::V
                     val::Val::Cpu(r)
                 }
                 val::Val::Metal(x) => {
-                    val::Val::Metal(metal_native::reduce(&metal_native::to_f32(x)?, dims, *keepdims, crate::fusion::ReduceOp::Max)?)
+                    val::Val::Metal(metal_ops::reduce(&metal_ops::to_f32(x)?, dims, *keepdims, crate::fusion::ReduceOp::Max)?)
                 }
             }
         }
@@ -4994,7 +4987,7 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> crate::err::Res<val::V
                     val::Val::Cpu(r)
                 }
                 val::Val::Metal(x) => {
-                    val::Val::Metal(metal_native::reduce(&metal_native::to_f32(x)?, dims, *keepdims, crate::fusion::ReduceOp::Min)?)
+                    val::Val::Metal(metal_ops::reduce(&metal_ops::to_f32(x)?, dims, *keepdims, crate::fusion::ReduceOp::Min)?)
                 }
             }
         }
@@ -5007,7 +5000,7 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> crate::err::Res<val::V
                     val::Val::Cpu(r)
                 }
                 val::Val::Metal(x) => {
-                    val::Val::Metal(metal_native::reduce(&metal_native::to_f32(x)?, dims, *keepdims, crate::fusion::ReduceOp::Prod)?)
+                    val::Val::Metal(metal_ops::reduce(&metal_ops::to_f32(x)?, dims, *keepdims, crate::fusion::ReduceOp::Prod)?)
                 }
             }
         }
@@ -5018,7 +5011,7 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> crate::err::Res<val::V
                     val::Val::Cpu(t.contiguous().view(runtime::layout::Layout::contiguous(shape.clone())))
                 }
                 val::Val::Metal(t) => {
-                    let r = metal_native::contiguous(t)?;
+                    let r = metal_ops::contiguous(t)?;
                     val::Val::Metal(runtime::metal::run::MetalTensor {
                         buffer: r.buffer,
                         layout: runtime::layout::Layout::contiguous(shape.clone()),
@@ -5034,7 +5027,7 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> crate::err::Res<val::V
                     val::Val::Cpu(t.view(t.layout.permute(dims)).contiguous())
                 }
                 val::Val::Metal(t) => {
-                    val::Val::Metal(metal_native::permute(t, dims)?)
+                    val::Val::Metal(metal_ops::permute(t, dims)?)
                 }
             }
         }
@@ -5079,10 +5072,10 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> crate::err::Res<val::V
                             layout: r.layout.narrow(dim, start, (len - 1) * stride + 1),
                             dtype: r.dtype,
                         };
-                        r = metal_native::contiguous(&r)?;
+                        r = metal_ops::contiguous(&r)?;
                         if stride > 1 {
                             let idx: Vec<u32> = (0..len as u32).map(|i| i * stride as u32).collect();
-                            r = metal_native::index_select(&r, dim, &idx)?;
+                            r = metal_ops::index_select(&r, dim, &idx)?;
                         }
                     }
                     val::Val::Metal(r)
@@ -5097,7 +5090,7 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> crate::err::Res<val::V
                     val::Val::Cpu(runtime::cpu::Tensor::cat(&[x, y], *dim))
                 }
                 (val::Val::Metal(x), val::Val::Metal(y)) => {
-                    val::Val::Metal(metal_native::cat(x, y, *dim)?)
+                    val::Val::Metal(metal_ops::cat(x, y, *dim)?)
                 }
                 _ => return Err("device mismatch".to_string()),
             }
@@ -5109,7 +5102,7 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> crate::err::Res<val::V
                     val::Val::Cpu(t.view(t.layout.broadcast_to(shape)).contiguous())
                 }
                 val::Val::Metal(t) => {
-                    val::Val::Metal(metal_native::broadcast_to(t, shape)?)
+                    val::Val::Metal(metal_ops::broadcast_to(t, shape)?)
                 }
             }
         }
@@ -5119,7 +5112,7 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> crate::err::Res<val::V
             match (&a, &b) {
                 (val::Val::Cpu(x), val::Val::Cpu(y)) => val::Val::Cpu(x.matmul(y)),
                 (val::Val::Metal(x), val::Val::Metal(y)) => {
-                    val::Val::Metal(metal_native::matmul(x, y)?)
+                    val::Val::Metal(metal_ops::matmul(x, y)?)
                 }
                 _ => return Err("device mismatch".to_string()),
             }
@@ -5237,17 +5230,17 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> crate::err::Res<val::V
                         val::Val::Cpu(next_p)
                     }
                     val::Val::Metal(p) => {
-                        let g32 = metal_native::to_f32(g.as_metal()?)?;
-                        let m32 = metal_native::to_f32(m_t.as_metal()?)?;
-                        let v32 = metal_native::to_f32(v_t.as_metal()?)?;
+                        let g32 = metal_ops::to_f32(g.as_metal()?)?;
+                        let m32 = metal_ops::to_f32(m_t.as_metal()?)?;
+                        let v32 = metal_ops::to_f32(v_t.as_metal()?)?;
                         let (np, nm, nv) = adamw_native(
                             p,
                             &g32,
                             &m32,
                             &v32,
-                            &metal_native::to_f32(lr_t.as_metal()?)?,
-                            &metal_native::to_f32(c1_t.as_metal()?)?,
-                            &metal_native::to_f32(c2_t.as_metal()?)?,
+                            &metal_ops::to_f32(lr_t.as_metal()?)?,
+                            &metal_ops::to_f32(c1_t.as_metal()?)?,
+                            &metal_ops::to_f32(c2_t.as_metal()?)?,
                             *beta1,
                             *beta2,
                             *eps,
@@ -5399,47 +5392,47 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> crate::err::Res<val::V
                         let g = if *weight_decay == 0.0 {
                             g.as_metal()?.clone()
                         } else {
-                            let wd = metal_native::fill(p.layout.shape(), *weight_decay, p.dtype)?;
-                            metal_native::binary(
+                            let wd = metal_ops::fill(p.layout.shape(), *weight_decay, p.dtype)?;
+                            metal_ops::binary(
                                 g.as_metal()?,
-                                &metal_native::binary(p, &wd, metal_native::BinOp::Mul)?,
-                                metal_native::BinOp::Add,
+                                &metal_ops::binary(p, &wd, metal_ops::BinOp::Mul)?,
+                                metal_ops::BinOp::Add,
                             )?
                         };
                         // next_v = first ? g : momentum * v + (1 - dampening) * g,
                         // as tensor arithmetic: velocity is zeros on the first
                         // step, so the (1 - first) branch contributes nothing.
-                        let mom = metal_native::fill(p.layout.shape(), *momentum, p.dtype)?;
-                        let damp = metal_native::fill(p.layout.shape(), 1.0 - dampening, p.dtype)?;
-                        let continued = metal_native::binary(
-                            &metal_native::binary(v_t.as_metal()?, &mom, metal_native::BinOp::Mul)?,
-                            &metal_native::binary(&g, &damp, metal_native::BinOp::Mul)?,
-                            metal_native::BinOp::Add,
+                        let mom = metal_ops::fill(p.layout.shape(), *momentum, p.dtype)?;
+                        let damp = metal_ops::fill(p.layout.shape(), 1.0 - dampening, p.dtype)?;
+                        let continued = metal_ops::binary(
+                            &metal_ops::binary(v_t.as_metal()?, &mom, metal_ops::BinOp::Mul)?,
+                            &metal_ops::binary(&g, &damp, metal_ops::BinOp::Mul)?,
+                            metal_ops::BinOp::Add,
                         )?;
-                        let first32 = metal_native::to_f32(first_t.as_metal()?)?;
-                        let not_first = metal_native::binary(
-                            &metal_native::fill(first32.layout.shape(), 1.0, first32.dtype)?,
+                        let first32 = metal_ops::to_f32(first_t.as_metal()?)?;
+                        let not_first = metal_ops::binary(
+                            &metal_ops::fill(first32.layout.shape(), 1.0, first32.dtype)?,
                             &first32,
-                            metal_native::BinOp::Sub,
+                            metal_ops::BinOp::Sub,
                         )?;
-                        let next_v = metal_native::binary(
-                            &metal_native::binary(&first32, &g, metal_native::BinOp::Mul)?,
-                            &metal_native::binary(&not_first, &continued, metal_native::BinOp::Mul)?,
-                            metal_native::BinOp::Add,
+                        let next_v = metal_ops::binary(
+                            &metal_ops::binary(&first32, &g, metal_ops::BinOp::Mul)?,
+                            &metal_ops::binary(&not_first, &continued, metal_ops::BinOp::Mul)?,
+                            metal_ops::BinOp::Add,
                         )?;
                         let used = if *nesterov {
-                            metal_native::binary(
+                            metal_ops::binary(
                                 &g,
-                                &metal_native::binary(&next_v, &mom, metal_native::BinOp::Mul)?,
-                                metal_native::BinOp::Add,
+                                &metal_ops::binary(&next_v, &mom, metal_ops::BinOp::Mul)?,
+                                metal_ops::BinOp::Add,
                             )?
                         } else {
                             next_v.clone()
                         };
-                        let next_p = metal_native::binary(
+                        let next_p = metal_ops::binary(
                             p,
-                            &metal_native::binary(&used, &metal_native::to_f32(lr_t.as_metal()?)?, metal_native::BinOp::Mul)?,
-                            metal_native::BinOp::Sub,
+                            &metal_ops::binary(&used, &metal_ops::to_f32(lr_t.as_metal()?)?, metal_ops::BinOp::Mul)?,
+                            metal_ops::BinOp::Sub,
                         )?;
                         ev.sgd.insert(node.id, val::Val::Metal(next_v));
                         val::Val::Metal(next_p)
@@ -8495,7 +8488,7 @@ fn kv_attention(
                         layout: x.layout.narrow(0, b, 1),
                         dtype: x.dtype,
                     };
-                    Ok(val::Val::Metal(metal_native::contiguous(&n)?))
+                    Ok(val::Val::Metal(metal_ops::contiguous(&n)?))
                 }
             }
         };
@@ -8517,7 +8510,7 @@ fn kv_attention(
         }
         val::Val::Metal(_) => {
             let refs: Vec<&runtime::metal::run::MetalTensor> = outs.iter().map(|o| o.as_metal().unwrap()).collect();
-            metal_native::cat(refs[0], refs[1], 0).map(val::Val::Metal)
+            metal_ops::cat(refs[0], refs[1], 0).map(val::Val::Metal)
         }
     }
 }
@@ -8721,9 +8714,9 @@ fn kv_attention_slot(
             )?;
             let real = match scale {
                 Some(scale) => {
-                    let g32 = metal_native::cast(&gathered, crate::runtime::dtype::DType::F32)?;
-                    let off = metal_native::fill(g32.layout.shape(), 128.0, g32.dtype)?;
-                    let centered = metal_native::binary(&g32, &off, metal_native::BinOp::Sub)?;
+                    let g32 = metal_ops::cast(&gathered, crate::runtime::dtype::DType::F32)?;
+                    let off = metal_ops::fill(g32.layout.shape(), 128.0, g32.dtype)?;
+                    let centered = metal_ops::binary(&g32, &off, metal_ops::BinOp::Sub)?;
                     let scales = runtime::metal::indexing::index_select(
                         runtime::metal::device::MetalDevice::get(),
                         scale.metal()?,
@@ -8735,24 +8728,24 @@ fn kv_attention_slot(
                         layout: runtime::layout::Layout::contiguous(vec![ctx_rows.len(), h, 1]),
                         dtype: scales.dtype,
                     };
-                    metal_native::binary(&centered, &scales, metal_native::BinOp::Mul)?
+                    metal_ops::binary(&centered, &scales, metal_ops::BinOp::Mul)?
                 }
-                None => metal_native::cast(&gathered, crate::runtime::dtype::DType::F32)?,
+                None => metal_ops::cast(&gathered, crate::runtime::dtype::DType::F32)?,
             };
             let pad = ctx - ctx_rows.len();
             let full = if pad > 0 {
-                let zeros = metal_native::fill(&[pad, h, d], 0.0, real.dtype)?;
-                metal_native::cat(&real, &zeros, 0)?
+                let zeros = metal_ops::fill(&[pad, h, d], 0.0, real.dtype)?;
+                metal_ops::cat(&real, &zeros, 0)?
             } else {
                 real
             };
-            let permuted = metal_native::permute(&full, &[1, 0, 2])?;
+            let permuted = metal_ops::permute(&full, &[1, 0, 2])?;
             let expanded = runtime::metal::run::MetalTensor {
                 buffer: permuted.buffer.clone(),
                 layout: runtime::layout::Layout::contiguous(vec![1, h, ctx, d]),
                 dtype: permuted.dtype,
             };
-            metal_native::contiguous(&expanded)
+            metal_ops::contiguous(&expanded)
         };
         let (k_scale, v_scale) = match slab_dtype {
             DType::U8 => (Some(&pool.scales[2 * layer]), Some(&pool.scales[2 * layer + 1])),
@@ -8761,8 +8754,8 @@ fn kv_attention_slot(
         let kn = gather_rows(&pool.k[layer], k_scale)?;
         let vn = gather_rows(&pool.v[layer], v_scale)?;
         let qn = q.as_metal()?;
-        let q32 = metal_native::to_f32(qn)?;
-        let out = metal_native::composed::sdpa_forward(&q32, &kn, &vn, scale, true)?;
+        let q32 = metal_ops::to_f32(qn)?;
+        let out = composed::sdpa_forward(&q32, &kn, &vn, scale, true)?;
         kv_evict(pool, state, start);
         return Ok(val::Val::Metal(out));
     }
@@ -8886,13 +8879,13 @@ fn kv_scatter_rows(
         // device, scatter into slabs with computed physical indices.
         let new_rows = |x: &val::Val| -> crate::err::Res<runtime::metal::run::MetalTensor> {
             let x = x.as_metal()?;
-            let p = metal_native::permute(x, &[0, 2, 1, 3])?;
+            let p = metal_ops::permute(x, &[0, 2, 1, 3])?;
             let n = runtime::metal::run::MetalTensor {
                 buffer: p.buffer.clone(),
                 layout: p.layout.narrow(1, 0, advance),
                 dtype: p.dtype,
             };
-            let r = metal_native::contiguous(&n)?;
+            let r = metal_ops::contiguous(&n)?;
             Ok(runtime::metal::run::MetalTensor {
                 buffer: r.buffer,
                 layout: runtime::layout::Layout::contiguous(vec![advance, h, d]),
@@ -8901,14 +8894,14 @@ fn kv_scatter_rows(
         };
         if slab_dtype == DType::U8 {
             let quantize = |x: &runtime::metal::run::MetalTensor| -> crate::err::Res<(runtime::metal::run::MetalTensor, runtime::metal::run::MetalTensor)> {
-                let abs = metal_native::unary(x, metal_native::UnOp::Abs)?;
-                let amax = metal_native::reduce(&abs, &[2], true, crate::fusion::ReduceOp::Max)?;
-                let scale = metal_native::binary(&amax, &metal_native::fill(amax.layout.shape(), 127.0, amax.dtype)?, metal_native::BinOp::Div)?;
-                let scale = metal_native::binary(&scale, &metal_native::fill(scale.layout.shape(), 1e-12, scale.dtype)?, metal_native::BinOp::Add)?;
-                let q = metal_native::binary(x, &scale, metal_native::BinOp::Div)?;
-                let q = metal_native::binary(&q, &metal_native::fill(q.layout.shape(), 128.0, q.dtype)?, metal_native::BinOp::Add)?;
-                let q = metal_native::unary(&q, metal_native::UnOp::Round)?;
-                let q = metal_native::cast(&q, crate::runtime::dtype::DType::U8)?;
+                let abs = metal_ops::unary(x, metal_ops::UnOp::Abs)?;
+                let amax = metal_ops::reduce(&abs, &[2], true, crate::fusion::ReduceOp::Max)?;
+                let scale = metal_ops::binary(&amax, &metal_ops::fill(amax.layout.shape(), 127.0, amax.dtype)?, metal_ops::BinOp::Div)?;
+                let scale = metal_ops::binary(&scale, &metal_ops::fill(scale.layout.shape(), 1e-12, scale.dtype)?, metal_ops::BinOp::Add)?;
+                let q = metal_ops::binary(x, &scale, metal_ops::BinOp::Div)?;
+                let q = metal_ops::binary(&q, &metal_ops::fill(q.layout.shape(), 128.0, q.dtype)?, metal_ops::BinOp::Add)?;
+                let q = metal_ops::unary(&q, metal_ops::UnOp::Round)?;
+                let q = metal_ops::cast(&q, crate::runtime::dtype::DType::U8)?;
                 Ok((q, scale))
             };
             let (qk, sk) = quantize(&new_rows(k)?)?;
@@ -8943,8 +8936,8 @@ fn kv_scatter_rows(
             )?;
         } else {
             let nd = slab_dtype;
-            let kr = metal_native::cast(&new_rows(k)?, nd)?;
-            let vr = metal_native::cast(&new_rows(v)?, nd)?;
+            let kr = metal_ops::cast(&new_rows(k)?, nd)?;
+            let vr = metal_ops::cast(&new_rows(v)?, nd)?;
             runtime::metal::indexing::scatter_set(
                 runtime::metal::device::MetalDevice::get(),
                 pool.k[layer].metal()?,
@@ -9915,7 +9908,7 @@ fn scalar_binding(value: f64, dtype: DType, device: &Device) -> err::Res<val::Va
     if device.is_cpu() {
         Ok(val::Val::Cpu(runtime::cpu::Tensor::full(&[], value, nd)))
     } else {
-        Ok(val::Val::Metal(metal_native::fill(&[], value, nd)?))
+        Ok(val::Val::Metal(metal_ops::fill(&[], value, nd)?))
     }
 }
 

@@ -24,22 +24,3 @@ impl Device {
         }
     }
 }
-
-use crate::runtime::dtype::DType as ND;
-
-pub fn dtype_name(d: ND) -> &'static str {
-    d.name()
-}
-
-pub fn dtype_of_name(name: &str) -> Option<ND> {
-    match name {
-        "f32" => Some(ND::F32),
-        "f64" => Some(ND::F64),
-        "f16" => Some(ND::F16),
-        "bf16" => Some(ND::BF16),
-        "u8" => Some(ND::U8),
-        "u32" => Some(ND::U32),
-        "i64" => Some(ND::I64),
-        _ => None,
-    }
-}

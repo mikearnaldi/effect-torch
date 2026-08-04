@@ -2,7 +2,7 @@ use crate::fusion::ReduceOp;
 use crate::runtime::dtype::DType;
 use crate::runtime::layout::Layout;
 use crate::runtime::metal::run::MetalTensor;
-use super::{binary, broadcast_to, cat, cast, compare, fill, gather, matmul, permute, reduce, unary, where_, BinOp, UnOp};
+use super::ops::{binary, broadcast_to, cat, cast, compare, fill, gather, matmul, permute, reduce, unary, where_, BinOp, UnOp};
 
 fn rank(t: &MetalTensor) -> usize {
     t.layout.shape().len()
@@ -41,7 +41,7 @@ fn narrow(t: &MetalTensor, dim: usize, start: usize, len: usize) -> crate::err::
         layout: t.layout.narrow(dim, start, len),
         dtype: t.dtype,
     };
-    super::contiguous(&v)
+    super::ops::contiguous(&v)
 }
 
 fn full_like(t: &MetalTensor, value: f64) -> crate::err::Res<MetalTensor> {
@@ -132,7 +132,7 @@ pub fn sdpa_backward(
     let r = rank(q);
     let s = sdpa_scores(q, k, scale, causal)?;
     let p = softmax_lastdim(&s)?;
-    let g = super::contiguous(g)?;
+    let g = super::ops::contiguous(g)?;
     let dv = matmul(&transpose_last2(&p)?, &g)?;
     let dp = matmul(&g, &transpose_last2(v)?)?;
     let dp_sum = reduce(&binary(&p, &dp, BinOp::Mul)?, &[r - 1], true, ReduceOp::Sum)?;
@@ -142,9 +142,9 @@ pub fn sdpa_backward(
         let (t, sq) = (dims[r - 2], dims[r - 1]);
         ds = binary(&ds, &causal_gate(t, sq, ds.dtype)?, BinOp::Mul)?;
     }
-    let dq_raw = matmul(&ds, &super::contiguous(k)?)?;
+    let dq_raw = matmul(&ds, &super::ops::contiguous(k)?)?;
     let dq = binary(&dq_raw, &full_like(&dq_raw, scale)?, BinOp::Mul)?;
-    let dk_raw = matmul(&transpose_last2(&ds)?, &super::contiguous(q)?)?;
+    let dk_raw = matmul(&transpose_last2(&ds)?, &super::ops::contiguous(q)?)?;
     let dk = binary(&dk_raw, &full_like(&dk_raw, scale)?, BinOp::Mul)?;
     Ok((dq, dk, dv))
 }
@@ -303,7 +303,7 @@ pub fn cross_entropy_backward(
     let safe_target = where_(&ignored, &zero_ids, &target_to_ids(target)?)?;
     let ids = unsqueeze_last(&safe_target)?;
     let neg_ones = fill(ids.layout.shape(), -1.0, logits.dtype)?;
-    let p = super::scatter_add(&p, r - 1, &ids.to_u32_vec()?, &neg_ones)?;
+    let p = super::ops::scatter_add(&p, r - 1, &ids.to_u32_vec()?, &neg_ones)?;
     let keep = compare(&ignored, &fill(ignored.layout.shape(), 0.0, DType::U8)?, BinOp::Eq)?;
     let keep = unsqueeze_last(&keep)?;
     let masked = where_(&keep, &p, &zeros_like(&p)?)?;

@@ -553,9 +553,9 @@ kernel void et_sdpa_bwd_q(
             dtype: l.dtype,
         })?;
         // d_vec = rowsum(g ∘ o) through the native mul + reduce.
-        let prod = crate::metal_native::binary(&g, &o, crate::metal_native::BinOp::Mul)?;
+        let prod = crate::runtime::metal::ops::binary(&g, &o, crate::runtime::metal::ops::BinOp::Mul)?;
         // prod is flattened [BH, T, Dv]; reduce its last dim.
-        let d_vec = crate::metal_native::reduce(&prod, &[2], true, crate::fusion::ReduceOp::Sum)?;
+        let d_vec = crate::runtime::metal::ops::reduce(&prod, &[2], true, crate::fusion::ReduceOp::Sum)?;
         let d_vec = contig(&d_vec)?;
         let dq_buf = alloc_f32(bh * t * d);
         let dk_buf = alloc_f32(bh * s * d);
