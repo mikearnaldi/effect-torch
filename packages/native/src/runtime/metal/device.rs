@@ -264,16 +264,20 @@ impl MetalDevice {
     }
 
     pub fn upload_bytes(&self, data: &[u8]) -> Arc<Buffer> {
-        let bucket_size = data.len().next_power_of_two().max(16);
+        // Length is exactly data.len(): newBufferWithBytes copies that
+        // many bytes from the source — a rounded-up (bucketed) length
+        // would read past the end of the caller's allocation. Uploads
+        // are never pooled, so bucketing buys nothing.
+        let size = data.len().max(1);
         let raw = unsafe {
             self.raw.newBufferWithBytes_length_options(
                 NonNull::new(data.as_ptr() as *const std::ffi::c_void as *mut std::ffi::c_void).unwrap(),
-                bucket_size,
+                size,
                 SHARED_OPTIONS,
             )
         }
         .expect("metal buffer allocation failed");
-        let buffer = Arc::new(Buffer { raw, size: bucket_size });
+        let buffer = Arc::new(Buffer { raw, size });
         // Host uploads retire only at the next synchronize. Uploads are
         // NEVER pooled: the only strong refs are the caller's and this
         // list's, so nothing can recycle the bytes before the GPU has

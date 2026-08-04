@@ -21,7 +21,7 @@ const CKPT = new URL("../data/fineweb-ckpt.safetensors", import.meta.url).pathna
 
 const BATCH = 64
 const STEPS = Number(process.env.FINEWEB_STEPS ?? 5000)
-const CHECKPOINT_EVERY = Number(process.env.FINEWEB_CHECKPOINT_EVERY ?? 1000)
+const CHECKPOINT_EVERY = Number(process.env.FINEWEB_CHECKPOINT_EVERY ?? 100)
 const LR = 6e-4
 const VAL_BATCHES = 20
 
@@ -85,11 +85,7 @@ const program = Effect.gen(function* () {
       }),
     stop: ({ step }) => step >= chunkTarget,
     onStep: ({ step, loss, elapsed }) =>
-      step % 50 === 0 || step === 1
-        ? Effect.log(
-          `step ${String(step).padStart(4)}  loss ${loss.toFixed(4)}  ${(Duration.toMillis(elapsed) / 1000).toFixed(1)}s`
-        )
-        : Effect.void
+      Effect.log(`step ${String(step).padStart(4)}  loss ${loss.toFixed(4)}  ${(Duration.toMillis(elapsed) / 1000).toFixed(1)}s`)
   }))
 
   // Resume when a checkpoint exists: parameters, optimizer state, global
