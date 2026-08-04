@@ -23,6 +23,45 @@ const loadBin = (path: string) => {
   return new Uint16Array(buffer.buffer, buffer.byteOffset, buffer.byteLength / 2)
 }
 
+// Epoch-based batching: all non-overlapping BLOCK-windows in a shuffled
+// permutation, so every window is seen exactly once per epoch (no
+// replacement); the permutation is reshuffled at each epoch boundary.
+const makeTrainSampler = (data: Uint16Array, onEpoch: (epoch: number) => void) => {
+  const windowCount = Math.floor((data.length - 1) / BLOCK)
+  const order = new Uint32Array(windowCount)
+  for (let i = 0; i < windowCount; i++) order[i] = i
+  let cursor = 0
+  let epoch = 1
+  const shuffle = () => {
+    for (let i = windowCount - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1))
+      const t = order[i]
+      order[i] = order[j]
+      order[j] = t
+    }
+  }
+  shuffle()
+  return () => {
+    if (cursor + BATCH > windowCount) {
+      shuffle()
+      cursor = 0
+      epoch += 1
+      onEpoch(epoch)
+    }
+    const inputs = new Uint32Array(BATCH * BLOCK)
+    const targets = new Uint32Array(BATCH * BLOCK)
+    for (let b = 0; b < BATCH; b++) {
+      const start = order[cursor + b] * BLOCK
+      for (let t = 0; t < BLOCK; t++) {
+        inputs[b * BLOCK + t] = data[start + t]
+        targets[b * BLOCK + t] = data[start + t + 1]
+      }
+    }
+    cursor += BATCH
+    return { inputs, targets }
+  }
+}
+
 const sampleBatch = (data: Uint16Array) =>
   Effect.gen(function* () {
     const inputs = new Uint32Array(BATCH * BLOCK)
@@ -45,7 +84,7 @@ const program = Effect.gen(function* () {
   const val = loadBin(VAL_BIN)
   const tokenizer = yield* loadTokenizer
   yield* Effect.log(
-    `fineweb-train: vocab ${tokenizer.vocabSize}, ${(train.length / 1e6).toFixed(0)}M train tokens, block ${BLOCK}, batch ${BATCH} (${(BATCH * BLOCK * STEPS / 1e6).toFixed(0)}M tokens over ${STEPS} steps)`
+    `fineweb-train: vocab ${tokenizer.vocabSize}, ${(train.length / 1e6).toFixed(0)}M train tokens, block ${BLOCK}, batch ${BATCH} (${Math.floor((train.length - 1) / BLOCK / BATCH)} steps per epoch)`
   )
 
   yield* Effect.log("1) creating model")
@@ -55,11 +94,19 @@ const program = Effect.gen(function* () {
   yield* Effect.log(`  total: ${total.toLocaleString()} parameters`)
 
   yield* Effect.log(`2) training: adamW lr=${LR}, ${STEPS} steps`)
+  const sampler = makeTrainSampler(train, (epoch) => console.log(`epoch ${epoch}`))
   const trainer = yield* Trainer.compile(yield* Trainer.make(model, {
     optimizer: yield* Optimizer.adamW(),
     lr: LearningRate.constant(LR),
     loss: Loss.crossEntropy,
-    data: () => sampleBatch(train),
+    data: () =>
+      Effect.gen(function* () {
+        const { inputs, targets } = sampler()
+        return {
+          input: yield* Tensor.fromTypedArray(inputs, [BATCH, BLOCK]),
+          target: yield* Tensor.fromTypedArray(targets, [BATCH, BLOCK])
+        }
+      }),
     stop: ({ step }) => step >= STEPS,
     onStep: ({ step, loss, elapsed }) =>
       Effect.log(`step ${String(step).padStart(4)}  loss ${loss.toFixed(4)}  ${(Duration.toMillis(elapsed) / 1000).toFixed(1)}s`)
