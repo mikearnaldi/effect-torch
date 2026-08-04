@@ -48,7 +48,8 @@ const program = Effect.gen(function* () {
   for (const prompt of prompts) {
     const generated: Array<number> = []
     const gen = yield* inference.generation()
-    const entry = yield* gen.add(yield* tokenizer.encode(prompt))
+    const encoded = yield* tokenizer.encode(prompt)
+    const entry = yield* gen.add(yield* Tensor.reshape(encoded, [1, encoded.shape[0]]))
     let logits = entry.logits
     for (let i = 0; i < MAX_NEW_TOKENS; i++) {
       const [probs] = yield* Tensor.compute([yield* Tensor.softmax(logits)])
