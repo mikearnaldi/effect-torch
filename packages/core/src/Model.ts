@@ -142,9 +142,9 @@ export interface CompiledModel extends Model {
    */
   readonly stats: () => Tensor.CompileStats
   /**
-   * Releases the cached forward programs.
+   * Clears the cached forward programs early (otherwise GC-collected).
    */
-  readonly dispose: () => Effect.Effect<void>
+  readonly clear: () => Effect.Effect<void>
 }
 
 /**
@@ -1122,7 +1122,7 @@ export const compile = (
           return output
         }),
       stats: fn.stats,
-      dispose: fn.dispose
+      clear: fn.clear
     })
   )
 

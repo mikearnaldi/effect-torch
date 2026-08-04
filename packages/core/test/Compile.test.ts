@@ -132,13 +132,13 @@ onDevices("Compile", () => (it) => {
       })
     )
 
-    it.effect("dispose releases cached programs", () =>
+    it.effect("clear releases cached programs", () =>
       Effect.gen(function* () {
         const fn = yield* Tensor.compile(([a]) => Effect.map(Tensor.relu(a), (out) => [out]))
         const x = yield* Tensor.fromTypedArray(floats([1]), [1])
         yield* fn.call([x])
         expect(fn.stats().cached).toBe(1)
-        yield* fn.dispose()
+        yield* fn.clear()
         expect(fn.stats()).toEqual({ cached: 0, compiled: 1 })
       })
     )

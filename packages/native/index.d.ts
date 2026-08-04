@@ -8,7 +8,6 @@ export declare class CancellationToken {
 
 export declare class CompiledProgram {
   get signature(): string
-  dispose(): void
   run(inputs: Array<NativeTensor>, scalars: Array<number>, token?: CancellationToken | undefined | null): Promise<Array<NativeTensor>>
 }
 
@@ -18,13 +17,11 @@ export declare class DecodeProgram {
   get layers(): number
   get kvHeads(): number
   get headDim(): number
-  dispose(): void
   run(inputs: Array<NativeTensor>, seq: NativeKvSequence, tokens: Array<number>, token?: CancellationToken | undefined | null): Promise<Array<NativeTensor>>
   runBatched(inputs: Array<NativeTensor>, seqs: Array<NativeKvSequence>, tokens: Array<Array<number>>, token?: CancellationToken | undefined | null): Promise<Array<NativeTensor>>
 }
 
 export declare class LazyTensor {
-  dispose(): void
   get shape(): Array<number>
   get dtype(): string
   static zeros(shape: Array<number>, dtype?: NativeDType | undefined | null, device?: string | undefined | null): LazyTensor
@@ -122,7 +119,6 @@ export declare class NativeTensor {
   get shape(): Array<number>
   get dtype(): string
   get device(): string
-  dispose(): void
   readback(token?: CancellationToken | undefined | null): Promise<ArrayBuffer>
 }
 

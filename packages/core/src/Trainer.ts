@@ -201,9 +201,9 @@ export interface CompiledTrainer<S, EL = never, RL = never, ED = never, RD = nev
    */
   readonly stats: () => Tensor.CompileStats
   /**
-   * Releases the cached programs.
+   * Clears the cached programs early (they are otherwise collected by GC).
    */
-  readonly dispose: () => Effect.Effect<void>
+  readonly clear: () => Effect.Effect<void>
 }
 
 /**
@@ -280,7 +280,7 @@ export const compile = <S, EL = never, RL = never, ED = never, RD = never, EO = 
       ...trainer,
       train: (params) => trainLoop(trainer.model, trainer.config, params, cache),
       stats: () => Tensor.programCacheStats(cache),
-      dispose: () => Tensor.disposeProgramCache(cache)
+      clear: () => Tensor.clearProgramCache(cache)
     }
   })
 

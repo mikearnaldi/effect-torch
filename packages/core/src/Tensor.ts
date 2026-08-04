@@ -3400,30 +3400,6 @@ export const toNumberArray = (self: Any): Effect.Effect<Array<number>, TensorErr
       )
 
 /**
- * Explicitly releases the native buffer of a materialized tensor instead of
- * waiting for GC. In workloads that replace device-resident values every
- * iteration (like training loops replacing parameters and optimizer state),
- * prompt release lets the backend allocator reuse the buffers immediately —
- * on backends with a scanning allocator (Metal) this keeps per-iteration
- * cost flat. Using the tensor afterwards fails at evaluation time.
- *
- * @since 0.1.0
- * @category destructors
- */
-export const dispose = (self: Concrete): Effect.Effect<void, TensorError> =>
-  Effect.try({
-    try: () => {
-      self.materialized.dispose()
-      self.lazy.dispose()
-    },
-    catch: (error) =>
-      new TensorError({
-        op: "dispose",
-        message: error instanceof Error ? error.message : String(error)
-      })
-  })
-
-/**
  * Saves tensors to a safetensors file. The tensors are evaluated and
  * serialized entirely on the native side — all entries share a single graph
  * walk (shared subgraphs are computed once, `randn` draws are consistent
@@ -3519,12 +3495,12 @@ export interface CompiledFn<E = never, R = never> {
     scalars?: ReadonlyArray<number>
   ) => Effect.Effect<Array<Concrete>, TensorError | E, R>
   readonly stats: () => CompileStats
-  readonly dispose: () => Effect.Effect<void>
+  readonly clear: () => Effect.Effect<void>
 }
 
 /**
  * The shape-keyed program cache behind a compiled function or trainer.
- * A bounded LRU (programs evicted past `capacity` are disposed) with
+ * A bounded LRU (programs evicted past `capacity` become GC-collectable) with
  * single-flight tracing: concurrent misses on the same signature trace
  * once and every waiter receives the same program. Owned by the compiled
  * value — dropping the last reference makes the whole cache collectable.
@@ -3575,13 +3551,10 @@ export const programCacheStats = (cache: ProgramCache): CompileStats => ({
  * @category compilation
  * @internal
  */
-export const disposeProgramCache = (cache: ProgramCache): Effect.Effect<void> =>
+export const clearProgramCache = (cache: ProgramCache): Effect.Effect<void> =>
   Effect.sync(() => {
-    for (const entry of cache.entries.values()) {
-      if (entry._tag === "ready") {
-        entry.program.dispose()
-      }
-    }
+    // Dropping the last JS reference makes the native program collectable;
+    // its finalizer releases the frozen graph.
     cache.entries.clear()
     cache.keys.clear()
   })
@@ -3598,11 +3571,7 @@ const evictProgramCache = (cache: ProgramCache): void => {
       if (oldest === undefined) {
         return
       }
-      const entry = cache.entries.get(oldest)
       cache.entries.delete(oldest)
-      if (entry?._tag === "ready") {
-        entry.program.dispose()
-      }
     }
 }
 
@@ -4099,7 +4068,7 @@ export const compile = <E = never, R = never>(
           return yield* runProgram(program, inputs, scalars)
         }),
       stats: () => programCacheStats(cache),
-      dispose: () => disposeProgramCache(cache)
+      clear: () => clearProgramCache(cache)
     }
     return self
   })

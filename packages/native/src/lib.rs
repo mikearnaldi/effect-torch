@@ -375,22 +375,6 @@ impl NativeTensor {
         self.inner.device().name().to_string()
     }
 
-    // Explicitly releases the underlying buffer: the tensor is replaced by an
-    // empty CPU scalar, dropping the last strong reference to the real buffer
-    // (unless graph leaves still share it) so the backend allocator can reuse
-    // it immediately instead of waiting for GC. Using the tensor afterwards
-    // fails at evaluation time.
-    #[napi]
-    pub fn dispose(&mut self, env: Env) -> Result<()> {
-        let bytes = std::mem::take(&mut self.bytes);
-        if bytes != 0 {
-            EXTERNAL_MEMORY_BYTES.fetch_sub(bytes, Ordering::Relaxed);
-            sync_v8(&env);
-        }
-        self.inner = val::Val::Cpu(runtime::cpu::Tensor::zeros(&[], runtime::dtype::DType::F32));
-        Ok(())
-    }
-
     #[napi(ts_return_type = "Promise<ArrayBuffer>")]
     pub async fn readback(&self, token: Option<&CancellationToken>) -> Result<Readback> {
         let inner = self.inner.clone();
@@ -2121,21 +2105,6 @@ macro_rules! lazy_ctor {
 
 #[napi]
 impl LazyTensor {
-    // Replaces the node with an empty constant, dropping the reference to the
-    // subgraph (including any materialized leaf buffer) so it can be freed
-    // immediately instead of waiting for GC. Using the tensor afterwards
-    // fails at evaluation time.
-    #[napi]
-    pub fn dispose(&mut self) -> Result<()> {
-        self.node = Node::new(NodeKind::Full {
-            shape: vec![],
-            value: 0.0,
-            dtype: DType::F32,
-            device: Device::Cpu,
-        })
-        .map_err(|message| Error::new(Status::GenericFailure, message))?;
-        Ok(())
-    }
 
     #[napi(getter)]
     pub fn shape(&self) -> Vec<u32> {
@@ -9337,7 +9306,7 @@ impl NativeKvPool {
     }
 }
 
-#[napi]
+#[napi(custom_finalize)]
 pub struct NativeKvSequence {
     pool: Arc<PoolInner>,
     state: Arc<Mutex<SeqState>>,
@@ -9345,6 +9314,15 @@ pub struct NativeKvSequence {
     // (their blocks are disjoint by allocation).
     run_lock: Arc<Mutex<()>>,
     released: AtomicBool,
+}
+
+// Blocks return to the pool when the sequence is collected — GC alone is
+// sufficient for lifecycle; `release()` only returns them early.
+impl ObjectFinalize for NativeKvSequence {
+    fn finalize(self, _env: Env) -> Result<()> {
+        self.return_blocks();
+        Ok(())
+    }
 }
 
 impl NativeKvSequence {
@@ -9443,7 +9421,7 @@ impl NativeKvSequence {
 
 #[napi]
 pub struct DecodeProgram {
-    inner: Option<ProgramInner>,
+    inner: ProgramInner,
     cursor_slot: u32,
     layers: u32,
     kv_heads: u32,
@@ -9460,10 +9438,7 @@ impl DecodeProgram {
     }
     #[napi(getter)]
     pub fn signature(&self) -> Result<String> {
-        self.inner
-            .as_ref()
-            .map(|inner| inner.signature.clone())
-            .ok_or_else(|| Error::new(Status::GenericFailure, "program is disposed".to_string()))
+        Ok(self.inner.signature.clone())
     }
 
     #[napi(getter)]
@@ -9479,11 +9454,6 @@ impl DecodeProgram {
     #[napi(getter)]
     pub fn head_dim(&self) -> u32 {
         self.head_dim
-    }
-
-    #[napi]
-    pub fn dispose(&mut self) {
-        self.inner = None;
     }
 
     // Runs the frozen decode/prefill graph against a sequence: the
@@ -9580,10 +9550,7 @@ impl DecodeProgram {
                 ));
             }
         }
-        let inner = self
-            .inner
-            .as_ref()
-            .ok_or_else(|| Error::new(Status::GenericFailure, "program is disposed".to_string()))?;
+        let inner = &self.inner;
         let tensor_count = inner.slots.iter().filter(|s| !s.scalar).count();
         let caller_inputs = tensor_count - usize::from(self.cursor_tensor);
         if inputs.len() != caller_inputs {
@@ -9772,12 +9739,12 @@ pub fn compile_decode(roots: Vec<&LazyTensor>, window: Option<u32>, batch: Optio
         .collect::<Vec<_>>()
         .join(",");
     Ok(DecodeProgram {
-        inner: Some(ProgramInner {
+        inner: ProgramInner {
             roots: nodes,
             slots,
             leaves,
             signature,
-        }),
+        },
         cursor_slot: geometry.cursor_slot,
         layers: geometry.layers as u32,
         kv_heads: geometry.kv_heads as u32,
@@ -9827,7 +9794,7 @@ struct ProgramInner {
 
 #[napi]
 pub struct CompiledProgram {
-    inner: Option<ProgramInner>,
+    inner: ProgramInner,
 }
 
 fn collect_program_slots(
@@ -9916,20 +9883,12 @@ fn scalar_binding(value: f64, dtype: DType, device: &Device) -> err::Res<val::Va
 impl CompiledProgram {
     #[napi(getter)]
     pub fn signature(&self) -> Result<String> {
-        self.inner
-            .as_ref()
-            .map(|inner| inner.signature.clone())
-            .ok_or_else(|| Error::new(Status::GenericFailure, "program is disposed".to_string()))
+        Ok(self.inner.signature.clone())
     }
 
     // Drops the frozen graphs; constant/parameter leaf buffers stay alive
     // through any NativeTensor handles that share them. Running a disposed
     // program is an error.
-    #[napi]
-    pub fn dispose(&mut self) {
-        self.inner = None;
-    }
-
     #[napi]
     pub async fn run(
         &self,
@@ -9937,10 +9896,7 @@ impl CompiledProgram {
         scalars: Vec<f64>,
         token: Option<&CancellationToken>,
     ) -> Result<Vec<NativeTensor>> {
-        let inner = self
-            .inner
-            .as_ref()
-            .ok_or_else(|| Error::new(Status::GenericFailure, "program is disposed".to_string()))?;
+        let inner = &self.inner;
         let tensor_count = inner.slots.iter().filter(|s| !s.scalar).count();
         let scalar_count = inner.slots.len() - tensor_count;
         if inputs.len() != tensor_count {
@@ -10085,12 +10041,12 @@ pub fn compile(roots: Vec<&LazyTensor>) -> Result<CompiledProgram> {
         .collect::<Vec<_>>()
         .join(",");
     Ok(CompiledProgram {
-        inner: Some(ProgramInner {
+        inner: ProgramInner {
             roots: nodes,
             slots,
             leaves,
             signature,
-        }),
+        },
     })
 }
 

@@ -288,7 +288,7 @@ onDevices("Trainer", () => (it) => {
       })
     )
 
-    it.effect("dispose releases the cached programs", () =>
+    it.effect("clear releases the cached programs", () =>
       Effect.gen(function* () {
         const model = yield* mlp
         const data = yield* xor
@@ -301,7 +301,7 @@ onDevices("Trainer", () => (it) => {
         }))
         yield* trainer.train()
         expect(trainer.stats().cached).toBe(1)
-        yield* trainer.dispose()
+        yield* trainer.clear()
         expect(trainer.stats()).toEqual({ cached: 0, compiled: 1 })
       })
     )
