@@ -140,6 +140,21 @@ export interface Trained<S> {
   readonly params: ReadonlyArray<Tensor.Concrete>
   readonly state: S
   readonly loss: number
+  readonly step: number
+}
+
+/**
+ * A resumable training position: the optimizer state and global step
+ * count exactly as a previous {@link Trained} returned them. Passing it
+ * back to `train` continues the run as if it had never stopped — same
+ * optimizer moments, same step numbering for `stop`/`onStep`.
+ *
+ * @since 0.1.0
+ * @category models
+ */
+export interface Resume<S> {
+  readonly state: S
+  readonly step: number
 }
 
 /**
@@ -167,7 +182,8 @@ export interface Trainer<S, EL = never, RL = never, ED = never, RD = never, EO =
    * deterministic graphs.
    */
   readonly train: (
-    params?: Model.Params
+    params?: Model.Params,
+    resume?: Resume<S>
   ) => Effect.Effect<
     Trained<S>,
     Model.ModelError | Tensor.TensorError | Gradient.GradError | EL | ED | EO,
@@ -232,7 +248,7 @@ export const make = <S, EL = never, RL = never, ED = never, RD = never, EO = nev
   Effect.succeed({
     model,
     config,
-    train: (params) => trainLoop(model, config, params, undefined)
+    train: (params, resume) => trainLoop(model, config, params, resume, undefined)
   })
 
 /**
@@ -278,7 +294,7 @@ export const compile = <S, EL = never, RL = never, ED = never, RD = never, EO = 
     return {
       [CompiledTypeId]: CompiledTypeId,
       ...trainer,
-      train: (params) => trainLoop(trainer.model, trainer.config, params, cache),
+      train: (params, resume) => trainLoop(trainer.model, trainer.config, params, resume, cache),
       stats: cache.stats,
       clear: cache.clear
     }
@@ -399,6 +415,7 @@ const trainLoop = <S, EL = never, RL = never, ED = never, RD = never, EO = never
   model: Model.Model,
   config: TrainConfig<S, EL, RL, ED, RD, EO, RO>,
   initial: Model.Params | undefined,
+  resume: Resume<S> | undefined,
   cache: Tensor.ProgramCache | undefined
 ): Effect.Effect<
   Trained<S>,
@@ -409,7 +426,7 @@ const trainLoop = <S, EL = never, RL = never, ED = never, RD = never, EO = never
     let params: Model.Params = initial !== undefined
       ? initial
       : yield* model.init
-    let state = yield* config.optimizer.init(params)
+    let state = resume !== undefined ? resume.state : yield* config.optimizer.init(params)
     if (cache !== undefined) {
       // Program inputs must be materialized buffers: the initial
       // parameters and state are lazy graph values, so evaluate them
@@ -419,7 +436,7 @@ const trainLoop = <S, EL = never, RL = never, ED = never, RD = never, EO = never
       params = materialized.slice(0, params.length)
       state = config.optimizer.rebuildState(state, materialized.slice(params.length))
     }
-    let step = 0
+    let step = resume?.step ?? 0
     let loss = Number.NaN
     let trained: ReadonlyArray<Tensor.Concrete>
     const started = yield* Effect.sync(() => Date.now())
@@ -445,5 +462,5 @@ const trainLoop = <S, EL = never, RL = never, ED = never, RD = never, EO = never
       }
       if (config.stop(info)) break
     } while (true)
-    return { params: trained, state, loss }
+    return { params: trained, state, loss, step }
   })

@@ -208,6 +208,35 @@ onDevices("Trainer", () => (it) => {
       })
     )
 
+    it.effect("resume continues with identical params, state, and step numbering", () =>
+      Effect.gen(function* () {
+        const model = yield* mlp
+        const input = yield* Tensor.fromTypedArray(floats([0, 1, 1, 0]), [2, 2])
+        const target = yield* Tensor.fromTypedArray(floats([1, 0]), [2, 1])
+        const initial = yield* Tensor.compute(yield* model.init)
+        const makeTrainer = (stopStep: number) =>
+          Effect.gen(function* () {
+            return yield* Trainer.compile(yield* Trainer.make(model, {
+              optimizer: yield* Optimizer.adam(),
+              lr: LearningRate.constant(0.05),
+              loss: Loss.mse,
+              data: { input, target },
+              stop: ({ step }) => step >= stopStep
+            }))
+          })
+        const uninterrupted = yield* (yield* makeTrainer(20)).train(initial)
+        const first = yield* (yield* makeTrainer(8)).train(initial)
+        expect(first.step).toBe(8)
+        const resumed = yield* (yield* makeTrainer(20)).train(first.params, { state: first.state, step: first.step })
+        expect(resumed.step).toBe(20)
+        expect(uninterrupted.step).toBe(20)
+        expect(resumed.loss).toBe(uninterrupted.loss)
+        for (let i = 0; i < uninterrupted.params.length; i++) {
+          expect(yield* values(resumed.params[i])).toEqual(yield* values(uninterrupted.params[i]))
+        }
+      })
+    )
+
     it.effect("agrees with the uncompiled loop under a learning-rate schedule", () =>
       Effect.gen(function* () {
         const model = yield* mlp

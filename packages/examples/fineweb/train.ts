@@ -11,9 +11,12 @@ import { BLOCK, CHECKPOINT, createGpt, loadTokenizer, saveParams } from "./model
 
 const TRAIN_BIN = new URL("../data/fineweb-train.bin", import.meta.url).pathname
 const VAL_BIN = new URL("../data/fineweb-val.bin", import.meta.url).pathname
+const CKPT_BIN = new URL("../data/fineweb-ckpt.safetensors", import.meta.url).pathname
+const CKPT_META = new URL("../data/fineweb-ckpt.json", import.meta.url).pathname
 
 const BATCH = 64
-const STEPS = 5000
+const STEPS = Number(process.env.FINEWEB_STEPS ?? 5000)
+const CHECKPOINT_EVERY = Number(process.env.FINEWEB_CHECKPOINT_EVERY ?? 1000)
 const LR = 6e-4
 const VAL_BATCHES = 20
 
@@ -93,10 +96,11 @@ const program = Effect.gen(function* () {
   const total = params0.reduce((sum, param) => sum + param.shape.reduce((a, b) => a * b, 1), 0)
   yield* Effect.log(`  total: ${total.toLocaleString()} parameters`)
 
-  yield* Effect.log(`2) training: adamW lr=${LR}, ${STEPS} steps`)
+  yield* Effect.log(`2) training: adamW lr=${LR}, ${STEPS} steps (checkpoint every ${CHECKPOINT_EVERY})`)
   const sampler = makeTrainSampler(train, (epoch) => console.log(`epoch ${epoch}`))
+  const optimizer = yield* Optimizer.adamW()
   const trainer = yield* Trainer.compile(yield* Trainer.make(model, {
-    optimizer: yield* Optimizer.adamW(),
+    optimizer,
     lr: LearningRate.constant(LR),
     loss: Loss.crossEntropy,
     data: () =>
@@ -107,12 +111,63 @@ const program = Effect.gen(function* () {
           target: yield* Tensor.fromTypedArray(targets, [BATCH, BLOCK])
         }
       }),
-    stop: ({ step }) => step >= STEPS,
+    stop: ({ step }) => step >= chunkTarget,
     onStep: ({ step, loss, elapsed }) =>
-      Effect.log(`step ${String(step).padStart(4)}  loss ${loss.toFixed(4)}  ${(Duration.toMillis(elapsed) / 1000).toFixed(1)}s`)
+      step % 50 === 0 || step === 1
+        ? Effect.log(
+          `step ${String(step).padStart(4)}  loss ${loss.toFixed(4)}  ${(Duration.toMillis(elapsed) / 1000).toFixed(1)}s`
+        )
+        : Effect.void
   }))
-  const trained = yield* trainer.train(params0)
-  const params = trained.params
+
+  // Resume when a checkpoint exists: params by name, optimizer state by
+  // state-roots order, global step from the meta file. 0-d state roots
+  // (AdamW's step count) live in the meta as numbers — the optimizer's
+  // own f64 CPU encoding can't ride the safetensors onto the device —
+  // and are rebuilt as f32 on the ambient device (AdamW casts the count
+  // per use, so its storage dtype is immaterial). The window permutation
+  // starts fresh (a reshuffle, as at any epoch boundary).
+  let params = params0
+  let step = 0
+  let resume: Trainer.Resume<Optimizer.AdamState> | undefined
+  if (fs.existsSync(CKPT_BIN) && fs.existsSync(CKPT_META)) {
+    const tensors = yield* Tensor.load(CKPT_BIN)
+    const meta = JSON.parse(fs.readFileSync(CKPT_META, "utf8"))
+    params = model.names.map((name) => tensors[`param:${name}`])
+    const fresh = yield* optimizer.init(params)
+    const roots = yield* Effect.forEach(optimizer.stateRoots(fresh), (root, i) =>
+      root.shape.length === 0
+        ? Tensor.full([], meta.scalars[i], { dtype: "f32" })
+        : Effect.succeed(tensors[`state:${i}`]))
+    step = meta.step
+    resume = { state: optimizer.rebuildState(fresh, roots), step }
+    yield* Effect.log(`resuming from step ${step}`)
+  }
+
+  let chunkTarget = Math.min(step + CHECKPOINT_EVERY, STEPS)
+  while (step < STEPS) {
+    const trained = yield* trainer.train(params, resume)
+    params = trained.params
+    step = trained.step
+    resume = { state: trained.state, step }
+    const tensors: Record<string, Tensor.Any> = Object.fromEntries(
+      model.names.map((name, i) => [`param:${name}`, params[i]])
+    )
+    const scalars: Record<number, number> = {}
+    for (const [i, root] of optimizer.stateRoots(trained.state).entries()) {
+      if (root.shape.length === 0) {
+        const [materialized] = yield* Tensor.compute([root])
+        const [value] = yield* Tensor.toNumberArray(materialized)
+        scalars[i] = value
+      } else {
+        tensors[`state:${i}`] = root
+      }
+    }
+    yield* Tensor.save(CKPT_BIN, tensors)
+    fs.writeFileSync(CKPT_META, JSON.stringify({ step, scalars }))
+    yield* Effect.log(`checkpoint at step ${step}`)
+    chunkTarget = Math.min(step + CHECKPOINT_EVERY, STEPS)
+  }
 
   yield* Effect.log(`3) held-out loss over ${VAL_BATCHES} val batches`)
   let valLoss = 0
