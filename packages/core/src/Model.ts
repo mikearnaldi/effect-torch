@@ -35,7 +35,7 @@
  *
  * @since 0.1.0
  */
-import { Data, Effect, Scope, Semaphore } from "effect"
+import { Data, Effect, Semaphore } from "effect"
 import { CurrentDevice } from "./Device.ts"
 import * as Gradient from "./Gradient.ts"
 import * as Tensor from "./Tensor.ts"
@@ -1256,6 +1256,12 @@ export interface Generation {
   >
   /** The number of live sequences. */
   readonly live: () => Effect.Effect<number>
+  /**
+   * Releases every live sequence's blocks now (they would otherwise
+   * return to the pool at GC). The session stays usable — new
+   * sequences can be added after closing.
+   */
+  readonly close: () => Effect.Effect<void>
 }
 
 /**
@@ -1263,16 +1269,24 @@ export interface Generation {
  * (chunked prefill, decode) plus the kv pool they run against, derived
  * from the model's structure and compiled eagerly at construction. Not
  * a {@link Model}: generation runs through {@link Generation} sessions.
- * The artifact is immutable and parallel-safe; sessions and their
- * sequences are Scope-managed. The artifact itself has no explicit
- * lifetime — native finalizers release programs and pool when it is
- * unreachable.
+ * The artifact is immutable and parallel-safe; sequences' blocks return
+ * to the pool at GC (native finalizers), with Generation.close and
+ * GenerationSeq.finish as the explicit early releases. The artifact
+ * itself has no explicit lifetime — native finalizers release programs
+ * and pool when it is unreachable.
  *
  * @since 0.1.0
  * @category compilation
  */
 export interface InferenceProgram {
-  readonly generation: () => Effect.Effect<Generation, InferenceError, Scope.Scope>
+  /**
+   * Opens a generation session. No Scope required: sequences return
+   * their blocks to the pool when collected (native finalizers) —
+   * {@link Generation.close} is the explicit, deterministic release
+   * for prompt cleanup, and {@link GenerationSeq.finish} the
+   * per-sequence one.
+   */
+  readonly generation: () => Effect.Effect<Generation, InferenceError>
 }
 
 /**
@@ -1291,9 +1305,10 @@ export interface InferenceProgram {
  * (no shape-keyed growth, unlike the JIT caches of RFC 0008) and the
  * pool is device memory of the same kind tensors are — all of it is
  * released by the native finalizers when the artifact is unreachable.
- * {@link Sequence}s, by contrast, hold pool blocks — a capacity
- * resource with no GC-visible pressure signal — so they are
- * Scope-managed.
+ * Live sequences do pin pool blocks — a capacity resource — but those
+ * return through the same finalizers; {@link Generation.close} and
+ * {@link GenerationSeq.finish} exist for prompt, deterministic release
+ * under pressure.
  *
  * @since 0.1.0
  * @category compilation
@@ -1429,12 +1444,6 @@ export const inference = (
         Effect.gen(function* () {
           const roundLock = yield* Semaphore.make(1)
           const live: Array<LiveEntry> = []
-          yield* Effect.addFinalizer(() =>
-            Effect.sync(() => {
-              for (const entry of live) entry.native.release()
-              live.length = 0
-            })
-          )
           const add = (prompt: Tensor.Any) =>
             Effect.gen(function* () {
               if (live.length >= decodeBatch) {
@@ -1571,7 +1580,12 @@ export const inference = (
                   return results
                 })
               ),
-            live: () => Effect.sync(() => live.length)
+            live: () => Effect.sync(() => live.length),
+            close: () =>
+              Effect.sync(() => {
+                for (const entry of live) entry.native.release()
+                live.length = 0
+              })
           }
           return generation
         })

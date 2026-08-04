@@ -263,10 +263,11 @@ onDevices("Inference", () => (it) => {
         // Exactly one 3-block prompt fits; a second, different prompt
         // succeeds only by evicting the first's cached blocks.
         const program = yield* Model.inference(model, params, { maxTokens: 12, blockSize: 4 })
-        yield* Effect.scoped(Effect.gen(function* () {
+        {
           const gen = yield* program.generation()
           yield* gen.add(yield* ids([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 0]))
-        }))
+          yield* gen.close()
+        }
         const prompt = [2, 4, 6, 8, 10, 0, 1, 3, 5, 7, 9, 11]
         const gen = yield* program.generation()
         const entry = yield* gen.add(yield* ids(prompt))
@@ -295,16 +296,14 @@ onDevices("Inference", () => (it) => {
         // Generate past the window: the prompt's first block leaves the
         // window, lands in the prefix cache, and the sequence finishes
         // the rest of the prompt's blocks into the cache as well.
-        yield* Effect.scoped(Effect.gen(function* () {
+        {
           const gen = yield* program.generation()
           const entry = yield* gen.add(yield* ids(prompt))
-          let logits = entry.logits
           for (let i = 0; i < 4; i++) {
-            const [stepped] = yield* gen.step([{ seq: entry.seq, token: 0 }])
-            logits = stepped
-            void logits
+            yield* gen.step([{ seq: entry.seq, token: 0 }])
           }
-        }))
+          yield* gen.close()
+        }
         const gen = yield* program.generation()
         const entry = yield* gen.add(yield* ids(prompt))
         const input = yield* ids(prompt)

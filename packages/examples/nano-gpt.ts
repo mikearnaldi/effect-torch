@@ -178,7 +178,7 @@ const generate = (
   tokenizer: Tokenizer.Tokenizer,
   prompt: string
 ) =>
-  Effect.scoped(Effect.gen(function* () {
+  Effect.gen(function* () {
     const bosId = Option.getOrThrow(tokenizer.tokenToId(BOS))
     const eosId = Option.getOrThrow(tokenizer.tokenToId(EOS))
     const promptIds = yield* Tensor.toNumberArray(yield* tokenizer.encode(prompt))
@@ -206,8 +206,9 @@ const generate = (
       const [nextLogits] = yield* gen.step([{ seq: entry.seq, token: next }])
       logits = nextLogits
     }
+    yield* gen.close()
     return yield* tokenizer.decode(generated)
-  }))
+  })
 
 const program = Effect.gen(function* () {
   const device = yield* Device.CurrentDevice
