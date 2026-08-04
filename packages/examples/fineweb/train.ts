@@ -2,7 +2,7 @@ import { Duration, Effect } from "effect"
 import { NodeRuntime } from "@effect/platform-node"
 import { Checkpoint, Device, LearningRate, Loss, Optimizer, Sampler, Tensor, Trainer } from "@effect-torch/core"
 import fs from "node:fs"
-import { BLOCK, CHECKPOINT, createGpt, loadTokenizer, saveParams } from "./model.js"
+import { BLOCK, CHECKPOINT, createGpt, heldOutLoss, loadBin, loadTokenizer, saveParams, windows } from "./model.js"
 
 // FineWeb pre-training: trains the shared GPT on the token bins produced
 // by prepare.ts (~745M GPT-2 BPE tokens, u16), reports a held-out loss
@@ -24,36 +24,6 @@ const STEPS = Number(process.env.FINEWEB_STEPS ?? 5000)
 const CHECKPOINT_EVERY = Number(process.env.FINEWEB_CHECKPOINT_EVERY ?? 100)
 const LR = 6e-4
 const VAL_BATCHES = 20
-
-const loadBin = (path: string) => {
-  const buffer = fs.readFileSync(path)
-  if (buffer.byteOffset % 2 !== 0) throw new Error("misaligned token bin buffer")
-  return new Uint16Array(buffer.buffer, buffer.byteOffset, buffer.byteLength / 2)
-}
-
-const windows = (data: Uint16Array, starts: ReadonlyArray<number>) => {
-  const inputs = new Uint32Array(BATCH * BLOCK)
-  const targets = new Uint32Array(BATCH * BLOCK)
-  for (const [b, start] of starts.entries()) {
-    for (let t = 0; t < BLOCK; t++) {
-      inputs[b * BLOCK + t] = data[start + t]
-      targets[b * BLOCK + t] = data[start + t + 1]
-    }
-  }
-  return { inputs, targets }
-}
-
-const sampleBatch = (data: Uint16Array) =>
-  Effect.gen(function* () {
-    const { inputs, targets } = windows(
-      data,
-      Array.from({ length: BATCH }, () => Math.floor(Math.random() * (data.length - BLOCK - 1)))
-    )
-    return {
-      input: yield* Tensor.fromTypedArray(inputs, [BATCH, BLOCK]),
-      target: yield* Tensor.fromTypedArray(targets, [BATCH, BLOCK])
-    }
-  })
 
 const program = Effect.gen(function* () {
   const train = loadBin(TRAIN_BIN)
@@ -77,7 +47,7 @@ const program = Effect.gen(function* () {
     loss: Loss.crossEntropy,
     data: () =>
       Effect.gen(function* () {
-        const { inputs, targets } = windows(train, sampler.next())
+        const { inputs, targets } = windows(train, sampler.next(), BATCH, BLOCK)
         return {
           input: yield* Tensor.fromTypedArray(inputs, [BATCH, BLOCK]),
           target: yield* Tensor.fromTypedArray(targets, [BATCH, BLOCK])
@@ -124,15 +94,8 @@ const program = Effect.gen(function* () {
   }
 
   yield* Effect.log(`3) held-out loss over ${VAL_BATCHES} val batches`)
-  let valLoss = 0
-  for (let i = 0; i < VAL_BATCHES; i++) {
-    const batch = yield* sampleBatch(val)
-    const logits = yield* model.forward(params, batch.input)
-    const [lossTensor] = yield* Tensor.compute([yield* Loss.crossEntropy(logits, batch.target)])
-    const [loss] = yield* Tensor.toNumberArray(lossTensor)
-    valLoss += loss
-  }
-  yield* Effect.log(`val loss ${(valLoss / VAL_BATCHES).toFixed(4)}`)
+  const valLoss = yield* heldOutLoss(model, params, val, BATCH, BLOCK, VAL_BATCHES)
+  yield* Effect.log(`val loss ${valLoss.toFixed(4)}`)
 
   yield* Effect.log(`4) saving checkpoint to ${CHECKPOINT}`)
   yield* saveParams(model, params, CHECKPOINT)

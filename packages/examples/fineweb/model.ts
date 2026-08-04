@@ -1,5 +1,6 @@
 import { Effect } from "effect"
-import { Device, Model, Tensor, Tokenizer } from "@effect-torch/core"
+import { Device, Loss, Model, Tensor, Tokenizer } from "@effect-torch/core"
+import fs from "node:fs"
 
 // Shared pieces of the FineWeb pre-training pilot (see train.ts
 // and infer.ts): the GPT-2-architecture model, its size
@@ -67,4 +68,52 @@ export const loadParams = (
       if (tensor === undefined) throw new Error(`checkpoint ${path} is missing parameter ${name}`)
       return tensor
     })
+  })
+
+/** Reads a u16 token bin produced by prepare.ts. */
+export const loadBin = (path: string) => {
+  const buffer = fs.readFileSync(path)
+  if (buffer.byteOffset % 2 !== 0) throw new Error("misaligned token bin buffer")
+  return new Uint16Array(buffer.buffer, buffer.byteOffset, buffer.byteLength / 2)
+}
+
+/** Materializes batch windows (start offsets) into input/target id arrays. */
+export const windows = (data: Uint16Array, starts: ReadonlyArray<number>, batch: number, block: number) => {
+  const inputs = new Uint32Array(batch * block)
+  const targets = new Uint32Array(batch * block)
+  for (const [b, start] of starts.entries()) {
+    for (let t = 0; t < block; t++) {
+      inputs[b * block + t] = data[start + t]
+      targets[b * block + t] = data[start + t + 1]
+    }
+  }
+  return { inputs, targets }
+}
+
+/** Mean cross-entropy over `batches` random windows of `data`. */
+export const heldOutLoss = (
+  model: Model.Model,
+  params: Model.Params,
+  data: Uint16Array,
+  batch: number,
+  block: number,
+  batches: number
+) =>
+  Effect.gen(function* () {
+    let total = 0
+    for (let i = 0; i < batches; i++) {
+      const { inputs, targets } = windows(
+        data,
+        Array.from({ length: batch }, () => Math.floor(Math.random() * (data.length - block - 1))),
+        batch,
+        block
+      )
+      const input = yield* Tensor.fromTypedArray(inputs, [batch, block])
+      const target = yield* Tensor.fromTypedArray(targets, [batch, block])
+      const logits = yield* model.forward(params, input)
+      const [lossTensor] = yield* Tensor.compute([yield* Loss.crossEntropy(logits, target)])
+      const [loss] = yield* Tensor.toNumberArray(lossTensor)
+      total += loss
+    }
+    return total / batches
   })
