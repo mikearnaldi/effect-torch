@@ -187,8 +187,7 @@ kernel void et_sdpa_fwd(
         let mut hasher = DefaultHasher::new();
         (t, s, d, dv, scale.to_bits(), causal).hash(&mut hasher);
         let key = hasher.finish();
-        let src = kernel_source(t, s, d, dv, scale, causal);
-        MetalDevice::get().compile(key, &src, "et_sdpa_fwd")
+        MetalDevice::get().compile_lazy(key, "et_sdpa_fwd", || kernel_source(t, s, d, dv, scale, causal))
     }
 
     pub fn forward(
@@ -238,8 +237,6 @@ kernel void et_sdpa_fwd(
                 },
             );
         });
-        MetalDevice::get().synchronize();
-        MetalDevice::get().synchronize();
         let o = MetalTensor {
             buffer: o_buf,
             layout: crate::runtime::layout::Layout::contiguous(out_shape),
@@ -509,8 +506,7 @@ kernel void et_sdpa_bwd_q(
         let mut hasher = DefaultHasher::new();
         (name, t, s, d, dv, scale.to_bits(), causal).hash(&mut hasher);
         let key = hasher.finish();
-        let src = bwd_source(t, s, d, dv, scale, causal);
-        MetalDevice::get().compile(key, &src, name)
+        MetalDevice::get().compile_lazy(key, name, || bwd_source(t, s, d, dv, scale, causal))
     }
 
     // The fused backward: d_vec via candle (one small op), then two
@@ -616,8 +612,6 @@ kernel void et_sdpa_bwd_q(
                 );
             });
         }
-        MetalDevice::get().synchronize();
-        MetalDevice::get().synchronize();
         let dq = MetalTensor {
             buffer: dq_buf,
             layout: crate::runtime::layout::Layout::contiguous(q_shape),

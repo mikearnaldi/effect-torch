@@ -96,7 +96,7 @@ pub fn gemm(
         _ => unreachable!(),
     };
     let has_bias = bias.is_some();
-    let pipeline = dev.compile(key_for(has_bias, a.dtype), &gemm_source(has_bias, ty), "et_gemm")?;
+    let pipeline = dev.compile_lazy(key_for(has_bias, a.dtype), "et_gemm", || gemm_source(has_bias, ty))?;
     let out = MetalTensor {
         buffer: dev.alloc(batch * m * n, a.dtype),
         layout: crate::runtime::layout::Layout::contiguous(vec![batch, m, n]),

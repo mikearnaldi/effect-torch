@@ -364,7 +364,7 @@ pub fn cumsum(a: &MetalTensor, dim: usize) -> crate::err::Res<MetalTensor> {
 }
 
 pub fn fill(shape: &[usize], value: f64, dtype: DType) -> crate::err::Res<MetalTensor> {
-    let out = MetalTensor::zeros(MetalDevice::get(), shape.to_vec(), dtype);
+    let out = MetalTensor::empty(MetalDevice::get(), shape.to_vec(), dtype);
     kernels::fill(MetalDevice::get(), &out, value)?;
     Ok(out)
 }

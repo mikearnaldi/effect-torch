@@ -2916,6 +2916,9 @@ struct Evaluator {
     // dtype/device, memoized per walk: identical for every parameter,
     // and the naive path copies each scalar per parameter per step.
     step_scalars: std::collections::HashMap<(u64, DType, u8), val::Val>,
+    // Device-packed fusion scalar buffers (cat of the 0-d step scalars),
+    // memoized per walk: every AdamW group in a step packs the same triple.
+    scalar_packs: std::collections::HashMap<(u64, u64, u64), val::Val>,
     consumers: std::collections::HashMap<u64, usize>,
     roots: HashSet<u64>,
     // RFC 0008: Input/ScalarInput node id -> argument buffer, populated by
@@ -2959,6 +2962,7 @@ impl Evaluator {
             multi: std::collections::HashMap::new(),
             ln: std::collections::HashMap::new(),
             step_scalars: std::collections::HashMap::new(),
+            scalar_packs: std::collections::HashMap::new(),
             consumers,
             roots: roots.iter().map(|root| root.id).collect(),
             slots,
@@ -5180,18 +5184,29 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> crate::err::Res<val::V
             let c1_t = ev.step_scalar(c1.id, p.dtype(), &p.device())?;
             let c2_t = ev.step_scalar(c2.id, p.dtype(), &p.device())?;
             let fused = if fusion::is_supported(&p.device(), p.dtype()) {
-                let exprs = fusion::adamw_exprs(*beta1, *beta2, *eps, *weight_decay);
-                fusion::run(
-                    &exprs,
-                    &[p.clone(), g.clone(), m_t.clone(), v_t.clone()],
-                    None,
-                    &[lr_t.clone(), c1_t.clone(), c2_t.clone()],
-                    p.numel(),
-                    &p.shape(),
-                    p.dtype(),
-                    &p.device(),
-                )
-                .ok()
+                if p.device().is_cpu() {
+                    let exprs = fusion::adamw_exprs(*beta1, *beta2, *eps, *weight_decay);
+                    fusion::run(
+                        &exprs,
+                        &[p.clone(), g.clone(), m_t.clone(), v_t.clone()],
+                        None,
+                        &[lr_t.clone(), c1_t.clone(), c2_t.clone()],
+                        p.numel(),
+                        &p.shape(),
+                        p.dtype(),
+                        &p.device(),
+                    )
+                    .ok()
+                } else {
+                    let plan = fusion::adamw_group_plan(1, &p.shape(), *beta1, *beta2, *eps, *weight_decay);
+                    let pack = match ev.scalar_packs.entry((lr.id, c1.id, c2.id)) {
+                        std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+                        std::collections::hash_map::Entry::Vacant(e) => {
+                            e.insert(fusion::pack_scalars_metal(&[lr_t.clone(), c1_t.clone(), c2_t.clone()])?)
+                        }
+                    };
+                    fusion::run_group_metal(&plan, &[p.clone(), g.clone(), m_t.clone(), v_t.clone()], pack, &p.shape()).ok()
+                }
             } else {
                 None
             };
@@ -5280,26 +5295,37 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> crate::err::Res<val::V
                 inputs.push(ev.value(ms[i].id)?);
                 inputs.push(ev.value(vs[i].id)?);
             }
-            let base = fusion::adamw_exprs(*beta1, *beta2, *eps, *weight_decay);
-            let mut exprs = Vec::with_capacity(params.len() * 3);
-            for i in 0..params.len() {
-                let remap: std::collections::HashMap<u32, u32> = (0u32..4)
-                    .map(|k| (k, (i * 4) as u32 + k))
-                    .collect();
-                for expr in &base {
-                    exprs.push(expr.remap_lanes(&remap));
+            let outs = if !first_p.device().is_cpu() && fusion::is_supported(&first_p.device(), first_p.dtype()) {
+                let plan = fusion::adamw_group_plan(params.len(), &first_p.shape(), *beta1, *beta2, *eps, *weight_decay);
+                let pack = match ev.scalar_packs.entry((lr.id, c1.id, c2.id)) {
+                    std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+                    std::collections::hash_map::Entry::Vacant(e) => {
+                        e.insert(fusion::pack_scalars_metal(&[lr_t, c1_t, c2_t])?)
+                    }
+                };
+                fusion::run_group_metal(&plan, &inputs, pack, &first_p.shape())?
+            } else {
+                let base = fusion::adamw_exprs(*beta1, *beta2, *eps, *weight_decay);
+                let mut exprs = Vec::with_capacity(params.len() * 3);
+                for i in 0..params.len() {
+                    let remap: std::collections::HashMap<u32, u32> = (0u32..4)
+                        .map(|k| (k, (i * 4) as u32 + k))
+                        .collect();
+                    for expr in &base {
+                        exprs.push(expr.remap_lanes(&remap));
+                    }
                 }
-            }
-            let outs = fusion::run(
-                &exprs,
-                &inputs,
-                None,
-                &[lr_t, c1_t, c2_t],
-                first_p.numel(),
-                &first_p.shape(),
-                first_p.dtype(),
-                &first_p.device(),
-            )?;
+                fusion::run(
+                    &exprs,
+                    &inputs,
+                    None,
+                    &[lr_t, c1_t, c2_t],
+                    first_p.numel(),
+                    &first_p.shape(),
+                    first_p.dtype(),
+                    &first_p.device(),
+                )?
+            };
             let head = outs[0].clone();
             ev.multi.insert(node.id, outs);
             head
@@ -10036,7 +10062,8 @@ impl CompiledProgram {
             let t_sync = t1.elapsed() - t_encode;
             ev.run_ce_checks().map_err(to_napi_err)?;
             if walk_timing {
-                eprintln!("[walk] program eval {:.1}us ({} roots) encode {:.1}us sync {:.1}us", t1.elapsed().as_micros(), roots.len(), t_encode.as_micros(), t_sync.as_micros());
+                let (d, s, n) = crate::runtime::metal::device::dispatch_stats_reset();
+                eprintln!("[walk] program eval {:.1}us ({} roots) encode {:.1}us sync {:.1}us dispatches {} syncs {} sync_wait {:.1}us", t1.elapsed().as_micros(), roots.len(), t_encode.as_micros(), t_sync.as_micros(), d, s, n as f64 / 1000.0);
             }
             Ok(outputs)
         })

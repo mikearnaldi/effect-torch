@@ -32,7 +32,7 @@ pub fn index_select(dev: &MetalDevice, x: &MetalTensor, dim: usize, ids: &[u32])
     let mut out_shape = shape.to_vec();
     out_shape[dim] = l;
     let total: usize = out_shape.iter().product();
-    let out = MetalTensor::zeros(dev, out_shape.clone(), x.dtype);
+    let out = MetalTensor::empty(dev, out_shape.clone(), x.dtype);
     if total == 0 {
         return Ok(out);
     }
@@ -55,7 +55,7 @@ pub fn index_select(dev: &MetalDevice, x: &MetalTensor, dim: usize, ids: &[u32])
             decompose.push_str(&format!("        base += ({coord}) * {s}u;\n"));
         }
     }
-    let src = format!(
+    let make_src = || format!(
         r#"
 #include <metal_stdlib>
 using namespace metal;
@@ -71,7 +71,7 @@ kernel void et_isel(
 }}
 "#
     );
-    let pipeline = dev.compile(key(&[0x15E1, x.dtype as u64, dim as u64, l as u64, key(&out_shape.iter().map(|&v| v as u64).collect::<Vec<_>>()), key(&strides.iter().map(|&v| v as u64).collect::<Vec<_>>())]), &src, "et_isel")?;
+    let pipeline = dev.compile_lazy(key(&[0x15E1, x.dtype as u64, dim as u64, l as u64, key(&out_shape.iter().map(|&v| v as u64).collect::<Vec<_>>()), key(&strides.iter().map(|&v| v as u64).collect::<Vec<_>>())]), "et_isel", make_src)?;
     let ids_buf = dev.alloc_with_data_u32(ids);
     let padded = total.div_ceil(256) * 256;
     dev.with_encoder(|e| {
@@ -89,7 +89,7 @@ pub fn gather(dev: &MetalDevice, x: &MetalTensor, dim: usize, ids: &[u32], ids_s
     let rank = shape.len();
     assert_eq!(ids_shape.len(), rank, "gather: rank mismatch");
     let total: usize = ids_shape.iter().product();
-    let out = MetalTensor::zeros(dev, ids_shape.to_vec(), x.dtype);
+    let out = MetalTensor::empty(dev, ids_shape.to_vec(), x.dtype);
     if total == 0 {
         return Ok(out);
     }
@@ -111,7 +111,7 @@ pub fn gather(dev: &MetalDevice, x: &MetalTensor, dim: usize, ids: &[u32], ids_s
             }
         }
     }
-    let src = format!(
+    let make_src = || format!(
         r#"
 #include <metal_stdlib>
 using namespace metal;
@@ -127,7 +127,7 @@ kernel void et_gather(
 }}
 "#
     );
-    let pipeline = dev.compile(key(&[0x6A7E, x.dtype as u64, dim as u64, key(&ids_shape.iter().map(|&v| v as u64).collect::<Vec<_>>()), key(&strides.iter().map(|&v| v as u64).collect::<Vec<_>>())]), &src, "et_gather")?;
+    let pipeline = dev.compile_lazy(key(&[0x6A7E, x.dtype as u64, dim as u64, key(&ids_shape.iter().map(|&v| v as u64).collect::<Vec<_>>()), key(&strides.iter().map(|&v| v as u64).collect::<Vec<_>>())]), "et_gather", make_src)?;
     let ids_buf = dev.alloc_with_data_u32(ids);
     let padded = total.div_ceil(256) * 256;
     dev.with_encoder(|e| {
@@ -176,7 +176,7 @@ pub fn scatter_add(dev: &MetalDevice, x: &MetalTensor, dim: usize, ids: &[u32], 
             src_decompose.push_str(&format!("        src_off += {coord} * {ss}u;\n"));
         }
     }
-    let src = format!(
+    let make_src = || format!(
         r#"
 #include <metal_stdlib>
 using namespace metal;
@@ -193,7 +193,7 @@ kernel void et_sadd(
 }}
 "#
     );
-    let pipeline = dev.compile(key(&[0x5ADD, x.dtype as u64, dim as u64, key(&ids_shape.iter().map(|&v| v as u64).collect::<Vec<_>>()), key(&os.iter().map(|&v| v as u64).collect::<Vec<_>>()), key(&src_strides.iter().map(|&v| v as u64).collect::<Vec<_>>())]), &src, "et_sadd")?;
+    let pipeline = dev.compile_lazy(key(&[0x5ADD, x.dtype as u64, dim as u64, key(&ids_shape.iter().map(|&v| v as u64).collect::<Vec<_>>()), key(&os.iter().map(|&v| v as u64).collect::<Vec<_>>()), key(&src_strides.iter().map(|&v| v as u64).collect::<Vec<_>>())]), "et_sadd", make_src)?;
     let ids_buf = dev.alloc_with_data_u32(ids);
     let padded = total.div_ceil(256) * 256;
     dev.with_encoder(|e| {
@@ -221,12 +221,12 @@ pub fn cat(dev: &MetalDevice, tensors: &[&MetalTensor], dim: usize) -> Result<Me
         }
     }
     out_shape[dim] = tensors.iter().map(|t| t.layout.shape()[dim]).sum();
-    let out = MetalTensor::zeros(dev, out_shape.clone(), dtype);
+    let out = MetalTensor::empty(dev, out_shape.clone(), dtype);
     let ty = msl_type(dtype);
     let esz = dtype.size_in_bytes();
     let inner: usize = out_shape[dim + 1..].iter().product();
     let outer: usize = out_shape[..dim].iter().product();
-    let src = format!(
+    let make_src = || format!(
         r#"
 #include <metal_stdlib>
 using namespace metal;
@@ -247,7 +247,7 @@ kernel void et_cat(
 "#,
         outdim = out_shape[dim]
     );
-    let pipeline = dev.compile(key(&[0xCA7, dtype as u64, dim as u64, inner as u64, outer as u64, out_shape[dim] as u64]), &src, "et_cat")?;
+    let pipeline = dev.compile_lazy(key(&[0xCA7, dtype as u64, dim as u64, inner as u64, outer as u64, out_shape[dim] as u64]), "et_cat", make_src)?;
     let mut dim_off = 0usize;
     for t in tensors {
         let tc = super::kernels::strided_copy(dev, t)?;
@@ -300,7 +300,7 @@ pub fn scatter_set(dev: &MetalDevice, x: &MetalTensor, dim: usize, ids: &[u32], 
             src_decompose.push_str(&format!("        src_off += {coord} * {ss}u;\n"));
         }
     }
-    let src = format!(
+    let make_src = || format!(
         r#"
 #include <metal_stdlib>
 using namespace metal;
@@ -317,7 +317,7 @@ kernel void et_sset(
 }}
 "#
     );
-    let pipeline = dev.compile(key(&[0x55E7, x.dtype as u64, dim as u64, key(&ids_shape.iter().map(|&v| v as u64).collect::<Vec<_>>()), key(&os.iter().map(|&v| v as u64).collect::<Vec<_>>()), key(&src_strides.iter().map(|&v| v as u64).collect::<Vec<_>>())]), &src, "et_sset")?;
+    let pipeline = dev.compile_lazy(key(&[0x55E7, x.dtype as u64, dim as u64, key(&ids_shape.iter().map(|&v| v as u64).collect::<Vec<_>>()), key(&os.iter().map(|&v| v as u64).collect::<Vec<_>>()), key(&src_strides.iter().map(|&v| v as u64).collect::<Vec<_>>())]), "et_sset", make_src)?;
     let ids_buf = dev.alloc_with_data_u32(ids);
     let padded = total.div_ceil(256) * 256;
     dev.with_encoder(|e| {

@@ -168,8 +168,7 @@ kernel void et_paged_scatter(
         let slab_dtype = slab_dtype(k_slab);
         let mut hasher = DefaultHasher::new();
         (0x5CA7u32, d, slab_dtype).hash(&mut hasher);
-        let src = scatter_source(d, slab_dtype);
-        let pipe = compile(hasher.finish(), &src, "et_paged_scatter")?;
+        let pipe = MetalDevice::get().compile_lazy(hasher.finish(), "et_paged_scatter", || scatter_source(d, slab_dtype))?;
         let k_new = wrap_contig(k_new)?;
         let v_new = wrap_contig(v_new)?;
         let f32_off = |off: usize| off * 4;
@@ -211,7 +210,6 @@ kernel void et_paged_scatter(
                 },
             );
         });
-        MetalDevice::get().synchronize();
         Ok(())
     }
 
@@ -418,8 +416,7 @@ kernel void et_paged_decode(
 
         let mut hasher = DefaultHasher::new();
         (d, slab_dtype, scale.to_bits()).hash(&mut hasher);
-        let src = kernel_source(d, slab_dtype, scale);
-        compile(hasher.finish(), &src, "et_paged_decode")
+        MetalDevice::get().compile_lazy(hasher.finish(), "et_paged_decode", || kernel_source(d, slab_dtype, scale))
     }
 
     // One launch for the whole batch: q [B, H, C, D] contiguous
@@ -491,8 +488,6 @@ kernel void et_paged_decode(
                 },
             );
         });
-        MetalDevice::get().synchronize();
-        MetalDevice::get().synchronize();
         Ok(MetalTensor {
             buffer: out_buf,
             layout: crate::runtime::layout::Layout::contiguous(vec![b, h, c, d]),

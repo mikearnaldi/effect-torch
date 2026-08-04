@@ -9,6 +9,10 @@
 
 use crate::dev::Device;
 use crate::runtime::dtype::DType;
+#[cfg(target_os = "macos")]
+use crate::runtime::metal::device::MetalDevice;
+#[cfg(target_os = "macos")]
+use crate::runtime::metal::run::MetalTensor;
 #[cfg(any(target_os = "macos", feature = "cuda"))]
 
 const BLOCK: usize = 256;
@@ -611,6 +615,7 @@ fn fusion_phase_nanos(_phase: usize, _nanos: u64) {}
 mod metal {
     use super::{fusion_phase_nanos, Expr, ReduceOp};
     use crate::dev::Device;
+    use crate::runtime::dtype::DType;
     use crate::runtime::metal::device::MetalDevice;
     use crate::runtime::metal::run::MetalTensor;
 
@@ -639,19 +644,50 @@ mod metal {
             .map(|v| v.as_metal().cloned())
             .collect::<crate::err::Res<_>>()?;
         let refs: Vec<&MetalTensor> = native.iter().collect();
-        let scalar_values: Vec<f32> = scalars
+        // Pack the scalar lanes without any host readback: when every
+        // scalar is already a Metal f32 tensor, cat the 0-d values into one
+        // device buffer and bind it directly. Otherwise fall back to a
+        // single fence for all host readbacks.
+        let dev = MetalDevice::get();
+        let metal_scalars: Option<Vec<MetalTensor>> = scalars
             .iter()
-            .map(|v| v.to_f32_vec().map(|x| x[0]))
-            .collect::<crate::err::Res<_>>()?;
+            .map(|v| match v {
+                crate::val::Val::Metal(t) if t.dtype == DType::F32 => Some(t.clone()),
+                _ => None,
+            })
+            .collect();
+        let (scalar_buf, num_scalars) = if scalars.is_empty() {
+            (None, 0)
+        } else if let Some(ts) = metal_scalars {
+            let views: Vec<MetalTensor> = ts
+                .iter()
+                .map(|t| MetalTensor {
+                    buffer: t.buffer.clone(),
+                    layout: crate::runtime::layout::Layout::contiguous(vec![1]),
+                    dtype: DType::F32,
+                })
+                .collect();
+            let refs: Vec<&MetalTensor> = views.iter().collect();
+            let packed = crate::runtime::metal::indexing::cat(dev, &refs, 0)?;
+            (Some(packed.buffer.clone()), scalars.len())
+        } else {
+            dev.synchronize();
+            let vals: Vec<f32> = scalars
+                .iter()
+                .map(|v| v.to_f32_vec().map(|x| x[0]))
+                .collect::<crate::err::Res<_>>()?;
+            (Some(dev.alloc_with_data(&vals)), vals.len())
+        };
         if phase_timing {
             fusion_phase_nanos(0, t_start.elapsed().as_nanos() as u64);
         }
-        let outs = crate::runtime::metal::run::run_elementwise(
+        let outs = crate::runtime::metal::run::run_elementwise_scalar_buf(
             MetalDevice::get(),
             exprs,
             &refs,
             lane_strides,
-            &scalar_values,
+            scalar_buf.as_deref(),
+            num_scalars,
             n,
             shape,
         )?;
@@ -717,8 +753,19 @@ pub fn is_supported(device: &Device, dtype: DType) -> bool {
 // composed update's operation order exactly. Step-dependent values are
 // scalar lanes so the compiled kernel is stable across steps.
 pub fn adamw_exprs(beta1: f64, beta2: f64, eps: f64, weight_decay: f64) -> [Expr; 3] {
+    adamw_exprs_with(
+        beta1,
+        beta2,
+        eps,
+        weight_decay,
+        Expr::Scalar(0),
+        Expr::Scalar(1),
+        Expr::Scalar(2),
+    )
+}
+
+fn adamw_exprs_with(beta1: f64, beta2: f64, eps: f64, weight_decay: f64, lr: Expr, c1: Expr, c2: Expr) -> [Expr; 3] {
     let (p, g, m, v) = (Expr::Input(0), Expr::Input(1), Expr::Input(2), Expr::Input(3));
-    let (lr, c1, c2) = (Expr::Scalar(0), Expr::Scalar(1), Expr::Scalar(2));
     let next_m = Expr::Add(
         Box::new(Expr::Mul(Box::new(m), Box::new(Expr::cst(beta1)))),
         Box::new(Expr::Mul(Box::new(g.clone()), Box::new(Expr::cst(1.0 - beta1)))),
@@ -760,8 +807,11 @@ pub fn adamw_exprs(beta1: f64, beta2: f64, eps: f64, weight_decay: f64) -> [Expr
 // scalar lanes [lr, first], mirroring the composed update including the
 // first-step v = g initialization as a select on the 0-d `first` flag.
 pub fn sgd_exprs(momentum: f64, dampening: f64, nesterov: bool, weight_decay: f64) -> [Expr; 2] {
+    sgd_exprs_with(momentum, dampening, nesterov, weight_decay, Expr::Scalar(0), Expr::Scalar(1))
+}
+
+fn sgd_exprs_with(momentum: f64, dampening: f64, nesterov: bool, weight_decay: f64, lr: Expr, first: Expr) -> [Expr; 2] {
     let (p, g, v) = (Expr::Input(0), Expr::Input(1), Expr::Input(2));
-    let (lr, first) = (Expr::Scalar(0), Expr::Scalar(1));
     let gp = if weight_decay == 0.0 {
         g
     } else {
@@ -788,6 +838,140 @@ pub fn sgd_exprs(momentum: f64, dampening: f64, nesterov: bool, weight_decay: f6
         Expr::Sub(Box::new(p), Box::new(Expr::Mul(Box::new(used), Box::new(lr)))),
         next_v,
     ]
+}
+
+// A pre-built, process-cached AdamW group plan: the exprs, lane strides and
+// pipeline key depend only on the parameter count, shape and
+// hyperparameters, so groups rebuild and re-hash none of it per step.
+pub struct GroupPlan {
+    pub exprs: Vec<Expr>,
+    pub strides: Vec<Vec<usize>>,
+    pub key: u64,
+    pub num_scalars: usize,
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn adamw_group_plan(
+    params_len: usize,
+    shape: &[usize],
+    beta1: f64,
+    beta2: f64,
+    eps: f64,
+    weight_decay: f64,
+) -> std::sync::Arc<GroupPlan> {
+    type Key = (usize, Vec<usize>, u64, u64, u64, u64);
+    static PLANS: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<Key, std::sync::Arc<GroupPlan>>>> =
+        std::sync::OnceLock::new();
+    let key: Key = (
+        params_len,
+        shape.to_vec(),
+        beta1.to_bits(),
+        beta2.to_bits(),
+        eps.to_bits(),
+        weight_decay.to_bits(),
+    );
+    let cache = PLANS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    if let Some(p) = cache.lock().unwrap().get(&key) {
+        return p.clone();
+    }
+    let base = adamw_exprs(beta1, beta2, eps, weight_decay);
+    let mut exprs = Vec::with_capacity(params_len * 3);
+    for i in 0..params_len {
+        let remap: std::collections::HashMap<u32, u32> = (0u32..4)
+            .map(|k| (k, (i * 4) as u32 + k))
+            .collect();
+        for expr in &base {
+            exprs.push(expr.remap_lanes(&remap));
+        }
+    }
+    let contig = contiguous_strides(shape);
+    let strides = vec![contig; params_len * 4];
+    let n: usize = shape.iter().product();
+    let key_hash = crate::runtime::metal::run::elementwise_key(&exprs, &strides, shape, n, 3);
+    let plan = std::sync::Arc::new(GroupPlan {
+        exprs,
+        strides,
+        key: key_hash,
+        num_scalars: 3,
+    });
+    cache.lock().unwrap().insert(key, plan.clone());
+    plan
+}
+
+// Cat 0-d f32 scalars into one packed device buffer (no host readback for
+// device-resident scalars; CPU scalars upload as f32). Callers memoize the
+// result per walk.
+pub fn pack_scalars_metal(scalars: &[crate::val::Val]) -> crate::err::Res<crate::val::Val> {
+    let dev = MetalDevice::get();
+    let mut views = Vec::with_capacity(scalars.len());
+    for v in scalars {
+        let t = match v {
+            crate::val::Val::Metal(t) => {
+                let t = if t.layout.is_contiguous() && t.layout.offset() == 0 {
+                    t.clone()
+                } else {
+                    crate::runtime::metal::kernels::strided_copy(dev, t)?
+                };
+                if t.dtype == DType::F32 {
+                    t
+                } else {
+                    crate::runtime::metal::kernels::cast(dev, &t, DType::F32)?
+                }
+            }
+            crate::val::Val::Cpu(t) => {
+                let t = t.cast(DType::F32).contiguous();
+                let crate::runtime::cpu::CpuBuffer::F32(v) = &t.buffer else { unreachable!() };
+                MetalTensor::from_f32(dev, v.as_slice().to_vec(), vec![1])
+            }
+        };
+        views.push(MetalTensor {
+            buffer: t.buffer.clone(),
+            layout: crate::runtime::layout::Layout::contiguous(vec![1]),
+            dtype: DType::F32,
+        });
+    }
+    let refs: Vec<&MetalTensor> = views.iter().collect();
+    Ok(crate::val::Val::Metal(crate::runtime::metal::indexing::cat(dev, &refs, 0)?))
+}
+
+// Runs a cached group plan on Metal with a pre-packed scalar buffer.
+pub fn run_group_metal(
+    plan: &GroupPlan,
+    inputs: &[crate::val::Val],
+    packed_scalars: &crate::val::Val,
+    shape: &[usize],
+) -> crate::err::Res<Vec<crate::val::Val>> {
+    if inputs.len() + plan.exprs.len() + 1 > 31 {
+        return Err(format!(
+            "fusion: {} buffer arguments exceed Metal's limit of 31",
+            inputs.len() + plan.exprs.len() + 1
+        ));
+    }
+    let dev = MetalDevice::get();
+    let mut owned = Vec::with_capacity(inputs.len());
+    for v in inputs {
+        let t = v.as_metal()?;
+        owned.push(if t.layout.is_contiguous() {
+            t.clone()
+        } else {
+            crate::runtime::metal::kernels::strided_copy(dev, t)?
+        });
+    }
+    let refs: Vec<&MetalTensor> = owned.iter().collect();
+    let packed = packed_scalars.as_metal()?;
+    let n: usize = shape.iter().product();
+    let outs = crate::runtime::metal::run::run_elementwise_prekeyed(
+        dev,
+        plan.key,
+        &plan.exprs,
+        &refs,
+        &plan.strides,
+        Some(&packed.buffer),
+        plan.num_scalars,
+        n,
+        shape,
+    )?;
+    Ok(outs.into_iter().map(crate::val::Val::Metal).collect())
 }
 
 /// Evaluates each expression over the flattened inputs (broadcast to the

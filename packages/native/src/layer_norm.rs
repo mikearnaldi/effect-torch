@@ -161,7 +161,7 @@ kernel void et_ln_bwd(
         let mut hasher = DefaultHasher::new();
         name.hash(&mut hasher);
         let key = hasher.finish();
-        MetalDevice::get().compile(key, source(), name)
+        MetalDevice::get().compile_lazy(key, name, || source().to_string())
     }
 
     fn wrap(buf: Arc<crate::runtime::metal::device::Buffer>, n: usize, shape: Vec<usize>) -> crate::err::Res<MetalTensor> {
@@ -195,7 +195,6 @@ kernel void et_ln_bwd(
                 objc2_metal::MTLSize { width: NT, height: 1, depth: 1 },
             );
         });
-        MetalDevice::get().synchronize();
         wrap(out_buf, x.numel(), x.layout.shape().to_vec())
     }
 
@@ -224,7 +223,6 @@ kernel void et_ln_bwd(
                 objc2_metal::MTLSize { width: NT, height: 1, depth: 1 },
             );
         });
-        MetalDevice::get().synchronize();
         Ok((
             wrap(dx_buf, x.numel(), x.layout.shape().to_vec())?,
             wrap(xh_buf, x.numel(), x.layout.shape().to_vec())?,

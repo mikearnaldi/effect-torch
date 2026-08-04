@@ -43,12 +43,12 @@ pub fn conv1d(dev: &MetalDevice, x: &MetalTensor, w: &MetalTensor, stride: usize
     let (c_out, c_per, k) = dims3(w);
     let cout_per = c_out / groups;
     let l_out = (l + 2 * padding - dilation * (k - 1) - 1) / stride + 1;
-    let out = MetalTensor::zeros(dev, vec![n, c_out, l_out], x.dtype);
+    let out = MetalTensor::empty(dev, vec![n, c_out, l_out], x.dtype);
     let total = n * c_out * l_out;
     if total == 0 {
         return Ok(out);
     }
-    let src = format!(
+    let make_src = || format!(
         r#"{HEADER}
 kernel void et_conv1d(
     device const float* x [[buffer(0)]],
@@ -75,7 +75,7 @@ kernel void et_conv1d(
 }}
 "#
     );
-    let pipeline = dev.compile(key(&[0xC0A1, n as u64, c_in as u64, l as u64, c_out as u64, k as u64, stride as u64, padding as u64, dilation as u64, groups as u64]), &src, "et_conv1d")?;
+    let pipeline = dev.compile_lazy(key(&[0xC0A1, n as u64, c_in as u64, l as u64, c_out as u64, k as u64, stride as u64, padding as u64, dilation as u64, groups as u64]), "et_conv1d", make_src)?;
     grid_for(dev, &pipeline, total, &[
         (0, &x.buffer, x.layout.offset() * 4),
         (1, &w.buffer, w.layout.offset() * 4),
@@ -90,12 +90,12 @@ pub fn conv2d(dev: &MetalDevice, x: &MetalTensor, w: &MetalTensor, stride: usize
     let cout_per = c_out / groups;
     let oh = (h + 2 * padding - dilation * (kh - 1) - 1) / stride + 1;
     let ow = (wd + 2 * padding - dilation * (kw - 1) - 1) / stride + 1;
-    let out = MetalTensor::zeros(dev, vec![n, c_out, oh, ow], x.dtype);
+    let out = MetalTensor::empty(dev, vec![n, c_out, oh, ow], x.dtype);
     let total = n * c_out * oh * ow;
     if total == 0 {
         return Ok(out);
     }
-    let src = format!(
+    let make_src = || format!(
         r#"{HEADER}
 kernel void et_conv2d(
     device const float* x [[buffer(0)]],
@@ -127,7 +127,7 @@ kernel void et_conv2d(
 }}
 "#
     );
-    let pipeline = dev.compile(key(&[0xC0A2, n as u64, c_in as u64, h as u64, wd as u64, c_out as u64, kh as u64, kw as u64, stride as u64, padding as u64, dilation as u64, groups as u64]), &src, "et_conv2d")?;
+    let pipeline = dev.compile_lazy(key(&[0xC0A2, n as u64, c_in as u64, h as u64, wd as u64, c_out as u64, kh as u64, kw as u64, stride as u64, padding as u64, dilation as u64, groups as u64]), "et_conv2d", make_src)?;
     grid_for(dev, &pipeline, total, &[
         (0, &x.buffer, x.layout.offset() * 4),
         (1, &w.buffer, w.layout.offset() * 4),
@@ -143,12 +143,12 @@ pub fn conv_transpose1d(dev: &MetalDevice, x: &MetalTensor, w: &MetalTensor, str
     let cin_per = c_in / groups;
     let c_out = c_out_per_g * groups;
     let l_out = (l - 1) * stride - 2 * padding + dilation * (k - 1) + output_padding + 1;
-    let out = MetalTensor::zeros(dev, vec![n, c_out, l_out], x.dtype);
+    let out = MetalTensor::empty(dev, vec![n, c_out, l_out], x.dtype);
     let total = n * c_out * l_out;
     if total == 0 {
         return Ok(out);
     }
-    let src = format!(
+    let make_src = || format!(
         r#"{HEADER}
 kernel void et_convt1d(
     device const float* x [[buffer(0)]],
@@ -178,7 +178,7 @@ kernel void et_convt1d(
 }}
 "#
     );
-    let pipeline = dev.compile(key(&[0xC0B1, n as u64, c_in as u64, l as u64, c_out as u64, k as u64, stride as u64, padding as u64, output_padding as u64, dilation as u64, groups as u64]), &src, "et_convt1d")?;
+    let pipeline = dev.compile_lazy(key(&[0xC0B1, n as u64, c_in as u64, l as u64, c_out as u64, k as u64, stride as u64, padding as u64, output_padding as u64, dilation as u64, groups as u64]), "et_convt1d", make_src)?;
     grid_for(dev, &pipeline, total, &[
         (0, &x.buffer, x.layout.offset() * 4),
         (1, &w.buffer, w.layout.offset() * 4),
@@ -195,12 +195,12 @@ pub fn conv_transpose2d(dev: &MetalDevice, x: &MetalTensor, w: &MetalTensor, str
     let c_out = c_out_per_g * groups;
     let oh = (h - 1) * stride - 2 * padding + dilation * (kh - 1) + output_padding + 1;
     let ow = (wd - 1) * stride - 2 * padding + dilation * (kw - 1) + output_padding + 1;
-    let out = MetalTensor::zeros(dev, vec![n, c_out, oh, ow], x.dtype);
+    let out = MetalTensor::empty(dev, vec![n, c_out, oh, ow], x.dtype);
     let total = n * c_out * oh * ow;
     if total == 0 {
         return Ok(out);
     }
-    let src = format!(
+    let make_src = || format!(
         r#"{HEADER}
 kernel void et_convt2d(
     device const float* x [[buffer(0)]],
@@ -236,7 +236,7 @@ kernel void et_convt2d(
 }}
 "#
     );
-    let pipeline = dev.compile(key(&[0xC0B2, n as u64, c_in as u64, h as u64, wd as u64, c_out as u64, kh as u64, kw as u64, stride as u64, padding as u64, output_padding as u64, dilation as u64, groups as u64]), &src, "et_convt2d")?;
+    let pipeline = dev.compile_lazy(key(&[0xC0B2, n as u64, c_in as u64, h as u64, wd as u64, c_out as u64, kh as u64, kw as u64, stride as u64, padding as u64, output_padding as u64, dilation as u64, groups as u64]), "et_convt2d", make_src)?;
     grid_for(dev, &pipeline, total, &[
         (0, &x.buffer, x.layout.offset() * 4),
         (1, &w.buffer, w.layout.offset() * 4),
@@ -252,12 +252,12 @@ pub fn conv2d_backward_w(dev: &MetalDevice, x: &MetalTensor, g: &MetalTensor, ke
     let (kh, kw) = (kernel[0], kernel[1]);
     let c_per = c_in / groups;
     let cout_per = out_channels / groups;
-    let out = MetalTensor::zeros(dev, vec![out_channels, c_per, kh, kw], x.dtype);
+    let out = MetalTensor::empty(dev, vec![out_channels, c_per, kh, kw], x.dtype);
     let total = out_channels * c_per * kh * kw;
     if total == 0 {
         return Ok(out);
     }
-    let src = format!(
+    let make_src = || format!(
         r#"{HEADER}
 kernel void et_conv2d_bw(
     device const float* x [[buffer(0)]],
@@ -291,7 +291,7 @@ kernel void et_conv2d_bw(
         h_dim = x.layout.shape()[2],
         w_dim = x.layout.shape()[3]
     );
-    let pipeline = dev.compile(key(&[0xC0C2, n as u64, c_in as u64, oh as u64, ow as u64, out_channels as u64, kh as u64, kw as u64, stride as u64, padding as u64, dilation as u64, groups as u64]), &src, "et_conv2d_bw")?;
+    let pipeline = dev.compile_lazy(key(&[0xC0C2, n as u64, c_in as u64, oh as u64, ow as u64, out_channels as u64, kh as u64, kw as u64, stride as u64, padding as u64, dilation as u64, groups as u64]), "et_conv2d_bw", make_src)?;
     grid_for(dev, &pipeline, total, &[
         (0, &x.buffer, x.layout.offset() * 4),
         (1, &g.buffer, g.layout.offset() * 4),

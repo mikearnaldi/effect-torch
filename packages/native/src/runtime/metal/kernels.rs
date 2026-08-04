@@ -31,7 +31,7 @@ pub fn fill(dev: &MetalDevice, out: &MetalTensor, value: f64) -> Result<(), Stri
         return Ok(());
     }
     let ty = msl_type(out.dtype);
-    let src = format!(
+    let make_src = || format!(
         r#"
 #include <metal_stdlib>
 using namespace metal;
@@ -40,7 +40,7 @@ kernel void et_fill(device {ty}* out [[buffer(0)]], constant float& v [[buffer(1
 }}
 "#
     );
-    let pipeline = dev.compile(key(&[0xF111, out.dtype as u64, n as u64]), &src, "et_fill")?;
+    let pipeline = dev.compile_lazy(key(&[0xF111, out.dtype as u64, n as u64]), "et_fill", make_src)?;
     let v = value as f32;
     let padded = n.div_ceil(256) * 256;
     dev.with_encoder(|e| {
@@ -55,11 +55,11 @@ kernel void et_fill(device {ty}* out [[buffer(0)]], constant float& v [[buffer(1
 pub fn relu_i64(dev: &MetalDevice, x: &MetalTensor) -> Result<MetalTensor, String> {
     assert_eq!(x.dtype, DType::I64);
     let n = x.numel();
-    let out = MetalTensor::zeros(dev, x.layout.shape().to_vec(), DType::I64);
+    let out = MetalTensor::empty(dev, x.layout.shape().to_vec(), DType::I64);
     if n == 0 {
         return Ok(out);
     }
-    let src = format!(
+    let make_src = || format!(
         r#"
 #include <metal_stdlib>
 using namespace metal;
@@ -68,7 +68,7 @@ kernel void et_relu_i64(device const long* a [[buffer(0)]], device long* out [[b
 }}
 "#
     );
-    let pipeline = dev.compile(key(&[0x8E10, n as u64]), &src, "et_relu_i64")?;
+    let pipeline = dev.compile_lazy(key(&[0x8E10, n as u64]), "et_relu_i64", make_src)?;
     let padded = n.div_ceil(256) * 256;
     dev.with_encoder(|e| {
         e.setComputePipelineState(pipeline.as_raw());
@@ -88,12 +88,12 @@ pub fn cast(dev: &MetalDevice, x: &MetalTensor, dtype: DType) -> Result<MetalTen
         });
     }
     let n = x.numel();
-    let out = MetalTensor::zeros(dev, x.layout.shape().to_vec(), dtype);
+    let out = MetalTensor::empty(dev, x.layout.shape().to_vec(), dtype);
     if n == 0 {
         return Ok(out);
     }
     let (src_ty, dst_ty) = (msl_type(x.dtype), msl_type(dtype));
-    let src = format!(
+    let make_src = || format!(
         r#"
 #include <metal_stdlib>
 using namespace metal;
@@ -102,7 +102,7 @@ kernel void et_cast(device const {src_ty}* a [[buffer(0)]], device {dst_ty}* out
 }}
 "#
     );
-    let pipeline = dev.compile(key(&[0xCA57, x.dtype as u64, dtype as u64, n as u64]), &src, "et_cast")?;
+    let pipeline = dev.compile_lazy(key(&[0xCA57, x.dtype as u64, dtype as u64, n as u64]), "et_cast", make_src)?;
     let padded = n.div_ceil(256) * 256;
     dev.with_encoder(|e| {
         e.setComputePipelineState(pipeline.as_raw());
@@ -118,7 +118,7 @@ pub fn strided_copy(dev: &MetalDevice, x: &MetalTensor) -> Result<MetalTensor, S
         return Ok(x.clone());
     }
     let n = x.numel();
-    let out = MetalTensor::zeros(dev, x.layout.shape().to_vec(), x.dtype);
+    let out = MetalTensor::empty(dev, x.layout.shape().to_vec(), x.dtype);
     if n == 0 {
         return Ok(out);
     }
@@ -144,7 +144,7 @@ pub fn strided_copy(dev: &MetalDevice, x: &MetalTensor) -> Result<MetalTensor, S
             decompose.push_str(&format!("            src_off += {coord} * {};\n", strides[d]));
         }
     }
-    let src = format!(
+    let make_src = || format!(
         r#"
 #include <metal_stdlib>
 using namespace metal;
@@ -157,7 +157,7 @@ kernel void et_scopy(device const {ty}* a [[buffer(0)]], device {ty}* out [[buff
 "#
     );
     let shape_key = key(&shape.iter().map(|&v| v as u64).chain(strides.iter().map(|&v| v as u64)).collect::<Vec<_>>());
-    let pipeline = dev.compile(key(&[0x5C09, x.dtype as u64, shape_key]), &src, "et_scopy")?;
+    let pipeline = dev.compile_lazy(key(&[0x5C09, x.dtype as u64, shape_key]), "et_scopy", make_src)?;
     let padded = n.div_ceil(256) * 256;
     dev.with_encoder(|e| {
         e.setComputePipelineState(pipeline.as_raw());
@@ -195,11 +195,11 @@ inline float xoro_f32(thread ulong& s0, thread ulong& s1) {
 
 pub fn randn(dev: &MetalDevice, shape: &[usize], seed: u64) -> Result<MetalTensor, String> {
     let n: usize = shape.iter().product();
-    let out = MetalTensor::zeros(dev, shape.to_vec(), DType::F32);
+    let out = MetalTensor::empty(dev, shape.to_vec(), DType::F32);
     if n == 0 {
         return Ok(out);
     }
-    let src = format!(
+    let make_src = || format!(
         r#"{RNG_SRC}
 kernel void et_randn(device float* out [[buffer(0)]], uint i [[thread_position_in_grid]]) {{
     if (i < {n}u) {{
@@ -212,7 +212,7 @@ kernel void et_randn(device float* out [[buffer(0)]], uint i [[thread_position_i
 }}
 "#
     );
-    let pipeline = dev.compile(key(&[0x8A11, seed, n as u64]), &src, "et_randn")?;
+    let pipeline = dev.compile_lazy(key(&[0x8A11, seed, n as u64]), "et_randn", make_src)?;
     let padded = n.div_ceil(256) * 256;
     dev.with_encoder(|e| {
         e.setComputePipelineState(pipeline.as_raw());
@@ -224,11 +224,11 @@ kernel void et_randn(device float* out [[buffer(0)]], uint i [[thread_position_i
 
 pub fn uniform(dev: &MetalDevice, lo: f64, hi: f64, shape: &[usize], seed: u64) -> Result<MetalTensor, String> {
     let n: usize = shape.iter().product();
-    let out = MetalTensor::zeros(dev, shape.to_vec(), DType::F32);
+    let out = MetalTensor::empty(dev, shape.to_vec(), DType::F32);
     if n == 0 {
         return Ok(out);
     }
-    let src = format!(
+    let make_src = || format!(
         r#"{RNG_SRC}
 kernel void et_uniform(device float* out [[buffer(0)]], uint i [[thread_position_in_grid]]) {{
     if (i < {n}u) {{
@@ -240,7 +240,7 @@ kernel void et_uniform(device float* out [[buffer(0)]], uint i [[thread_position
 "#,
         lo as f32, hi as f32, lo as f32
     );
-    let pipeline = dev.compile(key(&[0x0B1F, seed, n as u64, lo.to_bits() as u64, hi.to_bits() as u64]), &src, "et_uniform")?;
+    let pipeline = dev.compile_lazy(key(&[0x0B1F, seed, n as u64, lo.to_bits() as u64, hi.to_bits() as u64]), "et_uniform", make_src)?;
     let padded = n.div_ceil(256) * 256;
     dev.with_encoder(|e| {
         e.setComputePipelineState(pipeline.as_raw());
@@ -252,12 +252,12 @@ kernel void et_uniform(device float* out [[buffer(0)]], uint i [[thread_position
 
 pub fn arange(dev: &MetalDevice, start: f64, end: f64, step: f64, dtype: DType) -> Result<MetalTensor, String> {
     let n = ((end - start) / step).ceil().max(0.0) as usize;
-    let out = MetalTensor::zeros(dev, vec![n], dtype);
+    let out = MetalTensor::empty(dev, vec![n], dtype);
     if n == 0 {
         return Ok(out);
     }
     let ty = msl_type(dtype);
-    let src = format!(
+    let make_src = || format!(
         r#"
 #include <metal_stdlib>
 using namespace metal;
@@ -267,7 +267,7 @@ kernel void et_arange(device {ty}* out [[buffer(0)]], uint i [[thread_position_i
 "#,
         step, start
     );
-    let pipeline = dev.compile(key(&[0xA26E, dtype as u64, start.to_bits(), step.to_bits(), n as u64]), &src, "et_arange")?;
+    let pipeline = dev.compile_lazy(key(&[0xA26E, dtype as u64, start.to_bits(), step.to_bits(), n as u64]), "et_arange", make_src)?;
     let padded = n.div_ceil(256) * 256;
     dev.with_encoder(|e| {
         e.setComputePipelineState(pipeline.as_raw());
@@ -278,13 +278,13 @@ kernel void et_arange(device {ty}* out [[buffer(0)]], uint i [[thread_position_i
 }
 
 pub fn eye(dev: &MetalDevice, n: usize, dtype: DType) -> Result<MetalTensor, String> {
-    let out = MetalTensor::zeros(dev, vec![n, n], dtype);
+    let out = MetalTensor::empty(dev, vec![n, n], dtype);
     fill(dev, &out, 0.0)?;
     if n == 0 {
         return Ok(out);
     }
     let ty = msl_type(dtype);
-    let src = format!(
+    let make_src = || format!(
         r#"
 #include <metal_stdlib>
 using namespace metal;
@@ -293,7 +293,7 @@ kernel void et_eye(device {ty}* out [[buffer(0)]], uint i [[thread_position_in_g
 }}
 "#
     );
-    let pipeline = dev.compile(key(&[0xE7E, dtype as u64, n as u64]), &src, "et_eye")?;
+    let pipeline = dev.compile_lazy(key(&[0xE7E, dtype as u64, n as u64]), "et_eye", make_src)?;
     dev.with_encoder(|e| {
         e.setComputePipelineState(pipeline.as_raw());
         set_buffer(e, 0, &out.buffer, 0);
@@ -313,7 +313,7 @@ pub fn argreduce(dev: &MetalDevice, x: &MetalTensor, dim: usize, pick_max: bool)
     let kept_n: usize = kept_dims.iter().product();
     let mut out_shape = shape.to_vec();
     out_shape[dim] = 1;
-    let out = MetalTensor::zeros(dev, out_shape, DType::U32);
+    let out = MetalTensor::empty(dev, out_shape, DType::U32);
     if kept_n == 0 {
         return Ok(out);
     }
@@ -331,7 +331,7 @@ pub fn argreduce(dev: &MetalDevice, x: &MetalTensor, dim: usize, pick_max: bool)
             decompose.push_str(&format!("        base += ((gid / {div}u) % {c}u) * {s}u;\n"));
         }
     }
-    let src = format!(
+    let make_src = || format!(
         r#"
 #include <metal_stdlib>
 using namespace metal;
@@ -352,7 +352,7 @@ kernel void et_argred(
 }}
 "#
     );
-    let pipeline = dev.compile(key(&[0xA26D, x.dtype as u64, dim as u64, pick_max as u64, n as u64, key(&kept_dims.iter().map(|&v| v as u64).collect::<Vec<_>>())]), &src, "et_argred")?;
+    let pipeline = dev.compile_lazy(key(&[0xA26D, x.dtype as u64, dim as u64, pick_max as u64, n as u64, key(&kept_dims.iter().map(|&v| v as u64).collect::<Vec<_>>())]), "et_argred", make_src)?;
     let padded = kept_n.div_ceil(256) * 256;
     dev.with_encoder(|e| {
         e.setComputePipelineState(pipeline.as_raw());
@@ -372,7 +372,7 @@ pub fn cumsum(dev: &MetalDevice, x: &MetalTensor, dim: usize) -> Result<MetalTen
     let kept_dims: Vec<usize> = kept.iter().map(|&d| shape[d]).collect();
     let kept_strides: Vec<usize> = kept.iter().map(|&d| x.layout.strides()[d]).collect();
     let kept_n: usize = kept_dims.iter().product();
-    let out = MetalTensor::zeros(dev, shape.to_vec(), x.dtype);
+    let out = MetalTensor::empty(dev, shape.to_vec(), x.dtype);
     if kept_n == 0 {
         return Ok(out);
     }
@@ -392,7 +392,7 @@ pub fn cumsum(dev: &MetalDevice, x: &MetalTensor, dim: usize) -> Result<MetalTen
             decompose.push_str(&format!("        base += ((gid / {div}u) % {c}u) * {s}u;\n        obase += ((gid / {div}u) % {c}u) * {o}u;\n"));
         }
     }
-    let src = format!(
+    let make_src = || format!(
         r#"
 #include <metal_stdlib>
 using namespace metal;
@@ -413,7 +413,7 @@ kernel void et_cumsum(
 "#,
         os_dim = os[dim]
     );
-    let pipeline = dev.compile(key(&[0xC50A, x.dtype as u64, dim as u64, n as u64, key(&kept_dims.iter().map(|&v| v as u64).collect::<Vec<_>>())]), &src, "et_cumsum")?;
+    let pipeline = dev.compile_lazy(key(&[0xC50A, x.dtype as u64, dim as u64, n as u64, key(&kept_dims.iter().map(|&v| v as u64).collect::<Vec<_>>())]), "et_cumsum", make_src)?;
     let padded = kept_n.div_ceil(256) * 256;
     dev.with_encoder(|e| {
         e.setComputePipelineState(pipeline.as_raw());

@@ -69,7 +69,7 @@ kernel void et_rotary(
         let mut hasher = DefaultHasher::new();
         "et_rotary".hash(&mut hasher);
         let key = hasher.finish();
-        MetalDevice::get().compile(key, source(), "et_rotary")
+        MetalDevice::get().compile_lazy(key, "et_rotary", || source().to_string())
     }
 
     /// x [.., T, D] -> R(sign·angles) x. `offsets` is one position
@@ -127,7 +127,6 @@ kernel void et_rotary(
                 },
             );
         });
-        MetalDevice::get().synchronize();
         Ok(MetalTensor {
             buffer: out_buf,
             layout: crate::runtime::layout::Layout::contiguous(dims.to_vec()),

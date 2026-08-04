@@ -37,6 +37,18 @@ impl MetalTensor {
         out
     }
 
+    // Alloc without the zero-fill dispatch: only for outputs the kernel
+    // provably overwrites in full.
+    pub fn empty(dev: &MetalDevice, shape: Vec<usize>, dtype: DType) -> Self {
+        let n: usize = shape.iter().product();
+        let buffer = dev.alloc(n.max(1), dtype);
+        MetalTensor {
+            buffer,
+            layout: crate::runtime::layout::Layout::contiguous(shape),
+            dtype,
+        }
+    }
+
     pub fn numel(&self) -> usize {
         self.layout.numel()
     }
@@ -75,6 +87,17 @@ fn hash_exprs(parts: &[u64]) -> u64 {
     h.finish()
 }
 
+pub fn elementwise_key(exprs: &[Expr], lane_strides: &[Vec<usize>], shape: &[usize], n: usize, num_scalars: usize) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    exprs.hash(&mut hasher);
+    lane_strides.hash(&mut hasher);
+    shape.hash(&mut hasher);
+    n.hash(&mut hasher);
+    num_scalars.hash(&mut hasher);
+    hasher.finish()
+}
+
 pub fn run_elementwise(
     dev: &MetalDevice,
     exprs: &[Expr],
@@ -84,21 +107,54 @@ pub fn run_elementwise(
     n: usize,
     shape: &[usize],
 ) -> Result<Vec<MetalTensor>, String> {
-    use std::hash::{Hash, Hasher};
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    exprs.hash(&mut hasher);
-    lane_strides.hash(&mut hasher);
-    shape.hash(&mut hasher);
-    n.hash(&mut hasher);
-    scalars.len().hash(&mut hasher);
-    let key = hasher.finish();
+    let scalar_buf = if scalars.is_empty() { None } else { Some(dev.alloc_with_data(scalars)) };
+    let key = elementwise_key(exprs, lane_strides, shape, n, scalars.len());
+    run_elementwise_prekeyed(dev, key, exprs, inputs, lane_strides, scalar_buf.as_deref(), scalars.len(), n, shape)
+}
+
+// Same kernel as run_elementwise, but the packed scalar buffer is supplied
+// directly (already device-resident) — no host readback anywhere.
+#[allow(clippy::too_many_arguments)]
+pub fn run_elementwise_scalar_buf(
+    dev: &MetalDevice,
+    exprs: &[Expr],
+    inputs: &[&MetalTensor],
+    lane_strides: &[Vec<usize>],
+    scalar_buf: Option<&super::device::Buffer>,
+    num_scalars: usize,
+    n: usize,
+    shape: &[usize],
+) -> Result<Vec<MetalTensor>, String> {
+    let key = elementwise_key(exprs, lane_strides, shape, n, num_scalars);
+    run_elementwise_prekeyed(dev, key, exprs, inputs, lane_strides, scalar_buf, num_scalars, n, shape)
+}
+
+// Fully prekeyed: no expr hashing, no source emission unless the pipeline
+// cache actually misses.
+#[allow(clippy::too_many_arguments)]
+pub fn run_elementwise_prekeyed(
+    dev: &MetalDevice,
+    key: u64,
+    exprs: &[Expr],
+    inputs: &[&MetalTensor],
+    lane_strides: &[Vec<usize>],
+    scalar_buf: Option<&super::device::Buffer>,
+    num_scalars: usize,
+    n: usize,
+    shape: &[usize],
+) -> Result<Vec<MetalTensor>, String> {
     let name = "et_fused";
-    let src = emit::emit_elementwise(exprs, lane_strides, shape, n, scalars.len(), name);
-    let pipeline = dev.compile(key, &src, name)?;
+    let pipeline = match dev.pipeline_cached(key) {
+        Some(p) => p,
+        None => {
+            let src = emit::emit_elementwise(exprs, lane_strides, shape, n, num_scalars, name);
+            dev.compile_slow(key, &src, name)?
+        }
+    };
 
     let mut out_bufs = Vec::with_capacity(exprs.len());
     for _ in 0..exprs.len() {
-        out_bufs.push(MetalTensor::zeros(dev, shape.to_vec(), DType::F32));
+        out_bufs.push(MetalTensor::empty(dev, shape.to_vec(), DType::F32));
     }
     let padded = n.div_ceil(emit::BLOCK) * emit::BLOCK;
     dev.with_encoder(|e| {
@@ -108,10 +164,8 @@ pub fn run_elementwise(
             set_buffer(e, idx, &t.buffer, t.layout.offset() * 4);
             idx += 1;
         }
-        let scalar_buf;
-        if !scalars.is_empty() {
-            scalar_buf = dev.alloc_with_data(scalars);
-            set_buffer(e, idx, &scalar_buf, 0);
+        if let Some(buf) = scalar_buf {
+            set_buffer(e, idx, buf, 0);
             idx += 1;
         }
         for t in &out_bufs {
@@ -149,11 +203,16 @@ pub fn run_reduce(
     out_shape.hash(&mut hasher);
     let key = hasher.finish();
     let name = "et_fused_reduce";
-    let src = emit::emit_reduce(op, expr, lane_strides, in_shape, dims, keepdims, out_shape, name);
-    let pipeline = dev.compile(key, &src, name)?;
+    let pipeline = match dev.pipeline_cached(key) {
+        Some(p) => p,
+        None => {
+            let src = emit::emit_reduce(op, expr, lane_strides, in_shape, dims, keepdims, out_shape, name);
+            dev.compile_slow(key, &src, name)?
+        }
+    };
 
     let out_n: usize = out_shape.iter().product();
-    let out = MetalTensor::zeros(dev, out_shape.to_vec(), DType::F32);
+    let out = MetalTensor::empty(dev, out_shape.to_vec(), DType::F32);
     let padded = out_n.div_ceil(emit::BLOCK) * emit::BLOCK;
     dev.with_encoder(|e| {
         e.setComputePipelineState(pipeline.as_raw());

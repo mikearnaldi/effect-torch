@@ -55,7 +55,6 @@ mod metal {
             m * k,
             0,
         )?;
-        MetalDevice::get().synchronize();
         let mut out_shape = dims.to_vec();
         out_shape[rank - 1] = n;
         Ok(MetalTensor {

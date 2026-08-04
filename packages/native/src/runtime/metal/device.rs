@@ -12,6 +12,17 @@ use std::sync::{Arc, Mutex, OnceLock};
 const PROBES: usize = 8;
 const MAX_BUCKET: usize = 4096;
 const DISPATCHES_PER_BUFFER: usize = 4096;
+
+pub static DISPATCHES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static SYNCS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static SYNC_NANOS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+pub fn dispatch_stats_reset() -> (u64, u64, u64) {
+    let d = DISPATCHES.swap(0, std::sync::atomic::Ordering::Relaxed);
+    let s = SYNCS.swap(0, std::sync::atomic::Ordering::Relaxed);
+    let n = SYNC_NANOS.swap(0, std::sync::atomic::Ordering::Relaxed);
+    (d, s, n)
+}
 const SWEEP_MS: u64 = 100;
 
 pub struct Buffer {
@@ -126,6 +137,7 @@ impl EncoderManager {
             unsafe { encoder.memoryBarrierWithScope(objc2_metal::MTLBarrierScope::Buffers) };
         }
         self.count += 1;
+        DISPATCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if self.count >= DISPATCHES_PER_BUFFER {
             self.commit();
         }
@@ -259,6 +271,27 @@ impl MetalDevice {
     }
 
     pub fn compile(&self, key: u64, source: &str, name: &str) -> Result<Pipeline, String> {
+        if let Some(p) = self.pipeline_cached(key) {
+            return Ok(p);
+        }
+        self.compile_slow(key, source, name)
+    }
+
+    // Cache-hit fast path that never builds the kernel source: MSL source
+    // generation (SSA emission, format! graphs) is the dominant encode cost
+    // on hot paths, and it is pure waste when the pipeline is cached.
+    pub fn compile_lazy(&self, key: u64, name: &str, make_source: impl FnOnce() -> String) -> Result<Pipeline, String> {
+        match self.pipeline_cached(key) {
+            Some(p) => Ok(p),
+            None => self.compile_slow(key, &make_source(), name),
+        }
+    }
+
+    pub fn pipeline_cached(&self, key: u64) -> Option<Pipeline> {
+        self.pipelines.lock().unwrap().get(&key).cloned()
+    }
+
+    pub fn compile_slow(&self, key: u64, source: &str, name: &str) -> Result<Pipeline, String> {
         let mut cache = self.pipelines.lock().unwrap();
         if let Some(p) = cache.get(&key) {
             return Ok(p.clone());
@@ -292,11 +325,18 @@ impl MetalDevice {
         out
     }
 
+    #[track_caller]
     pub fn synchronize(&self) {
+        let t = std::time::Instant::now();
+        if std::env::var_os("EFFECT_TORCH_SYNC_TRACE").is_some() {
+            eprintln!("[sync] {}", std::panic::Location::caller());
+        }
         self.encoder.lock().unwrap().synchronize();
         // The GPU has consumed everything submitted so far; retired
         // uploads may return to the pool.
         self.retired.lock().unwrap().clear();
+        SYNCS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        SYNC_NANOS.fetch_add(t.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
     }
 
     pub fn grid(width: usize, height: usize, depth: usize) -> MTLSize {

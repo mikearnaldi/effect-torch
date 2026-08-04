@@ -233,8 +233,7 @@ kernel void et_ce_bwd(
         let mut hasher = DefaultHasher::new();
         (tgt, name).hash(&mut hasher);
         let key = hasher.finish();
-        let src = source(tgt);
-        MetalDevice::get().compile(key, &src, name)
+        MetalDevice::get().compile_lazy(key, name, || source(tgt))
     }
 
     fn wrap(buf: Arc<crate::runtime::metal::device::Buffer>, n: usize, shape: Vec<usize>) -> crate::err::Res<MetalTensor> {
@@ -300,7 +299,6 @@ kernel void et_ce_bwd(
                 dispatch_grid(e, 1, NT);
             });
         }
-        MetalDevice::get().synchronize();
         let status = wrap(status_buf, 3, vec![3])?;
         let loss = MetalTensor {
             buffer: status.buffer.clone(),
@@ -352,7 +350,6 @@ kernel void et_ce_bwd(
                 dispatch_grid(e, n, NT);
             });
         }
-        MetalDevice::get().synchronize();
         // The zero-active check is deferred to the walk's end (see
         // ce_forward); the count buffer is returned for it.
         let count = wrap(count_buf.clone(), 1, vec![1])?;
