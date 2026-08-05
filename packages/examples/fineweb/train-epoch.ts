@@ -37,6 +37,13 @@ const CHECKPOINT_EVERY = 100
 const PRECISION: Trainer.Precision = "mixedBf16"
 const VAL_BATCHES = 40
 
+const formatEta = (ms: number) => {
+  const min = Math.round(ms / 60000)
+  return min >= 60 ? `${Math.floor(min / 60)}h${String(min % 60).padStart(2, "0")}m` : `${min}m`
+}
+
+let firstStep: { step: number; ms: number } | undefined
+
 const program = Effect.gen(function*() {
   const train = loadBin(TRAIN_BIN)
   const val = loadBin(VAL_BIN)
@@ -68,12 +75,21 @@ const program = Effect.gen(function*() {
       }),
     stop: ({ step }) => step >= chunkTarget,
     precision: PRECISION,
-    onStep: ({ step, loss, elapsed }) =>
-      Effect.log(
-        `step ${String(step).padStart(5)}/${totalSteps}  loss ${loss.toFixed(4)}  ${
-          (Duration.toMillis(elapsed) / 1000).toFixed(1)
-        }s`
+    onStep: ({ step, loss, elapsed }) => {
+      // ETA from the mean step time, excluding the first step (its
+      // capture/compile overhead would skew the average) and anchored
+      // at the first step seen, so resumed runs estimate correctly.
+      const ms = Duration.toMillis(elapsed)
+      if (firstStep === undefined) firstStep = { step, ms }
+      const done = step - firstStep.step
+      const remaining = totalSteps - step
+      const eta = done > 0 && remaining > 0
+        ? `  eta ${formatEta(((ms - firstStep.ms) / done) * remaining)}`
+        : ""
+      return Effect.log(
+        `step ${String(step).padStart(5)}/${totalSteps}  loss ${loss.toFixed(4)}  ${(ms / 1000).toFixed(1)}s${eta}`
       )
+    }
   })
 
   // A saved epoch checkpoint resumes bit-exactly; otherwise start from the
