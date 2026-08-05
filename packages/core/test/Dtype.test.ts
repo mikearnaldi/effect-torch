@@ -70,6 +70,22 @@ onDevices("Dtype", (device) => (it) => {
       })
     )
 
+    it.effect("a 0-d float scalar never promotes a float tensor's dtype", () =>
+      Effect.gen(function* () {
+        const t = yield* as("bf16", [1, 2, 3, 4], [2, 2])
+        const scalar = yield* Tensor.constant(0.5, { dtype: "f32" })
+        const [left] = yield* Tensor.compute([yield* Tensor.mul(scalar, t)])
+        expect(left.dtype).toBe("bf16")
+        deep(yield* Tensor.toNumberArray(left), [0.5, 1, 1.5, 2])
+        const [right] = yield* Tensor.compute([yield* Tensor.mul(t, scalar)])
+        expect(right.dtype).toBe("bf16")
+        // bf16 reductions keep bf16 storage (f32 accumulation in-kernel)
+        const [summed] = yield* Tensor.compute([yield* Tensor.sum(t, { dims: [0] })])
+        expect(summed.dtype).toBe("bf16")
+        deep(yield* Tensor.toNumberArray(summed), [4, 6])
+      })
+    )
+
     it.effect("guarded ops state their dtype requirements", () =>
       Effect.gen(function* () {
         const q = yield* as("f16", [1, 0, 0, 1], [1, 1, 2, 2])

@@ -1108,6 +1108,22 @@ fn broadcast_shapes(a: &[usize], b: &[usize]) -> std::result::Result<Vec<usize>,
     Ok(out)
 }
 
+// A 0-d float operand never promotes a float tensor's dtype: scalar ×
+// tensor keeps the tensor's dtype (the scalar is cast to it at
+// evaluation), matching PyTorch's scalar promotion rules. Mismatches
+// involving integer dtypes keep the legacy first-operand rule.
+fn scalar_aware_binary_dtype(a: &Node, b: &Node) -> runtime::dtype::DType {
+    if a.dtype != b.dtype
+        && a.dtype.is_float()
+        && b.dtype.is_float()
+        && a.shape.is_empty() != b.shape.is_empty()
+    {
+        if a.shape.is_empty() { b.dtype } else { a.dtype }
+    } else {
+        a.dtype
+    }
+}
+
 fn reduced_shape(shape: &[usize], dims: &[usize], keepdims: bool) -> Vec<usize> {
     if keepdims {
         shape
@@ -1203,7 +1219,7 @@ impl Node {
             | NodeKind::Maximum { a, b }
             | NodeKind::Minimum { a, b } => (
                 broadcast_shapes(&a.shape, &b.shape)?,
-                a.dtype,
+                scalar_aware_binary_dtype(a, b),
                 a.device.clone(),
             ),
             NodeKind::Eq { a, b }
@@ -3821,6 +3837,35 @@ fn adamw_native(
     Ok((next_p, next_m, next_v))
 }
 
+// A 0-d float operand never promotes a float tensor's dtype: the scalar
+// is cast into the tensor's dtype before dispatch (mirrors
+// scalar_aware_binary_dtype), so e.g. an f32 scalar gradient scaling a
+// bf16 tensor stays bf16 — and the CPU backend, which requires matching
+// dtypes, receives an already-matching pair.
+fn coerce_scalar_vals(a: val::Val, b: val::Val) -> crate::err::Res<(val::Val, val::Val)> {
+    if a.dtype() == b.dtype() || !a.dtype().is_float() || !b.dtype().is_float() {
+        return Ok((a, b));
+    }
+    let a_scalar = a.shape().is_empty();
+    let b_scalar = b.shape().is_empty();
+    if a_scalar == b_scalar {
+        return Ok((a, b));
+    }
+    let cast_val = |v: &val::Val, dtype: runtime::dtype::DType| -> crate::err::Res<val::Val> {
+        Ok(match v {
+            val::Val::Cpu(t) => val::Val::Cpu(t.cast(dtype)),
+            val::Val::Metal(t) => val::Val::Metal(metal_ops::cast(t, dtype)?),
+        })
+    };
+    if a_scalar {
+        let target = b.dtype();
+        Ok((cast_val(&a, target)?, b))
+    } else {
+        let target = a.dtype();
+        Ok((a, cast_val(&b, target)?))
+    }
+}
+
 fn eval_node(
     root: &Arc<Node>,
     cancelled: &AtomicBool,
@@ -4001,6 +4046,7 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> crate::err::Res<val::V
         NodeKind::Add { a, b } => {
             let a = ev.value(a.id)?;
             let b = ev.value(b.id)?;
+            let (a, b) = coerce_scalar_vals(a, b)?;
             match (&a, &b) {
                 (val::Val::Cpu(x), val::Val::Cpu(y)) => val::Val::Cpu(x.add(y)),
                 (val::Val::Metal(x), val::Val::Metal(y)) => {
@@ -4012,6 +4058,7 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> crate::err::Res<val::V
         NodeKind::Sub { a, b } => {
             let a = ev.value(a.id)?;
             let b = ev.value(b.id)?;
+            let (a, b) = coerce_scalar_vals(a, b)?;
             match (&a, &b) {
                 (val::Val::Cpu(x), val::Val::Cpu(y)) => val::Val::Cpu(x.sub(y)),
                 (val::Val::Metal(x), val::Val::Metal(y)) => {
@@ -4023,6 +4070,7 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> crate::err::Res<val::V
         NodeKind::Mul { a, b } => {
             let a = ev.value(a.id)?;
             let b = ev.value(b.id)?;
+            let (a, b) = coerce_scalar_vals(a, b)?;
             match (&a, &b) {
                 (val::Val::Cpu(x), val::Val::Cpu(y)) => val::Val::Cpu(x.mul(y)),
                 (val::Val::Metal(x), val::Val::Metal(y)) => {
@@ -4034,6 +4082,7 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> crate::err::Res<val::V
         NodeKind::Div { a, b } => {
             let a = ev.value(a.id)?;
             let b = ev.value(b.id)?;
+            let (a, b) = coerce_scalar_vals(a, b)?;
             match (&a, &b) {
                 (val::Val::Cpu(x), val::Val::Cpu(y)) => val::Val::Cpu(x.div(y)),
                 (val::Val::Metal(x), val::Val::Metal(y)) => {
@@ -4094,6 +4143,7 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> crate::err::Res<val::V
         }
         NodeKind::Maximum { a, b } => {
             let (x, y) = (ev.value(a.id)?, ev.value(b.id)?);
+            let (x, y) = coerce_scalar_vals(x, y)?;
             match (&x, &y) {
                 (val::Val::Cpu(a), val::Val::Cpu(b)) => val::Val::Cpu(a.maximum(b)),
                 (val::Val::Metal(a), val::Val::Metal(b)) => {
@@ -4104,6 +4154,7 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> crate::err::Res<val::V
         }
         NodeKind::Minimum { a, b } => {
             let (x, y) = (ev.value(a.id)?, ev.value(b.id)?);
+            let (x, y) = coerce_scalar_vals(x, y)?;
             match (&x, &y) {
                 (val::Val::Cpu(a), val::Val::Cpu(b)) => val::Val::Cpu(a.minimum(b)),
                 (val::Val::Metal(a), val::Val::Metal(b)) => {
@@ -4917,7 +4968,16 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> crate::err::Res<val::V
                     val::Val::Cpu(r)
                 }
                 val::Val::Metal(x) => {
-                    val::Val::Metal(metal_ops::reduce(&metal_ops::to_f32(x)?, dims, *keepdims, crate::fusion::ReduceOp::Sum)?)
+                    val::Val::Metal({
+                        let x32;
+                        let x = if matches!(x.dtype, runtime::dtype::DType::F32 | runtime::dtype::DType::BF16) {
+                            x
+                        } else {
+                            x32 = metal_ops::to_f32(x)?;
+                            &x32
+                        };
+                        metal_ops::reduce(x, dims, *keepdims, crate::fusion::ReduceOp::Sum)?
+                    })
                 }
             }
         }
@@ -4930,7 +4990,16 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> crate::err::Res<val::V
                     val::Val::Cpu(r)
                 }
                 val::Val::Metal(x) => {
-                    val::Val::Metal(metal_ops::reduce(&metal_ops::to_f32(x)?, dims, *keepdims, crate::fusion::ReduceOp::Mean)?)
+                    val::Val::Metal({
+                        let x32;
+                        let x = if matches!(x.dtype, runtime::dtype::DType::F32 | runtime::dtype::DType::BF16) {
+                            x
+                        } else {
+                            x32 = metal_ops::to_f32(x)?;
+                            &x32
+                        };
+                        metal_ops::reduce(x, dims, *keepdims, crate::fusion::ReduceOp::Mean)?
+                    })
                 }
             }
         }
@@ -4943,7 +5012,16 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> crate::err::Res<val::V
                     val::Val::Cpu(r)
                 }
                 val::Val::Metal(x) => {
-                    val::Val::Metal(metal_ops::reduce(&metal_ops::to_f32(x)?, dims, *keepdims, crate::fusion::ReduceOp::Max)?)
+                    val::Val::Metal({
+                        let x32;
+                        let x = if matches!(x.dtype, runtime::dtype::DType::F32 | runtime::dtype::DType::BF16) {
+                            x
+                        } else {
+                            x32 = metal_ops::to_f32(x)?;
+                            &x32
+                        };
+                        metal_ops::reduce(x, dims, *keepdims, crate::fusion::ReduceOp::Max)?
+                    })
                 }
             }
         }
@@ -4956,7 +5034,16 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> crate::err::Res<val::V
                     val::Val::Cpu(r)
                 }
                 val::Val::Metal(x) => {
-                    val::Val::Metal(metal_ops::reduce(&metal_ops::to_f32(x)?, dims, *keepdims, crate::fusion::ReduceOp::Min)?)
+                    val::Val::Metal({
+                        let x32;
+                        let x = if matches!(x.dtype, runtime::dtype::DType::F32 | runtime::dtype::DType::BF16) {
+                            x
+                        } else {
+                            x32 = metal_ops::to_f32(x)?;
+                            &x32
+                        };
+                        metal_ops::reduce(x, dims, *keepdims, crate::fusion::ReduceOp::Min)?
+                    })
                 }
             }
         }
@@ -4969,7 +5056,16 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> crate::err::Res<val::V
                     val::Val::Cpu(r)
                 }
                 val::Val::Metal(x) => {
-                    val::Val::Metal(metal_ops::reduce(&metal_ops::to_f32(x)?, dims, *keepdims, crate::fusion::ReduceOp::Prod)?)
+                    val::Val::Metal({
+                        let x32;
+                        let x = if matches!(x.dtype, runtime::dtype::DType::F32 | runtime::dtype::DType::BF16) {
+                            x
+                        } else {
+                            x32 = metal_ops::to_f32(x)?;
+                            &x32
+                        };
+                        metal_ops::reduce(x, dims, *keepdims, crate::fusion::ReduceOp::Prod)?
+                    })
                 }
             }
         }

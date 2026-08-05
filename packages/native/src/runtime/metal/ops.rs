@@ -186,6 +186,34 @@ pub fn binary(a: &MetalTensor, b: &MetalTensor, op: BinOp) -> crate::err::Res<Me
 }
 
 pub fn binary_promote(a: &MetalTensor, b: &MetalTensor, op: BinOp) -> crate::err::Res<MetalTensor> {
+    // A 0-d float operand never promotes a float tensor's dtype: the
+    // scalar is cast into it (mirrors scalar_aware_binary_dtype in
+    // lib.rs), so an f32 scalar gradient scaling a bf16 tensor stays
+    // bf16 instead of materializing an f32 copy of the tensor.
+    let ac;
+    let bc;
+    let (a, b) = if a.dtype != b.dtype
+        && a.dtype.is_float()
+        && b.dtype.is_float()
+        && a.layout.shape().is_empty()
+        && !b.layout.shape().is_empty()
+    {
+        ac = cast(a, b.dtype)?;
+        (&ac, b)
+    } else if a.dtype != b.dtype
+        && a.dtype.is_float()
+        && b.dtype.is_float()
+        && b.layout.shape().is_empty()
+        && !a.layout.shape().is_empty()
+    {
+        bc = cast(b, a.dtype)?;
+        (a, &bc)
+    } else {
+        (a, b)
+    };
+    if a.dtype == b.dtype && matches!(a.dtype, DType::F32 | DType::BF16) {
+        return binary(a, b, op);
+    }
     let dt = a.dtype;
     let a32 = to_f32(a)?;
     let b32 = to_f32(b)?;
@@ -267,7 +295,9 @@ pub fn where_(cond: &MetalTensor, a: &MetalTensor, b: &MetalTensor) -> crate::er
 }
 
 pub fn reduce(a: &MetalTensor, dims: &[usize], keepdims: bool, op: ReduceOp) -> crate::err::Res<MetalTensor> {
-    require_f32(a)?;
+    if !matches!(a.dtype, DType::F32 | DType::BF16) {
+        return Err(format!("reduce: unsupported dtype {:?} on Metal (f32 or bf16)", a.dtype));
+    }
     let an = contig(a)?;
     let in_shape = a.layout.shape().to_vec();
     let out_shape: Vec<usize> = if keepdims {

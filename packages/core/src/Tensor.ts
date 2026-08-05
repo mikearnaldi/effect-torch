@@ -299,6 +299,14 @@ export const constantLike = (self: Any, value: number): Effect.Effect<Lazy, Tens
       new TensorError({ op: "constantLike", message: error instanceof Error ? error.message : String(error) })
   })
 
+// A 0-d float scalar never promotes a float tensor's dtype (the native
+// graph applies the same rule): `mul(f32Scalar, bf16Tensor)` is bf16.
+const scalarCoercible = (a: Any, b: Any): boolean =>
+  a.dtype !== b.dtype && isFloat(a.dtype) && isFloat(b.dtype) && (a.shape.length === 0) !== (b.shape.length === 0)
+
+const isFloat = (dtype: DType): boolean =>
+  dtype === "f32" || dtype === "f64" || dtype === "f16" || dtype === "bf16"
+
 const binaryOp = (
   op: string,
   native: (a: NativeLazyTensorType, b: NativeLazyTensorType) => NativeLazyTensorType,
@@ -312,11 +320,19 @@ const binaryOp = (
     (self: Any, other: Any): Effect.Effect<Lazy, TensorError> =>
       Effect.try({
         try: () => {
-          checkCompatible(op, self, other)
+          if (self.dtype !== other.dtype && !scalarCoercible(self, other)) {
+            throw new Error(
+              `${op}: dtype mismatch, got ${self.dtype} and ${other.dtype}, use cast for explicit conversion`
+            )
+          }
+          if (self.device !== other.device) {
+            throw new Error(`${op}: device mismatch, got ${self.device} and ${other.device}`)
+          }
+          const dtype = scalarCoercible(self, other) && self.shape.length === 0 ? other.dtype : self.dtype
           return makeLazy(
             native(self.lazy, other.lazy),
             broadcastShapes(op, self.shape, other.shape),
-            outDtype(self.dtype),
+            outDtype(dtype),
             self.device
           )
         },
