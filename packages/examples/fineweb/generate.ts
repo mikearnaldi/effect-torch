@@ -3,11 +3,9 @@ import { NodeRuntime } from "@effect/platform-node"
 import { Device, Model, Tensor } from "@effect-torch/core"
 import { BLOCK, CHECKPOINT, createGpt, EOT, loadParams, loadTokenizer } from "./model.js"
 
-// Streaming generation: the prompt comes from argv and tokens are printed
-// as they are produced (the full sequence is re-decoded each step and only
-// the new suffix is written — BPE tokens don't split cleanly on word
-// boundaries). Generation is unbounded (sliding-window attention, RoPE)
-// and stops at <|endoftext|>. Usage:
+// Streaming generation: the prompt comes from argv and each token is
+// decoded and printed as it is produced. Generation is unbounded
+// (sliding-window attention, RoPE) and stops at <|endoftext|>. Usage:
 //   pnpm tsx fineweb/generate.ts "The history of the printing press"
 // FINEWEB_TEMPERATURE tunes the sampling.
 
@@ -45,21 +43,15 @@ const program = Effect.gen(function* () {
     attentionWindow: BLOCK
   })
 
-  const generated: Array<number> = []
-  let printed = ""
   const gen = yield* inference.generation()
   const encoded = yield* tokenizer.encode(prompt)
   const entry = yield* gen.add(yield* Tensor.reshape(encoded, [1, encoded.shape[0]]))
   let logits = entry.logits
-  process.stdout.write(prompt)
   while (true) {
     const [probs] = yield* Tensor.compute([yield* Tensor.softmax(logits)])
     const token = sampleCategorical(yield* Tensor.toNumberArray(probs), TEMPERATURE)
     if (token === eotId) break
-    generated.push(token)
-    const text = yield* tokenizer.decode(generated)
-    process.stdout.write(text.slice(printed.length))
-    printed = text
+    process.stdout.write(yield* tokenizer.decode([token]))
     const [stepped] = yield* gen.step([{ seq: entry.seq, token }])
     logits = stepped
   }
