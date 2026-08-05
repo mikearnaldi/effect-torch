@@ -6,11 +6,11 @@ import { BLOCK, CHECKPOINT, createGpt, EOT, loadParams, loadTokenizer } from "./
 // Streaming generation: the prompt comes from argv and tokens are printed
 // as they are produced (the full sequence is re-decoded each step and only
 // the new suffix is written — BPE tokens don't split cleanly on word
-// boundaries). Usage:
+// boundaries). Generation is unbounded (sliding-window attention, RoPE)
+// and stops at <|endoftext|>. Usage:
 //   pnpm tsx fineweb/generate.ts "The history of the printing press"
-// FINEWEB_MAX_TOKENS / FINEWEB_TEMPERATURE tune the rollout.
+// FINEWEB_TEMPERATURE tunes the sampling.
 
-const MAX_NEW_TOKENS = Number(process.env.FINEWEB_MAX_TOKENS ?? 240)
 const TEMPERATURE = Number(process.env.FINEWEB_TEMPERATURE ?? 0.8)
 
 const sampleCategorical = (probs: ReadonlyArray<number>, temperature: number) => {
@@ -52,7 +52,7 @@ const program = Effect.gen(function* () {
   const entry = yield* gen.add(yield* Tensor.reshape(encoded, [1, encoded.shape[0]]))
   let logits = entry.logits
   process.stdout.write(prompt)
-  for (let i = 0; i < MAX_NEW_TOKENS; i++) {
+  while (true) {
     const [probs] = yield* Tensor.compute([yield* Tensor.softmax(logits)])
     const token = sampleCategorical(yield* Tensor.toNumberArray(probs), TEMPERATURE)
     if (token === eotId) break
