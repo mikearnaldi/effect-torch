@@ -79,6 +79,19 @@ export interface TrainStep {
 }
 
 /**
+ * The numeric precision of the training loop. `"f32"` keeps parameters,
+ * forward, backward, and optimizer state in f32 end to end. `"mixedBf16"`
+ * runs forward/backward in bf16 while the optimizer owns f32 master
+ * weights: the step graph casts masters to bf16 at the forward boundary
+ * and gradients flow back through the casts, so the update arithmetic
+ * stays f32. Metal only.
+ *
+ * @since 0.1.0
+ * @category models
+ */
+export type Precision = "f32" | "mixedBf16"
+
+/**
  * Configuration for {@link make}. `loss` is any loss function in the
  * shape of {@link Loss.mse} — `(prediction, target) => Effect<Lazy>` —
  * so the `Loss` module's exports slot in directly. `lr` is the
@@ -127,12 +140,9 @@ export interface TrainConfig<
   readonly stop: (info: TrainStep) => boolean
   readonly onStep?: (info: TrainStep) => Effect.Effect<void, EO, RO>
   /**
-   * `"mixedBf16"` runs forward/backward in bf16 while the optimizer owns
-   * f32 master weights: the step graph casts masters to bf16 at the
-   * forward boundary and gradients flow back through the casts, so the
-   * update arithmetic stays f32. Metal only.
+   * Defaults to `"f32"`; see {@link Precision}.
    */
-  readonly precision?: "f32" | "mixedBf16"
+  readonly precision?: Precision
 }
 
 /**
