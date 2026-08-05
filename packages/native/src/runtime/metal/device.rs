@@ -1,4 +1,5 @@
 use crate::runtime::dtype::DType;
+use super::arena;
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_metal::{
@@ -17,6 +18,40 @@ pub static DISPATCHES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU
 pub static SYNCS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static SYNC_NANOS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+// Bytes of driver-allocated root buffers currently alive (pool, arenas,
+// uploads — suballocations share their arena's root and are not
+// counted). A hard ceiling, set with EFFECT_TORCH_MEMORY_CAP_MB, turns
+// memory runaways into a loud failure instead of a system freeze.
+pub static LIVE_BYTES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+fn memory_cap() -> Option<usize> {
+    static CAP: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    *CAP.get_or_init(|| {
+        std::env::var("EFFECT_TORCH_MEMORY_CAP_MB")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .map(|mb| mb * 1024 * 1024)
+    })
+}
+
+fn live_bytes_track(size: usize) {
+    let live = LIVE_BYTES.fetch_add(size, std::sync::atomic::Ordering::Relaxed) + size;
+    if let Some(cap) = memory_cap() {
+        if live > cap {
+            MetalDevice::get().dump_live_bytes();
+            panic!(
+                "metal: memory cap exceeded — {} MB live, cap {} MB (EFFECT_TORCH_MEMORY_CAP_MB)",
+                live >> 20,
+                cap >> 20
+            );
+        }
+    }
+}
+
+fn live_bytes_untrack(size: usize) {
+    LIVE_BYTES.fetch_sub(size, std::sync::atomic::Ordering::Relaxed);
+}
+
 pub fn dispatch_stats_reset() -> (u64, u64, u64) {
     let d = DISPATCHES.swap(0, std::sync::atomic::Ordering::Relaxed);
     let s = SYNCS.swap(0, std::sync::atomic::Ordering::Relaxed);
@@ -28,15 +63,36 @@ const SWEEP_MS: u64 = 100;
 pub struct Buffer {
     raw: Retained<ProtocolObject<dyn MTLBuffer>>,
     pub size: usize,
+    // Byte offset of this buffer's start within `raw` — nonzero for
+    // arena suballocations, which share one underlying MTLBuffer.
+    pub base: usize,
+    // Whether this handle owns driver memory (roots) or shares an
+    // arena's root (suballocations) — drives live-bytes accounting.
+    counted: bool,
+}
+
+impl Drop for Buffer {
+    fn drop(&mut self) {
+        if self.counted {
+            live_bytes_untrack(self.size);
+        }
+    }
 }
 
 impl Buffer {
     pub fn from_raw(raw: Retained<ProtocolObject<dyn MTLBuffer>>, size: usize) -> Self {
-        Buffer { raw, size }
+        Buffer { raw, size, base: 0, counted: false }
+    }
+
+    // A view into `arena` at byte offset `base`; the Retained clone keeps
+    // the underlying MTLBuffer alive independently of the arena handle.
+    pub fn suballoc(arena: &Buffer, base: usize, size: usize) -> Self {
+        assert!(base + size <= arena.size);
+        Buffer { raw: arena.raw.clone(), size, base: arena.base + base, counted: false }
     }
 
     pub fn contents_ptr(&self) -> *mut std::ffi::c_void {
-        self.raw.contents().as_ptr()
+        unsafe { self.raw.contents().cast::<u8>().add(self.base).as_ptr().cast() }
     }
 
     pub fn as_raw(&self) -> &ProtocolObject<dyn MTLBuffer> {
@@ -45,14 +101,14 @@ impl Buffer {
 
     pub fn read_f32(&self, offset_elems: usize, n: usize) -> Vec<f32> {
         assert!(offset_elems * 4 + n * 4 <= self.size);
-        let ptr = unsafe { self.raw.contents().cast::<f32>().add(offset_elems) };
-        unsafe { std::slice::from_raw_parts(ptr.as_ptr(), n) }.to_vec()
+        let ptr = unsafe { self.contents_ptr().cast::<f32>().add(offset_elems) };
+        unsafe { std::slice::from_raw_parts(ptr, n) }.to_vec()
     }
 
     pub fn write_f32(&mut self, offset_elems: usize, data: &[f32]) {
         assert!(offset_elems * 4 + data.len() * 4 <= self.size);
-        let ptr = unsafe { self.raw.contents().cast::<f32>().add(offset_elems) };
-        unsafe { std::ptr::copy_nonoverlapping(data.as_ptr(), ptr.as_ptr(), data.len()) };
+        let ptr = unsafe { self.contents_ptr().cast::<f32>().add(offset_elems) };
+        unsafe { std::ptr::copy_nonoverlapping(data.as_ptr(), ptr, data.len()) };
     }
 }
 
@@ -222,6 +278,12 @@ impl MetalDevice {
 
     pub fn alloc(&self, elements: usize, dtype: DType) -> Arc<Buffer> {
         let size = elements * dtype.size_in_bytes();
+        // Arena replay (RFC 0016): serve from the program's planned
+        // arena, falling through to the pool for pool-planned entries
+        // and after divergence.
+        if let Some(buf) = arena::replay_alloc(size) {
+            return buf;
+        }
         let bucket_size = size.next_power_of_two().max(16);
         let mut alloc = self.allocator.lock().unwrap();
         {
@@ -235,7 +297,9 @@ impl MetalDevice {
             for k in 0..PROBES {
                 let idx = cursor.wrapping_add(k) % bucket.len();
                 if Arc::strong_count(&bucket[idx]) == 1 {
-                    return bucket.swap_remove(idx);
+                    let buffer = bucket.swap_remove(idx);
+                    arena::capture_alloc(Arc::as_ptr(&buffer) as usize, size);
+                    return buffer;
                 }
             }
         }
@@ -244,15 +308,28 @@ impl MetalDevice {
         } else {
             SHARED_OPTIONS
         };
+        live_bytes_track(bucket_size);
         let raw = self
             .raw
             .newBufferWithLength_options(bucket_size, options)
             .expect("metal buffer allocation failed");
-        let buffer = Arc::new(Buffer { raw, size: bucket_size });
+        let buffer = Arc::new(Buffer { raw, size: bucket_size, base: 0, counted: true });
         if bucket.len() < MAX_BUCKET {
             bucket.push(buffer.clone());
         }
+        arena::capture_alloc(Arc::as_ptr(&buffer) as usize, size);
         buffer
+    }
+
+    /// A raw buffer outside the pool and the arena capture/replay —
+    /// the arena itself is allocated this way.
+    pub fn alloc_raw(&self, size: usize) -> Arc<Buffer> {
+        live_bytes_track(size.max(1));
+        let raw = self
+            .raw
+            .newBufferWithLength_options(size.max(1), SHARED_OPTIONS)
+            .expect("metal buffer allocation failed");
+        Arc::new(Buffer { raw, size: size.max(1), base: 0, counted: true })
     }
 
     pub fn alloc_with_data(&self, data: &[f32]) -> Arc<Buffer> {
@@ -269,6 +346,7 @@ impl MetalDevice {
         // would read past the end of the caller's allocation. Uploads
         // are never pooled, so bucketing buys nothing.
         let size = data.len().max(1);
+        live_bytes_track(size);
         let raw = unsafe {
             self.raw.newBufferWithBytes_length_options(
                 NonNull::new(data.as_ptr() as *const std::ffi::c_void as *mut std::ffi::c_void).unwrap(),
@@ -277,7 +355,7 @@ impl MetalDevice {
             )
         }
         .expect("metal buffer allocation failed");
-        let buffer = Arc::new(Buffer { raw, size });
+        let buffer = Arc::new(Buffer { raw, size, base: 0, counted: false });
         // Host uploads retire only at the next synchronize. Uploads are
         // NEVER pooled: the only strong refs are the caller's and this
         // list's, so nothing can recycle the bytes before the GPU has
@@ -350,11 +428,59 @@ impl MetalDevice {
         }
         self.encoder.lock().unwrap().synchronize()?;
         // The GPU has consumed everything submitted so far; retired
-        // uploads may return to the pool.
-        self.retired.lock().unwrap().clear();
+        // uploads may return to the pool. Dead buckets at or above 1 MB
+        // are released too — the arena (RFC 0016) owns the step working
+        // set, so the pool must not accumulate dead giants across
+        // phases; small buckets stay for cheap reuse.
+        {
+            let mut alloc = self.allocator.lock().unwrap();
+            let mut retired = self.retired.lock().unwrap();
+            for (bucket_size, bucket) in alloc.buckets.iter_mut() {
+                if *bucket_size < (1 << 20) {
+                    continue;
+                }
+                bucket.retain(|b| {
+                    if Arc::strong_count(b) == 1 {
+                        retired.push(b.clone());
+                        false
+                    } else {
+                        true
+                    }
+                });
+            }
+            retired.clear();
+        }
         SYNCS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         SYNC_NANOS.fetch_add(t.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
         Ok(())
+    }
+
+    /// Breakdown of live bytes by pool bucket (dead = held only by the
+    /// pool) plus retired uploads — printed when the memory cap trips.
+    /// Lock-free best effort: the dump runs from the allocation path,
+    /// which may already hold the allocator lock.
+    pub fn dump_live_bytes(&self) {
+        let mut rows: Vec<(usize, usize, usize)> = Vec::new();
+        if let Ok(alloc) = self.allocator.try_lock() {
+            for (bucket_size, bucket) in alloc.buckets.iter() {
+                let live = bucket.iter().filter(|b| Arc::strong_count(b) > 1).count();
+                let dead = bucket.len() - live;
+                if live + dead > 0 {
+                    rows.push((*bucket_size, live, dead));
+                }
+            }
+            rows.sort_by_key(|(size, _, _)| std::cmp::Reverse(*size));
+        }
+        let retired_bytes: usize = self
+            .retired
+            .try_lock()
+            .map(|r| r.iter().map(|b| b.size).sum())
+            .unwrap_or(0);
+        eprintln!("[mem] live {} MB; pool buckets (size: live/dead): {}; retired {} MB; shared arena {} MB",
+            LIVE_BYTES.load(std::sync::atomic::Ordering::Relaxed) >> 20,
+            rows.iter().take(12).map(|(s, l, d)| format!("{}MB:{l}/{d}", s >> 20)).collect::<Vec<_>>().join(" "),
+            retired_bytes >> 20,
+            super::arena::shared_arena_size() >> 20);
     }
 
     pub fn grid(width: usize, height: usize, depth: usize) -> MTLSize {
@@ -363,7 +489,7 @@ impl MetalDevice {
 }
 
 pub fn set_buffer(encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>, index: usize, buffer: &Buffer, offset: usize) {
-    unsafe { encoder.setBuffer_offset_atIndex(Some(buffer.as_raw()), offset, index) };
+    unsafe { encoder.setBuffer_offset_atIndex(Some(buffer.as_raw()), buffer.base + offset, index) };
 }
 
 pub fn set_bytes<T>(encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>, index: usize, data: &T) {

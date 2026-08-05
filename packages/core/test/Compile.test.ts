@@ -23,7 +23,7 @@ onDevices("Compile", () => (it) => {
         )
         const [actual] = yield* fn.call([x, y])
         expect(yield* values(actual)).toEqual(yield* values(expected))
-        expect(fn.stats()).toEqual({ cached: 1, compiled: 1 })
+        expect(yield* fn.stats).toEqual({ cached: 1, compiled: 1 })
       })
     )
 
@@ -39,7 +39,7 @@ onDevices("Compile", () => (it) => {
         expect(yield* values(first)).toEqual([0, 2, 0, 4])
         expect(yield* values(second)).toEqual([0, 6, 0, 8])
         expect(yield* values(third)).toEqual([0, 2, 0, 4, 0, 6])
-        expect(fn.stats()).toEqual({ cached: 2, compiled: 2 })
+        expect(yield* fn.stats).toEqual({ cached: 2, compiled: 2 })
       })
     )
 
@@ -52,7 +52,7 @@ onDevices("Compile", () => (it) => {
         const x = yield* Tensor.fromTypedArray(floats([1, 2, 3]), [3])
         expect(yield* values((yield* fn.call([x], [2]))[0])).toEqual([2, 4, 6])
         expect(yield* values((yield* fn.call([x], [-1]))[0])).toEqual([-1, -2, -3])
-        expect(fn.stats()).toEqual({ cached: 1, compiled: 1 })
+        expect(yield* fn.stats).toEqual({ cached: 1, compiled: 1 })
         const error = yield* Effect.flip(fn.call([x]))
         expect(error._tag).toBe("TensorError")
       })
@@ -71,7 +71,7 @@ onDevices("Compile", () => (it) => {
         for (const [actual] of results) {
           expect(yield* values(actual)).toEqual(expected)
         }
-        expect(fn.stats()).toEqual({ cached: 1, compiled: 1 })
+        expect(yield* fn.stats).toEqual({ cached: 1, compiled: 1 })
       })
     )
 
@@ -84,9 +84,9 @@ onDevices("Compile", () => (it) => {
         yield* fn.call([yield* of(1)])
         yield* fn.call([yield* of(2)])
         yield* fn.call([yield* of(3)])
-        expect(fn.stats()).toEqual({ cached: 2, compiled: 3 })
+        expect(yield* fn.stats).toEqual({ cached: 2, compiled: 3 })
         yield* fn.call([yield* of(1)])
-        expect(fn.stats()).toEqual({ cached: 2, compiled: 4 })
+        expect(yield* fn.stats).toEqual({ cached: 2, compiled: 4 })
       })
     )
 
@@ -101,7 +101,7 @@ onDevices("Compile", () => (it) => {
         const x = yield* Tensor.fromTypedArray(floats([1]), [1])
         const error = yield* Effect.flip(fn.call([x]))
         expect(error._tag).toBe("TensorError")
-        expect(fn.stats().cached).toBe(0)
+        expect((yield* fn.stats).cached).toBe(0)
       })
     )
 
@@ -113,7 +113,7 @@ onDevices("Compile", () => (it) => {
         expect(yield* values((yield* fn.call([x]))[0])).toEqual([1, 0])
         const ints = (yield* Tensor.toTypedArray((yield* fn.call([y]))[0])) as BigInt64Array
         expect(Array.from(ints)).toEqual([3n, 0n])
-        expect(fn.stats()).toEqual({ cached: 2, compiled: 2 })
+        expect(yield* fn.stats).toEqual({ cached: 2, compiled: 2 })
       })
     )
 
@@ -132,19 +132,48 @@ onDevices("Compile", () => (it) => {
       })
     )
 
+    it.effect("arena replay matches the capture run bitwise across inputs", () =>
+      Effect.gen(function* () {
+        // Matmuls break fusion, so the graph has real intermediates for
+        // the arena to plan; runs 2+ replay the plan captured on run 1.
+        const fn = yield* Tensor.compile(([a, b]) =>
+          Effect.gen(function* () {
+            const m1 = yield* Tensor.matmul(a, b)
+            const scaled = yield* Tensor.mul(m1, yield* Tensor.constant(0.5))
+            const m2 = yield* Tensor.matmul(scaled, b)
+            return [yield* Tensor.tanh(yield* Tensor.add(m2, a))]
+          })
+        )
+        for (let i = 0; i < 3; i++) {
+          const x = yield* Tensor.fromTypedArray(floats([1 + i, 2, 3, 4 - i]), [2, 2])
+          const y = yield* Tensor.fromTypedArray(floats([5, 6 - i, 7, 8]), [2, 2])
+          const [expected] = yield* Tensor.compute([
+            yield* Tensor.tanh(
+              yield* Tensor.add(
+                yield* Tensor.matmul(yield* Tensor.mul(yield* Tensor.matmul(x, y), yield* Tensor.constant(0.5)), y),
+                x
+              )
+            )
+          ])
+          const [actual] = yield* fn.call([x, y])
+          expect(yield* values(actual)).toEqual(yield* values(expected))
+        }
+      })
+    )
+
     it.effect("clear releases cached programs", () =>
       Effect.gen(function* () {
         const fn = yield* Tensor.compile(([a]) => Effect.map(Tensor.relu(a), (out) => [out]))
         const x = yield* Tensor.fromTypedArray(floats([1]), [1])
         yield* fn.call([x])
-        expect(fn.stats().cached).toBe(1)
-        yield* fn.clear()
-        expect(fn.stats()).toEqual({ cached: 0, compiled: 1 })
+        expect((yield* fn.stats).cached).toBe(1)
+        yield* fn.clear
+        expect(yield* fn.stats).toEqual({ cached: 0, compiled: 1 })
       })
     )
   })
 
-  describe("Model.compile", () => {
+  describe("Model execution (always compiled)", () => {
     const mlp = Effect.gen(function* () {
       return yield* Model.chain(
         yield* Model.linear("fc1", 2, 8),
@@ -154,63 +183,68 @@ onDevices("Compile", () => (it) => {
       )
     })
 
-    it.effect("is still a model: execute matches forward bitwise", () =>
+    it.effect("execute matches forward bitwise", () =>
       Effect.gen(function* () {
         const model = yield* mlp
-        const compiled = yield* Model.compile(model)
-        expect(Model.isCompiled(model)).toBe(false)
-        expect(Model.isCompiled(compiled)).toBe(true)
         const params = yield* Tensor.compute(yield* model.init)
         const x = yield* Tensor.fromTypedArray(floats([0, 1, 1, 0]), [2, 2])
         const [expected] = yield* Tensor.compute([yield* model.forward(params, x)])
-        const actual = yield* compiled.execute(params, x)
+        const actual = yield* model.execute(params, x)
         expect(yield* values(actual)).toEqual(yield* values(expected))
-        expect(compiled.names).toEqual(model.names)
-        expect(compiled.stats()).toEqual({ cached: 1, compiled: 1 })
+        expect(yield* model.stats).toEqual({ cached: 1, compiled: 1 })
       })
     )
 
     it.effect("recompiles on a batch-shape change and serves concurrent calls", () =>
       Effect.gen(function* () {
         const model = yield* mlp
-        const compiled = yield* Model.compile(model)
         const params = yield* Tensor.compute(yield* model.init)
         const x2 = yield* Tensor.fromTypedArray(floats([0, 1, 1, 0]), [2, 2])
         const x4 = yield* Tensor.fromTypedArray(floats([0, 0, 0, 1, 1, 0, 1, 1]), [4, 2])
         const [a, b] = yield* Effect.all(
-          [compiled.execute(params, x2), compiled.execute(params, x2)],
+          [model.execute(params, x2), model.execute(params, x2)],
           { concurrency: "unbounded" }
         )
         expect(yield* values(a)).toEqual(yield* values(b))
-        yield* compiled.execute(params, x4)
-        expect(compiled.stats()).toEqual({ cached: 2, compiled: 2 })
+        yield* model.execute(params, x4)
+        expect(yield* model.stats).toEqual({ cached: 2, compiled: 2 })
       })
     )
 
     it.effect("forward stays a graph builder: it differentiates and composes", () =>
       Effect.gen(function* () {
         const model = yield* mlp
-        const compiled = yield* Model.compile(model)
         const params = yield* Tensor.compute(yield* model.init)
         const x = yield* Tensor.fromTypedArray(floats([0, 1, 1, 0]), [2, 2])
         const y = yield* Tensor.fromTypedArray(floats([1, 0]), [2, 1])
-        const loss = yield* Loss.mse(yield* compiled.forward(params, x), y)
+        const loss = yield* Loss.mse(yield* model.forward(params, x), y)
         const grads = yield* Gradient.grad(loss, params)
         const [value, ...evaluated] = yield* Tensor.compute([loss, ...grads])
         expect(Number.isFinite((yield* values(value))[0])).toBe(true)
         for (const g of evaluated) {
           expect((yield* values(g)).some((v) => v !== 0)).toBe(true)
         }
-        const chained = yield* Model.chain(compiled, yield* Model.relu)
+        const chained = yield* Model.chain(model, yield* Model.relu)
         const [out] = yield* Tensor.compute([yield* chained.forward(params, x)])
         expect(Number.isFinite((yield* values(out))[0])).toBe(true)
       })
     )
 
-    it.effect("trains under a compiled trainer like the original model", () =>
+    it.effect("clear releases the forward programs", () =>
       Effect.gen(function* () {
         const model = yield* mlp
-        const compiled = yield* Model.compile(model)
+        const params = yield* Tensor.compute(yield* model.init)
+        const x = yield* Tensor.fromTypedArray(floats([0, 1, 1, 0]), [2, 2])
+        yield* model.execute(params, x)
+        expect((yield* model.stats).cached).toBe(1)
+        yield* model.clear
+        expect(yield* model.stats).toEqual({ cached: 0, compiled: 1 })
+      })
+    )
+
+    it.effect("trains under a compiled trainer", () =>
+      Effect.gen(function* () {
+        const model = yield* mlp
         const input = yield* Tensor.fromTypedArray(floats([0, 1, 1, 0]), [2, 2])
         const target = yield* Tensor.fromTypedArray(floats([1, 0]), [2, 1])
         const initial = yield* Tensor.compute(yield* model.init)
@@ -222,7 +256,7 @@ onDevices("Compile", () => (it) => {
           stop: ({ step }) => step >= 10
         }
         const reference = yield* (yield* Trainer.make(model, config)).train(initial)
-        const traced = yield* (yield* Trainer.compile(yield* Trainer.make(compiled, config))).train(initial)
+        const traced = yield* (yield* Trainer.make(model, config)).train(initial)
         expect(traced.loss).toBe(reference.loss)
       })
     )

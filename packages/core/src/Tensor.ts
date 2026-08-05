@@ -3379,6 +3379,23 @@ const typedArrayConstructor = (dtype: DType) => {
 }
 
 /**
+ * Releases a concrete tensor's device buffer immediately instead of
+ * waiting for the garbage collector — the explicit early-release valve
+ * for evaluation loops that materialize large tensors per iteration.
+ * Using the tensor afterwards (through the handle or any lazy graph
+ * built from it) fails with a typed error.
+ *
+ * @since 0.1.0
+ * @category destructors
+ */
+export const clear = (self: Concrete): Effect.Effect<void, TensorError> =>
+  Effect.try({
+    try: () => self.materialized.clear(),
+    catch: (error) =>
+      new TensorError({ op: "clear", message: error instanceof Error ? error.message : String(error) })
+  })
+
+/**
  * Evaluates a tensor and reads its values back into a typed array matching
  * the tensor's dtype. Data is exported without copying when the device buffer
  * allows it.
@@ -3510,8 +3527,8 @@ export interface CompiledFn<E = never, R = never> {
     inputs: ReadonlyArray<Any>,
     scalars?: ReadonlyArray<number>
   ) => Effect.Effect<Array<Concrete>, TensorError | E, R>
-  readonly stats: () => CompileStats
-  readonly clear: () => Effect.Effect<void>
+  readonly stats: Effect.Effect<CompileStats>
+  readonly clear: Effect.Effect<void>
 }
 
 /**
@@ -3534,9 +3551,9 @@ export interface ProgramCache {
   compiled: number
   warned: boolean
   /** Programs cached, traces performed. */
-  readonly stats: () => CompileStats
+  readonly stats: Effect.Effect<CompileStats>
   /** Clears every cached program early (they are otherwise GC-collected). */
-  readonly clear: () => Effect.Effect<void>
+  readonly clear: Effect.Effect<void>
 }
 
 /** Mutable internals — the public surface is {@link ProgramCache}. */
@@ -3558,14 +3575,17 @@ export const makeProgramCache = (capacity: number = 32): ProgramCache => {
     keys: new Set(),
     compiled: 0,
     warned: false,
-    stats: () => ({ cached: cache.entries.size, compiled: cache.compiled }),
-    clear: () =>
-      Effect.sync(() => {
+    get stats() {
+      return Effect.sync(() => ({ cached: cache.entries.size, compiled: cache.compiled }))
+    },
+    get clear() {
+      return Effect.sync(() => {
         // Dropping the last JS reference makes the native program
         // collectable; its finalizer releases the frozen graph.
         cache.entries.clear()
         cache.keys.clear()
       })
+    }
   }
   return cache
 }
@@ -4078,8 +4098,12 @@ export const compile = <E = never, R = never>(
           const program = yield* cachedProgram(cache, signatureOf(inputs), trace(inputs))
           return yield* runProgram(program, inputs, scalars)
         }),
-      stats: cache.stats,
-      clear: cache.clear
+      get stats() {
+        return cache.stats
+      },
+      get clear() {
+        return cache.clear
+      }
     }
     return self
   })

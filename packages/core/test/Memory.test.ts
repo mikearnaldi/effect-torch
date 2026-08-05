@@ -1,4 +1,4 @@
-import { describe, layer } from "@effect/vitest"
+import { describe, expect, layer } from "@effect/vitest"
 import * as assert from "@effect/vitest/utils"
 import { Effect } from "effect"
 import { setFlagsFromString } from "node:v8"
@@ -11,6 +11,32 @@ const collectGarbage = runInNewContext("gc") as () => void
 
 layer(Device.Cpu)("Memory", (it) => {
   describe("external memory accounting", () => {
+    it.effect("clear releases the bytes immediately, without GC", () =>
+      Effect.gen(function* () {
+        const bytes = 4096 * 4096 * 4
+        collectGarbage()
+        const before = native.externalMemoryBytes()
+        const [t] = yield* Tensor.compute([yield* Tensor.zeros([4096, 4096])])
+        assert.strictEqual(native.externalMemoryBytes() - before, bytes)
+        yield* Tensor.clear(t)
+        assert.strictEqual(native.externalMemoryBytes(), before)
+      })
+    )
+
+    it.effect("use after clear is a typed error, through the handle and the graph", () =>
+      Effect.gen(function* () {
+        const [t] = yield* Tensor.compute([yield* Tensor.zeros([4])])
+        const downstream = yield* Tensor.add(t, yield* Tensor.constant(1))
+        yield* Tensor.clear(t)
+        const direct = yield* Effect.flip(Tensor.toNumberArray(t))
+        assert.strictEqual(direct._tag, "TensorError")
+        expect(direct.message).toMatch(/cleared/)
+        const viaGraph = yield* Effect.flip(Tensor.toNumberArray(downstream))
+        assert.strictEqual(viaGraph._tag, "TensorError")
+        expect(viaGraph.message).toMatch(/cleared/)
+      })
+    )
+
     it.effect("native tensor bytes are reported on compute and released on GC", () =>
       Effect.gen(function* () {
         const bytes = 4096 * 4096 * 4

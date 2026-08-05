@@ -15,6 +15,7 @@
 //!   semantic fused kernels.
 
 pub mod device;
+pub mod arena;
 pub mod emit;
 pub mod conv;
 pub mod gemm;

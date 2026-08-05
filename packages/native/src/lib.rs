@@ -277,9 +277,33 @@ fn get_device(device: Option<String>) -> Result<Device> {
     }
 }
 
+/// Shared storage behind a materialized tensor handle and the lazy
+/// Leaf node built from it. `clear()` empties the slot: the buffer is
+/// released immediately and every later use — through the handle or
+/// through the graph — is a typed error.
+pub struct LeafSlot(std::sync::Mutex<Option<val::Val>>);
+
+impl LeafSlot {
+    fn new(inner: val::Val) -> Self {
+        LeafSlot(std::sync::Mutex::new(Some(inner)))
+    }
+
+    fn get(&self) -> std::result::Result<val::Val, String> {
+        self.0
+            .lock()
+            .unwrap()
+            .clone()
+            .ok_or_else(|| "tensor was cleared".to_string())
+    }
+
+    fn clear(&self) -> bool {
+        self.0.lock().unwrap().take().is_some()
+    }
+}
+
 #[napi(custom_finalize)]
 pub struct NativeTensor {
-    pub(crate) inner: val::Val,
+    pub(crate) slot: std::sync::Arc<LeafSlot>,
     bytes: i64,
 }
 
@@ -298,7 +322,11 @@ impl NativeTensor {
         // told the delta at the next main-thread touchpoint (see sync_v8);
         // no JS-side involvement, so no missed sites and no drift.
         EXTERNAL_MEMORY_BYTES.fetch_add(bytes, Ordering::Relaxed);
-        Self { inner, bytes }
+        Self { slot: std::sync::Arc::new(LeafSlot::new(inner)), bytes }
+    }
+
+    fn val_cloned(&self) -> Result<val::Val> {
+        self.slot.get().map_err(|e| Error::new(Status::GenericFailure, e))
     }
 }
 
@@ -360,24 +388,37 @@ impl CancellationToken {
 
 #[napi]
 impl NativeTensor {
-    #[napi(getter)]
-    pub fn shape(&self) -> Vec<u32> {
-        self.inner.shape().iter().map(|&d| d as u32).collect()
+    /// Releases the tensor's buffer early instead of waiting for the
+    /// garbage collector. Using the handle — or any lazy graph built
+    /// from it — afterwards is a typed error.
+    #[napi]
+    pub fn clear(&mut self, env: Env) -> Result<()> {
+        if self.slot.clear() {
+            EXTERNAL_MEMORY_BYTES.fetch_sub(self.bytes, Ordering::Relaxed);
+            self.bytes = 0;
+            sync_v8(&env);
+        }
+        Ok(())
     }
 
     #[napi(getter)]
-    pub fn dtype(&self) -> String {
-        self.inner.dtype().name().to_string()
+    pub fn shape(&self) -> Result<Vec<u32>> {
+        Ok(self.val_cloned()?.shape().iter().map(|&d| d as u32).collect())
     }
 
     #[napi(getter)]
-    pub fn device(&self) -> String {
-        self.inner.device().name().to_string()
+    pub fn dtype(&self) -> Result<String> {
+        Ok(self.val_cloned()?.dtype().name().to_string())
+    }
+
+    #[napi(getter)]
+    pub fn device(&self) -> Result<String> {
+        Ok(self.val_cloned()?.device().name().to_string())
     }
 
     #[napi(ts_return_type = "Promise<ArrayBuffer>")]
     pub async fn readback(&self, token: Option<&CancellationToken>) -> Result<Readback> {
-        let inner = self.inner.clone();
+        let inner = self.val_cloned()?;
         let compute = tokio::task::spawn_blocking(move || readback_blocking(&inner));
         match token {
             Some(token) => {
@@ -502,7 +543,7 @@ enum PositionOffset {
 }
 
 enum NodeKind {
-    Leaf(val::Val),
+    Leaf(std::sync::Arc<LeafSlot>),
     // RFC 0008: placeholder leaves for compiled programs. An Input carries
     // the declared signature of one call argument; it evaluates only inside
     // CompiledProgram::run, which binds the slot to an argument buffer.
@@ -1144,14 +1185,17 @@ fn reduced_shape(shape: &[usize], dims: &[usize], keepdims: bool) -> Vec<usize> 
 impl Node {
     fn new(kind: NodeKind) -> std::result::Result<Arc<Node>, String> {
         let (shape, dtype, device) = match &kind {
-            NodeKind::Leaf(tensor) => (
-                tensor.shape(),
-                tensor.dtype(),
-                match tensor.device() {
-                    dev::Device::Cpu => dev::Device::Cpu,
-                    dev::Device::Metal => dev::Device::Metal,
-                },
-            ),
+            NodeKind::Leaf(slot) => {
+                let tensor = slot.get()?;
+                (
+                    tensor.shape(),
+                    tensor.dtype(),
+                    match tensor.device() {
+                        dev::Device::Cpu => dev::Device::Cpu,
+                        dev::Device::Metal => dev::Device::Metal,
+                    },
+                )
+            }
             NodeKind::Input {
                 shape,
                 dtype,
@@ -2267,7 +2311,7 @@ impl LazyTensor {
 
     #[napi(factory)]
     pub fn from_materialized(tensor: &NativeTensor) -> Result<Self> {
-        lazy_ctor!(Node::new(NodeKind::Leaf(tensor.inner.clone())))
+        lazy_ctor!(Node::new(NodeKind::Leaf(tensor.slot.clone())))
     }
 
     // RFC 0008: placeholder leaves. `input` declares one tensor argument of a
@@ -2930,8 +2974,15 @@ impl Evaluator {
         kv: Option<Arc<KvContext>>,
     ) -> Self {
         let mut consumers = std::collections::HashMap::new();
+        // One visited set across all roots: a node shared between roots
+        // is visited once, so each parent edge is counted exactly once —
+        // matching the single decrement it gets when that parent is
+        // evaluated. Counting per root would multiply the counts of
+        // shared nodes by the number of roots reaching them, and their
+        // buffers would never be released mid-walk.
+        let mut visited = HashSet::new();
         for root in roots {
-            count_consumers(root, &mut consumers);
+            count_consumers(root, &mut consumers, &mut visited);
         }
         Self {
             cache: std::collections::HashMap::new(),
@@ -2949,12 +3000,54 @@ impl Evaluator {
         }
     }
 
+    // RFC 0016: buffer identities of every Metal tensor the walk still
+    // references — the arena capture's liveness set at a node boundary.
+    fn live_buffer_keys(&self) -> HashSet<usize> {
+        let mut out = HashSet::new();
+        let mut add = |v: &val::Val| {
+            if let Some(key) = v.buffer_key() {
+                out.insert(key);
+            }
+        };
+        for v in self.cache.values() {
+            add(v);
+        }
+        for pair in self.adamw.values() {
+            add(&pair[0]);
+            add(&pair[1]);
+        }
+        for v in self.sgd.values() {
+            add(v);
+        }
+        for vs in self.multi.values() {
+            for v in vs {
+                add(v);
+            }
+        }
+        for pair in self.ln.values() {
+            add(&pair[0]);
+            add(&pair[1]);
+        }
+        for v in self.step_scalars.values() {
+            add(v);
+        }
+        for v in self.scalar_packs.values() {
+            add(v);
+        }
+        for v in self.slots.values() {
+            add(v);
+        }
+        for (v, _, _) in &self.ce_checks {
+            add(v);
+        }
+        out
+    }
+
     // Runs the deferred fused-CE status checks after the walk's final
     // synchronize: forward statuses are [loss, active, invalid],
     // backward counts are [active]. Errors are exactly the composed
     // path's, raised from the same eval call.
-    fn run_ce_checks(&self) -> crate::err::Res<()> {
-        for (buffer, forward, classes) in &self.ce_checks {
+    fn run_ce_checks(&self) -> crate::err::Res<()> {        for (buffer, forward, classes) in &self.ce_checks {
             let values = buffer.to_f32_vec()?;
             if *forward {
                 let (active, invalid) = (values[1] as usize, values[2] as usize);
@@ -3015,8 +3108,11 @@ impl Evaluator {
     }
 }
 
-fn count_consumers(root: &Arc<Node>, consumers: &mut std::collections::HashMap<u64, usize>) {
-    let mut visited = HashSet::new();
+fn count_consumers(
+    root: &Arc<Node>,
+    consumers: &mut std::collections::HashMap<u64, usize>,
+    visited: &mut HashSet<u64>,
+) {
     let mut stack = vec![root.clone()];
     while let Some(node) = stack.pop() {
         if !visited.insert(node.id) {
@@ -3882,12 +3978,20 @@ fn eval_node(
         if processed {
             let kind_timing = std::env::var_os("EFFECT_TORCH_KIND_TIMING").is_some();
             let t0 = kind_timing.then(std::time::Instant::now);
+            #[cfg(target_os = "macos")]
+            if runtime::metal::arena::capture_active() {
+                runtime::metal::arena::set_current_kind(node_kind_name(&node.kind));
+            }
             let output = eval_uncached(&node, ev)?;
             if let Some(t0) = t0 {
                 kind_timing_nanos(node_kind_name(&node.kind), t0.elapsed().as_nanos() as u64);
             }
             ev.cache.insert(node.id, output);
             ev.release_children(&node);
+            #[cfg(target_os = "macos")]
+            if runtime::metal::arena::capture_active() {
+                runtime::metal::arena::capture_checkpoint(&ev.live_buffer_keys());
+            }
             continue;
         }
         stack.push((node.clone(), true));
@@ -3906,7 +4010,7 @@ fn eval_node(
 
 fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> crate::err::Res<val::Val> {
     let output = match &node.kind {
-        NodeKind::Leaf(v) => v.clone(),
+        NodeKind::Leaf(slot) => slot.get()?,
         NodeKind::Input { slot, .. } | NodeKind::ScalarInput { slot, .. } => {
             ev.slots.get(&node.id).cloned().ok_or_else(|| {
                 format!(
@@ -8072,7 +8176,7 @@ pub async fn eval_lazy(
         // encoding and GPU execution (readback synchronizes itself).
         // The sync is device-global; one call covers every output.
         if let Some(first) = outputs.first() {
-            first.inner.synchronize().map_err(to_napi_err)?;
+            first.val_cloned()?.synchronize().map_err(to_napi_err)?;
         }
         // Deferred fused-CE status checks (would have split the
         // pipeline mid-walk).
@@ -9632,27 +9736,32 @@ impl DecodeProgram {
         all_tokens.extend(std::iter::repeat(vec![0u32; advance]).take(pad.len()));
         // The ids input is fixed-width too: pad the caller's last input
         // ([n, T] decode ids) with zero rows up to the program width.
-        let mut owned_inputs: Vec<NativeTensor> = inputs.iter().map(|t| NativeTensor::wrap(t.inner.clone())).collect();
+        let mut owned_inputs: Vec<NativeTensor> = inputs
+            .iter()
+            .map(|t| t.val_cloned().map(NativeTensor::wrap))
+            .collect::<Result<Vec<_>>>()?;
         if let Some(last) = owned_inputs.last_mut() {
-            let shape = last.inner.shape();
+            let last_val = last.val_cloned()?;
+            let shape = last_val.shape();
             if shape.len() == 2 && shape[0] < self.batch as usize {
                 let pad_rows = self.batch as usize - shape[0];
-                let zeros = match &last.inner {
+                let zeros = match &last_val {
                     val::Val::Cpu(_) => val::Val::Cpu(runtime::cpu::Tensor::zeros(
                         &[pad_rows, shape[1]],
-                        last.inner.dtype(),
+                        last_val.dtype(),
                     )),
                     val::Val::Metal(_) => val::Val::Metal(
-                        metal_ops::fill(&[pad_rows, shape[1]], 0.0, last.inner.dtype())
+                        metal_ops::fill(&[pad_rows, shape[1]], 0.0, last_val.dtype())
                             .map_err(to_napi_err)?,
                     ),
                 };
-                last.inner = match (&last.inner, &zeros) {
+                let padded = match (&last_val, &zeros) {
                     (val::Val::Cpu(a), val::Val::Cpu(b)) => val::Val::Cpu(runtime::cpu::Tensor::cat(&[a, b], 0)),
                     (val::Val::Metal(a), val::Val::Metal(b)) =>
                         val::Val::Metal(metal_ops::cat(a, b, 0).map_err(to_napi_err)?),
                     _ => return Err(Error::new(Status::GenericFailure, "device mismatch".to_string())),
                 };
+                last.slot = std::sync::Arc::new(LeafSlot::new(padded));
             }
         }
         let refs: Vec<&NativeTensor> = owned_inputs.iter().collect();
@@ -9722,7 +9831,7 @@ impl DecodeProgram {
             let input_index = slot
                 - inner.slots.iter().take(slot).filter(|s| s.scalar).count()
                 - usize::from(self.cursor_tensor && (slot as u32) > self.cursor_slot);
-            let got = &inputs[input_index].inner;
+            let got = inputs[input_index].val_cloned()?;
             if got.shape() != declared.shape.as_slice()
                 || got.dtype() != declared.dtype
                 || device_key(&got.device()) != device_key(&declared.device)
@@ -9736,7 +9845,7 @@ impl DecodeProgram {
         let slots = inner.slots.clone();
         let roots = inner.roots.clone();
         let leaves = inner.leaves.clone();
-        let inputs: Vec<val::Val> = inputs.iter().map(|input| input.inner.clone()).collect();
+        let inputs: Vec<val::Val> = inputs.iter().map(|input| input.val_cloned()).collect::<Result<Vec<_>>>()?;
         let kv = Arc::new(KvContext {
             pool: seqs[0].pool.clone(),
             slots: seqs.iter().map(|seq| seq.state.clone()).collect(),
@@ -9843,7 +9952,7 @@ impl DecodeProgram {
             // Synchronize once: per-root syncs would fully serialize
             // CPU encoding and GPU execution. Device-global: one call.
             if let Some(first) = outputs.first() {
-                first.inner.synchronize().map_err(to_napi_err)?;
+                first.val_cloned()?.synchronize().map_err(to_napi_err)?;
             }
             ev.run_ce_checks().map_err(to_napi_err)?;
             for (i, state) in slot_states.iter().enumerate() {
@@ -9900,6 +10009,7 @@ pub fn compile_decode(roots: Vec<&LazyTensor>, window: Option<u32>, batch: Optio
             slots,
             leaves,
             signature,
+            arena: Arc::new(Mutex::new(ArenaState::default())),
         },
         cursor_slot: geometry.cursor_slot,
         layers: geometry.layers as u32,
@@ -9946,6 +10056,16 @@ struct ProgramInner {
     // Placeholder node id -> slot index, collected once at freeze time.
     leaves: Vec<(u64, u32)>,
     signature: String,
+    // RFC 0016: the arena plan learned from the first run's allocation
+    // sequence and replayed by later runs. `captured` suppresses repeat
+    // capture after a divergence.
+    arena: Arc<Mutex<ArenaState>>,
+}
+
+#[derive(Default)]
+struct ArenaState {
+    captured: bool,
+    plan: Option<Arc<runtime::metal::arena::Plan>>,
 }
 
 #[napi]
@@ -10081,7 +10201,7 @@ impl CompiledProgram {
                 continue;
             }
             let input = tensors.next().expect("tensor count checked");
-            let got = &input.inner;
+            let got = input.val_cloned()?;
             if got.shape() != declared.shape.as_slice()
                 || got.dtype() != declared.dtype
                 || device_key(&got.device()) != device_key(&declared.device)
@@ -10105,9 +10225,33 @@ impl CompiledProgram {
         let slots = inner.slots.clone();
         let roots = inner.roots.clone();
         let leaves = inner.leaves.clone();
-        let inputs: Vec<val::Val> = inputs.iter().map(|input| input.inner.clone()).collect();
+        let arena_state = inner.arena.clone();
+        let arena_eligible = inner.slots.iter().any(|s| !s.device.is_cpu())
+            || inner.roots.iter().any(|r| !r.device.is_cpu());
+        let inputs: Vec<val::Val> = inputs.iter().map(|input| input.val_cloned()).collect::<Result<Vec<_>>>()?;
     run_compute(token, move |cancelled| {
         let _guard = metal_eval_guard(&roots);
+        // RFC 0016: replay the planned arena if one exists; otherwise
+        // capture this run's allocation sequence to build one.
+        #[cfg(target_os = "macos")]
+        let (plan, capturing) = {
+            let state = arena_state.lock().unwrap();
+            (state.plan.clone(), state.plan.is_none() && !state.captured && arena_eligible)
+        };
+        #[cfg(target_os = "macos")]
+        let replaying = plan.is_some();
+        #[cfg(target_os = "macos")]
+        if let Some(plan) = plan {
+            runtime::metal::arena::replay_begin(plan);
+        }
+        #[cfg(target_os = "macos")]
+        if capturing {
+            runtime::metal::arena::capture_begin();
+        }
+        // Clears the arena session on error paths that skip the explicit
+        // end below.
+        #[cfg(target_os = "macos")]
+        let _arena_session = runtime::metal::arena::SessionGuard::new();
         // Bindings are built inside the eval guard: scalar_binding
         // allocates on the device, which is not safe to do concurrently
         // with another walk on Metal.
@@ -10162,10 +10306,35 @@ impl CompiledProgram {
             // the host synchronize at readback; device-side reuse needs
             // no host round-trip. Device-global: one call.
             if let Some(first) = outputs.first() {
-                first.inner.synchronize().map_err(to_napi_err)?;
+                first.val_cloned()?.synchronize().map_err(to_napi_err)?;
             }
             let t_sync = t1.elapsed() - t_encode;
             ev.run_ce_checks().map_err(to_napi_err)?;
+            #[cfg(target_os = "macos")]
+            {
+                if replaying {
+                    if runtime::metal::arena::replay_end() {
+                        let mut state = arena_state.lock().unwrap();
+                        state.plan = None;
+                        state.captured = true;
+                        if std::env::var_os("EFFECT_TORCH_ARENA_DEBUG").is_some() {
+                            eprintln!("[arena] replay diverged from plan; arena disabled for this program");
+                        }
+                    }
+                } else if capturing {
+                    let live = ev.live_buffer_keys();
+                    let captured = runtime::metal::arena::capture_end(&live);
+                    let plan = runtime::metal::arena::plan(&captured, &|size| {
+                        runtime::metal::device::MetalDevice::get().alloc_raw(size)
+                    });
+                    if std::env::var_os("EFFECT_TORCH_ARENA_DEBUG").is_some() {
+                        eprintln!("[arena] {}", runtime::metal::arena::report(&captured, plan.total));
+                    }
+                    let mut state = arena_state.lock().unwrap();
+                    state.plan = Some(std::sync::Arc::new(plan));
+                    state.captured = true;
+                }
+            }
             if walk_timing {
                 let (d, s, n) = crate::runtime::metal::device::dispatch_stats_reset();
                 eprintln!("[walk] program eval {:.1}us ({} roots) encode {:.1}us sync {:.1}us dispatches {} syncs {} sync_wait {:.1}us", t1.elapsed().as_micros(), roots.len(), t_encode.as_micros(), t_sync.as_micros(), d, s, n as f64 / 1000.0);
@@ -10202,6 +10371,7 @@ pub fn compile(roots: Vec<&LazyTensor>) -> Result<CompiledProgram> {
             slots,
             leaves,
             signature,
+            arena: Arc::new(Mutex::new(ArenaState::default())),
         },
     })
 }

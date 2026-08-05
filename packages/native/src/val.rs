@@ -48,6 +48,15 @@ impl Val {
         }
     }
 
+    /// Identity of the underlying Metal buffer, for liveness tracking in
+    /// arena capture (RFC 0016). None for CPU tensors.
+    pub fn buffer_key(&self) -> Option<usize> {
+        match self {
+            Val::Cpu(_) => None,
+            Val::Metal(t) => Some(std::sync::Arc::as_ptr(&t.buffer) as usize),
+        }
+    }
+
     pub fn numel(&self) -> usize {
         match self {
             Val::Cpu(t) => t.numel(),

@@ -116,6 +116,12 @@ export declare class NativeKvSequence {
 }
 
 export declare class NativeTensor {
+  /**
+   * Releases the tensor's buffer early instead of waiting for the
+   * garbage collector. Using the handle — or any lazy graph built
+   * from it — afterwards is a typed error.
+   */
+  clear(): void
   get shape(): Array<number>
   get dtype(): string
   get device(): string
