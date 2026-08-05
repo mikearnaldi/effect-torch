@@ -176,10 +176,15 @@ export interface Resume<S> {
 
 /**
  * A trainer: a model plus an encapsulated training configuration, with
- * the training loop as a method. {@link make} creates the uncompiled
- * form (every step builds the step graph); {@link compile} returns a
- * {@link CompiledTrainer} whose steps run as frozen native programs —
- * still a `Trainer`, with the same `train` method.
+ * the training loop as a method. Every trainer is compiled: each step
+ * runs as a frozen native program — parameters, optimizer state roots,
+ * input, and target in (plus the step's scheduled learning rate as a
+ * runtime scalar), loss, updated parameters, and updated state roots
+ * out, in one native call per step. The step graph is traced once per
+ * input signature from the same definitions the reference loop uses
+ * (`model.forward`, `config.loss`, `Gradient.grad`, `optimizer.step`);
+ * a step whose batch signature differs from every cached program traces
+ * a new one, with least-recently-used eviction past the cache capacity.
  *
  * @since 0.1.0
  * @category models
@@ -191,12 +196,8 @@ export interface Trainer<S, EL = never, RL = never, ED = never, RD = never, EO =
    * Runs the training loop: initialize with `params` (or `model.init`
    * when omitted — continued training and fine-tuning pass a checkpoint's
    * parameters), then step until `stop` says otherwise (at least one
-   * step always runs), calling `onStep` after every step. With an
-   * uncompiled trainer each step builds and evaluates the full step
-   * graph; with a compiled one each step is a single frozen-program
-   * call. Both share the loop's semantics — same data sampling, same
-   * schedule, same stop policy — and agree step-for-step on
-   * deterministic graphs.
+   * step always runs), calling `onStep` after every step. The first step
+   * pays the trace; subsequent steps are single frozen-program calls.
    */
   readonly train: (
     params?: Model.Params,
@@ -206,54 +207,18 @@ export interface Trainer<S, EL = never, RL = never, ED = never, RD = never, EO =
     Model.ModelError | Tensor.TensorError | Gradient.GradError | EL | ED | EO,
     CurrentDevice | RL | RD | RO
   >
-}
-
-const CompiledTypeId: unique symbol = Symbol.for("@effect-torch/core/Trainer/Compiled")
-
-/**
- * @since 0.1.0
- * @category symbols
- */
-export type CompiledTypeId = typeof CompiledTypeId
-
-/**
- * A trainer whose steps run as frozen native programs (see
- * {@link compile}): still a {@link Trainer} in every respect, with the
- * shape-keyed program cache's diagnostics and release added as required
- * members.
- *
- * @since 0.1.0
- * @category models
- */
-export interface CompiledTrainer<S, EL = never, RL = never, ED = never, RD = never, EO = never, RO = never>
-  extends Trainer<S, EL, RL, ED, RD, EO, RO>
-{
-  readonly [CompiledTypeId]: CompiledTypeId
   /**
    * Shape-cache diagnostics: programs cached, traces performed.
    */
-  readonly stats: () => Tensor.CompileStats
+  readonly stats: Effect.Effect<Tensor.CompileStats>
   /**
    * Clears the cached programs early (they are otherwise collected by GC).
    */
-  readonly clear: () => Effect.Effect<void>
+  readonly clear: Effect.Effect<void>
 }
 
 /**
- * Returns `true` if the trainer was produced by {@link compile} and
- * narrows it to {@link CompiledTrainer}.
- *
- * @since 0.1.0
- * @category refinements
- */
-export const isCompiled = <S, EL = never, RL = never, ED = never, RD = never, EO = never, RO = never>(
-  trainer: Trainer<S, EL, RL, ED, RD, EO, RO>
-): trainer is CompiledTrainer<S, EL, RL, ED, RD, EO, RO> => CompiledTypeId in trainer
-
-/**
- * Creates a trainer for `model` from a training configuration. The
- * returned trainer runs the uncompiled loop: every step constructs the
- * forward, backward, and update graphs.
+ * Creates a trainer for `model` from a training configuration.
  *
  * @since 0.1.0
  * @category constructors
@@ -262,60 +227,42 @@ export const make = <S, EL = never, RL = never, ED = never, RD = never, EO = nev
   model: Model.Model,
   config: TrainConfig<S, EL, RL, ED, RD, EO, RO>
 ): Effect.Effect<Trainer<S, EL, RL, ED, RD, EO, RO>> =>
+  Effect.sync(() => {
+    const cache = Tensor.makeProgramCache(undefined)
+    return {
+      model,
+      config,
+      train: (params, resume) => trainLoop(model, config, params, resume, cache),
+      get stats() {
+        return cache.stats
+      },
+      get clear() {
+        return cache.clear
+      }
+    }
+  })
+
+/**
+ * The uncompiled loop: every step constructs and evaluates the full
+ * step graph. Internal — the reference the compiled programs are
+ * checked against step-for-step in tests.
+ *
+ * @since 0.1.0
+ * @category constructors
+ * @internal
+ */
+export const makeUncompiled = <S, EL = never, RL = never, ED = never, RD = never, EO = never, RO = never>(
+  model: Model.Model,
+  config: TrainConfig<S, EL, RL, ED, RD, EO, RO>
+): Effect.Effect<Trainer<S, EL, RL, ED, RD, EO, RO>> =>
   Effect.succeed({
     model,
     config,
-    train: (params, resume) => trainLoop(model, config, params, resume, undefined)
+    train: (params, resume) => trainLoop(model, config, params, resume, undefined),
+    stats: Effect.succeed({ cached: 0, compiled: 0 }),
+    clear: Effect.void
   })
 
-/**
- * Options for {@link compile}.
- *
- * @since 0.1.0
- * @category compilation
- */
-export interface CompileOptions {
-  /**
-   * Shape-cache capacity in programs. The first step with a new batch
-   * signature traces and freezes a step program; later steps with the
-   * same signature reuse it. Defaults to 32.
-   */
-  readonly cacheCapacity?: number
-}
-
-/**
- * Returns a compiled trainer: same configuration, but each step runs as a
- * frozen native program — parameters, optimizer state roots, input, and
- * target in (plus the step's scheduled learning rate as a runtime
- * scalar), loss, updated parameters, and updated state roots out, in one
- * native call per step. The step graph is traced from the same
- * definitions the uncompiled loop uses (`model.forward`, `config.loss`,
- * `Gradient.grad`, `optimizer.step`), so the two agree step-for-step on
- * deterministic graphs.
- *
- * Recompilation is automatic and shape-keyed: a step whose batch (or
- * parameter, or state) signature differs from every cached program traces
- * a new one, up to `cacheCapacity` programs with least-recently-used
- * eviction. The compiled trainer is still a {@link Trainer} — its
- * `train` method runs the same loop as the uncompiled form.
- *
- * @since 0.1.0
- * @category compilation
- */
-export const compile = <S, EL = never, RL = never, ED = never, RD = never, EO = never, RO = never>(
-  trainer: Trainer<S, EL, RL, ED, RD, EO, RO>,
-  options: CompileOptions = {}
-): Effect.Effect<CompiledTrainer<S, EL, RL, ED, RD, EO, RO>> =>
-  Effect.sync(() => {
-    const cache = Tensor.makeProgramCache(options.cacheCapacity)
-    return {
-      [CompiledTypeId]: CompiledTypeId,
-      ...trainer,
-      train: (params, resume) => trainLoop(trainer.model, trainer.config, params, resume, cache),
-      stats: cache.stats,
-      clear: cache.clear
-    }
-  })
 
 const uncompiledStep = <S, EL, RL, ED, RD, EO, RO>(
   model: Model.Model,
@@ -469,6 +416,26 @@ const trainLoop = <S, EL = never, RL = never, ED = never, RD = never, EO = never
     let loss = Number.NaN
     let trained: ReadonlyArray<Tensor.Concrete>
     const started = yield* Effect.sync(() => Date.now())
+    // Tensors the loop itself produced (the materialized init roots and
+    // each step's outputs) that a later step has consumed: their buffers
+    // are dead once the consuming step returns, so release them
+    // explicitly — one generation is params + optimizer moments, GBs at
+    // 360M-class scale, and GC timing is not a memory plan. Tensors the
+    // caller passed in stay the caller's.
+    let consumed: ReadonlyArray<Tensor.Concrete> = []
+    if (cache !== undefined) {
+      // Program inputs must be materialized buffers: the initial
+      // parameters and state are lazy graph values, so evaluate them
+      // once up front; every later step returns materialized values.
+      const roots = [...params, ...config.optimizer.stateRoots(state)]
+      const callerOwned = roots.every(Tensor.isTensor)
+      const materialized = yield* Tensor.compute(roots)
+      params = materialized.slice(0, params.length)
+      state = config.optimizer.rebuildState(state, materialized.slice(params.length))
+      if (!callerOwned) {
+        consumed = materialized
+      }
+    }
     do {
       step++
       const data: TrainData = typeof config.data === "function"
@@ -477,6 +444,12 @@ const trainLoop = <S, EL = never, RL = never, ED = never, RD = never, EO = never
       const result = cache !== undefined
         ? yield* compiledStep(model, config, cache, params, state, data, step)
         : yield* uncompiledStep(model, config, params, state, data, step)
+      if (consumed.length > 0) {
+        yield* Effect.forEach(consumed, (tensor) => Tensor.clear(tensor), { discard: true })
+      }
+      consumed = cache !== undefined
+        ? [...result.params, ...config.optimizer.stateRoots(result.state).filter(Tensor.isTensor)]
+        : []
       loss = result.loss
       trained = result.params
       params = result.params

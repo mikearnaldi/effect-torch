@@ -111,7 +111,7 @@ onDevices("Checkpoint", () => (it) => {
             data: { input, target },
             stop: ({ step }) => step >= stopStep
           }
-          return yield* Trainer.compile(yield* Trainer.make(model, config))
+          return yield* Trainer.make(model, config)
         })
       const trainer = yield* makeTrainer(8)
       const uninterrupted = yield* (yield* makeTrainer(20)).train(initial)
@@ -144,7 +144,7 @@ onDevices("Checkpoint", () => (it) => {
         data: { input, target },
         stop: ({ step }) => step >= 2
       }
-      const trainer = yield* Trainer.compile(yield* Trainer.make(model, config))
+      const trainer = yield* Trainer.make(model, config)
       const samplerConfig = { length: 4 * 8 + 1, block: 8, batch: 2 }
       const sampler = yield* Sampler.make(samplerConfig)
       sampler.next()

@@ -50,8 +50,9 @@ const program = Effect.gen(function* () {
 
   const samplerConfig = { length: train.length, block: BLOCK, batch: BATCH }
   let sampler: Sampler.Sampler
-  const trainer = yield* Trainer.compile(yield* Trainer.make(model, {
-    optimizer: yield* Optimizer.adamW(),
+  const optimizer = yield* Optimizer.adamW()
+  const trainer = yield* Trainer.make(model, {
+    optimizer,
     lr: LearningRate.withWarmup(
       LearningRate.cosine(PEAK_LR, { totalSteps, minLr: MIN_LR }),
       warmupSteps
@@ -69,7 +70,7 @@ const program = Effect.gen(function* () {
     precision: PRECISION,
     onStep: ({ step, loss, elapsed }) =>
       Effect.log(`step ${String(step).padStart(5)}/${totalSteps}  loss ${loss.toFixed(4)}  ${(Duration.toMillis(elapsed) / 1000).toFixed(1)}s`)
-  }))
+  })
 
 // A saved epoch checkpoint resumes bit-exactly; otherwise start from the
 // pilot's parameters with fresh optimizer state at step 0, falling back to
@@ -85,7 +86,7 @@ if (fs.existsSync(CKPT)) {
   resume = checkpoint.resume
   step = checkpoint.resume.step
   epoch = checkpoint.sampler.epoch
-  yield* Effect.log(`resuming epoch from step ${step}`)
+  yield* Effect.log(`resuming epoch ${epoch} from step ${step}`)
 } else if (fs.existsSync(CHECKPOINT)) {
   sampler = yield* Sampler.make(samplerConfig)
   params = yield* loadParams(model, CHECKPOINT)
@@ -101,6 +102,8 @@ if (fs.existsSync(CKPT)) {
 
   let chunkTarget = Math.min(step + CHECKPOINT_EVERY, totalSteps)
   while (step < totalSteps) {
+    const previous = params
+    const previousState = resume?.state
     const trained = yield* trainer.train(params, resume)
     params = trained.params
     step = trained.step
@@ -108,6 +111,15 @@ if (fs.existsSync(CKPT)) {
     yield* Checkpoint.saveWithSampler(CKPT, trainer, trained, sampler)
     yield* Effect.log(`checkpoint at step ${step}`)
     chunkTarget = Math.min(step + CHECKPOINT_EVERY, totalSteps)
+    // The trainer returned replacement params/state; the previous chunk's
+    // generation is dead weight (params + moments, GBs at scale) — release
+    // it explicitly rather than on GC timing. Tensors the trainer cleared
+    // itself are skipped (clear is idempotent).
+    const stale = [
+      ...previous.filter(Tensor.isTensor),
+      ...(previousState !== undefined ? optimizer.stateRoots(previousState).filter(Tensor.isTensor) : [])
+    ]
+    yield* Effect.forEach(stale, (tensor) => Tensor.clear(tensor), { discard: true })
   }
 
   yield* Effect.log(`3) held-out loss over ${VAL_BATCHES} val batches`)

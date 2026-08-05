@@ -23,8 +23,11 @@
  * the parameter arrays in order. `names` gives every parameter a stable,
  * checkpoint-friendly identity that maps directly onto
  * {@link Tensor.save} / {@link Tensor.load} via {@link save} and
- * {@link load}. {@link compile} freezes the forward graph into a cached
- * native program — a compiled model is still a `Model`.
+ * {@link load}. Every model carries a compiled execution path:
+ * {@link Model.execute} runs the forward as a frozen native program,
+ * traced once per input signature and replayed after, while
+ * {@link Model.forward} stays the lazy graph builder for training,
+ * composition, and differentiation.
  *
  * Stateful layers (batchnorm running stats) are deliberately absent: the
  * pure design keeps non-trainable state out of the parameter array until
@@ -102,36 +105,14 @@ export interface Model {
     params: Params,
     input: Tensor.Any
   ) => Effect.Effect<Tensor.Lazy, ModelError | Tensor.TensorError, CurrentDevice>
-}
-
-const CompiledTypeId: unique symbol = Symbol.for("@effect-torch/core/Model/Compiled")
-
-/**
- * @since 0.1.0
- * @category symbols
- */
-export type CompiledTypeId = typeof CompiledTypeId
-
-/**
- * A model with a compiled execution path (see {@link compile}): the
- * `forward` contract is unchanged — it is still the original graph
- * builder, composable and differentiable like any other model — and the
- * frozen forward program is exposed as {@link CompiledModel.execute},
- * the fast materialized path for evaluation, with the shape-keyed
- * program cache's diagnostics and release added as required members.
- *
- * @since 0.1.0
- * @category models
- */
-export interface CompiledModel extends Model {
-  readonly [CompiledTypeId]: CompiledTypeId
   /**
    * Runs the frozen forward program: parameters and input in,
    * materialized output out — one native call per invocation after the
-   * first call per input signature pays the trace. A new input shape
-   * traces a new program automatically. Use it for evaluation loops;
-   * use `forward` wherever a graph is being built (training,
-   * composition, differentiation).
+   * first call per input signature pays the trace. Parameter shapes are
+   * fixed by the architecture, so the cache key varies only on the data
+   * shape; a new input shape traces a new program automatically. Use it
+   * for evaluation loops; use `forward` wherever a graph is being built
+   * (training, composition, differentiation).
    */
   readonly execute: (
     params: Params,
@@ -140,21 +121,71 @@ export interface CompiledModel extends Model {
   /**
    * Shape-cache diagnostics: programs cached, traces performed.
    */
-  readonly stats: () => Tensor.CompileStats
+  readonly stats: Effect.Effect<Tensor.CompileStats>
   /**
    * Clears the cached forward programs early (otherwise GC-collected).
    */
-  readonly clear: () => Effect.Effect<void>
+  readonly clear: Effect.Effect<void>
 }
 
 /**
- * Returns `true` if the model was produced by {@link compile} and
- * narrows it to {@link CompiledModel}.
+ * The definition every constructor supplies; {@link make} attaches the
+ * compiled execution machinery.
  *
  * @since 0.1.0
- * @category refinements
+ * @category models
+ * @internal
  */
-export const isCompiled = (model: Model): model is CompiledModel => CompiledTypeId in model
+interface ModelDef {
+  readonly names: ReadonlyArray<string>
+  readonly init: Effect.Effect<Params, Tensor.TensorError, CurrentDevice>
+  readonly forward: Model["forward"]
+}
+
+type ModelInternal = {
+  -readonly [K in keyof Model]: Model[K]
+} & { _fn: Tensor.CompiledFn<ModelError | Tensor.TensorError, CurrentDevice> | undefined }
+
+// Every model is compiled: `execute` runs the forward as a frozen
+// program on the shared prototype; the program cache is created on the
+// first execute and the trace runs on the first call per input
+// signature, so constructors stay device-free.
+const ModelProto = {
+  execute(this: ModelInternal, params: Params, input: Tensor.Any) {
+    const self = this
+    return Effect.gen(function* () {
+      yield* checkArity("execute", self.names, params)
+      if (self._fn === undefined) {
+        self._fn = yield* Tensor.compile<ModelError | Tensor.TensorError, CurrentDevice>(
+          (inputs) =>
+            Effect.map(
+              self.forward(inputs.slice(0, -1), inputs[inputs.length - 1]),
+              (output) => [output]
+            )
+        )
+      }
+      const [output] = yield* self._fn.call([...params, input])
+      return output
+    })
+  },
+  get stats() {
+    const self = this as ModelInternal
+    return Effect.suspend(() => self._fn?.stats ?? Effect.succeed({ cached: 0, compiled: 0 }))
+  },
+  get clear() {
+    const self = this as ModelInternal
+    return Effect.suspend(() => self._fn?.clear ?? Effect.void)
+  }
+}
+
+const make = (def: ModelDef): Model => {
+  const self = Object.create(ModelProto) as ModelInternal
+  self.names = def.names
+  self.init = def.init
+  self.forward = def.forward
+  self._fn = undefined
+  return self
+}
 
 const checkName = (op: string, name: string): Effect.Effect<void, ModelError> =>
   name.length === 0 ? new ModelError({ op, message: "name must not be empty" }) : Effect.void
@@ -179,11 +210,11 @@ const checkArity = (
 const parameterless = (
   apply: (self: Tensor.Any) => Effect.Effect<Tensor.Lazy, Tensor.TensorError, CurrentDevice>
 ): Effect.Effect<Model> =>
-  Effect.succeed({
+  Effect.succeed(make({
     names: [],
     init: Effect.succeed<Params>([]),
     forward: (_, input) => apply(input)
-  })
+  }))
 
 /**
  * A fully-connected layer `add(matmul(input, weight), bias)` with
@@ -205,7 +236,7 @@ export const linear = (
     yield* checkPositiveInt("linear", "inFeatures", inFeatures)
     yield* checkPositiveInt("linear", "outFeatures", outFeatures)
     const names = [`${name}.weight`, `${name}.bias`]
-    return {
+    return make({
       names,
       init: Effect.gen(function* () {
         const drawn = yield* Tensor.randn([inFeatures, outFeatures])
@@ -219,7 +250,7 @@ export const linear = (
           const [weight, bias] = params
           return yield* Tensor.linear(input, weight, bias)
         })
-    }
+    })
   })
 
 /**
@@ -257,7 +288,7 @@ export const conv1d = (
     }
     const names = [`${name}.weight`, `${name}.bias`]
     const fanIn = (inChannels / groups) * kernelSize
-    return {
+    return make({
       names,
       init: Effect.gen(function* () {
         const drawn = yield* Tensor.randn([outChannels, inChannels / groups, kernelSize])
@@ -272,7 +303,7 @@ export const conv1d = (
           const out = yield* Tensor.conv1d(input, weight, options)
           return yield* Tensor.add(out, yield* Tensor.reshape(bias, [1, outChannels, 1]))
         })
-    }
+    })
   })
 
 /**
@@ -312,7 +343,7 @@ export const conv2d = (
     }
     const names = [`${name}.weight`, `${name}.bias`]
     const fanIn = (inChannels / groups) * kh * kw
-    return {
+    return make({
       names,
       init: Effect.gen(function* () {
         const drawn = yield* Tensor.randn([outChannels, inChannels / groups, kh, kw])
@@ -327,7 +358,7 @@ export const conv2d = (
           const out = yield* Tensor.conv2d(input, weight, options)
           return yield* Tensor.add(out, yield* Tensor.reshape(bias, [1, outChannels, 1, 1]))
         })
-    }
+    })
   })
 
 /**
@@ -363,7 +394,7 @@ export const embedding = (
       })
     }
     const names = [`${name}.weight`]
-    return {
+    return make({
       names,
       init: Effect.gen(function* () {
         const weight = yield* Tensor.randn([numEmbeddings, embeddingDim])
@@ -377,7 +408,7 @@ export const embedding = (
             ...(options.paddingIndex !== undefined ? { paddingIndex: options.paddingIndex } : {})
           })
         })
-    }
+    })
   })
 
 /**
@@ -402,7 +433,7 @@ export const positionEmbedding = (
     yield* checkPositiveInt("positionEmbedding", "maxPositions", maxPositions)
     yield* checkPositiveInt("positionEmbedding", "embeddingDim", embeddingDim)
     const names = [`${name}.weight`]
-    return {
+    return make({
       names,
       init: Effect.gen(function* () {
         const weight = yield* Tensor.randn([maxPositions, embeddingDim])
@@ -420,7 +451,7 @@ export const positionEmbedding = (
           }
           return yield* Tensor.positionEmbedding(params[0], t)
         })
-    }
+    })
   })
 
 /**
@@ -454,7 +485,7 @@ export const layerNorm = (
       return yield* new ModelError({ op: "layerNorm", message: `eps must be positive, got ${eps}` })
     }
     const names = [`${name}.weight`, `${name}.bias`]
-    return {
+    return make({
       names,
       init: Effect.gen(function* () {
         const weight = yield* Tensor.ones(shape)
@@ -467,7 +498,7 @@ export const layerNorm = (
           const [weight, bias] = params
           return yield* Tensor.layerNorm(input, weight, bias, eps)
         })
-    }
+    })
   })
 
 /**
@@ -531,7 +562,7 @@ export const multiHeadAttention = (
       `${name}.wo.bias`
     ]
     const causal = options.causal ?? false
-    return {
+    return make({
       names,
       init: Effect.gen(function* () {
         const qkvDrawn = yield* Tensor.randn([embedDim, 3 * embedDim])
@@ -590,7 +621,7 @@ export const multiHeadAttention = (
           )
           return yield* Tensor.linear(yield* mergeHeads(attended), woWeight, woBias)
         })
-    }
+    })
   })
 
 /**
@@ -729,11 +760,11 @@ export const dropout = (options: Tensor.DropoutOptions = {}): Effect.Effect<Mode
     if (p < 0 || p >= 1) {
       return yield* new ModelError({ op: "dropout", message: `p must be in [0, 1), got ${p}` })
     }
-    return {
+    return make({
       names: [],
       init: Effect.succeed<Params>([]),
       forward: (_, input) => Tensor.dropout(input, { p })
-    }
+    })
   })
 
 const pool = (
@@ -761,11 +792,11 @@ const pool = (
         message: `padding must be a non-negative integer, got ${options.padding}`
       })
     }
-    return {
+    return make({
       names: [],
       init: Effect.succeed<Params>([]),
       forward: (_, input) => apply(input, options)
-    }
+    })
   })
 
 /**
@@ -819,11 +850,11 @@ export const avgPool2d = (options: Tensor.PoolOptions): Effect.Effect<Model, Mod
  * @category combinators
  */
 export const checkpoint = (model: Model): Effect.Effect<Model> =>
-  Effect.succeed({
+  Effect.succeed(make({
     names: model.names,
     init: model.init,
     forward: (params, input) => Effect.flatMap(model.forward(params, input), Gradient.checkpoint)
-  })
+  }))
 
 /**
  * Adds a residual (skip) connection around a sub-model: the forward is
@@ -836,7 +867,7 @@ export const checkpoint = (model: Model): Effect.Effect<Model> =>
  * @category combinators
  */
 export const residual = (model: Model): Effect.Effect<Model> =>
-  Effect.succeed({
+  Effect.succeed(make({
     names: model.names,
     init: model.init,
     forward: (params, input) =>
@@ -844,7 +875,7 @@ export const residual = (model: Model): Effect.Effect<Model> =>
         const out = yield* model.forward(params, input)
         return yield* Tensor.add(input, out)
       })
-  })
+  }))
 
 /**
  * Transforms a model's input before it enters the sub-model:
@@ -860,11 +891,11 @@ export const mapInput = (
   model: Model,
   f: (input: Tensor.Any) => Effect.Effect<Tensor.Any, Tensor.TensorError, CurrentDevice>
 ): Effect.Effect<Model> =>
-  Effect.succeed({
+  Effect.succeed(make({
     names: model.names,
     init: model.init,
     forward: (params, input) => Effect.flatMap(f(input), (mapped) => model.forward(params, mapped))
-  })
+  }))
 
 /**
  * Fans one input into several sub-models and combines their outputs:
@@ -906,7 +937,7 @@ export const merge = <const M extends ReadonlyArray<Model>>(
     })
   }
   const arities = models.map((model) => model.names.length)
-  return Effect.succeed({
+  return Effect.succeed(make({
     names,
     init: Effect.gen(function* () {
       const params: Array<Tensor.Any> = []
@@ -926,7 +957,7 @@ export const merge = <const M extends ReadonlyArray<Model>>(
         }
         return yield* f(...(outputs as { [K in keyof M]: Tensor.Lazy }))
       })
-  })
+  }))
 }
 
 /**
@@ -986,7 +1017,7 @@ export const chain = (...models: ReadonlyArray<Model>): Effect.Effect<Model, Mod
     })
   }
   const arities = models.map((model) => model.names.length)
-  return Effect.succeed({
+  return Effect.succeed(make({
     names,
     init: Effect.gen(function* () {
       const params: Array<Tensor.Any> = []
@@ -1006,7 +1037,7 @@ export const chain = (...models: ReadonlyArray<Model>): Effect.Effect<Model, Mod
         }
         return current as Tensor.Lazy
       })
-  })
+  }))
 }
 
 /**
@@ -1063,68 +1094,6 @@ export const load = (
     return params
   })
 
-/**
- * Options for {@link compile}.
- *
- * @since 0.1.0
- * @category compilation
- */
-export interface CompileOptions {
-  /**
-   * Shape-cache capacity in programs. The first forward with a new input
-   * signature traces and freezes a program; later calls with the same
-   * signature reuse it. Defaults to 32.
-   */
-  readonly cacheCapacity?: number
-}
-
-/**
- * Returns a model with a compiled execution path: same `names`, `init`,
- * and `forward` (the graph-builder contract is untouched — the compiled
- * model composes, differentiates, and trains exactly like the original),
- * plus {@link CompiledModel.execute}, which runs the forward as a frozen
- * native program — parameters and input in, materialized output out, in
- * one native call per invocation after the first call per input
- * signature pays the trace. Parameter shapes are fixed by the
- * architecture, so in practice the cache key varies only on the data
- * shape; a new input shape traces a new program automatically, up to
- * `cacheCapacity` programs with least-recently-used eviction.
- *
- * The compiled model is still a {@link Model} — a {@link CompiledModel},
- * to be precise (`isCompiled` narrows a `Model` to one). Use `execute`
- * for evaluation loops; use `forward` wherever a graph is being built.
- *
- * @since 0.1.0
- * @category compilation
- */
-export const compile = (
-  model: Model,
-  options: CompileOptions = {}
-): Effect.Effect<CompiledModel, never, CurrentDevice> =>
-  Effect.map(
-    Tensor.compile<ModelError | Tensor.TensorError, CurrentDevice>(
-      (inputs) =>
-        Effect.map(
-          model.forward(inputs.slice(0, -1), inputs[inputs.length - 1]),
-          (output) => [output]
-        ),
-      { ...(options.cacheCapacity !== undefined ? { cacheCapacity: options.cacheCapacity } : {}) }
-    ),
-    (fn): CompiledModel => ({
-      [CompiledTypeId]: CompiledTypeId,
-      names: model.names,
-      init: model.init,
-      forward: model.forward,
-      execute: (params, input) =>
-        Effect.gen(function* () {
-          yield* checkArity("execute", model.names, params)
-          const [output] = yield* fn.call([...params, input])
-          return output
-        }),
-      stats: fn.stats,
-      clear: fn.clear
-    })
-  )
 
 /**
  * A failure in inference-artifact construction or generation (RFC

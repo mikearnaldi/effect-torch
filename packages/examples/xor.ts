@@ -33,7 +33,7 @@ const createModel = Effect.gen(function* () {
     yield* Model.linear("fc2", HIDDEN, 1),
     yield* Model.sigmoid
   )
-  return yield* Model.compile(model)
+  return model
 })
 
 // Initialize the parameters
@@ -69,7 +69,7 @@ const createTrainer = (
           }
         })
     })
-    return yield* Trainer.compile(trainer)
+    return trainer
   })
 
 class MispredictionError extends Data.TaggedError("MispredictionError")<{
@@ -84,7 +84,7 @@ class MispredictionError extends Data.TaggedError("MispredictionError")<{
 
 // One forward pass per input, failing on the first misprediction
 const evaluate = (
-  model: Model.CompiledModel,
+  model: Model.Model,
   params: Model.Params,
   x: Tensor.Any,
   y: Tensor.Any

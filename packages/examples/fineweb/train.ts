@@ -41,7 +41,7 @@ const program = Effect.gen(function* () {
 
   yield* Effect.log(`2) training: adamW lr=${LR}, ${STEPS} steps (checkpoint every ${CHECKPOINT_EVERY})`)
   let sampler: Sampler.Sampler
-  const trainer = yield* Trainer.compile(yield* Trainer.make(model, {
+  const trainer = yield* Trainer.make(model, {
     optimizer: yield* Optimizer.adamW(),
     lr: LearningRate.constant(LR),
     loss: Loss.crossEntropy,
@@ -56,7 +56,7 @@ const program = Effect.gen(function* () {
     stop: ({ step }) => step >= chunkTarget,
     onStep: ({ step, loss, elapsed }) =>
       Effect.log(`step ${String(step).padStart(4)}  loss ${loss.toFixed(4)}  ${(Duration.toMillis(elapsed) / 1000).toFixed(1)}s`)
-  }))
+  })
 
   // Resume when a checkpoint exists: parameters, optimizer state, global
   // step, and the sampler's permutation all come back exactly as saved.

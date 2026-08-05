@@ -18,7 +18,7 @@ export const LAYERS = 6
 
 export const createGpt = (
   vocabSize: number
-): Effect.Effect<Model.CompiledModel, Model.ModelError | Tensor.TensorError, Device.CurrentDevice> =>
+): Effect.Effect<Model.Model, Model.ModelError | Tensor.TensorError, Device.CurrentDevice> =>
   Effect.gen(function* () {
     // Token embeddings; positions are relative (RoPE inside attention),
     // so generation is unbounded — no position table to outgrow.
@@ -43,7 +43,7 @@ export const createGpt = (
       yield* Model.layerNorm("lnf", EMBED),
       yield* Model.linear("head", EMBED, vocabSize)
     )
-    return yield* Model.compile(model)
+    return model
   })
 
 export const loadTokenizer = Tokenizer.fromFile(TOKENIZER_JSON, {
@@ -110,9 +110,11 @@ export const heldOutLoss = (
       )
       const input = yield* Tensor.fromTypedArray(inputs, [batch, block])
       const target = yield* Tensor.fromTypedArray(targets, [batch, block])
-      const logits = yield* model.forward(params, input)
+      const logits = yield* model.execute(params, input)
       const [lossTensor] = yield* Tensor.compute([yield* Loss.crossEntropy(logits, target)])
       const [loss] = yield* Tensor.toNumberArray(lossTensor)
+      yield* Tensor.clear(logits)
+      yield* Tensor.clear(lossTensor)
       total += loss
     }
     return total / batches

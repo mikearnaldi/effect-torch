@@ -112,7 +112,7 @@ const createGpt = (vocabSize: number) =>
       yield* Model.layerNorm("lnf", EMBED),
       yield* Model.linear("head", EMBED, vocabSize)
     )
-    return yield* Model.compile(model)
+    return model
   })
 
 const ids = (values: ReadonlyArray<number>, shape: ReadonlyArray<number>) =>
@@ -153,7 +153,7 @@ const createTrainer = (model: Model.Model, data: ReadonlyArray<number>) =>
           )
           : Effect.void
     })
-    return yield* Trainer.compile(trainer)
+    return trainer
   })
 
 const init = (model: Model.Model) =>
