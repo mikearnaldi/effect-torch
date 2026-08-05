@@ -486,6 +486,20 @@ impl MetalDevice {
     pub fn grid(width: usize, height: usize, depth: usize) -> MTLSize {
         MTLSize { width, height, depth }
     }
+
+    /// Grid width of 64-bit flat kernels: index = gid.y * WIDE + gid.x.
+    pub const WIDE: usize = 1 << 30;
+
+    /// Grid and threadgroup for a flat elementwise kernel over an
+    /// already-padded thread count: 1-D with uint indexing when small,
+    /// a 2-D grid with a widened ulong index past u32::MAX threads.
+    pub fn grid_flat(padded: usize) -> (MTLSize, MTLSize) {
+        if padded > u32::MAX as usize {
+            (Self::grid(Self::WIDE, padded.div_ceil(Self::WIDE), 1), Self::grid(256, 1, 1))
+        } else {
+            (Self::grid(padded, 1, 1), Self::grid(256, 1, 1))
+        }
+    }
 }
 
 pub fn set_buffer(encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>, index: usize, buffer: &Buffer, offset: usize) {

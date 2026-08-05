@@ -1,6 +1,38 @@
 use crate::fusion::{Expr, ReduceOp};
+use super::device::MetalDevice;
 
 pub const BLOCK: usize = 256;
+
+/// Grid width of 64-bit kernels: flat index = gid.y * WIDE + gid.x.
+pub const WIDE: usize = MetalDevice::WIDE;
+
+/// The shader index type for a tensor of `n` elements: 32-bit math on
+/// the fast path; 64-bit once a flat offset can exceed u32 — any model
+/// worth training has a logits or weight tensor past 4G elements.
+pub fn idx_ty(n: usize) -> &'static str {
+    if n <= u32::MAX as usize { "uint" } else { "ulong" }
+}
+
+/// The gid parameter declaration and clamped flat index for a kernel
+/// covering `n` elements: 1-D grid with uint math when small, a 2-D
+/// grid with a widened flat index when not.
+fn gid_decl(n: usize) -> (String, String) {
+    if n <= u32::MAX as usize {
+        (
+            "    uint gid [[thread_position_in_grid]]".to_string(),
+            format!("    const uint clamped = min(gid, {}u);\n", n.saturating_sub(1)),
+        )
+    } else {
+        (
+            "    uint2 gid2 [[thread_position_in_grid]]".to_string(),
+            format!(
+                "    const ulong gid = ulong(gid2.y) * {}ul + ulong(gid2.x);\n    const ulong clamped = min(gid, {}ul);\n",
+                WIDE,
+                n.saturating_sub(1)
+            ),
+        )
+    }
+}
 
 // Storage dtype of the lanes and outputs: bf16 kernels load into float,
 // compute in float, and store back as bfloat — the fusion IR only models
@@ -230,10 +262,11 @@ pub fn emit_elementwise(
         params.push(format!("    device {ty}* out{j} [[buffer({idx})]]"));
         idx += 1;
     }
-    params.push("    uint gid [[thread_position_in_grid]]".to_string());
+    let (gid_param, clamped_decl) = gid_decl(n);
+    params.push(gid_param);
     src.push_str(&params.join(",\n"));
     src.push_str("\n) {\n");
-    src.push_str(&format!("    const uint clamped = min(gid, {}u);\n", n.saturating_sub(1)));
+    src.push_str(&clamped_decl);
     let lanes: Vec<String> = lane_strides
         .iter()
         .map(|s| lane_offset_expr(s, out_shape, "clamped"))
@@ -277,10 +310,11 @@ pub fn emit_reduce(
         idx += 1;
     }
     params.push(format!("    device {ty}* out [[buffer({idx})]]"));
-    params.push("    uint gid [[thread_position_in_grid]]".to_string());
+    let (gid_param, clamped_decl) = gid_decl(out_n);
+    params.push(gid_param);
     src.push_str(&params.join(",\n"));
     src.push_str("\n) {\n");
-    src.push_str(&format!("    const uint clamped = min(gid, {}u);\n", out_n.saturating_sub(1)));
+    src.push_str(&clamped_decl);
 
     // Per-lane base offsets from the non-reduced coordinates of the
     // flattened output index.
@@ -321,7 +355,9 @@ pub fn emit_reduce(
         ReduceOp::Min => "(INFINITY)",
     };
     src.push_str(&format!("    float acc = {init};\n"));
-    src.push_str(&format!("    for (uint r = 0u; r < {}u; ++r) {{\n", extent));
+    let rt = idx_ty(extent);
+    let (rz, ru) = if rt == "uint" { ("0u", "u") } else { ("0ul", "ul") };
+    src.push_str(&format!("    for ({rt} r = {rz}; r < {extent}{ru}; ++r) {{\n"));
     let mut lane_offsets = base_offsets.clone();
     for (j, &d) in dims.iter().enumerate() {
         if red_sizes[j] == 1 {
@@ -397,5 +433,34 @@ mod tests {
         assert!(src.contains("for (uint r = 0u; r < 3u; ++r)"));
         assert!(src.contains("acc /= 3.0f;"));
         assert!(src.contains("out[clamped] = acc;"));
+    }
+
+    #[test]
+    fn wide_indexing_past_u32() {
+        // Past u32::MAX elements the flat index widens: 2-D grid,
+        // ulong math — a 5G-element tensor is addressable.
+        let big = 5_000_000_000usize;
+        let exprs = vec![Expr::Input(0)];
+        let src = emit_elementwise(&exprs, &[vec![1]], &[big], big, 0, "wide_test", crate::runtime::dtype::DType::F32);
+        assert!(src.contains("uint2 gid2 [[thread_position_in_grid]]"));
+        assert!(src.contains("const ulong gid = ulong(gid2.y) * 1073741824ul + ulong(gid2.x);"));
+        assert!(src.contains("const ulong clamped = min(gid, 4999999999ul);"));
+        assert!(src.contains("out0[clamped]"));
+        // The small path is untouched: uint math, 1-D grid.
+        let small = emit_elementwise(&exprs, &[vec![1]], &[6], 6, 0, "narrow_test", crate::runtime::dtype::DType::F32);
+        assert!(small.contains("uint gid [[thread_position_in_grid]]"));
+        assert!(small.contains("const uint clamped = min(gid, 5u);"));
+        let red = emit_reduce(
+            ReduceOp::Sum,
+            &Expr::Input(0),
+            &[vec![1]],
+            &[big],
+            &[0],
+            false,
+            &[1],
+            "wide_reduce",
+            crate::runtime::dtype::DType::F32,
+        );
+        assert!(red.contains("for (ulong r = 0ul; r < 5000000000ul; ++r)"));
     }
 }

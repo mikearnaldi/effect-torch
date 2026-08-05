@@ -182,8 +182,8 @@ pub fn run_elementwise_prekeyed(
             idx += 1;
         }
         e.dispatchThreads_threadsPerThreadgroup(
-            MetalDevice::grid(padded, 1, 1),
-            MetalDevice::grid(emit::BLOCK, 1, 1),
+            MetalDevice::grid_flat(padded).0,
+            MetalDevice::grid_flat(padded).1,
         );
     });
     Ok(out_bufs)
@@ -234,8 +234,8 @@ pub fn run_reduce(
         }
         set_buffer(e, idx, &out.buffer, 0);
         e.dispatchThreads_threadsPerThreadgroup(
-            MetalDevice::grid(padded, 1, 1),
-            MetalDevice::grid(emit::BLOCK, 1, 1),
+            MetalDevice::grid_flat(padded).0,
+            MetalDevice::grid_flat(padded).1,
         );
     });
     Ok(out)

@@ -26,6 +26,7 @@ fn key(parts: &[u64]) -> u64 {
 }
 
 pub fn fill(dev: &MetalDevice, out: &MetalTensor, value: f64) -> Result<(), String> {
+    let wide = MetalDevice::WIDE;
     let n = out.numel();
     if n == 0 {
         return Ok(());
@@ -35,8 +36,9 @@ pub fn fill(dev: &MetalDevice, out: &MetalTensor, value: f64) -> Result<(), Stri
         r#"
 #include <metal_stdlib>
 using namespace metal;
-kernel void et_fill(device {ty}* out [[buffer(0)]], constant float& v [[buffer(1)]], uint i [[thread_position_in_grid]]) {{
-    if (i < {n}u) out[i] = ({ty})v;
+kernel void et_fill(device {ty}* out [[buffer(0)]], constant float& v [[buffer(1)]], uint2 gid2 [[thread_position_in_grid]]) {{
+    const ulong i = ulong(gid2.y) * {wide}ul + ulong(gid2.x);
+    if (i < {n}ul) out[i] = ({ty})v;
 }}
 "#
     );
@@ -47,12 +49,13 @@ kernel void et_fill(device {ty}* out [[buffer(0)]], constant float& v [[buffer(1
         e.setComputePipelineState(pipeline.as_raw());
         set_buffer(e, 0, &out.buffer, out.layout.offset() * out.dtype.size_in_bytes());
         set_bytes(e, 1, &v);
-        e.dispatchThreads_threadsPerThreadgroup(MetalDevice::grid(padded, 1, 1), MetalDevice::grid(256, 1, 1));
+        { let (g, tg) = MetalDevice::grid_flat(padded); e.dispatchThreads_threadsPerThreadgroup(g, tg); }
     });
     Ok(())
 }
 
 pub fn relu_i64(dev: &MetalDevice, x: &MetalTensor) -> Result<MetalTensor, String> {
+    let wide = MetalDevice::WIDE;
     assert_eq!(x.dtype, DType::I64);
     let n = x.numel();
     let out = MetalTensor::empty(dev, x.layout.shape().to_vec(), DType::I64);
@@ -63,8 +66,9 @@ pub fn relu_i64(dev: &MetalDevice, x: &MetalTensor) -> Result<MetalTensor, Strin
         r#"
 #include <metal_stdlib>
 using namespace metal;
-kernel void et_relu_i64(device const long* a [[buffer(0)]], device long* out [[buffer(1)]], uint i [[thread_position_in_grid]]) {{
-    if (i < {n}u) out[i] = max(a[i], 0L);
+kernel void et_relu_i64(device const long* a [[buffer(0)]], device long* out [[buffer(1)]], uint2 gid2 [[thread_position_in_grid]]) {{
+    const ulong i = ulong(gid2.y) * {wide}ul + ulong(gid2.x);
+    if (i < {n}ul) out[i] = max(a[i], 0L);
 }}
 "#
     );
@@ -74,12 +78,13 @@ kernel void et_relu_i64(device const long* a [[buffer(0)]], device long* out [[b
         e.setComputePipelineState(pipeline.as_raw());
         set_buffer(e, 0, &x.buffer, x.layout.offset() * 8);
         set_buffer(e, 1, &out.buffer, 0);
-        e.dispatchThreads_threadsPerThreadgroup(MetalDevice::grid(padded, 1, 1), MetalDevice::grid(256, 1, 1));
+        { let (g, tg) = MetalDevice::grid_flat(padded); e.dispatchThreads_threadsPerThreadgroup(g, tg); }
     });
     Ok(out)
 }
 
 pub fn cast(dev: &MetalDevice, x: &MetalTensor, dtype: DType) -> Result<MetalTensor, String> {
+    let wide = MetalDevice::WIDE;
     if x.dtype == dtype {
         return Ok(MetalTensor {
             buffer: x.buffer.clone(),
@@ -97,8 +102,9 @@ pub fn cast(dev: &MetalDevice, x: &MetalTensor, dtype: DType) -> Result<MetalTen
         r#"
 #include <metal_stdlib>
 using namespace metal;
-kernel void et_cast(device const {src_ty}* a [[buffer(0)]], device {dst_ty}* out [[buffer(1)]], uint i [[thread_position_in_grid]]) {{
-    if (i < {n}u) out[i] = ({dst_ty})a[i];
+kernel void et_cast(device const {src_ty}* a [[buffer(0)]], device {dst_ty}* out [[buffer(1)]], uint2 gid2 [[thread_position_in_grid]]) {{
+    const ulong i = ulong(gid2.y) * {wide}ul + ulong(gid2.x);
+    if (i < {n}ul) out[i] = ({dst_ty})a[i];
 }}
 "#
     );
@@ -108,12 +114,13 @@ kernel void et_cast(device const {src_ty}* a [[buffer(0)]], device {dst_ty}* out
         e.setComputePipelineState(pipeline.as_raw());
         set_buffer(e, 0, &x.buffer, x.layout.offset() * x.dtype.size_in_bytes());
         set_buffer(e, 1, &out.buffer, 0);
-        e.dispatchThreads_threadsPerThreadgroup(MetalDevice::grid(padded, 1, 1), MetalDevice::grid(256, 1, 1));
+        { let (g, tg) = MetalDevice::grid_flat(padded); e.dispatchThreads_threadsPerThreadgroup(g, tg); }
     });
     Ok(out)
 }
 
 pub fn strided_copy(dev: &MetalDevice, x: &MetalTensor) -> Result<MetalTensor, String> {
+    let wide = MetalDevice::WIDE;
     if x.layout.is_contiguous() && x.layout.offset() == 0 {
         return Ok(x.clone());
     }
@@ -148,8 +155,9 @@ pub fn strided_copy(dev: &MetalDevice, x: &MetalTensor) -> Result<MetalTensor, S
         r#"
 #include <metal_stdlib>
 using namespace metal;
-kernel void et_scopy(device const {ty}* a [[buffer(0)]], device {ty}* out [[buffer(1)]], uint i [[thread_position_in_grid]]) {{
-    if (i < {n}u) {{
+kernel void et_scopy(device const {ty}* a [[buffer(0)]], device {ty}* out [[buffer(1)]], uint2 gid2 [[thread_position_in_grid]]) {{
+    const ulong i = ulong(gid2.y) * {wide}ul + ulong(gid2.x);
+    if (i < {n}ul) {{
         uint src_off = 0u;
 {decompose}        out[i] = a[src_off];
     }}
@@ -163,7 +171,7 @@ kernel void et_scopy(device const {ty}* a [[buffer(0)]], device {ty}* out [[buff
         e.setComputePipelineState(pipeline.as_raw());
         set_buffer(e, 0, &x.buffer, x.layout.offset() * x.dtype.size_in_bytes());
         set_buffer(e, 1, &out.buffer, 0);
-        e.dispatchThreads_threadsPerThreadgroup(MetalDevice::grid(padded, 1, 1), MetalDevice::grid(256, 1, 1));
+        { let (g, tg) = MetalDevice::grid_flat(padded); e.dispatchThreads_threadsPerThreadgroup(g, tg); }
     });
     Ok(out)
 }
@@ -194,6 +202,7 @@ inline float xoro_f32(thread ulong& s0, thread ulong& s1) {
 "#;
 
 pub fn randn(dev: &MetalDevice, shape: &[usize], seed: u64) -> Result<MetalTensor, String> {
+    let wide = MetalDevice::WIDE;
     let n: usize = shape.iter().product();
     let out = MetalTensor::empty(dev, shape.to_vec(), DType::F32);
     if n == 0 {
@@ -201,8 +210,9 @@ pub fn randn(dev: &MetalDevice, shape: &[usize], seed: u64) -> Result<MetalTenso
     }
     let make_src = || format!(
         r#"{RNG_SRC}
-kernel void et_randn(device float* out [[buffer(0)]], uint i [[thread_position_in_grid]]) {{
-    if (i < {n}u) {{
+kernel void et_randn(device float* out [[buffer(0)]], uint2 gid2 [[thread_position_in_grid]]) {{
+    const ulong i = ulong(gid2.y) * {wide}ul + ulong(gid2.x);
+    if (i < {n}ul) {{
         ulong s0, s1;
         xoro_seed(s0, s1, {seed}ul + (ulong)i * 0x9E3779B97F4A7C15ul);
         float u1 = max(xoro_f32(s0, s1), 1e-12f);
@@ -217,12 +227,13 @@ kernel void et_randn(device float* out [[buffer(0)]], uint i [[thread_position_i
     dev.with_encoder(|e| {
         e.setComputePipelineState(pipeline.as_raw());
         set_buffer(e, 0, &out.buffer, 0);
-        e.dispatchThreads_threadsPerThreadgroup(MetalDevice::grid(padded, 1, 1), MetalDevice::grid(256, 1, 1));
+        { let (g, tg) = MetalDevice::grid_flat(padded); e.dispatchThreads_threadsPerThreadgroup(g, tg); }
     });
     Ok(out)
 }
 
 pub fn uniform(dev: &MetalDevice, lo: f64, hi: f64, shape: &[usize], seed: u64) -> Result<MetalTensor, String> {
+    let wide = MetalDevice::WIDE;
     let n: usize = shape.iter().product();
     let out = MetalTensor::empty(dev, shape.to_vec(), DType::F32);
     if n == 0 {
@@ -230,8 +241,9 @@ pub fn uniform(dev: &MetalDevice, lo: f64, hi: f64, shape: &[usize], seed: u64) 
     }
     let make_src = || format!(
         r#"{RNG_SRC}
-kernel void et_uniform(device float* out [[buffer(0)]], uint i [[thread_position_in_grid]]) {{
-    if (i < {n}u) {{
+kernel void et_uniform(device float* out [[buffer(0)]], uint2 gid2 [[thread_position_in_grid]]) {{
+    const ulong i = ulong(gid2.y) * {wide}ul + ulong(gid2.x);
+    if (i < {n}ul) {{
         ulong s0, s1;
         xoro_seed(s0, s1, {seed}ul + (ulong)i * 0x9E3779B97F4A7C15ul);
         out[i] = {:?}f + ({:?}f - {:?}f) * xoro_f32(s0, s1);
@@ -245,12 +257,13 @@ kernel void et_uniform(device float* out [[buffer(0)]], uint i [[thread_position
     dev.with_encoder(|e| {
         e.setComputePipelineState(pipeline.as_raw());
         set_buffer(e, 0, &out.buffer, 0);
-        e.dispatchThreads_threadsPerThreadgroup(MetalDevice::grid(padded, 1, 1), MetalDevice::grid(256, 1, 1));
+        { let (g, tg) = MetalDevice::grid_flat(padded); e.dispatchThreads_threadsPerThreadgroup(g, tg); }
     });
     Ok(out)
 }
 
 pub fn arange(dev: &MetalDevice, start: f64, end: f64, step: f64, dtype: DType) -> Result<MetalTensor, String> {
+    let wide = MetalDevice::WIDE;
     let n = ((end - start) / step).ceil().max(0.0) as usize;
     let out = MetalTensor::empty(dev, vec![n], dtype);
     if n == 0 {
@@ -261,8 +274,9 @@ pub fn arange(dev: &MetalDevice, start: f64, end: f64, step: f64, dtype: DType) 
         r#"
 #include <metal_stdlib>
 using namespace metal;
-kernel void et_arange(device {ty}* out [[buffer(0)]], uint i [[thread_position_in_grid]]) {{
-    if (i < {n}u) out[i] = ({ty})((float)i * {:?}f + {:?}f);
+kernel void et_arange(device {ty}* out [[buffer(0)]], uint2 gid2 [[thread_position_in_grid]]) {{
+    const ulong i = ulong(gid2.y) * {wide}ul + ulong(gid2.x);
+    if (i < {n}ul) out[i] = ({ty})((float)i * {:?}f + {:?}f);
 }}
 "#,
         step, start
@@ -272,12 +286,13 @@ kernel void et_arange(device {ty}* out [[buffer(0)]], uint i [[thread_position_i
     dev.with_encoder(|e| {
         e.setComputePipelineState(pipeline.as_raw());
         set_buffer(e, 0, &out.buffer, 0);
-        e.dispatchThreads_threadsPerThreadgroup(MetalDevice::grid(padded, 1, 1), MetalDevice::grid(256, 1, 1));
+        { let (g, tg) = MetalDevice::grid_flat(padded); e.dispatchThreads_threadsPerThreadgroup(g, tg); }
     });
     Ok(out)
 }
 
 pub fn eye(dev: &MetalDevice, n: usize, dtype: DType) -> Result<MetalTensor, String> {
+    let wide = MetalDevice::WIDE;
     let out = MetalTensor::empty(dev, vec![n, n], dtype);
     fill(dev, &out, 0.0)?;
     if n == 0 {
@@ -288,8 +303,9 @@ pub fn eye(dev: &MetalDevice, n: usize, dtype: DType) -> Result<MetalTensor, Str
         r#"
 #include <metal_stdlib>
 using namespace metal;
-kernel void et_eye(device {ty}* out [[buffer(0)]], uint i [[thread_position_in_grid]]) {{
-    if (i < {n}u) out[i * {n}u + i] = ({ty})1;
+kernel void et_eye(device {ty}* out [[buffer(0)]], uint2 gid2 [[thread_position_in_grid]]) {{
+    const ulong i = ulong(gid2.y) * {wide}ul + ulong(gid2.x);
+    if (i < {n}ul) out[i * {n}u + i] = ({ty})1;
 }}
 "#
     );
@@ -325,10 +341,10 @@ pub fn argreduce(dev: &MetalDevice, x: &MetalTensor, dim: usize, pick_max: bool)
         let c = kept_dims[k];
         let s = kept_strides[k];
         if k == kept_rank - 1 {
-            decompose.push_str(&format!("        base += (gid % {c}u) * {s}u;\n"));
+            decompose.push_str(&format!("        base += (gid % {c}u) * {s}ul;\n"));
         } else {
             let div: usize = kept_dims[k + 1..].iter().product();
-            decompose.push_str(&format!("        base += ((gid / {div}u) % {c}u) * {s}u;\n"));
+            decompose.push_str(&format!("        base += ((gid / {div}u) % {c}u) * {s}ul;\n"));
         }
     }
     let make_src = || format!(
@@ -341,11 +357,11 @@ kernel void et_argred(
     uint gid [[thread_position_in_grid]]
 ) {{
     if (gid >= {kept_n}u) return;
-    uint base = 0u;
+    ulong base = 0ul;
 {decompose}    uint best = 0u;
     {ty} best_v = x[base];
     for (uint i = 1u; i < {n}u; ++i) {{
-        {ty} v = x[base + i * {dstride}u];
+        {ty} v = x[base + ulong(i) * {dstride}ul];
         if (v {cmp} best_v) {{ best_v = v; best = i; }}
     }}
     out[gid] = best;
@@ -358,7 +374,7 @@ kernel void et_argred(
         e.setComputePipelineState(pipeline.as_raw());
         set_buffer(e, 0, &x.buffer, x.layout.offset() * x.dtype.size_in_bytes());
         set_buffer(e, 1, &out.buffer, 0);
-        e.dispatchThreads_threadsPerThreadgroup(MetalDevice::grid(padded, 1, 1), MetalDevice::grid(256, 1, 1));
+        { let (g, tg) = MetalDevice::grid_flat(padded); e.dispatchThreads_threadsPerThreadgroup(g, tg); }
     });
     Ok(out)
 }
@@ -386,10 +402,10 @@ pub fn cumsum(dev: &MetalDevice, x: &MetalTensor, dim: usize) -> Result<MetalTen
         let s = kept_strides[k];
         let o = os[kept[k]];
         if k == kept_rank - 1 {
-            decompose.push_str(&format!("        base += (gid % {c}u) * {s}u;\n        obase += (gid % {c}u) * {o}u;\n"));
+            decompose.push_str(&format!("        base += (gid % {c}u) * {s}ul;\n        obase += (gid % {c}u) * {o}ul;\n"));
         } else {
             let div: usize = kept_dims[k + 1..].iter().product();
-            decompose.push_str(&format!("        base += ((gid / {div}u) % {c}u) * {s}u;\n        obase += ((gid / {div}u) % {c}u) * {o}u;\n"));
+            decompose.push_str(&format!("        base += ((gid / {div}u) % {c}u) * {s}ul;\n        obase += ((gid / {div}u) % {c}u) * {o}ul;\n"));
         }
     }
     let make_src = || format!(
@@ -402,12 +418,12 @@ kernel void et_cumsum(
     uint gid [[thread_position_in_grid]]
 ) {{
     if (gid >= {kept_n}u) return;
-    uint base = 0u;
-    uint obase = 0u;
+    ulong base = 0ul;
+    ulong obase = 0ul;
 {decompose}    {ty} acc = ({ty})0;
     for (uint i = 0u; i < {n}u; ++i) {{
-        acc += x[base + i * {dstride}u];
-        out[obase + i * {os_dim}u] = acc;
+        acc += x[base + ulong(i) * {dstride}ul];
+        out[obase + ulong(i) * {os_dim}ul] = acc;
     }}
 }}
 "#,
@@ -419,7 +435,7 @@ kernel void et_cumsum(
         e.setComputePipelineState(pipeline.as_raw());
         set_buffer(e, 0, &x.buffer, x.layout.offset() * x.dtype.size_in_bytes());
         set_buffer(e, 1, &out.buffer, 0);
-        e.dispatchThreads_threadsPerThreadgroup(MetalDevice::grid(padded, 1, 1), MetalDevice::grid(256, 1, 1));
+        { let (g, tg) = MetalDevice::grid_flat(padded); e.dispatchThreads_threadsPerThreadgroup(g, tg); }
     });
     Ok(out)
 }
