@@ -40,7 +40,7 @@ const numbers = (t: Tensor.Any) => Tensor.toNumberArray(t)
 onDevices("Tokenizer", () => (it) => {
   describe("BPE", () => {
     it.effect("encodes to a [T] u32 tensor and decodes losslessly, including unicode", () =>
-      Effect.gen(function* () {
+      Effect.gen(function*() {
         const tokenizer = yield* trainBpe()
         const text = "hello world — こんにちは 😁 café, naïve"
         const ids = yield* tokenizer.encode(text)
@@ -49,11 +49,10 @@ onDevices("Tokenizer", () => (it) => {
         expect(ids.shape[0]).toBeGreaterThan(0)
         const decoded = yield* tokenizer.decode(ids)
         expect(decoded).toBe(text)
-      })
-    )
+      }))
 
     it.effect("encodeBatchConcat flattens ragged encodings in order, no padding", () =>
-      Effect.gen(function* () {
+      Effect.gen(function*() {
         const tokenizer = yield* trainBpe()
         const texts = ["hello world", "the lazy dog"]
         const flat = yield* tokenizer.encodeBatchConcat(texts)
@@ -61,11 +60,10 @@ onDevices("Tokenizer", () => (it) => {
         expect(flat.shape.length).toBe(1)
         const singles = yield* Effect.forEach(texts, (text) => Effect.flatMap(tokenizer.encode(text), numbers))
         expect(yield* numbers(flat)).toEqual(singles.flat())
-      })
-    )
+      }))
 
     it.effect("decodeBatch round-trips raw id arrays; vocab lookups are Options", () =>
-      Effect.gen(function* () {
+      Effect.gen(function*() {
         const tokenizer = yield* trainBpe()
         const texts = ["hello world", "the lazy dog"]
         const batch = yield* tokenizer.encodeBatch(texts)
@@ -81,11 +79,10 @@ onDevices("Tokenizer", () => (it) => {
         expect(tokenizer.idToToken(id)).toEqual(Option.some("<|endoftext|>"))
         expect(tokenizer.tokenToId("not a token")).toEqual(Option.none())
         expect(tokenizer.vocabSize).toBeGreaterThan(256)
-      })
-    )
+      }))
 
     it.effect("trains from files; save and fromFile/fromJson preserve encoding exactly", () =>
-      Effect.gen(function* () {
+      Effect.gen(function*() {
         const dir = yield* tmpdir
         const corpusFile = path.join(dir, "corpus.txt")
         yield* Effect.sync(() => fs.writeFileSync(corpusFile, corpusTexts.join("\n")))
@@ -110,15 +107,14 @@ onDevices("Tokenizer", () => (it) => {
 
         const fromJson = yield* Tokenizer.fromJson(fs.readFileSync(saved, "utf8"), Tokenizer.strictConfig)
         expect(yield* numbers(yield* fromJson.encode(text))).toEqual(expected)
-      })
-    )
+      }))
   })
 
   describe("padding and truncation", () => {
     const texts = ["hello world", "tokenizers turn text into tensors and tensors into models"]
 
     it.effect("Longest pads to the longest encoding with padId", () =>
-      Effect.gen(function* () {
+      Effect.gen(function*() {
         const tokenizer = yield* trainBpe({
           padding: Tokenizer.paddingLongest(0),
           truncation: Tokenizer.truncationNone,
@@ -133,11 +129,10 @@ onDevices("Tokenizer", () => (it) => {
         expect(shortRow.length).toBe(longRow.length)
         expect(shortRow.some((id, i) => id === 0 && longRow[i] !== 0)).toBe(true)
         expect(yield* tokenizer.decode(longRow)).toBe(texts[1])
-      })
-    )
+      }))
 
     it.effect("MaxLength pads and truncation caps overlong encodings", () =>
-      Effect.gen(function* () {
+      Effect.gen(function*() {
         const tokenizer = yield* trainBpe({
           padding: Tokenizer.paddingMaxLength(8, 0),
           truncation: Tokenizer.truncationMaxLength(8),
@@ -145,11 +140,10 @@ onDevices("Tokenizer", () => (it) => {
         })
         const batch = yield* tokenizer.encodeBatch(texts)
         expect(batch.shape).toEqual([2, 8])
-      })
-    )
+      }))
 
     it.effect("MaxLength padding without truncation fails on overlong encodings", () =>
-      Effect.gen(function* () {
+      Effect.gen(function*() {
         const tokenizer = yield* trainBpe({
           padding: Tokenizer.paddingMaxLength(4, 0),
           truncation: Tokenizer.truncationNone,
@@ -157,23 +151,21 @@ onDevices("Tokenizer", () => (it) => {
         })
         const error = yield* Effect.flip(tokenizer.encodeBatch(texts))
         expect(error.message).toContain("truncation")
-      })
-    )
+      }))
 
     it.effect("padding None fails on ragged encodings and on empty batches", () =>
-      Effect.gen(function* () {
+      Effect.gen(function*() {
         const tokenizer = yield* trainBpe()
         const ragged = yield* Effect.flip(tokenizer.encodeBatch(texts))
         expect(ragged.message).toContain("ragged")
         const empty = yield* Effect.flip(tokenizer.encodeBatch([]))
         expect(empty.message).toContain("at least one text")
-      })
-    )
+      }))
   })
 
   describe("special token policy", () => {
     it.effect("Never tokenizes special strings as ordinary text; Always parses them", () =>
-      Effect.gen(function* () {
+      Effect.gen(function*() {
         const dir = yield* tmpdir
         const saved = path.join(dir, "tokenizer.json")
         const tokenizer = yield* trainBpe()
@@ -197,8 +189,7 @@ onDevices("Tokenizer", () => (it) => {
         })
         const alwaysIds = yield* numbers(yield* always.encode(text))
         expect(alwaysIds).toContain(specialId)
-      })
-    )
+      }))
   })
 
   describe("training progress", () => {
@@ -206,7 +197,7 @@ onDevices("Tokenizer", () => (it) => {
     // feed iterator exhausts — before the merge phase, so all progress
     // callbacks are queued on the event loop ahead of train's resolution.
     it.effect("reports throttled byte progress ending at (total, total)", () =>
-      Effect.gen(function* () {
+      Effect.gen(function*() {
         const events: Array<[number, number]> = []
         const total = corpusTexts.reduce((sum, text) => sum + text.length, 0)
         yield* Tokenizer.train(
@@ -217,8 +208,7 @@ onDevices("Tokenizer", () => (it) => {
             minFrequency: 2,
             specialTokens: [],
             progress: Tokenizer.trainProgressReport(128, (processed, total) =>
-              Effect.sync(() => events.push([processed, total]))
-            )
+              Effect.sync(() => events.push([processed, total])))
           },
           Tokenizer.strictConfig
         )
@@ -228,14 +218,15 @@ onDevices("Tokenizer", () => (it) => {
           expect(processed).toBeLessThanOrEqual(total)
         }
         expect(events.at(-1)).toEqual([total, total])
-        const processed = events.map(([p]) => p)
+        const processed = events.map(([p]) =>
+          p
+        )
         expect([...processed].sort((a, b) => a - b)).toEqual(processed)
         expect(events.length).toBeLessThanOrEqual(Math.ceil(total / 128) + 1)
-      })
-    )
+      }))
 
     it.effect("everyBytes 0 disables reporting entirely", () =>
-      Effect.gen(function* () {
+      Effect.gen(function*() {
         const events: Array<[number, number]> = []
         yield* Tokenizer.train(
           {
@@ -245,17 +236,15 @@ onDevices("Tokenizer", () => (it) => {
             minFrequency: 2,
             specialTokens: [],
             progress: Tokenizer.trainProgressReport(0, (processed, total) =>
-              Effect.sync(() => events.push([processed, total]))
-            )
+              Effect.sync(() => events.push([processed, total])))
           },
           Tokenizer.strictConfig
         )
         expect(events).toEqual([])
-      })
-    )
+      }))
 
     it.effect("everyBytes bounds the report frequency", () =>
-      Effect.gen(function* () {
+      Effect.gen(function*() {
         const events: Array<[number, number]> = []
         const total = corpusTexts.reduce((sum, text) => sum + text.length, 0)
         yield* Tokenizer.train(
@@ -266,14 +255,12 @@ onDevices("Tokenizer", () => (it) => {
             minFrequency: 2,
             specialTokens: [],
             progress: Tokenizer.trainProgressReport(total, (processed, total) =>
-              Effect.sync(() => events.push([processed, total]))
-            )
+              Effect.sync(() => events.push([processed, total])))
           },
           Tokenizer.strictConfig
         )
         expect(events).toEqual([[total, total]])
-      })
-    )
+      }))
   })
 
   describe("model families", () => {
@@ -291,25 +278,23 @@ onDevices("Tokenizer", () => (it) => {
       )
 
     it.effect("WordPiece round-trips in-corpus text", () =>
-      Effect.gen(function* () {
+      Effect.gen(function*() {
         const tokenizer = yield* train("WordPiece", 200)
         const text = "the quick brown fox jumps over the lazy dog"
         const decoded = yield* tokenizer.decode(yield* tokenizer.encode(text))
         expect(decoded).toBe(text)
-      })
-    )
+      }))
 
     it.effect("Unigram round-trips in-corpus text", () =>
-      Effect.gen(function* () {
+      Effect.gen(function*() {
         const tokenizer = yield* train("Unigram", 100)
         const text = "the quick brown fox"
         const decoded = yield* tokenizer.decode(yield* tokenizer.encode(text))
         expect(decoded).toBe(text)
-      })
-    )
+      }))
 
     it.effect("Unigram byte fallback round-trips out-of-vocabulary text losslessly", () =>
-      Effect.gen(function* () {
+      Effect.gen(function*() {
         const tokenizer = yield* train("Unigram", 100)
         expect(Option.getOrElse(tokenizer.tokenToId("<unk>"), () => -1)).toBe(0)
         const text = "the quick\nbrown fox 😁 こんにちは"
@@ -317,16 +302,14 @@ onDevices("Tokenizer", () => (it) => {
         expect(ids).not.toContain(0)
         const decoded = yield* tokenizer.decode(ids)
         expect(decoded).toBe(text)
-      })
-    )
+      }))
 
     it.effect("WordLevel round-trips whitespace-separated words", () =>
-      Effect.gen(function* () {
+      Effect.gen(function*() {
         const tokenizer = yield* train("WordLevel", 200)
         const text = "hello world hello tokenizer"
         const decoded = yield* tokenizer.decode(yield* tokenizer.encode(text))
         expect(decoded).toBe(text)
-      })
-    )
+      }))
   })
 })

@@ -1,7 +1,7 @@
+import { Device, Tensor } from "@effect-torch/core"
+import { Console, Effect } from "effect"
 import { createRequire } from "node:module"
 import { performance } from "node:perf_hooks"
-import { Console, Effect } from "effect"
-import { Device, Tensor } from "@effect-torch/core"
 
 // @frost-beta/mlx ships its .ts sources, which do not compile under this
 // repo's strict tsconfig — so the package is kept out of the type program
@@ -25,7 +25,7 @@ const chain = (
   b: Tensor.Any,
   n: number
 ): Effect.Effect<Tensor.Lazy, Tensor.TensorError> =>
-  Effect.gen(function* () {
+  Effect.gen(function*() {
     let r = yield* Tensor.matmul(a, b)
     for (let i = 1; i < n; i++) {
       r = yield* Tensor.matmul(r, b)
@@ -34,16 +34,17 @@ const chain = (
   })
 
 const timed = <E>(effect: Effect.Effect<unknown, E>): Effect.Effect<number, E> =>
-  Effect.gen(function* () {
+  Effect.gen(function*() {
     const start = yield* Effect.sync(() => performance.now())
     yield* Effect.forEach(Array.from({ length: INNER }), () => effect, { discard: true })
     const elapsed = yield* Effect.sync(() => performance.now() - start)
     return elapsed / INNER / BATCH
   })
 
-const median = (values: ReadonlyArray<number>): number => [...values].sort((x, y) => x - y)[Math.floor(values.length / 2)]
+const median = (values: ReadonlyArray<number>): number =>
+  [...values].sort((x, y) => x - y)[Math.floor(values.length / 2)]
 
-const program = Effect.gen(function* () {
+const program = Effect.gen(function*() {
   const [am, bm] = yield* Effect.flatMap(
     Effect.zip(Tensor.randn([N, N]), Tensor.randn([N, N])),
     ([ra, rb]) => Tensor.compute([ra, rb])
@@ -65,8 +66,7 @@ const program = Effect.gen(function* () {
         for (let i = 0; i < BATCH; i++) r = mx.matmul(r, xb)
         mx.eval(r)
       })
-    )
-  )
+    ))
 
   yield* Console.log(`N=${N}, ${BATCH} chained matmuls, ms/op (median of ${TRIALS})`)
   yield* Console.log(`effect-torch: ${median(ours).toFixed(4)}  (all: ${ours.map((x) => x.toFixed(3)).join(" ")})`)

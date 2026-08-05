@@ -1,6 +1,6 @@
-import { Effect } from "effect"
-import { NodeRuntime } from "@effect/platform-node"
 import { Checkpoint, Device, LearningRate, Loss, Optimizer, Tensor, Trainer } from "@effect-torch/core"
+import { NodeRuntime } from "@effect/platform-node"
+import { Effect } from "effect"
 import { CHECKPOINT, createGpt, loadTokenizer, saveParams } from "./model.js"
 
 // Exports a training checkpoint as a model artifact: strips the optimizer
@@ -11,7 +11,7 @@ import { CHECKPOINT, createGpt, loadTokenizer, saveParams } from "./model.js"
 const [, , source = new URL("../data/fineweb-epoch-ckpt.safetensors", import.meta.url).pathname, out = CHECKPOINT] =
   process.argv
 
-const program = Effect.gen(function* () {
+const program = Effect.gen(function*() {
   const tokenizer = yield* loadTokenizer
   const model = yield* createGpt(tokenizer.vocabSize)
   // Checkpoint.load rebuilds optimizer state through the trainer's

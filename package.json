@@ -6,8 +6,13 @@
     "build": "pnpm -r build",
     "test": "pnpm -r test",
     "typecheck": "pnpm -r typecheck",
+    "lint": "oxlint -f unix && dprint check",
+    "lint-fix": "oxlint --fix && dprint fmt",
     "bench": "pnpm --filter @effect-torch/bench bench",
     "bench:mlx": "pnpm --filter @effect-torch/bench bench:mlx"
+  },
+  "devDependencies": {
+    "dprint": "^0.55.2",
+    "oxlint": "^1.77.0"
   }
 }
-

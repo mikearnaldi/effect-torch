@@ -16,14 +16,8 @@ import native, {
   type NativeTokenizer as NativeTokenizerType,
   type NativeTruncation as NativeTruncationType
 } from "@effect-torch/native"
-import {
-  Data,
-  Effect,
-  Option,
-  Queue,
-  Stream
-} from "effect"
-import { pipeArguments, type Pipeable } from "effect/Pipeable"
+import { Data, Effect, Option, Queue, Stream } from "effect"
+import { type Pipeable, pipeArguments } from "effect/Pipeable"
 import { CurrentDevice } from "./Device.ts"
 import * as Tensor from "./Tensor.ts"
 
@@ -66,10 +60,10 @@ export type Padding =
   | { readonly _tag: "None" }
   | { readonly _tag: "Longest"; readonly padId: number }
   | {
-      readonly _tag: "MaxLength"
-      readonly maxLength: number
-      readonly padId: number
-    }
+    readonly _tag: "MaxLength"
+    readonly maxLength: number
+    readonly padId: number
+  }
 
 /**
  * @since 0.1.0
@@ -92,7 +86,7 @@ export const paddingLongest = (padId: number): Padding => ({
  */
 export const paddingMaxLength = (
   maxLength: number,
-  padId: number,
+  padId: number
 ): Padding => ({
   _tag: "MaxLength",
   maxLength,
@@ -279,7 +273,7 @@ export interface Tokenizer extends Pipeable {
    * Encodes text into a `[T]` `u32` tensor of token ids.
    */
   readonly encode: (
-    text: string,
+    text: string
   ) => Effect.Effect<Tensor.Lazy, TokenizerError, CurrentDevice>
   /**
    * Encodes a batch into a `[B, T]` `u32` tensor, padded per the
@@ -287,7 +281,7 @@ export interface Tokenizer extends Pipeable {
    * encodings fail with {@link TokenizerError}.
    */
   readonly encodeBatch: (
-    texts: ReadonlyArray<string>,
+    texts: ReadonlyArray<string>
   ) => Effect.Effect<Tensor.Lazy, TokenizerError, CurrentDevice>
   /**
    * Encodes a batch into one flat `[ΣT]` `u32` tensor — the ragged
@@ -295,20 +289,20 @@ export interface Tokenizer extends Pipeable {
    * counterpart of {@link encodeBatch} for corpus tokenization.
    */
   readonly encodeBatchConcat: (
-    texts: ReadonlyArray<string>,
+    texts: ReadonlyArray<string>
   ) => Effect.Effect<Tensor.Lazy, TokenizerError, CurrentDevice>
   /**
    * Decodes ids back to text, losslessly (special tokens are not skipped).
    * Tensor inputs are materialized natively.
    */
   readonly decode: (
-    ids: Tensor.Any | ReadonlyArray<number>,
+    ids: Tensor.Any | ReadonlyArray<number>
   ) => Effect.Effect<string, TokenizerError>
   /**
    * Batch counterpart of {@link Tokenizer.decode}.
    */
   readonly decodeBatch: (
-    ids: ReadonlyArray<Tensor.Any | ReadonlyArray<number>>,
+    ids: ReadonlyArray<Tensor.Any | ReadonlyArray<number>>
   ) => Effect.Effect<ReadonlyArray<string>, TokenizerError>
   readonly tokenToId: (token: string) => Option.Option<number>
   readonly idToToken: (id: number) => Option.Option<string>
@@ -345,21 +339,21 @@ const toNativeTruncation = (truncation: Truncation): NativeTruncationType => {
 const toTokenizerError = (op: string) => (error: unknown) =>
   new TokenizerError({
     op,
-    message: error instanceof Error ? error.message : String(error),
+    message: error instanceof Error ? error.message : String(error)
   })
 
 const idsOf = (
-  ids: Tensor.Any | ReadonlyArray<number>,
+  ids: Tensor.Any | ReadonlyArray<number>
 ): Effect.Effect<ReadonlyArray<number>, TokenizerError> =>
   Array.isArray(ids)
     ? Effect.succeed(ids as ReadonlyArray<number>)
     : Effect.map(
-        Effect.mapError(
-          Tensor.toTypedArray(ids as Tensor.Any),
-          toTokenizerError("decode"),
-        ),
-        (data) => Array.from(data, Number)
-      )
+      Effect.mapError(
+        Tensor.toTypedArray(ids as Tensor.Any),
+        toTokenizerError("decode")
+      ),
+      (data) => Array.from(data, Number)
+    )
 
 const TokenizerProto = {
   pipe() {
@@ -369,13 +363,13 @@ const TokenizerProto = {
 
 const make = (
   handle: NativeTokenizerType,
-  config: TokenizerConfig,
+  config: TokenizerConfig
 ): Tokenizer => {
   const self = Object.create(TokenizerProto)
   self[TokenizerTypeId] = TokenizerTypeId
   self.vocabSize = handle.vocabSize
   self.encode = (text: string) =>
-    Effect.gen(function* () {
+    Effect.gen(function*() {
       const device = yield* CurrentDevice
       return yield* Effect.try({
         try: () => {
@@ -386,7 +380,7 @@ const make = (
       })
     })
   self.encodeBatch = (texts: ReadonlyArray<string>) =>
-    Effect.gen(function* () {
+    Effect.gen(function*() {
       const device = yield* CurrentDevice
       return yield* Effect.tryPromise({
         try: async () => {
@@ -402,7 +396,7 @@ const make = (
       })
     })
   self.encodeBatchConcat = (texts: ReadonlyArray<string>) =>
-    Effect.gen(function* () {
+    Effect.gen(function*() {
       const device = yield* CurrentDevice
       return yield* Effect.tryPromise({
         try: async () => {
@@ -416,23 +410,20 @@ const make = (
     Effect.flatMap(idsOf(ids), (resolved) =>
       Effect.try({
         try: () => handle.decode(resolved as Array<number>),
-        catch: toTokenizerError("decode"),
-      })
-    )
+        catch: toTokenizerError("decode")
+      }))
   self.decodeBatch = (
-    batch: ReadonlyArray<Tensor.Any | ReadonlyArray<number>>,
+    batch: ReadonlyArray<Tensor.Any | ReadonlyArray<number>>
   ) =>
     Effect.flatMap(
       Effect.forEach(batch, idsOf, { concurrency: "unbounded" }),
       (resolved) =>
         Effect.try({
-          try: () =>
-            handle.decodeBatch(resolved.map((row) => row as Array<number>)),
+          try: () => handle.decodeBatch(resolved.map((row) => row as Array<number>)),
           catch: toTokenizerError("decodeBatch")
-        }),
+        })
     )
-  self.tokenToId = (token: string) =>
-    Option.fromNullishOr(handle.tokenToId(token))
+  self.tokenToId = (token: string) => Option.fromNullishOr(handle.tokenToId(token))
   self.idToToken = (id: number) => Option.fromNullishOr(handle.idToToken(id))
   self.save = (path: string) =>
     Effect.try({
@@ -451,13 +442,13 @@ const make = (
  */
 export const fromFile = (
   path: string,
-  config: TokenizerConfig,
+  config: TokenizerConfig
 ): Effect.Effect<Tokenizer, TokenizerError> =>
   Effect.try({
     try: () =>
       make(
         NativeTokenizer.fromFile(path, config.specialTokens === "Always"),
-        config,
+        config
       ),
     catch: toTokenizerError("fromFile")
   })
@@ -470,13 +461,13 @@ export const fromFile = (
  */
 export const fromJson = (
   json: string,
-  config: TokenizerConfig,
+  config: TokenizerConfig
 ): Effect.Effect<Tokenizer, TokenizerError> =>
   Effect.try({
     try: () =>
       make(
         NativeTokenizer.fromJson(json, config.specialTokens === "Always"),
-        config,
+        config
       ),
     catch: toTokenizerError("fromJson")
   })
@@ -492,44 +483,41 @@ export const fromJson = (
  */
 export const train = <E = never, R = never>(
   trainConfig: TrainConfig<E, R>,
-  config: TokenizerConfig,
+  config: TokenizerConfig
 ): Effect.Effect<Tokenizer, TokenizerError | E, R> => {
   return Stream.callback<
     Effect.Effect<undefined | NativeTokenizerType, E | TokenizerError, R>
   >((queue) =>
-    Effect.gen(function* () {
+    Effect.gen(function*() {
       const progress = trainConfig.progress
-      const onProgress =
-        progress._tag === "Report"
-          ? (event: [number, number]) => {
-              Queue.offerUnsafe(
-                queue,
-                Effect.as(undefined)(progress.report(event[0], event[1])),
-              )
-            }
-          : () => {}
-      const progressEveryBytes =
-        progress._tag === "Report" ? Math.max(0, Math.floor(progress.everyBytes)) : 0
+      const onProgress = progress._tag === "Report"
+        ? (event: [number, number]) => {
+          Queue.offerUnsafe(
+            queue,
+            Effect.as(undefined)(progress.report(event[0], event[1]))
+          )
+        }
+        : () => {}
+      const progressEveryBytes = progress._tag === "Report" ? Math.max(0, Math.floor(progress.everyBytes)) : 0
       NativeTokenizer.train(
         {
           model: trainConfig.model,
           vocabSize: trainConfig.vocabSize,
           minFrequency: trainConfig.minFrequency,
           specialTokens: trainConfig.specialTokens as Array<string>,
-          source:
-            trainConfig.source._tag === "Files"
-              ? {
-                  tag: "Files",
-                  paths: trainConfig.source.paths as Array<string>,
-                }
-              : {
-                  tag: "Texts",
-                  texts: trainConfig.source.texts as Array<string>,
-                },
+          source: trainConfig.source._tag === "Files"
+            ? {
+              tag: "Files",
+              paths: trainConfig.source.paths as Array<string>
+            }
+            : {
+              tag: "Texts",
+              texts: trainConfig.source.texts as Array<string>
+            }
         },
         config.specialTokens === "Always",
         onProgress,
-        progressEveryBytes,
+        progressEveryBytes
       )
         .then((tensor) => {
           Queue.offerUnsafe(queue, Effect.succeed(tensor))
@@ -539,15 +527,17 @@ export const train = <E = never, R = never>(
           Queue.offerUnsafe(queue, Effect.fail(toTokenizerError("train")(e)))
           Queue.endUnsafe(queue)
         })
-    }),
+    })
   ).pipe(
     Stream.mapEffect((_) => _),
     Stream.filter((_) => _ !== undefined),
     Stream.runLast,
-    Effect.flatMap((_) => Effect.try({
-      try: () => make(Option.getOrThrow(_), config),
-      catch: toTokenizerError("train")
-    }))
+    Effect.flatMap((_) =>
+      Effect.try({
+        try: () => make(Option.getOrThrow(_), config),
+        catch: toTokenizerError("train")
+      })
+    )
   )
 }
 

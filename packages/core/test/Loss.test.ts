@@ -1,7 +1,7 @@
 import { describe, expect } from "@effect/vitest"
 import * as assert from "@effect/vitest/utils"
 import { Effect } from "effect"
-import { Device, Gradient, Loss, Tensor } from "../src/index.ts"
+import { type Device, Gradient, Loss, Tensor } from "../src/index.ts"
 import { floats, GRADCHECK_EPS, GRADCHECK_TOL, onDevices, TOL } from "./utils/devices.ts"
 
 const i64 = (data: ReadonlyArray<bigint>, shape?: ReadonlyArray<number>) =>
@@ -16,7 +16,7 @@ const gradcheck = (
   input: ReadonlyArray<number>,
   shape: ReadonlyArray<number>
 ) =>
-  Effect.gen(function* () {
+  Effect.gen(function*() {
     const x = yield* Tensor.fromTypedArray(floats(input), shape)
     const [analytic] = yield* Gradient.grad(yield* f(x), [x])
     const analyticValues = yield* values(analytic)
@@ -31,11 +31,10 @@ const gradcheck = (
   })
 
 onDevices("Loss", () => (it) => {
-  const f32 = (data: ReadonlyArray<number>, shape?: ReadonlyArray<number>) =>
-    Tensor.fromTypedArray(floats(data), shape)
+  const f32 = (data: ReadonlyArray<number>, shape?: ReadonlyArray<number>) => Tensor.fromTypedArray(floats(data), shape)
   describe("values", () => {
     it.effect("mse / l1 / huber", () =>
-      Effect.gen(function* () {
+      Effect.gen(function*() {
         const pred = yield* f32([1, 2, 4])
         const target = yield* f32([1, 0, 1])
         const [mseValue] = yield* values(yield* Loss.mse(pred, target))
@@ -46,11 +45,10 @@ onDevices("Loss", () => (it) => {
         expect(Math.abs(huberValue - (0 + 1.5 + 2.5) / 3)).toBeLessThan(TOL)
         const [huberSum] = yield* values(yield* Loss.huber(pred, target, { reduction: "sum" }))
         expect(Math.abs(huberSum - 4)).toBeLessThan(TOL)
-      })
-    )
+      }))
 
     it.effect("binaryCrossEntropy from probabilities and logits", () =>
-      Effect.gen(function* () {
+      Effect.gen(function*() {
         const p = yield* f32([0.8, 0.3])
         const y = yield* f32([1, 0])
         const [bce] = yield* values(yield* Loss.binaryCrossEntropy(p, y))
@@ -60,11 +58,10 @@ onDevices("Loss", () => (it) => {
         const [fromLogits] = yield* values(yield* Loss.binaryCrossEntropy(logits, y, { fromLogits: true }))
         const stable = (x: number, t: number) => Math.max(x, 0) - x * t + Math.log1p(Math.exp(-Math.abs(x)))
         expect(Math.abs(fromLogits - (stable(2, 1) + stable(-1, 0)) / 2)).toBeLessThan(TOL)
-      })
-    )
+      }))
 
     it.effect("crossEntropy and nll", () =>
-      Effect.gen(function* () {
+      Effect.gen(function*() {
         const logits = yield* f32([2, 1, 0, 0, 3, 1], [2, 3])
         const targets = yield* i64([0n, 1n])
         const [ce] = yield* values(yield* Loss.crossEntropy(logits, targets))
@@ -77,11 +74,10 @@ onDevices("Loss", () => (it) => {
         const logProbs = yield* Tensor.logSoftmax(logits)
         const [nllValue] = yield* values(yield* Loss.nll(logProbs, targets))
         expect(Math.abs(nllValue - expected)).toBeLessThan(TOL)
-      })
-    )
+      }))
 
     it.effect("klDiv / hinge / cosineEmbeddingLoss", () =>
-      Effect.gen(function* () {
+      Effect.gen(function*() {
         const logPred = yield* f32([Math.log(0.5), Math.log(0.5)])
         const target = yield* f32([0.25, 0.75])
         const [kl] = yield* values(yield* Loss.klDiv(logPred, target))
@@ -98,29 +94,26 @@ onDevices("Loss", () => (it) => {
         const targets = yield* f32([1, -1])
         const [cos] = yield* values(yield* Loss.cosineEmbeddingLoss(a, b, targets))
         expect(Math.abs(cos - 0)).toBeLessThan(TOL)
-      })
-    )
+      }))
 
     it.effect("reduction none returns the unreduced loss", () =>
-      Effect.gen(function* () {
+      Effect.gen(function*() {
         const pred = yield* f32([1, 2, 4])
         const none = yield* Loss.mse(pred, yield* Tensor.constantLike(pred, 0), { reduction: "none" })
         assert.deepStrictEqual(none.shape, [3])
         assert.deepStrictEqual(yield* values(none), [1, 4, 16])
-      })
-    )
+      }))
 
     it.effect("crossEntropy rejects mismatched targets", () =>
-      Effect.gen(function* () {
+      Effect.gen(function*() {
         const logits = yield* f32([1, 2, 3], [1, 3])
         const bad = yield* f32([0])
         const error = yield* Effect.flip(Loss.crossEntropy(logits, bad))
         expect(error.message).toContain("i64")
-      })
-    )
+      }))
 
     it.effect("chunked head crossEntropy matches the unchunked head", () =>
-      Effect.gen(function* () {
+      Effect.gen(function*() {
         // Force the RFC 0016 phase-2 rewrite on tiny shapes: one row per
         // chunk. The linear->CE head is chunked + checkpointed; loss and
         // gradients must match the plain Mean head.
@@ -147,7 +140,7 @@ onDevices("Loss", () => (it) => {
           withChunkEnv(
             min,
             size,
-            Effect.gen(function* () {
+            Effect.gen(function*() {
               const x = yield* f32(Array.from({ length: 24 }, (_, i) => Math.sin(i * 0.37)), [2, 3, 4])
               const w = yield* f32(Array.from({ length: 32 }, (_, i) => Math.cos(i * 0.11) * 0.5), [4, 8])
               const b = yield* f32(Array.from({ length: 8 }, (_, i) => i * 0.05 - 0.2), [8])
@@ -158,7 +151,12 @@ onDevices("Loss", () => (it) => {
               return [value, ...(yield* Effect.all(grads.map((g) => values(g))))] as Array<number | Array<number>>
             })
           )
-        for (const targets of [yield* i64([0n, 1n, 2n, 3n, 4n, 5n], [2, 3]), yield* i64([-100n, 1n, 2n, 3n, -100n, 5n], [2, 3])]) {
+        for (
+          const targets of [
+            yield* i64([0n, 1n, 2n, 3n, 4n, 5n], [2, 3]),
+            yield* i64([-100n, 1n, 2n, 3n, -100n, 5n], [2, 3])
+          ]
+        ) {
           const plain = yield* run("999999999999", "67108864", targets)
           const chunked = yield* run("0", "1", targets)
           expect(Math.abs((plain[0] as number) - (chunked[0] as number))).toBeLessThan(1e-5)
@@ -171,22 +169,24 @@ onDevices("Loss", () => (it) => {
             }
           }
         }
-      })
-    )
+      }))
   })
 
   describe("gradcheck (finite differences)", () => {
     it.effect("regression losses", () =>
-      Effect.gen(function* () {
+      Effect.gen(function*() {
         yield* gradcheck((x) => Effect.flatMap(Tensor.constantLike(x, 1), (t) => Loss.mse(x, t)), [0.5, -1, 2], [3])
         yield* gradcheck((x) => Effect.flatMap(Tensor.constantLike(x, 0.25), (t) => Loss.l1(x, t)), [0.5, -1, 2], [3])
         yield* gradcheck((x) => Effect.flatMap(Tensor.constantLike(x, 0), (t) => Loss.huber(x, t)), [0.5, -1, 2], [3])
-        yield* gradcheck((x) => Effect.flatMap(Tensor.constantLike(x, 0), (t) => Loss.huber(x, t, { delta: 0.75 })), [0.5, -1, 2], [3])
-      })
-    )
+        yield* gradcheck((x) => Effect.flatMap(Tensor.constantLike(x, 0), (t) => Loss.huber(x, t, { delta: 0.75 })), [
+          0.5,
+          -1,
+          2
+        ], [3])
+      }))
 
     it.effect("classification losses", () =>
-      Effect.gen(function* () {
+      Effect.gen(function*() {
         const y = yield* f32([1, 0, 1])
         yield* gradcheck((x) => Loss.binaryCrossEntropy(x, y), [0.8, 0.3, 0.6], [3])
         yield* gradcheck((x) => Loss.binaryCrossEntropy(x, y, { fromLogits: true }), [2, -1, 0.5], [3])
@@ -198,7 +198,6 @@ onDevices("Loss", () => (it) => {
         yield* gradcheck((x) => Loss.hinge(x, signs), [0.9, -0.3, 0.2], [3])
         const probs = yield* f32([0.25, 0.75, 0.1])
         yield* gradcheck((x) => Loss.klDiv(x, probs), [Math.log(0.5), Math.log(0.5), Math.log(0.9)], [3])
-      })
-    )
+      }))
   })
 })

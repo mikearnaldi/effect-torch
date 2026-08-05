@@ -1,12 +1,12 @@
-import { Data, Effect } from "effect"
-import { NodeRuntime } from "@effect/platform-node"
 import { Device, LearningRate, Loss, Model, Optimizer, Tensor, Trainer } from "@effect-torch/core"
+import { NodeRuntime } from "@effect/platform-node"
+import { Data, Effect } from "effect"
 
 const HIDDEN = 8
 const STEPS = 3000
 const LR = 0.1
 
-const program = Effect.gen(function* () {
+const program = Effect.gen(function*() {
   const device = yield* Device.CurrentDevice
   const x = yield* Tensor.fromTypedArray(new Float32Array([0, 0, 0, 1, 1, 0, 1, 1]), [4, 2])
   const y = yield* Tensor.fromTypedArray(new Float32Array([0, 1, 1, 0]), [4, 1])
@@ -26,7 +26,7 @@ const program = Effect.gen(function* () {
 })
 
 // Create the model
-const createModel = Effect.gen(function* () {
+const createModel = Effect.gen(function*() {
   const model = yield* Model.chain(
     yield* Model.linear("fc1", 2, HIDDEN),
     yield* Model.tanh,
@@ -38,7 +38,7 @@ const createModel = Effect.gen(function* () {
 
 // Initialize the parameters
 const init = (model: Model.Model) =>
-  Effect.gen(function* () {
+  Effect.gen(function*() {
     const params = yield* model.init
     for (const [i, name] of model.names.entries()) {
       yield* Effect.log(`  ${name} [${params[i].shape}] ${params[i].dtype} initialized`)
@@ -52,7 +52,7 @@ const createTrainer = (
   x: Tensor.Any,
   y: Tensor.Any
 ) =>
-  Effect.gen(function* () {
+  Effect.gen(function*() {
     const trainer = yield* Trainer.make(model, {
       optimizer: yield* Optimizer.adam(),
       lr: LearningRate.constant(LR),
@@ -60,11 +60,13 @@ const createTrainer = (
       data: { input: x, target: y },
       stop: ({ step }) => step >= STEPS,
       onStep: ({ step, loss }) =>
-        Effect.gen(function* () {
+        Effect.gen(function*() {
           if (step % 250 === 0) {
             const mem = process.memoryUsage()
             yield* Effect.log(
-              `step ${String(step).padStart(4)}  loss ${loss.toFixed(6)}  rss ${(mem.rss / 1e6).toFixed(0)}MB  ext ${(mem.external / 1e6).toFixed(1)}MB  heap ${(mem.heapUsed / 1e6).toFixed(0)}MB`
+              `step ${String(step).padStart(4)}  loss ${loss.toFixed(6)}  rss ${(mem.rss / 1e6).toFixed(0)}MB  ext ${
+                (mem.external / 1e6).toFixed(1)
+              }MB  heap ${(mem.heapUsed / 1e6).toFixed(0)}MB`
             )
           }
         })
@@ -78,7 +80,9 @@ class MispredictionError extends Data.TaggedError("MispredictionError")<{
   readonly actual: number
 }> {
   override get message() {
-    return `misprediction on [${this.input[0]}, ${this.input[1]}]: expected ${this.expected}, got ${this.actual.toFixed(4)}`
+    return `misprediction on [${this.input[0]}, ${this.input[1]}]: expected ${this.expected}, got ${
+      this.actual.toFixed(4)
+    }`
   }
 }
 
@@ -89,7 +93,7 @@ const evaluate = (
   x: Tensor.Any,
   y: Tensor.Any
 ) =>
-  Effect.gen(function* () {
+  Effect.gen(function*() {
     const inputs = yield* Tensor.toNumberArray(x)
     const targets = yield* Tensor.toNumberArray(y)
     for (let i = 0; i < targets.length; i++) {

@@ -1,6 +1,6 @@
-import { Effect } from "effect"
-import { NodeRuntime } from "@effect/platform-node"
 import { Device, Tensor, Tokenizer } from "@effect-torch/core"
+import { NodeRuntime } from "@effect/platform-node"
+import { Effect } from "effect"
 import { parquetMetadataAsync, parquetReadObjects } from "hyparquet"
 import { compressors } from "hyparquet-compressors"
 import fs from "node:fs"
@@ -36,7 +36,7 @@ const parquetFile = (path: string) => {
   }
 }
 
-const program = Effect.gen(function* () {
+const program = Effect.gen(function*() {
   const file = parquetFile(PARQUET)
   const metadata = yield* Effect.tryPromise(() => parquetMetadataAsync(file))
   const rows = Number(metadata.num_rows)
@@ -76,14 +76,18 @@ const program = Effect.gen(function* () {
     }
     if (start % (group * 50) === 0 || end === rows) {
       yield* Effect.log(
-        `row ${end}/${rows}  train ${(trainTokens / 1e6).toFixed(0)}M tokens  ${((Date.now() - started) / 1000).toFixed(0)}s`
+        `row ${end}/${rows}  train ${(trainTokens / 1e6).toFixed(0)}M tokens  ${
+          ((Date.now() - started) / 1000).toFixed(0)
+        }s`
       )
     }
   }
   fs.closeSync(trainFd)
   fs.closeSync(valFd)
   yield* Effect.log(
-    `done: ${(trainTokens / 1e6).toFixed(1)}M train tokens, ${(valTokens / 1e6).toFixed(1)}M val tokens in ${((Date.now() - started) / 1000).toFixed(0)}s`
+    `done: ${(trainTokens / 1e6).toFixed(1)}M train tokens, ${(valTokens / 1e6).toFixed(1)}M val tokens in ${
+      ((Date.now() - started) / 1000).toFixed(0)
+    }s`
   )
 })
 

@@ -1,7 +1,7 @@
 import { describe, expect } from "@effect/vitest"
 import * as assert from "@effect/vitest/utils"
 import { Effect, Exit } from "effect"
-import { Device, Gradient, Loss, Tensor } from "../src/index.ts"
+import { type Device, Gradient, Loss, Tensor } from "../src/index.ts"
 import { deep, floatDtype, floats, GRADCHECK_EPS, GRADCHECK_TOL, onDevices, TOL } from "./utils/devices.ts"
 
 const values = (t: Tensor.Any) => Tensor.toNumberArray(t)
@@ -14,10 +14,11 @@ type ScalarFn = (
 
 const sumOf = (
   op: (x: Tensor.Lazy) => Effect.Effect<Tensor.Lazy, Tensor.TensorError, Device.CurrentDevice>
-): ScalarFn => (x) => Effect.flatMap(op(x), (t) => Tensor.sum(t))
+): ScalarFn =>
+(x) => Effect.flatMap(op(x), (t) => Tensor.sum(t))
 
 const gradcheck = (f: ScalarFn, input: ReadonlyArray<number>, shape: ReadonlyArray<number>) =>
-  Effect.gen(function* () {
+  Effect.gen(function*() {
     const x = yield* Tensor.fromTypedArray(floats(input), shape)
     const [analytic] = yield* Gradient.grad(yield* f(x), [x])
     const analyticValues = yield* values(analytic)
@@ -32,22 +33,20 @@ const gradcheck = (f: ScalarFn, input: ReadonlyArray<number>, shape: ReadonlyArr
   })
 
 onDevices("Autodiff", () => (it) => {
-  const f32 = (data: ReadonlyArray<number>, shape?: ReadonlyArray<number>) =>
-    Tensor.fromTypedArray(floats(data), shape)
+  const f32 = (data: ReadonlyArray<number>, shape?: ReadonlyArray<number>) => Tensor.fromTypedArray(floats(data), shape)
   describe("gradcheck (finite differences)", () => {
     it.effect("elementwise add/mul/div with broadcasting", () =>
-      Effect.gen(function* () {
+      Effect.gen(function*() {
         const b = yield* f32([1, 2, 3], [1, 3])
         const input = [1, 2, 3, 4, 5, 6]
         yield* gradcheck(sumOf((x) => Tensor.add(x, b)), input, [2, 3])
         yield* gradcheck(sumOf((x) => Tensor.mul(x, b)), input, [2, 3])
         yield* gradcheck(sumOf((x) => Tensor.div(x, b)), input, [2, 3])
         yield* gradcheck(sumOf((x) => Tensor.div(b, x)), input, [2, 3])
-      })
-    )
+      }))
 
     it.effect("unary ops", () =>
-      Effect.gen(function* () {
+      Effect.gen(function*() {
         yield* gradcheck(sumOf((x) => Tensor.neg(x)), [1, -2, 3], [3])
         yield* gradcheck(sumOf((x) => Tensor.abs(x)), [1, -2, 3], [3])
         yield* gradcheck(sumOf((x) => Tensor.sqrt(x)), [1, 2, 3], [3])
@@ -57,10 +56,20 @@ onDevices("Autodiff", () => (it) => {
         yield* gradcheck(sumOf((x) => Tensor.cos(x)), [0.5, 1, 2], [3])
         yield* gradcheck(sumOf((x) => Tensor.tanh(x)), [0.5, -1, 2], [3])
         yield* gradcheck(sumOf((x) => Tensor.relu(x)), [0.5, -1, 2], [3])
-        yield* gradcheck(sumOf((x) => Effect.flatMap(Tensor.constantLike(x, 0.25), (c) => Tensor.maximum(x, c))), [0.5, -1, 2], [3])
-        yield* gradcheck(sumOf((x) => Effect.flatMap(Tensor.constantLike(x, 0.25), (c) => Tensor.minimum(x, c))), [0.5, -1, 2], [3])
+        yield* gradcheck(sumOf((x) => Effect.flatMap(Tensor.constantLike(x, 0.25), (c) => Tensor.maximum(x, c))), [
+          0.5,
+          -1,
+          2
+        ], [3])
+        yield* gradcheck(sumOf((x) => Effect.flatMap(Tensor.constantLike(x, 0.25), (c) => Tensor.minimum(x, c))), [
+          0.5,
+          -1,
+          2
+        ], [3])
         yield* gradcheck(sumOf((x) => Tensor.sigmoid(x)), [0.5, -1, 2], [3])
-        yield* gradcheck(sumOf((x) => Effect.flatMap(Tensor.constantLike(x, 1), (t) => Loss.mse(x, t))), [0.5, -1, 2], [3])
+        yield* gradcheck(sumOf((x) => Effect.flatMap(Tensor.constantLike(x, 1), (t) => Loss.mse(x, t))), [0.5, -1, 2], [
+          3
+        ])
         yield* gradcheck(sumOf((x) => Tensor.pow(x, 3)), [0.5, 1, 2], [3])
         yield* gradcheck(sumOf((x) => Tensor.erf(x)), [0.5, -1, 2], [3])
         yield* gradcheck(sumOf((x) => Tensor.floor(x)), [0.5, -1.3, 2.7], [3])
@@ -77,12 +86,15 @@ onDevices("Autodiff", () => (it) => {
         yield* gradcheck(sumOf((x) => Tensor.sinh(x)), [0.5, -1, 2], [3])
         yield* gradcheck(sumOf((x) => Tensor.cosh(x)), [0.5, -1, 2], [3])
         yield* gradcheck(sumOf((x) => Tensor.tan(x)), [0.5, -1, 1.2], [3])
-        yield* gradcheck(sumOf((x) => Effect.flatMap(Tensor.constantLike(x, 3), (c) => Tensor.remainder(x, c))), [0.5, -1.3, 2.7], [3])
-      })
-    )
+        yield* gradcheck(sumOf((x) => Effect.flatMap(Tensor.constantLike(x, 3), (c) => Tensor.remainder(x, c))), [
+          0.5,
+          -1.3,
+          2.7
+        ], [3])
+      }))
 
     it.effect("neural network ops", () =>
-      Effect.gen(function* () {
+      Effect.gen(function*() {
         yield* gradcheck(sumOf((x) => Tensor.silu(x)), [0.5, -1, 2], [3])
         yield* gradcheck(sumOf((x) => Tensor.softplus(x)), [0.5, -1, 2], [3])
         yield* gradcheck(sumOf((x) => Tensor.elu(x)), [0.5, -1, 2], [3])
@@ -99,11 +111,10 @@ onDevices("Autodiff", () => (it) => {
           [0.5, -1, 2],
           [3]
         )
-      })
-    )
+      }))
 
     it.effect("extended reductions and where", () =>
-      Effect.gen(function* () {
+      Effect.gen(function*() {
         yield* gradcheck(sumOf((x) => Tensor.variance(x)), [1, 2, 3, 4], [4])
         yield* gradcheck(sumOf((x) => Tensor.std(x)), [1, 2, 3, 4], [4])
         yield* gradcheck(sumOf((x) => Tensor.norm(x, { ord: 2 })), [0.5, -1, 2], [3])
@@ -115,11 +126,10 @@ onDevices("Autodiff", () => (it) => {
         const other = yield* f32([10, 20, 30])
         yield* gradcheck(sumOf((x) => Tensor.where(cond, x, other)), [0.5, -1, 2], [3])
         yield* gradcheck(sumOf((x) => Tensor.where(cond, other, x)), [0.5, -1, 2], [3])
-      })
-    )
+      }))
 
     it.effect("shape ops", () =>
-      Effect.gen(function* () {
+      Effect.gen(function*() {
         yield* gradcheck(sumOf((x) => Tensor.flatten(x, { startDim: 1 })), [1, 2, 3, 4, 5, 6, 7, 8], [2, 2, 2])
         yield* gradcheck(sumOf((x) => Tensor.tile(x, [2, 2])), [1, 2, 3, 4], [2, 2])
         yield* gradcheck(sumOf((x) => Tensor.pad(x, [[1, 1], [0, 2]])), [1, 2, 3, 4], [2, 2])
@@ -130,11 +140,10 @@ onDevices("Autodiff", () => (it) => {
         yield* gradcheck(sumOf((x) => Tensor.dot(x, b)), [1, 2, 3], [3])
         const parts = yield* Tensor.split(yield* f32([1, 2, 3, 4]), 2)
         assert.strictEqual(parts.length, 2)
-      })
-    )
+      }))
 
     it.effect("take and gather scatter gradients back", () =>
-      Effect.gen(function* () {
+      Effect.gen(function*() {
         const x = yield* f32([1, 2, 3, 4, 5, 6], [3, 2])
         const idx = yield* Tensor.fromTypedArray(new BigInt64Array([2n, 0n, 2n]))
         const loss = yield* Tensor.sum(yield* Tensor.take(x, idx))
@@ -145,16 +154,17 @@ onDevices("Autodiff", () => (it) => {
         const g2 = yield* Tensor.sum(yield* Tensor.gather(x, idx2, { dim: 1 }))
         const [dg] = yield* Gradient.grad(g2, [x])
         deep(yield* values(dg), [1, 1, 1, 1, 0, 0])
-      })
-    )
+      }))
 
     it.effect("scatterAdd", () =>
-      Effect.gen(function* () {
+      Effect.gen(function*() {
         yield* gradcheck(
-          sumOf((x) => Effect.gen(function* () {
-            const idx = yield* Tensor.fromTypedArray(new BigInt64Array([2n, 0n, 2n]))
-            return yield* Tensor.take(x, idx)
-          })),
+          sumOf((x) =>
+            Effect.gen(function*() {
+              const idx = yield* Tensor.fromTypedArray(new BigInt64Array([2n, 0n, 2n]))
+              return yield* Tensor.take(x, idx)
+            })
+          ),
           [1, 2, 3, 4, 5, 6],
           [3, 2]
         )
@@ -165,21 +175,19 @@ onDevices("Autodiff", () => (it) => {
           [1, 2, 3, 4],
           [2, 2]
         )
-      })
-    )
+      }))
 
     it.effect("strided slice", () =>
-      Effect.gen(function* () {
+      Effect.gen(function*() {
         yield* gradcheck(
           sumOf((x) => Tensor.slice(x, { start: [1], end: [7], stride: [2] })),
           [1, 2, 3, 4, 5, 6, 7, 8],
           [8]
         )
-      })
-    )
+      }))
 
     it.effect("convolution and pooling", () =>
-      Effect.gen(function* () {
+      Effect.gen(function*() {
         const w = yield* f32([1, 0, 0, 1], [1, 1, 2, 2])
         yield* gradcheck(sumOf((x) => Tensor.conv2d(x, w)), [1, 2, 3, 4, 5, 6, 7, 8, 9], [1, 1, 3, 3])
         const x = yield* f32([1, 2, 3, 4, 5, 6, 7, 8, 9], [1, 1, 3, 3])
@@ -198,7 +206,38 @@ onDevices("Autodiff", () => (it) => {
         )
         // non-uniform stride remainders: 5 % 2 != 6 % 2 with kernel 2
         const wnr = yield* f32([1, 0, 0, 1], [1, 1, 2, 2])
-        const xnr = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30]
+        const xnr = [
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15,
+          16,
+          17,
+          18,
+          19,
+          20,
+          21,
+          22,
+          23,
+          24,
+          25,
+          26,
+          27,
+          28,
+          29,
+          30
+        ]
         yield* gradcheck(
           sumOf((xr) => Tensor.conv2d(xr, wnr, { stride: 2 })),
           xnr,
@@ -231,35 +270,32 @@ onDevices("Autodiff", () => (it) => {
         )
         const xt = yield* f32([1, 2, 3, 4], [1, 1, 2, 2])
         yield* gradcheck(sumOf((w2) => Tensor.convTranspose2d(xt, w2)), [1, 2, 3, 4], [1, 1, 2, 2])
-      })
-    )
+      }))
 
     it.effect("linalg", () =>
-      Effect.gen(function* () {
+      Effect.gen(function*() {
         yield* gradcheck(sumOf((x) => Tensor.det(x)), [4, 1, 1, 3], [2, 2])
         yield* gradcheck(sumOf((x) => Tensor.inverse(x)), [4, 1, 1, 3], [2, 2])
         const b = yield* f32([9, 8], [2, 1])
         yield* gradcheck(sumOf((x) => Tensor.solve(x, b)), [4, 1, 1, 3], [2, 2])
         const a = yield* f32([4, 1, 1, 3], [2, 2])
         yield* gradcheck(sumOf((x) => Tensor.solve(a, x)), [9, 8], [2, 1])
-      })
-    )
+      }))
 
     it.effect("batched linalg", () =>
-      Effect.gen(function* () {
+      Effect.gen(function*() {
         yield* gradcheck(sumOf((x) => Tensor.det(x)), [4, 1, 1, 3, 2, 1, 1, 2], [2, 2, 2])
         yield* gradcheck(sumOf((x) => Tensor.inverse(x)), [4, 1, 1, 3, 2, 1, 1, 2], [2, 2, 2])
         const b = yield* f32([9, 8, 5, 4], [2, 2, 1])
         yield* gradcheck(sumOf((x) => Tensor.solve(x, b)), [4, 1, 1, 3, 2, 1, 1, 2], [2, 2, 2])
         const a = yield* f32([4, 1, 1, 3, 2, 1, 1, 2], [2, 2, 2])
         yield* gradcheck(sumOf((x) => Tensor.solve(a, x)), [9, 8, 5, 4], [2, 2, 1])
-      })
-    )
+      }))
 
     it.effect("checkpoint preserves values and gradients, sharing randn draws", () =>
-      Effect.gen(function* () {
+      Effect.gen(function*() {
         const f = (x: Tensor.Any) =>
-          Effect.gen(function* () {
+          Effect.gen(function*() {
             return yield* Tensor.mul(yield* Tensor.sin(x), yield* Tensor.add(x, yield* Tensor.constantLike(x, 1)))
           })
         const x = yield* f32([0.5, 1])
@@ -278,7 +314,7 @@ onDevices("Autodiff", () => (it) => {
 
         // the backward recompute must see the same randn draw as the forward
         const stochastic = (x: Tensor.Any) =>
-          Effect.gen(function* () {
+          Effect.gen(function*() {
             return yield* Tensor.mul(x, yield* Tensor.randn([2], { dtype: floatDtype }))
           })
         const x2 = yield* f32([2, 4])
@@ -291,11 +327,10 @@ onDevices("Autodiff", () => (it) => {
         for (let i = 0; i < 2; i++) {
           expect(Math.abs(outValues[i] / [2, 4][i] - gradValues[i])).toBeLessThan(TOL)
         }
-      })
-    )
+      }))
 
     it.effect("vjp / jvp", () =>
-      Effect.gen(function* () {
+      Effect.gen(function*() {
         const a = yield* f32([1, 2, 3, 4, 5, 6], [2, 3])
         const x = yield* f32([1, 1, 1], [3, 1])
         const y = yield* Tensor.matmul(a, x)
@@ -315,11 +350,10 @@ onDevices("Autodiff", () => (it) => {
         const tnValues = yield* values(tn)
         expect(Math.abs(tnValues[0] - Math.cos(0.5) * 2)).toBeLessThan(TOL)
         expect(Math.abs(tnValues[1] - Math.cos(1) * 3)).toBeLessThan(TOL)
-      })
-    )
+      }))
 
     it.effect("vmap rewrites the graph with per-op batching rules", () =>
-      Effect.gen(function* () {
+      Effect.gen(function*() {
         // elementwise + reduction: per-row sum of squares
         const x1 = yield* f32([1, 2, 3])
         const y1 = yield* Tensor.sum(yield* Tensor.square(x1))
@@ -367,17 +401,16 @@ onDevices("Autodiff", () => (it) => {
         const constant = yield* Tensor.ones([2])
         const error = yield* Effect.flip(Gradient.vmap(constant, x1, bx1))
         expect(error.message).toContain("does not depend")
-      })
-    )
+      }))
 
     it.effect("vmap supports shared-index take, gather and scatterAdd", () =>
-      Effect.gen(function* () {
+      Effect.gen(function*() {
         const x = yield* f32([1, 2, 3, 4, 5, 6], [3, 2])
         const bx = yield* f32([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12], [2, 3, 2])
         const perBatch = (
           f: (slice: Tensor.Any) => Effect.Effect<Tensor.Any, Tensor.TensorError>
         ) =>
-          Effect.gen(function* () {
+          Effect.gen(function*() {
             const outs: Array<Array<number>> = []
             for (const b of [0, 1]) {
               const slice = yield* Tensor.reshape(
@@ -415,35 +448,34 @@ onDevices("Autodiff", () => (it) => {
         deep(
           yield* values(scattered),
           yield* perBatch((s) =>
-            Effect.gen(function* () {
-              return yield* Tensor.scatterAdd(s, gatherIdx, yield* Tensor.mul(s, yield* Tensor.constantLike(s, 2)), { dim: 1 })
+            Effect.gen(function*() {
+              return yield* Tensor.scatterAdd(s, gatherIdx, yield* Tensor.mul(s, yield* Tensor.constantLike(s, 2)), {
+                dim: 1
+              })
             })
           )
         )
-      })
-    )
+      }))
 
     it.effect("matmul", () =>
-      Effect.gen(function* () {
+      Effect.gen(function*() {
         const b = yield* f32([1, 2, 3, 4, 5, 6], [3, 2])
         yield* gradcheck(sumOf((x) => Tensor.matmul(x, b)), [1, 2, 3, 4, 5, 6], [2, 3])
         const a = yield* f32([1, 2, 3, 4, 5, 6], [2, 3])
         yield* gradcheck(sumOf((x) => Tensor.matmul(a, x)), [1, 2, 3, 4, 5, 6], [3, 2])
-      })
-    )
+      }))
 
     it.effect("batched matmul with broadcast batch dims", () =>
-      Effect.gen(function* () {
+      Effect.gen(function*() {
         const b = yield* f32([1, 2, 3, 4, 5, 6], [3, 2])
         const input = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
         yield* gradcheck(sumOf((x) => Tensor.matmul(x, b)), input, [2, 2, 3])
         const c = yield* f32(input, [2, 2, 3])
         yield* gradcheck(sumOf((x) => Tensor.matmul(c, x)), [1, 2, 3, 4, 5, 6], [3, 2])
-      })
-    )
+      }))
 
     it.effect("reductions sum/mean/max/min", () =>
-      Effect.gen(function* () {
+      Effect.gen(function*() {
         const input = [1, 5, 3, 4, 2, 6]
         yield* gradcheck((x) => Tensor.sum(x), input, [2, 3])
         yield* gradcheck(sumOf((x) => Tensor.sum(x, { dims: [0] })), input, [2, 3])
@@ -451,11 +483,10 @@ onDevices("Autodiff", () => (it) => {
         yield* gradcheck(sumOf((x) => Tensor.max(x, { dims: [1] })), input, [2, 3])
         yield* gradcheck(sumOf((x) => Tensor.min(x, { dims: [0], keepdims: true })), input, [2, 3])
         yield* gradcheck(sumOf((x) => Tensor.mean(x, { dims: [0] })), input, [2, 3])
-      })
-    )
+      }))
 
     it.effect("max/min split gradients evenly across ties", () =>
-      Effect.gen(function* () {
+      Effect.gen(function*() {
         const x = yield* f32([1, 3, 3, 2], [4])
         const [gmax] = yield* Gradient.grad(yield* Tensor.max(x, { dims: [0] }), [x])
         deep(yield* values(gmax), [0, 0.5, 0.5, 0])
@@ -464,37 +495,38 @@ onDevices("Autodiff", () => (it) => {
         const y = yield* f32([2, 1, 1, 3], [4])
         const [gymin] = yield* Gradient.grad(yield* Tensor.min(y, { dims: [0] }), [y])
         deep(yield* values(gymin), [0, 0.5, 0.5, 0])
-      })
-    )
+      }))
 
     it.effect("shape ops", () =>
-      Effect.gen(function* () {
+      Effect.gen(function*() {
         const input = [1, 2, 3, 4, 5, 6]
         yield* gradcheck(sumOf((x) => Tensor.reshape(x, [3, 2])), input, [2, 3])
         yield* gradcheck(sumOf((x) => Tensor.transpose(x, [1, 0])), input, [2, 3])
         yield* gradcheck(sumOf((x) => Tensor.slice(x, { start: [0, 1], end: [2, 3] })), input, [2, 3])
         yield* gradcheck(sumOf((x) => Tensor.broadcastTo(x, [2, 3])), [1, 2, 3], [1, 3])
         yield* gradcheck(sumOf((x) => Tensor.broadcastTo(x, [2, 3])), [1, 2, 3], [3])
-        yield* gradcheck(sumOf((x) => Tensor.transpose(x, [2, 0, 1])), [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12], [2, 3, 2])
+        yield* gradcheck(sumOf((x) => Tensor.transpose(x, [2, 0, 1])), [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12], [
+          2,
+          3,
+          2
+        ])
         const c = yield* f32([7, 8, 9], [1, 3])
         yield* gradcheck(sumOf((x) => Tensor.concat([x, c], { dim: 0 })), [1, 2, 3], [1, 3])
-      })
-    )
+      }))
 
     it.effect("cast roundtrip through f16 has identity gradient", () =>
-      Effect.gen(function* () {
+      Effect.gen(function*() {
         const x = yield* f32([1, 2, 3])
         const loss = yield* Effect.flatMap(Tensor.cast(x, "f16"), (t) => Tensor.cast(t, "f32"))
         const [gx] = yield* Gradient.grad(yield* Tensor.sum(loss), [x])
         deep(yield* values(gx), [1, 1, 1])
-      })
-    )
+      }))
 
     it.effect("composite graph with shared subexpressions", () =>
-      Effect.gen(function* () {
+      Effect.gen(function*() {
         yield* gradcheck(
           (x) =>
-            Effect.gen(function* () {
+            Effect.gen(function*() {
               const y = yield* Tensor.mul(x, x)
               const z = yield* Tensor.add(y, x)
               const out = yield* Tensor.mul(y, z)
@@ -503,63 +535,57 @@ onDevices("Autodiff", () => (it) => {
           [0.5, 1.5, 2.5],
           [3]
         )
-      })
-    )
+      }))
   })
 
   describe("contract", () => {
     it.effect("rejects non-scalar output", () =>
-      Effect.gen(function* () {
+      Effect.gen(function*() {
         const x = yield* f32([1, 2, 3])
         const exit = yield* Effect.exit(Gradient.grad(x, [x]))
         assert.assertTrue(Exit.isFailure(exit))
-      })
-    )
+      }))
 
     it.effect("rejects non-float wrt", () =>
-      Effect.gen(function* () {
+      Effect.gen(function*() {
         const x = yield* Tensor.fromTypedArray(new BigInt64Array([1n, 2n]))
         const loss = yield* Effect.flatMap(Tensor.cast(x, floatDtype), (t) => Tensor.sum(t))
         const exit = yield* Effect.exit(Gradient.grad(loss, [x]))
         assert.assertTrue(Exit.isFailure(exit))
-      })
-    )
+      }))
 
     it.effect("strided slice is differentiable", () =>
-      Effect.gen(function* () {
+      Effect.gen(function*() {
         const x = yield* f32([1, 2, 3, 4, 5, 6, 7], [7])
         const sliced = yield* Tensor.slice(x, { stride: [2] })
         const loss = yield* Tensor.sum(sliced)
         const [g] = yield* Gradient.grad(loss, [x])
         deep(yield* values(g), [1, 0, 1, 0, 1, 0, 1])
-      })
-    )
+      }))
 
     it.effect("unused wrt argument yields zeros", () =>
-      Effect.gen(function* () {
+      Effect.gen(function*() {
         const x = yield* f32([1, 2, 3])
         const y = yield* f32([4, 5, 6])
         const loss = yield* Effect.flatMap(Tensor.mul(x, x), (t) => Tensor.sum(t))
         const [gx, gy] = yield* Gradient.grad(loss, [x, y])
         deep(yield* values(gx), [2, 4, 6])
         deep(yield* values(gy), [0, 0, 0])
-      })
-    )
+      }))
 
     it.effect("stopGradient blocks gradient flow", () =>
-      Effect.gen(function* () {
+      Effect.gen(function*() {
         const x = yield* f32([2, 3])
         const stopped = yield* Gradient.stopGradient(x)
         const loss = yield* Tensor.sum(yield* Tensor.mul(stopped, x))
         const [gx] = yield* Gradient.grad(loss, [x])
         deep(yield* values(gx), [2, 3])
-      })
-    )
+      }))
   })
 
   describe("grad + compute", () => {
     it.effect("loss and gradients come from the same randn draw", () =>
-      Effect.gen(function* () {
+      Effect.gen(function*() {
         const x = yield* f32([1, 2, 3])
         const r = yield* Tensor.randn([3], { dtype: floatDtype })
         const loss = yield* Tensor.sum(yield* Tensor.mul(x, r))
@@ -569,18 +595,17 @@ onDevices("Autodiff", () => (it) => {
         const gv = yield* values(g)
         const reconstructed = gv[0] * 1 + gv[1] * 2 + gv[2] * 3
         expect(Math.abs(lv - reconstructed)).toBeLessThan(TOL)
-      })
-    )
+      }))
   })
 
   describe("end-to-end", () => {
     it.effect("linear regression converges", () =>
-      Effect.gen(function* () {
+      Effect.gen(function*() {
         const trueW = [2, -3]
         const trueB = 1
         const xs = [0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0]
         const ys = xs.map((x) => trueW[0] * x + trueW[1] + trueB)
-        const features = xs.map((x) => [x, 1]).flat()
+        const features = xs.flatMap((x) => [x, 1])
         const x = yield* f32(features, [8, 2])
         const y = yield* f32(ys, [8, 1])
         let w = yield* f32([0, 0], [2, 1])
@@ -606,7 +631,6 @@ onDevices("Autodiff", () => (it) => {
         // w[1] and b are collinear (both multiply the constant feature 1),
         // only their sum is identified by the data
         expect(Math.abs(finalW[1] + finalB[0] - (trueW[1] + trueB))).toBeLessThan(0.1)
-      })
-    )
+      }))
   })
 })

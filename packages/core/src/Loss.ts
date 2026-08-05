@@ -78,7 +78,7 @@ const dualLoss = <T, O, R = never>(
  * @category losses
  */
 export const mse = dualLoss<Tensor.Any, LossOptions>((pred, target, options) =>
-  Effect.gen(function* () {
+  Effect.gen(function*() {
     const err = yield* Tensor.sub(pred, target)
     return yield* applyReduction(yield* Tensor.square(err), options?.reduction ?? "mean")
   })
@@ -91,7 +91,7 @@ export const mse = dualLoss<Tensor.Any, LossOptions>((pred, target, options) =>
  * @category losses
  */
 export const l1 = dualLoss<Tensor.Any, LossOptions>((pred, target, options) =>
-  Effect.gen(function* () {
+  Effect.gen(function*() {
     const err = yield* Tensor.sub(pred, target)
     return yield* applyReduction(yield* Tensor.abs(err), options?.reduction ?? "mean")
   })
@@ -116,7 +116,7 @@ export interface HuberOptions extends LossOptions {
  * @category losses
  */
 export const huber = dualLoss<Tensor.Any, HuberOptions>((pred, target, options) =>
-  Effect.gen(function* () {
+  Effect.gen(function*() {
     const delta = options?.delta ?? 1
     if (delta <= 0) {
       return yield* new Tensor.TensorError({ op: "huber", message: `huber: delta must be positive, got ${delta}` })
@@ -154,7 +154,7 @@ export interface BinaryCrossEntropyOptions extends LossOptions {
  */
 export const binaryCrossEntropy = dualLoss<Tensor.Any, BinaryCrossEntropyOptions>(
   (pred, target, options) =>
-    Effect.gen(function* () {
+    Effect.gen(function*() {
       if (options?.fromLogits === true) {
         const head = yield* Tensor.relu(pred)
         const mid = yield* Tensor.mul(pred, target)
@@ -177,18 +177,22 @@ const checkClassTargets = (
   input: Tensor.Any,
   targets: Tensor.Any
 ): Effect.Effect<number, Tensor.TensorError> =>
-  Effect.gen(function* () {
+  Effect.gen(function*() {
     if (input.shape.length < 1) {
       return yield* new Tensor.TensorError({ op, message: `${op}: expected rank >= 1, got rank ${input.shape.length}` })
     }
     if (targets.dtype !== "i64" && targets.dtype !== "u32") {
-      return yield* new Tensor.TensorError({ op, message: `${op}: targets must be i64 or u32 class indexes, got ${targets.dtype}` })
+      return yield* new Tensor.TensorError({
+        op,
+        message: `${op}: targets must be i64 or u32 class indexes, got ${targets.dtype}`
+      })
     }
     const expected = input.shape.slice(0, -1)
     if (expected.length !== targets.shape.length || expected.some((d, i) => d !== targets.shape[i])) {
       return yield* new Tensor.TensorError({
         op,
-        message: `${op}: targets shape [${targets.shape}] does not match input shape [${input.shape}] minus the class dimension`
+        message:
+          `${op}: targets shape [${targets.shape}] does not match input shape [${input.shape}] minus the class dimension`
       })
     }
     return input.shape[input.shape.length - 1]
@@ -205,7 +209,7 @@ const checkClassTargets = (
  * @category losses
  */
 export const crossEntropy = dualLoss<Tensor.Any, LossOptions, CurrentDevice>((logits, targets, options) =>
-  Effect.gen(function* () {
+  Effect.gen(function*() {
     const depth = yield* checkClassTargets("crossEntropy", logits, targets)
     if (logits.dtype !== "f32" && logits.dtype !== "f64" && logits.dtype !== "bf16") {
       return yield* new Tensor.TensorError({
@@ -231,7 +235,7 @@ export const crossEntropy = dualLoss<Tensor.Any, LossOptions, CurrentDevice>((lo
  * @category losses
  */
 export const nll = dualLoss<Tensor.Any, LossOptions, CurrentDevice>((logProbs, targets, options) =>
-  Effect.gen(function* () {
+  Effect.gen(function*() {
     const depth = yield* checkClassTargets("nll", logProbs, targets)
     if (logProbs.dtype !== "f32" && logProbs.dtype !== "f64") {
       return yield* new Tensor.TensorError({
@@ -254,7 +258,7 @@ export const nll = dualLoss<Tensor.Any, LossOptions, CurrentDevice>((logProbs, t
  * @category losses
  */
 export const klDiv = dualLoss<Tensor.Any, LossOptions>((logPred, target, options) =>
-  Effect.gen(function* () {
+  Effect.gen(function*() {
     const zero = yield* Tensor.constantLike(target, 0)
     const elements = yield* Tensor.where(
       yield* Tensor.gt(target, zero),
@@ -272,7 +276,7 @@ export const klDiv = dualLoss<Tensor.Any, LossOptions>((logPred, target, options
  * @category losses
  */
 export const hinge = dualLoss<Tensor.Any, LossOptions>((pred, target, options) =>
-  Effect.gen(function* () {
+  Effect.gen(function*() {
     const margin = yield* Tensor.add(
       yield* Tensor.neg(yield* Tensor.mul(pred, target)),
       yield* Tensor.constantLike(pred, 1)
@@ -310,17 +314,24 @@ export const cosineEmbeddingLoss = (
   targets: Tensor.Any,
   options: CosineEmbeddingOptions = {}
 ): Effect.Effect<Tensor.Lazy, Tensor.TensorError> =>
-  Effect.gen(function* () {
+  Effect.gen(function*() {
     const margin = options.margin ?? 0
     const dot = yield* Tensor.sum(yield* Tensor.mul(a, b), { dims: [-1] })
     const na = yield* Tensor.sqrt(yield* Tensor.sum(yield* Tensor.square(a), { dims: [-1] }))
     const nb = yield* Tensor.sqrt(yield* Tensor.sum(yield* Tensor.square(b), { dims: [-1] }))
-    const cos = yield* Tensor.div(dot, yield* Tensor.add(yield* Tensor.mul(na, nb), yield* Tensor.constantLike(dot, 1e-12)))
+    const cos = yield* Tensor.div(
+      dot,
+      yield* Tensor.add(yield* Tensor.mul(na, nb), yield* Tensor.constantLike(dot, 1e-12))
+    )
     const positive = yield* Tensor.add(yield* Tensor.neg(cos), yield* Tensor.constantLike(cos, 1))
     const negative = yield* Tensor.maximum(
       yield* Tensor.add(cos, yield* Tensor.constantLike(cos, -margin)),
       yield* Tensor.constantLike(cos, 0)
     )
-    const loss = yield* Tensor.where(yield* Tensor.gt(targets, yield* Tensor.constantLike(targets, 0)), positive, negative)
+    const loss = yield* Tensor.where(
+      yield* Tensor.gt(targets, yield* Tensor.constantLike(targets, 0)),
+      positive,
+      negative
+    )
     return yield* applyReduction(loss, options.reduction ?? "mean")
   })

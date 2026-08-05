@@ -1,7 +1,7 @@
 import { describe, expect } from "@effect/vitest"
 import * as assert from "@effect/vitest/utils"
 import { Effect } from "effect"
-import { Gradient, Loss, Optimizer, LearningRate, Tensor } from "../src/index.ts"
+import { Gradient, LearningRate, Loss, Optimizer, Tensor } from "../src/index.ts"
 import { floats, onDevices, TOL } from "./utils/devices.ts"
 
 const values = (t: Tensor.Any) => Tensor.toNumberArray(t)
@@ -15,7 +15,7 @@ const runStep = <S>(
   state: S,
   lr: number
 ) =>
-  Effect.gen(function* () {
+  Effect.gen(function*() {
     const lrT = yield* Tensor.full([], lr, { dtype: params[0].dtype })
     const next = yield* optimizer.step(params, grads, state, lrT)
     const evaluated = yield* Tensor.compute([...next.params, ...next.stateRoots])
@@ -26,8 +26,7 @@ const runStep = <S>(
   })
 
 onDevices("Optimizer", () => (it) => {
-  const f32 = (data: ReadonlyArray<number>, shape?: ReadonlyArray<number>) =>
-    Tensor.fromTypedArray(floats(data), shape)
+  const f32 = (data: ReadonlyArray<number>, shape?: ReadonlyArray<number>) => Tensor.fromTypedArray(floats(data), shape)
   const closeTo = (actual: Array<number>, expected: ReadonlyArray<number>, t = TOL) => {
     expect(actual.length).toBe(expected.length)
     for (let i = 0; i < actual.length; i++) {
@@ -36,7 +35,7 @@ onDevices("Optimizer", () => (it) => {
   }
   describe("sgd", () => {
     it.effect("plain update matches hand computation", () =>
-      Effect.gen(function* () {
+      Effect.gen(function*() {
         const optimizer = yield* Optimizer.sgd()
         const p = yield* f32([1, 2])
         const g = yield* f32([0.5, -0.5])
@@ -44,11 +43,10 @@ onDevices("Optimizer", () => (it) => {
         const step1 = yield* runStep(optimizer, [p], [g], state, 0.1)
         closeTo(yield* values(step1.params[0]), [0.95, 2.05])
         expect(step1.state.velocity).toEqual([])
-      })
-    )
+      }))
 
     it.effect("momentum recurrence matches hand computation over 3 steps", () =>
-      Effect.gen(function* () {
+      Effect.gen(function*() {
         const optimizer = yield* Optimizer.sgd({ momentum: 0.9 })
         const g = yield* f32([0.5, -0.5])
         let params = [yield* f32([1, 2])] as ReadonlyArray<Tensor.Any>
@@ -64,35 +62,32 @@ onDevices("Optimizer", () => (it) => {
           params = next.params
           state = next.state
         }
-      })
-    )
+      }))
 
     it.effect("weight decay adds coupled L2 to the gradient", () =>
-      Effect.gen(function* () {
+      Effect.gen(function*() {
         const optimizer = yield* Optimizer.sgd({ weightDecay: 1 })
         const p = yield* f32([1, 2])
         const g = yield* f32([0.5, -0.5])
         const state = yield* optimizer.init([p])
         const step1 = yield* runStep(optimizer, [p], [g], state, 0.1)
         closeTo(yield* values(step1.params[0]), [0.85, 1.85])
-      })
-    )
+      }))
 
     it.effect("nesterov uses the lookahead velocity", () =>
-      Effect.gen(function* () {
+      Effect.gen(function*() {
         const optimizer = yield* Optimizer.sgd({ momentum: 0.9, nesterov: true })
         const p = yield* f32([1])
         const g = yield* f32([0.5])
         const state = yield* optimizer.init([p])
         const step1 = yield* runStep(optimizer, [p], [g], state, 0.1)
         closeTo(yield* values(step1.params[0]), [0.905])
-      })
-    )
+      }))
   })
 
   describe("adam", () => {
     it.effect("first step matches the reference formula", () =>
-      Effect.gen(function* () {
+      Effect.gen(function*() {
         const optimizer = yield* Optimizer.adam()
         const p = yield* f32([1, -1])
         const g = yield* f32([0.1, 0.2])
@@ -100,11 +95,10 @@ onDevices("Optimizer", () => (it) => {
         const step1 = yield* runStep(optimizer, [p], [g], state, 0.1)
         closeTo(yield* values(step1.params[0]), [0.90000001, -1.099999995], 1e-5)
         expect(yield* scalar(step1.state.t)).toBe(1)
-      })
-    )
+      }))
 
     it.effect("bias correction uses the step count", () =>
-      Effect.gen(function* () {
+      Effect.gen(function*() {
         const optimizer = yield* Optimizer.adam()
         const g = yield* f32([0.1])
         let params = [yield* f32([1])] as ReadonlyArray<Tensor.Any>
@@ -120,11 +114,10 @@ onDevices("Optimizer", () => (it) => {
         const vHat = v2 / (1 - 0.999 * 0.999)
         const expected = 0.90000001 - (0.1 * mHat) / (Math.sqrt(vHat) + 1e-8)
         closeTo(yield* values(params[0]), [expected], 1e-5)
-      })
-    )
+      }))
 
     it.effect("zero gradients decay the moments while the parameter follows m_hat", () =>
-      Effect.gen(function* () {
+      Effect.gen(function*() {
         const optimizer = yield* Optimizer.adam()
         const p = yield* f32([1])
         const state = yield* optimizer.init([p])
@@ -136,24 +129,22 @@ onDevices("Optimizer", () => (it) => {
         closeTo(yield* values(step2.params[0]), [expected], 1e-5)
         closeTo(yield* values(step2.state.m[0]), [0.9 * 0.05])
         closeTo(yield* values(step2.state.v[0]), [0.999 * 0.00025])
-      })
-    )
+      }))
   })
 
   describe("adamW", () => {
     it.effect("applies decoupled weight decay", () =>
-      Effect.gen(function* () {
+      Effect.gen(function*() {
         const optimizer = yield* Optimizer.adamW({ weightDecay: 0.01 })
         const p = yield* f32([1, -1])
         const g = yield* f32([0.1, 0.2])
         const state = yield* optimizer.init([p])
         const step1 = yield* runStep(optimizer, [p], [g], state, 0.1)
         closeTo(yield* values(step1.params[0]), [0.89900001, -1.098999995], 1e-5)
-      })
-    )
+      }))
 
     it.effect("weight decay scales with lr", () =>
-      Effect.gen(function* () {
+      Effect.gen(function*() {
         const plain = yield* Optimizer.adam()
         const decayed = yield* Optimizer.adamW({ weightDecay: 1 })
         const p1 = yield* f32([1])
@@ -167,18 +158,17 @@ onDevices("Optimizer", () => (it) => {
         const [a] = yield* values(r1.params[0])
         const [b] = yield* values(r2.params[0])
         expect(Math.abs(a - b - 0.1)).toBeLessThan(TOL)
-      })
-    )
+      }))
   })
 
   describe("step", () => {
     it.effect("fits a linear model and drives the loss down", () =>
-      Effect.gen(function* () {
+      Effect.gen(function*() {
         const x = yield* f32([1, 2, 2, 5, 4, 3, 5, 8], [4, 2])
         const y = yield* f32([7, 18, 16, 33], [4, 1])
         const optimizer = yield* Optimizer.adam()
         const lossOf = (w: Tensor.Any, b: Tensor.Any) =>
-          Effect.gen(function* () {
+          Effect.gen(function*() {
             const pred = yield* Tensor.add(yield* Tensor.matmul(x, w), b)
             return yield* Loss.mse(pred, y)
           })
@@ -199,11 +189,10 @@ onDevices("Optimizer", () => (it) => {
         expect(last).toBeLessThan(first * 1e-4)
         closeTo(yield* values(params[0]), [2, 3], 5e-2)
         closeTo(yield* values(params[1]), [-1], 5e-2)
-      })
-    )
+      }))
 
     it.effect("the joint walk computes the same loss as a loss-only walk", () =>
-      Effect.gen(function* () {
+      Effect.gen(function*() {
         const optimizer = yield* Optimizer.sgd()
         const p = yield* f32([1, 2, 3])
         const state = yield* optimizer.init([p])
@@ -213,11 +202,10 @@ onDevices("Optimizer", () => (it) => {
         const jointLoss = yield* scalar(result.loss)
         const aloneLoss = yield* scalar(loss)
         expect(jointLoss).toBe(aloneLoss)
-      })
-    )
+      }))
 
     it.effect("returned params and state tensors are materialized leaves, across steps", () =>
-      Effect.gen(function* () {
+      Effect.gen(function*() {
         const optimizer = yield* Optimizer.adam()
         const p = yield* f32([1, 2])
         let params: ReadonlyArray<Tensor.Any> = [p]
@@ -235,13 +223,12 @@ onDevices("Optimizer", () => (it) => {
           params = result.params
           state = result.state
         }
-      })
-    )
+      }))
   })
 
   describe("user-land optimizers", () => {
     it.effect("a custom optimizer with tensor state implements the same contract", () =>
-      Effect.gen(function* () {
+      Effect.gen(function*() {
         interface AvgState {
           readonly prev: ReadonlyArray<Tensor.Any>
         }
@@ -252,11 +239,14 @@ onDevices("Optimizer", () => (it) => {
               (prev): AvgState => ({ prev })
             ),
           step: (params, grads, state, lr) =>
-            Effect.gen(function* () {
+            Effect.gen(function*() {
               const updates: Array<Tensor.Lazy> = []
               const used: Array<Tensor.Lazy> = []
               for (let i = 0; i < params.length; i++) {
-                const g = yield* Tensor.mul(yield* Tensor.add(grads[i], state.prev[i]), yield* Tensor.constantLike(grads[i], 0.5))
+                const g = yield* Tensor.mul(
+                  yield* Tensor.add(grads[i], state.prev[i]),
+                  yield* Tensor.constantLike(grads[i], 0.5)
+                )
                 updates.push(yield* Tensor.sub(params[i], yield* Tensor.mul(g, lr)))
                 used.push(g)
               }
@@ -281,22 +271,20 @@ onDevices("Optimizer", () => (it) => {
           params = next.params
           state = next.state
         }
-      })
-    )
+      }))
   })
 
   describe("validation", () => {
     it.effect("rejects non-float parameters at init", () =>
-      Effect.gen(function* () {
+      Effect.gen(function*() {
         const p = yield* Tensor.fromTypedArray(new BigInt64Array([1n]))
         const optimizer = yield* Optimizer.sgd()
         const error = yield* Effect.flip(optimizer.init([p]))
         expect(error.message).toContain("f32 or f64")
-      })
-    )
+      }))
 
     it.effect("rejects mismatched params/grads lengths", () =>
-      Effect.gen(function* () {
+      Effect.gen(function*() {
         const optimizer = yield* Optimizer.sgd()
         const p = yield* f32([1])
         const g = yield* f32([1])
@@ -304,11 +292,10 @@ onDevices("Optimizer", () => (it) => {
         const lr = yield* Tensor.full([], 0.1, { dtype: "f32" })
         const error = yield* Effect.flip(optimizer.step([p, p], [g], state, lr))
         expect(error.message).toContain("expected 2 gradients, got 1")
-      })
-    )
+      }))
 
     it.effect("rejects state built for different parameters", () =>
-      Effect.gen(function* () {
+      Effect.gen(function*() {
         const optimizer = yield* Optimizer.adam()
         const a = yield* f32([1])
         const b = yield* f32([1, 2])
@@ -317,8 +304,7 @@ onDevices("Optimizer", () => (it) => {
         const lr = yield* Tensor.full([], 0.1, { dtype: "f32" })
         const error = yield* Effect.flip(optimizer.step([b], [g], state, lr))
         expect(error.message).toContain("use init for these parameters")
-      })
-    )
+      }))
 
     it.effect("rejects invalid configuration", () =>
       Effect.sync(() => {
@@ -331,11 +317,10 @@ onDevices("Optimizer", () => (it) => {
         expect(() => Optimizer.adam({ beta2: Number.NaN })).toThrow("beta1 and beta2")
         expect(() => Optimizer.adam({ eps: 0 })).toThrow("eps must be positive")
         expect(() => Optimizer.adam({ eps: Number.NaN })).toThrow("eps must be positive")
-      })
-    )
+      }))
 
     it.effect("rejects a non-scalar learning rate at step", () =>
-      Effect.gen(function* () {
+      Effect.gen(function*() {
         const optimizer = yield* Optimizer.adam()
         const p = yield* f32([1])
         const g = yield* f32([0.5])
@@ -343,17 +328,16 @@ onDevices("Optimizer", () => (it) => {
         const lr = yield* Tensor.full([1], 0.1, { dtype: "f32" })
         const error = yield* Effect.flip(optimizer.step([p], [g], state, lr))
         expect(error.message).toContain("0-d float tensor")
-      })
-    )
+      }))
 
     it.effect("sgd matches a reference update composed from tensor ops", () =>
-      Effect.gen(function* () {
+      Effect.gen(function*() {
         const x = yield* Tensor.fromTypedArray(floats([1, 1, 2, 1, 3, 1, 4, 1]), [4, 2])
         const y = yield* Tensor.fromTypedArray(floats([2, 3, 4, 5]), [4, 1])
         const lr = 0.05
         const momentum = 0.9
         const run = (config: { dampening?: number; nesterov?: boolean; weightDecay?: number }) =>
-          Effect.gen(function* () {
+          Effect.gen(function*() {
             let params: ReadonlyArray<Tensor.Any> = [
               yield* Tensor.fromTypedArray(floats([0.5, -0.5]))
             ]
@@ -373,7 +357,7 @@ onDevices("Optimizer", () => (it) => {
             }
           })
         const reference = (config: { dampening?: number; nesterov?: boolean; weightDecay?: number }) =>
-          Effect.gen(function* () {
+          Effect.gen(function*() {
             const dampening = config.dampening ?? 0
             const nesterov = config.nesterov ?? false
             const weightDecay = config.weightDecay ?? 0
@@ -387,16 +371,22 @@ onDevices("Optimizer", () => (it) => {
               const [grad] = yield* Gradient.grad(loss, params)
               let g: Tensor.Any = grad
               if (weightDecay !== 0) {
-                g = yield* Tensor.add(g, yield* Tensor.mul(params[0], yield* Tensor.constantLike(params[0], weightDecay)))
+                g = yield* Tensor.add(
+                  g,
+                  yield* Tensor.mul(params[0], yield* Tensor.constantLike(params[0], weightDecay))
+                )
               }
               const nextVelocity: Tensor.Any = velocity === null
                 ? g
                 : yield* Tensor.add(
-                    yield* Tensor.mul(velocity, yield* Tensor.constantLike(velocity, momentum)),
-                    yield* Tensor.mul(g, yield* Tensor.constantLike(g, 1 - dampening))
-                  )
+                  yield* Tensor.mul(velocity, yield* Tensor.constantLike(velocity, momentum)),
+                  yield* Tensor.mul(g, yield* Tensor.constantLike(g, 1 - dampening))
+                )
               const used: Tensor.Any = nesterov
-                ? yield* Tensor.add(g, yield* Tensor.mul(nextVelocity, yield* Tensor.constantLike(nextVelocity, momentum)))
+                ? yield* Tensor.add(
+                  g,
+                  yield* Tensor.mul(nextVelocity, yield* Tensor.constantLike(nextVelocity, momentum))
+                )
                 : nextVelocity
               const [nextParam, v] = yield* Tensor.compute([
                 yield* Tensor.sub(params[0], yield* Tensor.mul(used, yield* Tensor.constantLike(used, lr))),
@@ -410,13 +400,15 @@ onDevices("Optimizer", () => (it) => {
               velocity: yield* values(velocity!)
             }
           })
-        for (const config of [
-          {},
-          { dampening: 0.3 },
-          { nesterov: true },
-          { weightDecay: 0.01 },
-          { dampening: 0.1, weightDecay: 0.01 }
-        ]) {
+        for (
+          const config of [
+            {},
+            { dampening: 0.3 },
+            { nesterov: true },
+            { weightDecay: 0.01 },
+            { dampening: 0.1, weightDecay: 0.01 }
+          ]
+        ) {
           const optimizerRun = yield* run(config)
           const referenceRun = yield* reference(config)
           for (let i = 0; i < 2; i++) {
@@ -424,15 +416,14 @@ onDevices("Optimizer", () => (it) => {
             expect(Math.abs(optimizerRun.velocity[i] - referenceRun.velocity[i])).toBeLessThan(TOL)
           }
         }
-      })
-    )
+      }))
 
     it.effect("adamW matches a reference update composed from tensor ops", () =>
-      Effect.gen(function* () {
+      Effect.gen(function*() {
         const x = yield* Tensor.fromTypedArray(floats([1, 1, 2, 1, 3, 1, 4, 1]), [4, 2])
         const y = yield* Tensor.fromTypedArray(floats([2, 3, 4, 5]), [4, 1])
         const run = () =>
-          Effect.gen(function* () {
+          Effect.gen(function*() {
             let params: ReadonlyArray<Tensor.Any> = [
               yield* Tensor.fromTypedArray(floats([0, 0]))
             ]
@@ -453,7 +444,7 @@ onDevices("Optimizer", () => (it) => {
             }
           })
         const reference = () =>
-          Effect.gen(function* () {
+          Effect.gen(function*() {
             const lr = 0.05
             const beta1 = 0.9
             const beta2 = 0.999
@@ -503,21 +494,19 @@ onDevices("Optimizer", () => (it) => {
           expect(Math.abs(optimizerRun.m[i] - referenceRun.m[i])).toBeLessThan(TOL)
           expect(Math.abs(optimizerRun.v[i] - referenceRun.v[i])).toBeLessThan(TOL)
         }
-      })
-    )
+      }))
   })
 
   describe("gradient clipping", () => {
     it.effect("clipByValue clamps elementwise", () =>
-      Effect.gen(function* () {
+      Effect.gen(function*() {
         const g = yield* Tensor.fromTypedArray(floats([-5, 0.5, 10]))
         const [clipped] = yield* Optimizer.clipByValue([g], { min: -1, max: 1 })
         assert.deepStrictEqual(yield* values(clipped), [-1, 0.5, 1])
-      })
-    )
+      }))
 
     it.effect("clipByGlobalNorm scales down only above the norm", () =>
-      Effect.gen(function* () {
+      Effect.gen(function*() {
         const g1 = yield* Tensor.fromTypedArray(floats([3, 4]))
         const g2 = yield* Tensor.fromTypedArray(floats([0, 12]))
         // total norm = 13, maxNorm 6.5 -> scale 0.5
@@ -532,8 +521,7 @@ onDevices("Optimizer", () => (it) => {
         // below the norm: unchanged
         const [u1] = yield* Optimizer.clipByGlobalNorm([g1], 100)
         assert.deepStrictEqual(yield* values(u1), [3, 4])
-      })
-    )
+      }))
   })
 
   describe("schedules", () => {
@@ -557,11 +545,10 @@ onDevices("Optimizer", () => (it) => {
         expect(Math.abs(warm(9) - 0.5)).toBeLessThan(1e-12)
         expect(warm(10)).toBe(0.5)
         expect(() => LearningRate.cosine(0, { totalSteps: 10 })).toThrow()
-      })
-    )
+      }))
 
     it.effect("a scheduled adam converges", () =>
-      Effect.gen(function* () {
+      Effect.gen(function*() {
         const schedule = LearningRate.withWarmup(LearningRate.cosine(0.1, { totalSteps: 200 }), 20)
         const w = yield* Tensor.fromTypedArray(floats([0, 0]))
         const x = yield* Tensor.fromTypedArray(floats([1, 1, 2, 1, 3, 1, 4, 1]), [4, 2])
@@ -581,7 +568,6 @@ onDevices("Optimizer", () => (it) => {
           yield* Loss.mse(yield* Tensor.matmul(x, yield* Tensor.reshape(params[0], [2, 1])), y)
         )
         expect(finalLoss[0]).toBeLessThan(1e-3)
-      })
-    )
+      }))
   })
 })

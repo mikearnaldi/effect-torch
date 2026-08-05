@@ -263,7 +263,6 @@ export const makeUncompiled = <S, EL = never, RL = never, ED = never, RD = never
     clear: Effect.void
   })
 
-
 const uncompiledStep = <S, EL, RL, ED, RD, EO, RO>(
   model: Model.Model,
   config: TrainConfig<S, EL, RL, ED, RD, EO, RO>,
@@ -276,7 +275,7 @@ const uncompiledStep = <S, EL, RL, ED, RD, EO, RO>(
   Model.ModelError | Tensor.TensorError | Gradient.GradError | EL,
   CurrentDevice | RL
 > =>
-  Effect.gen(function* () {
+  Effect.gen(function*() {
     const forwardParams = config.precision === "mixedBf16"
       ? yield* Effect.all(params.map((param) => Tensor.cast(param, "bf16")))
       : params
@@ -310,7 +309,7 @@ const traceStep = <S, EL, RL, ED, RD, EO, RO>(
   Model.ModelError | Tensor.TensorError | Gradient.GradError | EL,
   CurrentDevice | RL
 > =>
-  Effect.gen(function* () {
+  Effect.gen(function*() {
     const optimizer = config.optimizer
     const paramCount = params.length
     const stateCount = stateRoots.length
@@ -356,7 +355,7 @@ const compiledStep = <S, EL, RL, ED, RD, EO, RO>(
   Model.ModelError | Tensor.TensorError | Gradient.GradError | EL,
   CurrentDevice | RL
 > =>
-  Effect.gen(function* () {
+  Effect.gen(function*() {
     const device = yield* CurrentDevice
     const optimizer = config.optimizer
     const stateRoots = optimizer.stateRoots(state)
@@ -392,7 +391,7 @@ const trainLoop = <S, EL = never, RL = never, ED = never, RD = never, EO = never
   Model.ModelError | Tensor.TensorError | Gradient.GradError | EL | ED | EO,
   CurrentDevice | RL | RD | RO
 > =>
-  Effect.gen(function* () {
+  Effect.gen(function*() {
     if (config.precision === "mixedBf16" && (yield* CurrentDevice) !== "metal") {
       return yield* new Model.ModelError({
         op: "train",

@@ -1,7 +1,7 @@
-import { Duration, Effect } from "effect"
-import { NodeRuntime } from "@effect/platform-node"
 import type { Model } from "@effect-torch/core"
 import { Checkpoint, Device, LearningRate, Loss, Optimizer, Sampler, Tensor, Trainer } from "@effect-torch/core"
+import { NodeRuntime } from "@effect/platform-node"
+import { Duration, Effect } from "effect"
 import fs from "node:fs"
 import {
   BLOCK,
@@ -37,7 +37,7 @@ const CHECKPOINT_EVERY = 100
 const PRECISION: Trainer.Precision = "mixedBf16"
 const VAL_BATCHES = 40
 
-const program = Effect.gen(function* () {
+const program = Effect.gen(function*() {
   const train = loadBin(TRAIN_BIN)
   const val = loadBin(VAL_BIN)
   const tokenizer = yield* loadTokenizer
@@ -59,7 +59,7 @@ const program = Effect.gen(function* () {
     ),
     loss: Loss.crossEntropy,
     data: () =>
-      Effect.gen(function* () {
+      Effect.gen(function*() {
         const { inputs, targets } = windows(train, sampler.next(), BATCH, BLOCK)
         return {
           input: yield* Tensor.fromTypedArray(inputs, [BATCH, BLOCK]),
@@ -69,33 +69,37 @@ const program = Effect.gen(function* () {
     stop: ({ step }) => step >= chunkTarget,
     precision: PRECISION,
     onStep: ({ step, loss, elapsed }) =>
-      Effect.log(`step ${String(step).padStart(5)}/${totalSteps}  loss ${loss.toFixed(4)}  ${(Duration.toMillis(elapsed) / 1000).toFixed(1)}s`)
+      Effect.log(
+        `step ${String(step).padStart(5)}/${totalSteps}  loss ${loss.toFixed(4)}  ${
+          (Duration.toMillis(elapsed) / 1000).toFixed(1)
+        }s`
+      )
   })
 
-// A saved epoch checkpoint resumes bit-exactly; otherwise start from the
-// pilot's parameters with fresh optimizer state at step 0, falling back to
-// the model's initial (random) parameters when no pilot exists.
-let params: Model.Params
-let step = 0
-let resume: Trainer.Resume<Optimizer.AdamState> | undefined
-let epoch = 1
-if (fs.existsSync(CKPT)) {
-  const checkpoint = yield* Checkpoint.loadWithSampler(CKPT, trainer)
-  sampler = yield* Sampler.restore(samplerConfig, checkpoint.sampler)
-  params = checkpoint.params
-  resume = checkpoint.resume
-  step = checkpoint.resume.step
-  epoch = checkpoint.sampler.epoch
-  yield* Effect.log(`resuming epoch ${epoch} from step ${step}`)
-} else if (fs.existsSync(CHECKPOINT)) {
-  sampler = yield* Sampler.make(samplerConfig)
-  params = yield* loadParams(model, CHECKPOINT)
-  yield* Effect.log(`warm start from ${CHECKPOINT}`)
-} else {
-  sampler = yield* Sampler.make(samplerConfig)
-  params = yield* model.init
-  yield* Effect.log(`cold start from random init (no checkpoint at ${CHECKPOINT})`)
-}
+  // A saved epoch checkpoint resumes bit-exactly; otherwise start from the
+  // pilot's parameters with fresh optimizer state at step 0, falling back to
+  // the model's initial (random) parameters when no pilot exists.
+  let params: Model.Params
+  let step = 0
+  let resume: Trainer.Resume<Optimizer.AdamState> | undefined
+  let epoch = 1
+  if (fs.existsSync(CKPT)) {
+    const checkpoint = yield* Checkpoint.loadWithSampler(CKPT, trainer)
+    sampler = yield* Sampler.restore(samplerConfig, checkpoint.sampler)
+    params = checkpoint.params
+    resume = checkpoint.resume
+    step = checkpoint.resume.step
+    epoch = checkpoint.sampler.epoch
+    yield* Effect.log(`resuming epoch ${epoch} from step ${step}`)
+  } else if (fs.existsSync(CHECKPOINT)) {
+    sampler = yield* Sampler.make(samplerConfig)
+    params = yield* loadParams(model, CHECKPOINT)
+    yield* Effect.log(`warm start from ${CHECKPOINT}`)
+  } else {
+    sampler = yield* Sampler.make(samplerConfig)
+    params = yield* model.init
+    yield* Effect.log(`cold start from random init (no checkpoint at ${CHECKPOINT})`)
+  }
   yield* Effect.log(
     `2) training one epoch: ${totalSteps} steps, batch ${BATCH}, warmup ${warmupSteps} then cosine ${PEAK_LR} → ${MIN_LR} (checkpoint every ${CHECKPOINT_EVERY})`
   )

@@ -15,7 +15,7 @@
  */
 import { Data, Effect } from "effect"
 import type * as Device from "./Device.ts"
-import * as Model from "./Model.ts"
+import type * as Model from "./Model.ts"
 import type * as Sampler from "./Sampler.ts"
 import * as Tensor from "./Tensor.ts"
 import type * as Trainer from "./Trainer.ts"
@@ -71,7 +71,7 @@ export const save = <S, EL, RL, ED, RD, EO, RO>(
   trainer: Trainer.Trainer<S, EL, RL, ED, RD, EO, RO>,
   trained: Trainer.Trained<S>
 ): Effect.Effect<void, Tensor.TensorError, Device.CurrentDevice> =>
-  Effect.gen(function* () {
+  Effect.gen(function*() {
     const entries = yield* trainerEntries(trainer, trained)
     yield* Tensor.save(path, entries)
   })
@@ -89,7 +89,7 @@ export const saveWithSampler = <S, EL, RL, ED, RD, EO, RO>(
   trained: Trainer.Trained<S>,
   sampler: Sampler.Sampler
 ): Effect.Effect<void, Tensor.TensorError, Device.CurrentDevice> =>
-  Effect.gen(function* () {
+  Effect.gen(function*() {
     const entries = yield* trainerEntries(trainer, trained)
     const state = sampler.state()
     entries[SAMPLER_ORDER_KEY] = yield* Tensor.fromTypedArray(state.order, [state.order.length])
@@ -110,7 +110,7 @@ export const load = <S, EL, RL, ED, RD, EO, RO>(
   path: string,
   trainer: Trainer.Trainer<S, EL, RL, ED, RD, EO, RO>
 ): Effect.Effect<Checkpoint<S>, CheckpointError | Tensor.TensorError, Device.CurrentDevice> =>
-  Effect.gen(function* () {
+  Effect.gen(function*() {
     const tensors = yield* Tensor.load(path)
     const checkpoint = yield* trainerCheckpoint(path, trainer, tensors)
     return checkpoint
@@ -126,7 +126,7 @@ export const loadWithSampler = <S, EL, RL, ED, RD, EO, RO>(
   path: string,
   trainer: Trainer.Trainer<S, EL, RL, ED, RD, EO, RO>
 ): Effect.Effect<CheckpointWithSampler<S>, CheckpointError | Tensor.TensorError, Device.CurrentDevice> =>
-  Effect.gen(function* () {
+  Effect.gen(function*() {
     const tensors = yield* Tensor.load(path)
     const checkpoint = yield* trainerCheckpoint(path, trainer, tensors)
     const orderTensor = yield* required(path, tensors, SAMPLER_ORDER_KEY)
@@ -142,7 +142,7 @@ const trainerEntries = <S, EL, RL, ED, RD, EO, RO>(
   trainer: Trainer.Trainer<S, EL, RL, ED, RD, EO, RO>,
   trained: Trainer.Trained<S>
 ): Effect.Effect<Record<string, Tensor.Any>, Tensor.TensorError, Device.CurrentDevice> =>
-  Effect.gen(function* () {
+  Effect.gen(function*() {
     const entries: Record<string, Tensor.Any> = Object.fromEntries(
       trainer.model.names.map((name, i) => [`${PARAM_PREFIX}${name}`, trained.params[i]])
     )
@@ -169,7 +169,7 @@ const trainerCheckpoint = <S, EL, RL, ED, RD, EO, RO>(
   trainer: Trainer.Trainer<S, EL, RL, ED, RD, EO, RO>,
   tensors: Record<string, Tensor.Concrete>
 ): Effect.Effect<Checkpoint<S>, CheckpointError | Tensor.TensorError, Device.CurrentDevice> =>
-  Effect.gen(function* () {
+  Effect.gen(function*() {
     const optimizer = trainer.config.optimizer
     const params: Array<Tensor.Any> = []
     for (const name of trainer.model.names) {

@@ -7,8 +7,8 @@
  *
  * @since 0.1.0
  */
-import { Data, Effect } from "effect"
 import native from "@effect-torch/native"
+import { Data, Effect } from "effect"
 import type { CurrentDevice } from "./Device.ts"
 import * as Tensor from "./Tensor.ts"
 
@@ -24,7 +24,8 @@ export class GradError extends Data.TaggedError("GradError")<{
   readonly detail: string
 }> {}
 
-const isFloatDtype = (dtype: string): boolean => dtype === "f32" || dtype === "f64" || dtype === "f16" || dtype === "bf16"
+const isFloatDtype = (dtype: string): boolean =>
+  dtype === "f32" || dtype === "f64" || dtype === "f16" || dtype === "bf16"
 
 const toGradError = (error: unknown): GradError => {
   const detail = error instanceof Error ? error.message : String(error)
@@ -58,7 +59,7 @@ export const grad = (
   loss: Tensor.Any,
   wrt: ReadonlyArray<Tensor.Any>
 ): Effect.Effect<Array<Tensor.Lazy>, GradError> =>
-  Effect.gen(function* () {
+  Effect.gen(function*() {
     if (loss.shape.length !== 0) {
       return yield* new GradError({
         reason: "non-scalar-output",
@@ -75,7 +76,8 @@ export const grad = (
       if (!isFloatDtype(target.dtype)) {
         return yield* new GradError({
           reason: "non-float-dtype",
-          detail: `grad: cannot differentiate with respect to ${target.dtype} tensor, only f32 and f64 are differentiable`
+          detail:
+            `grad: cannot differentiate with respect to ${target.dtype} tensor, only f32 and f64 are differentiable`
         })
       }
     }
@@ -136,7 +138,7 @@ const checkSameShapeDtype = (
   b: Tensor.Any,
   bName: string
 ): Effect.Effect<void, Tensor.TensorError> =>
-  Effect.gen(function* () {
+  Effect.gen(function*() {
     if (a.shape.length !== b.shape.length || !a.shape.every((d, i) => d === b.shape[i])) {
       return yield* new Tensor.TensorError({
         op,
@@ -165,7 +167,7 @@ export const vjp = (
   x: Tensor.Any,
   v: Tensor.Any
 ): Effect.Effect<Tensor.Lazy, Tensor.TensorError | GradError> =>
-  Effect.gen(function* () {
+  Effect.gen(function*() {
     yield* checkSameShapeDtype("vjp", y, v, "cotangent")
     const loss = yield* Tensor.sum(yield* Tensor.mul(y, yield* stopGradient(v)))
     const [pullback] = yield* grad(loss, [x])
@@ -187,7 +189,7 @@ export const jvp = (
   x: Tensor.Any,
   v: Tensor.Any
 ): Effect.Effect<Tensor.Lazy, Tensor.TensorError | GradError, CurrentDevice> =>
-  Effect.gen(function* () {
+  Effect.gen(function*() {
     yield* checkSameShapeDtype("jvp", x, v, "tangent")
     // u is a free linearization point: g(u) = J(x)ᵀ u is linear in u, and
     // its own vjp at u = 0 with cotangent v is J(x) v

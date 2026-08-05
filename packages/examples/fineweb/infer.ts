@@ -1,6 +1,6 @@
-import { Effect, Option } from "effect"
-import { NodeRuntime } from "@effect/platform-node"
 import { Device, Model, Tensor } from "@effect-torch/core"
+import { NodeRuntime } from "@effect/platform-node"
+import { Effect, Option } from "effect"
 import { BLOCK, createGpt, EOT, loadParams, loadTokenizer } from "./model.js"
 
 // FineWeb inference: loads the checkpoint saved by train.ts and
@@ -29,7 +29,7 @@ const sampleCategorical = (probs: ReadonlyArray<number>, temperature: number) =>
   return scaled.length - 1
 }
 
-const program = Effect.gen(function* () {
+const program = Effect.gen(function*() {
   const tokenizer = yield* loadTokenizer
   const eotId = Option.getOrThrow(tokenizer.tokenToId(EOT))
   const model = yield* createGpt(tokenizer.vocabSize)

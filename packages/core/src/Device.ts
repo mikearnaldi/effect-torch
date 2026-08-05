@@ -1,5 +1,5 @@
-import { Context, Effect, Layer } from "effect"
 import native from "@effect-torch/native"
+import { Context, Effect, Layer } from "effect"
 
 /**
  * Devices supported by the native backend.
@@ -27,8 +27,7 @@ export class CurrentDevice extends Context.Service<CurrentDevice, DeviceKind>()(
  * @since 0.1.0
  * @category layers
  */
-export const layer = (device: DeviceKind): Layer.Layer<CurrentDevice> =>
-  Layer.succeed(CurrentDevice, device)
+export const layer = (device: DeviceKind): Layer.Layer<CurrentDevice> => Layer.succeed(CurrentDevice, device)
 
 /**
  * Provides {@link CurrentDevice} with the CPU device.
@@ -64,7 +63,7 @@ export const isAvailable = (device: DeviceKind): Effect.Effect<boolean> =>
  */
 export const Best: Layer.Layer<CurrentDevice> = Layer.effect(
   CurrentDevice,
-  Effect.gen(function* () {
+  Effect.gen(function*() {
     if (yield* isAvailable("metal")) return "metal" as const
     return "cpu" as const
   })

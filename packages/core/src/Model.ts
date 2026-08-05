@@ -142,9 +142,11 @@ interface ModelDef {
   readonly forward: Model["forward"]
 }
 
-type ModelInternal = {
-  -readonly [K in keyof Model]: Model[K]
-} & { _fn: Tensor.CompiledFn<ModelError | Tensor.TensorError, CurrentDevice> | undefined }
+type ModelInternal =
+  & {
+    -readonly [K in keyof Model]: Model[K]
+  }
+  & { _fn: Tensor.CompiledFn<ModelError | Tensor.TensorError, CurrentDevice> | undefined }
 
 // Every model is compiled: `execute` runs the forward as a frozen
 // program on the shared prototype; the program cache is created on the
@@ -153,7 +155,7 @@ type ModelInternal = {
 const ModelProto = {
   execute(this: ModelInternal, params: Params, input: Tensor.Any) {
     const self = this
-    return Effect.gen(function* () {
+    return Effect.gen(function*() {
       yield* checkArity("execute", self.names, params)
       if (self._fn === undefined) {
         self._fn = yield* Tensor.compile<ModelError | Tensor.TensorError, CurrentDevice>(
@@ -203,9 +205,9 @@ const checkArity = (
   params.length === names.length
     ? Effect.void
     : new ModelError({
-        op: "forward",
-        message: `${who}: expected ${names.length} parameters [${names.join(", ")}], got ${params.length}`
-      })
+      op: "forward",
+      message: `${who}: expected ${names.length} parameters [${names.join(", ")}], got ${params.length}`
+    })
 
 const parameterless = (
   apply: (self: Tensor.Any) => Effect.Effect<Tensor.Lazy, Tensor.TensorError, CurrentDevice>
@@ -231,21 +233,21 @@ export const linear = (
   inFeatures: number,
   outFeatures: number
 ): Effect.Effect<Model, ModelError> =>
-  Effect.gen(function* () {
+  Effect.gen(function*() {
     yield* checkName("linear", name)
     yield* checkPositiveInt("linear", "inFeatures", inFeatures)
     yield* checkPositiveInt("linear", "outFeatures", outFeatures)
     const names = [`${name}.weight`, `${name}.bias`]
     return make({
       names,
-      init: Effect.gen(function* () {
+      init: Effect.gen(function*() {
         const drawn = yield* Tensor.randn([inFeatures, outFeatures])
         const weight = yield* Tensor.mul(drawn, yield* Tensor.constantLike(drawn, 1 / Math.sqrt(inFeatures)))
         const bias = yield* Tensor.zeros([1, outFeatures])
         return [weight, bias] as const
       }),
       forward: (params, input) =>
-        Effect.gen(function* () {
+        Effect.gen(function*() {
           yield* checkArity(name, names, params)
           const [weight, bias] = params
           return yield* Tensor.linear(input, weight, bias)
@@ -273,7 +275,7 @@ export const conv1d = (
   kernelSize: number,
   options: Tensor.ConvOptions = {}
 ): Effect.Effect<Model, ModelError> =>
-  Effect.gen(function* () {
+  Effect.gen(function*() {
     yield* checkName("conv1d", name)
     yield* checkPositiveInt("conv1d", "inChannels", inChannels)
     yield* checkPositiveInt("conv1d", "outChannels", outChannels)
@@ -290,14 +292,14 @@ export const conv1d = (
     const fanIn = (inChannels / groups) * kernelSize
     return make({
       names,
-      init: Effect.gen(function* () {
+      init: Effect.gen(function*() {
         const drawn = yield* Tensor.randn([outChannels, inChannels / groups, kernelSize])
         const weight = yield* Tensor.mul(drawn, yield* Tensor.constantLike(drawn, 1 / Math.sqrt(fanIn)))
         const bias = yield* Tensor.zeros([outChannels])
         return [weight, bias] as const
       }),
       forward: (params, input) =>
-        Effect.gen(function* () {
+        Effect.gen(function*() {
           yield* checkArity(name, names, params)
           const [weight, bias] = params
           const out = yield* Tensor.conv1d(input, weight, options)
@@ -326,7 +328,7 @@ export const conv2d = (
   kernelSize: number | readonly [number, number],
   options: Tensor.ConvOptions = {}
 ): Effect.Effect<Model, ModelError> =>
-  Effect.gen(function* () {
+  Effect.gen(function*() {
     yield* checkName("conv2d", name)
     yield* checkPositiveInt("conv2d", "inChannels", inChannels)
     yield* checkPositiveInt("conv2d", "outChannels", outChannels)
@@ -345,14 +347,14 @@ export const conv2d = (
     const fanIn = (inChannels / groups) * kh * kw
     return make({
       names,
-      init: Effect.gen(function* () {
+      init: Effect.gen(function*() {
         const drawn = yield* Tensor.randn([outChannels, inChannels / groups, kh, kw])
         const weight = yield* Tensor.mul(drawn, yield* Tensor.constantLike(drawn, 1 / Math.sqrt(fanIn)))
         const bias = yield* Tensor.zeros([outChannels])
         return [weight, bias] as const
       }),
       forward: (params, input) =>
-        Effect.gen(function* () {
+        Effect.gen(function*() {
           yield* checkArity(name, names, params)
           const [weight, bias] = params
           const out = yield* Tensor.conv2d(input, weight, options)
@@ -379,7 +381,7 @@ export const embedding = (
   embeddingDim: number,
   options: { readonly paddingIndex?: number } = {}
 ): Effect.Effect<Model, ModelError> =>
-  Effect.gen(function* () {
+  Effect.gen(function*() {
     yield* checkName("embedding", name)
     yield* checkPositiveInt("embedding", "numEmbeddings", numEmbeddings)
     yield* checkPositiveInt("embedding", "embeddingDim", embeddingDim)
@@ -396,12 +398,12 @@ export const embedding = (
     const names = [`${name}.weight`]
     return make({
       names,
-      init: Effect.gen(function* () {
+      init: Effect.gen(function*() {
         const weight = yield* Tensor.randn([numEmbeddings, embeddingDim])
         return [weight] as const
       }),
       forward: (params, input) =>
-        Effect.gen(function* () {
+        Effect.gen(function*() {
           yield* checkArity(name, names, params)
           return yield* Tensor.embedding(input, {
             weight: params[0],
@@ -428,19 +430,19 @@ export const positionEmbedding = (
   maxPositions: number,
   embeddingDim: number
 ): Effect.Effect<Model, ModelError> =>
-  Effect.gen(function* () {
+  Effect.gen(function*() {
     yield* checkName("positionEmbedding", name)
     yield* checkPositiveInt("positionEmbedding", "maxPositions", maxPositions)
     yield* checkPositiveInt("positionEmbedding", "embeddingDim", embeddingDim)
     const names = [`${name}.weight`]
     return make({
       names,
-      init: Effect.gen(function* () {
+      init: Effect.gen(function*() {
         const weight = yield* Tensor.randn([maxPositions, embeddingDim])
         return [weight] as const
       }),
       forward: (params, input) =>
-        Effect.gen(function* () {
+        Effect.gen(function*() {
           yield* checkArity(name, names, params)
           const t = input.shape.length === 0 ? 0 : input.shape[input.shape.length - 1]
           if (t > maxPositions) {
@@ -471,7 +473,7 @@ export const layerNorm = (
   normalizedShape: number | ReadonlyArray<number>,
   options: { readonly eps?: number } = {}
 ): Effect.Effect<Model, ModelError> =>
-  Effect.gen(function* () {
+  Effect.gen(function*() {
     yield* checkName("layerNorm", name)
     const shape: ReadonlyArray<number> = typeof normalizedShape === "number" ? [normalizedShape] : normalizedShape
     if (shape.length === 0) {
@@ -487,13 +489,13 @@ export const layerNorm = (
     const names = [`${name}.weight`, `${name}.bias`]
     return make({
       names,
-      init: Effect.gen(function* () {
+      init: Effect.gen(function*() {
         const weight = yield* Tensor.ones(shape)
         const bias = yield* Tensor.zeros(shape)
         return [weight, bias] as const
       }),
       forward: (params, input) =>
-        Effect.gen(function* () {
+        Effect.gen(function*() {
           yield* checkArity(name, names, params)
           const [weight, bias] = params
           return yield* Tensor.layerNorm(input, weight, bias, eps)
@@ -541,7 +543,7 @@ export const multiHeadAttention = (
   numHeads: number,
   options: MultiHeadAttentionOptions = {}
 ): Effect.Effect<Model, ModelError> =>
-  Effect.gen(function* () {
+  Effect.gen(function*() {
     yield* checkName("multiHeadAttention", name)
     yield* checkPositiveInt("multiHeadAttention", "embedDim", embedDim)
     yield* checkPositiveInt("multiHeadAttention", "numHeads", numHeads)
@@ -564,7 +566,7 @@ export const multiHeadAttention = (
     const causal = options.causal ?? false
     return make({
       names,
-      init: Effect.gen(function* () {
+      init: Effect.gen(function*() {
         const qkvDrawn = yield* Tensor.randn([embedDim, 3 * embedDim])
         const qkvWeight = yield* Tensor.mul(qkvDrawn, yield* Tensor.constantLike(qkvDrawn, 1 / Math.sqrt(embedDim)))
         const qkvBias = yield* Tensor.zeros([1, 3 * embedDim])
@@ -574,7 +576,7 @@ export const multiHeadAttention = (
         return [qkvWeight, qkvBias, woWeight, woBias] as const
       }),
       forward: (params, input) =>
-        Effect.gen(function* () {
+        Effect.gen(function*() {
           yield* checkArity(name, names, params)
           const [qkvWeight, qkvBias, woWeight, woBias] = params
           const rank = input.shape.length
@@ -582,7 +584,7 @@ export const multiHeadAttention = (
           const leading = input.shape.slice(0, -2)
           // [..., T, E] -> [..., T, H, Dh] -> [..., H, T, Dh]
           const splitHeads = (x: Tensor.Any) =>
-            Effect.gen(function* () {
+            Effect.gen(function*() {
               const reshaped = yield* Tensor.reshape(x, [...leading, t, numHeads, headDim])
               const perm = Array.from({ length: rank + 1 }, (_, i) => i)
               perm[rank - 2] = rank - 1
@@ -591,7 +593,7 @@ export const multiHeadAttention = (
             })
           // [..., H, T, Dh] -> [..., T, H, Dh] -> [..., T, E]
           const mergeHeads = (x: Tensor.Any) =>
-            Effect.gen(function* () {
+            Effect.gen(function*() {
               const perm = Array.from({ length: rank + 1 }, (_, i) => i)
               perm[rank - 2] = rank - 1
               perm[rank - 1] = rank - 2
@@ -755,7 +757,7 @@ export const flatten = (
  * @category constructors
  */
 export const dropout = (options: Tensor.DropoutOptions = {}): Effect.Effect<Model, ModelError> =>
-  Effect.gen(function* () {
+  Effect.gen(function*() {
     const p = options.p ?? 0.5
     if (p < 0 || p >= 1) {
       return yield* new ModelError({ op: "dropout", message: `p must be in [0, 1), got ${p}` })
@@ -775,7 +777,7 @@ const pool = (
   ) => Effect.Effect<Tensor.Lazy, Tensor.TensorError, CurrentDevice>,
   options: Tensor.PoolOptions
 ): Effect.Effect<Model, ModelError> =>
-  Effect.gen(function* () {
+  Effect.gen(function*() {
     const [kh, kw] = typeof options.kernelSize === "number"
       ? [options.kernelSize, options.kernelSize] as const
       : options.kernelSize
@@ -871,7 +873,7 @@ export const residual = (model: Model): Effect.Effect<Model> =>
     names: model.names,
     init: model.init,
     forward: (params, input) =>
-      Effect.gen(function* () {
+      Effect.gen(function*() {
         const out = yield* model.forward(params, input)
         return yield* Tensor.add(input, out)
       })
@@ -939,7 +941,7 @@ export const merge = <const M extends ReadonlyArray<Model>>(
   const arities = models.map((model) => model.names.length)
   return Effect.succeed(make({
     names,
-    init: Effect.gen(function* () {
+    init: Effect.gen(function*() {
       const params: Array<Tensor.Any> = []
       for (const model of models) {
         params.push(...(yield* model.init))
@@ -947,7 +949,7 @@ export const merge = <const M extends ReadonlyArray<Model>>(
       return params
     }),
     forward: (params, input) =>
-      Effect.gen(function* () {
+      Effect.gen(function*() {
         yield* checkArity("merge", names, params)
         const outputs: Array<Tensor.Lazy> = []
         let offset = 0
@@ -974,14 +976,13 @@ export const merge = <const M extends ReadonlyArray<Model>>(
  */
 export const add = (...models: ReadonlyArray<Model>): Effect.Effect<Model, ModelError> =>
   merge(models, (first, ...rest) =>
-    Effect.gen(function* () {
+    Effect.gen(function*() {
       let acc: Tensor.Any = first
       for (const output of rest) {
         acc = yield* Tensor.add(acc, output)
       }
       return acc as Tensor.Lazy
-    })
-  )
+    }))
 
 /**
  * Composes models into a single model that threads its input through each
@@ -1019,7 +1020,7 @@ export const chain = (...models: ReadonlyArray<Model>): Effect.Effect<Model, Mod
   const arities = models.map((model) => model.names.length)
   return Effect.succeed(make({
     names,
-    init: Effect.gen(function* () {
+    init: Effect.gen(function*() {
       const params: Array<Tensor.Any> = []
       for (const model of models) {
         params.push(...(yield* model.init))
@@ -1027,7 +1028,7 @@ export const chain = (...models: ReadonlyArray<Model>): Effect.Effect<Model, Mod
       return params
     }),
     forward: (params, input) =>
-      Effect.gen(function* () {
+      Effect.gen(function*() {
         yield* checkArity("chain", names, params)
         let current: Tensor.Any = input
         let offset = 0
@@ -1056,13 +1057,13 @@ export const save = (
 ): Effect.Effect<void, ModelError | Tensor.TensorError> =>
   params.length !== model.names.length
     ? new ModelError({
-        op: "save",
-        message: `model has ${model.names.length} parameters, got ${params.length}`
-      })
+      op: "save",
+      message: `model has ${model.names.length} parameters, got ${params.length}`
+    })
     : Tensor.save(
-        path,
-        Object.fromEntries(model.names.map((name, i) => [name, params[i]]))
-      )
+      path,
+      Object.fromEntries(model.names.map((name, i) => [name, params[i]]))
+    )
 
 /**
  * Loads a model's parameters from a safetensors file written by
@@ -1078,7 +1079,7 @@ export const load = (
   model: Model,
   path: string
 ): Effect.Effect<ReadonlyArray<Tensor.Concrete>, ModelError | Tensor.TensorError, CurrentDevice> =>
-  Effect.gen(function* () {
+  Effect.gen(function*() {
     const record = yield* Tensor.load(path)
     const params: Array<Tensor.Concrete> = []
     for (const name of model.names) {
@@ -1093,7 +1094,6 @@ export const load = (
     }
     return params
   })
-
 
 /**
  * A failure in inference-artifact construction or generation (RFC
@@ -1287,7 +1287,7 @@ export const inference = (
   params: Params,
   config: InferenceConfig
 ): Effect.Effect<InferenceProgram, InferenceError | ModelError | Tensor.TensorError, CurrentDevice> =>
-  Effect.gen(function* () {
+  Effect.gen(function*() {
     yield* checkArity("inference", model.names, params)
     const device = yield* CurrentDevice
     // Freeze the weights: params may be lazy graphs (init draws), and a
@@ -1333,7 +1333,7 @@ export const inference = (
     // cacheable attention, non-causal attention) surface here rather
     // than on first use.
     const trace = (inputShape: ReadonlyArray<number>, batch?: number) =>
-      Effect.gen(function* () {
+      Effect.gen(function*() {
         const exemplar = yield* Tensor.zeros(inputShape, { dtype: tokenDtype })
         const placeholders: Array<Tensor.Lazy> = []
         for (let i = 0; i < frozenParams.length; i++) {
@@ -1377,15 +1377,14 @@ export const inference = (
           tokens.dtype === "u32" ? Effect.succeed(tokens) : Tensor.cast(tokens, "u32"),
           Tensor.toNumberArray
         ),
-        (error) =>
-          new InferenceError({ op, message: `token ids must be readable integers: ${error.message}` })
+        (error) => new InferenceError({ op, message: `token ids must be readable integers: ${error.message}` })
       )
     interface LiveEntry {
       readonly seq: GenerationSeq
       readonly native: Tensor.NativeKvSequence
     }
     const lastLogits = (op: "prefill" | "step", output: Tensor.Concrete, row: number) =>
-      Effect.gen(function* () {
+      Effect.gen(function*() {
         const rank = output.shape.length
         if (rank < 2) {
           return yield* new InferenceError({
@@ -1410,11 +1409,11 @@ export const inference = (
       )
     const self: InferenceProgram = {
       generation: () =>
-        Effect.gen(function* () {
+        Effect.gen(function*() {
           const roundLock = yield* Semaphore.make(1)
           const live: Array<LiveEntry> = []
           const add = (prompt: Tensor.Any) =>
-            Effect.gen(function* () {
+            Effect.gen(function*() {
               if (live.length >= decodeBatch) {
                 return yield* new InferenceError({
                   op: "add",
@@ -1478,7 +1477,7 @@ export const inference = (
             add,
             step: (entries) =>
               roundLock.withPermits(1)(
-                Effect.gen(function* () {
+                Effect.gen(function*() {
                   if (entries.length === 0) {
                     return yield* new InferenceError({
                       op: "step",

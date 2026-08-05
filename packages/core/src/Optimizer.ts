@@ -39,7 +39,7 @@
  * @since 0.1.0
  */
 import { Effect } from "effect"
-import { CurrentDevice } from "./Device.ts"
+import type { CurrentDevice } from "./Device.ts"
 import * as Gradient from "./Gradient.ts"
 import * as Tensor from "./Tensor.ts"
 
@@ -173,8 +173,7 @@ const isFloat = (dtype: Tensor.DType): boolean => dtype === "f32" || dtype === "
 // eval arms cast (and copy, for 0-d scalars the copy is free) to the
 // parameter dtype/device. The sgd `first` flag is precision-irrelevant and
 // stays on the parameter device in the parameter's precision family.
-const scalarDtype = (params: ReadonlyArray<Tensor.Any>): Tensor.DType =>
-  params[0]?.dtype === "f64" ? "f64" : "f32"
+const scalarDtype = (params: ReadonlyArray<Tensor.Any>): Tensor.DType => params[0]?.dtype === "f64" ? "f64" : "f32"
 
 // The step count lives on the ambient device like every other state
 // tensor — never a hidden device override. Its dtype follows the
@@ -190,9 +189,9 @@ const checkLr = (op: string, lr: Tensor.Any): Effect.Effect<void, Tensor.TensorE
   lr.shape.length === 0 && isFloat(lr.dtype)
     ? Effect.void
     : new Tensor.TensorError({
-        op,
-        message: `${op}: lr must be a 0-d float tensor, got shape [${lr.shape}] ${lr.dtype}`
-      })
+      op,
+      message: `${op}: lr must be a 0-d float tensor, got shape [${lr.shape}] ${lr.dtype}`
+    })
 
 const checkParams = (
   op: string,
@@ -249,7 +248,8 @@ const checkStateLength = (
   if (state.length !== params.length) {
     return new Tensor.TensorError({
       op,
-      message: `${op}: state holds ${state.length} ${kind} tensors for ${params.length} parameters, use init for these parameters`
+      message:
+        `${op}: state holds ${state.length} ${kind} tensors for ${params.length} parameters, use init for these parameters`
     })
   }
   for (let i = 0; i < params.length; i++) {
@@ -285,7 +285,7 @@ export const sgd = (config: SgdConfig = {}): Effect.Effect<Optimizer<SgdState>> 
 
   return Effect.succeed({
     init: (params) =>
-      Effect.gen(function* () {
+      Effect.gen(function*() {
         yield* checkParams("sgd", params)
         const velocity: Array<Tensor.Any> = []
         if (momentum !== 0) {
@@ -297,7 +297,7 @@ export const sgd = (config: SgdConfig = {}): Effect.Effect<Optimizer<SgdState>> 
         return { velocity, first } satisfies SgdState
       }),
     step: (params, grads, state, lr) =>
-      Effect.gen(function* () {
+      Effect.gen(function*() {
         yield* checkParams("sgd", params)
         yield* checkGrads("sgd", params, grads)
         yield* checkLr("sgd", lr)
@@ -383,7 +383,7 @@ const makeAdam = (op: string, config: ResolvedAdamConfig): Effect.Effect<Optimiz
 
   return Effect.succeed({
     init: (params) =>
-      Effect.gen(function* () {
+      Effect.gen(function*() {
         yield* checkParams(op, params)
         const m: Array<Tensor.Any> = []
         const v: Array<Tensor.Any> = []
@@ -395,7 +395,7 @@ const makeAdam = (op: string, config: ResolvedAdamConfig): Effect.Effect<Optimiz
         return { m, v, t } satisfies AdamState
       }),
     step: (params, grads, state, lr) =>
-      Effect.gen(function* () {
+      Effect.gen(function*() {
         yield* checkParams(op, params)
         yield* checkGrads(op, params, grads)
         yield* checkLr(op, lr)
@@ -509,7 +509,7 @@ export const clipByValue = (
   grads: ReadonlyArray<Tensor.Any>,
   options: { readonly min?: number; readonly max?: number }
 ): Effect.Effect<Array<Tensor.Lazy>, Tensor.TensorError> =>
-  Effect.gen(function* () {
+  Effect.gen(function*() {
     if (options.min === undefined && options.max === undefined) {
       return yield* new Tensor.TensorError({
         op: "clipByValue",
@@ -537,7 +537,7 @@ export const clipByGlobalNorm = (
   grads: ReadonlyArray<Tensor.Any>,
   maxNorm: number
 ): Effect.Effect<Array<Tensor.Lazy>, Tensor.TensorError> =>
-  Effect.gen(function* () {
+  Effect.gen(function*() {
     if (maxNorm <= 0) {
       return yield* new Tensor.TensorError({
         op: "clipByGlobalNorm",
@@ -606,7 +606,7 @@ export const step = <S, P extends ReadonlyArray<Tensor.Any>>(
   { readonly loss: Tensor.Concrete; readonly params: Materialized<P>; readonly state: S },
   Gradient.GradError | Tensor.TensorError
 > =>
-  Effect.gen(function* () {
+  Effect.gen(function*() {
     const grads = yield* Gradient.grad(loss, params)
     const next = yield* optimizer.step(params, grads, state, lr)
     const evaluated = yield* Tensor.compute([loss, ...next.params, ...next.stateRoots])

@@ -3,7 +3,18 @@ import { Effect } from "effect"
 import * as fs from "node:fs"
 import * as os from "node:os"
 import * as path from "node:path"
-import { Checkpoint, Device, Gradient, LearningRate, Loss, Model, Optimizer, Sampler, Tensor, Trainer } from "../src/index.ts"
+import {
+  Checkpoint,
+  Device,
+  Gradient,
+  LearningRate,
+  Loss,
+  Model,
+  Optimizer,
+  Sampler,
+  Tensor,
+  Trainer
+} from "../src/index.ts"
 import { floats, onDevices } from "./utils/devices.ts"
 
 const tmpdir = Effect.sync(() => fs.mkdtempSync(path.join(os.tmpdir(), "effect-torch-")))
@@ -13,7 +24,7 @@ const values = (t: Tensor.Any) =>
 
 onDevices("Checkpoint", () => (it) => {
   it.effect("round-trips tensors of every dtype", () =>
-    Effect.gen(function* () {
+    Effect.gen(function*() {
       const dir = yield* tmpdir
       const file = path.join(dir, "model.safetensors")
       // every dtype that runs on every device (f64 is CPU-only hardware-wise)
@@ -37,11 +48,10 @@ onDevices("Checkpoint", () => (it) => {
       expect(yield* values(loaded["w.i64"])).toEqual([7, 8, 9])
       expect(yield* values(loaded["w.u8"])).toEqual([10, 11])
       expect(yield* values(loaded["w.u32"])).toEqual([12])
-    })
-  )
+    }))
 
   it.effect("evaluates lazy graphs during save", () =>
-    Effect.gen(function* () {
+    Effect.gen(function*() {
       const dir = yield* tmpdir
       const file = path.join(dir, "lazy.safetensors")
       const x = yield* Tensor.fromTypedArray(floats([1, 2, 3]), [3])
@@ -53,11 +63,10 @@ onDevices("Checkpoint", () => (it) => {
       const loaded = yield* Tensor.load(file)
       expect(yield* values(loaded["sum"])).toEqual([5, 7, 9])
       expect(yield* values(loaded["product"])).toEqual([4, 10, 18])
-    })
-  )
+    }))
 
   it.effect("loaded tensors are ordinary materialized tensors", () =>
-    Effect.gen(function* () {
+    Effect.gen(function*() {
       const dir = yield* tmpdir
       const file = path.join(dir, "ops.safetensors")
       yield* Tensor.save(file, {
@@ -66,11 +75,10 @@ onDevices("Checkpoint", () => (it) => {
       const loaded = yield* Tensor.load(file)
       const doubled = yield* Tensor.add(loaded["x"], loaded["x"])
       expect(yield* values(doubled)).toEqual([2, 4])
-    })
-  )
+    }))
 
   it.effect("round-trips optimizer state", () =>
-    Effect.gen(function* () {
+    Effect.gen(function*() {
       const dir = yield* tmpdir
       const file = path.join(dir, "state.safetensors")
       const optimizer = yield* Optimizer.adam()
@@ -85,11 +93,10 @@ onDevices("Checkpoint", () => (it) => {
       const loaded = yield* Tensor.load(file)
       expect(yield* values(loaded["m.0"])).toEqual(yield* values(m))
       expect(yield* values(loaded["v.0"])).toEqual(yield* values(v))
-    })
-  )
+    }))
 
   it.effect("trainer checkpoint resumes bit-exactly (params, state, step)", () =>
-    Effect.gen(function* () {
+    Effect.gen(function*() {
       const dir = yield* tmpdir
       const file = path.join(dir, "trainer.safetensors")
       const model = yield* Model.chain(
@@ -103,7 +110,7 @@ onDevices("Checkpoint", () => (it) => {
       const optimizer = yield* Optimizer.adam()
       const initial = yield* Tensor.compute(yield* model.init)
       const makeTrainer = (stopStep: number) =>
-        Effect.gen(function* () {
+        Effect.gen(function*() {
           const config: Trainer.TrainConfig<Optimizer.AdamState, Tensor.TensorError> = {
             optimizer,
             lr: LearningRate.constant(0.05),
@@ -126,11 +133,10 @@ onDevices("Checkpoint", () => (it) => {
       for (let i = 0; i < uninterrupted.params.length; i++) {
         expect(yield* values(resumed.params[i])).toEqual(yield* values(uninterrupted.params[i]))
       }
-    })
-  )
+    }))
 
   it.effect("sampler state round-trips: resume continues the permutation", () =>
-    Effect.gen(function* () {
+    Effect.gen(function*() {
       const dir = yield* tmpdir
       const file = path.join(dir, "trainer-sampler.safetensors")
       const model = yield* Model.chain(yield* Model.linear("fc1", 2, 4), yield* Model.linear("fc2", 4, 1))
@@ -155,11 +161,10 @@ onDevices("Checkpoint", () => (it) => {
       const restored = yield* Sampler.restore(samplerConfig, checkpoint.sampler)
       expect(restored.next()).toEqual(expected)
       expect(checkpoint.resume.step).toBe(2)
-    })
-  )
+    }))
 
   it.effect("optimizer state lives on the ambient device, never a hidden override", () =>
-    Effect.gen(function* () {
+    Effect.gen(function*() {
       const device = yield* Device.CurrentDevice
       const optimizer = yield* Optimizer.adamW()
       const p = yield* Tensor.fromTypedArray(floats([1, -1]), [2])
@@ -167,19 +172,17 @@ onDevices("Checkpoint", () => (it) => {
       for (const root of optimizer.stateRoots(state)) {
         expect(root.device).toBe(device)
       }
-    })
-  )
+    }))
 
   it.effect("fails with TensorError on a missing file", () =>
-    Effect.gen(function* () {
+    Effect.gen(function*() {
       const error = yield* Effect.flip(Tensor.load("/nonexistent/model.safetensors"))
       expect(error._tag).toBe("TensorError")
       expect(error.op).toBe("load")
-    })
-  )
+    }))
 
   it.effect("fails with TensorError on an unwritable path", () =>
-    Effect.gen(function* () {
+    Effect.gen(function*() {
       const error = yield* Effect.flip(
         Tensor.save("/nonexistent/dir/model.safetensors", {
           x: yield* Tensor.fromTypedArray(floats([1]), [1])
@@ -187,6 +190,5 @@ onDevices("Checkpoint", () => (it) => {
       )
       expect(error._tag).toBe("TensorError")
       expect(error.op).toBe("save")
-    })
-  )
+    }))
 })

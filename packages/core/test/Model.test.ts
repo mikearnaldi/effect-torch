@@ -10,7 +10,7 @@ const tmpdir = Effect.sync(() => fs.mkdtempSync(path.join(os.tmpdir(), "effect-t
 
 const values = (t: Tensor.Any) => Tensor.toNumberArray(t)
 
-const mlp = Effect.gen(function* () {
+const mlp = Effect.gen(function*() {
   return yield* Model.chain(
     yield* Model.linear("fc1", 2, 8),
     yield* Model.tanh,
@@ -23,7 +23,7 @@ const handForward = (
   [w1, b1, w2, b2]: ReadonlyArray<Tensor.Any>,
   x: Tensor.Any
 ) =>
-  Effect.gen(function* () {
+  Effect.gen(function*() {
     const h = yield* Tensor.tanh(yield* Tensor.add(yield* Tensor.matmul(x, w1), b1))
     return yield* Tensor.sigmoid(yield* Tensor.add(yield* Tensor.matmul(h, w2), b2))
   })
@@ -31,26 +31,24 @@ const handForward = (
 onDevices("Model", () => (it) => {
   describe("validation", () => {
     it.effect("linear rejects an empty name", () =>
-      Effect.gen(function* () {
+      Effect.gen(function*() {
         const error = yield* Effect.flip(Model.linear("", 2, 8))
         expect(error._tag).toBe("ModelError")
         expect(error.op).toBe("linear")
         expect(error.message).toContain("name")
-      })
-    )
+      }))
 
     it.effect("linear rejects non-positive feature counts", () =>
-      Effect.gen(function* () {
+      Effect.gen(function*() {
         for (const [inF, outF] of [[0, 8], [-1, 8], [2.5, 8], [2, 0]] as const) {
           const error = yield* Effect.flip(Model.linear("fc", inF, outF))
           expect(error._tag).toBe("ModelError")
           expect(error.op).toBe("linear")
         }
-      })
-    )
+      }))
 
     it.effect("chain fails on duplicate names", () =>
-      Effect.gen(function* () {
+      Effect.gen(function*() {
         const error = yield* Effect.flip(
           Model.chain(
             yield* Model.linear("fc", 2, 2),
@@ -61,40 +59,36 @@ onDevices("Model", () => (it) => {
         expect(error._tag).toBe("ModelError")
         expect(error.op).toBe("chain")
         expect(error.message).toContain("fc.weight")
-      })
-    )
+      }))
 
     it.effect("chain fails when empty", () =>
-      Effect.gen(function* () {
+      Effect.gen(function*() {
         const error = yield* Effect.flip(Model.chain())
         expect(error._tag).toBe("ModelError")
         expect(error.message).toContain("at least one model")
-      })
-    )
+      }))
   })
 
   describe("names", () => {
     it.effect("concatenates names in order and reports arity", () =>
-      Effect.gen(function* () {
+      Effect.gen(function*() {
         const model = yield* mlp
         expect(model.names).toEqual(["fc1.weight", "fc1.bias", "fc2.weight", "fc2.bias"])
         const params = yield* model.init
         expect(params.length).toBe(model.names.length)
-      })
-    )
+      }))
   })
 
   describe("arity", () => {
     it.effect("init produces one parameter per name", () =>
-      Effect.gen(function* () {
+      Effect.gen(function*() {
         const model = yield* mlp
         const params = yield* model.init
         expect(params.length).toBe(model.names.length)
-      })
-    )
+      }))
 
     it.effect("forward fails with ModelError on the wrong parameter count", () =>
-      Effect.gen(function* () {
+      Effect.gen(function*() {
         const model = yield* mlp
         const params = yield* model.init
         const x = yield* Tensor.fromTypedArray(floats([0, 1]), [1, 2])
@@ -105,11 +99,10 @@ onDevices("Model", () => (it) => {
           expect(error.message).toContain("4 parameters")
           expect(error.message).toContain("got 3")
         }
-      })
-    )
+      }))
 
     it.effect("a layer called directly checks its own arity", () =>
-      Effect.gen(function* () {
+      Effect.gen(function*() {
         const fc = yield* Model.linear("fc1", 2, 8)
         const x = yield* Tensor.fromTypedArray(floats([0, 1]), [1, 2])
         const error = yield* Effect.flip(fc.forward([], x))
@@ -118,11 +111,10 @@ onDevices("Model", () => (it) => {
           expect(error.message).toContain("fc1")
           expect(error.message).toContain("[fc1.weight, fc1.bias]")
         }
-      })
-    )
+      }))
 
     it.effect("nested chains flatten to one array", () =>
-      Effect.gen(function* () {
+      Effect.gen(function*() {
         const nested = yield* Model.chain(
           yield* Model.chain(yield* Model.linear("a", 2, 3), yield* Model.relu),
           yield* Model.chain(yield* Model.relu, yield* Model.linear("b", 3, 1))
@@ -130,24 +122,22 @@ onDevices("Model", () => (it) => {
         expect(nested.names).toEqual(["a.weight", "a.bias", "b.weight", "b.bias"])
         const params = yield* nested.init
         expect(params.length).toBe(4)
-      })
-    )
+      }))
   })
 
   describe("composition", () => {
     it.effect("chained forward matches the hand-written forward on the same parameters", () =>
-      Effect.gen(function* () {
+      Effect.gen(function*() {
         const model = yield* mlp
         const params = yield* Tensor.compute(yield* model.init)
         const x = yield* Tensor.fromTypedArray(floats([0, 0, 0, 1, 1, 0, 1, 1]), [4, 2])
         const viaModel = yield* Tensor.compute([yield* model.forward(params, x)])
         const byHand = yield* Tensor.compute([yield* handForward(params, x)])
         deep(yield* values(viaModel[0]), yield* values(byHand[0]))
-      })
-    )
+      }))
 
     it.effect("chained gradients match the hand-written gradients", () =>
-      Effect.gen(function* () {
+      Effect.gen(function*() {
         const model = yield* mlp
         const params = yield* Tensor.compute(yield* model.init)
         const x = yield* Tensor.fromTypedArray(floats([0, 0, 0, 1, 1, 0, 1, 1]), [4, 2])
@@ -158,11 +148,10 @@ onDevices("Model", () => (it) => {
         for (let i = 0; i < gradsModel.length; i++) {
           deep(yield* values(gradsModel[i]), yield* values(gradsHand[i]))
         }
-      })
-    )
+      }))
 
     it.effect("slices the parameter array across mixed parameterless and parameterised stages", () =>
-      Effect.gen(function* () {
+      Effect.gen(function*() {
         const model = yield* Model.chain(
           yield* Model.linear("a", 2, 3),
           yield* Model.relu,
@@ -171,7 +160,7 @@ onDevices("Model", () => (it) => {
         )
         const [wa, ba, wb, bb] = yield* Tensor.compute(yield* model.init)
         const x = yield* Tensor.fromTypedArray(floats([1, 2, 3, 4]), [2, 2])
-        const manual = Effect.gen(function* () {
+        const manual = Effect.gen(function*() {
           const h1 = yield* Tensor.relu(yield* Tensor.add(yield* Tensor.matmul(x, wa), ba))
           const h2 = yield* Tensor.relu(h1)
           return yield* Tensor.add(yield* Tensor.matmul(h2, wb), bb)
@@ -179,11 +168,10 @@ onDevices("Model", () => (it) => {
         const [viaModel] = yield* Tensor.compute([yield* model.forward([wa, ba, wb, bb], x)])
         const [byHand] = yield* Tensor.compute([yield* manual])
         deep(yield* values(viaModel), yield* values(byHand))
-      })
-    )
+      }))
 
     it.effect("add sums the branches' outputs over a shared input", () =>
-      Effect.gen(function* () {
+      Effect.gen(function*() {
         const model = yield* Model.add(
           yield* Model.linear("a", 2, 2),
           yield* Model.linear("b", 2, 2),
@@ -191,7 +179,7 @@ onDevices("Model", () => (it) => {
         )
         const params = yield* Tensor.compute(yield* model.init)
         const x = yield* Tensor.fromTypedArray(floats([1, 2, 3, 4]), [2, 2])
-        const manual = Effect.gen(function* () {
+        const manual = Effect.gen(function*() {
           const [wa, ba, wb, bb] = params
           const a = yield* Tensor.add(yield* Tensor.matmul(x, wa), ba)
           const b = yield* Tensor.add(yield* Tensor.matmul(x, wb), bb)
@@ -200,11 +188,10 @@ onDevices("Model", () => (it) => {
         const [viaModel] = yield* Tensor.compute([yield* model.forward(params, x)])
         const [byHand] = yield* Tensor.compute([yield* manual])
         deep(yield* values(viaModel), yield* values(byHand))
-      })
-    )
+      }))
 
     it.effect("add fails on an empty chain and on colliding parameter names", () =>
-      Effect.gen(function* () {
+      Effect.gen(function*() {
         const empty = yield* Effect.flip(Model.add())
         expect(empty._tag).toBe("ModelError")
         const colliding = yield* Effect.flip(Model.add(
@@ -212,13 +199,12 @@ onDevices("Model", () => (it) => {
           yield* Model.linear("a", 2, 2)
         ))
         expect(colliding._tag).toBe("ModelError")
-      })
-    )
+      }))
   })
 
   describe("layers", () => {
     it.effect("conv2d forward matches a manual conv + bias", () =>
-      Effect.gen(function* () {
+      Effect.gen(function*() {
         const model = yield* Model.conv2d("c", 2, 4, 3, { padding: 1 })
         expect(model.names).toEqual(["c.weight", "c.bias"])
         const [w, b] = yield* Tensor.compute(yield* model.init)
@@ -231,32 +217,34 @@ onDevices("Model", () => (it) => {
         ])
         expect(viaModel.shape).toEqual([1, 4, 4, 4])
         deep(yield* values(viaModel), yield* values(byHand))
-      })
-    )
+      }))
 
     it.effect("conv2d supports grouped convolutions", () =>
-      Effect.gen(function* () {
+      Effect.gen(function*() {
         const model = yield* Model.conv2d("c", 4, 4, [3, 3], { groups: 2 })
         const [w, b] = yield* Tensor.compute(yield* model.init)
         expect(w.shape).toEqual([4, 2, 3, 3])
-        const x = yield* Tensor.fromTypedArray(floats(Array.from({ length: 4 * 5 * 5 }, (_, i) => i / 100)), [1, 4, 5, 5])
+        const x = yield* Tensor.fromTypedArray(floats(Array.from({ length: 4 * 5 * 5 }, (_, i) => i / 100)), [
+          1,
+          4,
+          5,
+          5
+        ])
         const [out] = yield* Tensor.compute([yield* model.forward([w, b], x)])
         expect(out.shape).toEqual([1, 4, 3, 3])
-      })
-    )
+      }))
 
     it.effect("conv2d rejects invalid configuration", () =>
-      Effect.gen(function* () {
+      Effect.gen(function*() {
         expect((yield* Effect.flip(Model.conv2d("", 2, 4, 3))).op).toBe("conv2d")
         expect((yield* Effect.flip(Model.conv2d("c", 0, 4, 3))).op).toBe("conv2d")
         expect((yield* Effect.flip(Model.conv2d("c", 2, 4, 0))).op).toBe("conv2d")
         const grouped = yield* Effect.flip(Model.conv2d("c", 3, 4, 3, { groups: 2 }))
         expect(grouped.message).toContain("groups")
-      })
-    )
+      }))
 
     it.effect("conv1d forward matches a manual conv + bias", () =>
-      Effect.gen(function* () {
+      Effect.gen(function*() {
         const model = yield* Model.conv1d("c", 2, 3, 3, { stride: 2 })
         expect(model.names).toEqual(["c.weight", "c.bias"])
         const [w, b] = yield* Tensor.compute(yield* model.init)
@@ -268,11 +256,10 @@ onDevices("Model", () => (it) => {
         ])
         expect(viaModel.shape).toEqual([1, 3, 3])
         deep(yield* values(viaModel), yield* values(byHand))
-      })
-    )
+      }))
 
     it.effect("embedding looks up rows and accumulates gradients", () =>
-      Effect.gen(function* () {
+      Effect.gen(function*() {
         const model = yield* Model.embedding("emb", 3, 2)
         expect(model.names).toEqual(["emb.weight"])
         const [w] = yield* Tensor.compute(yield* model.init)
@@ -284,18 +271,16 @@ onDevices("Model", () => (it) => {
         const loss = yield* Tensor.sum(yield* model.forward([w], indexes))
         const [grad] = yield* Tensor.compute(yield* Gradient.grad(loss, [w]))
         deep(yield* values(grad), [2, 2, 1, 1, 0, 0])
-      })
-    )
+      }))
 
     it.effect("embedding rejects an out-of-range paddingIndex", () =>
-      Effect.gen(function* () {
+      Effect.gen(function*() {
         const error = yield* Effect.flip(Model.embedding("emb", 3, 2, { paddingIndex: 3 }))
         expect(error.message).toContain("paddingIndex")
-      })
-    )
+      }))
 
     it.effect("positionEmbedding looks up rows 0..t-1 and ignores the input values", () =>
-      Effect.gen(function* () {
+      Effect.gen(function*() {
         const model = yield* Model.positionEmbedding("wpe", 4, 2)
         expect(model.names).toEqual(["wpe.weight"])
         const [w] = yield* Tensor.compute(yield* model.init)
@@ -316,11 +301,10 @@ onDevices("Model", () => (it) => {
         const error = yield* Effect.flip(model.forward([w], tooLong))
         expect(error._tag).toBe("ModelError")
         expect(error.message).toContain("exceeds maxPositions")
-      })
-    )
+      }))
 
     it.effect("layerNorm normalizes the trailing dimensions to unit statistics", () =>
-      Effect.gen(function* () {
+      Effect.gen(function*() {
         const model = yield* Model.layerNorm("ln", 4)
         expect(model.names).toEqual(["ln.weight", "ln.bias"])
         const params = yield* Tensor.compute(yield* model.init)
@@ -331,11 +315,10 @@ onDevices("Model", () => (it) => {
         const variances = yield* values(yield* Tensor.variance(out, { dims: [-1], correction: 0 }))
         deep(means, [0, 0])
         deep(variances, [1, 1])
-      })
-    )
+      }))
 
     it.effect("layerNorm normalizes multi-dimension shapes and applies weight and bias", () =>
-      Effect.gen(function* () {
+      Effect.gen(function*() {
         const model = yield* Model.layerNorm("ln", [2, 3])
         const [w, b] = yield* Tensor.compute(yield* model.init)
         expect(w.shape).toEqual([2, 3])
@@ -347,19 +330,17 @@ onDevices("Model", () => (it) => {
         const one = yield* Tensor.fromTypedArray(floats([1, 1, 1, 1, 1, 1]), [2, 3])
         const [scaled] = yield* Tensor.compute([yield* model.forward([two, one], x)])
         deep(yield* values(scaled), (yield* values(out)).map((v) => v * 2 + 1))
-      })
-    )
+      }))
 
     it.effect("layerNorm rejects invalid configuration", () =>
-      Effect.gen(function* () {
+      Effect.gen(function*() {
         expect((yield* Effect.flip(Model.layerNorm("ln", []))).message).toContain("empty")
         expect((yield* Effect.flip(Model.layerNorm("ln", 0))).message).toContain("positive")
         expect((yield* Effect.flip(Model.layerNorm("ln", 4, { eps: 0 }))).message).toContain("eps")
-      })
-    )
+      }))
 
     it.effect("multiHeadAttention matches a manual head-split composition (values and gradients)", () =>
-      Effect.gen(function* () {
+      Effect.gen(function*() {
         const embedDim = 8
         const numHeads = 2
         const headDim = embedDim / numHeads
@@ -375,9 +356,9 @@ onDevices("Model", () => (it) => {
           floats(Array.from({ length: 2 * 3 * 8 }, (_, i) => ((i * 5 + 1) % 11 - 5) / 5)),
           [2, 3, 8]
         )
-        const manual = Effect.gen(function* () {
+        const manual = Effect.gen(function*() {
           const split = (t: Tensor.Any) =>
-            Effect.gen(function* () {
+            Effect.gen(function*() {
               const r = yield* Tensor.reshape(t, [2, 3, numHeads, headDim])
               return yield* Tensor.transpose(r, [0, 2, 1, 3])
             })
@@ -400,11 +381,10 @@ onDevices("Model", () => (it) => {
         for (let i = 0; i < params.length; i++) {
           deep(yield* values(gradsModel[i]), yield* values(gradsManual[i]))
         }
-      })
-    )
+      }))
 
     it.effect("multiHeadAttention with causal masking changes the output and trains", () =>
-      Effect.gen(function* () {
+      Effect.gen(function*() {
         const plain = yield* Model.multiHeadAttention("attn", 8, 2)
         const causal = yield* Model.multiHeadAttention("attn", 8, 2, { causal: true })
         expect(causal.names).toEqual(plain.names)
@@ -421,11 +401,10 @@ onDevices("Model", () => (it) => {
         const loss = yield* Tensor.sum(yield* causal.forward(params, x))
         const grads = yield* Tensor.compute(yield* Gradient.grad(loss, params))
         expect(grads.length).toBe(4)
-      })
-    )
+      }))
 
     it.effect("multiHeadAttention rejects invalid configuration and arity", () =>
-      Effect.gen(function* () {
+      Effect.gen(function*() {
         expect((yield* Effect.flip(Model.multiHeadAttention("", 8, 2))).op).toBe("multiHeadAttention")
         expect((yield* Effect.flip(Model.multiHeadAttention("a", 0, 2))).op).toBe("multiHeadAttention")
         expect((yield* Effect.flip(Model.multiHeadAttention("a", 8, 0))).op).toBe("multiHeadAttention")
@@ -434,11 +413,10 @@ onDevices("Model", () => (it) => {
         const x = yield* Tensor.fromTypedArray(floats(Array.from({ length: 8 }, (_, i) => i / 8)), [1, 1, 8])
         const error = yield* Effect.flip(model.forward([], x))
         expect(error._tag).toBe("ModelError")
-      })
-    )
+      }))
 
     it.effect("activation models apply the corresponding tensor operations", () =>
-      Effect.gen(function* () {
+      Effect.gen(function*() {
         const x = yield* Tensor.fromTypedArray(floats([-2, -0.5, 0, 0.5, 2]), [5])
         const cases: Array<[Model.Model, (x: Tensor.Any) => Effect.Effect<Tensor.Lazy, Tensor.TensorError>]> = [
           [yield* Model.gelu(), (x) => Tensor.gelu(x)],
@@ -458,11 +436,10 @@ onDevices("Model", () => (it) => {
           const [byHand] = yield* Tensor.compute([yield* op(x)])
           deep(yield* values(viaModel), yield* values(byHand))
         }
-      })
-    )
+      }))
 
     it.effect("flatten collapses all but the batch dimension by default", () =>
-      Effect.gen(function* () {
+      Effect.gen(function*() {
         const model = yield* Model.flatten()
         const x = yield* Tensor.fromTypedArray(floats(Array.from({ length: 120 }, (_, i) => i)), [2, 3, 4, 5])
         const [out] = yield* Tensor.compute([yield* model.forward([], x)])
@@ -470,22 +447,20 @@ onDevices("Model", () => (it) => {
         const full = yield* Model.flatten({ startDim: 0 })
         const [vector] = yield* Tensor.compute([yield* full.forward([], x)])
         expect(vector.shape).toEqual([120])
-      })
-    )
+      }))
 
     it.effect("dropout with p = 0 is the identity and validates p", () =>
-      Effect.gen(function* () {
+      Effect.gen(function*() {
         const model = yield* Model.dropout({ p: 0 })
         const x = yield* Tensor.fromTypedArray(floats([1, 2, 3]), [3])
         const [out] = yield* Tensor.compute([yield* model.forward([], x)])
         deep(yield* values(out), [1, 2, 3])
         expect((yield* Effect.flip(Model.dropout({ p: 1 }))).message).toContain("[0, 1)")
         expect((yield* Effect.flip(Model.dropout({ p: -0.1 }))).message).toContain("[0, 1)")
-      })
-    )
+      }))
 
     it.effect("pool models apply the corresponding tensor operations", () =>
-      Effect.gen(function* () {
+      Effect.gen(function*() {
         const x = yield* Tensor.fromTypedArray(floats(Array.from({ length: 16 }, (_, i) => i)), [1, 1, 4, 4])
         const maxPool = yield* Model.maxPool2d({ kernelSize: 2 })
         const [viaMax] = yield* Tensor.compute([yield* maxPool.forward([], x)])
@@ -498,11 +473,10 @@ onDevices("Model", () => (it) => {
         expect((yield* Effect.flip(Model.maxPool2d({ kernelSize: 0 }))).message).toContain("kernelSize")
         expect((yield* Effect.flip(Model.avgPool2d({ kernelSize: 2, stride: 0 }))).message).toContain("stride")
         expect((yield* Effect.flip(Model.maxPool2d({ kernelSize: 2, padding: -1 }))).message).toContain("padding")
-      })
-    )
+      }))
 
     it.effect("a conv net chain flows end to end", () =>
-      Effect.gen(function* () {
+      Effect.gen(function*() {
         const model = yield* Model.chain(
           yield* Model.conv2d("conv", 3, 4, 3, { padding: 1 }),
           yield* Model.relu,
@@ -512,14 +486,18 @@ onDevices("Model", () => (it) => {
         )
         expect(model.names).toEqual(["conv.weight", "conv.bias", "fc.weight", "fc.bias"])
         const params = yield* model.init
-        const x = yield* Tensor.fromTypedArray(floats(Array.from({ length: 2 * 3 * 8 * 8 }, (_, i) => i / 384)), [2, 3, 8, 8])
+        const x = yield* Tensor.fromTypedArray(floats(Array.from({ length: 2 * 3 * 8 * 8 }, (_, i) => i / 384)), [
+          2,
+          3,
+          8,
+          8
+        ])
         const [out] = yield* Tensor.compute([yield* model.forward(params, x)])
         expect(out.shape).toEqual([2, 10])
-      })
-    )
+      }))
 
     it.effect("a dropout stage drops out of the eval chain with the same parameter array", () =>
-      Effect.gen(function* () {
+      Effect.gen(function*() {
         const trainNet = yield* Model.chain(
           yield* Model.linear("fc1", 2, 4),
           yield* Model.relu,
@@ -536,11 +514,10 @@ onDevices("Model", () => (it) => {
         const [viaTrain] = yield* Tensor.compute([yield* trainNet.forward(params, x)])
         const [viaEval] = yield* Tensor.compute([yield* evalNet.forward(params, x)])
         deep(yield* values(viaTrain), yield* values(viaEval))
-      })
-    )
+      }))
 
     it.effect("checkpoint preserves names, outputs, and gradients", () =>
-      Effect.gen(function* () {
+      Effect.gen(function*() {
         const block = Model.chain(yield* Model.linear("fc", 2, 8), yield* Model.tanh)
         const plain = yield* Model.chain(yield* block, yield* Model.linear("head", 8, 1))
         const wrapped = yield* Model.chain(
@@ -560,11 +537,10 @@ onDevices("Model", () => (it) => {
         for (let i = 0; i < gradsPlain.length; i++) {
           deep(yield* values(gradsWrapped[i]), yield* values(gradsPlain[i]))
         }
-      })
-    )
+      }))
 
     it.effect("a checkpointed sub-model still checks its own arity", () =>
-      Effect.gen(function* () {
+      Effect.gen(function*() {
         const wrapped = yield* Model.checkpoint(yield* Model.linear("fc1", 2, 8))
         const x = yield* Tensor.fromTypedArray(floats([0, 1]), [1, 2])
         const error = yield* Effect.flip(wrapped.forward([], x))
@@ -572,11 +548,10 @@ onDevices("Model", () => (it) => {
         if (error._tag === "ModelError") {
           expect(error.message).toContain("fc1")
         }
-      })
-    )
+      }))
 
     it.effect("residual adds the block input to its output (values and gradients)", () =>
-      Effect.gen(function* () {
+      Effect.gen(function*() {
         const block = Model.chain(yield* Model.linear("fc", 2, 2), yield* Model.tanh)
         const plain = yield* block
         const skip = yield* Model.residual(yield* block)
@@ -596,11 +571,10 @@ onDevices("Model", () => (it) => {
         for (let i = 0; i < grads.length; i++) {
           deep(yield* values(grads[i]), yield* values(gradsPlain[i]))
         }
-      })
-    )
+      }))
 
     it.effect("residual composes with checkpoint inside a chain", () =>
-      Effect.gen(function* () {
+      Effect.gen(function*() {
         const block = Model.chain(yield* Model.linear("fc", 2, 2), yield* Model.relu)
         const net = yield* Model.chain(
           yield* Model.checkpoint(yield* Model.residual(yield* block)),
@@ -613,18 +587,17 @@ onDevices("Model", () => (it) => {
         const loss = yield* Tensor.sum(yield* net.forward(params, x))
         const grads = yield* Tensor.compute(yield* Gradient.grad(loss, params))
         expect(grads.length).toBe(net.names.length)
-      })
-    )
+      }))
 
     it.effect("merge fans one input into several models and combines outputs (values and gradients)", () =>
-      Effect.gen(function* () {
+      Effect.gen(function*() {
         const a = yield* Model.linear("a", 2, 2)
         const b = yield* Model.linear("b", 2, 2)
         const merged = yield* Model.merge([a, b], (x, y) => Tensor.add(x, y))
         expect(merged.names).toEqual(["a.weight", "a.bias", "b.weight", "b.bias"])
         const params = yield* Tensor.compute(yield* merged.init)
         const x = yield* Tensor.fromTypedArray(floats([0, 1, 1, 0]), [2, 2])
-        const hand = Effect.gen(function* () {
+        const hand = Effect.gen(function*() {
           return yield* Tensor.add(
             yield* a.forward(params.slice(0, 2), x),
             yield* b.forward(params.slice(2), x)
@@ -642,19 +615,17 @@ onDevices("Model", () => (it) => {
         }
         const error = yield* Effect.flip(merged.forward(params.slice(0, 3), x))
         expect(error._tag).toBe("ModelError")
-      })
-    )
+      }))
 
     it.effect("merge is variadic: three models merge with per-model combiner arguments", () =>
-      Effect.gen(function* () {
+      Effect.gen(function*() {
         const a = yield* Model.linear("a", 2, 2)
         const b = yield* Model.linear("b", 2, 2)
         const c = yield* Model.linear("c", 2, 2)
         const merged = yield* Model.merge([a, b, c], (x, y, z) =>
-          Effect.gen(function* () {
+          Effect.gen(function*() {
             return yield* Tensor.add(x, yield* Tensor.add(y, z))
-          })
-        )
+          }))
         expect(merged.names).toEqual(["a.weight", "a.bias", "b.weight", "b.bias", "c.weight", "c.bias"])
         const params = yield* Tensor.compute(yield* merged.init)
         const x = yield* Tensor.fromTypedArray(floats([0, 1, 1, 0]), [2, 2])
@@ -669,29 +640,24 @@ onDevices("Model", () => (it) => {
           )
         ])
         deep(yield* values(viaMerge), yield* values(byHand))
-      })
-    )
+      }))
 
     it.effect("merge rejects an empty array and duplicate parameter names", () =>
-      Effect.gen(function* () {
+      Effect.gen(function*() {
         const empty = yield* Effect.flip(Model.merge([], () => Tensor.zeros([1])))
         expect(empty.message).toContain("at least one")
         const error = yield* Effect.flip(
-          Model.merge([yield* Model.linear("fc", 2, 2), yield* Model.linear("fc", 2, 2)], (x, y) =>
-            Tensor.add(x, y)
-          )
+          Model.merge([yield* Model.linear("fc", 2, 2), yield* Model.linear("fc", 2, 2)], (x, y) => Tensor.add(x, y))
         )
         expect(error._tag).toBe("ModelError")
         expect(error.message).toContain("duplicate")
-      })
-    )
+      }))
 
     it.effect("mapInput transforms the input before the sub-model", () =>
-      Effect.gen(function* () {
+      Effect.gen(function*() {
         const emb = yield* Model.embedding("pos", 4, 2)
         const positioned = yield* Model.mapInput(emb, (idx) =>
-          Tensor.arange(idx.shape[idx.shape.length - 1], undefined, { dtype: "i64" })
-        )
+          Tensor.arange(idx.shape[idx.shape.length - 1], undefined, { dtype: "i64" }))
         expect(positioned.names).toEqual(["pos.weight"])
         const [w] = yield* Tensor.compute(yield* positioned.init)
         const ids = yield* Tensor.fromTypedArray(new BigInt64Array([2n, 3n]), [1, 2])
@@ -704,13 +670,12 @@ onDevices("Model", () => (it) => {
           )
         ])
         deep(yield* values(viaMapped), yield* values(byHand))
-      })
-    )
+      }))
   })
 
   describe("serialization", () => {
     it.effect("save/load round-trips values and order", () =>
-      Effect.gen(function* () {
+      Effect.gen(function*() {
         const dir = yield* tmpdir
         const file = path.join(dir, "mlp.safetensors")
         const model = yield* mlp
@@ -726,11 +691,10 @@ onDevices("Model", () => (it) => {
         const [before] = yield* Tensor.compute([yield* model.forward(params, x)])
         const [after] = yield* Tensor.compute([yield* model.forward(loaded, x)])
         deep(yield* values(after), yield* values(before))
-      })
-    )
+      }))
 
     it.effect("save fails with ModelError on an arity mismatch", () =>
-      Effect.gen(function* () {
+      Effect.gen(function*() {
         const dir = yield* tmpdir
         const model = yield* mlp
         const params = yield* Tensor.compute(yield* model.init)
@@ -738,11 +702,10 @@ onDevices("Model", () => (it) => {
         expect(error._tag).toBe("ModelError")
         expect(error.op).toBe("save")
         expect(error.message).toContain("4 parameters, got 3")
-      })
-    )
+      }))
 
     it.effect("load fails with ModelError on missing keys", () =>
-      Effect.gen(function* () {
+      Effect.gen(function*() {
         const dir = yield* tmpdir
         const file = path.join(dir, "partial.safetensors")
         const small = yield* Model.linear("fc1", 2, 8)
@@ -752,11 +715,10 @@ onDevices("Model", () => (it) => {
         expect(error._tag).toBe("ModelError")
         expect(error.op).toBe("load")
         expect(error.message).toContain("fc2.weight")
-      })
-    )
+      }))
 
     it.effect("params from a different architecture fail at graph-build time", () =>
-      Effect.gen(function* () {
+      Effect.gen(function*() {
         const dir = yield* tmpdir
         const file = path.join(dir, "wide.safetensors")
         const wide = yield* Model.chain(
@@ -775,7 +737,6 @@ onDevices("Model", () => (it) => {
         const error = yield* Effect.flip(narrow.forward(params, x))
         expect(error._tag).toBe("TensorError")
         expect(error.op).toBe("linear")
-      })
-    )
+      }))
   })
 })

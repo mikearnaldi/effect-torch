@@ -1,6 +1,6 @@
-import { Duration, Effect } from "effect"
-import { NodeRuntime } from "@effect/platform-node"
 import { Checkpoint, Device, LearningRate, Loss, Optimizer, Sampler, Tensor, Trainer } from "@effect-torch/core"
+import { NodeRuntime } from "@effect/platform-node"
+import { Duration, Effect } from "effect"
 import fs from "node:fs"
 import { BLOCK, CHECKPOINT, createGpt, heldOutLoss, loadBin, loadTokenizer, saveParams, windows } from "./model.js"
 
@@ -25,12 +25,14 @@ const CHECKPOINT_EVERY = Number(process.env.FINEWEB_CHECKPOINT_EVERY ?? 100)
 const LR = 6e-4
 const VAL_BATCHES = 20
 
-const program = Effect.gen(function* () {
+const program = Effect.gen(function*() {
   const train = loadBin(TRAIN_BIN)
   const val = loadBin(VAL_BIN)
   const tokenizer = yield* loadTokenizer
   yield* Effect.log(
-    `fineweb-train: vocab ${tokenizer.vocabSize}, ${(train.length / 1e6).toFixed(0)}M train tokens, block ${BLOCK}, batch ${BATCH} (${Math.floor((train.length - 1) / BLOCK / BATCH)} steps per epoch)`
+    `fineweb-train: vocab ${tokenizer.vocabSize}, ${
+      (train.length / 1e6).toFixed(0)
+    }M train tokens, block ${BLOCK}, batch ${BATCH} (${Math.floor((train.length - 1) / BLOCK / BATCH)} steps per epoch)`
   )
 
   yield* Effect.log("1) creating model")
@@ -46,7 +48,7 @@ const program = Effect.gen(function* () {
     lr: LearningRate.constant(LR),
     loss: Loss.crossEntropy,
     data: () =>
-      Effect.gen(function* () {
+      Effect.gen(function*() {
         const { inputs, targets } = windows(train, sampler.next(), BATCH, BLOCK)
         return {
           input: yield* Tensor.fromTypedArray(inputs, [BATCH, BLOCK]),
@@ -55,7 +57,9 @@ const program = Effect.gen(function* () {
       }),
     stop: ({ step }) => step >= chunkTarget,
     onStep: ({ step, loss, elapsed }) =>
-      Effect.log(`step ${String(step).padStart(4)}  loss ${loss.toFixed(4)}  ${(Duration.toMillis(elapsed) / 1000).toFixed(1)}s`)
+      Effect.log(
+        `step ${String(step).padStart(4)}  loss ${loss.toFixed(4)}  ${(Duration.toMillis(elapsed) / 1000).toFixed(1)}s`
+      )
   })
 
   // Resume when a checkpoint exists: parameters, optimizer state, global

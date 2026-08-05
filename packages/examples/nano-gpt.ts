@@ -1,6 +1,6 @@
-import { Duration, Effect, Option } from "effect"
-import { NodeRuntime } from "@effect/platform-node"
 import { Device, LearningRate, Loss, Model, Optimizer, Tensor, Tokenizer, Trainer } from "@effect-torch/core"
+import { NodeRuntime } from "@effect/platform-node"
+import { Duration, Effect, Option } from "effect"
 
 // A GPT with a Unigram tokenizer (byte fallback, trained on the fly,
 // RFC 0009) on a few KB of public-domain verse: token embeddings,
@@ -88,7 +88,7 @@ const EOS = "<|eos|>"
 const DOCUMENTS = CORPUS.split("\n\n").map((poem) => poem.trim() + "\n")
 
 const createGpt = (vocabSize: number) =>
-  Effect.gen(function* () {
+  Effect.gen(function*() {
     // Token embeddings; positions are relative (RoPE inside attention),
     // so generation is unbounded — no position table to outgrow.
     const embeddings = yield* Model.embedding("wte", vocabSize, EMBED)
@@ -119,7 +119,7 @@ const ids = (values: ReadonlyArray<number>, shape: ReadonlyArray<number>) =>
   Tensor.fromTypedArray(new Uint32Array(values), shape)
 
 const sampleBatch = (data: ReadonlyArray<number>) =>
-  Effect.gen(function* () {
+  Effect.gen(function*() {
     const inputs: Array<number> = []
     const targets: Array<number> = []
     for (let b = 0; b < BATCH; b++) {
@@ -139,7 +139,7 @@ const sampleBatch = (data: ReadonlyArray<number>) =>
 // so the whole run is served by one frozen step program; the first step
 // pays the trace.
 const createTrainer = (model: Model.Model, data: ReadonlyArray<number>) =>
-  Effect.gen(function* () {
+  Effect.gen(function*() {
     const trainer = yield* Trainer.make(model, {
       optimizer: yield* Optimizer.adamW(),
       lr: LearningRate.constant(LR),
@@ -149,7 +149,9 @@ const createTrainer = (model: Model.Model, data: ReadonlyArray<number>) =>
       onStep: ({ step, loss, elapsed }) =>
         step % 25 === 0 || step === 1
           ? Effect.log(
-            `step ${String(step).padStart(4)}  loss ${loss.toFixed(4)}  ${(Duration.toMillis(elapsed) / 1000).toFixed(1)}s`
+            `step ${String(step).padStart(4)}  loss ${loss.toFixed(4)}  ${
+              (Duration.toMillis(elapsed) / 1000).toFixed(1)
+            }s`
           )
           : Effect.void
     })
@@ -157,7 +159,7 @@ const createTrainer = (model: Model.Model, data: ReadonlyArray<number>) =>
   })
 
 const init = (model: Model.Model) =>
-  Effect.gen(function* () {
+  Effect.gen(function*() {
     const params = yield* model.init
     for (const [i, name] of model.names.entries()) {
       yield* Effect.log(`  ${name} [${params[i].shape}] ${params[i].dtype} initialized`)
@@ -178,13 +180,13 @@ const generate = (
   tokenizer: Tokenizer.Tokenizer,
   prompt: string
 ) =>
-  Effect.gen(function* () {
+  Effect.gen(function*() {
     const bosId = Option.getOrThrow(tokenizer.tokenToId(BOS))
     const eosId = Option.getOrThrow(tokenizer.tokenToId(EOS))
     const promptIds = yield* Tensor.toNumberArray(yield* tokenizer.encode(prompt))
     const gen = yield* program.generation()
     const sample = (logits: Tensor.Any) =>
-      Effect.gen(function* () {
+      Effect.gen(function*() {
         const row = yield* Tensor.toNumberArray(logits)
         const max = Math.max(...row)
         const exps = row.map((x) => Math.exp((x - max) / TEMPERATURE))
@@ -210,7 +212,7 @@ const generate = (
     return yield* tokenizer.decode(generated)
   })
 
-const program = Effect.gen(function* () {
+const program = Effect.gen(function*() {
   const device = yield* Device.CurrentDevice
 
   yield* Effect.log(`0) training ${TOKENIZER_MODEL} tokenizer (target vocab ${VOCAB})`)
@@ -221,7 +223,10 @@ const program = Effect.gen(function* () {
       vocabSize: VOCAB,
       minFrequency: 2,
       specialTokens: [BOS, EOS],
-      progress: Tokenizer.trainProgressReport(256, (processed, total) => Effect.log(`tokenizer feed ${processed}/${total}`))
+      progress: Tokenizer.trainProgressReport(
+        256,
+        (processed, total) => Effect.log(`tokenizer feed ${processed}/${total}`)
+      )
     },
     Tokenizer.strictConfig
   )

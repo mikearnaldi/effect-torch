@@ -1,6 +1,6 @@
+import native from "@effect-torch/native"
 import { layer } from "@effect/vitest"
 import * as assert from "@effect/vitest/utils"
-import native from "@effect-torch/native"
 import { Device } from "../../src/index.ts"
 
 export type TestDevice = "cpu" | "metal"
@@ -41,8 +41,7 @@ export const deep = (actual: unknown, expected: unknown): void => {
     return
   }
   if (Array.isArray(actual) && Array.isArray(expected)) {
-    const numeric = (v: ReadonlyArray<unknown>): v is ReadonlyArray<number> =>
-      v.every((x) => typeof x === "number")
+    const numeric = (v: ReadonlyArray<unknown>): v is ReadonlyArray<number> => v.every((x) => typeof x === "number")
     if (numeric(actual) && numeric(expected)) {
       assert.deepStrictEqual(actual.length, expected.length)
       actual.forEach((v, i) => {

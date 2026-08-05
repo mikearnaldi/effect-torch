@@ -1,6 +1,6 @@
-import { Effect, Option } from "effect"
-import { NodeRuntime } from "@effect/platform-node"
 import { Device, Model, Tensor } from "@effect-torch/core"
+import { NodeRuntime } from "@effect/platform-node"
+import { Effect, Option } from "effect"
 import { BLOCK, CHECKPOINT, createGpt, EOT, loadParams, loadTokenizer } from "./model.js"
 
 // Streaming generation: the prompt comes from argv and each token is
@@ -26,7 +26,7 @@ const sampleCategorical = (probs: ReadonlyArray<number>, temperature: number) =>
   return scaled.length - 1
 }
 
-const program = Effect.gen(function* () {
+const program = Effect.gen(function*() {
   const prompt = process.argv.slice(2).join(" ")
   if (prompt.length === 0) {
     yield* Effect.log("usage: pnpm tsx fineweb/generate.ts <prompt>")

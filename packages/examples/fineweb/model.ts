@@ -1,5 +1,5 @@
+import { type Device, Loss, Model, Tensor, Tokenizer } from "@effect-torch/core"
 import { Effect } from "effect"
-import { Device, Loss, Model, Tensor, Tokenizer } from "@effect-torch/core"
 import fs from "node:fs"
 
 // Shared pieces of the FineWeb pre-training pilot (see train.ts
@@ -19,7 +19,7 @@ export const LAYERS = 6
 export const createGpt = (
   vocabSize: number
 ): Effect.Effect<Model.Model, Model.ModelError | Tensor.TensorError, Device.CurrentDevice> =>
-  Effect.gen(function* () {
+  Effect.gen(function*() {
     // Token embeddings; positions are relative (RoPE inside attention),
     // so generation is unbounded — no position table to outgrow.
     const embeddings = yield* Model.embedding("wte", vocabSize, EMBED)
@@ -61,7 +61,7 @@ export const loadParams = (
   model: Model.Model,
   path: string
 ): Effect.Effect<Model.Params, Tensor.TensorError, Device.CurrentDevice> =>
-  Effect.gen(function* () {
+  Effect.gen(function*() {
     const tensors = yield* Tensor.load(path)
     return model.names.map((name) => {
       const tensor = tensors[name]
@@ -99,20 +99,20 @@ export const heldOutLoss = (
   block: number,
   batches: number
 ) =>
-  Effect.gen(function* () {
+  Effect.gen(function*() {
     // Forward + loss as ONE frozen program: the chunked-head rewrite
     // (RFC 0016 phase 2) fires inside it, so the full logits tensor is
     // never materialized during evaluation, and the program's arena plan
     // shares the training arena's memory instead of stacking on top.
     return yield* Effect.acquireUseRelease(
       Tensor.compile((inputs) =>
-        Effect.gen(function* () {
+        Effect.gen(function*() {
           const logits = yield* model.forward(inputs.slice(0, -2), inputs[inputs.length - 2])
           return [yield* Loss.crossEntropy(logits, inputs[inputs.length - 1])]
         })
       ),
       (lossProgram) =>
-        Effect.gen(function* () {
+        Effect.gen(function*() {
           let total = 0
           for (let i = 0; i < batches; i++) {
             const { inputs, targets } = windows(
