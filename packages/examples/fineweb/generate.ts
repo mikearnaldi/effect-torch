@@ -47,14 +47,29 @@ const program = Effect.gen(function* () {
   const encoded = yield* tokenizer.encode(prompt)
   const entry = yield* gen.add(yield* Tensor.reshape(encoded, [1, encoded.shape[0]]))
   let logits = entry.logits
+  // Incremental decode: re-decode the sequence per token, but hold back a
+  // trailing run of U+FFFD — a merge boundary can split a multi-byte
+  // codepoint, and the next token may complete it (genuine invalid bytes
+  // still print, one token later; everything flushes at the end).
+  const ids: Array<number> = []
+  let emitted = 0
+  let text = ""
   while (true) {
     const [probs] = yield* Tensor.compute([yield* Tensor.softmax(logits)])
     const token = sampleCategorical(yield* Tensor.toNumberArray(probs), TEMPERATURE)
     if (token === eotId) break
-    process.stdout.write(yield* tokenizer.decode([token]))
+    ids.push(token)
+    text = yield* tokenizer.decode(ids)
+    let safe = text.length
+    while (safe > emitted && text.charCodeAt(safe - 1) === 0xfffd) safe--
+    if (safe > emitted) {
+      process.stdout.write(text.slice(emitted, safe))
+      emitted = safe
+    }
     const [stepped] = yield* gen.step([{ seq: entry.seq, token }])
     logits = stepped
   }
+  process.stdout.write(text.slice(emitted))
   yield* gen.close()
   process.stdout.write("\n")
 })
