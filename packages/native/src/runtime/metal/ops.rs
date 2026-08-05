@@ -36,6 +36,8 @@ pub enum UnOp {
     Ceil,
     Round,
     Erf,
+    Gelu,
+    GeluTanh,
     Sign,
 }
 
@@ -71,6 +73,8 @@ fn un_expr(op: &UnOp, a: Expr) -> Expr {
         UnOp::Ceil => Expr::Ceil(Box::new(a)),
         UnOp::Round => Expr::Round(Box::new(a)),
         UnOp::Erf => Expr::Erf(Box::new(a)),
+        UnOp::Gelu => Expr::Gelu(Box::new(a)),
+        UnOp::GeluTanh => Expr::GeluTanh(Box::new(a)),
         UnOp::Sign => {
             let pos = Expr::Gt(Box::new(a.clone()), Box::new(zero()));
             let neg = Expr::Lt(Box::new(a), Box::new(zero()));

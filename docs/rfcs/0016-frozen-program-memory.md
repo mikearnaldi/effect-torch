@@ -149,21 +149,49 @@ with no new node kind and automatic CPU parity.
 
 ## Phase 3 — Gemm epilogue/prologue fusion
 
-Extend the existing bias-epilogue machinery:
+**DONE (as built).** `gelu` became a real node (`NodeKind::Gelu`,
+emitted by `Tensor.gelu`, with a composite grad rule and a fusion
+`Expr::Gelu`/`GeluTanh` so it still folds into elementwise regions).
+An eval-time pass in `fuse_roots` (`gemm_epilogue_pass`, before the
+elementwise fold) rewrites two Metal-only patterns:
 
-- **gelu into the fc gemm epilogue** — removes two `[B, T, 4E]`
-  materializations per layer (pre-gelu, post-gelu).
-- **residual add into the proj gemm epilogue** — the epilogue grows
-  from bias-vector to full C-matrix add.
-- **layernorm backward chains** — audit what the fusion engine already
-  catches; `run_reduce` takes a prologue `Expr`, so
-  prologue-into-reduce exists; close the reduce-epilogue gap.
+- **gelu into the fc gemm epilogue** — `Gelu(Linear)` becomes
+  `LinearGelu`. With a backward graph present the pre-activation has
+  further consumers, so the dual-store variant writes both the
+  pre-activation (output 0, read through `FusedPick`) and the gelu
+  output from one gemm launch; at inference the pre-activation buffer
+  disappears entirely. The accumulator applies gelu in f32 before the
+  bf16 store — strictly more accurate than the unfused path, which
+  rounds the pre-activation to bf16 first.
+- **residual add into the proj gemm epilogue** — `Add(Linear, r)`
+  with the Linear single-consumer and an exactly output-shaped `r`
+  becomes `LinearResidual`; the standalone proj output never
+  materializes. Safe because Linear backward reads `x`/`w` and the
+  routed grad, never its own output.
 
-Modest individual gains that shrink the live-set the arena then
-compacts — multiplicative with Phase 1.
+Both epilogues ride the existing bias-gemm kernel (`gemm_fused`,
+`Epilogue` joins the pipeline-cache key). CPU keeps composed fallbacks.
+`EFFECT_TORCH_NO_EPILOGUE` isolates the pass for A/B measurement.
 
-**Gate.** Step time at batch 64 and 128; allocation-trace intermediate
-count.
+**Not done:** the layernorm-backward audit — LN already has dedicated
+fused forward/backward kernels; the reduce-epilogue gap stays open.
+
+**Gate results (30M, block 1024, mixedBf16).** Step time is
+noise-level either way: batch 32 A/B 0.83 vs 0.85 s/step (within
+run-to-run variance), batch 128 fused 2.8 s/step ≈ the 2.86 baseline.
+The win is structural, as predicted: 18 fewer kernel launches per
+6-layer stack (`LinearResidual×12`, `LinearGelu×6`, `FusedPick×12` in
+the compiled step graph), the transient proj-output buffers gone, and
+the f32-accumulator gelu. Parity: 5 new cargo tests (fused vs unfused
+forward + grads, dual-store structure, shared-linear guard, gelu-grad
+finite differences), 81/81 cargo, 628/628 vitest.
+
+**Original sketch for the record.** "Removes two [B, T, 4E]
+materializations per layer (pre-gelu, post-gelu)" — not achievable as
+stated: gelu backward needs the pre-activation and proj-gemm backward
+needs the post-gelu, so both persist in training. The dual-store gemm
+removes the separate gelu pass (one read of the pre-activation) and
+its launch instead.
 
 ## Phase 4 — One-launch optimizer
 

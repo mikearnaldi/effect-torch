@@ -56,6 +56,7 @@ export declare class LazyTensor {
   sqrt(): LazyTensor
   exp(): LazyTensor
   tanh(): LazyTensor
+  gelu(approximate?: boolean | undefined | null): LazyTensor
   relu(): LazyTensor
   erf(): LazyTensor
   floor(): LazyTensor

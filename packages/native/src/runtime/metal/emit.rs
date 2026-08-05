@@ -109,6 +109,8 @@ fn emit_expr(e: &Expr, lane: &dyn Fn(u32) -> String, num_inputs: usize) -> Strin
         Expr::Round(a) => format!("round({})", emit_expr(a, lane, num_inputs)),
         Expr::Powf(a, e) => format!("pow({}, {})", emit_expr(a, lane, num_inputs), f32_lit(f64::from_bits(*e))),
         Expr::Erf(a) => format!("erf_as({})", emit_expr(a, lane, num_inputs)),
+        Expr::Gelu(a) => format!("gelu_as({})", emit_expr(a, lane, num_inputs)),
+        Expr::GeluTanh(a) => format!("gelu_tanh_as({})", emit_expr(a, lane, num_inputs)),
     }
 }
 
@@ -179,6 +181,8 @@ fn emit_expr_ssa(
         Expr::Round(a) => format!("round({})", s(a, body, next, memo)),
         Expr::Powf(a, e) => format!("pow({}, {})", s(a, body, next, memo), f32_lit(f64::from_bits(*e))),
         Expr::Erf(a) => format!("erf_as({})", s(a, body, next, memo)),
+        Expr::Gelu(a) => format!("gelu_as({})", s(a, body, next, memo)),
+        Expr::GeluTanh(a) => format!("gelu_tanh_as({})", s(a, body, next, memo)),
     };
     let name = format!("t{}", *next);
     *next += 1;
@@ -216,10 +220,10 @@ fn lane_offset_expr(strides: &[usize], out_shape: &[usize], index: &str) -> Stri
     }
 }
 
-const HEADER: &str = r#"
-#include <metal_stdlib>
-using namespace metal;
-
+/// The erf/gelu helpers, shared by fused elementwise/reduce kernels
+/// (via [`HEADER`]) and kernels that build their own source (gemm
+/// epilogues).
+pub(crate) const ACT_FNS: &str = r#"
 inline float erf_as(float x) {
     float ax = fabs(x);
     float t = 1.0f / (1.0f + 0.3275911f * ax);
@@ -232,6 +236,20 @@ inline float erf_as(float x) {
     float sign = x / fmax(ax, 1e-30f);
     return sign * tail;
 }
+
+inline float gelu_as(float x) {
+    return 0.5f * x * (1.0f + erf_as(x * 0.7071067811865476f));
+}
+
+inline float gelu_tanh_as(float x) {
+    float u = 0.7978845608028654f * (x + 0.044715f * x * x * x);
+    return 0.5f * x * (1.0f + tanh(u));
+}
+"#;
+
+const PREAMBLE: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
 "#;
 
 pub fn emit_elementwise(
@@ -246,7 +264,7 @@ pub fn emit_elementwise(
     let num_inputs = lane_strides.len();
     let num_outputs = exprs.len();
     let ty = storage_ty(dtype);
-    let mut src = String::from(HEADER);
+    let mut src = format!("{PREAMBLE}{ACT_FNS}");
     src.push_str(&format!("kernel void {name}(\n"));
     let mut idx = 0usize;
     let mut params: Vec<String> = Vec::new();
@@ -301,7 +319,7 @@ pub fn emit_reduce(
     let out_n: usize = out_shape.iter().product();
     let contig_out = contiguous_strides(out_shape);
     let ty = storage_ty(dtype);
-    let mut src = String::from(HEADER);
+    let mut src = format!("{PREAMBLE}{ACT_FNS}");
     src.push_str(&format!("kernel void {name}(\n"));
     let mut params: Vec<String> = Vec::new();
     let mut idx = 0usize;

@@ -96,6 +96,10 @@ pub enum Expr {
     // Exact in the CPU interpreter; lowered to a stable expansion in ug
     // ops for GPU kernels (Metal has no erf).
     Erf(Box<Expr>),
+    // gelu with the exact erf form / the tanh approximation; emitted as
+    // one helper so gemm epilogues and elementwise regions share it.
+    Gelu(Box<Expr>),
+    GeluTanh(Box<Expr>),
 }
 
 /// `x^e` with special cases for the common exponents: exact multiplies
@@ -190,7 +194,9 @@ impl Expr {
             | Expr::Ceil(a)
             | Expr::Round(a)
             | Expr::Powf(a, _)
-            | Expr::Erf(a) => 1 + a.ops(),
+            | Expr::Erf(a)
+            | Expr::Gelu(a)
+            | Expr::GeluTanh(a) => 1 + a.ops(),
         }
     }
 
@@ -229,6 +235,8 @@ impl Expr {
             Expr::Round(a) => Expr::Round(Box::new(a.remap_inputs(f))),
             Expr::Powf(a, e) => Expr::Powf(Box::new(a.remap_inputs(f)), *e),
             Expr::Erf(a) => Expr::Erf(Box::new(a.remap_inputs(f))),
+            Expr::Gelu(a) => Expr::Gelu(Box::new(a.remap_inputs(f))),
+            Expr::GeluTanh(a) => Expr::GeluTanh(Box::new(a.remap_inputs(f))),
         }
     }
 
@@ -280,6 +288,8 @@ impl Expr {
                 Expr::Round(a) => Expr::Round(Box::new(go(a, lane, r, remap))),
                 Expr::Powf(a, e) => Expr::Powf(Box::new(go(a, lane, r, remap)), *e),
                 Expr::Erf(a) => Expr::Erf(Box::new(go(a, lane, r, remap))),
+                Expr::Gelu(a) => Expr::Gelu(Box::new(go(a, lane, r, remap))),
+                Expr::GeluTanh(a) => Expr::GeluTanh(Box::new(go(a, lane, r, remap))),
             }
         }
         go(self, lane, replacement, remap)
@@ -448,6 +458,18 @@ fn eval<T: Scalar, F: Fn(u32) -> T>(e: &Expr, lane: &F, scalars: &[T]) -> T {
         Expr::Round(a) => eval(a, lane, scalars).round(),
         Expr::Powf(a, e) => eval(a, lane, scalars).powf(f64::from_bits(*e)),
         Expr::Erf(a) => eval(a, lane, scalars).erf(),
+        Expr::Gelu(a) => {
+            let x = eval(a, lane, scalars);
+            let inner = x.mul(T::from_f64(std::f64::consts::FRAC_1_SQRT_2)).erf();
+            x.mul(T::from_f64(0.5)).mul(T::from_f64(1.0).add(inner))
+        }
+        Expr::GeluTanh(a) => {
+            let x = eval(a, lane, scalars);
+            let u = x
+                .add(x.mul(x).mul(x).mul(T::from_f64(0.044715)))
+                .mul(T::from_f64(0.7978845608028654));
+            x.mul(T::from_f64(0.5)).mul(T::from_f64(1.0).add(u.tanh()))
+        }
     }
 }
 

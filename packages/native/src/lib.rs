@@ -689,6 +689,13 @@ enum NodeKind {
     Erf {
         a: Arc<Node>,
     },
+    // Gaussian error linear unit as a single node (Tensor.gelu).
+    // `approximate` selects the tanh form over the exact erf form. A
+    // pointwise unary op: folds into fusion regions like tanh/erf.
+    Gelu {
+        a: Arc<Node>,
+        approximate: bool,
+    },
     Floor {
         a: Arc<Node>,
     },
@@ -894,6 +901,27 @@ enum NodeKind {
         x: Arc<Node>,
         weight: Arc<Node>,
         bias: Arc<Node>,
+    },
+    // RFC 0016 phase 3 — created only by the evaluation-time epilogue
+    // pass: y = x·W + b + residual in one gemm launch (the residual add
+    // rides the epilogue; the standalone proj output never materializes).
+    // Never in user graphs, so autodiff and vmap reject it.
+    LinearResidual {
+        x: Arc<Node>,
+        weight: Arc<Node>,
+        bias: Arc<Node>,
+        residual: Arc<Node>,
+    },
+    // RFC 0016 phase 3 — created only by the evaluation-time epilogue
+    // pass: y = gelu(x·W + b) in one gemm launch. `dual` writes the
+    // pre-activation as output 0 as well (backward needs it); consumers
+    // read the outputs through FusedPick. Never in user graphs.
+    LinearGelu {
+        x: Arc<Node>,
+        weight: Arc<Node>,
+        bias: Arc<Node>,
+        approximate: bool,
+        dual: bool,
     },
     Conv1d {
         x: Arc<Node>,
@@ -1354,6 +1382,41 @@ fn reduced_shape(shape: &[usize], dims: &[usize], keepdims: bool) -> Vec<usize> 
     }
 }
 
+fn gelu_cpu(t: &runtime::cpu::Tensor, approximate: bool) -> runtime::cpu::Tensor {
+    let dt = t.dtype();
+    let full = |v: f64| runtime::cpu::Tensor::full(&[], v, dt);
+    if approximate {
+        let u = t
+            .add(&t.mul(t).mul(t).mul(&full(0.044715)))
+            .mul(&full(0.7978845608028654));
+        t.mul(&full(0.5)).mul(&full(1.0).add(&u.tanh()))
+    } else {
+        let inner = t.mul(&full(std::f64::consts::FRAC_1_SQRT_2)).erf();
+        t.mul(&full(0.5)).mul(&full(1.0).add(&inner))
+    }
+}
+
+fn linear_out_shape(
+    x: &[usize],
+    weight: &[usize],
+    bias: &[usize],
+) -> std::result::Result<Vec<usize>, String> {
+    let rank = x.len();
+    if rank < 2
+        || weight.len() != 2
+        || x[rank - 1] != weight[0]
+        || bias != [weight[1]]
+    {
+        return Err(format!(
+            "linear: expected x [.., K], weight [K, N], bias [N], got {:?} x {:?} + {:?}",
+            x, weight, bias
+        ));
+    }
+    let mut out = x.to_vec();
+    out[rank - 1] = weight[1];
+    Ok(out)
+}
+
 impl Node {
     fn new(kind: NodeKind) -> std::result::Result<Arc<Node>, String> {
         let (shape, dtype, device) = match &kind {
@@ -1457,6 +1520,7 @@ impl Node {
             | NodeKind::Tanh { a }
             | NodeKind::Relu { a }
             | NodeKind::Erf { a }
+            | NodeKind::Gelu { a, .. }
             | NodeKind::Floor { a }
             | NodeKind::Ceil { a }
             | NodeKind::Round { a }
@@ -1732,19 +1796,32 @@ impl Node {
                 (shape.clone(), g.dtype, g.device.clone())
             }
             NodeKind::Linear { x, weight, bias } => {
-                let rank = x.shape.len();
-                if rank < 2
-                    || weight.shape.len() != 2
-                    || x.shape[rank - 1] != weight.shape[0]
-                    || bias.shape != [weight.shape[1]]
-                {
+                let out = linear_out_shape(&x.shape, &weight.shape, &bias.shape)?;
+                (out, x.dtype, x.device.clone())
+            }
+            NodeKind::LinearGelu { x, weight, bias, .. } => {
+                let out = linear_out_shape(&x.shape, &weight.shape, &bias.shape)?;
+                (out, x.dtype, x.device.clone())
+            }
+            NodeKind::LinearResidual {
+                x,
+                weight,
+                bias,
+                residual,
+            } => {
+                let out = linear_out_shape(&x.shape, &weight.shape, &bias.shape)?;
+                if residual.shape != out {
                     return Err(format!(
-                        "linear: expected x [.., K], weight [K, N], bias [N], got {:?} x {:?} + {:?}",
-                        x.shape, weight.shape, bias.shape
+                        "linear residual: residual shape {:?} does not match output {:?}",
+                        residual.shape, out
                     ));
                 }
-                let mut out = x.shape.clone();
-                out[rank - 1] = weight.shape[1];
+                if residual.dtype != x.dtype {
+                    return Err(format!(
+                        "linear residual: residual dtype {:?} does not match {:?}",
+                        residual.dtype, x.dtype
+                    ));
+                }
                 (out, x.dtype, x.device.clone())
             }
             NodeKind::LayerNorm { x, weight, bias, .. } => {
@@ -2669,6 +2746,14 @@ impl LazyTensor {
     }
 
     #[napi]
+    pub fn gelu(&self, approximate: Option<bool>) -> Result<Self> {
+        lazy_ctor!(Node::new(NodeKind::Gelu {
+            a: self.node.clone(),
+            approximate: approximate.unwrap_or(false),
+        }))
+    }
+
+    #[napi]
     pub fn relu(&self) -> Result<Self> {
         lazy_ctor!(Node::new(NodeKind::Relu {
             a: self.node.clone(),
@@ -3348,6 +3433,7 @@ fn node_children(kind: &NodeKind) -> Vec<Arc<Node>> {
         | NodeKind::Tanh { a }
         | NodeKind::Relu { a }
         | NodeKind::Erf { a }
+        | NodeKind::Gelu { a, .. }
         | NodeKind::Floor { a }
         | NodeKind::Ceil { a }
         | NodeKind::Round { a }
@@ -3390,6 +3476,13 @@ fn node_children(kind: &NodeKind) -> Vec<Arc<Node>> {
         }
         NodeKind::LayerNormBackwardOut { of, .. } => vec![of.clone()],
         NodeKind::Linear { x, weight, bias } => vec![x.clone(), weight.clone(), bias.clone()],
+        NodeKind::LinearGelu { x, weight, bias, .. } => vec![x.clone(), weight.clone(), bias.clone()],
+        NodeKind::LinearResidual {
+            x,
+            weight,
+            bias,
+            residual,
+        } => vec![x.clone(), weight.clone(), bias.clone(), residual.clone()],
         NodeKind::SdpaBackward { q, k, v, g, fwd, .. } => {
             vec![q.clone(), k.clone(), v.clone(), g.clone(), fwd.clone()]
         }
@@ -3722,6 +3815,30 @@ fn remap_children(kind: &NodeKind, f: &dyn Fn(&Arc<Node>) -> Arc<Node>) -> NodeK
             weight: f(weight),
             bias: f(bias),
         },
+        NodeKind::LinearGelu {
+            x,
+            weight,
+            bias,
+            approximate,
+            dual,
+        } => NodeKind::LinearGelu {
+            x: f(x),
+            weight: f(weight),
+            bias: f(bias),
+            approximate: *approximate,
+            dual: *dual,
+        },
+        NodeKind::LinearResidual {
+            x,
+            weight,
+            bias,
+            residual,
+        } => NodeKind::LinearResidual {
+            x: f(x),
+            weight: f(weight),
+            bias: f(bias),
+            residual: f(residual),
+        },
         NodeKind::Conv1d {
             x,
             w,
@@ -3845,6 +3962,10 @@ fn remap_children(kind: &NodeKind, f: &dyn Fn(&Arc<Node>) -> Arc<Node>) -> NodeK
         NodeKind::Tanh { a } => NodeKind::Tanh { a: f(a) },
         NodeKind::Relu { a } => NodeKind::Relu { a: f(a) },
         NodeKind::Erf { a } => NodeKind::Erf { a: f(a) },
+        NodeKind::Gelu { a, approximate } => NodeKind::Gelu {
+            a: f(a),
+            approximate: *approximate,
+        },
         NodeKind::Floor { a } => NodeKind::Floor { a: f(a) },
         NodeKind::Ceil { a } => NodeKind::Ceil { a: f(a) },
         NodeKind::Round { a } => NodeKind::Round { a: f(a) },
@@ -4527,6 +4648,20 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> crate::err::Res<val::V
                 val::Val::Metal(t) => val::Val::Metal(metal_ops::unary_promote(t, metal_ops::UnOp::Erf)?),
             }
         }
+        NodeKind::Gelu { a, approximate } => {
+            let x = ev.value(a.id)?;
+            match &x {
+                val::Val::Cpu(t) => val::Val::Cpu(gelu_cpu(t, *approximate)),
+                val::Val::Metal(t) => {
+                    let op = if *approximate {
+                        metal_ops::UnOp::GeluTanh
+                    } else {
+                        metal_ops::UnOp::Gelu
+                    };
+                    val::Val::Metal(metal_ops::unary_promote(t, op)?)
+                }
+            }
+        }
         NodeKind::Floor { a } => {
             let x = ev.value(a.id)?;
             match &x {
@@ -4917,6 +5052,102 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> crate::err::Res<val::V
                             metal_ops::BinOp::Add,
                         )?;
                         val::Val::Metal(metal_ops::from_f32(&r, x.dtype)?)
+                    }
+                }
+                _ => return Err("device mismatch".to_string()),
+            }
+        }
+        NodeKind::LinearResidual {
+            x,
+            weight,
+            bias,
+            residual,
+        } => {
+            let x = ev.value(x.id)?;
+            let weight = ev.value(weight.id)?;
+            let bias = ev.value(bias.id)?;
+            let residual = ev.value(residual.id)?;
+            match (&x, &weight, &bias, &residual) {
+                (val::Val::Cpu(x), val::Val::Cpu(w), val::Val::Cpu(b), val::Val::Cpu(r)) => {
+                    val::Val::Cpu(x.matmul(w).add(b).add(r))
+                }
+                (val::Val::Metal(x), val::Val::Metal(w), val::Val::Metal(b), val::Val::Metal(r)) => {
+                    if linear::is_supported(x, w) {
+                        let (out, extra) = linear::linear_forward_fused(x, w, b, Some(r), None)?;
+                        debug_assert!(extra.is_none());
+                        val::Val::Metal(out)
+                    } else {
+                        let x32 = metal_ops::to_f32(x)?;
+                        let w32 = metal_ops::to_f32(w)?;
+                        let b32 = metal_ops::to_f32(b)?;
+                        let r32 = metal_ops::to_f32(r)?;
+                        let out = metal_ops::binary(
+                            &metal_ops::binary(&metal_ops::matmul(&x32, &w32)?, &b32, metal_ops::BinOp::Add)?,
+                            &r32,
+                            metal_ops::BinOp::Add,
+                        )?;
+                        val::Val::Metal(metal_ops::from_f32(&out, x.dtype)?)
+                    }
+                }
+                _ => return Err("device mismatch".to_string()),
+            }
+        }
+        NodeKind::LinearGelu {
+            x,
+            weight,
+            bias,
+            approximate,
+            dual,
+        } => {
+            let x = ev.value(x.id)?;
+            let weight = ev.value(weight.id)?;
+            let bias = ev.value(bias.id)?;
+            let finish = |m: val::Val, g: val::Val, ev: &mut Evaluator| {
+                if *dual {
+                    ev.multi.insert(node.id, vec![m.clone(), g]);
+                    m
+                } else {
+                    g
+                }
+            };
+            match (&x, &weight, &bias) {
+                (val::Val::Cpu(x), val::Val::Cpu(w), val::Val::Cpu(b)) => {
+                    let m = x.matmul(w).add(b);
+                    let g = gelu_cpu(&m, *approximate);
+                    finish(val::Val::Cpu(m), val::Val::Cpu(g), ev)
+                }
+                (val::Val::Metal(x), val::Val::Metal(w), val::Val::Metal(b)) => {
+                    if linear::is_supported(x, w) {
+                        let (out, out2) = linear::linear_forward_fused(
+                            x,
+                            w,
+                            b,
+                            None,
+                            Some((*approximate, *dual)),
+                        )?;
+                        if *dual {
+                            let g = out2.expect("dual gelu gemm writes two outputs");
+                            finish(val::Val::Metal(out), val::Val::Metal(g), ev)
+                        } else {
+                            val::Val::Metal(out)
+                        }
+                    } else {
+                        let x32 = metal_ops::to_f32(x)?;
+                        let w32 = metal_ops::to_f32(w)?;
+                        let b32 = metal_ops::to_f32(b)?;
+                        let m32 = metal_ops::binary(
+                            &metal_ops::matmul(&x32, &w32)?,
+                            &b32,
+                            metal_ops::BinOp::Add,
+                        )?;
+                        let m = metal_ops::from_f32(&m32, x.dtype)?;
+                        let op = if *approximate {
+                            metal_ops::UnOp::GeluTanh
+                        } else {
+                            metal_ops::UnOp::Gelu
+                        };
+                        let g = metal_ops::unary_promote(&m, op)?;
+                        finish(val::Val::Metal(m), val::Val::Metal(g), ev)
                     }
                 }
                 _ => return Err("device mismatch".to_string()),
@@ -6266,7 +6497,9 @@ mod autodiff {
             NodeKind::FusedElementwise { .. }
             | NodeKind::FusedElementwiseMulti { .. }
             | NodeKind::FusedPick { .. }
-            | NodeKind::FusedReduce { .. } => {
+            | NodeKind::FusedReduce { .. }
+            | NodeKind::LinearGelu { .. }
+            | NodeKind::LinearResidual { .. } => {
                 Err("vmap: fused elementwise nodes are internal to evaluation".to_string())
             }
             _ => Ok(remap_children(&node.kind, f)),
@@ -6524,6 +6757,44 @@ mod autodiff {
                         a: neg(mul(a.clone(), a.clone())?)?,
                     })?;
                     accumulate(a, mul(mul(g, c)?, e))?;
+                }
+                // exact: d/dx gelu(x) = Φ(x) + x·φ(x) with
+                // Φ(x) = ½(1+erf(x/√2)), φ(x) = e^{-x²/2}/√(2π).
+                // tanh: ½(1+t) + ½x(1-t²)·c(1+3k·x²) with
+                // t = tanh(c(x+kx³)), c = √(2/π), k = 0.044715.
+                NodeKind::Gelu { a, approximate } => {
+                    let dt = a.dtype;
+                    let dv = &a.device;
+                    let half = full(0.5, dt, dv)?;
+                    let one = full(1.0, dt, dv)?;
+                    let dg = if *approximate {
+                        let c = full((2.0f64 / std::f64::consts::PI).sqrt(), dt, dv)?;
+                        let k = full(0.044715, dt, dv)?;
+                        let x2 = mul(a.clone(), a.clone())?;
+                        let u = mul(add(a.clone(), mul(mul(x2.clone(), a.clone())?, k.clone())?)?, c.clone())?;
+                        let t = mk(NodeKind::Tanh { a: u })?;
+                        let sech2 = add(one.clone(), neg(mul(t.clone(), t.clone())?)?)?;
+                        let du = mul(c, add(one.clone(), mul(full(3.0, dt, dv)?, mul(k, x2)?)?)?)?;
+                        add(
+                            mul(half.clone(), add(one, t)?)?,
+                            mul(mul(mul(half, a.clone())?, sech2)?, du)?,
+                        )?
+                    } else {
+                        let inner = mk(NodeKind::Erf {
+                            a: mul(a.clone(), full(std::f64::consts::FRAC_1_SQRT_2, dt, dv)?)?,
+                        })?;
+                        let phi_up = mul(half, add(one, inner)?)?;
+                        let neg_x2_half = div(neg(mul(a.clone(), a.clone())?)?, full(2.0, dt, dv)?)?;
+                        let xphi = mul(
+                            a.clone(),
+                            mul(
+                                full(1.0 / (2.0 * std::f64::consts::PI).sqrt(), dt, dv)?,
+                                mk(NodeKind::Exp { a: neg_x2_half })?,
+                            )?,
+                        )?;
+                        add(phi_up, xphi)?
+                    };
+                    accumulate(a, mul(g, dg))?;
                 }
                 // zero almost everywhere; the cotangent is an explicit zero
                 // rather than a drop so higher-order walks stay total
@@ -7162,7 +7433,9 @@ mod autodiff {
                 NodeKind::FusedElementwise { .. }
                 | NodeKind::FusedElementwiseMulti { .. }
                 | NodeKind::FusedPick { .. }
-                | NodeKind::FusedReduce { .. } => {
+                | NodeKind::FusedReduce { .. }
+                | NodeKind::LinearGelu { .. }
+                | NodeKind::LinearResidual { .. } => {
                     return Err(
                         "grad: fused elementwise nodes are internal to evaluation".to_string(),
                     );
@@ -7451,11 +7724,165 @@ fn group_optimizer_steps(roots: &[Arc<Node>]) -> std::result::Result<Vec<Arc<Nod
         .collect())
 }
 
+// RFC 0016 phase 3: folds gemm epilogues before the elementwise fold
+// sees the graph. Two patterns, both Metal-only with gemm-supported
+// dtypes:
+//
+// - Add(Linear(x, w, b), r) with the Linear's only consumer being this
+//   Add and r exactly output-shaped becomes LinearResidual — the
+//   epilogue adds r to the accumulator and the standalone proj output
+//   never materializes. Linear backward reads x/w and the routed grad,
+//   never its own output, so dropping the node is safe.
+// - Gelu(Linear(x, w, b)) becomes LinearGelu. When the pre-activation
+//   has further consumers (the backward gelu chain), the dual variant
+//   writes it as output 0 and consumers read both through FusedPick;
+//   otherwise the pre-activation buffer disappears entirely.
+fn gemm_epilogue_pass(roots: &[Arc<Node>]) -> std::result::Result<Vec<Arc<Node>>, String> {
+    let mut order: Vec<Arc<Node>> = Vec::new();
+    let mut visited = HashSet::new();
+    fn visit(n: &Arc<Node>, visited: &mut HashSet<u64>, order: &mut Vec<Arc<Node>>) {
+        if !visited.insert(n.id) {
+            return;
+        }
+        for c in node_children(&n.kind) {
+            visit(&c, visited, order);
+        }
+        order.push(n.clone());
+    }
+    for r in roots {
+        visit(r, &mut visited, &mut order);
+    }
+    let mut consumers: HashMap<u64, usize> = HashMap::new();
+    for n in &order {
+        for c in node_children(&n.kind) {
+            *consumers.entry(c.id).or_insert(0) += 1;
+        }
+    }
+    // A Linear the epilogue pass may absorb: Metal, f32/bf16 (the fused
+    // gemm's supported dtypes).
+    fn absorbable_linear(node: &Arc<Node>) -> Option<(Arc<Node>, Arc<Node>, Arc<Node>)> {
+        if !matches!(node.device, dev::Device::Metal)
+            || !matches!(node.dtype, DType::F32 | DType::BF16)
+        {
+            return None;
+        }
+        match &node.kind {
+            NodeKind::Linear { x, weight, bias } => Some((x.clone(), weight.clone(), bias.clone())),
+            _ => None,
+        }
+    }
+    let mut map: HashMap<u64, Arc<Node>> = HashMap::new();
+    for node in &order {
+        let remap = |ch: &Arc<Node>| map.get(&ch.id).cloned().unwrap_or_else(|| ch.clone());
+        match &node.kind {
+            NodeKind::Add { a: a0, b: b0 } => {
+                let a = remap(a0);
+                let b = remap(b0);
+                // (linear, residual) or (residual, linear); consumer
+                // counts are keyed by the ORIGINAL child ids, since the
+                // remap minted fresh ones.
+                let fused = [(a.clone(), b.clone(), a0.id), (b.clone(), a.clone(), b0.id)]
+                    .into_iter()
+                    .find_map(|(cand, res, orig_id)| {
+                        let (x, weight, bias) = absorbable_linear(&cand)?;
+                        // The Linear's only consumer must be this Add;
+                        // Linear backward reads x/w and the routed grad,
+                        // never its own output.
+                        if consumers.get(&orig_id).copied().unwrap_or(0) != 1 {
+                            return None;
+                        }
+                        if res.shape != cand.shape
+                            || res.dtype != cand.dtype
+                            || !matches!(res.device, dev::Device::Metal)
+                        {
+                            return None;
+                        }
+                        Some(Node::new(NodeKind::LinearResidual {
+                            x,
+                            weight,
+                            bias,
+                            residual: res,
+                        }))
+                    });
+                match fused {
+                    Some(fused) => {
+                        map.insert(node.id, fused?);
+                    }
+                    None => {
+                        map.insert(node.id, Node::new(NodeKind::Add { a, b })?);
+                    }
+                }
+            }
+            NodeKind::Gelu { a: a0, approximate } => {
+                let a = remap(a0);
+                match absorbable_linear(&a) {
+                    Some((x, weight, bias)) => {
+                        let orig_id = a0.id;
+                        if consumers.get(&orig_id).copied().unwrap_or(0) == 1 {
+                            // Nothing else reads the pre-activation (no
+                            // backward): the gemm stores only the gelu.
+                            map.insert(
+                                node.id,
+                                Node::new(NodeKind::LinearGelu {
+                                    x,
+                                    weight,
+                                    bias,
+                                    approximate: *approximate,
+                                    dual: false,
+                                })?,
+                            );
+                        } else {
+                            let dual = Node::new(NodeKind::LinearGelu {
+                                x,
+                                weight,
+                                bias,
+                                approximate: *approximate,
+                                dual: true,
+                            })?;
+                            map.insert(
+                                orig_id,
+                                Node::new(NodeKind::FusedPick {
+                                    of: dual.clone(),
+                                    index: 0,
+                                })?,
+                            );
+                            map.insert(
+                                node.id,
+                                Node::new(NodeKind::FusedPick { of: dual, index: 1 })?,
+                            );
+                        }
+                    }
+                    None => {
+                        map.insert(
+                            node.id,
+                            Node::new(NodeKind::Gelu {
+                                a,
+                                approximate: *approximate,
+                            })?,
+                        );
+                    }
+                }
+            }
+            _ => {
+                let rebuilt = remap_children(&node.kind, &remap);
+                map.insert(node.id, Node::new(rebuilt)?);
+            }
+        }
+    }
+    Ok(roots.iter().map(|r| map.get(&r.id).cloned().unwrap_or_else(|| r.clone())).collect())
+}
+
 fn fuse_roots(roots: &[Arc<Node>]) -> std::result::Result<Vec<Arc<Node>>, String> {
     let roots = &group_optimizer_steps(roots)?;
     if std::env::var_os("EFFECT_TORCH_NO_FUSION").is_some() {
         return Ok(roots.to_vec());
     }
+    // EFFECT_TORCH_NO_EPILOGUE isolates the pass for A/B measurement.
+    let roots = &if std::env::var_os("EFFECT_TORCH_NO_EPILOGUE").is_some() {
+        roots.to_vec()
+    } else {
+        gemm_epilogue_pass(roots)?
+    };
     use fusion::Expr as E;
 
     let mut order: Vec<Arc<Node>> = Vec::new();
@@ -7530,6 +7957,16 @@ fn fuse_roots(roots: &[Arc<Node>]) -> std::result::Result<Vec<Arc<Node>>, String
                 Some(OpT::Unary(Box::new(|a| E::Max(Box::new(a), Box::new(E::cst(0.0))))))
             }
             NodeKind::Tanh { .. } => Some(OpT::Unary(Box::new(|a| E::Tanh(Box::new(a))))),
+            NodeKind::Gelu { approximate, .. } => {
+                let approximate = *approximate;
+                Some(OpT::Unary(Box::new(move |a| {
+                    if approximate {
+                        E::GeluTanh(Box::new(a))
+                    } else {
+                        E::Gelu(Box::new(a))
+                    }
+                })))
+            }
             NodeKind::Abs { .. } => Some(OpT::Unary(Box::new(|a| E::Abs(Box::new(a))))),
             NodeKind::Erf { .. } => Some(OpT::Unary(Box::new(|a| E::Erf(Box::new(a))))),
             NodeKind::Floor { .. } => Some(OpT::Unary(Box::new(|a| E::Floor(Box::new(a))))),
@@ -8477,6 +8914,9 @@ fn node_kind_name(kind: &NodeKind) -> &'static str {
         NodeKind::Div { .. } => "Div",
         NodeKind::Matmul { .. } => "Matmul",
         NodeKind::Linear { .. } => "Linear",
+        NodeKind::LinearGelu { .. } => "LinearGelu",
+        NodeKind::LinearResidual { .. } => "LinearResidual",
+        NodeKind::Gelu { .. } => "Gelu",
         NodeKind::Sdpa { .. } => "Sdpa",
         NodeKind::SdpaBackward { .. } | NodeKind::SdpaBackwardOut { .. } => "SdpaBwd",
         NodeKind::Concat { .. } => "Concat",
@@ -10875,5 +11315,230 @@ mod chunked_ce_tests {
         let t = leaf(CpuTensor::from_vec(vec![0i64, 1, 2, 3, 4, 5], vec![2, 3]));
         let node = chunked_head_ce_with(&logits, &t, -100, 0, 1).unwrap();
         assert!(matches!(node.kind, NodeKind::CrossEntropy { reduction: CeReduction::Mean, .. }));
+    }
+}
+
+#[cfg(test)]
+#[cfg(target_os = "macos")]
+mod epilogue_tests {
+    use super::*;
+    use runtime::metal::device::MetalDevice;
+    use runtime::metal::run::MetalTensor;
+
+    fn mleaf(data: Vec<f32>, shape: Vec<usize>) -> Arc<Node> {
+        let t = MetalTensor::from_f32(MetalDevice::get(), data, shape);
+        Node::new(NodeKind::Leaf(std::sync::Arc::new(LeafSlot::new(val::Val::Metal(t))))).unwrap()
+    }
+
+    fn eval_f32(node: &Arc<Node>) -> Vec<f32> {
+        let cancelled = AtomicBool::new(false);
+        let mut ev = Evaluator::new(std::slice::from_ref(node));
+        let v = eval_node(node, &cancelled, &mut ev).unwrap();
+        v.to_f32_vec().unwrap()
+    }
+
+    fn assert_close(a: &[f32], b: &[f32], tol: f32, what: &str) {
+        assert_eq!(a.len(), b.len(), "{what}: length");
+        for (i, (x, y)) in a.iter().zip(b.iter()).enumerate() {
+            let d = (x - y).abs() / y.abs().max(1.0);
+            assert!(d <= tol, "{what}[{i}]: {x} vs {y}");
+        }
+    }
+
+    fn kind_counts(root: &Arc<Node>) -> HashMap<&'static str, usize> {
+        kind_counts_all(std::slice::from_ref(root))
+    }
+
+    fn kind_counts_all(roots: &[Arc<Node>]) -> HashMap<&'static str, usize> {
+        let mut counts: HashMap<&'static str, usize> = HashMap::new();
+        let mut seen = HashSet::new();
+        let mut stack = roots.to_vec();
+        while let Some(n) = stack.pop() {
+            if !seen.insert(n.id) {
+                continue;
+            }
+            *counts.entry(node_kind_name(&n.kind)).or_insert(0) += 1;
+            stack.extend(node_children(&n.kind));
+        }
+        counts
+    }
+
+    fn fixture() -> (Arc<Node>, Arc<Node>, Arc<Node>, Arc<Node>) {
+        let x = mleaf((0..24).map(|i| (i as f32 * 0.37).sin()).collect(), vec![2, 3, 4]);
+        let w = mleaf((0..32).map(|i| (i as f32 * 0.11).cos() * 0.5).collect(), vec![4, 8]);
+        let b = mleaf((0..8).map(|i| i as f32 * 0.05 - 0.2).collect(), vec![8]);
+        let r = mleaf((0..48).map(|i| (i as f32 * 0.19).sin() * 0.3).collect(), vec![2, 3, 8]);
+        (x, w, b, r)
+    }
+
+    fn linear(x: &Arc<Node>, w: &Arc<Node>, b: &Arc<Node>) -> Arc<Node> {
+        Node::new(NodeKind::Linear {
+            x: x.clone(),
+            weight: w.clone(),
+            bias: b.clone(),
+        })
+        .unwrap()
+    }
+
+    fn sum_all(a: &Arc<Node>) -> Arc<Node> {
+        Node::new(NodeKind::Sum {
+            a: a.clone(),
+            dims: vec![0, 1, 2],
+            keepdims: false,
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn residual_epilogue_matches_unfused() {
+        let (x, w, b, r) = fixture();
+        let out = Node::new(NodeKind::Add {
+            a: linear(&x, &w, &b),
+            b: r.clone(),
+        })
+        .unwrap();
+        let loss = sum_all(&out);
+        let grads = autodiff::grad(&loss, &[x.clone(), w.clone(), b.clone(), r.clone()]).unwrap();
+        let mut roots = vec![loss.clone()];
+        roots.extend(grads.iter().cloned());
+        let fused = gemm_epilogue_pass(&roots).unwrap();
+        let counts = kind_counts(&fused[0].clone());
+        assert_eq!(counts.get("LinearResidual"), Some(&1), "{counts:?}");
+        assert_eq!(counts.get("Linear"), None, "{counts:?}");
+        assert_eq!(counts.get("Add"), None, "{counts:?}");
+        for ((name, p), f) in ["loss", "dx", "dw", "db", "dr"]
+            .iter()
+            .zip(roots.iter())
+            .zip(fused.iter())
+        {
+            assert_close(&eval_f32(p), &eval_f32(f), 1e-4, name);
+        }
+    }
+
+    #[test]
+    fn residual_epilogue_keeps_shared_linear() {
+        // The Linear output feeding anything besides the Add (here a
+        // second residual consumer) blocks the rewrite.
+        let (x, w, b, r) = fixture();
+        let lin = linear(&x, &w, &b);
+        let out1 = Node::new(NodeKind::Add {
+            a: lin.clone(),
+            b: r.clone(),
+        })
+        .unwrap();
+        let out2 = Node::new(NodeKind::Add {
+            a: lin,
+            b: r.clone(),
+        })
+        .unwrap();
+        let fused = gemm_epilogue_pass(&[out1, out2]).unwrap();
+        let counts = kind_counts(&Node::new(NodeKind::Add {
+            a: fused[0].clone(),
+            b: fused[1].clone(),
+        })
+        .unwrap());
+        assert_eq!(counts.get("LinearResidual"), None, "{counts:?}");
+    }
+
+    #[test]
+    fn gelu_epilogue_matches_unfused() {
+        for approximate in [false, true] {
+            let (x, w, b, _) = fixture();
+            let g = Node::new(NodeKind::Gelu {
+                a: linear(&x, &w, &b),
+                approximate,
+            })
+            .unwrap();
+            let loss = sum_all(&g);
+            let grads = autodiff::grad(&loss, &[x.clone(), w.clone(), b.clone()]).unwrap();
+            let mut roots = vec![loss.clone()];
+            roots.extend(grads.iter().cloned());
+            let fused = gemm_epilogue_pass(&roots).unwrap();
+            let counts = kind_counts_all(&fused);
+            // Backward reads the pre-activation, so the dual-store
+            // variant must be present behind two FusedPick nodes.
+            assert_eq!(counts.get("LinearGelu"), Some(&1), "{counts:?}");
+            assert_eq!(counts.get("FusedPick"), Some(&2), "{counts:?}");
+            assert_eq!(counts.get("Linear"), None, "{counts:?}");
+            for ((name, p), f) in ["loss", "dx", "dw", "db"]
+                .iter()
+                .zip(roots.iter())
+                .zip(fused.iter())
+            {
+                assert_close(&eval_f32(p), &eval_f32(f), 1e-3, name);
+            }
+        }
+    }
+
+    #[test]
+    fn gelu_epilogue_drops_preact_without_backward() {
+        let (x, w, b, _) = fixture();
+        let g = Node::new(NodeKind::Gelu {
+            a: linear(&x, &w, &b),
+            approximate: false,
+        })
+        .unwrap();
+        let fused = gemm_epilogue_pass(std::slice::from_ref(&g)).unwrap();
+        let counts = kind_counts(&fused[0]);
+        assert_eq!(counts.get("LinearGelu"), Some(&1), "{counts:?}");
+        assert_eq!(counts.get("FusedPick"), None, "{counts:?}");
+        assert_close(&eval_f32(&g), &eval_f32(&fused[0]), 1e-4, "gelu");
+    }
+
+    #[test]
+    fn gelu_grad_matches_finite_difference() {
+        // The grad rule itself (not the epilogue): central differences
+        // on sum(gelu(x)) over a small CPU tensor, both variants.
+        for approximate in [false, true] {
+            let data: Vec<f32> = (0..12).map(|i| (i as f32 * 0.43).sin() * 2.0).collect();
+            let x = Node::new(NodeKind::Leaf(std::sync::Arc::new(LeafSlot::new(
+                val::Val::Cpu(runtime::cpu::Tensor::from_vec(data.clone(), vec![3, 4])),
+            ))))
+            .unwrap();
+            let g = Node::new(NodeKind::Gelu {
+                a: x.clone(),
+                approximate,
+            })
+            .unwrap();
+            let loss = Node::new(NodeKind::Sum {
+                a: g,
+                dims: vec![0, 1],
+                keepdims: false,
+            })
+            .unwrap();
+            let dx = &autodiff::grad(&loss, std::slice::from_ref(&x)).unwrap()[0];
+            let got = eval_f32(dx);
+            let eps = 1e-3f32;
+            for i in 0..data.len() {
+                let mut plus = data.clone();
+                plus[i] += eps;
+                let mut minus = data.clone();
+                minus[i] -= eps;
+                let f = |d: Vec<f32>| {
+                    let xl = Node::new(NodeKind::Leaf(std::sync::Arc::new(LeafSlot::new(
+                        val::Val::Cpu(runtime::cpu::Tensor::from_vec(d, vec![3, 4])),
+                    ))))
+                    .unwrap();
+                    let gl = Node::new(NodeKind::Gelu {
+                        a: xl,
+                        approximate,
+                    })
+                    .unwrap();
+                    let l = Node::new(NodeKind::Sum {
+                        a: gl,
+                        dims: vec![0, 1],
+                        keepdims: false,
+                    })
+                    .unwrap();
+                    eval_f32(&l)[0]
+                };
+                let want = (f(plus) - f(minus)) / (2.0 * eps);
+                assert!(
+                    (got[i] - want).abs() / want.abs().max(1.0) < 1e-2,
+                    "gelu grad[{i}] approximate={approximate}: {} vs {want}",
+                    got[i]
+                );
+            }
+        }
     }
 }

@@ -1346,22 +1346,9 @@ export interface GeluOptions {
  */
 export const gelu = dualOptions(
   (self: Any, options: GeluOptions = {}): Effect.Effect<Lazy, TensorError> =>
-    Effect.gen(function*() {
-      if (options.approximate === "tanh") {
-        const c = Math.sqrt(2 / Math.PI)
-        const inner = yield* mul(
-          yield* add(self, yield* mul(yield* pow(self, 3), yield* constantLike(self, 0.044715))),
-          yield* constantLike(self, c)
-        )
-        return yield* mul(
-          yield* mul(self, yield* constantLike(self, 0.5)),
-          yield* add(yield* tanh(inner), yield* constantLike(self, 1))
-        )
-      }
-      return yield* mul(
-        yield* mul(self, yield* constantLike(self, 0.5)),
-        yield* add(yield* erf(yield* div(self, yield* constantLike(self, Math.SQRT2))), yield* constantLike(self, 1))
-      )
+    Effect.try({
+      try: () => makeLazy(self.lazy.gelu(options.approximate === "tanh"), self.shape, self.dtype, self.device),
+      catch: (error) => new TensorError({ op: "gelu", message: error instanceof Error ? error.message : String(error) })
     })
 )
 

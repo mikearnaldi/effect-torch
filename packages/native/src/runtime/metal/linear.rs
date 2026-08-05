@@ -16,12 +16,31 @@ pub fn is_supported(x: &MetalTensor, weight: &MetalTensor) -> bool {
 pub use metal::linear_forward;
 
 #[cfg(target_os = "macos")]
+pub use metal::linear_forward_fused;
+
+#[cfg(target_os = "macos")]
 mod metal {
     use crate::runtime::metal::device::MetalDevice;
+    use crate::runtime::metal::gemm::Epilogue;
     use crate::runtime::metal::run::MetalTensor;
 
 
     pub fn linear_forward(x: &MetalTensor, weight: &MetalTensor, bias: &MetalTensor) -> crate::err::Res<MetalTensor> {
+        let (out, extra) = linear_forward_fused(x, weight, bias, None, None)?;
+        debug_assert!(extra.is_none());
+        Ok(out)
+    }
+
+    /// y = x·W + b with an optional epilogue: a residual add (same-shape
+    /// C source) or gelu (optionally dual-storing the pre-activation as
+    /// the second return). One gemm launch either way.
+    pub fn linear_forward_fused(
+        x: &MetalTensor,
+        weight: &MetalTensor,
+        bias: &MetalTensor,
+        residual: Option<&MetalTensor>,
+        gelu: Option<(bool, bool)>,
+    ) -> crate::err::Res<(MetalTensor, Option<MetalTensor>)> {
         let dims = x.layout.shape();
         let rank = dims.len();
         let (k, n) = (weight.layout.shape()[0], weight.layout.shape()[1]);
@@ -43,11 +62,35 @@ mod metal {
         } else {
             crate::runtime::metal::kernels::strided_copy(MetalDevice::get(), weight)?
         };
-        let out = crate::runtime::metal::gemm::gemm(
+        let rn = match residual {
+            Some(r) => {
+                let rr = flat(r, vec![b, m, n]);
+                Some(if rr.layout.is_contiguous() {
+                    rr
+                } else {
+                    crate::runtime::metal::kernels::strided_copy(MetalDevice::get(), &rr)?
+                })
+            }
+            None => None,
+        };
+        let epilogue = match (rn.is_some(), gelu) {
+            (true, None) => Epilogue::Residual,
+            (false, Some((false, false))) => Epilogue::GeluErf,
+            (false, Some((true, false))) => Epilogue::GeluTanh,
+            (false, Some((false, true))) => Epilogue::GeluErfDual,
+            (false, Some((true, true))) => Epilogue::GeluTanhDual,
+            (true, Some(_)) => {
+                return Err("linear: residual and gelu epilogues cannot combine".to_string())
+            }
+            (false, None) => Epilogue::None,
+        };
+        let (out, out2) = crate::runtime::metal::gemm::gemm_fused(
             MetalDevice::get(),
             &xn,
             &wn,
             Some(bias),
+            rn.as_ref(),
+            epilogue,
             b,
             m,
             n,
@@ -57,11 +100,12 @@ mod metal {
         )?;
         let mut out_shape = dims.to_vec();
         out_shape[rank - 1] = n;
-        Ok(MetalTensor {
-            buffer: out.buffer,
-            layout: crate::runtime::layout::Layout::contiguous(out_shape),
-            dtype: out.dtype,
-        })
+        let wrap = |t: MetalTensor| MetalTensor {
+            buffer: t.buffer,
+            layout: crate::runtime::layout::Layout::contiguous(out_shape.clone()),
+            dtype: t.dtype,
+        };
+        Ok((wrap(out), out2.map(wrap)))
     }
 }
 
