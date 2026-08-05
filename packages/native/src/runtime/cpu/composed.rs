@@ -222,12 +222,13 @@ pub fn cross_entropy_forward(
     logits: &Tensor,
     target: &Tensor,
     ignore_index: i64,
+    reduction: crate::CeReduction,
 ) -> Result<Tensor, String> {
     let r = rank(logits);
     let classes = logits.shape()[r - 1];
     let ignored = ce_ignored_mask(target, ignore_index);
     let count = ce_active_count(&ignored, target.numel());
-    if count == 0.0 {
+    if count == 0.0 && reduction == crate::CeReduction::Mean {
         return Err("cross_entropy: no active targets (all positions are ignored)".to_string());
     }
     ce_check_labels(target, &ignored, classes)?;
@@ -240,19 +241,25 @@ pub fn cross_entropy_forward(
     let per_position = squeeze_last(&lse).sub(&picked);
     let masked = Tensor::zeros(per_position.shape(), per_position.dtype()).where_(&ignored, &per_position);
     let total = masked.sum(&all_dims(&masked));
-    let scale = Tensor::full(total.shape(), 1.0 / count, total.dtype());
-    Ok(total.mul(&scale))
+    match reduction {
+        crate::CeReduction::Mean => {
+            let scale = Tensor::full(total.shape(), 1.0 / count, total.dtype());
+            Ok(total.mul(&scale))
+        }
+        crate::CeReduction::Sum => Ok(total),
+    }
 }
 
 pub fn cross_entropy_backward(
     logits: &Tensor,
     target: &Tensor,
     ignore_index: i64,
+    reduction: crate::CeReduction,
 ) -> Result<Tensor, String> {
     let r = rank(logits);
     let ignored = ce_ignored_mask(target, ignore_index);
     let count = ce_active_count(&ignored, target.numel());
-    if count == 0.0 {
+    if count == 0.0 && reduction == crate::CeReduction::Mean {
         return Err("cross_entropy: no active targets (all positions are ignored)".to_string());
     }
     let p = softmax_lastdim(logits);
@@ -265,8 +272,13 @@ pub fn cross_entropy_backward(
     let keep = ignored.eq(&Tensor::zeros(ignored.shape(), DType::U8));
     let keep = unsqueeze_last(&keep);
     let masked = p.where_(&keep, &Tensor::zeros(p.shape(), p.dtype()));
-    let scale = Tensor::full(masked.shape(), 1.0 / count, masked.dtype());
-    Ok(masked.mul(&scale))
+    match reduction {
+        crate::CeReduction::Mean => {
+            let scale = Tensor::full(masked.shape(), 1.0 / count, masked.dtype());
+            Ok(masked.mul(&scale))
+        }
+        crate::CeReduction::Sum => Ok(masked),
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -415,7 +427,7 @@ mod tests {
     fn cross_entropy_matches_log_softmax() {
         let logits = Tensor::from_vec(vec![2f32, 0., -1., 0., 3., 1.], vec![2, 3]);
         let target = Tensor::from_vec(vec![0i64, 1], vec![2]);
-        let loss = cross_entropy_forward(&logits, &target, -100).unwrap();
+        let loss = cross_entropy_forward(&logits, &target, -100, crate::CeReduction::Mean).unwrap();
         let lse = logsumexp_lastdim(&logits);
         let CpuBuffer::F32(v) = &lse.buffer else { panic!() };
         let expect = ((v[0] - 2.0) + (v[1] - 3.0)) / 2.0;

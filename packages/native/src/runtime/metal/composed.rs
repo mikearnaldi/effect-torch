@@ -265,12 +265,13 @@ pub fn cross_entropy_forward(
     logits: &MetalTensor,
     target: &MetalTensor,
     ignore_index: i64,
+    reduction: crate::CeReduction,
 ) -> crate::err::Res<MetalTensor> {
     let r = rank(logits);
     let classes = logits.layout.shape()[r - 1];
     let ignored = ce_ignored_mask(target, ignore_index)?;
     let count = ce_active_count(&ignored, target.numel())?;
-    if count == 0.0 {
+    if count == 0.0 && reduction == crate::CeReduction::Mean {
         return crate::err::err("cross_entropy: no active targets (all positions are ignored)");
     }
     ce_check_labels(target, &ignored, classes)?;
@@ -284,18 +285,24 @@ pub fn cross_entropy_forward(
     let masked = where_(&ignored, &zeros_like(&per_position)?, &per_position)?;
     let all: Vec<usize> = (0..rank(&masked)).collect();
     let total = reduce(&masked, &all, true, ReduceOp::Sum)?;
-    binary(&total, &fill(total.layout.shape(), 1.0 / count, total.dtype)?, BinOp::Mul)
+    match reduction {
+        crate::CeReduction::Mean => {
+            binary(&total, &fill(total.layout.shape(), 1.0 / count, total.dtype)?, BinOp::Mul)
+        }
+        crate::CeReduction::Sum => Ok(total),
+    }
 }
 
 pub fn cross_entropy_backward(
     logits: &MetalTensor,
     target: &MetalTensor,
     ignore_index: i64,
+    reduction: crate::CeReduction,
 ) -> crate::err::Res<MetalTensor> {
     let r = rank(logits);
     let ignored = ce_ignored_mask(target, ignore_index)?;
     let count = ce_active_count(&ignored, target.numel())?;
-    if count == 0.0 {
+    if count == 0.0 && reduction == crate::CeReduction::Mean {
         return crate::err::err("cross_entropy: no active targets (all positions are ignored)");
     }
     let p = softmax_lastdim(logits)?;
@@ -307,7 +314,12 @@ pub fn cross_entropy_backward(
     let keep = compare(&ignored, &fill(ignored.layout.shape(), 0.0, DType::U8)?, BinOp::Eq)?;
     let keep = unsqueeze_last(&keep)?;
     let masked = where_(&keep, &p, &zeros_like(&p)?)?;
-    binary(&masked, &fill(masked.layout.shape(), 1.0 / count, masked.dtype)?, BinOp::Mul)
+    match reduction {
+        crate::CeReduction::Mean => {
+            binary(&masked, &fill(masked.layout.shape(), 1.0 / count, masked.dtype)?, BinOp::Mul)
+        }
+        crate::CeReduction::Sum => Ok(masked),
+    }
 }
 
 pub fn rotary_forward(x: &MetalTensor, offsets: &[usize], theta: f64, sign: f64) -> crate::err::Res<MetalTensor> {

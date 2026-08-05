@@ -55,7 +55,7 @@ us, the head-gemm→CE chain — with every step behind a measurement
 gate. Cursor's MoK validates the scoped approach: hand-fusing the one
 layer that mattered beat the generic systems 2.37×.
 
-## Phase 1 — Buffer planning (arena allocation)
+## Phase 1 — Buffer planning (arena allocation) — **DONE**
 
 **Mechanism.** At `freezeProgram` time the schedule is fixed and every
 intermediate's shape/dtype is known. Walk the schedule, compute live
@@ -86,37 +86,66 @@ time does not regress; loss curve **bit-identical** (same kernels,
 same order, different addresses — this phase carries zero numerical
 risk).
 
-## Phase 2 — Chunked head + cross-entropy
+## Phase 2 — Chunked head + cross-entropy — **DONE**
 
 **The observation.** `logsumexp` is per-row and chunks are rows: the
 `[rows, 50257]` logits tensor has no cross-row dependency except the
-final `sum(nll)/count`. Split rows into chunks; per chunk, in forward:
-`gemm(hidden_chunk, W_head) + b → CE → nll_chunk`, keeping nothing but
-the nll and the hidden chunk (already live). In backward, recompute
-the logits chunk (rematerialization — gradient checkpointing applied
-to exactly one tensor), CE-backward it, and accumulate
-`dW_head += dlogits_chunkᵀ @ hidden_chunk`,
-`dhidden_chunk = dlogits_chunk @ W_headᵀ` in a fixed chunk order
-(deterministic).
+final `sum(nll)/count`.
 
-**Cost model.** The head gemm runs 1.5× (forward + recompute). At
-batch 128 that is +0.42 TFLOP against a ~6 TFLOP step — **~7% step
-time for −6.6 GB peak** (logits and dlogits both leave the live set).
+**As built** (differs from the original freeze-time sketch, simpler):
+the rewrite happens at **graph construction** in `cross_entropy`
+(`chunked_head_ce` in lib.rs), not at freeze. When the logits node is a
+`Linear` head and `rows × vocab ≥ 2^28` (env-overridable:
+`EFFECT_TORCH_CE_CHUNK_MIN`, `EFFECT_TORCH_CE_CHUNK_SIZE`):
 
-**Architecture.** A freeze-time rewrite, not a new public op:
-pattern-match `Linear(x, W, b) → CrossEntropy(target)` in the traced
-graph and replace with a `ChunkedLinearCE` node carrying a
-hand-written backward (`dhidden`, `dW`, `db`). The Model/Loss API is
-untouched — the model still logically returns logits. The rewrite is
-threshold-gated on `rows × vocab` so small models keep the simple
-path, and verified against the unfused path on a fixed seed. A
-forward-only variant serves held-out evaluation and inference without
-recompute cost.
+- rows are split into `clamp(numel / 2^26, 2, 64)` chunks;
+- per chunk: `Slice → Linear → CrossEntropy(Sum) → Checkpoint → Cast f32`;
+  the Checkpoint makes backward recompute the chunk logits (one extra
+  head gemm per chunk) instead of retaining them — peak logits memory
+  is one chunk, forward and backward;
+- the loss is `Σ chunk_sums / active_count` in f32, where the active
+  count is an exact integer reduction over the targets — reproducing
+  the Mean reduction without per-chunk normalization error.
+- A new `CeReduction::{Mean, Sum}` on the CE nodes carries this: Sum
+  never divides by the active count and never errors on an all-ignored
+  chunk (a padding-heavy batch can produce one); Mean keeps the exact
+  previous semantics, including the zero-active error. The fused Metal
+  kernels take a runtime `mean` flag (no pipeline-key split); the CPU
+  and Metal composed fallbacks mirror it.
+- Validation runs through the plain node first, so construction-time
+  error messages are identical whether or not the rewrite fires.
+- If the same logits node is consumed elsewhere too (sampling + loss),
+  the rewrite still fires for the CE path; the other consumer keeps the
+  full logits alive as before — correct, just not smaller.
 
-**Gate.** Loss curve equivalent to the unfused path within bf16
-tolerance (dW accumulation order changes, so not bit-exact); peak
-memory drops by the predicted amount; step-time regression ≤ the
-cost-model 7%.
+**Held-out evaluation** must build forward + CE as one lazy graph for
+the rewrite to fire: `model.execute` materializes logits, so applying
+`crossEntropy` to its result keeps the full `[rows, vocab]` tensor
+alive (this was the eval-time memory spike — a plain forward was using
+more than training). `heldOutLoss` now compiles `(params, input,
+target) → loss` via `Tensor.compile`; its plan shares the training
+arena's root.
+
+**Two latent bugs fixed along the way.** (a) The fused-multi kernel
+execution check reserved a phantom scalar-pack slot when `scalars` was
+empty, erroring at exactly 31 real buffer arguments — the batch-256
+loss combine hit it. (b) Pool bucketing rounded every allocation to a
+power of two, so a 1.1GB activation pinned a 2GB buffer; large blocks
+(≥64MB) now round to 64MB pages.
+
+**Measured** (30M preset, block 1024, mixedBf16, M4 Max 48GB):
+batch 128 step **2.86s chunked vs 3.06s unchunked** (faster — the
+6.6GB f32 logits and their CE internals never leave the L2/fabric
+budget), full-run peak ~13GB vs ~19.8GB; batch 192 trains at 4.26s/step;
+**batch 256 trains end-to-end in a 25.6GB cap** (5.7s/step, val
+included) — impossible before (logits alone were 13.2GB bf16). Loss
+curves match within bf16 reassociation (val 9.4791 chunked vs 9.4804
+unchunked from identical init).
+
+**Original sketch for the record.** A freeze-time `ChunkedLinearCE`
+node with a hand-written backward; the graph-construction rewrite plus
+the existing Checkpoint machinery (deep-copy recompute) subsumes it
+with no new node kind and automatic CPU parity.
 
 ## Phase 3 — Gemm epilogue/prologue fusion
 
@@ -175,10 +204,11 @@ pays at MoE/distributed scale we do not have.
 
 ## Verification
 
-Standard gates after every phase: `cargo test` (65), `pnpm vitest run`
-in `packages/core` (620, modulo the three documented environmental
-flakes), warning-free `cargo build`, `pnpm typecheck`, nano-gpt
-end-to-end at the 2.3–2.6s/400-step guardrail, fineweb step-time and
-peak-memory measurements at batch 64/128. Phase-specific gates as
-listed above. Native builds for perf comparisons are always
-`napi build --release`.
+Standard gates after every phase: `cargo test` (74), `pnpm vitest run`
+in `packages/core` (628, modulo the documented intermittent flakes),
+warning-free `cargo build`, `pnpm typecheck`, nano-gpt end-to-end at
+the 1.5s/400-step guardrail, fineweb step-time and peak-memory
+measurements at batch 64/128/256. Phase-specific gates as listed
+above. Native builds for perf comparisons are always
+`napi build --release`. All heavy runs under
+`EFFECT_TORCH_MEMORY_CAP_MB`.

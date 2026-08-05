@@ -626,12 +626,13 @@ mod metal {
         device: &Device,
     ) -> crate::err::Res<Vec<crate::val::Val>> {
         let _ = device;
-        // Metal exposes at most 31 buffer argument slots per kernel
-        // (scalars share one packed slot).
-        if inputs.len() + exprs.len() + 1 > 31 {
+        // Metal exposes at most 31 buffer argument slots per kernel; the
+        // packed-scalar buffer takes one only when scalars are present.
+        let scalar_slots = usize::from(!scalars.is_empty());
+        if inputs.len() + exprs.len() + scalar_slots > 31 {
             return Err(format!(
-                "fusion: {} buffer arguments exceed Metal's limit of 31",
-                inputs.len() + exprs.len() + 1
+                "fusion multi: {} buffer arguments exceed Metal's limit of 31",
+                inputs.len() + exprs.len() + scalar_slots
             ));
         }
         let phase_timing = std::env::var_os("EFFECT_TORCH_FUSION_TIMING").is_some();
@@ -709,7 +710,7 @@ mod metal {
         let _ = device;
         if inputs.len() + 1 > 31 {
             return Err(format!(
-                "fusion: {} buffer arguments exceed Metal's limit of 31",
+                "fusion reduce: {} buffer arguments exceed Metal's limit of 31",
                 inputs.len() + 1
             ));
         }
@@ -940,7 +941,7 @@ pub fn run_group_metal(
 ) -> crate::err::Res<Vec<crate::val::Val>> {
     if inputs.len() + plan.exprs.len() + 1 > 31 {
         return Err(format!(
-            "fusion: {} buffer arguments exceed Metal's limit of 31",
+            "fusion group: {} buffer arguments exceed Metal's limit of 31",
             inputs.len() + plan.exprs.len() + 1
         ));
     }

@@ -284,7 +284,16 @@ impl MetalDevice {
         if let Some(buf) = arena::replay_alloc(size) {
             return buf;
         }
-        let bucket_size = size.next_power_of_two().max(16);
+        let bucket_size = if size >= (64 << 20) {
+            // Large blocks: power-of-two bucketing pins up to 2x the
+            // request per live block (a 1.1 GB activation would hold a
+            // 2 GB buffer), which is what actually exhausts the driver
+            // on big capture runs. Round to 64 MB pages instead — reuse
+            // still works between equal-size requests.
+            size.next_multiple_of(64 << 20)
+        } else {
+            size.next_power_of_two().max(16)
+        };
         let mut alloc = self.allocator.lock().unwrap();
         {
             let mut retired = self.retired.lock().unwrap();

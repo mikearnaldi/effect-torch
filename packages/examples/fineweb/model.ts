@@ -100,22 +100,36 @@ export const heldOutLoss = (
   batches: number
 ) =>
   Effect.gen(function* () {
-    let total = 0
-    for (let i = 0; i < batches; i++) {
-      const { inputs, targets } = windows(
-        data,
-        Array.from({ length: batch }, () => Math.floor(Math.random() * (data.length - block - 1))),
-        batch,
-        block
-      )
-      const input = yield* Tensor.fromTypedArray(inputs, [batch, block])
-      const target = yield* Tensor.fromTypedArray(targets, [batch, block])
-      const logits = yield* model.execute(params, input)
-      const [lossTensor] = yield* Tensor.compute([yield* Loss.crossEntropy(logits, target)])
-      const [loss] = yield* Tensor.toNumberArray(lossTensor)
-      yield* Tensor.clear(logits)
-      yield* Tensor.clear(lossTensor)
-      total += loss
-    }
-    return total / batches
+    // Forward + loss as ONE frozen program: the chunked-head rewrite
+    // (RFC 0016 phase 2) fires inside it, so the full logits tensor is
+    // never materialized during evaluation, and the program's arena plan
+    // shares the training arena's memory instead of stacking on top.
+    return yield* Effect.acquireUseRelease(
+      Tensor.compile((inputs) =>
+        Effect.gen(function* () {
+          const logits = yield* model.forward(inputs.slice(0, -2), inputs[inputs.length - 2])
+          return [yield* Loss.crossEntropy(logits, inputs[inputs.length - 1])]
+        })
+      ),
+      (lossProgram) =>
+        Effect.gen(function* () {
+          let total = 0
+          for (let i = 0; i < batches; i++) {
+            const { inputs, targets } = windows(
+              data,
+              Array.from({ length: batch }, () => Math.floor(Math.random() * (data.length - block - 1))),
+              batch,
+              block
+            )
+            const input = yield* Tensor.fromTypedArray(inputs, [batch, block])
+            const target = yield* Tensor.fromTypedArray(targets, [batch, block])
+            const [lossTensor] = yield* lossProgram.call([...params, input, target])
+            const [loss] = yield* Tensor.toNumberArray(lossTensor)
+            yield* Tensor.clear(lossTensor)
+            total += loss
+          }
+          return total / batches
+        }),
+      (lossProgram) => lossProgram.clear
+    )
   })

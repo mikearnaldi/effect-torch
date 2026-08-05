@@ -110,13 +110,14 @@ kernel void et_ce_fwd(
     }}
 }}
 
-// Single threadgroup: loss = sum(nll) / active, plus active and
-// invalid counts for the host-side error semantics.
+// Single threadgroup: loss = sum(nll) (/ active when mean), plus active
+// and invalid counts for the host-side error semantics.
 kernel void et_ce_status(
     device const float* nll [[buffer(0)]],
     device const uint* flags [[buffer(1)]],
     device float* status [[buffer(2)]],
     constant uint& N [[buffer(3)]],
+    constant uint& mean [[buffer(4)]],
     uint tid [[thread_position_in_threadgroup]]
 ) {{
     float s = 0.0f;
@@ -142,7 +143,7 @@ kernel void et_ce_status(
         float ts = 0.0f;
         uint ta = 0, ti = 0;
         for (uint g = 0; g < NT / 32; g++) {{ ts += ps[g]; ta += pa[g]; ti += pi[g]; }}
-        status[0] = ta > 0 ? ts / float(ta) : 0.0f;
+        status[0] = (mean != 0u) ? (ta > 0 ? ts / float(ta) : 0.0f) : ts;
         status[1] = float(ta);
         status[2] = float(ti);
     }}
@@ -173,8 +174,8 @@ kernel void et_ce_count(
     }}
 }}
 
-// grad = (softmax(z) - one_hot(t)) / count for active rows, zeros
-// where ignored. One threadgroup per row, one pass.
+// grad = (softmax(z) - one_hot(t)) (/ count when mean) for active rows,
+// zeros where ignored. One threadgroup per row, one pass.
 kernel void et_ce_bwd(
     device const ZS* Z [[buffer(0)]],
     device const TGT* T [[buffer(1)]],
@@ -182,6 +183,7 @@ kernel void et_ce_bwd(
     device ZS* G [[buffer(3)]],
     constant uint& V [[buffer(4)]],
     constant long& ignore [[buffer(5)]],
+    constant uint& mean [[buffer(6)]],
     uint tgid [[threadgroup_position_in_grid]],
     uint tid [[thread_position_in_threadgroup]]
 ) {{
@@ -220,7 +222,7 @@ kernel void et_ce_bwd(
         lse = fm + log(fl);
     }}
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    const float inv = 1.0f / count[0];
+    const float inv = (mean != 0u) ? 1.0f / count[0] : 1.0f;
     for (uint j = tid; j < V; j += NT) {{
         const float p = exp(float(z[j]) - lse);
         g[j] = ZS((p - ((long)j == t ? 1.0f : 0.0f)) * inv);
@@ -261,7 +263,7 @@ kernel void et_ce_bwd(
     // Returns (loss scalar, status [3]) — the status is NOT read here:
     // checking it requires a device sync, which would split the walk's
     // encode pipeline. The evaluator defers it to the walk's end.
-    pub fn ce_forward(logits: &MetalTensor, target: &MetalTensor, ignore_index: i64) -> crate::err::Res<(MetalTensor, MetalTensor)> {
+    pub fn ce_forward(logits: &MetalTensor, target: &MetalTensor, ignore_index: i64, reduction: crate::CeReduction) -> crate::err::Res<(MetalTensor, MetalTensor)> {
         if std::env::var_os("EFFECT_TORCH_FUSION_DEBUG").is_some() {
             eprintln!("[ce] fused forward");
         }
@@ -297,12 +299,17 @@ kernel void et_ce_bwd(
         }
         {
             let pipe = pipeline(tgt, logits_dtype, "et_ce_status")?;
+            let mean: u32 = match reduction {
+                crate::CeReduction::Mean => 1,
+                crate::CeReduction::Sum => 0,
+            };
             MetalDevice::get().with_encoder(|e| {
                 e.setComputePipelineState(pipe.as_raw());
                 set_buffer(e, 0, &nll_buf, 0);
                 set_buffer(e, 1, &flags_buf, 0);
                 set_buffer(e, 2, &status_buf, 0);
                 set_bytes(e, 3, &(n as u32));
+                set_bytes(e, 4, &mean);
                 dispatch_grid(e, 1, NT);
             });
         }
@@ -316,8 +323,9 @@ kernel void et_ce_bwd(
     }
 
     // Returns (grad, count [1]) — the count check is deferred like the
-    // forward's status (see ce_forward).
-    pub fn ce_backward(logits: &MetalTensor, target: &MetalTensor, ignore_index: i64) -> crate::err::Res<(MetalTensor, MetalTensor)> {
+    // forward's status (see ce_forward). Sum reduction skips the count
+    // kernel entirely (no division by it) and binds a dummy buffer.
+    pub fn ce_backward(logits: &MetalTensor, target: &MetalTensor, ignore_index: i64, reduction: crate::CeReduction) -> crate::err::Res<(MetalTensor, MetalTensor)> {
         let rank = logits.layout.shape().len();
         let v = logits.layout.shape()[rank - 1];
         let n = logits.numel() / v;
@@ -334,7 +342,11 @@ kernel void et_ce_bwd(
         let _ = out_shape;
         let count_buf = alloc(1, crate::runtime::dtype::DType::F32);
         let grad_buf = alloc(n * v, logits_dtype);
-        {
+        let mean: u32 = match reduction {
+            crate::CeReduction::Mean => 1,
+            crate::CeReduction::Sum => 0,
+        };
+        if mean != 0 {
             let pipe = pipeline(tgt, logits_dtype, "et_ce_count")?;
             MetalDevice::get().with_encoder(|e| {
                 e.setComputePipelineState(pipe.as_raw());
@@ -355,6 +367,7 @@ kernel void et_ce_bwd(
                 set_buffer(e, 3, &grad_buf, 0);
                 set_bytes(e, 4, &(v as u32));
                 set_bytes(e, 5, &ignore_index);
+                set_bytes(e, 6, &mean);
                 dispatch_grid(e, n, NT);
             });
         }

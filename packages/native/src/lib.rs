@@ -542,6 +542,17 @@ enum PositionOffset {
     Cursor,
 }
 
+// Cross-entropy reduction over active (non-ignored) positions. Mean
+// divides the nll sum by the active count and errors when it is zero;
+// Sum returns the raw nll sum (zero when nothing is active) — the
+// chunked-head rewrite (RFC 0016 phase 2) composes Sum chunks into the
+// exact global mean itself.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CeReduction {
+    Mean,
+    Sum,
+}
+
 enum NodeKind {
     Leaf(std::sync::Arc<LeafSlot>),
     // RFC 0008: placeholder leaves for compiled programs. An Input carries
@@ -760,11 +771,13 @@ enum NodeKind {
         logits: Arc<Node>,
         target: Arc<Node>,
         ignore_index: i64,
+        reduction: CeReduction,
     },
     CrossEntropyBackward {
         logits: Arc<Node>,
         target: Arc<Node>,
         ignore_index: i64,
+        reduction: CeReduction,
     },
     // Scaled dot-product attention as one semantic node (the SgdStep
     // precedent: semantics in the graph, execution strategy native). The
@@ -1135,6 +1148,165 @@ fn cached_constant(value: f64, dtype: DType, device: Device) -> std::result::Res
     Ok(node)
 }
 
+// RFC 0016 phase 2 — chunked head. cross_entropy(Linear(x, w, b)) with a
+// huge logits tensor (LM vocab heads) is rewritten at graph construction
+// into per-chunk Sum cross-entropies, each wrapped in a Checkpoint so the
+// chunk logits live one chunk at a time (recomputed in backward) instead
+// of the full [rows, vocab] tensor being retained for the whole walk.
+// The chunk sums are combined in f32 and divided by the exact active
+// count, reproducing the Mean reduction bit-closely; model code is
+// untouched and the rewrite is backend-agnostic.
+const CHUNKED_CE_MIN_LOGITS: usize = 1 << 28;
+const CHUNKED_CE_CHUNK_LOGITS: usize = 1 << 26;
+const CHUNKED_CE_MAX_CHUNKS: usize = 64;
+
+fn chunked_ce_limits() -> (usize, usize) {
+    let read = |name: &str, default: usize| {
+        std::env::var(name)
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(default)
+    };
+    (
+        read("EFFECT_TORCH_CE_CHUNK_MIN", CHUNKED_CE_MIN_LOGITS),
+        read("EFFECT_TORCH_CE_CHUNK_SIZE", CHUNKED_CE_CHUNK_LOGITS),
+    )
+}
+
+fn chunked_head_ce(
+    logits: &Arc<Node>,
+    target: &Arc<Node>,
+    ignore_index: i64,
+) -> std::result::Result<Arc<Node>, String> {
+    let (min_logits, chunk_logits) = chunked_ce_limits();
+    chunked_head_ce_with(logits, target, ignore_index, min_logits, chunk_logits)
+}
+
+fn chunked_head_ce_with(
+    logits: &Arc<Node>,
+    target: &Arc<Node>,
+    ignore_index: i64,
+    min_logits: usize,
+    chunk_logits: usize,
+) -> std::result::Result<Arc<Node>, String> {
+    // Validate with the exact unchunked semantics first so error messages
+    // are identical whether or not the rewrite fires.
+    let plain = Node::new(NodeKind::CrossEntropy {
+        logits: logits.clone(),
+        target: target.clone(),
+        ignore_index,
+        reduction: CeReduction::Mean,
+    })?;
+    let NodeKind::Linear { x, weight, bias } = &logits.kind else {
+        return Ok(plain);
+    };
+    let (k_dim, vocab) = (weight.shape[0], weight.shape[1]);
+    let rank = x.shape.len();
+    if rank < 2 {
+        return Ok(plain);
+    }
+    let rows: usize = x.shape[..rank - 1].iter().product();
+    if rows < 2 {
+        return Ok(plain);
+    }
+    let numel = rows.saturating_mul(vocab);
+    if numel < min_logits {
+        return Ok(plain);
+    }
+    let chunks = (numel / chunk_logits)
+        .clamp(2, CHUNKED_CE_MAX_CHUNKS)
+        .min(rows);
+    if chunks < 2 {
+        return Ok(plain);
+    }
+    let device = logits.device.clone();
+    let x2 = if rank == 2 {
+        x.clone()
+    } else {
+        Node::new(NodeKind::Reshape {
+            a: x.clone(),
+            shape: vec![rows, k_dim],
+        })?
+    };
+    let t1 = if target.shape.as_slice() == [rows] {
+        target.clone()
+    } else {
+        Node::new(NodeKind::Reshape {
+            a: target.clone(),
+            shape: vec![rows],
+        })?
+    };
+    // Exact active count in f32: rows - #{t == ignore_index}. Counts are
+    // integers far below 2^24, so f32 is exact. A u32 target can never
+    // hold a negative (or huge) ignore_index, matching ce_ignored_mask.
+    let ignored_count = if target.dtype == DType::U32 && (ignore_index < 0 || ignore_index > u32::MAX as i64) {
+        cached_constant(0.0, DType::F32, device.clone())?
+    } else {
+        let ignore = cached_constant(ignore_index as f64, target.dtype, device.clone())?;
+        let ignored = Node::new(NodeKind::Eq {
+            a: t1.clone(),
+            b: ignore,
+        })?;
+        let ignored = Node::new(NodeKind::Cast {
+            a: ignored,
+            dtype: DType::F32,
+        })?;
+        Node::new(NodeKind::Sum {
+            a: ignored,
+            dims: vec![0],
+            keepdims: false,
+        })?
+    };
+    let rows_f32 = cached_constant(rows as f64, DType::F32, device)?;
+    let active = Node::new(NodeKind::Sub {
+        a: rows_f32,
+        b: ignored_count,
+    })?;
+    let chunk_len = rows.div_ceil(chunks);
+    let mut total: Option<Arc<Node>> = None;
+    let mut off = 0;
+    while off < rows {
+        let end = (off + chunk_len).min(rows);
+        let xk = Node::new(NodeKind::Slice {
+            a: x2.clone(),
+            ranges: vec![(off, end, 1), (0, k_dim, 1)],
+        })?;
+        let tk = Node::new(NodeKind::Slice {
+            a: t1.clone(),
+            ranges: vec![(off, end, 1)],
+        })?;
+        let lk = Node::new(NodeKind::Linear {
+            x: xk,
+            weight: weight.clone(),
+            bias: bias.clone(),
+        })?;
+        let cek = Node::new(NodeKind::CrossEntropy {
+            logits: lk,
+            target: tk,
+            ignore_index,
+            reduction: CeReduction::Sum,
+        })?;
+        // The checkpoint makes backward recompute this chunk's logits
+        // (one extra head gemm per chunk) instead of retaining every
+        // chunk's logits from forward to backward.
+        let ck = Node::new(NodeKind::Checkpoint { a: cek })?;
+        let ck32 = Node::new(NodeKind::Cast {
+            a: ck,
+            dtype: DType::F32,
+        })?;
+        total = Some(match total {
+            None => ck32,
+            Some(t) => Node::new(NodeKind::Add { a: t, b: ck32 })?,
+        });
+        off = end;
+    }
+    let total = total.expect("at least one chunk");
+    Node::new(NodeKind::Div {
+        a: total,
+        b: active,
+    })
+}
+
 fn broadcast_shapes(a: &[usize], b: &[usize]) -> std::result::Result<Vec<usize>, String> {
     let rank = a.len().max(b.len());
     let mut out = Vec::with_capacity(rank);
@@ -1412,6 +1584,7 @@ impl Node {
                 logits,
                 target,
                 ignore_index: _,
+                reduction: _,
             } => {
                 let rank = logits.shape.len();
                 if rank < 1 {
@@ -2600,11 +2773,7 @@ impl LazyTensor {
 
     #[napi]
     pub fn cross_entropy(&self, target: &LazyTensor, ignore_index: i64) -> Result<Self> {
-        lazy_ctor!(Node::new(NodeKind::CrossEntropy {
-            logits: self.node.clone(),
-            target: target.node.clone(),
-            ignore_index,
-        }))
+        lazy_ctor!(chunked_head_ce(&self.node, &target.node, ignore_index))
     }
 
     #[napi]
@@ -2950,13 +3119,22 @@ struct Evaluator {
     // ordinary and non-kv compiled walks; KvAttention nodes error without
     // it.
     kv: Option<Arc<KvContext>>,
-    // Deferred cross-entropy status checks (fused CE): (buffer,
-    // forward?, classes). Reading the status requires a device sync,
-    // which would split the walk's encode/execute pipeline mid-graph —
-    // so the fused kernels record their status here and the walk
-    // validates them after its final synchronize, preserving the exact
-    // error semantics.
-    ce_checks: Vec<(val::Val, bool, usize)>,
+    // Deferred cross-entropy status checks (fused CE): (buffer, kind,
+    // classes). Reading the status requires a device sync, which would
+    // split the walk's encode/execute pipeline mid-graph — so the fused
+    // kernels record their status here and the walk validates them after
+    // its final synchronize, preserving the exact error semantics.
+    ce_checks: Vec<(val::Val, CeCheck, usize)>,
+}
+
+// Which deferred status check a fused cross-entropy call needs. Sum
+// reductions never divide by the active count, so their forward only
+// validates labels and their backward needs no check at all.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CeCheck {
+    ForwardMean,
+    ForwardSum,
+    BackwardMean,
 }
 
 impl Evaluator {
@@ -3047,24 +3225,32 @@ impl Evaluator {
     // synchronize: forward statuses are [loss, active, invalid],
     // backward counts are [active]. Errors are exactly the composed
     // path's, raised from the same eval call.
-    fn run_ce_checks(&self) -> crate::err::Res<()> {        for (buffer, forward, classes) in &self.ce_checks {
+    fn run_ce_checks(&self) -> crate::err::Res<()> {
+        for (buffer, kind, classes) in &self.ce_checks {
             let values = buffer.to_f32_vec()?;
-            if *forward {
-                let (active, invalid) = (values[1] as usize, values[2] as usize);
-                if active == 0 {
-                    return Err(
-                        "cross_entropy: no active targets (all positions are ignored)".to_string(),
-                    );
+            match kind {
+                CeCheck::ForwardMean | CeCheck::ForwardSum => {
+                    let (active, invalid) = (values[1] as usize, values[2] as usize);
+                    if *kind == CeCheck::ForwardMean && active == 0 {
+                        return Err(
+                            "cross_entropy: no active targets (all positions are ignored)"
+                                .to_string(),
+                        );
+                    }
+                    if invalid > 0 {
+                        return Err(format!(
+                            "cross_entropy: target out of range [0, {classes}) at an active position"
+                        ));
+                    }
                 }
-                if invalid > 0 {
-                    return Err(format!(
-                        "cross_entropy: target out of range [0, {classes}) at an active position"
-                    ));
+                CeCheck::BackwardMean => {
+                    if values[0] == 0.0 {
+                        return Err(
+                            "cross_entropy: no active targets (all positions are ignored)"
+                                .to_string(),
+                        );
+                    }
                 }
-            } else if values[0] == 0.0 {
-                return Err(
-                    "cross_entropy: no active targets (all positions are ignored)".to_string(),
-                );
             }
         }
         Ok(())
@@ -3422,19 +3608,23 @@ fn remap_children(kind: &NodeKind, f: &dyn Fn(&Arc<Node>) -> Arc<Node>) -> NodeK
             logits,
             target,
             ignore_index,
+            reduction,
         } => NodeKind::CrossEntropy {
             logits: f(logits),
             target: f(target),
             ignore_index: *ignore_index,
+            reduction: *reduction,
         },
         NodeKind::CrossEntropyBackward {
             logits,
             target,
             ignore_index,
+            reduction,
         } => NodeKind::CrossEntropyBackward {
             logits: f(logits),
             target: f(target),
             ignore_index: *ignore_index,
+            reduction: *reduction,
         },
         NodeKind::Sdpa {
             q,
@@ -4456,23 +4646,28 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> crate::err::Res<val::V
             logits,
             target,
             ignore_index,
+            reduction,
         } => {
             let logits_t = ev.value(logits.id)?;
             let target_t = ev.value(target.id)?;
             match (&logits_t, &target_t) {
                 (val::Val::Cpu(l), val::Val::Cpu(t)) => {
-                    let r = runtime::cpu::composed::cross_entropy_forward(l, t, *ignore_index)?;
+                    let r = runtime::cpu::composed::cross_entropy_forward(l, t, *ignore_index, *reduction)?;
                     val::Val::Cpu(r)
                 }
                 (val::Val::Metal(l), val::Val::Metal(t)) => {
                     if loss::is_supported(l, t) {
-                        let (loss_t, status) = loss::ce_forward(l, t, *ignore_index)?;
+                        let (loss_t, status) = loss::ce_forward(l, t, *ignore_index, *reduction)?;
                         let classes = l.layout.shape()[l.layout.shape().len() - 1];
-                        ev.ce_checks.push((val::Val::Metal(status), true, l.numel() / classes));
+                        let check = match reduction {
+                            CeReduction::Mean => CeCheck::ForwardMean,
+                            CeReduction::Sum => CeCheck::ForwardSum,
+                        };
+                        ev.ce_checks.push((val::Val::Metal(status), check, l.numel() / classes));
                         val::Val::Metal(loss_t)
                     } else {
                         let l32 = metal_ops::to_f32(l)?;
-                        let r = composed::cross_entropy_forward(&l32, t, *ignore_index)?;
+                        let r = composed::cross_entropy_forward(&l32, t, *ignore_index, *reduction)?;
                         val::Val::Metal(r)
                     }
                 }
@@ -4483,22 +4678,28 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> crate::err::Res<val::V
             logits,
             target,
             ignore_index,
+            reduction,
         } => {
             let logits_t = ev.value(logits.id)?;
             let target_t = ev.value(target.id)?;
             match (&logits_t, &target_t) {
                 (val::Val::Cpu(l), val::Val::Cpu(t)) => {
-                    let r = runtime::cpu::composed::cross_entropy_backward(l, t, *ignore_index)?;
+                    let r = runtime::cpu::composed::cross_entropy_backward(l, t, *ignore_index, *reduction)?;
                     val::Val::Cpu(r)
                 }
                 (val::Val::Metal(l), val::Val::Metal(t)) => {
                     if loss::is_supported(l, t) {
-                        let (grad, count) = loss::ce_backward(l, t, *ignore_index)?;
-                        ev.ce_checks.push((val::Val::Metal(count), false, 0));
+                        let (grad, count) = loss::ce_backward(l, t, *ignore_index, *reduction)?;
+                        // Sum backward does not divide by the active
+                        // count, so the zero-active check is a forward
+                        // (Mean) concern only.
+                        if *reduction == CeReduction::Mean {
+                            ev.ce_checks.push((val::Val::Metal(count), CeCheck::BackwardMean, 0));
+                        }
                         val::Val::Metal(grad)
                     } else {
                         let l32 = metal_ops::to_f32(l)?;
-                        let r = composed::cross_entropy_backward(&l32, t, *ignore_index)?;
+                        let r = composed::cross_entropy_backward(&l32, t, *ignore_index, *reduction)?;
                         val::Val::Metal(r)
                     }
                 }
@@ -6660,11 +6861,13 @@ mod autodiff {
                     logits,
                     target,
                     ignore_index,
+                    reduction,
                 } => {
                     let gb = mk(NodeKind::CrossEntropyBackward {
                         logits: logits.clone(),
                         target: target.clone(),
                         ignore_index: *ignore_index,
+                        reduction: *reduction,
                     })?;
                     accumulate(logits, mul(g, gb))?;
                 }
@@ -10582,5 +10785,95 @@ mod kv_tests {
         state.note_tokens(&pool, &[5]);
         let store = pool.blocks.lock().unwrap();
         assert_eq!(store.hashes[state.blocks[1] as usize], Some(second));
+    }
+}
+
+#[cfg(test)]
+mod chunked_ce_tests {
+    use super::*;
+    use runtime::cpu::Tensor as CpuTensor;
+
+    fn leaf(t: CpuTensor) -> Arc<Node> {
+        Node::new(NodeKind::Leaf(std::sync::Arc::new(LeafSlot::new(val::Val::Cpu(t))))).unwrap()
+    }
+
+    fn eval_f32(node: &Arc<Node>) -> Vec<f32> {
+        let cancelled = AtomicBool::new(false);
+        let mut ev = Evaluator::new(std::slice::from_ref(node));
+        let v = eval_node(node, &cancelled, &mut ev).unwrap();
+        v.to_f32_vec().unwrap()
+    }
+
+    fn assert_close(a: &[f32], b: &[f32], tol: f32, what: &str) {
+        assert_eq!(a.len(), b.len(), "{what}: length");
+        for (i, (x, y)) in a.iter().zip(b.iter()).enumerate() {
+            assert!((x - y).abs() <= tol, "{what}[{i}]: {x} vs {y}");
+        }
+    }
+
+    // Builds x_leaf -> tanh -> Linear(w, b) logits so the checkpoint
+    // regions share a non-leaf trunk input, plus i64 targets.
+    fn head(targets: Vec<i64>) -> (Arc<Node>, Arc<Node>, Arc<Node>, Arc<Node>, Arc<Node>) {
+        let x_leaf = leaf(CpuTensor::from_vec(
+            (0..24).map(|i| (i as f32 * 0.37).sin()).collect(),
+            vec![2, 3, 4],
+        ));
+        let x = Node::new(NodeKind::Tanh { a: x_leaf.clone() }).unwrap();
+        let w = leaf(CpuTensor::from_vec(
+            (0..32).map(|i| (i as f32 * 0.11).cos() * 0.5).collect(),
+            vec![4, 8],
+        ));
+        let b = leaf(CpuTensor::from_vec(
+            (0..8).map(|i| i as f32 * 0.05 - 0.2).collect(),
+            vec![8],
+        ));
+        let logits = Node::new(NodeKind::Linear {
+            x,
+            weight: w.clone(),
+            bias: b.clone(),
+        })
+        .unwrap();
+        let t = leaf(CpuTensor::from_vec(targets, vec![2, 3]));
+        (logits, t, x_leaf, w, b)
+    }
+
+    #[test]
+    fn chunked_ce_matches_unchunked() {
+        let (logits, t, x, w, b) = head(vec![0, 1, 2, 3, 4, 5]);
+        // min = usize::MAX disables the rewrite: the plain Mean node.
+        let plain = chunked_head_ce_with(&logits, &t, -100, usize::MAX, 1).unwrap();
+        // size 1 forces one row per chunk (6 chunks over 6 rows).
+        let chunked = chunked_head_ce_with(&logits, &t, -100, 0, 1).unwrap();
+        assert_close(&eval_f32(&plain), &eval_f32(&chunked), 1e-5, "loss");
+        let gp = autodiff::grad(&plain, &[x.clone(), w.clone(), b.clone()]).unwrap();
+        let gc = autodiff::grad(&chunked, &[x, w, b]).unwrap();
+        for ((name, a), c) in ["dx", "dw", "db"].iter().zip(gp.iter()).zip(gc.iter()) {
+            assert_close(&eval_f32(a), &eval_f32(c), 1e-4, name);
+        }
+    }
+
+    #[test]
+    fn chunked_ce_with_fully_ignored_chunk() {
+        // chunk_len is 1 row: chunk 0 is entirely ignored, one later
+        // position is ignored — the Sum reduction must absorb both.
+        let (logits, t, x, w, b) = head(vec![-100, 1, 2, 3, -100, 5]);
+        let plain = chunked_head_ce_with(&logits, &t, -100, usize::MAX, 1).unwrap();
+        let chunked = chunked_head_ce_with(&logits, &t, -100, 0, 1).unwrap();
+        assert_close(&eval_f32(&plain), &eval_f32(&chunked), 1e-5, "loss");
+        let gp = autodiff::grad(&plain, &[x.clone(), w.clone(), b.clone()]).unwrap();
+        let gc = autodiff::grad(&chunked, &[x, w, b]).unwrap();
+        for ((name, a), c) in ["dx", "dw", "db"].iter().zip(gp.iter()).zip(gc.iter()) {
+            assert_close(&eval_f32(a), &eval_f32(c), 1e-4, name);
+        }
+    }
+
+    #[test]
+    fn chunked_ce_only_rewrites_linear_heads() {
+        // An arbitrary logits tensor (no Linear producer) is left alone
+        // even when the limits would fire.
+        let logits = leaf(CpuTensor::from_vec(vec![0.1f32; 2 * 3 * 8], vec![2, 3, 8]));
+        let t = leaf(CpuTensor::from_vec(vec![0i64, 1, 2, 3, 4, 5], vec![2, 3]));
+        let node = chunked_head_ce_with(&logits, &t, -100, 0, 1).unwrap();
+        assert!(matches!(node.kind, NodeKind::CrossEntropy { reduction: CeReduction::Mean, .. }));
     }
 }

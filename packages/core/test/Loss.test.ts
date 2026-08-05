@@ -118,6 +118,61 @@ onDevices("Loss", () => (it) => {
         expect(error.message).toContain("i64")
       })
     )
+
+    it.effect("chunked head crossEntropy matches the unchunked head", () =>
+      Effect.gen(function* () {
+        // Force the RFC 0016 phase-2 rewrite on tiny shapes: one row per
+        // chunk. The linear->CE head is chunked + checkpointed; loss and
+        // gradients must match the plain Mean head.
+        const withChunkEnv = <A, E, R>(min: string, size: string, effect: Effect.Effect<A, E, R>) =>
+          Effect.acquireUseRelease(
+            Effect.sync(() => {
+              const prev = [process.env.EFFECT_TORCH_CE_CHUNK_MIN, process.env.EFFECT_TORCH_CE_CHUNK_SIZE]
+              process.env.EFFECT_TORCH_CE_CHUNK_MIN = min
+              process.env.EFFECT_TORCH_CE_CHUNK_SIZE = size
+              return prev
+            }),
+            () => effect,
+            (prev) =>
+              Effect.sync(() => {
+                const keys = ["EFFECT_TORCH_CE_CHUNK_MIN", "EFFECT_TORCH_CE_CHUNK_SIZE"]
+                for (const [i, key] of keys.entries()) {
+                  const value = prev[i]
+                  if (value === undefined) delete process.env[key]
+                  else process.env[key] = value
+                }
+              })
+          )
+        const run = (min: string, size: string, targets: Tensor.Any) =>
+          withChunkEnv(
+            min,
+            size,
+            Effect.gen(function* () {
+              const x = yield* f32(Array.from({ length: 24 }, (_, i) => Math.sin(i * 0.37)), [2, 3, 4])
+              const w = yield* f32(Array.from({ length: 32 }, (_, i) => Math.cos(i * 0.11) * 0.5), [4, 8])
+              const b = yield* f32(Array.from({ length: 8 }, (_, i) => i * 0.05 - 0.2), [8])
+              const logits = yield* Tensor.linear(x, w, b)
+              const loss = yield* Tensor.crossEntropy(logits, { target: targets, ignoreIndex: -100 })
+              const [value] = yield* values(loss)
+              const grads = yield* Gradient.grad(loss, [x, w, b])
+              return [value, ...(yield* Effect.all(grads.map((g) => values(g))))] as Array<number | Array<number>>
+            })
+          )
+        for (const targets of [yield* i64([0n, 1n, 2n, 3n, 4n, 5n], [2, 3]), yield* i64([-100n, 1n, 2n, 3n, -100n, 5n], [2, 3])]) {
+          const plain = yield* run("999999999999", "67108864", targets)
+          const chunked = yield* run("0", "1", targets)
+          expect(Math.abs((plain[0] as number) - (chunked[0] as number))).toBeLessThan(1e-5)
+          for (let g = 0; g < 3; g++) {
+            const a = plain[g + 1] as Array<number>
+            const c = chunked[g + 1] as Array<number>
+            expect(a.length).toBe(c.length)
+            for (let i = 0; i < a.length; i++) {
+              expect(Math.abs(a[i] - c[i])).toBeLessThan(1e-4)
+            }
+          }
+        }
+      })
+    )
   })
 
   describe("gradcheck (finite differences)", () => {
