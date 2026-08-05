@@ -11,7 +11,7 @@ import { BLOCK, createGpt, EOT, loadParams, loadTokenizer } from "./model.js"
 
 const TEMPERATURE = 0.8
 const MAX_NEW_TOKENS = 240
-const CHECKPOINT = new URL("../backup/fineweb-ckpt.safetensors", import.meta.url).pathname
+const CHECKPOINT = new URL("../backup/fineweb-epoch-ckpt.safetensors", import.meta.url).pathname
 
 // Multinomial sampling with temperature over a probability vector.
 const sampleCategorical = (probs: ReadonlyArray<number>, temperature: number) => {
