@@ -207,10 +207,10 @@ const checkClassTargets = (
 export const crossEntropy = dualLoss<Tensor.Any, LossOptions, CurrentDevice>((logits, targets, options) =>
   Effect.gen(function* () {
     const depth = yield* checkClassTargets("crossEntropy", logits, targets)
-    if (logits.dtype !== "f32" && logits.dtype !== "f64") {
+    if (logits.dtype !== "f32" && logits.dtype !== "f64" && logits.dtype !== "bf16") {
       return yield* new Tensor.TensorError({
         op: "crossEntropy",
-        message: `crossEntropy: logits must be f32 or f64, got ${logits.dtype}`
+        message: `crossEntropy: logits must be f32, f64 or bf16, got ${logits.dtype}`
       })
     }
     if ((options?.reduction ?? "mean") === "mean") {

@@ -51,11 +51,14 @@ mod metal {
         dv: usize,
         scale: f64,
         causal: bool,
+        ty: &str,
     ) -> String {
         format!(
             r#"
 #include <metal_stdlib>
 using namespace metal;
+
+#define STOR {ty}
 
 #define T {t}
 #define S {s}
@@ -70,10 +73,10 @@ using namespace metal;
 #define OFFSET {offset}
 
 kernel void et_sdpa_fwd(
-    device const float* Q [[buffer(0)]],
-    device const float* K [[buffer(1)]],
-    device const float* V [[buffer(2)]],
-    device float* O [[buffer(3)]],
+    device const STOR* Q [[buffer(0)]],
+    device const STOR* K [[buffer(1)]],
+    device const STOR* V [[buffer(2)]],
+    device STOR* O [[buffer(3)]],
     device float* L [[buffer(4)]],
     uint3 tgid [[threadgroup_position_in_grid]],
     uint3 tpitg [[thread_position_in_threadgroup]]
@@ -81,10 +84,10 @@ kernel void et_sdpa_fwd(
     const int q0 = tgid.x * TQ;
     const long bh = tgid.y;
     const uint tid = tpitg.x;
-    device const float* Qb = Q + bh * (long)T * D;
-    device const float* Kb = K + bh * (long)S * D;
-    device const float* Vb = V + bh * (long)S * DV;
-    device float* Ob = O + bh * (long)T * DV;
+    device const STOR* Qb = Q + bh * (long)T * D;
+    device const STOR* Kb = K + bh * (long)S * D;
+    device const STOR* Vb = V + bh * (long)S * DV;
+    device STOR* Ob = O + bh * (long)T * DV;
 
     threadgroup float St[TQ][TK];
     threadgroup float Ot[TQ][DV];
@@ -107,7 +110,7 @@ kernel void et_sdpa_fwd(
             float acc;
             if (q < T && k < S && (!CAUSAL || k <= q + OFFSET)) {{
                 acc = 0.0f;
-                for (int d = 0; d < D; d++) {{ acc += Qb[q * D + d] * Kb[k * D + d]; }}
+                for (int d = 0; d < D; d++) {{ acc += float(Qb[q * D + d]) * float(Kb[k * D + d]); }}
                 acc *= SCALE;
             }} else {{
                 acc = -INFINITY;
@@ -141,7 +144,7 @@ kernel void et_sdpa_fwd(
             float acc = Ot[qi][dv] * corr[qi];
             for (int kj = 0; kj < TK; kj++) {{
                 int k = kt + kj;
-                if (k < S) {{ acc += St[qi][kj] * Vb[k * DV + dv]; }}
+                if (k < S) {{ acc += St[qi][kj] * float(Vb[k * DV + dv]); }}
             }}
             Ot[qi][dv] = acc;
         }}
@@ -151,7 +154,7 @@ kernel void et_sdpa_fwd(
         int qi = i / DV;
         int dv = i % DV;
         int q = q0 + qi;
-        if (q < T) {{ Ob[q * DV + dv] = Ot[qi][dv] / l[qi]; }}
+        if (q < T) {{ Ob[q * DV + dv] = STOR(Ot[qi][dv] / l[qi]); }}
     }}
     // L = logsumexp(scores) per row, for the backward's P recomputation.
     for (int i = tid; i < TQ; i += NT) {{
@@ -170,6 +173,7 @@ kernel void et_sdpa_fwd(
             scale = scale as f32,
             causal = if causal { 1 } else { 0 },
             offset = s.saturating_sub(t),
+            ty = ty,
         )
     }
 
@@ -180,14 +184,20 @@ kernel void et_sdpa_fwd(
         dv: usize,
         scale: f64,
         causal: bool,
+        dtype: crate::runtime::dtype::DType,
     ) -> crate::err::Res<Pipeline> {
         use std::collections::hash_map::DefaultHasher;
         use std::hash::{Hash, Hasher};
 
         let mut hasher = DefaultHasher::new();
-        (t, s, d, dv, scale.to_bits(), causal).hash(&mut hasher);
+        (t, s, d, dv, scale.to_bits(), causal, dtype).hash(&mut hasher);
         let key = hasher.finish();
-        MetalDevice::get().compile_lazy(key, "et_sdpa_fwd", || kernel_source(t, s, d, dv, scale, causal))
+        let ty = match dtype {
+            crate::runtime::dtype::DType::F32 => "float",
+            crate::runtime::dtype::DType::BF16 => "bfloat",
+            other => return Err(format!("flash: unsupported dtype {other:?}")),
+        };
+        MetalDevice::get().compile_lazy(key, "et_sdpa_fwd", || kernel_source(t, s, d, dv, scale, causal, ty))
     }
 
     pub fn forward(
@@ -213,10 +223,12 @@ kernel void et_sdpa_fwd(
         let q = contig(&flat(q, bh, t, d))?;
         let k = contig(&flat(k, bh, s, d))?;
         let v = contig(&flat(v, bh, s, dv))?;
-        let pipe = pipeline(t, s, d, dv, scale, causal)?;
-        let o_buf = alloc_f32(bh * t * dv);
+        let dtype = q.dtype;
+        let pipe = pipeline(t, s, d, dv, scale, causal, dtype)?;
+        let o_buf = MetalDevice::get().alloc((bh * t * dv).max(1), dtype);
         let l_buf = alloc_f32(bh * t);
-        let byte_offset = |off: usize| off * 4;
+        let sz = dtype.size_in_bytes();
+        let byte_offset = |off: usize| off * sz;
         MetalDevice::get().with_encoder(|e| {
             e.setComputePipelineState(pipe.as_raw());
             set_buffer(e, 0, &q.buffer, byte_offset(q.layout.offset()));
@@ -240,7 +252,7 @@ kernel void et_sdpa_fwd(
         let o = MetalTensor {
             buffer: o_buf,
             layout: crate::runtime::layout::Layout::contiguous(out_shape),
-            dtype: crate::runtime::dtype::DType::F32,
+            dtype,
         };
         let l = MetalTensor {
             buffer: l_buf,
@@ -256,11 +268,13 @@ kernel void et_sdpa_fwd(
     // in threadgroup memory and consumed by all four gradients — the
     // shared-data win over the composed recompute (~12 DRAM round
     // trips per tile).
-    fn bwd_source(t: usize, s: usize, d: usize, dv: usize, scale: f64, causal: bool) -> String {
+    fn bwd_source(t: usize, s: usize, d: usize, dv: usize, scale: f64, causal: bool, ty: &str) -> String {
         format!(
             r#"
 #include <metal_stdlib>
 using namespace metal;
+
+#define STOR {ty}
 
 #define T {t}
 #define S {s}
@@ -277,38 +291,38 @@ using namespace metal;
 #define CELLS_DQ ((TQ * D + NT - 1) / NT)
 
 kernel void et_sdpa_bwd_kv(
-    device const float* Q [[buffer(0)]],
-    device const float* K [[buffer(1)]],
-    device const float* V [[buffer(2)]],
-    device const float* G [[buffer(3)]],
+    device const STOR* Q [[buffer(0)]],
+    device const STOR* K [[buffer(1)]],
+    device const STOR* V [[buffer(2)]],
+    device const STOR* G [[buffer(3)]],
     device const float* L [[buffer(4)]],
     device const float* Dvec [[buffer(5)]],
-    device float* DK [[buffer(6)]],
-    device float* DVout [[buffer(7)]],
+    device STOR* DK [[buffer(6)]],
+    device STOR* DVout [[buffer(7)]],
     uint3 tgid [[threadgroup_position_in_grid]],
     uint3 tpitg [[thread_position_in_threadgroup]]
 ) {{
     const int j0 = tgid.x * TK;
     const long bh = tgid.y;
     const uint tid = tpitg.x;
-    device const float* Qb = Q + bh * (long)T * D;
-    device const float* Kb = K + bh * (long)S * D;
-    device const float* Vb = V + bh * (long)S * DV;
-    device const float* Gb = G + bh * (long)T * DV;
+    device const STOR* Qb = Q + bh * (long)T * D;
+    device const STOR* Kb = K + bh * (long)S * D;
+    device const STOR* Vb = V + bh * (long)S * DV;
+    device const STOR* Gb = G + bh * (long)T * DV;
     device const float* Lb = L + bh * (long)T;
     device const float* Db = Dvec + bh * (long)T;
-    device float* DKb = DK + bh * (long)S * D;
-    device float* DVb = DVout + bh * (long)S * DV;
+    device STOR* DKb = DK + bh * (long)S * D;
+    device STOR* DVb = DVout + bh * (long)S * DV;
 
     threadgroup float Kt[TK][D];
     threadgroup float Vt[TK][DV];
     for (int i = tid; i < TK * D; i += NT) {{
         int kj = i / D, dd = i % D;
-        Kt[kj][dd] = (j0 + kj < S) ? Kb[(j0 + kj) * D + dd] : 0.0f;
+        Kt[kj][dd] = (j0 + kj < S) ? float(Kb[(j0 + kj) * D + dd]) : 0.0f;
     }}
     for (int i = tid; i < TK * DV; i += NT) {{
         int kj = i / DV, dv = i % DV;
-        Vt[kj][dv] = (j0 + kj < S) ? Vb[(j0 + kj) * DV + dv] : 0.0f;
+        Vt[kj][dv] = (j0 + kj < S) ? float(Vb[(j0 + kj) * DV + dv]) : 0.0f;
     }}
     float acc_dk[CELLS_DK];
     float acc_dv[CELLS_DV];
@@ -326,11 +340,11 @@ kernel void et_sdpa_bwd_kv(
         // that earlier ones do not (the per-cell mask handles it).
         for (int i = tid; i < TQ * D; i += NT) {{
             int t = i / D, dd = i % D;
-            Qt[t][dd] = (i0 + t < T) ? Qb[(i0 + t) * D + dd] : 0.0f;
+            Qt[t][dd] = (i0 + t < T) ? float(Qb[(i0 + t) * D + dd]) : 0.0f;
         }}
         for (int i = tid; i < TQ * DV; i += NT) {{
             int t = i / DV, dv = i % DV;
-            Gt[t][dv] = (i0 + t < T) ? Gb[(i0 + t) * DV + dv] : 0.0f;
+            Gt[t][dv] = (i0 + t < T) ? float(Gb[(i0 + t) * DV + dv]) : 0.0f;
         }}
         for (int i = tid; i < TQ; i += NT) {{
             lt[i] = (i0 + i < T) ? Lb[i0 + i] : 0.0f;
@@ -376,37 +390,37 @@ kernel void et_sdpa_bwd_kv(
         int c = tid + w * NT;
         if (c >= TK * D) {{ break; }}
         int kj = c / D, dd = c % D;
-        if (j0 + kj < S) {{ DKb[(j0 + kj) * D + dd] = acc_dk[w]; }}
+        if (j0 + kj < S) {{ DKb[(j0 + kj) * D + dd] = STOR(acc_dk[w]); }}
     }}
     for (int w = 0; w < CELLS_DV; w++) {{
         int c = tid + w * NT;
         if (c >= TK * DV) {{ break; }}
         int kj = c / DV, dv = c % DV;
-        if (j0 + kj < S) {{ DVb[(j0 + kj) * DV + dv] = acc_dv[w]; }}
+        if (j0 + kj < S) {{ DVb[(j0 + kj) * DV + dv] = STOR(acc_dv[w]); }}
     }}
 }}
 
 kernel void et_sdpa_bwd_q(
-    device const float* Q [[buffer(0)]],
-    device const float* K [[buffer(1)]],
-    device const float* V [[buffer(2)]],
-    device const float* G [[buffer(3)]],
+    device const STOR* Q [[buffer(0)]],
+    device const STOR* K [[buffer(1)]],
+    device const STOR* V [[buffer(2)]],
+    device const STOR* G [[buffer(3)]],
     device const float* L [[buffer(4)]],
     device const float* Dvec [[buffer(5)]],
-    device float* DQ [[buffer(6)]],
+    device STOR* DQ [[buffer(6)]],
     uint3 tgid [[threadgroup_position_in_grid]],
     uint3 tpitg [[thread_position_in_threadgroup]]
 ) {{
     const int i0 = tgid.x * TQ;
     const long bh = tgid.y;
     const uint tid = tpitg.x;
-    device const float* Qb = Q + bh * (long)T * D;
-    device const float* Kb = K + bh * (long)S * D;
-    device const float* Vb = V + bh * (long)S * DV;
-    device const float* Gb = G + bh * (long)T * DV;
+    device const STOR* Qb = Q + bh * (long)T * D;
+    device const STOR* Kb = K + bh * (long)S * D;
+    device const STOR* Vb = V + bh * (long)S * DV;
+    device const STOR* Gb = G + bh * (long)T * DV;
     device const float* Lb = L + bh * (long)T;
     device const float* Db = Dvec + bh * (long)T;
-    device float* DQb = DQ + bh * (long)T * D;
+    device STOR* DQb = DQ + bh * (long)T * D;
 
     threadgroup float Qt[TQ][D];
     threadgroup float Gt[TQ][DV];
@@ -414,11 +428,11 @@ kernel void et_sdpa_bwd_q(
     threadgroup float dt[TQ];
     for (int i = tid; i < TQ * D; i += NT) {{
         int t = i / D, dd = i % D;
-        Qt[t][dd] = (i0 + t < T) ? Qb[(i0 + t) * D + dd] : 0.0f;
+        Qt[t][dd] = (i0 + t < T) ? float(Qb[(i0 + t) * D + dd]) : 0.0f;
     }}
     for (int i = tid; i < TQ * DV; i += NT) {{
         int t = i / DV, dv = i % DV;
-        Gt[t][dv] = (i0 + t < T) ? Gb[(i0 + t) * DV + dv] : 0.0f;
+        Gt[t][dv] = (i0 + t < T) ? float(Gb[(i0 + t) * DV + dv]) : 0.0f;
     }}
     for (int i = tid; i < TQ; i += NT) {{
         lt[i] = (i0 + i < T) ? Lb[i0 + i] : 0.0f;
@@ -436,11 +450,11 @@ kernel void et_sdpa_bwd_q(
         if (CAUSAL && j0 > i0 + TQ - 1 + OFFSET) {{ break; }}
         for (int i = tid; i < TK * D; i += NT) {{
             int kj = i / D, dd = i % D;
-            Kt[kj][dd] = (j0 + kj < S) ? Kb[(j0 + kj) * D + dd] : 0.0f;
+            Kt[kj][dd] = (j0 + kj < S) ? float(Kb[(j0 + kj) * D + dd]) : 0.0f;
         }}
         for (int i = tid; i < TK * DV; i += NT) {{
             int kj = i / DV, dv = i % DV;
-            Vt[kj][dv] = (j0 + kj < S) ? Vb[(j0 + kj) * DV + dv] : 0.0f;
+            Vt[kj][dv] = (j0 + kj < S) ? float(Vb[(j0 + kj) * DV + dv]) : 0.0f;
         }}
         threadgroup_barrier(mem_flags::mem_threadgroup);
         for (int i = tid; i < TQ * TK; i += NT) {{
@@ -474,7 +488,7 @@ kernel void et_sdpa_bwd_q(
         int c = tid + w * NT;
         if (c >= TQ * D) {{ break; }}
         int t = c / D, dd = c % D;
-        if (i0 + t < T) {{ DQb[(i0 + t) * D + dd] = acc_dq[w]; }}
+        if (i0 + t < T) {{ DQb[(i0 + t) * D + dd] = STOR(acc_dq[w]); }}
     }}
 }}
 "#,
@@ -488,6 +502,7 @@ kernel void et_sdpa_bwd_q(
             scale = scale as f32,
             causal = if causal { 1 } else { 0 },
             offset = s.saturating_sub(t),
+            ty = ty,
         )
     }
 
@@ -499,14 +514,20 @@ kernel void et_sdpa_bwd_q(
         dv: usize,
         scale: f64,
         causal: bool,
+        dtype: crate::runtime::dtype::DType,
     ) -> crate::err::Res<Pipeline> {
         use std::collections::hash_map::DefaultHasher;
         use std::hash::{Hash, Hasher};
 
         let mut hasher = DefaultHasher::new();
-        (name, t, s, d, dv, scale.to_bits(), causal).hash(&mut hasher);
+        (name, t, s, d, dv, scale.to_bits(), causal, dtype).hash(&mut hasher);
         let key = hasher.finish();
-        MetalDevice::get().compile_lazy(key, name, || bwd_source(t, s, d, dv, scale, causal))
+                let ty = match dtype {
+            crate::runtime::dtype::DType::F32 => "float",
+            crate::runtime::dtype::DType::BF16 => "bfloat",
+            other => return Err(format!("flash: unsupported dtype {other:?}")),
+        };
+        MetalDevice::get().compile_lazy(key, name, || bwd_source(t, s, d, dv, scale, causal, ty))
     }
 
     // The fused backward: d_vec via candle (one small op), then two
@@ -557,20 +578,27 @@ kernel void et_sdpa_bwd_q(
         // prod is flattened [BH, T, Dv]; reduce its last dim.
         let d_vec = crate::runtime::metal::ops::reduce(&prod, &[2], true, crate::fusion::ReduceOp::Sum)?;
         let d_vec = contig(&d_vec)?;
-        let dq_buf = alloc_f32(bh * t * d);
-        let dk_buf = alloc_f32(bh * s * d);
-        let dv_buf = alloc_f32(bh * s * dv);
-        let off = |o: usize| o * 4;
+        let d_vec = if d_vec.dtype == crate::runtime::dtype::DType::F32 {
+            d_vec
+        } else {
+            crate::runtime::metal::ops::cast(&d_vec, crate::runtime::dtype::DType::F32)?
+        };
+        let dtype = q.dtype;
+        let dq_buf = MetalDevice::get().alloc((bh * t * d).max(1), dtype);
+        let dk_buf = MetalDevice::get().alloc((bh * s * d).max(1), dtype);
+        let dv_buf = MetalDevice::get().alloc((bh * s * dv).max(1), dtype);
+        let sz = dtype.size_in_bytes();
+        let off = |o: usize| o * sz;
         {
-            let pipe = bwd_pipeline("et_sdpa_bwd_kv", t, s, d, dv, scale, causal)?;
+            let pipe = bwd_pipeline("et_sdpa_bwd_kv", t, s, d, dv, scale, causal, dtype)?;
             MetalDevice::get().with_encoder(|e| {
                 e.setComputePipelineState(pipe.as_raw());
                 set_buffer(e, 0, &q.buffer, off(q.layout.offset()));
                 set_buffer(e, 1, &k.buffer, off(k.layout.offset()));
                 set_buffer(e, 2, &v.buffer, off(v.layout.offset()));
                 set_buffer(e, 3, &g.buffer, off(g.layout.offset()));
-                set_buffer(e, 4, &l.buffer, off(l.layout.offset()));
-                set_buffer(e, 5, &d_vec.buffer, off(d_vec.layout.offset()));
+                set_buffer(e, 4, &l.buffer, l.layout.offset() * 4);
+                set_buffer(e, 5, &d_vec.buffer, d_vec.layout.offset() * 4);
                 set_buffer(e, 6, &dk_buf, 0);
                 set_buffer(e, 7, &dv_buf, 0);
                 e.dispatchThreadgroups_threadsPerThreadgroup(
@@ -588,15 +616,15 @@ kernel void et_sdpa_bwd_q(
             });
         }
         {
-            let pipe = bwd_pipeline("et_sdpa_bwd_q", t, s, d, dv, scale, causal)?;
+            let pipe = bwd_pipeline("et_sdpa_bwd_q", t, s, d, dv, scale, causal, dtype)?;
             MetalDevice::get().with_encoder(|e| {
                 e.setComputePipelineState(pipe.as_raw());
                 set_buffer(e, 0, &q.buffer, off(q.layout.offset()));
                 set_buffer(e, 1, &k.buffer, off(k.layout.offset()));
                 set_buffer(e, 2, &v.buffer, off(v.layout.offset()));
                 set_buffer(e, 3, &g.buffer, off(g.layout.offset()));
-                set_buffer(e, 4, &l.buffer, off(l.layout.offset()));
-                set_buffer(e, 5, &d_vec.buffer, off(d_vec.layout.offset()));
+                set_buffer(e, 4, &l.buffer, l.layout.offset() * 4);
+                set_buffer(e, 5, &d_vec.buffer, d_vec.layout.offset() * 4);
                 set_buffer(e, 6, &dq_buf, 0);
                 e.dispatchThreadgroups_threadsPerThreadgroup(
                     objc2_metal::MTLSize {
@@ -615,17 +643,17 @@ kernel void et_sdpa_bwd_q(
         let dq = MetalTensor {
             buffer: dq_buf,
             layout: crate::runtime::layout::Layout::contiguous(q_shape),
-            dtype: crate::runtime::dtype::DType::F32,
+            dtype,
         };
         let dk = MetalTensor {
             buffer: dk_buf,
             layout: crate::runtime::layout::Layout::contiguous(k_shape),
-            dtype: crate::runtime::dtype::DType::F32,
+            dtype,
         };
         let dv = MetalTensor {
             buffer: dv_buf,
             layout: crate::runtime::layout::Layout::contiguous(v_shape),
-            dtype: crate::runtime::dtype::DType::F32,
+            dtype,
         };
         Ok((dq, dk, dv))
     }

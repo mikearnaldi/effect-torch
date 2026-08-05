@@ -24,7 +24,7 @@ export class GradError extends Data.TaggedError("GradError")<{
   readonly detail: string
 }> {}
 
-const isFloatDtype = (dtype: string): boolean => dtype === "f32" || dtype === "f64"
+const isFloatDtype = (dtype: string): boolean => dtype === "f32" || dtype === "f64" || dtype === "f16" || dtype === "bf16"
 
 const toGradError = (error: unknown): GradError => {
   const detail = error instanceof Error ? error.message : String(error)
@@ -68,7 +68,7 @@ export const grad = (
     if (!isFloatDtype(loss.dtype)) {
       return yield* new GradError({
         reason: "non-float-dtype",
-        detail: `grad: loss dtype must be f32 or f64, got ${loss.dtype}`
+        detail: `grad: loss dtype must be a float dtype, got ${loss.dtype}`
       })
     }
     for (const target of wrt) {

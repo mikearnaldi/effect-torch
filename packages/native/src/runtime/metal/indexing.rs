@@ -142,10 +142,12 @@ kernel void et_gather(
 
 pub fn scatter_add(dev: &MetalDevice, x: &MetalTensor, dim: usize, ids: &[u32], src_t: &MetalTensor) -> Result<MetalTensor, String> {
     if x.dtype != DType::F32 {
-        return Err(format!(
-            "scatter_add on Metal is f32-only (atomic float add), got {}",
-            x.dtype.name()
-        ));
+        // No bf16 atomics in MSL: accumulate in f32 (the more precise
+        // order anyway), then cast back to the caller's dtype.
+        let x32 = super::kernels::cast(dev, x, DType::F32)?;
+        let src32 = super::kernels::cast(dev, src_t, DType::F32)?;
+        let out32 = scatter_add(dev, &x32, dim, ids, &src32)?;
+        return super::kernels::cast(dev, &out32, x.dtype);
     }
     let out = super::kernels::strided_copy(dev, x)?;
     let shape = x.layout.shape();

@@ -9,7 +9,7 @@ use crate::runtime::metal::run::MetalTensor;
 
 /// Whether the fused rotary path can run: Metal, f32, even head dim.
 pub fn is_supported(x: &MetalTensor) -> bool {
-    x.dtype == crate::runtime::dtype::DType::F32 && x.layout.shape().last().unwrap_or(&1) % 2 == 0
+    matches!(x.dtype, crate::runtime::dtype::DType::F32 | crate::runtime::dtype::DType::BF16) && x.layout.shape().last().unwrap_or(&1) % 2 == 0
 }
 
 #[cfg(target_os = "macos")]
@@ -27,14 +27,16 @@ mod metal {
     // One thread per (row, t, j): angle = (offset + t) * theta^(-2j/D);
     // GPT-NeoX half-split rotation. sign = -1 gives the transpose
     // rotation (the backward).
-    fn source() -> &'static str {
+    fn source(ty: &str) -> String {
         r#"
 #include <metal_stdlib>
 using namespace metal;
 
+#define STOR {ty}
+
 kernel void et_rotary(
-    device const float* X [[buffer(0)]],
-    device float* O [[buffer(1)]],
+    device const STOR* X [[buffer(0)]],
+    device STOR* O [[buffer(1)]],
     device const float* offsets [[buffer(2)]],
     constant uint& T [[buffer(3)]],
     constant uint& D [[buffer(4)]],
@@ -54,22 +56,27 @@ kernel void et_rotary(
     const float c = cos(angle);
     const float s = sin(angle);
     const ulong base = ((ulong)row * T + t) * D;
-    const float f = X[base + j];
-    const float g = X[base + hd + j];
-    O[base + j] = f * c - g * s;
-    O[base + hd + j] = g * c + f * s;
+    const float f = float(X[base + j]);
+    const float g = float(X[base + hd + j]);
+    O[base + j] = STOR(f * c - g * s);
+    O[base + hd + j] = STOR(g * c + f * s);
 }
-"#
+"#.replace("{ty}", ty)
     }
 
-    fn pipeline() -> crate::err::Res<Pipeline> {
+    fn pipeline(dtype: crate::runtime::dtype::DType) -> crate::err::Res<Pipeline> {
         use std::collections::hash_map::DefaultHasher;
         use std::hash::{Hash, Hasher};
 
         let mut hasher = DefaultHasher::new();
-        "et_rotary".hash(&mut hasher);
+        ("et_rotary", dtype).hash(&mut hasher);
         let key = hasher.finish();
-        MetalDevice::get().compile_lazy(key, "et_rotary", || source().to_string())
+        let ty = match dtype {
+            crate::runtime::dtype::DType::F32 => "float",
+            crate::runtime::dtype::DType::BF16 => "bfloat",
+            other => return Err(format!("rotary: unsupported dtype {other:?}")),
+        };
+        MetalDevice::get().compile_lazy(key, "et_rotary", || source(ty))
     }
 
     /// x [.., T, D] -> R(sign·angles) x. `offsets` is one position
@@ -100,11 +107,11 @@ kernel void et_rotary(
             crate::runtime::metal::kernels::strided_copy(MetalDevice::get(), x)?
         };
         let offsets_buf = MetalDevice::get().alloc_with_data(&offsets_vec);
-        let out_buf = MetalDevice::get().alloc(xn.numel().max(1), crate::runtime::dtype::DType::F32);
-        let pipe = pipeline()?;
+        let out_buf = MetalDevice::get().alloc(xn.numel().max(1), xn.dtype);
+        let pipe = pipeline(xn.dtype)?;
         MetalDevice::get().with_encoder(|e| {
             e.setComputePipelineState(pipe.as_raw());
-            set_buffer(e, 0, &xn.buffer, xn.layout.offset() * 4);
+            set_buffer(e, 0, &xn.buffer, xn.layout.offset() * xn.dtype.size_in_bytes());
             set_buffer(e, 2, &offsets_buf, 0);
             set_buffer(e, 1, &out_buf, 0);
             set_bytes(e, 3, &(t as u32));
@@ -130,7 +137,7 @@ kernel void et_rotary(
         Ok(MetalTensor {
             buffer: out_buf,
             layout: crate::runtime::layout::Layout::contiguous(dims.to_vec()),
-            dtype: crate::runtime::dtype::DType::F32,
+            dtype: x.dtype,
         })
     }
 }

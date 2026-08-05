@@ -9,7 +9,7 @@ import { BLOCK, CHECKPOINT, createGpt, EOT, loadParams, loadTokenizer } from "./
 //   pnpm tsx fineweb/generate.ts "The history of the printing press"
 // FINEWEB_TEMPERATURE tunes the sampling.
 
-const TEMPERATURE = Number(process.env.FINEWEB_TEMPERATURE ?? 0.8)
+const TEMPERATURE = Number(process.env.FINEWEB_TEMPERATURE ?? 0.2)
 
 const sampleCategorical = (probs: ReadonlyArray<number>, temperature: number) => {
   let sum = 0

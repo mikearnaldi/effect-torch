@@ -7,8 +7,8 @@ use crate::runtime::metal::run::MetalTensor;
 
 /// Whether the fused linear path can run: Metal, f32, 2-D weight.
 pub fn is_supported(x: &MetalTensor, weight: &MetalTensor) -> bool {
-    x.dtype == crate::runtime::dtype::DType::F32
-        && weight.dtype == crate::runtime::dtype::DType::F32
+    matches!(x.dtype, crate::runtime::dtype::DType::F32 | crate::runtime::dtype::DType::BF16)
+        && weight.dtype == x.dtype
         && weight.layout.shape().len() == 2
 }
 

@@ -1217,8 +1217,8 @@ export const scaledDotProductAttention = (
       if (k.shape[rank - 2] !== v.shape[rank - 2]) {
         throw new Error(`${op}: k and v sequence lengths mismatch, got [${k.shape}] and [${v.shape}]`)
       }
-      if (q.dtype !== "f32" && q.dtype !== "f64") {
-        throw new Error(`${op}: dtype must be f32 or f64, got ${q.dtype}`)
+      if (q.dtype !== "f32" && q.dtype !== "f64" && q.dtype !== "bf16") {
+        throw new Error(`${op}: dtype must be f32, f64 or bf16, got ${q.dtype}`)
       }
       if (k.dtype !== q.dtype || v.dtype !== q.dtype) {
         throw new Error(`${op}: q, k and v must share a dtype, got ${q.dtype}, ${k.dtype} and ${v.dtype}`)
@@ -2523,8 +2523,8 @@ export const crossEntropy: {
       if (self.shape.length < 1) {
         throw new Error("crossEntropy: logits must have rank >= 1")
       }
-      if (self.dtype !== "f32" && self.dtype !== "f64") {
-        throw new Error(`crossEntropy: logits must be f32 or f64, got ${self.dtype}`)
+      if (self.dtype !== "f32" && self.dtype !== "f64" && self.dtype !== "bf16") {
+        throw new Error(`crossEntropy: logits must be f32, f64 or bf16, got ${self.dtype}`)
       }
       if (target.dtype !== "i64" && target.dtype !== "u32") {
         throw new Error(`crossEntropy: targets must be i64 or u32, got ${target.dtype}`)
@@ -2573,10 +2573,10 @@ export const embedding = (
         message: `embedding: weight must be rank 2 [vocab, hidden], got shape [${weight.shape}]`
       })
     }
-    if (weight.dtype !== "f32" && weight.dtype !== "f64") {
+    if (weight.dtype !== "f32" && weight.dtype !== "f64" && weight.dtype !== "f16" && weight.dtype !== "bf16") {
       return yield* new TensorError({
         op: "embedding",
-        message: `embedding: weight must be f32 or f64, got ${weight.dtype}`
+        message: `embedding: weight must be a float dtype, got ${weight.dtype}`
       })
     }
     if (indexes.dtype !== "i64" && indexes.dtype !== "u32") {

@@ -8,7 +8,7 @@ use crate::runtime::metal::run::MetalTensor;
 
 /// Whether the fused layer-norm path can run: Metal, f32, last-dim norm.
 pub fn is_supported(x: &MetalTensor, weight: &MetalTensor) -> bool {
-    x.dtype == crate::runtime::dtype::DType::F32 && weight.dtype == crate::runtime::dtype::DType::F32
+    matches!(x.dtype, crate::runtime::dtype::DType::F32 | crate::runtime::dtype::DType::BF16) && weight.dtype == x.dtype
 }
 
 #[cfg(target_os = "macos")]
@@ -32,34 +32,37 @@ mod metal {
         }
     }
 
-    fn alloc_f32(n: usize) -> Arc<crate::runtime::metal::device::Buffer> {
-        MetalDevice::get().alloc(n.max(1), crate::runtime::dtype::DType::F32)
+    fn alloc_t(n: usize, dtype: crate::runtime::dtype::DType) -> Arc<crate::runtime::metal::device::Buffer> {
+        MetalDevice::get().alloc(n.max(1), dtype)
     }
 
-    fn source() -> &'static str {
+    fn source(ty: &str) -> String {
         r#"
 #include <metal_stdlib>
 using namespace metal;
 
 #define NT 128
+#define STOR {ty}
+#define LD(x) float(x)
+#define ST(p, v) ((p) = STOR(v))
 
 // Per-row layer norm: mean and variance in two in-kernel passes, one
 // launch. One threadgroup per row.
 kernel void et_ln_fwd(
-    device const float* X [[buffer(0)]],
-    device const float* W [[buffer(1)]],
-    device const float* B [[buffer(2)]],
-    device float* O [[buffer(3)]],
+    device const STOR* X [[buffer(0)]],
+    device const STOR* W [[buffer(1)]],
+    device const STOR* B [[buffer(2)]],
+    device STOR* O [[buffer(3)]],
     constant uint& D [[buffer(4)]],
     constant float& eps [[buffer(5)]],
     uint tgid [[threadgroup_position_in_grid]],
     uint tid [[thread_position_in_threadgroup]]
 ) {
     const uint row = tgid;
-    device const float* x = X + (ulong)row * D;
-    device float* o = O + (ulong)row * D;
+    device const STOR* x = X + (ulong)row * D;
+    device STOR* o = O + (ulong)row * D;
     float s = 0.0f;
-    for (uint j = tid; j < D; j += NT) { s += x[j]; }
+    for (uint j = tid; j < D; j += NT) { s += LD(x[j]); }
     s = simd_sum(s);
     threadgroup float ps[NT / 32];
     const uint lane = tid % 32;
@@ -71,7 +74,7 @@ kernel void et_ln_fwd(
     for (uint g = 0; g < NT / 32; g++) { mean += ps[g]; }
     mean /= float(D);
     float q = 0.0f;
-    for (uint j = tid; j < D; j += NT) { const float c = x[j] - mean; q += c * c; }
+    for (uint j = tid; j < D; j += NT) { const float c = LD(x[j]) - mean; q += c * c; }
     q = simd_sum(q);
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (lane == 0) { ps[grp] = q; }
@@ -81,29 +84,29 @@ kernel void et_ln_fwd(
     var /= float(D);
     const float rstd = rsqrt(var + eps);
     for (uint j = tid; j < D; j += NT) {
-        o[j] = (x[j] - mean) * rstd * W[j] + B[j];
+        ST(o[j], (LD(x[j]) - mean) * rstd * LD(W[j]) + LD(B[j]));
     }
 }
 
 // Backward: dx plus x̂ (dw/db are plain reduces host-side).
 kernel void et_ln_bwd(
-    device const float* X [[buffer(0)]],
-    device const float* W [[buffer(1)]],
-    device const float* G [[buffer(2)]],
-    device float* DX [[buffer(3)]],
-    device float* XH [[buffer(4)]],
+    device const STOR* X [[buffer(0)]],
+    device const STOR* W [[buffer(1)]],
+    device const STOR* G [[buffer(2)]],
+    device STOR* DX [[buffer(3)]],
+    device STOR* XH [[buffer(4)]],
     constant uint& D [[buffer(5)]],
     constant float& eps [[buffer(6)]],
     uint tgid [[threadgroup_position_in_grid]],
     uint tid [[thread_position_in_threadgroup]]
 ) {
     const uint row = tgid;
-    device const float* x = X + (ulong)row * D;
-    device const float* g = G + (ulong)row * D;
-    device float* dx = DX + (ulong)row * D;
-    device float* xh = XH + (ulong)row * D;
+    device const STOR* x = X + (ulong)row * D;
+    device const STOR* g = G + (ulong)row * D;
+    device STOR* dx = DX + (ulong)row * D;
+    device STOR* xh = XH + (ulong)row * D;
     float s = 0.0f;
-    for (uint j = tid; j < D; j += NT) { s += x[j]; }
+    for (uint j = tid; j < D; j += NT) { s += LD(x[j]); }
     s = simd_sum(s);
     threadgroup float ps[NT / 32];
     const uint lane = tid % 32;
@@ -115,7 +118,7 @@ kernel void et_ln_bwd(
     for (uint g = 0; g < NT / 32; g++) { mean += ps[g]; }
     mean /= float(D);
     float q = 0.0f;
-    for (uint j = tid; j < D; j += NT) { const float c = x[j] - mean; q += c * c; }
+    for (uint j = tid; j < D; j += NT) { const float c = LD(x[j]) - mean; q += c * c; }
     q = simd_sum(q);
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (lane == 0) { ps[grp] = q; }
@@ -128,8 +131,8 @@ kernel void et_ln_bwd(
     float s1 = 0.0f;
     float s2 = 0.0f;
     for (uint j = tid; j < D; j += NT) {
-        const float dyw = g[j] * W[j];
-        const float hat = (x[j] - mean) * rstd;
+        const float dyw = LD(g[j]) * LD(W[j]);
+        const float hat = (LD(x[j]) - mean) * rstd;
         s1 += dyw;
         s2 += dyw * hat;
     }
@@ -146,30 +149,34 @@ kernel void et_ln_bwd(
     m1 /= float(D);
     m2 /= float(D);
     for (uint j = tid; j < D; j += NT) {
-        const float hat = (x[j] - mean) * rstd;
-        xh[j] = hat;
-        dx[j] = (g[j] * W[j] - m1 - hat * m2) * rstd;
+        const float hat = (LD(x[j]) - mean) * rstd;
+        ST(xh[j], hat);
+        ST(dx[j], (LD(g[j]) * LD(W[j]) - m1 - hat * m2) * rstd);
     }
 }
-"#
+"#.replace("{ty}", ty)
     }
 
-    fn pipeline(name: &'static str) -> crate::err::Res<Pipeline> {
+    fn pipeline(name: &'static str, dtype: crate::runtime::dtype::DType) -> crate::err::Res<Pipeline> {
         use std::collections::hash_map::DefaultHasher;
         use std::hash::{Hash, Hasher};
 
         let mut hasher = DefaultHasher::new();
-        name.hash(&mut hasher);
+        (name, dtype).hash(&mut hasher);
         let key = hasher.finish();
-        MetalDevice::get().compile_lazy(key, name, || source().to_string())
+        let ty = match dtype {
+            crate::runtime::dtype::DType::F32 => "float",
+            crate::runtime::dtype::DType::BF16 => "bfloat",
+            other => return Err(format!("layer_norm: unsupported dtype {other:?}")),
+        };
+        MetalDevice::get().compile_lazy(key, name, || source(ty))
     }
 
-    fn wrap(buf: Arc<crate::runtime::metal::device::Buffer>, n: usize, shape: Vec<usize>) -> crate::err::Res<MetalTensor> {
-        let _ = n;
+    fn wrap(buf: Arc<crate::runtime::metal::device::Buffer>, shape: Vec<usize>, dtype: crate::runtime::dtype::DType) -> crate::err::Res<MetalTensor> {
         Ok(MetalTensor {
             buffer: buf,
             layout: crate::runtime::layout::Layout::contiguous(shape),
-            dtype: crate::runtime::dtype::DType::F32,
+            dtype,
         })
     }
 
@@ -179,9 +186,10 @@ kernel void et_ln_bwd(
         let x = wrap_contig(x)?;
         let weight = wrap_contig(weight)?;
         let bias = wrap_contig(bias)?;
-        let out_buf = alloc_f32(x.numel());
-        let pipe = pipeline("et_ln_fwd")?;
-        let off = |o: usize| o * 4;
+        let out_buf = alloc_t(x.numel(), x.dtype);
+        let pipe = pipeline("et_ln_fwd", x.dtype)?;
+        let sz = x.dtype.size_in_bytes();
+        let off = |o: usize| o * sz;
         MetalDevice::get().with_encoder(|e| {
             e.setComputePipelineState(pipe.as_raw());
             set_buffer(e, 0, &x.buffer, off(x.layout.offset()));
@@ -195,7 +203,7 @@ kernel void et_ln_bwd(
                 objc2_metal::MTLSize { width: NT, height: 1, depth: 1 },
             );
         });
-        wrap(out_buf, x.numel(), x.layout.shape().to_vec())
+        wrap(out_buf, x.layout.shape().to_vec(), x.dtype)
     }
 
     // Returns (dx, x̂) — dw/db are computed host-side from x̂.
@@ -205,10 +213,11 @@ kernel void et_ln_bwd(
         let x = wrap_contig(x)?;
         let weight = wrap_contig(weight)?;
         let g = wrap_contig(g)?;
-        let dx_buf = alloc_f32(x.numel());
-        let xh_buf = alloc_f32(x.numel());
-        let pipe = pipeline("et_ln_bwd")?;
-        let off = |o: usize| o * 4;
+        let dx_buf = alloc_t(x.numel(), x.dtype);
+        let xh_buf = alloc_t(x.numel(), x.dtype);
+        let pipe = pipeline("et_ln_bwd", x.dtype)?;
+        let sz = x.dtype.size_in_bytes();
+        let off = |o: usize| o * sz;
         MetalDevice::get().with_encoder(|e| {
             e.setComputePipelineState(pipe.as_raw());
             set_buffer(e, 0, &x.buffer, off(x.layout.offset()));
@@ -224,8 +233,8 @@ kernel void et_ln_bwd(
             );
         });
         Ok((
-            wrap(dx_buf, x.numel(), x.layout.shape().to_vec())?,
-            wrap(xh_buf, x.numel(), x.layout.shape().to_vec())?,
+            wrap(dx_buf, x.layout.shape().to_vec(), x.dtype)?,
+            wrap(xh_buf, x.layout.shape().to_vec(), x.dtype)?,
         ))
     }
 }

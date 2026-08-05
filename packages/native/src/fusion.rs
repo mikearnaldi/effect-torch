@@ -739,7 +739,7 @@ pub fn is_supported(device: &Device, dtype: DType) -> bool {
     match device {
         Device::Cpu => matches!(dtype, DType::F32 | DType::F64),
         #[cfg(target_os = "macos")]
-        Device::Metal => dtype == DType::F32,
+        Device::Metal => matches!(dtype, DType::F32 | DType::BF16),
         #[cfg(not(target_os = "macos"))]
         Device::Metal => false,
     }
@@ -884,7 +884,7 @@ pub fn adamw_group_plan(
     let contig = contiguous_strides(shape);
     let strides = vec![contig; params_len * 4];
     let n: usize = shape.iter().product();
-    let key_hash = crate::runtime::metal::run::elementwise_key(&exprs, &strides, shape, n, 3);
+    let key_hash = crate::runtime::metal::run::elementwise_key(&exprs, &strides, shape, n, 3, crate::runtime::dtype::DType::F32);
     let plan = std::sync::Arc::new(GroupPlan {
         exprs,
         strides,
@@ -1048,7 +1048,7 @@ pub fn run(
         (Device::Cpu, DType::F32) => cpu_bridge_elementwise::<f32>(exprs, inputs, strides, scalars, n, shape),
         (Device::Cpu, DType::F64) => cpu_bridge_elementwise::<f64>(exprs, inputs, strides, scalars, n, shape),
         #[cfg(target_os = "macos")]
-        (Device::Metal, DType::F32) => {
+        (Device::Metal, DType::F32 | DType::BF16) => {
             metal::run(exprs, inputs, lane_strides, scalars, n, shape, device)
         }
         _ => Err(format!("fusion: unsupported device/dtype {device:?} {dtype:?}")),
@@ -1169,7 +1169,7 @@ pub fn run_reduce(
             cpu_bridge_reduce::<f64>(op, expr, inputs, strides, in_shape, dims, keepdims, out_shape)
         }
         #[cfg(target_os = "macos")]
-        (Device::Metal, DType::F32) => {
+        (Device::Metal, DType::F32 | DType::BF16) => {
             metal::run_reduce(op, expr, inputs, strides, in_shape, dims, keepdims, out_shape, device)
         }
         _ => Err(format!("fusion: unsupported device/dtype {device:?} {dtype:?}")),

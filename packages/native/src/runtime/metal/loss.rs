@@ -13,7 +13,7 @@ use crate::runtime::metal::run::MetalTensor;
 
 /// Whether the fused CE path can run: Metal, f32 logits, integer targets.
 pub fn is_supported(logits: &MetalTensor, target: &MetalTensor) -> bool {
-    logits.dtype == DType::F32 && matches!(target.dtype, DType::U32 | DType::I64)
+    matches!(logits.dtype, DType::F32 | DType::BF16) && matches!(target.dtype, DType::U32 | DType::I64)
 }
 
 #[cfg(target_os = "macos")]
@@ -42,11 +42,16 @@ mod metal {
         MetalDevice::get().alloc(n.max(1), dtype)
     }
 
-    fn source(tgt: crate::runtime::dtype::DType) -> String {
+    fn source(tgt: crate::runtime::dtype::DType, z: crate::runtime::dtype::DType) -> String {
         let tgt_ty = match tgt {
             DType::U32 => "uint",
             DType::I64 => "long",
             other => unreachable!("ce: unsupported target dtype {other:?}"),
+        };
+        let z_ty = match z {
+            DType::F32 => "float",
+            DType::BF16 => "bfloat",
+            other => unreachable!("ce: unsupported logits dtype {other:?}"),
         };
         format!(
             r#"
@@ -55,12 +60,13 @@ using namespace metal;
 
 #define NT {nt}
 #define TGT {tgt_ty}
+#define ZS {z_ty}
 
 // One threadgroup per row: online (max, sumexp) over the row's V
 // logits, then nll and status flags. flags bit0 = ignored,
 // bit1 = invalid-but-active target.
 kernel void et_ce_fwd(
-    device const float* Z [[buffer(0)]],
+    device const ZS* Z [[buffer(0)]],
     device const TGT* T [[buffer(1)]],
     device float* nll [[buffer(2)]],
     device uint* flags [[buffer(3)]],
@@ -70,14 +76,14 @@ kernel void et_ce_fwd(
     uint tid [[thread_position_in_threadgroup]]
 ) {{
     const uint row = tgid;
-    device const float* z = Z + (ulong)row * V;
+    device const ZS* z = Z + (ulong)row * V;
     const long t = (long)T[row];
     const bool ignored = (t == ignore);
     const bool invalid = !ignored && (t < 0 || t >= (long)V);
     float m = -INFINITY;
     float l = 0.0f;
     for (uint j = tid; j < V; j += NT) {{
-        const float v = z[j];
+        const float v = float(z[j]);
         const float mn = max(m, v);
         l = l * exp(m - mn) + exp(v - mn);
         m = mn;
@@ -170,27 +176,27 @@ kernel void et_ce_count(
 // grad = (softmax(z) - one_hot(t)) / count for active rows, zeros
 // where ignored. One threadgroup per row, one pass.
 kernel void et_ce_bwd(
-    device const float* Z [[buffer(0)]],
+    device const ZS* Z [[buffer(0)]],
     device const TGT* T [[buffer(1)]],
     device const float* count [[buffer(2)]],
-    device float* G [[buffer(3)]],
+    device ZS* G [[buffer(3)]],
     constant uint& V [[buffer(4)]],
     constant long& ignore [[buffer(5)]],
     uint tgid [[threadgroup_position_in_grid]],
     uint tid [[thread_position_in_threadgroup]]
 ) {{
     const uint row = tgid;
-    device const float* z = Z + (ulong)row * V;
-    device float* g = G + (ulong)row * V;
+    device const ZS* z = Z + (ulong)row * V;
+    device ZS* g = G + (ulong)row * V;
     const long t = (long)T[row];
     if (t == ignore) {{
-        for (uint j = tid; j < V; j += NT) {{ g[j] = 0.0f; }}
+        for (uint j = tid; j < V; j += NT) {{ g[j] = ZS(0.0f); }}
         return;
     }}
     float m = -INFINITY;
     float l = 0.0f;
     for (uint j = tid; j < V; j += NT) {{
-        const float v = z[j];
+        const float v = float(z[j]);
         const float mn = max(m, v);
         l = l * exp(m - mn) + exp(v - mn);
         m = mn;
@@ -216,32 +222,32 @@ kernel void et_ce_bwd(
     threadgroup_barrier(mem_flags::mem_threadgroup);
     const float inv = 1.0f / count[0];
     for (uint j = tid; j < V; j += NT) {{
-        const float p = exp(z[j] - lse);
-        g[j] = (p - ((long)j == t ? 1.0f : 0.0f)) * inv;
+        const float p = exp(float(z[j]) - lse);
+        g[j] = ZS((p - ((long)j == t ? 1.0f : 0.0f)) * inv);
     }}
 }}
 "#,
             nt = NT,
             tgt_ty = tgt_ty,
+            z_ty = z_ty,
         )
     }
 
-    fn pipeline(tgt: crate::runtime::dtype::DType, name: &'static str) -> crate::err::Res<Pipeline> {
+    fn pipeline(tgt: crate::runtime::dtype::DType, z: crate::runtime::dtype::DType, name: &'static str) -> crate::err::Res<Pipeline> {
         use std::collections::hash_map::DefaultHasher;
         use std::hash::{Hash, Hasher};
 
         let mut hasher = DefaultHasher::new();
-        (tgt, name).hash(&mut hasher);
+        (tgt, z, name).hash(&mut hasher);
         let key = hasher.finish();
-        MetalDevice::get().compile_lazy(key, name, || source(tgt))
+        MetalDevice::get().compile_lazy(key, name, || source(tgt, z))
     }
 
-    fn wrap(buf: Arc<crate::runtime::metal::device::Buffer>, n: usize, shape: Vec<usize>) -> crate::err::Res<MetalTensor> {
-        let _ = n;
+    fn wrap(buf: Arc<crate::runtime::metal::device::Buffer>, shape: Vec<usize>, dtype: crate::runtime::dtype::DType) -> crate::err::Res<MetalTensor> {
         Ok(MetalTensor {
             buffer: buf,
             layout: crate::runtime::layout::Layout::contiguous(shape),
-            dtype: crate::runtime::dtype::DType::F32,
+            dtype,
         })
     }
 
@@ -263,6 +269,7 @@ kernel void et_ce_bwd(
         let v = logits.layout.shape()[rank - 1];
         let n = logits.numel() / v;
         let tgt = target.dtype;
+        let logits_dtype = logits.dtype;
         let flat = |x: &MetalTensor, shape: Vec<usize>| MetalTensor {
             buffer: x.buffer.clone(),
             layout: crate::runtime::layout::Layout::contiguous(shape),
@@ -274,8 +281,8 @@ kernel void et_ce_bwd(
         let flags_buf = alloc(n, crate::runtime::dtype::DType::U32);
         let status_buf = alloc(3, crate::runtime::dtype::DType::F32);
         {
-            let pipe = pipeline(tgt, "et_ce_fwd")?;
-            let f32_off = |off: usize| off * DType::F32.size_in_bytes();
+            let pipe = pipeline(tgt, logits_dtype, "et_ce_fwd")?;
+            let f32_off = |off: usize| off * logits_dtype.size_in_bytes();
             let tgt_off = |off: usize| off * tgt.size_in_bytes();
             MetalDevice::get().with_encoder(|e| {
                 e.setComputePipelineState(pipe.as_raw());
@@ -289,7 +296,7 @@ kernel void et_ce_bwd(
             });
         }
         {
-            let pipe = pipeline(tgt, "et_ce_status")?;
+            let pipe = pipeline(tgt, logits_dtype, "et_ce_status")?;
             MetalDevice::get().with_encoder(|e| {
                 e.setComputePipelineState(pipe.as_raw());
                 set_buffer(e, 0, &nll_buf, 0);
@@ -299,7 +306,7 @@ kernel void et_ce_bwd(
                 dispatch_grid(e, 1, NT);
             });
         }
-        let status = wrap(status_buf, 3, vec![3])?;
+        let status = wrap(status_buf, vec![3], crate::runtime::dtype::DType::F32)?;
         let loss = MetalTensor {
             buffer: status.buffer.clone(),
             layout: crate::runtime::layout::Layout::contiguous(vec![]),
@@ -316,6 +323,7 @@ kernel void et_ce_bwd(
         let n = logits.numel() / v;
         let out_shape = logits.layout.shape().to_vec();
         let tgt = target.dtype;
+        let logits_dtype = logits.dtype;
         let flat = |x: &MetalTensor, shape: Vec<usize>| MetalTensor {
             buffer: x.buffer.clone(),
             layout: crate::runtime::layout::Layout::contiguous(shape),
@@ -325,9 +333,9 @@ kernel void et_ce_bwd(
         let target = wrap_contig(&flat(target, vec![n]))?;
         let _ = out_shape;
         let count_buf = alloc(1, crate::runtime::dtype::DType::F32);
-        let grad_buf = alloc(n * v, crate::runtime::dtype::DType::F32);
+        let grad_buf = alloc(n * v, logits_dtype);
         {
-            let pipe = pipeline(tgt, "et_ce_count")?;
+            let pipe = pipeline(tgt, logits_dtype, "et_ce_count")?;
             MetalDevice::get().with_encoder(|e| {
                 e.setComputePipelineState(pipe.as_raw());
                 set_buffer(e, 0, &target.buffer, target.layout.offset() * tgt.size_in_bytes());
@@ -338,10 +346,10 @@ kernel void et_ce_bwd(
             });
         }
         {
-            let pipe = pipeline(tgt, "et_ce_bwd")?;
+            let pipe = pipeline(tgt, logits_dtype, "et_ce_bwd")?;
             MetalDevice::get().with_encoder(|e| {
                 e.setComputePipelineState(pipe.as_raw());
-                set_buffer(e, 0, &logits.buffer, logits.layout.offset() * DType::F32.size_in_bytes());
+                                set_buffer(e, 0, &logits.buffer, logits.layout.offset() * logits_dtype.size_in_bytes());
                 set_buffer(e, 1, &target.buffer, target.layout.offset() * tgt.size_in_bytes());
                 set_buffer(e, 2, &count_buf, 0);
                 set_buffer(e, 3, &grad_buf, 0);
@@ -352,8 +360,8 @@ kernel void et_ce_bwd(
         }
         // The zero-active check is deferred to the walk's end (see
         // ce_forward); the count buffer is returned for it.
-        let count = wrap(count_buf.clone(), 1, vec![1])?;
-        let grad = wrap(grad_buf, n * v, vec![n, v])?;
+        let count = wrap(count_buf.clone(), vec![1], crate::runtime::dtype::DType::F32)?;
+        let grad = wrap(grad_buf, vec![n, v], logits_dtype)?;
         let grad = MetalTensor {
             buffer: grad.buffer,
             layout: crate::runtime::layout::Layout::contiguous(out_shape),

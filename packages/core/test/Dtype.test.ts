@@ -76,13 +76,14 @@ onDevices("Dtype", (device) => (it) => {
         const error = yield* Effect.flip(Effect.gen(function* () {
           return yield* Tensor.compute([yield* Tensor.scaledDotProductAttention(q, q, q, { causal: true })])
         }))
-        expect(error.message).toMatch(/dtype must be f32 or f64, got f16/)
+        expect(error.message).toMatch(/dtype must be f32, f64 or bf16, got f16/)
+        // bf16 cross-entropy runs on both devices (fused kernel with f32
+        // accumulation on Metal, composed on CPU)
         const logits = yield* as("bf16", [1, 2, 3, 4, 5, 6], [2, 3])
         const target = yield* Tensor.fromTypedArray(new Uint32Array([0, 2]), [2])
-        const ceError = yield* Effect.flip(Effect.gen(function* () {
-          return yield* Tensor.compute([yield* Tensor.crossEntropy(logits, { target })])
-        }))
-        expect(ceError.message).toMatch(/logits must be f32 or f64, got bf16/)
+        const [loss] = yield* Tensor.compute([yield* Tensor.crossEntropy(logits, { target })])
+        const [v] = yield* Tensor.toNumberArray(loss)
+        expect(v).toBeGreaterThan(0)
       })
     )
   })

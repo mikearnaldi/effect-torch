@@ -26,13 +26,15 @@ import {
 
 const TRAIN_BIN = new URL("../data/fineweb-train.bin", import.meta.url).pathname
 const VAL_BIN = new URL("../data/fineweb-val.bin", import.meta.url).pathname
-const CKPT = new URL("../data/fineweb-epoch-ckpt.safetensors", import.meta.url).pathname
+const CKPT = process.env.FINEWEB_CKPT ?? new URL("../data/fineweb-epoch-ckpt.safetensors", import.meta.url).pathname
+const OUT = process.env.FINEWEB_OUT ?? CHECKPOINT
 
 const BATCH = 64
 const PEAK_LR = 3e-4
 const MIN_LR = 3e-5
 const WARMUP_FRACTION = 0.005
 const CHECKPOINT_EVERY = Number(process.env.FINEWEB_CHECKPOINT_EVERY ?? 2000)
+const PRECISION = process.env.FINEWEB_PRECISION === "bf16" ? "mixedBf16" as const : "f32" as const
 const VAL_BATCHES = 40
 
 const program = Effect.gen(function* () {
@@ -64,6 +66,7 @@ const program = Effect.gen(function* () {
         }
       }),
     stop: ({ step }) => step >= chunkTarget,
+    precision: PRECISION,
     onStep: ({ step, loss, elapsed }) =>
       Effect.log(`step ${String(step).padStart(5)}/${totalSteps}  loss ${loss.toFixed(4)}  ${(Duration.toMillis(elapsed) / 1000).toFixed(1)}s`)
   }))
@@ -106,8 +109,8 @@ const program = Effect.gen(function* () {
   const valLoss = yield* heldOutLoss(model, params, val, BATCH, BLOCK, VAL_BATCHES)
   yield* Effect.log(`val loss ${valLoss.toFixed(4)}`)
 
-  yield* Effect.log(`4) saving model to ${CHECKPOINT}`)
-  yield* saveParams(model, params, CHECKPOINT)
+  yield* Effect.log(`4) saving model to ${OUT}`)
+  yield* saveParams(model, params, OUT)
 })
 
 NodeRuntime.runMain(program.pipe(Effect.provide(Device.Best)))

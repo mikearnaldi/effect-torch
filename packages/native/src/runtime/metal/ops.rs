@@ -91,8 +91,8 @@ fn contig(t: &MetalTensor) -> crate::err::Res<MetalTensor> {
 }
 
 fn require_f32(t: &MetalTensor) -> crate::err::Res<()> {
-    if t.dtype != DType::F32 {
-        return Err("metal_native: emitter is f32-only".to_string());
+    if !matches!(t.dtype, DType::F32 | DType::BF16) {
+        return Err(format!("metal_native: emitter supports f32 and bf16, got {:?}", t.dtype));
     }
     Ok(())
 }
@@ -173,6 +173,9 @@ pub fn from_f32(t: &MetalTensor, dtype: DType) -> crate::err::Res<MetalTensor> {
 pub fn binary(a: &MetalTensor, b: &MetalTensor, op: BinOp) -> crate::err::Res<MetalTensor> {
     require_f32(a)?;
     require_f32(b)?;
+    if a.dtype != b.dtype {
+        return Err(format!("binary: dtype mismatch, got {:?} and {:?}; cast explicitly", a.dtype, b.dtype));
+    }
     let shape = broadcast_shape(a.layout.shape(), b.layout.shape())?;
     let an = contig(a)?;
     let bn = contig(b)?;
@@ -246,7 +249,12 @@ pub fn powf(a: &MetalTensor, e: f64) -> crate::err::Res<MetalTensor> {
 pub fn where_(cond: &MetalTensor, a: &MetalTensor, b: &MetalTensor) -> crate::err::Res<MetalTensor> {
     require_f32(a)?;
     require_f32(b)?;
-    let cond32 = to_f32(cond)?;
+    if a.dtype != b.dtype {
+        return Err(format!("where: branch dtype mismatch, got {:?} and {:?}; cast explicitly", a.dtype, b.dtype));
+    }
+    // The emitter types every lane uniformly; the condition rides the
+    // branch dtype (u8/f32 masks cast cleanly into either).
+    let cond32 = kernels::cast(MetalDevice::get(), cond, a.dtype)?;
     let shape = broadcast_shape(&broadcast_shape(cond.layout.shape(), a.layout.shape())?, b.layout.shape())?;
     let cn = contig(&cond32)?;
     let an = contig(a)?;

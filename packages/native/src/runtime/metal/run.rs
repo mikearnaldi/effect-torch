@@ -87,7 +87,14 @@ fn hash_exprs(parts: &[u64]) -> u64 {
     h.finish()
 }
 
-pub fn elementwise_key(exprs: &[Expr], lane_strides: &[Vec<usize>], shape: &[usize], n: usize, num_scalars: usize) -> u64 {
+pub fn elementwise_key(
+    exprs: &[Expr],
+    lane_strides: &[Vec<usize>],
+    shape: &[usize],
+    n: usize,
+    num_scalars: usize,
+    dtype: DType,
+) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     exprs.hash(&mut hasher);
@@ -95,6 +102,7 @@ pub fn elementwise_key(exprs: &[Expr], lane_strides: &[Vec<usize>], shape: &[usi
     shape.hash(&mut hasher);
     n.hash(&mut hasher);
     num_scalars.hash(&mut hasher);
+    (dtype as u8).hash(&mut hasher);
     hasher.finish()
 }
 
@@ -108,7 +116,7 @@ pub fn run_elementwise(
     shape: &[usize],
 ) -> Result<Vec<MetalTensor>, String> {
     let scalar_buf = if scalars.is_empty() { None } else { Some(dev.alloc_with_data(scalars)) };
-    let key = elementwise_key(exprs, lane_strides, shape, n, scalars.len());
+    let key = elementwise_key(exprs, lane_strides, shape, n, scalars.len(), inputs[0].dtype);
     run_elementwise_prekeyed(dev, key, exprs, inputs, lane_strides, scalar_buf.as_deref(), scalars.len(), n, shape)
 }
 
@@ -125,7 +133,7 @@ pub fn run_elementwise_scalar_buf(
     n: usize,
     shape: &[usize],
 ) -> Result<Vec<MetalTensor>, String> {
-    let key = elementwise_key(exprs, lane_strides, shape, n, num_scalars);
+    let key = elementwise_key(exprs, lane_strides, shape, n, num_scalars, inputs[0].dtype);
     run_elementwise_prekeyed(dev, key, exprs, inputs, lane_strides, scalar_buf, num_scalars, n, shape)
 }
 
@@ -143,25 +151,26 @@ pub fn run_elementwise_prekeyed(
     n: usize,
     shape: &[usize],
 ) -> Result<Vec<MetalTensor>, String> {
+    let dtype = inputs[0].dtype;
     let name = "et_fused";
     let pipeline = match dev.pipeline_cached(key) {
         Some(p) => p,
         None => {
-            let src = emit::emit_elementwise(exprs, lane_strides, shape, n, num_scalars, name);
+            let src = emit::emit_elementwise(exprs, lane_strides, shape, n, num_scalars, name, dtype);
             dev.compile_slow(key, &src, name)?
         }
     };
 
     let mut out_bufs = Vec::with_capacity(exprs.len());
     for _ in 0..exprs.len() {
-        out_bufs.push(MetalTensor::empty(dev, shape.to_vec(), DType::F32));
+        out_bufs.push(MetalTensor::empty(dev, shape.to_vec(), dtype));
     }
     let padded = n.div_ceil(emit::BLOCK) * emit::BLOCK;
     dev.with_encoder(|e| {
         e.setComputePipelineState(pipeline.as_raw());
         let mut idx = 0usize;
         for t in inputs {
-            set_buffer(e, idx, &t.buffer, t.layout.offset() * 4);
+            set_buffer(e, idx, &t.buffer, t.layout.offset() * t.dtype.size_in_bytes());
             idx += 1;
         }
         if let Some(buf) = scalar_buf {
@@ -201,24 +210,26 @@ pub fn run_reduce(
     dims.hash(&mut hasher);
     keepdims.hash(&mut hasher);
     out_shape.hash(&mut hasher);
+    let dtype = inputs[0].dtype;
+    (dtype as u8).hash(&mut hasher);
     let key = hasher.finish();
     let name = "et_fused_reduce";
     let pipeline = match dev.pipeline_cached(key) {
         Some(p) => p,
         None => {
-            let src = emit::emit_reduce(op, expr, lane_strides, in_shape, dims, keepdims, out_shape, name);
+            let src = emit::emit_reduce(op, expr, lane_strides, in_shape, dims, keepdims, out_shape, name, dtype);
             dev.compile_slow(key, &src, name)?
         }
     };
 
     let out_n: usize = out_shape.iter().product();
-    let out = MetalTensor::empty(dev, out_shape.to_vec(), DType::F32);
+    let out = MetalTensor::empty(dev, out_shape.to_vec(), dtype);
     let padded = out_n.div_ceil(emit::BLOCK) * emit::BLOCK;
     dev.with_encoder(|e| {
         e.setComputePipelineState(pipeline.as_raw());
         let mut idx = 0usize;
         for t in inputs {
-            set_buffer(e, idx, &t.buffer, t.layout.offset() * 4);
+            set_buffer(e, idx, &t.buffer, t.layout.offset() * t.dtype.size_in_bytes());
             idx += 1;
         }
         set_buffer(e, idx, &out.buffer, 0);

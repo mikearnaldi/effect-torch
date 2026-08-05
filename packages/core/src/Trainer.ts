@@ -120,12 +120,19 @@ export interface TrainConfig<
   readonly optimizer: Optimizer.Optimizer<S>
   readonly lr: LearningRate
   readonly loss: (
-    prediction: Tensor.Any,
+    pred: Tensor.Any,
     target: Tensor.Any
-  ) => Effect.Effect<Tensor.Lazy, EL, RL>
+  ) => Effect.Effect<Tensor.Lazy, EL | Tensor.TensorError, CurrentDevice | RL>
   readonly data: TrainDataSource<ED, RD>
   readonly stop: (info: TrainStep) => boolean
   readonly onStep?: (info: TrainStep) => Effect.Effect<void, EO, RO>
+  /**
+   * `"mixedBf16"` runs forward/backward in bf16 while the optimizer owns
+   * f32 master weights: the step graph casts masters to bf16 at the
+   * forward boundary and gradients flow back through the casts, so the
+   * update arithmetic stays f32. Metal only.
+   */
+  readonly precision?: "f32" | "mixedBf16"
 }
 
 /**
@@ -313,7 +320,10 @@ const uncompiledStep = <S, EL, RL, ED, RD, EO, RO>(
   CurrentDevice | RL
 > =>
   Effect.gen(function* () {
-    const prediction = yield* model.forward(params, data.input)
+    const forwardParams = config.precision === "mixedBf16"
+      ? yield* Effect.all(params.map((param) => Tensor.cast(param, "bf16")))
+      : params
+    const prediction = yield* model.forward(forwardParams, data.input)
     const lossTensor = yield* config.loss(prediction, data.target)
     const lr = yield* Tensor.constant(config.lr(step - 1), { dtype: params[0].dtype })
     const result = yield* Optimizer.step(config.optimizer, lossTensor, params, state, lr)
@@ -366,7 +376,10 @@ const traceStep = <S, EL, RL, ED, RD, EO, RO>(
       device
     )
     const placeholderState = optimizer.rebuildState(state, statePlaceholders)
-    const prediction = yield* model.forward(paramPlaceholders, input)
+    const forwardParams = config.precision === "mixedBf16"
+      ? yield* Effect.all(paramPlaceholders.map((param) => Tensor.cast(param, "bf16")))
+      : paramPlaceholders
+    const prediction = yield* model.forward(forwardParams, input)
     const lossTensor = yield* config.loss(prediction, target)
     const grads = yield* Gradient.grad(lossTensor, paramPlaceholders)
     const next = yield* optimizer.step(paramPlaceholders, grads, placeholderState, lr)
@@ -423,6 +436,12 @@ const trainLoop = <S, EL = never, RL = never, ED = never, RD = never, EO = never
   CurrentDevice | RL | RD | RO
 > =>
   Effect.gen(function* () {
+    if (config.precision === "mixedBf16" && (yield* CurrentDevice) !== "metal") {
+      return yield* new Model.ModelError({
+        op: "train",
+        message: "mixedBf16 precision requires the metal device (bf16 kernels)"
+      })
+    }
     let params: Model.Params = initial !== undefined
       ? initial
       : yield* model.init

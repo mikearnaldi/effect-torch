@@ -91,8 +91,8 @@ fn sdpa_check(op: &str, q: &Node, k: &Node, v: &Node) -> std::result::Result<Vec
             k.shape, v.shape
         ));
     }
-    if !matches!(q.dtype, DType::F32 | DType::F64) {
-        return Err(format!("{op}: dtype must be f32 or f64, got {:?}", q.dtype));
+    if !matches!(q.dtype, DType::F32 | DType::F64 | DType::BF16) {
+        return Err(format!("{op}: dtype must be f32, f64 or bf16, got {:?}", q.dtype));
     }
     if k.dtype != q.dtype || v.dtype != q.dtype {
         return Err(format!("{op}: q, k and v must share a dtype, got {:?}, {:?} and {:?}", q.dtype, k.dtype, v.dtype));
@@ -1360,9 +1360,9 @@ impl Node {
                 if logits.shape[rank - 1] == 0 {
                     return Err("cross_entropy: class dimension must be non-empty".to_string());
                 }
-                if !matches!(logits.dtype, DType::F32 | DType::F64) {
+                if !matches!(logits.dtype, DType::F32 | DType::F64 | DType::BF16) {
                     return Err(format!(
-                        "cross_entropy: logits must be f32 or f64, got {:?}",
+                        "cross_entropy: logits must be f32, f64 or bf16, got {:?}",
                         logits.dtype
                     ));
                 }
@@ -1480,9 +1480,9 @@ impl Node {
                 if d % 2 != 0 {
                     return Err(format!("rotary_embedding: head dim must be even, got {d}"));
                 }
-                if x.dtype != DType::F32 {
+                if !matches!(x.dtype, DType::F32 | DType::BF16) {
                     return Err(format!(
-                        "rotary_embedding: dtype must be f32, got {:?}",
+                        "rotary_embedding: dtype must be f32 or bf16, got {:?}",
                         x.dtype
                     ));
                 }
@@ -4365,7 +4365,7 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> crate::err::Res<val::V
                     val::Val::Cpu(runtime::cpu::composed::sdpa_forward(q, k, v, *scale, *causal))
                 }
                 (val::Val::Metal(q), val::Val::Metal(k), val::Val::Metal(v)) => {
-                    if q.dtype == runtime::dtype::DType::F32 {
+                    if matches!(q.dtype, runtime::dtype::DType::F32 | runtime::dtype::DType::BF16) {
                         let (o, l) = flash::forward(q, k, v, *scale, *causal)?;
                         // L rides the evaluator for the chunked backward; the
                         // node's own cache entry holds O.
@@ -4407,7 +4407,7 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> crate::err::Res<val::V
                     )
                 }
                 (val::Val::Metal(q), val::Val::Metal(k), val::Val::Metal(v), val::Val::Metal(g)) => {
-                    if let (Some(val::Val::Metal(l)), true) = (&l, q.dtype == runtime::dtype::DType::F32) {
+                    if let (Some(val::Val::Metal(l)), true) = (&l, matches!(q.dtype, runtime::dtype::DType::F32 | runtime::dtype::DType::BF16)) {
                         let o = o.as_metal()?;
                         let (dq, dk, dv) = flash::backward_fused(q, k, v, o, l, g, *scale, *causal)?;
                         (
@@ -4510,7 +4510,7 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> crate::err::Res<val::V
                     val::Val::Cpu(r)
                 }
                 val::Val::Metal(x) => {
-                    if x.dtype == runtime::dtype::DType::F32 {
+                    if matches!(x.dtype, runtime::dtype::DType::F32 | runtime::dtype::DType::BF16) {
                         val::Val::Metal(rotary::rotary(x, &offsets, *theta, 1.0)?)
                     } else {
                         let x32 = metal_ops::to_f32(x)?;
@@ -4529,7 +4529,7 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> crate::err::Res<val::V
                     val::Val::Cpu(r)
                 }
                 val::Val::Metal(g) => {
-                    if g.dtype == runtime::dtype::DType::F32 {
+                    if matches!(g.dtype, runtime::dtype::DType::F32 | runtime::dtype::DType::BF16) {
                         // Transpose rotation == forward with negated angles.
                         val::Val::Metal(rotary::rotary(g, &[0usize], *theta, -1.0)?)
                     } else {
@@ -4549,7 +4549,7 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> crate::err::Res<val::V
                     val::Val::Cpu(x.matmul(w).add(b))
                 }
                 (val::Val::Metal(x), val::Val::Metal(w), val::Val::Metal(b)) => {
-                    if x.dtype == runtime::dtype::DType::F32 {
+                    if linear::is_supported(x, w) {
                         val::Val::Metal(linear::linear_forward(x, w, b)?)
                     } else {
                         let x32 = metal_ops::to_f32(x)?;

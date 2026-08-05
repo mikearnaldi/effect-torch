@@ -2,6 +2,33 @@ use crate::fusion::{Expr, ReduceOp};
 
 pub const BLOCK: usize = 256;
 
+// Storage dtype of the lanes and outputs: bf16 kernels load into float,
+// compute in float, and store back as bfloat — the fusion IR only models
+// float math, so dtype support is purely a load/store concern.
+fn storage_ty(dtype: crate::runtime::dtype::DType) -> &'static str {
+    match dtype {
+        crate::runtime::dtype::DType::F32 => "float",
+        crate::runtime::dtype::DType::BF16 => "bfloat",
+        other => unreachable!("emit: unsupported storage dtype {other:?}"),
+    }
+}
+
+fn load_expr(access: String, dtype: crate::runtime::dtype::DType) -> String {
+    match dtype {
+        crate::runtime::dtype::DType::F32 => access,
+        crate::runtime::dtype::DType::BF16 => format!("float({access})"),
+        other => unreachable!("emit: unsupported storage dtype {other:?}"),
+    }
+}
+
+fn store_expr(value: &str, dtype: crate::runtime::dtype::DType) -> String {
+    match dtype {
+        crate::runtime::dtype::DType::F32 => value.to_string(),
+        crate::runtime::dtype::DType::BF16 => format!("bfloat({value})"),
+        other => unreachable!("emit: unsupported storage dtype {other:?}"),
+    }
+}
+
 fn f32_lit(v: f64) -> String {
     let v = v as f32;
     if v.is_infinite() {
@@ -182,15 +209,17 @@ pub fn emit_elementwise(
     n: usize,
     num_scalars: usize,
     name: &str,
+    dtype: crate::runtime::dtype::DType,
 ) -> String {
     let num_inputs = lane_strides.len();
     let num_outputs = exprs.len();
+    let ty = storage_ty(dtype);
     let mut src = String::from(HEADER);
     src.push_str(&format!("kernel void {name}(\n"));
     let mut idx = 0usize;
     let mut params: Vec<String> = Vec::new();
     for k in 0..num_inputs {
-        params.push(format!("    device const float* in{k} [[buffer({idx})]]"));
+        params.push(format!("    device const {ty}* in{k} [[buffer({idx})]]"));
         idx += 1;
     }
     if num_scalars > 0 {
@@ -198,7 +227,7 @@ pub fn emit_elementwise(
         idx += 1;
     }
     for j in 0..num_outputs {
-        params.push(format!("    device float* out{j} [[buffer({idx})]]"));
+        params.push(format!("    device {ty}* out{j} [[buffer({idx})]]"));
         idx += 1;
     }
     params.push("    uint gid [[thread_position_in_grid]]".to_string());
@@ -209,14 +238,14 @@ pub fn emit_elementwise(
         .iter()
         .map(|s| lane_offset_expr(s, out_shape, "clamped"))
         .collect();
-    let lane = |k: u32| -> String { format!("in{}[{}]", k, lanes[k as usize]) };
+    let lane = |k: u32| -> String { load_expr(format!("in{}[{}]", k, lanes[k as usize]), dtype) };
     let mut next = 0usize;
     let mut memo = std::collections::HashMap::new();
     for (j, expr) in exprs.iter().enumerate() {
         let mut body = String::new();
         let v = emit_expr_ssa(expr, &lane, num_inputs, &mut body, &mut next, &mut memo);
         src.push_str(&body);
-        src.push_str(&format!("    out{j}[clamped] = {v};\n"));
+        src.push_str(&format!("    out{j}[clamped] = {};\n", store_expr(&v, dtype)));
     }
     src.push_str("}\n");
     src
@@ -232,20 +261,22 @@ pub fn emit_reduce(
     keepdims: bool,
     out_shape: &[usize],
     name: &str,
+    dtype: crate::runtime::dtype::DType,
 ) -> String {
     let num_inputs = lane_strides.len();
     let rank = in_shape.len();
     let out_n: usize = out_shape.iter().product();
     let contig_out = contiguous_strides(out_shape);
+    let ty = storage_ty(dtype);
     let mut src = String::from(HEADER);
     src.push_str(&format!("kernel void {name}(\n"));
     let mut params: Vec<String> = Vec::new();
     let mut idx = 0usize;
     for k in 0..num_inputs {
-        params.push(format!("    device const float* in{k} [[buffer({idx})]]"));
+        params.push(format!("    device const {ty}* in{k} [[buffer({idx})]]"));
         idx += 1;
     }
-    params.push(format!("    device float* out [[buffer({idx})]]"));
+    params.push(format!("    device {ty}* out [[buffer({idx})]]"));
     params.push("    uint gid [[thread_position_in_grid]]".to_string());
     src.push_str(&params.join(",\n"));
     src.push_str("\n) {\n");
@@ -313,7 +344,7 @@ pub fn emit_reduce(
             lane_offsets[k] = format!("{} + {term}", lane_offsets[k]);
         }
     }
-    let lane = |k: u32| -> String { format!("in{}[{}]", k, lane_offsets[k as usize]) };
+    let lane = |k: u32| -> String { load_expr(format!("in{}[{}]", k, lane_offsets[k as usize]), dtype) };
     let v = emit_expr(expr, &lane, num_inputs);
     let fold = match op {
         ReduceOp::Sum | ReduceOp::Mean => format!("acc += {v};"),
@@ -326,7 +357,7 @@ pub fn emit_reduce(
     if op == ReduceOp::Mean {
         src.push_str(&format!("    acc /= {extent}.0f;\n"));
     }
-    src.push_str("    out[clamped] = acc;\n");
+    src.push_str(&format!("    out[clamped] = {};\n", store_expr("acc", dtype)));
     src.push_str("}\n");
     src
 }
@@ -341,12 +372,12 @@ mod tests {
             Box::new(Expr::Input(0)),
             Box::new(Expr::Mul(Box::new(Expr::Input(1)), Box::new(Expr::Const(2.0f64.to_bits())))),
         )];
-        let src = emit_elementwise(&exprs, &[vec![3, 1], vec![0, 1]], &[2, 3], 6, 0, "fused_test");
+        let src = emit_elementwise(&exprs, &[vec![3, 1], vec![0, 1]], &[2, 3], 6, 0, "fused_test", crate::runtime::dtype::DType::F32);
         assert!(src.contains("kernel void fused_test("));
         assert!(src.contains("in0[clamped]"));
         assert!(src.contains("in1[(clamped % 3)]"));
         assert!(src.contains("out0[clamped] ="));
-        let nc = emit_elementwise(&exprs, &[vec![2, 1], vec![3, 1]], &[2, 3], 6, 0, "fused_nc");
+        let nc = emit_elementwise(&exprs, &[vec![2, 1], vec![3, 1]], &[2, 3], 6, 0, "fused_nc", crate::runtime::dtype::DType::F32);
         assert!(nc.contains("in0[(((clamped / 3) % 2) * 2) + (clamped % 3)]"));
     }
 
@@ -361,7 +392,7 @@ mod tests {
             &[1],
             false,
             &[2],
-            "reduce_test",
+            "reduce_test", crate::runtime::dtype::DType::F32,
         );
         assert!(src.contains("for (uint r = 0u; r < 3u; ++r)"));
         assert!(src.contains("acc /= 3.0f;"));

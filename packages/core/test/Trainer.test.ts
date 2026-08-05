@@ -20,7 +20,7 @@ const xor = Effect.gen(function* () {
   return { input, target } as const
 })
 
-onDevices("Trainer", () => (it) => {
+onDevices("Trainer", (device) => (it) => {
   describe("stop policy", () => {
     it.effect("stops on a loss target", () =>
       Effect.gen(function* () {
@@ -205,6 +205,42 @@ onDevices("Trainer", () => (it) => {
           expect(yield* values(traced.params[i])).toEqual(yield* values(reference.params[i]))
         }
         expect(compiled.stats()).toEqual({ cached: 1, compiled: 1 })
+      })
+    )
+
+    it.effect("mixedBf16: bf16 compute with f32 masters converges; typed error on cpu", () =>
+      Effect.gen(function* () {
+        const model = yield* mlp
+        const raw = yield* xor
+        // mixed precision casts the parameters; the input pipeline is the
+        // app's domain (an LM gets bf16 activations from its bf16
+        // embedding) — feed bf16 features.
+        const data = {
+          input: yield* Tensor.cast(raw.input, "bf16"),
+          target: yield* Tensor.cast(raw.target, "bf16")
+        }
+        const makeMixed = Effect.gen(function* () {
+          return yield* Trainer.make(model, {
+            optimizer: yield* Optimizer.adam(),
+            lr: LearningRate.constant(0.1),
+            loss: Loss.mse,
+            data,
+            stop: ({ step }) => step >= 1200,
+            precision: "mixedBf16"
+          })
+        })
+        if (device !== "metal") {
+          const error = yield* Effect.flip(Effect.flatMap(makeMixed, (trainer) => trainer.train()))
+          expect(error._tag).toBe("ModelError")
+          return
+        }
+        const trainer = yield* makeMixed
+        const { params, loss } = yield* trainer.train()
+        expect(loss).toBeLessThan(0.1)
+        // masters stay f32 — the optimizer's update arithmetic is f32
+        expect(params.every((p) => p.dtype === "f32")).toBe(true)
+        const [pred] = yield* Tensor.compute([yield* model.forward(params, data.input)])
+        expect((yield* values(pred)).map((v) => (v > 0.5 ? 1 : 0))).toEqual([0, 1, 1, 0])
       })
     )
 
