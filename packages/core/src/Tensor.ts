@@ -31,9 +31,9 @@ const {
  */
 export type DType = "f32" | "f64" | "f16" | "bf16" | "i64" | "u8" | "u32"
 
-type _TupleOf<T, N extends number, R extends unknown[]> = R['length'] extends N ? R : _TupleOf<T, N, [T, ...R]>;
+type _TupleOf<T, N extends number, R extends Array<unknown>> = R["length"] extends N ? R : _TupleOf<T, N, [T, ...R]>
 
-export type Tuple<T, N extends number> = N extends N ? number extends N ? T[] : _TupleOf<T, N, []> : never;
+export type Tuple<T, N extends number> = N extends N ? number extends N ? Array<T> : _TupleOf<T, N, []> : never
 
 /**
  * JavaScript typed arrays accepted by {@link fromTypedArray} and returned by

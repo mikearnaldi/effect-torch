@@ -28,7 +28,9 @@ const bench = <A extends Tensor.Any>(
     }
     const ms = (performance.now() - start) / ITERS / CHAIN
     yield* Console.log(
-      `${label.padEnd(40)} ${ms.toFixed(3)} ms  ${(flops / ms / 1e6).toFixed(0)} GFLOP/s  x${perStep}/step = ${(ms * perStep).toFixed(0)} ms`
+      `${label.padEnd(40)} ${ms.toFixed(3)} ms  ${(flops / ms / 1e6).toFixed(0)} GFLOP/s  x${perStep}/step = ${
+        (ms * perStep).toFixed(0)
+      } ms`
     )
   })
 
@@ -36,10 +38,9 @@ const bench = <A extends Tensor.Any>(
 const BT = 128 * 256 // tokens per step at batch 128
 
 const program = Effect.gen(function*() {
-  const mk = (shape: readonly number[]) => Effect.flatMap(Tensor.randn(shape), (t) => Tensor.cast(t, "bf16"))
+  const mk = (shape: ReadonlyArray<number>) => Effect.flatMap(Tensor.randn(shape), (t) => Tensor.cast(t, "bf16"))
   const gemm = (m: number, k: number, n: number, perStep: number, label: string) =>
-    Effect.flatMap(Effect.zip(mk([m, k]), mk([k, n])), ([a, b]) =>
-      bench(label, a, b, 2 * m * k * n, perStep))
+    Effect.flatMap(Effect.zip(mk([m, k]), mk([k, n])), ([a, b]) => bench(label, a, b, 2 * m * k * n, perStep))
 
   // trunk: 6 layers, each fwd + dX + dW
   yield* gemm(BT, 256, 768, 6, "qkv   [32k,256]x[256,768]    fwd")
