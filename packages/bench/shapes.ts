@@ -6,13 +6,13 @@ const ITERS = Number(process.env.ITERS ?? 20)
 
 const CHAIN = Number(process.env.CHAIN ?? 20)
 
-const bench = <A extends Tensor.Any, E>(
+const bench = <A extends Tensor.Any>(
   label: string,
   a: A,
   b: A,
   flops: number,
   perStep: number
-): Effect.Effect<void, E> =>
+): Effect.Effect<void, Tensor.TensorError> =>
   Effect.gen(function*() {
     // CHAIN identical matmuls as roots of one compute: one sync per
     // iteration, so eager per-call overhead does not drown the kernel.

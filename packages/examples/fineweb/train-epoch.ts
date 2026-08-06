@@ -76,12 +76,12 @@ const program = Effect.gen(function*() {
     stop: ({ step }) => step >= chunkTarget,
     precision: PRECISION,
     onStep: ({ step, loss, elapsed }) => {
-      // ETA from the mean step time, excluding the first step (its
-      // capture/compile overhead would skew the average). The trainer
-      // runs in 100-step chunks between checkpoints and `elapsed`
-      // resets each chunk — re-anchor whenever it goes backwards.
+      // ETA from the mean step time since the epoch began, excluding
+      // the first step seen (its capture/compile overhead would skew
+      // the average); the clock is continuous across checkpoint chunks
+      // via Resume.startedAt.
       const ms = Duration.toMillis(elapsed)
-      if (firstStep === undefined || ms < firstStep.ms) firstStep = { step, ms }
+      if (firstStep === undefined) firstStep = { step, ms }
       const done = step - firstStep.step
       const remaining = totalSteps - step
       const eta = done > 0 && remaining > 0
@@ -122,13 +122,17 @@ const program = Effect.gen(function*() {
   )
 
   let chunkTarget = Math.min(step + CHECKPOINT_EVERY, totalSteps)
+  // One clock for the whole epoch: carried through every chunk's
+  // resume so TrainStep.elapsed never restarts at a checkpoint.
+  const epochStartedAt = resume?.startedAt ?? Date.now()
+  if (resume !== undefined) resume = { ...resume, startedAt: epochStartedAt }
   while (step < totalSteps) {
     const previous = params
     const previousState = resume?.state
     const trained = yield* trainer.train(params, resume)
     params = trained.params
     step = trained.step
-    resume = { state: trained.state, step }
+    resume = { state: trained.state, step, startedAt: epochStartedAt }
     yield* Checkpoint.saveWithSampler(CKPT, trainer, trained, sampler)
     yield* Effect.log(`checkpoint at step ${step}`)
     chunkTarget = Math.min(step + CHECKPOINT_EVERY, totalSteps)

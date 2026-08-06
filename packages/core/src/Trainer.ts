@@ -65,9 +65,10 @@ export type TrainDataSource<E = never, R = never> =
 /**
  * Per-step progress reported to {@link TrainConfig.onStep} and
  * {@link TrainConfig.stop}: the 1-based step number, the step's loss
- * value, and the time elapsed since this `train` run began — each
- * invocation of `train` starts its own clock, so continued training and
- * re-runs never share a start time.
+ * value, and the time elapsed since the run began. The clock starts at
+ * each `train` invocation unless {@link Resume.startedAt} carries an
+ * earlier anchor — chunked runs that want one continuous clock pass
+ * the anchor through.
  *
  * @since 0.1.0
  * @category models
@@ -164,7 +165,9 @@ export interface Trained<S> {
  * A resumable training position: the optimizer state and global step
  * count exactly as a previous {@link Trained} returned them. Passing it
  * back to `train` continues the run as if it had never stopped — same
- * optimizer moments, same step numbering for `stop`/`onStep`.
+ * optimizer moments, same step numbering for `stop`/`onStep`, and —
+ * when `startedAt` is carried along — the same clock for
+ * {@link TrainStep.elapsed}.
  *
  * @since 0.1.0
  * @category models
@@ -172,6 +175,13 @@ export interface Trained<S> {
 export interface Resume<S> {
   readonly state: S
   readonly step: number
+  /**
+   * Epoch wall-clock anchor in milliseconds (`Date.now()`). When set,
+   * {@link TrainStep.elapsed} measures from this point instead of the
+   * current `train` invocation, so a run chunked into several `train`
+   * calls keeps one continuous clock. Absent means: start now.
+   */
+  readonly startedAt?: number
 }
 
 /**
@@ -414,7 +424,7 @@ const trainLoop = <S, EL = never, RL = never, ED = never, RD = never, EO = never
     let step = resume?.step ?? 0
     let loss = Number.NaN
     let trained: ReadonlyArray<Tensor.Concrete>
-    const started = yield* Effect.sync(() => Date.now())
+    const started = resume?.startedAt ?? (yield* Effect.sync(() => Date.now()))
     // Tensors the loop itself produced (the materialized init roots and
     // each step's outputs) that a later step has consumed: their buffers
     // are dead once the consuming step returns, so release them
