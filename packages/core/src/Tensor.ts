@@ -3573,9 +3573,10 @@ const evictProgramCache = (cache: ProgramCacheState): void => {
 
 /**
  * Looks up the program for `key`, running `trace` once on a miss.
- * Concurrent misses on the same key share one trace (single-flight): the
- * first caller traces, the rest await the same deferred. A failed trace
- * is not cached.
+ * The thunk is only invoked on a miss — cache hits never build a
+ * trace effect. Concurrent misses on the same key share one trace
+ * (single-flight): the first caller traces, the rest await the same
+ * deferred. A failed trace is not cached.
  *
  * @since 0.1.0
  * @category compilation
@@ -3584,7 +3585,7 @@ const evictProgramCache = (cache: ProgramCacheState): void => {
 export const cachedProgram = <E, R>(
   cache: ProgramCacheState,
   key: string,
-  trace: Effect.Effect<NativeCompiledProgramType, E, R>
+  trace: () => Effect.Effect<NativeCompiledProgramType, E, R>
 ): Effect.Effect<NativeCompiledProgramType, TensorError | E, R> =>
   Effect.suspend(() => {
     const hit = cache.entries.get(key)
@@ -3609,7 +3610,7 @@ export const cachedProgram = <E, R>(
           )
         }
       }
-      const exit = yield* Effect.exit(trace)
+      const exit = yield* Effect.exit(trace())
       yield* Deferred.done(deferred, exit)
       if (Exit.isFailure(exit)) {
         cache.entries.delete(key)
@@ -4046,7 +4047,7 @@ export const compile = <E = never, R = never>(
     const self: CompiledFn<E, R> = {
       call: (inputs) =>
         Effect.gen(function*() {
-          const program = yield* cachedProgram(cache, signatureOf(inputs), trace(inputs))
+          const program = yield* cachedProgram(cache, signatureOf(inputs), () => trace(inputs))
           return yield* runProgram(program, inputs)
         }),
       get stats() {

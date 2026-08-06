@@ -373,7 +373,7 @@ const compiledStep = <S, EL, RL, ED, RD, EO, RO>(
     const program = yield* Tensor.cachedProgram(
       cache,
       Tensor.signatureOf(inputs),
-      traceStep(model, config, params, stateRoots, state, data, device)
+      () => traceStep(model, config, params, stateRoots, state, data, device)
     )
     const outputs = yield* Tensor.runProgram(program, inputs, [config.lr(step - 1)])
     const loss = (yield* Tensor.toNumberArray(outputs[0]))[0]
