@@ -25,10 +25,22 @@ fn key(parts: &[u64]) -> u64 {
     h.finish()
 }
 
-pub fn index_select(dev: &MetalDevice, x: &MetalTensor, dim: usize, ids: &[u32]) -> Result<MetalTensor, String> {
+/// Host-side indices uploaded once — for op callers whose indices were
+/// never on-device. Hot paths (gather/scatter under a compiled step)
+/// keep indices on the device and never read them back.
+pub fn ids_from_host(dev: &MetalDevice, ids: &[u32]) -> MetalTensor {
+    MetalTensor {
+        buffer: dev.alloc_with_data_u32(ids),
+        layout: crate::runtime::layout::Layout::contiguous(vec![ids.len()]),
+        dtype: DType::U32,
+    }
+}
+
+pub fn index_select(dev: &MetalDevice, x: &MetalTensor, dim: usize, ids: &MetalTensor) -> Result<MetalTensor, String> {
+    assert_eq!(ids.dtype, DType::U32, "index_select: ids must be u32");
     let shape = x.layout.shape();
     let rank = shape.len();
-    let l = ids.len();
+    let l = ids.numel();
     let mut out_shape = shape.to_vec();
     out_shape[dim] = l;
     let total: usize = out_shape.iter().product();
@@ -72,19 +84,19 @@ kernel void et_isel(
 "#
     );
     let pipeline = dev.compile_lazy(key(&[0x15E1, x.dtype as u64, dim as u64, l as u64, key(&out_shape.iter().map(|&v| v as u64).collect::<Vec<_>>()), key(&strides.iter().map(|&v| v as u64).collect::<Vec<_>>())]), "et_isel", make_src)?;
-    let ids_buf = dev.alloc_with_data_u32(ids);
     let padded = total.div_ceil(256) * 256;
     dev.with_encoder(|e| {
         e.setComputePipelineState(pipeline.as_raw());
         set_buffer(e, 0, &x.buffer, x.layout.offset() * x.dtype.size_in_bytes());
-        set_buffer(e, 1, &ids_buf, 0);
+        set_buffer(e, 1, &ids.buffer, ids.layout.offset() * 4);
         set_buffer(e, 2, &out.buffer, 0);
         e.dispatchThreads_threadsPerThreadgroup(MetalDevice::grid(padded, 1, 1), MetalDevice::grid(256, 1, 1));
     });
     Ok(out)
 }
 
-pub fn gather(dev: &MetalDevice, x: &MetalTensor, dim: usize, ids: &[u32], ids_shape: &[usize]) -> Result<MetalTensor, String> {
+pub fn gather(dev: &MetalDevice, x: &MetalTensor, dim: usize, ids: &MetalTensor, ids_shape: &[usize]) -> Result<MetalTensor, String> {
+    assert_eq!(ids.dtype, DType::U32, "gather: ids must be u32");
     let shape = x.layout.shape();
     let rank = shape.len();
     assert_eq!(ids_shape.len(), rank, "gather: rank mismatch");
@@ -128,19 +140,19 @@ kernel void et_gather(
 "#
     );
     let pipeline = dev.compile_lazy(key(&[0x6A7E, x.dtype as u64, dim as u64, key(&ids_shape.iter().map(|&v| v as u64).collect::<Vec<_>>()), key(&strides.iter().map(|&v| v as u64).collect::<Vec<_>>())]), "et_gather", make_src)?;
-    let ids_buf = dev.alloc_with_data_u32(ids);
     let padded = total.div_ceil(256) * 256;
     dev.with_encoder(|e| {
         e.setComputePipelineState(pipeline.as_raw());
         set_buffer(e, 0, &x.buffer, x.layout.offset() * x.dtype.size_in_bytes());
-        set_buffer(e, 1, &ids_buf, 0);
+        set_buffer(e, 1, &ids.buffer, ids.layout.offset() * 4);
         set_buffer(e, 2, &out.buffer, 0);
         e.dispatchThreads_threadsPerThreadgroup(MetalDevice::grid(padded, 1, 1), MetalDevice::grid(256, 1, 1));
     });
     Ok(out)
 }
 
-pub fn scatter_add(dev: &MetalDevice, x: &MetalTensor, dim: usize, ids: &[u32], src_t: &MetalTensor) -> Result<MetalTensor, String> {
+pub fn scatter_add(dev: &MetalDevice, x: &MetalTensor, dim: usize, ids: &MetalTensor, src_t: &MetalTensor) -> Result<MetalTensor, String> {
+    assert_eq!(ids.dtype, DType::U32, "scatter_add: ids must be u32");
     if x.dtype != DType::F32 {
         // No bf16 atomics in MSL: accumulate in f32 (the more precise
         // order anyway), then cast back to the caller's dtype.
@@ -196,12 +208,11 @@ kernel void et_sadd(
 "#
     );
     let pipeline = dev.compile_lazy(key(&[0x5ADD, x.dtype as u64, dim as u64, key(&ids_shape.iter().map(|&v| v as u64).collect::<Vec<_>>()), key(&os.iter().map(|&v| v as u64).collect::<Vec<_>>()), key(&src_strides.iter().map(|&v| v as u64).collect::<Vec<_>>())]), "et_sadd", make_src)?;
-    let ids_buf = dev.alloc_with_data_u32(ids);
     let padded = total.div_ceil(256) * 256;
     dev.with_encoder(|e| {
         e.setComputePipelineState(pipeline.as_raw());
         set_buffer(e, 0, &out.buffer, 0);
-        set_buffer(e, 1, &ids_buf, 0);
+        set_buffer(e, 1, &ids.buffer, ids.layout.offset() * 4);
         set_buffer(e, 2, &src_t.buffer, src_t.layout.offset() * src_t.dtype.size_in_bytes());
         e.dispatchThreads_threadsPerThreadgroup(MetalDevice::grid(padded, 1, 1), MetalDevice::grid(256, 1, 1));
     });
@@ -340,7 +351,7 @@ mod tests {
     fn index_select_rows() {
         let dev = MetalDevice::get();
         let x = MetalTensor::from_f32(dev, (0..6).map(|v| v as f32).collect(), vec![2, 3]);
-        let out = index_select(dev, &x, 1, &[2, 0]).unwrap();
+        let out = index_select(dev, &x, 1, &ids_from_host(dev, &[2, 0])).unwrap();
         dev.synchronize();
         assert_eq!(out.read_f32().unwrap(), vec![2., 0., 5., 3.]);
     }
@@ -349,7 +360,7 @@ mod tests {
     fn gather_rows() {
         let dev = MetalDevice::get();
         let x = MetalTensor::from_f32(dev, (0..6).map(|v| v as f32).collect(), vec![2, 3]);
-        let out = gather(dev, &x, 0, &[1, 1, 1, 0, 0, 0, 1, 1, 1], &[3, 3]).unwrap();
+        let out = gather(dev, &x, 0, &ids_from_host(dev, &[1, 1, 1, 0, 0, 0, 1, 1, 1]), &[3, 3]).unwrap();
         dev.synchronize();
         assert_eq!(out.read_f32().unwrap(), vec![3., 4., 5., 0., 1., 2., 3., 4., 5.]);
     }
@@ -359,7 +370,7 @@ mod tests {
         let dev = MetalDevice::get();
         let table = MetalTensor::zeros(dev, vec![4, 2], DType::F32);
         let src = MetalTensor::from_f32(dev, vec![1f32, 2., 3., 4.], vec![2, 2]);
-        let out = scatter_add(dev, &table, 0, &[1, 1, 3, 3], &src).unwrap();
+        let out = scatter_add(dev, &table, 0, &ids_from_host(dev, &[1, 1, 3, 3]), &src).unwrap();
         dev.synchronize();
         assert_eq!(out.read_f32().unwrap(), vec![0., 0., 1., 2., 0., 0., 3., 4.]);
     }

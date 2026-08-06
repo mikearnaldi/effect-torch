@@ -372,20 +372,23 @@ pub fn broadcast_to(t: &MetalTensor, shape: &[usize]) -> crate::err::Res<MetalTe
     contig(&b)
 }
 
-pub fn index_select(a: &MetalTensor, dim: usize, ids: &[u32]) -> crate::err::Res<MetalTensor> {
+pub fn index_select(a: &MetalTensor, dim: usize, ids: &MetalTensor) -> crate::err::Res<MetalTensor> {
     let an = contig(a)?;
-    indexing::index_select(MetalDevice::get(), &an, dim, ids)
+    let idn = contig(ids)?;
+    indexing::index_select(MetalDevice::get(), &an, dim, &idn)
 }
 
-pub fn gather(a: &MetalTensor, dim: usize, ids: &[u32], ids_shape: &[usize]) -> crate::err::Res<MetalTensor> {
+pub fn gather(a: &MetalTensor, dim: usize, ids: &MetalTensor, ids_shape: &[usize]) -> crate::err::Res<MetalTensor> {
     let an = contig(a)?;
-    indexing::gather(MetalDevice::get(), &an, dim, ids, ids_shape)
+    let idn = contig(ids)?;
+    indexing::gather(MetalDevice::get(), &an, dim, &idn, ids_shape)
 }
 
-pub fn scatter_add(a: &MetalTensor, dim: usize, ids: &[u32], src: &MetalTensor) -> crate::err::Res<MetalTensor> {
+pub fn scatter_add(a: &MetalTensor, dim: usize, ids: &MetalTensor, src: &MetalTensor) -> crate::err::Res<MetalTensor> {
     let an = contig(a)?;
     let sn = contig(src)?;
-    indexing::scatter_add(MetalDevice::get(), &an, dim, ids, &sn)
+    let idn = contig(ids)?;
+    indexing::scatter_add(MetalDevice::get(), &an, dim, &idn, &sn)
 }
 
 pub fn cat(a: &MetalTensor, b: &MetalTensor, dim: usize) -> crate::err::Res<MetalTensor> {

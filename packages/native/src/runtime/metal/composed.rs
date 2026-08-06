@@ -279,7 +279,8 @@ pub fn cross_entropy_forward(
     let zero_ids = fill(target.layout.shape(), 0.0, DType::I64)?;
     let safe_target = where_(&ignored, &zero_ids, &target_to_ids(target)?)?;
     let safe_ids = unsqueeze_last(&safe_target)?;
-    let picked = gather(logits, r - 1, &safe_ids.to_u32_vec()?, safe_ids.layout.shape())?;
+    let safe_ids32 = super::ops::cast(&safe_ids, DType::U32)?;
+    let picked = gather(logits, r - 1, &safe_ids32, safe_ids.layout.shape())?;
     let picked = squeeze_last(&picked)?;
     let per_position = binary(&squeeze_last(&lse)?, &picked, BinOp::Sub)?;
     let masked = where_(&ignored, &zeros_like(&per_position)?, &per_position)?;
@@ -310,7 +311,8 @@ pub fn cross_entropy_backward(
     let safe_target = where_(&ignored, &zero_ids, &target_to_ids(target)?)?;
     let ids = unsqueeze_last(&safe_target)?;
     let neg_ones = fill(ids.layout.shape(), -1.0, logits.dtype)?;
-    let p = super::ops::scatter_add(&p, r - 1, &ids.to_u32_vec()?, &neg_ones)?;
+    let ids32 = super::ops::cast(&ids, DType::U32)?;
+    let p = super::ops::scatter_add(&p, r - 1, &ids32, &neg_ones)?;
     let keep = compare(&ignored, &fill(ignored.layout.shape(), 0.0, DType::U8)?, BinOp::Eq)?;
     let keep = unsqueeze_last(&keep)?;
     let masked = where_(&keep, &p, &zeros_like(&p)?)?;

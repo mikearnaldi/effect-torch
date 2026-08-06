@@ -4183,8 +4183,29 @@ fn cpu_to_metal(t: &runtime::cpu::Tensor) -> err::Res<runtime::metal::run::Metal
     })
 }
 
-fn index_ids_u32(indexes: &val::Val) -> crate::err::Res<Vec<u32>> {
-    indexes.to_u32_vec()
+// Device-side index path: indices already on Metal stay on the device
+// (cast to u32 there); reading them back would synchronize the whole
+// command queue mid-step — the wte gather/scatter pair was costing
+// ~530ms/step of host-blocked time at batch 32 before this.
+#[cfg(target_os = "macos")]
+fn metal_ids_u32(indexes: &val::Val) -> crate::err::Res<runtime::metal::run::MetalTensor> {
+    match indexes {
+        val::Val::Metal(t) => {
+            let t = metal_ops::contiguous(t)?;
+            if t.dtype == DType::U32 {
+                Ok(t)
+            } else {
+                metal_ops::cast(&t, DType::U32)
+            }
+        }
+        val::Val::Cpu(_) => {
+            let ids = indexes.to_u32_vec()?;
+            Ok(runtime::metal::indexing::ids_from_host(
+                runtime::metal::device::MetalDevice::get(),
+                &ids,
+            ))
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4745,7 +4766,7 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> crate::err::Res<val::V
                     val::Val::Cpu(x.scatter_add(*dim, indexes.as_cpu()?, s))
                 }
                 (val::Val::Metal(x), val::Val::Metal(s)) => {
-                    let ids = index_ids_u32(&indexes)?;
+                    let ids = metal_ids_u32(&indexes)?;
                     val::Val::Metal(metal_ops::scatter_add(x, *dim, &ids, s)?)
                 }
                 _ => return Err("device mismatch".to_string()),
@@ -4759,7 +4780,7 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> crate::err::Res<val::V
                     val::Val::Cpu(x.gather(*dim, indexes.as_cpu()?))
                 }
                 val::Val::Metal(x) => {
-                    let ids = index_ids_u32(&indexes)?;
+                    let ids = metal_ids_u32(&indexes)?;
                     val::Val::Metal(metal_ops::gather(x, *dim, &ids, &indexes.shape())?)
                 }
             }
@@ -4772,7 +4793,7 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> crate::err::Res<val::V
                     val::Val::Cpu(x.index_select(*dim, indexes.as_cpu()?))
                 }
                 val::Val::Metal(x) => {
-                    let ids = index_ids_u32(&indexes)?;
+                    let ids = metal_ids_u32(&indexes)?;
                     val::Val::Metal(metal_ops::index_select(x, *dim, &ids)?)
                 }
             }
@@ -5676,7 +5697,11 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> crate::err::Res<val::V
                         r = metal_ops::contiguous(&r)?;
                         if stride > 1 {
                             let idx: Vec<u32> = (0..len as u32).map(|i| i * stride as u32).collect();
-                            r = metal_ops::index_select(&r, dim, &idx)?;
+                            let ids = runtime::metal::indexing::ids_from_host(
+                                runtime::metal::device::MetalDevice::get(),
+                                &idx,
+                            );
+                            r = metal_ops::index_select(&r, dim, &ids)?;
                         }
                     }
                     val::Val::Metal(r)
@@ -9517,12 +9542,16 @@ fn kv_attention_slot(
         // Native Metal fallback: gather the context rows through the
         // block table, dequantize when int8, attend via the composed
         // native sdpa.
+        let ctx_rows_t = runtime::metal::indexing::ids_from_host(
+            runtime::metal::device::MetalDevice::get(),
+            &ctx_rows,
+        );
         let gather_rows = |slab: &PoolSlab, scale: Option<&PoolSlab>| -> crate::err::Res<runtime::metal::run::MetalTensor> {
             let gathered = runtime::metal::indexing::index_select(
                 runtime::metal::device::MetalDevice::get(),
                 slab.metal()?,
                 0,
-                &ctx_rows,
+                &ctx_rows_t,
             )?;
             let real = match scale {
                 Some(scale) => {
@@ -9533,7 +9562,7 @@ fn kv_attention_slot(
                         runtime::metal::device::MetalDevice::get(),
                         scale.metal()?,
                         0,
-                        &ctx_rows,
+                        &ctx_rows_t,
                     )?;
                     let scales = runtime::metal::run::MetalTensor {
                         buffer: scales.buffer.clone(),

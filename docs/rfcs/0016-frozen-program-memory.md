@@ -195,12 +195,23 @@ its launch instead.
 
 ## Phase 4 — One-launch optimizer
 
-AdamW is pointwise given `(p, g, m, v, t)`. If params, grads, and both
-moment buffers are each flat arenas, the entire optimizer step is one
-elementwise kernel over the flat space — no per-tensor dispatch table,
-no grid sync. The grad gather is free *because of Phase 1*: the arena
-assignment can place grad slots directly into the grad arena. Side
-benefit: checkpoints become three contiguous blobs.
+**DEFERRED (measured, not worth it now).** Per-kind encode profiling
+(`EFFECT_TORCH_KIND_TIMING`) at batch 32: AdamW self-time is
+~1.5 ms/step (12.1 ms over 8 steps × 308 evals). Even a perfect
+one-launch optimizer saves <0.5% of step time at our scale — the
+flat-arena param/moment storage redesign does not pay for itself.
+Revisit at 124M+ if optimizer share grows.
+
+What the same profile actually exposed — **fixed instead**: every
+`Gather`/`ScatterAdd` read its index tensor back to the host
+(`to_u32_vec`), synchronizing the command queue mid-step: the wte
+embedding-grad scatter alone cost ~530 ms/step of host-blocked time at
+batch 32 (the GPU drained, then idled through the host wakeup, id
+conversion, re-upload, and the remaining encode). Indices now stay on
+the device end to end (`metal_ids_u32`: contiguous + cast to u32 on
+Metal; host indices upload once via `ids_from_host`). Batch 32:
+0.84 → 0.70 s/step (-16%). Batch 128: 2.85 ≈ 2.86 s/step — neutral,
+the queue there is deep enough that the sync hid behind GPU work.
 
 **Gate.** Step time; checkpoint round-trip unchanged.
 
