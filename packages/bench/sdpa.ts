@@ -1,0 +1,24 @@
+import { Device, Tensor } from "@effect-torch/core"
+import { Console, Effect } from "effect"
+import { performance } from "node:perf_hooks"
+
+const ITERS = Number(process.env.ITERS ?? 20)
+
+const program = Effect.gen(function*() {
+  const shape = [8, 12, 1024, 64] as const
+  const q = yield* Tensor.cast(yield* Tensor.randn(shape), "bf16")
+  const k = yield* Tensor.cast(yield* Tensor.randn(shape), "bf16")
+  const v = yield* Tensor.cast(yield* Tensor.randn(shape), "bf16")
+  const once = Effect.flatMap(
+    Tensor.scaledDotProductAttention(q, k, v, { causal: true }),
+    Tensor.toTypedArray
+  )
+  yield* once
+  const start = performance.now()
+  for (let i = 0; i < ITERS; i++) {
+    yield* once
+  }
+  yield* Console.log(`sdpa fwd [8,12,1024,64] bf16 causal: ${((performance.now() - start) / ITERS).toFixed(3)} ms/op`)
+})
+
+Effect.runPromise(Effect.provide(program, Device.Metal))

@@ -198,6 +198,22 @@ fn gemm_mma_source(bias: bool, epilogue: Epilogue, ty: &str, cfg: MmaConfig) -> 
     let dj = qw / 8;
     let load_n = t * 8;
     let store_n = t * t;
+    // bf16/f16 stage and multiply natively (matrix units take the
+    // reduced-precision inputs with an f32 accumulator); f32 stages as
+    // f32. Native staging halves threadgroup traffic and skips the
+    // conversion.
+    let (stage_ty, sg_ty, zero) = match ty {
+        "bfloat" => ("bfloat", "bfloat", "bfloat(0.0f)"),
+        "half" => ("half", "half", "half(0.0h)"),
+        _ => ("float", "float", "0.0f"),
+    };
+    let a_expr = "A[a_batch + (ulong)(m0 + r) * K + k0 + c]";
+    let b_expr = "B[b_batch + (ulong)(k0 + r) * N + n0 + c]";
+    let (a_load, b_load) = if sg_ty == "float" {
+        (format!("float({a_expr})"), format!("float({b_expr})"))
+    } else {
+        (a_expr.to_string(), b_expr.to_string())
+    };
     format!(
         r#"
 #include <metal_stdlib>
@@ -222,8 +238,8 @@ kernel void et_gemm_mma(
     const ulong a_batch = (ulong)batch * strideA;
     const ulong b_batch = (ulong)batch * strideB;
     const ulong d_batch = (ulong)batch * M * N;
-    threadgroup float As[{T}][8];
-    threadgroup float Bs[8][{T}];
+    threadgroup {STAGE_TY} As[{T}][8];
+    threadgroup {STAGE_TY} Bs[8][{T}];
     const uint sg = tid / 32u;
     const uint qm = (sg % {SG_PER_COL}u) * 16u;
     const uint qn = (sg / {SG_PER_COL}u) * {QW}u;
@@ -234,18 +250,18 @@ kernel void et_gemm_mma(
     for (uint k0 = 0; k0 < K; k0 += 8u) {{
         for (uint e = tid; e < {LOAD_N}u; e += {THREADS}u) {{
             const uint r = e / 8u, c = e % 8u;
-            As[r][c] = (m0 + r < M && k0 + c < K) ? float(A[a_batch + (ulong)(m0 + r) * K + k0 + c]) : 0.0f;
+            As[r][c] = (m0 + r < M && k0 + c < K) ? {A_LOAD} : {ZERO};
         }}
         for (uint e = tid; e < {LOAD_N}u; e += {THREADS}u) {{
             const uint r = e / {T}u, c = e % {T}u;
-            Bs[r][c] = (k0 + r < K && n0 + c < N) ? float(B[b_batch + (ulong)(k0 + r) * N + n0 + c]) : 0.0f;
+            Bs[r][c] = (k0 + r < K && n0 + c < N) ? {B_LOAD} : {ZERO};
         }}
         threadgroup_barrier(mem_flags::mem_threadgroup);
         for (uint di = 0; di < 2u; di++) {{
-            simdgroup_float8x8 af;
+            simdgroup_{SG_TY}8x8 af;
             simdgroup_load(af, &As[qm + 8u * di][0], 8);
             for (uint dj = 0; dj < {DJ}u; dj++) {{
-                simdgroup_float8x8 bf;
+                simdgroup_{SG_TY}8x8 bf;
                 simdgroup_load(bf, &Bs[0][qn + 8u * dj], {T});
                 simdgroup_multiply_accumulate(acc[di][dj], af, bf, acc[di][dj]);
             }}
@@ -283,6 +299,11 @@ kernel void et_gemm_mma(
         DJ = dj,
         LOAD_N = load_n,
         STORE_N = store_n,
+        STAGE_TY = stage_ty,
+        SG_TY = sg_ty,
+        ZERO = zero,
+        A_LOAD = a_load,
+        B_LOAD = b_load,
     )
 }
 
