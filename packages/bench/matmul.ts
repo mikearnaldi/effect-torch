@@ -45,7 +45,9 @@ const suite: Effect.Effect<void, Tensor.TensorError, Device.CurrentDevice> = Eff
 
 const program = Effect.gen(function*() {
   yield* Console.log(`matmul f32 ${N}x${N} @ ${N}x${N}, ${ITERS} iterations, ${BATCH} chained per iter`)
-  yield* Effect.provide(suite, Device.Cpu)
+  if (!process.env.METAL_ONLY) {
+    yield* Effect.provide(suite, Device.Cpu)
+  }
   if (yield* Device.isAvailable("metal")) {
     yield* Effect.provide(suite, Device.Metal)
   }
