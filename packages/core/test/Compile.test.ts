@@ -1,6 +1,6 @@
 import { describe, expect } from "@effect/vitest"
 import { Effect } from "effect"
-import { Gradient, LearningRate, Loss, Model, Optimizer, Tensor, Trainer } from "../src/index.ts"
+import { Device, Gradient, LearningRate, Loss, Model, Optimizer, Tensor, Trainer } from "../src/index.ts"
 import { floats, onDevices } from "./utils/devices.ts"
 
 const values = (t: Tensor.Any) => Tensor.toNumberArray(t)
@@ -43,16 +43,16 @@ onDevices("Compile", () => (it) => {
 
     it.effect("threads runtime scalars through the graph", () =>
       Effect.gen(function*() {
-        const fn = yield* Tensor.compile(
-          ([a], [scale]) => Effect.map(Tensor.mul(a, scale), (out) => [out]),
-          { scalars: 1 }
-        )
+        // Runtime scalars are an internal mechanism (the Trainer's
+        // learning rate): a scalar slot declared with makeScalarInput,
+        // numbers bound at runProgram time.
         const x = yield* Tensor.fromTypedArray(floats([1, 2, 3]), [3])
-        expect(yield* values((yield* fn.call([x], [2]))[0])).toEqual([2, 4, 6])
-        expect(yield* values((yield* fn.call([x], [-1]))[0])).toEqual([-1, -2, -3])
-        expect(yield* fn.stats).toEqual({ cached: 1, compiled: 1 })
-        const error = yield* Effect.flip(fn.call([x]))
-        expect(error._tag).toBe("TensorError")
+        const device = yield* Device.CurrentDevice
+        const a = yield* Tensor.makeInput(0, x)
+        const scale = yield* Tensor.makeScalarInput(1, "f32", device)
+        const program = yield* Tensor.freezeProgram([yield* Tensor.mul(a, scale)])
+        expect(yield* values((yield* Tensor.runProgram(program, [x], [2]))[0])).toEqual([2, 4, 6])
+        expect(yield* values((yield* Tensor.runProgram(program, [x], [-1]))[0])).toEqual([-1, -2, -3])
       }))
 
     it.effect("traces once under concurrent first calls (single-flight)", () =>

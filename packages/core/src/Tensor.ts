@@ -3470,13 +3470,6 @@ export interface CompileStats {
  */
 export interface CompileOptions {
   /**
-   * Number of runtime scalar slots (a learning rate, a flag) declared
-   * after the tensor inputs. Scalars arrive as plain numbers at call
-   * time and appear inside the graph as 0-d f32 placeholder tensors.
-   * Defaults to 0.
-   */
-  readonly scalars?: number
-  /**
    * Shape-cache capacity in programs. The first call with a new input
    * signature (shapes, dtypes, device) traces and freezes a program;
    * later calls with the same signature reuse it. Defaults to 32.
@@ -3486,19 +3479,18 @@ export interface CompileOptions {
 
 /**
  * A traced graph builder frozen into a native program, called with
- * materialized inputs and runtime scalars. The first call per input
- * signature pays the trace; subsequent calls are a single async native
- * evaluation each — no graph construction, no differentiation, no fusion
- * rewrite. Concurrent calls are safe: the frozen graph is immutable and
- * every call runs its own evaluator.
+ * materialized inputs. The first call per input signature pays the
+ * trace; subsequent calls are a single async native evaluation each —
+ * no graph construction, no differentiation, no fusion rewrite.
+ * Concurrent calls are safe: the frozen graph is immutable and every
+ * call runs its own evaluator.
  *
  * @since 0.1.0
  * @category compilation
  */
 export interface CompiledFn<E = never, R = never> {
   readonly call: (
-    inputs: ReadonlyArray<Any>,
-    scalars?: ReadonlyArray<number>
+    inputs: ReadonlyArray<Any>
   ) => Effect.Effect<Array<Concrete>, TensorError | E, R>
   readonly stats: Effect.Effect<CompileStats>
   readonly clear: Effect.Effect<void>
@@ -4015,30 +4007,30 @@ export const rotaryEmbedding = (
  * builder runs once per input signature against placeholder leaves, and
  * the traced graph — including any differentiation or optimizer update
  * the builder performed — is frozen into a native program; calling the
- * result binds materialized inputs and runtime scalars to the declared
- * slots and evaluates the frozen graph in one walk, with exactly the
- * observable behaviour of evaluating the builder's graph directly
- * (shared subgraphs dedup, `randn`/`dropout` draw fresh per call).
+ * result binds materialized inputs to the declared slots and evaluates
+ * the frozen graph in one walk, with exactly the observable behaviour
+ * of evaluating the builder's graph directly (shared subgraphs dedup,
+ * `randn`/`dropout` draw fresh per call).
  *
  * Recompilation is automatic and shape-keyed: a call whose inputs differ
  * in shape, dtype, or device from every cached signature traces a new
  * program, up to `cacheCapacity` programs (least-recently-used eviction).
  * Materializing a tensor inside `build` fails at trace time — a compiled
- * builder is a pure graph builder over its placeholders.
+ * builder is a pure graph builder over its placeholders. Runtime-varying
+ * scalars (a learning rate) are an internal mechanism — the Trainer
+ * declares slots with {@link makeScalarInput} and passes numbers to
+ * {@link runProgram}.
  *
  * @since 0.1.0
  * @category compilation
  */
 export const compile = <E = never, R = never>(
   build: (
-    inputs: ReadonlyArray<Lazy>,
-    scalars: ReadonlyArray<Lazy>
+    inputs: ReadonlyArray<Lazy>
   ) => Effect.Effect<ReadonlyArray<Any>, E, R>,
   options: CompileOptions = {}
 ): Effect.Effect<CompiledFn<E, R>, never, CurrentDevice> =>
   Effect.gen(function*() {
-    const device = yield* CurrentDevice
-    const scalarCount = options.scalars ?? 0
     const cache = makeProgramCache(options.cacheCapacity)
     const trace = (
       inputs: ReadonlyArray<Any>
@@ -4048,24 +4040,14 @@ export const compile = <E = never, R = never>(
         for (let i = 0; i < inputs.length; i++) {
           placeholders.push(yield* makeInput(i, inputs[i]))
         }
-        const scalarPlaceholders: Array<Lazy> = []
-        for (let j = 0; j < scalarCount; j++) {
-          scalarPlaceholders.push(yield* makeScalarInput(inputs.length + j, "f32", device))
-        }
-        const roots = yield* build(placeholders, scalarPlaceholders)
+        const roots = yield* build(placeholders)
         return yield* freezeProgram(roots)
       })
     const self: CompiledFn<E, R> = {
-      call: (inputs, scalars = []) =>
+      call: (inputs) =>
         Effect.gen(function*() {
-          if (scalars.length !== scalarCount) {
-            return yield* new TensorError({
-              op: "call",
-              message: `expected ${scalarCount} scalars, got ${scalars.length}`
-            })
-          }
           const program = yield* cachedProgram(cache, signatureOf(inputs), trace(inputs))
-          return yield* runProgram(program, inputs, scalars)
+          return yield* runProgram(program, inputs)
         }),
       get stats() {
         return cache.stats
