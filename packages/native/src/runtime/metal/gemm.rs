@@ -331,16 +331,26 @@ pub fn gemm_fused(
         _ => unreachable!(),
     };
     let has_bias = bias.is_some();
-    // MMA pays when tiles are mostly full and K is long enough to
-    // amortize the cooperative loads; the geometry adapts to the
-    // device's threadgroup memory (mma_config). Small gemms
-    // (nano-gpt scale) run the naive kernel.
-    let cfg = mma_config(dev);
-    let use_mma = std::env::var_os("EFFECT_TORCH_NO_MMA").is_none()
-        && m >= cfg.tile
-        && n >= cfg.tile
-        && k >= 32;
-    let pipeline = if use_mma {
+    // MMA pays when the grid fills the GPU AND K is long enough to
+    // amortize the cooperative loads — measured on M4 Max: below ~64
+    // threadgroups the naive kernel wins (N=128/256 starve at 4–16
+    // groups), above it MMA pulls ahead (N=512 at 64 groups, 1.3x;
+    // N=4096, 3x). Two bands: the device's preferred geometry
+    // (mma_config) for full-size gemms, 32x32 for medium ones; truly
+    // small gemms run the naive kernel.
+    const MIN_GROUPS: usize = 64;
+    let big = mma_config(dev);
+    let groups = |tile: usize| (m.div_ceil(tile)) * (n.div_ceil(tile)) * batch;
+    let medium = MmaConfig { tile: 32, threads: 128 };
+    let cfg = if m >= big.tile && n >= big.tile && k >= 32 && groups(big.tile) >= MIN_GROUPS {
+        Some(big)
+    } else if big.tile > 32 && m >= 32 && n >= 32 && k >= 16 && groups(32) >= MIN_GROUPS {
+        Some(medium)
+    } else {
+        None
+    };
+    let use_mma = std::env::var_os("EFFECT_TORCH_NO_MMA").is_none() && cfg.is_some();
+    let pipeline = if let Some(cfg) = cfg.filter(|_| use_mma) {
         dev.compile_lazy(mma_key_for(has_bias, epilogue, a.dtype, cfg), "et_gemm_mma", || {
             gemm_mma_source(has_bias, epilogue, ty, cfg)
         })?
@@ -384,7 +394,7 @@ pub fn gemm_fused(
         if let Some(out2) = &out2 {
             set_buffer(e, 10, &out2.buffer, 0);
         }
-        if use_mma {
+        if let Some(cfg) = cfg.filter(|_| use_mma) {
             e.dispatchThreadgroups_threadsPerThreadgroup(
                 MetalDevice::grid(n.div_ceil(cfg.tile), m.div_ceil(cfg.tile), batch),
                 MetalDevice::grid(cfg.threads, 1, 1),
