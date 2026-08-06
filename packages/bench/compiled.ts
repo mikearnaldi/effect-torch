@@ -7,8 +7,7 @@ const ITERS = Number(process.env.ITERS ?? 10)
 const program = Effect.gen(function*() {
   const mk = (shape: readonly number[]) => Effect.flatMap(Tensor.randn(shape), (t) => Tensor.cast(t, "bf16"))
   const [a, b] = yield* Effect.zip(mk([131072, 768]), mk([768, 2304]))
-  const f = yield* Tensor.compile(([a, b]: [Tensor.Any, Tensor.Any]) =>
-    Effect.map(Tensor.matmul(a, b), (r) => [r]))
+  const f = yield* Tensor.compile(([a, b]) => Effect.map(Tensor.matmul(a, b), (r) => [r]))
   const once = Effect.flatMap(f.call([a, b]), (outs) => Effect.forEach(outs, Tensor.clear, { discard: true }))
   yield* once
   const start = performance.now()

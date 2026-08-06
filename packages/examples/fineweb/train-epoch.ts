@@ -77,10 +77,11 @@ const program = Effect.gen(function*() {
     precision: PRECISION,
     onStep: ({ step, loss, elapsed }) => {
       // ETA from the mean step time, excluding the first step (its
-      // capture/compile overhead would skew the average) and anchored
-      // at the first step seen, so resumed runs estimate correctly.
+      // capture/compile overhead would skew the average). The trainer
+      // runs in 100-step chunks between checkpoints and `elapsed`
+      // resets each chunk — re-anchor whenever it goes backwards.
       const ms = Duration.toMillis(elapsed)
-      if (firstStep === undefined) firstStep = { step, ms }
+      if (firstStep === undefined || ms < firstStep.ms) firstStep = { step, ms }
       const done = step - firstStep.step
       const remaining = totalSteps - step
       const eta = done > 0 && remaining > 0
