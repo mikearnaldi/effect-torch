@@ -213,6 +213,32 @@ Metal; host indices upload once via `ids_from_host`). Batch 32:
 0.84 → 0.70 s/step (-16%). Batch 128: 2.85 ≈ 2.86 s/step — neutral,
 the queue there is deep enough that the sync hid behind GPU work.
 
+Removing that sync exposed **two latent executor bugs**, both fixed:
+
+- *Retired-buffer accumulation.* Retired uploads and swept dead pool
+  buckets were dropped only at `synchronize()`; with no mid-step sync
+  the driver footprint grew unbounded inside a step (52 GB
+  driver-allocated vs 19 GB rust-live) and batch 256 died with
+  `kIOGPUCommandBufferCallbackErrorOutOfMemory`. Retired blocks now
+  ride the command buffer being committed when they were retired and
+  drop as buffers complete (`reap_completed`), and a memory
+  backpressure (`memory_budget` = min(env cap, ½ × recommended working
+  set), checked against the driver's `currentAllocatedSize`) waits on
+  the oldest in-flight buffer before fresh allocations — the host may
+  no longer outrun the GPU by more than the budget. Command buffers
+  also commit early once they reference 4 GiB of distinct pool memory
+  (`cb_track` in `set_buffer`), since an uncommitted buffer pins
+  everything it references.
+- *Cross-command-buffer execution overlap.* Metal may execute
+  consecutive command buffers concurrently; the pool recycles buffers
+  across them, and with dense byte-budgeted commits that overlap
+  became a real corruption source (NaN losses at batch 128+). Command
+  buffers are now serialized GPU-side with a shared event (wait at
+  start, signal at end) — no host stall.
+
+Verified: batch 256 bare (no cap) trains + validates end to end at
+5.8 s/step with correct loss curves; batch 32 stays at 0.70 s/step.
+
 **Gate.** Step time; checkpoint round-trip unchanged.
 
 ## Phase 5 — CUDA stance (recorded, not scheduled)

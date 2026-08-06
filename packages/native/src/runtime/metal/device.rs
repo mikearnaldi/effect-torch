@@ -52,6 +52,38 @@ fn live_bytes_untrack(size: usize) {
     LIVE_BYTES.fetch_sub(size, std::sync::atomic::Ordering::Relaxed);
 }
 
+// Host-GPU divergence guard. The walk encodes far faster than the GPU
+// executes; without a bound, buffers pile up in dead pool buckets and
+// in-flight command buffers faster than the driver can reclaim them,
+// and a command buffer fails with kIOGPUCommandBufferCallbackError-
+// OutOfMemory (this is what the pre-RFC-0016 mid-step index readback
+// accidentally prevented by syncing every step). When live bytes pass
+// the budget — the env cap if set, else 3/4 of the device's
+// recommended working set — dead buckets are moved to the retired list
+// and the host waits on the oldest in-flight command buffer until
+// pressure subsides. Steps that fit never wait.
+fn memory_budget() -> usize {
+    static BUDGET: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *BUDGET.get_or_init(|| {
+        let recommended = MetalDevice::get().raw.recommendedMaxWorkingSetSize() as usize;
+        let budget = match std::env::var("EFFECT_TORCH_MEMORY_BUDGET_MB") {
+            Ok(v) => v.parse::<usize>().expect("EFFECT_TORCH_MEMORY_BUDGET_MB: not a number") * 1024 * 1024,
+            Err(_) => match memory_cap() {
+                Some(cap) => cap.min(recommended / 2),
+                None => recommended / 2,
+            },
+        };
+        if std::env::var_os("EFFECT_TORCH_SYNC_TRACE").is_some() {
+            eprintln!(
+                "[sync] memory budget {} MB (recommended working set {} MB)",
+                budget >> 20,
+                recommended >> 20
+            );
+        }
+        budget
+    })
+}
+
 pub fn dispatch_stats_reset() -> (u64, u64, u64) {
     let d = DISPATCHES.swap(0, std::sync::atomic::Ordering::Relaxed);
     let s = SYNCS.swap(0, std::sync::atomic::Ordering::Relaxed);
@@ -168,23 +200,92 @@ struct EncoderManager {
         Retained<ProtocolObject<dyn MTLComputeCommandEncoder>>,
     )>,
     count: usize,
-    in_flight: Vec<Retained<ProtocolObject<dyn MTLCommandBuffer>>>,
+    // Command-buffer serialization. The allocator recycles buffers
+    // across command buffers and Metal may overlap their execution —
+    // commit order is not execution order — so each buffer waits on
+    // the event its predecessor signals. GPU-side ordering only; the
+    // host never blocks on this. (Dense byte-budgeted commits made the
+    // overlap a real corruption source at batch 128+: NaN losses.)
+    order_event: Retained<ProtocolObject<dyn objc2_metal::MTLEvent>>,
+    order_value: u64,
+    // Submitted command buffers, each holding the buffers retired
+    // before its commit. The queue is serial, so once a command buffer
+    // completes every command buffer that could still reference those
+    // retired blocks has finished: reaping completed entries drops them
+    // back to the driver mid-step instead of accumulating until
+    // synchronize (a mid-step readback used to force that drain;
+    // without it, big capture runs exhausted the driver —
+    // kIOGPUCommandBufferCallbackErrorOutOfMemory at batch 256).
+    in_flight: Vec<(
+        Retained<ProtocolObject<dyn MTLCommandBuffer>>,
+        Vec<Arc<Buffer>>,
+    )>,
 }
 
 impl EncoderManager {
-    fn new(queue: Retained<ProtocolObject<dyn MTLCommandQueue>>) -> Self {
-        EncoderManager { queue, current: None, count: 0, in_flight: Vec::new() }
+    fn new(queue: Retained<ProtocolObject<dyn MTLCommandQueue>>, device: &ProtocolObject<dyn MTLDevice>) -> Self {
+        let event = device.newSharedEvent().expect("metal shared event");
+        // The wait/signal API takes the MTLEvent super-protocol; same
+        // object, rewrapped at the type level.
+        let order_event: Retained<ProtocolObject<dyn objc2_metal::MTLEvent>> =
+            unsafe { Retained::cast_unchecked(event) };
+        EncoderManager {
+            queue,
+            current: None,
+            count: 0,
+            order_event,
+            order_value: 0,
+            in_flight: Vec::new(),
+        }
+    }
+
+    fn reap_completed(&mut self) {
+        while let Some((cb, _)) = self.in_flight.first() {
+            let done = matches!(
+                cb.status(),
+                objc2_metal::MTLCommandBufferStatus::Completed | objc2_metal::MTLCommandBufferStatus::Error
+            );
+            if done {
+                self.in_flight.remove(0);
+            } else {
+                break;
+            }
+        }
+    }
+
+    // Waits for the oldest submitted command buffer and reaps it,
+    // dropping the retired blocks it carried. Returns false when no
+    // command buffer is in flight (nothing more to reclaim).
+    fn wait_oldest(&mut self) -> bool {
+        if self.in_flight.is_empty() {
+            return false;
+        }
+        if std::env::var_os("EFFECT_TORCH_SYNC_TRACE").is_some() {
+            eprintln!(
+                "[sync] backpressure: waiting on oldest command buffer ({} in flight)",
+                self.in_flight.len()
+            );
+        }
+        self.in_flight[0].0.waitUntilCompleted();
+        self.reap_completed();
+        true
     }
 
     fn ensure_encoder(&mut self) {
+        self.reap_completed();
         if self.current.is_none() {
             let cb = self.queue.commandBuffer().expect("metal command buffer");
+            if self.order_value > 0 {
+                // Wait for the predecessor's signal before executing any
+                // dispatch in this buffer.
+                cb.encodeWaitForEvent_value(&self.order_event, self.order_value);
+            }
             let encoder = cb.computeCommandEncoder().expect("metal compute encoder");
             self.current = Some((cb, encoder));
         }
     }
 
-    fn finish_dispatch(&mut self) {
+    fn finish_dispatch(&mut self, retired: &mut Vec<Arc<Buffer>>) {
         // Untracked hazards: without a barrier, Metal may overlap adjacent
         // compute dispatches in the same command buffer. Our allocator
         // recycles buffers across dispatches, so every dispatch must be
@@ -194,23 +295,26 @@ impl EncoderManager {
         }
         self.count += 1;
         DISPATCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        if self.count >= DISPATCHES_PER_BUFFER {
-            self.commit();
+        if self.count >= DISPATCHES_PER_BUFFER || cb_referenced_bytes() >= CB_REF_BYTES {
+            self.commit(retired);
         }
     }
 
-    fn commit(&mut self) {
+    fn commit(&mut self, retired: &mut Vec<Arc<Buffer>>) {
         if let Some((cb, encoder)) = self.current.take() {
             encoder.endEncoding();
+            self.order_value += 1;
+            cb.encodeSignalEvent_value(&self.order_event, self.order_value);
             cb.commit();
-            self.in_flight.push(cb);
+            self.in_flight.push((cb, std::mem::take(retired)));
             self.count = 0;
+            cb_refs_reset();
         }
     }
 
-    fn synchronize(&mut self) -> crate::err::Res<()> {
-        self.commit();
-        if let Some(last) = self.in_flight.last() {
+    fn synchronize(&mut self, retired: &mut Vec<Arc<Buffer>>) -> crate::err::Res<()> {
+        self.commit(retired);
+        if let Some((last, _)) = self.in_flight.last() {
             last.waitUntilCompleted();
             let status = last.status();
             if status != objc2_metal::MTLCommandBufferStatus::Completed {
@@ -263,10 +367,11 @@ impl MetalDevice {
             .to_vec()
             .swap_remove(ordinal.min(devices.len() - 1));
         let queue = raw.newCommandQueue().ok_or("failed to create command queue")?;
+        let encoder = EncoderManager::new(queue, &raw);
         Ok(MetalDevice {
             raw,
             allocator: Mutex::new(Allocator::new()),
-            encoder: Mutex::new(EncoderManager::new(queue)),
+            encoder: Mutex::new(encoder),
             pipelines: Mutex::new(HashMap::new()),
             retired: Mutex::new(Vec::new()),
         })
@@ -274,6 +379,49 @@ impl MetalDevice {
 
     pub fn raw(&self) -> &ProtocolObject<dyn MTLDevice> {
         &self.raw
+    }
+
+    // See memory_budget: stalls the encoder only when the driver's own
+    // allocation counter passes the budget, by waiting on the oldest
+    // in-flight command buffer so the driver reclaims what it has
+    // finished with. currentAllocatedSize sees everything the driver
+    // holds (including what LIVE_BYTES does not). Lock order is
+    // encoder -> allocator -> retired, matching synchronize.
+    fn backpressure(&self) {
+        if self.raw.currentAllocatedSize() <= memory_budget() {
+            return;
+        }
+        let mut manager = self.encoder.lock().unwrap();
+        {
+            let mut alloc = self.allocator.lock().unwrap();
+            let mut retired = self.retired.lock().unwrap();
+            for (bucket_size, bucket) in alloc.buckets.iter_mut() {
+                if *bucket_size < (1 << 20) {
+                    continue;
+                }
+                bucket.retain(|b| {
+                    if Arc::strong_count(b) == 1 {
+                        retired.push(b.clone());
+                        false
+                    } else {
+                        true
+                    }
+                });
+            }
+        }
+        manager.reap_completed();
+        if std::env::var_os("EFFECT_TORCH_SYNC_TRACE").is_some() {
+            eprintln!(
+                "[sync] backpressure at {} MB driver-allocated (budget {} MB)",
+                self.raw.currentAllocatedSize() >> 20,
+                memory_budget() >> 20
+            );
+        }
+        while self.raw.currentAllocatedSize() > memory_budget() {
+            if !manager.wait_oldest() {
+                break;
+            }
+        }
     }
 
     pub fn alloc(&self, elements: usize, dtype: DType) -> Arc<Buffer> {
@@ -284,6 +432,7 @@ impl MetalDevice {
         if let Some(buf) = arena::replay_alloc(size) {
             return buf;
         }
+        self.backpressure();
         let bucket_size = if size >= (64 << 20) {
             // Large blocks: power-of-two bucketing pins up to 2x the
             // request per live block (a 1.1 GB activation would hold a
@@ -333,6 +482,7 @@ impl MetalDevice {
     /// A raw buffer outside the pool and the arena capture/replay —
     /// the arena itself is allocated this way.
     pub fn alloc_raw(&self, size: usize) -> Arc<Buffer> {
+        self.backpressure();
         live_bytes_track(size.max(1));
         let raw = self
             .raw
@@ -425,7 +575,7 @@ impl MetalDevice {
         manager.ensure_encoder();
         let encoder = &manager.current.as_ref().unwrap().1;
         let out = f(encoder);
-        manager.finish_dispatch();
+        manager.finish_dispatch(&mut self.retired.lock().unwrap());
         out
     }
 
@@ -435,7 +585,14 @@ impl MetalDevice {
         if std::env::var_os("EFFECT_TORCH_SYNC_TRACE").is_some() {
             eprintln!("[sync] {}", std::panic::Location::caller());
         }
-        self.encoder.lock().unwrap().synchronize()?;
+        {
+            let mut manager = self.encoder.lock().unwrap();
+            let mut retired = self.retired.lock().unwrap();
+            manager.synchronize(&mut retired)?;
+            // Anything retired after the last commit rides no command
+            // buffer; the GPU is drained, so it drops here.
+            retired.clear();
+        }
         // The GPU has consumed everything submitted so far; retired
         // uploads may return to the pool. Dead buckets at or above 1 MB
         // are released too — the arena (RFC 0016) owns the step working
@@ -513,6 +670,47 @@ impl MetalDevice {
 
 pub fn set_buffer(encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>, index: usize, buffer: &Buffer, offset: usize) {
     unsafe { encoder.setBuffer_offset_atIndex(Some(buffer.as_raw()), buffer.base + offset, index) };
+    cb_track(buffer);
+}
+
+// Per-command-buffer referenced-bytes accounting (RFC 0016): a command
+// buffer retains every buffer its dispatches reference until it
+// completes, so one 4096-dispatch buffer can pin tens of GB that no
+// amount of waiting on OLDER buffers reclaims. finish_dispatch commits
+// early once the current buffer references CB_REF_BYTES of distinct
+// pool memory. Arena views (counted == false) share one root and are
+// skipped — the root is persistent and reclaiming it is never the
+// goal; uploads are small.
+thread_local! {
+    static CB_REFS: std::cell::RefCell<(std::collections::HashSet<u64>, usize)> =
+        std::cell::RefCell::new((std::collections::HashSet::new(), 0));
+}
+
+const CB_REF_BYTES: usize = 4 << 30;
+
+fn cb_track(buffer: &Buffer) {
+    if !buffer.counted {
+        return;
+    }
+    let addr = buffer.as_raw().gpuAddress();
+    CB_REFS.with(|c| {
+        let mut c = c.borrow_mut();
+        if c.0.insert(addr) {
+            c.1 += buffer.size;
+        }
+    });
+}
+
+fn cb_referenced_bytes() -> usize {
+    CB_REFS.with(|c| c.borrow().1)
+}
+
+fn cb_refs_reset() {
+    CB_REFS.with(|c| {
+        let mut c = c.borrow_mut();
+        c.0.clear();
+        c.1 = 0;
+    });
 }
 
 pub fn set_bytes<T>(encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>, index: usize, data: &T) {
