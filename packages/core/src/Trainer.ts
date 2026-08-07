@@ -29,7 +29,7 @@
  *
  * @since 0.1.0
  */
-import { Duration, Effect } from "effect"
+import { Clock, Duration, Effect } from "effect"
 import { CurrentDevice, type DeviceKind } from "./Device.ts"
 import * as Gradient from "./Gradient.ts"
 import type { LearningRate } from "./LearningRate.ts"
@@ -424,7 +424,7 @@ const trainLoop = <S, EL = never, RL = never, ED = never, RD = never, EO = never
     let step = resume?.step ?? 0
     let loss = Number.NaN
     let trained: ReadonlyArray<Tensor.Concrete>
-    const started = resume?.startedAt ?? (yield* Effect.sync(() => Date.now()))
+    const started = resume?.startedAt ?? (yield* Clock.currentTimeMillis)
     // Tensors the loop itself produced (the materialized init roots and
     // each step's outputs) that a later step has consumed: their buffers
     // are dead once the consuming step returns, so release them
@@ -466,7 +466,7 @@ const trainLoop = <S, EL = never, RL = never, ED = never, RD = never, EO = never
       const info: TrainStep = {
         step,
         loss,
-        elapsed: Duration.millis(yield* Effect.sync(() => Date.now() - started))
+        elapsed: Duration.millis((yield* Clock.currentTimeMillis) - started)
       }
       if (config.onStep !== undefined) {
         yield* config.onStep(info)

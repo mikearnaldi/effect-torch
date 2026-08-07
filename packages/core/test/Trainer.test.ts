@@ -1,5 +1,6 @@
 import { describe, expect } from "@effect/vitest"
 import { Duration, Effect } from "effect"
+import { TestClock } from "effect/testing"
 import { LearningRate, Loss, Model, Optimizer, Tensor, Trainer } from "../src/index.ts"
 import { floats, onDevices } from "./utils/devices.ts"
 
@@ -111,13 +112,16 @@ onDevices("Trainer", (device) => (it) => {
           loss: Loss.mse,
           data: { input, target },
           stop: ({ step }) => step >= 3,
-          onStep: ({ elapsed }) => Effect.sync(() => runs.at(-1)!.push(Duration.toMillis(elapsed)))
+          onStep: ({ elapsed }) =>
+            Effect.sync(() => runs.at(-1)!.push(Duration.toMillis(elapsed))).pipe(
+              Effect.andThen(TestClock.adjust("100 millis"))
+            )
         })
         runs.push([])
         yield* trainer.train()
         runs.push([])
         yield* trainer.train()
-        expect(runs[1][0]).toBeLessThanOrEqual(runs[0][2])
+        expect(runs).toEqual([[0, 100, 200], [0, 100, 200]])
       }))
 
     it.effect("a data sampler is re-drawn with the step number every step", () =>
