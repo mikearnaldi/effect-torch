@@ -265,13 +265,6 @@ export const makeRuntime = (
   const concreteHandle = (value: NativeTensor): Runtime.ConcreteTensorHandle => {
     const graph = native.LazyTensor.fromMaterialized(value)
     const handle = tensorObject<Runtime.ConcreteTensorHandle>("Tensor", value.shape, value.dtype, value.device)
-    const [shape, tensorDtype] = graph.metadata()
-    if (
-      handle.shape.length !== shape.length || !handle.shape.every((dimension, index) => dimension === shape[index]) ||
-      handle.dtype !== dtype(tensorDtype)
-    ) {
-      throw new Error("native runtime created inconsistent concrete tensor graph metadata")
-    }
     handleRecords.set(handle, { owner, kind: "concrete-tensor", graph, value, disposed: false })
     backendHandles.add(handle)
     return handle

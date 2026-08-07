@@ -3819,7 +3819,14 @@ export const runProgram = (
 ): Effect.Effect<Array<Concrete>, TensorError, Runtime.Runtime> =>
   Effect.gen(function*() {
     const runtime = yield* Runtime.Runtime
-    const concrete = inputs.every(isTensor) ? inputs as ReadonlyArray<Concrete> : yield* compute(inputs)
+    let concrete: ReadonlyArray<Concrete>
+    if (inputs.every(isTensor)) {
+      concrete = inputs as ReadonlyArray<Concrete>
+    } else {
+      const materialized = yield* compute(inputs.filter((input) => !isTensor(input)))
+      let index = 0
+      concrete = inputs.map((input) => isTensor(input) ? input : materialized[index++]!)
+    }
     const values = yield* fromBackend(
       "run",
       runtime.run(program.handle, concrete, scalars)
