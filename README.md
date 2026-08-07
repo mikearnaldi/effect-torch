@@ -199,7 +199,7 @@ hidden CPU fallback, copy a foreign tensor, or execute a kernel.
 `Tensor.compute` evaluates related roots in one native graph walk:
 
 ```ts
-const [lossValue, gradientValue] = yield * Tensor.compute([
+const [lossValue, gradientValue] = yield* Tensor.compute([
   loss,
   gradient
 ])
@@ -242,8 +242,8 @@ Consequences:
 Concrete tensors can be released deterministically:
 
 ```ts
-const [value] = yield * Tensor.compute([graph])
-yield * Tensor.clear(value)
+const [value] = yield* Tensor.compute([graph])
+yield* Tensor.clear(value)
 ```
 
 Native finalizers remain a GC fallback. CPU external buffers are included in
@@ -533,8 +533,8 @@ Binary operations broadcast like NumPy and support data-first and data-last
 usage:
 
 ```ts
-const first = yield * Tensor.add(a, b)
-const second = yield * a.pipe(Tensor.add(b))
+const first = yield* Tensor.add(a, b)
+const second = yield* a.pipe(Tensor.add(b))
 ```
 
 Numbers are not implicit tensor operands. Use `constantLike` when a scalar must
@@ -651,16 +651,16 @@ scaled-dot-product-attention backward paths are currently first-order only.
 `Tensor.compile` creates a reusable function over tensor inputs:
 
 ```ts
-const compiled = yield * Tensor.compile(([x, weight]) =>
+const compiled = yield* Tensor.compile(([x, weight]) =>
   Effect.gen(function*() {
     const product = yield* Tensor.matmul(x, weight)
     return [yield* Tensor.relu(product)]
   }), { cacheCapacity: 8 })
 
-const [output] = yield * compiled.call([x, weight])
-const stats = yield * compiled.stats
+const [output] = yield* compiled.call([x, weight])
+const stats = yield* compiled.stats
 
-yield * compiled.clear
+yield* compiled.clear
 ```
 
 Compilation behavior:
@@ -775,9 +775,9 @@ The optimizer API includes SGD, Adam, and AdamW. Optimizers are pure graph
 transforms: parameters and state are tensors, and nothing is mutated in place.
 
 ```ts
-const optimizer = yield * Optimizer.adamW({ weightDecay: 0.01 })
-const state = yield * optimizer.init(params)
-const next = yield * optimizer.step(params, grads, state, lrTensor)
+const optimizer = yield* Optimizer.adamW({ weightDecay: 0.01 })
+const state = yield* optimizer.init(params)
+const next = yield* optimizer.step(params, grads, state, lrTensor)
 ```
 
 `Optimizer.step(optimizer, loss, params, state, lr)` is the full-step helper. It
@@ -806,8 +806,8 @@ the result to a runtime scalar for the compiled update graph.
 for each input signature. `Trainer.makeUncompiled` provides the reference loop.
 
 ```ts
-const trainer = yield * Trainer.make(model, {
-  optimizer: yield * Optimizer.adam(),
+const trainer = yield* Trainer.make(model, {
+  optimizer: yield* Optimizer.adam(),
   lr: LearningRate.constant(0.1),
   loss: Loss.mse,
   data: { input, target },
@@ -818,7 +818,7 @@ const trainer = yield * Trainer.make(model, {
       : Effect.void
 })
 
-const trained = yield * trainer.train()
+const trained = yield* trainer.train()
 ```
 
 Training data can be fixed or produced by an effectful per-step function.
@@ -849,14 +849,14 @@ Trainer checkpoints use safetensors and include model parameters, optimizer
 state roots, and the global step:
 
 ```ts
-yield * Checkpoint.save("training.safetensors", trainer, trained)
+yield* Checkpoint.save("training.safetensors", trainer, trained)
 
-const restored = yield * Checkpoint.load(
+const restored = yield* Checkpoint.load(
   "training.safetensors",
   trainer
 )
 
-const continued = yield * trainer.train(
+const continued = yield* trainer.train(
   restored.params,
   restored.resume
 )
@@ -874,7 +874,7 @@ permutation is exhausted is a new random event.
 decode programs backed by a paged KV cache:
 
 ```ts
-const inference = yield * Model.inference(model, params, {
+const inference = yield* Model.inference(model, params, {
   maxTokens: 8192,
   blockSize: 16,
   prefillChunk: 16,
@@ -883,18 +883,18 @@ const inference = yield * Model.inference(model, params, {
   decodeBatch: 8
 })
 
-const generation = yield * inference.generation()
-const entry = yield * generation.add(promptTensor)
+const generation = yield* inference.generation()
+const entry = yield* generation.add(promptTensor)
 
 let logits = entry.logits
 
 for (const token of generatedTokens) {
-  ;[logits] = yield * generation.step([
+  ;[logits] = yield* generation.step([
     { seq: entry.seq, token }
   ])
 }
 
-yield * entry.seq.finish()
+yield* entry.seq.finish()
 ```
 
 The inference transform:
@@ -930,7 +930,7 @@ Both tensor backends expose direct path-based safetensors I/O through a Runtime
 extension:
 
 ```ts
-yield * Tensor.save(
+yield* Tensor.save(
   "weights.safetensors",
   {
     "model.weight": weight,
@@ -941,7 +941,7 @@ yield * Tensor.save(
   }
 )
 
-const archive = yield * Tensor.loadArchive("weights.safetensors")
+const archive = yield* Tensor.loadArchive("weights.safetensors")
 const restoredWeight = archive.tensors["model.weight"]
 ```
 
@@ -958,8 +958,8 @@ Properties:
 Models provide named parameter persistence:
 
 ```ts
-yield * Model.save(model, params, "model.safetensors")
-const restoredParams = yield * Model.load(model, "model.safetensors")
+yield* Model.save(model, params, "model.safetensors")
+const restoredParams = yield* Model.load(model, "model.safetensors")
 ```
 
 Trainer checkpoints extend the same format with optimizer, step, and optional
