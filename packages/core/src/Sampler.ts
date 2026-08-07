@@ -53,31 +53,6 @@ export interface SamplerState {
 }
 
 /**
- * Sampler state written before checkpoints recorded {@link SamplerConfig}.
- * Kept only so existing checkpoints can be migrated with
- * {@link restoreCheckpoint}.
- *
- * @since 0.1.0
- * @category models
- */
-export interface LegacySamplerState {
-  readonly _tag: "LegacySamplerState"
-  readonly order: Uint32Array
-  readonly cursor: number
-  readonly epoch: number
-}
-
-/**
- * A sampler state loaded from a checkpoint: current states validate their
- * saved configuration directly; legacy states require the one-batch-per-step
- * migration in {@link restoreCheckpoint}.
- *
- * @since 0.1.0
- * @category models
- */
-export type CheckpointSamplerState = SamplerState | LegacySamplerState
-
-/**
  * @since 0.1.0
  * @category models
  */
@@ -245,54 +220,4 @@ export const restore = (
         fromOrder(stableConfig, stableState.order, stableState.cursor, stableState.epoch)
       )
   )
-}
-
-/**
- * Restores sampler state loaded from a trainer checkpoint. Current
- * checkpoints validate their persisted config exactly. For legacy
- * checkpoints, the epoch and cursor are reconstructed from the checkpoint
- * step under the checkpoint convention of one sampler draw per optimizer
- * step.
- *
- * @since 0.1.0
- * @category constructors
- */
-export const restoreCheckpoint = (
-  config: SamplerConfig,
-  state: CheckpointSamplerState,
-  step: number
-): Effect.Effect<Sampler, SamplerError> => {
-  if (state._tag === "SamplerState") return restore(config, state)
-  const stableConfig = { ...config }
-  const stableState: LegacySamplerState = {
-    _tag: "LegacySamplerState",
-    order: state.order.slice(),
-    cursor: state.cursor,
-    epoch: state.epoch
-  }
-  if (!Number.isSafeInteger(step) || step < 1) {
-    return new SamplerError({
-      op: "sampler.restoreCheckpoint",
-      message: `sampler.restoreCheckpoint: legacy checkpoint step must be a positive integer, got ${step}`
-    })
-  }
-  return Effect.flatMap(checkConfig("sampler.restoreCheckpoint", stableConfig), (windows) => {
-    const drawsPerEpoch = Math.floor(windows / stableConfig.batch)
-    const expectedEpoch = Math.floor((step - 1) / drawsPerEpoch) + 1
-    const expectedCursor = (((step - 1) % drawsPerEpoch) + 1) * stableConfig.batch
-    if (stableState.epoch !== expectedEpoch || stableState.cursor !== expectedCursor) {
-      return new SamplerError({
-        op: "sampler.restoreCheckpoint",
-        message:
-          `sampler.restoreCheckpoint: legacy state epoch=${stableState.epoch}, cursor=${stableState.cursor} does not match step ${step} under batch ${stableConfig.batch} (expected epoch=${expectedEpoch}, cursor=${expectedCursor})`
-      })
-    }
-    return restore(stableConfig, {
-      _tag: "SamplerState",
-      config: stableConfig,
-      order: stableState.order,
-      cursor: stableState.cursor,
-      epoch: stableState.epoch
-    })
-  })
 }

@@ -158,16 +158,14 @@ onDevices("Checkpoint", () => (it) => {
       yield* Checkpoint.saveWithSampler(file, trainer, trained, sampler)
       const expected = sampler.next()
       const checkpoint = yield* Checkpoint.loadWithSampler(file, trainer)
-      const restored = yield* Sampler.restoreCheckpoint(samplerConfig, checkpoint.sampler, checkpoint.resume.step)
+      const restored = yield* Sampler.restore(samplerConfig, checkpoint.sampler)
       expect(restored.next()).toEqual(expected)
       expect(checkpoint.resume.step).toBe(2)
       expect(checkpoint.sampler._tag).toBe("SamplerState")
-      if (checkpoint.sampler._tag === "SamplerState") {
-        expect(checkpoint.sampler.config).toEqual(samplerConfig)
-      }
+      expect(checkpoint.sampler.config).toEqual(samplerConfig)
     }))
 
-  it.effect("distinguishes legacy sampler metadata and rejects malformed v1 metadata", () =>
+  it.effect("rejects missing or malformed sampler metadata", () =>
     Effect.gen(function*() {
       const dir = yield* tmpdir
       const base = path.join(dir, "sampler-base.safetensors")
@@ -187,8 +185,6 @@ onDevices("Checkpoint", () => (it) => {
       const sampler = yield* Sampler.make(samplerConfig)
       sampler.next()
       yield* Checkpoint.saveWithSampler(base, trainer, trained, sampler)
-      const expected = sampler.next()
-
       const corrupt = (name: string, mutate: (entries: Record<string, Tensor.Any>) => void) =>
         Effect.gen(function*() {
           const entries: Record<string, Tensor.Any> = { ...yield* Tensor.load(base) }
@@ -204,25 +200,10 @@ onDevices("Checkpoint", () => (it) => {
           expect(error.message).toContain(text)
         })
 
-      const legacy = yield* corrupt("legacy.safetensors", (entries) => {
-        delete entries["sampler:version"]
-        delete entries["sampler:length"]
-        delete entries["sampler:block"]
-        delete entries["sampler:batch"]
-      })
-      const legacyCheckpoint = yield* Checkpoint.loadWithSampler(legacy, trainer)
-      expect(legacyCheckpoint.sampler._tag).toBe("LegacySamplerState")
-      const restoredLegacy = yield* Sampler.restoreCheckpoint(
-        samplerConfig,
-        legacyCheckpoint.sampler,
-        legacyCheckpoint.resume.step
-      )
-      expect(restoredLegacy.next()).toEqual(expected)
-
-      const partial = yield* corrupt("partial.safetensors", (entries) => {
+      const missingVersion = yield* corrupt("missing-version.safetensors", (entries) => {
         delete entries["sampler:version"]
       })
-      yield* expectCheckpointError(partial, "sampler:length without sampler:version")
+      yield* expectCheckpointError(missingVersion, "missing sampler:version")
 
       const floatVersion = yield* Tensor.full([], 1, { dtype: "f32" })
       const malformedVersion = yield* corrupt("version-dtype.safetensors", (entries) => {

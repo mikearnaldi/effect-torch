@@ -56,13 +56,13 @@ export interface Checkpoint<S> {
 
 /**
  * A {@link Checkpoint} with the data sampler's state, for
- * {@link Sampler.restoreCheckpoint}.
+ * {@link Sampler.restore}.
  *
  * @since 0.1.0
  * @category models
  */
 export interface CheckpointWithSampler<S> extends Checkpoint<S> {
-  readonly sampler: Sampler.CheckpointSamplerState
+  readonly sampler: Sampler.SamplerState
 }
 
 /**
@@ -139,24 +139,7 @@ export const loadWithSampler = <S, EL, RL, ED, RD, EO, RO>(
   Effect.gen(function*() {
     const tensors = yield* Tensor.load(path)
     const checkpoint = yield* trainerCheckpoint(path, trainer, tensors)
-    const versionTensor = tensors[SAMPLER_VERSION_KEY]
-    if (versionTensor === undefined) {
-      const v1Key = [SAMPLER_LENGTH_KEY, SAMPLER_BLOCK_KEY, SAMPLER_BATCH_KEY].find((key) => tensors[key] !== undefined)
-      if (v1Key !== undefined) {
-        return yield* new CheckpointError({
-          op: "checkpoint.load",
-          message: `checkpoint ${path} has ${v1Key} without ${SAMPLER_VERSION_KEY}`
-        })
-      }
-      const order = yield* readU32Vector(path, tensors, SAMPLER_ORDER_KEY)
-      const cursor = yield* readU32Scalar(path, tensors, SAMPLER_CURSOR_KEY)
-      const epoch = yield* readU32Scalar(path, tensors, SAMPLER_EPOCH_KEY)
-      return {
-        ...checkpoint,
-        sampler: { _tag: "LegacySamplerState", order, cursor, epoch }
-      }
-    }
-    const version = yield* decodeU32Scalar(path, SAMPLER_VERSION_KEY, versionTensor)
+    const version = yield* readU32Scalar(path, tensors, SAMPLER_VERSION_KEY)
     if (version !== SAMPLER_VERSION) {
       return yield* new CheckpointError({
         op: "checkpoint.load",

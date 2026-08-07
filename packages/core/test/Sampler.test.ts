@@ -15,7 +15,7 @@ it.effect("every window exactly once in a divisible epoch, reshuffled at the bou
     expect(second.every((start) => start % 8 === 0 && start < 32)).toBe(true)
   }))
 
-it.effect("skips a trailing partial batch consistently across legacy epoch migration", () =>
+it.effect("skips a trailing partial batch consistently across restore", () =>
   Effect.gen(function*() {
     const partialConfig = { length: 5 * 8 + 1, block: 8, batch: 2 }
     const sampler = yield* Sampler.make(partialConfig)
@@ -24,12 +24,7 @@ it.effect("skips a trailing partial batch consistently across legacy epoch migra
     const boundary = sampler.state()
     expect(boundary).toMatchObject({ cursor: 4, epoch: 1 })
 
-    const restored = yield* Sampler.restoreCheckpoint(partialConfig, {
-      _tag: "LegacySamplerState",
-      order: boundary.order,
-      cursor: boundary.cursor,
-      epoch: boundary.epoch
-    }, 2)
+    const restored = yield* Sampler.restore(partialConfig, boundary)
     expect(restored.state()).toMatchObject({ cursor: 4, epoch: 1 })
     expect(restored.next()).toHaveLength(2)
     expect(restored.state()).toMatchObject({ cursor: 2, epoch: 2 })
@@ -121,56 +116,4 @@ it.effect("sampler construction snapshots config and restore inputs", () =>
     const restored = yield* restore
     expect(restored.state().config).toEqual(config)
     expect(new Set(restored.state().order).size).toBe(restored.state().order.length)
-  }))
-
-it.effect("checkpoint restore rejects batch changes and migrates matching legacy state", () =>
-  Effect.gen(function*() {
-    const sampler = yield* Sampler.make(config)
-    sampler.next()
-    const state = sampler.state()
-    const changed = yield* Effect.flip(
-      Sampler.restoreCheckpoint({ ...config, batch: 1 }, state, 1)
-    )
-    expect(changed._tag).toBe("SamplerError")
-
-    const legacy: Sampler.LegacySamplerState = {
-      _tag: "LegacySamplerState",
-      order: state.order,
-      cursor: state.cursor,
-      epoch: state.epoch
-    }
-    const restored = yield* Sampler.restoreCheckpoint(config, legacy, 1)
-    expect(restored.state().config).toEqual(config)
-    const legacyChanged = yield* Effect.flip(
-      Sampler.restoreCheckpoint({ ...config, batch: 1 }, legacy, 1)
-    )
-    expect(legacyChanged._tag).toBe("SamplerError")
-  }))
-
-it.effect("migrates matching legacy state after the first epoch", () =>
-  Effect.gen(function*() {
-    const sampler = yield* Sampler.make(config)
-    sampler.next()
-    sampler.next()
-    const boundary = sampler.state()
-    expect(boundary).toMatchObject({ cursor: 4, epoch: 1 })
-    const boundaryRestore = yield* Sampler.restoreCheckpoint(config, {
-      _tag: "LegacySamplerState",
-      order: boundary.order,
-      cursor: boundary.cursor,
-      epoch: boundary.epoch
-    }, 2)
-    boundaryRestore.next()
-    expect(boundaryRestore.state()).toMatchObject({ cursor: 2, epoch: 2 })
-
-    sampler.next()
-    const state = sampler.state()
-    expect(state).toMatchObject({ cursor: 2, epoch: 2 })
-    const restored = yield* Sampler.restoreCheckpoint(config, {
-      _tag: "LegacySamplerState",
-      order: state.order,
-      cursor: state.cursor,
-      epoch: state.epoch
-    }, 3)
-    expect(restored.state()).toMatchObject({ cursor: 2, epoch: 2, config })
   }))
