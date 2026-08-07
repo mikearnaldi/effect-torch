@@ -158,9 +158,101 @@ onDevices("Checkpoint", () => (it) => {
       yield* Checkpoint.saveWithSampler(file, trainer, trained, sampler)
       const expected = sampler.next()
       const checkpoint = yield* Checkpoint.loadWithSampler(file, trainer)
-      const restored = yield* Sampler.restore(samplerConfig, checkpoint.sampler)
+      const restored = yield* Sampler.restoreCheckpoint(samplerConfig, checkpoint.sampler, checkpoint.resume.step)
       expect(restored.next()).toEqual(expected)
       expect(checkpoint.resume.step).toBe(2)
+      expect(checkpoint.sampler._tag).toBe("SamplerState")
+      if (checkpoint.sampler._tag === "SamplerState") {
+        expect(checkpoint.sampler.config).toEqual(samplerConfig)
+      }
+    }))
+
+  it.effect("distinguishes legacy sampler metadata and rejects malformed v1 metadata", () =>
+    Effect.gen(function*() {
+      const dir = yield* tmpdir
+      const base = path.join(dir, "sampler-base.safetensors")
+      const model = yield* Model.linear("fc", 2, 1)
+      const input = yield* Tensor.fromTypedArray(floats([0, 1]), [1, 2])
+      const target = yield* Tensor.fromTypedArray(floats([1]), [1, 1])
+      const optimizer = yield* Optimizer.sgd()
+      const trainer = yield* Trainer.make(model, {
+        optimizer,
+        lr: LearningRate.constant(0.1),
+        loss: Loss.mse,
+        data: { input, target },
+        stop: ({ step }) => step >= 1
+      })
+      const trained = yield* trainer.train()
+      const samplerConfig = { length: 4 * 8 + 1, block: 8, batch: 2 }
+      const sampler = yield* Sampler.make(samplerConfig)
+      sampler.next()
+      yield* Checkpoint.saveWithSampler(base, trainer, trained, sampler)
+      const expected = sampler.next()
+
+      const corrupt = (name: string, mutate: (entries: Record<string, Tensor.Any>) => void) =>
+        Effect.gen(function*() {
+          const entries: Record<string, Tensor.Any> = { ...yield* Tensor.load(base) }
+          mutate(entries)
+          const file = path.join(dir, name)
+          yield* Tensor.save(file, entries)
+          return file
+        })
+      const expectCheckpointError = (file: string, text: string) =>
+        Effect.gen(function*() {
+          const error = yield* Effect.flip(Checkpoint.loadWithSampler(file, trainer))
+          expect(error._tag).toBe("CheckpointError")
+          expect(error.message).toContain(text)
+        })
+
+      const legacy = yield* corrupt("legacy.safetensors", (entries) => {
+        delete entries["sampler:version"]
+        delete entries["sampler:length"]
+        delete entries["sampler:block"]
+        delete entries["sampler:batch"]
+      })
+      const legacyCheckpoint = yield* Checkpoint.loadWithSampler(legacy, trainer)
+      expect(legacyCheckpoint.sampler._tag).toBe("LegacySamplerState")
+      const restoredLegacy = yield* Sampler.restoreCheckpoint(
+        samplerConfig,
+        legacyCheckpoint.sampler,
+        legacyCheckpoint.resume.step
+      )
+      expect(restoredLegacy.next()).toEqual(expected)
+
+      const partial = yield* corrupt("partial.safetensors", (entries) => {
+        delete entries["sampler:version"]
+      })
+      yield* expectCheckpointError(partial, "sampler:length without sampler:version")
+
+      const floatVersion = yield* Tensor.full([], 1, { dtype: "f32" })
+      const malformedVersion = yield* corrupt("version-dtype.safetensors", (entries) => {
+        entries["sampler:version"] = floatVersion
+      })
+      yield* expectCheckpointError(malformedVersion, "expected a u32 scalar")
+
+      const futureVersion = yield* Tensor.full([], 2, { dtype: "u32" })
+      const unsupportedVersion = yield* corrupt("future-version.safetensors", (entries) => {
+        entries["sampler:version"] = futureVersion
+      })
+      yield* expectCheckpointError(unsupportedVersion, "unsupported sampler version 2")
+
+      const vectorLength = yield* Tensor.fromTypedArray(new Uint32Array([33]), [1])
+      const malformedLength = yield* corrupt("length-rank.safetensors", (entries) => {
+        entries["sampler:length"] = vectorLength
+      })
+      yield* expectCheckpointError(malformedLength, "expected a u32 scalar")
+
+      const matrixOrder = yield* Tensor.fromTypedArray(new Uint32Array([0, 1, 2, 3]), [2, 2])
+      const malformedOrder = yield* corrupt("order-rank.safetensors", (entries) => {
+        entries["sampler:order"] = matrixOrder
+      })
+      yield* expectCheckpointError(malformedOrder, "expected a u32 vector")
+
+      const floatStep = yield* Tensor.full([], 1, { dtype: "f32" })
+      const malformedStep = yield* corrupt("step-dtype.safetensors", (entries) => {
+        entries["meta:step"] = floatStep
+      })
+      yield* expectCheckpointError(malformedStep, "invalid meta:step")
     }))
 
   it.effect("optimizer state lives on the ambient device, never a hidden override", () =>

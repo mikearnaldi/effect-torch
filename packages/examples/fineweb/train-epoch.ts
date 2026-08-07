@@ -18,8 +18,8 @@ import {
 // Full-epoch training, warm-started from the pilot checkpoint
 // (fineweb-model.safetensors, written by train.ts): parameters load from
 // disk, AdamW starts fresh, and the learning rate follows linear warmup
-// into a cosine decay over exactly one epoch of the 745M-token bin —
-// every window seen exactly once (see Sampler). Checkpoints land in a
+// into a cosine decay over every complete batch in one pass through the
+// 745M-token bin, without replacement (see Sampler). Checkpoints land in a
 // separate file so a pilot checkpoint is never clobbered, and an
 // interrupted epoch resumes bit-exactly (params, optimizer, step, data
 // layout). The final parameters replace fineweb-model.safetensors.
@@ -102,7 +102,7 @@ const program = Effect.gen(function*() {
   let epoch = 1
   if (fs.existsSync(CKPT)) {
     const checkpoint = yield* Checkpoint.loadWithSampler(CKPT, trainer)
-    sampler = yield* Sampler.restore(samplerConfig, checkpoint.sampler)
+    sampler = yield* Sampler.restoreCheckpoint(samplerConfig, checkpoint.sampler, checkpoint.resume.step)
     params = checkpoint.params
     resume = checkpoint.resume
     step = checkpoint.resume.step

@@ -71,7 +71,7 @@ const program = Effect.gen(function*() {
   let epoch = 1
   if (fs.existsSync(CKPT)) {
     const checkpoint = yield* Checkpoint.loadWithSampler(CKPT, trainer)
-    sampler = yield* Sampler.restore(samplerConfig, checkpoint.sampler)
+    sampler = yield* Sampler.restoreCheckpoint(samplerConfig, checkpoint.sampler, checkpoint.resume.step)
     params = checkpoint.params
     resume = checkpoint.resume
     step = checkpoint.resume.step
