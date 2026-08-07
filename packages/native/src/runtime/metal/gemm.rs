@@ -311,6 +311,224 @@ fn mma_key_for(bias: bool, epilogue: Epilogue, dtype: DType, cfg: MmaConfig) -> 
     key_for(bias, epilogue, dtype) ^ 0xA11A_0000_0000 ^ ((cfg.tile as u64) << 48)
 }
 
+fn splitk_key(
+    name: &'static str,
+    dtype: DType,
+    cfg: MmaConfig,
+    splits: usize,
+    total: usize,
+) -> u64 {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+
+    let mut hasher = DefaultHasher::new();
+    (name, dtype, cfg.tile, cfg.threads, splits, total, MetalDevice::WIDE).hash(&mut hasher);
+    hasher.finish()
+}
+
+// Split-K for long-K narrow-output gemms (head-dX, trunk-dW): the
+// output grid alone starves the GPU and every threadgroup re-reads all
+// of A and B, so K is partitioned across threadgroups; each element
+// is read once, writing f32 partials that a second kernel reduces in
+// a fixed order (deterministic). Biases and epilogues are unsupported;
+// only plain backward gemms take this path. Staging intentionally stays
+// single-buffered: double buffering wins the head-dX microbench but
+// loses 6.5% over 400 FineWeb steps on M4 Max due to thermal throttling.
+fn gemm_splitk_source(
+    ty: &str,
+    sg_ty: &str,
+    cfg: MmaConfig,
+    splits: usize,
+    total: usize,
+) -> String {
+    let t = cfg.tile;
+    let threads = cfg.threads;
+    let sg_per_col = t / 16;
+    let qw = t / (threads / 32 / sg_per_col);
+    let dj = qw / 8;
+    let load_n = t * 8;
+    let store_n = t * t;
+    let zero = if sg_ty == "float" {
+        "0.0f"
+    } else if sg_ty == "bfloat" {
+        "bfloat(0.0f)"
+    } else {
+        "half(0.0h)"
+    };
+    let a_expr = "A[a_batch + (ulong)(m0 + r) * K + kk + c]";
+    let b_expr = "B[b_batch + (ulong)(kk + r) * N + n0 + c]";
+    let (a_load, b_load) = if sg_ty == "float" {
+        (format!("float({a_expr})"), format!("float({b_expr})"))
+    } else {
+        (a_expr.to_string(), b_expr.to_string())
+    };
+    format!(
+        r#"
+#include <metal_stdlib>
+#include <metal_simdgroup_matrix>
+using namespace metal;
+kernel void et_gemm_splitk(
+    device const {ty}* A [[buffer(0)]],
+    device const {ty}* B [[buffer(1)]],
+    device float* P [[buffer(2)]],
+    constant uint& M [[buffer(4)]],
+    constant uint& N [[buffer(5)]],
+    constant uint& K [[buffer(6)]],
+    constant uint& strideA [[buffer(7)]],
+    constant uint& strideB [[buffer(8)]],
+    uint3 tgid [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]]
+) {{
+    const uint slice = tgid.z % {SPLITS}u;
+    const uint batch = tgid.z / {SPLITS}u;
+    const uint m0 = tgid.y * {T}u;
+    const uint n0 = tgid.x * {T}u;
+    const ulong a_batch = (ulong)batch * strideA;
+    const ulong b_batch = (ulong)batch * strideB;
+    threadgroup {sg_ty} As[{T}][8];
+    threadgroup {sg_ty} Bs[8][{T}];
+    const uint sg = tid / 32u;
+    const uint qm = (sg % {SG_PER_COL}u) * 16u;
+    const uint qn = (sg / {SG_PER_COL}u) * {QW}u;
+    const uint klen = (K + {SPLITS}u - 1u) / {SPLITS}u;
+    const uint k_start = slice * klen;
+    const uint k_end = min(K, k_start + klen);
+    simdgroup_float8x8 acc[2][{DJ}];
+    for (uint di = 0; di < 2u; di++)
+        for (uint dj = 0; dj < {DJ}u; dj++)
+            acc[di][dj] = simdgroup_float8x8(0.0f);
+    for (uint k0 = k_start; k0 < k_end; k0 += 8u) {{
+        const uint kk = k0;
+        for (uint e = tid; e < {LOAD_N}u; e += {THREADS}u) {{
+            const uint r = e / 8u, c = e % 8u;
+            As[r][c] = (m0 + r < M && kk + c < k_end) ? {A_LOAD} : {ZERO};
+        }}
+        for (uint e = tid; e < {LOAD_N}u; e += {THREADS}u) {{
+            const uint r = e / {T}u, c = e % {T}u;
+            Bs[r][c] = (kk + r < k_end && n0 + c < N) ? {B_LOAD} : {ZERO};
+        }}
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint di = 0; di < 2u; di++) {{
+            simdgroup_{sg_ty}8x8 af;
+            simdgroup_load(af, &As[qm + 8u * di][0], 8);
+            for (uint dj = 0; dj < {DJ}u; dj++) {{
+                simdgroup_{sg_ty}8x8 bf;
+                simdgroup_load(bf, &Bs[0][qn + 8u * dj], {T});
+                simdgroup_multiply_accumulate(acc[di][dj], af, bf, acc[di][dj]);
+            }}
+        }}
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }}
+    threadgroup float Cs[{T}][{T}];
+    for (uint di = 0; di < 2u; di++)
+        for (uint dj = 0; dj < {DJ}u; dj++)
+            simdgroup_store(acc[di][dj], &Cs[qm + 8u * di][qn + 8u * dj], {T});
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const ulong p_base = (ulong)slice * {TOTAL}ul + (ulong)batch * M * N;
+    for (uint e = tid; e < {STORE_N}u; e += {THREADS}u) {{
+        const uint r = e / {T}u, c = e % {T}u;
+        const uint i = m0 + r, j = n0 + c;
+        if (i < M && j < N) {{
+            P[p_base + (ulong)i * N + j] = Cs[r][c];
+        }}
+    }}
+}}
+
+kernel void et_gemm_splitk_reduce(
+    device const float* P [[buffer(0)]],
+    device {ty}* D [[buffer(1)]],
+    uint2 gid2 [[thread_position_in_grid]]
+) {{
+    const ulong i = ulong(gid2.y) * {WIDE}ul + ulong(gid2.x);
+    if (i < {TOTAL}ul) {{
+        float acc = 0.0f;
+        for (uint s = 0u; s < {SPLITS}u; s++) {{
+            acc += P[(ulong)s * {TOTAL}ul + i];
+        }}
+        D[i] = {ty}(acc);
+    }}
+}}
+"#,
+        ty = ty,
+        sg_ty = sg_ty,
+        T = t,
+        THREADS = threads,
+        SG_PER_COL = sg_per_col,
+        QW = qw,
+        DJ = dj,
+        LOAD_N = load_n,
+        STORE_N = store_n,
+        ZERO = zero,
+        A_LOAD = a_load,
+        B_LOAD = b_load,
+        SPLITS = splits,
+        WIDE = MetalDevice::WIDE,
+        TOTAL = total,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn gemm_splitk(
+    dev: &MetalDevice,
+    a: &MetalTensor,
+    b: &MetalTensor,
+    splits: usize,
+    batch: usize,
+    m: usize,
+    n: usize,
+    k: usize,
+    stride_a: usize,
+    stride_b: usize,
+    cfg: MmaConfig,
+) -> Result<MetalTensor, String> {
+    let ty = match a.dtype {
+        DType::F32 => "float",
+        DType::F16 => "half",
+        DType::BF16 => "bfloat",
+        other => unreachable!("gemm: unsupported dtype {other:?}"),
+    };
+    let sg_ty = if a.dtype == DType::F32 { "float" } else { ty };
+    let esz = a.dtype.size_in_bytes();
+    let total = batch * m * n;
+    let source = gemm_splitk_source(ty, sg_ty, cfg, splits, total);
+    let key = splitk_key("et_gemm_splitk", a.dtype, cfg, splits, total);
+    let pipeline = dev.compile_lazy(key, "et_gemm_splitk", || source.clone())?;
+    let partial = dev.alloc(splits * total, DType::F32);
+    let out = MetalTensor {
+        buffer: dev.alloc(total.max(1), a.dtype),
+        layout: crate::runtime::layout::Layout::contiguous(vec![batch, m, n]),
+        dtype: a.dtype,
+    };
+    let (mu, nu, ku) = (m as u32, n as u32, k as u32);
+    let (sa, sb) = (stride_a as u32, stride_b as u32);
+    dev.with_encoder(|e| {
+        e.setComputePipelineState(pipeline.as_raw());
+        set_buffer(e, 0, &a.buffer, a.layout.offset() * esz);
+        set_buffer(e, 1, &b.buffer, b.layout.offset() * esz);
+        set_buffer(e, 2, &partial, 0);
+        set_bytes(e, 4, &mu);
+        set_bytes(e, 5, &nu);
+        set_bytes(e, 6, &ku);
+        set_bytes(e, 7, &sa);
+        set_bytes(e, 8, &sb);
+        e.dispatchThreadgroups_threadsPerThreadgroup(
+            MetalDevice::grid(n.div_ceil(cfg.tile), m.div_ceil(cfg.tile), batch * splits),
+            MetalDevice::grid(cfg.threads, 1, 1),
+        );
+    });
+    let rkey = splitk_key("et_gemm_splitk_reduce", a.dtype, cfg, splits, total);
+    let rpipeline = dev.compile_lazy(rkey, "et_gemm_splitk_reduce", || source)?;
+    let padded = total.div_ceil(256) * 256;
+    dev.with_encoder(|e| {
+        e.setComputePipelineState(rpipeline.as_raw());
+        set_buffer(e, 0, &partial, 0);
+        set_buffer(e, 1, &out.buffer, 0);
+        let (g, tg) = MetalDevice::grid_flat(padded);
+        e.dispatchThreads_threadsPerThreadgroup(g, tg);
+    });
+    Ok(out)
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn gemm_fused(
     dev: &MetalDevice,
@@ -371,6 +589,22 @@ pub fn gemm_fused(
         None
     };
     let use_mma = std::env::var_os("EFFECT_TORCH_NO_MMA").is_none() && cfg.is_some();
+    // Split-K: long K, narrow output grid, no bias or epilogue (the
+    // head-dX / trunk-dW class). Partition K so every element is read
+    // once and the grid fills the GPU, then reduce f32 partials in a
+    // fixed order.
+    if let Some(cfg) =
+        cfg.filter(|_| use_mma && !has_bias && epilogue == Epilogue::None && k >= 2048)
+    {
+        let g = groups(cfg.tile);
+        if g < 256 {
+            let splits = 2048usize.div_ceil(g).clamp(1, 32).min((k / 128).max(1));
+            if splits > 1 {
+                let out = gemm_splitk(dev, a, b, splits, batch, m, n, k, stride_a, stride_b, cfg)?;
+                return Ok((out, None));
+            }
+        }
+    }
     let pipeline = if let Some(cfg) = cfg.filter(|_| use_mma) {
         dev.compile_lazy(mma_key_for(has_bias, epilogue, a.dtype, cfg), "et_gemm_mma", || {
             gemm_mma_source(has_bias, epilogue, ty, cfg)
@@ -593,7 +827,8 @@ mod tests {
     #[test]
     fn gemm_mma_bf16_matches_f32() {
         let dev = MetalDevice::get();
-        let (batch, m, n, k) = (2usize, 37usize, 53usize, 29usize);
+        // Exactly 64 32x32 threadgroups: enough to force the normal MMA path.
+        let (batch, m, n, k) = (16usize, 37usize, 53usize, 37usize);
         let a: Vec<f32> = (0..batch * m * k).map(|i| (i as f32 * 0.37).sin()).collect();
         let b: Vec<f32> = (0..k * n).map(|i| (i as f32 * 0.19).cos()).collect();
         let to_bf16 = |v: &[f32]| -> Vec<u8> {
@@ -612,6 +847,11 @@ mod tests {
         let tbb = from_bytes(to_bf16(&b), vec![k, n]);
         let out32 = gemm(dev, &ta32, &tb32, None, batch, m, n, k, m * k, 0).unwrap();
         let outb = gemm(dev, &tab, &tbb, None, batch, m, n, k, m * k, 0).unwrap();
+        let cfg = MmaConfig { tile: 32, threads: 128 };
+        assert_eq!(
+            dev.pipeline_cached(mma_key_for(false, Epilogue::None, DType::BF16, cfg)).is_some(),
+            std::env::var_os("EFFECT_TORCH_NO_MMA").is_none()
+        );
         dev.synchronize();
         let gotb: Vec<f32> = {
             let n = outb.numel();
@@ -637,6 +877,66 @@ mod tests {
             }
         }
         let _ = out32;
+    }
+
+    #[test]
+    fn gemm_splitk_and_bias_fallback_match_cpu() {
+        // The 32x32 MMA grid has exactly 64 threadgroups, enough to
+        // select MMA but still narrow enough to select split-K.
+        let dev = MetalDevice::get();
+        let (batch, m, n, k) = (2usize, 128usize, 256usize, 2051usize);
+        let a: Vec<f32> = (0..batch * m * k).map(|i| (i as f32 * 0.001).sin() * 0.5).collect();
+        let b: Vec<f32> = (0..k * n)
+            .map(|i| (i as f32 * 0.0017).cos() * 0.5)
+            .collect();
+        let bias: Vec<f32> = (0..n).map(|j| j as f32 * 0.01).collect();
+        let ta = MetalTensor::from_f32(dev, a.clone(), vec![batch, m, k]);
+        let tb = MetalTensor::from_f32(dev, b.clone(), vec![k, n]);
+        let tbias = MetalTensor::from_f32(dev, bias.clone(), vec![n]);
+        let out = gemm(dev, &ta, &tb, None, batch, m, n, k, m * k, 0).unwrap();
+        let cfg = MmaConfig { tile: 32, threads: 128 };
+        let use_mma = std::env::var_os("EFFECT_TORCH_NO_MMA").is_none();
+        assert_eq!(
+            dev.pipeline_cached(splitk_key("et_gemm_splitk", DType::F32, cfg, 16, batch * m * n))
+                .is_some(),
+            use_mma
+        );
+        let biased =
+            gemm(dev, &ta, &tb, Some(&tbias), batch, m, n, k, m * k, 0).unwrap();
+        assert_eq!(
+            dev.pipeline_cached(mma_key_for(true, Epilogue::None, DType::F32, cfg)).is_some(),
+            use_mma
+        );
+        dev.synchronize().unwrap();
+        let got = out.read_f32().unwrap();
+        let got_biased = biased.read_f32().unwrap();
+        for (bi, i, j) in [(0, 0, 0), (0, 63, 255), (1, 0, 255), (1, 127, 0), (1, 127, 255)] {
+            let want: f32 = (0..k)
+                .map(|p| a[bi * m * k + i * k + p] * b[p * n + j])
+                .sum();
+            let index = bi * m * n + i * n + j;
+            let actual = got[index];
+            assert!(
+                (actual - want).abs() / want.abs().max(1.0) < 1e-3,
+                "splitk[{bi},{i},{j}]: {actual} vs {want}"
+            );
+            let actual_biased = got_biased[index];
+            let want_biased = want + bias[j];
+            assert!(
+                (actual_biased - want_biased).abs() / want_biased.abs().max(1.0) < 1e-3,
+                "biased[{bi},{i},{j}]: {actual_biased} vs {want_biased}"
+            );
+        }
+    }
+
+    #[test]
+    fn gemm_splitk_keys_separate_pipeline_sources() {
+        let cfg = MmaConfig { tile: 32, threads: 128 };
+        let f32_main = splitk_key("et_gemm_splitk", DType::F32, cfg, 16, 65_536);
+        let f16_main = splitk_key("et_gemm_splitk", DType::F16, cfg, 16, 65_536);
+        let f32_reduce = splitk_key("et_gemm_splitk_reduce", DType::F32, cfg, 16, 65_536);
+        assert_ne!(f32_main, f16_main);
+        assert_ne!(f32_main, f32_reduce);
     }
 
     #[test]
