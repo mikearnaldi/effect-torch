@@ -49,6 +49,14 @@ onDevices("Tensor", (device) => (it) => {
         assert.assertTrue(Exit.isFailure(exit))
       }))
 
+    it.effect("fromTypedArray snapshots its input", () =>
+      Effect.gen(function*() {
+        const source = new Uint32Array([1, 2, 3])
+        const tensor = yield* Tensor.fromTypedArray(source)
+        source.fill(9)
+        deep(yield* values(tensor), [1, 2, 3])
+      }))
+
     it.effect("reads back non-contiguous views", () =>
       Effect.gen(function*() {
         const source = yield* Tensor.fromTypedArray(floats([1, 2, 3, 4, 5, 6]), [2, 3])

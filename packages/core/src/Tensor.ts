@@ -578,8 +578,7 @@ export const fromTypedArray = (
         `fromTypedArray: data length ${data.length} does not match shape [${validShape}]`
       )
     }
-    const bytes = new Uint8Array(data.byteLength)
-    bytes.set(new Uint8Array(data.buffer, data.byteOffset, data.byteLength))
+    const bytes = new Uint8Array(data.buffer, data.byteOffset, data.byteLength)
     return {
       request: { op: "fromBytes", inputs: [], attributes: { data: bytes, shape: validShape, dtype } },
       shape: validShape,
