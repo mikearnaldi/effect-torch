@@ -1,4 +1,4 @@
-import * as BackendNative from "@effect-torch/backend-native"
+import * as BackendApple from "@effect-torch/backend-apple-native"
 import type { Model } from "@effect-torch/core"
 import { Checkpoint, LearningRate, Loss, Optimizer, Sampler, Tensor, Trainer } from "@effect-torch/core"
 import { NodeRuntime } from "@effect/platform-node"
@@ -156,4 +156,4 @@ const program = Effect.gen(function*() {
   yield* saveParams(model, params, OUT)
 })
 
-NodeRuntime.runMain(program.pipe(Effect.provide(BackendNative.Best)))
+NodeRuntime.runMain(program.pipe(Effect.provide(BackendApple.layer)))

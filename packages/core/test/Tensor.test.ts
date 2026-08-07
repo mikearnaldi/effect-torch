@@ -7,7 +7,7 @@ import { deep, floatDtype, floats, onDevices, TOL } from "./utils/devices.ts"
 const values = (t: Tensor.Any) =>
   Effect.map(Tensor.toTypedArray(t), (arr) => Array.from<number | bigint>(arr).map(Number))
 
-onDevices("Tensor", () => (it) => {
+onDevices("Tensor", (device) => (it) => {
   describe("constructors", () => {
     it.effect("zeros/ones/full produce the right values and dtype", () =>
       Effect.gen(function*() {
@@ -807,49 +807,61 @@ onDevices("Tensor", () => (it) => {
         const m = yield* Tensor.fromTypedArray(floats([1, 2, 3, 4]), [2, 2])
         deep(yield* values(yield* Tensor.trace(m)), [5])
       }))
-    it.effect("inverse/det/solve", () =>
-      Effect.gen(function*() {
-        const a = yield* Tensor.fromTypedArray(floats([4, 1, 1, 3]), [2, 2])
-        const inv = yield* Tensor.inverse(a)
-        const identity = yield* values(yield* Tensor.matmul(a, inv))
-        for (let i = 0; i < 4; i++) {
-          expect(Math.abs(identity[i] - [1, 0, 0, 1][i])).toBeLessThan(TOL)
-        }
-        const [d] = yield* values(yield* Tensor.det(a))
-        expect(Math.abs(d - 11)).toBeLessThan(TOL)
-        const b = yield* Tensor.fromTypedArray(floats([9, 8]), [2, 1])
-        const x = yield* Tensor.solve(a, b)
-        const xValues = yield* values(x)
-        expect(Math.abs(xValues[0] - 19 / 11)).toBeLessThan(TOL)
-        expect(Math.abs(xValues[1] - 23 / 11)).toBeLessThan(TOL)
-        const singular = yield* Tensor.fromTypedArray(floats([1, 2, 2, 4]), [2, 2])
-        const error = yield* Effect.flip(Effect.flatMap(Tensor.inverse(singular), (t) => values(t)))
-        expect(error.message).toContain("singular")
-      }))
+    if (device === "cpu") {
+      it.effect("inverse/det/solve", () =>
+        Effect.gen(function*() {
+          const a = yield* Tensor.fromTypedArray(floats([4, 1, 1, 3]), [2, 2])
+          const inv = yield* Tensor.inverse(a)
+          const identity = yield* values(yield* Tensor.matmul(a, inv))
+          for (let i = 0; i < 4; i++) {
+            expect(Math.abs(identity[i] - [1, 0, 0, 1][i])).toBeLessThan(TOL)
+          }
+          const [d] = yield* values(yield* Tensor.det(a))
+          expect(Math.abs(d - 11)).toBeLessThan(TOL)
+          const b = yield* Tensor.fromTypedArray(floats([9, 8]), [2, 1])
+          const x = yield* Tensor.solve(a, b)
+          const xValues = yield* values(x)
+          expect(Math.abs(xValues[0] - 19 / 11)).toBeLessThan(TOL)
+          expect(Math.abs(xValues[1] - 23 / 11)).toBeLessThan(TOL)
+          const singular = yield* Tensor.fromTypedArray(floats([1, 2, 2, 4]), [2, 2])
+          const error = yield* Effect.flip(Effect.flatMap(Tensor.inverse(singular), (t) => values(t)))
+          expect(error.message).toContain("singular")
+        }))
 
-    it.effect("batched inverse/det/solve", () =>
-      Effect.gen(function*() {
-        const a = yield* Tensor.fromTypedArray(floats([4, 1, 1, 3, 1, 2, 3, 4]), [2, 2, 2])
-        const inv = yield* Tensor.inverse(a)
-        deep(inv.shape, [2, 2, 2])
-        const identity = yield* values(yield* Tensor.matmul(a, inv))
-        const expectedIdentity = [1, 0, 0, 1, 1, 0, 0, 1]
-        for (let i = 0; i < 8; i++) {
-          expect(Math.abs(identity[i] - expectedIdentity[i])).toBeLessThan(TOL)
-        }
-        const dets = yield* values(yield* Tensor.det(a))
-        deep(dets.length, 2)
-        expect(Math.abs(dets[0] - 11)).toBeLessThan(TOL)
-        expect(Math.abs(dets[1] - -2)).toBeLessThan(TOL)
-        const b = yield* Tensor.fromTypedArray(floats([9, 8, 1, 1]), [2, 2, 1])
-        const x = yield* Tensor.solve(a, b)
-        deep(x.shape, [2, 2, 1])
-        const xValues = yield* values(x)
-        expect(Math.abs(xValues[0] - 19 / 11)).toBeLessThan(TOL)
-        expect(Math.abs(xValues[1] - 23 / 11)).toBeLessThan(TOL)
-        expect(Math.abs(xValues[2] - -1)).toBeLessThan(TOL)
-        expect(Math.abs(xValues[3] - 1)).toBeLessThan(TOL)
-      }))
+      it.effect("batched inverse/det/solve", () =>
+        Effect.gen(function*() {
+          const a = yield* Tensor.fromTypedArray(floats([4, 1, 1, 3, 1, 2, 3, 4]), [2, 2, 2])
+          const inv = yield* Tensor.inverse(a)
+          deep(inv.shape, [2, 2, 2])
+          const identity = yield* values(yield* Tensor.matmul(a, inv))
+          const expectedIdentity = [1, 0, 0, 1, 1, 0, 0, 1]
+          for (let i = 0; i < 8; i++) {
+            expect(Math.abs(identity[i] - expectedIdentity[i])).toBeLessThan(TOL)
+          }
+          const dets = yield* values(yield* Tensor.det(a))
+          deep(dets.length, 2)
+          expect(Math.abs(dets[0] - 11)).toBeLessThan(TOL)
+          expect(Math.abs(dets[1] - -2)).toBeLessThan(TOL)
+          const b = yield* Tensor.fromTypedArray(floats([9, 8, 1, 1]), [2, 2, 1])
+          const x = yield* Tensor.solve(a, b)
+          deep(x.shape, [2, 2, 1])
+          const xValues = yield* values(x)
+          expect(Math.abs(xValues[0] - 19 / 11)).toBeLessThan(TOL)
+          expect(Math.abs(xValues[1] - 23 / 11)).toBeLessThan(TOL)
+          expect(Math.abs(xValues[2] - -1)).toBeLessThan(TOL)
+          expect(Math.abs(xValues[3] - 1)).toBeLessThan(TOL)
+        }))
+    } else {
+      it.effect("rejects unsupported linalg instead of falling back to CPU", () =>
+        Effect.gen(function*() {
+          const a = yield* Tensor.fromTypedArray(floats([4, 1, 1, 3]), [2, 2])
+          const b = yield* Tensor.fromTypedArray(floats([9, 8]), [2, 1])
+          for (const operation of [Tensor.inverse(a), Tensor.det(a), Tensor.solve(a, b)]) {
+            const error = yield* Effect.flip(Effect.flatMap(operation, values))
+            expect(error.message).toContain("not supported on Metal")
+          }
+        }))
+    }
   })
 
   describe("convolution and pooling", () => {

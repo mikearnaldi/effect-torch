@@ -10,7 +10,6 @@
     "**/dist",
     "**/build",
     "**/coverage",
-    "packages/native/**",
     "packages/examples/data/**",
     "packages/examples/backup/**"
   ],

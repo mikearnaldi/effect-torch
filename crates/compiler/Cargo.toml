@@ -1,0 +1,9 @@
+[package]
+name = "effect-torch-compiler"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+effect-torch-graph = { path = "../graph" }
+effect-torch-runtime = { path = "../runtime" }
+libm = "0.2"

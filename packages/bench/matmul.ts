@@ -1,4 +1,5 @@
-import * as BackendNative from "@effect-torch/backend-native"
+import * as BackendApple from "@effect-torch/backend-apple-native"
+import * as BackendCpu from "@effect-torch/backend-cpu"
 import { Runtime, Tensor } from "@effect-torch/core"
 import { Console, Effect } from "effect"
 import { performance } from "node:perf_hooks"
@@ -51,10 +52,10 @@ const suite: Effect.Effect<void, Tensor.TensorError, Runtime.Runtime> = Effect.g
 const main = async (): Promise<void> => {
   process.stdout.write(`matmul f32 ${N}x${N} @ ${N}x${N}, ${ITERS} iterations, ${BATCH} chained per iter\n`)
   if (!process.env.METAL_ONLY) {
-    await Effect.runPromise(Effect.provide(suite, BackendNative.Cpu))
+    await Effect.runPromise(Effect.provide(suite, BackendCpu.layer))
   }
-  if (BackendNative.isAvailable("metal")) {
-    await Effect.runPromise(Effect.provide(suite, BackendNative.Metal))
+  if (await Effect.runPromise(BackendApple.isAvailable)) {
+    await Effect.runPromise(Effect.provide(suite, BackendApple.layer))
   }
 }
 

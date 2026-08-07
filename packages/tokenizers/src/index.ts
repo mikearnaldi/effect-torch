@@ -10,11 +10,12 @@
  * ids unless the tokenizer is configured with `specialTokens: "Always"` —
  * the tiktoken `allowed_special` discipline.
  */
-import native, { type NativeTokenizer as NativeTokenizerType } from "@effect-torch/native"
 import { Data, Effect, Option, Queue, Stream } from "effect"
 import { type Pipeable, pipeArguments } from "effect/Pipeable"
+import native from "./internal/native.js"
 
 const { NativeTokenizer } = native
+type NativeTokenizerType = InstanceType<typeof NativeTokenizer>
 
 /**
  * @since 0.1.0

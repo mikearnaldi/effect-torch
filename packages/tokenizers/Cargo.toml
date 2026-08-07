@@ -1,0 +1,17 @@
+[package]
+name = "effect-torch-tokenizers"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+napi = { version = "3", features = ["async"] }
+napi-derive = "3"
+rayon = "1"
+tokenizers = "0.22"
+tokio = { version = "1", features = ["rt", "sync", "macros"] }
+
+[build-dependencies]
+napi-build = "1"

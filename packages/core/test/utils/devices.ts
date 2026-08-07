@@ -1,11 +1,13 @@
-import * as BackendNative from "@effect-torch/backend-native"
+import * as BackendApple from "@effect-torch/backend-apple-native"
+import * as BackendCpu from "@effect-torch/backend-cpu"
 import { layer } from "@effect/vitest"
 import * as assert from "@effect/vitest/utils"
+import { Effect } from "effect"
 import type { Runtime } from "../../src/index.ts"
 
 export type TestDevice = "cpu" | "metal"
 
-export const metalAvailable: boolean = BackendNative.isAvailable("metal")
+export const metalAvailable: boolean = Effect.runSync(BackendApple.isAvailable)
 
 /** Tests settle on f32: it runs on every device, so one dtype and one set
  * of tolerances covers CPU and Metal alike. */
@@ -54,8 +56,8 @@ type SuiteFn = Parameters<ReturnType<typeof layer<Runtime.Runtime, never>>>[1]
  * when the machine has one.
  */
 export const onDevices = (name: string, make: (device: TestDevice) => SuiteFn): void => {
-  layer(BackendNative.Cpu)(`${name} (cpu)`, make("cpu"))
+  layer(BackendCpu.layer)(`${name} (cpu)`, make("cpu"))
   if (metalAvailable) {
-    layer(BackendNative.Metal)(`${name} (metal)`, make("metal"))
+    layer(BackendApple.layer)(`${name} (metal)`, make("metal"))
   }
 }

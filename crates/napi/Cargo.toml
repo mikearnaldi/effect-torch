@@ -1,0 +1,12 @@
+[package]
+name = "effect-torch-napi"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+crate-type = ["rlib"]
+
+[dependencies]
+effect-torch-runtime = { path = "../runtime" }
+napi = { version = "3", features = ["async"] }
+tokio = { version = "1", features = ["rt", "sync", "macros"] }

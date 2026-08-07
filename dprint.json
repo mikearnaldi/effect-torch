@@ -17,7 +17,6 @@
     "**/build",
     "**/coverage",
     "**/node_modules",
-    "packages/native",
     "packages/examples/data",
     "packages/examples/backup",
     "docs",

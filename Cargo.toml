@@ -1,0 +1,20 @@
+[workspace]
+members = [
+  "crates/autodiff",
+  "crates/compiler",
+  "crates/graph",
+  "crates/napi",
+  "crates/runtime",
+  "crates/runtime-cpu",
+  "crates/runtime-metal",
+  "packages/tokenizers",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+version = "0.1.0"
+
+[profile.release]
+lto = true
+codegen-units = 1

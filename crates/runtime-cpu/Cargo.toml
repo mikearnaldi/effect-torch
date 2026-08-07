@@ -1,0 +1,35 @@
+[package]
+name = "effect-torch-runtime-cpu"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+crate-type = ["rlib", "cdylib"]
+
+[features]
+napi-addon = [
+  "dep:effect-torch-autodiff",
+  "dep:effect-torch-compiler",
+  "dep:effect-torch-napi",
+  "dep:napi",
+  "dep:napi-derive",
+  "dep:safetensors",
+  "dep:tokio",
+]
+
+[dependencies]
+effect-torch-autodiff = { path = "../autodiff", optional = true }
+effect-torch-compiler = { path = "../compiler", optional = true }
+effect-torch-graph = { path = "../graph" }
+effect-torch-napi = { path = "../napi", optional = true }
+effect-torch-runtime = { path = "../runtime" }
+half = "2"
+libm = "0.2"
+matrixmultiply = "0.3"
+napi = { version = "3", features = ["async"], optional = true }
+napi-derive = { version = "3", optional = true }
+safetensors = { version = "0.6", optional = true }
+tokio = { version = "1", features = ["rt", "sync", "macros"], optional = true }
+
+[build-dependencies]
+napi-build = "1"

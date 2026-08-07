@@ -1,4 +1,4 @@
-import * as BackendNative from "@effect-torch/backend-native"
+import * as BackendApple from "@effect-torch/backend-apple-native"
 import { Tensor } from "@effect-torch/core"
 import { Console, Effect } from "effect"
 import { performance } from "node:perf_hooks"
@@ -22,4 +22,4 @@ const program = Effect.gen(function*() {
   yield* Console.log(`sdpa fwd [8,12,1024,64] bf16 causal: ${((performance.now() - start) / ITERS).toFixed(3)} ms/op`)
 })
 
-Effect.runPromise(Effect.provide(program, BackendNative.Metal))
+Effect.runPromise(Effect.provide(program, BackendApple.layer))

@@ -1,0 +1,41 @@
+[package]
+name = "effect-torch-runtime-metal"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+crate-type = ["rlib", "cdylib"]
+
+[features]
+napi-addon = [
+  "dep:effect-torch-autodiff",
+  "dep:effect-torch-napi",
+  "dep:napi",
+  "dep:napi-derive",
+  "dep:safetensors",
+  "dep:tokio",
+]
+
+[dependencies]
+effect-torch-autodiff = { path = "../autodiff", optional = true }
+effect-torch-compiler = { path = "../compiler" }
+effect-torch-graph = { path = "../graph" }
+effect-torch-napi = { path = "../napi", optional = true }
+effect-torch-runtime = { path = "../runtime" }
+half = "2"
+napi = { version = "3", features = ["async"], optional = true }
+napi-derive = { version = "3", optional = true }
+safetensors = { version = "0.6", optional = true }
+tokio = { version = "1", features = ["rt", "sync", "macros"], optional = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-foundation = "0.3"
+objc2-metal = "0.3.2"
+
+[dev-dependencies]
+effect-torch-runtime-cpu = { path = "../runtime-cpu" }
+matrixmultiply = "0.3"
+
+[build-dependencies]
+napi-build = "1"

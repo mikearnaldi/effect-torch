@@ -1,30 +1,60 @@
-import * as BackendNative from "@effect-torch/backend-native"
+import * as BackendApple from "@effect-torch/backend-apple-native"
+import * as BackendCpu from "@effect-torch/backend-cpu"
 import { expect, it as test, layer } from "@effect/vitest"
 import { Effect, Layer } from "effect"
 import { Runtime, Tensor } from "../src/index.ts"
 
-layer(BackendNative.Best)("Runtime", (it) => {
-  it.effect("Best provides an available runtime", () =>
+const metalAvailable = Effect.runSync(BackendApple.isAvailable)
+
+layer(BackendCpu.layer)("Runtime", (it) => {
+  it.effect("provides the CPU runtime", () =>
     Effect.gen(function*() {
       const runtime = yield* Runtime.Runtime
-      expect(runtime.backend.name).toBe("@effect-torch/backend-native")
-      expect(BackendNative.isAvailable(runtime.placement.deviceType as "cpu" | "metal")).toBe(true)
+      expect(runtime.backend.name).toBe("@effect-torch/backend-cpu")
+      expect(runtime.placement.deviceType).toBe("cpu")
     }))
 
-  it.effect("rejects foreign graph and buffer handles", () =>
+  if (metalAvailable) {
+    it.effect("rejects foreign lazy and concrete tensor handles", () =>
+      Effect.gen(function*() {
+        const cpu = yield* Runtime.Runtime
+        const apple = BackendApple.makeRuntime()
+        const graph = yield* cpu.node({
+          op: "ones",
+          inputs: [],
+          attributes: { shape: [1], dtype: "f32" }
+        })
+        const lazyError = yield* Effect.flip(apple.node({ op: "relu", inputs: [graph] }))
+        expect(lazyError.reason).toBe("foreign-handle")
+
+        const [value] = yield* cpu.evaluate([graph])
+        const concreteError = yield* Effect.flip(apple.readback(value))
+        expect(concreteError.reason).toBe("foreign-handle")
+        yield* cpu.release(value)
+      }))
+
+    it.effect("rejects foreign tensors during graph construction", () =>
+      Effect.gen(function*() {
+        const tensor = yield* Effect.provide(Tensor.ones([1]), BackendApple.layer)
+        const error = yield* Effect.flip(Tensor.relu(tensor))
+        expect(error.backend?.reason).toBe("foreign-handle")
+      }))
+  }
+
+  it.effect("rejects released tensor and sequence handles", () =>
     Effect.gen(function*() {
-      const graph = BackendNative.cpu.graph.ones([1], "f32")
-      const graphError = yield* Effect.flip(BackendNative.metal.validateGraph([graph]))
-      expect(graphError.reason).toBe("foreign-handle")
+      const cpu = yield* Runtime.Runtime
+      const graph = yield* cpu.node({
+        op: "ones",
+        inputs: [],
+        attributes: { shape: [1], dtype: "f32" }
+      })
+      const [value] = yield* cpu.evaluate([graph])
+      yield* cpu.release(value)
+      const releasedTensorError = yield* Effect.flip(cpu.readback(value))
+      expect(releasedTensorError.reason).toBe("invalid-handle")
 
-      const [value] = yield* BackendNative.cpu.evaluate([graph])
-      const bufferError = yield* Effect.flip(BackendNative.metal.readback(value.handle))
-      expect(bufferError.reason).toBe("foreign-handle")
-      yield* BackendNative.cpu.releaseBuffer(value.handle)
-      const releasedBufferError = yield* Effect.flip(BackendNative.cpu.readback(value.handle))
-      expect(releasedBufferError.reason).toBe("invalid-handle")
-
-      const decode = BackendNative.cpu.extensions.decode!
+      const decode = cpu.extensions.decode!
       const pool = yield* decode.makePool({
         layers: 1,
         kvHeads: 1,
@@ -39,45 +69,31 @@ layer(BackendNative.Best)("Runtime", (it) => {
       expect(releasedSequenceError.reason).toBe("invalid-handle")
     }))
 
-  it.effect("rejects foreign tensors during graph construction", () =>
+  it.effect("memoizes the runtime service", () =>
     Effect.gen(function*() {
       const runtime = yield* Runtime.Runtime
-      if (runtime.placement.deviceType === "cpu" && !BackendNative.isAvailable("metal")) return
-      const foreign = runtime.placement.deviceType === "cpu" ? BackendNative.metal : BackendNative.cpu
-      const tensor = Tensor.makeLazy(foreign.graph.ones([1], "f32"), [1], "f32", foreign.placement)
-      const error = yield* Effect.flip(Tensor.relu(tensor))
-      expect(error.backend?.reason).toBe("foreign-handle")
+      expect(BackendCpu.makeRuntime()).toBe(runtime)
+      expect(BackendCpu.makeRuntime()).toBe(runtime)
     }))
+})
 
-  it("partitions compiled signatures by runtime identity", () => {
-    const tensor = Tensor.makeLazy(
-      BackendNative.cpu.graph.ones([1], "f32"),
-      [1],
-      "f32",
-      BackendNative.cpu.placement
+test.effect("the memoized runtime reuses compiled caches", () =>
+  Effect.gen(function*() {
+    const compiled = yield* Tensor.compile((inputs) => Effect.map(Tensor.relu(inputs[0]), (output) => [output]))
+    const firstRuntime = BackendCpu.makeRuntime()
+    const secondRuntime = BackendCpu.makeRuntime()
+    expect(secondRuntime).toBe(firstRuntime)
+    const FirstCpu = Layer.succeed(Runtime.Runtime, firstRuntime)
+    const SecondCpu = Layer.succeed(Runtime.Runtime, secondRuntime)
+    const input = yield* Effect.provide(
+      Tensor.fromTypedArray(new Float32Array([-1, 2])),
+      FirstCpu
     )
-    const other: Runtime.RuntimeService = { ...BackendNative.cpu, identity: {} }
-    expect(Tensor.signatureOf([tensor], BackendNative.cpu)).not.toBe(Tensor.signatureOf([tensor], other))
-  })
-})
 
-test("compiled caches isolate runtime identities with the same placement", async () => {
-  const compiled = await Effect.runPromise(
-    Tensor.compile((inputs) => Effect.map(Tensor.relu(inputs[0]), (output) => [output]))
-  )
-  const input = await Effect.runPromise(
-    Effect.provide(Tensor.fromTypedArray(new Float32Array([-1, 2])), BackendNative.Cpu)
-  )
-  const otherRuntime: Runtime.RuntimeService = { ...BackendNative.cpu, identity: {} }
-  const OtherCpu = Layer.succeed(Runtime.Runtime, otherRuntime)
+    const [first] = yield* Effect.provide(compiled.call([input]), FirstCpu)
+    const [second] = yield* Effect.provide(compiled.call([input]), SecondCpu)
 
-  const [first] = await Effect.runPromise(Effect.provide(compiled.call([input]), BackendNative.Cpu))
-  const [second] = await Effect.runPromise(Effect.provide(compiled.call([input]), OtherCpu))
-
-  await expect(yieldValues(first)).resolves.toEqual([0, 2])
-  await expect(yieldValues(second)).resolves.toEqual([0, 2])
-  expect(await Effect.runPromise(compiled.stats)).toEqual({ cached: 2, compiled: 2 })
-})
-
-const yieldValues = (tensor: Tensor.Any): Promise<Array<number>> =>
-  Effect.runPromise(Effect.provide(Tensor.toNumberArray(tensor), BackendNative.Cpu))
+    expect(yield* Effect.provide(Tensor.toNumberArray(first), SecondCpu)).toEqual([0, 2])
+    expect(yield* Effect.provide(Tensor.toNumberArray(second), FirstCpu)).toEqual([0, 2])
+    expect(yield* compiled.stats).toEqual({ cached: 1, compiled: 1 })
+  }))

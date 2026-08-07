@@ -1,6 +1,5 @@
 import { Data, Deferred, Effect, Exit } from "effect"
 import { dual } from "effect/Function"
-import { type Pipeable, pipeArguments } from "effect/Pipeable"
 import * as Runtime from "./Runtime.ts"
 
 /**
@@ -9,7 +8,7 @@ import * as Runtime from "./Runtime.ts"
  * @since 0.1.0
  * @category models
  */
-export type DType = "f32" | "f64" | "f16" | "bf16" | "i64" | "u8" | "u32"
+export type DType = Runtime.DType
 
 /**
  * JavaScript typed arrays accepted by {@link fromTypedArray} and returned by
@@ -50,16 +49,7 @@ export class TensorError extends Data.TaggedError("TensorError")<{
  * @since 0.1.0
  * @category models
  */
-export interface Any extends Pipeable {
-  readonly [TensorTypeId]: TensorTypeId
-  readonly _tag: "LazyTensor" | "Tensor"
-  /** The runtime-owned computation-graph handle. */
-  readonly lazy: Runtime.GraphHandle
-  readonly shape: ReadonlyArray<number>
-  readonly dtype: DType
-  readonly device: string
-  readonly placement: Runtime.Placement
-}
+export type Any = Runtime.TensorHandle
 
 /**
  * A tensor described by a lazy computation graph. Operations on lazy tensors
@@ -68,9 +58,7 @@ export interface Any extends Pipeable {
  * @since 0.1.0
  * @category models
  */
-export interface Lazy extends Any {
-  readonly _tag: "LazyTensor"
-}
+export type Lazy = Runtime.LazyTensorHandle
 
 /**
  * A materialized tensor whose data resides on the device, obtained through
@@ -79,13 +67,7 @@ export interface Lazy extends Any {
  * @since 0.1.0
  * @category models
  */
-export interface Concrete extends Any {
-  readonly _tag: "Tensor"
-  /** The runtime-owned materialized buffer handle. */
-  readonly materialized: Runtime.BufferHandle
-}
-
-const TensorTypeId: unique symbol = Symbol.for("@effect-torch/core/Tensor")
+export type Concrete = Runtime.ConcreteTensorHandle
 
 /**
  * A backend-owned frozen program used by compiled functions, models,
@@ -96,57 +78,11 @@ const TensorTypeId: unique symbol = Symbol.for("@effect-torch/core/Tensor")
  */
 export interface CompiledProgram {
   readonly handle: Runtime.ProgramHandle
-}
-
-/**
- * @since 0.1.0
- * @category symbols
- */
-export type TensorTypeId = typeof TensorTypeId
-
-const TensorProto = {
-  [TensorTypeId]: TensorTypeId,
-  pipe(this: Any) {
-    return pipeArguments(this, arguments)
-  }
-}
-
-/**
- * Wraps a native graph handle as a {@link Lazy}. The native graph does
- * not track shapes, so the caller owns the `shape`, `dtype` and `device`
- * metadata: it must exactly describe the handle's result, or every
- * downstream operation reads wrong shapes. Gradient and Optimizer use this
- * constructor to wrap backend-produced adjoints and fused update nodes.
- *
- * @since 0.1.0
- * @category constructors
- */
-export const makeLazy = (
-  lazy: Runtime.GraphHandle,
-  shape: ReadonlyArray<number>,
-  dtype: DType,
-  placement: Runtime.Placement
-): Lazy => {
-  const self = Object.create(TensorProto)
-  self._tag = "LazyTensor"
-  self.lazy = lazy
-  self.shape = shape
-  self.dtype = dtype
-  self.device = placement.deviceType
-  self.placement = placement
-  return self
-}
-
-const fromHandle = (runtime: Runtime.RuntimeService, value: Runtime.BufferValue): Concrete => {
-  const self = Object.create(TensorProto)
-  self._tag = "Tensor"
-  self.lazy = runtime.graph.fromBuffer(value.handle)
-  self.materialized = value.handle
-  self.shape = value.shape
-  self.dtype = value.dtype
-  self.device = value.placement.deviceType
-  self.placement = value.placement
-  return self
+  readonly outputs: ReadonlyArray<{
+    readonly shape: ReadonlyArray<number>
+    readonly dtype: DType
+    readonly placement: Runtime.Placement
+  }>
 }
 
 /**
@@ -218,28 +154,83 @@ const checkCompatible = (op: string, a: Any, b: Any): void => {
 const backendMessage = (error: Runtime.BackendError): string => error.message
 
 const caughtTensorError = (op: string, error: unknown): TensorError =>
-  error instanceof Runtime.BackendError
+  error instanceof TensorError
+    ? error
+    : error instanceof Runtime.BackendError
     ? new TensorError({ op, message: error.message, backend: error })
     : new TensorError({ op, message: error instanceof Error ? error.message : String(error) })
 
 const fromBackend = <A>(op: string, effect: Effect.Effect<A, Runtime.BackendError>): Effect.Effect<A, TensorError> =>
   Effect.mapError(effect, (error) => new TensorError({ op, message: backendMessage(error), backend: error }))
 
-const validateTensors = (
-  runtime: Runtime.RuntimeService,
-  op: string,
-  tensors: ReadonlyArray<Any>
-): Effect.Effect<void, TensorError> => fromBackend(op, runtime.validateGraph(tensors.map((tensor) => tensor.lazy)))
+interface GraphResult {
+  readonly request: Runtime.NodeRequest
+  readonly shape: ReadonlyArray<number>
+  readonly dtype: DType
+  readonly placement: Runtime.Placement
+}
 
-const graphTry = <A>(
+const sameShape = (a: ReadonlyArray<number>, b: ReadonlyArray<number>): boolean =>
+  a.length === b.length && a.every((dimension, index) => dimension === b[index])
+
+const samePlacement = (a: Runtime.Placement, b: Runtime.Placement): boolean =>
+  a.id === b.id && a.deviceType === b.deviceType && a.description === b.description && a.ordinal === b.ordinal &&
+  a.memorySpace === b.memorySpace
+
+const isTensorHandleValue = (value: unknown): value is Any =>
+  typeof value === "object" && value !== null &&
+  ((value as { readonly _tag?: unknown })._tag === "LazyTensor" ||
+    (value as { readonly _tag?: unknown })._tag === "Tensor")
+
+const validateTensorHandle = <T extends "LazyTensor" | "Tensor">(
   op: string,
-  tensors: ReadonlyArray<Any>,
-  evaluate: () => A
-): Effect.Effect<A, TensorError, Runtime.Runtime> =>
+  runtime: Runtime.RuntimeService,
+  value: Runtime.TensorHandle,
+  expected: {
+    readonly _tag: T
+    readonly shape?: ReadonlyArray<number>
+    readonly dtype?: DType
+    readonly placement?: Runtime.Placement
+  }
+): T extends "LazyTensor" ? Lazy : Concrete => {
+  const validDtypes: ReadonlyArray<string> = ["f32", "f64", "f16", "bf16", "i64", "u8", "u32"]
+  if (
+    !isTensorHandleValue(value) || value._tag !== expected._tag || !Array.isArray(value.shape) ||
+    !value.shape.every((dimension) => Number.isSafeInteger(dimension) && dimension >= 0) ||
+    !validDtypes.includes(value.dtype) || typeof value.device !== "string" ||
+    typeof value.placement !== "object" || value.placement === null || value.device !== value.placement.deviceType ||
+    !samePlacement(value.placement, runtime.placement) ||
+    (expected.shape !== undefined && !sameShape(value.shape, expected.shape)) ||
+    (expected.dtype !== undefined && value.dtype !== expected.dtype) ||
+    (expected.placement !== undefined && !samePlacement(value.placement, expected.placement))
+  ) {
+    const candidate = value as Partial<Runtime.TensorHandle>
+    throw new TensorError({
+      op,
+      message: `${op}: backend returned invalid ${
+        expected._tag === "LazyTensor" ? "lazy" : "concrete"
+      } tensor metadata; expected ${expected.dtype ?? "runtime dtype"} [${expected.shape ?? "runtime shape"}] on ${
+        expected.placement?.id ?? runtime.placement.id
+      }, got ${String(candidate.dtype)} [${Array.isArray(candidate.shape) ? candidate.shape : "invalid shape"}] on ${
+        candidate.placement?.id ?? "invalid placement"
+      }`
+    })
+  }
+  return value as T extends "LazyTensor" ? Lazy : Concrete
+}
+
+const graphTry = (
+  op: string,
+  evaluate: (runtime: Runtime.RuntimeService) => GraphResult
+): Effect.Effect<Lazy, TensorError, Runtime.Runtime> =>
   Effect.gen(function*() {
     const runtime = yield* Runtime.Runtime
-    yield* validateTensors(runtime, op, tensors)
-    return yield* Effect.try({ try: evaluate, catch: (error) => caughtTensorError(op, error) })
+    const result = yield* Effect.try({ try: () => evaluate(runtime), catch: (error) => caughtTensorError(op, error) })
+    const handle = yield* fromBackend(op, runtime.node(result.request))
+    return yield* Effect.try({
+      try: () => validateTensorHandle(op, runtime, handle, { _tag: "LazyTensor", ...result }),
+      catch: (error) => caughtTensorError(op, error)
+    })
   })
 
 const numel = (shape: ReadonlyArray<number>): number => shape.reduce((a, b) => a * b, 1)
@@ -263,14 +254,14 @@ export const constant = (
   value: number,
   options: TensorOptions = {}
 ): Effect.Effect<Lazy, TensorError, Runtime.Runtime> =>
-  Effect.gen(function*() {
-    const runtime = yield* Runtime.Runtime
+  graphTry("constant", (runtime) => {
     const dtype = options.dtype ?? "f32"
-    return yield* Effect.try({
-      try: () => makeLazy(runtime.graph.constant(value, dtype), [], dtype, runtime.placement),
-      catch: (error) =>
-        new TensorError({ op: "constant", message: error instanceof Error ? error.message : String(error) })
-    })
+    return {
+      request: { op: "constant", inputs: [], attributes: { value, dtype } },
+      shape: [],
+      dtype,
+      placement: runtime.placement
+    }
   })
 
 /**
@@ -286,15 +277,12 @@ export const constant = (
  * @category constructors
  */
 export const constantLike = (self: Any, value: number): Effect.Effect<Lazy, TensorError, Runtime.Runtime> =>
-  Effect.gen(function*() {
-    const runtime = yield* Runtime.Runtime
-    yield* fromBackend("constantLike", runtime.validateGraph([self.lazy]))
-    return yield* Effect.try({
-      try: () => makeLazy(runtime.graph.constant(value, self.dtype), [], self.dtype, runtime.placement),
-      catch: (error) =>
-        new TensorError({ op: "constantLike", message: error instanceof Error ? error.message : String(error) })
-    })
-  })
+  graphTry("constantLike", (runtime) => ({
+    request: { op: "constant", inputs: [self], attributes: { value, dtype: self.dtype } },
+    shape: [],
+    dtype: self.dtype,
+    placement: runtime.placement
+  }))
 
 // A 0-d float scalar never promotes a float tensor's dtype (the native
 // graph applies the same rule): `mul(f32Scalar, bf16Tensor)` is bf16.
@@ -305,7 +293,7 @@ const isFloat = (dtype: DType): boolean => dtype === "f32" || dtype === "f64" ||
 
 const binaryOp = (
   op: string,
-  native: (a: Runtime.GraphHandle, b: Runtime.GraphHandle) => Runtime.GraphHandle,
+  request: (a: Runtime.TensorHandle, b: Runtime.TensorHandle) => Runtime.NodeRequest,
   outDtype: (dtype: DType) => DType = (dtype) => dtype
 ): {
   (other: Any): (self: Any) => Effect.Effect<Lazy, TensorError, Runtime.Runtime>
@@ -314,45 +302,36 @@ const binaryOp = (
   dual(
     2,
     (self: Any, other: Any): Effect.Effect<Lazy, TensorError, Runtime.Runtime> =>
-      Effect.gen(function*() {
-        const runtime = yield* Runtime.Runtime
-        yield* validateTensors(runtime, op, [self, other])
-        return yield* Effect.try({
-          try: () => {
-            if (self.dtype !== other.dtype && !scalarCoercible(self, other)) {
-              throw new Error(
-                `${op}: dtype mismatch, got ${self.dtype} and ${other.dtype}, use cast for explicit conversion`
-              )
-            }
-            if (self.placement.id !== other.placement.id) {
-              throw new Error(`${op}: placement mismatch, got ${self.placement.id} and ${other.placement.id}`)
-            }
-            const dtype = scalarCoercible(self, other) && self.shape.length === 0 ? other.dtype : self.dtype
-            return makeLazy(
-              native(self.lazy, other.lazy),
-              broadcastShapes(op, self.shape, other.shape),
-              outDtype(dtype),
-              self.placement
-            )
-          },
-          catch: (error) => caughtTensorError(op, error)
-        })
+      graphTry(op, () => {
+        if (self.dtype !== other.dtype && !scalarCoercible(self, other)) {
+          throw new Error(
+            `${op}: dtype mismatch, got ${self.dtype} and ${other.dtype}, use cast for explicit conversion`
+          )
+        }
+        if (self.placement.id !== other.placement.id) {
+          throw new Error(`${op}: placement mismatch, got ${self.placement.id} and ${other.placement.id}`)
+        }
+        const dtype = scalarCoercible(self, other) && self.shape.length === 0 ? other.dtype : self.dtype
+        return {
+          request: request(self, other),
+          shape: broadcastShapes(op, self.shape, other.shape),
+          dtype: outDtype(dtype),
+          placement: self.placement
+        }
       })
   )
 
 const unaryOp = (
   op: string,
-  native: (a: Runtime.GraphHandle) => Runtime.GraphHandle
+  request: (a: Runtime.TensorHandle) => Runtime.NodeRequest
 ): (self: Any) => Effect.Effect<Lazy, TensorError, Runtime.Runtime> =>
 (self) =>
-  Effect.gen(function*() {
-    const runtime = yield* Runtime.Runtime
-    yield* validateTensors(runtime, op, [self])
-    return yield* Effect.try({
-      try: () => makeLazy(native(self.lazy), self.shape, self.dtype, self.placement),
-      catch: (error) => caughtTensorError(op, error)
-    })
-  })
+  graphTry(op, () => ({
+    request: request(self),
+    shape: self.shape,
+    dtype: self.dtype,
+    placement: self.placement
+  }))
 
 const normalizeDim = (op: string, rank: number, dim: number): number => {
   const normalized = dim < 0 ? dim + rank : dim
@@ -369,7 +348,7 @@ const dualOptions = <O, R = Runtime.Runtime>(
   (self: Any, options?: O): Effect.Effect<Lazy, TensorError, R>
 } =>
   dual(
-    (args) => args.length === 2 || (args.length === 1 && args[0] !== undefined && TensorTypeId in (args[0] as object)),
+    (args) => args.length === 2 || (args.length === 1 && isTensorHandleValue(args[0])),
     impl
   )
 
@@ -383,22 +362,15 @@ export const zeros = (
   shape: ReadonlyArray<number>,
   options: TensorOptions = {}
 ): Effect.Effect<Lazy, TensorError, Runtime.Runtime> =>
-  Effect.gen(function*() {
-    const runtime = yield* Runtime.Runtime
-    return yield* Effect.try({
-      try: () => {
-        const validShape = validateShape("zeros", shape)
-        const dtype = options.dtype ?? "f32"
-        return makeLazy(
-          runtime.graph.zeros(validShape, dtype),
-          validShape,
-          dtype,
-          runtime.placement
-        )
-      },
-      catch: (error) =>
-        new TensorError({ op: "zeros", message: error instanceof Error ? error.message : String(error) })
-    })
+  graphTry("zeros", (runtime) => {
+    const validShape = validateShape("zeros", shape)
+    const dtype = options.dtype ?? "f32"
+    return {
+      request: { op: "zeros", inputs: [], attributes: { shape: validShape, dtype } },
+      shape: validShape,
+      dtype,
+      placement: runtime.placement
+    }
   })
 
 /**
@@ -411,21 +383,15 @@ export const ones = (
   shape: ReadonlyArray<number>,
   options: TensorOptions = {}
 ): Effect.Effect<Lazy, TensorError, Runtime.Runtime> =>
-  Effect.gen(function*() {
-    const runtime = yield* Runtime.Runtime
-    return yield* Effect.try({
-      try: () => {
-        const validShape = validateShape("ones", shape)
-        const dtype = options.dtype ?? "f32"
-        return makeLazy(
-          runtime.graph.ones(validShape, dtype),
-          validShape,
-          dtype,
-          runtime.placement
-        )
-      },
-      catch: (error) => new TensorError({ op: "ones", message: error instanceof Error ? error.message : String(error) })
-    })
+  graphTry("ones", (runtime) => {
+    const validShape = validateShape("ones", shape)
+    const dtype = options.dtype ?? "f32"
+    return {
+      request: { op: "ones", inputs: [], attributes: { shape: validShape, dtype } },
+      shape: validShape,
+      dtype,
+      placement: runtime.placement
+    }
   })
 
 /**
@@ -439,21 +405,15 @@ export const full = (
   value: number,
   options: TensorOptions = {}
 ): Effect.Effect<Lazy, TensorError, Runtime.Runtime> =>
-  Effect.gen(function*() {
-    const runtime = yield* Runtime.Runtime
-    return yield* Effect.try({
-      try: () => {
-        const validShape = validateShape("full", shape)
-        const dtype = options.dtype ?? "f32"
-        return makeLazy(
-          runtime.graph.full(validShape, value, dtype),
-          validShape,
-          dtype,
-          runtime.placement
-        )
-      },
-      catch: (error) => new TensorError({ op: "full", message: error instanceof Error ? error.message : String(error) })
-    })
+  graphTry("full", (runtime) => {
+    const validShape = validateShape("full", shape)
+    const dtype = options.dtype ?? "f32"
+    return {
+      request: { op: "full", inputs: [], attributes: { shape: validShape, value, dtype } },
+      shape: validShape,
+      dtype,
+      placement: runtime.placement
+    }
   })
 
 /**
@@ -467,22 +427,15 @@ export const randn = (
   shape: ReadonlyArray<number>,
   options: { readonly dtype?: "f32" | "f64" | "f16" | "bf16" } = {}
 ): Effect.Effect<Lazy, TensorError, Runtime.Runtime> =>
-  Effect.gen(function*() {
-    const runtime = yield* Runtime.Runtime
-    return yield* Effect.try({
-      try: () => {
-        const validShape = validateShape("randn", shape)
-        const dtype = options.dtype ?? "f32"
-        return makeLazy(
-          runtime.graph.randn(validShape, dtype),
-          validShape,
-          dtype,
-          runtime.placement
-        )
-      },
-      catch: (error) =>
-        new TensorError({ op: "randn", message: error instanceof Error ? error.message : String(error) })
-    })
+  graphTry("randn", (runtime) => {
+    const validShape = validateShape("randn", shape)
+    const dtype = options.dtype ?? "f32"
+    return {
+      request: { op: "randn", inputs: [], attributes: { shape: validShape, dtype } },
+      shape: validShape,
+      dtype,
+      placement: runtime.placement
+    }
   })
 
 /**
@@ -497,22 +450,19 @@ export const uniform = (
   shape: ReadonlyArray<number>,
   options: { readonly min?: number; readonly max?: number; readonly dtype?: "f32" | "f64" | "f16" | "bf16" } = {}
 ): Effect.Effect<Lazy, TensorError, Runtime.Runtime> =>
-  Effect.gen(function*() {
-    const runtime = yield* Runtime.Runtime
-    return yield* Effect.try({
-      try: () => {
-        const validShape = validateShape("uniform", shape)
-        const dtype = options.dtype ?? "f32"
-        return makeLazy(
-          runtime.graph.uniform(validShape, options.min ?? 0, options.max ?? 1, dtype),
-          validShape,
-          dtype,
-          runtime.placement
-        )
+  graphTry("uniform", (runtime) => {
+    const validShape = validateShape("uniform", shape)
+    const dtype = options.dtype ?? "f32"
+    return {
+      request: {
+        op: "uniform",
+        inputs: [],
+        attributes: { shape: validShape, lo: options.min ?? 0, hi: options.max ?? 1, dtype }
       },
-      catch: (error) =>
-        new TensorError({ op: "uniform", message: error instanceof Error ? error.message : String(error) })
-    })
+      shape: validShape,
+      dtype,
+      placement: runtime.placement
+    }
   })
 
 /**
@@ -563,25 +513,18 @@ export const arange = (
   end?: number,
   options: { readonly step?: number; readonly dtype?: DType } = {}
 ): Effect.Effect<Lazy, TensorError, Runtime.Runtime> =>
-  Effect.gen(function*() {
-    const runtime = yield* Runtime.Runtime
-    return yield* Effect.try({
-      try: () => {
-        const from = end === undefined ? 0 : start
-        const to = end === undefined ? start : end
-        const step = options.step ?? 1
-        const size = Math.max(0, Math.ceil((to - from) / step))
-        const dtype = options.dtype ?? "f32"
-        return makeLazy(
-          runtime.graph.arange(from, to, step, dtype),
-          [size],
-          dtype,
-          runtime.placement
-        )
-      },
-      catch: (error) =>
-        new TensorError({ op: "arange", message: error instanceof Error ? error.message : String(error) })
-    })
+  graphTry("arange", (runtime) => {
+    const from = end === undefined ? 0 : start
+    const to = end === undefined ? start : end
+    const step = options.step ?? 1
+    const size = Math.max(0, Math.ceil((to - from) / step))
+    const dtype = options.dtype ?? "f32"
+    return {
+      request: { op: "arange", inputs: [], attributes: { start: from, end: to, step, dtype } },
+      shape: [size],
+      dtype,
+      placement: runtime.placement
+    }
   })
 
 /**
@@ -594,22 +537,16 @@ export const eye = (
   n: number,
   options: TensorOptions = {}
 ): Effect.Effect<Lazy, TensorError, Runtime.Runtime> =>
-  Effect.gen(function*() {
-    const runtime = yield* Runtime.Runtime
-    return yield* Effect.try({
-      try: () => {
-        const [size] = validateShape("eye", [n])
-        if (size === 0) throw new Error("eye: n must be positive")
-        const dtype = options.dtype ?? "f32"
-        return makeLazy(
-          runtime.graph.eye(size, dtype),
-          [size, size],
-          dtype,
-          runtime.placement
-        )
-      },
-      catch: (error) => new TensorError({ op: "eye", message: error instanceof Error ? error.message : String(error) })
-    })
+  graphTry("eye", (runtime) => {
+    const [size] = validateShape("eye", [n])
+    if (size === 0) throw new Error("eye: n must be positive")
+    const dtype = options.dtype ?? "f32"
+    return {
+      request: { op: "eye", inputs: [], attributes: { n: size, dtype } },
+      shape: [size, size],
+      dtype,
+      placement: runtime.placement
+    }
   })
 
 const dtypeOfTypedArray = (data: TypedArray): DType => {
@@ -633,32 +570,22 @@ export const fromTypedArray = (
   data: TypedArray,
   shape?: ReadonlyArray<number>
 ): Effect.Effect<Lazy, TensorError, Runtime.Runtime> =>
-  Effect.gen(function*() {
-    const runtime = yield* Runtime.Runtime
-    return yield* Effect.try({
-      try: () => {
-        const dtype = dtypeOfTypedArray(data)
-        const validShape = shape === undefined ? [data.length] : validateShape("fromTypedArray", shape)
-        if (numel(validShape) !== data.length) {
-          throw new Error(
-            `fromTypedArray: data length ${data.length} does not match shape [${validShape}]`
-          )
-        }
-        const bytes = new Uint8Array(data.byteLength)
-        bytes.set(new Uint8Array(data.buffer, data.byteOffset, data.byteLength))
-        return makeLazy(
-          runtime.graph.fromBytes(bytes, validShape, dtype),
-          validShape,
-          dtype,
-          runtime.placement
-        )
-      },
-      catch: (error) =>
-        new TensorError({
-          op: "fromTypedArray",
-          message: error instanceof Error ? error.message : String(error)
-        })
-    })
+  graphTry("fromTypedArray", (runtime) => {
+    const dtype = dtypeOfTypedArray(data)
+    const validShape = shape === undefined ? [data.length] : validateShape("fromTypedArray", shape)
+    if (numel(validShape) !== data.length) {
+      throw new Error(
+        `fromTypedArray: data length ${data.length} does not match shape [${validShape}]`
+      )
+    }
+    const bytes = new Uint8Array(data.byteLength)
+    bytes.set(new Uint8Array(data.buffer, data.byteOffset, data.byteLength))
+    return {
+      request: { op: "fromBytes", inputs: [], attributes: { data: bytes, shape: validShape, dtype } },
+      shape: validShape,
+      dtype,
+      placement: runtime.placement
+    }
   })
 
 /**
@@ -668,15 +595,12 @@ export const fromTypedArray = (
  * @category constructors
  */
 export const zerosLike = (self: Any): Effect.Effect<Lazy, TensorError, Runtime.Runtime> =>
-  Effect.gen(function*() {
-    const runtime = yield* Runtime.Runtime
-    yield* fromBackend("zerosLike", runtime.validateGraph([self.lazy]))
-    return yield* Effect.try({
-      try: () => makeLazy(runtime.graph.zeros([...self.shape], self.dtype), self.shape, self.dtype, runtime.placement),
-      catch: (error) =>
-        new TensorError({ op: "zerosLike", message: error instanceof Error ? error.message : String(error) })
-    })
-  })
+  graphTry("zerosLike", (runtime) => ({
+    request: { op: "zeros", inputs: [self], attributes: { shape: [...self.shape], dtype: self.dtype } },
+    shape: self.shape,
+    dtype: self.dtype,
+    placement: runtime.placement
+  }))
 
 /**
  * Creates a lazy tensor of ones with the same shape and dtype as the input.
@@ -685,15 +609,12 @@ export const zerosLike = (self: Any): Effect.Effect<Lazy, TensorError, Runtime.R
  * @category constructors
  */
 export const onesLike = (self: Any): Effect.Effect<Lazy, TensorError, Runtime.Runtime> =>
-  Effect.gen(function*() {
-    const runtime = yield* Runtime.Runtime
-    yield* fromBackend("onesLike", runtime.validateGraph([self.lazy]))
-    return yield* Effect.try({
-      try: () => makeLazy(runtime.graph.ones([...self.shape], self.dtype), self.shape, self.dtype, runtime.placement),
-      catch: (error) =>
-        new TensorError({ op: "onesLike", message: error instanceof Error ? error.message : String(error) })
-    })
-  })
+  graphTry("onesLike", (runtime) => ({
+    request: { op: "ones", inputs: [self], attributes: { shape: [...self.shape], dtype: self.dtype } },
+    shape: self.shape,
+    dtype: self.dtype,
+    placement: runtime.placement
+  }))
 
 /**
  * Creates a lazy tensor filled with `value`, with the same shape and dtype
@@ -706,16 +627,12 @@ export const fullLike = (
   self: Any,
   value: number
 ): Effect.Effect<Lazy, TensorError, Runtime.Runtime> =>
-  Effect.gen(function*() {
-    const runtime = yield* Runtime.Runtime
-    yield* fromBackend("fullLike", runtime.validateGraph([self.lazy]))
-    return yield* Effect.try({
-      try: () =>
-        makeLazy(runtime.graph.full([...self.shape], value, self.dtype), self.shape, self.dtype, runtime.placement),
-      catch: (error) =>
-        new TensorError({ op: "fullLike", message: error instanceof Error ? error.message : String(error) })
-    })
-  })
+  graphTry("fullLike", (runtime) => ({
+    request: { op: "full", inputs: [self], attributes: { shape: [...self.shape], value, dtype: self.dtype } },
+    shape: self.shape,
+    dtype: self.dtype,
+    placement: runtime.placement
+  }))
 
 /**
  * Returns the shape of a tensor.
@@ -748,7 +665,7 @@ export const device = (self: Any): string => self.device
  * @since 0.1.0
  * @category elementwise
  */
-export const add = binaryOp("add", (a, b) => a.add(b))
+export const add = binaryOp("add", (a, b) => ({ op: "add", inputs: [a, b] }))
 
 /**
  * Elementwise subtraction with broadcasting.
@@ -756,7 +673,7 @@ export const add = binaryOp("add", (a, b) => a.add(b))
  * @since 0.1.0
  * @category elementwise
  */
-export const sub = binaryOp("sub", (a, b) => a.sub(b))
+export const sub = binaryOp("sub", (a, b) => ({ op: "sub", inputs: [a, b] }))
 
 /**
  * Elementwise multiplication with broadcasting.
@@ -764,7 +681,7 @@ export const sub = binaryOp("sub", (a, b) => a.sub(b))
  * @since 0.1.0
  * @category elementwise
  */
-export const mul = binaryOp("mul", (a, b) => a.mul(b))
+export const mul = binaryOp("mul", (a, b) => ({ op: "mul", inputs: [a, b] }))
 
 /**
  * Elementwise division with broadcasting.
@@ -772,7 +689,7 @@ export const mul = binaryOp("mul", (a, b) => a.mul(b))
  * @since 0.1.0
  * @category elementwise
  */
-export const div = binaryOp("div", (a, b) => a.div(b))
+export const div = binaryOp("div", (a, b) => ({ op: "div", inputs: [a, b] }))
 
 /**
  * Elementwise maximum of two tensors with broadcasting. At equal elements
@@ -782,7 +699,7 @@ export const div = binaryOp("div", (a, b) => a.div(b))
  * @since 0.1.0
  * @category elementwise
  */
-export const maximum = binaryOp("maximum", (a, b) => a.maximum(b))
+export const maximum = binaryOp("maximum", (a, b) => ({ op: "maximum", inputs: [a, b] }))
 
 /**
  * Elementwise minimum of two tensors with broadcasting. At equal elements
@@ -792,7 +709,7 @@ export const maximum = binaryOp("maximum", (a, b) => a.maximum(b))
  * @since 0.1.0
  * @category elementwise
  */
-export const minimum = binaryOp("minimum", (a, b) => a.minimum(b))
+export const minimum = binaryOp("minimum", (a, b) => ({ op: "minimum", inputs: [a, b] }))
 
 /**
  * Elementwise equality comparison with broadcasting. Returns a `u8` tensor.
@@ -800,7 +717,7 @@ export const minimum = binaryOp("minimum", (a, b) => a.minimum(b))
  * @since 0.1.0
  * @category elementwise
  */
-export const eq = binaryOp("eq", (a, b) => a.eq(b), () => "u8")
+export const eq = binaryOp("eq", (a, b) => ({ op: "eq", inputs: [a, b] }), () => "u8")
 
 /**
  * Elementwise greater-than comparison with broadcasting. Returns a `u8` tensor.
@@ -808,7 +725,7 @@ export const eq = binaryOp("eq", (a, b) => a.eq(b), () => "u8")
  * @since 0.1.0
  * @category elementwise
  */
-export const gt = binaryOp("gt", (a, b) => a.gt(b), () => "u8")
+export const gt = binaryOp("gt", (a, b) => ({ op: "gt", inputs: [a, b] }), () => "u8")
 
 /**
  * Elementwise less-than comparison with broadcasting. Returns a `u8` tensor.
@@ -816,7 +733,7 @@ export const gt = binaryOp("gt", (a, b) => a.gt(b), () => "u8")
  * @since 0.1.0
  * @category elementwise
  */
-export const lt = binaryOp("lt", (a, b) => a.lt(b), () => "u8")
+export const lt = binaryOp("lt", (a, b) => ({ op: "lt", inputs: [a, b] }), () => "u8")
 
 /**
  * Elementwise greater-than-or-equal comparison with broadcasting. Returns a
@@ -825,7 +742,7 @@ export const lt = binaryOp("lt", (a, b) => a.lt(b), () => "u8")
  * @since 0.1.0
  * @category elementwise
  */
-export const ge = binaryOp("ge", (a, b) => a.ge(b), () => "u8")
+export const ge = binaryOp("ge", (a, b) => ({ op: "ge", inputs: [a, b] }), () => "u8")
 
 /**
  * Elementwise less-than-or-equal comparison with broadcasting. Returns a `u8`
@@ -834,7 +751,7 @@ export const ge = binaryOp("ge", (a, b) => a.ge(b), () => "u8")
  * @since 0.1.0
  * @category elementwise
  */
-export const le = binaryOp("le", (a, b) => a.le(b), () => "u8")
+export const le = binaryOp("le", (a, b) => ({ op: "le", inputs: [a, b] }), () => "u8")
 
 /**
  * Elementwise negation.
@@ -842,7 +759,7 @@ export const le = binaryOp("le", (a, b) => a.le(b), () => "u8")
  * @since 0.1.0
  * @category elementwise
  */
-export const neg = unaryOp("neg", (a) => a.neg())
+export const neg = unaryOp("neg", (a) => ({ op: "neg", inputs: [a] }))
 
 /**
  * Elementwise absolute value.
@@ -850,7 +767,7 @@ export const neg = unaryOp("neg", (a) => a.neg())
  * @since 0.1.0
  * @category elementwise
  */
-export const abs = unaryOp("abs", (a) => a.abs())
+export const abs = unaryOp("abs", (a) => ({ op: "abs", inputs: [a] }))
 
 /**
  * Elementwise square root.
@@ -858,7 +775,7 @@ export const abs = unaryOp("abs", (a) => a.abs())
  * @since 0.1.0
  * @category elementwise
  */
-export const sqrt = unaryOp("sqrt", (a) => a.sqrt())
+export const sqrt = unaryOp("sqrt", (a) => ({ op: "sqrt", inputs: [a] }))
 
 /**
  * Elementwise exponential.
@@ -866,7 +783,7 @@ export const sqrt = unaryOp("sqrt", (a) => a.sqrt())
  * @since 0.1.0
  * @category elementwise
  */
-export const exp = unaryOp("exp", (a) => a.exp())
+export const exp = unaryOp("exp", (a) => ({ op: "exp", inputs: [a] }))
 
 /**
  * Elementwise natural logarithm.
@@ -874,7 +791,7 @@ export const exp = unaryOp("exp", (a) => a.exp())
  * @since 0.1.0
  * @category elementwise
  */
-export const log = unaryOp("log", (a) => a.log())
+export const log = unaryOp("log", (a) => ({ op: "log", inputs: [a] }))
 
 /**
  * Elementwise sine.
@@ -882,7 +799,7 @@ export const log = unaryOp("log", (a) => a.log())
  * @since 0.1.0
  * @category elementwise
  */
-export const sin = unaryOp("sin", (a) => a.sin())
+export const sin = unaryOp("sin", (a) => ({ op: "sin", inputs: [a] }))
 
 /**
  * Elementwise cosine.
@@ -890,7 +807,7 @@ export const sin = unaryOp("sin", (a) => a.sin())
  * @since 0.1.0
  * @category elementwise
  */
-export const cos = unaryOp("cos", (a) => a.cos())
+export const cos = unaryOp("cos", (a) => ({ op: "cos", inputs: [a] }))
 
 /**
  * Elementwise hyperbolic tangent.
@@ -898,7 +815,7 @@ export const cos = unaryOp("cos", (a) => a.cos())
  * @since 0.1.0
  * @category elementwise
  */
-export const tanh = unaryOp("tanh", (a) => a.tanh())
+export const tanh = unaryOp("tanh", (a) => ({ op: "tanh", inputs: [a] }))
 
 /**
  * Elementwise rectified linear unit, `max(x, 0)`. The gradient at `x = 0`
@@ -907,7 +824,7 @@ export const tanh = unaryOp("tanh", (a) => a.tanh())
  * @since 0.1.0
  * @category elementwise
  */
-export const relu = unaryOp("relu", (a) => a.relu())
+export const relu = unaryOp("relu", (a) => ({ op: "relu", inputs: [a] }))
 
 /**
  * Elementwise error function.
@@ -915,7 +832,7 @@ export const relu = unaryOp("relu", (a) => a.relu())
  * @since 0.1.0
  * @category elementwise
  */
-export const erf = unaryOp("erf", (a) => a.erf())
+export const erf = unaryOp("erf", (a) => ({ op: "erf", inputs: [a] }))
 
 /**
  * Elementwise floor. The gradient is `0` almost everywhere.
@@ -923,7 +840,7 @@ export const erf = unaryOp("erf", (a) => a.erf())
  * @since 0.1.0
  * @category elementwise
  */
-export const floor = unaryOp("floor", (a) => a.floor())
+export const floor = unaryOp("floor", (a) => ({ op: "floor", inputs: [a] }))
 
 /**
  * Elementwise ceiling. The gradient is `0` almost everywhere.
@@ -931,7 +848,7 @@ export const floor = unaryOp("floor", (a) => a.floor())
  * @since 0.1.0
  * @category elementwise
  */
-export const ceil = unaryOp("ceil", (a) => a.ceil())
+export const ceil = unaryOp("ceil", (a) => ({ op: "ceil", inputs: [a] }))
 
 /**
  * Elementwise rounding to the nearest integer. The gradient is `0` almost
@@ -940,7 +857,7 @@ export const ceil = unaryOp("ceil", (a) => a.ceil())
  * @since 0.1.0
  * @category elementwise
  */
-export const round = unaryOp("round", (a) => a.round())
+export const round = unaryOp("round", (a) => ({ op: "round", inputs: [a] }))
 
 /**
  * Elementwise sign: `-1`, `0` or `1`. The gradient is `0` everywhere.
@@ -948,7 +865,7 @@ export const round = unaryOp("round", (a) => a.round())
  * @since 0.1.0
  * @category elementwise
  */
-export const sign = unaryOp("sign", (a) => a.sign())
+export const sign = unaryOp("sign", (a) => ({ op: "sign", inputs: [a] }))
 
 /**
  * Elementwise square, `x * x`.
@@ -1082,7 +999,7 @@ export const ne: {
  * @since 0.1.0
  * @category elementwise
  */
-export const logicalAnd = binaryOp("logicalAnd", (a, b) => a.minimum(b))
+export const logicalAnd = binaryOp("logicalAnd", (a, b) => ({ op: "minimum", inputs: [a, b] }))
 
 /**
  * Elementwise logical OR on `u8` tensors with broadcasting.
@@ -1090,7 +1007,7 @@ export const logicalAnd = binaryOp("logicalAnd", (a, b) => a.minimum(b))
  * @since 0.1.0
  * @category elementwise
  */
-export const logicalOr = binaryOp("logicalOr", (a, b) => a.maximum(b))
+export const logicalOr = binaryOp("logicalOr", (a, b) => ({ op: "maximum", inputs: [a, b] }))
 
 /**
  * Elementwise logical NOT on a `u8` tensor: `0` becomes `1`, everything
@@ -1135,7 +1052,7 @@ export const where: {
 } = dual(
   3,
   (cond: Any, a: Any, b: Any): Effect.Effect<Lazy, TensorError, Runtime.Runtime> =>
-    graphTry("where", [cond, a, b], () => {
+    graphTry("where", () => {
       if (cond.dtype !== "u8") {
         throw new Error(`where: condition must be u8, got ${cond.dtype}`)
       }
@@ -1148,7 +1065,12 @@ export const where: {
         broadcastShapes("where", cond.shape, a.shape),
         b.shape
       )
-      return makeLazy(cond.lazy.whereCond(a.lazy, b.lazy), shape, a.dtype, a.placement)
+      return {
+        request: { op: "whereCond", inputs: [cond, a, b] },
+        shape,
+        dtype: a.dtype,
+        placement: a.placement
+      }
     })
 )
 
@@ -1231,7 +1153,7 @@ export const scaledDotProductAttention = (
   v: Any,
   options: ScaledDotProductAttentionOptions = {}
 ): Effect.Effect<Lazy, TensorError, Runtime.Runtime> =>
-  graphTry("scaledDotProductAttention", [q, k, v], () => {
+  graphTry("scaledDotProductAttention", () => {
     const op = "scaledDotProductAttention"
     const rank = q.shape.length
     if (rank < 2 || k.shape.length !== rank || v.shape.length !== rank) {
@@ -1264,12 +1186,16 @@ export const scaledDotProductAttention = (
       throw new Error(`${op}: q, k and v must use the same placement`)
     }
     const scale = options.scale ?? 1 / Math.sqrt(q.shape[rank - 1])
-    return makeLazy(
-      q.lazy.scaledDotProductAttention(k.lazy, v.lazy, scale, options.causal ?? false),
-      [...q.shape.slice(0, -1), v.shape[rank - 1]],
-      q.dtype,
-      q.placement
-    )
+    return {
+      request: {
+        op: "scaledDotProductAttention",
+        inputs: [q, k, v],
+        attributes: { scale, causal: options.causal ?? false }
+      },
+      shape: [...q.shape.slice(0, -1), v.shape[rank - 1]],
+      dtype: q.dtype,
+      placement: q.placement
+    }
   })
 
 /**
@@ -1368,11 +1294,16 @@ export interface GeluOptions {
  */
 export const gelu = dualOptions(
   (self: Any, options: GeluOptions = {}): Effect.Effect<Lazy, TensorError, Runtime.Runtime> =>
-    graphTry(
-      "gelu",
-      [self],
-      () => makeLazy(self.lazy.gelu(options.approximate === "tanh"), self.shape, self.dtype, self.placement)
-    )
+    graphTry("gelu", () => ({
+      request: {
+        op: "gelu",
+        inputs: [self],
+        attributes: { approximate: options.approximate === "tanh" }
+      },
+      shape: self.shape,
+      dtype: self.dtype,
+      placement: self.placement
+    }))
 )
 
 /**
@@ -1489,7 +1420,12 @@ export const pow: {
 } = dual(
   2,
   (self: Any, exponent: number): Effect.Effect<Lazy, TensorError, Runtime.Runtime> =>
-    graphTry("pow", [self], () => makeLazy(self.lazy.pow(exponent), self.shape, self.dtype, self.placement))
+    graphTry("pow", () => ({
+      request: { op: "pow", inputs: [self], attributes: { exponent } },
+      shape: self.shape,
+      dtype: self.dtype,
+      placement: self.placement
+    }))
 )
 
 /**
@@ -1505,14 +1441,14 @@ export const matmul: {
 } = dual(
   2,
   (self: Any, other: Any): Effect.Effect<Lazy, TensorError, Runtime.Runtime> =>
-    graphTry("matmul", [self, other], () => {
+    graphTry("matmul", () => {
       checkCompatible("matmul", self, other)
-      return makeLazy(
-        self.lazy.matmul(other.lazy),
-        matmulShape(self.shape, other.shape),
-        self.dtype,
-        self.placement
-      )
+      return {
+        request: { op: "matmul", inputs: [self, other] },
+        shape: matmulShape(self.shape, other.shape),
+        dtype: self.dtype,
+        placement: self.placement
+      }
     })
 )
 
@@ -1557,31 +1493,24 @@ const reducedShape = (
 
 const reduceOp = (
   op: string,
-  native: (a: Runtime.GraphHandle, dims: Array<number>, keepdims: boolean) => Runtime.GraphHandle
+  request: (a: Runtime.TensorHandle, dims: ReadonlyArray<number>, keepdims: boolean) => Runtime.NodeRequest
 ): {
   (options?: ReduceOptions): (self: Any) => Effect.Effect<Lazy, TensorError, Runtime.Runtime>
   (self: Any, options?: ReduceOptions): Effect.Effect<Lazy, TensorError, Runtime.Runtime>
 } =>
   dual(
-    (args) => args.length === 2 || (args.length === 1 && args[0] !== undefined && TensorTypeId in (args[0] as object)),
+    (args) => args.length === 2 || (args.length === 1 && isTensorHandleValue(args[0])),
     (self: Any, options: ReduceOptions = {}): Effect.Effect<Lazy, TensorError, Runtime.Runtime> =>
-      Effect.gen(function*() {
-        const runtime = yield* Runtime.Runtime
-        yield* validateTensors(runtime, op, [self])
-        return yield* Effect.try({
-          try: () => {
-            const dims = options.dims ?? self.shape.map((_, i) => i)
-            const keepdims = options.keepdims ?? false
-            const normalized = normalizeDims(op, self.shape.length, dims)
-            return makeLazy(
-              native(self.lazy, normalized, keepdims),
-              reducedShape(op, self.shape, dims, keepdims),
-              self.dtype,
-              self.placement
-            )
-          },
-          catch: (error) => caughtTensorError(op, error)
-        })
+      graphTry(op, () => {
+        const dims = options.dims ?? self.shape.map((_, i) => i)
+        const keepdims = options.keepdims ?? false
+        const normalized = normalizeDims(op, self.shape.length, dims)
+        return {
+          request: request(self, normalized, keepdims),
+          shape: reducedShape(op, self.shape, dims, keepdims),
+          dtype: self.dtype,
+          placement: self.placement
+        }
       })
   )
 
@@ -1592,7 +1521,11 @@ const reduceOp = (
  * @since 0.1.0
  * @category reductions
  */
-export const sum = reduceOp("sum", (a, dims, keepdims) => a.sum(dims, keepdims))
+export const sum = reduceOp("sum", (self, dims, keepdims) => ({
+  op: "sum",
+  inputs: [self],
+  attributes: { dims, keepdims }
+}))
 
 /**
  * Computes the mean of a tensor over the given dimensions (all of them by
@@ -1601,7 +1534,11 @@ export const sum = reduceOp("sum", (a, dims, keepdims) => a.sum(dims, keepdims))
  * @since 0.1.0
  * @category reductions
  */
-export const mean = reduceOp("mean", (a, dims, keepdims) => a.mean(dims, keepdims))
+export const mean = reduceOp("mean", (self, dims, keepdims) => ({
+  op: "mean",
+  inputs: [self],
+  attributes: { dims, keepdims }
+}))
 
 /**
  * Computes the maximum of a tensor over the given dimensions (all of them by
@@ -1610,7 +1547,11 @@ export const mean = reduceOp("mean", (a, dims, keepdims) => a.mean(dims, keepdim
  * @since 0.1.0
  * @category reductions
  */
-export const max = reduceOp("max", (a, dims, keepdims) => a.max(dims, keepdims))
+export const max = reduceOp("max", (self, dims, keepdims) => ({
+  op: "max",
+  inputs: [self],
+  attributes: { dims, keepdims }
+}))
 
 /**
  * Computes the minimum of a tensor over the given dimensions (all of them by
@@ -1619,7 +1560,11 @@ export const max = reduceOp("max", (a, dims, keepdims) => a.max(dims, keepdims))
  * @since 0.1.0
  * @category reductions
  */
-export const min = reduceOp("min", (a, dims, keepdims) => a.min(dims, keepdims))
+export const min = reduceOp("min", (self, dims, keepdims) => ({
+  op: "min",
+  inputs: [self],
+  attributes: { dims, keepdims }
+}))
 
 /**
  * Returns the indices of the maximum values along `dim` as an `i64` tensor,
@@ -1634,14 +1579,14 @@ export const argmax: {
 } = dual(
   2,
   (self: Any, dim: number): Effect.Effect<Lazy, TensorError, Runtime.Runtime> =>
-    graphTry("argmax", [self], () => {
+    graphTry("argmax", () => {
       const d = normalizeDim("argmax", self.shape.length, dim)
-      return makeLazy(
-        self.lazy.argmax(d),
-        self.shape.filter((_, i) => i !== d),
-        "i64",
-        self.placement
-      )
+      return {
+        request: { op: "argmax", inputs: [self], attributes: { dim: d } },
+        shape: self.shape.filter((_, i) => i !== d),
+        dtype: "i64",
+        placement: self.placement
+      }
     })
 )
 
@@ -1658,14 +1603,14 @@ export const argmin: {
 } = dual(
   2,
   (self: Any, dim: number): Effect.Effect<Lazy, TensorError, Runtime.Runtime> =>
-    graphTry("argmin", [self], () => {
+    graphTry("argmin", () => {
       const d = normalizeDim("argmin", self.shape.length, dim)
-      return makeLazy(
-        self.lazy.argmin(d),
-        self.shape.filter((_, i) => i !== d),
-        "i64",
-        self.placement
-      )
+      return {
+        request: { op: "argmin", inputs: [self], attributes: { dim: d } },
+        shape: self.shape.filter((_, i) => i !== d),
+        dtype: "i64",
+        placement: self.placement
+      }
     })
 )
 
@@ -1681,9 +1626,14 @@ export const cumsum: {
 } = dual(
   2,
   (self: Any, dim: number): Effect.Effect<Lazy, TensorError, Runtime.Runtime> =>
-    graphTry("cumsum", [self], () => {
+    graphTry("cumsum", () => {
       const d = normalizeDim("cumsum", self.shape.length, dim)
-      return makeLazy(self.lazy.cumsum(d), self.shape, self.dtype, self.placement)
+      return {
+        request: { op: "cumsum", inputs: [self], attributes: { dim: d } },
+        shape: self.shape,
+        dtype: self.dtype,
+        placement: self.placement
+      }
     })
 )
 
@@ -1848,7 +1798,11 @@ export const logsumexp = dualOptions(
  * @since 0.1.0
  * @category reductions
  */
-export const prod = reduceOp("prod", (a, dims, keepdims) => a.prod(dims, keepdims))
+export const prod = reduceOp("prod", (self, dims, keepdims) => ({
+  op: "prod",
+  inputs: [self],
+  attributes: { dims, keepdims }
+}))
 
 /**
  * Reshapes a tensor. The total number of elements must stay the same.
@@ -1862,7 +1816,7 @@ export const reshape: {
 } = dual(
   2,
   (self: Any, newShape: ReadonlyArray<number>): Effect.Effect<Lazy, TensorError, Runtime.Runtime> =>
-    graphTry("reshape", [self], () => {
+    graphTry("reshape", () => {
       const validShape = validateShape("reshape", newShape)
       if (numel(validShape) !== numel(self.shape)) {
         throw new Error(
@@ -1871,7 +1825,12 @@ export const reshape: {
           } elements)`
         )
       }
-      return makeLazy(self.lazy.reshape(validShape), validShape, self.dtype, self.placement)
+      return {
+        request: { op: "reshape", inputs: [self], attributes: { shape: validShape } },
+        shape: validShape,
+        dtype: self.dtype,
+        placement: self.placement
+      }
     })
 )
 
@@ -1888,7 +1847,7 @@ export const transpose: {
 } = dual(
   2,
   (self: Any, dims: ReadonlyArray<number>): Effect.Effect<Lazy, TensorError, Runtime.Runtime> =>
-    graphTry("transpose", [self], () => {
+    graphTry("transpose", () => {
       if (dims.length !== self.shape.length) {
         throw new Error(
           `transpose: expected ${self.shape.length} dimensions, got [${dims}]`
@@ -1905,7 +1864,12 @@ export const transpose: {
         throw new Error(`transpose: dims [${dims}] are not a permutation`)
       }
       const outShape = normalized.map((d) => self.shape[d])
-      return makeLazy(self.lazy.permute(normalized), outShape, self.dtype, self.placement)
+      return {
+        request: { op: "permute", inputs: [self], attributes: { dims: normalized } },
+        shape: outShape,
+        dtype: self.dtype,
+        placement: self.placement
+      }
     })
 )
 
@@ -1935,7 +1899,7 @@ export const slice: {
 } = dual(
   2,
   (self: Any, options: SliceOptions): Effect.Effect<Lazy, TensorError, Runtime.Runtime> =>
-    graphTry("slice", [self], () => {
+    graphTry("slice", () => {
       const rank = self.shape.length
       const ranges: Array<[number, number, number]> = []
       const outShape: Array<number> = []
@@ -1954,12 +1918,16 @@ export const slice: {
         ranges.push([start, stop, stride])
         outShape.push(len)
       }
-      return makeLazy(
-        self.lazy.slice(ranges.map((r) => [...r])),
-        outShape,
-        self.dtype,
-        self.placement
-      )
+      return {
+        request: {
+          op: "slice",
+          inputs: [self],
+          attributes: { ranges: ranges.map((range) => [...range]) }
+        },
+        shape: outShape,
+        dtype: self.dtype,
+        placement: self.placement
+      }
     })
 )
 
@@ -1975,30 +1943,38 @@ export const concat = (
   tensors: readonly [Any, Any, ...ReadonlyArray<Any>],
   options: { readonly dim?: number } = {}
 ): Effect.Effect<Lazy, TensorError, Runtime.Runtime> =>
-  graphTry("concat", tensors, () => {
+  Effect.gen(function*() {
     const [first, ...rest] = tensors
     const dim = options.dim ?? 0
     const rank = first.shape.length
     const axis = dim < 0 ? dim + rank : dim
     if (!Number.isInteger(axis) || axis < 0 || axis >= rank) {
-      throw new Error(`concat: dimension ${dim} out of range for rank ${rank}`)
+      return yield* new TensorError({
+        op: "concat",
+        message: `concat: dimension ${dim} out of range for rank ${rank}`
+      })
     }
-    let lazy = first.lazy
-    let outShape: ReadonlyArray<number> = first.shape
+    let out: Any = first
     for (const next of rest) {
-      checkCompatible("concat", first, next)
-      if (next.shape.length !== rank) {
-        throw new Error(`concat: rank mismatch, [${outShape}] vs [${next.shape}]`)
-      }
-      for (let i = 0; i < rank; i++) {
-        if (i !== axis && outShape[i] !== next.shape[i]) {
-          throw new Error(`concat: shape mismatch at dim ${i}, [${outShape}] vs [${next.shape}]`)
+      out = yield* graphTry("concat", () => {
+        checkCompatible("concat", first, next)
+        if (next.shape.length !== rank) {
+          throw new Error(`concat: rank mismatch, [${out.shape}] vs [${next.shape}]`)
         }
-      }
-      lazy = lazy.concat(next.lazy, axis)
-      outShape = outShape.map((d, i) => (i === axis ? d + next.shape[i] : d))
+        for (let i = 0; i < rank; i++) {
+          if (i !== axis && out.shape[i] !== next.shape[i]) {
+            throw new Error(`concat: shape mismatch at dim ${i}, [${out.shape}] vs [${next.shape}]`)
+          }
+        }
+        return {
+          request: { op: "concat", inputs: [out, next], attributes: { dim: axis } },
+          shape: out.shape.map((d, i) => (i === axis ? d + next.shape[i] : d)),
+          dtype: first.dtype,
+          placement: first.placement
+        }
+      })
     }
-    return makeLazy(lazy, outShape, first.dtype, first.placement)
+    return out as Lazy
   })
 
 /**
@@ -2015,7 +1991,7 @@ export const broadcastTo: {
 } = dual(
   2,
   (self: Any, target: ReadonlyArray<number>): Effect.Effect<Lazy, TensorError, Runtime.Runtime> =>
-    graphTry("broadcastTo", [self], () => {
+    graphTry("broadcastTo", () => {
       const validShape = validateShape("broadcastTo", target)
       if (validShape.length < self.shape.length) {
         throw new Error(`broadcastTo: cannot broadcast [${self.shape}] to lower rank [${validShape}]`)
@@ -2027,7 +2003,12 @@ export const broadcastTo: {
           throw new Error(`broadcastTo: cannot broadcast [${self.shape}] to [${validShape}]`)
         }
       }
-      return makeLazy(self.lazy.broadcastTo(validShape), validShape, self.dtype, self.placement)
+      return {
+        request: { op: "broadcastTo", inputs: [self], attributes: { shape: validShape } },
+        shape: validShape,
+        dtype: self.dtype,
+        placement: self.placement
+      }
     })
 )
 
@@ -2144,7 +2125,7 @@ export const stack = (
     for (const t of tensors) {
       expanded.push(yield* unsqueeze(t, d))
     }
-    return yield* concat(expanded as [Any, Any, ...Array<Any>], { dim: d })
+    return yield* concat(expanded as unknown as [Any, Any, ...Array<Any>], { dim: d })
   })
 
 /**
@@ -2310,13 +2291,13 @@ export const take: {
     options?: { readonly dim?: number }
   ): Effect.Effect<Lazy, TensorError, Runtime.Runtime>
 } = dual(
-  (args) => args.length === 3 || (args.length === 2 && TensorTypeId in (args[1] as object)),
+  (args) => args.length === 3 || (args.length === 2 && isTensorHandleValue(args[1])),
   (
     self: Any,
     indexes: Any,
     options: { readonly dim?: number } = {}
   ): Effect.Effect<Lazy, TensorError, Runtime.Runtime> =>
-    graphTry("take", [self, indexes], () => {
+    graphTry("take", () => {
       const d = normalizeDim("take", self.shape.length, options.dim ?? 0)
       if (indexes.dtype !== "i64" && indexes.dtype !== "u32") {
         throw new Error(`take: indexes must be i64 or u32, got ${indexes.dtype}`)
@@ -2329,7 +2310,12 @@ export const take: {
       }
       const outShape = [...self.shape]
       outShape[d] = indexes.shape[0]
-      return makeLazy(self.lazy.indexSelect(d, indexes.lazy), outShape, self.dtype, self.placement)
+      return {
+        request: { op: "indexSelect", inputs: [self, indexes], attributes: { dim: d } },
+        shape: outShape,
+        dtype: self.dtype,
+        placement: self.placement
+      }
     })
 )
 
@@ -2353,13 +2339,13 @@ export const gather: {
     options?: { readonly dim?: number }
   ): Effect.Effect<Lazy, TensorError, Runtime.Runtime>
 } = dual(
-  (args) => args.length === 3 || (args.length === 2 && TensorTypeId in (args[1] as object)),
+  (args) => args.length === 3 || (args.length === 2 && isTensorHandleValue(args[1])),
   (
     self: Any,
     indexes: Any,
     options: { readonly dim?: number } = {}
   ): Effect.Effect<Lazy, TensorError, Runtime.Runtime> =>
-    graphTry("gather", [self, indexes], () => {
+    graphTry("gather", () => {
       const d = normalizeDim("gather", self.shape.length, options.dim ?? 0)
       if (indexes.dtype !== "i64" && indexes.dtype !== "u32") {
         throw new Error(`gather: indexes must be i64 or u32, got ${indexes.dtype}`)
@@ -2379,7 +2365,12 @@ export const gather: {
       if (indexes.placement.id !== self.placement.id) {
         throw new Error("gather: indexes must use the same placement as the input")
       }
-      return makeLazy(self.lazy.gather(d, indexes.lazy), indexes.shape, self.dtype, self.placement)
+      return {
+        request: { op: "gather", inputs: [self, indexes], attributes: { dim: d } },
+        shape: indexes.shape,
+        dtype: self.dtype,
+        placement: self.placement
+      }
     })
 )
 
@@ -2397,7 +2388,7 @@ export const scatterAdd = (
   src: Any,
   options: { readonly dim?: number } = {}
 ): Effect.Effect<Lazy, TensorError, Runtime.Runtime> =>
-  graphTry("scatterAdd", [self, indexes, src], () => {
+  graphTry("scatterAdd", () => {
     const d = normalizeDim("scatterAdd", self.shape.length, options.dim ?? 0)
     if (indexes.dtype !== "i64" && indexes.dtype !== "u32") {
       throw new Error(`scatterAdd: indexes must be i64 or u32, got ${indexes.dtype}`)
@@ -2421,7 +2412,16 @@ export const scatterAdd = (
     if (indexes.placement.id !== self.placement.id) {
       throw new Error("scatterAdd: indexes must use the same placement as the input")
     }
-    return makeLazy(self.lazy.scatterAdd(d, indexes.lazy, src.lazy), self.shape, self.dtype, self.placement)
+    return {
+      request: {
+        op: "scatterAdd",
+        inputs: [self, indexes, src],
+        attributes: { dim: d }
+      },
+      shape: self.shape,
+      dtype: self.dtype,
+      placement: self.placement
+    }
   })
 
 /**
@@ -2499,7 +2499,7 @@ export const crossEntropy: {
   self: Any,
   options: { readonly target: Any; readonly ignoreIndex?: number }
 ): Effect.Effect<Lazy, TensorError, Runtime.Runtime> =>
-  graphTry("crossEntropy", [self, options.target], () => {
+  graphTry("crossEntropy", () => {
     const { target } = options
     const ignoreIndex = options.ignoreIndex ?? -100
     if (self.shape.length < 1) {
@@ -2523,7 +2523,16 @@ export const crossEntropy: {
     if (target.placement.id !== self.placement.id) {
       throw new Error("crossEntropy: target must use the same placement as logits")
     }
-    return makeLazy(self.lazy.crossEntropy(target.lazy, ignoreIndex), [], self.dtype, self.placement)
+    return {
+      request: {
+        op: "crossEntropy",
+        inputs: [self, target],
+        attributes: { ignoreIndex }
+      },
+      shape: [],
+      dtype: self.dtype,
+      placement: self.placement
+    }
   }))
 
 /**
@@ -2587,7 +2596,12 @@ export const embedding = (
         yield* reshape(yield* cast(yield* eq(flat, yield* constantLike(flat, paddingIndex)), weight.dtype), [n, 1]),
         [n, hidden]
       )
-      const stopped = makeLazy(out.lazy.stopGradient(), out.shape, out.dtype, out.placement)
+      const stopped = yield* graphTry("stopGradient", () => ({
+        request: { op: "stopGradient", inputs: [out] },
+        shape: out.shape,
+        dtype: out.dtype,
+        placement: out.placement
+      }))
       out = yield* add(yield* sub(out, yield* mul(mask, out)), yield* mul(mask, stopped))
     }
     return yield* reshape(out, [...indexes.shape, hidden])
@@ -2771,15 +2785,13 @@ export const conv2d: {
     options?: ConvOptions
   ): Effect.Effect<Lazy, TensorError, Runtime.Runtime>
 } = dual(
-  (args) => args.length === 3 || (args.length === 2 && TensorTypeId in (args[1] as object)),
+  (args) => args.length === 3 || (args.length === 2 && isTensorHandleValue(args[1])),
   (
     self: Any,
     weight: Any,
     options: ConvOptions = {}
   ): Effect.Effect<Lazy, TensorError, Runtime.Runtime> =>
     Effect.gen(function*() {
-      const runtime = yield* Runtime.Runtime
-      yield* validateTensors(runtime, "conv2d", [self, weight])
       const opts = yield* checkConvOptions("conv2d", self, weight, options, 2)
       yield* Effect.try({
         try: () => checkCompatible("conv2d", self, weight),
@@ -2802,17 +2814,16 @@ export const conv2d: {
       }
       const oh = yield* convOutDim("conv2d", self.shape[2], weight.shape[2], opts.stride, opts.padding, opts.dilation)
       const ow = yield* convOutDim("conv2d", self.shape[3], weight.shape[3], opts.stride, opts.padding, opts.dilation)
-      return yield* Effect.try({
-        try: () =>
-          makeLazy(
-            self.lazy.conv2d(weight.lazy, opts.stride, opts.padding, opts.dilation, opts.groups),
-            [self.shape[0], cOut, oh, ow],
-            self.dtype,
-            self.placement
-          ),
-        catch: (error) =>
-          new TensorError({ op: "conv2d", message: error instanceof Error ? error.message : String(error) })
-      })
+      return yield* graphTry("conv2d", () => ({
+        request: {
+          op: "conv2d",
+          inputs: [self, weight],
+          attributes: opts
+        },
+        shape: [self.shape[0], cOut, oh, ow],
+        dtype: self.dtype,
+        placement: self.placement
+      }))
     })
 )
 
@@ -2834,15 +2845,13 @@ export const conv1d: {
     options?: ConvOptions
   ): Effect.Effect<Lazy, TensorError, Runtime.Runtime>
 } = dual(
-  (args) => args.length === 3 || (args.length === 2 && TensorTypeId in (args[1] as object)),
+  (args) => args.length === 3 || (args.length === 2 && isTensorHandleValue(args[1])),
   (
     self: Any,
     weight: Any,
     options: ConvOptions = {}
   ): Effect.Effect<Lazy, TensorError, Runtime.Runtime> =>
     Effect.gen(function*() {
-      const runtime = yield* Runtime.Runtime
-      yield* validateTensors(runtime, "conv1d", [self, weight])
       const opts = yield* checkConvOptions("conv1d", self, weight, options, 1)
       yield* Effect.try({
         try: () => checkCompatible("conv1d", self, weight),
@@ -2864,17 +2873,16 @@ export const conv1d: {
         })
       }
       const ol = yield* convOutDim("conv1d", self.shape[2], weight.shape[2], opts.stride, opts.padding, opts.dilation)
-      return yield* Effect.try({
-        try: () =>
-          makeLazy(
-            self.lazy.conv1d(weight.lazy, opts.stride, opts.padding, opts.dilation, opts.groups),
-            [self.shape[0], cOut, ol],
-            self.dtype,
-            self.placement
-          ),
-        catch: (error) =>
-          new TensorError({ op: "conv1d", message: error instanceof Error ? error.message : String(error) })
-      })
+      return yield* graphTry("conv1d", () => ({
+        request: {
+          op: "conv1d",
+          inputs: [self, weight],
+          attributes: opts
+        },
+        shape: [self.shape[0], cOut, ol],
+        dtype: self.dtype,
+        placement: self.placement
+      }))
     })
 )
 
@@ -2987,7 +2995,7 @@ const convTranspose2dImpl = (
       for (let i = 0; i < groups; i++) {
         outs.push(yield* convGroup(xs[i], ws[i]))
       }
-      out = yield* concat(outs as [Any, Any, ...Array<Any>], { dim: 1 })
+      out = yield* concat(outs as unknown as [Any, Any, ...Array<Any>], { dim: 1 })
     }
     if (outputPads[0] > 0 || outputPads[1] > 0) {
       out = yield* pad(out, [[0, 0], [0, 0], [0, outputPads[0]], [0, outputPads[1]]])
@@ -3016,7 +3024,7 @@ export const convTranspose2d: {
     options?: ConvTransposeOptions
   ): Effect.Effect<Lazy, TensorError, Runtime.Runtime>
 } = dual(
-  (args) => args.length === 3 || (args.length === 2 && TensorTypeId in (args[1] as object)),
+  (args) => args.length === 3 || (args.length === 2 && isTensorHandleValue(args[1])),
   (
     self: Any,
     weight: Any,
@@ -3050,7 +3058,7 @@ export const convTranspose1d: {
     options?: ConvTransposeOptions
   ): Effect.Effect<Lazy, TensorError, Runtime.Runtime>
 } = dual(
-  (args) => args.length === 3 || (args.length === 2 && TensorTypeId in (args[1] as object)),
+  (args) => args.length === 3 || (args.length === 2 && isTensorHandleValue(args[1])),
   (
     self: Any,
     weight: Any,
@@ -3197,11 +3205,12 @@ const checkSquare = (op: string, self: Any): Effect.Effect<void, TensorError> =>
 export const inverse = (self: Any): Effect.Effect<Lazy, TensorError, Runtime.Runtime> =>
   Effect.gen(function*() {
     yield* checkSquare("inverse", self)
-    return yield* graphTry(
-      "inverse",
-      [self],
-      () => makeLazy(self.lazy.inverse(), self.shape, self.dtype, self.placement)
-    )
+    return yield* graphTry("inverse", () => ({
+      request: { op: "inverse", inputs: [self] },
+      shape: self.shape,
+      dtype: self.dtype,
+      placement: self.placement
+    }))
   })
 
 /**
@@ -3215,8 +3224,12 @@ export const inverse = (self: Any): Effect.Effect<Lazy, TensorError, Runtime.Run
 export const det = (self: Any): Effect.Effect<Lazy, TensorError, Runtime.Runtime> =>
   Effect.gen(function*() {
     yield* checkSquare("det", self)
-    return yield* graphTry("det", [self], () =>
-      makeLazy(self.lazy.det(), self.shape.slice(0, -2), self.dtype, self.placement))
+    return yield* graphTry("det", () => ({
+      request: { op: "det", inputs: [self] },
+      shape: self.shape.slice(0, -2),
+      dtype: self.dtype,
+      placement: self.placement
+    }))
   })
 
 /**
@@ -3254,8 +3267,12 @@ export const solve: {
         catch: (error) =>
           new TensorError({ op: "solve", message: error instanceof Error ? error.message : String(error) })
       })
-      return yield* graphTry("solve", [self, b], () =>
-        makeLazy(self.lazy.solve(b.lazy), b.shape, self.dtype, self.placement))
+      return yield* graphTry("solve", () => ({
+        request: { op: "solve", inputs: [self, b] },
+        shape: b.shape,
+        dtype: self.dtype,
+        placement: self.placement
+      }))
     })
 )
 
@@ -3273,7 +3290,12 @@ export const cast: {
 } = dual(
   2,
   (self: Any, dtype: DType): Effect.Effect<Lazy, TensorError, Runtime.Runtime> =>
-    graphTry("cast", [self], () => makeLazy(self.lazy.cast(dtype), self.shape, dtype, self.placement))
+    graphTry("cast", () => ({
+      request: { op: "cast", inputs: [self], attributes: { dtype } },
+      shape: self.shape,
+      dtype,
+      placement: self.placement
+    }))
 )
 /**
  * Evaluates one or more lazy tensors in a single graph walk, running the
@@ -3298,10 +3320,28 @@ export const compute = <Roots extends ReadonlyArray<Any>>(
       return [] as unknown as { readonly [K in keyof Roots]: Concrete }
     }
     const runtime = yield* Runtime.Runtime
-    yield* fromBackend("evaluate", runtime.validateGraph(roots.map((root) => root.lazy)))
-    if (roots.every(isTensor)) return roots as { readonly [K in keyof Roots]: Concrete }
-    const values = yield* fromBackend("evaluate", runtime.evaluate(roots.map((root) => root.lazy)))
-    return values.map((value) => fromHandle(runtime, value)) as { readonly [K in keyof Roots]: Concrete }
+    const values = yield* fromBackend("evaluate", runtime.evaluate(roots))
+    if (values.length !== roots.length) {
+      yield* releaseTensors(runtime, values)
+      return yield* new TensorError({
+        op: "evaluate",
+        message: `evaluate: backend returned ${values.length} tensors for ${roots.length} roots`
+      })
+    }
+    const checked = Effect.forEach(values, (value, index) =>
+      Effect.try({
+        try: () =>
+          validateTensorHandle("evaluate", runtime, value, {
+            _tag: "Tensor",
+            shape: roots[index].shape,
+            dtype: roots[index].dtype,
+            placement: roots[index].placement
+          }),
+        catch: (error) => caughtTensorError("evaluate", error)
+      }))
+    return (yield* preserveOnFailure(checked, releaseTensors(runtime, values))) as {
+      readonly [K in keyof Roots]: Concrete
+    }
   })
 
 const typedArrayConstructor = (dtype: DType) => {
@@ -3336,7 +3376,7 @@ const typedArrayConstructor = (dtype: DType) => {
 export const clear = (self: Concrete): Effect.Effect<void, TensorError, Runtime.Runtime> =>
   Effect.gen(function*() {
     const runtime = yield* Runtime.Runtime
-    yield* fromBackend("clear", runtime.releaseBuffer(self.materialized))
+    yield* fromBackend("clear", runtime.release(self))
   })
 
 /**
@@ -3349,9 +3389,9 @@ export const clear = (self: Concrete): Effect.Effect<void, TensorError, Runtime.
  */
 export const toTypedArray = (self: Any): Effect.Effect<TypedArray, TensorError, Runtime.Runtime> =>
   Effect.gen(function*() {
-    const [evaluated] = yield* compute([self])
     const runtime = yield* Runtime.Runtime
-    const buffer = yield* fromBackend("toTypedArray", runtime.readback(evaluated.materialized))
+    const evaluated = isTensor(self) ? self : (yield* compute([self]))[0]
+    const buffer = yield* fromBackend("toTypedArray", runtime.readback(evaluated))
     const Ctor = typedArrayConstructor(evaluated.dtype)
     return new Ctor(buffer)
   })
@@ -3373,26 +3413,59 @@ export const toNumberArray = (self: Any): Effect.Effect<Array<number>, TensorErr
     })
     : Effect.map(toTypedArray(self), (arr) => Array.from(arr as Float32Array | Float64Array | Uint8Array | Uint32Array))
 
+const validateMetadata = (op: string, metadata: Readonly<Record<string, string>>): Readonly<Record<string, string>> => {
+  if (typeof metadata !== "object" || metadata === null || Array.isArray(metadata)) {
+    throw new TensorError({ op, message: `${op}: metadata must be a record of strings` })
+  }
+  const output = Object.create(null) as Record<string, string>
+  for (const [key, value] of Object.entries(metadata)) {
+    if (typeof value !== "string") {
+      throw new TensorError({ op, message: `${op}: metadata ${JSON.stringify(key)} must be a string` })
+    }
+    output[key] = value
+  }
+  return Object.freeze(output)
+}
+
+const releaseTensors = (
+  runtime: Runtime.RuntimeService,
+  values: ReadonlyArray<Concrete>
+): Effect.Effect<void> => Effect.ignore(Effect.forEach(values, (value) => runtime.release(value), { discard: true }))
+
+const preserveOnFailure = <A, E, R>(
+  effect: Effect.Effect<A, E, R>,
+  cleanup: Effect.Effect<void>
+): Effect.Effect<A, E, R> => Effect.onExit(effect, (exit) => Exit.isFailure(exit) ? cleanup : Effect.void)
+
+/** Metadata accepted by direct safetensors file writes. */
+export interface SafetensorsOptions {
+  readonly metadata?: Readonly<Record<string, string>>
+}
+
+/** A direct safetensors archive with materialized runtime-owned tensors. */
+export interface SafetensorsArchive {
+  readonly tensors: Readonly<Record<string, Concrete>>
+  readonly metadata: Readonly<Record<string, string>>
+}
+
 /**
- * Saves tensors to a safetensors file. The tensors are evaluated and
- * serialized entirely on the native side — all entries share a single graph
- * walk (shared subgraphs are computed once, `randn` draws are consistent
- * across entries) and tensor data never crosses the JavaScript thread.
- * Interrupting the fiber aborts the native work.
+ * Saves tensors through the runtime's optional direct path. All entries are
+ * evaluated in one shared graph walk by backends that implement the extension.
  *
  * @since 0.1.0
  * @category destructors
  */
 export const save = (
   path: string,
-  tensors: Readonly<Record<string, Any>>
+  tensors: Readonly<Record<string, Any>>,
+  options: SafetensorsOptions = {}
 ): Effect.Effect<void, TensorError, Runtime.Runtime> => {
   const entries = Object.entries(tensors)
-  if (entries.length === 0) {
-    return new TensorError({ op: "save", message: "save: expected at least one tensor" })
+  if (entries.length === 0) return new TensorError({ op: "save", message: "save: expected at least one tensor" })
+  if (entries.some(([name]) => name === "__metadata__")) {
+    return new TensorError({ op: "save", message: "save: __metadata__ is reserved and cannot be a tensor name" })
   }
   return Effect.gen(function*() {
-    const roots = entries.map(([, tensor]) => tensor)
     const runtime = yield* Runtime.Runtime
     const extension = runtime.extensions.pathSafetensors
     if (extension === undefined) {
@@ -3401,37 +3474,87 @@ export const save = (
         message: `save: backend ${runtime.backend.name} does not support path-based safetensors`
       })
     }
+    const metadata = yield* Effect.try({
+      try: () => validateMetadata("save", options.metadata ?? {}),
+      catch: (error) => caughtTensorError("save", error)
+    })
     yield* fromBackend(
       "save",
-      extension.save(path, entries.map(([name]) => name), roots.map((tensor) => tensor.lazy))
+      extension.save(path, {
+        entries: entries.map(([name, tensor]) => ({ name, tensor })),
+        metadata
+      })
     )
   })
 }
 
-/**
- * Loads a safetensors file straight into materialized tensors on the
- * current device; the file is read and deserialized entirely on the native
- * side, so tensor data never crosses the JavaScript thread. Interrupting
- * the fiber aborts the native work.
- *
- * @since 0.1.0
- * @category constructors
- */
-export const load = (
+/** Loads tensors and archive metadata through the optional direct path. */
+export const loadArchive = (
   path: string
-): Effect.Effect<Record<string, Concrete>, TensorError, Runtime.Runtime> =>
+): Effect.Effect<SafetensorsArchive, TensorError, Runtime.Runtime> =>
   Effect.gen(function*() {
     const runtime = yield* Runtime.Runtime
     const extension = runtime.extensions.pathSafetensors
     if (extension === undefined) {
       return yield* new TensorError({
-        op: "load",
-        message: `load: backend ${runtime.backend.name} does not support path-based safetensors`
+        op: "loadArchive",
+        message: `loadArchive: backend ${runtime.backend.name} does not support path-based safetensors`
       })
     }
-    const values = yield* fromBackend("load", extension.load(path))
-    return Object.fromEntries(values.map(([name, value]) => [name, fromHandle(runtime, value)]))
+    const archive = yield* fromBackend("loadArchive", extension.load(path))
+    const candidates: Array<Concrete> = []
+    if (typeof archive === "object" && archive !== null && Array.isArray(archive.entries)) {
+      for (const entry of archive.entries) {
+        if (
+          typeof entry === "object" && entry !== null && typeof entry.tensor === "object" && entry.tensor !== null &&
+          entry.tensor._tag === "Tensor"
+        ) candidates.push(entry.tensor)
+      }
+    }
+    const checked = yield* preserveOnFailure(
+      Effect.try({
+        try: () => {
+          if (typeof archive !== "object" || archive === null || !Array.isArray(archive.entries)) {
+            throw new TensorError({ op: "loadArchive", message: "loadArchive: backend returned an invalid archive" })
+          }
+          const metadata = validateMetadata("loadArchive", archive.metadata)
+          const names = new Set<string>()
+          const tensors = Object.create(null) as Record<string, Concrete>
+          for (const entry of archive.entries) {
+            if (
+              typeof entry !== "object" || entry === null || typeof entry.name !== "string" ||
+              entry.name === "__metadata__" || names.has(entry.name)
+            ) {
+              throw new TensorError({
+                op: "loadArchive",
+                message: "loadArchive: backend returned invalid tensor names"
+              })
+            }
+            names.add(entry.name)
+            tensors[entry.name] = validateTensorHandle("loadArchive", runtime, entry.tensor, { _tag: "Tensor" })
+          }
+          return Object.freeze({ tensors: Object.freeze(tensors), metadata })
+        },
+        catch: (error) => caughtTensorError("loadArchive", error)
+      }),
+      releaseTensors(runtime, candidates)
+    )
+    return checked
   })
+
+/** Loads only the tensor record from {@link loadArchive}. */
+export const load = (
+  path: string
+): Effect.Effect<Readonly<Record<string, Concrete>>, TensorError, Runtime.Runtime> =>
+  Effect.map(loadArchive(path), (archive) => archive.tensors).pipe(
+    Effect.mapError((error) =>
+      new TensorError({
+        op: "load",
+        message: error.message,
+        ...(error.backend === undefined ? {} : { backend: error.backend })
+      })
+    )
+  )
 
 /**
  * Diagnostics over a compiled function's shape-keyed program cache: the
@@ -3633,21 +3756,16 @@ export const signatureOf = (inputs: ReadonlyArray<Any>, runtime: Runtime.Runtime
  * @category compilation
  */
 export const makeInput = (slot: number, exemplar: Any): Effect.Effect<Lazy, TensorError, Runtime.Runtime> =>
-  Effect.gen(function*() {
-    const runtime = yield* Runtime.Runtime
-    yield* fromBackend("input", runtime.validateGraph([exemplar.lazy]))
-    return yield* Effect.try({
-      try: () =>
-        makeLazy(
-          runtime.graph.input(slot, [...exemplar.shape], exemplar.dtype),
-          exemplar.shape,
-          exemplar.dtype,
-          runtime.placement
-        ),
-      catch: (error) =>
-        new TensorError({ op: "input", message: error instanceof Error ? error.message : String(error) })
-    })
-  })
+  graphTry("input", (runtime) => ({
+    request: {
+      op: "input",
+      inputs: [exemplar],
+      attributes: { slot, shape: [...exemplar.shape], dtype: exemplar.dtype }
+    },
+    shape: exemplar.shape,
+    dtype: exemplar.dtype,
+    placement: runtime.placement
+  }))
 
 /**
  * Creates the placeholder leaf for one runtime scalar of a traced graph:
@@ -3660,14 +3778,12 @@ export const makeScalarInput = (
   slot: number,
   dtype: DType
 ): Effect.Effect<Lazy, TensorError, Runtime.Runtime> =>
-  Effect.gen(function*() {
-    const runtime = yield* Runtime.Runtime
-    return yield* Effect.try({
-      try: () => makeLazy(runtime.graph.scalarInput(slot, dtype), [], dtype, runtime.placement),
-      catch: (error) =>
-        new TensorError({ op: "scalarInput", message: error instanceof Error ? error.message : String(error) })
-    })
-  })
+  graphTry("scalarInput", (runtime) => ({
+    request: { op: "scalarInput", inputs: [], attributes: { slot, dtype } },
+    shape: [],
+    dtype,
+    placement: runtime.placement
+  }))
 
 /**
  * Freezes traced roots into a native program: validates the slot
@@ -3682,8 +3798,11 @@ export const freezeProgram = (
 ): Effect.Effect<CompiledProgram, TensorError, Runtime.Runtime> =>
   Effect.gen(function*() {
     const runtime = yield* Runtime.Runtime
-    const handle = yield* fromBackend("compile", runtime.compile(roots.map((root) => root.lazy)))
-    return { handle }
+    const handle = yield* fromBackend("compile", runtime.compile(roots))
+    return {
+      handle,
+      outputs: roots.map((root) => ({ shape: root.shape, dtype: root.dtype, placement: root.placement }))
+    }
   })
 
 /**
@@ -3701,12 +3820,24 @@ export const runProgram = (
 ): Effect.Effect<Array<Concrete>, TensorError, Runtime.Runtime> =>
   Effect.gen(function*() {
     const runtime = yield* Runtime.Runtime
-    const concrete = yield* compute(inputs)
+    const concrete = inputs.every(isTensor) ? inputs as ReadonlyArray<Concrete> : yield* compute(inputs)
     const values = yield* fromBackend(
       "run",
-      runtime.run(program.handle, concrete.map((input) => input.materialized), scalars)
+      runtime.run(program.handle, concrete, scalars)
     )
-    return values.map((value) => fromHandle(runtime, value))
+    if (values.length !== program.outputs.length) {
+      yield* releaseTensors(runtime, values)
+      return yield* new TensorError({
+        op: "run",
+        message: `run: backend returned ${values.length} tensors for ${program.outputs.length} program outputs`
+      })
+    }
+    const checked = Effect.forEach(values, (value, index) =>
+      Effect.try({
+        try: () => validateTensorHandle("run", runtime, value, { _tag: "Tensor", ...program.outputs[index] }),
+        catch: (error) => caughtTensorError("run", error)
+      }))
+    return yield* preserveOnFailure(checked, releaseTensors(runtime, values))
   })
 
 /**
@@ -3721,6 +3852,7 @@ export interface DecodeProgram {
   readonly layers: number
   readonly kvHeads: number
   readonly headDim: number
+  readonly outputs: CompiledProgram["outputs"]
 }
 
 /**
@@ -3774,6 +3906,21 @@ export const makeKvPool = (
     return { handle }
   })
 
+/**
+ * Creates an independent live sequence in `pool`.
+ *
+ * A sequence owns a block table and cursor into the pool. It starts without a
+ * prompt; use {@link kvPrefillMatch} to attach a resident prefix, then execute
+ * prefill or decode programs with {@link runDecodeProgram} or
+ * {@link runBatchedDecodeProgram}. Release the sequence with
+ * {@link releaseKvSequence} when it leaves the scheduler.
+ *
+ * Fails when the current runtime has no decode extension or when `pool` is not
+ * owned by that runtime.
+ *
+ * @since 0.1.0
+ * @category compilation
+ */
 export const makeKvSequence = (pool: KvPool): Effect.Effect<KvSequence, TensorError, Runtime.Runtime> =>
   Effect.gen(function*() {
     const runtime = yield* Runtime.Runtime
@@ -3788,6 +3935,20 @@ export const makeKvSequence = (pool: KvPool): Effect.Effect<KvSequence, TensorEr
     return { handle }
   })
 
+/**
+ * Attaches the longest resident whole-block prefix of `tokens` to `sequence`
+ * and returns the number of matched tokens.
+ *
+ * The result is the offset at which prefill should begin. A return value of
+ * zero means no reusable prefix was found. Matching updates the sequence's
+ * block table and cursor; later decode runs continue from that position.
+ *
+ * Fails when the current runtime has no decode extension or when `sequence` is
+ * invalid, released, or owned by another runtime.
+ *
+ * @since 0.1.0
+ * @category compilation
+ */
 export const kvPrefillMatch = (
   sequence: KvSequence,
   tokens: ReadonlyArray<number>
@@ -3800,6 +3961,20 @@ export const kvPrefillMatch = (
       : fromBackend("prefillMatch", extension.prefillMatch(sequence.handle, tokens))
   })
 
+/**
+ * Returns the current token cursor of `sequence`.
+ *
+ * The cursor includes tokens supplied by a matched prefix and tokens committed
+ * by subsequent prefill or decode runs. It is independent of any active
+ * attention window: window eviction may release old blocks without rewinding
+ * the logical sequence position.
+ *
+ * Fails when the current runtime has no decode extension or when `sequence` is
+ * invalid, released, or owned by another runtime.
+ *
+ * @since 0.1.0
+ * @category compilation
+ */
 export const kvSequenceCursor = (sequence: KvSequence): Effect.Effect<number, TensorError, Runtime.Runtime> =>
   Effect.gen(function*() {
     const runtime = yield* Runtime.Runtime
@@ -3809,6 +3984,19 @@ export const kvSequenceCursor = (sequence: KvSequence): Effect.Effect<number, Te
       : fromBackend("sequenceCursor", extension.sequenceCursor(sequence.handle))
   })
 
+/**
+ * Releases `sequence` and returns every block reference it owns to its pool.
+ *
+ * The handle is invalid after this Effect succeeds. Callers that manage live
+ * generation sessions should release each sequence exactly once; native
+ * finalization is only a fallback for abandoned handles.
+ *
+ * Fails when the current runtime has no decode extension or when `sequence` is
+ * invalid, already released, or owned by another runtime.
+ *
+ * @since 0.1.0
+ * @category compilation
+ */
 export const releaseKvSequence = (sequence: KvSequence): Effect.Effect<void, TensorError, Runtime.Runtime> =>
   Effect.gen(function*() {
     const runtime = yield* Runtime.Runtime
@@ -3840,8 +4028,11 @@ export const compileDecodeProgram = (
         message: `compileDecode: backend ${runtime.backend.name} does not support compiled inference`
       })
     }
-    const value = yield* fromBackend("compileDecode", extension.compile(roots.map((root) => root.lazy), window, batch))
-    return value
+    const value = yield* fromBackend("compileDecode", extension.compile(roots, window, batch))
+    return {
+      ...value,
+      outputs: roots.map((root) => ({ shape: root.shape, dtype: root.dtype, placement: root.placement }))
+    }
   })
 
 /**
@@ -3867,12 +4058,24 @@ export const runDecodeProgram = (
     if (extension === undefined) {
       return yield* new TensorError({ op: "decode", message: "decode: inference extension is unavailable" })
     }
-    const concrete = yield* compute(inputs)
+    const concrete = inputs.every(isTensor) ? inputs as ReadonlyArray<Concrete> : yield* compute(inputs)
     const values = yield* fromBackend(
       "decode",
-      extension.run(program.handle, concrete.map((input) => input.materialized), seq.handle, tokens)
+      extension.run(program.handle, concrete, seq.handle, tokens)
     )
-    return values.map((value) => fromHandle(runtime, value))
+    if (values.length !== program.outputs.length) {
+      yield* releaseTensors(runtime, values)
+      return yield* new TensorError({
+        op: "decode",
+        message: `decode: backend returned ${values.length} tensors for ${program.outputs.length} program outputs`
+      })
+    }
+    const checked = Effect.forEach(values, (value, index) =>
+      Effect.try({
+        try: () => validateTensorHandle("decode", runtime, value, { _tag: "Tensor", ...program.outputs[index] }),
+        catch: (error) => caughtTensorError("decode", error)
+      }))
+    return yield* preserveOnFailure(checked, releaseTensors(runtime, values))
   })
 
 /**
@@ -3899,17 +4102,30 @@ export const runBatchedDecodeProgram = (
         message: "decodeBatched: inference extension is unavailable"
       })
     }
-    const concrete = yield* compute(inputs)
+    const concrete = inputs.every(isTensor) ? inputs as ReadonlyArray<Concrete> : yield* compute(inputs)
     const values = yield* fromBackend(
       "decodeBatched",
       extension.runBatched(
         program.handle,
-        concrete.map((input) => input.materialized),
+        concrete,
         seqs.map((sequence) => sequence.handle),
         tokens
       )
     )
-    return values.map((value) => fromHandle(runtime, value))
+    if (values.length !== program.outputs.length) {
+      yield* releaseTensors(runtime, values)
+      return yield* new TensorError({
+        op: "decodeBatched",
+        message:
+          `decodeBatched: backend returned ${values.length} tensors for ${program.outputs.length} program outputs`
+      })
+    }
+    const checked = Effect.forEach(values, (value, index) =>
+      Effect.try({
+        try: () => validateTensorHandle("decodeBatched", runtime, value, { _tag: "Tensor", ...program.outputs[index] }),
+        catch: (error) => caughtTensorError("decodeBatched", error)
+      }))
+    return yield* preserveOnFailure(checked, releaseTensors(runtime, values))
   })
 
 /**
@@ -3926,7 +4142,6 @@ export const linear = (
   bias: Any
 ): Effect.Effect<Lazy, TensorError, Runtime.Runtime> =>
   Effect.gen(function*() {
-    const runtime = yield* Runtime.Runtime
     const k = self.shape[self.shape.length - 1]
     if (
       self.shape.length < 2 ||
@@ -3957,21 +4172,12 @@ export const linear = (
       catch: (error) =>
         new TensorError({ op: "linear", message: error instanceof Error ? error.message : String(error) })
     })
-    yield* validateTensors(runtime, "linear", [self, weight, flatBias])
-    return yield* Effect.try({
-      try: () =>
-        makeLazy(
-          self.lazy.linear(weight.lazy, flatBias.lazy),
-          [...self.shape.slice(0, -1), n],
-          self.dtype,
-          self.placement
-        ),
-      catch: (error) =>
-        new TensorError({
-          op: "linear",
-          message: error instanceof Error ? error.message : String(error)
-        })
-    })
+    return yield* graphTry("linear", () => ({
+      request: { op: "linear", inputs: [self, weight, flatBias] },
+      shape: [...self.shape.slice(0, -1), n],
+      dtype: self.dtype,
+      placement: self.placement
+    }))
   })
 
 /**
@@ -3988,7 +4194,7 @@ export const layerNorm = (
   bias: Any,
   eps = 1e-5
 ): Effect.Effect<Lazy, TensorError, Runtime.Runtime> =>
-  graphTry("layerNorm", [self, weight, bias], () => {
+  graphTry("layerNorm", () => {
     const k = weight.shape.length
     const suffix = self.shape.slice(self.shape.length - k)
     if (
@@ -4003,7 +4209,16 @@ export const layerNorm = (
     }
     checkCompatible("layerNorm", self, weight)
     checkCompatible("layerNorm", self, bias)
-    return makeLazy(self.lazy.layerNorm(weight.lazy, bias.lazy, eps), self.shape, self.dtype, self.placement)
+    return {
+      request: {
+        op: "layerNorm",
+        inputs: [self, weight, bias],
+        attributes: { eps }
+      },
+      shape: self.shape,
+      dtype: self.dtype,
+      placement: self.placement
+    }
   })
 
 /**
@@ -4019,18 +4234,18 @@ export const positionEmbedding = (
   weight: Any,
   seqLen: number
 ): Effect.Effect<Lazy, TensorError, Runtime.Runtime> =>
-  graphTry("positionEmbedding", [weight], () => {
+  graphTry("positionEmbedding", () => {
     if (weight.shape.length !== 2) {
       throw new Error(
         `positionEmbedding: weight must be [maxPositions, E], got [${weight.shape}]`
       )
     }
-    return makeLazy(
-      weight.lazy.positionEmbedding(seqLen),
-      [seqLen, weight.shape[1]],
-      weight.dtype,
-      weight.placement
-    )
+    return {
+      request: { op: "positionEmbedding", inputs: [weight], attributes: { seqLen } },
+      shape: [seqLen, weight.shape[1]],
+      dtype: weight.dtype,
+      placement: weight.placement
+    }
   })
 
 /**
@@ -4049,13 +4264,12 @@ export const rotaryEmbedding = (
   seqLen: number,
   theta: number
 ): Effect.Effect<Lazy, TensorError, Runtime.Runtime> =>
-  graphTry("rotaryEmbedding", [self], () =>
-    makeLazy(
-      self.lazy.rotaryEmbedding(seqLen, theta),
-      self.shape,
-      self.dtype,
-      self.placement
-    ))
+  graphTry("rotaryEmbedding", () => ({
+    request: { op: "rotaryEmbedding", inputs: [self], attributes: { seqLen, theta } },
+    shape: self.shape,
+    dtype: self.dtype,
+    placement: self.placement
+  }))
 
 /**
  * Compiles a graph builder into a reusable executable, JAX-style. The

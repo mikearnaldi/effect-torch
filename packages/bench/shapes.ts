@@ -1,4 +1,4 @@
-import * as BackendNative from "@effect-torch/backend-native"
+import * as BackendApple from "@effect-torch/backend-apple-native"
 import { type Runtime, Tensor } from "@effect-torch/core"
 import { Console, Effect } from "effect"
 import { performance } from "node:perf_hooks"
@@ -59,4 +59,4 @@ const program = Effect.gen(function*() {
   yield* gemm(256, rows, 50257, 48, `head  [256,${rows}]x[${rows},50k]  dW x48`)
 })
 
-Effect.runPromise(Effect.provide(program, BackendNative.Metal))
+Effect.runPromise(Effect.provide(program, BackendApple.layer))

@@ -1,4 +1,4 @@
-import * as BackendNative from "@effect-torch/backend-native"
+import * as BackendCpu from "@effect-torch/backend-cpu"
 import { describe, expect, layer } from "@effect/vitest"
 import * as assert from "@effect/vitest/utils"
 import { Effect } from "effect"
@@ -18,7 +18,7 @@ const externalMemoryBytes = Effect.gen(function*() {
   return yield* diagnostics.externalMemoryBytes
 })
 
-layer(BackendNative.Cpu)("Memory", (it) => {
+layer(BackendCpu.layer)("Memory", (it) => {
   describe("external memory accounting", () => {
     it.effect("clear releases the bytes immediately, without GC", () =>
       Effect.gen(function*() {

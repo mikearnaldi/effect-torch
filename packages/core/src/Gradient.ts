@@ -26,24 +26,46 @@ export class GradError extends Data.TaggedError("GradError")<{
 const isFloatDtype = (dtype: string): boolean =>
   dtype === "f32" || dtype === "f64" || dtype === "f16" || dtype === "bf16"
 
-const toGradError = (error: unknown): GradError => {
-  const detail = error instanceof Error ? error.message : String(error)
-  return new GradError({
-    // the scalar and float-dtype contracts are validated above, so a native
-    // error here means the graph contains a non-differentiable construct
-    reason: "not-differentiable",
-    detail
-  })
-}
-
-const validateGraph = (
-  runtime: Runtime.RuntimeService,
+const fromBackend = <A>(
   op: string,
-  tensors: ReadonlyArray<Tensor.Any>
-): Effect.Effect<void, Tensor.TensorError> =>
-  runtime.validateGraph(tensors.map((tensor) => tensor.lazy)).pipe(
+  effect: Effect.Effect<A, Runtime.BackendError>
+): Effect.Effect<A, Tensor.TensorError> =>
+  effect.pipe(
     Effect.mapError((error) => new Tensor.TensorError({ op, message: error.message, backend: error }))
   )
+
+const validateResult = (
+  op: string,
+  runtime: Runtime.RuntimeService,
+  value: Runtime.LazyTensorHandle,
+  expected: {
+    readonly shape: ReadonlyArray<number>
+    readonly dtype: Tensor.DType
+    readonly placement: Runtime.Placement
+  }
+): Tensor.Lazy => {
+  const candidate = value as Partial<Runtime.LazyTensorHandle>
+  const placement = candidate.placement
+  if (
+    candidate._tag !== "LazyTensor" || candidate.dtype !== expected.dtype || !Array.isArray(candidate.shape) ||
+    candidate.shape.length !== expected.shape.length ||
+    !candidate.shape.every((dimension, index) => dimension === expected.shape[index]) ||
+    placement === undefined || candidate.device !== placement.deviceType || placement.id !== expected.placement.id ||
+    placement.deviceType !== expected.placement.deviceType ||
+    placement.description !== expected.placement.description ||
+    placement.ordinal !== expected.placement.ordinal || placement.memorySpace !== expected.placement.memorySpace ||
+    placement.id !== runtime.placement.id || placement.deviceType !== runtime.placement.deviceType
+  ) {
+    throw new Tensor.TensorError({
+      op,
+      message:
+        `${op}: backend returned invalid lazy tensor metadata; expected ${expected.dtype} [${expected.shape}], got ${
+          String(candidate.dtype)
+        } [${Array.isArray(candidate.shape) ? candidate.shape : "invalid shape"}]`
+    })
+  }
+  return value
+}
 
 /**
  * Computes the gradients of a scalar loss with respect to the given tensors.
@@ -90,11 +112,17 @@ export const grad = (
         })
       }
     }
-    yield* validateGraph(runtime, "grad", [loss, ...wrt])
-    const grads = yield* runtime.grad(loss.lazy, wrt.map((target) => target.lazy)).pipe(
-      Effect.mapError(toGradError)
-    )
-    return grads.map((handle, i) => Tensor.makeLazy(handle, wrt[i].shape, wrt[i].dtype, wrt[i].placement))
+    const grads = yield* fromBackend("grad", runtime.grad(loss, wrt))
+    if (grads.length !== wrt.length) {
+      return yield* new Tensor.TensorError({
+        op: "grad",
+        message: `grad: backend returned ${grads.length} tensors for ${wrt.length} targets`
+      })
+    }
+    return yield* Effect.try({
+      try: () => grads.map((value, index) => validateResult("grad", runtime, value, wrt[index])),
+      catch: (error) => error as Tensor.TensorError
+    })
   })
 
 /**
@@ -110,14 +138,13 @@ export const stopGradient = (
 ): Effect.Effect<Tensor.Lazy, Tensor.TensorError, Runtime.Runtime> =>
   Effect.gen(function*() {
     const runtime = yield* Runtime.Runtime
-    yield* validateGraph(runtime, "stopGradient", [self])
+    const handle = yield* fromBackend(
+      "stopGradient",
+      runtime.node({ op: "stopGradient", inputs: [self] })
+    )
     return yield* Effect.try({
-      try: () => Tensor.makeLazy(self.lazy.stopGradient(), self.shape, self.dtype, self.placement),
-      catch: (error) =>
-        new Tensor.TensorError({
-          op: "stopGradient",
-          message: error instanceof Error ? error.message : String(error)
-        })
+      try: () => validateResult("stopGradient", runtime, handle, self),
+      catch: (error) => error as Tensor.TensorError
     })
   })
 
@@ -138,14 +165,10 @@ export const checkpoint = (
 ): Effect.Effect<Tensor.Lazy, Tensor.TensorError, Runtime.Runtime> =>
   Effect.gen(function*() {
     const runtime = yield* Runtime.Runtime
-    yield* validateGraph(runtime, "checkpoint", [self])
+    const handle = yield* fromBackend("checkpoint", runtime.node({ op: "checkpoint", inputs: [self] }))
     return yield* Effect.try({
-      try: () => Tensor.makeLazy(self.lazy.checkpoint(), self.shape, self.dtype, self.placement),
-      catch: (error) =>
-        new Tensor.TensorError({
-          op: "checkpoint",
-          message: error instanceof Error ? error.message : String(error)
-        })
+      try: () => validateResult("checkpoint", runtime, handle, self),
+      catch: (error) => error as Tensor.TensorError
     })
   })
 
@@ -241,8 +264,7 @@ export const vmap = (
 ): Effect.Effect<Tensor.Lazy, Tensor.TensorError, Runtime.Runtime> =>
   Effect.gen(function*() {
     const runtime = yield* Runtime.Runtime
-    yield* validateGraph(runtime, "vmap", [y, x, batchedX])
-    return yield* Effect.try({
+    const { dim, outShape } = yield* Effect.try({
       try: () => {
         const dim = options.dim ?? 0
         if (batchedX.shape.length !== x.shape.length + 1 || dim < 0 || dim >= batchedX.shape.length) {
@@ -261,15 +283,26 @@ export const vmap = (
         if (batchedX.dtype !== x.dtype) {
           throw new Error(`vmap: dtype mismatch, got ${batchedX.dtype} and ${x.dtype}`)
         }
-        const batch = batchedX.shape[dim]
         const outShape = [...y.shape]
-        outShape.splice(Math.min(dim, outShape.length), 0, batch)
-        return Tensor.makeLazy(y.lazy.vmap(x.lazy, batchedX.lazy, dim), outShape, y.dtype, y.placement)
+        outShape.splice(Math.min(dim, outShape.length), 0, batchedX.shape[dim])
+        return { dim, outShape }
       },
       catch: (error) =>
         new Tensor.TensorError({
           op: "vmap",
           message: error instanceof Error ? error.message : String(error)
         })
+    })
+    const handle = yield* fromBackend(
+      "vmap",
+      runtime.node({
+        op: "vmap",
+        inputs: [y, x, batchedX],
+        attributes: { dim }
+      })
+    )
+    return yield* Effect.try({
+      try: () => validateResult("vmap", runtime, handle, { shape: outShape, dtype: y.dtype, placement: y.placement }),
+      catch: (error) => error as Tensor.TensorError
     })
   })

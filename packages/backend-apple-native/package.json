@@ -1,0 +1,50 @@
+{
+  "name": "@effect-torch/backend-apple-native",
+  "version": "0.1.0",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts",
+    "./package.json": "./package.json"
+  },
+  "main": "src/index.ts",
+  "types": "src/index.ts",
+  "files": [
+    "dist/index.js",
+    "dist/index.d.ts",
+    "dist/internal/adapter.js",
+    "dist/internal/native.js",
+    "dist/internal/effect-torch-backend-apple-native.darwin-arm64.node",
+    "dist/internal/effect-torch-backend-apple-native.darwin-x64.node"
+  ],
+  "publishConfig": {
+    "exports": {
+      ".": "./dist/index.js",
+      "./package.json": "./package.json"
+    },
+    "main": "dist/index.js",
+    "types": "dist/index.d.ts"
+  },
+  "napi": {
+    "binaryName": "effect-torch-backend-apple-native"
+  },
+  "scripts": {
+    "build": "node ../../scripts/build-native.mjs --matrix && pnpm run build:ts && node ../../scripts/verify-native-packages.mjs --artifacts",
+    "build:debug": "node ../../scripts/build-native.mjs --host --profile debug && pnpm run build:ts",
+    "build:ts": "tsc -p tsconfig.build.json && node ../../scripts/clean-native-declarations.mjs",
+    "typecheck": "tsc -p tsconfig.json",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "effect": "4.0.0-beta.101"
+  },
+  "peerDependencies": {
+    "@effect-torch/core": "workspace:^"
+  },
+  "devDependencies": {
+    "@effect-torch/backend-cpu": "workspace:*",
+    "@effect/vitest": "4.0.0-beta.101",
+    "@types/node": "^22.0.0",
+    "typescript": "^5.8.0",
+    "vitest": "^4.1.10"
+  }
+}

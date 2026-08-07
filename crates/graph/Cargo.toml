@@ -1,0 +1,7 @@
+[package]
+name = "effect-torch-graph"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+effect-torch-runtime = { path = "../runtime" }

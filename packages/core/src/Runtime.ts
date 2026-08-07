@@ -1,5 +1,8 @@
 import { Context, Data, type Effect } from "effect"
-import type { DType } from "./Tensor.ts"
+import type { Pipeable } from "effect/Pipeable"
+
+/** Element data types supported by tensor runtimes. */
+export type DType = "f32" | "f64" | "f16" | "bf16" | "i64" | "u8" | "u32"
 
 /**
  * Backend implementation metadata.
@@ -65,103 +68,34 @@ export class BackendError extends Data.TaggedError("BackendError")<{
   readonly details?: unknown
 }> {}
 
-declare const GraphHandleTypeId: unique symbol
-declare const BufferHandleTypeId: unique symbol
+declare const TensorHandleTypeId: unique symbol
+declare const LazyTensorHandleTypeId: unique symbol
+declare const ConcreteTensorHandleTypeId: unique symbol
 declare const ProgramHandleTypeId: unique symbol
 declare const DecodeProgramHandleTypeId: unique symbol
 declare const KvPoolHandleTypeId: unique symbol
 declare const KvSequenceHandleTypeId: unique symbol
 
-export interface GraphHandle {
-  readonly [GraphHandleTypeId]: typeof GraphHandleTypeId
-  add(other: GraphHandle): GraphHandle
-  sub(other: GraphHandle): GraphHandle
-  mul(other: GraphHandle): GraphHandle
-  div(other: GraphHandle): GraphHandle
-  maximum(other: GraphHandle): GraphHandle
-  minimum(other: GraphHandle): GraphHandle
-  eq(other: GraphHandle): GraphHandle
-  gt(other: GraphHandle): GraphHandle
-  lt(other: GraphHandle): GraphHandle
-  ge(other: GraphHandle): GraphHandle
-  le(other: GraphHandle): GraphHandle
-  matmul(other: GraphHandle): GraphHandle
-  inverse(): GraphHandle
-  det(): GraphHandle
-  solve(other: GraphHandle): GraphHandle
-  neg(): GraphHandle
-  abs(): GraphHandle
-  sqrt(): GraphHandle
-  exp(): GraphHandle
-  tanh(): GraphHandle
-  gelu(approximate?: boolean | null): GraphHandle
-  relu(): GraphHandle
-  erf(): GraphHandle
-  floor(): GraphHandle
-  ceil(): GraphHandle
-  round(): GraphHandle
-  sign(): GraphHandle
-  whereCond(a: GraphHandle, b: GraphHandle): GraphHandle
-  argmax(dim: number): GraphHandle
-  argmin(dim: number): GraphHandle
-  cumsum(dim: number): GraphHandle
-  indexSelect(dim: number, indexes: GraphHandle): GraphHandle
-  scatterAdd(dim: number, indexes: GraphHandle, src: GraphHandle): GraphHandle
-  gather(dim: number, indexes: GraphHandle): GraphHandle
-  crossEntropy(target: GraphHandle, ignoreIndex: number): GraphHandle
-  scaledDotProductAttention(k: GraphHandle, v: GraphHandle, scale: number, causal: boolean): GraphHandle
-  positionEmbedding(seqLen: number): GraphHandle
-  rotaryEmbedding(seqLen: number, theta: number): GraphHandle
-  layerNorm(weight: GraphHandle, bias: GraphHandle, eps: number): GraphHandle
-  linear(weight: GraphHandle, bias: GraphHandle): GraphHandle
-  conv1d(weight: GraphHandle, stride: number, padding: number, dilation: number, groups: number): GraphHandle
-  conv2d(weight: GraphHandle, stride: number, padding: number, dilation: number, groups: number): GraphHandle
-  log(): GraphHandle
-  sin(): GraphHandle
-  cos(): GraphHandle
-  pow(exp: number): GraphHandle
-  cast(dtype: DType): GraphHandle
-  sum(dims: Array<number>, keepdims: boolean): GraphHandle
-  prod(dims: Array<number>, keepdims: boolean): GraphHandle
-  mean(dims: Array<number>, keepdims: boolean): GraphHandle
-  max(dims: Array<number>, keepdims: boolean): GraphHandle
-  min(dims: Array<number>, keepdims: boolean): GraphHandle
-  reshape(shape: Array<number>): GraphHandle
-  permute(dims: Array<number>): GraphHandle
-  slice(ranges: Array<Array<number>>): GraphHandle
-  concat(other: GraphHandle, dim: number): GraphHandle
-  broadcastTo(shape: Array<number>): GraphHandle
-  stopGradient(): GraphHandle
-  checkpoint(): GraphHandle
-  vmap(x: GraphHandle, batchedX: GraphHandle, dim: number): GraphHandle
-  adamwStep(
-    grad: GraphHandle,
-    m: GraphHandle,
-    v: GraphHandle,
-    lr: GraphHandle,
-    c1: GraphHandle,
-    c2: GraphHandle,
-    beta1: number,
-    beta2: number,
-    eps: number,
-    weightDecay: number
-  ): GraphHandle
-  adamwOut(index: number): GraphHandle
-  sgdStep(
-    grad: GraphHandle,
-    velocity: GraphHandle,
-    first: GraphHandle,
-    lr: GraphHandle,
-    momentum: number,
-    dampening: number,
-    nesterov: boolean,
-    weightDecay: number
-  ): GraphHandle
-  sgdOut(index: number): GraphHandle
+/** A backend-owned tensor value with only backend-neutral static metadata. */
+export interface TensorHandle extends Pipeable {
+  readonly [TensorHandleTypeId]: typeof TensorHandleTypeId
+  readonly _tag: "LazyTensor" | "Tensor"
+  readonly shape: ReadonlyArray<number>
+  readonly dtype: DType
+  readonly device: string
+  readonly placement: Placement
 }
 
-export interface BufferHandle {
-  readonly [BufferHandleTypeId]: typeof BufferHandleTypeId
+/** A backend-owned lazy tensor value. */
+export interface LazyTensorHandle extends TensorHandle {
+  readonly [LazyTensorHandleTypeId]: typeof LazyTensorHandleTypeId
+  readonly _tag: "LazyTensor"
+}
+
+/** A backend-owned materialized tensor value. */
+export interface ConcreteTensorHandle extends TensorHandle {
+  readonly [ConcreteTensorHandleTypeId]: typeof ConcreteTensorHandleTypeId
+  readonly _tag: "Tensor"
 }
 
 export interface ProgramHandle {
@@ -180,27 +114,290 @@ export interface KvSequenceHandle {
   readonly [KvSequenceHandleTypeId]: typeof KvSequenceHandleTypeId
 }
 
-export interface GraphFactory {
-  readonly constant: (value: number, dtype: DType) => GraphHandle
-  readonly zeros: (shape: Array<number>, dtype: DType) => GraphHandle
-  readonly ones: (shape: Array<number>, dtype: DType) => GraphHandle
-  readonly full: (shape: Array<number>, value: number, dtype: DType) => GraphHandle
-  readonly randn: (shape: Array<number>, dtype: DType) => GraphHandle
-  readonly uniform: (shape: Array<number>, lo: number, hi: number, dtype: DType) => GraphHandle
-  readonly arange: (start: number, end: number, step: number, dtype: DType) => GraphHandle
-  readonly eye: (n: number, dtype: DType) => GraphHandle
-  /** Snapshots `data` before returning; the caller retains ownership. */
-  readonly fromBytes: (data: Uint8Array, shape: Array<number>, dtype: DType) => GraphHandle
-  readonly fromBuffer: (buffer: BufferHandle) => GraphHandle
-  readonly input: (slot: number, shape: Array<number>, dtype: DType) => GraphHandle
-  readonly scalarInput: (slot: number, dtype: DType) => GraphHandle
+/**
+ * Inputs and attributes for every semantic graph operation.
+ *
+ * @since 0.1.0
+ * @category models
+ */
+export interface NodeOperationMap {
+  readonly constant: {
+    readonly inputs: readonly [] | readonly [exemplar: TensorHandle]
+    readonly attributes: { readonly value: number; readonly dtype: DType }
+  }
+  readonly zeros: {
+    readonly inputs: readonly [] | readonly [exemplar: TensorHandle]
+    readonly attributes: { readonly shape: ReadonlyArray<number>; readonly dtype: DType }
+  }
+  readonly ones: {
+    readonly inputs: readonly [] | readonly [exemplar: TensorHandle]
+    readonly attributes: { readonly shape: ReadonlyArray<number>; readonly dtype: DType }
+  }
+  readonly full: {
+    readonly inputs: readonly [] | readonly [exemplar: TensorHandle]
+    readonly attributes: { readonly shape: ReadonlyArray<number>; readonly value: number; readonly dtype: DType }
+  }
+  readonly randn: {
+    readonly inputs: readonly []
+    readonly attributes: { readonly shape: ReadonlyArray<number>; readonly dtype: DType }
+  }
+  readonly uniform: {
+    readonly inputs: readonly []
+    readonly attributes: {
+      readonly shape: ReadonlyArray<number>
+      readonly lo: number
+      readonly hi: number
+      readonly dtype: DType
+    }
+  }
+  readonly arange: {
+    readonly inputs: readonly []
+    readonly attributes: { readonly start: number; readonly end: number; readonly step: number; readonly dtype: DType }
+  }
+  readonly eye: {
+    readonly inputs: readonly []
+    readonly attributes: { readonly n: number; readonly dtype: DType }
+  }
+  readonly fromBytes: {
+    readonly inputs: readonly []
+    /** The backend snapshots `data`; the caller retains ownership. */
+    readonly attributes: { readonly data: Uint8Array; readonly shape: ReadonlyArray<number>; readonly dtype: DType }
+  }
+  readonly input: {
+    readonly inputs: readonly [] | readonly [exemplar: TensorHandle]
+    readonly attributes: { readonly slot: number; readonly shape: ReadonlyArray<number>; readonly dtype: DType }
+  }
+  readonly scalarInput: {
+    readonly inputs: readonly []
+    readonly attributes: { readonly slot: number; readonly dtype: DType }
+  }
+  readonly add: { readonly inputs: readonly [self: TensorHandle, other: TensorHandle] }
+  readonly sub: { readonly inputs: readonly [self: TensorHandle, other: TensorHandle] }
+  readonly mul: { readonly inputs: readonly [self: TensorHandle, other: TensorHandle] }
+  readonly div: { readonly inputs: readonly [self: TensorHandle, other: TensorHandle] }
+  readonly maximum: { readonly inputs: readonly [self: TensorHandle, other: TensorHandle] }
+  readonly minimum: { readonly inputs: readonly [self: TensorHandle, other: TensorHandle] }
+  readonly eq: { readonly inputs: readonly [self: TensorHandle, other: TensorHandle] }
+  readonly gt: { readonly inputs: readonly [self: TensorHandle, other: TensorHandle] }
+  readonly lt: { readonly inputs: readonly [self: TensorHandle, other: TensorHandle] }
+  readonly ge: { readonly inputs: readonly [self: TensorHandle, other: TensorHandle] }
+  readonly le: { readonly inputs: readonly [self: TensorHandle, other: TensorHandle] }
+  readonly matmul: { readonly inputs: readonly [self: TensorHandle, other: TensorHandle] }
+  readonly solve: { readonly inputs: readonly [self: TensorHandle, other: TensorHandle] }
+  readonly concat: {
+    readonly inputs: readonly [self: TensorHandle, other: TensorHandle]
+    readonly attributes: { readonly dim: number }
+  }
+  readonly neg: { readonly inputs: readonly [self: TensorHandle] }
+  readonly abs: { readonly inputs: readonly [self: TensorHandle] }
+  readonly sqrt: { readonly inputs: readonly [self: TensorHandle] }
+  readonly exp: { readonly inputs: readonly [self: TensorHandle] }
+  readonly log: { readonly inputs: readonly [self: TensorHandle] }
+  readonly sin: { readonly inputs: readonly [self: TensorHandle] }
+  readonly cos: { readonly inputs: readonly [self: TensorHandle] }
+  readonly tanh: { readonly inputs: readonly [self: TensorHandle] }
+  readonly relu: { readonly inputs: readonly [self: TensorHandle] }
+  readonly erf: { readonly inputs: readonly [self: TensorHandle] }
+  readonly floor: { readonly inputs: readonly [self: TensorHandle] }
+  readonly ceil: { readonly inputs: readonly [self: TensorHandle] }
+  readonly round: { readonly inputs: readonly [self: TensorHandle] }
+  readonly sign: { readonly inputs: readonly [self: TensorHandle] }
+  readonly inverse: { readonly inputs: readonly [self: TensorHandle] }
+  readonly det: { readonly inputs: readonly [self: TensorHandle] }
+  readonly stopGradient: { readonly inputs: readonly [self: TensorHandle] }
+  readonly checkpoint: { readonly inputs: readonly [self: TensorHandle] }
+  readonly gelu: {
+    readonly inputs: readonly [self: TensorHandle]
+    readonly attributes: { readonly approximate?: boolean | null }
+  }
+  readonly pow: {
+    readonly inputs: readonly [self: TensorHandle]
+    readonly attributes: { readonly exponent: number }
+  }
+  readonly cast: {
+    readonly inputs: readonly [self: TensorHandle]
+    readonly attributes: { readonly dtype: DType }
+  }
+  readonly whereCond: {
+    readonly inputs: readonly [condition: TensorHandle, a: TensorHandle, b: TensorHandle]
+  }
+  readonly argmax: {
+    readonly inputs: readonly [self: TensorHandle]
+    readonly attributes: { readonly dim: number }
+  }
+  readonly argmin: {
+    readonly inputs: readonly [self: TensorHandle]
+    readonly attributes: { readonly dim: number }
+  }
+  readonly cumsum: {
+    readonly inputs: readonly [self: TensorHandle]
+    readonly attributes: { readonly dim: number }
+  }
+  readonly indexSelect: {
+    readonly inputs: readonly [self: TensorHandle, indexes: TensorHandle]
+    readonly attributes: { readonly dim: number }
+  }
+  readonly scatterAdd: {
+    readonly inputs: readonly [self: TensorHandle, indexes: TensorHandle, src: TensorHandle]
+    readonly attributes: { readonly dim: number }
+  }
+  readonly gather: {
+    readonly inputs: readonly [self: TensorHandle, indexes: TensorHandle]
+    readonly attributes: { readonly dim: number }
+  }
+  readonly crossEntropy: {
+    readonly inputs: readonly [self: TensorHandle, target: TensorHandle]
+    readonly attributes: { readonly ignoreIndex: number }
+  }
+  readonly scaledDotProductAttention: {
+    readonly inputs: readonly [q: TensorHandle, k: TensorHandle, v: TensorHandle]
+    readonly attributes: { readonly scale: number; readonly causal: boolean }
+  }
+  readonly positionEmbedding: {
+    readonly inputs: readonly [weight: TensorHandle]
+    readonly attributes: { readonly seqLen: number }
+  }
+  readonly rotaryEmbedding: {
+    readonly inputs: readonly [self: TensorHandle]
+    readonly attributes: { readonly seqLen: number; readonly theta: number }
+  }
+  readonly layerNorm: {
+    readonly inputs: readonly [self: TensorHandle, weight: TensorHandle, bias: TensorHandle]
+    readonly attributes: { readonly eps: number }
+  }
+  readonly linear: {
+    readonly inputs: readonly [self: TensorHandle, weight: TensorHandle, bias: TensorHandle]
+  }
+  readonly conv1d: {
+    readonly inputs: readonly [self: TensorHandle, weight: TensorHandle]
+    readonly attributes: {
+      readonly stride: number
+      readonly padding: number
+      readonly dilation: number
+      readonly groups: number
+    }
+  }
+  readonly conv2d: {
+    readonly inputs: readonly [self: TensorHandle, weight: TensorHandle]
+    readonly attributes: {
+      readonly stride: number
+      readonly padding: number
+      readonly dilation: number
+      readonly groups: number
+    }
+  }
+  readonly sum: {
+    readonly inputs: readonly [self: TensorHandle]
+    readonly attributes: { readonly dims: ReadonlyArray<number>; readonly keepdims: boolean }
+  }
+  readonly prod: {
+    readonly inputs: readonly [self: TensorHandle]
+    readonly attributes: { readonly dims: ReadonlyArray<number>; readonly keepdims: boolean }
+  }
+  readonly mean: {
+    readonly inputs: readonly [self: TensorHandle]
+    readonly attributes: { readonly dims: ReadonlyArray<number>; readonly keepdims: boolean }
+  }
+  readonly max: {
+    readonly inputs: readonly [self: TensorHandle]
+    readonly attributes: { readonly dims: ReadonlyArray<number>; readonly keepdims: boolean }
+  }
+  readonly min: {
+    readonly inputs: readonly [self: TensorHandle]
+    readonly attributes: { readonly dims: ReadonlyArray<number>; readonly keepdims: boolean }
+  }
+  readonly reshape: {
+    readonly inputs: readonly [self: TensorHandle]
+    readonly attributes: { readonly shape: ReadonlyArray<number> }
+  }
+  readonly permute: {
+    readonly inputs: readonly [self: TensorHandle]
+    readonly attributes: { readonly dims: ReadonlyArray<number> }
+  }
+  readonly slice: {
+    readonly inputs: readonly [self: TensorHandle]
+    readonly attributes: { readonly ranges: ReadonlyArray<ReadonlyArray<number>> }
+  }
+  readonly broadcastTo: {
+    readonly inputs: readonly [self: TensorHandle]
+    readonly attributes: { readonly shape: ReadonlyArray<number> }
+  }
+  readonly vmap: {
+    readonly inputs: readonly [y: TensorHandle, x: TensorHandle, batchedX: TensorHandle]
+    readonly attributes: { readonly dim: number }
+  }
+  readonly adamwStep: {
+    readonly inputs: readonly [
+      param: TensorHandle,
+      grad: TensorHandle,
+      m: TensorHandle,
+      v: TensorHandle,
+      lr: TensorHandle,
+      c1: TensorHandle,
+      c2: TensorHandle
+    ]
+    readonly attributes: {
+      readonly beta1: number
+      readonly beta2: number
+      readonly eps: number
+      readonly weightDecay: number
+    }
+  }
+  readonly adamwOut: {
+    readonly inputs: readonly [step: TensorHandle]
+    readonly attributes: { readonly index: number }
+  }
+  readonly sgdStep: {
+    readonly inputs: readonly [
+      param: TensorHandle,
+      grad: TensorHandle,
+      velocity: TensorHandle,
+      first: TensorHandle,
+      lr: TensorHandle
+    ]
+    readonly attributes: {
+      readonly momentum: number
+      readonly dampening: number
+      readonly nesterov: boolean
+      readonly weightDecay: number
+    }
+  }
+  readonly sgdOut: {
+    readonly inputs: readonly [step: TensorHandle]
+    readonly attributes: { readonly index: number }
+  }
 }
 
-export interface BufferValue {
-  readonly handle: BufferHandle
-  readonly shape: ReadonlyArray<number>
-  readonly dtype: DType
-  readonly placement: Placement
+/**
+ * A type-checked semantic graph construction request.
+ *
+ * @since 0.1.0
+ * @category models
+ */
+export type NodeRequest<Operation extends keyof NodeOperationMap = keyof NodeOperationMap> = {
+  readonly [K in Operation]: { readonly op: K } & NodeOperationMap[K]
+}[Operation]
+
+/** A named tensor entry for a direct safetensors write. */
+export interface PathSafetensorsSaveEntry {
+  readonly name: string
+  readonly tensor: TensorHandle
+}
+
+/** A named materialized entry returned by a direct safetensors read. */
+export interface PathSafetensorsLoadEntry {
+  readonly name: string
+  readonly tensor: ConcreteTensorHandle
+}
+
+export interface PathSafetensorsSaveArchive {
+  readonly entries: ReadonlyArray<PathSafetensorsSaveEntry>
+  readonly metadata: Readonly<Record<string, string>>
+}
+
+export interface PathSafetensorsLoadArchive {
+  readonly entries: ReadonlyArray<PathSafetensorsLoadEntry>
+  readonly metadata: Readonly<Record<string, string>>
 }
 
 export interface DecodeProgramValue {
@@ -212,17 +409,13 @@ export interface DecodeProgramValue {
 }
 
 export interface PathSafetensors {
-  readonly save: (
-    path: string,
-    names: ReadonlyArray<string>,
-    tensors: ReadonlyArray<GraphHandle>
-  ) => Effect.Effect<void, BackendError>
-  readonly load: (path: string) => Effect.Effect<ReadonlyArray<readonly [string, BufferValue]>, BackendError>
+  readonly save: (path: string, archive: PathSafetensorsSaveArchive) => Effect.Effect<void, BackendError>
+  readonly load: (path: string) => Effect.Effect<PathSafetensorsLoadArchive, BackendError>
 }
 
 export interface DecodeRuntime {
   readonly compile: (
-    roots: ReadonlyArray<GraphHandle>,
+    roots: ReadonlyArray<TensorHandle>,
     window?: number,
     batch?: number
   ) => Effect.Effect<DecodeProgramValue, BackendError>
@@ -243,16 +436,16 @@ export interface DecodeRuntime {
   readonly releaseSequence: (sequence: KvSequenceHandle) => Effect.Effect<void, BackendError>
   readonly run: (
     program: DecodeProgramHandle,
-    inputs: ReadonlyArray<BufferHandle>,
+    inputs: ReadonlyArray<ConcreteTensorHandle>,
     sequence: KvSequenceHandle,
     tokens: ReadonlyArray<number>
-  ) => Effect.Effect<ReadonlyArray<BufferValue>, BackendError>
+  ) => Effect.Effect<ReadonlyArray<ConcreteTensorHandle>, BackendError>
   readonly runBatched: (
     program: DecodeProgramHandle,
-    inputs: ReadonlyArray<BufferHandle>,
+    inputs: ReadonlyArray<ConcreteTensorHandle>,
     sequences: ReadonlyArray<KvSequenceHandle>,
     tokens: ReadonlyArray<ReadonlyArray<number>>
-  ) => Effect.Effect<ReadonlyArray<BufferValue>, BackendError>
+  ) => Effect.Effect<ReadonlyArray<ConcreteTensorHandle>, BackendError>
 }
 
 export interface RuntimeDiagnostics {
@@ -266,26 +459,27 @@ export interface RuntimeDiagnostics {
  * @category models
  */
 export interface RuntimeService {
-  /** Stable identity used to isolate backend-owned caches. */
+  /** Stable identity shared by equivalent service instances and used to isolate backend-owned caches. */
   readonly identity: object
   readonly backend: BackendInfo
   readonly placement: Placement
   readonly capabilities: Capabilities
-  readonly graph: GraphFactory
-  readonly validateGraph: (handles: ReadonlyArray<GraphHandle>) => Effect.Effect<void, BackendError>
-  readonly evaluate: (roots: ReadonlyArray<GraphHandle>) => Effect.Effect<ReadonlyArray<BufferValue>, BackendError>
+  readonly node: (request: NodeRequest) => Effect.Effect<LazyTensorHandle, BackendError>
+  readonly evaluate: (
+    roots: ReadonlyArray<TensorHandle>
+  ) => Effect.Effect<ReadonlyArray<ConcreteTensorHandle>, BackendError>
   readonly grad: (
-    loss: GraphHandle,
-    wrt: ReadonlyArray<GraphHandle>
-  ) => Effect.Effect<ReadonlyArray<GraphHandle>, BackendError>
-  readonly compile: (roots: ReadonlyArray<GraphHandle>) => Effect.Effect<ProgramHandle, BackendError>
+    loss: TensorHandle,
+    wrt: ReadonlyArray<TensorHandle>
+  ) => Effect.Effect<ReadonlyArray<LazyTensorHandle>, BackendError>
+  readonly compile: (roots: ReadonlyArray<TensorHandle>) => Effect.Effect<ProgramHandle, BackendError>
   readonly run: (
     program: ProgramHandle,
-    inputs: ReadonlyArray<BufferHandle>,
+    inputs: ReadonlyArray<ConcreteTensorHandle>,
     scalars: ReadonlyArray<number>
-  ) => Effect.Effect<ReadonlyArray<BufferValue>, BackendError>
-  readonly readback: (buffer: BufferHandle) => Effect.Effect<ArrayBuffer, BackendError>
-  readonly releaseBuffer: (buffer: BufferHandle) => Effect.Effect<void, BackendError>
+  ) => Effect.Effect<ReadonlyArray<ConcreteTensorHandle>, BackendError>
+  readonly readback: (tensor: ConcreteTensorHandle) => Effect.Effect<ArrayBuffer, BackendError>
+  readonly release: (tensor: ConcreteTensorHandle) => Effect.Effect<void, BackendError>
   readonly extensions: {
     readonly pathSafetensors?: PathSafetensors
     readonly decode?: DecodeRuntime

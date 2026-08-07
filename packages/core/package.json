@@ -8,6 +8,9 @@
   },
   "main": "src/index.ts",
   "types": "src/index.ts",
+  "files": [
+    "dist"
+  ],
   "publishConfig": {
     "exports": {
       ".": "./dist/index.js",
@@ -17,7 +20,7 @@
     "types": "dist/index.d.ts"
   },
   "scripts": {
-    "build": "tsc -p tsconfig.build.json",
+    "build": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\" && tsc -p tsconfig.build.json",
     "typecheck": "tsc -p tsconfig.json",
     "test": "vitest run"
   },
@@ -25,7 +28,8 @@
     "effect": "4.0.0-beta.101"
   },
   "devDependencies": {
-    "@effect-torch/backend-native": "workspace:*",
+    "@effect-torch/backend-apple-native": "workspace:*",
+    "@effect-torch/backend-cpu": "workspace:*",
     "@effect-torch/tokenizers": "workspace:*",
     "@effect/vitest": "4.0.0-beta.101",
     "@types/node": "^22.0.0",

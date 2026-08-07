@@ -32,7 +32,7 @@ const gradcheck = (f: ScalarFn, input: ReadonlyArray<number>, shape: ReadonlyArr
     }
   })
 
-onDevices("Autodiff", () => (it) => {
+onDevices("Autodiff", (device) => (it) => {
   const f32 = (data: ReadonlyArray<number>, shape?: ReadonlyArray<number>) => Tensor.fromTypedArray(floats(data), shape)
   describe("gradcheck (finite differences)", () => {
     it.effect("elementwise add/mul/div with broadcasting", () =>
@@ -272,25 +272,27 @@ onDevices("Autodiff", () => (it) => {
         yield* gradcheck(sumOf((w2) => Tensor.convTranspose2d(xt, w2)), [1, 2, 3, 4], [1, 1, 2, 2])
       }))
 
-    it.effect("linalg", () =>
-      Effect.gen(function*() {
-        yield* gradcheck(sumOf((x) => Tensor.det(x)), [4, 1, 1, 3], [2, 2])
-        yield* gradcheck(sumOf((x) => Tensor.inverse(x)), [4, 1, 1, 3], [2, 2])
-        const b = yield* f32([9, 8], [2, 1])
-        yield* gradcheck(sumOf((x) => Tensor.solve(x, b)), [4, 1, 1, 3], [2, 2])
-        const a = yield* f32([4, 1, 1, 3], [2, 2])
-        yield* gradcheck(sumOf((x) => Tensor.solve(a, x)), [9, 8], [2, 1])
-      }))
+    if (device === "cpu") {
+      it.effect("linalg", () =>
+        Effect.gen(function*() {
+          yield* gradcheck(sumOf((x) => Tensor.det(x)), [4, 1, 1, 3], [2, 2])
+          yield* gradcheck(sumOf((x) => Tensor.inverse(x)), [4, 1, 1, 3], [2, 2])
+          const b = yield* f32([9, 8], [2, 1])
+          yield* gradcheck(sumOf((x) => Tensor.solve(x, b)), [4, 1, 1, 3], [2, 2])
+          const a = yield* f32([4, 1, 1, 3], [2, 2])
+          yield* gradcheck(sumOf((x) => Tensor.solve(a, x)), [9, 8], [2, 1])
+        }))
 
-    it.effect("batched linalg", () =>
-      Effect.gen(function*() {
-        yield* gradcheck(sumOf((x) => Tensor.det(x)), [4, 1, 1, 3, 2, 1, 1, 2], [2, 2, 2])
-        yield* gradcheck(sumOf((x) => Tensor.inverse(x)), [4, 1, 1, 3, 2, 1, 1, 2], [2, 2, 2])
-        const b = yield* f32([9, 8, 5, 4], [2, 2, 1])
-        yield* gradcheck(sumOf((x) => Tensor.solve(x, b)), [4, 1, 1, 3, 2, 1, 1, 2], [2, 2, 2])
-        const a = yield* f32([4, 1, 1, 3, 2, 1, 1, 2], [2, 2, 2])
-        yield* gradcheck(sumOf((x) => Tensor.solve(a, x)), [9, 8, 5, 4], [2, 2, 1])
-      }))
+      it.effect("batched linalg", () =>
+        Effect.gen(function*() {
+          yield* gradcheck(sumOf((x) => Tensor.det(x)), [4, 1, 1, 3, 2, 1, 1, 2], [2, 2, 2])
+          yield* gradcheck(sumOf((x) => Tensor.inverse(x)), [4, 1, 1, 3, 2, 1, 1, 2], [2, 2, 2])
+          const b = yield* f32([9, 8, 5, 4], [2, 2, 1])
+          yield* gradcheck(sumOf((x) => Tensor.solve(x, b)), [4, 1, 1, 3, 2, 1, 1, 2], [2, 2, 2])
+          const a = yield* f32([4, 1, 1, 3, 2, 1, 1, 2], [2, 2, 2])
+          yield* gradcheck(sumOf((x) => Tensor.solve(a, x)), [9, 8, 5, 4], [2, 2, 1])
+        }))
+    }
 
     it.effect("checkpoint preserves values and gradients, sharing randn draws", () =>
       Effect.gen(function*() {

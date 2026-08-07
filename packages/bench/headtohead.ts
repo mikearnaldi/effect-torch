@@ -1,4 +1,4 @@
-import * as BackendNative from "@effect-torch/backend-native"
+import * as BackendApple from "@effect-torch/backend-apple-native"
 import { type Runtime, Tensor } from "@effect-torch/core"
 import { Console, Effect } from "effect"
 import { createRequire } from "node:module"
@@ -74,4 +74,4 @@ const program = Effect.gen(function*() {
   yield* Console.log(`node-mlx:     ${median(theirs).toFixed(4)}  (all: ${theirs.map((x) => x.toFixed(3)).join(" ")})`)
 })
 
-Effect.runPromise(Effect.provide(program, BackendNative.Metal))
+Effect.runPromise(Effect.provide(program, BackendApple.layer))

@@ -9,14 +9,14 @@
 
 ## Summary
 
-Decouple `@effect-torch/core` from the single `@effect-torch/native`
-addon so CPU, Metal, CUDA, ROCm, PJRT/TPU, and remote implementations
-can be installed, versioned, and evolved independently.
+Decouple `@effect-torch/core` from the former monolithic native addon so
+CPU, Metal, and future implementations can be installed, versioned, and
+evolved independently.
 
 Core will depend on one Effect service, `Runtime.Runtime`, whose value is
 a live `Runtime.RuntimeService` bound to a default placement. The runtime owns its
-devices, contexts, queues, allocators, compiler caches, graph handles,
-buffers, executables, and optional extensions. Backend packages acquire
+  devices, contexts, queues, allocators, compiler caches, tensor handles,
+  executables, and optional extensions. Backend packages acquire
 that runtime and provide it as a Layer at the application or test-program
 boundary. Tensors retain only opaque handles and static metadata; all
 backend dispatch uses the ambient service, which validates those handles.
@@ -50,8 +50,7 @@ CPU and Metal kernels. It is now the scaling boundary.
 
 The coupling is deeper than `CurrentDevice`:
 
-- `@effect-torch/core` has a mandatory dependency on
-  `@effect-torch/native`.
+- Core had a mandatory dependency on the monolithic addon.
 - `Tensor.Any` stores that addon's `LazyTensor`; a concrete tensor also
   stores its `NativeTensor`.
 - Tensor construction, ordinary ops, evaluation, autodiff, compilation,
@@ -83,7 +82,7 @@ new boundary should preserve that advantage.
 3. Multiple backend packages can be loaded in one Node process without
    sharing native classes or global registration; each Effect program has
    one authoritative runtime service.
-4. Every tensor, buffer, and executable uses an opaque backend-owned handle
+4. Every tensor and executable uses an opaque backend-owned handle
    whose compatibility is validated by the active runtime.
 5. Existing lazy evaluation, one-walk semantics, autodiff, cancellation,
    compilation, strict dtype behavior, and early errors are preserved.
@@ -126,9 +125,7 @@ In particular, this RFC permits breaking changes to:
   addon.
 
 Old APIs are removed rather than deprecated by default. Core does not
-carry compatibility adapters after the corresponding migration phase;
-the transitional `@effect-torch/backend-native` adapter exists to stage
-the implementation safely, not to preserve a public legacy contract.
+carry compatibility adapters after the corresponding migration phase.
 
 ## Terminology
 
@@ -141,8 +138,7 @@ string `"metal"`:
 | Runtime | A live instance owning clients, contexts, queues, allocators, caches, and sessions |
 | Device | A physical or logical endpoint owned by a runtime |
 | Placement | A device plus a memory space or placement policy |
-| Graph handle | An opaque lazy value owned and interpreted by one runtime |
-| Buffer handle | An opaque materialized value owned by one runtime |
+| Tensor handle | An opaque lazy or concrete value owned and interpreted by one runtime, carrying only static metadata |
 | Executable handle | An opaque compiled artifact owned by one runtime |
 
 A backend is code. A runtime is a resource. A device cannot be compared
@@ -167,26 +163,26 @@ export interface RuntimeService {
 
   readonly node: (
     request: NodeRequest
-  ) => Effect.Effect<GraphHandle, BackendError>
+  ) => Effect.Effect<LazyTensorHandle, BackendError>
 
   readonly evaluate: (
-    roots: ReadonlyArray<GraphHandle>
-  ) => Effect.Effect<ReadonlyArray<BufferHandle>, BackendError>
+    roots: ReadonlyArray<TensorHandle>
+  ) => Effect.Effect<ReadonlyArray<ConcreteTensorHandle>, BackendError>
 
   readonly grad: (
-    loss: GraphHandle,
-    wrt: ReadonlyArray<GraphHandle>
-  ) => Effect.Effect<ReadonlyArray<GraphHandle>, BackendError>
+    loss: TensorHandle,
+    wrt: ReadonlyArray<TensorHandle>
+  ) => Effect.Effect<ReadonlyArray<LazyTensorHandle>, BackendError>
 
   readonly compile: (
-    roots: ReadonlyArray<GraphHandle>
+    roots: ReadonlyArray<TensorHandle>
   ) => Effect.Effect<ExecutableHandle, BackendError>
 
   readonly run: (
     executable: ExecutableHandle,
-    inputs: ReadonlyArray<BufferHandle>,
+    inputs: ReadonlyArray<ConcreteTensorHandle>,
     scalars: ReadonlyArray<number>
-  ) => Effect.Effect<ReadonlyArray<BufferHandle>, BackendError>
+  ) => Effect.Effect<ReadonlyArray<ConcreteTensorHandle>, BackendError>
 }
 
 export class Runtime extends Context.Service<Runtime, RuntimeService>()(
@@ -227,15 +223,24 @@ workers, and similar resources use `Layer.scoped` and
 ### Ambient runtime and tensor handles
 
 One ambient `Runtime.Runtime` service is authoritative for the whole Effect
-program. Tensors never retain, select, or provide a runtime. They contain
-only an opaque backend handle and static tensor metadata:
+program. Tensors never retain, select, or provide a runtime. They are the
+opaque backend handle and expose only static tensor metadata:
 
 ```ts
-interface Any {
-  readonly lazy: GraphHandle
+interface TensorHandle {
+  readonly _tag: "LazyTensor" | "Tensor"
   readonly shape: ReadonlyArray<number>
   readonly dtype: DType
+  readonly device: string
   readonly placement: Placement
+}
+
+interface LazyTensorHandle extends TensorHandle {
+  readonly _tag: "LazyTensor"
+}
+
+interface ConcreteTensorHandle extends TensorHandle {
+  readonly _tag: "Tensor"
 }
 ```
 
@@ -364,8 +369,8 @@ inputs contribute metadata and opaque handles but never select or provide a
 runtime. The backend rejects foreign exemplar or helper handles before
 compilation.
 
-Programs and buffers are separate opaque handle classes in the contract.
-The runtime validates executable and input compatibility before dispatch;
+Programs and tensors are separate opaque handle classes in the contract.
+The runtime validates executable and concrete-input compatibility before dispatch;
 core does not compare runtime identities.
 
 ### Transfers
@@ -373,8 +378,8 @@ core does not compare runtime identities.
 The baseline contract does not pass runtime services to tensor operations
 and does not provide an in-program cross-runtime transfer operation. Data
 movement between independently provided runtime programs is explicit: read
-back or export host-owned data from the source program, then import it at
-the target program boundary. A later application-level extension may
+back values from the source program and construct a new tensor in the target
+program. A later application-level extension may
 negotiate peer-to-peer, shared-memory, DLPack-like, or external GPU resource
 import, but zero-copy is not promised by the base API.
 
@@ -412,8 +417,9 @@ selection helper accepts explicit candidate Layers and falls back only
 on typed availability errors; authentication, configuration, or
 compilation failures must not silently select CPU.
 
-The current `Device.Best` hard-coded Metal/CPU probe is removed or moved
-to a convenience package assembled from explicit backend dependencies.
+No combined `Best` Layer is provided. Applications import one backend package
+and provide its Layer explicitly; application-owned fallback policy must handle
+typed availability errors without hiding failures or transfers.
 
 ### Inference extensions
 
@@ -438,50 +444,52 @@ finalization is fallback only.
 
 ### Tokenizers and safetensors
 
-Tokenization is a CPU utility, not a tensor backend. The tokenizer
-package returns `Uint32Array`, `ArrayBuffer`, or a backend-neutral host
-tensor descriptor. The selected runtime imports that data. A
-backend-specific zero-copy import can optimize the path later, but the
-tokenizer cannot construct another addon's graph handle.
+Tokenization is a CPU utility, not a tensor backend. The tokenizer package
+returns `Uint32Array`; `Tensor.fromTypedArray` snapshots that token data into
+the selected runtime. The tokenizer cannot construct another addon's tensor
+handle.
 
-Safetensors is split conceptually into:
-
-1. backend-neutral file/header/metadata parsing;
-2. host or mapped tensor byte views;
-3. runtime-owned import/export;
-4. optional direct-loading extensions.
+Safetensors is an optional direct-loading runtime extension. It consumes
+runtime-owned tensor handles for writes and returns concrete tensor handles
+plus structured archive metadata for reads. Core does not define a second
+host-side tensor representation or a byte codec API.
 
 A local path is not meaningful to every runtime. Remote APIs must
 distinguish client bytes, URLs or object-store references, and
 server-local paths. Requested placement is never silently changed while
 loading.
 
+Local runtimes may expose a structured path extension carrying named entries
+and metadata. The native extension uses the official Rust `safetensors` crate,
+writes through a same-directory temporary file and rename, rejects malformed
+layout and unsupported placement (including f64 on Metal), and never falls
+back to CPU. `Tensor.save` and `Tensor.load` retain the direct path API;
+`Tensor.loadArchive` returns metadata explicitly.
+
 ## Native Architecture
 
-The existing Rust implementation is separated into reusable crates.
-The exact names are provisional, but the boundaries are:
+The pre-CUDA Rust implementation is separated into reusable crates. Phase 3
+uses these boundaries:
 
 ```text
 effect-torch-graph
-  semantic nodes, static metadata, validation, traversal, serialization
+  production nodes, static metadata validation, traversal/remapping, leaf ownership
 
 effect-torch-autodiff
-  reverse/forward transforms, vmap, checkpoint transforms
+  reverse-mode gradients, vmap, checkpoint transforms
 
 effect-torch-compiler
-  neutral rewrites, fusion regions, frozen-program scheduling
+  neutral fusion IR and CPU interpreter, graph rewrites, frozen-program planning
 
 effect-torch-runtime
-  dtype, layout, errors, runtime traits, shared evaluator contracts
+  dtype, layout, errors, cancellation and runtime execution contracts
 
 effect-torch-runtime-cpu
 effect-torch-runtime-metal
-effect-torch-runtime-cuda
-effect-torch-runtime-rocm
   storage, allocators, kernels, lowering, synchronization
 
 effect-torch-napi
-  shared Node-API adapter and lifecycle support
+  shared cancellation, async-work, readback ownership and lifecycle support
 ```
 
 Native npm packages statically link the graph version and runtime crates
@@ -498,10 +506,12 @@ The graph representation is layered over time:
    plans, launch-specific nodes);
 4. optional stateful inference graph.
 
-Backend-specific lowered nodes do not leak into the semantic contract
-consumed by another backend. The current monolithic `NodeKind` can be
-split incrementally; it is not a flag-day prerequisite for the service
-boundary.
+Backend-specific lowered nodes do not leak into the TypeScript semantic
+contract consumed by another backend. Phase 3 moves the authoritative graph
+and validation into `effect-torch-graph`; its remaining lowered variants are
+the allowed incremental seam. Neutral fusion expressions and rewrite logic
+are owned by `effect-torch-compiler`, while Metal emission, kernels, and arena
+planning are owned by the macOS-gated `effect-torch-runtime-metal` crate.
 
 Rust traits are not the plugin boundary. A project-specific C function
 table would require permanent decisions about allocation, ownership,
@@ -515,22 +525,17 @@ The intended package topology is:
 
 ```text
 @effect-torch/core
-@effect-torch/backend-native       # transitional CPU + Metal adapter
 @effect-torch/backend-cpu
-@effect-torch/backend-metal
-@effect-torch/backend-cuda
-@effect-torch/backend-rocm
-@effect-torch/backend-pjrt
-@effect-torch/backend-remote
+@effect-torch/backend-apple-native
 @effect-torch/tokenizers
-@effect-torch/safetensors
 ```
 
-CPU and Metal may remain together during the TypeScript migration. CUDA
-is the first backend that must ship independently: its compiler, driver,
-platform, and binary distribution requirements prove the package
-boundary. ROCm remains separate from CUDA rather than becoming another
-feature flag on one universal addon.
+Each backend package owns one runtime, one Layer, and one package-local N-API
+addon. CPU never exposes or selects Metal. Apple Metal never exports CPU and
+does not silently execute Metal graphs on CPU. Both addons statically link the
+shared root Rust graph, autodiff, compiler, runtime, and N-API implementation
+crates. Tokenizers owns a separate tokenizer-only addon and returns host-owned
+token ids.
 
 Node-API stabilizes the Node-facing ABI, not the ABI of CUDA, ROCm,
 Metal, PJRT, or their linked libraries. Each backend package owns its
@@ -564,8 +569,9 @@ not cause effect-torch to introduce a second dynamic plugin ABI.
 
 ## Backend Conformance
 
-Core publishes a backend conformance suite. Every general backend runs
-the same semantic tests against each supported placement:
+Core's existing semantic tests run against CPU and every available Apple Metal
+placement through the test device helper. There is no conformance package,
+runner abstraction, or second set of wrapper tests. The shared suite covers:
 
 - constructors and strict dtype behavior;
 - every baseline operation, shape, broadcasting, and error contract;
@@ -574,7 +580,7 @@ the same semantic tests against each supported placement:
 - compilation, cache isolation, concurrent calls, and scalar slots;
 - cancellation and late-resource cleanup;
 - explicit clear/disposal and use-after-close behavior;
-- serialization/import/export round trips;
+- direct serialization round trips;
 - foreign-handle rejection;
 - memory boundedness under deferred GC.
 
@@ -588,8 +594,8 @@ being omitted silently.
 
 Rejected as the target. It preserves maximum Rust code sharing but ties
 all toolchains, binaries, platform dependencies, and release cycles to
-one package. TPU and remote execution remain unnatural. The existing
-addon is retained only as a transitional adapter.
+one package. TPU and remote execution remain unnatural. The monolithic addon
+was deleted when the package-local backend addons landed.
 
 ### Move the graph and transforms to TypeScript
 
@@ -630,43 +636,49 @@ first version.
 
 1. Add the `Runtime.Runtime` service contract, opaque handle types, and
    structured backend errors.
-2. Wrap the existing native addon as one CPU/Metal runtime without
-   changing its Rust graph implementation.
+2. Wrap the native graph implementation behind the runtime boundary.
 3. Route all tensor construction, operations, evaluation, autodiff, and
    compilation through the runtime.
-4. Remove `@effect-torch/native` imports and dependency from core.
+4. Remove direct native-addon imports and dependencies from core.
 5. Replace `DeviceKind` and the dumb `CurrentDevice` service with
    runtime-owned placement metadata.
 6. Require backends to reject foreign or incompatible handles at every
    multi-handle boundary.
 
-The transitional native runtime exposes one logical runtime instance
-where its current process-global Metal state requires it; it does not
-pretend multiple isolated Metal clients already exist.
+Each backend package exposes one logical runtime instance. The Apple package
+does not pretend that the current process-global Metal state is multiple
+isolated clients.
 
 ### Phase 2: Peripheral boundaries
 
-1. Move tokenizer-native integration behind a tokenizer package and
-   host tensor import.
-2. Separate safetensors parsing from runtime placement and direct I/O.
+1. Move tokenizer-native integration behind a tokenizer package returning
+   token arrays.
+2. Move safetensors behind optional direct runtime I/O.
 3. Move decode/KV APIs behind an inference extension.
-4. Replace hard-coded `Device.Best` with explicit Layer composition.
+4. Remove hard-coded best-device selection and require an explicit backend Layer.
 
-### Phase 3: Shared native crates
+### Phase 3: Shared native crates (implemented)
 
-1. Extract the semantic graph, autodiff, neutral transforms, runtime
-   contracts, and N-API support into shared Rust crates.
-2. Separate semantic nodes from backend-lowered nodes incrementally.
-3. Make CPU and Metal implementations consume the shared runtime traits.
-4. Preserve the full conformance suite after every extraction.
+1. The production graph, metadata validation, traversal/remapping, and leaf
+   ownership live in `effect-torch-graph`.
+2. Reverse-mode gradients, vmap, and checkpoint transforms live in
+   `effect-torch-autodiff`; neutral fusion, rewrites, CPU expression
+   interpretation, and frozen slot planning live in `effect-torch-compiler`.
+3. CPU and macOS-gated Metal storage and kernels live in their runtime crates
+   and implement the shared runtime contracts; reusable cancellation and
+   readback lifecycle mechanics live in `effect-torch-napi`.
+4. The CPU and Apple packages each own a thin N-API wrapper and binary. Shared
+   orchestration source remains in the root N-API crate; there is no generic
+   npm native package or combined backend adapter.
 
-### Phase 4: Independent accelerators
+### Phase 4: Independent accelerators (deferred)
 
 1. Ship CUDA as a separate addon and run the full backend suite.
 2. Validate binary packaging, availability errors, lifecycle, compiled
    caches, and memory ownership on real hardware.
 3. Add ROCm as an independent package using the same semantic crates.
-4. Split CPU and Metal packages if separate distribution remains useful.
+4. Keep every accelerator in its own package rather than adding it to either
+   existing backend addon.
 
 ### Phase 5: Compiler and remote runtimes
 
@@ -718,24 +730,19 @@ pretend multiple isolated Metal clients already exist.
    when placement display names match.
 5. Fiber interruption and runtime shutdown have tested, bounded resource
    behavior.
-6. The backend conformance suite is reusable by a package outside core.
-7. CUDA ships as an independently installable backend package and passes
-   the baseline suite on real hardware.
-8. No operation silently falls back or transfers to CPU.
-9. Incompatible core/backend package versions are rejected through the
+6. The core suite passes against every installed first-party backend.
+7. No operation silently falls back or transfers to CPU.
+8. Incompatible core/backend package versions are rejected through the
    backend's peer dependency before Layer construction.
-10. PJRT/TPU support is not declared until an effect-torch graph lowers,
+9. PJRT/TPU support is not declared until an effect-torch graph lowers,
     compiles, executes, and transfers buffers through a real PJRT plugin.
 
 ## Open Questions
 
-1. Whether CPU and Metal remain one first-party package after the
-   migration. This does not affect the core contract and can be decided
-   from release and binary-size measurements.
-2. Whether semantic graph serialization should be an effect-torch schema
+1. Whether semantic graph serialization should be an effect-torch schema
    or only StableHLO lowering. The first remote/PJRT implementation will
    provide the concrete requirement.
-3. Which inference features form the first extension contract. The
+2. Which inference features form the first extension contract. The
    current API is the behavioral reference, not a required physical
    representation.
 

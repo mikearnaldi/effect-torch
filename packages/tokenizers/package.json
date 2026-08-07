@@ -8,6 +8,25 @@
   },
   "main": "src/index.ts",
   "types": "src/index.ts",
+  "os": [
+    "darwin",
+    "linux"
+  ],
+  "cpu": [
+    "arm64",
+    "x64"
+  ],
+  "files": [
+    "dist/index.js",
+    "dist/index.d.ts",
+    "dist/internal/native.js",
+    "dist/internal/effect-torch-tokenizers.darwin-arm64.node",
+    "dist/internal/effect-torch-tokenizers.darwin-x64.node",
+    "dist/internal/effect-torch-tokenizers.linux-arm64-gnu.node",
+    "dist/internal/effect-torch-tokenizers.linux-arm64-musl.node",
+    "dist/internal/effect-torch-tokenizers.linux-x64-gnu.node",
+    "dist/internal/effect-torch-tokenizers.linux-x64-musl.node"
+  ],
   "publishConfig": {
     "exports": {
       ".": "./dist/index.js",
@@ -16,12 +35,16 @@
     "main": "dist/index.js",
     "types": "dist/index.d.ts"
   },
+  "napi": {
+    "binaryName": "effect-torch-tokenizers"
+  },
   "scripts": {
-    "build": "tsc -p tsconfig.build.json",
+    "build": "node ../../scripts/build-native.mjs --matrix && pnpm run build:ts && node ../../scripts/verify-native-packages.mjs --artifacts",
+    "build:debug": "node ../../scripts/build-native.mjs --host --profile debug && pnpm run build:ts",
+    "build:ts": "tsc -p tsconfig.build.json && node ../../scripts/clean-native-declarations.mjs",
     "typecheck": "tsc -p tsconfig.json"
   },
   "dependencies": {
-    "@effect-torch/native": "workspace:*",
     "effect": "4.0.0-beta.101"
   },
   "devDependencies": {

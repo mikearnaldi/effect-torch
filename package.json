@@ -3,13 +3,15 @@
   "private": true,
   "packageManager": "pnpm@10.13.1",
   "scripts": {
-    "build": "pnpm -r build",
+    "build": "pnpm run build:native:matrix && pnpm --filter @effect-torch/core run build",
+    "build:native:matrix": "node scripts/build-native.mjs --matrix && pnpm --filter @effect-torch/backend-cpu --filter @effect-torch/backend-apple-native --filter @effect-torch/tokenizers run build:ts && node scripts/verify-native-packages.mjs --artifacts",
     "test": "pnpm -r test",
     "typecheck": "pnpm -r typecheck",
     "lint": "oxlint -f unix && dprint check",
     "lint-fix": "oxlint --fix && dprint fmt",
     "bench": "pnpm --filter @effect-torch/bench bench",
-    "bench:mlx": "pnpm --filter @effect-torch/bench bench:mlx"
+    "bench:mlx": "pnpm --filter @effect-torch/bench bench:mlx",
+    "verify:native-packages": "node scripts/verify-native-packages.mjs"
   },
   "devDependencies": {
     "dprint": "^0.55.2",

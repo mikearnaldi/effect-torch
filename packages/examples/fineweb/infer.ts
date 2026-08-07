@@ -1,4 +1,4 @@
-import * as BackendNative from "@effect-torch/backend-native"
+import * as BackendApple from "@effect-torch/backend-apple-native"
 import { Model, Tensor } from "@effect-torch/core"
 import { NodeRuntime } from "@effect/platform-node"
 import { Effect, Option } from "effect"
@@ -67,4 +67,4 @@ const program = Effect.gen(function*() {
   }
 })
 
-NodeRuntime.runMain(program.pipe(Effect.provide(BackendNative.Best)))
+NodeRuntime.runMain(program.pipe(Effect.provide(BackendApple.layer)))

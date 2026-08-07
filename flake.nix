@@ -24,15 +24,12 @@
             packages = with pkgs; [
               nodejs_22
               corepack
-              rustc
-              cargo
-              rustfmt
-              clippy
-              rust-analyzer
+              rustup
+              zig
+              cargo-zigbuild
+              dprint
               cmake
               pkg-config
-            ] ++ pkgs.lib.optionals pkgs.stdenv.isDarwin [
-              libiconv
             ];
           };
         });

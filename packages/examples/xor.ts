@@ -1,4 +1,4 @@
-import * as BackendNative from "@effect-torch/backend-native"
+import * as BackendCpu from "@effect-torch/backend-cpu"
 import { LearningRate, Loss, Model, Optimizer, Runtime, Tensor, Trainer } from "@effect-torch/core"
 import { NodeRuntime } from "@effect/platform-node"
 import { Data, Effect } from "effect"
@@ -117,4 +117,4 @@ const evaluate = (
     yield* Effect.log(`${targets.length}/${targets.length} correct`)
   })
 
-NodeRuntime.runMain(program.pipe(Effect.provide(BackendNative.Best)))
+NodeRuntime.runMain(program.pipe(Effect.provide(BackendCpu.layer)))
