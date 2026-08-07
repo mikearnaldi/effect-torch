@@ -437,6 +437,50 @@ impl CancellationState {
     }
 }
 
+#[cfg(test)]
+mod cancellation_state_tests {
+    use super::CancellationState;
+    use std::sync::{Arc, Barrier};
+
+    #[test]
+    fn cancellation_prevents_commit() {
+        let state = CancellationState::new();
+        assert!(state.cancel());
+        assert!(!state.complete());
+        assert!(state.cancelled.load(std::sync::atomic::Ordering::Acquire));
+    }
+
+    #[test]
+    fn commit_prevents_late_cancellation() {
+        let state = CancellationState::new();
+        assert!(state.complete());
+        assert!(!state.cancel());
+        assert!(!state.cancelled.load(std::sync::atomic::Ordering::Acquire));
+    }
+
+    #[test]
+    fn cancellation_and_commit_have_one_winner() {
+        for _ in 0..1_000 {
+            let state = Arc::new(CancellationState::new());
+            let barrier = Arc::new(Barrier::new(3));
+            let cancel_state = state.clone();
+            let cancel_barrier = barrier.clone();
+            let cancel = std::thread::spawn(move || {
+                cancel_barrier.wait();
+                cancel_state.cancel()
+            });
+            let complete_state = state.clone();
+            let complete_barrier = barrier.clone();
+            let complete = std::thread::spawn(move || {
+                complete_barrier.wait();
+                complete_state.complete()
+            });
+            barrier.wait();
+            assert_ne!(cancel.join().unwrap(), complete.join().unwrap());
+        }
+    }
+}
+
 #[napi]
 impl CancellationToken {
     #[napi(constructor)]

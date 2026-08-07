@@ -1,6 +1,6 @@
 import * as BackendNative from "@effect-torch/backend-native"
-import { expect, layer } from "@effect/vitest"
-import { Effect } from "effect"
+import { expect, it as test, layer } from "@effect/vitest"
+import { Effect, Layer } from "effect"
 import { Runtime, Tensor } from "../src/index.ts"
 
 layer(BackendNative.Best)("Runtime", (it) => {
@@ -60,3 +60,24 @@ layer(BackendNative.Best)("Runtime", (it) => {
     expect(Tensor.signatureOf([tensor], BackendNative.cpu)).not.toBe(Tensor.signatureOf([tensor], other))
   })
 })
+
+test("compiled caches isolate runtime identities with the same placement", async () => {
+  const compiled = await Effect.runPromise(
+    Tensor.compile((inputs) => Effect.map(Tensor.relu(inputs[0]), (output) => [output]))
+  )
+  const input = await Effect.runPromise(
+    Effect.provide(Tensor.fromTypedArray(new Float32Array([-1, 2])), BackendNative.Cpu)
+  )
+  const otherRuntime: Runtime.RuntimeService = { ...BackendNative.cpu, identity: {} }
+  const OtherCpu = Layer.succeed(Runtime.Runtime, otherRuntime)
+
+  const [first] = await Effect.runPromise(Effect.provide(compiled.call([input]), BackendNative.Cpu))
+  const [second] = await Effect.runPromise(Effect.provide(compiled.call([input]), OtherCpu))
+
+  await expect(yieldValues(first)).resolves.toEqual([0, 2])
+  await expect(yieldValues(second)).resolves.toEqual([0, 2])
+  expect(await Effect.runPromise(compiled.stats)).toEqual({ cached: 2, compiled: 2 })
+})
+
+const yieldValues = (tensor: Tensor.Any): Promise<Array<number>> =>
+  Effect.runPromise(Effect.provide(Tensor.toNumberArray(tensor), BackendNative.Cpu))
