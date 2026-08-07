@@ -13,13 +13,13 @@ Decouple `@effect-torch/core` from the single `@effect-torch/native`
 addon so CPU, Metal, CUDA, ROCm, PJRT/TPU, and remote implementations
 can be installed, versioned, and evolved independently.
 
-Core will depend on one Effect service, `TensorRuntime`, whose value is
-a live runtime bound to a default placement. The runtime owns its
+Core will depend on one Effect service, `Runtime.Runtime`, whose value is
+a live `Runtime.RuntimeService` bound to a default placement. The runtime owns its
 devices, contexts, queues, allocators, compiler caches, graph handles,
 buffers, executables, and optional extensions. Backend packages acquire
-that runtime and provide it as a Layer. Tensors permanently retain the
-exact runtime that created them; operations dispatch through the
-tensor's owner, not through the ambient service.
+that runtime and provide it as a Layer at the application or test-program
+boundary. Tensors retain only opaque handles and static metadata; all
+backend dispatch uses the ambient service, which validates those handles.
 
 The TypeScript boundary uses opaque, runtime-owned handles. Native
 backend addons statically link shared Rust crates for the semantic
@@ -81,8 +81,10 @@ new boundary should preserve that advantage.
 1. `@effect-torch/core` has no mandatory native dependency.
 2. Backend implementations are independently installable packages.
 3. Multiple backend packages can be loaded in one Node process without
-   sharing native classes or global registration.
-4. Every tensor, buffer, and executable has explicit runtime ownership.
+   sharing native classes or global registration; each Effect program has
+   one authoritative runtime service.
+4. Every tensor, buffer, and executable uses an opaque backend-owned handle
+   whose compatibility is validated by the active runtime.
 5. Existing lazy evaluation, one-walk semantics, autodiff, cancellation,
    compilation, strict dtype behavior, and early errors are preserved.
 6. Native backends reuse one semantic graph and transform
@@ -116,7 +118,7 @@ In particular, this RFC permits breaking changes to:
 - TypeScript module names, service requirements, tensor internals, and
   public constructor signatures;
 - npm package names and dependency relationships;
-- backend protocol and capability shapes before their first stable
+- backend contract and capability shapes before their first stable
   release;
 - checkpoint metadata and other persisted formats;
 - native addon exports, handle classes, and compiled-program artifacts;
@@ -150,15 +152,14 @@ necessarily interoperable.
 
 ## Design
 
-### The `TensorRuntime` service
+### The `Runtime.Runtime` service
 
-Core defines a single service for tensor construction and runtime
-selection. The following is illustrative; exact method grouping may
+Core defines a single service for tensor construction and backend
+dispatch. The following is illustrative; exact method grouping may
 change during implementation, but the ownership boundary is normative:
 
 ```ts
-export interface Runtime {
-  readonly protocolVersion: number
+export interface RuntimeService {
   readonly identity: object
   readonly backend: BackendInfo
   readonly placement: Placement
@@ -188,8 +189,8 @@ export interface Runtime {
   ) => Effect.Effect<ReadonlyArray<BufferHandle>, BackendError>
 }
 
-export class TensorRuntime extends Context.Service<TensorRuntime, Runtime>()(
-  "@effect-torch/core/TensorRuntime"
+export class Runtime extends Context.Service<Runtime, RuntimeService>()(
+  "@effect-torch/core/Runtime"
 ) {}
 ```
 
@@ -197,6 +198,10 @@ Service methods have no Effect requirements of their own. Dependencies
 such as configuration, credentials, filesystem access, native addon
 loading, or logging are resolved while constructing the Layer, rather
 than leaking through every tensor operation.
+
+`identity` partitions backend-owned caches when a compiled function is used
+under different runtime services. Core never stores it on tensors or uses it
+as a package compatibility/version check.
 
 The first service value is bound to one default placement. A runtime may
 internally enumerate multiple devices, but core does not initially
@@ -219,15 +224,15 @@ trivial. CUDA contexts, PJRT clients, remote channels, background
 workers, and similar resources use `Layer.scoped` and
 `Effect.acquireRelease`.
 
-### Tensor affiliation
+### Ambient runtime and tensor handles
 
-Every tensor retains its exact runtime and placement alongside its
-opaque handle and static metadata:
+One ambient `Runtime.Runtime` service is authoritative for the whole Effect
+program. Tensors never retain, select, or provide a runtime. They contain
+only an opaque backend handle and static tensor metadata:
 
 ```ts
 interface Any {
-  readonly runtime: Runtime
-  readonly handle: GraphHandle
+  readonly lazy: GraphHandle
   readonly shape: ReadonlyArray<number>
   readonly dtype: DType
   readonly placement: Placement
@@ -240,26 +245,27 @@ types. Handles are internal opaque values. The runtime package that
 creates a handle is the only component allowed to interpret or destroy
 it.
 
-The ambient service is consulted only when creating a root tensor,
-loading data, or explicitly selecting a target placement. Once a tensor
-exists, ordinary operations dispatch through `self.runtime`. Tensor-like
-constructors derive placement from their input. Changing the ambient
-Layer cannot redirect an existing tensor to another backend.
+All backend dispatch, including graph construction that needs a factory,
+evaluation, autodiff, compilation, readback, disposal, serialization, and
+extensions, uses the ambient service. Tensor-like metadata can derive
+from inputs, but input tensors never provide runtime dependencies.
 
-For every multi-input operation:
+Core does not compare or recover runtime identity from tensors. A backend
+owns its handles and must reject an incompatible or foreign handle with a
+typed `BackendError` at its boundary. Applications provide one runtime
+Layer at the program boundary and do not locally override it.
 
-1. Core compares runtime identity by object identity, not backend or
-   device strings.
-2. Core validates dtype, shape, and placement compatibility.
-3. Core sends only handles owned by that runtime to the runtime method.
+### No stripped internal API
 
-The same rule applies to evaluation roots, program inputs, save entries,
-KV state, and every other multi-handle operation. The initial behavior
-for mixed runtimes is a typed error with an explicit-transfer remedy.
+The implementation must not declare or depend on `@internal` APIs. A
+symbol is either a normal published contract or an unexported
+implementation detail. `stripInternal` remains enabled as a publication
+safeguard, but source code must not rely on declaration-stripped fields or
+helpers.
 
-### Semantic operation protocol
+### Semantic operation contract
 
-Core and backend packages share a versioned semantic operation
+Core and backend packages share a semantic operation
 vocabulary. `NodeRequest` is a discriminated union covering public graph
 semantics: constructors, elementwise operations, reductions, shape
 operations, indexing, linalg, and semantic neural-network operations.
@@ -269,7 +275,7 @@ fused MSL expressions, or backend-specific GEMM epilogues.
 A single semantic request method is preferred to an interface with one
 method per operation:
 
-- It gives the backend protocol one versioned surface.
+- It gives the backend contract one coherent surface.
 - Older backends can reject an unknown operation cleanly.
 - Native adapters can map requests to existing N-API methods during the
   migration and later accept the request directly.
@@ -286,30 +292,31 @@ the same metadata at their boundary; moving to one authoritative metadata
 implementation is part of the Rust extraction, not a prerequisite for
 the TypeScript decoupling.
 
-### Protocol and capabilities
+### Package compatibility and capabilities
 
 Every runtime reports:
 
-- an effect-torch runtime protocol version;
-- backend name and implementation version;
+- its backend package name;
 - a stable display description of its default placement;
-- supported baseline opset version;
 - dtype and placement constraints;
-- optional extension versions.
+- available optional features and extensions.
 
-Layer construction rejects incompatible protocol majors. Additive
-protocol changes require explicit minor-version negotiation rather than
-assuming structural TypeScript compatibility at runtime. Backend npm
-packages also declare a compatible `@effect-torch/core` peer dependency.
+The npm package graph is the compatibility mechanism. Backend packages
+declare a semver range for `@effect-torch/core` as a peer dependency, and
+their own package version identifies the backend implementation. Core does
+not maintain a second runtime protocol, operation-set, or extension version that
+can drift from those package versions. Incompatible contract changes use
+normal semver and are rejected by package installation rather than by a
+duplicate runtime version negotiation path.
 
-The general tensor backend has a required baseline semantic opset. It is
+The general tensor backend has one required baseline semantic contract. It is
 not a bag of optional per-op callbacks with CPU fallback. A backend may
 reject an operation/dtype/layout combination at graph construction or
 compile time, but the error must identify the unsupported capability at
 the earliest boundary.
 
-Capabilities that imply different state or lifecycle models are
-versioned extensions. Initial candidates are:
+Capabilities that imply different state or lifecycle models are typed
+optional extensions. Initial candidates are:
 
 - compiled inference and stateful KV sessions;
 - paged attention and prefix caching;
@@ -322,9 +329,8 @@ versioned extensions. Initial candidates are:
 
 `evaluate` preserves the current multi-root contract: one call shares
 one graph walk, deduplication cache, random draws, and liveness analysis.
-All roots must initially belong to the same runtime. A future
-orchestrator may partition roots, but that behavior is not part of this
-RFC.
+The active backend validates every root handle before evaluation. A future
+orchestrator may partition roots, but that behavior is not part of this RFC.
 
 Runtime Effects are interruptible. Fiber interruption requests backend
 cancellation; it does not promise that an already submitted GPU or TPU
@@ -339,41 +345,38 @@ management mechanism.
 
 ### Compilation
 
-Compiled programs retain the runtime that compiled them. Program cache
-keys include at least:
+Compiled programs contain an opaque backend-owned program handle, not a
+runtime service reference. The active runtime validates that handle before
+execution. Backend-owned program cache keys include at least:
 
-- exact runtime identity;
-- backend and protocol/compiler versions;
+- the backend runtime instance where isolation requires it;
+- backend package and compiler versions;
 - placement and memory space;
 - input shapes and dtypes;
-- compile options and relevant capability versions.
+- compile options and relevant capabilities.
 
 Shape-specialized compilation from RFC 0008 and RFC 0016 remains
 unchanged. A cache hit can never reuse an executable across runtime
 instances merely because both display the same device name.
 
-Tracing uses the runtime of its exemplar inputs. Helper tensors created
-while tracing must use that runtime or derive from placeholders; an
-unrelated ambient runtime cannot enter a compiled graph. This closes the
-existing class of bugs where composed tensor operations create helper
-tensors from `CurrentDevice` instead of from their input.
+Tracing and helper-tensor construction use the ambient runtime. Exemplar
+inputs contribute metadata and opaque handles but never select or provide a
+runtime. The backend rejects foreign exemplar or helper handles before
+compilation.
 
-Programs and buffers are separate opaque handle classes in the protocol.
-A runtime validates executable and input affinity again before dispatch,
-even though core checks first.
+Programs and buffers are separate opaque handle classes in the contract.
+The runtime validates executable and input compatibility before dispatch;
+core does not compare runtime identities.
 
 ### Transfers
 
-Cross-runtime movement is explicit:
-
-```ts
-Tensor.transfer(tensor, targetRuntime)
-```
-
-The baseline implementation stages through host memory. A later
-extension may negotiate peer-to-peer, shared-memory, DLPack-like, or
-external GPU resource import, but zero-copy is not promised by the base
-API. Transfer failures name source and target placements.
+The baseline contract does not pass runtime services to tensor operations
+and does not provide an in-program cross-runtime transfer operation. Data
+movement between independently provided runtime programs is explicit: read
+back or export host-owned data from the source program, then import it at
+the target program boundary. A later application-level extension may
+negotiate peer-to-peer, shared-memory, DLPack-like, or external GPU resource
+import, but zero-copy is not promised by the base API.
 
 There is no implicit transfer for binary operations, evaluation,
 compilation, model execution, or fallback. This keeps performance,
@@ -389,7 +392,7 @@ operation, phase, and diagnostic details.
 The backend error taxonomy must distinguish at least:
 
 - unavailable backend or device;
-- incompatible runtime protocol;
+- incompatible core/backend package contract;
 - unsupported operation, dtype, layout, or placement;
 - invalid or foreign handle;
 - compilation failure;
@@ -416,9 +419,9 @@ to a convenience package assembled from explicit backend dependencies.
 
 The existing `DecodeProgram`, `NativeKvPool`, and `NativeKvSequence`
 encode one CPU/Metal inference strategy. They do not belong in the base
-runtime protocol.
+runtime contract.
 
-Inference becomes an optional versioned runtime extension with shared
+Inference becomes an optional typed runtime extension with shared
 high-level semantics but backend-owned physical state. For example:
 
 - CUDA may use paged device memory and continuous batching.
@@ -427,10 +430,11 @@ high-level semantics but backend-owned physical state. For example:
 - A remote runtime may return a server-owned generation session and a
   token stream without exposing KV buffers at all.
 
-Inference artifacts, pools, and sessions carry stronger affinity than
-ordinary tensors: runtime identity, compiled artifact identity, model or
-pool identity, and session generation must match. Stateful resources
-are scoped and explicitly releasable; GC finalization is fallback only.
+Inference artifacts, pools, and sessions carry stronger backend-owned
+relationships than ordinary tensors: compiled artifact, model or pool, and
+session generation must match. The active runtime validates those opaque
+handles. Stateful resources are scoped and explicitly releasable; GC
+finalization is fallback only.
 
 ### Tokenizers and safetensors
 
@@ -494,7 +498,7 @@ The graph representation is layered over time:
    plans, launch-specific nodes);
 4. optional stateful inference graph.
 
-Backend-specific lowered nodes do not leak into the semantic protocol
+Backend-specific lowered nodes do not leak into the semantic contract
 consumed by another backend. The current monolithic `NodeKind` can be
 split incrementally; it is not a flag-day prerequisite for the service
 boundary.
@@ -567,11 +571,11 @@ the same semantic tests against each supported placement:
 - every baseline operation, shape, broadcasting, and error contract;
 - multi-root evaluation and random-node consistency;
 - autodiff and finite-difference checks;
-- compilation, cache affinity, concurrent calls, and scalar slots;
+- compilation, cache isolation, concurrent calls, and scalar slots;
 - cancellation and late-resource cleanup;
 - explicit clear/disposal and use-after-close behavior;
 - serialization/import/export round trips;
-- foreign-runtime rejection;
+- foreign-handle rejection;
 - memory boundedness under deferred GC.
 
 Optional extensions publish separate suites. Backend-specific numerical
@@ -617,14 +621,15 @@ dispatch after lowering remains an implementation detail.
 Deferred. Provider capability negotiation and subgraph compilation are
 proven mechanisms, but automatic partitioning requires transfer costs,
 scheduling, numerical policy, and failure semantics that the project
-does not yet need. One graph belongs to one runtime in the first version.
+does not yet need. One graph is interpreted by one backend runtime in the
+first version.
 
 ## Migration
 
 ### Phase 1: TypeScript boundary
 
-1. Add the `TensorRuntime` protocol, opaque handle types, structured
-   backend errors, and runtime identity.
+1. Add the `Runtime.Runtime` service contract, opaque handle types, and
+   structured backend errors.
 2. Wrap the existing native addon as one CPU/Metal runtime without
    changing its Rust graph implementation.
 3. Route all tensor construction, operations, evaluation, autodiff, and
@@ -632,7 +637,8 @@ does not yet need. One graph belongs to one runtime in the first version.
 4. Remove `@effect-torch/native` imports and dependency from core.
 5. Replace `DeviceKind` and the dumb `CurrentDevice` service with
    runtime-owned placement metadata.
-6. Enforce runtime affinity across every multi-handle boundary.
+6. Require backends to reject foreign or incompatible handles at every
+   multi-handle boundary.
 
 The transitional native runtime exposes one logical runtime instance
 where its current process-global Metal state requires it; it does not
@@ -677,18 +683,20 @@ pretend multiple isolated Metal clients already exist.
   device and caches are process-global. The adapter must expose their
   real ownership until the native runtime is made instance-based.
 - **Graph-semantic drift between packages.** Shared Rust crates,
-  protocol/opset versions, and one conformance suite are the mitigation.
+  peer-dependency semver ranges, and one conformance suite are the
+  mitigation.
 - **Handle lifetime across Effect scopes.** Escaped tensors can outlive
   a scoped runtime value. Closed runtimes reject new use; releases drain
   in-flight ownership; tests cover use-after-close and worker teardown.
 - **Compiled cache aliasing.** Device display strings are insufficient.
-  Exact runtime identity and compiler options become part of every cache
-  key and runtime validation.
+  Each backend owns cache isolation and validates every executable and input
+  handle before dispatch.
 - **Inference over-generalization.** Forcing CPU/Metal paged-KV objects
   onto PJRT or remote serving would produce a leaky base interface.
-  Versioned extensions keep physical state backend-owned.
-- **Protocol growth.** A giant optional API becomes impossible to
-  implement honestly. The semantic baseline stays small and versioned;
+  Typed extensions keep physical state backend-owned.
+- **Contract growth.** A giant optional API becomes impossible to
+  implement honestly. The semantic baseline stays small; incompatible
+  changes follow package semver;
   stateful domains use extensions.
 - **Packaging burden.** Separate CUDA and ROCm prebuilds increase release
   work. This is intentional: their dependencies and compatibility
@@ -700,37 +708,34 @@ pretend multiple isolated Metal clients already exist.
 ## Acceptance Criteria
 
 1. `@effect-torch/core` imports and depends on no native package.
-2. The existing CPU and Metal suite passes through a `TensorRuntime`
+2. The existing CPU and Metal suite passes through a `Runtime`
    adapter with unchanged semantics and no material performance
    regression.
 3. Tensor, buffer, program, decode, and KV native classes no longer
    appear in core's public or internal backend-neutral types.
-4. Two runtime instances can coexist; cross-runtime operations fail at
-   the earliest boundary even when device display names match.
+4. Different runtime Layers can execute independent programs in one Node
+   process; a backend rejects foreign handles at the earliest boundary even
+   when placement display names match.
 5. Fiber interruption and runtime shutdown have tested, bounded resource
    behavior.
 6. The backend conformance suite is reusable by a package outside core.
 7. CUDA ships as an independently installable backend package and passes
    the baseline suite on real hardware.
 8. No operation silently falls back or transfers to CPU.
-9. Backend protocol incompatibility fails during Layer construction with
-   a typed diagnostic.
+9. Incompatible core/backend package versions are rejected through the
+   backend's peer dependency before Layer construction.
 10. PJRT/TPU support is not declared until an effect-torch graph lowers,
     compiles, executes, and transfers buffers through a real PJRT plugin.
 
 ## Open Questions
 
-1. Whether the public tag should be named `TensorRuntime` or
-   `ComputeRuntime`. This RFC uses `TensorRuntime`; it must not be named
-   `CurrentDevice`, because the value owns substantially more than a
-   device selector.
-2. Whether CPU and Metal remain one first-party package after the
-   migration. This does not affect the core protocol and can be decided
+1. Whether CPU and Metal remain one first-party package after the
+   migration. This does not affect the core contract and can be decided
    from release and binary-size measurements.
-3. Whether semantic graph serialization should be an effect-torch schema
+2. Whether semantic graph serialization should be an effect-torch schema
    or only StableHLO lowering. The first remote/PJRT implementation will
    provide the concrete requirement.
-4. Which inference features form the first extension version. The
+3. Which inference features form the first extension contract. The
    current API is the behavioral reference, not a required physical
    representation.
 

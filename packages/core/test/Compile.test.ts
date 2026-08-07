@@ -1,6 +1,6 @@
 import { describe, expect } from "@effect/vitest"
 import { Effect } from "effect"
-import { Device, Gradient, LearningRate, Loss, Model, Optimizer, Tensor, Trainer } from "../src/index.ts"
+import { Gradient, LearningRate, Loss, Model, Optimizer, Tensor, Trainer } from "../src/index.ts"
 import { floats, onDevices } from "./utils/devices.ts"
 
 const values = (t: Tensor.Any) => Tensor.toNumberArray(t)
@@ -47,9 +47,8 @@ onDevices("Compile", () => (it) => {
         // learning rate): a scalar slot declared with makeScalarInput,
         // numbers bound at runProgram time.
         const x = yield* Tensor.fromTypedArray(floats([1, 2, 3]), [3])
-        const device = yield* Device.CurrentDevice
         const a = yield* Tensor.makeInput(0, x)
-        const scale = yield* Tensor.makeScalarInput(1, "f32", device)
+        const scale = yield* Tensor.makeScalarInput(1, "f32")
         const program = yield* Tensor.freezeProgram([yield* Tensor.mul(a, scale)])
         expect(yield* values((yield* Tensor.runProgram(program, [x], [2]))[0])).toEqual([2, 4, 6])
         expect(yield* values((yield* Tensor.runProgram(program, [x], [-1]))[0])).toEqual([-1, -2, -3])

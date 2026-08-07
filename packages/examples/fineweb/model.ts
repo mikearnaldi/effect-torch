@@ -1,4 +1,6 @@
-import { type Device, Loss, Model, Tensor, Tokenizer } from "@effect-torch/core"
+import { Loss, Model, Tensor } from "@effect-torch/core"
+import type { Runtime } from "@effect-torch/core"
+import * as Tokenizer from "@effect-torch/tokenizers"
 import { Effect } from "effect"
 import fs from "node:fs"
 
@@ -18,7 +20,7 @@ export const LAYERS = 6
 
 export const createGpt = (
   vocabSize: number
-): Effect.Effect<Model.Model, Model.ModelError | Tensor.TensorError, Device.CurrentDevice> =>
+): Effect.Effect<Model.Model, Model.ModelError | Tensor.TensorError> =>
   Effect.gen(function*() {
     // Token embeddings; positions are relative (RoPE inside attention),
     // so generation is unbounded — no position table to outgrow.
@@ -60,7 +62,7 @@ export const saveParams = (model: Model.Model, params: Model.Params, path: strin
 export const loadParams = (
   model: Model.Model,
   path: string
-): Effect.Effect<Model.Params, Tensor.TensorError, Device.CurrentDevice> =>
+): Effect.Effect<Model.Params, Tensor.TensorError, Runtime.Runtime> =>
   Effect.gen(function*() {
     const tensors = yield* Tensor.load(path)
     return model.names.map((name) => {

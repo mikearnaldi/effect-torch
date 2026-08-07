@@ -1,4 +1,5 @@
-import { Device, LearningRate, Loss, Model, Optimizer, Tensor, Trainer } from "@effect-torch/core"
+import * as BackendNative from "@effect-torch/backend-native"
+import { LearningRate, Loss, Model, Optimizer, Runtime, Tensor, Trainer } from "@effect-torch/core"
 import { NodeRuntime } from "@effect/platform-node"
 import { Data, Effect } from "effect"
 
@@ -7,12 +8,12 @@ const STEPS = 3000
 const LR = 0.1
 
 const program = Effect.gen(function*() {
-  const device = yield* Device.CurrentDevice
+  const runtime = yield* Runtime.Runtime
   const x = yield* Tensor.fromTypedArray(new Float32Array([0, 0, 0, 1, 1, 0, 1, 1]), [4, 2])
   const y = yield* Tensor.fromTypedArray(new Float32Array([0, 1, 1, 0]), [4, 1])
 
   // A 2 -> HIDDEN (tanh) -> 1 (sigmoid) MLP, composed from primitive models.
-  yield* Effect.log(`1) creating model: 2 -> ${HIDDEN} (tanh) -> 1 (sigmoid) on ${device}`)
+  yield* Effect.log(`1) creating model: 2 -> ${HIDDEN} (tanh) -> 1 (sigmoid) on ${runtime.placement.description}`)
   const model = yield* createModel
   const params = yield* init(model)
 
@@ -116,4 +117,4 @@ const evaluate = (
     yield* Effect.log(`${targets.length}/${targets.length} correct`)
   })
 
-NodeRuntime.runMain(program.pipe(Effect.provide(Device.Best)))
+NodeRuntime.runMain(program.pipe(Effect.provide(BackendNative.Best)))

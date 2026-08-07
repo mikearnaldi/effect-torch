@@ -1,5 +1,5 @@
 {
-  "name": "@effect-torch/core",
+  "name": "@effect-torch/backend-native",
   "version": "0.1.0",
   "type": "module",
   "exports": {
@@ -18,18 +18,17 @@
   },
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
-    "typecheck": "tsc -p tsconfig.json",
-    "test": "vitest run"
+    "typecheck": "tsc -p tsconfig.json"
   },
   "dependencies": {
+    "@effect-torch/native": "workspace:*",
     "effect": "4.0.0-beta.101"
   },
+  "peerDependencies": {
+    "@effect-torch/core": "workspace:^"
+  },
   "devDependencies": {
-    "@effect-torch/backend-native": "workspace:*",
-    "@effect-torch/tokenizers": "workspace:*",
-    "@effect/vitest": "4.0.0-beta.101",
     "@types/node": "^22.0.0",
-    "typescript": "^5.8.0",
-    "vitest": "^4.1.10"
+    "typescript": "^5.8.0"
   }
 }

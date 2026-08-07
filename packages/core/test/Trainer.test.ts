@@ -233,7 +233,8 @@ onDevices("Trainer", (device) => (it) => {
         expect(loss).toBeLessThan(0.1)
         // masters stay f32 — the optimizer's update arithmetic is f32
         expect(params.every((p) => p.dtype === "f32")).toBe(true)
-        const [pred] = yield* Tensor.compute([yield* model.forward(params, data.input)])
+        const forwardParams = yield* Effect.all(params.map((param) => Tensor.cast(param, "bf16")))
+        const [pred] = yield* Tensor.compute([yield* model.forward(forwardParams, data.input)])
         expect((yield* values(pred)).map((v) => (v > 0.5 ? 1 : 0))).toEqual([0, 1, 1, 0])
       }))
 

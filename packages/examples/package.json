@@ -9,7 +9,9 @@
     "typecheck": "tsc -p tsconfig.json"
   },
   "dependencies": {
+    "@effect-torch/backend-native": "workspace:*",
     "@effect-torch/core": "workspace:*",
+    "@effect-torch/tokenizers": "workspace:*",
     "@effect/platform-node": "4.0.0-beta.101",
     "@types/node": "^22.0.0",
     "effect": "^4.0.0-beta.101",

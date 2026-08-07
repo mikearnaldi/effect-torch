@@ -59,6 +59,11 @@ fn tensor_bytes(t: &Val) -> Res<Vec<u8>> {
             Ok(out)
         }
         Val::Metal(t) => {
+            let t = if t.layout.is_contiguous() {
+                t.clone()
+            } else {
+                runtime::metal::kernels::strided_copy(runtime::metal::device::MetalDevice::get(), t)?
+            };
             runtime::metal::device::MetalDevice::get().synchronize()?;
             let n = t.numel();
             let size = t.dtype.size_in_bytes();

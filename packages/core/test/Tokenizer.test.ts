@@ -1,10 +1,9 @@
-import { describe, expect } from "@effect/vitest"
+import * as Tokenizer from "@effect-torch/tokenizers"
+import { describe, expect, it } from "@effect/vitest"
 import { Effect, Option } from "effect"
 import * as fs from "node:fs"
 import * as os from "node:os"
 import * as path from "node:path"
-import { Tensor, Tokenizer } from "../src/index.ts"
-import { onDevices } from "./utils/devices.ts"
 
 const tmpdir = Effect.sync(() => fs.mkdtempSync(path.join(os.tmpdir(), "effect-torch-tok-")))
 
@@ -35,9 +34,9 @@ const trainBpe = (
     config
   )
 
-const numbers = (t: Tensor.Any) => Tensor.toNumberArray(t)
+const numbers = (ids: Tokenizer.TokenIds): Effect.Effect<Array<number>> => Effect.succeed(Array.from(ids.data))
 
-onDevices("Tokenizer", () => (it) => {
+describe("Tokenizer", () => {
   describe("BPE", () => {
     it.effect("encodes to a [T] u32 tensor and decodes losslessly, including unicode", () =>
       Effect.gen(function*() {

@@ -1,4 +1,4 @@
-import { Device, Tensor, Tokenizer } from "@effect-torch/core"
+import * as Tokenizer from "@effect-torch/tokenizers"
 import { NodeRuntime } from "@effect/platform-node"
 import { Effect } from "effect"
 import { parquetMetadataAsync, parquetReadObjects } from "hyparquet"
@@ -63,7 +63,7 @@ const program = Effect.gen(function*() {
       parquetReadObjects({ file, compressors, columns: ["text"], rowStart: start, rowEnd: end })
     )
     const flat = yield* tokenizer.encodeBatchConcat(documents.map((document) => document.text + EOT))
-    const ids = yield* Tensor.toNumberArray(flat)
+    const ids = flat.data
     const u16 = new Uint16Array(ids.length)
     for (let i = 0; i < ids.length; i++) u16[i] = ids[i]
     const bytes = Buffer.from(u16.buffer, u16.byteOffset, u16.byteLength)
@@ -98,4 +98,4 @@ const expect50256 = (tokenizer: Tokenizer.Tokenizer) => {
   }
 }
 
-NodeRuntime.runMain(program.pipe(Effect.provide(Device.Best)))
+NodeRuntime.runMain(program)

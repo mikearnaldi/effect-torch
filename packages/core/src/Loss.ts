@@ -9,7 +9,7 @@
  */
 import { Effect } from "effect"
 import { dual } from "effect/Function"
-import type { CurrentDevice } from "./Device.ts"
+import type * as Runtime from "./Runtime.ts"
 import * as Tensor from "./Tensor.ts"
 
 /**
@@ -34,7 +34,7 @@ export interface LossOptions {
 const applyReduction = (
   self: Tensor.Any,
   reduction: Reduction
-): Effect.Effect<Tensor.Lazy, Tensor.TensorError> => {
+): Effect.Effect<Tensor.Lazy, Tensor.TensorError, Runtime.Runtime> => {
   switch (reduction) {
     case "mean":
       return Tensor.mean(self)
@@ -48,7 +48,7 @@ const applyReduction = (
 const isTarget = (value: unknown): boolean =>
   value !== undefined && value !== null && typeof value === "object" && "_tag" in value
 
-const dualLoss = <T, O, R = never>(
+const dualLoss = <T, O, R = Runtime.Runtime>(
   impl: (
     pred: Tensor.Any,
     target: T,
@@ -208,7 +208,7 @@ const checkClassTargets = (
  * @since 0.1.0
  * @category losses
  */
-export const crossEntropy = dualLoss<Tensor.Any, LossOptions, CurrentDevice>((logits, targets, options) =>
+export const crossEntropy = dualLoss<Tensor.Any, LossOptions>((logits, targets, options) =>
   Effect.gen(function*() {
     const depth = yield* checkClassTargets("crossEntropy", logits, targets)
     if (logits.dtype !== "f32" && logits.dtype !== "f64" && logits.dtype !== "bf16") {
@@ -234,7 +234,7 @@ export const crossEntropy = dualLoss<Tensor.Any, LossOptions, CurrentDevice>((lo
  * @since 0.1.0
  * @category losses
  */
-export const nll = dualLoss<Tensor.Any, LossOptions, CurrentDevice>((logProbs, targets, options) =>
+export const nll = dualLoss<Tensor.Any, LossOptions>((logProbs, targets, options) =>
   Effect.gen(function*() {
     const depth = yield* checkClassTargets("nll", logProbs, targets)
     if (logProbs.dtype !== "f32" && logProbs.dtype !== "f64") {
@@ -313,7 +313,7 @@ export const cosineEmbeddingLoss = (
   b: Tensor.Any,
   targets: Tensor.Any,
   options: CosineEmbeddingOptions = {}
-): Effect.Effect<Tensor.Lazy, Tensor.TensorError> =>
+): Effect.Effect<Tensor.Lazy, Tensor.TensorError, Runtime.Runtime> =>
   Effect.gen(function*() {
     const margin = options.margin ?? 0
     const dot = yield* Tensor.sum(yield* Tensor.mul(a, b), { dims: [-1] })

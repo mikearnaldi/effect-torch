@@ -1,7 +1,7 @@
 import { describe, expect } from "@effect/vitest"
 import * as assert from "@effect/vitest/utils"
 import { Effect, Exit } from "effect"
-import { type Device, Gradient, Loss, Tensor } from "../src/index.ts"
+import { Gradient, Loss, type Runtime, Tensor } from "../src/index.ts"
 import { deep, floatDtype, floats, GRADCHECK_EPS, GRADCHECK_TOL, onDevices, TOL } from "./utils/devices.ts"
 
 const values = (t: Tensor.Any) => Tensor.toNumberArray(t)
@@ -10,10 +10,10 @@ const scalar = (t: Tensor.Any) => Effect.map(values(t), (v) => v[0])
 
 type ScalarFn = (
   x: Tensor.Lazy
-) => Effect.Effect<Tensor.Lazy, Tensor.TensorError, Device.CurrentDevice>
+) => Effect.Effect<Tensor.Lazy, Tensor.TensorError, Runtime.Runtime>
 
 const sumOf = (
-  op: (x: Tensor.Lazy) => Effect.Effect<Tensor.Lazy, Tensor.TensorError, Device.CurrentDevice>
+  op: (x: Tensor.Lazy) => Effect.Effect<Tensor.Lazy, Tensor.TensorError, Runtime.Runtime>
 ): ScalarFn =>
 (x) => Effect.flatMap(op(x), (t) => Tensor.sum(t))
 
@@ -408,7 +408,7 @@ onDevices("Autodiff", () => (it) => {
         const x = yield* f32([1, 2, 3, 4, 5, 6], [3, 2])
         const bx = yield* f32([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12], [2, 3, 2])
         const perBatch = (
-          f: (slice: Tensor.Any) => Effect.Effect<Tensor.Any, Tensor.TensorError>
+          f: (slice: Tensor.Any) => Effect.Effect<Tensor.Any, Tensor.TensorError, Runtime.Runtime>
         ) =>
           Effect.gen(function*() {
             const outs: Array<Array<number>> = []

@@ -30,11 +30,11 @@
  * @since 0.1.0
  */
 import { Clock, Duration, Effect } from "effect"
-import { CurrentDevice, type DeviceKind } from "./Device.ts"
 import * as Gradient from "./Gradient.ts"
 import type { LearningRate } from "./LearningRate.ts"
 import * as Model from "./Model.ts"
 import * as Optimizer from "./Optimizer.ts"
+import * as Runtime from "./Runtime.ts"
 import * as Tensor from "./Tensor.ts"
 
 /**
@@ -136,7 +136,7 @@ export interface TrainConfig<
   readonly loss: (
     pred: Tensor.Any,
     target: Tensor.Any
-  ) => Effect.Effect<Tensor.Lazy, EL | Tensor.TensorError, CurrentDevice | RL>
+  ) => Effect.Effect<Tensor.Lazy, EL | Tensor.TensorError, Runtime.Runtime | RL>
   readonly data: TrainDataSource<ED, RD>
   readonly stop: (info: TrainStep) => boolean
   readonly onStep?: (info: TrainStep) => Effect.Effect<void, EO, RO>
@@ -215,7 +215,7 @@ export interface Trainer<S, EL = never, RL = never, ED = never, RD = never, EO =
   ) => Effect.Effect<
     Trained<S>,
     Model.ModelError | Tensor.TensorError | Gradient.GradError | EL | ED | EO,
-    CurrentDevice | RL | RD | RO
+    Runtime.Runtime | RL | RD | RO
   >
   /**
    * Shape-cache diagnostics: programs cached, traces performed.
@@ -253,13 +253,11 @@ export const make = <S, EL = never, RL = never, ED = never, RD = never, EO = nev
   })
 
 /**
- * The uncompiled loop: every step constructs and evaluates the full
- * step graph. Internal — the reference the compiled programs are
- * checked against step-for-step in tests.
+ * The uncompiled reference loop: every step constructs and evaluates the
+ * full step graph. It is useful for checking compiled execution step-for-step.
  *
  * @since 0.1.0
  * @category constructors
- * @internal
  */
 export const makeUncompiled = <S, EL = never, RL = never, ED = never, RD = never, EO = never, RO = never>(
   model: Model.Model,
@@ -283,7 +281,7 @@ const uncompiledStep = <S, EL, RL, ED, RD, EO, RO>(
 ): Effect.Effect<
   { readonly loss: number; readonly params: ReadonlyArray<Tensor.Concrete>; readonly state: S },
   Model.ModelError | Tensor.TensorError | Gradient.GradError | EL,
-  CurrentDevice | RL
+  Runtime.Runtime | RL
 > =>
   Effect.gen(function*() {
     const forwardParams = config.precision === "mixedBf16"
@@ -291,7 +289,7 @@ const uncompiledStep = <S, EL, RL, ED, RD, EO, RO>(
       : params
     const prediction = yield* model.forward(forwardParams, data.input)
     const lossTensor = yield* config.loss(prediction, data.target)
-    const lr = yield* Tensor.constant(config.lr(step - 1), { dtype: params[0].dtype })
+    const lr = yield* Tensor.constantLike(params[0], config.lr(step - 1))
     const result = yield* Optimizer.step(config.optimizer, lossTensor, params, state, lr)
     return {
       loss: (yield* Tensor.toNumberArray(result.loss))[0],
@@ -312,12 +310,11 @@ const traceStep = <S, EL, RL, ED, RD, EO, RO>(
   params: Model.Params,
   stateRoots: ReadonlyArray<Tensor.Any>,
   state: S,
-  data: TrainData,
-  device: DeviceKind
+  data: TrainData
 ): Effect.Effect<
-  Tensor.NativeCompiledProgram,
+  Tensor.CompiledProgram,
   Model.ModelError | Tensor.TensorError | Gradient.GradError | EL,
-  CurrentDevice | RL
+  Runtime.Runtime | RL
 > =>
   Effect.gen(function*() {
     const optimizer = config.optimizer
@@ -338,8 +335,7 @@ const traceStep = <S, EL, RL, ED, RD, EO, RO>(
     // applies with Tensor.constant.
     const lr = yield* Tensor.makeScalarInput(
       paramCount + stateCount + 2,
-      params[0]?.dtype ?? "f32",
-      device
+      params[0]?.dtype ?? "f32"
     )
     const placeholderState = optimizer.rebuildState(state, statePlaceholders)
     const forwardParams = config.precision === "mixedBf16"
@@ -363,17 +359,17 @@ const compiledStep = <S, EL, RL, ED, RD, EO, RO>(
 ): Effect.Effect<
   { readonly loss: number; readonly params: ReadonlyArray<Tensor.Concrete>; readonly state: S },
   Model.ModelError | Tensor.TensorError | Gradient.GradError | EL,
-  CurrentDevice | RL
+  Runtime.Runtime | RL
 > =>
   Effect.gen(function*() {
-    const device = yield* CurrentDevice
+    const runtime = yield* Runtime.Runtime
     const optimizer = config.optimizer
     const stateRoots = optimizer.stateRoots(state)
     const inputs = [...params, ...stateRoots, data.input, data.target]
     const program = yield* Tensor.cachedProgram(
       cache,
-      Tensor.signatureOf(inputs),
-      () => traceStep(model, config, params, stateRoots, state, data, device)
+      Tensor.signatureOf(inputs, runtime),
+      () => traceStep(model, config, params, stateRoots, state, data)
     )
     const outputs = yield* Tensor.runProgram(program, inputs, [config.lr(step - 1)])
     const loss = (yield* Tensor.toNumberArray(outputs[0]))[0]
@@ -399,28 +395,20 @@ const trainLoop = <S, EL = never, RL = never, ED = never, RD = never, EO = never
 ): Effect.Effect<
   Trained<S>,
   Model.ModelError | Tensor.TensorError | Gradient.GradError | EL | ED | EO,
-  CurrentDevice | RL | RD | RO
+  Runtime.Runtime | RL | RD | RO
 > =>
   Effect.gen(function*() {
-    if (config.precision === "mixedBf16" && (yield* CurrentDevice) !== "metal") {
-      return yield* new Model.ModelError({
-        op: "train",
-        message: "mixedBf16 precision requires the metal device (bf16 kernels)"
-      })
-    }
     let params: Model.Params = initial !== undefined
       ? initial
       : yield* model.init
-    let state = resume !== undefined ? resume.state : yield* config.optimizer.init(params)
-    if (cache !== undefined) {
-      // Program inputs must be materialized buffers: the initial
-      // parameters and state are lazy graph values, so evaluate them
-      // once up front; every later step returns materialized values.
-      const roots = [...params, ...config.optimizer.stateRoots(state)]
-      const materialized = yield* Tensor.compute(roots)
-      params = materialized.slice(0, params.length)
-      state = config.optimizer.rebuildState(state, materialized.slice(params.length))
+    const runtime = yield* Runtime.Runtime
+    if (config.precision === "mixedBf16" && !runtime.capabilities.features.includes("mixed-bf16")) {
+      return yield* new Model.ModelError({
+        op: "train",
+        message: `mixedBf16 precision is not supported by ${runtime.backend.name} on ${runtime.placement.description}`
+      })
     }
+    let state = resume !== undefined ? resume.state : yield* config.optimizer.init(params)
     let step = resume?.step ?? 0
     let loss = Number.NaN
     let trained: ReadonlyArray<Tensor.Concrete>

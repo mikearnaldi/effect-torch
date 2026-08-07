@@ -1,25 +1,34 @@
-import native from "@effect-torch/native"
+import * as BackendNative from "@effect-torch/backend-native"
 import { describe, expect, layer } from "@effect/vitest"
 import * as assert from "@effect/vitest/utils"
 import { Effect } from "effect"
 import { setFlagsFromString } from "node:v8"
 import { runInNewContext } from "node:vm"
-import { Device, Tensor } from "../src/index.ts"
+import { Runtime, Tensor } from "../src/index.ts"
 
 setFlagsFromString("--expose-gc")
 const collectGarbage = runInNewContext("gc") as () => void
 
-layer(Device.Cpu)("Memory", (it) => {
+const externalMemoryBytes = Effect.gen(function*() {
+  const runtime = yield* Runtime.Runtime
+  const diagnostics = runtime.extensions.diagnostics
+  if (diagnostics === undefined) {
+    return yield* Effect.die(new Error("runtime does not provide memory diagnostics"))
+  }
+  return yield* diagnostics.externalMemoryBytes
+})
+
+layer(BackendNative.Cpu)("Memory", (it) => {
   describe("external memory accounting", () => {
     it.effect("clear releases the bytes immediately, without GC", () =>
       Effect.gen(function*() {
         const bytes = 4096 * 4096 * 4
         collectGarbage()
-        const before = native.externalMemoryBytes()
+        const before = yield* externalMemoryBytes
         const [t] = yield* Tensor.compute([yield* Tensor.zeros([4096, 4096])])
-        assert.strictEqual(native.externalMemoryBytes() - before, bytes)
+        assert.strictEqual((yield* externalMemoryBytes) - before, bytes)
         yield* Tensor.clear(t)
-        assert.strictEqual(native.externalMemoryBytes(), before)
+        assert.strictEqual(yield* externalMemoryBytes, before)
       }))
 
     it.effect("use after clear is a typed error, through the handle and the graph", () =>
@@ -35,7 +44,7 @@ layer(Device.Cpu)("Memory", (it) => {
         expect(viaGraph.message).toMatch(/cleared/)
       }))
 
-    it.effect("native tensor bytes are reported on compute and released on GC", () =>
+    it.effect("runtime tensor bytes are reported on compute and released on GC", () =>
       Effect.gen(function*() {
         const bytes = 4096 * 4096 * 4
 
@@ -45,20 +54,20 @@ layer(Device.Cpu)("Memory", (it) => {
         })
 
         collectGarbage()
-        const before = native.externalMemoryBytes()
+        const before = yield* externalMemoryBytes
         assert.deepStrictEqual(yield* allocate, [4096, 4096])
-        assert.strictEqual(native.externalMemoryBytes() - before, bytes)
-        // native finalizers run on a later event-loop turn after the handle
+        assert.strictEqual((yield* externalMemoryBytes) - before, bytes)
+        // Backend finalizers run on a later event-loop turn after the handle
         // becomes unreachable; pump the loop until the bytes come back
         const waitTurn = Effect.promise(() => new Promise((resolve) => setTimeout(resolve, 100)))
         yield* Effect.gen(function*() {
           for (let i = 0; i < 30; i++) {
-            if (native.externalMemoryBytes() === before) return
+            if ((yield* externalMemoryBytes) === before) return
             yield* waitTurn
             collectGarbage()
           }
         })
-        assert.strictEqual(native.externalMemoryBytes(), before)
+        assert.strictEqual(yield* externalMemoryBytes, before)
       }), 20000)
   })
 

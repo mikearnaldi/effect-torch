@@ -1,4 +1,5 @@
-import { Device, Tensor } from "@effect-torch/core"
+import * as BackendNative from "@effect-torch/backend-native"
+import { type Runtime, Tensor } from "@effect-torch/core"
 import { Console, Effect } from "effect"
 import { createRequire } from "node:module"
 import { performance } from "node:perf_hooks"
@@ -24,7 +25,7 @@ const chain = (
   a: Tensor.Any,
   b: Tensor.Any,
   n: number
-): Effect.Effect<Tensor.Lazy, Tensor.TensorError> =>
+): Effect.Effect<Tensor.Lazy, Tensor.TensorError, Runtime.Runtime> =>
   Effect.gen(function*() {
     let r = yield* Tensor.matmul(a, b)
     for (let i = 1; i < n; i++) {
@@ -33,7 +34,7 @@ const chain = (
     return r
   })
 
-const timed = <E>(effect: Effect.Effect<unknown, E>): Effect.Effect<number, E> =>
+const timed = <E, R>(effect: Effect.Effect<unknown, E, R>): Effect.Effect<number, E, R> =>
   Effect.gen(function*() {
     const start = yield* Effect.sync(() => performance.now())
     yield* Effect.forEach(Array.from({ length: INNER }), () => effect, { discard: true })
@@ -73,4 +74,4 @@ const program = Effect.gen(function*() {
   yield* Console.log(`node-mlx:     ${median(theirs).toFixed(4)}  (all: ${theirs.map((x) => x.toFixed(3)).join(" ")})`)
 })
 
-Effect.runPromise(Effect.provide(program, Device.Metal))
+Effect.runPromise(Effect.provide(program, BackendNative.Metal))

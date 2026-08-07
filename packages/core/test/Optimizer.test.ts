@@ -235,7 +235,7 @@ onDevices("Optimizer", () => (it) => {
         const avgGradSgd = (): Optimizer.Optimizer<AvgState> => ({
           init: (params) =>
             Effect.map(
-              Effect.forEach(params, (p) => Tensor.zeros(p.shape, { dtype: p.dtype })),
+              Effect.forEach(params, Tensor.zerosLike),
               (prev): AvgState => ({ prev })
             ),
           step: (params, grads, state, lr) =>
@@ -317,6 +317,14 @@ onDevices("Optimizer", () => (it) => {
         expect(() => Optimizer.adam({ beta2: Number.NaN })).toThrow("beta1 and beta2")
         expect(() => Optimizer.adam({ eps: 0 })).toThrow("eps must be positive")
         expect(() => Optimizer.adam({ eps: Number.NaN })).toThrow("eps must be positive")
+      }))
+
+    it.effect("rejects numerically unstable f32 bias correction", () =>
+      Effect.gen(function*() {
+        const optimizer = yield* Optimizer.adam({ beta2: 0.9999999 })
+        const p = yield* f32([1])
+        const error = yield* Effect.flip(optimizer.init([p]))
+        expect(error.message).toContain("bias-correction error below 1%")
       }))
 
     it.effect("rejects a non-scalar learning rate at step", () =>

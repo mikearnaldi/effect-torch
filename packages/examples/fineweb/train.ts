@@ -1,4 +1,5 @@
-import { Checkpoint, Device, LearningRate, Loss, Optimizer, Sampler, Tensor, Trainer } from "@effect-torch/core"
+import * as BackendNative from "@effect-torch/backend-native"
+import { Checkpoint, LearningRate, Loss, Optimizer, Sampler, Tensor, Trainer } from "@effect-torch/core"
 import { NodeRuntime } from "@effect/platform-node"
 import { Duration, Effect } from "effect"
 import fs from "node:fs"
@@ -105,4 +106,4 @@ const program = Effect.gen(function*() {
   yield* saveParams(model, params, CHECKPOINT)
 })
 
-NodeRuntime.runMain(program.pipe(Effect.provide(Device.Best)))
+NodeRuntime.runMain(program.pipe(Effect.provide(BackendNative.Best)))

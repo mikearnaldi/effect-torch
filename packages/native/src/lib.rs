@@ -4,7 +4,7 @@ use dev::Device;
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, OnceLock};
 
 mod dev;
@@ -161,7 +161,11 @@ unsafe extern "C" fn finalize_readback(
     hint: *mut std::ffi::c_void,
 ) {
     let hint = unsafe { Box::from_raw(hint as *mut FinalizeHint) };
-    match *hint {
+    release_readback(*hint);
+}
+
+fn release_readback(hint: FinalizeHint) {
+    match hint {
         FinalizeHint::ZeroCopy { tensor, addr } => {
             drop(tensor);
             unregister_export(addr);
@@ -175,17 +179,38 @@ unsafe extern "C" fn finalize_readback(
 pub struct Readback {
     data: *mut u8,
     byte_len: usize,
-    hint: FinalizeHint,
+    hint: Option<FinalizeHint>,
 }
 
 unsafe impl Send for Readback {}
 
+struct FinalizeHintGuard(*mut std::ffi::c_void);
+
+impl Drop for FinalizeHintGuard {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            let hint = unsafe { Box::from_raw(self.0 as *mut FinalizeHint) };
+            release_readback(*hint);
+        }
+    }
+}
+
+impl Drop for Readback {
+    fn drop(&mut self) {
+        if let Some(hint) = self.hint.take() {
+            release_readback(hint);
+        }
+    }
+}
+
 impl ToNapiValue for Readback {
     unsafe fn to_napi_value(
         env: napi::sys::napi_env,
-        value: Self,
+        mut value: Self,
     ) -> Result<napi::sys::napi_value> {
-        let hint = Box::into_raw(Box::new(value.hint)) as *mut std::ffi::c_void;
+        let hint = Box::into_raw(Box::new(value.hint.take().expect("readback ownership transferred once")))
+            as *mut std::ffi::c_void;
+        let mut hint_guard = FinalizeHintGuard(hint);
         let mut result = std::ptr::null_mut();
         napi::check_status!(
             unsafe {
@@ -200,6 +225,7 @@ impl ToNapiValue for Readback {
             },
             "failed to create external arraybuffer"
         )?;
+        hint_guard.0 = std::ptr::null_mut();
         Ok(result)
     }
 }
@@ -328,6 +354,19 @@ impl NativeTensor {
     fn val_cloned(&self) -> Result<val::Val> {
         self.slot.get().map_err(|e| Error::new(Status::GenericFailure, e))
     }
+
+    fn release_accounting(&mut self) {
+        if self.bytes != 0 {
+            EXTERNAL_MEMORY_BYTES.fetch_sub(self.bytes, Ordering::Relaxed);
+            self.bytes = 0;
+        }
+    }
+}
+
+impl Drop for NativeTensor {
+    fn drop(&mut self) {
+        self.release_accounting();
+    }
 }
 
 // Native bytes currently retained by JS-reachable tensors.
@@ -347,8 +386,8 @@ fn sync_v8(env: &Env) {
 // V8's GC only sees the small JS handle; report the native buffer size so
 // collection is scheduled with knowledge of native memory pressure.
 impl ObjectFinalize for NativeTensor {
-    fn finalize(self, env: Env) -> Result<()> {
-        EXTERNAL_MEMORY_BYTES.fetch_sub(self.bytes, Ordering::Relaxed);
+    fn finalize(mut self, env: Env) -> Result<()> {
+        self.release_accounting();
         sync_v8(&env);
         Ok(())
     }
@@ -356,8 +395,46 @@ impl ObjectFinalize for NativeTensor {
 
 #[napi]
 pub struct CancellationToken {
-    cancelled: Arc<AtomicBool>,
+    state: Arc<CancellationState>,
     notify: Arc<tokio::sync::Notify>,
+}
+
+struct CancellationState {
+    cancelled: AtomicBool,
+    phase: AtomicU8,
+}
+
+impl CancellationState {
+    fn new() -> Self {
+        Self {
+            cancelled: AtomicBool::new(false),
+            phase: AtomicU8::new(0),
+        }
+    }
+
+    fn cancel(&self) -> bool {
+        if self
+            .phase
+            .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            self.cancelled.store(true, Ordering::Release);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn complete(&self) -> bool {
+        match self
+            .phase
+            .compare_exchange(0, 2, Ordering::AcqRel, Ordering::Acquire)
+        {
+            Ok(_) | Err(2) => true,
+            Err(1) => false,
+            Err(_) => unreachable!("unknown cancellation phase"),
+        }
+    }
 }
 
 #[napi]
@@ -369,20 +446,21 @@ impl CancellationToken {
         // GC's pressure signal within one evaluation of reality.
         sync_v8(&env);
         Self {
-            cancelled: Arc::new(AtomicBool::new(false)),
+            state: Arc::new(CancellationState::new()),
             notify: Arc::new(tokio::sync::Notify::new()),
         }
     }
 
     #[napi]
     pub fn cancel(&self) {
-        self.cancelled.store(true, Ordering::Relaxed);
-        self.notify.notify_waiters();
+        if self.state.cancel() {
+            self.notify.notify_one();
+        }
     }
 
     #[napi(getter)]
     pub fn cancelled(&self) -> bool {
-        self.cancelled.load(Ordering::Relaxed)
+        self.state.cancelled.load(Ordering::Acquire)
     }
 }
 
@@ -419,26 +497,17 @@ impl NativeTensor {
     #[napi(ts_return_type = "Promise<ArrayBuffer>")]
     pub async fn readback(&self, token: Option<&CancellationToken>) -> Result<Readback> {
         let inner = self.val_cloned()?;
-        let compute = tokio::task::spawn_blocking(move || readback_blocking(&inner));
-        match token {
-            Some(token) => {
-                if token.cancelled.load(Ordering::Relaxed) {
-                    return Err(Error::new(
-                        Status::Cancelled,
-                        "operation aborted".to_string(),
-                    ));
-                }
-                let notify = token.notify.clone();
-                tokio::select! {
-                    result = compute => result.map_err(to_join_err)?,
-                    _ = notify.notified() => Err(Error::new(
-                        Status::Cancelled,
-                        "operation aborted".to_string(),
-                    )),
-                }
+        run_compute(token, move |cancelled, _state| {
+            if cancelled.load(Ordering::Acquire) {
+                return Err(Error::new(Status::Cancelled, "operation aborted".to_string()));
             }
-            None => compute.await.map_err(to_join_err)?,
-        }
+            let value = readback_blocking(&inner)?;
+            if cancelled.load(Ordering::Acquire) {
+                return Err(Error::new(Status::Cancelled, "operation aborted".to_string()));
+            }
+            Ok(value)
+        })
+        .await
     }
 }
 
@@ -461,7 +530,7 @@ fn readback_blocking(inner: &val::Val) -> Result<Readback> {
         inner.clone()
     };
     // Contiguous layout for the flat read; Metal reads synchronize first.
-    let (base, offset, _dtype, elem_count) = match &flat {
+    let (base, offset, keep, elem_count) = match &flat {
         val::Val::Cpu(t) => {
             let t = t.contiguous();
             let elem_size = t.dtype().size_in_bytes();
@@ -507,10 +576,10 @@ fn readback_blocking(inner: &val::Val) -> Result<Readback> {
             return Ok(Readback {
                 data: addr as *mut u8,
                 byte_len,
-                hint: FinalizeHint::ZeroCopy {
-                    tensor: flat.clone(),
+                hint: Some(FinalizeHint::ZeroCopy {
+                    tensor: keep,
                     addr,
-                },
+                }),
             });
         }
     }
@@ -530,7 +599,7 @@ fn readback_blocking(inner: &val::Val) -> Result<Readback> {
     Ok(Readback {
         data: ptr,
         byte_len: len,
-        hint: FinalizeHint::Owned { ptr, len, cap },
+        hint: Some(FinalizeHint::Owned { ptr, len, cap }),
     })
 }
 
@@ -5796,9 +5865,8 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> crate::err::Res<val::V
             let m_t = ev.value(m.id)?;
             let v_t = ev.value(v.id)?;
             // The step-varying scalars arrive as 0-d tensors; cast to the
-            // parameter dtype and copy to its device (they may be CPU f64 —
-            // the bias corrections are computed in f64 to avoid
-            // cancellation — and 0-d copies are free).
+            // parameter dtype and copy to its device. The evaluator memoizes
+            // these scalar conversions across every parameter in the step.
             let lr_t = ev.step_scalar(lr.id, p.dtype(), &p.device())?;
             let c1_t = ev.step_scalar(c1.id, p.dtype(), &p.device())?;
             let c2_t = ev.step_scalar(c2.id, p.dtype(), &p.device())?;
@@ -7549,11 +7617,13 @@ pub fn is_device_available(device: String) -> bool {
 
 async fn run_compute<T: Send + 'static>(
     token: Option<&CancellationToken>,
-    compute: impl FnOnce(&AtomicBool) -> Result<T> + Send + 'static,
+    compute: impl FnOnce(&AtomicBool, &CancellationState) -> Result<T> + Send + 'static,
 ) -> Result<T> {
-    let flag = token.map(|t| t.cancelled.clone());
-    let handle = tokio::task::spawn_blocking(move || {
-        let cancelled = flag.unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
+    let state = token
+        .map(|token| token.state.clone())
+        .unwrap_or_else(|| Arc::new(CancellationState::new()));
+    let worker_state = state.clone();
+    let mut handle = tokio::task::spawn_blocking(move || {
         // Metal command buffers, encoders, and their temporaries are
         // autoreleased Objective-C objects. tokio blocking threads have no
         // run loop, so without an explicit pool those objects accumulate for
@@ -7562,16 +7632,31 @@ async fn run_compute<T: Send + 'static>(
         // memory and per-call cost flat across long training loops.
         #[cfg(target_os = "macos")]
         {
-            objc2::rc::autoreleasepool(|_| compute(&cancelled))
+            objc2::rc::autoreleasepool(|_| {
+                let result = compute(&worker_state.cancelled, &worker_state);
+                if worker_state.complete() {
+                    result
+                } else {
+                    drop(result);
+                    Err(Error::new(Status::Cancelled, "operation aborted".to_string()))
+                }
+            })
         }
         #[cfg(not(target_os = "macos"))]
         {
-            compute(&cancelled)
+            let result = compute(&worker_state.cancelled, &worker_state);
+            if worker_state.complete() {
+                result
+            } else {
+                drop(result);
+                Err(Error::new(Status::Cancelled, "operation aborted".to_string()))
+            }
         }
     });
     match token {
         Some(token) => {
-            if token.cancelled.load(Ordering::Relaxed) {
+            if token.state.cancelled.load(Ordering::Acquire) {
+                let _ = handle.await.map_err(to_join_err)?;
                 return Err(Error::new(
                     Status::Cancelled,
                     "operation aborted".to_string(),
@@ -7579,11 +7664,18 @@ async fn run_compute<T: Send + 'static>(
             }
             let notify = token.notify.clone();
             tokio::select! {
-                result = handle => result.map_err(to_join_err)?,
-                _ = notify.notified() => Err(Error::new(
-                    Status::Cancelled,
-                    "operation aborted".to_string(),
-                )),
+                biased;
+                result = &mut handle => result.map_err(to_join_err)?,
+                _ = notify.notified() => {
+                    // The fiber may stop waiting immediately, but native work
+                    // still owns buffers and transactional state. Await it so
+                    // the result is dropped in Rust and decode can roll back.
+                    let _ = handle.await.map_err(to_join_err)?;
+                    Err(Error::new(
+                        Status::Cancelled,
+                        "operation aborted".to_string(),
+                    ))
+                },
             }
         }
         None => handle.await.map_err(to_join_err)?,
@@ -8828,7 +8920,7 @@ pub async fn eval_lazy(
             entries.iter().map(|(k, n)| format!("{k}×{n}")).collect::<Vec<_>>().join(" ")
         );
     }
-    run_compute(token, move |cancelled| {
+    run_compute(token, move |cancelled, _state| {
         let t1 = std::time::Instant::now();
         let _guard = metal_eval_guard(&nodes);
         let mut ev = Evaluator::new(&nodes);
@@ -10534,7 +10626,7 @@ impl DecodeProgram {
         let cursor_slot = self.cursor_slot;
         let batched = self.batch > 1;
         let cursor_tensor = self.cursor_tensor;
-        run_compute(token, move |cancelled| {
+        run_compute(token, move |cancelled, cancellation| {
             let _run_guards: Vec<_> = run_locks
                 .iter()
                 .map(|lock| {
@@ -10602,20 +10694,23 @@ impl DecodeProgram {
                 .iter()
                 .map(|state| state.lock().map(|s| s.blocks.len()).unwrap_or(0))
                 .collect();
+            let rollback = || {
+                for (i, state) in slot_states.iter().enumerate() {
+                    if let Ok(mut state) = state.lock() {
+                        for block in state.blocks.split_off(frontiers[i]) {
+                            kv.pool.unref_block(block);
+                        }
+                        state.advance = 0;
+                    }
+                }
+            };
             let mut ev = Evaluator::with_kv(&roots, by_id, Some(kv.clone()));
             let mut outputs = Vec::with_capacity(roots.len());
             for node in &roots {
                 let output = match eval_node(node, cancelled, &mut ev) {
                     Ok(output) => output,
                     Err(error) => {
-                        for (i, state) in slot_states.iter().enumerate() {
-                            if let Ok(mut state) = state.lock() {
-                                for block in state.blocks.split_off(frontiers[i]) {
-                                    kv.pool.unref_block(block);
-                                }
-                                state.advance = 0;
-                            }
-                        }
+                        rollback();
                         return Err(to_napi_err(error));
                     }
                 };
@@ -10624,9 +10719,25 @@ impl DecodeProgram {
             // Synchronize once: per-root syncs would fully serialize
             // CPU encoding and GPU execution. Device-global: one call.
             if let Some(first) = outputs.first() {
-                first.val_cloned()?.synchronize().map_err(to_napi_err)?;
+                let synchronized = first
+                    .val_cloned()
+                    .and_then(|value| value.synchronize().map_err(to_napi_err));
+                if let Err(error) = synchronized {
+                    rollback();
+                    return Err(error);
+                }
             }
-            ev.run_ce_checks().map_err(to_napi_err)?;
+            if let Err(error) = ev.run_ce_checks() {
+                rollback();
+                return Err(to_napi_err(error));
+            }
+            if !cancellation.complete() {
+                rollback();
+                return Err(Error::new(
+                    Status::Cancelled,
+                    "operation aborted".to_string(),
+                ));
+            }
             for (i, state) in slot_states.iter().enumerate() {
                 if let Ok(mut state) = state.lock() {
                     state.note_tokens(&kv.pool, &tokens[i]);
@@ -10901,7 +11012,7 @@ impl CompiledProgram {
         let arena_eligible = inner.slots.iter().any(|s| !s.device.is_cpu())
             || inner.roots.iter().any(|r| !r.device.is_cpu());
         let inputs: Vec<val::Val> = inputs.iter().map(|input| input.val_cloned()).collect::<Result<Vec<_>>>()?;
-    run_compute(token, move |cancelled| {
+    run_compute(token, move |cancelled, _state| {
         let _guard = metal_eval_guard(&roots);
         // RFC 0016: replay the planned arena if one exists; otherwise
         // capture this run's allocation sequence to build one.
@@ -11069,7 +11180,7 @@ pub async fn save_tensors(
         ));
     }
     let nodes: Vec<Arc<Node>> = tensors.iter().map(|t| t.node.clone()).collect();
-    run_compute(token, move |cancelled| {
+    run_compute(token, move |cancelled, _state| {
         let _guard = metal_eval_guard(&nodes);
         let mut ev = Evaluator::new(&nodes);
         let mut map = std::collections::HashMap::with_capacity(names.len());
@@ -11093,7 +11204,7 @@ pub async fn load_tensors(
     token: Option<&CancellationToken>,
 ) -> Result<(Vec<String>, Vec<NativeTensor>)> {
     let dev = get_device(device)?;
-    run_compute(token, move |_cancelled| {
+    run_compute(token, move |_cancelled, _state| {
         let mut entries = safetensors::load(&path, &dev).map_err(to_napi_err)?;
         entries.sort_by(|a, b| a.0.cmp(&b.0));
         Ok((

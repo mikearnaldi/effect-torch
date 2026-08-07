@@ -1,4 +1,5 @@
-import { Device, Model, Tensor } from "@effect-torch/core"
+import * as BackendNative from "@effect-torch/backend-native"
+import { Model, Tensor } from "@effect-torch/core"
 import { NodeRuntime } from "@effect/platform-node"
 import { Effect, Option } from "effect"
 import { BLOCK, createGpt, EOT, loadParams, loadTokenizer } from "./model.js"
@@ -50,7 +51,7 @@ const program = Effect.gen(function*() {
     const generated: Array<number> = []
     const gen = yield* inference.generation()
     const encoded = yield* tokenizer.encode(prompt)
-    const entry = yield* gen.add(yield* Tensor.reshape(encoded, [1, encoded.shape[0]]))
+    const entry = yield* gen.add(yield* Tensor.fromTypedArray(encoded.data, [1, encoded.shape[0]]))
     let logits = entry.logits
     for (let i = 0; i < MAX_NEW_TOKENS; i++) {
       const [probs] = yield* Tensor.compute([yield* Tensor.softmax(logits)])
@@ -66,4 +67,4 @@ const program = Effect.gen(function*() {
   }
 })
 
-NodeRuntime.runMain(program.pipe(Effect.provide(Device.Best)))
+NodeRuntime.runMain(program.pipe(Effect.provide(BackendNative.Best)))

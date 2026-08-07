@@ -1,4 +1,5 @@
-import { Device, Tensor } from "@effect-torch/core"
+import * as BackendNative from "@effect-torch/backend-native"
+import { type Runtime, Tensor } from "@effect-torch/core"
 import { Console, Effect } from "effect"
 import { performance } from "node:perf_hooks"
 
@@ -12,7 +13,7 @@ const bench = <A extends Tensor.Any>(
   b: A,
   flops: number,
   perStep: number
-): Effect.Effect<void, Tensor.TensorError> =>
+): Effect.Effect<void, Tensor.TensorError, Runtime.Runtime> =>
   Effect.gen(function*() {
     // CHAIN identical matmuls as roots of one compute: one sync per
     // iteration, so eager per-call overhead does not drown the kernel.
@@ -58,4 +59,4 @@ const program = Effect.gen(function*() {
   yield* gemm(256, rows, 50257, 48, `head  [256,${rows}]x[${rows},50k]  dW x48`)
 })
 
-Effect.runPromise(Effect.provide(program, Device.Metal))
+Effect.runPromise(Effect.provide(program, BackendNative.Metal))

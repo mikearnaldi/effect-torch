@@ -1,4 +1,5 @@
-import { Device, Tensor } from "@effect-torch/core"
+import * as BackendNative from "@effect-torch/backend-native"
+import { Tensor } from "@effect-torch/core"
 import { Console, Effect } from "effect"
 import { performance } from "node:perf_hooks"
 
@@ -22,4 +23,4 @@ const program = Effect.gen(function*() {
   )
 })
 
-Effect.runPromise(Effect.provide(program, Device.Metal))
+Effect.runPromise(Effect.provide(program, BackendNative.Metal))

@@ -39,8 +39,8 @@
  * @since 0.1.0
  */
 import { Data, Effect, Semaphore } from "effect"
-import { CurrentDevice } from "./Device.ts"
 import * as Gradient from "./Gradient.ts"
+import * as Runtime from "./Runtime.ts"
 import * as Tensor from "./Tensor.ts"
 
 /**
@@ -92,19 +92,17 @@ export interface Model {
    * `Tensor.compute`), so initial `randn` draws are consistent with the
    * first loss within that walk.
    */
-  readonly init: Effect.Effect<Params, Tensor.TensorError, CurrentDevice>
+  readonly init: Effect.Effect<Params, Tensor.TensorError, Runtime.Runtime>
   /**
    * Extends the graph: parameters and input in, lazy output out.
    * Single-input, single-output; differentiated as-is by
    * `Gradient.grad`. Fails with a {@link ModelError} if `params.length`
-   * does not match the model's arity. May require the current device
-   * (layers that draw randomness or reshape on-device, like `dropout`
-   * and the pools).
+   * does not match the model's arity.
    */
   readonly forward: (
     params: Params,
     input: Tensor.Any
-  ) => Effect.Effect<Tensor.Lazy, ModelError | Tensor.TensorError, CurrentDevice>
+  ) => Effect.Effect<Tensor.Lazy, ModelError | Tensor.TensorError, Runtime.Runtime>
   /**
    * Runs the frozen forward program: parameters and input in,
    * materialized output out — one native call per invocation after the
@@ -117,7 +115,7 @@ export interface Model {
   readonly execute: (
     params: Params,
     input: Tensor.Any
-  ) => Effect.Effect<Tensor.Concrete, ModelError | Tensor.TensorError, CurrentDevice>
+  ) => Effect.Effect<Tensor.Concrete, ModelError | Tensor.TensorError, Runtime.Runtime>
   /**
    * Shape-cache diagnostics: programs cached, traces performed.
    */
@@ -134,11 +132,10 @@ export interface Model {
  *
  * @since 0.1.0
  * @category models
- * @internal
  */
 interface ModelDef {
   readonly names: ReadonlyArray<string>
-  readonly init: Effect.Effect<Params, Tensor.TensorError, CurrentDevice>
+  readonly init: Effect.Effect<Params, Tensor.TensorError, Runtime.Runtime>
   readonly forward: Model["forward"]
 }
 
@@ -146,7 +143,7 @@ type ModelInternal =
   & {
     -readonly [K in keyof Model]: Model[K]
   }
-  & { _fn: Tensor.CompiledFn<ModelError | Tensor.TensorError, CurrentDevice> | undefined }
+  & { _fn: Tensor.CompiledFn<ModelError | Tensor.TensorError, Runtime.Runtime> | undefined }
 
 // Every model is compiled: `execute` runs the forward as a frozen
 // program on the shared prototype; the program cache is created on the
@@ -158,7 +155,7 @@ const ModelProto = {
     return Effect.gen(function*() {
       yield* checkArity("execute", self.names, params)
       if (self._fn === undefined) {
-        self._fn = yield* Tensor.compile<ModelError | Tensor.TensorError, CurrentDevice>(
+        self._fn = yield* Tensor.compile<ModelError | Tensor.TensorError, Runtime.Runtime>(
           (inputs) =>
             Effect.map(
               self.forward(inputs.slice(0, -1), inputs[inputs.length - 1]),
@@ -210,7 +207,7 @@ const checkArity = (
     })
 
 const parameterless = (
-  apply: (self: Tensor.Any) => Effect.Effect<Tensor.Lazy, Tensor.TensorError, CurrentDevice>
+  apply: (self: Tensor.Any) => Effect.Effect<Tensor.Lazy, Tensor.TensorError, Runtime.Runtime>
 ): Effect.Effect<Model> =>
   Effect.succeed(make({
     names: [],
@@ -774,7 +771,7 @@ const pool = (
   apply: (
     self: Tensor.Any,
     options: Tensor.PoolOptions
-  ) => Effect.Effect<Tensor.Lazy, Tensor.TensorError, CurrentDevice>,
+  ) => Effect.Effect<Tensor.Lazy, Tensor.TensorError, Runtime.Runtime>,
   options: Tensor.PoolOptions
 ): Effect.Effect<Model, ModelError> =>
   Effect.gen(function*() {
@@ -891,7 +888,7 @@ export const residual = (model: Model): Effect.Effect<Model> =>
  */
 export const mapInput = (
   model: Model,
-  f: (input: Tensor.Any) => Effect.Effect<Tensor.Any, Tensor.TensorError, CurrentDevice>
+  f: (input: Tensor.Any) => Effect.Effect<Tensor.Any, Tensor.TensorError, Runtime.Runtime>
 ): Effect.Effect<Model> =>
   Effect.succeed(make({
     names: model.names,
@@ -918,7 +915,7 @@ export const mapInput = (
  */
 export const merge = <const M extends ReadonlyArray<Model>>(
   models: M,
-  f: (...outputs: { [K in keyof M]: Tensor.Lazy }) => Effect.Effect<Tensor.Lazy, Tensor.TensorError, CurrentDevice>
+  f: (...outputs: { [K in keyof M]: Tensor.Lazy }) => Effect.Effect<Tensor.Lazy, Tensor.TensorError, Runtime.Runtime>
 ): Effect.Effect<Model, ModelError> => {
   if (models.length === 0) {
     return new ModelError({ op: "merge", message: "at least one model is required" })
@@ -1054,7 +1051,7 @@ export const save = (
   model: Model,
   params: Params,
   path: string
-): Effect.Effect<void, ModelError | Tensor.TensorError> =>
+): Effect.Effect<void, ModelError | Tensor.TensorError, Runtime.Runtime> =>
   params.length !== model.names.length
     ? new ModelError({
       op: "save",
@@ -1078,7 +1075,7 @@ export const save = (
 export const load = (
   model: Model,
   path: string
-): Effect.Effect<ReadonlyArray<Tensor.Concrete>, ModelError | Tensor.TensorError, CurrentDevice> =>
+): Effect.Effect<ReadonlyArray<Tensor.Concrete>, ModelError | Tensor.TensorError, Runtime.Runtime> =>
   Effect.gen(function*() {
     const record = yield* Tensor.load(path)
     const params: Array<Tensor.Concrete> = []
@@ -1160,10 +1157,9 @@ export interface InferenceConfig {
  * @category compilation
  */
 export interface GenerationSeq {
-  /** @internal the native handle (block table + cursor) */
-  readonly _native: Tensor.NativeKvSequence
-  readonly cursor: () => Effect.Effect<number>
-  readonly finish: () => Effect.Effect<void>
+  readonly sequence: Tensor.KvSequence
+  readonly cursor: () => Effect.Effect<number, Tensor.TensorError, Runtime.Runtime>
+  readonly finish: () => Effect.Effect<void, Tensor.TensorError, Runtime.Runtime>
 }
 
 /**
@@ -1203,7 +1199,7 @@ export interface Generation {
    */
   readonly add: (
     prompt: Tensor.Any
-  ) => Effect.Effect<GenerationEntry, InferenceError | ModelError | Tensor.TensorError, CurrentDevice>
+  ) => Effect.Effect<GenerationEntry, InferenceError | ModelError | Tensor.TensorError, Runtime.Runtime>
   /**
    * Advances each entry's sequence one token in one run and returns
    * the new logits `[vocab]` in entry order. Single entry: the `[1, 1]`
@@ -1221,7 +1217,7 @@ export interface Generation {
   ) => Effect.Effect<
     ReadonlyArray<Tensor.Concrete>,
     InferenceError | ModelError | Tensor.TensorError,
-    CurrentDevice
+    Runtime.Runtime
   >
   /** The number of live sequences. */
   readonly live: () => Effect.Effect<number>
@@ -1230,7 +1226,7 @@ export interface Generation {
    * return to the pool at GC). The session stays usable — new
    * sequences can be added after closing.
    */
-  readonly close: () => Effect.Effect<void>
+  readonly close: () => Effect.Effect<void, Tensor.TensorError, Runtime.Runtime>
 }
 
 /**
@@ -1286,10 +1282,9 @@ export const inference = (
   model: Model,
   params: Params,
   config: InferenceConfig
-): Effect.Effect<InferenceProgram, InferenceError | ModelError | Tensor.TensorError, CurrentDevice> =>
+): Effect.Effect<InferenceProgram, InferenceError | ModelError | Tensor.TensorError, Runtime.Runtime> =>
   Effect.gen(function*() {
     yield* checkArity("inference", model.names, params)
-    const device = yield* CurrentDevice
     // Freeze the weights: params may be lazy graphs (init draws), and a
     // compiled run materializes its inputs per call — without a single
     // up-front materialization every prefill/step would re-draw.
@@ -1368,7 +1363,6 @@ export const inference = (
       prefillProgram.headDim,
       config.maxTokens,
       blockSize,
-      device,
       config.kvDtype === "int8" ? "u8" : (config.kvDtype ?? "f32")
     ).pipe(Effect.mapError((error) => new InferenceError({ op: "inference", message: error.message })))
     const tokenIds = (op: "prefill" | "step", tokens: Tensor.Any) =>
@@ -1381,7 +1375,7 @@ export const inference = (
       )
     interface LiveEntry {
       readonly seq: GenerationSeq
-      readonly native: Tensor.NativeKvSequence
+      readonly sequence: Tensor.KvSequence
     }
     const lastLogits = (op: "prefill" | "step", output: Tensor.Concrete, row: number) =>
       Effect.gen(function*() {
@@ -1414,10 +1408,17 @@ export const inference = (
           const live: Array<LiveEntry> = []
           const add = (prompt: Tensor.Any) =>
             Effect.gen(function*() {
+              const runtime = yield* Runtime.Runtime
               if (live.length >= decodeBatch) {
                 return yield* new InferenceError({
                   op: "add",
                   message: `a session holds at most decodeBatch (${decodeBatch}) live sequences; finish one first`
+                })
+              }
+              if (prompt.placement.id !== runtime.placement.id) {
+                return yield* new InferenceError({
+                  op: "add",
+                  message: "prompt must use the inference program runtime and placement"
                 })
               }
               if (prompt.shape.length !== 2 || prompt.shape[0] !== 1 || prompt.shape[1] < 1) {
@@ -1428,50 +1429,50 @@ export const inference = (
               }
               const ids = yield* tokenIds("prefill", prompt)
               const t = ids.length
-              const native = pool.makeSequence()
-              // The pool's prefix cache supplies the longest resident
-              // prefix (whole blocks only); only the suffix is computed.
-              const matched = yield* Effect.try({
-                try: () => native.prefillMatch(ids),
-                catch: (error) =>
-                  new InferenceError({
-                    op: "add",
-                    message: error instanceof Error ? error.message : String(error)
-                  })
-              })
-              let logits: Tensor.Concrete | undefined
-              for (let offset = matched; offset < t; offset += prefillChunk) {
-                const real = Math.min(prefillChunk, t - offset)
-                let input = yield* Tensor.slice(prompt, { start: [0, offset], end: [1, offset + real] })
-                if (real < prefillChunk) {
-                  const pad = yield* Tensor.zeros([1, prefillChunk - real], { dtype: prompt.dtype })
-                  input = yield* Tensor.concat([input, pad], { dim: 1 })
+              const sequence = yield* Tensor.makeKvSequence(pool)
+              let retained = false
+              return yield* Effect.gen(function*() {
+                // The pool's prefix cache supplies the longest resident
+                // prefix (whole blocks only); only the suffix is computed.
+                const matched = yield* Tensor.kvPrefillMatch(sequence, ids)
+                let logits: Tensor.Concrete | undefined
+                for (let offset = matched; offset < t; offset += prefillChunk) {
+                  const real = Math.min(prefillChunk, t - offset)
+                  let input = yield* Tensor.slice(prompt, { start: [0, offset], end: [1, offset + real] })
+                  if (real < prefillChunk) {
+                    const pad = yield* Tensor.zeros([1, prefillChunk - real], { dtype: prompt.dtype })
+                    input = yield* Tensor.concat([input, pad], { dim: 1 })
+                  }
+                  const [output] = yield* Tensor.runDecodeProgram(
+                    prefillProgram,
+                    [...frozenParams, input],
+                    sequence,
+                    ids.slice(offset, offset + real)
+                  )
+                  if (offset + real === t) {
+                    logits = yield* lastLogits("prefill", output, real - 1)
+                  }
                 }
-                const [output] = yield* Tensor.runDecodeProgram(
-                  prefillProgram,
-                  [...frozenParams, input],
-                  native,
-                  ids.slice(offset, offset + real)
+                const seq: GenerationSeq = {
+                  sequence,
+                  cursor: () => Tensor.kvSequenceCursor(sequence),
+                  finish: () =>
+                    Effect.gen(function*() {
+                      const i = live.findIndex((e) => e.seq === seq)
+                      if (i >= 0) {
+                        yield* Tensor.releaseKvSequence(sequence)
+                        live.splice(i, 1)
+                      }
+                    })
+                }
+                live.push({ seq, sequence })
+                retained = true
+                return { seq, logits: logits as Tensor.Concrete } satisfies GenerationEntry
+              }).pipe(
+                Effect.ensuring(
+                  Effect.suspend(() => retained ? Effect.void : Effect.ignore(Tensor.releaseKvSequence(sequence)))
                 )
-                if (offset + real === t) {
-                  logits = yield* lastLogits("prefill", output, real - 1)
-                }
-              }
-              const seq: GenerationSeq = {
-                _native: native,
-                cursor: () => Effect.sync(() => native.cursor),
-                finish: () =>
-                  Effect.sync(() => {
-                    const i = live.findIndex((e) => e.seq === seq)
-                    if (i >= 0) {
-                      live.splice(i, 1)
-                      native.release()
-                    }
-                  })
-              }
-              live.push({ seq, native })
-              const result: GenerationEntry = { seq, logits: logits as Tensor.Concrete }
-              return result
+              )
             })
           const generation: Generation = {
             add,
@@ -1516,7 +1517,7 @@ export const inference = (
                     const [output] = yield* Tensor.runDecodeProgram(
                       decodeProgram,
                       [...frozenParams, input],
-                      entry.seq._native,
+                      entry.seq.sequence,
                       [entry.token]
                     )
                     return [yield* lastLogits("step", output, 0)]
@@ -1532,7 +1533,7 @@ export const inference = (
                   const [output] = yield* Tensor.runBatchedDecodeProgram(
                     batchedProgram,
                     [...frozenParams, input],
-                    entries.map((entry) => entry.seq._native),
+                    entries.map((entry) => entry.seq.sequence),
                     ids.map((id) => [id])
                   )
                   const vocab = output.shape[output.shape.length - 1]!
@@ -1550,8 +1551,8 @@ export const inference = (
               ),
             live: () => Effect.sync(() => live.length),
             close: () =>
-              Effect.sync(() => {
-                for (const entry of live) entry.native.release()
+              Effect.gen(function*() {
+                yield* Effect.forEach(live, (entry) => Tensor.releaseKvSequence(entry.sequence), { discard: true })
                 live.length = 0
               })
           }

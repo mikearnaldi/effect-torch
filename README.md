@@ -17,24 +17,23 @@ open, with an API surface small enough to read end to end:
 - **Tensors and dtypes** — the raw data of AI models
 - **A lazy computation graph** — operations describe _what_ to compute, a
   single `compute` decides _when_
-- **Device abstraction** — the same program runs on CPU, Metal, or CUDA
+- **Backend runtime abstraction** — the same program can target independently
+  packaged CPU, Metal, CUDA, or remote implementations
 - **Typed errors and cancellation** — because correctness and resource
   control matter as much as speed
 
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────┐
-│ @effect-torch/core (TypeScript)             │
-│   Tensor ops → Effect<Tensor.Lazy, TensorError> │
-│   shape/dtype/device checked at graph build  │
-└──────────────────┬──────────────────────────┘
-                   │ napi-rs (one FFI hop per evaluate)
-┌──────────────────┴──────────────────────────┐
-│ @effect-torch/native (Rust + candle)        │
-│   lazy graph (Arc<LazyNode>) → candle ops    │
-│   CPU / Metal / CUDA, tokio blocking pool    │
-└─────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────┐
+│ @effect-torch/core (TypeScript)                  │
+│   backend-neutral tensors and Runtime service    │
+└──────────────────────┬───────────────────────────┘
+                       │ opaque handles
+┌──────────────────────┴───────────────────────────┐
+│ @effect-torch/backend-native                     │
+│   CPU / Metal Runtime Layers over the Rust addon │
+└──────────────────────────────────────────────────┘
 ```
 
 - **Lazy by design.** Every operation appends a node to a computation graph.
@@ -47,9 +46,10 @@ open, with an API surface small enough to read end to end:
   aborts the native computation.
 - **Strict dtypes.** No implicit promotion: mixing `f32` with `i64` fails with
   a typed `TensorError`, and `cast` is the only way to convert.
-- **Device as a service.** Tensors are created within a `CurrentDevice`
-  context, provided by a Layer — device selection is explicit and visible at
-  the type level.
+- **Runtime as a service.** One ambient `Runtime.Runtime` is authoritative for
+  the Effect program. Tensors retain opaque handles and static metadata, not a
+  runtime reference. Backend selection is explicit through a Layer at the
+  program boundary.
 
 ## Installation
 
@@ -61,13 +61,14 @@ manually.
 
 ```bash
 pnpm install
-pnpm --filter @effect-torch/native build   # builds the Rust native module
+pnpm build   # builds the native module and TypeScript packages
 ```
 
 ## Usage
 
 ```ts
-import { Device, Tensor } from "@effect-torch/core"
+import * as BackendNative from "@effect-torch/backend-native"
+import { Tensor } from "@effect-torch/core"
 import { Effect } from "effect"
 
 const program = Effect.gen(function*() {
@@ -77,7 +78,7 @@ const program = Effect.gen(function*() {
 
   // operations extend the graph, checking shapes/dtypes/devices eagerly
   const c = yield* Tensor.matmul(a, b)
-  const d = yield* Tensor.add(c, 1)
+  const d = yield* Tensor.add(c, yield* Tensor.constantLike(c, 1))
   const e = yield* Tensor.mean(d)
 
   // evaluate runs the whole graph on the device, off the JS thread
@@ -85,40 +86,41 @@ const program = Effect.gen(function*() {
   console.log(result[0])
 })
 
-// device selection is explicit, via a Layer
-Effect.runPromise(Effect.provide(program, Device.Metal))
+// backend selection is explicit at the program boundary
+Effect.runPromise(Effect.provide(program, BackendNative.Metal))
 ```
 
 ## API
 
-Everything is exported through two namespaces: `Tensor` and `Device`.
+The primary backend-neutral APIs are exported through the `Tensor` and
+`Runtime` namespaces. Backend packages provide concrete runtime Layers.
 
-### `Device`
+### `Runtime` and `@effect-torch/backend-native`
 
-| Export                                     | Description                                                                            |
-| ------------------------------------------ | -------------------------------------------------------------------------------------- |
-| `DeviceKind`                               | `"cpu" \| "metal" \| "cuda"`                                                           |
-| `CurrentDevice`                            | `Context.Service` holding the device used by constructors                              |
-| `Cpu` / `Metal` / `Cuda` / `layer(device)` | Layers providing `CurrentDevice`                                                       |
-| `Best`                                     | Layer providing the best available device — probes CUDA, then Metal, falls back to CPU |
-| `isAvailable(device)`                      | `Effect<boolean>` — checks device availability at runtime                              |
+| Export                                 | Description                                        |
+| -------------------------------------- | -------------------------------------------------- |
+| `Runtime.Runtime`                      | Ambient Effect service tag                         |
+| `Runtime.RuntimeService`               | Backend implementation contract                    |
+| `Runtime.Placement`                    | Runtime-owned device and memory placement metadata |
+| `BackendNative.Cpu` / `Metal` / `Best` | Layers providing the native CPU or Metal runtime   |
+| `BackendNative.isAvailable(device)`    | Checks native device availability                  |
 
 ### `Tensor` — types
 
-| Export                       | Description                                    |
-| ---------------------------- | ---------------------------------------------- |
-| `Any`                        | Supertype accepted by every operation          |
-| `Lazy`                       | A tensor described by a lazy computation graph |
-| `Concrete`                   | A materialized tensor living on the device     |
-| `DType`                      | `"f32" \| "f64" \| "i64" \| "u8" \| "u32"`     |
-| `TypedArray`                 | The JS typed arrays matching each `DType`      |
-| `TensorError`                | Tagged error raised by every operation         |
-| `isLazyTensor` / `isTensor`  | Refinements on `Any`                           |
-| `shape` / `dtype` / `device` | Getters                                        |
+| Export                       | Description                                                   |
+| ---------------------------- | ------------------------------------------------------------- |
+| `Any`                        | Supertype accepted by every operation                         |
+| `Lazy`                       | A tensor described by a lazy computation graph                |
+| `Concrete`                   | A materialized tensor living on the device                    |
+| `DType`                      | `"f32" \| "f64" \| "f16" \| "bf16" \| "i64" \| "u8" \| "u32"` |
+| `TypedArray`                 | The JS typed arrays matching each `DType`                     |
+| `TensorError`                | Tagged error raised by every operation                        |
+| `isLazyTensor` / `isTensor`  | Refinements on `Any`                                          |
+| `shape` / `dtype` / `device` | Getters                                                       |
 
 ### `Tensor` — constructors
 
-All constructors return `Effect<Tensor.Lazy, TensorError, CurrentDevice>` and
+All constructors return `Effect<Tensor.Lazy, TensorError, Runtime.Runtime>` and
 accept an optional `{ dtype }`.
 
 | Export                                          | Description                                 |
@@ -136,8 +138,9 @@ accept an optional `{ dtype }`.
 ### `Tensor` — elementwise operations
 
 All dual (data-first and data-last), all lazy. Binary operations accept
-`Tensor.Any | number` (a number is lifted to a scalar of the same
-dtype/device) and broadcast like NumPy. Mixed dtypes or devices fail.
+`Tensor.Any` and broadcast like NumPy; use `constantLike` to lift a number
+to a scalar with matching dtype and placement. Mixed dtypes fail, and the
+backend rejects incompatible handles.
 
 | Export                                                                   | Description                                                 |
 | ------------------------------------------------------------------------ | ----------------------------------------------------------- |
@@ -229,11 +232,11 @@ All take the prediction first and accept `{ reduction?: "mean" | "sum" | "none" 
 
 ### `Tensor` — evaluation
 
-| Export                    | Description                                                                                                                                          |
-| ------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `evaluate([t1, t2, ...])` | `Effect<Tensor[], TensorError>` — runs the graph in one shared walk: shared subgraphs computed once, single `randn` draw across roots; interruptible |
-| `toTypedArray(t)`         | `Effect<TypedArray, TensorError>` — evaluate + zero-copy readback where possible                                                                     |
-| `toNumberArray(t)`        | `Effect<number[], TensorError>` — fails for `i64` tensors instead of silently coercing bigints                                                       |
+| Export                   | Description                                                                                                                                                  |
+| ------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `compute([t1, t2, ...])` | `Effect<Tensor[], TensorError, Runtime.Runtime>` — runs one shared graph walk: shared subgraphs compute once and roots share each random draw; interruptible |
+| `toTypedArray(t)`        | `Effect<TypedArray, TensorError, Runtime.Runtime>` — evaluate plus zero-copy readback where possible                                                         |
+| `toNumberArray(t)`       | `Effect<number[], TensorError, Runtime.Runtime>` — fails for `i64` tensors instead of silently coercing bigints                                              |
 
 ### `Gradient` — autodiff
 
@@ -255,7 +258,7 @@ so gradients can be differentiated again.
 ```ts
 const step = Effect.gen(function*() {
   const pred = yield* Tensor.add(yield* Tensor.matmul(x, w), b)
-  const loss = yield* Tensor.mse(pred, y)
+  const loss = yield* Loss.mse(pred, y)
   const [gw, gb] = yield* Gradient.grad(loss, [w, b])
   // loss and grads share the forward graph: evaluate them in one walk
   const [l, gW, gB] = yield* Tensor.compute([loss, gw, gb])
@@ -269,10 +272,10 @@ Tensors are saved and loaded in the [safetensors](https://github.com/huggingface
 format. All file I/O, graph evaluation, and serialization happen on the
 native side — tensor data never crosses the JavaScript thread.
 
-| Export                              | Description                                                                                                                            |
-| ----------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------- |
-| `save(path, { name: tensor, ... })` | `Effect<void, TensorError>` — evaluates all entries in one shared graph walk and writes the file natively                              |
-| `load(path)`                        | `Effect<Record<string, Tensor>, TensorError, CurrentDevice>` — reads the file straight into materialized tensors on the current device |
+| Export                              | Description                                                                                                                  |
+| ----------------------------------- | ---------------------------------------------------------------------------------------------------------------------------- |
+| `save(path, { name: tensor, ... })` | `Effect<void, TensorError, Runtime.Runtime>` — evaluates all entries in one shared graph walk and writes through the runtime |
+| `load(path)`                        | `Effect<Record<string, Tensor>, TensorError, Runtime.Runtime>` — imports materialized tensors through the active runtime     |
 
 ```ts
 yield * Tensor.save("checkpoint.safetensors", { "model.w": w, "model.b": b })
@@ -290,25 +293,25 @@ walk**: one forward pass, one backward pass, one async boundary, and
 gradient tensors are freed as soon as their update consumes them. Formulas
 match PyTorch/candle exactly.
 
-| Export                                                        | Description                                               |
-| ------------------------------------------------------------- | --------------------------------------------------------- |
-| `sgd({ lr, momentum?, dampening?, nesterov?, weightDecay? })` | SGD with optional momentum and coupled L2 decay           |
-| `adam({ lr?, beta1?, beta2?, eps? })`                         | Adam, standard defaults (`1e-3`, `0.9`, `0.999`, `1e-8`)  |
-| `adamW({ ..., weightDecay? })`                                | Adam with decoupled weight decay (default `0.01`)         |
-| `step(optimizer, loss, params, state)`                        | `Effect<{ loss, params, state }>` — full step in one walk |
-| `optimizer.init(params)`                                      | zero-initialized state, validates float dtypes            |
-| `optimizer.step(params, grads, state)`                        | the raw graph transform, for custom loops                 |
+| Export                                                    | Description                                                                            |
+| --------------------------------------------------------- | -------------------------------------------------------------------------------------- |
+| `sgd({ momentum?, dampening?, nesterov?, weightDecay? })` | SGD with optional momentum and coupled L2 decay                                        |
+| `adam({ beta1?, beta2?, eps? })`                          | Adam defaults (`0.9`, `0.999`, `1e-8`); f32 rejects >1% bias-correction rounding error |
+| `adamW({ ..., weightDecay? })`                            | Adam with decoupled weight decay (default `0.01`)                                      |
+| `step(optimizer, loss, params, state, lr)`                | Full gradient, update, and materialization step in one walk                            |
+| `optimizer.init(params)`                                  | Zero-initialized state; validates float dtypes                                         |
+| `optimizer.step(params, grads, state, lr)`                | Raw graph transform for custom loops; `lr` is a 0-d float tensor                       |
 
 ```ts
-const optimizer = Optimizer.adam({ lr: 0.1 })
-
 const trained = Effect.gen(function*() {
+  const optimizer = yield* Optimizer.adam()
   let params = [w, b]
   let state = yield* optimizer.init(params)
   for (let i = 0; i < steps; i++) {
     const pred = yield* Tensor.add(yield* Tensor.matmul(x, params[0]), params[1])
-    const loss = yield* Tensor.mse(pred, y)
-    const result = yield* Optimizer.step(optimizer, loss, params, state)
+    const loss = yield* Loss.mse(pred, y)
+    const lr = yield* Tensor.constantLike(params[0], 0.1)
+    const result = yield* Optimizer.step(optimizer, loss, params, state, lr)
     params = result.params // materialized leaves of the next step's graph
     state = result.state
   }
@@ -323,28 +326,27 @@ forward graph — the Flax/Haiku design, flattened: parameters are a flat
 array of tensors, so `Gradient.grad` and `Optimizer.step` work on any
 model with zero adapter code. There is no mutable module state. Everything
 that can fail returns an `Effect`: constructors validate into a
-`ModelError`, and `Model.train` runs the full training loop.
+`ModelError`, and `Trainer` runs the full training loop.
 
-| Export                                                                  | Description                                                                                                                                                                                       |
-| ----------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `Model.linear(name, in, out)`                                           | `Effect` of a fully-connected layer, `randn * 1/√in` weight, zero bias                                                                                                                            |
-| `Model.conv1d` / `Model.conv2d(name, in, out, k, opts?)`                | `Effect`s of convolution layers, fan-in-scaled weight, per-channel bias                                                                                                                           |
-| `Model.embedding(name, num, dim, opts?)`                                | `Effect` of an embedding lookup layer, unit-normal weight                                                                                                                                         |
-| `Model.positionEmbedding(name, max, dim)`                               | `Effect` of a learned absolute position embedding; reads only the input's sequence length                                                                                                         |
-| `Model.layerNorm(name, shape, { eps? })`                                | `Effect` of layer normalization over the trailing `shape` dims                                                                                                                                    |
-| `Model.multiHeadAttention(name, embedDim, numHeads, { causal? })`       | `Effect` of multi-head attention: wq/wk/wv/wo projections over `scaledDotProductAttention`                                                                                                        |
-| `Model.tanh` / `sigmoid` / `relu` / `silu` / `mish` / `softplus`        | `Effect`s of activations as parameterless models                                                                                                                                                  |
-| `Model.gelu(opts?)` / `elu(opts?)` / `leakyRelu(opts?)`                 | `Effect`s of option-taking activations                                                                                                                                                            |
-| `Model.softmax(dim?)` / `logSoftmax(dim?)` / `flatten(opts?)`           | `Effect`s of shape/reduction stages (`flatten` preserves the batch dim)                                                                                                                           |
-| `Model.dropout({ p? })`                                                 | `Effect` of inverted dropout — always applies; build the eval chain without it                                                                                                                    |
-| `Model.maxPool2d(opts)` / `avgPool2d(opts)`                             | `Effect`s of pooling stages                                                                                                                                                                       |
-| `Model.chain(...models)`                                                | `Effect` of sequential composition; parameter arrays concatenated in order, arity checked in `forward`                                                                                            |
-| `Model.checkpoint(block)`                                               | gradient-checkpoint a sub-model: recompute its forward during backward, trading FLOPs for peak memory                                                                                             |
-| `Model.residual(block)`                                                 | add a skip connection: `forward = input + block(input)`                                                                                                                                           |
-| `Model.mapInput(model, f)`                                              | transform the input before it enters the sub-model (positions from a sequence length, patches from an image)                                                                                      |
-| `Model.merge([a, b, ...], f)`                                           | fan one input into several models and combine their outputs with a variadic combiner — non-sequential tops like token + position embeddings                                                       |
-| `Model.train(model, { optimizer, loss, data, stop, params?, onStep? })` | the training loop: init → forward → loss → grad → update, one walk per step; `data` is a fixed batch or a per-step sampler; `stop: (info) => boolean` ends it (step count, loss target, anything) |
-| `Model.save(model, params, path)` / `Model.load(model, path)`           | named checkpoints via safetensors                                                                                                                                                                 |
+| Export                                                            | Description                                                                                                                                 |
+| ----------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------- |
+| `Model.linear(name, in, out)`                                     | `Effect` of a fully-connected layer, `randn * 1/√in` weight, zero bias                                                                      |
+| `Model.conv1d` / `Model.conv2d(name, in, out, k, opts?)`          | `Effect`s of convolution layers, fan-in-scaled weight, per-channel bias                                                                     |
+| `Model.embedding(name, num, dim, opts?)`                          | `Effect` of an embedding lookup layer, unit-normal weight                                                                                   |
+| `Model.positionEmbedding(name, max, dim)`                         | `Effect` of a learned absolute position embedding; reads only the input's sequence length                                                   |
+| `Model.layerNorm(name, shape, { eps? })`                          | `Effect` of layer normalization over the trailing `shape` dims                                                                              |
+| `Model.multiHeadAttention(name, embedDim, numHeads, { causal? })` | `Effect` of multi-head attention: wq/wk/wv/wo projections over `scaledDotProductAttention`                                                  |
+| `Model.tanh` / `sigmoid` / `relu` / `silu` / `mish` / `softplus`  | `Effect`s of activations as parameterless models                                                                                            |
+| `Model.gelu(opts?)` / `elu(opts?)` / `leakyRelu(opts?)`           | `Effect`s of option-taking activations                                                                                                      |
+| `Model.softmax(dim?)` / `logSoftmax(dim?)` / `flatten(opts?)`     | `Effect`s of shape/reduction stages (`flatten` preserves the batch dim)                                                                     |
+| `Model.dropout({ p? })`                                           | `Effect` of inverted dropout — always applies; build the eval chain without it                                                              |
+| `Model.maxPool2d(opts)` / `avgPool2d(opts)`                       | `Effect`s of pooling stages                                                                                                                 |
+| `Model.chain(...models)`                                          | `Effect` of sequential composition; parameter arrays concatenated in order, arity checked in `forward`                                      |
+| `Model.checkpoint(block)`                                         | gradient-checkpoint a sub-model: recompute its forward during backward, trading FLOPs for peak memory                                       |
+| `Model.residual(block)`                                           | add a skip connection: `forward = input + block(input)`                                                                                     |
+| `Model.mapInput(model, f)`                                        | transform the input before it enters the sub-model (positions from a sequence length, patches from an image)                                |
+| `Model.merge([a, b, ...], f)`                                     | fan one input into several models and combine their outputs with a variadic combiner — non-sequential tops like token + position embeddings |
+| `Model.save(model, params, path)` / `Model.load(model, path)`     | named checkpoints via safetensors                                                                                                           |
 
 ```ts
 const program = Effect.gen(function*() {
@@ -355,13 +357,15 @@ const program = Effect.gen(function*() {
     yield* Model.sigmoid
   )
 
-  const trained = yield* Model.train(model, {
-    optimizer: Optimizer.adam({ lr: 0.1 }),
+  const trainer = yield* Trainer.make(model, {
+    optimizer: yield* Optimizer.adam(),
+    lr: LearningRate.constant(0.1),
     loss: Loss.mse,
     data: { input: x, target: y },
     stop: ({ step, loss }) => step >= 3000 || loss < 1e-4,
     onStep: ({ step, loss }) => (step % 250 === 0 ? Effect.log(`step ${step} loss ${loss}`) : Effect.void)
   })
+  const trained = yield* trainer.train()
   // trained.params: materialized leaves, ready for forward / save / more training
 })
 ```

@@ -1,4 +1,5 @@
-import { Device, Model, Tensor } from "@effect-torch/core"
+import * as BackendNative from "@effect-torch/backend-native"
+import { Model, Tensor } from "@effect-torch/core"
 import { NodeRuntime } from "@effect/platform-node"
 import { Effect, Option } from "effect"
 import { BLOCK, CHECKPOINT, createGpt, EOT, loadParams, loadTokenizer } from "./model.js"
@@ -45,7 +46,7 @@ const program = Effect.gen(function*() {
 
   const gen = yield* inference.generation()
   const encoded = yield* tokenizer.encode(prompt)
-  const entry = yield* gen.add(yield* Tensor.reshape(encoded, [1, encoded.shape[0]]))
+  const entry = yield* gen.add(yield* Tensor.fromTypedArray(encoded.data, [1, encoded.shape[0]]))
   let logits = entry.logits
   // Incremental decode: re-decode the sequence per token, but hold back a
   // trailing run of U+FFFD — a merge boundary can split a multi-byte
@@ -74,4 +75,4 @@ const program = Effect.gen(function*() {
   process.stdout.write("\n")
 })
 
-NodeRuntime.runMain(program.pipe(Effect.provide(Device.Best)))
+NodeRuntime.runMain(program.pipe(Effect.provide(BackendNative.Best)))

@@ -7,9 +7,8 @@
  *
  * @since 0.1.0
  */
-import native from "@effect-torch/native"
 import { Data, Effect } from "effect"
-import type { CurrentDevice } from "./Device.ts"
+import * as Runtime from "./Runtime.ts"
 import * as Tensor from "./Tensor.ts"
 
 /**
@@ -37,6 +36,15 @@ const toGradError = (error: unknown): GradError => {
   })
 }
 
+const validateGraph = (
+  runtime: Runtime.RuntimeService,
+  op: string,
+  tensors: ReadonlyArray<Tensor.Any>
+): Effect.Effect<void, Tensor.TensorError> =>
+  runtime.validateGraph(tensors.map((tensor) => tensor.lazy)).pipe(
+    Effect.mapError((error) => new Tensor.TensorError({ op, message: error.message, backend: error }))
+  )
+
 /**
  * Computes the gradients of a scalar loss with respect to the given tensors.
  * The loss is an ordinary lazy graph value — there is no tracing and no
@@ -58,8 +66,9 @@ const toGradError = (error: unknown): GradError => {
 export const grad = (
   loss: Tensor.Any,
   wrt: ReadonlyArray<Tensor.Any>
-): Effect.Effect<Array<Tensor.Lazy>, GradError> =>
+): Effect.Effect<Array<Tensor.Lazy>, GradError | Tensor.TensorError, Runtime.Runtime> =>
   Effect.gen(function*() {
+    const runtime = yield* Runtime.Runtime
     if (loss.shape.length !== 0) {
       return yield* new GradError({
         reason: "non-scalar-output",
@@ -81,11 +90,11 @@ export const grad = (
         })
       }
     }
-    const grads = yield* Effect.try({
-      try: () => native.grad(loss.lazy, wrt.map((target) => target.lazy)),
-      catch: toGradError
-    })
-    return grads.map((handle, i) => Tensor.makeLazy(handle, wrt[i].shape, wrt[i].dtype, wrt[i].device))
+    yield* validateGraph(runtime, "grad", [loss, ...wrt])
+    const grads = yield* runtime.grad(loss.lazy, wrt.map((target) => target.lazy)).pipe(
+      Effect.mapError(toGradError)
+    )
+    return grads.map((handle, i) => Tensor.makeLazy(handle, wrt[i].shape, wrt[i].dtype, wrt[i].placement))
   })
 
 /**
@@ -98,14 +107,18 @@ export const grad = (
  */
 export const stopGradient = (
   self: Tensor.Any
-): Effect.Effect<Tensor.Lazy, Tensor.TensorError> =>
-  Effect.try({
-    try: () => Tensor.makeLazy(self.lazy.stopGradient(), self.shape, self.dtype, self.device),
-    catch: (error) =>
-      new Tensor.TensorError({
-        op: "stopGradient",
-        message: error instanceof Error ? error.message : String(error)
-      })
+): Effect.Effect<Tensor.Lazy, Tensor.TensorError, Runtime.Runtime> =>
+  Effect.gen(function*() {
+    const runtime = yield* Runtime.Runtime
+    yield* validateGraph(runtime, "stopGradient", [self])
+    return yield* Effect.try({
+      try: () => Tensor.makeLazy(self.lazy.stopGradient(), self.shape, self.dtype, self.placement),
+      catch: (error) =>
+        new Tensor.TensorError({
+          op: "stopGradient",
+          message: error instanceof Error ? error.message : String(error)
+        })
+    })
   })
 
 /**
@@ -122,14 +135,18 @@ export const stopGradient = (
  */
 export const checkpoint = (
   self: Tensor.Any
-): Effect.Effect<Tensor.Lazy, Tensor.TensorError> =>
-  Effect.try({
-    try: () => Tensor.makeLazy(self.lazy.checkpoint(), self.shape, self.dtype, self.device),
-    catch: (error) =>
-      new Tensor.TensorError({
-        op: "checkpoint",
-        message: error instanceof Error ? error.message : String(error)
-      })
+): Effect.Effect<Tensor.Lazy, Tensor.TensorError, Runtime.Runtime> =>
+  Effect.gen(function*() {
+    const runtime = yield* Runtime.Runtime
+    yield* validateGraph(runtime, "checkpoint", [self])
+    return yield* Effect.try({
+      try: () => Tensor.makeLazy(self.lazy.checkpoint(), self.shape, self.dtype, self.placement),
+      catch: (error) =>
+        new Tensor.TensorError({
+          op: "checkpoint",
+          message: error instanceof Error ? error.message : String(error)
+        })
+    })
   })
 
 const checkSameShapeDtype = (
@@ -166,7 +183,7 @@ export const vjp = (
   y: Tensor.Any,
   x: Tensor.Any,
   v: Tensor.Any
-): Effect.Effect<Tensor.Lazy, Tensor.TensorError | GradError> =>
+): Effect.Effect<Tensor.Lazy, Tensor.TensorError | GradError, Runtime.Runtime> =>
   Effect.gen(function*() {
     yield* checkSameShapeDtype("vjp", y, v, "cotangent")
     const loss = yield* Tensor.sum(yield* Tensor.mul(y, yield* stopGradient(v)))
@@ -188,7 +205,7 @@ export const jvp = (
   y: Tensor.Any,
   x: Tensor.Any,
   v: Tensor.Any
-): Effect.Effect<Tensor.Lazy, Tensor.TensorError | GradError, CurrentDevice> =>
+): Effect.Effect<Tensor.Lazy, Tensor.TensorError | GradError, Runtime.Runtime> =>
   Effect.gen(function*() {
     yield* checkSameShapeDtype("jvp", x, v, "tangent")
     // u is a free linearization point: g(u) = J(x)ᵀ u is linear in u, and
@@ -221,37 +238,38 @@ export const vmap = (
   x: Tensor.Any,
   batchedX: Tensor.Any,
   options: { readonly dim?: number } = {}
-): Effect.Effect<Tensor.Lazy, Tensor.TensorError> =>
-  Effect.try({
-    try: () => {
-      const dim = options.dim ?? 0
-      if (batchedX.shape.length !== x.shape.length + 1 || dim < 0 || dim >= batchedX.shape.length) {
-        throw new Error(
-          `vmap: batched input shape [${batchedX.shape}] must be the input shape [${x.shape}] with one dimension inserted`
-        )
-      }
-      for (let i = 0; i < x.shape.length; i++) {
-        const at = i < dim ? i : i + 1
-        if (batchedX.shape[at] !== x.shape[i]) {
+): Effect.Effect<Tensor.Lazy, Tensor.TensorError, Runtime.Runtime> =>
+  Effect.gen(function*() {
+    const runtime = yield* Runtime.Runtime
+    yield* validateGraph(runtime, "vmap", [y, x, batchedX])
+    return yield* Effect.try({
+      try: () => {
+        const dim = options.dim ?? 0
+        if (batchedX.shape.length !== x.shape.length + 1 || dim < 0 || dim >= batchedX.shape.length) {
           throw new Error(
-            `vmap: batched input shape [${batchedX.shape}] does not match input shape [${x.shape}] outside dim ${dim}`
+            `vmap: batched input shape [${batchedX.shape}] must be the input shape [${x.shape}] with one dimension inserted`
           )
         }
-      }
-      if (batchedX.dtype !== x.dtype) {
-        throw new Error(`vmap: dtype mismatch, got ${batchedX.dtype} and ${x.dtype}`)
-      }
-      if (batchedX.device !== x.device) {
-        throw new Error(`vmap: device mismatch, got ${batchedX.device} and ${x.device}`)
-      }
-      const batch = batchedX.shape[dim]
-      const outShape = [...y.shape]
-      outShape.splice(Math.min(dim, outShape.length), 0, batch)
-      return Tensor.makeLazy(y.lazy.vmap(x.lazy, batchedX.lazy, dim), outShape, y.dtype, y.device)
-    },
-    catch: (error) =>
-      new Tensor.TensorError({
-        op: "vmap",
-        message: error instanceof Error ? error.message : String(error)
-      })
+        for (let i = 0; i < x.shape.length; i++) {
+          const at = i < dim ? i : i + 1
+          if (batchedX.shape[at] !== x.shape[i]) {
+            throw new Error(
+              `vmap: batched input shape [${batchedX.shape}] does not match input shape [${x.shape}] outside dim ${dim}`
+            )
+          }
+        }
+        if (batchedX.dtype !== x.dtype) {
+          throw new Error(`vmap: dtype mismatch, got ${batchedX.dtype} and ${x.dtype}`)
+        }
+        const batch = batchedX.shape[dim]
+        const outShape = [...y.shape]
+        outShape.splice(Math.min(dim, outShape.length), 0, batch)
+        return Tensor.makeLazy(y.lazy.vmap(x.lazy, batchedX.lazy, dim), outShape, y.dtype, y.placement)
+      },
+      catch: (error) =>
+        new Tensor.TensorError({
+          op: "vmap",
+          message: error instanceof Error ? error.message : String(error)
+        })
+    })
   })

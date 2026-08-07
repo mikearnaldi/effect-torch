@@ -3,18 +3,7 @@ import { Effect } from "effect"
 import * as fs from "node:fs"
 import * as os from "node:os"
 import * as path from "node:path"
-import {
-  Checkpoint,
-  Device,
-  Gradient,
-  LearningRate,
-  Loss,
-  Model,
-  Optimizer,
-  Sampler,
-  Tensor,
-  Trainer
-} from "../src/index.ts"
+import { Checkpoint, Gradient, LearningRate, Loss, Model, Optimizer, Sampler, Tensor, Trainer } from "../src/index.ts"
 import { floats, onDevices } from "./utils/devices.ts"
 
 const tmpdir = Effect.sync(() => fs.mkdtempSync(path.join(os.tmpdir(), "effect-torch-")))
@@ -63,6 +52,17 @@ onDevices("Checkpoint", () => (it) => {
       const loaded = yield* Tensor.load(file)
       expect(yield* values(loaded["sum"])).toEqual([5, 7, 9])
       expect(yield* values(loaded["product"])).toEqual([4, 10, 18])
+    }))
+
+  it.effect("round-trips non-contiguous views", () =>
+    Effect.gen(function*() {
+      const dir = yield* tmpdir
+      const file = path.join(dir, "views.safetensors")
+      const source = yield* Tensor.fromTypedArray(floats([1, 2, 3, 4, 5, 6]), [2, 3])
+      yield* Tensor.save(file, { transposed: yield* Tensor.transpose(source, [1, 0]) })
+      const loaded = yield* Tensor.load(file)
+      expect(loaded.transposed.shape).toEqual([3, 2])
+      expect(yield* values(loaded.transposed)).toEqual([1, 4, 2, 5, 3, 6])
     }))
 
   it.effect("loaded tensors are ordinary materialized tensors", () =>
@@ -236,14 +236,13 @@ onDevices("Checkpoint", () => (it) => {
       yield* expectCheckpointError(malformedStep, "invalid meta:step")
     }))
 
-  it.effect("optimizer state lives on the ambient device, never a hidden override", () =>
+  it.effect("optimizer state retains the parameter placement", () =>
     Effect.gen(function*() {
-      const device = yield* Device.CurrentDevice
       const optimizer = yield* Optimizer.adamW()
       const p = yield* Tensor.fromTypedArray(floats([1, -1]), [2])
       const state = yield* optimizer.init([p])
       for (const root of optimizer.stateRoots(state)) {
-        expect(root.device).toBe(device)
+        expect(root.placement.id).toBe(p.placement.id)
       }
     }))
 

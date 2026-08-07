@@ -3,7 +3,7 @@ import { Effect } from "effect"
 import * as fs from "node:fs"
 import * as os from "node:os"
 import * as path from "node:path"
-import { Gradient, Model, Tensor } from "../src/index.ts"
+import { Gradient, Model, type Runtime, Tensor } from "../src/index.ts"
 import { deep, floats, onDevices } from "./utils/devices.ts"
 
 const tmpdir = Effect.sync(() => fs.mkdtempSync(path.join(os.tmpdir(), "effect-torch-")))
@@ -418,7 +418,9 @@ onDevices("Model", () => (it) => {
     it.effect("activation models apply the corresponding tensor operations", () =>
       Effect.gen(function*() {
         const x = yield* Tensor.fromTypedArray(floats([-2, -0.5, 0, 0.5, 2]), [5])
-        const cases: Array<[Model.Model, (x: Tensor.Any) => Effect.Effect<Tensor.Lazy, Tensor.TensorError>]> = [
+        const cases: Array<
+          [Model.Model, (x: Tensor.Any) => Effect.Effect<Tensor.Lazy, Tensor.TensorError, Runtime.Runtime>]
+        > = [
           [yield* Model.gelu(), (x) => Tensor.gelu(x)],
           [yield* Model.gelu({ approximate: "tanh" }), (x) => Tensor.gelu(x, { approximate: "tanh" })],
           [yield* Model.silu, Tensor.silu],
@@ -644,7 +646,7 @@ onDevices("Model", () => (it) => {
 
     it.effect("merge rejects an empty array and duplicate parameter names", () =>
       Effect.gen(function*() {
-        const empty = yield* Effect.flip(Model.merge([], () => Tensor.zeros([1])))
+        const empty = yield* Effect.flip(Model.merge([], () => Effect.succeed(null as never)))
         expect(empty.message).toContain("at least one")
         const error = yield* Effect.flip(
           Model.merge([yield* Model.linear("fc", 2, 2), yield* Model.linear("fc", 2, 2)], (x, y) => Tensor.add(x, y))

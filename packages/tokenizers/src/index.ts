@@ -1,9 +1,8 @@
 /**
- * RFC 0009: tokenizers. A `Tokenizer` turns text into id tensors — the entry
- * point of the text data plane. Encoding, batch encoding and training run
- * natively (the HuggingFace `tokenizers` crate over napi) `encode` and
- * `encodeBatch` return `u32` tensors built in Rust, so the id buffer never
- * round-trips through JS. Loading is `tokenizer.json`-compatible, so every
+ * RFC 0009: tokenizers. A `Tokenizer` turns text into host-owned token ids.
+ * Encoding, batch encoding and training run natively (the HuggingFace
+ * `tokenizers` crate over napi), while tensor runtimes explicitly import the
+ * returned data. Loading is `tokenizer.json`-compatible, so every
  * HuggingFace Hub tokenizer works out of the box, and `train` builds BPE,
  * WordPiece, Unigram or WordLevel tokenizers from raw text files.
  *
@@ -11,15 +10,9 @@
  * ids unless the tokenizer is configured with `specialTokens: "Always"` —
  * the tiktoken `allowed_special` discipline.
  */
-import native, {
-  type NativePadding as NativePaddingType,
-  type NativeTokenizer as NativeTokenizerType,
-  type NativeTruncation as NativeTruncationType
-} from "@effect-torch/native"
+import native, { type NativeTokenizer as NativeTokenizerType } from "@effect-torch/native"
 import { Data, Effect, Option, Queue, Stream } from "effect"
 import { type Pipeable, pipeArguments } from "effect/Pipeable"
-import { CurrentDevice } from "./Device.ts"
-import * as Tensor from "./Tensor.ts"
 
 const { NativeTokenizer } = native
 
@@ -28,7 +21,7 @@ const { NativeTokenizer } = native
  * @category symbols
  */
 export const TokenizerTypeId: unique symbol = Symbol.for(
-  "@effect-torch/core/Tokenizer"
+  "@effect-torch/tokenizers/Tokenizer"
 )
 
 /**
@@ -141,6 +134,26 @@ export interface TokenizerConfig {
   readonly truncation: Truncation
   readonly specialTokens: SpecialTokenPolicy
 }
+
+/**
+ * Host-owned token ids ready for explicit import by a tensor runtime.
+ *
+ * @since 0.1.0
+ * @category models
+ */
+export interface TokenIds {
+  readonly data: Uint32Array
+  readonly shape: ReadonlyArray<number>
+  readonly dtype: "u32"
+}
+
+/**
+ * Values accepted by tokenizer decode operations.
+ *
+ * @since 0.1.0
+ * @category models
+ */
+export type TokenIdInput = TokenIds | Uint32Array | ReadonlyArray<number>
 
 /**
  * The strictest configuration: no padding, no truncation, special-token
@@ -256,9 +269,9 @@ export interface TrainConfig<E, R> {
 }
 
 /**
- * A text tokenizer. Values are immutable and safe for concurrent use the
- * native handle owns only CPU heap (vocab tables, merges, regexes), so it
- * is reclaimed by ordinary GC finalization — no explicit disposal.
+ * A text tokenizer. Values are immutable and safe for concurrent use. The
+ * implementation owns only CPU heap (vocab tables, merges, regexes), so it
+ * is reclaimed by ordinary GC finalization; no explicit disposal is needed.
  *
  * @since 0.1.0
  * @category models
@@ -270,39 +283,38 @@ export interface Tokenizer extends Pipeable {
    */
   readonly vocabSize: number
   /**
-   * Encodes text into a `[T]` `u32` tensor of token ids.
+   * Encodes text into host-owned `[T]` `u32` token ids.
    */
   readonly encode: (
     text: string
-  ) => Effect.Effect<Tensor.Lazy, TokenizerError, CurrentDevice>
+  ) => Effect.Effect<TokenIds, TokenizerError>
   /**
-   * Encodes a batch into a `[B, T]` `u32` tensor, padded per the
+   * Encodes a batch into host-owned `[B, T]` `u32` ids, padded per the
    * tokenizer's {@link Padding} config with `paddingNone`, ragged
    * encodings fail with {@link TokenizerError}.
    */
   readonly encodeBatch: (
     texts: ReadonlyArray<string>
-  ) => Effect.Effect<Tensor.Lazy, TokenizerError, CurrentDevice>
+  ) => Effect.Effect<TokenIds, TokenizerError>
   /**
-   * Encodes a batch into one flat `[ΣT]` `u32` tensor — the ragged
+   * Encodes a batch into one flat host-owned `[ΣT]` `u32` value — the ragged
    * encodings concatenated in order, no padding. The document-stream
    * counterpart of {@link encodeBatch} for corpus tokenization.
    */
   readonly encodeBatchConcat: (
     texts: ReadonlyArray<string>
-  ) => Effect.Effect<Tensor.Lazy, TokenizerError, CurrentDevice>
+  ) => Effect.Effect<TokenIds, TokenizerError>
   /**
    * Decodes ids back to text, losslessly (special tokens are not skipped).
-   * Tensor inputs are materialized natively.
    */
   readonly decode: (
-    ids: Tensor.Any | ReadonlyArray<number>
+    ids: TokenIdInput
   ) => Effect.Effect<string, TokenizerError>
   /**
    * Batch counterpart of {@link Tokenizer.decode}.
    */
   readonly decodeBatch: (
-    ids: ReadonlyArray<Tensor.Any | ReadonlyArray<number>>
+    ids: ReadonlyArray<TokenIdInput>
   ) => Effect.Effect<ReadonlyArray<string>, TokenizerError>
   readonly tokenToId: (token: string) => Option.Option<number>
   readonly idToToken: (id: number) => Option.Option<string>
@@ -312,30 +324,6 @@ export interface Tokenizer extends Pipeable {
   readonly save: (path: string) => Effect.Effect<void, TokenizerError>
 }
 
-const toNativePadding = (padding: Padding): NativePaddingType => {
-  switch (padding._tag) {
-    case "None":
-      return { tag: "None" }
-    case "Longest":
-      return { tag: "Longest", padId: padding.padId }
-    case "MaxLength":
-      return {
-        tag: "MaxLength",
-        maxLength: padding.maxLength,
-        padId: padding.padId
-      }
-  }
-}
-
-const toNativeTruncation = (truncation: Truncation): NativeTruncationType => {
-  switch (truncation._tag) {
-    case "None":
-      return { tag: "None" }
-    case "MaxLength":
-      return { tag: "MaxLength", maxLength: truncation.maxLength }
-  }
-}
-
 const toTokenizerError = (op: string) => (error: unknown) =>
   new TokenizerError({
     op,
@@ -343,17 +331,55 @@ const toTokenizerError = (op: string) => (error: unknown) =>
   })
 
 const idsOf = (
-  ids: Tensor.Any | ReadonlyArray<number>
+  ids: TokenIdInput
 ): Effect.Effect<ReadonlyArray<number>, TokenizerError> =>
-  Array.isArray(ids)
-    ? Effect.succeed(ids as ReadonlyArray<number>)
-    : Effect.map(
-      Effect.mapError(
-        Tensor.toTypedArray(ids as Tensor.Any),
-        toTokenizerError("decode")
-      ),
-      (data) => Array.from(data, Number)
-    )
+  "data" in ids
+    ? Effect.succeed(Array.from(ids.data))
+    : Effect.succeed(Array.from(ids))
+
+const tokenIds = (data: Uint32Array, shape: ReadonlyArray<number>): TokenIds => ({ data, shape, dtype: "u32" })
+
+const truncate = (data: Uint32Array, config: TokenizerConfig): Uint32Array =>
+  config.truncation._tag === "MaxLength" && data.length > config.truncation.maxLength
+    ? data.slice(0, config.truncation.maxLength)
+    : data
+
+const makeBatch = (rows: ReadonlyArray<Uint32Array>, config: TokenizerConfig): TokenIds => {
+  if (rows.length === 0) {
+    throw new Error("encodeBatch: expected at least one text")
+  }
+  const truncated = rows.map((row) => truncate(row, config))
+  let columns: number
+  let padId = 0
+  switch (config.padding._tag) {
+    case "None": {
+      columns = truncated[0]!.length
+      if (truncated.some((row) => row.length !== columns)) {
+        throw new Error("encodeBatch: ragged encodings require an explicit padding policy")
+      }
+      break
+    }
+    case "Longest": {
+      columns = Math.max(...truncated.map((row) => row.length))
+      padId = config.padding.padId
+      break
+    }
+    case "MaxLength": {
+      columns = config.padding.maxLength
+      padId = config.padding.padId
+      if (truncated.some((row) => row.length > columns)) {
+        throw new Error("encodeBatch: an encoding exceeds maxLength; configure truncation explicitly")
+      }
+      break
+    }
+  }
+  const data = new Uint32Array(rows.length * columns)
+  if (padId !== 0) data.fill(padId)
+  for (let row = 0; row < truncated.length; row++) {
+    data.set(truncated[row]!, row * columns)
+  }
+  return tokenIds(data, [rows.length, columns])
+}
 
 const TokenizerProto = {
   pipe() {
@@ -369,51 +395,41 @@ const make = (
   self[TokenizerTypeId] = TokenizerTypeId
   self.vocabSize = handle.vocabSize
   self.encode = (text: string) =>
-    Effect.gen(function*() {
-      const device = yield* CurrentDevice
-      return yield* Effect.try({
-        try: () => {
-          const lazy = handle.encodeTensor(text, device)
-          return Tensor.makeLazy(lazy, lazy.shape, "u32", device)
-        },
-        catch: toTokenizerError("encode")
-      })
+    Effect.try({
+      try: () => {
+        const data = truncate(handle.encode(text), config)
+        return tokenIds(data, [data.length])
+      },
+      catch: toTokenizerError("encode")
     })
   self.encodeBatch = (texts: ReadonlyArray<string>) =>
-    Effect.gen(function*() {
-      const device = yield* CurrentDevice
-      return yield* Effect.tryPromise({
-        try: async () => {
-          const lazy = await handle.encodeBatchTensor(
-            texts as Array<string>,
-            toNativePadding(config.padding),
-            toNativeTruncation(config.truncation),
-            device
-          )
-          return Tensor.makeLazy(lazy, lazy.shape, "u32", device)
-        },
-        catch: toTokenizerError("encodeBatch")
-      })
+    Effect.tryPromise({
+      try: async () => makeBatch(await handle.encodeBatch([...texts]), config),
+      catch: toTokenizerError("encodeBatch")
     })
   self.encodeBatchConcat = (texts: ReadonlyArray<string>) =>
-    Effect.gen(function*() {
-      const device = yield* CurrentDevice
-      return yield* Effect.tryPromise({
-        try: async () => {
-          const lazy = await handle.encodeBatchConcatTensor(texts as Array<string>, device)
-          return Tensor.makeLazy(lazy, lazy.shape, "u32", device)
-        },
-        catch: toTokenizerError("encodeBatchConcat")
-      })
+    Effect.tryPromise({
+      try: async () => {
+        const rows = (await handle.encodeBatch([...texts])).map((row) => truncate(row, config))
+        const length = rows.reduce((total, row) => total + row.length, 0)
+        const data = new Uint32Array(length)
+        let offset = 0
+        for (const row of rows) {
+          data.set(row, offset)
+          offset += row.length
+        }
+        return tokenIds(data, [length])
+      },
+      catch: toTokenizerError("encodeBatchConcat")
     })
-  self.decode = (ids: Tensor.Any | ReadonlyArray<number>) =>
+  self.decode = (ids: TokenIdInput) =>
     Effect.flatMap(idsOf(ids), (resolved) =>
       Effect.try({
         try: () => handle.decode(resolved as Array<number>),
         catch: toTokenizerError("decode")
       }))
   self.decodeBatch = (
-    batch: ReadonlyArray<Tensor.Any | ReadonlyArray<number>>
+    batch: ReadonlyArray<TokenIdInput>
   ) =>
     Effect.flatMap(
       Effect.forEach(batch, idsOf, { concurrency: "unbounded" }),

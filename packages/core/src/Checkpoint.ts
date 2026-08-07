@@ -7,15 +7,14 @@
  * `stateRoots`/`rebuildState` contract (plus an `init` template) makes
  * any state a canonical list of tensors, so every entry rides the same
  * file — `param:<name>`, `state:<i>`, the step as a 0-d `meta:step`, and
- * the sampler as `sampler:*`. Roots the current device cannot represent
- * (f64 on Metal) load onto the CPU, restored with their recorded dtype —
- * resuming is bit-exact.
+ * the sampler as `sampler:*`. Every restored tensor is imported by the
+ * selected runtime without implicit placement fallback.
  *
  * @since 0.1.0
  */
 import { Data, Effect } from "effect"
-import type * as Device from "./Device.ts"
 import type * as Model from "./Model.ts"
+import type * as Runtime from "./Runtime.ts"
 import type * as Sampler from "./Sampler.ts"
 import * as Tensor from "./Tensor.ts"
 import type * as Trainer from "./Trainer.ts"
@@ -76,7 +75,7 @@ export const save = <S, EL, RL, ED, RD, EO, RO>(
   path: string,
   trainer: Trainer.Trainer<S, EL, RL, ED, RD, EO, RO>,
   trained: Trainer.Trained<S>
-): Effect.Effect<void, Tensor.TensorError, Device.CurrentDevice> =>
+): Effect.Effect<void, Tensor.TensorError, Runtime.Runtime> =>
   Effect.gen(function*() {
     const entries = yield* trainerEntries(trainer, trained)
     yield* Tensor.save(path, entries)
@@ -94,7 +93,7 @@ export const saveWithSampler = <S, EL, RL, ED, RD, EO, RO>(
   trainer: Trainer.Trainer<S, EL, RL, ED, RD, EO, RO>,
   trained: Trainer.Trained<S>,
   sampler: Sampler.Sampler
-): Effect.Effect<void, Tensor.TensorError, Device.CurrentDevice> =>
+): Effect.Effect<void, Tensor.TensorError, Runtime.Runtime> =>
   Effect.gen(function*() {
     const entries = yield* trainerEntries(trainer, trained)
     const state = sampler.state()
@@ -119,7 +118,7 @@ export const saveWithSampler = <S, EL, RL, ED, RD, EO, RO>(
 export const load = <S, EL, RL, ED, RD, EO, RO>(
   path: string,
   trainer: Trainer.Trainer<S, EL, RL, ED, RD, EO, RO>
-): Effect.Effect<Checkpoint<S>, CheckpointError | Tensor.TensorError, Device.CurrentDevice> =>
+): Effect.Effect<Checkpoint<S>, CheckpointError | Tensor.TensorError, Runtime.Runtime> =>
   Effect.gen(function*() {
     const tensors = yield* Tensor.load(path)
     const checkpoint = yield* trainerCheckpoint(path, trainer, tensors)
@@ -135,7 +134,7 @@ export const load = <S, EL, RL, ED, RD, EO, RO>(
 export const loadWithSampler = <S, EL, RL, ED, RD, EO, RO>(
   path: string,
   trainer: Trainer.Trainer<S, EL, RL, ED, RD, EO, RO>
-): Effect.Effect<CheckpointWithSampler<S>, CheckpointError | Tensor.TensorError, Device.CurrentDevice> =>
+): Effect.Effect<CheckpointWithSampler<S>, CheckpointError | Tensor.TensorError, Runtime.Runtime> =>
   Effect.gen(function*() {
     const tensors = yield* Tensor.load(path)
     const checkpoint = yield* trainerCheckpoint(path, trainer, tensors)
@@ -167,13 +166,20 @@ export const loadWithSampler = <S, EL, RL, ED, RD, EO, RO>(
 const trainerEntries = <S, EL, RL, ED, RD, EO, RO>(
   trainer: Trainer.Trainer<S, EL, RL, ED, RD, EO, RO>,
   trained: Trainer.Trained<S>
-): Effect.Effect<Record<string, Tensor.Any>, Tensor.TensorError, Device.CurrentDevice> =>
+): Effect.Effect<Record<string, Tensor.Any>, Tensor.TensorError, Runtime.Runtime> =>
   Effect.gen(function*() {
     const entries: Record<string, Tensor.Any> = Object.fromEntries(
       trainer.model.names.map((name, i) => [`${PARAM_PREFIX}${name}`, trained.params[i]])
     )
     for (const [i, root] of trainer.config.optimizer.stateRoots(trained.state).entries()) {
       entries[`${STATE_PREFIX}${i}`] = root
+    }
+    const first = trained.params[0]
+    if (first === undefined) {
+      return yield* new Tensor.TensorError({
+        op: "checkpoint.save",
+        message: "checkpoint.save: expected model parameters"
+      })
     }
     entries[STEP_KEY] = yield* Tensor.full([], trained.step, { dtype: "u32" })
     return entries
@@ -194,7 +200,7 @@ const decodeU32Scalar = (
   path: string,
   key: string,
   tensor: Tensor.Concrete
-): Effect.Effect<number, CheckpointError | Tensor.TensorError> =>
+): Effect.Effect<number, CheckpointError | Tensor.TensorError, Runtime.Runtime> =>
   Effect.gen(function*() {
     if (tensor.dtype !== "u32" || tensor.shape.length !== 0) {
       return yield* new CheckpointError({
@@ -217,14 +223,14 @@ const readU32Scalar = (
   path: string,
   tensors: Record<string, Tensor.Concrete>,
   key: string
-): Effect.Effect<number, CheckpointError | Tensor.TensorError> =>
+): Effect.Effect<number, CheckpointError | Tensor.TensorError, Runtime.Runtime> =>
   Effect.flatMap(required(path, tensors, key), (tensor) => decodeU32Scalar(path, key, tensor))
 
 const readU32Vector = (
   path: string,
   tensors: Record<string, Tensor.Concrete>,
   key: string
-): Effect.Effect<Uint32Array, CheckpointError | Tensor.TensorError> =>
+): Effect.Effect<Uint32Array, CheckpointError | Tensor.TensorError, Runtime.Runtime> =>
   Effect.gen(function*() {
     const tensor = yield* required(path, tensors, key)
     if (tensor.dtype !== "u32" || tensor.shape.length !== 1) {
@@ -250,7 +256,7 @@ const trainerCheckpoint = <S, EL, RL, ED, RD, EO, RO>(
   path: string,
   trainer: Trainer.Trainer<S, EL, RL, ED, RD, EO, RO>,
   tensors: Record<string, Tensor.Concrete>
-): Effect.Effect<Checkpoint<S>, CheckpointError | Tensor.TensorError, Device.CurrentDevice> =>
+): Effect.Effect<Checkpoint<S>, CheckpointError | Tensor.TensorError, Runtime.Runtime> =>
   Effect.gen(function*() {
     const optimizer = trainer.config.optimizer
     const params: Array<Tensor.Any> = []

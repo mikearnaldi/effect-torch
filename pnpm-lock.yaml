@@ -15,8 +15,30 @@ importers:
         specifier: ^1.77.0
         version: 1.77.0
 
+  packages/backend-native:
+    dependencies:
+      '@effect-torch/core':
+        specifier: workspace:^
+        version: link:../core
+      '@effect-torch/native':
+        specifier: workspace:*
+        version: link:../native
+      effect:
+        specifier: 4.0.0-beta.101
+        version: 4.0.0-beta.101
+    devDependencies:
+      '@types/node':
+        specifier: ^22.0.0
+        version: 22.20.1
+      typescript:
+        specifier: ^5.8.0
+        version: 5.9.3
+
   packages/bench:
     dependencies:
+      '@effect-torch/backend-native':
+        specifier: workspace:*
+        version: link:../backend-native
       '@effect-torch/core':
         specifier: workspace:*
         version: link:../core
@@ -39,13 +61,16 @@ importers:
 
   packages/core:
     dependencies:
-      '@effect-torch/native':
-        specifier: workspace:*
-        version: link:../native
       effect:
         specifier: 4.0.0-beta.101
         version: 4.0.0-beta.101
     devDependencies:
+      '@effect-torch/backend-native':
+        specifier: workspace:*
+        version: link:../backend-native
+      '@effect-torch/tokenizers':
+        specifier: workspace:*
+        version: link:../tokenizers
       '@effect/vitest':
         specifier: 4.0.0-beta.101
         version: 4.0.0-beta.101(effect@4.0.0-beta.101)(vitest@4.1.10(@types/node@22.20.1)(vite@8.1.5(@types/node@22.20.1)(esbuild@0.28.1)(tsx@4.23.1)(yaml@2.9.0)))
@@ -61,9 +86,15 @@ importers:
 
   packages/examples:
     dependencies:
+      '@effect-torch/backend-native':
+        specifier: workspace:*
+        version: link:../backend-native
       '@effect-torch/core':
         specifier: workspace:*
         version: link:../core
+      '@effect-torch/tokenizers':
+        specifier: workspace:*
+        version: link:../tokenizers
       '@effect/platform-node':
         specifier: 4.0.0-beta.101
         version: 4.0.0-beta.101(effect@4.0.0-beta.101)(ioredis@5.11.1)
@@ -90,7 +121,23 @@ importers:
     devDependencies:
       '@napi-rs/cli':
         specifier: ^3.0.0
-        version: 3.7.4(@emnapi/runtime@1.11.2)(@types/node@22.20.1)
+        version: 3.7.4(@emnapi/runtime@1.9.2)(@types/node@22.20.1)
+
+  packages/tokenizers:
+    dependencies:
+      '@effect-torch/native':
+        specifier: workspace:*
+        version: link:../native
+      effect:
+        specifier: 4.0.0-beta.101
+        version: 4.0.0-beta.101
+    devDependencies:
+      '@types/node':
+        specifier: ^22.0.0
+        version: 22.20.1
+      typescript:
+        specifier: ^5.8.0
+        version: 5.9.3
 
 packages:
 
@@ -2013,7 +2060,7 @@ snapshots:
   '@msgpackr-extract/msgpackr-extract-win32-x64@3.0.4':
     optional: true
 
-  '@napi-rs/cli@3.7.4(@emnapi/runtime@1.11.2)(@types/node@22.20.1)':
+  '@napi-rs/cli@3.7.4(@emnapi/runtime@1.9.2)(@types/node@22.20.1)':
     dependencies:
       '@inquirer/prompts': 8.5.2(@types/node@22.20.1)
       '@napi-rs/cross-toolchain': 1.0.3
@@ -2028,7 +2075,7 @@ snapshots:
       semver: 7.8.5
       typanion: 3.14.0
     optionalDependencies:
-      '@emnapi/runtime': 1.11.2
+      '@emnapi/runtime': 1.9.2
     transitivePeerDependencies:
       - '@napi-rs/cross-toolchain-arm64-target-aarch64'
       - '@napi-rs/cross-toolchain-arm64-target-armv7'

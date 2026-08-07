@@ -1,17 +1,11 @@
-import native from "@effect-torch/native"
+import * as BackendNative from "@effect-torch/backend-native"
 import { layer } from "@effect/vitest"
 import * as assert from "@effect/vitest/utils"
-import { Device } from "../../src/index.ts"
+import type { Runtime } from "../../src/index.ts"
 
 export type TestDevice = "cpu" | "metal"
 
-export const metalAvailable: boolean = (() => {
-  try {
-    return native.isDeviceAvailable("metal")
-  } catch {
-    return false
-  }
-})()
+export const metalAvailable: boolean = BackendNative.isAvailable("metal")
 
 /** Tests settle on f32: it runs on every device, so one dtype and one set
  * of tolerances covers CPU and Metal alike. */
@@ -53,15 +47,15 @@ export const deep = (actual: unknown, expected: unknown): void => {
   assert.deepStrictEqual(actual, expected)
 }
 
-type SuiteFn = Parameters<ReturnType<typeof layer<Device.CurrentDevice, never>>>[1]
+type SuiteFn = Parameters<ReturnType<typeof layer<Runtime.Runtime, never>>>[1]
 
 /**
  * Registers the same suite once per device: always on CPU, and on Metal
  * when the machine has one.
  */
 export const onDevices = (name: string, make: (device: TestDevice) => SuiteFn): void => {
-  layer(Device.Cpu)(`${name} (cpu)`, make("cpu"))
+  layer(BackendNative.Cpu)(`${name} (cpu)`, make("cpu"))
   if (metalAvailable) {
-    layer(Device.Metal)(`${name} (metal)`, make("metal"))
+    layer(BackendNative.Metal)(`${name} (metal)`, make("metal"))
   }
 }

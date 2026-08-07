@@ -1,7 +1,7 @@
 import { describe, expect } from "@effect/vitest"
 import * as assert from "@effect/vitest/utils"
 import { Effect } from "effect"
-import { type Device, Gradient, Loss, Tensor } from "../src/index.ts"
+import { Gradient, Loss, type Runtime, Tensor } from "../src/index.ts"
 import { floats, GRADCHECK_EPS, GRADCHECK_TOL, onDevices, TOL } from "./utils/devices.ts"
 
 const i64 = (data: ReadonlyArray<bigint>, shape?: ReadonlyArray<number>) =>
@@ -12,7 +12,7 @@ const values = (t: Tensor.Any) => Tensor.toNumberArray(t)
 const scalar = (t: Tensor.Any) => Effect.map(values(t), (v) => v[0])
 
 const gradcheck = (
-  f: (x: Tensor.Lazy) => Effect.Effect<Tensor.Lazy, Tensor.TensorError, Device.CurrentDevice>,
+  f: (x: Tensor.Lazy) => Effect.Effect<Tensor.Lazy, Tensor.TensorError, Runtime.Runtime>,
   input: ReadonlyArray<number>,
   shape: ReadonlyArray<number>
 ) =>

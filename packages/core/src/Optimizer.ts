@@ -39,8 +39,8 @@
  * @since 0.1.0
  */
 import { Effect } from "effect"
-import type { CurrentDevice } from "./Device.ts"
 import * as Gradient from "./Gradient.ts"
+import * as Runtime from "./Runtime.ts"
 import * as Tensor from "./Tensor.ts"
 
 /**
@@ -73,7 +73,9 @@ export interface SgdState {
 /**
  * Configuration for Adam (`beta1 = 0.9`, `beta2 = 0.999`, `eps = 1e-8` by
  * default). The learning rate is a per-step input to
- * {@link Optimizer.step}, not configuration.
+ * {@link Optimizer.step}, not configuration. For f32 state, initialization
+ * rejects betas whose rounded first-step bias correction differs from the
+ * configured value by more than 1%.
  *
  * @since 0.1.0
  * @category models
@@ -98,9 +100,9 @@ export interface AdamWConfig extends AdamConfig {
 /**
  * State carried between Adam-family steps: first and second moment
  * estimates, one per parameter, plus the step count `t` used for bias
- * correction. Every field is a tensor: `t` is a 0-d CPU f64 tensor (the
- * bias corrections derived from it cancel catastrophically in f32), so
- * the count flows through the graph like any other state.
+ * correction. Every field is a tensor: `t` is a 0-d tensor matching the
+ * first parameter's dtype and placement, so the count flows through the
+ * graph like any other state.
  *
  * @since 0.1.0
  * @category models
@@ -153,27 +155,18 @@ export interface OptimizerUpdate<S> {
 export interface Optimizer<S> {
   readonly init: (
     params: ReadonlyArray<Tensor.Any>
-  ) => Effect.Effect<S, Tensor.TensorError, CurrentDevice>
+  ) => Effect.Effect<S, Tensor.TensorError, Runtime.Runtime>
   readonly step: (
     params: ReadonlyArray<Tensor.Any>,
     grads: ReadonlyArray<Tensor.Any>,
     state: S,
     lr: Tensor.Any
-  ) => Effect.Effect<OptimizerUpdate<S>, Tensor.TensorError>
+  ) => Effect.Effect<OptimizerUpdate<S>, Tensor.TensorError, Runtime.Runtime>
   readonly stateRoots: (state: S) => ReadonlyArray<Tensor.Any>
   readonly rebuildState: (state: S, roots: ReadonlyArray<Tensor.Any>) => S
 }
 
 const isFloat = (dtype: Tensor.DType): boolean => dtype === "f32" || dtype === "f64"
-
-// Step-count and correction tensors live on the CPU in f64 regardless of
-// the parameter device: 1 - beta^t catastrophically cancels in f32 when
-// the result is small (c2 starts at 1e-3), so the corrections are computed
-// in f64 exactly as the host-side formula would be, and the step nodes'
-// eval arms cast (and copy, for 0-d scalars the copy is free) to the
-// parameter dtype/device. The sgd `first` flag is precision-irrelevant and
-// stays on the parameter device in the parameter's precision family.
-const scalarDtype = (params: ReadonlyArray<Tensor.Any>): Tensor.DType => params[0]?.dtype === "f64" ? "f64" : "f32"
 
 // The step count lives on the ambient device like every other state
 // tensor — never a hidden device override. Its dtype follows the
@@ -182,21 +175,40 @@ const scalarDtype = (params: ReadonlyArray<Tensor.Any>): Tensor.DType => params[
 const stepCount = (
   value: number,
   params: ReadonlyArray<Tensor.Any>
-): Effect.Effect<Tensor.Lazy, Tensor.TensorError, CurrentDevice> =>
-  Tensor.full([], value, { dtype: scalarDtype(params) })
+): Effect.Effect<Tensor.Lazy, Tensor.TensorError, Runtime.Runtime> =>
+  params[0] === undefined
+    ? new Tensor.TensorError({ op: "stepCount", message: "stepCount: expected at least one parameter" })
+    : Tensor.constantLike(params[0], value)
 
-const checkLr = (op: string, lr: Tensor.Any): Effect.Effect<void, Tensor.TensorError> =>
-  lr.shape.length === 0 && isFloat(lr.dtype)
-    ? Effect.void
-    : new Tensor.TensorError({
+const checkLr = (op: string, lr: Tensor.Any): Effect.Effect<void, Tensor.TensorError> => {
+  if (lr.shape.length !== 0 || !isFloat(lr.dtype)) {
+    return new Tensor.TensorError({
       op,
       message: `${op}: lr must be a 0-d float tensor, got shape [${lr.shape}] ${lr.dtype}`
     })
+  }
+  return Effect.void
+}
+
+const checkStateScalar = (
+  op: string,
+  name: string,
+  value: Tensor.Any
+): Effect.Effect<void, Tensor.TensorError> => {
+  if (value.shape.length !== 0 || !isFloat(value.dtype)) {
+    return new Tensor.TensorError({ op, message: `${op}: ${name} must be a 0-d float tensor` })
+  }
+  return Effect.void
+}
 
 const checkParams = (
   op: string,
   params: ReadonlyArray<Tensor.Any>
 ): Effect.Effect<void, Tensor.TensorError> => {
+  const first = params[0]
+  if (first === undefined) {
+    return new Tensor.TensorError({ op, message: `${op}: expected at least one parameter` })
+  }
   for (const param of params) {
     if (!isFloat(param.dtype)) {
       return new Tensor.TensorError({
@@ -263,6 +275,15 @@ const checkStateLength = (
   return Effect.void
 }
 
+const validateGraph = (
+  runtime: Runtime.RuntimeService,
+  op: string,
+  tensors: ReadonlyArray<Tensor.Any>
+): Effect.Effect<void, Tensor.TensorError> =>
+  runtime.validateGraph(tensors.map((tensor) => tensor.lazy)).pipe(
+    Effect.mapError((error) => new Tensor.TensorError({ op, message: error.message, backend: error }))
+  )
+
 /**
  * Creates a stochastic gradient descent optimizer with optional momentum,
  * dampening, nesterov, and coupled (L2) weight decay. With no momentum the
@@ -290,20 +311,23 @@ export const sgd = (config: SgdConfig = {}): Effect.Effect<Optimizer<SgdState>> 
         const velocity: Array<Tensor.Any> = []
         if (momentum !== 0) {
           for (const param of params) {
-            velocity.push(yield* Tensor.zeros(param.shape, { dtype: param.dtype }))
+            velocity.push(yield* Tensor.zerosLike(param))
           }
         }
-        const first = yield* Tensor.ones([], { dtype: scalarDtype(params) })
+        const first = yield* Tensor.constantLike(params[0], 1)
         return { velocity, first } satisfies SgdState
       }),
     step: (params, grads, state, lr) =>
       Effect.gen(function*() {
+        const runtime = yield* Runtime.Runtime
         yield* checkParams("sgd", params)
         yield* checkGrads("sgd", params, grads)
         yield* checkLr("sgd", lr)
+        yield* checkStateScalar("sgd", "first-step flag", state.first)
         if (momentum !== 0) {
           yield* checkStateLength("sgd", "velocity", state.velocity, params)
         }
+        yield* validateGraph(runtime, "sgd", [...params, ...grads, ...state.velocity, state.first, lr])
         const updates: Array<Tensor.Lazy> = []
         const velocities: Array<Tensor.Any> = []
         for (let i = 0; i < params.length; i++) {
@@ -335,7 +359,7 @@ export const sgd = (config: SgdConfig = {}): Effect.Effect<Optimizer<SgdState>> 
           })
           const makeOut = (index: number): Tensor.Lazy => {
             const handle = step.sgdOut(index)
-            return Tensor.makeLazy(handle, params[i].shape, params[i].dtype, params[i].device)
+            return Tensor.makeLazy(handle, params[i].shape, params[i].dtype, params[i].placement)
           }
           updates.push(makeOut(0))
           velocities.push(makeOut(1))
@@ -380,27 +404,45 @@ const makeAdam = (op: string, config: ResolvedAdamConfig): Effect.Effect<Optimiz
   if (!Number.isFinite(eps) || eps <= 0) {
     throw new Error(`${op}: eps must be positive, got ${eps}`)
   }
+  const f32CorrectionError = (beta: number): number => {
+    const exact = 1 - beta
+    const rounded = 1 - Math.fround(Math.exp(Math.fround(Math.log(beta))))
+    return Math.abs(rounded - exact) / exact
+  }
+  const checkBetaPrecision = (dtype: Tensor.DType): Effect.Effect<void, Tensor.TensorError> =>
+    dtype === "f32" && (f32CorrectionError(beta1) > 0.01 || f32CorrectionError(beta2) > 0.01)
+      ? new Tensor.TensorError({
+        op,
+        message:
+          `${op}: beta1 and beta2 must keep bias-correction error below 1% at f32 precision, got ${beta1} and ${beta2}`
+      })
+      : Effect.void
 
   return Effect.succeed({
     init: (params) =>
       Effect.gen(function*() {
         yield* checkParams(op, params)
+        yield* checkBetaPrecision(params[0]!.dtype)
         const m: Array<Tensor.Any> = []
         const v: Array<Tensor.Any> = []
         for (const param of params) {
-          m.push(yield* Tensor.zeros(param.shape, { dtype: param.dtype }))
-          v.push(yield* Tensor.zeros(param.shape, { dtype: param.dtype }))
+          m.push(yield* Tensor.zerosLike(param))
+          v.push(yield* Tensor.zerosLike(param))
         }
         const t = yield* stepCount(0, params)
         return { m, v, t } satisfies AdamState
       }),
     step: (params, grads, state, lr) =>
       Effect.gen(function*() {
+        const runtime = yield* Runtime.Runtime
         yield* checkParams(op, params)
         yield* checkGrads(op, params, grads)
         yield* checkLr(op, lr)
+        yield* checkStateScalar(op, "step count", state.t)
+        yield* checkBetaPrecision(state.t.dtype)
         yield* checkStateLength(op, "first-moment", state.m, params)
         yield* checkStateLength(op, "second-moment", state.v, params)
+        yield* validateGraph(runtime, op, [...params, ...grads, ...state.m, ...state.v, state.t, lr])
         // The bias corrections 1 - beta^t are tensor ops over the state's
         // step count, built once per step and shared by every parameter's
         // update node (the evaluator dedups them into one kernel each).
@@ -444,7 +486,7 @@ const makeAdam = (op: string, config: ResolvedAdamConfig): Effect.Effect<Optimiz
           })
           const makeOut = (index: number): Tensor.Lazy => {
             const handle = step.adamwOut(index)
-            return Tensor.makeLazy(handle, params[i].shape, params[i].dtype, params[i].device)
+            return Tensor.makeLazy(handle, params[i].shape, params[i].dtype, params[i].placement)
           }
           updates.push(makeOut(0))
           m.push(makeOut(1))
@@ -508,7 +550,7 @@ export const adamW = (config: AdamWConfig = {}): Effect.Effect<Optimizer<AdamSta
 export const clipByValue = (
   grads: ReadonlyArray<Tensor.Any>,
   options: { readonly min?: number; readonly max?: number }
-): Effect.Effect<Array<Tensor.Lazy>, Tensor.TensorError> =>
+): Effect.Effect<Array<Tensor.Lazy>, Tensor.TensorError, Runtime.Runtime> =>
   Effect.gen(function*() {
     if (options.min === undefined && options.max === undefined) {
       return yield* new Tensor.TensorError({
@@ -536,7 +578,7 @@ export const clipByValue = (
 export const clipByGlobalNorm = (
   grads: ReadonlyArray<Tensor.Any>,
   maxNorm: number
-): Effect.Effect<Array<Tensor.Lazy>, Tensor.TensorError> =>
+): Effect.Effect<Array<Tensor.Lazy>, Tensor.TensorError, Runtime.Runtime> =>
   Effect.gen(function*() {
     if (maxNorm <= 0) {
       return yield* new Tensor.TensorError({
@@ -604,7 +646,8 @@ export const step = <S, P extends ReadonlyArray<Tensor.Any>>(
   lr: Tensor.Any
 ): Effect.Effect<
   { readonly loss: Tensor.Concrete; readonly params: Materialized<P>; readonly state: S },
-  Gradient.GradError | Tensor.TensorError
+  Gradient.GradError | Tensor.TensorError,
+  Runtime.Runtime
 > =>
   Effect.gen(function*() {
     const grads = yield* Gradient.grad(loss, params)

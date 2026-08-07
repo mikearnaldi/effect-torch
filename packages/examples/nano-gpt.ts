@@ -1,4 +1,6 @@
-import { Device, LearningRate, Loss, Model, Optimizer, Tensor, Tokenizer, Trainer } from "@effect-torch/core"
+import * as BackendNative from "@effect-torch/backend-native"
+import { LearningRate, Loss, Model, Optimizer, Runtime, Tensor, Trainer } from "@effect-torch/core"
+import * as Tokenizer from "@effect-torch/tokenizers"
 import { NodeRuntime } from "@effect/platform-node"
 import { Duration, Effect, Option } from "effect"
 
@@ -183,7 +185,7 @@ const generate = (
   Effect.gen(function*() {
     const bosId = Option.getOrThrow(tokenizer.tokenToId(BOS))
     const eosId = Option.getOrThrow(tokenizer.tokenToId(EOS))
-    const promptIds = yield* Tensor.toNumberArray(yield* tokenizer.encode(prompt))
+    const promptIds = Array.from((yield* tokenizer.encode(prompt)).data)
     const gen = yield* program.generation()
     const sample = (logits: Tensor.Any) =>
       Effect.gen(function*() {
@@ -213,7 +215,7 @@ const generate = (
   })
 
 const program = Effect.gen(function*() {
-  const device = yield* Device.CurrentDevice
+  const runtime = yield* Runtime.Runtime
 
   yield* Effect.log(`0) training ${TOKENIZER_MODEL} tokenizer (target vocab ${VOCAB})`)
   const tokenizer = yield* Tokenizer.train(
@@ -235,10 +237,10 @@ const program = Effect.gen(function*() {
   const eosId = Option.getOrThrow(tokenizer.tokenToId(EOS))
   const data: Array<number> = []
   for (const poem of DOCUMENTS) {
-    data.push(bosId, ...(yield* Tensor.toNumberArray(yield* tokenizer.encode(poem))), eosId)
+    data.push(bosId, ...(yield* tokenizer.encode(poem)).data, eosId)
   }
   yield* Effect.log(
-    `nano-gpt: vocab ${vocabSize} (${data.length} tokens in ${DOCUMENTS.length} documents), block ${BLOCK}, embed ${EMBED}, ${HEADS} heads, ${LAYERS} layers on ${device}`
+    `nano-gpt: vocab ${vocabSize} (${data.length} tokens in ${DOCUMENTS.length} documents), block ${BLOCK}, embed ${EMBED}, ${HEADS} heads, ${LAYERS} layers on ${runtime.placement.description}`
   )
 
   yield* Effect.log("1) creating model")
@@ -269,4 +271,4 @@ const program = Effect.gen(function*() {
   }
 })
 
-NodeRuntime.runMain(program.pipe(Effect.provide(Device.Best)))
+NodeRuntime.runMain(program.pipe(Effect.provide(BackendNative.Best)))

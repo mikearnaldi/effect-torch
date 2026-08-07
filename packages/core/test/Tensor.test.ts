@@ -48,6 +48,14 @@ onDevices("Tensor", () => (it) => {
         const exit = yield* Effect.exit(Tensor.fromTypedArray(new Float32Array([1, 2, 3]), [2, 2]))
         assert.assertTrue(Exit.isFailure(exit))
       }))
+
+    it.effect("reads back non-contiguous views", () =>
+      Effect.gen(function*() {
+        const source = yield* Tensor.fromTypedArray(floats([1, 2, 3, 4, 5, 6]), [2, 3])
+        const transposed = yield* Tensor.transpose(source, [1, 0])
+        const [materialized] = yield* Tensor.compute([transposed])
+        deep(yield* values(materialized), [1, 4, 2, 5, 3, 6])
+      }))
   })
 
   describe("elementwise", () => {
