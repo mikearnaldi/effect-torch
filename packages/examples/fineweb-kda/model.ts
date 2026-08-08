@@ -24,7 +24,7 @@ export { EOT, heldOutLoss, loadBin, loadParams, loadTokenizer, saveParams, windo
 
 export const CHECKPOINT = new URL("../data/fineweb-kda-model.safetensors", import.meta.url).pathname
 
-export const BLOCK = 256
+export const BLOCK = Number(process.env.FINEWEB_BLOCK ?? 256)
 export const EMBED = 256
 export const HEADS = 4
 export const LAYERS = 6

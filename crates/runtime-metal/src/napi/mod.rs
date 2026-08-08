@@ -27,7 +27,7 @@ use err::to_napi_err;
 use runtime::metal::ops as metal_ops;
 
 use runtime::metal::{
-    composed, device, flash, kda, kernels, layer_norm, linear, loss, paged, rotary,
+    composed, device, flash, kda, kernels, layer_norm, linear, loss, paged, rotary, shortconv,
 };
 
 enum FinalizeHint {
@@ -2447,8 +2447,12 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> err::Res<value::Value>
                     let (t, dk) = (dims[r - 2], dims[r - 1]);
                     let dv = v.layout.shape()[r - 1];
                     let bh: usize = dims[..r - 2].iter().product();
-                    if std::env::var_os("EFFECT_TORCH_NO_KDA_FUSED").is_none()
-                        && kda::is_supported(q.dtype, dk, dv)
+                    if !kda::supported_dtype(q.dtype) {
+                        return Err(format!(
+                            "kda chunk: dtype {:?} is not supported on Metal (f32 or bf16 required)",
+                            q.dtype
+                        ));
+                    }
                     {
                         // Fused sequential scan: one launch per layer.
                         let flat = |x: &runtime::metal::run::MetalTensor, w: usize| {
@@ -2475,8 +2479,6 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> err::Res<value::Value>
                             layout: runtime::layout::Layout::contiguous(shape),
                             dtype: out.dtype,
                         })?)
-                    } else {
-                        value::Value(composed::kda_chunk_forward(q, k, v, g, b, *scale)?)
                     }
                 }
                 _ => return Err("device mismatch".to_string()),
@@ -2513,7 +2515,14 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> err::Res<value::Value>
             match (&x, &weight) {
 
                 (value::Value(x), value::Value(w)) => {
-                    value::Value(composed::short_conv1d_forward(x, w)?)
+                    if !shortconv::supported_dtype(x.dtype) {
+                        return Err(format!(
+                            "short_conv1d: dtype {:?} is not supported on Metal (f32 or bf16 required)",
+                            x.dtype
+                        ));
+                    }
+                    let t = x.layout.shape()[x.layout.shape().len() - 2];
+                    value::Value(shortconv::forward(x, w, None, t, false)?.0)
                 }
                 _ => return Err("device mismatch".to_string()),
             }
@@ -2548,10 +2557,13 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> err::Res<value::Value>
                     let (t, dk) = (dims[r - 2], dims[r - 1]);
                     let dv = v.layout.shape()[r - 1];
                     let bh: usize = dims[..r - 2].iter().product();
-                    let (dq, dk, dv_, dg, db) = if std::env::var_os("EFFECT_TORCH_NO_KDA_FUSED")
-                        .is_none()
-                        && kda::is_supported(q.dtype, dk, dv)
-                    {
+                    if !kda::supported_dtype(q.dtype) {
+                        return Err(format!(
+                            "kda backward: dtype {:?} is not supported on Metal (f32 or bf16 required)",
+                            q.dtype
+                        ));
+                    }
+                    let (dq, dk, dv_, dg, db) = {
                         let flat = |x: &runtime::metal::run::MetalTensor, w: usize| {
                             metal_ops::contiguous(&runtime::metal::run::MetalTensor {
                                 buffer: x.buffer.clone(),
@@ -2584,8 +2596,6 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> err::Res<value::Value>
                             restore(&gdg, dk)?,
                             restore(&gdb, 1)?,
                         )
-                    } else {
-                        composed::kda_chunk_backward(q, k, v, ld, b, g, *scale)?
                     };
                     let values = vec![
                         value::Value(dq),
@@ -2614,7 +2624,13 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> err::Res<value::Value>
             match (&x, &weight, &g) {
 
                 (value::Value(x), value::Value(w), value::Value(g)) => {
-                    value::Value(composed::short_conv1d_backward_x(x, w, g)?)
+                    if !shortconv::supported_dtype(x.dtype) {
+                        return Err(format!(
+                            "short_conv1d backward: dtype {:?} is not supported on Metal (f32 or bf16 required)",
+                            x.dtype
+                        ));
+                    }
+                    value::Value(shortconv::backward_x(g, w)?)
                 }
                 _ => return Err("device mismatch".to_string()),
             }
@@ -2626,7 +2642,13 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> err::Res<value::Value>
             match (&x, &weight, &g) {
 
                 (value::Value(x), value::Value(w), value::Value(g)) => {
-                    value::Value(composed::short_conv1d_backward_w(x, w, g)?)
+                    if !shortconv::supported_dtype(x.dtype) {
+                        return Err(format!(
+                            "short_conv1d backward: dtype {:?} is not supported on Metal (f32 or bf16 required)",
+                            x.dtype
+                        ));
+                    }
+                    value::Value(shortconv::backward_w(x, g, w.layout.shape()[1])?)
                 }
                 _ => return Err("device mismatch".to_string()),
             }
@@ -4359,14 +4381,16 @@ fn kda_recurrence(
             (gs, bs)
         };
         // The T=1 decode step runs the fused register-resident
-        // recurrence (RFC 0018 phase 3); chunked prefill keeps the
-        // composed reference path.
+        // recurrence (RFC 0018 phase 3); longer runs use the fused
+        // sequential scan. Unsupported dtypes fail loud — never a
+        // silent slower path.
         let in_dtype = q.as_metal()?.dtype;
-        if t == 1
-            && state.advance == 1
-            && std::env::var_os("EFFECT_TORCH_NO_KDA_FUSED").is_none()
-            && kda::is_supported(in_dtype, geometry.head_dim, geometry.value_dim)
-        {
+        if !kda::supported_dtype(in_dtype) {
+            return Err(format!(
+                "kda recurrence: dtype {in_dtype:?} is not supported on Metal (f32 or bf16 required)"
+            ));
+        }
+        if t == 1 && state.advance == 1 {
             let flat =
                 |x: &runtime::metal::run::MetalTensor, w: usize| runtime::metal::run::MetalTensor {
                     buffer: x.buffer.clone(),
@@ -4395,9 +4419,7 @@ fn kda_recurrence(
             continue;
         }
         // Prefill (t > 1): the fused sequential scan carries the slot's
-        // state in and out when the geometry supports it.
-        if std::env::var_os("EFFECT_TORCH_NO_KDA_FUSED").is_none()
-            && kda::is_supported(in_dtype, geometry.head_dim, geometry.value_dim)
+        // state in and out.
         {
             let flat = |x: &runtime::metal::run::MetalTensor, w: usize| -> err::Res<_> {
                 metal_ops::contiguous(&runtime::metal::run::MetalTensor {
@@ -4430,26 +4452,6 @@ fn kda_recurrence(
             })?);
             continue;
         }
-        let (out, final_state) = composed::kda_chunk_with_state(
-            &qs,
-            &ks,
-            &vs,
-            &gs,
-            &bs,
-            scale,
-            &state.kda_states[layer as usize],
-        )?;
-        state.kda_states[layer as usize] = final_state;
-        outs.push(metal_ops::contiguous(&runtime::metal::run::MetalTensor {
-            buffer: out.buffer.clone(),
-            layout: runtime::layout::Layout::contiguous(vec![
-                1,
-                geometry.heads,
-                t,
-                geometry.value_dim,
-            ]),
-            dtype: out.dtype,
-        })?);
     }
     let mut acc = outs
         .first()
@@ -4485,7 +4487,12 @@ fn conv_state(
         ));
     }
     let in_dtype = x.as_metal()?.dtype;
-    let w32 = metal_ops::to_f32(weight.as_metal()?)?;
+    if !shortconv::supported_dtype(in_dtype) {
+        return Err(format!(
+            "conv state: dtype {in_dtype:?} is not supported on Metal (f32 or bf16 required)"
+        ));
+    }
+    let w = weight.as_metal()?;
     let mut outs: Vec<runtime::metal::run::MetalTensor> = Vec::with_capacity(batch);
     for (b, slot) in kv.slots.iter().enumerate() {
         let xs = {
@@ -4495,7 +4502,7 @@ fn conv_state(
                 layout: x.layout.narrow(0, b, 1),
                 dtype: x.dtype,
             })?;
-            metal_ops::to_f32(&runtime::metal::run::MetalTensor {
+            metal_ops::contiguous(&runtime::metal::run::MetalTensor {
                 buffer: narrowed.buffer.clone(),
                 layout: runtime::layout::Layout::contiguous(vec![t, geometry.channels]),
                 dtype: narrowed.dtype,
@@ -4511,14 +4518,18 @@ fn conv_state(
                 runtime::dtype::DType::F32,
             )?);
         }
-        let (out, new_state) = composed::short_conv1d_with_state(
+        // The fused kernel carries the slot's [K-1, C] window as f32
+        // history and returns the shifted window (only the `advance`
+        // real rows shift in).
+        let (out, new_state) = shortconv::forward(
             &xs,
-            &w32,
-            &state.conv_states[layer as usize],
+            w,
+            Some(&state.conv_states[layer as usize]),
             state.advance,
+            true,
         )?;
-        state.conv_states[layer as usize] = new_state;
-        let out = metal_ops::from_f32(&out, in_dtype)?;
+        state.conv_states[layer as usize] =
+            new_state.ok_or_else(|| "conv state: window writeback missing".to_string())?;
         outs.push(metal_ops::contiguous(&runtime::metal::run::MetalTensor {
             buffer: out.buffer.clone(),
             layout: runtime::layout::Layout::contiguous(vec![1, t, geometry.channels]),

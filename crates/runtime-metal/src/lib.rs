@@ -49,7 +49,7 @@ pub mod runtime {
     pub mod metal {
         pub use crate::{
             arena, composed, conv, device, emit, flash, gemm, indexing, kda, kernels, layer_norm,
-            linear, loss, ops, paged, rotary, run,
+            linear, loss, ops, paged, rotary, run, shortconv,
         };
     }
 }
@@ -84,6 +84,7 @@ pub mod linear;
 pub mod loss;
 pub mod paged;
 pub mod rotary;
+pub mod shortconv;
 
 fn identity() -> &'static RuntimeIdentity {
     static IDENTITY: OnceLock<RuntimeIdentity> = OnceLock::new();

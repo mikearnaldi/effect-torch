@@ -2,21 +2,20 @@
 //! launch per (sequence slot, layer) advances the gated delta-rule state
 //! by one token — S = Diag(alpha) S + beta k (v - (Diag(alpha) S)^T k)^T,
 //! o = scale * S^T q — with the [Dk, Dv] fp32 state distributed across
-//! threadgroup registers (each of 32 lanes holds Dk/32 rows for one of 4
-//! value columns), simd_sum reductions for the k^T S and S^T q
+//! threadgroup registers (each of 32 lanes holds ceil(Dk/32) rows for one
+//! of 4 value columns), simd_sum reductions for the k^T S and S^T q
 //! contractions, and the state read and written in place. This replaces
 //! the ~45-launch composed chunk path for the T=1 decode step; chunked
-//! prefill keeps the composed reference. Head dims must satisfy
-//! Dk % 32 == 0 and Dv % 4 == 0 (both 64/128 in practice).
+//! prefill keeps the composed reference. All head dims are supported:
+//! out-of-range lanes/rows are masked off (the project rule is to fail
+//! loud on genuinely unsupported input, never to degrade silently).
 
 use crate::runtime::dtype::DType;
 
-pub fn is_supported(dtype: DType, head_dim: usize, value_dim: usize) -> bool {
+/// f64 has no Metal compute support anywhere in this backend; everything
+/// else (any head/value dims, f32/bf16) is handled by the masked kernels.
+pub fn supported_dtype(dtype: DType) -> bool {
     matches!(dtype, DType::F32 | DType::BF16)
-        && head_dim % 32 == 0
-        && head_dim <= 128
-        && value_dim % 4 == 0
-        && value_dim <= 128
 }
 
 #[cfg(target_os = "macos")]
@@ -69,6 +68,7 @@ kernel void et_kda_decode(
     const uint lane = tpitg.x;
     const uint dv = tgid.y * 4 + tpitg.y;
     const uint h = tgid.z;
+    const bool dv_ok = dv < DV;
     device const T* qp = Q + h * DK;
     device const T* kp = K + h * DK;
     device const T* gp = G + h * DK;
@@ -78,33 +78,37 @@ kernel void et_kda_decode(
     float kv = 0.0f;
     for (uint m = 0; m < M; m++) {{
         const uint d = m * 32 + lane;
-        const float km = float(kp[d]);
-        float sm = sp[(ulong)d * DV + dv] * exp(float(gp[d]));
+        const bool ok = (d < DK) && dv_ok;
+        const float km = ok ? float(kp[d]) : 0.0f;
+        float sm = ok ? sp[(ulong)d * DV + dv] * exp(float(gp[d])) : 0.0f;
         kv += sm * km;
         s[m] = sm;
         kk[m] = km;
     }}
     const float kvm = simd_sum(kv);
-    const float delta = (float(V[h * DV + dv]) - kvm) * float(B[h]);
+    const float vv = dv_ok ? float(V[h * DV + dv]) : 0.0f;
+    const float delta = (vv - kvm) * float(B[h]);
     float qo = 0.0f;
     for (uint m = 0; m < M; m++) {{
         const uint d = m * 32 + lane;
+        const bool ok = (d < DK) && dv_ok;
         s[m] += kk[m] * delta;
-        qo += s[m] * float(qp[d]);
+        qo += ok ? s[m] * float(qp[d]) : 0.0f;
     }}
     const float o = simd_sum(qo) * SCALE;
-    if (lane == 0) {{
+    if (lane == 0 && dv_ok) {{
         O[h * DV + dv] = T(o);
     }}
     for (uint m = 0; m < M; m++) {{
-        sp[(ulong)(m * 32 + lane) * DV + dv] = s[m];
+        const uint d = m * 32 + lane;
+        if (d < DK && dv_ok) sp[(ulong)d * DV + dv] = s[m];
     }}
 }}
 "#,
             ty = ty,
             dk = dk,
             dv = dv,
-            m = dk / 32,
+            m = dk.div_ceil(32),
             scale = scale,
         )
     }
@@ -158,6 +162,7 @@ kernel void et_kda_forward(
     const uint lane = tpitg.x;
     const uint dv = tgid.y * 4 + tpitg.y;
     const uint bh = tgid.z;
+    const bool dv_ok = dv < DV;
     device const T* qp = Q + (ulong)bh * steps * DK;
     device const T* kp = K + (ulong)bh * steps * DK;
     device const T* vp = V + (ulong)bh * steps * DV;
@@ -169,7 +174,10 @@ kernel void et_kda_forward(
     float s[M];
     if (has_s0) {{
         device const float* s0p = S0 + (ulong)bh * DK * DV;
-        for (uint m = 0; m < M; m++) s[m] = s0p[(ulong)(m * 32 + lane) * DV + dv];
+        for (uint m = 0; m < M; m++) {{
+            const uint d = m * 32 + lane;
+            s[m] = (d < DK && dv_ok) ? s0p[(ulong)d * DV + dv] : 0.0f;
+        }}
     }} else {{
         for (uint m = 0; m < M; m++) s[m] = 0.0f;
     }}
@@ -178,32 +186,39 @@ kernel void et_kda_forward(
         float kv = 0.0f;
         for (uint m = 0; m < M; m++) {{
             const uint d = m * 32 + lane;
-            const float km = float(kp[t * DK + d]);
-            float sm = s[m] * exp(float(gp[t * DK + d]));
+            const bool ok = (d < DK) && dv_ok;
+            const float km = ok ? float(kp[t * DK + d]) : 0.0f;
+            float sm = ok ? s[m] * exp(float(gp[t * DK + d])) : 0.0f;
             kv += sm * km;
             s[m] = sm;
             kk[m] = km;
         }}
         const float kvm = simd_sum(kv);
-        const float delta = (float(vp[t * DV + dv]) - kvm) * float(bp[t]);
+        const float vv = dv_ok ? float(vp[t * DV + dv]) : 0.0f;
+        const float delta = (vv - kvm) * float(bp[t]);
         float qo = 0.0f;
         for (uint m = 0; m < M; m++) {{
+            const uint d = m * 32 + lane;
+            const bool ok = (d < DK) && dv_ok;
             s[m] += kk[m] * delta;
-            qo += s[m] * float(qp[t * DK + m * 32 + lane]);
+            qo += ok ? s[m] * float(qp[t * DK + d]) : 0.0f;
         }}
         const float o = simd_sum(qo) * SCALE;
-        if (lane == 0) op[t * DV + dv] = T(o);
+        if (lane == 0 && dv_ok) op[t * DV + dv] = T(o);
     }}
-    if (write_s1) {{
+    if (write_s1 && dv_ok) {{
         device float* s1p = S1 + (ulong)bh * DK * DV;
-        for (uint m = 0; m < M; m++) s1p[(ulong)(m * 32 + lane) * DV + dv] = s[m];
+        for (uint m = 0; m < M; m++) {{
+            const uint d = m * 32 + lane;
+            if (d < DK) s1p[(ulong)d * DV + dv] = s[m];
+        }}
     }}
 }}
 "#,
             ty = ty,
             dk = dk,
             dv = dv,
-            m = dk / 32,
+            m = dk.div_ceil(32),
             scale = scale,
         )
     }
@@ -288,25 +303,32 @@ kernel void et_kda_backward(
     for (uint t = 0; t < steps; t++) {{
         if (t % CHUNK == 0) {{
             device float* dst = starts + (t / CHUNK) * rowElems;
-            for (uint m = 0; m < M; m++)
-                for (uint c = 0; c < C4; c++)
-                    dst[(ulong)(m * 32 + lane) * DV + row * C4 + c] = s[m][c];
+            for (uint m = 0; m < M; m++) {{
+                const uint d = m * 32 + lane;
+                if (d >= DK) continue;
+                for (uint c = 0; c < C4; c++) {{
+                    const uint col = row * C4 + c;
+                    if (col < DV) dst[(ulong)d * DV + col] = s[m][c];
+                }}
+            }}
         }}
         float kk[M];
         float al[M];
         for (uint m = 0; m < M; m++) {{
             const uint d = m * 32 + lane;
-            kk[m] = float(kp[t * DK + d]);
-            al[m] = exp(float(gp[t * DK + d]));
+            kk[m] = (d < DK) ? float(kp[t * DK + d]) : 0.0f;
+            al[m] = (d < DK) ? exp(float(gp[t * DK + d])) : 0.0f;
         }}
         const float beta = float(bp[t]);
         for (uint m = 0; m < M; m++)
             for (uint c = 0; c < C4; c++) s[m][c] *= al[m];
         for (uint c = 0; c < C4; c++) {{
+            const uint col = row * C4 + c;
             float kv = 0.0f;
             for (uint m = 0; m < M; m++) kv += s[m][c] * kk[m];
             const float kvm = simd_sum(kv);
-            const float delta = (float(vp[t * DV + row * C4 + c]) - kvm) * beta;
+            const float vv = (col < DV) ? float(vp[t * DV + col]) : 0.0f;
+            const float delta = (vv - kvm) * beta;
             for (uint m = 0; m < M; m++) s[m][c] += kk[m] * delta;
         }}
     }}
@@ -320,35 +342,46 @@ kernel void et_kda_backward(
         const uint clen = min((uint)CHUNK, steps - t0);
         // Recompute the chunk's per-token states and deltas.
         device const float* st = starts + ci * rowElems;
-        for (uint m = 0; m < M; m++)
-            for (uint c = 0; c < C4; c++)
-                s[m][c] = st[(ulong)(m * 32 + lane) * DV + row * C4 + c];
+        for (uint m = 0; m < M; m++) {{
+            const uint d = m * 32 + lane;
+            for (uint c = 0; c < C4; c++) {{
+                const uint col = row * C4 + c;
+                s[m][c] = (d < DK && col < DV) ? st[(ulong)d * DV + col] : 0.0f;
+            }}
+        }}
         for (uint i = 0; i < clen; i++) {{
             const uint t = t0 + i;
             float kk[M];
             float al[M];
             for (uint m = 0; m < M; m++) {{
                 const uint d = m * 32 + lane;
-                kk[m] = float(kp[t * DK + d]);
-                al[m] = exp(float(gp[t * DK + d]));
+                kk[m] = (d < DK) ? float(kp[t * DK + d]) : 0.0f;
+                al[m] = (d < DK) ? exp(float(gp[t * DK + d])) : 0.0f;
             }}
             const float beta = float(bp[t]);
             for (uint m = 0; m < M; m++)
                 for (uint c = 0; c < C4; c++) s[m][c] *= al[m];
             device float* ws = wss + i * rowElems;
             for (uint c = 0; c < C4; c++) {{
+                const uint col = row * C4 + c;
                 float kv = 0.0f;
                 for (uint m = 0; m < M; m++) kv += s[m][c] * kk[m];
                 const float kvm = simd_sum(kv);
                 // Raw delta (no beta): the adjoint formulas consume it
                 // unscaled; beta enters the state update separately.
-                const float delta = float(vp[t * DV + row * C4 + c]) - kvm;
+                const float vv = (col < DV) ? float(vp[t * DV + col]) : 0.0f;
+                const float delta = vv - kvm;
                 for (uint m = 0; m < M; m++) s[m][c] += kk[m] * (beta * delta);
-                wsd[i * DV + row * C4 + c] = delta;
+                if (col < DV) wsd[i * DV + col] = delta;
             }}
-            for (uint m = 0; m < M; m++)
-                for (uint c = 0; c < C4; c++)
-                    ws[(ulong)(m * 32 + lane) * DV + row * C4 + c] = s[m][c];
+            for (uint m = 0; m < M; m++) {{
+                const uint d = m * 32 + lane;
+                if (d >= DK) continue;
+                for (uint c = 0; c < C4; c++) {{
+                    const uint col = row * C4 + c;
+                    if (col < DV) ws[(ulong)d * DV + col] = s[m][c];
+                }}
+            }}
         }}
         threadgroup_barrier(mem_flags::mem_device);
 
@@ -359,24 +392,26 @@ kernel void et_kda_backward(
             const float beta = float(bp[t]);
             float kk[M];
             float al[M];
+            float qq[M];
             float gg[C4];
             float dd[C4];
             for (uint m = 0; m < M; m++) {{
                 const uint d = m * 32 + lane;
-                kk[m] = float(kp[t * DK + d]);
-                al[m] = exp(float(gp[t * DK + d]));
+                const bool dok = d < DK;
+                kk[m] = dok ? float(kp[t * DK + d]) : 0.0f;
+                al[m] = dok ? exp(float(gp[t * DK + d])) : 0.0f;
+                qq[m] = dok ? SCALE * float(qp[t * DK + d]) : 0.0f;
             }}
             for (uint c = 0; c < C4; c++) {{
-                gg[c] = float(dop[t * DV + row * C4 + c]);
-                dd[c] = wsd[i * DV + row * C4 + c];
+                const uint col = row * C4 + c;
+                gg[c] = (col < DV) ? float(dop[t * DV + col]) : 0.0f;
+                dd[c] = (col < DV) ? wsd[i * DV + col] : 0.0f;
             }}
             device const float* ws = wss + i * rowElems;
             device const float* wp = (i == 0) ? (starts + ci * rowElems) : (wss + (i - 1) * rowElems);
             // L += scale · q · do^T
-            for (uint m = 0; m < M; m++) {{
-                const float qv = SCALE * float(qp[t * DK + m * 32 + lane]);
-                for (uint c = 0; c < C4; c++) lam[m][c] += qv * gg[c];
-            }}
+            for (uint m = 0; m < M; m++)
+                for (uint c = 0; c < C4; c++) lam[m][c] += qq[m] * gg[c];
             // lamk[c] = sum_dk L[dk, dv_c] · k[dk]
             float lamk[C4];
             for (uint c = 0; c < C4; c++) {{
@@ -385,8 +420,11 @@ kernel void et_kda_backward(
                 lamk[c] = simd_sum(acc);
             }}
             if (lane == 0) {{
-                for (uint c = 0; c < C4; c++)
-                    dV[(ulong)bh * steps * DV + t * DV + row * C4 + c] = T(beta * lamk[c]);
+                for (uint c = 0; c < C4; c++) {{
+                    const uint col = row * C4 + c;
+                    if (col < DV)
+                        dV[(ulong)bh * steps * DV + t * DV + col] = T(beta * lamk[c]);
+                }}
             }}
             // Per-dk partial sums over this row's C4 value columns.
             for (uint m = 0; m < M; m++) {{
@@ -396,8 +434,10 @@ kernel void et_kda_backward(
                 float ssdec = 0.0f;
                 float sdga = 0.0f;
                 for (uint c = 0; c < C4; c++) {{
-                    const float sprev = wp[(ulong)d * DV + row * C4 + c];
-                    const float stt = ws[(ulong)d * DV + row * C4 + c];
+                    const uint col = row * C4 + c;
+                    const bool ok = (d < DK) && (col < DV);
+                    const float sprev = ok ? wp[(ulong)d * DV + col] : 0.0f;
+                    const float stt = ok ? ws[(ulong)d * DV + col] : 0.0f;
                     const float mm = lam[m][c] - beta * kk[m] * lamk[c];
                     sdq += stt * gg[c];
                     sldel += lam[m][c] * dd[c];
@@ -405,16 +445,19 @@ kernel void et_kda_backward(
                     sdga += sprev * mm;
                     lam[m][c] = al[m] * mm;
                 }}
-                const uint base = d * 4 + row;
-                p_dq[base] = sdq;
-                p_ldel[base] = sldel;
-                p_sdec[base] = ssdec;
-                p_dga[base] = sdga;
+                if (d < DK) {{
+                    const uint base = d * 4 + row;
+                    p_dq[base] = sdq;
+                    p_ldel[base] = sldel;
+                    p_sdec[base] = ssdec;
+                    p_dga[base] = sdga;
+                }}
             }}
             threadgroup_barrier(mem_flags::mem_threadgroup);
             if (row == 0) {{
                 for (uint m = 0; m < M; m++) {{
                     const uint d = m * 32 + lane;
+                    if (d >= DK) continue;
                     const uint base = d * 4;
                     r_dq[d] = p_dq[base] + p_dq[base + 1] + p_dq[base + 2] + p_dq[base + 3];
                     r_ldel[d] = p_ldel[base] + p_ldel[base + 1] + p_ldel[base + 2] + p_ldel[base + 3];
@@ -424,11 +467,15 @@ kernel void et_kda_backward(
             }}
             threadgroup_barrier(mem_flags::mem_threadgroup);
             float dbp = 0.0f;
-            for (uint m = 0; m < M; m++) dbp += kk[m] * r_ldel[m * 32 + lane];
+            for (uint m = 0; m < M; m++) {{
+                const uint d = m * 32 + lane;
+                if (d < DK) dbp += kk[m] * r_ldel[d];
+            }}
             const float dbv = simd_sum(dbp);
             if (row == 0) {{
                 for (uint m = 0; m < M; m++) {{
                     const uint d = m * 32 + lane;
+                    if (d >= DK) continue;
                     dQ[(ulong)bh * steps * DK + t * DK + d] = T(SCALE * r_dq[d]);
                     dK[(ulong)bh * steps * DK + t * DK + d] = T(beta * (r_ldel[d] - r_sdec[d]));
                     dG[(ulong)bh * steps * DK + t * DK + d] = T(al[m] * r_dga[d]);
@@ -443,8 +490,8 @@ kernel void et_kda_backward(
             ty = ty,
             dk = dk,
             dv = dv,
-            m = dk / 32,
-            c4 = dv / 4,
+            m = dk.div_ceil(32),
+            c4 = dv.div_ceil(4),
             chunk = 64,
             scale = scale,
         )
@@ -489,7 +536,7 @@ kernel void et_kda_backward(
             e.dispatchThreadgroups_threadsPerThreadgroup(
                 objc2_metal::MTLSize {
                     width: 1,
-                    height: dv / 4,
+                    height: dv.div_ceil(4),
                     depth: h,
                 },
                 objc2_metal::MTLSize {
@@ -591,7 +638,7 @@ kernel void et_kda_backward(
             e.dispatchThreadgroups_threadsPerThreadgroup(
                 objc2_metal::MTLSize {
                     width: 1,
-                    height: dv / 4,
+                    height: dv.div_ceil(4),
                     depth: bh,
                 },
                 objc2_metal::MTLSize {

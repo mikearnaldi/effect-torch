@@ -13,7 +13,7 @@ export const TOKENIZER_JSON = new URL("../data/gpt2-tokenizer.json", import.meta
 export const CHECKPOINT = new URL("../data/fineweb-model.safetensors", import.meta.url).pathname
 export const EOT = "<|endoftext|>"
 
-export const BLOCK = 256
+export const BLOCK = Number(process.env.FINEWEB_BLOCK ?? 256)
 export const EMBED = 256
 export const HEADS = 4
 export const LAYERS = 6
