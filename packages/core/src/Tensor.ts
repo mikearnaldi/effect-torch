@@ -3,7 +3,8 @@ import { dual } from "effect/Function"
 import * as Runtime from "./Runtime.ts"
 
 /**
- * Element data types supported by the native backend.
+ * Element data types understood by the runtime API. Availability depends on
+ * the active backend and placement.
  *
  * @since 0.1.0
  * @category models
@@ -11,8 +12,11 @@ import * as Runtime from "./Runtime.ts"
 export type DType = Runtime.DType
 
 /**
- * JavaScript typed arrays accepted by {@link fromTypedArray} and returned by
- * {@link toTypedArray}, matching the supported {@link DType}s.
+ * JavaScript typed-array representations used for tensor transfer.
+ * {@link fromTypedArray} infers `f16` from `Float16Array`, but there is no
+ * typed-array representation for `bf16`. Readback widens both `f16` and
+ * `bf16` tensors to `Float32Array`; the other dtypes use their corresponding
+ * array type.
  *
  * @since 0.1.0
  * @category models
@@ -26,6 +30,7 @@ export type TypedArray = Float32Array | Float64Array | Float16Array | BigInt64Ar
  * @category models
  */
 export interface TensorOptions {
+  /** Element dtype of the constructed tensor; defaults to `f32`. */
   readonly dtype?: DType
 }
 
@@ -37,14 +42,18 @@ export interface TensorOptions {
  * @category errors
  */
 export class TensorError extends Data.TaggedError("TensorError")<{
+  /** Public operation name associated with the failure. */
   readonly op: string
+  /** Human-readable description of the failed validation or backend work. */
   readonly message: string
+  /** Original backend failure when the error crossed the runtime boundary. */
   readonly backend?: Runtime.BackendError
 }> {}
 
 /**
- * Common supertype of {@link Lazy} and {@link Concrete}. Every operation
- * accepts this type, so lazy and evaluated tensors can be mixed freely.
+ * Common supertype of {@link Lazy} and {@link Concrete}. Graph-building
+ * operations generally accept either form, subject to matching runtime,
+ * placement, shape, and dtype requirements.
  *
  * @since 0.1.0
  * @category models
@@ -61,8 +70,10 @@ export type Any = Runtime.TensorHandle
 export type Lazy = Runtime.LazyTensorHandle
 
 /**
- * A materialized tensor whose data resides on the device, obtained through
- * {@link compute}.
+ * A materialized tensor whose data is owned by its backend handle, obtained
+ * through evaluation, compiled execution, or loading. The handle keeps that
+ * storage alive until {@link clear} succeeds or native finalization runs;
+ * using a cleared handle fails.
  *
  * @since 0.1.0
  * @category models
@@ -70,17 +81,22 @@ export type Lazy = Runtime.LazyTensorHandle
 export type Concrete = Runtime.ConcreteTensorHandle
 
 /**
- * A backend-owned frozen program used by compiled functions, models,
- * and trainers.
+ * A backend-owned frozen program and the metadata expected for its outputs.
+ * The opaque handle keeps the native program alive while reachable.
  *
  * @since 0.1.0
  * @category compilation
  */
 export interface CompiledProgram {
+  /** Opaque runtime handle for the frozen graph. */
   readonly handle: Runtime.ProgramHandle
+  /** Output metadata recorded from the roots at freeze time. */
   readonly outputs: ReadonlyArray<{
+    /** Expected output shape. */
     readonly shape: ReadonlyArray<number>
+    /** Expected output dtype. */
     readonly dtype: DType
+    /** Expected output placement. */
     readonly placement: Runtime.Placement
   }>
 }
@@ -658,8 +674,9 @@ export const dtype = (self: Any): DType => self.dtype
 export const device = (self: Any): string => self.device
 
 /**
- * Elementwise addition with broadcasting. Fails with {@link TensorError} if
- * the dtypes or devices differ.
+ * Elementwise addition with broadcasting. Dtypes and placements must match,
+ * except that when exactly one operand is a 0-d float tensor, its value is
+ * coerced to the non-scalar float operand's dtype without promoting it.
  *
  * @since 0.1.0
  * @category elementwise
@@ -667,7 +684,8 @@ export const device = (self: Any): string => self.device
 export const add = binaryOp("add", (a, b) => ({ op: "add", inputs: [a, b] }))
 
 /**
- * Elementwise subtraction with broadcasting.
+ * Elementwise subtraction with broadcasting. The 0-d float coercion described
+ * by {@link add} also applies.
  *
  * @since 0.1.0
  * @category elementwise
@@ -675,7 +693,8 @@ export const add = binaryOp("add", (a, b) => ({ op: "add", inputs: [a, b] }))
 export const sub = binaryOp("sub", (a, b) => ({ op: "sub", inputs: [a, b] }))
 
 /**
- * Elementwise multiplication with broadcasting.
+ * Elementwise multiplication with broadcasting. The 0-d float coercion
+ * described by {@link add} also applies.
  *
  * @since 0.1.0
  * @category elementwise
@@ -683,7 +702,8 @@ export const sub = binaryOp("sub", (a, b) => ({ op: "sub", inputs: [a, b] }))
 export const mul = binaryOp("mul", (a, b) => ({ op: "mul", inputs: [a, b] }))
 
 /**
- * Elementwise division with broadcasting.
+ * Elementwise division with broadcasting. The 0-d float coercion described by
+ * {@link add} also applies.
  *
  * @since 0.1.0
  * @category elementwise
@@ -691,9 +711,10 @@ export const mul = binaryOp("mul", (a, b) => ({ op: "mul", inputs: [a, b] }))
 export const div = binaryOp("div", (a, b) => ({ op: "div", inputs: [a, b] }))
 
 /**
- * Elementwise maximum of two tensors with broadcasting. At equal elements
- * the gradient flows to the left operand only. (Not to be confused with
- * the reduction {@link max}.)
+ * Elementwise maximum of two tensors with broadcasting. The 0-d float
+ * coercion described by {@link add} also applies. At equal elements the
+ * gradient flows to the left operand only. Not to be confused with the
+ * reduction {@link max}.
  *
  * @since 0.1.0
  * @category elementwise
@@ -701,9 +722,10 @@ export const div = binaryOp("div", (a, b) => ({ op: "div", inputs: [a, b] }))
 export const maximum = binaryOp("maximum", (a, b) => ({ op: "maximum", inputs: [a, b] }))
 
 /**
- * Elementwise minimum of two tensors with broadcasting. At equal elements
- * the gradient flows to the left operand only. (Not to be confused with
- * the reduction {@link min}.)
+ * Elementwise minimum of two tensors with broadcasting. The 0-d float
+ * coercion described by {@link add} also applies. At equal elements the
+ * gradient flows to the left operand only. Not to be confused with the
+ * reduction {@link min}.
  *
  * @since 0.1.0
  * @category elementwise
@@ -711,7 +733,8 @@ export const maximum = binaryOp("maximum", (a, b) => ({ op: "maximum", inputs: [
 export const minimum = binaryOp("minimum", (a, b) => ({ op: "minimum", inputs: [a, b] }))
 
 /**
- * Elementwise equality comparison with broadcasting. Returns a `u8` tensor.
+ * Elementwise equality comparison with broadcasting. Returns a `u8` tensor;
+ * the 0-d float coercion described by {@link add} also applies.
  *
  * @since 0.1.0
  * @category elementwise
@@ -719,7 +742,8 @@ export const minimum = binaryOp("minimum", (a, b) => ({ op: "minimum", inputs: [
 export const eq = binaryOp("eq", (a, b) => ({ op: "eq", inputs: [a, b] }), () => "u8")
 
 /**
- * Elementwise greater-than comparison with broadcasting. Returns a `u8` tensor.
+ * Elementwise greater-than comparison with broadcasting. Returns a `u8`
+ * tensor; the 0-d float coercion described by {@link add} also applies.
  *
  * @since 0.1.0
  * @category elementwise
@@ -727,7 +751,8 @@ export const eq = binaryOp("eq", (a, b) => ({ op: "eq", inputs: [a, b] }), () =>
 export const gt = binaryOp("gt", (a, b) => ({ op: "gt", inputs: [a, b] }), () => "u8")
 
 /**
- * Elementwise less-than comparison with broadcasting. Returns a `u8` tensor.
+ * Elementwise less-than comparison with broadcasting. Returns a `u8` tensor;
+ * the 0-d float coercion described by {@link add} also applies.
  *
  * @since 0.1.0
  * @category elementwise
@@ -736,7 +761,7 @@ export const lt = binaryOp("lt", (a, b) => ({ op: "lt", inputs: [a, b] }), () =>
 
 /**
  * Elementwise greater-than-or-equal comparison with broadcasting. Returns a
- * `u8` tensor.
+ * `u8` tensor; the 0-d float coercion described by {@link add} also applies.
  *
  * @since 0.1.0
  * @category elementwise
@@ -745,7 +770,7 @@ export const ge = binaryOp("ge", (a, b) => ({ op: "ge", inputs: [a, b] }), () =>
 
 /**
  * Elementwise less-than-or-equal comparison with broadcasting. Returns a `u8`
- * tensor.
+ * tensor; the 0-d float coercion described by {@link add} also applies.
  *
  * @since 0.1.0
  * @category elementwise
@@ -976,7 +1001,8 @@ export const tan = (self: Any): Effect.Effect<Lazy, TensorError, Runtime.Runtime
   })
 
 /**
- * Elementwise not-equal comparison with broadcasting. Returns a `u8` tensor.
+ * Elementwise not-equal comparison with broadcasting. Returns a `u8` tensor;
+ * the 0-d float coercion described by {@link add} also applies.
  *
  * @since 0.1.0
  * @category elementwise
@@ -993,7 +1019,9 @@ export const ne: {
 )
 
 /**
- * Elementwise logical AND on `u8` tensors with broadcasting.
+ * Elementwise numeric minimum with broadcasting, intended as logical AND for
+ * `u8` masks containing only `0` and `1`. This function does not enforce the
+ * dtype or mask values, and follows {@link minimum}'s dtype coercion rules.
  *
  * @since 0.1.0
  * @category elementwise
@@ -1001,7 +1029,9 @@ export const ne: {
 export const logicalAnd = binaryOp("logicalAnd", (a, b) => ({ op: "minimum", inputs: [a, b] }))
 
 /**
- * Elementwise logical OR on `u8` tensors with broadcasting.
+ * Elementwise numeric maximum with broadcasting, intended as logical OR for
+ * `u8` masks containing only `0` and `1`. This function does not enforce the
+ * dtype or mask values, and follows {@link maximum}'s dtype coercion rules.
  *
  * @since 0.1.0
  * @category elementwise
@@ -1009,8 +1039,8 @@ export const logicalAnd = binaryOp("logicalAnd", (a, b) => ({ op: "minimum", inp
 export const logicalOr = binaryOp("logicalOr", (a, b) => ({ op: "maximum", inputs: [a, b] }))
 
 /**
- * Elementwise logical NOT on a `u8` tensor: `0` becomes `1`, everything
- * else becomes `0`.
+ * Compares every element with zero: `0` becomes `1` and every other value
+ * becomes `0`, returning `u8`. The input dtype is not restricted to `u8`.
  *
  * @since 0.1.0
  * @category elementwise
@@ -1039,8 +1069,10 @@ export const remainder: {
 
 /**
  * Selects elements from `a` or `b` depending on a `u8` condition tensor,
- * with broadcasting across all three inputs. Gradients flow only to the
- * selected side.
+ * with broadcasting across all three inputs. Condition values are not
+ * checked to be `0` or `1`; zero is false and nonzero is true. The value
+ * tensors must have exactly matching dtypes and placements. Gradients flow
+ * only to the selected side.
  *
  * @since 0.1.0
  * @category elementwise
@@ -1131,7 +1163,10 @@ export const logSoftmax = dualOptions(
 export interface ScaledDotProductAttentionOptions {
   /** Score multiplier; defaults to `1 / sqrt(headDim)`. */
   readonly scale?: number
-  /** Mask the scores causally: query `i` attends to keys `j <= i` (right-aligned when the key sequence is longer than the query sequence). */
+  /**
+   * Mask scores causally: query `i` attends to keys `j <= i`, right-aligned
+   * when the key sequence is longer than the query sequence.
+   */
   readonly causal?: boolean
 }
 
@@ -1230,6 +1265,7 @@ export const softplus = (self: Any): Effect.Effect<Lazy, TensorError, Runtime.Ru
  * @category models
  */
 export interface EluOptions {
+  /** Scale of the negative branch; defaults to `1`. */
   readonly alpha?: number
 }
 
@@ -1250,17 +1286,23 @@ export const elu = dualOptions(
 )
 
 /**
- * Options for {@link leakyRelu}. `negativeSlope` defaults to `0.01`.
+ * Options for {@link leakyRelu}.
  *
  * @since 0.1.0
  * @category models
  */
 export interface LeakyReluOptions {
+  /**
+   * Negative-branch slope; defaults to `0.01`. Values above `1` do not
+   * produce the usual piecewise Leaky ReLU.
+   */
   readonly negativeSlope?: number
 }
 
 /**
- * Leaky ReLU: `x` when `x > 0`, `negativeSlope * x` otherwise.
+ * Computes `maximum(x, negativeSlope * x)`, with a default slope of `0.01`.
+ * This is the usual Leaky ReLU piecewise formula only when
+ * `negativeSlope <= 1`; the slope is not otherwise validated.
  *
  * @since 0.1.0
  * @category neural network
@@ -1280,6 +1322,7 @@ export const leakyRelu = dualOptions(
  * @category models
  */
 export interface GeluOptions {
+  /** Approximation mode; defaults to the exact `"none"` form. */
   readonly approximate?: "none" | "tanh"
 }
 
@@ -1323,7 +1366,9 @@ export const mish = (self: Any): Effect.Effect<Lazy, TensorError, Runtime.Runtim
  * @category models
  */
 export interface ClampOptions {
+  /** Inclusive lower bound. */
   readonly min?: number
+  /** Inclusive upper bound. */
   readonly max?: number
 }
 
@@ -1363,6 +1408,7 @@ export const hardtanh = (self: Any): Effect.Effect<Lazy, TensorError, Runtime.Ru
  * @category models
  */
 export interface DropoutOptions {
+  /** Probability of replacing an element with zero; defaults to `0.5`. */
   readonly p?: number
 }
 
@@ -1458,7 +1504,13 @@ export const matmul: {
  * @category models
  */
 export interface ReduceOptions {
+  /**
+   * Dimensions to reduce. Reduction operations default to every dimension;
+   * {@link softmax} and {@link logSoftmax} default to the last dimension.
+   * Negative indexes count from the end.
+   */
   readonly dims?: ReadonlyArray<number>
+  /** Whether reduced dimensions remain with size `1`; defaults to `false`. */
   readonly keepdims?: boolean
 }
 
@@ -1645,6 +1697,7 @@ export const cumsum: {
  * @category models
  */
 export interface VarianceOptions extends ReduceOptions {
+  /** Value subtracted from the reduced element count; defaults to `1`. */
   readonly correction?: number
 }
 
@@ -1696,6 +1749,10 @@ export const std = dualOptions(
  * @category models
  */
 export interface NormOptions extends ReduceOptions {
+  /**
+   * Norm order; defaults to `2`. Positive finite values and positive or
+   * negative `Infinity` are supported.
+   */
   readonly ord?: number
 }
 
@@ -1735,8 +1792,9 @@ export const norm = dualOptions(
 )
 
 /**
- * Computes the logical AND of all elements over the given dimensions (all
- * of them by default). The input must be `u8`.
+ * Computes the numeric minimum over the given dimensions (all by default),
+ * intended as logical AND for a `u8` mask containing only `0` and `1`. The
+ * dtype is enforced, but mask values are not.
  *
  * @since 0.1.0
  * @category reductions
@@ -1752,8 +1810,9 @@ export const all = dualOptions(
 )
 
 /**
- * Computes the logical OR of all elements over the given dimensions (all of
- * them by default). The input must be `u8`.
+ * Computes the numeric maximum over the given dimensions (all by default),
+ * intended as logical OR for a `u8` mask containing only `0` and `1`. The
+ * dtype is enforced, but mask values are not.
  *
  * @since 0.1.0
  * @category reductions
@@ -1880,8 +1939,17 @@ export const transpose: {
  * @category models
  */
 export interface SliceOptions {
+  /**
+   * Inclusive start index per dimension; defaults to `0`. Negative indexes
+   * count from the end.
+   */
   readonly start?: ReadonlyArray<number>
+  /**
+   * Exclusive end index per dimension; defaults to the dimension extent.
+   * Negative indexes count from the end.
+   */
   readonly end?: ReadonlyArray<number>
+  /** Positive step per dimension; defaults to `1`. */
   readonly stride?: ReadonlyArray<number>
 }
 
@@ -2128,10 +2196,11 @@ export const stack = (
   })
 
 /**
- * Splits a tensor along `dim` into chunks. A number `sections` gives
- * equal-sized chunks (the last one smaller if the dimension does not divide
- * evenly); an array gives the exact size of each chunk and must sum to the
- * dimension size.
+ * Splits a tensor along `dim`. A numeric `sections` is the maximum size of
+ * each chunk, not the number of chunks; the last chunk may be smaller. An
+ * array supplies each chunk size and must sum to the dimension size. The
+ * array path currently validates only that sum, so callers must supply
+ * non-negative integer sizes.
  *
  * @since 0.1.0
  * @category shape operations
@@ -2703,9 +2772,13 @@ export const trace = (
  * @category models
  */
 export interface ConvOptions {
+  /** Step between kernel positions; defaults to `1`. */
   readonly stride?: number
+  /** Symmetric zero padding on each spatial dimension; defaults to `0`. */
   readonly padding?: number
+  /** Spacing between kernel elements; defaults to `1`. */
   readonly dilation?: number
+  /** Number of independent channel groups; defaults to `1`. */
   readonly groups?: number
 }
 
@@ -2916,6 +2989,10 @@ const dilateDim = (
  * @category models
  */
 export interface ConvTransposeOptions extends ConvOptions {
+  /**
+   * Extra zeros appended to each output spatial dimension; defaults to `0`
+   * and must be less than `stride`.
+   */
   readonly outputPadding?: number
 }
 
@@ -3084,16 +3161,19 @@ export const convTranspose1d: {
 )
 
 /**
- * Options for {@link maxPool2d} and {@link avgPool2d}. `kernelSize` is the
- * window `[KH, KW]` (a number for square windows); `stride` defaults to the
- * kernel size (non-overlapping windows).
+ * Options for {@link maxPool2d} and {@link avgPool2d}. Padding inserts real
+ * zeros before windows are reduced: padded zeros can win an all-negative max
+ * window and are included in an average's divisor.
  *
  * @since 0.1.0
  * @category models
  */
 export interface PoolOptions {
+  /** Window size `[KH, KW]`, or one number for a square window. */
   readonly kernelSize: number | readonly [number, number]
+  /** Window step; defaults to `kernelSize`. */
   readonly stride?: number | readonly [number, number]
+  /** Symmetric zero padding on height and width; defaults to `0`. */
   readonly padding?: number
 }
 
@@ -3156,8 +3236,10 @@ const pool2d = (
   })
 
 /**
- * 2-D max pooling over `[N, C, H, W]`, composed from window slices —
- * gradients route to the maximal element of each window.
+ * 2-D max pooling over `[N, C, H, W]`, composed from window slices.
+ * Gradients are divided evenly among tied maximal elements in each window.
+ * Padding contributes zeros, rather than negative infinity, so it can
+ * determine boundary maxima for negative inputs.
  *
  * @since 0.1.0
  * @category neural network
@@ -3169,6 +3251,7 @@ export const maxPool2d = (
 
 /**
  * 2-D average pooling over `[N, C, H, W]`, composed from window slices.
+ * Padding contributes zeros and remains part of the fixed window divisor.
  *
  * @since 0.1.0
  * @category neural network
@@ -3276,9 +3359,10 @@ export const solve: {
 )
 
 /**
- * Converts a tensor to a different dtype. Dtypes are strict in this library:
- * no implicit promotion happens anywhere, so `cast` is the only way to mix
- * dtypes.
+ * Converts a tensor to a different dtype. Most mixed-dtype operations require
+ * an explicit cast. Binary elementwise operations have one narrow exception:
+ * a 0-d float operand is coerced to a non-scalar float operand's dtype, as
+ * described by {@link add}.
  *
  * @since 0.1.0
  * @category operations
@@ -3304,8 +3388,10 @@ export const cast: {
  * nodes produce a single set of draws across all roots. This matters for
  * gradients: the loss and its gradients share the forward graph, so they
  * must be evaluated together to be consistent. Interrupting the fiber
- * aborts the native evaluation. Already materialized roots are returned
- * as-is. A tuple in gives the same tuple out, each element materialized.
+ * aborts the native evaluation. Concrete roots are accepted, but callers must
+ * not rely on the returned handle having the same JavaScript identity or
+ * storage aliasing as the input. A tuple in gives the same tuple shape out,
+ * with each element materialized.
  *
  * @since 0.1.0
  * @category destructors
@@ -3363,11 +3449,11 @@ const typedArrayConstructor = (dtype: DType) => {
 }
 
 /**
- * Releases a concrete tensor's device buffer immediately instead of
- * waiting for the garbage collector — the explicit early-release valve
- * for evaluation loops that materialize large tensors per iteration.
- * Using the tensor afterwards (through the handle or any lazy graph
- * built from it) fails with a typed error.
+ * Asks the active runtime to release the backend storage referenced by this
+ * concrete handle immediately instead of waiting for native finalization.
+ * After success, using this handle, or a lazy graph that captured it, fails
+ * with a typed error. Call exactly once for a handle that will no longer be
+ * used; this does not release unrelated handles or graph nodes.
  *
  * @since 0.1.0
  * @category destructors
@@ -3379,9 +3465,12 @@ export const clear = (self: Concrete): Effect.Effect<void, TensorError, Runtime.
   })
 
 /**
- * Evaluates a tensor and reads its values back into a typed array matching
- * the tensor's dtype. Data is exported without copying when the device buffer
- * allows it.
+ * Evaluates a tensor and returns its values in a host typed array.
+ * `f16` and `bf16` are widened to `Float32Array`; `f32`, `f64`, `i64`, `u8`,
+ * and `u32` return `Float32Array`, `Float64Array`, `BigInt64Array`,
+ * `Uint8Array`, and `Uint32Array`, respectively. The backing `ArrayBuffer` may
+ * directly export runtime storage or hold a copied readback; callers must not
+ * rely on either ownership mode.
  *
  * @since 0.1.0
  * @category destructors
@@ -3436,14 +3525,32 @@ const preserveOnFailure = <A, E, R>(
   cleanup: Effect.Effect<void>
 ): Effect.Effect<A, E, R> => Effect.onExit(effect, (exit) => Exit.isFailure(exit) ? cleanup : Effect.void)
 
-/** Metadata accepted by direct safetensors file writes. */
+/**
+ * Options for direct safetensors writes.
+ *
+ * @since 0.1.0
+ * @category models
+ */
 export interface SafetensorsOptions {
+  /**
+   * String metadata stored in the archive; `__metadata__` is reserved as a
+   * tensor name.
+   */
   readonly metadata?: Readonly<Record<string, string>>
 }
 
-/** A direct safetensors archive with materialized runtime-owned tensors. */
+/**
+ * Materialized tensors and string metadata loaded from a safetensors archive.
+ * Each tensor handle owns runtime storage that the caller may release with
+ * {@link clear} when no longer needed.
+ *
+ * @since 0.1.0
+ * @category models
+ */
 export interface SafetensorsArchive {
+  /** Null-prototype, frozen record of archive names to materialized tensors. */
   readonly tensors: Readonly<Record<string, Concrete>>
+  /** Frozen string metadata record. */
   readonly metadata: Readonly<Record<string, string>>
 }
 
@@ -3487,7 +3594,14 @@ export const save = (
   })
 }
 
-/** Loads tensors and archive metadata through the optional direct path. */
+/**
+ * Loads tensors and archive metadata through the runtime's optional direct
+ * path. Returned concrete handles own runtime storage; release them with
+ * {@link clear} when deterministic cleanup is required.
+ *
+ * @since 0.1.0
+ * @category constructors
+ */
 export const loadArchive = (
   path: string
 ): Effect.Effect<SafetensorsArchive, TensorError, Runtime.Runtime> =>
@@ -3541,7 +3655,13 @@ export const loadArchive = (
     return checked
   })
 
-/** Loads only the tensor record from {@link loadArchive}. */
+/**
+ * Loads only the tensor record from {@link loadArchive}. Returned concrete
+ * handles have the same ownership and cleanup requirements.
+ *
+ * @since 0.1.0
+ * @category constructors
+ */
 export const load = (
   path: string
 ): Effect.Effect<Readonly<Record<string, Concrete>>, TensorError, Runtime.Runtime> =>
@@ -3556,16 +3676,18 @@ export const load = (
   )
 
 /**
- * Diagnostics over a compiled function's shape-keyed program cache: the
- * number of programs currently cached and the total number of traces
- * performed. A `compiled` count that grows without bound signals
- * accidental shape polymorphism (feeding unbounded shape variants).
+ * Diagnostics over a program cache. `cached` includes ready and currently
+ * tracing entries; `compiled` counts trace attempts, including failures and
+ * re-traces after eviction. A growing count can signal unbounded signature
+ * variation.
  *
  * @since 0.1.0
  * @category compilation
  */
 export interface CompileStats {
+  /** Number of ready or in-flight entries currently in the cache. */
   readonly cached: number
+  /** Total trace attempts since this cache was created. */
   readonly compiled: number
 }
 
@@ -3577,52 +3699,72 @@ export interface CompileStats {
  */
 export interface CompileOptions {
   /**
-   * Shape-cache capacity in programs. The first call with a new input
-   * signature (shapes, dtypes, device) traces and freezes a program;
-   * later calls with the same signature reuse it. Defaults to 32.
+   * Capacity for ready LRU entries. Signatures include runtime identity and
+   * each input's shape, dtype, and placement. In-flight entries can
+   * temporarily exceed the capacity. Defaults to `32`.
    */
   readonly cacheCapacity?: number
 }
 
 /**
- * A traced graph builder frozen into a native program, called with
- * materialized inputs. The first call per input signature pays the
- * trace; subsequent calls are a single async native evaluation each —
- * no graph construction, no differentiation, no fusion rewrite.
- * Concurrent calls are safe: the frozen graph is immutable and every
- * call runs its own evaluator.
+ * A traced graph builder frozen into native programs. Calls accept lazy or
+ * concrete inputs; lazy inputs are materialized before the frozen program
+ * runs. The first call per signature traces placeholders with the inputs'
+ * metadata. Later concrete-input calls reuse one native evaluation without
+ * rebuilding, differentiating, or rewriting the frozen graph. Concurrent
+ * calls are safe because each run has its own evaluator.
  *
  * @since 0.1.0
  * @category compilation
  */
 export interface CompiledFn<E = never, R = never> {
+  /**
+   * Executes the program selected by the inputs' runtime and metadata
+   * signature.
+   */
   readonly call: (
     inputs: ReadonlyArray<Any>
   ) => Effect.Effect<Array<Concrete>, TensorError | E, Runtime.Runtime | R>
+  /** Snapshot of current entries and cumulative trace attempts. */
   readonly stats: Effect.Effect<CompileStats>
+  /**
+   * Drops current cache entries; an already in-flight trace may insert its
+   * result afterwards.
+   */
   readonly clear: Effect.Effect<void>
 }
 
 /**
- * The shape-keyed program cache behind a compiled function or trainer.
- * A bounded LRU (programs evicted past `capacity` become GC-collectable) with
- * single-flight tracing: concurrent misses on the same signature trace
- * once and every waiter receives the same program. Owned by the compiled
- * value — dropping the last reference makes the whole cache collectable.
- * Trainer and Model can share it with {@link compile}.
+ * Mutable coordination state for a program cache. Ready programs use LRU
+ * eviction; pending traces can temporarily exceed `capacity`. Concurrent
+ * misses for one key share a trace. Eviction and clearing only drop JavaScript
+ * references, so native finalization occurs once no other references remain.
+ * Consumers should use {@link makeProgramCache} and {@link cachedProgram}
+ * rather than mutate the exposed collections and counters.
  *
  * @since 0.1.0
  * @category compilation
  */
 export interface ProgramCache {
+  /** Maximum number of ready programs retained after trace completion. */
   readonly capacity: number
+  /** LRU-ordered ready entries and in-flight single-flight entries. */
   readonly entries: Map<string, ProgramCacheEntry>
+  /**
+   * Signatures observed since creation or the last clear, used for
+   * diagnostics.
+   */
   keys: Set<string>
+  /** Cumulative trace-attempt counter; clearing entries does not reset it. */
   compiled: number
+  /** Whether the distinct-signature capacity warning has been emitted. */
   warned: boolean
-  /** Programs cached, traces performed. */
+  /** Snapshot of current entries and cumulative trace attempts. */
   readonly stats: Effect.Effect<CompileStats>
-  /** Clears every cached program early (they are otherwise GC-collected). */
+  /**
+   * Drops current entries and signature history; an in-flight trace may
+   * repopulate the cache.
+   */
   readonly clear: Effect.Effect<void>
 }
 
@@ -3634,6 +3776,10 @@ type ProgramCacheEntry =
   | { readonly _tag: "pending"; readonly deferred: Deferred.Deferred<CompiledProgram, unknown> }
 
 /**
+ * Creates empty mutable cache state for {@link cachedProgram}. `capacity`
+ * defaults to `32` and should be a non-negative integer; this constructor does
+ * not validate it. A zero capacity permits tracing but retains no ready entry.
+ *
  * @since 0.1.0
  * @category compilation
  */
@@ -3680,7 +3826,9 @@ const evictProgramCache = (cache: ProgramCacheState): void => {
  * The thunk is only invoked on a miss — cache hits never build a
  * trace effect. Concurrent misses on the same key share one trace
  * (single-flight): the first caller traces, the rest await the same
- * deferred. A failed trace is not cached.
+ * deferred. A failed trace is removed from `entries` but still increments
+ * `compiled` and remains in signature history until clear. Ready entries are
+ * evicted after successful traces; pending entries can exceed capacity.
  *
  * @since 0.1.0
  * @category compilation
@@ -3725,16 +3873,18 @@ export const cachedProgram = <E, R>(
     })
   })
 
+/** Process-local ids keep runtime object identities out of serialized keys. */
+const runtimeSignatureIds = new WeakMap<object, number>()
+let nextRuntimeSignatureId = 0
+
 /**
- * The cache key of a call: runtime identity, shapes, dtypes, and placements
- * of the input tensors. Any change re-traces against the new signature.
+ * Builds a process-local cache key from the object identity of
+ * `runtime.identity` and each input's placement id, shape, and dtype. Tensor
+ * values and handle identities are not part of the key.
  *
  * @since 0.1.0
  * @category compilation
  */
-const runtimeSignatureIds = new WeakMap<object, number>()
-let nextRuntimeSignatureId = 0
-
 export const signatureOf = (inputs: ReadonlyArray<Any>, runtime: Runtime.RuntimeService): string => {
   let runtimeId = runtimeSignatureIds.get(runtime.identity)
   if (runtimeId === undefined) {
@@ -3746,10 +3896,9 @@ export const signatureOf = (inputs: ReadonlyArray<Any>, runtime: Runtime.Runtime
 }
 
 /**
- * Creates the placeholder leaf for one tensor argument of a traced graph,
- * carrying the exemplar's shape, dtype, and device. Slot indexes are
- * shared with scalar slots: every slot number is declared exactly once.
- * Trainer uses these placeholders when tracing its step graph.
+ * Creates a placeholder leaf for one tensor argument of a traced graph. The
+ * exemplar contributes metadata only; its value is not captured. Slot indexes
+ * are shared with scalar slots and must be unique in the frozen graph.
  *
  * @since 0.1.0
  * @category compilation
@@ -3805,9 +3954,10 @@ export const freezeProgram = (
   })
 
 /**
- * Runs a frozen program: lazy inputs are materialized first, then one
- * async native call binds the argument buffers and scalar values to the
- * declared slots and evaluates the frozen graph in a single walk.
+ * Runs a frozen program. Lazy inputs are materialized first; one async native
+ * call then binds concrete buffers and scalar values to declared slots and
+ * evaluates the graph. Input count and metadata must match the declarations;
+ * those constraints are validated by the backend.
  *
  * @since 0.1.0
  * @category compilation
@@ -3847,43 +3997,62 @@ export const runProgram = (
   })
 
 /**
- * A backend-owned decode program behind inference artifacts (RFC 0010).
+ * A backend-owned decode program with fixed batch width, attention geometry,
+ * and output metadata.
  *
  * @since 0.1.0
  * @category compilation
  */
 export interface DecodeProgram {
+  /** Opaque runtime handle for the rewritten frozen graph. */
   readonly handle: Runtime.DecodeProgramHandle
+  /**
+   * Fixed compiled batch width; batched execution accepts at most this many
+   * active sequences.
+   */
   readonly batch: number
+  /** Number of cacheable attention layers in the rewritten graph. */
   readonly layers: number
+  /** Number of key/value heads per cacheable attention layer. */
   readonly kvHeads: number
+  /** Width of each cached key/value head. */
   readonly headDim: number
+  /** Output metadata recorded from the roots at compile time. */
   readonly outputs: CompiledProgram["outputs"]
 }
 
 /**
- * A backend-owned kv sequence (block table + cursor over a pool).
+ * A backend-owned KV sequence: a mutable block table and logical token cursor
+ * over one {@link KvPool}. Release live sequences deterministically with
+ * {@link releaseKvSequence}; native finalization is a fallback.
  *
  * @since 0.1.0
  * @category compilation
  */
 export interface KvSequence {
+  /** Opaque runtime handle for the live sequence. */
   readonly handle: Runtime.KvSequenceHandle
 }
 
 /**
- * A backend-owned kv pool (the per-layer key/value arena).
+ * A backend-owned KV pool containing the per-layer key/value arenas and prefix
+ * cache. There is no explicit pool-release operation; its native storage is
+ * finalized after the pool and all sequences backed by it become unreachable.
  *
  * @since 0.1.0
  * @category compilation
  */
 export interface KvPool {
+  /** Opaque runtime handle for the fixed-capacity pool. */
   readonly handle: Runtime.KvPoolHandle
 }
 
 /**
- * Allocates a kv pool (RFC 0010): `layers` per-layer `[maxTokens,
- * kvHeads, headDim]` key/value slabs with `blockSize`-token blocks.
+ * Allocates a KV pool: `layers` per-layer `[maxTokens, kvHeads, headDim]`
+ * key/value slabs with `blockSize`-token blocks. Geometry and capacities must
+ * be positive integers, and `maxTokens` must be a multiple of `blockSize`.
+ * Native backends currently use `f32`, `f16`, `bf16`, or quantized `u8` KV
+ * storage; unsupported dtypes and malformed values fail in the backend.
  *
  * @since 0.1.0
  * @category compilation
@@ -3915,10 +4084,10 @@ export const makeKvPool = (
 /**
  * Creates an independent live sequence in `pool`.
  *
- * A sequence owns a block table and cursor into the pool. It starts without a
- * prompt; use {@link kvPrefillMatch} to attach a resident prefix, then execute
- * prefill or decode programs with {@link runDecodeProgram} or
- * {@link runBatchedDecodeProgram}. Release the sequence with
+ * A sequence owns a block table and cursor into the pool. It starts empty; use
+ * {@link kvPrefillMatch} to attach a resident prefix, then execute prefill or
+ * decode programs with {@link runDecodeProgram} or
+ * {@link runBatchedDecodeProgram}. Release it exactly once with
  * {@link releaseKvSequence} when it leaves the scheduler.
  *
  * Fails when the current runtime has no decode extension or when `pool` is not
@@ -3942,15 +4111,19 @@ export const makeKvSequence = (pool: KvPool): Effect.Effect<KvSequence, TensorEr
   })
 
 /**
- * Attaches the longest resident whole-block prefix of `tokens` to `sequence`
- * and returns the number of matched tokens.
+ * Attaches the longest resident whole-block proper prefix of `tokens` to
+ * `sequence` and returns the number of matched tokens. For non-empty input, at
+ * least one token is left for execution even when the complete sequence is
+ * resident; empty input returns zero.
  *
  * The result is the offset at which prefill should begin. A return value of
  * zero means no reusable prefix was found. Matching updates the sequence's
  * block table and cursor; later decode runs continue from that position.
  *
- * Fails when the current runtime has no decode extension or when `sequence` is
- * invalid, released, or owned by another runtime.
+ * Token values are expected to be non-negative integers representable as
+ * `u32`; this wrapper leaves validation to the backend. Fails when the current
+ * runtime has no decode extension or when `sequence` is invalid, released, or
+ * owned by another runtime.
  *
  * @since 0.1.0
  * @category compilation
@@ -4013,9 +4186,13 @@ export const releaseKvSequence = (sequence: KvSequence): Effect.Effect<void, Ten
   })
 
 /**
- * Rewrites a traced forward graph for generation (causal attention to
- * paged kv attention, position embeddings to cursor-offset gathers) and
- * freezes it.
+ * Rewrites and freezes traced roots for paged-KV generation. The graph must
+ * contain at least one causal {@link scaledDotProductAttention}; non-causal
+ * attention and runtime scalar-input nodes are rejected. Cacheable attention
+ * nodes must have compatible geometry. `window`, when supplied, must be a
+ * non-negative integer; `batch` (default `1`) must be a positive integer.
+ * These constraints are checked by the decode backend rather than this
+ * wrapper.
  *
  * @since 0.1.0
  * @category compilation
@@ -4042,12 +4219,13 @@ export const compileDecodeProgram = (
   })
 
 /**
- * Runs a frozen decode program against a kv sequence: lazy inputs are
- * materialized first, then one async native call binds the argument
- * buffers, evaluates against the sequence's pool blocks, and advances
- * the cursor. `tokens` carries the real new tokens of the run (one for
- * decode, the un-padded chunk for prefill) — the native side records
- * them for the prefix cache's block hashes.
+ * Runs a frozen single-sequence decode program. Lazy inputs are materialized
+ * first, then one native call binds the input slots and evaluates against the
+ * sequence's pool. Program, sequence, pool geometry, runtime, input count, and
+ * input metadata must agree. `tokens` contains the real, unpadded token ids
+ * represented by the query rows; on success its length advances the cursor
+ * and its values feed prefix-cache hashes. Token values and advance limits are
+ * backend-validated. A failed run rolls back cursor and block allocations.
  *
  * @since 0.1.0
  * @category compilation
@@ -4085,10 +4263,16 @@ export const runDecodeProgram = (
   })
 
 /**
- * Runs a frozen batched decode program against one kv sequence per
- * batch slot (RFC 0013): slot b owns batch row b, the cursors bind as
- * a `[batch]` tensor, and every sequence advances by the same count
- * (1 for decode). `tokens` carries one real token list per slot.
+ * Runs a frozen batched decode program against one active sequence per batch
+ * row. The active count must be from `1` through `program.batch`; the backend
+ * pads unused rows to the fixed compiled width. Sequences must be distinct,
+ * live, from one compatible pool and runtime, and `tokens` must provide one
+ * equally sized, nonempty real-token row per sequence. Every sequence advances
+ * by that row length, normally `1` for decode. The final input may use the
+ * active batch width only when it is rank 2; the backend zero-pads that input
+ * to the compiled width. Every other input must exactly match its program
+ * declaration. Constraint failures or execution failures roll back every
+ * sequence in the batch.
  *
  * @since 0.1.0
  * @category compilation
@@ -4231,7 +4415,8 @@ export const layerNorm = (
  * Rows `0..seqLen-1` of a `[maxPositions, embeddingDim]` position
  * embedding table, as a single semantic operation (the graph equivalent
  * of gathering `arange(seqLen)`). The semantic node lets decode compilation
- * (RFC 0010) offset the positions by the runtime cursor.
+ * offset the positions by the runtime cursor. `seqLen` must be a positive
+ * integer within the table; this wrapper leaves those checks to the backend.
  *
  * @since 0.1.0
  * @category neural network
@@ -4258,9 +4443,11 @@ export const positionEmbedding = (
  * Rotary position embedding (RoPE, GPT-NeoX half-split) over the last
  * dimension of a `[..., seqLen, D]` input (D even): positions
  * `0..seqLen-1` rotated by `theta^(-2j/D)`. The semantic node lets decode
- * compilation (RFC 0010) rebase the positions on the runtime cursor;
- * attention then sees only
- * relative offsets, which is what makes cached generation unbounded.
+ * compilation rebase positions on the runtime cursor. Input rank, `seqLen`,
+ * even head width, and dtype constraints are backend-validated. `theta` is
+ * passed through without validation and should be positive and finite.
+ * Generation beyond a pool's finite capacity additionally requires an
+ * attention window that can evict old blocks.
  *
  * @since 0.1.0
  * @category neural network
@@ -4278,18 +4465,19 @@ export const rotaryEmbedding = (
   }))
 
 /**
- * Compiles a graph builder into a reusable executable, JAX-style. The
- * builder runs once per input signature against placeholder leaves, and
- * the traced graph — including any differentiation or optimizer update
- * the builder performed — is frozen into a native program; calling the
- * result binds materialized inputs to the declared slots and evaluates
- * the frozen graph in one walk, with exactly the observable behaviour
- * of evaluating the builder's graph directly (shared subgraphs dedup,
- * `randn`/`dropout` draw fresh per call).
+ * Compiles a graph builder into a reusable executable. The builder receives
+ * lazy placeholders carrying the call inputs' metadata, not their values, and
+ * runs for each trace attempt on a cache miss. Its graph, including
+ * differentiation or optimizer updates already built into it, is frozen into
+ * a native program. Concurrent misses for one signature share an attempt, but
+ * failed traces, eviction, or clearing can cause that signature to be traced
+ * again. Calls accept lazy or concrete inputs; lazy graphs are materialized
+ * before program execution. Random nodes in the frozen graph draw afresh on
+ * each run.
  *
- * Recompilation is automatic and shape-keyed: a call whose inputs differ
- * in shape, dtype, or device from every cached signature traces a new
- * program, up to `cacheCapacity` programs (least-recently-used eviction).
+ * Recompilation is automatic when runtime identity, placement, shape, or dtype
+ * differs from every cached signature. Ready programs use least-recently-used
+ * eviction at `cacheCapacity`; an evicted signature is traced again if used.
  * Materializing a tensor inside `build` fails at trace time — a compiled
  * builder is a pure graph builder over its placeholders. Runtime-varying
  * scalars such as a learning rate use {@link makeScalarInput}; Trainer

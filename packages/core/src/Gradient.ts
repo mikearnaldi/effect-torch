@@ -2,8 +2,9 @@
  * Reverse-mode autodiff and graph transforms. The backward transform runs
  * natively on the graph itself — there is no tracing and no function
  * transformation: the loss is an ordinary lazy graph value and adjoints are
- * expressed in the same node vocabulary as the forward pass, so
- * higher-order derivatives work by applying {@link grad} again.
+ * expressed as graph nodes. Higher-order derivatives can be requested by
+ * applying {@link grad} again, but succeed only when the backend supplies
+ * adjoints for every forward and backward node involved.
  *
  * @since 0.1.0
  */
@@ -19,7 +20,15 @@ import * as Tensor from "./Tensor.ts"
  * @category errors
  */
 export class GradError extends Data.TaggedError("GradError")<{
+  /**
+   * Validation class for a loss or differentiation target that cannot enter
+   * autodiff.
+   */
   readonly reason: "non-scalar-output" | "non-float-dtype" | "not-differentiable"
+  /**
+   * Human-readable explanation, including the offending shape, dtype, or
+   * operation.
+   */
   readonly detail: string
 }> {}
 
@@ -72,12 +81,19 @@ const validateResult = (
  * The loss is an ordinary lazy graph value — there is no tracing and no
  * function transformation, the backward transform runs natively on the
  * graph itself: one walk, with adjoints expressed in the same node
- * vocabulary as the forward pass, so higher-order derivatives work by
- * applying `grad` again.
+ * vocabulary as the forward pass. Applying `grad` to a derivative graph can
+ * produce higher-order derivatives only where all participating forward ops
+ * and generated adjoint ops are themselves differentiable. Semantic fused
+ * operations such as {@link Tensor.crossEntropy} and
+ * {@link Tensor.scaledDotProductAttention} explicitly do not provide a
+ * second-order path; unsupported backend adjoints may surface as
+ * {@link Tensor.TensorError} rather than `GradError`.
  *
- * Gradients are lazy tensors sharing the forward graph; a `wrt` tensor that
- * does not influence the loss yields a zero gradient. Because the loss and
- * its gradients share the forward graph, evaluate them together with
+ * The loss and every `wrt` tensor must use a floating dtype supported by the
+ * active backend. Gradients are lazy tensors sharing the forward graph; a
+ * `wrt` tensor that does not influence the loss yields a zero gradient.
+ * Because the loss and its gradients share the forward graph, evaluate them
+ * together with
  * {@link Tensor.compute}: evaluating them separately recomputes the forward
  * pass and, if the graph contains `randn`, produces values from different
  * random draws.
@@ -217,9 +233,10 @@ export const vjp = (
 /**
  * Jacobian-vector product (forward-mode pushforward via
  * forward-over-reverse): given an output graph `y` built from `x`, the
- * primal `x`, and a tangent `v` with `x`'s shape, returns `J(x) v`. Uses
- * second-order adjoints, so the graph must be twice differentiable through
- * the ops it uses.
+ * primal `x`, and a tangent `v` with `x`'s shape, returns `J(x) v`. This
+ * construction uses second-order adjoints and therefore fails for operations
+ * whose backward graph is not differentiable, including fused attention and
+ * fused cross entropy.
  *
  * @since 0.1.0
  * @category autodiff

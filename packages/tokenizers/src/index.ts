@@ -1,14 +1,15 @@
 /**
- * RFC 0009: tokenizers. A `Tokenizer` turns text into host-owned token ids.
- * Encoding, batch encoding and training run natively (the HuggingFace
- * `tokenizers` crate over napi), while tensor runtimes explicitly import the
- * returned data. Loading is `tokenizer.json`-compatible, so every
- * HuggingFace Hub tokenizer works out of the box, and `train` builds BPE,
- * WordPiece, Unigram or WordLevel tokenizers from raw text files.
+ * Native-backed text tokenization using the HuggingFace `tokenizers` crate.
+ * Encoding returns caller-owned token-id buffers for explicit import by a
+ * tensor runtime. Loading accepts `tokenizer.json` components supported by
+ * the bundled crate; documents using unsupported or custom components fail.
  *
- * Special-token strings in input text are never parsed into special-token
- * ids unless the tokenizer is configured with `specialTokens: "Always"` —
- * the tiktoken `allowed_special` discipline.
+ * `specialTokens: "Always"` explicitly parses registered special-token
+ * strings. `"Never"` routes them through ordinary tokenization, although a
+ * one-character special can still resolve through the tokenizer vocabulary.
+ *
+ * @since 0.1.0
+ * @module
  */
 import { Data, Effect, Option, Queue, Stream } from "effect"
 import { type Pipeable, pipeArguments } from "effect/Pipeable"
@@ -18,6 +19,8 @@ const { NativeTokenizer } = native
 type NativeTokenizerType = InstanceType<typeof NativeTokenizer>
 
 /**
+ * Runtime marker installed on tokenizer values.
+ *
  * @since 0.1.0
  * @category symbols
  */
@@ -26,26 +29,39 @@ export const TokenizerTypeId: unique symbol = Symbol.for(
 )
 
 /**
+ * Type of {@link TokenizerTypeId}.
+ *
  * @since 0.1.0
  * @category symbols
  */
 export type TokenizerTypeId = typeof TokenizerTypeId
 
 /**
- * Error type raised by tokenizer operations: native load/train/encode
- * failures, ragged batches without padding, and decode of invalid ids.
+ * Failure from an Effect-returning tokenizer constructor or member. Its
+ * members are `_tag: "TokenizerError"`, the operation label, and a diagnostic
+ * message. Failures include native errors, file I/O, invalid serialized
+ * tokenizers, and batch shape or padding errors. Vocabulary lookup members
+ * return {@link Option.Option} instead.
  *
  * @since 0.1.0
  * @category errors
  */
 export class TokenizerError extends Data.TaggedError("TokenizerError")<{
+  /** One of `fromFile`, `fromJson`, `train`, `encode`, `encodeBatch`, `encodeBatchConcat`, `decode`, `decodeBatch`, or `save`. */
   readonly op: string
+  /** Human-readable diagnostic from the wrapper or native implementation. */
   readonly message: string
 }> {}
 
 /**
- * Batch padding policy. `None` makes {@link Tokenizer.encodeBatch} fail on
- * ragged encodings instead of silently picking a pad id.
+ * Batch padding policy. `None` requires equal row lengths after truncation;
+ * `Longest` pads to the longest row; `MaxLength` produces exactly
+ * `maxLength` columns and fails if a row is still longer. Padding does not
+ * truncate and applies only to {@link Tokenizer.encodeBatch}.
+ *
+ * A `maxLength` must be a finite non-negative integer. A `padId` must be an
+ * unsigned 32-bit integer; membership in the vocabulary is not checked.
+ * These numeric constraints are not validated by the constructors.
  *
  * @since 0.1.0
  * @category models
@@ -60,12 +76,16 @@ export type Padding =
   }
 
 /**
+ * Disables batch padding.
+ *
  * @since 0.1.0
  * @category constructors
  */
 export const paddingNone: Padding = { _tag: "None" }
 
 /**
+ * Pads batch rows to the longest post-truncation row with `padId`.
+ *
  * @since 0.1.0
  * @category constructors
  */
@@ -75,6 +95,9 @@ export const paddingLongest = (padId: number): Padding => ({
 })
 
 /**
+ * Pads batch rows to exactly `maxLength` with `padId`; it does not truncate
+ * rows that exceed that length.
+ *
  * @since 0.1.0
  * @category constructors
  */
@@ -88,7 +111,10 @@ export const paddingMaxLength = (
 })
 
 /**
- * Per-encode truncation policy, applied before padding.
+ * Per-encode truncation policy, applied before batch padding. `maxLength`
+ * must be a finite non-negative integer, but the constructor does not
+ * validate it. With `MaxLength` padding, the post-truncation row must fit the
+ * padding length or {@link Tokenizer.encodeBatch} fails.
  *
  * @since 0.1.0
  * @category models
@@ -98,12 +124,16 @@ export type Truncation =
   | { readonly _tag: "MaxLength"; readonly maxLength: number }
 
 /**
+ * Disables truncation.
+ *
  * @since 0.1.0
  * @category constructors
  */
 export const truncationNone: Truncation = { _tag: "None" }
 
 /**
+ * Keeps at most the first `maxLength` ids from each encoded sequence.
+ *
  * @since 0.1.0
  * @category constructors
  */
@@ -113,10 +143,12 @@ export const truncationMaxLength = (maxLength: number): Truncation => ({
 })
 
 /**
- * Whether special-token strings occurring in input text are parsed into
- * their special ids (`"Always"`) or tokenized as ordinary text (`"Never"`).
- * Post-processors configured in the tokenizer (BOS/EOS templates) apply
- * regardless — this controls parsing, not structural insertion.
+ * Whether registered special-token strings in input text are parsed into
+ * their special ids (`"Always"`) or routed through ordinary tokenization
+ * (`"Never"`). A one-character registered string cannot be split and may
+ * still resolve to its special id through the tokenizer vocabulary.
+ * Configured post-processors may also insert tokens; this policy controls
+ * input parsing, not structural insertion.
  *
  * @since 0.1.0
  * @category models
@@ -124,32 +156,46 @@ export const truncationMaxLength = (maxLength: number): Truncation => ({
 export type SpecialTokenPolicy = "Never" | "Always"
 
 /**
- * Immutable tokenizer behaviour configuration. All fields are required:
- * padding, truncation and special-token handling are explicit decisions.
+ * Tokenizer behavior configuration. All fields are required. Construction
+ * captures `specialTokens`, then retains this object and reads its padding
+ * and truncation policies during encoding. The object and nested policies are
+ * not cloned or frozen. The caller retains ownership but must not mutate them
+ * while the tokenizer is in use.
  *
  * @since 0.1.0
  * @category models
  */
 export interface TokenizerConfig {
+  /** Batch padding policy; ignored by single and concatenated encoding. */
   readonly padding: Padding
+  /** Per-sequence truncation applied by all encoding members. */
   readonly truncation: Truncation
+  /** Controls special-token parsing; captured when the tokenizer is constructed. */
   readonly specialTokens: SpecialTokenPolicy
 }
 
 /**
- * Host-owned token ids ready for explicit import by a tensor runtime.
+ * Token ids in a fresh, writable host buffer owned by the caller. Values
+ * returned by this module use shape `[T]` for one or concatenated sequences
+ * and `[B, T]` for padded batches, with row-major data. The object, buffer,
+ * and shape array are not frozen.
  *
  * @since 0.1.0
  * @category models
  */
 export interface TokenIds {
+  /** Caller-owned row-major token ids. */
   readonly data: Uint32Array
+  /** Logical dimensions whose product equals `data.length` for module output. */
   readonly shape: ReadonlyArray<number>
+  /** Element type metadata; always unsigned 32-bit integers. */
   readonly dtype: "u32"
 }
 
 /**
- * Values accepted by tokenizer decode operations.
+ * Values accepted by tokenizer decode operations. Array elements must be
+ * unsigned 32-bit integer ids. For {@link TokenIds}, decoding reads only
+ * `data`; `shape` and `dtype` are not validated or interpreted.
  *
  * @since 0.1.0
  * @category models
@@ -157,8 +203,9 @@ export interface TokenIds {
 export type TokenIdInput = TokenIds | Uint32Array | ReadonlyArray<number>
 
 /**
- * The strictest configuration: no padding, no truncation, special-token
- * strings tokenize as ordinary text.
+ * Shared configuration with no padding or truncation and ordinary parsing of
+ * special-token strings. This object and its nested singleton policies are
+ * not frozen and must be treated as read-only.
  *
  * @since 0.1.0
  * @category constructors
@@ -170,10 +217,11 @@ export const strictConfig: TokenizerConfig = {
 }
 
 /**
- * The subword model family to train. Pipeline defaults follow the canonical
- * setups: BPE trains byte-level (GPT-2 style), WordPiece with the BERT
- * normalizer and `##` continuations, Unigram with the SentencePiece `▁`
- * metaspace convention, WordLevel on whitespace-split words.
+ * The model family to train. BPE uses byte-level preprocessing, WordPiece a
+ * BERT normalizer and `##` continuations, Unigram the SentencePiece `▁`
+ * metaspace convention plus byte fallback, and WordLevel whitespace tokens.
+ * WordPiece automatically adds `[UNK]`; Unigram automatically adds `<unk>`
+ * at id `0`. BPE and WordLevel add no unknown token automatically.
  *
  * @since 0.1.0
  * @category models
@@ -181,8 +229,15 @@ export const strictConfig: TokenizerConfig = {
 export type TrainModel = "BPE" | "WordPiece" | "Unigram" | "WordLevel"
 
 /**
- * Where {@link train} reads its corpus from: raw text `Files` streamed
- * from disk, or `Texts` already in memory.
+ * Where {@link train} reads its corpus. `Files` are UTF-8 text streamed in
+ * path order and fed one line at a time with `\n` and optional preceding `\r`
+ * removed; line boundaries are sequence boundaries and are not trained as
+ * characters. A line read or UTF-8 error stops that file's feed. `Texts`
+ * feeds each string as one sequence.
+ *
+ * Source constructors retain their input arrays without copying them. Keep
+ * those arrays unchanged while a source may be used by a lazy training
+ * Effect.
  *
  * @since 0.1.0
  * @category models
@@ -192,6 +247,8 @@ export type TrainSource =
   | { readonly _tag: "Texts"; readonly texts: ReadonlyArray<string> }
 
 /**
+ * Creates a file source without copying `paths`.
+ *
  * @since 0.1.0
  * @category constructors
  */
@@ -201,6 +258,8 @@ export const trainFiles = (paths: ReadonlyArray<string>): TrainSource => ({
 })
 
 /**
+ * Creates an in-memory source without copying `texts`.
+ *
  * @since 0.1.0
  * @category constructors
  */
@@ -210,18 +269,20 @@ export const trainTexts = (texts: ReadonlyArray<string>): TrainSource => ({
 })
 
 /**
- * Training progress reporting. The corpus feed is the dominant cost on
- * large corpora and is reported as `(processed, total)` corpus bytes; one
- * final `(total, total)` event signals that the feed is complete and the
- * (indeterminate) merge computation has begun. Reports are throttled by
- * `everyBytes`: the callback fires at most once per `everyBytes` corpus
- * bytes consumed; `everyBytes: 0` disables reporting (including the
- * completion event) entirely. Granularity is per sequence: progress
- * advances as
- * corpus sequences are pulled, so a corpus of many short sequences (e.g.
- * lines) reports smoothly while a single huge sequence reports once. The
- * callback runs on the JS thread and returns an Effect — what to do with
- * the events (log, render, ignore) is the caller's decision.
+ * Progress for the corpus-feed phase of training, measured in UTF-8 bytes.
+ * `Texts` totals sum encoded string lengths. `Files` totals use raw file
+ * sizes while processed counts exclude stripped line terminators, so an
+ * intermediate processed value can trail the total. Non-empty feed
+ * completion is pinned to `(total, total)` and does not mean model computation
+ * is complete.
+ *
+ * Reporting is checked once per sequence and emitted after at least
+ * `everyBytes` more processed bytes; a large sequence produces one report,
+ * not catch-up reports. The final pin is emitted even below the interval.
+ * Finite `everyBytes` values are floored and lower-bounded at zero; zero
+ * disables all reports. Report Effects run in order on the JS side. Failure
+ * or interruption stops awaiting reports, but does not cancel native training
+ * already in progress.
  *
  * @since 0.1.0
  * @category models
@@ -229,19 +290,25 @@ export const trainTexts = (texts: ReadonlyArray<string>): TrainSource => ({
 export type TrainProgress<E, R> =
   | { readonly _tag: "None" }
   | {
+    /** Selects Effect-based progress reporting. */
     readonly _tag: "Report"
+    /** Finite approximate minimum byte interval; normalized at runtime. */
     readonly everyBytes: number
+    /** Handles one `(processed, total)` feed-progress event. */
     readonly report: (processed: number, total: number) => Effect.Effect<void, E, R>
   }
 
 /**
+ * Disables training progress reports.
+ *
  * @since 0.1.0
  * @category constructors
  */
 export const trainProgressNone: TrainProgress<never, never> = { _tag: "None" }
 
 /**
- * Reports at most once per `everyBytes` corpus bytes consumed.
+ * Reports feed progress at sequence boundaries using `everyBytes` as the
+ * approximate minimum interval.
  *
  * @since 0.1.0
  * @category constructors
@@ -252,75 +319,97 @@ export const trainProgressReport = <E, R>(
 ): TrainProgress<E, R> => ({ _tag: "Report", everyBytes, report })
 
 /**
- * Configuration for {@link train}. Training is deterministic and streams
- * from the given source. Ids are allocated special tokens first, then the
- * alphabet (BPE seeds the full 256-byte alphabet), then merges or pieces
- * in rank order.
+ * Configuration for {@link train}. `vocabSize` is a trainer target, not an
+ * exact result: corpus size and frequency filtering can produce fewer ids,
+ * required alphabets and special tokens constrain the minimum, and Unigram
+ * appends missing byte-fallback pieces after training.
  *
  * @since 0.1.0
  * @category models
  */
 export interface TrainConfig<E, R> {
+  /** Corpus source read when the lazy training Effect starts. */
   readonly source: TrainSource
+  /** Model family and built-in preprocessing pipeline. */
   readonly model: TrainModel
+  /** Positive unsigned 32-bit target size, including trainer special tokens. */
   readonly vocabSize: number
+  /** Unsigned 32-bit frequency cutoff; not used by the Unigram trainer. */
   readonly minFrequency: number
+  /** Registered special tokens, ordered before learned tokens by the trainer. */
   readonly specialTokens: ReadonlyArray<string>
+  /** Corpus-feed progress policy. */
   readonly progress: TrainProgress<E, R>
 }
 
 /**
- * A text tokenizer. Values are immutable and safe for concurrent use. The
- * implementation owns only CPU heap (vocab tables, merges, regexes), so it
- * is reclaimed by ordinary GC finalization; no explicit disposal is needed.
+ * A native-backed text tokenizer. The facade and retained configuration are
+ * not runtime-frozen; concurrent use requires callers not to mutate either.
+ * The native handle owns CPU heap and is reclaimed by GC finalization, so no
+ * explicit disposal is required.
  *
  * @since 0.1.0
  * @category models
  */
 export interface Tokenizer extends Pipeable {
+  /** Runtime marker used by {@link isTokenizer}; not an authenticity check. */
   readonly [TokenizerTypeId]: TokenizerTypeId
   /**
-   * Vocabulary size including special tokens.
+   * Vocabulary size including added and special tokens.
    */
   readonly vocabSize: number
   /**
-   * Encodes text into host-owned `[T]` `u32` token ids.
+   * Encodes text into caller-owned `[T]` `u32` ids. Truncation applies but
+   * padding does not. Native encoding runs synchronously on the JS thread and
+   * cannot be interrupted once the call starts.
    */
   readonly encode: (
     text: string
   ) => Effect.Effect<TokenIds, TokenizerError>
   /**
-   * Encodes a batch into host-owned `[B, T]` `u32` ids, padded per the
-   * tokenizer's {@link Padding} config with `paddingNone`, ragged
-   * encodings fail with {@link TokenizerError}.
+   * Encodes a non-empty batch in parallel into caller-owned `[B, T]` `u32`
+   * ids. Rows are truncated before applying the padding policy; without
+   * padding, unequal row lengths fail. Native encoding runs off the JS thread,
+   * but interrupting the Effect does not cancel work already started.
    */
   readonly encodeBatch: (
     texts: ReadonlyArray<string>
   ) => Effect.Effect<TokenIds, TokenizerError>
   /**
-   * Encodes a batch into one flat host-owned `[ΣT]` `u32` value — the ragged
-   * encodings concatenated in order, no padding. The document-stream
-   * counterpart of {@link encodeBatch} for corpus tokenization.
+   * Encodes a batch in parallel and concatenates its post-truncation rows into
+   * caller-owned `[sum(T)]` `u32` ids in input order. Padding is ignored and
+   * an empty batch returns `[0]`. Native work runs off the JS thread, but
+   * interruption does not cancel work already started.
    */
   readonly encodeBatchConcat: (
     texts: ReadonlyArray<string>
   ) => Effect.Effect<TokenIds, TokenizerError>
   /**
-   * Decodes ids back to text, losslessly (special tokens are not skipped).
+   * Decodes all supplied data as one flat sequence. A {@link TokenIds} shape
+   * is ignored, special tokens are included, and ids absent from the
+   * vocabulary are silently omitted. Decoding is pipeline-dependent and is
+   * not guaranteed to invert encoding. The native call runs synchronously on
+   * the JS thread and cannot be interrupted once started.
    */
   readonly decode: (
     ids: TokenIdInput
   ) => Effect.Effect<string, TokenizerError>
   /**
-   * Batch counterpart of {@link Tokenizer.decode}.
+   * Decodes each outer input as one sequence. Inner {@link TokenIds} shapes
+   * are ignored; a `[B, T]` value is not split into rows automatically. The
+   * native batch call runs synchronously on the JS thread.
    */
   readonly decodeBatch: (
     ids: ReadonlyArray<TokenIdInput>
   ) => Effect.Effect<ReadonlyArray<string>, TokenizerError>
+  /** Synchronously returns the id for an exact vocabulary or added token. */
   readonly tokenToId: (token: string) => Option.Option<number>
+  /** Synchronously returns the token for an id, or `None` when it is unknown. */
   readonly idToToken: (id: number) => Option.Option<string>
   /**
-   * Saves the tokenizer as a self-contained `tokenizer.json`.
+   * Saves the native tokenizer as a `tokenizer.json`. File I/O and
+   * serialization run synchronously on the JS thread and cannot be
+   * interrupted once started.
    */
   readonly save: (path: string) => Effect.Effect<void, TokenizerError>
 }
@@ -451,8 +540,10 @@ const make = (
 }
 
 /**
- * Loads a tokenizer from a `tokenizer.json` file (the format every
- * HuggingFace Hub tokenizer ships).
+ * Loads a tokenizer from a supported `tokenizer.json` file. File I/O and
+ * parsing run synchronously on the JS thread when the Effect executes and
+ * cannot be interrupted once started. The supplied config is retained by
+ * reference by the returned tokenizer.
  *
  * @since 0.1.0
  * @category constructors
@@ -471,7 +562,10 @@ export const fromFile = (
   })
 
 /**
- * Loads a tokenizer from an in-memory `tokenizer.json` document.
+ * Loads a tokenizer from a supported in-memory `tokenizer.json` document.
+ * Parsing runs synchronously on the JS thread when the Effect executes and
+ * cannot be interrupted once started. The supplied config is retained by
+ * reference by the returned tokenizer.
  *
  * @since 0.1.0
  * @category constructors
@@ -490,10 +584,10 @@ export const fromJson = (
   })
 
 /**
- * Trains a tokenizer from a corpus ({@link TrainSource}): raw text files
- * streamed from disk, or texts already in memory. Runs natively off the
- * JS thread the result is immediately usable and `save`-able as
- * `tokenizer.json`.
+ * Trains a tokenizer from a {@link TrainSource}. Native file reading and
+ * training run off the JS thread. Interrupting the Effect or failing a report
+ * Effect stops awaiting the result but does not cancel native work already
+ * started. The tokenizer config is retained by reference in the result.
  *
  * @since 0.1.0
  * @category constructors
@@ -559,7 +653,9 @@ export const train = <E = never, R = never>(
 }
 
 /**
- * Returns `true` if the value is a {@link Tokenizer}.
+ * Tests only for presence of {@link TokenizerTypeId}, including through the
+ * prototype chain. It does not check the marker value or validate tokenizer
+ * members, so marked or spoofed objects also pass.
  *
  * @since 0.1.0
  * @category guards

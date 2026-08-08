@@ -15,11 +15,20 @@
  * yield* trainer.train()
  * ```
  *
+ * The trainer calls schedules with consecutive non-negative integer steps,
+ * but a `LearningRate` is an ordinary function and does not enforce that
+ * domain or validate returned rates. Constructor validation is synchronous
+ * and limited to the comparisons documented below; except for `warmupSteps`,
+ * values are not separately checked for finiteness or integrality. The guards
+ * use direct JavaScript comparisons, so `NaN` is not rejected.
+ *
  * @since 0.1.0
  */
 
 /**
- * A learning-rate schedule: maps the 0-based step number to a rate.
+ * A learning-rate schedule: maps a 0-based step number to a rate. The trainer
+ * supplies non-negative integers; direct callers are responsible for using
+ * that domain and for returning a finite rate suitable for their optimizer.
  *
  * @since 0.1.0
  * @category models
@@ -27,7 +36,7 @@
 export type LearningRate = (step: number) => number
 
 /**
- * A constant rate.
+ * A constant rate. Neither `lr` nor the call's step is validated.
  *
  * @since 0.1.0
  * @category constructors
@@ -36,6 +45,9 @@ export const constant = (lr: number): LearningRate => () => lr
 
 /**
  * Exponential decay: `initial * decayRate ^ (step / decaySteps)`.
+ * `initial` and `decayRate` must be greater than `0`; `decaySteps` must be at
+ * least `1` but need not be an integer. Violating one of those comparisons
+ * throws synchronously. Schedule calls are not validated.
  *
  * @since 0.1.0
  * @category constructors
@@ -54,6 +66,9 @@ export const exponential = (
 
 /**
  * Step decay: `initial * dropFactor ^ floor(step / dropEvery)`.
+ * `initial` and `dropFactor` must be greater than `0`; `dropEvery` must be at
+ * least `1` but need not be an integer. Violating one of those comparisons
+ * throws synchronously. Schedule calls are not validated.
  *
  * @since 0.1.0
  * @category constructors
@@ -72,7 +87,13 @@ export const stepwise = (
 
 /**
  * Cosine annealing from `initial` to `minLr` (default `0`) over
- * `totalSteps`.
+ * `totalSteps`. It uses `min(step / totalSteps, 1)`, so with finite
+ * configuration and finite non-negative steps, calls at or beyond
+ * `totalSteps` stay at `minLr`. Positive infinity is also upper-clamped;
+ * negative steps and `NaN` are not normalized. Requires
+ * `initial > minLr >= 0` and `totalSteps >= 1`, without requiring an integral
+ * `totalSteps`. Violating one of those comparisons throws synchronously, but
+ * values are not separately checked for finiteness.
  *
  * @since 0.1.0
  * @category constructors
@@ -94,8 +115,13 @@ export const cosine = (
 }
 
 /**
- * Linear warmup from `0` to the base schedule's rate over `warmupSteps`,
- * then the base schedule (re-indexed so its step 0 starts after warmup).
+ * Prepends `warmupSteps` linearly scaled uses of `base(0)`. For
+ * `warmupSteps = N`, steps `0..N-1` return
+ * `base(0) / N, 2 * base(0) / N, ..., base(0)`; step `N` then starts the
+ * re-indexed base schedule at `base(0)`, followed by `base(1)`, and so on.
+ * Thus the sequence does not emit zero and emits `base(0)` twice at the
+ * boundary. `warmupSteps` must be a positive integer or construction throws
+ * synchronously. The base schedule's outputs and call steps are not validated.
  *
  * @since 0.1.0
  * @category combinators

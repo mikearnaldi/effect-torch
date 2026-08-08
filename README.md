@@ -112,7 +112,13 @@ pnpm --filter @effect-torch/backend-apple-native build:debug
 
 ```ts
 import * as BackendApple from "@effect-torch/backend-apple-native"
+import { Tensor } from "@effect-torch/core"
 import { Effect } from "effect"
+
+const program = Effect.gen(function*() {
+  const tensor = yield* Tensor.ones([2, 2])
+  return yield* Tensor.toNumberArray(tensor)
+})
 
 const result = await Effect.runPromise(
   program.pipe(Effect.provide(BackendApple.layer))
@@ -157,8 +163,11 @@ const inspect = Effect.gen(function*() {
 Both native backend packages expose:
 
 ```ts
-makeRuntime(): Runtime.RuntimeService
-layer: Layer.Layer<Runtime.Runtime>
+import { Runtime } from "@effect-torch/core"
+import { Layer } from "effect"
+
+declare const makeRuntime: () => Runtime.RuntimeService
+declare const layer: Layer.Layer<Runtime.Runtime>
 ```
 
 `makeRuntime()` is a lazy, memoized factory. Importing the public module does
@@ -183,6 +192,9 @@ Constructors and operations return Effects that build graph nodes. Numeric
 execution is deferred:
 
 ```ts
+import { Tensor } from "@effect-torch/core"
+import { Effect } from "effect"
+
 const graph = Effect.gen(function*() {
   const x = yield* Tensor.ones([2, 3])
   const y = yield* Tensor.full([1, 3], 2)
@@ -199,10 +211,17 @@ hidden CPU fallback, copy a foreign tensor, or execute a kernel.
 `Tensor.compute` evaluates related roots in one native graph walk:
 
 ```ts
-const [lossValue, gradientValue] = yield* Tensor.compute([
-  loss,
-  gradient
-])
+import { Tensor } from "@effect-torch/core"
+import { Effect } from "effect"
+
+const evaluate = (loss: Tensor.Any, gradient: Tensor.Any) =>
+  Effect.gen(function*() {
+    const [lossValue, gradientValue] = yield* Tensor.compute([
+      loss,
+      gradient
+    ])
+    return { lossValue, gradientValue }
+  })
 ```
 
 One walk provides important semantics:
@@ -242,8 +261,14 @@ Consequences:
 Concrete tensors can be released deterministically:
 
 ```ts
-const [value] = yield* Tensor.compute([graph])
-yield* Tensor.clear(value)
+import { Tensor } from "@effect-torch/core"
+import { Effect } from "effect"
+
+const release = (graph: Tensor.Any) =>
+  Effect.gen(function*() {
+    const [value] = yield* Tensor.compute([graph])
+    yield* Tensor.clear(value)
+  })
 ```
 
 Native finalizers remain a GC fallback. CPU external buffers are included in
@@ -533,8 +558,15 @@ Binary operations broadcast like NumPy and support data-first and data-last
 usage:
 
 ```ts
-const first = yield* Tensor.add(a, b)
-const second = yield* a.pipe(Tensor.add(b))
+import { Tensor } from "@effect-torch/core"
+import { Effect } from "effect"
+
+const addBothWays = (a: Tensor.Any, b: Tensor.Any) =>
+  Effect.gen(function*() {
+    const first = yield* Tensor.add(a, b)
+    const second = yield* a.pipe(Tensor.add(b))
+    return { first, second }
+  })
 ```
 
 Numbers are not implicit tensor operands. Use `constantLike` when a scalar must
@@ -615,18 +647,19 @@ function.
 import { Gradient, Loss, Tensor } from "@effect-torch/core"
 import { Effect } from "effect"
 
-const step = Effect.gen(function*() {
-  const prediction = yield* Tensor.matmul(input, weight)
-  const loss = yield* Loss.mse(prediction, target)
-  const [gradient] = yield* Gradient.grad(loss, [weight])
+const step = (input: Tensor.Any, weight: Tensor.Any, target: Tensor.Any) =>
+  Effect.gen(function*() {
+    const prediction = yield* Tensor.matmul(input, weight)
+    const loss = yield* Loss.mse(prediction, target)
+    const [gradient] = yield* Gradient.grad(loss, [weight])
 
-  const [lossValue, gradientValue] = yield* Tensor.compute([
-    loss,
-    gradient
-  ])
+    const [lossValue, gradientValue] = yield* Tensor.compute([
+      loss,
+      gradient
+    ])
 
-  return { lossValue, gradientValue }
-})
+    return { lossValue, gradientValue }
+  })
 ```
 
 The public transforms are:
@@ -651,16 +684,23 @@ scaled-dot-product-attention backward paths are currently first-order only.
 `Tensor.compile` creates a reusable function over tensor inputs:
 
 ```ts
-const compiled = yield* Tensor.compile(([x, weight]) =>
+import { Tensor } from "@effect-torch/core"
+import { Effect } from "effect"
+
+const runCompiled = (x: Tensor.Any, weight: Tensor.Any) =>
   Effect.gen(function*() {
-    const product = yield* Tensor.matmul(x, weight)
-    return [yield* Tensor.relu(product)]
-  }), { cacheCapacity: 8 })
+    const compiled = yield* Tensor.compile(([input, parameter]) =>
+      Effect.gen(function*() {
+        const product = yield* Tensor.matmul(input, parameter)
+        return [yield* Tensor.relu(product)]
+      }), { cacheCapacity: 8 })
 
-const [output] = yield* compiled.call([x, weight])
-const stats = yield* compiled.stats
+    const [output] = yield* compiled.call([x, weight])
+    const stats = yield* compiled.stats
 
-yield* compiled.clear
+    yield* compiled.clear
+    return { output, stats }
+  })
 ```
 
 Compilation behavior:
@@ -743,18 +783,23 @@ mapInput
 Example:
 
 ```ts
-import { Model } from "@effect-torch/core"
+import { Model, Tensor } from "@effect-torch/core"
+import { Effect } from "effect"
 
-const model = yield* Model.chain(
-  yield* Model.linear("fc1", 2, 8),
-  yield* Model.tanh,
-  yield* Model.linear("fc2", 8, 1),
-  yield* Model.sigmoid
-)
+const runModel = (input: Tensor.Any) =>
+  Effect.gen(function*() {
+    const model = yield* Model.chain(
+      yield* Model.linear("fc1", 2, 8),
+      yield* Model.tanh,
+      yield* Model.linear("fc2", 8, 1),
+      yield* Model.sigmoid
+    )
 
-const params = yield* model.init
-const lazyOutput = yield* model.forward(params, input)
-const concreteOutput = yield* model.execute(params, input)
+    const params = yield* Tensor.compute(yield* model.init)
+    const lazyOutput = yield* model.forward(params, input)
+    const concreteOutput = yield* model.execute(params, input)
+    return { lazyOutput, concreteOutput }
+  })
 ```
 
 Use `forward` for composition and differentiation. Use `execute` for repeated
@@ -775,9 +820,19 @@ The optimizer API includes SGD, Adam, and AdamW. Optimizers are pure graph
 transforms: parameters and state are tensors, and nothing is mutated in place.
 
 ```ts
-const optimizer = yield* Optimizer.adamW({ weightDecay: 0.01 })
-const state = yield* optimizer.init(params)
-const next = yield* optimizer.step(params, grads, state, lrTensor)
+import { Optimizer, Tensor } from "@effect-torch/core"
+import { Effect } from "effect"
+
+const update = (
+  params: ReadonlyArray<Tensor.Any>,
+  grads: ReadonlyArray<Tensor.Any>,
+  lrTensor: Tensor.Any
+) =>
+  Effect.gen(function*() {
+    const optimizer = yield* Optimizer.adamW({ weightDecay: 0.01 })
+    const state = yield* optimizer.init(params)
+    return yield* optimizer.step(params, grads, state, lrTensor)
+  })
 ```
 
 `Optimizer.step(optimizer, loss, params, state, lr)` is the full-step helper. It
@@ -806,19 +861,25 @@ the result to a runtime scalar for the compiled update graph.
 for each input signature. `Trainer.makeUncompiled` provides the reference loop.
 
 ```ts
-const trainer = yield* Trainer.make(model, {
-  optimizer: yield* Optimizer.adam(),
-  lr: LearningRate.constant(0.1),
-  loss: Loss.mse,
-  data: { input, target },
-  stop: ({ step, loss }) => step >= 3000 || loss < 1e-4,
-  onStep: ({ step, loss }) =>
-    step % 100 === 0
-      ? Effect.log(`step=${step} loss=${loss}`)
-      : Effect.void
-})
+import { LearningRate, Loss, Model, Optimizer, Tensor, Trainer } from "@effect-torch/core"
+import { Effect } from "effect"
 
-const trained = yield* trainer.train()
+const train = (model: Model.Model, input: Tensor.Any, target: Tensor.Any) =>
+  Effect.gen(function*() {
+    const trainer = yield* Trainer.make(model, {
+      optimizer: yield* Optimizer.adam(),
+      lr: LearningRate.constant(0.1),
+      loss: Loss.mse,
+      data: { input, target },
+      stop: ({ step, loss }) => step >= 3000 || loss < 1e-4,
+      onStep: ({ step, loss }) =>
+        step % 100 === 0
+          ? Effect.log(`step=${step} loss=${loss}`)
+          : Effect.void
+    })
+
+    return yield* trainer.train()
+  })
 ```
 
 Training data can be fixed or produced by an effectful per-step function.
@@ -849,17 +910,26 @@ Trainer checkpoints use safetensors and include model parameters, optimizer
 state roots, and the global step:
 
 ```ts
-yield* Checkpoint.save("training.safetensors", trainer, trained)
+import { Checkpoint, Trainer } from "@effect-torch/core"
+import { Effect } from "effect"
 
-const restored = yield* Checkpoint.load(
-  "training.safetensors",
-  trainer
-)
+const saveAndResume = <S>(
+  trainer: Trainer.Trainer<S>,
+  trained: Trainer.Trained<S>
+) =>
+  Effect.gen(function*() {
+    yield* Checkpoint.save("training.safetensors", trainer, trained)
 
-const continued = yield* trainer.train(
-  restored.params,
-  restored.resume
-)
+    const restored = yield* Checkpoint.load(
+      "training.safetensors",
+      trainer
+    )
+
+    return yield* trainer.train(
+      restored.params,
+      restored.resume
+    )
+  })
 ```
 
 `Checkpoint.saveWithSampler` and `loadWithSampler` also persist the complete
@@ -874,27 +944,38 @@ permutation is exhausted is a new random event.
 decode programs backed by a paged KV cache:
 
 ```ts
-const inference = yield* Model.inference(model, params, {
-  maxTokens: 8192,
-  blockSize: 16,
-  prefillChunk: 16,
-  attentionWindow: 256,
-  kvDtype: "bf16",
-  decodeBatch: 8
-})
+import { Model, Tensor } from "@effect-torch/core"
+import { Effect } from "effect"
 
-const generation = yield* inference.generation()
-const entry = yield* generation.add(promptTensor)
+const generate = (
+  model: Model.Model,
+  params: Model.Params,
+  promptTensor: Tensor.Any,
+  generatedTokens: ReadonlyArray<number>
+) =>
+  Effect.gen(function*() {
+    const inference = yield* Model.inference(model, params, {
+      maxTokens: 8192,
+      blockSize: 16,
+      prefillChunk: 16,
+      attentionWindow: 256,
+      kvDtype: "bf16",
+      decodeBatch: 8
+    })
 
-let logits = entry.logits
+    const generation = yield* inference.generation()
+    const entry = yield* generation.add(promptTensor)
+    let logits = entry.logits
 
-for (const token of generatedTokens) {
-  ;[logits] = yield* generation.step([
-    { seq: entry.seq, token }
-  ])
-}
+    for (const token of generatedTokens) {
+      ;[logits] = yield* generation.step([
+        { seq: entry.seq, token }
+      ])
+    }
 
-yield* entry.seq.finish()
+    yield* entry.seq.finish()
+    return logits
+  })
 ```
 
 The inference transform:
@@ -930,19 +1011,25 @@ Both tensor backends expose direct path-based safetensors I/O through a Runtime
 extension:
 
 ```ts
-yield* Tensor.save(
-  "weights.safetensors",
-  {
-    "model.weight": weight,
-    "model.bias": bias
-  },
-  {
-    metadata: { framework: "effect-torch" }
-  }
-)
+import { Tensor } from "@effect-torch/core"
+import { Effect } from "effect"
 
-const archive = yield* Tensor.loadArchive("weights.safetensors")
-const restoredWeight = archive.tensors["model.weight"]
+const roundTrip = (weight: Tensor.Any, bias: Tensor.Any) =>
+  Effect.gen(function*() {
+    yield* Tensor.save(
+      "weights.safetensors",
+      {
+        "model.weight": weight,
+        "model.bias": bias
+      },
+      {
+        metadata: { framework: "effect-torch" }
+      }
+    )
+
+    const archive = yield* Tensor.loadArchive("weights.safetensors")
+    return archive.tensors["model.weight"]
+  })
 ```
 
 Properties:
@@ -958,8 +1045,14 @@ Properties:
 Models provide named parameter persistence:
 
 ```ts
-yield* Model.save(model, params, "model.safetensors")
-const restoredParams = yield* Model.load(model, "model.safetensors")
+import { Model } from "@effect-torch/core"
+import { Effect } from "effect"
+
+const roundTrip = (model: Model.Model, params: Model.Params) =>
+  Effect.gen(function*() {
+    yield* Model.save(model, params, "model.safetensors")
+    return yield* Model.load(model, "model.safetensors")
+  })
 ```
 
 Trainer checkpoints extend the same format with optimizer, step, and optional
@@ -972,20 +1065,22 @@ sampler state.
 N-API addon. It is not part of the tensor Runtime service.
 
 ```ts
-import * as Tokenizer from "@effect-torch/tokenizers"
 import { Tensor } from "@effect-torch/core"
+import * as Tokenizer from "@effect-torch/tokenizers"
+import { Effect } from "effect"
 
-const tokenizer = yield* Tokenizer.fromFile(
-  "tokenizer.json",
-  Tokenizer.strictConfig
-)
+const tokenize = Effect.gen(function*() {
+  const tokenizer = yield* Tokenizer.fromFile(
+    "tokenizer.json",
+    Tokenizer.strictConfig
+  )
 
-const encoded = yield* tokenizer.encode("Effect meets tensors")
-
-const tokenTensor = yield* Tensor.fromTypedArray(
-  encoded.data,
-  [1, encoded.shape[0]]
-)
+  const encoded = yield* tokenizer.encode("Effect meets tensors")
+  return yield* Tensor.fromTypedArray(
+    encoded.data,
+    [1, encoded.shape[0]]
+  )
+})
 ```
 
 Loading supports HuggingFace-compatible `tokenizer.json` files or in-memory JSON.

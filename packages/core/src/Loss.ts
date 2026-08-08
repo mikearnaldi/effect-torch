@@ -1,9 +1,8 @@
 /**
- * Loss functions. Every loss takes the prediction and the target and
- * returns a lazy graph value; with the default `reduction: "mean"` (or
- * `"sum"`) the result is a scalar ready for {@link Gradient.grad}, while
- * `reduction: "none"` returns the unreduced per-element loss for custom
- * weighting or masking.
+ * Loss functions return lazy graph values. `"mean"` and `"sum"` reduce every
+ * dimension of each function's loss-specific unreduced result to a scalar
+ * suitable for `Gradient.grad`; `"none"` preserves that result, which may be
+ * elementwise or per-example/per-position depending on the loss.
  *
  * @since 0.1.0
  */
@@ -13,8 +12,9 @@ import type * as Runtime from "./Runtime.ts"
 import * as Tensor from "./Tensor.ts"
 
 /**
- * How a loss aggregates its per-element values: `"mean"` (default) or
- * `"sum"` over all dimensions, or `"none"` to keep the elementwise loss.
+ * How a loss aggregates its unreduced values: `"mean"` (default) or `"sum"`
+ * over all resulting dimensions, or `"none"` to preserve the loss-specific
+ * unreduced shape. This is not a batch-only or KL `batchmean` reduction.
  *
  * @since 0.1.0
  * @category models
@@ -28,6 +28,7 @@ export type Reduction = "mean" | "sum" | "none"
  * @category models
  */
 export interface LossOptions {
+  /** Aggregation applied to the unreduced loss; defaults to `"mean"`. */
   readonly reduction?: Reduction
 }
 
@@ -72,7 +73,8 @@ const dualLoss = <T, O, R = Runtime.Runtime>(
   ) as never
 
 /**
- * Mean squared error: `(pred - target)^2`.
+ * Squared error `(pred - target)^2`, followed by the requested reduction.
+ * With `"none"`, the result has the broadcast shape of `pred` and `target`.
  *
  * @since 0.1.0
  * @category losses
@@ -85,7 +87,8 @@ export const mse = dualLoss<Tensor.Any, LossOptions>((pred, target, options) =>
 )
 
 /**
- * L1 loss: `|pred - target|`.
+ * Absolute error `|pred - target|`, followed by the requested reduction.
+ * With `"none"`, the result has the broadcast shape of `pred` and `target`.
  *
  * @since 0.1.0
  * @category losses
@@ -105,6 +108,10 @@ export const l1 = dualLoss<Tensor.Any, LossOptions>((pred, target, options) =>
  * @category models
  */
 export interface HuberOptions extends LossOptions {
+  /**
+   * Positive transition point between quadratic and linear regions; defaults
+   * to `1`.
+   */
   readonly delta?: number
 }
 
@@ -141,13 +148,21 @@ export const huber = dualLoss<Tensor.Any, HuberOptions>((pred, target, options) 
  * @category models
  */
 export interface BinaryCrossEntropyOptions extends LossOptions {
+  /**
+   * Treat `pred` as logits and use the stable logits formula; defaults to
+   * `false`.
+   */
   readonly fromLogits?: boolean
 }
 
 /**
- * Binary cross entropy between probabilities (or logits with
- * `fromLogits`) and 0/1 targets. Probabilities are clamped to
- * `[1e-12, 1 - 1e-12]` to keep the logs finite.
+ * Binary cross entropy between probabilities, or logits when `fromLogits` is
+ * true, and broadcast-compatible targets. Target values are not checked to be
+ * in `[0, 1]`. The probability path requests a clamp to
+ * `[1e-12, 1 - 1e-12]`, but those bounds are represented in the tensor dtype
+ * and can round to `0` or `1`; finite logarithms are therefore not guaranteed,
+ * especially at reduced precision. Prefer the stable logits form when
+ * possible.
  *
  * @since 0.1.0
  * @category losses
@@ -199,11 +214,14 @@ const checkClassTargets = (
   })
 
 /**
- * Cross entropy between class logits and `i64` class-index targets:
- * `nll(logSoftmax(logits), targets)`. The class dimension is the last one.
- * The default `mean` reduction delegates to {@link Tensor.crossEntropy}
- * (whose backward is not second-order differentiable); `sum` and `none`
- * are computed from log-softmax directly.
+ * Cross entropy between class logits and `i64` or `u32` class-index targets.
+ * The class dimension is last and the target shape must equal the leading
+ * logits shape. The default `mean` delegates to {@link Tensor.crossEntropy}:
+ * `i64` target `-100` is excluded, an empty active set or other out-of-range
+ * active index fails during evaluation, and the backward is not second-order
+ * differentiable. `sum` and `none` instead use one-hot log-softmax; `none`
+ * returns the target shape, and any index unmatched by `0..classes-1`
+ * contributes zero because that path does not validate index values.
  *
  * @since 0.1.0
  * @category losses
@@ -228,8 +246,10 @@ export const crossEntropy = dualLoss<Tensor.Any, LossOptions>((logits, targets, 
 )
 
 /**
- * Negative log likelihood between log-probabilities and `i64` class-index
- * targets. The class dimension is the last one.
+ * Negative log likelihood between `f32` or `f64` log-probabilities and `i64`
+ * or `u32` class-index targets. The class dimension is last and `"none"`
+ * returns the target shape. Index values are not range-checked: an index
+ * unmatched by `0..classes-1` produces zero loss.
  *
  * @since 0.1.0
  * @category losses
@@ -250,9 +270,12 @@ export const nll = dualLoss<Tensor.Any, LossOptions>((logProbs, targets, options
 )
 
 /**
- * Kullback-Leibler divergence `sum(target * (log(target) - log(pred)))`,
- * with `pred` given as log-probabilities. Elements where `target` is `0`
- * contribute `0`.
+ * Elementwise Kullback-Leibler terms
+ * `target * (log(target) - logPred)`, with predictions already expressed as
+ * log-probabilities. Non-positive target elements contribute zero, including
+ * negative values; target validity is not otherwise checked. The default is
+ * the mean over every broadcast result element, not the conventional summed
+ * KL or batch mean. Select `"sum"` explicitly for a total divergence.
  *
  * @since 0.1.0
  * @category losses
@@ -270,7 +293,8 @@ export const klDiv = dualLoss<Tensor.Any, LossOptions>((logPred, target, options
 )
 
 /**
- * Hinge loss for ±1 targets: `max(0, 1 - target * pred)`.
+ * Hinge expression `max(0, 1 - target * pred)`, intended for targets `-1` and
+ * `1`. Target values are not validated.
  *
  * @since 0.1.0
  * @category losses
@@ -289,21 +313,27 @@ export const hinge = dualLoss<Tensor.Any, LossOptions>((pred, target, options) =
 )
 
 /**
- * Options for {@link cosineEmbedding}. `margin` is the value below which
- * negative (−1 target) pairs are pushed, default `0`.
+ * Options for {@link cosineEmbeddingLoss}. `margin` is the maximum cosine at
+ * which the non-positive-target branch has zero loss, default `0`.
  *
  * @since 0.1.0
  * @category models
  */
 export interface CosineEmbeddingOptions extends LossOptions {
+  /** Threshold used by the non-positive-target branch; defaults to `0`. */
   readonly margin?: number
 }
 
 /**
- * Cosine embedding loss between two tensors over their last dimension:
- * `1 - cos(a, b)` for `+1` targets, `max(0, cos(a, b) - margin)` for `−1`
- * targets. `targets` must be a tensor of ±1 broadcastable against the
- * leading dimensions.
+ * Cosine embedding loss over the last dimension. The cosine denominator is
+ * `norm(a) * norm(b) + 1e-12`, with the epsilon represented in the input
+ * dtype. In dtypes that represent it, zero vectors produce a cosine of zero;
+ * in low-precision dtypes it may round to zero and permit non-finite results.
+ * Every result is otherwise slightly biased rather than using a clamped norm.
+ * Any positive target selects `1 - cosine`; zero or a negative target selects
+ * `max(0, cosine - margin)`. Values are not restricted to `-1` and `1`. Inputs
+ * and targets follow the underlying broadcasting rules; this wrapper does not
+ * independently validate equal feature widths or target shape.
  *
  * @since 0.1.0
  * @category losses

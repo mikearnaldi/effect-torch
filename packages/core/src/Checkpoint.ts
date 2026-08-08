@@ -1,14 +1,26 @@
 /**
- * Trainer checkpoints: a whole training position — parameters, optimizer
- * state, global step, and optionally the data sampler's state — as a
- * single safetensors file.
+ * Trainer checkpoint persistence: parameters, optimizer tensor state, global
+ * step, and optionally data-sampler state in one safetensors file. The last
+ * loss, training data, and {@link Trainer.Resume.startedAt} elapsed-time anchor
+ * are not persisted; a loaded resume starts a new elapsed clock unless the
+ * caller supplies an anchor.
  *
- * Serialization never inspects the optimizer state `S` itself: the
- * `stateRoots`/`rebuildState` contract (plus an `init` template) makes
- * any state a canonical list of tensors, so every entry rides the same
- * file — `param:<name>`, `state:<i>`, the step as a 0-d `meta:step`, and
- * the sampler as `sampler:*`. Every restored tensor is imported by the
- * selected runtime without implicit placement fallback.
+ * Optimizer state `S` is opaque. Saving serializes only the tensors returned
+ * by `optimizer.stateRoots(state)`, in positional `state:<i>` order. Loading
+ * calls the supplied optimizer's `init` to make a structural template, takes
+ * the expected root count from that template, and passes the loaded roots to
+ * `rebuildState`. Thus every resumable dynamic value must be represented by a
+ * tensor root, while all non-root structure must be reproducible by `init`;
+ * the root count, meaning, and order must remain stable.
+ *
+ * Archives contain no model or optimizer identity, hyperparameters, state
+ * schema, library version, or other provenance (the sampler payload alone is
+ * versioned). Compatibility is the caller's responsibility: load with the
+ * same model parameter names and semantics, optimizer implementation and
+ * configuration, and state-root schema. Obvious missing metadata is rejected,
+ * but semantic mismatches may load and fail or diverge only when used. Every
+ * restored tensor is imported by the selected runtime without placement
+ * fallback.
  *
  * @since 0.1.0
  */
@@ -20,11 +32,18 @@ import * as Tensor from "./Tensor.ts"
 import type * as Trainer from "./Trainer.ts"
 
 /**
+ * A structurally invalid checkpoint payload, such as a missing required key,
+ * malformed u32 metadata, or unsupported sampler payload version. Path access,
+ * safetensors parsing, tensor import, and backend failures remain
+ * {@link Tensor.TensorError}s.
+ *
  * @since 0.1.0
  * @category errors
  */
 export class CheckpointError extends Data.TaggedError("CheckpointError")<{
+  /** The checkpoint operation that detected the invalid payload. */
   readonly op: string
+  /** A diagnostic naming the path, entry, or unsupported version. */
   readonly message: string
 }> {}
 
@@ -42,31 +61,47 @@ const SAMPLER_VERSION = 1
 const U32_MAX = 0xffff_ffff
 
 /**
- * A restored training position: the parameters and the {@link Trainer.Resume}
- * to pass back to `trainer.train(params, resume)`.
+ * A restored training position for `trainer.train(params, resume)`. It is
+ * reconstructed under the trainer and runtime supplied to {@link load}, not
+ * from provenance embedded in the archive.
  *
  * @since 0.1.0
  * @category models
  */
 export interface Checkpoint<S> {
+  /** Materialized parameters in the supplied trainer's `model.names` order. */
   readonly params: Model.Params
+  /**
+   * The optimizer state rebuilt from loaded roots and the persisted u32 global
+   * step. `startedAt` is absent because elapsed-time state is not persisted.
+   */
   readonly resume: Trainer.Resume<S>
 }
 
 /**
- * A {@link Checkpoint} with the data sampler's state, for
- * {@link Sampler.restore}.
+ * A {@link Checkpoint} with decoded sampler state from
+ * {@link loadWithSampler}. Sampler invariants are checked later by
+ * {@link Sampler.restore} against the requested configuration.
  *
  * @since 0.1.0
  * @category models
  */
 export interface CheckpointWithSampler<S> extends Checkpoint<S> {
+  /** Decoded u32 sampler payload to validate and copy with {@link Sampler.restore}. */
   readonly sampler: Sampler.SamplerState
 }
 
 /**
- * Saves parameters, optimizer state roots, and the global step to a
- * single safetensors file at `path`.
+ * Saves parameters by `trainer.model.names`, optimizer state roots by stable
+ * positional index, and the global step as a u32 scalar. For a faithful round
+ * trip, `trained.step` must be an integer in `0..4294967295`; this function
+ * does not validate that range before backend conversion. Optimizer values not
+ * exposed by `stateRoots`, the last loss, `Resume.startedAt`, and trainer
+ * provenance are not written.
+ *
+ * `path` is handled by the selected runtime's direct safetensors extension.
+ * Unsupported path I/O, an unwritable path, tensor evaluation, unsupported
+ * dtypes, and backend serialization failures are {@link Tensor.TensorError}s.
  *
  * @since 0.1.0
  * @category destructors
@@ -82,8 +117,15 @@ export const save = <S, EL, RL, ED, RD, EO, RO>(
   })
 
 /**
- * {@link save} plus the data sampler's state, so resuming continues the
- * epoch exactly where it stopped.
+ * {@link save} plus the sampler's configuration, order, cursor, epoch, and
+ * payload version. All sampler metadata is represented as u32; configuration
+ * and epoch are positive u32 values, while cursor and order indices may be
+ * zero. The same path and backend failures surface as
+ * {@link Tensor.TensorError}.
+ *
+ * This preserves the remaining draws in the current permutation. JavaScript
+ * RNG state is not saved, so the next reshuffle is not guaranteed to match an
+ * uninterrupted sampler.
  *
  * @since 0.1.0
  * @category destructors
@@ -108,9 +150,22 @@ export const saveWithSampler = <S, EL, RL, ED, RD, EO, RO>(
   })
 
 /**
- * Loads a checkpoint saved by {@link save}. The optimizer state is
- * rebuilt generically: an `init` template supplies the structure, the
- * saved roots supply the values, `rebuildState` injects them.
+ * Loads a checkpoint written by {@link save} (or the trainer portion of
+ * {@link saveWithSampler}). Parameters are selected by the supplied model's
+ * names. The supplied optimizer's `init` state determines how many positional
+ * roots are required, and `rebuildState` injects those roots into that
+ * template. Extra archive entries are ignored.
+ *
+ * The archive does not prove trainer compatibility. In particular, loaded
+ * parameter and state-root shapes or dtypes are not compared with a persisted
+ * schema, and optimizer identity and hyperparameters are not stored. Use the
+ * same trainer semantics and a stable `stateRoots`/`rebuildState` contract.
+ * The returned resume contains the u32 global step but no `startedAt` anchor.
+ *
+ * Missing required checkpoint entries or malformed `meta:step` metadata fail
+ * with {@link CheckpointError}. Missing paths, malformed safetensors files,
+ * unavailable path I/O, unsupported imports, optimizer initialization, and
+ * backend failures surface as {@link Tensor.TensorError}.
  *
  * @since 0.1.0
  * @category constructors
@@ -126,7 +181,17 @@ export const load = <S, EL, RL, ED, RD, EO, RO>(
   })
 
 /**
- * {@link load} plus the sampler state saved by {@link saveWithSampler}.
+ * {@link load} plus the versioned sampler payload written by
+ * {@link saveWithSampler}. Sampler scalars must be rank-0 u32 tensors and
+ * `sampler:order` a rank-1 u32 tensor; only payload version 1 is accepted.
+ * The decoded state is not a full sampler validation: pass it with the exact
+ * saved configuration to {@link Sampler.restore}, which checks the window
+ * count, permutation, batch-aligned cursor, and positive u32 epoch.
+ *
+ * Missing or malformed checkpoint entries and unsupported sampler versions
+ * fail with {@link CheckpointError}; path, safetensors parsing, tensor import,
+ * optimizer initialization, and backend failures remain
+ * {@link Tensor.TensorError}s. RNG state is not part of the payload.
  *
  * @since 0.1.0
  * @category constructors

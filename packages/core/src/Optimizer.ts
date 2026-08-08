@@ -1,27 +1,27 @@
 /**
  * Optimizers expressed as pure graph transforms. An optimizer's `step`
  * takes the current parameters, their gradients, and optimizer state, and
- * returns updated parameters and updated state as lazy graph values —
- * nothing is mutated and nothing is materialized inside the optimizer.
+ * returns updated parameters and updated state as lazy graph values.
+ * Nothing is mutated or materialized by the optimizer itself.
  * Because gradients share the loss's forward graph and the updates extend
  * the same graphs further, the loss, the updated parameters, and the
  * updated state can all be roots of a single {@link Tensor.compute} walk:
- * one training step costs exactly one forward and one backward pass, and
- * intermediate gradient tensors are freed as soon as their update consumes
- * them.
+ * the shared forward and backward graphs are evaluated once. The evaluator
+ * may release intermediate buffers after their final consumer.
  *
- * State is re-materialized into graph leaves at every step (that is what
- * {@link step} does), so the graph depth stays O(model depth) no matter how
- * many steps run. Optimizer state is *all tensors* — the Adam step count
- * `t` is a 0-d tensor, not a JS number — so every piece of step-varying
- * data flows through the graph and a frozen graph (a compiled step) never
- * replays a stale count, flag, or rate. The learning rate is not part of
- * the configuration: it is a per-step input to {@link Optimizer.step}, so
+ * The full-step {@link step} helper materializes updated state roots between
+ * calls, so graph depth stays O(model depth) no matter how many steps run.
+ * Built-in optimizers represent all step-varying state as tensors — the Adam
+ * step count `t` is a 0-d tensor, not a JS number — so a frozen graph never
+ * replays a stale count, flag, or rate. The learning rate is not part of the
+ * configuration: it is a per-step input to {@link Optimizer.step}, so
  * learning-rate schedules are ordinary data flowing through the same
  * graph instead of a reason to rebuild the optimizer (or its graph) every
  * step.
  *
- * Update formulas match PyTorch / candle-nn exactly:
+ * Update formulas follow PyTorch / candle-nn semantics. Arithmetic is
+ * evaluated in the tensors' dtype by the selected backend, so rounding and
+ * kernel ordering are not cross-backend or cross-dtype equality guarantees:
  *
  * - SGD: `g += weightDecay * p`; `v = momentum * v + (1 - dampening) * g`
  *   (with `v = g` on the first step, selected by the 0-d `first` flag in
@@ -30,7 +30,7 @@
  * - Adam / AdamW: `m = beta1 * m + (1 - beta1) * g`,
  *   `v = beta2 * v + (1 - beta2) * g^2`, bias-corrected
  *   `m_hat = m / (1 - beta1^t)`, `v_hat = v / (1 - beta2^t)`,
- *   `p = p * (1 - lr * weightDecay) - lr * m_hat / (sqrt(v_hat) + eps)`.
+ *   `p = p - lr * weightDecay * p - lr * m_hat / (sqrt(v_hat) + eps)`.
  *   The decay term is decoupled (AdamW) and zero for plain Adam. The
  *   correction denominators `1 - beta1^t` / `1 - beta2^t` are computed as
  *   tensor ops from the state's `t`, once per step, shared by every
@@ -51,22 +51,28 @@ import * as Tensor from "./Tensor.ts"
  * @category models
  */
 export interface SgdConfig {
+  /** Momentum coefficient. Defaults to `0`; must be finite and non-negative. */
   readonly momentum?: number
+  /** Momentum dampening. Defaults to `0`; range and finiteness are not validated. */
   readonly dampening?: number
+  /** Enables Nesterov momentum. Defaults to `false`; requires `momentum > 0` and zero dampening. */
   readonly nesterov?: boolean
+  /** Coupled L2 weight decay. Defaults to `0`; range and finiteness are not validated. */
   readonly weightDecay?: number
 }
 
 /**
  * State carried between SGD steps: one velocity tensor per parameter
- * (empty when momentum is disabled) and the 0-d `first` flag (1 on the
- * first step, 0 after) that selects `v = g` over the momentum recurrence.
+ * (empty when momentum is disabled) and the 0-d `first` flag that selects
+ * `v = g` on the first momentum update. The flag is unused without momentum.
  *
  * @since 0.1.0
  * @category models
  */
 export interface SgdState {
+  /** Velocities in parameter order; empty when momentum is disabled. */
   readonly velocity: ReadonlyArray<Tensor.Any>
+  /** A 0-d float flag: `1` before the first momentum update, then `0`; unused without momentum. */
   readonly first: Tensor.Any
 }
 
@@ -81,19 +87,23 @@ export interface SgdState {
  * @category models
  */
 export interface AdamConfig {
+  /** First-moment decay. Defaults to `0.9`; must be finite and in `[0, 1)`. */
   readonly beta1?: number
+  /** Second-moment decay. Defaults to `0.999`; must be finite and in `[0, 1)`. */
   readonly beta2?: number
+  /** Denominator epsilon. Defaults to `1e-8`; must be finite and positive. */
   readonly eps?: number
 }
 
 /**
  * Configuration for AdamW. `weightDecay` defaults to `0.01` and is applied
- * decoupled from the gradient, `p *= (1 - lr * weightDecay)`.
+ * decoupled from the gradient as `p -= lr * weightDecay * p`.
  *
  * @since 0.1.0
  * @category models
  */
 export interface AdamWConfig extends AdamConfig {
+  /** Decoupled weight decay. Defaults to `0.01`; range and finiteness are not validated. */
   readonly weightDecay?: number
 }
 
@@ -108,8 +118,11 @@ export interface AdamWConfig extends AdamConfig {
  * @category models
  */
 export interface AdamState {
+  /** First-moment tensors in parameter order, matching parameter shapes and dtypes. */
   readonly m: ReadonlyArray<Tensor.Any>
+  /** Second-moment tensors in parameter order, matching parameter shapes and dtypes. */
   readonly v: ReadonlyArray<Tensor.Any>
+  /** The completed-step count as a 0-d float tensor. */
   readonly t: Tensor.Any
 }
 
@@ -117,10 +130,9 @@ export interface AdamState {
  * The result of {@link Optimizer.step}: updated parameters and updated
  * state as lazy graph values, in the same order as the input parameters,
  * plus `stateRoots` listing the tensors inside `state` that must be
- * evaluated before the state is fed into another `step` call (state is
- * always re-materialized into graph leaves between steps, so graph depth
- * stays O(model depth) no matter how many steps run). Repack the
- * evaluated roots into a new state value with
+ * evaluated before the state is fed into another `step` call. The full-step
+ * helper and trainer re-materialize these roots between calls so graph depth
+ * stays O(model depth). Repack evaluated roots into a new state value with
  * `optimizer.rebuildState(state, evaluated)`.
  *
  * User-land optimizers implement the same contract: return your new state
@@ -130,8 +142,11 @@ export interface AdamState {
  * @category models
  */
 export interface OptimizerUpdate<S> {
+  /** Updated lazy parameters, one per input parameter in the same order and with matching metadata. */
   readonly params: Array<Tensor.Lazy>
+  /** The next structural optimizer state, containing the tensors listed by `stateRoots`. */
   readonly state: S
+  /** Updated state tensors to materialize, in the stable order expected by `rebuildState`. */
   readonly stateRoots: ReadonlyArray<Tensor.Any>
 }
 
@@ -153,16 +168,38 @@ export interface OptimizerUpdate<S> {
  * @category models
  */
 export interface Optimizer<S> {
+  /**
+   * Validates a non-empty parameter array and creates its initial state.
+   * Built-in optimizers accept only f32 or f64 parameters. The returned
+   * state belongs to this optimizer and parameter order.
+   */
   readonly init: (
     params: ReadonlyArray<Tensor.Any>
   ) => Effect.Effect<S, Tensor.TensorError, Runtime.Runtime>
+  /**
+   * Extends the update graph without evaluating it. `params` and `grads`
+   * must have equal lengths and pairwise matching shapes, dtypes, order,
+   * and placement. `state` must come from `init` or the preceding update
+   * for those parameters. `lr` must be a 0-d float tensor on the same
+   * placement; using the parameter dtype avoids backend coercion.
+   */
   readonly step: (
     params: ReadonlyArray<Tensor.Any>,
     grads: ReadonlyArray<Tensor.Any>,
     state: S,
     lr: Tensor.Any
   ) => Effect.Effect<OptimizerUpdate<S>, Tensor.TensorError, Runtime.Runtime>
+  /**
+   * Extracts every tensor needed by the next step in a stable order. The
+   * result is the optimizer state's compiled-program input boundary.
+   */
   readonly stateRoots: (state: S) => ReadonlyArray<Tensor.Any>
+  /**
+   * Replaces the tensor leaves of `state` with `roots`, preserving any
+   * non-tensor structure. `roots` must have exactly the length, order, and
+   * metadata produced by `stateRoots`; this synchronous method does not
+   * validate or evaluate them.
+   */
   readonly rebuildState: (state: S, roots: ReadonlyArray<Tensor.Any>) => S
 }
 
@@ -309,7 +346,14 @@ const validateResult = (
 /**
  * Creates a stochastic gradient descent optimizer with optional momentum,
  * dampening, nesterov, and coupled (L2) weight decay. With no momentum the
- * update is `p -= lr * g`.
+ * update is `p -= lr * g`. Defaults are `momentum = 0`, `dampening = 0`,
+ * `nesterov = false`, and `weightDecay = 0`.
+ *
+ * Throws synchronously when `momentum` is not finite and non-negative, or
+ * when Nesterov is requested without `momentum > 0` and `dampening = 0`.
+ * `dampening` and `weightDecay` are not otherwise validated. Initialization
+ * and stepping report tensor, state, and backend failures as
+ * {@link Tensor.TensorError} in the returned effects.
  *
  * @since 0.1.0
  * @category constructors
@@ -534,7 +578,11 @@ const makeAdam = (op: string, config: ResolvedAdamConfig): Effect.Effect<Optimiz
 /**
  * Creates an Adam optimizer with the standard defaults (`beta1 = 0.9`,
  * `beta2 = 0.999`, `eps = 1e-8`). The learning rate is a per-step input
- * to `step`.
+ * to `step`. Betas must be finite and in `[0, 1)` and epsilon must be
+ * finite and positive; invalid values throw synchronously while creating
+ * the optimizer. For f32 parameters, `init` and `step` can instead fail
+ * with {@link Tensor.TensorError} when the rounded first-step bias
+ * correction differs by more than 1%.
  *
  * @since 0.1.0
  * @category constructors
@@ -549,8 +597,10 @@ export const adam = (config: AdamConfig = {}): Effect.Effect<Optimizer<AdamState
 
 /**
  * Creates an AdamW optimizer: Adam with decoupled weight decay (default
- * `0.01`), applied as `p *= (1 - lr * weightDecay)` before the adaptive
- * update. The learning rate is a per-step input to `step`.
+ * `0.01`), applied as `p -= lr * weightDecay * p` alongside the adaptive
+ * update. The learning rate is a per-step input to `step`. Beta and epsilon
+ * validation and errors are the same as {@link adam}; `weightDecay` is not
+ * range-checked and may be set to `0` to disable decay.
  *
  * @since 0.1.0
  * @category constructors
@@ -566,7 +616,10 @@ export const adamW = (config: AdamWConfig = {}): Effect.Effect<Optimizer<AdamSta
 /**
  * Clips every gradient elementwise into `[min, max]`. A pure graph
  * transform, applied between {@link Gradient.grad} and
- * {@link Optimizer.step}.
+ * {@link Optimizer.step}. Either bound may be omitted; omitting both fails
+ * with {@link Tensor.TensorError}. Bounds are not checked for finiteness or
+ * ordering, so callers supplying both must ensure `min <= max`. Tensor and
+ * backend constraints are reported as {@link Tensor.TensorError}.
  *
  * @since 0.1.0
  * @category transforms
@@ -594,7 +647,11 @@ export const clipByValue = (
  * square root of the sum of squares over *all* gradients, and every
  * gradient is scaled by `maxNorm / (totalNorm + 1e-6)` when that factor is
  * below `1`. A pure graph transform, applied between
- * {@link Gradient.grad} and {@link Optimizer.step}.
+ * {@link Gradient.grad} and {@link Optimizer.step}. Gradients may have
+ * different shapes but must be floating tensors with a common dtype and
+ * placement so their scalar squared norms can be added. An empty array
+ * returns an empty array. `maxNorm <= 0` fails with
+ * {@link Tensor.TensorError}; finiteness is not checked.
  *
  * @since 0.1.0
  * @category transforms
@@ -658,6 +715,13 @@ export type Materialized<P extends ReadonlyArray<Tensor.Any>> = {
  * `lr` is the step's learning rate as a 0-d float tensor on the
  * parameters' device — lift the step's scheduled value with
  * `Tensor.full([], schedule(step), { dtype: params[0].dtype })`.
+ * `loss` must be scalar, and it and `params` must use autodiff-supported
+ * floating dtypes. Additional parameter, state, and learning-rate constraints
+ * are defined by `optimizer`; the built-in optimizers require non-empty
+ * f32/f64 parameters and matching state metadata. Gradient, tensor, and
+ * backend failures remain in the returned effect. The helper does not clear
+ * its inputs or previous state; the caller owns both those tensors and the
+ * returned materialized parameter/state roots.
  *
  * @since 0.1.0
  * @category destructors

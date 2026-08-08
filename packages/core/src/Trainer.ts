@@ -1,31 +1,28 @@
 /**
- * Training as an encapsulated value. A {@link Trainer} pairs a model
- * with a training configuration — optimizer, learning-rate schedule,
- * loss, data source, stop policy — and its {@link Trainer.train} method
- * runs the loop: initialize with the given parameters (or `model.init`),
- * then repeatedly build `loss(forward(params, input), target)`,
- * differentiate it, extend the graph with the optimizer update, and
- * compute loss, parameters, and state in a single walk — one forward
- * pass, one backward pass, one async boundary per step, with graph depth
- * staying O(model depth).
+ * Training as an encapsulated value. A {@link Trainer} pairs a model with
+ * an optimizer, learning-rate schedule, loss, data source, and stop policy.
+ * Its {@link Trainer.train} method repeatedly builds or runs
+ * `loss(forward(params, input), target)`, differentiates it, applies the
+ * optimizer, and materializes loss, parameters, and state together.
  *
- * {@link make} builds the uncompiled trainer: every step constructs the
- * full forward+backward+update graph. {@link compile} returns a trainer
- * that freezes the step graph into a native program the first time a
- * batch signature is seen and reuses it afterwards — a compiled trainer
- * is still a `Trainer`, trained by the same `train` method: one step is
- * one program call with parameters, optimizer state roots, batch, and
- * the scheduled learning rate in, and loss, updated parameters, and
- * updated state roots out. A batch whose signature (shapes, dtypes,
- * device) differs from every cached program traces a new one, so shape
- * changes (a partial last batch, a different eval batch size) recompile
- * automatically up to the cache capacity.
+ * {@link make} creates the compiled trainer. The first step for an input
+ * signature traces and freezes the forward, loss, backward, and update
+ * graph; later steps reuse that program. Parameters, optimizer state roots,
+ * input, and target are tensor inputs, while the scheduled learning rate is
+ * a runtime scalar. Signatures include the runtime and every tensor input's
+ * shapes, dtypes, and placements. New signatures trace automatically into
+ * a 32-entry LRU cache. {@link makeUncompiled} creates the reference trainer
+ * that constructs and evaluates the full graph every step.
  *
- * Since there is one semantic definition of a step — the compiled trace
- * is exactly the uncompiled step's graph transform — compiled and
- * uncompiled loops agree step-for-step on deterministic graphs and in
- * distribution on stochastic ones (`randn`/`dropout` draw fresh per step
- * in both).
+ * Tracing executes the effects returned by `model.forward`, `config.loss`,
+ * and `optimizer.step` only on a cache miss. Those effects must describe a
+ * graph and must not be used for per-step application side effects, because
+ * cache hits do not run them. The data sampler and `onStep` effect, and the
+ * learning-rate and stop functions, still run on every step. Frozen random
+ * nodes such as `randn` and dropout draw fresh values on each program call.
+ * Compiled and uncompiled trainers share the same graph definition;
+ * floating-point results remain subject to backend, dtype, and fusion
+ * rounding behavior.
  *
  * @since 0.1.0
  */
@@ -38,19 +35,21 @@ import * as Runtime from "./Runtime.ts"
 import * as Tensor from "./Tensor.ts"
 
 /**
- * The training data for { Trainer.train}: a full-batch input and its target.
- * (A `Dataset` module with batching is future work.)
+ * The training data for {@link Trainer.train}: one input batch and its
+ * target. The trainer reads but never clears these tensors.
  *
  * @since 0.1.0
  * @category models
  */
 export interface TrainData {
+  /** Model input for one step; its shape, dtype, and placement participate in the compiled cache key. */
   readonly input: Tensor.Any
+  /** Target passed unchanged to the configured loss; it also participates in the cache key. */
   readonly target: Tensor.Any
 }
 
 /**
- * The batches { Trainer.train} consumes: either a fixed `(input, target)`
+ * The batches {@link Trainer.train} consumes: either a fixed `(input, target)`
  * pair (full-batch — the same tensors every step) or a sampler called
  * with the 1-based step number to produce that step's batch (mini-batch
  * training).
@@ -74,18 +73,28 @@ export type TrainDataSource<E = never, R = never> =
  * @category models
  */
 export interface TrainStep {
+  /** Global, 1-based completed-step number, including any resumed steps. */
   readonly step: number
+  /** Materialized scalar loss for this completed step. */
   readonly loss: number
+  /** Duration since this invocation began or since the resume anchor. */
   readonly elapsed: Duration.Duration
 }
 
 /**
- * The numeric precision of the training loop. `"f32"` keeps parameters,
- * forward, backward, and optimizer state in f32 end to end. `"mixedBf16"`
- * runs forward/backward in bf16 while the optimizer owns f32 master
- * weights: the step graph casts masters to bf16 at the forward boundary
- * and gradients flow back through the casts, so the update arithmetic
- * stays f32. Metal only.
+ * The trainer's parameter-cast policy. `"f32"` adds no casts; actual
+ * parameter, data, forward, loss, and optimizer dtypes remain those supplied
+ * by the model and configuration. With the usual f32 parameters, optimizer
+ * state and updates therefore remain f32; built-in optimizers still require
+ * f32 or f64 master parameters.
+ *
+ * `"mixedBf16"` casts parameters to bf16 only at the model-forward boundary.
+ * Gradients flow through those casts to the master parameters, whose original
+ * dtype is retained for optimizer state and updates (normally f32). Inputs
+ * and targets are not cast, and every selected model/loss operation must
+ * support its resulting dtypes. This mode requires the runtime's
+ * `mixed-bf16` feature, currently provided by Metal; unsupported runtimes fail
+ * when training starts.
  *
  * @since 0.1.0
  * @category models
@@ -131,23 +140,36 @@ export interface TrainConfig<
   EO = never,
   RO = never
 > {
+  /** Optimizer used for every step; its state type is `S`. */
   readonly optimizer: Optimizer.Optimizer<S>
+  /**
+   * Schedule called every step with the 0-based global step (`step - 1`).
+   * Its numeric result is not validated before being bound as a runtime scalar.
+   */
   readonly lr: LearningRate
+  /**
+   * Builds a scalar loss from the model prediction and target. In a compiled
+   * trainer its effect runs while tracing a cache miss, not on cache hits, so
+   * it must be a graph-building effect rather than a per-step callback.
+   */
   readonly loss: (
     pred: Tensor.Any,
     target: Tensor.Any
   ) => Effect.Effect<Tensor.Lazy, EL | Tensor.TensorError, Runtime.Runtime | RL>
+  /** Fixed training data or an effectful sampler invoked with each 1-based global step. */
   readonly data: TrainDataSource<ED, RD>
+  /** Synchronous stop policy, checked after `onStep`; at least one step always runs. */
   readonly stop: (info: TrainStep) => boolean
+  /** Effect run after each successful step and before `stop` is checked. */
   readonly onStep?: (info: TrainStep) => Effect.Effect<void, EO, RO>
   /**
-   * Defaults to `"f32"`; see {@link Precision}.
+   * Parameter-cast policy. Defaults to `"f32"`; see {@link Precision}.
    */
   readonly precision?: Precision
 }
 
 /**
- * The result of { Trainer.train}: the trained parameters (materialized
+ * The result of {@link Trainer.train}: the trained parameters (materialized
  * leaves, ready for `forward`, `save`, or more training), the final
  * optimizer state, and the final step's loss.
  *
@@ -155,25 +177,32 @@ export interface TrainConfig<
  * @category models
  */
 export interface Trained<S> {
+  /** Final materialized parameters in model order; ownership transfers to the caller. */
   readonly params: ReadonlyArray<Tensor.Concrete>
+  /** Final optimizer state; its materialized tensor roots are caller-owned. */
   readonly state: S
+  /** Final step's scalar loss. */
   readonly loss: number
+  /** Global, 1-based number of the final completed step. */
   readonly step: number
 }
 
 /**
- * A resumable training position: the optimizer state and global step
- * count exactly as a previous {@link Trained} returned them. Passing it
- * back to `train` continues the run as if it had never stopped — same
- * optimizer moments, same step numbering for `stop`/`onStep`, and —
- * when `startedAt` is carried along — the same clock for
- * {@link TrainStep.elapsed}.
+ * A resumable training position: optimizer state and global step count from
+ * a previous {@link Trained} value. Resume it only together with that value's
+ * matching `params`, using the same model, training configuration, and
+ * parameter order. The trainer does not validate that relationship up front;
+ * mismatched state is rejected only where tensor metadata can be checked and
+ * otherwise produces incorrect continuation semantics. Carrying `startedAt`
+ * also preserves one elapsed-time clock across calls.
  *
  * @since 0.1.0
  * @category models
  */
 export interface Resume<S> {
+  /** Optimizer state paired with the matching parameters from the same completed step. */
   readonly state: S
+  /** Prior non-negative integer step count; the next sample uses `step + 1`. Not validated here. */
   readonly step: number
   /**
    * Epoch wall-clock anchor in milliseconds (`Date.now()`). When set,
@@ -185,29 +214,36 @@ export interface Resume<S> {
 }
 
 /**
- * A trainer: a model plus an encapsulated training configuration, with
- * the training loop as a method. Every trainer is compiled: each step
- * runs as a frozen native program — parameters, optimizer state roots,
- * input, and target in (plus the step's scheduled learning rate as a
- * runtime scalar), loss, updated parameters, and updated state roots
- * out, in one native call per step. The step graph is traced once per
- * input signature from the same definitions the reference loop uses
- * (`model.forward`, `config.loss`, `Gradient.grad`, `optimizer.step`);
- * a step whose batch signature differs from every cached program traces
- * a new one, with least-recently-used eviction past the cache capacity.
+ * A model and training configuration with a reusable training loop.
+ * Trainers from {@link make} execute frozen programs keyed by runtime identity
+ * and each parameter, state, input, and target tensor's placement, shape, and
+ * dtype. Trainers from {@link makeUncompiled} expose the same API but build
+ * each step graph.
  *
  * @since 0.1.0
  * @category models
  */
 export interface Trainer<S, EL = never, RL = never, ED = never, RD = never, EO = never, RO = never> {
+  /** Model whose parameter order and forward graph define the training step. */
   readonly model: Model.Model
+  /** Configuration captured by the trainer and by each compiled trace. */
   readonly config: TrainConfig<S, EL, RL, ED, RD, EO, RO>
   /**
-   * Runs the training loop: initialize with `params` (or `model.init`
-   * when omitted — continued training and fine-tuning pass a checkpoint's
-   * parameters), then step until `stop` says otherwise (at least one
-   * step always runs), calling `onStep` after every step. The first step
-   * pays the trace; subsequent steps are single frozen-program calls.
+   * Runs at least one step, starting from `params` or `model.init`, and calls
+   * `onStep` before checking `stop`. A `resume` must be accompanied by its
+   * matching `params`; omitting `resume` initializes fresh optimizer state.
+   *
+   * The compiled loop explicitly clears each parameter/state generation it
+   * produced after the next step consumes it. An all-concrete initial set of
+   * supplied parameters and resume roots remains caller-owned; if any initial
+   * root is lazy, the materialized initial generation becomes loop-owned.
+   * Data tensors are never cleared. Final parameters and state roots transfer
+   * to the caller. The uncompiled reference loop performs no explicit clears.
+   *
+   * Fails in the typed channel for model arity or mixed-precision support,
+   * tensor/gradient/backend errors, or configured loss, data, and callback
+   * errors. Exceptions thrown by the schedule or synchronous policies are
+   * defects rather than typed failures.
    */
   readonly train: (
     params?: Model.Params,
@@ -218,17 +254,23 @@ export interface Trainer<S, EL = never, RL = never, ED = never, RD = never, EO =
     Runtime.Runtime | RL | RD | RO
   >
   /**
-   * Shape-cache diagnostics: programs cached, traces performed.
+   * Current cached-program count and cumulative trace count. Uncompiled
+   * trainers always report zero for both values.
    */
   readonly stats: Effect.Effect<Tensor.CompileStats>
   /**
-   * Clears the cached programs early (they are otherwise collected by GC).
+   * Drops cached program references so their native resources can be
+   * garbage-collected; it does not clear tensors or reset the cumulative
+   * trace count. A later step retraces. This is a no-op when uncompiled.
    */
   readonly clear: Effect.Effect<void>
 }
 
 /**
- * Creates a trainer for `model` from a training configuration.
+ * Creates a compiled trainer for `model`. Programs are traced lazily and
+ * retained in a trainer-owned 32-entry LRU cache across `train` calls. Cache
+ * eviction or {@link Trainer.clear} drops program references; dropping the
+ * trainer makes the remaining cache collectable.
  *
  * @since 0.1.0
  * @category constructors
@@ -253,8 +295,10 @@ export const make = <S, EL = never, RL = never, ED = never, RD = never, EO = nev
   })
 
 /**
- * The uncompiled reference loop: every step constructs and evaluates the
- * full step graph. It is useful for checking compiled execution step-for-step.
+ * Creates the uncompiled reference trainer. Every step constructs and
+ * evaluates the full forward, loss, backward, and update graph. Its
+ * {@link Trainer.stats} values remain zero and {@link Trainer.clear} is a
+ * no-op.
  *
  * @since 0.1.0
  * @category constructors
