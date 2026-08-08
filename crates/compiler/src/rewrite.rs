@@ -9,6 +9,30 @@ use std::sync::Arc;
 type Node = GraphNode<crate::Expr>;
 type NodeKind = GraphNodeKind<crate::Expr>;
 
+// Stack-safe post-order traversal: children in left-to-right order,
+// shared nodes once (the autodiff `topo` pattern). Graph walks must
+// never recurse — deep graphs are bounded by heap, not the call stack.
+fn post_order(roots: &[Arc<Node>]) -> Vec<Arc<Node>> {
+    let mut visited = HashSet::new();
+    let mut order = Vec::new();
+    let mut stack: Vec<(Arc<Node>, bool)> =
+        roots.iter().rev().map(|r| (r.clone(), false)).collect();
+    while let Some((node, processed)) = stack.pop() {
+        if processed {
+            order.push(node);
+            continue;
+        }
+        if !visited.insert(node.id) {
+            continue;
+        }
+        stack.push((node.clone(), true));
+        for c in node_children(&node.kind).into_iter().rev() {
+            stack.push((c, false));
+        }
+    }
+    order
+}
+
 fn reduced_shape(shape: &[usize], dims: &[usize], keepdims: bool) -> Vec<usize> {
     if keepdims {
         shape
@@ -43,20 +67,7 @@ fn group_optimizer_steps(roots: &[Arc<Node>]) -> std::result::Result<Vec<Arc<Nod
     if std::env::var_os("EFFECT_TORCH_OPT_GROUPS").is_none() {
         return Ok(roots.to_vec());
     }
-    let mut order: Vec<Arc<Node>> = Vec::new();
-    let mut visited = HashSet::new();
-    fn visit(n: &Arc<Node>, visited: &mut HashSet<u64>, order: &mut Vec<Arc<Node>>) {
-        if !visited.insert(n.id) {
-            return;
-        }
-        for c in node_children(&n.kind) {
-            visit(&c, visited, order);
-        }
-        order.push(n.clone());
-    }
-    for r in roots {
-        visit(r, &mut visited, &mut order);
-    }
+    let order = post_order(roots);
     // Bucket steps by (shape, dtype, hyperparameters).
     type Key = (Vec<usize>, DType, u64, u64, u64, u64);
     let mut buckets: HashMap<Key, Vec<Arc<Node>>> = HashMap::new();
@@ -204,20 +215,7 @@ fn group_optimizer_steps(roots: &[Arc<Node>]) -> std::result::Result<Vec<Arc<Nod
 //   writes it as output 0 and consumers read both through FusedPick;
 //   otherwise the pre-activation buffer disappears entirely.
 pub fn gemm_epilogue_pass(roots: &[Arc<Node>]) -> std::result::Result<Vec<Arc<Node>>, String> {
-    let mut order: Vec<Arc<Node>> = Vec::new();
-    let mut visited = HashSet::new();
-    fn visit(n: &Arc<Node>, visited: &mut HashSet<u64>, order: &mut Vec<Arc<Node>>) {
-        if !visited.insert(n.id) {
-            return;
-        }
-        for c in node_children(&n.kind) {
-            visit(&c, visited, order);
-        }
-        order.push(n.clone());
-    }
-    for r in roots {
-        visit(r, &mut visited, &mut order);
-    }
+    let order = post_order(roots);
     let mut consumers: HashMap<u64, usize> = HashMap::new();
     for n in &order {
         for c in node_children(&n.kind) {
@@ -353,20 +351,7 @@ pub fn fuse_roots(roots: &[Arc<Node>]) -> std::result::Result<Vec<Arc<Node>>, St
     };
     use fusion::Expr as E;
 
-    let mut order: Vec<Arc<Node>> = Vec::new();
-    let mut visited = HashSet::new();
-    fn visit(n: &Arc<Node>, visited: &mut HashSet<u64>, order: &mut Vec<Arc<Node>>) {
-        if !visited.insert(n.id) {
-            return;
-        }
-        for c in node_children(&n.kind) {
-            visit(&c, visited, order);
-        }
-        order.push(n.clone());
-    }
-    for r in roots {
-        visit(r, &mut visited, &mut order);
-    }
+    let order = post_order(roots);
     let mut consumers: HashMap<u64, usize> = HashMap::new();
     for n in &order {
         for c in node_children(&n.kind) {
@@ -665,8 +650,10 @@ pub fn fuse_roots(roots: &[Arc<Node>]) -> std::result::Result<Vec<Arc<Node>>, St
             Some(OpT::Unary(f)) => {
                 let c = children[0].clone();
                 let (mut region, expr) = match open.remove(&c.id) {
-                    Some(r) => {
-                        let e = f(r.expr.clone());
+                    Some(mut r) => {
+                        // Owned region, overwritten just below: take the
+                        // expr instead of cloning the whole tree.
+                        let e = f(std::mem::replace(&mut r.expr, E::cst(0.0)));
                         (r, e)
                     }
                     None => {
@@ -796,7 +783,7 @@ pub fn fuse_roots(roots: &[Arc<Node>]) -> std::result::Result<Vec<Arc<Node>>, St
                 let (mut region, expr) = match (ra, rb) {
                     (Some(mut r1), Some(r2)) => {
                         let b_expr = r1.absorb(r2);
-                        let e = f(r1.expr.clone(), b_expr);
+                        let e = f(std::mem::replace(&mut r1.expr, E::cst(0.0)), b_expr);
                         (r1, e)
                     }
                     (Some(mut r), None) => {
@@ -805,7 +792,7 @@ pub fn fuse_roots(roots: &[Arc<Node>]) -> std::result::Result<Vec<Arc<Node>>, St
                         } else {
                             r.lane(&map.get(&b.id).cloned().unwrap_or_else(|| b.clone()))
                         };
-                        let e = f(r.expr.clone(), l);
+                        let e = f(std::mem::replace(&mut r.expr, E::cst(0.0)), l);
                         (r, e)
                     }
                     (None, Some(mut r)) => {
@@ -814,7 +801,7 @@ pub fn fuse_roots(roots: &[Arc<Node>]) -> std::result::Result<Vec<Arc<Node>>, St
                         } else {
                             r.lane(&map.get(&a.id).cloned().unwrap_or_else(|| a.clone()))
                         };
-                        let e = f(l, r.expr.clone());
+                        let e = f(l, std::mem::replace(&mut r.expr, E::cst(0.0)));
                         (r, e)
                     }
                     (None, None) => {
@@ -939,20 +926,7 @@ fn merge_shared_regions(roots: &[Arc<Node>]) -> std::result::Result<Vec<Arc<Node
     }
 
     fn analyze(roots: &[Arc<Node>]) -> (Vec<Arc<Node>>, HashMap<u64, Vec<u64>>) {
-        let mut order: Vec<Arc<Node>> = Vec::new();
-        let mut visited = HashSet::new();
-        fn visit(n: &Arc<Node>, visited: &mut HashSet<u64>, order: &mut Vec<Arc<Node>>) {
-            if !visited.insert(n.id) {
-                return;
-            }
-            for c in node_children(&n.kind) {
-                visit(&c, visited, order);
-            }
-            order.push(n.clone());
-        }
-        for r in roots {
-            visit(r, &mut visited, &mut order);
-        }
+        let order = post_order(roots);
         let mut consumers: HashMap<u64, Vec<u64>> = HashMap::new();
         for n in &order {
             for c in node_children(&n.kind) {

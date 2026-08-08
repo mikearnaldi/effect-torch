@@ -954,6 +954,37 @@ pub struct Node<E: FusionExpression> {
     pub kind: NodeKind<E>,
 }
 
+impl<E: FusionExpression> Drop for Node<E> {
+    fn drop(&mut self) {
+        // Deep graphs (long op chains, large fused backward graphs)
+        // recurse in default destructor glue through Arc<Node> children
+        // and overflow worker-thread stacks, so descendants drain into a
+        // worklist: children are cloned out BEFORE their parent's kind
+        // drops (so no Node destructor can fire mid-drain), uniquely
+        // owned nodes are unwrapped and their kind swapped for a dummy
+        // leaf, and their children rejoin the worklist.
+        let dummy = || NodeKind::<E>::Zeros {
+            shape: Vec::new(),
+            dtype: DType::F32,
+            device: Device::Cpu,
+        };
+        let mut worklist: Vec<Arc<Node<E>>> = Vec::new();
+        let kind = std::mem::replace(&mut self.kind, dummy());
+        worklist.extend(node_children(&kind));
+        drop(kind);
+        while let Some(arc) = worklist.pop() {
+            let Ok(mut node) = Arc::try_unwrap(arc) else {
+                continue;
+            };
+            let kind = std::mem::replace(&mut node.kind, dummy());
+            // `node` drops at the end of this iteration with a dummy
+            // kind; its Drop sees no children and returns immediately.
+            worklist.extend(node_children(&kind));
+            drop(kind);
+        }
+    }
+}
+
 impl<E: FusionExpression> Node<E> {
     pub fn new(kind: NodeKind<E>) -> Result<Arc<Self>, String> {
         let metadata = kind.metadata()?;

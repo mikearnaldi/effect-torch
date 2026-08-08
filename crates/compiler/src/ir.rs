@@ -45,7 +45,7 @@ pub fn broadcast_compatible(lane: &[usize], out: &[usize]) -> bool {
     lane_strides(lane, out).is_some()
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Debug)]
 pub enum Expr {
     // per-element input lane k
     Input(u32),
@@ -93,6 +93,69 @@ pub enum Expr {
     // one helper so gemm epilogues and elementwise regions share it.
     Gelu(Box<Expr>),
     GeluTanh(Box<Expr>),
+}
+
+impl Expr {
+    // Moves child boxes into the worklist, leaving cheap leaves behind;
+    // used by Drop so destructor glue never recurses.
+    fn drain_children(&mut self, worklist: &mut Vec<Box<Expr>>) {
+        fn dummy() -> Box<Expr> {
+            Box::new(Expr::Const(0))
+        }
+        match self {
+            Expr::Input(_) | Expr::Scalar(_) | Expr::Const(_) => {}
+            Expr::Select(c, a, b) => {
+                worklist.push(std::mem::replace(c, dummy()));
+                worklist.push(std::mem::replace(a, dummy()));
+                worklist.push(std::mem::replace(b, dummy()));
+            }
+            Expr::Add(a, b)
+            | Expr::Sub(a, b)
+            | Expr::Mul(a, b)
+            | Expr::Div(a, b)
+            | Expr::Min(a, b)
+            | Expr::Max(a, b)
+            | Expr::Lt(a, b)
+            | Expr::Le(a, b)
+            | Expr::Gt(a, b)
+            | Expr::Ge(a, b)
+            | Expr::Eq(a, b)
+            | Expr::Ne(a, b) => {
+                worklist.push(std::mem::replace(a, dummy()));
+                worklist.push(std::mem::replace(b, dummy()));
+            }
+            Expr::Neg(a)
+            | Expr::Sqrt(a)
+            | Expr::Exp(a)
+            | Expr::Sin(a)
+            | Expr::Cos(a)
+            | Expr::Tanh(a)
+            | Expr::Abs(a)
+            | Expr::Log(a)
+            | Expr::Floor(a)
+            | Expr::Ceil(a)
+            | Expr::Round(a)
+            | Expr::Powf(a, _)
+            | Expr::Erf(a)
+            | Expr::Gelu(a)
+            | Expr::GeluTanh(a) => worklist.push(std::mem::replace(a, dummy())),
+        }
+    }
+}
+
+impl Drop for Expr {
+    fn drop(&mut self) {
+        // A long elementwise chain fuses into one deep Expr; default
+        // destructor glue recurses over the Box chain and overflows the
+        // (worker-thread) stack, so descendants drain into a worklist.
+        // Worklist entries drop with dummy leaves in place, so their own
+        // Drop returns immediately.
+        let mut worklist = Vec::new();
+        self.drain_children(&mut worklist);
+        while let Some(mut node) = worklist.pop() {
+            node.drain_children(&mut worklist);
+        }
+    }
 }
 
 /// `x^e` with special cases for the common exponents: exact multiplies
@@ -151,18 +214,11 @@ impl Expr {
         Expr::Const(v.to_bits())
     }
 
-    /// Remaps per-element lane indices through `remap` (which must cover
-    /// every lane the expression references).
-    pub fn remap_lanes(&self, remap: &std::collections::HashMap<u32, u32>) -> Self {
-        self.remap_inputs(&mut |k| remap[&k])
-    }
-
-    /// Number of nodes in the expression tree (shared subtrees count per
-    /// occurrence: this bounds emitted kernel size, not SSA values).
-    pub fn ops(&self) -> usize {
+    // Child references in left-to-right order.
+    fn children(&self) -> Vec<&Expr> {
         match self {
-            Expr::Input(_) | Expr::Scalar(_) | Expr::Const(_) => 1,
-            Expr::Select(c, a, b) => 1 + c.ops() + a.ops() + b.ops(),
+            Expr::Input(_) | Expr::Scalar(_) | Expr::Const(_) => Vec::new(),
+            Expr::Select(c, a, b) => vec![c.as_ref(), a.as_ref(), b.as_ref()],
             Expr::Add(a, b)
             | Expr::Sub(a, b)
             | Expr::Mul(a, b)
@@ -174,7 +230,7 @@ impl Expr {
             | Expr::Gt(a, b)
             | Expr::Ge(a, b)
             | Expr::Eq(a, b)
-            | Expr::Ne(a, b) => 1 + a.ops() + b.ops(),
+            | Expr::Ne(a, b) => vec![a.as_ref(), b.as_ref()],
             Expr::Neg(a)
             | Expr::Sqrt(a)
             | Expr::Exp(a)
@@ -189,48 +245,98 @@ impl Expr {
             | Expr::Powf(a, _)
             | Expr::Erf(a)
             | Expr::Gelu(a)
-            | Expr::GeluTanh(a) => 1 + a.ops(),
+            | Expr::GeluTanh(a) => vec![a.as_ref()],
         }
     }
 
-    fn remap_inputs(&self, f: &mut dyn FnMut(u32) -> u32) -> Self {
+    // Rebuilds the same variant with new children (left-to-right).
+    fn rebuild(&self, mut children: Vec<Expr>) -> Expr {
+        let mut next = || Box::new(children.remove(0));
         match self {
-            Expr::Input(k) => Expr::Input(f(*k)),
+            Expr::Input(k) => Expr::Input(*k),
             Expr::Scalar(k) => Expr::Scalar(*k),
             Expr::Const(b) => Expr::Const(*b),
-            Expr::Add(a, b) => Expr::Add(Box::new(a.remap_inputs(f)), Box::new(b.remap_inputs(f))),
-            Expr::Sub(a, b) => Expr::Sub(Box::new(a.remap_inputs(f)), Box::new(b.remap_inputs(f))),
-            Expr::Mul(a, b) => Expr::Mul(Box::new(a.remap_inputs(f)), Box::new(b.remap_inputs(f))),
-            Expr::Div(a, b) => Expr::Div(Box::new(a.remap_inputs(f)), Box::new(b.remap_inputs(f))),
-            Expr::Min(a, b) => Expr::Min(Box::new(a.remap_inputs(f)), Box::new(b.remap_inputs(f))),
-            Expr::Max(a, b) => Expr::Max(Box::new(a.remap_inputs(f)), Box::new(b.remap_inputs(f))),
-            Expr::Lt(a, b) => Expr::Lt(Box::new(a.remap_inputs(f)), Box::new(b.remap_inputs(f))),
-            Expr::Le(a, b) => Expr::Le(Box::new(a.remap_inputs(f)), Box::new(b.remap_inputs(f))),
-            Expr::Gt(a, b) => Expr::Gt(Box::new(a.remap_inputs(f)), Box::new(b.remap_inputs(f))),
-            Expr::Ge(a, b) => Expr::Ge(Box::new(a.remap_inputs(f)), Box::new(b.remap_inputs(f))),
-            Expr::Eq(a, b) => Expr::Eq(Box::new(a.remap_inputs(f)), Box::new(b.remap_inputs(f))),
-            Expr::Ne(a, b) => Expr::Ne(Box::new(a.remap_inputs(f)), Box::new(b.remap_inputs(f))),
-            Expr::Select(c, a, b) => Expr::Select(
-                Box::new(c.remap_inputs(f)),
-                Box::new(a.remap_inputs(f)),
-                Box::new(b.remap_inputs(f)),
-            ),
-            Expr::Neg(a) => Expr::Neg(Box::new(a.remap_inputs(f))),
-            Expr::Sqrt(a) => Expr::Sqrt(Box::new(a.remap_inputs(f))),
-            Expr::Exp(a) => Expr::Exp(Box::new(a.remap_inputs(f))),
-            Expr::Sin(a) => Expr::Sin(Box::new(a.remap_inputs(f))),
-            Expr::Cos(a) => Expr::Cos(Box::new(a.remap_inputs(f))),
-            Expr::Tanh(a) => Expr::Tanh(Box::new(a.remap_inputs(f))),
-            Expr::Abs(a) => Expr::Abs(Box::new(a.remap_inputs(f))),
-            Expr::Log(a) => Expr::Log(Box::new(a.remap_inputs(f))),
-            Expr::Floor(a) => Expr::Floor(Box::new(a.remap_inputs(f))),
-            Expr::Ceil(a) => Expr::Ceil(Box::new(a.remap_inputs(f))),
-            Expr::Round(a) => Expr::Round(Box::new(a.remap_inputs(f))),
-            Expr::Powf(a, e) => Expr::Powf(Box::new(a.remap_inputs(f)), *e),
-            Expr::Erf(a) => Expr::Erf(Box::new(a.remap_inputs(f))),
-            Expr::Gelu(a) => Expr::Gelu(Box::new(a.remap_inputs(f))),
-            Expr::GeluTanh(a) => Expr::GeluTanh(Box::new(a.remap_inputs(f))),
+            Expr::Select(..) => Expr::Select(next(), next(), next()),
+            Expr::Add(..) => Expr::Add(next(), next()),
+            Expr::Sub(..) => Expr::Sub(next(), next()),
+            Expr::Mul(..) => Expr::Mul(next(), next()),
+            Expr::Div(..) => Expr::Div(next(), next()),
+            Expr::Min(..) => Expr::Min(next(), next()),
+            Expr::Max(..) => Expr::Max(next(), next()),
+            Expr::Lt(..) => Expr::Lt(next(), next()),
+            Expr::Le(..) => Expr::Le(next(), next()),
+            Expr::Gt(..) => Expr::Gt(next(), next()),
+            Expr::Ge(..) => Expr::Ge(next(), next()),
+            Expr::Eq(..) => Expr::Eq(next(), next()),
+            Expr::Ne(..) => Expr::Ne(next(), next()),
+            Expr::Neg(..) => Expr::Neg(next()),
+            Expr::Sqrt(..) => Expr::Sqrt(next()),
+            Expr::Exp(..) => Expr::Exp(next()),
+            Expr::Sin(..) => Expr::Sin(next()),
+            Expr::Cos(..) => Expr::Cos(next()),
+            Expr::Tanh(..) => Expr::Tanh(next()),
+            Expr::Abs(..) => Expr::Abs(next()),
+            Expr::Log(..) => Expr::Log(next()),
+            Expr::Floor(..) => Expr::Floor(next()),
+            Expr::Ceil(..) => Expr::Ceil(next()),
+            Expr::Round(..) => Expr::Round(next()),
+            Expr::Powf(_, e) => Expr::Powf(next(), *e),
+            Expr::Erf(..) => Expr::Erf(next()),
+            Expr::Gelu(..) => Expr::Gelu(next()),
+            Expr::GeluTanh(..) => Expr::GeluTanh(next()),
         }
+    }
+
+    // Iterative post-order rebuild: `f` may substitute a leaf (Some) or
+    // keep it (None); internal nodes rebuild from already-transformed
+    // children. Tree transforms must never recurse — deep fused regions
+    // are bounded by heap, not the call stack.
+    fn transform(&self, f: &mut dyn FnMut(&Expr) -> Option<Expr>) -> Expr {
+        let mut stack: Vec<(&Expr, bool)> = vec![(self, false)];
+        let mut out: Vec<Expr> = Vec::new();
+        while let Some((node, processed)) = stack.pop() {
+            let children = node.children();
+            if processed {
+                let rebuilt = out.split_off(out.len() - children.len());
+                out.push(node.rebuild(rebuilt));
+                continue;
+            }
+            if children.is_empty() {
+                out.push(f(node).unwrap_or_else(|| node.rebuild(Vec::new())));
+                continue;
+            }
+            stack.push((node, true));
+            for child in children.into_iter().rev() {
+                stack.push((child, false));
+            }
+        }
+        debug_assert_eq!(out.len(), 1);
+        out.pop().expect("transform result")
+    }
+
+    /// Remaps per-element lane indices through `remap` (which must cover
+    /// every lane the expression references).
+    pub fn remap_lanes(&self, remap: &std::collections::HashMap<u32, u32>) -> Self {
+        self.remap_inputs(&mut |k| remap[&k])
+    }
+
+    /// Number of nodes in the expression tree (shared subtrees count per
+    /// occurrence: this bounds emitted kernel size, not SSA values).
+    pub fn ops(&self) -> usize {
+        let mut count = 0usize;
+        let mut stack = vec![self];
+        while let Some(node) = stack.pop() {
+            count += 1;
+            stack.extend(node.children());
+        }
+        count
+    }
+
+    fn remap_inputs(&self, f: &mut dyn FnMut(u32) -> u32) -> Self {
+        self.transform(&mut |e| match e {
+            Expr::Input(k) => Some(Expr::Input(f(*k))),
+            _ => None,
+        })
     }
 
     /// Inlines `replacement` for `lane` and remaps the remaining lanes
@@ -245,83 +351,35 @@ impl Expr {
         replacement: &Expr,
         remap: &std::collections::HashMap<u32, u32>,
     ) -> Self {
-        fn go(e: &Expr, lane: u32, r: &Expr, remap: &std::collections::HashMap<u32, u32>) -> Expr {
-            match e {
-                Expr::Input(k) if *k == lane => r.clone(),
-                Expr::Input(k) => Expr::Input(remap[k]),
-                Expr::Scalar(k) => Expr::Scalar(*k),
-                Expr::Const(b) => Expr::Const(*b),
-                Expr::Add(a, b) => Expr::Add(
-                    Box::new(go(a, lane, r, remap)),
-                    Box::new(go(b, lane, r, remap)),
-                ),
-                Expr::Sub(a, b) => Expr::Sub(
-                    Box::new(go(a, lane, r, remap)),
-                    Box::new(go(b, lane, r, remap)),
-                ),
-                Expr::Mul(a, b) => Expr::Mul(
-                    Box::new(go(a, lane, r, remap)),
-                    Box::new(go(b, lane, r, remap)),
-                ),
-                Expr::Div(a, b) => Expr::Div(
-                    Box::new(go(a, lane, r, remap)),
-                    Box::new(go(b, lane, r, remap)),
-                ),
-                Expr::Min(a, b) => Expr::Min(
-                    Box::new(go(a, lane, r, remap)),
-                    Box::new(go(b, lane, r, remap)),
-                ),
-                Expr::Max(a, b) => Expr::Max(
-                    Box::new(go(a, lane, r, remap)),
-                    Box::new(go(b, lane, r, remap)),
-                ),
-                Expr::Lt(a, b) => Expr::Lt(
-                    Box::new(go(a, lane, r, remap)),
-                    Box::new(go(b, lane, r, remap)),
-                ),
-                Expr::Le(a, b) => Expr::Le(
-                    Box::new(go(a, lane, r, remap)),
-                    Box::new(go(b, lane, r, remap)),
-                ),
-                Expr::Gt(a, b) => Expr::Gt(
-                    Box::new(go(a, lane, r, remap)),
-                    Box::new(go(b, lane, r, remap)),
-                ),
-                Expr::Ge(a, b) => Expr::Ge(
-                    Box::new(go(a, lane, r, remap)),
-                    Box::new(go(b, lane, r, remap)),
-                ),
-                Expr::Eq(a, b) => Expr::Eq(
-                    Box::new(go(a, lane, r, remap)),
-                    Box::new(go(b, lane, r, remap)),
-                ),
-                Expr::Ne(a, b) => Expr::Ne(
-                    Box::new(go(a, lane, r, remap)),
-                    Box::new(go(b, lane, r, remap)),
-                ),
-                Expr::Select(c, a, b) => Expr::Select(
-                    Box::new(go(c, lane, r, remap)),
-                    Box::new(go(a, lane, r, remap)),
-                    Box::new(go(b, lane, r, remap)),
-                ),
-                Expr::Neg(a) => Expr::Neg(Box::new(go(a, lane, r, remap))),
-                Expr::Sqrt(a) => Expr::Sqrt(Box::new(go(a, lane, r, remap))),
-                Expr::Exp(a) => Expr::Exp(Box::new(go(a, lane, r, remap))),
-                Expr::Sin(a) => Expr::Sin(Box::new(go(a, lane, r, remap))),
-                Expr::Cos(a) => Expr::Cos(Box::new(go(a, lane, r, remap))),
-                Expr::Tanh(a) => Expr::Tanh(Box::new(go(a, lane, r, remap))),
-                Expr::Abs(a) => Expr::Abs(Box::new(go(a, lane, r, remap))),
-                Expr::Log(a) => Expr::Log(Box::new(go(a, lane, r, remap))),
-                Expr::Floor(a) => Expr::Floor(Box::new(go(a, lane, r, remap))),
-                Expr::Ceil(a) => Expr::Ceil(Box::new(go(a, lane, r, remap))),
-                Expr::Round(a) => Expr::Round(Box::new(go(a, lane, r, remap))),
-                Expr::Powf(a, e) => Expr::Powf(Box::new(go(a, lane, r, remap)), *e),
-                Expr::Erf(a) => Expr::Erf(Box::new(go(a, lane, r, remap))),
-                Expr::Gelu(a) => Expr::Gelu(Box::new(go(a, lane, r, remap))),
-                Expr::GeluTanh(a) => Expr::GeluTanh(Box::new(go(a, lane, r, remap))),
-            }
+        self.transform(&mut |e| match e {
+            Expr::Input(k) if *k == lane => Some(replacement.clone()),
+            Expr::Input(k) => Some(Expr::Input(remap[k])),
+            _ => None,
+        })
+    }
+}
+
+// Clone, equality and hashing are manual and iterative (via the
+// post-order plan): derived glue would recurse over deep Box chains.
+impl Clone for Expr {
+    fn clone(&self) -> Self {
+        self.transform(&mut |_| None)
+    }
+}
+
+impl PartialEq for Expr {
+    fn eq(&self, other: &Self) -> bool {
+        flatten(self) == flatten(other)
+    }
+}
+
+impl Eq for Expr {}
+
+impl std::hash::Hash for Expr {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        for op in flatten(self) {
+            op.hash(state);
         }
-        go(self, lane, replacement, remap)
     }
 }
 
@@ -473,60 +531,209 @@ macro_rules! impl_scalar {
 impl_scalar!(f32, libm::erff);
 impl_scalar!(f64, libm::erf);
 
-fn eval_at<T: Scalar>(e: &Expr, i: usize, inputs: &[&[T]], scalars: &[T]) -> T {
-    eval(e, &|k| inputs[k as usize][i], scalars)
+// A fused expression flattened to a post-order plan. A long elementwise
+// chain fuses into one deep Expr, and the interpreter runs once per
+// element — a recursive tree walk would multiply the chain depth by the
+// call stack of every element. The plan evaluates with an explicit value
+// stack: depth is bounded by heap, never the call stack.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum Flat {
+    Input(u32),
+    Scalar(u32),
+    Const(u64),
+    Add,
+    Sub,
+    Mul,
+    Div,
+    Min,
+    Max,
+    Lt,
+    Le,
+    Gt,
+    Ge,
+    Eq,
+    Ne,
+    Select,
+    Neg,
+    Sqrt,
+    Exp,
+    Sin,
+    Cos,
+    Tanh,
+    Abs,
+    Log,
+    Floor,
+    Ceil,
+    Round,
+    Powf(u64),
+    Erf,
+    Gelu,
+    GeluTanh,
+}
+
+// Iterative post-order flattening (the traversal is stack-safe like the
+// evaluator below).
+fn flatten(e: &Expr) -> Vec<Flat> {
+    let mut out = Vec::new();
+    let mut stack: Vec<(&Expr, bool)> = vec![(e, false)];
+    while let Some((node, processed)) = stack.pop() {
+        if processed {
+            out.push(match node {
+                Expr::Input(k) => Flat::Input(*k),
+                Expr::Scalar(k) => Flat::Scalar(*k),
+                Expr::Const(bits) => Flat::Const(*bits),
+                Expr::Add(..) => Flat::Add,
+                Expr::Sub(..) => Flat::Sub,
+                Expr::Mul(..) => Flat::Mul,
+                Expr::Div(..) => Flat::Div,
+                Expr::Min(..) => Flat::Min,
+                Expr::Max(..) => Flat::Max,
+                Expr::Lt(..) => Flat::Lt,
+                Expr::Le(..) => Flat::Le,
+                Expr::Gt(..) => Flat::Gt,
+                Expr::Ge(..) => Flat::Ge,
+                Expr::Eq(..) => Flat::Eq,
+                Expr::Ne(..) => Flat::Ne,
+                Expr::Select(..) => Flat::Select,
+                Expr::Neg(..) => Flat::Neg,
+                Expr::Sqrt(..) => Flat::Sqrt,
+                Expr::Exp(..) => Flat::Exp,
+                Expr::Sin(..) => Flat::Sin,
+                Expr::Cos(..) => Flat::Cos,
+                Expr::Tanh(..) => Flat::Tanh,
+                Expr::Abs(..) => Flat::Abs,
+                Expr::Log(..) => Flat::Log,
+                Expr::Floor(..) => Flat::Floor,
+                Expr::Ceil(..) => Flat::Ceil,
+                Expr::Round(..) => Flat::Round,
+                Expr::Powf(_, e) => Flat::Powf(*e),
+                Expr::Erf(..) => Flat::Erf,
+                Expr::Gelu(..) => Flat::Gelu,
+                Expr::GeluTanh(..) => Flat::GeluTanh,
+            });
+            continue;
+        }
+        stack.push((node, true));
+        match node {
+            Expr::Input(_) | Expr::Scalar(_) | Expr::Const(_) => {}
+            Expr::Select(c, a, b) => {
+                stack.push((b, false));
+                stack.push((a, false));
+                stack.push((c, false));
+            }
+            Expr::Add(a, b)
+            | Expr::Sub(a, b)
+            | Expr::Mul(a, b)
+            | Expr::Div(a, b)
+            | Expr::Min(a, b)
+            | Expr::Max(a, b)
+            | Expr::Lt(a, b)
+            | Expr::Le(a, b)
+            | Expr::Gt(a, b)
+            | Expr::Ge(a, b)
+            | Expr::Eq(a, b)
+            | Expr::Ne(a, b) => {
+                stack.push((b, false));
+                stack.push((a, false));
+            }
+            Expr::Neg(a)
+            | Expr::Sqrt(a)
+            | Expr::Exp(a)
+            | Expr::Sin(a)
+            | Expr::Cos(a)
+            | Expr::Tanh(a)
+            | Expr::Abs(a)
+            | Expr::Log(a)
+            | Expr::Floor(a)
+            | Expr::Ceil(a)
+            | Expr::Round(a)
+            | Expr::Powf(a, _)
+            | Expr::Erf(a)
+            | Expr::Gelu(a)
+            | Expr::GeluTanh(a) => stack.push((a, false)),
+        }
+    }
+    out
 }
 
 // The scalar evaluator shared by the contiguous path (lane accessor reads
 // lane[k][i]) and the strided path (lane values pre-gathered per element).
-fn eval<T: Scalar, F: Fn(u32) -> T>(e: &Expr, lane: &F, scalars: &[T]) -> T {
-    match e {
-        Expr::Input(k) => lane(*k),
-        Expr::Scalar(k) => scalars[*k as usize],
-        Expr::Const(bits) => T::from_f64(f64::from_bits(*bits)),
-        Expr::Add(a, b) => eval(a, lane, scalars).add(eval(b, lane, scalars)),
-        Expr::Sub(a, b) => eval(a, lane, scalars).sub(eval(b, lane, scalars)),
-        Expr::Mul(a, b) => eval(a, lane, scalars).mul(eval(b, lane, scalars)),
-        Expr::Div(a, b) => eval(a, lane, scalars).div(eval(b, lane, scalars)),
-        Expr::Min(a, b) => eval(a, lane, scalars).min(eval(b, lane, scalars)),
-        Expr::Max(a, b) => eval(a, lane, scalars).max(eval(b, lane, scalars)),
-        Expr::Lt(a, b) => eval(a, lane, scalars).lt(eval(b, lane, scalars)),
-        Expr::Le(a, b) => eval(a, lane, scalars).le(eval(b, lane, scalars)),
-        Expr::Gt(a, b) => eval(a, lane, scalars).gt(eval(b, lane, scalars)),
-        Expr::Ge(a, b) => eval(a, lane, scalars).ge(eval(b, lane, scalars)),
-        Expr::Eq(a, b) => eval(a, lane, scalars).eq(eval(b, lane, scalars)),
-        Expr::Ne(a, b) => eval(a, lane, scalars).ne(eval(b, lane, scalars)),
-        Expr::Select(c, a, b) => T::pick(
-            eval(c, lane, scalars),
-            eval(a, lane, scalars),
-            eval(b, lane, scalars),
-        ),
-        Expr::Neg(a) => eval(a, lane, scalars).neg(),
-        Expr::Sqrt(a) => eval(a, lane, scalars).sqrt(),
-        Expr::Exp(a) => eval(a, lane, scalars).exp(),
-        Expr::Sin(a) => eval(a, lane, scalars).sin(),
-        Expr::Cos(a) => eval(a, lane, scalars).cos(),
-        Expr::Tanh(a) => eval(a, lane, scalars).tanh(),
-        Expr::Abs(a) => eval(a, lane, scalars).abs(),
-        Expr::Log(a) => eval(a, lane, scalars).log(),
-        Expr::Floor(a) => eval(a, lane, scalars).floor(),
-        Expr::Ceil(a) => eval(a, lane, scalars).ceil(),
-        Expr::Round(a) => eval(a, lane, scalars).round(),
-        Expr::Powf(a, e) => eval(a, lane, scalars).powf(f64::from_bits(*e)),
-        Expr::Erf(a) => eval(a, lane, scalars).erf(),
-        Expr::Gelu(a) => {
-            let x = eval(a, lane, scalars);
-            let inner = x.mul(T::from_f64(std::f64::consts::FRAC_1_SQRT_2)).erf();
-            x.mul(T::from_f64(0.5)).mul(T::from_f64(1.0).add(inner))
-        }
-        Expr::GeluTanh(a) => {
-            let x = eval(a, lane, scalars);
-            let u = x
-                .add(x.mul(x).mul(x).mul(T::from_f64(0.044715)))
-                .mul(T::from_f64(0.7978845608028654));
-            x.mul(T::from_f64(0.5)).mul(T::from_f64(1.0).add(u.tanh()))
+// `values` is caller-owned scratch, reused across elements.
+fn eval_plan<T: Scalar, F: Fn(u32) -> T>(
+    plan: &[Flat],
+    lane: &F,
+    scalars: &[T],
+    values: &mut Vec<T>,
+) -> T {
+    macro_rules! binary {
+        ($m:ident) => {{
+            let b = values.pop().expect("plan operand");
+            let a = values.pop().expect("plan operand");
+            values.push(a.$m(b));
+        }};
+    }
+    macro_rules! unary {
+        ($m:ident) => {{
+            let a = values.pop().expect("plan operand");
+            values.push(a.$m());
+        }};
+    }
+    values.clear();
+    for op in plan {
+        match op {
+            Flat::Input(k) => values.push(lane(*k)),
+            Flat::Scalar(k) => values.push(scalars[*k as usize]),
+            Flat::Const(bits) => values.push(T::from_f64(f64::from_bits(*bits))),
+            Flat::Add => binary!(add),
+            Flat::Sub => binary!(sub),
+            Flat::Mul => binary!(mul),
+            Flat::Div => binary!(div),
+            Flat::Min => binary!(min),
+            Flat::Max => binary!(max),
+            Flat::Lt => binary!(lt),
+            Flat::Le => binary!(le),
+            Flat::Gt => binary!(gt),
+            Flat::Ge => binary!(ge),
+            Flat::Eq => binary!(eq),
+            Flat::Ne => binary!(ne),
+            Flat::Select => {
+                let b = values.pop().expect("plan operand");
+                let a = values.pop().expect("plan operand");
+                let c = values.pop().expect("plan operand");
+                values.push(T::pick(c, a, b));
+            }
+            Flat::Neg => unary!(neg),
+            Flat::Sqrt => unary!(sqrt),
+            Flat::Exp => unary!(exp),
+            Flat::Sin => unary!(sin),
+            Flat::Cos => unary!(cos),
+            Flat::Tanh => unary!(tanh),
+            Flat::Abs => unary!(abs),
+            Flat::Log => unary!(log),
+            Flat::Floor => unary!(floor),
+            Flat::Ceil => unary!(ceil),
+            Flat::Round => unary!(round),
+            Flat::Powf(e) => {
+                let a = values.pop().expect("plan operand");
+                values.push(a.powf(f64::from_bits(*e)));
+            }
+            Flat::Erf => unary!(erf),
+            Flat::Gelu => {
+                let x = values.pop().expect("plan operand");
+                let inner = x.mul(T::from_f64(std::f64::consts::FRAC_1_SQRT_2)).erf();
+                values.push(x.mul(T::from_f64(0.5)).mul(T::from_f64(1.0).add(inner)));
+            }
+            Flat::GeluTanh => {
+                let x = values.pop().expect("plan operand");
+                let u = x
+                    .add(x.mul(x).mul(x).mul(T::from_f64(0.044715)))
+                    .mul(T::from_f64(0.7978845608028654));
+                values.push(x.mul(T::from_f64(0.5)).mul(T::from_f64(1.0).add(u.tanh())));
+            }
         }
     }
+    debug_assert_eq!(values.len(), 1);
+    values.pop().expect("plan result")
 }
 
 pub fn interpret_core<T: Scalar>(
@@ -542,15 +749,16 @@ pub fn interpret_core<T: Scalar>(
         Some(ss) if ss.iter().any(|s| s != &contig) => Some(ss),
         _ => None,
     };
-    let mut outs: Vec<Vec<T>> = exprs
-        .iter()
-        .map(|_| vec![<T as Scalar>::from_f64(0.0); n])
-        .collect();
+    let init = <T as Scalar>::from_f64(0.0);
+    let mut outs: Vec<Vec<T>> = exprs.iter().map(|_| vec![init; n]).collect();
+    let plans: Vec<Vec<Flat>> = exprs.iter().map(flatten).collect();
+    let mut values: Vec<T> = Vec::new();
     match strided {
         None => {
             for i in 0..n {
-                for (out, expr) in outs.iter_mut().zip(exprs.iter()) {
-                    out[i] = eval_at(expr, i, slices, scalar_values);
+                for (out, plan) in outs.iter_mut().zip(plans.iter()) {
+                    out[i] =
+                        eval_plan(plan, &|k| slices[k as usize][i], scalar_values, &mut values);
                 }
             }
         }
@@ -560,13 +768,14 @@ pub fn interpret_core<T: Scalar>(
             let rank = shape.len();
             let mut coord = vec![0usize; rank];
             let mut offs = vec![0usize; slices.len()];
-            let mut lane_vals = vec![<T as Scalar>::from_f64(0.0); slices.len()];
+            let mut lane_vals = vec![init; slices.len()];
             for i in 0..n {
                 for (v, (slice, off)) in lane_vals.iter_mut().zip(slices.iter().zip(offs.iter())) {
                     *v = slice[*off];
                 }
-                for (out, expr) in outs.iter_mut().zip(exprs.iter()) {
-                    out[i] = eval(expr, &|k| lane_vals[k as usize], scalar_values);
+                for (out, plan) in outs.iter_mut().zip(plans.iter()) {
+                    out[i] =
+                        eval_plan(plan, &|k| lane_vals[k as usize], scalar_values, &mut values);
                 }
                 for d in (0..rank).rev() {
                     coord[d] += 1;
@@ -621,11 +830,13 @@ pub fn interpret_reduce_core<T: Scalar>(
     let mut offs = vec![0usize; slices.len()];
     let mut lane_vals = vec![init; slices.len()];
     let mut out_off = 0usize;
+    let plan = flatten(expr);
+    let mut values: Vec<T> = Vec::new();
     for _ in 0..in_n {
         for (v, (slice, off)) in lane_vals.iter_mut().zip(slices.iter().zip(offs.iter())) {
             *v = slice[*off];
         }
-        let v = eval(expr, &|k| lane_vals[k as usize], &[]);
+        let v = eval_plan(&plan, &|k| lane_vals[k as usize], &[], &mut values);
         acc[out_off] = op.fold(acc[out_off], v);
         for d in (0..rank).rev() {
             coord[d] += 1;

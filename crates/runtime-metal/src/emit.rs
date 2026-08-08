@@ -199,99 +199,135 @@ fn emit_expr_ssa(
     next: &mut usize,
     memo: &mut std::collections::HashMap<usize, String>,
 ) -> String {
-    let ptr = e as *const Expr as usize;
-    if let Some(t) = memo.get(&ptr) {
-        return t.clone();
+    let _ = num_inputs;
+    // Iterative post-order emission (memoized by node pointer): a long
+    // elementwise chain is one deep Expr, and kernel emission must not
+    // multiply its depth by the call stack.
+    macro_rules! binary {
+        ($stack:ident, $fmt:literal) => {{
+            let b = $stack.pop().expect("emit operand");
+            let a = $stack.pop().expect("emit operand");
+            format!($fmt, a, b)
+        }};
     }
-    match e {
-        Expr::Input(k) => return lane(*k),
-        Expr::Scalar(k) => return format!("scs[{}]", *k as usize),
-        Expr::Const(bits) => return f32_lit(f64::from_bits(*bits)),
-        _ => {}
+    macro_rules! unary {
+        ($stack:ident, $fmt:literal) => {{
+            let a = $stack.pop().expect("emit operand");
+            format!($fmt, a)
+        }};
     }
-    let s = |x: &Expr,
-             body: &mut String,
-             next: &mut usize,
-             memo: &mut std::collections::HashMap<usize, String>| {
-        emit_expr_ssa(x, lane, num_inputs, body, next, memo)
-    };
-    let rhs = match e {
-        Expr::Input(_) | Expr::Scalar(_) | Expr::Const(_) => unreachable!(),
-        Expr::Add(a, b) => format!("({} + {})", s(a, body, next, memo), s(b, body, next, memo)),
-        Expr::Sub(a, b) => format!("({} - {})", s(a, body, next, memo), s(b, body, next, memo)),
-        Expr::Mul(a, b) => format!("({} * {})", s(a, body, next, memo), s(b, body, next, memo)),
-        Expr::Div(a, b) => format!("({} / {})", s(a, body, next, memo), s(b, body, next, memo)),
-        Expr::Min(a, b) => format!(
-            "fmin({}, {})",
-            s(a, body, next, memo),
-            s(b, body, next, memo)
-        ),
-        Expr::Max(a, b) => format!(
-            "fmax({}, {})",
-            s(a, body, next, memo),
-            s(b, body, next, memo)
-        ),
-        Expr::Lt(a, b) => format!(
-            "({} < {} ? 1.0f : 0.0f)",
-            s(a, body, next, memo),
-            s(b, body, next, memo)
-        ),
-        Expr::Le(a, b) => format!(
-            "({} <= {} ? 1.0f : 0.0f)",
-            s(a, body, next, memo),
-            s(b, body, next, memo)
-        ),
-        Expr::Gt(a, b) => format!(
-            "({} > {} ? 1.0f : 0.0f)",
-            s(a, body, next, memo),
-            s(b, body, next, memo)
-        ),
-        Expr::Ge(a, b) => format!(
-            "({} >= {} ? 1.0f : 0.0f)",
-            s(a, body, next, memo),
-            s(b, body, next, memo)
-        ),
-        Expr::Eq(a, b) => format!(
-            "({} == {} ? 1.0f : 0.0f)",
-            s(a, body, next, memo),
-            s(b, body, next, memo)
-        ),
-        Expr::Ne(a, b) => format!(
-            "({} != {} ? 1.0f : 0.0f)",
-            s(a, body, next, memo),
-            s(b, body, next, memo)
-        ),
-        Expr::Select(c, a, b) => format!(
-            "({} != 0.0f ? {} : {})",
-            s(c, body, next, memo),
-            s(a, body, next, memo),
-            s(b, body, next, memo)
-        ),
-        Expr::Neg(a) => format!("(-{})", s(a, body, next, memo)),
-        Expr::Sqrt(a) => format!("sqrt({})", s(a, body, next, memo)),
-        Expr::Exp(a) => format!("exp({})", s(a, body, next, memo)),
-        Expr::Sin(a) => format!("sin({})", s(a, body, next, memo)),
-        Expr::Cos(a) => format!("cos({})", s(a, body, next, memo)),
-        Expr::Tanh(a) => format!("tanh({})", s(a, body, next, memo)),
-        Expr::Abs(a) => format!("fabs({})", s(a, body, next, memo)),
-        Expr::Log(a) => format!("log({})", s(a, body, next, memo)),
-        Expr::Floor(a) => format!("floor({})", s(a, body, next, memo)),
-        Expr::Ceil(a) => format!("ceil({})", s(a, body, next, memo)),
-        Expr::Round(a) => format!("round({})", s(a, body, next, memo)),
-        Expr::Powf(a, e) => format!(
-            "pow({}, {})",
-            s(a, body, next, memo),
-            f32_lit(f64::from_bits(*e))
-        ),
-        Expr::Erf(a) => format!("erf_as({})", s(a, body, next, memo)),
-        Expr::Gelu(a) => format!("gelu_as({})", s(a, body, next, memo)),
-        Expr::GeluTanh(a) => format!("gelu_tanh_as({})", s(a, body, next, memo)),
-    };
-    let name = format!("t{}", *next);
-    *next += 1;
-    body.push_str(&format!("    float {name} = {rhs};\n"));
-    memo.insert(ptr, name.clone());
-    name
+    let mut stack: Vec<(&Expr, bool)> = vec![(e, false)];
+    let mut results: Vec<String> = Vec::new();
+    while let Some((node, processed)) = stack.pop() {
+        if !processed {
+            let ptr = node as *const Expr as usize;
+            if let Some(t) = memo.get(&ptr) {
+                results.push(t.clone());
+                continue;
+            }
+            match node {
+                Expr::Input(k) => {
+                    results.push(lane(*k));
+                    continue;
+                }
+                Expr::Scalar(k) => {
+                    results.push(format!("scs[{}]", *k as usize));
+                    continue;
+                }
+                Expr::Const(bits) => {
+                    results.push(f32_lit(f64::from_bits(*bits)));
+                    continue;
+                }
+                _ => {}
+            }
+            stack.push((node, true));
+            match node {
+                Expr::Select(c, a, b) => {
+                    stack.push((b, false));
+                    stack.push((a, false));
+                    stack.push((c, false));
+                }
+                Expr::Add(a, b)
+                | Expr::Sub(a, b)
+                | Expr::Mul(a, b)
+                | Expr::Div(a, b)
+                | Expr::Min(a, b)
+                | Expr::Max(a, b)
+                | Expr::Lt(a, b)
+                | Expr::Le(a, b)
+                | Expr::Gt(a, b)
+                | Expr::Ge(a, b)
+                | Expr::Eq(a, b)
+                | Expr::Ne(a, b) => {
+                    stack.push((b, false));
+                    stack.push((a, false));
+                }
+                Expr::Neg(a)
+                | Expr::Sqrt(a)
+                | Expr::Exp(a)
+                | Expr::Sin(a)
+                | Expr::Cos(a)
+                | Expr::Tanh(a)
+                | Expr::Abs(a)
+                | Expr::Log(a)
+                | Expr::Floor(a)
+                | Expr::Ceil(a)
+                | Expr::Round(a)
+                | Expr::Powf(a, _)
+                | Expr::Erf(a)
+                | Expr::Gelu(a)
+                | Expr::GeluTanh(a) => stack.push((a, false)),
+                Expr::Input(_) | Expr::Scalar(_) | Expr::Const(_) => unreachable!(),
+            }
+            continue;
+        }
+        let rhs = match node {
+            Expr::Input(_) | Expr::Scalar(_) | Expr::Const(_) => unreachable!(),
+            Expr::Add(..) => binary!(results, "({} + {})"),
+            Expr::Sub(..) => binary!(results, "({} - {})"),
+            Expr::Mul(..) => binary!(results, "({} * {})"),
+            Expr::Div(..) => binary!(results, "({} / {})"),
+            Expr::Min(..) => binary!(results, "fmin({}, {})"),
+            Expr::Max(..) => binary!(results, "fmax({}, {})"),
+            Expr::Lt(..) => binary!(results, "({} < {} ? 1.0f : 0.0f)"),
+            Expr::Le(..) => binary!(results, "({} <= {} ? 1.0f : 0.0f)"),
+            Expr::Gt(..) => binary!(results, "({} > {} ? 1.0f : 0.0f)"),
+            Expr::Ge(..) => binary!(results, "({} >= {} ? 1.0f : 0.0f)"),
+            Expr::Eq(..) => binary!(results, "({} == {} ? 1.0f : 0.0f)"),
+            Expr::Ne(..) => binary!(results, "({} != {} ? 1.0f : 0.0f)"),
+            Expr::Select(..) => {
+                let b = results.pop().expect("emit operand");
+                let a = results.pop().expect("emit operand");
+                let c = results.pop().expect("emit operand");
+                format!("({} != 0.0f ? {} : {})", c, a, b)
+            }
+            Expr::Neg(..) => unary!(results, "(-{})"),
+            Expr::Sqrt(..) => unary!(results, "sqrt({})"),
+            Expr::Exp(..) => unary!(results, "exp({})"),
+            Expr::Sin(..) => unary!(results, "sin({})"),
+            Expr::Cos(..) => unary!(results, "cos({})"),
+            Expr::Tanh(..) => unary!(results, "tanh({})"),
+            Expr::Abs(..) => unary!(results, "fabs({})"),
+            Expr::Log(..) => unary!(results, "log({})"),
+            Expr::Floor(..) => unary!(results, "floor({})"),
+            Expr::Ceil(..) => unary!(results, "ceil({})"),
+            Expr::Round(..) => unary!(results, "round({})"),
+            Expr::Powf(_, e) => {
+                let a = results.pop().expect("emit operand");
+                format!("pow({}, {})", a, f32_lit(f64::from_bits(*e)))
+            }
+            Expr::Erf(..) => unary!(results, "erf_as({})"),
+            Expr::Gelu(..) => unary!(results, "gelu_as({})"),
+            Expr::GeluTanh(..) => unary!(results, "gelu_tanh_as({})"),
+        };
+        let name = format!("t{}", *next);
+        *next += 1;
+        body.push_str(&format!("    float {name} = {rhs};\n"));
+        memo.insert(node as *const Expr as usize, name.clone());
+        results.push(name);
+    }
+    debug_assert_eq!(results.len(), 1);
+    results.pop().expect("emit result")
 }
 
 fn lane_offset_expr(strides: &[usize], out_shape: &[usize], index: &str) -> String {

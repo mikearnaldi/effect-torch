@@ -49,6 +49,64 @@ mod tests {
         assert!(matches!(fused[0].kind, NodeKind::FusedElementwise { .. }));
     }
 
+    // Long elementwise chains fuse into one deep expression region; every
+    // walk over it (evaluate, clone, compare, hash, count, drop) must be
+    // stack-safe. This test lives on a 256 KiB stack to prove it.
+    #[test]
+    fn deep_fused_regions_never_recurse() {
+        std::thread::Builder::new()
+            .stack_size(256 * 1024)
+            .spawn(|| {
+                let mut expr = Expr::Input(0);
+                for _ in 0..100_000 {
+                    expr = Expr::Add(Box::new(expr), Box::new(Expr::Input(1)));
+                }
+                assert_eq!(expr.ops(), 200_001);
+                let cloned = expr.clone();
+                assert!(cloned == expr);
+                let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                std::hash::Hash::hash(&expr, &mut hasher);
+                let a = [1.0f32];
+                let b = [2.0f32];
+                let out = interpret_core(&[expr], &[&a, &b], None, &[], 1, &[1]);
+                assert_eq!(out, [vec![200_001.0f32]]);
+                // The 100k-deep expression drops at scope end on this
+                // small-stack thread.
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    // The same depth discipline for whole graphs: fusion's traversals and
+    // the node destructors are iterative.
+    #[test]
+    fn deep_graphs_fuse_and_drop_without_recursion() {
+        std::thread::Builder::new()
+            .stack_size(256 * 1024)
+            .spawn(|| {
+                let leaf = || {
+                    Node::<Expr>::new(NodeKind::Input {
+                        slot: 0,
+                        shape: vec![1],
+                        dtype: DType::F32,
+                        device: Device::Cpu,
+                    })
+                    .unwrap()
+                };
+                let mut node = leaf();
+                for _ in 0..50_000 {
+                    node = Node::new(NodeKind::Add { a: node, b: leaf() }).unwrap();
+                }
+                let fused = fuse_roots(&[node]).unwrap();
+                assert!(matches!(fused[0].kind, NodeKind::FusedElementwise { .. }));
+                drop(fused);
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
     #[test]
     fn frozen_program_planner_uses_real_placeholder_nodes() {
         let input = Node::<Expr>::new(NodeKind::Input {
