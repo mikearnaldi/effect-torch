@@ -1,4 +1,4 @@
-use super::device::{set_buffer, set_bytes, MetalDevice};
+use super::device::{set_buffer, MetalDevice};
 use super::run::MetalTensor;
 use crate::runtime::dtype::DType;
 use objc2_metal::MTLComputeCommandEncoder;
@@ -32,24 +32,34 @@ pub fn fill(dev: &MetalDevice, out: &MetalTensor, value: f64) -> Result<(), Stri
         return Ok(());
     }
     let ty = msl_type(out.dtype);
+    // The scalar is baked as a literal of the target type: routing it
+    // through a float constant would silently round integer and f64
+    // fills above 2^24 (a checkpointed u32 sampler length hit exactly
+    // this).
+    let literal = match out.dtype {
+        DType::U8 => format!("(uchar){}", value as u8),
+        DType::U32 => format!("(uint){}u", value as u32),
+        DType::I64 => format!("(long){}ll", value as i64),
+        DType::F64 => format!("{value:?}"),
+        _ => format!("{:?}f", value as f32),
+    };
     let make_src = || {
         format!(
             r#"
 #include <metal_stdlib>
 using namespace metal;
-kernel void et_fill(device {ty}* out [[buffer(0)]], constant float& v [[buffer(1)]], uint2 gid2 [[thread_position_in_grid]]) {{
+kernel void et_fill(device {ty}* out [[buffer(0)]], uint2 gid2 [[thread_position_in_grid]]) {{
     const ulong i = ulong(gid2.y) * {wide}ul + ulong(gid2.x);
-    if (i < {n}ul) out[i] = ({ty})v;
+    if (i < {n}ul) out[i] = ({ty})({literal});
 }}
 "#
         )
     };
     let pipeline = dev.compile_lazy(
-        key(&[0xF111, out.dtype as u64, n as u64]),
+        key(&[0xF111, out.dtype as u64, n as u64, value.to_bits()]),
         "et_fill",
         make_src,
     )?;
-    let v = value as f32;
     let padded = n.div_ceil(256) * 256;
     dev.with_encoder(|e| {
         e.setComputePipelineState(pipeline.as_raw());
@@ -59,7 +69,6 @@ kernel void et_fill(device {ty}* out [[buffer(0)]], constant float& v [[buffer(1
             &out.buffer,
             out.layout.offset() * out.dtype.size_in_bytes(),
         );
-        set_bytes(e, 1, &v);
         {
             let (g, tg) = MetalDevice::grid_flat(padded);
             e.dispatchThreads_threadsPerThreadgroup(g, tg);
@@ -346,6 +355,15 @@ pub fn arange(
         return Ok(out);
     }
     let ty = msl_type(dtype);
+    // Integer arange computes in 64-bit integer arithmetic: the float
+    // form rounds positions above 2^24 (token ids and position grids can
+    // exceed that). Integral starts/steps are exact; fractional ones
+    // truncate toward zero, matching the final integer cast.
+    let element = match dtype {
+        DType::I64 => format!("(long)i * {}ll + {}ll", step as i64, start as i64),
+        DType::U32 => format!("(uint)((ulong)i * {}ul + {}ul)", step as u32, start as u32),
+        _ => format!("(float)i * {:?}f + {:?}f", step, start),
+    };
     let make_src = || {
         format!(
             r#"
@@ -353,10 +371,9 @@ pub fn arange(
 using namespace metal;
 kernel void et_arange(device {ty}* out [[buffer(0)]], uint2 gid2 [[thread_position_in_grid]]) {{
     const ulong i = ulong(gid2.y) * {wide}ul + ulong(gid2.x);
-    if (i < {n}ul) out[i] = ({ty})((float)i * {:?}f + {:?}f);
+    if (i < {n}ul) out[i] = ({ty})({element});
 }}
 "#,
-            step, start
         )
     };
     let pipeline = dev.compile_lazy(
@@ -624,5 +641,26 @@ mod tests {
         let e = eye(dev, 2, DType::F32).unwrap();
         dev.synchronize().unwrap();
         assert_eq!(e.read_f32().unwrap(), vec![1., 0., 0., 1.]);
+    }
+
+    // Integer scalars must not round-trip through f32: values above
+    // 2^24 have no exact f32 form (a checkpointed u32 sampler length
+    // regressed this way).
+    #[test]
+    fn fill_and_arange_are_exact_for_large_integers() {
+        let dev = MetalDevice::get();
+        let out = MetalTensor::empty(dev, vec![2], DType::U32);
+        fill(dev, &out, 744_841_714.0).unwrap();
+        let a = arange(dev, 16_777_214.0, 16_777_220.0, 1.0, DType::I64).unwrap();
+        dev.synchronize().unwrap();
+        let raw = &out.buffer;
+        let words = unsafe { std::slice::from_raw_parts(raw.contents_ptr().cast::<u32>(), 2) };
+        assert_eq!(words, &[744_841_714, 744_841_714]);
+        let a_raw = &a.buffer;
+        let longs = unsafe { std::slice::from_raw_parts(a_raw.contents_ptr().cast::<i64>(), 6) };
+        assert_eq!(
+            longs,
+            &[16_777_214, 16_777_215, 16_777_216, 16_777_217, 16_777_218, 16_777_219]
+        );
     }
 }
