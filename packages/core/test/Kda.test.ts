@@ -1,7 +1,7 @@
 import { describe, expect } from "@effect/vitest"
 import * as assert from "@effect/vitest/utils"
 import { Effect } from "effect"
-import { Gradient, Model, Tensor } from "../src/index.ts"
+import { Gradient, LearningRate, Loss, Model, Optimizer, Tensor, Trainer } from "../src/index.ts"
 import { floats, GRADCHECK_EPS, GRADCHECK_TOL, onDevices } from "./utils/devices.ts"
 
 const values = (t: Tensor.Any) => Tensor.toNumberArray(t)
@@ -76,7 +76,7 @@ const inputs = (t: number, dk: number, dv: number, seed: number) =>
     return { beta, k, logDecay, q, v }
   })
 
-onDevices("Kda", () => (it) => {
+onDevices("Kda", (device) => (it) => {
   describe("kdaChunk", () => {
     const parity = (name: string, t: number, dk: number, dv: number, seed: number) =>
       it.effect(name, () =>
@@ -219,6 +219,41 @@ onDevices("Kda", () => (it) => {
             `param ${model.names[i]} has a degenerate gradient`
           )
         }
+      }))
+
+    it.effect("trains in mixedBf16 on metal, typed error elsewhere", () =>
+      Effect.gen(function*() {
+        const model = yield* Model.kimiDeltaAttention("kda", 32, 4)
+        const raw = yield* Tensor.fromTypedArray(
+          floats(Array.from({ length: 2 * 8 * 32 }, (_, i) => ((i * 5 + 1) % 11 - 5) / 5)),
+          [2, 8, 32]
+        )
+        const data = {
+          input: yield* Tensor.cast(raw, "bf16"),
+          target: yield* Tensor.cast(raw, "bf16")
+        }
+        const makeTrainer = Effect.gen(function*() {
+          return yield* Trainer.make(model, {
+            optimizer: yield* Optimizer.adamW(),
+            lr: LearningRate.constant(1e-3),
+            loss: Loss.mse,
+            data,
+            stop: ({ step }) => step >= 4,
+            precision: "mixedBf16"
+          })
+        })
+        if (device !== "metal") {
+          const error = yield* Effect.flip(Effect.flatMap(makeTrainer, (trainer) => trainer.train()))
+          expect(error._tag).toBe("ModelError")
+          return
+        }
+        const trainer = yield* makeTrainer
+        const { params, step } = yield* trainer.train()
+        expect(step).toBe(4)
+        expect(params.every((p) => p.dtype === "f32")).toBe(true)
+        const forwardParams = yield* Effect.all(params.map((param) => Tensor.cast(param, "bf16")))
+        const [out] = yield* Tensor.compute([yield* model.forward(forwardParams, data.input)])
+        ;(yield* values(out)).forEach((x) => assert.assertTrue(Number.isFinite(x)))
       }))
   })
 

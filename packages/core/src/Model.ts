@@ -816,9 +816,11 @@ export const kimiDeltaAttention = (
           const qh = yield* l2Norm(yield* splitHeads(yield* shortConv(q, convqWeight), headDim))
           const kh = yield* l2Norm(yield* splitHeads(yield* shortConv(k, convkWeight), headDim))
           const vh = yield* splitHeads(yield* shortConv(v, convvWeight), headDim)
+          // Zero biases follow the compute dtype (mixedBf16 runs bf16).
+          const zeroBias = (n: number) => Tensor.zeros([1, n], { dtype: input.dtype })
           // Per-channel log decay: -exp(aLog) * softplus(fb(fa(x)) + dtBias).
-          const gateHidden = yield* Tensor.linear(input, faWeight, yield* Tensor.zeros([1, headDim]))
-          const gateFlat = yield* Tensor.linear(gateHidden, fbWeight, yield* Tensor.zeros([1, embedDim]))
+          const gateHidden = yield* Tensor.linear(input, faWeight, yield* zeroBias(headDim))
+          const gateFlat = yield* Tensor.linear(gateHidden, fbWeight, yield* zeroBias(embedDim))
           const gate = yield* splitHeads(gateFlat, headDim)
           const dt = yield* Tensor.reshape(dtBias, [numHeads, 1, headDim])
           const soft = yield* Tensor.softplus(yield* Tensor.add(gate, dt))
@@ -826,15 +828,15 @@ export const kimiDeltaAttention = (
           const logDecay = yield* Tensor.neg(yield* Tensor.mul(aExp, soft))
           // Per-head beta gate in [0, 1].
           const betaFlat = yield* Tensor.sigmoid(
-            yield* Tensor.linear(input, bWeight, yield* Tensor.zeros([1, numHeads]))
+            yield* Tensor.linear(input, bWeight, yield* zeroBias(numHeads))
           )
           const beta = yield* splitHeads(betaFlat, 1)
           const attended = yield* Tensor.kdaChunk(qh, kh, vh, logDecay, beta)
           // Sigmoid-gated per-head RMS normalization.
-          const gateOutHidden = yield* Tensor.linear(input, gaWeight, yield* Tensor.zeros([1, headDim]))
+          const gateOutHidden = yield* Tensor.linear(input, gaWeight, yield* zeroBias(headDim))
           const gateOut = yield* splitHeads(
             yield* Tensor.sigmoid(
-              yield* Tensor.linear(gateOutHidden, gbWeight, yield* Tensor.zeros([1, embedDim]))
+              yield* Tensor.linear(gateOutHidden, gbWeight, yield* zeroBias(embedDim))
             ),
             headDim
           )
