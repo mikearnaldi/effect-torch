@@ -1061,7 +1061,7 @@ mod tests {
         };
         let (dq, dk_, dv_, dld, db) = kda_chunk_backward(&q, &k, &v, &ld, &beta, &w, scale);
         let eps = 1e-6;
-        let mut fd = |input: &Tensor, analytic: &Tensor, which: usize, name: &str| {
+        let fd = |input: &Tensor, analytic: &Tensor, which: usize, name: &str| {
             let base = f64_data(input);
             let got = f64_data(analytic);
             let shape = input.shape().to_vec();
