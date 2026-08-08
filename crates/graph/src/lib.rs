@@ -259,6 +259,71 @@ fn kda_check<E: FusionExpression>(
     Ok(out)
 }
 
+// Validates a chunked head CE operand set: x [.., K], weight [K, V],
+// bias [1, V] or [V], target [..] integer. Returns the vocab.
+fn head_ce_check<E: FusionExpression>(
+    op: &str,
+    x: &Node<E>,
+    weight: &Node<E>,
+    bias: &Node<E>,
+    target: &Node<E>,
+) -> Result<usize, String> {
+    let rank = x.shape.len();
+    if rank < 2 || weight.shape.len() != 2 {
+        return Err(format!(
+            "{op}: x must be [.., K] with rank >= 2 and weight [K, V], got {:?} and {:?}",
+            x.shape, weight.shape
+        ));
+    }
+    let (k, v) = (weight.shape[0], weight.shape[1]);
+    if x.shape[rank - 1] != k {
+        return Err(format!(
+            "{op}: x's last dim {} does not match the weight's input dim {k}",
+            x.shape[rank - 1]
+        ));
+    }
+    if bias.shape.len() > 2
+        || (bias.shape.len() >= 1 && bias.shape[bias.shape.len() - 1] != v)
+        || bias.shape.iter().product::<usize>() != v
+    {
+        return Err(format!(
+            "{op}: bias must hold {v} values, got {:?}",
+            bias.shape
+        ));
+    }
+    if target.shape != x.shape[..rank - 1] {
+        return Err(format!(
+            "{op}: target shape {:?} does not match x's leading shape {:?}",
+            target.shape,
+            &x.shape[..rank - 1]
+        ));
+    }
+    if !matches!(target.dtype, DType::I64 | DType::U32) {
+        return Err(format!(
+            "{op}: targets must be i64 or u32, got {:?}",
+            target.dtype
+        ));
+    }
+    if !matches!(x.dtype, DType::F32 | DType::F64 | DType::BF16) {
+        return Err(format!(
+            "{op}: x must be f32, f64 or bf16, got {:?}",
+            x.dtype
+        ));
+    }
+    if weight.dtype != x.dtype || bias.dtype != x.dtype {
+        return Err(format!(
+            "{op}: weight and bias must share x's dtype, got {:?}, {:?} and {:?}",
+            x.dtype, weight.dtype, bias.dtype
+        ));
+    }
+    for node in [weight, bias, target] {
+        if !node.device.same_device(&x.device) {
+            return Err(format!("{op}: all operands must be on the same device"));
+        }
+    }
+    Ok(v)
+}
+
 // Validates a short_conv1d pair: x [.., T, C], weight [C, K].
 fn short_conv_check<E: FusionExpression>(
     op: &str,
@@ -690,6 +755,39 @@ pub enum NodeKind<E: FusionExpression> {
         x: Arc<Node<E>>,
         weight: Arc<Node<E>>,
         layer: u32,
+    },
+    // RFC 0016 phase 2 (as-built revision): the chunked head +
+    // cross-entropy as one semantic node. Forward semantics are exactly
+    // Mean cross-entropy of Linear(x, weight, bias) against target, but
+    // evaluation processes one row-chunk at a time so the [rows, vocab]
+    // logits never materialize whole. Semantic so the adjoint can run
+    // the same chunk loop with a single transient grad-logits workspace
+    // — the graph-rewrite version (per-chunk CE nodes) kept every
+    // chunk's backward workspace alive until the head-parameter roots
+    // evaluated, which consumer-count release cannot fix.
+    ChunkedHeadCe {
+        x: Arc<Node<E>>,
+        weight: Arc<Node<E>>,
+        bias: Arc<Node<E>>,
+        target: Arc<Node<E>>,
+        ignore_index: i64,
+    },
+    // Closed-form adjoint: one eval loops the chunks, recomputing each
+    // chunk's logits and grad-logits in a transient workspace and
+    // accumulating (dx, dw, db); consumers read them through
+    // ChunkedHeadCeBackwardOut. g is the scalar cotangent of the loss.
+    // Not differentiable (no second-order).
+    ChunkedHeadCeBackward {
+        x: Arc<Node<E>>,
+        weight: Arc<Node<E>>,
+        bias: Arc<Node<E>>,
+        target: Arc<Node<E>>,
+        g: Arc<Node<E>>,
+        ignore_index: i64,
+    },
+    ChunkedHeadCeBackwardOut {
+        of: Arc<Node<E>>,
+        index: u8,
     },
     // ShortConv1d adjoints (RFC 0018 phase 4): dx is the full
     // correlation of the cotangent with the (unflipped) weight, dw the
@@ -1487,6 +1585,55 @@ impl<E: FusionExpression> NodeKind<E> {
             NodeKind::ConvState { x, weight, .. } => {
                 short_conv_check("conv_state", x, weight)?;
                 (x.shape.clone(), x.dtype, x.device.clone())
+            }
+            NodeKind::ChunkedHeadCe {
+                x,
+                weight,
+                bias,
+                target,
+                ..
+            } => {
+                head_ce_check("chunked_head_ce", x, weight, bias, target)?;
+                (Vec::new(), x.dtype, x.device.clone())
+            }
+            NodeKind::ChunkedHeadCeBackward {
+                x,
+                weight,
+                bias,
+                target,
+                g,
+                ..
+            } => {
+                head_ce_check("chunked_head_ce_backward", x, weight, bias, target)?;
+                if !g.shape.is_empty() && g.shape.iter().product::<usize>() != 1 {
+                    return Err(format!(
+                        "chunked head ce backward: grad must be a scalar, got {:?}",
+                        g.shape
+                    ));
+                }
+                (x.shape.clone(), x.dtype, x.device.clone())
+            }
+            NodeKind::ChunkedHeadCeBackwardOut { of, index } => {
+                let NodeKind::ChunkedHeadCeBackward {
+                    x, weight, bias, ..
+                } = &of.kind
+                else {
+                    return Err(
+                        "chunked head ce backward out: source must be a chunked head ce backward node"
+                            .to_string(),
+                    );
+                };
+                let source = match index {
+                    0 => x,
+                    1 => weight,
+                    2 => bias,
+                    i => {
+                        return Err(format!(
+                            "chunked head ce backward out: index must be 0..=2, got {i}"
+                        ))
+                    }
+                };
+                (source.shape.clone(), source.dtype, source.device.clone())
             }
             NodeKind::KdaBackward {
                 q,
@@ -2306,6 +2453,28 @@ pub fn node_children<E: FusionExpression>(kind: &NodeKind<E>) -> Vec<Arc<Node<E>
         NodeKind::ShortConv1d { x, weight } | NodeKind::ConvState { x, weight, .. } => {
             vec![x.clone(), weight.clone()]
         }
+        NodeKind::ChunkedHeadCe {
+            x,
+            weight,
+            bias,
+            target,
+            ..
+        } => vec![x.clone(), weight.clone(), bias.clone(), target.clone()],
+        NodeKind::ChunkedHeadCeBackward {
+            x,
+            weight,
+            bias,
+            target,
+            g,
+            ..
+        } => vec![
+            x.clone(),
+            weight.clone(),
+            bias.clone(),
+            target.clone(),
+            g.clone(),
+        ],
+        NodeKind::ChunkedHeadCeBackwardOut { of, .. } => vec![of.clone()],
         NodeKind::KdaBackward {
             q,
             k,
@@ -2679,6 +2848,40 @@ pub fn remap_children<E: FusionExpression>(
             weight: f(weight),
             layer: *layer,
         },
+        NodeKind::ChunkedHeadCe {
+            x,
+            weight,
+            bias,
+            target,
+            ignore_index,
+        } => NodeKind::ChunkedHeadCe {
+            x: f(x),
+            weight: f(weight),
+            bias: f(bias),
+            target: f(target),
+            ignore_index: *ignore_index,
+        },
+        NodeKind::ChunkedHeadCeBackward {
+            x,
+            weight,
+            bias,
+            target,
+            g,
+            ignore_index,
+        } => NodeKind::ChunkedHeadCeBackward {
+            x: f(x),
+            weight: f(weight),
+            bias: f(bias),
+            target: f(target),
+            g: f(g),
+            ignore_index: *ignore_index,
+        },
+        NodeKind::ChunkedHeadCeBackwardOut { of, index } => {
+            NodeKind::ChunkedHeadCeBackwardOut {
+                of: f(of),
+                index: *index,
+            }
+        }
         NodeKind::KdaBackward {
             q,
             k,

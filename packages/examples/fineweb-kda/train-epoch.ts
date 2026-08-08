@@ -41,7 +41,7 @@ const PEAK_LR = 3e-4
 const MIN_LR = 3e-5
 const WARMUP_FRACTION = 0.005
 const CHECKPOINT_EVERY = 100
-const PRECISION: Trainer.Precision = (process.env.FINEWEB_PRECISION as Trainer.Precision) ?? "f32"
+const PRECISION: Trainer.Precision = (process.env.FINEWEB_PRECISION as Trainer.Precision) ?? "mixedBf16"
 const VAL_BATCHES = 40
 
 const formatEta = (ms: number) => {

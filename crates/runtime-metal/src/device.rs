@@ -528,7 +528,9 @@ impl MetalDevice {
         let raw = self
             .raw
             .newBufferWithLength_options(size.max(1), SHARED_OPTIONS)
-            .expect("metal buffer allocation failed");
+            .unwrap_or_else(|| {
+                panic!("metal buffer allocation failed: {size} bytes")
+            });
         Arc::new(Buffer {
             raw,
             size: size.max(1),

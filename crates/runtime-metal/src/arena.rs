@@ -169,57 +169,81 @@ pub fn capture_end(live: &HashSet<usize>) -> CaptureResult {
 // ---------------------------------------------------------------------------
 
 pub enum PlanEntry {
-    /// Suballocate at this byte offset in the arena.
-    Arena { offset: usize, size: usize },
-    /// Allocate from the pool (the buffer escapes the walk).
+    /// Suballocate at this byte offset in the arena buffer at this index.
+    Arena {
+        buffer: u32,
+        offset: usize,
+        size: usize,
+    },
+    /// Allocate from the pool (the buffer escapes the walk, or is larger
+    /// than the per-buffer arena cap).
     Pool { size: usize },
 }
 
 pub struct Plan {
     pub entries: Vec<PlanEntry>,
-    /// Bytes of arena this plan needs.
+    /// Flat bytes of arena space this plan needs (spanning buffers).
     pub total: usize,
-    /// The backing buffer. Program runs are serialized by the eval
-    /// guard, so plans share one buffer (grown to the largest plan);
-    /// the static holds only a Weak reference, so the arena is released
-    /// when the last program using it is dropped.
-    pub arena: Arc<Buffer>,
+    /// The backing buffers, each up to the arena cap. Program runs are
+    /// serialized by the eval guard, so plans share buffers (grown to
+    /// the largest plan); the static holds only Weak references, so the
+    /// arena is released when the last program using it is dropped.
+    pub arena: Vec<Arc<Buffer>>,
 }
 
-/// The shared arena's Weak handle, grown (never shrunk) as plans demand.
-static SHARED_ARENA: std::sync::Mutex<Option<std::sync::Weak<Buffer>>> =
-    std::sync::Mutex::new(None);
+/// The shared arena buffers' Weak handles, grown (never shrunk) as plans
+/// demand more slots.
+static SHARED_ARENA: std::sync::Mutex<Vec<std::sync::Weak<Buffer>>> =
+    std::sync::Mutex::new(Vec::new());
 
 pub fn shared_arena_size() -> usize {
     SHARED_ARENA
         .lock()
         .unwrap()
-        .as_ref()
-        .and_then(|w| w.upgrade())
-        .map(|a| a.size)
-        .unwrap_or(0)
+        .iter()
+        .map(|w| w.upgrade().map(|a| a.size).unwrap_or(0))
+        .sum()
 }
 
-/// Returns an arena of at least `total` bytes, sharing the live one
-/// when it is big enough and replacing the Weak handle otherwise.
-fn shared_arena(total: usize, make_arena: &dyn Fn(usize) -> Arc<Buffer>) -> Arc<Buffer> {
+/// Returns one arena buffer per slot the plan needs, sharing live ones
+/// and growing the slot list otherwise.
+fn shared_arenas(slots: usize, make_arena: &dyn Fn(usize) -> Arc<Buffer>) -> Vec<Arc<Buffer>> {
     let mut guard = SHARED_ARENA.lock().unwrap();
-    let existing = guard.as_ref().and_then(|w| w.upgrade());
-    match existing {
-        Some(arena) if arena.size >= total => arena,
-        _ => {
-            let arena = make_arena(total);
-            *guard = Some(Arc::downgrade(&arena));
+    let cap = arena_cap();
+    (0..slots)
+        .map(|i| {
+            if let Some(arena) = guard.get(i).and_then(|w| w.upgrade()) {
+                return arena;
+            }
+            let arena = make_arena(cap);
+            guard.push(Arc::downgrade(&arena));
             arena
-        }
-    }
+        })
+        .collect()
+}
+
+/// Per-buffer arena capacity: the plan is spread across arena buffers of
+/// at most this many bytes, because the driver refuses single buffers
+/// above a device-dependent size long before physical memory runs out
+/// (a 30+ GiB plan on a 48 GiB machine fails as one buffer but fits
+/// comfortably as eight 4 GiB ones). Oversize allocations go to the
+/// pool.
+fn arena_cap() -> usize {
+    std::env::var("EFFECT_TORCH_ARENA_CAP_MB")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(4096)
+        * 1024
+        * 1024
 }
 
 /// Packs captured intervals with a best-fit free-list allocator over a
-/// flat address space. Deterministic: intervals are placed in event
-/// order, best fit breaks ties by lowest offset. Returns the placement
-/// per allocation and the total arena size.
+/// flat address space, then splits the flat space into cap-sized arena
+/// buffers (no placement straddles a buffer boundary). Deterministic:
+/// intervals are placed in event order, best fit breaks ties by lowest
+/// offset. Returns the placement per allocation and the flat total.
 pub fn plan_layout(captured: &CaptureResult) -> (Vec<PlanEntry>, usize) {
+    let cap = arena_cap();
     // Releases sorted by death time, processed as births advance.
     let mut releases: Vec<(usize, (usize, usize))> = Vec::new();
     let mut free: Vec<(usize, usize)> = Vec::new();
@@ -232,6 +256,10 @@ pub fn plan_layout(captured: &CaptureResult) -> (Vec<PlanEntry>, usize) {
             continue;
         };
         let aligned = align(*size).max(ALIGN);
+        if aligned > cap {
+            entries.push(PlanEntry::Pool { size: *size });
+            continue;
+        }
         releases.sort_by_key(|(d, _)| *d);
         let mut r = 0;
         while r < releases.len() && releases[r].0 <= birth {
@@ -241,6 +269,21 @@ pub fn plan_layout(captured: &CaptureResult) -> (Vec<PlanEntry>, usize) {
         releases.drain(..r);
         free.sort_by_key(|(offset, _)| *offset);
         coalesce(&mut free);
+        // Split free regions at buffer boundaries so no placement
+        // straddles two arena buffers.
+        let mut split: Vec<(usize, usize)> = Vec::with_capacity(free.len() + 1);
+        for (offset, region) in free.drain(..) {
+            let mut cur = offset;
+            let mut left = region;
+            while left > 0 {
+                let room = cap - (cur % cap);
+                let take = room.min(left);
+                split.push((cur, take));
+                cur += take;
+                left -= take;
+            }
+        }
+        free = split;
         // Best fit: smallest free region that holds the allocation.
         let mut best: Option<usize> = None;
         for (k, (_, rsize)) in free.iter().enumerate() {
@@ -257,6 +300,11 @@ pub fn plan_layout(captured: &CaptureResult) -> (Vec<PlanEntry>, usize) {
                 roffset
             }
             None => {
+                // Never straddle a buffer boundary when extending.
+                let room = cap - (top % cap);
+                if aligned > room {
+                    top += room;
+                }
                 let offset = top;
                 top += aligned;
                 offset
@@ -264,7 +312,8 @@ pub fn plan_layout(captured: &CaptureResult) -> (Vec<PlanEntry>, usize) {
         };
         releases.push((death.max(birth + 1), (offset, aligned)));
         entries.push(PlanEntry::Arena {
-            offset,
+            buffer: (offset / cap) as u32,
+            offset: offset % cap,
             size: *size,
         });
     }
@@ -273,7 +322,124 @@ pub fn plan_layout(captured: &CaptureResult) -> (Vec<PlanEntry>, usize) {
 
 pub fn plan(captured: &CaptureResult, make_arena: &dyn Fn(usize) -> Arc<Buffer>) -> Plan {
     let (entries, total) = plan_layout(captured);
-    let arena = shared_arena(total, make_arena);
+    if std::env::var_os("EFFECT_TORCH_ARENA_DEBUG").is_some() {
+        let mut sizes: Vec<usize> = captured.sizes.clone();
+        sizes.sort_unstable_by(|a, b| b.cmp(a));
+        eprintln!(
+            "arena plan: total {} bytes ({} allocs), top sizes {:?}",
+            total,
+            sizes.len(),
+            &sizes[..sizes.len().min(8)]
+        );
+        // Lifetime histogram of the biggest buffers: (size, birth, death, kind).
+        let mut big: Vec<(usize, usize, usize, &str)> = captured
+            .sizes
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| **s > 32 << 20)
+            .map(|(i, s)| {
+                let (b, d) = captured.intervals[i].unwrap_or((usize::MAX, usize::MAX));
+                (i, *s, b, d)
+            })
+            .map(|(i, s, b, d)| {
+                (s, b, d, captured.kinds[i].unwrap_or("?"))
+            })
+            .collect();
+        big.sort_by_key(|(s, _, _, _)| usize::MAX - *s);
+        let clocks = captured
+            .intervals
+            .iter()
+            .filter_map(|i| *i)
+            .map(|(_, d)| d)
+            .max()
+            .unwrap_or(0);
+        eprintln!("arena plan: big-buffer lifetimes (size, birth, death, kind), walk end clock {clocks}:");
+        for (s, b, d, kind) in big.iter().take(12) {
+            eprintln!("  {:>10} {:>7} {:>7} {}", s, b, d, kind);
+        }
+        let mut by_kind: std::collections::HashMap<&str, (usize, usize)> =
+            std::collections::HashMap::new();
+        for (i, s) in captured.sizes.iter().enumerate() {
+            if *s <= 32 << 20 {
+                continue;
+            }
+            let e = by_kind.entry(captured.kinds[i].unwrap_or("?")).or_default();
+            e.0 += 1;
+            e.1 += s;
+        }
+        let mut kinds: Vec<_> = by_kind.into_iter().collect();
+        kinds.sort_by_key(|(_, (_, bytes))| usize::MAX - bytes);
+        for (kind, (count, bytes)) in kinds.iter().take(10) {
+            eprintln!("  kind {kind}: {count} buffers, {} MiB total", bytes >> 20);
+        }
+        // True concurrency sweep: where does the live set peak, and
+        // which kinds are live there?
+        let mut events: Vec<(usize, i128, usize)> = Vec::new();
+        for (i, s) in captured.sizes.iter().enumerate() {
+            if let Some((b, d)) = captured.intervals[i] {
+                events.push((b, *s as i128, i));
+                events.push((d, -(*s as i128), i));
+            }
+        }
+        events.sort_by_key(|(c, delta, _)| (*c, *delta));
+        let mut live = 0i128;
+        let mut peak = 0i128;
+        let mut peak_clock = 0usize;
+        for (clock, delta, _) in &events {
+            live += delta;
+            if live > peak {
+                peak = live;
+                peak_clock = *clock;
+            }
+        }
+        eprintln!(
+            "arena plan: true concurrency peak {} MiB at clock {}",
+            peak >> 20,
+            peak_clock
+        );
+        let mut live_kinds: std::collections::HashMap<&str, (usize, usize)> =
+            std::collections::HashMap::new();
+        for (i, s) in captured.sizes.iter().enumerate() {
+            if let Some((b, d)) = captured.intervals[i] {
+                if b <= peak_clock && peak_clock < d {
+                    let e = live_kinds.entry(captured.kinds[i].unwrap_or("?")).or_default();
+                    e.0 += 1;
+                    e.1 += s;
+                }
+            }
+        }
+        let mut lk: Vec<_> = live_kinds.into_iter().collect();
+        lk.sort_by_key(|(_, (_, bytes))| usize::MAX - bytes);
+        for (kind, (count, bytes)) in lk.iter().take(8) {
+            eprintln!("  live@peak {kind}: {count} buffers, {} MiB", bytes >> 20);
+        }
+        // Birth/death spread of the dominant live-at-peak kind.
+        if let Some((kind, _)) = lk.first() {
+            let mut spans: Vec<(usize, usize, usize)> = captured
+                .sizes
+                .iter()
+                .enumerate()
+                .filter(|(i, s)| {
+                    **s > 32 << 20
+                        && captured.kinds[*i].unwrap_or("?") == *kind
+                        && captured.intervals[*i].is_some_and(|(b, d)| {
+                            b <= peak_clock && peak_clock < d
+                        })
+                })
+                .map(|(i, s)| {
+                    let (b, d) = captured.intervals[i].unwrap_or((usize::MAX, usize::MAX));
+                    (*s, b, d)
+                })
+                .collect();
+            spans.sort_by_key(|(_, b, _)| *b);
+            eprintln!("  {kind} LIVE-AT-PEAK spans (size, birth, death):");
+            for (s, b, d) in spans.iter().take(16) {
+                eprintln!("    {:>10} {:>7} {:>7}", s, b, d);
+            }
+        }
+    }
+    let slots = total.div_ceil(arena_cap()).max(1);
+    let arena = shared_arenas(slots, make_arena);
     Plan {
         entries,
         total,
@@ -430,8 +596,8 @@ pub fn replay_alloc(size: usize) -> Option<Arc<Buffer>> {
         }
         match entry {
             PlanEntry::Pool { .. } => None,
-            PlanEntry::Arena { offset, .. } => Some(Arc::new(Buffer::suballoc(
-                &replay.plan.arena,
+            PlanEntry::Arena { buffer, offset, .. } => Some(Arc::new(Buffer::suballoc(
+                &replay.plan.arena[*buffer as usize],
                 *offset,
                 size,
             ))),
@@ -519,5 +685,35 @@ mod tests {
         let (entries, total) = plan_layout(&captured);
         assert_eq!(offsets(&entries)[2], Some(0));
         assert_eq!(total, 512);
+    }
+
+    #[test]
+    fn plans_span_buffers_without_straddling() {
+        // 1 MiB cap (env override is read per call): three 600 KiB
+        // overlapping intervals pack two per buffer max, never across a
+        // boundary.
+        unsafe { std::env::set_var("EFFECT_TORCH_ARENA_CAP_MB", "1") };
+        let captured = cr(
+            vec![600 << 10; 4],
+            vec![Some((1, 5)), Some((2, 5)), Some((3, 5)), Some((4, 5))],
+        );
+        let (entries, _) = plan_layout(&captured);
+        unsafe { std::env::remove_var("EFFECT_TORCH_ARENA_CAP_MB") };
+        let placements: Vec<(u32, usize)> = entries
+            .iter()
+            .map(|e| match e {
+                PlanEntry::Arena { buffer, offset, .. } => (*buffer, *offset),
+                PlanEntry::Pool { .. } => panic!("unexpected pool entry"),
+            })
+            .collect();
+        let cap = 1 << 20;
+        for (_buffer, offset) in &placements {
+            assert!(offset + (600 << 10) <= cap, "straddles a boundary");
+        }
+        // Four 600 KiB intervals at a 1 MiB cap: one per buffer.
+        assert_eq!(
+            placements.iter().map(|(b, _)| *b).collect::<Vec<_>>(),
+            vec![0, 1, 2, 3]
+        );
     }
 }

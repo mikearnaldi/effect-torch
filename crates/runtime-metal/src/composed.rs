@@ -462,6 +462,170 @@ pub fn rotary_forward(
     cat(&out_first, &out_second, r - 1)
 }
 
+// --- Chunked head cross-entropy (RFC 0016 phase 2, semantic form) ---
+
+fn head_ce_chunk_len(rows: usize, vocab: usize, chunk_size: usize) -> usize {
+    let elements = rows.saturating_mul(vocab);
+    let chunks = (elements / chunk_size).clamp(2, 64).min(rows);
+    rows.div_ceil(chunks.max(1))
+}
+
+// Active count and label checks from one host readback: targets are
+// integers far below 2^24, so the f32 readback is exact, and this runs
+// once per eval (the emitter rejects u8 comparisons).
+fn head_ce_check_target(
+    t1: &MetalTensor,
+    ignore_index: i64,
+    vocab: usize,
+) -> crate::err::Res<f64> {
+    let host = super::ops::to_f32(t1)?.read_f32()?;
+    let mut active = 0usize;
+    for &value in &host {
+        let t = value as i64;
+        if t == ignore_index {
+            continue;
+        }
+        if t < 0 || t as usize >= vocab {
+            return Err(format!(
+                "cross_entropy: target out of range [0, {vocab}) at an active position"
+            ));
+        }
+        active += 1;
+    }
+    Ok(active as f64)
+}
+
+// Mean cross-entropy of Linear(x, weight, bias) against target,
+// evaluated one row-chunk at a time so the [rows, vocab] logits never
+// materialize whole. `checkpoint` is invoked at each iteration's end
+// with the buffer pointers still live (arena capture marks everything
+// else dead at that point — without it, intra-eval temporaries are all
+// planned as live-until-walk-end).
+pub fn chunked_head_ce_forward(
+    x: &MetalTensor,
+    weight: &MetalTensor,
+    bias: &MetalTensor,
+    target: &MetalTensor,
+    ignore_index: i64,
+    chunk_size: usize,
+    checkpoint: &mut dyn FnMut(&[usize]),
+) -> crate::err::Res<MetalTensor> {
+    let dims = x.layout.shape().to_vec();
+    let r = dims.len();
+    let (inner, vocab) = (weight.layout.shape()[0], weight.layout.shape()[1]);
+    let rows: usize = dims[..r - 1].iter().product();
+    let x2 = super::ops::contiguous(&MetalTensor {
+        buffer: x.buffer.clone(),
+        layout: Layout::contiguous(vec![rows, inner]),
+        dtype: x.dtype,
+    })?;
+    let t1 = super::ops::contiguous(&MetalTensor {
+        buffer: target.buffer.clone(),
+        layout: Layout::contiguous(vec![rows]),
+        dtype: target.dtype,
+    })?;
+    // Match Mean semantics exactly: zero-active error before label
+    // checks, in the plain path's order.
+    let count = head_ce_check_target(&t1, ignore_index, vocab)?;
+    if count == 0.0 {
+        return Err("cross_entropy: no active targets (all positions are ignored)".to_string());
+    }
+    let chunk_len = head_ce_chunk_len(rows, vocab, chunk_size);
+    let mut total = fill(&[1], 0.0, DType::F32)?;
+    let mut off = 0;
+    while off < rows {
+        let end = (off + chunk_len).min(rows);
+        let x_c = narrow(&x2, 0, off, end - off)?;
+        let t_c = narrow(&t1, 0, off, end - off)?;
+        let logits = binary(&matmul(&x_c, weight)?, bias, BinOp::Add)?;
+        let (nll, _status) = crate::loss::ce_forward(&logits, &t_c, ignore_index, crate::CeReduction::Sum)?;
+        total = binary(&total, &super::ops::to_f32(&nll)?, BinOp::Add)?;
+        checkpoint(&[std::sync::Arc::as_ptr(&total.buffer) as usize]);
+        off = end;
+    }
+    let mean = binary(&total, &fill(&[1], count, DType::F32)?, BinOp::Div)?;
+    if mean.dtype == x.dtype {
+        Ok(mean)
+    } else {
+        super::ops::from_f32(&mean, x.dtype)
+    }
+}
+
+// Closed-form adjoint: recomputes each chunk's logits and grad-logits
+// in a transient workspace and accumulates (dx, dw, db); grad-logits
+// never outlive their chunk.
+pub fn chunked_head_ce_backward(
+    x: &MetalTensor,
+    weight: &MetalTensor,
+    bias: &MetalTensor,
+    target: &MetalTensor,
+    g: &MetalTensor,
+    ignore_index: i64,
+    chunk_size: usize,
+    checkpoint: &mut dyn FnMut(&[usize]),
+) -> crate::err::Res<(MetalTensor, MetalTensor, MetalTensor)> {
+    let dims = x.layout.shape().to_vec();
+    let r = dims.len();
+    let (inner, vocab) = (weight.layout.shape()[0], weight.layout.shape()[1]);
+    let rows: usize = dims[..r - 1].iter().product();
+    let x2 = super::ops::contiguous(&MetalTensor {
+        buffer: x.buffer.clone(),
+        layout: Layout::contiguous(vec![rows, inner]),
+        dtype: x.dtype,
+    })?;
+    let t1 = super::ops::contiguous(&MetalTensor {
+        buffer: target.buffer.clone(),
+        layout: Layout::contiguous(vec![rows]),
+        dtype: target.dtype,
+    })?;
+    let count = head_ce_check_target(&t1, ignore_index, vocab)?;
+    let scale = fill(&[1], scalar_f64(g)? / count, DType::F32)?;
+    let chunk_len = head_ce_chunk_len(rows, vocab, chunk_size);
+    let w32t = transpose_last2(&super::ops::to_f32(weight)?)?;
+    let mut dx_chunks: Vec<MetalTensor> = Vec::new();
+    let mut dw = fill(&[inner, vocab], 0.0, DType::F32)?;
+    let mut db = fill(&[1, vocab], 0.0, DType::F32)?;
+    let mut off = 0;
+    while off < rows {
+        let end = (off + chunk_len).min(rows);
+        let x_c = narrow(&x2, 0, off, end - off)?;
+        let t_c = narrow(&t1, 0, off, end - off)?;
+        let logits = binary(&matmul(&x_c, weight)?, bias, BinOp::Add)?;
+        let (gb, _count) = crate::loss::ce_backward(&logits, &t_c, ignore_index, crate::CeReduction::Sum)?;
+        let gb32 = binary(&super::ops::to_f32(&gb)?, &scale, BinOp::Mul)?;
+        dx_chunks.push(matmul(&gb32, &w32t)?);
+        dw = binary(
+            &dw,
+            &matmul(&transpose_last2(&super::ops::to_f32(&x_c)?)?, &gb32)?,
+            BinOp::Add,
+        )?;
+        db = binary(&db, &reduce(&gb32, &[0], true, ReduceOp::Sum)?, BinOp::Add)?;
+        let mut live: Vec<usize> = vec![
+            std::sync::Arc::as_ptr(&dw.buffer) as usize,
+            std::sync::Arc::as_ptr(&db.buffer) as usize,
+        ];
+        live.extend(dx_chunks.iter().map(|t| std::sync::Arc::as_ptr(&t.buffer) as usize));
+        checkpoint(&live);
+        off = end;
+    }
+    let dx = super::ops::from_f32(
+        &super::ops::contiguous(&MetalTensor {
+            buffer: cat_tree(dx_chunks, 0, checkpoint)?.buffer.clone(),
+            layout: Layout::contiguous(dims),
+            dtype: DType::F32,
+        })?,
+        x.dtype,
+    )?;
+    let dw = super::ops::from_f32(&dw, weight.dtype)?;
+    let db_flat = super::ops::from_f32(&db, bias.dtype)?;
+    let db = super::ops::contiguous(&MetalTensor {
+        buffer: db_flat.buffer.clone(),
+        layout: Layout::contiguous(bias.layout.shape().to_vec()),
+        dtype: db_flat.dtype,
+    })?;
+    Ok((dx, dw, db))
+}
+
 // --- Kimi Delta Attention (RFC 0018) ---
 
 fn unsqueeze(t: &MetalTensor, dim: usize) -> crate::err::Res<MetalTensor> {
@@ -536,6 +700,38 @@ fn cat_all(ts: &[MetalTensor], dim: usize) -> crate::err::Res<MetalTensor> {
         acc = cat(&acc, t, dim)?;
     }
     Ok(acc)
+}
+
+// Balanced pairwise concat: a left-deep fold holds every partial result
+// until the fold completes (64 chunks ≈ 8 GiB live at once); the tree
+// keeps one fold level live at a time, and the checkpoint hook records
+// the dead level per round so the arena plans the tight bound.
+fn cat_tree(
+    ts: Vec<MetalTensor>,
+    dim: usize,
+    checkpoint: &mut dyn FnMut(&[usize]),
+) -> crate::err::Res<MetalTensor> {
+    let mut level = ts;
+    while level.len() > 1 {
+        let mut next: Vec<MetalTensor> = Vec::with_capacity(level.len().div_ceil(2));
+        for pair in level.chunks(2) {
+            next.push(if pair.len() == 2 {
+                cat(&pair[0], &pair[1], dim)?
+            } else {
+                pair[0].clone()
+            });
+        }
+        let live: Vec<usize> = next
+            .iter()
+            .map(|t| std::sync::Arc::as_ptr(&t.buffer) as usize)
+            .collect();
+        checkpoint(&live);
+        level = next;
+    }
+    level
+        .into_iter()
+        .next()
+        .ok_or_else(|| "cat_tree: empty".to_string())
 }
 
 // Chunked gated delta-rule linear attention, reference implementation

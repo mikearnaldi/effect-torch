@@ -414,7 +414,7 @@ fn chunked_head_ce_with(
     let NodeKind::Linear { x, weight, bias } = &logits.kind else {
         return Ok(plain);
     };
-    let (inner, vocabulary) = (weight.shape[0], weight.shape[1]);
+    let (_inner, vocabulary) = (weight.shape[0], weight.shape[1]);
     let rank = x.shape.len();
     if rank < 2 {
         return Ok(plain);
@@ -430,95 +430,18 @@ fn chunked_head_ce_with(
     if chunks < 2 {
         return Ok(plain);
     }
-    let x = if rank == 2 {
-        x.clone()
-    } else {
-        Node::new(NodeKind::Reshape {
-            a: x.clone(),
-            shape: vec![rows, inner],
-        })?
-    };
-    let target = if target.shape.as_slice() == [rows] {
-        target.clone()
-    } else {
-        Node::new(NodeKind::Reshape {
-            a: target.clone(),
-            shape: vec![rows],
-        })?
-    };
-    let ignored_count =
-        if target.dtype == DType::U32 && (ignore_index < 0 || ignore_index > u32::MAX as i64) {
-            cached_constant(0.0, DType::F32)?
-        } else {
-            let ignore = cached_constant(ignore_index as f64, target.dtype)?;
-            let ignored = Node::new(NodeKind::Eq {
-                a: target.clone(),
-                b: ignore,
-            })?;
-            let ignored = Node::new(NodeKind::Cast {
-                a: ignored,
-                dtype: DType::F32,
-            })?;
-            Node::new(NodeKind::Sum {
-                a: ignored,
-                dims: vec![0],
-                keepdims: false,
-            })?
-        };
-    let active = Node::new(NodeKind::Sub {
-        a: cached_constant(rows as f64, DType::F32)?,
-        b: ignored_count,
-    })?;
-    let chunk_length = rows.div_ceil(chunks);
-    let mut total = None;
-    let mut offset = 0;
-    while offset < rows {
-        let end = (offset + chunk_length).min(rows);
-        let x_chunk = Node::new(NodeKind::Slice {
-            a: x.clone(),
-            ranges: vec![(offset, end, 1), (0, inner, 1)],
-        })?;
-        let target_chunk = Node::new(NodeKind::Slice {
-            a: target.clone(),
-            ranges: vec![(offset, end, 1)],
-        })?;
-        let logits_chunk = Node::new(NodeKind::Linear {
-            x: x_chunk,
-            weight: weight.clone(),
-            bias: bias.clone(),
-        })?;
-        let loss = Node::new(NodeKind::CrossEntropy {
-            logits: logits_chunk,
-            target: target_chunk,
-            ignore_index,
-            reduction: CeReduction::Sum,
-        })?;
-        let loss = Node::new(NodeKind::Checkpoint { a: loss })?;
-        let loss = Node::new(NodeKind::Cast {
-            a: loss,
-            dtype: DType::F32,
-        })?;
-        total = Some(match total {
-            None => loss,
-            Some(previous) => Node::new(NodeKind::Add {
-                a: previous,
-                b: loss,
-            })?,
-        });
-        offset = end;
-    }
-    let mean = Node::new(NodeKind::Div {
-        a: total.expect("at least one chunk"),
-        b: active,
-    })?;
-    if mean.dtype == logits.dtype {
-        Ok(mean)
-    } else {
-        Node::new(NodeKind::Cast {
-            a: mean,
-            dtype: logits.dtype,
-        })
-    }
+    // The semantic node: evaluation runs the chunk loop natively, so the
+    // [rows, vocab] logits never materialize whole, and the closed-form
+    // backward holds one chunk of grad-logits workspace at a time (the
+    // graph-chain version retained every chunk's workspace until the
+    // head-parameter roots ran).
+    Node::new(NodeKind::ChunkedHeadCe {
+        x: x.clone(),
+        weight: weight.clone(),
+        bias: bias.clone(),
+        target: target.clone(),
+        ignore_index,
+    })
 }
 
 fn gelu(tensor: &Tensor, approximate: bool) -> Tensor {
@@ -1686,6 +1609,52 @@ fn eval_uncached(node: &Arc<Node>, evaluator: &mut Evaluator) -> err::Res<Value>
             *ignore_index,
             *reduction,
         )?),
+        NodeKind::ChunkedHeadCe {
+            x,
+            weight,
+            bias,
+            target,
+            ignore_index,
+        } => {
+            let (_, chunk_size) = chunked_ce_limits();
+            Value(composed::chunked_head_ce_forward(
+                evaluator.value(x.id)?.tensor(),
+                evaluator.value(weight.id)?.tensor(),
+                evaluator.value(bias.id)?.tensor(),
+                evaluator.value(target.id)?.tensor(),
+                *ignore_index,
+                chunk_size,
+            )?)
+        }
+        NodeKind::ChunkedHeadCeBackward {
+            x,
+            weight,
+            bias,
+            target,
+            g,
+            ignore_index,
+        } => {
+            let (_, chunk_size) = chunked_ce_limits();
+            let (dx, dw, db) = composed::chunked_head_ce_backward(
+                evaluator.value(x.id)?.tensor(),
+                evaluator.value(weight.id)?.tensor(),
+                evaluator.value(bias.id)?.tensor(),
+                evaluator.value(target.id)?.tensor(),
+                evaluator.value(g.id)?.tensor(),
+                *ignore_index,
+                chunk_size,
+            )?;
+            let values = vec![Value(dx), Value(dw), Value(db)];
+            let head = values[0].clone();
+            evaluator.multi.insert(node.id, values);
+            head
+        }
+        NodeKind::ChunkedHeadCeBackwardOut { of, index } => evaluator
+            .multi
+            .get(&of.id)
+            .and_then(|values| values.get(*index as usize))
+            .cloned()
+            .ok_or_else(|| "chunked head ce backward out: outputs missing".to_string())?,
         NodeKind::Sdpa {
             q,
             k,
@@ -2628,6 +2597,10 @@ fn node_kind_name(kind: &NodeKind) -> &'static str {
         | NodeKind::Min { .. }
         | NodeKind::Prod { .. } => "Reduce",
         NodeKind::CrossEntropy { .. } | NodeKind::CrossEntropyBackward { .. } => "CE",
+        NodeKind::ChunkedHeadCe { .. } => "HeadCE",
+        NodeKind::ChunkedHeadCeBackward { .. } | NodeKind::ChunkedHeadCeBackwardOut { .. } => {
+            "HeadCEBwd"
+        }
         NodeKind::AdamWStep { .. } | NodeKind::AdamWOut { .. } => "AdamW",
         NodeKind::AdamWStepGroup { .. } => "AdamWGroup",
         NodeKind::AdamWGroupOut { .. } => "AdamWGroupOut",

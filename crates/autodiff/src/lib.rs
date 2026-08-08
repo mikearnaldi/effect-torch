@@ -404,8 +404,13 @@ fn vmap_rebuild(
         | NodeKind::KdaBackward { .. }
         | NodeKind::KdaBackwardOut { .. }
         | NodeKind::ShortConv1dBackwardX { .. }
-        | NodeKind::ShortConv1dBackwardW { .. } => {
+        | NodeKind::ShortConv1dBackwardW { .. }
+        | NodeKind::ChunkedHeadCeBackward { .. }
+        | NodeKind::ChunkedHeadCeBackwardOut { .. } => {
             Err("vmap: stateful decode and backward nodes are internal".to_string())
+        }
+        NodeKind::ChunkedHeadCe { .. } => {
+            Err("vmap: chunked head ce nodes are not supported under vmap".to_string())
         }
         NodeKind::ShortConv1d { .. } => {
             Err("vmap: short conv nodes are not supported under vmap".to_string())
@@ -1109,6 +1114,38 @@ fn backward(
                     reduction: *reduction,
                 })?;
                 accumulate(logits, mul(g, gb))?;
+            }
+            NodeKind::ChunkedHeadCe {
+                x,
+                weight,
+                bias,
+                target,
+                ignore_index,
+            } => {
+                // Closed-form chunked adjoint: one backward node, one
+                // picker per differentiable input (the SdpaBackward
+                // pattern).
+                let bw = mk(NodeKind::ChunkedHeadCeBackward {
+                    x: x.clone(),
+                    weight: weight.clone(),
+                    bias: bias.clone(),
+                    target: target.clone(),
+                    g: g.clone(),
+                    ignore_index: *ignore_index,
+                })?;
+                for (input, index) in [(x, 0u8), (weight, 1u8), (bias, 2u8)] {
+                    let out = mk(NodeKind::ChunkedHeadCeBackwardOut {
+                        of: bw.clone(),
+                        index,
+                    })?;
+                    accumulate(input, Ok(out))?;
+                }
+            }
+            NodeKind::ChunkedHeadCeBackward { .. } | NodeKind::ChunkedHeadCeBackwardOut { .. } => {
+                return Err(
+                    "grad: chunked head ce backward nodes are not differentiable (no second-order)"
+                        .to_string(),
+                );
             }
             NodeKind::CrossEntropyBackward { .. } => {
                 return Err(

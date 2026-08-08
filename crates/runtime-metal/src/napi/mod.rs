@@ -500,7 +500,7 @@ fn chunked_head_ce_with(
     let NodeKind::Linear { x, weight, bias } = &logits.kind else {
         return Ok(plain);
     };
-    let (k_dim, vocab) = (weight.shape[0], weight.shape[1]);
+    let (_k_dim, vocab) = (weight.shape[0], weight.shape[1]);
     let rank = x.shape.len();
     if rank < 2 {
         return Ok(plain);
@@ -519,101 +519,18 @@ fn chunked_head_ce_with(
     if chunks < 2 {
         return Ok(plain);
     }
-    let device = logits.device.clone();
-    let x2 = if rank == 2 {
-        x.clone()
-    } else {
-        Node::new(NodeKind::Reshape {
-            a: x.clone(),
-            shape: vec![rows, k_dim],
-        })?
-    };
-    let t1 = if target.shape.as_slice() == [rows] {
-        target.clone()
-    } else {
-        Node::new(NodeKind::Reshape {
-            a: target.clone(),
-            shape: vec![rows],
-        })?
-    };
-    // Exact active count in f32: rows - #{t == ignore_index}. Counts are
-    // integers far below 2^24, so f32 is exact. A u32 target can never
-    // hold a negative (or huge) ignore_index, matching ce_ignored_mask.
-    let ignored_count =
-        if target.dtype == DType::U32 && (ignore_index < 0 || ignore_index > u32::MAX as i64) {
-            cached_constant(0.0, DType::F32, device.clone())?
-        } else {
-            let ignore = cached_constant(ignore_index as f64, target.dtype, device.clone())?;
-            let ignored = Node::new(NodeKind::Eq {
-                a: t1.clone(),
-                b: ignore,
-            })?;
-            let ignored = Node::new(NodeKind::Cast {
-                a: ignored,
-                dtype: DType::F32,
-            })?;
-            Node::new(NodeKind::Sum {
-                a: ignored,
-                dims: vec![0],
-                keepdims: false,
-            })?
-        };
-    let rows_f32 = cached_constant(rows as f64, DType::F32, device)?;
-    let active = Node::new(NodeKind::Sub {
-        a: rows_f32,
-        b: ignored_count,
-    })?;
-    let chunk_len = rows.div_ceil(chunks);
-    let mut total: Option<Arc<Node>> = None;
-    let mut off = 0;
-    while off < rows {
-        let end = (off + chunk_len).min(rows);
-        let xk = Node::new(NodeKind::Slice {
-            a: x2.clone(),
-            ranges: vec![(off, end, 1), (0, k_dim, 1)],
-        })?;
-        let tk = Node::new(NodeKind::Slice {
-            a: t1.clone(),
-            ranges: vec![(off, end, 1)],
-        })?;
-        let lk = Node::new(NodeKind::Linear {
-            x: xk,
-            weight: weight.clone(),
-            bias: bias.clone(),
-        })?;
-        let cek = Node::new(NodeKind::CrossEntropy {
-            logits: lk,
-            target: tk,
-            ignore_index,
-            reduction: CeReduction::Sum,
-        })?;
-        // The checkpoint makes backward recompute this chunk's logits
-        // (one extra head gemm per chunk) instead of retaining every
-        // chunk's logits from forward to backward.
-        let ck = Node::new(NodeKind::Checkpoint { a: cek })?;
-        let ck32 = Node::new(NodeKind::Cast {
-            a: ck,
-            dtype: DType::F32,
-        })?;
-        total = Some(match total {
-            None => ck32,
-            Some(t) => Node::new(NodeKind::Add { a: t, b: ck32 })?,
-        });
-        off = end;
-    }
-    let total = total.expect("at least one chunk");
-    let mean = Node::new(NodeKind::Div {
-        a: total,
-        b: active,
-    })?;
-    if mean.dtype == logits.dtype {
-        Ok(mean)
-    } else {
-        Node::new(NodeKind::Cast {
-            a: mean,
-            dtype: logits.dtype,
-        })
-    }
+    // The semantic node: evaluation runs the chunk loop natively, so the
+    // [rows, vocab] logits never materialize whole, and the closed-form
+    // backward holds one chunk of grad-logits workspace at a time (the
+    // graph-chain version retained every chunk's workspace until the
+    // head-parameter roots ran).
+    Node::new(NodeKind::ChunkedHeadCe {
+        x: x.clone(),
+        weight: weight.clone(),
+        bias: bias.clone(),
+        target: target.clone(),
+        ignore_index,
+    })
 }
 
 #[napi]
@@ -2335,7 +2252,103 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> err::Res<value::Value>
                 _ => return Err("device mismatch".to_string()),
             }
         }
-        NodeKind::Sdpa {
+        NodeKind::ChunkedHeadCe {
+            x,
+            weight,
+            bias,
+            target,
+            ignore_index,
+        } => {
+            let x = ev.value(x.id)?;
+            let weight = ev.value(weight.id)?;
+            let bias = ev.value(bias.id)?;
+            let target = ev.value(target.id)?;
+            match (&x, &weight, &bias, &target) {
+
+                (value::Value(x), value::Value(w), value::Value(b), value::Value(t)) => {
+                    let (_, chunk_size) = chunked_ce_limits();
+                    let mut checkpoint = |live: &[usize]| {
+                        if runtime::metal::arena::capture_active() {
+                            let mut keys = ev.live_buffer_keys();
+                            keys.extend(live.iter().copied());
+                            runtime::metal::arena::capture_checkpoint(&keys);
+                        }
+                    };
+                    value::Value(composed::chunked_head_ce_forward(
+                        x,
+                        w,
+                        b,
+                        t,
+                        *ignore_index,
+                        chunk_size,
+                        &mut checkpoint,
+                    )?)
+                }
+                _ => return Err("device mismatch".to_string()),
+            }
+        }
+        NodeKind::ChunkedHeadCeBackward {
+            x,
+            weight,
+            bias,
+            target,
+            g,
+            ignore_index,
+        } => {
+            let x = ev.value(x.id)?;
+            let weight = ev.value(weight.id)?;
+            let bias = ev.value(bias.id)?;
+            let target = ev.value(target.id)?;
+            let g = ev.value(g.id)?;
+            match (&x, &weight, &bias, &target, &g) {
+
+                (
+                    value::Value(x),
+                    value::Value(w),
+                    value::Value(b),
+                    value::Value(t),
+                    value::Value(g),
+                ) => {
+                    let (_, chunk_size) = chunked_ce_limits();
+                    let (dx, dw, db) = {
+                        let mut checkpoint = |live: &[usize]| {
+                            if runtime::metal::arena::capture_active() {
+                                let mut keys = ev.live_buffer_keys();
+                                keys.extend(live.iter().copied());
+                                runtime::metal::arena::capture_checkpoint(&keys);
+                            }
+                        };
+                        composed::chunked_head_ce_backward(
+                            x,
+                            w,
+                            b,
+                            t,
+                            g,
+                            *ignore_index,
+                            chunk_size,
+                            &mut checkpoint,
+                        )?
+                    };
+                    let values = vec![
+                        value::Value(dx),
+                        value::Value(dw),
+                        value::Value(db),
+                    ];
+                    let head = values[0].clone();
+                    ev.multi.insert(node.id, values);
+                    head
+                }
+                _ => return Err("device mismatch".to_string()),
+            }
+        }
+        NodeKind::ChunkedHeadCeBackwardOut { of, index } => ev
+            .multi
+            .get(&of.id)
+            .and_then(|outs| outs.get(*index as usize))
+            .cloned()
+            .ok_or_else(|| {
+                err::err_str("chunked head ce backward out: outputs missing".to_string())
+            })?,        NodeKind::Sdpa {
             q,
             k,
             v,
@@ -3976,6 +3989,10 @@ fn node_kind_name(kind: &NodeKind) -> &'static str {
         | NodeKind::Min { .. }
         | NodeKind::Prod { .. } => "Reduce",
         NodeKind::CrossEntropy { .. } | NodeKind::CrossEntropyBackward { .. } => "CE",
+        NodeKind::ChunkedHeadCe { .. } => "HeadCE",
+        NodeKind::ChunkedHeadCeBackward { .. } | NodeKind::ChunkedHeadCeBackwardOut { .. } => {
+            "HeadCEBwd"
+        }
         NodeKind::AdamWStep { .. } | NodeKind::AdamWOut { .. } => "AdamW",
         NodeKind::AdamWStepGroup { .. } => "AdamWGroup",
         NodeKind::AdamWGroupOut { .. } => "AdamWGroupOut",

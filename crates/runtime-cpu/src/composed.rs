@@ -409,6 +409,110 @@ pub fn rotary_forward(
     Ok(Tensor::cat(&[&out_first, &out_second], r - 1).contiguous())
 }
 
+// --- Chunked head cross-entropy (RFC 0016 phase 2, semantic form) ---
+
+fn head_ce_chunk_len(rows: usize, vocab: usize, chunk_size: usize) -> usize {
+    let elements = rows.saturating_mul(vocab);
+    let chunks = (elements / chunk_size).clamp(2, 64).min(rows);
+    rows.div_ceil(chunks.max(1))
+}
+
+// Mean cross-entropy of Linear(x, weight, bias) against target,
+// evaluated one row-chunk at a time so the [rows, vocab] logits never
+// materialize whole.
+pub fn chunked_head_ce_forward(
+    x: &Tensor,
+    weight: &Tensor,
+    bias: &Tensor,
+    target: &Tensor,
+    ignore_index: i64,
+    chunk_size: usize,
+) -> Result<Tensor, String> {
+    let dims = x.shape().to_vec();
+    let r = rank(x);
+    let (inner, vocab) = (weight.shape()[0], weight.shape()[1]);
+    let rows: usize = dims[..r - 1].iter().product();
+    let x2 = x.contiguous().view(Layout::contiguous(vec![rows, inner]));
+    let t1 = target.contiguous().view(Layout::contiguous(vec![rows]));
+    // Match Mean semantics exactly: zero-active error before label
+    // checks, in the plain path's order.
+    let ignored = ce_ignored_mask(&t1, ignore_index);
+    let count = ce_active_count(&ignored, rows);
+    if count == 0.0 {
+        return Err("cross_entropy: no active targets (all positions are ignored)".to_string());
+    }
+    ce_check_labels(&t1, &ignored, vocab)?;
+    let chunk_len = head_ce_chunk_len(rows, vocab, chunk_size);
+    let mut total = Tensor::zeros(&[], DType::F32);
+    let mut off = 0;
+    while off < rows {
+        let end = (off + chunk_len).min(rows);
+        let x_c = narrow(&x2, 0, off, end - off);
+        let t_c = narrow(&t1, 0, off, end - off);
+        let logits = x_c.matmul(weight).add(bias);
+        let nll = cross_entropy_forward(&logits, &t_c, ignore_index, CrossEntropyReduction::Sum)?;
+        total = total.add(&nll.cast(DType::F32));
+        off = end;
+    }
+    let mean = total.div(&Tensor::full(&[], count, DType::F32));
+    Ok(if mean.dtype() == x.dtype() {
+        mean
+    } else {
+        mean.cast(x.dtype())
+    })
+}
+
+// Closed-form adjoint: recomputes each chunk's logits and grad-logits
+// in a transient workspace and accumulates (dx, dw, db); grad-logits
+// never outlive their chunk.
+pub fn chunked_head_ce_backward(
+    x: &Tensor,
+    weight: &Tensor,
+    bias: &Tensor,
+    target: &Tensor,
+    g: &Tensor,
+    ignore_index: i64,
+    chunk_size: usize,
+) -> Result<(Tensor, Tensor, Tensor), String> {
+    let dims = x.shape().to_vec();
+    let r = rank(x);
+    let (inner, vocab) = (weight.shape()[0], weight.shape()[1]);
+    let rows: usize = dims[..r - 1].iter().product();
+    let x2 = x.contiguous().view(Layout::contiguous(vec![rows, inner]));
+    let t1 = target.contiguous().view(Layout::contiguous(vec![rows]));
+    let ignored = ce_ignored_mask(&t1, ignore_index);
+    let count = ce_active_count(&ignored, rows);
+    let scale = Tensor::full(&[], scalar(&g.cast(DType::F64)) / count, DType::F32);
+    let chunk_len = head_ce_chunk_len(rows, vocab, chunk_size);
+    let w32t = transpose_last2(&weight.cast(DType::F32));
+    let mut dx_chunks: Vec<Tensor> = Vec::new();
+    let mut dw = Tensor::zeros(&[inner, vocab], DType::F32);
+    let mut db = Tensor::zeros(&[vocab], DType::F32);
+    let mut off = 0;
+    while off < rows {
+        let end = (off + chunk_len).min(rows);
+        let x_c = narrow(&x2, 0, off, end - off);
+        let t_c = narrow(&t1, 0, off, end - off);
+        let logits = x_c.matmul(weight).add(bias);
+        let gb = cross_entropy_backward(&logits, &t_c, ignore_index, CrossEntropyReduction::Sum)?;
+        let gb32 = gb.cast(DType::F32).mul(&scale);
+        dx_chunks.push(gb32.matmul(&w32t));
+        dw = dw.add(&transpose_last2(&x_c.cast(DType::F32)).matmul(&gb32));
+        db = db.add(&gb32.sum(&[0]));
+        off = end;
+    }
+    let dx = Tensor::cat(&dx_chunks.iter().collect::<Vec<_>>(), 0)
+        .contiguous()
+        .view(Layout::contiguous(dims))
+        .cast(x.dtype());
+    let dw = dw.cast(weight.dtype());
+    let db = db
+        .cast(bias.dtype())
+        .contiguous()
+        .view(Layout::contiguous(bias.shape().to_vec()));
+    Ok((dx, dw, db))
+}
+
 // --- Kimi Delta Attention (RFC 0018) ---
 
 fn unsqueeze(t: &Tensor, dim: usize) -> Tensor {
