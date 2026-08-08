@@ -48,7 +48,7 @@ pub mod runtime {
 
     pub mod metal {
         pub use crate::{
-            arena, composed, conv, device, emit, flash, gemm, indexing, kernels, layer_norm,
+            arena, composed, conv, device, emit, flash, gemm, indexing, kda, kernels, layer_norm,
             linear, loss, ops, paged, rotary, run,
         };
     }
@@ -78,6 +78,7 @@ pub mod composed;
 pub mod ops;
 
 pub mod flash;
+pub mod kda;
 pub mod layer_norm;
 pub mod linear;
 pub mod loss;

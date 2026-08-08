@@ -26,7 +26,9 @@ use err::to_napi_err;
 
 use runtime::metal::ops as metal_ops;
 
-use runtime::metal::{composed, device, flash, kernels, layer_norm, linear, loss, paged, rotary};
+use runtime::metal::{
+    composed, device, flash, kda, kernels, layer_norm, linear, loss, paged, rotary,
+};
 
 enum FinalizeHint {
     ZeroCopy {
@@ -2479,6 +2481,77 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> err::Res<value::Value>
                 _ => return Err("device mismatch".to_string()),
             }
         }
+        NodeKind::KdaBackward {
+            q,
+            k,
+            v,
+            log_decay,
+            beta,
+            g,
+            scale,
+        } => {
+            let q = ev.value(q.id)?;
+            let k = ev.value(k.id)?;
+            let v = ev.value(v.id)?;
+            let log_decay = ev.value(log_decay.id)?;
+            let beta = ev.value(beta.id)?;
+            let g = ev.value(g.id)?;
+            match (&q, &k, &v, &log_decay, &beta, &g) {
+
+                (
+                    value::Value(q),
+                    value::Value(k),
+                    value::Value(v),
+                    value::Value(ld),
+                    value::Value(b),
+                    value::Value(g),
+                ) => {
+                    let (dq, dk, dv, dg, db) =
+                        composed::kda_chunk_backward(q, k, v, ld, b, g, *scale)?;
+                    let values = vec![
+                        value::Value(dq),
+                        value::Value(dk),
+                        value::Value(dv),
+                        value::Value(dg),
+                        value::Value(db),
+                    ];
+                    let head = values[0].clone();
+                    ev.multi.insert(node.id, values);
+                    head
+                }
+                _ => return Err("device mismatch".to_string()),
+            }
+        }
+        NodeKind::KdaBackwardOut { of, index } => ev
+            .multi
+            .get(&of.id)
+            .and_then(|outs| outs.get(*index as usize))
+            .cloned()
+            .ok_or_else(|| err::err_str("kda backward out: outputs missing".to_string()))?,
+        NodeKind::ShortConv1dBackwardX { x, weight, g } => {
+            let x = ev.value(x.id)?;
+            let weight = ev.value(weight.id)?;
+            let g = ev.value(g.id)?;
+            match (&x, &weight, &g) {
+
+                (value::Value(x), value::Value(w), value::Value(g)) => {
+                    value::Value(composed::short_conv1d_backward_x(x, w, g)?)
+                }
+                _ => return Err("device mismatch".to_string()),
+            }
+        }
+        NodeKind::ShortConv1dBackwardW { x, weight, g } => {
+            let x = ev.value(x.id)?;
+            let weight = ev.value(weight.id)?;
+            let g = ev.value(g.id)?;
+            match (&x, &weight, &g) {
+
+                (value::Value(x), value::Value(w), value::Value(g)) => {
+                    value::Value(composed::short_conv1d_backward_w(x, w, g)?)
+                }
+                _ => return Err("device mismatch".to_string()),
+            }
+        }
         NodeKind::ConvState { x, weight, layer } => {
             let context = ev.kv.clone().ok_or_else(|| {
                 err::err_str(
@@ -3790,7 +3863,11 @@ fn node_kind_name(kind: &NodeKind) -> &'static str {
         NodeKind::KvAttention { .. } => "KvAttention",
         NodeKind::KdaChunk { .. } => "KdaChunk",
         NodeKind::KdaRecurrence { .. } => "KdaRecurrence",
+        NodeKind::KdaBackward { .. } | NodeKind::KdaBackwardOut { .. } => "KdaBwd",
         NodeKind::ShortConv1d { .. } => "ShortConv",
+        NodeKind::ShortConv1dBackwardX { .. } | NodeKind::ShortConv1dBackwardW { .. } => {
+            "ShortConvBwd"
+        }
         NodeKind::ConvState { .. } => "ConvState",
         NodeKind::Sum { .. }
         | NodeKind::Mean { .. }
@@ -4202,6 +4279,42 @@ fn kda_recurrence(
         } else {
             (gs, bs)
         };
+        // The T=1 decode step runs the fused register-resident
+        // recurrence (RFC 0018 phase 3); chunked prefill keeps the
+        // composed reference path.
+        let in_dtype = q.as_metal()?.dtype;
+        if t == 1
+            && state.advance == 1
+            && std::env::var_os("EFFECT_TORCH_NO_KDA_FUSED").is_none()
+            && kda::is_supported(in_dtype, geometry.head_dim, geometry.value_dim)
+        {
+            let flat =
+                |x: &runtime::metal::run::MetalTensor, w: usize| runtime::metal::run::MetalTensor {
+                    buffer: x.buffer.clone(),
+                    layout: runtime::layout::Layout::contiguous(vec![geometry.heads, w]),
+                    dtype: x.dtype,
+                };
+            let out = kda::decode(
+                &flat(&qs, geometry.head_dim),
+                &flat(&ks, geometry.head_dim),
+                &flat(&vs, geometry.value_dim),
+                &flat(&gs, geometry.head_dim),
+                &flat(&bs, 1),
+                &state.kda_states[layer as usize],
+                scale,
+            )?;
+            outs.push(metal_ops::contiguous(&runtime::metal::run::MetalTensor {
+                buffer: out.buffer.clone(),
+                layout: runtime::layout::Layout::contiguous(vec![
+                    1,
+                    geometry.heads,
+                    1,
+                    geometry.value_dim,
+                ]),
+                dtype: out.dtype,
+            })?);
+            continue;
+        }
         let (out, final_state) = composed::kda_chunk_with_state(
             &qs,
             &ks,

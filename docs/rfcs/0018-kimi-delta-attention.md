@@ -1,8 +1,9 @@
 # RFC 0018: Kimi Delta Attention — Chunked Linear Attention, Recurrent Decode State, and No-RoPE Hybrid Stacks
 
-- **Status**: Phase 1–2 implemented (composed forward + stateful decode
-  on both backends, hybrid generation green); Phase 3 (fused Metal
-  kernels) and Phase 4 (closed-form backward) pending measurement.
+- **Status**: Implemented — forward, closed-form backward, recurrent
+  decode kernel, hybrid generation, and training all gated. Remaining
+  follow-up: fused chunked forward/backward Metal kernels (see the
+  Phase 3 measurement below).
 - **Created**: 2026-08-08
 - **Depends on**: RFC 0007 (fusion), RFC 0008 (compilation), RFC 0010
   (inference), RFC 0012 (dtypes), RFC 0013 (batched decode), RFC 0015
@@ -25,9 +26,27 @@ gates:
   right-pads, so pad rows are masked to identity updates (β=0, log
   decay 0) and conv windows shift in only real rows — the KV path's
   pad-overwrite trick does not transfer to running state.
-- **Decode eval is the composed chunked path for v1** (per-slot, any T)
-  on both backends; the fused register-resident Metal decode kernel is
-  the Phase 3 performance item and was not needed for correctness.
+- **Phase 4 (backward) landed before the fused forward kernels.** The
+  closed-form adjoint (`KdaBackward` + `KdaBackwardOut`, plus
+  `ShortConv1dBackwardX/W`) runs the reverse-time delta-rule adjoint
+  with per-chunk recompute — chunk-start states retained, per-token
+  states recomputed within the chunk; no O(T) retention. Verified
+  against central finite differences of the forward (< 1e-4 rel, f64,
+  across chunk boundaries) on all five operands, plus TS gradchecks and
+  an end-to-end training smoke.
+- **Phase 3 decode kernel landed; chunked forward/backward kernels
+  deferred on measurement.** The fused register-resident decode kernel
+  (`kda.rs`: state distributed across threadgroup registers, simd_sum
+  contractions, in-place state) matches the composed path to < 1e-4 and
+  measures **49.4 vs 39.5 tok/s (1.25×)** end-to-end on the 30M
+  fineweb-kda model at short context with per-step host sync, replacing
+  ~45 launches per KDA layer per token with 1. The composed chunked
+  prefill/training path measures ~1.7 s/step at batch 32 (30M, block
+  256) vs ~0.7–0.85 s/step for the attention baseline — the fused
+  chunk-pipeline kernels (gate+cumsum, intra+solve, state scan, output;
+  and their adjoints) are the accepted follow-up when training
+  throughput matters; `EFFECT_TORCH_NO_KDA_FUSED` A/Bs the decode
+  kernel.
 - **Pure-KDA stacks** (zero KV layers) work: the KV pool accepts
   `layers = 0` and keeps only block hashing.
 - **Prefix cache is bypassed** for stacks with recurrent layers (the KV
@@ -35,8 +54,10 @@ gates:
 - Gates: chunked forward matches a per-token recurrent oracle on CPU
   and Metal (< 5e-4 rel, cargo; 2e-3 vitest), hybrid and pure-KDA
   greedy generation match full-forward naive generation token-for-token
-  (single and batched), 653/654 vitest (one pre-existing worker-exit
-  flake, reproduced on HEAD), cargo workspace green.
+  (single and batched), backward finite-difference parity, 654/654
+  core vitest, cargo workspace green; the fineweb-kda example trains
+  (loss 11.33 → 8.75 over 12 steps) and generates through the fused
+  decode path.
 
 ## Summary
 

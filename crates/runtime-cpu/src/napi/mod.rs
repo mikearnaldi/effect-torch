@@ -1769,6 +1769,55 @@ fn eval_uncached(node: &Arc<Node>, evaluator: &mut Evaluator) -> err::Res<Value>
             evaluator.value(x.id)?.tensor(),
             evaluator.value(weight.id)?.tensor(),
         )),
+        NodeKind::KdaBackward {
+            q,
+            k,
+            v,
+            log_decay,
+            beta,
+            g,
+            scale,
+        } => {
+            let (dq, dk, dv, dg, db) = composed::kda_chunk_backward(
+                evaluator.value(q.id)?.tensor(),
+                evaluator.value(k.id)?.tensor(),
+                evaluator.value(v.id)?.tensor(),
+                evaluator.value(log_decay.id)?.tensor(),
+                evaluator.value(beta.id)?.tensor(),
+                evaluator.value(g.id)?.tensor(),
+                *scale,
+            );
+            let values = vec![
+                Value(dq),
+                Value(dk),
+                Value(dv),
+                Value(dg),
+                Value(db),
+            ];
+            let head = values[0].clone();
+            evaluator.multi.insert(node.id, values);
+            head
+        }
+        NodeKind::KdaBackwardOut { of, index } => evaluator
+            .multi
+            .get(&of.id)
+            .and_then(|values| values.get(*index as usize))
+            .cloned()
+            .ok_or_else(|| "kda backward out: outputs missing".to_string())?,
+        NodeKind::ShortConv1dBackwardX { x, weight, g } => {
+            Value(composed::short_conv1d_backward_x(
+                evaluator.value(x.id)?.tensor(),
+                evaluator.value(weight.id)?.tensor(),
+                evaluator.value(g.id)?.tensor(),
+            ))
+        }
+        NodeKind::ShortConv1dBackwardW { x, weight, g } => {
+            Value(composed::short_conv1d_backward_w(
+                evaluator.value(x.id)?.tensor(),
+                evaluator.value(weight.id)?.tensor(),
+                evaluator.value(g.id)?.tensor(),
+            ))
+        }
         NodeKind::ConvState { x, weight, layer } => {
             let context = evaluator.kv.clone().ok_or_else(|| {
                 "conv state: node evaluates only inside a decode program run".to_string()
@@ -2567,7 +2616,11 @@ fn node_kind_name(kind: &NodeKind) -> &'static str {
         NodeKind::KvAttention { .. } => "KvAttention",
         NodeKind::KdaChunk { .. } => "KdaChunk",
         NodeKind::KdaRecurrence { .. } => "KdaRecurrence",
+        NodeKind::KdaBackward { .. } | NodeKind::KdaBackwardOut { .. } => "KdaBwd",
         NodeKind::ShortConv1d { .. } => "ShortConv",
+        NodeKind::ShortConv1dBackwardX { .. } | NodeKind::ShortConv1dBackwardW { .. } => {
+            "ShortConvBwd"
+        }
         NodeKind::ConvState { .. } => "ConvState",
         NodeKind::Sum { .. }
         | NodeKind::Mean { .. }

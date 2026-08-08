@@ -399,8 +399,13 @@ fn vmap_rebuild(
         NodeKind::KdaChunk { .. } => {
             Err("vmap: kda chunk nodes are not supported under vmap".to_string())
         }
-        NodeKind::KdaRecurrence { .. } | NodeKind::ConvState { .. } => {
-            Err("vmap: stateful decode nodes are internal to inference".to_string())
+        NodeKind::KdaRecurrence { .. }
+        | NodeKind::ConvState { .. }
+        | NodeKind::KdaBackward { .. }
+        | NodeKind::KdaBackwardOut { .. }
+        | NodeKind::ShortConv1dBackwardX { .. }
+        | NodeKind::ShortConv1dBackwardW { .. } => {
+            Err("vmap: stateful decode and backward nodes are internal".to_string())
         }
         NodeKind::ShortConv1d { .. } => {
             Err("vmap: short conv nodes are not supported under vmap".to_string())
@@ -1262,10 +1267,38 @@ fn backward(
                         .to_string(),
                 );
             }
-            NodeKind::KdaChunk { .. } => {
+            NodeKind::KdaChunk {
+                q,
+                k,
+                v,
+                log_decay,
+                beta,
+                scale,
+            } => {
+                // Closed-form adjoint (RFC 0018 phase 4): one backward
+                // node, one picker per differentiable input — the
+                // SdpaBackward pattern.
+                let bw = mk(NodeKind::KdaBackward {
+                    q: q.clone(),
+                    k: k.clone(),
+                    v: v.clone(),
+                    log_decay: log_decay.clone(),
+                    beta: beta.clone(),
+                    g: g.clone(),
+                    scale: *scale,
+                })?;
+                for (input, index) in [(q, 0u8), (k, 1u8), (v, 2u8), (log_decay, 3u8), (beta, 4u8)]
+                {
+                    let out = mk(NodeKind::KdaBackwardOut {
+                        of: bw.clone(),
+                        index,
+                    })?;
+                    accumulate(input, Ok(out))?;
+                }
+            }
+            NodeKind::KdaBackward { .. } | NodeKind::KdaBackwardOut { .. } => {
                 return Err(
-                    "grad: kda chunk is not yet differentiable (RFC 0018 phase 4 adds the closed-form backward)"
-                        .to_string(),
+                    "grad: kda backward nodes are not differentiable (no second-order)".to_string(),
                 );
             }
             NodeKind::KdaRecurrence { .. } | NodeKind::ConvState { .. } => {
@@ -1274,9 +1307,31 @@ fn backward(
                         .to_string(),
                 );
             }
-            NodeKind::ShortConv1d { .. } => {
+            NodeKind::ShortConv1d { x, weight } => {
+                // dx is the full correlation of the cotangent with the
+                // (unflipped) weight; dw is the per-tap correlation of
+                // cotangent and input over the causal window.
+                accumulate(
+                    x,
+                    mk(NodeKind::ShortConv1dBackwardX {
+                        x: x.clone(),
+                        weight: weight.clone(),
+                        g: g.clone(),
+                    }),
+                )?;
+                accumulate(
+                    weight,
+                    mk(NodeKind::ShortConv1dBackwardW {
+                        x: x.clone(),
+                        weight: weight.clone(),
+                        g: g.clone(),
+                    }),
+                )?;
+            }
+            NodeKind::ShortConv1dBackwardX { .. } | NodeKind::ShortConv1dBackwardW { .. } => {
                 return Err(
-                    "grad: short conv is not yet differentiable (RFC 0018 phase 4)".to_string(),
+                    "grad: short conv backward nodes are not differentiable (no second-order)"
+                        .to_string(),
                 );
             }
             NodeKind::RotaryEmbedding {

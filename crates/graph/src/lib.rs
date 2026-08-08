@@ -650,6 +650,27 @@ pub enum NodeKind<E: FusionExpression> {
         scale: f64,
         layer: u32,
     },
+    // Closed-form KDA backward (RFC 0018 phase 4): produces (dq, dk, dv,
+    // dlog_decay, dbeta) in one eval from the saved operands and the
+    // output cotangent g (same shape as the forward output); consumers
+    // read them through KdaBackwardOut. The eval arms run the adjoint
+    // delta-rule recurrence in reverse with per-chunk recompute (chunk
+    // start states retained, per-token states recomputed within the
+    // chunk) — bounded memory, no O(T) state retention. Not
+    // differentiable (no second-order).
+    KdaBackward {
+        q: Arc<Node<E>>,
+        k: Arc<Node<E>>,
+        v: Arc<Node<E>>,
+        log_decay: Arc<Node<E>>,
+        beta: Arc<Node<E>>,
+        g: Arc<Node<E>>,
+        scale: f64,
+    },
+    KdaBackwardOut {
+        of: Arc<Node<E>>,
+        index: u8,
+    },
     // Causal depthwise short convolution over [.., T, C] with weight
     // [C, K] as one semantic node: y[t, c] = sum_j w[c, j] * x[t-K+1+j, c]
     // with zero history (left zero-padding of K-1). Semantic so the
@@ -669,6 +690,21 @@ pub enum NodeKind<E: FusionExpression> {
         x: Arc<Node<E>>,
         weight: Arc<Node<E>>,
         layer: u32,
+    },
+    // ShortConv1d adjoints (RFC 0018 phase 4): dx is the full
+    // correlation of the cotangent with the (unflipped) weight, dw the
+    // per-tap correlation of cotangent and input over the zero-padded
+    // causal window. x rides along for shape/dtype metadata. Not
+    // differentiable (no second-order).
+    ShortConv1dBackwardX {
+        x: Arc<Node<E>>,
+        weight: Arc<Node<E>>,
+        g: Arc<Node<E>>,
+    },
+    ShortConv1dBackwardW {
+        x: Arc<Node<E>>,
+        weight: Arc<Node<E>>,
+        g: Arc<Node<E>>,
     },
     // RoPE (GPT-NeoX half-split rotary) as one semantic node: x is
     // [.., T, D] with D even; the last dim rotates in half pairs by
@@ -1452,6 +1488,69 @@ impl<E: FusionExpression> NodeKind<E> {
                 short_conv_check("conv_state", x, weight)?;
                 (x.shape.clone(), x.dtype, x.device.clone())
             }
+            NodeKind::KdaBackward {
+                q,
+                k,
+                v,
+                log_decay,
+                beta,
+                g,
+                ..
+            } => {
+                let out = kda_check("kda_backward", q, k, v, log_decay, beta)?;
+                if g.shape != out {
+                    return Err(format!(
+                        "kda backward: grad shape {:?} does not match the kda output shape {out:?}",
+                        g.shape
+                    ));
+                }
+                if g.dtype != q.dtype || !g.device.same_device(&q.device) {
+                    return Err("kda backward: grad must share dtype and device with q".to_string());
+                }
+                (q.shape.clone(), q.dtype, q.device.clone())
+            }
+            NodeKind::KdaBackwardOut { of, index } => {
+                let NodeKind::KdaBackward {
+                    q,
+                    k,
+                    v,
+                    log_decay,
+                    beta,
+                    ..
+                } = &of.kind
+                else {
+                    return Err("kda backward out: source must be a kda backward node".to_string());
+                };
+                let source = match index {
+                    0 => q,
+                    1 => k,
+                    2 => v,
+                    3 => log_decay,
+                    4 => beta,
+                    i => return Err(format!("kda backward out: index must be 0..=4, got {i}")),
+                };
+                (source.shape.clone(), source.dtype, source.device.clone())
+            }
+            NodeKind::ShortConv1dBackwardX { x, weight, g } => {
+                short_conv_check("short_conv1d_backward", x, weight)?;
+                if g.shape != x.shape {
+                    return Err(format!(
+                        "short_conv1d backward: grad shape {:?} does not match the input shape {:?}",
+                        g.shape, x.shape
+                    ));
+                }
+                (x.shape.clone(), x.dtype, x.device.clone())
+            }
+            NodeKind::ShortConv1dBackwardW { x, weight, g } => {
+                short_conv_check("short_conv1d_backward", x, weight)?;
+                if g.shape != x.shape {
+                    return Err(format!(
+                        "short_conv1d backward: grad shape {:?} does not match the input shape {:?}",
+                        g.shape, x.shape
+                    ));
+                }
+                (weight.shape.clone(), weight.dtype, weight.device.clone())
+            }
             NodeKind::RotaryEmbedding { x, seq_len, .. } => {
                 let rank = x.shape.len();
                 if rank < 2 {
@@ -2207,6 +2306,27 @@ pub fn node_children<E: FusionExpression>(kind: &NodeKind<E>) -> Vec<Arc<Node<E>
         NodeKind::ShortConv1d { x, weight } | NodeKind::ConvState { x, weight, .. } => {
             vec![x.clone(), weight.clone()]
         }
+        NodeKind::KdaBackward {
+            q,
+            k,
+            v,
+            log_decay,
+            beta,
+            g,
+            ..
+        } => vec![
+            q.clone(),
+            k.clone(),
+            v.clone(),
+            log_decay.clone(),
+            beta.clone(),
+            g.clone(),
+        ],
+        NodeKind::KdaBackwardOut { of, .. } => vec![of.clone()],
+        NodeKind::ShortConv1dBackwardX { x, weight, g }
+        | NodeKind::ShortConv1dBackwardW { x, weight, g } => {
+            vec![x.clone(), weight.clone(), g.clone()]
+        }
         NodeKind::PositionEmbedding { weight, .. } => vec![weight.clone()],
         NodeKind::RotaryEmbedding { x, .. } => vec![x.clone()],
         NodeKind::RotaryEmbeddingBackward { g, .. } => vec![g.clone()],
@@ -2558,6 +2678,37 @@ pub fn remap_children<E: FusionExpression>(
             x: f(x),
             weight: f(weight),
             layer: *layer,
+        },
+        NodeKind::KdaBackward {
+            q,
+            k,
+            v,
+            log_decay,
+            beta,
+            g,
+            scale,
+        } => NodeKind::KdaBackward {
+            q: f(q),
+            k: f(k),
+            v: f(v),
+            log_decay: f(log_decay),
+            beta: f(beta),
+            g: f(g),
+            scale: *scale,
+        },
+        NodeKind::KdaBackwardOut { of, index } => NodeKind::KdaBackwardOut {
+            of: f(of),
+            index: *index,
+        },
+        NodeKind::ShortConv1dBackwardX { x, weight, g } => NodeKind::ShortConv1dBackwardX {
+            x: f(x),
+            weight: f(weight),
+            g: f(g),
+        },
+        NodeKind::ShortConv1dBackwardW { x, weight, g } => NodeKind::ShortConv1dBackwardW {
+            x: f(x),
+            weight: f(weight),
+            g: f(g),
         },
         NodeKind::RotaryEmbedding {
             x,

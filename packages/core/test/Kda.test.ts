@@ -1,8 +1,8 @@
 import { describe, expect } from "@effect/vitest"
 import * as assert from "@effect/vitest/utils"
 import { Effect } from "effect"
-import { Model, Tensor } from "../src/index.ts"
-import { floats, onDevices } from "./utils/devices.ts"
+import { Gradient, Model, Tensor } from "../src/index.ts"
+import { floats, GRADCHECK_EPS, GRADCHECK_TOL, onDevices } from "./utils/devices.ts"
 
 const values = (t: Tensor.Any) => Tensor.toNumberArray(t)
 
@@ -112,6 +112,53 @@ onDevices("Kda", () => (it) => {
         const result = yield* Tensor.kdaChunk(q, k, v, logDecay, beta).pipe(Effect.flip)
         assert.assertTrue(String(result.message).includes("beta must have shape"))
       }))
+
+    it.effect("numeric gradcheck of all five operands", () =>
+      Effect.gen(function*() {
+        const t = 8
+        const dk = 4
+        const dv = 6
+        const base = yield* inputs(t, dk, dv, 9)
+        const scale = 1 / Math.sqrt(dk)
+        const w = yield* Tensor.fromTypedArray(floats(pattern(1 * 2 * t * dv)), [1, 2, t, dv])
+        const build = (vals: ReadonlyArray<number>, which: number) =>
+          Effect.gen(function*() {
+            const parts: Array<Tensor.Any> = []
+            const shapes = [base.q.shape, base.k.shape, base.v.shape, base.logDecay.shape, base.beta.shape]
+            const current = [base.q, base.k, base.v, base.logDecay, base.beta]
+            for (let j = 0; j < 5; j++) {
+              parts.push(
+                j === which
+                  ? yield* Tensor.fromTypedArray(floats(vals), shapes[j])
+                  : current[j]
+              )
+            }
+            const out = yield* Tensor.kdaChunk(parts[0], parts[1], parts[2], parts[3], parts[4], { scale })
+            return yield* Tensor.sum(yield* Tensor.mul(out, w))
+          })
+        const operands = [base.q, base.k, base.v, base.logDecay, base.beta]
+        const loss = yield* Effect.gen(function*() {
+          const out = yield* Tensor.kdaChunk(base.q, base.k, base.v, base.logDecay, base.beta, { scale })
+          return yield* Tensor.sum(yield* Tensor.mul(out, w))
+        })
+        const analytic = yield* Tensor.compute(yield* Gradient.grad(loss, operands))
+        for (let which = 0; which < 5; which++) {
+          const vals = yield* values(operands[which])
+          const gradVals = yield* values(analytic[which])
+          const probes = [...new Set([0, 3, 7, 13, 19, Math.floor(vals.length / 2), vals.length - 1])]
+            .filter((i) => i < vals.length)
+          for (const i of probes) {
+            const plus = vals.map((x, j) => (j === i ? x + GRADCHECK_EPS : x))
+            const minus = vals.map((x, j) => (j === i ? x - GRADCHECK_EPS : x))
+            const fp = yield* values(yield* build(plus, which))
+            const fm = yield* values(yield* build(minus, which))
+            const numeric = (fp[0] - fm[0]) / (2 * GRADCHECK_EPS)
+            expect(Math.abs(gradVals[i] - numeric)).toBeLessThan(
+              GRADCHECK_TOL * Math.max(1, Math.abs(gradVals[i]))
+            )
+          }
+        }
+      }))
   })
 
   describe("kimiDeltaAttention", () => {
@@ -152,6 +199,27 @@ onDevices("Kda", () => (it) => {
         expect((yield* Effect.flip(Model.kimiDeltaAttention("a", 0, 2))).op).toBe("kimiDeltaAttention")
         expect((yield* Effect.flip(Model.kimiDeltaAttention("a", 7, 2))).message).toContain("divisible")
       }))
+
+    it.effect("gradients flow to every parameter", () =>
+      Effect.gen(function*() {
+        const model = yield* Model.kimiDeltaAttention("kda", 16, 4)
+        const params = yield* Tensor.compute(yield* model.init)
+        const x = yield* Tensor.fromTypedArray(
+          floats(Array.from({ length: 2 * 9 * 16 }, (_, i) => ((i * 5 + 1) % 11 - 5) / 5)),
+          [2, 9, 16]
+        )
+        const out = yield* model.forward(params, x)
+        const loss = yield* Tensor.sum(yield* Tensor.square(out))
+        const grads = yield* Tensor.compute(yield* Gradient.grad(loss, params))
+        assert.strictEqual(grads.length, params.length)
+        for (const [i, g] of grads.entries()) {
+          const gv = yield* values(g)
+          assert.assertTrue(
+            gv.every(Number.isFinite) && gv.some((x) => x !== 0),
+            `param ${model.names[i]} has a degenerate gradient`
+          )
+        }
+      }))
   })
 
   describe("shortConv1d", () => {
@@ -175,6 +243,39 @@ onDevices("Kda", () => (it) => {
         })
         const [a, b] = [yield* values(viaNode), yield* values(yield* manual)]
         a.forEach((x, i) => assert.assertTrue(close(x, b[i]), `out[${i}]: ${x} != ${b[i]}`))
+      }))
+
+    it.effect("numeric gradcheck of input and weight", () =>
+      Effect.gen(function*() {
+        const xVals = Array.from({ length: 2 * 5 * 4 }, (_, i) => ((i * 5 + 1) % 11 - 5) / 5)
+        const wVals = Array.from({ length: 4 * 4 }, (_, i) => ((i * 3 + 2) % 7 - 3) / 3)
+        const gw = yield* Tensor.fromTypedArray(floats(pattern(2 * 5 * 4)), [2, 5, 4])
+        const build = (xv: ReadonlyArray<number>, wv: ReadonlyArray<number>) =>
+          Effect.gen(function*() {
+            const x = yield* Tensor.fromTypedArray(floats(xv), [2, 5, 4])
+            const w = yield* Tensor.fromTypedArray(floats(wv), [4, 4])
+            return yield* Tensor.sum(yield* Tensor.mul(yield* Tensor.shortConv1d(x, w), gw))
+          })
+        const x = yield* Tensor.fromTypedArray(floats(xVals), [2, 5, 4])
+        const w = yield* Tensor.fromTypedArray(floats(wVals), [4, 4])
+        const loss = yield* Tensor.sum(yield* Tensor.mul(yield* Tensor.shortConv1d(x, w), gw))
+        const [dx, dw] = yield* Tensor.compute(yield* Gradient.grad(loss, [x, w]))
+        const analytic = [yield* values(dx), yield* values(dw)]
+        const bases = [xVals, wVals]
+        for (const which of [0, 1]) {
+          for (let i = 0; i < bases[which].length; i++) {
+            const plus = bases[which].map((v, j) => (j === i ? v + GRADCHECK_EPS : v))
+            const minus = bases[which].map((v, j) => (j === i ? v - GRADCHECK_EPS : v))
+            const fp = which === 0 ? yield* values(yield* build(plus, wVals)) : yield* values(yield* build(xVals, plus))
+            const fm = which === 0
+              ? yield* values(yield* build(minus, wVals))
+              : yield* values(yield* build(xVals, minus))
+            const numeric = (fp[0] - fm[0]) / (2 * GRADCHECK_EPS)
+            expect(Math.abs(analytic[which][i] - numeric)).toBeLessThan(
+              GRADCHECK_TOL * Math.max(1, Math.abs(analytic[which][i]))
+            )
+          }
+        }
       }))
   })
 

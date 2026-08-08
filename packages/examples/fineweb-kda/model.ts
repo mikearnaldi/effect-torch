@@ -15,8 +15,7 @@ import { Effect } from "effect"
 //
 // Generation runs through Model.inference, which rewrites the KDA layers
 // into stateful recurrent decode with fixed-size per-sequence state.
-// Training awaits the closed-form KDA backward (RFC 0018 phase 4):
-// KdaChunk is deliberately inference-only until then.
+// Training runs the closed-form KDA backward (RFC 0018 phase 4).
 //
 // Shared fineweb helpers (tokenizer, checkpoint I/O, data windows,
 // held-out loss) are re-exported from the sibling example.

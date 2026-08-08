@@ -814,3 +814,293 @@ pub fn short_conv1d_with_state(
     let new_state = narrow(&real, 0, advance, kk - 1)?;
     Ok((acc, new_state))
 }
+
+// ShortConv1d adjoints (RFC 0018 phase 4). dx[s] = sum_j w[:, K-1-j] *
+// g[s+j] (full correlation over the right-zero-padded cotangent);
+// dw[:, j] = sum_t g[t] * x[t-K+1+j] (per-tap correlation over the
+// causal window). g and x are [.., T, C]; weight is [C, K].
+pub fn short_conv1d_backward_x(
+    x: &MetalTensor,
+    weight: &MetalTensor,
+    g: &MetalTensor,
+) -> crate::err::Res<MetalTensor> {
+    let dims = x.layout.shape().to_vec();
+    let r = dims.len();
+    let (t, c) = (dims[r - 2], dims[r - 1]);
+    let kk = weight.layout.shape()[1];
+    let batch: usize = dims[..r - 2].iter().product();
+    let g3 = super::ops::contiguous(&MetalTensor {
+        buffer: g.buffer.clone(),
+        layout: Layout::contiguous(vec![batch, t, c]),
+        dtype: g.dtype,
+    })?;
+    let padded = cat(&g3, &fill(&[batch, kk - 1, c], 0.0, g3.dtype)?, 1)?;
+    let mut acc = fill(&[batch, t, c], 0.0, g3.dtype)?;
+    for j in 0..kk {
+        let wj = transpose_last2(&narrow(weight, 1, kk - 1 - j, 1)?)?;
+        acc = binary(
+            &acc,
+            &binary(&narrow(&padded, 1, j, t)?, &wj, BinOp::Mul)?,
+            BinOp::Add,
+        )?;
+    }
+    super::ops::contiguous(&MetalTensor {
+        buffer: acc.buffer.clone(),
+        layout: Layout::contiguous(dims),
+        dtype: acc.dtype,
+    })
+}
+
+pub fn short_conv1d_backward_w(
+    x: &MetalTensor,
+    weight: &MetalTensor,
+    g: &MetalTensor,
+) -> crate::err::Res<MetalTensor> {
+    let dims = x.layout.shape().to_vec();
+    let r = dims.len();
+    let (t, c) = (dims[r - 2], dims[r - 1]);
+    let kk = weight.layout.shape()[1];
+    let batch: usize = dims[..r - 2].iter().product();
+    let view3 = |t_: &MetalTensor| {
+        super::ops::contiguous(&MetalTensor {
+            buffer: t_.buffer.clone(),
+            layout: Layout::contiguous(vec![batch, t, c]),
+            dtype: t_.dtype,
+        })
+    };
+    let x3 = view3(x)?;
+    let g3 = view3(g)?;
+    let window = cat(&fill(&[batch, kk - 1, c], 0.0, x3.dtype)?, &x3, 1)?;
+    let mut cols: Vec<MetalTensor> = Vec::with_capacity(kk);
+    for j in 0..kk {
+        cols.push(reduce(
+            &binary(&g3, &narrow(&window, 1, j, t)?, BinOp::Mul)?,
+            &[1],
+            true,
+            ReduceOp::Sum,
+        )?);
+    }
+    // [batch, K, C] -> sum over batch -> [1, K, C] -> [1, C, K] -> [C, K]
+    let stacked = cat_all(&cols, 1)?;
+    let summed = reduce(&stacked, &[0], true, ReduceOp::Sum)?;
+    let transposed = transpose_last2(&summed)?;
+    super::ops::contiguous(&MetalTensor {
+        buffer: transposed.buffer.clone(),
+        layout: Layout::contiguous(vec![c, kk]),
+        dtype: transposed.dtype,
+    })
+}
+
+// Closed-form KDA backward (RFC 0018 phase 4). With S̃_t = Diag(α_t)
+// S_{t-1}, δ_t = v_t − S̃_tᵀ k_t, S_t = S̃_t + β_t k_t δ_tᵀ and o_t =
+// scale · S_tᵀ q_t, the adjoint state Λ_t = ∂L/∂S_t runs in reverse:
+//
+//   Λ_t   += scale · q_t g_tᵀ           (g = output cotangent)
+//   dq_t   = scale · S_t g_t
+//   dv_t   = β_t Λ_tᵀ k_t
+//   dk_t   = β_t (Λ_t δ_t − S̃_t (Λ_tᵀ k_t))
+//   dβ_t   = k_tᵀ Λ_t δ_t
+//   dα_t   = sum_dv(S_{t-1} ⊙ M_t), M_t = (I − β_t k_t k_tᵀ) Λ_t
+//   dg_t   = dα_t ⊙ α_t
+//   Λ_{t-1} = Diag(α_t) M_t
+//
+// Memory stays bounded: pass 1 retains only the 64-token chunk start
+// states; pass 2 walks chunks in reverse and recomputes the per-token
+// states within each chunk (transient, one chunk at a time).
+#[allow(clippy::too_many_arguments)]
+pub fn kda_chunk_backward(
+    q: &MetalTensor,
+    k: &MetalTensor,
+    v: &MetalTensor,
+    log_decay: &MetalTensor,
+    beta: &MetalTensor,
+    g: &MetalTensor,
+    scale: f64,
+) -> crate::err::Res<(
+    MetalTensor,
+    MetalTensor,
+    MetalTensor,
+    MetalTensor,
+    MetalTensor,
+)> {
+    const CHUNK: usize = 64;
+    let in_dtype = q.dtype;
+    let q = super::ops::to_f32(q)?;
+    let k = super::ops::to_f32(k)?;
+    let v = super::ops::to_f32(v)?;
+    let log_decay = super::ops::to_f32(log_decay)?;
+    let beta = super::ops::to_f32(beta)?;
+    let g = super::ops::to_f32(g)?;
+    let work = DType::F32;
+
+    let dims = q.layout.shape().to_vec();
+    let r = dims.len();
+    let (t_total, dk) = (dims[r - 2], dims[r - 1]);
+    let dv = v.layout.shape()[r - 1];
+    let bh: usize = dims[..r - 2].iter().product();
+
+    let flatten = |x: &MetalTensor, d: usize| -> crate::err::Res<MetalTensor> {
+        super::ops::contiguous(&MetalTensor {
+            buffer: x.buffer.clone(),
+            layout: Layout::contiguous(vec![bh, t_total, d]),
+            dtype: x.dtype,
+        })
+    };
+    let q3 = flatten(&q, dk)?;
+    let k3 = flatten(&k, dk)?;
+    let v3 = flatten(&v, dv)?;
+    let ld3 = flatten(&log_decay, dk)?;
+    let b3 = flatten(&beta, 1)?;
+    let g3 = flatten(&g, dv)?;
+
+    let tok = |x: &MetalTensor, t: usize| narrow(x, 1, t, 1); // [BH, 1, D]
+    let col = |x: &MetalTensor, t: usize| transpose_last2(&narrow(x, 1, t, 1)?); // [BH, D, 1]
+
+    // Pass 1: chunk start states via the per-token recurrence.
+    let mut starts: Vec<MetalTensor> = Vec::new();
+    let mut state = fill(&[bh, dk, dv], 0.0, work)?;
+    let mut t0 = 0;
+    while t0 < t_total {
+        let c = CHUNK.min(t_total - t0);
+        starts.push(state.clone());
+        for i in 0..c {
+            let alpha = transpose_last2(&unary(&tok(&ld3, t0 + i)?, UnOp::Exp)?)?; // [BH, dk, 1]
+            let sdec = binary(&state, &alpha, BinOp::Mul)?;
+            let k_col = col(&k3, t0 + i)?;
+            let delta = binary(
+                &col(&v3, t0 + i)?,
+                &matmul(&transpose_last2(&sdec)?, &k_col)?,
+                BinOp::Sub,
+            )?; // [BH, dv, 1]
+            state = binary(
+                &sdec,
+                &matmul(
+                    &k_col,
+                    &binary(&transpose_last2(&delta)?, &tok(&b3, t0 + i)?, BinOp::Mul)?,
+                )?,
+                BinOp::Add,
+            )?;
+        }
+        t0 += c;
+    }
+
+    // Pass 2: reverse adjoint walk with per-chunk forward recompute.
+    let mut lam = fill(&[bh, dk, dv], 0.0, work)?;
+    let mut dq_rows: Vec<MetalTensor> = Vec::new();
+    let mut dk_rows: Vec<MetalTensor> = Vec::new();
+    let mut dv_rows: Vec<MetalTensor> = Vec::new();
+    let mut dg_rows: Vec<MetalTensor> = Vec::new();
+    let mut db_rows: Vec<MetalTensor> = Vec::new();
+    for ci in (0..starts.len()).rev() {
+        let t0 = ci * CHUNK;
+        let c = CHUNK.min(t_total - t0);
+        // Recompute this chunk's per-token states.
+        let mut sdecs: Vec<MetalTensor> = Vec::with_capacity(c);
+        let mut states_t: Vec<MetalTensor> = Vec::with_capacity(c);
+        let mut deltas: Vec<MetalTensor> = Vec::with_capacity(c);
+        let mut s = starts[ci].clone();
+        for i in 0..c {
+            let alpha = transpose_last2(&unary(&tok(&ld3, t0 + i)?, UnOp::Exp)?)?;
+            let sdec = binary(&s, &alpha, BinOp::Mul)?;
+            let k_col = col(&k3, t0 + i)?;
+            let delta = binary(
+                &col(&v3, t0 + i)?,
+                &matmul(&transpose_last2(&sdec)?, &k_col)?,
+                BinOp::Sub,
+            )?;
+            s = binary(
+                &sdec,
+                &matmul(
+                    &k_col,
+                    &binary(&transpose_last2(&delta)?, &tok(&b3, t0 + i)?, BinOp::Mul)?,
+                )?,
+                BinOp::Add,
+            )?;
+            sdecs.push(sdec);
+            deltas.push(delta);
+            states_t.push(s.clone());
+        }
+        for i in (0..c).rev() {
+            let t = t0 + i;
+            let q_col = col(&q3, t)?; // [BH, dk, 1]
+            let g_row = tok(&g3, t)?; // [BH, 1, dv]
+            let k_col = col(&k3, t)?;
+            let b_t = tok(&b3, t)?; // [BH, 1, 1]
+            lam = binary(
+                &lam,
+                &binary(
+                    &matmul(&q_col, &g_row)?,
+                    &fill(&[bh, dk, dv], scale, work)?,
+                    BinOp::Mul,
+                )?,
+                BinOp::Add,
+            )?;
+            let g_col = transpose_last2(&g_row)?; // [BH, dv, 1]
+            dq_rows.push(transpose_last2(&binary(
+                &matmul(&states_t[i], &g_col)?,
+                &fill(&[bh, dk, 1], scale, work)?,
+                BinOp::Mul,
+            )?)?);
+            let lam_k = matmul(&transpose_last2(&lam)?, &k_col)?; // [BH, dv, 1]
+            dv_rows.push(transpose_last2(&binary(&lam_k, &b_t, BinOp::Mul)?)?);
+            let lam_delta = matmul(&lam, &deltas[i])?; // [BH, dk, 1]
+            dk_rows.push(transpose_last2(&binary(
+                &binary(&lam_delta, &matmul(&sdecs[i], &lam_k)?, BinOp::Sub)?,
+                &transpose_last2(&b_t)?,
+                BinOp::Mul,
+            )?)?);
+            db_rows.push(reduce(
+                &binary(&k_col, &lam_delta, BinOp::Mul)?,
+                &[1],
+                true,
+                ReduceOp::Sum,
+            )?); // [BH, 1, 1]
+                 // M = (I - beta k kᵀ) Λ
+            let m_ = binary(
+                &lam,
+                &binary(
+                    &matmul(&k_col, &transpose_last2(&lam_k)?)?,
+                    &transpose_last2(&b_t)?,
+                    BinOp::Mul,
+                )?,
+                BinOp::Sub,
+            )?;
+            let s_prev = if i == 0 {
+                &starts[ci]
+            } else {
+                &states_t[i - 1]
+            };
+            let dalpha = reduce(&binary(s_prev, &m_, BinOp::Mul)?, &[2], true, ReduceOp::Sum)?; // [BH, dk, 1]
+            let alpha = transpose_last2(&unary(&tok(&ld3, t)?, UnOp::Exp)?)?;
+            dg_rows.push(transpose_last2(&binary(&dalpha, &alpha, BinOp::Mul)?)?);
+            lam = binary(&alpha, &m_, BinOp::Mul)?;
+        }
+    }
+    for rows in [
+        &mut dq_rows,
+        &mut dk_rows,
+        &mut dv_rows,
+        &mut dg_rows,
+        &mut db_rows,
+    ] {
+        rows.reverse();
+    }
+    let assemble = |rows: Vec<MetalTensor>, width: usize| -> crate::err::Res<MetalTensor> {
+        let mut shape = dims.clone();
+        shape[r - 1] = width;
+        let joined = cat_all(&rows, 1)?;
+        let out = super::ops::contiguous(&MetalTensor {
+            buffer: joined.buffer.clone(),
+            layout: Layout::contiguous(shape),
+            dtype: work,
+        })?;
+        super::ops::from_f32(&out, in_dtype)
+    };
+    Ok((
+        assemble(dq_rows, dk)?,
+        assemble(dk_rows, dk)?,
+        assemble(dv_rows, dv)?,
+        assemble(dg_rows, dk)?,
+        assemble(db_rows, 1)?,
+    ))
+}

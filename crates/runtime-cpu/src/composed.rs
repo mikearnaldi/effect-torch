@@ -693,6 +693,227 @@ pub fn short_conv1d_with_state(
     (acc, new_state)
 }
 
+// ShortConv1d adjoints (RFC 0018 phase 4). dx[s] = sum_j w[:, K-1-j] *
+// g[s+j] (full correlation over the right-zero-padded cotangent);
+// dw[:, j] = sum_t g[t] * x[t-K+1+j] (per-tap correlation over the
+// causal window). g and x are [.., T, C]; weight is [C, K].
+pub fn short_conv1d_backward_x(x: &Tensor, weight: &Tensor, g: &Tensor) -> Tensor {
+    let dims = x.shape().to_vec();
+    let r = dims.len();
+    let (t, c) = (dims[r - 2], dims[r - 1]);
+    let kk = weight.shape()[1];
+    let batch: usize = dims[..r - 2].iter().product();
+    let g3 = g.contiguous().view(Layout::contiguous(vec![batch, t, c]));
+    let padded = Tensor::cat(&[&g3, &Tensor::zeros(&[batch, kk - 1, c], g3.dtype())], 1);
+    let mut acc = Tensor::zeros(&[batch, t, c], g3.dtype());
+    for j in 0..kk {
+        let wj = transpose_last2(&narrow(weight, 1, kk - 1 - j, 1));
+        acc = acc.add(&narrow(&padded, 1, j, t).mul(&wj));
+    }
+    acc.contiguous().view(Layout::contiguous(dims))
+}
+
+pub fn short_conv1d_backward_w(x: &Tensor, weight: &Tensor, g: &Tensor) -> Tensor {
+    let dims = x.shape().to_vec();
+    let r = dims.len();
+    let (t, c) = (dims[r - 2], dims[r - 1]);
+    let kk = weight.shape()[1];
+    let batch: usize = dims[..r - 2].iter().product();
+    let x3 = x.contiguous().view(Layout::contiguous(vec![batch, t, c]));
+    let g3 = g.contiguous().view(Layout::contiguous(vec![batch, t, c]));
+    let window = Tensor::cat(&[&Tensor::zeros(&[batch, kk - 1, c], x3.dtype()), &x3], 1);
+    let mut cols: Vec<Tensor> = Vec::with_capacity(kk);
+    for j in 0..kk {
+        // [batch, 1, C]: sum over T of g * window[j .. j+T]
+        let tap = g3.mul(&narrow(&window, 1, j, t)).sum(&[1]);
+        cols.push(tap);
+    }
+    // [batch, K, C] -> sum over batch -> [1, K, C] -> [1, C, K] -> [C, K]
+    let stacked = Tensor::cat(&cols.iter().collect::<Vec<_>>(), 1);
+    let summed = stacked.sum(&[0]);
+    transpose_last2(&summed)
+        .contiguous()
+        .view(Layout::contiguous(vec![c, kk]))
+}
+
+// Closed-form KDA backward (RFC 0018 phase 4). With S̃_t = Diag(α_t)
+// S_{t-1}, δ_t = v_t − S̃_tᵀ k_t, S_t = S̃_t + β_t k_t δ_tᵀ and o_t =
+// scale · S_tᵀ q_t, the adjoint state Λ_t = ∂L/∂S_t runs in reverse:
+//
+//   Λ_t   += scale · q_t g_tᵀ           (g = output cotangent)
+//   dq_t   = scale · S_t g_t
+//   dv_t   = β_t Λ_tᵀ k_t
+//   dk_t   = β_t (Λ_t δ_t − S̃_t (Λ_tᵀ k_t))
+//   dβ_t   = k_tᵀ Λ_t δ_t
+//   dα_t   = sum_dv(S_{t-1} ⊙ M_t), M_t = (I − β_t k_t k_tᵀ) Λ_t
+//   dg_t   = dα_t ⊙ α_t
+//   Λ_{t-1} = Diag(α_t) M_t
+//
+// Memory stays bounded: pass 1 retains only the 64-token chunk start
+// states; pass 2 walks chunks in reverse and recomputes the per-token
+// states within each chunk (transient, one chunk at a time).
+pub fn kda_chunk_backward(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    log_decay: &Tensor,
+    beta: &Tensor,
+    g: &Tensor,
+    scale: f64,
+) -> (Tensor, Tensor, Tensor, Tensor, Tensor) {
+    const CHUNK: usize = 64;
+    let in_dtype = q.dtype();
+    let work = if in_dtype == DType::F64 {
+        DType::F64
+    } else {
+        DType::F32
+    };
+    let q = q.cast(work);
+    let k = k.cast(work);
+    let v = v.cast(work);
+    let log_decay = log_decay.cast(work);
+    let beta = beta.cast(work);
+    let g = g.cast(work);
+
+    let dims = q.shape().to_vec();
+    let r = dims.len();
+    let (t_total, dk) = (dims[r - 2], dims[r - 1]);
+    let dv = v.shape()[r - 1];
+    let bh: usize = dims[..r - 2].iter().product();
+
+    let q3 = q
+        .contiguous()
+        .view(Layout::contiguous(vec![bh, t_total, dk]));
+    let k3 = k
+        .contiguous()
+        .view(Layout::contiguous(vec![bh, t_total, dk]));
+    let v3 = v
+        .contiguous()
+        .view(Layout::contiguous(vec![bh, t_total, dv]));
+    let ld3 = log_decay
+        .contiguous()
+        .view(Layout::contiguous(vec![bh, t_total, dk]));
+    let b3 = beta
+        .contiguous()
+        .view(Layout::contiguous(vec![bh, t_total, 1]));
+    let g3 = g
+        .contiguous()
+        .view(Layout::contiguous(vec![bh, t_total, dv]));
+
+    let tok = |x: &Tensor, t: usize| narrow(x, 1, t, 1); // [BH, 1, D]
+    let col = |x: &Tensor, t: usize| transpose_last2(&narrow(x, 1, t, 1)); // [BH, D, 1]
+
+    // Pass 1: chunk start states via the per-token recurrence.
+    let mut starts: Vec<Tensor> = Vec::new();
+    let mut state = Tensor::zeros(&[bh, dk, dv], work);
+    let mut t0 = 0;
+    while t0 < t_total {
+        let c = CHUNK.min(t_total - t0);
+        starts.push(state.clone());
+        for i in 0..c {
+            let alpha = transpose_last2(&tok(&ld3, t0 + i).exp()); // [BH, dk, 1]
+            let sdec = state.mul(&alpha);
+            let k_col = col(&k3, t0 + i);
+            let delta = col(&v3, t0 + i).sub(&transpose_last2(&sdec).matmul(&k_col)); // [BH, dv, 1]
+            state = sdec.add(&k_col.matmul(&transpose_last2(&delta).mul(&tok(&b3, t0 + i))));
+        }
+        t0 += c;
+    }
+
+    // Pass 2: reverse adjoint walk with per-chunk forward recompute.
+    let mut lam = Tensor::zeros(&[bh, dk, dv], work);
+    let mut dq_rows: Vec<Tensor> = Vec::new();
+    let mut dk_rows: Vec<Tensor> = Vec::new();
+    let mut dv_rows: Vec<Tensor> = Vec::new();
+    let mut dg_rows: Vec<Tensor> = Vec::new();
+    let mut db_rows: Vec<Tensor> = Vec::new();
+    for ci in (0..starts.len()).rev() {
+        let t0 = ci * CHUNK;
+        let c = CHUNK.min(t_total - t0);
+        // Recompute this chunk's per-token states.
+        let mut sdecs: Vec<Tensor> = Vec::with_capacity(c);
+        let mut states_t: Vec<Tensor> = Vec::with_capacity(c);
+        let mut deltas: Vec<Tensor> = Vec::with_capacity(c);
+        let mut s = starts[ci].clone();
+        for i in 0..c {
+            let alpha = transpose_last2(&tok(&ld3, t0 + i).exp());
+            let sdec = s.mul(&alpha);
+            let k_col = col(&k3, t0 + i);
+            let delta = col(&v3, t0 + i).sub(&transpose_last2(&sdec).matmul(&k_col));
+            s = sdec.add(&k_col.matmul(&transpose_last2(&delta).mul(&tok(&b3, t0 + i))));
+            sdecs.push(sdec);
+            deltas.push(delta);
+            states_t.push(s.clone());
+        }
+        for i in (0..c).rev() {
+            let t = t0 + i;
+            let q_col = col(&q3, t); // [BH, dk, 1]
+            let g_row = tok(&g3, t); // [BH, 1, dv]
+            let k_col = col(&k3, t);
+            let b_t = tok(&b3, t); // [BH, 1, 1]
+            lam = lam.add(
+                &q_col
+                    .matmul(&g_row)
+                    .mul(&Tensor::full(&[bh, dk, dv], scale, work)),
+            );
+            let g_col = transpose_last2(&g_row); // [BH, dv, 1]
+            dq_rows.push(transpose_last2(
+                &states_t[i]
+                    .matmul(&g_col)
+                    .mul(&Tensor::full(&[bh, dk, 1], scale, work)),
+            ));
+            let lam_k = transpose_last2(&lam).matmul(&k_col); // [BH, dv, 1]
+            dv_rows.push(transpose_last2(&lam_k.mul(&b_t)));
+            let lam_delta = lam.matmul(&deltas[i]); // [BH, dk, 1]
+            dk_rows.push(transpose_last2(
+                &lam_delta
+                    .sub(&sdecs[i].matmul(&lam_k))
+                    .mul(&transpose_last2(&b_t)),
+            ));
+            db_rows.push(k_col.mul(&lam_delta).sum(&[1])); // [BH, 1, 1]
+                                                           // M = (I - beta k kᵀ) Λ
+            let m_ = lam.sub(
+                &k_col
+                    .matmul(&transpose_last2(&lam_k))
+                    .mul(&transpose_last2(&b_t)),
+            );
+            let s_prev = if i == 0 {
+                &starts[ci]
+            } else {
+                &states_t[i - 1]
+            };
+            let dalpha = s_prev.mul(&m_).sum(&[2]); // [BH, dk, 1]
+            let alpha = transpose_last2(&tok(&ld3, t).exp());
+            dg_rows.push(transpose_last2(&dalpha.mul(&alpha)));
+            lam = alpha.mul(&m_);
+        }
+    }
+    for rows in [
+        &mut dq_rows,
+        &mut dk_rows,
+        &mut dv_rows,
+        &mut dg_rows,
+        &mut db_rows,
+    ] {
+        rows.reverse();
+    }
+    let assemble = |rows: Vec<Tensor>, width: usize| {
+        let mut shape = dims.clone();
+        shape[r - 1] = width;
+        Tensor::cat(&rows.iter().collect::<Vec<_>>(), 1)
+            .contiguous()
+            .view(Layout::contiguous(shape))
+            .cast(in_dtype)
+    };
+    (
+        assemble(dq_rows, dk),
+        assemble(dk_rows, dk),
+        assemble(dv_rows, dv),
+        assemble(dg_rows, dk),
+        assemble(db_rows, 1),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -801,6 +1022,108 @@ mod tests {
     #[test]
     fn kda_chunk_matches_naive_multi_chunk() {
         kda_case(129, 16, 16, 17);
+    }
+
+    // Central finite differences of the forward are the oracle for the
+    // closed-form adjoint (f64 for tight tolerances).
+    fn kda_backward_case(t: usize, dk: usize, dv: usize, seed: u64) {
+        let bh = 1;
+        let f64_data = |t_: &Tensor| {
+            let CpuBuffer::F64(v) = &t_.buffer else {
+                panic!()
+            };
+            v.as_slice().to_vec()
+        };
+        let q = Tensor::from_vec(prand(bh * t * dk, seed), vec![bh, t, dk]).cast(DType::F64);
+        let k = Tensor::from_vec(prand(bh * t * dk, seed + 1), vec![bh, t, dk]).cast(DType::F64);
+        let v = Tensor::from_vec(prand(bh * t * dv, seed + 2), vec![bh, t, dv]).cast(DType::F64);
+        let ld = Tensor::from_vec(
+            prand(bh * t * dk, seed + 3)
+                .into_iter()
+                .map(|x| (x.abs() + 0.05) * -1.5)
+                .collect(),
+            vec![bh, t, dk],
+        )
+        .cast(DType::F64);
+        let beta = Tensor::from_vec(
+            prand(bh * t, seed + 4)
+                .into_iter()
+                .map(|x| x.abs() * 0.9 + 0.05)
+                .collect(),
+            vec![bh, t, 1],
+        )
+        .cast(DType::F64);
+        let w = Tensor::from_vec(prand(bh * t * dv, seed + 5), vec![bh, t, dv]).cast(DType::F64);
+        let scale = 1.0 / (dk as f64).sqrt();
+        let loss = |q_: &Tensor, k_: &Tensor, v_: &Tensor, ld_: &Tensor, b_: &Tensor| -> f64 {
+            let out = kda_chunk_forward(q_, k_, v_, ld_, b_, scale);
+            f64_data(&out.mul(&w).sum(&[0, 1, 2]))[0]
+        };
+        let (dq, dk_, dv_, dld, db) = kda_chunk_backward(&q, &k, &v, &ld, &beta, &w, scale);
+        let eps = 1e-6;
+        let mut fd = |input: &Tensor, analytic: &Tensor, which: usize, name: &str| {
+            let base = f64_data(input);
+            let got = f64_data(analytic);
+            let shape = input.shape().to_vec();
+            let mut local_worst = 0f64;
+            for i in 0..base.len() {
+                let mut plus = base.clone();
+                plus[i] += eps;
+                let mut minus = base.clone();
+                minus[i] -= eps;
+                let plus_t = Tensor::from_vec(plus, shape.clone());
+                let minus_t = Tensor::from_vec(minus, shape.clone());
+                let (lp, lm) = match which {
+                    0 => (
+                        loss(&plus_t, &k, &v, &ld, &beta),
+                        loss(&minus_t, &k, &v, &ld, &beta),
+                    ),
+                    1 => (
+                        loss(&q, &plus_t, &v, &ld, &beta),
+                        loss(&q, &minus_t, &v, &ld, &beta),
+                    ),
+                    2 => (
+                        loss(&q, &k, &plus_t, &ld, &beta),
+                        loss(&q, &k, &minus_t, &ld, &beta),
+                    ),
+                    3 => (
+                        loss(&q, &k, &v, &plus_t, &beta),
+                        loss(&q, &k, &v, &minus_t, &beta),
+                    ),
+                    _ => (
+                        loss(&q, &k, &v, &ld, &plus_t),
+                        loss(&q, &k, &v, &ld, &minus_t),
+                    ),
+                };
+                let numeric = (lp - lm) / (2.0 * eps);
+                let rel = (numeric - got[i]).abs() / got[i].abs().max(1e-6);
+                local_worst = local_worst.max(rel);
+                assert!(
+                    rel < 1e-4,
+                    "{name}[{i}]: analytic {} vs numeric {numeric}",
+                    got[i]
+                );
+            }
+            local_worst
+        };
+        let w0 = fd(&q, &dq, 0, "dq");
+        let w1 = fd(&k, &dk_, 1, "dk");
+        let w2 = fd(&v, &dv_, 2, "dv");
+        let w3 = fd(&ld, &dld, 3, "dlog_decay");
+        let w4 = fd(&beta, &db, 4, "dbeta");
+        for (name, w_) in [("dq", w0), ("dk", w1), ("dv", w2), ("dld", w3), ("db", w4)] {
+            eprintln!("  t={t} {name} worst rel {w_:e}");
+        }
+    }
+
+    #[test]
+    fn kda_backward_matches_finite_differences() {
+        kda_backward_case(8, 4, 6, 21);
+    }
+
+    #[test]
+    fn kda_backward_matches_finite_differences_across_chunk() {
+        kda_backward_case(70, 4, 4, 23);
     }
 
     #[test]
