@@ -49,10 +49,11 @@ using namespace metal;
 
 #define T {ty}
 
-// One thread per output element of one sequence: x [steps, C], optional
-// f32 history [K-1, C], y [steps, C]; when flag 2 is set the last K-1
-// real rows (of `advance`) plus remaining history write the shifted
-// window to WIN.
+// One thread per output element, addressed by a 3D grid (channel, row,
+// batch) — no div/mod index math. x [.., steps, C], optional f32
+// history [K-1, C] (single-sequence use only), y mirrors x; when flag 2
+// is set the last K-1 real rows (of `advance`) plus surviving history
+// write the shifted window to WIN.
 kernel void et_shortconv_fwd(
     device const T* X [[buffer(0)]],
     device const T* W [[buffer(1)]],
@@ -64,51 +65,43 @@ kernel void et_shortconv_fwd(
     constant uint& K [[buffer(7)]],
     constant uint& advance [[buffer(8)]],
     constant uint& flags [[buffer(9)]],
-    constant uint& batch [[buffer(10)]],
-    uint2 gid2 [[thread_position_in_grid]]
+    uint3 gid [[thread_position_in_grid]]
 ) {{
-    const ulong i = ulong(gid2.y) * {wide}ul + ulong(gid2.x);
+    const uint c = gid.x;
+    const uint t = gid.y;
+    if (c >= C) return;
     const bool has_hist = (flags & 1u) != 0u;
     const bool write_win = (flags & 2u) != 0u;
-    const ulong outs = ulong(batch) * ulong(steps) * C;
-    const ulong wins = ulong(K - 1) * C;
-    if (i < outs) {{
-        const uint c = uint(i % C);
-        // Batch-local row: tap reads never cross the batch boundary.
-        const uint t = uint((i / C) % ulong(steps));
+    const ulong rowBase = (ulong)gid.z * steps * C;
+    if (t < steps) {{
         float acc = 0.0f;
         for (uint j = 0; j < K; j++) {{
             const long s = long(t) + long(j) - long(K - 1);
             if (s >= 0) {{
-                acc += float(W[c * K + j]) * float(X[i - ulong(long(K - 1) - long(j)) * C]);
+                acc += float(W[c * K + j]) * float(X[rowBase + ulong(s) * C + c]);
             }} else if (has_hist) {{
-                const uint hr = uint(K - 1 + s);
-                acc += float(W[c * K + j]) * HIST[ulong(hr) * C + c];
+                acc += float(W[c * K + j]) * HIST[ulong(K - 1 + s) * C + c];
             }}
         }}
-        Y[i] = T(acc);
+        Y[rowBase + ulong(t) * C + c] = T(acc);
     }}
-    if (write_win && i < wins) {{
-        // Window row r holds real position advance-(K-1)+r (negative:
+    if (write_win && t < K - 1 && gid.z == 0) {{
+        // Window row t holds real position advance-(K-1)+t (negative:
         // the surviving history row K-1+s).
-        const uint c = uint(i % C);
-        const uint r = uint(i / C);
-        const long s = long(advance) - long(K - 1) + long(r);
+        const long s = long(advance) - long(K - 1) + long(t);
         float val = 0.0f;
         if (s >= 0) {{
-            val = float(X[ulong(s) * C + c]);
+            val = float(X[rowBase + ulong(s) * C + c]);
         }} else if (has_hist) {{
             val = HIST[ulong(K - 1 + s) * C + c];
         }}
-        WIN[i] = val;
+        WIN[ulong(t) * C + c] = val;
     }}
 }}
 "#,
             ty = ty,
-            wide = MetalDevice::WIDE,
         )
     }
-
     fn bwd_x_source(dtype: DType) -> String {
         let ty = ty_of(dtype);
         format!(
@@ -128,25 +121,22 @@ kernel void et_shortconv_bwd_x(
     constant uint& steps [[buffer(4)]],
     constant uint& C [[buffer(5)]],
     constant uint& K [[buffer(6)]],
-    uint2 gid2 [[thread_position_in_grid]]
+    uint3 gid [[thread_position_in_grid]]
 ) {{
-    const ulong i = ulong(gid2.y) * {wide}ul + ulong(gid2.x);
-    if (i >= ulong(steps) * C * ulong(batch)) return;
-    const uint c = uint(i % C);
-    // Batch-local row: reads never cross the batch boundary.
-    const uint t = uint((i / C) % ulong(steps));
-    const ulong batch_base = i / (ulong(steps) * C) * (ulong(steps) * C);
+    const uint c = gid.x;
+    const uint t = gid.y;
+    if (c >= C || t >= steps) return;
+    const ulong rowBase = (ulong)gid.z * steps * C;
     float acc = 0.0f;
     for (uint j = 0; j < K; j++) {{
         if (t + j < steps) {{
-            acc += float(W[c * K + (K - 1 - j)]) * float(G[batch_base + (i - batch_base) + ulong(j) * C]);
+            acc += float(W[c * K + (K - 1 - j)]) * float(G[rowBase + ulong(t + j) * C + c]);
         }}
     }}
-    dX[i] = T(acc);
+    dX[rowBase + ulong(t) * C + c] = T(acc);
 }}
 "#,
             ty = ty,
-            wide = MetalDevice::WIDE,
         )
     }
 
@@ -205,6 +195,18 @@ kernel void et_shortconv_bwd_w(
         MetalDevice::grid_flat(n.div_ceil(256) * 256)
     }
 
+    // 3D (channels, rows, batch) thread grid, 32×8 threadgroups.
+    fn grid3d(
+        c: usize,
+        steps: usize,
+        batch: usize,
+    ) -> (objc2_metal::MTLSize, objc2_metal::MTLSize) {
+        (
+            MetalDevice::grid(c.div_ceil(32) * 32, steps.div_ceil(8) * 8, batch),
+            MetalDevice::grid(32, 8, 1),
+        )
+    }
+
     // Forward: x [.., steps, C] (any leading batch without history; one
     // sequence with history), weight [C, K]; optional f32 history
     // [K-1, C]; when requested returns the shifted f32 window.
@@ -244,7 +246,7 @@ kernel void et_shortconv_bwd_w(
             flags |= 2;
         }
         let elem = |off: usize| off * dtype.size_in_bytes();
-        let (grid, tg) = grid_over((batch * steps * c).max((kk - 1) * c));
+        let (grid, tg) = grid3d(c, steps.max(if write_window { kk - 1 } else { 0 }), batch);
         dev.with_encoder(|e| {
             e.setComputePipelineState(pipe.as_raw());
             set_buffer(e, 0, &x.buffer, elem(x.layout.offset()));
@@ -257,7 +259,6 @@ kernel void et_shortconv_bwd_w(
             set_bytes(e, 7, &(kk as u32));
             set_bytes(e, 8, &(advance as u32));
             set_bytes(e, 9, &flags);
-            set_bytes(e, 10, &(batch as u32));
             e.dispatchThreads_threadsPerThreadgroup(grid, tg);
         });
         let y = MetalTensor {
@@ -291,7 +292,7 @@ kernel void et_shortconv_bwd_w(
         let pipe = pipeline(0xC042, dtype, "et_shortconv_bwd_x", || bwd_x_source(dtype))?;
         let out = dev.alloc(batch * steps * c, dtype);
         let elem = |off: usize| off * dtype.size_in_bytes();
-        let (grid, tg) = grid_over(batch * steps * c);
+        let (grid, tg) = grid3d(c, steps, batch);
         dev.with_encoder(|e| {
             e.setComputePipelineState(pipe.as_raw());
             set_buffer(e, 0, &g.buffer, elem(g.layout.offset()));

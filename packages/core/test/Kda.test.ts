@@ -168,9 +168,7 @@ onDevices("Kda", (device) => (it) => {
         expect(model.names).toEqual([
           "kda.qkv.weight",
           "kda.qkv.bias",
-          "kda.convq.weight",
-          "kda.convk.weight",
-          "kda.convv.weight",
+          "kda.convqkv.weight",
           "kda.fa.weight",
           "kda.fb.weight",
           "kda.alog",

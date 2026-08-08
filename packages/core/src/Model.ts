@@ -658,7 +658,7 @@ export interface KimiDeltaAttentionOptions {
 /**
  * Kimi Delta Attention over `[..., T, embedDim]` inputs (Kimi Linear
  * style): one fused q/k/v projection, a causal depthwise short
- * convolution (kernel 4) plus SiLU on each of q/k/v, per-head L2
+ * convolution (kernel 4) plus SiLU over the fused projection, per-head L2
  * normalization of q and k, a low-rank per-channel log-decay gate
  * `logDecay = -exp(aLog) * softplus(fb(fa(x)) + dtBias)`, a sigmoid
  * per-head gate `beta`, the {@link Tensor.kdaChunk} gated delta-rule
@@ -670,12 +670,11 @@ export interface KimiDeltaAttentionOptions {
  * Kimi K3 configuration).
  *
  * Names are exactly `["<name>.qkv.weight", "<name>.qkv.bias",
- * "<name>.convq.weight", "<name>.convk.weight", "<name>.convv.weight",
- * "<name>.fa.weight", "<name>.fb.weight", "<name>.alog",
- * "<name>.dtbias", "<name>.b.weight", "<name>.ga.weight",
+ * "<name>.convqkv.weight", "<name>.fa.weight", "<name>.fb.weight",
+ * "<name>.alog", "<name>.dtbias", "<name>.b.weight", "<name>.ga.weight",
  * "<name>.gb.weight", "<name>.norm.weight", "<name>.wo.weight",
  * "<name>.wo.bias"]`. Projection weights use `randn * (1 /
- * sqrt(fanIn))`, convolution weights `randn * (1 / sqrt(4))`, `alog` and
+ * sqrt(fanIn))`, the convolution weight `randn * (1 / sqrt(4))`, `alog` and
  * `dtbias` are zero (an initial per-step decay of about `exp(-0.69)`),
  * `norm.weight` is one and biases are zero. Fails with a
  * {@link ModelError} on an empty name, counts that are not positive
@@ -706,9 +705,7 @@ export const kimiDeltaAttention = (
     const names = [
       `${name}.qkv.weight`,
       `${name}.qkv.bias`,
-      `${name}.convq.weight`,
-      `${name}.convk.weight`,
-      `${name}.convv.weight`,
+      `${name}.convqkv.weight`,
       `${name}.fa.weight`,
       `${name}.fb.weight`,
       `${name}.alog`,
@@ -731,9 +728,7 @@ export const kimiDeltaAttention = (
         return [
           yield* scaled(embedDim, [embedDim, 3 * embedDim]),
           yield* Tensor.zeros([1, 3 * embedDim]),
-          yield* scaled(4, [embedDim, 4]),
-          yield* scaled(4, [embedDim, 4]),
-          yield* scaled(4, [embedDim, 4]),
+          yield* scaled(4, [3 * embedDim, 4]),
           yield* scaled(embedDim, [embedDim, headDim]),
           yield* scaled(headDim, [headDim, embedDim]),
           yield* Tensor.zeros([numHeads]),
@@ -752,9 +747,7 @@ export const kimiDeltaAttention = (
           const [
             qkvWeight,
             qkvBias,
-            convqWeight,
-            convkWeight,
-            convvWeight,
+            convqkvWeight,
             faWeight,
             fbWeight,
             aLog,
@@ -787,12 +780,6 @@ export const kimiDeltaAttention = (
               const transposed = yield* Tensor.transpose(x, perm)
               return yield* Tensor.reshape(transposed, [...leading, t, embedDim])
             })
-          // Causal depthwise short convolution (kernel 4) + SiLU on a
-          // [..., T, E] projection.
-          const shortConv = (x: Tensor.Any, weight: Tensor.Any) =>
-            Effect.gen(function*() {
-              return yield* Tensor.silu(yield* Tensor.shortConv1d(x, weight))
-            })
           // Per-head L2 normalization along the head dim.
           const l2Norm = (x: Tensor.Any) =>
             Effect.gen(function*() {
@@ -800,22 +787,26 @@ export const kimiDeltaAttention = (
               const epsT = yield* Tensor.constantLike(ss, 1e-6)
               return yield* Tensor.mul(x, yield* Tensor.rsqrt(yield* Tensor.add(ss, epsT)))
             })
+          // One causal depthwise short convolution (kernel 4) + SiLU over
+          // the fused [.., T, 3E] projection — contiguous input, one
+          // launch — then the q/k/v slices.
           const qkv = yield* Tensor.linear(input, qkvWeight, qkvBias)
-          const q = yield* Tensor.slice(qkv, {
+          const convolved = yield* Tensor.silu(yield* Tensor.shortConv1d(qkv, convqkvWeight))
+          const q = yield* Tensor.slice(convolved, {
             start: [...leading.map(() => 0), 0, 0],
             end: [...leading.map((d) => d), t, embedDim]
           })
-          const k = yield* Tensor.slice(qkv, {
+          const k = yield* Tensor.slice(convolved, {
             start: [...leading.map(() => 0), 0, embedDim],
             end: [...leading.map((d) => d), t, 2 * embedDim]
           })
-          const v = yield* Tensor.slice(qkv, {
+          const v = yield* Tensor.slice(convolved, {
             start: [...leading.map(() => 0), 0, 2 * embedDim],
             end: [...leading.map((d) => d), t, 3 * embedDim]
           })
-          const qh = yield* l2Norm(yield* splitHeads(yield* shortConv(q, convqWeight), headDim))
-          const kh = yield* l2Norm(yield* splitHeads(yield* shortConv(k, convkWeight), headDim))
-          const vh = yield* splitHeads(yield* shortConv(v, convvWeight), headDim)
+          const qh = yield* l2Norm(yield* splitHeads(q, headDim))
+          const kh = yield* l2Norm(yield* splitHeads(k, headDim))
+          const vh = yield* splitHeads(v, headDim)
           // Zero biases follow the compute dtype (mixedBf16 runs bf16).
           const zeroBias = (n: number) => Tensor.zeros([1, n], { dtype: input.dtype })
           // Per-channel log decay: -exp(aLog) * softplus(fb(fa(x)) + dtBias).
