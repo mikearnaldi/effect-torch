@@ -194,6 +194,105 @@ fn sdpa_check<E: FusionExpression>(
     Ok(out)
 }
 
+// Validates kda_chunk operands: q, k and log_decay [.., H, T, Dk], v
+// [.., H, T, Dv], beta [.., H, T, 1]; returns the output shape
+// [.., H, T, Dv]. Leading dims must match exactly.
+fn kda_check<E: FusionExpression>(
+    op: &str,
+    q: &Node<E>,
+    k: &Node<E>,
+    v: &Node<E>,
+    log_decay: &Node<E>,
+    beta: &Node<E>,
+) -> Result<Vec<usize>, String> {
+    let rank = q.shape.len();
+    if rank < 2
+        || k.shape.len() != rank
+        || v.shape.len() != rank
+        || log_decay.shape.len() != rank
+        || beta.shape.len() != rank
+    {
+        return Err(format!(
+            "{op}: q, k, v, log_decay and beta must share a rank >= 2, got {:?}, {:?}, {:?}, {:?} and {:?}",
+            q.shape, k.shape, v.shape, log_decay.shape, beta.shape
+        ));
+    }
+    if k.shape != q.shape || log_decay.shape != q.shape {
+        return Err(format!(
+            "{op}: q, k and log_decay must share a shape, got {:?}, {:?} and {:?}",
+            q.shape, k.shape, log_decay.shape
+        ));
+    }
+    if v.shape[..rank - 1] != q.shape[..rank - 1] {
+        return Err(format!(
+            "{op}: v must match q on all but the head dim, got {:?} and {:?}",
+            v.shape, q.shape
+        ));
+    }
+    let mut beta_shape = q.shape.clone();
+    beta_shape[rank - 1] = 1;
+    if beta.shape != beta_shape {
+        return Err(format!(
+            "{op}: beta must have shape {beta_shape:?}, got {:?}",
+            beta.shape
+        ));
+    }
+    if !matches!(q.dtype, DType::F32 | DType::F64 | DType::BF16) {
+        return Err(format!(
+            "{op}: dtype must be f32, f64 or bf16, got {:?}",
+            q.dtype
+        ));
+    }
+    for (name, t) in [("k", k), ("v", v), ("log_decay", log_decay), ("beta", beta)] {
+        if t.dtype != q.dtype {
+            return Err(format!(
+                "{op}: all operands must share a dtype, got {:?} and {:?} for {name}",
+                q.dtype, t.dtype
+            ));
+        }
+        if !t.device.same_device(&q.device) {
+            return Err(format!("{op}: all operands must be on the same device"));
+        }
+    }
+    let mut out = q.shape.clone();
+    out[rank - 1] = v.shape[rank - 1];
+    Ok(out)
+}
+
+// Validates a short_conv1d pair: x [.., T, C], weight [C, K].
+fn short_conv_check<E: FusionExpression>(
+    op: &str,
+    x: &Node<E>,
+    weight: &Node<E>,
+) -> Result<(), String> {
+    if x.shape.len() < 2 || weight.shape.len() != 2 {
+        return Err(format!(
+            "{op}: expected x [.., T, C] and weight [C, K], got {:?} and {:?}",
+            x.shape, weight.shape
+        ));
+    }
+    let c = x.shape[x.shape.len() - 1];
+    if weight.shape[0] != c {
+        return Err(format!(
+            "{op}: weight has {} channels, expected {c}",
+            weight.shape[0]
+        ));
+    }
+    if weight.shape[1] == 0 {
+        return Err(format!("{op}: kernel size must be >= 1"));
+    }
+    if !x.dtype.is_float() || x.dtype != weight.dtype {
+        return Err(format!(
+            "{op}: dtypes must be floating point and match, got {:?} and {:?}",
+            x.dtype, weight.dtype
+        ));
+    }
+    if !x.device.same_device(&weight.device) {
+        return Err(format!("{op}: input and weight must be on the same device"));
+    }
+    Ok(())
+}
+
 fn conv_out_dim(
     input: usize,
     kernel: usize,
@@ -511,6 +610,65 @@ pub enum NodeKind<E: FusionExpression> {
         scale: f64,
         layer: u32,
         window: Option<usize>,
+    },
+    // Kimi Delta Attention (RFC 0018): gated delta-rule linear attention
+    // as one semantic node (the Sdpa precedent — semantics in the graph,
+    // execution strategy native). q, k and log_decay are [.., H, T, Dk],
+    // v is [.., H, T, Dv] and beta is [.., H, T, 1], all with equal
+    // leading dims. log_decay holds the raw per-channel log decay rates
+    // (<= 0, pre-cumsum; the gate activation lives upstream) and beta is
+    // already sigmoided into [0, 1]. The recurrence is
+    // S_t = (I - beta_t k_t k_t^T) Diag(exp(log_decay_t)) S_{t-1}
+    //     + beta_t k_t v_t^T,   o_t = scale * S_t^T q_t
+    // starting from a zero state; the output is [.., H, T, Dv]. The
+    // eval arms compose the chunked parallel form (chunk 64, WY
+    // representation + UT transform) as the reference implementation;
+    // fused kernels can replace them without touching the graph. The
+    // decode rewrite turns this into a stateful KdaRecurrence. Not yet
+    // differentiable (phase 4 adds the closed-form backward).
+    KdaChunk {
+        q: Arc<Node<E>>,
+        k: Arc<Node<E>>,
+        v: Arc<Node<E>>,
+        log_decay: Arc<Node<E>>,
+        beta: Arc<Node<E>>,
+        scale: f64,
+    },
+    // RFC 0018: stateful KDA recurrence, the decode/prefill semantic
+    // node produced by the decode rewrite (never written by user code —
+    // `compile_decode` turns each KdaChunk into one). Same operand
+    // contract as KdaChunk, but the initial state comes from the
+    // sequence's slot in the run's decode context and the final state is
+    // written back to it, keeping the graph a pure function of its
+    // inputs. Not differentiable.
+    KdaRecurrence {
+        q: Arc<Node<E>>,
+        k: Arc<Node<E>>,
+        v: Arc<Node<E>>,
+        log_decay: Arc<Node<E>>,
+        beta: Arc<Node<E>>,
+        scale: f64,
+        layer: u32,
+    },
+    // Causal depthwise short convolution over [.., T, C] with weight
+    // [C, K] as one semantic node: y[t, c] = sum_j w[c, j] * x[t-K+1+j, c]
+    // with zero history (left zero-padding of K-1). Semantic so the
+    // decode rewrite can carry the K-1-token window as sequence state
+    // instead of re-deriving "this pad+conv is a short conv" from
+    // composed ops.
+    ShortConv1d {
+        x: Arc<Node<E>>,
+        weight: Arc<Node<E>>,
+    },
+    // RFC 0018: stateful short convolution, the decode/prefill semantic
+    // node produced by the decode rewrite (never written by user code).
+    // Same contract as ShortConv1d, but the K-1 previous inputs ride the
+    // sequence's slot and the new window is written back. Not
+    // differentiable.
+    ConvState {
+        x: Arc<Node<E>>,
+        weight: Arc<Node<E>>,
+        layer: u32,
     },
     // RoPE (GPT-NeoX half-split rotary) as one semantic node: x is
     // [.., T, D] with D even; the last dim rotates in half pairs by
@@ -1232,6 +1390,36 @@ impl<E: FusionExpression> NodeKind<E> {
                     ));
                 }
                 (out, q.dtype, q.device.clone())
+            }
+            NodeKind::KdaChunk {
+                q,
+                k,
+                v,
+                log_decay,
+                beta,
+                ..
+            } => {
+                let out = kda_check("kda_chunk", q, k, v, log_decay, beta)?;
+                (out, q.dtype, q.device.clone())
+            }
+            NodeKind::KdaRecurrence {
+                q,
+                k,
+                v,
+                log_decay,
+                beta,
+                ..
+            } => {
+                let out = kda_check("kda_recurrence", q, k, v, log_decay, beta)?;
+                (out, q.dtype, q.device.clone())
+            }
+            NodeKind::ShortConv1d { x, weight } => {
+                short_conv_check("short_conv1d", x, weight)?;
+                (x.shape.clone(), x.dtype, x.device.clone())
+            }
+            NodeKind::ConvState { x, weight, .. } => {
+                short_conv_check("conv_state", x, weight)?;
+                (x.shape.clone(), x.dtype, x.device.clone())
             }
             NodeKind::RotaryEmbedding { x, seq_len, .. } => {
                 let rank = x.shape.len();
@@ -1957,6 +2145,37 @@ pub fn node_children<E: FusionExpression>(kind: &NodeKind<E>) -> Vec<Arc<Node<E>
         }
         NodeKind::Sdpa { q, k, v, .. } => vec![q.clone(), k.clone(), v.clone()],
         NodeKind::KvAttention { q, k, v, .. } => vec![q.clone(), k.clone(), v.clone()],
+        NodeKind::KdaChunk {
+            q,
+            k,
+            v,
+            log_decay,
+            beta,
+            ..
+        } => vec![
+            q.clone(),
+            k.clone(),
+            v.clone(),
+            log_decay.clone(),
+            beta.clone(),
+        ],
+        NodeKind::KdaRecurrence {
+            q,
+            k,
+            v,
+            log_decay,
+            beta,
+            ..
+        } => vec![
+            q.clone(),
+            k.clone(),
+            v.clone(),
+            log_decay.clone(),
+            beta.clone(),
+        ],
+        NodeKind::ShortConv1d { x, weight } | NodeKind::ConvState { x, weight, .. } => {
+            vec![x.clone(), weight.clone()]
+        }
         NodeKind::PositionEmbedding { weight, .. } => vec![weight.clone()],
         NodeKind::RotaryEmbedding { x, .. } => vec![x.clone()],
         NodeKind::RotaryEmbeddingBackward { g, .. } => vec![g.clone()],
@@ -2267,6 +2486,47 @@ pub fn remap_children<E: FusionExpression>(
             scale: *scale,
             layer: *layer,
             window: *window,
+        },
+        NodeKind::KdaChunk {
+            q,
+            k,
+            v,
+            log_decay,
+            beta,
+            scale,
+        } => NodeKind::KdaChunk {
+            q: f(q),
+            k: f(k),
+            v: f(v),
+            log_decay: f(log_decay),
+            beta: f(beta),
+            scale: *scale,
+        },
+        NodeKind::KdaRecurrence {
+            q,
+            k,
+            v,
+            log_decay,
+            beta,
+            scale,
+            layer,
+        } => NodeKind::KdaRecurrence {
+            q: f(q),
+            k: f(k),
+            v: f(v),
+            log_decay: f(log_decay),
+            beta: f(beta),
+            scale: *scale,
+            layer: *layer,
+        },
+        NodeKind::ShortConv1d { x, weight } => NodeKind::ShortConv1d {
+            x: f(x),
+            weight: f(weight),
+        },
+        NodeKind::ConvState { x, weight, layer } => NodeKind::ConvState {
+            x: f(x),
+            weight: f(weight),
+            layer: *layer,
         },
         NodeKind::RotaryEmbedding {
             x,

@@ -996,6 +996,33 @@ impl LazyTensor {
     }
 
     #[napi]
+    pub fn kda_chunk(
+        &self,
+        k: &LazyTensor,
+        v: &LazyTensor,
+        log_decay: &LazyTensor,
+        beta: &LazyTensor,
+        scale: f64,
+    ) -> Result<Self> {
+        lazy_ctor!(Node::new(NodeKind::KdaChunk {
+            q: self.node.clone(),
+            k: k.node.clone(),
+            v: v.node.clone(),
+            log_decay: log_decay.node.clone(),
+            beta: beta.node.clone(),
+            scale,
+        }))
+    }
+
+    #[napi(js_name = "shortConv1d")]
+    pub fn short_conv1d(&self, weight: &LazyTensor) -> Result<Self> {
+        lazy_ctor!(Node::new(NodeKind::ShortConv1d {
+            x: self.node.clone(),
+            weight: weight.node.clone(),
+        }))
+    }
+
+    #[napi]
     pub fn position_embedding(&self, seq_len: u32) -> Result<Self> {
         lazy_ctor!(Node::new(NodeKind::PositionEmbedding {
             weight: self.node.clone(),
@@ -1700,6 +1727,59 @@ fn eval_uncached(node: &Arc<Node>, evaluator: &mut Evaluator) -> err::Res<Value>
             .and_then(|values| values.get(*index as usize))
             .cloned()
             .ok_or_else(|| "sdpa backward out: outputs missing".to_string())?,
+        NodeKind::KdaChunk {
+            q,
+            k,
+            v,
+            log_decay,
+            beta,
+            scale,
+        } => Value(composed::kda_chunk_forward(
+            evaluator.value(q.id)?.tensor(),
+            evaluator.value(k.id)?.tensor(),
+            evaluator.value(v.id)?.tensor(),
+            evaluator.value(log_decay.id)?.tensor(),
+            evaluator.value(beta.id)?.tensor(),
+            *scale,
+        )),
+        NodeKind::KdaRecurrence {
+            q,
+            k,
+            v,
+            log_decay,
+            beta,
+            scale,
+            layer,
+        } => {
+            let context = evaluator.kv.clone().ok_or_else(|| {
+                "kda recurrence: node evaluates only inside a decode program run".to_string()
+            })?;
+            kda_recurrence(
+                &context,
+                *layer,
+                &evaluator.value(q.id)?,
+                &evaluator.value(k.id)?,
+                &evaluator.value(v.id)?,
+                &evaluator.value(log_decay.id)?,
+                &evaluator.value(beta.id)?,
+                *scale,
+            )?
+        }
+        NodeKind::ShortConv1d { x, weight } => Value(composed::short_conv1d_forward(
+            evaluator.value(x.id)?.tensor(),
+            evaluator.value(weight.id)?.tensor(),
+        )),
+        NodeKind::ConvState { x, weight, layer } => {
+            let context = evaluator.kv.clone().ok_or_else(|| {
+                "conv state: node evaluates only inside a decode program run".to_string()
+            })?;
+            conv_state(
+                &context,
+                *layer,
+                &evaluator.value(x.id)?,
+                &evaluator.value(weight.id)?,
+            )?
+        }
         NodeKind::PositionEmbedding { weight, seq_len } => {
             let weight = evaluator.value(weight.id)?;
             Value(
@@ -2485,6 +2565,10 @@ fn node_kind_name(kind: &NodeKind) -> &'static str {
         NodeKind::LayerNormBackwardOut { .. } => "LayerNormOut",
         NodeKind::PositionEmbedding { .. } => "PosEmb",
         NodeKind::KvAttention { .. } => "KvAttention",
+        NodeKind::KdaChunk { .. } => "KdaChunk",
+        NodeKind::KdaRecurrence { .. } => "KdaRecurrence",
+        NodeKind::ShortConv1d { .. } => "ShortConv",
+        NodeKind::ConvState { .. } => "ConvState",
         NodeKind::Sum { .. }
         | NodeKind::Mean { .. }
         | NodeKind::Max { .. }
@@ -2932,6 +3016,11 @@ struct SeqState {
     advance: usize,
     last_hash: u64,
     pending: Vec<u32>,
+    // RFC 0018: per-layer recurrent state, allocated lazily from the
+    // decode geometry on first use — [H, Dk, Dv] f32 per KDA layer and
+    // [K-1, C] f32 per short-conv layer.
+    kda_states: Vec<Tensor>,
+    conv_states: Vec<Tensor>,
 }
 
 impl SeqState {
@@ -2951,9 +3040,164 @@ impl SeqState {
     }
 }
 
+// RFC 0018: uniform KDA layer geometry of a decode program.
+#[derive(Clone, Copy, Default)]
+struct KdaGeometry {
+    layers: usize,
+    heads: usize,
+    head_dim: usize,
+    value_dim: usize,
+}
+
+// RFC 0018: uniform short-conv layer geometry of a decode program.
+#[derive(Clone, Copy, Default)]
+struct ConvGeometry {
+    layers: usize,
+    channels: usize,
+    kernel: usize,
+}
+
 struct KvContext {
     pool: Arc<PoolInner>,
     slots: Vec<Arc<Mutex<SeqState>>>,
+    kda: KdaGeometry,
+    conv: ConvGeometry,
+}
+
+// RFC 0018: stateful KDA evaluation, one sequence slot per leading
+// batch row. Each slot's [H, Dk, Dv] f32 state drives the chunked
+// recurrence and is replaced by the final state.
+#[allow(clippy::too_many_arguments)]
+fn kda_recurrence(
+    context: &KvContext,
+    layer: u32,
+    q: &Value,
+    k: &Value,
+    v: &Value,
+    log_decay: &Value,
+    beta: &Value,
+    scale: f64,
+) -> err::Res<Value> {
+    let geometry = context.kda;
+    if geometry.layers == 0 || (layer as usize) >= geometry.layers {
+        return Err("kda recurrence: layer out of range for the decode geometry".to_string());
+    }
+    let dimensions = q.shape();
+    let batch = dimensions[..dimensions.len() - 3].iter().product::<usize>();
+    if batch != context.slots.len() {
+        return Err(format!(
+            "kda recurrence: batch {batch} does not match {} decode slots",
+            context.slots.len()
+        ));
+    }
+    let mut outputs = Vec::with_capacity(batch);
+    for (index, slot) in context.slots.iter().enumerate() {
+        let narrow = |value: &Value, width: usize| {
+            value
+                .tensor()
+                .view(value.tensor().layout.narrow(0, index, 1))
+                .contiguous()
+                .view(Layout::contiguous(vec![
+                    geometry.heads,
+                    dimensions[dimensions.len() - 2],
+                    width,
+                ]))
+        };
+        let mut state = slot
+            .lock()
+            .map_err(|error| format!("kda recurrence: sequence lock poisoned: {error}"))?;
+        while state.kda_states.len() < geometry.layers {
+            state.kda_states.push(Tensor::zeros(
+                &[geometry.heads, geometry.head_dim, geometry.value_dim],
+                DType::F32,
+            ));
+        }
+        let tokens = dimensions[dimensions.len() - 2];
+        let qs = narrow(q, geometry.head_dim);
+        let ks = narrow(k, geometry.head_dim);
+        let vs = narrow(v, geometry.value_dim);
+        let gs = narrow(log_decay, geometry.head_dim);
+        let bs = narrow(beta, 1);
+        // Chunked prefill right-pads: pad rows must contribute identity
+        // updates (beta 0, log-decay 0) so the running state only
+        // absorbs real tokens.
+        let (gs, bs) = if state.advance < tokens {
+            let mut mask = vec![0f32; tokens];
+            mask[..state.advance].fill(1.0);
+            let mask = Tensor::from_vec(mask, vec![1, tokens, 1]);
+            (gs.mul(&mask), bs.mul(&mask))
+        } else {
+            (gs, bs)
+        };
+        let (out, final_state) = composed::kda_chunk_with_state(
+            &qs,
+            &ks,
+            &vs,
+            &gs,
+            &bs,
+            scale,
+            &state.kda_states[layer as usize].clone(),
+        );
+        state.kda_states[layer as usize] = final_state;
+        let mut out_shape = out.shape().to_vec();
+        out_shape.insert(0, 1);
+        outputs.push(Value(out.view(Layout::contiguous(out_shape))));
+    }
+    let tensors = outputs.iter().map(Value::tensor).collect::<Vec<_>>();
+    Ok(Value(Tensor::cat(&tensors, 0)))
+}
+
+// RFC 0018: stateful short-conv evaluation, one sequence slot per
+// leading batch row. Each slot's [K-1, C] f32 window is shifted by the
+// new tokens and written back.
+fn conv_state(context: &KvContext, layer: u32, x: &Value, weight: &Value) -> err::Res<Value> {
+    let geometry = context.conv;
+    if geometry.layers == 0 || (layer as usize) >= geometry.layers {
+        return Err("conv state: layer out of range for the decode geometry".to_string());
+    }
+    let dimensions = x.shape();
+    let batch = dimensions[..dimensions.len() - 2].iter().product::<usize>();
+    if batch != context.slots.len() {
+        return Err(format!(
+            "conv state: batch {batch} does not match {} decode slots",
+            context.slots.len()
+        ));
+    }
+    let t = dimensions[dimensions.len() - 2];
+    let in_dtype = x.dtype();
+    let w32 = weight.tensor().cast(DType::F32).contiguous();
+    let mut outputs = Vec::with_capacity(batch);
+    for (index, slot) in context.slots.iter().enumerate() {
+        let xs = x
+            .tensor()
+            .view(x.tensor().layout.narrow(0, index, 1))
+            .contiguous()
+            .view(Layout::contiguous(vec![t, geometry.channels]))
+            .cast(DType::F32);
+        let mut state = slot
+            .lock()
+            .map_err(|error| format!("conv state: sequence lock poisoned: {error}"))?;
+        while state.conv_states.len() < geometry.layers {
+            state.conv_states.push(Tensor::zeros(
+                &[geometry.kernel - 1, geometry.channels],
+                DType::F32,
+            ));
+        }
+        let (out, new_state) = composed::short_conv1d_with_state(
+            &xs,
+            &w32,
+            &state.conv_states[layer as usize],
+            state.advance,
+        );
+        state.conv_states[layer as usize] = new_state;
+        outputs.push(Value(out.cast(in_dtype).view(Layout::contiguous(vec![
+            1,
+            t,
+            geometry.channels,
+        ]))));
+    }
+    let tensors = outputs.iter().map(Value::tensor).collect::<Vec<_>>();
+    Ok(Value(Tensor::cat(&tensors, 0)))
 }
 
 fn kv_attention(
@@ -3191,6 +3435,8 @@ struct DecodeGeometry {
     layers: usize,
     kv_heads: usize,
     head_dim: usize,
+    kda: KdaGeometry,
+    conv: ConvGeometry,
     cursor_slot: u32,
     cursor_tensor: bool,
 }
@@ -3243,8 +3489,12 @@ fn decode_rewrite(
     }
     let mut remapped = HashMap::new();
     let mut layers = 0;
+    let mut kda_layers = 0;
+    let mut conv_layers = 0;
     let mut cursor_tensor = false;
     let mut geometry = None;
+    let mut kda_geometry = None;
+    let mut conv_geometry = None;
     for node in order {
         let remap = |child: &Arc<Node>| {
             remapped
@@ -3292,6 +3542,69 @@ fn decode_rewrite(
                     scale: *scale,
                     layer,
                     window,
+                }
+            }
+            NodeKind::KdaChunk {
+                q,
+                k,
+                v,
+                log_decay,
+                beta,
+                scale,
+            } => {
+                let rank = q.shape.len();
+                if rank != 4 || q.shape[..rank - 3].iter().product::<usize>() != batch {
+                    return Err(format!(
+                        "decode: kda state caching expects layers of shape [{batch}, H, T, D], got {:?}",
+                        q.shape
+                    ));
+                }
+                let current = (q.shape[rank - 3], q.shape[rank - 1], v.shape[rank - 1]);
+                if let Some(previous) = kda_geometry {
+                    if previous != current {
+                        return Err(format!(
+                            "decode: kda layers disagree on head geometry ({previous:?} vs {current:?})"
+                        ));
+                    }
+                } else {
+                    kda_geometry = Some(current);
+                }
+                let layer = kda_layers;
+                kda_layers += 1;
+                NodeKind::KdaRecurrence {
+                    q: remap(q),
+                    k: remap(k),
+                    v: remap(v),
+                    log_decay: remap(log_decay),
+                    beta: remap(beta),
+                    scale: *scale,
+                    layer,
+                }
+            }
+            NodeKind::ShortConv1d { x, weight } => {
+                let rank = x.shape.len();
+                if rank != 3 || x.shape[..rank - 2].iter().product::<usize>() != batch {
+                    return Err(format!(
+                        "decode: conv state caching expects layers of shape [{batch}, T, C], got {:?}",
+                        x.shape
+                    ));
+                }
+                let current = (x.shape[rank - 1], weight.shape[1]);
+                if let Some(previous) = conv_geometry {
+                    if previous != current {
+                        return Err(format!(
+                            "decode: short conv layers disagree on geometry ({previous:?} vs {current:?})"
+                        ));
+                    }
+                } else {
+                    conv_geometry = Some(current);
+                }
+                let layer = conv_layers;
+                conv_layers += 1;
+                NodeKind::ConvState {
+                    x: remap(x),
+                    weight: remap(weight),
+                    layer,
                 }
             }
             NodeKind::RotaryEmbedding {
@@ -3380,13 +3693,28 @@ fn decode_rewrite(
         };
         remapped.insert(node.id, Node::new(kind)?);
     }
-    if layers == 0 {
+    if layers == 0 && kda_layers == 0 {
         return Err(
-            "decode: model has no cacheable attention (no causal sdpa node in the forward graph)"
+            "decode: model has no cacheable attention or recurrent layers (no causal sdpa or kda chunk node in the forward graph)"
                 .to_string(),
         );
     }
-    let (kv_heads, head_dim) = geometry.expect("attention geometry exists");
+    let (kv_heads, head_dim) = geometry.unwrap_or((0, 0));
+    let kda = kda_geometry
+        .map(|(heads, head_dim, value_dim)| KdaGeometry {
+            layers: kda_layers as usize,
+            heads,
+            head_dim,
+            value_dim,
+        })
+        .unwrap_or_default();
+    let conv = conv_geometry
+        .map(|(channels, kernel)| ConvGeometry {
+            layers: conv_layers as usize,
+            channels,
+            kernel,
+        })
+        .unwrap_or_default();
     let roots = roots
         .iter()
         .map(|root| {
@@ -3402,6 +3730,8 @@ fn decode_rewrite(
             layers: layers as usize,
             kv_heads,
             head_dim,
+            kda,
+            conv,
             cursor_slot,
             cursor_tensor,
         },
@@ -3441,7 +3771,13 @@ impl NativeKvPool {
             max_tokens as usize,
         );
         let block_size = block_size.unwrap_or(16) as usize;
-        if layers == 0 || kv_heads == 0 || head_dim == 0 {
+        if layers == 0 && (kv_heads != 0 || head_dim != 0) {
+            return Err(Error::new(
+                Status::InvalidArg,
+                "kv pool: heads and head dim must be zero when layers is zero",
+            ));
+        }
+        if layers > 0 && (kv_heads == 0 || head_dim == 0) {
             return Err(Error::new(
                 Status::InvalidArg,
                 "kv pool: layers, kv heads and head dim must be positive",
@@ -3520,6 +3856,8 @@ impl NativeKvSequence {
                 advance: 0,
                 last_hash: HASH_SEED,
                 pending: Vec::new(),
+                kda_states: Vec::new(),
+                conv_states: Vec::new(),
             })),
             run_lock: Arc::new(Mutex::new(())),
             released: AtomicBool::new(false),
@@ -3626,6 +3964,8 @@ pub struct DecodeProgram {
     layers: u32,
     kv_heads: u32,
     head_dim: u32,
+    kda: KdaGeometry,
+    conv: ConvGeometry,
     batch: u32,
     cursor_tensor: bool,
 }
@@ -3655,6 +3995,41 @@ impl DecodeProgram {
     #[napi(getter)]
     pub fn head_dim(&self) -> u32 {
         self.head_dim
+    }
+
+    #[napi(getter)]
+    pub fn kda_layers(&self) -> u32 {
+        self.kda.layers as u32
+    }
+
+    #[napi(getter)]
+    pub fn kda_heads(&self) -> u32 {
+        self.kda.heads as u32
+    }
+
+    #[napi(getter)]
+    pub fn kda_head_dim(&self) -> u32 {
+        self.kda.head_dim as u32
+    }
+
+    #[napi(getter)]
+    pub fn kda_value_dim(&self) -> u32 {
+        self.kda.value_dim as u32
+    }
+
+    #[napi(getter)]
+    pub fn conv_layers(&self) -> u32 {
+        self.conv.layers as u32
+    }
+
+    #[napi(getter)]
+    pub fn conv_channels(&self) -> u32 {
+        self.conv.channels as u32
+    }
+
+    #[napi(getter)]
+    pub fn conv_kernel(&self) -> u32 {
+        self.conv.kernel as u32
     }
 
     #[napi]
@@ -3823,6 +4198,8 @@ impl DecodeProgram {
                 .iter()
                 .map(|sequence| sequence.state.clone())
                 .collect(),
+            kda: self.kda,
+            conv: self.conv,
         });
         let mut ordered = sequences.clone();
         ordered.sort_by_key(|sequence| Arc::as_ptr(&sequence.run_lock) as usize);
@@ -3909,6 +4286,27 @@ impl DecodeProgram {
                 .iter()
                 .map(|state| state.lock().map(|state| state.blocks.len()).unwrap_or(0))
                 .collect::<Vec<_>>();
+            // RFC 0018: recurrent state mutates in place during the
+            // walk, so a failed run restores the pre-run snapshot (KV
+            // blocks roll back by refcount instead).
+            let kda_snapshots = states
+                .iter()
+                .map(|state| {
+                    state
+                        .lock()
+                        .map(|state| state.kda_states.clone())
+                        .unwrap_or_default()
+                })
+                .collect::<Vec<_>>();
+            let conv_snapshots = states
+                .iter()
+                .map(|state| {
+                    state
+                        .lock()
+                        .map(|state| state.conv_states.clone())
+                        .unwrap_or_default()
+                })
+                .collect::<Vec<_>>();
             let rollback = || {
                 for (index, state) in states.iter().enumerate() {
                     if let Ok(mut state) = state.lock() {
@@ -3916,6 +4314,8 @@ impl DecodeProgram {
                             context.pool.unref_block(block);
                         }
                         state.advance = 0;
+                        state.kda_states = kda_snapshots[index].clone();
+                        state.conv_states = conv_snapshots[index].clone();
                     }
                 }
             };
@@ -3992,6 +4392,8 @@ pub fn compile_decode(
         layers: geometry.layers as u32,
         kv_heads: geometry.kv_heads as u32,
         head_dim: geometry.head_dim as u32,
+        kda: geometry.kda,
+        conv: geometry.conv,
         batch,
         cursor_tensor: geometry.cursor_tensor,
     })
@@ -4051,10 +4453,14 @@ mod tests {
             advance: 3,
             last_hash: HASH_SEED,
             pending: Vec::new(),
+            kda_states: Vec::new(),
+            conv_states: Vec::new(),
         }));
         let context = KvContext {
             pool,
             slots: vec![state.clone()],
+            kda: KdaGeometry::default(),
+            conv: ConvGeometry::default(),
         };
         let q = Value(Tensor::from_vec(
             (0..24).map(|value| value as f32).collect(),
@@ -4126,6 +4532,8 @@ mod tests {
             advance: 0,
             last_hash: HASH_SEED,
             pending: Vec::new(),
+            kda_states: Vec::new(),
+            conv_states: Vec::new(),
         };
         state.note_tokens(&pool, &[7, 8, 9]);
         let first = chain_hash(HASH_SEED, &[7, 8]);

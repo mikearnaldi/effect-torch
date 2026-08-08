@@ -1,0 +1,318 @@
+import { describe, expect } from "@effect/vitest"
+import * as assert from "@effect/vitest/utils"
+import { Effect } from "effect"
+import { Model, Tensor } from "../src/index.ts"
+import { floats, onDevices } from "./utils/devices.ts"
+
+const values = (t: Tensor.Any) => Tensor.toNumberArray(t)
+
+// f32 accumulation orders differ between the composed chunk kernels and
+// the per-token oracle; 70 recurrent steps stay well within this.
+const TOL = 2e-3
+const close = (a: number, b: number): boolean => Math.abs(a - b) <= TOL * Math.max(1, Math.abs(b))
+
+// deterministic, asymmetric values in (-1, 1)
+const pattern = (n: number): Array<number> => Array.from({ length: n }, (_, i) => ((i * 7 + 3) % 13 - 6) / 5)
+
+// Per-token gated delta-rule recurrence, the ground truth for the chunked
+// semantic node:
+//   S_t = (I - beta_t k_t k_tᵀ) Diag(exp(g_t)) S_{t-1} + beta_t k_t v_tᵀ
+//   o_t = scale · S_tᵀ q_t
+const naiveKda = (
+  q: Tensor.Any,
+  k: Tensor.Any,
+  v: Tensor.Any,
+  logDecay: Tensor.Any,
+  beta: Tensor.Any,
+  scale: number
+) =>
+  Effect.gen(function*() {
+    const [b, h, t, dk] = q.shape
+    const dv = v.shape[3]
+    const swap = [0, 1, 3, 2]
+    let state = yield* Tensor.zeros([b, h, dk, dv])
+    const outs: Array<Tensor.Any> = []
+    for (let i = 0; i < t; i++) {
+      const at = (x: Tensor.Any, width: number) => Tensor.slice(x, { start: [0, 0, i, 0], end: [b, h, i + 1, width] })
+      const qT = yield* at(q, dk)
+      const kT = yield* at(k, dk)
+      const vT = yield* at(v, dv)
+      const alphaT = yield* Tensor.exp(yield* at(logDecay, dk))
+      const bT = yield* at(beta, 1)
+      const decayed = yield* Tensor.mul(state, yield* Tensor.transpose(alphaT, swap))
+      const kvMem = yield* Tensor.matmul(
+        yield* Tensor.transpose(decayed, swap),
+        yield* Tensor.transpose(kT, swap)
+      )
+      const delta = yield* Tensor.mul(
+        yield* Tensor.sub(yield* Tensor.transpose(vT, swap), kvMem),
+        yield* Tensor.transpose(bT, swap)
+      )
+      state = yield* Tensor.add(
+        decayed,
+        yield* Tensor.matmul(yield* Tensor.transpose(kT, swap), yield* Tensor.transpose(delta, swap))
+      )
+      const o = yield* Tensor.mul(
+        yield* Tensor.matmul(yield* Tensor.transpose(state, swap), yield* Tensor.transpose(qT, swap)),
+        yield* Tensor.constantLike(state, scale)
+      )
+      outs.push(yield* Tensor.transpose(o, swap))
+    }
+    return yield* Tensor.concat(outs as [Tensor.Any, Tensor.Any, ...Array<Tensor.Any>], { dim: 2 })
+  })
+
+const inputs = (t: number, dk: number, dv: number, seed: number) =>
+  Effect.gen(function*() {
+    const b = 1
+    const h = 2
+    const f32 = (data: ReadonlyArray<number>, shape: ReadonlyArray<number>) =>
+      Tensor.fromTypedArray(floats(data), shape)
+    const n = b * h * t * dk
+    const q = yield* f32(pattern(n).map((x) => x * 0.8 + seed * 0.01), [b, h, t, dk])
+    const k = yield* f32(pattern(n).map((x) => x * 0.7 - 0.1), [b, h, t, dk])
+    const v = yield* f32(pattern(b * h * t * dv).map((x) => x * -0.5 + 0.2), [b, h, t, dv])
+    const logDecay = yield* f32(pattern(n).map((x) => -(Math.abs(x) + 0.05) * 1.5), [b, h, t, dk])
+    const beta = yield* f32(pattern(b * h * t).map((x) => Math.abs(x) * 0.9 + 0.05), [b, h, t, 1])
+    return { beta, k, logDecay, q, v }
+  })
+
+onDevices("Kda", () => (it) => {
+  describe("kdaChunk", () => {
+    const parity = (name: string, t: number, dk: number, dv: number, seed: number) =>
+      it.effect(name, () =>
+        Effect.gen(function*() {
+          const { beta, k, logDecay, q, v } = yield* inputs(t, dk, dv, seed)
+          const scale = 1 / Math.sqrt(dk)
+          const out = yield* Tensor.kdaChunk(q, k, v, logDecay, beta)
+          expect(out.shape).toEqual([1, 2, t, dv])
+          const expected = yield* naiveKda(q, k, v, logDecay, beta, scale)
+          const [a, b] = [yield* values(out), yield* values(expected)]
+          a.forEach((x, i) => assert.assertTrue(close(x, b[i]), `out[${i}]: ${x} != ${b[i]}`))
+        }))
+
+    parity("matches the per-token recurrence within a sub-chunk", 13, 8, 8, 1)
+    parity("matches the per-token recurrence across sub-chunks", 40, 8, 16, 2)
+    parity("matches the per-token recurrence across a ragged chunk tail", 70, 16, 8, 3)
+    parity("matches the per-token recurrence over multiple chunks", 129, 16, 16, 4)
+    parity("matches the per-token recurrence for a single token", 1, 8, 8, 5)
+
+    it.effect("respects a custom scale", () =>
+      Effect.gen(function*() {
+        const { beta, k, logDecay, q, v } = yield* inputs(20, 8, 8, 6)
+        const out = yield* Tensor.kdaChunk(q, k, v, logDecay, beta, { scale: 0.5 })
+        const expected = yield* naiveKda(q, k, v, logDecay, beta, 0.5)
+        const [a, b] = [yield* values(out), yield* values(expected)]
+        a.forEach((x, i) => assert.assertTrue(close(x, b[i]), `out[${i}]: ${x} != ${b[i]}`))
+      }))
+
+    it.effect("rejects a mismatched beta shape", () =>
+      Effect.gen(function*() {
+        const { k, logDecay, q, v } = yield* inputs(8, 8, 8, 7)
+        const beta = yield* Tensor.fromTypedArray(floats(pattern(1 * 2 * 8 * 2)), [1, 2, 8, 2])
+        const result = yield* Tensor.kdaChunk(q, k, v, logDecay, beta).pipe(Effect.flip)
+        assert.assertTrue(String(result.message).includes("beta must have shape"))
+      }))
+  })
+
+  describe("kimiDeltaAttention", () => {
+    it.effect("runs a finite forward pass at the declared shapes", () =>
+      Effect.gen(function*() {
+        const model = yield* Model.kimiDeltaAttention("kda", 32, 4)
+        expect(model.names).toEqual([
+          "kda.qkv.weight",
+          "kda.qkv.bias",
+          "kda.convq.weight",
+          "kda.convk.weight",
+          "kda.convv.weight",
+          "kda.fa.weight",
+          "kda.fb.weight",
+          "kda.alog",
+          "kda.dtbias",
+          "kda.b.weight",
+          "kda.ga.weight",
+          "kda.gb.weight",
+          "kda.norm.weight",
+          "kda.wo.weight",
+          "kda.wo.bias"
+        ])
+        const params = yield* Tensor.compute(yield* model.init)
+        const x = yield* Tensor.fromTypedArray(
+          floats(Array.from({ length: 2 * 10 * 32 }, (_, i) => ((i * 5 + 1) % 11 - 5) / 5)),
+          [2, 10, 32]
+        )
+        const [out] = yield* Tensor.compute([yield* model.forward(params, x)])
+        expect(out.shape).toEqual([2, 10, 32])
+        const vs = yield* values(out)
+        vs.forEach((x, i) => assert.assertTrue(Number.isFinite(x), `out[${i}] not finite`))
+      }))
+
+    it.effect("rejects invalid configurations", () =>
+      Effect.gen(function*() {
+        expect((yield* Effect.flip(Model.kimiDeltaAttention("", 8, 2))).op).toBe("kimiDeltaAttention")
+        expect((yield* Effect.flip(Model.kimiDeltaAttention("a", 0, 2))).op).toBe("kimiDeltaAttention")
+        expect((yield* Effect.flip(Model.kimiDeltaAttention("a", 7, 2))).message).toContain("divisible")
+      }))
+  })
+
+  describe("shortConv1d", () => {
+    it.effect("matches the pad + depthwise conv1d composition", () =>
+      Effect.gen(function*() {
+        const x = yield* Tensor.fromTypedArray(
+          floats(Array.from({ length: 2 * 7 * 6 }, (_, i) => ((i * 5 + 1) % 11 - 5) / 5)),
+          [2, 7, 6]
+        )
+        const w = yield* Tensor.fromTypedArray(
+          floats(Array.from({ length: 6 * 4 }, (_, i) => ((i * 3 + 2) % 7 - 3) / 3)),
+          [6, 4]
+        )
+        const viaNode = yield* Tensor.shortConv1d(x, w)
+        const manual = Effect.gen(function*() {
+          const transposed = yield* Tensor.transpose(x, [0, 2, 1])
+          const padded = yield* Tensor.pad(transposed, [[0, 0], [0, 0], [3, 0]])
+          const w4 = yield* Tensor.reshape(w, [6, 1, 4])
+          const convolved = yield* Tensor.conv1d(padded, w4, { groups: 6 })
+          return yield* Tensor.transpose(convolved, [0, 2, 1])
+        })
+        const [a, b] = [yield* values(viaNode), yield* values(yield* manual)]
+        a.forEach((x, i) => assert.assertTrue(close(x, b[i]), `out[${i}]: ${x} != ${b[i]}`))
+      }))
+  })
+
+  describe("recurrent generation (RFC 0018)", () => {
+    const VOCAB = 12
+    const EMBED = 8
+    const HEADS = 2
+
+    // The K3-style hybrid: a KDA layer plus a causal full-attention
+    // layer with no positional encoding anywhere.
+    const makeHybrid = Effect.gen(function*() {
+      const wte = yield* Model.embedding("wte", VOCAB, EMBED)
+      const kda = yield* Model.kimiDeltaAttention("kda", EMBED, HEADS)
+      const attn = yield* Model.multiHeadAttention("attn", EMBED, HEADS, { causal: true })
+      const head = yield* Model.linear("head", EMBED, VOCAB)
+      return yield* Model.chain(wte, kda, attn, head)
+    })
+
+    const makePureKda = Effect.gen(function*() {
+      const wte = yield* Model.embedding("wte", VOCAB, EMBED)
+      const kda = yield* Model.kimiDeltaAttention("kda", EMBED, HEADS)
+      const head = yield* Model.linear("head", EMBED, VOCAB)
+      return yield* Model.chain(wte, kda, head)
+    })
+
+    const ids = (tokens: ReadonlyArray<number>) => Tensor.fromTypedArray(new Uint32Array(tokens), [1, tokens.length])
+
+    const argmaxOf = (logits: Tensor.Any) =>
+      Effect.map(
+        Tensor.toNumberArray(logits),
+        (values) => values.reduce((best, value, index) => (value > values[best] ? index : best), 0)
+      )
+
+    // The reference: greedy generation through the ordinary forward
+    // graph, recomputing the whole context every step.
+    const naiveGenerate = (model: Model.Model, params: Model.Params, prompt: ReadonlyArray<number>, steps: number) =>
+      Effect.gen(function*() {
+        const context = [...prompt]
+        for (let i = 0; i < steps; i++) {
+          const input = yield* ids(context)
+          const output = yield* model.forward(params, input)
+          const t = input.shape[1]
+          const [logits] = yield* Tensor.compute([
+            yield* Tensor.reshape(
+              yield* Tensor.slice(output, { start: [0, t - 1, 0], end: [1, t, VOCAB] }),
+              [VOCAB]
+            )
+          ])
+          context.push(yield* argmaxOf(logits))
+        }
+        return context
+      })
+
+    const cachedGenerate = (program: Model.InferenceProgram, prompt: ReadonlyArray<number>, steps: number) =>
+      Effect.gen(function*() {
+        const gen = yield* program.generation()
+        const context = [...prompt]
+        const entry = yield* gen.add(yield* ids(prompt))
+        let logits = entry.logits
+        for (let i = 0; i < steps; i++) {
+          const next = yield* argmaxOf(logits)
+          context.push(next)
+          if (i < steps - 1) {
+            const [nextLogits] = yield* gen.step([{ seq: entry.seq, token: next }])
+            logits = nextLogits
+          }
+        }
+        return context
+      })
+
+    it.effect("hybrid KDA + NoPE attention matches naive greedy generation token-for-token", () =>
+      Effect.gen(function*() {
+        const model = yield* makeHybrid
+        const params = yield* Tensor.compute(yield* model.init)
+        const prompt = [1, 5, 3]
+        const steps = 9
+        const program = yield* Model.inference(model, params, {
+          maxTokens: 64,
+          blockSize: 4,
+          prefillChunk: 4
+        })
+        const naive = yield* naiveGenerate(model, params, prompt, steps)
+        const cached = yield* cachedGenerate(program, prompt, steps)
+        expect(cached).toEqual(naive)
+        expect(cached.length).toBe(prompt.length + steps)
+      }))
+
+    it.effect("a pure-KDA stack (zero KV layers) generates through the decode programs", () =>
+      Effect.gen(function*() {
+        const model = yield* makePureKda
+        const params = yield* Tensor.compute(yield* model.init)
+        const prompt = [2, 4]
+        const steps = 7
+        const program = yield* Model.inference(model, params, {
+          maxTokens: 64,
+          blockSize: 4,
+          prefillChunk: 4
+        })
+        const naive = yield* naiveGenerate(model, params, prompt, steps)
+        const cached = yield* cachedGenerate(program, prompt, steps)
+        expect(cached).toEqual(naive)
+      }))
+
+    it.effect("batched decode steps two hybrid sequences independently", () =>
+      Effect.gen(function*() {
+        const model = yield* makeHybrid
+        const params = yield* Tensor.compute(yield* model.init)
+        const program = yield* Model.inference(model, params, {
+          maxTokens: 64,
+          blockSize: 4,
+          prefillChunk: 4,
+          decodeBatch: 4
+        })
+        const gen = yield* program.generation()
+        const a = yield* gen.add(yield* ids([1, 5, 3]))
+        const b = yield* gen.add(yield* ids([2, 7]))
+        const naiveA = yield* naiveGenerate(model, params, [1, 5, 3], 5)
+        const naiveB = yield* naiveGenerate(model, params, [2, 7], 5)
+        const contextA = [1, 5, 3]
+        const contextB = [2, 7]
+        let logitsA = a.logits
+        let logitsB = b.logits
+        for (let i = 0; i < 5; i++) {
+          const nextA = yield* argmaxOf(logitsA)
+          const nextB = yield* argmaxOf(logitsB)
+          contextA.push(nextA)
+          contextB.push(nextB)
+          if (i < 4) {
+            const [nextLogitsA, nextLogitsB] = yield* gen.step([
+              { seq: a.seq, token: nextA },
+              { seq: b.seq, token: nextB }
+            ])
+            logitsA = nextLogitsA
+            logitsB = nextLogitsB
+          }
+        }
+        expect(contextA).toEqual(naiveA)
+        expect(contextB).toEqual(naiveB)
+      }))
+  })
+})

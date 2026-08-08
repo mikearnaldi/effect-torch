@@ -1233,6 +1233,148 @@ export const scaledDotProductAttention = (
   })
 
 /**
+ * Options for {@link kdaChunk}.
+ *
+ * @since 0.1.0
+ * @category neural network
+ */
+export interface KdaChunkOptions {
+  /** Output multiplier; defaults to `1 / sqrt(headDim)`. */
+  readonly scale?: number
+}
+
+/**
+ * Kimi Delta Attention (KDA) as a single semantic operation: gated
+ * delta-rule linear attention evaluated in the chunked parallel form.
+ * With the per-channel log decay `g = logDecay` and per-head gate
+ * `beta`, each head carries a matrix state `S` of shape `[Dk, Dv]`
+ * updated per token as
+ * `S_t = (I - beta_t k_t k_tᵀ) Diag(exp(g_t)) S_{t-1} + beta_t k_t v_tᵀ`
+ * from a zero initial state, producing `o_t = scale · S_tᵀ q_t`.
+ *
+ * `q`, `k` and `logDecay` are `[..., H, T, Dk]`, `v` is `[..., H, T, Dv]`
+ * and `beta` is `[..., H, T, 1]`, all with equal leading dimensions and
+ * a shared dtype; the output is `[..., H, T, Dv]`. `logDecay` holds raw
+ * per-channel log decay rates (`<= 0`, before any cumulative summation —
+ * the gate activation lives upstream) and `beta` must already lie in
+ * `[0, 1]` (e.g. sigmoided). Because positional information is carried
+ * by the learnable decayed transition itself, KDA layers use no
+ * positional encoding.
+ *
+ * The implementation computes in f32 (f64 stays f64) with chunk size 64
+ * and sub-chunk 16, using the pivot-factored decay and sequential
+ * triangular substitution of the reference algorithm — no reciprocal
+ * cumulative decay is ever formed. Not yet differentiable.
+ *
+ * @since 0.1.0
+ * @category neural network
+ */
+export const kdaChunk = (
+  q: Any,
+  k: Any,
+  v: Any,
+  logDecay: Any,
+  beta: Any,
+  options: KdaChunkOptions = {}
+): Effect.Effect<Lazy, TensorError, Runtime.Runtime> =>
+  graphTry("kdaChunk", () => {
+    const op = "kdaChunk"
+    const rank = q.shape.length
+    if (
+      rank < 2 || k.shape.length !== rank || v.shape.length !== rank ||
+      logDecay.shape.length !== rank || beta.shape.length !== rank
+    ) {
+      throw new Error(
+        `${op}: q, k, v, logDecay and beta must share a rank >= 2, got [${q.shape}], [${k.shape}], [${v.shape}], [${logDecay.shape}] and [${beta.shape}]`
+      )
+    }
+    if (!k.shape.every((d, i) => d === q.shape[i]) || !logDecay.shape.every((d, i) => d === q.shape[i])) {
+      throw new Error(
+        `${op}: q, k and logDecay must share a shape, got [${q.shape}], [${k.shape}] and [${logDecay.shape}]`
+      )
+    }
+    if (!v.shape.slice(0, -1).every((d, i) => d === q.shape[i])) {
+      throw new Error(`${op}: v must match q on all but the head dim, got [${v.shape}] and [${q.shape}]`)
+    }
+    const betaShape = [...q.shape.slice(0, -1), 1]
+    if (!beta.shape.every((d, i) => d === betaShape[i])) {
+      throw new Error(`${op}: beta must have shape [${betaShape}], got [${beta.shape}]`)
+    }
+    if (q.dtype !== "f32" && q.dtype !== "f64" && q.dtype !== "bf16") {
+      throw new Error(`${op}: dtype must be f32, f64 or bf16, got ${q.dtype}`)
+    }
+    for (const [name, t] of [["k", k], ["v", v], ["logDecay", logDecay], ["beta", beta]] as const) {
+      if (t.dtype !== q.dtype) {
+        throw new Error(`${op}: all operands must share a dtype, got ${q.dtype} and ${t.dtype} for ${name}`)
+      }
+      if (t.placement.id !== q.placement.id) {
+        throw new Error(`${op}: all operands must use the same placement`)
+      }
+    }
+    const scale = options.scale ?? 1 / Math.sqrt(q.shape[rank - 1])
+    return {
+      request: {
+        op: "kdaChunk",
+        inputs: [q, k, v, logDecay, beta],
+        attributes: { scale }
+      },
+      shape: [...q.shape.slice(0, -1), v.shape[rank - 1]],
+      dtype: q.dtype,
+      placement: q.placement
+    }
+  })
+
+/**
+ * Causal depthwise short convolution over `[..., T, C]` inputs with a
+ * `[C, K]` weight as a single semantic operation:
+ * `y[t, c] = sum_j weight[c, j] · x[t - K + 1 + j, c]` with zero history
+ * (a left zero-padding of `K - 1` tokens). The output has the input's
+ * shape. This is the KDA-style local mixing convolution; kept semantic so
+ * compiled generation can carry the `K - 1`-token window as per-sequence
+ * state instead of re-deriving it from composed ops. Not yet
+ * differentiable.
+ *
+ * @since 0.1.0
+ * @category neural network
+ */
+export const shortConv1d = (
+  self: Any,
+  weight: Any
+): Effect.Effect<Lazy, TensorError, Runtime.Runtime> =>
+  graphTry("shortConv1d", () => {
+    const op = "shortConv1d"
+    const rank = self.shape.length
+    if (rank < 2 || weight.shape.length !== 2) {
+      throw new Error(
+        `${op}: expected input [..., T, C] and weight [C, K], got [${self.shape}] and [${weight.shape}]`
+      )
+    }
+    const channels = self.shape[rank - 1]
+    if (weight.shape[0] !== channels) {
+      throw new Error(`${op}: weight has ${weight.shape[0]} channels, expected ${channels}`)
+    }
+    if (weight.shape[1] < 1) {
+      throw new Error(`${op}: kernel size must be >= 1, got ${weight.shape[1]}`)
+    }
+    if (self.dtype !== weight.dtype) {
+      throw new Error(`${op}: input and weight must share a dtype, got ${self.dtype} and ${weight.dtype}`)
+    }
+    if (self.placement.id !== weight.placement.id) {
+      throw new Error(`${op}: input and weight must use the same placement`)
+    }
+    return {
+      request: {
+        op: "shortConv1d",
+        inputs: [self, weight],
+        attributes: {}
+      },
+      shape: self.shape,
+      dtype: self.dtype,
+      placement: self.placement
+    }
+  })
+
+/**
  * SiLU / swish activation, `x * sigmoid(x)`.
  *
  * @since 0.1.0
@@ -4017,6 +4159,20 @@ export interface DecodeProgram {
   readonly kvHeads: number
   /** Width of each cached key/value head. */
   readonly headDim: number
+  /** Number of KDA recurrent layers with per-sequence state. */
+  readonly kdaLayers: number
+  /** Number of heads per KDA layer. */
+  readonly kdaHeads: number
+  /** Key width of each KDA head. */
+  readonly kdaHeadDim: number
+  /** Value width of each KDA head. */
+  readonly kdaValueDim: number
+  /** Number of short-conv layers with per-sequence window state. */
+  readonly convLayers: number
+  /** Channel count of each short-conv layer. */
+  readonly convChannels: number
+  /** Kernel size of each short-conv layer. */
+  readonly convKernel: number
   /** Output metadata recorded from the roots at compile time. */
   readonly outputs: CompiledProgram["outputs"]
 }

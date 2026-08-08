@@ -23,6 +23,13 @@ export declare class DecodeProgram {
   get layers(): number
   get kvHeads(): number
   get headDim(): number
+  get kdaLayers(): number
+  get kdaHeads(): number
+  get kdaHeadDim(): number
+  get kdaValueDim(): number
+  get convLayers(): number
+  get convChannels(): number
+  get convKernel(): number
   run(
     inputs: Array<NativeTensor>,
     seq: NativeKvSequence,
@@ -90,6 +97,8 @@ export declare class LazyTensor {
   gather(dim: number, indexes: LazyTensor): LazyTensor
   crossEntropy(target: LazyTensor, ignoreIndex: number): LazyTensor
   scaledDotProductAttention(k: LazyTensor, v: LazyTensor, scale: number, causal: boolean): LazyTensor
+  kdaChunk(k: LazyTensor, v: LazyTensor, logDecay: LazyTensor, beta: LazyTensor, scale: number): LazyTensor
+  shortConv1d(weight: LazyTensor): LazyTensor
   positionEmbedding(seqLen: number): LazyTensor
   rotaryEmbedding(seqLen: number, theta: number): LazyTensor
   layerNorm(weight: LazyTensor, bias: LazyTensor, eps: number): LazyTensor

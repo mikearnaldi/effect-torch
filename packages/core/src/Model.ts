@@ -645,6 +645,212 @@ export const multiHeadAttention = (
   })
 
 /**
+ * Options for {@link kimiDeltaAttention}.
+ *
+ * @since 0.1.0
+ * @category constructors
+ */
+export interface KimiDeltaAttentionOptions {
+  /** Epsilon of the output RMS normalization; defaults to `1e-6`. */
+  readonly normEps?: number
+}
+
+/**
+ * Kimi Delta Attention over `[..., T, embedDim]` inputs (Kimi Linear
+ * style): one fused q/k/v projection, a causal depthwise short
+ * convolution (kernel 4) plus SiLU on each of q/k/v, per-head L2
+ * normalization of q and k, a low-rank per-channel log-decay gate
+ * `logDecay = -exp(aLog) * softplus(fb(fa(x)) + dtBias)`, a sigmoid
+ * per-head gate `beta`, the {@link Tensor.kdaChunk} gated delta-rule
+ * core, and a sigmoid-gated per-head RMS normalization before the output
+ * projection. The head dimension is `embedDim / numHeads` for both keys
+ * and values. KDA layers carry positional information in their learnable
+ * decayed state transition and apply **no** positional encoding; in a
+ * hybrid stack the full-attention layers can therefore omit RoPE (the
+ * Kimi K3 configuration).
+ *
+ * Names are exactly `["<name>.qkv.weight", "<name>.qkv.bias",
+ * "<name>.convq.weight", "<name>.convk.weight", "<name>.convv.weight",
+ * "<name>.fa.weight", "<name>.fb.weight", "<name>.alog",
+ * "<name>.dtbias", "<name>.b.weight", "<name>.ga.weight",
+ * "<name>.gb.weight", "<name>.norm.weight", "<name>.wo.weight",
+ * "<name>.wo.bias"]`. Projection weights use `randn * (1 /
+ * sqrt(fanIn))`, convolution weights `randn * (1 / sqrt(4))`, `alog` and
+ * `dtbias` are zero (an initial per-step decay of about `exp(-0.69)`),
+ * `norm.weight` is one and biases are zero. Fails with a
+ * {@link ModelError} on an empty name, counts that are not positive
+ * integers, or `embedDim` not divisible by `numHeads`. The core is not
+ * yet differentiable, so this constructor is inference-only for now.
+ *
+ * @since 0.1.0
+ * @category constructors
+ */
+export const kimiDeltaAttention = (
+  name: string,
+  embedDim: number,
+  numHeads: number,
+  options: KimiDeltaAttentionOptions = {}
+): Effect.Effect<Model, ModelError> =>
+  Effect.gen(function*() {
+    yield* checkName("kimiDeltaAttention", name)
+    yield* checkPositiveInt("kimiDeltaAttention", "embedDim", embedDim)
+    yield* checkPositiveInt("kimiDeltaAttention", "numHeads", numHeads)
+    if (embedDim % numHeads !== 0) {
+      return yield* new ModelError({
+        op: "kimiDeltaAttention",
+        message: `embedDim ${embedDim} must be divisible by numHeads ${numHeads}`
+      })
+    }
+    const headDim = embedDim / numHeads
+    const eps = options.normEps ?? 1e-6
+    const names = [
+      `${name}.qkv.weight`,
+      `${name}.qkv.bias`,
+      `${name}.convq.weight`,
+      `${name}.convk.weight`,
+      `${name}.convv.weight`,
+      `${name}.fa.weight`,
+      `${name}.fb.weight`,
+      `${name}.alog`,
+      `${name}.dtbias`,
+      `${name}.b.weight`,
+      `${name}.ga.weight`,
+      `${name}.gb.weight`,
+      `${name}.norm.weight`,
+      `${name}.wo.weight`,
+      `${name}.wo.bias`
+    ]
+    const scaled = (fanIn: number, shape: ReadonlyArray<number>) =>
+      Effect.gen(function*() {
+        const drawn = yield* Tensor.randn(shape)
+        return yield* Tensor.mul(drawn, yield* Tensor.constantLike(drawn, 1 / Math.sqrt(fanIn)))
+      })
+    return make({
+      names,
+      init: Effect.gen(function*() {
+        return [
+          yield* scaled(embedDim, [embedDim, 3 * embedDim]),
+          yield* Tensor.zeros([1, 3 * embedDim]),
+          yield* scaled(4, [embedDim, 4]),
+          yield* scaled(4, [embedDim, 4]),
+          yield* scaled(4, [embedDim, 4]),
+          yield* scaled(embedDim, [embedDim, headDim]),
+          yield* scaled(headDim, [headDim, embedDim]),
+          yield* Tensor.zeros([numHeads]),
+          yield* Tensor.zeros([embedDim]),
+          yield* scaled(embedDim, [embedDim, numHeads]),
+          yield* scaled(embedDim, [embedDim, headDim]),
+          yield* scaled(headDim, [headDim, embedDim]),
+          yield* Tensor.full([headDim], 1),
+          yield* scaled(embedDim, [embedDim, embedDim]),
+          yield* Tensor.zeros([1, embedDim])
+        ] as const
+      }),
+      forward: (params, input) =>
+        Effect.gen(function*() {
+          yield* checkArity(name, names, params)
+          const [
+            qkvWeight,
+            qkvBias,
+            convqWeight,
+            convkWeight,
+            convvWeight,
+            faWeight,
+            fbWeight,
+            aLog,
+            dtBias,
+            bWeight,
+            gaWeight,
+            gbWeight,
+            normWeight,
+            woWeight,
+            woBias
+          ] = params
+          const rank = input.shape.length
+          const t = input.shape[rank - 2]
+          const leading = input.shape.slice(0, -2)
+          // [..., T, E] -> [..., H, T, Dh]
+          const splitHeads = (x: Tensor.Any, width: number) =>
+            Effect.gen(function*() {
+              const reshaped = yield* Tensor.reshape(x, [...leading, t, numHeads, width])
+              const perm = Array.from({ length: rank + 1 }, (_, i) => i)
+              perm[rank - 2] = rank - 1
+              perm[rank - 1] = rank - 2
+              return yield* Tensor.transpose(reshaped, perm)
+            })
+          // [..., H, T, Dh] -> [..., T, E]
+          const mergeHeads = (x: Tensor.Any) =>
+            Effect.gen(function*() {
+              const perm = Array.from({ length: rank + 1 }, (_, i) => i)
+              perm[rank - 2] = rank - 1
+              perm[rank - 1] = rank - 2
+              const transposed = yield* Tensor.transpose(x, perm)
+              return yield* Tensor.reshape(transposed, [...leading, t, embedDim])
+            })
+          // Causal depthwise short convolution (kernel 4) + SiLU on a
+          // [..., T, E] projection.
+          const shortConv = (x: Tensor.Any, weight: Tensor.Any) =>
+            Effect.gen(function*() {
+              return yield* Tensor.silu(yield* Tensor.shortConv1d(x, weight))
+            })
+          // Per-head L2 normalization along the head dim.
+          const l2Norm = (x: Tensor.Any) =>
+            Effect.gen(function*() {
+              const ss = yield* Tensor.sum(yield* Tensor.square(x), { dims: [-1], keepdims: true })
+              const epsT = yield* Tensor.constantLike(ss, 1e-6)
+              return yield* Tensor.mul(x, yield* Tensor.rsqrt(yield* Tensor.add(ss, epsT)))
+            })
+          const qkv = yield* Tensor.linear(input, qkvWeight, qkvBias)
+          const q = yield* Tensor.slice(qkv, {
+            start: [...leading.map(() => 0), 0, 0],
+            end: [...leading.map((d) => d), t, embedDim]
+          })
+          const k = yield* Tensor.slice(qkv, {
+            start: [...leading.map(() => 0), 0, embedDim],
+            end: [...leading.map((d) => d), t, 2 * embedDim]
+          })
+          const v = yield* Tensor.slice(qkv, {
+            start: [...leading.map(() => 0), 0, 2 * embedDim],
+            end: [...leading.map((d) => d), t, 3 * embedDim]
+          })
+          const qh = yield* l2Norm(yield* splitHeads(yield* shortConv(q, convqWeight), headDim))
+          const kh = yield* l2Norm(yield* splitHeads(yield* shortConv(k, convkWeight), headDim))
+          const vh = yield* splitHeads(yield* shortConv(v, convvWeight), headDim)
+          // Per-channel log decay: -exp(aLog) * softplus(fb(fa(x)) + dtBias).
+          const gateHidden = yield* Tensor.linear(input, faWeight, yield* Tensor.zeros([1, headDim]))
+          const gateFlat = yield* Tensor.linear(gateHidden, fbWeight, yield* Tensor.zeros([1, embedDim]))
+          const gate = yield* splitHeads(gateFlat, headDim)
+          const dt = yield* Tensor.reshape(dtBias, [numHeads, 1, headDim])
+          const soft = yield* Tensor.softplus(yield* Tensor.add(gate, dt))
+          const aExp = yield* Tensor.exp(yield* Tensor.reshape(aLog, [numHeads, 1, 1]))
+          const logDecay = yield* Tensor.neg(yield* Tensor.mul(aExp, soft))
+          // Per-head beta gate in [0, 1].
+          const betaFlat = yield* Tensor.sigmoid(
+            yield* Tensor.linear(input, bWeight, yield* Tensor.zeros([1, numHeads]))
+          )
+          const beta = yield* splitHeads(betaFlat, 1)
+          const attended = yield* Tensor.kdaChunk(qh, kh, vh, logDecay, beta)
+          // Sigmoid-gated per-head RMS normalization.
+          const gateOutHidden = yield* Tensor.linear(input, gaWeight, yield* Tensor.zeros([1, headDim]))
+          const gateOut = yield* splitHeads(
+            yield* Tensor.sigmoid(
+              yield* Tensor.linear(gateOutHidden, gbWeight, yield* Tensor.zeros([1, embedDim]))
+            ),
+            headDim
+          )
+          const ms = yield* Tensor.mean(yield* Tensor.square(attended), { dims: [-1], keepdims: true })
+          const epsT = yield* Tensor.constantLike(ms, eps)
+          const normed = yield* Tensor.mul(
+            yield* Tensor.mul(attended, yield* Tensor.rsqrt(yield* Tensor.add(ms, epsT))),
+            normWeight
+          )
+          const gated = yield* Tensor.mul(normed, gateOut)
+          return yield* Tensor.linear(yield* mergeHeads(gated), woWeight, woBias)
+        })
+    })
+  })
+
+/**
  * The hyperbolic tangent activation as a parameterless model.
  *
  * @since 0.1.0
@@ -1414,14 +1620,23 @@ export const inference = (
     const prefillProgram = yield* trace([1, prefillChunk])
     const decodeProgram = yield* trace([1, 1])
     const batchedProgram = decodeBatch > 1 ? yield* trace([decodeBatch, 1], decodeBatch) : undefined
+    const geometryOf = (program: Tensor.DecodeProgram) => [
+      program.layers,
+      program.kvHeads,
+      program.headDim,
+      program.kdaLayers,
+      program.kdaHeads,
+      program.kdaHeadDim,
+      program.kdaValueDim,
+      program.convLayers,
+      program.convChannels,
+      program.convKernel
+    ]
+    const sameGeometry = (a: Tensor.DecodeProgram, b: Tensor.DecodeProgram) =>
+      geometryOf(a).every((value, index) => value === geometryOf(b)[index])
     if (
-      prefillProgram.layers !== decodeProgram.layers ||
-      prefillProgram.kvHeads !== decodeProgram.kvHeads ||
-      prefillProgram.headDim !== decodeProgram.headDim ||
-      (batchedProgram !== undefined &&
-        (batchedProgram.layers !== decodeProgram.layers ||
-          batchedProgram.kvHeads !== decodeProgram.kvHeads ||
-          batchedProgram.headDim !== decodeProgram.headDim))
+      !sameGeometry(prefillProgram, decodeProgram) ||
+      (batchedProgram !== undefined && !sameGeometry(batchedProgram, decodeProgram))
     ) {
       return yield* new InferenceError({
         op: "inference",
@@ -1504,8 +1719,14 @@ export const inference = (
               let retained = false
               return yield* Effect.gen(function*() {
                 // The pool's prefix cache supplies the longest resident
-                // prefix (whole blocks only); only the suffix is computed.
-                const matched = yield* Tensor.kvPrefillMatch(sequence, ids)
+                // prefix (whole blocks only); only the suffix is
+                // computed. Stacks with recurrent (KDA/conv) layers skip
+                // the prefix cache: the KV blocks say nothing about the
+                // recurrent state, so reuse would silently corrupt it
+                // (RFC 0018 v1 limitation).
+                const matched = prefillProgram.kdaLayers > 0 || prefillProgram.convLayers > 0
+                  ? 0
+                  : yield* Tensor.kvPrefillMatch(sequence, ids)
                 let logits: Tensor.Concrete | undefined
                 for (let offset = matched; offset < t; offset += prefillChunk) {
                   const real = Math.min(prefillChunk, t - offset)

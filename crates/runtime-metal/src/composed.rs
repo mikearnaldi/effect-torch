@@ -461,3 +461,356 @@ pub fn rotary_forward(
     )?;
     cat(&out_first, &out_second, r - 1)
 }
+
+// --- Kimi Delta Attention (RFC 0018) ---
+
+fn unsqueeze(t: &MetalTensor, dim: usize) -> crate::err::Res<MetalTensor> {
+    let mut shape = t.layout.shape().to_vec();
+    shape.insert(dim, 1);
+    Ok(MetalTensor {
+        buffer: t.buffer.clone(),
+        layout: Layout::contiguous(shape),
+        dtype: t.dtype,
+    })
+}
+
+// tril mask (diagonal 0 includes the diagonal, -1 excludes it) as u8.
+fn tril_mask(n: usize, diagonal: i64) -> crate::err::Res<MetalTensor> {
+    let mut data = Vec::with_capacity(n * n);
+    for i in 0..n as i64 {
+        for j in 0..n as i64 {
+            data.push((j <= i + diagonal) as u8);
+        }
+    }
+    Ok(MetalTensor {
+        buffer: crate::runtime::metal::device::MetalDevice::get().upload_bytes(&data),
+        layout: Layout::contiguous(vec![n, n]),
+        dtype: DType::U8,
+    })
+}
+
+// row [1, n] -> [batch, 1, n] via broadcast add against zeros.
+fn batch_row(row: &MetalTensor, batch: usize) -> crate::err::Res<MetalTensor> {
+    let n = row.layout.shape()[row.layout.shape().len() - 1];
+    binary(&fill(&[batch, 1, n], 0.0, row.dtype)?, row, BinOp::Add)
+}
+
+// Unit lower-triangular inverse: given strictly lower-triangular a
+// [.., n, n], returns (I + a)^-1 via batched row-wise forward
+// substitution x_i = e_i - a_i[:, :i] @ x_{:i} (RFC 0018 numerics
+// contract: sequential substitution, never a series expansion).
+fn unit_lower_inverse(a: &MetalTensor) -> crate::err::Res<MetalTensor> {
+    let dims = a.layout.shape().to_vec();
+    let r = dims.len();
+    let n = dims[r - 1];
+    let batch: usize = dims[..r - 2].iter().product();
+    let a3 = super::ops::contiguous(&MetalTensor {
+        buffer: a.buffer.clone(),
+        layout: Layout::contiguous(vec![batch, n, n]),
+        dtype: a.dtype,
+    })?;
+    let id = super::ops::eye(n, a.dtype)?;
+    let mut x = batch_row(&narrow(&id, 0, 0, 1)?, batch)?;
+    for i in 1..n {
+        let a_row = narrow(&a3, 1, i, 1)?;
+        let a_left = narrow(&a_row, 2, 0, i)?;
+        let contrib = matmul(&a_left, &x)?;
+        let e_i = batch_row(&narrow(&id, 0, i, 1)?, batch)?;
+        let row = binary(&e_i, &contrib, BinOp::Sub)?;
+        x = cat(&x, &row, 1)?;
+    }
+    Ok(MetalTensor {
+        buffer: x.buffer.clone(),
+        layout: Layout::contiguous(dims),
+        dtype: x.dtype,
+    })
+}
+
+fn cat_all(ts: &[MetalTensor], dim: usize) -> crate::err::Res<MetalTensor> {
+    let mut it = ts.iter();
+    let mut acc = it
+        .next()
+        .ok_or_else(|| "cat_all: empty".to_string())?
+        .clone();
+    for t in it {
+        acc = cat(&acc, t, dim)?;
+    }
+    Ok(acc)
+}
+
+// Chunked gated delta-rule linear attention, reference implementation
+// (RFC 0018; FLA `naive_chunk_kda` equivalent). q/k/log_decay
+// [.., H, T, Dk], v [.., H, T, Dv], beta [.., H, T, 1]; computes in f32
+// from a zero initial state. Chunk 64, sub-chunk 16: intra-chunk blocks
+// use the pivot-factored decay exp(g_i - g_j) = exp(g_i - g_p) *
+// exp(g_p - g_j) so no reciprocal cumulative decay is ever formed.
+pub fn kda_chunk_forward(
+    q: &MetalTensor,
+    k: &MetalTensor,
+    v: &MetalTensor,
+    log_decay: &MetalTensor,
+    beta: &MetalTensor,
+    scale: f64,
+) -> crate::err::Res<MetalTensor> {
+    let dims = q.layout.shape().to_vec();
+    let r = dims.len();
+    let dk = dims[r - 1];
+    let dv = v.layout.shape()[r - 1];
+    let bh: usize = dims[..r - 2].iter().product();
+    let initial = fill(&[bh, dk, dv], 0.0, DType::F32)?;
+    Ok(kda_chunk_with_state(q, k, v, log_decay, beta, scale, &initial)?.0)
+}
+
+// Stateful variant: starts from `initial_state` ([BH, Dk, Dv] f32) and
+// returns the output alongside the final state. The decode path drives
+// this per sequence slot.
+pub fn kda_chunk_with_state(
+    q: &MetalTensor,
+    k: &MetalTensor,
+    v: &MetalTensor,
+    log_decay: &MetalTensor,
+    beta: &MetalTensor,
+    scale: f64,
+    initial_state: &MetalTensor,
+) -> crate::err::Res<(MetalTensor, MetalTensor)> {
+    const CHUNK: usize = 64;
+    const SUB: usize = 16;
+    let in_dtype = q.dtype;
+    let q = super::ops::to_f32(q)?;
+    let k = super::ops::to_f32(k)?;
+    let v = super::ops::to_f32(v)?;
+    let log_decay = super::ops::to_f32(log_decay)?;
+    let beta = super::ops::to_f32(beta)?;
+    let work = DType::F32;
+
+    let dims = q.layout.shape().to_vec();
+    let r = dims.len();
+    let (t, dk) = (dims[r - 2], dims[r - 1]);
+    let dv = v.layout.shape()[r - 1];
+    let bh: usize = dims[..r - 2].iter().product();
+
+    let flatten = |x: &MetalTensor, d: usize| -> crate::err::Res<MetalTensor> {
+        super::ops::contiguous(&MetalTensor {
+            buffer: x.buffer.clone(),
+            layout: Layout::contiguous(vec![bh, t, d]),
+            dtype: x.dtype,
+        })
+    };
+    let q3 = flatten(&q, dk)?;
+    let k3 = flatten(&k, dk)?;
+    let v3 = flatten(&v, dv)?;
+    let ld3 = flatten(&log_decay, dk)?;
+    let b3 = flatten(&beta, 1)?;
+
+    let mut state = super::ops::contiguous(initial_state)?;
+    let mut outs: Vec<MetalTensor> = Vec::new();
+    let mut t0 = 0;
+    while t0 < t {
+        let c = CHUNK.min(t - t0);
+        let qc = narrow(&q3, 1, t0, c)?;
+        let kc = narrow(&k3, 1, t0, c)?;
+        let vc = narrow(&v3, 1, t0, c)?;
+        let bc = narrow(&b3, 1, t0, c)?;
+        // Inclusive chunk-local cumulative log decay, [BH, c, Dk].
+        let gc = super::ops::cumsum(&narrow(&ld3, 1, t0, c)?, 1)?;
+
+        // Intra-chunk attention matrices, assembled from SUB-sized
+        // blocks: Aqk (lower-triangular, scaled) and Akk (strictly
+        // lower, beta-weighted).
+        let blocks = c.div_ceil(SUB);
+        let mut aqk_rows: Vec<MetalTensor> = Vec::new();
+        let mut akk_rows: Vec<MetalTensor> = Vec::new();
+        for rb in 0..blocks {
+            let rs = rb * SUB;
+            let br = SUB.min(c - rs);
+            let q_r = narrow(&qc, 1, rs, br)?;
+            let k_r = narrow(&kc, 1, rs, br)?;
+            let g_r = narrow(&gc, 1, rs, br)?;
+            let g_p = narrow(&gc, 1, rs, 1)?;
+            let b_r = narrow(&bc, 1, rs, br)?;
+            let mut aqk_cols: Vec<MetalTensor> = Vec::new();
+            let mut akk_cols: Vec<MetalTensor> = Vec::new();
+            for cb in 0..blocks {
+                let cs = cb * SUB;
+                let cc = SUB.min(c - cs);
+                if cb > rb {
+                    aqk_cols.push(fill(&[bh, br, cc], 0.0, work)?);
+                    akk_cols.push(fill(&[bh, br, cc], 0.0, work)?);
+                    continue;
+                }
+                let k_c = narrow(&kc, 1, cs, cc)?;
+                let g_c = narrow(&gc, 1, cs, cc)?;
+                if cb == rb {
+                    // Diagonal block: full per-channel decay matrix,
+                    // masked by select (exp overflow on the masked
+                    // triangle is discarded, never multiplied).
+                    let d = binary(&unsqueeze(&g_r, 2)?, &unsqueeze(&g_c, 1)?, BinOp::Sub)?;
+                    let e = unary(&d, UnOp::Exp)?;
+                    let zeros = fill(e.layout.shape(), 0.0, work)?;
+                    let m_incl = unsqueeze(&unsqueeze(&tril_mask(br, 0)?, 0)?, 3)?;
+                    let m_strict = unsqueeze(&unsqueeze(&tril_mask(br, -1)?, 0)?, 3)?;
+                    let e_incl = where_(&m_incl, &e, &zeros)?;
+                    let e_strict = where_(&m_strict, &e, &zeros)?;
+                    let qq = binary(&unsqueeze(&q_r, 2)?, &unsqueeze(&k_c, 1)?, BinOp::Mul)?;
+                    let aqk = binary(
+                        &squeeze_last(&reduce(
+                            &binary(&qq, &e_incl, BinOp::Mul)?,
+                            &[3],
+                            true,
+                            ReduceOp::Sum,
+                        )?)?,
+                        &fill(&[bh, br, cc], scale, work)?,
+                        BinOp::Mul,
+                    )?;
+                    let kk = binary(&unsqueeze(&k_r, 2)?, &unsqueeze(&k_c, 1)?, BinOp::Mul)?;
+                    let akk = binary(
+                        &squeeze_last(&reduce(
+                            &binary(&kk, &e_strict, BinOp::Mul)?,
+                            &[3],
+                            true,
+                            ReduceOp::Sum,
+                        )?)?,
+                        &b_r,
+                        BinOp::Mul,
+                    )?;
+                    aqk_cols.push(aqk);
+                    akk_cols.push(akk);
+                } else {
+                    // Off-diagonal block: decay factors at the row
+                    // block's pivot, both directions bounded by 1.
+                    let qd = binary(
+                        &q_r,
+                        &unary(&binary(&g_r, &g_p, BinOp::Sub)?, UnOp::Exp)?,
+                        BinOp::Mul,
+                    )?;
+                    let kd = binary(
+                        &k_c,
+                        &unary(&binary(&g_p, &g_c, BinOp::Sub)?, UnOp::Exp)?,
+                        BinOp::Mul,
+                    )?;
+                    let aqk = binary(
+                        &matmul(&qd, &transpose_last2(&kd)?)?,
+                        &fill(&[bh, br, cc], scale, work)?,
+                        BinOp::Mul,
+                    )?;
+                    let kkd = binary(
+                        &k_r,
+                        &unary(&binary(&g_r, &g_p, BinOp::Sub)?, UnOp::Exp)?,
+                        BinOp::Mul,
+                    )?;
+                    let akk = binary(&matmul(&kkd, &transpose_last2(&kd)?)?, &b_r, BinOp::Mul)?;
+                    aqk_cols.push(aqk);
+                    akk_cols.push(akk);
+                }
+            }
+            aqk_rows.push(cat_all(&aqk_cols, 2)?);
+            akk_rows.push(cat_all(&akk_cols, 2)?);
+        }
+        let aqk = cat_all(&aqk_rows, 1)?;
+        let akk = cat_all(&akk_rows, 1)?;
+
+        // UT transform: M = (I + Akk)^-1, then the WY representation.
+        let m = unit_lower_inverse(&akk)?;
+        let w_in = binary(
+            &binary(&kc, &bc, BinOp::Mul)?,
+            &unary(&gc, UnOp::Exp)?,
+            BinOp::Mul,
+        )?;
+        let w = matmul(&m, &w_in)?;
+        let u = matmul(&m, &binary(&vc, &bc, BinOp::Mul)?)?;
+
+        let v_new = binary(&u, &matmul(&w, &state)?, BinOp::Sub)?;
+        let o_inter = binary(
+            &matmul(&binary(&qc, &unary(&gc, UnOp::Exp)?, BinOp::Mul)?, &state)?,
+            &fill(&[bh, c, dv], scale, work)?,
+            BinOp::Mul,
+        )?;
+        let o_intra = matmul(&aqk, &v_new)?;
+        outs.push(binary(&o_inter, &o_intra, BinOp::Add)?);
+
+        // State update: decay to the chunk end, then rank-c update with
+        // the decayed keys kg = k * exp(g_last - g).
+        let g_last = narrow(&gc, 1, c - 1, 1)?;
+        let kg = binary(
+            &kc,
+            &unary(&binary(&g_last, &gc, BinOp::Sub)?, UnOp::Exp)?,
+            BinOp::Mul,
+        )?;
+        let decay = transpose_last2(&unary(&g_last, UnOp::Exp)?)?;
+        state = binary(
+            &binary(&state, &decay, BinOp::Mul)?,
+            &matmul(&transpose_last2(&kg)?, &v_new)?,
+            BinOp::Add,
+        )?;
+        t0 += c;
+    }
+
+    let out = cat_all(&outs, 1)?;
+    let mut out_shape = dims;
+    out_shape[r - 1] = dv;
+    let out = super::ops::contiguous(&MetalTensor {
+        buffer: out.buffer.clone(),
+        layout: Layout::contiguous(out_shape),
+        dtype: out.dtype,
+    })?;
+    Ok((super::ops::from_f32(&out, in_dtype)?, state))
+}
+
+// Causal depthwise short convolution over [.., T, C] with weight
+// [C, K] and zero history: y[t] = sum_j w[:, j] * x[t-K+1+j].
+pub fn short_conv1d_forward(x: &MetalTensor, weight: &MetalTensor) -> crate::err::Res<MetalTensor> {
+    let dims = x.layout.shape().to_vec();
+    let r = dims.len();
+    let (t, c) = (dims[r - 2], dims[r - 1]);
+    let kk = weight.layout.shape()[1];
+    let batch: usize = dims[..r - 2].iter().product();
+    let x3 = super::ops::contiguous(&MetalTensor {
+        buffer: x.buffer.clone(),
+        layout: Layout::contiguous(vec![batch, t, c]),
+        dtype: x.dtype,
+    })?;
+    let history = fill(&[batch, kk - 1, c], 0.0, x.dtype)?;
+    let window = cat(&history, &x3, 1)?;
+    let mut acc = fill(&[batch, t, c], 0.0, x.dtype)?;
+    for j in 0..kk {
+        let wj = transpose_last2(&narrow(weight, 1, j, 1)?)?;
+        acc = binary(
+            &acc,
+            &binary(&narrow(&window, 1, j, t)?, &wj, BinOp::Mul)?,
+            BinOp::Add,
+        )?;
+    }
+    super::ops::contiguous(&MetalTensor {
+        buffer: acc.buffer.clone(),
+        layout: Layout::contiguous(dims),
+        dtype: acc.dtype,
+    })
+}
+
+// Stateful per-slot variant: x [T, C], state [K-1, C]; returns the
+// output and the new window. `advance` is the count of real tokens
+// (chunked prefill right-pads): outputs are computed over the full
+// padded window — causal, so real rows never see padding — but the
+// stored window shifts in only the first `advance` rows.
+pub fn short_conv1d_with_state(
+    x: &MetalTensor,
+    weight: &MetalTensor,
+    state: &MetalTensor,
+    advance: usize,
+) -> crate::err::Res<(MetalTensor, MetalTensor)> {
+    let dims = x.layout.shape().to_vec();
+    let (t, kk) = (dims[0], weight.layout.shape()[1]);
+    let window = cat(state, x, 0)?;
+    let mut acc = fill(&dims, 0.0, x.dtype)?;
+    for j in 0..kk {
+        let wj = transpose_last2(&narrow(weight, 1, j, 1)?)?;
+        acc = binary(
+            &acc,
+            &binary(&narrow(&window, 0, j, t)?, &wj, BinOp::Mul)?,
+            BinOp::Add,
+        )?;
+    }
+    let real = narrow(&window, 0, 0, kk - 1 + advance)?;
+    let new_state = narrow(&real, 0, advance, kk - 1)?;
+    Ok((acc, new_state))
+}

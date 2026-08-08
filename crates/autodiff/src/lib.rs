@@ -396,6 +396,15 @@ fn vmap_rebuild(
             "vmap: position embedding and kv attention nodes are not supported under vmap"
                 .to_string(),
         ),
+        NodeKind::KdaChunk { .. } => {
+            Err("vmap: kda chunk nodes are not supported under vmap".to_string())
+        }
+        NodeKind::KdaRecurrence { .. } | NodeKind::ConvState { .. } => {
+            Err("vmap: stateful decode nodes are internal to inference".to_string())
+        }
+        NodeKind::ShortConv1d { .. } => {
+            Err("vmap: short conv nodes are not supported under vmap".to_string())
+        }
         NodeKind::RotaryEmbedding { .. } => {
             Err("vmap: rotary embedding nodes are not supported under vmap".to_string())
         }
@@ -1251,6 +1260,23 @@ fn backward(
                 return Err(
                     "grad: kv attention is an inference-only node and is not differentiable"
                         .to_string(),
+                );
+            }
+            NodeKind::KdaChunk { .. } => {
+                return Err(
+                    "grad: kda chunk is not yet differentiable (RFC 0018 phase 4 adds the closed-form backward)"
+                        .to_string(),
+                );
+            }
+            NodeKind::KdaRecurrence { .. } | NodeKind::ConvState { .. } => {
+                return Err(
+                    "grad: stateful decode nodes are inference-only and are not differentiable"
+                        .to_string(),
+                );
+            }
+            NodeKind::ShortConv1d { .. } => {
+                return Err(
+                    "grad: short conv is not yet differentiable (RFC 0018 phase 4)".to_string(),
                 );
             }
             NodeKind::RotaryEmbedding {

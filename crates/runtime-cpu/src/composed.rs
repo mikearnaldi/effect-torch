@@ -409,6 +409,290 @@ pub fn rotary_forward(
     Ok(Tensor::cat(&[&out_first, &out_second], r - 1).contiguous())
 }
 
+// --- Kimi Delta Attention (RFC 0018) ---
+
+fn unsqueeze(t: &Tensor, dim: usize) -> Tensor {
+    let mut shape = t.shape().to_vec();
+    shape.insert(dim, 1);
+    t.contiguous().view(Layout::contiguous(shape))
+}
+
+fn eye(n: usize, dtype: DType) -> Tensor {
+    let mut data = Vec::with_capacity(n * n);
+    for i in 0..n {
+        for j in 0..n {
+            data.push((i == j) as u8 as f32);
+        }
+    }
+    Tensor::from_vec(data, vec![n, n]).cast(dtype)
+}
+
+// tril mask (diagonal 0 includes the diagonal, -1 excludes it) as u8.
+fn tril_mask(n: usize, diagonal: i64) -> Tensor {
+    let mut data = Vec::with_capacity(n * n);
+    for i in 0..n as i64 {
+        for j in 0..n as i64 {
+            data.push((j <= i + diagonal) as u8);
+        }
+    }
+    Tensor::from_vec(data, vec![n, n])
+}
+
+// Unit lower-triangular inverse: given strictly lower-triangular a
+// [.., n, n], returns (I + a)^-1 via batched row-wise forward
+// substitution x_i = e_i - a_i[:, :i] @ x_{:i} (RFC 0018 numerics
+// contract: sequential substitution, never a series expansion).
+fn unit_lower_inverse(a: &Tensor) -> Tensor {
+    let dims = a.shape();
+    let r = rank(a);
+    let n = dims[r - 1];
+    let batch: usize = dims[..r - 2].iter().product();
+    let a3 = a.contiguous().view(Layout::contiguous(vec![batch, n, n]));
+    let id = eye(n, a.dtype());
+    let mut x = batch_row(&narrow(&id, 0, 0, 1), batch);
+    for i in 1..n {
+        let a_row = narrow(&a3, 1, i, 1);
+        let a_left = narrow(&a_row, 2, 0, i);
+        let contrib = a_left.matmul(&x);
+        let e_i = batch_row(&narrow(&id, 0, i, 1), batch);
+        let row = e_i.sub(&contrib);
+        x = Tensor::cat(&[&x, &row], 1);
+    }
+    x.view(Layout::contiguous(dims.to_vec()))
+}
+
+// row [1, n] -> [batch, 1, n] via broadcast add against zeros.
+fn batch_row(row: &Tensor, batch: usize) -> Tensor {
+    let n = row.shape()[row.shape().len() - 1];
+    Tensor::zeros(&[batch, 1, n], row.dtype()).add(row)
+}
+
+// Chunked gated delta-rule linear attention, reference implementation
+// (RFC 0018; FLA `naive_chunk_kda` equivalent). q/k/log_decay
+// [.., H, T, Dk], v [.., H, T, Dv], beta [.., H, T, 1]; computes in f32
+// (f64 stays f64) from a zero initial state. Chunk 64, sub-chunk 16:
+// intra-chunk blocks use the pivot-factored decay
+// exp(g_i - g_j) = exp(g_i - g_p) * exp(g_p - g_j) so no reciprocal
+// cumulative decay is ever formed.
+pub fn kda_chunk_forward(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    log_decay: &Tensor,
+    beta: &Tensor,
+    scale: f64,
+) -> Tensor {
+    let dims = q.shape().to_vec();
+    let r = dims.len();
+    let dk = dims[r - 1];
+    let dv = v.shape()[r - 1];
+    let bh: usize = dims[..r - 2].iter().product();
+    let work = if q.dtype() == DType::F64 {
+        DType::F64
+    } else {
+        DType::F32
+    };
+    let initial = Tensor::zeros(&[bh, dk, dv], work);
+    kda_chunk_with_state(q, k, v, log_decay, beta, scale, &initial).0
+}
+
+// Stateful variant: starts from `initial_state` ([BH, Dk, Dv], work
+// dtype) and returns the output alongside the final state. The decode
+// path drives this per sequence slot.
+pub fn kda_chunk_with_state(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    log_decay: &Tensor,
+    beta: &Tensor,
+    scale: f64,
+    initial_state: &Tensor,
+) -> (Tensor, Tensor) {
+    const CHUNK: usize = 64;
+    const SUB: usize = 16;
+    let in_dtype = q.dtype();
+    let work = if in_dtype == DType::F64 {
+        DType::F64
+    } else {
+        DType::F32
+    };
+    let q = q.cast(work);
+    let k = k.cast(work);
+    let v = v.cast(work);
+    let log_decay = log_decay.cast(work);
+    let beta = beta.cast(work);
+
+    let dims = q.shape().to_vec();
+    let r = dims.len();
+    let (t, dk) = (dims[r - 2], dims[r - 1]);
+    let dv = v.shape()[r - 1];
+    let bh: usize = dims[..r - 2].iter().product();
+
+    let q3 = q.contiguous().view(Layout::contiguous(vec![bh, t, dk]));
+    let k3 = k.contiguous().view(Layout::contiguous(vec![bh, t, dk]));
+    let v3 = v.contiguous().view(Layout::contiguous(vec![bh, t, dv]));
+    let ld3 = log_decay
+        .contiguous()
+        .view(Layout::contiguous(vec![bh, t, dk]));
+    let b3 = beta.contiguous().view(Layout::contiguous(vec![bh, t, 1]));
+
+    let mut state = initial_state.cast(work).contiguous();
+    let mut outs: Vec<Tensor> = Vec::new();
+    let mut t0 = 0;
+    while t0 < t {
+        let c = CHUNK.min(t - t0);
+        let qc = narrow(&q3, 1, t0, c);
+        let kc = narrow(&k3, 1, t0, c);
+        let vc = narrow(&v3, 1, t0, c);
+        let bc = narrow(&b3, 1, t0, c);
+        // Inclusive chunk-local cumulative log decay, [BH, c, Dk].
+        let gc = narrow(&ld3, 1, t0, c).cumsum(1);
+
+        // Intra-chunk attention matrices, assembled from SUB-sized
+        // blocks: Aqk (lower-triangular, scaled) and Akk (strictly
+        // lower, beta-weighted).
+        let blocks = c.div_ceil(SUB);
+        let mut aqk_rows: Vec<Tensor> = Vec::new();
+        let mut akk_rows: Vec<Tensor> = Vec::new();
+        for rb in 0..blocks {
+            let rs = rb * SUB;
+            let br = SUB.min(c - rs);
+            let q_r = narrow(&qc, 1, rs, br);
+            let k_r = narrow(&kc, 1, rs, br);
+            let g_r = narrow(&gc, 1, rs, br);
+            let g_p = narrow(&gc, 1, rs, 1);
+            let b_r = narrow(&bc, 1, rs, br);
+            let mut aqk_cols: Vec<Tensor> = Vec::new();
+            let mut akk_cols: Vec<Tensor> = Vec::new();
+            for cb in 0..blocks {
+                let cs = cb * SUB;
+                let cc = SUB.min(c - cs);
+                if cb > rb {
+                    aqk_cols.push(Tensor::zeros(&[bh, br, cc], work));
+                    akk_cols.push(Tensor::zeros(&[bh, br, cc], work));
+                    continue;
+                }
+                let k_c = narrow(&kc, 1, cs, cc);
+                let g_c = narrow(&gc, 1, cs, cc);
+                if cb == rb {
+                    // Diagonal block: full per-channel decay matrix,
+                    // masked by select (exp overflow on the masked
+                    // triangle is discarded, never multiplied).
+                    let d = unsqueeze(&g_r, 2).sub(&unsqueeze(&g_c, 1));
+                    let e = d.exp();
+                    let zeros = Tensor::zeros(e.shape(), work);
+                    let m_incl = unsqueeze(&unsqueeze(&tril_mask(br, 0), 0), 3);
+                    let m_strict = unsqueeze(&unsqueeze(&tril_mask(br, -1), 0), 3);
+                    let e_incl = e.where_(&m_incl, &zeros);
+                    let e_strict = e.where_(&m_strict, &zeros);
+                    let qq = unsqueeze(&q_r, 2).mul(&unsqueeze(&k_c, 1));
+                    let aqk = squeeze_last(&qq.mul(&e_incl).sum(&[3])).mul(&Tensor::full(
+                        &[bh, br, cc],
+                        scale,
+                        work,
+                    ));
+                    let kk = unsqueeze(&k_r, 2).mul(&unsqueeze(&k_c, 1));
+                    let akk = squeeze_last(&kk.mul(&e_strict).sum(&[3])).mul(&b_r);
+                    aqk_cols.push(aqk);
+                    akk_cols.push(akk);
+                } else {
+                    // Off-diagonal block: decay factors at the row
+                    // block's pivot, both directions bounded by 1.
+                    let qd = q_r.mul(&g_r.sub(&g_p).exp());
+                    let kd = k_c.mul(&g_p.sub(&g_c).exp());
+                    let aqk = qd.matmul(&transpose_last2(&kd)).mul(&Tensor::full(
+                        &[bh, br, cc],
+                        scale,
+                        work,
+                    ));
+                    let kkd = k_r.mul(&g_r.sub(&g_p).exp());
+                    let akk = kkd.matmul(&transpose_last2(&kd)).mul(&b_r);
+                    aqk_cols.push(aqk);
+                    akk_cols.push(akk);
+                }
+            }
+            aqk_rows.push(Tensor::cat(&aqk_cols.iter().collect::<Vec<_>>(), 2));
+            akk_rows.push(Tensor::cat(&akk_cols.iter().collect::<Vec<_>>(), 2));
+        }
+        let aqk = Tensor::cat(&aqk_rows.iter().collect::<Vec<_>>(), 1);
+        let akk = Tensor::cat(&akk_rows.iter().collect::<Vec<_>>(), 1);
+
+        // UT transform: M = (I + Akk)^-1, then the WY representation.
+        let m = unit_lower_inverse(&akk);
+        let w_in = kc.mul(&bc).mul(&gc.exp());
+        let w = m.matmul(&w_in);
+        let u = m.matmul(&vc.mul(&bc));
+
+        let v_new = u.sub(&w.matmul(&state));
+        let o_inter =
+            qc.mul(&gc.exp())
+                .matmul(&state)
+                .mul(&Tensor::full(&[bh, c, dv], scale, work));
+        let o_intra = aqk.matmul(&v_new);
+        outs.push(o_inter.add(&o_intra));
+
+        // State update: decay to the chunk end, then rank-c update with
+        // the decayed keys kg = k * exp(g_last - g).
+        let g_last = narrow(&gc, 1, c - 1, 1);
+        let kg = kc.mul(&g_last.sub(&gc).exp());
+        let decay = transpose_last2(&g_last.exp());
+        state = state.mul(&decay).add(&transpose_last2(&kg).matmul(&v_new));
+        t0 += c;
+    }
+
+    let out = Tensor::cat(&outs.iter().collect::<Vec<_>>(), 1);
+    let mut out_shape = dims;
+    out_shape[r - 1] = dv;
+    let out = out
+        .contiguous()
+        .view(Layout::contiguous(out_shape))
+        .cast(in_dtype);
+    (out, state)
+}
+
+// Causal depthwise short convolution over [.., T, C] with weight
+// [C, K] and zero history: y[t] = sum_j w[:, j] * x[t-K+1+j].
+pub fn short_conv1d_forward(x: &Tensor, weight: &Tensor) -> Tensor {
+    let dims = x.shape().to_vec();
+    let r = dims.len();
+    let (t, c) = (dims[r - 2], dims[r - 1]);
+    let kk = weight.shape()[1];
+    let batch: usize = dims[..r - 2].iter().product();
+    let x3 = x.contiguous().view(Layout::contiguous(vec![batch, t, c]));
+    let history = Tensor::zeros(&[batch, kk - 1, c], x.dtype());
+    let window = Tensor::cat(&[&history, &x3], 1);
+    let mut acc = Tensor::zeros(&[batch, t, c], x.dtype());
+    for j in 0..kk {
+        let wj = transpose_last2(&narrow(weight, 1, j, 1));
+        acc = acc.add(&narrow(&window, 1, j, t).mul(&wj));
+    }
+    acc.contiguous().view(Layout::contiguous(dims))
+}
+
+// Stateful per-slot variant: x [T, C], state [K-1, C]; returns the
+// output and the new window. `advance` is the count of real tokens
+// (chunked prefill right-pads): outputs are computed over the full
+// padded window — causal, so real rows never see padding — but the
+// stored window shifts in only the first `advance` rows.
+pub fn short_conv1d_with_state(
+    x: &Tensor,
+    weight: &Tensor,
+    state: &Tensor,
+    advance: usize,
+) -> (Tensor, Tensor) {
+    let dims = x.shape().to_vec();
+    let (t, kk) = (dims[0], weight.shape()[1]);
+    let window = Tensor::cat(&[state, x], 0);
+    let mut acc = Tensor::zeros(&dims, x.dtype());
+    for j in 0..kk {
+        let wj = transpose_last2(&narrow(weight, 1, j, 1));
+        acc = acc.add(&narrow(&window, 0, j, t).mul(&wj));
+    }
+    let real = narrow(&window, 0, 0, kk - 1 + advance);
+    let new_state = narrow(&real, 0, advance, kk - 1).contiguous();
+    (acc, new_state)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -418,6 +702,128 @@ mod tests {
             panic!()
         };
         v.as_slice().to_vec()
+    }
+
+    // Deterministic pseudo-random f32 in [-1, 1] (xorshift).
+    fn prand(n: usize, seed: u64) -> Vec<f32> {
+        let mut s = seed | 1;
+        (0..n)
+            .map(|_| {
+                s ^= s << 13;
+                s ^= s >> 7;
+                s ^= s << 17;
+                ((s % 2000) as f32 / 1000.0) - 1.0
+            })
+            .collect()
+    }
+
+    // Per-token gated delta-rule recurrence, the ground truth for the
+    // chunked implementation. Inputs [BH, T, D] f32.
+    fn naive_kda(
+        q: &Tensor,
+        k: &Tensor,
+        v: &Tensor,
+        log_decay: &Tensor,
+        beta: &Tensor,
+        scale: f64,
+    ) -> Tensor {
+        let dims = q.shape();
+        let (bh, t, dk) = (dims[0], dims[1], dims[2]);
+        let dv = v.shape()[2];
+        let mut state = Tensor::zeros(&[bh, dk, dv], DType::F32);
+        let mut outs = Vec::new();
+        for i in 0..t {
+            let q_t = narrow(q, 1, i, 1); // [BH,1,dk]
+            let k_t = narrow(k, 1, i, 1);
+            let v_t = narrow(v, 1, i, 1); // [BH,1,dv]
+            let alpha = narrow(log_decay, 1, i, 1).exp(); // [BH,1,dk]
+            let b_t = narrow(beta, 1, i, 1); // [BH,1,1]
+            let sd = state.mul(&transpose_last2(&alpha)); // Diag(alpha) S
+            let kv_mem = transpose_last2(&sd).matmul(&transpose_last2(&k_t)); // [BH,dv,1]
+            let delta = transpose_last2(&v_t).sub(&kv_mem).mul(&b_t); // [BH,dv,1]
+            state = sd.add(&transpose_last2(&k_t).matmul(&transpose_last2(&delta)));
+            let o = transpose_last2(&state)
+                .matmul(&transpose_last2(&q_t))
+                .mul(&Tensor::full(&[bh, dv, 1], scale, DType::F32));
+            outs.push(transpose_last2(&o)); // [BH,1,dv]
+        }
+        Tensor::cat(&outs.iter().collect::<Vec<_>>(), 1)
+    }
+
+    fn kda_case(t: usize, dk: usize, dv: usize, seed: u64) {
+        let bh = 2;
+        let q = Tensor::from_vec(prand(bh * t * dk, seed), vec![bh, t, dk]);
+        let k = Tensor::from_vec(prand(bh * t * dk, seed + 1), vec![bh, t, dk]);
+        let v = Tensor::from_vec(prand(bh * t * dv, seed + 2), vec![bh, t, dv]);
+        // Log decays in [-3, -0.05]: a realistic gate range.
+        let ld: Vec<f32> = prand(bh * t * dk, seed + 3)
+            .into_iter()
+            .map(|x| (x.abs() + 0.05) * -1.5)
+            .collect();
+        let ld = Tensor::from_vec(ld, vec![bh, t, dk]);
+        let beta: Vec<f32> = prand(bh * t, seed + 4)
+            .into_iter()
+            .map(|x| x.abs() * 0.9 + 0.05)
+            .collect();
+        let beta = Tensor::from_vec(beta, vec![bh, t, 1]);
+        let scale = 1.0 / (dk as f64).sqrt();
+
+        let chunked = kda_chunk_forward(&q, &k, &v, &ld, &beta, scale);
+        let naive = naive_kda(&q, &k, &v, &ld, &beta, scale);
+        let (a, b) = (f32_data(&chunked), f32_data(&naive));
+        assert_eq!(a.len(), b.len());
+        let mut worst = 0f32;
+        for (x, y) in a.iter().zip(b.iter()) {
+            let rel = (x - y).abs() / y.abs().max(1e-3);
+            worst = worst.max(rel);
+        }
+        assert!(
+            worst < 5e-4,
+            "kda chunk vs naive mismatch at t={t} dk={dk} dv={dv}: worst rel {worst}"
+        );
+    }
+
+    #[test]
+    fn kda_chunk_matches_naive_within_sub_chunk() {
+        kda_case(13, 8, 8, 7);
+    }
+
+    #[test]
+    fn kda_chunk_matches_naive_across_sub_chunks() {
+        kda_case(40, 8, 16, 11);
+    }
+
+    #[test]
+    fn kda_chunk_matches_naive_across_chunks_ragged() {
+        kda_case(70, 16, 8, 13);
+    }
+
+    #[test]
+    fn kda_chunk_matches_naive_multi_chunk() {
+        kda_case(129, 16, 16, 17);
+    }
+
+    #[test]
+    fn unit_lower_inverse_inverts() {
+        // (I + a) with strictly-lower a; x = (I + a)^-1 must satisfy
+        // (I + a) x = I.
+        let mut a = vec![0f32; 4 * 4];
+        a[4] = 0.5;
+        a[8] = -0.25;
+        a[9] = 0.75;
+        a[12] = 0.1;
+        a[13] = -0.4;
+        a[14] = 0.3;
+        let a = Tensor::from_vec(a, vec![1, 4, 4]);
+        let x = unit_lower_inverse(&a);
+        let prod = eye(4, DType::F32).add(&a).matmul(&x);
+        let d = f32_data(&prod);
+        for i in 0..4 {
+            for j in 0..4 {
+                let want = if i == j { 1.0 } else { 0.0 };
+                assert!((d[i * 4 + j] - want).abs() < 1e-5);
+            }
+        }
     }
 
     #[test]

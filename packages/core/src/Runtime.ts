@@ -387,6 +387,22 @@ export interface NodeOperationMap {
     readonly inputs: readonly [q: TensorHandle, k: TensorHandle, v: TensorHandle]
     readonly attributes: { readonly scale: number; readonly causal: boolean }
   }
+  /** Computes Kimi Delta Attention (gated delta-rule linear attention) in chunked form. */
+  readonly kdaChunk: {
+    readonly inputs: readonly [
+      q: TensorHandle,
+      k: TensorHandle,
+      v: TensorHandle,
+      logDecay: TensorHandle,
+      beta: TensorHandle
+    ]
+    readonly attributes: { readonly scale: number }
+  }
+  /** Applies a causal depthwise short convolution over `[..., T, C]` with zero history. */
+  readonly shortConv1d: {
+    readonly inputs: readonly [self: TensorHandle, weight: TensorHandle]
+    readonly attributes: Record<string, never>
+  }
   /** Selects a prefix from a learned position-embedding table. */
   readonly positionEmbedding: {
     readonly inputs: readonly [weight: TensorHandle]
@@ -601,6 +617,20 @@ export interface DecodeProgramValue {
   readonly kvHeads: number
   /** Width of each key/value head. */
   readonly headDim: number
+  /** Number of KDA recurrent layers with per-sequence state. */
+  readonly kdaLayers: number
+  /** Number of heads per KDA layer. */
+  readonly kdaHeads: number
+  /** Key width of each KDA head. */
+  readonly kdaHeadDim: number
+  /** Value width of each KDA head. */
+  readonly kdaValueDim: number
+  /** Number of short-conv layers with per-sequence window state. */
+  readonly convLayers: number
+  /** Channel count of each short-conv layer. */
+  readonly convChannels: number
+  /** Kernel size of each short-conv layer. */
+  readonly convKernel: number
 }
 
 /**

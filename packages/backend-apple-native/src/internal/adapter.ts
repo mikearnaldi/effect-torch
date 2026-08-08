@@ -534,6 +534,20 @@ export const makeRuntime = (
                 request.attributes.causal
               )
             )
+          case "kdaChunk":
+            return graph(
+              nativeGraph(request.inputs[0], operation).kdaChunk(
+                nativeGraph(request.inputs[1], operation),
+                nativeGraph(request.inputs[2], operation),
+                nativeGraph(request.inputs[3], operation),
+                nativeGraph(request.inputs[4], operation),
+                request.attributes.scale
+              )
+            )
+          case "shortConv1d":
+            return graph(
+              nativeGraph(request.inputs[0], operation).shortConv1d(nativeGraph(request.inputs[1], operation))
+            )
           case "positionEmbedding":
             return graph(nativeGraph(request.inputs[0], operation).positionEmbedding(request.attributes.seqLen))
           case "rotaryEmbedding":
@@ -717,7 +731,14 @@ export const makeRuntime = (
             batch: value.batch,
             layers: value.layers,
             kvHeads: value.kvHeads,
-            headDim: value.headDim
+            headDim: value.headDim,
+            kdaLayers: value.kdaLayers,
+            kdaHeads: value.kdaHeads,
+            kdaHeadDim: value.kdaHeadDim,
+            kdaValueDim: value.kdaValueDim,
+            convLayers: value.convLayers,
+            convChannels: value.convChannels,
+            convKernel: value.convKernel
           }
         },
         catch: backendErrorFor("compileDecode", "compile", "compilation-failed")
