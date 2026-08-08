@@ -1,9 +1,8 @@
 # RFC 0018: Kimi Delta Attention — Chunked Linear Attention, Recurrent Decode State, and No-RoPE Hybrid Stacks
 
-- **Status**: Implemented — forward, closed-form backward, recurrent
-  decode kernel, hybrid generation, and training all gated. Remaining
-  follow-up: fused chunked forward/backward Metal kernels (see the
-  Phase 3 measurement below).
+- **Status**: Implemented — fused forward, closed-form backward, and
+  recurrent decode kernels on Metal (composed reference paths on both
+  backends), hybrid generation, and training, all gated.
 - **Created**: 2026-08-08
 - **Depends on**: RFC 0007 (fusion), RFC 0008 (compilation), RFC 0010
   (inference), RFC 0012 (dtypes), RFC 0013 (batched decode), RFC 0015
@@ -34,19 +33,23 @@ gates:
   against central finite differences of the forward (< 1e-4 rel, f64,
   across chunk boundaries) on all five operands, plus TS gradchecks and
   an end-to-end training smoke.
-- **Phase 3 decode kernel landed; chunked forward/backward kernels
-  deferred on measurement.** The fused register-resident decode kernel
-  (`kda.rs`: state distributed across threadgroup registers, simd_sum
-  contractions, in-place state) matches the composed path to < 1e-4 and
-  measures **49.4 vs 39.5 tok/s (1.25×)** end-to-end on the 30M
-  fineweb-kda model at short context with per-step host sync, replacing
-  ~45 launches per KDA layer per token with 1. The composed chunked
-  prefill/training path measures ~1.7 s/step at batch 32 (30M, block
-  256) vs ~0.7–0.85 s/step for the attention baseline — the fused
-  chunk-pipeline kernels (gate+cumsum, intra+solve, state scan, output;
-  and their adjoints) are the accepted follow-up when training
-  throughput matters; `EFFECT_TORCH_NO_KDA_FUSED` A/Bs the decode
-  kernel.
+- **Phase 3 fused kernels landed (forward, backward, decode).**
+  Sequential register-resident scans, not the WY chunk pipeline: at
+  Dk/Dv ≤ 128 the chunk algebra's materialization costs dominate on
+  this hardware (the MLX evidence agrees — register recurrent kernels
+  are competitive-to-better on Max-class parts), so the fused form is
+  the plain delta-rule scan, one launch per (batch·head) strip. The
+  backward keeps one threadgroup per batch·head (the dk-side gradients
+  sum over the full value dim), recomputes chunk-start states then
+  per-token states into fp32 workspace scratch, and walks the adjoint
+  in reverse with threadgroup-memory cross-row reductions. Decode
+  kernel: one launch per slot per KDA layer (49.4 vs 39.5 tok/s on the
+  30M example). Training (30M, block 256, batch 64, M4 Max): **2.4 →
+  0.94 s/step (2.5×)**, within 1.5× of the fused-attention baseline
+  (~0.6 s/step). Parity: fused forward/backward match the composed
+  (finite-difference-verified) reference to < 1e-3 including stateful
+  carry-over across chunk boundaries; `EFFECT_TORCH_NO_KDA_FUSED`
+  restores the composed paths everywhere for A/B.
 - **Pure-KDA stacks** (zero KV layers) work: the KV pool accepts
   `layers = 0` and keeps only block hashing.
 - **Prefix cache is bypassed** for stacks with recurrent layers (the KV

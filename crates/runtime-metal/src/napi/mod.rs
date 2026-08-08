@@ -2441,7 +2441,44 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> err::Res<value::Value>
                     value::Value(v),
                     value::Value(g),
                     value::Value(b),
-                ) => value::Value(composed::kda_chunk_forward(q, k, v, g, b, *scale)?),
+                ) => {
+                    let dims = q.layout.shape();
+                    let r = dims.len();
+                    let (t, dk) = (dims[r - 2], dims[r - 1]);
+                    let dv = v.layout.shape()[r - 1];
+                    let bh: usize = dims[..r - 2].iter().product();
+                    if std::env::var_os("EFFECT_TORCH_NO_KDA_FUSED").is_none()
+                        && kda::is_supported(q.dtype, dk, dv)
+                    {
+                        // Fused sequential scan: one launch per layer.
+                        let flat = |x: &runtime::metal::run::MetalTensor, w: usize| {
+                            metal_ops::contiguous(&runtime::metal::run::MetalTensor {
+                                buffer: x.buffer.clone(),
+                                layout: runtime::layout::Layout::contiguous(vec![bh, t, w]),
+                                dtype: x.dtype,
+                            })
+                        };
+                        let (out, _) = kda::forward(
+                            &flat(q, dk)?,
+                            &flat(k, dk)?,
+                            &flat(v, dv)?,
+                            &flat(g, dk)?,
+                            &flat(b, 1)?,
+                            *scale,
+                            None,
+                            false,
+                        )?;
+                        let mut shape = dims.to_vec();
+                        shape[r - 1] = dv;
+                        value::Value(metal_ops::contiguous(&runtime::metal::run::MetalTensor {
+                            buffer: out.buffer.clone(),
+                            layout: runtime::layout::Layout::contiguous(shape),
+                            dtype: out.dtype,
+                        })?)
+                    } else {
+                        value::Value(composed::kda_chunk_forward(q, k, v, g, b, *scale)?)
+                    }
+                }
                 _ => return Err("device mismatch".to_string()),
             }
         }
@@ -2506,12 +2543,54 @@ fn eval_uncached(node: &Arc<Node>, ev: &mut Evaluator) -> err::Res<value::Value>
                     value::Value(b),
                     value::Value(g),
                 ) => {
-                    let (dq, dk, dv, dg, db) =
-                        composed::kda_chunk_backward(q, k, v, ld, b, g, *scale)?;
+                    let dims = q.layout.shape();
+                    let r = dims.len();
+                    let (t, dk) = (dims[r - 2], dims[r - 1]);
+                    let dv = v.layout.shape()[r - 1];
+                    let bh: usize = dims[..r - 2].iter().product();
+                    let (dq, dk, dv_, dg, db) = if std::env::var_os("EFFECT_TORCH_NO_KDA_FUSED")
+                        .is_none()
+                        && kda::is_supported(q.dtype, dk, dv)
+                    {
+                        let flat = |x: &runtime::metal::run::MetalTensor, w: usize| {
+                            metal_ops::contiguous(&runtime::metal::run::MetalTensor {
+                                buffer: x.buffer.clone(),
+                                layout: runtime::layout::Layout::contiguous(vec![bh, t, w]),
+                                dtype: x.dtype,
+                            })
+                        };
+                        let (gdq, gdk, gdv, gdg, gdb) = kda::backward(
+                            &flat(q, dk)?,
+                            &flat(k, dk)?,
+                            &flat(v, dv)?,
+                            &flat(ld, dk)?,
+                            &flat(b, 1)?,
+                            &flat(g, dv)?,
+                            *scale,
+                        )?;
+                        let restore = |x: &runtime::metal::run::MetalTensor, w: usize| {
+                            let mut shape = dims.to_vec();
+                            shape[r - 1] = w;
+                            metal_ops::contiguous(&runtime::metal::run::MetalTensor {
+                                buffer: x.buffer.clone(),
+                                layout: runtime::layout::Layout::contiguous(shape),
+                                dtype: x.dtype,
+                            })
+                        };
+                        (
+                            restore(&gdq, dk)?,
+                            restore(&gdk, dk)?,
+                            restore(&gdv, dv)?,
+                            restore(&gdg, dk)?,
+                            restore(&gdb, 1)?,
+                        )
+                    } else {
+                        composed::kda_chunk_backward(q, k, v, ld, b, g, *scale)?
+                    };
                     let values = vec![
                         value::Value(dq),
                         value::Value(dk),
-                        value::Value(dv),
+                        value::Value(dv_),
                         value::Value(dg),
                         value::Value(db),
                     ];
@@ -4309,6 +4388,42 @@ fn kda_recurrence(
                     1,
                     geometry.heads,
                     1,
+                    geometry.value_dim,
+                ]),
+                dtype: out.dtype,
+            })?);
+            continue;
+        }
+        // Prefill (t > 1): the fused sequential scan carries the slot's
+        // state in and out when the geometry supports it.
+        if std::env::var_os("EFFECT_TORCH_NO_KDA_FUSED").is_none()
+            && kda::is_supported(in_dtype, geometry.head_dim, geometry.value_dim)
+        {
+            let flat = |x: &runtime::metal::run::MetalTensor, w: usize| -> err::Res<_> {
+                metal_ops::contiguous(&runtime::metal::run::MetalTensor {
+                    buffer: x.buffer.clone(),
+                    layout: runtime::layout::Layout::contiguous(vec![geometry.heads, t, w]),
+                    dtype: x.dtype,
+                })
+            };
+            let (out, final_state) = kda::forward(
+                &flat(&qs, geometry.head_dim)?,
+                &flat(&ks, geometry.head_dim)?,
+                &flat(&vs, geometry.value_dim)?,
+                &flat(&gs, geometry.head_dim)?,
+                &flat(&bs, 1)?,
+                scale,
+                Some(&state.kda_states[layer as usize]),
+                true,
+            )?;
+            state.kda_states[layer as usize] =
+                final_state.ok_or_else(|| "kda forward: final state missing".to_string())?;
+            outs.push(metal_ops::contiguous(&runtime::metal::run::MetalTensor {
+                buffer: out.buffer.clone(),
+                layout: runtime::layout::Layout::contiguous(vec![
+                    1,
+                    geometry.heads,
+                    t,
                     geometry.value_dim,
                 ]),
                 dtype: out.dtype,
