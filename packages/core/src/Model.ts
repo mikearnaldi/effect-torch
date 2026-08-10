@@ -20,8 +20,8 @@
  * `names` gives every parameter a stable, checkpoint-friendly identity
  * mapped by {@link save} and {@link load}. Every model also carries a
  * compiled execution path:
- * {@link Model.execute} runs the forward as a frozen native program,
- * traced once per input signature and replayed after, while
+ * {@link Model.execute} runs the forward as a cached native executable,
+ * traced and compiled once per input signature and reused after, while
  * {@link Model.forward} stays the lazy graph builder for training,
  * composition, and differentiation. {@link inference} builds the separate
  * paged-KV artifact used for autoregressive generation.
@@ -109,8 +109,8 @@ export interface Model {
    * Runs the frozen forward program: parameters and input in,
    * materialized output out. With concrete inputs, each invocation makes one
    * native program call after the first call per signature pays the trace;
-   * lazy inputs are first materialized in a separate graph walk. The cache
-   * signature includes runtime identity and every parameter and input tensor's
+   * lazy inputs are first materialized through the common executable path. The
+   * cache signature includes runtime identity and every parameter and input tensor's
    * shape, dtype, and placement; values do not affect it. Any signature change
    * traces a new program automatically. `execute` does not retain parameter
    * values, so materialize lazy initializers once before repeated calls. Use it
@@ -1606,7 +1606,14 @@ export const inference = (
         }
         placeholders.push(yield* Tensor.makeInput(frozenParams.length, exemplar))
         const output = yield* model.forward(placeholders.slice(0, -1), placeholders[placeholders.length - 1])
-        return yield* Tensor.compileDecodeProgram([output], config.attentionWindow, batch).pipe(
+        const state = {
+          maxTokens: config.maxTokens,
+          blockSize,
+          kvDtype: config.kvDtype === "int8" ? "u8" as const : (config.kvDtype ?? "f32"),
+          batch: batch ?? 1,
+          ...(config.attentionWindow === undefined ? {} : { window: config.attentionWindow })
+        }
+        return yield* Tensor.compileDecodeProgram([output], state, { outputCapacity: decodeBatch * 2 }).pipe(
           Effect.mapError((error) => new InferenceError({ op: "inference", message: error.message }))
         )
       })
@@ -1642,7 +1649,16 @@ export const inference = (
       prefillProgram.headDim,
       config.maxTokens,
       blockSize,
-      config.kvDtype === "int8" ? "u8" : (config.kvDtype ?? "f32")
+      config.kvDtype === "int8" ? "u8" : (config.kvDtype ?? "f32"),
+      {
+        kdaLayers: prefillProgram.kdaLayers,
+        kdaHeads: prefillProgram.kdaHeads,
+        kdaHeadDim: prefillProgram.kdaHeadDim,
+        kdaValueDim: prefillProgram.kdaValueDim,
+        convLayers: prefillProgram.convLayers,
+        convChannels: prefillProgram.convChannels,
+        convKernel: prefillProgram.convKernel
+      }
     ).pipe(Effect.mapError((error) => new InferenceError({ op: "inference", message: error.message })))
     const tokenIds = (op: "prefill" | "step", tokens: Tensor.Any) =>
       Effect.mapError(
@@ -1656,25 +1672,62 @@ export const inference = (
       readonly seq: GenerationSeq
       readonly sequence: Tensor.KvSequence
     }
-    const lastLogits = (op: "prefill" | "step", output: Tensor.Concrete, row: number) =>
+    const compileLogitRows = (
+      op: "prefill" | "step",
+      program: Tensor.DecodeProgram,
+      rows: ReadonlyArray<readonly [batch: number, token: number]>
+    ) =>
       Effect.gen(function*() {
-        const rank = output.shape.length
-        if (rank < 2) {
+        const output = program.outputs[0]
+        if (program.outputs.length !== 1 || output === undefined || output.shape.length !== 3) {
           return yield* new InferenceError({
             op,
-            message: `model output must be [..., T, vocab], got [${output.shape}]`
+            message: `model output must be [batch, T, vocab], got ${program.outputs.length} output(s)${
+              output === undefined ? "" : ` with first shape [${output.shape}]`
+            }`
           })
         }
-        const vocab = output.shape[rank - 1]
-        const leading = output.shape.slice(0, -2)
-        const last = yield* Tensor.slice(output, {
-          start: [...leading.map(() => 0), row, 0],
-          end: [...leading.map((d: number) => d), row + 1, vocab]
-        })
-        const reshaped = yield* Tensor.reshape(last, [vocab])
-        const [result] = yield* Tensor.compute([reshaped])
-        return result
+        const [batch, steps, vocab] = output.shape
+        for (const [rowBatch, rowToken] of rows) {
+          if (rowBatch < 0 || rowBatch >= batch! || rowToken < 0 || rowToken >= steps!) {
+            return yield* new InferenceError({
+              op,
+              message: `logit row [${rowBatch}, ${rowToken}] is outside model output [${output.shape}]`
+            })
+          }
+        }
+        const exemplar = yield* Tensor.zeros(output.shape, { dtype: output.dtype })
+        const placeholder = yield* Tensor.makeInput(0, exemplar)
+        const roots: Array<Tensor.Lazy> = []
+        for (const [rowBatch, rowToken] of rows) {
+          const row = yield* Tensor.slice(placeholder, {
+            start: [rowBatch, rowToken, 0],
+            end: [rowBatch + 1, rowToken + 1, vocab]
+          })
+          roots.push(yield* Tensor.reshape(row, [vocab!]))
+        }
+        return yield* Tensor.freezeProgram(roots, { outputCapacity: decodeBatch * 2 })
       })
+    const prefillExtractors: Array<Tensor.CompiledProgram> = []
+    for (let row = 0; row < prefillChunk; row++) {
+      prefillExtractors.push(yield* compileLogitRows("prefill", prefillProgram, [[0, row]]))
+    }
+    const decodeExtractor = yield* compileLogitRows("step", decodeProgram, [[0, 0]])
+    const batchedExtractors: Array<Tensor.CompiledProgram | undefined> = []
+    if (batchedProgram !== undefined) {
+      for (let active = 2; active <= decodeBatch; active++) {
+        batchedExtractors[active] = yield* compileLogitRows(
+          "step",
+          batchedProgram,
+          Array.from({ length: active }, (_, row) => [row, 0] as const)
+        )
+      }
+    }
+    const extractLogits = (
+      output: Tensor.Concrete,
+      extractor: Tensor.CompiledProgram
+    ): Effect.Effect<Array<Tensor.Concrete>, Tensor.TensorError, Runtime.Runtime> =>
+      Tensor.runProgram(extractor, [output]).pipe(Effect.ensuring(Effect.ignore(Tensor.clear(output))))
     const idTensor = (ids: ReadonlyArray<number>, shape: ReadonlyArray<number>) =>
       Tensor.fromTypedArray(
         tokenDtype === "i64" ? BigInt64Array.from(ids.map(BigInt)) : Uint32Array.from(ids),
@@ -1735,7 +1788,10 @@ export const inference = (
                     ids.slice(offset, offset + real)
                   )
                   if (offset + real === t) {
-                    logits = yield* lastLogits("prefill", output, real - 1)
+                    const [last] = yield* extractLogits(output, prefillExtractors[real - 1]!)
+                    logits = last
+                  } else {
+                    yield* Tensor.clear(output)
                   }
                 }
                 const seq: GenerationSeq = {
@@ -1805,7 +1861,7 @@ export const inference = (
                       entry.seq.sequence,
                       [entry.token]
                     )
-                    return [yield* lastLogits("step", output, 0)]
+                    return yield* extractLogits(output, decodeExtractor)
                   }
                   if (batchedProgram === undefined) {
                     return yield* new InferenceError({
@@ -1821,17 +1877,7 @@ export const inference = (
                     entries.map((entry) => entry.seq.sequence),
                     ids.map((id) => [id])
                   )
-                  const vocab = output.shape[output.shape.length - 1]!
-                  const results: Array<Tensor.Concrete> = []
-                  for (let i = 0; i < entries.length; i++) {
-                    const row = yield* Tensor.slice(output, {
-                      start: [i, 0, 0],
-                      end: [i + 1, 1, vocab]
-                    })
-                    const [concrete] = yield* Tensor.compute([yield* Tensor.reshape(row, [vocab])])
-                    results.push(concrete)
-                  }
-                  return results
+                  return yield* extractLogits(output, batchedExtractors[entries.length]!)
                 })
               ),
             live: () => Effect.sync(() => live.length),

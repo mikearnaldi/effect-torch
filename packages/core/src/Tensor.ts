@@ -88,8 +88,8 @@ export type Concrete = Runtime.ConcreteTensorHandle
  * @category compilation
  */
 export interface CompiledProgram {
-  /** Opaque runtime handle for the frozen graph. */
-  readonly handle: Runtime.ProgramHandle
+  /** Opaque runtime handle for the compiled executable. */
+  readonly handle: Runtime.ExecutableHandle
   /** Output metadata recorded from the roots at freeze time. */
   readonly outputs: ReadonlyArray<{
     /** Expected output shape. */
@@ -3523,14 +3523,11 @@ export const cast: {
     }))
 )
 /**
- * Evaluates one or more lazy tensors in a single graph walk, running the
- * computation off the JavaScript thread, and returns the materialized
- * tensors in the same order. All roots share one deduplication cache:
- * subgraphs shared between the roots are computed only once, and `randn`
- * nodes produce a single set of draws across all roots. This matters for
- * gradients: the loss and its gradients share the forward graph, so they
- * must be evaluated together to be consistent. Interrupting the fiber
- * aborts the native evaluation. Concrete roots are accepted, but callers must
+ * Compiles one or more tensor roots into a static executable, runs it off the
+ * JavaScript thread, and returns materialized tensors in the same order. All
+ * roots are lowered together, so shared subgraphs execute once and random
+ * nodes produce one consistent set of draws across all roots. Interrupting
+ * the fiber aborts native execution. Concrete roots are accepted, but callers must
  * not rely on the returned handle having the same JavaScript identity or
  * storage aliasing as the input. A tuple in gives the same tuple shape out,
  * with each element materialized.
@@ -3547,24 +3544,28 @@ export const compute = <Roots extends ReadonlyArray<Any>>(
       return [] as unknown as { readonly [K in keyof Roots]: Concrete }
     }
     const runtime = yield* Runtime.Runtime
-    const values = yield* fromBackend("evaluate", runtime.evaluate(roots))
+    const executable = yield* fromBackend("compile", runtime.compile({ roots }))
+    const values = yield* fromBackend(
+      "execute",
+      runtime.execute(executable, { bindings: [], scalars: [], runtimeValues: {} })
+    )
     if (values.length !== roots.length) {
       yield* releaseTensors(runtime, values)
       return yield* new TensorError({
-        op: "evaluate",
-        message: `evaluate: backend returned ${values.length} tensors for ${roots.length} roots`
+        op: "execute",
+        message: `execute: backend returned ${values.length} tensors for ${roots.length} roots`
       })
     }
     const checked = Effect.forEach(values, (value, index) =>
       Effect.try({
         try: () =>
-          validateTensorHandle("evaluate", runtime, value, {
+          validateTensorHandle("execute", runtime, value, {
             _tag: "Tensor",
             shape: roots[index].shape,
             dtype: roots[index].dtype,
             placement: roots[index].placement
           }),
-        catch: (error) => caughtTensorError("evaluate", error)
+        catch: (error) => caughtTensorError("execute", error)
       }))
     return (yield* preserveOnFailure(checked, releaseTensors(runtime, values))) as {
       readonly [K in keyof Roots]: Concrete
@@ -3698,7 +3699,8 @@ export interface SafetensorsArchive {
 
 /**
  * Saves tensors through the runtime's optional direct path. All entries are
- * evaluated in one shared graph walk by backends that implement the extension.
+ * compiled and materialized together before the transfer service serializes
+ * the resulting concrete tensors.
  *
  * @since 0.1.0
  * @category destructors
@@ -3726,12 +3728,16 @@ export const save = (
       try: () => validateMetadata("save", options.metadata ?? {}),
       catch: (error) => caughtTensorError("save", error)
     })
-    yield* fromBackend(
-      "save",
-      extension.save(path, {
-        entries: entries.map(([name, tensor]) => ({ name, tensor })),
-        metadata
-      })
+    const materialized = yield* compute(entries.map(([, tensor]) => tensor))
+    yield* Effect.ensuring(
+      fromBackend(
+        "save",
+        extension.save(path, {
+          entries: entries.map(([name], index) => ({ name, tensor: materialized[index] })),
+          metadata
+        })
+      ),
+      releaseTensors(runtime, materialized)
     )
   })
 }
@@ -3839,7 +3845,7 @@ export interface CompileStats {
  * @since 0.1.0
  * @category compilation
  */
-export interface CompileOptions {
+export interface CompileOptions extends Runtime.ExecutableCompileOptions {
   /**
    * Capacity for ready LRU entries. Signatures include runtime identity and
    * each input's shape, dtype, and placement. In-flight entries can
@@ -4084,11 +4090,12 @@ export const makeScalarInput = (
  * @category compilation
  */
 export const freezeProgram = (
-  roots: ReadonlyArray<Any>
+  roots: ReadonlyArray<Any>,
+  options: Runtime.ExecutableCompileOptions = {}
 ): Effect.Effect<CompiledProgram, TensorError, Runtime.Runtime> =>
   Effect.gen(function*() {
     const runtime = yield* Runtime.Runtime
-    const handle = yield* fromBackend("compile", runtime.compile(roots))
+    const handle = yield* fromBackend("compile", runtime.compile({ roots, options }))
     return {
       handle,
       outputs: roots.map((root) => ({ shape: root.shape, dtype: root.dtype, placement: root.placement }))
@@ -4111,17 +4118,15 @@ export const runProgram = (
 ): Effect.Effect<Array<Concrete>, TensorError, Runtime.Runtime> =>
   Effect.gen(function*() {
     const runtime = yield* Runtime.Runtime
-    let concrete: ReadonlyArray<Concrete>
-    if (inputs.every(isTensor)) {
-      concrete = inputs as ReadonlyArray<Concrete>
-    } else {
-      const materialized = yield* compute(inputs.filter((input) => !isTensor(input)))
-      let index = 0
-      concrete = inputs.map((input) => isTensor(input) ? input : materialized[index++]!)
-    }
-    const values = yield* fromBackend(
-      "run",
-      runtime.run(program.handle, concrete, scalars)
+    const materialized = inputs.every(isTensor) ? [] : yield* compute(inputs.filter((input) => !isTensor(input)))
+    let index = 0
+    const concrete = inputs.map((input) => isTensor(input) ? input : materialized[index++]!)
+    const values = yield* Effect.ensuring(
+      fromBackend(
+        "run",
+        runtime.execute(program.handle, { bindings: concrete, scalars, runtimeValues: {} })
+      ),
+      releaseTensors(runtime, materialized)
     )
     if (values.length !== program.outputs.length) {
       yield* releaseTensors(runtime, values)
@@ -4145,9 +4150,9 @@ export const runProgram = (
  * @since 0.1.0
  * @category compilation
  */
-export interface DecodeProgram {
-  /** Opaque runtime handle for the rewritten frozen graph. */
-  readonly handle: Runtime.DecodeProgramHandle
+export interface DecodeProgram extends Runtime.DecodeStateSchema {
+  /** Opaque runtime handle for the rewritten static executable. */
+  readonly handle: Runtime.ExecutableHandle
   /**
    * Fixed compiled batch width; batched execution accepts at most this many
    * active sequences.
@@ -4203,6 +4208,17 @@ export interface KvPool {
   readonly handle: Runtime.KvPoolHandle
 }
 
+/** Recurrent state allocated when a sequence is created. */
+export interface KvRecurrentGeometry {
+  readonly kdaLayers: number
+  readonly kdaHeads: number
+  readonly kdaHeadDim: number
+  readonly kdaValueDim: number
+  readonly convLayers: number
+  readonly convChannels: number
+  readonly convKernel: number
+}
+
 /**
  * Allocates a KV pool: `layers` per-layer `[maxTokens, kvHeads, headDim]`
  * key/value slabs with `blockSize`-token blocks. Geometry and capacities must
@@ -4219,7 +4235,16 @@ export const makeKvPool = (
   headDim: number,
   maxTokens: number,
   blockSize: number,
-  dtype: DType = "f32"
+  dtype: DType = "f32",
+  recurrent: KvRecurrentGeometry = {
+    kdaLayers: 0,
+    kdaHeads: 0,
+    kdaHeadDim: 0,
+    kdaValueDim: 0,
+    convLayers: 0,
+    convChannels: 0,
+    convKernel: 0
+  }
 ): Effect.Effect<KvPool, TensorError, Runtime.Runtime> =>
   Effect.gen(function*() {
     const runtime = yield* Runtime.Runtime
@@ -4232,7 +4257,7 @@ export const makeKvPool = (
     }
     const handle = yield* fromBackend(
       "makeKvPool",
-      extension.makePool({ layers, kvHeads, headDim, maxTokens, blockSize, dtype })
+      extension.makePool({ layers, kvHeads, headDim, maxTokens, blockSize, dtype, ...recurrent })
     )
     return { handle }
   })
@@ -4355,8 +4380,8 @@ export const releaseKvSequence = (sequence: KvSequence): Effect.Effect<void, Ten
  */
 export const compileDecodeProgram = (
   roots: ReadonlyArray<Any>,
-  window?: number,
-  batch?: number
+  state: Runtime.DecodeStateRequest,
+  options: { readonly outputCapacity?: number } = {}
 ): Effect.Effect<DecodeProgram, TensorError, Runtime.Runtime> =>
   Effect.gen(function*() {
     const runtime = yield* Runtime.Runtime
@@ -4367,9 +4392,26 @@ export const compileDecodeProgram = (
         message: `compileDecode: backend ${runtime.backend.name} does not support compiled inference`
       })
     }
-    const value = yield* fromBackend("compileDecode", extension.compile(roots, window, batch))
+    const handle = yield* fromBackend(
+      "compileDecode",
+      runtime.compile({
+        roots,
+        options: {
+          constantWeights: true,
+          ...(options.outputCapacity === undefined ? {} : { outputCapacity: options.outputCapacity })
+        },
+        state
+      })
+    )
+    if (handle.state === undefined) {
+      return yield* new TensorError({
+        op: "compileDecode",
+        message: "compileDecode: backend returned a stateless executable"
+      })
+    }
     return {
-      ...value,
+      handle,
+      ...handle.state,
       outputs: roots.map((root) => ({ shape: root.shape, dtype: root.dtype, placement: root.placement }))
     }
   })
@@ -4394,14 +4436,23 @@ export const runDecodeProgram = (
 ): Effect.Effect<Array<Concrete>, TensorError, Runtime.Runtime> =>
   Effect.gen(function*() {
     const runtime = yield* Runtime.Runtime
-    const extension = runtime.extensions.decode
-    if (extension === undefined) {
+    if (runtime.extensions.decode === undefined) {
       return yield* new TensorError({ op: "decode", message: "decode: inference extension is unavailable" })
     }
-    const concrete = inputs.every(isTensor) ? inputs as ReadonlyArray<Concrete> : yield* compute(inputs)
-    const values = yield* fromBackend(
-      "decode",
-      extension.run(program.handle, concrete, seq.handle, tokens)
+    const materialized = inputs.every(isTensor) ? [] : yield* compute(inputs.filter((input) => !isTensor(input)))
+    let index = 0
+    const concrete = inputs.map((input) => isTensor(input) ? input : materialized[index++]!)
+    const values = yield* Effect.ensuring(
+      fromBackend(
+        "decode",
+        runtime.execute(program.handle, {
+          bindings: concrete,
+          scalars: [],
+          runtimeValues: {},
+          state: { sequences: [seq.handle], tokens: [tokens] }
+        })
+      ),
+      releaseTensors(runtime, materialized)
     )
     if (values.length !== program.outputs.length) {
       yield* releaseTensors(runtime, values)
@@ -4441,22 +4492,29 @@ export const runBatchedDecodeProgram = (
 ): Effect.Effect<Array<Concrete>, TensorError, Runtime.Runtime> =>
   Effect.gen(function*() {
     const runtime = yield* Runtime.Runtime
-    const extension = runtime.extensions.decode
-    if (extension === undefined) {
+    if (runtime.extensions.decode === undefined) {
       return yield* new TensorError({
         op: "decodeBatched",
         message: "decodeBatched: inference extension is unavailable"
       })
     }
-    const concrete = inputs.every(isTensor) ? inputs as ReadonlyArray<Concrete> : yield* compute(inputs)
-    const values = yield* fromBackend(
-      "decodeBatched",
-      extension.runBatched(
-        program.handle,
-        concrete,
-        seqs.map((sequence) => sequence.handle),
-        tokens
-      )
+    const materialized = inputs.every(isTensor) ? [] : yield* compute(inputs.filter((input) => !isTensor(input)))
+    let index = 0
+    const concrete = inputs.map((input) => isTensor(input) ? input : materialized[index++]!)
+    const values = yield* Effect.ensuring(
+      fromBackend(
+        "decodeBatched",
+        runtime.execute(program.handle, {
+          bindings: concrete,
+          scalars: [],
+          runtimeValues: {},
+          state: {
+            sequences: seqs.map((sequence) => sequence.handle),
+            tokens
+          }
+        })
+      ),
+      releaseTensors(runtime, materialized)
     )
     if (values.length !== program.outputs.length) {
       yield* releaseTensors(runtime, values)
@@ -4660,7 +4718,13 @@ export const compile = <E = never, R = never>(
           placeholders.push(yield* makeInput(i, inputs[i]))
         }
         const roots = yield* build(placeholders)
-        return yield* freezeProgram(roots)
+        const compileOptions: Runtime.ExecutableCompileOptions = {
+          ...(options.optimize === undefined ? {} : { optimize: options.optimize }),
+          ...(options.precision === undefined ? {} : { precision: options.precision }),
+          ...(options.constantWeights === undefined ? {} : { constantWeights: options.constantWeights }),
+          ...(options.outputCapacity === undefined ? {} : { outputCapacity: options.outputCapacity })
+        }
+        return yield* freezeProgram(roots, compileOptions)
       })
     const self: CompiledFn<E, R> = {
       call: (inputs) =>

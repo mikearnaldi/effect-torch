@@ -7,19 +7,10 @@ export declare class CancellationToken {
 }
 
 /** @internal */
-export declare class CompiledProgram {
+export declare class Executable {
   get signature(): string
-  run(
-    inputs: Array<NativeTensor>,
-    scalars: Array<number>,
-    token?: CancellationToken | undefined | null
-  ): Promise<Array<NativeTensor>>
-}
-
-/** @internal */
-export declare class DecodeProgram {
+  get stateful(): boolean
   get batch(): number
-  get signature(): string
   get layers(): number
   get kvHeads(): number
   get headDim(): number
@@ -30,16 +21,12 @@ export declare class DecodeProgram {
   get convLayers(): number
   get convChannels(): number
   get convKernel(): number
-  run(
+  get diagnostics(): NativeExecutableDiagnostics
+  execute(
     inputs: Array<NativeTensor>,
-    seq: NativeKvSequence,
-    tokens: Array<number>,
-    token?: CancellationToken | undefined | null
-  ): Promise<Array<NativeTensor>>
-  runBatched(
-    inputs: Array<NativeTensor>,
-    seqs: Array<NativeKvSequence>,
-    tokens: Array<Array<number>>,
+    scalars: Array<number>,
+    sequences?: Array<NativeKvSequence> | undefined | null,
+    tokens?: Array<Array<number>> | undefined | null,
     token?: CancellationToken | undefined | null
   ): Promise<Array<NativeTensor>>
 }
@@ -157,7 +144,8 @@ export declare class NativeKvPool {
     headDim: number,
     maxTokens: number,
     blockSize?: number | undefined | null,
-    dtype?: NativeDType | undefined | null
+    dtype?: NativeDType | undefined | null,
+    recurrent?: NativeRecurrentStateSchema | undefined | null
   )
   get capacity(): number
   get freeBlocks(): number
@@ -187,20 +175,12 @@ export declare class NativeTensor {
 }
 
 /** @internal */
-export declare function compile(roots: Array<LazyTensor>): CompiledProgram
-
-/** @internal */
-export declare function compileDecode(
+export declare function compile(
   roots: Array<LazyTensor>,
-  window?: number | undefined | null,
-  batch?: number | undefined | null
-): DecodeProgram
-
-/** @internal */
-export declare function evalLazy(
-  tensors: Array<LazyTensor>,
-  token?: CancellationToken | undefined | null
-): Promise<Array<NativeTensor>>
+  options?: NativeCompileOptions | undefined | null,
+  state?: NativeKvStateSchema | undefined | null,
+  cacheKey?: string | undefined | null
+): Executable
 
 /** @internal */
 export declare function externalMemoryBytes(): number
@@ -229,6 +209,55 @@ export declare const enum NativeDType {
 }
 
 /** @internal */
+export interface NativeCompileOptions {
+  optimize?: boolean
+  allowReducedPrecision?: boolean
+  constantWeights?: boolean
+  outputCapacity?: number
+}
+
+/** @internal */
+export interface NativeKvStateSchema {
+  maxTokens: number
+  blockSize: number
+  kvDtype: NativeDType
+  window?: number
+  batch: number
+}
+
+/** @internal */
+export interface NativeRecurrentStateSchema {
+  kdaLayers: number
+  kdaHeads: number
+  kdaHeadDim: number
+  kdaValueDim: number
+  convLayers: number
+  convChannels: number
+  convKernel: number
+}
+
+/** @internal */
+export interface NativeExecutableDiagnostics {
+  semanticNodesBeforeOptimization: number
+  semanticNodesAfterOptimization: number
+  instructions: Array<{ kind: string; count: number }>
+  pipelineCount: number
+  commandCount: number
+  synchronizationCount: number
+  outputCapacity: number
+  memory: {
+    externalBytes: number
+    persistentBytes: number
+    stateBytes: number
+    outputBytes: number
+    workspaceBytes: number
+    transactionBytes: number
+    peakLiveBytes: number
+    packingOverheadBytes: number
+  }
+}
+
+/** @internal */
 export interface NativeSafetensorsArchive {
   entries: Array<NativeSafetensorsEntry>
   metadata: Record<string, string>
@@ -244,7 +273,7 @@ export interface NativeSafetensorsEntry {
 export declare function saveTensors(
   path: string,
   names: Array<string>,
-  tensors: Array<LazyTensor>,
+  tensors: Array<NativeTensor>,
   metadata: Record<string, string>,
   token?: CancellationToken | undefined | null
 ): Promise<void>
@@ -252,15 +281,12 @@ export declare function saveTensors(
 /** @internal */
 export interface NativeAddon {
   readonly CancellationToken: typeof CancellationToken
-  readonly CompiledProgram: typeof CompiledProgram
-  readonly DecodeProgram: typeof DecodeProgram
+  readonly Executable: typeof Executable
   readonly LazyTensor: typeof LazyTensor
   readonly NativeKvPool: typeof NativeKvPool
   readonly NativeKvSequence: typeof NativeKvSequence
   readonly NativeTensor: typeof NativeTensor
   readonly compile: typeof compile
-  readonly compileDecode: typeof compileDecode
-  readonly evalLazy: typeof evalLazy
   readonly externalMemoryBytes: typeof externalMemoryBytes
   readonly grad: typeof grad
   readonly isAvailable: typeof isAvailable

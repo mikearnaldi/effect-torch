@@ -1,7 +1,7 @@
 use super::err::{err, Res};
 use super::value::Value;
-use crate::{device::MetalDevice, kernels, run::MetalTensor};
-use effect_torch_runtime::{DType, Layout};
+use crate::device::MetalDevice;
+use effect_torch_runtime::DType;
 use safetensors::tensor::{serialize, Dtype, SafeTensors, TensorView};
 use std::collections::HashMap;
 use std::io::Write;
@@ -36,45 +36,47 @@ fn runtime_dtype(dtype: Dtype) -> Res<DType> {
 }
 
 pub fn tensor_bytes(value: &Value) -> Res<Vec<u8>> {
-    let tensor = if value.0.layout.is_contiguous() {
-        value.0.clone()
-    } else {
-        kernels::strided_copy(MetalDevice::get(), &value.0)?
-    };
+    let tensor = &value.0;
     MetalDevice::get().synchronize()?;
-    let length = tensor.numel() * tensor.dtype.size_in_bytes();
-    let pointer = unsafe {
-        tensor
-            .buffer
-            .contents_ptr()
-            .cast::<u8>()
-            .add(tensor.layout.offset() * tensor.dtype.size_in_bytes())
+    let count = tensor.numel();
+    let base = tensor.buffer.contents_ptr().cast::<u8>();
+    let logical_offset = |mut linear: usize| {
+        let mut offset = tensor.layout.offset();
+        for dimension in (0..tensor.layout.rank()).rev() {
+            let width = tensor.layout.shape()[dimension].max(1);
+            offset += (linear % width) * tensor.layout.strides()[dimension];
+            linear /= width;
+        }
+        offset
     };
-    Ok(unsafe { std::slice::from_raw_parts(pointer, length) }.to_vec())
+    let mut output = Vec::with_capacity(count * tensor.dtype.size_in_bytes());
+    macro_rules! write_le {
+        ($type:ty) => {{
+            let source = base.cast::<$type>();
+            for index in 0..count {
+                output.extend_from_slice(
+                    &unsafe { *source.add(logical_offset(index)) }.to_le_bytes(),
+                );
+            }
+        }};
+    }
+    match tensor.dtype {
+        DType::F32 => write_le!(f32),
+        DType::F64 => write_le!(f64),
+        DType::F16 | DType::BF16 => write_le!(u16),
+        DType::U8 => {
+            for index in 0..count {
+                output.push(unsafe { *base.add(logical_offset(index)) });
+            }
+        }
+        DType::U32 => write_le!(u32),
+        DType::I64 => write_le!(i64),
+    }
+    Ok(output)
 }
 
 pub fn value_from_bytes(bytes: &[u8], shape: &[usize], dtype: DType) -> Res<Value> {
-    let elements = shape
-        .iter()
-        .try_fold(1usize, |total, &dimension| total.checked_mul(dimension))
-        .ok_or_else(|| "safetensors: tensor element count overflows".to_string())?;
-    let expected = elements
-        .checked_mul(dtype.size_in_bytes())
-        .ok_or_else(|| "safetensors: tensor byte length overflows".to_string())?;
-    if bytes.len() != expected {
-        return err(format!(
-            "safetensors: expected {expected} bytes for {dtype} tensor with shape {shape:?}, got {}",
-            bytes.len()
-        ));
-    }
-    if dtype == DType::F64 {
-        return err("safetensors: f64 is not supported on Metal");
-    }
-    Ok(Value(MetalTensor {
-        buffer: MetalDevice::get().upload_bytes(bytes),
-        layout: Layout::contiguous(shape.to_vec()),
-        dtype,
-    }))
+    crate::value::value_from_bytes(bytes, shape, dtype)
 }
 
 fn temporary_path(path: &Path) -> Res<PathBuf> {
@@ -129,7 +131,7 @@ pub fn save(
     let views = owned
         .iter()
         .map(|(name, dtype, shape, bytes)| {
-            TensorView::new(*dtype, shape.clone(), bytes).map(|view| (name.as_str(), view))
+            TensorView::new(*dtype, shape.to_vec(), bytes).map(|view| (name.as_str(), view))
         })
         .collect::<Result<Vec<_>, _>>()
         .map_err(|error| error.to_string())?;

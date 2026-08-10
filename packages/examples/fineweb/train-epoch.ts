@@ -78,7 +78,7 @@ const program = Effect.gen(function*() {
     precision: PRECISION,
     onStep: ({ step, loss, elapsed }) => {
       // ETA from the mean step time since the epoch began, excluding
-      // the first step seen (its capture/compile overhead would skew
+      // the first step seen (its compile overhead would skew
       // the average); the clock is continuous across checkpoint chunks
       // via Resume.startedAt.
       const ms = Duration.toMillis(elapsed)

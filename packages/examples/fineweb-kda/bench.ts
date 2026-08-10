@@ -16,15 +16,18 @@ const program = Effect.gen(function*() {
   const argmax = (vals: Array<number>) => vals.reduce((best, v, j) => (v > vals[best] ? j : best), 0)
   // warmup
   let next = argmax(yield* Tensor.toNumberArray(logits))
+  yield* Tensor.clear(logits)
   for (let i = 0; i < 8; i++) {
     const [l] = yield* gen.step([{ seq: entry.seq, token: next }])
     next = argmax(yield* Tensor.toNumberArray(l))
+    yield* Tensor.clear(l)
   }
   const N = 64
   const t0 = Date.now()
   for (let i = 0; i < N; i++) {
     const [l] = yield* gen.step([{ seq: entry.seq, token: next }])
     next = argmax(yield* Tensor.toNumberArray(l))
+    yield* Tensor.clear(l)
   }
   const ms = (Date.now() - t0) / N
   yield* Effect.log(`${ms.toFixed(2)} ms/token (${(1000 / ms).toFixed(1)} tok/s)`)

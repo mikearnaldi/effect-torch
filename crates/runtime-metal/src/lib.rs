@@ -7,14 +7,15 @@
 //! - `kernels`, `indexing`, `conv`, `gemm` — primitive kernels
 //!   (creation/cast/copy/random/reductions, gather/scatter/select/cat,
 //!   conv family, tiled matmul).
-//! - `ops` — the dispatch helpers the evaluator calls for ordinary
-//!   ops (binary/unary/compare/cast/matmul/contiguous/views).
-//! - `composed` — composite fallbacks built from `ops` (sdpa,
-//!   layer_norm, cross_entropy, rotary, optimizer steps).
+//! - `ops` — dispatch helpers used by executable commands for ordinary
+//!   operations (binary/unary/compare/cast/matmul/contiguous/views).
+//! - `composed` (tests only) — primitive-built numerical references for
+//!   destination-kernel parity tests.
 //! - `flash`, `loss`, `layer_norm`, `rotary`, `paged`, `linear` —
 //!   semantic fused kernels.
 
 #![cfg(target_os = "macos")]
+#![cfg_attr(not(feature = "napi-addon"), allow(dead_code))]
 
 pub mod err {
     pub type Res<T> = Result<T, String>;
@@ -47,26 +48,25 @@ pub mod runtime {
     }
 
     pub mod metal {
+        #[cfg(test)]
+        pub use crate::composed;
         pub use crate::{
-            arena, composed, conv, device, emit, flash, gemm, indexing, kda, kernels, layer_norm,
-            linear, loss, ops, paged, rotary, run, shortconv,
+            conv, device, emit, flash, gemm, indexing, kda, kernels, layer_norm, linear, loss, ops,
+            paged, rotary, run, shortconv,
         };
     }
 }
 
 pub use effect_torch_graph::CrossEntropyReduction as CeReduction;
 
-use effect_torch_runtime::{
-    Backend, BackendError, BackendResult, Capabilities, Capability, DeviceId, ErasedBuffer,
-    Placement, RuntimeIdentity,
-};
+use effect_torch_runtime::{DeviceId, Placement, RuntimeIdentity};
 use std::any::Any;
 use std::sync::OnceLock;
 
-pub mod arena;
 pub mod conv;
 pub mod device;
 pub mod emit;
+pub(crate) mod executable;
 pub mod gemm;
 pub mod indexing;
 pub mod kernels;
@@ -74,6 +74,7 @@ pub mod kernels;
 pub mod napi;
 pub mod run;
 
+#[cfg(test)]
 pub mod composed;
 pub mod ops;
 
@@ -85,6 +86,8 @@ pub mod loss;
 pub mod paged;
 pub mod rotary;
 pub mod shortconv;
+pub(crate) mod value;
+mod workspace;
 
 fn identity() -> &'static RuntimeIdentity {
     static IDENTITY: OnceLock<RuntimeIdentity> = OnceLock::new();
@@ -124,120 +127,5 @@ impl effect_torch_runtime::Buffer for run::MetalTensor {
 
     fn as_any(&self) -> &dyn Any {
         self
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MetalOperation {
-    Add,
-    Matmul,
-}
-
-pub struct MetalBackend {
-    identity: RuntimeIdentity,
-    capabilities: Capabilities,
-}
-
-impl MetalBackend {
-    pub fn new() -> Self {
-        Self {
-            identity: identity().clone(),
-            capabilities: Capabilities::new(
-                vec![
-                    effect_torch_runtime::DType::F32,
-                    effect_torch_runtime::DType::F16,
-                    effect_torch_runtime::DType::BF16,
-                    effect_torch_runtime::DType::U8,
-                    effect_torch_runtime::DType::U32,
-                    effect_torch_runtime::DType::I64,
-                ],
-                vec![
-                    Capability::Compilation,
-                    Capability::AsyncExecution,
-                    Capability::UnifiedMemory,
-                ],
-            ),
-        }
-    }
-}
-
-impl Default for MetalBackend {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl Backend<MetalOperation> for MetalBackend {
-    fn identity(&self) -> &RuntimeIdentity {
-        &self.identity
-    }
-
-    fn capabilities(&self) -> &Capabilities {
-        &self.capabilities
-    }
-
-    fn execute(
-        &self,
-        operation: &MetalOperation,
-        inputs: &[ErasedBuffer],
-    ) -> BackendResult<ErasedBuffer> {
-        if inputs.len() != 2 {
-            return Err(BackendError::Execution {
-                operation: Some(format!("{operation:?}")),
-                message: format!("expected 2 inputs, got {}", inputs.len()),
-            });
-        }
-        let mut tensors = Vec::with_capacity(2);
-        for input in inputs {
-            input.validate_owner(self.identity.id())?;
-            tensors.push(input.downcast_ref::<run::MetalTensor>().ok_or_else(|| {
-                BackendError::Execution {
-                    operation: Some(format!("{operation:?}")),
-                    message: "Metal backend received a non-Metal buffer".to_string(),
-                }
-            })?);
-        }
-        let output = match operation {
-            MetalOperation::Add => ops::binary(tensors[0], tensors[1], ops::BinOp::Add),
-            MetalOperation::Matmul => ops::matmul(tensors[0], tensors[1]),
-        }
-        .map_err(|message| BackendError::Execution {
-            operation: Some(format!("{operation:?}")),
-            message,
-        })?;
-        Ok(ErasedBuffer::new(output))
-    }
-
-    fn synchronize(&self) -> BackendResult<()> {
-        device::MetalDevice::get()
-            .synchronize()
-            .map_err(|message| BackendError::Execution {
-                operation: Some("synchronize".to_string()),
-                message,
-            })
-    }
-}
-
-#[cfg(test)]
-mod runtime_tests {
-    use super::*;
-
-    #[test]
-    fn shared_backend_contract_executes_production_metal_kernels() {
-        let backend = MetalBackend::new();
-        let device = device::MetalDevice::get();
-        let a = ErasedBuffer::new(run::MetalTensor::from_f32(device, vec![1.0, 2.0], vec![2]));
-        let b = ErasedBuffer::new(run::MetalTensor::from_f32(device, vec![3.0, 4.0], vec![2]));
-        let output = backend.execute(&MetalOperation::Add, &[a, b]).unwrap();
-        backend.synchronize().unwrap();
-        assert_eq!(
-            output
-                .downcast_ref::<run::MetalTensor>()
-                .unwrap()
-                .read_f32()
-                .unwrap(),
-            [4.0, 6.0]
-        );
-        assert_eq!(output.runtime_id(), backend.identity().id());
     }
 }

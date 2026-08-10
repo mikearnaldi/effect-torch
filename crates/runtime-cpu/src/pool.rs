@@ -16,6 +16,49 @@ pub struct Slab {
     pub row_width: usize,
 }
 
+pub enum SlabReader<'a> {
+    F32(&'a [f32]),
+    F16(&'a [f16]),
+    BF16(&'a [bf16]),
+    U8(&'a [u8]),
+}
+
+impl SlabReader<'_> {
+    pub fn get_f32(&self, index: usize) -> f32 {
+        match self {
+            Self::F32(values) => values[index],
+            Self::F16(values) => values[index].to_f32(),
+            Self::BF16(values) => values[index].to_f32(),
+            Self::U8(values) => values[index] as f32,
+        }
+    }
+}
+
+pub enum SlabWriter<'a> {
+    F32(&'a mut [f32]),
+    F16(&'a mut [f16]),
+    BF16(&'a mut [bf16]),
+    U8(&'a mut [u8]),
+}
+
+impl SlabWriter<'_> {
+    pub fn set_f32(&mut self, index: usize, value: f32) {
+        match self {
+            Self::F32(values) => values[index] = value,
+            Self::F16(values) => values[index] = f16::from_f32(value),
+            Self::BF16(values) => values[index] = bf16::from_f32(value),
+            Self::U8(_) => panic!("set_f32 on a u8 slab"),
+        }
+    }
+
+    pub fn set_u8(&mut self, index: usize, value: u8) {
+        let Self::U8(values) = self else {
+            panic!("set_u8 on a non-u8 slab")
+        };
+        values[index] = value;
+    }
+}
+
 impl Slab {
     pub fn new(rows: usize, row_width: usize, dtype: DType) -> Self {
         let n = rows * row_width;
@@ -31,6 +74,26 @@ impl Slab {
             dtype,
             rows,
             row_width,
+        }
+    }
+
+    pub fn read<R>(&self, f: impl FnOnce(SlabReader<'_>) -> R) -> R {
+        let data = self.data.read().unwrap();
+        match &*data {
+            SlabData::F32(values) => f(SlabReader::F32(values)),
+            SlabData::F16(values) => f(SlabReader::F16(values)),
+            SlabData::BF16(values) => f(SlabReader::BF16(values)),
+            SlabData::U8(values) => f(SlabReader::U8(values)),
+        }
+    }
+
+    pub fn write<R>(&self, f: impl FnOnce(SlabWriter<'_>) -> R) -> R {
+        let mut data = self.data.write().unwrap();
+        match &mut *data {
+            SlabData::F32(values) => f(SlabWriter::F32(values)),
+            SlabData::F16(values) => f(SlabWriter::F16(values)),
+            SlabData::BF16(values) => f(SlabWriter::BF16(values)),
+            SlabData::U8(values) => f(SlabWriter::U8(values)),
         }
     }
 

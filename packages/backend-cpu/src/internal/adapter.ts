@@ -2,18 +2,19 @@ import { Runtime } from "@effect-torch/core"
 import { Effect } from "effect"
 import { pipeArguments } from "effect/Pipeable"
 import type {
-  CompiledProgram,
-  DecodeProgram,
+  Executable as NativeExecutable,
   LazyTensor,
   NativeAddon,
+  NativeCompileOptions,
   NativeDType,
   NativeKvPool,
   NativeKvSequence,
+  NativeKvStateSchema,
   NativeTensor
 } from "./native-addon.js"
 
 type CancellationToken = InstanceType<NativeAddon["CancellationToken"]>
-type HandleKind = "lazy-tensor" | "concrete-tensor" | "program" | "decode-program" | "kv-pool" | "kv-sequence"
+type HandleKind = "lazy-tensor" | "concrete-tensor" | "executable" | "kv-pool" | "kv-sequence"
 
 interface HandleRecord {
   readonly owner: object
@@ -21,14 +22,18 @@ interface HandleRecord {
   readonly graph?: LazyTensor
   readonly value?: object
   readonly info?: unknown
+  readonly structure?: StructuralNode
   disposed: boolean
 }
 
-interface DecodeProgramInfo {
-  readonly batch: number
-  readonly layers: number
-  readonly kvHeads: number
-  readonly headDim: number
+interface StructuralNode {
+  readonly op: string
+  readonly inputs: ReadonlyArray<Runtime.TensorHandle>
+  readonly attributes: unknown
+}
+
+interface ExecutableInfo {
+  readonly state?: Runtime.DecodeStateSchema
 }
 
 interface KvPoolInfo {
@@ -36,6 +41,16 @@ interface KvPoolInfo {
   readonly layers: number
   readonly kvHeads: number
   readonly headDim: number
+  readonly maxTokens: number
+  readonly blockSize: number
+  readonly dtype: Runtime.DType
+  readonly kdaLayers: number
+  readonly kdaHeads: number
+  readonly kdaHeadDim: number
+  readonly kdaValueDim: number
+  readonly convLayers: number
+  readonly convChannels: number
+  readonly convKernel: number
 }
 
 interface KvSequenceInfo {
@@ -254,10 +269,18 @@ export const makeRuntime = (
       }
     }) as unknown as H
   }
+  let pendingStructure: StructuralNode | undefined
   const lazyHandle = (value: LazyTensor): Runtime.LazyTensorHandle => {
     const [shape, tensorDtype] = value.metadata()
     const handle = tensorObject<Runtime.LazyTensorHandle>("LazyTensor", shape, tensorDtype, device)
-    handleRecords.set(handle, { owner, kind: "lazy-tensor", graph: value, disposed: false })
+    handleRecords.set(handle, {
+      owner,
+      kind: "lazy-tensor",
+      graph: value,
+      ...(pendingStructure === undefined ? {} : { structure: pendingStructure }),
+      disposed: false
+    })
+    pendingStructure = undefined
     backendHandles.add(handle)
     return handle
   }
@@ -265,7 +288,18 @@ export const makeRuntime = (
   const concreteHandle = (value: NativeTensor): Runtime.ConcreteTensorHandle => {
     const graph = native.LazyTensor.fromMaterialized(value)
     const handle = tensorObject<Runtime.ConcreteTensorHandle>("Tensor", value.shape, value.dtype, value.device)
-    handleRecords.set(handle, { owner, kind: "concrete-tensor", graph, value, disposed: false })
+    handleRecords.set(handle, {
+      owner,
+      kind: "concrete-tensor",
+      graph,
+      value,
+      structure: {
+        op: "materialized-parameter",
+        inputs: [],
+        attributes: { shape: handle.shape, dtype: handle.dtype, device: handle.device }
+      },
+      disposed: false
+    })
     backendHandles.add(handle)
     return handle
   }
@@ -285,22 +319,31 @@ export const makeRuntime = (
     }
     return found.value as NativeTensor
   }
-  const program = (value: CompiledProgram): Runtime.ProgramHandle => wrapOpaque<Runtime.ProgramHandle>("program", value)
-  const nativeProgram = (handle: Runtime.ProgramHandle, operation: string): CompiledProgram =>
-    record(handle, "program", operation, "execute").value as CompiledProgram
-  const decodeProgram = (value: DecodeProgram): Runtime.DecodeProgramHandle =>
-    wrapOpaque<Runtime.DecodeProgramHandle>(
-      "decode-program",
+  const executableHandle = (
+    value: NativeExecutable,
+    state?: Runtime.DecodeStateSchema
+  ): Runtime.ExecutableHandle => {
+    const nativeDiagnostics = value.diagnostics
+    const diagnostics: Runtime.ExecutableDiagnostics = Object.freeze({
+      ...nativeDiagnostics,
+      instructions: Object.freeze(nativeDiagnostics.instructions.map((instruction) => Object.freeze(instruction))),
+      memory: Object.freeze(nativeDiagnostics.memory)
+    })
+    const handle = Object.freeze(
+      state === undefined ? { diagnostics } : { state, diagnostics }
+    ) as Runtime.ExecutableHandle
+    handleRecords.set(handle, {
+      owner,
+      kind: "executable",
       value,
-      {
-        batch: value.batch,
-        layers: value.layers,
-        kvHeads: value.kvHeads,
-        headDim: value.headDim
-      } satisfies DecodeProgramInfo
-    )
-  const nativeDecodeProgram = (handle: Runtime.DecodeProgramHandle, operation: string): HandleRecord =>
-    record(handle, "decode-program", operation, "execute")
+      info: state === undefined ? {} : { state } satisfies ExecutableInfo,
+      disposed: false
+    })
+    backendHandles.add(handle)
+    return handle
+  }
+  const nativeExecutable = (handle: Runtime.ExecutableHandle, operation: string): HandleRecord =>
+    record(handle, "executable", operation, "execute")
   const pool = (value: NativeKvPool, info: Omit<KvPoolInfo, "key">): Runtime.KvPoolHandle =>
     wrapOpaque<Runtime.KvPoolHandle>("kv-pool", value, { ...info, key: value } satisfies KvPoolInfo)
   const nativePool = (handle: Runtime.KvPoolHandle, operation: string): HandleRecord =>
@@ -326,9 +369,60 @@ export const makeRuntime = (
       throw error
     }
   }
+  const normalizedStructure = (value: unknown): unknown => {
+    if (value instanceof Uint8Array) return Array.from(value)
+    if (Array.isArray(value)) return value.map(normalizedStructure)
+    if (typeof value === "object" && value !== null) {
+      return Object.fromEntries(
+        Object.entries(value)
+          .sort(([left], [right]) => left.localeCompare(right))
+          .map(([key, entry]) => [key, normalizedStructure(entry)])
+      )
+    }
+    return value
+  }
+  const executableCacheKey = (request: Runtime.CompileRequest): string | undefined => {
+    const ids = new Map<object, number>()
+    const nodes: Array<unknown> = []
+    const visit = (handle: Runtime.TensorHandle): number | undefined => {
+      const existing = ids.get(handle)
+      if (existing !== undefined) return existing
+      const found = tensorRecord(handle, "compile", "compile")
+      if (found.structure === undefined) return undefined
+      const inputs: Array<number> = []
+      for (const input of found.structure.inputs) {
+        const id = visit(input)
+        if (id === undefined) return undefined
+        inputs.push(id)
+      }
+      const id = nodes.length
+      ids.set(handle, id)
+      nodes.push({
+        op: found.structure.op,
+        inputs,
+        attributes: normalizedStructure(found.structure.attributes),
+        shape: handle.shape,
+        dtype: handle.dtype,
+        device: handle.device
+      })
+      return id
+    }
+    const roots: Array<number> = []
+    for (const root of request.roots) {
+      const id = visit(root)
+      if (id === undefined) return undefined
+      roots.push(id)
+    }
+    return JSON.stringify({ nodes, roots, options: request.options, state: request.state })
+  }
   const node = (request: Runtime.NodeRequest): Effect.Effect<Runtime.LazyTensorHandle, Runtime.BackendError> =>
     Effect.try({
       try: () => {
+        pendingStructure = {
+          op: request.op,
+          inputs: [...request.inputs],
+          attributes: "attributes" in request ? request.attributes : {}
+        }
         const operation = request.op
         switch (request.op) {
           case "constant": {
@@ -692,57 +786,58 @@ export const makeRuntime = (
       },
       catch: backendErrorFor(request.op, "graph")
     })
-  const resolveDecode = (
-    programHandle: Runtime.DecodeProgramHandle,
-    sequenceHandles: ReadonlyArray<Runtime.KvSequenceHandle>,
+  const resolveExecutionState = (
+    schema: Runtime.DecodeStateSchema,
+    invocation: Runtime.ExecutionStateInvocation,
     operation: string
-  ): { readonly program: DecodeProgram; readonly sequences: ReadonlyArray<NativeKvSequence> } => {
-    const programRecord = nativeDecodeProgram(programHandle, operation)
-    const programInfo = programRecord.info as DecodeProgramInfo
-    const sequenceRecords = sequenceHandles.map((handle) => nativeSequence(handle, operation))
+  ): ReadonlyArray<NativeKvSequence> => {
+    const sequenceRecords = invocation.sequences.map((handle) => nativeSequence(handle, operation))
     const sequenceInfos = sequenceRecords.map((entry) => entry.info as KvSequenceInfo)
     const firstPool = sequenceInfos[0]?.pool
     if (
       firstPool === undefined ||
       sequenceInfos.some((entry) => entry.pool.key !== firstPool.key) ||
-      firstPool.layers !== programInfo.layers ||
-      firstPool.kvHeads !== programInfo.kvHeads ||
-      firstPool.headDim !== programInfo.headDim ||
-      sequenceRecords.length > programInfo.batch
+      firstPool.maxTokens !== schema.maxTokens ||
+      firstPool.blockSize !== schema.blockSize ||
+      firstPool.dtype !== schema.kvDtype ||
+      firstPool.layers !== schema.layers ||
+      firstPool.kvHeads !== schema.kvHeads ||
+      firstPool.headDim !== schema.headDim ||
+      firstPool.kdaLayers !== schema.kdaLayers ||
+      firstPool.kdaHeads !== schema.kdaHeads ||
+      firstPool.kdaHeadDim !== schema.kdaHeadDim ||
+      firstPool.kdaValueDim !== schema.kdaValueDim ||
+      firstPool.convLayers !== schema.convLayers ||
+      firstPool.convChannels !== schema.convChannels ||
+      firstPool.convKernel !== schema.convKernel ||
+      sequenceRecords.length > schema.batch ||
+      new Set(invocation.sequences).size !== sequenceRecords.length
     ) {
       throw invalidHandle(operation, "execute", "invalid-handle", "kv-sequence")
     }
-    return {
-      program: programRecord.value as DecodeProgram,
-      sequences: sequenceRecords.map((entry) => entry.value as NativeKvSequence)
+    if (invocation.tokens.length !== sequenceRecords.length) {
+      throw new Error(`${operation}: expected one token row per sequence`)
     }
+    const advance = invocation.tokens[0]?.length ?? 0
+    if (
+      advance === 0 ||
+      invocation.tokens.some((row) =>
+        row.length !== advance || row.some((token) => !Number.isSafeInteger(token) || token < 0 || token > 0xffff_ffff)
+      )
+    ) {
+      throw new Error(`${operation}: invalid token rows for compiled state schema`)
+    }
+    if (
+      schema.window === undefined &&
+      sequenceRecords.some((entry, index) =>
+        (entry.value as NativeKvSequence).cursor + invocation.tokens[index]!.length > schema.maxTokens
+      )
+    ) {
+      throw new Error(`${operation}: sequence context exceeds pool capacity ${schema.maxTokens}`)
+    }
+    return sequenceRecords.map((entry) => entry.value as NativeKvSequence)
   }
   const decode: Runtime.DecodeRuntime = {
-    compile: (roots, window, batch) =>
-      Effect.try({
-        try: () => {
-          const value = native.compileDecode(
-            roots.map((root) => nativeGraph(root, "compileDecode", "compile")),
-            window,
-            batch
-          )
-          return {
-            handle: decodeProgram(value),
-            batch: value.batch,
-            layers: value.layers,
-            kvHeads: value.kvHeads,
-            headDim: value.headDim,
-            kdaLayers: value.kdaLayers,
-            kdaHeads: value.kdaHeads,
-            kdaHeadDim: value.kdaHeadDim,
-            kdaValueDim: value.kdaValueDim,
-            convLayers: value.convLayers,
-            convChannels: value.convChannels,
-            convKernel: value.convKernel
-          }
-        },
-        catch: backendErrorFor("compileDecode", "compile", "compilation-failed")
-      }),
     makePool: (options) =>
       Effect.try({
         try: () =>
@@ -753,9 +848,32 @@ export const makeRuntime = (
               options.headDim,
               options.maxTokens,
               options.blockSize,
-              options.dtype as NativeDType
+              options.dtype as NativeDType,
+              {
+                kdaLayers: options.kdaLayers,
+                kdaHeads: options.kdaHeads,
+                kdaHeadDim: options.kdaHeadDim,
+                kdaValueDim: options.kdaValueDim,
+                convLayers: options.convLayers,
+                convChannels: options.convChannels,
+                convKernel: options.convKernel
+              }
             ),
-            { layers: options.layers, kvHeads: options.kvHeads, headDim: options.headDim }
+            {
+              layers: options.layers,
+              kvHeads: options.kvHeads,
+              headDim: options.headDim,
+              maxTokens: options.maxTokens,
+              blockSize: options.blockSize,
+              dtype: options.dtype,
+              kdaLayers: options.kdaLayers,
+              kdaHeads: options.kdaHeads,
+              kdaHeadDim: options.kdaHeadDim,
+              kdaValueDim: options.kdaValueDim,
+              convLayers: options.convLayers,
+              convChannels: options.convChannels,
+              convKernel: options.convKernel
+            }
           ),
         catch: backendErrorFor("makeKvPool", "execute")
       }),
@@ -786,46 +904,7 @@ export const makeRuntime = (
           sequenceRecord.disposed = true
         },
         catch: backendErrorFor("releaseSequence", "execute")
-      }),
-    run: (handle, inputs, seq, tokens) =>
-      cancellableFor(
-        "decode",
-        "execute",
-        (token) => {
-          const resolved = resolveDecode(handle, [seq], "decode")
-          return resolved.program.run(
-            inputs.map((input) => nativeTensor(input, "decode")),
-            resolved.sequences[0]!,
-            [...tokens],
-            token
-          )
-        },
-        clearBuffers
-      ).pipe(
-        Effect.flatMap((values) =>
-          Effect.try({
-            try: () => mapTensors(values),
-            catch: backendErrorFor("decode", "execute")
-          })
-        )
-      ),
-    runBatched: (handle, inputs, sequences, tokens) =>
-      cancellableFor("decodeBatched", "execute", (token) => {
-        const resolved = resolveDecode(handle, sequences, "decodeBatched")
-        return resolved.program.runBatched(
-          inputs.map((input) => nativeTensor(input, "decodeBatched")),
-          [...resolved.sequences],
-          tokens.map((row) => [...row]),
-          token
-        )
-      }, clearBuffers).pipe(
-        Effect.flatMap((values) =>
-          Effect.try({
-            try: () => mapTensors(values),
-            catch: backendErrorFor("decodeBatched", "execute")
-          })
-        )
-      )
+      })
   }
   const pathSafetensors: Runtime.PathSafetensors = {
     save: (path, archive) =>
@@ -836,7 +915,7 @@ export const makeRuntime = (
           native.saveTensors(
             path,
             archive.entries.map((entry) => entry.name),
-            archive.entries.map((entry) => nativeGraph(entry.tensor, "save", "io")),
+            archive.entries.map((entry) => nativeTensor(entry.tensor, "save", "io")),
             { ...archive.metadata },
             token
           )
@@ -882,46 +961,138 @@ export const makeRuntime = (
       features: []
     },
     node,
-    evaluate: (roots) =>
-      cancellableFor(
-        "evaluate",
-        "execute",
-        (token) => native.evalLazy(roots.map((root) => nativeGraph(root, "evaluate")), token),
-        clearBuffers
-      ).pipe(
-        Effect.flatMap((values) =>
-          Effect.try({
-            try: () => mapTensors(values),
-            catch: backendErrorFor("evaluate", "execute")
-          })
-        )
-      ),
     grad: (loss, wrt) =>
       Effect.try({
-        try: () =>
-          native.grad(
+        try: () => {
+          pendingStructure = undefined
+          return native.grad(
             nativeGraph(loss, "grad", "autodiff"),
             wrt.map((target) => nativeGraph(target, "grad", "autodiff"))
-          ).map(graph),
+          ).map(graph)
+        },
         catch: backendErrorFor("grad", "autodiff")
       }),
-    compile: (roots) =>
+    compile: (request) =>
       Effect.try({
-        try: () => program(native.compile(roots.map((root) => nativeGraph(root, "compile", "compile")))),
+        try: () => {
+          const roots = request.roots.map((root) => nativeGraph(root, "compile", "compile"))
+          if (
+            request.options?.outputCapacity !== undefined &&
+            (!Number.isSafeInteger(request.options.outputCapacity) ||
+              request.options.outputCapacity <= 0 ||
+              request.options.outputCapacity > 0xffff_ffff)
+          ) {
+            throw new Error("compile: outputCapacity must be a positive uint32")
+          }
+          const options: NativeCompileOptions | undefined = request.options === undefined
+            ? undefined
+            : {
+              ...(request.options.optimize === undefined ? {} : { optimize: request.options.optimize }),
+              ...(request.options.precision === undefined
+                ? {}
+                : { allowReducedPrecision: request.options.precision === "allow-reduced-precision" }),
+              ...(request.options.constantWeights === undefined
+                ? {}
+                : { constantWeights: request.options.constantWeights }),
+              ...(request.options.outputCapacity === undefined
+                ? {}
+                : { outputCapacity: request.options.outputCapacity })
+            }
+          const state: NativeKvStateSchema | undefined = request.state === undefined
+            ? undefined
+            : {
+              maxTokens: request.state.maxTokens,
+              blockSize: request.state.blockSize,
+              kvDtype: request.state.kvDtype as NativeDType,
+              ...(request.state.window === undefined ? {} : { window: request.state.window }),
+              batch: request.state.batch
+            }
+          const value = native.compile(roots, options, state, executableCacheKey(request))
+          if (value.stateful !== (request.state !== undefined)) {
+            throw new Error("compile: native executable state does not match the request")
+          }
+          if (request.state === undefined) return executableHandle(value)
+          if (value.batch !== request.state.batch) {
+            throw new Error(
+              `compile: native batch ${value.batch} does not match requested batch ${request.state.batch}`
+            )
+          }
+          const geometry = {
+            layers: value.layers,
+            kvHeads: value.kvHeads,
+            headDim: value.headDim,
+            kdaLayers: value.kdaLayers,
+            kdaHeads: value.kdaHeads,
+            kdaHeadDim: value.kdaHeadDim,
+            kdaValueDim: value.kdaValueDim,
+            convLayers: value.convLayers,
+            convChannels: value.convChannels,
+            convKernel: value.convKernel
+          }
+          for (const [name, dimension] of Object.entries(geometry)) {
+            if (!Number.isSafeInteger(dimension) || dimension < 0) {
+              throw new Error(`compile: native executable returned invalid ${name} ${dimension}`)
+            }
+          }
+          const schema: Runtime.DecodeStateSchema = Object.freeze({
+            maxTokens: request.state.maxTokens,
+            blockSize: request.state.blockSize,
+            kvDtype: request.state.kvDtype,
+            ...(request.state.window === undefined ? {} : { window: request.state.window }),
+            batch: request.state.batch,
+            ...geometry
+          })
+          return executableHandle(value, schema)
+        },
         catch: backendErrorFor("compile", "compile", "compilation-failed")
       }),
-    run: (handle, inputs, scalars) =>
+    execute: (handle, invocation) =>
       cancellableFor(
-        "run",
         "execute",
-        (token) =>
-          nativeProgram(handle, "run").run(inputs.map((input) => nativeTensor(input, "run")), [...scalars], token),
+        "execute",
+        (token) => {
+          const executableRecord = nativeExecutable(handle, "execute")
+          if (Object.keys(invocation.runtimeValues).length > 0) {
+            throw new Runtime.BackendError({
+              reason: "unsupported-operation",
+              backend: backendName,
+              operation: "execute",
+              phase: "execute",
+              message: "execute: CPU runtime values are not supported",
+              details: { device }
+            })
+          }
+          const value = executableRecord.value as NativeExecutable
+          const inputs = invocation.bindings.map((input) => nativeTensor(input, "execute"))
+          const scalars = [...invocation.scalars]
+          const schema = (executableRecord.info as ExecutableInfo).state
+          if (schema === undefined) {
+            if (invocation.state !== undefined) {
+              throw new Error("execute: stateless executable does not accept state")
+            }
+            return value.execute(inputs, scalars, undefined, undefined, token)
+          }
+          if (invocation.state === undefined) {
+            throw new Error("execute: stateful executable requires state")
+          }
+          if (scalars.length > 0) {
+            throw new Error("execute: stateful executable does not accept scalar inputs")
+          }
+          const sequences = resolveExecutionState(schema, invocation.state, "execute")
+          return value.execute(
+            inputs,
+            scalars,
+            [...sequences],
+            invocation.state.tokens.map((row) => [...row]),
+            token
+          )
+        },
         clearBuffers
       ).pipe(
         Effect.flatMap((values) =>
           Effect.try({
             try: () => mapTensors(values),
-            catch: backendErrorFor("run", "execute")
+            catch: backendErrorFor("execute", "execute")
           })
         )
       ),

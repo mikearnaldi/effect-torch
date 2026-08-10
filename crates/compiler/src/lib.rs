@@ -1,10 +1,18 @@
+mod diagnostics;
 mod ir;
+mod lowered;
+mod planner;
+mod request;
 mod rewrite;
 mod schedule;
 
+pub use diagnostics::*;
 pub use ir::*;
-pub use rewrite::{fuse_roots, gemm_epilogue_pass};
-pub use schedule::{collect_program_slots, ProgramSlot};
+pub use lowered::*;
+pub use planner::*;
+pub use request::*;
+pub use rewrite::{fuse_roots, fuse_roots_with_options, gemm_epilogue_pass};
+pub use schedule::{collect_program_slots, graph_post_order, ProgramSlot};
 
 #[cfg(test)]
 mod tests {
@@ -47,6 +55,24 @@ mod tests {
         let root = Node::new(NodeKind::Tanh { a: sum }).unwrap();
         let fused = fuse_roots(&[root]).unwrap();
         assert!(matches!(fused[0].kind, NodeKind::FusedElementwise { .. }));
+    }
+
+    #[test]
+    fn explicit_compile_options_disable_optional_rewrites() {
+        let x = Node::<Expr>::new(NodeKind::Input {
+            slot: 0,
+            shape: vec![4],
+            dtype: DType::F32,
+            device: Device::Cpu,
+        })
+        .unwrap();
+        let root = Node::new(NodeKind::Neg { a: x }).unwrap();
+        let options = CompileOptions {
+            optimize: false,
+            ..CompileOptions::default()
+        };
+        let rewritten = fuse_roots_with_options(std::slice::from_ref(&root), &options).unwrap();
+        assert!(std::sync::Arc::ptr_eq(&root, &rewritten[0]));
     }
 
     // Long elementwise chains fuse into one deep expression region; every

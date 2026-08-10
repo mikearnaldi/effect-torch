@@ -93,10 +93,8 @@ declare const TensorHandleTypeId: unique symbol
 declare const LazyTensorHandleTypeId: unique symbol
 /** Internal nominal brand for concrete tensor handles. */
 declare const ConcreteTensorHandleTypeId: unique symbol
-/** Internal nominal brand for compiled program handles. */
-declare const ProgramHandleTypeId: unique symbol
-/** Internal nominal brand for compiled decode program handles. */
-declare const DecodeProgramHandleTypeId: unique symbol
+/** Internal nominal brand for compiled executable handles. */
+declare const ExecutableHandleTypeId: unique symbol
 /** Internal nominal brand for paged KV pool handles. */
 declare const KvPoolHandleTypeId: unique symbol
 /** Internal nominal brand for paged KV sequence handles. */
@@ -150,25 +148,159 @@ export interface ConcreteTensorHandle extends TensorHandle {
 }
 
 /**
- * Opaque backend-owned compiled program.
+ * Compilation controls that affect lowering, scheduling, and memory planning.
  *
  * @since 0.1.0
  * @category models
  */
-export interface ProgramHandle {
-  /** Nominal compiled-program-handle brand. */
-  readonly [ProgramHandleTypeId]: typeof ProgramHandleTypeId
+export interface ExecutableCompileOptions {
+  /** Enables optional rewrites and fusion. Defaults to `true`. */
+  readonly optimize?: boolean
+  /** Precision policy used by backend lowering. Defaults to `strict`. */
+  readonly precision?: "strict" | "allow-reduced-precision"
+  /** Authorizes inference-only constant-weight preparation. */
+  readonly constantWeights?: boolean
+  /** Number of live output generations preallocated during compilation. */
+  readonly outputCapacity?: number
 }
 
 /**
- * Opaque backend-owned compiled decode program.
+ * Bounded persistent state requested for a generation executable.
  *
  * @since 0.1.0
  * @category models
  */
-export interface DecodeProgramHandle {
-  /** Nominal decode-program-handle brand. */
-  readonly [DecodeProgramHandleTypeId]: typeof DecodeProgramHandleTypeId
+export interface DecodeStateRequest {
+  /** Total token-row capacity of the compatible KV pool. */
+  readonly maxTokens: number
+  /** Number of token rows allocated and cached as one unit. */
+  readonly blockSize: number
+  /** Element data type used for KV storage. */
+  readonly kvDtype: DType
+  /** Optional bounded sliding-attention window. */
+  readonly window?: number
+  /** Fixed compiled batch width. */
+  readonly batch: number
+}
+
+/**
+ * Complete bounded state schema attached to a compiled executable.
+ *
+ * @since 0.1.0
+ * @category models
+ */
+export interface DecodeStateSchema extends DecodeStateRequest {
+  /** Number of attention layers backed by the KV pool. */
+  readonly layers: number
+  /** Number of key/value heads per attention layer. */
+  readonly kvHeads: number
+  /** Width of each key/value head. */
+  readonly headDim: number
+  /** Number of KDA recurrent layers with per-sequence state. */
+  readonly kdaLayers: number
+  /** Number of heads per KDA layer. */
+  readonly kdaHeads: number
+  /** Key width of each KDA head. */
+  readonly kdaHeadDim: number
+  /** Value width of each KDA head. */
+  readonly kdaValueDim: number
+  /** Number of short-conv layers with per-sequence window state. */
+  readonly convLayers: number
+  /** Channel count of each short-conv layer. */
+  readonly convChannels: number
+  /** Kernel size of each short-conv layer. */
+  readonly convKernel: number
+}
+
+/** One lowered instruction category in executable diagnostics. */
+export interface ExecutableInstructionDiagnostics {
+  readonly kind: string
+  readonly count: number
+}
+
+/** Static memory totals derived from an executable's immutable plan. */
+export interface ExecutableMemoryDiagnostics {
+  readonly externalBytes: number
+  readonly persistentBytes: number
+  readonly stateBytes: number
+  readonly outputBytes: number
+  readonly workspaceBytes: number
+  readonly transactionBytes: number
+  readonly peakLiveBytes: number
+  readonly packingOverheadBytes: number
+}
+
+/** Deterministic compile and planning summary attached to an executable. */
+export interface ExecutableDiagnostics {
+  readonly semanticNodesBeforeOptimization: number
+  readonly semanticNodesAfterOptimization: number
+  readonly instructions: ReadonlyArray<ExecutableInstructionDiagnostics>
+  readonly pipelineCount: number
+  readonly commandCount: number
+  readonly synchronizationCount: number
+  /** Maximum live output generations admitted without allocating during execution. */
+  readonly outputCapacity: number
+  readonly memory: ExecutableMemoryDiagnostics
+}
+
+/**
+ * Opaque backend-owned executable plus its optional public state contract.
+ *
+ * @since 0.1.0
+ * @category models
+ */
+export interface ExecutableHandle {
+  /** Nominal executable-handle brand. */
+  readonly [ExecutableHandleTypeId]: typeof ExecutableHandleTypeId
+  /** Complete state schema for generation executables. */
+  readonly state?: DecodeStateSchema
+  /** Immutable lowering and static-memory summary. */
+  readonly diagnostics: ExecutableDiagnostics
+}
+
+/**
+ * One semantic graph compilation request.
+ *
+ * @since 0.1.0
+ * @category models
+ */
+export interface CompileRequest {
+  /** Semantic graph roots to lower into one executable. */
+  readonly roots: ReadonlyArray<TensorHandle>
+  /** Explicit controls that join the executable cache key. */
+  readonly options?: ExecutableCompileOptions
+  /** Optional bounded persistent-state contract. */
+  readonly state?: DecodeStateRequest
+}
+
+/**
+ * Per-invocation state supplied to a stateful executable.
+ *
+ * @since 0.1.0
+ * @category models
+ */
+export interface ExecutionStateInvocation {
+  /** Active sequences, from one compatible pool. */
+  readonly sequences: ReadonlyArray<KvSequenceHandle>
+  /** Real unpadded token ids represented by each active sequence row. */
+  readonly tokens: ReadonlyArray<ReadonlyArray<number>>
+}
+
+/**
+ * Complete dynamic input to one immutable executable invocation.
+ *
+ * @since 0.1.0
+ * @category models
+ */
+export interface ExecutionInvocation {
+  /** Materialized tensor bindings in declaration order. */
+  readonly bindings: ReadonlyArray<ConcreteTensorHandle>
+  /** Scalar bindings in declaration order. */
+  readonly scalars: ReadonlyArray<number>
+  /** Named bounded runtime values used by the fixed command schedule. */
+  readonly runtimeValues: Readonly<Record<string, number | Uint32Array>>
+  /** Stateful generation invocation, omitted for ordinary programs. */
+  readonly state?: ExecutionStateInvocation
 }
 
 /**
@@ -557,8 +689,8 @@ export type NodeRequest<Operation extends keyof NodeOperationMap = keyof NodeOpe
 export interface PathSafetensorsSaveEntry {
   /** Archive entry name. */
   readonly name: string
-  /** Tensor graph to evaluate and serialize. */
-  readonly tensor: TensorHandle
+  /** Materialized tensor to serialize. */
+  readonly tensor: ConcreteTensorHandle
 }
 
 /**
@@ -581,7 +713,7 @@ export interface PathSafetensorsLoadEntry {
  * @category models
  */
 export interface PathSafetensorsSaveArchive {
-  /** Named tensor graphs to serialize. */
+  /** Named materialized tensors to serialize. */
   readonly entries: ReadonlyArray<PathSafetensorsSaveEntry>
   /** Archive-level string metadata. */
   readonly metadata: Readonly<Record<string, string>>
@@ -601,46 +733,13 @@ export interface PathSafetensorsLoadArchive {
 }
 
 /**
- * Backend-owned decode program and its fixed attention geometry.
- *
- * @since 0.1.0
- * @category models
- */
-export interface DecodeProgramValue {
-  /** Opaque compiled decode program. */
-  readonly handle: DecodeProgramHandle
-  /** Fixed leading batch size accepted by the program. */
-  readonly batch: number
-  /** Number of attention layers backed by the KV pool. */
-  readonly layers: number
-  /** Number of key/value heads per attention layer. */
-  readonly kvHeads: number
-  /** Width of each key/value head. */
-  readonly headDim: number
-  /** Number of KDA recurrent layers with per-sequence state. */
-  readonly kdaLayers: number
-  /** Number of heads per KDA layer. */
-  readonly kdaHeads: number
-  /** Key width of each KDA head. */
-  readonly kdaHeadDim: number
-  /** Value width of each KDA head. */
-  readonly kdaValueDim: number
-  /** Number of short-conv layers with per-sequence window state. */
-  readonly convLayers: number
-  /** Channel count of each short-conv layer. */
-  readonly convChannels: number
-  /** Kernel size of each short-conv layer. */
-  readonly convKernel: number
-}
-
-/**
  * Optional runtime extension for direct path-based safetensors I/O.
  *
  * @since 0.1.0
  * @category models
  */
 export interface PathSafetensors {
-  /** Evaluates and writes an archive without transferring tensor data through JavaScript. */
+  /** Writes a materialized archive without transferring tensor data through JavaScript. */
   readonly save: (path: string, archive: PathSafetensorsSaveArchive) => Effect.Effect<void, BackendError>
   /** Reads an archive directly into materialized runtime tensors. */
   readonly load: (path: string) => Effect.Effect<PathSafetensorsLoadArchive, BackendError>
@@ -653,12 +752,6 @@ export interface PathSafetensors {
  * @category models
  */
 export interface DecodeRuntime {
-  /** Compiles graph roots into a decode program for a fixed batch and optional attention window. */
-  readonly compile: (
-    roots: ReadonlyArray<TensorHandle>,
-    window?: number,
-    batch?: number
-  ) => Effect.Effect<DecodeProgramValue, BackendError>
   /** Allocates the fixed-capacity paged KV storage shared by sequences. */
   readonly makePool: (options: {
     /** Number of attention layers stored in the pool. */
@@ -673,6 +766,20 @@ export interface DecodeRuntime {
     readonly blockSize: number
     /** Element data type used for KV storage. */
     readonly dtype: DType
+    /** Number of KDA recurrent layers prepared for each sequence. */
+    readonly kdaLayers: number
+    /** Number of heads in each KDA recurrent layer. */
+    readonly kdaHeads: number
+    /** Key width of each KDA recurrent head. */
+    readonly kdaHeadDim: number
+    /** Value width of each KDA recurrent head. */
+    readonly kdaValueDim: number
+    /** Number of short-conv recurrent layers prepared for each sequence. */
+    readonly convLayers: number
+    /** Channel count of each short-conv recurrent layer. */
+    readonly convChannels: number
+    /** Kernel size of each short-conv recurrent layer. */
+    readonly convKernel: number
   }) => Effect.Effect<KvPoolHandle, BackendError>
   /** Creates an empty sequence backed by a KV pool. */
   readonly makeSequence: (pool: KvPoolHandle) => Effect.Effect<KvSequenceHandle, BackendError>
@@ -685,20 +792,6 @@ export interface DecodeRuntime {
   readonly sequenceCursor: (sequence: KvSequenceHandle) => Effect.Effect<number, BackendError>
   /** Releases a sequence and all block references it owns. */
   readonly releaseSequence: (sequence: KvSequenceHandle) => Effect.Effect<void, BackendError>
-  /** Executes a decode program for one sequence. */
-  readonly run: (
-    program: DecodeProgramHandle,
-    inputs: ReadonlyArray<ConcreteTensorHandle>,
-    sequence: KvSequenceHandle,
-    tokens: ReadonlyArray<number>
-  ) => Effect.Effect<ReadonlyArray<ConcreteTensorHandle>, BackendError>
-  /** Executes a decode program for a batch of independent sequences. */
-  readonly runBatched: (
-    program: DecodeProgramHandle,
-    inputs: ReadonlyArray<ConcreteTensorHandle>,
-    sequences: ReadonlyArray<KvSequenceHandle>,
-    tokens: ReadonlyArray<ReadonlyArray<number>>
-  ) => Effect.Effect<ReadonlyArray<ConcreteTensorHandle>, BackendError>
 }
 
 /**
@@ -729,22 +822,17 @@ export interface RuntimeService {
   readonly capabilities: Capabilities
   /** Constructs one lazy semantic graph node. */
   readonly node: (request: NodeRequest) => Effect.Effect<LazyTensorHandle, BackendError>
-  /** Evaluates graph roots into materialized tensors in one backend walk. */
-  readonly evaluate: (
-    roots: ReadonlyArray<TensorHandle>
-  ) => Effect.Effect<ReadonlyArray<ConcreteTensorHandle>, BackendError>
   /** Builds reverse-mode gradients of `loss` with respect to selected tensors. */
   readonly grad: (
     loss: TensorHandle,
     wrt: ReadonlyArray<TensorHandle>
   ) => Effect.Effect<ReadonlyArray<LazyTensorHandle>, BackendError>
-  /** Compiles graph roots into a reusable backend program. */
-  readonly compile: (roots: ReadonlyArray<TensorHandle>) => Effect.Effect<ProgramHandle, BackendError>
-  /** Executes a compiled program with materialized tensors and scalar slots. */
-  readonly run: (
-    program: ProgramHandle,
-    inputs: ReadonlyArray<ConcreteTensorHandle>,
-    scalars: ReadonlyArray<number>
+  /** Compiles semantic graph roots into one immutable backend executable. */
+  readonly compile: (request: CompileRequest) => Effect.Effect<ExecutableHandle, BackendError>
+  /** Executes an immutable program with one complete invocation. */
+  readonly execute: (
+    executable: ExecutableHandle,
+    invocation: ExecutionInvocation
   ) => Effect.Effect<ReadonlyArray<ConcreteTensorHandle>, BackendError>
   /** Copies a materialized tensor into a host-owned array buffer. */
   readonly readback: (tensor: ConcreteTensorHandle) => Effect.Effect<ArrayBuffer, BackendError>

@@ -534,8 +534,8 @@ impl_scalar!(f64, libm::erf);
 // A fused expression flattened to a post-order plan. A long elementwise
 // chain fuses into one deep Expr, and the interpreter runs once per
 // element — a recursive tree walk would multiply the chain depth by the
-// call stack of every element. The plan evaluates with an explicit value
-// stack: depth is bounded by heap, never the call stack.
+// call stack of every element. Prepared CPU programs retain this plan and
+// evaluate it with caller-owned scratch.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum Flat {
     Input(u32),
@@ -573,8 +573,7 @@ enum Flat {
 
 // Iterative post-order flattening (the traversal is stack-safe like the
 // evaluator below).
-fn flatten(e: &Expr) -> Vec<Flat> {
-    let mut out = Vec::new();
+fn flatten_into(e: &Expr, out: &mut Vec<Flat>) {
     let mut stack: Vec<(&Expr, bool)> = vec![(e, false)];
     while let Some((node, processed)) = stack.pop() {
         if processed {
@@ -653,87 +652,278 @@ fn flatten(e: &Expr) -> Vec<Flat> {
             | Expr::GeluTanh(a) => stack.push((a, false)),
         }
     }
+}
+
+fn flatten(e: &Expr) -> Vec<Flat> {
+    let mut out = Vec::new();
+    flatten_into(e, &mut out);
     out
 }
 
-// The scalar evaluator shared by the contiguous path (lane accessor reads
-// lane[k][i]) and the strided path (lane values pre-gathered per element).
-// `values` is caller-owned scratch, reused across elements.
-fn eval_plan<T: Scalar, F: Fn(u32) -> T>(
+/// Immutable flattened expression plans retained by a compiled CPU command.
+///
+/// `scratch_elements` is the exact number of native scalar elements needed
+/// to cache referenced input lanes and evaluate the deepest plan. Preparation
+/// allocates; evaluation does not.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CpuFusionProgram {
+    ops: Box<[Flat]>,
+    plan_ends: Box<[usize]>,
+    input_count: usize,
+    scalar_count: usize,
+    value_scratch_len: usize,
+}
+
+impl CpuFusionProgram {
+    pub fn new(exprs: &[Expr]) -> Self {
+        let mut ops = Vec::new();
+        let mut plan_ends = Vec::with_capacity(exprs.len());
+        let mut input_count = 0usize;
+        let mut scalar_count = 0usize;
+        let mut value_scratch_len = 0usize;
+        for expr in exprs {
+            let start = ops.len();
+            flatten_into(expr, &mut ops);
+            let mut depth = 0usize;
+            for op in &ops[start..] {
+                match op {
+                    Flat::Input(k) => {
+                        input_count = input_count.max(*k as usize + 1);
+                        depth += 1;
+                    }
+                    Flat::Scalar(k) => {
+                        scalar_count = scalar_count.max(*k as usize + 1);
+                        depth += 1;
+                    }
+                    Flat::Const(_) => depth += 1,
+                    Flat::Add
+                    | Flat::Sub
+                    | Flat::Mul
+                    | Flat::Div
+                    | Flat::Min
+                    | Flat::Max
+                    | Flat::Lt
+                    | Flat::Le
+                    | Flat::Gt
+                    | Flat::Ge
+                    | Flat::Eq
+                    | Flat::Ne => {
+                        debug_assert!(depth >= 2);
+                        depth -= 1;
+                    }
+                    Flat::Select => {
+                        debug_assert!(depth >= 3);
+                        depth -= 2;
+                    }
+                    Flat::Neg
+                    | Flat::Sqrt
+                    | Flat::Exp
+                    | Flat::Sin
+                    | Flat::Cos
+                    | Flat::Tanh
+                    | Flat::Abs
+                    | Flat::Log
+                    | Flat::Floor
+                    | Flat::Ceil
+                    | Flat::Round
+                    | Flat::Powf(_)
+                    | Flat::Erf
+                    | Flat::Gelu
+                    | Flat::GeluTanh => debug_assert!(depth >= 1),
+                }
+                value_scratch_len = value_scratch_len.max(depth);
+            }
+            debug_assert_eq!(depth, 1);
+            plan_ends.push(ops.len());
+        }
+        Self {
+            ops: ops.into_boxed_slice(),
+            plan_ends: plan_ends.into_boxed_slice(),
+            input_count,
+            scalar_count,
+            value_scratch_len,
+        }
+    }
+
+    pub fn output_count(&self) -> usize {
+        self.plan_ends.len()
+    }
+
+    pub fn input_count(&self) -> usize {
+        self.input_count
+    }
+
+    pub fn scalar_count(&self) -> usize {
+        self.scalar_count
+    }
+
+    pub fn value_scratch_len(&self) -> usize {
+        self.value_scratch_len
+    }
+
+    pub fn scratch_elements(&self) -> usize {
+        self.input_count
+            .checked_add(self.value_scratch_len)
+            .expect("CPU fusion scratch element count overflow")
+    }
+
+    fn plan(&self, output: usize) -> &[Flat] {
+        let end = self.plan_ends[output];
+        let start = output
+            .checked_sub(1)
+            .map_or(0, |previous| self.plan_ends[previous]);
+        &self.ops[start..end]
+    }
+
+    /// Evaluates one output plan with caller-supplied lane accessors and value
+    /// stack. Callers must provide at least `value_scratch_len()` elements.
+    pub fn evaluate<T: Scalar>(
+        &self,
+        output: usize,
+        mut lane: impl FnMut(u32) -> T,
+        mut scalar: impl FnMut(u32) -> T,
+        values: &mut [T],
+    ) -> T {
+        assert!(values.len() >= self.value_scratch_len);
+        eval_plan(self.plan(output), &mut lane, &mut scalar, values)
+    }
+}
+
+fn eval_plan<T: Scalar>(
     plan: &[Flat],
-    lane: &F,
-    scalars: &[T],
-    values: &mut Vec<T>,
+    lane: &mut impl FnMut(u32) -> T,
+    scalar: &mut impl FnMut(u32) -> T,
+    values: &mut [T],
 ) -> T {
     macro_rules! binary {
-        ($m:ident) => {{
-            let b = values.pop().expect("plan operand");
-            let a = values.pop().expect("plan operand");
-            values.push(a.$m(b));
+        ($m:ident, $depth:ident) => {{
+            debug_assert!($depth >= 2);
+            values[$depth - 2] = values[$depth - 2].$m(values[$depth - 1]);
+            $depth -= 1;
         }};
     }
     macro_rules! unary {
-        ($m:ident) => {{
-            let a = values.pop().expect("plan operand");
-            values.push(a.$m());
+        ($m:ident, $depth:ident) => {{
+            debug_assert!($depth >= 1);
+            values[$depth - 1] = values[$depth - 1].$m();
         }};
     }
-    values.clear();
+    let mut depth = 0usize;
     for op in plan {
         match op {
-            Flat::Input(k) => values.push(lane(*k)),
-            Flat::Scalar(k) => values.push(scalars[*k as usize]),
-            Flat::Const(bits) => values.push(T::from_f64(f64::from_bits(*bits))),
-            Flat::Add => binary!(add),
-            Flat::Sub => binary!(sub),
-            Flat::Mul => binary!(mul),
-            Flat::Div => binary!(div),
-            Flat::Min => binary!(min),
-            Flat::Max => binary!(max),
-            Flat::Lt => binary!(lt),
-            Flat::Le => binary!(le),
-            Flat::Gt => binary!(gt),
-            Flat::Ge => binary!(ge),
-            Flat::Eq => binary!(eq),
-            Flat::Ne => binary!(ne),
+            Flat::Input(k) => {
+                values[depth] = lane(*k);
+                depth += 1;
+            }
+            Flat::Scalar(k) => {
+                values[depth] = scalar(*k);
+                depth += 1;
+            }
+            Flat::Const(bits) => {
+                values[depth] = T::from_f64(f64::from_bits(*bits));
+                depth += 1;
+            }
+            Flat::Add => binary!(add, depth),
+            Flat::Sub => binary!(sub, depth),
+            Flat::Mul => binary!(mul, depth),
+            Flat::Div => binary!(div, depth),
+            Flat::Min => binary!(min, depth),
+            Flat::Max => binary!(max, depth),
+            Flat::Lt => binary!(lt, depth),
+            Flat::Le => binary!(le, depth),
+            Flat::Gt => binary!(gt, depth),
+            Flat::Ge => binary!(ge, depth),
+            Flat::Eq => binary!(eq, depth),
+            Flat::Ne => binary!(ne, depth),
             Flat::Select => {
-                let b = values.pop().expect("plan operand");
-                let a = values.pop().expect("plan operand");
-                let c = values.pop().expect("plan operand");
-                values.push(T::pick(c, a, b));
+                debug_assert!(depth >= 3);
+                values[depth - 3] =
+                    T::pick(values[depth - 3], values[depth - 2], values[depth - 1]);
+                depth -= 2;
             }
-            Flat::Neg => unary!(neg),
-            Flat::Sqrt => unary!(sqrt),
-            Flat::Exp => unary!(exp),
-            Flat::Sin => unary!(sin),
-            Flat::Cos => unary!(cos),
-            Flat::Tanh => unary!(tanh),
-            Flat::Abs => unary!(abs),
-            Flat::Log => unary!(log),
-            Flat::Floor => unary!(floor),
-            Flat::Ceil => unary!(ceil),
-            Flat::Round => unary!(round),
+            Flat::Neg => unary!(neg, depth),
+            Flat::Sqrt => unary!(sqrt, depth),
+            Flat::Exp => unary!(exp, depth),
+            Flat::Sin => unary!(sin, depth),
+            Flat::Cos => unary!(cos, depth),
+            Flat::Tanh => unary!(tanh, depth),
+            Flat::Abs => unary!(abs, depth),
+            Flat::Log => unary!(log, depth),
+            Flat::Floor => unary!(floor, depth),
+            Flat::Ceil => unary!(ceil, depth),
+            Flat::Round => unary!(round, depth),
             Flat::Powf(e) => {
-                let a = values.pop().expect("plan operand");
-                values.push(a.powf(f64::from_bits(*e)));
+                debug_assert!(depth >= 1);
+                values[depth - 1] = values[depth - 1].powf(f64::from_bits(*e));
             }
-            Flat::Erf => unary!(erf),
+            Flat::Erf => unary!(erf, depth),
             Flat::Gelu => {
-                let x = values.pop().expect("plan operand");
+                debug_assert!(depth >= 1);
+                let x = values[depth - 1];
                 let inner = x.mul(T::from_f64(std::f64::consts::FRAC_1_SQRT_2)).erf();
-                values.push(x.mul(T::from_f64(0.5)).mul(T::from_f64(1.0).add(inner)));
+                values[depth - 1] = x.mul(T::from_f64(0.5)).mul(T::from_f64(1.0).add(inner));
             }
             Flat::GeluTanh => {
-                let x = values.pop().expect("plan operand");
+                debug_assert!(depth >= 1);
+                let x = values[depth - 1];
                 let u = x
                     .add(x.mul(x).mul(x).mul(T::from_f64(0.044715)))
                     .mul(T::from_f64(0.7978845608028654));
-                values.push(x.mul(T::from_f64(0.5)).mul(T::from_f64(1.0).add(u.tanh())));
+                values[depth - 1] = x.mul(T::from_f64(0.5)).mul(T::from_f64(1.0).add(u.tanh()));
             }
         }
     }
-    debug_assert_eq!(values.len(), 1);
-    values.pop().expect("plan result")
+    debug_assert_eq!(depth, 1);
+    values[0]
+}
+
+fn strided_offset(index: usize, shape: &[usize], strides: &[usize]) -> usize {
+    let mut remainder = index;
+    let mut offset = 0usize;
+    for dimension in (0..shape.len()).rev() {
+        let width = shape[dimension].max(1);
+        offset += (remainder % width) * strides[dimension];
+        remainder /= width;
+    }
+    offset
+}
+
+pub fn interpret_core_into<T: Scalar>(
+    program: &CpuFusionProgram,
+    slices: &[&[T]],
+    strides: Option<&[Vec<usize>]>,
+    scalar_values: &[T],
+    n: usize,
+    shape: &[usize],
+    outputs: &mut [&mut [T]],
+    scratch: &mut [T],
+) {
+    assert_eq!(outputs.len(), program.output_count());
+    assert!(slices.len() >= program.input_count());
+    assert!(scalar_values.len() >= program.scalar_count());
+    assert!(outputs.iter().all(|output| output.len() >= n));
+    assert!(scratch.len() >= program.scratch_elements());
+    if let Some(strides) = strides {
+        assert_eq!(strides.len(), slices.len());
+        assert!(strides.iter().all(|lane| lane.len() == shape.len()));
+    }
+    let (lane_values, values) = scratch.split_at_mut(program.input_count());
+    for index in 0..n {
+        for lane in 0..program.input_count() {
+            let offset = strides.map_or(index, |strides| {
+                strided_offset(index, shape, &strides[lane])
+            });
+            lane_values[lane] = slices[lane][offset];
+        }
+        for (output_index, output) in outputs.iter_mut().enumerate() {
+            output[index] = program.evaluate(
+                output_index,
+                |lane| lane_values[lane as usize],
+                |scalar| scalar_values[scalar as usize],
+                values,
+            );
+        }
+    }
 }
 
 pub fn interpret_core<T: Scalar>(
@@ -744,56 +934,95 @@ pub fn interpret_core<T: Scalar>(
     n: usize,
     shape: &[usize],
 ) -> Vec<Vec<T>> {
-    let contig = contiguous_strides(shape);
-    let strided = match strides {
-        Some(ss) if ss.iter().any(|s| s != &contig) => Some(ss),
-        _ => None,
-    };
+    let program = CpuFusionProgram::new(exprs);
     let init = <T as Scalar>::from_f64(0.0);
     let mut outs: Vec<Vec<T>> = exprs.iter().map(|_| vec![init; n]).collect();
-    let plans: Vec<Vec<Flat>> = exprs.iter().map(flatten).collect();
-    let mut values: Vec<T> = Vec::new();
-    match strided {
-        None => {
-            for i in 0..n {
-                for (out, plan) in outs.iter_mut().zip(plans.iter()) {
-                    out[i] =
-                        eval_plan(plan, &|k| slices[k as usize][i], scalar_values, &mut values);
-                }
-            }
-        }
-        // Broadcast lanes: walk the output coordinates with an odometer so
-        // each lane's element offset is incremental (no per-element div/mod).
-        Some(ss) => {
-            let rank = shape.len();
-            let mut coord = vec![0usize; rank];
-            let mut offs = vec![0usize; slices.len()];
-            let mut lane_vals = vec![init; slices.len()];
-            for i in 0..n {
-                for (v, (slice, off)) in lane_vals.iter_mut().zip(slices.iter().zip(offs.iter())) {
-                    *v = slice[*off];
-                }
-                for (out, plan) in outs.iter_mut().zip(plans.iter()) {
-                    out[i] =
-                        eval_plan(plan, &|k| lane_vals[k as usize], scalar_values, &mut values);
-                }
-                for d in (0..rank).rev() {
-                    coord[d] += 1;
-                    for (off, s) in offs.iter_mut().zip(ss.iter()) {
-                        *off += s[d];
-                    }
-                    if coord[d] < shape[d] {
-                        break;
-                    }
-                    coord[d] = 0;
-                    for (off, s) in offs.iter_mut().zip(ss.iter()) {
-                        *off -= shape[d] * s[d];
-                    }
-                }
-            }
+    let mut output_slices = outs.iter_mut().map(Vec::as_mut_slice).collect::<Vec<_>>();
+    let mut scratch = vec![init; program.scratch_elements()];
+    interpret_core_into(
+        &program,
+        slices,
+        strides,
+        scalar_values,
+        n,
+        shape,
+        &mut output_slices,
+        &mut scratch,
+    );
+    outs
+}
+
+fn reduce_output_offset(
+    index: usize,
+    in_shape: &[usize],
+    dims: &[usize],
+    keepdims: bool,
+    out_shape: &[usize],
+) -> usize {
+    let mut remainder = index;
+    let mut out_dimension = out_shape.len();
+    let mut out_stride = 1usize;
+    let mut out_offset = 0usize;
+    for dimension in (0..in_shape.len()).rev() {
+        let width = in_shape[dimension].max(1);
+        let coordinate = remainder % width;
+        remainder /= width;
+        if !dims.contains(&dimension) {
+            out_dimension -= 1;
+            out_offset += coordinate * out_stride;
+            out_stride *= out_shape[out_dimension];
+        } else if keepdims {
+            out_dimension -= 1;
+            out_stride *= out_shape[out_dimension];
         }
     }
-    outs
+    debug_assert_eq!(out_dimension, 0);
+    out_offset
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn interpret_reduce_core_into<T: Scalar>(
+    op: ReduceOp,
+    program: &CpuFusionProgram,
+    slices: &[&[T]],
+    strides: &[Vec<usize>],
+    in_shape: &[usize],
+    dims: &[usize],
+    keepdims: bool,
+    out_shape: &[usize],
+    output: &mut [T],
+    scratch: &mut [T],
+) {
+    assert_eq!(program.output_count(), 1);
+    assert_eq!(program.scalar_count(), 0);
+    assert!(slices.len() >= program.input_count());
+    assert_eq!(strides.len(), slices.len());
+    assert!(strides.iter().all(|lane| lane.len() == in_shape.len()));
+    assert_eq!(output.len(), out_shape.iter().product::<usize>());
+    assert!(scratch.len() >= program.scratch_elements());
+    let init = <T as Scalar>::from_f64(op.init());
+    output.fill(init);
+    let (lane_values, values) = scratch.split_at_mut(program.input_count());
+    for index in 0..in_shape.iter().product() {
+        for lane in 0..program.input_count() {
+            lane_values[lane] = slices[lane][strided_offset(index, in_shape, &strides[lane])];
+        }
+        let value = program.evaluate(
+            0,
+            |lane| lane_values[lane as usize],
+            |_| unreachable!("fused reduce scalar lane"),
+            values,
+        );
+        let output_index = reduce_output_offset(index, in_shape, dims, keepdims, out_shape);
+        output[output_index] = op.fold(output[output_index], value);
+    }
+    if op == ReduceOp::Mean {
+        let extent: usize = dims.iter().map(|&dimension| in_shape[dimension]).product();
+        let extent = <T as Scalar>::from_f64(extent as f64);
+        for value in output {
+            *value = Scalar::div(*value, extent);
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -807,61 +1036,23 @@ pub fn interpret_reduce_core<T: Scalar>(
     keepdims: bool,
     out_shape: &[usize],
 ) -> Vec<T> {
-    let in_n: usize = in_shape.iter().product();
-    let out_n: usize = out_shape.iter().product();
-    // Output strides in input-dim space: reduced dims get stride 0;
-    // non-reduced dims get their contiguous output stride (the out-dim
-    // index is d itself with keepdims, or the compacted index without).
-    let rank = in_shape.len();
-    let contig_out = contiguous_strides(out_shape);
-    let mut out_strides = vec![0usize; rank];
-    let mut o = 0;
-    for d in 0..rank {
-        if dims.contains(&d) {
-            continue;
-        }
-        let out_d = if keepdims { d } else { o };
-        out_strides[d] = contig_out[out_d];
-        o += 1;
-    }
+    let program = CpuFusionProgram::new(std::slice::from_ref(expr));
     let init = <T as Scalar>::from_f64(op.init());
-    let mut acc = vec![init; out_n];
-    let mut coord = vec![0usize; rank];
-    let mut offs = vec![0usize; slices.len()];
-    let mut lane_vals = vec![init; slices.len()];
-    let mut out_off = 0usize;
-    let plan = flatten(expr);
-    let mut values: Vec<T> = Vec::new();
-    for _ in 0..in_n {
-        for (v, (slice, off)) in lane_vals.iter_mut().zip(slices.iter().zip(offs.iter())) {
-            *v = slice[*off];
-        }
-        let v = eval_plan(&plan, &|k| lane_vals[k as usize], &[], &mut values);
-        acc[out_off] = op.fold(acc[out_off], v);
-        for d in (0..rank).rev() {
-            coord[d] += 1;
-            for (off, s) in offs.iter_mut().zip(strides.iter()) {
-                *off += s[d];
-            }
-            out_off += out_strides[d];
-            if coord[d] < in_shape[d] {
-                break;
-            }
-            coord[d] = 0;
-            for (off, s) in offs.iter_mut().zip(strides.iter()) {
-                *off -= in_shape[d] * s[d];
-            }
-            out_off -= in_shape[d] * out_strides[d];
-        }
-    }
-    if op == ReduceOp::Mean {
-        let extent: usize = dims.iter().map(|&d| in_shape[d]).product();
-        let e = <T as Scalar>::from_f64(extent as f64);
-        for a in acc.iter_mut() {
-            *a = Scalar::div(*a, e);
-        }
-    }
-    acc
+    let mut output = vec![init; out_shape.iter().product()];
+    let mut scratch = vec![init; program.scratch_elements()];
+    interpret_reduce_core_into(
+        op,
+        &program,
+        slices,
+        strides,
+        in_shape,
+        dims,
+        keepdims,
+        out_shape,
+        &mut output,
+        &mut scratch,
+    );
+    output
 }
 // The fused AdamW update as three expressions over lanes [param, grad, m,
 // v] with scalar lanes [lr, 1 - beta1^t, 1 - beta2^t], mirroring the
@@ -1025,5 +1216,71 @@ pub fn is_supported(
             dtype,
             effect_torch_runtime::DType::F32 | effect_torch_runtime::DType::BF16
         ),
+    }
+}
+
+#[cfg(test)]
+mod interpreter_tests {
+    use super::*;
+
+    #[test]
+    fn prepared_into_paths_match_wrappers_with_exact_scratch() {
+        let exprs = [
+            Expr::Add(Box::new(Expr::Input(0)), Box::new(Expr::Input(1))),
+            Expr::Mul(Box::new(Expr::Input(0)), Box::new(Expr::Scalar(0))),
+        ];
+        let a = [1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0];
+        let b = [10.0f32, 20.0, 30.0];
+        let strides = [vec![3, 1], vec![0, 1]];
+        let wrapped = interpret_core(&exprs, &[&a, &b], Some(&strides), &[0.5], 6, &[2, 3]);
+        let program = CpuFusionProgram::new(&exprs);
+        assert_eq!(program.input_count(), 2);
+        assert_eq!(program.value_scratch_len(), 2);
+        assert_eq!(program.scratch_elements(), 4);
+        let mut first = [0.0f32; 6];
+        let mut second = [0.0f32; 6];
+        let mut outputs: [&mut [f32]; 2] = [&mut first, &mut second];
+        let mut scratch = [0.0f32; 4];
+        interpret_core_into(
+            &program,
+            &[&a, &b],
+            Some(&strides),
+            &[0.5],
+            6,
+            &[2, 3],
+            &mut outputs,
+            &mut scratch,
+        );
+        assert_eq!(first.as_slice(), wrapped[0]);
+        assert_eq!(second.as_slice(), wrapped[1]);
+
+        let reduce_expr = Expr::Mul(Box::new(Expr::Input(0)), Box::new(Expr::Input(0)));
+        let reduce_program = CpuFusionProgram::new(std::slice::from_ref(&reduce_expr));
+        assert_eq!(reduce_program.scratch_elements(), 3);
+        let wrapped_reduce = interpret_reduce_core(
+            ReduceOp::Mean,
+            &reduce_expr,
+            &[&a],
+            &[vec![3, 1]],
+            &[2, 3],
+            &[1],
+            false,
+            &[2],
+        );
+        let mut reduced = [0.0f32; 2];
+        let mut reduce_scratch = [0.0f32; 3];
+        interpret_reduce_core_into(
+            ReduceOp::Mean,
+            &reduce_program,
+            &[&a],
+            &[vec![3, 1]],
+            &[2, 3],
+            &[1],
+            false,
+            &[2],
+            &mut reduced,
+            &mut reduce_scratch,
+        );
+        assert_eq!(reduced.as_slice(), wrapped_reduce);
     }
 }

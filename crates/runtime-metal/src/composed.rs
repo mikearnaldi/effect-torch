@@ -473,11 +473,7 @@ fn head_ce_chunk_len(rows: usize, vocab: usize, chunk_size: usize) -> usize {
 // Active count and label checks from one host readback: targets are
 // integers far below 2^24, so the f32 readback is exact, and this runs
 // once per eval (the emitter rejects u8 comparisons).
-fn head_ce_check_target(
-    t1: &MetalTensor,
-    ignore_index: i64,
-    vocab: usize,
-) -> crate::err::Res<f64> {
+fn head_ce_check_target(t1: &MetalTensor, ignore_index: i64, vocab: usize) -> crate::err::Res<f64> {
     let host = super::ops::to_f32(t1)?.read_f32()?;
     let mut active = 0usize;
     for &value in &host {
@@ -497,10 +493,7 @@ fn head_ce_check_target(
 
 // Mean cross-entropy of Linear(x, weight, bias) against target,
 // evaluated one row-chunk at a time so the [rows, vocab] logits never
-// materialize whole. `checkpoint` is invoked at each iteration's end
-// with the buffer pointers still live (arena capture marks everything
-// else dead at that point — without it, intra-eval temporaries are all
-// planned as live-until-walk-end).
+// materialize whole.
 pub fn chunked_head_ce_forward(
     x: &MetalTensor,
     weight: &MetalTensor,
@@ -508,7 +501,6 @@ pub fn chunked_head_ce_forward(
     target: &MetalTensor,
     ignore_index: i64,
     chunk_size: usize,
-    checkpoint: &mut dyn FnMut(&[usize]),
 ) -> crate::err::Res<MetalTensor> {
     let dims = x.layout.shape().to_vec();
     let r = dims.len();
@@ -538,9 +530,9 @@ pub fn chunked_head_ce_forward(
         let x_c = narrow(&x2, 0, off, end - off)?;
         let t_c = narrow(&t1, 0, off, end - off)?;
         let logits = binary(&matmul(&x_c, weight)?, bias, BinOp::Add)?;
-        let (nll, _status) = crate::loss::ce_forward(&logits, &t_c, ignore_index, crate::CeReduction::Sum)?;
+        let (nll, _status) =
+            crate::loss::ce_forward(&logits, &t_c, ignore_index, crate::CeReduction::Sum)?;
         total = binary(&total, &super::ops::to_f32(&nll)?, BinOp::Add)?;
-        checkpoint(&[std::sync::Arc::as_ptr(&total.buffer) as usize]);
         off = end;
     }
     let mean = binary(&total, &fill(&[1], count, DType::F32)?, BinOp::Div)?;
@@ -562,7 +554,6 @@ pub fn chunked_head_ce_backward(
     g: &MetalTensor,
     ignore_index: i64,
     chunk_size: usize,
-    checkpoint: &mut dyn FnMut(&[usize]),
 ) -> crate::err::Res<(MetalTensor, MetalTensor, MetalTensor)> {
     let dims = x.layout.shape().to_vec();
     let r = dims.len();
@@ -591,7 +582,8 @@ pub fn chunked_head_ce_backward(
         let x_c = narrow(&x2, 0, off, end - off)?;
         let t_c = narrow(&t1, 0, off, end - off)?;
         let logits = binary(&matmul(&x_c, weight)?, bias, BinOp::Add)?;
-        let (gb, _count) = crate::loss::ce_backward(&logits, &t_c, ignore_index, crate::CeReduction::Sum)?;
+        let (gb, _count) =
+            crate::loss::ce_backward(&logits, &t_c, ignore_index, crate::CeReduction::Sum)?;
         let gb32 = binary(&super::ops::to_f32(&gb)?, &scale, BinOp::Mul)?;
         dx_chunks.push(matmul(&gb32, &w32t)?);
         dw = binary(
@@ -600,17 +592,12 @@ pub fn chunked_head_ce_backward(
             BinOp::Add,
         )?;
         db = binary(&db, &reduce(&gb32, &[0], true, ReduceOp::Sum)?, BinOp::Add)?;
-        let mut live: Vec<usize> = vec![
-            std::sync::Arc::as_ptr(&dw.buffer) as usize,
-            std::sync::Arc::as_ptr(&db.buffer) as usize,
-        ];
-        live.extend(dx_chunks.iter().map(|t| std::sync::Arc::as_ptr(&t.buffer) as usize));
-        checkpoint(&live);
         off = end;
     }
+    let mut cat_checkpoint = |_live: &[usize]| {};
     let dx = super::ops::from_f32(
         &super::ops::contiguous(&MetalTensor {
-            buffer: cat_tree(dx_chunks, 0, checkpoint)?.buffer.clone(),
+            buffer: cat_tree(dx_chunks, 0, &mut cat_checkpoint)?.buffer.clone(),
             layout: Layout::contiguous(dims),
             dtype: DType::F32,
         })?,
@@ -704,8 +691,8 @@ fn cat_all(ts: &[MetalTensor], dim: usize) -> crate::err::Res<MetalTensor> {
 
 // Balanced pairwise concat: a left-deep fold holds every partial result
 // until the fold completes (64 chunks ≈ 8 GiB live at once); the tree
-// keeps one fold level live at a time, and the checkpoint hook records
-// the dead level per round so the arena plans the tight bound.
+// keeps one fold level live at a time. The callback lets callers expose
+// each fixed fold level to their command planner.
 fn cat_tree(
     ts: Vec<MetalTensor>,
     dim: usize,

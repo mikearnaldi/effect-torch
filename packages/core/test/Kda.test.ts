@@ -337,10 +337,11 @@ onDevices("Kda", (device) => (it) => {
     const ids = (tokens: ReadonlyArray<number>) => Tensor.fromTypedArray(new Uint32Array(tokens), [1, tokens.length])
 
     const argmaxOf = (logits: Tensor.Any) =>
-      Effect.map(
-        Tensor.toNumberArray(logits),
-        (values) => values.reduce((best, value, index) => (value > values[best] ? index : best), 0)
-      )
+      Effect.gen(function*() {
+        const values = yield* Tensor.toNumberArray(logits)
+        if (Tensor.isTensor(logits)) yield* Tensor.clear(logits)
+        return values.reduce((best, value, index) => (value > values[best] ? index : best), 0)
+      })
 
     // The reference: greedy generation through the ordinary forward
     // graph, recomputing the whole context every step.

@@ -26,6 +26,7 @@ const program = Effect.gen(function*() {
   let logits = entry.logits
   for (let i = 0; i < 8; i++) {
     const vals = yield* Tensor.toNumberArray(logits)
+    yield* Tensor.clear(logits)
     const next = vals.reduce((best, v, j) => (v > vals[best] ? j : best), 0)
     const finite = vals.every(Number.isFinite)
     yield* Effect.log(`step ${i}: argmax ${next}, finite ${finite}`)

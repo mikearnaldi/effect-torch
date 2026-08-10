@@ -1,4 +1,6 @@
-#[derive(Debug, Clone, PartialEq, Eq)]
+use crate::DType;
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Layout {
     shape: Vec<usize>,
     strides: Vec<usize>,
@@ -20,7 +22,9 @@ impl Layout {
         let mut acc = 1usize;
         for d in (0..shape.len()).rev() {
             strides[d] = acc;
-            acc *= shape[d];
+            if d != 0 {
+                acc = acc.checked_mul(shape[d]).expect("layout stride overflow");
+            }
         }
         Layout {
             shape,
@@ -46,7 +50,13 @@ impl Layout {
     }
 
     pub fn numel(&self) -> usize {
-        self.shape.iter().product()
+        self.checked_numel().expect("layout element count overflow")
+    }
+
+    pub fn checked_numel(&self) -> Option<usize> {
+        self.shape
+            .iter()
+            .try_fold(1usize, |count, &dim| count.checked_mul(dim))
     }
 
     pub fn is_contiguous(&self) -> bool {
@@ -55,7 +65,12 @@ impl Layout {
             if self.shape[d] != 1 && self.strides[d] != acc {
                 return false;
             }
-            acc *= self.shape[d];
+            if d != 0 {
+                let Some(next) = acc.checked_mul(self.shape[d]) else {
+                    return false;
+                };
+                acc = next;
+            }
         }
         true
     }
@@ -102,16 +117,28 @@ impl Layout {
     }
 
     pub fn max_index(&self) -> usize {
-        if self.numel() == 0 {
-            return 0;
+        self.checked_max_index()
+            .expect("layout maximum index overflow")
+    }
+
+    pub fn checked_max_index(&self) -> Option<usize> {
+        if self.shape.contains(&0) {
+            return Some(0);
         }
-        let mut idx = self.offset;
-        for d in 0..self.rank() {
-            if self.shape[d] > 0 {
-                idx += (self.shape[d] - 1) * self.strides[d];
-            }
+        let mut index = self.offset;
+        for (&dim, &stride) in self.shape.iter().zip(&self.strides) {
+            index = index.checked_add((dim - 1).checked_mul(stride)?)?;
         }
-        idx + 1
+        index.checked_add(1)
+    }
+
+    pub fn checked_byte_size(&self, dtype: DType) -> Option<usize> {
+        self.checked_max_index()?.checked_mul(dtype.size_in_bytes())
+    }
+
+    pub fn byte_size(&self, dtype: DType) -> usize {
+        self.checked_byte_size(dtype)
+            .expect("layout byte size overflow")
     }
 }
 
@@ -173,5 +200,32 @@ mod tests {
         assert_eq!(l.offset(), 2);
         assert!(!l.is_contiguous());
         assert_eq!(l.max_index(), 19);
+    }
+
+    #[test]
+    fn checked_layout_sizes_detect_overflow() {
+        let numel_overflow = Layout::new(vec![usize::MAX, 2], vec![2, 1], 0);
+        assert_eq!(numel_overflow.checked_numel(), None);
+        assert_eq!(numel_overflow.checked_max_index(), None);
+
+        let index_overflow = Layout::new(vec![2], vec![usize::MAX], 0);
+        assert_eq!(index_overflow.checked_max_index(), None);
+
+        let byte_overflow = Layout::new(vec![usize::MAX / 2], vec![1], 0);
+        assert_eq!(byte_overflow.checked_byte_size(DType::F32), None);
+    }
+
+    #[test]
+    fn checked_layout_sizes_handle_empty_and_strided_layouts() {
+        let empty = Layout::new(vec![3, 0], vec![8, usize::MAX], usize::MAX);
+        assert_eq!(empty.checked_numel(), Some(0));
+        assert_eq!(empty.checked_max_index(), Some(0));
+        assert_eq!(empty.checked_byte_size(DType::F32), Some(0));
+
+        let strided = Layout::new(vec![2, 3], vec![8, 2], 1);
+        assert_eq!(strided.checked_numel(), Some(6));
+        assert_eq!(strided.checked_max_index(), Some(14));
+        assert_eq!(strided.checked_byte_size(DType::F32), Some(56));
+        assert_eq!(strided.byte_size(DType::F32), 56);
     }
 }

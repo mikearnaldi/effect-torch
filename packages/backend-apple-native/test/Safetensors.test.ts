@@ -1,7 +1,6 @@
-import { makeRuntime as makeCpuRuntime } from "@effect-torch/backend-cpu"
 import { describe, expect, it } from "@effect/vitest"
 import { Effect } from "effect"
-import { mkdtemp, rm } from "node:fs/promises"
+import { mkdtemp, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import path from "node:path"
 import { isAvailable, makeRuntime } from "../src/index.ts"
@@ -14,6 +13,18 @@ const withTempFile = <A, E, R>(prefix: string, use: (file: string) => Effect.Eff
   )
 
 const suite = Effect.runSync(isAvailable) ? describe : describe.skip
+
+const writeF64Archive = (file: string): Promise<void> => {
+  const encoded = new TextEncoder().encode(
+    JSON.stringify({ x: { dtype: "F64", shape: [1], data_offsets: [0, 8] } })
+  )
+  const headerLength = Math.ceil(encoded.byteLength / 8) * 8
+  const archive = new Uint8Array(8 + headerLength + 8)
+  new DataView(archive.buffer).setBigUint64(0, BigInt(headerLength), true)
+  archive.fill(0x20, 8, 8 + headerLength)
+  archive.set(encoded, 8)
+  return writeFile(file, archive)
+}
 
 suite("Apple Metal tensor handles and direct safetensors", () => {
   it.effect("round trips direct Metal tensors and metadata", () =>
@@ -28,10 +39,18 @@ suite("Apple Metal tensor handles and direct safetensors", () => {
         expect(Object.isFrozen(tensor)).toBe(true)
         expect(tensor).toMatchObject({ _tag: "LazyTensor", shape: [2], dtype: "u8", device: "metal" })
 
+        const executable = yield* runtime.compile({ roots: [tensor] })
+        const [concrete] = yield* runtime.execute(executable, {
+          bindings: [],
+          scalars: [],
+          runtimeValues: {}
+        })
+
         yield* runtime.extensions.pathSafetensors!.save(file, {
-          entries: [{ name: "values", tensor }],
+          entries: [{ name: "values", tensor: concrete }],
           metadata: { framework: "effect-torch" }
         })
+        yield* runtime.release(concrete)
         const archive = yield* runtime.extensions.pathSafetensors!.load(file)
         expect(archive.metadata).toEqual({ framework: "effect-torch" })
         const loaded = archive.entries[0]!.tensor
@@ -43,17 +62,8 @@ suite("Apple Metal tensor handles and direct safetensors", () => {
   it.effect("rejects f64 direct loading instead of executing on CPU", () =>
     withTempFile("effect-torch-metal-safetensors-f64-", (file) =>
       Effect.gen(function*() {
-        const cpu = makeCpuRuntime()
         const runtime = makeRuntime()
-        const tensor = yield* cpu.node({
-          op: "fromBytes",
-          inputs: [],
-          attributes: { data: new Uint8Array(8), shape: [1], dtype: "f64" }
-        })
-        yield* cpu.extensions.pathSafetensors!.save(file, {
-          entries: [{ name: "x", tensor }],
-          metadata: {}
-        })
+        yield* Effect.tryPromise(() => writeF64Archive(file))
         const error = yield* Effect.flip(runtime.extensions.pathSafetensors!.load(file))
         expect(error.reason).toBe("unsupported-placement")
       })))

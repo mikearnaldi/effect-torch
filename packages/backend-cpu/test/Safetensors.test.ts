@@ -36,9 +36,11 @@ describe("CPU tensor handles and direct safetensors", () => {
       expect(lazy).not.toHaveProperty("lazy")
       expect(lazy).not.toHaveProperty("materialized")
 
-      const [concrete] = yield* runtime.evaluate([lazy])
+      const initial = yield* runtime.compile({ roots: [lazy] })
+      const [concrete] = yield* runtime.execute(initial, { bindings: [], scalars: [], runtimeValues: {} })
       const relu = yield* runtime.node({ op: "relu", inputs: [concrete] })
-      const [result] = yield* runtime.evaluate([relu])
+      const executable = yield* runtime.compile({ roots: [relu] })
+      const [result] = yield* runtime.execute(executable, { bindings: [], scalars: [], runtimeValues: {} })
       expect([...new Float32Array(yield* runtime.readback(result))]).toEqual([0, 2])
       yield* runtime.release(result)
       yield* runtime.release(concrete)
@@ -56,7 +58,8 @@ describe("CPU tensor handles and direct safetensors", () => {
         inputs: [source],
         attributes: { dims: [1, 0] }
       })
-      const [value] = yield* runtime.evaluate([transposed])
+      const executable = yield* runtime.compile({ roots: [transposed] })
+      const [value] = yield* runtime.execute(executable, { bindings: [], scalars: [], runtimeValues: {} })
       expect(value.shape).toEqual([3, 2])
       expect([...new Float32Array(yield* runtime.readback(value))]).toEqual([1, 4, 2, 5, 3, 6])
       yield* runtime.release(value)
@@ -66,11 +69,13 @@ describe("CPU tensor handles and direct safetensors", () => {
     withTempFile("effect-torch-cpu-safetensors-", (file) =>
       Effect.gen(function*() {
         const name = "quoted\"\\\nname"
-        const tensor = yield* runtime.node({
+        const lazy = yield* runtime.node({
           op: "fromBytes",
           inputs: [],
           attributes: { data: new Uint8Array([7, 8]), shape: [2], dtype: "u8" }
         })
+        const executable = yield* runtime.compile({ roots: [lazy] })
+        const [tensor] = yield* runtime.execute(executable, { bindings: [], scalars: [], runtimeValues: {} })
         yield* runtime.extensions.pathSafetensors!.save(file, {
           entries: [{ name, tensor }],
           metadata: { framework: "effect-torch", escaped: "\"\\\n" }
@@ -82,6 +87,7 @@ describe("CPU tensor handles and direct safetensors", () => {
         expect(loaded).toMatchObject({ _tag: "Tensor", shape: [2], dtype: "u8", device: "cpu" })
         expect([...new Uint8Array(yield* runtime.readback(loaded))]).toEqual([7, 8])
         yield* runtime.release(loaded)
+        yield* runtime.release(tensor)
       })))
 
   it.effect("rejects malformed direct input", () =>

@@ -1,4 +1,6 @@
 use crate as fusion;
+use crate::schedule::graph_post_order;
+use crate::CompileOptions;
 use effect_torch_graph::{
     node_children, remap_children, Device, Node as GraphNode, NodeKind as GraphNodeKind,
 };
@@ -8,30 +10,6 @@ use std::sync::Arc;
 
 type Node = GraphNode<crate::Expr>;
 type NodeKind = GraphNodeKind<crate::Expr>;
-
-// Stack-safe post-order traversal: children in left-to-right order,
-// shared nodes once (the autodiff `topo` pattern). Graph walks must
-// never recurse — deep graphs are bounded by heap, not the call stack.
-fn post_order(roots: &[Arc<Node>]) -> Vec<Arc<Node>> {
-    let mut visited = HashSet::new();
-    let mut order = Vec::new();
-    let mut stack: Vec<(Arc<Node>, bool)> =
-        roots.iter().rev().map(|r| (r.clone(), false)).collect();
-    while let Some((node, processed)) = stack.pop() {
-        if processed {
-            order.push(node);
-            continue;
-        }
-        if !visited.insert(node.id) {
-            continue;
-        }
-        stack.push((node.clone(), true));
-        for c in node_children(&node.kind).into_iter().rev() {
-            stack.push((c, false));
-        }
-    }
-    order
-}
 
 fn reduced_shape(shape: &[usize], dims: &[usize], keepdims: bool) -> Vec<usize> {
     if keepdims {
@@ -63,11 +41,14 @@ fn reduced_shape(shape: &[usize], dims: &[usize], keepdims: bool) -> Vec<usize> 
 // (12.9ms vs 11.5ms per step). Set EFFECT_TORCH_OPT_GROUPS=1 to
 // enable — it should win once parameters are large enough that kernel
 // efficiency dominates launch count.
-fn group_optimizer_steps(roots: &[Arc<Node>]) -> std::result::Result<Vec<Arc<Node>>, String> {
-    if std::env::var_os("EFFECT_TORCH_OPT_GROUPS").is_none() {
+fn group_optimizer_steps(
+    roots: &[Arc<Node>],
+    enabled: bool,
+) -> std::result::Result<Vec<Arc<Node>>, String> {
+    if !enabled {
         return Ok(roots.to_vec());
     }
-    let order = post_order(roots);
+    let order = graph_post_order(roots);
     // Bucket steps by (shape, dtype, hyperparameters).
     type Key = (Vec<usize>, DType, u64, u64, u64, u64);
     let mut buckets: HashMap<Key, Vec<Arc<Node>>> = HashMap::new();
@@ -215,7 +196,7 @@ fn group_optimizer_steps(roots: &[Arc<Node>]) -> std::result::Result<Vec<Arc<Nod
 //   writes it as output 0 and consumers read both through FusedPick;
 //   otherwise the pre-activation buffer disappears entirely.
 pub fn gemm_epilogue_pass(roots: &[Arc<Node>]) -> std::result::Result<Vec<Arc<Node>>, String> {
-    let order = post_order(roots);
+    let order = graph_post_order(roots);
     let mut consumers: HashMap<u64, usize> = HashMap::new();
     for n in &order {
         for c in node_children(&n.kind) {
@@ -339,19 +320,28 @@ pub fn gemm_epilogue_pass(roots: &[Arc<Node>]) -> std::result::Result<Vec<Arc<No
 }
 
 pub fn fuse_roots(roots: &[Arc<Node>]) -> std::result::Result<Vec<Arc<Node>>, String> {
-    let roots = &group_optimizer_steps(roots)?;
-    if std::env::var_os("EFFECT_TORCH_NO_FUSION").is_some() {
+    fuse_roots_with_options(roots, &CompileOptions::from_environment())
+}
+
+pub fn fuse_roots_with_options(
+    roots: &[Arc<Node>],
+    options: &CompileOptions,
+) -> std::result::Result<Vec<Arc<Node>>, String> {
+    if !options.optimize {
         return Ok(roots.to_vec());
     }
-    // EFFECT_TORCH_NO_EPILOGUE isolates the pass for A/B measurement.
-    let roots = &if std::env::var_os("EFFECT_TORCH_NO_EPILOGUE").is_some() {
+    let roots = &group_optimizer_steps(roots, options.environment.optimizer_groups)?;
+    if !options.environment.fusion {
+        return Ok(roots.to_vec());
+    }
+    let roots = &if !options.environment.gemm_epilogues {
         roots.to_vec()
     } else {
         gemm_epilogue_pass(roots)?
     };
     use fusion::Expr as E;
 
-    let order = post_order(roots);
+    let order = graph_post_order(roots);
     let mut consumers: HashMap<u64, usize> = HashMap::new();
     for n in &order {
         for c in node_children(&n.kind) {
@@ -885,15 +875,23 @@ pub fn fuse_roots(roots: &[Arc<Node>]) -> std::result::Result<Vec<Arc<Node>>, St
         }
     }
     // close regions whose end has no consumer in the graph (graph roots)
-    for (id, region) in open.drain() {
-        let node = order.iter().find(|n| n.id == id).unwrap();
-        emit_region(node, region, &mut map)?;
+    for node in &order {
+        if let Some(region) = open.remove(&node.id) {
+            emit_region(node, region, &mut map)?;
+        }
     }
+    debug_assert!(open.is_empty());
     Ok(roots
         .iter()
         .map(|r| map.get(&r.id).cloned().unwrap_or_else(|| r.clone()))
         .collect::<Vec<_>>())
-    .and_then(|roots| merge_shared_regions(&roots))
+    .and_then(|roots| {
+        merge_shared_regions(
+            &roots,
+            options.environment.multi_output_fusion,
+            options.environment.fusion_debug,
+        )
+    })
 }
 
 // RFC 0007 multi-output merge: when a fused region materializes because
@@ -907,8 +905,12 @@ pub fn fuse_roots(roots: &[Arc<Node>]) -> std::result::Result<Vec<Arc<Node>>, St
 // which only exists once the region sweep has finished. Repeats to a
 // fixpoint; each merge removes at least one FusedElementwise node, so it
 // terminates.
-fn merge_shared_regions(roots: &[Arc<Node>]) -> std::result::Result<Vec<Arc<Node>>, String> {
-    if std::env::var_os("EFFECT_TORCH_NO_MULTI_FUSION").is_some() {
+fn merge_shared_regions(
+    roots: &[Arc<Node>],
+    enabled: bool,
+    debug: bool,
+) -> std::result::Result<Vec<Arc<Node>>, String> {
+    if !enabled {
         return Ok(roots.to_vec());
     }
     // Total expression size bound for one merged kernel: keeps register
@@ -926,7 +928,7 @@ fn merge_shared_regions(roots: &[Arc<Node>]) -> std::result::Result<Vec<Arc<Node
     }
 
     fn analyze(roots: &[Arc<Node>]) -> (Vec<Arc<Node>>, HashMap<u64, Vec<u64>>) {
-        let order = post_order(roots);
+        let order = graph_post_order(roots);
         let mut consumers: HashMap<u64, Vec<u64>> = HashMap::new();
         for n in &order {
             for c in node_children(&n.kind) {
@@ -1084,7 +1086,7 @@ fn merge_shared_regions(roots: &[Arc<Node>]) -> std::result::Result<Vec<Arc<Node
     let mut current = roots.to_vec();
     loop {
         let (order, consumers) = analyze(&current);
-        if std::env::var_os("EFFECT_TORCH_FUSION_DEBUG").is_some() {
+        if debug {
             let mut fe = 0;
             let mut multi = 0;
             let mut pick = 0;
@@ -1106,7 +1108,7 @@ fn merge_shared_regions(roots: &[Arc<Node>]) -> std::result::Result<Vec<Arc<Node
         let Some(plan) = find_merge(&order, &consumers) else {
             return Ok(current);
         };
-        if std::env::var_os("EFFECT_TORCH_FUSION_DEBUG").is_some() {
+        if debug {
             eprintln!(
                 "[fusion] multi-merge: prefix {} -> group {:?} (keep {})",
                 plan.prefix, plan.group, plan.keep_prefix

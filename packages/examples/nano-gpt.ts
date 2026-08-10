@@ -190,6 +190,7 @@ const generate = (
     const sample = (logits: Tensor.Any) =>
       Effect.gen(function*() {
         const row = yield* Tensor.toNumberArray(logits)
+        if (Tensor.isTensor(logits)) yield* Tensor.clear(logits)
         const max = Math.max(...row)
         const exps = row.map((x) => Math.exp((x - max) / TEMPERATURE))
         const total = exps.reduce((a, b) => a + b, 0)

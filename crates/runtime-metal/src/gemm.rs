@@ -150,7 +150,7 @@ fn key_for(bias: bool, epilogue: Epilogue, dtype: DType) -> u64 {
 // the epilogue (bias/residual/gelu/dual-store) runs from a threadgroup
 // staging tile. The naive kernel stays for EFFECT_TORCH_NO_MMA A/B,
 // small shapes, and reference.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 struct MmaConfig {
     tile: usize,
     threads: usize,
@@ -171,6 +171,230 @@ fn mma_config(dev: &MetalDevice) -> MmaConfig {
             }
         }
     })
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct GemmShape {
+    pub batch: usize,
+    pub m: usize,
+    pub n: usize,
+    pub k: usize,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum GemmAlgorithm {
+    Tiled,
+    SimdgroupMma {
+        tile: usize,
+        threads: usize,
+    },
+    SplitK {
+        tile: usize,
+        threads: usize,
+        splits: usize,
+    },
+}
+
+impl GemmAlgorithm {
+    fn mma_config(self) -> Option<MmaConfig> {
+        match self {
+            GemmAlgorithm::Tiled => None,
+            GemmAlgorithm::SimdgroupMma { tile, threads }
+            | GemmAlgorithm::SplitK { tile, threads, .. } => Some(MmaConfig { tile, threads }),
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct SplitKScratchRequirement {
+    pub dtype: DType,
+    pub shape: [usize; 4],
+    pub elements: usize,
+    pub bytes: usize,
+}
+
+/// Exact buffers and algorithm selected for one GEMM shape. Execution consumes
+/// this value directly, so changing the process MMA environment after planning
+/// cannot change the algorithm or its scratch requirement.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct GemmRequirements {
+    pub shape: GemmShape,
+    pub dtype: DType,
+    pub has_bias: bool,
+    pub epilogue: Epilogue,
+    pub mma: bool,
+    pub algorithm: GemmAlgorithm,
+    pub output_elements: usize,
+    pub output_bytes: usize,
+    pub output_count: usize,
+    pub split_k_scratch: Option<SplitKScratchRequirement>,
+}
+
+fn checked_product(values: &[usize], what: &str) -> Result<usize, String> {
+    values.iter().try_fold(1usize, |product, &value| {
+        product
+            .checked_mul(value)
+            .ok_or_else(|| format!("gemm: {what} size overflow"))
+    })
+}
+
+fn dtype_name(dtype: DType) -> Result<&'static str, String> {
+    match dtype {
+        DType::F32 => Ok("float"),
+        DType::F16 => Ok("half"),
+        DType::BF16 => Ok("bfloat"),
+        other => Err(format!("gemm: unsupported dtype {other:?}")),
+    }
+}
+
+fn mma_candidate(
+    dev: &MetalDevice,
+    shape: GemmShape,
+) -> Result<Option<(MmaConfig, usize)>, String> {
+    const MIN_GROUPS: usize = 64;
+    let big = mma_config(dev);
+    let groups = |tile: usize| -> Result<usize, String> {
+        checked_product(
+            &[shape.m.div_ceil(tile), shape.n.div_ceil(tile), shape.batch],
+            "threadgroup grid",
+        )
+    };
+    let big_groups = groups(big.tile)?;
+    if shape.m >= big.tile && shape.n >= big.tile && shape.k >= 32 && big_groups >= MIN_GROUPS {
+        return Ok(Some((big, big_groups)));
+    }
+    if big.tile > 32 && shape.m >= 32 && shape.n >= 32 && shape.k >= 16 {
+        let medium_groups = groups(32)?;
+        if medium_groups >= MIN_GROUPS {
+            return Ok(Some((
+                MmaConfig {
+                    tile: 32,
+                    threads: 128,
+                },
+                medium_groups,
+            )));
+        }
+    }
+    Ok(None)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn gemm_requirements(
+    dev: &MetalDevice,
+    dtype: DType,
+    has_bias: bool,
+    epilogue: Epilogue,
+    batch: usize,
+    m: usize,
+    n: usize,
+    k: usize,
+    mma: bool,
+) -> Result<GemmRequirements, String> {
+    dtype_name(dtype)?;
+    if m > u32::MAX as usize || n > u32::MAX as usize || k > u32::MAX as usize {
+        return Err("gemm: M, N, and K must fit in u32".to_string());
+    }
+    let shape = GemmShape { batch, m, n, k };
+    let output_elements = checked_product(&[batch, m, n], "output")?;
+    let output_bytes = output_elements
+        .checked_mul(dtype.size_in_bytes())
+        .ok_or_else(|| "gemm: output byte size overflow".to_string())?;
+    let candidate = if mma {
+        mma_candidate(dev, shape)?
+    } else {
+        None
+    };
+    let algorithm = match candidate {
+        Some((cfg, group_count))
+            if !has_bias && epilogue == Epilogue::None && k >= 2048 && group_count < 256 =>
+        {
+            let splits = 2048usize
+                .div_ceil(group_count)
+                .clamp(1, 32)
+                .min((k / 128).max(1));
+            if splits > 1 {
+                GemmAlgorithm::SplitK {
+                    tile: cfg.tile,
+                    threads: cfg.threads,
+                    splits,
+                }
+            } else {
+                GemmAlgorithm::SimdgroupMma {
+                    tile: cfg.tile,
+                    threads: cfg.threads,
+                }
+            }
+        }
+        Some((cfg, _)) => GemmAlgorithm::SimdgroupMma {
+            tile: cfg.tile,
+            threads: cfg.threads,
+        },
+        None => GemmAlgorithm::Tiled,
+    };
+    let split_k_scratch = match algorithm {
+        GemmAlgorithm::SplitK { splits, .. } => {
+            let elements = output_elements
+                .checked_mul(splits)
+                .ok_or_else(|| "gemm: split-K scratch size overflow".to_string())?;
+            let bytes = elements
+                .checked_mul(DType::F32.size_in_bytes())
+                .ok_or_else(|| "gemm: split-K scratch byte size overflow".to_string())?;
+            Some(SplitKScratchRequirement {
+                dtype: DType::F32,
+                shape: [splits, batch, m, n],
+                elements,
+                bytes,
+            })
+        }
+        _ => None,
+    };
+    Ok(GemmRequirements {
+        shape,
+        dtype,
+        has_bias,
+        epilogue,
+        mma,
+        algorithm,
+        output_elements,
+        output_bytes,
+        output_count: if epilogue.dual() { 2 } else { 1 },
+        split_k_scratch,
+    })
+}
+
+pub fn matmul_requirements(
+    dev: &MetalDevice,
+    a_shape: &[usize],
+    b_shape: &[usize],
+    dtype: DType,
+    mma: bool,
+) -> Result<GemmRequirements, String> {
+    if a_shape.len() < 2 || b_shape.len() < 2 {
+        return Err("matmul needs rank >= 2".to_string());
+    }
+    let ar = a_shape.len();
+    let br = b_shape.len();
+    let (m, k) = (a_shape[ar - 2], a_shape[ar - 1]);
+    let (k2, n) = (b_shape[br - 2], b_shape[br - 1]);
+    if k != k2 {
+        return Err(format!("matmul inner dim mismatch: {k} vs {k2}"));
+    }
+    let batch_a = checked_product(&a_shape[..ar - 2], "left batch")?;
+    let batch_b = checked_product(&b_shape[..br - 2], "right batch")?;
+    if batch_a != batch_b && batch_a != 1 && batch_b != 1 {
+        return Err(format!("matmul batch mismatch: {batch_a} vs {batch_b}"));
+    }
+    gemm_requirements(
+        dev,
+        dtype,
+        false,
+        Epilogue::None,
+        batch_a.max(batch_b),
+        m,
+        n,
+        k,
+        mma,
+    )
 }
 
 fn gemm_mma_source(bias: bool, epilogue: Epilogue, ty: &str, cfg: MmaConfig) -> String {
@@ -491,10 +715,12 @@ kernel void et_gemm_splitk_reduce(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn gemm_splitk(
+fn gemm_splitk_into(
     dev: &MetalDevice,
     a: &MetalTensor,
     b: &MetalTensor,
+    out: &MetalTensor,
+    scratch: &MetalTensor,
     splits: usize,
     batch: usize,
     m: usize,
@@ -503,32 +729,31 @@ fn gemm_splitk(
     stride_a: usize,
     stride_b: usize,
     cfg: MmaConfig,
-) -> Result<MetalTensor, String> {
-    let ty = match a.dtype {
-        DType::F32 => "float",
-        DType::F16 => "half",
-        DType::BF16 => "bfloat",
-        other => unreachable!("gemm: unsupported dtype {other:?}"),
-    };
-    let sg_ty = if a.dtype == DType::F32 { "float" } else { ty };
+) -> Result<(), String> {
     let esz = a.dtype.size_in_bytes();
     let total = batch * m * n;
-    let source = gemm_splitk_source(ty, sg_ty, cfg, splits, total);
     let key = splitk_key("et_gemm_splitk", a.dtype, cfg, splits, total);
-    let pipeline = dev.compile_lazy(key, "et_gemm_splitk", || source.clone())?;
-    let partial = dev.alloc(splits * total, DType::F32);
-    let out = MetalTensor {
-        buffer: dev.alloc(total.max(1), a.dtype),
-        layout: crate::runtime::layout::Layout::contiguous(vec![batch, m, n]),
-        dtype: a.dtype,
-    };
+    let pipeline = dev.pipeline_cached(key).ok_or_else(|| {
+        format!("gemm: split-K pipeline {key:#x} was not precompiled for exact requirements")
+    })?;
+    let rkey = splitk_key("et_gemm_splitk_reduce", a.dtype, cfg, splits, total);
+    let rpipeline = dev.pipeline_cached(rkey).ok_or_else(|| {
+        format!(
+            "gemm: split-K reduce pipeline {rkey:#x} was not precompiled for exact requirements"
+        )
+    })?;
     let (mu, nu, ku) = (m as u32, n as u32, k as u32);
     let (sa, sb) = (stride_a as u32, stride_b as u32);
     dev.with_encoder(|e| {
         e.setComputePipelineState(pipeline.as_raw());
         set_buffer(e, 0, &a.buffer, a.layout.offset() * esz);
         set_buffer(e, 1, &b.buffer, b.layout.offset() * esz);
-        set_buffer(e, 2, &partial, 0);
+        set_buffer(
+            e,
+            2,
+            &scratch.buffer,
+            scratch.layout.offset() * DType::F32.size_in_bytes(),
+        );
         set_bytes(e, 4, &mu);
         set_bytes(e, 5, &nu);
         set_bytes(e, 6, &ku);
@@ -539,17 +764,386 @@ fn gemm_splitk(
             MetalDevice::grid(cfg.threads, 1, 1),
         );
     });
-    let rkey = splitk_key("et_gemm_splitk_reduce", a.dtype, cfg, splits, total);
-    let rpipeline = dev.compile_lazy(rkey, "et_gemm_splitk_reduce", || source)?;
     let padded = total.div_ceil(256) * 256;
     dev.with_encoder(|e| {
         e.setComputePipelineState(rpipeline.as_raw());
-        set_buffer(e, 0, &partial, 0);
-        set_buffer(e, 1, &out.buffer, 0);
+        set_buffer(
+            e,
+            0,
+            &scratch.buffer,
+            scratch.layout.offset() * DType::F32.size_in_bytes(),
+        );
+        set_buffer(e, 1, &out.buffer, out.layout.offset() * esz);
         let (g, tg) = MetalDevice::grid_flat(padded);
         e.dispatchThreads_threadsPerThreadgroup(g, tg);
     });
-    Ok(out)
+    Ok(())
+}
+
+/// Compiles only the pipeline(s) selected in `requirements` and allocates no
+/// tensor or scratch buffers.
+pub fn precompile_gemm_fused(
+    dev: &MetalDevice,
+    requirements: &GemmRequirements,
+) -> Result<usize, String> {
+    if requirements.output_elements == 0 {
+        return Ok(0);
+    }
+    let ty = dtype_name(requirements.dtype)?;
+    match requirements.algorithm {
+        GemmAlgorithm::Tiled => {
+            dev.compile_lazy(
+                key_for(
+                    requirements.has_bias,
+                    requirements.epilogue,
+                    requirements.dtype,
+                ),
+                "et_gemm",
+                || gemm_source(requirements.has_bias, requirements.epilogue, ty),
+            )?;
+            Ok(1)
+        }
+        GemmAlgorithm::SimdgroupMma { tile, threads } => {
+            let cfg = MmaConfig { tile, threads };
+            dev.compile_lazy(
+                mma_key_for(
+                    requirements.has_bias,
+                    requirements.epilogue,
+                    requirements.dtype,
+                    cfg,
+                ),
+                "et_gemm_mma",
+                || gemm_mma_source(requirements.has_bias, requirements.epilogue, ty, cfg),
+            )?;
+            Ok(1)
+        }
+        GemmAlgorithm::SplitK {
+            tile,
+            threads,
+            splits,
+        } => {
+            let cfg = MmaConfig { tile, threads };
+            let total = requirements.output_elements;
+            let sg_ty = if requirements.dtype == DType::F32 {
+                "float"
+            } else {
+                ty
+            };
+            let source = gemm_splitk_source(ty, sg_ty, cfg, splits, total);
+            dev.compile_lazy(
+                splitk_key("et_gemm_splitk", requirements.dtype, cfg, splits, total),
+                "et_gemm_splitk",
+                || source.clone(),
+            )?;
+            dev.compile_lazy(
+                splitk_key(
+                    "et_gemm_splitk_reduce",
+                    requirements.dtype,
+                    cfg,
+                    splits,
+                    total,
+                ),
+                "et_gemm_splitk_reduce",
+                || source,
+            )?;
+            Ok(2)
+        }
+    }
+}
+
+pub fn precompile_gemm(
+    dev: &MetalDevice,
+    requirements: &GemmRequirements,
+) -> Result<usize, String> {
+    precompile_gemm_fused(dev, requirements)
+}
+
+pub fn precompile_matmul(
+    dev: &MetalDevice,
+    requirements: &GemmRequirements,
+) -> Result<usize, String> {
+    precompile_gemm_fused(dev, requirements)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn warm_gemm_fused(
+    dev: &MetalDevice,
+    dtype: DType,
+    has_bias: bool,
+    epilogue: Epilogue,
+    batch: usize,
+    m: usize,
+    n: usize,
+    k: usize,
+    mma: bool,
+) -> Result<usize, String> {
+    let requirements = gemm_requirements(dev, dtype, has_bias, epilogue, batch, m, n, k, mma)?;
+    precompile_gemm_fused(dev, &requirements)
+}
+
+fn matrix_span(batch: usize, stride: usize, elements: usize) -> Result<usize, String> {
+    if batch == 0 || elements == 0 {
+        return Ok(0);
+    }
+    (batch - 1)
+        .checked_mul(stride)
+        .and_then(|offset| offset.checked_add(elements))
+        .ok_or_else(|| "gemm: input span overflow".to_string())
+}
+
+fn validate_contiguous(
+    tensor: &MetalTensor,
+    dtype: DType,
+    elements: usize,
+    exact: bool,
+    name: &str,
+) -> Result<(), String> {
+    if tensor.dtype != dtype {
+        return Err(format!(
+            "gemm: {name} dtype mismatch, expected {dtype:?}, got {:?}",
+            tensor.dtype
+        ));
+    }
+    if !tensor.layout.is_contiguous() {
+        return Err(format!("gemm: {name} must be contiguous"));
+    }
+    let actual = tensor
+        .layout
+        .checked_numel()
+        .ok_or_else(|| format!("gemm: {name} element count overflow"))?;
+    if (exact && actual != elements) || (!exact && actual < elements) {
+        let relation = if exact { "exactly" } else { "at least" };
+        return Err(format!(
+            "gemm: {name} needs {relation} {elements} elements, got {actual}"
+        ));
+    }
+    let bytes = elements
+        .checked_mul(dtype.size_in_bytes())
+        .and_then(|size| {
+            tensor
+                .layout
+                .offset()
+                .checked_mul(dtype.size_in_bytes())?
+                .checked_add(size)
+        })
+        .ok_or_else(|| format!("gemm: {name} byte range overflow"))?;
+    if bytes > tensor.buffer.size {
+        return Err(format!(
+            "gemm: {name} byte range {bytes} exceeds buffer size {}",
+            tensor.buffer.size
+        ));
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn gemm_fused_into(
+    dev: &MetalDevice,
+    a: &MetalTensor,
+    b: &MetalTensor,
+    bias: Option<&MetalTensor>,
+    residual: Option<&MetalTensor>,
+    out: &MetalTensor,
+    out2: Option<&MetalTensor>,
+    split_k_scratch: Option<&MetalTensor>,
+    stride_a: usize,
+    stride_b: usize,
+    requirements: &GemmRequirements,
+) -> Result<(), String> {
+    let GemmShape { batch, m, n, k } = requirements.shape;
+    if a.dtype != requirements.dtype || b.dtype != requirements.dtype {
+        return Err(format!(
+            "gemm: input dtype mismatch for {:?} requirements",
+            requirements.dtype
+        ));
+    }
+    if bias.is_some() != requirements.has_bias {
+        return Err("gemm: bias presence does not match requirements".to_string());
+    }
+    if residual.is_some() != (requirements.epilogue == Epilogue::Residual) {
+        return Err("gemm: residual presence does not match epilogue requirements".to_string());
+    }
+    if out2.is_some() != (requirements.output_count == 2) {
+        return Err("gemm: secondary output presence does not match requirements".to_string());
+    }
+    if stride_a > u32::MAX as usize || stride_b > u32::MAX as usize {
+        return Err("gemm: batch strides must fit in u32".to_string());
+    }
+    match (requirements.split_k_scratch, split_k_scratch) {
+        (Some(expected), Some(actual)) => validate_contiguous(
+            actual,
+            expected.dtype,
+            expected.elements,
+            true,
+            "split-K scratch",
+        )?,
+        (Some(_), None) => return Err("gemm: exact split-K scratch buffer is required".to_string()),
+        (None, Some(_)) => {
+            return Err("gemm: scratch supplied for an algorithm that needs none".to_string())
+        }
+        (None, None) => {}
+    }
+    let a_matrix = m
+        .checked_mul(k)
+        .ok_or_else(|| "gemm: left matrix size overflow".to_string())?;
+    let b_matrix = k
+        .checked_mul(n)
+        .ok_or_else(|| "gemm: right matrix size overflow".to_string())?;
+    validate_contiguous(
+        a,
+        requirements.dtype,
+        matrix_span(batch, stride_a, a_matrix)?,
+        false,
+        "left input",
+    )?;
+    validate_contiguous(
+        b,
+        requirements.dtype,
+        matrix_span(batch, stride_b, b_matrix)?,
+        false,
+        "right input",
+    )?;
+    if let Some(bias) = bias {
+        validate_contiguous(bias, requirements.dtype, n, true, "bias")?;
+    }
+    if let Some(residual) = residual {
+        validate_contiguous(
+            residual,
+            requirements.dtype,
+            requirements.output_elements,
+            true,
+            "residual",
+        )?;
+    }
+    validate_contiguous(
+        out,
+        requirements.dtype,
+        requirements.output_elements,
+        true,
+        "destination",
+    )?;
+    if let Some(out2) = out2 {
+        validate_contiguous(
+            out2,
+            requirements.dtype,
+            requirements.output_elements,
+            true,
+            "secondary destination",
+        )?;
+    }
+    if requirements.output_elements == 0 {
+        return Ok(());
+    }
+
+    if let GemmAlgorithm::SplitK { splits, .. } = requirements.algorithm {
+        return gemm_splitk_into(
+            dev,
+            a,
+            b,
+            out,
+            split_k_scratch.expect("validated split-K scratch"),
+            splits,
+            batch,
+            m,
+            n,
+            k,
+            stride_a,
+            stride_b,
+            requirements
+                .algorithm
+                .mma_config()
+                .expect("split-K has MMA config"),
+        );
+    }
+
+    let cfg = requirements.algorithm.mma_config();
+    let (key, name) = match cfg {
+        Some(cfg) => (
+            mma_key_for(
+                requirements.has_bias,
+                requirements.epilogue,
+                requirements.dtype,
+                cfg,
+            ),
+            "et_gemm_mma",
+        ),
+        None => (
+            key_for(
+                requirements.has_bias,
+                requirements.epilogue,
+                requirements.dtype,
+            ),
+            "et_gemm",
+        ),
+    };
+    let pipeline = dev.pipeline_cached(key).ok_or_else(|| {
+        format!("gemm: {name} pipeline {key:#x} was not precompiled for exact requirements")
+    })?;
+    let esz = requirements.dtype.size_in_bytes();
+    let (mu, nu, ku) = (m as u32, n as u32, k as u32);
+    let (sa, sb) = (stride_a as u32, stride_b as u32);
+    dev.with_encoder(|e| {
+        e.setComputePipelineState(pipeline.as_raw());
+        set_buffer(e, 0, &a.buffer, a.layout.offset() * esz);
+        set_buffer(e, 1, &b.buffer, b.layout.offset() * esz);
+        set_buffer(e, 2, &out.buffer, out.layout.offset() * esz);
+        if let Some(bias) = bias {
+            set_buffer(e, 3, &bias.buffer, bias.layout.offset() * esz);
+        }
+        set_bytes(e, 4, &mu);
+        set_bytes(e, 5, &nu);
+        set_bytes(e, 6, &ku);
+        set_bytes(e, 7, &sa);
+        set_bytes(e, 8, &sb);
+        if let Some(residual) = residual {
+            set_buffer(e, 9, &residual.buffer, residual.layout.offset() * esz);
+        }
+        if let Some(out2) = out2 {
+            set_buffer(e, 10, &out2.buffer, out2.layout.offset() * esz);
+        }
+        if let Some(cfg) = cfg {
+            e.dispatchThreadgroups_threadsPerThreadgroup(
+                MetalDevice::grid(n.div_ceil(cfg.tile), m.div_ceil(cfg.tile), batch),
+                MetalDevice::grid(cfg.threads, 1, 1),
+            );
+        } else {
+            e.dispatchThreadgroups_threadsPerThreadgroup(
+                MetalDevice::grid(n.div_ceil(TILE), m.div_ceil(TILE), batch),
+                MetalDevice::grid(TILE, TILE, 1),
+            );
+        }
+    });
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn gemm_into(
+    dev: &MetalDevice,
+    a: &MetalTensor,
+    b: &MetalTensor,
+    bias: Option<&MetalTensor>,
+    out: &MetalTensor,
+    split_k_scratch: Option<&MetalTensor>,
+    stride_a: usize,
+    stride_b: usize,
+    requirements: &GemmRequirements,
+) -> Result<(), String> {
+    if requirements.epilogue != Epilogue::None || requirements.output_count != 1 {
+        return Err("gemm_into requires a plain, single-output epilogue".to_string());
+    }
+    gemm_fused_into(
+        dev,
+        a,
+        b,
+        bias,
+        None,
+        out,
+        None,
+        split_k_scratch,
+        stride_a,
+        stride_b,
+        requirements,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -567,132 +1161,37 @@ pub fn gemm_fused(
     stride_a: usize,
     stride_b: usize,
 ) -> Result<(MetalTensor, Option<MetalTensor>), String> {
-    assert_eq!(a.dtype, b.dtype, "gemm: dtype mismatch");
-    assert!(
-        matches!(a.dtype, DType::F32 | DType::F16 | DType::BF16),
-        "gemm: unsupported dtype {:?}",
-        a.dtype
-    );
-    if let Some(bias) = bias {
-        assert_eq!(bias.dtype, a.dtype, "gemm: bias dtype mismatch");
-    }
-    if let Some(r) = residual {
-        assert_eq!(r.dtype, a.dtype, "gemm: residual dtype mismatch");
-        assert_eq!(
-            epilogue,
-            Epilogue::Residual,
-            "gemm: residual without residual epilogue"
-        );
-    }
-    assert_eq!(
-        (epilogue == Epilogue::Residual),
-        residual.is_some(),
-        "gemm: residual epilogue needs a residual tensor"
-    );
-    let esz = a.dtype.size_in_bytes();
-    let ty = match a.dtype {
-        DType::F32 => "float",
-        DType::F16 => "half",
-        DType::BF16 => "bfloat",
-        _ => unreachable!(),
-    };
-    let has_bias = bias.is_some();
-    // MMA pays when the grid fills the GPU AND K is long enough to
-    // amortize the cooperative loads — measured on M4 Max: below ~64
-    // threadgroups the naive kernel wins (N=128/256 starve at 4–16
-    // groups), above it MMA pulls ahead (N=512 at 64 groups, 1.3x;
-    // N=4096, 3x). Two bands: the device's preferred geometry
-    // (mma_config) for full-size gemms, 32x32 for medium ones; truly
-    // small gemms run the naive kernel.
-    const MIN_GROUPS: usize = 64;
-    let big = mma_config(dev);
-    let groups = |tile: usize| (m.div_ceil(tile)) * (n.div_ceil(tile)) * batch;
-    let medium = MmaConfig {
-        tile: 32,
-        threads: 128,
-    };
-    let cfg = if m >= big.tile && n >= big.tile && k >= 32 && groups(big.tile) >= MIN_GROUPS {
-        Some(big)
-    } else if big.tile > 32 && m >= 32 && n >= 32 && k >= 16 && groups(32) >= MIN_GROUPS {
-        Some(medium)
-    } else {
-        None
-    };
-    let use_mma = std::env::var_os("EFFECT_TORCH_NO_MMA").is_none() && cfg.is_some();
-    // Split-K: long K, narrow output grid, no bias or epilogue (the
-    // head-dX / trunk-dW class). Partition K so every element is read
-    // once and the grid fills the GPU, then reduce f32 partials in a
-    // fixed order.
-    if let Some(cfg) =
-        cfg.filter(|_| use_mma && !has_bias && epilogue == Epilogue::None && k >= 2048)
-    {
-        let g = groups(cfg.tile);
-        if g < 256 {
-            let splits = 2048usize.div_ceil(g).clamp(1, 32).min((k / 128).max(1));
-            if splits > 1 {
-                let out = gemm_splitk(dev, a, b, splits, batch, m, n, k, stride_a, stride_b, cfg)?;
-                return Ok((out, None));
-            }
-        }
-    }
-    let pipeline = if let Some(cfg) = cfg.filter(|_| use_mma) {
-        dev.compile_lazy(
-            mma_key_for(has_bias, epilogue, a.dtype, cfg),
-            "et_gemm_mma",
-            || gemm_mma_source(has_bias, epilogue, ty, cfg),
-        )?
-    } else {
-        dev.compile_lazy(key_for(has_bias, epilogue, a.dtype), "et_gemm", || {
-            gemm_source(has_bias, epilogue, ty)
-        })?
-    };
-    let out = MetalTensor {
-        buffer: dev.alloc(batch * m * n, a.dtype),
-        layout: crate::runtime::layout::Layout::contiguous(vec![batch, m, n]),
-        dtype: a.dtype,
-    };
-    let out2 = if epilogue.dual() {
-        Some(MetalTensor {
-            buffer: dev.alloc(batch * m * n, a.dtype),
-            layout: crate::runtime::layout::Layout::contiguous(vec![batch, m, n]),
-            dtype: a.dtype,
-        })
-    } else {
-        None
-    };
-    let (mu, nu, ku) = (m as u32, n as u32, k as u32);
-    let (sa, sb) = (stride_a as u32, stride_b as u32);
-    dev.with_encoder(|e| {
-        e.setComputePipelineState(pipeline.as_raw());
-        set_buffer(e, 0, &a.buffer, a.layout.offset() * esz);
-        set_buffer(e, 1, &b.buffer, b.layout.offset() * esz);
-        set_buffer(e, 2, &out.buffer, 0);
-        if let Some(bias) = bias {
-            set_buffer(e, 3, &bias.buffer, bias.layout.offset() * esz);
-        }
-        set_bytes(e, 4, &mu);
-        set_bytes(e, 5, &nu);
-        set_bytes(e, 6, &ku);
-        set_bytes(e, 7, &sa);
-        set_bytes(e, 8, &sb);
-        if let Some(r) = residual {
-            set_buffer(e, 9, &r.buffer, r.layout.offset() * esz);
-        }
-        if let Some(out2) = &out2 {
-            set_buffer(e, 10, &out2.buffer, 0);
-        }
-        if let Some(cfg) = cfg.filter(|_| use_mma) {
-            e.dispatchThreadgroups_threadsPerThreadgroup(
-                MetalDevice::grid(n.div_ceil(cfg.tile), m.div_ceil(cfg.tile), batch),
-                MetalDevice::grid(cfg.threads, 1, 1),
-            );
-        } else {
-            e.dispatchThreadgroups_threadsPerThreadgroup(
-                MetalDevice::grid(n.div_ceil(TILE), m.div_ceil(TILE), batch),
-                MetalDevice::grid(TILE, TILE, 1),
-            );
-        }
-    });
+    let requirements = gemm_requirements(
+        dev,
+        a.dtype,
+        bias.is_some(),
+        epilogue,
+        batch,
+        m,
+        n,
+        k,
+        super::device::mma_enabled(),
+    )?;
+    precompile_gemm_fused(dev, &requirements)?;
+    let shape = vec![batch, m, n];
+    let out = MetalTensor::empty(dev, shape.clone(), a.dtype);
+    let out2 = (requirements.output_count == 2).then(|| MetalTensor::empty(dev, shape, a.dtype));
+    let scratch = requirements
+        .split_k_scratch
+        .map(|scratch| MetalTensor::empty(dev, scratch.shape.to_vec(), scratch.dtype));
+    gemm_fused_into(
+        dev,
+        a,
+        b,
+        bias,
+        residual,
+        &out,
+        out2.as_ref(),
+        scratch.as_ref(),
+        stride_a,
+        stride_b,
+        &requirements,
+    )?;
     Ok((out, out2))
 }
 
@@ -726,36 +1225,107 @@ pub fn gemm(
     .map(|(out, _)| out)
 }
 
+pub fn matmul_into(
+    dev: &MetalDevice,
+    a: &MetalTensor,
+    b: &MetalTensor,
+    out: &MetalTensor,
+    split_k_scratch: Option<&MetalTensor>,
+    requirements: &GemmRequirements,
+) -> Result<(), String> {
+    let a_shape = a.layout.shape();
+    let b_shape = b.layout.shape();
+    if a_shape.len() < 2 || b_shape.len() < 2 {
+        return Err("matmul needs rank >= 2".to_string());
+    }
+    let ar = a_shape.len();
+    let br = b_shape.len();
+    let batch_a = checked_product(&a_shape[..ar - 2], "left batch")?;
+    let batch_b = checked_product(&b_shape[..br - 2], "right batch")?;
+    let actual_shape = GemmShape {
+        batch: batch_a.max(batch_b),
+        m: a_shape[ar - 2],
+        n: b_shape[br - 1],
+        k: a_shape[ar - 1],
+    };
+    if a.dtype != b.dtype
+        || requirements.dtype != a.dtype
+        || requirements.shape != actual_shape
+        || requirements.has_bias
+        || requirements.epilogue != Epilogue::None
+    {
+        return Err("matmul: inputs do not match exact requirements".to_string());
+    }
+    if a_shape[ar - 1] != b_shape[br - 2] || (batch_a != batch_b && batch_a != 1 && batch_b != 1) {
+        return Err("matmul: input shapes are incompatible".to_string());
+    }
+    let output_batch_shape = if batch_a >= batch_b {
+        &a_shape[..ar - 2]
+    } else {
+        &b_shape[..br - 2]
+    };
+    let out_shape = out.layout.shape();
+    if out_shape.len() != output_batch_shape.len() + 2
+        || &out_shape[..output_batch_shape.len()] != output_batch_shape
+        || out_shape[out_shape.len() - 2] != actual_shape.m
+        || out_shape[out_shape.len() - 1] != actual_shape.n
+    {
+        return Err("matmul: destination shape does not match broadcast output".to_string());
+    }
+    let stride_a = if batch_a == 1 {
+        0
+    } else {
+        actual_shape
+            .m
+            .checked_mul(actual_shape.k)
+            .ok_or_else(|| "matmul: left stride overflow".to_string())?
+    };
+    let stride_b = if batch_b == 1 {
+        0
+    } else {
+        actual_shape
+            .k
+            .checked_mul(actual_shape.n)
+            .ok_or_else(|| "matmul: right stride overflow".to_string())?
+    };
+    gemm_into(
+        dev,
+        a,
+        b,
+        None,
+        out,
+        split_k_scratch,
+        stride_a,
+        stride_b,
+        requirements,
+    )
+}
+
 pub fn matmul(dev: &MetalDevice, a: &MetalTensor, b: &MetalTensor) -> Result<MetalTensor, String> {
+    let requirements = matmul_requirements(
+        dev,
+        a.layout.shape(),
+        b.layout.shape(),
+        a.dtype,
+        super::device::mma_enabled(),
+    )?;
+    precompile_matmul(dev, &requirements)?;
     let ar = a.layout.shape().len();
     let br = b.layout.shape().len();
-    assert!(ar >= 2 && br >= 2, "matmul needs rank >= 2");
-    let m = a.layout.shape()[ar - 2];
-    let k = a.layout.shape()[ar - 1];
-    let k2 = b.layout.shape()[br - 2];
-    let n = b.layout.shape()[br - 1];
-    assert_eq!(k, k2, "matmul inner dim mismatch");
-    let batch_a: usize = a.layout.shape()[..ar - 2].iter().product();
-    let batch_b: usize = b.layout.shape()[..br - 2].iter().product();
-    assert!(
-        batch_a == batch_b || batch_a == 1 || batch_b == 1,
-        "matmul batch mismatch: {batch_a} vs {batch_b}"
-    );
-    let batch = batch_a.max(batch_b);
-    let stride_a = if batch_a == 1 { 0 } else { m * k };
-    let stride_b = if batch_b == 1 { 0 } else { k * n };
-    let out = gemm(dev, a, b, None, batch, m, n, k, stride_a, stride_b)?;
+    let batch_a = checked_product(&a.layout.shape()[..ar - 2], "left batch")?;
+    let batch_b = checked_product(&b.layout.shape()[..br - 2], "right batch")?;
     let mut out_shape = if batch_a >= batch_b {
         a.layout.shape()[..ar - 2].to_vec()
     } else {
         b.layout.shape()[..br - 2].to_vec()
     };
-    out_shape.extend([m, n]);
-    Ok(MetalTensor {
-        buffer: out.buffer,
-        layout: crate::runtime::layout::Layout::contiguous(out_shape),
-        dtype: a.dtype,
-    })
+    out_shape.extend([requirements.shape.m, requirements.shape.n]);
+    let out = MetalTensor::empty(dev, out_shape, a.dtype);
+    let scratch = requirements
+        .split_k_scratch
+        .map(|scratch| MetalTensor::empty(dev, scratch.shape.to_vec(), scratch.dtype));
+    matmul_into(dev, a, b, &out, scratch.as_ref(), &requirements)?;
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -797,6 +1367,154 @@ mod tests {
         for (x, y) in got.iter().zip(&want) {
             assert!((x - y).abs() / y.abs().max(1.0) < 1e-4, "{x} vs {y}");
         }
+    }
+
+    #[test]
+    fn gemm_requirements_report_exact_splitk_scratch() {
+        let dev = MetalDevice::get();
+        let requirements = gemm_requirements(
+            dev,
+            DType::BF16,
+            false,
+            Epilogue::None,
+            2,
+            128,
+            256,
+            2051,
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            requirements.algorithm,
+            GemmAlgorithm::SplitK {
+                tile: 32,
+                threads: 128,
+                splits: 16,
+            }
+        );
+        let scratch = requirements.split_k_scratch.unwrap();
+        assert_eq!(scratch.dtype, DType::F32);
+        assert_eq!(scratch.shape, [16, 2, 128, 256]);
+        assert_eq!(scratch.elements, 16 * 2 * 128 * 256);
+        assert_eq!(scratch.bytes, scratch.elements * 4);
+        assert_eq!(
+            requirements,
+            gemm_requirements(
+                dev,
+                DType::BF16,
+                false,
+                Epilogue::None,
+                2,
+                128,
+                256,
+                2051,
+                true,
+            )
+            .unwrap()
+        );
+
+        for (has_bias, epilogue, outputs) in [
+            (true, Epilogue::None, 1),
+            (true, Epilogue::Residual, 1),
+            (true, Epilogue::GeluErf, 1),
+            (true, Epilogue::GeluTanhDual, 2),
+        ] {
+            let requirements = gemm_requirements(
+                dev,
+                DType::BF16,
+                has_bias,
+                epilogue,
+                2,
+                128,
+                256,
+                2051,
+                true,
+            )
+            .unwrap();
+            assert!(requirements.split_k_scratch.is_none());
+            assert_eq!(requirements.output_count, outputs);
+        }
+
+        let f32_requirements = gemm_requirements(
+            dev,
+            DType::F32,
+            false,
+            Epilogue::None,
+            2,
+            128,
+            256,
+            2051,
+            true,
+        )
+        .unwrap();
+        let too_small = MetalTensor::empty(dev, vec![1], DType::F32);
+        let error = gemm_into(
+            dev,
+            &too_small,
+            &too_small,
+            None,
+            &too_small,
+            Some(&too_small),
+            0,
+            0,
+            &f32_requirements,
+        )
+        .unwrap_err();
+        assert!(error.contains("split-K scratch needs exactly"), "{error}");
+        let error = gemm_into(
+            dev,
+            &too_small,
+            &too_small,
+            None,
+            &too_small,
+            None,
+            0,
+            0,
+            &f32_requirements,
+        )
+        .unwrap_err();
+        assert!(error.contains("exact split-K scratch"), "{error}");
+    }
+
+    #[test]
+    fn plain_matmul_into_matches_allocating_wrapper() {
+        let dev = MetalDevice::get();
+        let (m, n, k) = (13usize, 17usize, 11usize);
+        let a: Vec<f32> = (0..m * k).map(|i| (i as f32 * 0.13).sin()).collect();
+        let b: Vec<f32> = (0..k * n).map(|i| (i as f32 * 0.29).cos()).collect();
+        let ta = MetalTensor::from_f32(dev, a, vec![m, k]);
+        let tb = MetalTensor::from_f32(dev, b, vec![k, n]);
+        let requirements = matmul_requirements(dev, &[m, k], &[k, n], DType::F32, false).unwrap();
+        precompile_matmul(dev, &requirements).unwrap();
+        let destination = MetalTensor::empty(dev, vec![m, n], DType::F32);
+        matmul_into(dev, &ta, &tb, &destination, None, &requirements).unwrap();
+        let allocating = matmul(dev, &ta, &tb).unwrap();
+        dev.synchronize().unwrap();
+        let got = destination.read_f32().unwrap();
+        let want = allocating.read_f32().unwrap();
+        for (got, want) in got.iter().zip(&want) {
+            assert!((got - want).abs() < 1e-5, "{got} vs {want}");
+        }
+    }
+
+    #[test]
+    fn gemm_into_requires_precompile_and_allocates_no_device_buffer() {
+        let dev = MetalDevice::new(0).unwrap();
+        let (m, n, k) = (8usize, 9usize, 7usize);
+        let a = MetalTensor::from_f32(&dev, vec![0.25; m * k], vec![m, k]);
+        let b = MetalTensor::from_f32(&dev, vec![0.5; k * n], vec![k, n]);
+        let out = MetalTensor::empty(&dev, vec![1, m, n], DType::F32);
+        let requirements =
+            gemm_requirements(&dev, DType::F32, false, Epilogue::None, 1, m, n, k, false).unwrap();
+        let error =
+            gemm_into(&dev, &a, &b, None, &out, None, m * k, k * n, &requirements).unwrap_err();
+        assert!(error.contains("not precompiled"), "{error}");
+
+        precompile_gemm(&dev, &requirements).unwrap();
+        let _dispatch_guard = dev.begin_executable_dispatch().unwrap();
+        let result = gemm_into(&dev, &a, &b, None, &out, None, m * k, k * n, &requirements);
+        result.unwrap();
+        dev.synchronize().unwrap();
     }
 
     #[test]
@@ -955,7 +1673,7 @@ mod tests {
     }
 
     #[test]
-    fn gemm_splitk_and_bias_fallback_match_cpu() {
+    fn gemm_splitk_and_bias_variant_match_cpu() {
         // The 32x32 MMA grid has exactly 64 threadgroups, enough to
         // select MMA but still narrow enough to select split-K.
         let dev = MetalDevice::get();

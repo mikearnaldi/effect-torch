@@ -54,9 +54,27 @@ onDevices("Compile", () => (it) => {
         expect(yield* values((yield* Tensor.runProgram(program, [x], [-1]))[0])).toEqual([-1, -2, -3])
       }))
 
+    it.effect("reports and enforces the compile-time output capacity", () =>
+      Effect.gen(function*() {
+        const x = yield* Tensor.fromTypedArray(floats([1, 2]), [2])
+        const input = yield* Tensor.makeInput(0, x)
+        const program = yield* Tensor.freezeProgram([yield* Tensor.neg(input)], { outputCapacity: 3 })
+        expect(program.handle.diagnostics.outputCapacity).toBe(3)
+        const retained = [
+          (yield* Tensor.runProgram(program, [x]))[0],
+          (yield* Tensor.runProgram(program, [x]))[0],
+          (yield* Tensor.runProgram(program, [x]))[0]
+        ]
+        const error = yield* Effect.flip(Tensor.runProgram(program, [x]))
+        expect(error.message).toMatch(/all 3 preallocated output generations are still live/)
+        yield* Effect.forEach(retained, (tensor) => Tensor.clear(tensor), { discard: true })
+      }))
+
     it.effect("traces once under concurrent first calls (single-flight)", () =>
       Effect.gen(function*() {
-        const fn = yield* Tensor.compile(([a]) => Effect.map(Tensor.sigmoid(a), (out) => [out]))
+        const fn = yield* Tensor.compile(([a]) => Effect.map(Tensor.sigmoid(a), (out) => [out]), {
+          outputCapacity: 8
+        })
         const x = yield* Tensor.fromTypedArray(floats([0, 1, 2]), [3])
         const results = yield* Effect.forEach(
           Array.from({ length: 8 }, () => fn.call([x])),
@@ -123,10 +141,10 @@ onDevices("Compile", () => (it) => {
         expect(yield* values(first)).not.toEqual(yield* values(second))
       }))
 
-    it.effect("arena replay matches the capture run bitwise across inputs", () =>
+    it.effect("the static executable plan matches direct computation across inputs", () =>
       Effect.gen(function*() {
         // Matmuls break fusion, so the graph has real intermediates for
-        // the arena to plan; runs 2+ replay the plan captured on run 1.
+        // the memory planner to reuse across repeated executions.
         const fn = yield* Tensor.compile(([a, b]) =>
           Effect.gen(function*() {
             const m1 = yield* Tensor.matmul(a, b)
@@ -148,6 +166,8 @@ onDevices("Compile", () => (it) => {
           ])
           const [actual] = yield* fn.call([x, y])
           expect(yield* values(actual)).toEqual(yield* values(expected))
+          yield* Tensor.clear(actual)
+          yield* Tensor.clear(expected)
         }
       }))
 

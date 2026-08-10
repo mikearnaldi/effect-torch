@@ -207,17 +207,6 @@ impl fmt::Debug for ErasedBuffer {
     }
 }
 
-pub trait Backend<Op>: Send + Sync {
-    fn identity(&self) -> &RuntimeIdentity;
-    fn capabilities(&self) -> &Capabilities;
-
-    fn execute(&self, operation: &Op, inputs: &[ErasedBuffer]) -> BackendResult<ErasedBuffer>;
-
-    fn synchronize(&self) -> BackendResult<()> {
-        Ok(())
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

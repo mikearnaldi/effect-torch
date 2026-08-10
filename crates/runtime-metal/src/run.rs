@@ -53,6 +53,40 @@ impl MetalTensor {
         self.layout.numel()
     }
 
+    pub(crate) fn validate_destination(
+        &self,
+        operation: &str,
+        shape: &[usize],
+        dtype: DType,
+    ) -> Result<(), String> {
+        if self.layout.shape() != shape || self.dtype != dtype {
+            return Err(format!(
+                "{operation} destination mismatch: expected {shape:?}:{dtype:?}, got {:?}:{:?}",
+                self.layout.shape(),
+                self.dtype
+            ));
+        }
+        if !self.layout.is_contiguous() {
+            return Err(format!(
+                "{operation} destination must have contiguous layout, got {:?}",
+                self.layout
+            ));
+        }
+        let end = self
+            .layout
+            .offset()
+            .checked_add(self.numel())
+            .and_then(|elements| elements.checked_mul(dtype.size_in_bytes()))
+            .ok_or_else(|| format!("{operation} destination byte range overflow"))?;
+        if end > self.buffer.size {
+            return Err(format!(
+                "{operation} destination requires {end} bytes, buffer has {}",
+                self.buffer.size
+            ));
+        }
+        Ok(())
+    }
+
     pub fn read_f32(&self) -> crate::err::Res<Vec<f32>> {
         crate::runtime::metal::device::MetalDevice::get().synchronize()?;
         Ok(self.buffer.read_f32(self.layout.offset(), self.numel()))
@@ -103,6 +137,139 @@ pub fn elementwise_key(
     num_scalars.hash(&mut hasher);
     (dtype as u8).hash(&mut hasher);
     hasher.finish()
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn reduce_key(
+    op: ReduceOp,
+    expr: &Expr,
+    lane_strides: &[Vec<usize>],
+    in_shape: &[usize],
+    dims: &[usize],
+    keepdims: bool,
+    out_shape: &[usize],
+    dtype: DType,
+) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    (op as u8).hash(&mut hasher);
+    expr.hash(&mut hasher);
+    lane_strides.hash(&mut hasher);
+    in_shape.hash(&mut hasher);
+    dims.hash(&mut hasher);
+    keepdims.hash(&mut hasher);
+    out_shape.hash(&mut hasher);
+    (dtype as u8).hash(&mut hasher);
+    hasher.finish()
+}
+
+/// Compiles the exact elementwise pipeline key without allocating buffers.
+pub fn compile_elementwise(
+    dev: &MetalDevice,
+    exprs: &[Expr],
+    lane_strides: &[Vec<usize>],
+    shape: &[usize],
+    n: usize,
+    num_scalars: usize,
+    dtype: DType,
+) -> Result<(), String> {
+    if n == 0 {
+        return Ok(());
+    }
+    let key = elementwise_key(exprs, lane_strides, shape, n, num_scalars, dtype);
+    if dev.pipeline_cached(key).is_none() {
+        let source = emit::emit_elementwise(
+            exprs,
+            lane_strides,
+            shape,
+            n,
+            num_scalars,
+            "et_fused",
+            dtype,
+        );
+        dev.compile_slow(key, &source, "et_fused")?;
+    }
+    Ok(())
+}
+
+pub fn warm_elementwise(
+    dev: &MetalDevice,
+    exprs: &[Expr],
+    lane_strides: &[Vec<usize>],
+    shape: &[usize],
+    n: usize,
+    num_scalars: usize,
+    dtype: DType,
+) -> Result<(), String> {
+    compile_elementwise(dev, exprs, lane_strides, shape, n, num_scalars, dtype)
+}
+
+/// Compiles the exact fused-reduce pipeline key without allocating buffers.
+#[allow(clippy::too_many_arguments)]
+pub fn compile_reduce(
+    dev: &MetalDevice,
+    op: ReduceOp,
+    expr: &Expr,
+    lane_strides: &[Vec<usize>],
+    in_shape: &[usize],
+    dims: &[usize],
+    keepdims: bool,
+    out_shape: &[usize],
+    dtype: DType,
+) -> Result<(), String> {
+    if out_shape.iter().product::<usize>() == 0 {
+        return Ok(());
+    }
+    let key = reduce_key(
+        op,
+        expr,
+        lane_strides,
+        in_shape,
+        dims,
+        keepdims,
+        out_shape,
+        dtype,
+    );
+    if dev.pipeline_cached(key).is_none() {
+        let source = emit::emit_reduce(
+            op,
+            expr,
+            lane_strides,
+            in_shape,
+            dims,
+            keepdims,
+            out_shape,
+            "et_fused_reduce",
+            dtype,
+        );
+        dev.compile_slow(key, &source, "et_fused_reduce")?;
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn warm_reduce(
+    dev: &MetalDevice,
+    op: ReduceOp,
+    expr: &Expr,
+    lane_strides: &[Vec<usize>],
+    in_shape: &[usize],
+    dims: &[usize],
+    keepdims: bool,
+    out_shape: &[usize],
+    dtype: DType,
+) -> Result<(), String> {
+    compile_reduce(
+        dev,
+        op,
+        expr,
+        lane_strides,
+        in_shape,
+        dims,
+        keepdims,
+        out_shape,
+        dtype,
+    )
 }
 
 pub fn run_elementwise(
@@ -182,20 +349,134 @@ pub fn run_elementwise_prekeyed(
     shape: &[usize],
 ) -> Result<Vec<MetalTensor>, String> {
     let dtype = inputs[0].dtype;
-    let name = "et_fused";
-    let pipeline = match dev.pipeline_cached(key) {
-        Some(p) => p,
-        None => {
-            let src =
-                emit::emit_elementwise(exprs, lane_strides, shape, n, num_scalars, name, dtype);
-            dev.compile_slow(key, &src, name)?
-        }
-    };
-
+    if n != 0 && dev.pipeline_cached(key).is_none() {
+        let source = emit::emit_elementwise(
+            exprs,
+            lane_strides,
+            shape,
+            n,
+            num_scalars,
+            "et_fused",
+            dtype,
+        );
+        dev.compile_slow(key, &source, "et_fused")?;
+    }
     let mut out_bufs = Vec::with_capacity(exprs.len());
     for _ in 0..exprs.len() {
         out_bufs.push(MetalTensor::empty(dev, shape.to_vec(), dtype));
     }
+    let output_refs = out_bufs.iter().collect::<Vec<_>>();
+    run_elementwise_into_prekeyed(
+        dev,
+        key,
+        exprs,
+        inputs,
+        lane_strides,
+        scalar_buf,
+        num_scalars,
+        n,
+        shape,
+        &output_refs,
+    )?;
+    Ok(out_bufs)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn run_elementwise_into(
+    dev: &MetalDevice,
+    exprs: &[Expr],
+    inputs: &[&MetalTensor],
+    lane_strides: &[Vec<usize>],
+    scalar_buf: Option<&super::device::Buffer>,
+    num_scalars: usize,
+    n: usize,
+    shape: &[usize],
+    outputs: &[&MetalTensor],
+) -> Result<(), String> {
+    let dtype = inputs
+        .first()
+        .ok_or_else(|| "elementwise requires at least one input".to_string())?
+        .dtype;
+    let key = elementwise_key(exprs, lane_strides, shape, n, num_scalars, dtype);
+    run_elementwise_into_prekeyed(
+        dev,
+        key,
+        exprs,
+        inputs,
+        lane_strides,
+        scalar_buf,
+        num_scalars,
+        n,
+        shape,
+        outputs,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn run_elementwise_into_prekeyed(
+    dev: &MetalDevice,
+    key: u64,
+    exprs: &[Expr],
+    inputs: &[&MetalTensor],
+    lane_strides: &[Vec<usize>],
+    scalar_buf: Option<&super::device::Buffer>,
+    num_scalars: usize,
+    n: usize,
+    shape: &[usize],
+    outputs: &[&MetalTensor],
+) -> Result<(), String> {
+    let dtype = inputs
+        .first()
+        .ok_or_else(|| "elementwise requires at least one input".to_string())?
+        .dtype;
+    if inputs.len() != lane_strides.len() {
+        return Err(format!(
+            "elementwise received {} inputs and {} stride entries",
+            inputs.len(),
+            lane_strides.len()
+        ));
+    }
+    if exprs.len() != outputs.len() {
+        return Err(format!(
+            "elementwise received {} expressions and {} destinations",
+            exprs.len(),
+            outputs.len()
+        ));
+    }
+    if shape.iter().product::<usize>() != n {
+        return Err(format!(
+            "elementwise shape {shape:?} has a different element count than {n}"
+        ));
+    }
+    if num_scalars == 0 && scalar_buf.is_some() || num_scalars != 0 && scalar_buf.is_none() {
+        return Err(format!(
+            "elementwise scalar buffer mismatch for {num_scalars} scalar(s)"
+        ));
+    }
+    for (index, input) in inputs.iter().enumerate() {
+        if input.dtype != dtype {
+            return Err(format!(
+                "elementwise input {index} has dtype {:?}, expected {dtype:?}",
+                input.dtype
+            ));
+        }
+        if lane_strides[index].len() != shape.len() {
+            return Err(format!(
+                "elementwise input {index} has rank-{} strides for rank-{} output",
+                lane_strides[index].len(),
+                shape.len()
+            ));
+        }
+    }
+    for output in outputs {
+        output.validate_destination("elementwise", shape, dtype)?;
+    }
+    if n == 0 {
+        return Ok(());
+    }
+    let pipeline = dev.pipeline_cached(key).ok_or_else(|| {
+        format!("elementwise pipeline {key:#x} was not precompiled for the exact expression")
+    })?;
     let padded = n.div_ceil(emit::BLOCK) * emit::BLOCK;
     dev.with_encoder(|e| {
         e.setComputePipelineState(pipeline.as_raw());
@@ -213,8 +494,13 @@ pub fn run_elementwise_prekeyed(
             set_buffer(e, idx, buf, 0);
             idx += 1;
         }
-        for t in &out_bufs {
-            set_buffer(e, idx, &t.buffer, 0);
+        for t in outputs {
+            set_buffer(
+                e,
+                idx,
+                &t.buffer,
+                t.layout.offset() * t.dtype.size_in_bytes(),
+            );
             idx += 1;
         }
         e.dispatchThreads_threadsPerThreadgroup(
@@ -222,7 +508,7 @@ pub fn run_elementwise_prekeyed(
             MetalDevice::grid_flat(padded).1,
         );
     });
-    Ok(out_bufs)
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -237,39 +523,91 @@ pub fn run_reduce(
     keepdims: bool,
     out_shape: &[usize],
 ) -> Result<MetalTensor, String> {
-    use std::hash::{Hash, Hasher};
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    (op as u8).hash(&mut hasher);
-    expr.hash(&mut hasher);
-    lane_strides.hash(&mut hasher);
-    in_shape.hash(&mut hasher);
-    dims.hash(&mut hasher);
-    keepdims.hash(&mut hasher);
-    out_shape.hash(&mut hasher);
     let dtype = inputs[0].dtype;
-    (dtype as u8).hash(&mut hasher);
-    let key = hasher.finish();
-    let name = "et_fused_reduce";
-    let pipeline = match dev.pipeline_cached(key) {
-        Some(p) => p,
-        None => {
-            let src = emit::emit_reduce(
-                op,
-                expr,
-                lane_strides,
-                in_shape,
-                dims,
-                keepdims,
-                out_shape,
-                name,
-                dtype,
-            );
-            dev.compile_slow(key, &src, name)?
-        }
-    };
-
-    let out_n: usize = out_shape.iter().product();
+    compile_reduce(
+        dev,
+        op,
+        expr,
+        lane_strides,
+        in_shape,
+        dims,
+        keepdims,
+        out_shape,
+        dtype,
+    )?;
     let out = MetalTensor::empty(dev, out_shape.to_vec(), dtype);
+    run_reduce_into(
+        dev,
+        op,
+        expr,
+        inputs,
+        lane_strides,
+        in_shape,
+        dims,
+        keepdims,
+        out_shape,
+        &out,
+    )?;
+    Ok(out)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn run_reduce_into(
+    dev: &MetalDevice,
+    op: ReduceOp,
+    expr: &Expr,
+    inputs: &[&MetalTensor],
+    lane_strides: &[Vec<usize>],
+    in_shape: &[usize],
+    dims: &[usize],
+    keepdims: bool,
+    out_shape: &[usize],
+    out: &MetalTensor,
+) -> Result<(), String> {
+    let dtype = inputs
+        .first()
+        .ok_or_else(|| "reduce requires at least one input".to_string())?
+        .dtype;
+    if inputs.len() != lane_strides.len() {
+        return Err(format!(
+            "reduce received {} inputs and {} stride entries",
+            inputs.len(),
+            lane_strides.len()
+        ));
+    }
+    for (index, input) in inputs.iter().enumerate() {
+        if input.dtype != dtype {
+            return Err(format!(
+                "reduce input {index} has dtype {:?}, expected {dtype:?}",
+                input.dtype
+            ));
+        }
+        if lane_strides[index].len() != in_shape.len() {
+            return Err(format!(
+                "reduce input {index} has rank-{} strides for rank-{} input",
+                lane_strides[index].len(),
+                in_shape.len()
+            ));
+        }
+    }
+    out.validate_destination("reduce", out_shape, dtype)?;
+    let out_n: usize = out_shape.iter().product();
+    if out_n == 0 {
+        return Ok(());
+    }
+    let key = reduce_key(
+        op,
+        expr,
+        lane_strides,
+        in_shape,
+        dims,
+        keepdims,
+        out_shape,
+        dtype,
+    );
+    let pipeline = dev.pipeline_cached(key).ok_or_else(|| {
+        format!("reduce pipeline {key:#x} was not precompiled for the exact expression")
+    })?;
     let padded = out_n.div_ceil(emit::BLOCK) * emit::BLOCK;
     dev.with_encoder(|e| {
         e.setComputePipelineState(pipeline.as_raw());
@@ -283,13 +621,18 @@ pub fn run_reduce(
             );
             idx += 1;
         }
-        set_buffer(e, idx, &out.buffer, 0);
+        set_buffer(
+            e,
+            idx,
+            &out.buffer,
+            out.layout.offset() * out.dtype.size_in_bytes(),
+        );
         e.dispatchThreads_threadsPerThreadgroup(
             MetalDevice::grid_flat(padded).0,
             MetalDevice::grid_flat(padded).1,
         );
     });
-    Ok(out)
+    Ok(())
 }
 
 #[cfg(test)]
@@ -394,5 +737,199 @@ mod tests {
         for (x, y) in g.iter().zip(&want) {
             assert!((x - y).abs() / y.abs().max(1.0) < 1e-4, "{x} vs {y}");
         }
+    }
+
+    #[test]
+    fn fused_wrappers_match_into_destinations() {
+        let dev = MetalDevice::new(0).unwrap();
+        let a = MetalTensor::from_f32(&dev, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0], vec![2, 3]);
+        let b = MetalTensor::from_f32(&dev, vec![10.0, 20.0, 30.0], vec![1, 3]);
+        let exprs = [Expr::Add(
+            Box::new(Expr::Input(0)),
+            Box::new(Expr::Input(1)),
+        )];
+        let strides = [vec![3, 1], vec![0, 1]];
+        let wrapped = run_elementwise(&dev, &exprs, &[&a, &b], &strides, &[], 6, &[2, 3]).unwrap();
+        let destination = MetalTensor::empty(&dev, vec![2, 3], DType::F32);
+        run_elementwise_into(
+            &dev,
+            &exprs,
+            &[&a, &b],
+            &strides,
+            None,
+            0,
+            6,
+            &[2, 3],
+            &[&destination],
+        )
+        .unwrap();
+
+        let reduce_wrapped = run_reduce(
+            &dev,
+            ReduceOp::Sum,
+            &Expr::Input(0),
+            &[&a],
+            &[vec![3, 1]],
+            &[2, 3],
+            &[1],
+            false,
+            &[2],
+        )
+        .unwrap();
+        let reduce_destination = MetalTensor::empty(&dev, vec![2], DType::F32);
+        run_reduce_into(
+            &dev,
+            ReduceOp::Sum,
+            &Expr::Input(0),
+            &[&a],
+            &[vec![3, 1]],
+            &[2, 3],
+            &[1],
+            false,
+            &[2],
+            &reduce_destination,
+        )
+        .unwrap();
+
+        dev.synchronize().unwrap();
+        assert_eq!(
+            wrapped[0].buffer.read_f32(0, 6),
+            destination.buffer.read_f32(0, 6)
+        );
+        assert_eq!(
+            reduce_wrapped.buffer.read_f32(0, 2),
+            reduce_destination.buffer.read_f32(0, 2)
+        );
+    }
+
+    #[test]
+    fn fused_into_paths_use_no_planned_allocations_or_uploads() {
+        let dev = MetalDevice::new(0).unwrap();
+        let input = MetalTensor::from_f32(&dev, vec![1.0, 2.0, 3.0, 4.0], vec![2, 2]);
+        let elementwise_output = MetalTensor::empty(&dev, vec![2, 2], DType::F32);
+        let reduce_output = MetalTensor::empty(&dev, vec![2], DType::F32);
+        let expr = Expr::Mul(Box::new(Expr::Input(0)), Box::new(Expr::Input(0)));
+        compile_elementwise(
+            &dev,
+            std::slice::from_ref(&expr),
+            &[vec![2, 1]],
+            &[2, 2],
+            4,
+            0,
+            DType::F32,
+        )
+        .unwrap();
+        compile_reduce(
+            &dev,
+            ReduceOp::Sum,
+            &Expr::Input(0),
+            &[vec![2, 1]],
+            &[2, 2],
+            &[1],
+            false,
+            &[2],
+            DType::F32,
+        )
+        .unwrap();
+
+        let _dispatch_guard = dev.begin_executable_dispatch().unwrap();
+        run_elementwise_into(
+            &dev,
+            std::slice::from_ref(&expr),
+            &[&input],
+            &[vec![2, 1]],
+            None,
+            0,
+            4,
+            &[2, 2],
+            &[&elementwise_output],
+        )
+        .unwrap();
+        run_reduce_into(
+            &dev,
+            ReduceOp::Sum,
+            &Expr::Input(0),
+            &[&input],
+            &[vec![2, 1]],
+            &[2, 2],
+            &[1],
+            false,
+            &[2],
+            &reduce_output,
+        )
+        .unwrap();
+        let result = dev.synchronize();
+        result.unwrap();
+        assert_eq!(reduce_output.buffer.read_f32(0, 2), vec![3.0, 7.0]);
+    }
+
+    #[test]
+    fn fused_into_requires_the_exact_precompiled_expression() {
+        let dev = MetalDevice::new(0).unwrap();
+        let input = MetalTensor::from_f32(&dev, vec![1.0, -2.0, 3.0, -4.0], vec![4]);
+        let output = MetalTensor::empty(&dev, vec![4], DType::F32);
+        let expression = Expr::Abs(Box::new(Expr::Input(0)));
+        let error = run_elementwise_into(
+            &dev,
+            std::slice::from_ref(&expression),
+            &[&input],
+            &[vec![1]],
+            None,
+            0,
+            4,
+            &[4],
+            &[&output],
+        )
+        .unwrap_err();
+        assert!(error.contains("not precompiled"), "{error}");
+
+        compile_elementwise(
+            &dev,
+            &[Expr::Neg(Box::new(Expr::Input(0)))],
+            &[vec![1]],
+            &[4],
+            4,
+            0,
+            DType::F32,
+        )
+        .unwrap();
+        let error = run_elementwise_into(
+            &dev,
+            std::slice::from_ref(&expression),
+            &[&input],
+            &[vec![1]],
+            None,
+            0,
+            4,
+            &[4],
+            &[&output],
+        )
+        .unwrap_err();
+        assert!(error.contains("not precompiled"), "{error}");
+
+        compile_elementwise(
+            &dev,
+            std::slice::from_ref(&expression),
+            &[vec![1]],
+            &[4],
+            4,
+            0,
+            DType::F32,
+        )
+        .unwrap();
+        run_elementwise_into(
+            &dev,
+            std::slice::from_ref(&expression),
+            &[&input],
+            &[vec![1]],
+            None,
+            0,
+            4,
+            &[4],
+            &[&output],
+        )
+        .unwrap();
+        dev.synchronize().unwrap();
+        assert_eq!(output.buffer.read_f32(0, 4), vec![1.0, 2.0, 3.0, 4.0]);
     }
 }

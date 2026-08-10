@@ -36,12 +36,21 @@ fn runtime_dtype(dtype: Dtype) -> Res<RuntimeDType> {
 }
 
 pub fn tensor_bytes(value: &Value) -> Res<Vec<u8>> {
-    let tensor = value.tensor().contiguous();
+    let tensor = value.tensor();
     let mut output = Vec::with_capacity(tensor.numel() * tensor.dtype().size_in_bytes());
+    let logical_offset = |mut linear: usize| {
+        let mut offset = tensor.layout.offset();
+        for dimension in (0..tensor.layout.rank()).rev() {
+            let width = tensor.layout.shape()[dimension].max(1);
+            offset += (linear % width) * tensor.layout.strides()[dimension];
+            linear /= width;
+        }
+        offset
+    };
     macro_rules! write_le {
         ($values:expr) => {
-            for value in $values.iter() {
-                output.extend_from_slice(&value.to_le_bytes());
+            for index in 0..tensor.numel() {
+                output.extend_from_slice(&$values[logical_offset(index)].to_le_bytes());
             }
         };
     }
@@ -50,7 +59,11 @@ pub fn tensor_bytes(value: &Value) -> Res<Vec<u8>> {
         CpuBuffer::F64(values) => write_le!(values),
         CpuBuffer::F16(values) => write_le!(values),
         CpuBuffer::BF16(values) => write_le!(values),
-        CpuBuffer::U8(values) => output.extend_from_slice(values),
+        CpuBuffer::U8(values) => {
+            for index in 0..tensor.numel() {
+                output.push(values[logical_offset(index)]);
+            }
+        }
         CpuBuffer::U32(values) => write_le!(values),
         CpuBuffer::I64(values) => write_le!(values),
     }
@@ -171,7 +184,7 @@ pub fn save(
     let views = owned
         .iter()
         .map(|(name, dtype, shape, bytes)| {
-            TensorView::new(*dtype, shape.clone(), bytes).map(|view| (name.as_str(), view))
+            TensorView::new(*dtype, shape.to_vec(), bytes).map(|view| (name.as_str(), view))
         })
         .collect::<Result<Vec<_>, _>>()
         .map_err(|error| error.to_string())?;

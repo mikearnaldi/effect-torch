@@ -1,10 +1,85 @@
-use super::device::{set_buffer, set_bytes, MetalDevice};
+use super::device::{set_buffer, set_bytes, MetalDevice, Pipeline};
 use super::run::MetalTensor;
 use crate::runtime::dtype::DType;
+use crate::runtime::layout::Layout;
 use objc2_metal::MTLComputeCommandEncoder;
 
-fn msl_type(d: DType) -> &'static str {
-    match d {
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TensorRequirement {
+    pub shape: Vec<usize>,
+    pub dtype: DType,
+}
+
+pub type BufferRequirement = TensorRequirement;
+
+impl TensorRequirement {
+    pub fn bytes(&self) -> Result<usize, String> {
+        checked_product(&self.shape)?
+            .checked_mul(self.dtype.size_in_bytes())
+            .ok_or_else(|| {
+                format!(
+                    "indexing tensor byte size overflow for {:?}:{:?}",
+                    self.shape, self.dtype
+                )
+            })
+    }
+}
+
+/// Exact caller-owned resources for one indexing operation.
+///
+/// `ids` stores converted/compacted U32 indexes. Non-f32 scatter-add also
+/// needs an f32 `accumulator` and `source_cast`. Host scatter-set callers use
+/// `staging` for the uploaded U32 indexes. Cat and layout-aware reads need no
+/// copy scratch because their kernels consume source strides directly.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct IndexingRequirements {
+    pub output: Option<TensorRequirement>,
+    pub ids: Option<TensorRequirement>,
+    pub accumulator: Option<TensorRequirement>,
+    pub source_cast: Option<TensorRequirement>,
+    pub staging: Option<TensorRequirement>,
+    pub output_bytes: usize,
+    pub scratch_bytes: usize,
+    pub staging_bytes: usize,
+    pub status_bytes: usize,
+    pub pipeline_count: usize,
+}
+
+fn finalize_requirements(
+    mut requirements: IndexingRequirements,
+    pipeline_count: usize,
+) -> Result<IndexingRequirements, String> {
+    requirements.output_bytes = requirements
+        .output
+        .as_ref()
+        .map_or(Ok(0), TensorRequirement::bytes)?;
+    requirements.scratch_bytes = requirements.scratch_bytes()?;
+    requirements.staging_bytes = requirements.staging_bytes()?;
+    requirements.pipeline_count = pipeline_count;
+    Ok(requirements)
+}
+
+impl IndexingRequirements {
+    pub fn scratch_bytes(&self) -> Result<usize, String> {
+        [&self.ids, &self.accumulator, &self.source_cast]
+            .into_iter()
+            .flatten()
+            .try_fold(0usize, |total, requirement| {
+                total
+                    .checked_add(requirement.bytes()?)
+                    .ok_or_else(|| "indexing scratch byte size overflow".to_string())
+            })
+    }
+
+    pub fn staging_bytes(&self) -> Result<usize, String> {
+        self.staging
+            .as_ref()
+            .map_or(Ok(0), TensorRequirement::bytes)
+    }
+}
+
+fn msl_type(dtype: DType) -> &'static str {
+    match dtype {
         DType::F32 => "float",
         DType::F64 => "double",
         DType::F16 => "half",
@@ -18,498 +93,1668 @@ fn msl_type(d: DType) -> &'static str {
 fn key(parts: &[u64]) -> u64 {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
-    let mut h = DefaultHasher::new();
-    for p in parts {
-        p.hash(&mut h);
+    let mut hasher = DefaultHasher::new();
+    for part in parts {
+        part.hash(&mut hasher);
     }
-    h.finish()
+    hasher.finish()
 }
 
-/// Host-side indices uploaded once — for op callers whose indices were
-/// never on-device. Hot paths (gather/scatter under a compiled step)
-/// keep indices on the device and never read them back.
+fn layout_key(layout: &Layout) -> u64 {
+    let mut parts = Vec::with_capacity(layout.rank() * 2);
+    parts.extend(layout.shape().iter().map(|&value| value as u64));
+    parts.extend(layout.strides().iter().map(|&value| value as u64));
+    key(&parts)
+}
+
+fn cached_pipeline(dev: &MetalDevice, pipeline_key: u64, name: &str) -> Result<Pipeline, String> {
+    dev.pipeline_cached(pipeline_key).ok_or_else(|| {
+        format!("{name}: exact pipeline is not warm; call the matching exact warm function")
+    })
+}
+
+fn convert_key(layout: &Layout, source: DType, destination: DType) -> u64 {
+    key(&[
+        0xC012,
+        source as u64,
+        destination as u64,
+        layout_key(layout),
+    ])
+}
+
+fn index_select_key(layout: &Layout, dtype: DType, dim: usize, ids_len: usize) -> u64 {
+    key(&[
+        0x15E1,
+        dtype as u64,
+        dim as u64,
+        ids_len as u64,
+        layout_key(layout),
+    ])
+}
+
+fn gather_key(layout: &Layout, dtype: DType, dim: usize, ids_shape: &[usize]) -> u64 {
+    key(&[
+        0x6A7E,
+        dtype as u64,
+        dim as u64,
+        key(&ids_shape
+            .iter()
+            .map(|&value| value as u64)
+            .collect::<Vec<_>>()),
+        layout_key(layout),
+    ])
+}
+
+fn scatter_add_key(output_shape: &[usize], source_layout: &Layout, dim: usize) -> u64 {
+    key(&[
+        0x5ADD,
+        dim as u64,
+        layout_key(&Layout::contiguous(output_shape.to_vec())),
+        layout_key(source_layout),
+    ])
+}
+
+fn cat_key(source_layout: &Layout, output_shape: &[usize], dtype: DType, dim: usize) -> u64 {
+    key(&[
+        0xCA7,
+        dtype as u64,
+        dim as u64,
+        layout_key(source_layout),
+        key(&output_shape
+            .iter()
+            .map(|&value| value as u64)
+            .collect::<Vec<_>>()),
+    ])
+}
+
+fn scatter_set_key(
+    destination_layout: &Layout,
+    source_layout: &Layout,
+    dtype: DType,
+    dim: usize,
+) -> u64 {
+    key(&[
+        0x55E7,
+        dtype as u64,
+        dim as u64,
+        layout_key(destination_layout),
+        layout_key(source_layout),
+    ])
+}
+
+fn checked_product(values: &[usize]) -> Result<usize, String> {
+    values.iter().try_fold(1usize, |total, value| {
+        total
+            .checked_mul(*value)
+            .ok_or_else(|| "indexing element count overflow".to_string())
+    })
+}
+
+fn contiguous_requirement(shape: &[usize], dtype: DType) -> TensorRequirement {
+    TensorRequirement {
+        shape: shape.to_vec(),
+        dtype,
+    }
+}
+
+fn ids_requirement(layout: &Layout, dtype: DType) -> Option<TensorRequirement> {
+    if dtype == DType::U32 && layout.is_contiguous() {
+        None
+    } else {
+        Some(contiguous_requirement(layout.shape(), DType::U32))
+    }
+}
+
+fn validate_dim(layout: &Layout, dim: usize, name: &str) -> Result<(), String> {
+    if dim >= layout.rank() {
+        return Err(format!(
+            "{name}: dimension {dim} is out of range for rank {}",
+            layout.rank()
+        ));
+    }
+    Ok(())
+}
+
+fn validate_destination(
+    destination: &MetalTensor,
+    requirement: &TensorRequirement,
+    name: &str,
+) -> Result<(), String> {
+    if destination.layout.shape() != requirement.shape || destination.dtype != requirement.dtype {
+        return Err(format!(
+            "{name}: destination mismatch, expected {:?}:{:?}, got {:?}:{:?}",
+            requirement.shape,
+            requirement.dtype,
+            destination.layout.shape(),
+            destination.dtype
+        ));
+    }
+    if !destination.layout.is_contiguous() {
+        return Err(format!("{name}: destination must be contiguous"));
+    }
+    let offset = destination
+        .layout
+        .offset()
+        .checked_mul(destination.dtype.size_in_bytes())
+        .ok_or_else(|| format!("{name}: destination offset overflow"))?;
+    let required = requirement.bytes()?;
+    if offset
+        .checked_add(required)
+        .is_none_or(|end| end > destination.buffer.size)
+    {
+        return Err(format!(
+            "{name}: destination buffer has {} bytes, needs {required} bytes at offset {offset}",
+            destination.buffer.size
+        ));
+    }
+    Ok(())
+}
+
+fn validate_scratch(
+    scratch: Option<&MetalTensor>,
+    requirement: &Option<TensorRequirement>,
+    name: &str,
+) -> Result<(), String> {
+    match (scratch, requirement) {
+        (None, None) => Ok(()),
+        (Some(_), None) => Err(format!("{name}: unexpected scratch tensor")),
+        (None, Some(requirement)) => Err(format!(
+            "{name}: missing scratch tensor {:?}:{:?}",
+            requirement.shape, requirement.dtype
+        )),
+        (Some(scratch), Some(requirement)) => {
+            if scratch.layout.offset() != 0 {
+                return Err(format!("{name}: scratch must have zero layout offset"));
+            }
+            validate_destination(scratch, requirement, name)
+        }
+    }
+}
+
+fn offset_bytes(tensor: &MetalTensor) -> usize {
+    tensor.layout.offset() * tensor.dtype.size_in_bytes()
+}
+
+fn decompose(layout: &Layout, index: &str, variable: &str) -> String {
+    let contiguous = Layout::contiguous(layout.shape().to_vec());
+    let mut source = String::new();
+    for dimension in 0..layout.rank() {
+        if layout.shape()[dimension] == 1 || layout.strides()[dimension] == 0 {
+            continue;
+        }
+        let coordinate = if dimension + 1 == layout.rank() {
+            format!("({index} % {}ul)", layout.shape()[dimension])
+        } else {
+            format!(
+                "(({index} / {}ul) % {}ul)",
+                contiguous.strides()[dimension],
+                layout.shape()[dimension]
+            )
+        };
+        source.push_str(&format!(
+            "    {variable} += {coordinate} * {}ul;\n",
+            layout.strides()[dimension]
+        ));
+    }
+    source
+}
+
+fn convert_pipeline(
+    dev: &MetalDevice,
+    source_layout: &Layout,
+    source_dtype: DType,
+    destination_dtype: DType,
+) -> Result<Pipeline, String> {
+    let total = source_layout.numel();
+    let source_ty = msl_type(source_dtype);
+    let destination_ty = msl_type(destination_dtype);
+    let decomposition = decompose(source_layout, "i", "source_offset");
+    let make_source = || {
+        format!(
+            r#"
+#include <metal_stdlib>
+using namespace metal;
+kernel void et_index_convert(device const {source_ty}* source [[buffer(0)]], device {destination_ty}* destination [[buffer(1)]], uint gid [[thread_position_in_grid]]) {{
+    const ulong i = (ulong)gid;
+    if (i >= {total}ul) return;
+    ulong source_offset = 0ul;
+{decomposition}    destination[i] = ({destination_ty})source[source_offset];
+}}
+"#
+        )
+    };
+    dev.compile_lazy(
+        convert_key(source_layout, source_dtype, destination_dtype),
+        "et_index_convert",
+        make_source,
+    )
+}
+
+fn convert_into(
+    dev: &MetalDevice,
+    source: &MetalTensor,
+    destination: &MetalTensor,
+) -> Result<(), String> {
+    let requirement = contiguous_requirement(source.layout.shape(), destination.dtype);
+    validate_destination(destination, &requirement, "index conversion")?;
+    let total = source.numel();
+    if total == 0 {
+        return Ok(());
+    }
+    let pipeline = cached_pipeline(
+        dev,
+        convert_key(&source.layout, source.dtype, destination.dtype),
+        "index conversion",
+    )?;
+    dispatch(
+        dev,
+        &pipeline,
+        total,
+        &[
+            (0, &source.buffer, offset_bytes(source)),
+            (1, &destination.buffer, offset_bytes(destination)),
+        ],
+        &[],
+    );
+    Ok(())
+}
+
+fn dispatch(
+    dev: &MetalDevice,
+    pipeline: &Pipeline,
+    total: usize,
+    buffers: &[(usize, &super::device::Buffer, usize)],
+    scalars: &[(usize, u32)],
+) {
+    let padded = total.div_ceil(256) * 256;
+    dev.with_encoder(|encoder| {
+        encoder.setComputePipelineState(pipeline.as_raw());
+        for &(index, buffer, offset) in buffers {
+            set_buffer(encoder, index, buffer, offset);
+        }
+        for &(index, value) in scalars {
+            set_bytes(encoder, index, &value);
+        }
+        encoder.dispatchThreads_threadsPerThreadgroup(
+            MetalDevice::grid(padded, 1, 1),
+            MetalDevice::grid(256, 1, 1),
+        );
+    });
+}
+
+fn prepare_ids<'a>(
+    dev: &MetalDevice,
+    ids: &'a MetalTensor,
+    scratch: Option<&'a MetalTensor>,
+    requirement: &Option<TensorRequirement>,
+    name: &str,
+) -> Result<&'a MetalTensor, String> {
+    validate_scratch(scratch, requirement, name)?;
+    if let Some(scratch) = scratch {
+        convert_into(dev, ids, scratch)?;
+        Ok(scratch)
+    } else {
+        Ok(ids)
+    }
+}
+
 pub fn ids_from_host(dev: &MetalDevice, ids: &[u32]) -> MetalTensor {
     MetalTensor {
         buffer: dev.alloc_with_data_u32(ids),
-        layout: crate::runtime::layout::Layout::contiguous(vec![ids.len()]),
+        layout: Layout::contiguous(vec![ids.len()]),
         dtype: DType::U32,
     }
 }
 
-pub fn index_select(
-    dev: &MetalDevice,
-    x: &MetalTensor,
+pub fn index_select_requirements(
+    input_layout: &Layout,
+    input_dtype: DType,
     dim: usize,
-    ids: &MetalTensor,
-) -> Result<MetalTensor, String> {
-    assert_eq!(ids.dtype, DType::U32, "index_select: ids must be u32");
-    let shape = x.layout.shape();
-    let rank = shape.len();
-    let l = ids.numel();
-    let mut out_shape = shape.to_vec();
-    out_shape[dim] = l;
-    let total: usize = out_shape.iter().product();
-    let out = MetalTensor::empty(dev, out_shape.clone(), x.dtype);
-    if total == 0 {
-        return Ok(out);
+    ids_layout: &Layout,
+    ids_dtype: DType,
+) -> Result<IndexingRequirements, String> {
+    validate_dim(input_layout, dim, "index_select")?;
+    let mut shape = input_layout.shape().to_vec();
+    shape[dim] = ids_layout.numel();
+    let requirements = IndexingRequirements {
+        output: Some(contiguous_requirement(&shape, input_dtype)),
+        ids: ids_requirement(ids_layout, ids_dtype),
+        ..IndexingRequirements::default()
+    };
+    let pipelines = usize::from(checked_product(&shape)? != 0)
+        + usize::from(requirements.ids.is_some() && ids_layout.numel() != 0);
+    finalize_requirements(requirements, pipelines)
+}
+
+pub fn gather_requirements(
+    input_layout: &Layout,
+    input_dtype: DType,
+    dim: usize,
+    ids_layout: &Layout,
+    ids_dtype: DType,
+    ids_shape: &[usize],
+) -> Result<IndexingRequirements, String> {
+    validate_dim(input_layout, dim, "gather")?;
+    if ids_shape.len() != input_layout.rank() {
+        return Err(format!(
+            "gather: index rank {} does not match input rank {}",
+            ids_shape.len(),
+            input_layout.rank()
+        ));
     }
-    let ty = msl_type(x.dtype);
-    let offset = x.layout.offset();
-    let strides = x.layout.strides();
-    let mut decompose = String::new();
-    for d in (0..rank).rev() {
-        let c = out_shape[d];
-        let s = strides[d];
-        let coord = if d == rank - 1 {
-            format!("gid % {c}u")
-        } else {
-            let div: usize = out_shape[d + 1..].iter().product();
-            format!("(gid / {div}u) % {c}u")
-        };
-        if d == dim {
-            decompose.push_str(&format!("        base += ids[{coord}] * {s}u;\n"));
-        } else {
-            decompose.push_str(&format!("        base += ({coord}) * {s}u;\n"));
+    if checked_product(ids_shape)? != ids_layout.numel() {
+        return Err(format!(
+            "gather: index shape {ids_shape:?} has a different element count from {:?}",
+            ids_layout.shape()
+        ));
+    }
+    for dimension in 0..ids_shape.len() {
+        if dimension != dim && ids_shape[dimension] > input_layout.shape()[dimension] {
+            return Err(format!(
+                "gather: index extent {} exceeds input extent {} at dimension {dimension}",
+                ids_shape[dimension],
+                input_layout.shape()[dimension]
+            ));
         }
     }
-    let make_src = || {
+    let requirements = IndexingRequirements {
+        output: Some(contiguous_requirement(ids_shape, input_dtype)),
+        ids: ids_requirement(ids_layout, ids_dtype),
+        ..IndexingRequirements::default()
+    };
+    let pipelines = usize::from(checked_product(ids_shape)? != 0)
+        + usize::from(requirements.ids.is_some() && ids_layout.numel() != 0);
+    finalize_requirements(requirements, pipelines)
+}
+
+pub fn scatter_add_requirements(
+    input_layout: &Layout,
+    input_dtype: DType,
+    dim: usize,
+    ids_layout: &Layout,
+    ids_dtype: DType,
+    source_layout: &Layout,
+    source_dtype: DType,
+) -> Result<IndexingRequirements, String> {
+    validate_dim(input_layout, dim, "scatter_add")?;
+    if source_layout.rank() != input_layout.rank() {
+        return Err("scatter_add: source and input ranks must match".to_string());
+    }
+    if source_dtype != input_dtype {
+        return Err(format!(
+            "scatter_add: source dtype {source_dtype:?} does not match input dtype {input_dtype:?}"
+        ));
+    }
+    if ids_layout.numel() != source_layout.numel() {
+        return Err(format!(
+            "scatter_add: indexes have {} elements but source has {}",
+            ids_layout.numel(),
+            source_layout.numel()
+        ));
+    }
+    for dimension in 0..source_layout.rank() {
+        if dimension != dim && source_layout.shape()[dimension] > input_layout.shape()[dimension] {
+            return Err(format!(
+                "scatter_add: source extent exceeds input at dimension {dimension}"
+            ));
+        }
+    }
+    let needs_cast = input_dtype != DType::F32;
+    let requirements = IndexingRequirements {
+        output: Some(contiguous_requirement(input_layout.shape(), input_dtype)),
+        ids: ids_requirement(ids_layout, ids_dtype),
+        accumulator: needs_cast.then(|| contiguous_requirement(input_layout.shape(), DType::F32)),
+        source_cast: needs_cast.then(|| contiguous_requirement(source_layout.shape(), DType::F32)),
+        staging: None,
+        ..IndexingRequirements::default()
+    };
+    let conversions = usize::from(input_layout.numel() != 0)
+        + usize::from(needs_cast && input_layout.numel() != 0)
+        + usize::from(needs_cast && source_layout.numel() != 0);
+    let pipelines = conversions
+        + usize::from(source_layout.numel() != 0)
+        + usize::from(requirements.ids.is_some() && ids_layout.numel() != 0);
+    finalize_requirements(requirements, pipelines)
+}
+
+pub fn cat_requirements(
+    layouts: &[&Layout],
+    dtypes: &[DType],
+    dim: usize,
+) -> Result<IndexingRequirements, String> {
+    if layouts.is_empty() || layouts.len() != dtypes.len() {
+        return Err("cat: layouts and dtypes must be non-empty and have equal length".to_string());
+    }
+    validate_dim(layouts[0], dim, "cat")?;
+    let dtype = dtypes[0];
+    let mut shape = layouts[0].shape().to_vec();
+    let mut concatenated = 0usize;
+    for (layout, &candidate_dtype) in layouts.iter().zip(dtypes) {
+        if candidate_dtype != dtype || layout.rank() != shape.len() {
+            return Err("cat: all inputs must have the same dtype and rank".to_string());
+        }
+        for dimension in 0..shape.len() {
+            if dimension != dim && layout.shape()[dimension] != shape[dimension] {
+                return Err(format!("cat: shape mismatch at dimension {dimension}"));
+            }
+        }
+        concatenated = concatenated
+            .checked_add(layout.shape()[dim])
+            .ok_or_else(|| "cat: concatenated dimension overflow".to_string())?;
+    }
+    shape[dim] = concatenated;
+    let requirements = IndexingRequirements {
+        output: Some(contiguous_requirement(&shape, dtype)),
+        ..IndexingRequirements::default()
+    };
+    let pipelines = layouts
+        .iter()
+        .zip(dtypes)
+        .filter(|(layout, _)| layout.numel() != 0)
+        .map(|(layout, &dtype)| cat_key(layout, &shape, dtype, dim))
+        .collect::<std::collections::HashSet<_>>()
+        .len();
+    finalize_requirements(requirements, pipelines)
+}
+
+pub fn scatter_set_requirements(
+    destination_layout: &Layout,
+    destination_dtype: DType,
+    dim: usize,
+    ids_layout: &Layout,
+    ids_dtype: DType,
+    source_layout: &Layout,
+    source_dtype: DType,
+) -> Result<IndexingRequirements, String> {
+    validate_dim(destination_layout, dim, "scatter_set")?;
+    if source_layout.rank() != destination_layout.rank() || source_dtype != destination_dtype {
+        return Err("scatter_set: source rank and dtype must match destination".to_string());
+    }
+    if ids_layout.numel() != source_layout.shape()[dim] {
+        return Err(format!(
+            "scatter_set: expected {} indexes, got {}",
+            source_layout.shape()[dim],
+            ids_layout.numel()
+        ));
+    }
+    for dimension in 0..source_layout.rank() {
+        if dimension != dim
+            && source_layout.shape()[dimension] != destination_layout.shape()[dimension]
+        {
+            return Err(format!(
+                "scatter_set: source shape mismatch at dimension {dimension}"
+            ));
+        }
+    }
+    let requirements = IndexingRequirements {
+        ids: ids_requirement(ids_layout, ids_dtype),
+        ..IndexingRequirements::default()
+    };
+    let pipelines = usize::from(source_layout.numel() != 0)
+        + usize::from(requirements.ids.is_some() && ids_layout.numel() != 0);
+    finalize_requirements(requirements, pipelines)
+}
+
+pub fn scatter_set_staging_requirements(
+    destination_layout: &Layout,
+    destination_dtype: DType,
+    dim: usize,
+    ids_len: usize,
+    source_layout: &Layout,
+    source_dtype: DType,
+) -> Result<IndexingRequirements, String> {
+    let ids_layout = Layout::contiguous(vec![ids_len]);
+    let mut requirements = scatter_set_requirements(
+        destination_layout,
+        destination_dtype,
+        dim,
+        &ids_layout,
+        DType::U32,
+        source_layout,
+        source_dtype,
+    )?;
+    requirements.staging = Some(contiguous_requirement(&[ids_len], DType::U32));
+    requirements.staging_bytes = requirements.staging_bytes()?;
+    Ok(requirements)
+}
+
+fn index_select_pipeline(
+    dev: &MetalDevice,
+    input_layout: &Layout,
+    dtype: DType,
+    dim: usize,
+    ids_len: usize,
+) -> Result<Pipeline, String> {
+    let mut output_shape = input_layout.shape().to_vec();
+    output_shape[dim] = ids_len;
+    let total = checked_product(&output_shape)?;
+    let ty = msl_type(dtype);
+    let mut decomposition = String::new();
+    for dimension in (0..input_layout.rank()).rev() {
+        let count = output_shape[dimension];
+        let divisor = output_shape[dimension + 1..]
+            .iter()
+            .product::<usize>()
+            .max(1);
+        let coordinate = format!("((gid / {divisor}u) % {count}u)");
+        if dimension == dim {
+            decomposition.push_str(&format!(
+                "    source_offset += ids[{coordinate}] * {}ul;\n",
+                input_layout.strides()[dimension]
+            ));
+        } else {
+            decomposition.push_str(&format!(
+                "    source_offset += {coordinate} * {}ul;\n",
+                input_layout.strides()[dimension]
+            ));
+        }
+    }
+    let make_source = || {
         format!(
             r#"
 #include <metal_stdlib>
 using namespace metal;
-kernel void et_isel(
-    device const {ty}* x [[buffer(0)]],
-    device const uint* ids [[buffer(1)]],
-    device {ty}* out [[buffer(2)]],
-    uint gid [[thread_position_in_grid]]
-) {{
+kernel void et_isel(device const {ty}* input [[buffer(0)]], device const uint* ids [[buffer(1)]], device {ty}* output [[buffer(2)]], uint gid [[thread_position_in_grid]]) {{
     if (gid >= {total}u) return;
-    uint base = {offset}u;
-{decompose}    out[gid] = x[base];
+    ulong source_offset = 0ul;
+{decomposition}    output[gid] = input[source_offset];
 }}
 "#
         )
     };
-    let pipeline = dev.compile_lazy(
-        key(&[
-            0x15E1,
-            x.dtype as u64,
-            dim as u64,
-            l as u64,
-            key(&out_shape.iter().map(|&v| v as u64).collect::<Vec<_>>()),
-            key(&strides.iter().map(|&v| v as u64).collect::<Vec<_>>()),
-        ]),
+    dev.compile_lazy(
+        index_select_key(input_layout, dtype, dim, ids_len),
         "et_isel",
-        make_src,
-    )?;
-    let padded = total.div_ceil(256) * 256;
-    dev.with_encoder(|e| {
-        e.setComputePipelineState(pipeline.as_raw());
-        set_buffer(e, 0, &x.buffer, x.layout.offset() * x.dtype.size_in_bytes());
-        set_buffer(e, 1, &ids.buffer, ids.layout.offset() * 4);
-        set_buffer(e, 2, &out.buffer, 0);
-        e.dispatchThreads_threadsPerThreadgroup(
-            MetalDevice::grid(padded, 1, 1),
-            MetalDevice::grid(256, 1, 1),
+        make_source,
+    )
+}
+
+fn gather_pipeline(
+    dev: &MetalDevice,
+    input_layout: &Layout,
+    dtype: DType,
+    dim: usize,
+    ids_shape: &[usize],
+) -> Result<Pipeline, String> {
+    let total = checked_product(ids_shape)?;
+    let ty = msl_type(dtype);
+    let mut decomposition = String::new();
+    for dimension in (0..input_layout.rank()).rev() {
+        let count = ids_shape[dimension];
+        let divisor = ids_shape[dimension + 1..].iter().product::<usize>().max(1);
+        let coordinate = format!("((gid / {divisor}u) % {count}u)");
+        if dimension == dim {
+            decomposition.push_str(&format!(
+                "    source_offset += ids[gid] * {}ul;\n",
+                input_layout.strides()[dimension]
+            ));
+        } else {
+            decomposition.push_str(&format!(
+                "    source_offset += {coordinate} * {}ul;\n",
+                input_layout.strides()[dimension]
+            ));
+        }
+    }
+    let make_source = || {
+        format!(
+            r#"
+#include <metal_stdlib>
+using namespace metal;
+kernel void et_gather(device const {ty}* input [[buffer(0)]], device const uint* ids [[buffer(1)]], device {ty}* output [[buffer(2)]], uint gid [[thread_position_in_grid]]) {{
+    if (gid >= {total}u) return;
+    ulong source_offset = 0ul;
+{decomposition}    output[gid] = input[source_offset];
+}}
+"#
+        )
+    };
+    dev.compile_lazy(
+        gather_key(input_layout, dtype, dim, ids_shape),
+        "et_gather",
+        make_source,
+    )
+}
+
+fn scatter_add_pipeline(
+    dev: &MetalDevice,
+    output_shape: &[usize],
+    source_layout: &Layout,
+    dim: usize,
+) -> Result<Pipeline, String> {
+    let total = source_layout.numel();
+    let output_layout = Layout::contiguous(output_shape.to_vec());
+    let source_contiguous = Layout::contiguous(source_layout.shape().to_vec());
+    let mut output_decomposition = String::new();
+    let mut source_decomposition = String::new();
+    for dimension in (0..source_layout.rank()).rev() {
+        let count = source_layout.shape()[dimension];
+        let divisor = source_contiguous.strides()[dimension];
+        let coordinate = format!("((gid / {divisor}u) % {count}u)");
+        if dimension == dim {
+            output_decomposition.push_str(&format!(
+                "    output_offset += ids[gid] * {}ul;\n",
+                output_layout.strides()[dimension]
+            ));
+        } else {
+            output_decomposition.push_str(&format!(
+                "    output_offset += {coordinate} * {}ul;\n",
+                output_layout.strides()[dimension]
+            ));
+        }
+        source_decomposition.push_str(&format!(
+            "    source_offset += {coordinate} * {}ul;\n",
+            source_layout.strides()[dimension]
+        ));
+    }
+    let make_source = || {
+        format!(
+            r#"
+#include <metal_stdlib>
+using namespace metal;
+kernel void et_sadd(device float* output [[buffer(0)]], device const uint* ids [[buffer(1)]], device const float* source [[buffer(2)]], uint gid [[thread_position_in_grid]]) {{
+    if (gid >= {total}u) return;
+    ulong output_offset = 0ul;
+{output_decomposition}    ulong source_offset = 0ul;
+{source_decomposition}    atomic_fetch_add_explicit((device atomic_float*)&output[output_offset], source[source_offset], memory_order_relaxed);
+}}
+"#
+        )
+    };
+    dev.compile_lazy(
+        scatter_add_key(output_shape, source_layout, dim),
+        "et_sadd",
+        make_source,
+    )
+}
+
+fn cat_pipeline(
+    dev: &MetalDevice,
+    source_layout: &Layout,
+    output_shape: &[usize],
+    dtype: DType,
+    dim: usize,
+) -> Result<Pipeline, String> {
+    let total = source_layout.numel();
+    let ty = msl_type(dtype);
+    let inner = checked_product(&output_shape[dim + 1..])?;
+    let source_decomposition = decompose(source_layout, "gid", "source_offset");
+    let source_dim = source_layout.shape()[dim];
+    let output_dim = output_shape[dim];
+    let make_source = || {
+        format!(
+            r#"
+#include <metal_stdlib>
+using namespace metal;
+kernel void et_cat(device const {ty}* source [[buffer(0)]], device {ty}* output [[buffer(1)]], constant uint& dim_offset [[buffer(2)]], uint gid [[thread_position_in_grid]]) {{
+    if (gid >= {total}u) return;
+    ulong source_offset = 0ul;
+{source_decomposition}    const uint outer = gid / ({source_dim}u * {inner}u);
+    const uint remainder = gid % ({source_dim}u * {inner}u);
+    output[outer * {output_dim}u * {inner}u + dim_offset * {inner}u + remainder] = source[source_offset];
+}}
+"#
+        )
+    };
+    dev.compile_lazy(
+        cat_key(source_layout, output_shape, dtype, dim),
+        "et_cat",
+        make_source,
+    )
+}
+
+fn scatter_set_pipeline(
+    dev: &MetalDevice,
+    destination_layout: &Layout,
+    source_layout: &Layout,
+    dtype: DType,
+    dim: usize,
+) -> Result<Pipeline, String> {
+    let total = source_layout.numel();
+    let ty = msl_type(dtype);
+    let source_contiguous = Layout::contiguous(source_layout.shape().to_vec());
+    let mut destination_decomposition = String::new();
+    let mut source_decomposition = String::new();
+    for dimension in (0..source_layout.rank()).rev() {
+        let count = source_layout.shape()[dimension];
+        let divisor = source_contiguous.strides()[dimension];
+        let coordinate = format!("((gid / {divisor}u) % {count}u)");
+        if dimension == dim {
+            destination_decomposition.push_str(&format!(
+                "    destination_offset += ids[{coordinate}] * {}ul;\n",
+                destination_layout.strides()[dimension]
+            ));
+        } else {
+            destination_decomposition.push_str(&format!(
+                "    destination_offset += {coordinate} * {}ul;\n",
+                destination_layout.strides()[dimension]
+            ));
+        }
+        source_decomposition.push_str(&format!(
+            "    source_offset += {coordinate} * {}ul;\n",
+            source_layout.strides()[dimension]
+        ));
+    }
+    let make_source = || {
+        format!(
+            r#"
+#include <metal_stdlib>
+using namespace metal;
+kernel void et_sset(device {ty}* destination [[buffer(0)]], device const uint* ids [[buffer(1)]], device const {ty}* source [[buffer(2)]], uint gid [[thread_position_in_grid]]) {{
+    if (gid >= {total}u) return;
+    ulong destination_offset = 0ul;
+{destination_decomposition}    ulong source_offset = 0ul;
+{source_decomposition}    destination[destination_offset] = source[source_offset];
+}}
+"#
+        )
+    };
+    dev.compile_lazy(
+        scatter_set_key(destination_layout, source_layout, dtype, dim),
+        "et_sset",
+        make_source,
+    )
+}
+
+pub fn index_select_into(
+    dev: &MetalDevice,
+    input: &MetalTensor,
+    dim: usize,
+    ids: &MetalTensor,
+    destination: &MetalTensor,
+    ids_scratch: Option<&MetalTensor>,
+) -> Result<(), String> {
+    let requirements =
+        index_select_requirements(&input.layout, input.dtype, dim, &ids.layout, ids.dtype)?;
+    let output = requirements.output.as_ref().expect("index_select output");
+    validate_destination(destination, output, "index_select")?;
+    let ids = prepare_ids(dev, ids, ids_scratch, &requirements.ids, "index_select ids")?;
+    let total = destination.numel();
+    if total != 0 {
+        let pipeline = cached_pipeline(
+            dev,
+            index_select_key(&input.layout, input.dtype, dim, ids.numel()),
+            "index_select",
+        )?;
+        dispatch(
+            dev,
+            &pipeline,
+            total,
+            &[
+                (0, &input.buffer, offset_bytes(input)),
+                (1, &ids.buffer, offset_bytes(ids)),
+                (2, &destination.buffer, offset_bytes(destination)),
+            ],
+            &[],
         );
-    });
-    Ok(out)
+    }
+    Ok(())
+}
+
+pub fn gather_into(
+    dev: &MetalDevice,
+    input: &MetalTensor,
+    dim: usize,
+    ids: &MetalTensor,
+    ids_shape: &[usize],
+    destination: &MetalTensor,
+    ids_scratch: Option<&MetalTensor>,
+) -> Result<(), String> {
+    let requirements = gather_requirements(
+        &input.layout,
+        input.dtype,
+        dim,
+        &ids.layout,
+        ids.dtype,
+        ids_shape,
+    )?;
+    let output = requirements.output.as_ref().expect("gather output");
+    validate_destination(destination, output, "gather")?;
+    let ids = prepare_ids(dev, ids, ids_scratch, &requirements.ids, "gather ids")?;
+    let total = destination.numel();
+    if total != 0 {
+        let pipeline = cached_pipeline(
+            dev,
+            gather_key(&input.layout, input.dtype, dim, ids_shape),
+            "gather",
+        )?;
+        dispatch(
+            dev,
+            &pipeline,
+            total,
+            &[
+                (0, &input.buffer, offset_bytes(input)),
+                (1, &ids.buffer, offset_bytes(ids)),
+                (2, &destination.buffer, offset_bytes(destination)),
+            ],
+            &[],
+        );
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn scatter_add_into(
+    dev: &MetalDevice,
+    input: &MetalTensor,
+    dim: usize,
+    ids: &MetalTensor,
+    source: &MetalTensor,
+    destination: &MetalTensor,
+    ids_scratch: Option<&MetalTensor>,
+    accumulator: Option<&MetalTensor>,
+    source_cast: Option<&MetalTensor>,
+) -> Result<(), String> {
+    let requirements = scatter_add_requirements(
+        &input.layout,
+        input.dtype,
+        dim,
+        &ids.layout,
+        ids.dtype,
+        &source.layout,
+        source.dtype,
+    )?;
+    let output = requirements.output.as_ref().expect("scatter_add output");
+    validate_destination(destination, output, "scatter_add")?;
+    validate_scratch(
+        accumulator,
+        &requirements.accumulator,
+        "scatter_add accumulator",
+    )?;
+    validate_scratch(
+        source_cast,
+        &requirements.source_cast,
+        "scatter_add source cast",
+    )?;
+    let ids = prepare_ids(dev, ids, ids_scratch, &requirements.ids, "scatter_add ids")?;
+    let (accumulator, source) = if input.dtype == DType::F32 {
+        convert_into(dev, input, destination)?;
+        (destination, source)
+    } else {
+        let accumulator = accumulator.expect("validated scatter_add accumulator");
+        let source_cast = source_cast.expect("validated scatter_add source cast");
+        convert_into(dev, input, accumulator)?;
+        convert_into(dev, source, source_cast)?;
+        (accumulator, source_cast)
+    };
+    if source.numel() != 0 {
+        let pipeline = cached_pipeline(
+            dev,
+            scatter_add_key(input.layout.shape(), &source.layout, dim),
+            "scatter_add",
+        )?;
+        dispatch(
+            dev,
+            &pipeline,
+            source.numel(),
+            &[
+                (0, &accumulator.buffer, offset_bytes(accumulator)),
+                (1, &ids.buffer, offset_bytes(ids)),
+                (2, &source.buffer, offset_bytes(source)),
+            ],
+            &[],
+        );
+    }
+    if input.dtype != DType::F32 {
+        convert_into(dev, accumulator, destination)?;
+    }
+    Ok(())
+}
+
+pub fn cat_into(
+    dev: &MetalDevice,
+    tensors: &[&MetalTensor],
+    dim: usize,
+    destination: &MetalTensor,
+) -> Result<(), String> {
+    let layouts = tensors
+        .iter()
+        .map(|tensor| &tensor.layout)
+        .collect::<Vec<_>>();
+    let dtypes = tensors
+        .iter()
+        .map(|tensor| tensor.dtype)
+        .collect::<Vec<_>>();
+    let requirements = cat_requirements(&layouts, &dtypes, dim)?;
+    let output = requirements.output.as_ref().expect("cat output");
+    validate_destination(destination, output, "cat")?;
+    let mut dim_offset = 0usize;
+    for tensor in tensors {
+        let total = tensor.numel();
+        if total != 0 {
+            let pipeline = cached_pipeline(
+                dev,
+                cat_key(&tensor.layout, &output.shape, tensor.dtype, dim),
+                "cat",
+            )?;
+            dispatch(
+                dev,
+                &pipeline,
+                total,
+                &[
+                    (0, &tensor.buffer, offset_bytes(tensor)),
+                    (1, &destination.buffer, offset_bytes(destination)),
+                ],
+                &[(2, dim_offset as u32)],
+            );
+        }
+        dim_offset += tensor.layout.shape()[dim];
+    }
+    Ok(())
+}
+
+pub fn scatter_set_into(
+    dev: &MetalDevice,
+    destination: &MetalTensor,
+    dim: usize,
+    ids: &MetalTensor,
+    source: &MetalTensor,
+    ids_scratch: Option<&MetalTensor>,
+) -> Result<(), String> {
+    let requirements = scatter_set_requirements(
+        &destination.layout,
+        destination.dtype,
+        dim,
+        &ids.layout,
+        ids.dtype,
+        &source.layout,
+        source.dtype,
+    )?;
+    let ids = prepare_ids(dev, ids, ids_scratch, &requirements.ids, "scatter_set ids")?;
+    if source.numel() != 0 {
+        let pipeline = cached_pipeline(
+            dev,
+            scatter_set_key(&destination.layout, &source.layout, destination.dtype, dim),
+            "scatter_set",
+        )?;
+        dispatch(
+            dev,
+            &pipeline,
+            source.numel(),
+            &[
+                (0, &destination.buffer, offset_bytes(destination)),
+                (1, &ids.buffer, offset_bytes(ids)),
+                (2, &source.buffer, offset_bytes(source)),
+            ],
+            &[],
+        );
+    }
+    Ok(())
+}
+
+fn allocate_requirement(dev: &MetalDevice, requirement: &TensorRequirement) -> MetalTensor {
+    MetalTensor::empty(dev, requirement.shape.clone(), requirement.dtype)
+}
+
+pub fn index_select(
+    dev: &MetalDevice,
+    input: &MetalTensor,
+    dim: usize,
+    ids: &MetalTensor,
+) -> Result<MetalTensor, String> {
+    let requirements =
+        index_select_requirements(&input.layout, input.dtype, dim, &ids.layout, ids.dtype)?;
+    compile_index_select_layout_exact(
+        dev,
+        &input.layout,
+        input.dtype,
+        dim,
+        &ids.layout,
+        ids.dtype,
+    )?;
+    let output = allocate_requirement(
+        dev,
+        requirements.output.as_ref().expect("index_select output"),
+    );
+    let ids_scratch = requirements
+        .ids
+        .as_ref()
+        .map(|requirement| allocate_requirement(dev, requirement));
+    index_select_into(dev, input, dim, ids, &output, ids_scratch.as_ref())?;
+    Ok(output)
 }
 
 pub fn gather(
     dev: &MetalDevice,
-    x: &MetalTensor,
+    input: &MetalTensor,
     dim: usize,
     ids: &MetalTensor,
     ids_shape: &[usize],
 ) -> Result<MetalTensor, String> {
-    assert_eq!(ids.dtype, DType::U32, "gather: ids must be u32");
-    let shape = x.layout.shape();
-    let rank = shape.len();
-    assert_eq!(ids_shape.len(), rank, "gather: rank mismatch");
-    let total: usize = ids_shape.iter().product();
-    let out = MetalTensor::empty(dev, ids_shape.to_vec(), x.dtype);
-    if total == 0 {
-        return Ok(out);
-    }
-    let ty = msl_type(x.dtype);
-    let strides = x.layout.strides();
-    let mut decompose = String::new();
-    for d in (0..rank).rev() {
-        let c = ids_shape[d];
-        let div: usize = ids_shape[d + 1..].iter().product::<usize>().max(1);
-        let coord = format!("((gid / {div}u) % {c}u)");
-        if d == dim {
-            decompose.push_str(&format!("        base += ids[gid] * {}u;\n", strides[d]));
-        } else {
-            let s = strides[d];
-            if s == 1 {
-                decompose.push_str(&format!("        base += {coord};\n"));
-            } else {
-                decompose.push_str(&format!("        base += {coord} * {s}u;\n"));
-            }
-        }
-    }
-    let make_src = || {
-        format!(
-            r#"
-#include <metal_stdlib>
-using namespace metal;
-kernel void et_gather(
-    device const {ty}* x [[buffer(0)]],
-    device const uint* ids [[buffer(1)]],
-    device {ty}* out [[buffer(2)]],
-    uint gid [[thread_position_in_grid]]
-) {{
-    if (gid >= {total}u) return;
-    uint base = 0u;
-{decompose}    out[gid] = x[base];
-}}
-"#
-        )
-    };
-    let pipeline = dev.compile_lazy(
-        key(&[
-            0x6A7E,
-            x.dtype as u64,
-            dim as u64,
-            key(&ids_shape.iter().map(|&v| v as u64).collect::<Vec<_>>()),
-            key(&strides.iter().map(|&v| v as u64).collect::<Vec<_>>()),
-        ]),
-        "et_gather",
-        make_src,
+    let requirements = gather_requirements(
+        &input.layout,
+        input.dtype,
+        dim,
+        &ids.layout,
+        ids.dtype,
+        ids_shape,
     )?;
-    let padded = total.div_ceil(256) * 256;
-    dev.with_encoder(|e| {
-        e.setComputePipelineState(pipeline.as_raw());
-        set_buffer(e, 0, &x.buffer, x.layout.offset() * x.dtype.size_in_bytes());
-        set_buffer(e, 1, &ids.buffer, ids.layout.offset() * 4);
-        set_buffer(e, 2, &out.buffer, 0);
-        e.dispatchThreads_threadsPerThreadgroup(
-            MetalDevice::grid(padded, 1, 1),
-            MetalDevice::grid(256, 1, 1),
-        );
-    });
-    Ok(out)
+    compile_gather_layout(
+        dev,
+        &input.layout,
+        input.dtype,
+        dim,
+        &ids.layout,
+        ids.dtype,
+        ids_shape,
+    )?;
+    let output = allocate_requirement(dev, requirements.output.as_ref().expect("gather output"));
+    let ids_scratch = requirements
+        .ids
+        .as_ref()
+        .map(|requirement| allocate_requirement(dev, requirement));
+    gather_into(
+        dev,
+        input,
+        dim,
+        ids,
+        ids_shape,
+        &output,
+        ids_scratch.as_ref(),
+    )?;
+    Ok(output)
 }
 
 pub fn scatter_add(
     dev: &MetalDevice,
-    x: &MetalTensor,
+    input: &MetalTensor,
     dim: usize,
     ids: &MetalTensor,
-    src_t: &MetalTensor,
+    source: &MetalTensor,
 ) -> Result<MetalTensor, String> {
-    assert_eq!(ids.dtype, DType::U32, "scatter_add: ids must be u32");
-    if x.dtype != DType::F32 {
-        // No bf16 atomics in MSL: accumulate in f32 (the more precise
-        // order anyway), then cast back to the caller's dtype.
-        let x32 = super::kernels::cast(dev, x, DType::F32)?;
-        let src32 = super::kernels::cast(dev, src_t, DType::F32)?;
-        let out32 = scatter_add(dev, &x32, dim, ids, &src32)?;
-        return super::kernels::cast(dev, &out32, x.dtype);
-    }
-    let out = super::kernels::strided_copy(dev, x)?;
-    let shape = x.layout.shape();
-    let rank = shape.len();
-    let ids_shape = src_t.layout.shape().to_vec();
-    let total: usize = ids_shape.iter().product();
-    if total == 0 {
-        return Ok(out);
-    }
-    let out_strides = crate::runtime::layout::Layout::contiguous(shape.to_vec());
-    let os = out_strides.strides().to_vec();
-    let src_strides = src_t.layout.strides().to_vec();
-    let mut decompose = String::new();
-    let mut src_decompose = String::new();
-    for d in (0..rank).rev() {
-        let c = ids_shape[d];
-        let div: usize = ids_shape[d + 1..].iter().product::<usize>().max(1);
-        let coord = format!("((gid / {div}u) % {c}u)");
-        if d == dim {
-            decompose.push_str(&format!("        base += ids[gid] * {}u;\n", os[d]));
-        } else {
-            decompose.push_str(&format!("        base += {coord} * {}u;\n", os[d]));
-        }
-        let ss = src_strides[d];
-        if ss == 1 {
-            src_decompose.push_str(&format!("        src_off += {coord};\n"));
-        } else {
-            src_decompose.push_str(&format!("        src_off += {coord} * {ss}u;\n"));
-        }
-    }
-    let make_src = || {
-        format!(
-            r#"
-#include <metal_stdlib>
-using namespace metal;
-kernel void et_sadd(
-    device float* out [[buffer(0)]],
-    device const uint* ids [[buffer(1)]],
-    device const float* src [[buffer(2)]],
-    uint gid [[thread_position_in_grid]]
-) {{
-    if (gid >= {total}u) return;
-    uint base = 0u;
-{decompose}    uint src_off = 0u;
-{src_decompose}    atomic_fetch_add_explicit((device atomic_float*)&out[base], src[src_off], memory_order_relaxed);
-}}
-"#
-        )
-    };
-    let pipeline = dev.compile_lazy(
-        key(&[
-            0x5ADD,
-            x.dtype as u64,
-            dim as u64,
-            key(&ids_shape.iter().map(|&v| v as u64).collect::<Vec<_>>()),
-            key(&os.iter().map(|&v| v as u64).collect::<Vec<_>>()),
-            key(&src_strides.iter().map(|&v| v as u64).collect::<Vec<_>>()),
-        ]),
-        "et_sadd",
-        make_src,
+    let requirements = scatter_add_requirements(
+        &input.layout,
+        input.dtype,
+        dim,
+        &ids.layout,
+        ids.dtype,
+        &source.layout,
+        source.dtype,
     )?;
-    let padded = total.div_ceil(256) * 256;
-    dev.with_encoder(|e| {
-        e.setComputePipelineState(pipeline.as_raw());
-        set_buffer(e, 0, &out.buffer, 0);
-        set_buffer(e, 1, &ids.buffer, ids.layout.offset() * 4);
-        set_buffer(
-            e,
-            2,
-            &src_t.buffer,
-            src_t.layout.offset() * src_t.dtype.size_in_bytes(),
-        );
-        e.dispatchThreads_threadsPerThreadgroup(
-            MetalDevice::grid(padded, 1, 1),
-            MetalDevice::grid(256, 1, 1),
-        );
-    });
-    Ok(out)
+    compile_scatter_add_layouts(
+        dev,
+        &input.layout,
+        input.dtype,
+        dim,
+        &ids.layout,
+        ids.dtype,
+        &source.layout,
+        source.dtype,
+    )?;
+    let output = allocate_requirement(
+        dev,
+        requirements.output.as_ref().expect("scatter_add output"),
+    );
+    let ids_scratch = requirements
+        .ids
+        .as_ref()
+        .map(|requirement| allocate_requirement(dev, requirement));
+    let accumulator = requirements
+        .accumulator
+        .as_ref()
+        .map(|requirement| allocate_requirement(dev, requirement));
+    let source_cast = requirements
+        .source_cast
+        .as_ref()
+        .map(|requirement| allocate_requirement(dev, requirement));
+    scatter_add_into(
+        dev,
+        input,
+        dim,
+        ids,
+        source,
+        &output,
+        ids_scratch.as_ref(),
+        accumulator.as_ref(),
+        source_cast.as_ref(),
+    )?;
+    Ok(output)
 }
 
 pub fn cat(dev: &MetalDevice, tensors: &[&MetalTensor], dim: usize) -> Result<MetalTensor, String> {
-    assert!(!tensors.is_empty());
-    let dtype = tensors[0].dtype;
-    let rank = tensors[0].layout.shape().len();
-    let mut out_shape = tensors[0].layout.shape().to_vec();
-    for t in tensors {
-        assert_eq!(t.dtype, dtype, "mixed dtypes");
-        assert_eq!(t.layout.shape().len(), rank, "cat rank mismatch");
-        for d in 0..rank {
-            if d != dim {
-                assert_eq!(t.layout.shape()[d], out_shape[d], "cat shape mismatch");
-            }
-        }
-    }
-    out_shape[dim] = tensors.iter().map(|t| t.layout.shape()[dim]).sum();
-    let out = MetalTensor::empty(dev, out_shape.clone(), dtype);
-    let ty = msl_type(dtype);
-    let esz = dtype.size_in_bytes();
-    let inner: usize = out_shape[dim + 1..].iter().product();
-    let outer: usize = out_shape[..dim].iter().product();
-    let make_src = || {
-        format!(
-            r#"
-#include <metal_stdlib>
-using namespace metal;
-kernel void et_cat(
-    device const {ty}* src [[buffer(0)]],
-    device {ty}* out [[buffer(1)]],
-    constant uint& tdim [[buffer(2)]],
-    constant uint& dim_off [[buffer(3)]],
-    uint gid [[thread_position_in_grid]]
-) {{
-    const uint inner = {inner}u;
-    const uint seg_n = tdim * inner * {outer}u;
-    if (gid >= seg_n) return;
-    const uint o = gid / (tdim * inner);
-    const uint r = gid % (tdim * inner);
-    out[o * {outdim}u * inner + dim_off * inner + r] = src[gid];
-}}
-"#,
-            outdim = out_shape[dim]
-        )
-    };
-    let pipeline = dev.compile_lazy(
-        key(&[
-            0xCA7,
-            dtype as u64,
-            dim as u64,
-            inner as u64,
-            outer as u64,
-            out_shape[dim] as u64,
-        ]),
-        "et_cat",
-        make_src,
-    )?;
-    let mut dim_off = 0usize;
-    for t in tensors {
-        let tc = super::kernels::strided_copy(dev, t)?;
-        let tdim = t.layout.shape()[dim];
-        let n = outer * tdim * inner;
-        if n > 0 {
-            let (tdu, dou) = (tdim as u32, dim_off as u32);
-            let padded = n.div_ceil(256) * 256;
-            dev.with_encoder(|e| {
-                e.setComputePipelineState(pipeline.as_raw());
-                set_buffer(e, 0, &tc.buffer, tc.layout.offset() * esz);
-                set_buffer(e, 1, &out.buffer, 0);
-                set_bytes(e, 2, &tdu);
-                set_bytes(e, 3, &dou);
-                e.dispatchThreads_threadsPerThreadgroup(
-                    MetalDevice::grid(padded, 1, 1),
-                    MetalDevice::grid(256, 1, 1),
-                );
-            });
-        }
-        dim_off += tdim;
-    }
-    Ok(out)
+    let layouts = tensors
+        .iter()
+        .map(|tensor| &tensor.layout)
+        .collect::<Vec<_>>();
+    let dtypes = tensors
+        .iter()
+        .map(|tensor| tensor.dtype)
+        .collect::<Vec<_>>();
+    let requirements = cat_requirements(&layouts, &dtypes, dim)?;
+    compile_cat_layouts(dev, &layouts, &dtypes, dim)?;
+    let output = allocate_requirement(dev, requirements.output.as_ref().expect("cat output"));
+    cat_into(dev, tensors, dim, &output)?;
+    Ok(output)
 }
 
 pub fn scatter_set(
     dev: &MetalDevice,
-    x: &MetalTensor,
+    destination: &MetalTensor,
     dim: usize,
     ids: &[u32],
-    src_t: &MetalTensor,
+    source: &MetalTensor,
 ) -> Result<(), String> {
-    let shape = x.layout.shape();
-    let rank = shape.len();
-    let ids_shape = src_t.layout.shape().to_vec();
-    let total: usize = ids_shape.iter().product();
-    if total == 0 {
+    let requirements = scatter_set_staging_requirements(
+        &destination.layout,
+        destination.dtype,
+        dim,
+        ids.len(),
+        &source.layout,
+        source.dtype,
+    )?;
+    let staging = requirements.staging.as_ref().expect("scatter_set staging");
+    debug_assert_eq!(staging.bytes()?, ids.len() * std::mem::size_of::<u32>());
+    compile_scatter_set_layouts(
+        dev,
+        &destination.layout,
+        destination.dtype,
+        dim,
+        &Layout::contiguous(vec![ids.len()]),
+        DType::U32,
+        &source.layout,
+        source.dtype,
+    )?;
+    let ids = ids_from_host(dev, ids);
+    scatter_set_into(dev, destination, dim, &ids, source, None)
+}
+
+pub fn compile_index_select_layout_exact(
+    dev: &MetalDevice,
+    input_layout: &Layout,
+    input_dtype: DType,
+    dim: usize,
+    ids_layout: &Layout,
+    ids_dtype: DType,
+) -> Result<(), String> {
+    let requirements =
+        index_select_requirements(input_layout, input_dtype, dim, ids_layout, ids_dtype)?;
+    if let Some(ids) = &requirements.ids {
+        if ids_layout.numel() != 0 {
+            convert_pipeline(dev, ids_layout, ids_dtype, ids.dtype)?;
+        }
+    }
+    if requirements
+        .output
+        .as_ref()
+        .expect("index_select output")
+        .bytes()?
+        != 0
+    {
+        index_select_pipeline(dev, input_layout, input_dtype, dim, ids_layout.numel())?;
+    }
+    Ok(())
+}
+
+pub fn warm_index_select(
+    shape: &[usize],
+    dtype: DType,
+    dim: usize,
+    ids_len: usize,
+) -> Result<(), String> {
+    warm_index_select_layout_exact(
+        &Layout::contiguous(shape.to_vec()),
+        dtype,
+        dim,
+        &Layout::contiguous(vec![ids_len]),
+        DType::U32,
+    )
+}
+
+pub fn warm_index_select_layout(
+    input_layout: &Layout,
+    input_dtype: DType,
+    dim: usize,
+    ids_len: usize,
+) -> Result<(), String> {
+    warm_index_select_layout_exact(
+        input_layout,
+        input_dtype,
+        dim,
+        &Layout::contiguous(vec![ids_len]),
+        DType::U32,
+    )
+}
+
+pub fn compile_gather_layout(
+    dev: &MetalDevice,
+    input_layout: &Layout,
+    input_dtype: DType,
+    dim: usize,
+    ids_layout: &Layout,
+    ids_dtype: DType,
+    ids_shape: &[usize],
+) -> Result<(), String> {
+    let requirements = gather_requirements(
+        input_layout,
+        input_dtype,
+        dim,
+        ids_layout,
+        ids_dtype,
+        ids_shape,
+    )?;
+    if let Some(ids) = &requirements.ids {
+        if ids_layout.numel() != 0 {
+            convert_pipeline(dev, ids_layout, ids_dtype, ids.dtype)?;
+        }
+    }
+    if requirements
+        .output
+        .as_ref()
+        .expect("gather output")
+        .bytes()?
+        != 0
+    {
+        gather_pipeline(dev, input_layout, input_dtype, dim, ids_shape)?;
+    }
+    Ok(())
+}
+
+pub fn warm_gather(
+    shape: &[usize],
+    dtype: DType,
+    dim: usize,
+    ids_shape: &[usize],
+) -> Result<(), String> {
+    warm_gather_layout(
+        &Layout::contiguous(shape.to_vec()),
+        dtype,
+        dim,
+        &Layout::contiguous(ids_shape.to_vec()),
+        DType::U32,
+        ids_shape,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn compile_scatter_add_layouts(
+    dev: &MetalDevice,
+    input_layout: &Layout,
+    input_dtype: DType,
+    dim: usize,
+    ids_layout: &Layout,
+    ids_dtype: DType,
+    source_layout: &Layout,
+    source_dtype: DType,
+) -> Result<(), String> {
+    let requirements = scatter_add_requirements(
+        input_layout,
+        input_dtype,
+        dim,
+        ids_layout,
+        ids_dtype,
+        source_layout,
+        source_dtype,
+    )?;
+    if let Some(ids) = &requirements.ids {
+        if ids_layout.numel() != 0 {
+            convert_pipeline(dev, ids_layout, ids_dtype, ids.dtype)?;
+        }
+    }
+    if input_layout.numel() != 0 {
+        convert_pipeline(dev, input_layout, input_dtype, DType::F32)?;
+    }
+    let effective_source = if source_dtype == DType::F32 {
+        source_layout.clone()
+    } else {
+        if source_layout.numel() != 0 {
+            convert_pipeline(dev, source_layout, source_dtype, DType::F32)?;
+        }
+        Layout::contiguous(source_layout.shape().to_vec())
+    };
+    if source_layout.numel() != 0 {
+        scatter_add_pipeline(dev, input_layout.shape(), &effective_source, dim)?;
+    }
+    if input_dtype != DType::F32 && input_layout.numel() != 0 {
+        convert_pipeline(
+            dev,
+            &Layout::contiguous(input_layout.shape().to_vec()),
+            DType::F32,
+            input_dtype,
+        )?;
+    }
+    Ok(())
+}
+
+pub fn warm_scatter_add(
+    shape: &[usize],
+    dtype: DType,
+    dim: usize,
+    ids_shape: &[usize],
+) -> Result<(), String> {
+    warm_scatter_add_layouts(
+        &Layout::contiguous(shape.to_vec()),
+        dtype,
+        dim,
+        &Layout::contiguous(ids_shape.to_vec()),
+        DType::U32,
+        &Layout::contiguous(ids_shape.to_vec()),
+        dtype,
+    )
+}
+
+pub fn compile_cat_layouts(
+    dev: &MetalDevice,
+    layouts: &[&Layout],
+    dtypes: &[DType],
+    dim: usize,
+) -> Result<(), String> {
+    let requirements = cat_requirements(layouts, dtypes, dim)?;
+    let output = requirements.output.as_ref().expect("cat output");
+    for (layout, &dtype) in layouts.iter().zip(dtypes) {
+        if layout.numel() != 0 {
+            cat_pipeline(dev, layout, &output.shape, dtype, dim)?;
+        }
+    }
+    Ok(())
+}
+
+pub fn warm_cat(shapes: &[&[usize]], dtype: DType, dim: usize) -> Result<(), String> {
+    if shapes.is_empty() {
         return Ok(());
     }
-    let ty = msl_type(x.dtype);
-    let out_strides = crate::runtime::layout::Layout::contiguous(shape.to_vec());
-    let os = out_strides.strides().to_vec();
-    let src_strides = src_t.layout.strides().to_vec();
-    let mut decompose = String::new();
-    let mut src_decompose = String::new();
-    for d in (0..rank).rev() {
-        let c = ids_shape[d];
-        let div: usize = ids_shape[d + 1..].iter().product::<usize>().max(1);
-        let coord = format!("((gid / {div}u) % {c}u)");
-        if d == dim {
-            decompose.push_str(&format!("        base += ids[gid] * {}u;\n", os[d]));
-        } else {
-            decompose.push_str(&format!("        base += {coord} * {}u;\n", os[d]));
-        }
-        let ss = src_strides[d];
-        if ss == 1 {
-            src_decompose.push_str(&format!("        src_off += {coord};\n"));
-        } else {
-            src_decompose.push_str(&format!("        src_off += {coord} * {ss}u;\n"));
+    let layouts = shapes
+        .iter()
+        .map(|shape| Layout::contiguous(shape.to_vec()))
+        .collect::<Vec<_>>();
+    let references = layouts.iter().collect::<Vec<_>>();
+    warm_cat_layouts(&references, &vec![dtype; shapes.len()], dim)
+}
+
+pub fn compile_scatter_set_layouts(
+    dev: &MetalDevice,
+    destination_layout: &Layout,
+    destination_dtype: DType,
+    dim: usize,
+    ids_layout: &Layout,
+    ids_dtype: DType,
+    source_layout: &Layout,
+    source_dtype: DType,
+) -> Result<(), String> {
+    let requirements = scatter_set_requirements(
+        destination_layout,
+        destination_dtype,
+        dim,
+        ids_layout,
+        ids_dtype,
+        source_layout,
+        source_dtype,
+    )?;
+    if let Some(ids) = &requirements.ids {
+        if ids_layout.numel() != 0 {
+            convert_pipeline(dev, ids_layout, ids_dtype, ids.dtype)?;
         }
     }
-    let make_src = || {
-        format!(
-            r#"
-#include <metal_stdlib>
-using namespace metal;
-kernel void et_sset(
-    device {ty}* out [[buffer(0)]],
-    device const uint* ids [[buffer(1)]],
-    device const {ty}* src [[buffer(2)]],
-    uint gid [[thread_position_in_grid]]
-) {{
-    if (gid >= {total}u) return;
-    uint base = 0u;
-{decompose}    uint src_off = 0u;
-{src_decompose}    out[base] = src[src_off];
-}}
-"#
-        )
-    };
-    let pipeline = dev.compile_lazy(
-        key(&[
-            0x55E7,
-            x.dtype as u64,
-            dim as u64,
-            key(&ids_shape.iter().map(|&v| v as u64).collect::<Vec<_>>()),
-            key(&os.iter().map(|&v| v as u64).collect::<Vec<_>>()),
-            key(&src_strides.iter().map(|&v| v as u64).collect::<Vec<_>>()),
-        ]),
-        "et_sset",
-        make_src,
-    )?;
-    let ids_buf = dev.alloc_with_data_u32(ids);
-    let padded = total.div_ceil(256) * 256;
-    dev.with_encoder(|e| {
-        e.setComputePipelineState(pipeline.as_raw());
-        set_buffer(e, 0, &x.buffer, x.layout.offset() * x.dtype.size_in_bytes());
-        set_buffer(e, 1, &ids_buf, 0);
-        set_buffer(
-            e,
-            2,
-            &src_t.buffer,
-            src_t.layout.offset() * src_t.dtype.size_in_bytes(),
-        );
-        e.dispatchThreads_threadsPerThreadgroup(
-            MetalDevice::grid(padded, 1, 1),
-            MetalDevice::grid(256, 1, 1),
-        );
-    });
+    if source_layout.numel() != 0 {
+        scatter_set_pipeline(
+            dev,
+            destination_layout,
+            source_layout,
+            destination_dtype,
+            dim,
+        )?;
+    }
     Ok(())
+}
+
+pub fn warm_index_select_layout_exact(
+    input_layout: &Layout,
+    input_dtype: DType,
+    dim: usize,
+    ids_layout: &Layout,
+    ids_dtype: DType,
+) -> Result<(), String> {
+    compile_index_select_layout_exact(
+        MetalDevice::get(),
+        input_layout,
+        input_dtype,
+        dim,
+        ids_layout,
+        ids_dtype,
+    )
+}
+
+pub fn warm_gather_layout(
+    input_layout: &Layout,
+    input_dtype: DType,
+    dim: usize,
+    ids_layout: &Layout,
+    ids_dtype: DType,
+    ids_shape: &[usize],
+) -> Result<(), String> {
+    compile_gather_layout(
+        MetalDevice::get(),
+        input_layout,
+        input_dtype,
+        dim,
+        ids_layout,
+        ids_dtype,
+        ids_shape,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn warm_scatter_add_layouts(
+    input_layout: &Layout,
+    input_dtype: DType,
+    dim: usize,
+    ids_layout: &Layout,
+    ids_dtype: DType,
+    source_layout: &Layout,
+    source_dtype: DType,
+) -> Result<(), String> {
+    compile_scatter_add_layouts(
+        MetalDevice::get(),
+        input_layout,
+        input_dtype,
+        dim,
+        ids_layout,
+        ids_dtype,
+        source_layout,
+        source_dtype,
+    )
+}
+
+pub fn warm_cat_layouts(layouts: &[&Layout], dtypes: &[DType], dim: usize) -> Result<(), String> {
+    compile_cat_layouts(MetalDevice::get(), layouts, dtypes, dim)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn warm_scatter_set_layouts(
+    destination_layout: &Layout,
+    destination_dtype: DType,
+    dim: usize,
+    ids_layout: &Layout,
+    ids_dtype: DType,
+    source_layout: &Layout,
+    source_dtype: DType,
+) -> Result<(), String> {
+    compile_scatter_set_layouts(
+        MetalDevice::get(),
+        destination_layout,
+        destination_dtype,
+        dim,
+        ids_layout,
+        ids_dtype,
+        source_layout,
+        source_dtype,
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn index_select_rows() {
-        let dev = MetalDevice::get();
-        let x = MetalTensor::from_f32(dev, (0..6).map(|v| v as f32).collect(), vec![2, 3]);
-        let out = index_select(dev, &x, 1, &ids_from_host(dev, &[2, 0])).unwrap();
-        dev.synchronize().unwrap();
-        assert_eq!(out.read_f32().unwrap(), vec![2., 0., 5., 3.]);
+    fn allocate_optional(
+        dev: &MetalDevice,
+        requirement: &Option<TensorRequirement>,
+    ) -> Option<MetalTensor> {
+        requirement
+            .as_ref()
+            .map(|requirement| allocate_requirement(dev, requirement))
     }
 
     #[test]
-    fn gather_rows() {
+    fn destination_apis_match_allocating_wrappers() {
         let dev = MetalDevice::get();
-        let x = MetalTensor::from_f32(dev, (0..6).map(|v| v as f32).collect(), vec![2, 3]);
-        let out = gather(
-            dev,
-            &x,
+        let input =
+            MetalTensor::from_f32(dev, (0..6).map(|value| value as f32).collect(), vec![2, 3]);
+
+        let select_ids = ids_from_host(dev, &[2, 0]);
+        let selected = index_select(dev, &input, 1, &select_ids).unwrap();
+        let select_requirements = index_select_requirements(
+            &input.layout,
+            input.dtype,
+            1,
+            &select_ids.layout,
+            select_ids.dtype,
+        )
+        .unwrap();
+        let selected_into = allocate_requirement(dev, select_requirements.output.as_ref().unwrap());
+        index_select_into(dev, &input, 1, &select_ids, &selected_into, None).unwrap();
+
+        let gather_ids = ids_from_host(dev, &[1, 1, 1, 0, 0, 0, 1, 1, 1]);
+        let gathered = gather(dev, &input, 0, &gather_ids, &[3, 3]).unwrap();
+        let gather_requirements = gather_requirements(
+            &input.layout,
+            input.dtype,
             0,
-            &ids_from_host(dev, &[1, 1, 1, 0, 0, 0, 1, 1, 1]),
+            &gather_ids.layout,
+            gather_ids.dtype,
             &[3, 3],
         )
         .unwrap();
-        dev.synchronize().unwrap();
-        assert_eq!(
-            out.read_f32().unwrap(),
-            vec![3., 4., 5., 0., 1., 2., 3., 4., 5.]
-        );
-    }
+        let gathered_into = allocate_requirement(dev, gather_requirements.output.as_ref().unwrap());
+        gather_into(dev, &input, 0, &gather_ids, &[3, 3], &gathered_into, None).unwrap();
 
-    #[test]
-    fn scatter_add_embedding() {
-        let dev = MetalDevice::get();
         let table = MetalTensor::zeros(dev, vec![4, 2], DType::F32);
-        let src = MetalTensor::from_f32(dev, vec![1f32, 2., 3., 4.], vec![2, 2]);
-        let out = scatter_add(dev, &table, 0, &ids_from_host(dev, &[1, 1, 3, 3]), &src).unwrap();
+        let source = MetalTensor::from_f32(dev, vec![1., 2., 3., 4.], vec![2, 2]);
+        let scatter_ids = ids_from_host(dev, &[1, 1, 3, 3]);
+        let scattered = scatter_add(dev, &table, 0, &scatter_ids, &source).unwrap();
+        let scatter_requirements = scatter_add_requirements(
+            &table.layout,
+            table.dtype,
+            0,
+            &scatter_ids.layout,
+            scatter_ids.dtype,
+            &source.layout,
+            source.dtype,
+        )
+        .unwrap();
+        let scattered_into =
+            allocate_requirement(dev, scatter_requirements.output.as_ref().unwrap());
+        scatter_add_into(
+            dev,
+            &table,
+            0,
+            &scatter_ids,
+            &source,
+            &scattered_into,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        let a = MetalTensor::from_f32(dev, vec![1., 2.], vec![1, 2]);
+        let b = MetalTensor::from_f32(dev, vec![3., 4.], vec![1, 2]);
+        let concatenated = cat(dev, &[&a, &b], 0).unwrap();
+        let cat_requirements =
+            cat_requirements(&[&a.layout, &b.layout], &[a.dtype, b.dtype], 0).unwrap();
+        let concatenated_into =
+            allocate_requirement(dev, cat_requirements.output.as_ref().unwrap());
+        cat_into(dev, &[&a, &b], 0, &concatenated_into).unwrap();
+
+        let set_destination = MetalTensor::zeros(dev, vec![4, 2], DType::F32);
+        let set_destination_into = MetalTensor::zeros(dev, vec![4, 2], DType::F32);
+        scatter_set(dev, &set_destination, 0, &[1, 3], &source).unwrap();
+        let set_ids = ids_from_host(dev, &[1, 3]);
+        scatter_set_into(dev, &set_destination_into, 0, &set_ids, &source, None).unwrap();
+
         dev.synchronize().unwrap();
         assert_eq!(
-            out.read_f32().unwrap(),
-            vec![0., 0., 1., 2., 0., 0., 3., 4.]
+            selected.read_f32().unwrap(),
+            selected_into.read_f32().unwrap()
+        );
+        assert_eq!(
+            gathered.read_f32().unwrap(),
+            gathered_into.read_f32().unwrap()
+        );
+        assert_eq!(
+            scattered.read_f32().unwrap(),
+            scattered_into.read_f32().unwrap()
+        );
+        assert_eq!(
+            concatenated.read_f32().unwrap(),
+            concatenated_into.read_f32().unwrap()
+        );
+        assert_eq!(
+            set_destination.read_f32().unwrap(),
+            set_destination_into.read_f32().unwrap()
         );
     }
 
     #[test]
-    fn cat_dims() {
-        let dev = MetalDevice::get();
-        let a = MetalTensor::from_f32(dev, vec![1f32, 2.], vec![1, 2]);
-        let b = MetalTensor::from_f32(dev, vec![3f32, 4.], vec![1, 2]);
-        let c = cat(dev, &[&a, &b], 0).unwrap();
+    fn requirements_expose_cast_and_staging_storage_exactly() {
+        let input = Layout::contiguous(vec![4, 2]);
+        let ids = Layout::new(vec![2, 2], vec![1, 2], 0);
+        let source = Layout::contiguous(vec![2, 2]);
+        let requirements = scatter_add_requirements(
+            &input,
+            DType::BF16,
+            0,
+            &ids,
+            DType::I64,
+            &source,
+            DType::BF16,
+        )
+        .unwrap();
+        assert_eq!(requirements.ids.as_ref().unwrap().bytes().unwrap(), 16);
+        assert_eq!(
+            requirements.accumulator.as_ref().unwrap().bytes().unwrap(),
+            32
+        );
+        assert_eq!(
+            requirements.source_cast.as_ref().unwrap().bytes().unwrap(),
+            16
+        );
+        assert_eq!(requirements.scratch_bytes().unwrap(), 64);
+        assert_eq!(requirements.scratch_bytes, 64);
+        assert_eq!(requirements.output_bytes, 16);
+        assert_eq!(requirements.staging_bytes, 0);
+        assert_eq!(requirements.pipeline_count, 5);
+
+        let staging =
+            scatter_set_staging_requirements(&input, DType::F32, 0, 2, &source, DType::F32)
+                .unwrap();
+        assert_eq!(staging.staging_bytes().unwrap(), 8);
+        assert_eq!(staging.staging_bytes, 8);
+    }
+
+    #[test]
+    fn into_uses_no_device_allocation_after_warm() {
+        let dev = MetalDevice::new(0).unwrap();
+        let input =
+            MetalTensor::from_f32(&dev, (0..6).map(|value| value as f32).collect(), vec![2, 3]);
+        let ids = ids_from_host(&dev, &[2, 0]);
+        let requirements =
+            index_select_requirements(&input.layout, input.dtype, 1, &ids.layout, ids.dtype)
+                .unwrap();
+        let destination = allocate_requirement(&dev, requirements.output.as_ref().unwrap());
+        let ids_scratch = allocate_optional(&dev, &requirements.ids);
+        let error = index_select_into(&dev, &input, 1, &ids, &destination, ids_scratch.as_ref())
+            .unwrap_err();
+        assert!(error.contains("not warm"), "{error}");
+        compile_index_select_layout_exact(
+            &dev,
+            &input.layout,
+            input.dtype,
+            1,
+            &ids.layout,
+            ids.dtype,
+        )
+        .unwrap();
+        let _dispatch_guard = dev.begin_executable_dispatch().unwrap();
+        let result = index_select_into(&dev, &input, 1, &ids, &destination, ids_scratch.as_ref());
+        result.unwrap();
         dev.synchronize().unwrap();
-        assert_eq!(c.read_f32().unwrap(), vec![1., 2., 3., 4.]);
-        let d = cat(dev, &[&a, &a], 1).unwrap();
-        dev.synchronize().unwrap();
-        assert_eq!(d.read_f32().unwrap(), vec![1., 2., 1., 2.]);
     }
 }

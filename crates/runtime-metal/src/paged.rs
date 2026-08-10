@@ -6,12 +6,142 @@
 //! length is a runtime value (unlike the training flash pipeline,
 //! nothing shape-dependent is baked). Slab dtypes f16/bf16 load
 //! natively; int8 slabs dequantize in registers with the per-(token,
-//! head) scale slab (RFC 0012). The composed scatter+gather path in
+//! head) scale slab (RFC 0012). The primitive scatter+gather reference in
 //! lib.rs remains the reference and the CPU fallback.
 
 /// Whether the paged kernel can run this decode step: Metal, f32/// compute, head dim within the kernel's register budget, slabs in a
 /// supported storage dtype.
 use crate::runtime::dtype::DType;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScatterRequirements {
+    pub slab_dtype: DType,
+    pub head_dim: usize,
+    pub output_bytes: usize,
+    pub state_next_bytes: usize,
+    pub staging_bytes: usize,
+    pub status_bytes: usize,
+    pub scratch_bytes: usize,
+    pub pipeline_count: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AttentionRequirements {
+    pub slab_dtype: DType,
+    pub head_dim: usize,
+    pub scale_bits: u64,
+    pub output_bytes: usize,
+    pub state_next_bytes: usize,
+    pub staging_bytes: usize,
+    pub status_bytes: usize,
+    pub scratch_bytes: usize,
+    pub pipeline_count: usize,
+}
+
+pub fn scatter_requirements(
+    slab_dtype: DType,
+    batch: usize,
+    heads: usize,
+    chunk: usize,
+    head_dim: usize,
+) -> crate::err::Res<ScatterRequirements> {
+    if !matches!(
+        slab_dtype,
+        DType::F32 | DType::F16 | DType::BF16 | DType::U8
+    ) {
+        return Err(format!(
+            "paged scatter: unsupported slab dtype {slab_dtype:?}"
+        ));
+    }
+    batch
+        .checked_mul(heads)
+        .and_then(|value| value.checked_mul(chunk))
+        .and_then(|value| value.checked_mul(head_dim))
+        .ok_or_else(|| "paged scatter: requirement element count overflow".to_string())?;
+    Ok(ScatterRequirements {
+        slab_dtype,
+        head_dim,
+        output_bytes: 0,
+        state_next_bytes: 0,
+        staging_bytes: 0,
+        status_bytes: 0,
+        scratch_bytes: 0,
+        pipeline_count: 1,
+    })
+}
+
+pub fn attention_requirements(
+    slab_dtype: DType,
+    batch: usize,
+    heads: usize,
+    chunk: usize,
+    head_dim: usize,
+    scale: f64,
+) -> crate::err::Res<AttentionRequirements> {
+    if !matches!(
+        slab_dtype,
+        DType::F32 | DType::F16 | DType::BF16 | DType::U8
+    ) {
+        return Err(format!(
+            "paged attention: unsupported slab dtype {slab_dtype:?}"
+        ));
+    }
+    let output_bytes = batch
+        .checked_mul(heads)
+        .and_then(|value| value.checked_mul(chunk))
+        .and_then(|value| value.checked_mul(head_dim))
+        .and_then(|value| value.checked_mul(DType::F32.size_in_bytes()))
+        .ok_or_else(|| "paged attention: requirement byte size overflow".to_string())?;
+    Ok(AttentionRequirements {
+        slab_dtype,
+        head_dim,
+        scale_bits: scale.to_bits(),
+        output_bytes,
+        state_next_bytes: 0,
+        staging_bytes: 0,
+        status_bytes: 0,
+        scratch_bytes: 0,
+        pipeline_count: 1,
+    })
+}
+
+pub fn decode_requirements(
+    slab_dtype: DType,
+    batch: usize,
+    heads: usize,
+    chunk: usize,
+    head_dim: usize,
+    scale: f64,
+) -> crate::err::Res<AttentionRequirements> {
+    attention_requirements(slab_dtype, batch, heads, chunk, head_dim, scale)
+}
+
+#[cfg(test)]
+mod requirement_tests {
+    use super::*;
+
+    #[test]
+    fn requirements_are_exact_and_pipeline_specific() {
+        let scatter = scatter_requirements(DType::U8, 2, 4, 3, 16).unwrap();
+        assert_eq!(
+            (
+                scatter.output_bytes,
+                scatter.state_next_bytes,
+                scatter.staging_bytes,
+                scatter.status_bytes,
+                scatter.scratch_bytes,
+            ),
+            (0, 0, 0, 0, 0)
+        );
+        assert_eq!(scatter.pipeline_count, 1);
+
+        let attention = decode_requirements(DType::F16, 2, 4, 3, 16, 0.25).unwrap();
+        assert_eq!(attention.output_bytes, 2 * 4 * 3 * 16 * 4);
+        assert_eq!(attention.pipeline_count, 1);
+        assert!(scatter_requirements(DType::I64, 1, 1, 1, 1).is_err());
+        assert!(attention_requirements(DType::F32, usize::MAX, 2, 1, 1, 1.0).is_err());
+    }
+}
 
 pub fn is_supported(
     q: &crate::runtime::metal::run::MetalTensor,
@@ -27,7 +157,10 @@ pub fn is_supported(
 }
 
 #[cfg(target_os = "macos")]
-pub use metal::{decode, scatter};
+pub use metal::{
+    attention_into, decode, decode_into, scatter, scatter_into, warm_all, warm_attention,
+    warm_attention_exact, warm_scatter, warm_scatter_exact, IntoResources,
+};
 
 #[cfg(target_os = "macos")]
 mod metal {
@@ -36,6 +169,23 @@ mod metal {
     use crate::runtime::metal::run::MetalTensor;
 
     use objc2_metal::MTLComputeCommandEncoder;
+
+    #[derive(Clone, Copy)]
+    pub struct IntoResources<'a> {
+        pub staging: &'a [MetalTensor],
+        pub status: &'a [MetalTensor],
+        pub scratch: &'a [MetalTensor],
+    }
+
+    impl IntoResources<'_> {
+        pub const fn empty() -> Self {
+            Self {
+                staging: &[],
+                status: &[],
+                scratch: &[],
+            }
+        }
+    }
 
     const THREADS: usize = 128;
 
@@ -49,6 +199,21 @@ mod metal {
 
     fn slab_dtype(t: &MetalTensor) -> DType {
         t.dtype
+    }
+
+    fn validate_empty_resources(
+        resources: IntoResources<'_>,
+        operation: &str,
+    ) -> crate::err::Res<()> {
+        if !resources.staging.is_empty()
+            || !resources.status.is_empty()
+            || !resources.scratch.is_empty()
+        {
+            return Err(format!(
+                "{operation}: staging, status, and scratch views must be empty"
+            ));
+        }
+        Ok(())
     }
 
     // Writes the new-token row of every slot into the slabs in one
@@ -87,6 +252,7 @@ kernel void et_paged_scatter(
     constant uint& maxBlocks [[buffer(9)]],
     constant uint& H [[buffer(10)]],
     constant uint& advance [[buffer(11)]],
+    device const uint* blockBases [[buffer(12)]],
     uint3 gridDim [[threadgroups_per_grid]],
     uint3 tgid [[threadgroup_position_in_grid]],
     uint3 tpitg [[thread_position_in_threadgroup]]
@@ -95,11 +261,13 @@ kernel void et_paged_scatter(
     const uint h = tgid.x;
     const uint tid = tpitg.x;
     const uint C = gridDim.z;
+    if (ctxlens[b] == 0) {{ return; }}
     const uint cursor = ctxlens[b] - advance;
     // Rows cursor..needed, one per new token; D-wide within each row.
     for (uint p = 0; p < advance; p++) {{
         const uint pos = cursor + p;
-        const uint phys = tables[(ulong)b * maxBlocks + pos / blockSize] * blockSize + (pos % blockSize);
+        const uint tableIndex = pos / blockSize - blockBases[b];
+        const uint phys = tables[(ulong)b * maxBlocks + tableIndex] * blockSize + (pos % blockSize);
         const ulong dst = (ulong)phys * H * D + h * D;
         device const float* krow = Kn + ((ulong)b * H * C + h * C + p) * D;
         device const float* vrow = Vn + ((ulong)b * H * C + h * C + p) * D;
@@ -137,11 +305,59 @@ kernel void et_paged_scatter(
         )
     }
 
+    fn scatter_key(d: usize, slab_dtype: DType) -> u64 {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+
+        let mut hasher = DefaultHasher::new();
+        (0x5CA7u32, d, slab_dtype).hash(&mut hasher);
+        hasher.finish()
+    }
+
     // Fused batched scatter: k_new/v_new [B, H, C, D] f32 (C = 1 for
     // decode, the chunk for prefill); write rows per slot are
     // ctxlens[b] - advance .. ctxlens[b].
     #[allow(clippy::too_many_arguments)]
-    pub fn scatter(
+    pub fn warm_all(d: usize, scale: f64) -> crate::err::Res<usize> {
+        let mut count = 0;
+        for dtype in [DType::F32, DType::F16, DType::BF16, DType::U8] {
+            MetalDevice::get().compile_lazy(scatter_key(d, dtype), "et_paged_scatter", || {
+                scatter_source(d, dtype)
+            })?;
+            pipeline(d, dtype, scale)?;
+            count += 2;
+        }
+        Ok(count)
+    }
+
+    pub fn warm_scatter(d: usize, slab_dtype: DType) -> crate::err::Res<()> {
+        MetalDevice::get().compile_lazy(scatter_key(d, slab_dtype), "et_paged_scatter", || {
+            scatter_source(d, slab_dtype)
+        })?;
+        Ok(())
+    }
+
+    pub fn warm_scatter_exact(requirements: &super::ScatterRequirements) -> crate::err::Res<()> {
+        warm_scatter(requirements.head_dim, requirements.slab_dtype)
+    }
+
+    pub fn warm_attention(d: usize, slab_dtype: DType, scale: f64) -> crate::err::Res<()> {
+        pipeline(d, slab_dtype, scale)?;
+        Ok(())
+    }
+
+    pub fn warm_attention_exact(
+        requirements: &super::AttentionRequirements,
+    ) -> crate::err::Res<()> {
+        warm_attention(
+            requirements.head_dim,
+            requirements.slab_dtype,
+            f64::from_bits(requirements.scale_bits),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn scatter_into(
         k_new: &MetalTensor,
         v_new: &MetalTensor,
         k_slab: &MetalTensor,
@@ -150,12 +366,11 @@ kernel void et_paged_scatter(
         v_scales: Option<&MetalTensor>,
         tables: &MetalTensor,
         ctxlens: &MetalTensor,
+        block_bases: &MetalTensor,
         block_size: usize,
         advance: usize,
+        resources: IntoResources<'_>,
     ) -> crate::err::Res<()> {
-        use std::collections::hash_map::DefaultHasher;
-        use std::hash::{Hash, Hasher};
-
         let (b, h, c, d) = (
             k_new.layout.shape()[0],
             k_new.layout.shape()[1],
@@ -163,13 +378,17 @@ kernel void et_paged_scatter(
             k_new.layout.shape()[3],
         );
         let slab_dtype = slab_dtype(k_slab);
-        let mut hasher = DefaultHasher::new();
-        (0x5CA7u32, d, slab_dtype).hash(&mut hasher);
-        let pipe = MetalDevice::get().compile_lazy(hasher.finish(), "et_paged_scatter", || {
-            scatter_source(d, slab_dtype)
-        })?;
-        let k_new = wrap_contig(k_new)?;
-        let v_new = wrap_contig(v_new)?;
+        validate_empty_resources(resources, "paged scatter")?;
+        if !k_new.layout.is_contiguous() || !v_new.layout.is_contiguous() {
+            return Err(
+                "paged scatter: new K/V inputs must be contiguous before scatter_into".to_string(),
+            );
+        }
+        let pipe = MetalDevice::get()
+            .pipeline_cached(scatter_key(d, slab_dtype))
+            .ok_or_else(|| {
+                "paged scatter: exact pipeline is not warm; call warm_scatter".to_string()
+            })?;
         let f32_off = |off: usize| off * 4;
         let u32_off = |off: usize| off * 4;
         let elem_off = |off: usize| off * slab_dtype.size_in_bytes();
@@ -196,6 +415,12 @@ kernel void et_paged_scatter(
             set_bytes(e, 9, &max_blocks);
             set_bytes(e, 10, &(h as u32));
             set_bytes(e, 11, &(advance as u32));
+            set_buffer(
+                e,
+                12,
+                &block_bases.buffer,
+                u32_off(block_bases.layout.offset()),
+            );
             e.dispatchThreadgroups_threadsPerThreadgroup(
                 objc2_metal::MTLSize {
                     width: h,
@@ -210,6 +435,39 @@ kernel void et_paged_scatter(
             );
         });
         Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn scatter(
+        k_new: &MetalTensor,
+        v_new: &MetalTensor,
+        k_slab: &MetalTensor,
+        v_slab: &MetalTensor,
+        k_scales: Option<&MetalTensor>,
+        v_scales: Option<&MetalTensor>,
+        tables: &MetalTensor,
+        ctxlens: &MetalTensor,
+        block_bases: &MetalTensor,
+        block_size: usize,
+        advance: usize,
+    ) -> crate::err::Res<()> {
+        let k_new = wrap_contig(k_new)?;
+        let v_new = wrap_contig(v_new)?;
+        warm_scatter(k_new.layout.shape()[3], k_slab.dtype)?;
+        scatter_into(
+            &k_new,
+            &v_new,
+            k_slab,
+            v_slab,
+            k_scales,
+            v_scales,
+            tables,
+            ctxlens,
+            block_bases,
+            block_size,
+            advance,
+            IntoResources::empty(),
+        )
     }
 
     // One threadgroup per (slot, head): q is staged once into
@@ -271,6 +529,7 @@ kernel void et_paged_decode(
     constant uint& window [[buffer(10)]],
     constant uint& H [[buffer(11)]],
     constant uint& advance [[buffer(12)]],
+    device const uint* blockBases [[buffer(13)]],
     uint3 gridDim [[threadgroups_per_grid]],
     uint3 tgid [[threadgroup_position_in_grid]],
     uint3 tpitg [[thread_position_in_threadgroup]]
@@ -281,6 +540,13 @@ kernel void et_paged_decode(
     const uint C = gridDim.z;
     const uint tid = tpitg.x;
     const uint needed = ctxlens[b];
+    if (needed == 0) {{
+        if (tid == 0) {{
+            device float* o = O + ((ulong)b * H * C + h * C + p) * D;
+            for (int d = 0; d < D; d++) {{ o[d] = 0.0f; }}
+        }}
+        return;
+    }}
     // Causal per q row: row p of the new chunk attends through
     // cursor + p (pads clamp to the real frontier; their outputs are
     // discarded downstream).
@@ -301,7 +567,7 @@ kernel void et_paged_decode(
     for (int d = 0; d < D; d++) {{ acc[d] = 0.0f; }}
 
     for (uint row = start + tid; row < ctx; row += NT) {{
-        const uint phys = table[row / blockSize] * blockSize + (row % blockSize);
+        const uint phys = table[row / blockSize - blockBases[b]] * blockSize + (row % blockSize);
         const ulong krow = (ulong)phys * H * D + h * D;
         float score = 0.0f;
 #if INT8
@@ -405,15 +671,21 @@ kernel void et_paged_decode(
         )
     }
 
-    fn pipeline(d: usize, slab_dtype: DType, scale: f64) -> crate::err::Res<Pipeline> {
+    fn attention_key(d: usize, slab_dtype: DType, scale: f64) -> u64 {
         use std::collections::hash_map::DefaultHasher;
         use std::hash::{Hash, Hasher};
 
         let mut hasher = DefaultHasher::new();
         (d, slab_dtype, scale.to_bits()).hash(&mut hasher);
-        MetalDevice::get().compile_lazy(hasher.finish(), "et_paged_decode", || {
-            kernel_source(d, slab_dtype, scale)
-        })
+        hasher.finish()
+    }
+
+    fn pipeline(d: usize, slab_dtype: DType, scale: f64) -> crate::err::Res<Pipeline> {
+        MetalDevice::get().compile_lazy(
+            attention_key(d, slab_dtype, scale),
+            "et_paged_decode",
+            || kernel_source(d, slab_dtype, scale),
+        )
     }
 
     // One launch for the whole batch: q [B, H, C, D] contiguous
@@ -422,7 +694,7 @@ kernel void et_paged_decode(
     // kernel derives per-row causal lengths from `advance`). Returns
     // [B, H, C, D] f32.
     #[allow(clippy::too_many_arguments)]
-    pub fn decode(
+    pub fn attention_into(
         q: &MetalTensor,
         k_slab: &MetalTensor,
         v_slab: &MetalTensor,
@@ -430,11 +702,14 @@ kernel void et_paged_decode(
         v_scales: Option<&MetalTensor>,
         tables: &MetalTensor,
         ctxlens: &MetalTensor,
+        block_bases: &MetalTensor,
         window: Option<usize>,
         scale: f64,
         block_size: usize,
         advance: usize,
-    ) -> crate::err::Res<MetalTensor> {
+        output: &MetalTensor,
+        resources: IntoResources<'_>,
+    ) -> crate::err::Res<()> {
         let (b, h, c, d) = (
             q.layout.shape()[0],
             q.layout.shape()[1],
@@ -442,10 +717,25 @@ kernel void et_paged_decode(
             q.layout.shape()[3],
         );
         let slab_dtype = slab_dtype(k_slab);
-        let q = wrap_contig(q)?;
-        let pipe = pipeline(d, slab_dtype, scale)?;
-        let out_buf =
-            MetalDevice::get().alloc((b * h * c * d).max(1), crate::runtime::dtype::DType::F32);
+        validate_empty_resources(resources, "paged attention")?;
+        if !q.layout.is_contiguous() {
+            return Err(
+                "paged attention: query must be contiguous before attention_into".to_string(),
+            );
+        }
+        if output.dtype != DType::F32
+            || output.layout.shape() != [b, h, c, d]
+            || !output.layout.is_contiguous()
+        {
+            return Err(format!(
+                "paged attention: output must be contiguous [{b}, {h}, {c}, {d}]:F32"
+            ));
+        }
+        let pipe = MetalDevice::get()
+            .pipeline_cached(attention_key(d, slab_dtype, scale))
+            .ok_or_else(|| {
+                "paged attention: exact pipeline is not warm; call warm_attention".to_string()
+            })?;
         let max_blocks = tables.layout.shape()[1];
         let f32_off = |off: usize| off * DType::F32.size_in_bytes();
         let u32_off = |off: usize| off * DType::U32.size_in_bytes();
@@ -457,7 +747,7 @@ kernel void et_paged_decode(
             set_buffer(e, 2, &v_slab.buffer, elem_off(v_slab.layout.offset()));
             set_buffer(e, 3, &tables.buffer, u32_off(tables.layout.offset()));
             set_buffer(e, 4, &ctxlens.buffer, u32_off(ctxlens.layout.offset()));
-            set_buffer(e, 5, &out_buf, 0);
+            set_buffer(e, 5, &output.buffer, f32_off(output.layout.offset()));
             let (ksb, kso) = match k_scales {
                 Some(t) => (&t.buffer, t.layout.offset()),
                 None => (&k_slab.buffer, k_slab.layout.offset()),
@@ -473,6 +763,12 @@ kernel void et_paged_decode(
             set_bytes(e, 10, &(window.unwrap_or(0) as u32));
             set_bytes(e, 11, &(h as u32));
             set_bytes(e, 12, &(advance as u32));
+            set_buffer(
+                e,
+                13,
+                &block_bases.buffer,
+                u32_off(block_bases.layout.offset()),
+            );
             e.dispatchThreadgroups_threadsPerThreadgroup(
                 objc2_metal::MTLSize {
                     width: h,
@@ -486,10 +782,214 @@ kernel void et_paged_decode(
                 },
             );
         });
-        Ok(MetalTensor {
-            buffer: out_buf,
-            layout: crate::runtime::layout::Layout::contiguous(vec![b, h, c, d]),
-            dtype: crate::runtime::dtype::DType::F32,
-        })
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn decode_into(
+        q: &MetalTensor,
+        k_slab: &MetalTensor,
+        v_slab: &MetalTensor,
+        k_scales: Option<&MetalTensor>,
+        v_scales: Option<&MetalTensor>,
+        tables: &MetalTensor,
+        ctxlens: &MetalTensor,
+        block_bases: &MetalTensor,
+        window: Option<usize>,
+        scale: f64,
+        block_size: usize,
+        advance: usize,
+        output: &MetalTensor,
+        resources: IntoResources<'_>,
+    ) -> crate::err::Res<()> {
+        attention_into(
+            q,
+            k_slab,
+            v_slab,
+            k_scales,
+            v_scales,
+            tables,
+            ctxlens,
+            block_bases,
+            window,
+            scale,
+            block_size,
+            advance,
+            output,
+            resources,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn decode(
+        q: &MetalTensor,
+        k_slab: &MetalTensor,
+        v_slab: &MetalTensor,
+        k_scales: Option<&MetalTensor>,
+        v_scales: Option<&MetalTensor>,
+        tables: &MetalTensor,
+        ctxlens: &MetalTensor,
+        block_bases: &MetalTensor,
+        window: Option<usize>,
+        scale: f64,
+        block_size: usize,
+        advance: usize,
+    ) -> crate::err::Res<MetalTensor> {
+        let shape = q.layout.shape().to_vec();
+        let q = wrap_contig(q)?;
+        warm_attention(q.layout.shape()[3], k_slab.dtype, scale)?;
+        let output = MetalTensor::empty(MetalDevice::get(), shape, DType::F32);
+        decode_into(
+            &q,
+            k_slab,
+            v_slab,
+            k_scales,
+            v_scales,
+            tables,
+            ctxlens,
+            block_bases,
+            window,
+            scale,
+            block_size,
+            advance,
+            &output,
+            IntoResources::empty(),
+        )?;
+        Ok(output)
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod tests {
+    use crate::runtime::dtype::DType;
+    use crate::runtime::layout::Layout;
+    use crate::runtime::metal::device::MetalDevice;
+    use crate::runtime::metal::run::MetalTensor as MT;
+
+    fn u32_tensor(dev: &MetalDevice, values: &[u32], shape: Vec<usize>) -> MT {
+        MT {
+            buffer: dev.alloc_with_data_u32(values),
+            layout: Layout::contiguous(shape),
+            dtype: DType::U32,
+        }
+    }
+
+    fn max_diff(a: &MT, b: &MT) -> f32 {
+        a.read_f32()
+            .unwrap()
+            .iter()
+            .zip(b.read_f32().unwrap())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0, f32::max)
+    }
+
+    #[test]
+    fn scatter_attention_into_match_wrappers_and_use_only_supplied_views() {
+        let dev = MetalDevice::get();
+        let (b, h, c, d) = (1usize, 2usize, 1usize, 8usize);
+        let q = MT::from_f32(
+            dev,
+            (0..b * h * c * d)
+                .map(|index| index as f32 / 13.0)
+                .collect(),
+            vec![b, h, c, d],
+        );
+        let k_new = MT::from_f32(
+            dev,
+            (0..b * h * c * d)
+                .map(|index| (index as f32 + 1.0) / 11.0)
+                .collect(),
+            vec![b, h, c, d],
+        );
+        let v_new = MT::from_f32(
+            dev,
+            (0..b * h * c * d)
+                .map(|index| (index as f32 - 3.0) / 7.0)
+                .collect(),
+            vec![b, h, c, d],
+        );
+        let expected_k = MT::from_f32(dev, vec![0.0; 2 * h * d], vec![2, h, d]);
+        let expected_v = MT::from_f32(dev, vec![0.0; 2 * h * d], vec![2, h, d]);
+        let actual_k = MT::from_f32(dev, vec![0.0; 2 * h * d], vec![2, h, d]);
+        let actual_v = MT::from_f32(dev, vec![0.0; 2 * h * d], vec![2, h, d]);
+        let tables = u32_tensor(dev, &[0], vec![b, 1]);
+        let ctxlens = u32_tensor(dev, &[1], vec![b]);
+        let block_bases = u32_tensor(dev, &[0], vec![b]);
+        let scale = 1.0 / (d as f64).sqrt();
+
+        super::metal::scatter(
+            &k_new,
+            &v_new,
+            &expected_k,
+            &expected_v,
+            None,
+            None,
+            &tables,
+            &ctxlens,
+            &block_bases,
+            2,
+            1,
+        )
+        .unwrap();
+        let expected_output = super::metal::decode(
+            &q,
+            &expected_k,
+            &expected_v,
+            None,
+            None,
+            &tables,
+            &ctxlens,
+            &block_bases,
+            None,
+            scale,
+            2,
+            1,
+        )
+        .unwrap();
+        let actual_output = MT::empty(dev, vec![b, h, c, d], DType::F32);
+        let scatter_requirements = super::scatter_requirements(DType::F32, b, h, c, d).unwrap();
+        let attention_requirements =
+            super::attention_requirements(DType::F32, b, h, c, d, scale).unwrap();
+        super::metal::warm_scatter_exact(&scatter_requirements).unwrap();
+        super::metal::warm_attention_exact(&attention_requirements).unwrap();
+        dev.synchronize().unwrap();
+
+        let _dispatch_guard = dev.begin_executable_dispatch().unwrap();
+        super::metal::scatter_into(
+            &k_new,
+            &v_new,
+            &actual_k,
+            &actual_v,
+            None,
+            None,
+            &tables,
+            &ctxlens,
+            &block_bases,
+            2,
+            1,
+            super::metal::IntoResources::empty(),
+        )
+        .unwrap();
+        super::metal::attention_into(
+            &q,
+            &actual_k,
+            &actual_v,
+            None,
+            None,
+            &tables,
+            &ctxlens,
+            &block_bases,
+            None,
+            scale,
+            2,
+            1,
+            &actual_output,
+            super::metal::IntoResources::empty(),
+        )
+        .unwrap();
+        dev.synchronize().unwrap();
+        assert!(max_diff(&expected_k, &actual_k) < 1e-6);
+        assert!(max_diff(&expected_v, &actual_v) < 1e-6);
+        assert!(max_diff(&expected_output, &actual_output) < 1e-6);
     }
 }

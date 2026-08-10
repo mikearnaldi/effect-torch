@@ -12,10 +12,11 @@ import { BLOCK, CHECKPOINT, createGpt, EOT, loadParams, loadTokenizer } from "./
 
 const TEMPERATURE = Number(process.env.FINEWEB_TEMPERATURE ?? 0.2)
 
-const sampleCategorical = (probs: ReadonlyArray<number>, temperature: number) => {
+const sampleCategorical = (logits: ReadonlyArray<number>, temperature: number) => {
+  const max = Math.max(...logits)
   let sum = 0
-  const scaled = probs.map((p) => {
-    const v = Math.pow(Math.max(p, 1e-12), 1 / temperature)
+  const scaled = logits.map((logit) => {
+    const v = Math.exp((logit - max) / temperature)
     sum += v
     return v
   })
@@ -56,8 +57,9 @@ const program = Effect.gen(function*() {
   let emitted = 0
   let text = ""
   while (true) {
-    const [probs] = yield* Tensor.compute([yield* Tensor.softmax(logits)])
-    const token = sampleCategorical(yield* Tensor.toNumberArray(probs), TEMPERATURE)
+    const values = yield* Tensor.toNumberArray(logits)
+    yield* Tensor.clear(logits)
+    const token = sampleCategorical(values, TEMPERATURE)
     if (token === eotId) break
     ids.push(token)
     text = yield* tokenizer.decode(ids)

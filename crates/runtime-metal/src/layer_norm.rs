@@ -6,19 +6,114 @@
 
 use crate::runtime::metal::run::MetalTensor;
 
+#[cfg(test)]
+thread_local! {
+    static TEST_DEVICE_ALLOCATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static TEST_PIPELINE_REQUESTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn record_device_allocation() {
+    TEST_DEVICE_ALLOCATIONS.with(|count| count.set(count.get() + 1));
+}
+
+#[cfg(test)]
+fn record_pipeline_request() {
+    TEST_PIPELINE_REQUESTS.with(|count| count.set(count.get() + 1));
+}
+
+#[cfg(test)]
+fn reset_test_counts() {
+    TEST_DEVICE_ALLOCATIONS.with(|count| count.set(0));
+    TEST_PIPELINE_REQUESTS.with(|count| count.set(0));
+}
+
+#[cfg(test)]
+fn test_counts() -> (usize, usize) {
+    (
+        TEST_DEVICE_ALLOCATIONS.with(std::cell::Cell::get),
+        TEST_PIPELINE_REQUESTS.with(std::cell::Cell::get),
+    )
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BufferRequirement {
+    pub shape: Vec<usize>,
+    pub dtype: crate::runtime::dtype::DType,
+    pub elements: usize,
+    pub bytes: usize,
+}
+
+impl BufferRequirement {
+    fn new(
+        shape: Vec<usize>,
+        dtype: crate::runtime::dtype::DType,
+        label: &str,
+    ) -> crate::err::Res<Self> {
+        let elements = shape
+            .iter()
+            .try_fold(1usize, |total, dimension| total.checked_mul(*dimension));
+        let elements =
+            elements.ok_or_else(|| format!("layer_norm: {label} element count overflow"))?;
+        let bytes = elements
+            .max(1)
+            .checked_mul(dtype.size_in_bytes())
+            .ok_or_else(|| format!("layer_norm: {label} byte size overflow"))?;
+        Ok(Self {
+            shape,
+            dtype,
+            elements,
+            bytes,
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LayerNormTopology {
+    Rows { threads: usize, dispatches: usize },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LayerNormForwardRequirements {
+    pub output: BufferRequirement,
+    pub topology: LayerNormTopology,
+    pub rows: usize,
+    pub normalized_elements: usize,
+    pub dtype: crate::runtime::dtype::DType,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LayerNormBackwardRequirements {
+    pub dx: BufferRequirement,
+    pub normalized: BufferRequirement,
+    pub topology: LayerNormTopology,
+    pub rows: usize,
+    pub normalized_elements: usize,
+    pub dtype: crate::runtime::dtype::DType,
+}
+
 /// Whether the fused layer-norm path can run: Metal, f32, last-dim norm.
 pub fn is_supported(x: &MetalTensor, weight: &MetalTensor) -> bool {
     matches!(
         x.dtype,
-        crate::runtime::dtype::DType::F32 | crate::runtime::dtype::DType::BF16
+        crate::runtime::dtype::DType::F32
+            | crate::runtime::dtype::DType::F16
+            | crate::runtime::dtype::DType::BF16
     ) && weight.dtype == x.dtype
 }
 
 #[cfg(target_os = "macos")]
-pub use metal::{ln_backward, ln_forward};
+pub use metal::{
+    ln_backward, ln_backward_into, ln_backward_requirements, ln_forward, ln_forward_into,
+    ln_forward_requirements, warm_backward, warm_backward_exact, warm_forward, warm_forward_exact,
+};
 
 #[cfg(target_os = "macos")]
 mod metal {
+    use super::{
+        BufferRequirement, LayerNormBackwardRequirements, LayerNormForwardRequirements,
+        LayerNormTopology,
+    };
     use crate::runtime::metal::device::{set_buffer, set_bytes, MetalDevice, Pipeline};
     use crate::runtime::metal::run::MetalTensor;
 
@@ -26,6 +121,139 @@ mod metal {
     use std::sync::Arc;
 
     const NT: usize = 128;
+
+    fn checked_numel(shape: &[usize], label: &str) -> crate::err::Res<usize> {
+        shape
+            .iter()
+            .try_fold(1usize, |total, dimension| total.checked_mul(*dimension))
+            .ok_or_else(|| format!("layer_norm: {label} element count overflow"))
+    }
+
+    fn geometry(
+        x_shape: &[usize],
+        x_dtype: crate::runtime::dtype::DType,
+        weight_shape: &[usize],
+        weight_dtype: crate::runtime::dtype::DType,
+        bias_shape: Option<&[usize]>,
+        bias_dtype: Option<crate::runtime::dtype::DType>,
+    ) -> crate::err::Res<(usize, usize)> {
+        if !matches!(
+            x_dtype,
+            crate::runtime::dtype::DType::F32
+                | crate::runtime::dtype::DType::F16
+                | crate::runtime::dtype::DType::BF16
+        ) {
+            return Err(format!("layer_norm: unsupported dtype {x_dtype:?}"));
+        }
+        if weight_dtype != x_dtype || bias_dtype.is_some_and(|dtype| dtype != x_dtype) {
+            return Err("layer_norm: x/weight/bias dtypes must match".to_string());
+        }
+        if weight_shape.is_empty() || weight_shape.len() > x_shape.len() {
+            return Err("layer_norm: normalized shape must be a non-empty suffix of x".to_string());
+        }
+        if x_shape[x_shape.len() - weight_shape.len()..] != *weight_shape {
+            return Err("layer_norm: weight shape must match the normalized suffix".to_string());
+        }
+        if bias_shape.is_some_and(|shape| shape != weight_shape) {
+            return Err("layer_norm: bias shape must match weight shape".to_string());
+        }
+        let normalized_elements = checked_numel(weight_shape, "normalized shape")?;
+        let x_elements = checked_numel(x_shape, "input")?;
+        if normalized_elements == 0 || x_elements == 0 {
+            return Err("layer_norm: zero-sized dimensions are unsupported".to_string());
+        }
+        let rows = x_elements / normalized_elements;
+        if rows > u32::MAX as usize || normalized_elements > u32::MAX as usize {
+            return Err("layer_norm: rows and normalized elements must fit u32".to_string());
+        }
+        Ok((rows, normalized_elements))
+    }
+
+    pub fn ln_forward_requirements(
+        x_shape: &[usize],
+        x_dtype: crate::runtime::dtype::DType,
+        weight_shape: &[usize],
+        weight_dtype: crate::runtime::dtype::DType,
+        bias_shape: &[usize],
+        bias_dtype: crate::runtime::dtype::DType,
+    ) -> crate::err::Res<LayerNormForwardRequirements> {
+        let (rows, normalized_elements) = geometry(
+            x_shape,
+            x_dtype,
+            weight_shape,
+            weight_dtype,
+            Some(bias_shape),
+            Some(bias_dtype),
+        )?;
+        Ok(LayerNormForwardRequirements {
+            output: BufferRequirement::new(x_shape.to_vec(), x_dtype, "output")?,
+            topology: LayerNormTopology::Rows {
+                threads: NT,
+                dispatches: 1,
+            },
+            rows,
+            normalized_elements,
+            dtype: x_dtype,
+        })
+    }
+
+    pub fn ln_backward_requirements(
+        x_shape: &[usize],
+        x_dtype: crate::runtime::dtype::DType,
+        weight_shape: &[usize],
+        weight_dtype: crate::runtime::dtype::DType,
+        gradient_shape: &[usize],
+        gradient_dtype: crate::runtime::dtype::DType,
+    ) -> crate::err::Res<LayerNormBackwardRequirements> {
+        let (rows, normalized_elements) =
+            geometry(x_shape, x_dtype, weight_shape, weight_dtype, None, None)?;
+        if gradient_shape != x_shape || gradient_dtype != x_dtype {
+            return Err("layer_norm: gradient must match x shape and dtype".to_string());
+        }
+        Ok(LayerNormBackwardRequirements {
+            dx: BufferRequirement::new(x_shape.to_vec(), x_dtype, "dx")?,
+            normalized: BufferRequirement::new(x_shape.to_vec(), x_dtype, "normalized")?,
+            topology: LayerNormTopology::Rows {
+                threads: NT,
+                dispatches: 1,
+            },
+            rows,
+            normalized_elements,
+            dtype: x_dtype,
+        })
+    }
+
+    fn require_contiguous(tensor: &MetalTensor, label: &str) -> crate::err::Res<()> {
+        if !tensor.layout.is_contiguous() {
+            return Err(format!("layer_norm: {label} must be contiguous"));
+        }
+        let end = tensor
+            .layout
+            .offset()
+            .checked_add(tensor.numel())
+            .and_then(|elements| elements.checked_mul(tensor.dtype.size_in_bytes()))
+            .ok_or_else(|| format!("layer_norm: {label} storage range overflow"))?;
+        if end > tensor.buffer.size {
+            return Err(format!("layer_norm: {label} storage is too small"));
+        }
+        Ok(())
+    }
+
+    fn require_exact(
+        tensor: &MetalTensor,
+        shape: &[usize],
+        dtype: crate::runtime::dtype::DType,
+        label: &str,
+    ) -> crate::err::Res<()> {
+        if tensor.layout.shape() != shape || tensor.dtype != dtype {
+            return Err(format!(
+                "layer_norm: {label} must be {shape:?}:{dtype:?}, got {:?}:{:?}",
+                tensor.layout.shape(),
+                tensor.dtype
+            ));
+        }
+        require_contiguous(tensor, label)
+    }
 
     fn wrap_contig(t: &MetalTensor) -> crate::err::Res<MetalTensor> {
         if t.layout.is_contiguous() {
@@ -39,6 +267,8 @@ mod metal {
         n: usize,
         dtype: crate::runtime::dtype::DType,
     ) -> Arc<crate::runtime::metal::device::Buffer> {
+        #[cfg(test)]
+        super::record_device_allocation();
         MetalDevice::get().alloc(n.max(1), dtype)
     }
 
@@ -164,22 +394,59 @@ kernel void et_ln_bwd(
         .replace("{ty}", ty)
     }
 
-    fn pipeline(
-        name: &'static str,
-        dtype: crate::runtime::dtype::DType,
-    ) -> crate::err::Res<Pipeline> {
+    fn pipeline_key(name: &'static str, dtype: crate::runtime::dtype::DType) -> u64 {
         use std::collections::hash_map::DefaultHasher;
         use std::hash::{Hash, Hasher};
 
         let mut hasher = DefaultHasher::new();
         (name, dtype).hash(&mut hasher);
-        let key = hasher.finish();
+        hasher.finish()
+    }
+
+    fn pipeline(
+        name: &'static str,
+        dtype: crate::runtime::dtype::DType,
+    ) -> crate::err::Res<Pipeline> {
+        #[cfg(test)]
+        super::record_pipeline_request();
         let ty = match dtype {
             crate::runtime::dtype::DType::F32 => "float",
+            crate::runtime::dtype::DType::F16 => "half",
             crate::runtime::dtype::DType::BF16 => "bfloat",
             other => return Err(format!("layer_norm: unsupported dtype {other:?}")),
         };
-        MetalDevice::get().compile_lazy(key, name, || source(ty))
+        MetalDevice::get().compile_lazy(pipeline_key(name, dtype), name, || source(ty))
+    }
+
+    fn cached_pipeline(
+        name: &'static str,
+        dtype: crate::runtime::dtype::DType,
+    ) -> crate::err::Res<Pipeline> {
+        MetalDevice::get()
+            .pipeline_cached(pipeline_key(name, dtype))
+            .ok_or_else(|| {
+                format!("layer_norm: {name} pipeline is not warm; call the exact warm function")
+            })
+    }
+
+    pub fn warm_forward(dtype: crate::runtime::dtype::DType) -> crate::err::Res<()> {
+        pipeline("et_ln_fwd", dtype)?;
+        Ok(())
+    }
+
+    pub fn warm_forward_exact(requirements: &LayerNormForwardRequirements) -> crate::err::Res<()> {
+        warm_forward(requirements.dtype)
+    }
+
+    pub fn warm_backward(dtype: crate::runtime::dtype::DType) -> crate::err::Res<()> {
+        pipeline("et_ln_bwd", dtype)?;
+        Ok(())
+    }
+
+    pub fn warm_backward_exact(
+        requirements: &LayerNormBackwardRequirements,
+    ) -> crate::err::Res<()> {
+        warm_backward(requirements.dtype)
     }
 
     fn wrap(
@@ -194,27 +461,33 @@ kernel void et_ln_bwd(
         })
     }
 
-    pub fn ln_forward(
+    pub fn ln_forward_into(
         x: &MetalTensor,
         weight: &MetalTensor,
         bias: &MetalTensor,
         eps: f64,
-    ) -> crate::err::Res<MetalTensor> {
-        let d = weight.numel();
-        let rows = x.numel() / d;
-        let x = wrap_contig(x)?;
-        let weight = wrap_contig(weight)?;
-        let bias = wrap_contig(bias)?;
-        let out_buf = alloc_t(x.numel(), x.dtype);
-        let pipe = pipeline("et_ln_fwd", x.dtype)?;
+        output: &MetalTensor,
+    ) -> crate::err::Res<()> {
+        let (rows, d) = geometry(
+            x.layout.shape(),
+            x.dtype,
+            weight.layout.shape(),
+            weight.dtype,
+            Some(bias.layout.shape()),
+            Some(bias.dtype),
+        )?;
+        for (tensor, label) in [(x, "x"), (weight, "weight"), (bias, "bias")] {
+            require_contiguous(tensor, label)?;
+        }
+        require_exact(output, x.layout.shape(), x.dtype, "output")?;
+        let pipe = cached_pipeline("et_ln_fwd", x.dtype)?;
         let sz = x.dtype.size_in_bytes();
-        let off = |o: usize| o * sz;
         MetalDevice::get().with_encoder(|e| {
             e.setComputePipelineState(pipe.as_raw());
-            set_buffer(e, 0, &x.buffer, off(x.layout.offset()));
-            set_buffer(e, 1, &weight.buffer, off(weight.layout.offset()));
-            set_buffer(e, 2, &bias.buffer, off(bias.layout.offset()));
-            set_buffer(e, 3, &out_buf, 0);
+            set_buffer(e, 0, &x.buffer, x.layout.offset() * sz);
+            set_buffer(e, 1, &weight.buffer, weight.layout.offset() * sz);
+            set_buffer(e, 2, &bias.buffer, bias.layout.offset() * sz);
+            set_buffer(e, 3, &output.buffer, output.layout.offset() * sz);
             set_bytes(e, 4, &(d as u32));
             set_bytes(e, 5, &(eps as f32));
             e.dispatchThreadgroups_threadsPerThreadgroup(
@@ -230,33 +503,69 @@ kernel void et_ln_bwd(
                 },
             );
         });
-        wrap(out_buf, x.layout.shape().to_vec(), x.dtype)
+        Ok(())
     }
 
-    // Returns (dx, x̂) — dw/db are computed host-side from x̂.
-    pub fn ln_backward(
+    pub fn ln_forward(
+        x: &MetalTensor,
+        weight: &MetalTensor,
+        bias: &MetalTensor,
+        eps: f64,
+    ) -> crate::err::Res<MetalTensor> {
+        let requirements = ln_forward_requirements(
+            x.layout.shape(),
+            x.dtype,
+            weight.layout.shape(),
+            weight.dtype,
+            bias.layout.shape(),
+            bias.dtype,
+        )?;
+        warm_forward_exact(&requirements)?;
+        let x = wrap_contig(x)?;
+        let weight = wrap_contig(weight)?;
+        let bias = wrap_contig(bias)?;
+        let output = wrap(
+            alloc_t(requirements.output.elements, requirements.output.dtype),
+            requirements.output.shape.clone(),
+            requirements.output.dtype,
+        )?;
+        ln_forward_into(&x, &weight, &bias, eps, &output)?;
+        Ok(output)
+    }
+
+    pub fn ln_backward_into(
         x: &MetalTensor,
         weight: &MetalTensor,
         g: &MetalTensor,
         eps: f64,
-    ) -> crate::err::Res<(MetalTensor, MetalTensor)> {
-        let d = weight.numel();
-        let rows = x.numel() / d;
-        let x = wrap_contig(x)?;
-        let weight = wrap_contig(weight)?;
-        let g = wrap_contig(g)?;
-        let dx_buf = alloc_t(x.numel(), x.dtype);
-        let xh_buf = alloc_t(x.numel(), x.dtype);
-        let pipe = pipeline("et_ln_bwd", x.dtype)?;
+        dx: &MetalTensor,
+        normalized: &MetalTensor,
+    ) -> crate::err::Res<()> {
+        let (rows, d) = geometry(
+            x.layout.shape(),
+            x.dtype,
+            weight.layout.shape(),
+            weight.dtype,
+            None,
+            None,
+        )?;
+        if g.layout.shape() != x.layout.shape() || g.dtype != x.dtype {
+            return Err("layer_norm: gradient must match x shape and dtype".to_string());
+        }
+        for (tensor, label) in [(x, "x"), (weight, "weight"), (g, "gradient")] {
+            require_contiguous(tensor, label)?;
+        }
+        require_exact(dx, x.layout.shape(), x.dtype, "dx")?;
+        require_exact(normalized, x.layout.shape(), x.dtype, "normalized")?;
+        let pipe = cached_pipeline("et_ln_bwd", x.dtype)?;
         let sz = x.dtype.size_in_bytes();
-        let off = |o: usize| o * sz;
         MetalDevice::get().with_encoder(|e| {
             e.setComputePipelineState(pipe.as_raw());
-            set_buffer(e, 0, &x.buffer, off(x.layout.offset()));
-            set_buffer(e, 1, &weight.buffer, off(weight.layout.offset()));
-            set_buffer(e, 2, &g.buffer, off(g.layout.offset()));
-            set_buffer(e, 3, &dx_buf, 0);
-            set_buffer(e, 4, &xh_buf, 0);
+            set_buffer(e, 0, &x.buffer, x.layout.offset() * sz);
+            set_buffer(e, 1, &weight.buffer, weight.layout.offset() * sz);
+            set_buffer(e, 2, &g.buffer, g.layout.offset() * sz);
+            set_buffer(e, 3, &dx.buffer, dx.layout.offset() * sz);
+            set_buffer(e, 4, &normalized.buffer, normalized.layout.offset() * sz);
             set_bytes(e, 5, &(d as u32));
             set_bytes(e, 6, &(eps as f32));
             e.dispatchThreadgroups_threadsPerThreadgroup(
@@ -272,9 +581,184 @@ kernel void et_ln_bwd(
                 },
             );
         });
-        Ok((
-            wrap(dx_buf, x.layout.shape().to_vec(), x.dtype)?,
-            wrap(xh_buf, x.layout.shape().to_vec(), x.dtype)?,
-        ))
+        Ok(())
+    }
+
+    // Returns (dx, x_hat); dw/db are computed by the caller from x_hat.
+    pub fn ln_backward(
+        x: &MetalTensor,
+        weight: &MetalTensor,
+        g: &MetalTensor,
+        eps: f64,
+    ) -> crate::err::Res<(MetalTensor, MetalTensor)> {
+        let requirements = ln_backward_requirements(
+            x.layout.shape(),
+            x.dtype,
+            weight.layout.shape(),
+            weight.dtype,
+            g.layout.shape(),
+            g.dtype,
+        )?;
+        warm_backward_exact(&requirements)?;
+        let x = wrap_contig(x)?;
+        let weight = wrap_contig(weight)?;
+        let g = wrap_contig(g)?;
+        let dx = wrap(
+            alloc_t(requirements.dx.elements, requirements.dx.dtype),
+            requirements.dx.shape.clone(),
+            requirements.dx.dtype,
+        )?;
+        let normalized = wrap(
+            alloc_t(
+                requirements.normalized.elements,
+                requirements.normalized.dtype,
+            ),
+            requirements.normalized.shape.clone(),
+            requirements.normalized.dtype,
+        )?;
+        ln_backward_into(&x, &weight, &g, eps, &dx, &normalized)?;
+        Ok((dx, normalized))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::LayerNormTopology;
+    use crate::runtime::cpu::{CpuBuffer, Tensor};
+    use crate::runtime::dtype::DType;
+    use crate::runtime::metal::device::MetalDevice;
+    use crate::runtime::metal::run::MetalTensor;
+
+    fn cpu_f32(tensor: &Tensor) -> &[f32] {
+        let CpuBuffer::F32(values) = &tensor.buffer else {
+            panic!("expected f32 tensor")
+        };
+        values
+    }
+
+    #[test]
+    fn requirements_include_auxiliary_and_topology() {
+        let forward = crate::layer_norm::ln_forward_requirements(
+            &[2, 3, 4],
+            DType::F16,
+            &[3, 4],
+            DType::F16,
+            &[3, 4],
+            DType::F16,
+        )
+        .unwrap();
+        assert_eq!(forward.output.shape, [2, 3, 4]);
+        assert_eq!(forward.rows, 2);
+        assert_eq!(forward.normalized_elements, 12);
+        assert_eq!(
+            forward.topology,
+            LayerNormTopology::Rows {
+                threads: 128,
+                dispatches: 1,
+            }
+        );
+
+        let backward = crate::layer_norm::ln_backward_requirements(
+            &[2, 3, 4],
+            DType::F16,
+            &[3, 4],
+            DType::F16,
+            &[2, 3, 4],
+            DType::F16,
+        )
+        .unwrap();
+        assert_eq!(backward.dx.shape, [2, 3, 4]);
+        assert_eq!(backward.normalized.shape, [2, 3, 4]);
+        assert_eq!(backward.normalized.bytes, 2 * 3 * 4 * 2);
+        assert_eq!(backward.topology, forward.topology);
+    }
+
+    #[test]
+    fn into_matches_allocating_and_cpu_without_allocating() {
+        let dev = MetalDevice::get();
+        let x_values: Vec<f32> = (0..24)
+            .map(|index| (index as f32 * 0.37).sin() * 2.0)
+            .collect();
+        let weight_values: Vec<f32> = (0..12).map(|index| 0.5 + index as f32 * 0.07).collect();
+        let bias_values: Vec<f32> = (0..12).map(|index| index as f32 * 0.03 - 0.1).collect();
+        let gradient_values: Vec<f32> = (0..24).map(|index| (index as f32 * 0.19).cos()).collect();
+        let x = MetalTensor::from_f32(dev, x_values.clone(), vec![2, 3, 4]);
+        let weight = MetalTensor::from_f32(dev, weight_values.clone(), vec![3, 4]);
+        let bias = MetalTensor::from_f32(dev, bias_values.clone(), vec![3, 4]);
+        let gradient = MetalTensor::from_f32(dev, gradient_values.clone(), vec![2, 3, 4]);
+        let eps = 1e-5;
+
+        let forward_req = crate::layer_norm::ln_forward_requirements(
+            x.layout.shape(),
+            x.dtype,
+            weight.layout.shape(),
+            weight.dtype,
+            bias.layout.shape(),
+            bias.dtype,
+        )
+        .unwrap();
+        crate::layer_norm::warm_forward_exact(&forward_req).unwrap();
+        let output = MetalTensor::empty(dev, forward_req.output.shape.clone(), DType::F32);
+        super::reset_test_counts();
+        crate::layer_norm::ln_forward_into(&x, &weight, &bias, eps, &output).unwrap();
+        assert_eq!(super::test_counts(), (0, 0));
+
+        let backward_req = crate::layer_norm::ln_backward_requirements(
+            x.layout.shape(),
+            x.dtype,
+            weight.layout.shape(),
+            weight.dtype,
+            gradient.layout.shape(),
+            gradient.dtype,
+        )
+        .unwrap();
+        crate::layer_norm::warm_backward_exact(&backward_req).unwrap();
+        let dx = MetalTensor::empty(dev, backward_req.dx.shape.clone(), DType::F32);
+        let normalized = MetalTensor::empty(dev, backward_req.normalized.shape.clone(), DType::F32);
+        super::reset_test_counts();
+        crate::layer_norm::ln_backward_into(&x, &weight, &gradient, eps, &dx, &normalized).unwrap();
+        assert_eq!(super::test_counts(), (0, 0));
+
+        let allocated_output = crate::layer_norm::ln_forward(&x, &weight, &bias, eps).unwrap();
+        let (allocated_dx, allocated_normalized) =
+            crate::layer_norm::ln_backward(&x, &weight, &gradient, eps).unwrap();
+        dev.synchronize().unwrap();
+
+        let cpu_x = Tensor::from_vec(x_values, vec![2, 3, 4]);
+        let cpu_weight = Tensor::from_vec(weight_values, vec![3, 4]);
+        let cpu_bias = Tensor::from_vec(bias_values, vec![3, 4]);
+        let cpu_gradient = Tensor::from_vec(gradient_values, vec![2, 3, 4]);
+        let cpu_output =
+            crate::runtime::cpu::composed::layer_norm_forward(&cpu_x, &cpu_weight, &cpu_bias, eps)
+                .contiguous();
+        let (cpu_dx, _, _) = crate::runtime::cpu::composed::layer_norm_backward(
+            &cpu_x,
+            &cpu_weight,
+            &cpu_gradient,
+            eps,
+        );
+        let output_values = output.read_f32().unwrap();
+        let allocated_output = allocated_output.read_f32().unwrap();
+        for ((actual, allocated), expected) in output_values
+            .iter()
+            .zip(&allocated_output)
+            .zip(cpu_f32(&cpu_output))
+        {
+            assert!((actual - expected).abs() < 2e-5);
+            assert!((actual - allocated).abs() < 1e-6);
+        }
+        let dx_values = dx.read_f32().unwrap();
+        let allocated_dx = allocated_dx.read_f32().unwrap();
+        let cpu_dx = cpu_dx.contiguous();
+        for ((actual, allocated), expected) in
+            dx_values.iter().zip(&allocated_dx).zip(cpu_f32(&cpu_dx))
+        {
+            assert!((actual - expected).abs() < 3e-5);
+            assert!((actual - allocated).abs() < 1e-6);
+        }
+        assert_eq!(
+            normalized.read_f32().unwrap(),
+            allocated_normalized.read_f32().unwrap()
+        );
     }
 }

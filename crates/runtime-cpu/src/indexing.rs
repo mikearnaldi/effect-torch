@@ -1,272 +1,727 @@
-use super::tensor::{CpuBuffer, Tensor};
+use super::tensor::{source_index, CpuBuffer, CpuDestination, CpuTensorRequirement, Elem, Tensor};
 use effect_torch_runtime::{DType, Layout};
 
-fn indices_vec(t: &Tensor) -> Vec<usize> {
-    let c = t.contiguous();
-    match &c.buffer {
-        CpuBuffer::U32(v) => v.iter().map(|&x| x as usize).collect(),
-        CpuBuffer::I64(v) => v.iter().map(|&x| x as usize).collect(),
-        CpuBuffer::U8(v) => v.iter().map(|&x| x as usize).collect(),
-        _ => panic!("indices must be u8/u32/i64"),
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IndexingTopology {
+    Direct { passes: usize },
+}
+
+/// Exact caller-owned resources for one layout-aware indexing invocation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IndexingRequirements {
+    pub output: CpuTensorRequirement,
+    /// Optional converted IDs. Direct CPU indexing consumes IDs indirectly, so this is `None`.
+    pub ids: Option<CpuTensorRequirement>,
+    pub scratch: Vec<CpuTensorRequirement>,
+    pub topology: IndexingTopology,
+    pub input_layouts: Vec<Layout>,
+    pub dim: usize,
+}
+
+impl IndexingRequirements {
+    pub fn scratch_bytes(&self) -> usize {
+        self.ids
+            .iter()
+            .chain(&self.scratch)
+            .try_fold(0usize, |total, requirement| {
+                total.checked_add(requirement.bytes)
+            })
+            .expect("indexing scratch byte size overflow")
     }
 }
 
-fn gather_impl<T: super::tensor::Elem>(
-    x: &[T],
-    xl: &Layout,
-    ids: &[usize],
-    ids_shape: &[usize],
-    dim: usize,
-) -> Tensor {
-    let shape = xl.shape();
-    let rank = shape.len();
-    assert!(dim < rank);
-    assert_eq!(ids_shape.len(), rank);
-    let total: usize = ids_shape.iter().product();
-    let mut out = vec![T::default(); total];
-    for (lin, &id) in ids.iter().enumerate() {
-        assert!(id < shape[dim], "gather index out of bounds");
-        let mut rem = lin;
-        let mut base = xl.offset();
-        for d in (0..rank).rev() {
-            let c = ids_shape[d].max(1);
-            let i = rem % c;
-            rem /= c;
-            let coord = if d == dim { id } else { i };
-            base += coord * xl.strides()[d];
-        }
-        out[lin] = x[base];
-    }
-    Tensor::from_vec(out, ids_shape.to_vec())
+fn checked_requirement(
+    shape: &[usize],
+    dtype: DType,
+    operation: &str,
+) -> Result<CpuTensorRequirement, String> {
+    shape
+        .iter()
+        .try_fold(1usize, |total, &dimension| total.checked_mul(dimension))
+        .and_then(|elements| elements.checked_mul(dtype.size_in_bytes()))
+        .ok_or_else(|| format!("{operation}: output byte size overflow"))?;
+    Ok(CpuTensorRequirement::new(shape, dtype))
 }
 
-fn scatter_add_impl<T: super::tensor::Elem + std::ops::Add<Output = T>>(
-    x: &[T],
-    xl: &Layout,
-    ids: &[usize],
-    ids_shape: &[usize],
-    src: &[T],
-    dim: usize,
+fn allocate_output(
+    requirement: CpuTensorRequirement,
+    write: impl FnOnce(&mut CpuDestination<'_>) -> Result<(), String>,
 ) -> Tensor {
-    let shape = xl.shape();
-    let rank = shape.len();
-    let total: usize = ids_shape.iter().product();
-    let mut out = vec![T::default(); xl.numel()];
-    super::tensor::copy_strided(x, xl, &mut out);
-    let out_strides = Layout::contiguous(shape.to_vec());
-    let os = out_strides.strides().to_vec();
-    for lin in 0..total {
-        let id = ids[lin];
-        assert!(id < shape[dim], "scatter_add index out of bounds");
-        let mut rem = lin;
-        let mut base = 0usize;
-        for d in (0..rank).rev() {
-            let c = ids_shape[d].max(1);
-            let i = rem % c;
-            rem /= c;
-            let coord = if d == dim { id } else { i };
-            base += coord * os[d];
-        }
-        out[base] = out[base] + src[lin];
+    let mut output = Tensor::empty(&requirement.shape, requirement.dtype);
+    {
+        let mut destination = output
+            .destination()
+            .expect("new CPU tensor storage must be unique");
+        write(&mut destination).expect("new CPU tensor must satisfy indexing requirements");
     }
-    Tensor::from_vec(out, shape.to_vec())
+    output
 }
 
-fn index_select_impl<T: super::tensor::Elem>(
-    x: &[T],
-    xl: &Layout,
-    ids: &[usize],
-    dim: usize,
-) -> Tensor {
-    let shape = xl.shape();
-    let rank = shape.len();
-    let dstride = xl.strides()[dim];
-    let l = ids.len();
-    let mut out_shape = shape.to_vec();
-    out_shape[dim] = l;
-    let total: usize = out_shape.iter().product();
-    let mut out = vec![T::default(); total];
-    for lin in 0..total {
-        let mut rem = lin;
-        let mut src = xl.offset();
-        for d in (0..rank).rev() {
-            let c = out_shape[d].max(1);
-            let i = rem % c;
-            rem /= c;
-            src += if d == dim {
-                let id = ids[i];
-                assert!(id < shape[dim], "index_select index out of bounds");
-                id * dstride
-            } else {
-                i * xl.strides()[d]
-            };
-        }
-        out[lin] = x[src];
+fn validate_indices(ids: &Tensor, operation: &str) -> Result<(), String> {
+    match ids.dtype() {
+        DType::U8 | DType::U32 | DType::I64 => Ok(()),
+        dtype => Err(format!(
+            "{operation}: indices must be u8/u32/i64, got {dtype}"
+        )),
     }
-    Tensor::from_vec(out, out_shape)
+}
+
+fn index_at(ids: &Tensor, linear: usize, operation: &str) -> Result<usize, String> {
+    let index = source_index(&ids.layout, linear);
+    match &ids.buffer {
+        CpuBuffer::U8(values) => Ok(values[index] as usize),
+        CpuBuffer::U32(values) => Ok(values[index] as usize),
+        CpuBuffer::I64(values) => usize::try_from(values[index])
+            .map_err(|_| format!("{operation}: negative index {}", values[index])),
+        _ => Err(format!(
+            "{operation}: indices must be u8/u32/i64, got {}",
+            ids.dtype()
+        )),
+    }
+}
+
+fn validate_dimension(tensor: &Tensor, dim: usize, operation: &str) -> Result<(), String> {
+    if dim >= tensor.shape().len() {
+        return Err(format!(
+            "{operation}: dimension {dim} is out of bounds for rank {}",
+            tensor.shape().len()
+        ));
+    }
+    Ok(())
+}
+
+fn gather_into_impl<T: Elem>(
+    input: &[T],
+    tensor: &Tensor,
+    dim: usize,
+    ids: &Tensor,
+    destination: &mut CpuDestination<'_>,
+) -> Result<(), String> {
+    destination.write::<T, _>("gather", ids.shape(), |output| -> Result<(), String> {
+        for (linear, value) in output.iter_mut().enumerate() {
+            let id = index_at(ids, linear, "gather")?;
+            if id >= tensor.shape()[dim] {
+                return Err(format!(
+                    "gather: index {id} is out of bounds for extent {}",
+                    tensor.shape()[dim]
+                ));
+            }
+            let mut remainder = linear;
+            let mut input_index = tensor.layout.offset();
+            for dimension in (0..tensor.shape().len()).rev() {
+                let width = ids.shape()[dimension].max(1);
+                let coordinate = remainder % width;
+                remainder /= width;
+                input_index += if dimension == dim {
+                    id * tensor.layout.strides()[dimension]
+                } else {
+                    coordinate * tensor.layout.strides()[dimension]
+                };
+            }
+            *value = input[input_index];
+        }
+        Ok(())
+    })?
+}
+
+fn index_select_into_impl<T: Elem>(
+    input: &[T],
+    tensor: &Tensor,
+    dim: usize,
+    ids: &Tensor,
+    destination: &mut CpuDestination<'_>,
+) -> Result<(), String> {
+    destination.write_current_shaped::<T, _>(
+        "index_select",
+        |output_shape, output| -> Result<(), String> {
+            for (linear, value) in output.iter_mut().enumerate() {
+                let mut remainder = linear;
+                let mut input_index = tensor.layout.offset();
+                for dimension in (0..tensor.shape().len()).rev() {
+                    let width = output_shape[dimension].max(1);
+                    let coordinate = remainder % width;
+                    remainder /= width;
+                    if dimension == dim {
+                        let id = index_at(ids, coordinate, "index_select")?;
+                        if id >= tensor.shape()[dim] {
+                            return Err(format!(
+                                "index_select: index {id} is out of bounds for extent {}",
+                                tensor.shape()[dim]
+                            ));
+                        }
+                        input_index += id * tensor.layout.strides()[dimension];
+                    } else {
+                        input_index += coordinate * tensor.layout.strides()[dimension];
+                    }
+                }
+                *value = input[input_index];
+            }
+            Ok(())
+        },
+    )?
+}
+
+fn scatter_add_into_impl<T: Elem + std::ops::Add<Output = T>>(
+    input: &[T],
+    tensor: &Tensor,
+    dim: usize,
+    ids: &Tensor,
+    source: &[T],
+    source_tensor: &Tensor,
+    destination: &mut CpuDestination<'_>,
+) -> Result<(), String> {
+    destination.write::<T, _>(
+        "scatter_add",
+        tensor.shape(),
+        |output| -> Result<(), String> {
+            super::tensor::copy_strided(input, &tensor.layout, output);
+            for linear in 0..source_tensor.numel() {
+                let id = index_at(ids, linear, "scatter_add")?;
+                if id >= tensor.shape()[dim] {
+                    return Err(format!(
+                        "scatter_add: index {id} is out of bounds for extent {}",
+                        tensor.shape()[dim]
+                    ));
+                }
+                let mut remainder = linear;
+                let mut output_index = 0usize;
+                let mut output_stride = 1usize;
+                for dimension in (0..tensor.shape().len()).rev() {
+                    let width = source_tensor.shape()[dimension].max(1);
+                    let coordinate = remainder % width;
+                    remainder /= width;
+                    output_index += if dimension == dim {
+                        id * output_stride
+                    } else {
+                        coordinate * output_stride
+                    };
+                    output_stride *= tensor.shape()[dimension];
+                }
+                output[output_index] =
+                    output[output_index] + source[source_index(&source_tensor.layout, linear)];
+            }
+            Ok(())
+        },
+    )?
+}
+
+fn cat_strided_into_impl<T: Elem>(
+    tensors: &[&Tensor],
+    dim: usize,
+    destination: &mut CpuDestination<'_>,
+) -> Result<(), String> {
+    destination.write_current_shaped::<T, _>("cat", |output_shape, output| {
+        let inner = output_shape[dim + 1..].iter().product::<usize>();
+        let outer = output_shape[..dim].iter().product::<usize>();
+        let mut dimension_offset = 0usize;
+        for tensor in tensors {
+            let tensor_dimension = tensor.shape()[dim];
+            let input = T::storage_of(&tensor.buffer)
+                .expect("cat dtype validated before dispatch")
+                .as_slice();
+            for outer_index in 0..outer {
+                for dimension_index in 0..tensor_dimension {
+                    for inner_index in 0..inner {
+                        let input_linear = (outer_index * tensor_dimension + dimension_index)
+                            * inner
+                            + inner_index;
+                        let output_linear =
+                            (outer_index * output_shape[dim] + dimension_offset + dimension_index)
+                                * inner
+                                + inner_index;
+                        output[output_linear] = input[source_index(&tensor.layout, input_linear)];
+                    }
+                }
+            }
+            dimension_offset += tensor_dimension;
+        }
+    })
 }
 
 impl Tensor {
-    pub fn gather(&self, dim: usize, ids: &Tensor) -> Tensor {
-        assert_eq!(
-            ids.shape().len(),
-            self.shape().len(),
-            "gather: rank mismatch"
-        );
-        let flat = indices_vec(ids);
-        let ids_shape = ids.shape().to_vec();
-        let xc = self.contiguous();
-        macro_rules! go {
-            ($v:expr) => {
-                gather_impl($v, &self.layout, &flat, &ids_shape, dim)
+    pub fn gather_requirements(
+        &self,
+        dim: usize,
+        ids: &Tensor,
+    ) -> Result<IndexingRequirements, String> {
+        validate_dimension(self, dim, "gather")?;
+        validate_indices(ids, "gather")?;
+        if ids.shape().len() != self.shape().len() {
+            return Err(format!(
+                "gather: index rank {} does not match input rank {}",
+                ids.shape().len(),
+                self.shape().len()
+            ));
+        }
+        for dimension in 0..self.shape().len() {
+            if dimension != dim && ids.shape()[dimension] > self.shape()[dimension] {
+                return Err(format!(
+                    "gather: index extent exceeds input extent at dimension {dimension}"
+                ));
+            }
+        }
+        Ok(IndexingRequirements {
+            output: checked_requirement(ids.shape(), self.dtype(), "gather")?,
+            ids: None,
+            scratch: Vec::new(),
+            topology: IndexingTopology::Direct { passes: 1 },
+            input_layouts: vec![self.layout.clone(), ids.layout.clone()],
+            dim,
+        })
+    }
+
+    pub fn gather_output_requirements(
+        &self,
+        dim: usize,
+        ids: &Tensor,
+    ) -> Result<CpuTensorRequirement, String> {
+        Ok(self.gather_requirements(dim, ids)?.output)
+    }
+
+    pub fn gather_scratch_requirements(
+        &self,
+        dim: usize,
+        ids: &Tensor,
+    ) -> Result<Vec<CpuTensorRequirement>, String> {
+        Ok(self.gather_requirements(dim, ids)?.scratch)
+    }
+
+    pub fn gather_into(
+        &self,
+        dim: usize,
+        ids: &Tensor,
+        destination: &mut CpuDestination<'_>,
+    ) -> Result<(), String> {
+        validate_dimension(self, dim, "gather")?;
+        validate_indices(ids, "gather")?;
+        if ids.shape().len() != self.shape().len() {
+            return Err(format!(
+                "gather: index rank {} does not match input rank {}",
+                ids.shape().len(),
+                self.shape().len()
+            ));
+        }
+        for dimension in 0..self.shape().len() {
+            if dimension != dim && ids.shape()[dimension] > self.shape()[dimension] {
+                return Err(format!(
+                    "gather: index extent exceeds input extent at dimension {dimension}"
+                ));
+            }
+        }
+        macro_rules! gather {
+            ($values:expr) => {
+                gather_into_impl($values, self, dim, ids, destination)
             };
         }
-        match &xc.buffer {
-            CpuBuffer::F32(v) => go!(v),
-            CpuBuffer::F64(v) => go!(v),
-            CpuBuffer::F16(v) => go!(v),
-            CpuBuffer::BF16(v) => go!(v),
-            CpuBuffer::U8(v) => go!(v),
-            CpuBuffer::U32(v) => go!(v),
-            CpuBuffer::I64(v) => go!(v),
+        match &self.buffer {
+            CpuBuffer::F32(values) => gather!(values),
+            CpuBuffer::F64(values) => gather!(values),
+            CpuBuffer::F16(values) => gather!(values),
+            CpuBuffer::BF16(values) => gather!(values),
+            CpuBuffer::U8(values) => gather!(values),
+            CpuBuffer::U32(values) => gather!(values),
+            CpuBuffer::I64(values) => gather!(values),
+        }
+    }
+
+    pub fn gather(&self, dim: usize, ids: &Tensor) -> Tensor {
+        let requirements = self
+            .gather_requirements(dim, ids)
+            .unwrap_or_else(|message| panic!("{message}"));
+        allocate_output(requirements.output, |destination| {
+            self.gather_into(dim, ids, destination)
+        })
+    }
+
+    pub fn index_select_requirements(
+        &self,
+        dim: usize,
+        ids: &Tensor,
+    ) -> Result<IndexingRequirements, String> {
+        validate_dimension(self, dim, "index_select")?;
+        validate_indices(ids, "index_select")?;
+        let mut output_shape = self.shape().to_vec();
+        output_shape[dim] = ids.numel();
+        Ok(IndexingRequirements {
+            output: checked_requirement(&output_shape, self.dtype(), "index_select")?,
+            ids: None,
+            scratch: Vec::new(),
+            topology: IndexingTopology::Direct { passes: 1 },
+            input_layouts: vec![self.layout.clone(), ids.layout.clone()],
+            dim,
+        })
+    }
+
+    pub fn index_select_output_requirements(
+        &self,
+        dim: usize,
+        ids: &Tensor,
+    ) -> Result<CpuTensorRequirement, String> {
+        Ok(self.index_select_requirements(dim, ids)?.output)
+    }
+
+    pub fn index_select_scratch_requirements(
+        &self,
+        dim: usize,
+        ids: &Tensor,
+    ) -> Result<Vec<CpuTensorRequirement>, String> {
+        Ok(self.index_select_requirements(dim, ids)?.scratch)
+    }
+
+    pub fn index_select_into(
+        &self,
+        dim: usize,
+        ids: &Tensor,
+        destination: &mut CpuDestination<'_>,
+    ) -> Result<(), String> {
+        validate_dimension(self, dim, "index_select")?;
+        validate_indices(ids, "index_select")?;
+        if destination.shape().len() != self.shape().len() {
+            return Err(format!(
+                "index_select destination rank mismatch: expected {}, got {}",
+                self.shape().len(),
+                destination.shape().len()
+            ));
+        }
+        for dimension in 0..self.shape().len() {
+            let expected = if dimension == dim {
+                ids.numel()
+            } else {
+                self.shape()[dimension]
+            };
+            if destination.shape()[dimension] != expected {
+                return Err(format!(
+                    "index_select destination shape mismatch at dimension {dimension}: expected {expected}, got {}",
+                    destination.shape()[dimension]
+                ));
+            }
+        }
+        macro_rules! index_select {
+            ($values:expr) => {
+                index_select_into_impl($values, self, dim, ids, destination)
+            };
+        }
+        match &self.buffer {
+            CpuBuffer::F32(values) => index_select!(values),
+            CpuBuffer::F64(values) => index_select!(values),
+            CpuBuffer::F16(values) => index_select!(values),
+            CpuBuffer::BF16(values) => index_select!(values),
+            CpuBuffer::U8(values) => index_select!(values),
+            CpuBuffer::U32(values) => index_select!(values),
+            CpuBuffer::I64(values) => index_select!(values),
         }
     }
 
     pub fn index_select(&self, dim: usize, ids: &Tensor) -> Tensor {
-        let flat = indices_vec(ids);
-        assert_eq!(flat.len(), ids.numel(), "index_select ids must be 1-D");
-        let xc = self.contiguous();
-        macro_rules! go {
-            ($v:expr) => {
-                index_select_impl($v, &self.layout, &flat, dim)
+        let requirements = self
+            .index_select_requirements(dim, ids)
+            .unwrap_or_else(|message| panic!("{message}"));
+        allocate_output(requirements.output, |destination| {
+            self.index_select_into(dim, ids, destination)
+        })
+    }
+
+    pub fn scatter_add_requirements(
+        &self,
+        dim: usize,
+        ids: &Tensor,
+        src: &Tensor,
+    ) -> Result<IndexingRequirements, String> {
+        validate_dimension(self, dim, "scatter_add")?;
+        validate_indices(ids, "scatter_add")?;
+        if self.dtype() != src.dtype() {
+            return Err(format!(
+                "scatter_add: source dtype {} does not match input dtype {}",
+                src.dtype(),
+                self.dtype()
+            ));
+        }
+        if ids.shape() != src.shape() {
+            return Err(format!(
+                "scatter_add: indexes shape {:?} does not match source shape {:?}",
+                ids.shape(),
+                src.shape()
+            ));
+        }
+        if src.shape().len() != self.shape().len() {
+            return Err(format!(
+                "scatter_add: source rank {} does not match input rank {}",
+                src.shape().len(),
+                self.shape().len()
+            ));
+        }
+        for dimension in 0..self.shape().len() {
+            if dimension != dim && src.shape()[dimension] > self.shape()[dimension] {
+                return Err(format!(
+                    "scatter_add: source extent exceeds input at dimension {dimension}"
+                ));
+            }
+        }
+        Ok(IndexingRequirements {
+            output: checked_requirement(self.shape(), self.dtype(), "scatter_add")?,
+            ids: None,
+            scratch: Vec::new(),
+            topology: IndexingTopology::Direct { passes: 2 },
+            input_layouts: vec![self.layout.clone(), ids.layout.clone(), src.layout.clone()],
+            dim,
+        })
+    }
+
+    pub fn scatter_add_output_requirements(
+        &self,
+        dim: usize,
+        ids: &Tensor,
+        src: &Tensor,
+    ) -> Result<CpuTensorRequirement, String> {
+        Ok(self.scatter_add_requirements(dim, ids, src)?.output)
+    }
+
+    pub fn scatter_add_scratch_requirements(
+        &self,
+        dim: usize,
+        ids: &Tensor,
+        src: &Tensor,
+    ) -> Result<Vec<CpuTensorRequirement>, String> {
+        Ok(self.scatter_add_requirements(dim, ids, src)?.scratch)
+    }
+
+    pub fn scatter_add_into(
+        &self,
+        dim: usize,
+        ids: &Tensor,
+        src: &Tensor,
+        destination: &mut CpuDestination<'_>,
+    ) -> Result<(), String> {
+        validate_dimension(self, dim, "scatter_add")?;
+        validate_indices(ids, "scatter_add")?;
+        if self.dtype() != src.dtype() {
+            return Err(format!(
+                "scatter_add: source dtype {} does not match input dtype {}",
+                src.dtype(),
+                self.dtype()
+            ));
+        }
+        if ids.shape() != src.shape() {
+            return Err(format!(
+                "scatter_add: indexes shape {:?} does not match source shape {:?}",
+                ids.shape(),
+                src.shape()
+            ));
+        }
+        if src.shape().len() != self.shape().len() {
+            return Err(format!(
+                "scatter_add: source rank {} does not match input rank {}",
+                src.shape().len(),
+                self.shape().len()
+            ));
+        }
+        for dimension in 0..self.shape().len() {
+            if dimension != dim && src.shape()[dimension] > self.shape()[dimension] {
+                return Err(format!(
+                    "scatter_add: source extent exceeds input at dimension {dimension}"
+                ));
+            }
+        }
+        macro_rules! scatter_add {
+            ($input:expr, $source:expr) => {
+                scatter_add_into_impl($input, self, dim, ids, $source, src, destination)
             };
         }
-        match &xc.buffer {
-            CpuBuffer::F32(v) => go!(v),
-            CpuBuffer::F64(v) => go!(v),
-            CpuBuffer::F16(v) => go!(v),
-            CpuBuffer::BF16(v) => go!(v),
-            CpuBuffer::U8(v) => go!(v),
-            CpuBuffer::U32(v) => go!(v),
-            CpuBuffer::I64(v) => go!(v),
+        match (&self.buffer, &src.buffer) {
+            (CpuBuffer::F32(input), CpuBuffer::F32(source)) => scatter_add!(input, source),
+            (CpuBuffer::F64(input), CpuBuffer::F64(source)) => scatter_add!(input, source),
+            (CpuBuffer::F16(input), CpuBuffer::F16(source)) => scatter_add!(input, source),
+            (CpuBuffer::BF16(input), CpuBuffer::BF16(source)) => scatter_add!(input, source),
+            (CpuBuffer::U8(input), CpuBuffer::U8(source)) => scatter_add!(input, source),
+            (CpuBuffer::U32(input), CpuBuffer::U32(source)) => scatter_add!(input, source),
+            (CpuBuffer::I64(input), CpuBuffer::I64(source)) => scatter_add!(input, source),
+            _ => unreachable!("dtype checked before dispatch"),
         }
     }
 
     pub fn scatter_add(&self, dim: usize, ids: &Tensor, src: &Tensor) -> Tensor {
-        assert_eq!(self.dtype(), src.dtype(), "mixed dtypes");
-        assert_eq!(
-            ids.shape(),
-            src.shape(),
-            "scatter_add: indexes shape must match src shape"
-        );
-        let flat = indices_vec(ids);
-        let ids_shape = ids.shape().to_vec();
-        let src_c = src.contiguous();
-        macro_rules! go {
-            ($x:expr, $s:expr) => {
-                scatter_add_impl($x, &self.layout, &flat, &ids_shape, $s, dim)
-            };
+        let requirements = self
+            .scatter_add_requirements(dim, ids, src)
+            .unwrap_or_else(|message| panic!("{message}"));
+        allocate_output(requirements.output, |destination| {
+            self.scatter_add_into(dim, ids, src, destination)
+        })
+    }
+
+    pub fn cat_requirements(
+        tensors: &[&Tensor],
+        dim: usize,
+    ) -> Result<IndexingRequirements, String> {
+        let Some(first) = tensors.first() else {
+            return Err("cat: tensors must not be empty".to_string());
+        };
+        let dtype = first.dtype();
+        let rank = first.shape().len();
+        if dim >= rank {
+            return Err(format!(
+                "cat: dimension {dim} is out of bounds for rank {rank}"
+            ));
         }
-        match (&self.buffer, &src_c.buffer) {
-            (CpuBuffer::F32(x), CpuBuffer::F32(s)) => go!(x, s),
-            (CpuBuffer::F64(x), CpuBuffer::F64(s)) => go!(x, s),
-            (CpuBuffer::F16(x), CpuBuffer::F16(s)) => go!(x, s),
-            (CpuBuffer::BF16(x), CpuBuffer::BF16(s)) => go!(x, s),
-            (CpuBuffer::U8(x), CpuBuffer::U8(s)) => go!(x, s),
-            (CpuBuffer::U32(x), CpuBuffer::U32(s)) => go!(x, s),
-            (CpuBuffer::I64(x), CpuBuffer::I64(s)) => go!(x, s),
-            _ => unreachable!("dtype checked above"),
+        let mut output_shape = first.shape().to_vec();
+        let mut concatenated = 0usize;
+        for tensor in tensors {
+            if tensor.dtype() != dtype || tensor.shape().len() != rank {
+                return Err("cat: all inputs must have the same dtype and rank".to_string());
+            }
+            for dimension in 0..rank {
+                if dimension != dim && tensor.shape()[dimension] != output_shape[dimension] {
+                    return Err(format!("cat: shape mismatch at dimension {dimension}"));
+                }
+            }
+            concatenated = concatenated
+                .checked_add(tensor.shape()[dim])
+                .ok_or_else(|| "cat: concatenated dimension overflow".to_string())?;
+        }
+        output_shape[dim] = concatenated;
+        Ok(IndexingRequirements {
+            output: checked_requirement(&output_shape, dtype, "cat")?,
+            ids: None,
+            scratch: Vec::new(),
+            topology: IndexingTopology::Direct {
+                passes: tensors.len(),
+            },
+            input_layouts: tensors.iter().map(|tensor| tensor.layout.clone()).collect(),
+            dim,
+        })
+    }
+
+    pub fn cat_output_requirements(
+        tensors: &[&Tensor],
+        dim: usize,
+    ) -> Result<CpuTensorRequirement, String> {
+        Ok(Self::cat_requirements(tensors, dim)?.output)
+    }
+
+    pub fn cat_scratch_requirements(
+        tensors: &[&Tensor],
+        dim: usize,
+    ) -> Result<Vec<CpuTensorRequirement>, String> {
+        Ok(Self::cat_requirements(tensors, dim)?.scratch)
+    }
+
+    pub fn cat_into(
+        tensors: &[&Tensor],
+        dim: usize,
+        destination: &mut CpuDestination<'_>,
+    ) -> Result<(), String> {
+        let Some(first) = tensors.first() else {
+            return Err("cat: tensors must not be empty".to_string());
+        };
+        let rank = first.shape().len();
+        if dim >= rank {
+            return Err(format!(
+                "cat: dimension {dim} is out of bounds for rank {rank}"
+            ));
+        }
+        if destination.shape().len() != rank {
+            return Err(format!(
+                "cat destination rank mismatch: expected {rank}, got {}",
+                destination.shape().len()
+            ));
+        }
+        let mut concatenated = 0usize;
+        for tensor in tensors {
+            if tensor.dtype() != first.dtype() {
+                return Err(format!(
+                    "cat: input dtype {} does not match {}",
+                    tensor.dtype(),
+                    first.dtype()
+                ));
+            }
+            if tensor.shape().len() != rank {
+                return Err(format!(
+                    "cat: input rank {} does not match {rank}",
+                    tensor.shape().len()
+                ));
+            }
+            for dimension in 0..rank {
+                if dimension != dim && tensor.shape()[dimension] != first.shape()[dimension] {
+                    return Err(format!("cat: shape mismatch at dimension {dimension}"));
+                }
+            }
+            concatenated = concatenated
+                .checked_add(tensor.shape()[dim])
+                .ok_or_else(|| "cat: concatenated dimension overflow".to_string())?;
+        }
+        for dimension in 0..rank {
+            let expected = if dimension == dim {
+                concatenated
+            } else {
+                first.shape()[dimension]
+            };
+            if destination.shape()[dimension] != expected {
+                return Err(format!(
+                    "cat destination shape mismatch at dimension {dimension}: expected {expected}, got {}",
+                    destination.shape()[dimension]
+                ));
+            }
+        }
+        match first.dtype() {
+            DType::F32 => cat_strided_into_impl::<f32>(tensors, dim, destination),
+            DType::F64 => cat_strided_into_impl::<f64>(tensors, dim, destination),
+            DType::F16 => cat_strided_into_impl::<half::f16>(tensors, dim, destination),
+            DType::BF16 => cat_strided_into_impl::<half::bf16>(tensors, dim, destination),
+            DType::U8 => cat_strided_into_impl::<u8>(tensors, dim, destination),
+            DType::U32 => cat_strided_into_impl::<u32>(tensors, dim, destination),
+            DType::I64 => cat_strided_into_impl::<i64>(tensors, dim, destination),
         }
     }
 
     pub fn cat(tensors: &[&Tensor], dim: usize) -> Tensor {
-        assert!(!tensors.is_empty());
-        let dtype = tensors[0].dtype();
-        let rank = tensors[0].shape().len();
-        assert!(dim < rank);
-        let mut out_shape = tensors[0].shape().to_vec();
-        for t in tensors {
-            assert_eq!(t.dtype(), dtype, "mixed dtypes");
-            assert_eq!(t.shape().len(), rank, "cat rank mismatch");
-            for d in 0..rank {
-                if d != dim {
-                    assert_eq!(t.shape()[d], out_shape[d], "cat shape mismatch");
-                }
-            }
-        }
-        out_shape[dim] = tensors.iter().map(|t| t.shape()[dim]).sum();
-        let out_n: usize = out_shape.iter().product();
-        let inner: usize = out_shape[dim + 1..].iter().product();
-        let outer: usize = out_shape[..dim].iter().product();
-
-        macro_rules! go {
-            ($variant:ident, $t:ty) => {{
-                let mut out = vec![<$t>::default(); out_n];
-                let mut dim_off = 0usize;
-                for t in tensors {
-                    let tc = t.contiguous();
-                    let CpuBuffer::$variant(data) = &tc.buffer else {
-                        unreachable!()
-                    };
-                    let tdim = t.shape()[dim];
-                    for o in 0..outer {
-                        let s = o * tdim * inner;
-                        let d = o * out_shape[dim] * inner + dim_off * inner;
-                        out[d..d + tdim * inner].copy_from_slice(&data[s..s + tdim * inner]);
-                    }
-                    dim_off += tdim;
-                }
-                Tensor::from_vec(out, out_shape.clone())
-            }};
-        }
-        match dtype {
-            DType::F32 => go!(F32, f32),
-            DType::F64 => go!(F64, f64),
-            DType::F16 => go!(F16, half::f16),
-            DType::BF16 => go!(BF16, half::bf16),
-            DType::U8 => go!(U8, u8),
-            DType::U32 => go!(U32, u32),
-            DType::I64 => go!(I64, i64),
-        }
+        let requirements =
+            Self::cat_requirements(tensors, dim).unwrap_or_else(|message| panic!("{message}"));
+        allocate_output(requirements.output, |destination| {
+            Self::cat_into(tensors, dim, destination)
+        })
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{ExecutableAllocationGuard, CPU_STORAGE_ALIGNMENT};
+    use effect_torch_runtime::Layout;
 
-    fn f32_data(t: &Tensor) -> Vec<f32> {
-        let CpuBuffer::F32(v) = &t.buffer else {
+    fn f32_data(tensor: &Tensor) -> Vec<f32> {
+        let CpuBuffer::F32(values) = &tensor.buffer else {
             panic!()
         };
-        v.as_slice().to_vec()
+        values.as_slice().to_vec()
     }
 
     #[test]
     fn gather_rows() {
-        let x = Tensor::from_vec((0..6).map(|v| v as f32).collect(), vec![2, 3]);
+        let x = Tensor::from_vec((0..6).map(|value| value as f32).collect(), vec![2, 3]);
         let ids = Tensor::from_vec(vec![1u32, 1, 1, 0, 0, 0, 1, 1, 1], vec![3, 3]);
-        let g = x.gather(0, &ids);
-        assert_eq!(g.shape(), &[3, 3]);
-        assert_eq!(f32_data(&g), vec![3., 4., 5., 0., 1., 2., 3., 4., 5.]);
+        let gathered = x.gather(0, &ids);
+        assert_eq!(gathered.shape(), &[3, 3]);
+        assert_eq!(
+            f32_data(&gathered),
+            vec![3., 4., 5., 0., 1., 2., 3., 4., 5.]
+        );
     }
 
     #[test]
     fn index_select_dim1() {
-        let x = Tensor::from_vec((0..6).map(|v| v as f32).collect(), vec![2, 3]);
+        let x = Tensor::from_vec((0..6).map(|value| value as f32).collect(), vec![2, 3]);
         let ids = Tensor::from_vec(vec![2u32, 0], vec![2]);
-        let g = x.index_select(1, &ids);
-        assert_eq!(g.shape(), &[2, 2]);
-        assert_eq!(f32_data(&g), vec![2., 0., 5., 3.]);
+        let selected = x.index_select(1, &ids);
+        assert_eq!(selected.shape(), &[2, 2]);
+        assert_eq!(f32_data(&selected), vec![2., 0., 5., 3.]);
     }
 
     #[test]
     fn scatter_add_embedding() {
         let table = Tensor::zeros(&[4, 2], DType::F32);
         let ids = Tensor::from_vec(vec![1u32, 1, 3, 3], vec![2, 2]);
-        let src = Tensor::from_vec(vec![1f32, 2., 3., 4.], vec![2, 2]);
-        let out = table.scatter_add(0, &ids, &src);
-        assert_eq!(f32_data(&out), vec![0., 0., 1., 2., 0., 0., 3., 4.]);
+        let source = Tensor::from_vec(vec![1f32, 2., 3., 4.], vec![2, 2]);
+        let output = table.scatter_add(0, &ids, &source);
+        assert_eq!(f32_data(&output), vec![0., 0., 1., 2., 0., 0., 3., 4.]);
     }
 
     #[test]
@@ -279,5 +734,133 @@ mod tests {
         let d = Tensor::cat(&[&a, &a], 1);
         assert_eq!(d.shape(), &[1, 4]);
         assert_eq!(f32_data(&d), vec![1., 2., 1., 2.]);
+    }
+
+    #[test]
+    fn exact_requirements_and_into_match_wrappers() {
+        let input = Tensor::from_vec((0..6).map(|value| value as f32).collect(), vec![2, 3]);
+        let ids = Tensor::from_vec(vec![2i64, 0], vec![2]);
+        let requirements = input.index_select_requirements(1, &ids).unwrap();
+        assert_eq!(requirements.output.shape, vec![2, 2]);
+        assert_eq!(requirements.output.dtype, DType::F32);
+        assert_eq!(requirements.output.bytes, 4 * std::mem::size_of::<f32>());
+        assert_eq!(requirements.output.alignment, CPU_STORAGE_ALIGNMENT);
+        assert!(requirements.ids.is_none());
+        assert!(requirements.scratch.is_empty());
+        assert_eq!(requirements.scratch_bytes(), 0);
+
+        let mut output = Tensor::empty(&requirements.output.shape, requirements.output.dtype);
+        input
+            .index_select_into(1, &ids, &mut output.destination().unwrap())
+            .unwrap();
+        assert_eq!(f32_data(&output), f32_data(&input.index_select(1, &ids)));
+
+        let cat = Tensor::cat_requirements(&[&input, &input], 0).unwrap();
+        assert_eq!(cat.output.shape, vec![4, 3]);
+        assert_eq!(cat.output.bytes, 12 * std::mem::size_of::<f32>());
+        assert_eq!(cat.output.alignment, CPU_STORAGE_ALIGNMENT);
+
+        let gather_ids = Tensor::from_vec(vec![2u8, 0, 1, 1], vec![2, 2]);
+        let gather_requirements = input.gather_requirements(1, &gather_ids).unwrap();
+        let mut gathered = Tensor::empty(
+            &gather_requirements.output.shape,
+            gather_requirements.output.dtype,
+        );
+        input
+            .gather_into(1, &gather_ids, &mut gathered.destination().unwrap())
+            .unwrap();
+        assert_eq!(f32_data(&gathered), f32_data(&input.gather(1, &gather_ids)));
+
+        let source = Tensor::from_vec(vec![1f32, 2., 3., 4.], vec![2, 2]);
+        let scatter_requirements = input
+            .scatter_add_requirements(1, &gather_ids, &source)
+            .unwrap();
+        let mut scattered = Tensor::empty(
+            &scatter_requirements.output.shape,
+            scatter_requirements.output.dtype,
+        );
+        input
+            .scatter_add_into(
+                1,
+                &gather_ids,
+                &source,
+                &mut scattered.destination().unwrap(),
+            )
+            .unwrap();
+        assert_eq!(
+            f32_data(&scattered),
+            f32_data(&input.scatter_add(1, &gather_ids, &source))
+        );
+
+        let mut concatenated = Tensor::empty(&cat.output.shape, cat.output.dtype);
+        Tensor::cat_into(
+            &[&input, &input],
+            0,
+            &mut concatenated.destination().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            f32_data(&concatenated),
+            f32_data(&Tensor::cat(&[&input, &input], 0))
+        );
+    }
+
+    #[test]
+    fn into_rejects_invalid_destinations() {
+        let input = Tensor::from_vec((0..6).map(|value| value as f32).collect(), vec![2, 3]);
+        let ids = Tensor::from_vec(vec![2u32, 0], vec![2]);
+        let mut wrong_shape = Tensor::zeros(&[4], DType::F32);
+        assert!(input
+            .index_select_into(1, &ids, &mut wrong_shape.destination().unwrap())
+            .is_err());
+
+        let mut wrong_dtype = Tensor::zeros(&[2, 2], DType::F64);
+        assert!(input
+            .index_select_into(1, &ids, &mut wrong_dtype.destination().unwrap())
+            .is_err());
+
+        let short = Tensor::from_vec(vec![0.0f32; 3], vec![3]);
+        let mut insufficient = Tensor {
+            buffer: short.buffer,
+            layout: Layout::contiguous(vec![2, 2]),
+        };
+        assert!(input
+            .index_select_into(1, &ids, &mut insufficient.destination().unwrap())
+            .is_err());
+    }
+
+    #[test]
+    fn caller_destinations_run_under_execution_guard_without_materialization() {
+        let input = Tensor::from_vec((0..6).map(|value| value as f32).collect(), vec![2, 3]);
+        let input = input.view(input.layout.permute(&[1, 0]));
+        let ids = Tensor::from_vec(vec![1i64, 0], vec![2]);
+        let mut selected = Tensor::empty(&[3, 2], DType::F32);
+        let mut gathered = Tensor::empty(&[2, 2], DType::F32);
+        let gather_ids = Tensor::from_vec(vec![2u8, 0, 1, 1], vec![2, 2]);
+        let source = Tensor::from_vec(vec![1f32, 2., 3., 4.], vec![2, 2]);
+        let base = Tensor::zeros(&[3, 2], DType::F32);
+        let mut scattered = Tensor::empty(&[3, 2], DType::F32);
+        let mut concatenated = Tensor::empty(&[6, 2], DType::F32);
+
+        let _guard = ExecutableAllocationGuard::enter();
+        input
+            .index_select_into(1, &ids, &mut selected.destination().unwrap())
+            .unwrap();
+        input
+            .gather_into(0, &gather_ids, &mut gathered.destination().unwrap())
+            .unwrap();
+        base.scatter_add_into(
+            0,
+            &gather_ids,
+            &source,
+            &mut scattered.destination().unwrap(),
+        )
+        .unwrap();
+        Tensor::cat_into(
+            &[&selected, &selected],
+            0,
+            &mut concatenated.destination().unwrap(),
+        )
+        .unwrap();
     }
 }

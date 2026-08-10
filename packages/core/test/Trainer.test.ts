@@ -118,7 +118,12 @@ onDevices("Trainer", (device) => (it) => {
             )
         })
         runs.push([])
-        yield* trainer.train()
+        const first = yield* trainer.train()
+        const firstOwned = [
+          ...first.params,
+          ...trainer.config.optimizer.stateRoots(first.state).filter(Tensor.isTensor)
+        ]
+        yield* Effect.forEach(Array.from(new Set(firstOwned)), (tensor) => Tensor.clear(tensor), { discard: true })
         runs.push([])
         yield* trainer.train()
         expect(runs).toEqual([[0, 100, 200], [0, 100, 200]])

@@ -27,7 +27,8 @@ layer(BackendCpu.layer)("Runtime", (it) => {
         const lazyError = yield* Effect.flip(apple.node({ op: "relu", inputs: [graph] }))
         expect(lazyError.reason).toBe("foreign-handle")
 
-        const [value] = yield* cpu.evaluate([graph])
+        const executable = yield* cpu.compile({ roots: [graph] })
+        const [value] = yield* cpu.execute(executable, { bindings: [], scalars: [], runtimeValues: {} })
         const concreteError = yield* Effect.flip(apple.readback(value))
         expect(concreteError.reason).toBe("foreign-handle")
         yield* cpu.release(value)
@@ -49,7 +50,8 @@ layer(BackendCpu.layer)("Runtime", (it) => {
         inputs: [],
         attributes: { shape: [1], dtype: "f32" }
       })
-      const [value] = yield* cpu.evaluate([graph])
+      const executable = yield* cpu.compile({ roots: [graph] })
+      const [value] = yield* cpu.execute(executable, { bindings: [], scalars: [], runtimeValues: {} })
       yield* cpu.release(value)
       const releasedTensorError = yield* Effect.flip(cpu.readback(value))
       expect(releasedTensorError.reason).toBe("invalid-handle")
@@ -61,7 +63,14 @@ layer(BackendCpu.layer)("Runtime", (it) => {
         headDim: 2,
         maxTokens: 16,
         blockSize: 4,
-        dtype: "f32"
+        dtype: "f32",
+        kdaLayers: 0,
+        kdaHeads: 0,
+        kdaHeadDim: 0,
+        kdaValueDim: 0,
+        convLayers: 0,
+        convChannels: 0,
+        convKernel: 0
       })
       const sequence = yield* decode.makeSequence(pool)
       yield* decode.releaseSequence(sequence)

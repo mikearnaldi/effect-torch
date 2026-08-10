@@ -33,10 +33,11 @@ const makeRopeGpt = Effect.gen(function*() {
 const ids = (tokens: ReadonlyArray<number>) => Tensor.fromTypedArray(new Uint32Array(tokens), [1, tokens.length])
 
 const argmaxOf = (logits: Tensor.Any) =>
-  Effect.map(
-    Tensor.toNumberArray(logits),
-    (values) => values.reduce((best, value, index) => (value > values[best] ? index : best), 0)
-  )
+  Effect.gen(function*() {
+    const values = yield* Tensor.toNumberArray(logits)
+    if (Tensor.isTensor(logits)) yield* Tensor.clear(logits)
+    return values.reduce((best, value, index) => (value > values[best] ? index : best), 0)
+  })
 
 // The reference: greedy generation through the ordinary forward graph,
 // recomputing the whole context every step.
@@ -464,7 +465,9 @@ onDevices("Inference", () => (it) => {
       Effect.gen(function*() {
         const model = yield* makeGpt()
         const params = yield* Tensor.compute(yield* model.init)
-        const program = yield* Model.inference(model, params, { maxTokens: 64, blockSize: 4, decodeBatch: 8 })
+        // Three blocks fit the reference plus two active sequences exactly;
+        // inactive padding rows must not reserve KV capacity.
+        const program = yield* Model.inference(model, params, { maxTokens: 12, blockSize: 4, decodeBatch: 8 })
         // Sequential reference, single-sequence path.
         const ref = yield* program.generation()
         const r1 = yield* ref.add(yield* ids([3, 1, 4]))

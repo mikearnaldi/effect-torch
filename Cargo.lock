@@ -290,7 +290,6 @@ dependencies = [
  "effect-torch-runtime",
  "half",
  "libm",
- "matrixmultiply",
  "napi",
  "napi-build 1.2.1",
  "napi-derive",

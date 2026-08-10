@@ -7,8 +7,5 @@ pub mod layout {
 }
 
 pub mod metal {
-    pub use crate::{
-        arena, composed, conv, device, flash, indexing, kda, kernels, layer_norm, linear, loss,
-        ops, paged, rotary, run, shortconv,
-    };
+    pub use crate::{device, run};
 }

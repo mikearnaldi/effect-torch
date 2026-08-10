@@ -2876,12 +2876,10 @@ pub fn remap_children<E: FusionExpression>(
             g: f(g),
             ignore_index: *ignore_index,
         },
-        NodeKind::ChunkedHeadCeBackwardOut { of, index } => {
-            NodeKind::ChunkedHeadCeBackwardOut {
-                of: f(of),
-                index: *index,
-            }
-        }
+        NodeKind::ChunkedHeadCeBackwardOut { of, index } => NodeKind::ChunkedHeadCeBackwardOut {
+            of: f(of),
+            index: *index,
+        },
         NodeKind::KdaBackward {
             q,
             k,

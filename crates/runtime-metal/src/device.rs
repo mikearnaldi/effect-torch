@@ -1,4 +1,3 @@
-use super::arena;
 use crate::runtime::dtype::DType;
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
@@ -6,9 +5,10 @@ use objc2_metal::{
     MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder,
     MTLComputePipelineState, MTLDevice, MTLLibrary, MTLResourceOptions, MTLSize,
 };
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::ptr::NonNull;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
 const PROBES: usize = 8;
 const MAX_BUCKET: usize = 4096;
@@ -17,9 +17,110 @@ const DISPATCHES_PER_BUFFER: usize = 4096;
 pub static DISPATCHES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static SYNCS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static SYNC_NANOS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static PIPELINE_COMPILE_MISSES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub static EXECUTABLE_PIPELINE_MISS_ATTEMPTS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub static EXECUTABLE_ALLOCATION_ATTEMPTS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
 
-// Bytes of driver-allocated root buffers currently alive (pool, arenas,
-// uploads — suballocations share their arena's root and are not
+#[cfg(test)]
+thread_local! {
+    static TEST_DEVICE_BUFFER_ALLOCATIONS: Cell<usize> = const { Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn reset_test_device_buffer_allocations() {
+    TEST_DEVICE_BUFFER_ALLOCATIONS.with(|count| count.set(0));
+}
+
+#[cfg(test)]
+pub(crate) fn test_device_buffer_allocations() -> usize {
+    TEST_DEVICE_BUFFER_ALLOCATIONS.with(Cell::get)
+}
+
+#[cfg(test)]
+fn record_test_device_buffer_allocation() {
+    TEST_DEVICE_BUFFER_ALLOCATIONS.with(|count| count.set(count.get() + 1));
+}
+
+// One logical Metal command stream at a time. The encoder manager itself is
+// mutex-protected per dispatch, but interleaving whole operation sequences can
+// let one thread synchronize and inspect another thread's partial sequence.
+static EXECUTION_LOCK: Mutex<()> = Mutex::new(());
+
+thread_local! {
+    static EXECUTION_GUARD: RefCell<Option<MutexGuard<'static, ()>>> = const { RefCell::new(None) };
+    static EXPLICIT_EXECUTION_DEPTH: Cell<usize> = const { Cell::new(0) };
+}
+
+fn claim_execution() {
+    EXECUTION_GUARD.with(|guard| {
+        if guard.borrow().is_none() {
+            *guard.borrow_mut() = Some(
+                EXECUTION_LOCK
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner()),
+            );
+        }
+    });
+}
+
+fn release_automatic_execution() {
+    if EXPLICIT_EXECUTION_DEPTH.with(Cell::get) == 0 {
+        EXECUTION_GUARD.with(|guard| {
+            guard.borrow_mut().take();
+        });
+    }
+}
+
+pub(crate) struct MetalExecutionGuard;
+
+pub(crate) fn begin_execution() -> MetalExecutionGuard {
+    claim_execution();
+    EXPLICIT_EXECUTION_DEPTH.with(|depth| depth.set(depth.get() + 1));
+    MetalExecutionGuard
+}
+
+#[cfg(test)]
+pub(crate) fn execution_claimed_for_test() -> bool {
+    EXECUTION_GUARD.with(|guard| guard.borrow().is_some())
+}
+
+impl Drop for MetalExecutionGuard {
+    fn drop(&mut self) {
+        EXPLICIT_EXECUTION_DEPTH.with(|depth| {
+            let next = depth.get().saturating_sub(1);
+            depth.set(next);
+            if next == 0 {
+                EXECUTION_GUARD.with(|guard| {
+                    guard.borrow_mut().take();
+                });
+            }
+        });
+    }
+}
+
+struct AutomaticExecutionRelease;
+
+impl Drop for AutomaticExecutionRelease {
+    fn drop(&mut self) {
+        release_automatic_execution();
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static INJECTED_PRIOR_FAILURE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+pub fn inject_prior_command_buffer_failure_for_test() {
+    INJECTED_PRIOR_FAILURE.with(|failure| failure.set(true));
+}
+
+// Bytes of driver-allocated root buffers currently alive (pool, workspace,
+// uploads). Suballocations share their segment's root and are not
 // counted). A hard ceiling, set with EFFECT_TORCH_MEMORY_CAP_MB, turns
 // memory runaways into a loud failure instead of a system freeze.
 pub static LIVE_BYTES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -89,6 +190,13 @@ fn memory_budget() -> usize {
     })
 }
 
+/// Forces all process-global memory policy environment reads at compilation.
+/// Subsequent execution only observes these immutable snapshots.
+pub fn snapshot_global_environment() {
+    let _ = memory_cap();
+    let _ = memory_budget();
+}
+
 pub fn dispatch_stats_reset() -> (u64, u64, u64) {
     let d = DISPATCHES.swap(0, std::sync::atomic::Ordering::Relaxed);
     let s = SYNCS.swap(0, std::sync::atomic::Ordering::Relaxed);
@@ -100,12 +208,12 @@ const SWEEP_MS: u64 = 100;
 pub struct Buffer {
     raw: Retained<ProtocolObject<dyn MTLBuffer>>,
     pub size: usize,
-    // Byte offset of this buffer's start within `raw` — nonzero for
-    // arena suballocations, which share one underlying MTLBuffer.
+    // Byte offset of this buffer's start within `raw`; planned slices share
+    // one underlying MTLBuffer.
     pub base: usize,
-    // Whether this handle owns driver memory (roots) or shares an
-    // arena's root (suballocations) — drives live-bytes accounting.
+    // Whether this handle owns driver memory or retains a segment root.
     counted: bool,
+    _owner: Option<Arc<Buffer>>,
 }
 
 impl Drop for Buffer {
@@ -123,18 +231,18 @@ impl Buffer {
             size,
             base: 0,
             counted: false,
+            _owner: None,
         }
     }
 
-    // A view into `arena` at byte offset `base`; the Retained clone keeps
-    // the underlying MTLBuffer alive independently of the arena handle.
-    pub fn suballoc(arena: &Buffer, base: usize, size: usize) -> Self {
-        assert!(base + size <= arena.size);
+    pub fn suballoc(segment: &Arc<Buffer>, base: usize, size: usize) -> Self {
+        assert!(base + size <= segment.size);
         Buffer {
-            raw: arena.raw.clone(),
+            raw: segment.raw.clone(),
             size,
-            base: arena.base + base,
+            base: segment.base + base,
             counted: false,
+            _owner: Some(segment.clone()),
         }
     }
 
@@ -236,12 +344,16 @@ struct EncoderManager {
     // retired blocks has finished: reaping completed entries drops them
     // back to the driver mid-step instead of accumulating until
     // synchronize (a mid-step readback used to force that drain;
-    // without it, big capture runs exhausted the driver —
+    // without it, large command streams exhausted the driver,
     // kIOGPUCommandBufferCallbackErrorOutOfMemory at batch 256).
     in_flight: Vec<(
+        u64,
         Retained<ProtocolObject<dyn MTLCommandBuffer>>,
         Vec<Arc<Buffer>>,
     )>,
+    // Failures survive mid-step reaping and backpressure waits. They are
+    // consumed only after synchronize has drained every submitted buffer.
+    failures: Vec<(u64, String)>,
 }
 
 impl EncoderManager {
@@ -261,18 +373,31 @@ impl EncoderManager {
             order_event,
             order_value: 0,
             in_flight: Vec::new(),
+            failures: Vec::new(),
         }
     }
 
+    fn record_failure(&mut self, sequence: u64, cb: &ProtocolObject<dyn MTLCommandBuffer>) {
+        if cb.status() != objc2_metal::MTLCommandBufferStatus::Error {
+            return;
+        }
+        let description = cb
+            .error()
+            .map(|error| error.localizedDescription().to_string())
+            .unwrap_or_else(|| "unknown error".to_string());
+        self.failures.push((sequence, description));
+    }
+
     fn reap_completed(&mut self) {
-        while let Some((cb, _)) = self.in_flight.first() {
+        while let Some((_, cb, _)) = self.in_flight.first() {
             let done = matches!(
                 cb.status(),
                 objc2_metal::MTLCommandBufferStatus::Completed
                     | objc2_metal::MTLCommandBufferStatus::Error
             );
             if done {
-                self.in_flight.remove(0);
+                let (sequence, cb, _) = self.in_flight.remove(0);
+                self.record_failure(sequence, &cb);
             } else {
                 break;
             }
@@ -292,7 +417,7 @@ impl EncoderManager {
                 self.in_flight.len()
             );
         }
-        self.in_flight[0].0.waitUntilCompleted();
+        self.in_flight[0].1.waitUntilCompleted();
         self.reap_completed();
         true
     }
@@ -311,7 +436,7 @@ impl EncoderManager {
         }
     }
 
-    fn finish_dispatch(&mut self, retired: &mut Vec<Arc<Buffer>>) {
+    fn finish_dispatch(&mut self, retired: &mut Vec<Arc<Buffer>>, allow_automatic_commit: bool) {
         // Untracked hazards: without a barrier, Metal may overlap adjacent
         // compute dispatches in the same command buffer. Our allocator
         // recycles buffers across dispatches, so every dispatch must be
@@ -321,7 +446,9 @@ impl EncoderManager {
         }
         self.count += 1;
         DISPATCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        if self.count >= DISPATCHES_PER_BUFFER || cb_referenced_bytes() >= CB_REF_BYTES {
+        if allow_automatic_commit
+            && (self.count >= DISPATCHES_PER_BUFFER || cb_referenced_bytes() >= CB_REF_BYTES)
+        {
             self.commit(retired);
         }
     }
@@ -332,7 +459,8 @@ impl EncoderManager {
             self.order_value += 1;
             cb.encodeSignalEvent_value(&self.order_event, self.order_value);
             cb.commit();
-            self.in_flight.push((cb, std::mem::take(retired)));
+            self.in_flight
+                .push((self.order_value, cb, std::mem::take(retired)));
             self.count = 0;
             cb_refs_reset();
         }
@@ -340,23 +468,27 @@ impl EncoderManager {
 
     fn synchronize(&mut self, retired: &mut Vec<Arc<Buffer>>) -> crate::err::Res<()> {
         self.commit(retired);
-        if let Some((last, _)) = self.in_flight.last() {
-            last.waitUntilCompleted();
-            let status = last.status();
-            if status != objc2_metal::MTLCommandBufferStatus::Completed {
-                let description = last
-                    .error()
-                    .map(|e| e.localizedDescription().to_string())
-                    .unwrap_or_else(|| "unknown error".to_string());
-                self.in_flight.clear();
-                return Err(format!(
-                    "metal: GPU command buffer failed ({description}) — GPU work was lost; this is usually device memory exhaustion"
-                ));
-            }
+        while !self.in_flight.is_empty() {
+            self.in_flight[0].1.waitUntilCompleted();
+            self.reap_completed();
         }
-        self.in_flight.clear();
-        Ok(())
+        command_buffer_result(std::mem::take(&mut self.failures))
     }
+}
+
+fn command_buffer_result(failures: Vec<(u64, String)>) -> crate::err::Res<()> {
+    if failures.is_empty() {
+        return Ok(());
+    }
+    let count = failures.len();
+    let descriptions = failures
+        .into_iter()
+        .map(|(sequence, description)| format!("#{sequence}: {description}"))
+        .collect::<Vec<_>>()
+        .join("; ");
+    Err(format!(
+        "metal: {count} GPU command buffer failure(s) ({descriptions}); GPU work was lost; this is usually device memory exhaustion"
+    ))
 }
 
 pub struct MetalDevice {
@@ -378,6 +510,89 @@ unsafe impl Sync for Buffer {}
 static SHARED_OPTIONS: MTLResourceOptions = MTLResourceOptions(
     MTLResourceOptions::StorageModeShared.0 | MTLResourceOptions::HazardTrackingModeUntracked.0,
 );
+
+thread_local! {
+    static PRIVATE_INTERMEDIATES: std::cell::Cell<Option<bool>> = const {
+        std::cell::Cell::new(None)
+    };
+    static MMA_ENABLED: std::cell::Cell<Option<bool>> = const {
+        std::cell::Cell::new(None)
+    };
+    static EXECUTABLE_DISPATCH_GUARD: std::cell::Cell<bool> = const {
+        std::cell::Cell::new(false)
+    };
+}
+
+#[derive(Debug)]
+pub(crate) struct ForbiddenExecutableAllocation {
+    operation: &'static str,
+}
+
+impl std::fmt::Display for ForbiddenExecutableAllocation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "MetalDevice::{} is forbidden during executable dispatch",
+            self.operation
+        )
+    }
+}
+
+pub(crate) struct ExecutableDispatchGuard;
+
+impl Drop for ExecutableDispatchGuard {
+    fn drop(&mut self) {
+        EXECUTABLE_DISPATCH_GUARD.with(|active| active.set(false));
+    }
+}
+
+/// Applies a compile-time allocation policy to all nested backend calls.
+pub fn with_execution_environment<R>(private: bool, mma: bool, f: impl FnOnce() -> R) -> R {
+    PRIVATE_INTERMEDIATES.with(|policy| {
+        MMA_ENABLED.with(|mma_policy| {
+            let previous_private = policy.replace(Some(private));
+            let previous_mma = mma_policy.replace(Some(mma));
+            struct Restore<'a> {
+                private: &'a std::cell::Cell<Option<bool>>,
+                previous_private: Option<bool>,
+                mma: &'a std::cell::Cell<Option<bool>>,
+                previous_mma: Option<bool>,
+            }
+            impl Drop for Restore<'_> {
+                fn drop(&mut self) {
+                    self.private.set(self.previous_private);
+                    self.mma.set(self.previous_mma);
+                }
+            }
+            let _restore = Restore {
+                private: policy,
+                previous_private,
+                mma: mma_policy,
+                previous_mma,
+            };
+            f()
+        })
+    })
+}
+
+fn private_intermediates() -> bool {
+    PRIVATE_INTERMEDIATES.with(|policy| {
+        policy.get().unwrap_or_else(|| {
+            static DEFAULT: OnceLock<bool> = OnceLock::new();
+            *DEFAULT
+                .get_or_init(|| std::env::var_os("EFFECT_TORCH_PRIVATE_INTERMEDIATES").is_some())
+        })
+    })
+}
+
+pub fn mma_enabled() -> bool {
+    MMA_ENABLED.with(|policy| {
+        policy.get().unwrap_or_else(|| {
+            static DEFAULT: OnceLock<bool> = OnceLock::new();
+            *DEFAULT.get_or_init(|| std::env::var_os("EFFECT_TORCH_NO_MMA").is_none())
+        })
+    })
+}
 
 pub fn is_available() -> bool {
     objc2_metal::MTLCopyAllDevices()
@@ -458,19 +673,14 @@ impl MetalDevice {
     }
 
     pub fn alloc(&self, elements: usize, dtype: DType) -> Arc<Buffer> {
+        self.reject_executable_allocation("alloc");
         let size = elements * dtype.size_in_bytes();
-        // Arena replay (RFC 0016): serve from the program's planned
-        // arena, falling through to the pool for pool-planned entries
-        // and after divergence.
-        if let Some(buf) = arena::replay_alloc(size) {
-            return buf;
-        }
         self.backpressure();
         let bucket_size = if size >= (64 << 20) {
             // Large blocks: power-of-two bucketing pins up to 2x the
             // request per live block (a 1.1 GB activation would hold a
             // 2 GB buffer), which is what actually exhausts the driver
-            // on big capture runs. Round to 64 MB pages instead — reuse
+            // on large dynamic runs. Round to 64 MB pages instead; reuse
             // still works between equal-size requests.
             size.next_multiple_of(64 << 20)
         } else {
@@ -489,12 +699,11 @@ impl MetalDevice {
                 let idx = cursor.wrapping_add(k) % bucket.len();
                 if Arc::strong_count(&bucket[idx]) == 1 {
                     let buffer = bucket.swap_remove(idx);
-                    arena::capture_alloc(Arc::as_ptr(&buffer) as usize, size);
                     return buffer;
                 }
             }
         }
-        let options = if std::env::var("EFFECT_TORCH_PRIVATE_INTERMEDIATES").is_ok() {
+        let options = if private_intermediates() {
             MTLResourceOptions(
                 MTLResourceOptions::StorageModePrivate.0
                     | MTLResourceOptions::HazardTrackingModeUntracked.0,
@@ -507,36 +716,51 @@ impl MetalDevice {
             .raw
             .newBufferWithLength_options(bucket_size, options)
             .expect("metal buffer allocation failed");
+        #[cfg(test)]
+        record_test_device_buffer_allocation();
         let buffer = Arc::new(Buffer {
             raw,
             size: bucket_size,
             base: 0,
             counted: true,
+            _owner: None,
         });
         if bucket.len() < MAX_BUCKET {
             bucket.push(buffer.clone());
         }
-        arena::capture_alloc(Arc::as_ptr(&buffer) as usize, size);
         buffer
     }
 
-    /// A raw buffer outside the pool and the arena capture/replay —
-    /// the arena itself is allocated this way.
+    /// A right-sized root buffer outside the dynamic tensor pool.
     pub fn alloc_raw(&self, size: usize) -> Arc<Buffer> {
+        self.alloc_raw_checked(size)
+            .unwrap_or_else(|error| panic!("{error}"))
+    }
+
+    pub fn alloc_raw_checked(&self, size: usize) -> Result<Arc<Buffer>, String> {
+        self.reject_executable_allocation("alloc_raw_checked");
         self.backpressure();
         live_bytes_track(size.max(1));
-        let raw = self
+        let Some(raw) = self
             .raw
             .newBufferWithLength_options(size.max(1), SHARED_OPTIONS)
-            .unwrap_or_else(|| {
-                panic!("metal buffer allocation failed: {size} bytes")
-            });
-        Arc::new(Buffer {
+        else {
+            live_bytes_untrack(size.max(1));
+            return Err(format!(
+                "metal buffer allocation failed: requested {size} bytes, current allocated {} bytes, recommended working set {} bytes",
+                self.raw.currentAllocatedSize(),
+                self.raw.recommendedMaxWorkingSetSize()
+            ));
+        };
+        #[cfg(test)]
+        record_test_device_buffer_allocation();
+        Ok(Arc::new(Buffer {
             raw,
             size: size.max(1),
             base: 0,
             counted: true,
-        })
+            _owner: None,
+        }))
     }
 
     pub fn alloc_with_data(&self, data: &[f32]) -> Arc<Buffer> {
@@ -552,6 +776,7 @@ impl MetalDevice {
     }
 
     pub fn upload_bytes(&self, data: &[u8]) -> Arc<Buffer> {
+        self.reject_executable_allocation("upload_bytes");
         // Length is exactly data.len(): newBufferWithBytes copies that
         // many bytes from the source — a rounded-up (bucketed) length
         // would read past the end of the caller's allocation. Uploads
@@ -567,11 +792,14 @@ impl MetalDevice {
             )
         }
         .expect("metal buffer allocation failed");
+        #[cfg(test)]
+        record_test_device_buffer_allocation();
         let buffer = Arc::new(Buffer {
             raw,
             size,
             base: 0,
-            counted: false,
+            counted: true,
+            _owner: None,
         });
         // Host uploads retire only at the next synchronize. Uploads are
         // NEVER pooled: the only strong refs are the caller's and this
@@ -599,6 +827,13 @@ impl MetalDevice {
     ) -> Result<Pipeline, String> {
         match self.pipeline_cached(key) {
             Some(p) => Ok(p),
+            None if self.executable_dispatch_active() => {
+                EXECUTABLE_PIPELINE_MISS_ATTEMPTS
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                Err(format!(
+                    "Metal executable dispatch attempted to compile missing pipeline {name} ({key:#x})"
+                ))
+            }
             None => self.compile_slow(key, &make_source(), name),
         }
     }
@@ -612,6 +847,13 @@ impl MetalDevice {
         if let Some(p) = cache.get(&key) {
             return Ok(p.clone());
         }
+        if self.executable_dispatch_active() {
+            EXECUTABLE_PIPELINE_MISS_ATTEMPTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return Err(format!(
+                "Metal executable dispatch attempted to compile missing pipeline {name} ({key:#x})"
+            ));
+        }
+        PIPELINE_COMPILE_MISSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let opts = objc2_metal::MTLCompileOptions::new();
         #[allow(deprecated)]
         opts.setFastMathEnabled(false);
@@ -637,16 +879,47 @@ impl MetalDevice {
         &self,
         f: impl FnOnce(&ProtocolObject<dyn MTLComputeCommandEncoder>) -> R,
     ) -> R {
+        claim_execution();
+        let allow_automatic_commit = !self.executable_dispatch_active();
         let mut manager = self.encoder.lock().unwrap();
         manager.ensure_encoder();
         let encoder = &manager.current.as_ref().unwrap().1;
         let out = f(encoder);
-        manager.finish_dispatch(&mut self.retired.lock().unwrap());
+        manager.finish_dispatch(&mut self.retired.lock().unwrap(), allow_automatic_commit);
         out
+    }
+
+    pub(crate) fn commit_executable_command(&self) {
+        let mut manager = self.encoder.lock().unwrap();
+        manager.commit(&mut self.retired.lock().unwrap());
+    }
+
+    pub(crate) fn begin_executable_dispatch(&self) -> Result<ExecutableDispatchGuard, String> {
+        EXECUTABLE_DISPATCH_GUARD.with(|active| {
+            if active.replace(true) {
+                active.set(true);
+                Err("nested Metal executable dispatch is not supported".to_string())
+            } else {
+                Ok(ExecutableDispatchGuard)
+            }
+        })
+    }
+
+    pub(crate) fn executable_dispatch_active(&self) -> bool {
+        EXECUTABLE_DISPATCH_GUARD.with(std::cell::Cell::get)
+    }
+
+    fn reject_executable_allocation(&self, operation: &'static str) {
+        if self.executable_dispatch_active() {
+            EXECUTABLE_ALLOCATION_ATTEMPTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            std::panic::panic_any(ForbiddenExecutableAllocation { operation });
+        }
     }
 
     #[track_caller]
     pub fn synchronize(&self) -> crate::err::Res<()> {
+        claim_execution();
+        let _release = AutomaticExecutionRelease;
         let t = std::time::Instant::now();
         if std::env::var_os("EFFECT_TORCH_SYNC_TRACE").is_some() {
             eprintln!("[sync] {}", std::panic::Location::caller());
@@ -661,8 +934,8 @@ impl MetalDevice {
         }
         // The GPU has consumed everything submitted so far; retired
         // uploads may return to the pool. Dead buckets at or above 1 MB
-        // are released too — the arena (RFC 0016) owns the step working
-        // set, so the pool must not accumulate dead giants across
+        // are released too; planned workspace owns executable working sets,
+        // so the dynamic pool must not accumulate dead giants across
         // phases; small buckets stay for cheap reuse.
         {
             let mut alloc = self.allocator.lock().unwrap();
@@ -687,6 +960,13 @@ impl MetalDevice {
             t.elapsed().as_nanos() as u64,
             std::sync::atomic::Ordering::Relaxed,
         );
+        #[cfg(test)]
+        if INJECTED_PRIOR_FAILURE.with(|failure| failure.replace(false)) {
+            return Err(
+                "metal: 1 GPU command buffer failure(s) (#test: injected prior failure); GPU work was lost"
+                    .to_string(),
+            );
+        }
         Ok(())
     }
 
@@ -711,11 +991,16 @@ impl MetalDevice {
             .try_lock()
             .map(|r| r.iter().map(|b| b.size).sum())
             .unwrap_or(0);
-        eprintln!("[mem] live {} MB; pool buckets (size: live/dead): {}; retired {} MB; shared arena {} MB",
+        eprintln!(
+            "[mem] live {} MB; pool buckets (size: live/dead): {}; retired {} MB",
             LIVE_BYTES.load(std::sync::atomic::Ordering::Relaxed) >> 20,
-            rows.iter().take(12).map(|(s, l, d)| format!("{}MB:{l}/{d}", s >> 20)).collect::<Vec<_>>().join(" "),
-            retired_bytes >> 20,
-            super::arena::shared_arena_size() >> 20);
+            rows.iter()
+                .take(12)
+                .map(|(s, l, d)| format!("{}MB:{l}/{d}", s >> 20))
+                .collect::<Vec<_>>()
+                .join(" "),
+            retired_bytes >> 20
+        );
     }
 
     pub fn grid(width: usize, height: usize, depth: usize) -> MTLSize {
@@ -759,9 +1044,8 @@ pub fn set_buffer(
 // completes, so one 4096-dispatch buffer can pin tens of GB that no
 // amount of waiting on OLDER buffers reclaims. finish_dispatch commits
 // early once the current buffer references CB_REF_BYTES of distinct
-// pool memory. Arena views (counted == false) share one root and are
-// skipped — the root is persistent and reclaiming it is never the
-// goal; uploads are small.
+// pool memory. Arena views and externally wrapped buffers (counted ==
+// false) are skipped because their root is accounted elsewhere.
 thread_local! {
     static CB_REFS: std::cell::RefCell<(std::collections::HashSet<u64>, usize)> =
         std::cell::RefCell::new((std::collections::HashSet::new(), 0));
@@ -837,7 +1121,7 @@ mod tests {
 
     #[test]
     fn pool_reuse() {
-        let dev = MetalDevice::get();
+        let dev = MetalDevice::new(0).unwrap();
         let a = dev.alloc(64, DType::F32);
         let ptr1 = a.contents_ptr() as usize;
         drop(a);
@@ -868,5 +1152,44 @@ mod tests {
         });
         dev.synchronize().unwrap();
         assert_eq!(out.read_f32(0, 4), vec![1.0, 2.0, 3.0, 4.0]);
+    }
+
+    #[test]
+    fn command_buffer_failures_report_every_submission() {
+        let error = command_buffer_result(vec![
+            (2, "first failure".to_string()),
+            (5, "later failure".to_string()),
+        ])
+        .unwrap_err();
+        assert!(error.contains("#2: first failure"), "{error}");
+        assert!(error.contains("#5: later failure"), "{error}");
+    }
+
+    #[test]
+    fn uploads_are_live_byte_counted() {
+        let upload = MetalDevice::get().upload_bytes(&[1, 2, 3, 4]);
+        assert!(upload.counted);
+        MetalDevice::get().synchronize().unwrap();
+    }
+
+    #[test]
+    fn executable_guard_rejects_every_tensor_allocation_entry_point() {
+        let device = MetalDevice::new(0).unwrap();
+        let guard = device.begin_executable_dispatch().unwrap();
+        for allocation in [
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _ = device.alloc(1, DType::F32);
+            })),
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _ = device.alloc_raw_checked(4);
+            })),
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _ = device.upload_bytes(&[0, 0, 0, 0]);
+            })),
+        ] {
+            assert!(allocation.is_err());
+        }
+        drop(guard);
+        assert_eq!(device.alloc_raw_checked(4).unwrap().size, 4);
     }
 }

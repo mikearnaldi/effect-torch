@@ -7,16 +7,94 @@
 
 use crate::runtime::metal::run::MetalTensor;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RotaryRequirements {
+    pub dtype: crate::runtime::dtype::DType,
+    pub output_bytes: usize,
+    pub state_next_bytes: usize,
+    pub staging_bytes: usize,
+    pub status_bytes: usize,
+    pub scratch_bytes: usize,
+    pub pipeline_count: usize,
+}
+
+pub fn requirements(
+    dtype: crate::runtime::dtype::DType,
+    shape: &[usize],
+) -> crate::err::Res<RotaryRequirements> {
+    if shape.len() < 2 || shape[shape.len() - 1] % 2 != 0 {
+        return Err("rotary: expected rank >= 2 and an even head dimension".to_string());
+    }
+    if !matches!(
+        dtype,
+        crate::runtime::dtype::DType::F32
+            | crate::runtime::dtype::DType::F16
+            | crate::runtime::dtype::DType::BF16
+    ) {
+        return Err(format!("rotary: unsupported dtype {dtype:?}"));
+    }
+    let elements = shape
+        .iter()
+        .try_fold(1usize, |count, value| count.checked_mul(*value))
+        .ok_or_else(|| "rotary: requirement element count overflow".to_string())?;
+    Ok(RotaryRequirements {
+        dtype,
+        output_bytes: elements
+            .checked_mul(dtype.size_in_bytes())
+            .ok_or_else(|| "rotary: requirement byte size overflow".to_string())?,
+        state_next_bytes: 0,
+        staging_bytes: shape[0]
+            .checked_mul(crate::runtime::dtype::DType::F32.size_in_bytes())
+            .ok_or_else(|| "rotary: requirement staging size overflow".to_string())?,
+        status_bytes: 0,
+        scratch_bytes: 0,
+        pipeline_count: 1,
+    })
+}
+
+pub fn rotary_requirements(
+    dtype: crate::runtime::dtype::DType,
+    shape: &[usize],
+) -> crate::err::Res<RotaryRequirements> {
+    requirements(dtype, shape)
+}
+
+#[cfg(test)]
+mod requirement_tests {
+    use super::*;
+    use crate::runtime::dtype::DType;
+
+    #[test]
+    fn requirements_include_exact_offsets_staging() {
+        let requirement = rotary_requirements(DType::F16, &[3, 2, 5, 16]).unwrap();
+        assert_eq!(requirement.output_bytes, 3 * 2 * 5 * 16 * 2);
+        assert_eq!(requirement.staging_bytes, 3 * 4);
+        assert_eq!(
+            (
+                requirement.state_next_bytes,
+                requirement.status_bytes,
+                requirement.scratch_bytes,
+            ),
+            (0, 0, 0)
+        );
+        assert_eq!(requirement.pipeline_count, 1);
+        assert!(rotary_requirements(DType::F32, &[1, 2, 3]).is_err());
+        assert!(rotary_requirements(DType::F32, &[usize::MAX, 2, 2]).is_err());
+    }
+}
+
 /// Whether the fused rotary path can run: Metal, f32, even head dim.
 pub fn is_supported(x: &MetalTensor) -> bool {
     matches!(
         x.dtype,
-        crate::runtime::dtype::DType::F32 | crate::runtime::dtype::DType::BF16
+        crate::runtime::dtype::DType::F32
+            | crate::runtime::dtype::DType::F16
+            | crate::runtime::dtype::DType::BF16
     ) && x.layout.shape().last().unwrap_or(&1) % 2 == 0
 }
 
 #[cfg(target_os = "macos")]
-pub use metal::rotary;
+pub use metal::{rotary, rotary_into, warm, warm_exact, IntoResources};
 
 #[cfg(target_os = "macos")]
 mod metal {
@@ -24,6 +102,13 @@ mod metal {
     use crate::runtime::metal::run::MetalTensor;
 
     use objc2_metal::MTLComputeCommandEncoder;
+
+    #[derive(Clone, Copy)]
+    pub struct IntoResources<'a> {
+        pub staging: &'a [MetalTensor],
+        pub status: &'a [MetalTensor],
+        pub scratch: &'a [MetalTensor],
+    }
 
     const NT: usize = 256;
 
@@ -67,66 +152,145 @@ kernel void et_rotary(
 "#.replace("{ty}", ty)
     }
 
-    fn pipeline(dtype: crate::runtime::dtype::DType) -> crate::err::Res<Pipeline> {
+    fn pipeline_key(dtype: crate::runtime::dtype::DType) -> u64 {
         use std::collections::hash_map::DefaultHasher;
         use std::hash::{Hash, Hasher};
 
         let mut hasher = DefaultHasher::new();
         ("et_rotary", dtype).hash(&mut hasher);
-        let key = hasher.finish();
+        hasher.finish()
+    }
+
+    fn pipeline(dtype: crate::runtime::dtype::DType) -> crate::err::Res<Pipeline> {
         let ty = match dtype {
             crate::runtime::dtype::DType::F32 => "float",
+            crate::runtime::dtype::DType::F16 => "half",
             crate::runtime::dtype::DType::BF16 => "bfloat",
             other => return Err(format!("rotary: unsupported dtype {other:?}")),
         };
-        MetalDevice::get().compile_lazy(key, "et_rotary", || source(ty))
+        MetalDevice::get().compile_lazy(pipeline_key(dtype), "et_rotary", || source(ty))
+    }
+
+    fn cached_pipeline(dtype: crate::runtime::dtype::DType) -> crate::err::Res<Pipeline> {
+        MetalDevice::get()
+            .pipeline_cached(pipeline_key(dtype))
+            .ok_or_else(|| "rotary: exact pipeline is not warm; call warm".to_string())
+    }
+
+    pub fn warm(dtype: crate::runtime::dtype::DType) -> crate::err::Res<()> {
+        pipeline(dtype)?;
+        Ok(())
+    }
+
+    pub fn warm_exact(requirements: &super::RotaryRequirements) -> crate::err::Res<()> {
+        warm(requirements.dtype)
     }
 
     /// x [.., T, D] -> R(sign·angles) x. `offsets` is one position
     /// offset per leading-dim-0 batch element (a single [0] for
     /// absolute positions).
-    pub fn rotary(
+    pub fn rotary_into(
         x: &MetalTensor,
         offsets: &[usize],
         theta: f64,
         sign: f32,
-    ) -> crate::err::Res<MetalTensor> {
+        output: &MetalTensor,
+        resources: IntoResources<'_>,
+    ) -> crate::err::Res<()> {
         let dims = x.layout.shape();
         let rank = dims.len();
+        if rank < 2 || dims[rank - 1] % 2 != 0 {
+            return Err("rotary: expected rank >= 2 and an even head dimension".to_string());
+        }
         let (t, d) = (dims[rank - 2], dims[rank - 1]);
         let batch = dims[0];
         let rows: usize = dims[..rank - 2].iter().product();
         let rows_per_batch = rows / batch;
-        // A single offset broadcasts over the batch.
-        let offsets_vec: Vec<f32> = if offsets.len() == 1 {
-            vec![offsets[0] as f32; batch]
-        } else {
-            if offsets.len() != batch {
-                return Err(format!(
-                    "rotary: {} offsets for batch {batch}",
-                    offsets.len()
-                ));
-            }
-            offsets.iter().map(|&o| o as f32).collect()
+        if offsets.len() != 1 && offsets.len() != batch {
+            return Err(format!(
+                "rotary: {} offsets for batch {batch}",
+                offsets.len()
+            ));
+        }
+        if !x.layout.is_contiguous() {
+            return Err("rotary: input must be contiguous before rotary_into".to_string());
+        }
+        if output.dtype != x.dtype
+            || output.layout.shape() != dims
+            || !output.layout.is_contiguous()
+        {
+            return Err(format!(
+                "rotary: output must be contiguous {:?}:{:?}",
+                dims, x.dtype
+            ));
+        }
+        let output_end = output
+            .layout
+            .checked_max_index()
+            .and_then(|elements| elements.checked_mul(output.dtype.size_in_bytes()))
+            .ok_or_else(|| "rotary: output byte size overflow".to_string())?;
+        if output_end > output.buffer.size {
+            return Err("rotary: output view exceeds its buffer".to_string());
+        }
+        if resources.staging.len() != 1
+            || !resources.status.is_empty()
+            || !resources.scratch.is_empty()
+        {
+            return Err(
+                "rotary: exactly one offsets staging view and no status/scratch views are required"
+                    .to_string(),
+            );
+        }
+        let offsets_staging = &resources.staging[0];
+        if offsets_staging.dtype != crate::runtime::dtype::DType::F32
+            || offsets_staging.layout.shape() != [batch]
+            || !offsets_staging.layout.is_contiguous()
+        {
+            return Err(format!(
+                "rotary: offsets staging must be contiguous [{batch}]:F32"
+            ));
+        }
+        let staging_end = offsets_staging
+            .layout
+            .checked_max_index()
+            .and_then(|elements| {
+                elements.checked_mul(crate::runtime::dtype::DType::F32.size_in_bytes())
+            })
+            .ok_or_else(|| "rotary: offsets staging byte size overflow".to_string())?;
+        if staging_end > offsets_staging.buffer.size {
+            return Err("rotary: offsets staging view exceeds its buffer".to_string());
+        }
+        let offset_ptr = unsafe {
+            offsets_staging
+                .buffer
+                .contents_ptr()
+                .cast::<f32>()
+                .add(offsets_staging.layout.offset())
         };
-        let xn = if x.layout.is_contiguous() {
-            x.clone()
-        } else {
-            crate::runtime::metal::kernels::strided_copy(MetalDevice::get(), x)?
-        };
-        let offsets_buf = MetalDevice::get().alloc_with_data(&offsets_vec);
-        let out_buf = MetalDevice::get().alloc(xn.numel().max(1), xn.dtype);
-        let pipe = pipeline(xn.dtype)?;
+        for index in 0..batch {
+            let value = if offsets.len() == 1 {
+                offsets[0]
+            } else {
+                offsets[index]
+            };
+            unsafe { offset_ptr.add(index).write(value as f32) };
+        }
+        let pipe = cached_pipeline(x.dtype)?;
         MetalDevice::get().with_encoder(|e| {
             e.setComputePipelineState(pipe.as_raw());
+            set_buffer(e, 0, &x.buffer, x.layout.offset() * x.dtype.size_in_bytes());
             set_buffer(
                 e,
-                0,
-                &xn.buffer,
-                xn.layout.offset() * xn.dtype.size_in_bytes(),
+                2,
+                &offsets_staging.buffer,
+                offsets_staging.layout.offset() * crate::runtime::dtype::DType::F32.size_in_bytes(),
             );
-            set_buffer(e, 2, &offsets_buf, 0);
-            set_buffer(e, 1, &out_buf, 0);
+            set_buffer(
+                e,
+                1,
+                &output.buffer,
+                output.layout.offset() * output.dtype.size_in_bytes(),
+            );
             set_bytes(e, 3, &(t as u32));
             set_bytes(e, 4, &(d as u32));
             set_bytes(e, 5, &(rows_per_batch as u32));
@@ -147,11 +311,42 @@ kernel void et_rotary(
                 },
             );
         });
-        Ok(MetalTensor {
-            buffer: out_buf,
-            layout: crate::runtime::layout::Layout::contiguous(dims.to_vec()),
-            dtype: x.dtype,
-        })
+        Ok(())
+    }
+
+    pub fn rotary(
+        x: &MetalTensor,
+        offsets: &[usize],
+        theta: f64,
+        sign: f32,
+    ) -> crate::err::Res<MetalTensor> {
+        let dims = x.layout.shape().to_vec();
+        let batch = dims[0];
+        let x = if x.layout.is_contiguous() {
+            x.clone()
+        } else {
+            crate::runtime::metal::kernels::strided_copy(MetalDevice::get(), x)?
+        };
+        warm(x.dtype)?;
+        let output = MetalTensor::empty(MetalDevice::get(), dims, x.dtype);
+        let offsets_staging = MetalTensor::empty(
+            MetalDevice::get(),
+            vec![batch],
+            crate::runtime::dtype::DType::F32,
+        );
+        rotary_into(
+            &x,
+            offsets,
+            theta,
+            sign,
+            &output,
+            IntoResources {
+                staging: std::slice::from_ref(&offsets_staging),
+                status: &[],
+                scratch: &[],
+            },
+        )?;
+        Ok(output)
     }
 }
 
@@ -171,6 +366,12 @@ mod tests {
             let (b, h, t, d) = shape;
             let data: Vec<f32> = (0..b * h * t * d).map(|i| i as f32).collect();
             let x = MT::from_f32(dev, data, vec![b, h, t, d]);
+            crate::runtime::metal::indexing::warm_cat(
+                &[&[b, h, t, d / 2], &[b, h, t, d / 2]],
+                crate::runtime::dtype::DType::F32,
+                3,
+            )
+            .unwrap();
             let composed =
                 crate::runtime::metal::composed::rotary_forward(&x, &[0], 10000.0, 1.0).unwrap();
             let fused = super::metal::rotary(&x, &[0], 10000.0, 1.0).unwrap();
@@ -198,5 +399,45 @@ mod tests {
                 "shape {shape:?} roundtrip max diff {max_diff}"
             );
         }
+    }
+
+    #[test]
+    fn into_matches_wrapper_and_uses_only_supplied_views() {
+        let dev = MetalDevice::get();
+        let shape = vec![2, 2, 3, 8];
+        let data = (0..shape.iter().product::<usize>())
+            .map(|index| index as f32 / 17.0)
+            .collect();
+        let x = MT::from_f32(dev, data, shape.clone());
+        let expected = super::metal::rotary(&x, &[1, 4], 10_000.0, 1.0).unwrap();
+        let requirements = super::rotary_requirements(x.dtype, &shape).unwrap();
+        let output = MT::empty(dev, shape, x.dtype);
+        let offsets = MT::empty(dev, vec![2], crate::runtime::dtype::DType::F32);
+        super::metal::warm_exact(&requirements).unwrap();
+        dev.synchronize().unwrap();
+
+        let _dispatch_guard = dev.begin_executable_dispatch().unwrap();
+        super::metal::rotary_into(
+            &x,
+            &[1, 4],
+            10_000.0,
+            1.0,
+            &output,
+            super::metal::IntoResources {
+                staging: std::slice::from_ref(&offsets),
+                status: &[],
+                scratch: &[],
+            },
+        )
+        .unwrap();
+        dev.synchronize().unwrap();
+        let max_diff = expected
+            .read_f32()
+            .unwrap()
+            .iter()
+            .zip(output.read_f32().unwrap())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(max_diff < 1e-6, "into parity diff {max_diff}");
     }
 }

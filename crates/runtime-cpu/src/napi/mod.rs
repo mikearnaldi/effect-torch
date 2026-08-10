@@ -1,12 +1,11 @@
 mod err;
-mod fusion;
 mod safetensors;
 mod value;
 
 use self::err::to_napi_err;
 use self::value::Value;
-use crate::{composed, conv, pool, CpuBuffer, Tensor};
-use effect_torch_compiler::{collect_program_slots, fuse_roots, ProgramSlot};
+use crate::{composed, executable, pool, CpuBuffer, CpuDestination, Elem, Tensor};
+use effect_torch_compiler::{CompileOptions, InferenceOptions, PrecisionPolicy, ProgramSlot};
 use effect_torch_graph::CrossEntropyReduction as CeReduction;
 use effect_torch_graph::{node_children, remap_children, Device, PositionOffset};
 use effect_torch_napi::{try_register_export, unregister_export, vec_to_bytes, CancellationState};
@@ -117,6 +116,7 @@ impl ToNapiValue for Readback {
 }
 
 #[napi(string_enum)]
+#[derive(Clone, Copy)]
 pub enum NativeDType {
     #[napi(value = "f32")]
     F32,
@@ -145,6 +145,96 @@ impl From<NativeDType> for DType {
             NativeDType::F16 => DType::F16,
             NativeDType::BF16 => DType::BF16,
         }
+    }
+}
+
+#[napi(object)]
+pub struct NativeCompileOptions {
+    pub optimize: Option<bool>,
+    pub allow_reduced_precision: Option<bool>,
+    pub constant_weights: Option<bool>,
+    pub output_capacity: Option<u32>,
+}
+
+#[napi(object)]
+pub struct NativeKvStateSchema {
+    pub max_tokens: u32,
+    pub block_size: u32,
+    pub kv_dtype: NativeDType,
+    pub window: Option<u32>,
+    pub batch: u32,
+}
+
+#[napi(object)]
+pub struct NativeRecurrentStateSchema {
+    pub kda_layers: u32,
+    pub kda_heads: u32,
+    pub kda_head_dim: u32,
+    pub kda_value_dim: u32,
+    pub conv_layers: u32,
+    pub conv_channels: u32,
+    pub conv_kernel: u32,
+}
+
+#[napi(object)]
+pub struct NativeInstructionDiagnostics {
+    pub kind: String,
+    pub count: f64,
+}
+
+#[napi(object)]
+pub struct NativeMemoryDiagnostics {
+    pub external_bytes: f64,
+    pub persistent_bytes: f64,
+    pub state_bytes: f64,
+    pub output_bytes: f64,
+    pub workspace_bytes: f64,
+    pub transaction_bytes: f64,
+    pub peak_live_bytes: f64,
+    pub packing_overhead_bytes: f64,
+}
+
+#[napi(object)]
+pub struct NativeExecutableDiagnostics {
+    pub semantic_nodes_before_optimization: f64,
+    pub semantic_nodes_after_optimization: f64,
+    pub instructions: Vec<NativeInstructionDiagnostics>,
+    pub pipeline_count: f64,
+    pub command_count: f64,
+    pub synchronization_count: f64,
+    pub output_capacity: f64,
+    pub memory: NativeMemoryDiagnostics,
+}
+
+fn executable_diagnostics(
+    diagnostics: &effect_torch_runtime::ExecutableDiagnostics,
+) -> NativeExecutableDiagnostics {
+    let memory = &diagnostics.memory;
+    NativeExecutableDiagnostics {
+        semantic_nodes_before_optimization: diagnostics.semantic_nodes_before_optimization as f64,
+        semantic_nodes_after_optimization: diagnostics.semantic_nodes_after_optimization as f64,
+        instructions: diagnostics
+            .instructions
+            .iter()
+            .map(|instruction| NativeInstructionDiagnostics {
+                kind: instruction.kind.clone(),
+                count: instruction.count as f64,
+            })
+            .collect(),
+        pipeline_count: diagnostics.pipeline_count as f64,
+        command_count: diagnostics.command_count as f64,
+        synchronization_count: diagnostics.synchronization_count as f64,
+        output_capacity: diagnostics.output_capacity as f64,
+        memory: NativeMemoryDiagnostics {
+            external_bytes: memory.external_bytes as f64,
+            persistent_bytes: memory.persistent_bytes as f64,
+            state_bytes: memory.state_bytes as f64,
+            output_bytes: memory.output_bytes as f64,
+            workspace_bytes: memory.workspace_bytes as f64,
+            transaction_bytes: memory.transaction_bytes as f64,
+            peak_live_bytes: memory.peak_live_bytes as f64,
+            packing_overhead_bytes: memory.packing_overhead_bytes as f64,
+        },
     }
 }
 
@@ -251,8 +341,8 @@ impl NativeTensor {
         Ok(self
             .value_cloned()?
             .shape()
-            .into_iter()
-            .map(|dimension| dimension as u32)
+            .iter()
+            .map(|&dimension| dimension as u32)
             .collect())
     }
 
@@ -285,12 +375,7 @@ impl NativeTensor {
 }
 
 fn readback_blocking(value: &Value) -> Result<Readback> {
-    let flat = if matches!(value.dtype(), DType::F16 | DType::BF16) {
-        Value(value.tensor().cast(DType::F32))
-    } else {
-        value.clone()
-    };
-    let tensor = flat.tensor().contiguous();
+    let tensor = value.tensor();
     let element_size = tensor.dtype().size_in_bytes();
     let base = match &tensor.buffer {
         CpuBuffer::U8(values) => values.as_ptr().cast::<u8>(),
@@ -301,8 +386,72 @@ fn readback_blocking(value: &Value) -> Result<Readback> {
         CpuBuffer::F32(values) => values.as_ptr().cast::<u8>(),
         CpuBuffer::F64(values) => values.as_ptr().cast::<u8>(),
     };
+    let count = tensor.numel();
+    let logical_offset = |mut linear: usize| {
+        let mut offset = tensor.layout.offset();
+        for dimension in (0..tensor.layout.rank()).rev() {
+            let width = tensor.layout.shape()[dimension].max(1);
+            offset += (linear % width) * tensor.layout.strides()[dimension];
+            linear /= width;
+        }
+        offset
+    };
+    macro_rules! gather {
+        ($values:expr, $type:ty) => {{
+            let values = $values;
+            (0..count)
+                .map(|index| values[logical_offset(index)])
+                .collect::<Vec<$type>>()
+        }};
+    }
+    let owned = match &tensor.buffer {
+        CpuBuffer::F16(values) => Some(vec_to_bytes(
+            gather!(values, half::f16)
+                .into_iter()
+                .map(f32::from)
+                .collect::<Vec<_>>(),
+        )),
+        CpuBuffer::BF16(values) => Some(vec_to_bytes(
+            gather!(values, half::bf16)
+                .into_iter()
+                .map(f32::from)
+                .collect::<Vec<_>>(),
+        )),
+        CpuBuffer::F32(values) if !tensor.layout.is_contiguous() => {
+            Some(vec_to_bytes(gather!(values, f32)))
+        }
+        CpuBuffer::F64(values) if !tensor.layout.is_contiguous() => {
+            Some(vec_to_bytes(gather!(values, f64)))
+        }
+        CpuBuffer::I64(values) if !tensor.layout.is_contiguous() => {
+            Some(vec_to_bytes(gather!(values, i64)))
+        }
+        CpuBuffer::U8(values) if !tensor.layout.is_contiguous() => {
+            Some(vec_to_bytes(gather!(values, u8)))
+        }
+        CpuBuffer::U32(values) if !tensor.layout.is_contiguous() => {
+            Some(vec_to_bytes(gather!(values, u32)))
+        }
+        _ => None,
+    };
+    if let Some((_, ptr, len, cap)) = owned {
+        return Ok(Readback {
+            data: ptr,
+            byte_len: len,
+            hint: Some(FinalizeHint::Owned { ptr, len, cap }),
+        });
+    }
     let offset = tensor.layout.offset() * element_size;
-    let byte_len = tensor.numel() * element_size;
+    let byte_len = count * element_size;
+    if !base.is_null() && byte_len <= 4096 {
+        let bytes = unsafe { std::slice::from_raw_parts(base.add(offset), byte_len) }.to_vec();
+        let (_, ptr, len, cap) = vec_to_bytes(bytes);
+        return Ok(Readback {
+            data: ptr,
+            byte_len: len,
+            hint: Some(FinalizeHint::Owned { ptr, len, cap }),
+        });
+    }
     if !base.is_null() {
         let addr = base as usize + offset;
         if try_register_export(addr) {
@@ -310,25 +459,14 @@ fn readback_blocking(value: &Value) -> Result<Readback> {
                 data: addr as *mut u8,
                 byte_len,
                 hint: Some(FinalizeHint::ZeroCopy {
-                    value: Value(tensor),
+                    value: value.clone(),
                     addr,
                 }),
             });
         }
     }
-    let (_, ptr, len, cap) = match flat.dtype() {
-        DType::F32 => vec_to_bytes(flat.to_f32_vec().map_err(to_napi_err)?),
-        DType::F64 => vec_to_bytes(flat.to_f64_vec().map_err(to_napi_err)?),
-        DType::I64 => vec_to_bytes(flat.to_i64_vec().map_err(to_napi_err)?),
-        DType::U8 => vec_to_bytes(flat.to_u8_vec().map_err(to_napi_err)?),
-        DType::U32 => vec_to_bytes(flat.to_u32_vec().map_err(to_napi_err)?),
-        dtype => {
-            return Err(Error::new(
-                Status::InvalidArg,
-                format!("readback not implemented for dtype: {}", dtype.name()),
-            ));
-        }
-    };
+    let bytes = unsafe { std::slice::from_raw_parts(base.add(offset), byte_len) }.to_vec();
+    let (_, ptr, len, cap) = vec_to_bytes(bytes);
     Ok(Readback {
         data: ptr,
         byte_len: len,
@@ -442,20 +580,6 @@ fn chunked_head_ce_with(
         target: target.clone(),
         ignore_index,
     })
-}
-
-fn gelu(tensor: &Tensor, approximate: bool) -> Tensor {
-    let dtype = tensor.dtype();
-    let full = |value: f64| Tensor::full(&[], value, dtype);
-    if approximate {
-        let inner = tensor
-            .add(&tensor.mul(tensor).mul(tensor).mul(&full(0.044715)))
-            .mul(&full(0.7978845608028654));
-        tensor.mul(&full(0.5)).mul(&full(1.0).add(&inner.tanh()))
-    } else {
-        let inner = tensor.mul(&full(std::f64::consts::FRAC_1_SQRT_2)).erf();
-        tensor.mul(&full(0.5)).mul(&full(1.0).add(&inner))
-    }
 }
 
 #[napi]
@@ -1249,1210 +1373,6 @@ impl LazyTensor {
     }
 }
 
-struct Evaluator {
-    cache: HashMap<u64, Value>,
-    adamw: HashMap<u64, [Value; 2]>,
-    sgd: HashMap<u64, Value>,
-    multi: HashMap<u64, Vec<Value>>,
-    layer_norm: HashMap<u64, [Value; 2]>,
-    step_scalars: HashMap<(u64, DType), Value>,
-    consumers: HashMap<u64, usize>,
-    roots: HashSet<u64>,
-    slots: HashMap<u64, Value>,
-    kv: Option<Arc<KvContext>>,
-}
-
-impl Evaluator {
-    fn new(roots: &[Arc<Node>]) -> Self {
-        Self::with_slots(roots, HashMap::new())
-    }
-
-    fn with_slots(roots: &[Arc<Node>], slots: HashMap<u64, Value>) -> Self {
-        Self::with_kv(roots, slots, None)
-    }
-
-    fn with_kv(
-        roots: &[Arc<Node>],
-        slots: HashMap<u64, Value>,
-        kv: Option<Arc<KvContext>>,
-    ) -> Self {
-        let mut consumers = HashMap::new();
-        let mut visited = HashSet::new();
-        for root in roots {
-            count_consumers(root, &mut consumers, &mut visited);
-        }
-        Self {
-            cache: HashMap::new(),
-            adamw: HashMap::new(),
-            sgd: HashMap::new(),
-            multi: HashMap::new(),
-            layer_norm: HashMap::new(),
-            step_scalars: HashMap::new(),
-            consumers,
-            roots: roots.iter().map(|root| root.id).collect(),
-            slots,
-            kv,
-        }
-    }
-
-    fn value(&self, id: u64) -> err::Res<Value> {
-        self.cache
-            .get(&id)
-            .cloned()
-            .ok_or_else(|| format!("internal error: unevaluated node {id}"))
-    }
-
-    fn step_scalar(&mut self, id: u64, dtype: DType) -> err::Res<Value> {
-        let key = (id, dtype);
-        if let Some(value) = self.step_scalars.get(&key) {
-            return Ok(value.clone());
-        }
-        let value = Value(self.value(id)?.tensor().cast(dtype));
-        self.step_scalars.insert(key, value.clone());
-        Ok(value)
-    }
-
-    fn release_children(&mut self, node: &Arc<Node>) {
-        for child in node_children(&node.kind) {
-            if let Some(count) = self.consumers.get_mut(&child.id) {
-                *count -= 1;
-                if *count == 0 && !self.roots.contains(&child.id) {
-                    self.cache.remove(&child.id);
-                    self.adamw.remove(&child.id);
-                    self.sgd.remove(&child.id);
-                    self.multi.remove(&child.id);
-                    self.layer_norm.remove(&child.id);
-                }
-            }
-        }
-    }
-}
-
-fn count_consumers(
-    root: &Arc<Node>,
-    consumers: &mut HashMap<u64, usize>,
-    visited: &mut HashSet<u64>,
-) {
-    let mut stack = vec![root.clone()];
-    while let Some(node) = stack.pop() {
-        if !visited.insert(node.id) {
-            continue;
-        }
-        for child in node_children(&node.kind) {
-            *consumers.entry(child.id).or_insert(0) += 1;
-            stack.push(child);
-        }
-    }
-}
-
-fn coerce_scalar_values(a: Value, b: Value) -> (Value, Value) {
-    if a.dtype() == b.dtype() || !a.dtype().is_float() || !b.dtype().is_float() {
-        return (a, b);
-    }
-    let a_scalar = a.shape().is_empty();
-    let b_scalar = b.shape().is_empty();
-    if a_scalar == b_scalar {
-        return (a, b);
-    }
-    if a_scalar {
-        (Value(a.tensor().cast(b.dtype())), b)
-    } else {
-        (a.clone(), Value(b.tensor().cast(a.dtype())))
-    }
-}
-
-fn normalize_node_output(node: &Node, mut output: Value) -> err::Res<Value> {
-    if !node.device.is_cpu() {
-        return Err(format!(
-            "{} requested an unsupported device",
-            node_kind_name(&node.kind)
-        ));
-    }
-    if output.dtype() != node.dtype {
-        output = Value(output.tensor().cast(node.dtype));
-    }
-    if output.shape() != node.shape {
-        let expected: usize = node.shape.iter().product();
-        if output.numel() != expected {
-            return Err(format!(
-                "{} returned shape {:?}, expected {:?}",
-                node_kind_name(&node.kind),
-                output.shape(),
-                node.shape
-            ));
-        }
-        output = Value(
-            output
-                .tensor()
-                .contiguous()
-                .view(Layout::contiguous(node.shape.clone())),
-        );
-    }
-    Ok(output)
-}
-
-fn eval_node(
-    root: &Arc<Node>,
-    cancelled: &CancellationFlag,
-    evaluator: &mut Evaluator,
-) -> err::Res<Value> {
-    let mut stack = vec![(root.clone(), false)];
-    while let Some((node, processed)) = stack.pop() {
-        if cancelled.load(Ordering::Relaxed) {
-            return Err("operation aborted".to_string());
-        }
-        if evaluator.cache.contains_key(&node.id) {
-            continue;
-        }
-        if processed {
-            let output = normalize_node_output(&node, eval_uncached(&node, evaluator)?)?;
-            evaluator.cache.insert(node.id, output);
-            evaluator.release_children(&node);
-            continue;
-        }
-        stack.push((node.clone(), true));
-        for child in node_children(&node.kind) {
-            if !evaluator.cache.contains_key(&child.id) {
-                stack.push((child, false));
-            }
-        }
-    }
-    Ok(evaluator
-        .cache
-        .get(&root.id)
-        .expect("root is evaluated before its consumers")
-        .clone())
-}
-
-fn eval_uncached(node: &Arc<Node>, evaluator: &mut Evaluator) -> err::Res<Value> {
-    if !node.device.is_cpu() {
-        return Err("unsupported device".to_string());
-    }
-    let value = match &node.kind {
-        NodeKind::Leaf(slot) => slot.get().map_err(|error| error.to_string())?,
-        NodeKind::Input { slot, .. } | NodeKind::ScalarInput { slot, .. } => evaluator
-            .slots
-            .get(&node.id)
-            .cloned()
-            .ok_or_else(|| {
-                format!(
-                    "input slot {slot} is unbound: placeholder leaves evaluate only inside a compiled program run"
-                )
-            })?,
-        NodeKind::FromBytes {
-            data,
-            shape,
-            dtype,
-            ..
-        } => safetensors::value_from_bytes(data, shape, *dtype)?,
-        NodeKind::Zeros { shape, dtype, .. } => Value(Tensor::zeros(shape, *dtype)),
-        NodeKind::Ones { shape, dtype, .. } => Value(Tensor::ones(shape, *dtype)),
-        NodeKind::Full {
-            shape,
-            value,
-            dtype,
-            ..
-        } => Value(Tensor::full(shape, *value, *dtype)),
-        NodeKind::Randn { shape, dtype, .. } => Value(Tensor::randn(shape, *dtype)),
-        NodeKind::Uniform {
-            lo,
-            hi,
-            shape,
-            dtype,
-            ..
-        } => Value(Tensor::uniform(*lo, *hi, shape, *dtype)),
-        NodeKind::Arange {
-            start,
-            end,
-            step,
-            dtype,
-            ..
-        } => Value(Tensor::arange(*start, *end, *step, *dtype)),
-        NodeKind::Eye { n, dtype, .. } => Value(Tensor::eye(*n, *dtype)),
-        NodeKind::Add { a, b } => {
-            let (a, b) = coerce_scalar_values(evaluator.value(a.id)?, evaluator.value(b.id)?);
-            Value(a.tensor().add(b.tensor()))
-        }
-        NodeKind::Sub { a, b } => {
-            let (a, b) = coerce_scalar_values(evaluator.value(a.id)?, evaluator.value(b.id)?);
-            Value(a.tensor().sub(b.tensor()))
-        }
-        NodeKind::Mul { a, b } => {
-            let (a, b) = coerce_scalar_values(evaluator.value(a.id)?, evaluator.value(b.id)?);
-            Value(a.tensor().mul(b.tensor()))
-        }
-        NodeKind::Div { a, b } => {
-            let (a, b) = coerce_scalar_values(evaluator.value(a.id)?, evaluator.value(b.id)?);
-            Value(a.tensor().div(b.tensor()))
-        }
-        NodeKind::Eq { a, b } => Value(
-            evaluator
-                .value(a.id)?
-                .tensor()
-                .eq(evaluator.value(b.id)?.tensor()),
-        ),
-        NodeKind::Gt { a, b } => Value(
-            evaluator
-                .value(a.id)?
-                .tensor()
-                .gt(evaluator.value(b.id)?.tensor()),
-        ),
-        NodeKind::Lt { a, b } => Value(
-            evaluator
-                .value(a.id)?
-                .tensor()
-                .lt(evaluator.value(b.id)?.tensor()),
-        ),
-        NodeKind::Ge { a, b } => Value(
-            evaluator
-                .value(a.id)?
-                .tensor()
-                .ge(evaluator.value(b.id)?.tensor()),
-        ),
-        NodeKind::Le { a, b } => Value(
-            evaluator
-                .value(a.id)?
-                .tensor()
-                .le(evaluator.value(b.id)?.tensor()),
-        ),
-        NodeKind::Maximum { a, b } => {
-            let (a, b) = coerce_scalar_values(evaluator.value(a.id)?, evaluator.value(b.id)?);
-            Value(a.tensor().maximum(b.tensor()))
-        }
-        NodeKind::Minimum { a, b } => {
-            let (a, b) = coerce_scalar_values(evaluator.value(a.id)?, evaluator.value(b.id)?);
-            Value(a.tensor().minimum(b.tensor()))
-        }
-        NodeKind::Neg { a } => Value(evaluator.value(a.id)?.tensor().neg()),
-        NodeKind::Abs { a } => Value(evaluator.value(a.id)?.tensor().abs()),
-        NodeKind::Sqrt { a } => Value(evaluator.value(a.id)?.tensor().sqrt()),
-        NodeKind::Exp { a } => Value(evaluator.value(a.id)?.tensor().exp()),
-        NodeKind::Log { a } => Value(evaluator.value(a.id)?.tensor().log()),
-        NodeKind::Sin { a } => Value(evaluator.value(a.id)?.tensor().sin()),
-        NodeKind::Cos { a } => Value(evaluator.value(a.id)?.tensor().cos()),
-        NodeKind::Tanh { a } => Value(evaluator.value(a.id)?.tensor().tanh()),
-        NodeKind::Relu { a } => Value(evaluator.value(a.id)?.tensor().relu()),
-        NodeKind::Erf { a } => Value(evaluator.value(a.id)?.tensor().erf()),
-        NodeKind::Gelu { a, approximate } => Value(gelu(
-            evaluator.value(a.id)?.tensor(),
-            *approximate,
-        )),
-        NodeKind::Floor { a } => Value(evaluator.value(a.id)?.tensor().floor()),
-        NodeKind::Ceil { a } => Value(evaluator.value(a.id)?.tensor().ceil()),
-        NodeKind::Round { a } => Value(evaluator.value(a.id)?.tensor().round()),
-        NodeKind::Sign { a } => Value(evaluator.value(a.id)?.tensor().sign()),
-        NodeKind::Where { cond, a, b } => Value(
-            evaluator
-                .value(a.id)?
-                .tensor()
-                .where_(
-                    evaluator.value(cond.id)?.tensor(),
-                    evaluator.value(b.id)?.tensor(),
-                ),
-        ),
-        NodeKind::Argmax { a, dim } => Value(
-            evaluator
-                .value(a.id)?
-                .tensor()
-                .argmax(*dim)
-                .cast(DType::I64),
-        ),
-        NodeKind::Argmin { a, dim } => Value(
-            evaluator
-                .value(a.id)?
-                .tensor()
-                .argmin(*dim)
-                .cast(DType::I64),
-        ),
-        NodeKind::Cumsum { a, dim } => Value(evaluator.value(a.id)?.tensor().cumsum(*dim)),
-        NodeKind::ScatterAdd {
-            a,
-            dim,
-            indexes,
-            src,
-        } => Value(evaluator.value(a.id)?.tensor().scatter_add(
-            *dim,
-            evaluator.value(indexes.id)?.tensor(),
-            evaluator.value(src.id)?.tensor(),
-        )),
-        NodeKind::Gather { a, dim, indexes } => Value(
-            evaluator
-                .value(a.id)?
-                .tensor()
-                .gather(*dim, evaluator.value(indexes.id)?.tensor()),
-        ),
-        NodeKind::IndexSelect { a, dim, indexes } => Value(
-            evaluator
-                .value(a.id)?
-                .tensor()
-                .index_select(*dim, evaluator.value(indexes.id)?.tensor()),
-        ),
-        NodeKind::CrossEntropy {
-            logits,
-            target,
-            ignore_index,
-            reduction,
-        } => Value(composed::cross_entropy_forward(
-            evaluator.value(logits.id)?.tensor(),
-            evaluator.value(target.id)?.tensor(),
-            *ignore_index,
-            *reduction,
-        )?),
-        NodeKind::CrossEntropyBackward {
-            logits,
-            target,
-            ignore_index,
-            reduction,
-        } => Value(composed::cross_entropy_backward(
-            evaluator.value(logits.id)?.tensor(),
-            evaluator.value(target.id)?.tensor(),
-            *ignore_index,
-            *reduction,
-        )?),
-        NodeKind::ChunkedHeadCe {
-            x,
-            weight,
-            bias,
-            target,
-            ignore_index,
-        } => {
-            let (_, chunk_size) = chunked_ce_limits();
-            Value(composed::chunked_head_ce_forward(
-                evaluator.value(x.id)?.tensor(),
-                evaluator.value(weight.id)?.tensor(),
-                evaluator.value(bias.id)?.tensor(),
-                evaluator.value(target.id)?.tensor(),
-                *ignore_index,
-                chunk_size,
-            )?)
-        }
-        NodeKind::ChunkedHeadCeBackward {
-            x,
-            weight,
-            bias,
-            target,
-            g,
-            ignore_index,
-        } => {
-            let (_, chunk_size) = chunked_ce_limits();
-            let (dx, dw, db) = composed::chunked_head_ce_backward(
-                evaluator.value(x.id)?.tensor(),
-                evaluator.value(weight.id)?.tensor(),
-                evaluator.value(bias.id)?.tensor(),
-                evaluator.value(target.id)?.tensor(),
-                evaluator.value(g.id)?.tensor(),
-                *ignore_index,
-                chunk_size,
-            )?;
-            let values = vec![Value(dx), Value(dw), Value(db)];
-            let head = values[0].clone();
-            evaluator.multi.insert(node.id, values);
-            head
-        }
-        NodeKind::ChunkedHeadCeBackwardOut { of, index } => evaluator
-            .multi
-            .get(&of.id)
-            .and_then(|values| values.get(*index as usize))
-            .cloned()
-            .ok_or_else(|| "chunked head ce backward out: outputs missing".to_string())?,
-        NodeKind::Sdpa {
-            q,
-            k,
-            v,
-            scale,
-            causal,
-        } => Value(composed::sdpa_forward(
-            evaluator.value(q.id)?.tensor(),
-            evaluator.value(k.id)?.tensor(),
-            evaluator.value(v.id)?.tensor(),
-            *scale,
-            *causal,
-        )),
-        NodeKind::SdpaBackward {
-            q,
-            k,
-            v,
-            g,
-            scale,
-            causal,
-            ..
-        } => {
-            let (dq, dk, dv) = composed::sdpa_backward(
-                evaluator.value(q.id)?.tensor(),
-                evaluator.value(k.id)?.tensor(),
-                evaluator.value(v.id)?.tensor(),
-                evaluator.value(g.id)?.tensor(),
-                *scale,
-                *causal,
-            );
-            let values = vec![Value(dq), Value(dk), Value(dv)];
-            let head = values[0].clone();
-            evaluator.multi.insert(node.id, values);
-            head
-        }
-        NodeKind::SdpaBackwardOut { of, index } => evaluator
-            .multi
-            .get(&of.id)
-            .and_then(|values| values.get(*index as usize))
-            .cloned()
-            .ok_or_else(|| "sdpa backward out: outputs missing".to_string())?,
-        NodeKind::KdaChunk {
-            q,
-            k,
-            v,
-            log_decay,
-            beta,
-            scale,
-        } => Value(composed::kda_chunk_forward(
-            evaluator.value(q.id)?.tensor(),
-            evaluator.value(k.id)?.tensor(),
-            evaluator.value(v.id)?.tensor(),
-            evaluator.value(log_decay.id)?.tensor(),
-            evaluator.value(beta.id)?.tensor(),
-            *scale,
-        )),
-        NodeKind::KdaRecurrence {
-            q,
-            k,
-            v,
-            log_decay,
-            beta,
-            scale,
-            layer,
-        } => {
-            let context = evaluator.kv.clone().ok_or_else(|| {
-                "kda recurrence: node evaluates only inside a decode program run".to_string()
-            })?;
-            kda_recurrence(
-                &context,
-                *layer,
-                &evaluator.value(q.id)?,
-                &evaluator.value(k.id)?,
-                &evaluator.value(v.id)?,
-                &evaluator.value(log_decay.id)?,
-                &evaluator.value(beta.id)?,
-                *scale,
-            )?
-        }
-        NodeKind::ShortConv1d { x, weight } => Value(composed::short_conv1d_forward(
-            evaluator.value(x.id)?.tensor(),
-            evaluator.value(weight.id)?.tensor(),
-        )),
-        NodeKind::KdaBackward {
-            q,
-            k,
-            v,
-            log_decay,
-            beta,
-            g,
-            scale,
-        } => {
-            let (dq, dk, dv, dg, db) = composed::kda_chunk_backward(
-                evaluator.value(q.id)?.tensor(),
-                evaluator.value(k.id)?.tensor(),
-                evaluator.value(v.id)?.tensor(),
-                evaluator.value(log_decay.id)?.tensor(),
-                evaluator.value(beta.id)?.tensor(),
-                evaluator.value(g.id)?.tensor(),
-                *scale,
-            );
-            let values = vec![
-                Value(dq),
-                Value(dk),
-                Value(dv),
-                Value(dg),
-                Value(db),
-            ];
-            let head = values[0].clone();
-            evaluator.multi.insert(node.id, values);
-            head
-        }
-        NodeKind::KdaBackwardOut { of, index } => evaluator
-            .multi
-            .get(&of.id)
-            .and_then(|values| values.get(*index as usize))
-            .cloned()
-            .ok_or_else(|| "kda backward out: outputs missing".to_string())?,
-        NodeKind::ShortConv1dBackwardX { x, weight, g } => {
-            Value(composed::short_conv1d_backward_x(
-                evaluator.value(x.id)?.tensor(),
-                evaluator.value(weight.id)?.tensor(),
-                evaluator.value(g.id)?.tensor(),
-            ))
-        }
-        NodeKind::ShortConv1dBackwardW { x, weight, g } => {
-            Value(composed::short_conv1d_backward_w(
-                evaluator.value(x.id)?.tensor(),
-                evaluator.value(weight.id)?.tensor(),
-                evaluator.value(g.id)?.tensor(),
-            ))
-        }
-        NodeKind::ConvState { x, weight, layer } => {
-            let context = evaluator.kv.clone().ok_or_else(|| {
-                "conv state: node evaluates only inside a decode program run".to_string()
-            })?;
-            conv_state(
-                &context,
-                *layer,
-                &evaluator.value(x.id)?,
-                &evaluator.value(weight.id)?,
-            )?
-        }
-        NodeKind::PositionEmbedding { weight, seq_len } => {
-            let weight = evaluator.value(weight.id)?;
-            Value(
-                weight
-                    .tensor()
-                    .view(weight.tensor().layout.narrow(0, 0, *seq_len))
-                    .contiguous(),
-            )
-        }
-        NodeKind::KvAttention {
-            q,
-            k,
-            v,
-            scale,
-            layer,
-            window,
-        } => {
-            let context = evaluator.kv.clone().ok_or_else(|| {
-                "kv attention: node evaluates only inside a kv program run".to_string()
-            })?;
-            kv_attention(
-                &context,
-                *layer,
-                &evaluator.value(q.id)?,
-                &evaluator.value(k.id)?,
-                &evaluator.value(v.id)?,
-                *scale,
-                *window,
-            )?
-        }
-        NodeKind::RotaryEmbedding {
-            x, theta, offset, ..
-        } => {
-            let offsets = match offset {
-                PositionOffset::Absolute => vec![0],
-                PositionOffset::Cursor => {
-                    let context = evaluator.kv.as_ref().ok_or_else(|| {
-                        "rotary embedding: cursor offset outside a kv program run".to_string()
-                    })?;
-                    context
-                        .slots
-                        .iter()
-                        .map(|slot| {
-                            slot.lock()
-                                .map(|state| state.cursor)
-                                .map_err(|error| {
-                                    format!("rotary embedding: sequence lock poisoned: {error}")
-                                })
-                        })
-                        .collect::<err::Res<Vec<_>>>()?
-                }
-            };
-            Value(composed::rotary_forward(
-                evaluator.value(x.id)?.tensor(),
-                &offsets,
-                *theta,
-                1.0,
-            )?)
-        }
-        NodeKind::RotaryEmbeddingBackward { g, theta, .. } => Value(
-            composed::rotary_forward(
-                evaluator.value(g.id)?.tensor(),
-                &[0],
-                *theta,
-                -1.0,
-            )?,
-        ),
-        NodeKind::Linear { x, weight, bias } => {
-            let activation = evaluator
-                .value(x.id)?
-                .tensor()
-                .try_matmul(evaluator.value(weight.id)?.tensor())?;
-            Value(activation.add(evaluator.value(bias.id)?.tensor()))
-        }
-        NodeKind::LinearResidual {
-            x,
-            weight,
-            bias,
-            residual,
-        } => {
-            let activation = evaluator
-                .value(x.id)?
-                .tensor()
-                .try_matmul(evaluator.value(weight.id)?.tensor())?;
-            Value(
-                activation
-                .add(evaluator.value(bias.id)?.tensor())
-                .add(evaluator.value(residual.id)?.tensor()),
-            )
-        }
-        NodeKind::LinearGelu {
-            x,
-            weight,
-            bias,
-            approximate,
-            dual,
-        } => {
-            let activation = evaluator
-                .value(x.id)?
-                .tensor()
-                .try_matmul(evaluator.value(weight.id)?.tensor())?
-                .add(evaluator.value(bias.id)?.tensor());
-            let output = gelu(&activation, *approximate);
-            if *dual {
-                let values = vec![Value(activation), Value(output)];
-                let head = values[0].clone();
-                evaluator.multi.insert(node.id, values);
-                head
-            } else {
-                Value(output)
-            }
-        }
-        NodeKind::LayerNorm {
-            x,
-            weight,
-            bias,
-            eps,
-        } => Value(composed::layer_norm_forward(
-            evaluator.value(x.id)?.tensor(),
-            evaluator.value(weight.id)?.tensor(),
-            evaluator.value(bias.id)?.tensor(),
-            *eps,
-        )),
-        NodeKind::LayerNormBackward { x, weight, g, eps } => {
-            let (dx, dw, db) = composed::layer_norm_backward(
-                evaluator.value(x.id)?.tensor(),
-                evaluator.value(weight.id)?.tensor(),
-                evaluator.value(g.id)?.tensor(),
-                *eps,
-            );
-            evaluator
-                .layer_norm
-                .insert(node.id, [Value(dw), Value(db)]);
-            Value(dx)
-        }
-        NodeKind::LayerNormBackwardOut { of, index } => evaluator
-            .layer_norm
-            .get(&of.id)
-            .and_then(|values| values.get(*index as usize - 1))
-            .cloned()
-            .ok_or_else(|| {
-                "layer_norm_backward_out: backward node has no stored outputs".to_string()
-            })?,
-        NodeKind::Conv1d {
-            x,
-            w,
-            stride,
-            padding,
-            dilation,
-            groups,
-        } => Value(conv::conv1d(
-            evaluator.value(x.id)?.tensor(),
-            evaluator.value(w.id)?.tensor(),
-            *stride,
-            *padding,
-            *dilation,
-            *groups,
-        )),
-        NodeKind::Conv2d {
-            x,
-            w,
-            stride,
-            padding,
-            dilation,
-            groups,
-        } => Value(conv::conv2d(
-            evaluator.value(x.id)?.tensor(),
-            evaluator.value(w.id)?.tensor(),
-            *stride,
-            *padding,
-            *dilation,
-            *groups,
-        )),
-        NodeKind::ConvTranspose1d {
-            x,
-            w,
-            stride,
-            padding,
-            output_padding,
-            dilation,
-            groups,
-        } => Value(conv::conv_transpose1d(
-            evaluator.value(x.id)?.tensor(),
-            evaluator.value(w.id)?.tensor(),
-            *stride,
-            *padding,
-            *output_padding,
-            *dilation,
-            *groups,
-        )),
-        NodeKind::ConvTranspose2d {
-            x,
-            w,
-            stride,
-            padding,
-            output_padding,
-            dilation,
-            groups,
-        } => Value(conv::conv_transpose2d(
-            evaluator.value(x.id)?.tensor(),
-            evaluator.value(w.id)?.tensor(),
-            *stride,
-            *padding,
-            *output_padding,
-            *dilation,
-            *groups,
-        )),
-        NodeKind::Conv1dBackwardW {
-            x,
-            g,
-            kernel,
-            out_channels,
-            stride,
-            padding,
-            dilation,
-            groups,
-        } => {
-            let x = evaluator.value(x.id)?;
-            let g = evaluator.value(g.id)?;
-            let expand = |tensor: &Tensor| {
-                let shape = tensor.shape();
-                tensor.contiguous().view(Layout::contiguous(vec![
-                    shape[0], shape[1], shape[2], 1,
-                ]))
-            };
-            let output = conv::conv2d_backward_w(
-                &expand(x.tensor()),
-                &expand(g.tensor()),
-                [*kernel, 1],
-                *out_channels,
-                *stride,
-                *padding,
-                *dilation,
-                *groups,
-            );
-            let shape = output.shape();
-            Value(output.contiguous().view(Layout::contiguous(vec![
-                shape[0], shape[1], shape[2],
-            ])))
-        }
-        NodeKind::Conv2dBackwardW {
-            x,
-            g,
-            kernel,
-            out_channels,
-            stride,
-            padding,
-            dilation,
-            groups,
-        } => Value(conv::conv2d_backward_w(
-            evaluator.value(x.id)?.tensor(),
-            evaluator.value(g.id)?.tensor(),
-            *kernel,
-            *out_channels,
-            *stride,
-            *padding,
-            *dilation,
-            *groups,
-        )),
-        NodeKind::Pow { a, exp } => Value(evaluator.value(a.id)?.tensor().powf(*exp)),
-        NodeKind::Cast { a, dtype } => Value(evaluator.value(a.id)?.tensor().cast(*dtype)),
-        NodeKind::Sum { a, dims, keepdims } => {
-            let output = evaluator.value(a.id)?.tensor().sum(dims);
-            Value(if *keepdims {
-                output
-            } else {
-                output.squeeze_dims(dims)
-            })
-        }
-        NodeKind::Mean { a, dims, keepdims } => {
-            let output = evaluator.value(a.id)?.tensor().mean(dims);
-            Value(if *keepdims {
-                output
-            } else {
-                output.squeeze_dims(dims)
-            })
-        }
-        NodeKind::Max { a, dims, keepdims } => {
-            let output = evaluator.value(a.id)?.tensor().max(dims);
-            Value(if *keepdims {
-                output
-            } else {
-                output.squeeze_dims(dims)
-            })
-        }
-        NodeKind::Min { a, dims, keepdims } => {
-            let output = evaluator.value(a.id)?.tensor().min(dims);
-            Value(if *keepdims {
-                output
-            } else {
-                output.squeeze_dims(dims)
-            })
-        }
-        NodeKind::Prod { a, dims, keepdims } => {
-            let output = evaluator.value(a.id)?.tensor().prod(dims);
-            Value(if *keepdims {
-                output
-            } else {
-                output.squeeze_dims(dims)
-            })
-        }
-        NodeKind::Reshape { a, shape } => Value(
-            evaluator
-                .value(a.id)?
-                .tensor()
-                .contiguous()
-                .view(Layout::contiguous(shape.clone())),
-        ),
-        NodeKind::Permute { a, dims } => {
-            let value = evaluator.value(a.id)?;
-            Value(value.tensor().view(value.tensor().layout.permute(dims)).contiguous())
-        }
-        NodeKind::Slice { a, ranges } => {
-            let mut output = evaluator.value(a.id)?.into_tensor();
-            for (dimension, &(start, stop, stride)) in ranges.iter().enumerate() {
-                let length = stop.saturating_sub(start).div_ceil(stride);
-                if length == 0 {
-                    let mut shape = output.shape().to_vec();
-                    shape[dimension] = 0;
-                    output = Tensor::zeros(&shape, output.dtype());
-                    continue;
-                }
-                output = output
-                    .view(output.layout.narrow(
-                        dimension,
-                        start,
-                        (length - 1) * stride + 1,
-                    ))
-                    .contiguous();
-                if stride > 1 {
-                    let indexes: Vec<u32> = (0..length as u32)
-                        .map(|index| index * stride as u32)
-                        .collect();
-                    output = output.index_select(
-                        dimension,
-                        &Tensor::from_vec(indexes, vec![length]),
-                    );
-                }
-            }
-            Value(output)
-        }
-        NodeKind::Concat { a, b, dim } => Value(Tensor::cat(
-            &[
-                evaluator.value(a.id)?.tensor(),
-                evaluator.value(b.id)?.tensor(),
-            ],
-            *dim,
-        )),
-        NodeKind::BroadcastTo { a, shape } => {
-            let value = evaluator.value(a.id)?;
-            Value(
-                value
-                    .tensor()
-                    .view(value.tensor().layout.broadcast_to(shape))
-                    .contiguous(),
-            )
-        }
-        NodeKind::Matmul { a, b } => {
-            let output = evaluator
-                .value(a.id)?
-                .tensor()
-                .try_matmul(evaluator.value(b.id)?.tensor())?;
-            Value(output)
-        }
-        NodeKind::Inverse { a } => Value(evaluator.value(a.id)?.tensor().try_inverse()?),
-        NodeKind::Det { a } => Value(evaluator.value(a.id)?.tensor().det()),
-        NodeKind::Solve { a, b } => {
-            let output = evaluator
-                .value(a.id)?
-                .tensor()
-                .try_solve(evaluator.value(b.id)?.tensor())?;
-            Value(output)
-        }
-        NodeKind::StopGradient { a } | NodeKind::Checkpoint { a } => evaluator.value(a.id)?,
-        NodeKind::AdamWStep {
-            param,
-            grad,
-            m,
-            v,
-            lr,
-            c1,
-            c2,
-            beta1,
-            beta2,
-            eps,
-            weight_decay,
-        } => {
-            let param_value = evaluator.value(param.id)?;
-            let grad_value = evaluator.value(grad.id)?;
-            let m_value = evaluator.value(m.id)?;
-            let v_value = evaluator.value(v.id)?;
-            let lr_value = evaluator.step_scalar(lr.id, param_value.dtype())?;
-            let c1_value = evaluator.step_scalar(c1.id, param_value.dtype())?;
-            let c2_value = evaluator.step_scalar(c2.id, param_value.dtype())?;
-            let fused = if fusion::is_supported(&param_value.device(), param_value.dtype()) {
-                fusion::run(
-                    &fusion::adamw_exprs(*beta1, *beta2, *eps, *weight_decay),
-                    &[
-                        param_value.clone(),
-                        grad_value.clone(),
-                        m_value.clone(),
-                        v_value.clone(),
-                    ],
-                    None,
-                    &[lr_value.clone(), c1_value.clone(), c2_value.clone()],
-                    param_value.numel(),
-                    &param_value.shape(),
-                    param_value.dtype(),
-                    &cpu_device(),
-                )
-                .ok()
-            } else {
-                None
-            };
-            if let Some(mut outputs) = fused {
-                let next_param = outputs.remove(0);
-                evaluator
-                    .adamw
-                    .insert(node.id, [outputs.remove(0), outputs.remove(0)]);
-                next_param
-            } else {
-                let (next_param, next_m, next_v) = composed::adamw_step(
-                    param_value.tensor(),
-                    grad_value.tensor(),
-                    m_value.tensor(),
-                    v_value.tensor(),
-                    lr_value.tensor(),
-                    c1_value.tensor(),
-                    c2_value.tensor(),
-                    *beta1,
-                    *beta2,
-                    *eps,
-                    *weight_decay,
-                );
-                evaluator
-                    .adamw
-                    .insert(node.id, [Value(next_m), Value(next_v)]);
-                Value(next_param)
-            }
-        }
-        NodeKind::AdamWOut { step, index } => {
-            let _ = evaluator.value(step.id)?;
-            match index {
-                0 => evaluator.value(step.id)?,
-                1 => evaluator.adamw[&step.id][0].clone(),
-                _ => evaluator.adamw[&step.id][1].clone(),
-            }
-        }
-        NodeKind::AdamWStepGroup {
-            params,
-            grads,
-            ms,
-            vs,
-            lr,
-            c1,
-            c2,
-            beta1,
-            beta2,
-            eps,
-            weight_decay,
-        } => {
-            let first = evaluator.value(params[0].id)?;
-            let lr = evaluator.step_scalar(lr.id, first.dtype())?;
-            let c1 = evaluator.step_scalar(c1.id, first.dtype())?;
-            let c2 = evaluator.step_scalar(c2.id, first.dtype())?;
-            let mut inputs = Vec::with_capacity(params.len() * 4);
-            for index in 0..params.len() {
-                inputs.push(evaluator.value(params[index].id)?);
-                inputs.push(evaluator.value(grads[index].id)?);
-                inputs.push(evaluator.value(ms[index].id)?);
-                inputs.push(evaluator.value(vs[index].id)?);
-            }
-            let base = fusion::adamw_exprs(*beta1, *beta2, *eps, *weight_decay);
-            let mut expressions = Vec::with_capacity(params.len() * 3);
-            for index in 0..params.len() {
-                let remap: HashMap<u32, u32> =
-                    (0..4).map(|lane| (lane, index as u32 * 4 + lane)).collect();
-                expressions.extend(base.iter().map(|expr| expr.remap_lanes(&remap)));
-            }
-            let outputs = fusion::run(
-                &expressions,
-                &inputs,
-                None,
-                &[lr, c1, c2],
-                first.numel(),
-                &first.shape(),
-                first.dtype(),
-                &cpu_device(),
-            )?;
-            let head = outputs[0].clone();
-            evaluator.multi.insert(node.id, outputs);
-            head
-        }
-        NodeKind::AdamWGroupOut { of, param, index } => {
-            let _ = evaluator.value(of.id)?;
-            evaluator
-                .multi
-                .get(&of.id)
-                .and_then(|outputs| outputs.get(*param as usize * 3 + *index as usize))
-                .cloned()
-                .ok_or_else(|| "adamw_group_out: group has no stored outputs".to_string())?
-        }
-        NodeKind::SgdStep {
-            param,
-            grad,
-            velocity,
-            first,
-            lr,
-            momentum,
-            dampening,
-            nesterov,
-            weight_decay,
-        } => {
-            let param_value = evaluator.value(param.id)?;
-            let grad_value = evaluator.value(grad.id)?;
-            let velocity_value = evaluator.value(velocity.id)?;
-            let first_value = evaluator.step_scalar(first.id, param_value.dtype())?;
-            let lr_value = evaluator.step_scalar(lr.id, param_value.dtype())?;
-            let fused = if fusion::is_supported(&param_value.device(), param_value.dtype()) {
-                fusion::run(
-                    &fusion::sgd_exprs(*momentum, *dampening, *nesterov, *weight_decay),
-                    &[
-                        param_value.clone(),
-                        grad_value.clone(),
-                        velocity_value.clone(),
-                    ],
-                    None,
-                    &[lr_value.clone(), first_value.clone()],
-                    param_value.numel(),
-                    &param_value.shape(),
-                    param_value.dtype(),
-                    &cpu_device(),
-                )
-                .ok()
-            } else {
-                None
-            };
-            if let Some(mut outputs) = fused {
-                let next_param = outputs.remove(0);
-                evaluator.sgd.insert(node.id, outputs.remove(0));
-                next_param
-            } else {
-                let (next_param, next_velocity) = composed::sgd_step(
-                    param_value.tensor(),
-                    grad_value.tensor(),
-                    velocity_value.tensor(),
-                    lr_value.tensor(),
-                    first_value.tensor(),
-                    *momentum,
-                    *dampening,
-                    *nesterov,
-                    *weight_decay,
-                );
-                evaluator.sgd.insert(node.id, Value(next_velocity));
-                Value(next_param)
-            }
-        }
-        NodeKind::SgdOut { step, index } => {
-            let _ = evaluator.value(step.id)?;
-            if *index == 0 {
-                evaluator.value(step.id)?
-            } else {
-                evaluator
-                    .sgd
-                    .get(&step.id)
-                    .cloned()
-                    .ok_or_else(|| "sgd_out: step has no stored velocity".to_string())?
-            }
-        }
-        NodeKind::FusedElementwise {
-            inputs,
-            strides,
-            shape,
-            expr,
-        } => {
-            let values = inputs
-                .iter()
-                .map(|input| evaluator.value(input.id))
-                .collect::<err::Res<Vec<_>>>()?;
-            let first = &values[0];
-            fusion::run(
-                std::slice::from_ref(expr),
-                &values,
-                Some(strides),
-                &[],
-                shape.iter().product(),
-                shape,
-                first.dtype(),
-                &cpu_device(),
-            )?
-            .remove(0)
-        }
-        NodeKind::FusedElementwiseMulti {
-            inputs,
-            strides,
-            shape,
-            exprs,
-        } => {
-            let values = inputs
-                .iter()
-                .map(|input| evaluator.value(input.id))
-                .collect::<err::Res<Vec<_>>>()?;
-            let first = &values[0];
-            let outputs = fusion::run(
-                exprs,
-                &values,
-                Some(strides),
-                &[],
-                shape.iter().product(),
-                shape,
-                first.dtype(),
-                &cpu_device(),
-            )?;
-            let head = outputs[0].clone();
-            evaluator.multi.insert(node.id, outputs);
-            head
-        }
-        NodeKind::FusedPick { of, index } => evaluator
-            .multi
-            .get(&of.id)
-            .and_then(|outputs| outputs.get(*index as usize))
-            .cloned()
-            .ok_or_else(|| "fused pick: multi output missing".to_string())?,
-        NodeKind::FusedReduce {
-            inputs,
-            strides,
-            in_shape,
-            expr,
-            op,
-            dims,
-            keepdims,
-            shape,
-        } => {
-            let values = inputs
-                .iter()
-                .map(|input| evaluator.value(input.id))
-                .collect::<err::Res<Vec<_>>>()?;
-            let first = &values[0];
-            fusion::run_reduce(
-                *op,
-                expr,
-                &values,
-                strides,
-                in_shape,
-                dims,
-                *keepdims,
-                shape,
-                first.dtype(),
-                &cpu_device(),
-            )?
-        }
-    };
-    Ok(value)
-}
-
 #[napi]
 pub fn grad(loss: &LazyTensor, wrt: Vec<&LazyTensor>) -> Result<Vec<LazyTensor>> {
     let targets = wrt
@@ -2483,180 +1403,249 @@ async fn run_compute<T: Send + 'static>(
     effect_torch_napi::run_compute(state, notify, compute).await
 }
 
-#[napi]
-pub async fn eval_lazy(
-    tensors: Vec<&LazyTensor>,
-    token: Option<&CancellationToken>,
-) -> Result<Vec<NativeTensor>> {
-    let roots = tensors
-        .iter()
-        .map(|tensor| tensor.node.clone())
-        .collect::<Vec<_>>();
-    let roots = fuse_roots_cached(&roots)?;
-    run_compute(token, move |cancelled, _state| {
-        let mut evaluator = Evaluator::new(&roots);
-        roots
-            .iter()
-            .map(|root| {
-                eval_node(root, cancelled, &mut evaluator)
-                    .map(NativeTensor::wrap)
-                    .map_err(to_napi_err)
-            })
-            .collect()
-    })
-    .await
-}
-
-fn fuse_roots_cached(roots: &[Arc<Node>]) -> Result<Vec<Arc<Node>>> {
-    if std::env::var_os("EFFECT_TORCH_NO_FUSION").is_some() {
-        return Ok(roots.to_vec());
-    }
-    type FusionCache = (u64, HashMap<Vec<u64>, (u64, Vec<Arc<Node>>)>);
-    static CACHE: LazyLock<Mutex<FusionCache>> = LazyLock::new(|| Mutex::new((0, HashMap::new())));
-    let key = roots.iter().map(|root| root.id).collect::<Vec<_>>();
-    {
-        let mut cache = CACHE.lock().map_err(|error| {
-            Error::new(
-                Status::GenericFailure,
-                format!("fusion cache lock poisoned: {error}"),
-            )
-        })?;
-        cache.0 += 1;
-        let tick = cache.0;
-        if let Some((entry_tick, fused)) = cache.1.get_mut(&key) {
-            *entry_tick = tick;
-            return Ok(fused.clone());
-        }
-    }
-    let fused = fuse_roots(roots).map_err(|error| Error::new(Status::GenericFailure, error))?;
-    let mut cache = CACHE.lock().map_err(|error| {
-        Error::new(
-            Status::GenericFailure,
-            format!("fusion cache lock poisoned: {error}"),
-        )
-    })?;
-    cache.0 += 1;
-    let tick = cache.0;
-    if cache.1.len() >= 32 {
-        if let Some(oldest) = cache
-            .1
-            .iter()
-            .min_by_key(|(_, (entry_tick, _))| *entry_tick)
-            .map(|(key, _)| key.clone())
-        {
-            cache.1.remove(&oldest);
-        }
-    }
-    cache.1.insert(key, (tick, fused.clone()));
-    Ok(fused)
-}
-
-fn node_kind_name(kind: &NodeKind) -> &'static str {
-    match kind {
-        NodeKind::FusedElementwise { .. } => "Fused",
-        NodeKind::FusedElementwiseMulti { .. } => "FusedMulti",
-        NodeKind::FusedReduce { .. } => "FusedReduce",
-        NodeKind::FusedPick { .. } => "FusedPick",
-        NodeKind::Add { .. } => "Add",
-        NodeKind::Sub { .. } => "Sub",
-        NodeKind::Mul { .. } => "Mul",
-        NodeKind::Div { .. } => "Div",
-        NodeKind::Matmul { .. } => "Matmul",
-        NodeKind::Linear { .. } => "Linear",
-        NodeKind::LinearGelu { .. } => "LinearGelu",
-        NodeKind::LinearResidual { .. } => "LinearResidual",
-        NodeKind::Gelu { .. } => "Gelu",
-        NodeKind::Sdpa { .. } => "Sdpa",
-        NodeKind::SdpaBackward { .. } | NodeKind::SdpaBackwardOut { .. } => "SdpaBwd",
-        NodeKind::Concat { .. } => "Concat",
-        NodeKind::Slice { .. } => "Slice",
-        NodeKind::Permute { .. } => "Permute",
-        NodeKind::Reshape { .. } => "Reshape",
-        NodeKind::BroadcastTo { .. } => "Broadcast",
-        NodeKind::Cast { .. } => "Cast",
-        NodeKind::Gather { .. } | NodeKind::IndexSelect { .. } => "Gather",
-        NodeKind::ScatterAdd { .. } => "ScatterAdd",
-        NodeKind::RotaryEmbedding { .. } => "Rope",
-        NodeKind::RotaryEmbeddingBackward { .. } => "RopeBwd",
-        NodeKind::LayerNorm { .. } => "LayerNorm",
-        NodeKind::LayerNormBackward { .. } => "LayerNormBwd",
-        NodeKind::LayerNormBackwardOut { .. } => "LayerNormOut",
-        NodeKind::PositionEmbedding { .. } => "PosEmb",
-        NodeKind::KvAttention { .. } => "KvAttention",
-        NodeKind::KdaChunk { .. } => "KdaChunk",
-        NodeKind::KdaRecurrence { .. } => "KdaRecurrence",
-        NodeKind::KdaBackward { .. } | NodeKind::KdaBackwardOut { .. } => "KdaBwd",
-        NodeKind::ShortConv1d { .. } => "ShortConv",
-        NodeKind::ShortConv1dBackwardX { .. } | NodeKind::ShortConv1dBackwardW { .. } => {
-            "ShortConvBwd"
-        }
-        NodeKind::ConvState { .. } => "ConvState",
-        NodeKind::Sum { .. }
-        | NodeKind::Mean { .. }
-        | NodeKind::Max { .. }
-        | NodeKind::Min { .. }
-        | NodeKind::Prod { .. } => "Reduce",
-        NodeKind::CrossEntropy { .. } | NodeKind::CrossEntropyBackward { .. } => "CE",
-        NodeKind::ChunkedHeadCe { .. } => "HeadCE",
-        NodeKind::ChunkedHeadCeBackward { .. } | NodeKind::ChunkedHeadCeBackwardOut { .. } => {
-            "HeadCEBwd"
-        }
-        NodeKind::AdamWStep { .. } | NodeKind::AdamWOut { .. } => "AdamW",
-        NodeKind::AdamWStepGroup { .. } => "AdamWGroup",
-        NodeKind::AdamWGroupOut { .. } => "AdamWGroupOut",
-        NodeKind::SgdStep { .. } | NodeKind::SgdOut { .. } => "Sgd",
-        NodeKind::Exp { .. }
-        | NodeKind::Log { .. }
-        | NodeKind::Sin { .. }
-        | NodeKind::Cos { .. }
-        | NodeKind::Tanh { .. }
-        | NodeKind::Erf { .. }
-        | NodeKind::Sqrt { .. }
-        | NodeKind::Abs { .. }
-        | NodeKind::Sign { .. }
-        | NodeKind::Neg { .. }
-        | NodeKind::Relu { .. }
-        | NodeKind::Pow { .. }
-        | NodeKind::Floor { .. }
-        | NodeKind::Ceil { .. }
-        | NodeKind::Round { .. } => "Unary",
-        NodeKind::Maximum { .. } | NodeKind::Minimum { .. } => "MaxMin",
-        NodeKind::Eq { .. }
-        | NodeKind::Lt { .. }
-        | NodeKind::Le { .. }
-        | NodeKind::Gt { .. }
-        | NodeKind::Ge { .. } => "Cmp",
-        NodeKind::Where { .. } => "Where",
-        NodeKind::Checkpoint { .. } | NodeKind::StopGradient { .. } => "Passthrough",
-        NodeKind::Argmax { .. } | NodeKind::Argmin { .. } | NodeKind::Cumsum { .. } => "Scan",
-        NodeKind::Inverse { .. } | NodeKind::Det { .. } | NodeKind::Solve { .. } => "Linalg",
-        NodeKind::Leaf(_) | NodeKind::Input { .. } | NodeKind::ScalarInput { .. } => "Input",
-        NodeKind::FromBytes { .. }
-        | NodeKind::Zeros { .. }
-        | NodeKind::Ones { .. }
-        | NodeKind::Full { .. }
-        | NodeKind::Randn { .. }
-        | NodeKind::Uniform { .. }
-        | NodeKind::Arange { .. }
-        | NodeKind::Eye { .. } => "Const",
-        _ => "Other",
+fn compile_cpu_roots(
+    roots: &[Arc<Node>],
+    options: CompileOptions,
+    state: Option<executable::CpuStatePlan>,
+) -> err::Res<executable::CpuCompilation> {
+    let (_, ce_chunk_size) = chunked_ce_limits();
+    match state {
+        Some(state) => executable::compile_with_state(roots, options, ce_chunk_size, state),
+        None => executable::compile(roots, options, ce_chunk_size),
     }
 }
 
 struct ProgramInner {
-    roots: Vec<Arc<Node>>,
+    executable: Arc<executable::CpuExecutable>,
     slots: Vec<ProgramSlot>,
-    leaves: Vec<(u64, u32)>,
+    generated_bindings: Vec<Value>,
     signature: String,
 }
 
-#[napi]
-pub struct CompiledProgram {
-    inner: ProgramInner,
+#[derive(Clone)]
+struct GeneratedBindingSignature {
+    shape: Vec<usize>,
+    dtype: DType,
+    layout: Layout,
 }
 
-fn scalar_binding(value: f64, dtype: DType) -> Value {
-    Value(Tensor::full(&[], value, dtype))
+#[derive(Clone)]
+struct CachedProgram {
+    executable: Arc<executable::CpuExecutable>,
+    slots: Vec<ProgramSlot>,
+    generated: Vec<GeneratedBindingSignature>,
+    generated_order: Vec<usize>,
+    signature: String,
+}
+
+#[derive(Default)]
+struct ProgramCache {
+    entries: HashMap<String, CachedProgram>,
+    order: VecDeque<String>,
+}
+
+impl ProgramCache {
+    fn get(&mut self, key: &str) -> Option<CachedProgram> {
+        let entry = self.entries.get(key)?.clone();
+        if let Some(index) = self.order.iter().position(|existing| existing == key) {
+            self.order.remove(index);
+        }
+        self.order.push_back(key.to_string());
+        Some(entry)
+    }
+
+    fn insert(&mut self, key: String, entry: CachedProgram) {
+        const CAPACITY: usize = 64;
+        if self.entries.contains_key(&key) {
+            self.order.retain(|existing| existing != &key);
+        }
+        self.entries.insert(key.clone(), entry);
+        self.order.push_back(key);
+        while self.entries.len() > CAPACITY {
+            if let Some(evicted) = self.order.pop_front() {
+                self.entries.remove(&evicted);
+            }
+        }
+    }
+}
+
+fn program_cache() -> &'static Mutex<ProgramCache> {
+    static CACHE: LazyLock<Mutex<ProgramCache>> = LazyLock::new(Default::default);
+    &CACHE
+}
+
+fn semantic_generated_bindings(roots: &[Arc<Node>]) -> err::Res<Vec<(usize, Value)>> {
+    effect_torch_compiler::graph_post_order(roots)
+        .into_iter()
+        .filter_map(|node| match &node.kind {
+            NodeKind::Leaf(slot) => Some(
+                slot.get::<Value>()
+                    .map(|value| (Arc::as_ptr(slot) as usize, value))
+                    .map_err(|error| format!("compile: generated binding {}: {error}", node.id)),
+            ),
+            _ => None,
+        })
+        .collect()
+}
+
+fn ordered_generated_bindings(semantic: &[(usize, Value)], order: &[usize]) -> Option<Vec<Value>> {
+    order
+        .iter()
+        .map(|index| semantic.get(*index).map(|(_, value)| value.clone()))
+        .collect()
+}
+
+fn generated_signatures(values: &[Value]) -> Vec<GeneratedBindingSignature> {
+    values
+        .iter()
+        .map(|value| GeneratedBindingSignature {
+            shape: value.shape().to_vec(),
+            dtype: value.dtype(),
+            layout: value.tensor().layout.clone(),
+        })
+        .collect()
+}
+
+fn generated_match(values: &[Value], expected: &[GeneratedBindingSignature]) -> bool {
+    values.len() == expected.len()
+        && values.iter().zip(expected).all(|(value, expected)| {
+            value.shape() == expected.shape
+                && value.dtype() == expected.dtype
+                && value.tensor().layout == expected.layout
+        })
+}
+
+#[napi]
+pub struct Executable {
+    inner: ProgramInner,
+    state: Option<KvStateSchema>,
+}
+
+#[derive(Clone, Copy)]
+struct KvStateSchema {
+    max_tokens: usize,
+    block_size: usize,
+    kv_dtype: DType,
+    window: Option<usize>,
+    batch: usize,
+    layers: usize,
+    kv_heads: usize,
+    head_dim: usize,
+    kda: KdaGeometry,
+    kda_dtype: DType,
+    conv: ConvGeometry,
+    cursor_slot: u32,
+    cursor_tensor: bool,
+}
+
+impl KvStateSchema {
+    fn from_native(schema: NativeKvStateSchema, geometry: DecodeGeometry) -> Result<Self> {
+        let max_tokens = schema.max_tokens as usize;
+        let block_size = schema.block_size as usize;
+        let batch = schema.batch as usize;
+        if max_tokens == 0 || block_size == 0 || max_tokens % block_size != 0 {
+            return Err(Error::new(
+                Status::InvalidArg,
+                "compile: KV max_tokens must be positive and divisible by block_size",
+            ));
+        }
+        if batch == 0 {
+            return Err(Error::new(
+                Status::InvalidArg,
+                "compile: KV batch must be positive",
+            ));
+        }
+        let kv_dtype = schema.kv_dtype.into();
+        if !matches!(kv_dtype, DType::F32 | DType::F16 | DType::BF16 | DType::U8) {
+            return Err(Error::new(
+                Status::InvalidArg,
+                format!("compile: unsupported KV state dtype {}", kv_dtype.name()),
+            ));
+        }
+        let window = schema.window.map(|window| window as usize);
+        if window.is_some_and(|window| window == 0 || window > max_tokens) {
+            return Err(Error::new(
+                Status::InvalidArg,
+                "compile: KV window must be in 1..=max_tokens",
+            ));
+        }
+        Ok(Self {
+            max_tokens,
+            block_size,
+            kv_dtype,
+            window,
+            batch,
+            layers: geometry.layers,
+            kv_heads: geometry.kv_heads,
+            head_dim: geometry.head_dim,
+            kda: geometry.kda,
+            kda_dtype: geometry.kda_dtype,
+            conv: geometry.conv,
+            cursor_slot: geometry.cursor_slot,
+            cursor_tensor: geometry.cursor_tensor,
+        })
+    }
+
+    fn referenced_state_bytes(&self) -> std::result::Result<usize, String> {
+        let checked = |values: &[usize], label: &str| {
+            values
+                .iter()
+                .try_fold(1usize, |total, value| total.checked_mul(*value))
+                .ok_or_else(|| format!("compile: {label} byte size overflow"))
+        };
+        let kv_elements = checked(
+            &[
+                self.layers,
+                self.max_tokens,
+                self.kv_heads,
+                self.head_dim,
+                2,
+            ],
+            "KV slab",
+        )?;
+        let mut bytes = kv_elements
+            .checked_mul(self.kv_dtype.size_in_bytes())
+            .ok_or_else(|| "compile: KV slab byte size overflow".to_string())?;
+        if self.kv_dtype == DType::U8 {
+            bytes = bytes
+                .checked_add(
+                    checked(
+                        &[self.layers, self.max_tokens, self.kv_heads, 2],
+                        "KV scale",
+                    )?
+                    .checked_mul(DType::F32.size_in_bytes())
+                    .ok_or_else(|| "compile: KV scale byte size overflow".to_string())?,
+                )
+                .ok_or_else(|| "compile: KV state byte size overflow".to_string())?;
+        }
+        let kda_bytes = checked(
+            &[
+                self.batch,
+                self.kda.layers,
+                self.kda.heads,
+                self.kda.head_dim,
+                self.kda.value_dim,
+            ],
+            "KDA state",
+        )?
+        .checked_mul(self.kda_dtype.size_in_bytes())
+        .ok_or_else(|| "compile: KDA state byte size overflow".to_string())?;
+        let conv_bytes = checked(
+            &[
+                self.batch,
+                self.conv.layers,
+                self.conv.kernel.saturating_sub(1),
+                self.conv.channels,
+            ],
+            "convolution state",
+        )?
+        .checked_mul(DType::F32.size_in_bytes())
+        .ok_or_else(|| "compile: convolution state byte size overflow".to_string())?;
+        bytes
+            .checked_add(kda_bytes)
+            .and_then(|bytes| bytes.checked_add(conv_bytes))
+            .ok_or_else(|| "compile: total state byte size overflow".to_string())
+    }
 }
 
 fn validate_tensor_input(input: &NativeTensor, slot: usize, declared: &ProgramSlot) -> Result<()> {
@@ -2682,15 +1671,39 @@ fn validate_tensor_input(input: &NativeTensor, slot: usize, declared: &ProgramSl
     Ok(())
 }
 
-#[napi]
-impl CompiledProgram {
-    #[napi(getter)]
-    pub fn signature(&self) -> Result<String> {
-        Ok(self.inner.signature.clone())
+fn validate_stateful_tensor_input(
+    input: &NativeTensor,
+    slot: usize,
+    declared: &ProgramSlot,
+    active_batch: usize,
+    compiled_batch: usize,
+    bounded_batch: bool,
+) -> Result<()> {
+    let got = input.value_cloned()?;
+    let shape_matches = if bounded_batch {
+        declared.shape.first() == Some(&compiled_batch)
+            && got.shape().first() == Some(&active_batch)
+            && got.shape().len() == declared.shape.len()
+            && got.shape()[1..] == declared.shape[1..]
+    } else {
+        got.shape() == declared.shape
+    };
+    if !shape_matches || got.dtype() != declared.dtype || !declared.device.is_cpu() {
+        return Err(Error::new(
+            Status::InvalidArg,
+            format!(
+                "input slot {slot}: expected bounded {}, got {:?}:{}@cpu",
+                declared.signature(),
+                got.shape(),
+                got.dtype().name(),
+            ),
+        ));
     }
+    Ok(())
+}
 
-    #[napi]
-    pub async fn run(
+impl Executable {
+    async fn execute_stateless(
         &self,
         inputs: Vec<&NativeTensor>,
         scalars: Vec<f64>,
@@ -2726,49 +1739,64 @@ impl CompiledProgram {
                 )?;
             }
         }
-        let slots = self.inner.slots.clone();
-        let roots = self.inner.roots.clone();
-        let leaves = self.inner.leaves.clone();
-        let inputs = inputs
+        let executable = self.inner.executable.clone();
+        let generated = self.inner.generated_bindings.clone();
+        let tensor_inputs = inputs
             .iter()
             .map(|input| input.value_cloned())
             .collect::<Result<Vec<_>>>()?;
         run_compute(token, move |cancelled, _state| {
-            let mut bindings = HashMap::new();
-            let mut tensors = inputs.iter();
-            let mut scalars = scalars.iter();
-            for (slot, declared) in slots.iter().enumerate() {
-                let binding = if declared.scalar {
-                    scalar_binding(
-                        *scalars.next().expect("scalar count checked"),
-                        declared.dtype,
-                    )
-                } else {
-                    tensors.next().expect("tensor count checked").clone()
-                };
-                bindings.insert(slot as u64, binding);
-            }
-            let by_id = leaves
-                .iter()
-                .map(|(id, slot)| (*id, bindings[&(*slot as u64)].clone()))
-                .collect::<HashMap<_, _>>();
-            let mut evaluator = Evaluator::with_slots(&roots, by_id);
-            roots
-                .iter()
-                .map(|root| {
-                    eval_node(root, cancelled, &mut evaluator)
-                        .map(NativeTensor::wrap)
-                        .map_err(to_napi_err)
-                })
-                .collect()
+            Ok(executable::execute_with_scalars(
+                &executable,
+                &tensor_inputs,
+                &generated,
+                &scalars,
+                cancelled,
+            )
+            .map_err(to_napi_err)?
+            .into_iter()
+            .map(NativeTensor::wrap)
+            .collect())
         })
         .await
     }
 }
 
+fn resolve_compile_options(native: Option<NativeCompileOptions>, stateful: bool) -> CompileOptions {
+    let mut options = CompileOptions::from_environment();
+    if let Some(native) = native {
+        if let Some(optimize) = native.optimize {
+            options.optimize = optimize;
+        }
+        if let Some(allow) = native.allow_reduced_precision {
+            options.precision = if allow {
+                PrecisionPolicy::AllowReducedPrecision
+            } else {
+                PrecisionPolicy::Strict
+            };
+        }
+        if stateful || native.constant_weights.is_some() {
+            options.inference = Some(InferenceOptions {
+                constant_weights: native.constant_weights.unwrap_or(false),
+            });
+        }
+        if let Some(output_capacity) = native.output_capacity {
+            options.output_capacity = output_capacity as usize;
+        }
+    } else if stateful {
+        options.inference = Some(InferenceOptions::default());
+    }
+    options
+}
+
 #[napi]
-pub fn compile(roots: Vec<&LazyTensor>) -> Result<CompiledProgram> {
-    let roots = roots
+pub fn compile(
+    roots: Vec<&LazyTensor>,
+    options: Option<NativeCompileOptions>,
+    state: Option<NativeKvStateSchema>,
+    cache_key: Option<String>,
+) -> Result<Executable> {
+    let mut roots = roots
         .iter()
         .map(|tensor| tensor.node.clone())
         .collect::<Vec<_>>();
@@ -2778,9 +1806,90 @@ pub fn compile(roots: Vec<&LazyTensor>) -> Result<CompiledProgram> {
             "compile: expected at least one root",
         ));
     }
-    let roots = fuse_roots(&roots).map_err(|error| Error::new(Status::GenericFailure, error))?;
-    let (slots, leaves) =
-        collect_program_slots(&roots).map_err(|error| Error::new(Status::InvalidArg, error))?;
+    let compile_options = resolve_compile_options(options, state.is_some());
+    if compile_options.output_capacity == 0 {
+        return Err(Error::new(
+            Status::InvalidArg,
+            "compile: output capacity must be positive",
+        ));
+    }
+    let state = match state {
+        Some(native) => {
+            if native.batch == 0
+                || native.max_tokens == 0
+                || native.block_size == 0
+                || native.max_tokens % native.block_size != 0
+            {
+                return Err(Error::new(
+                    Status::InvalidArg,
+                    "compile: KV batch/max_tokens/block_size must be positive and max_tokens must be divisible by block_size",
+                ));
+            }
+            if native
+                .window
+                .is_some_and(|window| window == 0 || window > native.max_tokens)
+            {
+                return Err(Error::new(
+                    Status::InvalidArg,
+                    "compile: KV window must be in 1..=max_tokens",
+                ));
+            }
+            let batch = native.batch as usize;
+            let window = native.window.map(|window| window as usize);
+            let (rewritten, geometry) = decode_rewrite(&roots, window, batch)
+                .map_err(|error| Error::new(Status::GenericFailure, error))?;
+            roots = rewritten;
+            Some(KvStateSchema::from_native(native, geometry)?)
+        }
+        None => None,
+    };
+    let state_bytes = state
+        .as_ref()
+        .map(KvStateSchema::referenced_state_bytes)
+        .transpose()
+        .map_err(to_napi_err)?;
+    let state_plan = state
+        .zip(state_bytes)
+        .map(|(state, bytes)| executable::CpuStatePlan {
+            bytes,
+            cursor_slot: state.cursor_slot,
+            cursor_tensor: state.cursor_tensor,
+            batch: state.batch,
+        });
+    let effective_cache_key = cache_key
+        .filter(|_| {
+            std::env::var_os("EFFECT_TORCH_NO_EXECUTABLE_CACHE").is_none()
+                && !compile_options
+                    .inference
+                    .as_ref()
+                    .is_some_and(|inference| inference.constant_weights)
+        })
+        .map(|key| format!("{key}|{compile_options:?}"));
+    if let Some(key) = effective_cache_key.as_deref() {
+        let semantic = semantic_generated_bindings(&roots).map_err(to_napi_err)?;
+        let cached = program_cache()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .get(key);
+        if let Some(cached) = cached {
+            if let Some(current) = ordered_generated_bindings(&semantic, &cached.generated_order)
+                .filter(|current| generated_match(current, &cached.generated))
+            {
+                return Ok(Executable {
+                    inner: ProgramInner {
+                        executable: cached.executable.instantiate().map_err(to_napi_err)?,
+                        slots: cached.slots,
+                        generated_bindings: current,
+                        signature: cached.signature,
+                    },
+                    state,
+                });
+            }
+        }
+    }
+    let compilation =
+        compile_cpu_roots(&roots, compile_options, state_plan).map_err(to_napi_err)?;
+    let slots = compilation.slots;
     if slots.iter().any(|slot| !slot.device.is_cpu()) {
         return Err(Error::new(
             Status::InvalidArg,
@@ -2792,13 +1901,47 @@ pub fn compile(roots: Vec<&LazyTensor>) -> Result<CompiledProgram> {
         .map(ProgramSlot::signature)
         .collect::<Vec<_>>()
         .join(",");
-    Ok(CompiledProgram {
+    if let Some(key) = effective_cache_key {
+        let semantic_generated = semantic_generated_bindings(&roots).map_err(to_napi_err)?;
+        let semantic_positions = semantic_generated
+            .iter()
+            .enumerate()
+            .map(|(index, (node, _))| (*node, index))
+            .collect::<HashMap<_, _>>();
+        let generated_order = compilation
+            .generated_slots
+            .iter()
+            .map(|node| semantic_positions.get(node).copied())
+            .collect::<Option<Vec<_>>>();
+        let generated = generated_signatures(&compilation.generated_bindings);
+        if generated_order
+            .as_deref()
+            .and_then(|order| ordered_generated_bindings(&semantic_generated, order))
+            .is_some_and(|values| generated_match(&values, &generated))
+        {
+            program_cache()
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .insert(
+                    key,
+                    CachedProgram {
+                        executable: Arc::clone(&compilation.executable),
+                        slots: slots.clone(),
+                        generated,
+                        generated_order: generated_order.expect("validated generated order"),
+                        signature: signature.clone(),
+                    },
+                );
+        }
+    }
+    Ok(Executable {
         inner: ProgramInner {
-            roots,
+            executable: compilation.executable,
             slots,
-            leaves,
+            generated_bindings: compilation.generated_bindings,
             signature,
         },
+        state,
     })
 }
 
@@ -2806,7 +1949,7 @@ pub fn compile(roots: Vec<&LazyTensor>) -> Result<CompiledProgram> {
 pub async fn save_tensors(
     path: String,
     names: Vec<String>,
-    tensors: Vec<&LazyTensor>,
+    tensors: Vec<&NativeTensor>,
     metadata: HashMap<String, String>,
     token: Option<&CancellationToken>,
 ) -> Result<()> {
@@ -2833,20 +1976,23 @@ pub async fn save_tensors(
             "save_tensors: tensor names must be unique and cannot be __metadata__",
         ));
     }
-    let roots = tensors
+    let tensors = tensors
         .iter()
-        .map(|tensor| tensor.node.clone())
-        .collect::<Vec<_>>();
+        .map(|tensor| tensor.value_cloned())
+        .collect::<Result<Vec<_>>>()?;
     run_compute(token, move |cancelled, _state| {
-        let mut evaluator = Evaluator::new(&roots);
-        let mut values = HashMap::with_capacity(names.len());
-        for (name, root) in names.iter().zip(&roots) {
-            values.insert(
-                name.clone(),
-                eval_node(root, cancelled, &mut evaluator).map_err(to_napi_err)?,
-            );
+        if cancelled.load(Ordering::Acquire) {
+            return Err(Error::new(Status::Cancelled, "operation aborted"));
         }
-        safetensors::save(&values, &metadata, &path).map_err(to_napi_err)
+        let mut values = HashMap::with_capacity(names.len());
+        for (name, tensor) in names.iter().zip(tensors) {
+            values.insert(name.clone(), tensor);
+        }
+        safetensors::save(&values, &metadata, &path).map_err(to_napi_err)?;
+        if cancelled.load(Ordering::Acquire) {
+            return Err(Error::new(Status::Cancelled, "operation aborted"));
+        }
+        Ok(())
     })
     .await
 }
@@ -2968,10 +2114,13 @@ struct PoolInner {
     k: Vec<pool::Slab>,
     v: Vec<pool::Slab>,
     scales: Vec<pool::Slab>,
+    kv_dtype: DType,
     kv_heads: usize,
     head_dim: usize,
     block_size: usize,
     max_tokens: usize,
+    kda: KdaGeometry,
+    conv: ConvGeometry,
     blocks: Mutex<BlockStore>,
 }
 
@@ -3042,9 +2191,8 @@ struct SeqState {
     advance: usize,
     last_hash: u64,
     pending: Vec<u32>,
-    // RFC 0018: per-layer recurrent state, allocated lazily from the
-    // decode geometry on first use — [H, Dk, Dv] f32 per KDA layer and
-    // [K-1, C] f32 per short-conv layer.
+    // Per-layer recurrent state is allocated when the sequence is created:
+    // [H, Dk, Dv] f32 per KDA layer and [K-1, C] f32 per short-conv layer.
     kda_states: Vec<Tensor>,
     conv_states: Vec<Tensor>,
 }
@@ -3067,7 +2215,7 @@ impl SeqState {
 }
 
 // RFC 0018: uniform KDA layer geometry of a decode program.
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
 struct KdaGeometry {
     layers: usize,
     heads: usize,
@@ -3076,7 +2224,7 @@ struct KdaGeometry {
 }
 
 // RFC 0018: uniform short-conv layer geometry of a decode program.
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
 struct ConvGeometry {
     layers: usize,
     channels: usize,
@@ -3086,147 +2234,590 @@ struct ConvGeometry {
 struct KvContext {
     pool: Arc<PoolInner>,
     slots: Vec<Arc<Mutex<SeqState>>>,
+    active_batch: usize,
     kda: KdaGeometry,
     conv: ConvGeometry,
+    transaction: Mutex<Option<CpuStateTransaction>>,
 }
 
-// RFC 0018: stateful KDA evaluation, one sequence slot per leading
-// batch row. Each slot's [H, Dk, Dv] f32 state drives the chunked
-// recurrence and is replaced by the final state.
-#[allow(clippy::too_many_arguments)]
-fn kda_recurrence(
+struct CpuStateTransaction {
+    frontiers: Vec<usize>,
+    advances: Vec<usize>,
+    cursors: Vec<usize>,
+    eviction_starts: Vec<usize>,
+}
+
+impl executable::CpuState for Arc<KvContext> {
+    fn begin(
+        &self,
+        executable: &executable::CpuExecutable,
+        values: &[Value],
+    ) -> std::result::Result<(), String> {
+        let mut frontiers = Vec::with_capacity(self.slots.len());
+        let mut advances = Vec::with_capacity(self.slots.len());
+        let mut cursors = Vec::with_capacity(self.slots.len());
+        for slot in &self.slots {
+            let mut state = slot
+                .lock()
+                .map_err(|error| format!("decode state lock poisoned: {error}"))?;
+            let additional = self
+                .pool
+                .max_tokens
+                .div_ceil(self.pool.block_size)
+                .saturating_sub(state.blocks.len());
+            state.blocks.reserve(additional);
+            frontiers.push(state.blocks.len());
+            advances.push(state.advance);
+            cursors.push(state.cursor);
+        }
+        if let Some(cursor) = executable.state_cursor {
+            let value = values
+                .get(cursor.index())
+                .ok_or_else(|| "decode cursor staging value is unresolved".to_string())?;
+            if value.dtype() != DType::I64 {
+                return Err("decode cursor staging must use i64".to_string());
+            }
+            let mut destination = unsafe { CpuDestination::from_planned(value.tensor()) };
+            destination.write::<i64, _>("decode cursor", &value.shape(), |output| {
+                if output.len() == 1 && cursors.len() == 1 {
+                    output[0] = cursors[0] as i64;
+                } else {
+                    assert_eq!(output.len(), cursors.len());
+                    for (output, cursor) in output.iter_mut().zip(&cursors) {
+                        *output = *cursor as i64;
+                    }
+                }
+            })?;
+        }
+        for command in &executable.commands {
+            if !matches!(
+                command.op,
+                executable::CpuOp::KdaRecurrence { .. }
+                    | executable::CpuOp::ConvState { .. }
+                    | executable::CpuOp::KvAttention { .. }
+            ) {
+                continue;
+            }
+            let input = &values[command.inputs[0].index()];
+            let shape = input.shape();
+            let steps = shape
+                .get(shape.len().saturating_sub(2))
+                .copied()
+                .ok_or_else(|| "decode state input has no token dimension".to_string())?;
+            if advances
+                .iter()
+                .take(self.active_batch)
+                .any(|advance| *advance == 0 || *advance > steps)
+            {
+                return Err(format!(
+                    "decode token advance must be in 1..={steps} for {}",
+                    command.op.name()
+                ));
+            }
+        }
+        *self
+            .transaction
+            .lock()
+            .map_err(|error| format!("decode transaction lock poisoned: {error}"))? =
+            Some(CpuStateTransaction {
+                frontiers,
+                advances,
+                cursors,
+                eviction_starts: vec![usize::MAX; self.slots.len()],
+            });
+        Ok(())
+    }
+
+    fn run_command(
+        &self,
+        command: &executable::CpuCommand,
+        inputs: &[Value],
+        staging: &[Value],
+        outputs: &mut [CpuDestination<'_>],
+        _scratch: &mut [CpuDestination<'_>],
+        state_outputs: &mut [CpuDestination<'_>],
+    ) -> std::result::Result<(), String> {
+        let mut transaction = self
+            .transaction
+            .lock()
+            .map_err(|error| format!("decode transaction lock poisoned: {error}"))?;
+        let transaction = transaction
+            .as_mut()
+            .ok_or_else(|| "decode state command ran outside a transaction".to_string())?;
+        match &command.op {
+            executable::CpuOp::KdaRecurrence { scale, layer } => {
+                prepare_kda_staging(self, transaction, *layer, inputs, staging)?;
+                composed::kda_chunk_forward_into(
+                    inputs[0].tensor(),
+                    inputs[1].tensor(),
+                    inputs[2].tensor(),
+                    staging[1].tensor(),
+                    staging[2].tensor(),
+                    *scale,
+                    Some(staging[0].tensor()),
+                    &mut outputs[0],
+                    Some(&mut state_outputs[0]),
+                    None,
+                )
+            }
+            executable::CpuOp::ConvState { layer } => {
+                prepare_conv_staging(self, *layer, &staging[0])?;
+                conv_state_into(
+                    &inputs[0],
+                    &inputs[1],
+                    &staging[0],
+                    &transaction.advances,
+                    &mut outputs[0],
+                    &mut state_outputs[0],
+                )
+            }
+            executable::CpuOp::KvAttention {
+                scale,
+                layer,
+                window,
+            } => kv_attention_into(
+                self,
+                *layer,
+                &inputs[0],
+                &inputs[1],
+                &inputs[2],
+                *scale,
+                *window,
+                &mut outputs[0],
+                &mut transaction.eviction_starts,
+            ),
+            executable::CpuOp::RotaryEmbedding { theta, .. } => composed::rotary_forward_into(
+                inputs[0].tensor(),
+                &transaction.cursors,
+                *theta,
+                1.0,
+                &mut outputs[0],
+            ),
+            _ => Err("state adapter received a non-state CPU command".to_string()),
+        }
+    }
+
+    fn commit(
+        &self,
+        executable: &executable::CpuExecutable,
+        values: &[Value],
+    ) -> std::result::Result<(), String> {
+        commit_recurrent_state(self, executable, values)?;
+        {
+            let transaction = self
+                .transaction
+                .lock()
+                .map_err(|error| format!("decode transaction lock poisoned: {error}"))?;
+            let transaction = transaction
+                .as_ref()
+                .ok_or_else(|| "decode commit has no active transaction".to_string())?;
+            let mut states = self
+                .slots
+                .iter()
+                .map(|slot| {
+                    slot.lock()
+                        .map_err(|error| format!("decode state lock poisoned: {error}"))
+                })
+                .collect::<err::Res<Vec<_>>>()?;
+            for (state, start) in states.iter_mut().zip(&transaction.eviction_starts) {
+                if *start != usize::MAX {
+                    kv_evict(&self.pool, state, *start);
+                }
+            }
+        }
+        *self
+            .transaction
+            .lock()
+            .map_err(|error| format!("decode transaction lock poisoned: {error}"))? = None;
+        Ok(())
+    }
+
+    fn rollback(&self) {
+        let transaction = self
+            .transaction
+            .lock()
+            .ok()
+            .and_then(|mut transaction| transaction.take());
+        let Some(transaction) = transaction else {
+            return;
+        };
+        for (slot, frontier) in self.slots.iter().zip(transaction.frontiers) {
+            if let Ok(mut state) = slot.lock() {
+                for block in state.blocks.split_off(frontier) {
+                    self.pool.unref_block(block);
+                }
+            }
+        }
+    }
+}
+
+fn tensor_element<T: Elem>(tensor: &Tensor, index: usize, operation: &str) -> err::Res<T> {
+    let storage = T::storage_of(&tensor.buffer)
+        .ok_or_else(|| format!("{operation}: tensor dtype mismatch"))?;
+    Ok(storage[crate::tensor::source_index(&tensor.layout, index)])
+}
+
+fn write_masked_state_input<T: Elem>(
+    source: &Tensor,
+    advances: &[usize],
+    destination: &mut CpuDestination<'_>,
+) -> err::Res<()> {
+    let shape = source.shape();
+    let batch = shape[..shape.len().saturating_sub(3)]
+        .iter()
+        .product::<usize>();
+    if shape.len() < 3 || batch != advances.len() || destination.shape() != shape {
+        return Err("kda recurrence: state mask geometry does not match decode slots".to_string());
+    }
+    let steps = shape[shape.len() - 2];
+    let width = shape[shape.len() - 1];
+    let per_batch = source.numel() / advances.len();
+    destination.write::<T, _>("kda masked input", shape, |output| {
+        for (index, value) in output.iter_mut().enumerate() {
+            let batch = index / per_batch;
+            let step = (index / width) % steps;
+            *value = if step < advances[batch] {
+                tensor_element::<T>(source, index, "kda masked input")
+                    .expect("source dtype and layout were validated")
+            } else {
+                T::default()
+            };
+        }
+    })
+}
+
+fn write_kda_initial<T: Elem>(
     context: &KvContext,
-    layer: u32,
-    q: &Value,
-    k: &Value,
-    v: &Value,
-    log_decay: &Value,
-    beta: &Value,
-    scale: f64,
-) -> err::Res<Value> {
+    layer: usize,
+    destination: &mut CpuDestination<'_>,
+) -> err::Res<()> {
     let geometry = context.kda;
-    if geometry.layers == 0 || (layer as usize) >= geometry.layers {
-        return Err("kda recurrence: layer out of range for the decode geometry".to_string());
+    let expected = [
+        context.slots.len() * geometry.heads,
+        geometry.head_dim,
+        geometry.value_dim,
+    ];
+    if destination.shape() != expected || destination.dtype() != T::dtype() {
+        return Err("kda recurrence: planned initial-state geometry is invalid".to_string());
     }
-    let dimensions = q.shape();
-    let batch = dimensions[..dimensions.len() - 3].iter().product::<usize>();
-    if batch != context.slots.len() {
-        return Err(format!(
-            "kda recurrence: batch {batch} does not match {} decode slots",
-            context.slots.len()
-        ));
-    }
-    let mut outputs = Vec::with_capacity(batch);
-    for (index, slot) in context.slots.iter().enumerate() {
-        let narrow = |value: &Value, width: usize| {
-            value
-                .tensor()
-                .view(value.tensor().layout.narrow(0, index, 1))
-                .contiguous()
-                .view(Layout::contiguous(vec![
-                    geometry.heads,
-                    dimensions[dimensions.len() - 2],
-                    width,
-                ]))
-        };
-        let mut state = slot
-            .lock()
-            .map_err(|error| format!("kda recurrence: sequence lock poisoned: {error}"))?;
-        while state.kda_states.len() < geometry.layers {
-            state.kda_states.push(Tensor::zeros(
-                &[geometry.heads, geometry.head_dim, geometry.value_dim],
-                DType::F32,
-            ));
+    let per_slot = geometry.heads * geometry.head_dim * geometry.value_dim;
+    destination.write::<T, _>("kda initial state", &expected, |output| {
+        output.fill(T::default());
+        for (batch, slot) in context.slots.iter().enumerate() {
+            let state = slot.lock().expect("decode run owns an unpoisoned sequence");
+            let Some(source) = state.kda_states.get(layer) else {
+                continue;
+            };
+            assert_eq!(
+                source.shape(),
+                [geometry.heads, geometry.head_dim, geometry.value_dim]
+            );
+            assert_eq!(source.dtype(), T::dtype());
+            for index in 0..per_slot {
+                output[batch * per_slot + index] =
+                    tensor_element::<T>(source, index, "kda initial state")
+                        .expect("persistent KDA state was validated");
+            }
         }
-        let tokens = dimensions[dimensions.len() - 2];
-        let qs = narrow(q, geometry.head_dim);
-        let ks = narrow(k, geometry.head_dim);
-        let vs = narrow(v, geometry.value_dim);
-        let gs = narrow(log_decay, geometry.head_dim);
-        let bs = narrow(beta, 1);
-        // Chunked prefill right-pads: pad rows must contribute identity
-        // updates (beta 0, log-decay 0) so the running state only
-        // absorbs real tokens.
-        let (gs, bs) = if state.advance < tokens {
-            let mut mask = vec![0f32; tokens];
-            mask[..state.advance].fill(1.0);
-            let mask = Tensor::from_vec(mask, vec![1, tokens, 1]);
-            (gs.mul(&mask), bs.mul(&mask))
-        } else {
-            (gs, bs)
-        };
-        let (out, final_state) = composed::kda_chunk_with_state(
-            &qs,
-            &ks,
-            &vs,
-            &gs,
-            &bs,
-            scale,
-            &state.kda_states[layer as usize].clone(),
-        );
-        state.kda_states[layer as usize] = final_state;
-        let mut out_shape = out.shape().to_vec();
-        out_shape.insert(0, 1);
-        outputs.push(Value(out.view(Layout::contiguous(out_shape))));
-    }
-    let tensors = outputs.iter().map(Value::tensor).collect::<Vec<_>>();
-    Ok(Value(Tensor::cat(&tensors, 0)))
+    })
 }
 
-// RFC 0018: stateful short-conv evaluation, one sequence slot per
-// leading batch row. Each slot's [K-1, C] f32 window is shifted by the
-// new tokens and written back.
-fn conv_state(context: &KvContext, layer: u32, x: &Value, weight: &Value) -> err::Res<Value> {
+fn prepare_kda_staging(
+    context: &KvContext,
+    transaction: &CpuStateTransaction,
+    layer: u32,
+    inputs: &[Value],
+    staging: &[Value],
+) -> err::Res<()> {
+    if layer as usize >= context.kda.layers || staging.len() != 3 || inputs.len() != 5 {
+        return Err("kda recurrence: invalid state command plan".to_string());
+    }
+    let mut initial = unsafe { CpuDestination::from_planned(staging[0].tensor()) };
+    match initial.dtype() {
+        DType::F32 => write_kda_initial::<f32>(context, layer as usize, &mut initial)?,
+        DType::F64 => write_kda_initial::<f64>(context, layer as usize, &mut initial)?,
+        dtype => {
+            return Err(format!(
+                "kda recurrence: unsupported planned state dtype {dtype}"
+            ))
+        }
+    }
+    for (source, target) in inputs[3..5].iter().zip(&staging[1..]) {
+        let mut destination = unsafe { CpuDestination::from_planned(target.tensor()) };
+        match source.dtype() {
+            DType::F32 => write_masked_state_input::<f32>(
+                source.tensor(),
+                &transaction.advances,
+                &mut destination,
+            )?,
+            DType::F64 => write_masked_state_input::<f64>(
+                source.tensor(),
+                &transaction.advances,
+                &mut destination,
+            )?,
+            DType::F16 => write_masked_state_input::<half::f16>(
+                source.tensor(),
+                &transaction.advances,
+                &mut destination,
+            )?,
+            DType::BF16 => write_masked_state_input::<half::bf16>(
+                source.tensor(),
+                &transaction.advances,
+                &mut destination,
+            )?,
+            dtype => return Err(format!("kda recurrence: unsupported input dtype {dtype}")),
+        }
+    }
+    Ok(())
+}
+
+fn prepare_conv_staging(context: &KvContext, layer: u32, staging: &Value) -> err::Res<()> {
     let geometry = context.conv;
-    if geometry.layers == 0 || (layer as usize) >= geometry.layers {
-        return Err("conv state: layer out of range for the decode geometry".to_string());
+    if layer as usize >= geometry.layers
+        || staging.dtype() != DType::F32
+        || staging.shape() != [context.slots.len(), geometry.kernel - 1, geometry.channels]
+    {
+        return Err("conv state: invalid state command plan".to_string());
     }
-    let dimensions = x.shape();
-    let batch = dimensions[..dimensions.len() - 2].iter().product::<usize>();
-    if batch != context.slots.len() {
-        return Err(format!(
-            "conv state: batch {batch} does not match {} decode slots",
-            context.slots.len()
-        ));
-    }
-    let t = dimensions[dimensions.len() - 2];
-    let in_dtype = x.dtype();
-    let w32 = weight.tensor().cast(DType::F32).contiguous();
-    let mut outputs = Vec::with_capacity(batch);
-    for (index, slot) in context.slots.iter().enumerate() {
-        let xs = x
-            .tensor()
-            .view(x.tensor().layout.narrow(0, index, 1))
-            .contiguous()
-            .view(Layout::contiguous(vec![t, geometry.channels]))
-            .cast(DType::F32);
-        let mut state = slot
-            .lock()
-            .map_err(|error| format!("conv state: sequence lock poisoned: {error}"))?;
-        while state.conv_states.len() < geometry.layers {
-            state.conv_states.push(Tensor::zeros(
-                &[geometry.kernel - 1, geometry.channels],
-                DType::F32,
-            ));
+    let per_slot = (geometry.kernel - 1) * geometry.channels;
+    let mut destination = unsafe { CpuDestination::from_planned(staging.tensor()) };
+    destination.write::<f32, _>("conv initial state", staging.tensor().shape(), |output| {
+        output.fill(0.0);
+        for (batch, slot) in context.slots.iter().enumerate() {
+            let state = slot.lock().expect("decode run owns an unpoisoned sequence");
+            let Some(source) = state.conv_states.get(layer as usize) else {
+                continue;
+            };
+            assert_eq!(source.shape(), [geometry.kernel - 1, geometry.channels]);
+            assert_eq!(source.dtype(), DType::F32);
+            for index in 0..per_slot {
+                output[batch * per_slot + index] =
+                    tensor_element::<f32>(source, index, "conv initial state")
+                        .expect("persistent convolution state was validated");
+            }
         }
-        let (out, new_state) = composed::short_conv1d_with_state(
-            &xs,
-            &w32,
-            &state.conv_states[layer as usize],
-            state.advance,
-        );
-        state.conv_states[layer as usize] = new_state;
-        outputs.push(Value(out.cast(in_dtype).view(Layout::contiguous(vec![
-            1,
-            t,
-            geometry.channels,
-        ]))));
-    }
-    let tensors = outputs.iter().map(Value::tensor).collect::<Vec<_>>();
-    Ok(Value(Tensor::cat(&tensors, 0)))
+    })?;
+    Ok(())
 }
 
-fn kv_attention(
+fn conv_state_into_impl<T: Elem>(
+    x: &Tensor,
+    weight: &Tensor,
+    state: &Tensor,
+    advances: &[usize],
+    output: &mut CpuDestination<'_>,
+    state_next: &mut CpuDestination<'_>,
+) -> err::Res<()> {
+    let shape = x.shape();
+    let rank = shape.len();
+    let batch = shape[..rank - 2].iter().product::<usize>();
+    let steps = shape[rank - 2];
+    let channels = shape[rank - 1];
+    let kernel = weight.shape()[1];
+    if batch != advances.len()
+        || state.shape() != [batch, kernel - 1, channels]
+        || state.dtype() != DType::F32
+        || output.shape() != shape
+        || output.dtype() != x.dtype()
+        || state_next.shape() != state.shape()
+        || state_next.dtype() != DType::F32
+    {
+        return Err("conv state: inconsistent planned destinations".to_string());
+    }
+    state_next.write::<f32, _>("conv next state", state.shape(), |next| {
+        output.write::<T, _>("conv state output", shape, |out| {
+            for batch_index in 0..batch {
+                for step in 0..steps {
+                    for channel in 0..channels {
+                        let mut value = 0.0f64;
+                        for tap in 0..kernel {
+                            let window_index = step + tap;
+                            let source = if window_index < kernel - 1 {
+                                tensor_element::<f32>(
+                                    state,
+                                    (batch_index * (kernel - 1) + window_index) * channels
+                                        + channel,
+                                    "conv state",
+                                )
+                                .expect("convolution state dtype was validated")
+                                    as f64
+                            } else {
+                                tensor_element::<T>(
+                                    x,
+                                    (batch_index * steps + window_index - (kernel - 1)) * channels
+                                        + channel,
+                                    "conv state input",
+                                )
+                                .expect("convolution input dtype was validated")
+                                .to_f64() as f32 as f64
+                            };
+                            let coefficient = tensor_element::<T>(
+                                weight,
+                                channel * kernel + tap,
+                                "conv state weight",
+                            )
+                            .expect("convolution weight dtype was validated")
+                            .to_f64() as f32 as f64;
+                            value += source * coefficient;
+                        }
+                        out[(batch_index * steps + step) * channels + channel] = T::from_f64(value);
+                    }
+                }
+                for index in 0..kernel - 1 {
+                    let window_index = advances[batch_index] + index;
+                    for channel in 0..channels {
+                        next[(batch_index * (kernel - 1) + index) * channels + channel] =
+                            if window_index < kernel - 1 {
+                                tensor_element::<f32>(
+                                    state,
+                                    (batch_index * (kernel - 1) + window_index) * channels
+                                        + channel,
+                                    "conv state",
+                                )
+                                .expect("convolution state dtype was validated")
+                            } else {
+                                tensor_element::<T>(
+                                    x,
+                                    (batch_index * steps + window_index - (kernel - 1)) * channels
+                                        + channel,
+                                    "conv state input",
+                                )
+                                .expect("convolution input dtype was validated")
+                                .to_f64() as f32
+                            };
+                    }
+                }
+            }
+        })
+    })??;
+    Ok(())
+}
+
+fn conv_state_into(
+    x: &Value,
+    weight: &Value,
+    state: &Value,
+    advances: &[usize],
+    output: &mut CpuDestination<'_>,
+    state_next: &mut CpuDestination<'_>,
+) -> err::Res<()> {
+    match x.dtype() {
+        DType::F32 => conv_state_into_impl::<f32>(
+            x.tensor(),
+            weight.tensor(),
+            state.tensor(),
+            advances,
+            output,
+            state_next,
+        ),
+        DType::F64 => conv_state_into_impl::<f64>(
+            x.tensor(),
+            weight.tensor(),
+            state.tensor(),
+            advances,
+            output,
+            state_next,
+        ),
+        DType::F16 => conv_state_into_impl::<half::f16>(
+            x.tensor(),
+            weight.tensor(),
+            state.tensor(),
+            advances,
+            output,
+            state_next,
+        ),
+        DType::BF16 => conv_state_into_impl::<half::bf16>(
+            x.tensor(),
+            weight.tensor(),
+            state.tensor(),
+            advances,
+            output,
+            state_next,
+        ),
+        dtype => Err(format!("conv state: unsupported input dtype {dtype}")),
+    }
+}
+
+fn recurrent_state_slices(
+    value: &Value,
+    batch: usize,
+    per_batch: usize,
+    squeeze_batch: bool,
+) -> Vec<Tensor> {
+    (0..batch)
+        .map(|index| {
+            let mut layout = value
+                .tensor()
+                .layout
+                .narrow(0, index * per_batch, per_batch);
+            if squeeze_batch {
+                let mut shape = layout.shape().to_vec();
+                let mut strides = layout.strides().to_vec();
+                shape.remove(0);
+                strides.remove(0);
+                layout = Layout::new(shape, strides, layout.offset());
+            }
+            value.tensor().view(layout)
+        })
+        .collect()
+}
+
+fn commit_recurrent_state(
+    context: &KvContext,
+    executable: &executable::CpuExecutable,
+    values: &[Value],
+) -> err::Res<()> {
+    let batch = context.slots.len();
+    let mut states = context
+        .slots
+        .iter()
+        .map(|slot| {
+            slot.lock()
+                .map_err(|error| format!("decode state lock poisoned: {error}"))
+        })
+        .collect::<err::Res<Vec<_>>>()?;
+
+    for command in &executable.commands {
+        let Some(&state_output) = command.state_outputs.first() else {
+            continue;
+        };
+        let value = &values[state_output.index()];
+        match command.op {
+            executable::CpuOp::KdaRecurrence { layer, .. } => {
+                let per_batch = context.kda.heads;
+                let updates = recurrent_state_slices(value, batch, per_batch, false);
+                for (state, update) in states.iter_mut().zip(updates) {
+                    let layer = layer as usize;
+                    let target = state.kda_states.get_mut(layer).ok_or_else(|| {
+                        format!("KDA state commit destination {layer} is missing")
+                    })?;
+                    let mut destination = target.destination().map_err(|_| {
+                        format!("KDA state commit destination {layer} is still borrowed")
+                    })?;
+                    update.copy_into(&mut destination)?;
+                }
+            }
+            executable::CpuOp::ConvState { layer } => {
+                let updates = recurrent_state_slices(value, batch, 1, true);
+                for (state, update) in states.iter_mut().zip(updates) {
+                    let layer = layer as usize;
+                    let target = state.conv_states.get_mut(layer).ok_or_else(|| {
+                        format!("convolution state commit destination {layer} is missing")
+                    })?;
+                    let mut destination = target.destination().map_err(|_| {
+                        format!("convolution state commit destination {layer} is still borrowed")
+                    })?;
+                    update.copy_into(&mut destination)?;
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn kv_attention_into(
     context: &KvContext,
     layer: u32,
     q: &Value,
@@ -3234,120 +2825,231 @@ fn kv_attention(
     v: &Value,
     scale: f64,
     window: Option<usize>,
-) -> err::Res<Value> {
+    output: &mut CpuDestination<'_>,
+    eviction_starts: &mut [usize],
+) -> err::Res<()> {
     let dimensions = q.shape();
-    let batch = dimensions[..dimensions.len() - 3].iter().product::<usize>();
+    let rank = dimensions.len();
+    if rank < 4
+        || q.dtype() != DType::F32
+        || k.dtype() != DType::F32
+        || v.dtype() != DType::F32
+        || k.shape() != dimensions
+        || v.shape() != dimensions
+        || output.shape() != dimensions
+        || output.dtype() != DType::F32
+    {
+        return Err("kv attention: expected matching rank-4-or-higher f32 tensors".to_string());
+    }
+    let batch = dimensions[..rank - 3].iter().product::<usize>();
+    let (heads, tokens, width) = (
+        dimensions[rank - 3],
+        dimensions[rank - 2],
+        dimensions[rank - 1],
+    );
     if batch != context.slots.len() {
         return Err(format!(
             "kv attention: batch {batch} does not match {} kv slots",
             context.slots.len()
         ));
     }
-    if batch == 1 {
-        let mut state = context.slots[0]
-            .lock()
-            .map_err(|error| format!("kv attention: sequence lock poisoned: {error}"))?;
-        return kv_attention_slot(&context.pool, &mut state, layer, q, k, v, scale, window);
-    }
-    let mut outputs = Vec::with_capacity(batch);
-    for (index, slot) in context.slots.iter().enumerate() {
-        let narrow = |value: &Value| {
-            Value(
-                value
-                    .tensor()
-                    .view(value.tensor().layout.narrow(0, index, 1))
-                    .contiguous(),
-            )
-        };
-        let mut state = slot
-            .lock()
-            .map_err(|error| format!("kv attention: sequence lock poisoned: {error}"))?;
-        outputs.push(kv_attention_slot(
-            &context.pool,
-            &mut state,
-            layer,
-            &narrow(q),
-            &narrow(k),
-            &narrow(v),
-            scale,
-            window,
-        )?);
-    }
-    let tensors = outputs.iter().map(Value::tensor).collect::<Vec<_>>();
-    Ok(Value(Tensor::cat(&tensors, 0)))
-}
+    let layer_index = layer as usize;
+    output.write::<f32, _>("kv attention output", &dimensions, |out| -> err::Res<()> {
+        out.fill(0.0);
+        for (batch_index, slot) in context.slots.iter().take(context.active_batch).enumerate() {
+            let mut state = slot
+                .lock()
+                .map_err(|error| format!("kv attention: sequence lock poisoned: {error}"))?;
+            let (cursor, needed, start) = kv_prepare(
+                &context.pool,
+                &mut state,
+                layer_index,
+                window,
+                heads,
+                width,
+                tokens,
+            )?;
+            let advance = state.advance;
+            let physical = |position: usize| -> u32 {
+                state.blocks[position / context.pool.block_size] * context.pool.block_size as u32
+                    + (position % context.pool.block_size) as u32
+            };
 
-#[allow(clippy::too_many_arguments)]
-fn kv_attention_slot(
-    pool: &Arc<PoolInner>,
-    state: &mut SeqState,
-    layer: u32,
-    q: &Value,
-    k: &Value,
-    v: &Value,
-    scale: f64,
-    window: Option<usize>,
-) -> err::Res<Value> {
-    if q.dtype() != DType::F32 {
-        return Err(format!(
-            "kv attention: dtype must be f32, got {:?}",
-            q.dtype()
-        ));
-    }
-    let layer = layer as usize;
-    let dimensions = q.shape();
-    let rank = dimensions.len();
-    let (tokens, heads, width) = (
-        dimensions[rank - 2],
-        dimensions[rank - 3],
-        dimensions[rank - 1],
-    );
-    let (cursor, needed, start) = kv_prepare(pool, state, layer, window, heads, width, tokens)?;
-    kv_scatter_rows(pool, state, layer, k, v, heads, width)?;
-    let full = cursor + tokens;
-    let physical = |position: usize| -> u32 {
-        state.blocks[position / pool.block_size] * pool.block_size as u32
-            + (position % pool.block_size) as u32
-    };
-    let rows = (start..needed).map(physical).collect::<Vec<_>>();
-    let context_length = full - start;
-    let gather = |slab: &pool::Slab, scale: Option<&pool::Slab>| -> Tensor {
-        let raw = slab.read_rows_f32(&rows);
-        let mut values = match scale {
-            Some(scale) => {
-                pool::dequantize_int8(&raw, &scale.read_rows_f32(&rows), rows.len(), heads, width)
-            }
-            None => raw,
-        };
-        values.resize(context_length * heads * width, 0.0);
-        let mut permuted = vec![0.0; context_length * heads * width];
-        for row in 0..context_length {
-            for head in 0..heads {
-                for column in 0..width {
-                    permuted[(head * context_length + row) * width + column] =
-                        values[(row * heads + head) * width + column];
+            let input_value =
+                |value: &Value, token: usize, head: usize, column: usize| -> err::Res<f32> {
+                    let logical = ((batch_index * heads + head) * tokens + token) * width + column;
+                    tensor_element::<f32>(value.tensor(), logical, "kv attention input")
+                };
+            if context.pool.k[layer_index].dtype == DType::U8 {
+                for (value, slab, scales) in [
+                    (
+                        k,
+                        &context.pool.k[layer_index],
+                        &context.pool.scales[2 * layer_index],
+                    ),
+                    (
+                        v,
+                        &context.pool.v[layer_index],
+                        &context.pool.scales[2 * layer_index + 1],
+                    ),
+                ] {
+                    scales.write(|mut scale_values| {
+                        slab.write(|mut quantized| -> err::Res<()> {
+                            for token in 0..advance {
+                                let row = physical(cursor + token) as usize;
+                                for head in 0..heads {
+                                    let mut maximum = 0.0f32;
+                                    for column in 0..width {
+                                        maximum = maximum
+                                            .max(input_value(value, token, head, column)?.abs());
+                                    }
+                                    let scale = maximum / 127.0 + 1e-12;
+                                    scale_values.set_f32(row * heads + head, scale);
+                                    for column in 0..width {
+                                        let value = (input_value(value, token, head, column)?
+                                            / scale)
+                                            .round()
+                                            .clamp(-127.0, 127.0)
+                                            + 128.0;
+                                        quantized.set_u8(
+                                            (row * heads + head) * width + column,
+                                            value as u8,
+                                        );
+                                    }
+                                }
+                            }
+                            Ok(())
+                        })
+                    })?;
+                }
+            } else {
+                for (value, slab) in [
+                    (k, &context.pool.k[layer_index]),
+                    (v, &context.pool.v[layer_index]),
+                ] {
+                    slab.write(|mut destination| -> err::Res<()> {
+                        for token in 0..advance {
+                            let row = physical(cursor + token) as usize;
+                            for head in 0..heads {
+                                for column in 0..width {
+                                    destination.set_f32(
+                                        (row * heads + head) * width + column,
+                                        input_value(value, token, head, column)?,
+                                    );
+                                }
+                            }
+                        }
+                        Ok(())
+                    })?;
                 }
             }
+
+            let context_length = cursor + tokens - start;
+            let available = needed.saturating_sub(start);
+            let query_offset = context_length.saturating_sub(tokens);
+            let mut attend = |keys: &pool::SlabReader<'_>,
+                              values: &pool::SlabReader<'_>,
+                              key_scales: Option<&pool::SlabReader<'_>>,
+                              value_scales: Option<&pool::SlabReader<'_>>|
+             -> err::Res<()> {
+                let cached = |reader: &pool::SlabReader<'_>,
+                              scales: Option<&pool::SlabReader<'_>>,
+                              key_index: usize,
+                              head: usize,
+                              column: usize|
+                 -> f32 {
+                    let row = physical(start + key_index) as usize;
+                    let raw = reader.get_f32((row * heads + head) * width + column);
+                    scales.map_or(raw, |scales| {
+                        (raw - 128.0) * scales.get_f32(row * heads + head)
+                    })
+                };
+                for head in 0..heads {
+                    for query in 0..tokens {
+                        let allowed = (query + query_offset + 1).min(context_length);
+                        let mut maximum = f64::NEG_INFINITY;
+                        for key_index in 0..allowed {
+                            let mut score = 0.0f64;
+                            if key_index < available {
+                                for column in 0..width {
+                                    let q_index = ((batch_index * heads + head) * tokens + query)
+                                        * width
+                                        + column;
+                                    score += tensor_element::<f32>(
+                                        q.tensor(),
+                                        q_index,
+                                        "kv attention query",
+                                    )? as f64
+                                        * cached(keys, key_scales, key_index, head, column) as f64;
+                                }
+                            }
+                            maximum = maximum.max(score * scale);
+                        }
+                        let mut denominator = 0.0f64;
+                        for key_index in 0..allowed {
+                            let mut score = 0.0f64;
+                            if key_index < available {
+                                for column in 0..width {
+                                    let q_index = ((batch_index * heads + head) * tokens + query)
+                                        * width
+                                        + column;
+                                    score += tensor_element::<f32>(
+                                        q.tensor(),
+                                        q_index,
+                                        "kv attention query",
+                                    )? as f64
+                                        * cached(keys, key_scales, key_index, head, column) as f64;
+                                }
+                            }
+                            denominator += (score * scale - maximum).exp();
+                        }
+                        for column in 0..width {
+                            let mut result = 0.0f64;
+                            for key_index in 0..available.min(allowed) {
+                                let mut score = 0.0f64;
+                                for depth in 0..width {
+                                    let q_index = ((batch_index * heads + head) * tokens + query)
+                                        * width
+                                        + depth;
+                                    score += tensor_element::<f32>(
+                                        q.tensor(),
+                                        q_index,
+                                        "kv attention query",
+                                    )? as f64
+                                        * cached(keys, key_scales, key_index, head, depth) as f64;
+                                }
+                                result += (score * scale - maximum).exp()
+                                    * cached(values, value_scales, key_index, head, column) as f64;
+                            }
+                            out[((batch_index * heads + head) * tokens + query) * width + column] =
+                                (result / denominator) as f32;
+                        }
+                    }
+                }
+                Ok(())
+            };
+            context.pool.k[layer_index].read(|keys| {
+                context.pool.v[layer_index].read(|values| {
+                    if context.pool.k[layer_index].dtype == DType::U8 {
+                        context.pool.scales[2 * layer_index].read(|key_scales| {
+                            context.pool.scales[2 * layer_index + 1].read(|value_scales| {
+                                attend(&keys, &values, Some(&key_scales), Some(&value_scales))
+                            })
+                        })
+                    } else {
+                        attend(&keys, &values, None, None)
+                    }
+                })
+            })?;
+            eviction_starts[batch_index] = if eviction_starts[batch_index] == usize::MAX {
+                start
+            } else {
+                eviction_starts[batch_index].max(start)
+            };
         }
-        Tensor::from_vec(permuted, vec![1, heads, context_length, width])
-    };
-    let (k_scale, v_scale) = if pool.k[layer].dtype == DType::U8 {
-        (
-            Some(&pool.scales[2 * layer]),
-            Some(&pool.scales[2 * layer + 1]),
-        )
-    } else {
-        (None, None)
-    };
-    let output = composed::sdpa_forward(
-        q.tensor(),
-        &gather(&pool.k[layer], k_scale),
-        &gather(&pool.v[layer], v_scale),
-        scale,
-        true,
-    );
-    kv_evict(pool, state, start);
-    Ok(Value(output))
+        Ok(())
+    })??;
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3382,10 +3084,10 @@ fn kv_prepare(
     let needed = cursor + advance;
     let full = cursor + tokens;
     let start = window.map_or(0, |window| full.saturating_sub(window));
-    if needed - start > pool.max_tokens {
+    if needed.saturating_sub(start) > pool.max_tokens {
         return Err(format!(
             "kv attention: live context {} exceeds pool capacity {}",
-            needed - start,
+            needed.saturating_sub(start),
             pool.max_tokens
         ));
     }
@@ -3401,57 +3103,8 @@ fn kv_prepare(
     Ok((cursor, needed, start))
 }
 
-fn kv_scatter_rows(
-    pool: &Arc<PoolInner>,
-    state: &SeqState,
-    layer: usize,
-    k: &Value,
-    v: &Value,
-    heads: usize,
-    width: usize,
-) -> err::Res<()> {
-    let cursor = state.cursor;
-    let advance = state.advance;
-    let physical = |position: usize| -> u32 {
-        state.blocks[position / pool.block_size] * pool.block_size as u32
-            + (position % pool.block_size) as u32
-    };
-    let rows = (cursor..cursor + advance).map(physical).collect::<Vec<_>>();
-    let new_rows = |value: &Value| -> Vec<f32> {
-        let tensor = value.tensor();
-        let permuted = tensor
-            .view(tensor.layout.permute(&[0, 2, 1, 3]))
-            .contiguous();
-        let narrowed = permuted
-            .view(permuted.layout.narrow(1, 0, advance))
-            .contiguous();
-        let narrowed = narrowed
-            .view(Layout::contiguous(vec![advance, heads, width]))
-            .cast(DType::F32)
-            .contiguous();
-        let CpuBuffer::F32(values) = &narrowed.buffer else {
-            unreachable!()
-        };
-        values.as_slice().to_vec()
-    };
-    let k_rows = new_rows(k);
-    let v_rows = new_rows(v);
-    if pool.k[layer].dtype == DType::U8 {
-        let (quantized_k, scales_k) = pool::quantize_int8(&k_rows, advance, heads, width);
-        let (quantized_v, scales_v) = pool::quantize_int8(&v_rows, advance, heads, width);
-        pool.k[layer].write_rows_u8(&rows, &quantized_k);
-        pool.v[layer].write_rows_u8(&rows, &quantized_v);
-        pool.scales[2 * layer].write_rows_f32(&rows, &scales_k);
-        pool.scales[2 * layer + 1].write_rows_f32(&rows, &scales_v);
-    } else {
-        pool.k[layer].write_rows_f32(&rows, &k_rows);
-        pool.v[layer].write_rows_f32(&rows, &v_rows);
-    }
-    Ok(())
-}
-
 fn kv_evict(pool: &PoolInner, state: &mut SeqState, start: usize) {
-    while (state.head + 1) * pool.block_size <= start {
+    while state.head < state.blocks.len() && (state.head + 1) * pool.block_size <= start {
         pool.unref_block(state.blocks[state.head]);
         state.head += 1;
     }
@@ -3462,6 +3115,7 @@ struct DecodeGeometry {
     kv_heads: usize,
     head_dim: usize,
     kda: KdaGeometry,
+    kda_dtype: DType,
     conv: ConvGeometry,
     cursor_slot: u32,
     cursor_tensor: bool,
@@ -3585,7 +3239,18 @@ fn decode_rewrite(
                         q.shape
                     ));
                 }
-                let current = (q.shape[rank - 3], q.shape[rank - 1], v.shape[rank - 1]);
+                if !matches!(q.dtype, DType::F32 | DType::F64) {
+                    return Err(format!(
+                        "decode: stateful KDA requires f32 or f64, got {}",
+                        q.dtype.name()
+                    ));
+                }
+                let current = (
+                    q.shape[rank - 3],
+                    q.shape[rank - 1],
+                    v.shape[rank - 1],
+                    q.dtype,
+                );
                 if let Some(previous) = kda_geometry {
                     if previous != current {
                         return Err(format!(
@@ -3727,13 +3392,14 @@ fn decode_rewrite(
     }
     let (kv_heads, head_dim) = geometry.unwrap_or((0, 0));
     let kda = kda_geometry
-        .map(|(heads, head_dim, value_dim)| KdaGeometry {
+        .map(|(heads, head_dim, value_dim, _)| KdaGeometry {
             layers: kda_layers as usize,
             heads,
             head_dim,
             value_dim,
         })
         .unwrap_or_default();
+    let kda_dtype = kda_geometry.map_or(DType::F32, |geometry| geometry.3);
     let conv = conv_geometry
         .map(|(channels, kernel)| ConvGeometry {
             layers: conv_layers as usize,
@@ -3757,6 +3423,7 @@ fn decode_rewrite(
             kv_heads,
             head_dim,
             kda,
+            kda_dtype,
             conv,
             cursor_slot,
             cursor_tensor,
@@ -3779,6 +3446,7 @@ impl NativeKvPool {
         max_tokens: u32,
         block_size: Option<u32>,
         dtype: Option<NativeDType>,
+        recurrent: Option<NativeRecurrentStateSchema>,
     ) -> Result<Self> {
         let dtype: DType = dtype.unwrap_or(NativeDType::F32).into();
         if !matches!(dtype, DType::F32 | DType::F16 | DType::BF16 | DType::U8) {
@@ -3797,6 +3465,26 @@ impl NativeKvPool {
             max_tokens as usize,
         );
         let block_size = block_size.unwrap_or(16) as usize;
+        let recurrent = recurrent.unwrap_or(NativeRecurrentStateSchema {
+            kda_layers: 0,
+            kda_heads: 0,
+            kda_head_dim: 0,
+            kda_value_dim: 0,
+            conv_layers: 0,
+            conv_channels: 0,
+            conv_kernel: 0,
+        });
+        let kda = KdaGeometry {
+            layers: recurrent.kda_layers as usize,
+            heads: recurrent.kda_heads as usize,
+            head_dim: recurrent.kda_head_dim as usize,
+            value_dim: recurrent.kda_value_dim as usize,
+        };
+        let conv = ConvGeometry {
+            layers: recurrent.conv_layers as usize,
+            channels: recurrent.conv_channels as usize,
+            kernel: recurrent.conv_kernel as usize,
+        };
         if layers == 0 && (kv_heads != 0 || head_dim != 0) {
             return Err(Error::new(
                 Status::InvalidArg,
@@ -3817,6 +3505,22 @@ impl NativeKvPool {
                 ),
             ));
         }
+        if (kda.layers == 0 && (kda.heads != 0 || kda.head_dim != 0 || kda.value_dim != 0))
+            || (kda.layers > 0 && (kda.heads == 0 || kda.head_dim == 0 || kda.value_dim == 0))
+        {
+            return Err(Error::new(
+                Status::InvalidArg,
+                "kv pool: KDA geometry must be entirely zero or entirely positive",
+            ));
+        }
+        if (conv.layers == 0 && (conv.channels != 0 || conv.kernel != 0))
+            || (conv.layers > 0 && (conv.channels == 0 || conv.kernel == 0))
+        {
+            return Err(Error::new(
+                Status::InvalidArg,
+                "kv pool: convolution geometry must be entirely zero or entirely positive",
+            ));
+        }
         let mut k = Vec::with_capacity(layers);
         let mut v = Vec::with_capacity(layers);
         let mut scales = Vec::with_capacity(layers * 2);
@@ -3833,10 +3537,13 @@ impl NativeKvPool {
                 k,
                 v,
                 scales,
+                kv_dtype: dtype,
                 kv_heads,
                 head_dim,
                 block_size,
                 max_tokens,
+                kda,
+                conv,
                 blocks: Mutex::new(BlockStore::new(max_tokens / block_size)),
             }),
         })
@@ -3873,18 +3580,34 @@ pub struct NativeKvSequence {
 
 impl NativeKvSequence {
     fn new(pool: Arc<PoolInner>) -> Self {
+        let kda_states = (0..pool.kda.layers)
+            .map(|_| {
+                Tensor::zeros(
+                    &[pool.kda.heads, pool.kda.head_dim, pool.kda.value_dim],
+                    DType::F32,
+                )
+            })
+            .collect();
+        let conv_states = (0..pool.conv.layers)
+            .map(|_| {
+                Tensor::zeros(
+                    &[pool.conv.kernel.saturating_sub(1), pool.conv.channels],
+                    DType::F32,
+                )
+            })
+            .collect();
         Self {
-            pool,
             state: Arc::new(Mutex::new(SeqState {
-                blocks: Vec::new(),
+                blocks: Vec::with_capacity(pool.max_tokens / pool.block_size),
                 head: 0,
                 cursor: 0,
                 advance: 0,
                 last_hash: HASH_SEED,
-                pending: Vec::new(),
-                kda_states: Vec::new(),
-                conv_states: Vec::new(),
+                pending: Vec::with_capacity(pool.block_size),
+                kda_states,
+                conv_states,
             })),
+            pool,
             run_lock: Arc::new(Mutex::new(())),
             released: AtomicBool::new(false),
         }
@@ -3983,24 +3706,106 @@ impl NativeKvSequence {
     }
 }
 
-#[napi]
-pub struct DecodeProgram {
-    inner: ProgramInner,
-    cursor_slot: u32,
-    layers: u32,
-    kv_heads: u32,
-    head_dim: u32,
-    kda: KdaGeometry,
-    conv: ConvGeometry,
-    batch: u32,
-    cursor_tensor: bool,
+fn validate_execution_mode(
+    stateful: bool,
+    scalar_count: usize,
+    sequence_count: Option<usize>,
+    token_count: Option<usize>,
+) -> Result<()> {
+    if stateful {
+        if scalar_count != 0 {
+            return Err(Error::new(
+                Status::InvalidArg,
+                "execute: stateful executables do not accept scalar inputs",
+            ));
+        }
+        match (sequence_count, token_count) {
+            (Some(sequences), Some(tokens)) if sequences == tokens => Ok(()),
+            (Some(sequences), Some(tokens)) => Err(Error::new(
+                Status::InvalidArg,
+                format!(
+                    "execute: expected one token list per sequence, got {tokens} for {sequences} sequences"
+                ),
+            )),
+            _ => Err(Error::new(
+                Status::InvalidArg,
+                "execute: stateful executables require sequence and token arrays",
+            )),
+        }
+    } else if sequence_count.is_some() || token_count.is_some() {
+        Err(Error::new(
+            Status::InvalidArg,
+            "execute: stateless executables do not accept state",
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_pool_schema(schema: &KvStateSchema, pool: &PoolInner) -> Result<()> {
+    if schema
+        .window
+        .is_some_and(|window| window == 0 || window > schema.max_tokens)
+        || pool.max_tokens != schema.max_tokens
+        || pool.block_size != schema.block_size
+        || pool.kv_dtype != schema.kv_dtype
+        || pool.k.len() != schema.layers
+        || pool.kv_heads != schema.kv_heads
+        || pool.head_dim != schema.head_dim
+        || pool.kda != schema.kda
+        || pool.conv != schema.conv
+    {
+        return Err(Error::new(
+            Status::InvalidArg,
+            "execute: pool capacity/block size/dtype/geometry does not match the compiled state schema",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_recurrent_state_schema(schema: &KvStateSchema, state: &SeqState) -> Result<()> {
+    if (!state.kda_states.is_empty() && state.kda_states.len() != schema.kda.layers)
+        || state.kda_states.iter().any(|tensor| {
+            tensor.shape() != [schema.kda.heads, schema.kda.head_dim, schema.kda.value_dim]
+                || tensor.dtype() != schema.kda_dtype
+        })
+        || (!state.conv_states.is_empty() && state.conv_states.len() != schema.conv.layers)
+        || state.conv_states.iter().any(|tensor| {
+            tensor.shape() != [schema.conv.kernel.saturating_sub(1), schema.conv.channels]
+                || tensor.dtype() != DType::F32
+        })
+    {
+        return Err(Error::new(
+            Status::InvalidArg,
+            "execute: sequence recurrent geometry/dtype does not match the compiled state schema",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_active_batch(schema: &KvStateSchema, sequences: usize) -> Result<()> {
+    if sequences == 0 || sequences > schema.batch {
+        return Err(Error::new(
+            Status::InvalidArg,
+            format!(
+                "execute: executable accepts 1..={} sequences, got {sequences}",
+                schema.batch
+            ),
+        ));
+    }
+    Ok(())
 }
 
 #[napi]
-impl DecodeProgram {
+impl Executable {
+    #[napi(getter)]
+    pub fn stateful(&self) -> bool {
+        self.state.is_some()
+    }
+
     #[napi(getter)]
     pub fn batch(&self) -> u32 {
-        self.batch
+        self.state.map_or(0, |state| state.batch as u32)
     }
 
     #[napi(getter)]
@@ -4009,119 +3814,90 @@ impl DecodeProgram {
     }
 
     #[napi(getter)]
+    pub fn diagnostics(&self) -> NativeExecutableDiagnostics {
+        executable_diagnostics(&self.inner.executable.diagnostics)
+    }
+
+    #[napi(getter)]
     pub fn layers(&self) -> u32 {
-        self.layers
+        self.state.map_or(0, |state| state.layers as u32)
     }
 
     #[napi(getter)]
     pub fn kv_heads(&self) -> u32 {
-        self.kv_heads
+        self.state.map_or(0, |state| state.kv_heads as u32)
     }
 
     #[napi(getter)]
     pub fn head_dim(&self) -> u32 {
-        self.head_dim
+        self.state.map_or(0, |state| state.head_dim as u32)
     }
 
     #[napi(getter)]
     pub fn kda_layers(&self) -> u32 {
-        self.kda.layers as u32
+        self.state.map_or(0, |state| state.kda.layers as u32)
     }
 
     #[napi(getter)]
     pub fn kda_heads(&self) -> u32 {
-        self.kda.heads as u32
+        self.state.map_or(0, |state| state.kda.heads as u32)
     }
 
     #[napi(getter)]
     pub fn kda_head_dim(&self) -> u32 {
-        self.kda.head_dim as u32
+        self.state.map_or(0, |state| state.kda.head_dim as u32)
     }
 
     #[napi(getter)]
     pub fn kda_value_dim(&self) -> u32 {
-        self.kda.value_dim as u32
+        self.state.map_or(0, |state| state.kda.value_dim as u32)
     }
 
     #[napi(getter)]
     pub fn conv_layers(&self) -> u32 {
-        self.conv.layers as u32
+        self.state.map_or(0, |state| state.conv.layers as u32)
     }
 
     #[napi(getter)]
     pub fn conv_channels(&self) -> u32 {
-        self.conv.channels as u32
+        self.state.map_or(0, |state| state.conv.channels as u32)
     }
 
     #[napi(getter)]
     pub fn conv_kernel(&self) -> u32 {
-        self.conv.kernel as u32
+        self.state.map_or(0, |state| state.conv.kernel as u32)
     }
 
     #[napi]
-    pub async fn run(
+    pub async fn execute(
         &self,
         inputs: Vec<&NativeTensor>,
-        sequence: &NativeKvSequence,
-        tokens: Vec<u32>,
+        scalars: Vec<f64>,
+        sequences: Option<Vec<&NativeKvSequence>>,
+        tokens: Option<Vec<Vec<u32>>>,
         token: Option<&CancellationToken>,
     ) -> Result<Vec<NativeTensor>> {
-        if self.batch != 1 {
-            return Err(Error::new(
-                Status::InvalidArg,
-                format!(
-                    "kv run: this program is batched (batch {}), use run_batched",
-                    self.batch
-                ),
-            ));
-        }
-        self.run_inner(inputs, vec![sequence], vec![tokens], token)
-            .await
-    }
-
-    #[napi]
-    pub async fn run_batched(
-        &self,
-        inputs: Vec<&NativeTensor>,
-        sequences: Vec<&NativeKvSequence>,
-        tokens: Vec<Vec<u32>>,
-        token: Option<&CancellationToken>,
-    ) -> Result<Vec<NativeTensor>> {
-        if sequences.is_empty() || sequences.len() > self.batch as usize {
-            return Err(Error::new(
-                Status::InvalidArg,
-                format!(
-                    "kv run: program accepts 1..={} sequences, got {}",
-                    self.batch,
-                    sequences.len()
-                ),
-            ));
-        }
-        let padding = (sequences.len()..self.batch as usize)
+        validate_execution_mode(
+            self.state.is_some(),
+            scalars.len(),
+            sequences.as_ref().map(Vec::len),
+            tokens.as_ref().map(Vec::len),
+        )?;
+        let Some(schema) = self.state else {
+            return self.execute_stateless(inputs, scalars, token).await;
+        };
+        let mut sequences = sequences.expect("state invocation was validated");
+        let mut tokens = tokens.expect("state invocation was validated");
+        let active_batch = sequences.len();
+        validate_active_batch(&schema, active_batch)?;
+        let padding = (sequences.len()..schema.batch)
             .map(|_| sequences[0].new_sequence_like())
             .collect::<Vec<_>>();
-        let mut all_sequences = sequences;
-        all_sequences.extend(padding.iter());
-        let mut all_tokens = tokens;
-        let advance = all_tokens.first().map(Vec::len).unwrap_or(1);
-        all_tokens.extend(std::iter::repeat(vec![0; advance]).take(padding.len()));
-        let mut owned_inputs = inputs
-            .iter()
-            .map(|input| input.value_cloned().map(NativeTensor::wrap))
-            .collect::<Result<Vec<_>>>()?;
-        if let Some(last) = owned_inputs.last_mut() {
-            let value = last.value_cloned()?;
-            let shape = value.shape();
-            if shape.len() == 2 && shape[0] < self.batch as usize {
-                let zeros =
-                    Tensor::zeros(&[self.batch as usize - shape[0], shape[1]], value.dtype());
-                let padded = Value(Tensor::cat(&[value.tensor(), &zeros], 0));
-                last.slot = Arc::new(LeafSlot::new(padded));
-            }
-        }
-        let input_refs = owned_inputs.iter().collect::<Vec<_>>();
+        sequences.extend(padding.iter());
+        let advance = tokens.first().map(Vec::len).unwrap_or(1);
+        tokens.extend(std::iter::repeat(vec![0; advance]).take(padding.len()));
         let output = self
-            .run_inner(input_refs, all_sequences, all_tokens, token)
+            .execute_stateful(inputs, sequences, tokens, active_batch, token)
             .await;
         for sequence in &padding {
             sequence.release();
@@ -4130,14 +3906,16 @@ impl DecodeProgram {
     }
 }
 
-impl DecodeProgram {
-    async fn run_inner(
+impl Executable {
+    async fn execute_stateful(
         &self,
         inputs: Vec<&NativeTensor>,
         sequences: Vec<&NativeKvSequence>,
         tokens: Vec<Vec<u32>>,
+        active_batch: usize,
         token: Option<&CancellationToken>,
     ) -> Result<Vec<NativeTensor>> {
+        let schema = self.state.expect("stateful execution was validated");
         let batch = sequences.len();
         if tokens.len() != batch || tokens.iter().any(Vec::is_empty) {
             return Err(Error::new(
@@ -4176,17 +3954,9 @@ impl DecodeProgram {
             }
         }
         let pool = &sequences[0].pool;
-        if pool.k.len() != self.layers as usize
-            || pool.kv_heads != self.kv_heads as usize
-            || pool.head_dim != self.head_dim as usize
-        {
-            return Err(Error::new(
-                Status::InvalidArg,
-                "kv run: pool geometry does not match the decode program",
-            ));
-        }
+        validate_pool_schema(&schema, pool)?;
         let tensor_count = self.inner.slots.iter().filter(|slot| !slot.scalar).count();
-        let caller_inputs = tensor_count - usize::from(self.cursor_tensor);
+        let caller_inputs = tensor_count - usize::from(schema.cursor_tensor);
         if inputs.len() != caller_inputs {
             return Err(Error::new(
                 Status::InvalidArg,
@@ -4196,8 +3966,16 @@ impl DecodeProgram {
                 ),
             ));
         }
+        let bounded_slot = self
+            .inner
+            .slots
+            .iter()
+            .enumerate()
+            .rev()
+            .find(|(slot, declared)| !declared.scalar && *slot as u32 != schema.cursor_slot)
+            .map(|(slot, _)| slot);
         for (slot, declared) in self.inner.slots.iter().enumerate() {
-            if declared.scalar || (self.cursor_tensor && slot as u32 == self.cursor_slot) {
+            if declared.scalar || (schema.cursor_tensor && slot as u32 == schema.cursor_slot) {
                 continue;
             }
             let input_index = slot
@@ -4208,12 +3986,18 @@ impl DecodeProgram {
                     .take(slot)
                     .filter(|declared| declared.scalar)
                     .count()
-                - usize::from(self.cursor_tensor && slot as u32 > self.cursor_slot);
-            validate_tensor_input(inputs[input_index], slot, declared)?;
+                - usize::from(schema.cursor_tensor && slot as u32 > schema.cursor_slot);
+            validate_stateful_tensor_input(
+                inputs[input_index],
+                slot,
+                declared,
+                active_batch,
+                schema.batch,
+                bounded_slot == Some(slot),
+            )?;
         }
-        let slots = self.inner.slots.clone();
-        let roots = self.inner.roots.clone();
-        let leaves = self.inner.leaves.clone();
+        let executable = self.inner.executable.clone();
+        let generated = self.inner.generated_bindings.clone();
         let inputs = inputs
             .iter()
             .map(|input| input.value_cloned())
@@ -4224,8 +4008,10 @@ impl DecodeProgram {
                 .iter()
                 .map(|sequence| sequence.state.clone())
                 .collect(),
-            kda: self.kda,
-            conv: self.conv,
+            active_batch,
+            kda: schema.kda,
+            conv: schema.conv,
+            transaction: Mutex::new(None),
         });
         let mut ordered = sequences.clone();
         ordered.sort_by_key(|sequence| Arc::as_ptr(&sequence.run_lock) as usize);
@@ -4237,9 +4023,7 @@ impl DecodeProgram {
             .iter()
             .map(|sequence| sequence.state.clone())
             .collect::<Vec<_>>();
-        let cursor_slot = self.cursor_slot;
-        let batched = self.batch > 1;
-        let cursor_tensor = self.cursor_tensor;
+        let max_tokens = schema.max_tokens;
         run_compute(token, move |cancelled, cancellation| {
             let _guards = run_locks
                 .iter()
@@ -4252,6 +4036,26 @@ impl DecodeProgram {
                     })
                 })
                 .collect::<Result<Vec<_>>>()?;
+            for (index, state) in states.iter().take(active_batch).enumerate() {
+                let state = state.lock().map_err(|error| {
+                    Error::new(
+                        Status::GenericFailure,
+                        format!("kv sequence lock poisoned: {error}"),
+                    )
+                })?;
+                validate_recurrent_state_schema(&schema, &state)?;
+                let frontier = state.cursor.checked_add(tokens[index].len());
+                if frontier.is_none()
+                    || (schema.window.is_none() && frontier.is_some_and(|value| value > max_tokens))
+                {
+                    return Err(Error::new(
+                        Status::InvalidArg,
+                        format!(
+                            "execute: sequence {index} exceeds compiled max_tokens {max_tokens}"
+                        ),
+                    ));
+                }
+            }
             for (index, state) in states.iter().enumerate() {
                 state
                     .lock()
@@ -4261,77 +4065,15 @@ impl DecodeProgram {
                             format!("kv sequence lock poisoned: {error}"),
                         )
                     })?
-                    .advance = tokens[index].len();
-            }
-            let mut bindings = HashMap::new();
-            let mut tensors = inputs.iter();
-            for (slot, declared) in slots.iter().enumerate() {
-                let binding = if declared.scalar {
-                    if batched || slot as u32 != cursor_slot {
-                        return Err(Error::new(
-                            Status::GenericFailure,
-                            format!("decode: unexpected scalar slot {slot}"),
-                        ));
-                    }
-                    let cursor = states[0]
-                        .lock()
-                        .map_err(|error| {
-                            Error::new(
-                                Status::GenericFailure,
-                                format!("kv sequence lock poisoned: {error}"),
-                            )
-                        })?
-                        .cursor;
-                    scalar_binding(cursor as f64, declared.dtype)
-                } else if cursor_tensor && slot as u32 == cursor_slot {
-                    let cursors = states
-                        .iter()
-                        .map(|state| {
-                            state
-                                .lock()
-                                .map(|state| state.cursor as i64)
-                                .map_err(|error| {
-                                    Error::new(
-                                        Status::GenericFailure,
-                                        format!("kv sequence lock poisoned: {error}"),
-                                    )
-                                })
-                        })
-                        .collect::<Result<Vec<_>>>()?;
-                    Value(Tensor::from_vec(cursors, vec![batch]))
+                    .advance = if index < active_batch {
+                    tokens[index].len()
                 } else {
-                    tensors.next().expect("tensor count checked").clone()
+                    0
                 };
-                bindings.insert(slot as u64, binding);
             }
-            let by_id = leaves
-                .iter()
-                .map(|(id, slot)| (*id, bindings[&(*slot as u64)].clone()))
-                .collect::<HashMap<_, _>>();
             let frontiers = states
                 .iter()
                 .map(|state| state.lock().map(|state| state.blocks.len()).unwrap_or(0))
-                .collect::<Vec<_>>();
-            // RFC 0018: recurrent state mutates in place during the
-            // walk, so a failed run restores the pre-run snapshot (KV
-            // blocks roll back by refcount instead).
-            let kda_snapshots = states
-                .iter()
-                .map(|state| {
-                    state
-                        .lock()
-                        .map(|state| state.kda_states.clone())
-                        .unwrap_or_default()
-                })
-                .collect::<Vec<_>>();
-            let conv_snapshots = states
-                .iter()
-                .map(|state| {
-                    state
-                        .lock()
-                        .map(|state| state.conv_states.clone())
-                        .unwrap_or_default()
-                })
                 .collect::<Vec<_>>();
             let rollback = || {
                 for (index, state) in states.iter().enumerate() {
@@ -4340,27 +4082,24 @@ impl DecodeProgram {
                             context.pool.unref_block(block);
                         }
                         state.advance = 0;
-                        state.kda_states = kda_snapshots[index].clone();
-                        state.conv_states = conv_snapshots[index].clone();
                     }
                 }
             };
-            let mut evaluator = Evaluator::with_kv(&roots, by_id, Some(context.clone()));
-            let mut outputs = Vec::with_capacity(roots.len());
-            for root in &roots {
-                match eval_node(root, cancelled, &mut evaluator) {
-                    Ok(value) => outputs.push(NativeTensor::wrap(value)),
-                    Err(error) => {
-                        rollback();
-                        return Err(to_napi_err(error));
-                    }
+            let outputs = match executable::execute_stateful(
+                &executable,
+                &inputs,
+                &generated,
+                cancelled,
+                &context,
+                &|| cancellation.complete(),
+            ) {
+                Ok(outputs) => outputs.into_iter().map(NativeTensor::wrap).collect(),
+                Err(error) => {
+                    rollback();
+                    return Err(to_napi_err(error));
                 }
-            }
-            if !cancellation.complete() {
-                rollback();
-                return Err(Error::new(Status::Cancelled, "operation aborted"));
-            }
-            for (index, state) in states.iter().enumerate() {
+            };
+            for (index, state) in states.iter().take(active_batch).enumerate() {
                 if let Ok(mut state) = state.lock() {
                     state.note_tokens(&context.pool, &tokens[index]);
                     state.cursor += state.advance;
@@ -4373,58 +4112,6 @@ impl DecodeProgram {
     }
 }
 
-#[napi]
-pub fn compile_decode(
-    roots: Vec<&LazyTensor>,
-    window: Option<u32>,
-    batch: Option<u32>,
-) -> Result<DecodeProgram> {
-    let roots = roots
-        .iter()
-        .map(|tensor| tensor.node.clone())
-        .collect::<Vec<_>>();
-    if roots.is_empty() {
-        return Err(Error::new(
-            Status::InvalidArg,
-            "compile_decode: expected at least one root",
-        ));
-    }
-    let batch = batch.unwrap_or(1);
-    if batch == 0 {
-        return Err(Error::new(
-            Status::InvalidArg,
-            "compile_decode: batch must be positive",
-        ));
-    }
-    let (roots, geometry) =
-        decode_rewrite(&roots, window.map(|window| window as usize), batch as usize)
-            .map_err(|error| Error::new(Status::GenericFailure, error))?;
-    let roots = fuse_roots(&roots).map_err(|error| Error::new(Status::GenericFailure, error))?;
-    let (slots, leaves) =
-        collect_program_slots(&roots).map_err(|error| Error::new(Status::InvalidArg, error))?;
-    let signature = slots
-        .iter()
-        .map(ProgramSlot::signature)
-        .collect::<Vec<_>>()
-        .join(",");
-    Ok(DecodeProgram {
-        inner: ProgramInner {
-            roots,
-            slots,
-            leaves,
-            signature,
-        },
-        cursor_slot: geometry.cursor_slot,
-        layers: geometry.layers as u32,
-        kv_heads: geometry.kv_heads as u32,
-        head_dim: geometry.head_dim as u32,
-        kda: geometry.kda,
-        conv: geometry.conv,
-        batch,
-        cursor_tensor: geometry.cursor_tensor,
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4435,11 +4122,23 @@ mod tests {
 
     fn eval_f32(node: &Arc<Node>) -> Vec<f32> {
         let cancelled = CancellationFlag::new();
-        let mut evaluator = Evaluator::new(std::slice::from_ref(node));
-        eval_node(node, &cancelled, &mut evaluator)
-            .unwrap()
-            .to_f32_vec()
-            .unwrap()
+        let compilation = executable::compile(
+            std::slice::from_ref(node),
+            CompileOptions::default(),
+            CHUNKED_CE_CHUNK_LOGITS,
+        )
+        .unwrap();
+        executable::execute(
+            &compilation.executable,
+            &[],
+            &compilation.generated_bindings,
+            &cancelled,
+            None,
+        )
+        .unwrap()
+        .remove(0)
+        .to_f32_vec()
+        .unwrap()
     }
 
     fn assert_close(actual: &[f32], expected: &[f32], tolerance: f32, name: &str) {
@@ -4450,6 +4149,222 @@ mod tests {
                 "{name}[{index}]: {actual} vs {expected}"
             );
         }
+    }
+
+    fn test_state_schema() -> KvStateSchema {
+        KvStateSchema {
+            max_tokens: 8,
+            block_size: 4,
+            kv_dtype: DType::F32,
+            window: Some(8),
+            batch: 2,
+            layers: 1,
+            kv_heads: 2,
+            head_dim: 4,
+            kda: KdaGeometry::default(),
+            kda_dtype: DType::F32,
+            conv: ConvGeometry::default(),
+            cursor_slot: 1,
+            cursor_tensor: true,
+        }
+    }
+
+    fn test_schema_pool() -> PoolInner {
+        PoolInner {
+            k: vec![pool::Slab::new(8, 8, DType::F32)],
+            v: vec![pool::Slab::new(8, 8, DType::F32)],
+            scales: Vec::new(),
+            kv_dtype: DType::F32,
+            kv_heads: 2,
+            head_dim: 4,
+            block_size: 4,
+            max_tokens: 8,
+            kda: KdaGeometry::default(),
+            conv: ConvGeometry::default(),
+            blocks: Mutex::new(BlockStore::new(2)),
+        }
+    }
+
+    #[test]
+    fn structural_cache_reuses_compilation_with_independent_resources_and_rebound_leaves() {
+        let graph = |left: Vec<f32>, right: Vec<f32>| LazyTensor {
+            node: Node::new(NodeKind::Add {
+                a: leaf(Tensor::from_vec(left, vec![2])),
+                b: leaf(Tensor::from_vec(right, vec![2])),
+            })
+            .unwrap(),
+        };
+        let first_root = graph(vec![1.0, 2.0], vec![3.0, 4.0]);
+        let second_root = graph(vec![10.0, 20.0], vec![30.0, 40.0]);
+        let key = Some("cpu-structural-cache-rebind-test".to_string());
+        let first = compile(vec![&first_root], None, None, key.clone()).unwrap();
+        let second = compile(vec![&second_root], None, None, key).unwrap();
+        assert!(!Arc::ptr_eq(
+            &first.inner.executable,
+            &second.inner.executable
+        ));
+        assert_eq!(
+            first.inner.executable.memory,
+            second.inner.executable.memory
+        );
+        assert_eq!(
+            first.inner.executable.diagnostics,
+            second.inner.executable.diagnostics
+        );
+        let first_output = executable::execute(
+            &first.inner.executable,
+            &[],
+            &first.inner.generated_bindings,
+            &CancellationFlag::new(),
+            None,
+        )
+        .unwrap();
+        let second_output = executable::execute(
+            &second.inner.executable,
+            &[],
+            &second.inner.generated_bindings,
+            &CancellationFlag::new(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(first_output[0].to_f32_vec().unwrap(), [4.0, 6.0]);
+        assert_eq!(second_output[0].to_f32_vec().unwrap(), [40.0, 60.0]);
+    }
+
+    #[test]
+    fn recurrent_state_slices_share_transaction_storage_without_backend_allocation() {
+        let kda = Value(Tensor::from_vec(
+            (0..24).map(|value| value as f32).collect(),
+            vec![4, 2, 3],
+        ));
+        let conv = Value(Tensor::from_vec(
+            (0..12).map(|value| value as f32).collect(),
+            vec![2, 2, 3],
+        ));
+
+        let (kda_slices, conv_slices) = {
+            let _guard = crate::ExecutableAllocationGuard::enter();
+            (
+                recurrent_state_slices(&kda, 2, 2, false),
+                recurrent_state_slices(&conv, 2, 1, true),
+            )
+        };
+
+        assert_eq!(kda_slices[0].shape(), &[2, 2, 3]);
+        assert_eq!(kda_slices[1].shape(), &[2, 2, 3]);
+        assert_eq!(
+            Value(kda_slices[1].clone()).to_f32_vec().unwrap(),
+            (12..24).map(|value| value as f32).collect::<Vec<_>>()
+        );
+        assert_eq!(conv_slices[0].shape(), &[2, 3]);
+        assert_eq!(conv_slices[1].shape(), &[2, 3]);
+        assert_eq!(
+            Value(conv_slices[1].clone()).to_f32_vec().unwrap(),
+            (6..12).map(|value| value as f32).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn invocation_mode_rejects_stateless_and_stateful_mismatches() {
+        assert!(validate_execution_mode(false, 1, None, None).is_ok());
+        assert!(validate_execution_mode(false, 0, Some(1), Some(1)).is_err());
+        assert!(validate_execution_mode(true, 1, Some(1), Some(1)).is_err());
+        assert!(validate_execution_mode(true, 0, None, None).is_err());
+        assert!(validate_execution_mode(true, 0, Some(2), Some(1)).is_err());
+        assert!(validate_execution_mode(true, 0, Some(2), Some(2)).is_ok());
+        let schema = test_state_schema();
+        assert!(validate_active_batch(&schema, 0).is_err());
+        assert!(validate_active_batch(&schema, 1).is_ok());
+        assert!(validate_active_batch(&schema, 2).is_ok());
+        assert!(validate_active_batch(&schema, 3).is_err());
+    }
+
+    #[test]
+    fn execute_rejects_every_schema_pool_mismatch() {
+        let pool = test_schema_pool();
+        let schema = test_state_schema();
+        validate_pool_schema(&schema, &pool).unwrap();
+
+        let mismatches = [
+            KvStateSchema {
+                max_tokens: 4,
+                ..schema
+            },
+            KvStateSchema {
+                block_size: 2,
+                ..schema
+            },
+            KvStateSchema {
+                kv_dtype: DType::F16,
+                ..schema
+            },
+            KvStateSchema {
+                layers: 2,
+                ..schema
+            },
+            KvStateSchema {
+                kv_heads: 1,
+                ..schema
+            },
+            KvStateSchema {
+                head_dim: 2,
+                ..schema
+            },
+            KvStateSchema {
+                window: Some(9),
+                ..schema
+            },
+        ];
+        for mismatch in mismatches {
+            assert!(validate_pool_schema(&mismatch, &pool).is_err());
+        }
+
+        let mut state = SeqState {
+            blocks: Vec::new(),
+            head: 0,
+            cursor: 0,
+            advance: 0,
+            last_hash: HASH_SEED,
+            pending: Vec::new(),
+            kda_states: Vec::new(),
+            conv_states: Vec::new(),
+        };
+        validate_recurrent_state_schema(&schema, &state).unwrap();
+        state.kda_states.push(Tensor::zeros(&[1, 2, 3], DType::F32));
+        assert!(validate_recurrent_state_schema(&schema, &state).is_err());
+    }
+
+    #[test]
+    fn state_capacity_is_exact_and_propagated_to_the_plan() {
+        let schema = KvStateSchema {
+            kv_dtype: DType::U8,
+            kda: KdaGeometry {
+                layers: 1,
+                heads: 3,
+                head_dim: 4,
+                value_dim: 5,
+            },
+            kda_dtype: DType::F64,
+            conv: ConvGeometry {
+                layers: 2,
+                channels: 7,
+                kernel: 3,
+            },
+            ..test_state_schema()
+        };
+        let state_bytes = schema.referenced_state_bytes().unwrap();
+        assert_eq!(state_bytes, 1_440);
+
+        let root = leaf(Tensor::ones(&[2], DType::F32));
+        let compilation = executable::compile_with_state_bytes(
+            &[root],
+            CompileOptions::default(),
+            CHUNKED_CE_CHUNK_LOGITS,
+            Some(state_bytes),
+        )
+        .unwrap();
+        assert_eq!(compilation.executable.memory.report.state_bytes, 1_440);
+        assert_eq!(compilation.executable.diagnostics.memory.state_bytes, 1_440);
     }
 
     #[test]
@@ -4466,10 +4381,13 @@ mod tests {
             k: vec![pool::Slab::new(8, 8, DType::F32)],
             v: vec![pool::Slab::new(8, 8, DType::F32)],
             scales: Vec::new(),
+            kv_dtype: DType::F32,
             kv_heads: 2,
             head_dim: 4,
             block_size: 4,
             max_tokens: 8,
+            kda: KdaGeometry::default(),
+            conv: ConvGeometry::default(),
             blocks: Mutex::new(BlockStore::new(2)),
         });
         let state = Arc::new(Mutex::new(SeqState {
@@ -4485,8 +4403,10 @@ mod tests {
         let context = KvContext {
             pool,
             slots: vec![state.clone()],
+            active_batch: 1,
             kda: KdaGeometry::default(),
             conv: ConvGeometry::default(),
+            transaction: Mutex::new(None),
         };
         let q = Value(Tensor::from_vec(
             (0..24).map(|value| value as f32).collect(),
@@ -4500,10 +4420,6 @@ mod tests {
             (48..72).map(|value| value as f32 * 0.01).collect(),
             vec![1, 2, 3, 4],
         ));
-        let actual = kv_attention(&context, 0, &q, &k, &v, 0.5, None)
-            .unwrap()
-            .to_f32_vec()
-            .unwrap();
         let expected = Value(composed::sdpa_forward(
             q.tensor(),
             k.tensor(),
@@ -4513,8 +4429,236 @@ mod tests {
         ))
         .to_f32_vec()
         .unwrap();
+        let mut actual = Tensor::zeros(&q.shape(), DType::F32);
+        let mut destination = CpuDestination::new(&mut actual).unwrap();
+        let mut eviction_starts = vec![usize::MAX];
+        {
+            let _guard = crate::ExecutableAllocationGuard::enter();
+            kv_attention_into(
+                &context,
+                0,
+                &q,
+                &k,
+                &v,
+                0.5,
+                None,
+                &mut destination,
+                &mut eviction_starts,
+            )
+            .unwrap();
+        }
+        drop(destination);
+        let actual = Value(actual).to_f32_vec().unwrap();
         assert_close(&actual, &expected, 1e-6, "kv attention");
         assert_eq!(state.lock().unwrap().advance, 3);
+    }
+
+    #[test]
+    fn compiled_kda_commits_planned_next_state() {
+        let pool = Arc::new(PoolInner {
+            k: Vec::new(),
+            v: Vec::new(),
+            scales: Vec::new(),
+            kv_dtype: DType::F32,
+            kv_heads: 0,
+            head_dim: 0,
+            block_size: 4,
+            max_tokens: 8,
+            kda: KdaGeometry {
+                layers: 1,
+                heads: 1,
+                head_dim: 2,
+                value_dim: 2,
+            },
+            conv: ConvGeometry::default(),
+            blocks: Mutex::new(BlockStore::new(2)),
+        });
+        let state = Arc::new(Mutex::new(SeqState {
+            blocks: Vec::new(),
+            head: 0,
+            cursor: 0,
+            advance: 2,
+            last_hash: HASH_SEED,
+            pending: Vec::new(),
+            kda_states: vec![Tensor::zeros(&[1, 2, 2], DType::F32)],
+            conv_states: Vec::new(),
+        }));
+        let context = Arc::new(KvContext {
+            pool,
+            slots: vec![state.clone()],
+            active_batch: 1,
+            kda: KdaGeometry {
+                layers: 1,
+                heads: 1,
+                head_dim: 2,
+                value_dim: 2,
+            },
+            conv: ConvGeometry::default(),
+            transaction: Mutex::new(None),
+        });
+        let leaf = |values: Vec<f32>, shape: Vec<usize>| {
+            Node::new(NodeKind::Leaf(Arc::new(LeafSlot::new(Value(
+                Tensor::from_vec(values, shape),
+            )))))
+            .unwrap()
+        };
+        let q = leaf(vec![0.2, 0.4, 0.1, 0.3], vec![1, 1, 2, 2]);
+        let k = leaf(vec![0.3, 0.1, 0.4, 0.2], vec![1, 1, 2, 2]);
+        let v = leaf(vec![0.5, 0.7, 0.6, 0.8], vec![1, 1, 2, 2]);
+        let decay = leaf(vec![-0.1, -0.2, -0.3, -0.4], vec![1, 1, 2, 2]);
+        let beta = leaf(vec![0.5, 0.25], vec![1, 1, 2, 1]);
+        let recurrence = Node::new(NodeKind::KdaRecurrence {
+            q: q.clone(),
+            k: k.clone(),
+            v: v.clone(),
+            log_decay: decay.clone(),
+            beta: beta.clone(),
+            scale: 0.5,
+            layer: 0,
+        })
+        .unwrap();
+        let compilation = executable::compile(
+            &[recurrence],
+            CompileOptions {
+                optimize: false,
+                ..CompileOptions::default()
+            },
+            1024,
+        )
+        .unwrap();
+        assert!(compilation.executable.memory.report.transaction_bytes > 0);
+
+        let zero = Tensor::zeros(&[1, 2, 2], DType::F32);
+        let leaf_value = |node: &Arc<Node>| -> Value {
+            match &node.kind {
+                NodeKind::Leaf(slot) => slot.get().unwrap(),
+                _ => unreachable!("test nodes are leaves"),
+            }
+        };
+        let q_value = leaf_value(&q);
+        let k_value = leaf_value(&k);
+        let v_value = leaf_value(&v);
+        let decay_value = leaf_value(&decay);
+        let beta_value = leaf_value(&beta);
+        let (expected_output, expected_state) = composed::kda_chunk_with_state(
+            q_value.tensor(),
+            k_value.tensor(),
+            v_value.tensor(),
+            decay_value.tensor(),
+            beta_value.tensor(),
+            0.5,
+            &zero,
+        );
+        let outputs = executable::execute(
+            &compilation.executable,
+            &[],
+            &compilation.generated_bindings,
+            &CancellationFlag::new(),
+            Some(&context),
+        )
+        .unwrap();
+        assert_close(
+            &outputs[0].to_f32_vec().unwrap(),
+            &Value(expected_output).to_f32_vec().unwrap(),
+            1e-6,
+            "compiled KDA output",
+        );
+        let committed = state.lock().unwrap().kda_states[0].clone();
+        assert_close(
+            &Value(committed).to_f32_vec().unwrap(),
+            &Value(expected_state).to_f32_vec().unwrap(),
+            1e-6,
+            "compiled KDA state",
+        );
+    }
+
+    #[test]
+    fn compiled_short_conv_commits_planned_next_state() {
+        let pool = Arc::new(PoolInner {
+            k: Vec::new(),
+            v: Vec::new(),
+            scales: Vec::new(),
+            kv_dtype: DType::F32,
+            kv_heads: 0,
+            head_dim: 0,
+            block_size: 4,
+            max_tokens: 8,
+            kda: KdaGeometry::default(),
+            conv: ConvGeometry {
+                layers: 1,
+                channels: 2,
+                kernel: 3,
+            },
+            blocks: Mutex::new(BlockStore::new(2)),
+        });
+        let state = Arc::new(Mutex::new(SeqState {
+            blocks: Vec::new(),
+            head: 0,
+            cursor: 0,
+            advance: 2,
+            last_hash: HASH_SEED,
+            pending: Vec::new(),
+            kda_states: Vec::new(),
+            conv_states: vec![Tensor::zeros(&[2, 2], DType::F32)],
+        }));
+        let context = Arc::new(KvContext {
+            pool,
+            slots: vec![state.clone()],
+            active_batch: 1,
+            kda: KdaGeometry::default(),
+            conv: ConvGeometry {
+                layers: 1,
+                channels: 2,
+                kernel: 3,
+            },
+            transaction: Mutex::new(None),
+        });
+        let x_value = Value(Tensor::from_vec(vec![1.0, 2.0, 3.0, 4.0], vec![1, 2, 2]));
+        let weight_value = Value(Tensor::from_vec(
+            vec![0.5, 1.0, -0.5, 0.25, 0.75, 1.25],
+            vec![2, 3],
+        ));
+        let x = Node::new(NodeKind::Leaf(Arc::new(LeafSlot::new(x_value.clone())))).unwrap();
+        let weight = Node::new(NodeKind::Leaf(Arc::new(LeafSlot::new(
+            weight_value.clone(),
+        ))))
+        .unwrap();
+        let operation = Node::new(NodeKind::ConvState {
+            x,
+            weight,
+            layer: 0,
+        })
+        .unwrap();
+        let compilation = executable::compile(
+            &[operation],
+            CompileOptions {
+                optimize: false,
+                ..CompileOptions::default()
+            },
+            1024,
+        )
+        .unwrap();
+        let outputs = executable::execute(
+            &compilation.executable,
+            &[],
+            &compilation.generated_bindings,
+            &CancellationFlag::new(),
+            Some(&context),
+        )
+        .unwrap();
+        assert_close(
+            &outputs[0].to_f32_vec().unwrap(),
+            &[-0.5, 2.5, -0.5, 6.5],
+            1e-6,
+            "compiled convolution output",
+        );
+        let committed = state.lock().unwrap().conv_states[0].clone();
+        assert_close(
+            &Value(committed).to_f32_vec().unwrap(),
+            &[1.0, 2.0, 3.0, 4.0],
+            1e-6,
+            "compiled convolution state",
+        );
     }
 
     fn block_store_pool(blocks: usize) -> PoolInner {
@@ -4522,10 +4666,13 @@ mod tests {
             k: Vec::new(),
             v: Vec::new(),
             scales: Vec::new(),
+            kv_dtype: DType::F32,
             kv_heads: 1,
             head_dim: 1,
             block_size: 2,
             max_tokens: blocks * 2,
+            kda: KdaGeometry::default(),
+            conv: ConvGeometry::default(),
             blocks: Mutex::new(BlockStore::new(blocks)),
         }
     }

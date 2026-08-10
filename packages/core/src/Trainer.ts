@@ -417,6 +417,7 @@ const compiledStep = <S, EL, RL, ED, RD, EO, RO>(
     )
     const outputs = yield* Tensor.runProgram(program, inputs, [config.lr(step - 1)])
     const loss = (yield* Tensor.toNumberArray(outputs[0]))[0]
+    yield* Tensor.clear(outputs[0])
     const trained = outputs.slice(1, 1 + params.length)
     return {
       loss,
