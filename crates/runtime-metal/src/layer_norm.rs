@@ -480,6 +480,7 @@ kernel void et_ln_bwd(
             require_contiguous(tensor, label)?;
         }
         require_exact(output, x.layout.shape(), x.dtype, "output")?;
+        MetalDevice::get().mark_buffer_write(&output.buffer)?;
         let pipe = cached_pipeline("et_ln_fwd", x.dtype)?;
         let sz = x.dtype.size_in_bytes();
         MetalDevice::get().with_encoder(|e| {
@@ -557,6 +558,8 @@ kernel void et_ln_bwd(
         }
         require_exact(dx, x.layout.shape(), x.dtype, "dx")?;
         require_exact(normalized, x.layout.shape(), x.dtype, "normalized")?;
+        MetalDevice::get().mark_buffer_write(&dx.buffer)?;
+        MetalDevice::get().mark_buffer_write(&normalized.buffer)?;
         let pipe = cached_pipeline("et_ln_bwd", x.dtype)?;
         let sz = x.dtype.size_in_bytes();
         MetalDevice::get().with_encoder(|e| {

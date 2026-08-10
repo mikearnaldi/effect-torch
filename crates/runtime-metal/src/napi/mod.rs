@@ -199,7 +199,6 @@ pub struct NativeExecutableDiagnostics {
     pub pipeline_count: f64,
     pub command_count: f64,
     pub synchronization_count: f64,
-    pub output_capacity: f64,
     pub memory: NativeMemoryDiagnostics,
 }
 
@@ -221,7 +220,6 @@ fn executable_diagnostics(
         pipeline_count: diagnostics.pipeline_count as f64,
         command_count: diagnostics.command_count as f64,
         synchronization_count: diagnostics.synchronization_count as f64,
-        output_capacity: diagnostics.output_capacity as f64,
         memory: NativeMemoryDiagnostics {
             external_bytes: memory.external_bytes as f64,
             persistent_bytes: memory.persistent_bytes as f64,
@@ -240,7 +238,6 @@ pub struct NativeCompileOptions {
     pub optimize: Option<bool>,
     pub allow_reduced_precision: Option<bool>,
     pub constant_weights: Option<bool>,
-    pub output_capacity: Option<u32>,
 }
 
 fn dtype_name(dtype: DType) -> &'static str {
@@ -416,7 +413,7 @@ impl NativeTensor {
 fn readback_blocking(inner: &value::Value) -> Result<Readback> {
     let tensor = inner.as_metal().map_err(to_napi_err)?;
     runtime::metal::device::MetalDevice::get()
-        .synchronize()
+        .synchronize_buffer(&tensor.buffer)
         .map_err(to_napi_err)?;
     let base = tensor.buffer.contents_ptr() as *const u8;
     let elem_size = tensor.dtype.size_in_bytes();
@@ -476,7 +473,7 @@ fn readback_blocking(inner: &value::Value) -> Result<Readback> {
     }
     let offset = tensor.layout.offset() * elem_size;
     // Small readbacks are copied so a short-lived scalar/metadata ArrayBuffer
-    // cannot pin an entire preallocated executable output generation until GC.
+    // cannot pin an entire pooled output segment until GC.
     if !base.is_null() && byte_len <= 4096 {
         let bytes = unsafe { std::slice::from_raw_parts(base.add(offset), byte_len) }.to_vec();
         let (_, ptr, len, cap) = vec_to_bytes(bytes);
@@ -2733,7 +2730,7 @@ impl NativeKvPool {
                 sequence_state(&self.inner, false).map_err(to_napi_err)?,
             )),
             run_lock: Arc::new(Mutex::new(())),
-            released: AtomicBool::new(false),
+            released: Arc::new(AtomicBool::new(false)),
         })
     }
 }
@@ -2745,7 +2742,7 @@ pub struct NativeKvSequence {
     // Serializes runs of this sequence; other sequences run concurrently
     // (their blocks are disjoint by allocation).
     run_lock: Arc<Mutex<()>>,
-    released: AtomicBool,
+    released: Arc<AtomicBool>,
 }
 
 // Blocks return to the pool when the sequence is collected — GC alone is
@@ -2768,7 +2765,7 @@ impl NativeKvSequence {
                     .expect("pool padding state was allocated during construction"),
             )),
             run_lock: Arc::new(Mutex::new(())),
-            released: AtomicBool::new(false),
+            released: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -2780,19 +2777,19 @@ impl NativeKvSequence {
         // for its whole duration, so releasing must wait for an
         // in-flight run rather than unref blocks it still scatters
         // into. Lock order stays run_lock -> state -> pool blocks.
-        let Ok(_run_guard) = self.run_lock.lock() else {
-            return;
-        };
-        if let Ok(mut state) = self.state.lock() {
-            for block in state.blocks.drain(..) {
-                self.pool.unref_block(block);
-            }
-            state.head = 0;
-            state.cursor = 0;
-            state.advance = 0;
-            state.last_hash = HASH_SEED;
-            state.pending.clear();
+        let _run_guard = self
+            .run_lock
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        for block in state.blocks.drain(..) {
+            self.pool.unref_block(block);
         }
+        state.head = 0;
+        state.cursor = 0;
+        state.advance = 0;
+        state.last_hash = HASH_SEED;
+        state.pending.clear();
     }
 }
 
@@ -2828,6 +2825,12 @@ impl NativeKvSequence {
     // begin alike share; nothing about the match is visible to callers.
     #[napi]
     pub fn prefill_match(&self, tokens: Vec<u32>) -> Result<u32> {
+        let _run_guard = self.run_lock.lock().map_err(|e| {
+            Error::new(
+                Status::GenericFailure,
+                format!("kv sequence lock poisoned: {e}"),
+            )
+        })?;
         if self.released.load(Ordering::SeqCst) {
             return Err(Error::new(
                 Status::GenericFailure,
@@ -3229,6 +3232,7 @@ impl Executable {
         ordered.sort_by_key(|seq| Arc::as_ptr(&seq.run_lock) as usize);
         let run_locks: Vec<Arc<Mutex<()>>> =
             ordered.iter().map(|seq| seq.run_lock.clone()).collect();
+        let released: Vec<Arc<AtomicBool>> = seqs.iter().map(|seq| seq.released.clone()).collect();
         let slot_states: Vec<Arc<Mutex<SeqState>>> =
             seqs.iter().map(|seq| seq.state.clone()).collect();
         run_compute(token, move |cancelled, cancellation| {
@@ -3243,6 +3247,14 @@ impl Executable {
                     })
                 })
                 .collect::<Result<Vec<_>>>()?;
+            for (index, released) in released.iter().enumerate() {
+                if released.load(Ordering::SeqCst) {
+                    return Err(Error::new(
+                        Status::GenericFailure,
+                        format!("kv sequence {index} is released"),
+                    ));
+                }
+            }
             for (index, state) in slot_states.iter().take(active_batch).enumerate() {
                 let cursor = state
                     .lock()
@@ -3526,9 +3538,6 @@ fn compile_options(explicit: Option<NativeCompileOptions>, stateful: bool) -> Co
                 constant_weights: explicit.constant_weights.unwrap_or(false),
             });
         }
-        if let Some(output_capacity) = explicit.output_capacity {
-            options.output_capacity = output_capacity as usize;
-        }
     } else if stateful {
         options.inference = Some(InferenceOptions::default());
     }
@@ -3551,12 +3560,6 @@ pub fn compile(
     }
 
     let options = compile_options(options, state.is_some());
-    if options.output_capacity == 0 {
-        return Err(Error::new(
-            Status::InvalidArg,
-            "compile: output capacity must be positive",
-        ));
-    }
     let mut executable_state = None;
     let state_schema = if let Some(state) = state {
         if state.batch == 0 || state.max_tokens == 0 || state.block_size == 0 {
@@ -3613,7 +3616,7 @@ pub fn compile(
             {
                 return Ok(Executable {
                     inner: ProgramInner {
-                        executable: cached.executable.instantiate().map_err(to_napi_err)?,
+                        executable: Arc::clone(&cached.executable),
                         slots: cached.slots,
                         generated_bindings: current,
                         signature: cached.signature,
@@ -3906,7 +3909,7 @@ mod epilogue_tests {
     }
 
     #[test]
-    fn structural_cache_reuses_compilation_with_independent_resources_and_rebound_leaves() {
+    fn structural_cache_shares_the_plan_and_rebinds_leaves() {
         let graph = |left: Vec<f32>, right: Vec<f32>| LazyTensor {
             node: Node::new(NodeKind::Add {
                 a: mleaf(left, vec![2]),
@@ -3919,7 +3922,7 @@ mod epilogue_tests {
         let key = Some("metal-structural-cache-rebind-test".to_string());
         let first = compile(vec![&first_root], None, None, key.clone()).unwrap();
         let second = compile(vec![&second_root], None, None, key).unwrap();
-        assert!(!Arc::ptr_eq(
+        assert!(Arc::ptr_eq(
             &first.inner.executable,
             &second.inner.executable
         ));
@@ -3931,24 +3934,84 @@ mod epilogue_tests {
             first.inner.executable.diagnostics,
             second.inner.executable.diagnostics
         );
-        let first_output = executable::execute(
-            &first.inner.executable,
-            &[],
-            &first.inner.generated_bindings,
-            &effect_torch_runtime::CancellationFlag::new(),
-            None,
-        )
-        .unwrap();
-        let second_output = executable::execute(
-            &second.inner.executable,
-            &[],
-            &second.inner.generated_bindings,
-            &effect_torch_runtime::CancellationFlag::new(),
-            None,
-        )
-        .unwrap();
-        assert_eq!(first_output[0].to_f32_vec().unwrap(), [4.0, 6.0]);
-        assert_eq!(second_output[0].to_f32_vec().unwrap(), [40.0, 60.0]);
+        let mut first_outputs = Vec::new();
+        let mut second_outputs = Vec::new();
+        for _ in 0..8 {
+            first_outputs.push(
+                executable::execute(
+                    &first.inner.executable,
+                    &[],
+                    &first.inner.generated_bindings,
+                    &effect_torch_runtime::CancellationFlag::new(),
+                    None,
+                )
+                .unwrap()
+                .remove(0),
+            );
+            second_outputs.push(
+                executable::execute(
+                    &second.inner.executable,
+                    &[],
+                    &second.inner.generated_bindings,
+                    &effect_torch_runtime::CancellationFlag::new(),
+                    None,
+                )
+                .unwrap()
+                .remove(0),
+            );
+        }
+        for output in first_outputs {
+            assert_eq!(output.to_f32_vec().unwrap(), [4.0, 6.0]);
+        }
+        for output in second_outputs {
+            assert_eq!(output.to_f32_vec().unwrap(), [40.0, 60.0]);
+        }
+    }
+
+    #[test]
+    fn zero_copy_readback_retains_pooled_output_after_tensor_clear() {
+        let root = LazyTensor {
+            node: Node::new(NodeKind::Randn {
+                shape: vec![2048],
+                dtype: DType::F32,
+                device: Device::Metal,
+            })
+            .unwrap(),
+        };
+        let program = compile(vec![&root], None, None, None).unwrap();
+        let run = || {
+            executable::execute(
+                &program.inner.executable,
+                &[],
+                &program.inner.generated_bindings,
+                &effect_torch_runtime::CancellationFlag::new(),
+                None,
+            )
+            .unwrap()
+            .remove(0)
+        };
+        let mut tensor = NativeTensor::wrap(run());
+        let inner = tensor.val_cloned().unwrap();
+        let readback = readback_blocking(&inner).unwrap();
+        drop(inner);
+        assert!(matches!(
+            readback.hint.as_ref(),
+            Some(FinalizeHint::ZeroCopy { .. })
+        ));
+        let expected = unsafe {
+            std::slice::from_raw_parts(readback.data.cast::<f32>(), readback.byte_len / 4).to_vec()
+        };
+
+        assert!(tensor.slot.clear());
+        EXTERNAL_MEMORY_BYTES.fetch_sub(tensor.bytes, Ordering::Relaxed);
+        tensor.bytes = 0;
+        for _ in 0..4 {
+            drop(run());
+        }
+        let retained = unsafe {
+            std::slice::from_raw_parts(readback.data.cast::<f32>(), readback.byte_len / 4).to_vec()
+        };
+        assert_eq!(retained, expected);
     }
 
     #[test]
@@ -4518,6 +4581,30 @@ mod epilogue_tests {
         assert!(state.kda_states.is_empty());
         assert!(state.conv_states.is_empty());
         assert_eq!(pool.free_blocks(), available);
+    }
+
+    #[test]
+    fn prefill_match_rechecks_release_after_acquiring_the_run_lock() {
+        let pool = NativeKvPool::new(1, 1, 2, 32, Some(16), Some(NativeDType::F32), None).unwrap();
+        let sequence = Arc::new(pool.make_sequence().unwrap());
+        let run_guard = sequence.run_lock.lock().unwrap();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let worker = {
+            let sequence = sequence.clone();
+            std::thread::spawn(move || {
+                started_tx.send(()).unwrap();
+                sequence.prefill_match((0..17).collect())
+            })
+        };
+        started_rx.recv().unwrap();
+        sequence.released.store(true, Ordering::SeqCst);
+        drop(run_guard);
+
+        let error = worker.join().unwrap().unwrap_err();
+        assert!(error.to_string().contains("kv sequence is released"));
+        let state = sequence.state.lock().unwrap();
+        assert!(state.blocks.is_empty());
+        assert_eq!(state.cursor, 0);
     }
 
     #[test]

@@ -143,9 +143,19 @@ where
 
             let allocation = match inner.allocator.allocate(&request.key, request.bytes) {
                 Ok(allocation) => allocation,
-                Err(error) => {
+                Err(error) if inner.idle.is_empty() => {
                     inner.rollback(&mut pending);
                     return Err(WorkspacePoolError::Allocation(error));
+                }
+                Err(_) => {
+                    inner.evict_all_idle();
+                    match inner.allocator.allocate(&request.key, request.bytes) {
+                        Ok(allocation) => allocation,
+                        Err(error) => {
+                            inner.rollback(&mut pending);
+                            return Err(WorkspacePoolError::Allocation(error));
+                        }
+                    }
                 }
             };
             if allocation.capacity < request.bytes {
@@ -467,6 +477,11 @@ where
         }
     }
 
+    fn evict_all_idle(&mut self) {
+        self.idle.clear();
+        self.idle_bytes = 0;
+    }
+
     fn next_lru_tick(&mut self) -> u64 {
         if let Some(next) = self.clock.checked_add(1) {
             self.clock = next;
@@ -629,6 +644,70 @@ mod tests {
         drop(pool.acquire(&[WorkspaceRequest::new("old", 40)]).unwrap());
         assert_eq!(calls.load(Ordering::SeqCst), calls_before + 1);
         assert!(pool.stats().idle_bytes <= 80);
+    }
+
+    #[derive(Debug)]
+    struct BudgetWorkspace {
+        bytes: usize,
+        live: Arc<AtomicUsize>,
+    }
+
+    impl Drop for BudgetWorkspace {
+        fn drop(&mut self) {
+            self.live.fetch_sub(self.bytes, Ordering::SeqCst);
+        }
+    }
+
+    struct BudgetAllocator {
+        limit: usize,
+        live: Arc<AtomicUsize>,
+    }
+
+    impl WorkspaceAllocator<&'static str> for BudgetAllocator {
+        type Workspace = BudgetWorkspace;
+        type Error = &'static str;
+
+        fn allocate(
+            &mut self,
+            _key: &&'static str,
+            minimum_bytes: usize,
+        ) -> Result<WorkspaceAllocation<Self::Workspace>, Self::Error> {
+            let live = self.live.load(Ordering::SeqCst);
+            if live.saturating_add(minimum_bytes) > self.limit {
+                return Err("budget exhausted");
+            }
+            self.live.fetch_add(minimum_bytes, Ordering::SeqCst);
+            Ok(WorkspaceAllocation::new(
+                BudgetWorkspace {
+                    bytes: minimum_bytes,
+                    live: Arc::clone(&self.live),
+                },
+                minimum_bytes,
+            ))
+        }
+    }
+
+    #[test]
+    fn allocation_pressure_evicts_incompatible_idle_storage_and_retries() {
+        let live = Arc::new(AtomicUsize::new(0));
+        let pool = WorkspacePool::new(
+            1024,
+            BudgetAllocator {
+                limit: 64,
+                live: Arc::clone(&live),
+            },
+        );
+        drop(pool.acquire(&[WorkspaceRequest::new("cold", 64)]).unwrap());
+        assert_eq!(pool.stats().idle_bytes, 64);
+        assert_eq!(live.load(Ordering::SeqCst), 64);
+
+        let replacement = pool
+            .acquire(&[WorkspaceRequest::new("replacement", 64)])
+            .unwrap();
+        assert_eq!(pool.stats().idle_bytes, 0);
+        assert_eq!(pool.stats().leased_bytes, 64);
+        assert_eq!(live.load(Ordering::SeqCst), 64);
+        drop(replacement);
     }
 
     struct InfallibleAllocator;

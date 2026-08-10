@@ -568,6 +568,8 @@ kernel void et_sdpa_fwd(
             crate::runtime::dtype::DType::F32,
             "logsumexp",
         )?;
+        MetalDevice::get().mark_buffer_write(&output.buffer)?;
+        MetalDevice::get().mark_buffer_write(&logsumexp.buffer)?;
 
         let pipe = cached_forward_pipeline(t, s, d, dv, scale, causal, q.dtype)?;
         let sz = q.dtype.size_in_bytes();
@@ -1050,6 +1052,9 @@ kernel void et_sdpa_bwd_q(
         )?;
         for (tensor, label) in [(q, "q"), (k, "k"), (v, "v"), (o, "output"), (g, "gradient")] {
             require_contiguous(tensor, label)?;
+        }
+        for tensor in [dq, dk, dv_out, d_vec_scratch] {
+            MetalDevice::get().mark_buffer_write(&tensor.buffer)?;
         }
 
         // Resolve every pipeline before encoding any work, so a partial

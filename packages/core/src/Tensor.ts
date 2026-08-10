@@ -4380,8 +4380,7 @@ export const releaseKvSequence = (sequence: KvSequence): Effect.Effect<void, Ten
  */
 export const compileDecodeProgram = (
   roots: ReadonlyArray<Any>,
-  state: Runtime.DecodeStateRequest,
-  options: { readonly outputCapacity?: number } = {}
+  state: Runtime.DecodeStateRequest
 ): Effect.Effect<DecodeProgram, TensorError, Runtime.Runtime> =>
   Effect.gen(function*() {
     const runtime = yield* Runtime.Runtime
@@ -4397,8 +4396,7 @@ export const compileDecodeProgram = (
       runtime.compile({
         roots,
         options: {
-          constantWeights: true,
-          ...(options.outputCapacity === undefined ? {} : { outputCapacity: options.outputCapacity })
+          constantWeights: true
         },
         state
       })
@@ -4721,8 +4719,7 @@ export const compile = <E = never, R = never>(
         const compileOptions: Runtime.ExecutableCompileOptions = {
           ...(options.optimize === undefined ? {} : { optimize: options.optimize }),
           ...(options.precision === undefined ? {} : { precision: options.precision }),
-          ...(options.constantWeights === undefined ? {} : { constantWeights: options.constantWeights }),
-          ...(options.outputCapacity === undefined ? {} : { outputCapacity: options.outputCapacity })
+          ...(options.constantWeights === undefined ? {} : { constantWeights: options.constantWeights })
         }
         return yield* freezeProgram(roots, compileOptions)
       })

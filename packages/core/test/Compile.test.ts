@@ -54,36 +54,38 @@ onDevices("Compile", () => (it) => {
         expect(yield* values((yield* Tensor.runProgram(program, [x], [-1]))[0])).toEqual([-1, -2, -3])
       }))
 
-    it.effect("reports and enforces the compile-time output capacity", () =>
+    it.effect("retains ordinary outputs across later invocations", () =>
       Effect.gen(function*() {
         const x = yield* Tensor.fromTypedArray(floats([1, 2]), [2])
         const input = yield* Tensor.makeInput(0, x)
-        const program = yield* Tensor.freezeProgram([yield* Tensor.neg(input)], { outputCapacity: 3 })
-        expect(program.handle.diagnostics.outputCapacity).toBe(3)
-        const retained = [
-          (yield* Tensor.runProgram(program, [x]))[0],
-          (yield* Tensor.runProgram(program, [x]))[0],
-          (yield* Tensor.runProgram(program, [x]))[0]
-        ]
-        const error = yield* Effect.flip(Tensor.runProgram(program, [x]))
-        expect(error.message).toMatch(/all 3 preallocated output generations are still live/)
+        const program = yield* Tensor.freezeProgram([yield* Tensor.neg(input)])
+        expect("outputCapacity" in program.handle.diagnostics).toBe(false)
+        expect(program.handle.diagnostics.memory.outputBytes).toBeGreaterThan(0)
+        const retained: Array<Tensor.Concrete> = []
+        for (let i = 0; i < 8; i++) {
+          const value = yield* Tensor.fromTypedArray(floats([i, i + 1]), [2])
+          retained.push((yield* Tensor.runProgram(program, [value]))[0])
+        }
+        for (let i = 0; i < retained.length; i++) {
+          expect(yield* values(retained[i])).toEqual([-i, -(i + 1)])
+        }
         yield* Effect.forEach(retained, (tensor) => Tensor.clear(tensor), { discard: true })
       }))
 
     it.effect("traces once under concurrent first calls (single-flight)", () =>
       Effect.gen(function*() {
-        const fn = yield* Tensor.compile(([a]) => Effect.map(Tensor.sigmoid(a), (out) => [out]), {
-          outputCapacity: 8
-        })
-        const x = yield* Tensor.fromTypedArray(floats([0, 1, 2]), [3])
+        const fn = yield* Tensor.compile(([a]) => Effect.map(Tensor.neg(a), (out) => [out]))
+        const inputs = yield* Effect.forEach(
+          Array.from({ length: 8 }, (_, index) => index),
+          (index) => Tensor.fromTypedArray(floats([index, index + 1]), [2])
+        )
         const results = yield* Effect.forEach(
-          Array.from({ length: 8 }, () => fn.call([x])),
-          (effect) => effect,
+          inputs,
+          (input) => fn.call([input]),
           { concurrency: "unbounded" }
         )
-        const expected = yield* values(results[0][0])
-        for (const [actual] of results) {
-          expect(yield* values(actual)).toEqual(expected)
+        for (let index = 0; index < results.length; index++) {
+          expect(yield* values(results[index][0])).toEqual([-index, -(index + 1)])
         }
         expect(yield* fn.stats).toEqual({ cached: 1, compiled: 1 })
       }))

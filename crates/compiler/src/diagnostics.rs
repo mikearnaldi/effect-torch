@@ -11,7 +11,6 @@ pub struct DiagnosticsInput {
     pub pipeline_count: usize,
     pub command_count: usize,
     pub synchronization_count: usize,
-    pub output_capacity: usize,
     pub compile_phases: Vec<CompilePhaseTiming>,
 }
 
@@ -44,7 +43,6 @@ where
         pipeline_count: input.pipeline_count,
         command_count: input.command_count,
         synchronization_count: input.synchronization_count,
-        output_capacity: input.output_capacity,
         memory: memory.report.clone(),
         compile_phases: input.compile_phases.into_boxed_slice(),
     }

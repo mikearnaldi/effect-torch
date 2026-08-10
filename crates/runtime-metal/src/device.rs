@@ -5,10 +5,10 @@ use objc2_metal::{
     MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder,
     MTLComputePipelineState, MTLDevice, MTLLibrary, MTLResourceOptions, MTLSize,
 };
-use std::cell::{Cell, RefCell};
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ptr::NonNull;
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 const PROBES: usize = 8;
 const MAX_BUCKET: usize = 4096;
@@ -23,91 +23,8 @@ pub static EXECUTABLE_PIPELINE_MISS_ATTEMPTS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 pub static EXECUTABLE_ALLOCATION_ATTEMPTS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
-
-#[cfg(test)]
-thread_local! {
-    static TEST_DEVICE_BUFFER_ALLOCATIONS: Cell<usize> = const { Cell::new(0) };
-}
-
-#[cfg(test)]
-pub(crate) fn reset_test_device_buffer_allocations() {
-    TEST_DEVICE_BUFFER_ALLOCATIONS.with(|count| count.set(0));
-}
-
-#[cfg(test)]
-pub(crate) fn test_device_buffer_allocations() -> usize {
-    TEST_DEVICE_BUFFER_ALLOCATIONS.with(Cell::get)
-}
-
-#[cfg(test)]
-fn record_test_device_buffer_allocation() {
-    TEST_DEVICE_BUFFER_ALLOCATIONS.with(|count| count.set(count.get() + 1));
-}
-
-// One logical Metal command stream at a time. The encoder manager itself is
-// mutex-protected per dispatch, but interleaving whole operation sequences can
-// let one thread synchronize and inspect another thread's partial sequence.
-static EXECUTION_LOCK: Mutex<()> = Mutex::new(());
-
-thread_local! {
-    static EXECUTION_GUARD: RefCell<Option<MutexGuard<'static, ()>>> = const { RefCell::new(None) };
-    static EXPLICIT_EXECUTION_DEPTH: Cell<usize> = const { Cell::new(0) };
-}
-
-fn claim_execution() {
-    EXECUTION_GUARD.with(|guard| {
-        if guard.borrow().is_none() {
-            *guard.borrow_mut() = Some(
-                EXECUTION_LOCK
-                    .lock()
-                    .unwrap_or_else(|error| error.into_inner()),
-            );
-        }
-    });
-}
-
-fn release_automatic_execution() {
-    if EXPLICIT_EXECUTION_DEPTH.with(Cell::get) == 0 {
-        EXECUTION_GUARD.with(|guard| {
-            guard.borrow_mut().take();
-        });
-    }
-}
-
-pub(crate) struct MetalExecutionGuard;
-
-pub(crate) fn begin_execution() -> MetalExecutionGuard {
-    claim_execution();
-    EXPLICIT_EXECUTION_DEPTH.with(|depth| depth.set(depth.get() + 1));
-    MetalExecutionGuard
-}
-
-#[cfg(test)]
-pub(crate) fn execution_claimed_for_test() -> bool {
-    EXECUTION_GUARD.with(|guard| guard.borrow().is_some())
-}
-
-impl Drop for MetalExecutionGuard {
-    fn drop(&mut self) {
-        EXPLICIT_EXECUTION_DEPTH.with(|depth| {
-            let next = depth.get().saturating_sub(1);
-            depth.set(next);
-            if next == 0 {
-                EXECUTION_GUARD.with(|guard| {
-                    guard.borrow_mut().take();
-                });
-            }
-        });
-    }
-}
-
-struct AutomaticExecutionRelease;
-
-impl Drop for AutomaticExecutionRelease {
-    fn drop(&mut self) {
-        release_automatic_execution();
-    }
-}
+static SUBMISSION_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static DEVICE_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 #[cfg(test)]
 thread_local! {
@@ -117,6 +34,18 @@ thread_local! {
 #[cfg(test)]
 pub fn inject_prior_command_buffer_failure_for_test() {
     INJECTED_PRIOR_FAILURE.with(|failure| failure.set(true));
+}
+
+#[cfg(test)]
+fn take_injected_failure() -> crate::err::Res<()> {
+    if INJECTED_PRIOR_FAILURE.with(|failure| failure.replace(false)) {
+        Err(
+            "metal: 1 GPU command buffer failure(s) (#test: injected prior failure); GPU work was lost"
+                .to_string(),
+        )
+    } else {
+        Ok(())
+    }
 }
 
 // Bytes of driver-allocated root buffers currently alive (pool, workspace,
@@ -135,17 +64,35 @@ fn memory_cap() -> Option<usize> {
     })
 }
 
+fn try_live_bytes_track(size: usize) -> Result<(), String> {
+    let cap = memory_cap();
+    LIVE_BYTES
+        .fetch_update(
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Relaxed,
+            |live| {
+                let next = live.checked_add(size)?;
+                (!cap.is_some_and(|cap| next > cap)).then_some(next)
+            },
+        )
+        .map(|_| ())
+        .map_err(|live| {
+            let requested = live.saturating_add(size);
+            match cap {
+                Some(cap) => format!(
+                    "metal: memory cap exceeded - {} MB requested live, cap {} MB (EFFECT_TORCH_MEMORY_CAP_MB)",
+                    requested >> 20,
+                    cap >> 20
+                ),
+                None => "metal: live-byte accounting overflow".to_string(),
+            }
+        })
+}
+
 fn live_bytes_track(size: usize) {
-    let live = LIVE_BYTES.fetch_add(size, std::sync::atomic::Ordering::Relaxed) + size;
-    if let Some(cap) = memory_cap() {
-        if live > cap {
-            MetalDevice::get().dump_live_bytes();
-            panic!(
-                "metal: memory cap exceeded — {} MB live, cap {} MB (EFFECT_TORCH_MEMORY_CAP_MB)",
-                live >> 20,
-                cap >> 20
-            );
-        }
+    if let Err(error) = try_live_bytes_track(size) {
+        MetalDevice::get().dump_live_bytes();
+        panic!("{error}");
     }
 }
 
@@ -204,6 +151,133 @@ pub fn dispatch_stats_reset() -> (u64, u64, u64) {
     (d, s, n)
 }
 const SWEEP_MS: u64 = 100;
+pub(crate) type BufferRetention = Arc<dyn Send + Sync>;
+
+struct BufferUsage {
+    // Keeps the physical allocation alive after its last Buffer wrapper drops
+    // but while an encoded command buffer can still access it.
+    _raw: Retained<ProtocolObject<dyn MTLBuffer>>,
+    tracked_size: Option<usize>,
+    pending_or_in_flight: std::sync::atomic::AtomicUsize,
+    producer: Mutex<Option<Weak<SubmissionContext>>>,
+    producer_failure: Mutex<Option<String>>,
+}
+
+impl BufferUsage {
+    fn new(raw: &Retained<ProtocolObject<dyn MTLBuffer>>, tracked_size: Option<usize>) -> Self {
+        Self {
+            _raw: raw.clone(),
+            tracked_size,
+            pending_or_in_flight: std::sync::atomic::AtomicUsize::new(0),
+            producer: Mutex::new(None),
+            producer_failure: Mutex::new(None),
+        }
+    }
+
+    fn in_use(&self) -> bool {
+        self.pending_or_in_flight
+            .load(std::sync::atomic::Ordering::Acquire)
+            > 0
+    }
+
+    fn set_producer(&self, producer: &Arc<SubmissionContext>) {
+        self.producer_failure
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take();
+        *self
+            .producer
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(Arc::downgrade(producer));
+    }
+
+    fn synchronize_producer(
+        &self,
+        consumer: Option<&Arc<SubmissionContext>>,
+    ) -> crate::err::Res<()> {
+        if let Some(error) = self
+            .producer_failure
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone()
+        {
+            return Err(error);
+        }
+        let producer = self
+            .producer
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .as_ref()
+            .and_then(Weak::upgrade);
+        let Some(producer) = producer else {
+            return Ok(());
+        };
+        if consumer.is_some_and(|consumer| Arc::ptr_eq(consumer, &producer)) {
+            return Ok(());
+        }
+        let result = if producer.has_pending_work() {
+            producer.synchronize()
+        } else {
+            Ok(())
+        };
+        self.complete_producer(producer.as_ref(), &result);
+        result
+    }
+
+    fn complete_producer(&self, producer: &SubmissionContext, result: &crate::err::Res<()>) {
+        let mut current = self
+            .producer
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if current
+            .as_ref()
+            .and_then(Weak::upgrade)
+            .is_some_and(|current| std::ptr::eq(current.as_ref(), producer))
+        {
+            if let Err(error) = result {
+                *self
+                    .producer_failure
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner()) = Some(error.clone());
+            }
+            current.take();
+        }
+    }
+}
+
+impl Drop for BufferUsage {
+    fn drop(&mut self) {
+        if let Some(size) = self.tracked_size {
+            live_bytes_untrack(size);
+        }
+    }
+}
+
+struct BufferUse {
+    usage: Arc<BufferUsage>,
+    _retention: Option<BufferRetention>,
+}
+
+impl BufferUse {
+    fn new(buffer: &Buffer) -> Self {
+        buffer
+            .usage
+            .pending_or_in_flight
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        Self {
+            usage: buffer.usage.clone(),
+            _retention: buffer._retention.clone(),
+        }
+    }
+}
+
+impl Drop for BufferUse {
+    fn drop(&mut self) {
+        self.usage
+            .pending_or_in_flight
+            .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+    }
+}
 
 pub struct Buffer {
     raw: Retained<ProtocolObject<dyn MTLBuffer>>,
@@ -211,38 +285,43 @@ pub struct Buffer {
     // Byte offset of this buffer's start within `raw`; planned slices share
     // one underlying MTLBuffer.
     pub base: usize,
-    // Whether this handle owns driver memory or retains a segment root.
-    counted: bool,
+    // Shared by every view of one physical allocation.
+    usage: Arc<BufferUsage>,
     _owner: Option<Arc<Buffer>>,
-}
-
-impl Drop for Buffer {
-    fn drop(&mut self) {
-        if self.counted {
-            live_bytes_untrack(self.size);
-        }
-    }
+    _retention: Option<BufferRetention>,
 }
 
 impl Buffer {
     pub fn from_raw(raw: Retained<ProtocolObject<dyn MTLBuffer>>, size: usize) -> Self {
+        let usage = Arc::new(BufferUsage::new(&raw, None));
         Buffer {
             raw,
             size,
             base: 0,
-            counted: false,
+            usage,
             _owner: None,
+            _retention: None,
         }
     }
 
     pub fn suballoc(segment: &Arc<Buffer>, base: usize, size: usize) -> Self {
+        Self::suballoc_with_retention(segment, base, size, segment._retention.clone())
+    }
+
+    pub(crate) fn suballoc_with_retention(
+        segment: &Arc<Buffer>,
+        base: usize,
+        size: usize,
+        retention: Option<BufferRetention>,
+    ) -> Self {
         assert!(base + size <= segment.size);
         Buffer {
             raw: segment.raw.clone(),
             size,
             base: segment.base + base,
-            counted: false,
+            usage: segment.usage.clone(),
             _owner: Some(segment.clone()),
+            _retention: retention,
         }
     }
 
@@ -261,6 +340,21 @@ impl Buffer {
         &self.raw
     }
 
+    fn in_use(&self) -> bool {
+        self.usage.in_use()
+    }
+
+    fn set_producer(&self, producer: &Arc<SubmissionContext>) {
+        self.usage.set_producer(producer);
+    }
+
+    fn synchronize_producer(
+        &self,
+        consumer: Option<&Arc<SubmissionContext>>,
+    ) -> crate::err::Res<()> {
+        self.usage.synchronize_producer(consumer)
+    }
+
     pub fn read_f32(&self, offset_elems: usize, n: usize) -> Vec<f32> {
         assert!(offset_elems * 4 + n * 4 <= self.size);
         let ptr = unsafe { self.contents_ptr().cast::<f32>().add(offset_elems) };
@@ -271,6 +365,30 @@ impl Buffer {
         assert!(offset_elems * 4 + data.len() * 4 <= self.size);
         let ptr = unsafe { self.contents_ptr().cast::<f32>().add(offset_elems) };
         unsafe { std::ptr::copy_nonoverlapping(data.as_ptr(), ptr, data.len()) };
+    }
+}
+
+#[derive(Default)]
+struct CommandBufferReferences {
+    uses: HashMap<usize, BufferUse>,
+    referenced_bytes: usize,
+}
+
+impl CommandBufferReferences {
+    fn track(&mut self, buffer: &Buffer) {
+        let key = Arc::as_ptr(&buffer.usage) as usize;
+        if self.uses.contains_key(&key) {
+            return;
+        }
+        self.referenced_bytes = self
+            .referenced_bytes
+            .saturating_add(buffer.usage.tracked_size.unwrap_or(0));
+        self.uses.insert(key, BufferUse::new(buffer));
+    }
+
+    fn take(&mut self) -> Vec<BufferUse> {
+        self.referenced_bytes = 0;
+        std::mem::take(&mut self.uses).into_values().collect()
     }
 }
 
@@ -300,11 +418,9 @@ impl Allocator {
         }
     }
 
-    // Buffers whose only reference is the bucket's may still be read by
-    // in-flight GPU dispatches (the serial encoder orders execution, not
-    // completion). The caller moves them to the device's retire list instead
-    // of deallocating; they are released at the next synchronize, when the
-    // GPU is drained.
+    // Buffers whose only host reference is the bucket's may still be read by
+    // pending GPU dispatches. Busy roots remain cached; idle roots move to the
+    // device retire list and can be released by the next completion boundary.
     fn sweep(&mut self, retired: &mut Vec<Arc<Buffer>>) {
         if self.last_sweep.elapsed() < std::time::Duration::from_millis(SWEEP_MS) {
             return;
@@ -312,7 +428,7 @@ impl Allocator {
         self.last_sweep = std::time::Instant::now();
         for bucket in self.buckets.values_mut() {
             bucket.retain(|b| {
-                if Arc::strong_count(b) > 1 {
+                if Arc::strong_count(b) > 1 || b.in_use() {
                     true
                 } else {
                     retired.push(b.clone());
@@ -349,11 +465,16 @@ struct EncoderManager {
     in_flight: Vec<(
         u64,
         Retained<ProtocolObject<dyn MTLCommandBuffer>>,
-        Vec<Arc<Buffer>>,
+        CommandBufferResources,
     )>,
     // Failures survive mid-step reaping and backpressure waits. They are
     // consumed only after synchronize has drained every submitted buffer.
     failures: Vec<(u64, String)>,
+}
+
+struct CommandBufferResources {
+    _retired: Vec<Arc<Buffer>>,
+    _uses: Vec<BufferUse>,
 }
 
 impl EncoderManager {
@@ -436,7 +557,12 @@ impl EncoderManager {
         }
     }
 
-    fn finish_dispatch(&mut self, retired: &mut Vec<Arc<Buffer>>, allow_automatic_commit: bool) {
+    fn finish_dispatch(
+        &mut self,
+        references: &mut CommandBufferReferences,
+        retired: &mut Vec<Arc<Buffer>>,
+        allow_automatic_commit: bool,
+    ) {
         // Untracked hazards: without a barrier, Metal may overlap adjacent
         // compute dispatches in the same command buffer. Our allocator
         // recycles buffers across dispatches, so every dispatch must be
@@ -447,32 +573,50 @@ impl EncoderManager {
         self.count += 1;
         DISPATCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if allow_automatic_commit
-            && (self.count >= DISPATCHES_PER_BUFFER || cb_referenced_bytes() >= CB_REF_BYTES)
+            && (self.count >= DISPATCHES_PER_BUFFER || references.referenced_bytes >= CB_REF_BYTES)
         {
-            self.commit(retired);
+            self.commit(references, retired);
         }
     }
 
-    fn commit(&mut self, retired: &mut Vec<Arc<Buffer>>) {
+    fn commit(&mut self, references: &mut CommandBufferReferences, retired: &mut Vec<Arc<Buffer>>) {
         if let Some((cb, encoder)) = self.current.take() {
             encoder.endEncoding();
             self.order_value += 1;
             cb.encodeSignalEvent_value(&self.order_event, self.order_value);
             cb.commit();
-            self.in_flight
-                .push((self.order_value, cb, std::mem::take(retired)));
+            let sequence = SUBMISSION_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+            self.in_flight.push((
+                sequence,
+                cb,
+                CommandBufferResources {
+                    _retired: std::mem::take(retired),
+                    _uses: references.take(),
+                },
+            ));
             self.count = 0;
-            cb_refs_reset();
         }
     }
 
-    fn synchronize(&mut self, retired: &mut Vec<Arc<Buffer>>) -> crate::err::Res<()> {
-        self.commit(retired);
+    fn synchronize(
+        &mut self,
+        references: &mut CommandBufferReferences,
+        retired: &mut Vec<Arc<Buffer>>,
+    ) -> crate::err::Res<()> {
+        self.commit(references, retired);
         while !self.in_flight.is_empty() {
             self.in_flight[0].1.waitUntilCompleted();
             self.reap_completed();
         }
         command_buffer_result(std::mem::take(&mut self.failures))
+    }
+
+    fn has_pending_work(&self) -> bool {
+        self.current.is_some() || !self.in_flight.is_empty() || !self.failures.is_empty()
+    }
+
+    fn oldest_submission(&self) -> Option<u64> {
+        self.in_flight.first().map(|(sequence, _, _)| *sequence)
     }
 }
 
@@ -491,21 +635,266 @@ fn command_buffer_result(failures: Vec<(u64, String)>) -> crate::err::Res<()> {
     ))
 }
 
-pub struct MetalDevice {
-    raw: Retained<ProtocolObject<dyn MTLDevice>>,
-    allocator: Mutex<Allocator>,
-    encoder: Mutex<EncoderManager>,
-    pipelines: Mutex<HashMap<u64, Pipeline>>,
+struct SubmissionContext {
+    device_id: u64,
+    manager: Mutex<EncoderManager>,
+    references: Mutex<CommandBufferReferences>,
     retired: Mutex<Vec<Arc<Buffer>>>,
+    failure: Mutex<Option<String>>,
+    writes: Mutex<HashMap<usize, Weak<BufferUsage>>>,
 }
 
-// Metal command queues serialize command buffer execution; our encoder
-// manager additionally holds a mutex for the entire encode session.
-// Buffers/pipelines are immutable after creation.
+impl SubmissionContext {
+    fn new(device_id: u64, manager: EncoderManager) -> Self {
+        Self {
+            device_id,
+            manager: Mutex::new(manager),
+            references: Mutex::new(CommandBufferReferences::default()),
+            retired: Mutex::new(Vec::new()),
+            failure: Mutex::new(None),
+            writes: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn with_encoder<R>(
+        self: &Arc<Self>,
+        allow_automatic_commit: bool,
+        f: impl FnOnce(&ProtocolObject<dyn MTLComputeCommandEncoder>) -> R,
+    ) -> R {
+        if let Some(error) = self
+            .failure
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone()
+        {
+            panic!("Metal submission already failed: {error}");
+        }
+        let mut manager = self
+            .manager
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        manager.ensure_encoder();
+        let encoder = &manager.current.as_ref().expect("encoder was created").1;
+        let _encoding_guard = EncodingContextGuard::enter(self.clone());
+        let out = f(encoder);
+        let mut references = self
+            .references
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let mut retired = self
+            .retired
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        manager.finish_dispatch(&mut references, &mut retired, allow_automatic_commit);
+        out
+    }
+
+    fn commit(&self) {
+        let mut manager = self
+            .manager
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let mut references = self
+            .references
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let mut retired = self
+            .retired
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        manager.commit(&mut references, &mut retired);
+    }
+
+    fn synchronize(&self) -> crate::err::Res<()> {
+        if let Some(error) = self
+            .failure
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone()
+        {
+            let result = Err(error);
+            self.publish_writes(&result);
+            return result;
+        }
+        let mut manager = self
+            .manager
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let mut references = self
+            .references
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let mut retired = self
+            .retired
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let result = manager.synchronize(&mut references, &mut retired);
+        // Anything retired after the last commit rides no command buffer; the
+        // context is drained, so it is safe to drop now.
+        retired.clear();
+        if let Err(error) = &result {
+            *self
+                .failure
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner()) = Some(error.clone());
+        }
+        self.publish_writes(&result);
+        result
+    }
+
+    fn has_pending_work(&self) -> bool {
+        let manager = self
+            .manager
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        manager.has_pending_work()
+            || self
+                .failure
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .is_some()
+            || !self
+                .references
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .uses
+                .is_empty()
+            || !self
+                .retired
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .is_empty()
+    }
+
+    fn reap_completed(&self) {
+        self.manager
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .reap_completed();
+    }
+
+    fn wait_oldest(&self) -> bool {
+        self.manager
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .wait_oldest()
+    }
+
+    fn oldest_submission(&self) -> Option<u64> {
+        self.manager
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .oldest_submission()
+    }
+
+    fn track_write(&self, usage: &Arc<BufferUsage>) {
+        self.writes
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .insert(Arc::as_ptr(usage) as usize, Arc::downgrade(usage));
+    }
+
+    fn publish_writes(&self, result: &crate::err::Res<()>) {
+        let writes = std::mem::take(
+            &mut *self
+                .writes
+                .lock()
+                .unwrap_or_else(|error| error.into_inner()),
+        );
+        for usage in writes.into_values().filter_map(|usage| usage.upgrade()) {
+            usage.complete_producer(self, result);
+        }
+    }
+}
+
+impl Drop for SubmissionContext {
+    fn drop(&mut self) {
+        let result = {
+            let manager = self
+                .manager
+                .get_mut()
+                .unwrap_or_else(|error| error.into_inner());
+            let references = self
+                .references
+                .get_mut()
+                .unwrap_or_else(|error| error.into_inner());
+            let retired = self
+                .retired
+                .get_mut()
+                .unwrap_or_else(|error| error.into_inner());
+            let result = manager.synchronize(references, retired);
+            retired.clear();
+            result
+        };
+        self.publish_writes(&result);
+    }
+}
+
+// Metal command queues, command buffers, and encoders are thread-safe at the
+// API boundary. Each manager is mutex-confined and each encoder is used by one
+// host thread at a time.
+unsafe impl Send for SubmissionContext {}
+unsafe impl Sync for SubmissionContext {}
+
+thread_local! {
+    static ACTIVE_SUBMISSIONS: RefCell<Vec<Arc<SubmissionContext>>> = const { RefCell::new(Vec::new()) };
+    static IMPLICIT_SUBMISSIONS: RefCell<HashMap<u64, Arc<SubmissionContext>>> = RefCell::new(HashMap::new());
+    static ENCODING_SUBMISSIONS: RefCell<Vec<Arc<SubmissionContext>>> = const { RefCell::new(Vec::new()) };
+}
+
+struct EncodingContextGuard;
+
+impl EncodingContextGuard {
+    fn enter(context: Arc<SubmissionContext>) -> Self {
+        ENCODING_SUBMISSIONS.with(|contexts| contexts.borrow_mut().push(context));
+        Self
+    }
+}
+
+impl Drop for EncodingContextGuard {
+    fn drop(&mut self) {
+        ENCODING_SUBMISSIONS.with(|contexts| {
+            contexts.borrow_mut().pop();
+        });
+    }
+}
+
+pub(crate) struct MetalSubmissionGuard<'a> {
+    device: &'a MetalDevice,
+    context: Arc<SubmissionContext>,
+}
+
+impl Drop for MetalSubmissionGuard<'_> {
+    fn drop(&mut self) {
+        if self.context.has_pending_work() {
+            let _ = self.context.synchronize();
+        }
+        ACTIVE_SUBMISSIONS.with(|contexts| {
+            let popped = contexts.borrow_mut().pop();
+            debug_assert!(popped.is_some_and(|context| Arc::ptr_eq(&context, &self.context)));
+        });
+        debug_assert_eq!(self.context.device_id, self.device.device_id());
+    }
+}
+
+pub struct MetalDevice {
+    id: u64,
+    raw: Retained<ProtocolObject<dyn MTLDevice>>,
+    queue: Retained<ProtocolObject<dyn MTLCommandQueue>>,
+    allocator: Mutex<Allocator>,
+    pipelines: Mutex<HashMap<u64, Pipeline>>,
+    retired: Mutex<Vec<Arc<Buffer>>>,
+    submissions: Mutex<Vec<Weak<SubmissionContext>>>,
+}
+
+// Buffers/pipelines are immutable after creation. Submission contexts isolate
+// command streams and failures while sharing one thread-safe command queue.
 unsafe impl Send for MetalDevice {}
 unsafe impl Sync for MetalDevice {}
 unsafe impl Send for Buffer {}
 unsafe impl Sync for Buffer {}
+unsafe impl Send for BufferUsage {}
+unsafe impl Sync for BufferUsage {}
 
 static SHARED_OPTIONS: MTLResourceOptions = MTLResourceOptions(
     MTLResourceOptions::StorageModeShared.0 | MTLResourceOptions::HazardTrackingModeUntracked.0,
@@ -615,13 +1004,14 @@ impl MetalDevice {
         let queue = raw
             .newCommandQueue()
             .ok_or("failed to create command queue")?;
-        let encoder = EncoderManager::new(queue, &raw);
         Ok(MetalDevice {
+            id: DEVICE_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             raw,
+            queue,
             allocator: Mutex::new(Allocator::new()),
-            encoder: Mutex::new(encoder),
             pipelines: Mutex::new(HashMap::new()),
             retired: Mutex::new(Vec::new()),
+            submissions: Mutex::new(Vec::new()),
         })
     }
 
@@ -629,17 +1019,110 @@ impl MetalDevice {
         &self.raw
     }
 
-    // See memory_budget: stalls the encoder only when the driver's own
-    // allocation counter passes the budget, by waiting on the oldest
-    // in-flight command buffer so the driver reclaims what it has
-    // finished with. currentAllocatedSize sees everything the driver
-    // holds (including what LIVE_BYTES does not). Lock order is
-    // encoder -> allocator -> retired, matching synchronize.
+    fn device_id(&self) -> u64 {
+        self.id
+    }
+
+    fn new_submission_context(&self) -> Arc<SubmissionContext> {
+        let context = Arc::new(SubmissionContext::new(
+            self.device_id(),
+            EncoderManager::new(self.queue.clone(), &self.raw),
+        ));
+        let mut submissions = self
+            .submissions
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        submissions.retain(|submission| submission.strong_count() > 0);
+        submissions.push(Arc::downgrade(&context));
+        context
+    }
+
+    fn active_submission(&self) -> Option<Arc<SubmissionContext>> {
+        ACTIVE_SUBMISSIONS.with(|contexts| {
+            contexts
+                .borrow()
+                .iter()
+                .rev()
+                .find(|context| context.device_id == self.device_id())
+                .cloned()
+        })
+    }
+
+    fn implicit_submission(&self) -> Arc<SubmissionContext> {
+        IMPLICIT_SUBMISSIONS.with(|contexts| {
+            let mut contexts = contexts.borrow_mut();
+            contexts
+                .entry(self.device_id())
+                .or_insert_with(|| self.new_submission_context())
+                .clone()
+        })
+    }
+
+    fn existing_implicit_submission(&self) -> Option<Arc<SubmissionContext>> {
+        IMPLICIT_SUBMISSIONS.with(|contexts| contexts.borrow().get(&self.device_id()).cloned())
+    }
+
+    fn remove_implicit_submission(&self) {
+        IMPLICIT_SUBMISSIONS.with(|contexts| {
+            contexts.borrow_mut().remove(&self.device_id());
+        });
+    }
+
+    fn dispatch_submission(&self) -> Arc<SubmissionContext> {
+        self.active_submission()
+            .unwrap_or_else(|| self.implicit_submission())
+    }
+
+    pub(crate) fn begin_submission(&self) -> Result<MetalSubmissionGuard<'_>, String> {
+        if self.active_submission().is_some() {
+            return Err("nested Metal submission is not supported".to_string());
+        }
+        if self
+            .existing_implicit_submission()
+            .is_some_and(|context| context.has_pending_work())
+        {
+            self.synchronize()?;
+        }
+        #[cfg(test)]
+        take_injected_failure()?;
+        let context = self.new_submission_context();
+        ACTIVE_SUBMISSIONS.with(|contexts| contexts.borrow_mut().push(context.clone()));
+        Ok(MetalSubmissionGuard {
+            device: self,
+            context,
+        })
+    }
+
+    fn submission_snapshot(&self) -> Vec<Arc<SubmissionContext>> {
+        let mut submissions = self
+            .submissions
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let mut live = Vec::with_capacity(submissions.len());
+        submissions.retain(|submission| {
+            if let Some(submission) = submission.upgrade() {
+                live.push(submission);
+                true
+            } else {
+                false
+            }
+        });
+        live
+    }
+
+    // See memory_budget: commit the caller's pending stream, then wait on the
+    // globally oldest submitted context until the driver falls below budget.
+    // The registry is snapshotted before waiting; no device allocator lock is
+    // held while a command buffer completes.
     fn backpressure(&self) {
         if self.raw.currentAllocatedSize() <= memory_budget() {
             return;
         }
-        let mut manager = self.encoder.lock().unwrap();
+        let contexts = self.submission_snapshot();
+        for context in &contexts {
+            context.commit();
+            context.reap_completed();
+        }
         {
             let mut alloc = self.allocator.lock().unwrap();
             let mut retired = self.retired.lock().unwrap();
@@ -648,7 +1131,7 @@ impl MetalDevice {
                     continue;
                 }
                 bucket.retain(|b| {
-                    if Arc::strong_count(b) == 1 {
+                    if Arc::strong_count(b) == 1 && !b.in_use() {
                         retired.push(b.clone());
                         false
                     } else {
@@ -657,7 +1140,6 @@ impl MetalDevice {
                 });
             }
         }
-        manager.reap_completed();
         if std::env::var_os("EFFECT_TORCH_SYNC_TRACE").is_some() {
             eprintln!(
                 "[sync] backpressure at {} MB driver-allocated (budget {} MB)",
@@ -666,7 +1148,19 @@ impl MetalDevice {
             );
         }
         while self.raw.currentAllocatedSize() > memory_budget() {
-            if !manager.wait_oldest() {
+            let Some(context) = contexts
+                .iter()
+                .filter_map(|context| {
+                    context
+                        .oldest_submission()
+                        .map(|sequence| (sequence, context))
+                })
+                .min_by_key(|(sequence, _)| *sequence)
+                .map(|(_, context)| context)
+            else {
+                break;
+            };
+            if !context.wait_oldest() {
                 break;
             }
         }
@@ -697,7 +1191,7 @@ impl MetalDevice {
         if !bucket.is_empty() {
             for k in 0..PROBES {
                 let idx = cursor.wrapping_add(k) % bucket.len();
-                if Arc::strong_count(&bucket[idx]) == 1 {
+                if Arc::strong_count(&bucket[idx]) == 1 && !bucket[idx].in_use() {
                     let buffer = bucket.swap_remove(idx);
                     return buffer;
                 }
@@ -712,18 +1206,18 @@ impl MetalDevice {
             SHARED_OPTIONS
         };
         live_bytes_track(bucket_size);
-        let raw = self
-            .raw
-            .newBufferWithLength_options(bucket_size, options)
-            .expect("metal buffer allocation failed");
-        #[cfg(test)]
-        record_test_device_buffer_allocation();
+        let Some(raw) = self.raw.newBufferWithLength_options(bucket_size, options) else {
+            live_bytes_untrack(bucket_size);
+            panic!("metal buffer allocation failed");
+        };
+        let usage = Arc::new(BufferUsage::new(&raw, Some(bucket_size)));
         let buffer = Arc::new(Buffer {
             raw,
             size: bucket_size,
             base: 0,
-            counted: true,
+            usage,
             _owner: None,
+            _retention: None,
         });
         if bucket.len() < MAX_BUCKET {
             bucket.push(buffer.clone());
@@ -740,7 +1234,7 @@ impl MetalDevice {
     pub fn alloc_raw_checked(&self, size: usize) -> Result<Arc<Buffer>, String> {
         self.reject_executable_allocation("alloc_raw_checked");
         self.backpressure();
-        live_bytes_track(size.max(1));
+        try_live_bytes_track(size.max(1))?;
         let Some(raw) = self
             .raw
             .newBufferWithLength_options(size.max(1), SHARED_OPTIONS)
@@ -752,14 +1246,14 @@ impl MetalDevice {
                 self.raw.recommendedMaxWorkingSetSize()
             ));
         };
-        #[cfg(test)]
-        record_test_device_buffer_allocation();
+        let usage = Arc::new(BufferUsage::new(&raw, Some(size.max(1))));
         Ok(Arc::new(Buffer {
             raw,
             size: size.max(1),
             base: 0,
-            counted: true,
+            usage,
             _owner: None,
+            _retention: None,
         }))
     }
 
@@ -783,23 +1277,25 @@ impl MetalDevice {
         // are never pooled, so bucketing buys nothing.
         let size = data.len().max(1);
         live_bytes_track(size);
-        let raw = unsafe {
+        let Some(raw) = (unsafe {
             self.raw.newBufferWithBytes_length_options(
                 NonNull::new(data.as_ptr() as *const std::ffi::c_void as *mut std::ffi::c_void)
                     .unwrap(),
                 size,
                 SHARED_OPTIONS,
             )
-        }
-        .expect("metal buffer allocation failed");
-        #[cfg(test)]
-        record_test_device_buffer_allocation();
+        }) else {
+            live_bytes_untrack(size);
+            panic!("metal buffer allocation failed");
+        };
+        let usage = Arc::new(BufferUsage::new(&raw, Some(size)));
         let buffer = Arc::new(Buffer {
             raw,
             size,
             base: 0,
-            counted: true,
+            usage,
             _owner: None,
+            _retention: None,
         });
         // Host uploads retire only at the next synchronize. Uploads are
         // NEVER pooled: the only strong refs are the caller's and this
@@ -879,19 +1375,13 @@ impl MetalDevice {
         &self,
         f: impl FnOnce(&ProtocolObject<dyn MTLComputeCommandEncoder>) -> R,
     ) -> R {
-        claim_execution();
         let allow_automatic_commit = !self.executable_dispatch_active();
-        let mut manager = self.encoder.lock().unwrap();
-        manager.ensure_encoder();
-        let encoder = &manager.current.as_ref().unwrap().1;
-        let out = f(encoder);
-        manager.finish_dispatch(&mut self.retired.lock().unwrap(), allow_automatic_commit);
-        out
+        self.dispatch_submission()
+            .with_encoder(allow_automatic_commit, f)
     }
 
     pub(crate) fn commit_executable_command(&self) {
-        let mut manager = self.encoder.lock().unwrap();
-        manager.commit(&mut self.retired.lock().unwrap());
+        self.dispatch_submission().commit();
     }
 
     pub(crate) fn begin_executable_dispatch(&self) -> Result<ExecutableDispatchGuard, String> {
@@ -918,25 +1408,21 @@ impl MetalDevice {
 
     #[track_caller]
     pub fn synchronize(&self) -> crate::err::Res<()> {
-        claim_execution();
-        let _release = AutomaticExecutionRelease;
         let t = std::time::Instant::now();
         if std::env::var_os("EFFECT_TORCH_SYNC_TRACE").is_some() {
             eprintln!("[sync] {}", std::panic::Location::caller());
         }
-        {
-            let mut manager = self.encoder.lock().unwrap();
-            let mut retired = self.retired.lock().unwrap();
-            manager.synchronize(&mut retired)?;
-            // Anything retired after the last commit rides no command
-            // buffer; the GPU is drained, so it drops here.
-            retired.clear();
+        let active = self.active_submission();
+        let context = active
+            .clone()
+            .or_else(|| self.existing_implicit_submission());
+        let submission_result = context.map_or(Ok(()), |context| context.synchronize());
+        if active.is_none() {
+            self.remove_implicit_submission();
         }
-        // The GPU has consumed everything submitted so far; retired
-        // uploads may return to the pool. Dead buckets at or above 1 MB
-        // are released too; planned workspace owns executable working sets,
-        // so the dynamic pool must not accumulate dead giants across
-        // phases; small buckets stay for cheap reuse.
+        submission_result?;
+        // This context has consumed its resources. Busy roots owned by another
+        // context remain protected by their BufferUsage tokens.
         {
             let mut alloc = self.allocator.lock().unwrap();
             let mut retired = self.retired.lock().unwrap();
@@ -945,7 +1431,7 @@ impl MetalDevice {
                     continue;
                 }
                 bucket.retain(|b| {
-                    if Arc::strong_count(b) == 1 {
+                    if Arc::strong_count(b) == 1 && !b.in_use() {
                         retired.push(b.clone());
                         false
                     } else {
@@ -961,12 +1447,31 @@ impl MetalDevice {
             std::sync::atomic::Ordering::Relaxed,
         );
         #[cfg(test)]
-        if INJECTED_PRIOR_FAILURE.with(|failure| failure.replace(false)) {
-            return Err(
-                "metal: 1 GPU command buffer failure(s) (#test: injected prior failure); GPU work was lost"
-                    .to_string(),
-            );
-        }
+        take_injected_failure()?;
+        Ok(())
+    }
+
+    #[track_caller]
+    pub(crate) fn synchronize_buffer(&self, buffer: &Buffer) -> crate::err::Res<()> {
+        let consumer = self
+            .active_submission()
+            .or_else(|| self.existing_implicit_submission());
+        buffer.synchronize_producer(consumer.as_ref())?;
+        self.synchronize()
+    }
+
+    pub(crate) fn synchronize_buffer_producer(&self, buffer: &Buffer) -> crate::err::Res<()> {
+        let consumer = self
+            .active_submission()
+            .or_else(|| self.existing_implicit_submission());
+        buffer.synchronize_producer(consumer.as_ref())
+    }
+
+    pub(crate) fn mark_buffer_write(&self, buffer: &Buffer) -> crate::err::Res<()> {
+        let producer = self.dispatch_submission();
+        buffer.synchronize_producer(Some(&producer))?;
+        buffer.set_producer(&producer);
+        producer.track_write(&buffer.usage);
         Ok(())
     }
 
@@ -978,7 +1483,10 @@ impl MetalDevice {
         let mut rows: Vec<(usize, usize, usize)> = Vec::new();
         if let Ok(alloc) = self.allocator.try_lock() {
             for (bucket_size, bucket) in alloc.buckets.iter() {
-                let live = bucket.iter().filter(|b| Arc::strong_count(b) > 1).count();
+                let live = bucket
+                    .iter()
+                    .filter(|b| Arc::strong_count(b) > 1 || b.in_use())
+                    .count();
                 let dead = bucket.len() - live;
                 if live + dead > 0 {
                     rows.push((*bucket_size, live, dead));
@@ -1035,48 +1543,25 @@ pub fn set_buffer(
     buffer: &Buffer,
     offset: usize,
 ) {
+    let context = ENCODING_SUBMISSIONS.with(|contexts| {
+        contexts
+            .borrow()
+            .last()
+            .cloned()
+            .expect("set_buffer must be called from MetalDevice::with_encoder")
+    });
     unsafe { encoder.setBuffer_offset_atIndex(Some(buffer.as_raw()), buffer.base + offset, index) };
-    cb_track(buffer);
+    context
+        .references
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .track(buffer);
 }
 
-// Per-command-buffer referenced-bytes accounting (RFC 0016): a command
-// buffer retains every buffer its dispatches reference until it
-// completes, so one 4096-dispatch buffer can pin tens of GB that no
-// amount of waiting on OLDER buffers reclaims. finish_dispatch commits
-// early once the current buffer references CB_REF_BYTES of distinct
-// pool memory. Arena views and externally wrapped buffers (counted ==
-// false) are skipped because their root is accounted elsewhere.
-thread_local! {
-    static CB_REFS: std::cell::RefCell<(std::collections::HashSet<u64>, usize)> =
-        std::cell::RefCell::new((std::collections::HashSet::new(), 0));
-}
-
+// A command buffer retains unique physical-storage usage tokens until it
+// completes. Besides driving byte-budgeted commits, these tokens prevent the
+// dynamic allocator from recycling an eager intermediate across contexts.
 const CB_REF_BYTES: usize = 4 << 30;
-
-fn cb_track(buffer: &Buffer) {
-    if !buffer.counted {
-        return;
-    }
-    let addr = buffer.as_raw().gpuAddress();
-    CB_REFS.with(|c| {
-        let mut c = c.borrow_mut();
-        if c.0.insert(addr) {
-            c.1 += buffer.size;
-        }
-    });
-}
-
-fn cb_referenced_bytes() -> usize {
-    CB_REFS.with(|c| c.borrow().1)
-}
-
-fn cb_refs_reset() {
-    CB_REFS.with(|c| {
-        let mut c = c.borrow_mut();
-        c.0.clear();
-        c.1 = 0;
-    });
-}
 
 pub fn set_bytes<T>(
     encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
@@ -1155,6 +1640,151 @@ mod tests {
     }
 
     #[test]
+    fn implicit_kernel_streams_overlap_and_isolate_failures() {
+        let dev = Arc::new(MetalDevice::new(0).unwrap());
+        dev.compile(0xF111, FILL_SRC, "fill").unwrap();
+        dev.synchronize().unwrap();
+        let encoding = Arc::new(std::sync::Barrier::new(2));
+        let submitted = Arc::new(std::sync::Barrier::new(2));
+        let threads = (0..2)
+            .map(|index| {
+                let dev = dev.clone();
+                let encoding = encoding.clone();
+                let submitted = submitted.clone();
+                std::thread::spawn(move || {
+                    let out = dev.alloc(16, DType::F32);
+                    let pipeline = dev.compile(0xF111, FILL_SRC, "fill").unwrap();
+                    let value = index as f32 + 1.0;
+                    dev.with_encoder(|encoder| {
+                        // Both host threads must own an encoder concurrently;
+                        // a process-wide execution lock deadlocks here.
+                        encoding.wait();
+                        encoder.setComputePipelineState(pipeline.as_raw());
+                        set_buffer(encoder, 0, &out, 0);
+                        set_bytes(encoder, 1, &value);
+                        encoder.dispatchThreads_threadsPerThreadgroup(
+                            MetalDevice::grid(16, 1, 1),
+                            MetalDevice::grid(16, 1, 1),
+                        );
+                    });
+                    submitted.wait();
+                    if index == 0 {
+                        inject_prior_command_buffer_failure_for_test();
+                    }
+                    let result = dev.synchronize();
+                    (result, out.read_f32(0, 16))
+                })
+            })
+            .collect::<Vec<_>>();
+        let mut results = threads
+            .into_iter()
+            .map(|thread| thread.join().unwrap())
+            .collect::<Vec<_>>();
+        assert!(results[0].0.is_err());
+        assert!(results[1].0.is_ok());
+        assert_eq!(results.remove(0).1, vec![1.0; 16]);
+        assert_eq!(results.remove(0).1, vec![2.0; 16]);
+    }
+
+    #[test]
+    fn cross_thread_readback_waits_for_the_eager_producer() {
+        let dev = MetalDevice::get();
+        crate::kernels::compile_fill(dev, &[16], 3.0, DType::F32).unwrap();
+        dev.synchronize().unwrap();
+        let (output_tx, output_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let out = crate::run::MetalTensor {
+            buffer: dev.alloc(16, DType::F32),
+            layout: crate::runtime::layout::Layout::contiguous(vec![16]),
+            dtype: DType::F32,
+        };
+        let worker = std::thread::spawn(move || {
+            let dev = MetalDevice::get();
+            crate::kernels::fill_into(dev, &out, 3.0).unwrap();
+            output_tx.send(out).unwrap();
+            release_rx.recv().unwrap();
+        });
+
+        let out = output_rx.recv().unwrap();
+        dev.synchronize_buffer(&out.buffer).unwrap();
+        assert_eq!(out.buffer.read_f32(0, 16), vec![3.0; 16]);
+        release_tx.send(()).unwrap();
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn allocator_does_not_recycle_a_pending_buffer_across_contexts() {
+        let dev = Arc::new(MetalDevice::new(0).unwrap());
+        dev.compile(0xF111, FILL_SRC, "fill").unwrap();
+        dev.synchronize().unwrap();
+        let pending = Arc::new(std::sync::Barrier::new(2));
+        let release = Arc::new(std::sync::Barrier::new(2));
+        let worker = {
+            let dev = dev.clone();
+            let pending = pending.clone();
+            let release = release.clone();
+            std::thread::spawn(move || {
+                let out = dev.alloc(16, DType::F32);
+                let address = out.contents_ptr() as usize;
+                let pipeline = dev.compile(0xF111, FILL_SRC, "fill").unwrap();
+                dev.with_encoder(|encoder| {
+                    encoder.setComputePipelineState(pipeline.as_raw());
+                    set_buffer(encoder, 0, &out, 0);
+                    set_bytes(encoder, 1, &1.0f32);
+                    encoder.dispatchThreads_threadsPerThreadgroup(
+                        MetalDevice::grid(16, 1, 1),
+                        MetalDevice::grid(16, 1, 1),
+                    );
+                });
+                drop(out);
+                pending.wait();
+                release.wait();
+                dev.synchronize().unwrap();
+                address
+            })
+        };
+        pending.wait();
+        let concurrent = dev.alloc(16, DType::F32);
+        let concurrent_address = concurrent.contents_ptr() as usize;
+        release.wait();
+        let pending_address = worker.join().unwrap();
+        assert_ne!(pending_address, concurrent_address);
+    }
+
+    #[test]
+    fn pending_buffer_use_retains_its_workspace_owner() {
+        let dev = MetalDevice::new(0).unwrap();
+        let root = dev.alloc_raw(16);
+        let retention: BufferRetention = Arc::new(());
+        let weak_retention = Arc::downgrade(&retention);
+        let buffer = Buffer::suballoc_with_retention(&root, 0, 16, Some(retention.clone()));
+        let mut references = CommandBufferReferences::default();
+        references.track(&buffer);
+        drop(buffer);
+        drop(retention);
+
+        assert!(weak_retention.upgrade().is_some());
+        drop(references);
+        assert!(weak_retention.upgrade().is_none());
+    }
+
+    #[test]
+    fn producer_failure_is_visible_to_every_dependent() {
+        let dev = MetalDevice::new(0).unwrap();
+        let producer = dev.new_submission_context();
+        *producer.failure.lock().unwrap() = Some("producer failed".to_string());
+        let buffer = dev.alloc_raw(16);
+        buffer.set_producer(&producer);
+
+        for _ in 0..2 {
+            assert_eq!(
+                buffer.synchronize_producer(None).unwrap_err(),
+                "producer failed"
+            );
+        }
+    }
+
+    #[test]
     fn command_buffer_failures_report_every_submission() {
         let error = command_buffer_result(vec![
             (2, "first failure".to_string()),
@@ -1168,7 +1798,7 @@ mod tests {
     #[test]
     fn uploads_are_live_byte_counted() {
         let upload = MetalDevice::get().upload_bytes(&[1, 2, 3, 4]);
-        assert!(upload.counted);
+        assert_eq!(upload.usage.tracked_size, Some(4));
         MetalDevice::get().synchronize().unwrap();
     }
 

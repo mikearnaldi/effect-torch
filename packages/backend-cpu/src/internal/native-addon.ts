@@ -213,7 +213,6 @@ export interface NativeCompileOptions {
   optimize?: boolean
   allowReducedPrecision?: boolean
   constantWeights?: boolean
-  outputCapacity?: number
 }
 
 /** @internal */
@@ -244,7 +243,6 @@ export interface NativeExecutableDiagnostics {
   pipelineCount: number
   commandCount: number
   synchronizationCount: number
-  outputCapacity: number
   memory: {
     externalBytes: number
     persistentBytes: number

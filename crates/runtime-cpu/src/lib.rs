@@ -14,7 +14,7 @@ pub mod reduce;
 pub mod storage;
 pub mod tensor;
 pub mod value;
-pub mod workspace;
+mod workspace;
 
 pub use storage::{
     CpuElement, CpuSegment, CpuStorage, CpuStorageError, ExecutableAllocationGuard,
@@ -24,10 +24,6 @@ pub use tensor::{
     CpuBuffer, CpuDestination, CpuOperationRequirements, CpuTensorRequirement, Elem, Tensor,
 };
 pub use value::Value;
-pub use workspace::{
-    default_workspace_request, workspace_pool, workspace_request, CpuWorkspaceAllocator,
-    CpuWorkspaceKey, CpuWorkspaceLease, CpuWorkspacePool,
-};
 
 use effect_torch_runtime::{Buffer, DType, DeviceId, Placement, RuntimeIdentity};
 use std::any::Any;

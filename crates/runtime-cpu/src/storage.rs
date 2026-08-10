@@ -10,21 +10,10 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 pub const CPU_STORAGE_ALIGNMENT: usize = 64;
+pub(crate) type CpuStorageRetention = Arc<dyn Send + Sync + std::panic::RefUnwindSafe>;
 
 thread_local! {
     static EXECUTABLE_ALLOCATION_DEPTH: Cell<usize> = const { Cell::new(0) };
-    #[cfg(test)]
-    static TEST_SEGMENT_ALLOCATIONS: Cell<usize> = const { Cell::new(0) };
-}
-
-#[cfg(test)]
-pub(crate) fn reset_test_segment_allocations() {
-    TEST_SEGMENT_ALLOCATIONS.with(|count| count.set(0));
-}
-
-#[cfg(test)]
-pub(crate) fn test_segment_allocations() -> usize {
-    TEST_SEGMENT_ALLOCATIONS.with(Cell::get)
 }
 
 /// Rejects ambient CPU tensor storage allocation on the current executor thread.
@@ -131,8 +120,6 @@ impl CpuSegment {
         // SAFETY: `layout` is valid and the returned allocation is owned by the segment.
         let pointer = NonNull::new(unsafe { alloc_zeroed(layout) })
             .ok_or(CpuStorageError::AllocationFailed { bytes, alignment })?;
-        #[cfg(test)]
-        TEST_SEGMENT_ALLOCATIONS.with(|count| count.set(count.get() + 1));
         Ok(Arc::new(Self {
             pointer,
             capacity: bytes,
@@ -153,7 +140,8 @@ impl CpuSegment {
         self.pointer.as_ptr()
     }
 
-    pub fn view<T: CpuElement>(
+    #[cfg(test)]
+    pub(crate) fn view<T: CpuElement>(
         self: &Arc<Self>,
         byte_offset: usize,
         len: usize,
@@ -207,6 +195,7 @@ cpu_elements!(f32, f64, f16, bf16, u8, u32, i64);
 #[derive(Clone)]
 pub struct CpuStorage<T: CpuElement> {
     owner: Arc<CpuSegment>,
+    retention: Option<CpuStorageRetention>,
     byte_offset: usize,
     len: usize,
     _element: PhantomData<T>,
@@ -217,6 +206,15 @@ impl<T: CpuElement> CpuStorage<T> {
         owner: Arc<CpuSegment>,
         byte_offset: usize,
         len: usize,
+    ) -> Result<Self, CpuStorageError> {
+        Self::from_segment_with_retention(owner, byte_offset, len, None)
+    }
+
+    pub(crate) fn from_segment_with_retention(
+        owner: Arc<CpuSegment>,
+        byte_offset: usize,
+        len: usize,
+        retention: Option<CpuStorageRetention>,
     ) -> Result<Self, CpuStorageError> {
         let byte_len = len
             .checked_mul(std::mem::size_of::<T>())
@@ -241,6 +239,7 @@ impl<T: CpuElement> CpuStorage<T> {
         }
         Ok(Self {
             owner,
+            retention,
             byte_offset,
             len,
             _element: PhantomData,
@@ -264,10 +263,6 @@ impl<T: CpuElement> CpuStorage<T> {
             );
         }
         Ok(storage)
-    }
-
-    pub fn owner(&self) -> &Arc<CpuSegment> {
-        &self.owner
     }
 
     pub fn byte_offset(&self) -> usize {
@@ -332,6 +327,7 @@ impl<T: CpuElement + fmt::Debug> fmt::Debug for CpuStorage<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("CpuStorage")
             .field("owner", &self.owner)
+            .field("retained_lease", &self.retention.is_some())
             .field("byte_offset", &self.byte_offset)
             .field("values", &self.as_slice())
             .finish()

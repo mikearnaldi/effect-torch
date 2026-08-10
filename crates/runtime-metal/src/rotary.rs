@@ -232,6 +232,7 @@ kernel void et_rotary(
         if output_end > output.buffer.size {
             return Err("rotary: output view exceeds its buffer".to_string());
         }
+        MetalDevice::get().mark_buffer_write(&output.buffer)?;
         if resources.staging.len() != 1
             || !resources.status.is_empty()
             || !resources.scratch.is_empty()

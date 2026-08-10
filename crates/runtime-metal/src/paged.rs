@@ -731,6 +731,7 @@ kernel void et_paged_decode(
                 "paged attention: output must be contiguous [{b}, {h}, {c}, {d}]:F32"
             ));
         }
+        MetalDevice::get().mark_buffer_write(&output.buffer)?;
         let pipe = MetalDevice::get()
             .pipeline_cached(attention_key(d, slab_dtype, scale))
             .ok_or_else(|| {

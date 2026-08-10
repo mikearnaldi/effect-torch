@@ -160,8 +160,6 @@ export interface ExecutableCompileOptions {
   readonly precision?: "strict" | "allow-reduced-precision"
   /** Authorizes inference-only constant-weight preparation. */
   readonly constantWeights?: boolean
-  /** Number of live output generations preallocated during compilation. */
-  readonly outputCapacity?: number
 }
 
 /**
@@ -223,6 +221,7 @@ export interface ExecutableMemoryDiagnostics {
   readonly externalBytes: number
   readonly persistentBytes: number
   readonly stateBytes: number
+  /** Logical escaping-output storage required by one invocation. */
   readonly outputBytes: number
   readonly workspaceBytes: number
   readonly transactionBytes: number
@@ -238,8 +237,6 @@ export interface ExecutableDiagnostics {
   readonly pipelineCount: number
   readonly commandCount: number
   readonly synchronizationCount: number
-  /** Maximum live output generations admitted without allocating during execution. */
-  readonly outputCapacity: number
   readonly memory: ExecutableMemoryDiagnostics
 }
 

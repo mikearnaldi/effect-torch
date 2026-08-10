@@ -801,11 +801,11 @@ pub struct InvocationResources {
 }
 ```
 
-With the current process-wide Metal serialization, one compatible segment set
-can serve multiple executables at different times. If concurrent execution is
-introduced, each in-flight invocation acquires an independent instance or an
-event-protected lease. An immutable executable remains concurrently callable;
-workspace is invocation state, not executable state.
+Concurrent Metal execution acquires an independent segment lease and submission
+context for every in-flight invocation. Contexts own their event-ordered command
+buffer chain and completion result while sharing the device command queue. An
+immutable executable remains concurrently callable; workspace and submission
+state belong to the invocation, not the executable.
 
 After submission, resources move into an `InFlightInvocation` retained until
 every backend completion token finishes. Cancellation or a host-side error
@@ -863,13 +863,12 @@ caches them only after backend completion. Donation of an external input is
 deferred until an API can consume/invalidate that handle or the runtime can
 otherwise prove unique ownership and non-aliasing.
 
-`output_capacity` is the compile-time bound on simultaneously live published
-output generations. Compilation allocates every generation and diagnostics
-report the bound. Execution never grows the pool: if all generations remain
-owned by returned tensor handles, it fails with a typed capacity error. Native
-structural-cache hits reuse immutable lowering while constructing an independent
-preallocated resource instance, so unrelated executable handles do not consume
-one another's output capacity.
+RFC 0020 supersedes the compile-time output-generation bound. Ordinary
+provisional output segments are leased independently from a runtime-wide output
+pool and transfer their leases to returned tensors. A later invocation may grow
+the pool within backend memory limits, but cannot overwrite a live result.
+Native structural-cache hits share immutable lowering and have no per-handle
+output quota.
 
 State-transaction storage is not published as output storage. Recurrent decode
 state is allocated when a sequence is created; successful CPU and Metal commits
@@ -1142,31 +1141,35 @@ At the end of this phase, delete allocation capture/replay and arena TLS.
 ## Implementation Status (2026-08-10)
 
 The unified CPU and Metal executor, static device-visible memory plans,
-destination-oriented kernels, bounded structural caches, configurable output
-capacity, and transactional KV/KDA/convolution decode are implemented. Inference
-construction eagerly compiles prefill, single-decode, batched-decode, and logits
-row-extraction programs; token steps do not trace or compile extraction graphs.
-Consumed logits and transient full decode outputs are released deterministically.
+destination-oriented kernels, bounded structural caches, runtime-owned
+workspace/output leases, and transactional KV/KDA/convolution decode are
+implemented. Inference construction eagerly compiles prefill, single-decode,
+batched-decode, and logits row-extraction programs; token steps do not trace or
+compile extraction graphs. Consumed logits and transient full decode outputs are
+released deterministically.
 
 Current verification:
 
-- CPU native tests: 110 passed;
-- Metal native tests: 116 passed;
+- CPU native tests: 114 passed;
+- Metal native tests: 125 passed;
 - core CPU/Metal tests: 664 passed;
-- release nano-GPT: 400 training steps in 1.9 seconds and all prompt generations
+- release nano-GPT: 400 training steps in 2.1 seconds and all prompt generations
   completed;
 - release FineWeb: approximately 0.544-0.546 seconds per steady-state step,
-  faster than the historical approximately 0.569 second intermediate baseline;
+  faster than the historical approximately 0.569 second intermediate baseline
+  (this predates the RFC 0020 Metal submission-context change);
 - release FineWeb-KDA: approximately 0.731 seconds per steady-state step.
 
 A fresh 20-step release FineWeb run reported 3,253,010,432 bytes maximum RSS
 and a 74,225,184 byte macOS peak-memory footprint. Unified CPU/GPU mappings
 inflate RSS on Apple silicon, so both operating-system figures are retained.
 
-The backend-storage criterion is met: successful post-compile execution performs
-no CPU segment or Metal buffer allocation, and capacity exhaustion fails rather
-than allocating. Literal host-heap-allocation freedom is not yet met. The current
-audit identifies these remaining Effect Torch-controlled allocations:
+The backend-storage criterion is met after pool warm-up: compatible workspace and
+released output segments are reused without CPU segment or Metal buffer
+allocation. A call retaining additional live outputs may grow the runtime output
+pool instead of failing at an executable-local capacity. Literal
+host-heap-allocation freedom is not yet met. The current audit identifies these
+remaining Effect Torch-controlled allocations:
 
 - per-invocation owner, resolved-value, command-input, scratch, staging, status,
   and result vectors in both executors;
@@ -1213,8 +1216,9 @@ allocation.
   executable memory report.
 - A debug allocation guard observes no unplanned intermediate allocation while
   encoding or executing a planned program.
-- Executable diagnostics expose the preallocated live-output capacity, and a
-  retained-output exhaustion test proves execution fails without growing it.
+- Executable diagnostics expose logical output bytes per invocation, and
+  retained-output tests prove later invocations neither overwrite nor invalidate
+  eight simultaneously live results.
 - After warm-up, reusable host invocation frames cover executor-owned owner,
   value-resolution, command-argument, status, and transaction metadata; any
   unavoidable output-publication or platform-driver allocation is classified

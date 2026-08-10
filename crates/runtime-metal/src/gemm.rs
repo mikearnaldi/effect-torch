@@ -1031,6 +1031,10 @@ pub fn gemm_fused_into(
             "secondary destination",
         )?;
     }
+    dev.mark_buffer_write(&out.buffer)?;
+    if let Some(out2) = out2 {
+        dev.mark_buffer_write(&out2.buffer)?;
+    }
     if requirements.output_elements == 0 {
         return Ok(());
     }

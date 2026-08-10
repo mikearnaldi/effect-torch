@@ -403,7 +403,14 @@ export const makeRuntime = (
       if (id === undefined) return undefined
       roots.push(id)
     }
-    return JSON.stringify({ nodes, roots, options: request.options, state: request.state })
+    const options = request.options === undefined
+      ? undefined
+      : {
+        optimize: request.options.optimize,
+        precision: request.options.precision,
+        constantWeights: request.options.constantWeights
+      }
+    return JSON.stringify({ nodes, roots, options, state: request.state })
   }
   const node = (request: Runtime.NodeRequest): Effect.Effect<Runtime.LazyTensorHandle, Runtime.BackendError> =>
     Effect.try({
@@ -780,20 +787,12 @@ export const makeRuntime = (
     options: Runtime.ExecutableCompileOptions | undefined
   ): NativeCompileOptions | undefined => {
     if (options === undefined) return undefined
-    if (
-      options.outputCapacity !== undefined &&
-      (!Number.isSafeInteger(options.outputCapacity) || options.outputCapacity <= 0 ||
-        options.outputCapacity > 0xffff_ffff)
-    ) {
-      throw new Error("compile: outputCapacity must be a positive uint32")
-    }
     return {
       ...(options.optimize === undefined ? {} : { optimize: options.optimize }),
       ...(options.precision === undefined
         ? {}
         : { allowReducedPrecision: options.precision === "allow-reduced-precision" }),
-      ...(options.constantWeights === undefined ? {} : { constantWeights: options.constantWeights }),
-      ...(options.outputCapacity === undefined ? {} : { outputCapacity: options.outputCapacity })
+      ...(options.constantWeights === undefined ? {} : { constantWeights: options.constantWeights })
     }
   }
   const uint32 = (value: number, name: string, allowZero: boolean): number => {

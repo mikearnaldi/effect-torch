@@ -24,7 +24,6 @@ pub struct ExecutableDiagnostics {
     pub pipeline_count: usize,
     pub command_count: usize,
     pub synchronization_count: usize,
-    pub output_capacity: usize,
     pub memory: MemoryReport,
     pub compile_phases: Box<[CompilePhaseTiming]>,
 }

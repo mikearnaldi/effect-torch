@@ -30,8 +30,8 @@ impl MetalTensor {
             dtype,
         };
         if n > 0 {
-            // Async fill on the serial encoder: ordered before any consumer
-            // dispatch, no host fence required.
+            // Async fill on the caller's submission: ordered before any later
+            // consumer in that context, with no host fence required.
             let _ = super::kernels::fill(dev, &out, 0.0);
         }
         out
@@ -84,16 +84,17 @@ impl MetalTensor {
                 self.buffer.size
             ));
         }
+        MetalDevice::get().mark_buffer_write(&self.buffer)?;
         Ok(())
     }
 
     pub fn read_f32(&self) -> crate::err::Res<Vec<f32>> {
-        crate::runtime::metal::device::MetalDevice::get().synchronize()?;
+        crate::runtime::metal::device::MetalDevice::get().synchronize_buffer(&self.buffer)?;
         Ok(self.buffer.read_f32(self.layout.offset(), self.numel()))
     }
 
     pub fn to_u32_vec(&self) -> crate::err::Res<Vec<u32>> {
-        crate::runtime::metal::device::MetalDevice::get().synchronize()?;
+        crate::runtime::metal::device::MetalDevice::get().synchronize_buffer(&self.buffer)?;
         let n = self.numel();
         let size = self.dtype.size_in_bytes();
         let ptr = unsafe {

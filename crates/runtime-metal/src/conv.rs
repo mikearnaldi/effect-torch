@@ -641,6 +641,7 @@ fn validate_destination(
             destination.buffer.size
         ));
     }
+    MetalDevice::get().mark_buffer_write(&destination.buffer)?;
     Ok(())
 }
 

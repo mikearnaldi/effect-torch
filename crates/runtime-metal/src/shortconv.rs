@@ -259,6 +259,7 @@ mod metal {
                 tensor.buffer.size
             ));
         }
+        MetalDevice::get().mark_buffer_write(&tensor.buffer)?;
         Ok(())
     }
 

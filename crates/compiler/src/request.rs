@@ -61,7 +61,6 @@ pub struct CompileOptions {
     pub optimize: bool,
     pub precision: PrecisionPolicy,
     pub inference: Option<InferenceOptions>,
-    pub output_capacity: usize,
     pub environment: EnvironmentOptions,
 }
 
@@ -71,7 +70,6 @@ impl Default for CompileOptions {
             optimize: true,
             precision: PrecisionPolicy::Strict,
             inference: None,
-            output_capacity: 2,
             environment: EnvironmentOptions::default(),
         }
     }

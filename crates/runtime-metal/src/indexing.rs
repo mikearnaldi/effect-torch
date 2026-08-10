@@ -247,6 +247,7 @@ fn validate_destination(
             destination.buffer.size
         ));
     }
+    MetalDevice::get().mark_buffer_write(&destination.buffer)?;
     Ok(())
 }
 
@@ -1060,6 +1061,7 @@ pub fn scatter_set_into(
         source.dtype,
     )?;
     let ids = prepare_ids(dev, ids, ids_scratch, &requirements.ids, "scatter_set ids")?;
+    dev.mark_buffer_write(&destination.buffer)?;
     if source.numel() != 0 {
         let pipeline = cached_pipeline(
             dev,

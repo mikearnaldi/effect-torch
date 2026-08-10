@@ -730,6 +730,9 @@ kernel void et_ce_bwd_scaled_f32(
         require_exact(status, &[3], DType::F32, "status")?;
         require_exact(nll_scratch, &[n], DType::F32, "nll scratch")?;
         require_exact(flags_scratch, &[n], DType::U32, "flags scratch")?;
+        for tensor in [loss, status, nll_scratch, flags_scratch] {
+            MetalDevice::get().mark_buffer_write(&tensor.buffer)?;
+        }
 
         let forward_pipe = cached_pipeline(target.dtype, logits.dtype, "et_ce_fwd")?;
         let status_pipe = cached_pipeline(target.dtype, logits.dtype, "et_ce_status")?;
@@ -865,6 +868,10 @@ kernel void et_ce_bwd_scaled_f32(
             }
             (crate::CeReduction::Sum, None) => {}
         }
+        MetalDevice::get().mark_buffer_write(&grad.buffer)?;
+        if let Some(status) = count_status {
+            MetalDevice::get().mark_buffer_write(&status.buffer)?;
+        }
 
         let count_pipe = if reduction == crate::CeReduction::Mean {
             Some(cached_pipeline(target.dtype, logits.dtype, "et_ce_count")?)
@@ -954,6 +961,7 @@ kernel void et_ce_bwd_scaled_f32(
         }
         require_contiguous(target, "target")?;
         require_exact(status, &[3], DType::F32, "status")?;
+        MetalDevice::get().mark_buffer_write(&status.buffer)?;
         let target_size = target.dtype.size_in_bytes();
         let pipe = cached_pipeline(target.dtype, logits_dtype, "et_ce_target_status")?;
         MetalDevice::get().with_encoder(|e| {
@@ -985,6 +993,7 @@ kernel void et_ce_bwd_scaled_f32(
         require_contiguous(target, "target")?;
         require_exact(scale, &[1], DType::F32, "scale")?;
         require_exact(grad, logits.layout.shape(), DType::F32, "scaled gradient")?;
+        MetalDevice::get().mark_buffer_write(&grad.buffer)?;
         let pipe = cached_pipeline(target.dtype, logits.dtype, "et_ce_bwd_scaled_f32")?;
         MetalDevice::get().with_encoder(|encoder| {
             encoder.setComputePipelineState(pipe.as_raw());

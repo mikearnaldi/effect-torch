@@ -8,7 +8,9 @@ use crate::composed::{
 use crate::conv::ConvRequirements;
 use crate::linalg::{DeterminantRequirements, InverseRequirements, SolveRequirements};
 use crate::matmul::MatmulRequirements;
+use crate::storage::CpuStorageRetention;
 use crate::value::Value;
+use crate::workspace::{workspace_pool, workspace_request, CpuWorkspaceLease};
 use crate::{composed, conv, fusion, CpuBuffer, CpuDestination, CpuSegment, CpuTensorRequirement};
 use crate::{ExecutableAllocationGuard, Tensor, CPU_STORAGE_ALIGNMENT};
 use effect_torch_compiler::{
@@ -26,9 +28,10 @@ use effect_torch_runtime::{
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 pub type Node = GraphNode<Expr>;
+static INVOCATION_NONCE: AtomicU64 = AtomicU64::new(0);
 
 fn cpu_device() -> Device {
     Device::Cpu
@@ -477,139 +480,6 @@ pub struct CpuExecutable {
     pub memory: MemoryPlan<NativeMemorySpace>,
     pub diagnostics: ExecutableDiagnostics,
     pub state_cursor: Option<ValueId>,
-    invocation_nonce: AtomicU64,
-    resources: CpuExecutableResources,
-}
-
-impl CpuExecutable {
-    pub fn instantiate(&self) -> Result<Arc<Self>, String> {
-        Ok(Arc::new(Self {
-            values: self.values.clone(),
-            bindings: self.bindings.clone(),
-            scalar_bindings: self.scalar_bindings.clone(),
-            padded_bindings: self.padded_bindings.clone(),
-            constants: self.constants.clone(),
-            commands: self.commands.clone(),
-            outputs: self.outputs.clone(),
-            options: self.options.clone(),
-            memory: self.memory.clone(),
-            diagnostics: self.diagnostics.clone(),
-            state_cursor: self.state_cursor,
-            invocation_nonce: AtomicU64::new(0),
-            resources: CpuExecutableResources::prepare(&self.memory, self.options.output_capacity)?,
-        }))
-    }
-}
-
-struct CpuExecutableResources {
-    fixed: Box<[Option<Arc<CpuSegment>>]>,
-    outputs: Box<[Box<[Option<Arc<CpuSegment>>]>]>,
-    actual_workspace_bytes: usize,
-}
-
-impl CpuExecutableResources {
-    fn prepare(
-        memory: &MemoryPlan<NativeMemorySpace>,
-        output_capacity: usize,
-    ) -> Result<Self, String> {
-        if output_capacity == 0 {
-            return Err("compile: CPU executable output capacity must be positive".to_string());
-        }
-        let mut fixed = Vec::with_capacity(memory.segments.len());
-        let mut actual_workspace_bytes = 0usize;
-        for (index, segment) in memory.segments.iter().enumerate() {
-            if segment.memory_space != NativeMemorySpace::Cpu {
-                return Err(format!(
-                    "compile: CPU segment {index} has unsupported memory space {:?}",
-                    segment.memory_space
-                ));
-            }
-            if matches!(
-                segment.ownership,
-                SegmentOwnership::Workspace | SegmentOwnership::InvocationStaging
-            ) {
-                actual_workspace_bytes = actual_workspace_bytes
-                    .checked_add(segment.bytes)
-                    .ok_or_else(|| {
-                        "compile: CPU executable workspace byte size overflow".to_string()
-                    })?;
-            }
-            fixed.push(match segment.ownership {
-                SegmentOwnership::ProvisionalOutput => None,
-                SegmentOwnership::Workspace
-                | SegmentOwnership::InvocationStaging
-                | SegmentOwnership::StateTransaction => Some(
-                    CpuSegment::allocate(segment.bytes, segment.alignment)
-                        .map_err(|error| format!("compile: CPU segment {index}: {error}"))?,
-                ),
-            });
-        }
-        let output_generations = if memory
-            .segments
-            .iter()
-            .any(|segment| matches!(segment.ownership, SegmentOwnership::ProvisionalOutput))
-        {
-            output_capacity
-        } else {
-            1
-        };
-        let outputs = (0..output_generations)
-            .map(|_| {
-                memory
-                    .segments
-                    .iter()
-                    .enumerate()
-                    .map(|(index, segment)| {
-                        matches!(segment.ownership, SegmentOwnership::ProvisionalOutput)
-                            .then(|| {
-                                CpuSegment::allocate(segment.bytes, segment.alignment).map_err(
-                                    |error| format!("compile: CPU output segment {index}: {error}"),
-                                )
-                            })
-                            .transpose()
-                    })
-                    .collect::<Result<Vec<_>, _>>()
-                    .map(Vec::into_boxed_slice)
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(Self {
-            fixed: fixed.into_boxed_slice(),
-            outputs: outputs.into_boxed_slice(),
-            actual_workspace_bytes,
-        })
-    }
-
-    fn acquire(&self) -> Result<InvocationSegments, String> {
-        let outputs = self
-            .outputs
-            .iter()
-            .find(|generation| {
-                generation.iter().flatten().all(|segment| Arc::strong_count(segment) == 1)
-            })
-            .ok_or_else(|| {
-                format!(
-                    "CPU executable resource capacity exhausted: all {} preallocated output generations are still live",
-                    self.outputs.len()
-                )
-            })?;
-        let owners = self
-            .fixed
-            .iter()
-            .zip(outputs)
-            .enumerate()
-            .map(|(index, (fixed, output))| {
-                fixed
-                    .as_ref()
-                    .or(output.as_ref())
-                    .cloned()
-                    .ok_or_else(|| format!("execute: CPU segment {index} was not prepared"))
-            })
-            .collect::<Result<Box<[_]>, _>>()?;
-        Ok(InvocationSegments {
-            owners,
-            actual_workspace_bytes: self.actual_workspace_bytes,
-        })
-    }
 }
 
 impl fmt::Debug for CpuExecutable {
@@ -2454,12 +2324,10 @@ impl Lowerer {
                 semantic_nodes_before_optimization,
                 semantic_nodes_after_optimization: self.node_values.len(),
                 command_count: self.commands.len(),
-                output_capacity: self.options.output_capacity,
                 ..DiagnosticsInput::default()
             },
             |kind| kind.clone(),
         );
-        let resources = CpuExecutableResources::prepare(&memory, self.options.output_capacity)?;
         Ok((
             CpuExecutable {
                 values: self.values.into_boxed_slice(),
@@ -2473,8 +2341,6 @@ impl Lowerer {
                 memory,
                 diagnostics,
                 state_cursor: self.state_cursor,
-                invocation_nonce: AtomicU64::new(0),
-                resources,
             },
             self.generated,
             self.generated_slots,
@@ -2799,11 +2665,75 @@ fn random_seed(nonce: u64, provenance: u64) -> u64 {
 
 struct InvocationSegments {
     owners: Box<[Arc<CpuSegment>]>,
+    retentions: Box<[Option<CpuStorageRetention>]>,
+    _workspace: CpuWorkspaceLease,
     actual_workspace_bytes: usize,
 }
 
 fn acquire_segments(executable: &CpuExecutable) -> Result<InvocationSegments, String> {
-    executable.resources.acquire()
+    let mut workspace_indices = Vec::new();
+    let mut workspace_requests = Vec::new();
+    for (index, segment) in executable.memory.segments.iter().enumerate() {
+        if segment.memory_space != NativeMemorySpace::Cpu {
+            return Err(format!(
+                "execute: CPU segment {index} has unsupported memory space {:?}",
+                segment.memory_space
+            ));
+        }
+        if !matches!(segment.ownership, SegmentOwnership::ProvisionalOutput) {
+            workspace_indices.push(index);
+            workspace_requests.push(workspace_request(segment.bytes, segment.alignment)?);
+        }
+    }
+    let workspace = workspace_pool()
+        .acquire_set(&workspace_requests)
+        .map_err(|error| format!("execute: CPU workspace acquisition failed: {error}"))?;
+    let mut owners: Vec<Option<Arc<CpuSegment>>> = std::iter::repeat_with(|| None)
+        .take(executable.memory.segments.len())
+        .collect();
+    let mut retentions: Vec<Option<CpuStorageRetention>> = std::iter::repeat_with(|| None)
+        .take(executable.memory.segments.len())
+        .collect();
+    let mut actual_workspace_bytes = 0usize;
+    for (&index, leased) in workspace_indices.iter().zip(workspace.segments()) {
+        owners[index] = Some(Arc::clone(leased.workspace()));
+        if matches!(
+            executable.memory.segments[index].ownership,
+            SegmentOwnership::Workspace | SegmentOwnership::InvocationStaging
+        ) {
+            actual_workspace_bytes = actual_workspace_bytes
+                .checked_add(leased.capacity())
+                .ok_or_else(|| "execute: CPU workspace byte size overflow".to_string())?;
+        }
+    }
+    for (index, segment) in executable.memory.segments.iter().enumerate() {
+        if !matches!(segment.ownership, SegmentOwnership::ProvisionalOutput) {
+            continue;
+        }
+        let request = workspace_request(segment.bytes, segment.alignment)?;
+        let lease = Arc::new(
+            workspace_pool()
+                .acquire(std::slice::from_ref(&request))
+                .map_err(|error| format!("execute: CPU output acquisition failed: {error}"))?,
+        );
+        let owner = Arc::clone(lease.segments()[0].workspace());
+        let retention: CpuStorageRetention = lease;
+        owners[index] = Some(owner);
+        retentions[index] = Some(retention);
+    }
+    let owners = owners
+        .into_iter()
+        .enumerate()
+        .map(|(index, owner)| {
+            owner.ok_or_else(|| format!("execute: CPU segment {index} was not acquired"))
+        })
+        .collect::<Result<Box<[_]>, _>>()?;
+    Ok(InvocationSegments {
+        owners,
+        retentions: retentions.into_boxed_slice(),
+        _workspace: workspace,
+        actual_workspace_bytes,
+    })
 }
 
 fn resolve_values(
@@ -2863,11 +2793,12 @@ fn resolve_values(
                         "execute: location {index} has {bytes} bytes, expected {expected}"
                     ));
                 }
-                Value(Tensor::from_segment(
+                Value(Tensor::from_segment_with_retention(
                     Arc::clone(&segments.owners[segment.index()]),
                     *offset,
                     declaration.shape.to_vec(),
                     declaration.dtype,
+                    segments.retentions[segment.index()].clone(),
                 )?)
             }
             Location::Alias { root, .. } => {
@@ -2990,15 +2921,16 @@ fn dispatch_command<'a>(
     let scratch_value = |index: usize| -> &Value { &values[command.scratch[index].index()] };
     match &command.op {
         CpuOp::Randn { provenance, .. } => {
-            crate::random::reseed(random_seed(nonce, *provenance));
-            Tensor::randn_into(&mut destinations[0])
+            Tensor::randn_seeded_into(random_seed(nonce, *provenance), &mut destinations[0])
         }
         CpuOp::Uniform {
             lo, hi, provenance, ..
-        } => {
-            crate::random::reseed(random_seed(nonce, *provenance));
-            Tensor::uniform_into(*lo, *hi, &mut destinations[0])
-        }
+        } => Tensor::uniform_seeded_into(
+            *lo,
+            *hi,
+            random_seed(nonce, *provenance),
+            &mut destinations[0],
+        ),
         CpuOp::Unary(kind) => {
             let source = inputs[0].tensor();
             match (kind, &command.plan) {
@@ -3780,8 +3712,6 @@ fn execute_reported_with_commit(
     state: Option<&dyn CpuState>,
     commit_allowed: Option<&dyn Fn() -> bool>,
 ) -> Result<CpuExecution, String> {
-    static EXECUTION_LOCK: Mutex<()> = Mutex::new(());
-
     if cancelled.load(Ordering::Acquire) {
         return Err("operation aborted".to_string());
     }
@@ -3792,10 +3722,7 @@ fn execute_reported_with_commit(
             scalar_bindings.len()
         ));
     }
-    let nonce = executable.invocation_nonce.fetch_add(1, Ordering::AcqRel);
-    let _execution = EXECUTION_LOCK
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let nonce = INVOCATION_NONCE.fetch_add(1, Ordering::AcqRel);
     let segments = acquire_segments(executable)?;
     let values = {
         let _allocation_guard = ExecutableAllocationGuard::enter();
@@ -3981,6 +3908,7 @@ mod tests {
     use super::*;
     use effect_torch_graph::{Device, LeafSlot};
     use std::sync::atomic::AtomicBool;
+    use std::sync::Barrier;
 
     fn leaf(values: Vec<f32>) -> Arc<Node> {
         Node::new(NodeKind::Leaf(Arc::new(LeafSlot::new(Value(
@@ -4058,7 +3986,7 @@ mod tests {
     }
 
     #[test]
-    fn repeated_execution_uses_only_preallocated_segments() {
+    fn retained_outputs_remain_valid_across_later_invocations() {
         let random = Node::new(NodeKind::Randn {
             shape: vec![32],
             dtype: DType::F32,
@@ -4066,27 +3994,53 @@ mod tests {
         })
         .unwrap();
         let compilation = compile(&[random], options(false), 1024).unwrap();
-        crate::storage::reset_test_segment_allocations();
-        let first = run(&compilation).remove(0);
-        let expected = first.to_f32_vec().unwrap();
-        let second = run(&compilation).remove(0);
-        assert_ne!(expected, second.to_f32_vec().unwrap());
-        assert_eq!(expected, first.to_f32_vec().unwrap());
-        assert_eq!(crate::storage::test_segment_allocations(), 0);
-        let error = execute(
-            &compilation.executable,
-            &[],
-            &compilation.generated_bindings,
-            &CancellationFlag::new(),
-            None,
-        )
-        .err()
+        let mut retained = Vec::new();
+        let mut snapshots = Vec::new();
+        for _ in 0..8 {
+            let output = run(&compilation).remove(0);
+            snapshots.push(output.to_f32_vec().unwrap());
+            retained.push(output);
+        }
+        for (output, expected) in retained.iter().zip(snapshots) {
+            assert_eq!(output.to_f32_vec().unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn one_plan_executes_concurrently_with_independent_frames() {
+        let input = Node::new(NodeKind::Input {
+            slot: 0,
+            shape: vec![2],
+            dtype: DType::F32,
+            device: Device::Cpu,
+        })
         .unwrap();
-        assert!(error.contains("resource capacity exhausted"));
-        assert_eq!(crate::storage::test_segment_allocations(), 0);
-        drop(first);
-        assert_eq!(run(&compilation).len(), 1);
-        assert_eq!(crate::storage::test_segment_allocations(), 0);
+        let output = Node::new(NodeKind::Neg { a: input }).unwrap();
+        let executable = compile(&[output], options(false), 1024).unwrap().executable;
+        let barrier = Arc::new(Barrier::new(9));
+        let handles = (0..8)
+            .map(|index| {
+                let executable = Arc::clone(&executable);
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    let input = Value(Tensor::from_vec(
+                        vec![index as f32, index as f32 + 1.0],
+                        vec![2],
+                    ));
+                    barrier.wait();
+                    execute(&executable, &[input], &[], &CancellationFlag::new(), None)
+                        .unwrap()
+                        .remove(0)
+                })
+            })
+            .collect::<Vec<_>>();
+        barrier.wait();
+        for (index, handle) in handles.into_iter().enumerate() {
+            assert_eq!(
+                handle.join().unwrap().to_f32_vec().unwrap(),
+                [-(index as f32), -(index as f32 + 1.0)]
+            );
+        }
     }
 
     #[test]
@@ -4233,6 +4187,44 @@ mod tests {
     }
 
     #[test]
+    fn independently_compiled_random_plans_receive_distinct_runtime_nonces() {
+        let random = Node::new(NodeKind::Randn {
+            shape: vec![16],
+            dtype: DType::F32,
+            device: Device::Cpu,
+        })
+        .unwrap();
+        let executables = [
+            compile(std::slice::from_ref(&random), options(false), 1024)
+                .unwrap()
+                .executable,
+            compile(&[random], options(false), 1024).unwrap().executable,
+        ];
+        let barrier = Arc::new(Barrier::new(3));
+        let handles = executables
+            .into_iter()
+            .map(|executable| {
+                let executable = Arc::clone(&executable);
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    execute(&executable, &[], &[], &CancellationFlag::new(), None)
+                        .unwrap()
+                        .remove(0)
+                        .to_f32_vec()
+                        .unwrap()
+                })
+            })
+            .collect::<Vec<_>>();
+        barrier.wait();
+        let outputs = handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect::<Vec<_>>();
+        assert_ne!(outputs[0], outputs[1]);
+    }
+
+    #[test]
     fn random_stream_identity_is_stable_across_optimization() {
         let deterministic = Node::new(NodeKind::Tanh {
             a: Node::new(NodeKind::Add {
@@ -4259,10 +4251,31 @@ mod tests {
             optimized.executable.commands.len(),
             unoptimized.executable.commands.len()
         );
-        assert_eq!(
-            run(&optimized)[1].to_f32_vec().unwrap(),
-            run(&unoptimized)[1].to_f32_vec().unwrap()
-        );
+        let provenance = |compilation: &CpuCompilation| {
+            compilation
+                .executable
+                .commands
+                .iter()
+                .find_map(|command| match command.op {
+                    CpuOp::Randn { provenance, .. } => Some(provenance),
+                    _ => None,
+                })
+                .expect("compiled random command")
+        };
+        let optimized_provenance = provenance(&optimized);
+        let unoptimized_provenance = provenance(&unoptimized);
+        assert_eq!(optimized_provenance, unoptimized_provenance);
+
+        let sample = |provenance| {
+            let mut tensor = Tensor::empty(&[16], DType::F32);
+            Tensor::randn_seeded_into(
+                random_seed(7, provenance),
+                &mut tensor.destination().unwrap(),
+            )
+            .unwrap();
+            Value(tensor).to_f32_vec().unwrap()
+        };
+        assert_eq!(sample(optimized_provenance), sample(unoptimized_provenance));
     }
 
     #[test]
@@ -4560,7 +4573,7 @@ mod tests {
     }
 
     #[test]
-    fn state_transaction_segments_are_fixed_and_never_published() {
+    fn state_transaction_segments_are_invocation_owned_and_never_published() {
         let q = leaf_shape(vec![0.2, 0.4, 0.1, 0.3], vec![1, 1, 2, 2]);
         let recurrence = Node::new(NodeKind::KdaRecurrence {
             q: q.clone(),
@@ -4582,11 +4595,7 @@ mod tests {
             .position(|segment| segment.ownership == SegmentOwnership::StateTransaction)
             .expect("stateful compilation declares a transaction segment");
 
-        let first = acquire_segments(&executable).unwrap();
-        let retained = Arc::clone(&first.owners[transaction_index]);
-        drop(first);
-        let second = acquire_segments(&executable).unwrap();
-
-        assert!(Arc::ptr_eq(&retained, &second.owners[transaction_index]));
+        let invocation = acquire_segments(&executable).unwrap();
+        assert!(invocation.retentions[transaction_index].is_none());
     }
 }

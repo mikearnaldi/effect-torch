@@ -1,5 +1,6 @@
 use crate::storage::{
-    assert_allocation_allowed, CpuElement, CpuSegment, CpuStorage, CPU_STORAGE_ALIGNMENT,
+    assert_allocation_allowed, CpuElement, CpuSegment, CpuStorage, CpuStorageRetention,
+    CPU_STORAGE_ALIGNMENT,
 };
 use effect_torch_runtime::{DType, Layout};
 use half::{bf16, f16};
@@ -53,9 +54,19 @@ impl CpuBuffer {
         len: usize,
         dtype: DType,
     ) -> Result<Self, String> {
+        Self::from_segment_with_retention(owner, byte_offset, len, dtype, None)
+    }
+
+    pub(crate) fn from_segment_with_retention(
+        owner: Arc<CpuSegment>,
+        byte_offset: usize,
+        len: usize,
+        dtype: DType,
+        retention: Option<CpuStorageRetention>,
+    ) -> Result<Self, String> {
         macro_rules! view {
             ($variant:ident, $type:ty) => {
-                CpuStorage::<$type>::from_segment(owner, byte_offset, len)
+                CpuStorage::<$type>::from_segment_with_retention(owner, byte_offset, len, retention)
                     .map(CpuBuffer::$variant)
                     .map_err(|error| error.to_string())
             };
@@ -216,11 +227,22 @@ impl Tensor {
         shape: Vec<usize>,
         dtype: DType,
     ) -> Result<Self, String> {
+        Self::from_segment_with_retention(owner, byte_offset, shape, dtype, None)
+    }
+
+    pub(crate) fn from_segment_with_retention(
+        owner: Arc<CpuSegment>,
+        byte_offset: usize,
+        shape: Vec<usize>,
+        dtype: DType,
+        retention: Option<CpuStorageRetention>,
+    ) -> Result<Self, String> {
         let len = shape
             .iter()
             .try_fold(1usize, |total, &dimension| total.checked_mul(dimension))
             .ok_or_else(|| "CPU tensor element count overflow".to_string())?;
-        let buffer = CpuBuffer::from_segment(owner, byte_offset, len, dtype)?;
+        let buffer =
+            CpuBuffer::from_segment_with_retention(owner, byte_offset, len, dtype, retention)?;
         Ok(Self::new(buffer, Layout::contiguous(shape)))
     }
 

@@ -1,31 +1,40 @@
-use crate::device::{Buffer, MetalDevice};
-use effect_torch_runtime::{NativeMemorySpace, SegmentOwnership};
-#[cfg(test)]
+use crate::device::{Buffer, BufferRetention, MetalDevice};
 use effect_torch_runtime::{
-    WorkspaceAllocation, WorkspaceAllocator, WorkspacePool, WorkspaceRequest,
+    NativeMemorySpace, SegmentDecl, SegmentOwnership, WorkspaceAllocation, WorkspaceAllocator,
+    WorkspaceLease, WorkspacePool, WorkspaceRequest,
 };
-#[cfg(test)]
 use objc2_metal::MTLDevice;
-use std::sync::Arc;
-#[cfg(test)]
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 #[cfg(test)]
 pub(crate) const DEFAULT_ALIGNMENT: usize = 256;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg(test)]
 pub(crate) struct MetalWorkspaceKey {
     pub memory_space: NativeMemorySpace,
     pub alignment: usize,
     pub capacity_class: usize,
 }
 
+impl MetalWorkspaceKey {
+    fn new(bytes: usize, alignment: usize) -> Result<Self, String> {
+        if alignment == 0 || !alignment.is_power_of_two() {
+            return Err(format!("invalid Metal workspace alignment {alignment}"));
+        }
+        let capacity_class = bytes
+            .checked_next_multiple_of(alignment)
+            .ok_or_else(|| "Metal workspace capacity class overflow".to_string())?;
+        Ok(Self {
+            memory_space: NativeMemorySpace::MetalShared,
+            alignment,
+            capacity_class,
+        })
+    }
+}
+
 #[derive(Debug)]
-#[cfg(test)]
 pub(crate) struct MetalWorkspaceAllocator;
 
-#[cfg(test)]
 impl WorkspaceAllocator<MetalWorkspaceKey> for MetalWorkspaceAllocator {
     type Workspace = Arc<Buffer>;
     type Error = String;
@@ -47,10 +56,9 @@ impl WorkspaceAllocator<MetalWorkspaceKey> for MetalWorkspaceAllocator {
     }
 }
 
-#[cfg(test)]
 pub(crate) type MetalWorkspacePool = WorkspacePool<MetalWorkspaceKey, MetalWorkspaceAllocator>;
+pub(crate) type MetalWorkspaceLease = WorkspaceLease<MetalWorkspaceKey, MetalWorkspaceAllocator>;
 
-#[cfg(test)]
 pub(crate) fn workspace_pool() -> &'static MetalWorkspacePool {
     static POOL: OnceLock<MetalWorkspacePool> = OnceLock::new();
     POOL.get_or_init(|| {
@@ -65,111 +73,87 @@ pub(crate) fn workspace_pool() -> &'static MetalWorkspacePool {
     })
 }
 
+fn request(bytes: usize, alignment: usize) -> Result<WorkspaceRequest<MetalWorkspaceKey>, String> {
+    let bytes = bytes.max(1);
+    Ok(WorkspaceRequest::new(
+        MetalWorkspaceKey::new(bytes, alignment)?,
+        bytes,
+    ))
+}
+
 pub(crate) struct InvocationResources {
     pub segments: Vec<Arc<Buffer>>,
+    pub retentions: Vec<Option<BufferRetention>>,
+    _workspace: MetalWorkspaceLease,
     pub actual_workspace_bytes: usize,
 }
 
-pub(crate) struct ExecutableResources {
-    fixed: Box<[Option<Arc<Buffer>>]>,
-    outputs: Box<[Box<[Option<Arc<Buffer>>]>]>,
-    actual_workspace_bytes: usize,
-}
-
-impl ExecutableResources {
-    pub fn prepare(
-        segments: &[effect_torch_runtime::SegmentDecl<NativeMemorySpace>],
-        output_capacity: usize,
-    ) -> Result<Self, String> {
-        if output_capacity == 0 {
-            return Err("Metal executable output capacity must be positive".to_string());
+pub(crate) fn acquire(
+    segments: &[SegmentDecl<NativeMemorySpace>],
+) -> Result<InvocationResources, String> {
+    let mut workspace_indices = Vec::new();
+    let mut workspace_requests = Vec::new();
+    for (index, segment) in segments.iter().enumerate() {
+        if segment.memory_space != NativeMemorySpace::MetalShared {
+            return Err(format!(
+                "unsupported executable Metal memory space {:?} for segment {index}",
+                segment.memory_space
+            ));
         }
-        let mut fixed = Vec::with_capacity(segments.len());
-        let mut actual_workspace_bytes = 0usize;
-        for (index, segment) in segments.iter().enumerate() {
-            if segment.memory_space != NativeMemorySpace::MetalShared {
-                return Err(format!(
-                    "unsupported executable Metal memory space {:?} for segment {index}",
-                    segment.memory_space
-                ));
-            }
-            if matches!(
-                segment.ownership,
-                SegmentOwnership::Workspace | SegmentOwnership::InvocationStaging
-            ) {
-                actual_workspace_bytes = actual_workspace_bytes
-                    .checked_add(segment.bytes)
-                    .ok_or_else(|| "Metal executable workspace byte size overflow".to_string())?;
-            }
-            fixed.push(match segment.ownership {
-                SegmentOwnership::ProvisionalOutput => None,
-                SegmentOwnership::Workspace
-                | SegmentOwnership::InvocationStaging
-                | SegmentOwnership::StateTransaction => {
-                    Some(MetalDevice::get().alloc_raw_checked(segment.bytes.max(1))?)
-                }
-            });
+        if !matches!(segment.ownership, SegmentOwnership::ProvisionalOutput) {
+            workspace_indices.push(index);
+            workspace_requests.push(request(segment.bytes, segment.alignment)?);
         }
-
-        let output_generations = if segments
-            .iter()
-            .any(|segment| matches!(segment.ownership, SegmentOwnership::ProvisionalOutput))
-        {
-            output_capacity
-        } else {
-            1
-        };
-        let outputs = (0..output_generations)
-            .map(|_| {
-                segments
-                    .iter()
-                    .map(|segment| {
-                        matches!(segment.ownership, SegmentOwnership::ProvisionalOutput)
-                            .then(|| MetalDevice::get().alloc_raw_checked(segment.bytes.max(1)))
-                            .transpose()
-                    })
-                    .collect::<Result<Vec<_>, _>>()
-                    .map(Vec::into_boxed_slice)
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(Self {
-            fixed: fixed.into_boxed_slice(),
-            outputs: outputs.into_boxed_slice(),
-            actual_workspace_bytes,
-        })
     }
-
-    pub fn acquire(&self) -> Result<InvocationResources, String> {
-        let outputs = self
-            .outputs
-            .iter()
-            .find(|generation| {
-                generation.iter().flatten().all(|buffer| Arc::strong_count(buffer) == 1)
-            })
-            .ok_or_else(|| {
-                format!(
-                    "Metal executable resource capacity exhausted: all {} preallocated output generations are still live",
-                    self.outputs.len()
-                )
-            })?;
-        let segments = self
-            .fixed
-            .iter()
-            .zip(outputs)
-            .enumerate()
-            .map(|(index, (fixed, output))| {
-                fixed
-                    .as_ref()
-                    .or(output.as_ref())
-                    .cloned()
-                    .ok_or_else(|| format!("Metal memory segment {index} was not prepared"))
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(InvocationResources {
-            segments,
-            actual_workspace_bytes: self.actual_workspace_bytes,
-        })
+    let workspace = workspace_pool()
+        .acquire_set(&workspace_requests)
+        .map_err(|error| format!("Metal workspace acquisition failed: {error}"))?;
+    let mut owners: Vec<Option<Arc<Buffer>>> = std::iter::repeat_with(|| None)
+        .take(segments.len())
+        .collect();
+    let mut retentions: Vec<Option<BufferRetention>> = std::iter::repeat_with(|| None)
+        .take(segments.len())
+        .collect();
+    let mut actual_workspace_bytes = 0usize;
+    for (&index, leased) in workspace_indices.iter().zip(workspace.segments()) {
+        owners[index] = Some(Arc::clone(leased.workspace()));
+        if matches!(
+            segments[index].ownership,
+            SegmentOwnership::Workspace | SegmentOwnership::InvocationStaging
+        ) {
+            actual_workspace_bytes = actual_workspace_bytes
+                .checked_add(leased.capacity())
+                .ok_or_else(|| "Metal workspace byte size overflow".to_string())?;
+        }
     }
+    for (index, segment) in segments.iter().enumerate() {
+        if !matches!(segment.ownership, SegmentOwnership::ProvisionalOutput) {
+            continue;
+        }
+        let output_request = request(segment.bytes, segment.alignment)?;
+        let lease = Arc::new(
+            workspace_pool()
+                .acquire(std::slice::from_ref(&output_request))
+                .map_err(|error| format!("Metal output acquisition failed: {error}"))?,
+        );
+        let owner = Arc::clone(lease.segments()[0].workspace());
+        let retention: BufferRetention = lease;
+        owners[index] = Some(owner);
+        retentions[index] = Some(retention);
+    }
+    let segments = owners
+        .into_iter()
+        .enumerate()
+        .map(|(index, owner)| {
+            owner.ok_or_else(|| format!("Metal memory segment {index} was not acquired"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(InvocationResources {
+        segments,
+        retentions,
+        _workspace: workspace,
+        actual_workspace_bytes,
+    })
 }
 
 #[cfg(test)]
@@ -228,5 +212,35 @@ mod tests {
             large_address
         );
         assert_eq!(small.segments()[0].capacity(), 1 << 20);
+    }
+
+    #[test]
+    fn output_views_retain_the_pool_lease() {
+        let pool = MetalWorkspacePool::new(1024, MetalWorkspaceAllocator);
+        let request = WorkspaceRequest::new(
+            MetalWorkspaceKey {
+                memory_space: NativeMemorySpace::MetalShared,
+                alignment: DEFAULT_ALIGNMENT,
+                capacity_class: DEFAULT_ALIGNMENT,
+            },
+            16,
+        );
+        let lease = Arc::new(pool.acquire(&[request]).unwrap());
+        let root = Arc::clone(lease.segments()[0].workspace());
+        let retention: BufferRetention = lease;
+        let output = Arc::new(Buffer::suballoc_with_retention(
+            &root,
+            0,
+            16,
+            Some(retention),
+        ));
+        drop(root);
+        let view = Arc::new(Buffer::suballoc(&output, 0, 8));
+        assert_eq!(pool.stats().leased_segments, 1);
+        drop(output);
+        assert_eq!(pool.stats().leased_segments, 1);
+        drop(view);
+        assert_eq!(pool.stats().leased_segments, 0);
+        assert_eq!(pool.stats().idle_segments, 1);
     }
 }

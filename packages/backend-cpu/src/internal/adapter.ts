@@ -413,7 +413,14 @@ export const makeRuntime = (
       if (id === undefined) return undefined
       roots.push(id)
     }
-    return JSON.stringify({ nodes, roots, options: request.options, state: request.state })
+    const options = request.options === undefined
+      ? undefined
+      : {
+        optimize: request.options.optimize,
+        precision: request.options.precision,
+        constantWeights: request.options.constantWeights
+      }
+    return JSON.stringify({ nodes, roots, options, state: request.state })
   }
   const node = (request: Runtime.NodeRequest): Effect.Effect<Runtime.LazyTensorHandle, Runtime.BackendError> =>
     Effect.try({
@@ -976,14 +983,6 @@ export const makeRuntime = (
       Effect.try({
         try: () => {
           const roots = request.roots.map((root) => nativeGraph(root, "compile", "compile"))
-          if (
-            request.options?.outputCapacity !== undefined &&
-            (!Number.isSafeInteger(request.options.outputCapacity) ||
-              request.options.outputCapacity <= 0 ||
-              request.options.outputCapacity > 0xffff_ffff)
-          ) {
-            throw new Error("compile: outputCapacity must be a positive uint32")
-          }
           const options: NativeCompileOptions | undefined = request.options === undefined
             ? undefined
             : {
@@ -993,10 +992,7 @@ export const makeRuntime = (
                 : { allowReducedPrecision: request.options.precision === "allow-reduced-precision" }),
               ...(request.options.constantWeights === undefined
                 ? {}
-                : { constantWeights: request.options.constantWeights }),
-              ...(request.options.outputCapacity === undefined
-                ? {}
-                : { outputCapacity: request.options.outputCapacity })
+                : { constantWeights: request.options.constantWeights })
             }
           const state: NativeKvStateSchema | undefined = request.state === undefined
             ? undefined

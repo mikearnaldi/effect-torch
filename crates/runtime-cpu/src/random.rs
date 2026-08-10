@@ -130,6 +130,32 @@ fn randn_with_rng_into(
     }
 }
 
+fn uniform_with_rng_into(
+    lo: f64,
+    hi: f64,
+    destination: &mut CpuDestination<'_>,
+    rng: &mut Xoroshiro128Plus,
+) -> Result<(), String> {
+    macro_rules! write {
+        ($type:ty) => {
+            destination.write_current::<$type, _>("uniform", |output| {
+                for value in output {
+                    *value = <$type as Elem>::from_f64(lo + (hi - lo) * rng.next_f64());
+                }
+            })
+        };
+    }
+    match destination.dtype() {
+        DType::F32 => write!(f32),
+        DType::F64 => write!(f64),
+        DType::F16 => write!(f16),
+        DType::BF16 => write!(bf16),
+        DType::U8 => write!(u8),
+        DType::U32 => write!(u32),
+        DType::I64 => write!(i64),
+    }
+}
+
 impl Tensor {
     pub fn arange_requirements(
         start: f64,
@@ -233,6 +259,13 @@ impl Tensor {
         with_rng(|rng| randn_with_rng_into(destination, rng))
     }
 
+    pub(crate) fn randn_seeded_into(
+        seed: u64,
+        destination: &mut CpuDestination<'_>,
+    ) -> Result<(), String> {
+        randn_with_rng_into(destination, &mut Xoroshiro128Plus::new(seed))
+    }
+
     pub fn randn(shape: &[usize], dtype: DType) -> Self {
         allocate_output(Self::randn_requirements(shape, dtype), Self::randn_into)
     }
@@ -269,26 +302,16 @@ impl Tensor {
         hi: f64,
         destination: &mut CpuDestination<'_>,
     ) -> Result<(), String> {
-        macro_rules! write {
-            ($type:ty) => {
-                destination.write_current::<$type, _>("uniform", |output| {
-                    with_rng(|rng| {
-                        for value in output {
-                            *value = <$type as Elem>::from_f64(lo + (hi - lo) * rng.next_f64());
-                        }
-                    });
-                })
-            };
-        }
-        match destination.dtype() {
-            DType::F32 => write!(f32),
-            DType::F64 => write!(f64),
-            DType::F16 => write!(f16),
-            DType::BF16 => write!(bf16),
-            DType::U8 => write!(u8),
-            DType::U32 => write!(u32),
-            DType::I64 => write!(i64),
-        }
+        with_rng(|rng| uniform_with_rng_into(lo, hi, destination, rng))
+    }
+
+    pub(crate) fn uniform_seeded_into(
+        lo: f64,
+        hi: f64,
+        seed: u64,
+        destination: &mut CpuDestination<'_>,
+    ) -> Result<(), String> {
+        uniform_with_rng_into(lo, hi, destination, &mut Xoroshiro128Plus::new(seed))
     }
 
     pub fn uniform(lo: f64, hi: f64, shape: &[usize], dtype: DType) -> Self {

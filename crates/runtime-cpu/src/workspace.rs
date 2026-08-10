@@ -1,4 +1,4 @@
-use crate::storage::{CpuSegment, CPU_STORAGE_ALIGNMENT};
+use crate::storage::CpuSegment;
 use effect_torch_runtime::{
     NativeMemorySpace, WorkspaceAllocation, WorkspaceAllocator, WorkspaceLease, WorkspacePool,
     WorkspaceRequest,
@@ -6,14 +6,14 @@ use effect_torch_runtime::{
 use std::sync::{Arc, OnceLock};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct CpuWorkspaceKey {
+pub(crate) struct CpuWorkspaceKey {
     pub memory_space: NativeMemorySpace,
     pub alignment: usize,
     pub capacity_class: usize,
 }
 
 impl CpuWorkspaceKey {
-    pub fn new(bytes: usize, alignment: usize) -> Result<Self, String> {
+    pub(crate) fn new(bytes: usize, alignment: usize) -> Result<Self, String> {
         if alignment == 0 || !alignment.is_power_of_two() {
             return Err(format!("invalid CPU workspace alignment {alignment}"));
         }
@@ -29,7 +29,7 @@ impl CpuWorkspaceKey {
 }
 
 #[derive(Debug, Default)]
-pub struct CpuWorkspaceAllocator;
+pub(crate) struct CpuWorkspaceAllocator;
 
 impl WorkspaceAllocator<CpuWorkspaceKey> for CpuWorkspaceAllocator {
     type Workspace = Arc<CpuSegment>;
@@ -61,10 +61,10 @@ impl WorkspaceAllocator<CpuWorkspaceKey> for CpuWorkspaceAllocator {
     }
 }
 
-pub type CpuWorkspacePool = WorkspacePool<CpuWorkspaceKey, CpuWorkspaceAllocator>;
-pub type CpuWorkspaceLease = WorkspaceLease<CpuWorkspaceKey, CpuWorkspaceAllocator>;
+pub(crate) type CpuWorkspacePool = WorkspacePool<CpuWorkspaceKey, CpuWorkspaceAllocator>;
+pub(crate) type CpuWorkspaceLease = WorkspaceLease<CpuWorkspaceKey, CpuWorkspaceAllocator>;
 
-pub fn workspace_pool() -> &'static CpuWorkspacePool {
+pub(crate) fn workspace_pool() -> &'static CpuWorkspacePool {
     static POOL: OnceLock<CpuWorkspacePool> = OnceLock::new();
     POOL.get_or_init(|| {
         let max_idle_bytes = std::env::var("EFFECT_TORCH_CPU_WORKSPACE_POOL_MB")
@@ -76,24 +76,21 @@ pub fn workspace_pool() -> &'static CpuWorkspacePool {
     })
 }
 
-pub fn workspace_request(
+pub(crate) fn workspace_request(
     bytes: usize,
     alignment: usize,
 ) -> Result<WorkspaceRequest<CpuWorkspaceKey>, String> {
+    let bytes = bytes.max(1);
     Ok(WorkspaceRequest::new(
         CpuWorkspaceKey::new(bytes, alignment)?,
         bytes,
     ))
 }
 
-pub fn default_workspace_request(bytes: usize) -> WorkspaceRequest<CpuWorkspaceKey> {
-    workspace_request(bytes, CPU_STORAGE_ALIGNMENT)
-        .expect("default CPU workspace alignment is valid")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::storage::{CpuStorage, CpuStorageRetention};
 
     #[test]
     fn whole_segment_pool_is_right_sized_best_fit_and_lru_bounded() {
@@ -181,5 +178,35 @@ mod tests {
         assert!(old_owner.upgrade().is_none());
         assert!(hot_owner.upgrade().is_some());
         assert_eq!(pool.stats().idle_bytes, 80);
+    }
+
+    #[test]
+    fn output_views_retain_the_pool_lease() {
+        let pool = CpuWorkspacePool::new(1024, CpuWorkspaceAllocator);
+        let request = workspace_request(16, 16).unwrap();
+        let lease = Arc::new(pool.acquire(&[request]).unwrap());
+        let owner = Arc::clone(lease.segments()[0].workspace());
+        let retention: CpuStorageRetention = lease;
+        let output =
+            CpuStorage::<u8>::from_segment_with_retention(owner, 0, 16, Some(retention)).unwrap();
+        let view = output.clone();
+        assert_eq!(pool.stats().leased_segments, 1);
+        drop(output);
+        assert_eq!(pool.stats().leased_segments, 1);
+        drop(view);
+        assert_eq!(pool.stats().leased_segments, 0);
+        assert_eq!(pool.stats().idle_segments, 1);
+    }
+
+    #[test]
+    fn zero_byte_requests_account_for_the_physical_allocation_floor() {
+        let pool = CpuWorkspacePool::new(0, CpuWorkspaceAllocator);
+        let lease = pool.acquire(&[workspace_request(0, 16).unwrap()]).unwrap();
+        assert_eq!(lease.requested_bytes(), 1);
+        assert_eq!(lease.actual_bytes(), 1);
+        assert_eq!(pool.stats().leased_bytes, 1);
+        drop(lease);
+        assert_eq!(pool.stats().idle_bytes, 0);
+        assert_eq!(pool.stats().idle_segments, 0);
     }
 }

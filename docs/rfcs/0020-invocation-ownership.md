@@ -1,6 +1,9 @@
 # RFC 0020: Invocation Ownership - Execution Frames, Runtime Pools, and Output Lifetimes
 
-- **Status**: Draft
+- **Status**: Partially implemented - ordinary output ownership, runtime pools,
+  shared plans, and concurrent CPU frames are complete; host-frame pooling,
+  overlapping Metal execution, donation, and explicit inference contexts are
+  deferred.
 - **Created**: 2026-08-10
 - **Depends on**: RFC 0003 (memory management), RFC 0008 (compilation),
   RFC 0010 (inference), RFC 0017 (multi-backend runtime), RFC 0019
@@ -91,11 +94,12 @@ unrelated limits. Changing a cache key changes how many valid results callers
 may retain. These are properties of an executable-local ring, not properties of
 the computation.
 
-The same embedding also obstructs real concurrency. One executable currently
-contains mutable or reusable invocation resources, while CPU and Metal protect
-execution with process-wide locks. Calls are thread-safe only because they are
-serialized. Making the command scheduler concurrent without changing ownership
-would allow invocations to write the same workspace and transaction storage.
+The same embedding also obstructed real concurrency. Before this RFC, one
+executable contained mutable or reusable invocation resources, while CPU and
+Metal protected execution with process-wide locks. Calls were thread-safe only
+because they were serialized. Making the command scheduler concurrent without
+changing ownership would have allowed invocations to write the same workspace
+and transaction storage.
 
 ### Static planning does not require static physical ownership
 
@@ -622,9 +626,10 @@ ownership. Diagnostics should report whether a backend is serial, concurrent,
 or scheduler-batched. `Send`/`Sync` means calls are safe; it does not by itself
 promise overlapping kernels.
 
-The current process-wide CPU and Metal locks remain until frame ownership is
-complete. Removing them before workspace, command metadata, allocator access,
-randomness, and state transactions are independently safe is forbidden.
+Process-wide CPU and Metal locks must remain until frame ownership is complete.
+Removing them before workspace, command metadata, allocator access, randomness,
+and state transactions are independently safe is forbidden. The current
+implementation reached that boundary for CPU and Metal in phase 4.
 
 ### Training
 
@@ -792,33 +797,58 @@ backend allocation or command fails after partial acquisition/submission, the
 runtime retains all referenced resources until safe completion and rolls back
 persistent state.
 
-## Current Implementation Gap
+## Implementation Status (2026-08-10)
 
-The repository already contains much of the required compiler and pool
-infrastructure:
+Phases 0-2 and the CPU and Metal portions of phase 4 are implemented:
 
-- `MemoryPlan` distinguishes workspace, provisional output, staging, and state
-  transaction ownership.
-- the generic runtime `WorkspacePool` implements atomic acquisition, best-fit
-  idle reuse, byte accounting, and idle eviction;
-- executable IR contains dense commands and statically planned values;
-- output publication already waits for successful execution;
-- recurrent decode commits transaction results into sequence-owned state;
-- structural cache hits construct independent resource instances rather than
-  accidentally sharing one ring.
+- `MemoryPlan` remains the immutable logical layout for workspace, provisional
+  output, staging, and state-transaction segments.
+- CPU and Metal production execution acquire workspace and transaction segments
+  from runtime-wide `WorkspacePool` instances.
+- Each provisional output segment receives a separate pool lease retained by
+  CPU storage or the Metal buffer-owner chain. Workspace returns after execution
+  while output leases remain active until the last tensor/view/readback owner
+  releases them.
+- `outputCapacity` and the executable-local output rings are removed from Rust,
+  NAPI, TypeScript, diagnostics, cache keys, tests, and inference construction.
+- Structural cache hits share one native executable plan while keeping generated
+  bindings invocation-handle-local.
+- CPU compiled randomness uses local nonce-derived RNG state, so calls to one
+  plan can execute concurrently with independent frames; the process-wide CPU
+  execution lock is removed.
+- Metal executable invocations and compile-time constant construction use
+  explicit submission contexts. Eager kernels use per-thread implicit contexts.
+  Contexts share one command queue but own their encoder/event chain, submitted
+  command buffers, failures, retirement, and completion boundary, so unrelated
+  kernel streams can overlap without failure or synchronization theft.
+- Every physical Metal allocation has a shared usage token retained by each
+  referencing command buffer. Dynamic allocator reuse and eviction require both
+  host-idle and GPU-idle storage, including aliases and unsubmitted encoders.
+- Destination writes publish producer completion and persistent failure state to
+  their backing storage. Executable bindings and readback fence that producer
+  without consuming another invocation's completion result.
+- Metal compiled randomness reserves one invocation nonce and derives command
+  seeds locally instead of assigning streams from per-operation atomics.
+- KV sequence release, prefix matching, and run admission linearize on the same
+  per-sequence lock and recheck release after admission on CPU and Metal.
+- Retained-output tests keep eight ordinary outputs live across later sequential
+  and concurrent calls on CPU and Metal. Structural-cache tests retain eight
+  outputs from each of two handles sharing one plan.
+- Native suites pass with 114 CPU and 125 Metal tests; core CPU/Metal tests pass
+  664/664. Release nano-GPT completes 400 steps and all generation paths in 2.1
+  seconds. The FineWeb data fixture is absent from this worktree, so the prior
+  approximately 0.545-second steady-state baseline was not rerun after enabling
+  Metal submission concurrency.
 
-The remaining architectural mismatch is concrete:
+Remaining work is intentionally narrower than the original mismatch:
 
-- `CpuExecutable` embeds `CpuExecutableResources`;
-- Metal `ExecutableResources` embeds fixed and output-generation buffers;
-- `outputCapacity` is part of compile options, diagnostics, cache keys, tests,
-  and inference construction;
-- the production Metal workspace pool is not yet used for executable dispatch;
-- CPU and Metal use process-wide execution locks;
-- host invocation vectors are allocated per call rather than leased from a
-  reusable host-frame pool.
-
-These are migration points, not reasons to weaken ordinary tensor semantics.
+- host owner/value/argument/status vectors are still allocated per invocation;
+- runtime policies expose idle limits through backend configuration rather than
+  one public `RuntimeMemoryPolicy` API, and CPU has no explicit hard byte budget;
+- trainer donation, caller-bound outputs, explicit reserved inference contexts,
+  and fixed-address replay remain future specialized APIs;
+- NAPI/JavaScript publication and opaque backend-driver allocations remain
+  outside the no-backing-allocation guarantee.
 
 ## Migration
 

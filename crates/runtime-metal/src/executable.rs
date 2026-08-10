@@ -14,8 +14,10 @@ use effect_torch_runtime::{
 };
 use std::collections::{HashMap, HashSet};
 use std::fmt;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+
+static INVOCATION_NONCE: AtomicU64 = AtomicU64::new(0);
 
 pub(crate) type Node = effect_torch_graph::Node<Expr>;
 pub(crate) type NodeKind = effect_torch_graph::NodeKind<Expr>;
@@ -1839,31 +1841,6 @@ pub(super) struct MetalExecutable {
     pub memory: MemoryPlan<NativeMemorySpace>,
     pub diagnostics: ExecutableDiagnostics,
     pub last_invocation_memory: Mutex<Option<InvocationMemoryReport>>,
-    resources: crate::workspace::ExecutableResources,
-}
-
-impl MetalExecutable {
-    pub(super) fn instantiate(&self) -> Result<Arc<Self>, String> {
-        Ok(Arc::new(Self {
-            values: self.values.clone(),
-            bindings: self.bindings.clone(),
-            scalar_bindings: self.scalar_bindings.clone(),
-            padded_bindings: self.padded_bindings.clone(),
-            constants: self.constants.clone(),
-            commands: self.commands.clone(),
-            outputs: self.outputs.clone(),
-            options: self.options.clone(),
-            environment: self.environment,
-            state_schema: self.state_schema,
-            memory: self.memory.clone(),
-            diagnostics: self.diagnostics.clone(),
-            last_invocation_memory: Mutex::new(None),
-            resources: crate::workspace::ExecutableResources::prepare(
-                &self.memory.segments,
-                self.options.output_capacity,
-            )?,
-        }))
-    }
 }
 
 impl fmt::Debug for MetalExecutable {
@@ -4136,15 +4113,10 @@ impl Lowerer {
                 pipeline_count,
                 command_count: self.commands.len(),
                 synchronization_count: 1,
-                output_capacity: self.options.output_capacity,
                 ..DiagnosticsInput::default()
             },
             |kind| kind.clone(),
         );
-        let resources = crate::workspace::ExecutableResources::prepare(
-            &memory.segments,
-            self.options.output_capacity,
-        )?;
         Ok((
             MetalExecutable {
                 values: self.values.into_boxed_slice(),
@@ -4160,7 +4132,6 @@ impl Lowerer {
                 memory,
                 diagnostics,
                 last_invocation_memory: Mutex::new(None),
-                resources,
             },
             self.generated,
             self.generated_slots,
@@ -4257,20 +4228,25 @@ pub(super) fn compile_with_state(
         return Err("compile: graph contains an unsupported device".to_string());
     }
     let order = graph_post_order(&optimized);
-    // Constructor constants lowered below dispatch Metal kernels. Keep their
-    // automatic execution claim scoped to compilation so execution may move
-    // to another NAPI worker without inheriting a permanently held lock.
-    let _compile_execution_guard = device::begin_execution();
+    // Constructor constants lowered below dispatch Metal kernels. Their
+    // submission is owned and drained before the artifact can be published or
+    // moved to another NAPI worker.
+    let metal = device::MetalDevice::get();
+    let _compile_submission = metal.begin_submission()?;
     let mut lowerer = Lowerer::new(options, ce_chunk_size, environment, state_schema, &slots);
-    for node in &order {
-        lowerer.lower(node)?;
-    }
-    let outputs = optimized
-        .iter()
-        .map(|root| lowerer.child_value(root))
-        .collect::<Result<Vec<_>, _>>()?;
-    let (executable, generated_bindings, generated_slots) =
-        lowerer.finish(outputs, semantic_nodes_before_optimization)?;
+    let lowering_result = (|| {
+        for node in &order {
+            lowerer.lower(node)?;
+        }
+        let outputs = optimized
+            .iter()
+            .map(|root| lowerer.child_value(root))
+            .collect::<Result<Vec<_>, _>>()?;
+        lowerer.finish(outputs, semantic_nodes_before_optimization)
+    })();
+    let gpu_result = metal.synchronize();
+    gpu_result?;
+    let (executable, generated_bindings, generated_slots) = lowering_result?;
     Ok(MetalCompilation {
         executable: Arc::new(executable),
         slots,
@@ -4730,8 +4706,17 @@ fn write_padded_binding(
     Ok(())
 }
 
-/// Executes one already-lowered program, including process-wide Metal
-/// serialization, synchronization, deferred statuses, and state publication.
+fn random_seed(nonce: u64, provenance: u64) -> u64 {
+    let mut value = nonce ^ provenance.wrapping_mul(0x9e37_79b9_7f4a_7c15);
+    value ^= value >> 30;
+    value = value.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    value ^= value >> 27;
+    value = value.wrapping_mul(0x94d0_49bb_1331_11eb);
+    value ^ (value >> 31)
+}
+
+/// Executes one already-lowered program, including invocation-owned Metal
+/// submission, synchronization, deferred statuses, and state publication.
 #[cfg(test)]
 pub(super) fn execute(
     executable: &MetalExecutable,
@@ -4797,7 +4782,6 @@ fn execute_with_commit(
     kv: Option<&dyn MetalDecodeContext>,
     commit_allowed: Option<&dyn Fn() -> bool>,
 ) -> Result<Vec<Value>, String> {
-    let _execution_guard = device::begin_execution();
     if cancelled.load(Ordering::Relaxed) {
         return Err("operation aborted".to_string());
     }
@@ -4846,6 +4830,7 @@ fn execute_with_commit(
                 binding.value
             ));
         }
+        device::MetalDevice::get().synchronize_buffer_producer(&tensor.buffer)?;
         values[binding.value.index()] = Some(source.clone());
     }
 
@@ -4861,7 +4846,7 @@ fn execute_with_commit(
                 .collect::<Vec<_>>()
         );
     }
-    let resources = executable.resources.acquire()?;
+    let resources = crate::workspace::acquire(&executable.memory.segments)?;
     *executable
         .last_invocation_memory
         .lock()
@@ -4889,7 +4874,12 @@ fn execute_with_commit(
                     .get(segment.index())
                     .ok_or_else(|| format!("Metal segment {segment} was not acquired"))?;
                 Some(Value(crate::run::MetalTensor {
-                    buffer: Arc::new(device::Buffer::suballoc(root, *offset, *bytes)),
+                    buffer: Arc::new(device::Buffer::suballoc_with_retention(
+                        root,
+                        *offset,
+                        *bytes,
+                        resources.retentions[segment.index()].clone(),
+                    )),
                     layout: effect_torch_runtime::Layout::contiguous(declaration.shape.to_vec()),
                     dtype: declaration.dtype,
                 }))
@@ -4950,13 +4940,15 @@ fn execute_with_commit(
 
     let mut ce_checks = Vec::new();
     let metal = device::MetalDevice::get();
+    let _submission = metal.begin_submission()?;
+    let invocation_nonce = INVOCATION_NONCE.fetch_add(1, Ordering::AcqRel);
     let dispatch_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let _dispatch_guard = metal.begin_executable_dispatch()?;
         device::with_execution_environment(
             executable.environment.private_intermediates,
             executable.environment.mma,
             || {
-                for command in &executable.commands {
+                for (command_index, command) in executable.commands.iter().enumerate() {
                     if cancelled.load(Ordering::Relaxed) {
                         return Err("operation aborted".to_string());
                     }
@@ -4988,6 +4980,7 @@ fn execute_with_commit(
                         &status,
                         kv,
                         &mut ce_checks,
+                        random_seed(invocation_nonce, command_index as u64),
                     )
                     .map_err(|error| format!("{}: {error}", command.op.name()))?;
                     if command.synchronization.commit_after {
@@ -5048,6 +5041,7 @@ fn execute_op_into(
     status: &[Value],
     kv: Option<&dyn MetalDecodeContext>,
     ce_checks: &mut Vec<DeferredCeCheck>,
+    random_seed: u64,
 ) -> Result<(), String> {
     let input = |index: usize| {
         inputs
@@ -5068,15 +5062,13 @@ fn execute_op_into(
             .ok_or_else(|| "state preparation requires a decode context".to_string())?
             .prepare_state(output(0)?.as_metal()?),
         MetalOp::Randn { shape, dtype } => {
-            static SEED: std::sync::atomic::AtomicU64 =
-                std::sync::atomic::AtomicU64::new(299_792_458);
             let destination = output(0)?.as_metal()?;
             let random = if *dtype == DType::F32 {
                 destination
             } else {
                 scratch_tensors[0]
             };
-            metal_ops::randn_into(random, SEED.fetch_add(1, Ordering::Relaxed))?;
+            metal_ops::randn_into(random, random_seed ^ 299_792_458)?;
             if *dtype != DType::F32 {
                 metal_ops::cast_into(random, destination)?;
             }
@@ -5089,15 +5081,13 @@ fn execute_op_into(
             shape,
             dtype,
         } => {
-            static SEED: std::sync::atomic::AtomicU64 =
-                std::sync::atomic::AtomicU64::new(78_778_899);
             let destination = output(0)?.as_metal()?;
             let random = if *dtype == DType::F32 {
                 destination
             } else {
                 scratch_tensors[0]
             };
-            metal_ops::uniform_into(*lo, *hi, random, SEED.fetch_add(1, Ordering::Relaxed))?;
+            metal_ops::uniform_into(*lo, *hi, random, random_seed ^ 78_778_899)?;
             if *dtype != DType::F32 {
                 metal_ops::cast_into(random, destination)?;
             }
@@ -6691,7 +6681,7 @@ mod tests {
     }
 
     #[test]
-    fn compile_time_constant_releases_execution_for_another_thread() {
+    fn compile_time_constant_is_ready_for_execution_on_another_thread() {
         let constant = Node::new(NodeKind::Full {
             shape: vec![2],
             value: 2.0,
@@ -6706,7 +6696,6 @@ mod tests {
         .unwrap();
 
         let compilation = compile_graph(&[root], false);
-        assert!(!device::execution_claimed_for_test());
 
         let values = std::thread::spawn(move || run(&compilation)[0].to_f32_vec().unwrap())
             .join()
@@ -7360,7 +7349,7 @@ mod tests {
     }
 
     #[test]
-    fn prior_command_buffer_failure_is_propagated_by_the_shared_executor() {
+    fn prior_command_buffer_failure_is_propagated_by_the_owning_submission() {
         let compilation = compile_graph(&[leaf(vec![1.0])], false);
         device::inject_prior_command_buffer_failure_for_test();
         let error = execute(
@@ -7373,10 +7362,6 @@ mod tests {
         .err()
         .unwrap();
         assert!(error.contains("GPU command buffer failure"));
-        assert_eq!(
-            crate::workspace::workspace_pool().stats().leased_segments,
-            0
-        );
     }
 
     #[test]
@@ -7707,7 +7692,7 @@ mod tests {
     }
 
     #[test]
-    fn output_backing_survives_workspace_reuse() {
+    fn retained_output_backing_survives_later_invocations() {
         let random = Node::new(NodeKind::Randn {
             shape: vec![32],
             dtype: DType::F32,
@@ -7715,27 +7700,54 @@ mod tests {
         })
         .unwrap();
         let compilation = compile_graph(&[random], false);
-        device::reset_test_device_buffer_allocations();
-        let first = run(&compilation).remove(0);
-        let expected = first.to_f32_vec().unwrap();
-        let second = run(&compilation).remove(0);
-        assert_ne!(expected, second.to_f32_vec().unwrap());
-        assert_eq!(expected, first.to_f32_vec().unwrap());
-        assert_eq!(device::test_device_buffer_allocations(), 0);
-        let error = execute(
-            &compilation.executable,
-            &[],
-            &compilation.generated_bindings,
-            &CancellationFlag::new(),
-            None,
-        )
-        .err()
+        let mut retained = Vec::new();
+        let mut snapshots = Vec::new();
+        for _ in 0..8 {
+            let output = run(&compilation).remove(0);
+            snapshots.push(output.to_f32_vec().unwrap());
+            retained.push(output);
+        }
+        for (output, expected) in retained.iter().zip(snapshots) {
+            assert_eq!(output.to_f32_vec().unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn one_plan_executes_concurrently_with_independent_submissions() {
+        let input = Node::new(NodeKind::Input {
+            slot: 0,
+            shape: vec![2],
+            dtype: DType::F32,
+            device: Device::Metal,
+        })
         .unwrap();
-        assert!(error.contains("resource capacity exhausted"));
-        assert_eq!(device::test_device_buffer_allocations(), 0);
-        drop(first);
-        assert_eq!(run(&compilation).len(), 1);
-        assert_eq!(device::test_device_buffer_allocations(), 0);
+        let output = Node::new(NodeKind::Neg { a: input }).unwrap();
+        let executable = compile_graph(&[output], false).executable;
+        let barrier = Arc::new(std::sync::Barrier::new(9));
+        let handles = (0..8)
+            .map(|index| {
+                let executable = executable.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    let input = Value(crate::run::MetalTensor::from_f32(
+                        device::MetalDevice::get(),
+                        vec![index as f32, index as f32 + 1.0],
+                        vec![2],
+                    ));
+                    barrier.wait();
+                    execute(&executable, &[input], &[], &CancellationFlag::new(), None)
+                        .unwrap()
+                        .remove(0)
+                })
+            })
+            .collect::<Vec<_>>();
+        barrier.wait();
+        for (index, handle) in handles.into_iter().enumerate() {
+            assert_eq!(
+                handle.join().unwrap().to_f32_vec().unwrap(),
+                [-(index as f32), -(index as f32 + 1.0)]
+            );
+        }
     }
 
     #[test]

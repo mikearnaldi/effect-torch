@@ -1613,7 +1613,7 @@ export const inference = (
           batch: batch ?? 1,
           ...(config.attentionWindow === undefined ? {} : { window: config.attentionWindow })
         }
-        return yield* Tensor.compileDecodeProgram([output], state, { outputCapacity: decodeBatch * 2 }).pipe(
+        return yield* Tensor.compileDecodeProgram([output], state).pipe(
           Effect.mapError((error) => new InferenceError({ op: "inference", message: error.message }))
         )
       })
@@ -1706,7 +1706,7 @@ export const inference = (
           })
           roots.push(yield* Tensor.reshape(row, [vocab!]))
         }
-        return yield* Tensor.freezeProgram(roots, { outputCapacity: decodeBatch * 2 })
+        return yield* Tensor.freezeProgram(roots)
       })
     const prefillExtractors: Array<Tensor.CompiledProgram> = []
     for (let row = 0; row < prefillChunk; row++) {
