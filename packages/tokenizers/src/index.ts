@@ -5,8 +5,14 @@
  * the bundled crate; documents using unsupported or custom components fail.
  *
  * `specialTokens: "Always"` explicitly parses registered special-token
- * strings. `"Never"` routes them through ordinary tokenization, although a
- * one-character special can still resolve through the tokenizer vocabulary.
+ * strings. `"Never"` suppresses exact raw multi-character special contents by
+ * encoding segments around their occurrences separately; normalized aliases
+ * and one-character specials can still be recognized, and tokenization can
+ * differ from one uninterrupted ordinary encode.
+ *
+ * Importing this module eagerly selects and loads a package-local native addon
+ * for supported macOS or Linux `arm64`/`x64` hosts. Unsupported hosts and addon
+ * loading failures throw during module evaluation, before an Effect is created.
  *
  * @since 0.1.0
  * @module
@@ -39,9 +45,11 @@ export type TokenizerTypeId = typeof TokenizerTypeId
 /**
  * Failure from an Effect-returning tokenizer constructor or member. Its
  * members are `_tag: "TokenizerError"`, the operation label, and a diagnostic
- * message. Failures include native errors, file I/O, invalid serialized
- * tokenizers, and batch shape or padding errors. Vocabulary lookup members
- * return {@link Option.Option} instead.
+ * message. Failures include native errors, ordinary file I/O, invalid
+ * serialized tokenizers, and batch shape or padding errors. Vocabulary lookup members
+ * return {@link Option.Option} instead. During file training, a line-read or
+ * UTF-8 error after a successful open has the separate truncation behavior documented by
+ * {@link TrainSource}.
  *
  * @since 0.1.0
  * @category errors
@@ -61,7 +69,9 @@ export class TokenizerError extends Data.TaggedError("TokenizerError")<{
  *
  * A `maxLength` must be a finite non-negative integer. A `padId` must be an
  * unsigned 32-bit integer; membership in the vocabulary is not checked.
- * These numeric constraints are not validated by the constructors.
+ * Neither constructors nor encoding comprehensively validate these numeric
+ * constraints. Invalid values may be coerced by typed-array operations, produce
+ * invalid shape metadata, or fail the encoding Effect.
  *
  * @since 0.1.0
  * @category models
@@ -112,9 +122,11 @@ export const paddingMaxLength = (
 
 /**
  * Per-encode truncation policy, applied before batch padding. `maxLength`
- * must be a finite non-negative integer, but the constructor does not
- * validate it. With `MaxLength` padding, the post-truncation row must fit the
- * padding length or {@link Tokenizer.encodeBatch} fails.
+ * must be a finite non-negative integer. Neither construction nor encoding
+ * validates this comprehensively; invalid values are subject to typed-array
+ * slice coercion and are outside the supported contract. With `MaxLength`
+ * padding, the post-truncation row must fit the padding length or
+ * {@link Tokenizer.encodeBatch} fails.
  *
  * @since 0.1.0
  * @category models
@@ -144,9 +156,10 @@ export const truncationMaxLength = (maxLength: number): Truncation => ({
 
 /**
  * Whether registered special-token strings in input text are parsed into
- * their special ids (`"Always"`) or routed through ordinary tokenization
- * (`"Never"`). A one-character registered string cannot be split and may
- * still resolve to its special id through the tokenizer vocabulary.
+ * their special ids (`"Always"`) or have exact raw multi-character contents
+ * suppressed by segmenting the text at their occurrences (`"Never"`). Segments
+ * are encoded separately, so ordinary merges cannot cross those boundaries.
+ * Normalized aliases and one-character specials can still be recognized.
  * Configured post-processors may also insert tokens; this policy controls
  * input parsing, not structural insertion.
  *
@@ -162,13 +175,21 @@ export type SpecialTokenPolicy = "Never" | "Always"
  * not cloned or frozen. The caller retains ownership but must not mutate them
  * while the tokenizer is in use.
  *
+ * These are facade-level policies. {@link fromFile} and {@link fromJson} retain
+ * native padding and truncation serialized in `tokenizer.json`; this config
+ * supplements rather than clears those settings. Each facade batch row is
+ * encoded natively as a separate sequence, and `"Never"` encodes each nonempty
+ * segment separately. Native `BatchLongest` is therefore not computed across
+ * the facade batch, while fixed native padding or truncation can apply per
+ * segment. Facade truncation and batch padding run afterward.
+ *
  * @since 0.1.0
  * @category models
  */
 export interface TokenizerConfig {
-  /** Batch padding policy; ignored by single and concatenated encoding. */
+  /** Facade batch padding policy; ignored by single and concatenated encoding. */
   readonly padding: Padding
-  /** Per-sequence truncation applied by all encoding members. */
+  /** Facade per-sequence truncation applied after native encoding. */
   readonly truncation: Truncation
   /** Controls special-token parsing; captured when the tokenizer is constructed. */
   readonly specialTokens: SpecialTokenPolicy
@@ -203,8 +224,10 @@ export interface TokenIds {
 export type TokenIdInput = TokenIds | Uint32Array | ReadonlyArray<number>
 
 /**
- * Shared configuration with no padding or truncation and ordinary parsing of
- * special-token strings. This object and its nested singleton policies are
+ * Shared configuration with no facade padding or truncation and the `"Never"`
+ * special-token policy. It does not disable native padding or truncation in a
+ * loaded tokenizer, and `"Never"` has the limitations documented by
+ * {@link SpecialTokenPolicy}. This object and its nested singleton policies are
  * not frozen and must be treated as read-only.
  *
  * @since 0.1.0
@@ -232,8 +255,10 @@ export type TrainModel = "BPE" | "WordPiece" | "Unigram" | "WordLevel"
  * Where {@link train} reads its corpus. `Files` are UTF-8 text streamed in
  * path order and fed one line at a time with `\n` and optional preceding `\r`
  * removed; line boundaries are sequence boundaries and are not trained as
- * characters. A line read or UTF-8 error stops that file's feed. `Texts`
- * feeds each string as one sequence.
+ * characters. Every path is statted and opened before training; those failures
+ * fail the Effect. Any line-read or UTF-8 error after opening is silently
+ * treated as EOF for that path, and training continues with an incomplete
+ * corpus. `Texts` feeds each string as one sequence.
  *
  * Source constructors retain their input arrays without copying them. Keep
  * those arrays unchanged while a source may be used by a lazy training
@@ -274,7 +299,8 @@ export const trainTexts = (texts: ReadonlyArray<string>): TrainSource => ({
  * sizes while processed counts exclude stripped line terminators, so an
  * intermediate processed value can trail the total. Non-empty feed
  * completion is pinned to `(total, total)` and does not mean model computation
- * is complete.
+ * is complete or prove that every byte was consumed; it may still be emitted
+ * after a file was truncated by a swallowed read or UTF-8 error.
  *
  * Reporting is checked once per sequence and emitted after at least
  * `everyBytes` more processed bytes; a large sequence produces one report,
@@ -359,8 +385,9 @@ export interface Tokenizer extends Pipeable {
    */
   readonly vocabSize: number
   /**
-   * Encodes text into caller-owned `[T]` `u32` ids. Truncation applies but
-   * padding does not. Native encoding runs synchronously on the JS thread and
+   * Encodes text into caller-owned `[T]` `u32` ids. Facade truncation applies
+   * but facade batch padding does not. Serialized native fixed policy may apply
+   * independently to every `"Never"` segment. Native encoding runs synchronously on the JS thread and
    * cannot be interrupted once the call starts.
    */
   readonly encode: (
@@ -368,8 +395,10 @@ export interface Tokenizer extends Pipeable {
   ) => Effect.Effect<TokenIds, TokenizerError>
   /**
    * Encodes a non-empty batch in parallel into caller-owned `[B, T]` `u32`
-   * ids. Rows are truncated before applying the padding policy; without
-   * padding, unequal row lengths fail. Native encoding runs off the JS thread,
+   * ids. Every text is encoded as a separate native sequence; serialized native
+   * `BatchLongest` is not computed across this batch, and fixed native policy
+   * may apply per `"Never"` segment. Facade truncation runs before facade
+   * padding; without facade padding, unequal row lengths fail. Native encoding runs off the JS thread,
    * but interrupting the Effect does not cancel work already started.
    */
   readonly encodeBatch: (
@@ -377,8 +406,9 @@ export interface Tokenizer extends Pipeable {
   ) => Effect.Effect<TokenIds, TokenizerError>
   /**
    * Encodes a batch in parallel and concatenates its post-truncation rows into
-   * caller-owned `[sum(T)]` `u32` ids in input order. Padding is ignored and
-   * an empty batch returns `[0]`. Native work runs off the JS thread, but
+   * caller-owned `[sum(T)]` `u32` ids in input order. Facade padding is ignored;
+   * serialized native fixed policy may already have applied per `"Never"`
+   * segment. An empty batch returns `[0]`. Native work runs off the JS thread, but
    * interruption does not cancel work already started.
    */
   readonly encodeBatchConcat: (
@@ -397,19 +427,26 @@ export interface Tokenizer extends Pipeable {
   /**
    * Decodes each outer input as one sequence. Inner {@link TokenIds} shapes
    * are ignored; a `[B, T]` value is not split into rows automatically. The
-   * native batch call runs synchronously on the JS thread.
+   * operation is synchronous from JavaScript's perspective and blocks until
+   * the native batch decode, which may use parallel workers internally, finishes.
+   * It cannot be interrupted once started.
    */
   readonly decodeBatch: (
     ids: ReadonlyArray<TokenIdInput>
   ) => Effect.Effect<ReadonlyArray<string>, TokenizerError>
   /** Synchronously returns the id for an exact vocabulary or added token. */
   readonly tokenToId: (token: string) => Option.Option<number>
-  /** Synchronously returns the token for an id, or `None` when it is unknown. */
+  /**
+   * Synchronously returns the token for an unsigned 32-bit integer id, or
+   * `None` when unknown. Other numbers are unsupported and may be coerced by Node-API.
+   */
   readonly idToToken: (id: number) => Option.Option<string>
   /**
-   * Saves the native tokenizer as a `tokenizer.json`. File I/O and
-   * serialization run synchronously on the JS thread and cannot be
-   * interrupted once started.
+   * Saves the native tokenizer as a `tokenizer.json`. Native settings are
+   * serialized, but the facade {@link TokenizerConfig} is not and must be
+   * supplied again when loading. The target is created or truncated directly,
+   * not written atomically, so failure can leave a partial file. File I/O and
+   * serialization block the JS thread and cannot be interrupted once started.
    */
   readonly save: (path: string) => Effect.Effect<void, TokenizerError>
 }
@@ -543,7 +580,8 @@ const make = (
  * Loads a tokenizer from a supported `tokenizer.json` file. File I/O and
  * parsing run synchronously on the JS thread when the Effect executes and
  * cannot be interrupted once started. The supplied config is retained by
- * reference by the returned tokenizer.
+ * reference by the returned tokenizer and supplements rather than replaces
+ * native padding or truncation serialized in the document.
  *
  * @since 0.1.0
  * @category constructors
@@ -565,7 +603,8 @@ export const fromFile = (
  * Loads a tokenizer from a supported in-memory `tokenizer.json` document.
  * Parsing runs synchronously on the JS thread when the Effect executes and
  * cannot be interrupted once started. The supplied config is retained by
- * reference by the returned tokenizer.
+ * reference by the returned tokenizer and supplements rather than replaces
+ * native padding or truncation serialized in the document.
  *
  * @since 0.1.0
  * @category constructors

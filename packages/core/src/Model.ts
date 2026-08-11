@@ -1,11 +1,13 @@
 /**
- * Models as pure values pairing parameter construction with a
- * parameterised forward graph builder — the Flax/Haiku design, flattened:
+ * Models pair pure parameter construction with a parameterised forward graph
+ * builder — the Flax/Haiku design, flattened:
  * parameters are always a flat array of tensors, configuration lives in
  * the factory's closure, and the forward graph is an ordinary lazy graph,
  * so {@link Gradient.grad} differentiates it and an optimizer's `step`
  * updates it with zero model-specific code. There is no mutable module
- * state or backward mode.
+ * state or backward mode. Each model object also lazily owns mutable
+ * compiled-program cache state exposed through {@link Model.stats} and
+ * {@link Model.clear}.
  *
  * Everything that can fail returns an `Effect`: factories validate their
  * configuration (positive integer feature counts, unique parameter names)
@@ -21,7 +23,7 @@
  * mapped by {@link save} and {@link load}. Every model also carries a
  * compiled execution path:
  * {@link Model.execute} runs the forward as a cached native executable,
- * traced and compiled once per input signature and reused after, while
+ * traced on a signature miss and reused until eviction or clearing, while
  * {@link Model.forward} stays the lazy graph builder for training,
  * composition, and differentiation. {@link inference} builds the separate
  * paged-KV artifact used for autoregressive generation.
@@ -106,27 +108,32 @@ export interface Model {
     input: Tensor.Any
   ) => Effect.Effect<Tensor.Lazy, ModelError | Tensor.TensorError, Runtime.Runtime>
   /**
-   * Runs the frozen forward program: parameters and input in,
+   * Runs the compiled forward program: parameters and input in,
    * materialized output out. With concrete inputs, each invocation makes one
    * native program call after the first call per signature pays the trace;
    * lazy inputs are first materialized through the common executable path. The
    * cache signature includes runtime identity and every parameter and input tensor's
    * shape, dtype, and placement; values do not affect it. Any signature change
-   * traces a new program automatically. `execute` does not retain parameter
+   * traces a new program automatically. Ready entries use a 32-entry LRU, so
+   * eviction, clearing, or a failed trace can retrace a previously seen
+   * signature. `execute` borrows and does not retain parameter
    * values, so materialize lazy initializers once before repeated calls. Use it
    * for evaluation loops; use `forward` wherever a graph is being built
-   * (training, composition, differentiation).
+   * (training, composition, differentiation). The returned concrete output is
+   * caller-owned and should be released with {@link Tensor.clear} when unused.
    */
   readonly execute: (
     params: Params,
     input: Tensor.Any
   ) => Effect.Effect<Tensor.Concrete, ModelError | Tensor.TensorError, Runtime.Runtime>
   /**
-   * Signature-cache diagnostics: programs cached and traces performed.
+   * JavaScript signature-cache diagnostics. `compiled` counts trace attempts,
+   * including failures and retraces, rather than native cold compilations.
    */
   readonly stats: Effect.Effect<Tensor.CompileStats>
   /**
-   * Clears the cached forward programs early (otherwise GC-collected).
+   * Clears JavaScript forward-program entries without clearing parameters,
+   * outputs, native caches, or the cumulative trace-attempt count.
    */
   readonly clear: Effect.Effect<void>
 }
@@ -651,7 +658,10 @@ export const multiHeadAttention = (
  * @category constructors
  */
 export interface KimiDeltaAttentionOptions {
-  /** Epsilon of the output RMS normalization; defaults to `1e-6`. */
+  /**
+   * Epsilon of the output RMS normalization; defaults to `1e-6`. It is not
+   * validated, so callers should provide a positive finite value.
+   */
   readonly normEps?: number
 }
 
@@ -678,8 +688,10 @@ export interface KimiDeltaAttentionOptions {
  * `dtbias` are zero (an initial per-step decay of about `exp(-0.69)`),
  * `norm.weight` is one and biases are zero. Fails with a
  * {@link ModelError} on an empty name, counts that are not positive
- * integers, or `embedDim` not divisible by `numHeads`. The core is not
- * yet differentiable, so this constructor is inference-only for now.
+ * integers, or `embedDim` not divisible by `numHeads`. The KDA and short-conv
+ * cores provide first-order adjoints, so this model is trainable, including
+ * mixed-bf16 training on supporting runtimes. Their backward nodes do not
+ * provide second-order derivatives.
  *
  * @since 0.1.0
  * @category constructors
@@ -966,11 +978,11 @@ export const flatten = (
  * probability `p` (default `0.5`) and scales survivors by `1 / (1 - p)`.
  * This is the functional form — it **always applies**; build the
  * evaluation chain without it (dropout adds nothing to the parameter
- * array, so one checkpoint serves both chains). The mask is drawn at
- * evaluation time, so the usual `randn` rule applies: evaluate the loss
- * and its gradients together in one walk. Fails with a {@link ModelError}
- * if `p` is outside `[0, 1)`. The range check does not reject `NaN`; do not
- * pass it as a probability.
+ * array, so one checkpoint serves both chains). The mask follows
+ * {@link Tensor.randn}'s per-invocation sharing rule: submit a loss and its
+ * gradients as roots of the same invocation when they must share it. Fails
+ * with a {@link ModelError} if `p` is outside `[0, 1)`. The range check does
+ * not reject `NaN`; do not pass it as a probability.
  *
  * @since 0.1.0
  * @category constructors
@@ -1264,7 +1276,7 @@ export const chain = (...models: ReadonlyArray<Model>): Effect.Effect<Model, Mod
  * Saves a model's parameters to a safetensors file, zipping `model.names`
  * with the parameter array into the record {@link Tensor.save} takes.
  * Fails with a {@link ModelError} if the parameter array's length does
- * not match the model's arity.
+ * not match the model's arity. Saving borrows parameters and does not clear them.
  *
  * @since 0.1.0
  * @category destructors
@@ -1288,10 +1300,13 @@ export const save = (
  * Loads a model's parameters from a safetensors file written by
  * {@link save}, returning the materialized tensors in `model.names` order
  * — the same array `forward` and optimizer steps expect. A missing key
- * fails with a {@link ModelError}; extra keys are ignored. Shape or dtype
+ * fails with a {@link ModelError}; extra keys are ignored. {@link Tensor.load}
+ * materializes the whole archive, so extra entries, and all imported entries
+ * after a missing-key failure, are left to native finalization. Shape or dtype
  * mismatches against the architecture surface as graph-build errors on
  * first use. Loading for a parameterless model therefore returns `[]` and
- * ignores every stored tensor.
+ * ignores every stored tensor. Returned handles are caller-owned and should be
+ * released with {@link Tensor.clear} when no longer needed.
  *
  * @since 0.1.0
  * @category destructors
@@ -1354,8 +1369,8 @@ export interface InferenceConfig {
    */
   readonly blockSize?: number
   /**
-   * Positive integer number of cached positions attended per step. Omit
-   * for full attention. A window permits old KV blocks to be evicted; with
+   * Positive integer number of cached positions attended per step, no greater
+   * than `maxTokens`. Omit for full attention. A window permits old KV blocks to be evicted; with
    * RoPE and no other absolute-position state this can extend generation
    * beyond `maxTokens` when the pool can hold the active window and block
    * frontier, subject to backend numeric and resource limits. Learned
@@ -1428,7 +1443,7 @@ export interface GenerationSeq {
 export interface GenerationEntry {
   /** The new live sequence handle. */
   readonly seq: GenerationSeq
-  /** Materialized final-prompt-position logits with shape `[vocab]`. */
+  /** Caller-owned final-prompt-position logits with shape `[vocab]`. */
   readonly logits: Tensor.Concrete
 }
 
@@ -1437,11 +1452,13 @@ export interface GenerationEntry {
  * are added individually with {@link Generation.add}, which performs
  * chunked prefill; {@link Generation.step} advances one or more in one
  * run. The entries are the batch: one entry uses the `[1, 1]` program and
- * more use one fixed-width batched run with native padding. The pool keeps a
+ * more use one fixed-width batched run with native padding. For artifacts
+ * without KDA or short-convolution recurrent state, the pool keeps a
  * content-addressed prefix cache: prompts whose leading blocks are
  * already resident (computed by an earlier, since finished or
  * still-live sequence) reuse them and compute only their suffix —
- * sharing is automatic and invisible to callers.
+ * sharing is automatic and invisible to callers. Recurrent artifacts skip
+ * prefix reuse because cached KV blocks do not reconstruct recurrent state.
  *
  * Sessions are ordinary values and require no `Scope`. Independent
  * sessions may run concurrently. Calls to `step` on one session are
@@ -1466,7 +1483,9 @@ export interface Generation {
   ) => Effect.Effect<GenerationEntry, InferenceError | ModelError | Tensor.TensorError, Runtime.Runtime>
   /**
    * Advances every entry's sequence by one token in one run and returns
-   * materialized `[vocab]` logits in entry order. The array must be nonempty
+   * caller-owned materialized `[vocab]` logits in entry order. Finishing a
+   * sequence or closing the session does not release previously returned
+   * logits. The array must be nonempty
    * and contain at most `decodeBatch` distinct live sequences from this
    * session. Each token must be a non-negative integer representable by the
    * configured token dtype and valid for the model vocabulary. Calls on the
@@ -1521,24 +1540,27 @@ export interface InferenceProgram {
 
 /**
  * Compiles a model for generation. The same `forward` graph builder is
- * traced with placeholders and rewritten natively: causal attention becomes
- * paged KV attention and position nodes become cursor-offset operations.
+ * traced with placeholders and decode-specialized natively: causal attention
+ * becomes paged KV attention and position nodes become cursor-offset operations.
  * Construction eagerly freezes prefill `[1, prefillChunk]` and decode
  * `[1, 1]` programs, plus batched decode `[decodeBatch, 1]` when
  * `decodeBatch > 1`. There is no shape-keyed growth or later tracing.
  *
  * The model must return logits exactly as `[batch, T, vocab]`, preserving
  * the two token-input axes; generation returns the selected final-position
- * row as `[vocab]`. A forward with no causal
- * `scaledDotProductAttention`, with non-causal attention, or with runtime
- * scalar inputs fails with an {@link InferenceError}. Learned position
+ * row as `[vocab]`. Stateless graphs are accepted. Causal attention, KDA,
+ * short convolution, and position operations use incremental state or cursor
+ * specialization when present. Non-causal attention and runtime scalar inputs
+ * fail with an {@link InferenceError}. Learned position
  * embeddings remain bounded by their table's total absolute cursor, even
  * with an attention window.
  *
- * `params` are eagerly materialized once with {@link Tensor.compute} before
- * tracing. This freezes lazy initializer draws for every later prefill and
+ * `params` are borrowed and eagerly materialized once with
+ * {@link Tensor.compute} before tracing. This freezes lazy initializer draws for every later prefill and
  * step. The concrete parameters remain native program inputs captured by
- * the artifact, so generation callers do not thread them.
+ * the artifact, so generation callers do not thread them. Caller-supplied
+ * concrete handles are not consumed; the artifact retains its own materialized
+ * generation until it becomes unreachable.
  *
  * The artifact and sessions require no `Scope`. Static programs and pool
  * memory are released by native finalizers when unreachable. Live sequences

@@ -1,4 +1,5 @@
 use effect_torch_runtime::{InstructionId, Location, SegmentOwnership, StorageClass, ValueId};
+use std::marker::PhantomData;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ValueAccess {
@@ -57,6 +58,15 @@ impl OutputDecl {
     }
 }
 
+/// Backend-neutral effects which are not represented by declared value uses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub struct InstructionEffects {
+    /// The instruction can report an execution failure.
+    pub may_fail: bool,
+    /// The instruction has observable effects beyond its declared resource writes.
+    pub has_side_effects: bool,
+}
+
 /// Storage which is supplied outside the planner or is already assigned.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum ValueStorage<M> {
@@ -82,6 +92,17 @@ pub struct ValueDecl<M> {
     pub name: String,
     pub bytes: usize,
     pub storage: ValueStorage<M>,
+}
+
+/// A backend value record containing the declaration authoritative for planning.
+pub trait LoweredValue<M> {
+    fn value_decl(&self) -> &ValueDecl<M>;
+}
+
+impl<M> LoweredValue<M> for ValueDecl<M> {
+    fn value_decl(&self) -> &ValueDecl<M> {
+        self
+    }
 }
 
 impl<M> ValueDecl<M> {
@@ -139,6 +160,11 @@ pub struct LoweredInstruction<K> {
     pub kind: K,
     pub inputs: Box<[ValueUse]>,
     pub outputs: Box<[OutputDecl]>,
+    pub scratch: Box<[ValueUse]>,
+    pub staging: Box<[ValueUse]>,
+    pub status: Box<[ValueUse]>,
+    pub state: Box<[ValueUse]>,
+    pub effects: InstructionEffects,
 }
 
 impl<K> LoweredInstruction<K> {
@@ -153,21 +179,65 @@ impl<K> LoweredInstruction<K> {
             kind,
             inputs: inputs.into(),
             outputs: outputs.into(),
+            scratch: Box::new([]),
+            staging: Box::new([]),
+            status: Box::new([]),
+            state: Box::new([]),
+            effects: InstructionEffects::default(),
         }
+    }
+
+    pub fn with_resources(
+        mut self,
+        scratch: impl Into<Box<[ValueUse]>>,
+        staging: impl Into<Box<[ValueUse]>>,
+        status: impl Into<Box<[ValueUse]>>,
+        state: impl Into<Box<[ValueUse]>>,
+    ) -> Self {
+        self.scratch = scratch.into();
+        self.staging = staging.into();
+        self.status = status.into();
+        self.state = state.into();
+        self
+    }
+
+    pub const fn with_effects(mut self, effects: InstructionEffects) -> Self {
+        self.effects = effects;
+        self
+    }
+
+    /// All values touched by this instruction. Outputs are defining writes.
+    pub fn resource_uses(&self) -> impl Iterator<Item = ValueUse> + '_ {
+        self.inputs
+            .iter()
+            .copied()
+            .chain(
+                self.outputs
+                    .iter()
+                    .map(|output| ValueUse::write(output.value)),
+            )
+            .chain(self.scratch.iter().copied())
+            .chain(self.staging.iter().copied())
+            .chain(self.status.iter().copied())
+            .chain(self.state.iter().copied())
     }
 }
 
-/// Dense compiler IR consumed by liveness and backend command planning.
+/// Authoritative dense compiler IR consumed by planning and execution.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct LoweredSchedule<K, M> {
-    pub values: Box<[ValueDecl<M>]>,
+pub struct LoweredProgram<K, M, V = ValueDecl<M>> {
+    pub values: Box<[V]>,
     pub instructions: Box<[LoweredInstruction<K>]>,
     pub outputs: Box<[ValueId]>,
+    memory_space: PhantomData<fn() -> M>,
 }
 
-impl<K, M> LoweredSchedule<K, M> {
+impl<K, M, V> LoweredProgram<K, M, V>
+where
+    V: LoweredValue<M>,
+{
     pub fn new(
-        values: impl Into<Box<[ValueDecl<M>]>>,
+        values: impl Into<Box<[V]>>,
         instructions: impl Into<Box<[LoweredInstruction<K>]>>,
         outputs: impl Into<Box<[ValueId]>>,
     ) -> Self {
@@ -175,6 +245,7 @@ impl<K, M> LoweredSchedule<K, M> {
             values: values.into(),
             instructions: instructions.into(),
             outputs: outputs.into(),
+            memory_space: PhantomData,
         }
     }
 }

@@ -14,23 +14,27 @@ use crate::workspace::{workspace_pool, workspace_request, CpuWorkspaceLease};
 use crate::{composed, conv, fusion, CpuBuffer, CpuDestination, CpuSegment, CpuTensorRequirement};
 use crate::{ExecutableAllocationGuard, Tensor, CPU_STORAGE_ALIGNMENT};
 use effect_torch_compiler::{
-    build_executable_diagnostics, fuse_roots_with_options, graph_post_order, plan_memory,
-    CompileOptions, DiagnosticsInput, Expr, LoweredInstruction, LoweredSchedule,
-    MemoryPlannerConfig, OutputDecl, ProgramSlot, ValueAccess, ValueDecl, ValueStorage, ValueUse,
+    build_executable_diagnostics, CompileOptions, CompilerDriver, CompilerWorkReport, DenseNodeId,
+    DiagnosticsInput, Expr, GraphIndex, InstructionEffects, LoweredInstruction, LoweredProgram,
+    LoweredValue, LoweringUnit, MemoryPlannerConfig, NativeRegion, OptimizationPlan, OutputDecl,
+    PreparedProgram, ProgramRequest, ProgramSlot, RegionId, StateCursorSlot, ValueDecl,
+    ValueStorage, ValueUse, ARTIFACT_ASSEMBLY_PHASE, PHYSICAL_PLANNING_PHASE, PUBLICATION_PHASE,
 };
 use effect_torch_graph::{
     node_children, CrossEntropyReduction, Device, Node as GraphNode, NodeKind, PositionOffset,
 };
 use effect_torch_runtime::{
-    CancellationFlag, DType, ExecutableDiagnostics, InstructionId, InvocationMemoryReport,
-    Location, MemoryPlan, NativeMemorySpace, SegmentOwnership, StorageClass, ValueId,
+    Buffer, CancellationFlag, DType, ExecutableDiagnostics, InstructionId, InvocationMemoryReport,
+    Location, MemoryPlan, NativeMemorySpace, ProgramSignature, SegmentOwnership, StorageClass,
+    ValueId,
 };
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Instant;
 
-pub type Node = GraphNode<Expr>;
+pub type Node = GraphNode;
 static INVOCATION_NONCE: AtomicU64 = AtomicU64::new(0);
 
 fn cpu_device() -> Device {
@@ -77,10 +81,24 @@ pub struct CpuStatePlan {
 }
 
 #[derive(Debug, Clone)]
-pub struct CpuValueDecl {
+struct CpuValueMetadata {
     pub shape: Box<[usize]>,
     pub dtype: DType,
     pub layout: effect_torch_runtime::Layout,
+}
+
+#[derive(Debug, Clone)]
+pub struct CpuLoweredValue {
+    pub shape: Box<[usize]>,
+    pub dtype: DType,
+    pub layout: effect_torch_runtime::Layout,
+    pub declaration: ValueDecl<NativeMemorySpace>,
+}
+
+impl LoweredValue<NativeMemorySpace> for CpuLoweredValue {
+    fn value_decl(&self) -> &ValueDecl<NativeMemorySpace> {
+        &self.declaration
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -458,45 +476,76 @@ pub enum CpuAlgorithmPlan {
 }
 
 #[derive(Debug, Clone)]
-pub struct CpuCommand {
-    pub op: CpuOp,
-    pub inputs: Box<[ValueId]>,
-    pub outputs: Box<[ValueId]>,
-    pub scratch: Box<[ValueId]>,
-    pub staging: Box<[ValueId]>,
-    pub state_outputs: Box<[ValueId]>,
-    pub plan: CpuAlgorithmPlan,
+pub enum CpuInstruction {
+    PrepareInvocation,
+    Operation { op: CpuOp, plan: CpuAlgorithmPlan },
+    FinalizeInvocation,
+}
+
+impl CpuInstruction {
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::PrepareInvocation => "prepare_invocation",
+            Self::Operation { op, .. } => op.name(),
+            Self::FinalizeInvocation => "finalize_invocation",
+        }
+    }
+
+    pub fn operation(&self) -> Option<(&CpuOp, &CpuAlgorithmPlan)> {
+        match self {
+            Self::Operation { op, plan } => Some((op, plan)),
+            Self::PrepareInvocation | Self::FinalizeInvocation => None,
+        }
+    }
+}
+
+pub type CpuCommand = LoweredInstruction<CpuInstruction>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CpuPhysicalCommand {
+    Encode(InstructionId),
 }
 
 pub struct CpuExecutable {
-    pub values: Box<[CpuValueDecl]>,
+    pub signature: ProgramSignature,
+    pub program: Arc<LoweredProgram<CpuInstruction, NativeMemorySpace, CpuLoweredValue>>,
+    pub physical: Box<[CpuPhysicalCommand]>,
     pub bindings: Box<[CpuBinding]>,
     scalar_bindings: Box<[CpuScalarBinding]>,
     padded_bindings: Box<[CpuPaddedBinding]>,
     constants: Box<[CpuConstant]>,
-    pub commands: Box<[CpuCommand]>,
-    pub outputs: Box<[ValueId]>,
     pub options: CompileOptions,
     pub memory: MemoryPlan<NativeMemorySpace>,
     pub diagnostics: ExecutableDiagnostics,
+    pub compiler_work: CompilerWorkReport,
     pub state_cursor: Option<ValueId>,
 }
 
 impl fmt::Debug for CpuExecutable {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("CpuExecutable")
-            .field("values", &self.values)
+            .field("signature", &self.signature)
+            .field("program", &self.program)
+            .field("physical", &self.physical)
             .field("bindings", &self.bindings)
             .field("scalar_bindings", &self.scalar_bindings)
             .field("padded_bindings", &self.padded_bindings)
             .field("constant_count", &self.constants.len())
-            .field("commands", &self.commands)
-            .field("outputs", &self.outputs)
             .field("options", &self.options)
             .field("memory", &self.memory)
             .field("diagnostics", &self.diagnostics)
+            .field("compiler_work", &self.compiler_work)
             .field("state_cursor", &self.state_cursor)
             .finish()
+    }
+}
+
+impl CpuExecutable {
+    pub fn instruction(&self, id: InstructionId) -> Option<&CpuCommand> {
+        self.program
+            .instructions
+            .get(id.index())
+            .filter(|instruction| instruction.id == id)
     }
 }
 
@@ -507,8 +556,26 @@ pub struct CpuCompilation {
     pub generated_slots: Vec<usize>,
 }
 
+#[derive(Clone)]
+pub struct CpuGeneratedValue {
+    node: DenseNodeId,
+    node_id: u64,
+    slot_identity: usize,
+    value: Value,
+}
+
+impl CpuGeneratedValue {
+    pub fn slot_identity(&self) -> usize {
+        self.slot_identity
+    }
+
+    pub fn value(&self) -> &Value {
+        &self.value
+    }
+}
+
 struct Lowerer {
-    values: Vec<CpuValueDecl>,
+    values: Vec<CpuValueMetadata>,
     storage: Vec<CpuValueStorage>,
     names: Vec<String>,
     bindings: Vec<CpuBinding>,
@@ -516,10 +583,11 @@ struct Lowerer {
     padded_bindings: Vec<CpuPaddedBinding>,
     declared_sources: HashMap<u32, CpuDeclaredSource>,
     constants: Vec<CpuConstant>,
-    commands: Vec<CpuCommand>,
+    instructions: Vec<LoweredInstruction<CpuInstruction>>,
     node_values: HashMap<u64, Box<[ValueId]>>,
     declared_values: HashMap<u32, ValueId>,
     random_provenance: HashMap<u64, u64>,
+    preloaded_generated: HashMap<u64, Value>,
     generated: Vec<Value>,
     generated_slots: Vec<usize>,
     state: Option<CpuStatePlan>,
@@ -536,6 +604,7 @@ impl Lowerer {
         random_provenance: HashMap<u64, u64>,
         slots: &[ProgramSlot],
         state: Option<CpuStatePlan>,
+        generated_values: &[CpuGeneratedValue],
     ) -> Self {
         let padded_slot = state.and_then(|state| {
             slots
@@ -581,10 +650,14 @@ impl Lowerer {
             padded_bindings: Vec::new(),
             declared_sources,
             constants: Vec::new(),
-            commands: Vec::new(),
+            instructions: Vec::new(),
             node_values: HashMap::new(),
             declared_values: HashMap::new(),
             random_provenance,
+            preloaded_generated: generated_values
+                .iter()
+                .map(|generated| (generated.node_id, generated.value.clone()))
+                .collect(),
             generated: Vec::new(),
             generated_slots: Vec::new(),
             state,
@@ -626,7 +699,7 @@ impl Lowerer {
             .ok_or_else(|| "compile: value byte size overflow".to_string())?;
         let id = ValueId::from_index(self.values.len())
             .ok_or_else(|| "compile: too many CPU values".to_string())?;
-        self.values.push(CpuValueDecl {
+        self.values.push(CpuValueMetadata {
             shape: shape.to_vec().into_boxed_slice(),
             dtype,
             layout,
@@ -658,6 +731,24 @@ impl Lowerer {
             .ok_or_else(|| format!("compile: child {} was not lowered", child.id))
     }
 
+    fn dense_value(&self, index: &GraphIndex, node: DenseNodeId) -> Result<ValueId, String> {
+        let node = index
+            .node(node)
+            .ok_or_else(|| format!("compile: dense node {node} is out of range"))?;
+        self.child_value(node)
+    }
+
+    fn dense_values(
+        &self,
+        index: &GraphIndex,
+        nodes: &[DenseNodeId],
+    ) -> Result<Vec<ValueId>, String> {
+        nodes
+            .iter()
+            .map(|node| self.dense_value(index, *node))
+            .collect()
+    }
+
     fn alias_value(
         &mut self,
         source: ValueId,
@@ -685,16 +776,24 @@ impl Lowerer {
         )
     }
 
-    fn command(&mut self, op: CpuOp, inputs: Vec<ValueId>, outputs: Vec<ValueId>) {
-        self.commands.push(CpuCommand {
-            op,
-            inputs: inputs.into_boxed_slice(),
-            outputs: outputs.into_boxed_slice(),
-            scratch: Box::new([]),
-            staging: Box::new([]),
-            state_outputs: Box::new([]),
-            plan: CpuAlgorithmPlan::None,
-        });
+    fn command(
+        &mut self,
+        op: CpuOp,
+        inputs: Vec<ValueId>,
+        outputs: Vec<ValueId>,
+    ) -> Result<(), String> {
+        let id = InstructionId::from_index(self.instructions.len())
+            .ok_or_else(|| "compile: too many CPU instructions".to_string())?;
+        self.instructions.push(LoweredInstruction::new(
+            id,
+            CpuInstruction::Operation {
+                op,
+                plan: CpuAlgorithmPlan::None,
+            },
+            inputs.into_iter().map(ValueUse::read).collect::<Vec<_>>(),
+            outputs.into_iter().map(OutputDecl::new).collect::<Vec<_>>(),
+        ));
+        Ok(())
     }
 
     fn metadata_tensor(&self, value: ValueId) -> Result<Tensor, String> {
@@ -739,10 +838,22 @@ impl Lowerer {
     }
 
     fn prepare_last_command(&mut self) -> Result<(), String> {
-        let index = self.commands.len() - 1;
-        let op = self.commands[index].op.clone();
-        let inputs = self.commands[index].inputs.to_vec();
-        let outputs = self.commands[index].outputs.to_vec();
+        let index = self.instructions.len() - 1;
+        let (op, _) = self.instructions[index]
+            .kind
+            .operation()
+            .expect("lowerer only prepares operation instructions");
+        let op = op.clone();
+        let inputs = self.instructions[index]
+            .inputs
+            .iter()
+            .map(|value_use| value_use.value)
+            .collect::<Vec<_>>();
+        let outputs = self.instructions[index]
+            .outputs
+            .iter()
+            .map(|output| output.value)
+            .collect::<Vec<_>>();
         let tensors = inputs
             .iter()
             .map(|value| self.metadata_tensor(*value))
@@ -1328,17 +1439,45 @@ impl Lowerer {
             CpuOp::KvAttention { .. } => CpuAlgorithmPlan::None,
             _ => CpuAlgorithmPlan::None,
         };
-        self.commands[index].scratch = scratch.into_boxed_slice();
-        self.commands[index].staging = staging.into_boxed_slice();
-        self.commands[index].state_outputs = state_outputs.into_boxed_slice();
-        self.commands[index].plan = plan;
+        let instruction = &mut self.instructions[index];
+        instruction.scratch = scratch
+            .into_iter()
+            .map(ValueUse::read_write)
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        instruction.staging = staging
+            .into_iter()
+            .map(ValueUse::read_write)
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        instruction.state = state_outputs
+            .into_iter()
+            .map(ValueUse::write)
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        instruction.effects = InstructionEffects {
+            may_fail: true,
+            has_side_effects: matches!(
+                op,
+                CpuOp::KdaRecurrence { .. } | CpuOp::ConvState { .. } | CpuOp::KvAttention { .. }
+            ),
+        };
+        let CpuInstruction::Operation {
+            plan: instruction_plan,
+            ..
+        } = &mut instruction.kind
+        else {
+            unreachable!("lowerer only prepares operation instructions")
+        };
+        *instruction_plan = plan;
         Ok(())
     }
 
     fn constant(&mut self, node: &Arc<Node>, payload: Value) -> Result<(), String> {
-        let value = self.value(
+        let value = self.value_with_layout(
             &node.shape,
             node.dtype,
+            payload.tensor().layout.clone(),
             CpuValueStorage::Constant,
             "constant",
         )?;
@@ -1370,6 +1509,310 @@ impl Lowerer {
         Ok(())
     }
 
+    fn bind_region_outputs(
+        &mut self,
+        index: &GraphIndex,
+        plan: &OptimizationPlan,
+        region_id: RegionId,
+        region: &NativeRegion,
+        outputs: &[ValueId],
+    ) -> Result<(), String> {
+        for output in region.semantic_outputs() {
+            let route = plan
+                .outputs
+                .get(output.semantic_node.index())
+                .copied()
+                .flatten()
+                .ok_or_else(|| {
+                    format!(
+                        "compile: region {region_id} semantic output {} has no physical route",
+                        output.semantic_node
+                    )
+                })?;
+            if route.region != region_id || route.index != output.index {
+                return Err(format!(
+                    "compile: region {region_id} semantic output {} has an inconsistent route",
+                    output.semantic_node
+                ));
+            }
+            let semantic = index.node(output.semantic_node).ok_or_else(|| {
+                format!(
+                    "compile: optimization output {} is out of range",
+                    output.semantic_node
+                )
+            })?;
+            let value = outputs.get(output.index as usize).copied().ok_or_else(|| {
+                format!(
+                    "compile: region {region_id} has no physical output {} for semantic node {}",
+                    output.index, semantic.id
+                )
+            })?;
+            let declaration = &self.values[value.index()];
+            if declaration.shape.as_ref() != semantic.shape || declaration.dtype != semantic.dtype {
+                return Err(format!(
+                    "compile: region {region_id} output {} metadata does not match semantic node {}",
+                    output.index, semantic.id
+                ));
+            }
+            match self.node_values.insert(semantic.id, Box::new([value])) {
+                Some(previous) if previous.as_ref() != [value] => {
+                    return Err(format!(
+                        "compile: semantic node {} was routed to multiple physical values",
+                        semantic.id
+                    ));
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
+    fn region_outputs(
+        &mut self,
+        region: RegionId,
+        count: usize,
+        shape: &[usize],
+        dtype: DType,
+    ) -> Result<Vec<ValueId>, String> {
+        (0..count)
+            .map(|output| {
+                self.dynamic_value(shape, dtype, &format!("region_{region}_output_{output}"))
+            })
+            .collect()
+    }
+
+    fn lower_region(
+        &mut self,
+        index: &GraphIndex,
+        plan: &OptimizationPlan,
+        region_id: RegionId,
+    ) -> Result<(), String> {
+        let region = plan
+            .regions
+            .get(region_id.index())
+            .ok_or_else(|| format!("compile: optimization region {region_id} is out of range"))?;
+        let (op, inputs, outputs) = match region {
+            NativeRegion::Elementwise(region) => {
+                if !region.device.is_cpu() {
+                    return Err(format!(
+                        "compile: impossible CPU optimization plan contains an elementwise region for {}",
+                        region.device.name()
+                    ));
+                }
+                ensure_fusion_dtype(region.dtype)?;
+                let inputs = self.dense_values(index, &region.inputs)?;
+                let strides = inputs
+                    .iter()
+                    .map(|value| {
+                        self.values[value.index()]
+                            .layout
+                            .broadcast_to(&region.shape)
+                            .strides()
+                            .to_vec()
+                    })
+                    .collect();
+                let outputs = self.region_outputs(region_id, 1, &region.shape, region.dtype)?;
+                (
+                    CpuOp::FusedElementwise {
+                        strides,
+                        shape: region.shape.clone(),
+                        exprs: vec![region.output.expression.clone()].into_boxed_slice(),
+                    },
+                    inputs,
+                    outputs,
+                )
+            }
+            NativeRegion::ElementwiseReduce(region) => {
+                if !region.device.is_cpu() {
+                    return Err(format!(
+                        "compile: impossible CPU optimization plan contains an elementwise-reduce region for {}",
+                        region.device.name()
+                    ));
+                }
+                ensure_fusion_dtype(region.dtype)?;
+                let inputs = self.dense_values(index, &region.inputs)?;
+                let strides = inputs
+                    .iter()
+                    .map(|value| {
+                        self.values[value.index()]
+                            .layout
+                            .broadcast_to(&region.input_shape)
+                            .strides()
+                            .to_vec()
+                    })
+                    .collect();
+                let outputs = self.region_outputs(region_id, 1, &region.shape, region.dtype)?;
+                (
+                    CpuOp::FusedReduce {
+                        strides,
+                        in_shape: region.input_shape.clone(),
+                        expr: region.expression.clone(),
+                        op: region.op,
+                        dims: region.dims.clone(),
+                        keepdims: region.keepdims,
+                        shape: region.shape.clone(),
+                    },
+                    inputs,
+                    outputs,
+                )
+            }
+            NativeRegion::MultiOutput(region) => {
+                if !region.device.is_cpu() {
+                    return Err(format!(
+                        "compile: impossible CPU optimization plan contains a multi-output region for {}",
+                        region.device.name()
+                    ));
+                }
+                ensure_fusion_dtype(region.dtype)?;
+                let inputs = self.dense_values(index, &region.inputs)?;
+                let strides = inputs
+                    .iter()
+                    .map(|value| {
+                        self.values[value.index()]
+                            .layout
+                            .broadcast_to(&region.shape)
+                            .strides()
+                            .to_vec()
+                    })
+                    .collect();
+                let outputs = self.region_outputs(
+                    region_id,
+                    region.outputs.len(),
+                    &region.shape,
+                    region.dtype,
+                )?;
+                (
+                    CpuOp::FusedElementwise {
+                        strides,
+                        shape: region.shape.clone(),
+                        exprs: region
+                            .outputs
+                            .iter()
+                            .map(|output| output.expression.clone())
+                            .collect(),
+                    },
+                    inputs,
+                    outputs,
+                )
+            }
+            NativeRegion::AdamW(region) => {
+                if !region.device.is_cpu() {
+                    return Err(format!(
+                        "compile: impossible CPU optimization plan contains an AdamW region for {}",
+                        region.device.name()
+                    ));
+                }
+                ensure_fusion_dtype(region.dtype)?;
+                let inputs = self.dense_values(index, &region.inputs)?;
+                let outputs = self.region_outputs(
+                    region_id,
+                    region.expressions.len(),
+                    &region.shape,
+                    region.dtype,
+                )?;
+                (
+                    CpuOp::AdamW {
+                        beta1: region.options.beta1,
+                        beta2: region.options.beta2,
+                        eps: region.options.eps,
+                        weight_decay: region.options.weight_decay,
+                        implementation: OptimizerImplementation::Fused,
+                        fused_exprs: Some(region.expressions.clone()),
+                    },
+                    inputs,
+                    outputs,
+                )
+            }
+            NativeRegion::AdamWGroup(region) => {
+                if !region.device.is_cpu() {
+                    return Err(format!(
+                        "compile: impossible CPU optimization plan contains an AdamW-group region for {}",
+                        region.device.name()
+                    ));
+                }
+                ensure_fusion_dtype(region.dtype)?;
+                // CpuOp::AdamWGroup uses blocked command inputs and interleaves
+                // these lanes immediately before fusion execution.
+                let mut dense_inputs = Vec::with_capacity(region.inputs.len());
+                for lane in 0..4 {
+                    dense_inputs.extend(
+                        region
+                            .parameter_inputs
+                            .iter()
+                            .map(|parameter| parameter[lane]),
+                    );
+                }
+                dense_inputs.extend(region.scalar_inputs);
+                let inputs = self.dense_values(index, &dense_inputs)?;
+                let outputs = self.region_outputs(
+                    region_id,
+                    region.expressions.len(),
+                    &region.shape,
+                    region.dtype,
+                )?;
+                (
+                    CpuOp::AdamWGroup {
+                        parameters: region.parameter_inputs.len(),
+                        fused_exprs: region.expressions.clone(),
+                    },
+                    inputs,
+                    outputs,
+                )
+            }
+            NativeRegion::Sgd(region) => {
+                if !region.device.is_cpu() {
+                    return Err(format!(
+                        "compile: impossible CPU optimization plan contains an SGD region for {}",
+                        region.device.name()
+                    ));
+                }
+                ensure_fusion_dtype(region.dtype)?;
+                // CpuOp::Sgd expects [param, grad, velocity, first, lr].
+                let dense_inputs = [
+                    region.tensor_inputs[0],
+                    region.tensor_inputs[1],
+                    region.tensor_inputs[2],
+                    region.scalar_inputs[1],
+                    region.scalar_inputs[0],
+                ];
+                let inputs = self.dense_values(index, &dense_inputs)?;
+                let outputs = self.region_outputs(
+                    region_id,
+                    region.expressions.len(),
+                    &region.shape,
+                    region.dtype,
+                )?;
+                (
+                    CpuOp::Sgd {
+                        momentum: region.options.momentum,
+                        dampening: region.options.dampening,
+                        nesterov: region.options.nesterov,
+                        weight_decay: region.options.weight_decay,
+                        implementation: OptimizerImplementation::Fused,
+                        fused_exprs: Some(region.expressions.clone()),
+                    },
+                    inputs,
+                    outputs,
+                )
+            }
+            NativeRegion::LinearResidual(region) => {
+                return Err(format!(
+                    "compile: impossible CPU optimization plan contains Metal-only linear-residual region for {}",
+                    region.device.name()
+                ));
+            }
+            NativeRegion::LinearGelu(region) => {
+                return Err(format!(
+                    "compile: impossible CPU optimization plan contains Metal-only linear-GELU region for {}",
+                    region.device.name()
+                ));
+            }
+        };
+        self.command(op, inputs, outputs.clone())?;
+        self.prepare_last_command()?;
+        self.bind_region_outputs(index, plan, region_id, region, &outputs)
+    }
+
     fn lower(&mut self, node: &Arc<Node>) -> Result<(), String> {
         if !node.device.is_cpu() {
             return Err(format!(
@@ -1391,9 +1834,12 @@ impl Lowerer {
 
         match &node.kind {
             NodeKind::Leaf(slot) => {
-                let payload: Value = slot
-                    .get()
-                    .map_err(|error| format!("compile: generated binding {}: {error}", node.id))?;
+                let payload = self.preloaded_generated.remove(&node.id).ok_or_else(|| {
+                    format!(
+                        "compile: generated binding {} has no prepared value",
+                        node.id
+                    )
+                })?;
                 if payload.shape() != node.shape || payload.dtype() != node.dtype {
                     return Err(format!(
                         "compile: generated binding {} changed shape or dtype",
@@ -1408,6 +1854,10 @@ impl Lowerer {
                         "compile: generated binding {} has an unsupported layout",
                         node.id
                     ));
+                }
+                if self.options.constant_weights() {
+                    self.constant(node, payload)?;
+                    return Ok(());
                 }
                 let generated = u32::try_from(self.generated.len())
                     .map_err(|_| "compile: too many generated bindings".to_string())?;
@@ -1537,16 +1987,12 @@ impl Lowerer {
             NodeKind::SdpaBackwardOut { of, index }
             | NodeKind::ChunkedHeadCeBackwardOut { of, index }
             | NodeKind::KdaBackwardOut { of, index }
-            | NodeKind::FusedPick { of, index }
             | NodeKind::AdamWOut { step: of, index }
             | NodeKind::SgdOut { step: of, index } => {
                 return self.selector(node, of, *index as usize)
             }
             NodeKind::LayerNormBackwardOut { of, index } => {
                 return self.selector(node, of, *index as usize);
-            }
-            NodeKind::AdamWGroupOut { of, param, index } => {
-                return self.selector(node, of, *param as usize * 3 + *index as usize);
             }
             NodeKind::StopGradient { a } | NodeKind::Checkpoint { a } => {
                 let value = self.child_value(a)?;
@@ -1661,10 +2107,6 @@ impl Lowerer {
                 (log_decay.shape.clone(), log_decay.dtype),
                 (beta.shape.clone(), beta.dtype),
             ],
-            NodeKind::LinearGelu { dual: true, .. } => vec![
-                (node.shape.clone(), node.dtype),
-                (node.shape.clone(), node.dtype),
-            ],
             NodeKind::LayerNormBackward { x, weight, .. } => vec![
                 (x.shape.clone(), x.dtype),
                 (weight.shape.clone(), weight.dtype),
@@ -1675,28 +2117,12 @@ impl Lowerer {
                 (m.shape.clone(), m.dtype),
                 (v.shape.clone(), v.dtype),
             ],
-            NodeKind::AdamWStepGroup { params, ms, vs, .. } => params
-                .iter()
-                .zip(ms)
-                .zip(vs)
-                .flat_map(|((param, m), v)| {
-                    [
-                        (param.shape.clone(), param.dtype),
-                        (m.shape.clone(), m.dtype),
-                        (v.shape.clone(), v.dtype),
-                    ]
-                })
-                .collect(),
             NodeKind::SgdStep {
                 param, velocity, ..
             } => vec![
                 (param.shape.clone(), param.dtype),
                 (velocity.shape.clone(), velocity.dtype),
             ],
-            NodeKind::FusedElementwiseMulti { exprs, .. } => exprs
-                .iter()
-                .map(|_| (node.shape.clone(), node.dtype))
-                .collect(),
             _ => vec![(node.shape.clone(), node.dtype)],
         };
         let outputs = output_metadata
@@ -1846,13 +2272,6 @@ impl Lowerer {
                 CpuOp::RotaryEmbeddingBackward { theta: *theta }
             }
             NodeKind::Linear { .. } => CpuOp::Linear,
-            NodeKind::LinearResidual { .. } => CpuOp::LinearResidual,
-            NodeKind::LinearGelu {
-                approximate, dual, ..
-            } => CpuOp::LinearGelu {
-                approximate: *approximate,
-                dual: *dual,
-            },
             NodeKind::LayerNorm { eps, .. } => CpuOp::LayerNorm { eps: *eps },
             NodeKind::LayerNormBackward { eps, .. } => CpuOp::LayerNormBackward { eps: *eps },
             NodeKind::Conv1d {
@@ -2008,33 +2427,6 @@ impl Lowerer {
                     fused_exprs,
                 }
             }
-            NodeKind::AdamWStepGroup {
-                params,
-                beta1,
-                beta2,
-                eps,
-                weight_decay,
-                ..
-            } => {
-                if !fusion::is_supported(&cpu_device(), params[0].dtype) {
-                    return Err(format!(
-                        "compile: grouped AdamW does not support CPU dtype {}",
-                        params[0].dtype
-                    ));
-                }
-                let base = fusion::adamw_exprs(*beta1, *beta2, *eps, *weight_decay);
-                let mut fused_exprs = Vec::with_capacity(params.len() * 3);
-                for index in 0..params.len() {
-                    let remap = (0..4)
-                        .map(|lane| (lane, index as u32 * 4 + lane))
-                        .collect::<HashMap<_, _>>();
-                    fused_exprs.extend(base.iter().map(|expr| expr.remap_lanes(&remap)));
-                }
-                CpuOp::AdamWGroup {
-                    parameters: params.len(),
-                    fused_exprs: fused_exprs.into_boxed_slice(),
-                }
-            }
             NodeKind::SgdStep {
                 momentum,
                 dampening,
@@ -2058,69 +2450,6 @@ impl Lowerer {
                     fused_exprs,
                 }
             }
-            NodeKind::FusedElementwise { shape, expr, .. } => {
-                ensure_fusion_dtype(node.dtype)?;
-                CpuOp::FusedElementwise {
-                    strides: inputs
-                        .iter()
-                        .map(|value| {
-                            self.values[value.index()]
-                                .layout
-                                .broadcast_to(shape)
-                                .strides()
-                                .to_vec()
-                        })
-                        .collect(),
-                    shape: shape.clone().into_boxed_slice(),
-                    exprs: vec![expr.clone()].into_boxed_slice(),
-                }
-            }
-            NodeKind::FusedElementwiseMulti { shape, exprs, .. } => {
-                ensure_fusion_dtype(node.dtype)?;
-                CpuOp::FusedElementwise {
-                    strides: inputs
-                        .iter()
-                        .map(|value| {
-                            self.values[value.index()]
-                                .layout
-                                .broadcast_to(shape)
-                                .strides()
-                                .to_vec()
-                        })
-                        .collect(),
-                    shape: shape.clone().into_boxed_slice(),
-                    exprs: exprs.clone().into_boxed_slice(),
-                }
-            }
-            NodeKind::FusedReduce {
-                in_shape,
-                expr,
-                op,
-                dims,
-                keepdims,
-                shape,
-                ..
-            } => {
-                ensure_fusion_dtype(node.dtype)?;
-                CpuOp::FusedReduce {
-                    strides: inputs
-                        .iter()
-                        .map(|value| {
-                            self.values[value.index()]
-                                .layout
-                                .broadcast_to(in_shape)
-                                .strides()
-                                .to_vec()
-                        })
-                        .collect(),
-                    in_shape: in_shape.clone().into_boxed_slice(),
-                    expr: expr.clone(),
-                    op: *op,
-                    dims: dims.clone().into_boxed_slice(),
-                    keepdims: *keepdims,
-                    shape: shape.clone().into_boxed_slice(),
-                }
-            }
             NodeKind::Leaf(_)
             | NodeKind::Input { .. }
             | NodeKind::ScalarInput { .. }
@@ -2135,15 +2464,13 @@ impl Lowerer {
             | NodeKind::KdaBackwardOut { .. }
             | NodeKind::LayerNormBackwardOut { .. }
             | NodeKind::AdamWOut { .. }
-            | NodeKind::AdamWGroupOut { .. }
             | NodeKind::SgdOut { .. }
-            | NodeKind::FusedPick { .. }
             | NodeKind::StopGradient { .. }
             | NodeKind::Checkpoint { .. } => {
                 unreachable!("zero-command nodes return before operation lowering")
             }
         };
-        self.command(op, inputs, outputs.clone());
+        self.command(op, inputs, outputs.clone())?;
         self.prepare_last_command()?;
         self.node_values.insert(node.id, outputs.into_boxed_slice());
         Ok(())
@@ -2152,8 +2479,11 @@ impl Lowerer {
     fn finish(
         mut self,
         outputs: Vec<ValueId>,
-        semantic_nodes_before_optimization: usize,
+        driver: &mut CompilerDriver<'_>,
     ) -> Result<(CpuExecutable, Vec<Value>, Vec<usize>), String> {
+        if !self.preloaded_generated.is_empty() {
+            return Err("compile: not all prepared generated bindings were lowered".to_string());
+        }
         for output in &outputs {
             let mut root = *output;
             while let CpuValueStorage::Alias { source, .. } = self.storage[root.index()] {
@@ -2227,11 +2557,16 @@ impl Lowerer {
                             byte_offset,
                         },
                     };
-                    Ok(ValueDecl {
-                        id,
-                        name: self.names[index].clone(),
-                        bytes,
-                        storage,
+                    Ok(CpuLoweredValue {
+                        shape: value.shape.clone(),
+                        dtype: value.dtype,
+                        layout: value.layout.clone(),
+                        declaration: ValueDecl {
+                            id,
+                            name: self.names[index].clone(),
+                            bytes,
+                            storage,
+                        },
                     })
                 })
                 .collect::<Result<Vec<_>, String>>()?;
@@ -2242,104 +2577,106 @@ impl Lowerer {
             .chain(self.padded_bindings.iter().map(|binding| binding.value))
             .chain(self.state_cursor)
             .collect::<Vec<_>>();
-        let mut instructions =
-            Vec::with_capacity(self.commands.len() + usize::from(!invocation_values.is_empty()));
+        let stateful = self.state.is_some()
+            || self.instructions.iter().any(|instruction| {
+                instruction.effects.has_side_effects || !instruction.state.is_empty()
+            });
+        let mut instructions = Vec::with_capacity(
+            self.instructions.len() + 1 + usize::from(!invocation_values.is_empty()),
+        );
         if !invocation_values.is_empty() {
-            instructions.push(LoweredInstruction::new(
-                InstructionId::from_index(0)
-                    .ok_or_else(|| "compile: too many CPU commands".to_string())?,
-                "prepare_invocation".to_string(),
-                Vec::new(),
-                invocation_values
-                    .iter()
-                    .copied()
-                    .map(OutputDecl::new)
-                    .collect::<Vec<_>>(),
-            ));
-        }
-        for command in &self.commands {
-            let mut uses = command
-                .inputs
-                .iter()
-                .map(|value| ValueUse {
-                    value: *value,
-                    access: ValueAccess::Read,
-                })
-                .collect::<Vec<_>>();
-            uses.extend(
-                command
-                    .scratch
-                    .iter()
-                    .chain(command.staging.iter())
-                    .map(|value| ValueUse::read_write(*value)),
+            instructions.push(
+                LoweredInstruction::new(
+                    InstructionId::from_index(0)
+                        .ok_or_else(|| "compile: too many CPU instructions".to_string())?,
+                    CpuInstruction::PrepareInvocation,
+                    Vec::new(),
+                    invocation_values
+                        .iter()
+                        .copied()
+                        .map(OutputDecl::new)
+                        .collect::<Vec<_>>(),
+                )
+                .with_effects(InstructionEffects {
+                    may_fail: true,
+                    has_side_effects: false,
+                }),
             );
-            let command_outputs = command
-                .outputs
-                .iter()
-                .chain(command.scratch.iter())
-                .chain(command.staging.iter())
-                .chain(command.state_outputs.iter())
-                .map(|value| OutputDecl::new(*value))
-                .collect::<Vec<_>>();
-            instructions.push(LoweredInstruction::new(
-                InstructionId::from_index(instructions.len())
-                    .ok_or_else(|| "compile: too many CPU commands".to_string())?,
-                command.op.name().to_string(),
-                uses,
-                command_outputs,
-            ));
+        }
+        let mut operation_ids = Vec::with_capacity(self.instructions.len());
+        for mut instruction in self.instructions {
+            let id = InstructionId::from_index(instructions.len())
+                .ok_or_else(|| "compile: too many CPU instructions".to_string())?;
+            instruction.id = id;
+            instructions.push(instruction);
+            operation_ids.push(id);
         }
         let finalization_inputs = outputs
             .iter()
             .copied()
             .chain(
-                self.commands
+                instructions
                     .iter()
-                    .flat_map(|command| command.state_outputs.iter().copied()),
+                    .flat_map(|instruction| instruction.state.iter().map(|use_| use_.value)),
             )
             .map(ValueUse::read)
             .collect::<Vec<_>>();
-        instructions.push(LoweredInstruction::new(
-            InstructionId::from_index(instructions.len())
-                .ok_or_else(|| "compile: too many CPU commands".to_string())?,
-            "finalize_invocation".to_string(),
-            finalization_inputs,
-            Vec::new(),
-        ));
-        let schedule = LoweredSchedule::new(values, instructions, outputs.clone());
-        let memory = plan_memory(
-            &schedule,
-            &MemoryPlannerConfig::uniform(
-                NativeMemorySpace::Cpu,
-                usize::MAX / 2,
-                CPU_STORAGE_ALIGNMENT,
-                1,
-            ),
-        )
-        .map_err(|error| format!("compile: CPU memory planning failed: {error}"))?;
+        instructions.push(
+            LoweredInstruction::new(
+                InstructionId::from_index(instructions.len())
+                    .ok_or_else(|| "compile: too many CPU instructions".to_string())?,
+                CpuInstruction::FinalizeInvocation,
+                finalization_inputs,
+                Vec::new(),
+            )
+            .with_effects(InstructionEffects {
+                may_fail: stateful,
+                has_side_effects: stateful,
+            }),
+        );
+        let program = Arc::new(LoweredProgram::new(values, instructions, outputs));
+        let memory = driver
+            .plan_memory(
+                &program,
+                &MemoryPlannerConfig::uniform(
+                    NativeMemorySpace::Cpu,
+                    usize::MAX / 2,
+                    CPU_STORAGE_ALIGNMENT,
+                    1,
+                ),
+            )
+            .map_err(|error| format!("compile: CPU memory planning failed: {error}"))?;
+        let physical = driver.phase(PHYSICAL_PLANNING_PHASE, || {
+            Ok::<_, String>(
+                operation_ids
+                    .into_iter()
+                    .map(CpuPhysicalCommand::Encode)
+                    .collect::<Vec<_>>(),
+            )
+        })?;
         let diagnostics = build_executable_diagnostics(
-            &schedule,
+            &program,
             &memory,
+            &driver.prepared().index,
             DiagnosticsInput {
-                semantic_nodes_before_optimization,
-                semantic_nodes_after_optimization: self.node_values.len(),
-                command_count: self.commands.len(),
+                command_count: physical.len(),
                 ..DiagnosticsInput::default()
             },
-            |kind| kind.clone(),
+            CpuInstruction::name,
         );
         Ok((
             CpuExecutable {
-                values: self.values.into_boxed_slice(),
+                signature: driver.prepared().signature.clone(),
+                program,
+                physical: physical.into_boxed_slice(),
                 bindings: self.bindings.into_boxed_slice(),
                 scalar_bindings: self.scalar_bindings.into_boxed_slice(),
                 padded_bindings: self.padded_bindings.into_boxed_slice(),
                 constants: self.constants.into_boxed_slice(),
-                commands: self.commands.into_boxed_slice(),
-                outputs: outputs.into_boxed_slice(),
                 options: self.options,
                 memory,
                 diagnostics,
+                compiler_work: CompilerWorkReport::default(),
                 state_cursor: self.state_cursor,
             },
             self.generated,
@@ -2474,21 +2811,9 @@ fn validate_cpu_support(node: &Node) -> Result<(), String> {
             same_dtype("matmul", &[a, b])?;
             matmul_dtype("matmul", a.dtype)
         }
-        NodeKind::Linear { x, weight, bias }
-        | NodeKind::LinearGelu {
-            x, weight, bias, ..
-        } => {
+        NodeKind::Linear { x, weight, bias } => {
             same_dtype("linear", &[x, weight, bias])?;
             matmul_dtype("linear", x.dtype)
-        }
-        NodeKind::LinearResidual {
-            x,
-            weight,
-            bias,
-            residual,
-        } => {
-            same_dtype("linear_residual", &[x, weight, bias, residual])?;
-            matmul_dtype("linear_residual", x.dtype)
         }
         NodeKind::Sdpa { q, .. } | NodeKind::SdpaBackward { q, .. } => {
             matmul_dtype("sdpa", q.dtype)
@@ -2531,7 +2856,7 @@ pub fn compile(
     options: CompileOptions,
     ce_chunk_size: usize,
 ) -> Result<CpuCompilation, String> {
-    compile_internal(roots, options, ce_chunk_size, None, None)
+    compile_roots_internal(roots, options, ce_chunk_size, None, None)
 }
 
 pub fn compile_with_state_bytes(
@@ -2540,7 +2865,7 @@ pub fn compile_with_state_bytes(
     ce_chunk_size: usize,
     state_bytes: Option<usize>,
 ) -> Result<CpuCompilation, String> {
-    compile_internal(roots, options, ce_chunk_size, state_bytes, None)
+    compile_roots_internal(roots, options, ce_chunk_size, state_bytes, None)
 }
 
 pub fn compile_with_state(
@@ -2549,7 +2874,7 @@ pub fn compile_with_state(
     ce_chunk_size: usize,
     state: CpuStatePlan,
 ) -> Result<CpuCompilation, String> {
-    compile_internal(
+    compile_roots_internal(
         roots,
         options,
         ce_chunk_size,
@@ -2558,7 +2883,144 @@ pub fn compile_with_state(
     )
 }
 
-fn compile_internal(
+fn validate_generated_payload(node: &Arc<Node>, payload: &Value) -> Result<(), String> {
+    if payload.shape() != node.shape || payload.dtype() != node.dtype {
+        return Err(format!(
+            "compile: generated binding {} changed shape or dtype",
+            node.id
+        ));
+    }
+    let tensor = payload.tensor();
+    if tensor.layout.shape() != node.shape {
+        return Err(format!(
+            "compile: generated binding {} layout shape does not match its node",
+            node.id
+        ));
+    }
+    let Some(end) = tensor.layout.checked_max_index() else {
+        return Err(format!(
+            "compile: generated binding {} has an overflowing CPU layout",
+            node.id
+        ));
+    };
+    if end > tensor.buffer.len() {
+        return Err(format!(
+            "compile: generated binding {} CPU layout exceeds its buffer",
+            node.id
+        ));
+    }
+    Ok(())
+}
+
+pub fn load_generated_values(index: &GraphIndex) -> Result<Vec<CpuGeneratedValue>, String> {
+    index
+        .leaves
+        .iter()
+        .map(|leaf| {
+            let node = index.node(leaf.node).ok_or_else(|| {
+                format!(
+                    "compile: generated binding node {} is out of range",
+                    leaf.node
+                )
+            })?;
+            if node.id != leaf.node_id
+                || node.shape != leaf.shape
+                || node.dtype != leaf.dtype
+                || !node.device.is_cpu()
+                || !leaf.device.is_cpu()
+            {
+                return Err(format!(
+                    "compile: generated binding {} does not match its graph index metadata",
+                    leaf.node_id
+                ));
+            }
+            let NodeKind::Leaf(slot) = &node.kind else {
+                return Err(format!(
+                    "compile: generated binding {} is not a leaf",
+                    leaf.node_id
+                ));
+            };
+            if Arc::as_ptr(slot) as usize != leaf.slot_identity {
+                return Err(format!(
+                    "compile: generated binding {} changed leaf identity",
+                    leaf.node_id
+                ));
+            }
+            let value: Value = slot
+                .get()
+                .map_err(|error| format!("compile: generated binding {}: {error}", node.id))?;
+            validate_generated_payload(node, &value)?;
+            Ok(CpuGeneratedValue {
+                node: leaf.node,
+                node_id: leaf.node_id,
+                slot_identity: leaf.slot_identity,
+                value,
+            })
+        })
+        .collect()
+}
+
+fn validate_generated_values(
+    index: &GraphIndex,
+    generated_values: &[CpuGeneratedValue],
+) -> Result<(), String> {
+    if generated_values.len() != index.leaves.len() {
+        return Err(format!(
+            "compile: expected {} prepared generated bindings, got {}",
+            index.leaves.len(),
+            generated_values.len()
+        ));
+    }
+    for (leaf, generated) in index.leaves.iter().zip(generated_values) {
+        let node = index.node(leaf.node).ok_or_else(|| {
+            format!(
+                "compile: generated binding node {} is out of range",
+                leaf.node
+            )
+        })?;
+        let slot_identity = match &node.kind {
+            NodeKind::Leaf(slot) => Arc::as_ptr(slot) as usize,
+            _ => {
+                return Err(format!(
+                    "compile: generated binding {} is not a leaf",
+                    leaf.node_id
+                ));
+            }
+        };
+        if generated.node != leaf.node
+            || generated.node_id != leaf.node_id
+            || generated.slot_identity != leaf.slot_identity
+            || node.id != leaf.node_id
+            || slot_identity != leaf.slot_identity
+            || node.shape != leaf.shape
+            || node.dtype != leaf.dtype
+            || !node.device.is_cpu()
+            || !leaf.device.is_cpu()
+        {
+            return Err(format!(
+                "compile: prepared generated binding {} has the wrong node identity or metadata",
+                leaf.node_id
+            ));
+        }
+        validate_generated_payload(node, &generated.value)?;
+    }
+    Ok(())
+}
+
+pub fn compile_prepared(
+    program: &PreparedProgram,
+    generated_values: &[CpuGeneratedValue],
+    state: Option<CpuStatePlan>,
+) -> Result<CpuCompilation, String> {
+    compile_prepared_internal(
+        program,
+        generated_values,
+        state.map(|state| state.bytes),
+        state,
+    )
+}
+
+fn compile_roots_internal(
     roots: &[Arc<Node>],
     options: CompileOptions,
     ce_chunk_size: usize,
@@ -2571,53 +3033,104 @@ fn compile_internal(
     if ce_chunk_size == 0 {
         return Err("compile: CE chunk size must be positive".to_string());
     }
-    let semantic_order = graph_post_order(roots);
-    let semantic_nodes_before_optimization = semantic_order.len();
-    let semantic_random = semantic_order
-        .iter()
-        .filter(|node| matches!(node.kind, NodeKind::Randn { .. } | NodeKind::Uniform { .. }))
-        .map(|node| node.id)
-        .collect::<Vec<_>>();
-    let optimized = fuse_roots_with_options(roots, &options)?;
-    let (slots, _) = effect_torch_compiler::collect_program_slots(&optimized)?;
+    let mut options = options;
+    options.environment.ce_chunk_size = ce_chunk_size;
+    let mut request = ProgramRequest::from_roots(roots.to_vec(), options);
+    if let Some(state) = state {
+        request =
+            request.with_state_cursor(StateCursorSlot::new(state.cursor_slot, state.cursor_tensor));
+    }
+    let program = request.prepare()?;
+    let generated_values = load_generated_values(&program.index)?;
+    compile_prepared_internal(&program, &generated_values, state_bytes, state)
+}
+
+fn compile_prepared_internal(
+    program: &PreparedProgram,
+    generated_values: &[CpuGeneratedValue],
+    state_bytes: Option<usize>,
+    state: Option<CpuStatePlan>,
+) -> Result<CpuCompilation, String> {
+    let index = &program.index;
+    let options = program.options.clone();
+    let ce_chunk_size = options.environment.ce_chunk_size;
+    if index.roots.is_empty() {
+        return Err("compile: expected at least one root".to_string());
+    }
+    if ce_chunk_size == 0 {
+        return Err("compile: CE chunk size must be positive".to_string());
+    }
+    let state_cursor =
+        state.map(|state| StateCursorSlot::new(state.cursor_slot, state.cursor_tensor));
+    if program.state_cursor != state_cursor {
+        return Err("compile: CPU state cursor does not match the prepared program".to_string());
+    }
+    validate_generated_values(index, generated_values)?;
+    let mut driver = CompilerDriver::new(program)?;
+    let slots = index.slots.to_vec();
     if slots.iter().any(|slot| !slot.device.is_cpu()) {
         return Err("compile: graph contains an unsupported device".to_string());
     }
-    let order = graph_post_order(&optimized);
-    let optimized_random = order
+    let random_provenance = index
+        .random_source_order
         .iter()
-        .filter(|node| matches!(node.kind, NodeKind::Randn { .. } | NodeKind::Uniform { .. }))
-        .map(|node| node.id)
-        .collect::<Vec<_>>();
-    if optimized_random.len() != semantic_random.len() {
-        return Err(
-            "compile: optimization changed the number of semantic random sources".to_string(),
-        );
-    }
-    let random_provenance = optimized_random
-        .into_iter()
-        .zip(semantic_random)
-        .collect::<HashMap<_, _>>();
-    let mut lowerer = Lowerer::new(options, ce_chunk_size, random_provenance, &slots, state);
-    for node in &order {
-        lowerer.lower(node)?;
-    }
-    let outputs = optimized
+        .map(|source| {
+            let node = index
+                .node(source.node)
+                .ok_or_else(|| format!("compile: random source {} is out of range", source.node))?;
+            Ok((node.id, source.provenance))
+        })
+        .collect::<Result<HashMap<_, _>, String>>()?;
+    let mut lowerer = Lowerer::new(
+        options,
+        ce_chunk_size,
+        random_provenance,
+        &slots,
+        state,
+        generated_values,
+    );
+    driver.lower(|unit, index, plan| {
+        match unit {
+            LoweringUnit::Node(node) => {
+                let semantic = index
+                    .node(node)
+                    .ok_or_else(|| format!("compile: dense node {node} is out of range"))?;
+                lowerer.lower(semantic)?;
+            }
+            LoweringUnit::Region(region) => lowerer.lower_region(index, plan, region)?,
+        }
+        Ok(())
+    })?;
+    let outputs = index
+        .roots
         .iter()
-        .map(|root| lowerer.child_value(root))
+        .map(|root| lowerer.dense_value(index, *root))
         .collect::<Result<Vec<_>, _>>()?;
-    let (mut executable, generated_bindings, generated_slots) =
-        lowerer.finish(outputs, semantic_nodes_before_optimization)?;
+    let artifact_assembly_started = Instant::now();
+    let artifact = lowerer.finish(outputs, &mut driver);
+    driver.record_phase(ARTIFACT_ASSEMBLY_PHASE, artifact_assembly_started.elapsed());
+    let (mut executable, generated_bindings, generated_slots) = artifact?;
+    let publication_started = Instant::now();
     if let Some(state_bytes) = state_bytes {
         executable.memory.report.state_bytes = state_bytes;
         executable.diagnostics.memory.state_bytes = state_bytes;
     }
-    Ok(CpuCompilation {
+    let mut compilation = CpuCompilation {
         executable: Arc::new(executable),
         slots,
         generated_bindings,
         generated_slots,
-    })
+    };
+    let compiler_work = driver.finish_with_phase(
+        &compilation.executable.program,
+        PUBLICATION_PHASE,
+        publication_started,
+    );
+    let executable = Arc::get_mut(&mut compilation.executable)
+        .expect("newly published CPU executable must be uniquely owned");
+    executable.diagnostics.compile_phases = compiler_work.compile_phases.clone();
+    executable.compiler_work = compiler_work;
+    Ok(compilation)
 }
 
 pub trait CpuState: Send + Sync {
@@ -2661,6 +3174,24 @@ fn random_seed(nonce: u64, provenance: u64) -> u64 {
     value ^= value >> 27;
     value = value.wrapping_mul(0x94d0_49bb_1331_11eb);
     value ^ (value >> 31)
+}
+
+fn resolve_physical_instruction<'a>(
+    executable: &'a CpuExecutable,
+    physical: &CpuPhysicalCommand,
+) -> Result<&'a CpuCommand, String> {
+    let CpuPhysicalCommand::Encode(id) = *physical;
+    let instruction = executable
+        .program
+        .instructions
+        .get(id.index())
+        .ok_or_else(|| format!("execute: physical instruction {id} is out of range"))?;
+    if instruction.id != id || instruction.kind.operation().is_none() {
+        return Err(format!(
+            "execute: physical instruction {id} does not resolve to an operation"
+        ));
+    }
+    Ok(instruction)
 }
 
 struct InvocationSegments {
@@ -2744,7 +3275,7 @@ fn resolve_values(
     segments: &InvocationSegments,
 ) -> Result<Box<[Value]>, String> {
     let mut values: Vec<Option<Value>> = std::iter::repeat_with(|| None)
-        .take(executable.values.len())
+        .take(executable.program.values.len())
         .collect();
     for constant in &executable.constants {
         values[constant.value.index()] = Some(constant.payload.clone());
@@ -2758,7 +3289,7 @@ fn resolve_values(
                 .get(slot as usize)
                 .ok_or_else(|| format!("execute: generated input slot {slot} is unbound"))?,
         };
-        let declaration = &executable.values[binding.value.index()];
+        let declaration = &executable.program.values[binding.value.index()];
         if source.shape() != declaration.shape.as_ref()
             || source.dtype() != declaration.dtype
             || source.tensor().layout != declaration.layout
@@ -2775,7 +3306,7 @@ fn resolve_values(
         if values[index].is_some() {
             continue;
         }
-        let declaration = &executable.values[index];
+        let declaration = &executable.program.values[index];
         let value = match location {
             Location::Segment {
                 segment,
@@ -2894,32 +3425,36 @@ fn dispatch_command<'a>(
     lanes: &mut Vec<Value>,
     state: Option<&dyn CpuState>,
 ) -> Result<(), String> {
+    let (op, plan) = command
+        .kind
+        .operation()
+        .ok_or_else(|| "execute: physical command references a boundary instruction".to_string())?;
     destinations.clear();
     scratch.clear();
     staging.clear();
     state_outputs.clear();
     for value in &command.outputs {
-        destinations.push(resolved_destination(&values[value.index()]));
+        destinations.push(resolved_destination(&values[value.value.index()]));
     }
     for value in &command.scratch {
-        scratch.push(resolved_destination(&values[value.index()]));
+        scratch.push(resolved_destination(&values[value.value.index()]));
     }
     for value in &command.staging {
-        staging.push(resolved_destination(&values[value.index()]));
+        staging.push(resolved_destination(&values[value.value.index()]));
     }
-    for value in &command.state_outputs {
-        state_outputs.push(resolved_destination(&values[value.index()]));
+    for value in &command.state {
+        state_outputs.push(resolved_destination(&values[value.value.index()]));
     }
 
     let output = |index: usize| -> Result<&Value, String> {
         command
             .outputs
             .get(index)
-            .map(|value| &values[value.index()])
-            .ok_or_else(|| format!("{}: missing output {index}", command.op.name()))
+            .map(|output| &values[output.value.index()])
+            .ok_or_else(|| format!("{}: missing output {index}", op.name()))
     };
-    let scratch_value = |index: usize| -> &Value { &values[command.scratch[index].index()] };
-    match &command.op {
+    let scratch_value = |index: usize| -> &Value { &values[command.scratch[index].value.index()] };
+    match op {
         CpuOp::Randn { provenance, .. } => {
             Tensor::randn_seeded_into(random_seed(nonce, *provenance), &mut destinations[0])
         }
@@ -2933,7 +3468,7 @@ fn dispatch_command<'a>(
         ),
         CpuOp::Unary(kind) => {
             let source = inputs[0].tensor();
-            match (kind, &command.plan) {
+            match (kind, plan) {
                 (CpuUnaryOp::Neg, _) => source.neg_into(&mut destinations[0]),
                 (CpuUnaryOp::Abs, _) => source.abs_into(&mut destinations[0]),
                 (CpuUnaryOp::Sqrt, _) => source.sqrt_into(&mut destinations[0]),
@@ -2980,10 +3515,7 @@ fn dispatch_command<'a>(
                             .squeeze_dims_into(&[0], &mut destinations[0])
                     }
                 }
-                _ => Err(format!(
-                    "{}: invalid immutable algorithm plan",
-                    command.op.name()
-                )),
+                _ => Err(format!("{}: invalid immutable algorithm plan", op.name())),
             }
         }
         CpuOp::Binary(kind) => {
@@ -2996,10 +3528,7 @@ fn dispatch_command<'a>(
             for input in inputs {
                 if input.dtype() != target_dtype && input.tensor().shape().is_empty() {
                     let target = staging_values.get(staged).ok_or_else(|| {
-                        format!(
-                            "{}: missing scalar cast staging {staged}",
-                            command.op.name()
-                        )
+                        format!("{}: missing scalar cast staging {staged}", op.name())
                     })?;
                     cast_staging(input, target)?;
                     lanes.push(target.clone());
@@ -3010,7 +3539,7 @@ fn dispatch_command<'a>(
             }
             let a = lanes[0].tensor();
             let b = lanes[1].tensor();
-            match (kind, &command.plan) {
+            match (kind, plan) {
                 (CpuBinaryOp::Add, _) => a.add_into(b, &mut destinations[0]),
                 (CpuBinaryOp::Sub, _) => a.sub_into(b, &mut destinations[0]),
                 (CpuBinaryOp::Mul, _) => a.mul_into(b, &mut destinations[0]),
@@ -3031,10 +3560,7 @@ fn dispatch_command<'a>(
                 (CpuBinaryOp::Solve, CpuAlgorithmPlan::Solve(requirements)) => {
                     a.solve_into(b, &mut destinations[0], scratch, requirements)
                 }
-                _ => Err(format!(
-                    "{}: invalid immutable algorithm plan",
-                    command.op.name()
-                )),
+                _ => Err(format!("{}: invalid immutable algorithm plan", op.name())),
             }
         }
         CpuOp::Where => inputs[1].tensor().where_into(
@@ -3241,7 +3767,7 @@ fn dispatch_command<'a>(
             &mut destinations[0],
         ),
         CpuOp::KdaRecurrence { .. } | CpuOp::ConvState { .. } | CpuOp::KvAttention { .. } => state
-            .ok_or_else(|| format!("{}: operation requires a state context", command.op.name()))?
+            .ok_or_else(|| format!("{}: operation requires a state context", op.name()))?
             .run_command(
                 command,
                 inputs,
@@ -3304,13 +3830,13 @@ fn dispatch_command<'a>(
             )
         }
         CpuOp::Linear | CpuOp::LinearResidual | CpuOp::LinearGelu { .. } => {
-            let CpuAlgorithmPlan::Linear { matmul, gelu } = &command.plan else {
+            let CpuAlgorithmPlan::Linear { matmul, gelu } = plan else {
                 return Err("linear: invalid immutable algorithm plan".to_string());
             };
             inputs[0]
                 .tensor()
                 .matmul_into(inputs[1].tensor(), &mut scratch[0], &mut [], matmul)?;
-            match &command.op {
+            match op {
                 CpuOp::Linear => scratch_value(0)
                     .tensor()
                     .add_into(inputs[2].tensor(), &mut destinations[0]),
@@ -3515,7 +4041,7 @@ fn dispatch_command<'a>(
                         fusion: Some(program),
                         strides,
                         ..
-                    } = &command.plan
+                    } = plan
                     else {
                         return Err("adamw_fused: missing prepared program".to_string());
                     };
@@ -3546,7 +4072,7 @@ fn dispatch_command<'a>(
                 lanes.push(inputs[parameters * 2 + index].clone());
                 lanes.push(inputs[parameters * 3 + index].clone());
             }
-            let CpuAlgorithmPlan::MultiFusion { program, strides } = &command.plan else {
+            let CpuAlgorithmPlan::MultiFusion { program, strides } = plan else {
                 return Err("adamw_group: missing prepared program".to_string());
             };
             fusion::run_elementwise_multi_into(
@@ -3592,7 +4118,7 @@ fn dispatch_command<'a>(
                         fusion: Some(program),
                         strides,
                         ..
-                    } = &command.plan
+                    } = plan
                     else {
                         return Err("sgd_fused: missing prepared program".to_string());
                     };
@@ -3612,7 +4138,7 @@ fn dispatch_command<'a>(
             }
         }
         CpuOp::FusedElementwise { strides, shape, .. } => {
-            let CpuAlgorithmPlan::Fusion(program) = &command.plan else {
+            let CpuAlgorithmPlan::Fusion(program) = plan else {
                 return Err("fused_elementwise: missing prepared program".to_string());
             };
             fusion::run_elementwise_multi_into(
@@ -3637,7 +4163,7 @@ fn dispatch_command<'a>(
             shape,
             ..
         } => {
-            let CpuAlgorithmPlan::Fusion(program) = &command.plan else {
+            let CpuAlgorithmPlan::Fusion(program) = plan else {
                 return Err("fused_reduce: missing prepared program".to_string());
             };
             fusion::run_reduce_into(
@@ -3715,12 +4241,32 @@ fn execute_reported_with_commit(
     if cancelled.load(Ordering::Acquire) {
         return Err("operation aborted".to_string());
     }
-    if scalar_bindings.len() != executable.scalar_bindings.len() {
-        return Err(format!(
-            "executable expected {} scalar bindings, got {}",
-            executable.scalar_bindings.len(),
-            scalar_bindings.len()
-        ));
+    executable
+        .signature
+        .validate_invocation_counts(
+            declared_bindings.len(),
+            scalar_bindings.len(),
+            usize::from(executable.state_cursor.is_some() && state.is_some()),
+            None,
+        )
+        .map_err(|error| format!("execute: {error}"))?;
+    for (index, value) in declared_bindings.iter().enumerate() {
+        if executable
+            .padded_bindings
+            .iter()
+            .any(|binding| binding.source as usize == index)
+        {
+            continue;
+        }
+        executable
+            .signature
+            .validate_binding_metadata(
+                index,
+                value.dtype(),
+                value.tensor().placement(),
+                &value.tensor().layout,
+            )
+            .map_err(|error| format!("execute: {error}"))?;
     }
     let nonce = INVOCATION_NONCE.fetch_add(1, Ordering::AcqRel);
     let segments = acquire_segments(executable)?;
@@ -3739,36 +4285,19 @@ fn execute_reported_with_commit(
         values
     };
 
-    let max_inputs = executable
-        .commands
-        .iter()
-        .map(|command| command.inputs.len())
-        .max()
-        .unwrap_or(0);
-    let max_outputs = executable
-        .commands
-        .iter()
-        .map(|command| command.outputs.len())
-        .max()
-        .unwrap_or(0);
-    let max_scratch = executable
-        .commands
-        .iter()
-        .map(|command| command.scratch.len())
-        .max()
-        .unwrap_or(0);
-    let max_staging = executable
-        .commands
-        .iter()
-        .map(|command| command.staging.len())
-        .max()
-        .unwrap_or(0);
-    let max_state_outputs = executable
-        .commands
-        .iter()
-        .map(|command| command.state_outputs.len())
-        .max()
-        .unwrap_or(0);
+    let mut max_inputs = 0;
+    let mut max_outputs = 0;
+    let mut max_scratch = 0;
+    let mut max_staging = 0;
+    let mut max_state_outputs = 0;
+    for physical in &executable.physical {
+        let instruction = resolve_physical_instruction(executable, physical)?;
+        max_inputs = max_inputs.max(instruction.inputs.len());
+        max_outputs = max_outputs.max(instruction.outputs.len());
+        max_scratch = max_scratch.max(instruction.scratch.len());
+        max_staging = max_staging.max(instruction.staging.len());
+        max_state_outputs = max_state_outputs.max(instruction.state.len());
+    }
     let mut input_values = Vec::with_capacity(max_inputs);
     let mut staging_values = Vec::with_capacity(max_staging);
     let mut destinations = Vec::with_capacity(max_outputs);
@@ -3779,23 +4308,24 @@ fn execute_reported_with_commit(
 
     let execution = (|| {
         let _allocation_guard = ExecutableAllocationGuard::enter();
-        for command in &executable.commands {
+        for physical in &executable.physical {
             if cancelled.load(Ordering::Acquire) {
                 return Err("operation aborted".to_string());
             }
+            let command = resolve_physical_instruction(executable, physical)?;
             input_values.clear();
             staging_values.clear();
             input_values.extend(
                 command
                     .inputs
                     .iter()
-                    .map(|value| values[value.index()].clone()),
+                    .map(|value_use| values[value_use.value.index()].clone()),
             );
             staging_values.extend(
                 command
                     .staging
                     .iter()
-                    .map(|value| values[value.index()].clone()),
+                    .map(|value_use| values[value_use.value.index()].clone()),
             );
             dispatch_command(
                 nonce,
@@ -3835,6 +4365,7 @@ fn execute_reported_with_commit(
         }
     }
     let outputs = executable
+        .program
         .outputs
         .iter()
         .map(|value| values[value.index()].clone())
@@ -3931,6 +4462,280 @@ mod tests {
         }
     }
 
+    fn encoded_instructions(executable: &CpuExecutable) -> Vec<&CpuCommand> {
+        executable
+            .physical
+            .iter()
+            .map(|physical| {
+                let CpuPhysicalCommand::Encode(id) = *physical;
+                let instruction = executable
+                    .instruction(id)
+                    .expect("physical ID resolves in the authoritative program");
+                assert!(instruction.kind.operation().is_some());
+                instruction
+            })
+            .collect()
+    }
+
+    fn operation(instruction: &CpuCommand) -> &CpuOp {
+        instruction
+            .kind
+            .operation()
+            .expect("encoded instruction is an operation")
+            .0
+    }
+
+    fn output_ids(instruction: &CpuCommand) -> Vec<ValueId> {
+        instruction
+            .outputs
+            .iter()
+            .map(|output| output.value)
+            .collect()
+    }
+
+    #[test]
+    fn physical_encodes_resolve_authoritative_operations_and_resources() {
+        let q = leaf_shape(vec![0.2, 0.4, 0.1, 0.3], vec![1, 1, 2, 2]);
+        let recurrence = Node::new(NodeKind::KdaRecurrence {
+            q: q.clone(),
+            k: q.clone(),
+            v: q,
+            log_decay: leaf_shape(vec![-0.1, -0.2, -0.3, -0.4], vec![1, 1, 2, 2]),
+            beta: leaf_shape(vec![0.5, 0.25], vec![1, 1, 2, 1]),
+            scale: 0.5,
+            layer: 0,
+        })
+        .unwrap();
+        let executable = compile(&[recurrence], options(false), 1024)
+            .unwrap()
+            .executable;
+
+        assert_eq!(executable.physical.len(), 1);
+        for physical in &executable.physical {
+            let CpuPhysicalCommand::Encode(id) = *physical;
+            let instruction = executable
+                .program
+                .instructions
+                .get(id.index())
+                .expect("physical ID is in range");
+            assert_eq!(instruction.id, id);
+            assert!(matches!(instruction.kind, CpuInstruction::Operation { .. }));
+
+            let planner = instruction
+                .resource_uses()
+                .map(|use_| use_.value)
+                .collect::<Vec<_>>();
+            let executor = instruction
+                .inputs
+                .iter()
+                .map(|use_| use_.value)
+                .chain(instruction.outputs.iter().map(|output| output.value))
+                .chain(instruction.scratch.iter().map(|use_| use_.value))
+                .chain(instruction.staging.iter().map(|use_| use_.value))
+                .chain(instruction.status.iter().map(|use_| use_.value))
+                .chain(instruction.state.iter().map(|use_| use_.value))
+                .collect::<Vec<_>>();
+            assert_eq!(planner, executor);
+            assert!(!instruction.staging.is_empty());
+            assert!(!instruction.state.is_empty());
+        }
+    }
+
+    #[test]
+    fn typed_program_is_authoritative_for_values_and_diagnostics() {
+        fn assert_typed(_: &LoweredProgram<CpuInstruction, NativeMemorySpace, CpuLoweredValue>) {}
+
+        let input = Node::new(NodeKind::Input {
+            slot: 0,
+            shape: vec![2],
+            dtype: DType::F32,
+            device: Device::Cpu,
+        })
+        .unwrap();
+        let scalar = Node::new(NodeKind::ScalarInput {
+            slot: 1,
+            dtype: DType::F32,
+            device: Device::Cpu,
+        })
+        .unwrap();
+        let root = Node::new(NodeKind::Add {
+            a: input,
+            b: scalar,
+        })
+        .unwrap();
+        let executable = compile(&[root], options(false), 1024).unwrap().executable;
+        assert_typed(&executable.program);
+
+        assert!(matches!(
+            executable
+                .program
+                .instructions
+                .first()
+                .map(|instruction| &instruction.kind),
+            Some(CpuInstruction::PrepareInvocation)
+        ));
+        assert!(matches!(
+            executable
+                .program
+                .instructions
+                .last()
+                .map(|instruction| &instruction.kind),
+            Some(CpuInstruction::FinalizeInvocation)
+        ));
+        for (index, value) in executable.program.values.iter().enumerate() {
+            assert_eq!(value.declaration.id.index(), index);
+            assert_eq!(value.layout.shape(), value.shape.as_ref());
+        }
+
+        let mut expected = std::collections::BTreeMap::<String, usize>::new();
+        for instruction in &executable.program.instructions {
+            *expected
+                .entry(instruction.kind.name().to_string())
+                .or_default() += 1;
+        }
+        let expected = expected.into_iter().collect::<Vec<_>>();
+        let actual = executable
+            .diagnostics
+            .instructions
+            .iter()
+            .map(|instruction| (instruction.kind.clone(), instruction.count))
+            .collect::<Vec<_>>();
+        assert_eq!(actual, expected);
+        assert_eq!(
+            executable.diagnostics.command_count,
+            executable.physical.len()
+        );
+    }
+
+    #[test]
+    fn prepared_compile_does_not_reload_leaf_slots() {
+        let slot = Arc::new(LeafSlot::new(Value(Tensor::from_vec(
+            vec![1.0f32, 2.0],
+            vec![2],
+        ))));
+        let root = Node::new(NodeKind::Leaf(Arc::clone(&slot))).unwrap();
+        let program = ProgramRequest::from_roots(vec![root], CompileOptions::default())
+            .prepare()
+            .unwrap();
+        let generated = load_generated_values(&program.index).unwrap();
+        assert_eq!(program.index.work.graph_index_builds, 1);
+        assert!(slot.clear());
+
+        let compilation = compile_prepared(&program, &generated, None).unwrap();
+        assert_eq!(compilation.generated_bindings.len(), 1);
+        assert_eq!(compilation.executable.memory.report.external_bytes, 8);
+        assert_eq!(compilation.executable.memory.report.persistent_bytes, 0);
+        assert_eq!(compilation.executable.signature, program.signature);
+        assert_eq!(compilation.executable.compiler_work.graph_index_builds, 1);
+        assert_eq!(
+            compilation.executable.compiler_work.semantic_nodes_rebuilt,
+            0
+        );
+        assert_eq!(
+            compilation
+                .executable
+                .diagnostics
+                .compile_phases
+                .iter()
+                .map(|timing| timing.phase.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "graph_index",
+                "optimization",
+                "lowering",
+                "lowered_program_validation",
+                "memory_planning",
+                "physical_planning",
+                "artifact_assembly",
+                "publication",
+            ]
+        );
+        let output = execute(
+            &compilation.executable,
+            &[],
+            &compilation.generated_bindings,
+            &CancellationFlag::new(),
+            None,
+        )
+        .unwrap()
+        .remove(0);
+        assert_eq!(output.to_f32_vec().unwrap(), [1.0, 2.0]);
+    }
+
+    #[test]
+    fn constant_weights_retain_exact_leaf_storage_without_generated_bindings() {
+        let mut tensor = Tensor::from_vec(vec![1.0f32, 99.0, 2.0, 99.0], vec![4]);
+        let layout = effect_torch_runtime::Layout::new(vec![2], vec![2], 0);
+        tensor.layout = layout.clone();
+        let slot = Arc::new(LeafSlot::new(Value(tensor)));
+        let leaf = Node::new(NodeKind::Leaf(Arc::clone(&slot))).unwrap();
+        let root = Node::new(NodeKind::Neg { a: leaf }).unwrap();
+        let program = ProgramRequest::from_roots(
+            vec![root],
+            CompileOptions {
+                inference: Some(effect_torch_compiler::InferenceOptions {
+                    constant_weights: true,
+                }),
+                ..CompileOptions::default()
+            },
+        )
+        .prepare()
+        .unwrap();
+        let generated = load_generated_values(&program.index).unwrap();
+        assert!(slot.clear());
+
+        let compilation = compile_prepared(&program, &generated, None).unwrap();
+
+        assert!(compilation.generated_bindings.is_empty());
+        assert!(compilation.generated_slots.is_empty());
+        assert!(compilation.executable.bindings.is_empty());
+        assert_eq!(compilation.executable.constants.len(), 1);
+        assert_eq!(compilation.executable.memory.report.external_bytes, 0);
+        assert_eq!(compilation.executable.memory.report.persistent_bytes, 8);
+        let constant = &compilation.executable.constants[0];
+        let lowered = &compilation.executable.program.values[constant.value.index()];
+        assert_eq!(lowered.layout, layout);
+        assert!(matches!(
+            lowered.declaration.storage,
+            ValueStorage::Fixed {
+                class: StorageClass::PersistentConstant,
+                location: Location::Persistent { .. }
+            }
+        ));
+        let output = execute(
+            &compilation.executable,
+            &[],
+            &[],
+            &CancellationFlag::new(),
+            None,
+        )
+        .unwrap()
+        .remove(0);
+        assert_eq!(output.to_f32_vec().unwrap(), [-1.0, -2.0]);
+    }
+
+    #[test]
+    fn explicit_false_constant_weights_remain_generated_bindings() {
+        let root = leaf(vec![3.0, 4.0]);
+        let compilation = compile(
+            &[root],
+            CompileOptions {
+                inference: Some(effect_torch_compiler::InferenceOptions {
+                    constant_weights: false,
+                }),
+                ..CompileOptions::default()
+            },
+            1024,
+        )
+        .unwrap();
+
+        assert_eq!(compilation.generated_bindings.len(), 1);
+        assert!(compilation.executable.constants.is_empty());
+        assert_eq!(compilation.executable.memory.report.external_bytes, 8);
+        assert_eq!(compilation.executable.memory.report.persistent_bytes, 0);
+        assert_eq!(run(&compilation)[0].to_f32_vec().unwrap(), [3.0, 4.0]);
+    }
+
     fn run(compilation: &CpuCompilation) -> Vec<Value> {
         execute(
             &compilation.executable,
@@ -3963,6 +4768,28 @@ mod tests {
         })
         .unwrap();
         let compilation = compile(&[root], options(false), 1024).unwrap();
+        assert_eq!(compilation.executable.signature.bindings.len(), 1);
+        assert_eq!(
+            compilation.executable.signature.bindings[0].layout,
+            effect_torch_runtime::BindingLayoutPolicy::Require(
+                effect_torch_runtime::LayoutConstraint::Exact(
+                    effect_torch_runtime::Layout::contiguous(vec![2])
+                )
+            )
+        );
+        assert_eq!(
+            compilation.executable.signature.invocation.scalars,
+            [effect_torch_runtime::ScalarDecl {
+                name: "slot_1".to_string(),
+                scalar_type: effect_torch_runtime::ScalarType::F32,
+            }]
+        );
+        assert!(compilation
+            .executable
+            .signature
+            .invocation
+            .runtime_values
+            .is_empty());
         let scalar_value = compilation.executable.scalar_bindings[0].value;
         let Location::Segment { segment, .. } =
             compilation.executable.memory.locations[scalar_value.index()]
@@ -3983,6 +4810,85 @@ mod tests {
         )
         .unwrap();
         assert_eq!(output[0].to_f32_vec().unwrap(), [4.5, 5.5]);
+    }
+
+    #[test]
+    fn learned_position_decode_signatures_keep_state_cursors_internal() {
+        for batch in [1usize, 3] {
+            let input = |slot| {
+                Node::new(NodeKind::Input {
+                    slot,
+                    shape: vec![batch, 1, 2, 4],
+                    dtype: DType::F32,
+                    device: Device::Cpu,
+                })
+                .unwrap()
+            };
+            let attention = Node::new(NodeKind::Sdpa {
+                q: input(0),
+                k: input(1),
+                v: input(2),
+                scale: 0.5,
+                causal: true,
+            })
+            .unwrap();
+            let positions = Node::new(NodeKind::PositionEmbedding {
+                weight: Node::new(NodeKind::Zeros {
+                    shape: vec![128, 6],
+                    dtype: DType::F32,
+                    device: Device::Cpu,
+                })
+                .unwrap(),
+                seq_len: 2,
+            })
+            .unwrap();
+            let (roots, geometry) = effect_torch_compiler::specialize_decode(
+                &[attention.clone(), positions, attention],
+                None,
+                batch,
+            )
+            .unwrap();
+            let compilation = compile_with_state(
+                &roots,
+                options(false),
+                1024,
+                CpuStatePlan {
+                    bytes: 0,
+                    cursor_slot: geometry.cursor_slot,
+                    cursor_tensor: geometry.cursor_tensor,
+                    batch,
+                },
+            )
+            .unwrap();
+            let signature = &compilation.executable.signature;
+
+            assert_eq!(signature.bindings.len(), 3);
+            assert!(signature.bindings.iter().all(|binding| matches!(
+                &binding.layout,
+                effect_torch_runtime::BindingLayoutPolicy::Require(
+                    effect_torch_runtime::LayoutConstraint::Exact(layout)
+                ) if layout == &effect_torch_runtime::Layout::contiguous(vec![batch, 1, 2, 4])
+            )));
+            assert!(signature.invocation.scalars.is_empty());
+            assert_eq!(signature.invocation.runtime_values.len(), 1);
+            assert_eq!(
+                signature.invocation.runtime_values[0].kind,
+                if batch == 1 {
+                    effect_torch_runtime::RuntimeValueKind::U64 {
+                        min: 0,
+                        max: u32::MAX as u64,
+                    }
+                } else {
+                    effect_torch_runtime::RuntimeValueKind::U32Array {
+                        max_len: batch,
+                        element_min: 0,
+                        element_max: u32::MAX,
+                    }
+                }
+            );
+            assert_eq!(signature.outputs.len(), 3);
+            assert_eq!(signature.outputs[0], signature.outputs[2]);
+        }
     }
 
     #[test]
@@ -4099,66 +5005,81 @@ mod tests {
         let left = Node::new(NodeKind::Neg { a: shared.clone() }).unwrap();
         let right = Node::new(NodeKind::Tanh { a: shared }).unwrap();
         let compilation = compile(&[left, right], options(false), 1024).unwrap();
+        let instructions = encoded_instructions(&compilation.executable);
         assert_eq!(
-            compilation
-                .executable
-                .commands
+            instructions
                 .iter()
-                .map(|command| command.op.name())
+                .map(|instruction| operation(instruction).name())
                 .collect::<Vec<_>>(),
             ["binary", "unary", "unary"]
         );
-        assert_eq!(compilation.executable.commands[1].inputs.len(), 1);
+        assert_eq!(instructions[1].inputs.len(), 1);
         assert_eq!(
-            compilation.executable.commands[1].inputs[0],
-            compilation.executable.commands[0].outputs[0]
+            instructions[1].inputs[0].value,
+            instructions[0].outputs[0].value
         );
         assert_eq!(
-            compilation.executable.commands[2].inputs[0],
-            compilation.executable.commands[0].outputs[0]
+            instructions[2].inputs[0].value,
+            instructions[0].outputs[0].value
         );
     }
 
     #[test]
     fn executable_does_not_keep_graph_roots_alive() {
         let root = Node::new(NodeKind::Neg {
-            a: leaf(vec![1.0, 2.0]),
+            a: Node::new(NodeKind::Neg {
+                a: leaf(vec![1.0, 2.0]),
+            })
+            .unwrap(),
         })
         .unwrap();
         let weak = Arc::downgrade(&root);
-        let compilation = compile(std::slice::from_ref(&root), options(false), 1024).unwrap();
+        let compilation = compile(std::slice::from_ref(&root), options(true), 1024).unwrap();
+        assert!(matches!(
+            operation(encoded_instructions(&compilation.executable)[0]),
+            CpuOp::FusedElementwise { .. }
+        ));
         drop(root);
         assert!(weak.upgrade().is_none());
-        assert_eq!(run(&compilation)[0].to_f32_vec().unwrap(), [-1.0, -2.0]);
+        assert_eq!(run(&compilation)[0].to_f32_vec().unwrap(), [1.0, 2.0]);
     }
 
     #[test]
-    fn selectors_are_explicit_producer_output_references_without_commands() {
-        let input = leaf(vec![1.0, -2.0, 3.0, -4.0]);
-        let producer = Node::new(NodeKind::FusedElementwiseMulti {
-            inputs: vec![input],
-            strides: vec![vec![1]],
-            shape: vec![4],
-            exprs: vec![Expr::Input(0), Expr::Neg(Box::new(Expr::Input(0)))],
+    fn production_optimizer_selectors_route_to_region_outputs_without_commands() {
+        let step = Node::new(NodeKind::SgdStep {
+            param: leaf(vec![1.0, 2.0]),
+            grad: leaf(vec![0.5, -0.25]),
+            velocity: leaf(vec![0.0, 0.0]),
+            first: leaf_shape(vec![1.0], vec![]),
+            lr: leaf_shape(vec![0.1], vec![]),
+            momentum: 0.9,
+            dampening: 0.0,
+            nesterov: false,
+            weight_decay: 0.0,
         })
         .unwrap();
-        let first = Node::new(NodeKind::FusedPick {
-            of: producer.clone(),
-            index: 0,
-        })
-        .unwrap();
-        let second = Node::new(NodeKind::FusedPick {
-            of: producer,
+        let velocity = Node::new(NodeKind::SgdOut {
+            step: step.clone(),
             index: 1,
         })
         .unwrap();
-        let compilation = compile(&[first, second], options(false), 1024).unwrap();
-        assert_eq!(compilation.executable.commands.len(), 1);
-        assert_eq!(compilation.executable.commands[0].outputs.len(), 2);
+        let compilation = compile(&[step, velocity], options(true), 1024).unwrap();
+        let instructions = encoded_instructions(&compilation.executable);
+        assert_eq!(instructions.len(), 1);
+        assert!(matches!(
+            operation(instructions[0]),
+            CpuOp::Sgd {
+                implementation: OptimizerImplementation::Fused,
+                ..
+            }
+        ));
         assert_eq!(
-            compilation.executable.outputs.as_ref(),
-            compilation.executable.commands[0].outputs.as_ref()
+            compilation.executable.program.outputs.as_ref(),
+            output_ids(instructions[0])
         );
+        let outputs = run(&compilation);
+        assert_eq!(outputs[0].to_f32_vec().unwrap(), [0.95, 2.025]);
+        assert_eq!(outputs[1].to_f32_vec().unwrap(), [0.5, -0.25]);
     }
 
     #[test]
@@ -4170,10 +5091,10 @@ mod tests {
         })
         .unwrap();
         let compilation = compile(&[random.clone(), random], options(false), 1024).unwrap();
-        assert_eq!(compilation.executable.commands.len(), 1);
+        assert_eq!(compilation.executable.physical.len(), 1);
         assert_eq!(
-            compilation.executable.outputs[0],
-            compilation.executable.outputs[1]
+            compilation.executable.program.outputs[0],
+            compilation.executable.program.outputs[1]
         );
         let first = run(&compilation);
         let second = run(&compilation);
@@ -4240,6 +5161,7 @@ mod tests {
             device: Device::Cpu,
         })
         .unwrap();
+        let random_id = random.id;
         let optimized = compile(
             &[deterministic.clone(), random.clone()],
             options(true),
@@ -4248,16 +5170,14 @@ mod tests {
         .unwrap();
         let unoptimized = compile(&[deterministic, random], options(false), 1024).unwrap();
         assert_ne!(
-            optimized.executable.commands.len(),
-            unoptimized.executable.commands.len()
+            optimized.executable.physical.len(),
+            unoptimized.executable.physical.len()
         );
         let provenance = |compilation: &CpuCompilation| {
-            compilation
-                .executable
-                .commands
-                .iter()
-                .find_map(|command| match command.op {
-                    CpuOp::Randn { provenance, .. } => Some(provenance),
+            encoded_instructions(&compilation.executable)
+                .into_iter()
+                .find_map(|instruction| match operation(instruction) {
+                    CpuOp::Randn { provenance, .. } => Some(*provenance),
                     _ => None,
                 })
                 .expect("compiled random command")
@@ -4265,6 +5185,7 @@ mod tests {
         let optimized_provenance = provenance(&optimized);
         let unoptimized_provenance = provenance(&unoptimized);
         assert_eq!(optimized_provenance, unoptimized_provenance);
+        assert_eq!(optimized_provenance, random_id);
 
         let sample = |provenance| {
             let mut tensor = Tensor::empty(&[16], DType::F32);
@@ -4288,13 +5209,121 @@ mod tests {
             .unwrap(),
         })
         .unwrap();
-        let optimized = compile(std::slice::from_ref(&root), options(true), 1024).unwrap();
-        let unoptimized = compile(std::slice::from_ref(&root), options(false), 1024).unwrap();
+        let roots = [root.clone(), root];
+        let optimized = compile(&roots, options(true), 1024).unwrap();
+        let unoptimized = compile(&roots, options(false), 1024).unwrap();
+        assert_eq!(optimized.executable.physical.len(), 1);
+        assert_eq!(unoptimized.executable.physical.len(), 2);
+        assert!(matches!(
+            operation(encoded_instructions(&optimized.executable)[0]),
+            CpuOp::FusedElementwise { .. }
+        ));
+        assert_eq!(
+            optimized.executable.program.outputs[0],
+            optimized.executable.program.outputs[1]
+        );
         assert_eq!(
             run(&optimized)[0].to_f32_vec().unwrap(),
             run(&unoptimized)[0].to_f32_vec().unwrap()
         );
-        assert!(optimized.executable.commands.len() < unoptimized.executable.commands.len());
+    }
+
+    #[test]
+    fn direct_elementwise_reduce_region_matches_semantic_lowering() {
+        let sum = Node::new(NodeKind::Add {
+            a: leaf_shape(vec![1.0, -2.0, 3.0, -4.0], vec![2, 2]),
+            b: leaf_shape(vec![0.5, 0.25, -0.5, 2.0], vec![2, 2]),
+        })
+        .unwrap();
+        let tanh = Node::new(NodeKind::Tanh { a: sum }).unwrap();
+        let root = Node::new(NodeKind::Sum {
+            a: tanh,
+            dims: vec![1],
+            keepdims: false,
+        })
+        .unwrap();
+        let optimized = compile(std::slice::from_ref(&root), options(true), 1024).unwrap();
+        let unoptimized = compile(std::slice::from_ref(&root), options(false), 1024).unwrap();
+        assert_eq!(optimized.executable.physical.len(), 1);
+        assert_eq!(unoptimized.executable.physical.len(), 3);
+        assert!(matches!(
+            operation(encoded_instructions(&optimized.executable)[0]),
+            CpuOp::FusedReduce { .. }
+        ));
+        assert_eq!(
+            run(&optimized)[0].to_f32_vec().unwrap(),
+            run(&unoptimized)[0].to_f32_vec().unwrap()
+        );
+    }
+
+    #[test]
+    fn direct_multi_output_region_emits_one_command_and_no_selectors() {
+        let sum = Node::new(NodeKind::Add {
+            a: leaf(vec![1.0, -2.0, 3.0, -4.0]),
+            b: leaf(vec![0.5, 0.25, -0.5, 2.0]),
+        })
+        .unwrap();
+        let prefix = Node::new(NodeKind::Tanh { a: sum }).unwrap();
+        let left = Node::new(NodeKind::Exp {
+            a: Node::new(NodeKind::Neg { a: prefix.clone() }).unwrap(),
+        })
+        .unwrap();
+        let right = Node::new(NodeKind::Sin {
+            a: Node::new(NodeKind::Mul {
+                a: prefix,
+                b: leaf(vec![2.0, 1.5, -0.5, 0.25]),
+            })
+            .unwrap(),
+        })
+        .unwrap();
+        let roots = [left, right];
+        let optimized = compile(&roots, options(true), 1024).unwrap();
+        let unoptimized = compile(&roots, options(false), 1024).unwrap();
+        let instructions = encoded_instructions(&optimized.executable);
+        assert_eq!(instructions.len(), 1);
+        assert_eq!(instructions[0].outputs.len(), 2);
+        assert_eq!(unoptimized.executable.physical.len(), 6);
+        assert_eq!(
+            optimized.executable.program.outputs.as_ref(),
+            output_ids(instructions[0])
+        );
+        for (optimized, unoptimized) in run(&optimized).iter().zip(run(&unoptimized)) {
+            assert_eq!(
+                optimized.to_f32_vec().unwrap(),
+                unoptimized.to_f32_vec().unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn optimization_plan_reports_one_index_and_no_semantic_rebuilds() {
+        let root = Node::new(NodeKind::Tanh {
+            a: Node::new(NodeKind::Add {
+                a: leaf(vec![1.0, 2.0]),
+                b: leaf(vec![3.0, 4.0]),
+            })
+            .unwrap(),
+        })
+        .unwrap();
+        let compilation = compile(&[root], options(true), 1024).unwrap();
+        let work = &compilation.executable.compiler_work;
+        assert_eq!(work.graph_index_builds, 1);
+        assert_eq!(work.semantic_nodes_rebuilt, 0);
+        assert_eq!(work.selected_regions, 1);
+        assert_eq!(
+            compilation
+                .executable
+                .diagnostics
+                .semantic_nodes_before_optimization,
+            work.semantic_nodes
+        );
+        assert_eq!(
+            compilation
+                .executable
+                .diagnostics
+                .semantic_nodes_after_optimization,
+            work.semantic_nodes
+        );
     }
 
     #[test]
@@ -4330,7 +5359,7 @@ mod tests {
         })
         .unwrap();
         let compilation = compile(&[slice], options(false), 1024).unwrap();
-        assert!(compilation.executable.commands.is_empty());
+        assert!(compilation.executable.physical.is_empty());
         assert_eq!(
             run(&compilation)[0].to_f32_vec().unwrap(),
             [6.0, 8.0, 16.0, 18.0]
@@ -4349,22 +5378,6 @@ mod tests {
             .err()
             .unwrap()
             .contains("does not support device metal"));
-
-        let bf16 = Node::new(NodeKind::Leaf(Arc::new(LeafSlot::new(Value(
-            Tensor::ones(&[2], DType::BF16),
-        )))))
-        .unwrap();
-        let fused = Node::new(NodeKind::FusedElementwise {
-            inputs: vec![bf16],
-            strides: vec![vec![1]],
-            shape: vec![2],
-            expr: Expr::Input(0),
-        })
-        .unwrap();
-        assert!(compile(&[fused], options(false), 1024)
-            .err()
-            .unwrap()
-            .contains("does not support dtype bf16"));
 
         let half = || {
             Node::new(NodeKind::Leaf(Arc::new(LeafSlot::new(Value(
@@ -4405,8 +5418,8 @@ mod tests {
         })
         .unwrap();
         let compilation = compile(&[root], options(false), 1024).unwrap();
-        let commands = &compilation.executable.commands;
-        let intermediate = commands[0].outputs[0];
+        let instructions = encoded_instructions(&compilation.executable);
+        let intermediate = instructions[0].outputs[0].value;
         assert!(matches!(
             compilation.executable.memory.locations[intermediate.index()],
             Location::Segment { .. }
@@ -4442,7 +5455,7 @@ mod tests {
         let optimized = compile(std::slice::from_ref(&adamw), options(true), 1024).unwrap();
         let unoptimized = compile(std::slice::from_ref(&adamw), options(false), 1024).unwrap();
         assert!(matches!(
-            &optimized.executable.commands[0].op,
+            operation(encoded_instructions(&optimized.executable)[0]),
             CpuOp::AdamW {
                 implementation: OptimizerImplementation::Fused,
                 fused_exprs: Some(_),
@@ -4450,13 +5463,21 @@ mod tests {
             }
         ));
         assert!(matches!(
-            &unoptimized.executable.commands[0].op,
+            operation(encoded_instructions(&unoptimized.executable)[0]),
             CpuOp::AdamW {
                 implementation: OptimizerImplementation::Composed,
                 fused_exprs: None,
                 ..
             }
         ));
+        for (optimized, unoptimized) in run(&optimized)[0]
+            .to_f32_vec()
+            .unwrap()
+            .iter()
+            .zip(run(&unoptimized)[0].to_f32_vec().unwrap())
+        {
+            assert!((optimized - unoptimized).abs() < 1e-6);
+        }
 
         let target = Node::new(NodeKind::Leaf(Arc::new(LeafSlot::new(Value(
             Tensor::from_vec(vec![0i64, 1], vec![2]),
@@ -4472,9 +5493,129 @@ mod tests {
         .unwrap();
         let compilation = compile(&[ce], options(false), 17).unwrap();
         assert!(matches!(
-            compilation.executable.commands[0].op,
+            operation(encoded_instructions(&compilation.executable)[0]),
             CpuOp::ChunkedHeadCe { chunk_size: 17, .. }
         ));
+    }
+
+    #[test]
+    fn grouped_adamw_region_preserves_output_routes_and_numerical_results() {
+        let scalar = |value| leaf_shape(vec![value], vec![]);
+        let lr = scalar(0.01);
+        let c1 = scalar(0.1);
+        let c2 = scalar(0.01);
+        let step = |param: Vec<f32>, grad: Vec<f32>| {
+            Node::new(NodeKind::AdamWStep {
+                param: leaf(param),
+                grad: leaf(grad),
+                m: leaf(vec![0.0, 0.0]),
+                v: leaf(vec![0.0, 0.0]),
+                lr: lr.clone(),
+                c1: c1.clone(),
+                c2: c2.clone(),
+                beta1: 0.9,
+                beta2: 0.99,
+                eps: 1e-8,
+                weight_decay: 0.01,
+            })
+            .unwrap()
+        };
+        let first = step(vec![1.0, 2.0], vec![0.1, -0.2]);
+        let first_m = Node::new(NodeKind::AdamWOut {
+            step: first.clone(),
+            index: 1,
+        })
+        .unwrap();
+        let second = step(vec![3.0, 4.0], vec![-0.3, 0.4]);
+        let second_v = Node::new(NodeKind::AdamWOut {
+            step: second.clone(),
+            index: 2,
+        })
+        .unwrap();
+        let roots = [first, first_m, second, second_v];
+        let mut grouped_options = options(true);
+        grouped_options.environment.optimizer_groups = true;
+        let grouped = compile(&roots, grouped_options, 1024).unwrap();
+        let independent = compile(&roots, options(false), 1024).unwrap();
+
+        let instructions = encoded_instructions(&grouped.executable);
+        assert_eq!(instructions.len(), 1);
+        assert_eq!(independent.executable.physical.len(), 2);
+        assert!(matches!(
+            operation(instructions[0]),
+            CpuOp::AdamWGroup { parameters: 2, .. }
+        ));
+        assert_eq!(instructions[0].outputs.len(), 6);
+        assert_eq!(
+            grouped.executable.program.outputs.as_ref(),
+            [
+                instructions[0].outputs[0].value,
+                instructions[0].outputs[1].value,
+                instructions[0].outputs[3].value,
+                instructions[0].outputs[5].value,
+            ]
+        );
+        for (grouped, independent) in run(&grouped).iter().zip(run(&independent)) {
+            for (grouped, independent) in grouped
+                .to_f32_vec()
+                .unwrap()
+                .iter()
+                .zip(independent.to_f32_vec().unwrap())
+            {
+                assert!((grouped - independent).abs() < 1e-6);
+            }
+        }
+    }
+
+    #[test]
+    fn grouped_adamw_rejects_different_runtime_scalars_and_preserves_results() {
+        let scalar = |value| leaf_shape(vec![value], vec![]);
+        let step = |param: Vec<f32>, grad: Vec<f32>, lr: f32, c1: f32, c2: f32| {
+            Node::new(NodeKind::AdamWStep {
+                param: leaf(param),
+                grad: leaf(grad),
+                m: leaf(vec![0.0, 0.0]),
+                v: leaf(vec![0.0, 0.0]),
+                lr: scalar(lr),
+                c1: scalar(c1),
+                c2: scalar(c2),
+                beta1: 0.9,
+                beta2: 0.99,
+                eps: 1e-8,
+                weight_decay: 0.01,
+            })
+            .unwrap()
+        };
+        let first = step(vec![1.0, 2.0], vec![0.1, -0.2], 0.01, 0.1, 0.01);
+        let second = step(vec![3.0, 4.0], vec![-0.3, 0.4], 0.02, 0.2, 0.04);
+        let roots = [first, second];
+        let mut grouped_options = options(true);
+        grouped_options.environment.optimizer_groups = true;
+        let selected = compile(&roots, grouped_options, 1024).unwrap();
+        let independent = compile(&roots, options(false), 1024).unwrap();
+
+        let instructions = encoded_instructions(&selected.executable);
+        assert_eq!(instructions.len(), 2);
+        assert!(instructions.iter().all(|instruction| matches!(
+            operation(instruction),
+            CpuOp::AdamW {
+                implementation: OptimizerImplementation::Fused,
+                ..
+            }
+        )));
+        assert!(!instructions
+            .iter()
+            .any(|instruction| matches!(operation(instruction), CpuOp::AdamWGroup { .. })));
+        for (selected, independent) in run(&selected).iter().zip(run(&independent)) {
+            for (selected, independent) in selected
+                .to_f32_vec()
+                .unwrap()
+                .iter()
+                .zip(independent.to_f32_vec().unwrap())
+            {
+                assert!((selected - independent).abs() < 1e-6);
+            }
+        }
     }
 
     struct InjectedFailureState {
@@ -4527,7 +5668,10 @@ mod tests {
         })
         .unwrap();
         let compilation = compile(&[recurrence], options(false), 1024).unwrap();
-        assert_eq!(compilation.executable.commands[0].state_outputs.len(), 1);
+        assert_eq!(
+            encoded_instructions(&compilation.executable)[0].state.len(),
+            1
+        );
         assert!(compilation.executable.memory.report.transaction_bytes > 0);
         assert!(compilation
             .executable

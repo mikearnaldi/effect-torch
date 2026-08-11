@@ -110,7 +110,8 @@ export const l1 = dualLoss<Tensor.Any, LossOptions>((pred, target, options) =>
 export interface HuberOptions extends LossOptions {
   /**
    * Positive transition point between quadratic and linear regions; defaults
-   * to `1`.
+   * to `1`. Values `<= 0` fail. Finiteness is not checked: `NaN` may propagate
+   * non-finite results and positive infinity is accepted.
    */
   readonly delta?: number
 }

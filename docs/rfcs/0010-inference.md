@@ -127,8 +127,10 @@ rebuilds it:
   appended after the last declared slot.
 - `RotaryEmbedding { offset: Absolute }` → `offset: Cursor` (the eval
   reads the sequence's cursor from the kv context; no slot needed).
-- Runtime scalar inputs are rejected (unsupported in inference graphs);
-  a walk with zero causal Sdpa nodes fails ("no cacheable attention").
+- Runtime scalar inputs are rejected (unsupported in inference graphs).
+  Graphs with no cacheable or recurrent operation are valid and produce a
+  zero-state decode geometry; their sequence cursor still tracks committed
+  tokens and can drive specialized position operations.
 
 The rewritten graph is fused and frozen with the RFC 0008 machinery.
 One model yields exactly two programs: one decode (`[1, 1]` input) and
@@ -209,7 +211,7 @@ Deliberate shape decisions:
 - **Eager compilation.** Exactly two signatures exist
   (`[1, prefillChunk]`, `[1, 1]`) and dtype/device are config, so both
   programs and the pool are built at construction, and construction
-  errors (no cacheable attention, non-causal attention) fail
+  errors such as non-causal attention fail
   `inference` itself rather than the first call.
 - **No explicit lifetime on the artifact.** The two programs are
   static (no shape-keyed growth, so RFC 0008's `dispose`-as-JIT-

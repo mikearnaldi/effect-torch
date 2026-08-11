@@ -245,7 +245,6 @@ dependencies = [
 name = "effect-torch-autodiff"
 version = "0.1.0"
 dependencies = [
- "effect-torch-compiler",
  "effect-torch-graph",
  "effect-torch-runtime",
 ]
@@ -254,6 +253,7 @@ dependencies = [
 name = "effect-torch-compiler"
 version = "0.1.0"
 dependencies = [
+ "effect-torch-autodiff",
  "effect-torch-graph",
  "effect-torch-runtime",
  "libm",

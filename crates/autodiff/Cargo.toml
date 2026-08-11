@@ -4,6 +4,5 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
-effect-torch-compiler = { path = "../compiler" }
 effect-torch-graph = { path = "../graph" }
 effect-torch-runtime = { path = "../runtime" }

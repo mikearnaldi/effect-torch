@@ -85,99 +85,6 @@ fn f32_lit(v: f64) -> String {
     format!("({s}f)")
 }
 
-fn emit_expr(e: &Expr, lane: &dyn Fn(u32) -> String, num_inputs: usize) -> String {
-    match e {
-        Expr::Input(k) => lane(*k),
-        Expr::Scalar(k) => format!("scs[{}]", *k as usize),
-        Expr::Const(bits) => f32_lit(f64::from_bits(*bits)),
-        Expr::Add(a, b) => format!(
-            "({} + {})",
-            emit_expr(a, lane, num_inputs),
-            emit_expr(b, lane, num_inputs)
-        ),
-        Expr::Sub(a, b) => format!(
-            "({} - {})",
-            emit_expr(a, lane, num_inputs),
-            emit_expr(b, lane, num_inputs)
-        ),
-        Expr::Mul(a, b) => format!(
-            "({} * {})",
-            emit_expr(a, lane, num_inputs),
-            emit_expr(b, lane, num_inputs)
-        ),
-        Expr::Div(a, b) => format!(
-            "({} / {})",
-            emit_expr(a, lane, num_inputs),
-            emit_expr(b, lane, num_inputs)
-        ),
-        Expr::Min(a, b) => format!(
-            "fmin({}, {})",
-            emit_expr(a, lane, num_inputs),
-            emit_expr(b, lane, num_inputs)
-        ),
-        Expr::Max(a, b) => format!(
-            "fmax({}, {})",
-            emit_expr(a, lane, num_inputs),
-            emit_expr(b, lane, num_inputs)
-        ),
-        Expr::Lt(a, b) => format!(
-            "({} < {} ? 1.0f : 0.0f)",
-            emit_expr(a, lane, num_inputs),
-            emit_expr(b, lane, num_inputs)
-        ),
-        Expr::Le(a, b) => format!(
-            "({} <= {} ? 1.0f : 0.0f)",
-            emit_expr(a, lane, num_inputs),
-            emit_expr(b, lane, num_inputs)
-        ),
-        Expr::Gt(a, b) => format!(
-            "({} > {} ? 1.0f : 0.0f)",
-            emit_expr(a, lane, num_inputs),
-            emit_expr(b, lane, num_inputs)
-        ),
-        Expr::Ge(a, b) => format!(
-            "({} >= {} ? 1.0f : 0.0f)",
-            emit_expr(a, lane, num_inputs),
-            emit_expr(b, lane, num_inputs)
-        ),
-        Expr::Eq(a, b) => format!(
-            "({} == {} ? 1.0f : 0.0f)",
-            emit_expr(a, lane, num_inputs),
-            emit_expr(b, lane, num_inputs)
-        ),
-        Expr::Ne(a, b) => format!(
-            "({} != {} ? 1.0f : 0.0f)",
-            emit_expr(a, lane, num_inputs),
-            emit_expr(b, lane, num_inputs)
-        ),
-        Expr::Select(c, a, b) => format!(
-            "({} != 0.0f ? {} : {})",
-            emit_expr(c, lane, num_inputs),
-            emit_expr(a, lane, num_inputs),
-            emit_expr(b, lane, num_inputs)
-        ),
-        Expr::Neg(a) => format!("(-{})", emit_expr(a, lane, num_inputs)),
-        Expr::Sqrt(a) => format!("sqrt({})", emit_expr(a, lane, num_inputs)),
-        Expr::Exp(a) => format!("exp({})", emit_expr(a, lane, num_inputs)),
-        Expr::Sin(a) => format!("sin({})", emit_expr(a, lane, num_inputs)),
-        Expr::Cos(a) => format!("cos({})", emit_expr(a, lane, num_inputs)),
-        Expr::Tanh(a) => format!("tanh({})", emit_expr(a, lane, num_inputs)),
-        Expr::Abs(a) => format!("fabs({})", emit_expr(a, lane, num_inputs)),
-        Expr::Log(a) => format!("log({})", emit_expr(a, lane, num_inputs)),
-        Expr::Floor(a) => format!("floor({})", emit_expr(a, lane, num_inputs)),
-        Expr::Ceil(a) => format!("ceil({})", emit_expr(a, lane, num_inputs)),
-        Expr::Round(a) => format!("round({})", emit_expr(a, lane, num_inputs)),
-        Expr::Powf(a, e) => format!(
-            "pow({}, {})",
-            emit_expr(a, lane, num_inputs),
-            f32_lit(f64::from_bits(*e))
-        ),
-        Expr::Erf(a) => format!("erf_as({})", emit_expr(a, lane, num_inputs)),
-        Expr::Gelu(a) => format!("gelu_as({})", emit_expr(a, lane, num_inputs)),
-        Expr::GeluTanh(a) => format!("gelu_tanh_as({})", emit_expr(a, lane, num_inputs)),
-    }
-}
-
 fn contiguous_strides(shape: &[usize]) -> Vec<usize> {
     let mut strides = vec![0usize; shape.len()];
     let mut acc = 1usize;
@@ -194,14 +101,13 @@ fn contiguous_strides(shape: &[usize]) -> Vec<usize> {
 fn emit_expr_ssa(
     e: &Expr,
     lane: &dyn Fn(u32) -> String,
-    num_inputs: usize,
+    indent: &str,
     body: &mut String,
     next: &mut usize,
     memo: &mut std::collections::HashMap<usize, String>,
 ) -> String {
-    let _ = num_inputs;
     // Iterative post-order emission (memoized by node pointer): a long
-    // elementwise chain is one deep Expr, and kernel emission must not
+    // fused chain is one deep Expr, and kernel emission must not
     // multiply its depth by the call stack.
     macro_rules! binary {
         ($stack:ident, $fmt:literal) => {{
@@ -322,7 +228,7 @@ fn emit_expr_ssa(
         };
         let name = format!("t{}", *next);
         *next += 1;
-        body.push_str(&format!("    float {name} = {rhs};\n"));
+        body.push_str(&format!("{indent}float {name} = {rhs};\n"));
         memo.insert(node as *const Expr as usize, name.clone());
         results.push(name);
     }
@@ -433,7 +339,7 @@ pub fn emit_elementwise(
     let mut memo = std::collections::HashMap::new();
     for (j, expr) in exprs.iter().enumerate() {
         let mut body = String::new();
-        let v = emit_expr_ssa(expr, &lane, num_inputs, &mut body, &mut next, &mut memo);
+        let v = emit_expr_ssa(expr, &lane, "    ", &mut body, &mut next, &mut memo);
         src.push_str(&body);
         src.push_str(&format!(
             "    out{j}[clamped] = {};\n",
@@ -552,13 +458,17 @@ pub fn emit_reduce(
     }
     let lane =
         |k: u32| -> String { load_expr(format!("in{}[{}]", k, lane_offsets[k as usize]), dtype) };
-    let v = emit_expr(expr, &lane, num_inputs);
+    let mut body = String::new();
+    let mut next = 0usize;
+    let mut memo = std::collections::HashMap::new();
+    let v = emit_expr_ssa(expr, &lane, "        ", &mut body, &mut next, &mut memo);
     let fold = match op {
         ReduceOp::Sum | ReduceOp::Mean => format!("acc += {v};"),
         ReduceOp::Max => format!("acc = fmax(acc, {v});"),
         ReduceOp::Prod => format!("acc *= {v};"),
         ReduceOp::Min => format!("acc = fmin(acc, {v});"),
     };
+    src.push_str(&body);
     src.push_str(&format!("        {fold}\n"));
     src.push_str("    }\n");
     if op == ReduceOp::Mean {
@@ -625,8 +535,62 @@ mod tests {
             crate::runtime::dtype::DType::F32,
         );
         assert!(src.contains("for (uint r = 0u; r < 3u; ++r)"));
+        assert!(src.contains(
+            "        float t0 = (in0[((clamped % 2) * 3) + (r % 3)] * in0[((clamped % 2) * 3) + (r % 3)]);\n        acc += t0;"
+        ));
         assert!(src.contains("acc /= 3.0f;"));
         assert!(src.contains("out[clamped] = acc;"));
+
+        let selected = Expr::Select(
+            Box::new(Expr::Input(0)),
+            Box::new(Expr::Input(1)),
+            Box::new(Expr::Input(2)),
+        );
+        let selected_src = emit_reduce(
+            ReduceOp::Sum,
+            &selected,
+            &[vec![1], vec![1], vec![1]],
+            &[2],
+            &[0],
+            false,
+            &[1],
+            "reduce_select_bf16",
+            crate::runtime::dtype::DType::BF16,
+        );
+        assert!(selected_src.contains(
+            "        float t0 = (float(in0[0u + (r % 2)]) != 0.0f ? float(in1[0u + (r % 2)]) : float(in2[0u + (r % 2)]));\n        acc += t0;"
+        ));
+        assert!(selected_src.contains("out[clamped] = bfloat(acc);"));
+    }
+
+    #[test]
+    fn deep_reduce_source_emission_is_stack_safe() {
+        std::thread::Builder::new()
+            .stack_size(256 * 1024)
+            .spawn(|| {
+                for depth in [50_000usize, 100_000] {
+                    let mut expr = crate::fusion::KernelExpr::Input(0);
+                    for _ in 0..depth {
+                        expr = crate::fusion::KernelExpr::Neg(Box::new(expr));
+                    }
+                    let src = emit_reduce(
+                        ReduceOp::Sum,
+                        &expr,
+                        &[vec![1]],
+                        &[2],
+                        &[0],
+                        false,
+                        &[1],
+                        "deep_reduce",
+                        crate::runtime::dtype::DType::F32,
+                    );
+                    assert!(src.contains(&format!("float t{} = (-t{});", depth - 1, depth - 2)));
+                    assert!(src.contains(&format!("acc += t{};", depth - 1)));
+                }
+            })
+            .unwrap()
+            .join()
+            .unwrap();
     }
 
     #[test]

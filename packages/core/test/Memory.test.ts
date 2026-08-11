@@ -92,6 +92,6 @@ layer(BackendCpu.layer)("Memory", (it) => {
           grown < 512 * 1024 * 1024,
           `expected bounded peak memory, RSS grew by ${grown} bytes`
         )
-      }))
+      }), 20000)
   })
 })

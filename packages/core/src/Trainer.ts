@@ -94,7 +94,10 @@ export interface TrainStep {
  * and targets are not cast, and every selected model/loss operation must
  * support its resulting dtypes. This mode requires the runtime's
  * `mixed-bf16` feature, currently provided by Metal; unsupported runtimes fail
- * when training starts.
+ * when training starts. It is a parameter-cast policy, not general AMP or
+ * autocast: it performs no automatic activation/loss casting beyond the model
+ * graph, loss scaling, finite-gradient detection, overflow skipping, or dynamic
+ * scale adjustment.
  *
  * @since 0.1.0
  * @category models
@@ -103,7 +106,7 @@ export type Precision = "f32" | "mixedBf16"
 
 /**
  * Configuration for {@link make}. `loss` is any loss function in the
- * shape of {@link Loss.mse} — `(prediction, target) => Effect<Lazy>` —
+ * shape of `Loss.mse` — `(prediction, target) => Effect<Lazy>` —
  * so the `Loss` module's exports slot in directly. `lr` is the
  * learning-rate schedule (see the `LearningRate` module): it is evaluated
  * with the 0-based step number on every step and the value flows into the
@@ -205,10 +208,12 @@ export interface Resume<S> {
   /** Prior non-negative integer step count; the next sample uses `step + 1`. Not validated here. */
   readonly step: number
   /**
-   * Epoch wall-clock anchor in milliseconds (`Date.now()`). When set,
+   * Millisecond anchor in the active Effect `Clock.currentTimeMillis` time base;
+   * with the live clock this is Unix-epoch time. When set,
    * {@link TrainStep.elapsed} measures from this point instead of the
    * current `train` invocation, so a run chunked into several `train`
-   * calls keeps one continuous clock. Absent means: start now.
+   * calls keeps one continuous clock. Absent means: start now. The value is not
+   * validated, so an incompatible or future anchor can yield meaningless elapsed time.
    */
   readonly startedAt?: number
 }
@@ -233,12 +238,14 @@ export interface Trainer<S, EL = never, RL = never, ED = never, RD = never, EO =
    * `onStep` before checking `stop`. A `resume` must be accompanied by its
    * matching `params`; omitting `resume` initializes fresh optimizer state.
    *
-   * The compiled loop explicitly clears each parameter/state generation it
-   * produced after the next step consumes it. An all-concrete initial set of
+   * On the successful compiled path, the loop clears each parameter/state
+   * generation it produced after the next step consumes it. An all-concrete initial set of
    * supplied parameters and resume roots remains caller-owned; if any initial
    * root is lazy, the materialized initial generation becomes loop-owned.
    * Data tensors are never cleared. Final parameters and state roots transfer
-   * to the caller. The uncompiled reference loop performs no explicit clears.
+   * to the caller. If training fails or is interrupted before a cleanup point,
+   * unreachable loop-owned generations rely on native finalization. The
+   * uncompiled reference loop performs no explicit clears.
    *
    * Fails in the typed channel for model arity or mixed-precision support,
    * tensor/gradient/backend errors, or configured loss, data, and callback
@@ -254,14 +261,15 @@ export interface Trainer<S, EL = never, RL = never, ED = never, RD = never, EO =
     Runtime.Runtime | RL | RD | RO
   >
   /**
-   * Current cached-program count and cumulative trace count. Uncompiled
-   * trainers always report zero for both values.
+   * Current JavaScript cached-program count and cumulative trace-attempt count,
+   * including failures and retraces. This does not count native cold
+   * compilations. Uncompiled trainers always report zero for both values.
    */
   readonly stats: Effect.Effect<Tensor.CompileStats>
   /**
-   * Drops cached program references so their native resources can be
-   * garbage-collected; it does not clear tensors or reset the cumulative
-   * trace count. A later step retraces. This is a no-op when uncompiled.
+   * Drops JavaScript cached-program references; it does not clear tensors,
+   * native structural or pipeline caches, or the cumulative trace count. A
+   * later step retraces. This is a no-op when uncompiled.
    */
   readonly clear: Effect.Effect<void>
 }

@@ -96,15 +96,10 @@ impl fmt::Display for ClearedLeaf {
 }
 impl Error for ClearedLeaf {}
 
-pub trait FusionExpression: Clone + Send + Sync + 'static {
-    type ReduceOp: Copy + Send + Sync + 'static;
-    fn lane_strides(lane: &[usize], out: &[usize]) -> Option<Vec<usize>>;
-}
-
-fn conv_check<E: FusionExpression>(
+fn conv_check(
     op: &str,
-    x: &Node<E>,
-    w: &Node<E>,
+    x: &Node,
+    w: &Node,
     stride: usize,
     _padding: usize,
     dilation: usize,
@@ -143,12 +138,7 @@ fn conv_check<E: FusionExpression>(
 
 // Validates q [.., T, D], k [.., S, D], v [.., S, Dv] and returns the
 // attention output shape [.., T, Dv]. Leading dims must match exactly.
-fn sdpa_check<E: FusionExpression>(
-    op: &str,
-    q: &Node<E>,
-    k: &Node<E>,
-    v: &Node<E>,
-) -> Result<Vec<usize>, String> {
+fn sdpa_check(op: &str, q: &Node, k: &Node, v: &Node) -> Result<Vec<usize>, String> {
     let rank = q.shape.len();
     if rank < 2 || k.shape.len() != rank || v.shape.len() != rank {
         return Err(format!(
@@ -197,13 +187,13 @@ fn sdpa_check<E: FusionExpression>(
 // Validates kda_chunk operands: q, k and log_decay [.., H, T, Dk], v
 // [.., H, T, Dv], beta [.., H, T, 1]; returns the output shape
 // [.., H, T, Dv]. Leading dims must match exactly.
-fn kda_check<E: FusionExpression>(
+fn kda_check(
     op: &str,
-    q: &Node<E>,
-    k: &Node<E>,
-    v: &Node<E>,
-    log_decay: &Node<E>,
-    beta: &Node<E>,
+    q: &Node,
+    k: &Node,
+    v: &Node,
+    log_decay: &Node,
+    beta: &Node,
 ) -> Result<Vec<usize>, String> {
     let rank = q.shape.len();
     if rank < 2
@@ -261,12 +251,12 @@ fn kda_check<E: FusionExpression>(
 
 // Validates a chunked head CE operand set: x [.., K], weight [K, V],
 // bias [1, V] or [V], target [..] integer. Returns the vocab.
-fn head_ce_check<E: FusionExpression>(
+fn head_ce_check(
     op: &str,
-    x: &Node<E>,
-    weight: &Node<E>,
-    bias: &Node<E>,
-    target: &Node<E>,
+    x: &Node,
+    weight: &Node,
+    bias: &Node,
+    target: &Node,
 ) -> Result<usize, String> {
     let rank = x.shape.len();
     if rank < 2 || weight.shape.len() != 2 {
@@ -325,11 +315,7 @@ fn head_ce_check<E: FusionExpression>(
 }
 
 // Validates a short_conv1d pair: x [.., T, C], weight [C, K].
-fn short_conv_check<E: FusionExpression>(
-    op: &str,
-    x: &Node<E>,
-    weight: &Node<E>,
-) -> Result<(), String> {
+fn short_conv_check(op: &str, x: &Node, weight: &Node) -> Result<(), String> {
     if x.shape.len() < 2 || weight.shape.len() != 2 {
         return Err(format!(
             "{op}: expected x [.., T, C] and weight [C, K], got {:?} and {:?}",
@@ -382,7 +368,7 @@ pub enum PositionOffset {
     Cursor,
 }
 
-pub enum NodeKind<E: FusionExpression> {
+pub enum NodeKind {
     Leaf(std::sync::Arc<LeafSlot>),
     // RFC 0008: placeholder leaves for compiled programs. An Input carries
     // the declared signature of one call argument; it evaluates only inside
@@ -445,173 +431,173 @@ pub enum NodeKind<E: FusionExpression> {
         device: Device,
     },
     Add {
-        a: Arc<Node<E>>,
-        b: Arc<Node<E>>,
+        a: Arc<Node>,
+        b: Arc<Node>,
     },
     Sub {
-        a: Arc<Node<E>>,
-        b: Arc<Node<E>>,
+        a: Arc<Node>,
+        b: Arc<Node>,
     },
     Mul {
-        a: Arc<Node<E>>,
-        b: Arc<Node<E>>,
+        a: Arc<Node>,
+        b: Arc<Node>,
     },
     Div {
-        a: Arc<Node<E>>,
-        b: Arc<Node<E>>,
+        a: Arc<Node>,
+        b: Arc<Node>,
     },
     Eq {
-        a: Arc<Node<E>>,
-        b: Arc<Node<E>>,
+        a: Arc<Node>,
+        b: Arc<Node>,
     },
     Gt {
-        a: Arc<Node<E>>,
-        b: Arc<Node<E>>,
+        a: Arc<Node>,
+        b: Arc<Node>,
     },
     Lt {
-        a: Arc<Node<E>>,
-        b: Arc<Node<E>>,
+        a: Arc<Node>,
+        b: Arc<Node>,
     },
     Ge {
-        a: Arc<Node<E>>,
-        b: Arc<Node<E>>,
+        a: Arc<Node>,
+        b: Arc<Node>,
     },
     Le {
-        a: Arc<Node<E>>,
-        b: Arc<Node<E>>,
+        a: Arc<Node>,
+        b: Arc<Node>,
     },
     Maximum {
-        a: Arc<Node<E>>,
-        b: Arc<Node<E>>,
+        a: Arc<Node>,
+        b: Arc<Node>,
     },
     Minimum {
-        a: Arc<Node<E>>,
-        b: Arc<Node<E>>,
+        a: Arc<Node>,
+        b: Arc<Node>,
     },
     Neg {
-        a: Arc<Node<E>>,
+        a: Arc<Node>,
     },
     Abs {
-        a: Arc<Node<E>>,
+        a: Arc<Node>,
     },
     Sqrt {
-        a: Arc<Node<E>>,
+        a: Arc<Node>,
     },
     Exp {
-        a: Arc<Node<E>>,
+        a: Arc<Node>,
     },
     Log {
-        a: Arc<Node<E>>,
+        a: Arc<Node>,
     },
     Sin {
-        a: Arc<Node<E>>,
+        a: Arc<Node>,
     },
     Cos {
-        a: Arc<Node<E>>,
+        a: Arc<Node>,
     },
     Tanh {
-        a: Arc<Node<E>>,
+        a: Arc<Node>,
     },
     Relu {
-        a: Arc<Node<E>>,
+        a: Arc<Node>,
     },
     Erf {
-        a: Arc<Node<E>>,
+        a: Arc<Node>,
     },
     // Gaussian error linear unit as a single node (Tensor.gelu).
     // `approximate` selects the tanh form over the exact erf form. A
     // pointwise unary op: folds into fusion regions like tanh/erf.
     Gelu {
-        a: Arc<Node<E>>,
+        a: Arc<Node>,
         approximate: bool,
     },
     Floor {
-        a: Arc<Node<E>>,
+        a: Arc<Node>,
     },
     Ceil {
-        a: Arc<Node<E>>,
+        a: Arc<Node>,
     },
     Round {
-        a: Arc<Node<E>>,
+        a: Arc<Node>,
     },
     Sign {
-        a: Arc<Node<E>>,
+        a: Arc<Node>,
     },
     Where {
-        cond: Arc<Node<E>>,
-        a: Arc<Node<E>>,
-        b: Arc<Node<E>>,
+        cond: Arc<Node>,
+        a: Arc<Node>,
+        b: Arc<Node>,
     },
     Pow {
-        a: Arc<Node<E>>,
+        a: Arc<Node>,
         exp: f64,
     },
     Cast {
-        a: Arc<Node<E>>,
+        a: Arc<Node>,
         dtype: DType,
     },
     Sum {
-        a: Arc<Node<E>>,
+        a: Arc<Node>,
         dims: Vec<usize>,
         keepdims: bool,
     },
     Mean {
-        a: Arc<Node<E>>,
+        a: Arc<Node>,
         dims: Vec<usize>,
         keepdims: bool,
     },
     Max {
-        a: Arc<Node<E>>,
+        a: Arc<Node>,
         dims: Vec<usize>,
         keepdims: bool,
     },
     Min {
-        a: Arc<Node<E>>,
+        a: Arc<Node>,
         dims: Vec<usize>,
         keepdims: bool,
     },
     Prod {
-        a: Arc<Node<E>>,
+        a: Arc<Node>,
         dims: Vec<usize>,
         keepdims: bool,
     },
     Argmax {
-        a: Arc<Node<E>>,
+        a: Arc<Node>,
         dim: usize,
     },
     Argmin {
-        a: Arc<Node<E>>,
+        a: Arc<Node>,
         dim: usize,
     },
     Cumsum {
-        a: Arc<Node<E>>,
+        a: Arc<Node>,
         dim: usize,
     },
     IndexSelect {
-        a: Arc<Node<E>>,
+        a: Arc<Node>,
         dim: usize,
-        indexes: Arc<Node<E>>,
+        indexes: Arc<Node>,
     },
     ScatterAdd {
-        a: Arc<Node<E>>,
+        a: Arc<Node>,
         dim: usize,
-        indexes: Arc<Node<E>>,
-        src: Arc<Node<E>>,
+        indexes: Arc<Node>,
+        src: Arc<Node>,
     },
     Gather {
-        a: Arc<Node<E>>,
+        a: Arc<Node>,
         dim: usize,
-        indexes: Arc<Node<E>>,
+        indexes: Arc<Node>,
     },
     CrossEntropy {
-        logits: Arc<Node<E>>,
-        target: Arc<Node<E>>,
+        logits: Arc<Node>,
+        target: Arc<Node>,
         ignore_index: i64,
         reduction: CeReduction,
     },
     CrossEntropyBackward {
-        logits: Arc<Node<E>>,
-        target: Arc<Node<E>>,
+        logits: Arc<Node>,
+        target: Arc<Node>,
         ignore_index: i64,
         reduction: CeReduction,
     },
@@ -622,9 +608,9 @@ pub enum NodeKind<E: FusionExpression> {
     // its adjoints. Shapes: q [.., T, D], k [.., S, D], v [.., S, Dv]
     // with equal leading dims; the output is [.., T, Dv].
     Sdpa {
-        q: Arc<Node<E>>,
-        k: Arc<Node<E>>,
-        v: Arc<Node<E>>,
+        q: Arc<Node>,
+        k: Arc<Node>,
+        v: Arc<Node>,
         scale: f64,
         causal: bool,
     },
@@ -637,16 +623,16 @@ pub enum NodeKind<E: FusionExpression> {
     // this is the adjoint of (reads its output and stashed L). Not
     // differentiable (no second-order).
     SdpaBackward {
-        q: Arc<Node<E>>,
-        k: Arc<Node<E>>,
-        v: Arc<Node<E>>,
-        g: Arc<Node<E>>,
-        fwd: Arc<Node<E>>,
+        q: Arc<Node>,
+        k: Arc<Node>,
+        v: Arc<Node>,
+        g: Arc<Node>,
+        fwd: Arc<Node>,
         scale: f64,
         causal: bool,
     },
     SdpaBackwardOut {
-        of: Arc<Node<E>>,
+        of: Arc<Node>,
         index: u8,
     },
     // Absolute position embedding as one semantic node: rows 0..seq_len
@@ -656,7 +642,7 @@ pub enum NodeKind<E: FusionExpression> {
     // runtime cursor instead of re-deriving "this gather is a position
     // embedding" from composed ops.
     PositionEmbedding {
-        weight: Arc<Node<E>>,
+        weight: Arc<Node>,
         seq_len: usize,
     },
     // RFC 0010: paged KV attention, the decode/prefill semantic node
@@ -669,9 +655,9 @@ pub enum NodeKind<E: FusionExpression> {
     // cursor arrive via the run's kv context, keeping the graph a pure
     // function of its inputs. Not differentiable.
     KvAttention {
-        q: Arc<Node<E>>,
-        k: Arc<Node<E>>,
-        v: Arc<Node<E>>,
+        q: Arc<Node>,
+        k: Arc<Node>,
+        v: Arc<Node>,
         scale: f64,
         layer: u32,
         window: Option<usize>,
@@ -692,11 +678,11 @@ pub enum NodeKind<E: FusionExpression> {
     // decode rewrite turns this into a stateful KdaRecurrence. Not yet
     // differentiable (phase 4 adds the closed-form backward).
     KdaChunk {
-        q: Arc<Node<E>>,
-        k: Arc<Node<E>>,
-        v: Arc<Node<E>>,
-        log_decay: Arc<Node<E>>,
-        beta: Arc<Node<E>>,
+        q: Arc<Node>,
+        k: Arc<Node>,
+        v: Arc<Node>,
+        log_decay: Arc<Node>,
+        beta: Arc<Node>,
         scale: f64,
     },
     // RFC 0018: stateful KDA recurrence, the decode/prefill semantic
@@ -707,11 +693,11 @@ pub enum NodeKind<E: FusionExpression> {
     // written back to it, keeping the graph a pure function of its
     // inputs. Not differentiable.
     KdaRecurrence {
-        q: Arc<Node<E>>,
-        k: Arc<Node<E>>,
-        v: Arc<Node<E>>,
-        log_decay: Arc<Node<E>>,
-        beta: Arc<Node<E>>,
+        q: Arc<Node>,
+        k: Arc<Node>,
+        v: Arc<Node>,
+        log_decay: Arc<Node>,
+        beta: Arc<Node>,
         scale: f64,
         layer: u32,
     },
@@ -724,16 +710,16 @@ pub enum NodeKind<E: FusionExpression> {
     // chunk) — bounded memory, no O(T) state retention. Not
     // differentiable (no second-order).
     KdaBackward {
-        q: Arc<Node<E>>,
-        k: Arc<Node<E>>,
-        v: Arc<Node<E>>,
-        log_decay: Arc<Node<E>>,
-        beta: Arc<Node<E>>,
-        g: Arc<Node<E>>,
+        q: Arc<Node>,
+        k: Arc<Node>,
+        v: Arc<Node>,
+        log_decay: Arc<Node>,
+        beta: Arc<Node>,
+        g: Arc<Node>,
         scale: f64,
     },
     KdaBackwardOut {
-        of: Arc<Node<E>>,
+        of: Arc<Node>,
         index: u8,
     },
     // Causal depthwise short convolution over [.., T, C] with weight
@@ -743,8 +729,8 @@ pub enum NodeKind<E: FusionExpression> {
     // instead of re-deriving "this pad+conv is a short conv" from
     // composed ops.
     ShortConv1d {
-        x: Arc<Node<E>>,
-        weight: Arc<Node<E>>,
+        x: Arc<Node>,
+        weight: Arc<Node>,
     },
     // RFC 0018: stateful short convolution, the decode/prefill semantic
     // node produced by the decode rewrite (never written by user code).
@@ -752,8 +738,8 @@ pub enum NodeKind<E: FusionExpression> {
     // sequence's slot and the new window is written back. Not
     // differentiable.
     ConvState {
-        x: Arc<Node<E>>,
-        weight: Arc<Node<E>>,
+        x: Arc<Node>,
+        weight: Arc<Node>,
         layer: u32,
     },
     // RFC 0016 phase 2 (as-built revision): the chunked head +
@@ -766,10 +752,10 @@ pub enum NodeKind<E: FusionExpression> {
     // chunk's backward workspace alive until the head-parameter roots
     // evaluated, which consumer-count release cannot fix.
     ChunkedHeadCe {
-        x: Arc<Node<E>>,
-        weight: Arc<Node<E>>,
-        bias: Arc<Node<E>>,
-        target: Arc<Node<E>>,
+        x: Arc<Node>,
+        weight: Arc<Node>,
+        bias: Arc<Node>,
+        target: Arc<Node>,
         ignore_index: i64,
     },
     // Closed-form adjoint: one eval loops the chunks, recomputing each
@@ -778,15 +764,15 @@ pub enum NodeKind<E: FusionExpression> {
     // ChunkedHeadCeBackwardOut. g is the scalar cotangent of the loss.
     // Not differentiable (no second-order).
     ChunkedHeadCeBackward {
-        x: Arc<Node<E>>,
-        weight: Arc<Node<E>>,
-        bias: Arc<Node<E>>,
-        target: Arc<Node<E>>,
-        g: Arc<Node<E>>,
+        x: Arc<Node>,
+        weight: Arc<Node>,
+        bias: Arc<Node>,
+        target: Arc<Node>,
+        g: Arc<Node>,
         ignore_index: i64,
     },
     ChunkedHeadCeBackwardOut {
-        of: Arc<Node<E>>,
+        of: Arc<Node>,
         index: u8,
     },
     // ShortConv1d adjoints (RFC 0018 phase 4): dx is the full
@@ -795,14 +781,14 @@ pub enum NodeKind<E: FusionExpression> {
     // causal window. x rides along for shape/dtype metadata. Not
     // differentiable (no second-order).
     ShortConv1dBackwardX {
-        x: Arc<Node<E>>,
-        weight: Arc<Node<E>>,
-        g: Arc<Node<E>>,
+        x: Arc<Node>,
+        weight: Arc<Node>,
+        g: Arc<Node>,
     },
     ShortConv1dBackwardW {
-        x: Arc<Node<E>>,
-        weight: Arc<Node<E>>,
-        g: Arc<Node<E>>,
+        x: Arc<Node>,
+        weight: Arc<Node>,
+        g: Arc<Node>,
     },
     // RoPE (GPT-NeoX half-split rotary) as one semantic node: x is
     // [.., T, D] with D even; the last dim rotates in half pairs by
@@ -813,7 +799,7 @@ pub enum NodeKind<E: FusionExpression> {
     // to Cursor (the run's kv cursor) instead of re-deriving "this
     // arange is a position" from composed ops.
     RotaryEmbedding {
-        x: Arc<Node<E>>,
+        x: Arc<Node>,
         seq_len: usize,
         theta: f64,
         offset: PositionOffset,
@@ -822,7 +808,7 @@ pub enum NodeKind<E: FusionExpression> {
     // transpose rotation, evaluated by the same fused kernel with
     // negated angles. Carries the input's shape/seq_len for metadata.
     RotaryEmbeddingBackward {
-        g: Arc<Node<E>>,
+        g: Arc<Node>,
         shape: Vec<usize>,
         seq_len: usize,
         theta: f64,
@@ -832,73 +818,52 @@ pub enum NodeKind<E: FusionExpression> {
     // Metal kernel handles it as one launch and decode compilation can
     // pass it through.
     LayerNorm {
-        x: Arc<Node<E>>,
-        weight: Arc<Node<E>>,
-        bias: Arc<Node<E>>,
+        x: Arc<Node>,
+        weight: Arc<Node>,
+        bias: Arc<Node>,
         eps: f64,
     },
     // Backward of LayerNorm: evaluates dx (its own value) and stores
     // (dw, db) for LayerNormBackwardOut, like the optimizer steps.
     LayerNormBackward {
-        x: Arc<Node<E>>,
-        weight: Arc<Node<E>>,
-        g: Arc<Node<E>>,
+        x: Arc<Node>,
+        weight: Arc<Node>,
+        g: Arc<Node>,
         eps: f64,
     },
     // Reads one weight-side output of a LayerNormBackward (1 = dw,
     // 2 = db).
     LayerNormBackwardOut {
-        of: Arc<Node<E>>,
+        of: Arc<Node>,
         index: u8,
     },
     // Fused linear layer: y = x·W + b in one gemm launch (addmm
     // epilogue on Metal). Semantic node — Model.linear and attention
     // projections build it directly.
     Linear {
-        x: Arc<Node<E>>,
-        weight: Arc<Node<E>>,
-        bias: Arc<Node<E>>,
-    },
-    // RFC 0016 phase 3 — created only by the evaluation-time epilogue
-    // pass: y = x·W + b + residual in one gemm launch (the residual add
-    // rides the epilogue; the standalone proj output never materializes).
-    // Never in user graphs, so autodiff and vmap reject it.
-    LinearResidual {
-        x: Arc<Node<E>>,
-        weight: Arc<Node<E>>,
-        bias: Arc<Node<E>>,
-        residual: Arc<Node<E>>,
-    },
-    // RFC 0016 phase 3 — created only by the evaluation-time epilogue
-    // pass: y = gelu(x·W + b) in one gemm launch. `dual` writes the
-    // pre-activation as output 0 as well (backward needs it); consumers
-    // read the outputs through FusedPick. Never in user graphs.
-    LinearGelu {
-        x: Arc<Node<E>>,
-        weight: Arc<Node<E>>,
-        bias: Arc<Node<E>>,
-        approximate: bool,
-        dual: bool,
+        x: Arc<Node>,
+        weight: Arc<Node>,
+        bias: Arc<Node>,
     },
     Conv1d {
-        x: Arc<Node<E>>,
-        w: Arc<Node<E>>,
+        x: Arc<Node>,
+        w: Arc<Node>,
         stride: usize,
         padding: usize,
         dilation: usize,
         groups: usize,
     },
     Conv2d {
-        x: Arc<Node<E>>,
-        w: Arc<Node<E>>,
+        x: Arc<Node>,
+        w: Arc<Node>,
         stride: usize,
         padding: usize,
         dilation: usize,
         groups: usize,
     },
     ConvTranspose1d {
-        x: Arc<Node<E>>,
-        w: Arc<Node<E>>,
+        x: Arc<Node>,
+        w: Arc<Node>,
         stride: usize,
         padding: usize,
         output_padding: usize,
@@ -906,8 +871,8 @@ pub enum NodeKind<E: FusionExpression> {
         groups: usize,
     },
     ConvTranspose2d {
-        x: Arc<Node<E>>,
-        w: Arc<Node<E>>,
+        x: Arc<Node>,
+        w: Arc<Node>,
         stride: usize,
         padding: usize,
         output_padding: usize,
@@ -915,8 +880,8 @@ pub enum NodeKind<E: FusionExpression> {
         groups: usize,
     },
     Conv1dBackwardW {
-        x: Arc<Node<E>>,
-        g: Arc<Node<E>>,
+        x: Arc<Node>,
+        g: Arc<Node>,
         kernel: usize,
         out_channels: usize,
         stride: usize,
@@ -925,8 +890,8 @@ pub enum NodeKind<E: FusionExpression> {
         groups: usize,
     },
     Conv2dBackwardW {
-        x: Arc<Node<E>>,
-        g: Arc<Node<E>>,
+        x: Arc<Node>,
+        g: Arc<Node>,
         kernel: [usize; 2],
         out_channels: usize,
         stride: usize,
@@ -935,160 +900,95 @@ pub enum NodeKind<E: FusionExpression> {
         groups: usize,
     },
     Reshape {
-        a: Arc<Node<E>>,
+        a: Arc<Node>,
         shape: Vec<usize>,
     },
     Permute {
-        a: Arc<Node<E>>,
+        a: Arc<Node>,
         dims: Vec<usize>,
     },
     Slice {
-        a: Arc<Node<E>>,
+        a: Arc<Node>,
         ranges: Vec<(usize, usize, usize)>,
     },
     Concat {
-        a: Arc<Node<E>>,
-        b: Arc<Node<E>>,
+        a: Arc<Node>,
+        b: Arc<Node>,
         dim: usize,
     },
     BroadcastTo {
-        a: Arc<Node<E>>,
+        a: Arc<Node>,
         shape: Vec<usize>,
     },
     Matmul {
-        a: Arc<Node<E>>,
-        b: Arc<Node<E>>,
+        a: Arc<Node>,
+        b: Arc<Node>,
     },
     Inverse {
-        a: Arc<Node<E>>,
+        a: Arc<Node>,
     },
     Det {
-        a: Arc<Node<E>>,
+        a: Arc<Node>,
     },
     Solve {
-        a: Arc<Node<E>>,
-        b: Arc<Node<E>>,
+        a: Arc<Node>,
+        b: Arc<Node>,
     },
     // lr, c1 (1 - beta1^t) and c2 (1 - beta2^t) are 0-d tensor children:
     // step-varying values flow through the graph so a frozen graph (RFC
     // 0008) never replays a stale step count or learning rate.
     AdamWStep {
-        param: Arc<Node<E>>,
-        grad: Arc<Node<E>>,
-        m: Arc<Node<E>>,
-        v: Arc<Node<E>>,
-        lr: Arc<Node<E>>,
-        c1: Arc<Node<E>>,
-        c2: Arc<Node<E>>,
+        param: Arc<Node>,
+        grad: Arc<Node>,
+        m: Arc<Node>,
+        v: Arc<Node>,
+        lr: Arc<Node>,
+        c1: Arc<Node>,
+        c2: Arc<Node>,
         beta1: f64,
         beta2: f64,
         eps: f64,
         weight_decay: f64,
     },
     AdamWOut {
-        step: Arc<Node<E>>,
-        index: u8,
-    },
-    // Freeze-time grouping of same-shape AdamW steps (the endgame for
-    // the optimizer: one fused launch per group instead of one per
-    // parameter — ≤4 params, Metal's 31-buffer limit: 4 lanes + 3
-    // outputs each plus 3 scalars).
-    AdamWStepGroup {
-        params: Vec<Arc<Node<E>>>,
-        grads: Vec<Arc<Node<E>>>,
-        ms: Vec<Arc<Node<E>>>,
-        vs: Vec<Arc<Node<E>>>,
-        lr: Arc<Node<E>>,
-        c1: Arc<Node<E>>,
-        c2: Arc<Node<E>>,
-        beta1: f64,
-        beta2: f64,
-        eps: f64,
-        weight_decay: f64,
-    },
-    // One output of a grouped step: `param`-th parameter's updated
-    // param (0), m (1), or v (2).
-    AdamWGroupOut {
-        of: Arc<Node<E>>,
-        param: u32,
+        step: Arc<Node>,
         index: u8,
     },
     // `first` is a 0-d flag (1.0 on the first step, 0.0 after) selecting
     // v = g over v = momentum * v + (1 - dampening) * g; velocity is always
     // a real buffer (zeros at init), so no placeholder is needed.
     SgdStep {
-        param: Arc<Node<E>>,
-        grad: Arc<Node<E>>,
-        velocity: Arc<Node<E>>,
-        first: Arc<Node<E>>,
-        lr: Arc<Node<E>>,
+        param: Arc<Node>,
+        grad: Arc<Node>,
+        velocity: Arc<Node>,
+        first: Arc<Node>,
+        lr: Arc<Node>,
         momentum: f64,
         dampening: f64,
         nesterov: bool,
         weight_decay: f64,
     },
     SgdOut {
-        step: Arc<Node<E>>,
+        step: Arc<Node>,
         index: u8,
-    },
-    // Created only by the evaluation-time fusion rewrite (RFC 0007 phase
-    // 2): a maximal chain of elementwise ops compiled to one kernel. Never
-    // appears in user graphs, so autodiff and vmap reject it. Input lanes
-    // may be broadcast-smaller than the output: `strides` gives each
-    // lane's strides in output-dim space (0 = broadcast along that dim).
-    FusedElementwise {
-        inputs: Vec<Arc<Node<E>>>,
-        strides: Vec<Vec<usize>>,
-        shape: Vec<usize>,
-        expr: E,
-    },
-    // Created by the multi-output post-pass (RFC 0007): a shared fused
-    // prefix and its fused continuations compiled to one kernel with one
-    // store per output. Consumers are FusedPick nodes.
-    FusedElementwiseMulti {
-        inputs: Vec<Arc<Node<E>>>,
-        strides: Vec<Vec<usize>>,
-        shape: Vec<usize>,
-        exprs: Vec<E>,
-    },
-    // Reads one output of a FusedElementwiseMulti.
-    FusedPick {
-        of: Arc<Node<E>>,
-        index: u8,
-    },
-    // Created only by the evaluation-time fusion rewrite (RFC 0007 phase
-    // 3a): an elementwise chain terminated by a single reduce, compiled to
-    // one kernel that evaluates the chain inside the reduce loop — the
-    // chain's intermediate never materializes. `strides` are per-lane in
-    // input-dim space; `dims` sorted ascending; `shape` is the reduced
-    // shape with keepdims applied.
-    FusedReduce {
-        inputs: Vec<Arc<Node<E>>>,
-        strides: Vec<Vec<usize>>,
-        in_shape: Vec<usize>,
-        expr: E,
-        op: <E as FusionExpression>::ReduceOp,
-        dims: Vec<usize>,
-        keepdims: bool,
-        shape: Vec<usize>,
     },
     StopGradient {
-        a: Arc<Node<E>>,
+        a: Arc<Node>,
     },
     Checkpoint {
-        a: Arc<Node<E>>,
+        a: Arc<Node>,
     },
 }
 
-pub struct Node<E: FusionExpression> {
+pub struct Node {
     pub id: u64,
     pub shape: Vec<usize>,
     pub dtype: DType,
     pub device: Device,
-    pub kind: NodeKind<E>,
+    pub kind: NodeKind,
 }
 
-impl<E: FusionExpression> Drop for Node<E> {
+impl Drop for Node {
     fn drop(&mut self) {
         // Deep graphs (long op chains, large fused backward graphs)
         // recurse in default destructor glue through Arc<Node> children
@@ -1097,12 +997,12 @@ impl<E: FusionExpression> Drop for Node<E> {
         // drops (so no Node destructor can fire mid-drain), uniquely
         // owned nodes are unwrapped and their kind swapped for a dummy
         // leaf, and their children rejoin the worklist.
-        let dummy = || NodeKind::<E>::Zeros {
+        let dummy = || NodeKind::Zeros {
             shape: Vec::new(),
             dtype: DType::F32,
             device: Device::Cpu,
         };
-        let mut worklist: Vec<Arc<Node<E>>> = Vec::new();
+        let mut worklist: Vec<Arc<Node>> = Vec::new();
         let kind = std::mem::replace(&mut self.kind, dummy());
         worklist.extend(node_children(&kind));
         drop(kind);
@@ -1119,8 +1019,8 @@ impl<E: FusionExpression> Drop for Node<E> {
     }
 }
 
-impl<E: FusionExpression> Node<E> {
-    pub fn new(kind: NodeKind<E>) -> Result<Arc<Self>, String> {
+impl Node {
+    pub fn new(kind: NodeKind) -> Result<Arc<Self>, String> {
         let metadata = kind.metadata()?;
         Ok(Arc::new(Self {
             id: NEXT_NODE_ID.fetch_add(1, Ordering::Relaxed),
@@ -1158,7 +1058,7 @@ fn broadcast_shapes(a: &[usize], b: &[usize]) -> std::result::Result<Vec<usize>,
 // tensor keeps the tensor's dtype (the scalar is cast to it at
 // evaluation), matching PyTorch's scalar promotion rules. Mismatches
 // involving integer dtypes keep the legacy first-operand rule.
-fn scalar_aware_binary_dtype<E: FusionExpression>(a: &Node<E>, b: &Node<E>) -> DType {
+fn scalar_aware_binary_dtype(a: &Node, b: &Node) -> DType {
     if a.dtype != b.dtype
         && a.dtype.is_float()
         && b.dtype.is_float()
@@ -1207,7 +1107,7 @@ fn linear_out_shape(
     out[rank - 1] = weight[1];
     Ok(out)
 }
-impl<E: FusionExpression> NodeKind<E> {
+impl NodeKind {
     pub fn metadata(&self) -> Result<NodeMetadata, String> {
         let (shape, dtype, device) = match self {
             NodeKind::Leaf(slot) => {
@@ -1739,33 +1639,6 @@ impl<E: FusionExpression> NodeKind<E> {
                 let out = linear_out_shape(&x.shape, &weight.shape, &bias.shape)?;
                 (out, x.dtype, x.device.clone())
             }
-            NodeKind::LinearGelu {
-                x, weight, bias, ..
-            } => {
-                let out = linear_out_shape(&x.shape, &weight.shape, &bias.shape)?;
-                (out, x.dtype, x.device.clone())
-            }
-            NodeKind::LinearResidual {
-                x,
-                weight,
-                bias,
-                residual,
-            } => {
-                let out = linear_out_shape(&x.shape, &weight.shape, &bias.shape)?;
-                if residual.shape != out {
-                    return Err(format!(
-                        "linear residual: residual shape {:?} does not match output {:?}",
-                        residual.shape, out
-                    ));
-                }
-                if residual.dtype != x.dtype {
-                    return Err(format!(
-                        "linear residual: residual dtype {:?} does not match {:?}",
-                        residual.dtype, x.dtype
-                    ));
-                }
-                (out, x.dtype, x.device.clone())
-            }
             NodeKind::LayerNorm {
                 x, weight, bias, ..
             } => {
@@ -2106,64 +1979,6 @@ impl<E: FusionExpression> NodeKind<E> {
                 }
                 (step.shape.clone(), step.dtype, step.device.clone())
             }
-            NodeKind::AdamWStepGroup {
-                params,
-                grads,
-                ms,
-                vs,
-                lr,
-                c1,
-                c2,
-                ..
-            } => {
-                let n = params.len();
-                if n == 0 || n > 4 {
-                    return Err(format!(
-                        "adamw_step_group: groups hold 1..=4 params (the 31-buffer limit: 4 lanes + 3 outputs each plus 3 scalars), got {n}"
-                    ));
-                }
-                if grads.len() != n || ms.len() != n || vs.len() != n {
-                    return Err(
-                        "adamw_step_group: params, grads, ms and vs must be equally long"
-                            .to_string(),
-                    );
-                }
-                let first = &params[0];
-                if !first.dtype.is_float() {
-                    return Err(format!(
-                        "adamw_step_group: dtype must be floating point, got {:?}",
-                        first.dtype
-                    ));
-                }
-                for (name, tensors) in [("param", params), ("grad", grads), ("m", ms), ("v", vs)] {
-                    for t in tensors {
-                        if t.shape != first.shape || t.dtype != first.dtype {
-                            return Err(format!(
-                                "adamw_step_group: {name} must share the group's shape and dtype"
-                            ));
-                        }
-                    }
-                }
-                for (name, t) in [("lr", lr), ("c1", c1), ("c2", c2)] {
-                    if !t.shape.is_empty() {
-                        return Err(format!(
-                            "adamw_step_group: {name} must be a scalar (0-d) tensor"
-                        ));
-                    }
-                }
-                (first.shape.clone(), first.dtype, first.device.clone())
-            }
-            NodeKind::AdamWGroupOut { of, param, index } => {
-                let NodeKind::AdamWStepGroup { params, .. } = &of.kind else {
-                    return Err("adamw_group_out: parent is not a step group".to_string());
-                };
-                if *index > 2 || *param as usize >= params.len() {
-                    return Err(format!(
-                        "adamw_group_out: param {param} or index {index} out of range"
-                    ));
-                }
-                (of.shape.clone(), of.dtype, of.device.clone())
-            }
             NodeKind::SgdStep {
                 param,
                 grad,
@@ -2198,138 +2013,6 @@ impl<E: FusionExpression> NodeKind<E> {
                 }
                 (step.shape.clone(), step.dtype, step.device.clone())
             }
-            NodeKind::FusedElementwise {
-                inputs,
-                strides,
-                shape,
-                ..
-            } => {
-                if inputs.is_empty() {
-                    return Err("fused: at least one input lane is required".to_string());
-                }
-                if strides.len() != inputs.len() {
-                    return Err(format!(
-                        "fused: got {} stride entries for {} inputs",
-                        strides.len(),
-                        inputs.len()
-                    ));
-                }
-                let first = &inputs[0];
-                for (input, stride) in inputs.iter().zip(strides.iter()) {
-                    if input.dtype != first.dtype || !input.device.same_device(&first.device) {
-                        return Err("fused: all inputs must share dtype and device".to_string());
-                    }
-                    if E::lane_strides(&input.shape, shape).as_ref() != Some(stride) {
-                        return Err(format!(
-                            "fused: input shape {:?} does not broadcast to {:?} with strides {stride:?}",
-                            input.shape, shape
-                        ));
-                    }
-                }
-                if !first.dtype.is_float() {
-                    return Err(format!(
-                        "fused: dtype must be floating point, got {:?}",
-                        first.dtype
-                    ));
-                }
-                (shape.clone(), first.dtype, first.device.clone())
-            }
-            NodeKind::FusedElementwiseMulti {
-                inputs,
-                strides,
-                shape,
-                exprs,
-            } => {
-                if exprs.is_empty() {
-                    return Err("fused multi: at least one output is required".to_string());
-                }
-                if inputs.is_empty() {
-                    return Err("fused multi: at least one input lane is required".to_string());
-                }
-                if strides.len() != inputs.len() {
-                    return Err(format!(
-                        "fused multi: got {} stride entries for {} inputs",
-                        strides.len(),
-                        inputs.len()
-                    ));
-                }
-                let first = &inputs[0];
-                for (input, stride) in inputs.iter().zip(strides.iter()) {
-                    if input.dtype != first.dtype || !input.device.same_device(&first.device) {
-                        return Err(
-                            "fused multi: all inputs must share dtype and device".to_string()
-                        );
-                    }
-                    if E::lane_strides(&input.shape, shape).as_ref() != Some(stride) {
-                        return Err(format!(
-                            "fused multi: input shape {:?} does not broadcast to {:?} with strides {stride:?}",
-                            input.shape, shape
-                        ));
-                    }
-                }
-                if !first.dtype.is_float() {
-                    return Err(format!(
-                        "fused multi: dtype must be floating point, got {:?}",
-                        first.dtype
-                    ));
-                }
-                (shape.clone(), first.dtype, first.device.clone())
-            }
-            NodeKind::FusedPick { of, .. } => (of.shape.clone(), of.dtype, of.device.clone()),
-            NodeKind::FusedReduce {
-                inputs,
-                strides,
-                in_shape,
-                dims,
-                keepdims,
-                shape,
-                ..
-            } => {
-                if inputs.is_empty() {
-                    return Err("fused reduce: at least one input lane is required".to_string());
-                }
-                if strides.len() != inputs.len() {
-                    return Err(format!(
-                        "fused reduce: got {} stride entries for {} inputs",
-                        strides.len(),
-                        inputs.len()
-                    ));
-                }
-                if dims.is_empty()
-                    || dims.iter().any(|&d| d >= in_shape.len())
-                    || !dims.windows(2).all(|w| w[0] < w[1])
-                {
-                    return Err(format!(
-                        "fused reduce: dims {dims:?} are not sorted unique dims of {in_shape:?}"
-                    ));
-                }
-                if &reduced_shape(in_shape, dims, *keepdims) != shape {
-                    return Err(format!(
-                        "fused reduce: shape {shape:?} is not {in_shape:?} reduced over {dims:?} (keepdims {keepdims})"
-                    ));
-                }
-                let first = &inputs[0];
-                for (input, stride) in inputs.iter().zip(strides.iter()) {
-                    if input.dtype != first.dtype || !input.device.same_device(&first.device) {
-                        return Err(
-                            "fused reduce: all inputs must share dtype and device".to_string()
-                        );
-                    }
-                    if E::lane_strides(&input.shape, in_shape).as_ref() != Some(stride) {
-                        return Err(format!(
-                            "fused reduce: input shape {:?} does not broadcast to {:?} with strides {stride:?}",
-                            input.shape, in_shape
-                        ));
-                    }
-                }
-                if !first.dtype.is_float() {
-                    return Err(format!(
-                        "fused reduce: dtype must be floating point, got {:?}",
-                        first.dtype
-                    ));
-                }
-                (shape.clone(), first.dtype, first.device.clone())
-            }
         };
         check_dtype_device(dtype, &device)?;
         Ok(NodeMetadata {
@@ -2353,7 +2036,7 @@ fn check_dtype_device(dtype: DType, device: &Device) -> std::result::Result<(), 
     }
     Ok(())
 }
-pub fn node_children<E: FusionExpression>(kind: &NodeKind<E>) -> Vec<Arc<Node<E>>> {
+pub fn node_children(kind: &NodeKind) -> Vec<Arc<Node>> {
     match kind {
         NodeKind::Leaf(_)
         | NodeKind::Input { .. }
@@ -2507,15 +2190,6 @@ pub fn node_children<E: FusionExpression>(kind: &NodeKind<E>) -> Vec<Arc<Node<E>
         }
         NodeKind::LayerNormBackwardOut { of, .. } => vec![of.clone()],
         NodeKind::Linear { x, weight, bias } => vec![x.clone(), weight.clone(), bias.clone()],
-        NodeKind::LinearGelu {
-            x, weight, bias, ..
-        } => vec![x.clone(), weight.clone(), bias.clone()],
-        NodeKind::LinearResidual {
-            x,
-            weight,
-            bias,
-            residual,
-        } => vec![x.clone(), weight.clone(), bias.clone(), residual.clone()],
         NodeKind::SdpaBackward {
             q, k, v, g, fwd, ..
         } => {
@@ -2551,24 +2225,6 @@ pub fn node_children<E: FusionExpression>(kind: &NodeKind<E>) -> Vec<Arc<Node<E>
             c2.clone(),
         ],
         NodeKind::AdamWOut { step, .. } => vec![step.clone()],
-        NodeKind::AdamWStepGroup {
-            params,
-            grads,
-            ms,
-            vs,
-            lr,
-            c1,
-            c2,
-            ..
-        } => params
-            .iter()
-            .chain(grads.iter())
-            .chain(ms.iter())
-            .chain(vs.iter())
-            .cloned()
-            .chain([lr.clone(), c1.clone(), c2.clone()])
-            .collect(),
-        NodeKind::AdamWGroupOut { of, .. } => vec![of.clone()],
         NodeKind::SgdStep {
             param,
             grad,
@@ -2584,19 +2240,12 @@ pub fn node_children<E: FusionExpression>(kind: &NodeKind<E>) -> Vec<Arc<Node<E>
             lr.clone(),
         ],
         NodeKind::SgdOut { step, .. } => vec![step.clone()],
-        NodeKind::FusedElementwise { inputs, .. } => inputs.clone(),
-        NodeKind::FusedElementwiseMulti { inputs, .. } => inputs.clone(),
-        NodeKind::FusedReduce { inputs, .. } => inputs.clone(),
-        NodeKind::FusedPick { of, .. } => vec![of.clone()],
     }
 }
 
 // Rebuilds a node kind with its children mapped through `f`. Used to
 // deep-copy subgraphs with fresh node ids (checkpoint recompute).
-pub fn remap_children<E: FusionExpression>(
-    kind: &NodeKind<E>,
-    f: &dyn Fn(&Arc<Node<E>>) -> Arc<Node<E>>,
-) -> NodeKind<E> {
+pub fn remap_children(kind: &NodeKind, f: &dyn Fn(&Arc<Node>) -> Arc<Node>) -> NodeKind {
     match kind {
         NodeKind::Leaf(t) => NodeKind::Leaf(t.clone()),
         NodeKind::Input {
@@ -2959,30 +2608,6 @@ pub fn remap_children<E: FusionExpression>(
             weight: f(weight),
             bias: f(bias),
         },
-        NodeKind::LinearGelu {
-            x,
-            weight,
-            bias,
-            approximate,
-            dual,
-        } => NodeKind::LinearGelu {
-            x: f(x),
-            weight: f(weight),
-            bias: f(bias),
-            approximate: *approximate,
-            dual: *dual,
-        },
-        NodeKind::LinearResidual {
-            x,
-            weight,
-            bias,
-            residual,
-        } => NodeKind::LinearResidual {
-            x: f(x),
-            weight: f(weight),
-            bias: f(bias),
-            residual: f(residual),
-        },
         NodeKind::Conv1d {
             x,
             w,
@@ -3196,36 +2821,6 @@ pub fn remap_children<E: FusionExpression>(
             step: f(step),
             index: *index,
         },
-        NodeKind::AdamWStepGroup {
-            params,
-            grads,
-            ms,
-            vs,
-            lr,
-            c1,
-            c2,
-            beta1,
-            beta2,
-            eps,
-            weight_decay,
-        } => NodeKind::AdamWStepGroup {
-            params: params.iter().map(|p| f(p)).collect(),
-            grads: grads.iter().map(|g| f(g)).collect(),
-            ms: ms.iter().map(|m| f(m)).collect(),
-            vs: vs.iter().map(|v| f(v)).collect(),
-            lr: f(lr),
-            c1: f(c1),
-            c2: f(c2),
-            beta1: *beta1,
-            beta2: *beta2,
-            eps: *eps,
-            weight_decay: *weight_decay,
-        },
-        NodeKind::AdamWGroupOut { of, param, index } => NodeKind::AdamWGroupOut {
-            of: f(of),
-            param: *param,
-            index: *index,
-        },
         NodeKind::SgdStep {
             param,
             grad,
@@ -3251,72 +2846,12 @@ pub fn remap_children<E: FusionExpression>(
             step: f(step),
             index: *index,
         },
-        NodeKind::FusedElementwise {
-            inputs,
-            strides,
-            shape,
-            expr,
-        } => NodeKind::FusedElementwise {
-            inputs: inputs.iter().map(|i| f(i)).collect(),
-            strides: strides.clone(),
-            shape: shape.clone(),
-            expr: expr.clone(),
-        },
-        NodeKind::FusedElementwiseMulti {
-            inputs,
-            strides,
-            shape,
-            exprs,
-        } => NodeKind::FusedElementwiseMulti {
-            inputs: inputs.iter().map(|i| f(i)).collect(),
-            strides: strides.clone(),
-            shape: shape.clone(),
-            exprs: exprs.clone(),
-        },
-        NodeKind::FusedPick { of, index } => NodeKind::FusedPick {
-            of: f(of),
-            index: *index,
-        },
-        NodeKind::FusedReduce {
-            inputs,
-            strides,
-            in_shape,
-            expr,
-            op,
-            dims,
-            keepdims,
-            shape,
-        } => NodeKind::FusedReduce {
-            inputs: inputs.iter().map(|i| f(i)).collect(),
-            strides: strides.clone(),
-            in_shape: in_shape.clone(),
-            expr: expr.clone(),
-            op: *op,
-            dims: dims.clone(),
-            keepdims: *keepdims,
-            shape: shape.clone(),
-        },
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[derive(Clone)]
-    struct TestExpr;
-
-    impl FusionExpression for TestExpr {
-        type ReduceOp = ();
-
-        fn lane_strides(lane: &[usize], out: &[usize]) -> Option<Vec<usize>> {
-            if lane == out {
-                Some(vec![1; out.len()])
-            } else {
-                None
-            }
-        }
-    }
 
     #[derive(Clone)]
     struct TestLeaf {
@@ -3343,26 +2878,23 @@ mod tests {
         }
     }
 
-    type TestNode = Node<TestExpr>;
-    type TestNodeKind = NodeKind<TestExpr>;
-
     #[test]
     fn semantic_nodes_own_authoritative_metadata_and_traversal() {
-        let a = TestNode::new(TestNodeKind::Input {
+        let a = Node::new(NodeKind::Input {
             slot: 0,
             shape: vec![2, 1],
             dtype: DType::F32,
             device: Device::Cpu,
         })
         .unwrap();
-        let b = TestNode::new(TestNodeKind::Input {
+        let b = Node::new(NodeKind::Input {
             slot: 1,
             shape: vec![1, 3],
             dtype: DType::F32,
             device: Device::Cpu,
         })
         .unwrap();
-        let add = TestNode::new(TestNodeKind::Add {
+        let add = Node::new(NodeKind::Add {
             a: a.clone(),
             b: b.clone(),
         })
@@ -3377,7 +2909,7 @@ mod tests {
                 child.clone()
             }
         });
-        let remapped = TestNode::new(remapped).unwrap();
+        let remapped = Node::new(remapped).unwrap();
         assert_eq!(remapped.shape, [1, 3]);
     }
 
@@ -3388,16 +2920,16 @@ mod tests {
             dtype: DType::F32,
             device: Device::Cpu,
         }));
-        let leaf = TestNode::new(TestNodeKind::Leaf(slot.clone())).unwrap();
+        let leaf = Node::new(NodeKind::Leaf(slot.clone())).unwrap();
         assert_eq!(leaf.shape, [4]);
         assert!(slot.clear());
         assert!(!slot.clear());
-        assert!(TestNode::new(TestNodeKind::Leaf(slot)).is_err());
+        assert!(Node::new(NodeKind::Leaf(slot)).is_err());
     }
 
     #[test]
     fn metadata_validation_rejects_unsupported_device_dtype() {
-        let error = TestNode::new(TestNodeKind::Zeros {
+        let error = Node::new(NodeKind::Zeros {
             shape: vec![1],
             dtype: DType::F64,
             device: Device::Metal,

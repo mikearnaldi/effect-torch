@@ -1,11 +1,12 @@
 import { describe, expect } from "@effect/vitest"
 import { Effect } from "effect"
 import { Gradient, LearningRate, Loss, Model, Optimizer, Tensor, Trainer } from "../src/index.ts"
+import type { Runtime } from "../src/index.ts"
 import { floats, onDevices } from "./utils/devices.ts"
 
 const values = (t: Tensor.Any) => Tensor.toNumberArray(t)
 
-onDevices("Compile", () => (it) => {
+onDevices("Compile", (device) => (it) => {
   describe("Tensor.compile", () => {
     it.effect("matches the uncompiled graph bitwise", () =>
       Effect.gen(function*() {
@@ -70,6 +71,36 @@ onDevices("Compile", () => (it) => {
           expect(yield* values(retained[i])).toEqual([-i, -(i + 1)])
         }
         yield* Effect.forEach(retained, (tensor) => Tensor.clear(tensor), { discard: true })
+      }))
+
+    it.effect("exposes frozen compile phase diagnostics", () =>
+      Effect.gen(function*() {
+        const x = yield* Tensor.fromTypedArray(floats([1, 2]), [2])
+        const input = yield* Tensor.makeInput(0, x)
+        const program = yield* Tensor.freezeProgram([yield* Tensor.neg(input)])
+        const phases = program.handle.diagnostics.compilePhases
+        expect(phases).toBeDefined()
+        if (phases === undefined) throw new Error("native compile phases are missing")
+        const typedPhases: ReadonlyArray<Runtime.ExecutableCompilePhaseDiagnostics> = phases
+
+        expect(typedPhases.map(({ phase }) => phase)).toEqual([
+          "graph_index",
+          "optimization",
+          "lowering",
+          "lowered_program_validation",
+          "memory_planning",
+          "physical_planning",
+          ...(device === "metal" ? ["pipeline_preparation"] : []),
+          "artifact_assembly",
+          ...(device === "metal" ? ["compile_submission"] : []),
+          "publication"
+        ])
+        expect(Object.isFrozen(typedPhases)).toBe(true)
+        for (const phase of typedPhases) {
+          expect(Object.isFrozen(phase)).toBe(true)
+          expect(Number.isFinite(phase.nanoseconds)).toBe(true)
+          expect(phase.nanoseconds).toBeGreaterThanOrEqual(0)
+        }
       }))
 
     it.effect("traces once under concurrent first calls (single-flight)", () =>

@@ -7,3 +7,10 @@ edition.workspace = true
 effect-torch-graph = { path = "../graph" }
 effect-torch-runtime = { path = "../runtime" }
 libm = "0.2"
+
+[dev-dependencies]
+effect-torch-autodiff = { path = "../autodiff" }
+
+[[bench]]
+name = "pipeline"
+harness = false

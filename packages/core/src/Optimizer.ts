@@ -5,14 +5,14 @@
  * Nothing is mutated or materialized by the optimizer itself.
  * Because gradients share the loss's forward graph and the updates extend
  * the same graphs further, the loss, the updated parameters, and the
- * updated state can all be roots of a single {@link Tensor.compute} walk:
- * the shared forward and backward graphs are evaluated once. The evaluator
- * may release intermediate buffers after their final consumer.
+ * updated state can all be roots of one {@link Tensor.compute} invocation:
+ * the shared forward and backward graph executes once, and the memory plan may
+ * reuse intermediate buffers after their final consumer.
  *
  * The full-step {@link step} helper materializes updated state roots between
  * calls, so graph depth stays O(model depth) no matter how many steps run.
  * Built-in optimizers represent all step-varying state as tensors — the Adam
- * step count `t` is a 0-d tensor, not a JS number — so a frozen graph never
+ * step count `t` is a 0-d tensor, not a JS number — so a compiled executable never
  * replays a stale count, flag, or rate. The learning rate is not part of the
  * configuration: it is a per-step input to {@link Optimizer.step}, so
  * learning-rate schedules are ordinary data flowing through the same
@@ -129,14 +129,16 @@ export interface AdamState {
 /**
  * The result of {@link Optimizer.step}: updated parameters and updated
  * state as lazy graph values, in the same order as the input parameters,
- * plus `stateRoots` listing the tensors inside `state` that must be
- * evaluated before the state is fed into another `step` call. The full-step
+ * plus `stateRoots` listing every tensor value whose current value must cross
+ * the next step or checkpoint boundary. Inert tensor fields need not appear.
+ * The full-step
  * helper and trainer re-materialize these roots between calls so graph depth
  * stays O(model depth). Repack evaluated roots into a new state value with
  * `optimizer.rebuildState(state, evaluated)`.
  *
- * User-land optimizers implement the same contract: return your new state
- * alongside the list of tensors it contains.
+ * User-land optimizers implement the same contract. Every step-varying value
+ * consumed by `step` must be represented by a stable root; dynamic non-root
+ * JavaScript state is captured during compiled tracing and becomes stale.
  *
  * @since 0.1.0
  * @category models
@@ -151,9 +153,10 @@ export interface OptimizerUpdate<S> {
 }
 
 /**
- * A stateful optimizer as a pure graph transform. `init` validates the
- * parameters and builds zero-initialized state; `step` extends the graph
- * with the update arithmetic. Neither evaluates anything.
+ * A stateful optimizer as a pure graph transform. `init` validates parameters
+ * and creates implementation-defined initial state; built-in optimizers create
+ * their required moments, velocities, and scalar controls. `step` extends the
+ * graph with update arithmetic. Neither evaluates anything.
  *
  * The learning rate is a per-step input: a 0-d float tensor on the same
  * device as the parameters. Pass a different value every step (a
@@ -190,8 +193,9 @@ export interface Optimizer<S> {
     lr: Tensor.Any
   ) => Effect.Effect<OptimizerUpdate<S>, Tensor.TensorError, Runtime.Runtime>
   /**
-   * Extracts every tensor needed by the next step in a stable order. The
-   * result is the optimizer state's compiled-program input boundary.
+   * Extracts every dynamic tensor value needed by the next step in a stable
+   * order. The result is the optimizer state's compiled-program input boundary;
+   * non-root structure must be immutable or reproducible by `init`.
    */
   readonly stateRoots: (state: S) => ReadonlyArray<Tensor.Any>
   /**
@@ -508,7 +512,7 @@ const makeAdam = (op: string, config: ResolvedAdamConfig): Effect.Effect<Optimiz
         yield* checkStateLength(op, "second-moment", state.v, params)
         // The bias corrections 1 - beta^t are tensor ops over the state's
         // step count, built once per step and shared by every parameter's
-        // update node (the evaluator dedups them into one kernel each).
+        // update node (lowering deduplicates them into one kernel each).
         const t = yield* Tensor.add(state.t, yield* Tensor.constantLike(state.t, 1))
         const one = yield* Tensor.constantLike(t, 1)
         const c1 = yield* Tensor.add(
@@ -703,13 +707,13 @@ export type Materialized<P extends ReadonlyArray<Tensor.Any>> = {
 /**
  * Runs one full training step: computes the gradients of a scalar loss
  * with respect to the parameters, extends the graph with the optimizer
- * update, and evaluates loss, updated parameters, and every tensor inside
- * the updated state in a single walk — one forward pass, one backward
- * pass, one async boundary. The returned parameters are materialized
+ * update, then materializes loss, updated parameters, and `next.stateRoots` in
+ * one {@link Tensor.compute} invocation. Shared forward, backward, and update
+ * subgraphs execute once behind one async boundary. The returned parameters are materialized
  * tensors with the same length, order, shapes, and dtypes as the input
  * parameters (a tuple in, the same tuple out), and the state is rebuilt
- * from materialized tensors via `optimizer.rebuildState`: both are
- * plain leaves of the next step's graph, so graph depth stays
+ * from those materialized roots via `optimizer.rebuildState`; tensor fields
+ * omitted from `stateRoots` remain as supplied by the optimizer. Both are plain leaves of the next step's graph, so graph depth stays
  * O(model depth) no matter how many steps run.
  *
  * `lr` is the step's learning rate as a 0-d float tensor on the

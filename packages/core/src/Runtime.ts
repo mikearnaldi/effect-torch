@@ -154,11 +154,19 @@ export interface ConcreteTensorHandle extends TensorHandle {
  * @category models
  */
 export interface ExecutableCompileOptions {
-  /** Enables optional rewrites and fusion. Defaults to `true`. */
+  /**
+   * Enables semantics-preserving fusion, epilogue, and optimizer regions.
+   * Defaults to `true`. Optimization records code-generation choices beside
+   * the semantic graph; it does not rewrite that graph. `false` uses the same
+   * typed lowering, memory planner, and executor with optional regions disabled.
+   */
   readonly optimize?: boolean
-  /** Precision policy used by backend lowering. Defaults to `strict`. */
-  readonly precision?: "strict" | "allow-reduced-precision"
-  /** Authorizes inference-only constant-weight preparation. */
+  /**
+   * Authorizes inference-only retention of eligible materialized graph leaves
+   * as executable constants. Their storage remains live with the executable,
+   * and bundled runtimes bypass structural executable-cache reuse in this mode.
+   * Defaults to `false`; do not enable for values expected to vary.
+   */
   readonly constantWeights?: boolean
 }
 
@@ -169,15 +177,15 @@ export interface ExecutableCompileOptions {
  * @category models
  */
 export interface DecodeStateRequest {
-  /** Total token-row capacity of the compatible KV pool. */
+  /** Positive unsigned 32-bit token-row capacity of the compatible KV pool. */
   readonly maxTokens: number
-  /** Number of token rows allocated and cached as one unit. */
+  /** Positive unsigned 32-bit paging unit that must divide `maxTokens`. */
   readonly blockSize: number
-  /** Element data type used for KV storage. */
+  /** KV storage dtype: `f32`, `f16`, `bf16`, or quantized `u8`. */
   readonly kvDtype: DType
-  /** Optional bounded sliding-attention window. */
+  /** Optional unsigned 32-bit sliding-attention window in `1..=maxTokens`. */
   readonly window?: number
-  /** Fixed compiled batch width. */
+  /** Positive unsigned 32-bit fixed compiled batch width. */
   readonly batch: number
 }
 
@@ -210,34 +218,88 @@ export interface DecodeStateSchema extends DecodeStateRequest {
   readonly convKernel: number
 }
 
-/** One lowered instruction category in executable diagnostics. */
+/**
+ * One lowered instruction category in executable diagnostics.
+ *
+ * @since 0.1.0
+ * @category models
+ */
 export interface ExecutableInstructionDiagnostics {
+  /** Backend-defined lowered instruction name. */
   readonly kind: string
+  /** Number of lowered instructions in this category. */
   readonly count: number
 }
 
-/** Static memory totals derived from an executable's immutable plan. */
+/**
+ * One observational wall-clock measurement from executable compilation.
+ *
+ * @since 0.1.0
+ * @category models
+ */
+export interface ExecutableCompilePhaseDiagnostics {
+  /** Stable compiler phase name, with optional backend-specific additions. */
+  readonly phase: string
+  /** Elapsed wall-clock time for the phase. */
+  readonly nanoseconds: number
+}
+
+/**
+ * Static logical byte totals derived from an executable's immutable memory
+ * plan. These are not current allocation, allocator capacity, or process RSS.
+ *
+ * @since 0.1.0
+ * @category models
+ */
 export interface ExecutableMemoryDiagnostics {
+  /** Borrowed invocation or generated-input storage referenced by the plan. */
   readonly externalBytes: number
+  /** Storage retained by executable constants. */
   readonly persistentBytes: number
+  /** Compatible persistent state footprint used by a stateful executable. */
   readonly stateBytes: number
   /** Logical escaping-output storage required by one invocation. */
   readonly outputBytes: number
+  /** Reusable per-invocation workspace and staging capacity. */
   readonly workspaceBytes: number
+  /** Rollback and commit staging for mutable state. */
   readonly transactionBytes: number
+  /** Peak simultaneous logical bytes among planned values. */
   readonly peakLiveBytes: number
+  /** Planned segment capacity beyond peak logical liveness. */
   readonly packingOverheadBytes: number
 }
 
-/** Deterministic compile and planning summary attached to an executable. */
+/**
+ * Static compilation and planning summary attached to an executable.
+ * Structural counters and memory values describe the artifact;
+ * `compilePhases` contains nondeterministic timing observations and does not
+ * participate in cache identity. A structural-cache hit retains the original
+ * artifact's timings rather than measuring the current `compile` call.
+ *
+ * @since 0.1.0
+ * @category models
+ */
 export interface ExecutableDiagnostics {
+  /** Number of semantic graph nodes presented to optimization. */
   readonly semanticNodesBeforeOptimization: number
+  /**
+   * Number of semantic nodes after identity-preserving planning. This currently
+   * equals `semanticNodesBeforeOptimization`; lowered counts expose fusion.
+   */
   readonly semanticNodesAfterOptimization: number
+  /** Lowered instruction counts grouped by backend-defined kind. */
   readonly instructions: ReadonlyArray<ExecutableInstructionDiagnostics>
+  /** Number of prepared backend pipelines, when applicable. */
   readonly pipelineCount: number
+  /** Number of physical encode commands in the executable. */
   readonly commandCount: number
+  /** Number of backend physical completion boundaries; Metal status gates and commits are excluded. */
   readonly synchronizationCount: number
+  /** Static logical memory-plan totals. */
   readonly memory: ExecutableMemoryDiagnostics
+  /** Ordered compiler timings; third-party runtimes may omit or extend them. */
+  readonly compilePhases?: ReadonlyArray<ExecutableCompilePhaseDiagnostics>
 }
 
 /**
@@ -262,7 +324,10 @@ export interface ExecutableHandle {
  * @category models
  */
 export interface CompileRequest {
-  /** Semantic graph roots to lower into one executable. */
+  /**
+   * Nonempty semantic roots owned by this runtime and belonging to one device.
+   * Root order, including duplicates, defines executable output order.
+   */
   readonly roots: ReadonlyArray<TensorHandle>
   /** Explicit controls that join the executable cache key. */
   readonly options?: ExecutableCompileOptions
@@ -277,9 +342,15 @@ export interface CompileRequest {
  * @category models
  */
 export interface ExecutionStateInvocation {
-  /** Active sequences, from one compatible pool. */
+  /**
+   * From `1` through the compiled batch width, distinct live sequences from
+   * one schema-compatible pool.
+   */
   readonly sequences: ReadonlyArray<KvSequenceHandle>
-  /** Real unpadded token ids represented by each active sequence row. */
+  /**
+   * One equally sized, nonempty row of unsigned 32-bit token ids per sequence.
+   * Success commits state and advances cursors; pre-commit failure rolls back.
+   */
   readonly tokens: ReadonlyArray<ReadonlyArray<number>>
 }
 
@@ -290,11 +361,18 @@ export interface ExecutionStateInvocation {
  * @category models
  */
 export interface ExecutionInvocation {
-  /** Materialized tensor bindings in declaration order. */
+  /**
+   * Materialized tensor bindings in ascending shared-slot order with scalar
+   * slots omitted. Counts, metadata, layout, ownership, and placement must
+   * match the compiled declarations.
+   */
   readonly bindings: ReadonlyArray<ConcreteTensorHandle>
-  /** Scalar bindings in declaration order. */
+  /** Scalar bindings in ascending shared-slot order with tensor slots omitted. */
   readonly scalars: ReadonlyArray<number>
-  /** Named bounded runtime values used by the fixed command schedule. */
+  /**
+   * Named bounded values used by a fixed schedule. Bundled CPU and Metal
+   * runtimes currently require this record to be empty for public invocations.
+   */
   readonly runtimeValues: Readonly<Record<string, number | Uint32Array>>
   /** Stateful generation invocation, omitted for ordinary programs. */
   readonly state?: ExecutionStateInvocation
@@ -686,7 +764,7 @@ export type NodeRequest<Operation extends keyof NodeOperationMap = keyof NodeOpe
 export interface PathSafetensorsSaveEntry {
   /** Archive entry name. */
   readonly name: string
-  /** Materialized tensor to serialize. */
+  /** Borrowed materialized tensor to serialize; saving does not release it. */
   readonly tensor: ConcreteTensorHandle
 }
 
@@ -699,7 +777,7 @@ export interface PathSafetensorsSaveEntry {
 export interface PathSafetensorsLoadEntry {
   /** Archive entry name. */
   readonly name: string
-  /** Materialized tensor loaded into the runtime placement. */
+  /** Caller-owned tensor loaded into the runtime placement. */
   readonly tensor: ConcreteTensorHandle
 }
 
@@ -736,14 +814,17 @@ export interface PathSafetensorsLoadArchive {
  * @category models
  */
 export interface PathSafetensors {
-  /** Writes a materialized archive without transferring tensor data through JavaScript. */
+  /** Writes a borrowed materialized archive without transferring tensor data through JavaScript. */
   readonly save: (path: string, archive: PathSafetensorsSaveArchive) => Effect.Effect<void, BackendError>
   /** Reads an archive directly into materialized runtime tensors. */
   readonly load: (path: string) => Effect.Effect<PathSafetensorsLoadArchive, BackendError>
 }
 
 /**
- * Optional runtime extension for compiled paged-KV inference.
+ * Optional runtime extension for compiled paged-KV and recurrent inference.
+ * Pool geometry must exactly match the executable schema. Attention geometry
+ * and each recurrent family are independently either all zero or all positive;
+ * capacities and paging units are positive with exact divisibility.
  *
  * @since 0.1.0
  * @category models
@@ -778,16 +859,20 @@ export interface DecodeRuntime {
     /** Kernel size of each short-conv recurrent layer. */
     readonly convKernel: number
   }) => Effect.Effect<KvPoolHandle, BackendError>
-  /** Creates an empty sequence backed by a KV pool. */
+  /** Creates an empty sequence with independent cursor, block table, and recurrent state. */
   readonly makeSequence: (pool: KvPoolHandle) => Effect.Effect<KvSequenceHandle, BackendError>
-  /** Attaches the longest resident whole-block proper prefix, leaving one token when input is non-empty. */
+  /**
+   * On an empty sequence, attaches the longest resident whole-block proper KV
+   * prefix, leaving one token when input is nonempty. Prefix entries do not
+   * restore KDA or short-convolution recurrent state.
+   */
   readonly prefillMatch: (
     sequence: KvSequenceHandle,
     tokens: ReadonlyArray<number>
   ) => Effect.Effect<number, BackendError>
   /** Returns the sequence's absolute token cursor. */
   readonly sequenceCursor: (sequence: KvSequenceHandle) => Effect.Effect<number, BackendError>
-  /** Releases a sequence and all block references it owns. */
+  /** Releases a sequence and its block references; call exactly once. */
   readonly releaseSequence: (sequence: KvSequenceHandle) => Effect.Effect<void, BackendError>
 }
 
@@ -824,16 +909,30 @@ export interface RuntimeService {
     loss: TensorHandle,
     wrt: ReadonlyArray<TensorHandle>
   ) => Effect.Effect<ReadonlyArray<LazyTensorHandle>, BackendError>
-  /** Compiles semantic graph roots into one immutable backend executable. */
+  /**
+   * Compiles nonempty, runtime-owned, single-device roots into one immutable
+   * executable. Tensor and scalar input declarations share one zero-based,
+   * gap-free slot namespace; repeated declarations must agree exactly.
+   */
   readonly compile: (request: CompileRequest) => Effect.Effect<ExecutableHandle, BackendError>
-  /** Executes an immutable program with one complete invocation. */
+  /**
+   * Executes a runtime-owned immutable program with one complete invocation.
+   * Inputs are borrowed. Returned handles are caller-owned, survive later
+   * invocations, and require exactly one successful `release` for deterministic cleanup.
+   */
   readonly execute: (
     executable: ExecutableHandle,
     invocation: ExecutionInvocation
   ) => Effect.Effect<ReadonlyArray<ConcreteTensorHandle>, BackendError>
-  /** Copies a materialized tensor into a host-owned array buffer. */
+  /**
+   * Exposes tensor values through an `ArrayBuffer`. A backend may copy the data
+   * or directly export retained runtime storage; callers must not rely on either mode.
+   */
   readonly readback: (tensor: ConcreteTensorHandle) => Effect.Effect<ArrayBuffer, BackendError>
-  /** Deterministically releases the storage owned by a materialized tensor handle. */
+  /**
+   * Releases this concrete handle's ownership and invalidates it and lazy graphs
+   * that captured it. Call exactly once; other aliases may still retain storage.
+   */
   readonly release: (tensor: ConcreteTensorHandle) => Effect.Effect<void, BackendError>
   /** Optional backend facilities outside the common tensor runtime contract. */
   readonly extensions: {

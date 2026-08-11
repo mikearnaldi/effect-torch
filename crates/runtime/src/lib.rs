@@ -19,10 +19,7 @@ pub use dense::{
 };
 pub use dtype::DType;
 pub use error::{BackendError, BackendResult};
-pub use executable::{
-    CompilePhaseTiming, Executable, ExecutableBackend, ExecutableDiagnostics, InstructionCount,
-    NativeExecutable,
-};
+pub use executable::{CompilePhaseTiming, ExecutableDiagnostics, InstructionCount};
 pub use layout::{broadcast_shape, Layout};
 pub use memory::{
     AllocationReport, InvocationMemoryReport, Location, MemoryPlan, MemoryPlanError, MemoryReport,

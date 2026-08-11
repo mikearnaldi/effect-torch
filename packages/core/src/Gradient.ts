@@ -3,8 +3,8 @@
  * natively on the graph itself — there is no tracing and no function
  * transformation: the loss is an ordinary lazy graph value and adjoints are
  * expressed as graph nodes. Higher-order derivatives can be requested by
- * applying {@link grad} again, but succeed only when the backend supplies
- * adjoints for every forward and backward node involved.
+ * applying {@link grad} again, but succeed only when the native autodiff
+ * transform defines adjoints for every forward and backward node involved.
  *
  * @since 0.1.0
  */
@@ -13,8 +13,10 @@ import * as Runtime from "./Runtime.ts"
 import * as Tensor from "./Tensor.ts"
 
 /**
- * Error raised by {@link grad} when the graph violates the autodiff
- * contract.
+ * Error raised by {@link grad} for wrapper precondition failures. Unsupported
+ * or non-differentiable nodes in the native autodiff transform surface as
+ * {@link Tensor.TensorError}; the `"not-differentiable"` reason is reserved and
+ * is not currently emitted.
  *
  * @since 0.1.0
  * @category errors
@@ -80,14 +82,15 @@ const validateResult = (
  * Computes the gradients of a scalar loss with respect to the given tensors.
  * The loss is an ordinary lazy graph value — there is no tracing and no
  * function transformation, the backward transform runs natively on the
- * graph itself: one walk, with adjoints expressed in the same node
+ * graph itself, with adjoints expressed in the same node
  * vocabulary as the forward pass. Applying `grad` to a derivative graph can
  * produce higher-order derivatives only where all participating forward ops
- * and generated adjoint ops are themselves differentiable. Semantic fused
- * operations such as {@link Tensor.crossEntropy} and
- * {@link Tensor.scaledDotProductAttention} explicitly do not provide a
- * second-order path; unsupported backend adjoints may surface as
- * {@link Tensor.TensorError} rather than `GradError`.
+ * and generated adjoint ops are themselves differentiable. Dedicated semantic
+ * backward nodes for cross entropy, RoPE, layer normalization, attention,
+ * KDA, short convolution, and convolution do not currently provide a
+ * second-order path. Unsupported or non-differentiable nodes in the native
+ * autodiff transform surface as {@link Tensor.TensorError} rather than
+ * `GradError`.
  *
  * The loss and every `wrt` tensor must use a floating dtype supported by the
  * active backend. Gradients are lazy tensors sharing the forward graph; a
@@ -213,7 +216,9 @@ const checkSameShapeDtype = (
  * Vector-Jacobian product (reverse-mode pullback): given an output graph
  * `y` (built from `x` however you like), the primal `x`, and a cotangent
  * `v` with `y`'s shape, returns `J(x)ᵀ v` — the gradient of `sum(y * v)`
- * with respect to `x`.
+ * with respect to `x`. `v` must exactly match `y`'s shape and dtype and use a
+ * compatible placement; `x` and the derived loss must satisfy {@link grad}'s
+ * floating-dtype contract. A disconnected `x` produces zeros.
  *
  * @since 0.1.0
  * @category autodiff
@@ -235,8 +240,10 @@ export const vjp = (
  * forward-over-reverse): given an output graph `y` built from `x`, the
  * primal `x`, and a tangent `v` with `x`'s shape, returns `J(x) v`. This
  * construction uses second-order adjoints and therefore fails for operations
- * whose backward graph is not differentiable, including fused attention and
- * fused cross entropy.
+ * whose backward graph is not differentiable. `v` must exactly match `x`'s
+ * shape and dtype and use a compatible placement; `x` and the derived losses
+ * must satisfy {@link grad}'s floating-dtype contract. A disconnected `x`
+ * produces zeros.
  *
  * @since 0.1.0
  * @category autodiff
@@ -262,13 +269,15 @@ export const jvp = (
  * Maps the function implicit in a graph over a batch dimension: given an
  * output graph `y` built from the unbatched input `x`, and `batchedX`
  * equal to `x` with a batch dimension inserted at `dim`, returns the graph
- * of `y` applied elementwise along that dimension (the output carries the
- * batch at `dim` too). This is a native graph rewrite with per-op batching
- * rules — not a slice-and-restack loop — so the batched graph is the same
- * size as the original. Elementwise ops and matmul batch by broadcasting;
+ * of `y` applied elementwise along that dimension. `y` must depend on `x`.
+ * The output batch axis is inserted at `min(dim, y.rank)`. This is a native graph rewrite with per-op batching
+ * rules, not a slice-and-restack loop. Graph size remains linear in the source
+ * graph and independent of batch length; some indexing rules add reshape and
+ * broadcast helpers. Elementwise ops and matmul batch by broadcasting;
  * reductions and shape ops shift their metadata; `randn`/`uniform` draw
- * per batch element; indexing with data-dependent indexes, `gather`,
- * `scatterAdd`, and rank-2 linalg are not supported.
+ * per batch element. Shared-index `indexSelect`/`take`, `gather`, and supported
+ * `scatterAdd` forms have batching rules; indexes that depend on `x` and
+ * unsupported fused, convolutional, recurrent, or decode operations fail.
  *
  * @since 0.1.0
  * @category autodiff

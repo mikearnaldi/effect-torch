@@ -11,7 +11,7 @@ The current system includes:
 
 - A lazy semantic tensor graph with strict shape, dtype, and placement checks.
 - Reverse-mode autodiff, VJP, JVP, vmap, and gradient checkpointing.
-- Explicit frozen-program compilation with bounded, runtime-aware caches.
+- Explicit reusable executable compilation with bounded, runtime-aware caches.
 - Independent native CPU and Apple Metal backends.
 - Pure model, optimizer, trainer, checkpoint, and learning-rate APIs.
 - Compiled training and paged KV-cache inference with batched decode.
@@ -206,9 +206,10 @@ const graph = Effect.gen(function*() {
 Graph construction validates metadata and handle ownership. It does not run a
 hidden CPU fallback, copy a foreign tensor, or execute a kernel.
 
-### Evaluation
+### Compilation and Materialization
 
-`Tensor.compute` evaluates related roots in one native graph walk:
+`Tensor.compute` submits related roots as one native compile request and executes
+the resulting executable:
 
 ```ts
 import { Tensor } from "@effect-torch/core"
@@ -224,26 +225,26 @@ const evaluate = (loss: Tensor.Any, gradient: Tensor.Any) =>
   })
 ```
 
-One walk provides important semantics:
+One request provides important semantics:
 
-- Shared subgraphs execute once.
+- Shared subgraphs lower and execute once.
 - Multiple roots observe the same draw from shared random nodes.
-- Intermediates are released after their final consumer.
-- Evaluation runs off the JavaScript event loop.
+- Intermediate lifetimes and reusable workspace are planned from final uses.
+- Execution runs off the JavaScript event loop.
 - Effect interruption is connected to native cancellation.
 
-`Tensor.toTypedArray` and `Tensor.toNumberArray` evaluate a lazy tensor when
+`Tensor.toTypedArray` and `Tensor.toNumberArray` materialize a lazy tensor when
 needed, or read an existing concrete tensor.
 
-Ordinary `compute` is not the frozen-program compiler. It rewrites and fuses
-the current graph, then evaluates it. Reusable frozen programs are created
-explicitly through `Tensor.compile`, a model's `execute` method, `Trainer.make`,
-or the inference APIs.
+Ordinary `compute` and explicitly reusable programs use the same compiler,
+memory planner, and executor. `compute` obtains a transient or structurally
+cached executable; `Tensor.compile`, a model's `execute` method, `Trainer.make`,
+and the inference APIs retain reusable executable handles.
 
 ### Resource Ownership
 
 Every lazy graph, concrete tensor, compiled program, decode program, KV pool,
-and KV sequence is represented by an opaque frozen TypeScript handle. Backend
+and KV sequence is represented by an opaque immutable TypeScript handle. Backend
 adapters maintain private ownership records in `WeakMap`s.
 
 Consequences:
@@ -253,9 +254,16 @@ Consequences:
 - Foreign handles fail with a typed `foreign-handle` error.
 - Equivalent calls to one backend's memoized `makeRuntime()` share handle
   ownership and stable runtime identity.
-- Program caches belong to each compiled function, model, or trainer; they are
-  not global runtime caches. Inference artifacts own a fixed set of eagerly
-  compiled prefill/decode programs rather than a shape-keyed program cache.
+- TypeScript signature caches belong to each compiled function, model, or
+  trainer. Each runtime also owns a bounded structural executable cache whose
+  entries share immutable plans without retaining generated concrete bindings.
+  Inference artifacts own a fixed set of eagerly compiled prefill/decode
+  programs rather than a shape-keyed program cache.
+- An executable owns immutable typed instructions, memory and physical plans,
+  pipelines, constants, signatures, and diagnostics, but not one permanent
+  invocation workspace. Calls lease runtime-owned workspace and provisional
+  output storage; successful outputs take independent ownership of their
+  backing.
 - There is no implicit cross-device transfer.
 
 Concrete tensors can be released deterministically:
@@ -322,14 +330,12 @@ Application Effect program
             v                               v
 effect-torch-runtime-cpu            effect-torch-runtime-metal
   CPU buffers and kernels              Metal buffers and kernels
-  CPU evaluator                        Metal evaluator and arena
+  typed CPU executable                  typed Metal executable
             |                               |
             +---------------+---------------+
                             |
-              statically linked shared crates
-       runtime <- graph <- compiler <- autodiff
-                            |
-                 backend-neutral N-API helpers
+                  statically linked crates
+      runtime, graph, compiler, autodiff, and N-API helpers
 
 @effect-torch/tokenizers is a separate TypeScript + Rust N-API package.
 It does not participate in Runtime.Runtime.
@@ -339,8 +345,8 @@ It does not participate in Runtime.Runtime.
 
 `@effect-torch/core` defines the public contract:
 
-- `RuntimeService` describes graph construction, evaluation, autodiff,
-  compilation, readback, release, and optional extensions.
+- `RuntimeService` describes graph construction, compilation/execution,
+  autodiff, readback, release, and optional extensions.
 - Tensor handles expose only immutable shape, dtype, device, and placement
   metadata.
 - Higher-level APIs build on the Runtime service without importing CPU or
@@ -353,37 +359,31 @@ native failures into structured `Runtime.BackendError` values.
 
 ### Rust Crates
 
-| Crate                        | Responsibility                                                                |
-| ---------------------------- | ----------------------------------------------------------------------------- |
-| `effect-torch-runtime`       | Dtypes, layouts, cancellation, runtime identity, capabilities, erased buffers |
-| `effect-torch-graph`         | Semantic graph nodes, metadata, ownership, and traversal                      |
-| `effect-torch-compiler`      | Neutral IR, rewrites, fusion regions, schedules, frozen-program planning      |
-| `effect-torch-autodiff`      | Reverse-mode graph transformation, vmap, and checkpoint rewrites              |
-| `effect-torch-napi`          | Backend-neutral cancellation, async compute, and byte-buffer helpers          |
-| `effect-torch-runtime-cpu`   | CPU tensor storage, kernels, evaluator, fusion, and complete CPU N-API addon  |
-| `effect-torch-runtime-metal` | Metal storage, kernels, evaluator, fusion, arena, and complete Metal addon    |
-| `effect-torch-tokenizers`    | Tokenizer-only N-API addon backed by the Rust `tokenizers` crate              |
+| Crate                        | Responsibility                                                                                        |
+| ---------------------------- | ----------------------------------------------------------------------------------------------------- |
+| `effect-torch-runtime`       | Dtypes, layouts, dense IDs, signatures, memory/diagnostic contracts, ownership, cancellation          |
+| `effect-torch-graph`         | Nongeneric semantic `Node`/`NodeKind` graph, metadata, leaves, and semantic traversal                 |
+| `effect-torch-compiler`      | Requests, shared graph index, side-table regions, `KernelExpr`, typed lowered tables, memory planning |
+| `effect-torch-autodiff`      | Reverse-mode graph transformation, vmap, JVP/VJP, and checkpoint semantics                            |
+| `effect-torch-napi`          | Backend-neutral cancellation, async execution, and byte-buffer helpers                                |
+| `effect-torch-runtime-cpu`   | CPU values/instructions, lowering, kernels, physical execution, storage, and CPU N-API addon          |
+| `effect-torch-runtime-metal` | Metal values/instructions, lowering, pipelines, physical execution, storage, and Metal N-API addon    |
+| `effect-torch-tokenizers`    | Tokenizer-only N-API addon backed by the Rust `tokenizers` crate                                      |
 
-The dependency direction keeps semantics above execution:
+The direct shared-crate dependencies keep autodiff independent of the compiler:
 
 ```text
-effect-torch-runtime
-        |
-        v
-effect-torch-graph
-        |
-        v
-effect-torch-compiler
-        |
-        v
-effect-torch-autodiff
+effect-torch-graph --------> effect-torch-runtime
+effect-torch-autodiff -----> effect-torch-graph, effect-torch-runtime
+effect-torch-compiler -----> effect-torch-graph, effect-torch-runtime
 
-runtime-cpu and runtime-metal consume the shared semantic crates.
+runtime-cpu and runtime-metal consume graph, compiler, runtime, and, for their
+Node-API graph/autodiff surface, autodiff.
 ```
 
-The generic Rust backend contract is an internal compile-time abstraction. It
-is not a stable plugin ABI. Each Node addon statically links the shared Rust
-crates it needs.
+The shared compiler driver and typed tables are internal statically dispatched
+Rust abstractions, not a stable plugin ABI. Each Node addon statically links the
+shared Rust crates it needs.
 
 ### Independent Native Backends
 
@@ -391,7 +391,7 @@ CPU and Metal do not select behavior through one shared feature-gated addon.
 Each runtime crate owns:
 
 - Its concrete tensor value type.
-- Its evaluator and operation dispatch.
+- Its typed lowered values, instructions, algorithms, and physical executor.
 - Its N-API classes and functions.
 - Its safetensors integration.
 - Its native `cdylib` output.
@@ -405,48 +405,69 @@ Rust object crosses between separately loaded `.node` files.
 
 ### Graph and Execution Engine
 
-The native graph stores semantic operations, child relationships, shape,
-dtype, placement, and leaf ownership. Both backend evaluators use iterative
-post-order traversal rather than recursive evaluation.
+The native graph stores nongeneric semantic operations, child relationships,
+shape, dtype, placement, and leaf ownership. Compilation accepts one
+`ProgramRequest`, creates one `PreparedProgram` and stack-safe `GraphIndex`, and
+uses dense side tables for topology, consumers, roots, slots, generated leaves,
+and random provenance. Shared nodes appear once and caller root order is
+preserved. Generated leaves are collected once for structural cache lookup,
+insertion, and binding order.
 
-During a graph walk:
+Autodiff, vmap, and checkpointing construct semantic graphs before this
+pipeline. Stateful inference uses one shared compiler specialization for CPU
+and Metal to create its decode graph and state-cursor contract, then indexes
+that specialized graph once.
 
-1. Consumer counts are computed for reachable nodes.
-2. Children are evaluated before their parent.
-3. Shared node IDs reuse cached values.
-4. Rewrites and supported fusion regions are dispatched to backend kernels.
-5. Non-root intermediates are removed immediately after their last consumer.
-6. Root values become concrete backend-owned handles.
+CPU and Metal lower the prepared graph into backend-typed `LoweredProgram`
+values and instructions. Each instruction declares inputs, outputs, scratch,
+staging, status, state, and effects. The memory planner consumes those exact
+declarations; backend physical plans add synchronization by `InstructionId`
+without copying tensor semantics. Execution resolves the fixed plan against an
+invocation frame and publishes separately owned output storage.
 
-This bounds peak intermediate tensor storage on deep chains and enables
-one-pass evaluation of losses, gradients, and optimizer updates. Traversal
-metadata still scales with the reachable graph.
+Invocation does not traverse a semantic graph, run fusion, discover
+intermediate allocations, compile pipelines, or fall back to another execution
+engine. `optimize: false` uses the same typed lowering, memory planning,
+ownership, and execution path with optional regions disabled.
 
 ### Compiler and Fusion
 
-The compiler identifies supported scalar expression regions and lowers those
-regions into a backend-neutral fusion IR. It also applies graph rewrites and
-plans frozen programs. Operations outside a fusion region remain semantic graph
-nodes dispatched directly by the backend evaluator. Fusion eligibility combines
-compiler-owned policy with backend capability checks.
+The compiler records elementwise, fused-reduction, multi-output, GEMM-epilogue,
+and optimizer choices as regions over `GraphIndex`. These are code-generation
+side tables, not semantic `Fused*` node kinds. Multi-output selection uses a
+region dependency DAG and bounded worklist, including split regions that
+duplicate a prefix expression when required to preserve transitive ancestry.
+
+`KernelExpr` is the narrow scalar expression body inside fused instructions.
+Backend lowering turns regions and uncovered semantic nodes directly into typed
+CPU or Metal instructions with retained algorithm/resource plans. Required
+Metal pipelines are prepared during executable compilation, and compiler phase
+timings plus structural instruction, memory, command, synchronization, and
+region-work metrics come from the authoritative artifacts.
 
 Current execution paths include:
 
 - CPU elementwise and reduction fusion for F32 and F64.
 - Metal elementwise and reduction fusion for F32 and BF16.
-- Semantic fused linear, layer-normalization, loss, and attention paths where
-  supported.
-- Bounded rewrite caches in both backend evaluators.
-- A Metal frozen-program arena that packs allocations from liveness intervals
-  and replays them across calls.
+- Multi-output shared-prefix fusion and GEMM residual/GELU epilogues.
+- Typed semantic-kernel instructions for layer normalization, loss, attention,
+  KDA, convolution, rotary operations, and paged KV state where supported.
+- Deterministic liveness-based segmented memory plans and runtime-owned
+  workspace/output pools.
+
+Executable compile options currently control optimization and inference-only
+constant weights. The unused executable precision option was removed until a
+lowering policy is specified; Trainer mixed-BF16 remains a separate graph and
+training policy.
 
 ### CPU Runtime
 
 The CPU runtime owns typed host buffers and implements tensor operations in
 Rust. F32 and F64 GEMM use `matrixmultiply`; other operations use repository
 kernels and composed primitives. It includes convolution, indexing, reduction,
-pooling, random generation, linalg, safetensors, fusion, KV-cache execution, and
-the complete CPU N-API surface.
+pooling, random generation, linalg, safetensors, typed executable lowering and
+execution, fusion kernels, KV-cache execution, and the complete CPU N-API
+surface.
 
 Unsupported capability paths return structured errors through the adapter. In
 particular, F16 and BF16 storage are supported, but CPU half-precision matmul is
@@ -457,26 +478,29 @@ currently unsupported.
 The Metal runtime is implemented against Apple's Metal APIs through `objc2`.
 It owns device buffers, command encoding, pipeline caches, generated Metal
 shader source, GEMM, flash attention, convolutions, indexing, rotary kernels,
-paged KV-cache operations, fusion, and frozen-program arena replay.
+paged KV-cache operations, fusion kernels, typed lowering, physical instruction
+plans, and runtime-owned segmented storage pools.
 
-A graph walk serializes access to shared command-buffer state, encodes its work,
-and synchronizes at the runtime boundary instead of after every operation.
-Metal never falls back to CPU for an unsupported graph.
+Each invocation owns its submission context and storage leases while immutable
+executable plans and pipeline caches are shared. Metal never compiles or falls
+back to CPU during execution of an unsupported program; unsupported lowering or
+pipeline preparation fails executable compilation.
 
 ### Async Execution and Cancellation
 
-Evaluation, compiled execution, decode, readback, and safetensors I/O execute
-through asynchronous native promises backed by Tokio's blocking task pool. The
-TypeScript adapter connects the Effect fiber's abort signal to a native
-`CancellationToken`. Native cancellation and successful completion atomically
-compete to commit one result. Graph construction, autodiff transformation, and
-program compilation are synchronous native calls and are not interruptible.
+Compiled materialization, reusable execution, decode, readback, and safetensors
+I/O execute through asynchronous native promises backed by Tokio's blocking
+task pool. The TypeScript adapter connects the Effect fiber's abort signal to a
+native `CancellationToken`. Native cancellation and successful completion
+atomically compete to commit one result. Graph construction, autodiff
+transformation, and program compilation are synchronous native calls and are
+not interruptible.
 
 Interrupted work is drained before late native results are discarded. Late
 tensor and archive results are explicitly cleaned up where the adapter owns
 their buffers; discarded readback buffers are reclaimed by their external
-ArrayBuffer finalizers. This applies to graph evaluation, compiled programs,
-decode, readback, and safetensors I/O.
+ArrayBuffer finalizers. This applies to transient and reusable programs, decode,
+readback, and safetensors I/O.
 
 ## Backend Capabilities
 
@@ -711,8 +735,9 @@ Compilation behavior:
 - The first call for a signature traces against placeholder inputs.
 - That call obtains `Runtime.Runtime`; this lets one compiled function specialize
   lazily for the backend, shape, placement, and dtype of its actual inputs.
-- The graph is frozen into a backend-owned program.
-- Later calls bind new inputs and execute the frozen program.
+- The semantic roots are prepared and lowered into a backend-owned typed
+  executable.
+- Later calls bind new inputs and execute that fixed plan.
 - Signatures include runtime identity, placement, shape, and dtype.
 - Each compiled function owns its cache; stable runtime identity partitions
   entries without creating duplicate entries for the same backend.
@@ -836,8 +861,8 @@ const update = (
 ```
 
 `Optimizer.step(optimizer, loss, params, state, lr)` is the full-step helper. It
-builds gradients and updates, then computes loss, new parameters, and optimizer
-state in one graph walk.
+builds gradients and updates, then compiles loss, new parameters, and optimizer
+state as one multi-root executable request.
 
 Gradient transforms include `clipByValue` and `clipByGlobalNorm` for custom
 training loops.
@@ -1034,7 +1059,8 @@ const roundTrip = (weight: Tensor.Any, bias: Tensor.Any) =>
 
 Properties:
 
-- Lazy save entries are evaluated together in one graph walk.
+- Lazy save entries are compiled and materialized together as one multi-root
+  request.
 - Loaded tensors are concrete runtime-owned handles.
 - Metadata values are strings.
 - `"__metadata__"` is reserved as a tensor name.
@@ -1317,12 +1343,24 @@ The examples include:
 
 ```bash
 pnpm bench
+pnpm bench:compile
 pnpm bench:mlx
+
+cargo bench -p effect-torch-compiler --bench pipeline
+cargo bench -p effect-torch-compiler --bench pipeline -- --workload stress
 ```
 
 The benchmark package contains configurable matmul, shape, compiled-program,
-attention, and optional MLX comparisons. `N`, `ITERS`, and `METAL_ONLY` control
-the default matmul benchmark.
+native cold-compile/warm-structural-cache, attention, and optional MLX
+comparisons. `N`, `ITERS`, and `METAL_ONLY` control the default matmul
+benchmark. `pnpm bench:compile -- --help` lists backend, workload, size,
+iteration, and optimization controls.
+
+The Rust compiler benchmark measures `GraphIndex` plus side-table optimization
+separately from graph construction and reports deterministic structural work.
+Its `stress` workload runs 50,000- and 100,000-node graphs on a 256 KiB thread
+stack; it does not include lowering, memory/physical planning, or pipeline
+preparation.
 
 Benchmark results are environment-specific and are intentionally not embedded
 as fixed claims in this README. `pnpm bench` runs CPU measurements on Linux and
@@ -1340,13 +1378,13 @@ packages/
   bench/                   Benchmarks
 
 crates/
-  runtime/                 Shared runtime contracts
-  graph/                   Semantic graph
-  compiler/                IR, rewrites, fusion, and program planning
-  autodiff/                Graph differentiation and transforms
+  runtime/                 IDs, signatures, memory, diagnostics, and ownership contracts
+  graph/                   Nongeneric semantic graph and leaf contracts
+  compiler/                Requests, graph index, regions, lowering tables, and memory planning
+  autodiff/                Semantic graph differentiation and transforms
   napi/                    Backend-neutral Node-API helpers
-  runtime-cpu/             CPU runtime and CPU-owned addon
-  runtime-metal/           Metal runtime and Metal-owned addon
+  runtime-cpu/             Typed CPU executable runtime and CPU-owned addon
+  runtime-metal/           Typed Metal executable runtime and Metal-owned addon
 
 scripts/
   build-native.mjs         Host and release-matrix native builder
@@ -1388,6 +1426,9 @@ implementation.
 
 The main architecture records are:
 
+- [RFC 0021: Compiler Pipeline Refactor](docs/rfcs/0021-compiler-pipeline-refactor.md)
+- [RFC 0020: Invocation Ownership](docs/rfcs/0020-invocation-ownership.md)
+- [RFC 0019: Executable Compilation](docs/rfcs/0019-executable-compilation.md)
 - [RFC 0017: Multi-Backend Runtime](docs/rfcs/0017-multi-backend-runtime.md)
 - [RFC 0002: Autodiff](docs/rfcs/0002-autodiff.md)
 - [RFC 0003: Memory Management](docs/rfcs/0003-memory-management.md)

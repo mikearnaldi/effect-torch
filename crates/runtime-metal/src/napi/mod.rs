@@ -6,17 +6,41 @@ pub(crate) mod value;
 use crate::executable;
 use crate::executable::{ConvGeometry, KdaGeometry, KvStateSchema, MetalDecodeContext, SeqState};
 
-#[cfg(test)]
-use effect_torch_compiler::gemm_epilogue_pass;
-use effect_torch_compiler::{CompileOptions, InferenceOptions, PrecisionPolicy, ProgramSlot};
+use effect_torch_compiler::{
+    specialize_decode, CompileOptions, ConvGeometry as DecodeConvGeometry, InferenceOptions,
+    KdaGeometry as DecodeKdaGeometry, PreparedProgram, ProgramRequest, ProgramSlot,
+    StateCursorSlot,
+};
 use effect_torch_graph::CrossEntropyReduction as CeReduction;
 use effect_torch_graph::Device;
-use effect_torch_graph::{node_children, remap_children, PositionOffset};
+use effect_torch_graph::PositionOffset;
 use effect_torch_napi::{try_register_export, unregister_export, vec_to_bytes, CancellationState};
+use effect_torch_runtime::Buffer;
 use runtime::dtype::DType;
 pub type LeafSlot = effect_torch_graph::LeafSlot;
-pub(crate) type Node = effect_torch_graph::Node<effect_torch_compiler::Expr>;
-pub(crate) type NodeKind = effect_torch_graph::NodeKind<effect_torch_compiler::Expr>;
+pub(crate) type Node = effect_torch_graph::Node;
+pub(crate) type NodeKind = effect_torch_graph::NodeKind;
+
+impl From<DecodeKdaGeometry> for KdaGeometry {
+    fn from(geometry: DecodeKdaGeometry) -> Self {
+        Self {
+            layers: geometry.layers,
+            heads: geometry.heads,
+            head_dim: geometry.head_dim,
+            value_dim: geometry.value_dim,
+        }
+    }
+}
+
+impl From<DecodeConvGeometry> for ConvGeometry {
+    fn from(geometry: DecodeConvGeometry) -> Self {
+        Self {
+            layers: geometry.layers,
+            channels: geometry.channels,
+            kernel: geometry.kernel,
+        }
+    }
+}
 
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
@@ -180,6 +204,12 @@ pub struct NativeInstructionDiagnostics {
 }
 
 #[napi(object)]
+pub struct NativeCompilePhaseDiagnostics {
+    pub phase: String,
+    pub nanoseconds: f64,
+}
+
+#[napi(object)]
 pub struct NativeMemoryDiagnostics {
     pub external_bytes: f64,
     pub persistent_bytes: f64,
@@ -200,6 +230,7 @@ pub struct NativeExecutableDiagnostics {
     pub command_count: f64,
     pub synchronization_count: f64,
     pub memory: NativeMemoryDiagnostics,
+    pub compile_phases: Vec<NativeCompilePhaseDiagnostics>,
 }
 
 fn executable_diagnostics(
@@ -230,13 +261,20 @@ fn executable_diagnostics(
             peak_live_bytes: memory.peak_live_bytes as f64,
             packing_overhead_bytes: memory.packing_overhead_bytes as f64,
         },
+        compile_phases: diagnostics
+            .compile_phases
+            .iter()
+            .map(|timing| NativeCompilePhaseDiagnostics {
+                phase: timing.phase.clone(),
+                nanoseconds: timing.nanoseconds as f64,
+            })
+            .collect(),
     }
 }
 
 #[napi(object)]
 pub struct NativeCompileOptions {
     pub optimize: Option<bool>,
-    pub allow_reduced_precision: Option<bool>,
     pub constant_weights: Option<bool>,
 }
 
@@ -1443,111 +1481,30 @@ fn compile_metal_roots(roots: &[Arc<Node>]) -> err::Res<executable::MetalCompila
     compile_metal_roots_with_options(roots, CompileOptions::from_environment(), None)
 }
 
+#[cfg(test)]
 fn compile_metal_roots_with_options(
     roots: &[Arc<Node>],
     options: CompileOptions,
     state_schema: Option<KvStateSchema>,
 ) -> err::Res<executable::MetalCompilation> {
-    let (_, ce_chunk_size) = chunked_ce_limits();
-    let environment = executable::MetalEnvironment {
-        private_intermediates: std::env::var_os("EFFECT_TORCH_PRIVATE_INTERMEDIATES").is_some(),
-        mma: std::env::var_os("EFFECT_TORCH_NO_MMA").is_none(),
-    };
-    executable::compile_with_state(roots, options, ce_chunk_size, environment, state_schema)
+    let mut request = ProgramRequest::from_roots(roots.to_vec(), options);
+    if let Some(schema) = state_schema {
+        request = request.with_state_cursor(StateCursorSlot::new(
+            schema.cursor_slot,
+            schema.cursor_tensor,
+        ));
+    }
+    let program = request.prepare()?;
+    let generated_bindings = executable::load_generated_bindings(&program.index)?;
+    compile_prepared_metal(&program, &generated_bindings, state_schema)
 }
 
-// Coarse node-kind names for EFFECT_TORCH_EVAL_STATS.
-#[cfg(test)]
-fn node_kind_name(kind: &NodeKind) -> &'static str {
-    match kind {
-        NodeKind::FusedElementwise { .. } => "Fused",
-        NodeKind::FusedElementwiseMulti { .. } => "FusedMulti",
-        NodeKind::FusedReduce { .. } => "FusedReduce",
-        NodeKind::FusedPick { .. } => "FusedPick",
-        NodeKind::Add { .. } => "Add",
-        NodeKind::Sub { .. } => "Sub",
-        NodeKind::Mul { .. } => "Mul",
-        NodeKind::Div { .. } => "Div",
-        NodeKind::Matmul { .. } => "Matmul",
-        NodeKind::Linear { .. } => "Linear",
-        NodeKind::LinearGelu { .. } => "LinearGelu",
-        NodeKind::LinearResidual { .. } => "LinearResidual",
-        NodeKind::Gelu { .. } => "Gelu",
-        NodeKind::Sdpa { .. } => "Sdpa",
-        NodeKind::SdpaBackward { .. } | NodeKind::SdpaBackwardOut { .. } => "SdpaBwd",
-        NodeKind::Concat { .. } => "Concat",
-        NodeKind::Slice { .. } => "Slice",
-        NodeKind::Permute { .. } => "Permute",
-        NodeKind::Reshape { .. } => "Reshape",
-        NodeKind::BroadcastTo { .. } => "Broadcast",
-        NodeKind::Cast { .. } => "Cast",
-        NodeKind::Gather { .. } | NodeKind::IndexSelect { .. } => "Gather",
-        NodeKind::ScatterAdd { .. } => "ScatterAdd",
-        NodeKind::RotaryEmbedding { .. } => "Rope",
-        NodeKind::RotaryEmbeddingBackward { .. } => "RopeBwd",
-        NodeKind::LayerNorm { .. } => "LayerNorm",
-        NodeKind::LayerNormBackward { .. } => "LayerNormBwd",
-        NodeKind::LayerNormBackwardOut { .. } => "LayerNormOut",
-        NodeKind::PositionEmbedding { .. } => "PosEmb",
-        NodeKind::KvAttention { .. } => "KvAttention",
-        NodeKind::KdaChunk { .. } => "KdaChunk",
-        NodeKind::KdaRecurrence { .. } => "KdaRecurrence",
-        NodeKind::KdaBackward { .. } | NodeKind::KdaBackwardOut { .. } => "KdaBwd",
-        NodeKind::ShortConv1d { .. } => "ShortConv",
-        NodeKind::ShortConv1dBackwardX { .. } | NodeKind::ShortConv1dBackwardW { .. } => {
-            "ShortConvBwd"
-        }
-        NodeKind::ConvState { .. } => "ConvState",
-        NodeKind::Sum { .. }
-        | NodeKind::Mean { .. }
-        | NodeKind::Max { .. }
-        | NodeKind::Min { .. }
-        | NodeKind::Prod { .. } => "Reduce",
-        NodeKind::CrossEntropy { .. } | NodeKind::CrossEntropyBackward { .. } => "CE",
-        NodeKind::ChunkedHeadCe { .. } => "HeadCE",
-        NodeKind::ChunkedHeadCeBackward { .. } | NodeKind::ChunkedHeadCeBackwardOut { .. } => {
-            "HeadCEBwd"
-        }
-        NodeKind::AdamWStep { .. } | NodeKind::AdamWOut { .. } => "AdamW",
-        NodeKind::AdamWStepGroup { .. } => "AdamWGroup",
-        NodeKind::AdamWGroupOut { .. } => "AdamWGroupOut",
-        NodeKind::SgdStep { .. } | NodeKind::SgdOut { .. } => "Sgd",
-        NodeKind::Exp { .. }
-        | NodeKind::Log { .. }
-        | NodeKind::Sin { .. }
-        | NodeKind::Cos { .. }
-        | NodeKind::Tanh { .. }
-        | NodeKind::Erf { .. }
-        | NodeKind::Sqrt { .. }
-        | NodeKind::Abs { .. }
-        | NodeKind::Sign { .. }
-        | NodeKind::Neg { .. }
-        | NodeKind::Relu { .. }
-        | NodeKind::Pow { .. }
-        | NodeKind::Floor { .. }
-        | NodeKind::Ceil { .. }
-        | NodeKind::Round { .. } => "Unary",
-        NodeKind::Maximum { .. } | NodeKind::Minimum { .. } => "MaxMin",
-        NodeKind::Eq { .. }
-        | NodeKind::Lt { .. }
-        | NodeKind::Le { .. }
-        | NodeKind::Gt { .. }
-        | NodeKind::Ge { .. } => "Cmp",
-        NodeKind::Where { .. } => "Where",
-        NodeKind::Checkpoint { .. } | NodeKind::StopGradient { .. } => "Passthrough",
-        NodeKind::Argmax { .. } | NodeKind::Argmin { .. } | NodeKind::Cumsum { .. } => "Scan",
-        NodeKind::Inverse { .. } | NodeKind::Det { .. } | NodeKind::Solve { .. } => "Linalg",
-        NodeKind::Leaf(_) | NodeKind::Input { .. } | NodeKind::ScalarInput { .. } => "Input",
-        NodeKind::FromBytes { .. }
-        | NodeKind::Zeros { .. }
-        | NodeKind::Ones { .. }
-        | NodeKind::Full { .. }
-        | NodeKind::Randn { .. }
-        | NodeKind::Uniform { .. }
-        | NodeKind::Arange { .. }
-        | NodeKind::Eye { .. } => "Const",
-        _ => "Other",
-    }
+fn compile_prepared_metal(
+    program: &PreparedProgram,
+    generated_bindings: &[value::Value],
+    state_schema: Option<KvStateSchema>,
+) -> err::Res<executable::MetalCompilation> {
+    executable::compile_prepared_with_state(program, generated_bindings, state_schema)
 }
 
 // RFC 0010: paged KV inference. A `NativeKvPool` is a fixed-capacity
@@ -2243,323 +2200,6 @@ fn kv_evict(pool: &PoolInner, state: &mut SeqState, start: usize) {
     }
 }
 
-struct DecodeGeometry {
-    layers: usize,
-    kv_heads: usize,
-    head_dim: usize,
-    kda: KdaGeometry,
-    conv: ConvGeometry,
-    cursor_slot: u32,
-    // Batched programs only: whether a cursor [batch] tensor slot
-    // exists — created when a learned PositionEmbedding is rewritten
-    // (RoPE reads cursors from the kv context instead, RFC 0013).
-    cursor_tensor: bool,
-}
-
-// The decode rewrite: same traced forward graph, cache-relevant nodes
-// reinterpreted. Deterministic — the layer ordinal of each Sdpa is its
-// order of first encounter in a post-order walk from the roots, so the
-// prefill and decode traces of one model agree. `batch` is the
-// graph's leading dim (RFC 0013): 1 for prefill/single decode (cursor
-// binds as a scalar), N for batched decode (cursor becomes a [batch]
-// tensor slot and position machinery is built per slot).
-fn decode_rewrite(
-    roots: &[Arc<Node>],
-    window: Option<usize>,
-    batch: usize,
-) -> std::result::Result<(Vec<Arc<Node>>, DecodeGeometry), String> {
-    let mut max_slot: Option<u32> = None;
-    {
-        let mut visited = HashSet::new();
-        let mut stack: Vec<Arc<Node>> = roots.to_vec();
-        while let Some(node) = stack.pop() {
-            if !visited.insert(node.id) {
-                continue;
-            }
-            match &node.kind {
-                NodeKind::Input { slot, .. } => {
-                    max_slot = Some(max_slot.map_or(*slot, |m: u32| m.max(*slot)))
-                }
-                NodeKind::ScalarInput { .. } => {
-                    return Err(
-                        "decode: runtime scalar inputs are not supported in inference graphs"
-                            .to_string(),
-                    )
-                }
-                _ => {}
-            }
-            stack.extend(node_children(&node.kind));
-        }
-    }
-    let cursor_slot = max_slot.map_or(0, |m| m + 1);
-    let mut visited = HashSet::new();
-    let mut order = Vec::new();
-    let mut stack: Vec<(Arc<Node>, bool)> = roots.iter().map(|r| (r.clone(), false)).collect();
-    while let Some((node, processed)) = stack.pop() {
-        if processed {
-            order.push(node);
-            continue;
-        }
-        if !visited.insert(node.id) {
-            continue;
-        }
-        stack.push((node.clone(), true));
-        for child in node_children(&node.kind) {
-            stack.push((child, false));
-        }
-    }
-    let mut map: HashMap<u64, Arc<Node>> = HashMap::new();
-    let mut layers = 0usize;
-    let mut kda_layers = 0usize;
-    let mut conv_layers = 0usize;
-    let mut cursor_tensor = false;
-    let mut geometry: Option<(usize, usize)> = None;
-    let mut kda_geometry: Option<(usize, usize, usize)> = None;
-    let mut conv_geometry: Option<(usize, usize)> = None;
-    for node in &order {
-        let remap =
-            |child: &Arc<Node>| map.get(&child.id).cloned().unwrap_or_else(|| child.clone());
-        let rebuilt = match &node.kind {
-            NodeKind::Sdpa {
-                q,
-                k,
-                v,
-                scale,
-                causal,
-            } => {
-                if !causal {
-                    return Err(
-                        "decode: only causal attention is cacheable, found a non-causal sdpa"
-                            .to_string(),
-                    );
-                }
-                let rank = k.shape.len();
-                if rank != 4 || k.shape[..rank - 3].iter().product::<usize>() != batch {
-                    return Err(format!(
-                        "decode: kv caching expects attention of shape [{batch}, H, T, D], got {:?}",
-                        k.shape
-                    ));
-                }
-                let (heads, dim) = (k.shape[rank - 3], k.shape[rank - 1]);
-                match geometry {
-                    Some((h0, d0)) if h0 != heads || d0 != dim => {
-                        return Err(format!(
-                            "decode: attention layers disagree on head geometry ([{h0}, {d0}] vs [{heads}, {dim}])"
-                        ));
-                    }
-                    None => geometry = Some((heads, dim)),
-                    _ => {}
-                }
-                let layer = layers;
-                layers += 1;
-                NodeKind::KvAttention {
-                    q: remap(q),
-                    k: remap(k),
-                    v: remap(v),
-                    scale: *scale,
-                    layer: layer as u32,
-                    window,
-                }
-            }
-            NodeKind::KdaChunk {
-                q,
-                k,
-                v,
-                log_decay,
-                beta,
-                scale,
-            } => {
-                let rank = q.shape.len();
-                if rank != 4 || q.shape[..rank - 3].iter().product::<usize>() != batch {
-                    return Err(format!(
-                        "decode: kda state caching expects layers of shape [{batch}, H, T, D], got {:?}",
-                        q.shape
-                    ));
-                }
-                let current = (q.shape[rank - 3], q.shape[rank - 1], v.shape[rank - 1]);
-                match kda_geometry {
-                    Some(previous) if previous != current => {
-                        return Err(format!(
-                            "decode: kda layers disagree on head geometry ({previous:?} vs {current:?})"
-                        ));
-                    }
-                    None => kda_geometry = Some(current),
-                    _ => {}
-                }
-                let layer = kda_layers;
-                kda_layers += 1;
-                NodeKind::KdaRecurrence {
-                    q: remap(q),
-                    k: remap(k),
-                    v: remap(v),
-                    log_decay: remap(log_decay),
-                    beta: remap(beta),
-                    scale: *scale,
-                    layer: layer as u32,
-                }
-            }
-            NodeKind::ShortConv1d { x, weight } => {
-                let rank = x.shape.len();
-                if rank != 3 || x.shape[..rank - 2].iter().product::<usize>() != batch {
-                    return Err(format!(
-                        "decode: conv state caching expects layers of shape [{batch}, T, C], got {:?}",
-                        x.shape
-                    ));
-                }
-                let current = (x.shape[rank - 1], weight.shape[1]);
-                match conv_geometry {
-                    Some(previous) if previous != current => {
-                        return Err(format!(
-                            "decode: short conv layers disagree on geometry ({previous:?} vs {current:?})"
-                        ));
-                    }
-                    None => conv_geometry = Some(current),
-                    _ => {}
-                }
-                let layer = conv_layers;
-                conv_layers += 1;
-                NodeKind::ConvState {
-                    x: remap(x),
-                    weight: remap(weight),
-                    layer: layer as u32,
-                }
-            }
-            NodeKind::RotaryEmbedding {
-                x,
-                seq_len,
-                theta,
-                offset,
-            } => NodeKind::RotaryEmbedding {
-                x: remap(x),
-                seq_len: *seq_len,
-                theta: *theta,
-                offset: match offset {
-                    PositionOffset::Absolute => PositionOffset::Cursor,
-                    PositionOffset::Cursor => PositionOffset::Cursor,
-                },
-            },
-            NodeKind::PositionEmbedding { weight, seq_len } => {
-                let t = *seq_len;
-                let e = weight.shape[1];
-                let device = weight.device.clone();
-                if batch > 1 {
-                    // Batched (RFC 0013): per-slot cursors arrive as a
-                    // [batch] tensor; flat gather indices cursors[b] + p
-                    // over the [maxPositions, E] table, reshaped back.
-                    cursor_tensor = true;
-                    let cursors = Node::new(NodeKind::Input {
-                        slot: cursor_slot,
-                        shape: vec![batch],
-                        dtype: DType::I64,
-                        device: device.clone(),
-                    })?;
-                    let positions = Node::new(NodeKind::Add {
-                        a: Node::new(NodeKind::Reshape {
-                            a: cursors,
-                            shape: vec![batch, 1],
-                        })?,
-                        b: Node::new(NodeKind::BroadcastTo {
-                            a: Node::new(NodeKind::Reshape {
-                                a: Node::new(NodeKind::Arange {
-                                    start: 0.0,
-                                    end: t as f64,
-                                    step: 1.0,
-                                    dtype: DType::I64,
-                                    device: device.clone(),
-                                })?,
-                                shape: vec![1, t],
-                            })?,
-                            shape: vec![batch, t],
-                        })?,
-                    })?;
-                    let indexes = Node::new(NodeKind::BroadcastTo {
-                        a: Node::new(NodeKind::Reshape {
-                            a: positions,
-                            shape: vec![batch * t, 1],
-                        })?,
-                        shape: vec![batch * t, e],
-                    })?;
-                    NodeKind::Reshape {
-                        a: Node::new(NodeKind::Gather {
-                            a: remap(weight),
-                            dim: 0,
-                            indexes,
-                        })?,
-                        shape: vec![batch, t, e],
-                    }
-                } else {
-                    let positions = Node::new(NodeKind::Add {
-                        a: Node::new(NodeKind::Arange {
-                            start: 0.0,
-                            end: t as f64,
-                            step: 1.0,
-                            dtype: DType::I64,
-                            device: device.clone(),
-                        })?,
-                        b: Node::new(NodeKind::ScalarInput {
-                            slot: cursor_slot,
-                            dtype: DType::I64,
-                            device: device.clone(),
-                        })?,
-                    })?;
-                    let indexes = Node::new(NodeKind::BroadcastTo {
-                        a: Node::new(NodeKind::Reshape {
-                            a: positions,
-                            shape: vec![t, 1],
-                        })?,
-                        shape: vec![t, e],
-                    })?;
-                    NodeKind::Gather {
-                        a: remap(weight),
-                        dim: 0,
-                        indexes,
-                    }
-                }
-            }
-            kind => remap_children(kind, &remap),
-        };
-        map.insert(node.id, Node::new(rebuilt)?);
-    }
-    if layers == 0 && kda_layers == 0 {
-        return Err(
-            "decode: model has no cacheable attention or recurrent layers (no causal sdpa or kda chunk node in the forward graph)"
-                .to_string(),
-        );
-    }
-    let (kv_heads, head_dim) = geometry.unwrap_or((0, 0));
-    let kda = kda_geometry
-        .map(|(heads, head_dim, value_dim)| KdaGeometry {
-            layers: kda_layers,
-            heads,
-            head_dim,
-            value_dim,
-        })
-        .unwrap_or_default();
-    let conv = conv_geometry
-        .map(|(channels, kernel)| ConvGeometry {
-            layers: conv_layers,
-            channels,
-            kernel,
-        })
-        .unwrap_or_default();
-    let roots = roots
-        .iter()
-        .map(|r| map.get(&r.id).cloned().unwrap_or_else(|| r.clone()))
-        .collect();
-    Ok((
-        roots,
-        DecodeGeometry {
-            layers,
-            kv_heads,
-            head_dim,
-            kda,
-            conv,
-            cursor_slot,
-            cursor_tensor,
-        },
-    ))
-}
-
 #[napi]
 pub struct NativeKvPool {
     inner: Arc<PoolInner>,
@@ -2616,8 +2256,8 @@ impl NativeKvPool {
             channels: recurrent.conv_channels as usize,
             kernel: recurrent.conv_kernel as usize,
         };
-        // Zero layers is the pure-recurrent (KDA-only) stack: no KV
-        // slabs, but sequences and block hashing still work.
+        // Zero attention layers needs no KV slabs; recurrent state, sequence
+        // cursors, and block hashing still work independently.
         if layers == 0 && (kv_heads != 0 || head_dim != 0) {
             return Err(Error::new(
                 Status::InvalidArg,
@@ -2955,11 +2595,6 @@ pub struct Executable {
 #[napi]
 impl Executable {
     #[napi(getter)]
-    pub fn signature(&self) -> Result<String> {
-        Ok(self.inner.signature.clone())
-    }
-
-    #[napi(getter)]
     pub fn diagnostics(&self) -> NativeExecutableDiagnostics {
         executable_diagnostics(&self.inner.executable.diagnostics)
     }
@@ -3179,17 +2814,12 @@ impl Executable {
             ));
         }
         let inner = &self.inner;
-        let tensor_count = inner.slots.iter().filter(|s| !s.scalar).count();
-        let caller_inputs = tensor_count - usize::from(stateful.cursor_tensor);
-        if inputs.len() != caller_inputs {
-            return Err(Error::new(
-                Status::InvalidArg,
-                format!(
-                    "program expected {caller_inputs} tensor inputs, got {}",
-                    inputs.len()
-                ),
-            ));
-        }
+        let runtime_values = usize::from(inner.slots.get(stateful.cursor_slot as usize).is_some());
+        inner
+            .executable
+            .signature
+            .validate_invocation_counts(inputs.len(), 0, runtime_values, None)
+            .map_err(|error| Error::new(Status::InvalidArg, error.to_string()))?;
         let bounded_slot = inner
             .slots
             .iter()
@@ -3341,7 +2971,6 @@ struct ProgramInner {
     executable: Arc<executable::MetalExecutable>,
     slots: Vec<ProgramSlot>,
     generated_bindings: Vec<value::Value>,
-    signature: String,
 }
 
 #[derive(Clone)]
@@ -3356,7 +2985,6 @@ struct CachedProgram {
     slots: Vec<ProgramSlot>,
     generated: Vec<GeneratedBindingSignature>,
     generated_order: Vec<usize>,
-    signature: String,
 }
 
 #[derive(Default)]
@@ -3395,27 +3023,17 @@ fn program_cache() -> &'static Mutex<ProgramCache> {
     &CACHE
 }
 
-fn semantic_generated_bindings(roots: &[Arc<Node>]) -> err::Res<Vec<(usize, value::Value)>> {
-    effect_torch_compiler::graph_post_order(roots)
-        .into_iter()
-        .filter_map(|node| match &node.kind {
-            NodeKind::Leaf(slot) => Some(
-                slot.get::<value::Value>()
-                    .map(|value| (Arc::as_ptr(slot) as usize, value))
-                    .map_err(|error| format!("compile: generated binding {}: {error}", node.id)),
-            ),
-            _ => None,
-        })
-        .collect()
-}
-
 fn ordered_generated_bindings(
-    semantic: &[(usize, value::Value)],
+    program: &PreparedProgram,
+    semantic: &[value::Value],
     order: &[usize],
 ) -> Option<Vec<value::Value>> {
+    if semantic.len() != program.index.leaves.len() || order.len() != semantic.len() {
+        return None;
+    }
     order
         .iter()
-        .map(|index| semantic.get(*index).map(|(_, value)| value.clone()))
+        .map(|position| semantic.get(*position).cloned())
         .collect()
 }
 
@@ -3434,6 +3052,7 @@ fn generated_match(values: &[value::Value], expected: &[GeneratedBindingSignatur
         && values.iter().zip(expected).all(|(value, expected)| {
             value.shape() == expected.shape
                 && value.dtype() == expected.dtype
+                && value.device().is_metal()
                 && value.as_metal().is_ok_and(|tensor| {
                     tensor.layout.is_contiguous() && tensor.layout.offset() == 0
                 })
@@ -3448,26 +3067,10 @@ impl Executable {
         token: Option<&CancellationToken>,
     ) -> Result<Vec<NativeTensor>> {
         let inner = &self.inner;
-        let tensor_count = inner.slots.iter().filter(|s| !s.scalar).count();
-        let scalar_count = inner.slots.len() - tensor_count;
-        if inputs.len() != tensor_count {
-            return Err(Error::new(
-                Status::InvalidArg,
-                format!(
-                    "program expected {tensor_count} tensor inputs, got {}",
-                    inputs.len()
-                ),
-            ));
-        }
-        if scalars.len() != scalar_count {
-            return Err(Error::new(
-                Status::InvalidArg,
-                format!(
-                    "program expected {scalar_count} scalar inputs, got {}",
-                    scalars.len()
-                ),
-            ));
-        }
+        let signature = &inner.executable.signature;
+        signature
+            .validate_invocation_counts(inputs.len(), scalars.len(), 0, None)
+            .map_err(|error| Error::new(Status::InvalidArg, error.to_string()))?;
         let mut tensors = inputs.iter();
         // Slots are indexed by declaration order; tensor and scalar
         // arguments arrive as separate vectors in slot order.
@@ -3503,6 +3106,12 @@ impl Executable {
             .iter()
             .map(|input| input.val_cloned())
             .collect::<Result<Vec<_>>>()?;
+        for (index, value) in inputs.iter().enumerate() {
+            let tensor = value.as_metal().map_err(to_napi_err)?;
+            signature
+                .validate_binding_metadata(index, value.dtype(), tensor.placement(), &tensor.layout)
+                .map_err(|error| Error::new(Status::InvalidArg, error.to_string()))?;
+        }
         run_compute(token, move |cancelled, _state| {
             Ok(executable::execute_with_scalars(
                 &executable,
@@ -3525,13 +3134,6 @@ fn compile_options(explicit: Option<NativeCompileOptions>, stateful: bool) -> Co
     if let Some(explicit) = explicit {
         if let Some(optimize) = explicit.optimize {
             options.optimize = optimize;
-        }
-        if let Some(allow) = explicit.allow_reduced_precision {
-            options.precision = if allow {
-                PrecisionPolicy::AllowReducedPrecision
-            } else {
-                PrecisionPolicy::Strict
-            };
         }
         if stateful || explicit.constant_weights.is_some() {
             options.inference = Some(InferenceOptions {
@@ -3569,9 +3171,11 @@ pub fn compile(
             ));
         }
         let window = state.window.map(|value| value as usize);
-        let (rewritten, geometry) = decode_rewrite(&nodes, window, state.batch as usize)
+        let (rewritten, geometry) = specialize_decode(&nodes, window, state.batch as usize)
             .map_err(|error| Error::new(Status::GenericFailure, error))?;
         nodes = rewritten;
+        let kda = geometry.kda.into();
+        let conv = geometry.conv.into();
         let schema = KvStateSchema {
             max_tokens: state.max_tokens as usize,
             block_size: state.block_size as usize,
@@ -3581,8 +3185,8 @@ pub fn compile(
             layers: geometry.layers,
             kv_heads: geometry.kv_heads,
             head_dim: geometry.head_dim,
-            kda: geometry.kda,
-            conv: geometry.conv,
+            kda,
+            conv,
             cursor_slot: geometry.cursor_slot,
             cursor_tensor: geometry.cursor_tensor,
         };
@@ -3595,61 +3199,57 @@ pub fn compile(
     } else {
         None
     };
+    let mut request = ProgramRequest::from_roots(nodes, options);
+    if let Some(state) = &executable_state {
+        request =
+            request.with_state_cursor(StateCursorSlot::new(state.cursor_slot, state.cursor_tensor));
+    }
+    let program = request.prepare().map_err(to_napi_err)?;
+    let semantic_generated =
+        executable::load_generated_bindings(&program.index).map_err(to_napi_err)?;
     let effective_cache_key = cache_key
         .filter(|_| {
             std::env::var_os("EFFECT_TORCH_NO_EXECUTABLE_CACHE").is_none()
-                && !options
+                && !program
+                    .options
                     .inference
                     .as_ref()
                     .is_some_and(|inference| inference.constant_weights)
         })
-        .map(|key| format!("{key}|{options:?}"));
+        .map(|key| format!("{key}|{:?}", program.options));
     if let Some(key) = effective_cache_key.as_deref() {
-        let semantic = semantic_generated_bindings(&nodes).map_err(to_napi_err)?;
         let cached = program_cache()
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .get(key);
         if let Some(cached) = cached {
-            if let Some(current) = ordered_generated_bindings(&semantic, &cached.generated_order)
+            if cached.executable.signature == program.signature {
+                if let Some(current) = ordered_generated_bindings(
+                    &program,
+                    &semantic_generated,
+                    &cached.generated_order,
+                )
                 .filter(|current| generated_match(current, &cached.generated))
-            {
-                return Ok(Executable {
-                    inner: ProgramInner {
-                        executable: Arc::clone(&cached.executable),
-                        slots: cached.slots,
-                        generated_bindings: current,
-                        signature: cached.signature,
-                    },
-                    state: executable_state,
-                });
+                {
+                    return Ok(Executable {
+                        inner: ProgramInner {
+                            executable: Arc::clone(&cached.executable),
+                            slots: cached.slots,
+                            generated_bindings: current,
+                        },
+                        state: executable_state,
+                    });
+                }
             }
         }
     }
     let compilation =
-        compile_metal_roots_with_options(&nodes, options, state_schema).map_err(to_napi_err)?;
+        compile_prepared_metal(&program, &semantic_generated, state_schema).map_err(to_napi_err)?;
     let slots = compilation.slots;
-    let signature = slots
-        .iter()
-        .map(|slot| slot.signature())
-        .collect::<Vec<_>>()
-        .join(",");
     if let Some(key) = effective_cache_key {
-        let semantic_generated = semantic_generated_bindings(&nodes).map_err(to_napi_err)?;
-        let semantic_positions = semantic_generated
-            .iter()
-            .enumerate()
-            .map(|(index, (node, _))| (*node, index))
-            .collect::<HashMap<_, _>>();
-        let generated_order = compilation
-            .generated_slots
-            .iter()
-            .map(|node| semantic_positions.get(node).copied())
-            .collect::<Option<Vec<_>>>();
+        let generated_order = &compilation.generated_order;
         let generated = generated_signatures(&compilation.generated_bindings);
-        if generated_order
-            .as_deref()
-            .and_then(|order| ordered_generated_bindings(&semantic_generated, order))
+        if ordered_generated_bindings(&program, &semantic_generated, generated_order)
             .is_some_and(|values| generated_match(&values, &generated))
         {
             program_cache()
@@ -3661,8 +3261,7 @@ pub fn compile(
                         executable: Arc::clone(&compilation.executable),
                         slots: slots.clone(),
                         generated,
-                        generated_order: generated_order.expect("validated generated order"),
-                        signature: signature.clone(),
+                        generated_order: generated_order.clone(),
                     },
                 );
         }
@@ -3672,7 +3271,6 @@ pub fn compile(
             executable: compilation.executable,
             slots,
             generated_bindings: compilation.generated_bindings,
-            signature,
         },
         state: executable_state,
     })
@@ -3821,6 +3419,37 @@ mod epilogue_tests {
         .unwrap()
     }
 
+    #[test]
+    fn executable_diagnostics_exposes_compile_phases() {
+        let root = mleaf(vec![1.0], vec![1]);
+        let compilation = compile_metal_roots(std::slice::from_ref(&root)).unwrap();
+        let diagnostics = executable_diagnostics(&compilation.executable.diagnostics);
+
+        assert_eq!(
+            diagnostics
+                .compile_phases
+                .iter()
+                .map(|timing| timing.phase.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "graph_index",
+                "optimization",
+                "lowering",
+                "lowered_program_validation",
+                "memory_planning",
+                "physical_planning",
+                "pipeline_preparation",
+                "artifact_assembly",
+                "compile_submission",
+                "publication",
+            ]
+        );
+        assert!(diagnostics
+            .compile_phases
+            .iter()
+            .all(|timing| timing.nanoseconds.is_finite() && timing.nanoseconds >= 0.0));
+    }
+
     fn mleaf_u32(data: Vec<u32>, shape: Vec<usize>) -> Arc<Node> {
         let t = MetalTensor {
             buffer: MetalDevice::get().alloc_with_data_u32(&data),
@@ -3855,55 +3484,11 @@ mod epilogue_tests {
         }
     }
 
-    fn kind_counts(root: &Arc<Node>) -> HashMap<&'static str, usize> {
-        kind_counts_all(std::slice::from_ref(root))
-    }
-
-    fn kind_counts_all(roots: &[Arc<Node>]) -> HashMap<&'static str, usize> {
-        let mut counts: HashMap<&'static str, usize> = HashMap::new();
-        let mut seen = HashSet::new();
-        let mut stack = roots.to_vec();
-        while let Some(n) = stack.pop() {
-            if !seen.insert(n.id) {
-                continue;
-            }
-            *counts.entry(node_kind_name(&n.kind)).or_insert(0) += 1;
-            stack.extend(node_children(&n.kind));
-        }
-        counts
-    }
-
-    fn fixture() -> (Arc<Node>, Arc<Node>, Arc<Node>, Arc<Node>) {
-        let x = mleaf(
-            (0..24).map(|i| (i as f32 * 0.37).sin()).collect(),
-            vec![2, 3, 4],
-        );
-        let w = mleaf(
-            (0..32).map(|i| (i as f32 * 0.11).cos() * 0.5).collect(),
-            vec![4, 8],
-        );
-        let b = mleaf((0..8).map(|i| i as f32 * 0.05 - 0.2).collect(), vec![8]);
-        let r = mleaf(
-            (0..48).map(|i| (i as f32 * 0.19).sin() * 0.3).collect(),
-            vec![2, 3, 8],
-        );
-        (x, w, b, r)
-    }
-
-    fn linear(x: &Arc<Node>, w: &Arc<Node>, b: &Arc<Node>) -> Arc<Node> {
+    fn linear(x: &Arc<Node>, weight: &Arc<Node>, bias: &Arc<Node>) -> Arc<Node> {
         Node::new(NodeKind::Linear {
             x: x.clone(),
-            weight: w.clone(),
-            bias: b.clone(),
-        })
-        .unwrap()
-    }
-
-    fn sum_all(a: &Arc<Node>) -> Arc<Node> {
-        Node::new(NodeKind::Sum {
-            a: a.clone(),
-            dims: vec![0, 1, 2],
-            keepdims: false,
+            weight: weight.clone(),
+            bias: bias.clone(),
         })
         .unwrap()
     }
@@ -3926,6 +3511,11 @@ mod epilogue_tests {
             &first.inner.executable,
             &second.inner.executable
         ));
+        assert_eq!(
+            first.inner.executable.signature,
+            second.inner.executable.signature
+        );
+        assert_eq!(first.inner.executable.signature.outputs.len(), 1);
         assert_eq!(
             first.inner.executable.memory,
             second.inner.executable.memory
@@ -3966,6 +3556,63 @@ mod epilogue_tests {
         for output in second_outputs {
             assert_eq!(output.to_f32_vec().unwrap(), [40.0, 60.0]);
         }
+    }
+
+    #[test]
+    fn constant_weights_bypass_structural_cache() {
+        let graph = |values: Vec<f32>| LazyTensor {
+            node: mleaf(values, vec![2]),
+        };
+        let first_root = graph(vec![1.0, 2.0]);
+        let second_root = graph(vec![3.0, 4.0]);
+        let constant_options = || NativeCompileOptions {
+            optimize: None,
+            constant_weights: Some(true),
+        };
+        let key = Some("metal-constant-weight-cache-suppression-test".to_string());
+        let first = compile(
+            vec![&first_root],
+            Some(constant_options()),
+            None,
+            key.clone(),
+        )
+        .unwrap();
+        let second = compile(vec![&second_root], Some(constant_options()), None, key).unwrap();
+
+        assert!(!Arc::ptr_eq(
+            &first.inner.executable,
+            &second.inner.executable
+        ));
+        assert!(first.inner.generated_bindings.is_empty());
+        assert!(second.inner.generated_bindings.is_empty());
+        assert_eq!(first.inner.executable.memory.report.persistent_bytes, 8);
+        assert_eq!(second.inner.executable.memory.report.persistent_bytes, 8);
+        assert_eq!(
+            executable::execute(
+                &first.inner.executable,
+                &[],
+                &[],
+                &effect_torch_runtime::CancellationFlag::new(),
+                None,
+            )
+            .unwrap()[0]
+                .to_f32_vec()
+                .unwrap(),
+            [1.0, 2.0]
+        );
+        assert_eq!(
+            executable::execute(
+                &second.inner.executable,
+                &[],
+                &[],
+                &effect_torch_runtime::CancellationFlag::new(),
+                None,
+            )
+            .unwrap()[0]
+                .to_f32_vec()
+                .unwrap(),
+            [3.0, 4.0]
+        );
     }
 
     #[test]
@@ -4012,107 +3659,6 @@ mod epilogue_tests {
             std::slice::from_raw_parts(readback.data.cast::<f32>(), readback.byte_len / 4).to_vec()
         };
         assert_eq!(retained, expected);
-    }
-
-    #[test]
-    fn residual_epilogue_matches_unfused() {
-        let (x, w, b, r) = fixture();
-        let out = Node::new(NodeKind::Add {
-            a: linear(&x, &w, &b),
-            b: r.clone(),
-        })
-        .unwrap();
-        let loss = sum_all(&out);
-        let grads =
-            effect_torch_autodiff::grad(&loss, &[x.clone(), w.clone(), b.clone(), r.clone()])
-                .unwrap();
-        let mut roots = vec![loss.clone()];
-        roots.extend(grads.iter().cloned());
-        let fused = gemm_epilogue_pass(&roots).unwrap();
-        let counts = kind_counts(&fused[0].clone());
-        assert_eq!(counts.get("LinearResidual"), Some(&1), "{counts:?}");
-        assert_eq!(counts.get("Linear"), None, "{counts:?}");
-        assert_eq!(counts.get("Add"), None, "{counts:?}");
-        for ((name, p), f) in ["loss", "dx", "dw", "db", "dr"]
-            .iter()
-            .zip(roots.iter())
-            .zip(fused.iter())
-        {
-            assert_close(&eval_f32(p), &eval_f32(f), 1e-4, name);
-        }
-    }
-
-    #[test]
-    fn residual_epilogue_keeps_shared_linear() {
-        // The Linear output feeding anything besides the Add (here a
-        // second residual consumer) blocks the rewrite.
-        let (x, w, b, r) = fixture();
-        let lin = linear(&x, &w, &b);
-        let out1 = Node::new(NodeKind::Add {
-            a: lin.clone(),
-            b: r.clone(),
-        })
-        .unwrap();
-        let out2 = Node::new(NodeKind::Add {
-            a: lin,
-            b: r.clone(),
-        })
-        .unwrap();
-        let fused = gemm_epilogue_pass(&[out1, out2]).unwrap();
-        let counts = kind_counts(
-            &Node::new(NodeKind::Add {
-                a: fused[0].clone(),
-                b: fused[1].clone(),
-            })
-            .unwrap(),
-        );
-        assert_eq!(counts.get("LinearResidual"), None, "{counts:?}");
-    }
-
-    #[test]
-    fn gelu_epilogue_matches_unfused() {
-        for approximate in [false, true] {
-            let (x, w, b, _) = fixture();
-            let g = Node::new(NodeKind::Gelu {
-                a: linear(&x, &w, &b),
-                approximate,
-            })
-            .unwrap();
-            let loss = sum_all(&g);
-            let grads =
-                effect_torch_autodiff::grad(&loss, &[x.clone(), w.clone(), b.clone()]).unwrap();
-            let mut roots = vec![loss.clone()];
-            roots.extend(grads.iter().cloned());
-            let fused = gemm_epilogue_pass(&roots).unwrap();
-            let counts = kind_counts_all(&fused);
-            // Backward reads the pre-activation, so the dual-store
-            // variant must be present behind two FusedPick nodes.
-            assert_eq!(counts.get("LinearGelu"), Some(&1), "{counts:?}");
-            assert_eq!(counts.get("FusedPick"), Some(&2), "{counts:?}");
-            assert_eq!(counts.get("Linear"), None, "{counts:?}");
-            for ((name, p), f) in ["loss", "dx", "dw", "db"]
-                .iter()
-                .zip(roots.iter())
-                .zip(fused.iter())
-            {
-                assert_close(&eval_f32(p), &eval_f32(f), 1e-3, name);
-            }
-        }
-    }
-
-    #[test]
-    fn gelu_epilogue_drops_preact_without_backward() {
-        let (x, w, b, _) = fixture();
-        let g = Node::new(NodeKind::Gelu {
-            a: linear(&x, &w, &b),
-            approximate: false,
-        })
-        .unwrap();
-        let fused = gemm_epilogue_pass(std::slice::from_ref(&g)).unwrap();
-        let counts = kind_counts(&fused[0]);
-        assert_eq!(counts.get("LinearGelu"), Some(&1), "{counts:?}");
-        assert_eq!(counts.get("FusedPick"), None, "{counts:?}");
-        assert_close(&eval_f32(&g), &eval_f32(&fused[0]), 1e-4, "gelu");
     }
 
     #[test]
@@ -4169,11 +3715,11 @@ mod epilogue_tests {
         })
         .unwrap();
         let compilation = compile_metal_roots(&[dw, db]).unwrap();
-        assert_eq!(compilation.executable.outputs.len(), 2);
-        assert_eq!(compilation.executable.commands.len(), 1);
+        assert_eq!(compilation.executable.program.outputs.len(), 2);
+        assert_eq!(compilation.executable.commands().len(), 1);
         assert!(matches!(
-            compilation.executable.commands[0].op,
-            executable::MetalOp::LayerNormBackward { .. }
+            compilation.executable.commands()[0].kind.operation(),
+            Some((executable::MetalOp::LayerNormBackward { .. }, _))
         ));
     }
 
@@ -4709,12 +4255,15 @@ mod epilogue_tests {
                 cursor_tensor: false,
             })
         );
-        let command = program
-            .inner
-            .executable
-            .commands
+        let commands = program.inner.executable.commands();
+        let command = commands
             .iter()
-            .find(|command| matches!(command.op, executable::MetalOp::KvAttention { .. }))
+            .find(|command| {
+                matches!(
+                    command.kind.operation(),
+                    Some((executable::MetalOp::KvAttention { .. }, _))
+                )
+            })
             .unwrap();
         assert_eq!(command.staging.len(), 5);
     }

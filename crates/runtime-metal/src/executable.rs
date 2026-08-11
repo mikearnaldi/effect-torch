@@ -2,25 +2,33 @@ use crate::value::Value;
 use crate::{
     device, flash, fusion, kda, layer_norm, linear, loss, ops as metal_ops, rotary, shortconv,
 };
+#[cfg(test)]
+use effect_torch_compiler::ProgramRequest;
 use effect_torch_compiler::{
-    build_executable_diagnostics, fuse_roots_with_options, graph_post_order, plan_memory,
-    CompileOptions, DiagnosticsInput, Expr, LoweredInstruction, LoweredSchedule,
-    MemoryPlannerConfig, OutputDecl, ProgramSlot, ValueAccess, ValueDecl, ValueStorage, ValueUse,
+    build_executable_diagnostics, CompileOptions, CompilerDriver, CompilerWorkReport, DenseNodeId,
+    DiagnosticsInput, EnvironmentOptions, Expr, GeneratedBinding, GraphIndex, InstructionEffects,
+    LoweredInstruction, LoweredProgram, LoweredValue, LoweringUnit, MemoryPlannerConfig,
+    NativeRegion, OptimizationPlan, OutputDecl, PreparedProgram, ProgramSlot, RegionId,
+    StateCursorSlot, ValueDecl, ValueStorage, ValueUse, ARTIFACT_ASSEMBLY_PHASE,
+    COMPILE_SUBMISSION_PHASE, PHYSICAL_PLANNING_PHASE, PIPELINE_PREPARATION_PHASE,
+    PUBLICATION_PHASE,
 };
 use effect_torch_graph::{node_children, CrossEntropyReduction, PositionOffset};
 use effect_torch_runtime::{
-    CancellationFlag, DType, ExecutableDiagnostics, InstructionId, InvocationMemoryReport,
-    Location, MemoryPlan, NativeMemorySpace, SegmentOwnership, StorageClass, ValueId,
+    Buffer, CancellationFlag, DType, ExecutableDiagnostics, InstructionId, InvocationMemoryReport,
+    Location, MemoryPlan, NativeMemorySpace, ProgramSignature, SegmentOwnership, StorageClass,
+    ValueId,
 };
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 static INVOCATION_NONCE: AtomicU64 = AtomicU64::new(0);
 
-pub(crate) type Node = effect_torch_graph::Node<Expr>;
-pub(crate) type NodeKind = effect_torch_graph::NodeKind<Expr>;
+pub(crate) type Node = effect_torch_graph::Node;
+pub(crate) type NodeKind = effect_torch_graph::NodeKind;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 pub(crate) struct KdaGeometry {
@@ -229,9 +237,23 @@ enum MetalDeclaredSource {
 }
 
 #[derive(Debug, Clone)]
-pub(super) struct MetalValueDecl {
+struct MetalValueMetadata {
     pub shape: Box<[usize]>,
     pub dtype: DType,
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct MetalLoweredValue {
+    pub shape: Box<[usize]>,
+    pub dtype: DType,
+    pub layout: effect_torch_runtime::Layout,
+    pub declaration: ValueDecl<NativeMemorySpace>,
+}
+
+impl LoweredValue<NativeMemorySpace> for MetalLoweredValue {
+    fn value_decl(&self) -> &ValueDecl<NativeMemorySpace> {
+        &self.declaration
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -590,16 +612,83 @@ impl MetalOp {
 }
 
 #[derive(Debug, Clone)]
-pub(super) struct MetalCommand {
-    pub op: MetalOp,
-    pub inputs: Box<[ValueId]>,
-    pub outputs: Box<[ValueId]>,
-    pub release: Box<[ValueId]>,
-    pub scratch: Box<[ValueId]>,
-    pub staging: Box<[ValueId]>,
-    pub status: Box<[ValueId]>,
-    pub plan: MetalCommandPlan,
-    pub synchronization: MetalCommandSynchronization,
+pub(super) enum MetalInstruction {
+    PrepareInvocation,
+    Operation {
+        op: MetalOp,
+        plan: MetalCommandPlan,
+        release: Box<[ValueId]>,
+        /// Legacy Metal randomness is keyed by physical lowered-command order.
+        random_seed_token: u64,
+    },
+    FinalizeInvocation,
+}
+
+impl MetalInstruction {
+    fn name(&self) -> &'static str {
+        match self {
+            Self::PrepareInvocation => "prepare_invocation",
+            Self::Operation { op, .. } => op.name(),
+            Self::FinalizeInvocation => "publish_outputs",
+        }
+    }
+
+    pub(super) fn operation(&self) -> Option<(&MetalOp, &MetalCommandPlan)> {
+        match self {
+            Self::Operation { op, plan, .. } => Some((op, plan)),
+            Self::PrepareInvocation | Self::FinalizeInvocation => None,
+        }
+    }
+
+    fn operation_mut(
+        &mut self,
+    ) -> Option<(
+        &mut MetalOp,
+        &mut MetalCommandPlan,
+        &mut Box<[ValueId]>,
+        &mut u64,
+    )> {
+        match self {
+            Self::Operation {
+                op,
+                plan,
+                release,
+                random_seed_token,
+            } => Some((op, plan, release, random_seed_token)),
+            Self::PrepareInvocation | Self::FinalizeInvocation => None,
+        }
+    }
+}
+
+pub(super) type MetalCommand = LoweredInstruction<MetalInstruction>;
+
+trait MetalResourceId {
+    fn index(&self) -> usize;
+}
+
+impl MetalResourceId for ValueUse {
+    fn index(&self) -> usize {
+        self.value.index()
+    }
+}
+
+impl MetalResourceId for OutputDecl {
+    fn index(&self) -> usize {
+        self.value.index()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum MetalPhysicalCommand {
+    Encode(InstructionId),
+    StatusGate(InstructionId),
+    Commit,
+    Complete,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct MetalPreparedArtifacts {
+    pub pipeline_count: usize,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -676,9 +765,9 @@ pub(super) struct ChunkedHeadBackwardPlan {
 }
 
 fn chunked_head_geometry(
-    x: &MetalValueDecl,
-    weight: &MetalValueDecl,
-    target: &MetalValueDecl,
+    x: &MetalValueMetadata,
+    weight: &MetalValueMetadata,
+    target: &MetalValueMetadata,
     chunk_size: usize,
 ) -> Result<(usize, usize, usize, usize), String> {
     if x.shape.is_empty() || weight.shape.len() != 2 {
@@ -789,36 +878,42 @@ fn ops_scratch(
         .collect()
 }
 
-fn declaration_layout(value: &MetalValueDecl) -> effect_torch_runtime::Layout {
+fn declaration_layout(value: &MetalValueMetadata) -> effect_torch_runtime::Layout {
     effect_torch_runtime::Layout::contiguous(value.shape.to_vec())
 }
 
 fn plan_command_resources(
     command: &MetalCommand,
-    values: &[MetalValueDecl],
+    values: &[MetalValueMetadata],
     environment: MetalEnvironment,
     state_schema: Option<&KvStateSchema>,
 ) -> Result<CommandResources, String> {
-    let input = |index: usize| -> Result<&MetalValueDecl, String> {
+    let (op, _) = command
+        .kind
+        .operation()
+        .ok_or_else(|| "compile: boundary instruction has no command resources".to_string())?;
+    let input = |index: usize| -> Result<&MetalValueMetadata, String> {
         let value = command
             .inputs
             .get(index)
-            .ok_or_else(|| format!("compile: {} is missing input {index}", command.op.name()))?;
+            .map(|use_| use_.value)
+            .ok_or_else(|| format!("compile: {} is missing input {index}", op.name()))?;
         values
             .get(value.index())
             .ok_or_else(|| format!("compile: command references unknown value {value}"))
     };
-    let output = |index: usize| -> Result<&MetalValueDecl, String> {
+    let output = |index: usize| -> Result<&MetalValueMetadata, String> {
         let value = command
             .outputs
             .get(index)
-            .ok_or_else(|| format!("compile: {} is missing output {index}", command.op.name()))?;
+            .map(|output| output.value)
+            .ok_or_else(|| format!("compile: {} is missing output {index}", op.name()))?;
         values
             .get(value.index())
             .ok_or_else(|| format!("compile: command references unknown value {value}"))
     };
     let mut resources = CommandResources::default();
-    match &command.op {
+    match op {
         MetalOp::PrepareState => {}
         MetalOp::Randn { shape, dtype } | MetalOp::Uniform { shape, dtype, .. } => {
             if *dtype != DType::F32 {
@@ -1363,7 +1458,7 @@ fn plan_command_resources(
         } => {
             let x = input(0)?;
             let weight = input(1)?;
-            let (residual, gelu) = match &command.op {
+            let (residual, gelu) = match op {
                 MetalOp::Linear { .. } => (false, None),
                 MetalOp::LinearResidual { .. } => (true, None),
                 MetalOp::LinearGelu {
@@ -1604,7 +1699,7 @@ fn plan_command_resources(
             }
         }
         MetalOp::PackOptimizerScalars => {
-            for (index, value) in command.inputs.iter().enumerate() {
+            for (index, value) in command.inputs.iter().map(|use_| use_.value).enumerate() {
                 let scalar = values
                     .get(value.index())
                     .ok_or_else(|| format!("compile: command references unknown value {value}"))?;
@@ -1815,49 +1910,67 @@ fn plan_command_resources(
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) struct MetalCommandSynchronization {
-    pub barrier_after_dispatch: bool,
-    pub commit_after: bool,
-    pub status_gate: bool,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct MetalEnvironment {
     pub private_intermediates: bool,
     pub mma: bool,
 }
 
+impl From<EnvironmentOptions> for MetalEnvironment {
+    fn from(environment: EnvironmentOptions) -> Self {
+        Self {
+            private_intermediates: environment.metal_private_intermediates,
+            mma: environment.metal_mma,
+        }
+    }
+}
+
 pub(super) struct MetalExecutable {
-    pub values: Box<[MetalValueDecl]>,
+    pub signature: ProgramSignature,
+    pub program: Arc<LoweredProgram<MetalInstruction, NativeMemorySpace, MetalLoweredValue>>,
+    pub physical: Box<[MetalPhysicalCommand]>,
+    pub prepared: MetalPreparedArtifacts,
     pub bindings: Box<[MetalBinding]>,
     scalar_bindings: Box<[MetalScalarBinding]>,
     padded_bindings: Box<[MetalPaddedBinding]>,
     constants: Box<[MetalConstant]>,
-    pub commands: Box<[MetalCommand]>,
-    pub outputs: Box<[ValueId]>,
     pub options: CompileOptions,
     pub environment: MetalEnvironment,
     pub state_schema: Option<KvStateSchema>,
     pub memory: MemoryPlan<NativeMemorySpace>,
     pub diagnostics: ExecutableDiagnostics,
+    pub compiler_work: CompilerWorkReport,
     pub last_invocation_memory: Mutex<Option<InvocationMemoryReport>>,
+    state_cursor: Option<ValueId>,
+}
+
+fn program_instruction<'a>(
+    program: &'a LoweredProgram<MetalInstruction, NativeMemorySpace, MetalLoweredValue>,
+    id: InstructionId,
+) -> Option<&'a MetalCommand> {
+    program
+        .instructions
+        .get(id.index())
+        .filter(|instruction| instruction.id == id)
 }
 
 impl fmt::Debug for MetalExecutable {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("MetalExecutable")
-            .field("values", &self.values)
+            .field("signature", &self.signature)
+            .field("program", &self.program)
+            .field("physical", &self.physical)
+            .field("prepared", &self.prepared)
             .field("bindings", &self.bindings)
             .field("scalar_bindings", &self.scalar_bindings)
             .field("padded_bindings", &self.padded_bindings)
             .field("constant_count", &self.constants.len())
-            .field("commands", &self.commands)
-            .field("outputs", &self.outputs)
             .field("options", &self.options)
             .field("environment", &self.environment)
             .field("state_schema", &self.state_schema)
             .field("memory", &self.memory)
             .field("diagnostics", &self.diagnostics)
+            .field("compiler_work", &self.compiler_work)
+            .field("state_cursor", &self.state_cursor)
             .field(
                 "last_invocation_memory",
                 &self
@@ -1869,15 +1982,34 @@ impl fmt::Debug for MetalExecutable {
     }
 }
 
+impl MetalExecutable {
+    pub(super) fn instruction(&self, id: InstructionId) -> Option<&MetalCommand> {
+        program_instruction(&self.program, id)
+    }
+
+    #[cfg(test)]
+    pub(super) fn commands(&self) -> Vec<&MetalCommand> {
+        self.physical
+            .iter()
+            .filter_map(|physical| match *physical {
+                MetalPhysicalCommand::Encode(id) => self.instruction(id),
+                MetalPhysicalCommand::StatusGate(_)
+                | MetalPhysicalCommand::Commit
+                | MetalPhysicalCommand::Complete => None,
+            })
+            .collect()
+    }
+}
+
 pub(super) struct MetalCompilation {
     pub executable: Arc<MetalExecutable>,
     pub slots: Vec<ProgramSlot>,
     pub generated_bindings: Vec<Value>,
-    pub generated_slots: Vec<usize>,
+    pub generated_order: Vec<usize>,
 }
 
-struct Lowerer {
-    values: Vec<MetalValueDecl>,
+struct Lowerer<'a> {
+    values: Vec<MetalValueMetadata>,
     storage: Vec<MetalValueStorage>,
     names: Vec<String>,
     bindings: Vec<MetalBinding>,
@@ -1885,11 +2017,13 @@ struct Lowerer {
     padded_bindings: Vec<MetalPaddedBinding>,
     declared_sources: HashMap<u32, MetalDeclaredSource>,
     constants: Vec<MetalConstant>,
-    commands: Vec<MetalCommand>,
+    instructions: Vec<MetalCommand>,
     node_values: HashMap<u64, Box<[ValueId]>>,
     declared_values: HashMap<u32, ValueId>,
     generated: Vec<Value>,
-    generated_slots: Vec<usize>,
+    prepared_generated: &'a [Value],
+    generated_by_node: HashMap<u64, usize>,
+    generated_order: Vec<usize>,
     ce_chunk_size: usize,
     options: CompileOptions,
     environment: MetalEnvironment,
@@ -1899,8 +2033,10 @@ struct Lowerer {
     optimizer_scalar_packs: HashMap<Vec<ValueId>, ValueId>,
 }
 
-impl Lowerer {
+impl<'a> Lowerer<'a> {
     fn new(
+        index: &GraphIndex,
+        prepared_generated: &'a [Value],
         options: CompileOptions,
         ce_chunk_size: usize,
         environment: MetalEnvironment,
@@ -1951,11 +2087,18 @@ impl Lowerer {
             padded_bindings: Vec::new(),
             declared_sources,
             constants: Vec::new(),
-            commands: Vec::new(),
+            instructions: Vec::new(),
             node_values: HashMap::new(),
             declared_values: HashMap::new(),
             generated: Vec::new(),
-            generated_slots: Vec::new(),
+            prepared_generated,
+            generated_by_node: index
+                .leaves
+                .iter()
+                .enumerate()
+                .map(|(position, binding)| (binding.node_id, position))
+                .collect(),
+            generated_order: Vec::new(),
             ce_chunk_size,
             options,
             environment,
@@ -1980,7 +2123,7 @@ impl Lowerer {
             .ok_or_else(|| "compile: value byte size overflow".to_string())?;
         let id = ValueId::from_index(self.values.len())
             .ok_or_else(|| "compile: too many Metal values".to_string())?;
-        self.values.push(MetalValueDecl {
+        self.values.push(MetalValueMetadata {
             shape: shape.to_vec().into_boxed_slice(),
             dtype,
         });
@@ -2037,6 +2180,24 @@ impl Lowerer {
             .ok_or_else(|| format!("compile: child {} was not lowered", child.id))
     }
 
+    fn dense_value(&self, index: &GraphIndex, node: DenseNodeId) -> Result<ValueId, String> {
+        let node = index
+            .node(node)
+            .ok_or_else(|| format!("compile: dense node {node} is out of range"))?;
+        self.child_value(node)
+    }
+
+    fn dense_values(
+        &self,
+        index: &GraphIndex,
+        nodes: &[DenseNodeId],
+    ) -> Result<Vec<ValueId>, String> {
+        nodes
+            .iter()
+            .map(|node| self.dense_value(index, *node))
+            .collect()
+    }
+
     fn child_output(&self, child: &Arc<Node>, index: usize) -> Result<ValueId, String> {
         self.node_values
             .get(&child.id)
@@ -2045,22 +2206,76 @@ impl Lowerer {
             .ok_or_else(|| format!("compile: child {} has no output {index}", child.id))
     }
 
-    fn command(&mut self, op: MetalOp, inputs: Vec<ValueId>, outputs: Vec<ValueId>) {
-        self.commands.push(MetalCommand {
-            op,
-            inputs: inputs.into_boxed_slice(),
-            outputs: outputs.into_boxed_slice(),
-            release: Box::new([]),
-            scratch: Box::new([]),
-            staging: Box::new([]),
-            status: Box::new([]),
-            plan: MetalCommandPlan::Direct,
-            synchronization: MetalCommandSynchronization {
-                barrier_after_dispatch: true,
-                commit_after: false,
-                status_gate: false,
-            },
-        });
+    fn command(
+        &mut self,
+        op: MetalOp,
+        inputs: Vec<ValueId>,
+        outputs: Vec<ValueId>,
+    ) -> Result<(), String> {
+        let id = InstructionId::from_index(self.instructions.len())
+            .ok_or_else(|| "compile: too many Metal instructions".to_string())?;
+        self.instructions.push(
+            LoweredInstruction::new(
+                id,
+                MetalInstruction::Operation {
+                    op,
+                    plan: MetalCommandPlan::Direct,
+                    release: Box::new([]),
+                    random_seed_token: 0,
+                },
+                inputs.into_iter().map(ValueUse::read).collect::<Vec<_>>(),
+                outputs.into_iter().map(OutputDecl::new).collect::<Vec<_>>(),
+            )
+            .with_effects(InstructionEffects {
+                may_fail: true,
+                has_side_effects: false,
+            }),
+        );
+        Ok(())
+    }
+
+    fn operation_command(
+        &mut self,
+        op: MetalOp,
+        mut inputs: Vec<ValueId>,
+        outputs: Vec<ValueId>,
+    ) -> Result<(), String> {
+        match &op {
+            MetalOp::AdamW { .. } => {
+                if inputs.len() != 7 {
+                    return Err(
+                        "compile: AdamW requires four tensors and three scalars".to_string()
+                    );
+                }
+                let packed = self.optimizer_scalar_pack(&inputs[4..7])?;
+                inputs.truncate(4);
+                inputs.push(packed);
+            }
+            MetalOp::AdamWGroup { parameters, .. } => {
+                let scalar_start = parameters
+                    .checked_mul(4)
+                    .ok_or_else(|| "compile: grouped AdamW input count overflow".to_string())?;
+                if inputs.len() != scalar_start + 3 {
+                    return Err(
+                        "compile: grouped AdamW requires four tensors per parameter and three scalars"
+                            .to_string(),
+                    );
+                }
+                let packed = self.optimizer_scalar_pack(&inputs[scalar_start..])?;
+                inputs.truncate(scalar_start);
+                inputs.push(packed);
+            }
+            MetalOp::Sgd { .. } => {
+                if inputs.len() != 5 {
+                    return Err("compile: SGD requires three tensors and two scalars".to_string());
+                }
+                let packed = self.optimizer_scalar_pack(&[inputs[4], inputs[3]])?;
+                inputs.truncate(3);
+                inputs.push(packed);
+            }
+            _ => {}
+        }
+        self.command(op, inputs, outputs)
     }
 
     fn optimizer_scalar_pack(&mut self, scalars: &[ValueId]) -> Result<ValueId, String> {
@@ -2079,7 +2294,7 @@ impl Lowerer {
             MetalOp::PackOptimizerScalars,
             scalars.to_vec(),
             vec![packed],
-        );
+        )?;
         self.optimizer_scalar_packs.insert(scalars.to_vec(), packed);
         Ok(packed)
     }
@@ -2114,6 +2329,340 @@ impl Lowerer {
         Ok(())
     }
 
+    fn bind_region_outputs(
+        &mut self,
+        index: &GraphIndex,
+        plan: &OptimizationPlan,
+        region_id: RegionId,
+        region: &NativeRegion,
+        outputs: &[ValueId],
+    ) -> Result<(), String> {
+        for output in region.semantic_outputs() {
+            let route = plan
+                .outputs
+                .get(output.semantic_node.index())
+                .copied()
+                .flatten()
+                .ok_or_else(|| {
+                    format!(
+                        "compile: region {region_id} semantic output {} has no physical route",
+                        output.semantic_node
+                    )
+                })?;
+            if route.region != region_id || route.index != output.index {
+                return Err(format!(
+                    "compile: region {region_id} semantic output {} has an inconsistent route",
+                    output.semantic_node
+                ));
+            }
+            let semantic = index.node(output.semantic_node).ok_or_else(|| {
+                format!(
+                    "compile: optimization output {} is out of range",
+                    output.semantic_node
+                )
+            })?;
+            let value = outputs.get(output.index as usize).copied().ok_or_else(|| {
+                format!(
+                    "compile: region {region_id} has no physical output {} for semantic node {}",
+                    output.index, semantic.id
+                )
+            })?;
+            let declaration = &self.values[value.index()];
+            if declaration.shape.as_ref() != semantic.shape || declaration.dtype != semantic.dtype {
+                return Err(format!(
+                    "compile: region {region_id} output {} metadata does not match semantic node {}",
+                    output.index, semantic.id
+                ));
+            }
+            match self.node_values.insert(semantic.id, Box::new([value])) {
+                Some(previous) if previous.as_ref() != [value] => {
+                    return Err(format!(
+                        "compile: semantic node {} was routed to multiple physical values",
+                        semantic.id
+                    ));
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
+    fn region_outputs(
+        &mut self,
+        region: RegionId,
+        count: usize,
+        shape: &[usize],
+        dtype: DType,
+    ) -> Result<Vec<ValueId>, String> {
+        (0..count)
+            .map(|output| {
+                self.dynamic_value(shape, dtype, &format!("region_{region}_output_{output}"))
+            })
+            .collect()
+    }
+
+    fn lower_region(
+        &mut self,
+        index: &GraphIndex,
+        plan: &OptimizationPlan,
+        region_id: RegionId,
+    ) -> Result<(), String> {
+        let region = plan
+            .regions
+            .get(region_id.index())
+            .ok_or_else(|| format!("compile: optimization region {region_id} is out of range"))?;
+        let (op, inputs, outputs) = match region {
+            NativeRegion::Elementwise(region) => {
+                if !region.device.is_metal() {
+                    return Err(format!(
+                        "compile: impossible Metal optimization plan contains an elementwise region for {}",
+                        region.device.name()
+                    ));
+                }
+                if region.inputs.is_empty() {
+                    return Err(
+                        "compile: fused Metal operation requires at least one input".to_string()
+                    );
+                }
+                if !matches!(region.dtype, DType::F32 | DType::BF16) {
+                    return Err(format!(
+                        "compile: fused operation does not support Metal dtype {}",
+                        region.dtype
+                    ));
+                }
+                let inputs = self.dense_values(index, &region.inputs)?;
+                let outputs = self.region_outputs(region_id, 1, &region.shape, region.dtype)?;
+                (
+                    MetalOp::FusedElementwise {
+                        strides: region
+                            .lane_strides
+                            .iter()
+                            .map(|strides| strides.to_vec())
+                            .collect(),
+                        shape: region.shape.clone(),
+                        exprs: vec![region.output.expression.clone()].into_boxed_slice(),
+                    },
+                    inputs,
+                    outputs,
+                )
+            }
+            NativeRegion::ElementwiseReduce(region) => {
+                if !region.device.is_metal() {
+                    return Err(format!(
+                        "compile: impossible Metal optimization plan contains an elementwise-reduce region for {}",
+                        region.device.name()
+                    ));
+                }
+                if region.inputs.is_empty() {
+                    return Err(
+                        "compile: fused Metal operation requires at least one input".to_string()
+                    );
+                }
+                if !matches!(region.dtype, DType::F32 | DType::BF16) {
+                    return Err(format!(
+                        "compile: fused operation does not support Metal dtype {}",
+                        region.dtype
+                    ));
+                }
+                let inputs = self.dense_values(index, &region.inputs)?;
+                let outputs = self.region_outputs(region_id, 1, &region.shape, region.dtype)?;
+                (
+                    MetalOp::FusedReduce {
+                        strides: region
+                            .lane_strides
+                            .iter()
+                            .map(|strides| strides.to_vec())
+                            .collect(),
+                        in_shape: region.input_shape.clone(),
+                        expr: region.expression.clone(),
+                        op: region.op,
+                        dims: region.dims.clone(),
+                        keepdims: region.keepdims,
+                        shape: region.shape.clone(),
+                    },
+                    inputs,
+                    outputs,
+                )
+            }
+            NativeRegion::MultiOutput(region) => {
+                if !region.device.is_metal() {
+                    return Err(format!(
+                        "compile: impossible Metal optimization plan contains a multi-output region for {}",
+                        region.device.name()
+                    ));
+                }
+                if region.inputs.is_empty() {
+                    return Err(
+                        "compile: fused Metal operation requires at least one input".to_string()
+                    );
+                }
+                if !matches!(region.dtype, DType::F32 | DType::BF16) {
+                    return Err(format!(
+                        "compile: fused operation does not support Metal dtype {}",
+                        region.dtype
+                    ));
+                }
+                let inputs = self.dense_values(index, &region.inputs)?;
+                let outputs = self.region_outputs(
+                    region_id,
+                    region.outputs.len(),
+                    &region.shape,
+                    region.dtype,
+                )?;
+                (
+                    MetalOp::FusedElementwise {
+                        strides: region
+                            .lane_strides
+                            .iter()
+                            .map(|strides| strides.to_vec())
+                            .collect(),
+                        shape: region.shape.clone(),
+                        exprs: region
+                            .outputs
+                            .iter()
+                            .map(|output| output.expression.clone())
+                            .collect(),
+                    },
+                    inputs,
+                    outputs,
+                )
+            }
+            NativeRegion::LinearResidual(region) => {
+                if !region.device.is_metal() {
+                    return Err(format!(
+                        "compile: impossible Metal optimization plan contains a linear-residual region for {}",
+                        region.device.name()
+                    ));
+                }
+                let inputs = self.dense_values(index, &region.inputs)?;
+                let outputs = self.region_outputs(region_id, 1, &region.shape, region.dtype)?;
+                (
+                    MetalOp::LinearResidual {
+                        implementation: MetalImplementation::Native,
+                    },
+                    inputs,
+                    outputs,
+                )
+            }
+            NativeRegion::LinearGelu(region) => {
+                if !region.device.is_metal() {
+                    return Err(format!(
+                        "compile: impossible Metal optimization plan contains a linear-GELU region for {}",
+                        region.device.name()
+                    ));
+                }
+                let inputs = self.dense_values(index, &region.inputs)?;
+                let outputs = self.region_outputs(
+                    region_id,
+                    1 + usize::from(region.dual),
+                    &region.shape,
+                    region.dtype,
+                )?;
+                (
+                    MetalOp::LinearGelu {
+                        approximate: region.approximate,
+                        dual: region.dual,
+                        implementation: MetalImplementation::Native,
+                    },
+                    inputs,
+                    outputs,
+                )
+            }
+            NativeRegion::AdamW(region) => {
+                if !region.device.is_metal() {
+                    return Err(format!(
+                        "compile: impossible Metal optimization plan contains an AdamW region for {}",
+                        region.device.name()
+                    ));
+                }
+                let inputs = self.dense_values(index, &region.inputs)?;
+                let outputs = self.region_outputs(
+                    region_id,
+                    region.expressions.len(),
+                    &region.shape,
+                    region.dtype,
+                )?;
+                (
+                    MetalOp::AdamW {
+                        beta1: region.options.beta1,
+                        beta2: region.options.beta2,
+                        eps: region.options.eps,
+                        weight_decay: region.options.weight_decay,
+                        implementation: OptimizerImplementation::Fused,
+                        exprs: region.expressions.clone(),
+                    },
+                    inputs,
+                    outputs,
+                )
+            }
+            NativeRegion::AdamWGroup(region) => {
+                if !region.device.is_metal() {
+                    return Err(format!(
+                        "compile: impossible Metal optimization plan contains an AdamW-group region for {}",
+                        region.device.name()
+                    ));
+                }
+                if region.parameter_inputs.is_empty() {
+                    return Err(
+                        "compile: grouped AdamW requires at least one parameter".to_string()
+                    );
+                }
+                let inputs = self.dense_values(index, &region.inputs)?;
+                let outputs = self.region_outputs(
+                    region_id,
+                    region.expressions.len(),
+                    &region.shape,
+                    region.dtype,
+                )?;
+                (
+                    MetalOp::AdamWGroup {
+                        parameters: region.parameter_inputs.len(),
+                        exprs: region.expressions.clone(),
+                    },
+                    inputs,
+                    outputs,
+                )
+            }
+            NativeRegion::Sgd(region) => {
+                if !region.device.is_metal() {
+                    return Err(format!(
+                        "compile: impossible Metal optimization plan contains an SGD region for {}",
+                        region.device.name()
+                    ));
+                }
+                // MetalOp::Sgd retains the legacy [param, grad, velocity, first, lr] input ABI.
+                let dense_inputs = [
+                    region.tensor_inputs[0],
+                    region.tensor_inputs[1],
+                    region.tensor_inputs[2],
+                    region.scalar_inputs[1],
+                    region.scalar_inputs[0],
+                ];
+                let inputs = self.dense_values(index, &dense_inputs)?;
+                let outputs = self.region_outputs(
+                    region_id,
+                    region.expressions.len(),
+                    &region.shape,
+                    region.dtype,
+                )?;
+                (
+                    MetalOp::Sgd {
+                        momentum: region.options.momentum,
+                        dampening: region.options.dampening,
+                        nesterov: region.options.nesterov,
+                        weight_decay: region.options.weight_decay,
+                        implementation: OptimizerImplementation::Fused,
+                        exprs: region.expressions.clone(),
+                    },
+                    inputs,
+                    outputs,
+                )
+            }
+        };
+        self.operation_command(op, inputs, outputs.clone())?;
+        self.bind_region_outputs(index, plan, region_id, region, &outputs)
+    }
+
     fn lower(&mut self, node: &Arc<Node>) -> Result<(), String> {
         if !node.device.is_metal() {
             return Err(format!(
@@ -2134,25 +2683,32 @@ impl Lowerer {
         validate_metal_support(node)?;
 
         match &node.kind {
-            NodeKind::Leaf(slot) => {
-                let payload: Value = slot
-                    .get()
-                    .map_err(|error| format!("compile: generated binding {}: {error}", node.id))?;
-                if payload.shape() != node.shape || payload.dtype() != node.dtype {
-                    return Err(format!(
-                        "compile: generated binding {} changed shape or dtype",
-                        node.id
-                    ));
-                }
-                let layout = &payload.as_metal()?.layout;
-                if layout.checked_max_index().is_none()
-                    || layout.max_index() * payload.dtype().size_in_bytes()
-                        > payload.as_metal()?.buffer.size
-                {
-                    return Err(format!(
-                        "compile: generated binding {} has an unsupported layout",
-                        node.id
-                    ));
+            NodeKind::Leaf(_) => {
+                let semantic_position =
+                    self.generated_by_node
+                        .get(&node.id)
+                        .copied()
+                        .ok_or_else(|| {
+                            format!(
+                                "compile: generated binding {} is missing from the prepared index",
+                                node.id
+                            )
+                        })?;
+                let payload = self
+                    .prepared_generated
+                    .get(semantic_position)
+                    .cloned()
+                    .ok_or_else(|| {
+                        format!(
+                            "compile: generated binding {} has no prepared value",
+                            node.id
+                        )
+                    })?;
+                if self.options.constant_weights() {
+                    let tensor = payload.as_metal()?;
+                    device::MetalDevice::get().synchronize_buffer_producer(&tensor.buffer)?;
+                    self.constant(node, payload)?;
+                    return Ok(());
                 }
                 let generated = u32::try_from(self.generated.len())
                     .map_err(|_| "compile: too many generated bindings".to_string())?;
@@ -2163,7 +2719,7 @@ impl Lowerer {
                     format!("generated_binding_{generated}"),
                 )?;
                 self.generated.push(payload);
-                self.generated_slots.push(Arc::as_ptr(slot) as usize);
+                self.generated_order.push(semantic_position);
                 self.bindings.push(MetalBinding {
                     value,
                     source: MetalBindingSource::Generated(generated),
@@ -2278,16 +2834,12 @@ impl Lowerer {
             NodeKind::SdpaBackwardOut { of, index }
             | NodeKind::ChunkedHeadCeBackwardOut { of, index }
             | NodeKind::KdaBackwardOut { of, index }
-            | NodeKind::FusedPick { of, index }
             | NodeKind::AdamWOut { step: of, index }
             | NodeKind::SgdOut { step: of, index } => {
                 return self.selector(node, of, *index as usize);
             }
             NodeKind::LayerNormBackwardOut { of, index } => {
                 return self.selector(node, of, *index as usize);
-            }
-            NodeKind::AdamWGroupOut { of, param, index } => {
-                return self.selector(node, of, *param as usize * 3 + *index as usize);
             }
             NodeKind::StopGradient { a } | NodeKind::Checkpoint { a } => {
                 let value = self.child_value(a)?;
@@ -2348,12 +2900,6 @@ impl Lowerer {
                 (log_decay.shape.clone(), log_decay.dtype),
                 (beta.shape.clone(), beta.dtype),
             ],
-            NodeKind::LinearGelu { dual: true, .. } => {
-                vec![
-                    (node.shape.clone(), node.dtype),
-                    (node.shape.clone(), node.dtype),
-                ]
-            }
             NodeKind::LayerNormBackward { x, weight, .. } => vec![
                 (x.shape.clone(), x.dtype),
                 (weight.shape.clone(), weight.dtype),
@@ -2364,28 +2910,12 @@ impl Lowerer {
                 (m.shape.clone(), m.dtype),
                 (v.shape.clone(), v.dtype),
             ],
-            NodeKind::AdamWStepGroup { params, ms, vs, .. } => params
-                .iter()
-                .zip(ms)
-                .zip(vs)
-                .flat_map(|((param, m), v)| {
-                    [
-                        (param.shape.clone(), param.dtype),
-                        (m.shape.clone(), m.dtype),
-                        (v.shape.clone(), v.dtype),
-                    ]
-                })
-                .collect(),
             NodeKind::SgdStep {
                 param, velocity, ..
             } => vec![
                 (param.shape.clone(), param.dtype),
                 (velocity.shape.clone(), velocity.dtype),
             ],
-            NodeKind::FusedElementwiseMulti { exprs, .. } => exprs
-                .iter()
-                .map(|_| (node.shape.clone(), node.dtype))
-                .collect(),
             _ => vec![(node.shape.clone(), node.dtype)],
         };
         let outputs = output_metadata
@@ -2540,19 +3070,6 @@ impl Lowerer {
                 }
             }
             NodeKind::Linear { x, .. } => MetalOp::Linear {
-                implementation: implementation(x.dtype),
-            },
-            NodeKind::LinearResidual { x, .. } => MetalOp::LinearResidual {
-                implementation: implementation(x.dtype),
-            },
-            NodeKind::LinearGelu {
-                x,
-                approximate,
-                dual,
-                ..
-            } => MetalOp::LinearGelu {
-                approximate: *approximate,
-                dual: *dual,
                 implementation: implementation(x.dtype),
             },
             NodeKind::LayerNorm { x, eps, .. } => MetalOp::LayerNorm {
@@ -2710,33 +3227,6 @@ impl Lowerer {
                         .collect(),
                 }
             }
-            NodeKind::AdamWStepGroup {
-                params,
-                beta1,
-                beta2,
-                eps,
-                weight_decay,
-                ..
-            } => {
-                if !matches!(params[0].dtype, DType::F32 | DType::BF16) {
-                    return Err(format!(
-                        "compile: grouped AdamW does not support Metal dtype {}",
-                        params[0].dtype
-                    ));
-                }
-                let base = fusion::adamw_exprs(*beta1, *beta2, *eps, *weight_decay);
-                let mut exprs = Vec::with_capacity(params.len() * 3);
-                for index in 0..params.len() {
-                    let remap = (0..4)
-                        .map(|lane| (lane, index as u32 * 4 + lane))
-                        .collect::<HashMap<_, _>>();
-                    exprs.extend(base.iter().map(|expr| expr.remap_lanes(&remap)));
-                }
-                MetalOp::AdamWGroup {
-                    parameters: params.len(),
-                    exprs: exprs.into_boxed_slice(),
-                }
-            }
             NodeKind::SgdStep {
                 momentum,
                 dampening,
@@ -2757,44 +3247,6 @@ impl Lowerer {
                         .collect(),
                 }
             }
-            NodeKind::FusedElementwise {
-                strides,
-                shape,
-                expr,
-                ..
-            } => MetalOp::FusedElementwise {
-                strides: strides.clone().into_boxed_slice(),
-                shape: shape.clone().into_boxed_slice(),
-                exprs: vec![expr.clone()].into_boxed_slice(),
-            },
-            NodeKind::FusedElementwiseMulti {
-                strides,
-                shape,
-                exprs,
-                ..
-            } => MetalOp::FusedElementwise {
-                strides: strides.clone().into_boxed_slice(),
-                shape: shape.clone().into_boxed_slice(),
-                exprs: exprs.clone().into_boxed_slice(),
-            },
-            NodeKind::FusedReduce {
-                strides,
-                in_shape,
-                expr,
-                op,
-                dims,
-                keepdims,
-                shape,
-                ..
-            } => MetalOp::FusedReduce {
-                strides: strides.clone().into_boxed_slice(),
-                in_shape: in_shape.clone().into_boxed_slice(),
-                expr: expr.clone(),
-                op: *op,
-                dims: dims.clone().into_boxed_slice(),
-                keepdims: *keepdims,
-                shape: shape.clone().into_boxed_slice(),
-            },
             NodeKind::Inverse { .. } | NodeKind::Det { .. } | NodeKind::Solve { .. } => {
                 unreachable!("unsupported Metal linalg is rejected during validation")
             }
@@ -2812,50 +3264,13 @@ impl Lowerer {
             | NodeKind::KdaBackwardOut { .. }
             | NodeKind::LayerNormBackwardOut { .. }
             | NodeKind::AdamWOut { .. }
-            | NodeKind::AdamWGroupOut { .. }
             | NodeKind::SgdOut { .. }
-            | NodeKind::FusedPick { .. }
             | NodeKind::StopGradient { .. }
             | NodeKind::Checkpoint { .. } => {
                 unreachable!("zero-command nodes return before operation lowering")
             }
         };
-        match &op {
-            MetalOp::AdamW { .. } => {
-                if inputs.len() != 7 {
-                    return Err(
-                        "compile: AdamW requires four tensors and three scalars".to_string()
-                    );
-                }
-                let packed = self.optimizer_scalar_pack(&inputs[4..7])?;
-                inputs.truncate(4);
-                inputs.push(packed);
-            }
-            MetalOp::AdamWGroup { parameters, .. } => {
-                let scalar_start = parameters
-                    .checked_mul(4)
-                    .ok_or_else(|| "compile: grouped AdamW input count overflow".to_string())?;
-                if inputs.len() != scalar_start + 3 {
-                    return Err(
-                        "compile: grouped AdamW requires four tensors per parameter and three scalars"
-                            .to_string(),
-                    );
-                }
-                let packed = self.optimizer_scalar_pack(&inputs[scalar_start..])?;
-                inputs.truncate(scalar_start);
-                inputs.push(packed);
-            }
-            MetalOp::Sgd { .. } => {
-                if inputs.len() != 5 {
-                    return Err("compile: SGD requires three tensors and two scalars".to_string());
-                }
-                let packed = self.optimizer_scalar_pack(&[inputs[4], inputs[3]])?;
-                inputs.truncate(3);
-                inputs.push(packed);
-            }
-            _ => {}
-        }
-        self.command(op, inputs, outputs.clone());
+        self.operation_command(op, inputs, outputs.clone())?;
         self.node_values.insert(node.id, outputs.into_boxed_slice());
         Ok(())
     }
@@ -2863,27 +3278,34 @@ impl Lowerer {
     fn finish(
         mut self,
         outputs: Vec<ValueId>,
-        semantic_nodes_before_optimization: usize,
+        driver: &mut CompilerDriver<'_>,
     ) -> Result<(MetalExecutable, Vec<Value>, Vec<usize>), String> {
         if let Some(cursor) = self.state_cursor {
-            self.commands.insert(
+            self.instructions.insert(
                 0,
-                MetalCommand {
-                    op: MetalOp::PrepareState,
-                    inputs: Box::new([]),
-                    outputs: Box::new([cursor]),
-                    release: Box::new([]),
-                    scratch: Box::new([]),
-                    staging: Box::new([]),
-                    status: Box::new([]),
-                    plan: MetalCommandPlan::Direct,
-                    synchronization: MetalCommandSynchronization {
-                        barrier_after_dispatch: false,
-                        commit_after: false,
-                        status_gate: false,
+                LoweredInstruction::new(
+                    InstructionId::new(0),
+                    MetalInstruction::Operation {
+                        op: MetalOp::PrepareState,
+                        plan: MetalCommandPlan::Direct,
+                        release: Box::new([]),
+                        random_seed_token: 0,
                     },
-                },
+                    Vec::new(),
+                    vec![OutputDecl::new(cursor)],
+                )
+                .with_effects(InstructionEffects {
+                    may_fail: true,
+                    has_side_effects: true,
+                }),
             );
+        }
+        for (token, instruction) in self.instructions.iter_mut().enumerate() {
+            let (_, _, _, random_seed_token) = instruction
+                .kind
+                .operation_mut()
+                .expect("lowerer retains only operation instructions before finalization");
+            *random_seed_token = token as u64;
         }
         let output_roots = outputs
             .iter()
@@ -2904,16 +3326,21 @@ impl Lowerer {
             .chain(output_roots.iter().copied())
             .collect::<HashSet<_>>();
         let mut last_use = vec![None::<usize>; self.values.len()];
-        for (command_index, command) in self.commands.iter().enumerate() {
+        for (command_index, command) in self.instructions.iter().enumerate() {
             for output in &command.outputs {
-                last_use[storage_root(&self.storage, *output).index()].get_or_insert(command_index);
+                last_use[storage_root(&self.storage, output.value).index()]
+                    .get_or_insert(command_index);
             }
             for input in &command.inputs {
-                last_use[storage_root(&self.storage, *input).index()] = Some(command_index);
+                last_use[storage_root(&self.storage, input.value).index()] = Some(command_index);
             }
         }
-        for (command_index, command) in self.commands.iter_mut().enumerate() {
-            command.release = last_use
+        for (command_index, command) in self.instructions.iter_mut().enumerate() {
+            let (_, _, release, _) = command
+                .kind
+                .operation_mut()
+                .expect("lowerer retains only operation instructions before finalization");
+            *release = last_use
                 .iter()
                 .enumerate()
                 .filter_map(|(index, last)| {
@@ -2925,7 +3352,7 @@ impl Lowerer {
         }
 
         let planned_resources = self
-            .commands
+            .instructions
             .iter()
             .map(|command| {
                 plan_command_resources(
@@ -2960,13 +3387,42 @@ impl Lowerer {
                 .drain(..)
                 .map(&mut append)
                 .collect::<Result<Vec<_>, _>>()?;
-            let command = &mut self.commands[command_index];
-            command.scratch = scratch.into_boxed_slice();
-            command.staging = staging.into_boxed_slice();
-            command.status = status.into_boxed_slice();
-            command.plan = resources.plan;
-            command.synchronization.status_gate = !command.status.is_empty();
-            command.synchronization.commit_after = command.synchronization.status_gate;
+            let (scratch, state): (Vec<_>, Vec<_>) = scratch.into_iter().partition(|value| {
+                self.storage[value.index()] != MetalValueStorage::StateTransaction
+            });
+            let command = &mut self.instructions[command_index];
+            command.scratch = scratch
+                .into_iter()
+                .map(ValueUse::read_write)
+                .collect::<Vec<_>>()
+                .into_boxed_slice();
+            command.staging = staging
+                .into_iter()
+                .map(ValueUse::read_write)
+                .collect::<Vec<_>>()
+                .into_boxed_slice();
+            command.status = status
+                .into_iter()
+                .map(ValueUse::write)
+                .collect::<Vec<_>>()
+                .into_boxed_slice();
+            command.state = state
+                .into_iter()
+                .map(ValueUse::write)
+                .collect::<Vec<_>>()
+                .into_boxed_slice();
+            let (op, plan, _, _) = command
+                .kind
+                .operation_mut()
+                .expect("lowerer retains only operation instructions before finalization");
+            *plan = resources.plan;
+            command.effects.has_side_effects = matches!(
+                op,
+                MetalOp::PrepareState
+                    | MetalOp::KdaRecurrence { .. }
+                    | MetalOp::ConvState { .. }
+                    | MetalOp::KvAttention { .. }
+            );
         }
 
         let mut constant_slots = 0u32;
@@ -3043,11 +3499,17 @@ impl Lowerer {
                         ownership: SegmentOwnership::StateTransaction,
                     },
                 };
-                Ok(ValueDecl {
-                    id,
-                    name: self.names[index].clone(),
-                    bytes,
-                    storage,
+                let layout = effect_torch_runtime::Layout::contiguous(value.shape.to_vec());
+                Ok(MetalLoweredValue {
+                    shape: value.shape.clone(),
+                    dtype: value.dtype,
+                    layout,
+                    declaration: ValueDecl {
+                        id,
+                        name: self.names[index].clone(),
+                        bytes,
+                        storage,
+                    },
                 })
             })
             .collect::<Result<Vec<_>, String>>()?;
@@ -3066,43 +3528,32 @@ impl Lowerer {
             .chain(self.padded_bindings.iter().map(|binding| binding.value))
             .collect::<Vec<_>>();
         let mut instructions = Vec::with_capacity(
-            self.commands.len() + usize::from(!invocation_values.is_empty()) + 1,
+            self.instructions.len() + usize::from(!invocation_values.is_empty()) + 1,
         );
         if !invocation_values.is_empty() {
-            instructions.push(LoweredInstruction::new(
-                InstructionId::from_index(0)
-                    .ok_or_else(|| "compile: too many Metal commands".to_string())?,
-                "prepare_invocation".to_string(),
-                Vec::new(),
-                invocation_values
-                    .iter()
-                    .copied()
-                    .map(OutputDecl::new)
-                    .collect::<Vec<_>>(),
-            ));
+            instructions.push(
+                LoweredInstruction::new(
+                    InstructionId::from_index(0)
+                        .ok_or_else(|| "compile: too many Metal instructions".to_string())?,
+                    MetalInstruction::PrepareInvocation,
+                    Vec::new(),
+                    invocation_values
+                        .iter()
+                        .copied()
+                        .map(OutputDecl::new)
+                        .collect::<Vec<_>>(),
+                )
+                .with_effects(InstructionEffects {
+                    may_fail: true,
+                    has_side_effects: false,
+                }),
+            );
         }
-        for command in &self.commands {
-            instructions.push(LoweredInstruction::new(
-                InstructionId::from_index(instructions.len())
-                    .ok_or_else(|| "compile: too many Metal commands".to_string())?,
-                command.op.name().to_string(),
-                command
-                    .inputs
-                    .iter()
-                    .map(|value| ValueUse {
-                        value: *value,
-                        access: ValueAccess::Read,
-                    })
-                    .collect::<Vec<_>>(),
-                command
-                    .outputs
-                    .iter()
-                    .chain(command.scratch.iter())
-                    .chain(command.staging.iter())
-                    .chain(command.status.iter())
-                    .map(|value| OutputDecl::new(*value))
-                    .collect::<Vec<_>>(),
-            ));
+        for mut instruction in self.instructions {
+            let id = InstructionId::from_index(instructions.len())
+                .ok_or_else(|| "compile: too many Metal instructions".to_string())?;
+            instruction.id = id;
+            instructions.push(instruction);
         }
         let mut publication_inputs = outputs
             .iter()
@@ -3111,1032 +3562,1234 @@ impl Lowerer {
             .collect::<Vec<_>>();
         publication_inputs.extend(invocation_values.iter().copied().map(ValueUse::read));
         publication_inputs.extend(self.state_cursor.map(ValueUse::read));
-        for command in &self.commands {
-            publication_inputs.extend(command.staging.iter().copied().map(ValueUse::read));
+        for command in &instructions {
             publication_inputs.extend(
                 command
-                    .scratch
+                    .staging
                     .iter()
-                    .copied()
-                    .filter(|value| {
-                        self.storage[value.index()] == MetalValueStorage::StateTransaction
-                    })
-                    .map(ValueUse::read),
+                    .map(|use_| ValueUse::read(use_.value)),
             );
-            if command.synchronization.status_gate {
+            publication_inputs.extend(command.state.iter().map(|use_| ValueUse::read(use_.value)));
+            if !command.status.is_empty() {
                 publication_inputs.extend(
                     command
                         .scratch
                         .iter()
                         .chain(command.status.iter())
-                        .copied()
-                        .map(ValueUse::read),
+                        .map(|use_| ValueUse::read(use_.value)),
                 );
             }
         }
-        instructions.push(LoweredInstruction::new(
-            InstructionId::from_index(instructions.len())
-                .ok_or_else(|| "compile: too many Metal commands".to_string())?,
-            "publish_outputs".to_string(),
-            publication_inputs,
-            Vec::new(),
-        ));
-        let schedule = LoweredSchedule::new(values, instructions, outputs.clone());
-        let mut memory = plan_memory(
-            &schedule,
-            &MemoryPlannerConfig::uniform(NativeMemorySpace::MetalShared, segment_max, 256, 256),
-        )
-        .map_err(|error| format!("compile: Metal memory planning failed: {error}"))?;
+        let stateful = self.state_schema.is_some()
+            || instructions.iter().any(|instruction| {
+                instruction.effects.has_side_effects || !instruction.state.is_empty()
+            });
+        instructions.push(
+            LoweredInstruction::new(
+                InstructionId::from_index(instructions.len())
+                    .ok_or_else(|| "compile: too many Metal instructions".to_string())?,
+                MetalInstruction::FinalizeInvocation,
+                publication_inputs,
+                Vec::new(),
+            )
+            .with_effects(InstructionEffects {
+                may_fail: stateful,
+                has_side_effects: stateful,
+            }),
+        );
+        let program = Arc::new(LoweredProgram::new(values, instructions, outputs.clone()));
+        let mut memory = driver
+            .plan_memory(
+                &program,
+                &MemoryPlannerConfig::uniform(
+                    NativeMemorySpace::MetalShared,
+                    segment_max,
+                    256,
+                    256,
+                ),
+            )
+            .map_err(|error| format!("compile: Metal memory planning failed: {error}"))?;
         if let Some(schema) = &self.state_schema {
             memory.report.state_bytes = schema.referenced_state_bytes()?;
         }
 
-        let mut pipeline_count = 0usize;
-        for command in &self.commands {
-            let dtype = command
-                .inputs
-                .first()
-                .or_else(|| command.outputs.first())
-                .map(|value| self.values[value.index()].dtype)
-                .unwrap_or(DType::F32);
-            match &command.op {
-                MetalOp::ChunkedHeadCe { .. } => {
-                    let MetalCommandPlan::ChunkedHeadForward(plan) = &command.plan else {
-                        return Err("compile: chunked head CE plan is missing".to_string());
-                    };
-                    for variant in std::iter::once(&plan.full).chain(plan.tail.iter()) {
-                        pipeline_count += crate::gemm::precompile_gemm_fused(
-                            device::MetalDevice::get(),
-                            &variant.head,
-                        )?;
-                        loss::warm_forward_exact(&variant.ce)?;
-                        pipeline_count += 2;
-                    }
-                    crate::kernels::warm_fill(&[3], 0.0, DType::F32)?;
-                    crate::ops::warm_binary(
-                        &[3],
-                        DType::F32,
-                        &[3],
-                        DType::F32,
-                        metal_ops::BinOp::Add,
-                        false,
-                    )?;
-                    crate::ops::warm_binary(
-                        &[1],
-                        DType::F32,
-                        &[1],
-                        DType::F32,
-                        metal_ops::BinOp::Div,
-                        false,
-                    )?;
-                    let destination = &self.values[command.outputs[0].index()];
-                    if destination.dtype != DType::F32 {
-                        crate::kernels::warm_cast(
-                            &destination.shape,
-                            DType::F32,
-                            destination.dtype,
-                        )?;
-                    }
-                    pipeline_count += 3;
+        let physical = driver.phase(PHYSICAL_PLANNING_PHASE, || {
+            let mut physical = Vec::with_capacity(program.instructions.len() * 3 + 1);
+            for instruction in &program.instructions {
+                if instruction.kind.operation().is_none() {
+                    continue;
                 }
-                MetalOp::ChunkedHeadCeBackward { .. } => {
-                    let MetalCommandPlan::ChunkedHeadBackward(plan) = &command.plan else {
-                        return Err("compile: chunked head CE backward plan is missing".to_string());
-                    };
-                    let x = &self.values[command.inputs[0].index()];
-                    let weight = &self.values[command.inputs[1].index()];
-                    let target = &self.values[command.inputs[3].index()];
-                    let gradient = &self.values[command.inputs[4].index()];
-                    if gradient.dtype != DType::F32 {
-                        crate::kernels::warm_cast(&gradient.shape, gradient.dtype, DType::F32)?;
-                    }
-                    if weight.dtype != DType::F32 {
-                        crate::kernels::warm_cast(&weight.shape, weight.dtype, DType::F32)?;
-                    }
-                    let transposed_weight =
-                        effect_torch_runtime::Layout::contiguous(weight.shape.to_vec())
-                            .permute(&[1, 0]);
-                    crate::kernels::warm_copy_layout(&transposed_weight, DType::F32)?;
-                    crate::kernels::warm_fill(&[plan.inner, plan.vocab], 0.0, DType::F32)?;
-                    crate::kernels::warm_fill(&[1, plan.vocab], 0.0, DType::F32)?;
-                    loss::warm_target_status(x.dtype, target.dtype)?;
-                    loss::warm_backward_scaled_f32(x.dtype, target.dtype)?;
-                    crate::ops::warm_binary(
-                        &[1],
-                        DType::F32,
-                        &[1],
-                        DType::F32,
-                        metal_ops::BinOp::Div,
-                        false,
-                    )?;
-                    for variant in std::iter::once(&plan.full).chain(plan.tail.iter()) {
-                        pipeline_count += crate::gemm::precompile_gemm_fused(
-                            device::MetalDevice::get(),
-                            &variant.head,
-                        )?;
-                        pipeline_count += crate::gemm::precompile_gemm_fused(
-                            device::MetalDevice::get(),
-                            &variant.dx,
-                        )?;
-                        pipeline_count += crate::gemm::precompile_gemm_fused(
-                            device::MetalDevice::get(),
-                            &variant.dw,
-                        )?;
-                        if x.dtype != DType::F32 {
-                            crate::kernels::warm_cast(
-                                &[variant.rows, plan.inner],
-                                x.dtype,
-                                DType::F32,
+                physical.push(MetalPhysicalCommand::Encode(instruction.id));
+                if !instruction.status.is_empty() {
+                    physical.push(MetalPhysicalCommand::StatusGate(instruction.id));
+                    physical.push(MetalPhysicalCommand::Commit);
+                }
+            }
+            physical.push(MetalPhysicalCommand::Complete);
+            Ok::<_, String>(physical)
+        })?;
+
+        let pipeline_count = driver.phase(PIPELINE_PREPARATION_PHASE, || {
+            let mut pipeline_count = 0usize;
+            for physical_command in &physical {
+                let MetalPhysicalCommand::Encode(id) = *physical_command else {
+                    continue;
+                };
+                let command = program_instruction(&program, id).ok_or_else(|| {
+                    format!("compile: physical Metal instruction {id} is out of range")
+                })?;
+                let Some((op, command_plan)) = command.kind.operation() else {
+                    return Err(format!(
+                        "compile: physical Metal instruction {id} is not an operation"
+                    ));
+                };
+                let dtype = command
+                    .inputs
+                    .first()
+                    .map(|value| self.values[value.index()].dtype)
+                    .or_else(|| {
+                        command
+                            .outputs
+                            .first()
+                            .map(|value| self.values[value.index()].dtype)
+                    })
+                    .unwrap_or(DType::F32);
+                match op {
+                    MetalOp::ChunkedHeadCe { .. } => {
+                        let MetalCommandPlan::ChunkedHeadForward(plan) = command_plan else {
+                            return Err("compile: chunked head CE plan is missing".to_string());
+                        };
+                        for variant in std::iter::once(&plan.full).chain(plan.tail.iter()) {
+                            pipeline_count += crate::gemm::precompile_gemm_fused(
+                                device::MetalDevice::get(),
+                                &variant.head,
                             )?;
-                            crate::kernels::warm_cast(
-                                &[variant.rows, plan.inner],
-                                DType::F32,
-                                x.dtype,
-                            )?;
+                            loss::warm_forward_exact(&variant.ce)?;
+                            pipeline_count += 2;
                         }
-                        let transposed_x = effect_torch_runtime::Layout::contiguous(vec![
-                            variant.rows,
-                            plan.inner,
-                        ])
-                        .permute(&[1, 0]);
-                        crate::kernels::warm_copy_layout(&transposed_x, DType::F32)?;
-                        crate::ops::warm_reduce(
-                            &[variant.rows, plan.vocab],
+                        crate::kernels::warm_fill(&[3], 0.0, DType::F32)?;
+                        crate::ops::warm_binary(
+                            &[3],
                             DType::F32,
-                            &[0],
-                            true,
-                            fusion::ReduceOp::Sum,
+                            &[3],
+                            DType::F32,
+                            metal_ops::BinOp::Add,
+                            false,
                         )?;
-                    }
-                    crate::ops::warm_binary(
-                        &[plan.inner, plan.vocab],
-                        DType::F32,
-                        &[plan.inner, plan.vocab],
-                        DType::F32,
-                        metal_ops::BinOp::Add,
-                        false,
-                    )?;
-                    crate::ops::warm_binary(
-                        &[1, plan.vocab],
-                        DType::F32,
-                        &[1, plan.vocab],
-                        DType::F32,
-                        metal_ops::BinOp::Add,
-                        false,
-                    )?;
-                    for output in &command.outputs[1..] {
-                        let destination = &self.values[output.index()];
-                        if destination.dtype == DType::F32 {
-                            crate::kernels::warm_copy(&destination.shape, DType::F32)?;
-                        } else {
+                        crate::ops::warm_binary(
+                            &[1],
+                            DType::F32,
+                            &[1],
+                            DType::F32,
+                            metal_ops::BinOp::Div,
+                            false,
+                        )?;
+                        let destination = &self.values[command.outputs[0].index()];
+                        if destination.dtype != DType::F32 {
                             crate::kernels::warm_cast(
                                 &destination.shape,
                                 DType::F32,
                                 destination.dtype,
                             )?;
                         }
+                        pipeline_count += 3;
                     }
-                    pipeline_count += 10;
-                }
-                MetalOp::Randn { shape, .. } => {
-                    crate::kernels::warm_randn(shape)?;
-                    crate::kernels::warm_cast(shape, DType::F32, dtype)?;
-                    pipeline_count += 1;
-                }
-                MetalOp::Uniform { lo, hi, shape, .. } => {
-                    crate::kernels::warm_uniform(*lo, *hi, shape)?;
-                    crate::kernels::warm_cast(shape, DType::F32, dtype)?;
-                    pipeline_count += 1;
-                }
-                MetalOp::FusedElementwise {
-                    strides,
-                    shape,
-                    exprs,
-                } => {
-                    crate::run::warm_elementwise(
-                        device::MetalDevice::get(),
-                        exprs,
+                    MetalOp::ChunkedHeadCeBackward { .. } => {
+                        let MetalCommandPlan::ChunkedHeadBackward(plan) = command_plan else {
+                            return Err(
+                                "compile: chunked head CE backward plan is missing".to_string()
+                            );
+                        };
+                        let x = &self.values[command.inputs[0].index()];
+                        let weight = &self.values[command.inputs[1].index()];
+                        let target = &self.values[command.inputs[3].index()];
+                        let gradient = &self.values[command.inputs[4].index()];
+                        if gradient.dtype != DType::F32 {
+                            crate::kernels::warm_cast(&gradient.shape, gradient.dtype, DType::F32)?;
+                        }
+                        if weight.dtype != DType::F32 {
+                            crate::kernels::warm_cast(&weight.shape, weight.dtype, DType::F32)?;
+                        }
+                        let transposed_weight =
+                            effect_torch_runtime::Layout::contiguous(weight.shape.to_vec())
+                                .permute(&[1, 0]);
+                        crate::kernels::warm_copy_layout(&transposed_weight, DType::F32)?;
+                        crate::kernels::warm_fill(&[plan.inner, plan.vocab], 0.0, DType::F32)?;
+                        crate::kernels::warm_fill(&[1, plan.vocab], 0.0, DType::F32)?;
+                        loss::warm_target_status(x.dtype, target.dtype)?;
+                        loss::warm_backward_scaled_f32(x.dtype, target.dtype)?;
+                        crate::ops::warm_binary(
+                            &[1],
+                            DType::F32,
+                            &[1],
+                            DType::F32,
+                            metal_ops::BinOp::Div,
+                            false,
+                        )?;
+                        for variant in std::iter::once(&plan.full).chain(plan.tail.iter()) {
+                            pipeline_count += crate::gemm::precompile_gemm_fused(
+                                device::MetalDevice::get(),
+                                &variant.head,
+                            )?;
+                            pipeline_count += crate::gemm::precompile_gemm_fused(
+                                device::MetalDevice::get(),
+                                &variant.dx,
+                            )?;
+                            pipeline_count += crate::gemm::precompile_gemm_fused(
+                                device::MetalDevice::get(),
+                                &variant.dw,
+                            )?;
+                            if x.dtype != DType::F32 {
+                                crate::kernels::warm_cast(
+                                    &[variant.rows, plan.inner],
+                                    x.dtype,
+                                    DType::F32,
+                                )?;
+                                crate::kernels::warm_cast(
+                                    &[variant.rows, plan.inner],
+                                    DType::F32,
+                                    x.dtype,
+                                )?;
+                            }
+                            let transposed_x = effect_torch_runtime::Layout::contiguous(vec![
+                                variant.rows,
+                                plan.inner,
+                            ])
+                            .permute(&[1, 0]);
+                            crate::kernels::warm_copy_layout(&transposed_x, DType::F32)?;
+                            crate::ops::warm_reduce(
+                                &[variant.rows, plan.vocab],
+                                DType::F32,
+                                &[0],
+                                true,
+                                fusion::ReduceOp::Sum,
+                            )?;
+                        }
+                        crate::ops::warm_binary(
+                            &[plan.inner, plan.vocab],
+                            DType::F32,
+                            &[plan.inner, plan.vocab],
+                            DType::F32,
+                            metal_ops::BinOp::Add,
+                            false,
+                        )?;
+                        crate::ops::warm_binary(
+                            &[1, plan.vocab],
+                            DType::F32,
+                            &[1, plan.vocab],
+                            DType::F32,
+                            metal_ops::BinOp::Add,
+                            false,
+                        )?;
+                        for output in &command.outputs[1..] {
+                            let destination = &self.values[output.index()];
+                            if destination.dtype == DType::F32 {
+                                crate::kernels::warm_copy(&destination.shape, DType::F32)?;
+                            } else {
+                                crate::kernels::warm_cast(
+                                    &destination.shape,
+                                    DType::F32,
+                                    destination.dtype,
+                                )?;
+                            }
+                        }
+                        pipeline_count += 10;
+                    }
+                    MetalOp::Randn { shape, .. } => {
+                        crate::kernels::warm_randn(shape)?;
+                        crate::kernels::warm_cast(shape, DType::F32, dtype)?;
+                        pipeline_count += 1;
+                    }
+                    MetalOp::Uniform { lo, hi, shape, .. } => {
+                        crate::kernels::warm_uniform(*lo, *hi, shape)?;
+                        crate::kernels::warm_cast(shape, DType::F32, dtype)?;
+                        pipeline_count += 1;
+                    }
+                    MetalOp::FusedElementwise {
                         strides,
                         shape,
-                        shape.iter().product(),
-                        0,
-                        dtype,
-                    )?;
-                    pipeline_count += 1;
-                }
-                MetalOp::FusedReduce {
-                    strides,
-                    in_shape,
-                    expr,
-                    op,
-                    dims,
-                    keepdims,
-                    shape,
-                } => {
-                    crate::run::warm_reduce(
-                        device::MetalDevice::get(),
-                        *op,
-                        expr,
+                        exprs,
+                    } => {
+                        crate::run::warm_elementwise(
+                            device::MetalDevice::get(),
+                            exprs,
+                            strides,
+                            shape,
+                            shape.iter().product(),
+                            0,
+                            dtype,
+                        )?;
+                        pipeline_count += 1;
+                    }
+                    MetalOp::FusedReduce {
                         strides,
                         in_shape,
+                        expr,
+                        op,
                         dims,
-                        *keepdims,
+                        keepdims,
                         shape,
-                        dtype,
-                    )?;
-                    pipeline_count += 1;
-                }
-                MetalOp::PackOptimizerScalars => {
-                    for input in &command.inputs {
-                        let scalar = &self.values[input.index()];
-                        if scalar.dtype != DType::F32 {
-                            crate::kernels::warm_cast(&scalar.shape, scalar.dtype, DType::F32)?;
-                        }
-                    }
-                    let shapes = vec![[1usize]; command.inputs.len()];
-                    let shapes = shapes
-                        .iter()
-                        .map(|shape| shape.as_slice())
-                        .collect::<Vec<_>>();
-                    crate::indexing::warm_cat(&shapes, DType::F32, 0)?;
-                    pipeline_count += 1;
-                }
-                MetalOp::AdamW {
-                    implementation: OptimizerImplementation::Fused,
-                    exprs,
-                    ..
-                } => {
-                    let shape = &self.values[command.inputs[0].index()].shape;
-                    let strides = vec![fusion::contiguous_strides(shape); 4];
-                    crate::run::warm_elementwise(
-                        device::MetalDevice::get(),
-                        exprs,
-                        &strides,
-                        shape,
-                        shape.iter().product(),
-                        3,
-                        dtype,
-                    )?;
-                    pipeline_count += 1;
-                }
-                MetalOp::AdamW {
-                    beta1,
-                    beta2,
-                    eps,
-                    weight_decay,
-                    implementation: OptimizerImplementation::Generic,
-                    ..
-                } => {
-                    let shape = &self.values[command.inputs[0].index()].shape;
-                    let strides = vec![fusion::contiguous_strides(shape); 4];
-                    crate::run::warm_elementwise(
-                        device::MetalDevice::get(),
-                        &fusion::adamw_exprs(*beta1, *beta2, *eps, *weight_decay),
-                        &strides,
-                        shape,
-                        shape.iter().product(),
-                        3,
-                        dtype,
-                    )?;
-                    pipeline_count += 1;
-                }
-                MetalOp::AdamWGroup { parameters, exprs } => {
-                    let shape = &self.values[command.inputs[0].index()].shape;
-                    let strides = vec![fusion::contiguous_strides(shape); parameters * 4];
-                    crate::run::warm_elementwise(
-                        device::MetalDevice::get(),
-                        exprs,
-                        &strides,
-                        shape,
-                        shape.iter().product(),
-                        3,
-                        dtype,
-                    )?;
-                    pipeline_count += 1;
-                }
-                MetalOp::Sgd {
-                    implementation: OptimizerImplementation::Fused,
-                    exprs,
-                    ..
-                } => {
-                    let shape = &self.values[command.inputs[0].index()].shape;
-                    let strides = vec![fusion::contiguous_strides(shape); 3];
-                    crate::run::warm_elementwise(
-                        device::MetalDevice::get(),
-                        exprs,
-                        &strides,
-                        shape,
-                        shape.iter().product(),
-                        2,
-                        dtype,
-                    )?;
-                    pipeline_count += 1;
-                }
-                MetalOp::Sgd {
-                    momentum,
-                    dampening,
-                    nesterov,
-                    weight_decay,
-                    implementation: OptimizerImplementation::Generic,
-                    ..
-                } => {
-                    let shape = &self.values[command.inputs[0].index()].shape;
-                    let strides = vec![fusion::contiguous_strides(shape); 3];
-                    crate::run::warm_elementwise(
-                        device::MetalDevice::get(),
-                        &fusion::sgd_exprs(*momentum, *dampening, *nesterov, *weight_decay),
-                        &strides,
-                        shape,
-                        shape.iter().product(),
-                        2,
-                        dtype,
-                    )?;
-                    pipeline_count += 1;
-                }
-                MetalOp::CrossEntropy {
-                    implementation: MetalImplementation::Native,
-                    ..
-                } => {
-                    let target = self.values[command.inputs[1].index()].dtype;
-                    loss::warm_forward(dtype, target)?;
-                    crate::kernels::warm_cast(&[], DType::F32, dtype)?;
-                    pipeline_count += 2;
-                }
-                MetalOp::CrossEntropyBackward {
-                    reduction,
-                    implementation: MetalImplementation::Native,
-                    ..
-                } => {
-                    let target = self.values[command.inputs[1].index()].dtype;
-                    loss::warm_backward(dtype, target, *reduction)?;
-                    pipeline_count += if *reduction == CrossEntropyReduction::Mean {
-                        2
-                    } else {
-                        1
-                    };
-                }
-                MetalOp::Sdpa {
-                    scale,
-                    causal,
-                    implementation: MetalImplementation::Native,
-                } => {
-                    flash::warm_forward(
-                        &self.values[command.inputs[0].index()].shape,
-                        &self.values[command.inputs[1].index()].shape,
-                        &self.values[command.inputs[2].index()].shape,
-                        *scale,
-                        *causal,
-                        dtype,
-                    )?;
-                    pipeline_count += 1;
-                }
-                MetalOp::SdpaBackward {
-                    scale,
-                    causal,
-                    implementation: MetalImplementation::Native,
-                } => {
-                    flash::warm_backward(
-                        &self.values[command.inputs[0].index()].shape,
-                        &self.values[command.inputs[1].index()].shape,
-                        &self.values[command.inputs[2].index()].shape,
-                        *scale,
-                        *causal,
-                        dtype,
-                    )?;
-                    let q = &self.values[command.inputs[0].index()];
-                    let v = &self.values[command.inputs[2].index()];
-                    let rank = q.shape.len();
-                    let flat_shape = vec![
-                        q.shape[..rank - 2].iter().product(),
-                        q.shape[rank - 2],
-                        v.shape[rank - 1],
-                    ];
-                    crate::ops::warm_binary(
-                        &flat_shape,
-                        dtype,
-                        &flat_shape,
-                        dtype,
-                        metal_ops::BinOp::Mul,
-                        false,
-                    )?;
-                    crate::ops::warm_reduce(&flat_shape, dtype, &[2], true, fusion::ReduceOp::Sum)?;
-                    crate::kernels::warm_cast(
-                        &[flat_shape[0], flat_shape[1], 1],
-                        dtype,
-                        DType::F32,
-                    )?;
-                    pipeline_count += 2;
-                }
-                MetalOp::KdaChunk { scale } => {
-                    let q = &self.values[command.inputs[0].index()];
-                    let v = &self.values[command.inputs[2].index()];
-                    kda::warm_forward(
-                        dtype,
-                        q.shape[q.shape.len() - 1],
-                        v.shape[v.shape.len() - 1],
-                        *scale,
-                    )?;
-                    pipeline_count += 1;
-                }
-                MetalOp::KdaRecurrence { .. } => {
-                    let q = &self.values[command.inputs[0].index()];
-                    let rank = q.shape.len();
-                    let dk = q.shape[q.shape.len() - 1];
-                    let heads = q.shape[rank - 3];
-                    let time = q.shape[rank - 2];
-                    match &command.plan {
-                        MetalCommandPlan::KdaDecode(requirements) => {
-                            kda::warm_decode_exact(requirements)?;
-                        }
-                        MetalCommandPlan::KdaForward(requirements) => {
-                            kda::warm_forward_exact(requirements)?;
-                            crate::ops::warm_binary(
-                                &[heads, time, dk],
-                                dtype,
-                                &[1, time, 1],
-                                dtype,
-                                metal_ops::BinOp::Mul,
-                                false,
-                            )?;
-                            crate::ops::warm_binary(
-                                &[heads, time, 1],
-                                dtype,
-                                &[1, time, 1],
-                                dtype,
-                                metal_ops::BinOp::Mul,
-                                false,
-                            )?;
-                        }
-                        _ => return Err("compile: KDA recurrence plan is missing".to_string()),
-                    }
-                    pipeline_count += 1;
-                }
-                MetalOp::KdaBackward { scale } => {
-                    let q = &self.values[command.inputs[0].index()];
-                    let v = &self.values[command.inputs[2].index()];
-                    kda::warm_backward(
-                        dtype,
-                        q.shape[q.shape.len() - 1],
-                        v.shape[v.shape.len() - 1],
-                        *scale,
-                    )?;
-                    pipeline_count += 1;
-                }
-                MetalOp::ShortConv1d
-                | MetalOp::ShortConv1dBackwardX
-                | MetalOp::ShortConv1dBackwardW => {
-                    shortconv::warm_all(dtype)?;
-                    pipeline_count += 3;
-                }
-                MetalOp::ConvState { .. } => {
-                    let MetalCommandPlan::ShortConvState(requirements) = &command.plan else {
-                        return Err("compile: convolution state plan is missing".to_string());
-                    };
-                    shortconv::warm_forward_exact(requirements)?;
-                    pipeline_count += requirements.pipeline_count;
-                }
-                MetalOp::KvAttention { scale, .. } => {
-                    let query = &self.values[command.inputs[0].index()];
-                    pipeline_count +=
-                        crate::paged::warm_all(query.shape[query.shape.len() - 1], *scale)?;
-                }
-                MetalOp::RotaryEmbedding {
-                    implementation: MetalImplementation::Native,
-                    ..
-                }
-                | MetalOp::RotaryEmbeddingBackward {
-                    implementation: MetalImplementation::Native,
-                    ..
-                } => {
-                    rotary::warm(dtype)?;
-                    pipeline_count += 1;
-                }
-                MetalOp::LayerNorm {
-                    implementation: MetalImplementation::Native,
-                    ..
-                } => {
-                    layer_norm::warm_forward(dtype)?;
-                    pipeline_count += 1;
-                }
-                MetalOp::LayerNormBackward {
-                    implementation: MetalImplementation::Native,
-                    ..
-                } => {
-                    layer_norm::warm_backward(dtype)?;
-                    let x = &self.values[command.inputs[0].index()];
-                    let weight = &self.values[command.inputs[1].index()];
-                    let gradient = &self.values[command.inputs[2].index()];
-                    crate::ops::warm_binary(
-                        &gradient.shape,
-                        gradient.dtype,
-                        &x.shape,
-                        x.dtype,
-                        metal_ops::BinOp::Mul,
-                        false,
-                    )?;
-                    let dimensions = (0..x.shape.len() - weight.shape.len()).collect::<Vec<_>>();
-                    crate::ops::warm_reduce(
-                        &x.shape,
-                        x.dtype,
-                        &dimensions,
-                        false,
-                        fusion::ReduceOp::Sum,
-                    )?;
-                    pipeline_count += 1;
-                }
-                MetalOp::Unary(kind) => {
-                    let shape = &self.values[command.inputs[0].index()].shape;
-                    let input_dtype = self.values[command.inputs[0].index()].dtype;
-                    match kind {
-                        MetalUnaryOp::Relu if dtype.is_float() => {
-                            crate::kernels::warm_cast(shape, input_dtype, DType::F32)?;
-                            crate::ops::warm_relu(shape, dtype)?;
-                            crate::kernels::warm_cast(shape, DType::F32, input_dtype)?;
-                        }
-                        MetalUnaryOp::Relu => crate::kernels::warm_relu_i64(shape)?,
-                        MetalUnaryOp::Pow { exponent_bits } => {
-                            crate::kernels::warm_cast(shape, input_dtype, DType::F32)?;
-                            crate::ops::warm_pow(shape, *exponent_bits)?;
-                            crate::kernels::warm_cast(shape, DType::F32, input_dtype)?;
-                        }
-                        MetalUnaryOp::Cast { dtype: destination } => {
-                            crate::kernels::warm_cast(shape, input_dtype, *destination)?;
-                        }
-                        kind => crate::ops::warm_unary(
+                    } => {
+                        crate::run::warm_reduce(
+                            device::MetalDevice::get(),
+                            *op,
+                            expr,
+                            strides,
+                            in_shape,
+                            dims,
+                            *keepdims,
                             shape,
                             dtype,
-                            match kind {
-                                MetalUnaryOp::Neg => metal_ops::UnOp::Neg,
-                                MetalUnaryOp::Abs => metal_ops::UnOp::Abs,
-                                MetalUnaryOp::Sqrt => metal_ops::UnOp::Sqrt,
-                                MetalUnaryOp::Exp => metal_ops::UnOp::Exp,
-                                MetalUnaryOp::Log => metal_ops::UnOp::Log,
-                                MetalUnaryOp::Sin => metal_ops::UnOp::Sin,
-                                MetalUnaryOp::Cos => metal_ops::UnOp::Cos,
-                                MetalUnaryOp::Tanh => metal_ops::UnOp::Tanh,
-                                MetalUnaryOp::Erf => metal_ops::UnOp::Erf,
-                                MetalUnaryOp::Gelu { approximate } => {
-                                    if *approximate {
-                                        metal_ops::UnOp::GeluTanh
-                                    } else {
-                                        metal_ops::UnOp::Gelu
-                                    }
-                                }
-                                MetalUnaryOp::Floor => metal_ops::UnOp::Floor,
-                                MetalUnaryOp::Ceil => metal_ops::UnOp::Ceil,
-                                MetalUnaryOp::Round => metal_ops::UnOp::Round,
-                                MetalUnaryOp::Sign => metal_ops::UnOp::Sign,
-                                MetalUnaryOp::Relu
-                                | MetalUnaryOp::Pow { .. }
-                                | MetalUnaryOp::Cast { .. } => unreachable!(),
-                            },
-                        )?,
-                    }
-                    if !matches!(
-                        kind,
-                        MetalUnaryOp::Cast { .. } | MetalUnaryOp::Relu | MetalUnaryOp::Pow { .. }
-                    ) {
-                        crate::kernels::warm_cast(shape, input_dtype, DType::F32)?;
-                        crate::kernels::warm_cast(shape, DType::F32, input_dtype)?;
-                    }
-                    pipeline_count += 1;
-                }
-                MetalOp::Binary(kind)
-                    if !matches!(kind, MetalBinaryOp::Concat { .. } | MetalBinaryOp::Matmul) =>
-                {
-                    let a = &self.values[command.inputs[0].index()];
-                    let b = &self.values[command.inputs[1].index()];
-                    let (operation, compare) = match kind {
-                        MetalBinaryOp::Add => (metal_ops::BinOp::Add, false),
-                        MetalBinaryOp::Sub => (metal_ops::BinOp::Sub, false),
-                        MetalBinaryOp::Mul => (metal_ops::BinOp::Mul, false),
-                        MetalBinaryOp::Div => (metal_ops::BinOp::Div, false),
-                        MetalBinaryOp::Eq => (metal_ops::BinOp::Eq, true),
-                        MetalBinaryOp::Gt => (metal_ops::BinOp::Gt, true),
-                        MetalBinaryOp::Lt => (metal_ops::BinOp::Lt, true),
-                        MetalBinaryOp::Ge => (metal_ops::BinOp::Ge, true),
-                        MetalBinaryOp::Le => (metal_ops::BinOp::Le, true),
-                        MetalBinaryOp::Maximum => (metal_ops::BinOp::Max, false),
-                        MetalBinaryOp::Minimum => (metal_ops::BinOp::Min, false),
-                        MetalBinaryOp::Concat { .. } | MetalBinaryOp::Matmul => unreachable!(),
-                    };
-                    crate::ops::warm_binary(
-                        &a.shape, a.dtype, &b.shape, b.dtype, operation, compare,
-                    )?;
-                    if compare {
-                        crate::kernels::warm_cast(&a.shape, a.dtype, DType::F32)?;
-                        crate::kernels::warm_cast(&b.shape, b.dtype, DType::F32)?;
-                        crate::kernels::warm_cast(
-                            &self.values[command.outputs[0].index()].shape,
-                            DType::F32,
-                            DType::U8,
                         )?;
-                    } else {
-                        let mut a_dtype = a.dtype;
-                        let mut b_dtype = b.dtype;
-                        if a_dtype != b_dtype
-                            && a_dtype.is_float()
-                            && b_dtype.is_float()
-                            && a.shape.is_empty()
-                            && !b.shape.is_empty()
-                        {
-                            crate::kernels::warm_cast(&a.shape, a_dtype, b_dtype)?;
-                            a_dtype = b_dtype;
-                        } else if a_dtype != b_dtype
-                            && a_dtype.is_float()
-                            && b_dtype.is_float()
-                            && b.shape.is_empty()
-                            && !a.shape.is_empty()
-                        {
-                            crate::kernels::warm_cast(&b.shape, b_dtype, a_dtype)?;
-                            b_dtype = a_dtype;
+                        pipeline_count += 1;
+                    }
+                    MetalOp::PackOptimizerScalars => {
+                        for input in &command.inputs {
+                            let scalar = &self.values[input.index()];
+                            if scalar.dtype != DType::F32 {
+                                crate::kernels::warm_cast(&scalar.shape, scalar.dtype, DType::F32)?;
+                            }
                         }
-                        if a_dtype != b_dtype || !matches!(a_dtype, DType::F32 | DType::BF16) {
-                            crate::kernels::warm_cast(&a.shape, a_dtype, DType::F32)?;
-                            crate::kernels::warm_cast(&b.shape, b_dtype, DType::F32)?;
+                        let shapes = vec![[1usize]; command.inputs.len()];
+                        let shapes = shapes
+                            .iter()
+                            .map(|shape| shape.as_slice())
+                            .collect::<Vec<_>>();
+                        crate::indexing::warm_cat(&shapes, DType::F32, 0)?;
+                        pipeline_count += 1;
+                    }
+                    MetalOp::AdamW {
+                        implementation: OptimizerImplementation::Fused,
+                        exprs,
+                        ..
+                    } => {
+                        let shape = &self.values[command.inputs[0].index()].shape;
+                        let strides = vec![fusion::contiguous_strides(shape); 4];
+                        crate::run::warm_elementwise(
+                            device::MetalDevice::get(),
+                            exprs,
+                            &strides,
+                            shape,
+                            shape.iter().product(),
+                            3,
+                            dtype,
+                        )?;
+                        pipeline_count += 1;
+                    }
+                    MetalOp::AdamW {
+                        beta1,
+                        beta2,
+                        eps,
+                        weight_decay,
+                        implementation: OptimizerImplementation::Generic,
+                        ..
+                    } => {
+                        let shape = &self.values[command.inputs[0].index()].shape;
+                        let strides = vec![fusion::contiguous_strides(shape); 4];
+                        crate::run::warm_elementwise(
+                            device::MetalDevice::get(),
+                            &fusion::adamw_exprs(*beta1, *beta2, *eps, *weight_decay),
+                            &strides,
+                            shape,
+                            shape.iter().product(),
+                            3,
+                            dtype,
+                        )?;
+                        pipeline_count += 1;
+                    }
+                    MetalOp::AdamWGroup { parameters, exprs } => {
+                        let shape = &self.values[command.inputs[0].index()].shape;
+                        let strides = vec![fusion::contiguous_strides(shape); parameters * 4];
+                        crate::run::warm_elementwise(
+                            device::MetalDevice::get(),
+                            exprs,
+                            &strides,
+                            shape,
+                            shape.iter().product(),
+                            3,
+                            dtype,
+                        )?;
+                        pipeline_count += 1;
+                    }
+                    MetalOp::Sgd {
+                        implementation: OptimizerImplementation::Fused,
+                        exprs,
+                        ..
+                    } => {
+                        let shape = &self.values[command.inputs[0].index()].shape;
+                        let strides = vec![fusion::contiguous_strides(shape); 3];
+                        crate::run::warm_elementwise(
+                            device::MetalDevice::get(),
+                            exprs,
+                            &strides,
+                            shape,
+                            shape.iter().product(),
+                            2,
+                            dtype,
+                        )?;
+                        pipeline_count += 1;
+                    }
+                    MetalOp::Sgd {
+                        momentum,
+                        dampening,
+                        nesterov,
+                        weight_decay,
+                        implementation: OptimizerImplementation::Generic,
+                        ..
+                    } => {
+                        let shape = &self.values[command.inputs[0].index()].shape;
+                        let strides = vec![fusion::contiguous_strides(shape); 3];
+                        crate::run::warm_elementwise(
+                            device::MetalDevice::get(),
+                            &fusion::sgd_exprs(*momentum, *dampening, *nesterov, *weight_decay),
+                            &strides,
+                            shape,
+                            shape.iter().product(),
+                            2,
+                            dtype,
+                        )?;
+                        pipeline_count += 1;
+                    }
+                    MetalOp::CrossEntropy {
+                        implementation: MetalImplementation::Native,
+                        ..
+                    } => {
+                        let target = self.values[command.inputs[1].index()].dtype;
+                        loss::warm_forward(dtype, target)?;
+                        crate::kernels::warm_cast(&[], DType::F32, dtype)?;
+                        pipeline_count += 2;
+                    }
+                    MetalOp::CrossEntropyBackward {
+                        reduction,
+                        implementation: MetalImplementation::Native,
+                        ..
+                    } => {
+                        let target = self.values[command.inputs[1].index()].dtype;
+                        loss::warm_backward(dtype, target, *reduction)?;
+                        pipeline_count += if *reduction == CrossEntropyReduction::Mean {
+                            2
+                        } else {
+                            1
+                        };
+                    }
+                    MetalOp::Sdpa {
+                        scale,
+                        causal,
+                        implementation: MetalImplementation::Native,
+                    } => {
+                        flash::warm_forward(
+                            &self.values[command.inputs[0].index()].shape,
+                            &self.values[command.inputs[1].index()].shape,
+                            &self.values[command.inputs[2].index()].shape,
+                            *scale,
+                            *causal,
+                            dtype,
+                        )?;
+                        pipeline_count += 1;
+                    }
+                    MetalOp::SdpaBackward {
+                        scale,
+                        causal,
+                        implementation: MetalImplementation::Native,
+                    } => {
+                        flash::warm_backward(
+                            &self.values[command.inputs[0].index()].shape,
+                            &self.values[command.inputs[1].index()].shape,
+                            &self.values[command.inputs[2].index()].shape,
+                            *scale,
+                            *causal,
+                            dtype,
+                        )?;
+                        let q = &self.values[command.inputs[0].index()];
+                        let v = &self.values[command.inputs[2].index()];
+                        let rank = q.shape.len();
+                        let flat_shape = vec![
+                            q.shape[..rank - 2].iter().product(),
+                            q.shape[rank - 2],
+                            v.shape[rank - 1],
+                        ];
+                        crate::ops::warm_binary(
+                            &flat_shape,
+                            dtype,
+                            &flat_shape,
+                            dtype,
+                            metal_ops::BinOp::Mul,
+                            false,
+                        )?;
+                        crate::ops::warm_reduce(
+                            &flat_shape,
+                            dtype,
+                            &[2],
+                            true,
+                            fusion::ReduceOp::Sum,
+                        )?;
+                        crate::kernels::warm_cast(
+                            &[flat_shape[0], flat_shape[1], 1],
+                            dtype,
+                            DType::F32,
+                        )?;
+                        pipeline_count += 2;
+                    }
+                    MetalOp::KdaChunk { scale } => {
+                        let q = &self.values[command.inputs[0].index()];
+                        let v = &self.values[command.inputs[2].index()];
+                        kda::warm_forward(
+                            dtype,
+                            q.shape[q.shape.len() - 1],
+                            v.shape[v.shape.len() - 1],
+                            *scale,
+                        )?;
+                        pipeline_count += 1;
+                    }
+                    MetalOp::KdaRecurrence { .. } => {
+                        let q = &self.values[command.inputs[0].index()];
+                        let rank = q.shape.len();
+                        let dk = q.shape[q.shape.len() - 1];
+                        let heads = q.shape[rank - 3];
+                        let time = q.shape[rank - 2];
+                        match command_plan {
+                            MetalCommandPlan::KdaDecode(requirements) => {
+                                kda::warm_decode_exact(requirements)?;
+                            }
+                            MetalCommandPlan::KdaForward(requirements) => {
+                                kda::warm_forward_exact(requirements)?;
+                                crate::ops::warm_binary(
+                                    &[heads, time, dk],
+                                    dtype,
+                                    &[1, time, 1],
+                                    dtype,
+                                    metal_ops::BinOp::Mul,
+                                    false,
+                                )?;
+                                crate::ops::warm_binary(
+                                    &[heads, time, 1],
+                                    dtype,
+                                    &[1, time, 1],
+                                    dtype,
+                                    metal_ops::BinOp::Mul,
+                                    false,
+                                )?;
+                            }
+                            _ => return Err("compile: KDA recurrence plan is missing".to_string()),
+                        }
+                        pipeline_count += 1;
+                    }
+                    MetalOp::KdaBackward { scale } => {
+                        let q = &self.values[command.inputs[0].index()];
+                        let v = &self.values[command.inputs[2].index()];
+                        kda::warm_backward(
+                            dtype,
+                            q.shape[q.shape.len() - 1],
+                            v.shape[v.shape.len() - 1],
+                            *scale,
+                        )?;
+                        pipeline_count += 1;
+                    }
+                    MetalOp::ShortConv1d
+                    | MetalOp::ShortConv1dBackwardX
+                    | MetalOp::ShortConv1dBackwardW => {
+                        shortconv::warm_all(dtype)?;
+                        pipeline_count += 3;
+                    }
+                    MetalOp::ConvState { .. } => {
+                        let MetalCommandPlan::ShortConvState(requirements) = command_plan else {
+                            return Err("compile: convolution state plan is missing".to_string());
+                        };
+                        shortconv::warm_forward_exact(requirements)?;
+                        pipeline_count += requirements.pipeline_count;
+                    }
+                    MetalOp::KvAttention { scale, .. } => {
+                        let query = &self.values[command.inputs[0].index()];
+                        pipeline_count +=
+                            crate::paged::warm_all(query.shape[query.shape.len() - 1], *scale)?;
+                    }
+                    MetalOp::RotaryEmbedding {
+                        implementation: MetalImplementation::Native,
+                        ..
+                    }
+                    | MetalOp::RotaryEmbeddingBackward {
+                        implementation: MetalImplementation::Native,
+                        ..
+                    } => {
+                        rotary::warm(dtype)?;
+                        pipeline_count += 1;
+                    }
+                    MetalOp::LayerNorm {
+                        implementation: MetalImplementation::Native,
+                        ..
+                    } => {
+                        layer_norm::warm_forward(dtype)?;
+                        pipeline_count += 1;
+                    }
+                    MetalOp::LayerNormBackward {
+                        implementation: MetalImplementation::Native,
+                        ..
+                    } => {
+                        layer_norm::warm_backward(dtype)?;
+                        let x = &self.values[command.inputs[0].index()];
+                        let weight = &self.values[command.inputs[1].index()];
+                        let gradient = &self.values[command.inputs[2].index()];
+                        crate::ops::warm_binary(
+                            &gradient.shape,
+                            gradient.dtype,
+                            &x.shape,
+                            x.dtype,
+                            metal_ops::BinOp::Mul,
+                            false,
+                        )?;
+                        let dimensions =
+                            (0..x.shape.len() - weight.shape.len()).collect::<Vec<_>>();
+                        crate::ops::warm_reduce(
+                            &x.shape,
+                            x.dtype,
+                            &dimensions,
+                            false,
+                            fusion::ReduceOp::Sum,
+                        )?;
+                        pipeline_count += 1;
+                    }
+                    MetalOp::Unary(kind) => {
+                        let shape = &self.values[command.inputs[0].index()].shape;
+                        let input_dtype = self.values[command.inputs[0].index()].dtype;
+                        match kind {
+                            MetalUnaryOp::Relu if dtype.is_float() => {
+                                crate::kernels::warm_cast(shape, input_dtype, DType::F32)?;
+                                crate::ops::warm_relu(shape, dtype)?;
+                                crate::kernels::warm_cast(shape, DType::F32, input_dtype)?;
+                            }
+                            MetalUnaryOp::Relu => crate::kernels::warm_relu_i64(shape)?,
+                            MetalUnaryOp::Pow { exponent_bits } => {
+                                crate::kernels::warm_cast(shape, input_dtype, DType::F32)?;
+                                crate::ops::warm_pow(shape, *exponent_bits)?;
+                                crate::kernels::warm_cast(shape, DType::F32, input_dtype)?;
+                            }
+                            MetalUnaryOp::Cast { dtype: destination } => {
+                                crate::kernels::warm_cast(shape, input_dtype, *destination)?;
+                            }
+                            kind => crate::ops::warm_unary(
+                                shape,
+                                dtype,
+                                match kind {
+                                    MetalUnaryOp::Neg => metal_ops::UnOp::Neg,
+                                    MetalUnaryOp::Abs => metal_ops::UnOp::Abs,
+                                    MetalUnaryOp::Sqrt => metal_ops::UnOp::Sqrt,
+                                    MetalUnaryOp::Exp => metal_ops::UnOp::Exp,
+                                    MetalUnaryOp::Log => metal_ops::UnOp::Log,
+                                    MetalUnaryOp::Sin => metal_ops::UnOp::Sin,
+                                    MetalUnaryOp::Cos => metal_ops::UnOp::Cos,
+                                    MetalUnaryOp::Tanh => metal_ops::UnOp::Tanh,
+                                    MetalUnaryOp::Erf => metal_ops::UnOp::Erf,
+                                    MetalUnaryOp::Gelu { approximate } => {
+                                        if *approximate {
+                                            metal_ops::UnOp::GeluTanh
+                                        } else {
+                                            metal_ops::UnOp::Gelu
+                                        }
+                                    }
+                                    MetalUnaryOp::Floor => metal_ops::UnOp::Floor,
+                                    MetalUnaryOp::Ceil => metal_ops::UnOp::Ceil,
+                                    MetalUnaryOp::Round => metal_ops::UnOp::Round,
+                                    MetalUnaryOp::Sign => metal_ops::UnOp::Sign,
+                                    MetalUnaryOp::Relu
+                                    | MetalUnaryOp::Pow { .. }
+                                    | MetalUnaryOp::Cast { .. } => unreachable!(),
+                                },
+                            )?,
+                        }
+                        if !matches!(
+                            kind,
+                            MetalUnaryOp::Cast { .. }
+                                | MetalUnaryOp::Relu
+                                | MetalUnaryOp::Pow { .. }
+                        ) {
+                            crate::kernels::warm_cast(shape, input_dtype, DType::F32)?;
+                            crate::kernels::warm_cast(shape, DType::F32, input_dtype)?;
+                        }
+                        pipeline_count += 1;
+                    }
+                    MetalOp::Binary(kind)
+                        if !matches!(
+                            kind,
+                            MetalBinaryOp::Concat { .. } | MetalBinaryOp::Matmul
+                        ) =>
+                    {
+                        let a = &self.values[command.inputs[0].index()];
+                        let b = &self.values[command.inputs[1].index()];
+                        let (operation, compare) = match kind {
+                            MetalBinaryOp::Add => (metal_ops::BinOp::Add, false),
+                            MetalBinaryOp::Sub => (metal_ops::BinOp::Sub, false),
+                            MetalBinaryOp::Mul => (metal_ops::BinOp::Mul, false),
+                            MetalBinaryOp::Div => (metal_ops::BinOp::Div, false),
+                            MetalBinaryOp::Eq => (metal_ops::BinOp::Eq, true),
+                            MetalBinaryOp::Gt => (metal_ops::BinOp::Gt, true),
+                            MetalBinaryOp::Lt => (metal_ops::BinOp::Lt, true),
+                            MetalBinaryOp::Ge => (metal_ops::BinOp::Ge, true),
+                            MetalBinaryOp::Le => (metal_ops::BinOp::Le, true),
+                            MetalBinaryOp::Maximum => (metal_ops::BinOp::Max, false),
+                            MetalBinaryOp::Minimum => (metal_ops::BinOp::Min, false),
+                            MetalBinaryOp::Concat { .. } | MetalBinaryOp::Matmul => unreachable!(),
+                        };
+                        crate::ops::warm_binary(
+                            &a.shape, a.dtype, &b.shape, b.dtype, operation, compare,
+                        )?;
+                        if compare {
+                            crate::kernels::warm_cast(&a.shape, a.dtype, DType::F32)?;
+                            crate::kernels::warm_cast(&b.shape, b.dtype, DType::F32)?;
                             crate::kernels::warm_cast(
                                 &self.values[command.outputs[0].index()].shape,
                                 DType::F32,
-                                a_dtype,
+                                DType::U8,
                             )?;
+                        } else {
+                            let mut a_dtype = a.dtype;
+                            let mut b_dtype = b.dtype;
+                            if a_dtype != b_dtype
+                                && a_dtype.is_float()
+                                && b_dtype.is_float()
+                                && a.shape.is_empty()
+                                && !b.shape.is_empty()
+                            {
+                                crate::kernels::warm_cast(&a.shape, a_dtype, b_dtype)?;
+                                a_dtype = b_dtype;
+                            } else if a_dtype != b_dtype
+                                && a_dtype.is_float()
+                                && b_dtype.is_float()
+                                && b.shape.is_empty()
+                                && !a.shape.is_empty()
+                            {
+                                crate::kernels::warm_cast(&b.shape, b_dtype, a_dtype)?;
+                                b_dtype = a_dtype;
+                            }
+                            if a_dtype != b_dtype || !matches!(a_dtype, DType::F32 | DType::BF16) {
+                                crate::kernels::warm_cast(&a.shape, a_dtype, DType::F32)?;
+                                crate::kernels::warm_cast(&b.shape, b_dtype, DType::F32)?;
+                                crate::kernels::warm_cast(
+                                    &self.values[command.outputs[0].index()].shape,
+                                    DType::F32,
+                                    a_dtype,
+                                )?;
+                            }
                         }
+                        pipeline_count += 1;
                     }
-                    pipeline_count += 1;
-                }
-                MetalOp::Binary(MetalBinaryOp::Matmul) => {
-                    let a = &self.values[command.inputs[0].index()];
-                    let b = &self.values[command.inputs[1].index()];
-                    let ar = a.shape.len();
-                    let br = b.shape.len();
-                    let batch_a = a.shape[..ar - 2].iter().product::<usize>();
-                    let batch_b = b.shape[..br - 2].iter().product::<usize>();
-                    pipeline_count += crate::gemm::warm_gemm_fused(
-                        device::MetalDevice::get(),
-                        a.dtype,
-                        false,
-                        crate::gemm::Epilogue::None,
-                        batch_a.max(batch_b),
-                        a.shape[ar - 2],
-                        b.shape[br - 1],
-                        a.shape[ar - 1],
-                        self.environment.mma,
-                    )?;
-                }
-                MetalOp::Linear {
-                    implementation: MetalImplementation::Native,
-                }
-                | MetalOp::LinearResidual {
-                    implementation: MetalImplementation::Native,
-                }
-                | MetalOp::LinearGelu {
-                    implementation: MetalImplementation::Native,
-                    ..
-                } => {
-                    let x = &self.values[command.inputs[0].index()];
-                    let weight = &self.values[command.inputs[1].index()];
-                    let rank = x.shape.len();
-                    let epilogue = match &command.op {
-                        MetalOp::Linear { .. } => crate::gemm::Epilogue::None,
-                        MetalOp::LinearResidual { .. } => crate::gemm::Epilogue::Residual,
-                        MetalOp::LinearGelu {
-                            approximate: false,
-                            dual: false,
-                            ..
-                        } => crate::gemm::Epilogue::GeluErf,
-                        MetalOp::LinearGelu {
-                            approximate: true,
-                            dual: false,
-                            ..
-                        } => crate::gemm::Epilogue::GeluTanh,
-                        MetalOp::LinearGelu {
-                            approximate: false,
-                            dual: true,
-                            ..
-                        } => crate::gemm::Epilogue::GeluErfDual,
-                        MetalOp::LinearGelu {
-                            approximate: true,
-                            dual: true,
-                            ..
-                        } => crate::gemm::Epilogue::GeluTanhDual,
-                        _ => unreachable!(),
-                    };
-                    pipeline_count += crate::gemm::warm_gemm_fused(
-                        device::MetalDevice::get(),
-                        x.dtype,
-                        true,
-                        epilogue,
-                        x.shape[..rank - 2].iter().product(),
-                        x.shape[rank - 2],
-                        weight.shape[1],
-                        weight.shape[0],
-                        self.environment.mma,
-                    )?;
-                }
-                MetalOp::Where => {
-                    let condition = &self.values[command.inputs[0].index()];
-                    let branch = &self.values[command.inputs[1].index()];
-                    crate::kernels::warm_cast(&condition.shape, condition.dtype, branch.dtype)?;
-                    crate::ops::warm_where(
-                        &self.values[command.inputs[0].index()].shape,
-                        &self.values[command.inputs[1].index()].shape,
-                        &self.values[command.inputs[2].index()].shape,
-                        self.values[command.inputs[1].index()].dtype,
-                    )?;
-                    pipeline_count += 1;
-                }
-                MetalOp::Argmax { dim } | MetalOp::Argmin { dim } => {
-                    let input = &self.values[command.inputs[0].index()];
-                    crate::kernels::warm_argreduce(
-                        &input.shape,
-                        input.dtype,
-                        *dim,
-                        matches!(&command.op, MetalOp::Argmax { .. }),
-                    )?;
-                    crate::kernels::warm_cast(
-                        &self.values[command.outputs[0].index()].shape,
-                        DType::U32,
-                        DType::I64,
-                    )?;
-                    pipeline_count += 2;
-                }
-                MetalOp::Cumsum { dim } => {
-                    let input = &self.values[command.inputs[0].index()];
-                    crate::kernels::warm_cumsum(&input.shape, input.dtype, *dim)?;
-                    pipeline_count += 1;
-                }
-                MetalOp::Gather { dim } => {
-                    let input = &self.values[command.inputs[0].index()];
-                    let indexes = &self.values[command.inputs[1].index()];
-                    crate::indexing::warm_gather_layout(
-                        &declaration_layout(input),
-                        input.dtype,
-                        *dim,
-                        &declaration_layout(indexes),
-                        indexes.dtype,
-                        &indexes.shape,
-                    )?;
-                    pipeline_count += 1;
-                }
-                MetalOp::IndexSelect { dim } => {
-                    let input = &self.values[command.inputs[0].index()];
-                    let indexes = &self.values[command.inputs[1].index()];
-                    crate::indexing::warm_index_select_layout_exact(
-                        &declaration_layout(input),
-                        input.dtype,
-                        *dim,
-                        &declaration_layout(indexes),
-                        indexes.dtype,
-                    )?;
-                    pipeline_count += 1;
-                }
-                MetalOp::ScatterAdd { dim } => {
-                    let input = &self.values[command.inputs[0].index()];
-                    let indexes = &self.values[command.inputs[1].index()];
-                    let source = &self.values[command.inputs[2].index()];
-                    crate::indexing::warm_scatter_add_layouts(
-                        &declaration_layout(input),
-                        input.dtype,
-                        *dim,
-                        &declaration_layout(indexes),
-                        indexes.dtype,
-                        &declaration_layout(source),
-                        source.dtype,
-                    )?;
-                    pipeline_count += 1;
-                }
-                MetalOp::Binary(MetalBinaryOp::Concat { dim }) => {
-                    let a = &self.values[command.inputs[0].index()];
-                    let b = &self.values[command.inputs[1].index()];
-                    crate::indexing::warm_cat(&[&a.shape, &b.shape], a.dtype, *dim)?;
-                    pipeline_count += 1;
-                }
-                MetalOp::Reshape { shape } => {
-                    let input = &self.values[command.inputs[0].index()];
-                    crate::kernels::warm_copy(shape, input.dtype)?;
-                    pipeline_count += usize::from(shape.iter().product::<usize>() != 0);
-                }
-                MetalOp::PositionEmbedding { seq_len } => {
-                    let input = &self.values[command.inputs[0].index()];
-                    let layout = effect_torch_runtime::Layout::contiguous(input.shape.to_vec())
-                        .narrow(0, 0, *seq_len);
-                    crate::kernels::warm_copy_layout(&layout, input.dtype)?;
-                    pipeline_count += usize::from(layout.shape().iter().product::<usize>() != 0);
-                }
-                MetalOp::Permute { dims } => {
-                    let input = &self.values[command.inputs[0].index()];
-                    let layout = effect_torch_runtime::Layout::contiguous(input.shape.to_vec())
-                        .permute(dims);
-                    crate::kernels::warm_copy_layout(&layout, input.dtype)?;
-                    pipeline_count += 1;
-                }
-                MetalOp::BroadcastTo { shape } => {
-                    let input = &self.values[command.inputs[0].index()];
-                    let layout = effect_torch_runtime::Layout::contiguous(input.shape.to_vec())
-                        .broadcast_to(shape);
-                    crate::kernels::warm_copy_layout(&layout, input.dtype)?;
-                    pipeline_count += 1;
-                }
-                MetalOp::Slice { ranges } => {
-                    let input = &self.values[command.inputs[0].index()];
-                    let mut layout = effect_torch_runtime::Layout::contiguous(input.shape.to_vec());
-                    let mut empty = false;
-                    for (dimension, &(start, stop, stride)) in ranges.iter().enumerate() {
-                        let length = stop.saturating_sub(start).div_ceil(stride);
-                        if length == 0 {
-                            empty = true;
-                            break;
-                        }
-                        layout = layout.narrow(dimension, start, (length - 1) * stride + 1);
-                        if stride > 1 {
-                            let mut shape = layout.shape().to_vec();
-                            let mut strides = layout.strides().to_vec();
-                            strides[dimension] = strides[dimension]
-                                .checked_mul(stride)
-                                .ok_or_else(|| "compile: slice stride overflow".to_string())?;
-                            shape[dimension] = length;
-                            layout =
-                                effect_torch_runtime::Layout::new(shape, strides, layout.offset());
-                        }
+                    MetalOp::Binary(MetalBinaryOp::Matmul) => {
+                        let a = &self.values[command.inputs[0].index()];
+                        let b = &self.values[command.inputs[1].index()];
+                        let ar = a.shape.len();
+                        let br = b.shape.len();
+                        let batch_a = a.shape[..ar - 2].iter().product::<usize>();
+                        let batch_b = b.shape[..br - 2].iter().product::<usize>();
+                        pipeline_count += crate::gemm::warm_gemm_fused(
+                            device::MetalDevice::get(),
+                            a.dtype,
+                            false,
+                            crate::gemm::Epilogue::None,
+                            batch_a.max(batch_b),
+                            a.shape[ar - 2],
+                            b.shape[br - 1],
+                            a.shape[ar - 1],
+                            self.environment.mma,
+                        )?;
                     }
-                    if !empty {
+                    MetalOp::Linear {
+                        implementation: MetalImplementation::Native,
+                    }
+                    | MetalOp::LinearResidual {
+                        implementation: MetalImplementation::Native,
+                    }
+                    | MetalOp::LinearGelu {
+                        implementation: MetalImplementation::Native,
+                        ..
+                    } => {
+                        let x = &self.values[command.inputs[0].index()];
+                        let weight = &self.values[command.inputs[1].index()];
+                        let rank = x.shape.len();
+                        let epilogue = match op {
+                            MetalOp::Linear { .. } => crate::gemm::Epilogue::None,
+                            MetalOp::LinearResidual { .. } => crate::gemm::Epilogue::Residual,
+                            MetalOp::LinearGelu {
+                                approximate: false,
+                                dual: false,
+                                ..
+                            } => crate::gemm::Epilogue::GeluErf,
+                            MetalOp::LinearGelu {
+                                approximate: true,
+                                dual: false,
+                                ..
+                            } => crate::gemm::Epilogue::GeluTanh,
+                            MetalOp::LinearGelu {
+                                approximate: false,
+                                dual: true,
+                                ..
+                            } => crate::gemm::Epilogue::GeluErfDual,
+                            MetalOp::LinearGelu {
+                                approximate: true,
+                                dual: true,
+                                ..
+                            } => crate::gemm::Epilogue::GeluTanhDual,
+                            _ => unreachable!(),
+                        };
+                        pipeline_count += crate::gemm::warm_gemm_fused(
+                            device::MetalDevice::get(),
+                            x.dtype,
+                            true,
+                            epilogue,
+                            x.shape[..rank - 2].iter().product(),
+                            x.shape[rank - 2],
+                            weight.shape[1],
+                            weight.shape[0],
+                            self.environment.mma,
+                        )?;
+                    }
+                    MetalOp::Where => {
+                        let condition = &self.values[command.inputs[0].index()];
+                        let branch = &self.values[command.inputs[1].index()];
+                        crate::kernels::warm_cast(&condition.shape, condition.dtype, branch.dtype)?;
+                        crate::ops::warm_where(
+                            &self.values[command.inputs[0].index()].shape,
+                            &self.values[command.inputs[1].index()].shape,
+                            &self.values[command.inputs[2].index()].shape,
+                            self.values[command.inputs[1].index()].dtype,
+                        )?;
+                        pipeline_count += 1;
+                    }
+                    MetalOp::Argmax { dim } | MetalOp::Argmin { dim } => {
+                        let input = &self.values[command.inputs[0].index()];
+                        crate::kernels::warm_argreduce(
+                            &input.shape,
+                            input.dtype,
+                            *dim,
+                            matches!(op, MetalOp::Argmax { .. }),
+                        )?;
+                        crate::kernels::warm_cast(
+                            &self.values[command.outputs[0].index()].shape,
+                            DType::U32,
+                            DType::I64,
+                        )?;
+                        pipeline_count += 2;
+                    }
+                    MetalOp::Cumsum { dim } => {
+                        let input = &self.values[command.inputs[0].index()];
+                        crate::kernels::warm_cumsum(&input.shape, input.dtype, *dim)?;
+                        pipeline_count += 1;
+                    }
+                    MetalOp::Gather { dim } => {
+                        let input = &self.values[command.inputs[0].index()];
+                        let indexes = &self.values[command.inputs[1].index()];
+                        crate::indexing::warm_gather_layout(
+                            &declaration_layout(input),
+                            input.dtype,
+                            *dim,
+                            &declaration_layout(indexes),
+                            indexes.dtype,
+                            &indexes.shape,
+                        )?;
+                        pipeline_count += 1;
+                    }
+                    MetalOp::IndexSelect { dim } => {
+                        let input = &self.values[command.inputs[0].index()];
+                        let indexes = &self.values[command.inputs[1].index()];
+                        crate::indexing::warm_index_select_layout_exact(
+                            &declaration_layout(input),
+                            input.dtype,
+                            *dim,
+                            &declaration_layout(indexes),
+                            indexes.dtype,
+                        )?;
+                        pipeline_count += 1;
+                    }
+                    MetalOp::ScatterAdd { dim } => {
+                        let input = &self.values[command.inputs[0].index()];
+                        let indexes = &self.values[command.inputs[1].index()];
+                        let source = &self.values[command.inputs[2].index()];
+                        crate::indexing::warm_scatter_add_layouts(
+                            &declaration_layout(input),
+                            input.dtype,
+                            *dim,
+                            &declaration_layout(indexes),
+                            indexes.dtype,
+                            &declaration_layout(source),
+                            source.dtype,
+                        )?;
+                        pipeline_count += 1;
+                    }
+                    MetalOp::Binary(MetalBinaryOp::Concat { dim }) => {
+                        let a = &self.values[command.inputs[0].index()];
+                        let b = &self.values[command.inputs[1].index()];
+                        crate::indexing::warm_cat(&[&a.shape, &b.shape], a.dtype, *dim)?;
+                        pipeline_count += 1;
+                    }
+                    MetalOp::Reshape { shape } => {
+                        let input = &self.values[command.inputs[0].index()];
+                        crate::kernels::warm_copy(shape, input.dtype)?;
+                        pipeline_count += usize::from(shape.iter().product::<usize>() != 0);
+                    }
+                    MetalOp::PositionEmbedding { seq_len } => {
+                        let input = &self.values[command.inputs[0].index()];
+                        let layout = effect_torch_runtime::Layout::contiguous(input.shape.to_vec())
+                            .narrow(0, 0, *seq_len);
                         crate::kernels::warm_copy_layout(&layout, input.dtype)?;
-                        pipeline_count += usize::from(layout.numel() != 0);
+                        pipeline_count +=
+                            usize::from(layout.shape().iter().product::<usize>() != 0);
                     }
+                    MetalOp::Permute { dims } => {
+                        let input = &self.values[command.inputs[0].index()];
+                        let layout = effect_torch_runtime::Layout::contiguous(input.shape.to_vec())
+                            .permute(dims);
+                        crate::kernels::warm_copy_layout(&layout, input.dtype)?;
+                        pipeline_count += 1;
+                    }
+                    MetalOp::BroadcastTo { shape } => {
+                        let input = &self.values[command.inputs[0].index()];
+                        let layout = effect_torch_runtime::Layout::contiguous(input.shape.to_vec())
+                            .broadcast_to(shape);
+                        crate::kernels::warm_copy_layout(&layout, input.dtype)?;
+                        pipeline_count += 1;
+                    }
+                    MetalOp::Slice { ranges } => {
+                        let input = &self.values[command.inputs[0].index()];
+                        let mut layout =
+                            effect_torch_runtime::Layout::contiguous(input.shape.to_vec());
+                        let mut empty = false;
+                        for (dimension, &(start, stop, stride)) in ranges.iter().enumerate() {
+                            let length = stop.saturating_sub(start).div_ceil(stride);
+                            if length == 0 {
+                                empty = true;
+                                break;
+                            }
+                            layout = layout.narrow(dimension, start, (length - 1) * stride + 1);
+                            if stride > 1 {
+                                let mut shape = layout.shape().to_vec();
+                                let mut strides = layout.strides().to_vec();
+                                strides[dimension] = strides[dimension]
+                                    .checked_mul(stride)
+                                    .ok_or_else(|| "compile: slice stride overflow".to_string())?;
+                                shape[dimension] = length;
+                                layout = effect_torch_runtime::Layout::new(
+                                    shape,
+                                    strides,
+                                    layout.offset(),
+                                );
+                            }
+                        }
+                        if !empty {
+                            crate::kernels::warm_copy_layout(&layout, input.dtype)?;
+                            pipeline_count += usize::from(layout.numel() != 0);
+                        }
+                    }
+                    MetalOp::Reduce { op, dims, keepdims } => {
+                        let input = &self.values[command.inputs[0].index()];
+                        let output = &self.values[command.outputs[0].index()];
+                        crate::kernels::warm_cast(&input.shape, input.dtype, DType::F32)?;
+                        crate::ops::warm_reduce(
+                            &input.shape,
+                            input.dtype,
+                            dims,
+                            *keepdims,
+                            match op {
+                                MetalReduceOp::Sum => fusion::ReduceOp::Sum,
+                                MetalReduceOp::Mean => fusion::ReduceOp::Mean,
+                                MetalReduceOp::Max => fusion::ReduceOp::Max,
+                                MetalReduceOp::Min => fusion::ReduceOp::Min,
+                                MetalReduceOp::Prod => fusion::ReduceOp::Prod,
+                            },
+                        )?;
+                        crate::kernels::warm_cast(&output.shape, DType::F32, output.dtype)?;
+                        pipeline_count += 1;
+                    }
+                    MetalOp::Conv1d {
+                        stride,
+                        padding,
+                        dilation,
+                        groups,
+                    } => {
+                        let requirements = conv_plan(command_plan)?;
+                        crate::conv::warm_conv1d(
+                            &self.values[command.inputs[0].index()].shape,
+                            &self.values[command.inputs[1].index()].shape,
+                            *stride,
+                            *padding,
+                            *dilation,
+                            *groups,
+                        )?;
+                        pipeline_count += requirements.pipeline_count;
+                    }
+                    MetalOp::Conv2d {
+                        stride,
+                        padding,
+                        dilation,
+                        groups,
+                    } => {
+                        let requirements = conv_plan(command_plan)?;
+                        crate::conv::warm_conv2d(
+                            &self.values[command.inputs[0].index()].shape,
+                            &self.values[command.inputs[1].index()].shape,
+                            *stride,
+                            *padding,
+                            *dilation,
+                            *groups,
+                        )?;
+                        pipeline_count += requirements.pipeline_count;
+                    }
+                    MetalOp::ConvTranspose1d {
+                        stride,
+                        padding,
+                        output_padding,
+                        dilation,
+                        groups,
+                    } => {
+                        let requirements = conv_plan(command_plan)?;
+                        crate::conv::warm_conv_transpose1d(
+                            &self.values[command.inputs[0].index()].shape,
+                            &self.values[command.inputs[1].index()].shape,
+                            *stride,
+                            *padding,
+                            *output_padding,
+                            *dilation,
+                            *groups,
+                        )?;
+                        pipeline_count += requirements.pipeline_count;
+                    }
+                    MetalOp::ConvTranspose2d {
+                        stride,
+                        padding,
+                        output_padding,
+                        dilation,
+                        groups,
+                    } => {
+                        let requirements = conv_plan(command_plan)?;
+                        crate::conv::warm_conv_transpose2d(
+                            &self.values[command.inputs[0].index()].shape,
+                            &self.values[command.inputs[1].index()].shape,
+                            *stride,
+                            *padding,
+                            *output_padding,
+                            *dilation,
+                            *groups,
+                        )?;
+                        pipeline_count += requirements.pipeline_count;
+                    }
+                    MetalOp::Conv1dBackwardW {
+                        kernel,
+                        out_channels,
+                        stride,
+                        padding,
+                        dilation,
+                        groups,
+                    } => {
+                        let requirements = conv_plan(command_plan)?;
+                        let mut x = self.values[command.inputs[0].index()].shape.to_vec();
+                        let mut gradient = self.values[command.inputs[1].index()].shape.to_vec();
+                        x.push(1);
+                        gradient.push(1);
+                        crate::conv::warm_conv2d_backward_w(
+                            &x,
+                            &gradient,
+                            [*kernel, 1],
+                            *out_channels,
+                            *stride,
+                            *padding,
+                            *dilation,
+                            *groups,
+                        )?;
+                        pipeline_count += requirements.pipeline_count;
+                    }
+                    MetalOp::Conv2dBackwardW {
+                        kernel,
+                        out_channels,
+                        stride,
+                        padding,
+                        dilation,
+                        groups,
+                    } => {
+                        let requirements = conv_plan(command_plan)?;
+                        crate::conv::warm_conv2d_backward_w(
+                            &self.values[command.inputs[0].index()].shape,
+                            &self.values[command.inputs[1].index()].shape,
+                            *kernel,
+                            *out_channels,
+                            *stride,
+                            *padding,
+                            *dilation,
+                            *groups,
+                        )?;
+                        pipeline_count += requirements.pipeline_count;
+                    }
+                    _ => {}
                 }
-                MetalOp::Reduce { op, dims, keepdims } => {
-                    let input = &self.values[command.inputs[0].index()];
-                    let output = &self.values[command.outputs[0].index()];
-                    crate::kernels::warm_cast(&input.shape, input.dtype, DType::F32)?;
-                    crate::ops::warm_reduce(
-                        &input.shape,
-                        input.dtype,
-                        dims,
-                        *keepdims,
-                        match op {
-                            MetalReduceOp::Sum => fusion::ReduceOp::Sum,
-                            MetalReduceOp::Mean => fusion::ReduceOp::Mean,
-                            MetalReduceOp::Max => fusion::ReduceOp::Max,
-                            MetalReduceOp::Min => fusion::ReduceOp::Min,
-                            MetalReduceOp::Prod => fusion::ReduceOp::Prod,
-                        },
-                    )?;
-                    crate::kernels::warm_cast(&output.shape, DType::F32, output.dtype)?;
-                    pipeline_count += 1;
-                }
-                MetalOp::Conv1d {
-                    stride,
-                    padding,
-                    dilation,
-                    groups,
-                } => {
-                    let requirements = conv_plan(&command.plan)?;
-                    crate::conv::warm_conv1d(
-                        &self.values[command.inputs[0].index()].shape,
-                        &self.values[command.inputs[1].index()].shape,
-                        *stride,
-                        *padding,
-                        *dilation,
-                        *groups,
-                    )?;
-                    pipeline_count += requirements.pipeline_count;
-                }
-                MetalOp::Conv2d {
-                    stride,
-                    padding,
-                    dilation,
-                    groups,
-                } => {
-                    let requirements = conv_plan(&command.plan)?;
-                    crate::conv::warm_conv2d(
-                        &self.values[command.inputs[0].index()].shape,
-                        &self.values[command.inputs[1].index()].shape,
-                        *stride,
-                        *padding,
-                        *dilation,
-                        *groups,
-                    )?;
-                    pipeline_count += requirements.pipeline_count;
-                }
-                MetalOp::ConvTranspose1d {
-                    stride,
-                    padding,
-                    output_padding,
-                    dilation,
-                    groups,
-                } => {
-                    let requirements = conv_plan(&command.plan)?;
-                    crate::conv::warm_conv_transpose1d(
-                        &self.values[command.inputs[0].index()].shape,
-                        &self.values[command.inputs[1].index()].shape,
-                        *stride,
-                        *padding,
-                        *output_padding,
-                        *dilation,
-                        *groups,
-                    )?;
-                    pipeline_count += requirements.pipeline_count;
-                }
-                MetalOp::ConvTranspose2d {
-                    stride,
-                    padding,
-                    output_padding,
-                    dilation,
-                    groups,
-                } => {
-                    let requirements = conv_plan(&command.plan)?;
-                    crate::conv::warm_conv_transpose2d(
-                        &self.values[command.inputs[0].index()].shape,
-                        &self.values[command.inputs[1].index()].shape,
-                        *stride,
-                        *padding,
-                        *output_padding,
-                        *dilation,
-                        *groups,
-                    )?;
-                    pipeline_count += requirements.pipeline_count;
-                }
-                MetalOp::Conv1dBackwardW {
-                    kernel,
-                    out_channels,
-                    stride,
-                    padding,
-                    dilation,
-                    groups,
-                } => {
-                    let requirements = conv_plan(&command.plan)?;
-                    let mut x = self.values[command.inputs[0].index()].shape.to_vec();
-                    let mut gradient = self.values[command.inputs[1].index()].shape.to_vec();
-                    x.push(1);
-                    gradient.push(1);
-                    crate::conv::warm_conv2d_backward_w(
-                        &x,
-                        &gradient,
-                        [*kernel, 1],
-                        *out_channels,
-                        *stride,
-                        *padding,
-                        *dilation,
-                        *groups,
-                    )?;
-                    pipeline_count += requirements.pipeline_count;
-                }
-                MetalOp::Conv2dBackwardW {
-                    kernel,
-                    out_channels,
-                    stride,
-                    padding,
-                    dilation,
-                    groups,
-                } => {
-                    let requirements = conv_plan(&command.plan)?;
-                    crate::conv::warm_conv2d_backward_w(
-                        &self.values[command.inputs[0].index()].shape,
-                        &self.values[command.inputs[1].index()].shape,
-                        *kernel,
-                        *out_channels,
-                        *stride,
-                        *padding,
-                        *dilation,
-                        *groups,
-                    )?;
-                    pipeline_count += requirements.pipeline_count;
-                }
-                _ => {}
             }
-        }
+            Ok(pipeline_count)
+        })?;
+        let command_count = physical
+            .iter()
+            .filter(|command| matches!(command, MetalPhysicalCommand::Encode(_)))
+            .count();
+        let synchronization_count = physical
+            .iter()
+            .filter(|command| matches!(command, MetalPhysicalCommand::Complete))
+            .count();
         let diagnostics = build_executable_diagnostics(
-            &schedule,
+            &program,
             &memory,
+            &driver.prepared().index,
             DiagnosticsInput {
-                semantic_nodes_before_optimization,
-                semantic_nodes_after_optimization: self.node_values.len(),
                 pipeline_count,
-                command_count: self.commands.len(),
-                synchronization_count: 1,
+                command_count,
+                synchronization_count,
                 ..DiagnosticsInput::default()
             },
-            |kind| kind.clone(),
+            MetalInstruction::name,
         );
         Ok((
             MetalExecutable {
-                values: self.values.into_boxed_slice(),
+                signature: driver.prepared().signature.clone(),
+                program,
+                physical: physical.into_boxed_slice(),
+                prepared: MetalPreparedArtifacts { pipeline_count },
                 bindings: self.bindings.into_boxed_slice(),
                 scalar_bindings: self.scalar_bindings.into_boxed_slice(),
                 padded_bindings: self.padded_bindings.into_boxed_slice(),
                 constants: self.constants.into_boxed_slice(),
-                commands: self.commands.into_boxed_slice(),
-                outputs: outputs.into_boxed_slice(),
                 options: self.options,
                 environment: self.environment,
                 state_schema: self.state_schema,
                 memory,
                 diagnostics,
+                compiler_work: CompilerWorkReport::default(),
                 last_invocation_memory: Mutex::new(None),
+                state_cursor: self.state_cursor,
             },
             self.generated,
-            self.generated_slots,
+            self.generated_order,
         ))
     }
+}
+
+fn validate_generated_binding_metadata<'a>(
+    index: &'a GraphIndex,
+    binding: &GeneratedBinding,
+) -> Result<&'a Arc<Node>, String> {
+    let node = index.node(binding.node).ok_or_else(|| {
+        format!(
+            "compile: generated binding {} references an unknown dense node",
+            binding.node_id
+        )
+    })?;
+    if node.id != binding.node_id || index.dense_id(binding.node_id) != Some(binding.node) {
+        return Err(format!(
+            "compile: generated binding {} has inconsistent node identity",
+            binding.node_id
+        ));
+    }
+    let NodeKind::Leaf(slot) = &node.kind else {
+        return Err(format!(
+            "compile: generated binding {} does not reference a leaf",
+            binding.node_id
+        ));
+    };
+    if Arc::as_ptr(slot) as usize != binding.slot_identity {
+        return Err(format!(
+            "compile: generated binding {} has inconsistent slot identity",
+            binding.node_id
+        ));
+    }
+    if node.shape != binding.shape
+        || node.dtype != binding.dtype
+        || !node.device.same_device(&binding.device)
+        || !binding.device.is_metal()
+    {
+        return Err(format!(
+            "compile: generated binding {} has inconsistent indexed metadata",
+            binding.node_id
+        ));
+    }
+    Ok(node)
+}
+
+fn validate_generated_binding_value(
+    binding: &GeneratedBinding,
+    payload: &Value,
+) -> Result<(), String> {
+    if payload.shape() != binding.shape
+        || payload.dtype() != binding.dtype
+        || !payload.device().same_device(&binding.device)
+        || !payload.device().is_metal()
+    {
+        return Err(format!(
+            "compile: generated binding {} changed shape, dtype, or device",
+            binding.node_id
+        ));
+    }
+    let tensor = payload.as_metal().map_err(|error| {
+        format!(
+            "compile: generated binding {} is not a Metal value: {error}",
+            binding.node_id
+        )
+    })?;
+    if !tensor.layout.is_contiguous() || tensor.layout.offset() != 0 {
+        return Err(format!(
+            "compile: generated binding {} must be zero-offset contiguous",
+            binding.node_id
+        ));
+    }
+    let bytes = tensor
+        .layout
+        .checked_byte_size(payload.dtype())
+        .ok_or_else(|| {
+            format!(
+                "compile: generated binding {} has an overflowing layout",
+                binding.node_id
+            )
+        })?;
+    if bytes > tensor.buffer.size {
+        return Err(format!(
+            "compile: generated binding {} exceeds its Metal buffer",
+            binding.node_id
+        ));
+    }
+    Ok(())
+}
+
+fn validate_prepared_generated_bindings(
+    index: &GraphIndex,
+    generated_bindings: &[Value],
+) -> Result<(), String> {
+    if generated_bindings.len() != index.leaves.len() {
+        return Err(format!(
+            "compile: prepared index declares {} generated bindings, got {} values",
+            index.leaves.len(),
+            generated_bindings.len()
+        ));
+    }
+    for (binding, payload) in index.leaves.iter().zip(generated_bindings) {
+        validate_generated_binding_metadata(index, binding)?;
+        validate_generated_binding_value(binding, payload)?;
+    }
+    Ok(())
+}
+
+/// Loads one immutable value snapshot for each generated leaf in semantic order.
+pub(super) fn load_generated_bindings(index: &GraphIndex) -> Result<Vec<Value>, String> {
+    if index.order.iter().any(|node| !node.device.is_metal())
+        || index.slots.iter().any(|slot| !slot.device.is_metal())
+    {
+        return Err("compile: graph contains an unsupported device".to_string());
+    }
+    index
+        .leaves
+        .iter()
+        .map(|binding| {
+            let node = validate_generated_binding_metadata(index, binding)?;
+            let NodeKind::Leaf(slot) = &node.kind else {
+                unreachable!("generated binding metadata validation requires a leaf")
+            };
+            let payload = slot.get::<Value>().map_err(|error| {
+                format!("compile: generated binding {}: {error}", binding.node_id)
+            })?;
+            validate_generated_binding_value(binding, &payload)?;
+            Ok(payload)
+        })
+        .collect()
 }
 
 fn validate_metal_support(node: &Node) -> Result<(), String> {
@@ -4168,28 +4821,6 @@ fn validate_metal_support(node: &Node) -> Result<(), String> {
                 x.dtype
             ))
         }
-        NodeKind::FusedElementwise {
-            inputs, expr: _, ..
-        }
-        | NodeKind::FusedElementwiseMulti { inputs, .. }
-        | NodeKind::FusedReduce { inputs, .. }
-            if inputs.is_empty() =>
-        {
-            Err("compile: fused Metal operation requires at least one input".to_string())
-        }
-        NodeKind::FusedElementwise { inputs, .. }
-        | NodeKind::FusedElementwiseMulti { inputs, .. }
-        | NodeKind::FusedReduce { inputs, .. }
-            if !matches!(inputs[0].dtype, DType::F32 | DType::BF16) =>
-        {
-            Err(format!(
-                "compile: fused operation does not support Metal dtype {}",
-                inputs[0].dtype
-            ))
-        }
-        NodeKind::AdamWStepGroup { params, .. } if params.is_empty() => {
-            Err("compile: grouped AdamW requires at least one parameter".to_string())
-        }
         _ => Ok(()),
     }
 }
@@ -4204,55 +4835,123 @@ pub(super) fn compile(
     compile_with_state(roots, options, ce_chunk_size, environment, None)
 }
 
+#[cfg(test)]
 pub(super) fn compile_with_state(
     roots: &[Arc<Node>],
-    options: CompileOptions,
+    mut options: CompileOptions,
     ce_chunk_size: usize,
     environment: MetalEnvironment,
     state_schema: Option<KvStateSchema>,
 ) -> Result<MetalCompilation, String> {
+    options.environment.ce_chunk_size = ce_chunk_size;
+    options.environment.metal_private_intermediates = environment.private_intermediates;
+    options.environment.metal_mma = environment.mma;
+    let mut request = ProgramRequest::from_roots(roots.to_vec(), options);
+    if let Some(schema) = state_schema {
+        request = request.with_state_cursor(StateCursorSlot::new(
+            schema.cursor_slot,
+            schema.cursor_tensor,
+        ));
+    }
+    let program = request.prepare()?;
+    let generated_bindings = load_generated_bindings(&program.index)?;
+    compile_prepared_with_state(&program, &generated_bindings, state_schema)
+}
+
+pub(super) fn compile_prepared_with_state(
+    program: &PreparedProgram,
+    generated_bindings: &[Value],
+    state_schema: Option<KvStateSchema>,
+) -> Result<MetalCompilation, String> {
     device::snapshot_global_environment();
-    if roots.is_empty() {
+    let index = &program.index;
+    let options = program.options.clone();
+    let ce_chunk_size = options.environment.ce_chunk_size;
+    let environment = options.environment.into();
+    if index.roots.is_empty() {
         return Err("compile: expected at least one root".to_string());
     }
     if ce_chunk_size == 0 {
         return Err("compile: CE chunk size must be positive".to_string());
     }
+    let state_cursor =
+        state_schema.map(|schema| StateCursorSlot::new(schema.cursor_slot, schema.cursor_tensor));
+    if program.state_cursor != state_cursor {
+        return Err("compile: Metal state cursor does not match the prepared program".to_string());
+    }
     if let Some(schema) = &state_schema {
         schema.validate()?;
     }
-    let semantic_nodes_before_optimization = graph_post_order(roots).len();
-    let optimized = fuse_roots_with_options(roots, &options)?;
-    let (slots, _) = effect_torch_compiler::collect_program_slots(&optimized)?;
-    if slots.iter().any(|slot| !slot.device.is_metal()) {
+    validate_prepared_generated_bindings(index, generated_bindings)?;
+    let mut driver = CompilerDriver::new(program)?;
+    let slots = index.slots.to_vec();
+    if index.order.iter().any(|node| !node.device.is_metal())
+        || slots.iter().any(|slot| !slot.device.is_metal())
+    {
         return Err("compile: graph contains an unsupported device".to_string());
     }
-    let order = graph_post_order(&optimized);
     // Constructor constants lowered below dispatch Metal kernels. Their
     // submission is owned and drained before the artifact can be published or
     // moved to another NAPI worker.
     let metal = device::MetalDevice::get();
+    let compile_submission_started = Instant::now();
     let _compile_submission = metal.begin_submission()?;
-    let mut lowerer = Lowerer::new(options, ce_chunk_size, environment, state_schema, &slots);
+    let mut lowerer = Lowerer::new(
+        index,
+        generated_bindings,
+        options,
+        ce_chunk_size,
+        environment,
+        state_schema,
+        &slots,
+    );
     let lowering_result = (|| {
-        for node in &order {
-            lowerer.lower(node)?;
-        }
-        let outputs = optimized
+        driver.lower(|unit, index, plan| {
+            match unit {
+                LoweringUnit::Node(node) => {
+                    let semantic = index
+                        .node(node)
+                        .ok_or_else(|| format!("compile: dense node {node} is out of range"))?;
+                    lowerer.lower(semantic)?;
+                }
+                LoweringUnit::Region(region) => lowerer.lower_region(index, plan, region)?,
+            }
+            Ok(())
+        })?;
+        let outputs = index
+            .roots
             .iter()
-            .map(|root| lowerer.child_value(root))
+            .map(|root| lowerer.dense_value(index, *root))
             .collect::<Result<Vec<_>, _>>()?;
-        lowerer.finish(outputs, semantic_nodes_before_optimization)
+        let artifact_assembly_started = Instant::now();
+        let artifact = lowerer.finish(outputs, &mut driver);
+        driver.record_phase(ARTIFACT_ASSEMBLY_PHASE, artifact_assembly_started.elapsed());
+        artifact
     })();
     let gpu_result = metal.synchronize();
+    driver.record_phase(
+        COMPILE_SUBMISSION_PHASE,
+        compile_submission_started.elapsed(),
+    );
     gpu_result?;
-    let (executable, generated_bindings, generated_slots) = lowering_result?;
-    Ok(MetalCompilation {
+    let (executable, generated_bindings, generated_order) = lowering_result?;
+    let publication_started = Instant::now();
+    let mut compilation = MetalCompilation {
         executable: Arc::new(executable),
         slots,
         generated_bindings,
-        generated_slots,
-    })
+        generated_order,
+    };
+    let compiler_work = driver.finish_with_phase(
+        &compilation.executable.program,
+        PUBLICATION_PHASE,
+        publication_started,
+    );
+    let executable = Arc::get_mut(&mut compilation.executable)
+        .expect("newly published Metal executable must be uniquely owned");
+    executable.diagnostics.compile_phases = compiler_work.compile_phases.clone();
+    executable.compiler_work = compiler_work;
+    Ok(compilation)
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -4315,8 +5014,11 @@ fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
     }
 }
 
-fn resolved_values(ids: &[ValueId], resolved: &[Option<Value>]) -> Result<Vec<Value>, String> {
-    ids.iter()
+fn resolved_values(
+    ids: impl IntoIterator<Item = ValueId>,
+    resolved: &[Option<Value>],
+) -> Result<Vec<Value>, String> {
+    ids.into_iter()
         .map(|value| {
             resolved
                 .get(value.index())
@@ -4325,6 +5027,21 @@ fn resolved_values(ids: &[ValueId], resolved: &[Option<Value>]) -> Result<Vec<Va
                 .ok_or_else(|| format!("Metal executable value {value} was not resolved"))
         })
         .collect()
+}
+
+fn resolve_physical_instruction<'a>(
+    executable: &'a MetalExecutable,
+    id: InstructionId,
+) -> Result<&'a MetalCommand, String> {
+    let instruction = executable
+        .instruction(id)
+        .ok_or_else(|| format!("execute: physical instruction {id} is out of range"))?;
+    if instruction.kind.operation().is_none() {
+        return Err(format!(
+            "execute: physical instruction {id} does not resolve to an operation"
+        ));
+    }
+    Ok(instruction)
 }
 
 fn pack_optimizer_scalars(
@@ -4494,11 +5211,19 @@ fn commit_state_transactions(
         .collect::<Result<Vec<_>, _>>()?;
     let mut copies = Vec::new();
     let mut eviction_starts = vec![0usize; states.len()];
-    for command in &executable.commands {
-        match &command.op {
+    for physical in &executable.physical {
+        let MetalPhysicalCommand::Encode(id) = *physical else {
+            continue;
+        };
+        let command = resolve_physical_instruction(executable, id)?;
+        let (op, _) = command
+            .kind
+            .operation()
+            .expect("resolved physical instruction is an operation");
+        match op {
             MetalOp::KdaRecurrence { layer, .. } => {
                 let root = resolved
-                    .get(command.scratch[0].index())
+                    .get(command.state[0].index())
                     .and_then(Option::as_ref)
                     .ok_or_else(|| "KDA state transaction is unresolved".to_string())?
                     .as_metal()?;
@@ -4525,7 +5250,7 @@ fn commit_state_transactions(
             }
             MetalOp::ConvState { layer } => {
                 let root = resolved
-                    .get(command.scratch[0].index())
+                    .get(command.state[0].index())
                     .and_then(Option::as_ref)
                     .ok_or_else(|| "conv state transaction is unresolved".to_string())?
                     .as_metal()?;
@@ -4794,15 +5519,31 @@ fn execute_with_commit(
         (None, Some(_)) => return Err("stateless executable received decode state".to_string()),
         (None, None) => {}
     }
-    if scalar_bindings.len() != executable.scalar_bindings.len() {
-        return Err(format!(
-            "executable expected {} scalar bindings, got {}",
-            executable.scalar_bindings.len(),
-            scalar_bindings.len()
-        ));
+    executable
+        .signature
+        .validate_invocation_counts(
+            declared_bindings.len(),
+            scalar_bindings.len(),
+            usize::from(executable.state_cursor.is_some() && kv.is_some()),
+            None,
+        )
+        .map_err(|error| format!("execute: {error}"))?;
+    for (index, value) in declared_bindings.iter().enumerate() {
+        if executable
+            .padded_bindings
+            .iter()
+            .any(|binding| binding.source as usize == index)
+        {
+            continue;
+        }
+        let tensor = value.as_metal()?;
+        executable
+            .signature
+            .validate_binding_metadata(index, value.dtype(), tensor.placement(), &tensor.layout)
+            .map_err(|error| format!("execute: {error}"))?;
     }
     let mut values: Vec<Option<Value>> = std::iter::repeat_with(|| None)
-        .take(executable.values.len())
+        .take(executable.program.values.len())
         .collect();
     for constant in &executable.constants {
         values[constant.value.index()] = Some(constant.payload.clone());
@@ -4816,7 +5557,7 @@ fn execute_with_commit(
                 .get(slot as usize)
                 .ok_or_else(|| format!("generated input slot {slot} is unbound"))?,
         };
-        let declaration = &executable.values[binding.value.index()];
+        let declaration = &executable.program.values[binding.value.index()];
         if source.shape() != declaration.shape.as_ref() || source.dtype() != declaration.dtype {
             return Err(format!(
                 "binding for value {} does not match its compiled signature",
@@ -4859,6 +5600,7 @@ fn execute_with_commit(
     let mut resolved = values;
     for (index, location) in executable.memory.locations.iter().enumerate() {
         let declaration = executable
+            .program
             .values
             .get(index)
             .ok_or_else(|| format!("Metal location {index} has no value declaration"))?;
@@ -4880,7 +5622,7 @@ fn execute_with_commit(
                         *bytes,
                         resources.retentions[segment.index()].clone(),
                     )),
-                    layout: effect_torch_runtime::Layout::contiguous(declaration.shape.to_vec()),
+                    layout: declaration.layout.clone(),
                     dtype: declaration.dtype,
                 }))
             }
@@ -4897,7 +5639,7 @@ fn execute_with_commit(
                         *byte_offset,
                         bytes,
                     )),
-                    layout: effect_torch_runtime::Layout::contiguous(declaration.shape.to_vec()),
+                    layout: declaration.layout.clone(),
                     dtype: declaration.dtype,
                 }))
             }
@@ -4948,44 +5690,114 @@ fn execute_with_commit(
             executable.environment.private_intermediates,
             executable.environment.mma,
             || {
-                for (command_index, command) in executable.commands.iter().enumerate() {
-                    if cancelled.load(Ordering::Relaxed) {
-                        return Err("operation aborted".to_string());
+                let mut last_encoded = None;
+                let mut pending_status_gate = None;
+                let mut completed = false;
+                for physical in &executable.physical {
+                    if completed {
+                        return Err("physical completion is not final".to_string());
                     }
-                    let inputs = resolved_values(&command.inputs, &resolved)?;
-                    let outputs = resolved_values(&command.outputs, &resolved)?;
-                    let scratch = resolved_values(&command.scratch, &resolved)?;
-                    let staging = resolved_values(&command.staging, &resolved)?;
-                    let status = resolved_values(&command.status, &resolved)?;
-                    if let MetalOp::KvAttention { layer, .. } = &command.op {
-                        let context = kv.ok_or_else(|| {
-                            "KV attention requires executable decode state".to_string()
-                        })?;
-                        let MetalCommandPlan::KvAttention(plan) = &command.plan else {
-                            return Err("KV attention is missing exact requirements".to_string());
-                        };
-                        let staging_tensors = staging
-                            .iter()
-                            .map(|value| value.as_metal().cloned())
-                            .collect::<Result<Vec<_>, _>>()?;
-                        context.prepare_kv_attention(*layer, plan, &staging_tensors)?;
+                    match *physical {
+                        MetalPhysicalCommand::Encode(id) => {
+                            if pending_status_gate.is_some() {
+                                return Err(
+                                    "physical status gate is missing its command-buffer commit"
+                                        .to_string(),
+                                );
+                            }
+                            if cancelled.load(Ordering::Relaxed) {
+                                return Err("operation aborted".to_string());
+                            }
+                            let command = resolve_physical_instruction(executable, id)?;
+                            let MetalInstruction::Operation {
+                                op,
+                                plan,
+                                random_seed_token,
+                                ..
+                            } = &command.kind
+                            else {
+                                unreachable!("physical resolution requires an operation")
+                            };
+                            let inputs = resolved_values(
+                                command.inputs.iter().map(|use_| use_.value),
+                                &resolved,
+                            )?;
+                            let outputs = resolved_values(
+                                command.outputs.iter().map(|output| output.value),
+                                &resolved,
+                            )?;
+                            let scratch = resolved_values(
+                                command.scratch.iter().map(|use_| use_.value),
+                                &resolved,
+                            )?;
+                            let staging = resolved_values(
+                                command.staging.iter().map(|use_| use_.value),
+                                &resolved,
+                            )?;
+                            let status = resolved_values(
+                                command.status.iter().map(|use_| use_.value),
+                                &resolved,
+                            )?;
+                            let state = resolved_values(
+                                command.state.iter().map(|use_| use_.value),
+                                &resolved,
+                            )?;
+                            if let MetalOp::KvAttention { layer, .. } = op {
+                                let context = kv.ok_or_else(|| {
+                                    "KV attention requires executable decode state".to_string()
+                                })?;
+                                let MetalCommandPlan::KvAttention(plan) = plan else {
+                                    return Err(
+                                        "KV attention is missing exact requirements".to_string()
+                                    );
+                                };
+                                let staging_tensors = staging
+                                    .iter()
+                                    .map(|value| value.as_metal().cloned())
+                                    .collect::<Result<Vec<_>, _>>()?;
+                                context.prepare_kv_attention(*layer, plan, &staging_tensors)?;
+                            }
+                            execute_op_into(
+                                op,
+                                plan,
+                                &inputs,
+                                &outputs,
+                                &scratch,
+                                &staging,
+                                &status,
+                                &state,
+                                kv,
+                                &mut ce_checks,
+                                random_seed(invocation_nonce, *random_seed_token),
+                            )
+                            .map_err(|error| format!("{}: {error}", op.name()))?;
+                            last_encoded = Some(id);
+                        }
+                        MetalPhysicalCommand::StatusGate(id) => {
+                            let command = resolve_physical_instruction(executable, id)?;
+                            if last_encoded != Some(id) || command.status.is_empty() {
+                                return Err(format!(
+                                    "physical status gate {id} does not follow its status instruction"
+                                ));
+                            }
+                            pending_status_gate = Some(id);
+                        }
+                        MetalPhysicalCommand::Commit => {
+                            pending_status_gate.take().ok_or_else(|| {
+                                "physical command-buffer commit has no status gate".to_string()
+                            })?;
+                            metal.commit_executable_command();
+                        }
+                        MetalPhysicalCommand::Complete => {
+                            if pending_status_gate.is_some() || completed {
+                                return Err("invalid physical completion ordering".to_string());
+                            }
+                            completed = true;
+                        }
                     }
-                    execute_op_into(
-                        &command.op,
-                        &command.plan,
-                        &inputs,
-                        &outputs,
-                        &scratch,
-                        &staging,
-                        &status,
-                        kv,
-                        &mut ce_checks,
-                        random_seed(invocation_nonce, command_index as u64),
-                    )
-                    .map_err(|error| format!("{}: {error}", command.op.name()))?;
-                    if command.synchronization.commit_after {
-                        metal.commit_executable_command();
-                    }
+                }
+                if !completed {
+                    return Err("physical program has no final completion".to_string());
                 }
                 Ok(())
             },
@@ -5009,16 +5821,11 @@ fn execute_with_commit(
     if commit_allowed.is_some_and(|allowed| !allowed()) {
         return Err("operation aborted".to_string());
     }
-    let has_state_transactions = executable.commands.iter().any(|command| {
-        matches!(
-            command.op,
-            MetalOp::KdaRecurrence { .. } | MetalOp::ConvState { .. } | MetalOp::KvAttention { .. }
-        )
-    });
-    if has_state_transactions {
+    if kv.is_some() {
         commit_state_transactions(executable, &resolved, kv)?;
     }
     executable
+        .program
         .outputs
         .iter()
         .map(|value| {
@@ -5039,6 +5846,7 @@ fn execute_op_into(
     scratch: &[Value],
     staging: &[Value],
     status: &[Value],
+    state: &[Value],
     kv: Option<&dyn MetalDecodeContext>,
     ce_checks: &mut Vec<DeferredCeCheck>,
     random_seed: u64,
@@ -5054,6 +5862,10 @@ fn execute_op_into(
             .ok_or_else(|| format!("{}: missing output {index}", op.name()))
     };
     let scratch_tensors = scratch
+        .iter()
+        .map(Value::as_metal)
+        .collect::<Result<Vec<_>, _>>()?;
+    let state_tensors = state
         .iter()
         .map(Value::as_metal)
         .collect::<Result<Vec<_>, _>>()?;
@@ -5796,7 +6608,7 @@ fn execute_op_into(
                     dtype: tensor.dtype,
                 })
             };
-            let state_next_root = scratch_tensors[0];
+            let state_next_root = state_tensors[0];
             let mask_root = staging.first().map(Value::as_metal).transpose()?;
             for (batch_index, slot) in context.slots().iter().enumerate() {
                 let state = slot
@@ -5875,20 +6687,20 @@ fn execute_op_into(
                         &decay,
                         &mask,
                         metal_ops::BinOp::Mul,
-                        scratch_tensors[1],
+                        scratch_tensors[0],
                     )?;
                     metal_ops::binary_into(
                         &beta,
                         &mask,
                         metal_ops::BinOp::Mul,
-                        scratch_tensors[2],
+                        scratch_tensors[1],
                     )?;
                     kda::forward_into(
                         &q,
                         &k,
                         &v,
+                        scratch_tensors[0],
                         scratch_tensors[1],
-                        scratch_tensors[2],
                         *scale,
                         Some(initial),
                         &destination,
@@ -6018,7 +6830,7 @@ fn execute_op_into(
                         dtype: tensor.dtype,
                     })
                 };
-            let state_next_root = scratch_tensors[0];
+            let state_next_root = state_tensors[0];
             for (batch_index, slot) in context.slots().iter().enumerate() {
                 let state = slot
                     .lock()
@@ -6660,6 +7472,24 @@ mod tests {
         .unwrap()
     }
 
+    fn scalar(value: f32) -> Arc<Node> {
+        Node::new(NodeKind::Reshape {
+            a: leaf(vec![value]),
+            shape: Vec::new(),
+        })
+        .unwrap()
+    }
+
+    fn assert_close(actual: &[f32], expected: &[f32]) {
+        assert_eq!(actual.len(), expected.len());
+        for (actual, expected) in actual.iter().zip(expected) {
+            assert!(
+                (actual - expected).abs() < 1e-5,
+                "{actual} differs from {expected}"
+            );
+        }
+    }
+
     fn options(optimize: bool) -> CompileOptions {
         CompileOptions {
             optimize,
@@ -6724,6 +7554,26 @@ mod tests {
         })
         .unwrap();
         let compilation = compile_graph(&[root], false);
+        assert_eq!(compilation.executable.signature.bindings.len(), 1);
+        assert_eq!(
+            compilation.executable.signature.bindings[0].layout,
+            effect_torch_runtime::BindingLayoutPolicy::Require(
+                effect_torch_runtime::LayoutConstraint::ZeroOffsetContiguous
+            )
+        );
+        assert_eq!(
+            compilation.executable.signature.invocation.scalars,
+            [effect_torch_runtime::ScalarDecl {
+                name: "slot_1".to_string(),
+                scalar_type: effect_torch_runtime::ScalarType::F32,
+            }]
+        );
+        assert!(compilation
+            .executable
+            .signature
+            .invocation
+            .runtime_values
+            .is_empty());
         let scalar_value = compilation.executable.scalar_bindings[0].value;
         let Location::Segment { segment, .. } =
             compilation.executable.memory.locations[scalar_value.index()]
@@ -6749,6 +7599,134 @@ mod tests {
         )
         .unwrap();
         assert_eq!(output[0].to_f32_vec().unwrap(), [4.5, 5.5]);
+    }
+
+    #[test]
+    fn learned_position_decode_signatures_keep_state_cursors_internal() {
+        for batch in [1usize, 3] {
+            let input = |slot| {
+                Node::new(NodeKind::Input {
+                    slot,
+                    shape: vec![batch, 1, 2, 4],
+                    dtype: DType::F32,
+                    device: Device::Metal,
+                })
+                .unwrap()
+            };
+            let attention = Node::new(NodeKind::Sdpa {
+                q: input(0),
+                k: input(1),
+                v: input(2),
+                scale: 0.5,
+                causal: true,
+            })
+            .unwrap();
+            let positions = Node::new(NodeKind::PositionEmbedding {
+                weight: Node::new(NodeKind::Zeros {
+                    shape: vec![128, 6],
+                    dtype: DType::F32,
+                    device: Device::Metal,
+                })
+                .unwrap(),
+                seq_len: 2,
+            })
+            .unwrap();
+            let (roots, geometry) = effect_torch_compiler::specialize_decode(
+                &[attention.clone(), positions, attention],
+                None,
+                batch,
+            )
+            .unwrap();
+            let compilation = compile_with_state(
+                &roots,
+                options(false),
+                1024,
+                MetalEnvironment {
+                    private_intermediates: false,
+                    mma: true,
+                },
+                Some(KvStateSchema {
+                    max_tokens: 16,
+                    block_size: 16,
+                    kv_dtype: DType::F32,
+                    window: None,
+                    batch,
+                    layers: geometry.layers,
+                    kv_heads: geometry.kv_heads,
+                    head_dim: geometry.head_dim,
+                    kda: KdaGeometry::default(),
+                    conv: ConvGeometry::default(),
+                    cursor_slot: geometry.cursor_slot,
+                    cursor_tensor: geometry.cursor_tensor,
+                }),
+            )
+            .unwrap();
+            let signature = &compilation.executable.signature;
+
+            assert_eq!(signature.bindings.len(), 3);
+            assert!(signature.bindings.iter().all(|binding| {
+                binding.layout
+                    == effect_torch_runtime::BindingLayoutPolicy::Require(
+                        effect_torch_runtime::LayoutConstraint::ZeroOffsetContiguous,
+                    )
+            }));
+            assert!(signature.invocation.scalars.is_empty());
+            assert_eq!(signature.invocation.runtime_values.len(), 1);
+            assert_eq!(
+                signature.invocation.runtime_values[0].kind,
+                if batch == 1 {
+                    effect_torch_runtime::RuntimeValueKind::U64 {
+                        min: 0,
+                        max: u32::MAX as u64,
+                    }
+                } else {
+                    effect_torch_runtime::RuntimeValueKind::U32Array {
+                        max_len: batch,
+                        element_min: 0,
+                        element_max: u32::MAX,
+                    }
+                }
+            );
+            assert_eq!(signature.outputs.len(), 3);
+            assert_eq!(signature.outputs[0], signature.outputs[2]);
+        }
+    }
+
+    #[test]
+    fn declared_strided_binding_is_rejected_by_the_metal_signature_contract() {
+        let input = Node::new(NodeKind::Input {
+            slot: 0,
+            shape: vec![2, 2],
+            dtype: DType::F32,
+            device: Device::Metal,
+        })
+        .unwrap();
+        let root = Node::new(NodeKind::Neg { a: input }).unwrap();
+        let compilation = compile_graph(&[root], false);
+        assert_eq!(
+            compilation.executable.signature.bindings[0].layout,
+            effect_torch_runtime::BindingLayoutPolicy::Require(
+                effect_torch_runtime::LayoutConstraint::ZeroOffsetContiguous
+            )
+        );
+
+        let mut input = crate::run::MetalTensor::from_f32(
+            device::MetalDevice::get(),
+            vec![1.0, 2.0, 3.0, 4.0],
+            vec![2, 2],
+        );
+        input.layout = input.layout.permute(&[1, 0]);
+        let error = execute_with_scalars(
+            &compilation.executable,
+            &[Value(input)],
+            &compilation.generated_bindings,
+            &[],
+            &CancellationFlag::new(),
+        )
+        .err()
+        .unwrap();
+
+        assert_eq!(error, "execute: binding 0 has the wrong layout");
     }
 
     #[test]
@@ -6840,6 +7818,34 @@ mod tests {
         .unwrap()
     }
 
+    fn operation(command: &MetalCommand) -> (&MetalOp, &MetalCommandPlan) {
+        command
+            .kind
+            .operation()
+            .expect("encoded command is an operation")
+    }
+
+    fn output_ids(command: &MetalCommand) -> Vec<ValueId> {
+        command.outputs.iter().map(|output| output.value).collect()
+    }
+
+    fn release_ids(command: &MetalCommand) -> &[ValueId] {
+        let MetalInstruction::Operation { release, .. } = &command.kind else {
+            unreachable!("encoded command is an operation")
+        };
+        release
+    }
+
+    fn random_seed_token(command: &MetalCommand) -> u64 {
+        let MetalInstruction::Operation {
+            random_seed_token, ..
+        } = command.kind
+        else {
+            unreachable!("encoded command is an operation")
+        };
+        random_seed_token
+    }
+
     #[test]
     fn command_order_is_dense_deterministic_and_shared_nodes_are_lowered_once() {
         let x = leaf(vec![1.0, 2.0]);
@@ -6851,25 +7857,26 @@ mod tests {
         assert_eq!(
             compilation
                 .executable
-                .commands
+                .commands()
                 .iter()
-                .map(|command| command.op.name())
+                .map(|command| operation(command).0.name())
                 .collect::<Vec<_>>(),
             ["binary", "unary", "unary"]
         );
         assert!(compilation
             .executable
+            .program
             .values
             .iter()
             .enumerate()
             .all(|(index, _)| ValueId::from_index(index).is_some()));
         assert_eq!(
-            compilation.executable.commands[1].inputs[0],
-            compilation.executable.commands[0].outputs[0]
+            compilation.executable.commands()[1].inputs[0].value,
+            compilation.executable.commands()[0].outputs[0].value
         );
         assert_eq!(
-            compilation.executable.commands[2].inputs[0],
-            compilation.executable.commands[0].outputs[0]
+            compilation.executable.commands()[2].inputs[0].value,
+            compilation.executable.commands()[0].outputs[0].value
         );
     }
 
@@ -6880,44 +7887,20 @@ mod tests {
             NodeKind::Leaf(slot) => Arc::downgrade(slot),
             _ => unreachable!(),
         };
-        let root = Node::new(NodeKind::Neg { a: leaf }).unwrap();
+        let root = Node::new(NodeKind::Neg {
+            a: Node::new(NodeKind::Neg { a: leaf }).unwrap(),
+        })
+        .unwrap();
         let weak_root = Arc::downgrade(&root);
-        let compilation = compile_graph(std::slice::from_ref(&root), false);
+        let compilation = compile_graph(std::slice::from_ref(&root), true);
+        assert!(matches!(
+            operation(compilation.executable.commands()[0]).0,
+            MetalOp::FusedElementwise { .. }
+        ));
         drop(root);
         assert!(weak_root.upgrade().is_none());
         assert!(leaf_slot.upgrade().is_none());
-        assert_eq!(run(&compilation)[0].to_f32_vec().unwrap(), [-1.0, -2.0]);
-    }
-
-    #[test]
-    fn selectors_are_explicit_output_ids_and_add_no_commands() {
-        let producer = Node::new(NodeKind::FusedElementwiseMulti {
-            inputs: vec![leaf(vec![1.0, -2.0, 3.0, -4.0])],
-            strides: vec![vec![1]],
-            shape: vec![4],
-            exprs: vec![Expr::Input(0), Expr::Neg(Box::new(Expr::Input(0)))],
-        })
-        .unwrap();
-        let first = Node::new(NodeKind::FusedPick {
-            of: producer.clone(),
-            index: 0,
-        })
-        .unwrap();
-        let second = Node::new(NodeKind::FusedPick {
-            of: producer,
-            index: 1,
-        })
-        .unwrap();
-        let compilation = compile_graph(&[first, second], false);
-        assert_eq!(compilation.executable.commands.len(), 1);
-        assert_eq!(compilation.executable.commands[0].outputs.len(), 2);
-        assert_eq!(
-            compilation.executable.outputs.as_ref(),
-            compilation.executable.commands[0].outputs.as_ref()
-        );
-        let outputs = run(&compilation);
-        assert_eq!(outputs[0].to_f32_vec().unwrap(), [1.0, -2.0, 3.0, -4.0]);
-        assert_eq!(outputs[1].to_f32_vec().unwrap(), [-1.0, 2.0, -3.0, 4.0]);
+        assert_eq!(run(&compilation)[0].to_f32_vec().unwrap(), [1.0, 2.0]);
     }
 
     #[test]
@@ -6929,10 +7912,10 @@ mod tests {
         })
         .unwrap();
         let compilation = compile_graph(&[random.clone(), random], false);
-        assert_eq!(compilation.executable.commands.len(), 1);
+        assert_eq!(compilation.executable.commands().len(), 1);
         assert_eq!(
-            compilation.executable.outputs[0],
-            compilation.executable.outputs[1]
+            compilation.executable.program.outputs[0],
+            compilation.executable.program.outputs[1]
         );
         let first = run(&compilation);
         let second = run(&compilation);
@@ -6957,11 +7940,728 @@ mod tests {
         .unwrap();
         let optimized = compile_graph(std::slice::from_ref(&root), true);
         let unoptimized = compile_graph(std::slice::from_ref(&root), false);
+        assert!(matches!(root.kind, NodeKind::Tanh { .. }));
+        assert_eq!(optimized.executable.commands().len(), 1);
+        assert!(matches!(
+            operation(optimized.executable.commands()[0]).0,
+            MetalOp::FusedElementwise { .. }
+        ));
         assert_eq!(
             run(&optimized)[0].to_f32_vec().unwrap(),
             run(&unoptimized)[0].to_f32_vec().unwrap()
         );
-        assert!(optimized.executable.commands.len() < unoptimized.executable.commands.len());
+        assert!(optimized.executable.commands().len() < unoptimized.executable.commands().len());
+    }
+
+    #[test]
+    fn direct_elementwise_reduce_region_preserves_topology_and_warming() {
+        let root = Node::new(NodeKind::Sum {
+            a: Node::new(NodeKind::Tanh {
+                a: Node::new(NodeKind::Add {
+                    a: leaf_shape(vec![1.0, -2.0, 3.0, -4.0], vec![2, 2]),
+                    b: leaf_shape(vec![0.5, 0.25, -0.5, 2.0], vec![2, 2]),
+                })
+                .unwrap(),
+            })
+            .unwrap(),
+            dims: vec![1],
+            keepdims: false,
+        })
+        .unwrap();
+        let optimized = compile_graph(std::slice::from_ref(&root), true);
+        let unoptimized = compile_graph(std::slice::from_ref(&root), false);
+        assert_eq!(optimized.executable.commands().len(), 1);
+        assert_eq!(unoptimized.executable.commands().len(), 3);
+        assert!(matches!(
+            operation(optimized.executable.commands()[0]).0,
+            MetalOp::FusedReduce { .. }
+        ));
+        assert!(matches!(
+            operation(optimized.executable.commands()[0]).1,
+            MetalCommandPlan::Direct
+        ));
+        let misses = device::EXECUTABLE_PIPELINE_MISS_ATTEMPTS.load(Ordering::Relaxed);
+        let actual = run(&optimized)[0].to_f32_vec().unwrap();
+        assert_eq!(
+            device::EXECUTABLE_PIPELINE_MISS_ATTEMPTS.load(Ordering::Relaxed),
+            misses
+        );
+        assert_close(&actual, &run(&unoptimized)[0].to_f32_vec().unwrap());
+    }
+
+    #[test]
+    fn direct_multi_output_region_routes_roots_without_selector_commands() {
+        let prefix = Node::new(NodeKind::Tanh {
+            a: Node::new(NodeKind::Add {
+                a: leaf(vec![1.0, -2.0, 3.0, -4.0]),
+                b: leaf(vec![0.5, 0.25, -0.5, 2.0]),
+            })
+            .unwrap(),
+        })
+        .unwrap();
+        let left = Node::new(NodeKind::Exp {
+            a: Node::new(NodeKind::Neg { a: prefix.clone() }).unwrap(),
+        })
+        .unwrap();
+        let right = Node::new(NodeKind::Sin {
+            a: Node::new(NodeKind::Mul {
+                a: prefix,
+                b: leaf(vec![2.0, 1.5, -0.5, 0.25]),
+            })
+            .unwrap(),
+        })
+        .unwrap();
+        let roots = [left, right];
+        let optimized = compile_graph(&roots, true);
+        let unoptimized = compile_graph(&roots, false);
+        assert_eq!(optimized.executable.commands().len(), 1);
+        assert_eq!(optimized.executable.commands()[0].outputs.len(), 2);
+        assert!(matches!(
+            operation(optimized.executable.commands()[0]).0,
+            MetalOp::FusedElementwise { .. }
+        ));
+        assert_eq!(
+            optimized.executable.program.outputs.as_ref(),
+            output_ids(optimized.executable.commands()[0])
+        );
+        for (actual, expected) in run(&optimized).iter().zip(run(&unoptimized)) {
+            assert_close(
+                &actual.to_f32_vec().unwrap(),
+                &expected.to_f32_vec().unwrap(),
+            );
+        }
+    }
+
+    #[test]
+    fn direct_linear_epilogues_preserve_single_and_dual_output_routing() {
+        let linear = || {
+            Node::new(NodeKind::Linear {
+                x: leaf_shape(vec![1.0, 2.0, -1.0, 0.5], vec![1, 2, 2]),
+                weight: leaf_shape(vec![0.5, -1.0, 2.0, 0.25], vec![2, 2]),
+                bias: leaf(vec![0.1, -0.2]),
+            })
+            .unwrap()
+        };
+
+        let residual_linear = linear();
+        let residual = Node::new(NodeKind::Add {
+            a: residual_linear,
+            b: leaf_shape(vec![0.5, 1.0, -0.5, 0.25], vec![1, 2, 2]),
+        })
+        .unwrap();
+        let optimized_residual = compile_graph(std::slice::from_ref(&residual), true);
+        let unoptimized_residual = compile_graph(std::slice::from_ref(&residual), false);
+        assert!(matches!(
+            operation(optimized_residual.executable.commands()[0]).0,
+            MetalOp::LinearResidual { .. }
+        ));
+        assert_eq!(optimized_residual.executable.commands().len(), 1);
+        assert_close(
+            &run(&optimized_residual)[0].to_f32_vec().unwrap(),
+            &run(&unoptimized_residual)[0].to_f32_vec().unwrap(),
+        );
+
+        let single_linear = linear();
+        let single = Node::new(NodeKind::Gelu {
+            a: single_linear,
+            approximate: false,
+        })
+        .unwrap();
+        let optimized_single = compile_graph(std::slice::from_ref(&single), true);
+        assert!(matches!(
+            operation(optimized_single.executable.commands()[0]).0,
+            MetalOp::LinearGelu { dual: false, .. }
+        ));
+        let MetalCommandPlan::Linear(single_plan) =
+            operation(optimized_single.executable.commands()[0]).1
+        else {
+            panic!("single GELU epilogue is missing its immutable requirements");
+        };
+        assert_eq!(single_plan.output_count, 1);
+
+        let dual_linear = linear();
+        let dual_gelu = Node::new(NodeKind::Gelu {
+            a: dual_linear.clone(),
+            approximate: true,
+        })
+        .unwrap();
+        let dual_roots = [dual_linear, dual_gelu];
+        let optimized_dual = compile_graph(&dual_roots, true);
+        let unoptimized_dual = compile_graph(&dual_roots, false);
+        assert_eq!(optimized_dual.executable.commands().len(), 1);
+        assert!(matches!(
+            operation(optimized_dual.executable.commands()[0]).0,
+            MetalOp::LinearGelu {
+                approximate: true,
+                dual: true,
+                ..
+            }
+        ));
+        let MetalCommandPlan::Linear(dual_plan) =
+            operation(optimized_dual.executable.commands()[0]).1
+        else {
+            panic!("dual GELU epilogue is missing its immutable requirements");
+        };
+        assert_eq!(dual_plan.output_count, 2);
+        assert_eq!(
+            optimized_dual.executable.program.outputs.as_ref(),
+            output_ids(optimized_dual.executable.commands()[0])
+        );
+        for (actual, expected) in run(&optimized_dual).iter().zip(run(&unoptimized_dual)) {
+            assert_close(
+                &actual.to_f32_vec().unwrap(),
+                &expected.to_f32_vec().unwrap(),
+            );
+        }
+    }
+
+    #[test]
+    fn optimizer_region_selectors_route_physical_outputs_without_commands() {
+        let adamw = Node::new(NodeKind::AdamWStep {
+            param: leaf(vec![1.0, 2.0]),
+            grad: leaf(vec![0.1, -0.2]),
+            m: leaf(vec![0.0, 0.0]),
+            v: leaf(vec![0.0, 0.0]),
+            lr: scalar(0.01),
+            c1: scalar(0.1),
+            c2: scalar(0.01),
+            beta1: 0.9,
+            beta2: 0.99,
+            eps: 1e-8,
+            weight_decay: 0.01,
+        })
+        .unwrap();
+        let adamw_m = Node::new(NodeKind::AdamWOut {
+            step: adamw.clone(),
+            index: 1,
+        })
+        .unwrap();
+        let adamw_v = Node::new(NodeKind::AdamWOut {
+            step: adamw.clone(),
+            index: 2,
+        })
+        .unwrap();
+        let adamw_roots = [adamw, adamw_m, adamw_v];
+        let optimized_adamw = compile_graph(&adamw_roots, true);
+        let unoptimized_adamw = compile_graph(&adamw_roots, false);
+        assert_eq!(optimized_adamw.executable.commands().len(), 2);
+        assert!(matches!(
+            operation(optimized_adamw.executable.commands()[0]).0,
+            MetalOp::PackOptimizerScalars
+        ));
+        assert!(matches!(
+            operation(optimized_adamw.executable.commands()[1]).0,
+            MetalOp::AdamW {
+                implementation: OptimizerImplementation::Fused,
+                ..
+            }
+        ));
+        assert_eq!(
+            optimized_adamw.executable.program.outputs.as_ref(),
+            output_ids(optimized_adamw.executable.commands()[1])
+        );
+        for (actual, expected) in run(&optimized_adamw).iter().zip(run(&unoptimized_adamw)) {
+            assert_close(
+                &actual.to_f32_vec().unwrap(),
+                &expected.to_f32_vec().unwrap(),
+            );
+        }
+
+        let sgd = Node::new(NodeKind::SgdStep {
+            param: leaf(vec![1.0, 2.0]),
+            grad: leaf(vec![0.5, -0.25]),
+            velocity: leaf(vec![0.0, 0.0]),
+            first: scalar(1.0),
+            lr: scalar(0.1),
+            momentum: 0.9,
+            dampening: 0.0,
+            nesterov: false,
+            weight_decay: 0.0,
+        })
+        .unwrap();
+        let velocity = Node::new(NodeKind::SgdOut {
+            step: sgd.clone(),
+            index: 1,
+        })
+        .unwrap();
+        let sgd_roots = [sgd, velocity];
+        let optimized_sgd = compile_graph(&sgd_roots, true);
+        let unoptimized_sgd = compile_graph(&sgd_roots, false);
+        assert_eq!(optimized_sgd.executable.commands().len(), 2);
+        assert!(matches!(
+            operation(optimized_sgd.executable.commands()[1]).0,
+            MetalOp::Sgd {
+                implementation: OptimizerImplementation::Fused,
+                ..
+            }
+        ));
+        assert_eq!(
+            optimized_sgd.executable.program.outputs.as_ref(),
+            output_ids(optimized_sgd.executable.commands()[1])
+        );
+        for (actual, expected) in run(&optimized_sgd).iter().zip(run(&unoptimized_sgd)) {
+            assert_close(
+                &actual.to_f32_vec().unwrap(),
+                &expected.to_f32_vec().unwrap(),
+            );
+        }
+    }
+
+    #[test]
+    fn grouped_adamw_region_uses_interleaved_lanes_and_routes_selectors() {
+        let lr = scalar(0.01);
+        let c1 = scalar(0.1);
+        let c2 = scalar(0.01);
+        let step = |param: Vec<f32>, grad: Vec<f32>| {
+            Node::new(NodeKind::AdamWStep {
+                param: leaf(param),
+                grad: leaf(grad),
+                m: leaf(vec![0.0, 0.0]),
+                v: leaf(vec![0.0, 0.0]),
+                lr: lr.clone(),
+                c1: c1.clone(),
+                c2: c2.clone(),
+                beta1: 0.9,
+                beta2: 0.99,
+                eps: 1e-8,
+                weight_decay: 0.01,
+            })
+            .unwrap()
+        };
+        let first = step(vec![1.0, 2.0], vec![0.1, -0.2]);
+        let first_m = Node::new(NodeKind::AdamWOut {
+            step: first.clone(),
+            index: 1,
+        })
+        .unwrap();
+        let second = step(vec![3.0, 4.0], vec![-0.3, 0.4]);
+        let second_v = Node::new(NodeKind::AdamWOut {
+            step: second.clone(),
+            index: 2,
+        })
+        .unwrap();
+        let roots = [first, first_m, second, second_v];
+        let mut grouped_options = options(true);
+        grouped_options.environment.optimizer_groups = true;
+        let grouped = compile(
+            &roots,
+            grouped_options,
+            1024,
+            MetalEnvironment {
+                private_intermediates: false,
+                mma: true,
+            },
+        )
+        .unwrap();
+        let independent = compile_graph(&roots, false);
+        assert_eq!(grouped.executable.commands().len(), 2);
+        assert!(matches!(
+            operation(grouped.executable.commands()[1]).0,
+            MetalOp::AdamWGroup { parameters: 2, .. }
+        ));
+        assert_eq!(grouped.executable.commands()[1].outputs.len(), 6);
+        assert_eq!(
+            grouped.executable.program.outputs.as_ref(),
+            [
+                grouped.executable.commands()[1].outputs[0].value,
+                grouped.executable.commands()[1].outputs[1].value,
+                grouped.executable.commands()[1].outputs[3].value,
+                grouped.executable.commands()[1].outputs[5].value,
+            ]
+        );
+        for (actual, expected) in run(&grouped).iter().zip(run(&independent)) {
+            assert_close(
+                &actual.to_f32_vec().unwrap(),
+                &expected.to_f32_vec().unwrap(),
+            );
+        }
+    }
+
+    #[test]
+    fn random_seed_identity_remains_lowered_command_derived_across_optimization() {
+        let deterministic = Node::new(NodeKind::Tanh {
+            a: Node::new(NodeKind::Add {
+                a: leaf(vec![1.0, 2.0]),
+                b: leaf(vec![3.0, 4.0]),
+            })
+            .unwrap(),
+        })
+        .unwrap();
+        let random = Node::new(NodeKind::Randn {
+            shape: vec![16],
+            dtype: DType::F32,
+            device: Device::Metal,
+        })
+        .unwrap();
+        let roots = [deterministic, random];
+        let optimized = compile_graph(&roots, true);
+        let unoptimized = compile_graph(&roots, false);
+        let optimized_random = optimized
+            .executable
+            .commands()
+            .iter()
+            .find(|command| matches!(operation(command).0, MetalOp::Randn { .. }))
+            .copied()
+            .unwrap();
+        let unoptimized_random = unoptimized
+            .executable
+            .commands()
+            .iter()
+            .find(|command| matches!(operation(command).0, MetalOp::Randn { .. }))
+            .copied()
+            .unwrap();
+        assert_eq!(random_seed_token(optimized_random), 1);
+        assert_eq!(random_seed_token(unoptimized_random), 2);
+        for executable in [&optimized.executable, &unoptimized.executable] {
+            assert!(executable
+                .commands()
+                .iter()
+                .enumerate()
+                .all(|(index, command)| random_seed_token(command) == index as u64));
+        }
+    }
+
+    #[test]
+    fn optimization_plan_builds_one_index_and_rebuilds_no_semantic_nodes() {
+        let root = Node::new(NodeKind::Tanh {
+            a: Node::new(NodeKind::Add {
+                a: leaf(vec![1.0, 2.0]),
+                b: leaf(vec![3.0, 4.0]),
+            })
+            .unwrap(),
+        })
+        .unwrap();
+        let compilation = compile_graph(&[root], true);
+        let work = &compilation.executable.compiler_work;
+        assert_eq!(work.graph_index_builds, 1);
+        assert_eq!(work.semantic_nodes_rebuilt, 0);
+        assert_eq!(work.selected_regions, 1);
+        assert_eq!(
+            compilation
+                .executable
+                .diagnostics
+                .semantic_nodes_before_optimization,
+            work.semantic_nodes
+        );
+        assert_eq!(
+            compilation
+                .executable
+                .diagnostics
+                .semantic_nodes_after_optimization,
+            work.semantic_nodes
+        );
+    }
+
+    #[test]
+    fn prepared_compile_uses_one_index_and_one_leaf_snapshot_collection() {
+        let left = leaf(vec![1.0, 2.0]);
+        let right = leaf(vec![3.0, 4.0]);
+        let leaf_slots = [&left, &right].map(|node| match &node.kind {
+            NodeKind::Leaf(slot) => Arc::clone(slot),
+            _ => unreachable!(),
+        });
+        let root = Node::new(NodeKind::Add { a: left, b: right }).unwrap();
+        let mut compile_options = options(false);
+        compile_options.environment.ce_chunk_size = 1024;
+        let program = ProgramRequest::from_roots(vec![root], compile_options)
+            .prepare()
+            .unwrap();
+        assert_eq!(program.index.work.graph_index_builds, 1);
+
+        let generated = load_generated_bindings(&program.index).unwrap();
+        assert_eq!(generated.len(), 2);
+        for slot in leaf_slots {
+            assert!(slot.clear());
+        }
+
+        let compilation = compile_prepared_with_state(&program, &generated, None).unwrap();
+        assert_eq!(compilation.generated_bindings.len(), 2);
+        assert_eq!(compilation.executable.memory.report.external_bytes, 16);
+        assert_eq!(compilation.executable.memory.report.persistent_bytes, 0);
+        assert_eq!(compilation.executable.signature, program.signature);
+        assert_eq!(compilation.executable.compiler_work.graph_index_builds, 1);
+        assert_eq!(
+            compilation.executable.compiler_work.semantic_nodes_rebuilt,
+            0
+        );
+        assert_eq!(
+            compilation
+                .executable
+                .diagnostics
+                .compile_phases
+                .iter()
+                .map(|timing| timing.phase.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "graph_index",
+                "optimization",
+                "lowering",
+                "lowered_program_validation",
+                "memory_planning",
+                "physical_planning",
+                "pipeline_preparation",
+                "artifact_assembly",
+                "compile_submission",
+                "publication",
+            ]
+        );
+        assert_eq!(compilation.generated_order, [0, 1]);
+        assert_eq!(run(&compilation)[0].to_f32_vec().unwrap(), [4.0, 6.0]);
+    }
+
+    #[test]
+    fn constant_weights_retain_leaf_storage_without_generated_bindings() {
+        let slot = Arc::new(LeafSlot::new(Value(crate::run::MetalTensor::from_f32(
+            device::MetalDevice::get(),
+            vec![1.0, 2.0],
+            vec![2],
+        ))));
+        let leaf = Node::new(NodeKind::Leaf(Arc::clone(&slot))).unwrap();
+        let root = Node::new(NodeKind::Neg { a: leaf }).unwrap();
+        let mut compile_options = options(false);
+        compile_options.inference = Some(effect_torch_compiler::InferenceOptions {
+            constant_weights: true,
+        });
+        let program = ProgramRequest::from_roots(vec![root], compile_options)
+            .prepare()
+            .unwrap();
+        let generated = load_generated_bindings(&program.index).unwrap();
+        assert!(slot.clear());
+
+        let compilation = compile_prepared_with_state(&program, &generated, None).unwrap();
+
+        assert!(compilation.generated_bindings.is_empty());
+        assert!(compilation.generated_order.is_empty());
+        assert!(compilation.executable.bindings.is_empty());
+        assert_eq!(compilation.executable.constants.len(), 1);
+        assert_eq!(compilation.executable.memory.report.external_bytes, 0);
+        assert_eq!(compilation.executable.memory.report.persistent_bytes, 8);
+        let constant = &compilation.executable.constants[0];
+        let lowered = &compilation.executable.program.values[constant.value.index()];
+        assert_eq!(
+            lowered.layout,
+            effect_torch_runtime::Layout::contiguous(vec![2])
+        );
+        assert!(matches!(
+            lowered.declaration.storage,
+            ValueStorage::Fixed {
+                class: StorageClass::PersistentConstant,
+                location: Location::Persistent { .. }
+            }
+        ));
+        let output = execute(
+            &compilation.executable,
+            &[],
+            &[],
+            &CancellationFlag::new(),
+            None,
+        )
+        .unwrap()
+        .remove(0);
+        assert_eq!(output.to_f32_vec().unwrap(), [-1.0, -2.0]);
+    }
+
+    #[test]
+    fn explicit_false_constant_weights_remain_generated_bindings() {
+        let root = leaf(vec![3.0, 4.0]);
+        let mut compile_options = options(false);
+        compile_options.inference = Some(effect_torch_compiler::InferenceOptions {
+            constant_weights: false,
+        });
+        let compilation = compile(
+            &[root],
+            compile_options,
+            1024,
+            MetalEnvironment {
+                private_intermediates: false,
+                mma: true,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(compilation.generated_bindings.len(), 1);
+        assert!(compilation.executable.constants.is_empty());
+        assert_eq!(compilation.executable.memory.report.external_bytes, 8);
+        assert_eq!(compilation.executable.memory.report.persistent_bytes, 0);
+        assert_eq!(run(&compilation)[0].to_f32_vec().unwrap(), [3.0, 4.0]);
+    }
+
+    #[test]
+    fn prepared_generated_values_require_the_indexed_zero_offset_contract() {
+        let root = leaf(vec![1.0, 2.0]);
+        let program = ProgramRequest::from_roots(vec![root], options(false))
+            .prepare()
+            .unwrap();
+        let mut generated = load_generated_bindings(&program.index).unwrap();
+        generated[0].0.layout = effect_torch_runtime::Layout::new(vec![2], vec![1], 1);
+
+        let error = compile_prepared_with_state(&program, &generated, None)
+            .err()
+            .unwrap();
+        assert!(error.contains("must be zero-offset contiguous"));
+    }
+
+    #[test]
+    fn optimized_status_commands_keep_physical_gate_order() {
+        let fused = Node::new(NodeKind::Tanh {
+            a: Node::new(NodeKind::Add {
+                a: leaf(vec![1.0, 2.0]),
+                b: leaf(vec![3.0, 4.0]),
+            })
+            .unwrap(),
+        })
+        .unwrap();
+        let ce = Node::new(NodeKind::CrossEntropy {
+            logits: leaf_shape(vec![2.0, 1.0, 1.0, 2.0], vec![2, 2]),
+            target: leaf_u32(&[0, 1], vec![2]),
+            ignore_index: u32::MAX as i64,
+            reduction: CrossEntropyReduction::Mean,
+        })
+        .unwrap();
+        let compilation = compile_graph(&[fused, ce], true);
+        assert!(matches!(
+            operation(compilation.executable.commands()[0]).0,
+            MetalOp::FusedElementwise { .. }
+        ));
+        let status = compilation.executable.commands()[1];
+        assert!(matches!(operation(status).0, MetalOp::CrossEntropy { .. }));
+        assert!(!status.status.is_empty());
+        assert_eq!(
+            compilation.executable.physical.as_ref(),
+            [
+                MetalPhysicalCommand::Encode(compilation.executable.commands()[0].id),
+                MetalPhysicalCommand::Encode(status.id),
+                MetalPhysicalCommand::StatusGate(status.id),
+                MetalPhysicalCommand::Commit,
+                MetalPhysicalCommand::Complete,
+            ]
+        );
+    }
+
+    #[test]
+    fn typed_program_physical_resources_and_diagnostics_are_authoritative() {
+        fn assert_typed(
+            _: &LoweredProgram<MetalInstruction, NativeMemorySpace, MetalLoweredValue>,
+        ) {
+        }
+
+        let q = leaf_shape(vec![0.2, 0.4, 0.1, 0.3], vec![1, 1, 2, 2]);
+        let recurrence = Node::new(NodeKind::KdaRecurrence {
+            q: q.clone(),
+            k: q.clone(),
+            v: q,
+            log_decay: leaf_shape(vec![-0.1, -0.2, -0.3, -0.4], vec![1, 1, 2, 2]),
+            beta: leaf_shape(vec![0.5, 0.25], vec![1, 1, 2, 1]),
+            scale: 0.5,
+            layer: 0,
+        })
+        .unwrap();
+        let ce = Node::new(NodeKind::CrossEntropy {
+            logits: leaf_shape(vec![2.0, 1.0, 1.0, 2.0], vec![2, 2]),
+            target: leaf_u32(&[0, 1], vec![2]),
+            ignore_index: u32::MAX as i64,
+            reduction: CrossEntropyReduction::Mean,
+        })
+        .unwrap();
+        let compilation = compile_graph_with_state(
+            &[recurrence, ce],
+            false,
+            KvStateSchema {
+                max_tokens: 64,
+                block_size: 16,
+                kv_dtype: DType::F32,
+                window: None,
+                batch: 1,
+                layers: 0,
+                kv_heads: 0,
+                head_dim: 0,
+                kda: KdaGeometry {
+                    layers: 1,
+                    heads: 1,
+                    head_dim: 2,
+                    value_dim: 2,
+                },
+                conv: ConvGeometry::default(),
+                cursor_slot: u32::MAX,
+                cursor_tensor: false,
+            },
+        );
+        let executable = &compilation.executable;
+        assert_typed(&executable.program);
+
+        for (index, value) in executable.program.values.iter().enumerate() {
+            assert_eq!(value.declaration.id.index(), index);
+            assert_eq!(value.layout.shape(), value.shape.as_ref());
+            assert_eq!(
+                value.layout,
+                effect_torch_runtime::Layout::contiguous(value.shape.to_vec())
+            );
+        }
+
+        let mut encoded = 0usize;
+        let mut saw_staging = false;
+        let mut saw_status = false;
+        let mut saw_state = false;
+        for physical in &executable.physical {
+            let MetalPhysicalCommand::Encode(id) = *physical else {
+                continue;
+            };
+            encoded += 1;
+            let instruction = executable
+                .instruction(id)
+                .expect("every physical Encode ID resolves");
+            assert_eq!(instruction.id, id);
+            assert!(matches!(
+                &instruction.kind,
+                MetalInstruction::Operation { .. }
+            ));
+
+            let planner = instruction
+                .resource_uses()
+                .map(|use_| use_.value)
+                .collect::<Vec<_>>();
+            let executor = instruction
+                .inputs
+                .iter()
+                .map(|use_| use_.value)
+                .chain(instruction.outputs.iter().map(|output| output.value))
+                .chain(instruction.scratch.iter().map(|use_| use_.value))
+                .chain(instruction.staging.iter().map(|use_| use_.value))
+                .chain(instruction.status.iter().map(|use_| use_.value))
+                .chain(instruction.state.iter().map(|use_| use_.value))
+                .collect::<Vec<_>>();
+            assert_eq!(planner, executor);
+            saw_staging |= !instruction.staging.is_empty();
+            saw_status |= !instruction.status.is_empty();
+            saw_state |= !instruction.state.is_empty();
+        }
+        assert!(saw_staging && saw_status && saw_state);
+        assert_eq!(
+            executable.physical.last(),
+            Some(&MetalPhysicalCommand::Complete)
+        );
+        assert_eq!(executable.diagnostics.command_count, encoded);
+        assert_eq!(executable.diagnostics.synchronization_count, 1);
+        assert_eq!(
+            executable.diagnostics.pipeline_count,
+            executable.prepared.pipeline_count
+        );
+
+        let mut expected = std::collections::BTreeMap::<String, usize>::new();
+        for instruction in &executable.program.instructions {
+            *expected
+                .entry(instruction.kind.name().to_string())
+                .or_default() += 1;
+        }
+        assert_eq!(
+            executable
+                .diagnostics
+                .instructions
+                .iter()
+                .map(|instruction| (instruction.kind.clone(), instruction.count))
+                .collect::<Vec<_>>(),
+            expected.into_iter().collect::<Vec<_>>()
+        );
     }
 
     #[test]
@@ -7013,12 +8713,10 @@ mod tests {
         })
         .unwrap();
         let compilation = compile_graph(&[root], false);
-        let commands = &compilation.executable.commands;
-        let intermediate = commands[0].outputs[0];
-        assert!(commands[1].release.contains(&intermediate));
-        assert!(!commands[1]
-            .release
-            .contains(&compilation.executable.outputs[0]));
+        let commands = compilation.executable.commands();
+        let intermediate = commands[0].outputs[0].value;
+        assert!(release_ids(commands[1]).contains(&intermediate));
+        assert!(!release_ids(commands[1]).contains(&compilation.executable.program.outputs[0]));
         assert!(compilation.executable.diagnostics.memory.output_bytes > 0);
         assert!(compilation.executable.diagnostics.memory.workspace_bytes > 0);
         assert_eq!(compilation.executable.diagnostics.command_count, 2);
@@ -7064,12 +8762,12 @@ mod tests {
             cursor_tensor: false,
         };
         let compilation = compile_graph_with_state(&[root], false, schema);
-        let command = compilation.executable.commands.last().unwrap();
+        let commands = compilation.executable.commands();
+        let command = commands.last().unwrap();
         assert!(!command.outputs.is_empty());
-        assert!(command.synchronization.barrier_after_dispatch);
         assert_eq!(command.staging.len(), 5);
         assert_eq!(
-            compilation.executable.values[command.staging[0].index()]
+            compilation.executable.program.values[command.staging[0].index()]
                 .shape
                 .as_ref(),
             [1, 4]
@@ -7103,7 +8801,7 @@ mod tests {
         .unwrap();
         let compilation = compile_graph_with_state(
             &[root],
-            false,
+            true,
             KvStateSchema {
                 max_tokens: 64,
                 block_size: 16,
@@ -7120,11 +8818,11 @@ mod tests {
             },
         );
         assert!(matches!(
-            compilation.executable.commands[0].op,
+            operation(compilation.executable.commands()[0]).0,
             MetalOp::PrepareState
         ));
         assert!(compilation.executable.bindings.is_empty());
-        let cursor = compilation.executable.commands[0].outputs[0];
+        let cursor = compilation.executable.commands()[0].outputs[0].value;
         let Location::Segment { segment, bytes, .. } =
             compilation.executable.memory.locations[cursor.index()]
         else {
@@ -7163,14 +8861,14 @@ mod tests {
         let optimized = compile_graph(std::slice::from_ref(&adamw), true);
         let unoptimized = compile_graph(std::slice::from_ref(&adamw), false);
         assert!(matches!(
-            optimized.executable.commands.last().unwrap().op,
+            operation(optimized.executable.commands().last().unwrap()).0,
             MetalOp::AdamW {
                 implementation: OptimizerImplementation::Fused,
                 ..
             }
         ));
         assert!(matches!(
-            unoptimized.executable.commands.last().unwrap().op,
+            operation(unoptimized.executable.commands().last().unwrap()).0,
             MetalOp::AdamW {
                 implementation: OptimizerImplementation::Generic,
                 ..
@@ -7226,7 +8924,7 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(
-            compilation.executable.commands.last().unwrap().op,
+            operation(compilation.executable.commands().last().unwrap()).0,
             MetalOp::ChunkedHeadCe { chunk_size: 17, .. }
         ));
         assert!(compilation.executable.environment.private_intermediates);
@@ -7281,22 +8979,24 @@ mod tests {
         let compilation = compile_graph(&[adamw(1.0), adamw(2.0)], true);
         let packs = compilation
             .executable
-            .commands
+            .commands()
             .iter()
-            .filter(|command| matches!(command.op, MetalOp::PackOptimizerScalars))
+            .filter(|command| matches!(operation(command).0, MetalOp::PackOptimizerScalars))
+            .copied()
             .collect::<Vec<_>>();
         let updates = compilation
             .executable
-            .commands
+            .commands()
             .iter()
-            .filter(|command| matches!(command.op, MetalOp::AdamW { .. }))
+            .filter(|command| matches!(operation(command).0, MetalOp::AdamW { .. }))
+            .copied()
             .collect::<Vec<_>>();
         assert_eq!(packs.len(), 1);
         assert_eq!(updates.len(), 2);
-        let packed = packs[0].outputs[0];
+        let packed = packs[0].outputs[0].value;
         assert!(updates
             .iter()
-            .all(|command| command.inputs.last() == Some(&packed)));
+            .all(|command| command.inputs.last().map(|use_| use_.value) == Some(packed)));
         let misses = device::EXECUTABLE_PIPELINE_MISS_ATTEMPTS.load(Ordering::Relaxed);
         assert_eq!(run(&compilation).len(), 2);
         assert_eq!(
@@ -7317,13 +9017,13 @@ mod tests {
         })
         .unwrap();
         let compilation = compile_graph(&[reshape], true);
-        assert_eq!(compilation.executable.commands.len(), 1);
+        assert_eq!(compilation.executable.commands().len(), 1);
         assert!(!compilation
             .executable
-            .commands
+            .commands()
             .iter()
-            .any(|command| matches!(command.op, MetalOp::Reshape { .. })));
-        let output = compilation.executable.outputs[0];
+            .any(|command| matches!(operation(command).0, MetalOp::Reshape { .. })));
+        let output = compilation.executable.program.outputs[0];
         let Location::Alias {
             root,
             byte_offset: 0,
@@ -7340,7 +9040,7 @@ mod tests {
             compilation.executable.memory.segments[segment.index()].ownership,
             SegmentOwnership::ProvisionalOutput
         );
-        assert!(!compilation.executable.commands[0].release.contains(&root));
+        assert!(!release_ids(compilation.executable.commands()[0]).contains(&root));
         let first = run(&compilation).remove(0);
         assert_eq!(first.shape(), &[2, 2]);
         assert_eq!(first.to_f32_vec().unwrap(), vec![-1.0, -2.0, -3.0, -4.0]);
@@ -7452,9 +9152,11 @@ mod tests {
             .segments
             .iter()
             .any(|segment| segment.ownership == SegmentOwnership::StateTransaction));
-        let mask = compilation.executable.commands[0].staging[0];
+        let mask = compilation.executable.commands()[0].staging[0].value;
         assert_eq!(
-            compilation.executable.values[mask.index()].shape.as_ref(),
+            compilation.executable.program.values[mask.index()]
+                .shape
+                .as_ref(),
             [2, 2, 1]
         );
     }
@@ -7505,10 +9207,10 @@ mod tests {
         );
         let transactions = compilation
             .executable
-            .commands
+            .commands()
             .iter()
-            .filter_map(|command| match command.op {
-                MetalOp::KdaRecurrence { .. } => command.scratch.first().copied(),
+            .filter_map(|command| match operation(command).0 {
+                MetalOp::KdaRecurrence { .. } => command.state.first().map(|use_| use_.value),
                 _ => None,
             })
             .collect::<Vec<_>>();
@@ -7898,9 +9600,9 @@ mod tests {
         let compilation = compile_graph(&roots, false);
         assert!(compilation
             .executable
-            .commands
+            .commands()
             .iter()
-            .all(|command| matches!(&command.plan, MetalCommandPlan::Conv(_))));
+            .all(|command| matches!(operation(command).1, MetalCommandPlan::Conv(_))));
         let misses = device::EXECUTABLE_PIPELINE_MISS_ATTEMPTS.load(Ordering::Relaxed);
         assert_eq!(run(&compilation).len(), roots.len());
         assert_eq!(

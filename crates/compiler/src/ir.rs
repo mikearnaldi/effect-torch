@@ -46,7 +46,7 @@ pub fn broadcast_compatible(lane: &[usize], out: &[usize]) -> bool {
 }
 
 #[derive(Debug)]
-pub enum Expr {
+pub enum KernelExpr {
     // per-element input lane k
     Input(u32),
     // scalar input k: a one-element tensor read at offset 0. Used for
@@ -55,97 +55,99 @@ pub enum Expr {
     Scalar(u32),
     // f64 bits, so the IR is Eq + Hash and can key the pipeline cache
     Const(u64),
-    Add(Box<Expr>, Box<Expr>),
-    Sub(Box<Expr>, Box<Expr>),
-    Mul(Box<Expr>, Box<Expr>),
-    Div(Box<Expr>, Box<Expr>),
-    Min(Box<Expr>, Box<Expr>),
-    Max(Box<Expr>, Box<Expr>),
+    Add(Box<KernelExpr>, Box<KernelExpr>),
+    Sub(Box<KernelExpr>, Box<KernelExpr>),
+    Mul(Box<KernelExpr>, Box<KernelExpr>),
+    Div(Box<KernelExpr>, Box<KernelExpr>),
+    Min(Box<KernelExpr>, Box<KernelExpr>),
+    Max(Box<KernelExpr>, Box<KernelExpr>),
     // Comparisons yield 1.0 / 0.0; they exist to feed Select.
-    Lt(Box<Expr>, Box<Expr>),
-    Le(Box<Expr>, Box<Expr>),
-    Gt(Box<Expr>, Box<Expr>),
-    Ge(Box<Expr>, Box<Expr>),
-    Eq(Box<Expr>, Box<Expr>),
-    Ne(Box<Expr>, Box<Expr>),
+    Lt(Box<KernelExpr>, Box<KernelExpr>),
+    Le(Box<KernelExpr>, Box<KernelExpr>),
+    Gt(Box<KernelExpr>, Box<KernelExpr>),
+    Ge(Box<KernelExpr>, Box<KernelExpr>),
+    Eq(Box<KernelExpr>, Box<KernelExpr>),
+    Ne(Box<KernelExpr>, Box<KernelExpr>),
     // cond != 0 ? lhs : rhs — a true select that does not propagate NaN
     // from the unselected side (unlike an arithmetic mask).
-    Select(Box<Expr>, Box<Expr>, Box<Expr>),
-    Neg(Box<Expr>),
-    Sqrt(Box<Expr>),
-    Exp(Box<Expr>),
-    Sin(Box<Expr>),
-    Cos(Box<Expr>),
-    Tanh(Box<Expr>),
-    Abs(Box<Expr>),
-    Log(Box<Expr>),
-    Floor(Box<Expr>),
-    Ceil(Box<Expr>),
-    Round(Box<Expr>),
+    Select(Box<KernelExpr>, Box<KernelExpr>, Box<KernelExpr>),
+    Neg(Box<KernelExpr>),
+    Sqrt(Box<KernelExpr>),
+    Exp(Box<KernelExpr>),
+    Sin(Box<KernelExpr>),
+    Cos(Box<KernelExpr>),
+    Tanh(Box<KernelExpr>),
+    Abs(Box<KernelExpr>),
+    Log(Box<KernelExpr>),
+    Floor(Box<KernelExpr>),
+    Ceil(Box<KernelExpr>),
+    Round(Box<KernelExpr>),
     // constant exponent (f64 bits, keeping the IR Eq + Hash). Common
     // exponents lower to multiplies/sqrt; the rest lower to the platform
     // pow.
-    Powf(Box<Expr>, u64),
+    Powf(Box<KernelExpr>, u64),
     // Exact in the CPU interpreter; lowered to a stable expansion in ug
     // ops for GPU kernels (Metal has no erf).
-    Erf(Box<Expr>),
+    Erf(Box<KernelExpr>),
     // gelu with the exact erf form / the tanh approximation; emitted as
     // one helper so gemm epilogues and elementwise regions share it.
-    Gelu(Box<Expr>),
-    GeluTanh(Box<Expr>),
+    Gelu(Box<KernelExpr>),
+    GeluTanh(Box<KernelExpr>),
 }
 
-impl Expr {
+pub type Expr = KernelExpr;
+
+impl KernelExpr {
     // Moves child boxes into the worklist, leaving cheap leaves behind;
     // used by Drop so destructor glue never recurses.
-    fn drain_children(&mut self, worklist: &mut Vec<Box<Expr>>) {
-        fn dummy() -> Box<Expr> {
-            Box::new(Expr::Const(0))
+    fn drain_children(&mut self, worklist: &mut Vec<Box<KernelExpr>>) {
+        fn dummy() -> Box<KernelExpr> {
+            Box::new(KernelExpr::Const(0))
         }
         match self {
-            Expr::Input(_) | Expr::Scalar(_) | Expr::Const(_) => {}
-            Expr::Select(c, a, b) => {
+            KernelExpr::Input(_) | KernelExpr::Scalar(_) | KernelExpr::Const(_) => {}
+            KernelExpr::Select(c, a, b) => {
                 worklist.push(std::mem::replace(c, dummy()));
                 worklist.push(std::mem::replace(a, dummy()));
                 worklist.push(std::mem::replace(b, dummy()));
             }
-            Expr::Add(a, b)
-            | Expr::Sub(a, b)
-            | Expr::Mul(a, b)
-            | Expr::Div(a, b)
-            | Expr::Min(a, b)
-            | Expr::Max(a, b)
-            | Expr::Lt(a, b)
-            | Expr::Le(a, b)
-            | Expr::Gt(a, b)
-            | Expr::Ge(a, b)
-            | Expr::Eq(a, b)
-            | Expr::Ne(a, b) => {
+            KernelExpr::Add(a, b)
+            | KernelExpr::Sub(a, b)
+            | KernelExpr::Mul(a, b)
+            | KernelExpr::Div(a, b)
+            | KernelExpr::Min(a, b)
+            | KernelExpr::Max(a, b)
+            | KernelExpr::Lt(a, b)
+            | KernelExpr::Le(a, b)
+            | KernelExpr::Gt(a, b)
+            | KernelExpr::Ge(a, b)
+            | KernelExpr::Eq(a, b)
+            | KernelExpr::Ne(a, b) => {
                 worklist.push(std::mem::replace(a, dummy()));
                 worklist.push(std::mem::replace(b, dummy()));
             }
-            Expr::Neg(a)
-            | Expr::Sqrt(a)
-            | Expr::Exp(a)
-            | Expr::Sin(a)
-            | Expr::Cos(a)
-            | Expr::Tanh(a)
-            | Expr::Abs(a)
-            | Expr::Log(a)
-            | Expr::Floor(a)
-            | Expr::Ceil(a)
-            | Expr::Round(a)
-            | Expr::Powf(a, _)
-            | Expr::Erf(a)
-            | Expr::Gelu(a)
-            | Expr::GeluTanh(a) => worklist.push(std::mem::replace(a, dummy())),
+            KernelExpr::Neg(a)
+            | KernelExpr::Sqrt(a)
+            | KernelExpr::Exp(a)
+            | KernelExpr::Sin(a)
+            | KernelExpr::Cos(a)
+            | KernelExpr::Tanh(a)
+            | KernelExpr::Abs(a)
+            | KernelExpr::Log(a)
+            | KernelExpr::Floor(a)
+            | KernelExpr::Ceil(a)
+            | KernelExpr::Round(a)
+            | KernelExpr::Powf(a, _)
+            | KernelExpr::Erf(a)
+            | KernelExpr::Gelu(a)
+            | KernelExpr::GeluTanh(a) => worklist.push(std::mem::replace(a, dummy())),
         }
     }
 }
 
-impl Drop for Expr {
+impl Drop for KernelExpr {
     fn drop(&mut self) {
-        // A long elementwise chain fuses into one deep Expr; default
+        // A long elementwise chain fuses into one deep KernelExpr; default
         // destructor glue recurses over the Box chain and overflows the
         // (worker-thread) stack, so descendants drain into a worklist.
         // Worklist entries drop with dummy leaves in place, so their own
@@ -160,19 +162,22 @@ impl Drop for Expr {
 
 /// `x^e` with special cases for the common exponents: exact multiplies
 /// and sqrt are faster and more accurate than the platform pow.
-pub fn pow_expr(x: Expr, e: f64) -> Expr {
+pub fn pow_expr(x: KernelExpr, e: f64) -> KernelExpr {
     match e {
-        0.0 => Expr::cst(1.0),
+        0.0 => KernelExpr::cst(1.0),
         1.0 => x,
-        -1.0 => Expr::Div(Box::new(Expr::cst(1.0)), Box::new(x)),
-        2.0 => Expr::Mul(Box::new(x.clone()), Box::new(x)),
-        3.0 => Expr::Mul(
-            Box::new(Expr::Mul(Box::new(x.clone()), Box::new(x.clone()))),
+        -1.0 => KernelExpr::Div(Box::new(KernelExpr::cst(1.0)), Box::new(x)),
+        2.0 => KernelExpr::Mul(Box::new(x.clone()), Box::new(x)),
+        3.0 => KernelExpr::Mul(
+            Box::new(KernelExpr::Mul(Box::new(x.clone()), Box::new(x.clone()))),
             Box::new(x),
         ),
-        0.5 => Expr::Sqrt(Box::new(x)),
-        -0.5 => Expr::Div(Box::new(Expr::cst(1.0)), Box::new(Expr::Sqrt(Box::new(x)))),
-        _ => Expr::Powf(Box::new(x), e.to_bits()),
+        0.5 => KernelExpr::Sqrt(Box::new(x)),
+        -0.5 => KernelExpr::Div(
+            Box::new(KernelExpr::cst(1.0)),
+            Box::new(KernelExpr::Sqrt(Box::new(x))),
+        ),
+        _ => KernelExpr::Powf(Box::new(x), e.to_bits()),
     }
 }
 
@@ -209,81 +214,81 @@ impl ReduceOp {
     }
 }
 
-impl Expr {
+impl KernelExpr {
     pub fn cst(v: f64) -> Self {
-        Expr::Const(v.to_bits())
+        KernelExpr::Const(v.to_bits())
     }
 
     // Child references in left-to-right order.
-    fn children(&self) -> Vec<&Expr> {
+    fn children(&self) -> Vec<&KernelExpr> {
         match self {
-            Expr::Input(_) | Expr::Scalar(_) | Expr::Const(_) => Vec::new(),
-            Expr::Select(c, a, b) => vec![c.as_ref(), a.as_ref(), b.as_ref()],
-            Expr::Add(a, b)
-            | Expr::Sub(a, b)
-            | Expr::Mul(a, b)
-            | Expr::Div(a, b)
-            | Expr::Min(a, b)
-            | Expr::Max(a, b)
-            | Expr::Lt(a, b)
-            | Expr::Le(a, b)
-            | Expr::Gt(a, b)
-            | Expr::Ge(a, b)
-            | Expr::Eq(a, b)
-            | Expr::Ne(a, b) => vec![a.as_ref(), b.as_ref()],
-            Expr::Neg(a)
-            | Expr::Sqrt(a)
-            | Expr::Exp(a)
-            | Expr::Sin(a)
-            | Expr::Cos(a)
-            | Expr::Tanh(a)
-            | Expr::Abs(a)
-            | Expr::Log(a)
-            | Expr::Floor(a)
-            | Expr::Ceil(a)
-            | Expr::Round(a)
-            | Expr::Powf(a, _)
-            | Expr::Erf(a)
-            | Expr::Gelu(a)
-            | Expr::GeluTanh(a) => vec![a.as_ref()],
+            KernelExpr::Input(_) | KernelExpr::Scalar(_) | KernelExpr::Const(_) => Vec::new(),
+            KernelExpr::Select(c, a, b) => vec![c.as_ref(), a.as_ref(), b.as_ref()],
+            KernelExpr::Add(a, b)
+            | KernelExpr::Sub(a, b)
+            | KernelExpr::Mul(a, b)
+            | KernelExpr::Div(a, b)
+            | KernelExpr::Min(a, b)
+            | KernelExpr::Max(a, b)
+            | KernelExpr::Lt(a, b)
+            | KernelExpr::Le(a, b)
+            | KernelExpr::Gt(a, b)
+            | KernelExpr::Ge(a, b)
+            | KernelExpr::Eq(a, b)
+            | KernelExpr::Ne(a, b) => vec![a.as_ref(), b.as_ref()],
+            KernelExpr::Neg(a)
+            | KernelExpr::Sqrt(a)
+            | KernelExpr::Exp(a)
+            | KernelExpr::Sin(a)
+            | KernelExpr::Cos(a)
+            | KernelExpr::Tanh(a)
+            | KernelExpr::Abs(a)
+            | KernelExpr::Log(a)
+            | KernelExpr::Floor(a)
+            | KernelExpr::Ceil(a)
+            | KernelExpr::Round(a)
+            | KernelExpr::Powf(a, _)
+            | KernelExpr::Erf(a)
+            | KernelExpr::Gelu(a)
+            | KernelExpr::GeluTanh(a) => vec![a.as_ref()],
         }
     }
 
     // Rebuilds the same variant with new children (left-to-right).
-    fn rebuild(&self, mut children: Vec<Expr>) -> Expr {
+    fn rebuild(&self, mut children: Vec<KernelExpr>) -> KernelExpr {
         let mut next = || Box::new(children.remove(0));
         match self {
-            Expr::Input(k) => Expr::Input(*k),
-            Expr::Scalar(k) => Expr::Scalar(*k),
-            Expr::Const(b) => Expr::Const(*b),
-            Expr::Select(..) => Expr::Select(next(), next(), next()),
-            Expr::Add(..) => Expr::Add(next(), next()),
-            Expr::Sub(..) => Expr::Sub(next(), next()),
-            Expr::Mul(..) => Expr::Mul(next(), next()),
-            Expr::Div(..) => Expr::Div(next(), next()),
-            Expr::Min(..) => Expr::Min(next(), next()),
-            Expr::Max(..) => Expr::Max(next(), next()),
-            Expr::Lt(..) => Expr::Lt(next(), next()),
-            Expr::Le(..) => Expr::Le(next(), next()),
-            Expr::Gt(..) => Expr::Gt(next(), next()),
-            Expr::Ge(..) => Expr::Ge(next(), next()),
-            Expr::Eq(..) => Expr::Eq(next(), next()),
-            Expr::Ne(..) => Expr::Ne(next(), next()),
-            Expr::Neg(..) => Expr::Neg(next()),
-            Expr::Sqrt(..) => Expr::Sqrt(next()),
-            Expr::Exp(..) => Expr::Exp(next()),
-            Expr::Sin(..) => Expr::Sin(next()),
-            Expr::Cos(..) => Expr::Cos(next()),
-            Expr::Tanh(..) => Expr::Tanh(next()),
-            Expr::Abs(..) => Expr::Abs(next()),
-            Expr::Log(..) => Expr::Log(next()),
-            Expr::Floor(..) => Expr::Floor(next()),
-            Expr::Ceil(..) => Expr::Ceil(next()),
-            Expr::Round(..) => Expr::Round(next()),
-            Expr::Powf(_, e) => Expr::Powf(next(), *e),
-            Expr::Erf(..) => Expr::Erf(next()),
-            Expr::Gelu(..) => Expr::Gelu(next()),
-            Expr::GeluTanh(..) => Expr::GeluTanh(next()),
+            KernelExpr::Input(k) => KernelExpr::Input(*k),
+            KernelExpr::Scalar(k) => KernelExpr::Scalar(*k),
+            KernelExpr::Const(b) => KernelExpr::Const(*b),
+            KernelExpr::Select(..) => KernelExpr::Select(next(), next(), next()),
+            KernelExpr::Add(..) => KernelExpr::Add(next(), next()),
+            KernelExpr::Sub(..) => KernelExpr::Sub(next(), next()),
+            KernelExpr::Mul(..) => KernelExpr::Mul(next(), next()),
+            KernelExpr::Div(..) => KernelExpr::Div(next(), next()),
+            KernelExpr::Min(..) => KernelExpr::Min(next(), next()),
+            KernelExpr::Max(..) => KernelExpr::Max(next(), next()),
+            KernelExpr::Lt(..) => KernelExpr::Lt(next(), next()),
+            KernelExpr::Le(..) => KernelExpr::Le(next(), next()),
+            KernelExpr::Gt(..) => KernelExpr::Gt(next(), next()),
+            KernelExpr::Ge(..) => KernelExpr::Ge(next(), next()),
+            KernelExpr::Eq(..) => KernelExpr::Eq(next(), next()),
+            KernelExpr::Ne(..) => KernelExpr::Ne(next(), next()),
+            KernelExpr::Neg(..) => KernelExpr::Neg(next()),
+            KernelExpr::Sqrt(..) => KernelExpr::Sqrt(next()),
+            KernelExpr::Exp(..) => KernelExpr::Exp(next()),
+            KernelExpr::Sin(..) => KernelExpr::Sin(next()),
+            KernelExpr::Cos(..) => KernelExpr::Cos(next()),
+            KernelExpr::Tanh(..) => KernelExpr::Tanh(next()),
+            KernelExpr::Abs(..) => KernelExpr::Abs(next()),
+            KernelExpr::Log(..) => KernelExpr::Log(next()),
+            KernelExpr::Floor(..) => KernelExpr::Floor(next()),
+            KernelExpr::Ceil(..) => KernelExpr::Ceil(next()),
+            KernelExpr::Round(..) => KernelExpr::Round(next()),
+            KernelExpr::Powf(_, e) => KernelExpr::Powf(next(), *e),
+            KernelExpr::Erf(..) => KernelExpr::Erf(next()),
+            KernelExpr::Gelu(..) => KernelExpr::Gelu(next()),
+            KernelExpr::GeluTanh(..) => KernelExpr::GeluTanh(next()),
         }
     }
 
@@ -291,9 +296,9 @@ impl Expr {
     // keep it (None); internal nodes rebuild from already-transformed
     // children. Tree transforms must never recurse — deep fused regions
     // are bounded by heap, not the call stack.
-    fn transform(&self, f: &mut dyn FnMut(&Expr) -> Option<Expr>) -> Expr {
-        let mut stack: Vec<(&Expr, bool)> = vec![(self, false)];
-        let mut out: Vec<Expr> = Vec::new();
+    fn transform(&self, f: &mut dyn FnMut(&KernelExpr) -> Option<KernelExpr>) -> KernelExpr {
+        let mut stack: Vec<(&KernelExpr, bool)> = vec![(self, false)];
+        let mut out: Vec<KernelExpr> = Vec::new();
         while let Some((node, processed)) = stack.pop() {
             let children = node.children();
             if processed {
@@ -334,7 +339,7 @@ impl Expr {
 
     fn remap_inputs(&self, f: &mut dyn FnMut(u32) -> u32) -> Self {
         self.transform(&mut |e| match e {
-            Expr::Input(k) => Some(Expr::Input(f(*k))),
+            KernelExpr::Input(k) => Some(KernelExpr::Input(f(*k))),
             _ => None,
         })
     }
@@ -348,12 +353,12 @@ impl Expr {
     pub fn merge_lane(
         &self,
         lane: u32,
-        replacement: &Expr,
+        replacement: &KernelExpr,
         remap: &std::collections::HashMap<u32, u32>,
     ) -> Self {
         self.transform(&mut |e| match e {
-            Expr::Input(k) if *k == lane => Some(replacement.clone()),
-            Expr::Input(k) => Some(Expr::Input(remap[k])),
+            KernelExpr::Input(k) if *k == lane => Some(replacement.clone()),
+            KernelExpr::Input(k) => Some(KernelExpr::Input(remap[k])),
             _ => None,
         })
     }
@@ -361,21 +366,21 @@ impl Expr {
 
 // Clone, equality and hashing are manual and iterative (via the
 // post-order plan): derived glue would recurse over deep Box chains.
-impl Clone for Expr {
+impl Clone for KernelExpr {
     fn clone(&self) -> Self {
         self.transform(&mut |_| None)
     }
 }
 
-impl PartialEq for Expr {
+impl PartialEq for KernelExpr {
     fn eq(&self, other: &Self) -> bool {
         flatten(self) == flatten(other)
     }
 }
 
-impl Eq for Expr {}
+impl Eq for KernelExpr {}
 
-impl std::hash::Hash for Expr {
+impl std::hash::Hash for KernelExpr {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         for op in flatten(self) {
             op.hash(state);
@@ -532,7 +537,7 @@ impl_scalar!(f32, libm::erff);
 impl_scalar!(f64, libm::erf);
 
 // A fused expression flattened to a post-order plan. A long elementwise
-// chain fuses into one deep Expr, and the interpreter runs once per
+// chain fuses into one deep KernelExpr, and the interpreter runs once per
 // element — a recursive tree walk would multiply the chain depth by the
 // call stack of every element. Prepared CPU programs retain this plan and
 // evaluate it with caller-owned scratch.
@@ -573,88 +578,88 @@ enum Flat {
 
 // Iterative post-order flattening (the traversal is stack-safe like the
 // evaluator below).
-fn flatten_into(e: &Expr, out: &mut Vec<Flat>) {
-    let mut stack: Vec<(&Expr, bool)> = vec![(e, false)];
+fn flatten_into(e: &KernelExpr, out: &mut Vec<Flat>) {
+    let mut stack: Vec<(&KernelExpr, bool)> = vec![(e, false)];
     while let Some((node, processed)) = stack.pop() {
         if processed {
             out.push(match node {
-                Expr::Input(k) => Flat::Input(*k),
-                Expr::Scalar(k) => Flat::Scalar(*k),
-                Expr::Const(bits) => Flat::Const(*bits),
-                Expr::Add(..) => Flat::Add,
-                Expr::Sub(..) => Flat::Sub,
-                Expr::Mul(..) => Flat::Mul,
-                Expr::Div(..) => Flat::Div,
-                Expr::Min(..) => Flat::Min,
-                Expr::Max(..) => Flat::Max,
-                Expr::Lt(..) => Flat::Lt,
-                Expr::Le(..) => Flat::Le,
-                Expr::Gt(..) => Flat::Gt,
-                Expr::Ge(..) => Flat::Ge,
-                Expr::Eq(..) => Flat::Eq,
-                Expr::Ne(..) => Flat::Ne,
-                Expr::Select(..) => Flat::Select,
-                Expr::Neg(..) => Flat::Neg,
-                Expr::Sqrt(..) => Flat::Sqrt,
-                Expr::Exp(..) => Flat::Exp,
-                Expr::Sin(..) => Flat::Sin,
-                Expr::Cos(..) => Flat::Cos,
-                Expr::Tanh(..) => Flat::Tanh,
-                Expr::Abs(..) => Flat::Abs,
-                Expr::Log(..) => Flat::Log,
-                Expr::Floor(..) => Flat::Floor,
-                Expr::Ceil(..) => Flat::Ceil,
-                Expr::Round(..) => Flat::Round,
-                Expr::Powf(_, e) => Flat::Powf(*e),
-                Expr::Erf(..) => Flat::Erf,
-                Expr::Gelu(..) => Flat::Gelu,
-                Expr::GeluTanh(..) => Flat::GeluTanh,
+                KernelExpr::Input(k) => Flat::Input(*k),
+                KernelExpr::Scalar(k) => Flat::Scalar(*k),
+                KernelExpr::Const(bits) => Flat::Const(*bits),
+                KernelExpr::Add(..) => Flat::Add,
+                KernelExpr::Sub(..) => Flat::Sub,
+                KernelExpr::Mul(..) => Flat::Mul,
+                KernelExpr::Div(..) => Flat::Div,
+                KernelExpr::Min(..) => Flat::Min,
+                KernelExpr::Max(..) => Flat::Max,
+                KernelExpr::Lt(..) => Flat::Lt,
+                KernelExpr::Le(..) => Flat::Le,
+                KernelExpr::Gt(..) => Flat::Gt,
+                KernelExpr::Ge(..) => Flat::Ge,
+                KernelExpr::Eq(..) => Flat::Eq,
+                KernelExpr::Ne(..) => Flat::Ne,
+                KernelExpr::Select(..) => Flat::Select,
+                KernelExpr::Neg(..) => Flat::Neg,
+                KernelExpr::Sqrt(..) => Flat::Sqrt,
+                KernelExpr::Exp(..) => Flat::Exp,
+                KernelExpr::Sin(..) => Flat::Sin,
+                KernelExpr::Cos(..) => Flat::Cos,
+                KernelExpr::Tanh(..) => Flat::Tanh,
+                KernelExpr::Abs(..) => Flat::Abs,
+                KernelExpr::Log(..) => Flat::Log,
+                KernelExpr::Floor(..) => Flat::Floor,
+                KernelExpr::Ceil(..) => Flat::Ceil,
+                KernelExpr::Round(..) => Flat::Round,
+                KernelExpr::Powf(_, e) => Flat::Powf(*e),
+                KernelExpr::Erf(..) => Flat::Erf,
+                KernelExpr::Gelu(..) => Flat::Gelu,
+                KernelExpr::GeluTanh(..) => Flat::GeluTanh,
             });
             continue;
         }
         stack.push((node, true));
         match node {
-            Expr::Input(_) | Expr::Scalar(_) | Expr::Const(_) => {}
-            Expr::Select(c, a, b) => {
+            KernelExpr::Input(_) | KernelExpr::Scalar(_) | KernelExpr::Const(_) => {}
+            KernelExpr::Select(c, a, b) => {
                 stack.push((b, false));
                 stack.push((a, false));
                 stack.push((c, false));
             }
-            Expr::Add(a, b)
-            | Expr::Sub(a, b)
-            | Expr::Mul(a, b)
-            | Expr::Div(a, b)
-            | Expr::Min(a, b)
-            | Expr::Max(a, b)
-            | Expr::Lt(a, b)
-            | Expr::Le(a, b)
-            | Expr::Gt(a, b)
-            | Expr::Ge(a, b)
-            | Expr::Eq(a, b)
-            | Expr::Ne(a, b) => {
+            KernelExpr::Add(a, b)
+            | KernelExpr::Sub(a, b)
+            | KernelExpr::Mul(a, b)
+            | KernelExpr::Div(a, b)
+            | KernelExpr::Min(a, b)
+            | KernelExpr::Max(a, b)
+            | KernelExpr::Lt(a, b)
+            | KernelExpr::Le(a, b)
+            | KernelExpr::Gt(a, b)
+            | KernelExpr::Ge(a, b)
+            | KernelExpr::Eq(a, b)
+            | KernelExpr::Ne(a, b) => {
                 stack.push((b, false));
                 stack.push((a, false));
             }
-            Expr::Neg(a)
-            | Expr::Sqrt(a)
-            | Expr::Exp(a)
-            | Expr::Sin(a)
-            | Expr::Cos(a)
-            | Expr::Tanh(a)
-            | Expr::Abs(a)
-            | Expr::Log(a)
-            | Expr::Floor(a)
-            | Expr::Ceil(a)
-            | Expr::Round(a)
-            | Expr::Powf(a, _)
-            | Expr::Erf(a)
-            | Expr::Gelu(a)
-            | Expr::GeluTanh(a) => stack.push((a, false)),
+            KernelExpr::Neg(a)
+            | KernelExpr::Sqrt(a)
+            | KernelExpr::Exp(a)
+            | KernelExpr::Sin(a)
+            | KernelExpr::Cos(a)
+            | KernelExpr::Tanh(a)
+            | KernelExpr::Abs(a)
+            | KernelExpr::Log(a)
+            | KernelExpr::Floor(a)
+            | KernelExpr::Ceil(a)
+            | KernelExpr::Round(a)
+            | KernelExpr::Powf(a, _)
+            | KernelExpr::Erf(a)
+            | KernelExpr::Gelu(a)
+            | KernelExpr::GeluTanh(a) => stack.push((a, false)),
         }
     }
 }
 
-fn flatten(e: &Expr) -> Vec<Flat> {
+fn flatten(e: &KernelExpr) -> Vec<Flat> {
     let mut out = Vec::new();
     flatten_into(e, &mut out);
     out
@@ -675,7 +680,7 @@ pub struct CpuFusionProgram {
 }
 
 impl CpuFusionProgram {
-    pub fn new(exprs: &[Expr]) -> Self {
+    pub fn new(exprs: &[KernelExpr]) -> Self {
         let mut ops = Vec::new();
         let mut plan_ends = Vec::with_capacity(exprs.len());
         let mut input_count = 0usize;
@@ -927,7 +932,7 @@ pub fn interpret_core_into<T: Scalar>(
 }
 
 pub fn interpret_core<T: Scalar>(
-    exprs: &[Expr],
+    exprs: &[KernelExpr],
     slices: &[&[T]],
     strides: Option<&[Vec<usize>]>,
     scalar_values: &[T],
@@ -1028,7 +1033,7 @@ pub fn interpret_reduce_core_into<T: Scalar>(
 #[allow(clippy::too_many_arguments)]
 pub fn interpret_reduce_core<T: Scalar>(
     op: ReduceOp,
-    expr: &Expr,
+    expr: &KernelExpr,
     slices: &[&[T]],
     strides: &[Vec<usize>],
     in_shape: &[usize],
@@ -1058,15 +1063,15 @@ pub fn interpret_reduce_core<T: Scalar>(
 // v] with scalar lanes [lr, 1 - beta1^t, 1 - beta2^t], mirroring the
 // composed update's operation order exactly. Step-dependent values are
 // scalar lanes so the compiled kernel is stable across steps.
-pub fn adamw_exprs(beta1: f64, beta2: f64, eps: f64, weight_decay: f64) -> [Expr; 3] {
+pub fn adamw_exprs(beta1: f64, beta2: f64, eps: f64, weight_decay: f64) -> [KernelExpr; 3] {
     adamw_exprs_with(
         beta1,
         beta2,
         eps,
         weight_decay,
-        Expr::Scalar(0),
-        Expr::Scalar(1),
-        Expr::Scalar(2),
+        KernelExpr::Scalar(0),
+        KernelExpr::Scalar(1),
+        KernelExpr::Scalar(2),
     )
 }
 
@@ -1075,38 +1080,44 @@ fn adamw_exprs_with(
     beta2: f64,
     eps: f64,
     weight_decay: f64,
-    lr: Expr,
-    c1: Expr,
-    c2: Expr,
-) -> [Expr; 3] {
+    lr: KernelExpr,
+    c1: KernelExpr,
+    c2: KernelExpr,
+) -> [KernelExpr; 3] {
     let (p, g, m, v) = (
-        Expr::Input(0),
-        Expr::Input(1),
-        Expr::Input(2),
-        Expr::Input(3),
+        KernelExpr::Input(0),
+        KernelExpr::Input(1),
+        KernelExpr::Input(2),
+        KernelExpr::Input(3),
     );
-    let next_m = Expr::Add(
-        Box::new(Expr::Mul(Box::new(m), Box::new(Expr::cst(beta1)))),
-        Box::new(Expr::Mul(
+    let next_m = KernelExpr::Add(
+        Box::new(KernelExpr::Mul(
+            Box::new(m),
+            Box::new(KernelExpr::cst(beta1)),
+        )),
+        Box::new(KernelExpr::Mul(
             Box::new(g.clone()),
-            Box::new(Expr::cst(1.0 - beta1)),
+            Box::new(KernelExpr::cst(1.0 - beta1)),
         )),
     );
-    let next_v = Expr::Add(
-        Box::new(Expr::Mul(Box::new(v), Box::new(Expr::cst(beta2)))),
-        Box::new(Expr::Mul(
-            Box::new(Expr::Mul(Box::new(g.clone()), Box::new(g))),
-            Box::new(Expr::cst(1.0 - beta2)),
+    let next_v = KernelExpr::Add(
+        Box::new(KernelExpr::Mul(
+            Box::new(v),
+            Box::new(KernelExpr::cst(beta2)),
+        )),
+        Box::new(KernelExpr::Mul(
+            Box::new(KernelExpr::Mul(Box::new(g.clone()), Box::new(g))),
+            Box::new(KernelExpr::cst(1.0 - beta2)),
         )),
     );
-    let m_hat = Expr::Div(Box::new(next_m.clone()), Box::new(c1));
-    let v_hat = Expr::Div(Box::new(next_v.clone()), Box::new(c2));
-    let adjusted = Expr::Mul(
-        Box::new(Expr::Div(
+    let m_hat = KernelExpr::Div(Box::new(next_m.clone()), Box::new(c1));
+    let v_hat = KernelExpr::Div(Box::new(next_v.clone()), Box::new(c2));
+    let adjusted = KernelExpr::Mul(
+        Box::new(KernelExpr::Div(
             Box::new(m_hat),
-            Box::new(Expr::Add(
-                Box::new(Expr::Sqrt(Box::new(v_hat))),
-                Box::new(Expr::cst(eps)),
+            Box::new(KernelExpr::Add(
+                Box::new(KernelExpr::Sqrt(Box::new(v_hat))),
+                Box::new(KernelExpr::cst(eps)),
             )),
         )),
         Box::new(lr.clone()),
@@ -1114,16 +1125,19 @@ fn adamw_exprs_with(
     let base = if weight_decay == 0.0 {
         p
     } else {
-        Expr::Mul(
+        KernelExpr::Mul(
             Box::new(p),
-            Box::new(Expr::Sub(
-                Box::new(Expr::cst(1.0)),
-                Box::new(Expr::Mul(Box::new(lr), Box::new(Expr::cst(weight_decay)))),
+            Box::new(KernelExpr::Sub(
+                Box::new(KernelExpr::cst(1.0)),
+                Box::new(KernelExpr::Mul(
+                    Box::new(lr),
+                    Box::new(KernelExpr::cst(weight_decay)),
+                )),
             )),
         )
     };
     [
-        Expr::Sub(Box::new(base), Box::new(adjusted)),
+        KernelExpr::Sub(Box::new(base), Box::new(adjusted)),
         next_m,
         next_v,
     ]
@@ -1132,14 +1146,19 @@ fn adamw_exprs_with(
 // The fused momentum-SGD update over lanes [param, grad, velocity] with
 // scalar lanes [lr, first], mirroring the composed update including the
 // first-step v = g initialization as a select on the 0-d `first` flag.
-pub fn sgd_exprs(momentum: f64, dampening: f64, nesterov: bool, weight_decay: f64) -> [Expr; 2] {
+pub fn sgd_exprs(
+    momentum: f64,
+    dampening: f64,
+    nesterov: bool,
+    weight_decay: f64,
+) -> [KernelExpr; 2] {
     sgd_exprs_with(
         momentum,
         dampening,
         nesterov,
         weight_decay,
-        Expr::Scalar(0),
-        Expr::Scalar(1),
+        KernelExpr::Scalar(0),
+        KernelExpr::Scalar(1),
     )
 }
 
@@ -1148,59 +1167,61 @@ fn sgd_exprs_with(
     dampening: f64,
     nesterov: bool,
     weight_decay: f64,
-    lr: Expr,
-    first: Expr,
-) -> [Expr; 2] {
-    let (p, g, v) = (Expr::Input(0), Expr::Input(1), Expr::Input(2));
+    lr: KernelExpr,
+    first: KernelExpr,
+) -> [KernelExpr; 2] {
+    let (p, g, v) = (
+        KernelExpr::Input(0),
+        KernelExpr::Input(1),
+        KernelExpr::Input(2),
+    );
     let gp = if weight_decay == 0.0 {
         g
     } else {
-        Expr::Add(
+        KernelExpr::Add(
             Box::new(g),
-            Box::new(Expr::Mul(
+            Box::new(KernelExpr::Mul(
                 Box::new(p.clone()),
-                Box::new(Expr::cst(weight_decay)),
+                Box::new(KernelExpr::cst(weight_decay)),
             )),
         )
     };
-    let continued = Expr::Add(
-        Box::new(Expr::Mul(Box::new(v), Box::new(Expr::cst(momentum)))),
-        Box::new(Expr::Mul(
+    let continued = KernelExpr::Add(
+        Box::new(KernelExpr::Mul(
+            Box::new(v),
+            Box::new(KernelExpr::cst(momentum)),
+        )),
+        Box::new(KernelExpr::Mul(
             Box::new(gp.clone()),
-            Box::new(Expr::cst(1.0 - dampening)),
+            Box::new(KernelExpr::cst(1.0 - dampening)),
         )),
     );
-    let next_v = Expr::Select(
-        Box::new(Expr::Gt(Box::new(first), Box::new(Expr::cst(0.5)))),
+    let next_v = KernelExpr::Select(
+        Box::new(KernelExpr::Gt(
+            Box::new(first),
+            Box::new(KernelExpr::cst(0.5)),
+        )),
         Box::new(gp.clone()),
         Box::new(continued),
     );
     let used = if nesterov {
-        Expr::Add(
+        KernelExpr::Add(
             Box::new(gp),
-            Box::new(Expr::Mul(
+            Box::new(KernelExpr::Mul(
                 Box::new(next_v.clone()),
-                Box::new(Expr::cst(momentum)),
+                Box::new(KernelExpr::cst(momentum)),
             )),
         )
     } else {
         next_v.clone()
     };
     [
-        Expr::Sub(
+        KernelExpr::Sub(
             Box::new(p),
-            Box::new(Expr::Mul(Box::new(used), Box::new(lr))),
+            Box::new(KernelExpr::Mul(Box::new(used), Box::new(lr))),
         ),
         next_v,
     ]
-}
-
-impl effect_torch_graph::FusionExpression for Expr {
-    type ReduceOp = ReduceOp;
-
-    fn lane_strides(lane: &[usize], out: &[usize]) -> Option<Vec<usize>> {
-        lane_strides(lane, out)
-    }
 }
 
 pub fn is_supported(
@@ -1226,8 +1247,14 @@ mod interpreter_tests {
     #[test]
     fn prepared_into_paths_match_wrappers_with_exact_scratch() {
         let exprs = [
-            Expr::Add(Box::new(Expr::Input(0)), Box::new(Expr::Input(1))),
-            Expr::Mul(Box::new(Expr::Input(0)), Box::new(Expr::Scalar(0))),
+            KernelExpr::Add(
+                Box::new(KernelExpr::Input(0)),
+                Box::new(KernelExpr::Input(1)),
+            ),
+            KernelExpr::Mul(
+                Box::new(KernelExpr::Input(0)),
+                Box::new(KernelExpr::Scalar(0)),
+            ),
         ];
         let a = [1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0];
         let b = [10.0f32, 20.0, 30.0];
@@ -1254,7 +1281,10 @@ mod interpreter_tests {
         assert_eq!(first.as_slice(), wrapped[0]);
         assert_eq!(second.as_slice(), wrapped[1]);
 
-        let reduce_expr = Expr::Mul(Box::new(Expr::Input(0)), Box::new(Expr::Input(0)));
+        let reduce_expr = KernelExpr::Mul(
+            Box::new(KernelExpr::Input(0)),
+            Box::new(KernelExpr::Input(0)),
+        );
         let reduce_program = CpuFusionProgram::new(std::slice::from_ref(&reduce_expr));
         assert_eq!(reduce_program.scratch_elements(), 3);
         let wrapped_reduce = interpret_reduce_core(

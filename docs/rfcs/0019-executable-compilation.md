@@ -195,15 +195,15 @@ Validate and specialize
         v
 Optional inference specialization
         v
-Canonicalize and optimize
+PreparedProgram + one GraphIndex
         v
-Backend lowering
+Side-table OptimizationPlan
         v
-Logical schedule
+Typed backend LoweredProgram
         v
 Liveness and memory assignment
         v
-Physical hazards, commands, and synchronization
+Physical InstructionId plan and prepared pipelines
         v
 Executable
         v
@@ -230,18 +230,22 @@ pub struct ProgramRequest {
     pub bindings: Vec<BindingDecl>,
     pub invocation: InvocationSignature,
     pub options: CompileOptions,
-    pub state: Option<StateSchema>,
+    pub state_cursor: Option<StateCursorSlot>,
 }
 
 pub struct CompileOptions {
     pub optimize: bool,
-    pub precision: PrecisionPolicy,
     pub inference: Option<InferenceOptions>,
+    pub environment: EnvironmentOptions,
 }
 
 pub struct InferenceOptions {
-    pub generation: Option<GenerationOptions>,
     pub constant_weights: bool,
+}
+
+pub struct StateCursorSlot {
+    pub slot: u32,
+    pub tensor: bool,
 }
 
 pub struct BindingDecl {
@@ -270,8 +274,14 @@ pub struct InvocationSignature {
 }
 ```
 
-`optimize: false` disables optional rewrites and fusion. It does not bypass
-lowering, scheduling, memory planning, or executable construction.
+`optimize: false` disables optional code-generation regions and fusion. It does
+not bypass lowering, scheduling, memory planning, or executable construction.
+
+The illustrative executable `PrecisionPolicy` was removed from the implemented
+compile request because it had no lowering consumer. It remains absent until an
+executable precision policy is specified. Trainer mixed-BF16 is separate: the
+Trainer builds a cast graph with F32 master parameters/state rather than setting
+an executable compile option.
 
 With `inference: None`, the compiler optimizes the requested roots without
 inference-only assumptions. This is the path for arbitrary `Tensor.compute` and
@@ -279,12 +289,13 @@ for training graphs. Backward saved values, rematerialization boundaries,
 optimizer updates, and their lifetimes are ordinary dependencies visible in
 those roots.
 
-`inference: Some(...)` permits inference-only transformations such as constant
-weight prepacking, legal donation, causal-attention-to-paged-KV lowering, KDA
-recurrence, and convolution-history caching. Generation options carry the
-persistent state geometry and bounded runtime-value contract. Prefill, single
-token decode, and batched decode are shape-specialized executables produced by
-that inference specialization, not compiler modes of their own.
+`inference: Some(...)` authorizes constant-weight retention. A stateful public
+compile request separately authorizes the shared semantic specialization that
+lowers causal attention, KDA recurrence, and convolution history to persistent
+decode state before `ProgramRequest` preparation. The resulting
+`StateCursorSlot` becomes a bounded scalar or batched cursor runtime value in
+`ProgramSignature`. Prefill, single-token decode, and batched decode remain
+shape-specialized executables, not compiler modes of their own.
 
 `Require` rejects a binding that does not satisfy its constraint.
 `Canonicalize` always emits the declared copy into the schedule and memory
@@ -336,7 +347,6 @@ structural graph hash
 complete binding declarations, layout policies, aliasing, and ownership
 complete invocation signature and bounded runtime-value declarations
 compile and inference-specialization options
-precision policy
 runtime/client identity and backend/device capabilities
 kernel-selection policy
 complete state schema and geometry
@@ -358,12 +368,13 @@ caches.
 
 ### Values and instructions
 
-Lowering converts graph nodes into an explicit instruction schedule. One graph
-node may lower to zero instructions (a view or eliminated value), one generic
-instruction, one fused instruction, or a nested schedule with fixed instruction
-topology. Bounded runtime values may select launch dimensions or active ranges,
-but may not introduce instructions, choose another algorithm, or increase an
-allocation beyond its declared capacity.
+Lowering converts prepared semantic nodes and RFC 0021 regions into an explicit
+typed instruction schedule. One graph node may lower to zero instructions (a
+view or eliminated value), one generic instruction, one fused instruction, or a
+typed algorithm plan with fixed dispatch topology. Bounded runtime values may
+select launch dimensions or active ranges, but may not introduce instructions,
+choose another algorithm, or increase an allocation beyond its declared
+capacity.
 
 ```rust
 pub type ValueId = u32;
@@ -429,10 +440,10 @@ optimizations disabled, the compiler emits approximately one instruction per
 materializing graph operation while still using the common scheduler, memory
 planner, and executor.
 
-Optimized lowering rewrites or combines those operations but targets the same
-IR. Correctness tests compare optimized and unoptimized executables. There is
-no graph interpreter whose allocation, synchronization, or error semantics can
-drift from production execution.
+Optimized lowering selects side-table regions that combine those operations but
+targets the same IR. Correctness tests compare optimized and unoptimized
+executables. There is no graph interpreter whose allocation, synchronization,
+or error semantics can drift from production execution.
 
 ### Fused and semantic operations
 
@@ -509,52 +520,64 @@ planner emits reuse edges. A backend command-planning pass then realizes all
 semantic and reuse edges as command-buffer boundaries, barriers, fences, or
 events.
 
-The initial Metal implementation uses one queue, buffer-scope barriers between
-relevant dispatches, event dependencies across command buffers, and no
-cross-queue execution. Consecutive command buffers are not assumed to execute
-serially merely because they were submitted in order. Every submitted command
-buffer contributes completion and error status to the invocation token.
+The implemented Metal physical plan uses one queue and explicit commit,
+completion, and status-gate boundaries. Every submitted command buffer
+contributes completion and error status to the invocation token.
 
-### Final linear command program
+### Authoritative lowered and physical programs
 
-Graph and SSA-like structures are compiler internals. After logical scheduling,
-memory assignment, and physical hazard planning, the backend emits a dense
-linear command program. The executable does not retain `Arc<Node>` roots for
-execution and does not perform reachability, topological, consumer-count, or
-last-use traversal at invocation time.
+Graph and region structures are compiler inputs. Backend lowering emits one
+dense typed `LoweredProgram`; memory planning and diagnostics consume that same
+program. A physical plan adds synchronization mechanics by referencing lowered
+`InstructionId`s and does not copy operation operands or resource declarations.
+The executable does not retain `Arc<Node>` roots for execution and does not
+perform reachability, topological, consumer-count, or last-use traversal at
+invocation time.
 
 Illustrative structure:
 
 ```rust
-pub struct NativeExecutable<C, P> {
-    pub signature: InvocationSignature,
-    pub locations: Box<[Location]>,
+pub struct NativeExecutable<I, M, V, C, P> {
+    pub signature: ProgramSignature,
+    pub program: Arc<LoweredProgram<I, M, V>>,
+    pub memory: MemoryPlan<M>,
+    pub physical: Box<[C]>,
     pub pipelines: Box<[P]>,
-    pub commands: Box<[C]>,
-    pub outputs: Box<[OutputSlot]>,
-    pub memory: MemoryPlan,
+}
+
+pub enum CpuPhysicalCommand {
+    Encode(InstructionId),
+}
+
+pub enum MetalPhysicalCommand {
+    Encode(InstructionId),
+    StatusGate(InstructionId),
+    Commit,
+    Complete,
 }
 ```
 
-CPU and Metal define different command enums. A Metal command stream may
-contain dispatch, buffer barrier, command-buffer commit, status gate, and state
-commit commands. A CPU stream may contain kernel-call, parallel-loop, status
-gate, and state commit commands. Commands refer to pipelines, values, and
-locations by dense integer indexes rather than graph pointers or hash-map keys.
+CPU and Metal define different typed instruction, value, and algorithm-plan
+records. Their lowered instructions declare inputs, outputs, scratch, staging,
+status, and state resources. Physical commands refer to those instructions by
+dense IDs rather than graph pointers or a second tensor-command enum.
 
-Fixed small loops may be unrolled. Larger fixed-topology loops use a compact
-`Repeat` command whose body is a contiguous command range and whose trip count
-is static or a bounded invocation value. Status gates may terminate a suffix,
-but they do not discover new instructions. Launch geometry can be computed from
-the invocation ABI; command topology and allocation remain fixed.
+Fixed internal dispatch sequences and loops are retained in typed algorithm
+plans with conservative declared resources. Status gates may terminate a
+suffix, but they do not discover new instructions. Launch geometry can be
+computed from the invocation ABI; instruction topology and allocation remain
+fixed.
 
 After invocation resources are resolved, execution is conceptually:
 
 ```rust
 let resolved = resolve_locations(executable, invocation, resources)?;
-let mut pc = 0;
-while pc < executable.commands.len() {
-    pc = dispatch(&executable.commands[pc], &resolved, pc)?;
+for command in executable.physical.iter() {
+    match command {
+        Encode(id) => dispatch(executable.program.instruction(*id), &resolved)?,
+        // status/commit/completion mechanics do not duplicate tensor semantics
+        _ => apply_physical_boundary(command, &resolved)?,
+    }
 }
 ```
 
@@ -1012,8 +1035,9 @@ escaping outputs and allocations outside executable workspace.
 ### RFC 0007: Kernel fusion
 
 Fusion remains an optimization over semantic graphs and scalar expression IR,
-but runs only during compilation. Fused nodes lower to explicit instructions
-with storage contracts. The CPU correctness path is generic executable
+but runs only during compilation. RFC 0021 side-table regions lower to explicit
+typed instructions with storage contracts; compiler-created fused semantic
+nodes are no longer used. The CPU correctness path is generic executable
 lowering, not a separate per-element graph interpreter.
 
 ### RFC 0008: Compilation
@@ -1186,6 +1210,24 @@ host invocation frames are preallocated and the publication/driver exceptions
 are finalized, this RFC remains `Draft` and must not claim zero total dynamic
 allocation.
 
+### RFC 0021 update (2026-08-11)
+
+RFC 0021 completed the compiler representation used by this executable model.
+One `ProgramRequest` prepares one `ProgramSignature` and `GraphIndex`; compiler
+optimizations are side-table regions over the nongeneric semantic graph. CPU
+and Metal now retain authoritative typed `LoweredProgram` values and
+instructions whose exact input, output, scratch, staging, status, and state
+resources feed liveness, memory planning, diagnostics, and execution.
+
+The backend physical plans reference lowered `InstructionId`s. CPU physical
+entries are encodes; Metal adds status gates, commits, and completion boundaries.
+There is no independently copied dense tensor-command array or string-valued
+planning schedule. `ProgramSignature` validates binding/scalar/runtime/RNG and
+output contracts, while decode's scalar or batched state cursor is represented
+as a bounded runtime-value contract derived during shared specialization.
+Inference-only constant weights remain implemented. The unused executable
+precision option was removed; Trainer mixed-BF16 remains separate.
+
 ## Acceptance Criteria
 
 ### Architecture
@@ -1196,9 +1238,9 @@ allocation.
 - Readback and serialization transfer work use the same submission coordinator
   and completion/error propagation as executable dispatch.
 - No production path executes a semantic graph directly.
-- A native executable dispatches from a dense linear command array; invocation
-  performs no graph reachability, topological sort, consumer counting, or
-  last-use traversal.
+- A native executable dispatches typed lowered instructions through a physical
+  plan of dense `InstructionId` references; invocation performs no graph
+  reachability, topological sort, consumer counting, or last-use traversal.
 - Production native executable handles do not retain semantic graph roots needed
   for execution; optional source maps are diagnostics-only.
 - Fusion and kernel selection do not occur during execute.

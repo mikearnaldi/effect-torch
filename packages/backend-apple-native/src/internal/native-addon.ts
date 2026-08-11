@@ -8,7 +8,6 @@ export declare class CancellationToken {
 
 /** @internal */
 export declare class Executable {
-  get signature(): string
   get stateful(): boolean
   get batch(): number
   get layers(): number
@@ -211,7 +210,6 @@ export declare const enum NativeDType {
 /** @internal */
 export interface NativeCompileOptions {
   optimize?: boolean
-  allowReducedPrecision?: boolean
   constantWeights?: boolean
 }
 
@@ -253,6 +251,7 @@ export interface NativeExecutableDiagnostics {
     peakLiveBytes: number
     packingOverheadBytes: number
   }
+  compilePhases: Array<{ phase: string; nanoseconds: number }>
 }
 
 /** @internal */

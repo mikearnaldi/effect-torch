@@ -6,6 +6,7 @@ use std::fmt;
 pub enum LayoutConstraint {
     Exact(Layout),
     Contiguous,
+    ZeroOffsetContiguous,
     AnyStrided,
 }
 
@@ -211,24 +212,126 @@ pub struct Invocation {
 }
 
 impl ProgramSignature {
+    pub fn validate_invocation_counts(
+        &self,
+        bindings: usize,
+        scalars: usize,
+        runtime_values: usize,
+        rng_counters: Option<usize>,
+    ) -> Result<(), InvocationError> {
+        validate_count("bindings", self.bindings.len(), bindings)?;
+        validate_count("scalars", self.invocation.scalars.len(), scalars)?;
+        validate_count(
+            "runtime values",
+            self.invocation.runtime_values.len(),
+            runtime_values,
+        )?;
+        match (self.invocation.rng, rng_counters) {
+            (None, None) => Ok(()),
+            (Some(decl), Some(actual)) if actual == decl.counter_count as usize => Ok(()),
+            (Some(decl), Some(actual)) => Err(InvocationError::RngCounterCount {
+                expected: decl.counter_count as usize,
+                actual,
+            }),
+            (expected, actual) => Err(InvocationError::RngPresence {
+                expected: expected.is_some(),
+                actual: actual.is_some(),
+            }),
+        }
+    }
+
+    pub fn validate_binding_metadata(
+        &self,
+        binding: usize,
+        dtype: DType,
+        placement: &Placement,
+        layout: &Layout,
+    ) -> Result<(), InvocationError> {
+        let Some(decl) = self.bindings.get(binding) else {
+            return Err(InvocationError::Count {
+                kind: "bindings",
+                expected: self.bindings.len(),
+                actual: binding.saturating_add(1),
+            });
+        };
+        if dtype != decl.dtype {
+            return Err(InvocationError::DTypeMismatch {
+                binding,
+                expected: decl.dtype,
+                actual: dtype,
+            });
+        }
+        if placement != &decl.placement {
+            return Err(InvocationError::PlacementMismatch { binding });
+        }
+        if layout.shape() != decl.shape {
+            return Err(InvocationError::ShapeMismatch { binding });
+        }
+        let layout_matches = match &decl.layout {
+            BindingLayoutPolicy::Require(LayoutConstraint::Exact(expected)) => layout == expected,
+            BindingLayoutPolicy::Require(LayoutConstraint::Contiguous) => layout.is_contiguous(),
+            BindingLayoutPolicy::Require(LayoutConstraint::ZeroOffsetContiguous) => {
+                layout.is_contiguous() && layout.offset() == 0
+            }
+            BindingLayoutPolicy::Require(LayoutConstraint::AnyStrided)
+            | BindingLayoutPolicy::Canonicalize { .. } => true,
+        };
+        if !layout_matches {
+            return Err(InvocationError::LayoutMismatch { binding });
+        }
+        Ok(())
+    }
+
+    pub fn validate_scalar_metadata(
+        &self,
+        scalar: usize,
+        scalar_type: ScalarType,
+    ) -> Result<(), InvocationError> {
+        let Some(decl) = self.invocation.scalars.get(scalar) else {
+            return Err(InvocationError::Count {
+                kind: "scalars",
+                expected: self.invocation.scalars.len(),
+                actual: scalar.saturating_add(1),
+            });
+        };
+        if decl.scalar_type != scalar_type {
+            return Err(InvocationError::ScalarTypeMismatch { scalar });
+        }
+        Ok(())
+    }
+
+    pub fn validate_runtime_value_metadata(
+        &self,
+        runtime_value: usize,
+        value: &RuntimeValue,
+    ) -> Result<(), InvocationError> {
+        let Some(decl) = self.invocation.runtime_values.get(runtime_value) else {
+            return Err(InvocationError::Count {
+                kind: "runtime values",
+                expected: self.invocation.runtime_values.len(),
+                actual: runtime_value.saturating_add(1),
+            });
+        };
+        decl.validate(value)
+            .map_err(|source| InvocationError::RuntimeValue {
+                runtime_value,
+                source,
+            })
+    }
+
     pub fn validate_invocation(
         &self,
         runtime: RuntimeId,
         invocation: &Invocation,
     ) -> Result<(), InvocationError> {
-        validate_count("bindings", self.bindings.len(), invocation.bindings.len())?;
-        validate_count(
-            "scalars",
-            self.invocation.scalars.len(),
+        self.validate_invocation_counts(
+            invocation.bindings.len(),
             invocation.scalars.len(),
-        )?;
-        validate_count(
-            "runtime values",
-            self.invocation.runtime_values.len(),
             invocation.runtime_values.len(),
+            invocation.rng.as_ref().map(|rng| rng.counters.len()),
         )?;
 
-        for (index, (decl, buffer)) in self.bindings.iter().zip(&invocation.bindings).enumerate() {
+        for (index, buffer) in invocation.bindings.iter().enumerate() {
             if buffer.runtime_id() != runtime {
                 return Err(InvocationError::InvalidOwner {
                     binding: index,
@@ -236,75 +339,20 @@ impl ProgramSignature {
                     actual: buffer.runtime_id(),
                 });
             }
-            if buffer.dtype() != decl.dtype {
-                return Err(InvocationError::DTypeMismatch {
-                    binding: index,
-                    expected: decl.dtype,
-                    actual: buffer.dtype(),
-                });
-            }
-            if buffer.placement() != &decl.placement {
-                return Err(InvocationError::PlacementMismatch { binding: index });
-            }
-            if buffer.layout().shape() != decl.shape {
-                return Err(InvocationError::ShapeMismatch { binding: index });
-            }
-            let layout_matches = match &decl.layout {
-                BindingLayoutPolicy::Require(LayoutConstraint::Exact(layout)) => {
-                    buffer.layout() == layout
-                }
-                BindingLayoutPolicy::Require(LayoutConstraint::Contiguous) => {
-                    buffer.layout().is_contiguous()
-                }
-                BindingLayoutPolicy::Require(LayoutConstraint::AnyStrided)
-                | BindingLayoutPolicy::Canonicalize { .. } => true,
-            };
-            if !layout_matches {
-                return Err(InvocationError::LayoutMismatch { binding: index });
-            }
+            self.validate_binding_metadata(
+                index,
+                buffer.dtype(),
+                buffer.placement(),
+                buffer.layout(),
+            )?;
         }
 
-        for (index, (decl, value)) in self
-            .invocation
-            .scalars
-            .iter()
-            .zip(&invocation.scalars)
-            .enumerate()
-        {
-            if decl.scalar_type != value.scalar_type() {
-                return Err(InvocationError::ScalarTypeMismatch { scalar: index });
-            }
+        for (index, value) in invocation.scalars.iter().enumerate() {
+            self.validate_scalar_metadata(index, value.scalar_type())?;
         }
 
-        for (index, (decl, value)) in self
-            .invocation
-            .runtime_values
-            .iter()
-            .zip(&invocation.runtime_values)
-            .enumerate()
-        {
-            decl.validate(value)
-                .map_err(|source| InvocationError::RuntimeValue {
-                    runtime_value: index,
-                    source,
-                })?;
-        }
-
-        match (&self.invocation.rng, &invocation.rng) {
-            (None, None) => {}
-            (Some(decl), Some(rng)) if rng.counters.len() == decl.counter_count as usize => {}
-            (Some(decl), Some(rng)) => {
-                return Err(InvocationError::RngCounterCount {
-                    expected: decl.counter_count as usize,
-                    actual: rng.counters.len(),
-                });
-            }
-            (expected, actual) => {
-                return Err(InvocationError::RngPresence {
-                    expected: expected.is_some(),
-                    actual: actual.is_some(),
-                });
-            }
+        for (index, value) in invocation.runtime_values.iter().enumerate() {
+            self.validate_runtime_value_metadata(index, value)?;
         }
         Ok(())
     }
@@ -609,5 +657,38 @@ mod tests {
             array.validate(&RuntimeValue::U32Array(vec![0].into_boxed_slice())),
             Err(RuntimeValueError::ArrayElementOutOfBounds { index: 0, .. })
         ));
+    }
+
+    #[test]
+    fn count_and_metadata_validation_do_not_require_erased_buffers() {
+        let mut signature = signature();
+        signature.bindings[0].layout =
+            BindingLayoutPolicy::Require(LayoutConstraint::ZeroOffsetContiguous);
+        assert!(signature.validate_invocation_counts(1, 0, 1, None).is_ok());
+        assert_eq!(
+            signature.validate_invocation_counts(0, 0, 1, None),
+            Err(InvocationError::Count {
+                kind: "bindings",
+                expected: 1,
+                actual: 0,
+            })
+        );
+
+        let placement = Placement::new(DeviceId::new("cpu:0"));
+        assert!(signature
+            .validate_binding_metadata(0, DType::F32, &placement, &Layout::contiguous(vec![2]),)
+            .is_ok());
+        assert_eq!(
+            signature.validate_binding_metadata(
+                0,
+                DType::F32,
+                &placement,
+                &Layout::new(vec![2], vec![1], 1),
+            ),
+            Err(InvocationError::LayoutMismatch { binding: 0 })
+        );
+        assert!(signature
+            .validate_runtime_value_metadata(0, &RuntimeValue::U64(2))
+            .is_ok());
     }
 }

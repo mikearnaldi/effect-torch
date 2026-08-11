@@ -32,6 +32,32 @@ interface StructuralNode {
   readonly attributes: unknown
 }
 
+const numberBits = new DataView(new ArrayBuffer(8))
+
+/** @internal */
+export const normalizedStructure = (value: unknown): unknown => {
+  if (typeof value === "number") {
+    if (Number.isFinite(value) && !Object.is(value, -0)) return value
+    numberBits.setFloat64(0, value, false)
+    const high = numberBits.getUint32(0, false).toString(16).padStart(8, "0")
+    const low = numberBits.getUint32(4, false).toString(16).padStart(8, "0")
+    return { $number: `${high}${low}` }
+  }
+  if (value instanceof Uint8Array) return Array.from(value)
+  if (Array.isArray(value)) return value.map(normalizedStructure)
+  if (typeof value === "object" && value !== null) {
+    return Object.fromEntries(
+      Object.entries(value)
+        .sort(([left], [right]) => left.localeCompare(right))
+        .map(([key, entry]) => [key, normalizedStructure(entry)])
+    )
+  }
+  return value
+}
+
+/** @internal */
+export const structuralCacheKey = (value: unknown): string => JSON.stringify(normalizedStructure(value))
+
 interface ExecutableInfo {
   readonly state?: Runtime.DecodeStateSchema
 }
@@ -327,7 +353,8 @@ export const makeRuntime = (
     const diagnostics: Runtime.ExecutableDiagnostics = Object.freeze({
       ...nativeDiagnostics,
       instructions: Object.freeze(nativeDiagnostics.instructions.map((instruction) => Object.freeze(instruction))),
-      memory: Object.freeze(nativeDiagnostics.memory)
+      memory: Object.freeze(nativeDiagnostics.memory),
+      compilePhases: Object.freeze(nativeDiagnostics.compilePhases.map((phase) => Object.freeze(phase)))
     })
     const handle = Object.freeze(
       state === undefined ? { diagnostics } : { state, diagnostics }
@@ -369,18 +396,6 @@ export const makeRuntime = (
       throw error
     }
   }
-  const normalizedStructure = (value: unknown): unknown => {
-    if (value instanceof Uint8Array) return Array.from(value)
-    if (Array.isArray(value)) return value.map(normalizedStructure)
-    if (typeof value === "object" && value !== null) {
-      return Object.fromEntries(
-        Object.entries(value)
-          .sort(([left], [right]) => left.localeCompare(right))
-          .map(([key, entry]) => [key, normalizedStructure(entry)])
-      )
-    }
-    return value
-  }
   const executableCacheKey = (request: Runtime.CompileRequest): string | undefined => {
     const ids = new Map<object, number>()
     const nodes: Array<unknown> = []
@@ -417,10 +432,9 @@ export const makeRuntime = (
       ? undefined
       : {
         optimize: request.options.optimize,
-        precision: request.options.precision,
         constantWeights: request.options.constantWeights
       }
-    return JSON.stringify({ nodes, roots, options, state: request.state })
+    return structuralCacheKey({ nodes, roots, options, state: request.state })
   }
   const node = (request: Runtime.NodeRequest): Effect.Effect<Runtime.LazyTensorHandle, Runtime.BackendError> =>
     Effect.try({
@@ -987,9 +1001,6 @@ export const makeRuntime = (
             ? undefined
             : {
               ...(request.options.optimize === undefined ? {} : { optimize: request.options.optimize }),
-              ...(request.options.precision === undefined
-                ? {}
-                : { allowReducedPrecision: request.options.precision === "allow-reduced-precision" }),
               ...(request.options.constantWeights === undefined
                 ? {}
                 : { constantWeights: request.options.constantWeights })

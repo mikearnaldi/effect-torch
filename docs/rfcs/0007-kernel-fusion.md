@@ -1,44 +1,45 @@
 # RFC 0007: True Kernel Fusion
 
-- **Status**: Implemented (phases 1–2; phase 3a in progress, 3b recorded)
-
-**Implementation notes (updated)**: the elementwise op set covers
-`Add/Sub/Mul/Div/Min/Max/Neg/Sqrt/Exp/Log/Sin/Cos/Tanh/Abs/Erf/Floor/Ceil/Round`
-plus constant-exponent `Pow` (small exponents lower to multiplies/sqrt),
-`sign` (lowered to `(x > 0) ? 1 : (x < 0) ? -1 : 0`, matching candle on
-NaN), identity casts, and `where(cmp, a, b)`: a comparison with a single
-consumer lowers to a float mask feeding a true `select` ternary (an
-arithmetic mask would propagate NaN from the unselected side — klDiv
-relies on masking `log(0)`). `Log/Tanh/Abs/Floor/Ceil/Round/Pow`, the six
-comparisons, and `Select` required extending `ug` itself — `ug`,
-`ug-metal`, and `ug-cuda` are patched to the `mikearnaldi/ug` fork (`Erf`
-stays an Abramowitz–Stegun expansion; Metal has no `erf`). Region inputs
-need not match the output shape: any broadcast-compatible tensor becomes
-a lane read through stride-0 dims (bias adds, softmax max-subtracts and
-computed scalars fuse instead of materializing), with per-lane strides
-baked into the Metal kernel (and keying its pipeline cache) and an
-odometer walk in the CPU interpreter. Uniform constructors fold to
-constants at any broadcast-compatible shape; a region that folds to zero
-lanes evaluates plainly. Regions are capped at 30 input lanes (Metal
-allows 31 buffer arguments per kernel; one slot is the output) — overflow
-materializes the region and starts a new one. A multi-output post-pass
-merges a materialized shared prefix with its fused continuations into one
-kernel (the prefix's expression is inlined into each continuation;
-unfused consumers keep it materialized as an extra output) — kernel
-signatures are fixed at compile time, so the merge runs on the finished
-rewrite where the full consumer set is known, and repeats to a fixpoint.
-A broadcast-smaller prefix is only ever inlined, never emitted (its
-materialized value would be computed at the wrong shape). CUDA fusion is
-disabled until the `ug-cuda` path can be tested on real hardware.
-`EFFECT_TORCH_NO_FUSION` disables the whole pass,
-`EFFECT_TORCH_NO_MULTI_FUSION` only the multi-output merge.
+- **Status**: Implemented (phases 1–3a and multi-output through RFC 0021;
+  phase 3b recorded, 2026-08-11)
 - **Author**: Michael Arnaldi
 - **Date**: 2026-07-28
 - **Depends on**: RFC 0004 (optimizers — the fused update nodes this replaces
   under the hood), RFC 0006 (roadmap; this item moves from "slot-in" to
   committed work)
 
-## Summary
+**As-built implementation notes (updated 2026-08-11)**: phases 1, 2, and 3a,
+including multi-output fusion, are implemented as RFC 0021 code-generation
+regions over one `GraphIndex`. Elementwise, reduction, optimizer, GEMM-epilogue,
+and multi-output choices live in `OptimizationPlan` side tables. They are not
+semantic `FusedElementwise`, `FusedElementwiseMulti`, `FusedPick`, or
+`FusedReduce` `NodeKind`s, and fusion does not rebuild the graph or run a
+whole-graph rewrite fixpoint.
+
+The current scalar IR is `KernelExpr`. Its operation set covers
+`Add/Sub/Mul/Div/Min/Max/Neg/Sqrt/Exp/Log/Sin/Cos/Tanh/Abs/Erf/Floor/Ceil/Round`,
+constant-exponent `Pow`, `sign`, identity casts, comparisons, and true `select`
+for `where`. Region inputs may be any broadcast-compatible shape through
+stride-0 lanes. Uniform constructors fold to constants; regions are capped at
+30 input lanes and the Metal 31-buffer limit.
+
+Multi-output selection uses an indexed region dependency DAG and bounded
+worklist. It inlines a shared prefix into continuations, retains a materialized
+prefix output for external consumers when legal, and creates a split
+duplicated-expression region when a continuation lane has transitive prefix
+ancestry. A broadcast-smaller prefix is inlined rather than emitted at the
+wrong shape. `EFFECT_TORCH_NO_FUSION` disables region fusion and
+`EFFECT_TORCH_NO_MULTI_FUSION` disables multi-output selection. CUDA fusion
+remains disabled until it can be tested on hardware.
+
+CPU and Metal lower selected regions to typed authoritative executable
+instructions. Required Metal pipelines compile during executable compilation;
+`execute` has no runtime kernel compilation or composed fallback. Compilation
+fails if a selected instruction cannot be prepared. `optimize: false` disables
+optional regions but uses the same typed compiler, memory planner, and executor
+as the optimized path.
+
+## Original Summary and Motivation (Historical)
 
 Candle launches one GPU kernel per operation and materializes every
 intermediate. Our fused AdamW/SGD nodes fuse at the *graph* level (one
@@ -54,9 +55,13 @@ The infrastructure already exists in our candle fork's dependency tree:
 device behind the `ug` feature flag. There is no CPU codegen — the CPU
 path is a small interpreter over our own expression IR in the eval arm.
 
-## Design
+## Original Design (Historical)
 
-### Expression IR
+This section preserves the 2026-07-28 proposal and its original `Expr` and
+semantic fused-node names. The as-built `KernelExpr` and side-table region
+architecture is recorded above and in RFC 0021.
+
+### Expression IR (original proposal)
 
 A small scalar expression tree in the native crate, defined over named
 input lanes and f64 constants:
@@ -71,7 +76,7 @@ Expr = Input(index) | Const(f64)
 The IR is structurally hashable; the hash keys a compiled-kernel cache
 (one compilation per distinct fused expression per device per dtype).
 
-### FusedElementwise node
+### FusedElementwise node (original proposal)
 
 A `NodeKind::FusedElementwise { inputs: Vec<NodeRef>, expr: Expr, ... }`.
 Phase-1 constraints: all inputs share one shape (scalars arrive as
@@ -155,7 +160,7 @@ loop of any future flash-attention kernel.
 
 Matmul-adjacent fusion (XLA territory) remains a non-goal.
 
-## Numerics
+## Numerics (Historical Proposal)
 
 GPU kernels evaluate the same scalar op sequence as the composed graph
 per element. With fast-math disabled and precise div/sqrt, expect
@@ -163,7 +168,7 @@ bitwise or last-ulp equality with the unfused path; CPU interpretation
 is bitwise-identical by construction. Acceptance: optimizer parity
 tests (exact), fused-op tests at 1e-9 f64 / 1e-6 f32 tolerance.
 
-## Build changes
+## Build Changes (Historical Proposal)
 
 Enable the `ug` feature (plus its `metal`/`cuda` sub-features) on the
 candle-core dependency in the fork; the native crate links
@@ -171,12 +176,13 @@ candle-core dependency in the fork; the native crate links
 requires the Metal compiler at runtime (always present on macOS) and
 NVRTC on CUDA hosts (already a candle CUDA requirement).
 
-## Failure modes and fallbacks
+## Failure Behavior (Current)
 
-If kernel compilation fails at runtime (driver limits, exotic dtypes),
-the eval arm falls back to the existing composed candle-op sequence —
-fusion is an optimization over identical semantics, never a hard
-dependency. The fallback path is tested by forcing the cache to miss.
+Fusion and pipeline preparation happen during executable compilation. A
+pipeline or lowering failure is a compilation error. `execute` follows the
+already prepared typed instruction and physical-ID plans and has no runtime
+compile, graph evaluator, or composed-operation fallback. `optimize: false` is
+the supported correctness baseline and uses the same compiler/executor path.
 
 ## Non-goals
 
@@ -187,7 +193,12 @@ dependency. The fallback path is tested by forcing the cache to miss.
 - Exposing the IR in the TypeScript API — fusion is an implementation
   detail of the native backend.
 
-## Addendum: semantic-node kernels and the walk pipeline (implemented)
+## Historical Addendum: Semantic-Node Kernels and the Walk Pipeline
+
+This addendum records the measured pre-RFC 0019/RFC 0021 evaluator
+implementation. Its optimization motivation and kernel results remain useful;
+its per-walk fusion cache and evaluator mechanics are superseded by executable
+compilation and RFC 0021 side-table regions.
 
 Two lessons fell out of measuring the fused path end to end
 (EFFECT_TORCH_KIND_TIMING / FUSION_TIMING / WALK_TIMING, all kept as

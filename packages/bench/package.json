@@ -5,6 +5,7 @@
   "type": "module",
   "scripts": {
     "bench": "tsx matmul.ts",
+    "bench:compile": "tsx compile.ts",
     "bench:mlx": "tsx headtohead.ts",
     "typecheck": "tsc -p tsconfig.json"
   },

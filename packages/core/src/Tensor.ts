@@ -61,8 +61,9 @@ export class TensorError extends Data.TaggedError("TensorError")<{
 export type Any = Runtime.TensorHandle
 
 /**
- * A tensor described by a lazy computation graph. Operations on lazy tensors
- * only extend the graph; nothing is computed until {@link compute} is called.
+ * A tensor described by an immutable semantic graph. Graph-building operations
+ * do not run tensor kernels. Materialization occurs when the graph is submitted
+ * through {@link compute}, readback, saving, or as a lazy executable input.
  *
  * @since 0.1.0
  * @category models
@@ -81,8 +82,11 @@ export type Lazy = Runtime.LazyTensorHandle
 export type Concrete = Runtime.ConcreteTensorHandle
 
 /**
- * A backend-owned frozen program and the metadata expected for its outputs.
- * The opaque handle keeps the native program alive while reachable.
+ * A backend-owned immutable executable and the metadata expected for its
+ * outputs. The opaque handle retains its typed lowered program, static plans,
+ * prepared artifacts, captured generated bindings or constants, and diagnostics.
+ * There is no explicit program-release operation; drop JavaScript and cache
+ * references to make the wrapper eligible for native finalization.
  *
  * @since 0.1.0
  * @category compilation
@@ -102,7 +106,8 @@ export interface CompiledProgram {
 }
 
 /**
- * Returns `true` if the tensor is still a lazy computation graph.
+ * Refines a handle by its lazy tag. This does not validate runtime ownership or
+ * whether concrete dependencies captured by the graph remain usable.
  *
  * @since 0.1.0
  * @category refinements
@@ -110,7 +115,8 @@ export interface CompiledProgram {
 export const isLazyTensor = (self: Any): self is Lazy => self._tag === "LazyTensor"
 
 /**
- * Returns `true` if the tensor has been materialized on the device.
+ * Refines a handle by its concrete tag. This is not a liveness check: a cleared
+ * concrete handle retains its tag but fails when used.
  *
  * @since 0.1.0
  * @category refinements
@@ -254,14 +260,12 @@ const numel = (shape: ReadonlyArray<number>): number => shape.reduce((a, b) => a
 const isFloatDtype = (dtype: string): boolean => dtype === "f32" || dtype === "f64"
 
 /**
- * Creates a shared 0-d constant tensor. The native runtime pools constant
- * leaves, so repeated calls with the same (value, dtype, device) triple
- * are backed by the same graph node — hot constants cost one native node
- * total instead of one per use. Use it for constants referenced many
- * times (a learning rate lifted per step, a scale applied in a loop); use
- * {@link full} for a fresh node or a non-scalar shape. A constant is
- * exactly that: never route a value that changes meaning per step through
- * one.
+ * Creates a 0-d constant tensor. Native backends use a bounded process-local
+ * pool keyed by value bits, dtype, and device, so a resident entry may be
+ * reused; graph-node identity is not a public guarantee. Use {@link full} for
+ * non-scalar shapes. Runtime-varying values must be declared as inputs: use
+ * {@link makeScalarInput} for a plain number or {@link makeInput}/{@link compile}
+ * for tensor bindings.
  *
  * @since 0.1.0
  * @category constructors
@@ -285,9 +289,9 @@ export const constant = (
  * `self` — the scalar counterpart of {@link zerosLike} / {@link onesLike}
  * / {@link fullLike}, and the way to lift a numeric constant next to an
  * existing tensor (custom losses, optimizer updates) without threading a
- * device through the environment. The native runtime pools constant
- * leaves (see {@link constant}). A constant is exactly that: never route
- * a value that changes meaning per step through one.
+ * device through the environment. Native runtimes may pool the leaf as
+ * described by {@link constant}; runtime-varying values require scalar or
+ * tensor input declarations.
  *
  * @since 0.1.0
  * @category constructors
@@ -434,7 +438,10 @@ export const full = (
 
 /**
  * Creates a lazy tensor sampled from a standard normal distribution. Only
- * floating point dtypes are supported.
+ * floating dtypes are supported. Sampling occurs per executable invocation:
+ * reusing one random node across roots shares one draw within that invocation,
+ * separately constructed nodes remain distinct, and every later invocation
+ * draws afresh. Optimization preserves semantic random-source identity.
  *
  * @since 0.1.0
  * @category constructors
@@ -455,9 +462,11 @@ export const randn = (
   })
 
 /**
- * Creates a lazy tensor sampled uniformly from `[min, max)`. Only floating
- * point dtypes are supported. Like {@link randn}, draws happen at
- * evaluation time: evaluate related tensors together in one walk.
+ * Creates a lazy floating-point tensor sampled uniformly from `[min, max)`;
+ * construction rejects `max <= min`, but does not reject `NaN` bounds.
+ * Sampling follows {@link randn}'s
+ * invocation semantics. Submit related roots together in one {@link compute}
+ * or compiled-program invocation when they must share a random source.
  *
  * @since 0.1.0
  * @category constructors
@@ -483,7 +492,8 @@ export const uniform = (
 
 /**
  * Creates a lazy 1-dimensional tensor of `steps` evenly spaced values from
- * `start` to `end`, both inclusive.
+ * `start` to `end`, both inclusive. `steps` must be a positive integer. This
+ * constructor supports only `f32` and `f64` despite accepting `TensorOptions`.
  *
  * @since 0.1.0
  * @category constructors
@@ -518,8 +528,10 @@ export const linspace = (
   })
 
 /**
- * Creates a lazy 1-dimensional tensor of evenly spaced values in the interval
- * `[start, end)`. When `end` is omitted the range is `[0, start)`.
+ * Creates values beginning at `start` and advancing by nonzero `step` until the
+ * next value would cross exclusive `end`. Omitting `end` uses `0` as the start
+ * and the first argument as the end. Positive and negative steps are supported;
+ * a step whose sign moves away from `end` produces an empty tensor.
  *
  * @since 0.1.0
  * @category constructors
@@ -544,7 +556,7 @@ export const arange = (
   })
 
 /**
- * Creates a lazy `n x n` identity matrix.
+ * Creates a lazy `n x n` identity matrix. `n` must be a positive integer.
  *
  * @since 0.1.0
  * @category constructors
@@ -576,8 +588,11 @@ const dtypeOfTypedArray = (data: TypedArray): DType => {
 }
 
 /**
- * Creates a lazy tensor from a typed array. The dtype is inferred from the
- * array type and the shape defaults to `[data.length]`.
+ * Creates a lazy tensor by copying the addressed bytes of `data` when this
+ * graph-building Effect runs. Later source-array mutation does not change the
+ * tensor. The dtype is inferred and shape defaults to `[data.length]`. This
+ * semantic leaf lowers as an executable constant independently of
+ * `constantWeights`; use an input placeholder for runtime-varying data.
  *
  * @since 0.1.0
  * @category constructors
@@ -1555,11 +1570,12 @@ export interface DropoutOptions {
 }
 
 /**
- * Randomly zeroes elements with probability `p` and scales the survivors by
- * `1 / (1 - p)` (inverted dropout). This is the functional form: it always
- * applies — skip it at evaluation time by construction. The mask is drawn
- * at evaluation time, so the usual `randn` rule applies: evaluate the loss
- * and its gradients together in one walk.
+ * Applies inverted dropout on every invocation; omit it from evaluation graphs
+ * when dropout is disabled. `p` defaults to `0.5`; values below `0` or at least
+ * `1` fail, but `NaN` is not rejected. This implementation accepts only `f32`
+ * and `f64`. For `p > 0`, the mask has
+ * {@link randn}'s sharing and fresh-per-invocation behavior. Submit a loss and
+ * its gradients as roots of the same invocation when they must share the mask.
  *
  * @since 0.1.0
  * @category neural network
@@ -2405,8 +2421,11 @@ export const chunk = (
 }
 
 /**
- * Tiles a tensor by repeating it `reps[i]` times along dimension `i`.
- * Extra leading entries in `reps` add new leading dimensions.
+ * Tiles with NumPy-style trailing alignment. When `reps` is shorter than the
+ * tensor rank, leading dimensions repeat once; extra leading entries add
+ * size-1 dimensions before repetition. Every repetition must be a positive
+ * integer. When no reshape or repetition is needed, the original handle may
+ * be returned, so fresh graph-node or storage identity is not guaranteed.
  *
  * @since 0.1.0
  * @category shape operations
@@ -2657,8 +2676,9 @@ export const flip = (
   })
 
 /**
- * Expands `i64` or `u32` class indexes of any shape into one-hot vectors of the
- * given depth, appended as a new last dimension.
+ * Expands `i64` or `u32` class indexes into vectors of positive `depth`,
+ * appended as a final dimension. Index values are not range-checked: values
+ * outside `[0, depth)` produce all-zero vectors.
  *
  * @since 0.1.0
  * @category shape operations
@@ -2980,8 +3000,8 @@ const convOutDim = (
 }
 
 /**
- * 2-D convolution as a single native node (candle's kernel on every
- * backend), differentiable through native adjoints. `self` is
+ * 2-D convolution as one semantic operation, lowered to the active backend's
+ * convolution implementation and differentiable through native adjoints. `self` is
  * `[N, C_in, H, W]`, `weight` is `[C_out, C_in/groups, KH, KW]`; a bias is
  * added separately with `add`.
  *
@@ -3419,9 +3439,9 @@ const checkSquare = (op: string, self: Any): Effect.Effect<void, TensorError> =>
   })
 
 /**
- * Matrix inverse of a tensor that is square on its last two dimensions;
- * leading dimensions are treated as batch. Linear algebra runs on the
- * CPU — on other devices the matrices round-trip through the host.
+ * Matrix inverse of a tensor square on its last two dimensions; leading
+ * dimensions are treated as batch. Currently supported only on CPU and only
+ * for `f32` or `f64`; non-CPU graphs fail compilation.
  *
  * @since 0.1.0
  * @category linalg
@@ -3438,9 +3458,9 @@ export const inverse = (self: Any): Effect.Effect<Lazy, TensorError, Runtime.Run
   })
 
 /**
- * Determinant of a tensor that is square on its last two dimensions, with
- * the leading (batch) dimensions as the output shape. Linear algebra runs
- * on the CPU — on other devices the matrices round-trip through the host.
+ * Determinant of a tensor square on its last two dimensions, with the leading
+ * batch dimensions as output shape. Currently supported only on CPU and only
+ * for `f32` or `f64`; non-CPU graphs fail compilation.
  *
  * @since 0.1.0
  * @category linalg
@@ -3459,8 +3479,8 @@ export const det = (self: Any): Effect.Effect<Lazy, TensorError, Runtime.Runtime
 /**
  * Solves the linear system `a @ x = b` for `x`, with `a` square on its last
  * two dimensions and `b` of matching rank whose leading dimensions equal
- * `a`'s. Linear algebra runs on the CPU — on other devices the
- * matrices round-trip through the host.
+ * `a`'s. Both tensors must share dtype and placement. Currently supported only
+ * on CPU and only for `f32` or `f64`; non-CPU graphs fail compilation.
  *
  * @since 0.1.0
  * @category linalg
@@ -3523,14 +3543,14 @@ export const cast: {
     }))
 )
 /**
- * Compiles one or more tensor roots into a static executable, runs it off the
- * JavaScript thread, and returns materialized tensors in the same order. All
- * roots are lowered together, so shared subgraphs execute once and random
- * nodes produce one consistent set of draws across all roots. Interrupting
- * the fiber aborts native execution. Concrete roots are accepted, but callers must
- * not rely on the returned handle having the same JavaScript identity or
- * storage aliasing as the input. A tuple in gives the same tuple shape out,
- * with each element materialized.
+ * Materializes all roots together and returns concrete handles in root order.
+ * A nonempty call submits one compile request, possibly served by the native
+ * structural cache, and executes one immutable lowered plan. Shared subgraphs
+ * run once and each shared random source has one draw across roots. Interruption
+ * requests backend cancellation; already-submitted work may be retired safely
+ * before resources are reclaimed. Returned outputs retain their escaping
+ * storage across later invocations until cleared or finalized. Concrete roots
+ * are accepted, but JavaScript identity and storage aliasing are unspecified.
  *
  * @since 0.1.0
  * @category destructors
@@ -3592,11 +3612,12 @@ const typedArrayConstructor = (dtype: DType) => {
 }
 
 /**
- * Asks the active runtime to release the backend storage referenced by this
- * concrete handle immediately instead of waiting for native finalization.
- * After success, using this handle, or a lazy graph that captured it, fails
- * with a typed error. Call exactly once for a handle that will no longer be
- * used; this does not release unrelated handles or graph nodes.
+ * Deterministically releases this concrete handle's ownership and invalidates
+ * it and lazy graphs that captured it. Call exactly once. This does not
+ * guarantee immediate physical deallocation: aliases, in-flight invocations,
+ * exported readback buffers, retained generated bindings or constants, and
+ * allocator caches may still retain backing storage. Independently owned
+ * handles remain valid.
  *
  * @since 0.1.0
  * @category destructors
@@ -3611,9 +3632,11 @@ export const clear = (self: Concrete): Effect.Effect<void, TensorError, Runtime.
  * Evaluates a tensor and returns its values in a host typed array.
  * `f16` and `bf16` are widened to `Float32Array`; `f32`, `f64`, `i64`, `u8`,
  * and `u32` return `Float32Array`, `Float64Array`, `BigInt64Array`,
- * `Uint8Array`, and `Uint32Array`, respectively. The backing `ArrayBuffer` may
- * directly export runtime storage or hold a copied readback; callers must not
- * rely on either ownership mode.
+ * `Uint8Array`, and `Uint32Array`, respectively. The returned array remains
+ * readable after later {@link clear} on the tensor. Its backing `ArrayBuffer`
+ * may be a copy or a direct export that retains runtime storage until the
+ * buffer is collected. Treat it as readback data; mutation is not a supported
+ * way to update a tensor because aliasing is unspecified.
  *
  * @since 0.1.0
  * @category destructors
@@ -3824,10 +3847,11 @@ export const load = (
   )
 
 /**
- * Diagnostics over a program cache. `cached` includes ready and currently
- * tracing entries; `compiled` counts trace attempts, including failures and
- * re-traces after eviction. A growing count can signal unbounded signature
- * variation.
+ * Diagnostics for one JavaScript {@link ProgramCache}. `cached` is the current
+ * cache-map size, including ready and pending traces that have not been cleared;
+ * `compiled` counts builder trace attempts,
+ * including failures and retraces after eviction. Neither field counts native
+ * structural-cache misses, native compilations, or backend pipeline entries.
  *
  * @since 0.1.0
  * @category compilation
@@ -3840,27 +3864,33 @@ export interface CompileStats {
 }
 
 /**
- * Options for {@link compile}.
+ * Controls tracing and executable compilation for {@link compile}.
+ * `optimize` defaults to `true` and records semantics-preserving code-generation
+ * regions beside the unchanged semantic graph. `false` disables those optional
+ * regions but uses the same typed compiler and executor. `constantWeights`
+ * retains captured concrete leaves as inference constants and bypasses bundled
+ * runtimes' structural executable cache; declared inputs remain dynamic.
  *
  * @since 0.1.0
  * @category compilation
  */
 export interface CompileOptions extends Runtime.ExecutableCompileOptions {
   /**
-   * Capacity for ready LRU entries. Signatures include runtime identity and
-   * each input's shape, dtype, and placement. In-flight entries can
-   * temporarily exceed the capacity. Defaults to `32`.
+   * Capacity for this function's ready JavaScript LRU entries. Signatures
+   * include runtime identity and each input's shape, dtype, and placement.
+   * In-flight entries can temporarily exceed the capacity. Defaults to `32`.
+   * This does not bound native structural or pipeline caches.
    */
   readonly cacheCapacity?: number
 }
 
 /**
- * A traced graph builder frozen into native programs. Calls accept lazy or
- * concrete inputs; lazy inputs are materialized before the frozen program
- * runs. The first call per signature traces placeholders with the inputs'
- * metadata. Later concrete-input calls reuse one native evaluation without
- * rebuilding, differentiating, or rewriting the frozen graph. Concurrent
- * calls are safe because each run has its own evaluator.
+ * A lazily traced, signature-specialized compiled function. The first call for
+ * a runtime and input metadata signature traces placeholders and obtains an
+ * immutable native executable; later calls reuse its typed lowered instructions
+ * and static plans. Lazy arguments are materialized before invocation. Every
+ * call has independent workspace, random state, and outputs, so one executable
+ * is concurrently callable and later calls do not overwrite live results.
  *
  * @since 0.1.0
  * @category compilation
@@ -3876,17 +3906,20 @@ export interface CompiledFn<E = never, R = never> {
   /** Snapshot of current entries and cumulative trace attempts. */
   readonly stats: Effect.Effect<CompileStats>
   /**
-   * Drops current cache entries; an already in-flight trace may insert its
-   * result afterwards.
+   * Drops this function's JavaScript cache entries and signature history only;
+   * native structural and pipeline caches are unaffected. An already in-flight
+   * trace may insert its result afterwards.
    */
   readonly clear: Effect.Effect<void>
 }
 
 /**
- * Mutable coordination state for a program cache. Ready programs use LRU
- * eviction; pending traces can temporarily exceed `capacity`. Concurrent
+ * Mutable coordination state for the JavaScript tracing cache. Ready programs
+ * use LRU eviction; pending traces can temporarily exceed `capacity`. Concurrent
  * misses for one key share a trace. Eviction and clearing only drop JavaScript
- * references, so native finalization occurs once no other references remain.
+ * wrapper references and do not clear native structural or pipeline caches.
+ * Wrapper finalization occurs once no JavaScript references remain, while
+ * shareable native artifacts may remain cached.
  * Consumers should use {@link makeProgramCache} and {@link cachedProgram}
  * rather than mutate the exposed collections and counters.
  *
@@ -3910,8 +3943,9 @@ export interface ProgramCache {
   /** Snapshot of current entries and cumulative trace attempts. */
   readonly stats: Effect.Effect<CompileStats>
   /**
-   * Drops current entries and signature history; an in-flight trace may
-   * repopulate the cache.
+   * Drops current JavaScript entries and signature history; an in-flight trace
+   * may repopulate the cache. Native caches and the cumulative trace count are
+   * unchanged.
    */
   readonly clear: Effect.Effect<void>
 }
@@ -3943,8 +3977,8 @@ export const makeProgramCache = (capacity: number = 32): ProgramCache => {
     },
     get clear() {
       return Effect.sync(() => {
-        // Dropping the last JS reference makes the native program
-        // collectable; its finalizer releases the frozen graph.
+        // Dropping the last JS wrapper reference permits native finalization;
+        // independently cached native artifacts may remain resident.
         cache.entries.clear()
         cache.keys.clear()
       })
@@ -4044,9 +4078,11 @@ export const signatureOf = (inputs: ReadonlyArray<Any>, runtime: Runtime.Runtime
 }
 
 /**
- * Creates a placeholder leaf for one tensor argument of a traced graph. The
- * exemplar contributes metadata only; its value is not captured. Slot indexes
- * are shared with scalar slots and must be unique in the frozen graph.
+ * Creates a tensor placeholder whose exemplar contributes metadata but not its
+ * value. Tensor and scalar declarations share one unsigned slot namespace and
+ * must form a contiguous range from zero. A slot may appear repeatedly only
+ * when every declaration agrees on kind, shape, dtype, and device. Runtime
+ * tensor bindings are supplied in ascending slot order with scalar slots omitted.
  *
  * @since 0.1.0
  * @category compilation
@@ -4064,8 +4100,11 @@ export const makeInput = (slot: number, exemplar: Any): Effect.Effect<Lazy, Tens
   }))
 
 /**
- * Creates the placeholder leaf for one runtime scalar of a traced graph:
- * a 0-d tensor whose value arrives as a plain number at call time.
+ * Creates a 0-d runtime-scalar placeholder. It shares {@link makeInput}'s
+ * contiguous slot namespace and repeated-declaration rules. {@link runProgram}
+ * receives scalar values separately in ascending scalar-slot order.
+ * `CompiledFn.call` has no scalar argument; use the manual placeholder,
+ * {@link freezeProgram}, and `runProgram` path for runtime scalars.
  *
  * @since 0.1.0
  * @category compilation
@@ -4082,9 +4121,13 @@ export const makeScalarInput = (
   }))
 
 /**
- * Freezes traced roots into a native program: validates the slot
- * declarations and runs the fusion rewrite once. The returned program is
- * an immutable, concurrently callable executable.
+ * Compiles nonempty traced roots into an immutable, concurrently callable
+ * executable. Preparation validates the roots and contiguous tensor/scalar
+ * slot contract and indexes the semantic graph once. With optimization enabled,
+ * fusion, epilogue, and optimizer choices are recorded as side-table regions;
+ * compilation does not insert fused semantic nodes or rebuild the graph.
+ * Backend lowering then creates the authoritative typed instruction, memory,
+ * and physical plans and prepares required artifacts.
  *
  * @since 0.1.0
  * @category compilation
@@ -4103,10 +4146,13 @@ export const freezeProgram = (
   })
 
 /**
- * Runs a frozen program. Lazy inputs are materialized first; one async native
- * call then binds concrete buffers and scalar values to declared slots and
- * evaluates the graph. Input count and metadata must match the declarations;
- * those constraints are validated by the backend.
+ * Executes an immutable lowered plan; execution performs no graph traversal,
+ * optimization, kernel selection, or allocation discovery. Lazy tensor inputs
+ * are materialized together and those temporary handles are released after the
+ * call. Tensor inputs and scalars bind their declarations in ascending slot
+ * order within their separate arrays. The backend validates counts, metadata,
+ * layout, placement, and ownership. Inputs are borrowed, while returned outputs
+ * retain escaping storage until cleared or finalized; aliasing is unspecified.
  *
  * @since 0.1.0
  * @category compilation
@@ -4151,14 +4197,14 @@ export const runProgram = (
  * @category compilation
  */
 export interface DecodeProgram extends Runtime.DecodeStateSchema {
-  /** Opaque runtime handle for the rewritten static executable. */
+  /** Opaque handle for the immutable decode-specialized lowered executable. */
   readonly handle: Runtime.ExecutableHandle
   /**
    * Fixed compiled batch width; batched execution accepts at most this many
    * active sequences.
    */
   readonly batch: number
-  /** Number of cacheable attention layers in the rewritten graph. */
+  /** Number of cacheable attention layers in the decode-specialized graph. */
   readonly layers: number
   /** Number of key/value heads per cacheable attention layer. */
   readonly kvHeads: number
@@ -4208,7 +4254,14 @@ export interface KvPool {
   readonly handle: Runtime.KvPoolHandle
 }
 
-/** Recurrent state allocated when a sequence is created. */
+/**
+ * Recurrent state allocated for each sequence. Each recurrent family must be
+ * either entirely zero or entirely positive. Current native pools store KDA
+ * and short-convolution recurrent state as `f32`, independently of KV dtype.
+ *
+ * @since 0.1.0
+ * @category compilation
+ */
 export interface KvRecurrentGeometry {
   readonly kdaLayers: number
   readonly kdaHeads: number
@@ -4220,11 +4273,12 @@ export interface KvRecurrentGeometry {
 }
 
 /**
- * Allocates a KV pool: `layers` per-layer `[maxTokens, kvHeads, headDim]`
- * key/value slabs with `blockSize`-token blocks. Geometry and capacities must
- * be positive integers, and `maxTokens` must be a multiple of `blockSize`.
- * Native backends currently use `f32`, `f16`, `bf16`, or quantized `u8` KV
- * storage; unsupported dtypes and malformed values fail in the backend.
+ * Allocates a fixed-capacity state pool. `maxTokens` and `blockSize` must be
+ * positive integers with exact divisibility. Attention geometry must be either
+ * entirely zero, for stateless or recurrent-only programs, or entirely positive. Each
+ * recurrent family follows {@link KvRecurrentGeometry}'s corresponding rule.
+ * KV storage supports `f32`, `f16`, `bf16`, or quantized `u8`; recurrent state
+ * remains `f32`. The pool must exactly match the compiled decode schema.
  *
  * @since 0.1.0
  * @category compilation
@@ -4265,9 +4319,9 @@ export const makeKvPool = (
 /**
  * Creates an independent live sequence in `pool`.
  *
- * A sequence owns a block table and cursor into the pool. It starts empty; use
- * {@link kvPrefillMatch} to attach a resident prefix, then execute prefill or
- * decode programs with {@link runDecodeProgram} or
+ * A sequence owns a block table, cursor, and recurrent state. It starts empty;
+ * {@link kvPrefillMatch} may attach a resident prefix only for programs without
+ * KDA or short-convolution recurrent state. Then execute prefill or decode with {@link runDecodeProgram} or
  * {@link runBatchedDecodeProgram}. Release it exactly once with
  * {@link releaseKvSequence} when it leaves the scheduler.
  *
@@ -4292,14 +4346,16 @@ export const makeKvSequence = (pool: KvPool): Effect.Effect<KvSequence, TensorEr
   })
 
 /**
- * Attaches the longest resident whole-block proper prefix of `tokens` to
- * `sequence` and returns the number of matched tokens. For non-empty input, at
+ * On a newly created empty sequence, attaches the longest resident whole-block
+ * proper KV prefix of `tokens` and returns the matched length. For non-empty input, at
  * least one token is left for execution even when the complete sequence is
  * resident; empty input returns zero.
  *
  * The result is the offset at which prefill should begin. A return value of
  * zero means no reusable prefix was found. Matching updates the sequence's
- * block table and cursor; later decode runs continue from that position.
+ * block table and cursor; later decode runs continue from that position. Prefix
+ * entries do not contain KDA or short-convolution recurrent state, so do not
+ * use this operation before programs with either recurrent family.
  *
  * Token values are expected to be non-negative integers representable as
  * `u32`; this wrapper leaves validation to the backend. Fails when the current
@@ -4367,13 +4423,17 @@ export const releaseKvSequence = (sequence: KvSequence): Effect.Effect<void, Ten
   })
 
 /**
- * Rewrites and freezes traced roots for paged-KV generation. The graph must
- * contain at least one causal {@link scaledDotProductAttention}; non-causal
- * attention and runtime scalar-input nodes are rejected. Cacheable attention
- * nodes must have compatible geometry. `window`, when supplied, must be a
- * non-negative integer; `batch` (default `1`) must be a positive integer.
- * These constraints are checked by the decode backend rather than this
- * wrapper.
+ * Performs decode semantic specialization and compiles the result as an
+ * immutable executable. Stateless graphs are allowed. Causal
+ * {@link scaledDotProductAttention}, KDA, short convolution, and position
+ * operations are converted to their incremental state or cursor forms when
+ * present; every attention operation must be causal, and runtime scalar inputs
+ * are rejected. Specialization creates one new semantic graph before ordinary
+ * single-index compilation; later fusion remains side-table planning. State capacities and
+ * `batch` must be positive unsigned 32-bit integers, `blockSize` must divide
+ * `maxTokens`, and `window` must be an unsigned 32-bit integer in
+ * `1..=maxTokens`. Compilation retains captured concrete leaves as
+ * constants and therefore bypasses native structural executable caching.
  *
  * @since 0.1.0
  * @category compilation
@@ -4415,13 +4475,15 @@ export const compileDecodeProgram = (
   })
 
 /**
- * Runs a frozen single-sequence decode program. Lazy inputs are materialized
- * first, then one native call binds the input slots and evaluates against the
+ * Runs one sequence through an immutable decode executable. Lazy inputs are materialized
+ * first, then one native call binds the input slots and executes against the
  * sequence's pool. Program, sequence, pool geometry, runtime, input count, and
  * input metadata must agree. `tokens` contains the real, unpadded token ids
  * represented by the query rows; on success its length advances the cursor
  * and its values feed prefix-cache hashes. Token values and advance limits are
- * backend-validated. A failed run rolls back cursor and block allocations.
+ * backend-validated. Failure or cancellation before commit rolls back cursor,
+ * block, and recurrent-state changes. Returned outputs retain their storage
+ * independently of the sequence and later invocations.
  *
  * @since 0.1.0
  * @category compilation
@@ -4473,11 +4535,12 @@ export const runDecodeProgram = (
  * pads unused rows to the fixed compiled width. Sequences must be distinct,
  * live, from one compatible pool and runtime, and `tokens` must provide one
  * equally sized, nonempty real-token row per sequence. Every sequence advances
- * by that row length, normally `1` for decode. The final input may use the
- * active batch width only when it is rank 2; the backend zero-pads that input
- * to the compiled width. Every other input must exactly match its program
- * declaration. Constraint failures or execution failures roll back every
- * sequence in the batch.
+ * by that row length, normally `1` for decode. The highest-slot tensor input
+ * may have any positive rank and use the active count as its leading dimension
+ * when remaining dimensions match; the backend zero-pads that dimension to the
+ * compiled width. Every other input must exactly match its declaration.
+ * Returned outputs retain the fixed compiled batch width, so padded rows must
+ * be ignored. Constraint or execution failure commits none of the sequences.
  *
  * @since 0.1.0
  * @category compilation
@@ -4677,24 +4740,27 @@ export const rotaryEmbedding = (
   }))
 
 /**
- * Compiles a graph builder into a reusable executable. The builder receives
+ * Creates a lazily traced compiled function; calling `compile` itself does not
+ * run `build` or perform native compilation. On the first call for each runtime
+ * and ordered input metadata signature, the builder receives
  * lazy placeholders carrying the call inputs' metadata, not their values, and
  * runs for each trace attempt on a cache miss. Its graph, including
  * differentiation or optimizer updates already built into it, is frozen into
  * a native program. Concurrent misses for one signature share an attempt, but
  * failed traces, eviction, or clearing can cause that signature to be traced
  * again. Calls accept lazy or concrete inputs; lazy graphs are materialized
- * before program execution. Random nodes in the frozen graph draw afresh on
+ * before program execution. Random nodes in the semantic graph draw afresh on
  * each run.
  *
- * Recompilation is automatic when runtime identity, placement, shape, or dtype
+ * Retracing is automatic when runtime identity, placement, shape, or dtype
  * differs from every cached signature. Ready programs use least-recently-used
  * eviction at `cacheCapacity`; an evicted signature is traced again if used.
  * Materializing a tensor inside `build` fails at trace time — a compiled
  * builder is a pure graph builder over its placeholders. Runtime-varying
- * scalars such as a learning rate use {@link makeScalarInput}; Trainer
- * declares those slots and passes numbers to
- * {@link runProgram}.
+ * scalars require the manual {@link makeScalarInput}, {@link freezeProgram},
+ * and {@link runProgram} path because `CompiledFn.call` binds tensors only.
+ * The JavaScript signature LRU, native structural executable cache, and backend
+ * pipeline caches are distinct; `CompiledFn.clear` clears only the first.
  *
  * @since 0.1.0
  * @category compilation
@@ -4718,7 +4784,6 @@ export const compile = <E = never, R = never>(
         const roots = yield* build(placeholders)
         const compileOptions: Runtime.ExecutableCompileOptions = {
           ...(options.optimize === undefined ? {} : { optimize: options.optimize }),
-          ...(options.precision === undefined ? {} : { precision: options.precision }),
           ...(options.constantWeights === undefined ? {} : { constantWeights: options.constantWeights })
         }
         return yield* freezeProgram(roots, compileOptions)

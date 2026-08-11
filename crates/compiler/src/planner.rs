@@ -1,4 +1,4 @@
-use crate::{LoweredSchedule, ValueDecl, ValueStorage};
+use crate::{LoweredProgram, LoweredValue, ValueStorage};
 use effect_torch_runtime::{
     AllocationReport, InstructionId, Location, LocationId, MemoryPlan, MemoryReport, OutputSlot,
     ReuseEdge, SegmentDecl, SegmentId, SegmentOwnership, StorageClass, ValueId,
@@ -219,14 +219,40 @@ impl fmt::Display for PlannerError {
 
 impl Error for PlannerError {}
 
-fn validate_dense_tables<K, M>(schedule: &LoweredSchedule<K, M>) -> Result<(), PlannerError> {
-    for (index, value) in schedule.values.iter().enumerate() {
+fn validate_dense_values<M, V>(values: &[V]) -> Result<(), PlannerError>
+where
+    V: LoweredValue<M>,
+{
+    for (index, value) in values.iter().enumerate() {
+        let value = value.value_decl();
         let expected = ValueId::from_index(index).ok_or(PlannerError::TooManyValues)?;
         if value.id != expected {
             return Err(PlannerError::ValueIdMismatch {
                 index,
                 actual: value.id,
             });
+        }
+    }
+    Ok(())
+}
+
+/// Validates dense table identities and every lowered value reference.
+pub fn validate_lowered_program<K, M, V>(
+    schedule: &LoweredProgram<K, M, V>,
+) -> Result<(), PlannerError>
+where
+    V: LoweredValue<M>,
+{
+    validate_dense_values(&schedule.values)?;
+
+    for value in &schedule.values {
+        if let ValueStorage::Alias { source, .. } = &value.value_decl().storage {
+            if schedule.values.get(source.index()).is_none() {
+                return Err(PlannerError::UnknownValue {
+                    instruction: None,
+                    value: *source,
+                });
+            }
         }
     }
     for (index, instruction) in schedule.instructions.iter().enumerate() {
@@ -237,22 +263,40 @@ fn validate_dense_tables<K, M>(schedule: &LoweredSchedule<K, M>) -> Result<(), P
                 actual: instruction.id,
             });
         }
+        for value_use in instruction.resource_uses() {
+            if schedule.values.get(value_use.value.index()).is_none() {
+                return Err(PlannerError::UnknownValue {
+                    instruction: Some(instruction.id),
+                    value: value_use.value,
+                });
+            }
+        }
+    }
+    for output in &schedule.outputs {
+        if schedule.values.get(output.index()).is_none() {
+            return Err(PlannerError::UnknownValue {
+                instruction: None,
+                value: *output,
+            });
+        }
     }
     Ok(())
 }
 
-pub fn normalize_aliases<M>(
-    values: &[ValueDecl<M>],
-) -> Result<Box<[NormalizedAlias]>, PlannerError> {
-    for (index, value) in values.iter().enumerate() {
-        let expected = ValueId::from_index(index).ok_or(PlannerError::TooManyValues)?;
-        if value.id != expected {
-            return Err(PlannerError::ValueIdMismatch {
-                index,
-                actual: value.id,
-            });
-        }
+impl<K, M, V> LoweredProgram<K, M, V>
+where
+    V: LoweredValue<M>,
+{
+    pub fn validate(&self) -> Result<(), PlannerError> {
+        validate_lowered_program(self)
     }
+}
+
+pub fn normalize_aliases<M, V>(values: &[V]) -> Result<Box<[NormalizedAlias]>, PlannerError>
+where
+    V: LoweredValue<M>,
+{
+    validate_dense_values(values)?;
 
     let mut state = vec![0u8; values.len()];
     let mut normalized: Vec<Option<NormalizedAlias>> = vec![None; values.len()];
@@ -268,13 +312,14 @@ pub fn normalize_aliases<M>(
             }
             if state[cursor] == 1 {
                 return Err(PlannerError::AliasCycle {
-                    value: values[cursor].id,
+                    value: values[cursor].value_decl().id,
                 });
             }
 
             state[cursor] = 1;
             path.push(cursor);
-            match &values[cursor].storage {
+            let value = values[cursor].value_decl();
+            match &value.storage {
                 ValueStorage::Alias {
                     source,
                     byte_offset,
@@ -286,14 +331,15 @@ pub fn normalize_aliases<M>(
                                 instruction: None,
                                 value: *source,
                             })?;
-                    let end = byte_offset.checked_add(values[cursor].bytes).ok_or(
+                    let source_decl = source_decl.value_decl();
+                    let end = byte_offset.checked_add(value.bytes).ok_or(
                         PlannerError::ByteSizeOverflow {
-                            value: Some(values[cursor].id),
+                            value: Some(value.id),
                         },
                     )?;
                     if end > source_decl.bytes {
                         return Err(PlannerError::AliasOutOfBounds {
-                            value: values[cursor].id,
+                            value: value.id,
                             source: *source,
                             end,
                             capacity: source_decl.bytes,
@@ -303,7 +349,7 @@ pub fn normalize_aliases<M>(
                 }
                 _ => {
                     normalized[cursor] = Some(NormalizedAlias {
-                        root: values[cursor].id,
+                        root: value.id,
                         byte_offset: 0,
                     });
                     state[cursor] = 2;
@@ -314,17 +360,18 @@ pub fn normalize_aliases<M>(
         }
 
         while let Some(index) = path.pop() {
+            let value = values[index].value_decl();
             let ValueStorage::Alias {
                 source,
                 byte_offset,
-            } = &values[index].storage
+            } = &value.storage
             else {
                 unreachable!("non-alias terminal was removed from the alias path")
             };
             let parent = normalized[source.index()].expect("alias parent must be normalized");
             let byte_offset = parent.byte_offset.checked_add(*byte_offset).ok_or(
                 PlannerError::ByteSizeOverflow {
-                    value: Some(values[index].id),
+                    value: Some(value.id),
                 },
             )?;
             normalized[index] = Some(NormalizedAlias {
@@ -341,8 +388,13 @@ pub fn normalize_aliases<M>(
         .collect())
 }
 
-pub fn analyze_liveness<K, M>(schedule: &LoweredSchedule<K, M>) -> Result<Liveness, PlannerError> {
-    validate_dense_tables(schedule)?;
+pub fn analyze_liveness<K, M, V>(
+    schedule: &LoweredProgram<K, M, V>,
+) -> Result<Liveness, PlannerError>
+where
+    V: LoweredValue<M>,
+{
+    validate_lowered_program(schedule)?;
     let aliases = normalize_aliases(&schedule.values)?;
     let mut first_read = vec![None::<usize>; schedule.values.len()];
     let mut first_write = vec![None::<usize>; schedule.values.len()];
@@ -372,16 +424,13 @@ pub fn analyze_liveness<K, M>(schedule: &LoweredSchedule<K, M>) -> Result<Livene
     };
 
     for instruction in &schedule.instructions {
-        for value_use in &instruction.inputs {
+        for value_use in instruction.resource_uses() {
             record(
                 instruction.id,
                 value_use.value,
                 value_use.access.reads(),
                 value_use.access.writes(),
             )?;
-        }
-        for output in &instruction.outputs {
-            record(instruction.id, output.value, false, true)?;
         }
     }
 
@@ -401,6 +450,7 @@ pub fn analyze_liveness<K, M>(schedule: &LoweredSchedule<K, M>) -> Result<Livene
 
     let mut intervals = vec![None; schedule.values.len()];
     for (index, value) in schedule.values.iter().enumerate() {
+        let value = value.value_decl();
         if matches!(value.storage, ValueStorage::Alias { .. }) {
             continue;
         }
@@ -565,15 +615,19 @@ fn add_fixed_bytes(
     checked_add(target, bytes)
 }
 
-fn build_report<K, M>(
-    schedule: &LoweredSchedule<K, M>,
+fn build_report<K, M, V>(
+    schedule: &LoweredProgram<K, M, V>,
     liveness: &Liveness,
     segments: &[SegmentDecl<M>],
     largest_allocations: usize,
-) -> Result<MemoryReport, PlannerError> {
+) -> Result<MemoryReport, PlannerError>
+where
+    V: LoweredValue<M>,
+{
     let mut report = MemoryReport::default();
     let mut largest = Vec::new();
     for value in &schedule.values {
+        let value = value.value_decl();
         match &value.storage {
             ValueStorage::Fixed { class, .. } => add_fixed_bytes(&mut report, *class, value.bytes)?,
             ValueStorage::Planned { class, .. } => {
@@ -620,6 +674,7 @@ fn build_report<K, M>(
     let mut starts = vec![0usize; schedule.instructions.len() + 1];
     let mut ends = vec![0usize; schedule.instructions.len() + 1];
     for (value, interval) in schedule.values.iter().zip(liveness.intervals.iter()) {
+        let value = value.value_decl();
         if !matches!(value.storage, ValueStorage::Planned { .. }) {
             continue;
         }
@@ -658,14 +713,27 @@ fn build_report<K, M>(
     Ok(report)
 }
 
-pub fn plan_memory<K, M>(
-    schedule: &LoweredSchedule<K, M>,
+pub fn plan_memory<K, M, V>(
+    schedule: &LoweredProgram<K, M, V>,
     config: &MemoryPlannerConfig<M>,
 ) -> Result<MemoryPlan<M>, PlannerError>
 where
     M: Clone + Eq,
+    V: LoweredValue<M>,
 {
     let liveness = analyze_liveness(schedule)?;
+    plan_memory_with_liveness(schedule, config, &liveness)
+}
+
+pub(crate) fn plan_memory_with_liveness<K, M, V>(
+    schedule: &LoweredProgram<K, M, V>,
+    config: &MemoryPlannerConfig<M>,
+    liveness: &Liveness,
+) -> Result<MemoryPlan<M>, PlannerError>
+where
+    M: Clone + Eq,
+    V: LoweredValue<M>,
+{
     for (index, space) in config.memory_spaces.iter().enumerate() {
         if space.max_segment_bytes == 0
             || space.segment_alignment == 0
@@ -689,12 +757,12 @@ where
         .iter()
         .enumerate()
         .filter_map(|(index, value)| {
-            matches!(value.storage, ValueStorage::Planned { .. }).then_some(index)
+            matches!(value.value_decl().storage, ValueStorage::Planned { .. }).then_some(index)
         })
         .collect();
     allocation_order.sort_by_key(|index| {
         let interval = liveness.intervals[*index].expect("planned value interval");
-        (interval.start, schedule.values[*index].id)
+        (interval.start, schedule.values[*index].value_decl().id)
     });
 
     let mut working: Vec<WorkingSegment<M>> = Vec::new();
@@ -702,7 +770,7 @@ where
     let mut assigned_by_value: Vec<Option<Assignment>> = vec![None; schedule.values.len()];
 
     for value_index in allocation_order {
-        let value = &schedule.values[value_index];
+        let value = schedule.values[value_index].value_decl();
         let ValueStorage::Planned {
             alignment,
             memory_space,
@@ -900,6 +968,7 @@ where
 
     let mut locations = Vec::with_capacity(schedule.values.len());
     for (index, value) in schedule.values.iter().enumerate() {
+        let value = value.value_decl();
         LocationId::from_index(index).ok_or(PlannerError::TooManyLocations)?;
         let location = match &value.storage {
             ValueStorage::Fixed { location, .. } => location.clone(),
@@ -951,12 +1020,24 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{LoweredInstruction, OutputDecl, ValueUse};
+    use crate::{LoweredInstruction, OutputDecl, ValueDecl, ValueUse};
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
     enum Space {
         A,
         B,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq, Hash)]
+    struct BackendValue {
+        declaration: ValueDecl<Space>,
+        _backend_tag: &'static str,
+    }
+
+    impl LoweredValue<Space> for BackendValue {
+        fn value_decl(&self) -> &ValueDecl<Space> {
+            &self.declaration
+        }
     }
 
     fn value(
@@ -996,8 +1077,8 @@ mod tests {
     fn schedule(
         values: Vec<ValueDecl<Space>>,
         instructions: Vec<LoweredInstruction<&'static str>>,
-    ) -> LoweredSchedule<&'static str, Space> {
-        LoweredSchedule::new(values, instructions, Vec::new())
+    ) -> LoweredProgram<&'static str, Space> {
+        LoweredProgram::new(values, instructions, Vec::new())
     }
 
     fn config(max_segment_bytes: usize) -> MemoryPlannerConfig<Space> {
@@ -1026,6 +1107,125 @@ mod tests {
             } => (segment, offset, bytes),
             ref location => panic!("expected segment location, got {location:?}"),
         }
+    }
+
+    #[test]
+    fn backend_values_are_authoritative_for_every_resource_and_storage_class() {
+        let fixed = |id: u32, name: &str, bytes: usize, class: StorageClass| BackendValue {
+            declaration: ValueDecl {
+                id: ValueId::new(id),
+                name: name.into(),
+                bytes,
+                storage: ValueStorage::Fixed {
+                    class,
+                    location: Location::Persistent { slot: id },
+                },
+            },
+            _backend_tag: "backend-only metadata",
+        };
+        let values = vec![
+            fixed(0, "input", 1, StorageClass::ExternalInput),
+            BackendValue {
+                declaration: value(1, 17, 16, Space::A, SegmentOwnership::Workspace),
+                _backend_tag: "planned backend value",
+            },
+            fixed(2, "constant", 2, StorageClass::PersistentConstant),
+            fixed(3, "state", 3, StorageClass::PersistentState),
+            fixed(4, "output", 4, StorageClass::EscapingOutput),
+            fixed(5, "status", 5, StorageClass::DeviceStatus),
+        ];
+        let instructions = vec![LoweredInstruction::new(
+            InstructionId::new(0),
+            "backend",
+            vec![ValueUse::read(ValueId::new(0))],
+            vec![OutputDecl::new(ValueId::new(1))],
+        )
+        .with_resources(
+            vec![ValueUse::read(ValueId::new(2))],
+            vec![ValueUse::read(ValueId::new(4))],
+            vec![ValueUse::read(ValueId::new(5))],
+            vec![ValueUse::read(ValueId::new(3))],
+        )];
+        let schedule = LoweredProgram::new(values, instructions, vec![ValueId::new(1)]);
+
+        schedule.validate().unwrap();
+        let liveness = analyze_liveness(&schedule).unwrap();
+        assert!(liveness.intervals.iter().all(Option::is_some));
+
+        let plan = plan_memory(&schedule, &config(128)).unwrap();
+        assert_eq!(segment_location(&plan, 1).2, 17);
+        assert_eq!(plan.report.external_bytes, 1);
+        assert_eq!(plan.report.persistent_bytes, 2);
+        assert_eq!(plan.report.state_bytes, 3);
+        assert_eq!(plan.report.output_bytes, 4);
+        assert_eq!(plan.report.workspace_bytes, 37);
+    }
+
+    #[test]
+    fn every_resource_category_extends_liveness() {
+        let resource_instruction = instruction(2, vec![], &[]).with_resources(
+            vec![ValueUse::read(ValueId::new(0))],
+            vec![ValueUse::read(ValueId::new(1))],
+            vec![ValueUse::read(ValueId::new(2))],
+            vec![ValueUse::read(ValueId::new(3))],
+        );
+        let schedule = schedule(
+            (0..4)
+                .map(|id| value(id, 16, 16, Space::A, SegmentOwnership::Workspace))
+                .collect(),
+            vec![
+                instruction(0, vec![], &[0, 1, 2, 3]),
+                instruction(1, vec![], &[]),
+                resource_instruction,
+            ],
+        );
+
+        let liveness = analyze_liveness(&schedule).unwrap();
+        for interval in &liveness.intervals {
+            assert_eq!(interval.unwrap().end, InstructionId::new(3));
+        }
+    }
+
+    #[test]
+    fn output_and_resource_writes_do_not_change_interval_semantics() {
+        let instruction = instruction(0, vec![], &[0]).with_resources(
+            vec![ValueUse::write(ValueId::new(0))],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        );
+        let schedule = schedule(
+            vec![value(0, 16, 16, Space::A, SegmentOwnership::Workspace)],
+            vec![instruction],
+        );
+
+        assert_eq!(
+            analyze_liveness(&schedule).unwrap().intervals[0],
+            Some(LiveInterval {
+                value: ValueId::new(0),
+                start: InstructionId::new(0),
+                end: InstructionId::new(1),
+            })
+        );
+    }
+
+    #[test]
+    fn resource_references_are_validated() {
+        let instruction = instruction(0, vec![], &[]).with_resources(
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            vec![ValueUse::read(ValueId::new(7))],
+        );
+        let schedule = schedule(Vec::new(), vec![instruction]);
+
+        assert_eq!(
+            analyze_liveness(&schedule),
+            Err(PlannerError::UnknownValue {
+                instruction: Some(InstructionId::new(0)),
+                value: ValueId::new(7),
+            })
+        );
     }
 
     #[test]
@@ -1079,7 +1279,7 @@ mod tests {
 
     #[test]
     fn escaping_outputs_remain_live_through_invocation_completion() {
-        let schedule = LoweredSchedule::new(
+        let schedule = LoweredProgram::new(
             vec![
                 value(0, 32, 16, Space::A, SegmentOwnership::ProvisionalOutput),
                 value(1, 32, 16, Space::A, SegmentOwnership::ProvisionalOutput),

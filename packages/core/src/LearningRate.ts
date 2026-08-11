@@ -1,7 +1,7 @@
 /**
  * Learning-rate schedules. A schedule is a plain function from the step
  * number (0-based) to the learning rate for that step. The training loop
- * ({@link Trainer.train}) evaluates it every step and lifts the value to a
+ * (`Trainer.train`) evaluates it every step and lifts the value to a
  * 0-d tensor that flows into the optimizer update as graph data — the
  * rate is never baked into the optimizer or its graph, so one optimizer
  * (and one compiled step) serves the whole schedule:

@@ -5,11 +5,14 @@ mod value;
 use self::err::to_napi_err;
 use self::value::Value;
 use crate::{composed, executable, pool, CpuBuffer, CpuDestination, Elem, Tensor};
-use effect_torch_compiler::{CompileOptions, InferenceOptions, PrecisionPolicy, ProgramSlot};
+use effect_torch_compiler::{
+    specialize_decode, CompileOptions, DecodeGeometry, InferenceOptions, PreparedProgram,
+    ProgramRequest, ProgramSlot, StateCursorSlot,
+};
 use effect_torch_graph::CrossEntropyReduction as CeReduction;
-use effect_torch_graph::{node_children, remap_children, Device, PositionOffset};
+use effect_torch_graph::{Device, PositionOffset};
 use effect_torch_napi::{try_register_export, unregister_export, vec_to_bytes, CancellationState};
-use effect_torch_runtime::{CancellationFlag, DType, Layout};
+use effect_torch_runtime::{Buffer, CancellationFlag, DType, Layout};
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -17,8 +20,10 @@ use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 
 pub type LeafSlot = effect_torch_graph::LeafSlot;
-pub(crate) type Node = effect_torch_graph::Node<effect_torch_compiler::Expr>;
-type NodeKind = effect_torch_graph::NodeKind<effect_torch_compiler::Expr>;
+pub(crate) type Node = effect_torch_graph::Node;
+type NodeKind = effect_torch_graph::NodeKind;
+type KdaGeometry = effect_torch_compiler::KdaGeometry;
+type ConvGeometry = effect_torch_compiler::ConvGeometry;
 
 fn cpu_device() -> Device {
     Device::Cpu
@@ -151,7 +156,6 @@ impl From<NativeDType> for DType {
 #[napi(object)]
 pub struct NativeCompileOptions {
     pub optimize: Option<bool>,
-    pub allow_reduced_precision: Option<bool>,
     pub constant_weights: Option<bool>,
 }
 
@@ -182,6 +186,12 @@ pub struct NativeInstructionDiagnostics {
 }
 
 #[napi(object)]
+pub struct NativeCompilePhaseDiagnostics {
+    pub phase: String,
+    pub nanoseconds: f64,
+}
+
+#[napi(object)]
 pub struct NativeMemoryDiagnostics {
     pub external_bytes: f64,
     pub persistent_bytes: f64,
@@ -202,6 +212,7 @@ pub struct NativeExecutableDiagnostics {
     pub command_count: f64,
     pub synchronization_count: f64,
     pub memory: NativeMemoryDiagnostics,
+    pub compile_phases: Vec<NativeCompilePhaseDiagnostics>,
 }
 
 fn executable_diagnostics(
@@ -232,6 +243,14 @@ fn executable_diagnostics(
             peak_live_bytes: memory.peak_live_bytes as f64,
             packing_overhead_bytes: memory.packing_overhead_bytes as f64,
         },
+        compile_phases: diagnostics
+            .compile_phases
+            .iter()
+            .map(|timing| NativeCompilePhaseDiagnostics {
+                phase: timing.phase.clone(),
+                nanoseconds: timing.nanoseconds as f64,
+            })
+            .collect(),
     }
 }
 
@@ -1400,23 +1419,45 @@ async fn run_compute<T: Send + 'static>(
     effect_torch_napi::run_compute(state, notify, compute).await
 }
 
-fn compile_cpu_roots(
+#[cfg(test)]
+thread_local! {
+    static CPU_PREPARATION_COUNTS: std::cell::Cell<(usize, usize, usize)> =
+        const { std::cell::Cell::new((0, 0, 0)) };
+}
+
+#[cfg(test)]
+fn cpu_preparation_counts() -> (usize, usize, usize) {
+    CPU_PREPARATION_COUNTS.with(std::cell::Cell::get)
+}
+
+fn prepare_cpu_program(
     roots: &[Arc<Node>],
     options: CompileOptions,
-    state: Option<executable::CpuStatePlan>,
-) -> err::Res<executable::CpuCompilation> {
-    let (_, ce_chunk_size) = chunked_ce_limits();
-    match state {
-        Some(state) => executable::compile_with_state(roots, options, ce_chunk_size, state),
-        None => executable::compile(roots, options, ce_chunk_size),
+    state_cursor: Option<StateCursorSlot>,
+) -> err::Res<(PreparedProgram, Vec<executable::CpuGeneratedValue>)> {
+    let mut request = ProgramRequest::from_roots(roots.to_vec(), options);
+    if let Some(state_cursor) = state_cursor {
+        request = request.with_state_cursor(state_cursor);
     }
+    let program = request.prepare()?;
+    #[cfg(test)]
+    CPU_PREPARATION_COUNTS.with(|counts| {
+        let (indexes, collections, gets) = counts.get();
+        counts.set((indexes + 1, collections, gets));
+    });
+    let generated = executable::load_generated_values(&program.index)?;
+    #[cfg(test)]
+    CPU_PREPARATION_COUNTS.with(|counts| {
+        let (indexes, collections, gets) = counts.get();
+        counts.set((indexes, collections + 1, gets + generated.len()));
+    });
+    Ok((program, generated))
 }
 
 struct ProgramInner {
     executable: Arc<executable::CpuExecutable>,
     slots: Vec<ProgramSlot>,
     generated_bindings: Vec<Value>,
-    signature: String,
 }
 
 #[derive(Clone)]
@@ -1432,7 +1473,6 @@ struct CachedProgram {
     slots: Vec<ProgramSlot>,
     generated: Vec<GeneratedBindingSignature>,
     generated_order: Vec<usize>,
-    signature: String,
 }
 
 #[derive(Default)]
@@ -1471,24 +1511,17 @@ fn program_cache() -> &'static Mutex<ProgramCache> {
     &CACHE
 }
 
-fn semantic_generated_bindings(roots: &[Arc<Node>]) -> err::Res<Vec<(usize, Value)>> {
-    effect_torch_compiler::graph_post_order(roots)
-        .into_iter()
-        .filter_map(|node| match &node.kind {
-            NodeKind::Leaf(slot) => Some(
-                slot.get::<Value>()
-                    .map(|value| (Arc::as_ptr(slot) as usize, value))
-                    .map_err(|error| format!("compile: generated binding {}: {error}", node.id)),
-            ),
-            _ => None,
-        })
-        .collect()
-}
-
-fn ordered_generated_bindings(semantic: &[(usize, Value)], order: &[usize]) -> Option<Vec<Value>> {
+fn ordered_generated_bindings(
+    program: &PreparedProgram,
+    generated: &[executable::CpuGeneratedValue],
+    order: &[usize],
+) -> Option<Vec<Value>> {
+    if generated.len() != program.index.leaves.len() || order.len() != generated.len() {
+        return None;
+    }
     order
         .iter()
-        .map(|index| semantic.get(*index).map(|(_, value)| value.clone()))
+        .map(|index| generated.get(*index).map(|value| value.value().clone()))
         .collect()
 }
 
@@ -1529,7 +1562,6 @@ struct KvStateSchema {
     kv_heads: usize,
     head_dim: usize,
     kda: KdaGeometry,
-    kda_dtype: DType,
     conv: ConvGeometry,
     cursor_slot: u32,
     cursor_tensor: bool,
@@ -1576,7 +1608,6 @@ impl KvStateSchema {
             kv_heads: geometry.kv_heads,
             head_dim: geometry.head_dim,
             kda: geometry.kda,
-            kda_dtype: geometry.kda_dtype,
             conv: geometry.conv,
             cursor_slot: geometry.cursor_slot,
             cursor_tensor: geometry.cursor_tensor,
@@ -1625,7 +1656,7 @@ impl KvStateSchema {
             ],
             "KDA state",
         )?
-        .checked_mul(self.kda_dtype.size_in_bytes())
+        .checked_mul(self.kda.dtype.size_in_bytes())
         .ok_or_else(|| "compile: KDA state byte size overflow".to_string())?;
         let conv_bytes = checked(
             &[
@@ -1706,26 +1737,10 @@ impl Executable {
         scalars: Vec<f64>,
         token: Option<&CancellationToken>,
     ) -> Result<Vec<NativeTensor>> {
-        let tensor_count = self.inner.slots.iter().filter(|slot| !slot.scalar).count();
-        let scalar_count = self.inner.slots.len() - tensor_count;
-        if inputs.len() != tensor_count {
-            return Err(Error::new(
-                Status::InvalidArg,
-                format!(
-                    "program expected {tensor_count} tensor inputs, got {}",
-                    inputs.len()
-                ),
-            ));
-        }
-        if scalars.len() != scalar_count {
-            return Err(Error::new(
-                Status::InvalidArg,
-                format!(
-                    "program expected {scalar_count} scalar inputs, got {}",
-                    scalars.len()
-                ),
-            ));
-        }
+        let signature = &self.inner.executable.signature;
+        signature
+            .validate_invocation_counts(inputs.len(), scalars.len(), 0, None)
+            .map_err(|error| Error::new(Status::InvalidArg, error.to_string()))?;
         let mut tensors = inputs.iter();
         for (slot, declared) in self.inner.slots.iter().enumerate() {
             if !declared.scalar {
@@ -1742,6 +1757,16 @@ impl Executable {
             .iter()
             .map(|input| input.value_cloned())
             .collect::<Result<Vec<_>>>()?;
+        for (index, value) in tensor_inputs.iter().enumerate() {
+            signature
+                .validate_binding_metadata(
+                    index,
+                    value.dtype(),
+                    value.tensor().placement(),
+                    &value.tensor().layout,
+                )
+                .map_err(|error| Error::new(Status::InvalidArg, error.to_string()))?;
+        }
         run_compute(token, move |cancelled, _state| {
             Ok(executable::execute_with_scalars(
                 &executable,
@@ -1764,13 +1789,6 @@ fn resolve_compile_options(native: Option<NativeCompileOptions>, stateful: bool)
     if let Some(native) = native {
         if let Some(optimize) = native.optimize {
             options.optimize = optimize;
-        }
-        if let Some(allow) = native.allow_reduced_precision {
-            options.precision = if allow {
-                PrecisionPolicy::AllowReducedPrecision
-            } else {
-                PrecisionPolicy::Strict
-            };
         }
         if stateful || native.constant_weights.is_some() {
             options.inference = Some(InferenceOptions {
@@ -1801,6 +1819,7 @@ pub fn compile(
         ));
     }
     let compile_options = resolve_compile_options(options, state.is_some());
+    let mut state_cursor = None;
     let state = match state {
         Some(native) => {
             if native.batch == 0
@@ -1824,13 +1843,16 @@ pub fn compile(
             }
             let batch = native.batch as usize;
             let window = native.window.map(|window| window as usize);
-            let (rewritten, geometry) = decode_rewrite(&roots, window, batch)
+            let (rewritten, geometry) = specialize_decode(&roots, window, batch)
                 .map_err(|error| Error::new(Status::GenericFailure, error))?;
             roots = rewritten;
+            state_cursor = Some(geometry.state_cursor());
             Some(KvStateSchema::from_native(native, geometry)?)
         }
         None => None,
     };
+    let (program, generated_values) =
+        prepare_cpu_program(&roots, compile_options, state_cursor).map_err(to_napi_err)?;
     let state_bytes = state
         .as_ref()
         .map(KvStateSchema::referenced_state_bytes)
@@ -1847,36 +1869,45 @@ pub fn compile(
     let effective_cache_key = cache_key
         .filter(|_| {
             std::env::var_os("EFFECT_TORCH_NO_EXECUTABLE_CACHE").is_none()
-                && !compile_options
+                && !program
+                    .options
                     .inference
                     .as_ref()
                     .is_some_and(|inference| inference.constant_weights)
         })
-        .map(|key| format!("{key}|{compile_options:?}"));
+        .map(|key| format!("{key}|{:?}", program.options));
     if let Some(key) = effective_cache_key.as_deref() {
-        let semantic = semantic_generated_bindings(&roots).map_err(to_napi_err)?;
         let cached = program_cache()
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .get(key);
         if let Some(cached) = cached {
-            if let Some(current) = ordered_generated_bindings(&semantic, &cached.generated_order)
-                .filter(|current| generated_match(current, &cached.generated))
-            {
-                return Ok(Executable {
-                    inner: ProgramInner {
-                        executable: Arc::clone(&cached.executable),
-                        slots: cached.slots,
-                        generated_bindings: current,
-                        signature: cached.signature,
-                    },
-                    state,
-                });
+            if cached.executable.signature == program.signature {
+                if let Some(current) = (generated_values.len() == cached.generated_order.len())
+                    .then(|| {
+                        ordered_generated_bindings(
+                            &program,
+                            &generated_values,
+                            &cached.generated_order,
+                        )
+                    })
+                    .flatten()
+                    .filter(|current| generated_match(current, &cached.generated))
+                {
+                    return Ok(Executable {
+                        inner: ProgramInner {
+                            executable: Arc::clone(&cached.executable),
+                            slots: cached.slots,
+                            generated_bindings: current,
+                        },
+                        state,
+                    });
+                }
             }
         }
     }
-    let compilation =
-        compile_cpu_roots(&roots, compile_options, state_plan).map_err(to_napi_err)?;
+    let compilation = executable::compile_prepared(&program, &generated_values, state_plan)
+        .map_err(to_napi_err)?;
     let slots = compilation.slots;
     if slots.iter().any(|slot| !slot.device.is_cpu()) {
         return Err(Error::new(
@@ -1884,29 +1915,28 @@ pub fn compile(
             "compile: graph contains an unsupported device",
         ));
     }
-    let signature = slots
-        .iter()
-        .map(ProgramSlot::signature)
-        .collect::<Vec<_>>()
-        .join(",");
     if let Some(key) = effective_cache_key {
-        let semantic_generated = semantic_generated_bindings(&roots).map_err(to_napi_err)?;
-        let semantic_positions = semantic_generated
+        let generated_positions = generated_values
             .iter()
             .enumerate()
-            .map(|(index, (node, _))| (*node, index))
+            .map(|(index, generated)| (generated.slot_identity(), index))
             .collect::<HashMap<_, _>>();
         let generated_order = compilation
             .generated_slots
             .iter()
-            .map(|node| semantic_positions.get(node).copied())
+            .map(|slot| generated_positions.get(slot).copied())
             .collect::<Option<Vec<_>>>();
-        let generated = generated_signatures(&compilation.generated_bindings);
-        if generated_order
+        let ordered = generated_order
             .as_deref()
-            .and_then(|order| ordered_generated_bindings(&semantic_generated, order))
-            .is_some_and(|values| generated_match(&values, &generated))
-        {
+            .and_then(|order| ordered_generated_bindings(&program, &generated_values, order));
+        if let Some((generated_order, ordered)) = generated_order.zip(ordered) {
+            let generated = generated_signatures(&ordered);
+            if !generated_match(&compilation.generated_bindings, &generated) {
+                return Err(Error::new(
+                    Status::GenericFailure,
+                    "compile: prepared generated binding order changed during lowering",
+                ));
+            }
             program_cache()
                 .lock()
                 .unwrap_or_else(|error| error.into_inner())
@@ -1916,8 +1946,7 @@ pub fn compile(
                         executable: Arc::clone(&compilation.executable),
                         slots: slots.clone(),
                         generated,
-                        generated_order: generated_order.expect("validated generated order"),
-                        signature: signature.clone(),
+                        generated_order,
                     },
                 );
         }
@@ -1927,7 +1956,6 @@ pub fn compile(
             executable: compilation.executable,
             slots,
             generated_bindings: compilation.generated_bindings,
-            signature,
         },
         state,
     })
@@ -2202,23 +2230,6 @@ impl SeqState {
     }
 }
 
-// RFC 0018: uniform KDA layer geometry of a decode program.
-#[derive(Clone, Copy, Default, PartialEq, Eq)]
-struct KdaGeometry {
-    layers: usize,
-    heads: usize,
-    head_dim: usize,
-    value_dim: usize,
-}
-
-// RFC 0018: uniform short-conv layer geometry of a decode program.
-#[derive(Clone, Copy, Default, PartialEq, Eq)]
-struct ConvGeometry {
-    layers: usize,
-    channels: usize,
-    kernel: usize,
-}
-
 struct KvContext {
     pool: Arc<PoolInner>,
     slots: Vec<Arc<Mutex<SeqState>>>,
@@ -2277,16 +2288,24 @@ impl executable::CpuState for Arc<KvContext> {
                 }
             })?;
         }
-        for command in &executable.commands {
+        for physical in &executable.physical {
+            let executable::CpuPhysicalCommand::Encode(id) = *physical;
+            let command = executable
+                .instruction(id)
+                .ok_or_else(|| format!("decode physical instruction {id} is unresolved"))?;
+            let (op, _) = command
+                .kind
+                .operation()
+                .ok_or_else(|| format!("decode physical instruction {id} references a boundary"))?;
             if !matches!(
-                command.op,
+                op,
                 executable::CpuOp::KdaRecurrence { .. }
                     | executable::CpuOp::ConvState { .. }
                     | executable::CpuOp::KvAttention { .. }
             ) {
                 continue;
             }
-            let input = &values[command.inputs[0].index()];
+            let input = &values[command.inputs[0].value.index()];
             let shape = input.shape();
             let steps = shape
                 .get(shape.len().saturating_sub(2))
@@ -2299,7 +2318,7 @@ impl executable::CpuState for Arc<KvContext> {
             {
                 return Err(format!(
                     "decode token advance must be in 1..={steps} for {}",
-                    command.op.name()
+                    op.name()
                 ));
             }
         }
@@ -2332,7 +2351,11 @@ impl executable::CpuState for Arc<KvContext> {
         let transaction = transaction
             .as_mut()
             .ok_or_else(|| "decode state command ran outside a transaction".to_string())?;
-        match &command.op {
+        let (op, _) = command
+            .kind
+            .operation()
+            .ok_or_else(|| "state adapter received a boundary instruction".to_string())?;
+        match op {
             executable::CpuOp::KdaRecurrence { scale, layer } => {
                 prepare_kda_staging(self, transaction, *layer, inputs, staging)?;
                 composed::kda_chunk_forward_into(
@@ -2765,17 +2788,25 @@ fn commit_recurrent_state(
         })
         .collect::<err::Res<Vec<_>>>()?;
 
-    for command in &executable.commands {
-        let Some(&state_output) = command.state_outputs.first() else {
+    for physical in &executable.physical {
+        let executable::CpuPhysicalCommand::Encode(id) = *physical;
+        let command = executable
+            .instruction(id)
+            .ok_or_else(|| format!("decode physical instruction {id} is unresolved"))?;
+        let Some(state_output) = command.state.first() else {
             continue;
         };
-        let value = &values[state_output.index()];
-        match command.op {
+        let value = &values[state_output.value.index()];
+        let (op, _) = command
+            .kind
+            .operation()
+            .ok_or_else(|| "decode physical instruction references a boundary".to_string())?;
+        match op {
             executable::CpuOp::KdaRecurrence { layer, .. } => {
                 let per_batch = context.kda.heads;
                 let updates = recurrent_state_slices(value, batch, per_batch, false);
                 for (state, update) in states.iter_mut().zip(updates) {
-                    let layer = layer as usize;
+                    let layer = *layer as usize;
                     let target = state.kda_states.get_mut(layer).ok_or_else(|| {
                         format!("KDA state commit destination {layer} is missing")
                     })?;
@@ -2788,7 +2819,7 @@ fn commit_recurrent_state(
             executable::CpuOp::ConvState { layer } => {
                 let updates = recurrent_state_slices(value, batch, 1, true);
                 for (state, update) in states.iter_mut().zip(updates) {
-                    let layer = layer as usize;
+                    let layer = *layer as usize;
                     let target = state.conv_states.get_mut(layer).ok_or_else(|| {
                         format!("convolution state commit destination {layer} is missing")
                     })?;
@@ -3098,327 +3129,6 @@ fn kv_evict(pool: &PoolInner, state: &mut SeqState, start: usize) {
     }
 }
 
-struct DecodeGeometry {
-    layers: usize,
-    kv_heads: usize,
-    head_dim: usize,
-    kda: KdaGeometry,
-    kda_dtype: DType,
-    conv: ConvGeometry,
-    cursor_slot: u32,
-    cursor_tensor: bool,
-}
-
-fn decode_rewrite(
-    roots: &[Arc<Node>],
-    window: Option<usize>,
-    batch: usize,
-) -> std::result::Result<(Vec<Arc<Node>>, DecodeGeometry), String> {
-    let mut maximum_slot = None;
-    let mut visited = HashSet::new();
-    let mut stack = roots.to_vec();
-    while let Some(node) = stack.pop() {
-        if !visited.insert(node.id) {
-            continue;
-        }
-        match &node.kind {
-            NodeKind::Input { slot, .. } => {
-                maximum_slot = Some(maximum_slot.map_or(*slot, |current: u32| current.max(*slot)));
-            }
-            NodeKind::ScalarInput { .. } => {
-                return Err(
-                    "decode: runtime scalar inputs are not supported in inference graphs"
-                        .to_string(),
-                );
-            }
-            _ => {}
-        }
-        stack.extend(node_children(&node.kind));
-    }
-    let cursor_slot = maximum_slot.map_or(0, |slot| slot + 1);
-    let mut visited = HashSet::new();
-    let mut order = Vec::new();
-    let mut stack = roots
-        .iter()
-        .map(|root| (root.clone(), false))
-        .collect::<Vec<_>>();
-    while let Some((node, processed)) = stack.pop() {
-        if processed {
-            order.push(node);
-            continue;
-        }
-        if !visited.insert(node.id) {
-            continue;
-        }
-        stack.push((node.clone(), true));
-        for child in node_children(&node.kind) {
-            stack.push((child, false));
-        }
-    }
-    let mut remapped = HashMap::new();
-    let mut layers = 0;
-    let mut kda_layers = 0;
-    let mut conv_layers = 0;
-    let mut cursor_tensor = false;
-    let mut geometry = None;
-    let mut kda_geometry = None;
-    let mut conv_geometry = None;
-    for node in order {
-        let remap = |child: &Arc<Node>| {
-            remapped
-                .get(&child.id)
-                .cloned()
-                .unwrap_or_else(|| child.clone())
-        };
-        let kind = match &node.kind {
-            NodeKind::Sdpa {
-                q,
-                k,
-                v,
-                scale,
-                causal,
-            } => {
-                if !causal {
-                    return Err(
-                        "decode: only causal attention is cacheable, found a non-causal sdpa"
-                            .to_string(),
-                    );
-                }
-                let rank = k.shape.len();
-                if rank != 4 || k.shape[..rank - 3].iter().product::<usize>() != batch {
-                    return Err(format!(
-                        "decode: kv caching expects attention of shape [{batch}, H, T, D], got {:?}",
-                        k.shape
-                    ));
-                }
-                let current = (k.shape[rank - 3], k.shape[rank - 1]);
-                if let Some(previous) = geometry {
-                    if previous != current {
-                        return Err(format!(
-                            "decode: attention layers disagree on head geometry ({previous:?} vs {current:?})"
-                        ));
-                    }
-                } else {
-                    geometry = Some(current);
-                }
-                let layer = layers;
-                layers += 1;
-                NodeKind::KvAttention {
-                    q: remap(q),
-                    k: remap(k),
-                    v: remap(v),
-                    scale: *scale,
-                    layer,
-                    window,
-                }
-            }
-            NodeKind::KdaChunk {
-                q,
-                k,
-                v,
-                log_decay,
-                beta,
-                scale,
-            } => {
-                let rank = q.shape.len();
-                if rank != 4 || q.shape[..rank - 3].iter().product::<usize>() != batch {
-                    return Err(format!(
-                        "decode: kda state caching expects layers of shape [{batch}, H, T, D], got {:?}",
-                        q.shape
-                    ));
-                }
-                if !matches!(q.dtype, DType::F32 | DType::F64) {
-                    return Err(format!(
-                        "decode: stateful KDA requires f32 or f64, got {}",
-                        q.dtype.name()
-                    ));
-                }
-                let current = (
-                    q.shape[rank - 3],
-                    q.shape[rank - 1],
-                    v.shape[rank - 1],
-                    q.dtype,
-                );
-                if let Some(previous) = kda_geometry {
-                    if previous != current {
-                        return Err(format!(
-                            "decode: kda layers disagree on head geometry ({previous:?} vs {current:?})"
-                        ));
-                    }
-                } else {
-                    kda_geometry = Some(current);
-                }
-                let layer = kda_layers;
-                kda_layers += 1;
-                NodeKind::KdaRecurrence {
-                    q: remap(q),
-                    k: remap(k),
-                    v: remap(v),
-                    log_decay: remap(log_decay),
-                    beta: remap(beta),
-                    scale: *scale,
-                    layer,
-                }
-            }
-            NodeKind::ShortConv1d { x, weight } => {
-                let rank = x.shape.len();
-                if rank != 3 || x.shape[..rank - 2].iter().product::<usize>() != batch {
-                    return Err(format!(
-                        "decode: conv state caching expects layers of shape [{batch}, T, C], got {:?}",
-                        x.shape
-                    ));
-                }
-                let current = (x.shape[rank - 1], weight.shape[1]);
-                if let Some(previous) = conv_geometry {
-                    if previous != current {
-                        return Err(format!(
-                            "decode: short conv layers disagree on geometry ({previous:?} vs {current:?})"
-                        ));
-                    }
-                } else {
-                    conv_geometry = Some(current);
-                }
-                let layer = conv_layers;
-                conv_layers += 1;
-                NodeKind::ConvState {
-                    x: remap(x),
-                    weight: remap(weight),
-                    layer,
-                }
-            }
-            NodeKind::RotaryEmbedding {
-                x, seq_len, theta, ..
-            } => NodeKind::RotaryEmbedding {
-                x: remap(x),
-                seq_len: *seq_len,
-                theta: *theta,
-                offset: PositionOffset::Cursor,
-            },
-            NodeKind::PositionEmbedding { weight, seq_len } => {
-                let tokens = *seq_len;
-                let width = weight.shape[1];
-                if batch > 1 {
-                    cursor_tensor = true;
-                    let cursors = Node::new(NodeKind::Input {
-                        slot: cursor_slot,
-                        shape: vec![batch],
-                        dtype: DType::I64,
-                        device: cpu_device(),
-                    })?;
-                    let positions = Node::new(NodeKind::Add {
-                        a: Node::new(NodeKind::Reshape {
-                            a: cursors,
-                            shape: vec![batch, 1],
-                        })?,
-                        b: Node::new(NodeKind::BroadcastTo {
-                            a: Node::new(NodeKind::Reshape {
-                                a: Node::new(NodeKind::Arange {
-                                    start: 0.0,
-                                    end: tokens as f64,
-                                    step: 1.0,
-                                    dtype: DType::I64,
-                                    device: cpu_device(),
-                                })?,
-                                shape: vec![1, tokens],
-                            })?,
-                            shape: vec![batch, tokens],
-                        })?,
-                    })?;
-                    let indexes = Node::new(NodeKind::BroadcastTo {
-                        a: Node::new(NodeKind::Reshape {
-                            a: positions,
-                            shape: vec![batch * tokens, 1],
-                        })?,
-                        shape: vec![batch * tokens, width],
-                    })?;
-                    NodeKind::Reshape {
-                        a: Node::new(NodeKind::Gather {
-                            a: remap(weight),
-                            dim: 0,
-                            indexes,
-                        })?,
-                        shape: vec![batch, tokens, width],
-                    }
-                } else {
-                    let positions = Node::new(NodeKind::Add {
-                        a: Node::new(NodeKind::Arange {
-                            start: 0.0,
-                            end: tokens as f64,
-                            step: 1.0,
-                            dtype: DType::I64,
-                            device: cpu_device(),
-                        })?,
-                        b: Node::new(NodeKind::ScalarInput {
-                            slot: cursor_slot,
-                            dtype: DType::I64,
-                            device: cpu_device(),
-                        })?,
-                    })?;
-                    let indexes = Node::new(NodeKind::BroadcastTo {
-                        a: Node::new(NodeKind::Reshape {
-                            a: positions,
-                            shape: vec![tokens, 1],
-                        })?,
-                        shape: vec![tokens, width],
-                    })?;
-                    NodeKind::Gather {
-                        a: remap(weight),
-                        dim: 0,
-                        indexes,
-                    }
-                }
-            }
-            kind => remap_children(kind, &remap),
-        };
-        remapped.insert(node.id, Node::new(kind)?);
-    }
-    if layers == 0 && kda_layers == 0 {
-        return Err(
-            "decode: model has no cacheable attention or recurrent layers (no causal sdpa or kda chunk node in the forward graph)"
-                .to_string(),
-        );
-    }
-    let (kv_heads, head_dim) = geometry.unwrap_or((0, 0));
-    let kda = kda_geometry
-        .map(|(heads, head_dim, value_dim, _)| KdaGeometry {
-            layers: kda_layers as usize,
-            heads,
-            head_dim,
-            value_dim,
-        })
-        .unwrap_or_default();
-    let kda_dtype = kda_geometry.map_or(DType::F32, |geometry| geometry.3);
-    let conv = conv_geometry
-        .map(|(channels, kernel)| ConvGeometry {
-            layers: conv_layers as usize,
-            channels,
-            kernel,
-        })
-        .unwrap_or_default();
-    let roots = roots
-        .iter()
-        .map(|root| {
-            remapped
-                .get(&root.id)
-                .cloned()
-                .unwrap_or_else(|| root.clone())
-        })
-        .collect();
-    Ok((
-        roots,
-        DecodeGeometry {
-            layers: layers as usize,
-            kv_heads,
-            head_dim,
-            kda,
-            kda_dtype,
-            conv,
-            cursor_slot,
-            cursor_tensor,
-        },
-    ))
-}
-
 #[napi]
 pub struct NativeKvPool {
     inner: Arc<PoolInner>,
@@ -3467,6 +3177,7 @@ impl NativeKvPool {
             heads: recurrent.kda_heads as usize,
             head_dim: recurrent.kda_head_dim as usize,
             value_dim: recurrent.kda_value_dim as usize,
+            dtype: DType::F32,
         };
         let conv = ConvGeometry {
             layers: recurrent.conv_layers as usize,
@@ -3572,7 +3283,7 @@ impl NativeKvSequence {
             .map(|_| {
                 Tensor::zeros(
                     &[pool.kda.heads, pool.kda.head_dim, pool.kda.value_dim],
-                    DType::F32,
+                    pool.kda.dtype,
                 )
             })
             .collect();
@@ -3761,7 +3472,7 @@ fn validate_recurrent_state_schema(schema: &KvStateSchema, state: &SeqState) -> 
     if (!state.kda_states.is_empty() && state.kda_states.len() != schema.kda.layers)
         || state.kda_states.iter().any(|tensor| {
             tensor.shape() != [schema.kda.heads, schema.kda.head_dim, schema.kda.value_dim]
-                || tensor.dtype() != schema.kda_dtype
+                || tensor.dtype() != schema.kda.dtype
         })
         || (!state.conv_states.is_empty() && state.conv_states.len() != schema.conv.layers)
         || state.conv_states.iter().any(|tensor| {
@@ -3800,11 +3511,6 @@ impl Executable {
     #[napi(getter)]
     pub fn batch(&self) -> u32 {
         self.state.map_or(0, |state| state.batch as u32)
-    }
-
-    #[napi(getter)]
-    pub fn signature(&self) -> Result<String> {
-        Ok(self.inner.signature.clone())
     }
 
     #[napi(getter)]
@@ -3949,17 +3655,13 @@ impl Executable {
         }
         let pool = &sequences[0].pool;
         validate_pool_schema(&schema, pool)?;
-        let tensor_count = self.inner.slots.iter().filter(|slot| !slot.scalar).count();
-        let caller_inputs = tensor_count - usize::from(schema.cursor_tensor);
-        if inputs.len() != caller_inputs {
-            return Err(Error::new(
-                Status::InvalidArg,
-                format!(
-                    "program expected {caller_inputs} tensor inputs, got {}",
-                    inputs.len()
-                ),
-            ));
-        }
+        let runtime_values =
+            usize::from(self.inner.slots.get(schema.cursor_slot as usize).is_some());
+        self.inner
+            .executable
+            .signature
+            .validate_invocation_counts(inputs.len(), 0, runtime_values, None)
+            .map_err(|error| Error::new(Status::InvalidArg, error.to_string()))?;
         let bounded_slot = self
             .inner
             .slots
@@ -4126,6 +3828,40 @@ mod tests {
         Node::new(NodeKind::Leaf(Arc::new(LeafSlot::new(Value(tensor))))).unwrap()
     }
 
+    #[test]
+    fn executable_diagnostics_exposes_compile_phases() {
+        let root = leaf(Tensor::from_vec(vec![1.0f32], vec![1]));
+        let compilation = executable::compile(
+            std::slice::from_ref(&root),
+            CompileOptions::default(),
+            CHUNKED_CE_CHUNK_LOGITS,
+        )
+        .unwrap();
+        let diagnostics = executable_diagnostics(&compilation.executable.diagnostics);
+
+        assert_eq!(
+            diagnostics
+                .compile_phases
+                .iter()
+                .map(|timing| timing.phase.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "graph_index",
+                "optimization",
+                "lowering",
+                "lowered_program_validation",
+                "memory_planning",
+                "physical_planning",
+                "artifact_assembly",
+                "publication",
+            ]
+        );
+        assert!(diagnostics
+            .compile_phases
+            .iter()
+            .all(|timing| timing.nanoseconds.is_finite() && timing.nanoseconds >= 0.0));
+    }
+
     fn eval_f32(node: &Arc<Node>) -> Vec<f32> {
         let cancelled = CancellationFlag::new();
         let compilation = executable::compile(
@@ -4168,7 +3904,6 @@ mod tests {
             kv_heads: 2,
             head_dim: 4,
             kda: KdaGeometry::default(),
-            kda_dtype: DType::F32,
             conv: ConvGeometry::default(),
             cursor_slot: 1,
             cursor_tensor: true,
@@ -4193,6 +3928,7 @@ mod tests {
 
     #[test]
     fn structural_cache_shares_the_plan_and_rebinds_leaves() {
+        let before = cpu_preparation_counts();
         let graph = |left: Vec<f32>, right: Vec<f32>| LazyTensor {
             node: Node::new(NodeKind::Add {
                 a: leaf(Tensor::from_vec(left, vec![2])),
@@ -4204,11 +3940,24 @@ mod tests {
         let second_root = graph(vec![10.0, 20.0], vec![30.0, 40.0]);
         let key = Some("cpu-structural-cache-rebind-test".to_string());
         let first = compile(vec![&first_root], None, None, key.clone()).unwrap();
+        let after_miss = cpu_preparation_counts();
+        assert_eq!(after_miss.0 - before.0, 1, "cache miss index builds");
+        assert_eq!(after_miss.1 - before.1, 1, "cache miss leaf collections");
+        assert_eq!(after_miss.2 - before.2, 2, "cache miss leaf gets");
         let second = compile(vec![&second_root], None, None, key).unwrap();
+        let after_hit = cpu_preparation_counts();
+        assert_eq!(after_hit.0 - after_miss.0, 1, "cache hit index builds");
+        assert_eq!(after_hit.1 - after_miss.1, 1, "cache hit leaf collections");
+        assert_eq!(after_hit.2 - after_miss.2, 2, "cache hit leaf gets");
         assert!(Arc::ptr_eq(
             &first.inner.executable,
             &second.inner.executable
         ));
+        assert_eq!(
+            first.inner.executable.signature,
+            second.inner.executable.signature
+        );
+        assert_eq!(first.inner.executable.signature.outputs.len(), 1);
         assert_eq!(
             first.inner.executable.memory,
             second.inner.executable.memory
@@ -4249,6 +3998,63 @@ mod tests {
         for output in second_outputs {
             assert_eq!(output.to_f32_vec().unwrap(), [40.0, 60.0]);
         }
+    }
+
+    #[test]
+    fn constant_weights_bypass_structural_cache() {
+        let graph = |values: Vec<f32>| LazyTensor {
+            node: leaf(Tensor::from_vec(values, vec![2])),
+        };
+        let first_root = graph(vec![1.0, 2.0]);
+        let second_root = graph(vec![3.0, 4.0]);
+        let constant_options = || NativeCompileOptions {
+            optimize: None,
+            constant_weights: Some(true),
+        };
+        let key = Some("cpu-constant-weight-cache-suppression-test".to_string());
+        let first = compile(
+            vec![&first_root],
+            Some(constant_options()),
+            None,
+            key.clone(),
+        )
+        .unwrap();
+        let second = compile(vec![&second_root], Some(constant_options()), None, key).unwrap();
+
+        assert!(!Arc::ptr_eq(
+            &first.inner.executable,
+            &second.inner.executable
+        ));
+        assert!(first.inner.generated_bindings.is_empty());
+        assert!(second.inner.generated_bindings.is_empty());
+        assert_eq!(first.inner.executable.memory.report.persistent_bytes, 8);
+        assert_eq!(second.inner.executable.memory.report.persistent_bytes, 8);
+        assert_eq!(
+            executable::execute(
+                &first.inner.executable,
+                &[],
+                &[],
+                &CancellationFlag::new(),
+                None,
+            )
+            .unwrap()[0]
+                .to_f32_vec()
+                .unwrap(),
+            [1.0, 2.0]
+        );
+        assert_eq!(
+            executable::execute(
+                &second.inner.executable,
+                &[],
+                &[],
+                &CancellationFlag::new(),
+                None,
+            )
+            .unwrap()[0]
+                .to_f32_vec()
+                .unwrap(),
+            [3.0, 4.0]
+        );
     }
 
     #[test]
@@ -4363,8 +4169,8 @@ mod tests {
                 heads: 3,
                 head_dim: 4,
                 value_dim: 5,
+                dtype: DType::F64,
             },
-            kda_dtype: DType::F64,
             conv: ConvGeometry {
                 layers: 2,
                 channels: 7,
@@ -4489,6 +4295,7 @@ mod tests {
                 heads: 1,
                 head_dim: 2,
                 value_dim: 2,
+                dtype: DType::F32,
             },
             conv: ConvGeometry::default(),
             blocks: Mutex::new(BlockStore::new(2)),
@@ -4512,6 +4319,7 @@ mod tests {
                 heads: 1,
                 head_dim: 2,
                 value_dim: 2,
+                dtype: DType::F32,
             },
             conv: ConvGeometry::default(),
             transaction: Mutex::new(None),

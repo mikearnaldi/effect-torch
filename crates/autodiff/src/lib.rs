@@ -1,4 +1,3 @@
-use effect_torch_compiler::Expr;
 use effect_torch_graph::{
     node_children, remap_children, Device, Node as GraphNode, NodeKind as GraphNodeKind,
     PositionOffset,
@@ -7,8 +6,8 @@ use effect_torch_runtime::DType;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-type Node = GraphNode<Expr>;
-type NodeKind = GraphNodeKind<Expr>;
+type Node = GraphNode;
+type NodeKind = GraphNodeKind;
 
 fn mk(kind: NodeKind) -> std::result::Result<Arc<Node>, String> {
     Node::new(kind)
@@ -425,14 +424,6 @@ fn vmap_rebuild(
         | NodeKind::Conv1dBackwardW { .. }
         | NodeKind::Conv2dBackwardW { .. } => {
             Err("vmap: convolution nodes are not supported under vmap".to_string())
-        }
-        NodeKind::FusedElementwise { .. }
-        | NodeKind::FusedElementwiseMulti { .. }
-        | NodeKind::FusedPick { .. }
-        | NodeKind::FusedReduce { .. }
-        | NodeKind::LinearGelu { .. }
-        | NodeKind::LinearResidual { .. } => {
-            Err("vmap: fused elementwise nodes are internal to evaluation".to_string())
         }
         _ => Ok(remap_children(&node.kind, f)),
     }
@@ -1504,19 +1495,9 @@ fn backward(
             }
             NodeKind::AdamWStep { .. }
             | NodeKind::AdamWOut { .. }
-            | NodeKind::AdamWStepGroup { .. }
-            | NodeKind::AdamWGroupOut { .. }
             | NodeKind::SgdStep { .. }
             | NodeKind::SgdOut { .. } => {
                 return Err("grad: optimizer update nodes are not differentiable".to_string());
-            }
-            NodeKind::FusedElementwise { .. }
-            | NodeKind::FusedElementwiseMulti { .. }
-            | NodeKind::FusedPick { .. }
-            | NodeKind::FusedReduce { .. }
-            | NodeKind::LinearGelu { .. }
-            | NodeKind::LinearResidual { .. } => {
-                return Err("grad: fused elementwise nodes are internal to evaluation".to_string());
             }
             NodeKind::Checkpoint { a } => {
                 // Deep-copy the region's interior with fresh node ids and

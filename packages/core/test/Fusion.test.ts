@@ -635,6 +635,32 @@ onDevices("Fusion", () => (it) => {
         }
       }))
 
+    it.effect("a prefix-dependent continuation uses the split multi-output topology", () =>
+      Effect.gen(function*() {
+        const build = Effect.gen(function*() {
+          const x = yield* Tensor.fromTypedArray(floats([0.5, -1, 2, -3, 0.25, 1.5]), [2, 3])
+          const prefix = yield* Tensor.tanh(
+            yield* Tensor.add(x, yield* Tensor.constantLike(x, 0.25))
+          )
+          const safe = yield* Tensor.exp(yield* Tensor.neg(prefix))
+          const reduced = yield* Tensor.sum(yield* Tensor.abs(prefix), { dims: [1], keepdims: true })
+          const dependent = yield* Tensor.sin(yield* Tensor.div(prefix, reduced))
+          return {
+            prefix: yield* values(prefix),
+            safe: yield* values(safe),
+            reduced: yield* values(reduced),
+            dependent: yield* values(dependent)
+          }
+        })
+        const fused = yield* withFusion(true, build)
+        const unfused = yield* withFusion(false, build)
+        for (const key of ["prefix", "safe", "reduced", "dependent"] as const) {
+          fused[key].forEach((v, i) => {
+            assert.assertTrue(close(v, unfused[key][i]), `${key}[${i}]: ${v} != ${unfused[key][i]}`)
+          })
+        }
+      }))
+
     it.effect("a reduce over a materialized prefix stays unfused but correct", () =>
       Effect.gen(function*() {
         const build = Effect.gen(function*() {

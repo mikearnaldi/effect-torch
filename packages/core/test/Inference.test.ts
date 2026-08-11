@@ -625,16 +625,37 @@ onDevices("Inference", () => (it) => {
         }
       }))
 
-    it.effect("rejects a model without cacheable attention at construction", () =>
+    it.effect("supports a model without cached state", () =>
       Effect.gen(function*() {
         const model = yield* Model.chain(
           yield* Model.embedding("wte", VOCAB, EMBED),
           yield* Model.linear("head", EMBED, VOCAB)
         )
         const params = yield* Tensor.compute(yield* model.init)
-        const error = yield* Effect.flip(Model.inference(model, params, { maxTokens: 16, blockSize: 4 }))
-        expect(error._tag).toBe("InferenceError")
-        expect(error.message).toMatch(/no cacheable attention/)
+        const program = yield* Model.inference(model, params, { maxTokens: 16, blockSize: 4 })
+        const gen = yield* program.generation()
+        const entry = yield* gen.add(yield* ids([1, 3, 5]))
+        const promptOutput = yield* model.forward(params, yield* ids([1, 3, 5]))
+        const [expectedPrompt] = yield* Tensor.compute([
+          yield* Tensor.reshape(
+            yield* Tensor.slice(promptOutput, { start: [0, 2, 0], end: [1, 3, VOCAB] }),
+            [VOCAB]
+          )
+        ])
+        deep(yield* Tensor.toNumberArray(entry.logits), yield* Tensor.toNumberArray(expectedPrompt))
+
+        const [stepLogits] = yield* gen.step([{ seq: entry.seq, token: 7 }])
+        const stepOutput = yield* model.forward(params, yield* ids([7]))
+        const [expectedStep] = yield* Tensor.compute([
+          yield* Tensor.reshape(yield* Tensor.slice(stepOutput, { start: [0, 0, 0], end: [1, 1, VOCAB] }), [VOCAB])
+        ])
+        deep(yield* Tensor.toNumberArray(stepLogits), yield* Tensor.toNumberArray(expectedStep))
+        expect(yield* entry.seq.cursor()).toBe(4)
+        yield* entry.seq.finish()
+        yield* Tensor.clear(entry.logits)
+        yield* Tensor.clear(expectedPrompt)
+        yield* Tensor.clear(stepLogits)
+        yield* Tensor.clear(expectedStep)
       }))
 
     it.effect("rejects non-causal attention at construction", () =>

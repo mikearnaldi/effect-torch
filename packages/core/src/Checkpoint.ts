@@ -69,7 +69,7 @@ const U32_MAX = 0xffff_ffff
  * @category models
  */
 export interface Checkpoint<S> {
-  /** Materialized parameters in the supplied trainer's `model.names` order. */
+  /** Caller-owned materialized parameters in the supplied trainer's `model.names` order. */
   readonly params: Model.Params
   /**
    * The optimizer state rebuilt from loaded roots and the persisted u32 global
@@ -99,6 +99,11 @@ export interface CheckpointWithSampler<S> extends Checkpoint<S> {
  * exposed by `stateRoots`, the last loss, `Resume.startedAt`, and trainer
  * provenance are not written.
  *
+ * `trained` must have been produced by this trainer with matching model arity,
+ * parameter-name order, and optimizer root schema. That relationship is not
+ * validated before entries are zipped. Saving borrows tensors and does not
+ * clear them.
+ *
  * `path` is handled by the selected runtime's direct safetensors extension.
  * Unsupported path I/O, an unwritable path, tensor evaluation, unsupported
  * dtypes, and backend serialization failures are {@link Tensor.TensorError}s.
@@ -125,7 +130,9 @@ export const save = <S, EL, RL, ED, RD, EO, RO>(
  *
  * This preserves the remaining draws in the current permutation. JavaScript
  * RNG state is not saved, so the next reshuffle is not guaranteed to match an
- * uninterrupted sampler.
+ * uninterrupted sampler. This function assumes `sampler.state()` already
+ * satisfies every sampler invariant; it does not independently validate the
+ * permutation, cursor, epoch, or unsigned-32-bit scalar ranges.
  *
  * @since 0.1.0
  * @category destructors
@@ -161,6 +168,10 @@ export const saveWithSampler = <S, EL, RL, ED, RD, EO, RO>(
  * schema, and optimizer identity and hyperparameters are not stored. Use the
  * same trainer semantics and a stable `stateRoots`/`rebuildState` contract.
  * The returned resume contains the u32 global step but no `startedAt` anchor.
+ * Loaded parameters and state roots are caller-owned; retain them while
+ * resuming and release them with {@link Tensor.clear} when no longer needed.
+ * All archive tensors are imported before selection; metadata and extra entries
+ * are not returned and rely on native finalization.
  *
  * Missing required checkpoint entries or malformed `meta:step` metadata fail
  * with {@link CheckpointError}. Missing paths, malformed safetensors files,

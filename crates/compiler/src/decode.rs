@@ -1,0 +1,824 @@
+use effect_torch_graph::{node_children, remap_children, Node, NodeKind, PositionOffset};
+use effect_torch_runtime::DType;
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct KdaGeometry {
+    pub layers: usize,
+    pub heads: usize,
+    pub head_dim: usize,
+    pub value_dim: usize,
+    pub dtype: DType,
+}
+
+impl Default for KdaGeometry {
+    fn default() -> Self {
+        Self {
+            layers: 0,
+            heads: 0,
+            head_dim: 0,
+            value_dim: 0,
+            dtype: DType::F32,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub struct ConvGeometry {
+    pub layers: usize,
+    pub channels: usize,
+    pub kernel: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct DecodeGeometry {
+    pub layers: usize,
+    pub kv_heads: usize,
+    pub head_dim: usize,
+    pub kda: KdaGeometry,
+    pub conv: ConvGeometry,
+    pub cursor_slot: u32,
+    pub cursor_tensor: bool,
+}
+
+impl DecodeGeometry {
+    pub const fn state_cursor(&self) -> crate::request::StateCursorSlot {
+        crate::request::StateCursorSlot::new(self.cursor_slot, self.cursor_tensor)
+    }
+}
+
+/// Builds the stateful decode specialization of an inference graph.
+///
+/// Traversal and reconstruction are iterative. Layer ordinals retain the
+/// historical decode order: roots and children are encountered from last to
+/// first, while returned roots remain in caller order.
+pub fn specialize_decode(
+    roots: &[Arc<Node>],
+    window: Option<usize>,
+    batch: usize,
+) -> Result<(Vec<Arc<Node>>, DecodeGeometry), String> {
+    let mut maximum_slot = None;
+    let mut visited = HashSet::new();
+    let mut stack = roots.to_vec();
+    while let Some(node) = stack.pop() {
+        if !visited.insert(node.id) {
+            continue;
+        }
+        match &node.kind {
+            NodeKind::Input { slot, .. } => {
+                maximum_slot = Some(maximum_slot.map_or(*slot, |current: u32| current.max(*slot)));
+            }
+            NodeKind::ScalarInput { .. } => {
+                return Err(
+                    "decode: runtime scalar inputs are not supported in inference graphs"
+                        .to_string(),
+                );
+            }
+            _ => {}
+        }
+        stack.extend(node_children(&node.kind));
+    }
+    let cursor_slot = maximum_slot.map_or(0, |slot| slot + 1);
+
+    let mut visited = HashSet::new();
+    let mut order = Vec::new();
+    let mut stack = roots
+        .iter()
+        .map(|root| (root.clone(), false))
+        .collect::<Vec<_>>();
+    while let Some((node, processed)) = stack.pop() {
+        if processed {
+            order.push(node);
+            continue;
+        }
+        if !visited.insert(node.id) {
+            continue;
+        }
+        stack.push((node.clone(), true));
+        for child in node_children(&node.kind) {
+            stack.push((child, false));
+        }
+    }
+
+    let mut remapped = HashMap::new();
+    let mut layers = 0usize;
+    let mut kda_layers = 0usize;
+    let mut conv_layers = 0usize;
+    let mut cursor_tensor = false;
+    let mut geometry: Option<(usize, usize)> = None;
+    let mut kda_geometry: Option<(usize, usize, usize, DType)> = None;
+    let mut conv_geometry: Option<(usize, usize)> = None;
+    for node in order {
+        let remap = |child: &Arc<Node>| {
+            remapped
+                .get(&child.id)
+                .cloned()
+                .unwrap_or_else(|| child.clone())
+        };
+        let kind = match &node.kind {
+            NodeKind::Sdpa {
+                q,
+                k,
+                v,
+                scale,
+                causal,
+            } => {
+                if !causal {
+                    return Err(
+                        "decode: only causal attention is cacheable, found a non-causal sdpa"
+                            .to_string(),
+                    );
+                }
+                let rank = k.shape.len();
+                if rank != 4 || k.shape[..rank - 3].iter().product::<usize>() != batch {
+                    return Err(format!(
+                        "decode: kv caching expects attention of shape [{batch}, H, T, D], got {:?}",
+                        k.shape
+                    ));
+                }
+                let current = (k.shape[rank - 3], k.shape[rank - 1]);
+                if let Some(previous) = geometry {
+                    if previous != current {
+                        if k.device.is_metal() {
+                            return Err(format!(
+                                "decode: attention layers disagree on head geometry ([{}, {}] vs [{}, {}])",
+                                previous.0, previous.1, current.0, current.1
+                            ));
+                        }
+                        return Err(format!(
+                            "decode: attention layers disagree on head geometry ({previous:?} vs {current:?})"
+                        ));
+                    }
+                } else {
+                    geometry = Some(current);
+                }
+                let layer = layers;
+                layers += 1;
+                NodeKind::KvAttention {
+                    q: remap(q),
+                    k: remap(k),
+                    v: remap(v),
+                    scale: *scale,
+                    layer: layer as u32,
+                    window,
+                }
+            }
+            NodeKind::KdaChunk {
+                q,
+                k,
+                v,
+                log_decay,
+                beta,
+                scale,
+            } => {
+                let rank = q.shape.len();
+                if rank != 4 || q.shape[..rank - 3].iter().product::<usize>() != batch {
+                    return Err(format!(
+                        "decode: kda state caching expects layers of shape [{batch}, H, T, D], got {:?}",
+                        q.shape
+                    ));
+                }
+                if q.device.is_cpu() && !matches!(q.dtype, DType::F32 | DType::F64) {
+                    return Err(format!(
+                        "decode: stateful KDA requires f32 or f64, got {}",
+                        q.dtype.name()
+                    ));
+                }
+                let current = (
+                    q.shape[rank - 3],
+                    q.shape[rank - 1],
+                    v.shape[rank - 1],
+                    q.dtype,
+                );
+                if let Some(previous) = kda_geometry {
+                    let dimensions_disagree = previous.0 != current.0
+                        || previous.1 != current.1
+                        || previous.2 != current.2;
+                    let dtype_disagrees = q.device.is_cpu() && previous.3 != current.3;
+                    if dimensions_disagree || dtype_disagrees {
+                        if q.device.is_metal() {
+                            let previous = (previous.0, previous.1, previous.2);
+                            let current = (current.0, current.1, current.2);
+                            return Err(format!(
+                                "decode: kda layers disagree on head geometry ({previous:?} vs {current:?})"
+                            ));
+                        }
+                        return Err(format!(
+                            "decode: kda layers disagree on head geometry ({previous:?} vs {current:?})"
+                        ));
+                    }
+                } else {
+                    kda_geometry = Some(current);
+                }
+                let layer = kda_layers;
+                kda_layers += 1;
+                NodeKind::KdaRecurrence {
+                    q: remap(q),
+                    k: remap(k),
+                    v: remap(v),
+                    log_decay: remap(log_decay),
+                    beta: remap(beta),
+                    scale: *scale,
+                    layer: layer as u32,
+                }
+            }
+            NodeKind::ShortConv1d { x, weight } => {
+                let rank = x.shape.len();
+                if rank != 3 || x.shape[..rank - 2].iter().product::<usize>() != batch {
+                    return Err(format!(
+                        "decode: conv state caching expects layers of shape [{batch}, T, C], got {:?}",
+                        x.shape
+                    ));
+                }
+                let current = (x.shape[rank - 1], weight.shape[1]);
+                if let Some(previous) = conv_geometry {
+                    if previous != current {
+                        return Err(format!(
+                            "decode: short conv layers disagree on geometry ({previous:?} vs {current:?})"
+                        ));
+                    }
+                } else {
+                    conv_geometry = Some(current);
+                }
+                let layer = conv_layers;
+                conv_layers += 1;
+                NodeKind::ConvState {
+                    x: remap(x),
+                    weight: remap(weight),
+                    layer: layer as u32,
+                }
+            }
+            NodeKind::RotaryEmbedding {
+                x, seq_len, theta, ..
+            } => NodeKind::RotaryEmbedding {
+                x: remap(x),
+                seq_len: *seq_len,
+                theta: *theta,
+                offset: PositionOffset::Cursor,
+            },
+            NodeKind::PositionEmbedding { weight, seq_len } => {
+                let tokens = *seq_len;
+                let width = weight.shape[1];
+                let device = weight.device.clone();
+                if batch > 1 {
+                    cursor_tensor = true;
+                    let cursors = Node::new(NodeKind::Input {
+                        slot: cursor_slot,
+                        shape: vec![batch],
+                        dtype: DType::I64,
+                        device: device.clone(),
+                    })?;
+                    let positions = Node::new(NodeKind::Add {
+                        a: Node::new(NodeKind::Reshape {
+                            a: cursors,
+                            shape: vec![batch, 1],
+                        })?,
+                        b: Node::new(NodeKind::BroadcastTo {
+                            a: Node::new(NodeKind::Reshape {
+                                a: Node::new(NodeKind::Arange {
+                                    start: 0.0,
+                                    end: tokens as f64,
+                                    step: 1.0,
+                                    dtype: DType::I64,
+                                    device: device.clone(),
+                                })?,
+                                shape: vec![1, tokens],
+                            })?,
+                            shape: vec![batch, tokens],
+                        })?,
+                    })?;
+                    let indexes = Node::new(NodeKind::BroadcastTo {
+                        a: Node::new(NodeKind::Reshape {
+                            a: positions,
+                            shape: vec![batch * tokens, 1],
+                        })?,
+                        shape: vec![batch * tokens, width],
+                    })?;
+                    NodeKind::Reshape {
+                        a: Node::new(NodeKind::Gather {
+                            a: remap(weight),
+                            dim: 0,
+                            indexes,
+                        })?,
+                        shape: vec![batch, tokens, width],
+                    }
+                } else {
+                    let positions = Node::new(NodeKind::Add {
+                        a: Node::new(NodeKind::Arange {
+                            start: 0.0,
+                            end: tokens as f64,
+                            step: 1.0,
+                            dtype: DType::I64,
+                            device: device.clone(),
+                        })?,
+                        b: Node::new(NodeKind::ScalarInput {
+                            slot: cursor_slot,
+                            dtype: DType::I64,
+                            device,
+                        })?,
+                    })?;
+                    let indexes = Node::new(NodeKind::BroadcastTo {
+                        a: Node::new(NodeKind::Reshape {
+                            a: positions,
+                            shape: vec![tokens, 1],
+                        })?,
+                        shape: vec![tokens, width],
+                    })?;
+                    NodeKind::Gather {
+                        a: remap(weight),
+                        dim: 0,
+                        indexes,
+                    }
+                }
+            }
+            kind => remap_children(kind, &remap),
+        };
+        remapped.insert(node.id, Node::new(kind)?);
+    }
+
+    let (kv_heads, head_dim) = geometry.unwrap_or((0, 0));
+    let kda = kda_geometry
+        .map(|(heads, head_dim, value_dim, dtype)| KdaGeometry {
+            layers: kda_layers,
+            heads,
+            head_dim,
+            value_dim,
+            dtype,
+        })
+        .unwrap_or_default();
+    let conv = conv_geometry
+        .map(|(channels, kernel)| ConvGeometry {
+            layers: conv_layers,
+            channels,
+            kernel,
+        })
+        .unwrap_or_default();
+    let roots = roots
+        .iter()
+        .map(|root| {
+            remapped
+                .get(&root.id)
+                .cloned()
+                .unwrap_or_else(|| root.clone())
+        })
+        .collect();
+    Ok((
+        roots,
+        DecodeGeometry {
+            layers,
+            kv_heads,
+            head_dim,
+            kda,
+            conv,
+            cursor_slot,
+            cursor_tensor,
+        },
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::schedule::graph_post_order;
+    use effect_torch_graph::Device;
+
+    fn tensor(shape: &[usize], dtype: DType, device: Device) -> Arc<Node> {
+        Node::new(NodeKind::Zeros {
+            shape: shape.to_vec(),
+            dtype,
+            device,
+        })
+        .unwrap()
+    }
+
+    fn input(slot: u32, shape: &[usize], dtype: DType, device: Device) -> Arc<Node> {
+        Node::new(NodeKind::Input {
+            slot,
+            shape: shape.to_vec(),
+            dtype,
+            device,
+        })
+        .unwrap()
+    }
+
+    fn attention(
+        batch: usize,
+        heads: usize,
+        tokens: usize,
+        dim: usize,
+        scale: f64,
+        causal: bool,
+        device: Device,
+    ) -> Arc<Node> {
+        let operand = tensor(&[batch, heads, tokens, dim], DType::F32, device);
+        Node::new(NodeKind::Sdpa {
+            q: operand.clone(),
+            k: operand.clone(),
+            v: operand,
+            scale,
+            causal,
+        })
+        .unwrap()
+    }
+
+    fn kda(
+        batch: usize,
+        heads: usize,
+        tokens: usize,
+        key_dim: usize,
+        value_dim: usize,
+        dtype: DType,
+        scale: f64,
+        device: Device,
+    ) -> Arc<Node> {
+        let q = tensor(&[batch, heads, tokens, key_dim], dtype, device.clone());
+        let v = tensor(&[batch, heads, tokens, value_dim], dtype, device.clone());
+        Node::new(NodeKind::KdaChunk {
+            q: q.clone(),
+            k: q.clone(),
+            v,
+            log_decay: q,
+            beta: tensor(&[batch, heads, tokens, 1], dtype, device),
+            scale,
+        })
+        .unwrap()
+    }
+
+    fn short_conv(
+        batch: usize,
+        tokens: usize,
+        channels: usize,
+        kernel: usize,
+        device: Device,
+    ) -> Arc<Node> {
+        Node::new(NodeKind::ShortConv1d {
+            x: tensor(&[batch, tokens, channels], DType::F32, device.clone()),
+            weight: tensor(&[channels, kernel], DType::F32, device),
+        })
+        .unwrap()
+    }
+
+    fn layer(kind: &NodeKind) -> u32 {
+        match kind {
+            NodeKind::KvAttention { layer, .. }
+            | NodeKind::KdaRecurrence { layer, .. }
+            | NodeKind::ConvState { layer, .. } => *layer,
+            _ => panic!("expected a stateful decode node"),
+        }
+    }
+
+    #[test]
+    fn specializes_all_stateful_semantics_in_one_new_graph_generation() {
+        for device in [Device::Cpu, Device::Metal] {
+            let shared = tensor(&[1, 1, 2, 4], DType::F32, device.clone());
+            let attention = Node::new(NodeKind::Sdpa {
+                q: shared.clone(),
+                k: shared.clone(),
+                v: shared.clone(),
+                scale: 0.5,
+                causal: true,
+            })
+            .unwrap();
+            let rotary = Node::new(NodeKind::RotaryEmbedding {
+                x: shared,
+                seq_len: 2,
+                theta: 10_000.0,
+                offset: PositionOffset::Absolute,
+            })
+            .unwrap();
+            let kda = kda(1, 2, 2, 3, 5, DType::F32, 0.25, device.clone());
+            let conv = short_conv(1, 2, 5, 3, device);
+            let roots = vec![attention, rotary, kda, conv];
+            let source = graph_post_order(&roots);
+            let source_ids = source.iter().map(|node| node.id).collect::<HashSet<_>>();
+
+            let (specialized, geometry) = specialize_decode(&roots, Some(32), 1).unwrap();
+
+            assert!(matches!(
+                specialized[0].kind,
+                NodeKind::KvAttention {
+                    scale: 0.5,
+                    layer: 0,
+                    window: Some(32),
+                    ..
+                }
+            ));
+            assert!(matches!(
+                specialized[1].kind,
+                NodeKind::RotaryEmbedding {
+                    offset: PositionOffset::Cursor,
+                    ..
+                }
+            ));
+            assert!(matches!(
+                specialized[2].kind,
+                NodeKind::KdaRecurrence {
+                    scale: 0.25,
+                    layer: 0,
+                    ..
+                }
+            ));
+            assert!(matches!(
+                specialized[3].kind,
+                NodeKind::ConvState { layer: 0, .. }
+            ));
+            let NodeKind::KvAttention { q, .. } = &specialized[0].kind else {
+                unreachable!()
+            };
+            let NodeKind::RotaryEmbedding { x, .. } = &specialized[1].kind else {
+                unreachable!()
+            };
+            assert!(Arc::ptr_eq(q, x), "shared source remains shared");
+            let generated = graph_post_order(&specialized);
+            assert_eq!(generated.len(), source.len());
+            assert!(generated.iter().all(|node| !source_ids.contains(&node.id)));
+            assert_eq!(geometry.layers, 1);
+            assert_eq!((geometry.kv_heads, geometry.head_dim), (1, 4));
+            assert_eq!(geometry.kda.layers, 1);
+            assert_eq!(geometry.conv.layers, 1);
+        }
+    }
+
+    #[test]
+    fn learned_positions_build_scalar_and_batched_cursor_graphs() {
+        for (device, batch) in [
+            (Device::Cpu, 1usize),
+            (Device::Cpu, 3usize),
+            (Device::Metal, 1usize),
+            (Device::Metal, 3usize),
+        ] {
+            let q = input(0, &[batch, 1, 2, 4], DType::F32, device.clone());
+            let k = input(1, &[batch, 1, 2, 4], DType::F32, device.clone());
+            let v = input(2, &[batch, 1, 2, 4], DType::F32, device.clone());
+            let attention = Node::new(NodeKind::Sdpa {
+                q,
+                k,
+                v,
+                scale: 0.5,
+                causal: true,
+            })
+            .unwrap();
+            let positions = Node::new(NodeKind::PositionEmbedding {
+                weight: tensor(&[128, 6], DType::F32, device.clone()),
+                seq_len: 2,
+            })
+            .unwrap();
+
+            let (roots, geometry) =
+                specialize_decode(&[attention, positions], None, batch).unwrap();
+
+            assert_eq!(geometry.cursor_slot, 3);
+            assert_eq!(geometry.cursor_tensor, batch > 1);
+            let cursor_nodes = graph_post_order(&roots)
+                .into_iter()
+                .filter(|node| match &node.kind {
+                    NodeKind::Input { slot, .. } | NodeKind::ScalarInput { slot, .. } => {
+                        *slot == geometry.cursor_slot
+                    }
+                    _ => false,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(cursor_nodes.len(), 1);
+            if batch == 1 {
+                assert!(matches!(
+                    cursor_nodes[0].kind,
+                    NodeKind::ScalarInput {
+                        dtype: DType::I64,
+                        ..
+                    }
+                ));
+                assert!(matches!(roots[1].kind, NodeKind::Gather { .. }));
+                assert_eq!(roots[1].shape, [2, 6]);
+            } else {
+                assert!(matches!(
+                    &cursor_nodes[0].kind,
+                    NodeKind::Input {
+                        shape,
+                        dtype: DType::I64,
+                        ..
+                    } if shape == &[batch]
+                ));
+                assert!(matches!(roots[1].kind, NodeKind::Reshape { .. }));
+                assert_eq!(roots[1].shape, [batch, 2, 6]);
+            }
+            assert!(cursor_nodes[0].device.same_device(&device));
+        }
+    }
+
+    #[test]
+    fn geometry_and_dtype_validation_preserve_backend_errors() {
+        let cpu_attention = [
+            attention(1, 2, 1, 4, 1.0, true, Device::Cpu),
+            attention(1, 3, 1, 4, 1.0, true, Device::Cpu),
+        ];
+        assert_eq!(
+            specialize_decode(&cpu_attention, None, 1).err().unwrap(),
+            "decode: attention layers disagree on head geometry ((3, 4) vs (2, 4))"
+        );
+        let metal_attention = [
+            attention(1, 2, 1, 4, 1.0, true, Device::Metal),
+            attention(1, 3, 1, 4, 1.0, true, Device::Metal),
+        ];
+        assert_eq!(
+            specialize_decode(&metal_attention, None, 1).err().unwrap(),
+            "decode: attention layers disagree on head geometry ([3, 4] vs [2, 4])"
+        );
+        let cpu_kda = [
+            kda(1, 2, 1, 4, 3, DType::F32, 1.0, Device::Cpu),
+            kda(1, 3, 1, 4, 3, DType::F32, 1.0, Device::Cpu),
+        ];
+        assert_eq!(
+            specialize_decode(&cpu_kda, None, 1).err().unwrap(),
+            "decode: kda layers disagree on head geometry ((3, 4, 3, F32) vs (2, 4, 3, F32))"
+        );
+        let conv = [
+            short_conv(1, 1, 3, 2, Device::Cpu),
+            short_conv(1, 1, 4, 2, Device::Cpu),
+            attention(1, 1, 1, 2, 1.0, true, Device::Cpu),
+        ];
+        assert_eq!(
+            specialize_decode(&conv, None, 1).err().unwrap(),
+            "decode: short conv layers disagree on geometry ((4, 2) vs (3, 2))"
+        );
+
+        let malformed_kda = kda(1, 1, 1, 2, 2, DType::F32, 1.0, Device::Cpu);
+        let NodeKind::KdaChunk {
+            q,
+            k,
+            v,
+            log_decay,
+            beta,
+            scale,
+        } = &malformed_kda.kind
+        else {
+            unreachable!()
+        };
+        let malformed_kda = Node::new(NodeKind::KdaChunk {
+            q: Node::new(NodeKind::Reshape {
+                a: q.clone(),
+                shape: vec![1, 1, 2],
+            })
+            .unwrap(),
+            k: Node::new(NodeKind::Reshape {
+                a: k.clone(),
+                shape: vec![1, 1, 2],
+            })
+            .unwrap(),
+            v: Node::new(NodeKind::Reshape {
+                a: v.clone(),
+                shape: vec![1, 1, 2],
+            })
+            .unwrap(),
+            log_decay: Node::new(NodeKind::Reshape {
+                a: log_decay.clone(),
+                shape: vec![1, 1, 2],
+            })
+            .unwrap(),
+            beta: Node::new(NodeKind::Reshape {
+                a: beta.clone(),
+                shape: vec![1, 1, 1],
+            })
+            .unwrap(),
+            scale: *scale,
+        })
+        .unwrap();
+        assert_eq!(
+            specialize_decode(&[malformed_kda], None, 1).err().unwrap(),
+            "decode: kda state caching expects layers of shape [1, H, T, D], got [1, 1, 2]"
+        );
+        assert_eq!(
+            specialize_decode(&[short_conv(1, 2, 3, 2, Device::Cpu)], None, 2)
+                .err()
+                .unwrap(),
+            "decode: conv state caching expects layers of shape [2, T, C], got [1, 2, 3]"
+        );
+        assert_eq!(
+            specialize_decode(&[attention(1, 1, 1, 2, 1.0, false, Device::Cpu)], None, 1)
+                .err()
+                .unwrap(),
+            "decode: only causal attention is cacheable, found a non-causal sdpa"
+        );
+        assert_eq!(
+            specialize_decode(
+                &[kda(1, 1, 1, 2, 2, DType::BF16, 1.0, Device::Cpu)],
+                None,
+                1
+            )
+            .err()
+            .unwrap(),
+            "decode: stateful KDA requires f32 or f64, got bf16"
+        );
+        let scalar = Node::new(NodeKind::ScalarInput {
+            slot: 0,
+            dtype: DType::I64,
+            device: Device::Cpu,
+        })
+        .unwrap();
+        assert_eq!(
+            specialize_decode(&[scalar], None, 1).err().unwrap(),
+            "decode: runtime scalar inputs are not supported in inference graphs"
+        );
+        let (stateless, stateless_geometry) =
+            specialize_decode(&[tensor(&[1], DType::F32, Device::Cpu)], None, 1).unwrap();
+        assert_eq!(stateless.len(), 1);
+        assert_eq!(stateless_geometry.layers, 0);
+        assert_eq!(stateless_geometry.kda.layers, 0);
+        assert_eq!(stateless_geometry.conv.layers, 0);
+
+        let (_, conv_geometry) =
+            specialize_decode(&[short_conv(1, 2, 3, 2, Device::Cpu)], None, 1).unwrap();
+        assert_eq!(conv_geometry.layers, 0);
+        assert_eq!(conv_geometry.kda.layers, 0);
+        assert_eq!(conv_geometry.conv.layers, 1);
+
+        let (_, cpu_geometry) =
+            specialize_decode(&[kda(1, 1, 1, 2, 3, DType::F64, 1.0, Device::Cpu)], None, 1)
+                .unwrap();
+        assert_eq!(cpu_geometry.kda.dtype, DType::F64);
+        for dtype in [DType::F32, DType::BF16] {
+            let (_, metal_geometry) =
+                specialize_decode(&[kda(1, 1, 1, 2, 3, dtype, 1.0, Device::Metal)], None, 1)
+                    .unwrap();
+            assert_eq!(metal_geometry.kda.dtype, dtype);
+        }
+        let (_, mixed_metal_geometry) = specialize_decode(
+            &[
+                kda(1, 1, 1, 2, 3, DType::F32, 1.0, Device::Metal),
+                kda(1, 1, 1, 2, 3, DType::BF16, 1.0, Device::Metal),
+            ],
+            None,
+            1,
+        )
+        .unwrap();
+        assert_eq!(mixed_metal_geometry.kda.layers, 2);
+        assert_eq!(mixed_metal_geometry.kda.dtype, DType::BF16);
+        assert!(Node::new(NodeKind::Zeros {
+            shape: vec![1, 1, 1, 2],
+            dtype: DType::F64,
+            device: Device::Metal,
+        })
+        .is_err());
+    }
+
+    #[test]
+    fn root_order_and_layer_numbering_are_stable() {
+        let roots = vec![
+            attention(1, 2, 1, 4, 1.0, true, Device::Cpu),
+            attention(1, 2, 1, 4, 2.0, true, Device::Cpu),
+            kda(1, 2, 1, 4, 3, DType::F32, 3.0, Device::Cpu),
+            kda(1, 2, 1, 4, 3, DType::F32, 4.0, Device::Cpu),
+            short_conv(1, 1, 3, 2, Device::Cpu),
+            short_conv(1, 1, 3, 2, Device::Cpu),
+        ];
+
+        for _ in 0..2 {
+            let (specialized, geometry) = specialize_decode(&roots, Some(7), 1).unwrap();
+            assert_eq!(specialized.len(), roots.len());
+            assert_eq!(
+                specialized
+                    .iter()
+                    .map(|node| layer(&node.kind))
+                    .collect::<Vec<_>>(),
+                [1, 0, 1, 0, 1, 0]
+            );
+            assert!(matches!(
+                specialized[0].kind,
+                NodeKind::KvAttention { scale: 1.0, .. }
+            ));
+            assert!(matches!(
+                specialized[1].kind,
+                NodeKind::KvAttention { scale: 2.0, .. }
+            ));
+            assert!(matches!(
+                specialized[2].kind,
+                NodeKind::KdaRecurrence { scale: 3.0, .. }
+            ));
+            assert!(matches!(
+                specialized[3].kind,
+                NodeKind::KdaRecurrence { scale: 4.0, .. }
+            ));
+            assert_eq!(geometry.layers, 2);
+            assert_eq!(geometry.kda.layers, 2);
+            assert_eq!(geometry.conv.layers, 2);
+        }
+    }
+
+    #[test]
+    fn specialization_is_stack_safe_for_deep_graphs() {
+        std::thread::Builder::new()
+            .stack_size(256 * 1024)
+            .spawn(|| {
+                let mut root = attention(1, 1, 1, 2, 1.0, true, Device::Cpu);
+                for _ in 0..50_000 {
+                    root = Node::new(NodeKind::Neg { a: root }).unwrap();
+                }
+                let (specialized, geometry) = specialize_decode(&[root], None, 1).unwrap();
+                assert_eq!(geometry.layers, 1);
+                assert_eq!(graph_post_order(&specialized).len(), 50_002);
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+}
