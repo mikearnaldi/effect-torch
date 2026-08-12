@@ -457,6 +457,39 @@ onDevices("Tensor", (device) => (it) => {
   })
 
   describe("neural network ops", () => {
+    it.effect("rmsNorm normalizes each last-dimension row with optional weight", () =>
+      Effect.gen(function*() {
+        const inputValues = [-2, -1, 0, 1, 1, 2, 3, 4, 4, 3, 2, 1, -1, -2, -3, -4]
+        const weightValues = [0.5, 1, 1.5, 2]
+        const eps = 1e-5
+        const input = yield* Tensor.fromTypedArray(floats(inputValues), [2, 2, 4])
+        const weight = yield* Tensor.fromTypedArray(floats(weightValues), [4])
+        const expected = (weighted: boolean) =>
+          inputValues.map((value, index) => {
+            const rowStart = Math.floor(index / 4) * 4
+            const row = inputValues.slice(rowStart, rowStart + 4)
+            const scale = 1 / Math.sqrt(row.reduce((sum, x) => sum + x * x, 0) / row.length + eps)
+            return value * scale * (weighted ? weightValues[index % 4] : 1)
+          })
+
+        const normalized = yield* Tensor.rmsNorm(input, undefined, eps)
+        deep(normalized.shape, [2, 2, 4])
+        deep(yield* values(normalized), expected(false))
+        deep(yield* values(yield* Tensor.rmsNorm(input, weight, eps)), expected(true))
+      }))
+
+    it.effect("rmsNorm validates input and weight shapes", () =>
+      Effect.gen(function*() {
+        const scalar = yield* Tensor.constant(1, { dtype: floatDtype })
+        const scalarError = yield* Effect.flip(Tensor.rmsNorm(scalar))
+        expect(scalarError.message).toContain("rank at least 1")
+
+        const input = yield* Tensor.ones([2, 4], { dtype: floatDtype })
+        const weight = yield* Tensor.ones([2, 2], { dtype: floatDtype })
+        const weightError = yield* Effect.flip(Tensor.rmsNorm(input, weight))
+        expect(weightError.message).toContain("weight must be [4]")
+      }))
+
     it.effect("softmax rows sum to 1 and logSoftmax agrees", () =>
       Effect.gen(function*() {
         const x = yield* Tensor.fromTypedArray(floats([1, 2, 3, 4, 5, 6]), [2, 3])

@@ -7,6 +7,9 @@ import type {
   NativeAddon,
   NativeCompileOptions,
   NativeDType,
+  NativeGgmlKQuant,
+  NativeGgufMetadataEntry,
+  NativeGgufTensorDescriptor,
   NativeKvPool,
   NativeKvSequence,
   NativeKvStateSchema,
@@ -23,6 +26,7 @@ interface HandleRecord {
   readonly value?: object
   readonly info?: unknown
   readonly structure?: StructuralNode
+  readonly declarations?: ReadonlySet<InputDeclaration>
   disposed: boolean
 }
 
@@ -31,6 +35,23 @@ interface StructuralNode {
   readonly inputs: ReadonlyArray<Runtime.TensorHandle>
   readonly attributes: unknown
 }
+
+interface TensorBindingDeclaration {
+  readonly kind: "tensor"
+  readonly slot: number
+  readonly shape: ReadonlyArray<number>
+  readonly dtype: Runtime.DType
+  readonly storage?: Runtime.EncodedTensorStorage
+}
+
+interface ScalarBindingDeclaration {
+  readonly kind: "scalar"
+  readonly slot: number
+  readonly dtype: Runtime.DType
+}
+
+type InputDeclaration = TensorBindingDeclaration | ScalarBindingDeclaration
+type TensorBinding = Omit<TensorBindingDeclaration, "kind" | "slot">
 
 const numberBits = new DataView(new ArrayBuffer(8))
 
@@ -79,6 +100,16 @@ interface KvSequenceInfo {
   readonly pool: KvPoolInfo
 }
 
+interface ExecutableInfo {
+  readonly bindings: ReadonlyArray<TensorBinding>
+  readonly outputs: ReadonlyArray<{
+    readonly shape: ReadonlyArray<number>
+    readonly dtype: Runtime.DType
+    readonly storage?: Runtime.EncodedTensorStorage
+  }>
+  readonly state?: Runtime.DecodeStateSchema
+}
+
 const handleRecords = new WeakMap<object, HandleRecord>()
 const backendHandlesKey = Symbol.for("@effect-torch/backend-handles")
 const existingBackendHandles = Reflect.get(globalThis, backendHandlesKey) as WeakSet<object> | undefined
@@ -100,7 +131,11 @@ const backendError = (
     : (() => {
       const message = error instanceof Error ? error.message : String(error)
       return new Runtime.BackendError({
-        reason: message.includes("tensor was cleared") ? "invalid-handle" : reason,
+        reason: message.includes("tensor was cleared")
+          ? "invalid-handle"
+          : message.includes("unsupported operation")
+          ? "unsupported-operation"
+          : reason,
         backend: backendName,
         operation,
         phase,
@@ -119,7 +154,22 @@ const cancellable = <A>(
 ): Effect.Effect<A, Runtime.BackendError> =>
   Effect.callback<A, Runtime.BackendError>((resume, signal) => {
     const token = new native.CancellationToken()
-    const abort = () => token.cancel()
+    let lateValue: A | undefined
+    let hasLateValue = false
+    const clearLateValue = () => {
+      if (!hasLateValue) return
+      hasLateValue = false
+      try {
+        onLateSuccess?.(lateValue as A)
+      } catch {
+        // The interrupted fiber cannot observe cleanup failures.
+      }
+      lateValue = undefined
+    }
+    const abort = () => {
+      token.cancel()
+      clearLateValue()
+    }
     if (signal.aborted) abort()
     else signal.addEventListener("abort", abort, { once: true })
     let pending: Promise<A>
@@ -132,16 +182,21 @@ const cancellable = <A>(
     }
     pending.then(
       (value) => {
-        signal.removeEventListener("abort", abort)
         if (signal.aborted) {
-          try {
-            onLateSuccess?.(value)
-          } catch {
-            // The interrupted fiber cannot observe cleanup failures.
-          }
+          lateValue = value
+          hasLateValue = true
+          clearLateValue()
           return
         }
-        resume(Effect.succeed(value))
+        lateValue = value
+        hasLateValue = true
+        resume(Effect.suspend(() => {
+          signal.removeEventListener("abort", abort)
+          if (!hasLateValue) return Effect.interrupt
+          hasLateValue = false
+          lateValue = undefined
+          return Effect.succeed(value)
+        }))
       },
       (error) => {
         signal.removeEventListener("abort", abort)
@@ -272,7 +327,8 @@ export const makeRuntime = (
     tag: H["_tag"],
     shape: ReadonlyArray<number>,
     tensorDtype: string,
-    tensorDevice: string
+    tensorDevice: string,
+    storage?: Runtime.EncodedTensorStorage
   ): H => {
     if (!shape.every((dimension) => Number.isSafeInteger(dimension) && dimension >= 0)) {
       throw new Error(`native runtime returned invalid shape [${shape}]`)
@@ -280,10 +336,26 @@ export const makeRuntime = (
     if (tensorDevice !== device) {
       throw new Error(`native runtime returned placement ${tensorDevice}, expected ${device}`)
     }
+    if (
+      storage !== undefined &&
+      (tensorDtype !== "f32" || storage.physicalDtype !== "u8" ||
+        !storage.physicalShape.every((dimension) => Number.isSafeInteger(dimension) && dimension >= 0))
+    ) {
+      throw new Error("native runtime returned invalid encoded tensor metadata")
+    }
     return Object.freeze({
       _tag: tag,
       shape: Object.freeze([...shape]),
       dtype: dtype(tensorDtype),
+      ...(storage === undefined
+        ? {}
+        : {
+          storage: Object.freeze({
+            encoding: storage.encoding,
+            physicalShape: Object.freeze([...storage.physicalShape]),
+            physicalDtype: "u8" as const
+          })
+        }),
       device: tensorDevice,
       placement,
       pipe(this: Runtime.TensorHandle) {
@@ -292,24 +364,65 @@ export const makeRuntime = (
     }) as unknown as H
   }
   let pendingStructure: StructuralNode | undefined
-  const lazyHandle = (value: LazyTensor): Runtime.LazyTensorHandle => {
-    const [shape, tensorDtype] = value.metadata()
-    const handle = tensorObject<Runtime.LazyTensorHandle>("LazyTensor", shape, tensorDtype, device)
+  let pendingDeclarations: ReadonlySet<InputDeclaration> | undefined
+  const lazyHandle = (
+    value: LazyTensor,
+    logical?: {
+      readonly shape: ReadonlyArray<number>
+      readonly dtype: Runtime.DType
+      readonly storage?: Runtime.EncodedTensorStorage
+    }
+  ): Runtime.LazyTensorHandle => {
+    const [nativeShape, nativeDtype] = value.metadata()
+    const handle = tensorObject<Runtime.LazyTensorHandle>(
+      "LazyTensor",
+      logical?.shape ?? nativeShape,
+      logical?.dtype ?? nativeDtype,
+      device,
+      logical?.storage
+    )
     handleRecords.set(handle, {
       owner,
       kind: "lazy-tensor",
       graph: value,
       ...(pendingStructure === undefined ? {} : { structure: pendingStructure }),
+      ...(pendingDeclarations === undefined ? {} : { declarations: pendingDeclarations }),
       disposed: false
     })
     pendingStructure = undefined
+    pendingDeclarations = undefined
     backendHandles.add(handle)
     return handle
   }
   const graph = lazyHandle
-  const concreteHandle = (value: NativeTensor): Runtime.ConcreteTensorHandle => {
+  const concreteHandle = (
+    value: NativeTensor,
+    logical?: {
+      readonly shape: ReadonlyArray<number>
+      readonly dtype: Runtime.DType
+      readonly storage?: Runtime.EncodedTensorStorage
+    }
+  ): Runtime.ConcreteTensorHandle => {
+    const expectedShape = logical?.storage?.physicalShape ?? logical?.shape
+    const expectedDtype = logical?.storage?.physicalDtype ?? logical?.dtype
+    if (
+      expectedShape !== undefined &&
+      (value.shape.length !== expectedShape.length ||
+        value.shape.some((dimension, index) => dimension !== expectedShape[index]) ||
+        value.dtype !== expectedDtype)
+    ) {
+      throw new Error(
+        `native runtime returned physical tensor ${value.dtype} [${value.shape}], expected ${expectedDtype} [${expectedShape}]`
+      )
+    }
     const graph = native.LazyTensor.fromMaterialized(value)
-    const handle = tensorObject<Runtime.ConcreteTensorHandle>("Tensor", value.shape, value.dtype, value.device)
+    const handle = tensorObject<Runtime.ConcreteTensorHandle>(
+      "Tensor",
+      logical?.shape ?? value.shape,
+      logical?.dtype ?? value.dtype,
+      value.device,
+      logical?.storage
+    )
     handleRecords.set(handle, {
       owner,
       kind: "concrete-tensor",
@@ -318,7 +431,7 @@ export const makeRuntime = (
       structure: {
         op: "materialized-parameter",
         inputs: [],
-        attributes: { shape: handle.shape, dtype: handle.dtype, device: handle.device }
+        attributes: { shape: handle.shape, dtype: handle.dtype, storage: handle.storage, device: handle.device }
       },
       disposed: false
     })
@@ -341,8 +454,134 @@ export const makeRuntime = (
     }
     return found.value as NativeTensor
   }
+  const sameShape = (left: ReadonlyArray<number>, right: ReadonlyArray<number>): boolean =>
+    left.length === right.length && left.every((dimension, index) => dimension === right[index])
+  const sameStorage = (
+    left: Runtime.EncodedTensorStorage | undefined,
+    right: Runtime.EncodedTensorStorage | undefined
+  ): boolean =>
+    left === undefined
+      ? right === undefined
+      : right !== undefined && left.encoding === right.encoding && left.physicalDtype === right.physicalDtype &&
+        sameShape(left.physicalShape, right.physicalShape)
+  const encodedRowBytes = (encoding: Runtime.TensorStorageEncoding, columns: number): number | undefined => {
+    if (columns % 256 !== 0) return undefined
+    const blockBytes = encoding === "Q2_K"
+      ? 84
+      : encoding === "Q3_K"
+      ? 110
+      : encoding === "Q4_K"
+      ? 144
+      : encoding === "Q5_K"
+      ? 176
+      : 210
+    return columns / 256 * blockBytes
+  }
+  const validEncodedGeometry = (
+    logicalShape: ReadonlyArray<number>,
+    storage: Runtime.EncodedTensorStorage
+  ): boolean => {
+    const columns = logicalShape.at(-1)
+    const rows = logicalShape.slice(0, -1).reduce((total, dimension) => total * dimension, 1)
+    const rowBytes = columns === undefined ? undefined : encodedRowBytes(storage.encoding, columns)
+    return rowBytes !== undefined && sameShape(storage.physicalShape, [rows, rowBytes])
+  }
+  const sameBinding = (left: TensorBinding, right: TensorBinding): boolean =>
+    left.dtype === right.dtype && sameShape(left.shape, right.shape) && sameStorage(left.storage, right.storage)
+  const declarationsFor = (request: Runtime.NodeRequest): ReadonlySet<InputDeclaration> => {
+    const declarations = new Set<InputDeclaration>()
+    const source = request.op === "constant" || request.op === "zeros" || request.op === "ones" ||
+      request.op === "full" || request.op === "randn" || request.op === "uniform" || request.op === "arange" ||
+      request.op === "eye" || request.op === "fromBytes" || request.op === "input" || request.op === "scalarInput"
+    if (!source) {
+      for (const input of request.inputs) {
+        for (const declaration of tensorRecord(input, request.op, "graph").declarations ?? []) {
+          declarations.add(declaration)
+        }
+      }
+    }
+    if (request.op === "input") {
+      declarations.add({
+        kind: "tensor",
+        slot: request.attributes.slot,
+        shape: Object.freeze([...request.attributes.shape]),
+        dtype: request.attributes.dtype,
+        ...(request.attributes.storage === undefined ? {} : { storage: request.attributes.storage })
+      })
+    } else if (request.op === "scalarInput") {
+      declarations.add({ kind: "scalar", slot: request.attributes.slot, dtype: request.attributes.dtype })
+    }
+    return declarations
+  }
+  const executableBindings = (roots: ReadonlyArray<Runtime.TensorHandle>): ReadonlyArray<TensorBinding> => {
+    const slots = new Map<number, InputDeclaration>()
+    for (const root of roots) {
+      for (const declaration of tensorRecord(root, "compile", "compile").declarations ?? []) {
+        if (!Number.isSafeInteger(declaration.slot) || declaration.slot < 0 || declaration.slot > 0xffff_ffff) {
+          throw new Error(`compile: input slot ${declaration.slot} is not an unsigned 32-bit integer`)
+        }
+        const existing = slots.get(declaration.slot)
+        if (existing === undefined) {
+          slots.set(declaration.slot, declaration)
+        } else if (
+          existing.kind !== declaration.kind || existing.dtype !== declaration.dtype ||
+          (existing.kind === "tensor" && declaration.kind === "tensor" && !sameBinding(existing, declaration))
+        ) {
+          throw new Error(`compile: repeated input slot ${declaration.slot} has conflicting logical declarations`)
+        }
+      }
+    }
+    const ordered = [...slots].sort(([left], [right]) => left - right)
+    for (let index = 0; index < ordered.length; index++) {
+      if (ordered[index]![0] !== index) throw new Error("compile: input slots must be contiguous from zero")
+    }
+    return Object.freeze(ordered.flatMap(([, declaration]) =>
+      declaration.kind === "scalar"
+        ? []
+        : [{
+          shape: Object.freeze([...declaration.shape]),
+          dtype: declaration.dtype,
+          ...(declaration.storage === undefined
+            ? {}
+            : {
+              storage: Object.freeze({
+                encoding: declaration.storage.encoding,
+                physicalShape: Object.freeze([...declaration.storage.physicalShape]),
+                physicalDtype: declaration.storage.physicalDtype
+              })
+            })
+        }]
+    ))
+  }
+  const nativeBinding = (
+    handle: Runtime.ConcreteTensorHandle,
+    expected: TensorBinding,
+    index: number,
+    boundedBatch?: { readonly compiled: number; readonly active: number }
+  ): NativeTensor => {
+    const found = tensorRecord(handle, "execute", "execute")
+    const shapeMatches = (actual: ReadonlyArray<number>, compiled: ReadonlyArray<number>): boolean =>
+      sameShape(actual, compiled) ||
+      (boundedBatch !== undefined && compiled.length > 0 && compiled[0] === boundedBatch.compiled &&
+        actual.length === compiled.length && actual[0] === boundedBatch.active &&
+        actual.slice(1).every((dimension, shapeIndex) => dimension === compiled[shapeIndex + 1]))
+    const storageMatches = expected.storage === undefined
+      ? handle.storage === undefined
+      : handle.storage !== undefined && expected.storage.encoding === handle.storage.encoding &&
+        expected.storage.physicalDtype === handle.storage.physicalDtype &&
+        shapeMatches(handle.storage.physicalShape, expected.storage.physicalShape)
+    if (
+      found.kind !== "concrete-tensor" || found.value === undefined || handle.dtype !== expected.dtype ||
+      !shapeMatches(handle.shape, expected.shape) || !storageMatches
+    ) {
+      throw new Error(`execute: tensor binding ${index} does not match its compiled logical declaration`)
+    }
+    return found.value as NativeTensor
+  }
   const executable = (
     value: Executable,
+    bindings: ExecutableInfo["bindings"],
+    outputs: ExecutableInfo["outputs"],
     state: Runtime.DecodeStateSchema | undefined
   ): Runtime.ExecutableHandle => {
     const nativeDiagnostics = value.diagnostics
@@ -355,7 +594,17 @@ export const makeRuntime = (
     const handle = Object.freeze(
       state === undefined ? { diagnostics } : { state, diagnostics }
     ) as unknown as Runtime.ExecutableHandle
-    handleRecords.set(handle, { owner, kind: "executable", value, info: state, disposed: false })
+    handleRecords.set(handle, {
+      owner,
+      kind: "executable",
+      value,
+      info: {
+        bindings,
+        outputs,
+        ...(state === undefined ? {} : { state })
+      } satisfies ExecutableInfo,
+      disposed: false
+    })
     backendHandles.add(handle)
     return handle
   }
@@ -370,7 +619,7 @@ export const makeRuntime = (
   const nativeSequence = (handle: Runtime.KvSequenceHandle, operation: string): HandleRecord =>
     record(handle, "kv-sequence", operation, "execute")
   const clearBuffers = (values: ReadonlyArray<NativeTensor>): void => {
-    for (const value of values) {
+    for (const value of new Set(values)) {
       try {
         value.clear()
       } catch {
@@ -378,13 +627,17 @@ export const makeRuntime = (
       }
     }
   }
-  const mapTensors = (values: ReadonlyArray<NativeTensor>): ReadonlyArray<Runtime.ConcreteTensorHandle> => {
-    try {
-      return values.map(concreteHandle)
-    } catch (error) {
-      clearBuffers(values)
-      throw error
+  const mapTensors = (
+    values: ReadonlyArray<NativeTensor>,
+    logical?: ExecutableInfo["outputs"]
+  ): ReadonlyArray<Runtime.ConcreteTensorHandle> => {
+    if (new Set(values).size !== values.length) {
+      throw new Error("native runtime returned duplicate tensor ownership")
     }
+    if (logical !== undefined && logical.length !== values.length) {
+      throw new Error(`native runtime returned ${values.length} outputs, expected ${logical.length}`)
+    }
+    return values.map((value, index) => concreteHandle(value, logical?.[index]))
   }
   const executableCacheKey = (request: Runtime.CompileRequest): string | undefined => {
     const ids = new Map<object, number>()
@@ -429,6 +682,7 @@ export const makeRuntime = (
   const node = (request: Runtime.NodeRequest): Effect.Effect<Runtime.LazyTensorHandle, Runtime.BackendError> =>
     Effect.try({
       try: () => {
+        pendingDeclarations = declarationsFor(request)
         pendingStructure = {
           op: request.op,
           inputs: [...request.inputs],
@@ -498,12 +752,21 @@ export const makeRuntime = (
             )
           case "input": {
             for (const exemplar of request.inputs) nativeGraph(exemplar, operation)
-            return graph(
+            const storage = request.attributes.storage
+            if (storage !== undefined && !validEncodedGeometry(request.attributes.shape, storage)) {
+              throw new Error("input: encoded storage does not match its logical GGML geometry")
+            }
+            return lazyHandle(
               native.LazyTensor.input(
                 request.attributes.slot,
-                [...request.attributes.shape],
-                request.attributes.dtype as NativeDType
-              )
+                [...(storage?.physicalShape ?? request.attributes.shape)],
+                (storage?.physicalDtype ?? request.attributes.dtype) as NativeDType
+              ),
+              {
+                shape: request.attributes.shape,
+                dtype: request.attributes.dtype,
+                ...(storage === undefined ? {} : { storage })
+              }
             )
           }
           case "scalarInput":
@@ -636,7 +899,12 @@ export const makeRuntime = (
                 nativeGraph(request.inputs[1], operation),
                 nativeGraph(request.inputs[2], operation),
                 request.attributes.scale,
-                request.attributes.causal
+                request.attributes.causal,
+                request.attributes.window === undefined
+                  ? -1
+                  : request.attributes.window === null
+                  ? 0
+                  : request.attributes.window
               )
             )
           case "kdaChunk":
@@ -659,7 +927,8 @@ export const makeRuntime = (
             return graph(
               nativeGraph(request.inputs[0], operation).rotaryEmbedding(
                 request.attributes.seqLen,
-                request.attributes.theta
+                request.attributes.theta,
+                request.attributes.layout
               )
             )
           case "layerNorm":
@@ -670,11 +939,38 @@ export const makeRuntime = (
                 request.attributes.eps
               )
             )
+          case "rmsNorm":
+            return graph(
+              nativeGraph(request.inputs[0], operation).rmsNorm(
+                request.inputs[1] === undefined ? undefined : nativeGraph(request.inputs[1], operation),
+                request.attributes.eps
+              )
+            )
           case "linear":
             return graph(
               nativeGraph(request.inputs[0], operation).linear(
                 nativeGraph(request.inputs[1], operation),
                 nativeGraph(request.inputs[2], operation)
+              )
+            )
+          case "quantizedLinear":
+            return graph(
+              nativeGraph(request.inputs[0], operation).quantizedLinear(
+                nativeGraph(request.inputs[1], operation),
+                request.inputs[2] === undefined ? undefined : nativeGraph(request.inputs[2], operation),
+                request.attributes.encoding as NativeGgmlKQuant,
+                request.attributes.logicalShape[0],
+                request.attributes.logicalShape[1]
+              )
+            )
+          case "quantizedEmbedding":
+            return graph(
+              nativeGraph(request.inputs[0], operation).quantizedEmbedding(
+                nativeGraph(request.inputs[1], operation),
+                request.attributes.encoding as NativeGgmlKQuant,
+                request.attributes.logicalShape[0],
+                request.attributes.logicalShape[1],
+                request.attributes.paddingIndex
               )
             )
           case "conv1d":
@@ -795,7 +1091,11 @@ export const makeRuntime = (
           details: { device }
         })
       },
-      catch: backendErrorFor(request.op, "graph")
+      catch: (error) => {
+        pendingStructure = undefined
+        pendingDeclarations = undefined
+        return backendErrorFor(request.op, "graph")(error)
+      }
     })
   const mapCompileOptions = (
     options: Runtime.ExecutableCompileOptions | undefined
@@ -827,7 +1127,8 @@ export const makeRuntime = (
       blockSize: uint32(state.blockSize, "state.blockSize", false),
       kvDtype: state.kvDtype,
       ...(state.window === undefined ? {} : { window: uint32(state.window, "state.window", true) }),
-      batch: uint32(state.batch, "state.batch", false)
+      batch: uint32(state.batch, "state.batch", false),
+      ...(state.lastTokenRow === undefined ? {} : { lastTokenRow: state.lastTokenRow })
     }
     return {
       request,
@@ -836,7 +1137,8 @@ export const makeRuntime = (
         blockSize: request.blockSize,
         kvDtype: request.kvDtype as NativeDType,
         ...(request.window === undefined ? {} : { window: request.window }),
-        batch: request.batch
+        batch: request.batch,
+        ...(request.lastTokenRow === undefined ? {} : { lastTokenRow: request.lastTokenRow })
       }
     }
   }
@@ -870,11 +1172,14 @@ export const makeRuntime = (
         `compile: native batch ${geometry.batch} disagrees with requested batch ${state.batch}`
       )
     }
+    if (typeof value.allowsWindowEviction !== "boolean") {
+      throw new Error("compile: native executable returned an invalid window eviction policy")
+    }
     return Object.freeze({
       maxTokens: state.maxTokens,
       blockSize: state.blockSize,
       kvDtype: state.kvDtype,
-      ...(state.window === undefined ? {} : { window: state.window }),
+      ...(state.window === undefined || !value.allowsWindowEviction ? {} : { window: state.window }),
       ...geometry
     })
   }
@@ -1028,18 +1333,28 @@ export const makeRuntime = (
   }
   const pathSafetensors: Runtime.PathSafetensors = {
     save: (path, archive) =>
-      cancellableFor(
-        "save",
-        "io",
-        (token) =>
-          native.saveTensors(
-            path,
-            archive.entries.map((entry) => entry.name),
-            archive.entries.map((entry) => nativeTensor(entry.tensor, "save", "io")),
-            { ...archive.metadata },
-            token
-          )
-      ),
+      archive.entries.some((entry) => entry.tensor.storage !== undefined)
+        ? Effect.fail(
+          new Runtime.BackendError({
+            reason: "unsupported-layout",
+            backend: backendName,
+            operation: "save",
+            phase: "io",
+            message: "save: encoded tensors cannot be represented by safetensors"
+          })
+        )
+        : cancellableFor(
+          "save",
+          "io",
+          (token) =>
+            native.saveTensors(
+              path,
+              archive.entries.map((entry) => entry.name),
+              archive.entries.map((entry) => nativeTensor(entry.tensor, "save", "io")),
+              { ...archive.metadata },
+              token
+            )
+        ),
     load: (path) =>
       cancellableFor(
         "load",
@@ -1063,8 +1378,8 @@ export const makeRuntime = (
           Effect.try({
             try: () => {
               const values = archive.entries.map((entry) => entry.tensor)
-              const mapped = mapTensors(values)
               try {
+                const mapped = mapTensors(values)
                 const metadata = Object.create(null) as Record<string, string>
                 for (const [key, value] of Object.entries(archive.metadata)) {
                   if (typeof value !== "string") throw new Error(`invalid safetensors metadata ${key}`)
@@ -1084,6 +1399,141 @@ export const makeRuntime = (
         )
       )
   }
+  const metadataValue = (entry: NativeGgufMetadataEntry): Runtime.GgufMetadataEntry => {
+    if (typeof entry.key !== "string" || entry.key.length === 0 || typeof entry.kind !== "string") {
+      throw new Error("native GGUF metadata entry is invalid")
+    }
+    const numericKinds = ["u8", "i8", "u16", "i16", "u32", "i32", "f32", "u64", "i64", "f64"]
+    const candidates: Array<Runtime.GgufMetadataScalar | ReadonlyArray<Runtime.GgufMetadataScalar>> = []
+    if (entry.numberValue !== undefined) {
+      if (!numericKinds.includes(entry.kind) || typeof entry.numberValue !== "number") {
+        throw new Error("invalid GGUF number metadata")
+      }
+      candidates.push(entry.numberValue)
+    }
+    if (entry.stringValue !== undefined) {
+      if (entry.kind !== "string" || typeof entry.stringValue !== "string") {
+        throw new Error("invalid GGUF string metadata")
+      }
+      candidates.push(entry.stringValue)
+    }
+    if (entry.booleanValue !== undefined) {
+      if (entry.kind !== "bool" || typeof entry.booleanValue !== "boolean") {
+        throw new Error("invalid GGUF boolean metadata")
+      }
+      candidates.push(entry.booleanValue)
+    }
+    if (entry.numberArray !== undefined) {
+      if (!numericKinds.includes(entry.kind) || !entry.numberArray.every((value) => typeof value === "number")) {
+        throw new Error("invalid GGUF number array metadata")
+      }
+      candidates.push(Object.freeze([...entry.numberArray]))
+    }
+    if (entry.stringArray !== undefined) {
+      if (entry.kind !== "string" || !entry.stringArray.every((value) => typeof value === "string")) {
+        throw new Error("invalid GGUF string array metadata")
+      }
+      candidates.push(Object.freeze([...entry.stringArray]))
+    }
+    if (entry.booleanArray !== undefined) {
+      if (entry.kind !== "bool" || !entry.booleanArray.every((value) => typeof value === "boolean")) {
+        throw new Error("invalid GGUF boolean array metadata")
+      }
+      candidates.push(Object.freeze([...entry.booleanArray]))
+    }
+    if (candidates.length !== 1) {
+      throw new Error(`native GGUF metadata ${entry.key} has invalid value fields`)
+    }
+    return Object.freeze({ key: entry.key, value: candidates[0]! })
+  }
+  const ggufDescriptor = (value: NativeGgufTensorDescriptor): Runtime.GgufTensorDescriptor => {
+    const encoded = value.format !== "F32"
+    if (
+      typeof value.name !== "string" || value.name.length === 0 ||
+      (value.format !== "F32" && value.format !== "Q2_K" && value.format !== "Q3_K" && value.format !== "Q4_K" &&
+        value.format !== "Q5_K" && value.format !== "Q6_K") ||
+      value.logicalDtype !== "f32" || value.physicalDtype !== (encoded ? "u8" : "f32") ||
+      !Array.isArray(value.logicalShape) || !Array.isArray(value.physicalShape) ||
+      !value.logicalShape.every((dimension) => Number.isSafeInteger(dimension) && dimension > 0) ||
+      !value.physicalShape.every((dimension) => Number.isSafeInteger(dimension) && dimension > 0) ||
+      (encoded && !validEncodedGeometry(value.logicalShape, {
+        encoding: value.format as Runtime.TensorStorageEncoding,
+        physicalShape: value.physicalShape,
+        physicalDtype: "u8"
+      }))
+    ) {
+      throw new Error("native GGUF tensor descriptor is invalid")
+    }
+    return Object.freeze({
+      name: value.name,
+      format: value.format,
+      logicalShape: Object.freeze([...value.logicalShape]),
+      logicalDtype: "f32",
+      physicalShape: Object.freeze([...value.physicalShape]),
+      physicalDtype: value.physicalDtype
+    })
+  }
+  const gguf: Runtime.GgufRuntime = {
+    inspect: (path) =>
+      cancellableFor("inspectGguf", "io", (token) => native.inspectGguf(path, token), undefined, "io-failed").pipe(
+        Effect.flatMap((inspection) =>
+          Effect.try({
+            try: () =>
+              Object.freeze({
+                metadata: Object.freeze(inspection.metadata.map(metadataValue)),
+                tensors: Object.freeze(inspection.tensors.map(ggufDescriptor))
+              }),
+            catch: backendErrorFor("inspectGguf", "io", "io-failed")
+          })
+        )
+      ),
+    load: (path) =>
+      Effect.uninterruptibleMask(() =>
+        Effect.interruptible(cancellableFor(
+          "loadGguf",
+          "io",
+          (token) => native.loadGguf(path, token),
+          (archive) => clearBuffers(archive.entries.map((entry) => entry.tensor)),
+          "io-failed"
+        )).pipe(
+          Effect.flatMap((archive) =>
+            Effect.try({
+              try: () => {
+                const values = archive.entries.map((entry) => entry.tensor)
+                try {
+                  if (new Set(values).size !== values.length) {
+                    throw new Error("native runtime returned duplicate tensor ownership")
+                  }
+                  const entries = archive.entries.map((entry) => {
+                    const descriptor = ggufDescriptor(entry.descriptor)
+                    const storage: Runtime.EncodedTensorStorage | undefined = descriptor.format === "F32"
+                      ? undefined
+                      : {
+                        encoding: descriptor.format,
+                        physicalShape: descriptor.physicalShape,
+                        physicalDtype: "u8"
+                      }
+                    return Object.freeze({
+                      descriptor,
+                      tensor: concreteHandle(entry.tensor, {
+                        shape: descriptor.logicalShape,
+                        dtype: "f32",
+                        ...(storage === undefined ? {} : { storage })
+                      })
+                    })
+                  })
+                  return Object.freeze({ entries: Object.freeze(entries) })
+                } catch (error) {
+                  clearBuffers(values)
+                  throw error
+                }
+              },
+              catch: backendErrorFor("loadGguf", "io", "io-failed")
+            })
+          )
+        )
+      )
+  }
   const runtime: Runtime.RuntimeService = {
     identity: owner,
     backend: { name: backendName },
@@ -1097,12 +1547,19 @@ export const makeRuntime = (
       Effect.try({
         try: () => {
           pendingStructure = undefined
+          const declarations = tensorRecord(loss, "grad", "autodiff").declarations
           return native.grad(
             nativeGraph(loss, "grad", "autodiff"),
             wrt.map((target) => nativeGraph(target, "grad", "autodiff"))
-          ).map(graph)
+          ).map((value) => {
+            pendingDeclarations = declarations
+            return graph(value)
+          })
         },
-        catch: backendErrorFor("grad", "autodiff")
+        catch: (error) => {
+          pendingDeclarations = undefined
+          return backendErrorFor("grad", "autodiff")(error)
+        }
       }),
     compile: (request) =>
       Effect.try({
@@ -1110,11 +1567,20 @@ export const makeRuntime = (
           if (!Array.isArray(request.roots) || request.roots.length === 0) {
             throw new Error("compile: expected at least one root")
           }
+          const bindings = executableBindings(request.roots)
           const roots = request.roots.map((root) => nativeGraph(root, "compile", "compile"))
           const options = mapCompileOptions(request.options)
           const state = mapStateRequest(request.state)
           const value = native.compile(roots, options, state?.native, executableCacheKey(request))
-          return executable(value, completeStateSchema(value, state?.request))
+          const outputs = request.roots.flatMap((root) => {
+            const base = {
+              dtype: root.dtype,
+              ...(root.storage === undefined ? {} : { storage: root.storage })
+            }
+            if (state?.request.lastTokenRow !== true) return [{ shape: root.shape, ...base }]
+            return Array.from({ length: state.request.batch }, () => ({ shape: [root.shape[2]!], ...base }))
+          })
+          return executable(value, bindings, outputs, completeStateSchema(value, state?.request))
         },
         catch: backendErrorFor("compile", "compile", "compilation-failed")
       }),
@@ -1130,12 +1596,27 @@ export const makeRuntime = (
               "unsupported-operation"
             )
           }
-          const inputs = invocation.bindings.map((input) => nativeTensor(input, "execute"))
-          if (executableRecord.info !== undefined && invocation.scalars.length !== 0) {
+          const info = executableRecord.info as ExecutableInfo
+          if (invocation.bindings.length !== info.bindings.length) {
+            throw executionError(
+              `execute: received ${invocation.bindings.length} tensor bindings, expected ${info.bindings.length}`
+            )
+          }
+          const inputs = invocation.bindings.map((input, index) =>
+            nativeBinding(
+              input,
+              info.bindings[index]!,
+              index,
+              info.state !== undefined && invocation.state !== undefined && index === info.bindings.length - 1
+                ? { compiled: info.state.batch, active: invocation.state.sequences.length }
+                : undefined
+            )
+          )
+          if (info.state !== undefined && invocation.scalars.length !== 0) {
             throw executionError("execute: stateful executable does not accept scalar inputs")
           }
           const [sequences, tokens] = resolveExecutionState(
-            executableRecord.info as Runtime.DecodeStateSchema | undefined,
+            info.state,
             invocation.state
           )
           return (executableRecord.value as Executable).execute(
@@ -1150,7 +1631,14 @@ export const makeRuntime = (
       ).pipe(
         Effect.flatMap((values) =>
           Effect.try({
-            try: () => mapTensors(values),
+            try: () => {
+              try {
+                return mapTensors(values, (nativeExecutable(handle, "execute").info as ExecutableInfo).outputs)
+              } catch (error) {
+                clearBuffers(values)
+                throw error
+              }
+            },
             catch: backendErrorFor("execute", "execute")
           })
         )
@@ -1176,6 +1664,7 @@ export const makeRuntime = (
       }),
     extensions: {
       pathSafetensors,
+      gguf,
       decode,
       diagnostics: {
         externalMemoryBytes: Effect.sync(() => native.externalMemoryBytes())

@@ -36,6 +36,7 @@ pub struct DecodeGeometry {
     pub layers: usize,
     pub kv_heads: usize,
     pub head_dim: usize,
+    pub allows_window_eviction: bool,
     pub kda: KdaGeometry,
     pub conv: ConvGeometry,
     pub cursor_slot: u32,
@@ -53,10 +54,17 @@ impl DecodeGeometry {
 /// Traversal and reconstruction are iterative. Layer ordinals retain the
 /// historical decode order: roots and children are encountered from last to
 /// first, while returned roots remain in caller order.
+///
+/// With `last_token_row`, every rewritten root must be `[batch, T, V]`;
+/// the returned roots are inference-only `LastTokenRow` selectors — one for
+/// batch 1, otherwise `batch` roots per source root, each over a static
+/// one-row slice in row order. The default (`false`) returns the rewritten
+/// roots unchanged.
 pub fn specialize_decode(
     roots: &[Arc<Node>],
     window: Option<usize>,
     batch: usize,
+    last_token_row: bool,
 ) -> Result<(Vec<Arc<Node>>, DecodeGeometry), String> {
     let mut maximum_slot = None;
     let mut visited = HashSet::new();
@@ -107,6 +115,8 @@ pub fn specialize_decode(
     let mut conv_layers = 0usize;
     let mut cursor_tensor = false;
     let mut geometry: Option<(usize, usize)> = None;
+    let mut allows_window_eviction = true;
+    let mut maximum_attention_window = None;
     let mut kda_geometry: Option<(usize, usize, usize, DType)> = None;
     let mut conv_geometry: Option<(usize, usize)> = None;
     for node in order {
@@ -123,6 +133,7 @@ pub fn specialize_decode(
                 v,
                 scale,
                 causal,
+                window: attention_window,
             } => {
                 if !causal {
                     return Err(
@@ -155,13 +166,22 @@ pub fn specialize_decode(
                 }
                 let layer = layers;
                 layers += 1;
+                let resolved_window = attention_window.resolve(window);
+                allows_window_eviction &= resolved_window.is_some();
+                if let Some(resolved_window) = resolved_window {
+                    maximum_attention_window = Some(
+                        maximum_attention_window.map_or(resolved_window, |current: usize| {
+                            current.max(resolved_window)
+                        }),
+                    );
+                }
                 NodeKind::KvAttention {
                     q: remap(q),
                     k: remap(k),
                     v: remap(v),
                     scale: *scale,
                     layer: layer as u32,
-                    window,
+                    window: resolved_window,
                 }
             }
             NodeKind::KdaChunk {
@@ -250,12 +270,17 @@ pub fn specialize_decode(
                 }
             }
             NodeKind::RotaryEmbedding {
-                x, seq_len, theta, ..
+                x,
+                seq_len,
+                theta,
+                layout,
+                ..
             } => NodeKind::RotaryEmbedding {
                 x: remap(x),
                 seq_len: *seq_len,
                 theta: *theta,
                 offset: PositionOffset::Cursor,
+                layout: *layout,
             },
             NodeKind::PositionEmbedding { weight, seq_len } => {
                 let tokens = *seq_len;
@@ -354,6 +379,15 @@ pub fn specialize_decode(
             kernel,
         })
         .unwrap_or_default();
+    if allows_window_eviction {
+        if let (Some(retained), Some(required)) = (window, maximum_attention_window) {
+            if retained < required {
+                return Err(format!(
+                    "decode: global attention window {retained} cannot retain explicit local window {required}"
+                ));
+            }
+        }
+    }
     let roots = roots
         .iter()
         .map(|root| {
@@ -362,13 +396,40 @@ pub fn specialize_decode(
                 .cloned()
                 .unwrap_or_else(|| root.clone())
         })
-        .collect();
+        .collect::<Vec<_>>();
+    let roots = if last_token_row {
+        let mut selected = Vec::new();
+        for root in &roots {
+            if root.shape.len() != 3 || root.shape[0] != batch {
+                return Err(format!(
+                    "decode: last-token-row roots must be [{batch}, T, V], got {:?}",
+                    root.shape
+                ));
+            }
+            let (tokens, width) = (root.shape[1], root.shape[2]);
+            if batch == 1 {
+                selected.push(Node::new(NodeKind::LastTokenRow { a: root.clone() })?);
+            } else {
+                for row in 0..batch {
+                    let slice = Node::new(NodeKind::Slice {
+                        a: root.clone(),
+                        ranges: vec![(row, row + 1, 1), (0, tokens, 1), (0, width, 1)],
+                    })?;
+                    selected.push(Node::new(NodeKind::LastTokenRow { a: slice })?);
+                }
+            }
+        }
+        selected
+    } else {
+        roots
+    };
     Ok((
         roots,
         DecodeGeometry {
             layers,
             kv_heads,
             head_dim,
+            allows_window_eviction,
             kda,
             conv,
             cursor_slot,
@@ -381,7 +442,7 @@ pub fn specialize_decode(
 mod tests {
     use super::*;
     use crate::schedule::graph_post_order;
-    use effect_torch_graph::Device;
+    use effect_torch_graph::{AttentionWindow, Device, RotaryLayout};
 
     fn tensor(shape: &[usize], dtype: DType, device: Device) -> Arc<Node> {
         Node::new(NodeKind::Zeros {
@@ -418,6 +479,7 @@ mod tests {
             v: operand,
             scale,
             causal,
+            window: AttentionWindow::Inherit,
         })
         .unwrap()
     }
@@ -478,6 +540,7 @@ mod tests {
                 v: shared.clone(),
                 scale: 0.5,
                 causal: true,
+                window: AttentionWindow::Inherit,
             })
             .unwrap();
             let rotary = Node::new(NodeKind::RotaryEmbedding {
@@ -485,6 +548,7 @@ mod tests {
                 seq_len: 2,
                 theta: 10_000.0,
                 offset: PositionOffset::Absolute,
+                layout: RotaryLayout::HalfSplit,
             })
             .unwrap();
             let kda = kda(1, 2, 2, 3, 5, DType::F32, 0.25, device.clone());
@@ -493,7 +557,7 @@ mod tests {
             let source = graph_post_order(&roots);
             let source_ids = source.iter().map(|node| node.id).collect::<HashSet<_>>();
 
-            let (specialized, geometry) = specialize_decode(&roots, Some(32), 1).unwrap();
+            let (specialized, geometry) = specialize_decode(&roots, Some(32), 1, false).unwrap();
 
             assert!(matches!(
                 specialized[0].kind,
@@ -535,6 +599,7 @@ mod tests {
             assert!(generated.iter().all(|node| !source_ids.contains(&node.id)));
             assert_eq!(geometry.layers, 1);
             assert_eq!((geometry.kv_heads, geometry.head_dim), (1, 4));
+            assert!(geometry.allows_window_eviction);
             assert_eq!(geometry.kda.layers, 1);
             assert_eq!(geometry.conv.layers, 1);
         }
@@ -557,6 +622,7 @@ mod tests {
                 v,
                 scale: 0.5,
                 causal: true,
+                window: AttentionWindow::Inherit,
             })
             .unwrap();
             let positions = Node::new(NodeKind::PositionEmbedding {
@@ -566,7 +632,7 @@ mod tests {
             .unwrap();
 
             let (roots, geometry) =
-                specialize_decode(&[attention, positions], None, batch).unwrap();
+                specialize_decode(&[attention, positions], None, batch, false).unwrap();
 
             assert_eq!(geometry.cursor_slot, 3);
             assert_eq!(geometry.cursor_tensor, batch > 1);
@@ -613,7 +679,9 @@ mod tests {
             attention(1, 3, 1, 4, 1.0, true, Device::Cpu),
         ];
         assert_eq!(
-            specialize_decode(&cpu_attention, None, 1).err().unwrap(),
+            specialize_decode(&cpu_attention, None, 1, false)
+                .err()
+                .unwrap(),
             "decode: attention layers disagree on head geometry ((3, 4) vs (2, 4))"
         );
         let metal_attention = [
@@ -621,7 +689,9 @@ mod tests {
             attention(1, 3, 1, 4, 1.0, true, Device::Metal),
         ];
         assert_eq!(
-            specialize_decode(&metal_attention, None, 1).err().unwrap(),
+            specialize_decode(&metal_attention, None, 1, false)
+                .err()
+                .unwrap(),
             "decode: attention layers disagree on head geometry ([3, 4] vs [2, 4])"
         );
         let cpu_kda = [
@@ -629,7 +699,7 @@ mod tests {
             kda(1, 3, 1, 4, 3, DType::F32, 1.0, Device::Cpu),
         ];
         assert_eq!(
-            specialize_decode(&cpu_kda, None, 1).err().unwrap(),
+            specialize_decode(&cpu_kda, None, 1, false).err().unwrap(),
             "decode: kda layers disagree on head geometry ((3, 4, 3, F32) vs (2, 4, 3, F32))"
         );
         let conv = [
@@ -638,7 +708,7 @@ mod tests {
             attention(1, 1, 1, 2, 1.0, true, Device::Cpu),
         ];
         assert_eq!(
-            specialize_decode(&conv, None, 1).err().unwrap(),
+            specialize_decode(&conv, None, 1, false).err().unwrap(),
             "decode: short conv layers disagree on geometry ((4, 2) vs (3, 2))"
         );
 
@@ -684,26 +754,34 @@ mod tests {
         })
         .unwrap();
         assert_eq!(
-            specialize_decode(&[malformed_kda], None, 1).err().unwrap(),
+            specialize_decode(&[malformed_kda], None, 1, false)
+                .err()
+                .unwrap(),
             "decode: kda state caching expects layers of shape [1, H, T, D], got [1, 1, 2]"
         );
         assert_eq!(
-            specialize_decode(&[short_conv(1, 2, 3, 2, Device::Cpu)], None, 2)
+            specialize_decode(&[short_conv(1, 2, 3, 2, Device::Cpu)], None, 2, false)
                 .err()
                 .unwrap(),
             "decode: conv state caching expects layers of shape [2, T, C], got [1, 2, 3]"
         );
         assert_eq!(
-            specialize_decode(&[attention(1, 1, 1, 2, 1.0, false, Device::Cpu)], None, 1)
-                .err()
-                .unwrap(),
+            specialize_decode(
+                &[attention(1, 1, 1, 2, 1.0, false, Device::Cpu)],
+                None,
+                1,
+                false
+            )
+            .err()
+            .unwrap(),
             "decode: only causal attention is cacheable, found a non-causal sdpa"
         );
         assert_eq!(
             specialize_decode(
                 &[kda(1, 1, 1, 2, 2, DType::BF16, 1.0, Device::Cpu)],
                 None,
-                1
+                1,
+                false
             )
             .err()
             .unwrap(),
@@ -716,30 +794,38 @@ mod tests {
         })
         .unwrap();
         assert_eq!(
-            specialize_decode(&[scalar], None, 1).err().unwrap(),
+            specialize_decode(&[scalar], None, 1, false).err().unwrap(),
             "decode: runtime scalar inputs are not supported in inference graphs"
         );
         let (stateless, stateless_geometry) =
-            specialize_decode(&[tensor(&[1], DType::F32, Device::Cpu)], None, 1).unwrap();
+            specialize_decode(&[tensor(&[1], DType::F32, Device::Cpu)], None, 1, false).unwrap();
         assert_eq!(stateless.len(), 1);
         assert_eq!(stateless_geometry.layers, 0);
         assert_eq!(stateless_geometry.kda.layers, 0);
         assert_eq!(stateless_geometry.conv.layers, 0);
 
         let (_, conv_geometry) =
-            specialize_decode(&[short_conv(1, 2, 3, 2, Device::Cpu)], None, 1).unwrap();
+            specialize_decode(&[short_conv(1, 2, 3, 2, Device::Cpu)], None, 1, false).unwrap();
         assert_eq!(conv_geometry.layers, 0);
         assert_eq!(conv_geometry.kda.layers, 0);
         assert_eq!(conv_geometry.conv.layers, 1);
 
-        let (_, cpu_geometry) =
-            specialize_decode(&[kda(1, 1, 1, 2, 3, DType::F64, 1.0, Device::Cpu)], None, 1)
-                .unwrap();
+        let (_, cpu_geometry) = specialize_decode(
+            &[kda(1, 1, 1, 2, 3, DType::F64, 1.0, Device::Cpu)],
+            None,
+            1,
+            false,
+        )
+        .unwrap();
         assert_eq!(cpu_geometry.kda.dtype, DType::F64);
         for dtype in [DType::F32, DType::BF16] {
-            let (_, metal_geometry) =
-                specialize_decode(&[kda(1, 1, 1, 2, 3, dtype, 1.0, Device::Metal)], None, 1)
-                    .unwrap();
+            let (_, metal_geometry) = specialize_decode(
+                &[kda(1, 1, 1, 2, 3, dtype, 1.0, Device::Metal)],
+                None,
+                1,
+                false,
+            )
+            .unwrap();
             assert_eq!(metal_geometry.kda.dtype, dtype);
         }
         let (_, mixed_metal_geometry) = specialize_decode(
@@ -749,6 +835,7 @@ mod tests {
             ],
             None,
             1,
+            false,
         )
         .unwrap();
         assert_eq!(mixed_metal_geometry.kda.layers, 2);
@@ -773,7 +860,7 @@ mod tests {
         ];
 
         for _ in 0..2 {
-            let (specialized, geometry) = specialize_decode(&roots, Some(7), 1).unwrap();
+            let (specialized, geometry) = specialize_decode(&roots, Some(7), 1, false).unwrap();
             assert_eq!(specialized.len(), roots.len());
             assert_eq!(
                 specialized
@@ -805,6 +892,116 @@ mod tests {
     }
 
     #[test]
+    fn resolved_attention_windows_determine_retention_policy() {
+        let make = |window| {
+            Node::new(NodeKind::Sdpa {
+                q: tensor(&[1, 4, 1, 2], DType::F32, Device::Cpu),
+                k: tensor(&[1, 2, 1, 2], DType::F32, Device::Cpu),
+                v: tensor(&[1, 2, 1, 2], DType::F32, Device::Cpu),
+                scale: 1.0,
+                causal: true,
+                window,
+            })
+            .unwrap()
+        };
+        let windows = |specialized: &[Arc<Node>]| {
+            specialized
+                .iter()
+                .map(|node| match node.kind {
+                    NodeKind::KvAttention { window, .. } => window,
+                    _ => panic!("expected KV attention"),
+                })
+                .collect::<Vec<_>>()
+        };
+
+        let (specialized, geometry) = specialize_decode(
+            &[
+                make(AttentionWindow::Inherit),
+                make(AttentionWindow::Local(3)),
+            ],
+            Some(11),
+            1,
+            false,
+        )
+        .unwrap();
+        assert_eq!(windows(&specialized), [Some(11), Some(3)]);
+        assert!(geometry.allows_window_eviction);
+        assert_eq!((geometry.kv_heads, geometry.head_dim), (2, 2));
+
+        let (specialized, geometry) = specialize_decode(
+            &[make(AttentionWindow::Local(3)), make(AttentionWindow::Full)],
+            Some(11),
+            1,
+            false,
+        )
+        .unwrap();
+        assert_eq!(windows(&specialized), [Some(3), None]);
+        assert!(!geometry.allows_window_eviction);
+
+        let error = match specialize_decode(&[make(AttentionWindow::Local(13))], Some(11), 1, false)
+        {
+            Ok(_) => panic!("expected an unsafe retention window to fail"),
+            Err(error) => error,
+        };
+        assert!(error.contains("cannot retain explicit local window 13"));
+    }
+
+    #[test]
+    fn last_token_row_rewrites_roots_into_state_driven_selectors() {
+        for device in [Device::Cpu, Device::Metal] {
+            let single = input(0, &[1, 4, 8], DType::F32, device.clone());
+            let (roots, _) = specialize_decode(&[single], None, 1, true).unwrap();
+            assert_eq!(roots.len(), 1);
+            let NodeKind::LastTokenRow { a } = &roots[0].kind else {
+                panic!("batch 1 rewrites the root into one last-token-row selector")
+            };
+            assert_eq!(roots[0].shape, [8]);
+            assert_eq!(a.shape, [1, 4, 8]);
+            assert!(roots[0].device.same_device(&device));
+
+            let batched = input(0, &[3, 4, 8], DType::F32, device.clone());
+            let (roots, _) = specialize_decode(&[batched], None, 3, true).unwrap();
+            assert_eq!(roots.len(), 3);
+            for (row, root) in roots.iter().enumerate() {
+                assert_eq!(root.shape, [8]);
+                let NodeKind::LastTokenRow { a } = &root.kind else {
+                    panic!("batched roots are last-token-row selectors")
+                };
+                let NodeKind::Slice { a: source, ranges } = &a.kind else {
+                    panic!("batched selectors read a static one-row slice")
+                };
+                assert_eq!(source.shape, [3, 4, 8]);
+                assert_eq!(ranges.as_slice(), [(row, row + 1, 1), (0, 4, 1), (0, 8, 1)]);
+            }
+
+            let stateful = attention(1, 2, 4, 2, 1.0, true, device.clone());
+            let logits = Node::new(NodeKind::Reshape {
+                a: stateful,
+                shape: vec![1, 4, 4],
+            })
+            .unwrap();
+            let (roots, geometry) = specialize_decode(&[logits], None, 1, true).unwrap();
+            assert_eq!(geometry.layers, 1);
+            assert!(matches!(roots[0].kind, NodeKind::LastTokenRow { .. }));
+
+            let malformed = input(0, &[1, 8], DType::F32, device.clone());
+            assert_eq!(
+                specialize_decode(&[malformed], None, 1, true)
+                    .err()
+                    .unwrap(),
+                "decode: last-token-row roots must be [1, T, V], got [1, 8]"
+            );
+            let wrong_batch = input(0, &[2, 4, 8], DType::F32, device);
+            assert_eq!(
+                specialize_decode(&[wrong_batch], None, 1, true)
+                    .err()
+                    .unwrap(),
+                "decode: last-token-row roots must be [1, T, V], got [2, 4, 8]"
+            );
+        }
+    }
+
+    #[test]
     fn specialization_is_stack_safe_for_deep_graphs() {
         std::thread::Builder::new()
             .stack_size(256 * 1024)
@@ -813,7 +1010,7 @@ mod tests {
                 for _ in 0..50_000 {
                     root = Node::new(NodeKind::Neg { a: root }).unwrap();
                 }
-                let (specialized, geometry) = specialize_decode(&[root], None, 1).unwrap();
+                let (specialized, geometry) = specialize_decode(&[root], None, 1, false).unwrap();
                 assert_eq!(geometry.layers, 1);
                 assert_eq!(graph_post_order(&specialized).len(), 50_002);
             })

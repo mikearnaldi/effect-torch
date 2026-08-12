@@ -16,6 +16,7 @@ fn mk(kind: NodeKind) -> std::result::Result<Arc<Node>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use effect_torch_graph::AttentionWindow;
 
     fn input(slot: u32, shape: Vec<usize>) -> Arc<Node> {
         Node::new(NodeKind::Input {
@@ -62,6 +63,34 @@ mod tests {
         })
         .unwrap();
         assert_eq!(grad(&loss, &[x]).unwrap()[0].shape, [3]);
+    }
+
+    #[test]
+    fn grouped_query_attention_rejects_autodiff_explicitly() {
+        let q = input(0, vec![1, 4, 2, 2]);
+        let k = input(1, vec![1, 2, 2, 2]);
+        let v = input(2, vec![1, 2, 2, 2]);
+        let attention = Node::new(NodeKind::Sdpa {
+            q: q.clone(),
+            k,
+            v,
+            scale: 1.0,
+            causal: true,
+            window: AttentionWindow::Inherit,
+        })
+        .unwrap();
+        let loss = Node::new(NodeKind::Sum {
+            a: attention,
+            dims: vec![0, 1, 2, 3],
+            keepdims: false,
+        })
+        .unwrap();
+
+        let error = match grad(&loss, &[q]) {
+            Ok(_) => panic!("grouped-query attention unexpectedly differentiated"),
+            Err(error) => error,
+        };
+        assert!(error.contains("grouped-query attention with unequal heads"));
     }
 }
 
@@ -395,6 +424,13 @@ fn vmap_rebuild(
             "vmap: position embedding and kv attention nodes are not supported under vmap"
                 .to_string(),
         ),
+        NodeKind::LastTokenRow { .. } => Err(
+            "vmap: last token row nodes are inference-only and not supported under vmap"
+                .to_string(),
+        ),
+        NodeKind::QuantizedLinear { .. } | NodeKind::QuantizedEmbedding { .. } => {
+            Err("vmap: encoded quantized operations are not supported under vmap".to_string())
+        }
         NodeKind::KdaChunk { .. } => {
             Err("vmap: kda chunk nodes are not supported under vmap".to_string())
         }
@@ -535,6 +571,17 @@ pub fn grad(loss: &Arc<Node>, wrt: &[Arc<Node>]) -> std::result::Result<Vec<Arc<
         }
     }
     let order = topo(loss);
+    if order.iter().any(|node| {
+        matches!(
+            node.kind,
+            NodeKind::QuantizedLinear { .. } | NodeKind::QuantizedEmbedding { .. }
+        )
+    }) {
+        return Err(
+            "grad: encoded quantized operations are inference-only and not differentiable"
+                .to_string(),
+        );
+    }
     let mut cotangents: HashMap<u64, Arc<Node>> = HashMap::new();
     cotangents.insert(loss.id, ones(loss.dtype, &loss.device)?);
     backward(&order, &mut cotangents)?;
@@ -1181,6 +1228,9 @@ fn backward(
                         .to_string(),
                 );
             }
+            NodeKind::RmsNorm { .. } => {
+                return Err("grad: RMS norm is not differentiable yet".to_string());
+            }
             NodeKind::Linear { x, weight, bias } => {
                 // y = x·W + b over the last dim: dx = g·Wᵀ,
                 // dw = xᵀ·g (reduced over leading dims), db = Σ g.
@@ -1227,13 +1277,27 @@ fn backward(
                     }),
                 )?;
             }
+            NodeKind::QuantizedLinear { .. } | NodeKind::QuantizedEmbedding { .. } => {
+                return Err(
+                    "grad: encoded quantized operations are inference-only and not differentiable"
+                        .to_string(),
+                );
+            }
             NodeKind::Sdpa {
                 q,
                 k,
                 v,
                 scale,
                 causal,
+                window,
             } => {
+                let rank = q.shape.len();
+                if rank >= 3 && q.shape[rank - 3] != k.shape[rank - 3] {
+                    return Err(
+                        "grad: grouped-query attention with unequal heads is not differentiable"
+                            .to_string(),
+                    );
+                }
                 let bw = mk(NodeKind::SdpaBackward {
                     q: q.clone(),
                     k: k.clone(),
@@ -1242,6 +1306,7 @@ fn backward(
                     fwd: node.clone(),
                     scale: *scale,
                     causal: *causal,
+                    window: *window,
                 })?;
                 for (input, index) in [(q, 0u8), (k, 1u8), (v, 2u8)] {
                     let out = mk(NodeKind::SdpaBackwardOut {
@@ -1292,6 +1357,12 @@ fn backward(
             NodeKind::KvAttention { .. } => {
                 return Err(
                     "grad: kv attention is an inference-only node and is not differentiable"
+                        .to_string(),
+                );
+            }
+            NodeKind::LastTokenRow { .. } => {
+                return Err(
+                    "grad: last token row is an inference-only node and is not differentiable"
                         .to_string(),
                 );
             }
@@ -1367,6 +1438,7 @@ fn backward(
                 seq_len,
                 theta,
                 offset,
+                layout,
             } => {
                 if *offset != PositionOffset::Absolute {
                     return Err(
@@ -1383,6 +1455,7 @@ fn backward(
                         shape: x.shape.clone(),
                         seq_len: *seq_len,
                         theta: *theta,
+                        layout: *layout,
                     }),
                 )?;
             }

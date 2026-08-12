@@ -11,6 +11,9 @@ import * as Runtime from "./Runtime.ts"
  */
 export type DType = Runtime.DType
 
+/** GGML K-quant storage encodings accepted by native tensor operations. */
+export type GgmlKQuant = Runtime.TensorStorageEncoding
+
 /**
  * JavaScript typed-array representations used for tensor transfer.
  * {@link fromTypedArray} infers `f16` from `Float16Array`, but there is no
@@ -100,6 +103,8 @@ export interface CompiledProgram {
     readonly shape: ReadonlyArray<number>
     /** Expected output dtype. */
     readonly dtype: DType
+    /** Expected encoded storage, when the output is an encoded identity. */
+    readonly storage?: Runtime.EncodedTensorStorage
     /** Expected output placement. */
     readonly placement: Runtime.Placement
   }>
@@ -189,6 +194,7 @@ interface GraphResult {
   readonly request: Runtime.NodeRequest
   readonly shape: ReadonlyArray<number>
   readonly dtype: DType
+  readonly storage?: Runtime.EncodedTensorStorage
   readonly placement: Runtime.Placement
 }
 
@@ -198,6 +204,41 @@ const sameShape = (a: ReadonlyArray<number>, b: ReadonlyArray<number>): boolean 
 const samePlacement = (a: Runtime.Placement, b: Runtime.Placement): boolean =>
   a.id === b.id && a.deviceType === b.deviceType && a.description === b.description && a.ordinal === b.ordinal &&
   a.memorySpace === b.memorySpace
+
+const sameStorage = (
+  a: Runtime.EncodedTensorStorage | undefined,
+  b: Runtime.EncodedTensorStorage | undefined
+): boolean =>
+  a === undefined
+    ? b === undefined
+    : b !== undefined && a.encoding === b.encoding && a.physicalDtype === b.physicalDtype &&
+      sameShape(a.physicalShape, b.physicalShape)
+
+const encodedRowBytes = (encoding: Runtime.TensorStorageEncoding, columns: number): number | undefined => {
+  if (columns % 256 !== 0) return undefined
+  const blockBytes = encoding === "Q2_K"
+    ? 84
+    : encoding === "Q3_K"
+    ? 110
+    : encoding === "Q4_K"
+    ? 144
+    : encoding === "Q5_K"
+    ? 176
+    : 210
+  return columns / 256 * blockBytes
+}
+
+const validStorage = (value: Runtime.TensorHandle): boolean => {
+  if (value.storage === undefined) return true
+  const columns = value.shape.at(-1)
+  const rows = value.shape.slice(0, -1).reduce((total, dimension) => total * dimension, 1)
+  const rowBytes = columns === undefined ? undefined : encodedRowBytes(value.storage.encoding, columns)
+  return value.dtype === "f32" &&
+    ["Q2_K", "Q3_K", "Q4_K", "Q5_K", "Q6_K"].includes(value.storage.encoding) &&
+    value.storage.physicalDtype === "u8" && Array.isArray(value.storage.physicalShape) &&
+    value.storage.physicalShape.every((dimension) => Number.isSafeInteger(dimension) && dimension >= 0) &&
+    rowBytes !== undefined && sameShape(value.storage.physicalShape, [rows, rowBytes])
+}
 
 const isTensorHandleValue = (value: unknown): value is Any =>
   typeof value === "object" && value !== null &&
@@ -212,6 +253,7 @@ const validateTensorHandle = <T extends "LazyTensor" | "Tensor">(
     readonly _tag: T
     readonly shape?: ReadonlyArray<number>
     readonly dtype?: DType
+    readonly storage?: Runtime.EncodedTensorStorage
     readonly placement?: Runtime.Placement
   }
 ): T extends "LazyTensor" ? Lazy : Concrete => {
@@ -219,11 +261,12 @@ const validateTensorHandle = <T extends "LazyTensor" | "Tensor">(
   if (
     !isTensorHandleValue(value) || value._tag !== expected._tag || !Array.isArray(value.shape) ||
     !value.shape.every((dimension) => Number.isSafeInteger(dimension) && dimension >= 0) ||
-    !validDtypes.includes(value.dtype) || typeof value.device !== "string" ||
+    !validDtypes.includes(value.dtype) || !validStorage(value) || typeof value.device !== "string" ||
     typeof value.placement !== "object" || value.placement === null || value.device !== value.placement.deviceType ||
     !samePlacement(value.placement, runtime.placement) ||
     (expected.shape !== undefined && !sameShape(value.shape, expected.shape)) ||
     (expected.dtype !== undefined && value.dtype !== expected.dtype) ||
+    !sameStorage(value.storage, expected.storage) ||
     (expected.placement !== undefined && !samePlacement(value.placement, expected.placement))
   ) {
     const candidate = value as Partial<Runtime.TensorHandle>
@@ -1183,13 +1226,20 @@ export interface ScaledDotProductAttentionOptions {
    * when the key sequence is longer than the query sequence.
    */
   readonly causal?: boolean
+  /**
+   * Causal attention window including the current token. `null` explicitly
+   * selects full causal attention; omission inherits the decode configuration.
+   */
+  readonly window?: number | null
 }
 
 /**
  * Scaled dot-product attention `softmax(q·kᵀ · scale) · v` as a single
  * semantic operation: `q` is `[..., T, D]`, `k` is `[..., S, D]` and `v`
- * is `[..., S, Dv]` with equal leading (batch/head) dimensions, giving an
- * output of `[..., T, Dv]`. The backward is closed-form and recomputes
+ * is `[..., S, Dv]`. At rank 3 and above, the final leading dimension is
+ * the head dimension: query heads may be a divisible multiple of K/V heads,
+ * while preceding batch dimensions must match. The output uses the query
+ * heads and has shape `[..., Hq, T, Dv]`. The backward is closed-form and recomputes
  * the attention probabilities instead of retaining them; it is not
  * second-order differentiable.
  *
@@ -1210,14 +1260,21 @@ export const scaledDotProductAttention = (
         `${op}: q, k and v must share a rank >= 2, got [${q.shape}], [${k.shape}] and [${v.shape}]`
       )
     }
-    const leading = q.shape.slice(0, -2)
-    if (
-      !leading.every((d, i) => d === k.shape[i]) ||
-      !leading.every((d, i) => d === v.shape[i])
-    ) {
+    const leading = q.shape.slice(0, rank < 3 ? -2 : -3)
+    if (!leading.every((d, i) => d === k.shape[i]) || !leading.every((d, i) => d === v.shape[i])) {
       throw new Error(
         `${op}: leading dims must match, got [${q.shape}], [${k.shape}] and [${v.shape}]`
       )
+    }
+    if (rank >= 3) {
+      const qHeads = q.shape[rank - 3]
+      const kvHeads = k.shape[rank - 3]
+      if (v.shape[rank - 3] !== kvHeads) {
+        throw new Error(`${op}: k and v heads mismatch, got [${k.shape}] and [${v.shape}]`)
+      }
+      if (kvHeads === 0 || qHeads % kvHeads !== 0) {
+        throw new Error(`${op}: query heads ${qHeads} must be divisible by K/V heads ${kvHeads}`)
+      }
     }
     if (q.shape[rank - 1] !== k.shape[rank - 1]) {
       throw new Error(`${op}: q and k head dims mismatch, got [${q.shape}] and [${k.shape}]`)
@@ -1234,12 +1291,24 @@ export const scaledDotProductAttention = (
     if (k.placement.id !== q.placement.id || v.placement.id !== q.placement.id) {
       throw new Error(`${op}: q, k and v must use the same placement`)
     }
+    if (options.window !== undefined) {
+      if (options.causal !== true) {
+        throw new Error(`${op}: window requires causal=true`)
+      }
+      if (options.window !== null && (!Number.isSafeInteger(options.window) || options.window <= 0)) {
+        throw new Error(`${op}: window must be a positive integer or null`)
+      }
+    }
     const scale = options.scale ?? 1 / Math.sqrt(q.shape[rank - 1])
     return {
       request: {
         op: "scaledDotProductAttention",
         inputs: [q, k, v],
-        attributes: { scale, causal: options.causal ?? false }
+        attributes: {
+          scale,
+          causal: options.causal ?? false,
+          ...(options.window === undefined ? {} : { window: options.window })
+        }
       },
       shape: [...q.shape.slice(0, -1), v.shape[rank - 1]],
       dtype: q.dtype,
@@ -2818,6 +2887,22 @@ export const embedding = (
         message: `embedding: paddingIndex must be an integer in [0, ${vocab}), got ${paddingIndex}`
       })
     }
+    if (weight.storage !== undefined) {
+      return yield* graphTry("embedding", () => ({
+        request: {
+          op: "quantizedEmbedding",
+          inputs: [indexes, weight],
+          attributes: {
+            encoding: weight.storage!.encoding,
+            logicalShape: [vocab, hidden],
+            ...(paddingIndex === undefined ? {} : { paddingIndex })
+          }
+        },
+        shape: [...indexes.shape, hidden],
+        dtype: "f32",
+        placement: weight.placement
+      }))
+    }
     const n = indexes.shape.reduce((acc, d) => acc * d, 1)
     const flat = indexes.shape.length === 1 ? indexes : yield* reshape(indexes, [n])
     let out: Any = yield* take(weight, flat, { dim: 0 })
@@ -3550,7 +3635,9 @@ export const cast: {
  * requests backend cancellation; already-submitted work may be retired safely
  * before resources are reclaimed. Returned outputs retain their escaping
  * storage across later invocations until cleared or finalized. Concrete roots
- * are accepted, but JavaScript identity and storage aliasing are unspecified.
+ * are accepted, but JavaScript identity and storage aliasing are unspecified;
+ * every returned handle has independent ownership and may be cleared without
+ * consuming its concrete root.
  *
  * @since 0.1.0
  * @category destructors
@@ -3583,6 +3670,7 @@ export const compute = <Roots extends ReadonlyArray<Any>>(
             _tag: "Tensor",
             shape: roots[index].shape,
             dtype: roots[index].dtype,
+            ...(roots[index].storage === undefined ? {} : { storage: roots[index].storage }),
             placement: roots[index].placement
           }),
         catch: (error) => caughtTensorError("execute", error)
@@ -3629,6 +3717,25 @@ export const clear = (self: Concrete): Effect.Effect<void, TensorError, Runtime.
   })
 
 /**
+ * Deterministically releases every concrete handle in input order. Each handle
+ * must have independent ownership and must be supplied exactly once.
+ *
+ * @since 0.1.0
+ * @category destructors
+ */
+export const clearAll = (
+  tensors: ReadonlyArray<Concrete>
+): Effect.Effect<void, TensorError, Runtime.Runtime> =>
+  Effect.gen(function*() {
+    const runtime = yield* Runtime.Runtime
+    yield* Effect.forEach(
+      tensors,
+      (tensor) => fromBackend("clearAll", runtime.release(tensor)),
+      { discard: true }
+    )
+  })
+
+/**
  * Evaluates a tensor and returns its values in a host typed array.
  * `f16` and `bf16` are widened to `Float32Array`; `f32`, `f64`, `i64`, `u8`,
  * and `u32` return `Float32Array`, `Float64Array`, `BigInt64Array`,
@@ -3643,6 +3750,12 @@ export const clear = (self: Concrete): Effect.Effect<void, TensorError, Runtime.
  */
 export const toTypedArray = (self: Any): Effect.Effect<TypedArray, TensorError, Runtime.Runtime> =>
   Effect.gen(function*() {
+    if (self.storage !== undefined) {
+      return yield* new TensorError({
+        op: "toTypedArray",
+        message: `toTypedArray: ${self.storage.encoding} storage requires explicit dequantization`
+      })
+    }
     const runtime = yield* Runtime.Runtime
     const evaluated = isTensor(self) ? self : (yield* compute([self]))[0]
     const buffer = yield* fromBackend("toTypedArray", runtime.readback(evaluated))
@@ -3723,7 +3836,8 @@ export interface SafetensorsArchive {
 /**
  * Saves tensors through the runtime's optional direct path. All entries are
  * compiled and materialized together before the transfer service serializes
- * the resulting concrete tensors.
+ * the resulting concrete tensors. Encoded tensors are rejected because
+ * safetensors cannot preserve their logical storage metadata.
  *
  * @since 0.1.0
  * @category destructors
@@ -3737,6 +3851,13 @@ export const save = (
   if (entries.length === 0) return new TensorError({ op: "save", message: "save: expected at least one tensor" })
   if (entries.some(([name]) => name === "__metadata__")) {
     return new TensorError({ op: "save", message: "save: __metadata__ is reserved and cannot be a tensor name" })
+  }
+  const encoded = entries.find(([, tensor]) => tensor.storage !== undefined)
+  if (encoded !== undefined) {
+    return new TensorError({
+      op: "save",
+      message: `save: encoded tensor ${JSON.stringify(encoded[0])} cannot be represented by safetensors`
+    })
   }
   return Effect.gen(function*() {
     const runtime = yield* Runtime.Runtime
@@ -4073,7 +4194,12 @@ export const signatureOf = (inputs: ReadonlyArray<Any>, runtime: Runtime.Runtime
     runtimeId = nextRuntimeSignatureId++
     runtimeSignatureIds.set(runtime.identity, runtimeId)
   }
-  const inputsKey = inputs.map((input) => `${input.placement.id}:${input.shape.join("x")}:${input.dtype}`).join("|")
+  const inputsKey = inputs.map((input) => {
+    const storage = input.storage === undefined
+      ? "dense"
+      : `${input.storage.encoding}:${input.storage.physicalShape.join("x")}:${input.storage.physicalDtype}`
+    return `${input.placement.id}:${input.shape.join("x")}:${input.dtype}:${storage}`
+  }).join("|")
   return `${runtimeId}|${inputsKey}`
 }
 
@@ -4092,10 +4218,16 @@ export const makeInput = (slot: number, exemplar: Any): Effect.Effect<Lazy, Tens
     request: {
       op: "input",
       inputs: [exemplar],
-      attributes: { slot, shape: [...exemplar.shape], dtype: exemplar.dtype }
+      attributes: {
+        slot,
+        shape: [...exemplar.shape],
+        dtype: exemplar.dtype,
+        ...(exemplar.storage === undefined ? {} : { storage: exemplar.storage })
+      }
     },
     shape: exemplar.shape,
     dtype: exemplar.dtype,
+    ...(exemplar.storage === undefined ? {} : { storage: exemplar.storage }),
     placement: runtime.placement
   }))
 
@@ -4141,7 +4273,12 @@ export const freezeProgram = (
     const handle = yield* fromBackend("compile", runtime.compile({ roots, options }))
     return {
       handle,
-      outputs: roots.map((root) => ({ shape: root.shape, dtype: root.dtype, placement: root.placement }))
+      outputs: roots.map((root) => ({
+        shape: root.shape,
+        dtype: root.dtype,
+        ...(root.storage === undefined ? {} : { storage: root.storage }),
+        placement: root.placement
+      }))
     }
   })
 
@@ -4354,8 +4491,8 @@ export const makeKvSequence = (pool: KvPool): Effect.Effect<KvSequence, TensorEr
  * The result is the offset at which prefill should begin. A return value of
  * zero means no reusable prefix was found. Matching updates the sequence's
  * block table and cursor; later decode runs continue from that position. Prefix
- * entries do not contain KDA or short-convolution recurrent state, so do not
- * use this operation before programs with either recurrent family.
+ * entries do not contain KDA or short-convolution recurrent state, so pools
+ * with recurrent geometry return zero until snapshots are supported.
  *
  * Token values are expected to be non-negative integers representable as
  * `u32`; this wrapper leaves validation to the backend. Fails when the current
@@ -4432,7 +4569,9 @@ export const releaseKvSequence = (sequence: KvSequence): Effect.Effect<void, Ten
  * single-index compilation; later fusion remains side-table planning. State capacities and
  * `batch` must be positive unsigned 32-bit integers, `blockSize` must divide
  * `maxTokens`, and `window` must be an unsigned 32-bit integer in
- * `1..=maxTokens`. Compilation retains captured concrete leaves as
+ * `1..=maxTokens`. With `state.lastTokenRow`, every root must be
+ * `[batch, T, V]` and the program outputs become advance-selected `[V]`
+ * rows: one for batch 1, otherwise `batch` rows in row order. Compilation retains captured concrete leaves as
  * constants and therefore bypasses native structural executable caching.
  *
  * @since 0.1.0
@@ -4470,7 +4609,11 @@ export const compileDecodeProgram = (
     return {
       handle,
       ...handle.state,
-      outputs: roots.map((root) => ({ shape: root.shape, dtype: root.dtype, placement: root.placement }))
+      outputs: roots.flatMap((root) => {
+        const base = { dtype: root.dtype, placement: root.placement }
+        if (state.lastTokenRow !== true) return [{ shape: root.shape, ...base }]
+        return Array.from({ length: state.batch }, () => ({ shape: [root.shape[2]!], ...base }))
+      })
     }
   })
 
@@ -4646,6 +4789,66 @@ export const linear = (
   })
 
 /**
+ * Applies a row-oriented weight `[N, K]` to an input `[..., K]`. Dense
+ * weights are transposed into the existing linear/matmul path; encoded
+ * weights dispatch to a native packed operation. Bias is optional and may be
+ * `[N]` or `[1, N]`.
+ *
+ * @since 0.1.0
+ * @category neural network
+ */
+export const linearRows = (
+  self: Any,
+  weight: Any,
+  bias?: Any
+): Effect.Effect<Lazy, TensorError, Runtime.Runtime> =>
+  Effect.gen(function*() {
+    const k = self.shape[self.shape.length - 1]
+    if (self.shape.length < 2 || weight.shape.length !== 2 || weight.shape[1] !== k) {
+      return yield* new TensorError({
+        op: "linearRows",
+        message: `linearRows: expected input [.., K] and weight [N, K], got [${self.shape}] x [${weight.shape}]`
+      })
+    }
+    const n = weight.shape[0]
+    let flatBias: Any | undefined
+    if (bias !== undefined) {
+      flatBias = yield* (
+        bias.shape.length === 1 && bias.shape[0] === n
+          ? Effect.succeed(bias)
+          : bias.shape.length === 2 && bias.shape[0] === 1 && bias.shape[1] === n
+          ? reshape(bias, [n])
+          : new TensorError({
+            op: "linearRows",
+            message: `linearRows: bias must be [N] or [1, N], got [${bias.shape}] for N ${n}`
+          })
+      )
+    }
+    yield* Effect.try({
+      try: () => {
+        checkCompatible("linearRows", self, weight)
+        if (flatBias !== undefined) checkCompatible("linearRows", self, flatBias)
+      },
+      catch: (error) =>
+        new TensorError({ op: "linearRows", message: error instanceof Error ? error.message : String(error) })
+    })
+    if (weight.storage === undefined) {
+      const transposed = yield* transpose(weight, [1, 0])
+      return flatBias === undefined ? yield* matmul(self, transposed) : yield* linear(self, transposed, flatBias)
+    }
+    return yield* graphTry("linearRows", () => ({
+      request: {
+        op: "quantizedLinear",
+        inputs: flatBias === undefined ? [self, weight] : [self, weight, flatBias],
+        attributes: { encoding: weight.storage!.encoding, logicalShape: [n, k] }
+      },
+      shape: [...self.shape.slice(0, -1), n],
+      dtype: "f32",
+      placement: self.placement
+    }))
+  })
+
+/**
  * Layer normalization over the last dim as a single semantic operation:
  * `y = (x − μ)/√(σ² + eps) · weight + bias`. The semantic node lets the
  * fused Metal kernel evaluate it in one launch (RFC 0007).
@@ -4687,6 +4890,39 @@ export const layerNorm = (
   })
 
 /**
+ * RMS normalization over the last dimension as one semantic operation:
+ * `y = x / sqrt(mean(x²) + eps)`, optionally multiplied by `weight`.
+ *
+ * @since 0.1.0
+ * @category neural network
+ */
+export const rmsNorm = (
+  self: Any,
+  weight?: Any,
+  eps = 1e-6
+): Effect.Effect<Lazy, TensorError, Runtime.Runtime> =>
+  graphTry("rmsNorm", () => {
+    const width = self.shape.at(-1)
+    if (width === undefined) throw new Error("rmsNorm: input must have rank at least 1")
+    if (weight !== undefined) {
+      if (weight.shape.length !== 1 || weight.shape[0] !== width) {
+        throw new Error(`rmsNorm: weight must be [${width}], got [${weight.shape}]`)
+      }
+      checkCompatible("rmsNorm", self, weight)
+    }
+    return {
+      request: {
+        op: "rmsNorm",
+        inputs: weight === undefined ? [self] : [self, weight],
+        attributes: { eps }
+      },
+      shape: self.shape,
+      dtype: self.dtype,
+      placement: self.placement
+    }
+  })
+
+/**
  * Rows `0..seqLen-1` of a `[maxPositions, embeddingDim]` position
  * embedding table, as a single semantic operation (the graph equivalent
  * of gathering `arange(seqLen)`). The semantic node lets decode compilation
@@ -4715,8 +4951,19 @@ export const positionEmbedding = (
   })
 
 /**
- * Rotary position embedding (RoPE, GPT-NeoX half-split) over the last
- * dimension of a `[..., seqLen, D]` input (D even): positions
+ * Options for {@link rotaryEmbedding}.
+ *
+ * @since 0.1.0
+ * @category neural network
+ */
+export interface RotaryEmbeddingOptions {
+  /** Pairing layout; defaults to GPT-NeoX-style half-split pairs. */
+  readonly layout?: "HalfSplit" | "InterleavedPairs"
+}
+
+/**
+ * Rotary position embedding (RoPE) over the last dimension of a
+ * `[..., seqLen, D]` input (D even): positions
  * `0..seqLen-1` rotated by `theta^(-2j/D)`. The semantic node lets decode
  * compilation rebase positions on the runtime cursor. Input rank, `seqLen`,
  * even head width, and dtype constraints are backend-validated. `theta` is
@@ -4730,14 +4977,21 @@ export const positionEmbedding = (
 export const rotaryEmbedding = (
   self: Any,
   seqLen: number,
-  theta: number
+  theta: number,
+  options: RotaryEmbeddingOptions = {}
 ): Effect.Effect<Lazy, TensorError, Runtime.Runtime> =>
-  graphTry("rotaryEmbedding", () => ({
-    request: { op: "rotaryEmbedding", inputs: [self], attributes: { seqLen, theta } },
-    shape: self.shape,
-    dtype: self.dtype,
-    placement: self.placement
-  }))
+  graphTry("rotaryEmbedding", () => {
+    const layout = options.layout ?? "HalfSplit"
+    if (layout !== "HalfSplit" && layout !== "InterleavedPairs") {
+      throw new Error(`rotaryEmbedding: unsupported layout ${String(layout)}`)
+    }
+    return {
+      request: { op: "rotaryEmbedding", inputs: [self], attributes: { seqLen, theta, layout } },
+      shape: self.shape,
+      dtype: self.dtype,
+      placement: self.placement
+    }
+  })
 
 /**
  * Creates a lazily traced compiled function; calling `compile` itself does not

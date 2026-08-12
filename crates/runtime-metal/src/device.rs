@@ -466,10 +466,13 @@ struct EncoderManager {
         u64,
         Retained<ProtocolObject<dyn MTLCommandBuffer>>,
         CommandBufferResources,
+        Option<&'static str>,
     )>,
     // Failures survive mid-step reaping and backpressure waits. They are
     // consumed only after synchronize has drained every submitted buffer.
     failures: Vec<(u64, String)>,
+    profile_label: Option<&'static str>,
+    profile_samples: Vec<(&'static str, f64)>,
 }
 
 struct CommandBufferResources {
@@ -495,7 +498,13 @@ impl EncoderManager {
             order_value: 0,
             in_flight: Vec::new(),
             failures: Vec::new(),
+            profile_label: None,
+            profile_samples: Vec::new(),
         }
+    }
+
+    fn set_profile_label(&mut self, label: Option<&'static str>) {
+        self.profile_label = label;
     }
 
     fn record_failure(&mut self, sequence: u64, cb: &ProtocolObject<dyn MTLCommandBuffer>) {
@@ -510,15 +519,21 @@ impl EncoderManager {
     }
 
     fn reap_completed(&mut self) {
-        while let Some((_, cb, _)) = self.in_flight.first() {
+        while let Some((_, cb, _, _)) = self.in_flight.first() {
             let done = matches!(
                 cb.status(),
                 objc2_metal::MTLCommandBufferStatus::Completed
                     | objc2_metal::MTLCommandBufferStatus::Error
             );
             if done {
-                let (sequence, cb, _) = self.in_flight.remove(0);
+                let (sequence, cb, _, label) = self.in_flight.remove(0);
                 self.record_failure(sequence, &cb);
+                if let Some(label) = label {
+                    let elapsed = cb.GPUEndTime() - cb.GPUStartTime();
+                    if elapsed.is_finite() && elapsed >= 0.0 {
+                        self.profile_samples.push((label, elapsed));
+                    }
+                }
             } else {
                 break;
             }
@@ -593,6 +608,7 @@ impl EncoderManager {
                     _retired: std::mem::take(retired),
                     _uses: references.take(),
                 },
+                self.profile_label.take(),
             ));
             self.count = 0;
         }
@@ -608,7 +624,27 @@ impl EncoderManager {
             self.in_flight[0].1.waitUntilCompleted();
             self.reap_completed();
         }
-        command_buffer_result(std::mem::take(&mut self.failures))
+        let result = command_buffer_result(std::mem::take(&mut self.failures));
+        if metal_profile_enabled() && !self.profile_samples.is_empty() {
+            let mut grouped = HashMap::<&'static str, (usize, f64)>::new();
+            for (label, elapsed) in self.profile_samples.drain(..) {
+                let entry = grouped.entry(label).or_default();
+                entry.0 += 1;
+                entry.1 += elapsed;
+            }
+            let mut grouped = grouped.into_iter().collect::<Vec<_>>();
+            grouped.sort_by(|left, right| right.1 .1.total_cmp(&left.1 .1));
+            let total = grouped.iter().map(|(_, (_, elapsed))| elapsed).sum::<f64>();
+            eprintln!("[metal-profile] total {:.3} ms", total * 1_000.0);
+            for (label, (count, elapsed)) in grouped {
+                eprintln!(
+                    "[metal-profile] {label}: {:.3} ms ({count} command buffers, {:.1}%)",
+                    elapsed * 1_000.0,
+                    elapsed / total * 100.0
+                );
+            }
+        }
+        result
     }
 
     fn has_pending_work(&self) -> bool {
@@ -616,7 +652,7 @@ impl EncoderManager {
     }
 
     fn oldest_submission(&self) -> Option<u64> {
-        self.in_flight.first().map(|(sequence, _, _)| *sequence)
+        self.in_flight.first().map(|(sequence, _, _, _)| *sequence)
     }
 }
 
@@ -827,6 +863,26 @@ impl Drop for SubmissionContext {
             result
         };
         self.publish_writes(&result);
+    }
+}
+
+fn metal_profile_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("EFFECT_TORCH_METAL_PROFILE").is_some())
+}
+
+pub(crate) struct MetalProfileRegion {
+    context: Arc<SubmissionContext>,
+}
+
+impl Drop for MetalProfileRegion {
+    fn drop(&mut self) {
+        self.context.commit();
+        self.context
+            .manager
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .set_profile_label(None);
     }
 }
 
@@ -1382,6 +1438,20 @@ impl MetalDevice {
 
     pub(crate) fn commit_executable_command(&self) {
         self.dispatch_submission().commit();
+    }
+
+    pub(crate) fn profile_region(&self, label: &'static str) -> Option<MetalProfileRegion> {
+        if !metal_profile_enabled() {
+            return None;
+        }
+        let context = self.dispatch_submission();
+        context.commit();
+        context
+            .manager
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .set_profile_label(Some(label));
+        Some(MetalProfileRegion { context })
     }
 
     pub(crate) fn begin_executable_dispatch(&self) -> Result<ExecutableDispatchGuard, String> {

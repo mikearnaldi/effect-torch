@@ -1,4 +1,5 @@
 mod err;
+mod gguf;
 mod runtime;
 pub(crate) mod safetensors;
 pub(crate) mod value;
@@ -12,14 +13,47 @@ use effect_torch_compiler::{
     StateCursorSlot,
 };
 use effect_torch_graph::CrossEntropyReduction as CeReduction;
-use effect_torch_graph::Device;
-use effect_torch_graph::PositionOffset;
+use effect_torch_graph::{AttentionWindow, Device, PositionOffset, RotaryLayout};
 use effect_torch_napi::{try_register_export, unregister_export, vec_to_bytes, CancellationState};
-use effect_torch_runtime::Buffer;
+use effect_torch_runtime::{Buffer, GgmlKQuant};
 use runtime::dtype::DType;
 pub type LeafSlot = effect_torch_graph::LeafSlot;
 pub(crate) type Node = effect_torch_graph::Node;
 pub(crate) type NodeKind = effect_torch_graph::NodeKind;
+
+fn attention_window(value: i64) -> Result<AttentionWindow> {
+    match value {
+        -1 => Ok(AttentionWindow::Inherit),
+        0 => Ok(AttentionWindow::Full),
+        value if value > 0 => usize::try_from(value)
+            .map(AttentionWindow::Local)
+            .map_err(|_| Error::new(Status::InvalidArg, "attention window is out of range")),
+        _ => Err(Error::new(
+            Status::InvalidArg,
+            "attention window must encode inherit, full, or a positive size",
+        )),
+    }
+}
+
+fn rotary_layout(value: &str) -> Result<RotaryLayout> {
+    match value {
+        "HalfSplit" => Ok(RotaryLayout::HalfSplit),
+        "InterleavedPairs" => Ok(RotaryLayout::InterleavedPairs),
+        _ => Err(Error::new(
+            Status::InvalidArg,
+            format!("unsupported rotary layout {value}"),
+        )),
+    }
+}
+
+fn ggml_k_quant(value: &str) -> Result<GgmlKQuant> {
+    GgmlKQuant::from_name(value).ok_or_else(|| {
+        Error::new(
+            Status::InvalidArg,
+            format!("unsupported GGML K-quant encoding {value}"),
+        )
+    })
+}
 
 impl From<DecodeKdaGeometry> for KdaGeometry {
     fn from(geometry: DecodeKdaGeometry) -> Self {
@@ -184,6 +218,7 @@ pub struct NativeKvStateSchema {
     pub kv_dtype: NativeDType,
     pub window: Option<u32>,
     pub batch: u32,
+    pub last_token_row: Option<bool>,
 }
 
 #[napi(object)]
@@ -1111,6 +1146,7 @@ impl LazyTensor {
         v: &LazyTensor,
         scale: f64,
         causal: bool,
+        window: i64,
     ) -> Result<Self> {
         lazy_ctor!(Node::new(NodeKind::Sdpa {
             q: self.node.clone(),
@@ -1118,6 +1154,7 @@ impl LazyTensor {
             v: v.node.clone(),
             scale,
             causal,
+            window: attention_window(window)?,
         }))
     }
 
@@ -1157,12 +1194,13 @@ impl LazyTensor {
     }
 
     #[napi]
-    pub fn rotary_embedding(&self, seq_len: u32, theta: f64) -> Result<Self> {
+    pub fn rotary_embedding(&self, seq_len: u32, theta: f64, layout: String) -> Result<Self> {
         lazy_ctor!(Node::new(NodeKind::RotaryEmbedding {
             x: self.node.clone(),
             seq_len: seq_len as usize,
             theta,
             offset: PositionOffset::Absolute,
+            layout: rotary_layout(&layout)?,
         }))
     }
 
@@ -1177,11 +1215,56 @@ impl LazyTensor {
     }
 
     #[napi]
+    pub fn rms_norm(&self, weight: Option<&LazyTensor>, eps: f64) -> Result<Self> {
+        lazy_ctor!(Node::new(NodeKind::RmsNorm {
+            x: self.node.clone(),
+            weight: weight.map(|value| value.node.clone()),
+            eps,
+        }))
+    }
+
+    #[napi]
     pub fn linear(&self, weight: &LazyTensor, bias: &LazyTensor) -> Result<Self> {
         lazy_ctor!(Node::new(NodeKind::Linear {
             x: self.node.clone(),
             weight: weight.node.clone(),
             bias: bias.node.clone(),
+        }))
+    }
+
+    #[napi]
+    pub fn quantized_linear(
+        &self,
+        weight: &LazyTensor,
+        bias: Option<&LazyTensor>,
+        encoding: String,
+        rows: u32,
+        columns: u32,
+    ) -> Result<Self> {
+        lazy_ctor!(Node::new(NodeKind::QuantizedLinear {
+            x: self.node.clone(),
+            weight: weight.node.clone(),
+            bias: bias.map(|value| value.node.clone()),
+            codec: ggml_k_quant(&encoding)?,
+            weight_shape: [rows as usize, columns as usize],
+        }))
+    }
+
+    #[napi]
+    pub fn quantized_embedding(
+        &self,
+        weight: &LazyTensor,
+        encoding: String,
+        rows: u32,
+        columns: u32,
+        padding_index: Option<u32>,
+    ) -> Result<Self> {
+        lazy_ctor!(Node::new(NodeKind::QuantizedEmbedding {
+            indexes: self.node.clone(),
+            weight: weight.node.clone(),
+            codec: ggml_k_quant(&encoding)?,
+            weight_shape: [rows as usize, columns as usize],
+            padding_index: padding_index.map(|value| value as usize),
         }))
     }
 
@@ -1942,7 +2025,7 @@ pub(crate) fn prepare_kv_attention(
     }
     let schema = kv.schema;
     if plan.batch != schema.batch
-        || plan.heads != schema.kv_heads
+        || plan.kv_heads != schema.kv_heads
         || plan.head_dim != schema.head_dim
         || plan.batch != kv.slots.len()
     {
@@ -1999,7 +2082,7 @@ pub(crate) fn prepare_kv_attention(
             &mut state,
             layer,
             schema.window,
-            plan.heads,
+            plan.kv_heads,
             plan.head_dim,
             plan.time,
         )?;
@@ -2049,12 +2132,25 @@ pub(crate) fn kv_attention_into(
         return Err("kv attention: paged destination path requires f32 q/k/v".to_string());
     }
     let rank = q.layout.shape().len();
-    let (batch, time, heads, head_dim) = (
+    let (batch, time, query_heads, head_dim) = (
         q.layout.shape()[..rank - 3].iter().product::<usize>(),
         q.layout.shape()[rank - 2],
         q.layout.shape()[rank - 3],
         q.layout.shape()[rank - 1],
     );
+    let kv_heads = k.layout.shape()[rank - 3];
+    if k.layout.shape()[..rank - 3] != q.layout.shape()[..rank - 3]
+        || v.layout.shape()[..rank - 3] != q.layout.shape()[..rank - 3]
+        || v.layout.shape()[rank - 3] != kv_heads
+        || kv_heads == 0
+        || !query_heads.is_multiple_of(kv_heads)
+        || k.layout.shape()[rank - 2] != time
+        || v.layout.shape()[rank - 2] != time
+        || k.layout.shape()[rank - 1] != head_dim
+        || v.layout.shape()[rank - 1] != head_dim
+    {
+        return Err("kv attention: incompatible grouped-query q/k/v shapes".to_string());
+    }
     if batch != kv.slots.len() || output.layout.shape() != q.layout.shape() {
         return Err("kv attention: destination shape or decode batch is inconsistent".to_string());
     }
@@ -2122,7 +2218,6 @@ pub(crate) fn kv_attention_into(
         output,
         paged::IntoResources::empty(),
     )?;
-    let _ = heads;
     Ok(())
 }
 
@@ -2489,6 +2584,9 @@ impl NativeKvSequence {
                 "prefill match: sequence already holds tokens".to_string(),
             ));
         }
+        if self.pool.kda.layers > 0 || self.pool.conv.layers > 0 {
+            return Ok(0);
+        }
         let block_size = self.pool.block_size;
         let matchable = tokens.len().saturating_sub(1) / block_size;
         let mut hash = HASH_SEED;
@@ -2511,6 +2609,7 @@ impl NativeKvSequence {
 struct StatefulExecutable {
     cursor_slot: u32,
     cursor_tensor: bool,
+    allows_window_eviction: bool,
     schema: KvStateSchema,
 }
 
@@ -2609,6 +2708,13 @@ impl Executable {
         self.state
             .as_ref()
             .map_or(0, |state| state.schema.batch as u32)
+    }
+
+    #[napi(getter)]
+    pub fn allows_window_eviction(&self) -> bool {
+        self.state
+            .as_ref()
+            .is_some_and(|state| state.allows_window_eviction)
     }
 
     #[napi(getter)]
@@ -3170,10 +3276,27 @@ pub fn compile(
                 "compile: state batch, max_tokens, and block_size must be positive".to_string(),
             ));
         }
-        let window = state.window.map(|value| value as usize);
-        let (rewritten, geometry) = specialize_decode(&nodes, window, state.batch as usize)
-            .map_err(|error| Error::new(Status::GenericFailure, error))?;
+        let requested_window = state.window.map(|value| value as usize);
+        if requested_window.is_some_and(|window| window == 0 || window > state.max_tokens as usize)
+        {
+            return Err(Error::new(
+                Status::InvalidArg,
+                "compile: KV window must be in 1..=max_tokens".to_string(),
+            ));
+        }
+        let (rewritten, geometry) = specialize_decode(
+            &nodes,
+            requested_window,
+            state.batch as usize,
+            state.last_token_row.unwrap_or(false),
+        )
+        .map_err(|error| Error::new(Status::GenericFailure, error))?;
         nodes = rewritten;
+        let window = if geometry.allows_window_eviction {
+            requested_window
+        } else {
+            None
+        };
         let kda = geometry.kda.into();
         let conv = geometry.conv.into();
         let schema = KvStateSchema {
@@ -3193,6 +3316,7 @@ pub fn compile(
         executable_state = Some(StatefulExecutable {
             cursor_slot: geometry.cursor_slot,
             cursor_tensor: geometry.cursor_tensor,
+            allows_window_eviction: geometry.allows_window_eviction,
             schema,
         });
         Some(schema)
@@ -3762,7 +3886,8 @@ mod epilogue_tests {
             .collect::<Vec<_>>();
         let plan = executable::KvAttentionPlan {
             batch: 1,
-            heads: 1,
+            query_heads: 1,
+            kv_heads: 1,
             time: 4,
             head_dim: 2,
         };
@@ -3834,7 +3959,8 @@ mod epilogue_tests {
             .collect::<Vec<_>>();
         let plan = executable::KvAttentionPlan {
             batch: 1,
-            heads: 1,
+            query_heads: 1,
+            kv_heads: 1,
             time: 1,
             head_dim: 2,
         };
@@ -3894,7 +4020,8 @@ mod epilogue_tests {
             .collect::<Vec<_>>();
         let plan = executable::KvAttentionPlan {
             batch: 8,
-            heads: 1,
+            query_heads: 1,
+            kv_heads: 1,
             time: 1,
             head_dim: 2,
         };
@@ -3930,6 +4057,7 @@ mod epilogue_tests {
                 v,
                 scale: 1.0,
                 causal: true,
+                window: AttentionWindow::Inherit,
             })
             .unwrap(),
         };
@@ -3942,6 +4070,7 @@ mod epilogue_tests {
                 kv_dtype: NativeDType::F32,
                 window: None,
                 batch: 1,
+                last_token_row: None,
             }),
             None,
         )
@@ -4014,6 +4143,7 @@ mod epilogue_tests {
                 v: split(8),
                 scale: 1.0 / 2.0f64.sqrt(),
                 causal: true,
+                window: AttentionWindow::Inherit,
             })
             .unwrap();
             Node::new(NodeKind::Reshape {
@@ -4046,6 +4176,7 @@ mod epilogue_tests {
                 kv_dtype: NativeDType::F32,
                 window: None,
                 batch: 1,
+                last_token_row: None,
             }),
             None,
         )
@@ -4213,6 +4344,7 @@ mod epilogue_tests {
                 v: q,
                 scale: 1.0,
                 causal: true,
+                window: AttentionWindow::Inherit,
             })
             .unwrap(),
         };
@@ -4225,11 +4357,13 @@ mod epilogue_tests {
                 kv_dtype: NativeDType::F16,
                 window: Some(32),
                 batch: 1,
+                last_token_row: None,
             }),
             None,
         )
         .unwrap();
         assert!(program.stateful());
+        assert!(program.allows_window_eviction());
         assert_eq!(program.batch(), 1);
         assert_eq!(program.layers(), 1);
         assert_eq!(

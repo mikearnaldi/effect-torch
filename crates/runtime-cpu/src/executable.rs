@@ -8,10 +8,13 @@ use crate::composed::{
 use crate::conv::ConvRequirements;
 use crate::linalg::{DeterminantRequirements, InverseRequirements, SolveRequirements};
 use crate::matmul::MatmulRequirements;
+use crate::quantized::QuantizedRequirements;
 use crate::storage::CpuStorageRetention;
 use crate::value::Value;
 use crate::workspace::{workspace_pool, workspace_request, CpuWorkspaceLease};
-use crate::{composed, conv, fusion, CpuBuffer, CpuDestination, CpuSegment, CpuTensorRequirement};
+use crate::{
+    composed, conv, fusion, quantized, CpuBuffer, CpuDestination, CpuSegment, CpuTensorRequirement,
+};
 use crate::{ExecutableAllocationGuard, Tensor, CPU_STORAGE_ALIGNMENT};
 use effect_torch_compiler::{
     build_executable_diagnostics, CompileOptions, CompilerDriver, CompilerWorkReport, DenseNodeId,
@@ -22,11 +25,12 @@ use effect_torch_compiler::{
 };
 use effect_torch_graph::{
     node_children, CrossEntropyReduction, Device, Node as GraphNode, NodeKind, PositionOffset,
+    RotaryLayout,
 };
 use effect_torch_runtime::{
-    Buffer, CancellationFlag, DType, ExecutableDiagnostics, InstructionId, InvocationMemoryReport,
-    Location, MemoryPlan, NativeMemorySpace, ProgramSignature, SegmentOwnership, StorageClass,
-    ValueId,
+    Buffer, CancellationFlag, DType, ExecutableDiagnostics, GgmlKQuant, InstructionId,
+    InvocationMemoryReport, Location, MemoryPlan, NativeMemorySpace, ProgramSignature,
+    SegmentOwnership, StorageClass, ValueId,
 };
 use std::collections::HashMap;
 use std::fmt;
@@ -225,10 +229,12 @@ pub enum CpuOp {
     Sdpa {
         scale: f64,
         causal: bool,
+        window: Option<usize>,
     },
     SdpaBackward {
         scale: f64,
         causal: bool,
+        window: Option<usize>,
     },
     KdaChunk {
         scale: f64,
@@ -246,6 +252,7 @@ pub enum CpuOp {
     ConvState {
         layer: u32,
     },
+    LastTokenRow,
     PositionEmbedding {
         seq_len: usize,
     },
@@ -257,17 +264,30 @@ pub enum CpuOp {
     RotaryEmbedding {
         theta: f64,
         cursor_offset: bool,
+        layout: RotaryLayout,
     },
     RotaryEmbeddingBackward {
         theta: f64,
+        layout: RotaryLayout,
     },
     Linear,
+    QuantizedLinear {
+        codec: GgmlKQuant,
+        weight_shape: [usize; 2],
+    },
+    QuantizedEmbedding {
+        codec: GgmlKQuant,
+        weight_shape: [usize; 2],
+    },
     LinearResidual,
     LinearGelu {
         approximate: bool,
         dual: bool,
     },
     LayerNorm {
+        eps: f64,
+    },
+    RmsNorm {
         eps: f64,
     },
     LayerNormBackward {
@@ -394,14 +414,18 @@ impl CpuOp {
             Self::ShortConv1dBackwardX => "short_conv1d_backward_x",
             Self::ShortConv1dBackwardW => "short_conv1d_backward_w",
             Self::ConvState { .. } => "conv_state",
+            Self::LastTokenRow => "last_token_row",
             Self::PositionEmbedding { .. } => "position_embedding",
             Self::KvAttention { .. } => "kv_attention",
             Self::RotaryEmbedding { .. } => "rotary_embedding",
             Self::RotaryEmbeddingBackward { .. } => "rotary_embedding_backward",
             Self::Linear => "linear",
+            Self::QuantizedLinear { .. } => "quantized_linear",
+            Self::QuantizedEmbedding { .. } => "quantized_embedding",
             Self::LinearResidual => "linear_residual",
             Self::LinearGelu { .. } => "linear_gelu",
             Self::LayerNorm { .. } => "layer_norm",
+            Self::RmsNorm { .. } => "rms_norm",
             Self::LayerNormBackward { .. } => "layer_norm_backward",
             Self::Conv1d { .. } => "conv1d",
             Self::Conv2d { .. } => "conv2d",
@@ -473,6 +497,7 @@ pub enum CpuAlgorithmPlan {
         matmul: MatmulRequirements,
         gelu: Option<effect_torch_compiler::CpuFusionProgram>,
     },
+    Quantized(QuantizedRequirements),
 }
 
 #[derive(Debug, Clone)]
@@ -1060,6 +1085,9 @@ impl Lowerer {
             CpuOp::LayerNorm { .. } => CpuAlgorithmPlan::LayerNormForward(
                 composed::layer_norm_forward_requirements(&tensors[0], &tensors[1], &tensors[2])?,
             ),
+            CpuOp::RmsNorm { .. } => CpuAlgorithmPlan::LayerNormForward(
+                composed::rms_norm_forward_requirements(&tensors[0], tensors.get(1))?,
+            ),
             CpuOp::LayerNormBackward { .. } => {
                 let requirements = composed::layer_norm_backward_requirements(
                     &tensors[0],
@@ -1375,6 +1403,49 @@ impl Lowerer {
                     None
                 };
                 CpuAlgorithmPlan::Linear { matmul, gelu }
+            }
+            CpuOp::QuantizedLinear {
+                codec,
+                weight_shape,
+            } => {
+                let requirements = quantized::linear_requirements(
+                    &tensors[0],
+                    &tensors[1],
+                    tensors.get(2),
+                    *codec,
+                    *weight_shape,
+                )?;
+                let output = &self.values[outputs[0].index()];
+                if output.shape.as_ref() != requirements.output.shape
+                    || output.dtype != requirements.output.dtype
+                {
+                    return Err(
+                        "compile: quantized_linear output does not match logical node shape"
+                            .to_string(),
+                    );
+                }
+                CpuAlgorithmPlan::Quantized(requirements)
+            }
+            CpuOp::QuantizedEmbedding {
+                codec,
+                weight_shape,
+            } => {
+                let requirements = quantized::embedding_requirements(
+                    &tensors[0],
+                    &tensors[1],
+                    *codec,
+                    *weight_shape,
+                )?;
+                let output = &self.values[outputs[0].index()];
+                if output.shape.as_ref() != requirements.output.shape
+                    || output.dtype != requirements.output.dtype
+                {
+                    return Err(
+                        "compile: quantized_embedding output does not match logical node shape"
+                            .to_string(),
+                    );
+                }
+                CpuAlgorithmPlan::Quantized(requirements)
             }
             CpuOp::KdaRecurrence { .. } => {
                 let requirements = composed::kda_chunk_forward_requirements(
@@ -2225,13 +2296,25 @@ impl Lowerer {
                 ignore_index: *ignore_index,
                 chunk_size: self.ce_chunk_size,
             },
-            NodeKind::Sdpa { scale, causal, .. } => CpuOp::Sdpa {
+            NodeKind::Sdpa {
+                scale,
+                causal,
+                window,
+                ..
+            } => CpuOp::Sdpa {
                 scale: *scale,
                 causal: *causal,
+                window: window.local(),
             },
-            NodeKind::SdpaBackward { scale, causal, .. } => CpuOp::SdpaBackward {
+            NodeKind::SdpaBackward {
+                scale,
+                causal,
+                window,
+                ..
+            } => CpuOp::SdpaBackward {
                 scale: *scale,
                 causal: *causal,
+                window: window.local(),
             },
             NodeKind::KdaChunk { scale, .. } => CpuOp::KdaChunk { scale: *scale },
             NodeKind::KdaRecurrence { scale, layer, .. } => CpuOp::KdaRecurrence {
@@ -2243,6 +2326,7 @@ impl Lowerer {
             NodeKind::ShortConv1dBackwardX { .. } => CpuOp::ShortConv1dBackwardX,
             NodeKind::ShortConv1dBackwardW { .. } => CpuOp::ShortConv1dBackwardW,
             NodeKind::ConvState { layer, .. } => CpuOp::ConvState { layer: *layer },
+            NodeKind::LastTokenRow { .. } => CpuOp::LastTokenRow,
             NodeKind::PositionEmbedding { seq_len, .. } => {
                 CpuOp::PositionEmbedding { seq_len: *seq_len }
             }
@@ -2264,15 +2348,41 @@ impl Lowerer {
                     window: *window,
                 }
             }
-            NodeKind::RotaryEmbedding { theta, offset, .. } => CpuOp::RotaryEmbedding {
+            NodeKind::RotaryEmbedding {
+                theta,
+                offset,
+                layout,
+                ..
+            } => CpuOp::RotaryEmbedding {
                 theta: *theta,
                 cursor_offset: matches!(offset, PositionOffset::Cursor),
+                layout: *layout,
             },
-            NodeKind::RotaryEmbeddingBackward { theta, .. } => {
-                CpuOp::RotaryEmbeddingBackward { theta: *theta }
+            NodeKind::RotaryEmbeddingBackward { theta, layout, .. } => {
+                CpuOp::RotaryEmbeddingBackward {
+                    theta: *theta,
+                    layout: *layout,
+                }
             }
             NodeKind::Linear { .. } => CpuOp::Linear,
+            NodeKind::QuantizedLinear {
+                codec,
+                weight_shape,
+                ..
+            } => CpuOp::QuantizedLinear {
+                codec: *codec,
+                weight_shape: *weight_shape,
+            },
+            NodeKind::QuantizedEmbedding {
+                codec,
+                weight_shape,
+                ..
+            } => CpuOp::QuantizedEmbedding {
+                codec: *codec,
+                weight_shape: *weight_shape,
+            },
             NodeKind::LayerNorm { eps, .. } => CpuOp::LayerNorm { eps: *eps },
+            NodeKind::RmsNorm { eps, .. } => CpuOp::RmsNorm { eps: *eps },
             NodeKind::LayerNormBackward { eps, .. } => CpuOp::LayerNormBackward { eps: *eps },
             NodeKind::Conv1d {
                 stride,
@@ -2838,6 +2948,13 @@ fn validate_cpu_support(node: &Node) -> Result<(), String> {
         } => {
             float_dtype("layer_norm", x.dtype)?;
             same_dtype("layer_norm", &[x, weight, bias])
+        }
+        NodeKind::RmsNorm { x, weight, .. } => {
+            float_dtype("rms_norm", x.dtype)?;
+            if let Some(weight) = weight {
+                same_dtype("rms_norm", &[x, weight])?;
+            }
+            Ok(())
         }
         NodeKind::LayerNormBackward { x, weight, g, .. } => {
             float_dtype("layer_norm_backward", x.dtype)?;
@@ -3424,6 +3541,7 @@ fn dispatch_command<'a>(
     state_outputs: &mut Vec<CpuDestination<'a>>,
     lanes: &mut Vec<Value>,
     state: Option<&dyn CpuState>,
+    cancelled: &CancellationFlag,
 ) -> Result<(), String> {
     let (op, plan) = command
         .kind
@@ -3680,16 +3798,25 @@ fn dispatch_command<'a>(
                 &mut scratch4[0],
             )
         }
-        CpuOp::Sdpa { scale, causal } => composed::sdpa_forward_into(
+        CpuOp::Sdpa {
+            scale,
+            causal,
+            window,
+        } => composed::sdpa_forward_into(
             inputs[0].tensor(),
             inputs[1].tensor(),
             inputs[2].tensor(),
             *scale,
             *causal,
+            *window,
             &mut destinations[0],
             &mut scratch[0],
         ),
-        CpuOp::SdpaBackward { scale, causal } => {
+        CpuOp::SdpaBackward {
+            scale,
+            causal,
+            window,
+        } => {
             let (scratch0, scratch1) = scratch.split_at_mut(1);
             composed::sdpa_logsumexp_into(
                 inputs[0].tensor(),
@@ -3697,6 +3824,7 @@ fn dispatch_command<'a>(
                 inputs[2].tensor(),
                 *scale,
                 *causal,
+                *window,
                 &mut scratch0[0],
             )?;
             let (outputs0, outputs12) = destinations.split_at_mut(1);
@@ -3710,6 +3838,7 @@ fn dispatch_command<'a>(
                 inputs[3].tensor(),
                 *scale,
                 *causal,
+                *window,
                 &mut outputs0[0],
                 &mut outputs1[0],
                 &mut outputs2[0],
@@ -3766,7 +3895,10 @@ fn dispatch_command<'a>(
             inputs[2].tensor(),
             &mut destinations[0],
         ),
-        CpuOp::KdaRecurrence { .. } | CpuOp::ConvState { .. } | CpuOp::KvAttention { .. } => state
+        CpuOp::KdaRecurrence { .. }
+        | CpuOp::ConvState { .. }
+        | CpuOp::KvAttention { .. }
+        | CpuOp::LastTokenRow => state
             .ok_or_else(|| format!("{}: operation requires a state context", op.name()))?
             .run_command(
                 command,
@@ -3779,6 +3911,7 @@ fn dispatch_command<'a>(
         CpuOp::RotaryEmbedding {
             theta,
             cursor_offset,
+            layout,
         } => {
             if *cursor_offset {
                 state
@@ -3797,21 +3930,29 @@ fn dispatch_command<'a>(
                     &[0],
                     *theta,
                     1.0,
+                    *layout,
                     &mut destinations[0],
                 )
             }
         }
-        CpuOp::RotaryEmbeddingBackward { theta } => composed::rotary_forward_into(
+        CpuOp::RotaryEmbeddingBackward { theta, layout } => composed::rotary_forward_into(
             inputs[0].tensor(),
             &[0],
             *theta,
             -1.0,
+            *layout,
             &mut destinations[0],
         ),
         CpuOp::LayerNorm { eps } => composed::layer_norm_forward_into(
             inputs[0].tensor(),
             inputs[1].tensor(),
             inputs[2].tensor(),
+            *eps,
+            &mut destinations[0],
+        ),
+        CpuOp::RmsNorm { eps } => composed::rms_norm_forward_into(
+            inputs[0].tensor(),
+            inputs.get(1).map(|input| input.tensor()),
             *eps,
             &mut destinations[0],
         ),
@@ -3882,6 +4023,33 @@ fn dispatch_command<'a>(
                 }
                 _ => unreachable!(),
             }
+        }
+        CpuOp::QuantizedLinear { codec, .. } => {
+            let CpuAlgorithmPlan::Quantized(requirements) = plan else {
+                return Err("quantized_linear: invalid immutable algorithm plan".to_string());
+            };
+            quantized::linear_into(
+                inputs[0].tensor(),
+                inputs[1].tensor(),
+                inputs.get(2).map(Value::tensor),
+                *codec,
+                &mut destinations[0],
+                requirements,
+                cancelled,
+            )
+        }
+        CpuOp::QuantizedEmbedding { codec, .. } => {
+            let CpuAlgorithmPlan::Quantized(requirements) = plan else {
+                return Err("quantized_embedding: invalid immutable algorithm plan".to_string());
+            };
+            quantized::embedding_into(
+                inputs[0].tensor(),
+                inputs[1].tensor(),
+                *codec,
+                &mut destinations[0],
+                requirements,
+                cancelled,
+            )
         }
         CpuOp::Conv1d {
             stride,
@@ -4339,6 +4507,7 @@ fn execute_reported_with_commit(
                 &mut state_destinations,
                 &mut lanes,
                 state,
+                cancelled,
             )?;
         }
         if cancelled.load(Ordering::Acquire) {
@@ -4455,6 +4624,20 @@ mod tests {
         .unwrap()
     }
 
+    fn leaf_u8_shape(values: Vec<u8>, shape: Vec<usize>) -> Arc<Node> {
+        Node::new(NodeKind::Leaf(Arc::new(LeafSlot::new(Value(
+            Tensor::from_vec(values, shape),
+        )))))
+        .unwrap()
+    }
+
+    fn leaf_u32_shape(values: Vec<u32>, shape: Vec<usize>) -> Arc<Node> {
+        Node::new(NodeKind::Leaf(Arc::new(LeafSlot::new(Value(
+            Tensor::from_vec(values, shape),
+        )))))
+        .unwrap()
+    }
+
     fn options(optimize: bool) -> CompileOptions {
         CompileOptions {
             optimize,
@@ -4538,6 +4721,83 @@ mod tests {
             assert_eq!(planner, executor);
             assert!(!instruction.staging.is_empty());
             assert!(!instruction.state.is_empty());
+        }
+    }
+
+    #[test]
+    fn quantized_linear_lowers_and_executes() {
+        let fixture = crate::quantized::fixtures::fixture(GgmlKQuant::Q4K);
+        let input = leaf_shape(vec![1.0; 256], vec![1, 256]);
+        let mut packed = Vec::with_capacity(3 * fixture.bytes.len());
+        for _ in 0..3 {
+            packed.extend_from_slice(fixture.bytes);
+        }
+        let weight = leaf_u8_shape(packed, vec![3, fixture.bytes.len()]);
+        let root = Node::new(NodeKind::QuantizedLinear {
+            x: input,
+            weight,
+            bias: None,
+            codec: GgmlKQuant::Q4K,
+            weight_shape: [3, 256],
+        })
+        .unwrap();
+        let compilation = compile(&[root], options(false), 1024).unwrap();
+        assert!(encoded_instructions(&compilation.executable)
+            .iter()
+            .any(|instruction| matches!(
+                operation(instruction),
+                CpuOp::QuantizedLinear {
+                    codec: GgmlKQuant::Q4K,
+                    ..
+                }
+            )));
+
+        let outputs = execute(
+            &compilation.executable,
+            &[],
+            &compilation.generated_bindings,
+            &CancellationFlag::new(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(outputs[0].to_f32_vec().unwrap(), [2048.0; 3]);
+    }
+
+    #[test]
+    fn mixed_k_quant_embedding_codecs_execute_in_one_program() {
+        let mut roots = Vec::new();
+        for fixture in &crate::quantized::fixtures::CASES {
+            roots.push(
+                Node::new(NodeKind::QuantizedEmbedding {
+                    indexes: leaf_u32_shape(vec![0], vec![1]),
+                    weight: leaf_u8_shape(fixture.bytes.to_vec(), vec![1, fixture.bytes.len()]),
+                    codec: fixture.codec,
+                    weight_shape: [1, 256],
+                    padding_index: Some(0),
+                })
+                .unwrap(),
+            );
+        }
+        let compilation = compile(&roots, options(false), 1024).unwrap();
+        let outputs = execute(
+            &compilation.executable,
+            &[],
+            &compilation.generated_bindings,
+            &CancellationFlag::new(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(outputs.len(), 5);
+        for (output, fixture) in outputs.iter().zip(&crate::quantized::fixtures::CASES) {
+            let values = output.to_f32_vec().unwrap();
+            for (group, &expected) in fixture.expected_groups.iter().enumerate() {
+                assert_eq!(
+                    &values[group * fixture.group_width..(group + 1) * fixture.group_width],
+                    vec![expected; fixture.group_width],
+                    "{} group {group}",
+                    fixture.codec.name()
+                );
+            }
         }
     }
 
@@ -4830,6 +5090,7 @@ mod tests {
                 v: input(2),
                 scale: 0.5,
                 causal: true,
+                window: effect_torch_graph::AttentionWindow::Inherit,
             })
             .unwrap();
             let positions = Node::new(NodeKind::PositionEmbedding {
@@ -4846,6 +5107,7 @@ mod tests {
                 &[attention.clone(), positions, attention],
                 None,
                 batch,
+                false,
             )
             .unwrap();
             let compilation = compile_with_state(

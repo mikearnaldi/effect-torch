@@ -4,6 +4,7 @@
   "type": "module",
   "exports": {
     ".": "./src/index.ts",
+    "./models": "./src/models/index.ts",
     "./package.json": "./package.json"
   },
   "main": "src/index.ts",
@@ -14,6 +15,7 @@
   "publishConfig": {
     "exports": {
       ".": "./dist/index.js",
+      "./models": "./dist/models/index.js",
       "./package.json": "./package.json"
     },
     "main": "dist/index.js",

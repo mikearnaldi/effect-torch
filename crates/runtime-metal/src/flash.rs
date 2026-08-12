@@ -87,6 +87,7 @@ pub struct SdpaForwardRequirements {
     pub logsumexp: BufferRequirement,
     pub topology: SdpaForwardTopology,
     pub batch_heads: usize,
+    pub head_group_size: usize,
     pub query_len: usize,
     pub key_len: usize,
     pub query_depth: usize,
@@ -172,7 +173,7 @@ mod metal {
         k_shape: &[usize],
         v_shape: &[usize],
         dtype: crate::runtime::dtype::DType,
-    ) -> crate::err::Res<(usize, usize, usize, usize, usize)> {
+    ) -> crate::err::Res<(usize, usize, usize, usize, usize, usize)> {
         supported_dtype(dtype)?;
         let rank = q_shape.len();
         if rank < 2 || k_shape.len() != rank || v_shape.len() != rank {
@@ -180,10 +181,25 @@ mod metal {
                 "flash: q/k/v must have the same rank >= 2, got {q_shape:?}, {k_shape:?}, {v_shape:?}"
             ));
         }
-        if q_shape[..rank - 2] != k_shape[..rank - 2] || q_shape[..rank - 2] != v_shape[..rank - 2]
-        {
+        let leading = if rank < 3 { rank - 2 } else { rank - 3 };
+        if q_shape[..leading] != k_shape[..leading] || q_shape[..leading] != v_shape[..leading] {
             return Err("flash: q/k/v leading dimensions must match".to_string());
         }
+        let group = if rank < 3 {
+            1
+        } else {
+            let query_heads = q_shape[rank - 3];
+            let kv_heads = k_shape[rank - 3];
+            if v_shape[rank - 3] != kv_heads
+                || kv_heads == 0
+                || !query_heads.is_multiple_of(kv_heads)
+            {
+                return Err(
+                    "flash: query heads must be divisible by matching K/V heads".to_string()
+                );
+            }
+            query_heads / kv_heads
+        };
         let (t, s, d, kd, vs, dv) = (
             q_shape[rank - 2],
             k_shape[rank - 2],
@@ -204,7 +220,7 @@ mod metal {
         if bh == 0 || t == 0 || s == 0 || d == 0 || dv == 0 {
             return Err("flash: zero-sized dimensions are unsupported".to_string());
         }
-        Ok((bh, t, s, d, dv))
+        Ok((bh, t, s, d, dv, group))
     }
 
     pub fn forward_requirements(
@@ -213,7 +229,7 @@ mod metal {
         v_shape: &[usize],
         dtype: crate::runtime::dtype::DType,
     ) -> crate::err::Res<SdpaForwardRequirements> {
-        let (batch_heads, query_len, key_len, query_depth, value_depth) =
+        let (batch_heads, query_len, key_len, query_depth, value_depth, head_group_size) =
             geometry(q_shape, k_shape, v_shape, dtype)?;
         let rank = q_shape.len();
         let mut output_shape = q_shape[..rank - 1].to_vec();
@@ -233,6 +249,7 @@ mod metal {
                 dispatches: 1,
             },
             batch_heads,
+            head_group_size,
             query_len,
             key_len,
             query_depth,
@@ -247,8 +264,13 @@ mod metal {
         v_shape: &[usize],
         dtype: crate::runtime::dtype::DType,
     ) -> crate::err::Res<SdpaBackwardRequirements> {
-        let (batch_heads, query_len, key_len, query_depth, value_depth) =
+        let (batch_heads, query_len, key_len, query_depth, value_depth, head_group_size) =
             geometry(q_shape, k_shape, v_shape, dtype)?;
+        if head_group_size != 1 {
+            return Err(
+                "flash backward: grouped-query attention is not differentiable".to_string(),
+            );
+        }
         Ok(SdpaBackwardRequirements {
             dq: BufferRequirement::new(q_shape.to_vec(), dtype, "dq")?,
             dk: BufferRequirement::new(k_shape.to_vec(), dtype, "dk")?,
@@ -318,6 +340,8 @@ mod metal {
         dv: usize,
         scale: f64,
         causal: bool,
+        window: Option<usize>,
+        head_group_size: usize,
         ty: &str,
     ) -> String {
         format!(
@@ -336,6 +360,8 @@ using namespace metal;
 #define NT {nt}
 #define SCALE {scale:?}f
 #define CAUSAL {causal}
+#define WINDOW {window}
+#define GROUP {head_group_size}
 // Right-aligned causal window: query q attends to keys k <= q + OFFSET.
 #define OFFSET {offset}
 
@@ -352,8 +378,8 @@ kernel void et_sdpa_fwd(
     const long bh = tgid.y;
     const uint tid = tpitg.x;
     device const STOR* Qb = Q + bh * (long)T * D;
-    device const STOR* Kb = K + bh * (long)S * D;
-    device const STOR* Vb = V + bh * (long)S * DV;
+    device const STOR* Kb = K + (bh / GROUP) * (long)S * D;
+    device const STOR* Vb = V + (bh / GROUP) * (long)S * DV;
     device STOR* Ob = O + bh * (long)T * DV;
 
     threadgroup float St[TQ][TK];
@@ -375,7 +401,7 @@ kernel void et_sdpa_fwd(
             int q = q0 + qi;
             int k = kt + kj;
             float acc;
-            if (q < T && k < S && (!CAUSAL || k <= q + OFFSET)) {{
+            if (q < T && k < S && (!CAUSAL || (k <= q + OFFSET && (WINDOW == 0 || k + WINDOW > q + OFFSET)))) {{
                 acc = 0.0f;
                 for (int d = 0; d < D; d++) {{ acc += float(Qb[q * D + d]) * float(Kb[k * D + d]); }}
                 acc *= SCALE;
@@ -439,6 +465,8 @@ kernel void et_sdpa_fwd(
             nt = THREADS,
             scale = scale as f32,
             causal = if causal { 1 } else { 0 },
+            window = window.unwrap_or(0),
+            head_group_size = head_group_size,
             offset = s.saturating_sub(t),
             ty = ty,
         )
@@ -451,13 +479,26 @@ kernel void et_sdpa_fwd(
         dv: usize,
         scale: f64,
         causal: bool,
+        window: Option<usize>,
+        head_group_size: usize,
         dtype: crate::runtime::dtype::DType,
     ) -> u64 {
         use std::collections::hash_map::DefaultHasher;
         use std::hash::{Hash, Hasher};
 
         let mut hasher = DefaultHasher::new();
-        (t, s, d, dv, scale.to_bits(), causal, dtype).hash(&mut hasher);
+        (
+            t,
+            s,
+            d,
+            dv,
+            scale.to_bits(),
+            causal,
+            window,
+            head_group_size,
+            dtype,
+        )
+            .hash(&mut hasher);
         hasher.finish()
     }
 
@@ -468,6 +509,8 @@ kernel void et_sdpa_fwd(
         dv: usize,
         scale: f64,
         causal: bool,
+        window: Option<usize>,
+        head_group_size: usize,
         dtype: crate::runtime::dtype::DType,
     ) -> crate::err::Res<Pipeline> {
         #[cfg(test)]
@@ -479,9 +522,9 @@ kernel void et_sdpa_fwd(
             other => return Err(format!("flash: unsupported dtype {other:?}")),
         };
         MetalDevice::get().compile_lazy(
-            forward_key(t, s, d, dv, scale, causal, dtype),
+            forward_key(t, s, d, dv, scale, causal, window, head_group_size, dtype),
             "et_sdpa_fwd",
-            || kernel_source(t, s, d, dv, scale, causal, ty),
+            || kernel_source(t, s, d, dv, scale, causal, window, head_group_size, ty),
         )
     }
 
@@ -492,10 +535,22 @@ kernel void et_sdpa_fwd(
         dv: usize,
         scale: f64,
         causal: bool,
+        window: Option<usize>,
+        head_group_size: usize,
         dtype: crate::runtime::dtype::DType,
     ) -> crate::err::Res<Pipeline> {
         MetalDevice::get()
-            .pipeline_cached(forward_key(t, s, d, dv, scale, causal, dtype))
+            .pipeline_cached(forward_key(
+                t,
+                s,
+                d,
+                dv,
+                scale,
+                causal,
+                window,
+                head_group_size,
+                dtype,
+            ))
             .ok_or_else(|| {
                 "flash: forward pipeline is not warm; call warm_forward_exact first".to_string()
             })
@@ -507,16 +562,18 @@ kernel void et_sdpa_fwd(
         v_shape: &[usize],
         scale: f64,
         causal: bool,
+        window: Option<usize>,
         dtype: crate::runtime::dtype::DType,
     ) -> crate::err::Res<()> {
         let requirements = forward_requirements(q_shape, k_shape, v_shape, dtype)?;
-        warm_forward_exact(&requirements, scale, causal)
+        warm_forward_exact(&requirements, scale, causal, window)
     }
 
     pub fn warm_forward_exact(
         requirements: &SdpaForwardRequirements,
         scale: f64,
         causal: bool,
+        window: Option<usize>,
     ) -> crate::err::Res<()> {
         pipeline(
             requirements.query_len,
@@ -525,6 +582,8 @@ kernel void et_sdpa_fwd(
             requirements.value_depth,
             scale,
             causal,
+            window,
+            requirements.head_group_size,
             requirements.dtype,
         )?;
         Ok(())
@@ -537,13 +596,14 @@ kernel void et_sdpa_fwd(
         v: &MetalTensor,
         scale: f64,
         causal: bool,
+        window: Option<usize>,
         output: &MetalTensor,
         logsumexp: &MetalTensor,
     ) -> crate::err::Res<()> {
         if q.dtype != k.dtype || q.dtype != v.dtype {
             return Err("flash: q/k/v dtypes must match".to_string());
         }
-        let (bh, t, s, d, dv) = geometry(
+        let (bh, t, s, d, dv, head_group_size) = geometry(
             q.layout.shape(),
             k.layout.shape(),
             v.layout.shape(),
@@ -571,7 +631,8 @@ kernel void et_sdpa_fwd(
         MetalDevice::get().mark_buffer_write(&output.buffer)?;
         MetalDevice::get().mark_buffer_write(&logsumexp.buffer)?;
 
-        let pipe = cached_forward_pipeline(t, s, d, dv, scale, causal, q.dtype)?;
+        let pipe =
+            cached_forward_pipeline(t, s, d, dv, scale, causal, window, head_group_size, q.dtype)?;
         let sz = q.dtype.size_in_bytes();
         MetalDevice::get().with_encoder(|e| {
             e.setComputePipelineState(pipe.as_raw());
@@ -607,6 +668,7 @@ kernel void et_sdpa_fwd(
         v: &MetalTensor,
         scale: f64,
         causal: bool,
+        window: Option<usize>,
     ) -> crate::err::Res<(MetalTensor, MetalTensor)> {
         if q.dtype != k.dtype || q.dtype != v.dtype {
             return Err("flash: q/k/v dtypes must match".to_string());
@@ -617,7 +679,7 @@ kernel void et_sdpa_fwd(
             v.layout.shape(),
             q.dtype,
         )?;
-        warm_forward_exact(&requirements, scale, causal)?;
+        warm_forward_exact(&requirements, scale, causal, window)?;
         let q = contig(q)?;
         let k = contig(k)?;
         let v = contig(v)?;
@@ -636,7 +698,7 @@ kernel void et_sdpa_fwd(
             ),
             dtype: crate::runtime::dtype::DType::F32,
         };
-        forward_into(&q, &k, &v, scale, causal, &o, &l)?;
+        forward_into(&q, &k, &v, scale, causal, window, &o, &l)?;
         Ok((o, l))
     }
     // The fused gradient passes use no atomics. Pass A (key-tiled)
@@ -653,6 +715,7 @@ kernel void et_sdpa_fwd(
         dv: usize,
         scale: f64,
         causal: bool,
+        window: Option<usize>,
         ty: &str,
     ) -> String {
         format!(
@@ -671,6 +734,7 @@ using namespace metal;
 #define NT {nt}
 #define SCALE {scale:?}f
 #define CAUSAL {causal}
+#define WINDOW {window}
 #define OFFSET {offset}
 #define CELLS_DK ((TK * D + NT - 1) / NT)
 #define CELLS_DV ((TK * DV + NT - 1) / NT)
@@ -760,7 +824,7 @@ kernel void et_sdpa_bwd_kv(
             int t = i / TK, kj = i % TK;
             int q = i0 + t, k = j0 + kj;
             float p;
-            if (q < T && k < S && (!CAUSAL || k <= q + OFFSET)) {{
+            if (q < T && k < S && (!CAUSAL || (k <= q + OFFSET && (WINDOW == 0 || k + WINDOW > q + OFFSET)))) {{
                 float acc = 0.0f;
                 for (int dd = 0; dd < D; dd++) {{ acc += Qt[t][dd] * Kt[kj][dd]; }}
                 p = exp(acc * SCALE - lt[t]);
@@ -866,7 +930,7 @@ kernel void et_sdpa_bwd_q(
             int t = i / TK, kj = i % TK;
             int q = i0 + t, k = j0 + kj;
             float p;
-            if (q < T && k < S && (!CAUSAL || k <= q + OFFSET)) {{
+            if (q < T && k < S && (!CAUSAL || (k <= q + OFFSET && (WINDOW == 0 || k + WINDOW > q + OFFSET)))) {{
                 float acc = 0.0f;
                 for (int dd = 0; dd < D; dd++) {{ acc += Qt[t][dd] * Kt[kj][dd]; }}
                 p = exp(acc * SCALE - lt[t]);
@@ -906,6 +970,7 @@ kernel void et_sdpa_bwd_q(
             nt = THREADS,
             scale = scale as f32,
             causal = if causal { 1 } else { 0 },
+            window = window.unwrap_or(0),
             offset = s.saturating_sub(t),
             ty = ty,
         )
@@ -919,13 +984,14 @@ kernel void et_sdpa_bwd_q(
         dv: usize,
         scale: f64,
         causal: bool,
+        window: Option<usize>,
         dtype: crate::runtime::dtype::DType,
     ) -> u64 {
         use std::collections::hash_map::DefaultHasher;
         use std::hash::{Hash, Hasher};
 
         let mut hasher = DefaultHasher::new();
-        (name, t, s, d, dv, scale.to_bits(), causal, dtype).hash(&mut hasher);
+        (name, t, s, d, dv, scale.to_bits(), causal, window, dtype).hash(&mut hasher);
         hasher.finish()
     }
 
@@ -937,6 +1003,7 @@ kernel void et_sdpa_bwd_q(
         dv: usize,
         scale: f64,
         causal: bool,
+        window: Option<usize>,
         dtype: crate::runtime::dtype::DType,
     ) -> crate::err::Res<Pipeline> {
         #[cfg(test)]
@@ -948,9 +1015,9 @@ kernel void et_sdpa_bwd_q(
             other => return Err(format!("flash: unsupported dtype {other:?}")),
         };
         MetalDevice::get().compile_lazy(
-            backward_key(name, t, s, d, dv, scale, causal, dtype),
+            backward_key(name, t, s, d, dv, scale, causal, window, dtype),
             name,
-            || bwd_source(t, s, d, dv, scale, causal, ty),
+            || bwd_source(t, s, d, dv, scale, causal, window, ty),
         )
     }
 
@@ -963,10 +1030,13 @@ kernel void et_sdpa_bwd_q(
         dv: usize,
         scale: f64,
         causal: bool,
+        window: Option<usize>,
         dtype: crate::runtime::dtype::DType,
     ) -> crate::err::Res<Pipeline> {
         MetalDevice::get()
-            .pipeline_cached(backward_key(name, t, s, d, dv, scale, causal, dtype))
+            .pipeline_cached(backward_key(
+                name, t, s, d, dv, scale, causal, window, dtype,
+            ))
             .ok_or_else(|| {
                 format!("flash: {name} pipeline is not warm; call warm_backward_exact first")
             })
@@ -978,16 +1048,18 @@ kernel void et_sdpa_bwd_q(
         v_shape: &[usize],
         scale: f64,
         causal: bool,
+        window: Option<usize>,
         dtype: crate::runtime::dtype::DType,
     ) -> crate::err::Res<()> {
         let requirements = backward_requirements(q_shape, k_shape, v_shape, dtype)?;
-        warm_backward_exact(&requirements, scale, causal)
+        warm_backward_exact(&requirements, scale, causal, window)
     }
 
     pub fn warm_backward_exact(
         requirements: &SdpaBackwardRequirements,
         scale: f64,
         causal: bool,
+        window: Option<usize>,
     ) -> crate::err::Res<()> {
         let (t, s, d, dv, dtype) = (
             requirements.query_len,
@@ -996,9 +1068,9 @@ kernel void et_sdpa_bwd_q(
             requirements.value_depth,
             requirements.dtype,
         );
-        bwd_pipeline("et_sdpa_bwd_d", t, s, d, dv, scale, causal, dtype)?;
-        bwd_pipeline("et_sdpa_bwd_kv", t, s, d, dv, scale, causal, dtype)?;
-        bwd_pipeline("et_sdpa_bwd_q", t, s, d, dv, scale, causal, dtype)?;
+        bwd_pipeline("et_sdpa_bwd_d", t, s, d, dv, scale, causal, window, dtype)?;
+        bwd_pipeline("et_sdpa_bwd_kv", t, s, d, dv, scale, causal, window, dtype)?;
+        bwd_pipeline("et_sdpa_bwd_q", t, s, d, dv, scale, causal, window, dtype)?;
         Ok(())
     }
 
@@ -1012,6 +1084,7 @@ kernel void et_sdpa_bwd_q(
         g: &MetalTensor,
         scale: f64,
         causal: bool,
+        window: Option<usize>,
         dq: &MetalTensor,
         dk: &MetalTensor,
         dv_out: &MetalTensor,
@@ -1020,12 +1093,17 @@ kernel void et_sdpa_bwd_q(
         if q.dtype != k.dtype || q.dtype != v.dtype || q.dtype != o.dtype || q.dtype != g.dtype {
             return Err("flash: backward storage dtypes must match".to_string());
         }
-        let (bh, t, s, d, dv) = geometry(
+        let (bh, t, s, d, dv, head_group_size) = geometry(
             q.layout.shape(),
             k.layout.shape(),
             v.layout.shape(),
             q.dtype,
         )?;
+        if head_group_size != 1 {
+            return Err(
+                "flash backward: grouped-query attention is not differentiable".to_string(),
+            );
+        }
         let rank = q.layout.shape().len();
         let output_shape = o.layout.shape();
         if output_shape.len() != rank
@@ -1060,11 +1138,20 @@ kernel void et_sdpa_bwd_q(
         // Resolve every pipeline before encoding any work, so a partial
         // warmup cannot leave a partially encoded backward operation.
         let d_pipe =
-            cached_backward_pipeline("et_sdpa_bwd_d", t, s, d, dv, scale, causal, q.dtype)?;
-        let kv_pipe =
-            cached_backward_pipeline("et_sdpa_bwd_kv", t, s, d, dv, scale, causal, q.dtype)?;
+            cached_backward_pipeline("et_sdpa_bwd_d", t, s, d, dv, scale, causal, window, q.dtype)?;
+        let kv_pipe = cached_backward_pipeline(
+            "et_sdpa_bwd_kv",
+            t,
+            s,
+            d,
+            dv,
+            scale,
+            causal,
+            window,
+            q.dtype,
+        )?;
         let q_pipe =
-            cached_backward_pipeline("et_sdpa_bwd_q", t, s, d, dv, scale, causal, q.dtype)?;
+            cached_backward_pipeline("et_sdpa_bwd_q", t, s, d, dv, scale, causal, window, q.dtype)?;
         let sz = q.dtype.size_in_bytes();
         let f32_size = crate::runtime::dtype::DType::F32.size_in_bytes();
 
@@ -1159,6 +1246,7 @@ kernel void et_sdpa_bwd_q(
         g: &MetalTensor,
         scale: f64,
         causal: bool,
+        window: Option<usize>,
     ) -> crate::err::Res<(MetalTensor, MetalTensor, MetalTensor)> {
         if q.dtype != k.dtype || q.dtype != v.dtype || q.dtype != o.dtype || q.dtype != g.dtype {
             return Err("flash: backward storage dtypes must match".to_string());
@@ -1170,7 +1258,7 @@ kernel void et_sdpa_bwd_q(
             q.dtype,
         );
         let requirements = requirements?;
-        warm_backward_exact(&requirements, scale, causal)?;
+        warm_backward_exact(&requirements, scale, causal, window)?;
         let q = contig(q)?;
         let k = contig(k)?;
         let v = contig(v)?;
@@ -1211,6 +1299,7 @@ kernel void et_sdpa_bwd_q(
             &g,
             scale,
             causal,
+            window,
             &dq,
             &dk,
             &dv_out,
@@ -1279,6 +1368,52 @@ mod attn_probe {
     }
 
     #[test]
+    fn grouped_query_ratios_and_local_windows_match_explicit_values() {
+        let dev = MetalDevice::get();
+        for (query_heads, kv_heads) in [(4usize, 2usize), (16, 1)] {
+            let q_values = pattern(query_heads * 2 * 2);
+            let k_values = pattern(kv_heads * 3 * 2);
+            let v_values = pattern(kv_heads * 3 * 3);
+            let q = MT::from_f32(dev, q_values, vec![1, query_heads, 2, 2]);
+            let k = MT::from_f32(dev, k_values.clone(), vec![1, kv_heads, 3, 2]);
+            let v = MT::from_f32(dev, v_values.clone(), vec![1, kv_heads, 3, 3]);
+            let repeat = |values: &[f32], width: usize| {
+                let mut repeated = Vec::new();
+                let per_head = 3 * width;
+                for head in 0..kv_heads {
+                    for _ in 0..query_heads / kv_heads {
+                        repeated.extend_from_slice(&values[head * per_head..(head + 1) * per_head]);
+                    }
+                }
+                repeated
+            };
+            let repeated_k = MT::from_f32(dev, repeat(&k_values, 2), vec![1, query_heads, 3, 2]);
+            let repeated_v = MT::from_f32(dev, repeat(&v_values, 3), vec![1, query_heads, 3, 3]);
+            let (actual, _) = crate::flash::forward(&q, &k, &v, 0.5, false, None).unwrap();
+            let (expected, _) =
+                crate::flash::forward(&q, &repeated_k, &repeated_v, 0.5, false, None).unwrap();
+            dev.synchronize().unwrap();
+            for (actual, expected) in actual
+                .read_f32()
+                .unwrap()
+                .iter()
+                .zip(expected.read_f32().unwrap())
+            {
+                assert!((actual - expected).abs() < 2e-5);
+            }
+        }
+
+        let q = MT::from_f32(dev, vec![0.0; 2], vec![1, 1, 2, 1]);
+        let k = MT::from_f32(dev, vec![0.0; 5], vec![1, 1, 5, 1]);
+        let v = MT::from_f32(dev, vec![1.0, 2.0, 4.0, 8.0, 16.0], vec![1, 1, 5, 1]);
+        let (local, _) = crate::flash::forward(&q, &k, &v, 1.0, true, Some(2)).unwrap();
+        let (full, _) = crate::flash::forward(&q, &k, &v, 1.0, true, None).unwrap();
+        dev.synchronize().unwrap();
+        assert_eq!(local.read_f32().unwrap(), vec![6.0, 12.0]);
+        assert_eq!(full.read_f32().unwrap(), vec![3.75, 6.2]);
+    }
+
+    #[test]
     fn into_matches_allocating_forward_and_cpu_backward_without_allocating() {
         let dev = MetalDevice::get();
         let q_values = pattern(8);
@@ -1297,14 +1432,14 @@ mod attn_probe {
             DType::F32,
         )
         .unwrap();
-        crate::flash::warm_forward_exact(&forward_req, scale, true).unwrap();
+        crate::flash::warm_forward_exact(&forward_req, scale, true, None).unwrap();
         let o_into = MT::empty(dev, forward_req.output.shape.clone(), DType::F32);
         let l_into = MT::empty(dev, forward_req.logsumexp.shape.clone(), DType::F32);
         super::reset_test_counts();
-        crate::flash::forward_into(&q, &k, &v, scale, true, &o_into, &l_into).unwrap();
+        crate::flash::forward_into(&q, &k, &v, scale, true, None, &o_into, &l_into).unwrap();
         assert_eq!(super::test_counts(), (0, 0));
 
-        let (o, l) = crate::flash::forward(&q, &k, &v, scale, true).unwrap();
+        let (o, l) = crate::flash::forward(&q, &k, &v, scale, true, None).unwrap();
         let backward_req = crate::flash::backward_requirements(
             q.layout.shape(),
             k.layout.shape(),
@@ -1312,14 +1447,14 @@ mod attn_probe {
             DType::F32,
         )
         .unwrap();
-        crate::flash::warm_backward_exact(&backward_req, scale, true).unwrap();
+        crate::flash::warm_backward_exact(&backward_req, scale, true, None).unwrap();
         let dq = MT::empty(dev, backward_req.dq.shape.clone(), DType::F32);
         let dk = MT::empty(dev, backward_req.dk.shape.clone(), DType::F32);
         let dv = MT::empty(dev, backward_req.dv.shape.clone(), DType::F32);
         let d_vec = MT::empty(dev, backward_req.d_vec_scratch.shape.clone(), DType::F32);
         super::reset_test_counts();
         crate::flash::backward_fused_into(
-            &q, &k, &v, &o, &l, &g, scale, true, &dq, &dk, &dv, &d_vec,
+            &q, &k, &v, &o, &l, &g, scale, true, None, &dq, &dk, &dv, &d_vec,
         )
         .unwrap();
         assert_eq!(super::test_counts(), (0, 0));

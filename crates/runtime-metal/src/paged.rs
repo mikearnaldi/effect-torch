@@ -29,6 +29,8 @@ pub struct ScatterRequirements {
 pub struct AttentionRequirements {
     pub slab_dtype: DType,
     pub head_dim: usize,
+    pub query_heads: usize,
+    pub kv_heads: usize,
     pub scale_bits: u64,
     pub output_bytes: usize,
     pub state_next_bytes: usize,
@@ -73,7 +75,8 @@ pub fn scatter_requirements(
 pub fn attention_requirements(
     slab_dtype: DType,
     batch: usize,
-    heads: usize,
+    query_heads: usize,
+    kv_heads: usize,
     chunk: usize,
     head_dim: usize,
     scale: f64,
@@ -86,8 +89,11 @@ pub fn attention_requirements(
             "paged attention: unsupported slab dtype {slab_dtype:?}"
         ));
     }
+    if kv_heads == 0 || !query_heads.is_multiple_of(kv_heads) {
+        return Err("paged attention: query heads must be divisible by K/V heads".to_string());
+    }
     let output_bytes = batch
-        .checked_mul(heads)
+        .checked_mul(query_heads)
         .and_then(|value| value.checked_mul(chunk))
         .and_then(|value| value.checked_mul(head_dim))
         .and_then(|value| value.checked_mul(DType::F32.size_in_bytes()))
@@ -95,6 +101,8 @@ pub fn attention_requirements(
     Ok(AttentionRequirements {
         slab_dtype,
         head_dim,
+        query_heads,
+        kv_heads,
         scale_bits: scale.to_bits(),
         output_bytes,
         state_next_bytes: 0,
@@ -108,12 +116,21 @@ pub fn attention_requirements(
 pub fn decode_requirements(
     slab_dtype: DType,
     batch: usize,
-    heads: usize,
+    query_heads: usize,
+    kv_heads: usize,
     chunk: usize,
     head_dim: usize,
     scale: f64,
 ) -> crate::err::Res<AttentionRequirements> {
-    attention_requirements(slab_dtype, batch, heads, chunk, head_dim, scale)
+    attention_requirements(
+        slab_dtype,
+        batch,
+        query_heads,
+        kv_heads,
+        chunk,
+        head_dim,
+        scale,
+    )
 }
 
 #[cfg(test)]
@@ -135,11 +152,11 @@ mod requirement_tests {
         );
         assert_eq!(scatter.pipeline_count, 1);
 
-        let attention = decode_requirements(DType::F16, 2, 4, 3, 16, 0.25).unwrap();
+        let attention = decode_requirements(DType::F16, 2, 4, 4, 3, 16, 0.25).unwrap();
         assert_eq!(attention.output_bytes, 2 * 4 * 3 * 16 * 4);
         assert_eq!(attention.pipeline_count, 1);
         assert!(scatter_requirements(DType::I64, 1, 1, 1, 1).is_err());
-        assert!(attention_requirements(DType::F32, usize::MAX, 2, 1, 1, 1.0).is_err());
+        assert!(attention_requirements(DType::F32, usize::MAX, 2, 2, 1, 1, 1.0).is_err());
     }
 }
 
@@ -199,6 +216,19 @@ mod metal {
 
     fn slab_dtype(t: &MetalTensor) -> DType {
         t.dtype
+    }
+
+    fn slab_heads(tensor: &MetalTensor, head_dim: usize) -> crate::err::Res<usize> {
+        let shape = tensor.layout.shape();
+        match shape {
+            [_, heads, dimension] if *dimension == head_dim => Ok(*heads),
+            [_, row_width] if head_dim != 0 && row_width.is_multiple_of(head_dim) => {
+                Ok(row_width / head_dim)
+            }
+            _ => {
+                Err("paged attention: K/V slab row width must be divisible by head dim".to_string())
+            }
+        }
     }
 
     fn validate_empty_resources(
@@ -318,13 +348,18 @@ kernel void et_paged_scatter(
     // decode, the chunk for prefill); write rows per slot are
     // ctxlens[b] - advance .. ctxlens[b].
     #[allow(clippy::too_many_arguments)]
-    pub fn warm_all(d: usize, scale: f64) -> crate::err::Res<usize> {
+    pub fn warm_all(
+        d: usize,
+        query_heads: usize,
+        kv_heads: usize,
+        scale: f64,
+    ) -> crate::err::Res<usize> {
         let mut count = 0;
         for dtype in [DType::F32, DType::F16, DType::BF16, DType::U8] {
             MetalDevice::get().compile_lazy(scatter_key(d, dtype), "et_paged_scatter", || {
                 scatter_source(d, dtype)
             })?;
-            pipeline(d, dtype, scale)?;
+            pipeline(d, query_heads, kv_heads, dtype, scale)?;
             count += 2;
         }
         Ok(count)
@@ -341,8 +376,14 @@ kernel void et_paged_scatter(
         warm_scatter(requirements.head_dim, requirements.slab_dtype)
     }
 
-    pub fn warm_attention(d: usize, slab_dtype: DType, scale: f64) -> crate::err::Res<()> {
-        pipeline(d, slab_dtype, scale)?;
+    pub fn warm_attention(
+        d: usize,
+        query_heads: usize,
+        kv_heads: usize,
+        slab_dtype: DType,
+        scale: f64,
+    ) -> crate::err::Res<()> {
+        pipeline(d, query_heads, kv_heads, slab_dtype, scale)?;
         Ok(())
     }
 
@@ -351,6 +392,8 @@ kernel void et_paged_scatter(
     ) -> crate::err::Res<()> {
         warm_attention(
             requirements.head_dim,
+            requirements.query_heads,
+            requirements.kv_heads,
             requirements.slab_dtype,
             f64::from_bits(requirements.scale_bits),
         )
@@ -477,7 +520,13 @@ kernel void et_paged_scatter(
     // fold within simd groups (32 lanes) via shuffles, then four group
     // partials combine in shared memory — no NT x D scratch, so D up
     // to 128 stays in the 32KB budget.
-    fn kernel_source(d: usize, slab_dtype: DType, scale: f64) -> String {
+    fn kernel_source(
+        d: usize,
+        query_heads: usize,
+        kv_heads: usize,
+        slab_dtype: DType,
+        scale: f64,
+    ) -> String {
         let (kv_ty, int8) = match slab_dtype {
             DType::F32 => ("float", 0),
             DType::F16 => ("half", 0),
@@ -509,6 +558,9 @@ using namespace metal;
 #define T_KV {kv_ty}
 #define INT8 {int8}
 #define VEC4 {vec4}
+#define QH {query_heads}
+#define KVH {kv_heads}
+#define GROUP {head_group_size}
 
 inline float4 kv_load4(device const T_KV* base, float s) {{
     {load4_prelude}
@@ -536,13 +588,14 @@ kernel void et_paged_decode(
 ) {{
     const uint b = tgid.y;
     const uint h = tgid.x;
+    const uint kvh = h / GROUP;
     const uint p = tgid.z;
     const uint C = gridDim.z;
     const uint tid = tpitg.x;
     const uint needed = ctxlens[b];
     if (needed == 0) {{
         if (tid == 0) {{
-            device float* o = O + ((ulong)b * H * C + h * C + p) * D;
+            device float* o = O + ((ulong)b * QH * C + h * C + p) * D;
             for (int d = 0; d < D; d++) {{ o[d] = 0.0f; }}
         }}
         return;
@@ -558,7 +611,7 @@ kernel void et_paged_decode(
     // Stage q once: the whole threadgroup reads threadgroup memory
     // from here on, never the device.
     threadgroup float qg[D];
-    for (int d = tid; d < D; d += NT) {{ qg[d] = Q[((ulong)b * H * C + h * C + p) * D + d]; }}
+    for (int d = tid; d < D; d += NT) {{ qg[d] = Q[((ulong)b * QH * C + h * C + p) * D + d]; }}
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     float m = -INFINITY;
@@ -568,10 +621,10 @@ kernel void et_paged_decode(
 
     for (uint row = start + tid; row < ctx; row += NT) {{
         const uint phys = table[row / blockSize - blockBases[b]] * blockSize + (row % blockSize);
-        const ulong krow = (ulong)phys * H * D + h * D;
+        const ulong krow = (ulong)phys * KVH * D + kvh * D;
         float score = 0.0f;
 #if INT8
-        const float ks = kscales[(ulong)phys * H + h];
+        const float ks = kscales[(ulong)phys * KVH + kvh];
 #else
         const float ks = 1.0f;
 #endif
@@ -596,7 +649,7 @@ kernel void et_paged_decode(
         const float c = (mn == -INFINITY) ? 0.0f : exp(m - mn);
         const float p = (mn == -INFINITY) ? 0.0f : exp(score - mn);
 #if INT8
-        const float vs = vscales[(ulong)phys * H + h];
+        const float vs = vscales[(ulong)phys * KVH + kvh];
 #else
         const float vs = 1.0f;
 #endif
@@ -654,7 +707,7 @@ kernel void et_paged_decode(
             fl += pl[g] * c;
             for (int d = 0; d < D; d++) {{ facc[d] += pacc[g][d] * c; }}
         }}
-        device float* o = O + ((ulong)b * H * C + h * C + p) * D;
+        device float* o = O + ((ulong)b * QH * C + h * C + p) * D;
         const float inv = (fl == 0.0f) ? 0.0f : 1.0f / fl;
         for (int d = 0; d < D; d++) {{ o[d] = facc[d] * inv; }}
     }}
@@ -666,25 +719,43 @@ kernel void et_paged_decode(
             kv_ty = kv_ty,
             int8 = int8,
             vec4 = vec4,
+            query_heads = query_heads,
+            kv_heads = kv_heads,
+            head_group_size = query_heads / kv_heads,
             load4_prelude = load4_prelude,
             load4 = load4,
         )
     }
 
-    fn attention_key(d: usize, slab_dtype: DType, scale: f64) -> u64 {
+    fn attention_key(
+        d: usize,
+        query_heads: usize,
+        kv_heads: usize,
+        slab_dtype: DType,
+        scale: f64,
+    ) -> u64 {
         use std::collections::hash_map::DefaultHasher;
         use std::hash::{Hash, Hasher};
 
         let mut hasher = DefaultHasher::new();
-        (d, slab_dtype, scale.to_bits()).hash(&mut hasher);
+        (d, query_heads, kv_heads, slab_dtype, scale.to_bits()).hash(&mut hasher);
         hasher.finish()
     }
 
-    fn pipeline(d: usize, slab_dtype: DType, scale: f64) -> crate::err::Res<Pipeline> {
+    fn pipeline(
+        d: usize,
+        query_heads: usize,
+        kv_heads: usize,
+        slab_dtype: DType,
+        scale: f64,
+    ) -> crate::err::Res<Pipeline> {
+        if kv_heads == 0 || !query_heads.is_multiple_of(kv_heads) {
+            return Err("paged attention: query heads must be divisible by K/V heads".to_string());
+        }
         MetalDevice::get().compile_lazy(
-            attention_key(d, slab_dtype, scale),
+            attention_key(d, query_heads, kv_heads, slab_dtype, scale),
             "et_paged_decode",
-            || kernel_source(d, slab_dtype, scale),
+            || kernel_source(d, query_heads, kv_heads, slab_dtype, scale),
         )
     }
 
@@ -716,6 +787,10 @@ kernel void et_paged_decode(
             q.layout.shape()[2],
             q.layout.shape()[3],
         );
+        let kv_heads = slab_heads(k_slab, d)?;
+        if kv_heads == 0 || !h.is_multiple_of(kv_heads) {
+            return Err("paged attention: query heads must be divisible by K/V heads".to_string());
+        }
         let slab_dtype = slab_dtype(k_slab);
         validate_empty_resources(resources, "paged attention")?;
         if !q.layout.is_contiguous() {
@@ -733,7 +808,7 @@ kernel void et_paged_decode(
         }
         MetalDevice::get().mark_buffer_write(&output.buffer)?;
         let pipe = MetalDevice::get()
-            .pipeline_cached(attention_key(d, slab_dtype, scale))
+            .pipeline_cached(attention_key(d, h, kv_heads, slab_dtype, scale))
             .ok_or_else(|| {
                 "paged attention: exact pipeline is not warm; call warm_attention".to_string()
             })?;
@@ -838,7 +913,9 @@ kernel void et_paged_decode(
     ) -> crate::err::Res<MetalTensor> {
         let shape = q.layout.shape().to_vec();
         let q = wrap_contig(q)?;
-        warm_attention(q.layout.shape()[3], k_slab.dtype, scale)?;
+        let d = q.layout.shape()[3];
+        let kv_heads = slab_heads(k_slab, d)?;
+        warm_attention(d, q.layout.shape()[1], kv_heads, k_slab.dtype, scale)?;
         let output = MetalTensor::empty(MetalDevice::get(), shape, DType::F32);
         decode_into(
             &q,
@@ -950,7 +1027,7 @@ mod tests {
         let actual_output = MT::empty(dev, vec![b, h, c, d], DType::F32);
         let scatter_requirements = super::scatter_requirements(DType::F32, b, h, c, d).unwrap();
         let attention_requirements =
-            super::attention_requirements(DType::F32, b, h, c, d, scale).unwrap();
+            super::attention_requirements(DType::F32, b, h, h, c, d, scale).unwrap();
         super::metal::warm_scatter_exact(&scatter_requirements).unwrap();
         super::metal::warm_attention_exact(&attention_requirements).unwrap();
         dev.synchronize().unwrap();
@@ -992,5 +1069,74 @@ mod tests {
         assert!(max_diff(&expected_k, &actual_k) < 1e-6);
         assert!(max_diff(&expected_v, &actual_v) < 1e-6);
         assert!(max_diff(&expected_output, &actual_output) < 1e-6);
+    }
+
+    #[test]
+    fn grouped_queries_directly_index_kv_heads() {
+        let dev = MetalDevice::get();
+        let (batch, query_heads, kv_heads, chunk, head_dim) =
+            (1usize, 4usize, 2usize, 1usize, 4usize);
+        let q = MT::from_f32(
+            dev,
+            vec![0.0; batch * query_heads * chunk * head_dim],
+            vec![batch, query_heads, chunk, head_dim],
+        );
+        let k_new = MT::from_f32(
+            dev,
+            vec![0.0; batch * kv_heads * chunk * head_dim],
+            vec![batch, kv_heads, chunk, head_dim],
+        );
+        let v_new = MT::from_f32(
+            dev,
+            vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0],
+            vec![batch, kv_heads, chunk, head_dim],
+        );
+        let k_slab = MT::from_f32(
+            dev,
+            vec![0.0; 2 * kv_heads * head_dim],
+            vec![2, kv_heads, head_dim],
+        );
+        let v_slab = MT::from_f32(
+            dev,
+            vec![0.0; 2 * kv_heads * head_dim],
+            vec![2, kv_heads, head_dim],
+        );
+        let tables = u32_tensor(dev, &[0], vec![batch, 1]);
+        let ctxlens = u32_tensor(dev, &[1], vec![batch]);
+        let block_bases = u32_tensor(dev, &[0], vec![batch]);
+        super::metal::scatter(
+            &k_new,
+            &v_new,
+            &k_slab,
+            &v_slab,
+            None,
+            None,
+            &tables,
+            &ctxlens,
+            &block_bases,
+            2,
+            1,
+        )
+        .unwrap();
+        let output = super::metal::decode(
+            &q,
+            &k_slab,
+            &v_slab,
+            None,
+            None,
+            &tables,
+            &ctxlens,
+            &block_bases,
+            None,
+            1.0,
+            2,
+            1,
+        )
+        .unwrap();
+        dev.synchronize().unwrap();
+        assert_eq!(
+            output.read_f32().unwrap(),
+            vec![1.0, 2.0, 3.0, 4.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 5.0, 6.0, 7.0, 8.0,]
+        );
     }
 }

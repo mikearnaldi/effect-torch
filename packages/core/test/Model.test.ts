@@ -10,6 +10,8 @@ const tmpdir = Effect.sync(() => fs.mkdtempSync(path.join(os.tmpdir(), "effect-t
 
 const values = (t: Tensor.Any) => Tensor.toNumberArray(t)
 
+const identityForward: Model.Definition["forward"] = (_, input) => Effect.succeed(input as Tensor.Lazy)
+
 const mlp = Effect.gen(function*() {
   return yield* Model.chain(
     yield* Model.linear("fc1", 2, 8),
@@ -30,6 +32,46 @@ const handForward = (
 
 onDevices("Model", () => (it) => {
   describe("validation", () => {
+    it.effect("define validates names and logical shapes", () =>
+      Effect.gen(function*() {
+        const model = yield* Model.define({
+          parameters: [
+            { name: "scalar", shape: [] },
+            { name: "empty", shape: [2, 0, 3] }
+          ],
+          init: Effect.succeed([]),
+          forward: identityForward
+        })
+        expect(model.names).toEqual(["scalar", "empty"])
+        expect(model.names).toEqual(model.parameters.map((parameter) => parameter.name))
+        expect(model.parameters.map((parameter) => parameter.shape)).toEqual([[], [2, 0, 3]])
+
+        for (
+          const parameters of [
+            [{ name: "", shape: [1] }],
+            [{ name: "x", shape: [1] }, { name: "x", shape: [2] }],
+            [{ name: "x", shape: [-1] }],
+            [{ name: "x", shape: [1.5] }],
+            [{ name: "x", shape: [Number.MAX_SAFE_INTEGER + 1] }]
+          ]
+        ) {
+          const error = yield* Effect.flip(Model.define({ parameters, forward: identityForward }))
+          expect(error._tag).toBe("ModelError")
+          expect(error.op).toBe("define")
+        }
+      }))
+
+    it.effect("define without init creates a load-only model", () =>
+      Effect.gen(function*() {
+        const model = yield* Model.define({
+          parameters: [{ name: "weight", shape: [2, 2] }],
+          forward: identityForward
+        })
+        const error = yield* Effect.flip(model.init)
+        expect(error._tag).toBe("ModelError")
+        expect(error.op).toBe("init")
+      }))
+
     it.effect("linear rejects an empty name", () =>
       Effect.gen(function*() {
         const error = yield* Effect.flip(Model.linear("", 2, 8))
@@ -74,6 +116,12 @@ onDevices("Model", () => (it) => {
       Effect.gen(function*() {
         const model = yield* mlp
         expect(model.names).toEqual(["fc1.weight", "fc1.bias", "fc2.weight", "fc2.bias"])
+        expect(model.parameters).toEqual([
+          { name: "fc1.weight", shape: [2, 8] },
+          { name: "fc1.bias", shape: [1, 8] },
+          { name: "fc2.weight", shape: [8, 1] },
+          { name: "fc2.bias", shape: [1, 1] }
+        ])
         const params = yield* model.init
         expect(params.length).toBe(model.names.length)
       }))

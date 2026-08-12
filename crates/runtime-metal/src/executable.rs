@@ -1,6 +1,7 @@
 use crate::value::Value;
 use crate::{
-    device, flash, fusion, kda, layer_norm, linear, loss, ops as metal_ops, rotary, shortconv,
+    device, flash, fusion, kda, layer_norm, linear, loss, ops as metal_ops, quantized, rotary,
+    shortconv,
 };
 #[cfg(test)]
 use effect_torch_compiler::ProgramRequest;
@@ -13,11 +14,11 @@ use effect_torch_compiler::{
     COMPILE_SUBMISSION_PHASE, PHYSICAL_PLANNING_PHASE, PIPELINE_PREPARATION_PHASE,
     PUBLICATION_PHASE,
 };
-use effect_torch_graph::{node_children, CrossEntropyReduction, PositionOffset};
+use effect_torch_graph::{node_children, CrossEntropyReduction, PositionOffset, RotaryLayout};
 use effect_torch_runtime::{
-    Buffer, CancellationFlag, DType, ExecutableDiagnostics, InstructionId, InvocationMemoryReport,
-    Location, MemoryPlan, NativeMemorySpace, ProgramSignature, SegmentOwnership, StorageClass,
-    ValueId,
+    Buffer, CancellationFlag, DType, ExecutableDiagnostics, GgmlKQuant, InstructionId,
+    InvocationMemoryReport, Location, MemoryPlan, NativeMemorySpace, ProgramSignature,
+    SegmentOwnership, StorageClass, ValueId,
 };
 use std::collections::{HashMap, HashSet};
 use std::fmt;
@@ -395,11 +396,13 @@ pub(super) enum MetalOp {
     Sdpa {
         scale: f64,
         causal: bool,
+        window: Option<usize>,
         implementation: MetalImplementation,
     },
     SdpaBackward {
         scale: f64,
         causal: bool,
+        window: Option<usize>,
         implementation: MetalImplementation,
     },
     KdaChunk {
@@ -418,6 +421,7 @@ pub(super) enum MetalOp {
     ConvState {
         layer: u32,
     },
+    LastTokenRow,
     PositionEmbedding {
         seq_len: usize,
     },
@@ -429,14 +433,24 @@ pub(super) enum MetalOp {
     RotaryEmbedding {
         theta: f64,
         cursor_offset: bool,
+        layout: RotaryLayout,
         implementation: MetalImplementation,
     },
     RotaryEmbeddingBackward {
         theta: f64,
+        layout: RotaryLayout,
         implementation: MetalImplementation,
     },
     Linear {
         implementation: MetalImplementation,
+    },
+    QuantizedLinear {
+        codec: GgmlKQuant,
+        weight_shape: [usize; 2],
+    },
+    QuantizedEmbedding {
+        codec: GgmlKQuant,
+        weight_shape: [usize; 2],
     },
     LinearResidual {
         implementation: MetalImplementation,
@@ -447,6 +461,10 @@ pub(super) enum MetalOp {
         implementation: MetalImplementation,
     },
     LayerNorm {
+        eps: f64,
+        implementation: MetalImplementation,
+    },
+    RmsNorm {
         eps: f64,
         implementation: MetalImplementation,
     },
@@ -577,13 +595,17 @@ impl MetalOp {
             Self::ShortConv1dBackwardX => "short_conv1d_backward_x",
             Self::ShortConv1dBackwardW => "short_conv1d_backward_w",
             Self::ConvState { .. } => "conv_state",
+            Self::LastTokenRow => "last_token_row",
             Self::PositionEmbedding { .. } => "position_embedding",
             Self::KvAttention { .. } => "kv_attention",
             Self::RotaryEmbedding { .. } | Self::RotaryEmbeddingBackward { .. } => "rotary_native",
             Self::Linear { .. } | Self::LinearResidual { .. } | Self::LinearGelu { .. } => {
                 "linear_native"
             }
+            Self::QuantizedLinear { .. } => "quantized_linear",
+            Self::QuantizedEmbedding { .. } => "quantized_embedding",
             Self::LayerNorm { .. } | Self::LayerNormBackward { .. } => "layer_norm_native",
+            Self::RmsNorm { .. } => "rms_norm_native",
             Self::Conv1d { .. } => "conv1d",
             Self::Conv2d { .. } => "conv2d",
             Self::ConvTranspose1d { .. } => "conv_transpose1d",
@@ -608,6 +630,36 @@ impl MetalOp {
             Self::FusedElementwise { .. } => "fused_elementwise",
             Self::FusedReduce { .. } => "fused_reduce",
         }
+    }
+
+    fn profile_name(&self, plan: &MetalCommandPlan) -> &'static str {
+        match (self, plan) {
+            (
+                Self::QuantizedLinear { codec, .. },
+                MetalCommandPlan::QuantizedLinear(requirements),
+            ) => quantized_linear_profile_name(*codec, requirements.vectors),
+            _ => self.name(),
+        }
+    }
+}
+
+fn quantized_linear_profile_name(codec: GgmlKQuant, vectors: usize) -> &'static str {
+    match (codec, vectors) {
+        (GgmlKQuant::Q2K, 1) => "quantized_linear_q2_k_m1",
+        (GgmlKQuant::Q2K, 2..=8) => "quantized_linear_q2_k_m2_8",
+        (GgmlKQuant::Q2K, _) => "quantized_linear_q2_k_m9_plus",
+        (GgmlKQuant::Q3K, 1) => "quantized_linear_q3_k_m1",
+        (GgmlKQuant::Q3K, 2..=8) => "quantized_linear_q3_k_m2_8",
+        (GgmlKQuant::Q3K, _) => "quantized_linear_q3_k_m9_plus",
+        (GgmlKQuant::Q4K, 1) => "quantized_linear_q4_k_m1",
+        (GgmlKQuant::Q4K, 2..=8) => "quantized_linear_q4_k_m2_8",
+        (GgmlKQuant::Q4K, _) => "quantized_linear_q4_k_m9_plus",
+        (GgmlKQuant::Q5K, 1) => "quantized_linear_q5_k_m1",
+        (GgmlKQuant::Q5K, 2..=8) => "quantized_linear_q5_k_m2_8",
+        (GgmlKQuant::Q5K, _) => "quantized_linear_q5_k_m9_plus",
+        (GgmlKQuant::Q6K, 1) => "quantized_linear_q6_k_m1",
+        (GgmlKQuant::Q6K, 2..=8) => "quantized_linear_q6_k_m2_8",
+        (GgmlKQuant::Q6K, _) => "quantized_linear_q6_k_m9_plus",
     }
 }
 
@@ -716,13 +768,16 @@ pub(super) enum MetalCommandPlan {
     ShortConvBackwardX(crate::shortconv::BackwardXRequirements),
     ShortConvBackwardW(crate::shortconv::BackwardWRequirements),
     Rotary(crate::rotary::RotaryRequirements),
+    QuantizedLinear(crate::quantized::LinearRequirements),
+    QuantizedEmbedding(crate::quantized::EmbeddingRequirements),
     KvAttention(KvAttentionPlan),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct KvAttentionPlan {
     pub(crate) batch: usize,
-    pub(crate) heads: usize,
+    pub(crate) query_heads: usize,
+    pub(crate) kv_heads: usize,
     pub(crate) time: usize,
     pub(crate) head_dim: usize,
 }
@@ -1431,6 +1486,53 @@ fn plan_command_resources(
                 &q.shape, &k.shape, &v.shape, q.dtype,
             )?);
         }
+        MetalOp::QuantizedLinear {
+            codec,
+            weight_shape,
+        } => {
+            let x = input(0)?;
+            let weight = input(1)?;
+            let bias = if command.inputs.len() == 3 {
+                let bias = input(2)?;
+                Some((bias.shape.as_ref(), bias.dtype))
+            } else {
+                None
+            };
+            let output = output(0)?;
+            resources.plan = MetalCommandPlan::QuantizedLinear(quantized::linear_requirements(
+                &x.shape,
+                x.dtype,
+                &weight.shape,
+                weight.dtype,
+                bias,
+                &output.shape,
+                output.dtype,
+                *codec,
+                *weight_shape,
+            )?);
+        }
+        MetalOp::QuantizedEmbedding {
+            codec,
+            weight_shape,
+        } => {
+            let indexes = input(0)?;
+            let weight = input(1)?;
+            let output = output(0)?;
+            resources.plan =
+                MetalCommandPlan::QuantizedEmbedding(quantized::embedding_requirements(
+                    &indexes.shape,
+                    indexes.dtype,
+                    &weight.shape,
+                    weight.dtype,
+                    &output.shape,
+                    output.dtype,
+                    *codec,
+                    *weight_shape,
+                )?);
+            resources
+                .status
+                .push(status("quantized_embedding_status", &[1], DType::U32));
+        }
         MetalOp::SdpaBackward {
             implementation: MetalImplementation::Native,
             ..
@@ -1500,6 +1602,21 @@ fn plan_command_resources(
                     &bias.shape,
                     bias.dtype,
                 )?);
+        }
+        MetalOp::RmsNorm {
+            implementation: MetalImplementation::Native,
+            ..
+        } => {
+            let x = input(0)?;
+            let weight = if command.inputs.len() == 2 {
+                let weight = input(1)?;
+                Some((weight.shape.as_ref(), weight.dtype))
+            } else {
+                None
+            };
+            resources.plan = MetalCommandPlan::LayerNormForward(
+                layer_norm::rms_forward_requirements(&x.shape, x.dtype, weight)?,
+            );
         }
         MetalOp::LayerNormBackward {
             implementation: MetalImplementation::Native,
@@ -1682,9 +1799,14 @@ fn plan_command_resources(
         MetalOp::RotaryEmbedding { .. } | MetalOp::RotaryEmbeddingBackward { .. } => {
             let source = input(0)?;
             let requirements = rotary::rotary_requirements(source.dtype, &source.shape)?;
+            let batch = if source.shape.len() == 2 {
+                1
+            } else {
+                source.shape[0]
+            };
             resources
                 .staging
-                .push(staging("rotary_offsets", &[source.shape[0]], DType::F32));
+                .push(staging("rotary_offsets", &[batch], DType::F32));
             resources.plan = MetalCommandPlan::Rotary(requirements);
         }
         MetalOp::Reduce { .. } => {
@@ -1713,8 +1835,9 @@ fn plan_command_resources(
             }
         }
         MetalOp::AdamW { .. } | MetalOp::AdamWGroup { .. } | MetalOp::Sgd { .. } => {}
-        MetalOp::KvAttention { layer, window, .. } => {
+        MetalOp::KvAttention { layer, .. } => {
             let q = input(0)?;
+            let k = input(1)?;
             if q.shape.len() < 3 || q.dtype != DType::F32 {
                 return Err(
                     "compile: paged KV attention requires rank >= 3 f32 queries".to_string()
@@ -1726,7 +1849,8 @@ fn plan_command_resources(
                     .iter()
                     .try_fold(1usize, |count, dimension| count.checked_mul(*dimension))
                     .ok_or_else(|| "compile: KV attention batch size overflow".to_string())?,
-                heads: q.shape[rank - 3],
+                query_heads: q.shape[rank - 3],
+                kv_heads: k.shape[rank - 3],
                 time: q.shape[rank - 2],
                 head_dim: q.shape[rank - 1],
             };
@@ -1740,23 +1864,21 @@ fn plan_command_resources(
                 "compile: paged KV attention requires an explicit state schema".to_string()
             })?;
             if plan.batch != schema.batch
-                || plan.heads != schema.kv_heads
+                || plan.kv_heads != schema.kv_heads
                 || plan.head_dim != schema.head_dim
                 || (*layer as usize) >= schema.layers
-                || *window != schema.window
             {
                 return Err(format!(
-                    "compile: KV attention geometry [{}, {}, {}, layer {}, window {:?}] does not match schema [{}, {}, {}, layers {}, window {:?}]",
+                    "compile: KV attention geometry [{}, query heads {}, KV heads {}, {}, layer {}] does not match schema [{}, KV heads {}, {}, layers {}]",
                     plan.batch,
-                    plan.heads,
+                    plan.query_heads,
+                    plan.kv_heads,
                     plan.head_dim,
                     layer,
-                    window,
                     schema.batch,
                     schema.kv_heads,
                     schema.head_dim,
-                    schema.layers,
-                    schema.window
+                    schema.layers
                 ));
             }
             resources.staging.extend([
@@ -1903,6 +2025,7 @@ fn plan_command_resources(
         | MetalOp::Slice { .. }
         | MetalOp::BroadcastTo { .. }
         | MetalOp::PositionEmbedding { .. }
+        | MetalOp::LastTokenRow
         | MetalOp::FusedElementwise { .. }
         | MetalOp::FusedReduce { .. } => {}
     }
@@ -3020,17 +3143,27 @@ impl<'a> Lowerer<'a> {
                 }
             }
             NodeKind::Sdpa {
-                q, scale, causal, ..
+                q,
+                scale,
+                causal,
+                window,
+                ..
             } => MetalOp::Sdpa {
                 scale: *scale,
                 causal: *causal,
+                window: window.local(),
                 implementation: implementation(q.dtype),
             },
             NodeKind::SdpaBackward {
-                q, scale, causal, ..
+                q,
+                scale,
+                causal,
+                window,
+                ..
             } => MetalOp::SdpaBackward {
                 scale: *scale,
                 causal: *causal,
+                window: window.local(),
                 implementation: implementation(q.dtype),
             },
             NodeKind::KdaChunk { scale, .. } => MetalOp::KdaChunk { scale: *scale },
@@ -3043,6 +3176,7 @@ impl<'a> Lowerer<'a> {
             NodeKind::ShortConv1dBackwardX { .. } => MetalOp::ShortConv1dBackwardX,
             NodeKind::ShortConv1dBackwardW { .. } => MetalOp::ShortConv1dBackwardW,
             NodeKind::ConvState { layer, .. } => MetalOp::ConvState { layer: *layer },
+            NodeKind::LastTokenRow { .. } => MetalOp::LastTokenRow,
             NodeKind::PositionEmbedding { seq_len, .. } => {
                 MetalOp::PositionEmbedding { seq_len: *seq_len }
             }
@@ -3057,22 +3191,48 @@ impl<'a> Lowerer<'a> {
                 window: *window,
             },
             NodeKind::RotaryEmbedding {
-                x, theta, offset, ..
+                x,
+                theta,
+                offset,
+                layout,
+                ..
             } => MetalOp::RotaryEmbedding {
                 theta: *theta,
                 cursor_offset: matches!(offset, PositionOffset::Cursor),
+                layout: *layout,
                 implementation: implementation(x.dtype),
             },
-            NodeKind::RotaryEmbeddingBackward { g, theta, .. } => {
-                MetalOp::RotaryEmbeddingBackward {
-                    theta: *theta,
-                    implementation: implementation(g.dtype),
-                }
-            }
+            NodeKind::RotaryEmbeddingBackward {
+                g, theta, layout, ..
+            } => MetalOp::RotaryEmbeddingBackward {
+                theta: *theta,
+                layout: *layout,
+                implementation: implementation(g.dtype),
+            },
             NodeKind::Linear { x, .. } => MetalOp::Linear {
                 implementation: implementation(x.dtype),
             },
+            NodeKind::QuantizedLinear {
+                codec,
+                weight_shape,
+                ..
+            } => MetalOp::QuantizedLinear {
+                codec: *codec,
+                weight_shape: *weight_shape,
+            },
+            NodeKind::QuantizedEmbedding {
+                codec,
+                weight_shape,
+                ..
+            } => MetalOp::QuantizedEmbedding {
+                codec: *codec,
+                weight_shape: *weight_shape,
+            },
             NodeKind::LayerNorm { x, eps, .. } => MetalOp::LayerNorm {
+                eps: *eps,
+                implementation: implementation(x.dtype),
+            },
+            NodeKind::RmsNorm { x, eps, .. } => MetalOp::RmsNorm {
                 eps: *eps,
                 implementation: implementation(x.dtype),
             },
@@ -3800,6 +3960,21 @@ impl<'a> Lowerer<'a> {
                         crate::kernels::warm_cast(shape, DType::F32, dtype)?;
                         pipeline_count += 1;
                     }
+                    MetalOp::QuantizedLinear { .. } => {
+                        let MetalCommandPlan::QuantizedLinear(requirements) = command_plan else {
+                            return Err("compile: quantized linear plan is missing".to_string());
+                        };
+                        quantized::warm_linear_exact(requirements)?;
+                        pipeline_count += requirements.pipeline_count;
+                    }
+                    MetalOp::QuantizedEmbedding { .. } => {
+                        let MetalCommandPlan::QuantizedEmbedding(requirements) = command_plan
+                        else {
+                            return Err("compile: quantized embedding plan is missing".to_string());
+                        };
+                        quantized::warm_embedding_exact(requirements)?;
+                        pipeline_count += requirements.pipeline_count;
+                    }
                     MetalOp::Uniform { lo, hi, shape, .. } => {
                         crate::kernels::warm_uniform(*lo, *hi, shape)?;
                         crate::kernels::warm_cast(shape, DType::F32, dtype)?;
@@ -3975,6 +4150,7 @@ impl<'a> Lowerer<'a> {
                     MetalOp::Sdpa {
                         scale,
                         causal,
+                        window,
                         implementation: MetalImplementation::Native,
                     } => {
                         flash::warm_forward(
@@ -3983,6 +4159,7 @@ impl<'a> Lowerer<'a> {
                             &self.values[command.inputs[2].index()].shape,
                             *scale,
                             *causal,
+                            *window,
                             dtype,
                         )?;
                         pipeline_count += 1;
@@ -3990,6 +4167,7 @@ impl<'a> Lowerer<'a> {
                     MetalOp::SdpaBackward {
                         scale,
                         causal,
+                        window,
                         implementation: MetalImplementation::Native,
                     } => {
                         flash::warm_backward(
@@ -3998,6 +4176,7 @@ impl<'a> Lowerer<'a> {
                             &self.values[command.inputs[2].index()].shape,
                             *scale,
                             *causal,
+                            *window,
                             dtype,
                         )?;
                         let q = &self.values[command.inputs[0].index()];
@@ -4100,18 +4279,26 @@ impl<'a> Lowerer<'a> {
                     }
                     MetalOp::KvAttention { scale, .. } => {
                         let query = &self.values[command.inputs[0].index()];
-                        pipeline_count +=
-                            crate::paged::warm_all(query.shape[query.shape.len() - 1], *scale)?;
+                        let key = &self.values[command.inputs[1].index()];
+                        let rank = query.shape.len();
+                        pipeline_count += crate::paged::warm_all(
+                            query.shape[rank - 1],
+                            query.shape[rank - 3],
+                            key.shape[rank - 3],
+                            *scale,
+                        )?;
                     }
                     MetalOp::RotaryEmbedding {
+                        layout,
                         implementation: MetalImplementation::Native,
                         ..
                     }
                     | MetalOp::RotaryEmbeddingBackward {
+                        layout,
                         implementation: MetalImplementation::Native,
                         ..
                     } => {
-                        rotary::warm(dtype)?;
+                        rotary::warm(dtype, *layout)?;
                         pipeline_count += 1;
                     }
                     MetalOp::LayerNorm {
@@ -4119,6 +4306,16 @@ impl<'a> Lowerer<'a> {
                         ..
                     } => {
                         layer_norm::warm_forward(dtype)?;
+                        pipeline_count += 1;
+                    }
+                    MetalOp::RmsNorm {
+                        implementation: MetalImplementation::Native,
+                        ..
+                    } => {
+                        let MetalCommandPlan::LayerNormForward(requirements) = command_plan else {
+                            return Err("compile: RMS norm plan is missing".to_string());
+                        };
+                        layer_norm::warm_rms_exact(requirements)?;
                         pipeline_count += 1;
                     }
                     MetalOp::LayerNormBackward {
@@ -4473,6 +4670,15 @@ impl<'a> Lowerer<'a> {
                             }
                         }
                         if !empty {
+                            crate::kernels::warm_copy_layout(&layout, input.dtype)?;
+                            pipeline_count += usize::from(layout.numel() != 0);
+                        }
+                    }
+                    MetalOp::LastTokenRow => {
+                        let input = &self.values[command.inputs[0].index()];
+                        if input.shape.len() == 3 {
+                            let layout =
+                                effect_torch_runtime::Layout::contiguous(vec![input.shape[2]]);
                             crate::kernels::warm_copy_layout(&layout, input.dtype)?;
                             pipeline_count += usize::from(layout.numel() != 0);
                         }
@@ -4967,6 +5173,11 @@ struct DeferredCeCheck {
     classes: usize,
 }
 
+struct DeferredQuantizedEmbeddingCheck {
+    buffer: Value,
+    rows: usize,
+}
+
 fn run_ce_checks(checks: &[DeferredCeCheck]) -> Result<(), String> {
     for check in checks {
         let tensor = check.buffer.as_metal()?;
@@ -4997,6 +5208,26 @@ fn run_ce_checks(checks: &[DeferredCeCheck]) -> Result<(), String> {
                 );
             }
             CeCheck::BackwardMean => {}
+        }
+    }
+    Ok(())
+}
+
+fn run_quantized_embedding_checks(
+    checks: &[DeferredQuantizedEmbeddingCheck],
+) -> Result<(), String> {
+    for check in checks {
+        let tensor = check.buffer.as_metal()?;
+        if tensor.dtype != DType::U32 || !tensor.layout.is_contiguous() || tensor.numel() != 1 {
+            return Err(
+                "quantized_embedding: deferred status must be one contiguous u32".to_string(),
+            );
+        }
+        if tensor.to_u32_vec()?[0] != 0 {
+            return Err(format!(
+                "quantized_embedding: index is outside 0..{}",
+                check.rows
+            ));
         }
     }
     Ok(())
@@ -5275,14 +5506,18 @@ fn commit_state_transactions(
                     copies.push(transaction_copy(&source, destination)?);
                 }
             }
-            MetalOp::KvAttention { window, .. } => {
+            MetalOp::KvAttention { .. } => {
                 for (index, state) in states.iter().take(context.active_batch()).enumerate() {
                     let frontier = state
                         .cursor
                         .checked_add(state.advance)
                         .ok_or_else(|| "KV state commit cursor overflow".to_string())?;
-                    eviction_starts[index] = eviction_starts[index]
-                        .max(window.map_or(0, |limit| frontier.saturating_sub(limit)));
+                    eviction_starts[index] = eviction_starts[index].max(
+                        context
+                            .schema()
+                            .window
+                            .map_or(0, |limit| frontier.saturating_sub(limit)),
+                    );
                 }
             }
             _ => {}
@@ -5681,6 +5916,7 @@ fn execute_with_commit(
     }
 
     let mut ce_checks = Vec::new();
+    let mut quantized_embedding_checks = Vec::new();
     let metal = device::MetalDevice::get();
     let _submission = metal.begin_submission()?;
     let invocation_nonce = INVOCATION_NONCE.fetch_add(1, Ordering::AcqRel);
@@ -5718,6 +5954,7 @@ fn execute_with_commit(
                             else {
                                 unreachable!("physical resolution requires an operation")
                             };
+                            let _profile = metal.profile_region(op.profile_name(plan));
                             let inputs = resolved_values(
                                 command.inputs.iter().map(|use_| use_.value),
                                 &resolved,
@@ -5768,6 +6005,7 @@ fn execute_with_commit(
                                 &state,
                                 kv,
                                 &mut ce_checks,
+                                &mut quantized_embedding_checks,
                                 random_seed(invocation_nonce, *random_seed_token),
                             )
                             .map_err(|error| format!("{}: {error}", op.name()))?;
@@ -5811,6 +6049,7 @@ fn execute_with_commit(
     // Status command buffers retain their boundaries, but one final fence is
     // sufficient for every deferred host check in command order.
     run_ce_checks(&ce_checks)?;
+    run_quantized_embedding_checks(&quantized_embedding_checks)?;
     match dispatch_result {
         Ok(result) => result?,
         Err(payload) => return Err(panic_message(payload)),
@@ -5849,6 +6088,7 @@ fn execute_op_into(
     state: &[Value],
     kv: Option<&dyn MetalDecodeContext>,
     ce_checks: &mut Vec<DeferredCeCheck>,
+    quantized_embedding_checks: &mut Vec<DeferredQuantizedEmbeddingCheck>,
     random_seed: u64,
 ) -> Result<(), String> {
     let input = |index: usize| {
@@ -6485,6 +6725,7 @@ fn execute_op_into(
         MetalOp::Sdpa {
             scale,
             causal,
+            window,
             implementation,
         } => match implementation {
             MetalImplementation::Native => {
@@ -6497,6 +6738,7 @@ fn execute_op_into(
                     input(2)?.as_metal()?,
                     *scale,
                     *causal,
+                    *window,
                     output(0)?.as_metal()?,
                     output(1)?.as_metal()?,
                 )?;
@@ -6506,6 +6748,7 @@ fn execute_op_into(
         MetalOp::SdpaBackward {
             scale,
             causal,
+            window,
             implementation,
         } => match implementation {
             MetalImplementation::Native => {
@@ -6521,6 +6764,7 @@ fn execute_op_into(
                     input(3)?.as_metal()?,
                     *scale,
                     *causal,
+                    *window,
                     output(0)?.as_metal()?,
                     output(1)?.as_metal()?,
                     output(2)?.as_metal()?,
@@ -6884,7 +7128,7 @@ fn execute_op_into(
                 return Err("KV attention is missing exact paged requirements".to_string());
             };
             let query = input(0)?.as_metal()?;
-            if query.layout.shape()[query.layout.shape().len() - 3] != requirements.heads
+            if query.layout.shape()[query.layout.shape().len() - 3] != requirements.query_heads
                 || query.layout.shape()[query.layout.shape().len() - 2] != requirements.time
                 || query.layout.shape()[query.layout.shape().len() - 1] != requirements.head_dim
                 || query.layout.shape()[..query.layout.shape().len() - 3]
@@ -6913,6 +7157,7 @@ fn execute_op_into(
         MetalOp::RotaryEmbedding {
             theta,
             cursor_offset,
+            layout,
             implementation: _,
         } => {
             let offsets = if *cursor_offset {
@@ -6943,6 +7188,7 @@ fn execute_op_into(
                 &offsets,
                 *theta,
                 1.0,
+                *layout,
                 output(0)?.as_metal()?,
                 rotary::IntoResources {
                     staging: &staging_tensors,
@@ -6953,6 +7199,7 @@ fn execute_op_into(
         }
         MetalOp::RotaryEmbeddingBackward {
             theta,
+            layout,
             implementation: _,
         } => {
             let gradient = input(0)?.as_metal()?;
@@ -6968,6 +7215,7 @@ fn execute_op_into(
                 &[0],
                 *theta,
                 -1.0,
+                *layout,
                 output(0)?.as_metal()?,
                 rotary::IntoResources {
                     staging: &staging_tensors,
@@ -6994,6 +7242,35 @@ fn execute_op_into(
                     )
                 }
             }
+        }
+        MetalOp::QuantizedLinear { .. } => {
+            let MetalCommandPlan::QuantizedLinear(requirements) = plan else {
+                return Err("quantized linear is missing exact requirements".to_string());
+            };
+            quantized::linear_into(
+                input(0)?.as_metal()?,
+                input(1)?.as_metal()?,
+                inputs.get(2).map(Value::as_metal).transpose()?,
+                output(0)?.as_metal()?,
+                requirements,
+            )
+        }
+        MetalOp::QuantizedEmbedding { .. } => {
+            let MetalCommandPlan::QuantizedEmbedding(requirements) = plan else {
+                return Err("quantized embedding is missing exact requirements".to_string());
+            };
+            quantized::embedding_into(
+                input(0)?.as_metal()?,
+                input(1)?.as_metal()?,
+                output(0)?.as_metal()?,
+                status[0].as_metal()?,
+                requirements,
+            )?;
+            quantized_embedding_checks.push(DeferredQuantizedEmbeddingCheck {
+                buffer: status[0].clone(),
+                rows: requirements.rows,
+            });
+            Ok(())
         }
         MetalOp::LinearResidual { implementation } => {
             let x = input(0)?.as_metal()?;
@@ -7065,6 +7342,21 @@ fn execute_op_into(
                     )
                 }
             }
+        }
+        MetalOp::RmsNorm {
+            eps,
+            implementation: MetalImplementation::Native,
+        } => {
+            let MetalCommandPlan::LayerNormForward(requirements) = plan else {
+                return Err("rms_norm is missing exact requirements".to_string());
+            };
+            layer_norm::rms_forward_into(
+                input(0)?.as_metal()?,
+                inputs.get(1).map(Value::as_metal).transpose()?,
+                *eps,
+                output(0)?.as_metal()?,
+                requirements,
+            )
         }
         MetalOp::LayerNormBackward {
             eps,
@@ -7312,6 +7604,47 @@ fn execute_op_into(
         MetalOp::BroadcastTo { shape } => {
             metal_ops::broadcast_to_into(input(0)?.as_metal()?, shape, output(0)?.as_metal()?)
         }
+        MetalOp::LastTokenRow => {
+            let context = kv.ok_or_else(|| {
+                "last token row requires an executable decode context".to_string()
+            })?;
+            let source = input(0)?.as_metal()?;
+            let shape = source.layout.shape();
+            if shape.len() != 3 || shape[0] != 1 {
+                return Err(format!(
+                    "last token row: expected source [1, T, V], got {shape:?}"
+                ));
+            }
+            let (time, width) = (shape[1], shape[2]);
+            let advance = context
+                .slots()
+                .first()
+                .ok_or_else(|| "last token row requires a decode slot".to_string())?
+                .lock()
+                .map_err(|error| format!("last token row sequence lock poisoned: {error}"))?
+                .advance;
+            if advance == 0 || advance > time {
+                return Err(format!(
+                    "last token row: token advance must be in 1..={time}, got {advance}"
+                ));
+            }
+            let strides = source.layout.strides();
+            if strides[2] != 1 {
+                return Err(format!(
+                    "last token row: innermost source stride must be 1, got {strides:?}"
+                ));
+            }
+            let offset = (advance - 1)
+                .checked_mul(strides[1])
+                .and_then(|row| row.checked_add(source.layout.offset()))
+                .ok_or_else(|| "last token row source offset overflow".to_string())?;
+            let row = crate::run::MetalTensor {
+                buffer: source.buffer.clone(),
+                layout: effect_torch_runtime::Layout::new(vec![width], vec![1], offset),
+                dtype: source.dtype,
+            };
+            crate::kernels::copy_into(device::MetalDevice::get(), &row, output(0)?.as_metal()?)
+        }
         MetalOp::PackOptimizerScalars => {
             pack_optimizer_scalars(inputs, &scratch_tensors, output(0)?).map(|_| ())
         }
@@ -7472,6 +7805,174 @@ mod tests {
         .unwrap()
     }
 
+    fn leaf_u8(values: &[u8], shape: Vec<usize>) -> Arc<Node> {
+        Node::new(NodeKind::Leaf(Arc::new(LeafSlot::new(Value(
+            crate::run::MetalTensor {
+                buffer: device::MetalDevice::get().upload_bytes(values),
+                layout: effect_torch_runtime::Layout::contiguous(shape),
+                dtype: DType::U8,
+            },
+        )))))
+        .unwrap()
+    }
+
+    fn leaf_i64(values: &[i64], shape: Vec<usize>) -> Arc<Node> {
+        let bytes = values
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect::<Vec<_>>();
+        Node::new(NodeKind::Leaf(Arc::new(LeafSlot::new(Value(
+            crate::run::MetalTensor {
+                buffer: device::MetalDevice::get().upload_bytes(&bytes),
+                layout: effect_torch_runtime::Layout::contiguous(shape),
+                dtype: DType::I64,
+            },
+        )))))
+        .unwrap()
+    }
+
+    struct QuantizedFixture {
+        codec: GgmlKQuant,
+        bytes: Vec<u8>,
+        group_width: usize,
+        expected_groups: Vec<f32>,
+    }
+
+    impl QuantizedFixture {
+        fn expected(&self) -> Vec<f32> {
+            self.expected_groups
+                .iter()
+                .flat_map(|value| std::iter::repeat_n(*value, self.group_width))
+                .collect()
+        }
+    }
+
+    fn quantized_fixtures() -> Vec<QuantizedFixture> {
+        let mut q2 = vec![0u8; 84];
+        for (index, value) in q2[..16].iter_mut().enumerate() {
+            *value = 0x10 | ((index % 15 + 1) as u8);
+        }
+        q2[16..80].fill(0xe4);
+        q2[80..84].copy_from_slice(&[0x00, 0x3c, 0x00, 0x38]);
+
+        let mut q3 = vec![0u8; 110];
+        q3[..32].fill(0xaa);
+        q3[32..96].fill(0xe4);
+        q3[96..104].fill(0x11);
+        q3[104..108].fill(0xaa);
+        q3[108..110].copy_from_slice(&[0x00, 0x3c]);
+
+        let scale_min = |length: usize, quant_offset: usize, high_offset: Option<usize>| {
+            let mut bytes = vec![0u8; length];
+            bytes[..4].copy_from_slice(&[0x00, 0x3c, 0x00, 0x38]);
+            bytes[4..8].fill(1);
+            bytes[8..12].fill(2);
+            bytes[12..16].fill(0x21);
+            if let Some(offset) = high_offset {
+                bytes[offset..offset + 32].fill(0x99);
+            }
+            bytes[quant_offset..].fill(0xe4);
+            bytes
+        };
+
+        let mut q6 = vec![0u8; 210];
+        q6[..192].fill(0xe4);
+        for (index, value) in q6[192..208].iter_mut().enumerate() {
+            *value = (index + 1) as u8;
+        }
+        q6[208..210].copy_from_slice(&[0x00, 0x38]);
+
+        vec![
+            QuantizedFixture {
+                codec: GgmlKQuant::Q2K,
+                bytes: q2,
+                group_width: 16,
+                expected_groups: vec![
+                    -0.5, -0.5, 2.5, 3.5, 9.5, 11.5, 20.5, 23.5, -0.5, -0.5, 10.5, 11.5, 25.5,
+                    27.5, 44.5, 2.5,
+                ],
+            },
+            QuantizedFixture {
+                codec: GgmlKQuant::Q3K,
+                bytes: q3,
+                group_width: 16,
+                expected_groups: vec![
+                    -4.0, -4.0, 1.0, 1.0, -2.0, -2.0, 3.0, 3.0, -4.0, -4.0, 1.0, 1.0, -2.0, -2.0,
+                    3.0, 3.0,
+                ],
+            },
+            QuantizedFixture {
+                codec: GgmlKQuant::Q4K,
+                bytes: scale_min(144, 16, None),
+                group_width: 32,
+                expected_groups: vec![3.0, 13.0, 3.0, 13.0, 3.0, 13.0, 3.0, 13.0],
+            },
+            QuantizedFixture {
+                codec: GgmlKQuant::Q5K,
+                bytes: scale_min(176, 48, Some(16)),
+                group_width: 32,
+                expected_groups: vec![19.0, 13.0, 3.0, 29.0, 19.0, 13.0, 3.0, 29.0],
+            },
+            QuantizedFixture {
+                codec: GgmlKQuant::Q6K,
+                bytes: q6,
+                group_width: 16,
+                expected_groups: vec![
+                    -14.0, -28.0, -18.0, -24.0, 35.0, 42.0, 105.0, 120.0, -126.0, -140.0, -66.0,
+                    -72.0, 91.0, 98.0, 225.0, 240.0,
+                ],
+            },
+        ]
+    }
+
+    fn assert_quantized_close(actual: &[f32], expected: &[f32]) {
+        assert_eq!(actual.len(), expected.len());
+        for (index, (&actual, &expected)) in actual.iter().zip(expected).enumerate() {
+            let tolerance = 1e-4 * expected.abs().max(1.0);
+            assert!(
+                (actual - expected).abs() <= tolerance,
+                "value {index}: {actual} differs from {expected} by more than {tolerance}"
+            );
+        }
+    }
+
+    fn assert_quantized_embedding_has_status_validation(compilation: &MetalCompilation) {
+        let commands = compilation.executable.commands();
+        assert_eq!(commands.len(), 1);
+        let command = commands[0];
+        assert!(matches!(
+            operation(command),
+            (
+                MetalOp::QuantizedEmbedding { .. },
+                MetalCommandPlan::QuantizedEmbedding(_)
+            )
+        ));
+        assert_eq!(command.status.len(), 1);
+        assert_eq!(
+            compilation.executable.physical.as_ref(),
+            [
+                MetalPhysicalCommand::Encode(command.id),
+                MetalPhysicalCommand::StatusGate(command.id),
+                MetalPhysicalCommand::Commit,
+                MetalPhysicalCommand::Complete,
+            ]
+        );
+        assert_eq!(compilation.executable.diagnostics.command_count, 1);
+        assert_eq!(compilation.executable.diagnostics.synchronization_count, 1);
+        assert!(compilation.executable.program.values.iter().any(|value| {
+            matches!(
+                &value.declaration.storage,
+                ValueStorage::Fixed {
+                    class: StorageClass::DeviceStatus,
+                    ..
+                } | ValueStorage::Planned {
+                    class: StorageClass::DeviceStatus,
+                    ..
+                }
+            )
+        }));
+    }
+
     fn scalar(value: f32) -> Arc<Node> {
         Node::new(NodeKind::Reshape {
             a: leaf(vec![value]),
@@ -7508,6 +8009,236 @@ mod tests {
             },
         )
         .unwrap()
+    }
+
+    #[test]
+    fn quantized_linear_executes_every_codec_for_single_and_multiple_vectors() {
+        for fixture in quantized_fixtures() {
+            let columns = 512usize;
+            let decoded = fixture
+                .expected()
+                .into_iter()
+                .cycle()
+                .take(columns)
+                .collect::<Vec<_>>();
+            for vectors in [1usize, 3, 4, 5, 16, 17] {
+                let input_values = (0..vectors * columns)
+                    .map(|index| ((index * 7 + index / columns * 3) % 17) as f32 * 0.125 - 1.0)
+                    .collect::<Vec<_>>();
+                let packed = fixture
+                    .bytes
+                    .iter()
+                    .copied()
+                    .cycle()
+                    .take(fixture.bytes.len() * 4)
+                    .collect::<Vec<_>>();
+                let bias = (vectors == 1).then(|| leaf_shape(vec![0.25, -0.5], vec![2]));
+                let root = Node::new(NodeKind::QuantizedLinear {
+                    x: leaf_shape(input_values.clone(), vec![vectors, columns]),
+                    weight: leaf_u8(&packed, vec![2, fixture.bytes.len() * 2]),
+                    bias,
+                    codec: fixture.codec,
+                    weight_shape: [2, columns],
+                })
+                .unwrap();
+                let compilation = compile_graph(&[root], false);
+                let actual = run(&compilation)[0].to_f32_vec().unwrap();
+                let mut expected = Vec::with_capacity(vectors * 2);
+                for vector in 0..vectors {
+                    let dot = input_values[vector * columns..(vector + 1) * columns]
+                        .iter()
+                        .zip(&decoded)
+                        .fold(0.0f32, |sum, (&input, &weight)| sum + input * weight);
+                    if vectors == 1 {
+                        expected.extend([dot + 0.25, dot - 0.5]);
+                    } else {
+                        expected.extend([dot, dot]);
+                    }
+                }
+                assert_quantized_close(&actual, &expected);
+            }
+        }
+    }
+
+    #[test]
+    fn quantized_embedding_executes_every_codec_for_u32_and_i64_indexes() {
+        for fixture in quantized_fixtures() {
+            let expected_row = fixture.expected();
+            let mut packed = vec![0u8; fixture.bytes.len() * 3];
+            packed[fixture.bytes.len()..fixture.bytes.len() * 2].copy_from_slice(&fixture.bytes);
+            for i64_indexes in [false, true] {
+                let indexes = if i64_indexes {
+                    leaf_i64(&[1, 1], vec![2])
+                } else {
+                    leaf_u32(&[1, 1], vec![2])
+                };
+                let root = Node::new(NodeKind::QuantizedEmbedding {
+                    indexes,
+                    weight: leaf_u8(&packed, vec![3, fixture.bytes.len()]),
+                    codec: fixture.codec,
+                    weight_shape: [3, 256],
+                    padding_index: None,
+                })
+                .unwrap();
+                let compilation = compile_graph(&[root], false);
+                assert_quantized_embedding_has_status_validation(&compilation);
+                let actual = run(&compilation)[0].to_f32_vec().unwrap();
+                let expected = expected_row
+                    .iter()
+                    .chain(&expected_row)
+                    .copied()
+                    .collect::<Vec<_>>();
+                assert_quantized_close(&actual, &expected);
+            }
+        }
+    }
+
+    #[test]
+    fn mixed_codec_graph_has_metal_commands_without_fallback_allocations_or_intermediate_syncs() {
+        let fixtures = quantized_fixtures();
+        let q2 = &fixtures[0];
+        let q6 = &fixtures[4];
+        let linear = Node::new(NodeKind::QuantizedLinear {
+            x: leaf_shape(vec![1.0; 256], vec![1, 256]),
+            weight: leaf_u8(&q2.bytes, vec![1, q2.bytes.len()]),
+            bias: None,
+            codec: q2.codec,
+            weight_shape: [1, 256],
+        })
+        .unwrap();
+        let embedding = Node::new(NodeKind::QuantizedEmbedding {
+            indexes: leaf_u32(&[0], vec![1]),
+            weight: leaf_u8(&q6.bytes, vec![1, q6.bytes.len()]),
+            codec: q6.codec,
+            weight_shape: [1, 256],
+            padding_index: None,
+        })
+        .unwrap();
+        let compilation = compile_graph(&[linear, embedding], false);
+        assert_eq!(compilation.executable.diagnostics.command_count, 2);
+        assert_eq!(compilation.executable.diagnostics.pipeline_count, 2);
+        assert_eq!(compilation.executable.diagnostics.synchronization_count, 1);
+        let commands = compilation.executable.commands();
+        assert!(commands[0].status.is_empty());
+        assert_eq!(commands[1].status.len(), 1);
+        assert_eq!(
+            compilation.executable.physical.as_ref(),
+            [
+                MetalPhysicalCommand::Encode(commands[0].id),
+                MetalPhysicalCommand::Encode(commands[1].id),
+                MetalPhysicalCommand::StatusGate(commands[1].id),
+                MetalPhysicalCommand::Commit,
+                MetalPhysicalCommand::Complete,
+            ]
+        );
+        assert!(compilation.executable.program.values.iter().any(|value| {
+            matches!(
+                &value.declaration.storage,
+                ValueStorage::Fixed {
+                    class: StorageClass::DeviceStatus,
+                    ..
+                } | ValueStorage::Planned {
+                    class: StorageClass::DeviceStatus,
+                    ..
+                }
+            )
+        }));
+        assert!(matches!(
+            operation(commands[0]),
+            (
+                MetalOp::QuantizedLinear {
+                    codec: GgmlKQuant::Q2K,
+                    ..
+                },
+                MetalCommandPlan::QuantizedLinear(_)
+            )
+        ));
+        assert!(matches!(
+            operation(commands[1]),
+            (
+                MetalOp::QuantizedEmbedding {
+                    codec: GgmlKQuant::Q6K,
+                    ..
+                },
+                MetalCommandPlan::QuantizedEmbedding(_)
+            )
+        ));
+
+        let allocations = device::EXECUTABLE_ALLOCATION_ATTEMPTS.load(Ordering::Relaxed);
+        let misses = device::EXECUTABLE_PIPELINE_MISS_ATTEMPTS.load(Ordering::Relaxed);
+        let dispatches = device::DISPATCHES.load(Ordering::Relaxed);
+        let synchronizations = device::SYNCS.load(Ordering::Relaxed);
+        let output = run(&compilation);
+        assert_eq!(
+            device::EXECUTABLE_ALLOCATION_ATTEMPTS.load(Ordering::Relaxed),
+            allocations
+        );
+        assert_eq!(
+            device::EXECUTABLE_PIPELINE_MISS_ATTEMPTS.load(Ordering::Relaxed),
+            misses
+        );
+        assert!(device::DISPATCHES.load(Ordering::Relaxed) >= dispatches + 2);
+        assert!(device::SYNCS.load(Ordering::Relaxed) > synchronizations);
+
+        let q2_expected = q2.expected().iter().sum::<f32>();
+        assert_quantized_close(&output[0].to_f32_vec().unwrap(), &[q2_expected]);
+        assert_quantized_close(&output[1].to_f32_vec().unwrap(), &q6.expected());
+    }
+
+    #[test]
+    fn quantized_embedding_rejects_invalid_indexes_and_execution_observes_cancellation() {
+        let fixture = &quantized_fixtures()[0];
+        for indexes in [
+            leaf_i64(&[-1], vec![1]),
+            leaf_i64(&[1], vec![1]),
+            leaf_u32(&[1], vec![1]),
+        ] {
+            let root = Node::new(NodeKind::QuantizedEmbedding {
+                indexes,
+                weight: leaf_u8(&fixture.bytes, vec![1, fixture.bytes.len()]),
+                codec: fixture.codec,
+                weight_shape: [1, 256],
+                padding_index: None,
+            })
+            .unwrap();
+            let compilation = compile_graph(&[root], false);
+            assert_quantized_embedding_has_status_validation(&compilation);
+            let error = match execute(
+                &compilation.executable,
+                &[],
+                &compilation.generated_bindings,
+                &CancellationFlag::new(),
+                None,
+            ) {
+                Ok(_) => panic!("invalid embedding index unexpectedly succeeded"),
+                Err(error) => error,
+            };
+            assert!(error.contains("index is outside 0..1"));
+        }
+
+        let root = Node::new(NodeKind::QuantizedLinear {
+            x: leaf_shape(vec![1.0; 256], vec![1, 256]),
+            weight: leaf_u8(&fixture.bytes, vec![1, fixture.bytes.len()]),
+            bias: None,
+            codec: fixture.codec,
+            weight_shape: [1, 256],
+        })
+        .unwrap();
+        let compilation = compile_graph(&[root], false);
+        let cancelled = CancellationFlag::new();
+        cancelled.cancel();
+        assert_eq!(
+            execute(
+                &compilation.executable,
+                &[],
+                &compilation.generated_bindings,
+                &cancelled,
+                None,
+            )
+            .err()
+            .unwrap(),
+            "operation aborted"
+        );
     }
 
     #[test]
@@ -7619,6 +8350,7 @@ mod tests {
                 v: input(2),
                 scale: 0.5,
                 causal: true,
+                window: effect_torch_graph::AttentionWindow::Inherit,
             })
             .unwrap();
             let positions = Node::new(NodeKind::PositionEmbedding {
@@ -7635,6 +8367,7 @@ mod tests {
                 &[attention.clone(), positions, attention],
                 None,
                 batch,
+                false,
             )
             .unwrap();
             let compilation = compile_with_state(
@@ -9270,6 +10003,111 @@ mod tests {
         }
     }
 
+    fn last_token_row_schema() -> KvStateSchema {
+        KvStateSchema {
+            max_tokens: 64,
+            block_size: 16,
+            kv_dtype: DType::F32,
+            window: None,
+            batch: 1,
+            layers: 0,
+            kv_heads: 0,
+            head_dim: 0,
+            kda: KdaGeometry::default(),
+            conv: ConvGeometry::default(),
+            cursor_slot: u32::MAX,
+            cursor_tensor: false,
+        }
+    }
+
+    fn last_token_row_context(advance: usize) -> TestDecodeContext {
+        TestDecodeContext {
+            schema: last_token_row_schema(),
+            slots: vec![Arc::new(Mutex::new(SeqState {
+                blocks: Vec::with_capacity(4),
+                head: 0,
+                cursor: 0,
+                advance,
+                last_hash: 0,
+                pending: Vec::new(),
+                kda_states: Vec::new(),
+                conv_states: Vec::new(),
+            }))],
+        }
+    }
+
+    fn compile_last_token_row() -> MetalCompilation {
+        let logits = Node::new(NodeKind::LastTokenRow {
+            a: leaf_shape((0..12).map(|value| value as f32).collect(), vec![1, 3, 4]),
+        })
+        .unwrap();
+        compile_graph_with_state(&[logits], false, last_token_row_schema())
+    }
+
+    #[test]
+    fn last_token_row_copies_the_advanced_row() {
+        let compilation = compile_last_token_row();
+        let context = last_token_row_context(2);
+        let outputs = execute_stateful(
+            &compilation.executable,
+            &[],
+            &compilation.generated_bindings,
+            &CancellationFlag::new(),
+            &context,
+            &|| true,
+        )
+        .unwrap();
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0].shape(), &[4]);
+        assert_eq!(outputs[0].to_f32_vec().unwrap(), [4.0, 5.0, 6.0, 7.0]);
+        assert_eq!(context.slots[0].lock().unwrap().cursor, 2);
+    }
+
+    #[test]
+    fn last_token_row_requires_a_decode_context_and_a_valid_advance() {
+        let logits = Node::new(NodeKind::LastTokenRow {
+            a: leaf_shape((0..12).map(|value| value as f32).collect(), vec![1, 3, 4]),
+        })
+        .unwrap();
+        let stateless = compile_graph(&[logits], false);
+        let error = execute(
+            &stateless.executable,
+            &[],
+            &stateless.generated_bindings,
+            &CancellationFlag::new(),
+            None,
+        )
+        .err()
+        .unwrap();
+        assert_eq!(
+            error,
+            "last_token_row: last token row requires an executable decode context"
+        );
+
+        let compilation = compile_last_token_row();
+
+        for advance in [0, 4] {
+            let context = last_token_row_context(advance);
+            let error = execute_stateful(
+                &compilation.executable,
+                &[],
+                &compilation.generated_bindings,
+                &CancellationFlag::new(),
+                &context,
+                &|| true,
+            )
+            .err()
+            .unwrap();
+            assert_eq!(
+                error,
+                format!(
+                    "last_token_row: last token row: token advance must be in 1..=3, got {advance}"
+                )
+            );
+            assert_eq!(context.slots[0].lock().unwrap().cursor, 0);
+        }
+    }
+
     #[test]
     fn backend_and_cancellation_failures_do_not_commit_recurrent_state() {
         let q = leaf_shape(vec![0.2, 0.4], vec![1, 1, 1, 2]);
@@ -9622,6 +10460,7 @@ mod tests {
             v,
             scale: 0.5,
             causal: true,
+            window: effect_torch_graph::AttentionWindow::Inherit,
         })
         .unwrap();
         let rotary = Node::new(NodeKind::RotaryEmbedding {
@@ -9629,6 +10468,7 @@ mod tests {
             seq_len: 2,
             theta: 10_000.0,
             offset: PositionOffset::Absolute,
+            layout: RotaryLayout::HalfSplit,
         })
         .unwrap();
         let layer_norm = Node::new(NodeKind::LayerNorm {
@@ -9738,6 +10578,7 @@ mod tests {
             v: v.clone(),
             scale: 0.5,
             causal: true,
+            window: effect_torch_graph::AttentionWindow::Inherit,
         })
         .unwrap();
         let backward = Node::new(NodeKind::SdpaBackward {
@@ -9748,6 +10589,7 @@ mod tests {
             fwd: forward,
             scale: 0.5,
             causal: true,
+            window: effect_torch_graph::AttentionWindow::Inherit,
         })
         .unwrap();
         let dk = Node::new(NodeKind::SdpaBackwardOut {

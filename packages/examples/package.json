@@ -6,6 +6,7 @@
   "scripts": {
     "xor": "tsx xor.ts",
     "nano-gpt": "tsx nano-gpt.ts",
+    "muse-glimmer": "tsx muse-glimmer/inference.ts",
     "typecheck": "tsc -p tsconfig.json"
   },
   "dependencies": {

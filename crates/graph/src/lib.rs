@@ -1,4 +1,4 @@
-use effect_torch_runtime::DType;
+use effect_torch_runtime::{DType, GgmlKQuant};
 use std::any::Any;
 use std::error::Error;
 use std::fmt;
@@ -136,8 +136,8 @@ fn conv_check(
     Ok(())
 }
 
-// Validates q [.., T, D], k [.., S, D], v [.., S, Dv] and returns the
-// attention output shape [.., T, Dv]. Leading dims must match exactly.
+// Validates rank-2 attention or q [.., Hq, T, D], k [.., Hkv, S, D],
+// v [.., Hkv, S, Dv] and returns the output shape [.., Hq, T, Dv].
 fn sdpa_check(op: &str, q: &Node, k: &Node, v: &Node) -> Result<Vec<usize>, String> {
     let rank = q.shape.len();
     if rank < 2 || k.shape.len() != rank || v.shape.len() != rank {
@@ -146,11 +146,27 @@ fn sdpa_check(op: &str, q: &Node, k: &Node, v: &Node) -> Result<Vec<usize>, Stri
             q.shape, k.shape, v.shape
         ));
     }
-    if q.shape[..rank - 2] != k.shape[..rank - 2] || q.shape[..rank - 2] != v.shape[..rank - 2] {
+    let leading = if rank < 3 { rank - 2 } else { rank - 3 };
+    if q.shape[..leading] != k.shape[..leading] || q.shape[..leading] != v.shape[..leading] {
         return Err(format!(
             "{op}: leading dims must match, got {:?}, {:?} and {:?}",
             q.shape, k.shape, v.shape
         ));
+    }
+    if rank >= 3 {
+        let q_heads = q.shape[rank - 3];
+        let kv_heads = k.shape[rank - 3];
+        if v.shape[rank - 3] != kv_heads {
+            return Err(format!(
+                "{op}: k and v heads mismatch, got {:?} and {:?}",
+                k.shape, v.shape
+            ));
+        }
+        if kv_heads == 0 || !q_heads.is_multiple_of(kv_heads) {
+            return Err(format!(
+                "{op}: query heads {q_heads} must be divisible by K/V heads {kv_heads}"
+            ));
+        }
     }
     if q.shape[rank - 1] != k.shape[rank - 1] {
         return Err(format!(
@@ -366,6 +382,33 @@ fn conv_out_dim(
 pub enum PositionOffset {
     Absolute,
     Cursor,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum AttentionWindow {
+    Inherit,
+    Full,
+    Local(usize),
+}
+
+impl AttentionWindow {
+    pub const fn resolve(self, inherited: Option<usize>) -> Option<usize> {
+        match self {
+            Self::Inherit => inherited,
+            Self::Full => None,
+            Self::Local(window) => Some(window),
+        }
+    }
+
+    pub const fn local(self) -> Option<usize> {
+        self.resolve(None)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum RotaryLayout {
+    HalfSplit,
+    InterleavedPairs,
 }
 
 pub enum NodeKind {
@@ -613,6 +656,7 @@ pub enum NodeKind {
         v: Arc<Node>,
         scale: f64,
         causal: bool,
+        window: AttentionWindow,
     },
     // Closed-form backward: recomputes P = softmax(scores) from q/k and
     // produces (dq, dk, dv) in one eval; consumers read them through
@@ -630,6 +674,7 @@ pub enum NodeKind {
         fwd: Arc<Node>,
         scale: f64,
         causal: bool,
+        window: AttentionWindow,
     },
     SdpaBackwardOut {
         of: Arc<Node>,
@@ -742,6 +787,16 @@ pub enum NodeKind {
         weight: Arc<Node>,
         layer: u32,
     },
+    // Inference-only decode output selector produced by the decode
+    // rewrite (never written by user code — `compile_decode` with the
+    // last-token-row flag wraps each [1, T, V] root in one). Copies the
+    // row selected by the run's token advance (advance - 1) out of the
+    // sequence dimension, producing [V]; the row index is read from the
+    // decode context at execution, so the graph stays a pure function of
+    // its inputs. Not differentiable and rejected under vmap.
+    LastTokenRow {
+        a: Arc<Node>,
+    },
     // RFC 0016 phase 2 (as-built revision): the chunked head +
     // cross-entropy as one semantic node. Forward semantics are exactly
     // Mean cross-entropy of Linear(x, weight, bias) against target, but
@@ -803,6 +858,7 @@ pub enum NodeKind {
         seq_len: usize,
         theta: f64,
         offset: PositionOffset,
+        layout: RotaryLayout,
     },
     // Backward of RotaryEmbedding (absolute positions only): the
     // transpose rotation, evaluated by the same fused kernel with
@@ -812,6 +868,7 @@ pub enum NodeKind {
         shape: Vec<usize>,
         seq_len: usize,
         theta: f64,
+        layout: RotaryLayout,
     },
     // Layer normalization over the last dim: y = (x − μ)/√(σ² + eps) ·
     // weight + bias. Semantic node (like RotaryEmbedding) so the fused
@@ -821,6 +878,13 @@ pub enum NodeKind {
         x: Arc<Node>,
         weight: Arc<Node>,
         bias: Arc<Node>,
+        eps: f64,
+    },
+    // RMS normalization over the last dimension:
+    // y = x / sqrt(mean(x^2) + eps), optionally multiplied by weight.
+    RmsNorm {
+        x: Arc<Node>,
+        weight: Option<Arc<Node>>,
         eps: f64,
     },
     // Backward of LayerNorm: evaluates dx (its own value) and stores
@@ -844,6 +908,20 @@ pub enum NodeKind {
         x: Arc<Node>,
         weight: Arc<Node>,
         bias: Arc<Node>,
+    },
+    QuantizedLinear {
+        x: Arc<Node>,
+        weight: Arc<Node>,
+        bias: Option<Arc<Node>>,
+        codec: GgmlKQuant,
+        weight_shape: [usize; 2],
+    },
+    QuantizedEmbedding {
+        indexes: Arc<Node>,
+        weight: Arc<Node>,
+        codec: GgmlKQuant,
+        weight_shape: [usize; 2],
+        padding_index: Option<usize>,
     },
     Conv1d {
         x: Arc<Node>,
@@ -1374,14 +1452,48 @@ impl NodeKind {
             NodeKind::CrossEntropyBackward { logits, .. } => {
                 (logits.shape.clone(), logits.dtype, logits.device.clone())
             }
-            NodeKind::Sdpa { q, k, v, .. } => {
+            NodeKind::Sdpa {
+                q,
+                k,
+                v,
+                causal,
+                window,
+                ..
+            } => {
+                if matches!(window, AttentionWindow::Local(0)) {
+                    return Err("sdpa: window must be positive".to_string());
+                }
+                if !causal && !matches!(window, AttentionWindow::Inherit) {
+                    return Err("sdpa: explicit window requires causal attention".to_string());
+                }
                 let out = sdpa_check("sdpa", q, k, v)?;
                 (out, q.dtype, q.device.clone())
             }
             NodeKind::SdpaBackward {
-                q, k, v, g, fwd, ..
+                q,
+                k,
+                v,
+                g,
+                fwd,
+                causal,
+                window,
+                ..
             } => {
+                if matches!(window, AttentionWindow::Local(0)) {
+                    return Err("sdpa backward: window must be positive".to_string());
+                }
+                if !causal && !matches!(window, AttentionWindow::Inherit) {
+                    return Err(
+                        "sdpa backward: explicit window requires causal attention".to_string()
+                    );
+                }
                 let out = sdpa_check("sdpa", q, k, v)?;
+                let rank = q.shape.len();
+                if rank >= 3 && q.shape[rank - 3] != k.shape[rank - 3] {
+                    return Err(
+                        "sdpa backward: grouped-query attention is not differentiable".to_string(),
+                    );
+                }
                 if !matches!(&fwd.kind, NodeKind::Sdpa { .. }) {
                     return Err("sdpa backward: fwd must be an sdpa node".to_string());
                 }
@@ -1485,6 +1597,15 @@ impl NodeKind {
             NodeKind::ConvState { x, weight, .. } => {
                 short_conv_check("conv_state", x, weight)?;
                 (x.shape.clone(), x.dtype, x.device.clone())
+            }
+            NodeKind::LastTokenRow { a } => {
+                if a.shape.len() != 3 || a.shape[0] != 1 {
+                    return Err(format!(
+                        "last_token_row: expected input [1, T, V], got {:?}",
+                        a.shape
+                    ));
+                }
+                (vec![a.shape[2]], a.dtype, a.device.clone())
             }
             NodeKind::ChunkedHeadCe {
                 x,
@@ -1639,6 +1760,100 @@ impl NodeKind {
                 let out = linear_out_shape(&x.shape, &weight.shape, &bias.shape)?;
                 (out, x.dtype, x.device.clone())
             }
+            NodeKind::QuantizedLinear {
+                x,
+                weight,
+                bias,
+                codec,
+                weight_shape: [rows, columns],
+            } => {
+                if x.shape.len() < 2 || x.shape.last() != Some(columns) {
+                    return Err(format!(
+                        "quantized_linear: expected input [.., {columns}], got {:?}",
+                        x.shape
+                    ));
+                }
+                let encoded_row_bytes = codec.encoded_row_bytes(*columns).ok_or_else(|| {
+                    format!(
+                        "quantized_linear: logical row width {columns} is invalid for {}",
+                        codec.name()
+                    )
+                })?;
+                if weight.shape != [*rows, encoded_row_bytes] || weight.dtype != DType::U8 {
+                    return Err(format!(
+                        "quantized_linear: expected packed {} weight [{rows}, {encoded_row_bytes}] u8, got {:?} {:?}",
+                        codec.name(),
+                        weight.shape,
+                        weight.dtype
+                    ));
+                }
+                if x.dtype != DType::F32 {
+                    return Err(format!(
+                        "quantized_linear: input must be f32, got {:?}",
+                        x.dtype
+                    ));
+                }
+                if !x.device.same_device(&weight.device) {
+                    return Err(
+                        "quantized_linear: input and weight must be on the same device".to_string(),
+                    );
+                }
+                if let Some(bias) = bias {
+                    if bias.shape != [*rows]
+                        || bias.dtype != DType::F32
+                        || !bias.device.same_device(&x.device)
+                    {
+                        return Err(format!(
+                            "quantized_linear: bias must be [{rows}] f32 on the input device"
+                        ));
+                    }
+                }
+                let mut out = x.shape.clone();
+                *out.last_mut().expect("validated input rank") = *rows;
+                (out, DType::F32, x.device.clone())
+            }
+            NodeKind::QuantizedEmbedding {
+                indexes,
+                weight,
+                codec,
+                weight_shape: [rows, columns],
+                padding_index,
+            } => {
+                let encoded_row_bytes = codec.encoded_row_bytes(*columns).ok_or_else(|| {
+                    format!(
+                        "quantized_embedding: logical row width {columns} is invalid for {}",
+                        codec.name()
+                    )
+                })?;
+                if weight.shape != [*rows, encoded_row_bytes] || weight.dtype != DType::U8 {
+                    return Err(format!(
+                        "quantized_embedding: expected packed {} weight [{rows}, {encoded_row_bytes}] u8, got {:?} {:?}",
+                        codec.name(),
+                        weight.shape,
+                        weight.dtype
+                    ));
+                }
+                if !matches!(indexes.dtype, DType::I64 | DType::U32) {
+                    return Err(format!(
+                        "quantized_embedding: indexes must be i64 or u32, got {:?}",
+                        indexes.dtype
+                    ));
+                }
+                if !indexes.device.same_device(&weight.device) {
+                    return Err(
+                        "quantized_embedding: indexes and weight must be on the same device"
+                            .to_string(),
+                    );
+                }
+                if padding_index.is_some_and(|index| index >= *rows) {
+                    return Err(format!(
+                        "quantized_embedding: padding index is outside 0..{rows}"
+                    ));
+                }
+                let mut out = indexes.shape.clone();
+                out.push(*columns);
+                (out, DType::F32, indexes.device.clone())
+            }
             NodeKind::LayerNorm {
                 x, weight, bias, ..
             } => {
@@ -1650,6 +1865,24 @@ impl NodeKind {
                         "layer_norm: weight and bias must match the input's trailing dims {:?}, got {:?} and {:?}",
                         x.shape, weight.shape, bias.shape
                     ));
+                }
+                (x.shape.clone(), x.dtype, x.device.clone())
+            }
+            NodeKind::RmsNorm { x, weight, .. } => {
+                if x.shape.is_empty() {
+                    return Err("rms_norm: input must have rank at least 1".to_string());
+                }
+                if let Some(weight) = weight {
+                    if weight.shape != [*x.shape.last().expect("validated input rank")]
+                        || weight.dtype != x.dtype
+                        || !weight.device.same_device(&x.device)
+                    {
+                        return Err(format!(
+                            "rms_norm: weight must be [{}] {:?} on the input device",
+                            x.shape.last().expect("validated input rank"),
+                            x.dtype
+                        ));
+                    }
                 }
                 (x.shape.clone(), x.dtype, x.device.clone())
             }
@@ -2180,16 +2413,32 @@ pub fn node_children(kind: &NodeKind) -> Vec<Arc<Node>> {
             vec![x.clone(), weight.clone(), g.clone()]
         }
         NodeKind::PositionEmbedding { weight, .. } => vec![weight.clone()],
+        NodeKind::LastTokenRow { a } => vec![a.clone()],
         NodeKind::RotaryEmbedding { x, .. } => vec![x.clone()],
         NodeKind::RotaryEmbeddingBackward { g, .. } => vec![g.clone()],
         NodeKind::LayerNorm {
             x, weight, bias, ..
         } => vec![x.clone(), weight.clone(), bias.clone()],
+        NodeKind::RmsNorm { x, weight, .. } => {
+            let mut children = vec![x.clone()];
+            children.extend(weight.iter().cloned());
+            children
+        }
         NodeKind::LayerNormBackward { x, weight, g, .. } => {
             vec![x.clone(), weight.clone(), g.clone()]
         }
         NodeKind::LayerNormBackwardOut { of, .. } => vec![of.clone()],
         NodeKind::Linear { x, weight, bias } => vec![x.clone(), weight.clone(), bias.clone()],
+        NodeKind::QuantizedLinear {
+            x, weight, bias, ..
+        } => {
+            let mut children = vec![x.clone(), weight.clone()];
+            children.extend(bias.iter().cloned());
+            children
+        }
+        NodeKind::QuantizedEmbedding {
+            indexes, weight, ..
+        } => vec![indexes.clone(), weight.clone()],
         NodeKind::SdpaBackward {
             q, k, v, g, fwd, ..
         } => {
@@ -2409,12 +2658,14 @@ pub fn remap_children(kind: &NodeKind, f: &dyn Fn(&Arc<Node>) -> Arc<Node>) -> N
             v,
             scale,
             causal,
+            window,
         } => NodeKind::Sdpa {
             q: f(q),
             k: f(k),
             v: f(v),
             scale: *scale,
             causal: *causal,
+            window: *window,
         },
         NodeKind::SdpaBackward {
             q,
@@ -2424,6 +2675,7 @@ pub fn remap_children(kind: &NodeKind, f: &dyn Fn(&Arc<Node>) -> Arc<Node>) -> N
             fwd,
             scale,
             causal,
+            window,
         } => NodeKind::SdpaBackward {
             q: f(q),
             k: f(k),
@@ -2432,6 +2684,7 @@ pub fn remap_children(kind: &NodeKind, f: &dyn Fn(&Arc<Node>) -> Arc<Node>) -> N
             fwd: f(fwd),
             scale: *scale,
             causal: *causal,
+            window: *window,
         },
         NodeKind::SdpaBackwardOut { of, index } => NodeKind::SdpaBackwardOut {
             of: f(of),
@@ -2497,6 +2750,7 @@ pub fn remap_children(kind: &NodeKind, f: &dyn Fn(&Arc<Node>) -> Arc<Node>) -> N
             weight: f(weight),
             layer: *layer,
         },
+        NodeKind::LastTokenRow { a } => NodeKind::LastTokenRow { a: f(a) },
         NodeKind::ChunkedHeadCe {
             x,
             weight,
@@ -2565,22 +2819,26 @@ pub fn remap_children(kind: &NodeKind, f: &dyn Fn(&Arc<Node>) -> Arc<Node>) -> N
             seq_len,
             theta,
             offset,
+            layout,
         } => NodeKind::RotaryEmbedding {
             x: f(x),
             seq_len: *seq_len,
             theta: *theta,
             offset: *offset,
+            layout: *layout,
         },
         NodeKind::RotaryEmbeddingBackward {
             g,
             shape,
             seq_len,
             theta,
+            layout,
         } => NodeKind::RotaryEmbeddingBackward {
             g: f(g),
             shape: shape.clone(),
             seq_len: *seq_len,
             theta: *theta,
+            layout: *layout,
         },
         NodeKind::LayerNorm {
             x,
@@ -2591,6 +2849,11 @@ pub fn remap_children(kind: &NodeKind, f: &dyn Fn(&Arc<Node>) -> Arc<Node>) -> N
             x: f(x),
             weight: f(weight),
             bias: f(bias),
+            eps: *eps,
+        },
+        NodeKind::RmsNorm { x, weight, eps } => NodeKind::RmsNorm {
+            x: f(x),
+            weight: weight.as_ref().map(f),
             eps: *eps,
         },
         NodeKind::LayerNormBackward { x, weight, g, eps } => NodeKind::LayerNormBackward {
@@ -2607,6 +2870,32 @@ pub fn remap_children(kind: &NodeKind, f: &dyn Fn(&Arc<Node>) -> Arc<Node>) -> N
             x: f(x),
             weight: f(weight),
             bias: f(bias),
+        },
+        NodeKind::QuantizedLinear {
+            x,
+            weight,
+            bias,
+            codec,
+            weight_shape,
+        } => NodeKind::QuantizedLinear {
+            x: f(x),
+            weight: f(weight),
+            bias: bias.as_ref().map(f),
+            codec: *codec,
+            weight_shape: *weight_shape,
+        },
+        NodeKind::QuantizedEmbedding {
+            indexes,
+            weight,
+            codec,
+            weight_shape,
+            padding_index,
+        } => NodeKind::QuantizedEmbedding {
+            indexes: f(indexes),
+            weight: f(weight),
+            codec: *codec,
+            weight_shape: *weight_shape,
+            padding_index: *padding_index,
         },
         NodeKind::Conv1d {
             x,
@@ -2937,5 +3226,103 @@ mod tests {
         .err()
         .unwrap();
         assert!(error.contains("f64 is not supported on device metal"));
+    }
+
+    #[test]
+    fn last_token_row_validates_rank_and_row_contract() {
+        let input = Node::new(NodeKind::Input {
+            slot: 0,
+            shape: vec![1, 7, 16],
+            dtype: DType::F32,
+            device: Device::Cpu,
+        })
+        .unwrap();
+        let row = Node::new(NodeKind::LastTokenRow { a: input.clone() }).unwrap();
+        assert_eq!(row.shape, [16]);
+        assert_eq!(row.dtype, DType::F32);
+        assert!(row.device.is_cpu());
+        assert_eq!(node_children(&row.kind).len(), 1);
+
+        let remapped = remap_children(&row.kind, &|_| input.clone());
+        let NodeKind::LastTokenRow { a } = &remapped else {
+            panic!("remap preserves the last-token-row kind")
+        };
+        assert!(Arc::ptr_eq(a, &input));
+
+        for shape in [vec![7, 16], vec![2, 7, 16], vec![1, 7, 16, 1]] {
+            let error = Node::new(NodeKind::LastTokenRow {
+                a: Node::new(NodeKind::Input {
+                    slot: 0,
+                    shape: shape.clone(),
+                    dtype: DType::F32,
+                    device: Device::Cpu,
+                })
+                .unwrap(),
+            })
+            .err()
+            .unwrap();
+            assert_eq!(
+                error,
+                format!("last_token_row: expected input [1, T, V], got {shape:?}")
+            );
+        }
+    }
+
+    #[test]
+    fn quantized_nodes_validate_packed_geometry_and_preserve_logical_outputs() {
+        let input = Node::new(NodeKind::Input {
+            slot: 0,
+            shape: vec![2, 256],
+            dtype: DType::F32,
+            device: Device::Cpu,
+        })
+        .unwrap();
+        let packed = Node::new(NodeKind::Input {
+            slot: 1,
+            shape: vec![3, 144],
+            dtype: DType::U8,
+            device: Device::Cpu,
+        })
+        .unwrap();
+        let linear = Node::new(NodeKind::QuantizedLinear {
+            x: input,
+            weight: packed.clone(),
+            bias: None,
+            codec: GgmlKQuant::Q4K,
+            weight_shape: [3, 256],
+        })
+        .unwrap();
+        assert_eq!(linear.shape, [2, 3]);
+        assert_eq!(linear.dtype, DType::F32);
+        assert_eq!(node_children(&linear.kind).len(), 2);
+
+        let indexes = Node::new(NodeKind::Input {
+            slot: 2,
+            shape: vec![2, 4],
+            dtype: DType::U32,
+            device: Device::Cpu,
+        })
+        .unwrap();
+        let embedding = Node::new(NodeKind::QuantizedEmbedding {
+            indexes,
+            weight: packed.clone(),
+            codec: GgmlKQuant::Q4K,
+            weight_shape: [3, 256],
+            padding_index: Some(2),
+        })
+        .unwrap();
+        assert_eq!(embedding.shape, [2, 4, 256]);
+        assert_eq!(embedding.dtype, DType::F32);
+
+        let invalid = Node::new(NodeKind::QuantizedEmbedding {
+            indexes: embedding,
+            weight: packed,
+            codec: GgmlKQuant::Q5K,
+            weight_shape: [3, 256],
+            padding_index: None,
+        })
+        .err()
+        .unwrap();
+        assert!(invalid.contains("expected packed Q5_K weight [3, 176] u8"));
     }
 }

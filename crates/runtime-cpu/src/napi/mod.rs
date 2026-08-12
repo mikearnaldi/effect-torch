@@ -1,4 +1,5 @@
 mod err;
+mod gguf;
 mod safetensors;
 mod value;
 
@@ -10,9 +11,9 @@ use effect_torch_compiler::{
     ProgramRequest, ProgramSlot, StateCursorSlot,
 };
 use effect_torch_graph::CrossEntropyReduction as CeReduction;
-use effect_torch_graph::{Device, PositionOffset};
+use effect_torch_graph::{AttentionWindow, Device, PositionOffset, RotaryLayout};
 use effect_torch_napi::{try_register_export, unregister_export, vec_to_bytes, CancellationState};
-use effect_torch_runtime::{Buffer, CancellationFlag, DType, Layout};
+use effect_torch_runtime::{Buffer, CancellationFlag, DType, GgmlKQuant, Layout};
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -27,6 +28,40 @@ type ConvGeometry = effect_torch_compiler::ConvGeometry;
 
 fn cpu_device() -> Device {
     Device::Cpu
+}
+
+fn attention_window(value: i64) -> Result<AttentionWindow> {
+    match value {
+        -1 => Ok(AttentionWindow::Inherit),
+        0 => Ok(AttentionWindow::Full),
+        value if value > 0 => usize::try_from(value)
+            .map(AttentionWindow::Local)
+            .map_err(|_| Error::new(Status::InvalidArg, "attention window is out of range")),
+        _ => Err(Error::new(
+            Status::InvalidArg,
+            "attention window must encode inherit, full, or a positive size",
+        )),
+    }
+}
+
+fn rotary_layout(value: &str) -> Result<RotaryLayout> {
+    match value {
+        "HalfSplit" => Ok(RotaryLayout::HalfSplit),
+        "InterleavedPairs" => Ok(RotaryLayout::InterleavedPairs),
+        _ => Err(Error::new(
+            Status::InvalidArg,
+            format!("unsupported rotary layout {value}"),
+        )),
+    }
+}
+
+fn ggml_k_quant(value: &str) -> Result<GgmlKQuant> {
+    GgmlKQuant::from_name(value).ok_or_else(|| {
+        Error::new(
+            Status::InvalidArg,
+            format!("unsupported GGML K-quant encoding {value}"),
+        )
+    })
 }
 
 enum FinalizeHint {
@@ -166,6 +201,7 @@ pub struct NativeKvStateSchema {
     pub kv_dtype: NativeDType,
     pub window: Option<u32>,
     pub batch: u32,
+    pub last_token_row: Option<bool>,
 }
 
 #[napi(object)]
@@ -1048,6 +1084,7 @@ impl LazyTensor {
         v: &LazyTensor,
         scale: f64,
         causal: bool,
+        window: i64,
     ) -> Result<Self> {
         lazy_ctor!(Node::new(NodeKind::Sdpa {
             q: self.node.clone(),
@@ -1055,6 +1092,7 @@ impl LazyTensor {
             v: v.node.clone(),
             scale,
             causal,
+            window: attention_window(window)?,
         }))
     }
 
@@ -1094,12 +1132,13 @@ impl LazyTensor {
     }
 
     #[napi]
-    pub fn rotary_embedding(&self, seq_len: u32, theta: f64) -> Result<Self> {
+    pub fn rotary_embedding(&self, seq_len: u32, theta: f64, layout: String) -> Result<Self> {
         lazy_ctor!(Node::new(NodeKind::RotaryEmbedding {
             x: self.node.clone(),
             seq_len: seq_len as usize,
             theta,
             offset: PositionOffset::Absolute,
+            layout: rotary_layout(&layout)?,
         }))
     }
 
@@ -1114,11 +1153,56 @@ impl LazyTensor {
     }
 
     #[napi]
+    pub fn rms_norm(&self, weight: Option<&LazyTensor>, eps: f64) -> Result<Self> {
+        lazy_ctor!(Node::new(NodeKind::RmsNorm {
+            x: self.node.clone(),
+            weight: weight.map(|value| value.node.clone()),
+            eps,
+        }))
+    }
+
+    #[napi]
     pub fn linear(&self, weight: &LazyTensor, bias: &LazyTensor) -> Result<Self> {
         lazy_ctor!(Node::new(NodeKind::Linear {
             x: self.node.clone(),
             weight: weight.node.clone(),
             bias: bias.node.clone(),
+        }))
+    }
+
+    #[napi]
+    pub fn quantized_linear(
+        &self,
+        weight: &LazyTensor,
+        bias: Option<&LazyTensor>,
+        encoding: String,
+        rows: u32,
+        columns: u32,
+    ) -> Result<Self> {
+        lazy_ctor!(Node::new(NodeKind::QuantizedLinear {
+            x: self.node.clone(),
+            weight: weight.node.clone(),
+            bias: bias.map(|value| value.node.clone()),
+            codec: ggml_k_quant(&encoding)?,
+            weight_shape: [rows as usize, columns as usize],
+        }))
+    }
+
+    #[napi]
+    pub fn quantized_embedding(
+        &self,
+        weight: &LazyTensor,
+        encoding: String,
+        rows: u32,
+        columns: u32,
+        padding_index: Option<u32>,
+    ) -> Result<Self> {
+        lazy_ctor!(Node::new(NodeKind::QuantizedEmbedding {
+            indexes: self.node.clone(),
+            weight: weight.node.clone(),
+            codec: ggml_k_quant(&encoding)?,
+            weight_shape: [rows as usize, columns as usize],
+            padding_index: padding_index.map(|value| value as usize),
         }))
     }
 
@@ -1557,6 +1641,7 @@ struct KvStateSchema {
     block_size: usize,
     kv_dtype: DType,
     window: Option<usize>,
+    allows_window_eviction: bool,
     batch: usize,
     layers: usize,
     kv_heads: usize,
@@ -1591,18 +1676,25 @@ impl KvStateSchema {
                 format!("compile: unsupported KV state dtype {}", kv_dtype.name()),
             ));
         }
-        let window = schema.window.map(|window| window as usize);
-        if window.is_some_and(|window| window == 0 || window > max_tokens) {
+        let requested_window = schema.window.map(|window| window as usize);
+        if requested_window.is_some_and(|window| window == 0 || window > max_tokens) {
             return Err(Error::new(
                 Status::InvalidArg,
                 "compile: KV window must be in 1..=max_tokens",
             ));
         }
+        let allows_window_eviction = geometry.allows_window_eviction;
+        let window = if allows_window_eviction {
+            requested_window
+        } else {
+            None
+        };
         Ok(Self {
             max_tokens,
             block_size,
             kv_dtype,
             window,
+            allows_window_eviction,
             batch,
             layers: geometry.layers,
             kv_heads: geometry.kv_heads,
@@ -1843,7 +1935,8 @@ pub fn compile(
             }
             let batch = native.batch as usize;
             let window = native.window.map(|window| window as usize);
-            let (rewritten, geometry) = specialize_decode(&roots, window, batch)
+            let last_token_row = native.last_token_row.unwrap_or(false);
+            let (rewritten, geometry) = specialize_decode(&roots, window, batch, last_token_row)
                 .map_err(|error| Error::new(Status::GenericFailure, error))?;
             roots = rewritten;
             state_cursor = Some(geometry.state_cursor());
@@ -2234,6 +2327,7 @@ struct KvContext {
     pool: Arc<PoolInner>,
     slots: Vec<Arc<Mutex<SeqState>>>,
     active_batch: usize,
+    window: Option<usize>,
     kda: KdaGeometry,
     conv: ConvGeometry,
     transaction: Mutex<Option<CpuStateTransaction>>,
@@ -2382,6 +2476,9 @@ impl executable::CpuState for Arc<KvContext> {
                     &mut state_outputs[0],
                 )
             }
+            executable::CpuOp::LastTokenRow => {
+                last_token_row_into(&inputs[0], transaction.advances[0], &mut outputs[0])
+            }
             executable::CpuOp::KvAttention {
                 scale,
                 layer,
@@ -2397,13 +2494,16 @@ impl executable::CpuState for Arc<KvContext> {
                 &mut outputs[0],
                 &mut transaction.eviction_starts,
             ),
-            executable::CpuOp::RotaryEmbedding { theta, .. } => composed::rotary_forward_into(
-                inputs[0].tensor(),
-                &transaction.cursors,
-                *theta,
-                1.0,
-                &mut outputs[0],
-            ),
+            executable::CpuOp::RotaryEmbedding { theta, layout, .. } => {
+                composed::rotary_forward_into(
+                    inputs[0].tensor(),
+                    &transaction.cursors,
+                    *theta,
+                    1.0,
+                    *layout,
+                    &mut outputs[0],
+                )
+            }
             _ => Err("state adapter received a non-state CPU command".to_string()),
         }
     }
@@ -2609,6 +2709,48 @@ fn prepare_conv_staging(context: &KvContext, layer: u32, staging: &Value) -> err
         }
     })?;
     Ok(())
+}
+
+fn last_token_row_into_impl<T: Elem>(
+    source: &Tensor,
+    advance: usize,
+    destination: &mut CpuDestination<'_>,
+) -> err::Res<()> {
+    let shape = source.shape();
+    if shape.len() != 3 || shape[0] != 1 || destination.shape() != [shape[2]] {
+        return Err("last token row: state command geometry must be [1, T, V] -> [V]".to_string());
+    }
+    let (steps, width) = (shape[1], shape[2]);
+    if advance == 0 || advance > steps {
+        return Err(format!(
+            "last token row: token advance must be in 1..={steps}, got {advance}"
+        ));
+    }
+    let row = advance - 1;
+    destination.write::<T, _>("last token row", &[width], |output| {
+        for (column, value) in output.iter_mut().enumerate() {
+            *value = tensor_element::<T>(source, row * width + column, "last token row")
+                .expect("source dtype and layout were validated");
+        }
+    })
+}
+
+fn last_token_row_into(
+    source: &Value,
+    advance: usize,
+    destination: &mut CpuDestination<'_>,
+) -> err::Res<()> {
+    match source.tensor().dtype() {
+        DType::F32 => last_token_row_into_impl::<f32>(source.tensor(), advance, destination),
+        DType::F64 => last_token_row_into_impl::<f64>(source.tensor(), advance, destination),
+        DType::F16 => last_token_row_into_impl::<half::f16>(source.tensor(), advance, destination),
+        DType::BF16 => {
+            last_token_row_into_impl::<half::bf16>(source.tensor(), advance, destination)
+        }
+        DType::U8 => last_token_row_into_impl::<u8>(source.tensor(), advance, destination),
+        DType::U32 => last_token_row_into_impl::<u32>(source.tensor(), advance, destination),
+        DType::I64 => last_token_row_into_impl::<i64>(source.tensor(), advance, destination),
+    }
 }
 
 fn conv_state_into_impl<T: Elem>(
@@ -2853,19 +2995,32 @@ fn kv_attention_into(
         || q.dtype() != DType::F32
         || k.dtype() != DType::F32
         || v.dtype() != DType::F32
-        || k.shape() != dimensions
-        || v.shape() != dimensions
+        || k.shape().len() != rank
+        || v.shape().len() != rank
         || output.shape() != dimensions
         || output.dtype() != DType::F32
     {
         return Err("kv attention: expected matching rank-4-or-higher f32 tensors".to_string());
     }
     let batch = dimensions[..rank - 3].iter().product::<usize>();
-    let (heads, tokens, width) = (
+    let (query_heads, tokens, width) = (
         dimensions[rank - 3],
         dimensions[rank - 2],
         dimensions[rank - 1],
     );
+    let kv_heads = k.shape()[rank - 3];
+    if k.shape()[..rank - 3] != dimensions[..rank - 3]
+        || v.shape()[..rank - 3] != dimensions[..rank - 3]
+        || v.shape()[rank - 3] != kv_heads
+        || kv_heads == 0
+        || !query_heads.is_multiple_of(kv_heads)
+        || k.shape()[rank - 2] != tokens
+        || v.shape()[rank - 2] != tokens
+        || k.shape()[rank - 1] != width
+        || v.shape()[rank - 1] != width
+    {
+        return Err("kv attention: incompatible grouped-query q/k/v shapes".to_string());
+    }
     if batch != context.slots.len() {
         return Err(format!(
             "kv attention: batch {batch} does not match {} kv slots",
@@ -2883,8 +3038,8 @@ fn kv_attention_into(
                 &context.pool,
                 &mut state,
                 layer_index,
-                window,
-                heads,
+                context.window,
+                kv_heads,
                 width,
                 tokens,
             )?;
@@ -2896,7 +3051,8 @@ fn kv_attention_into(
 
             let input_value =
                 |value: &Value, token: usize, head: usize, column: usize| -> err::Res<f32> {
-                    let logical = ((batch_index * heads + head) * tokens + token) * width + column;
+                    let logical =
+                        ((batch_index * kv_heads + head) * tokens + token) * width + column;
                     tensor_element::<f32>(value.tensor(), logical, "kv attention input")
                 };
             if context.pool.k[layer_index].dtype == DType::U8 {
@@ -2916,14 +3072,14 @@ fn kv_attention_into(
                         slab.write(|mut quantized| -> err::Res<()> {
                             for token in 0..advance {
                                 let row = physical(cursor + token) as usize;
-                                for head in 0..heads {
+                                for head in 0..kv_heads {
                                     let mut maximum = 0.0f32;
                                     for column in 0..width {
                                         maximum = maximum
                                             .max(input_value(value, token, head, column)?.abs());
                                     }
                                     let scale = maximum / 127.0 + 1e-12;
-                                    scale_values.set_f32(row * heads + head, scale);
+                                    scale_values.set_f32(row * kv_heads + head, scale);
                                     for column in 0..width {
                                         let value = (input_value(value, token, head, column)?
                                             / scale)
@@ -2931,7 +3087,7 @@ fn kv_attention_into(
                                             .clamp(-127.0, 127.0)
                                             + 128.0;
                                         quantized.set_u8(
-                                            (row * heads + head) * width + column,
+                                            (row * kv_heads + head) * width + column,
                                             value as u8,
                                         );
                                     }
@@ -2949,10 +3105,10 @@ fn kv_attention_into(
                     slab.write(|mut destination| -> err::Res<()> {
                         for token in 0..advance {
                             let row = physical(cursor + token) as usize;
-                            for head in 0..heads {
+                            for head in 0..kv_heads {
                                 for column in 0..width {
                                     destination.set_f32(
-                                        (row * heads + head) * width + column,
+                                        (row * kv_heads + head) * width + column,
                                         input_value(value, token, head, column)?,
                                     );
                                 }
@@ -2963,9 +3119,6 @@ fn kv_attention_into(
                 }
             }
 
-            let context_length = cursor + tokens - start;
-            let available = needed.saturating_sub(start);
-            let query_offset = context_length.saturating_sub(tokens);
             let mut attend = |keys: &pool::SlabReader<'_>,
                               values: &pool::SlabReader<'_>,
                               key_scales: Option<&pool::SlabReader<'_>>,
@@ -2973,61 +3126,61 @@ fn kv_attention_into(
              -> err::Res<()> {
                 let cached = |reader: &pool::SlabReader<'_>,
                               scales: Option<&pool::SlabReader<'_>>,
-                              key_index: usize,
+                              position: usize,
                               head: usize,
                               column: usize|
                  -> f32 {
-                    let row = physical(start + key_index) as usize;
-                    let raw = reader.get_f32((row * heads + head) * width + column);
+                    let row = physical(position) as usize;
+                    let raw = reader.get_f32((row * kv_heads + head) * width + column);
                     scales.map_or(raw, |scales| {
-                        (raw - 128.0) * scales.get_f32(row * heads + head)
+                        (raw - 128.0) * scales.get_f32(row * kv_heads + head)
                     })
                 };
-                for head in 0..heads {
+                for head in 0..query_heads {
+                    let kv_head = head / (query_heads / kv_heads);
                     for query in 0..tokens {
-                        let allowed = (query + query_offset + 1).min(context_length);
+                        let end = (cursor + query + 1).min(needed);
+                        let begin =
+                            window.map_or(start, |window| end.saturating_sub(window).max(start));
                         let mut maximum = f64::NEG_INFINITY;
-                        for key_index in 0..allowed {
+                        for position in begin..end {
                             let mut score = 0.0f64;
-                            if key_index < available {
-                                for column in 0..width {
-                                    let q_index = ((batch_index * heads + head) * tokens + query)
-                                        * width
-                                        + column;
-                                    score += tensor_element::<f32>(
-                                        q.tensor(),
-                                        q_index,
-                                        "kv attention query",
-                                    )? as f64
-                                        * cached(keys, key_scales, key_index, head, column) as f64;
-                                }
+                            for column in 0..width {
+                                let q_index = ((batch_index * query_heads + head) * tokens + query)
+                                    * width
+                                    + column;
+                                score += tensor_element::<f32>(
+                                    q.tensor(),
+                                    q_index,
+                                    "kv attention query",
+                                )? as f64
+                                    * cached(keys, key_scales, position, kv_head, column) as f64;
                             }
                             maximum = maximum.max(score * scale);
                         }
                         let mut denominator = 0.0f64;
-                        for key_index in 0..allowed {
+                        for position in begin..end {
                             let mut score = 0.0f64;
-                            if key_index < available {
-                                for column in 0..width {
-                                    let q_index = ((batch_index * heads + head) * tokens + query)
-                                        * width
-                                        + column;
-                                    score += tensor_element::<f32>(
-                                        q.tensor(),
-                                        q_index,
-                                        "kv attention query",
-                                    )? as f64
-                                        * cached(keys, key_scales, key_index, head, column) as f64;
-                                }
+                            for column in 0..width {
+                                let q_index = ((batch_index * query_heads + head) * tokens + query)
+                                    * width
+                                    + column;
+                                score += tensor_element::<f32>(
+                                    q.tensor(),
+                                    q_index,
+                                    "kv attention query",
+                                )? as f64
+                                    * cached(keys, key_scales, position, kv_head, column) as f64;
                             }
                             denominator += (score * scale - maximum).exp();
                         }
                         for column in 0..width {
                             let mut result = 0.0f64;
-                            for key_index in 0..available.min(allowed) {
+                            for position in begin..end {
                                 let mut score = 0.0f64;
                                 for depth in 0..width {
-                                    let q_index = ((batch_index * heads + head) * tokens + query)
+                                    let q_index = ((batch_index * query_heads + head) * tokens
+                                        + query)
                                         * width
                                         + depth;
                                     score += tensor_element::<f32>(
@@ -3035,13 +3188,14 @@ fn kv_attention_into(
                                         q_index,
                                         "kv attention query",
                                     )? as f64
-                                        * cached(keys, key_scales, key_index, head, depth) as f64;
+                                        * cached(keys, key_scales, position, kv_head, depth) as f64;
                                 }
                                 result += (score * scale - maximum).exp()
-                                    * cached(values, value_scales, key_index, head, column) as f64;
+                                    * cached(values, value_scales, position, kv_head, column)
+                                        as f64;
                             }
-                            out[((batch_index * heads + head) * tokens + query) * width + column] =
-                                (result / denominator) as f32;
+                            out[((batch_index * query_heads + head) * tokens + query) * width
+                                + column] = (result / denominator) as f32;
                         }
                     }
                 }
@@ -3101,8 +3255,7 @@ fn kv_prepare(
         ));
     }
     let needed = cursor + advance;
-    let full = cursor + tokens;
-    let start = window.map_or(0, |window| full.saturating_sub(window));
+    let start = window.map_or(0, |window| needed.saturating_sub(window));
     if needed.saturating_sub(start) > pool.max_tokens {
         return Err(format!(
             "kv attention: live context {} exceeds pool capacity {}",
@@ -3390,6 +3543,9 @@ impl NativeKvSequence {
                 "prefill match: sequence already holds tokens",
             ));
         }
+        if self.pool.kda.layers > 0 || self.pool.conv.layers > 0 {
+            return Ok(0);
+        }
         let matchable = tokens.len().saturating_sub(1) / self.pool.block_size;
         let mut hash = HASH_SEED;
         for index in 0..matchable {
@@ -3511,6 +3667,11 @@ impl Executable {
     #[napi(getter)]
     pub fn batch(&self) -> u32 {
         self.state.map_or(0, |state| state.batch as u32)
+    }
+
+    #[napi(getter)]
+    pub fn allows_window_eviction(&self) -> bool {
+        self.state.is_some_and(|state| state.allows_window_eviction)
     }
 
     #[napi(getter)]
@@ -3705,6 +3866,7 @@ impl Executable {
                 .map(|sequence| sequence.state.clone())
                 .collect(),
             active_batch,
+            window: schema.window,
             kda: schema.kda,
             conv: schema.conv,
             transaction: Mutex::new(None),
@@ -3899,6 +4061,7 @@ mod tests {
             block_size: 4,
             kv_dtype: DType::F32,
             window: Some(8),
+            allows_window_eviction: true,
             batch: 2,
             layers: 1,
             kv_heads: 2,
@@ -4230,13 +4393,14 @@ mod tests {
             pool,
             slots: vec![state.clone()],
             active_batch: 1,
+            window: None,
             kda: KdaGeometry::default(),
             conv: ConvGeometry::default(),
             transaction: Mutex::new(None),
         };
         let q = Value(Tensor::from_vec(
-            (0..24).map(|value| value as f32).collect(),
-            vec![1, 2, 3, 4],
+            (0..48).map(|value| value as f32).collect(),
+            vec![1, 4, 3, 4],
         ));
         let k = Value(Tensor::from_vec(
             (24..48).map(|value| value as f32 * 0.01).collect(),
@@ -4246,10 +4410,21 @@ mod tests {
             (48..72).map(|value| value as f32 * 0.01).collect(),
             vec![1, 2, 3, 4],
         ));
+        let repeat_heads = |tensor: &Tensor| {
+            let values = Value(tensor.clone()).to_f32_vec().unwrap();
+            let per_head = 3 * 4;
+            let mut repeated = Vec::new();
+            for head in 0..2 {
+                for _ in 0..2 {
+                    repeated.extend_from_slice(&values[head * per_head..(head + 1) * per_head]);
+                }
+            }
+            Tensor::from_vec(repeated, vec![1, 4, 3, 4])
+        };
         let expected = Value(composed::sdpa_forward(
             q.tensor(),
-            k.tensor(),
-            v.tensor(),
+            &repeat_heads(k.tensor()),
+            &repeat_heads(v.tensor()),
             0.5,
             true,
         ))
@@ -4314,6 +4489,7 @@ mod tests {
             pool,
             slots: vec![state.clone()],
             active_batch: 1,
+            window: None,
             kda: KdaGeometry {
                 layers: 1,
                 heads: 1,
@@ -4400,6 +4576,129 @@ mod tests {
         );
     }
 
+    fn last_token_row_context(advance: usize) -> Arc<KvContext> {
+        Arc::new(KvContext {
+            pool: Arc::new(PoolInner {
+                k: Vec::new(),
+                v: Vec::new(),
+                scales: Vec::new(),
+                kv_dtype: DType::F32,
+                kv_heads: 0,
+                head_dim: 0,
+                block_size: 4,
+                max_tokens: 8,
+                kda: KdaGeometry::default(),
+                conv: ConvGeometry::default(),
+                blocks: Mutex::new(BlockStore::new(2)),
+            }),
+            slots: vec![Arc::new(Mutex::new(SeqState {
+                blocks: Vec::new(),
+                head: 0,
+                cursor: 0,
+                advance,
+                last_hash: HASH_SEED,
+                pending: Vec::new(),
+                kda_states: Vec::new(),
+                conv_states: Vec::new(),
+            }))],
+            active_batch: 1,
+            window: None,
+            kda: KdaGeometry::default(),
+            conv: ConvGeometry::default(),
+            transaction: Mutex::new(None),
+        })
+    }
+
+    fn compile_last_token_row() -> executable::CpuCompilation {
+        let logits = Node::new(NodeKind::LastTokenRow {
+            a: Node::new(NodeKind::Leaf(Arc::new(LeafSlot::new(Value(
+                Tensor::from_vec((0..12).map(|value| value as f32).collect(), vec![1, 3, 4]),
+            )))))
+            .unwrap(),
+        })
+        .unwrap();
+        executable::compile(
+            &[logits],
+            CompileOptions {
+                optimize: false,
+                ..CompileOptions::default()
+            },
+            1024,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn last_token_row_copies_the_advanced_row() {
+        let compilation = compile_last_token_row();
+        let context = last_token_row_context(2);
+        let outputs = executable::execute(
+            &compilation.executable,
+            &[],
+            &compilation.generated_bindings,
+            &CancellationFlag::new(),
+            Some(&context),
+        )
+        .unwrap();
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0].shape(), &[4]);
+        assert_eq!(outputs[0].to_f32_vec().unwrap(), [4.0, 5.0, 6.0, 7.0]);
+    }
+
+    #[test]
+    fn last_token_row_requires_a_state_context_and_a_valid_advance() {
+        let compilation = compile_last_token_row();
+        let error = executable::execute(
+            &compilation.executable,
+            &[],
+            &compilation.generated_bindings,
+            &CancellationFlag::new(),
+            None,
+        )
+        .err()
+        .unwrap();
+        assert_eq!(error, "last_token_row: operation requires a state context");
+
+        for advance in [0, 4] {
+            let context = last_token_row_context(advance);
+            let error = executable::execute(
+                &compilation.executable,
+                &[],
+                &compilation.generated_bindings,
+                &CancellationFlag::new(),
+                Some(&context),
+            )
+            .err()
+            .unwrap();
+            assert_eq!(
+                error,
+                format!("last token row: token advance must be in 1..=3, got {advance}")
+            );
+        }
+    }
+
+    #[test]
+    fn last_token_row_compile_flag_rewrites_decode_outputs() {
+        let root = LazyTensor {
+            node: Node::new(NodeKind::Leaf(Arc::new(LeafSlot::new(Value(
+                Tensor::from_vec((0..24).map(|value| value as f32).collect(), vec![1, 3, 8]),
+            )))))
+            .unwrap(),
+        };
+        let schema = NativeKvStateSchema {
+            max_tokens: 8,
+            block_size: 4,
+            kv_dtype: NativeDType::F32,
+            window: None,
+            batch: 1,
+            last_token_row: Some(true),
+        };
+        let executable = compile(vec![&root], None, Some(schema), None).unwrap();
+        let outputs = &executable.inner.executable.signature.outputs;
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0].shape, vec![8]);
+    }
+
     #[test]
     fn compiled_short_conv_commits_planned_next_state() {
         let pool = Arc::new(PoolInner {
@@ -4433,6 +4732,7 @@ mod tests {
             pool,
             slots: vec![state.clone()],
             active_batch: 1,
+            window: None,
             kda: KdaGeometry::default(),
             conv: ConvGeometry {
                 layers: 1,

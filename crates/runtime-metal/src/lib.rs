@@ -11,7 +11,7 @@
 //!   operations (binary/unary/compare/cast/matmul/contiguous/views).
 //! - `composed` (tests only) — primitive-built numerical references for
 //!   destination-kernel parity tests.
-//! - `flash`, `loss`, `layer_norm`, `rotary`, `paged`, `linear` —
+//! - `flash`, `loss`, `layer_norm`, `rotary`, `paged`, `linear`, `quantized` —
 //!   semantic fused kernels.
 
 #![cfg(target_os = "macos")]
@@ -52,7 +52,7 @@ pub mod runtime {
         pub use crate::composed;
         pub use crate::{
             conv, device, emit, flash, gemm, indexing, kda, kernels, layer_norm, linear, loss, ops,
-            paged, rotary, run, shortconv,
+            paged, quantized, rotary, run, shortconv,
         };
     }
 }
@@ -84,6 +84,7 @@ pub mod layer_norm;
 pub mod linear;
 pub mod loss;
 pub mod paged;
+pub mod quantized;
 pub mod rotary;
 pub mod shortconv;
 pub(crate) mod value;

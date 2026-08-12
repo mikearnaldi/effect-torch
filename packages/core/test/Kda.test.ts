@@ -397,6 +397,44 @@ onDevices("Kda", (device) => (it) => {
         expect(cached.length).toBe(prompt.length + steps)
       }))
 
+    it.effect("hybrid KDA multi-chunk prefill matches the naive reference", () =>
+      Effect.gen(function*() {
+        const model = yield* makeHybrid
+        const params = yield* Tensor.compute(yield* model.init)
+        const prompt = [1, 5, 3, 8, 2, 11, 4, 7, 6]
+        const steps = 4
+        const program = yield* Model.inference(model, params, {
+          maxTokens: 64,
+          blockSize: 4,
+          prefillChunk: 4
+        })
+        const naive = yield* naiveGenerate(model, params, prompt, steps)
+        const cached = yield* cachedGenerate(program, prompt, steps)
+        expect(cached).toEqual(naive)
+      }))
+
+    it.effect("recurrent pools do not share prefixes across sequences", () =>
+      Effect.gen(function*() {
+        const model = yield* makeHybrid
+        const params = yield* Tensor.compute(yield* model.init)
+        const prompt = [1, 5, 3, 8, 2]
+        const program = yield* Model.inference(model, params, {
+          maxTokens: 64,
+          blockSize: 4,
+          prefillChunk: 4
+        })
+        const gen = yield* program.generation()
+        const first = yield* gen.add(yield* ids(prompt))
+        const second = yield* gen.add(yield* ids(prompt))
+        const firstValues = yield* Tensor.toNumberArray(first.logits)
+        const secondValues = yield* Tensor.toNumberArray(second.logits)
+        secondValues.forEach((value, index) => assert.assertTrue(close(value, firstValues[index]!)))
+        expect(yield* first.seq.cursor()).toBe(prompt.length)
+        expect(yield* second.seq.cursor()).toBe(prompt.length)
+        yield* Tensor.clearAll([first.logits, second.logits])
+        yield* gen.close()
+      }))
+
     it.effect("a pure-KDA stack (zero KV layers) generates through the decode programs", () =>
       Effect.gen(function*() {
         const model = yield* makePureKda

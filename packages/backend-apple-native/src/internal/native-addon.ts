@@ -10,6 +10,7 @@ export declare class CancellationToken {
 export declare class Executable {
   get stateful(): boolean
   get batch(): number
+  get allowsWindowEviction(): boolean
   get layers(): number
   get kvHeads(): number
   get headDim(): number
@@ -82,13 +83,28 @@ export declare class LazyTensor {
   scatterAdd(dim: number, indexes: LazyTensor, src: LazyTensor): LazyTensor
   gather(dim: number, indexes: LazyTensor): LazyTensor
   crossEntropy(target: LazyTensor, ignoreIndex: number): LazyTensor
-  scaledDotProductAttention(k: LazyTensor, v: LazyTensor, scale: number, causal: boolean): LazyTensor
+  scaledDotProductAttention(k: LazyTensor, v: LazyTensor, scale: number, causal: boolean, window: number): LazyTensor
   kdaChunk(k: LazyTensor, v: LazyTensor, logDecay: LazyTensor, beta: LazyTensor, scale: number): LazyTensor
   shortConv1d(weight: LazyTensor): LazyTensor
   positionEmbedding(seqLen: number): LazyTensor
-  rotaryEmbedding(seqLen: number, theta: number): LazyTensor
+  rotaryEmbedding(seqLen: number, theta: number, layout: NativeRotaryLayout): LazyTensor
   layerNorm(weight: LazyTensor, bias: LazyTensor, eps: number): LazyTensor
+  rmsNorm(weight: LazyTensor | undefined, eps: number): LazyTensor
   linear(weight: LazyTensor, bias: LazyTensor): LazyTensor
+  quantizedLinear(
+    weight: LazyTensor,
+    bias: LazyTensor | undefined | null,
+    encoding: NativeGgmlKQuant,
+    rows: number,
+    columns: number
+  ): LazyTensor
+  quantizedEmbedding(
+    weight: LazyTensor,
+    encoding: NativeGgmlKQuant,
+    rows: number,
+    columns: number,
+    paddingIndex?: number | undefined | null
+  ): LazyTensor
   conv1d(w: LazyTensor, stride: number, padding: number, dilation: number, groups: number): LazyTensor
   conv2d(w: LazyTensor, stride: number, padding: number, dilation: number, groups: number): LazyTensor
   log(): LazyTensor
@@ -197,6 +213,54 @@ export declare function loadTensors(
 ): Promise<NativeSafetensorsArchive>
 
 /** @internal */
+export type NativeGgmlKQuant = "Q2_K" | "Q3_K" | "Q4_K" | "Q5_K" | "Q6_K"
+
+/** @internal */
+export interface NativeGgufMetadataEntry {
+  key: string
+  kind: string
+  numberValue?: number
+  stringValue?: string
+  booleanValue?: boolean
+  numberArray?: Array<number>
+  stringArray?: Array<string>
+  booleanArray?: Array<boolean>
+}
+
+/** @internal */
+export interface NativeGgufTensorDescriptor {
+  name: string
+  format: "F32" | NativeGgmlKQuant
+  logicalShape: Array<number>
+  logicalDtype: "f32"
+  physicalShape: Array<number>
+  physicalDtype: "f32" | "u8"
+}
+
+/** @internal */
+export interface NativeGgufInspection {
+  metadata: Array<NativeGgufMetadataEntry>
+  tensors: Array<NativeGgufTensorDescriptor>
+}
+
+/** @internal */
+export interface NativeGgufArchive {
+  entries: Array<{ descriptor: NativeGgufTensorDescriptor; tensor: NativeTensor }>
+}
+
+/** @internal */
+export declare function inspectGguf(
+  path: string,
+  token?: CancellationToken | undefined | null
+): Promise<NativeGgufInspection>
+
+/** @internal */
+export declare function loadGguf(
+  path: string,
+  token?: CancellationToken | undefined | null
+): Promise<NativeGgufArchive>
+
+/** @internal */
 export declare const enum NativeDType {
   F32 = "f32",
   F64 = "f64",
@@ -206,6 +270,8 @@ export declare const enum NativeDType {
   F16 = "f16",
   BF16 = "bf16"
 }
+
+export type NativeRotaryLayout = "HalfSplit" | "InterleavedPairs"
 
 /** @internal */
 export interface NativeCompileOptions {
@@ -220,6 +286,7 @@ export interface NativeKvStateSchema {
   kvDtype: NativeDType
   window?: number
   batch: number
+  lastTokenRow?: boolean
 }
 
 /** @internal */
@@ -287,6 +354,8 @@ export interface NativeAddon {
   readonly externalMemoryBytes: typeof externalMemoryBytes
   readonly grad: typeof grad
   readonly isAvailable: typeof isAvailable
+  readonly inspectGguf: typeof inspectGguf
+  readonly loadGguf: typeof loadGguf
   readonly loadTensors: typeof loadTensors
   readonly saveTensors: typeof saveTensors
 }

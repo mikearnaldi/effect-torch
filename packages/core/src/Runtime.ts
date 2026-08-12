@@ -9,6 +9,16 @@ import type { Pipeable } from "effect/Pipeable"
  */
 export type DType = "f32" | "f64" | "f16" | "bf16" | "i64" | "u8" | "u32"
 
+/** Packed GGML K-quant encodings understood by native runtimes. */
+export type TensorStorageEncoding = "Q2_K" | "Q3_K" | "Q4_K" | "Q5_K" | "Q6_K"
+
+/** Physical storage metadata for a logically dense encoded tensor. */
+export interface EncodedTensorStorage {
+  readonly encoding: TensorStorageEncoding
+  readonly physicalShape: ReadonlyArray<number>
+  readonly physicalDtype: "u8"
+}
+
 /**
  * Backend implementation metadata.
  *
@@ -115,6 +125,8 @@ export interface TensorHandle extends Pipeable {
   readonly shape: ReadonlyArray<number>
   /** Tensor element data type. */
   readonly dtype: DType
+  /** Omitted for dense storage; present when native storage is encoded. */
+  readonly storage?: EncodedTensorStorage
   /** Device family that owns the tensor. */
   readonly device: string
   /** Exact runtime placement that owns the tensor. */
@@ -183,10 +195,20 @@ export interface DecodeStateRequest {
   readonly blockSize: number
   /** KV storage dtype: `f32`, `f16`, `bf16`, or quantized `u8`. */
   readonly kvDtype: DType
-  /** Optional unsigned 32-bit sliding-attention window in `1..=maxTokens`. */
+  /**
+   * Optional unsigned 32-bit global attention window in `1..=maxTokens`.
+   * A completed schema retains it as the KV eviction window only when every
+   * resolved attention operation is windowed.
+   */
   readonly window?: number
   /** Positive unsigned 32-bit fixed compiled batch width. */
   readonly batch: number
+  /**
+   * When true, every root must be `[batch, T, V]` and the decode rewrite
+   * returns native state-driven last-token selectors: one `[V]` root for
+   * batch 1, otherwise `batch` `[V]` roots in row order. Defaults to false.
+   */
+  readonly lastTokenRow?: boolean
 }
 
 /**
@@ -461,7 +483,12 @@ export interface NodeOperationMap {
   /** Declares a tensor input slot in a compiled program. */
   readonly input: {
     readonly inputs: readonly [] | readonly [exemplar: TensorHandle]
-    readonly attributes: { readonly slot: number; readonly shape: ReadonlyArray<number>; readonly dtype: DType }
+    readonly attributes: {
+      readonly slot: number
+      readonly shape: ReadonlyArray<number>
+      readonly dtype: DType
+      readonly storage?: EncodedTensorStorage
+    }
   }
   /** Declares a scalar input slot in a compiled program. */
   readonly scalarInput: {
@@ -592,7 +619,11 @@ export interface NodeOperationMap {
   /** Computes scaled dot-product attention. */
   readonly scaledDotProductAttention: {
     readonly inputs: readonly [q: TensorHandle, k: TensorHandle, v: TensorHandle]
-    readonly attributes: { readonly scale: number; readonly causal: boolean }
+    readonly attributes: {
+      readonly scale: number
+      readonly causal: boolean
+      readonly window?: number | null
+    }
   }
   /** Computes Kimi Delta Attention (gated delta-rule linear attention) in chunked form. */
   readonly kdaChunk: {
@@ -618,16 +649,44 @@ export interface NodeOperationMap {
   /** Applies rotary position embeddings to an attention tensor. */
   readonly rotaryEmbedding: {
     readonly inputs: readonly [self: TensorHandle]
-    readonly attributes: { readonly seqLen: number; readonly theta: number }
+    readonly attributes: {
+      readonly seqLen: number
+      readonly theta: number
+      readonly layout: "HalfSplit" | "InterleavedPairs"
+    }
   }
   /** Normalizes the trailing dimensions and applies affine parameters. */
   readonly layerNorm: {
     readonly inputs: readonly [self: TensorHandle, weight: TensorHandle, bias: TensorHandle]
     readonly attributes: { readonly eps: number }
   }
+  /** Applies RMS normalization over the last dimension, optionally with a scale. */
+  readonly rmsNorm: {
+    readonly inputs: readonly [self: TensorHandle] | readonly [self: TensorHandle, weight: TensorHandle]
+    readonly attributes: { readonly eps: number }
+  }
   /** Applies a linear projection with a bias. */
   readonly linear: {
     readonly inputs: readonly [self: TensorHandle, weight: TensorHandle, bias: TensorHandle]
+  }
+  /** Applies a row-oriented packed linear projection, with an optional dense bias. */
+  readonly quantizedLinear: {
+    readonly inputs:
+      | readonly [self: TensorHandle, weight: TensorHandle]
+      | readonly [self: TensorHandle, weight: TensorHandle, bias: TensorHandle]
+    readonly attributes: {
+      readonly encoding: TensorStorageEncoding
+      readonly logicalShape: readonly [rows: number, columns: number]
+    }
+  }
+  /** Selects and decodes rows from a packed embedding table. */
+  readonly quantizedEmbedding: {
+    readonly inputs: readonly [indexes: TensorHandle, weight: TensorHandle]
+    readonly attributes: {
+      readonly encoding: TensorStorageEncoding
+      readonly logicalShape: readonly [rows: number, columns: number]
+      readonly paddingIndex?: number
+    }
   }
   /** Applies a one-dimensional grouped convolution. */
   readonly conv1d: {
@@ -764,7 +823,7 @@ export type NodeRequest<Operation extends keyof NodeOperationMap = keyof NodeOpe
 export interface PathSafetensorsSaveEntry {
   /** Archive entry name. */
   readonly name: string
-  /** Borrowed materialized tensor to serialize; saving does not release it. */
+  /** Borrowed dense materialized tensor to serialize; saving does not release it. */
   readonly tensor: ConcreteTensorHandle
 }
 
@@ -814,10 +873,57 @@ export interface PathSafetensorsLoadArchive {
  * @category models
  */
 export interface PathSafetensors {
-  /** Writes a borrowed materialized archive without transferring tensor data through JavaScript. */
+  /** Writes a borrowed dense archive without transferring tensor data through JavaScript. */
   readonly save: (path: string, archive: PathSafetensorsSaveArchive) => Effect.Effect<void, BackendError>
   /** Reads an archive directly into materialized runtime tensors. */
   readonly load: (path: string) => Effect.Effect<PathSafetensorsLoadArchive, BackendError>
+}
+
+/** A scalar GGUF metadata value after native validation. */
+export type GgufMetadataScalar = number | string | boolean
+
+/** One ordered GGUF metadata entry. */
+export interface GgufMetadataEntry {
+  readonly key: string
+  readonly value: GgufMetadataScalar | ReadonlyArray<GgufMetadataScalar>
+}
+
+/** Backend-neutral tensor catalog entry returned by native GGUF inspection. */
+export interface GgufTensorDescriptor {
+  readonly name: string
+  readonly format: "F32" | TensorStorageEncoding
+  readonly logicalShape: ReadonlyArray<number>
+  readonly logicalDtype: "f32"
+  readonly physicalShape: ReadonlyArray<number>
+  readonly physicalDtype: "f32" | "u8"
+}
+
+/** GGUF metadata and tensor descriptors without tensor payloads. */
+export interface GgufInspection {
+  readonly metadata: ReadonlyArray<GgufMetadataEntry>
+  readonly tensors: ReadonlyArray<GgufTensorDescriptor>
+}
+
+/** One runtime-owned tensor returned by native GGUF loading. */
+export interface GgufLoadEntry {
+  readonly descriptor: GgufTensorDescriptor
+  readonly tensor: ConcreteTensorHandle
+}
+
+/** Runtime-owned tensors returned by native GGUF loading. */
+export interface GgufLoadArchive {
+  readonly entries: ReadonlyArray<GgufLoadEntry>
+}
+
+/** Optional native GGUF parser and loader extension. */
+export interface GgufRuntime {
+  readonly inspect: (path: string) => Effect.Effect<GgufInspection, BackendError>
+  /**
+   * Loads runtime-owned tensors. The implementation owns every handle until
+   * successful Effect completion and must release partial or late results when
+   * interrupted; ownership transfers to the caller with the returned archive.
+   */
+  readonly load: (path: string) => Effect.Effect<GgufLoadArchive, BackendError>
 }
 
 /**
@@ -864,7 +970,8 @@ export interface DecodeRuntime {
   /**
    * On an empty sequence, attaches the longest resident whole-block proper KV
    * prefix, leaving one token when input is nonempty. Prefix entries do not
-   * restore KDA or short-convolution recurrent state.
+   * restore KDA or short-convolution recurrent state, so pools with recurrent
+   * geometry return zero until snapshots are supported.
    */
   readonly prefillMatch: (
     sequence: KvSequenceHandle,
@@ -925,8 +1032,10 @@ export interface RuntimeService {
     invocation: ExecutionInvocation
   ) => Effect.Effect<ReadonlyArray<ConcreteTensorHandle>, BackendError>
   /**
-   * Exposes tensor values through an `ArrayBuffer`. A backend may copy the data
-   * or directly export retained runtime storage; callers must not rely on either mode.
+   * Exposes physical tensor storage through an `ArrayBuffer`. For encoded
+   * handles this is the packed byte representation, not logical f32 values. A
+   * backend may copy the data or directly export retained runtime storage;
+   * callers must not rely on either mode.
    */
   readonly readback: (tensor: ConcreteTensorHandle) => Effect.Effect<ArrayBuffer, BackendError>
   /**
@@ -938,6 +1047,8 @@ export interface RuntimeService {
   readonly extensions: {
     /** Direct path-based safetensors I/O, when supported. */
     readonly pathSafetensors?: PathSafetensors
+    /** Native GGUF inspection and loading, when supported. */
+    readonly gguf?: GgufRuntime
     /** Compiled paged-KV inference, when supported. */
     readonly decode?: DecodeRuntime
     /** Runtime memory and execution diagnostics, when supported. */

@@ -1,5 +1,5 @@
 use super::tensor::{source_index, CpuBuffer, CpuDestination, CpuTensorRequirement, Elem, Tensor};
-use effect_torch_graph::CrossEntropyReduction;
+use effect_torch_graph::{CrossEntropyReduction, RotaryLayout};
 use effect_torch_runtime::{DType, Layout};
 use half::{bf16, f16};
 
@@ -435,11 +435,17 @@ pub fn cross_entropy_backward_requirements(
     })
 }
 
-fn sdpa_geometry(
-    q: &Tensor,
-    k: &Tensor,
-    v: &Tensor,
-) -> Result<(usize, usize, usize, usize, usize), String> {
+struct SdpaGeometry {
+    batch: usize,
+    query_heads: usize,
+    kv_heads: usize,
+    query_len: usize,
+    key_len: usize,
+    query_depth: usize,
+    value_depth: usize,
+}
+
+fn sdpa_geometry(q: &Tensor, k: &Tensor, v: &Tensor) -> Result<SdpaGeometry, String> {
     if q.dtype() != k.dtype() || q.dtype() != v.dtype() {
         return Err("sdpa: q/k/v dtypes must match".to_string());
     }
@@ -450,9 +456,25 @@ fn sdpa_geometry(
     if r < 2 || k.shape().len() != r || v.shape().len() != r {
         return Err("sdpa: q/k/v must have matching rank >= 2".to_string());
     }
-    if q.shape()[..r - 2] != k.shape()[..r - 2] || q.shape()[..r - 2] != v.shape()[..r - 2] {
+    let leading = if r < 3 { r - 2 } else { r - 3 };
+    if q.shape()[..leading] != k.shape()[..leading] || q.shape()[..leading] != v.shape()[..leading]
+    {
         return Err("sdpa: q/k/v leading dimensions must match".to_string());
     }
+    let (batch, query_heads, kv_heads) = if r < 3 {
+        (1, 1, 1)
+    } else {
+        let query_heads = q.shape()[r - 3];
+        let kv_heads = k.shape()[r - 3];
+        if v.shape()[r - 3] != kv_heads || kv_heads == 0 || !query_heads.is_multiple_of(kv_heads) {
+            return Err("sdpa: query heads must be divisible by matching K/V heads".to_string());
+        }
+        (
+            checked_numel(&q.shape()[..r - 3], "sdpa batch")?,
+            query_heads,
+            kv_heads,
+        )
+    };
     let (t, s, d, kd, vs, dv) = (
         q.shape()[r - 2],
         k.shape()[r - 2],
@@ -464,8 +486,15 @@ fn sdpa_geometry(
     if d != kd || s != vs || t == 0 || s == 0 || d == 0 || dv == 0 {
         return Err("sdpa: incompatible or zero-sized q/k/v dimensions".to_string());
     }
-    let bh = checked_numel(&q.shape()[..r - 2], "sdpa batch/head")?;
-    Ok((bh, t, s, d, dv))
+    Ok(SdpaGeometry {
+        batch,
+        query_heads,
+        kv_heads,
+        query_len: t,
+        key_len: s,
+        query_depth: d,
+        value_depth: dv,
+    })
 }
 
 pub fn sdpa_forward_requirements(
@@ -473,7 +502,14 @@ pub fn sdpa_forward_requirements(
     k: &Tensor,
     v: &Tensor,
 ) -> Result<SdpaForwardRequirements, String> {
-    let (batch_heads, query_len, key_len, query_depth, value_depth) = sdpa_geometry(q, k, v)?;
+    let geometry = sdpa_geometry(q, k, v)?;
+    let (batch_heads, query_len, key_len, query_depth, value_depth) = (
+        geometry.batch * geometry.query_heads,
+        geometry.query_len,
+        geometry.key_len,
+        geometry.query_depth,
+        geometry.value_depth,
+    );
     let r = q.shape().len();
     let mut output_shape = q.shape().to_vec();
     output_shape[r - 1] = value_depth;
@@ -501,7 +537,17 @@ pub fn sdpa_backward_requirements(
     k: &Tensor,
     v: &Tensor,
 ) -> Result<SdpaBackwardRequirements, String> {
-    let (batch_heads, query_len, key_len, query_depth, value_depth) = sdpa_geometry(q, k, v)?;
+    let geometry = sdpa_geometry(q, k, v)?;
+    if geometry.query_heads != geometry.kv_heads {
+        return Err("sdpa backward: grouped-query attention is not differentiable".to_string());
+    }
+    let (batch_heads, query_len, key_len, query_depth, value_depth) = (
+        geometry.batch * geometry.query_heads,
+        geometry.query_len,
+        geometry.key_len,
+        geometry.query_depth,
+        geometry.value_depth,
+    );
     let work_dtype = work_dtype(q.dtype());
     Ok(SdpaBackwardRequirements {
         dq: checked_requirement(q.shape(), q.dtype(), "sdpa dq")?,
@@ -556,6 +602,33 @@ pub fn layer_norm_forward_requirements(
         output: checked_requirement(x.shape(), x.dtype(), "layer_norm output")?,
         topology: LayerNormTopology::Rows { row_passes: 3 },
         rows,
+        normalized_elements,
+        dtype: x.dtype(),
+    })
+}
+
+pub fn rms_norm_forward_requirements(
+    x: &Tensor,
+    weight: Option<&Tensor>,
+) -> Result<LayerNormForwardRequirements, String> {
+    validate_float_dtype(x.dtype(), "rms_norm")?;
+    if x.shape().is_empty() {
+        return Err("rms_norm: input must have rank at least 1".to_string());
+    }
+    let normalized_elements = *x.shape().last().expect("validated input rank");
+    let elements = checked_numel(x.shape(), "rms_norm input")?;
+    if normalized_elements == 0 || elements == 0 {
+        return Err("rms_norm: zero-sized dimensions are unsupported".to_string());
+    }
+    if weight.is_some_and(|weight| {
+        weight.dtype() != x.dtype() || weight.shape() != [normalized_elements]
+    }) {
+        return Err("rms_norm: weight must match the last dimension and dtype".to_string());
+    }
+    Ok(LayerNormForwardRequirements {
+        output: checked_requirement(x.shape(), x.dtype(), "rms_norm output")?,
+        topology: LayerNormTopology::Rows { row_passes: 2 },
+        rows: elements / normalized_elements,
         normalized_elements,
         dtype: x.dtype(),
     })
@@ -706,8 +779,19 @@ pub fn sdpa_backward(
     (dq, dk, dv)
 }
 
-fn sdpa_allowed(query: usize, key: usize, query_len: usize, key_len: usize, causal: bool) -> bool {
-    !causal || key <= query + key_len.saturating_sub(query_len)
+fn sdpa_allowed(
+    query: usize,
+    key: usize,
+    query_len: usize,
+    key_len: usize,
+    causal: bool,
+    window: Option<usize>,
+) -> bool {
+    if !causal {
+        return true;
+    }
+    let end = query + key_len.saturating_sub(query_len);
+    key <= end && window.is_none_or(|window| key >= (end + 1).saturating_sub(window))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -717,6 +801,7 @@ fn sdpa_forward_into_impl<T: Elem>(
     v: &Tensor,
     scale: f64,
     causal: bool,
+    window: Option<usize>,
     output: &mut CpuDestination<'_>,
     logsumexp: &mut CpuDestination<'_>,
     batch_heads: usize,
@@ -724,6 +809,8 @@ fn sdpa_forward_into_impl<T: Elem>(
     key_len: usize,
     query_depth: usize,
     value_depth: usize,
+    query_heads: usize,
+    kv_heads: usize,
 ) -> Result<(), String> {
     let q_values = tensor_values::<T>(q, "sdpa")?;
     let k_values = tensor_values::<T>(k, "sdpa")?;
@@ -738,6 +825,9 @@ fn sdpa_forward_into_impl<T: Elem>(
     logsumexp.write::<T, _>("sdpa logsumexp", &q.shape()[..q.shape().len() - 1], |lse| {
         output.write_current::<T, _>("sdpa output", |out| {
             for bh in 0..batch_heads {
+                let batch = bh / query_heads;
+                let query_head = bh % query_heads;
+                let kv_bh = batch * kv_heads + query_head / (query_heads / kv_heads);
                 for query in 0..query_len {
                     let q_base = (bh * query_len + query) * query_depth;
                     let row = bh * query_len + query;
@@ -746,10 +836,10 @@ fn sdpa_forward_into_impl<T: Elem>(
                     let mut maximum = f64::NEG_INFINITY;
                     let mut denominator = 0.0f64;
                     for key in 0..key_len {
-                        if !sdpa_allowed(query, key, query_len, key_len, causal) {
+                        if !sdpa_allowed(query, key, query_len, key_len, causal, window) {
                             continue;
                         }
-                        let k_base = (bh * key_len + key) * query_depth;
+                        let k_base = (kv_bh * key_len + key) * query_depth;
                         let mut score = 0.0f64;
                         for depth in 0..query_depth {
                             score += logical_value(q_values, q, q_base + depth).to_f64()
@@ -770,7 +860,7 @@ fn sdpa_forward_into_impl<T: Elem>(
                                     * logical_value(
                                         v_values,
                                         v,
-                                        (bh * key_len + key) * value_depth + value_index,
+                                        (kv_bh * key_len + key) * value_depth + value_index,
                                     )
                                     .to_f64();
                             out[output_index] = T::from_f64(value);
@@ -795,10 +885,12 @@ pub fn sdpa_forward_into(
     v: &Tensor,
     scale: f64,
     causal: bool,
+    window: Option<usize>,
     output: &mut CpuDestination<'_>,
     logsumexp: &mut CpuDestination<'_>,
 ) -> Result<(), String> {
-    let (batch_heads, query_len, key_len, query_depth, value_depth) = sdpa_geometry(q, k, v)?;
+    let geometry = sdpa_geometry(q, k, v)?;
+    let batch_heads = geometry.batch * geometry.query_heads;
     match q.dtype() {
         DType::F32 => sdpa_forward_into_impl::<f32>(
             q,
@@ -806,13 +898,16 @@ pub fn sdpa_forward_into(
             v,
             scale,
             causal,
+            window,
             output,
             logsumexp,
             batch_heads,
-            query_len,
-            key_len,
-            query_depth,
-            value_depth,
+            geometry.query_len,
+            geometry.key_len,
+            geometry.query_depth,
+            geometry.value_depth,
+            geometry.query_heads,
+            geometry.kv_heads,
         ),
         DType::F64 => sdpa_forward_into_impl::<f64>(
             q,
@@ -820,13 +915,16 @@ pub fn sdpa_forward_into(
             v,
             scale,
             causal,
+            window,
             output,
             logsumexp,
             batch_heads,
-            query_len,
-            key_len,
-            query_depth,
-            value_depth,
+            geometry.query_len,
+            geometry.key_len,
+            geometry.query_depth,
+            geometry.value_depth,
+            geometry.query_heads,
+            geometry.kv_heads,
         ),
         _ => unreachable!("sdpa geometry validated the CPU dtype"),
     }
@@ -838,6 +936,7 @@ fn sdpa_logsumexp_into_impl<T: Elem>(
     k: &Tensor,
     scale: f64,
     causal: bool,
+    window: Option<usize>,
     logsumexp: &mut CpuDestination<'_>,
     batch_heads: usize,
     query_len: usize,
@@ -853,7 +952,7 @@ fn sdpa_logsumexp_into_impl<T: Elem>(
                 let mut maximum = f64::NEG_INFINITY;
                 let mut denominator = 0.0f64;
                 for key in 0..key_len {
-                    if !sdpa_allowed(query, key, query_len, key_len, causal) {
+                    if !sdpa_allowed(query, key, query_len, key_len, causal, window) {
                         continue;
                     }
                     let k_base = (bh * key_len + key) * query_depth;
@@ -885,31 +984,38 @@ pub fn sdpa_logsumexp_into(
     v: &Tensor,
     scale: f64,
     causal: bool,
+    window: Option<usize>,
     logsumexp: &mut CpuDestination<'_>,
 ) -> Result<(), String> {
-    let (batch_heads, query_len, key_len, query_depth, _) = sdpa_geometry(q, k, v)?;
+    let geometry = sdpa_geometry(q, k, v)?;
+    if geometry.query_heads != geometry.kv_heads {
+        return Err("sdpa backward: grouped-query attention is not differentiable".to_string());
+    }
+    let batch_heads = geometry.batch * geometry.query_heads;
     match q.dtype() {
         DType::F32 => sdpa_logsumexp_into_impl::<f32>(
             q,
             k,
             scale,
             causal,
+            window,
             logsumexp,
             batch_heads,
-            query_len,
-            key_len,
-            query_depth,
+            geometry.query_len,
+            geometry.key_len,
+            geometry.query_depth,
         ),
         DType::F64 => sdpa_logsumexp_into_impl::<f64>(
             q,
             k,
             scale,
             causal,
+            window,
             logsumexp,
             batch_heads,
-            query_len,
-            key_len,
-            query_depth,
+            geometry.query_len,
+            geometry.key_len,
+            geometry.query_depth,
         ),
         _ => unreachable!("sdpa geometry validated the CPU dtype"),
     }
@@ -925,6 +1031,7 @@ fn sdpa_backward_into_impl<T: Elem>(
     gradient: &Tensor,
     scale: f64,
     causal: bool,
+    window: Option<usize>,
     dq: &mut CpuDestination<'_>,
     dk: &mut CpuDestination<'_>,
     dv: &mut CpuDestination<'_>,
@@ -964,7 +1071,8 @@ fn sdpa_backward_into_impl<T: Elem>(
                                 let q_base = (bh * query_len + query) * query_depth;
                                 let row = bh * query_len + query;
                                 for key in 0..key_len {
-                                    if !sdpa_allowed(query, key, query_len, key_len, causal) {
+                                    if !sdpa_allowed(query, key, query_len, key_len, causal, window)
+                                    {
                                         continue;
                                     }
                                     let k_base = (bh * key_len + key) * query_depth;
@@ -1035,12 +1143,23 @@ pub fn sdpa_backward_into(
     gradient: &Tensor,
     scale: f64,
     causal: bool,
+    window: Option<usize>,
     dq: &mut CpuDestination<'_>,
     dk: &mut CpuDestination<'_>,
     dv: &mut CpuDestination<'_>,
     d_vec_scratch: &mut CpuDestination<'_>,
 ) -> Result<(), String> {
-    let (batch_heads, query_len, key_len, query_depth, value_depth) = sdpa_geometry(q, k, v)?;
+    let geometry = sdpa_geometry(q, k, v)?;
+    if geometry.query_heads != geometry.kv_heads {
+        return Err("sdpa backward: grouped-query attention is not differentiable".to_string());
+    }
+    let (batch_heads, query_len, key_len, query_depth, value_depth) = (
+        geometry.batch * geometry.query_heads,
+        geometry.query_len,
+        geometry.key_len,
+        geometry.query_depth,
+        geometry.value_depth,
+    );
     let expected_output_elements = batch_heads
         .checked_mul(query_len)
         .and_then(|value| value.checked_mul(value_depth));
@@ -1067,6 +1186,7 @@ pub fn sdpa_backward_into(
             gradient,
             scale,
             causal,
+            window,
             dq,
             dk,
             dv,
@@ -1086,6 +1206,7 @@ pub fn sdpa_backward_into(
             gradient,
             scale,
             causal,
+            window,
             dq,
             dk,
             dv,
@@ -1230,6 +1351,82 @@ pub fn layer_norm_forward_into(
             normalized_elements,
         ),
         _ => unreachable!("layer_norm geometry validated float dtype"),
+    }
+}
+
+fn rms_norm_forward_into_impl<T: Elem>(
+    x: &Tensor,
+    weight: Option<&Tensor>,
+    eps: f64,
+    output: &mut CpuDestination<'_>,
+    rows: usize,
+    normalized_elements: usize,
+) -> Result<(), String> {
+    let x_values = tensor_values::<T>(x, "rms_norm")?;
+    let weight_values = weight
+        .map(|weight| tensor_values::<T>(weight, "rms_norm"))
+        .transpose()?;
+    output.write::<T, _>("rms_norm output", x.shape(), |out| {
+        for row in 0..rows {
+            let base = row * normalized_elements;
+            let mut mean_square = 0.0f64;
+            for index in 0..normalized_elements {
+                let value = logical_value(x_values, x, base + index).to_f64();
+                mean_square += value * value;
+            }
+            let scale = 1.0 / (mean_square / normalized_elements as f64 + eps).sqrt();
+            for index in 0..normalized_elements {
+                let weight = weight_values.map_or(1.0, |values| {
+                    logical_value(values, weight.expect("values require weight"), index).to_f64()
+                });
+                out[base + index] =
+                    T::from_f64(logical_value(x_values, x, base + index).to_f64() * scale * weight);
+            }
+        }
+    })
+}
+
+pub fn rms_norm_forward_into(
+    x: &Tensor,
+    weight: Option<&Tensor>,
+    eps: f64,
+    output: &mut CpuDestination<'_>,
+) -> Result<(), String> {
+    let requirements = rms_norm_forward_requirements(x, weight)?;
+    match x.dtype() {
+        DType::F32 => rms_norm_forward_into_impl::<f32>(
+            x,
+            weight,
+            eps,
+            output,
+            requirements.rows,
+            requirements.normalized_elements,
+        ),
+        DType::F64 => rms_norm_forward_into_impl::<f64>(
+            x,
+            weight,
+            eps,
+            output,
+            requirements.rows,
+            requirements.normalized_elements,
+        ),
+        DType::F16 => rms_norm_forward_into_impl::<f16>(
+            x,
+            weight,
+            eps,
+            output,
+            requirements.rows,
+            requirements.normalized_elements,
+        ),
+        DType::BF16 => rms_norm_forward_into_impl::<bf16>(
+            x,
+            weight,
+            eps,
+            output,
+            requirements.rows,
+            requirements.normalized_elements,
+        ),
+        _ => unreachable!("rms_norm requirements validated float dtype"),
     }
 }
 
@@ -2281,11 +2478,17 @@ pub fn rotary_forward(
     offsets: &[usize],
     theta: f64,
     sign: f64,
+    layout: RotaryLayout,
 ) -> Result<Tensor, String> {
+    if layout == RotaryLayout::InterleavedPairs {
+        let mut output = Tensor::empty(x.shape(), x.dtype());
+        rotary_forward_into(x, offsets, theta, sign, layout, &mut output.destination()?)?;
+        return Ok(output);
+    }
     let dims = x.shape();
     let r = dims.len();
     let (t, d) = (dims[r - 2], dims[r - 1]);
-    let batch = dims[0];
+    let batch = if r == 2 { 1 } else { dims[0] };
     if offsets.len() != 1 && offsets.len() != batch {
         return Err(format!(
             "rotary embedding: {} offsets for batch {batch}",
@@ -2357,13 +2560,18 @@ fn rotary_forward_into_impl<T: Elem>(
     offsets: &[usize],
     theta: f64,
     sign: f64,
+    layout: RotaryLayout,
     output: &mut CpuDestination<'_>,
     rows: usize,
     steps: usize,
     head_dim: usize,
 ) -> Result<(), String> {
     let values = tensor_values::<T>(x, "rotary")?;
-    let batch = x.shape()[0];
+    let batch = if x.shape().len() == 2 {
+        1
+    } else {
+        x.shape()[0]
+    };
     let rows_per_batch = rows / batch;
     let half = head_dim / 2;
     output.write::<T, _>("rotary output", x.shape(), |out| {
@@ -2381,10 +2589,14 @@ fn rotary_forward_into_impl<T: Elem>(
                         * (offset + step) as f64
                         * theta.powf(-2.0 * index as f64 / head_dim as f64);
                     let (sin, cos) = angle.sin_cos();
-                    let first = logical_value(values, x, base + index).to_f64();
-                    let second = logical_value(values, x, base + half + index).to_f64();
-                    out[base + index] = T::from_f64(first * cos - second * sin);
-                    out[base + half + index] = T::from_f64(second * cos + first * sin);
+                    let (first_index, second_index) = match layout {
+                        RotaryLayout::HalfSplit => (base + index, base + half + index),
+                        RotaryLayout::InterleavedPairs => (base + 2 * index, base + 2 * index + 1),
+                    };
+                    let first = logical_value(values, x, first_index).to_f64();
+                    let second = logical_value(values, x, second_index).to_f64();
+                    out[first_index] = T::from_f64(first * cos - second * sin);
+                    out[second_index] = T::from_f64(second * cos + first * sin);
                 }
             }
         }
@@ -2396,13 +2608,14 @@ pub fn rotary_forward_into(
     offsets: &[usize],
     theta: f64,
     sign: f64,
+    layout: RotaryLayout,
     output: &mut CpuDestination<'_>,
 ) -> Result<(), String> {
     let rank = x.shape().len();
     if rank < 2 || x.shape()[rank - 1] % 2 != 0 || !x.dtype().is_float() {
         return Err("rotary: expected a float rank >= 2 tensor with even head dimension".into());
     }
-    let batch = x.shape()[0];
+    let batch = if rank == 2 { 1 } else { x.shape()[0] };
     if offsets.len() != 1 && offsets.len() != batch {
         return Err(format!(
             "rotary embedding: {} offsets for batch {batch}",
@@ -2416,18 +2629,18 @@ pub fn rotary_forward_into(
     let steps = x.shape()[rank - 2];
     let head_dim = x.shape()[rank - 1];
     match x.dtype() {
-        DType::F32 => {
-            rotary_forward_into_impl::<f32>(x, offsets, theta, sign, output, rows, steps, head_dim)
-        }
-        DType::F64 => {
-            rotary_forward_into_impl::<f64>(x, offsets, theta, sign, output, rows, steps, head_dim)
-        }
-        DType::F16 => {
-            rotary_forward_into_impl::<f16>(x, offsets, theta, sign, output, rows, steps, head_dim)
-        }
-        DType::BF16 => {
-            rotary_forward_into_impl::<bf16>(x, offsets, theta, sign, output, rows, steps, head_dim)
-        }
+        DType::F32 => rotary_forward_into_impl::<f32>(
+            x, offsets, theta, sign, layout, output, rows, steps, head_dim,
+        ),
+        DType::F64 => rotary_forward_into_impl::<f64>(
+            x, offsets, theta, sign, layout, output, rows, steps, head_dim,
+        ),
+        DType::F16 => rotary_forward_into_impl::<f16>(
+            x, offsets, theta, sign, layout, output, rows, steps, head_dim,
+        ),
+        DType::BF16 => rotary_forward_into_impl::<bf16>(
+            x, offsets, theta, sign, layout, output, rows, steps, head_dim,
+        ),
         _ => unreachable!("rotary validated float dtype"),
     }
 }
@@ -5617,6 +5830,7 @@ mod tests {
                 &v,
                 0.5,
                 true,
+                None,
                 &mut attention.destination().unwrap(),
                 &mut lse.destination().unwrap(),
             )
@@ -5630,6 +5844,7 @@ mod tests {
                 &gradient,
                 0.5,
                 true,
+                None,
                 &mut dq.destination().unwrap(),
                 &mut dk.destination().unwrap(),
                 &mut dv.destination().unwrap(),
@@ -5828,6 +6043,7 @@ mod tests {
                 &[2, 5],
                 10_000.0,
                 1.0,
+                RotaryLayout::HalfSplit,
                 &mut rotary_output.destination().unwrap(),
             )
             .unwrap();
@@ -5898,7 +6114,7 @@ mod tests {
         assert_close(&sgd_v, &expected_v, 2e-5);
         assert_close(
             &rotary_output,
-            &rotary_forward(&rotary_x, &[2, 5], 10_000.0, 1.0).unwrap(),
+            &rotary_forward(&rotary_x, &[2, 5], 10_000.0, 1.0, RotaryLayout::HalfSplit).unwrap(),
             3e-5,
         );
         assert_close(
@@ -5920,6 +6136,158 @@ mod tests {
             short_conv1d_with_state(&state_x, &conv_weight, &state, 3);
         assert_close(&state_output, &expected_output, 2e-5);
         assert_close(&state_next, &expected_state, 1e-6);
+    }
+
+    #[test]
+    fn grouped_query_attention_and_local_windows_match_explicit_references() {
+        fn forward(
+            q: &Tensor,
+            k: &Tensor,
+            v: &Tensor,
+            causal: bool,
+            window: Option<usize>,
+        ) -> Tensor {
+            let requirements = sdpa_forward_requirements(q, k, v).unwrap();
+            let mut output = Tensor::empty(&requirements.output.shape, requirements.output.dtype);
+            let mut lse =
+                Tensor::empty(&requirements.logsumexp.shape, requirements.logsumexp.dtype);
+            sdpa_forward_into(
+                q,
+                k,
+                v,
+                0.5,
+                causal,
+                window,
+                &mut output.destination().unwrap(),
+                &mut lse.destination().unwrap(),
+            )
+            .unwrap();
+            output
+        }
+
+        for (query_heads, kv_heads) in [(4, 2), (16, 1)] {
+            let q = Tensor::from_vec(
+                prand(query_heads * 2 * 2, 301 + query_heads as u64),
+                vec![1, query_heads, 2, 2],
+            );
+            let k_values = prand(kv_heads * 3 * 2, 302 + query_heads as u64);
+            let v_values = prand(kv_heads * 3 * 3, 303 + query_heads as u64);
+            let k = Tensor::from_vec(k_values.clone(), vec![1, kv_heads, 3, 2]);
+            let v = Tensor::from_vec(v_values.clone(), vec![1, kv_heads, 3, 3]);
+            let expand = |values: &[f32], width: usize| {
+                let per_head = 3 * width;
+                let mut expanded = Vec::new();
+                for head in 0..kv_heads {
+                    for _ in 0..query_heads / kv_heads {
+                        expanded.extend_from_slice(&values[head * per_head..(head + 1) * per_head]);
+                    }
+                }
+                expanded
+            };
+            let repeated_k = Tensor::from_vec(expand(&k_values, 2), vec![1, query_heads, 3, 2]);
+            let repeated_v = Tensor::from_vec(expand(&v_values, 3), vec![1, query_heads, 3, 3]);
+            assert_close(
+                &forward(&q, &k, &v, false, None),
+                &forward(&q, &repeated_k, &repeated_v, false, None),
+                2e-6,
+            );
+        }
+
+        let q = Tensor::zeros(&[1, 1, 4, 1], DType::F32);
+        let k = Tensor::zeros(&[1, 1, 4, 1], DType::F32);
+        let v = Tensor::from_vec(vec![1.0f32, 2.0, 4.0, 8.0], vec![1, 1, 4, 1]);
+        assert_eq!(
+            f32_data(&forward(&q, &k, &v, true, Some(2))),
+            vec![1.0, 1.5, 3.0, 6.0]
+        );
+        assert_eq!(
+            f32_data(&forward(&q, &k, &v, true, None)),
+            vec![1.0, 1.5, 7.0 / 3.0, 3.75]
+        );
+
+        let q = Tensor::zeros(&[1, 1, 2, 1], DType::F32);
+        let k = Tensor::zeros(&[1, 1, 5, 1], DType::F32);
+        let v = Tensor::from_vec(vec![1.0f32, 2.0, 4.0, 8.0, 16.0], vec![1, 1, 5, 1]);
+        assert_eq!(
+            f32_data(&forward(&q, &k, &v, true, Some(2))),
+            vec![6.0, 12.0]
+        );
+        assert_eq!(f32_data(&forward(&q, &k, &v, true, None)), vec![3.75, 6.2]);
+    }
+
+    #[test]
+    fn rotary_layouts_use_the_requested_pairs() {
+        let x = Tensor::from_vec(vec![1.0f32, 2.0, 3.0, 4.0], vec![1, 1, 4]);
+        let half = rotary_forward(&x, &[1], 10_000.0, 1.0, RotaryLayout::HalfSplit).unwrap();
+        let interleaved =
+            rotary_forward(&x, &[1], 10_000.0, 1.0, RotaryLayout::InterleavedPairs).unwrap();
+        let (s0, c0) = 1.0f32.sin_cos();
+        let (s1, c1) = 0.01f32.sin_cos();
+        let expected_half = Tensor::from_vec(
+            vec![
+                1.0 * c0 - 3.0 * s0,
+                2.0 * c1 - 4.0 * s1,
+                3.0 * c0 + 1.0 * s0,
+                4.0 * c1 + 2.0 * s1,
+            ],
+            vec![1, 1, 4],
+        );
+        let expected_interleaved = Tensor::from_vec(
+            vec![
+                1.0 * c0 - 2.0 * s0,
+                2.0 * c0 + 1.0 * s0,
+                3.0 * c1 - 4.0 * s1,
+                4.0 * c1 + 3.0 * s1,
+            ],
+            vec![1, 1, 4],
+        );
+        assert_close(&half, &expected_half, 2e-6);
+        assert_close(&interleaved, &expected_interleaved, 2e-6);
+        assert_close(
+            &rotary_forward(&half, &[1], 10_000.0, -1.0, RotaryLayout::HalfSplit).unwrap(),
+            &x,
+            2e-6,
+        );
+        assert_close(
+            &rotary_forward(
+                &interleaved,
+                &[1],
+                10_000.0,
+                -1.0,
+                RotaryLayout::InterleavedPairs,
+            )
+            .unwrap(),
+            &x,
+            2e-6,
+        );
+
+        let rank_two =
+            Tensor::from_vec(vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0], vec![2, 4]);
+        let rank_two = rotary_forward(
+            &rank_two,
+            &[0],
+            10_000.0,
+            1.0,
+            RotaryLayout::InterleavedPairs,
+        )
+        .unwrap();
+        assert_close(
+            &rank_two,
+            &Tensor::from_vec(
+                vec![
+                    1.0f32,
+                    2.0,
+                    3.0,
+                    4.0,
+                    5.0 * c0 - 6.0 * s0,
+                    6.0 * c0 + 5.0 * s0,
+                    7.0 * c1 - 8.0 * s1,
+                    8.0 * c1 + 7.0 * s1,
+                ],
+                vec![2, 4],
+            ),
+            2e-6,
+        );
     }
 
     #[test]

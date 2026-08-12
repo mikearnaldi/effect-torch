@@ -1,6 +1,6 @@
 import { describe, expect } from "@effect/vitest"
 import { Effect } from "effect"
-import { LearningRate, Loss, Model, Optimizer, Tensor, Trainer } from "../src/index.ts"
+import { LearningRate, Loss, Model, Optimizer, Runtime, Tensor, Trainer } from "../src/index.ts"
 import { deep, onDevices, TOL } from "./utils/devices.ts"
 
 const VOCAB = 12
@@ -116,6 +116,80 @@ const cachedGenerate = (
 
 onDevices("Inference", () => (it) => {
   describe("Model.inference", () => {
+    it.effect("legacy window retains history for mixed local/full attention", () =>
+      Effect.gen(function*() {
+        const qExemplar = yield* Tensor.zeros([1, 4, 4, 1])
+        const kExemplar = yield* Tensor.zeros([1, 2, 4, 1])
+        const vExemplar = yield* Tensor.zeros([1, 2, 4, 1])
+        const q = yield* Tensor.makeInput(0, qExemplar)
+        const k = yield* Tensor.makeInput(1, kExemplar)
+        const v = yield* Tensor.makeInput(2, vExemplar)
+        const local = yield* Tensor.scaledDotProductAttention(q, k, v, { causal: true, window: 2 })
+        const full = yield* Tensor.scaledDotProductAttention(q, k, v, { causal: true, window: null })
+        const program = yield* Tensor.compileDecodeProgram([local, full], {
+          maxTokens: 8,
+          blockSize: 4,
+          kvDtype: "f32",
+          window: 4,
+          batch: 1
+        })
+        expect(program.kvHeads).toBe(2)
+        expect(program.headDim).toBe(1)
+        expect(program.window).toBeUndefined()
+        expect(program.handle.state?.window).toBeUndefined()
+
+        const pool = yield* Tensor.makeKvPool(
+          program.layers,
+          program.kvHeads,
+          program.headDim,
+          program.maxTokens,
+          program.blockSize
+        )
+        const sequence = yield* Tensor.makeKvSequence(pool)
+        const tensor = (values: ReadonlyArray<number>, shape: ReadonlyArray<number>) =>
+          Tensor.fromTypedArray(new Float32Array(values), shape)
+        const zeroQ = () => tensor(Array(16).fill(0), [1, 4, 4, 1])
+        const zeroK = () => tensor(Array(8).fill(0), [1, 2, 4, 1])
+
+        const first = yield* Tensor.runDecodeProgram(
+          program,
+          [yield* zeroQ(), yield* zeroK(), yield* tensor([1, 2, 4, 8, 10, 20, 40, 80], [1, 2, 4, 1])],
+          sequence,
+          [1, 2, 3, 4]
+        )
+        for (const output of first) yield* Tensor.clear(output)
+
+        const second = yield* Tensor.runDecodeProgram(
+          program,
+          [yield* zeroQ(), yield* zeroK(), yield* tensor([16, 0, 0, 0, 160, 0, 0, 0], [1, 2, 4, 1])],
+          sequence,
+          [5]
+        )
+        const localValues = yield* Tensor.toNumberArray(second[0])
+        const fullValues = yield* Tensor.toNumberArray(second[1])
+        deep([localValues[0], localValues[4], localValues[8], localValues[12]], [12, 12, 120, 120])
+        deep([fullValues[0], fullValues[4], fullValues[8], fullValues[12]], [6.2, 6.2, 62, 62])
+        for (const output of second) yield* Tensor.clear(output)
+
+        const third = yield* Tensor.runDecodeProgram(
+          program,
+          [yield* zeroQ(), yield* zeroK(), yield* tensor(Array(8).fill(0), [1, 2, 4, 1])],
+          sequence,
+          [6, 7, 8]
+        )
+        for (const output of third) yield* Tensor.clear(output)
+        const capacityError = yield* Effect.flip(
+          Tensor.runDecodeProgram(
+            program,
+            [yield* zeroQ(), yield* zeroK(), yield* tensor(Array(8).fill(0), [1, 2, 4, 1])],
+            sequence,
+            [9]
+          )
+        )
+        expect(capacityError.message).toContain("capacity")
+        yield* Tensor.releaseKvSequence(sequence)
+      }))
+
     it.effect("matches naive greedy generation token-for-token across pool block boundaries", () =>
       Effect.gen(function*() {
         const model = yield* makeGpt()
@@ -665,6 +739,144 @@ onDevices("Inference", () => (it) => {
         const error = yield* Effect.flip(Model.inference(model, params, { maxTokens: 16, blockSize: 4 }))
         expect(error._tag).toBe("InferenceError")
         expect(error.message).toMatch(/only causal attention is cacheable/)
+      }))
+
+    it.effect("releases its computed parameter generation when construction fails", () =>
+      Effect.gen(function*() {
+        const runtime = yield* Runtime.Runtime
+        const diagnostics = runtime.extensions.diagnostics
+        if (diagnostics === undefined) {
+          return yield* Effect.die(new Error("runtime does not provide memory diagnostics"))
+        }
+        const model = yield* makeGpt({ causal: false })
+        const params = yield* Tensor.compute(yield* model.init)
+        const before = yield* diagnostics.externalMemoryBytes
+        yield* Effect.flip(Model.inference(model, params, { maxTokens: 16, blockSize: 4 }))
+        expect(yield* diagnostics.externalMemoryBytes).toBe(before)
+        expect((yield* Tensor.toNumberArray(params[0])).length).toBeGreaterThan(0)
+      }))
+
+    it.effect("releases lazily materialized parameters when construction fails", () =>
+      Effect.gen(function*() {
+        const runtime = yield* Runtime.Runtime
+        const diagnostics = runtime.extensions.diagnostics
+        if (diagnostics === undefined) {
+          return yield* Effect.die(new Error("runtime does not provide memory diagnostics"))
+        }
+        const model = yield* makeGpt({ causal: false })
+        const params = yield* model.init
+        const before = yield* diagnostics.externalMemoryBytes
+        yield* Effect.flip(Model.inference(model, params, { maxTokens: 16, blockSize: 4 }))
+        expect(yield* diagnostics.externalMemoryBytes).toBe(before)
+      }))
+
+    it.effect("returns direct logits rows for single and batched decode", () =>
+      Effect.gen(function*() {
+        const model = yield* makeGpt()
+        const params = yield* Tensor.compute(yield* model.init)
+        const program = yield* Model.inference(model, params, {
+          maxTokens: 64,
+          blockSize: 4,
+          prefillChunk: 4,
+          decodeBatch: 2
+        })
+        const gen = yield* program.generation()
+        const a = yield* gen.add(yield* ids([1, 5, 3]))
+        const b = yield* gen.add(yield* ids([2, 4]))
+        expect(a.logits.shape).toEqual([VOCAB])
+        expect(b.logits.shape).toEqual([VOCAB])
+        const [single] = yield* gen.step([{ seq: a.seq, token: 1 }])
+        const batched = yield* gen.step([
+          { seq: a.seq, token: 2 },
+          { seq: b.seq, token: 3 }
+        ])
+        expect(single.shape).toEqual([VOCAB])
+        expect(batched.map((logits) => logits.shape)).toEqual([[VOCAB], [VOCAB]])
+        yield* Tensor.clearAll([a.logits, b.logits, single, ...batched])
+        yield* gen.close()
+      }))
+
+    it.effect("rejects a model whose output is not batch-by-time-by-vocab logits", () =>
+      Effect.gen(function*() {
+        const model = yield* Model.define({
+          parameters: [],
+          forward: (_, input) => Tensor.cast(input, "f32")
+        })
+        const error = yield* Effect.flip(Model.inference(model, [], { maxTokens: 16, blockSize: 4 }))
+        expect(error._tag).toBe("InferenceError")
+        expect(error.message).toMatch(/model output must be \[1, 4, vocab\]/)
+      }))
+
+    it.effect("validates step entries and keeps finished logits owned by the caller", () =>
+      Effect.gen(function*() {
+        const model = yield* makeGpt()
+        const params = yield* Tensor.compute(yield* model.init)
+        const program = yield* Model.inference(model, params, { maxTokens: 32, blockSize: 4, decodeBatch: 2 })
+        const gen = yield* program.generation()
+        const entry = yield* gen.add(yield* ids([1, 5, 3]))
+        const before = yield* Tensor.toNumberArray(entry.logits)
+        yield* entry.seq.finish()
+        yield* entry.seq.finish()
+        expect(yield* Tensor.toNumberArray(entry.logits)).toEqual(before)
+        expect(yield* gen.live()).toBe(0)
+        const finished = yield* Effect.flip(gen.step([{ seq: entry.seq, token: 1 }]))
+        expect(finished._tag).toBe("InferenceError")
+        expect(finished.message).toMatch(/not a live sequence/)
+        const empty = yield* Effect.flip(gen.step([]))
+        expect(empty.message).toMatch(/at least one entry/)
+        yield* Tensor.clear(entry.logits)
+        yield* gen.close()
+        yield* gen.close()
+      }))
+
+    it.effect("validates inference config and prompt dtype before compilation or execution", () =>
+      Effect.gen(function*() {
+        const model = yield* makeGpt()
+        const params = yield* Tensor.compute(yield* model.init)
+        const badConfigs = [
+          [{ maxTokens: 16, blockSize: 0 }, /blockSize/],
+          [{ maxTokens: 16, blockSize: 4, attentionWindow: 17 }, /attentionWindow/],
+          [{ maxTokens: 16, blockSize: 4, prefillChunk: 0 }, /prefillChunk/],
+          [{ maxTokens: 16, blockSize: 4, decodeBatch: 0 }, /decodeBatch/]
+        ] as const
+        for (const [config, message] of badConfigs) {
+          const error = yield* Effect.flip(Model.inference(model, params, config))
+          expect(error._tag).toBe("InferenceError")
+          expect(error.message).toMatch(message)
+        }
+        const program = yield* Model.inference(model, params, { maxTokens: 16, blockSize: 4 })
+        const gen = yield* program.generation()
+        const wrongDtype = yield* Effect.flip(
+          gen.add(yield* Tensor.fromTypedArray(BigInt64Array.of(1n, 2n), [1, 2]))
+        )
+        expect(wrongDtype._tag).toBe("InferenceError")
+        expect(wrongDtype.message).toMatch(/prompt dtype must be u32/)
+      }))
+
+    it.effect("runs i64 token programs without truncating token state", () =>
+      Effect.gen(function*() {
+        const model = yield* makeGpt()
+        const params = yield* Tensor.compute(yield* model.init)
+        const program = yield* Model.inference(model, params, {
+          maxTokens: 32,
+          blockSize: 4,
+          prefillChunk: 4,
+          tokenDtype: "i64"
+        })
+        const gen = yield* program.generation()
+        const entry = yield* gen.add(yield* Tensor.fromTypedArray(BigInt64Array.of(1n, 5n, 3n), [1, 3]))
+        const output = yield* model.forward(params, yield* ids([1, 5, 3]))
+        const [expected] = yield* Tensor.compute([
+          yield* Tensor.reshape(yield* Tensor.slice(output, { start: [0, 2, 0], end: [1, 3, VOCAB] }), [
+            VOCAB
+          ])
+        ])
+        deep(yield* Tensor.toNumberArray(entry.logits), yield* Tensor.toNumberArray(expected))
+        const [next] = yield* gen.step([{ seq: entry.seq, token: 7 }])
+        expect(next.shape).toEqual([VOCAB])
+        expect(yield* entry.seq.cursor()).toBe(4)
+        yield* Tensor.clearAll([entry.logits, expected, next])
+        yield* gen.close()
       }))
 
     it.effect("validates the add calling convention", () =>

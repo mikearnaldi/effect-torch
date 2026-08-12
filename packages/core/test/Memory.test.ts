@@ -31,6 +31,20 @@ layer(BackendCpu.layer)("Memory", (it) => {
         assert.strictEqual(yield* externalMemoryBytes, before)
       }))
 
+    it.effect("clearAll releases every tensor immediately", () =>
+      Effect.gen(function*() {
+        const bytes = 2 * 1024 * 1024 * 4
+        collectGarbage()
+        const before = yield* externalMemoryBytes
+        const tensors = yield* Tensor.compute([
+          yield* Tensor.zeros([1024, 1024]),
+          yield* Tensor.ones([1024, 1024])
+        ])
+        assert.strictEqual((yield* externalMemoryBytes) - before, bytes)
+        yield* Tensor.clearAll(tensors)
+        assert.strictEqual(yield* externalMemoryBytes, before)
+      }))
+
     it.effect("use after clear is a typed error, through the handle and the graph", () =>
       Effect.gen(function*() {
         const [t] = yield* Tensor.compute([yield* Tensor.zeros([4])])
@@ -42,6 +56,15 @@ layer(BackendCpu.layer)("Memory", (it) => {
         const viaGraph = yield* Effect.flip(Tensor.toNumberArray(downstream))
         assert.strictEqual(viaGraph._tag, "TensorError")
         expect(viaGraph.message).toMatch(/cleared/)
+      }))
+
+    it.effect("clearing a computed concrete root does not consume the source", () =>
+      Effect.gen(function*() {
+        const [source] = yield* Tensor.compute([yield* Tensor.ones([4])])
+        const [copy] = yield* Tensor.compute([source])
+        yield* Tensor.clear(copy)
+        assert.deepStrictEqual(yield* Tensor.toNumberArray(source), [1, 1, 1, 1])
+        yield* Tensor.clear(source)
       }))
 
     it.effect("runtime tensor bytes are reported on compute and released on GC", () =>

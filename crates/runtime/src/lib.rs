@@ -4,6 +4,7 @@ mod dense;
 mod dtype;
 mod error;
 mod executable;
+mod gguf;
 mod layout;
 mod memory;
 mod program;
@@ -20,6 +21,10 @@ pub use dense::{
 pub use dtype::DType;
 pub use error::{BackendError, BackendResult};
 pub use executable::{CompilePhaseTiming, ExecutableDiagnostics, InstructionCount};
+pub use gguf::{
+    parse_gguf, read_gguf_tensor_into, GgmlKQuant, GgufFile, GgufMetadataArray, GgufMetadataEntry,
+    GgufMetadataValue, GgufParseError, GgufTensorDescriptor, GgufTensorFormat,
+};
 pub use layout::{broadcast_shape, Layout};
 pub use memory::{
     AllocationReport, InvocationMemoryReport, Location, MemoryPlan, MemoryPlanError, MemoryReport,

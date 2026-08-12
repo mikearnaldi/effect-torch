@@ -9,6 +9,7 @@ pub mod matmul;
 pub mod napi;
 pub mod ops;
 pub mod pool;
+mod quantized;
 pub mod random;
 pub mod reduce;
 pub mod storage;

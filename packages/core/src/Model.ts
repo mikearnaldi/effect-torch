@@ -37,7 +37,7 @@
  *
  * @since 0.1.0
  */
-import { Data, Effect, Semaphore } from "effect"
+import { Data, Effect, Exit, Semaphore } from "effect"
 import * as Gradient from "./Gradient.ts"
 import * as Runtime from "./Runtime.ts"
 import * as Tensor from "./Tensor.ts"
@@ -60,8 +60,21 @@ export class ModelError extends Data.TaggedError("ModelError")<{
 }> {}
 
 /**
- * A model's parameters: a flat array of tensors in `names` order. Its
- * length is the model arity; parameterless models use the empty array.
+ * The stable name and logical shape of one model parameter.
+ *
+ * @since 0.1.0
+ * @category models
+ */
+export interface ParameterSpec {
+  /** Stable parameter identity. */
+  readonly name: string
+  /** Logical tensor shape, independent of its physical storage. */
+  readonly shape: ReadonlyArray<number>
+}
+
+/**
+ * A model's parameters in {@link Model.parameters} order. Its length is
+ * the model arity; parameterless models use the empty array.
  *
  * @since 0.1.0
  * @category models
@@ -73,16 +86,17 @@ export type Params = ReadonlyArray<Tensor.Any>
  * initial parameters as lazy graph values, and a forward function that
  * extends the graph — parameters and input in, lazy output out.
  *
- * Parameters are a flat array of tensors in `names` order, so the
- * existing training path (`Gradient.grad` followed by an optimizer step)
- * works on any model with zero adapter code. Configuration (feature
- * counts, activation choice) lives in the closure of the factory, never
- * in the parameters.
+ * Parameters are a flat array of tensors in `names` order, so the existing
+ * training path (`Gradient.grad` followed by an optimizer step) works on any
+ * model with zero adapter code. Storage precision is tensor metadata and does
+ * not change the model parameter contract.
  *
  * @since 0.1.0
  * @category models
  */
 export interface Model {
+  /** Logical parameter specifications in parameter-array order. */
+  readonly parameters: ReadonlyArray<ParameterSpec>
   /**
    * Stable parameter identities, one per parameter, in the same order
    * as the parameter array. Also serves as the model's arity;
@@ -94,7 +108,7 @@ export interface Model {
    * once with {@link Tensor.compute} before retaining them across separate
    * evaluations; {@link inference} performs that materialization eagerly.
    */
-  readonly init: Effect.Effect<Params, Tensor.TensorError, Runtime.Runtime>
+  readonly init: Effect.Effect<Params, ModelError | Tensor.TensorError, Runtime.Runtime>
   /**
    * Extends the graph: parameters and input in, lazy output out.
    * Single-input, single-output; differentiated as-is by
@@ -112,9 +126,10 @@ export interface Model {
    * materialized output out. With concrete inputs, each invocation makes one
    * native program call after the first call per signature pays the trace;
    * lazy inputs are first materialized through the common executable path. The
-   * cache signature includes runtime identity and every parameter and input tensor's
-   * shape, dtype, and placement; values do not affect it. Any signature change
-   * traces a new program automatically. Ready entries use a 32-entry LRU, so
+   * cache signature includes runtime identity and every parameter and input
+   * tensor's shape, dtype, storage encoding, and placement; values do not affect
+   * it. Any signature change traces a new program automatically. Ready entries
+   * use a 32-entry LRU, so
    * eviction, clearing, or a failed trace can retrace a previously seen
    * signature. `execute` borrows and does not retain parameter
    * values, so materialize lazy initializers once before repeated calls. Use it
@@ -139,15 +154,20 @@ export interface Model {
 }
 
 /**
- * The definition every constructor supplies; {@link make} attaches the
- * compiled execution machinery.
+ * A public model definition. Omitting `init` creates a load-only model.
  *
  * @since 0.1.0
  * @category models
  */
+export interface Definition {
+  readonly parameters: ReadonlyArray<ParameterSpec>
+  readonly init?: Effect.Effect<Params, Tensor.TensorError, Runtime.Runtime>
+  readonly forward: Model["forward"]
+}
+
 interface ModelDef {
-  readonly names: ReadonlyArray<string>
-  readonly init: Effect.Effect<Params, Tensor.TensorError, Runtime.Runtime>
+  readonly parameters: ReadonlyArray<ParameterSpec>
+  readonly init: Effect.Effect<Params, ModelError | Tensor.TensorError, Runtime.Runtime>
   readonly forward: Model["forward"]
 }
 
@@ -191,12 +211,52 @@ const ModelProto = {
 
 const make = (def: ModelDef): Model => {
   const self = Object.create(ModelProto) as ModelInternal
-  self.names = def.names
+  self.parameters = def.parameters
+  self.names = def.parameters.map((parameter) => parameter.name)
   self.init = def.init
   self.forward = def.forward
   self._fn = undefined
   return self
 }
+
+/**
+ * Validates and constructs a model with the standard compiled execution path.
+ *
+ * @since 0.1.0
+ * @category constructors
+ */
+export const define = (definition: Definition): Effect.Effect<Model, ModelError> =>
+  Effect.gen(function*() {
+    const seen = new Set<string>()
+    for (const parameter of definition.parameters) {
+      if (typeof parameter.name !== "string" || parameter.name.length === 0) {
+        return yield* new ModelError({ op: "define", message: "parameter name must not be empty" })
+      }
+      if (seen.has(parameter.name)) {
+        return yield* new ModelError({ op: "define", message: `duplicate parameter name: ${parameter.name}` })
+      }
+      seen.add(parameter.name)
+      if (!Array.isArray(parameter.shape)) {
+        return yield* new ModelError({ op: "define", message: `${parameter.name}: shape must be an array` })
+      }
+      for (const dimension of parameter.shape) {
+        if (!Number.isSafeInteger(dimension) || dimension < 0) {
+          return yield* new ModelError({
+            op: "define",
+            message: `${parameter.name}: shape dimensions must be non-negative safe integers, got ${dimension}`
+          })
+        }
+      }
+    }
+    return make({
+      parameters: definition.parameters,
+      init: definition.init ?? new ModelError({
+        op: "init",
+        message: "model has no initializer; load parameters before use"
+      }),
+      forward: definition.forward
+    })
+  })
 
 const checkName = (op: string, name: string): Effect.Effect<void, ModelError> =>
   name.length === 0 ? new ModelError({ op, message: "name must not be empty" }) : Effect.void
@@ -222,7 +282,7 @@ const parameterless = (
   apply: (self: Tensor.Any) => Effect.Effect<Tensor.Lazy, Tensor.TensorError, Runtime.Runtime>
 ): Effect.Effect<Model> =>
   Effect.succeed(make({
-    names: [],
+    parameters: [],
     init: Effect.succeed<Params>([]),
     forward: (_, input) => apply(input)
   }))
@@ -248,7 +308,10 @@ export const linear = (
     yield* checkPositiveInt("linear", "outFeatures", outFeatures)
     const names = [`${name}.weight`, `${name}.bias`]
     return make({
-      names,
+      parameters: [
+        { name: names[0], shape: [inFeatures, outFeatures] },
+        { name: names[1], shape: [1, outFeatures] }
+      ],
       init: Effect.gen(function*() {
         const drawn = yield* Tensor.randn([inFeatures, outFeatures])
         const weight = yield* Tensor.mul(drawn, yield* Tensor.constantLike(drawn, 1 / Math.sqrt(inFeatures)))
@@ -302,7 +365,10 @@ export const conv1d = (
     const names = [`${name}.weight`, `${name}.bias`]
     const fanIn = (inChannels / groups) * kernelSize
     return make({
-      names,
+      parameters: [
+        { name: names[0], shape: [outChannels, inChannels / groups, kernelSize] },
+        { name: names[1], shape: [outChannels] }
+      ],
       init: Effect.gen(function*() {
         const drawn = yield* Tensor.randn([outChannels, inChannels / groups, kernelSize])
         const weight = yield* Tensor.mul(drawn, yield* Tensor.constantLike(drawn, 1 / Math.sqrt(fanIn)))
@@ -360,7 +426,10 @@ export const conv2d = (
     const names = [`${name}.weight`, `${name}.bias`]
     const fanIn = (inChannels / groups) * kh * kw
     return make({
-      names,
+      parameters: [
+        { name: names[0], shape: [outChannels, inChannels / groups, kh, kw] },
+        { name: names[1], shape: [outChannels] }
+      ],
       init: Effect.gen(function*() {
         const drawn = yield* Tensor.randn([outChannels, inChannels / groups, kh, kw])
         const weight = yield* Tensor.mul(drawn, yield* Tensor.constantLike(drawn, 1 / Math.sqrt(fanIn)))
@@ -413,7 +482,7 @@ export const embedding = (
     }
     const names = [`${name}.weight`]
     return make({
-      names,
+      parameters: [{ name: names[0], shape: [numEmbeddings, embeddingDim] }],
       init: Effect.gen(function*() {
         const weight = yield* Tensor.randn([numEmbeddings, embeddingDim])
         return [weight] as const
@@ -456,7 +525,7 @@ export const positionEmbedding = (
     yield* checkPositiveInt("positionEmbedding", "embeddingDim", embeddingDim)
     const names = [`${name}.weight`]
     return make({
-      names,
+      parameters: [{ name: names[0], shape: [maxPositions, embeddingDim] }],
       init: Effect.gen(function*() {
         const weight = yield* Tensor.randn([maxPositions, embeddingDim])
         return [weight] as const
@@ -508,7 +577,10 @@ export const layerNorm = (
     }
     const names = [`${name}.weight`, `${name}.bias`]
     return make({
-      names,
+      parameters: [
+        { name: names[0], shape },
+        { name: names[1], shape }
+      ],
       init: Effect.gen(function*() {
         const weight = yield* Tensor.ones(shape)
         const bias = yield* Tensor.zeros(shape)
@@ -590,7 +662,12 @@ export const multiHeadAttention = (
     ]
     const causal = options.causal ?? false
     return make({
-      names,
+      parameters: [
+        { name: names[0], shape: [embedDim, 3 * embedDim] },
+        { name: names[1], shape: [1, 3 * embedDim] },
+        { name: names[2], shape: [embedDim, embedDim] },
+        { name: names[3], shape: [1, embedDim] }
+      ],
       init: Effect.gen(function*() {
         const qkvDrawn = yield* Tensor.randn([embedDim, 3 * embedDim])
         const qkvWeight = yield* Tensor.mul(qkvDrawn, yield* Tensor.constantLike(qkvDrawn, 1 / Math.sqrt(embedDim)))
@@ -735,7 +812,21 @@ export const kimiDeltaAttention = (
         return yield* Tensor.mul(drawn, yield* Tensor.constantLike(drawn, 1 / Math.sqrt(fanIn)))
       })
     return make({
-      names,
+      parameters: [
+        { name: names[0], shape: [embedDim, 3 * embedDim] },
+        { name: names[1], shape: [1, 3 * embedDim] },
+        { name: names[2], shape: [3 * embedDim, 4] },
+        { name: names[3], shape: [embedDim, headDim] },
+        { name: names[4], shape: [headDim, embedDim] },
+        { name: names[5], shape: [numHeads] },
+        { name: names[6], shape: [embedDim] },
+        { name: names[7], shape: [embedDim, numHeads] },
+        { name: names[8], shape: [embedDim, headDim] },
+        { name: names[9], shape: [headDim, embedDim] },
+        { name: names[10], shape: [headDim] },
+        { name: names[11], shape: [embedDim, embedDim] },
+        { name: names[12], shape: [1, embedDim] }
+      ],
       init: Effect.gen(function*() {
         return [
           yield* scaled(embedDim, [embedDim, 3 * embedDim]),
@@ -994,7 +1085,7 @@ export const dropout = (options: Tensor.DropoutOptions = {}): Effect.Effect<Mode
       return yield* new ModelError({ op: "dropout", message: `p must be in [0, 1), got ${p}` })
     }
     return make({
-      names: [],
+      parameters: [],
       init: Effect.succeed<Params>([]),
       forward: (_, input) => Tensor.dropout(input, { p })
     })
@@ -1026,7 +1117,7 @@ const pool = (
       })
     }
     return make({
-      names: [],
+      parameters: [],
       init: Effect.succeed<Params>([]),
       forward: (_, input) => apply(input, options)
     })
@@ -1084,7 +1175,7 @@ export const avgPool2d = (options: Tensor.PoolOptions): Effect.Effect<Model, Mod
  */
 export const checkpoint = (model: Model): Effect.Effect<Model> =>
   Effect.succeed(make({
-    names: model.names,
+    parameters: model.parameters,
     init: model.init,
     forward: (params, input) => Effect.flatMap(model.forward(params, input), Gradient.checkpoint)
   }))
@@ -1101,7 +1192,7 @@ export const checkpoint = (model: Model): Effect.Effect<Model> =>
  */
 export const residual = (model: Model): Effect.Effect<Model> =>
   Effect.succeed(make({
-    names: model.names,
+    parameters: model.parameters,
     init: model.init,
     forward: (params, input) =>
       Effect.gen(function*() {
@@ -1125,7 +1216,7 @@ export const mapInput = (
   f: (input: Tensor.Any) => Effect.Effect<Tensor.Any, Tensor.TensorError, Runtime.Runtime>
 ): Effect.Effect<Model> =>
   Effect.succeed(make({
-    names: model.names,
+    parameters: model.parameters,
     init: model.init,
     forward: (params, input) => Effect.flatMap(f(input), (mapped) => model.forward(params, mapped))
   }))
@@ -1154,7 +1245,8 @@ export const merge = <const M extends ReadonlyArray<Model>>(
   if (models.length === 0) {
     return new ModelError({ op: "merge", message: "at least one model is required" })
   }
-  const names = models.flatMap((model) => model.names)
+  const parameters = models.flatMap((model) => model.parameters)
+  const names = parameters.map((parameter) => parameter.name)
   const seen = new Set<string>()
   const duplicates = new Set<string>()
   for (const name of names) {
@@ -1171,7 +1263,7 @@ export const merge = <const M extends ReadonlyArray<Model>>(
   }
   const arities = models.map((model) => model.names.length)
   return Effect.succeed(make({
-    names,
+    parameters,
     init: Effect.gen(function*() {
       const params: Array<Tensor.Any> = []
       for (const model of models) {
@@ -1233,7 +1325,8 @@ export const chain = (...models: ReadonlyArray<Model>): Effect.Effect<Model, Mod
   if (models.length === 0) {
     return new ModelError({ op: "chain", message: "at least one model is required" })
   }
-  const names = models.flatMap((model) => model.names)
+  const parameters = models.flatMap((model) => model.parameters)
+  const names = parameters.map((parameter) => parameter.name)
   const seen = new Set<string>()
   const duplicates = new Set<string>()
   for (const name of names) {
@@ -1250,7 +1343,7 @@ export const chain = (...models: ReadonlyArray<Model>): Effect.Effect<Model, Mod
   }
   const arities = models.map((model) => model.names.length)
   return Effect.succeed(make({
-    names,
+    parameters,
     init: Effect.gen(function*() {
       const params: Array<Tensor.Any> = []
       for (const model of models) {
@@ -1370,8 +1463,9 @@ export interface InferenceConfig {
   readonly blockSize?: number
   /**
    * Positive integer number of cached positions attended per step, no greater
-   * than `maxTokens`. Omit for full attention. A window permits old KV blocks to be evicted; with
-   * RoPE and no other absolute-position state this can extend generation
+   * than `maxTokens`. Omit for full attention. A window permits old KV blocks to be evicted only
+   * when every attention operation resolves to a local window; an explicit full-attention
+   * operation retains full history. With RoPE and no other absolute-position state this can extend generation
    * beyond `maxTokens` when the pool can hold the active window and block
    * frontier, subject to backend numeric and resource limits. Learned
    * position tables still impose their absolute cursor limit.
@@ -1538,6 +1632,467 @@ export interface InferenceProgram {
   readonly generation: () => Effect.Effect<Generation, InferenceError>
 }
 
+interface ResolvedInferenceConfig {
+  readonly maxTokens: number
+  readonly blockSize: number
+  readonly prefillChunk: number
+  readonly tokenDtype: "u32" | "i64"
+  readonly kvDtype: Tensor.DType
+  readonly decodeBatch: number
+  readonly attentionWindow?: number
+}
+
+const invalidInferenceConfig = (message: string): InferenceError => new InferenceError({ op: "inference", message })
+
+const resolveInferenceConfig = (
+  config: InferenceConfig
+): Effect.Effect<ResolvedInferenceConfig, InferenceError> =>
+  Effect.gen(function*() {
+    const blockSize = config.blockSize ?? 16
+    if (!Number.isInteger(blockSize) || blockSize <= 0) {
+      return yield* invalidInferenceConfig(`blockSize must be a positive integer, got ${config.blockSize}`)
+    }
+    if (
+      !Number.isInteger(config.maxTokens) || config.maxTokens <= 0 || config.maxTokens % blockSize !== 0
+    ) {
+      return yield* invalidInferenceConfig(
+        `maxTokens must be a positive multiple of blockSize ${blockSize}, got ${config.maxTokens}`
+      )
+    }
+    if (
+      config.attentionWindow !== undefined &&
+      (!Number.isInteger(config.attentionWindow) || config.attentionWindow <= 0 ||
+        config.attentionWindow > config.maxTokens)
+    ) {
+      return yield* invalidInferenceConfig(
+        `attentionWindow must be a positive integer no greater than maxTokens, got ${config.attentionWindow}`
+      )
+    }
+    const prefillChunk = config.prefillChunk ?? blockSize
+    if (!Number.isInteger(prefillChunk) || prefillChunk <= 0) {
+      return yield* invalidInferenceConfig(`prefillChunk must be a positive integer, got ${config.prefillChunk}`)
+    }
+    const tokenDtype = config.tokenDtype ?? "u32"
+    if (tokenDtype !== "u32" && tokenDtype !== "i64") {
+      return yield* invalidInferenceConfig(`tokenDtype must be u32 or i64, got ${String(config.tokenDtype)}`)
+    }
+    const configuredKvDtype = config.kvDtype ?? "f32"
+    if (!["f32", "f16", "bf16", "int8"].includes(configuredKvDtype)) {
+      return yield* invalidInferenceConfig(`unsupported kvDtype ${String(config.kvDtype)}`)
+    }
+    const decodeBatch = config.decodeBatch ?? 8
+    if (!Number.isInteger(decodeBatch) || decodeBatch <= 0) {
+      return yield* invalidInferenceConfig(`decodeBatch must be a positive integer, got ${config.decodeBatch}`)
+    }
+    return {
+      maxTokens: config.maxTokens,
+      blockSize,
+      prefillChunk,
+      tokenDtype,
+      kvDtype: configuredKvDtype === "int8" ? "u8" : configuredKvDtype,
+      decodeBatch,
+      ...(config.attentionWindow === undefined ? {} : { attentionWindow: config.attentionWindow })
+    }
+  })
+
+interface DecodeGeometry {
+  readonly layers: number
+  readonly kvHeads: number
+  readonly headDim: number
+  readonly kdaLayers: number
+  readonly kdaHeads: number
+  readonly kdaHeadDim: number
+  readonly kdaValueDim: number
+  readonly convLayers: number
+  readonly convChannels: number
+  readonly convKernel: number
+  readonly window?: number
+}
+
+const decodeGeometry = (program: Tensor.DecodeProgram): DecodeGeometry => ({
+  layers: program.layers,
+  kvHeads: program.kvHeads,
+  headDim: program.headDim,
+  kdaLayers: program.kdaLayers,
+  kdaHeads: program.kdaHeads,
+  kdaHeadDim: program.kdaHeadDim,
+  kdaValueDim: program.kdaValueDim,
+  convLayers: program.convLayers,
+  convChannels: program.convChannels,
+  convKernel: program.convKernel,
+  ...(program.window === undefined ? {} : { window: program.window })
+})
+
+const sameDecodeGeometry = (left: DecodeGeometry, right: DecodeGeometry): boolean =>
+  left.layers === right.layers && left.kvHeads === right.kvHeads && left.headDim === right.headDim &&
+  left.kdaLayers === right.kdaLayers && left.kdaHeads === right.kdaHeads &&
+  left.kdaHeadDim === right.kdaHeadDim && left.kdaValueDim === right.kdaValueDim &&
+  left.convLayers === right.convLayers && left.convChannels === right.convChannels &&
+  left.convKernel === right.convKernel && left.window === right.window
+
+interface InferencePrograms {
+  readonly prefill: Tensor.DecodeProgram
+  readonly decode: Tensor.DecodeProgram
+  readonly batched: Tensor.DecodeProgram | undefined
+  readonly geometry: DecodeGeometry
+  readonly pool: Tensor.KvPool
+}
+
+const logitsVocab = (
+  output: Tensor.Any,
+  batch: number,
+  steps: number
+): Effect.Effect<number, InferenceError> => {
+  const expected = [batch, steps]
+  if (output.shape.length !== 3 || output.shape[0] !== expected[0] || output.shape[1] !== expected[1]) {
+    return new InferenceError({
+      op: "inference",
+      message: `model output must be [${batch}, ${steps}, vocab], got [${output.shape}]`
+    })
+  }
+  return Effect.succeed(output.shape[2]!)
+}
+
+const traceInferenceProgram = (
+  model: Model,
+  frozenParams: ReadonlyArray<Tensor.Concrete>,
+  config: ResolvedInferenceConfig,
+  inputShape: readonly [number, number]
+): Effect.Effect<
+  Tensor.DecodeProgram,
+  InferenceError | ModelError | Tensor.TensorError,
+  Runtime.Runtime
+> =>
+  Effect.gen(function*() {
+    const [programBatch, steps] = inputShape
+    const tokenInput = yield* Tensor.zeros(inputShape, { dtype: config.tokenDtype })
+    const inputs: Array<Tensor.Lazy> = []
+    for (let i = 0; i < frozenParams.length; i++) {
+      inputs.push(yield* Tensor.makeInput(i, frozenParams[i]!))
+    }
+    inputs.push(yield* Tensor.makeInput(inputs.length, tokenInput))
+    const output = yield* model.forward(inputs.slice(0, frozenParams.length), inputs[inputs.length - 1]!)
+    yield* logitsVocab(output, programBatch, steps)
+    return yield* Tensor.compileDecodeProgram([output], {
+      maxTokens: config.maxTokens,
+      blockSize: config.blockSize,
+      kvDtype: config.kvDtype,
+      batch: programBatch,
+      lastTokenRow: true,
+      ...(config.attentionWindow === undefined ? {} : { window: config.attentionWindow })
+    }).pipe(Effect.mapError((error) => new InferenceError({ op: "inference", message: error.message })))
+  })
+
+const compileInferencePrograms = (
+  model: Model,
+  frozenParams: ReadonlyArray<Tensor.Concrete>,
+  config: ResolvedInferenceConfig
+): Effect.Effect<
+  InferencePrograms,
+  InferenceError | ModelError | Tensor.TensorError,
+  Runtime.Runtime
+> =>
+  Effect.gen(function*() {
+    const prefill = yield* traceInferenceProgram(model, frozenParams, config, [1, config.prefillChunk])
+    const decode = yield* traceInferenceProgram(model, frozenParams, config, [1, 1])
+    const batched = config.decodeBatch > 1
+      ? yield* traceInferenceProgram(model, frozenParams, config, [config.decodeBatch, 1])
+      : undefined
+    const geometry = decodeGeometry(prefill)
+    if (
+      !sameDecodeGeometry(geometry, decodeGeometry(decode)) ||
+      (batched !== undefined && !sameDecodeGeometry(geometry, decodeGeometry(batched)))
+    ) {
+      return yield* new InferenceError({
+        op: "inference",
+        message: "prefill and decode traces disagree on attention geometry or retention policy"
+      })
+    }
+    const pool = yield* Tensor.makeKvPool(
+      geometry.layers,
+      geometry.kvHeads,
+      geometry.headDim,
+      config.maxTokens,
+      config.blockSize,
+      config.kvDtype,
+      {
+        kdaLayers: geometry.kdaLayers,
+        kdaHeads: geometry.kdaHeads,
+        kdaHeadDim: geometry.kdaHeadDim,
+        kdaValueDim: geometry.kdaValueDim,
+        convLayers: geometry.convLayers,
+        convChannels: geometry.convChannels,
+        convKernel: geometry.convKernel
+      }
+    ).pipe(Effect.mapError((error) => new InferenceError({ op: "inference", message: error.message })))
+    return { prefill, decode, batched, geometry, pool }
+  })
+
+interface PrefillChunkPlan {
+  readonly offset: number
+  readonly real: number
+  readonly final: boolean
+}
+
+const planPrefillChunks = (
+  total: number,
+  matched: number,
+  chunk: number
+): ReadonlyArray<PrefillChunkPlan> => {
+  const chunks: Array<PrefillChunkPlan> = []
+  for (let offset = matched; offset < total; offset += chunk) {
+    const real = Math.min(chunk, total - offset)
+    chunks.push({ offset, real, final: offset + real === total })
+  }
+  return chunks
+}
+
+const validatePrompt = (
+  prompt: Tensor.Any,
+  config: ResolvedInferenceConfig,
+  runtime: Runtime.RuntimeService
+): Effect.Effect<void, InferenceError> => {
+  if (prompt.placement.id !== runtime.placement.id) {
+    return new InferenceError({ op: "add", message: "prompt must use the inference program runtime and placement" })
+  }
+  if (prompt.dtype !== config.tokenDtype) {
+    return new InferenceError({
+      op: "add",
+      message: `prompt dtype must be ${config.tokenDtype}, got ${prompt.dtype}`
+    })
+  }
+  if (prompt.shape.length !== 2 || prompt.shape[0] !== 1 || prompt.shape[1]! < 1) {
+    return new InferenceError({
+      op: "add",
+      message: `add expects a prompt of shape [1, T] with T >= 1, got [${prompt.shape}]`
+    })
+  }
+  return Effect.void
+}
+
+const readTokenIds = (tokens: Tensor.Any): Effect.Effect<Array<number>, InferenceError, Runtime.Runtime> => {
+  const read = tokens.dtype === "i64"
+    ? Effect.gen(function*() {
+      const values = yield* Tensor.toTypedArray(tokens)
+      const ids: Array<number> = []
+      for (const value of values) {
+        if (typeof value !== "bigint" || value < 0n || value > 0xffff_ffffn) {
+          return yield* new InferenceError({
+            op: "prefill",
+            message: `token ids must fit u32 for decode state, got ${String(value)}`
+          })
+        }
+        ids.push(Number(value))
+      }
+      return ids
+    })
+    : Tensor.toNumberArray(tokens)
+  return Effect.mapError(read, (error) =>
+    error instanceof InferenceError
+      ? error
+      : new InferenceError({ op: "prefill", message: `token ids must be readable integers: ${error.message}` }))
+}
+
+const tokenTensor = (
+  ids: ReadonlyArray<number>,
+  shape: ReadonlyArray<number>,
+  dtype: "u32" | "i64"
+): Effect.Effect<Tensor.Lazy, Tensor.TensorError, Runtime.Runtime> =>
+  Tensor.fromTypedArray(dtype === "i64" ? BigInt64Array.from(ids.map(BigInt)) : Uint32Array.from(ids), shape)
+
+const prefillInput = (
+  prompt: Tensor.Any,
+  chunk: PrefillChunkPlan,
+  config: ResolvedInferenceConfig
+): Effect.Effect<Tensor.Lazy, Tensor.TensorError, Runtime.Runtime> =>
+  Effect.gen(function*() {
+    let input = yield* Tensor.slice(prompt, {
+      start: [0, chunk.offset],
+      end: [1, chunk.offset + chunk.real]
+    })
+    if (chunk.real < config.prefillChunk) {
+      input = yield* Tensor.concat([
+        input,
+        yield* Tensor.zeros([1, config.prefillChunk - chunk.real], { dtype: config.tokenDtype })
+      ], { dim: 1 })
+    }
+    return input
+  })
+
+const prefillInputs = (
+  frozenParams: ReadonlyArray<Tensor.Concrete>,
+  input: Tensor.Any
+): Effect.Effect<Array<Tensor.Any>, Tensor.TensorError, Runtime.Runtime> => Effect.succeed([...frozenParams, input])
+
+interface LiveEntry {
+  readonly seq: GenerationSeq
+}
+
+const releaseLiveEntry = (live: Array<LiveEntry>, entry: LiveEntry) =>
+  Effect.gen(function*() {
+    const index = live.indexOf(entry)
+    if (index < 0) return
+    yield* Tensor.releaseKvSequence(entry.seq.sequence)
+    live.splice(index, 1)
+  })
+
+const closeLiveEntries = (
+  live: Array<LiveEntry>
+): Effect.Effect<void, Tensor.TensorError, Runtime.Runtime> =>
+  Effect.gen(function*() {
+    const entries = live.splice(0)
+    let failure: Exit.Failure<void, Tensor.TensorError> | undefined
+    for (const entry of entries) {
+      const exit = yield* Effect.exit(Tensor.releaseKvSequence(entry.seq.sequence))
+      if (Exit.isFailure(exit)) {
+        live.push(entry)
+        failure ??= exit
+      }
+    }
+    if (failure !== undefined) {
+      return yield* Effect.failCause(failure.cause)
+    }
+  })
+
+const validateStepEntries = (
+  live: ReadonlyArray<LiveEntry>,
+  decodeBatch: number,
+  entries: ReadonlyArray<{ readonly seq: GenerationSeq; readonly token: number }>
+): Effect.Effect<void, InferenceError> =>
+  Effect.gen(function*() {
+    if (entries.length === 0) {
+      return yield* new InferenceError({ op: "step", message: "step expects at least one entry" })
+    }
+    if (entries.length > decodeBatch) {
+      return yield* new InferenceError({
+        op: "step",
+        message: `step accepts at most decodeBatch (${decodeBatch}) entries, got ${entries.length}`
+      })
+    }
+    for (const [index, entry] of entries.entries()) {
+      if (!Number.isInteger(entry.token) || entry.token < 0) {
+        return yield* new InferenceError({
+          op: "step",
+          message: `step expects token ids (non-negative integers), got ${entry.token}`
+        })
+      }
+      if (!live.some((liveEntry) => liveEntry.seq === entry.seq)) {
+        return yield* new InferenceError({
+          op: "step",
+          message: `entry ${index} is not a live sequence of this session`
+        })
+      }
+      if (entries.findIndex((other) => other.seq === entry.seq) !== index) {
+        return yield* new InferenceError({ op: "step", message: "step entries must be distinct sequences" })
+      }
+    }
+  })
+
+interface InferenceEngine {
+  readonly config: ResolvedInferenceConfig
+  readonly frozenParams: ReadonlyArray<Tensor.Concrete>
+  readonly programs: InferencePrograms
+}
+
+const openGeneration = (engine: InferenceEngine): Effect.Effect<Generation, never> =>
+  Effect.gen(function*() {
+    const roundLock = yield* Semaphore.make(1)
+    const live: Array<LiveEntry> = []
+    const config = engine.config
+    const programs = engine.programs
+    const add: Generation["add"] = (prompt) =>
+      Effect.gen(function*() {
+        const runtime = yield* Runtime.Runtime
+        if (live.length >= config.decodeBatch) {
+          return yield* new InferenceError({
+            op: "add",
+            message: `a session holds at most decodeBatch (${config.decodeBatch}) live sequences; finish one first`
+          })
+        }
+        yield* validatePrompt(prompt, config, runtime)
+        const [materializedPrompt] = yield* Tensor.compute([prompt])
+        return yield* Effect.gen(function*() {
+          const ids = yield* readTokenIds(materializedPrompt)
+          const sequence = yield* Tensor.makeKvSequence(programs.pool)
+          return yield* Effect.gen(function*() {
+            const matched = yield* Tensor.kvPrefillMatch(sequence, ids)
+            let logits: Tensor.Concrete | undefined
+            for (const chunk of planPrefillChunks(ids.length, matched, config.prefillChunk)) {
+              const input = yield* prefillInput(materializedPrompt, chunk, config)
+              const inputs = yield* prefillInputs(engine.frozenParams, input)
+              const [output] = yield* Tensor.runDecodeProgram(
+                programs.prefill,
+                inputs,
+                sequence,
+                ids.slice(chunk.offset, chunk.offset + chunk.real)
+              )
+              if (chunk.final) {
+                logits = output
+              } else {
+                yield* Tensor.clear(output)
+              }
+            }
+            if (logits === undefined) {
+              return yield* new InferenceError({ op: "prefill", message: "prefill produced no logits" })
+            }
+            const entry: LiveEntry = {
+              seq: {
+                sequence,
+                cursor: () => Tensor.kvSequenceCursor(sequence),
+                finish: () => releaseLiveEntry(live, entry)
+              }
+            }
+            live.push(entry)
+            return { seq: entry.seq, logits } satisfies GenerationEntry
+          }).pipe(
+            Effect.onExit((exit) =>
+              Exit.isFailure(exit) ? Effect.ignore(Tensor.releaseKvSequence(sequence)) : Effect.void
+            )
+          )
+        }).pipe(Effect.ensuring(Effect.ignore(Tensor.clear(materializedPrompt))))
+      })
+    const step: Generation["step"] = (entries) =>
+      roundLock.withPermits(1)(
+        Effect.gen(function*() {
+          yield* validateStepEntries(live, config.decodeBatch, entries)
+          if (entries.length === 1) {
+            const entry = entries[0]!
+            const input = yield* tokenTensor([entry.token], [1, 1], config.tokenDtype)
+            const [output] = yield* Tensor.runDecodeProgram(
+              programs.decode,
+              [...engine.frozenParams, input],
+              entry.seq.sequence,
+              [entry.token]
+            )
+            return [output]
+          }
+          if (programs.batched === undefined) {
+            return yield* new InferenceError({
+              op: "step",
+              message: `stepping ${entries.length} sequences needs decodeBatch > 1`
+            })
+          }
+          const ids = entries.map((entry) => entry.token)
+          const input = yield* tokenTensor(ids, [entries.length, 1], config.tokenDtype)
+          const outputs = yield* Tensor.runBatchedDecodeProgram(
+            programs.batched,
+            [...engine.frozenParams, input],
+            entries.map((entry) => entry.seq.sequence),
+            ids.map((id) => [id])
+          )
+          const selected = outputs.slice(0, entries.length)
+          yield* Tensor.clearAll(outputs.slice(entries.length))
+          return selected
+        })
+      )
+    return {
+      add,
+      step,
+      live: () => Effect.sync(() => live.length),
+      close: () => closeLiveEntries(live)
+    }
+  })
+
 /**
  * Compiles a model for generation. The same `forward` graph builder is
  * traced with placeholders and decode-specialized natively: causal attention
@@ -1547,8 +2102,9 @@ export interface InferenceProgram {
  * `decodeBatch > 1`. There is no shape-keyed growth or later tracing.
  *
  * The model must return logits exactly as `[batch, T, vocab]`, preserving
- * the two token-input axes; generation returns the selected final-position
- * row as `[vocab]`. Stateless graphs are accepted. Causal attention, KDA,
+ * the two token-input axes; generation returns the advance-selected
+ * final-position row as `[vocab]`, extracted natively by the decode
+ * specialization (`lastTokenRow`). Stateless graphs are accepted. Causal attention, KDA,
  * short convolution, and position operations use incremental state or cursor
  * specialization when present. Non-causal attention and runtime scalar inputs
  * fail with an {@link InferenceError}. Learned position
@@ -1578,339 +2134,18 @@ export const inference = (
 ): Effect.Effect<InferenceProgram, InferenceError | ModelError | Tensor.TensorError, Runtime.Runtime> =>
   Effect.gen(function*() {
     yield* checkArity("inference", model.names, params)
-    // Freeze the weights: params may be lazy graphs (init draws), and a
-    // compiled run materializes its inputs per call — without a single
-    // up-front materialization every prefill/step would re-draw.
+    const resolved = yield* resolveInferenceConfig(config)
     const frozenParams = yield* Tensor.compute(params)
-    const blockSize = config.blockSize ?? 16
-    if (
-      !Number.isInteger(config.maxTokens) || config.maxTokens <= 0 || config.maxTokens % blockSize !== 0
-    ) {
-      return yield* new InferenceError({
-        op: "inference",
-        message: `maxTokens must be a positive multiple of blockSize ${blockSize}, got ${config.maxTokens}`
-      })
-    }
-    if (
-      config.attentionWindow !== undefined &&
-      (!Number.isInteger(config.attentionWindow) || config.attentionWindow <= 0)
-    ) {
-      return yield* new InferenceError({
-        op: "inference",
-        message: `attentionWindow must be a positive integer, got ${config.attentionWindow}`
-      })
-    }
-    const prefillChunk = config.prefillChunk ?? blockSize
-    if (!Number.isInteger(prefillChunk) || prefillChunk <= 0) {
-      return yield* new InferenceError({
-        op: "inference",
-        message: `prefillChunk must be a positive integer, got ${config.prefillChunk}`
-      })
-    }
-    const tokenDtype = config.tokenDtype ?? "u32"
-    const decodeBatch = config.decodeBatch ?? 8
-    if (!Number.isInteger(decodeBatch) || decodeBatch <= 0) {
-      return yield* new InferenceError({
-        op: "inference",
-        message: `decodeBatch must be a positive integer, got ${config.decodeBatch}`
-      })
-    }
-    // Eager: two signatures always exist ([1, prefillChunk], [1, 1]),
-    // plus [decodeBatch, 1] when decodeBatch > 1. Dtype/device are config,
-    // so every program and the pool are built now; construction errors
-    // surface here rather than on first use.
-    const trace = (inputShape: ReadonlyArray<number>, batch?: number) =>
+    return yield* Effect.onExit(
       Effect.gen(function*() {
-        const exemplar = yield* Tensor.zeros(inputShape, { dtype: tokenDtype })
-        const placeholders: Array<Tensor.Lazy> = []
-        for (let i = 0; i < frozenParams.length; i++) {
-          placeholders.push(yield* Tensor.makeInput(i, frozenParams[i]))
-        }
-        placeholders.push(yield* Tensor.makeInput(frozenParams.length, exemplar))
-        const output = yield* model.forward(placeholders.slice(0, -1), placeholders[placeholders.length - 1])
-        const state = {
-          maxTokens: config.maxTokens,
-          blockSize,
-          kvDtype: config.kvDtype === "int8" ? "u8" as const : (config.kvDtype ?? "f32"),
-          batch: batch ?? 1,
-          ...(config.attentionWindow === undefined ? {} : { window: config.attentionWindow })
-        }
-        return yield* Tensor.compileDecodeProgram([output], state).pipe(
-          Effect.mapError((error) => new InferenceError({ op: "inference", message: error.message }))
-        )
-      })
-    const prefillProgram = yield* trace([1, prefillChunk])
-    const decodeProgram = yield* trace([1, 1])
-    const batchedProgram = decodeBatch > 1 ? yield* trace([decodeBatch, 1], decodeBatch) : undefined
-    const geometryOf = (program: Tensor.DecodeProgram) => [
-      program.layers,
-      program.kvHeads,
-      program.headDim,
-      program.kdaLayers,
-      program.kdaHeads,
-      program.kdaHeadDim,
-      program.kdaValueDim,
-      program.convLayers,
-      program.convChannels,
-      program.convKernel
-    ]
-    const sameGeometry = (a: Tensor.DecodeProgram, b: Tensor.DecodeProgram) =>
-      geometryOf(a).every((value, index) => value === geometryOf(b)[index])
-    if (
-      !sameGeometry(prefillProgram, decodeProgram) ||
-      (batchedProgram !== undefined && !sameGeometry(batchedProgram, decodeProgram))
-    ) {
-      return yield* new InferenceError({
-        op: "inference",
-        message: "prefill and decode traces disagree on attention geometry"
-      })
-    }
-    const pool = yield* Tensor.makeKvPool(
-      prefillProgram.layers,
-      prefillProgram.kvHeads,
-      prefillProgram.headDim,
-      config.maxTokens,
-      blockSize,
-      config.kvDtype === "int8" ? "u8" : (config.kvDtype ?? "f32"),
-      {
-        kdaLayers: prefillProgram.kdaLayers,
-        kdaHeads: prefillProgram.kdaHeads,
-        kdaHeadDim: prefillProgram.kdaHeadDim,
-        kdaValueDim: prefillProgram.kdaValueDim,
-        convLayers: prefillProgram.convLayers,
-        convChannels: prefillProgram.convChannels,
-        convKernel: prefillProgram.convKernel
-      }
-    ).pipe(Effect.mapError((error) => new InferenceError({ op: "inference", message: error.message })))
-    const tokenIds = (op: "prefill" | "step", tokens: Tensor.Any) =>
-      Effect.mapError(
-        Effect.flatMap(
-          tokens.dtype === "u32" ? Effect.succeed(tokens) : Tensor.cast(tokens, "u32"),
-          Tensor.toNumberArray
-        ),
-        (error) => new InferenceError({ op, message: `token ids must be readable integers: ${error.message}` })
-      )
-    interface LiveEntry {
-      readonly seq: GenerationSeq
-      readonly sequence: Tensor.KvSequence
-    }
-    const compileLogitRows = (
-      op: "prefill" | "step",
-      program: Tensor.DecodeProgram,
-      rows: ReadonlyArray<readonly [batch: number, token: number]>
-    ) =>
-      Effect.gen(function*() {
-        const output = program.outputs[0]
-        if (program.outputs.length !== 1 || output === undefined || output.shape.length !== 3) {
-          return yield* new InferenceError({
-            op,
-            message: `model output must be [batch, T, vocab], got ${program.outputs.length} output(s)${
-              output === undefined ? "" : ` with first shape [${output.shape}]`
-            }`
-          })
-        }
-        const [batch, steps, vocab] = output.shape
-        for (const [rowBatch, rowToken] of rows) {
-          if (rowBatch < 0 || rowBatch >= batch! || rowToken < 0 || rowToken >= steps!) {
-            return yield* new InferenceError({
-              op,
-              message: `logit row [${rowBatch}, ${rowToken}] is outside model output [${output.shape}]`
-            })
-          }
-        }
-        const exemplar = yield* Tensor.zeros(output.shape, { dtype: output.dtype })
-        const placeholder = yield* Tensor.makeInput(0, exemplar)
-        const roots: Array<Tensor.Lazy> = []
-        for (const [rowBatch, rowToken] of rows) {
-          const row = yield* Tensor.slice(placeholder, {
-            start: [rowBatch, rowToken, 0],
-            end: [rowBatch + 1, rowToken + 1, vocab]
-          })
-          roots.push(yield* Tensor.reshape(row, [vocab!]))
-        }
-        return yield* Tensor.freezeProgram(roots)
-      })
-    const prefillExtractors: Array<Tensor.CompiledProgram> = []
-    for (let row = 0; row < prefillChunk; row++) {
-      prefillExtractors.push(yield* compileLogitRows("prefill", prefillProgram, [[0, row]]))
-    }
-    const decodeExtractor = yield* compileLogitRows("step", decodeProgram, [[0, 0]])
-    const batchedExtractors: Array<Tensor.CompiledProgram | undefined> = []
-    if (batchedProgram !== undefined) {
-      for (let active = 2; active <= decodeBatch; active++) {
-        batchedExtractors[active] = yield* compileLogitRows(
-          "step",
-          batchedProgram,
-          Array.from({ length: active }, (_, row) => [row, 0] as const)
-        )
-      }
-    }
-    const extractLogits = (
-      output: Tensor.Concrete,
-      extractor: Tensor.CompiledProgram
-    ): Effect.Effect<Array<Tensor.Concrete>, Tensor.TensorError, Runtime.Runtime> =>
-      Tensor.runProgram(extractor, [output]).pipe(Effect.ensuring(Effect.ignore(Tensor.clear(output))))
-    const idTensor = (ids: ReadonlyArray<number>, shape: ReadonlyArray<number>) =>
-      Tensor.fromTypedArray(
-        tokenDtype === "i64" ? BigInt64Array.from(ids.map(BigInt)) : Uint32Array.from(ids),
-        shape
-      )
-    const self: InferenceProgram = {
-      generation: () =>
-        Effect.gen(function*() {
-          const roundLock = yield* Semaphore.make(1)
-          const live: Array<LiveEntry> = []
-          const add = (prompt: Tensor.Any) =>
-            Effect.gen(function*() {
-              const runtime = yield* Runtime.Runtime
-              if (live.length >= decodeBatch) {
-                return yield* new InferenceError({
-                  op: "add",
-                  message: `a session holds at most decodeBatch (${decodeBatch}) live sequences; finish one first`
-                })
-              }
-              if (prompt.placement.id !== runtime.placement.id) {
-                return yield* new InferenceError({
-                  op: "add",
-                  message: "prompt must use the inference program runtime and placement"
-                })
-              }
-              if (prompt.shape.length !== 2 || prompt.shape[0] !== 1 || prompt.shape[1] < 1) {
-                return yield* new InferenceError({
-                  op: "add",
-                  message: `add expects a prompt of shape [1, T] with T >= 1, got [${prompt.shape}]`
-                })
-              }
-              const ids = yield* tokenIds("prefill", prompt)
-              const t = ids.length
-              const sequence = yield* Tensor.makeKvSequence(pool)
-              let retained = false
-              return yield* Effect.gen(function*() {
-                // The pool's prefix cache supplies the longest resident
-                // prefix (whole blocks only); only the suffix is
-                // computed. Stacks with recurrent (KDA/conv) layers skip
-                // the prefix cache: the KV blocks say nothing about the
-                // recurrent state, so reuse would silently corrupt it
-                // (RFC 0018 v1 limitation).
-                const matched = prefillProgram.kdaLayers > 0 || prefillProgram.convLayers > 0
-                  ? 0
-                  : yield* Tensor.kvPrefillMatch(sequence, ids)
-                let logits: Tensor.Concrete | undefined
-                for (let offset = matched; offset < t; offset += prefillChunk) {
-                  const real = Math.min(prefillChunk, t - offset)
-                  let input = yield* Tensor.slice(prompt, { start: [0, offset], end: [1, offset + real] })
-                  if (real < prefillChunk) {
-                    const pad = yield* Tensor.zeros([1, prefillChunk - real], { dtype: prompt.dtype })
-                    input = yield* Tensor.concat([input, pad], { dim: 1 })
-                  }
-                  const [output] = yield* Tensor.runDecodeProgram(
-                    prefillProgram,
-                    [...frozenParams, input],
-                    sequence,
-                    ids.slice(offset, offset + real)
-                  )
-                  if (offset + real === t) {
-                    const [last] = yield* extractLogits(output, prefillExtractors[real - 1]!)
-                    logits = last
-                  } else {
-                    yield* Tensor.clear(output)
-                  }
-                }
-                const seq: GenerationSeq = {
-                  sequence,
-                  cursor: () => Tensor.kvSequenceCursor(sequence),
-                  finish: () =>
-                    Effect.gen(function*() {
-                      const i = live.findIndex((e) => e.seq === seq)
-                      if (i >= 0) {
-                        yield* Tensor.releaseKvSequence(sequence)
-                        live.splice(i, 1)
-                      }
-                    })
-                }
-                live.push({ seq, sequence })
-                retained = true
-                return { seq, logits: logits as Tensor.Concrete } satisfies GenerationEntry
-              }).pipe(
-                Effect.ensuring(
-                  Effect.suspend(() => retained ? Effect.void : Effect.ignore(Tensor.releaseKvSequence(sequence)))
-                )
-              )
-            })
-          const generation: Generation = {
-            add,
-            step: (entries) =>
-              roundLock.withPermits(1)(
-                Effect.gen(function*() {
-                  if (entries.length === 0) {
-                    return yield* new InferenceError({
-                      op: "step",
-                      message: "step expects at least one entry"
-                    })
-                  }
-                  if (entries.length > decodeBatch) {
-                    return yield* new InferenceError({
-                      op: "step",
-                      message: `step accepts at most decodeBatch (${decodeBatch}) entries, got ${entries.length}`
-                    })
-                  }
-                  for (const [i, entry] of entries.entries()) {
-                    if (!Number.isInteger(entry.token) || entry.token < 0) {
-                      return yield* new InferenceError({
-                        op: "step",
-                        message: `step expects token ids (non-negative integers), got ${entry.token}`
-                      })
-                    }
-                    if (!live.some((e) => e.seq === entry.seq)) {
-                      return yield* new InferenceError({
-                        op: "step",
-                        message: `entry ${i} is not a live sequence of this session`
-                      })
-                    }
-                    if (entries.findIndex((other) => other.seq === entry.seq) !== i) {
-                      return yield* new InferenceError({
-                        op: "step",
-                        message: "step entries must be distinct sequences"
-                      })
-                    }
-                  }
-                  if (entries.length === 1) {
-                    const entry = entries[0]!
-                    const input = yield* idTensor([entry.token], [1, 1])
-                    const [output] = yield* Tensor.runDecodeProgram(
-                      decodeProgram,
-                      [...frozenParams, input],
-                      entry.seq.sequence,
-                      [entry.token]
-                    )
-                    return yield* extractLogits(output, decodeExtractor)
-                  }
-                  if (batchedProgram === undefined) {
-                    return yield* new InferenceError({
-                      op: "step",
-                      message: `stepping ${entries.length} sequences needs decodeBatch > 1`
-                    })
-                  }
-                  const ids = entries.map((entry) => entry.token)
-                  const input = yield* idTensor(ids, [entries.length, 1])
-                  const [output] = yield* Tensor.runBatchedDecodeProgram(
-                    batchedProgram,
-                    [...frozenParams, input],
-                    entries.map((entry) => entry.seq.sequence),
-                    ids.map((id) => [id])
-                  )
-                  return yield* extractLogits(output, batchedExtractors[entries.length]!)
-                })
-              ),
-            live: () => Effect.sync(() => live.length),
-            close: () =>
-              Effect.gen(function*() {
-                yield* Effect.forEach(live, (entry) => Tensor.releaseKvSequence(entry.sequence), { discard: true })
-                live.length = 0
-              })
-          }
-          return generation
-        })
-    }
-    return self
+        const programs = yield* compileInferencePrograms(model, frozenParams, resolved)
+        return {
+          generation: () => openGeneration({ config: resolved, frozenParams, programs })
+        } satisfies InferenceProgram
+      }),
+      (exit) =>
+        Exit.isFailure(exit)
+          ? Effect.forEach(frozenParams, (parameter) => Effect.ignore(Tensor.clear(parameter)), { discard: true })
+          : Effect.void
+    )
   })

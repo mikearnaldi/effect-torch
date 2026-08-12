@@ -43,7 +43,7 @@ pub fn requirements(
             .checked_mul(dtype.size_in_bytes())
             .ok_or_else(|| "rotary: requirement byte size overflow".to_string())?,
         state_next_bytes: 0,
-        staging_bytes: shape[0]
+        staging_bytes: (if shape.len() == 2 { 1 } else { shape[0] })
             .checked_mul(crate::runtime::dtype::DType::F32.size_in_bytes())
             .ok_or_else(|| "rotary: requirement staging size overflow".to_string())?,
         status_bytes: 0,
@@ -100,6 +100,7 @@ pub use metal::{rotary, rotary_into, warm, warm_exact, IntoResources};
 mod metal {
     use crate::runtime::metal::device::{set_buffer, set_bytes, MetalDevice, Pipeline};
     use crate::runtime::metal::run::MetalTensor;
+    use effect_torch_graph::RotaryLayout;
 
     use objc2_metal::MTLComputeCommandEncoder;
 
@@ -115,12 +116,13 @@ mod metal {
     // One thread per (row, t, j): angle = (offset + t) * theta^(-2j/D);
     // GPT-NeoX half-split rotation. sign = -1 gives the transpose
     // rotation (the backward).
-    fn source(ty: &str) -> String {
+    fn source(ty: &str, layout: RotaryLayout) -> String {
         r#"
 #include <metal_stdlib>
 using namespace metal;
 
 #define STOR {ty}
+#define INTERLEAVED {interleaved}
 
 kernel void et_rotary(
     device const STOR* X [[buffer(0)]],
@@ -144,46 +146,68 @@ kernel void et_rotary(
     const float c = cos(angle);
     const float s = sin(angle);
     const ulong base = ((ulong)row * T + t) * D;
-    const float f = float(X[base + j]);
-    const float g = float(X[base + hd + j]);
-    O[base + j] = STOR(f * c - g * s);
-    O[base + hd + j] = STOR(g * c + f * s);
+    const uint first = INTERLEAVED ? 2 * j : j;
+    const uint second = INTERLEAVED ? 2 * j + 1 : hd + j;
+    const float f = float(X[base + first]);
+    const float g = float(X[base + second]);
+    O[base + first] = STOR(f * c - g * s);
+    O[base + second] = STOR(g * c + f * s);
 }
-"#.replace("{ty}", ty)
+"#
+        .replace("{ty}", ty)
+        .replace(
+            "{interleaved}",
+            if layout == RotaryLayout::InterleavedPairs {
+                "1"
+            } else {
+                "0"
+            },
+        )
     }
 
-    fn pipeline_key(dtype: crate::runtime::dtype::DType) -> u64 {
+    fn pipeline_key(dtype: crate::runtime::dtype::DType, layout: RotaryLayout) -> u64 {
         use std::collections::hash_map::DefaultHasher;
         use std::hash::{Hash, Hasher};
 
         let mut hasher = DefaultHasher::new();
-        ("et_rotary", dtype).hash(&mut hasher);
+        ("et_rotary", dtype, layout).hash(&mut hasher);
         hasher.finish()
     }
 
-    fn pipeline(dtype: crate::runtime::dtype::DType) -> crate::err::Res<Pipeline> {
+    fn pipeline(
+        dtype: crate::runtime::dtype::DType,
+        layout: RotaryLayout,
+    ) -> crate::err::Res<Pipeline> {
         let ty = match dtype {
             crate::runtime::dtype::DType::F32 => "float",
             crate::runtime::dtype::DType::F16 => "half",
             crate::runtime::dtype::DType::BF16 => "bfloat",
             other => return Err(format!("rotary: unsupported dtype {other:?}")),
         };
-        MetalDevice::get().compile_lazy(pipeline_key(dtype), "et_rotary", || source(ty))
+        MetalDevice::get().compile_lazy(pipeline_key(dtype, layout), "et_rotary", || {
+            source(ty, layout)
+        })
     }
 
-    fn cached_pipeline(dtype: crate::runtime::dtype::DType) -> crate::err::Res<Pipeline> {
+    fn cached_pipeline(
+        dtype: crate::runtime::dtype::DType,
+        layout: RotaryLayout,
+    ) -> crate::err::Res<Pipeline> {
         MetalDevice::get()
-            .pipeline_cached(pipeline_key(dtype))
+            .pipeline_cached(pipeline_key(dtype, layout))
             .ok_or_else(|| "rotary: exact pipeline is not warm; call warm".to_string())
     }
 
-    pub fn warm(dtype: crate::runtime::dtype::DType) -> crate::err::Res<()> {
-        pipeline(dtype)?;
+    pub fn warm(dtype: crate::runtime::dtype::DType, layout: RotaryLayout) -> crate::err::Res<()> {
+        pipeline(dtype, layout)?;
         Ok(())
     }
 
-    pub fn warm_exact(requirements: &super::RotaryRequirements) -> crate::err::Res<()> {
-        warm(requirements.dtype)
+    pub fn warm_exact(
+        requirements: &super::RotaryRequirements,
+        layout: RotaryLayout,
+    ) -> crate::err::Res<()> {
+        warm(requirements.dtype, layout)
     }
 
     /// x [.., T, D] -> R(sign·angles) x. `offsets` is one position
@@ -194,6 +218,7 @@ kernel void et_rotary(
         offsets: &[usize],
         theta: f64,
         sign: f32,
+        layout: RotaryLayout,
         output: &MetalTensor,
         resources: IntoResources<'_>,
     ) -> crate::err::Res<()> {
@@ -203,7 +228,7 @@ kernel void et_rotary(
             return Err("rotary: expected rank >= 2 and an even head dimension".to_string());
         }
         let (t, d) = (dims[rank - 2], dims[rank - 1]);
-        let batch = dims[0];
+        let batch = if rank == 2 { 1 } else { dims[0] };
         let rows: usize = dims[..rank - 2].iter().product();
         let rows_per_batch = rows / batch;
         if offsets.len() != 1 && offsets.len() != batch {
@@ -276,7 +301,7 @@ kernel void et_rotary(
             };
             unsafe { offset_ptr.add(index).write(value as f32) };
         }
-        let pipe = cached_pipeline(x.dtype)?;
+        let pipe = cached_pipeline(x.dtype, layout)?;
         MetalDevice::get().with_encoder(|e| {
             e.setComputePipelineState(pipe.as_raw());
             set_buffer(e, 0, &x.buffer, x.layout.offset() * x.dtype.size_in_bytes());
@@ -320,15 +345,16 @@ kernel void et_rotary(
         offsets: &[usize],
         theta: f64,
         sign: f32,
+        layout: RotaryLayout,
     ) -> crate::err::Res<MetalTensor> {
         let dims = x.layout.shape().to_vec();
-        let batch = dims[0];
+        let batch = if dims.len() == 2 { 1 } else { dims[0] };
         let x = if x.layout.is_contiguous() {
             x.clone()
         } else {
             crate::runtime::metal::kernels::strided_copy(MetalDevice::get(), x)?
         };
-        warm(x.dtype)?;
+        warm(x.dtype, layout)?;
         let output = MetalTensor::empty(MetalDevice::get(), dims, x.dtype);
         let offsets_staging = MetalTensor::empty(
             MetalDevice::get(),
@@ -340,6 +366,7 @@ kernel void et_rotary(
             offsets,
             theta,
             sign,
+            layout,
             &output,
             IntoResources {
                 staging: std::slice::from_ref(&offsets_staging),
@@ -375,7 +402,14 @@ mod tests {
             .unwrap();
             let composed =
                 crate::runtime::metal::composed::rotary_forward(&x, &[0], 10000.0, 1.0).unwrap();
-            let fused = super::metal::rotary(&x, &[0], 10000.0, 1.0).unwrap();
+            let fused = super::metal::rotary(
+                &x,
+                &[0],
+                10000.0,
+                1.0,
+                effect_torch_graph::RotaryLayout::HalfSplit,
+            )
+            .unwrap();
             dev.synchronize().unwrap();
             let a = composed.read_f32().unwrap();
             let bb = fused.read_f32().unwrap();
@@ -386,7 +420,14 @@ mod tests {
                 .fold(0f32, f32::max);
             assert!(max_diff < 1e-3, "shape {shape:?} max diff {max_diff}");
             // Backward: transpose rotation inverts the forward.
-            let back = super::metal::rotary(&fused, &[0], 10000.0, -1.0).unwrap();
+            let back = super::metal::rotary(
+                &fused,
+                &[0],
+                10000.0,
+                -1.0,
+                effect_torch_graph::RotaryLayout::HalfSplit,
+            )
+            .unwrap();
             dev.synchronize().unwrap();
             let x_vals = x.read_f32().unwrap();
             let rt = back.read_f32().unwrap();
@@ -403,6 +444,66 @@ mod tests {
     }
 
     #[test]
+    fn interleaved_pairs_use_the_pair_frequency_and_rank_two_batching() {
+        let dev = MetalDevice::get();
+        let x = MT::from_f32(
+            dev,
+            vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0],
+            vec![2, 4],
+        );
+        let half = super::metal::rotary(
+            &x,
+            &[0],
+            10_000.0,
+            1.0,
+            effect_torch_graph::RotaryLayout::HalfSplit,
+        )
+        .unwrap();
+        let interleaved = super::metal::rotary(
+            &x,
+            &[0],
+            10_000.0,
+            1.0,
+            effect_torch_graph::RotaryLayout::InterleavedPairs,
+        )
+        .unwrap();
+        let roundtrip = super::metal::rotary(
+            &interleaved,
+            &[0],
+            10_000.0,
+            -1.0,
+            effect_torch_graph::RotaryLayout::InterleavedPairs,
+        )
+        .unwrap();
+        dev.synchronize().unwrap();
+
+        let (s0, c0) = 1.0f32.sin_cos();
+        let (s1, c1) = 0.01f32.sin_cos();
+        let expected = vec![
+            1.0,
+            2.0,
+            3.0,
+            4.0,
+            5.0 * c0 - 6.0 * s0,
+            6.0 * c0 + 5.0 * s0,
+            7.0 * c1 - 8.0 * s1,
+            8.0 * c1 + 7.0 * s1,
+        ];
+        for (actual, expected) in interleaved.read_f32().unwrap().iter().zip(expected) {
+            assert!((actual - expected).abs() < 2e-6);
+        }
+        assert_ne!(half.read_f32().unwrap(), interleaved.read_f32().unwrap());
+        for (actual, expected) in roundtrip
+            .read_f32()
+            .unwrap()
+            .iter()
+            .zip(x.read_f32().unwrap())
+        {
+            assert!((actual - expected).abs() < 2e-6);
+        }
+    }
+
+    #[test]
     fn into_matches_wrapper_and_uses_only_supplied_views() {
         let dev = MetalDevice::get();
         let shape = vec![2, 2, 3, 8];
@@ -410,11 +511,19 @@ mod tests {
             .map(|index| index as f32 / 17.0)
             .collect();
         let x = MT::from_f32(dev, data, shape.clone());
-        let expected = super::metal::rotary(&x, &[1, 4], 10_000.0, 1.0).unwrap();
+        let expected = super::metal::rotary(
+            &x,
+            &[1, 4],
+            10_000.0,
+            1.0,
+            effect_torch_graph::RotaryLayout::HalfSplit,
+        )
+        .unwrap();
         let requirements = super::rotary_requirements(x.dtype, &shape).unwrap();
         let output = MT::empty(dev, shape, x.dtype);
         let offsets = MT::empty(dev, vec![2], crate::runtime::dtype::DType::F32);
-        super::metal::warm_exact(&requirements).unwrap();
+        super::metal::warm_exact(&requirements, effect_torch_graph::RotaryLayout::HalfSplit)
+            .unwrap();
         dev.synchronize().unwrap();
 
         let _dispatch_guard = dev.begin_executable_dispatch().unwrap();
@@ -423,6 +532,7 @@ mod tests {
             &[1, 4],
             10_000.0,
             1.0,
+            effect_torch_graph::RotaryLayout::HalfSplit,
             &output,
             super::metal::IntoResources {
                 staging: std::slice::from_ref(&offsets),

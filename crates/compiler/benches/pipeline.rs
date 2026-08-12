@@ -1,6 +1,6 @@
 use effect_torch_autodiff::grad;
 use effect_torch_compiler::{specialize_decode, CompileOptions, GraphIndex, OptimizationPlan};
-use effect_torch_graph::{Device, Node, NodeKind, PositionOffset};
+use effect_torch_graph::{AttentionWindow, Device, Node, NodeKind, PositionOffset, RotaryLayout};
 use effect_torch_runtime::DType;
 use std::env;
 use std::sync::Arc;
@@ -348,12 +348,14 @@ fn build_decode(size: usize) -> Result<Vec<Arc<Node>>, String> {
             seq_len: 1,
             theta: 10_000.0,
             offset: PositionOffset::Absolute,
+            layout: RotaryLayout::HalfSplit,
         });
         let k = node(NodeKind::RotaryEmbedding {
             x: k,
             seq_len: 1,
             theta: 10_000.0,
             offset: PositionOffset::Absolute,
+            layout: RotaryLayout::HalfSplit,
         });
         let attention = node(NodeKind::Sdpa {
             q,
@@ -361,6 +363,7 @@ fn build_decode(size: usize) -> Result<Vec<Arc<Node>>, String> {
             v,
             scale: 32.0f64.sqrt().recip(),
             causal: true,
+            window: AttentionWindow::Inherit,
         });
 
         let kda_q = input(&mut slot, &[1, 4, 1, 32]);
@@ -381,7 +384,7 @@ fn build_decode(size: usize) -> Result<Vec<Arc<Node>>, String> {
             weight: input(&mut slot, &[128, 3]),
         }));
     }
-    specialize_decode(&roots, Some(128), 1).map(|(specialized, _)| specialized)
+    specialize_decode(&roots, Some(128), 1, false).map(|(specialized, _)| specialized)
 }
 
 fn build_optimizer(size: usize) -> Vec<Arc<Node>> {

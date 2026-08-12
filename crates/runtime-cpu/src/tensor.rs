@@ -652,6 +652,62 @@ impl<'a> CpuDestination<'a> {
         self.tensor.dtype()
     }
 
+    pub(crate) fn write_bytes<R>(
+        &mut self,
+        operation: &str,
+        write: impl FnOnce(&mut [u8]) -> R,
+    ) -> Result<R, String> {
+        if !self.tensor.layout.is_contiguous() {
+            return Err(format!(
+                "{operation} destination must be contiguous, got {:?}",
+                self.tensor.layout
+            ));
+        }
+        let element_size = self.dtype().size_in_bytes();
+        let start = self
+            .tensor
+            .layout
+            .offset()
+            .checked_mul(element_size)
+            .ok_or_else(|| format!("{operation} destination byte offset overflows"))?;
+        let byte_len = self
+            .tensor
+            .numel()
+            .checked_mul(element_size)
+            .ok_or_else(|| format!("{operation} destination byte length overflows"))?;
+        let end = start
+            .checked_add(byte_len)
+            .ok_or_else(|| format!("{operation} destination byte range overflows"))?;
+        macro_rules! write_storage {
+            ($storage:expr) => {{
+                // SAFETY: CpuDestination proves exclusive access to this storage.
+                let values = unsafe { $storage.as_mut_slice_for_destination() };
+                let bytes = unsafe {
+                    std::slice::from_raw_parts_mut(
+                        values.as_mut_ptr().cast::<u8>(),
+                        std::mem::size_of_val(values),
+                    )
+                };
+                if end > bytes.len() {
+                    return Err(format!(
+                        "{operation} destination requires {end} bytes, storage has {}",
+                        bytes.len()
+                    ));
+                }
+                return Ok(write(&mut bytes[start..end]));
+            }};
+        }
+        match &self.tensor.buffer {
+            CpuBuffer::F32(storage) => write_storage!(storage),
+            CpuBuffer::F64(storage) => write_storage!(storage),
+            CpuBuffer::F16(storage) => write_storage!(storage),
+            CpuBuffer::BF16(storage) => write_storage!(storage),
+            CpuBuffer::U8(storage) => write_storage!(storage),
+            CpuBuffer::U32(storage) => write_storage!(storage),
+            CpuBuffer::I64(storage) => write_storage!(storage),
+        }
+    }
+
     pub(crate) fn validate_current<T: Elem>(&self, operation: &str) -> Result<(), String> {
         if self.dtype() != T::dtype() {
             return Err(format!(

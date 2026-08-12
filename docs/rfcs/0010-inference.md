@@ -155,8 +155,10 @@ closing) returns its blocks.
 
 `KvAttention` evaluation scatters the new tokens' k/v at the cursor
 (`scatter_set` through the block table, allocating on block-boundary
-crossings), then attends q causally over the last `window` positions of
-the gathered context (whole context when unset). Under a window, blocks
+crossings), then attends q causally within each operation's resolved `window`
+(whole context when unset). Pool-level retention uses
+the configured window only when every resolved attention operation is
+windowed; any full-attention operation retains the whole context. Under safe retention, blocks
 fully below the moving frontier are **evicted** back to the pool —
 they are never attended again — so a windowed sequence's footprint is
 O(window) however long it generates; the capacity error then bounds

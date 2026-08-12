@@ -16,6 +16,14 @@ export * as Checkpoint from "./Checkpoint.ts"
 export * as Gradient from "./Gradient.ts"
 
 /**
+ * Native GGUF inspection, model resolution, validation, and loading.
+ *
+ * @since 0.1.0
+ * @category modules
+ */
+export * as Gguf from "./Gguf.ts"
+
+/**
  * Composable learning-rate schedules for training steps.
  *
  * @since 0.1.0
@@ -38,6 +46,14 @@ export * as Loss from "./Loss.ts"
  * @category modules
  */
 export * as Model from "./Model.ts"
+
+/**
+ * Registration, exact-key lookup, and default Layers for model architectures.
+ *
+ * @since 0.1.0
+ * @category modules
+ */
+export * as Registry from "./Registry.ts"
 
 /**
  * Pure optimizer graph transforms and optimizer-state management.
