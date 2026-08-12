@@ -50,10 +50,10 @@ gates:
   (finite-difference-verified) reference to < 1e-3 including stateful
   carry-over across chunk boundaries; `EFFECT_TORCH_NO_KDA_FUSED`
   restores the composed paths everywhere for A/B.
-- **Pure-KDA stacks** (zero KV layers) work: the KV pool accepts
-  `layers = 0` and keeps only block hashing.
-- **Prefix cache is bypassed** for stacks with recurrent layers (the KV
-  blocks say nothing about recurrent state).
+- **Pure-KDA stacks** (zero KV layers) work, but have no block-anchored
+  prefix cache.
+- **Hybrid prefix caching** restores KV blocks plus KDA/conv recurrent-state
+  snapshots at completed block boundaries.
 - Gates: chunked forward matches a per-token recurrent oracle on CPU
   and Metal (< 5e-4 rel, cargo; 2e-3 vitest), hybrid and pure-KDA
   greedy generation match full-forward naive generation token-for-token
@@ -242,12 +242,11 @@ eviction.
   matrix state. On run failure, restore slot states from a pre-run
   snapshot taken into a scratch region of the same slab (one 64 KB/head
   memcpy per layer per active slot — negligible next to a failed walk).
-- **Prefix caching** (the `kvPrefillMatch` analogue) is explicitly **out
-  of scope for v1**: recurrent state is not content-addressable per
-  block. The vLLM/K3 approach (recompute state from a cached prefix
-  boundary) requires chunked prefill that resumes from a stored state —
-  noted as future work; `initialState` on `kdaChunk` already carries the
-  semantics.
+- **Prefix caching** stores an immutable recurrent-state snapshot beside each
+  completed content-addressed KV block boundary. A hybrid match takes the
+  deepest boundary with both blocks and a snapshot, then resumes chunked
+  prefill from it. Pure recurrent stacks have no block-anchored hash chain
+  and therefore no prefix reuse in this version.
 
 ### decode_rewrite changes
 
@@ -367,9 +366,9 @@ presets documented; CPU parity throughout per the standing rule.
   `decode_rewrite`/`run_inner`. Contained by the `DecodeContext`
   generalization and by keeping pure-attention compilation byte-for-byte
   on today's path.
-- **Prefix-cache gap**: hybrid stacks lose `kvPrefillMatch` benefits
-  unless state-resume lands; documented limitation for v1, not a
-  correctness issue.
+- **Prefix-cache scope**: hybrid stacks reuse prefixes through boundary
+  snapshots; pure recurrent stacks remain full-prefill because they have no
+  KV blocks anchoring the content-addressed chain.
 - **Scope discipline**: KDA only; GDN/MLA-hybrid variants are
   follow-ups that reuse the pool and scan machinery.
 

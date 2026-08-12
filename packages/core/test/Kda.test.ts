@@ -413,7 +413,7 @@ onDevices("Kda", (device) => (it) => {
         expect(cached).toEqual(naive)
       }))
 
-    it.effect("recurrent pools do not share prefixes across sequences", () =>
+    it.effect("recurrent pools restore shared prefixes across sequences", () =>
       Effect.gen(function*() {
         const model = yield* makeHybrid
         const params = yield* Tensor.compute(yield* model.init)
@@ -433,6 +433,80 @@ onDevices("Kda", (device) => (it) => {
         expect(yield* second.seq.cursor()).toBe(prompt.length)
         yield* Tensor.clearAll([first.logits, second.logits])
         yield* gen.close()
+      }))
+
+    it.effect("prefillMatch restores a recurrent snapshot at a block boundary", () =>
+      Effect.gen(function*() {
+        const model = yield* makeHybrid
+        const params = yield* Tensor.compute(yield* model.init)
+        const exemplar = yield* Tensor.zeros([1, 4], { dtype: "u32" })
+        const placeholders: Array<Tensor.Lazy> = []
+        for (let index = 0; index < params.length; index++) {
+          placeholders.push(yield* Tensor.makeInput(index, params[index]!))
+        }
+        placeholders.push(yield* Tensor.makeInput(params.length, exemplar))
+        const output = yield* model.forward(placeholders.slice(0, -1), placeholders[placeholders.length - 1]!)
+        const program = yield* Tensor.compileDecodeProgram([output], {
+          maxTokens: 16,
+          blockSize: 4,
+          kvDtype: "f32",
+          batch: 1
+        })
+        const pool = yield* Tensor.makeKvPool(
+          program.layers,
+          program.kvHeads,
+          program.headDim,
+          program.maxTokens,
+          program.blockSize,
+          program.kvDtype,
+          {
+            kdaLayers: program.kdaLayers,
+            kdaHeads: program.kdaHeads,
+            kdaHeadDim: program.kdaHeadDim,
+            kdaValueDim: program.kdaValueDim,
+            convLayers: program.convLayers,
+            convChannels: program.convChannels,
+            convKernel: program.convKernel
+          }
+        )
+        const first = yield* Tensor.makeKvSequence(pool)
+        const prefix = [1, 5, 3, 8]
+        const [firstOutput] = yield* Tensor.runDecodeProgram(
+          program,
+          [...params, yield* ids(prefix)],
+          first,
+          prefix
+        )
+        yield* Tensor.clear(firstOutput)
+        yield* Tensor.releaseKvSequence(first)
+
+        const resumed = yield* Tensor.makeKvSequence(pool)
+        const prompt = [...prefix, 2]
+        expect(yield* Tensor.kvPrefillMatch(resumed, prompt)).toBe(4)
+        const [suffixOutput] = yield* Tensor.runDecodeProgram(
+          program,
+          [...params, yield* ids([2, 0, 0, 0])],
+          resumed,
+          [2]
+        )
+        const [actual] = yield* Tensor.compute([
+          yield* Tensor.reshape(
+            yield* Tensor.slice(suffixOutput, { start: [0, 0, 0], end: [1, 1, VOCAB] }),
+            [VOCAB]
+          )
+        ])
+        const fullOutput = yield* model.forward(params, yield* ids(prompt))
+        const [expected] = yield* Tensor.compute([
+          yield* Tensor.reshape(
+            yield* Tensor.slice(fullOutput, { start: [0, 4, 0], end: [1, 5, VOCAB] }),
+            [VOCAB]
+          )
+        ])
+        const actualValues = yield* Tensor.toNumberArray(actual)
+        const expectedValues = yield* Tensor.toNumberArray(expected)
+        actualValues.forEach((value, index) => assert.assertTrue(close(value, expectedValues[index]!)))
+        yield* Tensor.clearAll([suffixOutput, actual, expected])
+        yield* Tensor.releaseKvSequence(resumed)
       }))
 
     it.effect("a pure-KDA stack (zero KV layers) generates through the decode programs", () =>

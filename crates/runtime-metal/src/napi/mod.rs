@@ -1641,6 +1641,7 @@ struct BlockStore {
     // back; entries go stale when the block is taken or evicted and
     // are skipped.
     lru: VecDeque<u32>,
+    snapshots: HashMap<u64, Arc<RecurrentSnapshot>>,
 }
 
 impl BlockStore {
@@ -1651,6 +1652,7 @@ impl BlockStore {
             hashes: vec![None; num_blocks],
             by_hash: HashMap::new(),
             lru: VecDeque::new(),
+            snapshots: HashMap::new(),
         }
     }
 
@@ -1674,6 +1676,18 @@ impl BlockStore {
             }
             if ids.is_empty() {
                 self.by_hash.remove(&hash);
+                self.snapshots.remove(&hash);
+            }
+        }
+    }
+
+    fn unref(&mut self, block: u32) {
+        let count = &mut self.refcounts[block as usize];
+        *count = count.saturating_sub(1);
+        if *count == 0 {
+            match self.hashes[block as usize] {
+                Some(_) => self.lru.push_back(block),
+                None => self.free.push(block),
             }
         }
     }
@@ -1687,6 +1701,74 @@ impl BlockStore {
                     .count()
             })
             .sum()
+    }
+}
+
+struct RecurrentSnapshot {
+    kda: Vec<Box<[f32]>>,
+    conv: Vec<Box<[f32]>>,
+}
+
+fn copy_f32_state(tensor: &runtime::metal::run::MetalTensor) -> Option<Box<[f32]>> {
+    if tensor.dtype != DType::F32 || !tensor.layout.is_contiguous() {
+        return None;
+    }
+    let ptr = unsafe {
+        tensor
+            .buffer
+            .contents_ptr()
+            .cast::<f32>()
+            .add(tensor.layout.offset())
+    };
+    Some(unsafe { std::slice::from_raw_parts(ptr, tensor.numel()) }.into())
+}
+
+fn write_f32_state(tensor: &runtime::metal::run::MetalTensor, data: &[f32]) -> err::Res<()> {
+    if tensor.dtype != DType::F32 || !tensor.layout.is_contiguous() || tensor.numel() != data.len()
+    {
+        return Err("recurrent state destination does not match its snapshot".to_string());
+    }
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            data.as_ptr(),
+            tensor
+                .buffer
+                .contents_ptr()
+                .cast::<f32>()
+                .add(tensor.layout.offset()),
+            data.len(),
+        );
+    }
+    Ok(())
+}
+
+impl RecurrentSnapshot {
+    fn capture(state: &SeqState) -> Option<Self> {
+        Some(Self {
+            kda: state
+                .kda_states
+                .iter()
+                .map(copy_f32_state)
+                .collect::<Option<Vec<_>>>()?,
+            conv: state
+                .conv_states
+                .iter()
+                .map(copy_f32_state)
+                .collect::<Option<Vec<_>>>()?,
+        })
+    }
+
+    fn restore_into(&self, state: &mut SeqState) -> err::Res<()> {
+        if self.kda.len() != state.kda_states.len() || self.conv.len() != state.conv_states.len() {
+            return Err("recurrent snapshot geometry does not match the sequence".to_string());
+        }
+        for (tensor, data) in state.kda_states.iter().zip(&self.kda) {
+            write_f32_state(tensor, data)?;
+        }
+        for (tensor, data) in state.conv_states.iter().zip(&self.conv) {
+            write_f32_state(tensor, data)?;
+        }
+        Ok(())
     }
 }
 
@@ -1767,13 +1849,56 @@ impl PoolInner {
     // (hashed, reclaimable) or returns it to the free list.
     fn unref_block(&self, block: u32) {
         if let Ok(mut store) = self.blocks.lock() {
-            let count = &mut store.refcounts[block as usize];
-            *count = count.saturating_sub(1);
-            if *count == 0 {
-                match store.hashes[block as usize] {
-                    Some(_) => store.lru.push_back(block),
-                    None => store.free.push(block),
-                }
+            store.unref(block);
+        }
+    }
+
+    fn take_recurrent_prefix(
+        &self,
+        boundary_hashes: &[u64],
+    ) -> Option<(Vec<u32>, u64, Arc<RecurrentSnapshot>)> {
+        let mut store = self.blocks.lock().ok()?;
+        let mut taken: Vec<u32> = Vec::new();
+        let mut deepest: Option<(usize, Arc<RecurrentSnapshot>)> = None;
+        for (index, &hash) in boundary_hashes.iter().enumerate() {
+            let Some(&block) = store.by_hash.get(&hash).and_then(|ids| ids.first()) else {
+                break;
+            };
+            store.refcounts[block as usize] += 1;
+            taken.push(block);
+            if let Some(snapshot) = store.snapshots.get(&hash) {
+                deepest = Some((index, Arc::clone(snapshot)));
+            }
+        }
+        let Some((index, snapshot)) = deepest else {
+            for block in taken.drain(..) {
+                store.unref(block);
+            }
+            return None;
+        };
+        for block in taken.drain(index + 1..) {
+            store.unref(block);
+        }
+        Some((taken, boundary_hashes[index], snapshot))
+    }
+
+    fn publish_recurrent_snapshot(&self, state: &SeqState) {
+        if self.k.is_empty() || (self.kda.layers == 0 && self.conv.layers == 0) {
+            return;
+        }
+        if state.cursor == 0 || state.cursor % self.block_size != 0 {
+            return;
+        }
+        if state.kda_states.len() != self.kda.layers || state.conv_states.len() != self.conv.layers
+        {
+            return;
+        }
+        let Some(snapshot) = RecurrentSnapshot::capture(state) else {
+            return;
+        };
+        if let Ok(mut store) = self.blocks.lock() {
+            if store.by_hash.contains_key(&state.last_hash) {
+                store.snapshots.insert(state.last_hash, Arc::new(snapshot));
             }
         }
     }
@@ -2008,6 +2133,7 @@ impl MetalDecodeContext for KvContext {
         state.note_tokens(&self.pool, &self.tokens[index]);
         state.cursor += state.advance;
         state.advance = 0;
+        self.pool.publish_recurrent_snapshot(state);
     }
 }
 
@@ -2526,6 +2652,40 @@ impl NativeKvSequence {
         state.last_hash = HASH_SEED;
         state.pending.clear();
     }
+
+    fn prefill_match_recurrent(&self, state: &mut SeqState, tokens: &[u32]) -> Result<u32> {
+        let block_size = self.pool.block_size;
+        let matchable = tokens.len().saturating_sub(1) / block_size;
+        let mut boundary_hashes = Vec::with_capacity(matchable);
+        let mut hash = HASH_SEED;
+        for i in 0..matchable {
+            hash = chain_hash(hash, &tokens[i * block_size..(i + 1) * block_size]);
+            boundary_hashes.push(hash);
+        }
+        let Some((blocks, hash, snapshot)) = self.pool.take_recurrent_prefix(&boundary_hashes)
+        else {
+            return Ok(0);
+        };
+        if let Err(message) = snapshot.restore_into(state) {
+            for block in blocks {
+                self.pool.unref_block(block);
+            }
+            state.head = 0;
+            state.cursor = 0;
+            state.advance = 0;
+            state.last_hash = HASH_SEED;
+            state.pending.clear();
+            return Err(Error::new(
+                Status::GenericFailure,
+                format!("prefill match: recurrent state restore failed: {message}"),
+            ));
+        }
+        let matched = blocks.len() * block_size;
+        state.blocks = blocks;
+        state.last_hash = hash;
+        state.cursor = matched;
+        Ok(matched as u32)
+    }
 }
 
 impl Drop for NativeKvSequence {
@@ -2556,8 +2716,11 @@ impl NativeKvSequence {
     // only the remaining suffix. Only whole blocks match (a partial
     // tail block's content is not final), and the block holding the
     // last prompt token is always computed — its logits are prefill's
-    // result. Sharing is content-addressed: two prompts that merely
-    // begin alike share; nothing about the match is visible to callers.
+    // result. Hybrid pools (KV blocks plus recurrent state) match only
+    // boundaries with a published recurrent snapshot and restore that
+    // state into the sequence. Sharing is content-addressed: two
+    // prompts that merely begin alike share; nothing about the match
+    // is visible to callers.
     #[napi]
     pub fn prefill_match(&self, tokens: Vec<u32>) -> Result<u32> {
         let _run_guard = self.run_lock.lock().map_err(|e| {
@@ -2585,7 +2748,10 @@ impl NativeKvSequence {
             ));
         }
         if self.pool.kda.layers > 0 || self.pool.conv.layers > 0 {
-            return Ok(0);
+            if self.pool.k.is_empty() {
+                return Ok(0);
+            }
+            return self.prefill_match_recurrent(&mut state, &tokens);
         }
         let block_size = self.pool.block_size;
         let matchable = tokens.len().saturating_sub(1) / block_size;
@@ -4400,5 +4566,325 @@ mod epilogue_tests {
             })
             .unwrap();
         assert_eq!(command.staging.len(), 5);
+    }
+
+    fn hybrid_pool(max_tokens: u32, block_size: u32) -> NativeKvPool {
+        NativeKvPool::new(
+            1,
+            1,
+            2,
+            max_tokens,
+            Some(block_size),
+            Some(NativeDType::F32),
+            Some(NativeRecurrentStateSchema {
+                kda_layers: 1,
+                kda_heads: 1,
+                kda_head_dim: 2,
+                kda_value_dim: 2,
+                conv_layers: 1,
+                conv_channels: 2,
+                conv_kernel: 3,
+            }),
+        )
+        .unwrap()
+    }
+
+    fn hybrid_schema(max_tokens: usize, block_size: usize) -> KvStateSchema {
+        KvStateSchema {
+            max_tokens,
+            block_size,
+            kv_dtype: DType::F32,
+            window: None,
+            batch: 1,
+            layers: 1,
+            kv_heads: 1,
+            head_dim: 2,
+            kda: KdaGeometry {
+                layers: 1,
+                heads: 1,
+                head_dim: 2,
+                value_dim: 2,
+            },
+            conv: ConvGeometry {
+                layers: 1,
+                channels: 2,
+                kernel: 3,
+            },
+            cursor_slot: u32::MAX,
+            cursor_tensor: false,
+        }
+    }
+
+    fn state_f32(tensor: &MetalTensor) -> Vec<f32> {
+        unsafe {
+            std::slice::from_raw_parts(
+                tensor
+                    .buffer
+                    .contents_ptr()
+                    .cast::<f32>()
+                    .add(tensor.layout.offset()),
+                tensor.numel(),
+            )
+            .to_vec()
+        }
+    }
+
+    fn set_state_f32(tensor: &MetalTensor, data: &[f32]) {
+        assert_eq!(tensor.numel(), data.len());
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                data.as_ptr(),
+                tensor
+                    .buffer
+                    .contents_ptr()
+                    .cast::<f32>()
+                    .add(tensor.layout.offset()),
+                data.len(),
+            );
+        }
+    }
+
+    fn commit_tokens(pool: &NativeKvPool, sequence: &NativeKvSequence, tokens: &[u32]) {
+        let context = KvContext {
+            pool: pool.inner.clone(),
+            slots: vec![sequence.state.clone()],
+            schema: hybrid_schema(pool.inner.max_tokens, pool.inner.block_size),
+            tokens: vec![tokens.to_vec()],
+            active_batch: 1,
+        };
+        let mut state = sequence.state.lock().unwrap();
+        let needed = (state.cursor + tokens.len()).div_ceil(pool.inner.block_size);
+        while state.head + state.blocks.len() < needed {
+            state.blocks.push(pool.inner.alloc_block().unwrap());
+        }
+        state.advance = tokens.len();
+        context.commit_slot(0, &mut state);
+    }
+
+    #[test]
+    fn recurrent_snapshots_publish_only_at_the_final_block_boundary() {
+        let pool = hybrid_pool(32, 4);
+        let sequence = pool.make_sequence().unwrap();
+        let tokens: Vec<u32> = (0..8).collect();
+        {
+            let state = sequence.state.lock().unwrap();
+            set_state_f32(&state.kda_states[0], &[1.0, 2.0, 3.0, 4.0]);
+            set_state_f32(&state.conv_states[0], &[5.0, 6.0, 7.0, 8.0]);
+        }
+        commit_tokens(&pool, &sequence, &tokens);
+        assert_eq!(sequence.cursor(), 8);
+        let first = chain_hash(HASH_SEED, &tokens[..4]);
+        let second = chain_hash(first, &tokens[4..]);
+        let store = pool.inner.blocks.lock().unwrap();
+        assert_eq!(store.snapshots.len(), 1);
+        assert!(!store.snapshots.contains_key(&first));
+        let snapshot = store.snapshots.get(&second).unwrap();
+        assert_eq!(&*snapshot.kda[0], &[1.0, 2.0, 3.0, 4.0]);
+        assert_eq!(&*snapshot.conv[0], &[5.0, 6.0, 7.0, 8.0]);
+    }
+
+    #[test]
+    fn recurrent_snapshots_skip_runs_ending_mid_block() {
+        let pool = hybrid_pool(32, 4);
+        let sequence = pool.make_sequence().unwrap();
+        commit_tokens(&pool, &sequence, &[1, 2, 3]);
+        assert_eq!(sequence.cursor(), 3);
+        assert!(pool.inner.blocks.lock().unwrap().snapshots.is_empty());
+    }
+
+    #[test]
+    fn recurrent_snapshots_are_not_published_for_padding_slots() {
+        let pool = hybrid_pool(32, 4);
+        let sequence = pool.make_sequence().unwrap();
+        let padding = sequence.new_sequence_like();
+        let context = KvContext {
+            pool: pool.inner.clone(),
+            slots: vec![sequence.state.clone(), padding.state.clone()],
+            schema: hybrid_schema(32, 4),
+            tokens: vec![vec![1, 2, 3, 4], vec![1, 2, 3, 4]],
+            active_batch: 1,
+        };
+        let mut states = context
+            .slots
+            .iter()
+            .map(|slot| slot.lock().unwrap())
+            .collect::<Vec<_>>();
+        {
+            let state = &mut states[0];
+            state.blocks.push(pool.inner.alloc_block().unwrap());
+            state.advance = 4;
+            set_state_f32(&state.kda_states[0], &[1.0, 2.0, 3.0, 4.0]);
+        }
+        for (index, state) in states.iter_mut().take(context.active_batch).enumerate() {
+            context.commit_slot(index, state);
+        }
+        assert_eq!(states[1].cursor, 0);
+        let store = pool.inner.blocks.lock().unwrap();
+        assert_eq!(store.snapshots.len(), 1);
+        let snapshot = store
+            .snapshots
+            .get(&chain_hash(HASH_SEED, &[1, 2, 3, 4]))
+            .unwrap();
+        assert_eq!(&*snapshot.kda[0], &[1.0, 2.0, 3.0, 4.0]);
+    }
+
+    #[test]
+    fn pure_recurrent_pools_never_publish_or_match() {
+        let pool = NativeKvPool::new(
+            0,
+            0,
+            0,
+            32,
+            Some(4),
+            Some(NativeDType::F32),
+            Some(NativeRecurrentStateSchema {
+                kda_layers: 1,
+                kda_heads: 1,
+                kda_head_dim: 2,
+                kda_value_dim: 2,
+                conv_layers: 1,
+                conv_channels: 2,
+                conv_kernel: 3,
+            }),
+        )
+        .unwrap();
+        let sequence = pool.make_sequence().unwrap();
+        commit_tokens(&pool, &sequence, &[1, 2, 3, 4]);
+        assert!(pool.inner.blocks.lock().unwrap().snapshots.is_empty());
+        let other = pool.make_sequence().unwrap();
+        assert_eq!(other.prefill_match(vec![1, 2, 3, 4, 5]).unwrap(), 0);
+        assert!(other.state.lock().unwrap().blocks.is_empty());
+    }
+
+    #[test]
+    fn prefill_match_restores_deep_copies_of_the_boundary_snapshot() {
+        let pool = hybrid_pool(32, 4);
+        let sequence = pool.make_sequence().unwrap();
+        let tokens: Vec<u32> = vec![1, 2, 3, 4];
+        {
+            let state = sequence.state.lock().unwrap();
+            set_state_f32(&state.kda_states[0], &[1.0, 2.0, 3.0, 4.0]);
+            set_state_f32(&state.conv_states[0], &[5.0, 6.0, 7.0, 8.0]);
+        }
+        commit_tokens(&pool, &sequence, &tokens);
+        {
+            let state = sequence.state.lock().unwrap();
+            set_state_f32(&state.kda_states[0], &[9.0; 4]);
+            set_state_f32(&state.conv_states[0], &[9.0; 4]);
+        }
+
+        let resumed = pool.make_sequence().unwrap();
+        assert_eq!(resumed.prefill_match(vec![1, 2, 3, 4, 5]).unwrap(), 4);
+        {
+            let state = resumed.state.lock().unwrap();
+            assert_eq!(state.cursor, 4);
+            assert_eq!(state.last_hash, chain_hash(HASH_SEED, &tokens));
+            assert_eq!(state.blocks.len(), 1);
+            assert_eq!(state_f32(&state.kda_states[0]), vec![1.0, 2.0, 3.0, 4.0]);
+            assert_eq!(state_f32(&state.conv_states[0]), vec![5.0, 6.0, 7.0, 8.0]);
+            set_state_f32(&state.kda_states[0], &[7.0; 4]);
+            set_state_f32(&state.conv_states[0], &[7.0; 4]);
+        }
+
+        let third = pool.make_sequence().unwrap();
+        assert_eq!(third.prefill_match(vec![1, 2, 3, 4, 5]).unwrap(), 4);
+        let state = third.state.lock().unwrap();
+        assert_eq!(state_f32(&state.kda_states[0]), vec![1.0, 2.0, 3.0, 4.0]);
+        assert_eq!(state_f32(&state.conv_states[0]), vec![5.0, 6.0, 7.0, 8.0]);
+    }
+
+    #[test]
+    fn prefill_match_truncates_to_the_deepest_snapshot_boundary() {
+        let pool = hybrid_pool(32, 4);
+        let sequence = pool.make_sequence().unwrap();
+        commit_tokens(&pool, &sequence, &[0, 1, 2, 3]);
+        let first = chain_hash(HASH_SEED, &[0, 1, 2, 3]);
+        let extra = pool.inner.alloc_block().unwrap();
+        pool.inner.set_hash(extra, chain_hash(first, &[4, 5, 6, 7]));
+
+        let resumed = pool.make_sequence().unwrap();
+        assert_eq!(resumed.prefill_match((0..9).collect()).unwrap(), 4);
+        {
+            let state = resumed.state.lock().unwrap();
+            assert_eq!(state.cursor, 4);
+            assert_eq!(state.last_hash, first);
+            assert_eq!(state.blocks.len(), 1);
+        }
+        assert_eq!(
+            pool.inner.blocks.lock().unwrap().refcounts[extra as usize],
+            1
+        );
+    }
+
+    #[test]
+    fn prefill_match_without_a_snapshot_boundary_holds_nothing() {
+        let pool = hybrid_pool(32, 4);
+        let block = pool.inner.alloc_block().unwrap();
+        pool.inner
+            .set_hash(block, chain_hash(HASH_SEED, &[1, 2, 3, 4]));
+        let sequence = pool.make_sequence().unwrap();
+        assert_eq!(sequence.prefill_match(vec![1, 2, 3, 4, 5]).unwrap(), 0);
+        assert!(sequence.state.lock().unwrap().blocks.is_empty());
+        assert_eq!(
+            pool.inner.blocks.lock().unwrap().refcounts[block as usize],
+            1
+        );
+    }
+
+    #[test]
+    fn prefill_match_unrefs_taken_blocks_when_the_restore_fails() {
+        let pool = hybrid_pool(32, 4);
+        let sequence = pool.make_sequence().unwrap();
+        commit_tokens(&pool, &sequence, &[1, 2, 3, 4]);
+        let block = sequence.state.lock().unwrap().blocks[0];
+        let hash = chain_hash(HASH_SEED, &[1, 2, 3, 4]);
+        pool.inner.blocks.lock().unwrap().snapshots.insert(
+            hash,
+            Arc::new(RecurrentSnapshot {
+                kda: Vec::new(),
+                conv: Vec::new(),
+            }),
+        );
+        let resumed = pool.make_sequence().unwrap();
+        let error = resumed.prefill_match(vec![1, 2, 3, 4, 5]).unwrap_err();
+        assert!(error.to_string().contains("recurrent state restore failed"));
+        {
+            let state = resumed.state.lock().unwrap();
+            assert!(state.blocks.is_empty());
+            assert_eq!(state.cursor, 0);
+            assert_eq!(state.last_hash, HASH_SEED);
+        }
+        assert_eq!(
+            pool.inner.blocks.lock().unwrap().refcounts[block as usize],
+            1
+        );
+    }
+
+    #[test]
+    fn recurrent_snapshots_are_removed_with_their_last_resident_block() {
+        let pool = hybrid_pool(8, 4);
+        let sequence = pool.make_sequence().unwrap();
+        commit_tokens(&pool, &sequence, &[1, 2, 3, 4]);
+        let block = sequence.state.lock().unwrap().blocks[0];
+        let hash = chain_hash(HASH_SEED, &[1, 2, 3, 4]);
+        assert!(pool
+            .inner
+            .blocks
+            .lock()
+            .unwrap()
+            .snapshots
+            .contains_key(&hash));
+        sequence.release();
+        assert!(pool
+            .inner
+            .blocks
+            .lock()
+            .unwrap()
+            .snapshots
+            .contains_key(&hash));
+        let _other = pool.inner.alloc_block().unwrap();
+        let evicted = pool.inner.alloc_block().unwrap();
+        assert_eq!(evicted, block);
+        assert!(pool.inner.blocks.lock().unwrap().snapshots.is_empty());
     }
 }

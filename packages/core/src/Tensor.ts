@@ -4491,8 +4491,9 @@ export const makeKvSequence = (pool: KvPool): Effect.Effect<KvSequence, TensorEr
  * The result is the offset at which prefill should begin. A return value of
  * zero means no reusable prefix was found. Matching updates the sequence's
  * block table and cursor; later decode runs continue from that position. Prefix
- * entries do not contain KDA or short-convolution recurrent state, so pools
- * with recurrent geometry return zero until snapshots are supported.
+ * entries for hybrid pools carry KDA and short-convolution state snapshots at
+ * completed block boundaries. Purely recurrent pools without KV blocks return
+ * zero.
  *
  * Token values are expected to be non-negative integers representable as
  * `u32`; this wrapper leaves validation to the backend. Fails when the current

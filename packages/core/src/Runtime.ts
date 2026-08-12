@@ -969,9 +969,9 @@ export interface DecodeRuntime {
   readonly makeSequence: (pool: KvPoolHandle) => Effect.Effect<KvSequenceHandle, BackendError>
   /**
    * On an empty sequence, attaches the longest resident whole-block proper KV
-   * prefix, leaving one token when input is nonempty. Prefix entries do not
-   * restore KDA or short-convolution recurrent state, so pools with recurrent
-   * geometry return zero until snapshots are supported.
+   * prefix, leaving one token when input is nonempty. Hybrid pools with
+   * recurrent geometry resume from snapshots published at completed block
+   * boundaries; purely recurrent pools without KV blocks return zero.
    */
   readonly prefillMatch: (
     sequence: KvSequenceHandle,

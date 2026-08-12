@@ -1546,13 +1546,12 @@ export interface GenerationEntry {
  * are added individually with {@link Generation.add}, which performs
  * chunked prefill; {@link Generation.step} advances one or more in one
  * run. The entries are the batch: one entry uses the `[1, 1]` program and
- * more use one fixed-width batched run with native padding. For artifacts
- * without KDA or short-convolution recurrent state, the pool keeps a
- * content-addressed prefix cache: prompts whose leading blocks are
- * already resident (computed by an earlier, since finished or
- * still-live sequence) reuse them and compute only their suffix —
- * sharing is automatic and invisible to callers. Recurrent artifacts skip
- * prefix reuse because cached KV blocks do not reconstruct recurrent state.
+ * more use one fixed-width batched run with native padding. The pool keeps a content-addressed prefix cache: prompts whose
+ * leading blocks are already resident (computed by an earlier, since
+ * finished or still-live sequence) reuse them and compute only their suffix.
+ * Hybrid recurrent artifacts also publish KDA and short-convolution state
+ * snapshots at completed block boundaries, so matching restores both. Purely
+ * recurrent artifacts without KV blocks have no block-anchored prefix cache.
  *
  * Sessions are ordinary values and require no `Scope`. Independent
  * sessions may run concurrently. Calls to `step` on one session are
