@@ -8,6 +8,14 @@
 export * as Checkpoint from "./Checkpoint.ts"
 
 /**
+ * Streaming conversational inference over structured chat messages.
+ *
+ * @since 0.1.0
+ * @category modules
+ */
+export * as Chat from "./Chat.ts"
+
+/**
  * Reverse-mode automatic differentiation and graph-gradient transforms.
  *
  * @since 0.1.0

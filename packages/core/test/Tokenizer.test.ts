@@ -76,6 +76,7 @@ describe("Tokenizer", () => {
         expect(Option.isSome(tokenizer.tokenToId("<|endoftext|>"))).toBe(true)
         const id = Option.getOrElse(tokenizer.tokenToId("<|endoftext|>"), () => -1)
         expect(tokenizer.idToToken(id)).toEqual(Option.some("<|endoftext|>"))
+        expect(yield* tokenizer.decode([id], { skipSpecialTokens: true })).toBe("")
         expect(tokenizer.tokenToId("not a token")).toEqual(Option.none())
         expect(tokenizer.vocabSize).toBeGreaterThan(256)
       }))
@@ -188,6 +189,30 @@ describe("Tokenizer", () => {
         })
         const alwaysIds = yield* numbers(yield* always.encode(text))
         expect(alwaysIds).toContain(specialId)
+      }))
+  })
+
+  describe("chat templates", () => {
+    it.effect("renders Jinja messages, namespaces, filters, and generation prompts", () =>
+      Effect.gen(function*() {
+        const tokenizer = yield* trainBpe()
+        const rendered = yield* tokenizer.applyChatTemplate(
+          `{%- set ns = namespace(items=[]) -%}{%- for item in values -%}{%- set ns.items = ns.items + [item] -%}{%- endfor -%}{{ bos_token }}{% for message in messages %}<|start|>{{ message.role }}<|message|>{{ message.content }}{{ '<|eot|>' if loop.last else '<|eom|>' }}{% endfor %}{% if add_generation_prompt %}<|start|>assistant{% endif %} {{ ns.items | join(',') }} {{ values | tojson }}`,
+          [
+            { role: "user", content: "hello" },
+            { role: "assistant", content: "hi" }
+          ],
+          {
+            addGenerationPrompt: true,
+            variables: {
+              bos_token: "<BOS>",
+              values: [1, "two"]
+            }
+          }
+        )
+        expect(rendered).toBe(
+          `<BOS><|start|>user<|message|>hello<|eom|><|start|>assistant<|message|>hi<|eot|><|start|>assistant 1,two [1,"two"]`
+        )
       }))
   })
 

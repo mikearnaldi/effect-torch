@@ -1,15 +1,14 @@
 import * as BackendApple from "@effect-torch/backend-apple-native"
-import { Gguf, Model, Registry, Tensor } from "@effect-torch/core"
+import { Chat, Gguf, Model, Registry, Tensor } from "@effect-torch/core"
 import * as Tokenizers from "@effect-torch/tokenizers"
 import { NodeRuntime } from "@effect/platform-node"
-import { Effect, Option } from "effect"
+import { Config, Effect, Option, Schema, Stream } from "effect"
 import path from "node:path"
 import { fileURLToPath } from "node:url"
 
 const directory = path.dirname(fileURLToPath(import.meta.url))
 const modelPath = path.join(directory, "../data/Muse-Glimmer-30B-UD-Q2_K_XL.gguf")
 const tokenizerPath = path.join(directory, "../data/muse-glimmer-tokenizer.json")
-const maxNewTokens = Number(process.env.MUSE_GLIMMER_MAX_NEW_TOKENS ?? 64)
 
 const timed = <A, E, R>(label: string, effect: Effect.Effect<A, E, R>): Effect.Effect<A, E, R> =>
   Effect.gen(function*() {
@@ -20,18 +19,32 @@ const timed = <A, E, R>(label: string, effect: Effect.Effect<A, E, R>): Effect.E
     return value
   })
 
-const chatPrompt = (prompt: string) =>
-  `<|begin_of_text|><|start|>system<|message|>You are a helpful AI assistant.\nKnowledge cutoff: 2026-01-04.\n\nReasoning strength: high.\n\n# Valid recipients: "self", "user".<|eot|><|start|>user<|message|>${prompt}<|eot|><|start|>assistant`
+const metadataNumber = (metadata: ReadonlyMap<string, unknown>, key: string): number | undefined => {
+  const value = metadata.get(key)
+  return typeof value === "number" && Number.isSafeInteger(value) ? value : undefined
+}
 
 const program = Effect.gen(function*() {
   const prompt = process.argv.slice(2).join(" ")
+
   if (prompt.length === 0) {
     yield* Effect.log("usage: pnpm tsx muse-glimmer/inference.ts <prompt>")
     return
   }
-  if (!Number.isSafeInteger(maxNewTokens) || maxNewTokens <= 0) {
-    return yield* Effect.die(new Error("MUSE_GLIMMER_MAX_NEW_TOKENS must be a positive integer"))
-  }
+
+  const maxNewTokens = yield* Config.option(
+    Config.schema(Schema.Int.check(Schema.isGreaterThan(0)), "MUSE_GLIMMER_MAX_NEW_TOKENS")
+  ).pipe(
+    Config.map(Option.getOrUndefined)
+  )
+
+  const reasoningStrength = yield* Config.nonEmptyString("MUSE_GLIMMER_REASONING_STRENGTH").pipe(
+    Config.withDefault("high")
+  )
+
+  const diagnostics = yield* Config.boolean("MUSE_GLIMMER_DIAGNOSTICS").pipe(
+    Config.withDefault(false)
+  )
 
   const tokenizer = yield* timed(
     "Loading tokenizer",
@@ -40,12 +53,22 @@ const program = Effect.gen(function*() {
       specialTokens: "Always"
     })
   )
-  const stopTokens = new Set([
-    Option.getOrThrow(tokenizer.tokenToId("<|end_of_text|>")),
-    Option.getOrThrow(tokenizer.tokenToId("<|eot|>"))
-  ])
+
   const loaded = yield* timed("Loading model", Gguf.load(modelPath))
-  if (process.env.MUSE_GLIMMER_DIAGNOSTICS !== undefined) {
+
+  const chatTemplate = loaded.metadata.get("tokenizer.chat_template")
+
+  if (typeof chatTemplate !== "string" || chatTemplate.length === 0) {
+    return yield* Effect.die(new Error("GGUF tokenizer.chat_template must be a non-empty string"))
+  }
+
+  const bosTokenId = metadataNumber(loaded.metadata, "tokenizer.ggml.bos_token_id")
+
+  if (bosTokenId === undefined) {
+    return yield* Effect.die(new Error("GGUF tokenizer.ggml.bos_token_id must be an integer"))
+  }
+
+  if (diagnostics) {
     const formats = new Map<string, { tensors: number; bytes: number }>()
     const tails = new Map<string, number>()
     for (const parameter of loaded.params) {
@@ -73,6 +96,7 @@ const program = Effect.gen(function*() {
     }
     process.stderr.write(`partial linear threadgroups: ${JSON.stringify(Object.fromEntries(tails))}\n`)
   }
+
   const inference = yield* timed(
     "Compiling inference",
     Model.inference(loaded.model, loaded.params, {
@@ -83,43 +107,69 @@ const program = Effect.gen(function*() {
       decodeBatch: 1
     })
   )
-  yield* Tensor.clearAll(loaded.params)
-  const generation = yield* inference.generation()
-  const encoded = yield* tokenizer.encode(chatPrompt(prompt))
-  const entry = yield* timed(
-    `Prefilling ${encoded.data.length} tokens`,
-    generation.add(yield* Tensor.fromTypedArray(encoded.data, [1, encoded.data.length]))
-  )
 
-  let logits: Tensor.Concrete | undefined = entry.logits
-  const generated: Array<number> = []
-  let emitted = 0
-  for (let step = 0; step < maxNewTokens; step++) {
-    const current = logits!
-    logits = undefined
-    const values = yield* Tensor.toTypedArray(current)
-    yield* Tensor.clear(current)
-    let token = 0
-    for (let index = 1; index < values.length; index++) {
-      if (Number(values[index]) > Number(values[token])) token = index
-    }
-    if (stopTokens.has(token)) break
-    generated.push(token)
-    const text = yield* tokenizer.decode(generated)
-    if (text.length > emitted) {
-      process.stdout.write(text.slice(emitted))
-      emitted = text.length
-    }
-    if (step + 1 < maxNewTokens) {
-      const start = performance.now()
-      const [next] = yield* generation.step([{ seq: entry.seq, token }])
-      process.stderr.write(` [${(1000 / (performance.now() - start)).toFixed(2)} tok/s]`)
-      logits = next
-    }
-  }
-  if (logits !== undefined) yield* Tensor.clear(logits)
-  yield* generation.close()
-  process.stdout.write("\n")
+  yield* Tensor.clearAll(loaded.params)
+
+  let sawSegment = false
+
+  yield* Stream.runForEach(
+    Chat.stream({
+      program: inference,
+      tokenizer,
+      template: chatTemplate,
+      messages: [{ role: "user", content: prompt }],
+      addGenerationPrompt: true,
+      variables: {
+        current_date: new Date().toISOString().slice(0, 10),
+        reasoning_strength: reasoningStrength
+      },
+      bosTokenId,
+      maxTokens: maxNewTokens
+    }),
+    (event) =>
+      Effect.sync(() => {
+        switch (event._tag) {
+          case "prefill": {
+            process.stderr.write(`Prefilling ${event.tokens} tokens...\n`)
+            process.stderr.write(`Prefilling ${event.tokens} tokens: ${(event.durationMs / 1000).toFixed(2)}s\n`)
+            break
+          }
+          case "start": {
+            sawSegment = true
+            const label = event.segment.kind === "content"
+              ? "response"
+              : event.segment.kind === "reasoning"
+              ? "reasoning"
+              : event.segment.recipient ?? event.segment.role
+            process.stdout.write(`[${label}]\n`)
+            break
+          }
+          case "delta": {
+            process.stdout.write(event.text)
+            break
+          }
+          case "end": {
+            process.stdout.write("\n")
+            break
+          }
+          case "done": {
+            const stats = event.result.stats
+            process.stderr.write(
+              `Decoding ${stats.generatedTokens} tokens: ${(stats.decodeMs / 1000).toFixed(2)}s (${
+                stats.decodeTokensPerSecond.toFixed(2)
+              } tok/s)\n`
+            )
+            break
+          }
+        }
+      })
+  )
+  if (!sawSegment) process.stdout.write("\n")
 })
 
-NodeRuntime.runMain(program.pipe(Effect.provide(Registry.layer), Effect.provide(BackendApple.layer)))
+NodeRuntime.runMain(
+  program.pipe(
+    Effect.provide(Registry.layer),
+    Effect.provide(BackendApple.layer)
+  )
+)

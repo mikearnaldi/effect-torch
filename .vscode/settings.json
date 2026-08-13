@@ -1,3 +1,26 @@
 {
-  "rust-analyzer.cargo.features": ["napi-addon"]
+  "rust-analyzer.cargo.features": ["napi-addon"],
+  "editor.formatOnSave": true,
+  "dprint.configPath": "${workspaceFolder}/dprint.json",
+  "[typescript]": {
+    "editor.defaultFormatter": "dprint.dprint"
+  },
+  "[typescriptreact]": {
+    "editor.defaultFormatter": "dprint.dprint"
+  },
+  "[javascript]": {
+    "editor.defaultFormatter": "dprint.dprint"
+  },
+  "[javascriptreact]": {
+    "editor.defaultFormatter": "dprint.dprint"
+  },
+  "[json]": {
+    "editor.defaultFormatter": "dprint.dprint"
+  },
+  "[jsonc]": {
+    "editor.defaultFormatter": "dprint.dprint"
+  },
+  "[markdown]": {
+    "editor.defaultFormatter": "dprint.dprint"
+  }
 }

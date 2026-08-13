@@ -308,6 +308,48 @@ it.effect("receives vocab_size from generic GGUF tokenizer token translation", (
   }).pipe(Effect.provide(services))
 })
 
+it.effect("exposes canonical tokenizer metadata from GGUF loading", () => {
+  const ggufRuntime = {
+    ...runtime,
+    extensions: {
+      gguf: {
+        inspect: () =>
+          Effect.succeed({
+            metadata: [
+              { key: "general.architecture", value: "generic-metadata-test" },
+              { key: "tokenizer.chat_template", value: "{{ messages }}" },
+              { key: "tokenizer.ggml.bos_token_id", value: 1 },
+              { key: "tokenizer.ggml.eos_token_id", value: 2 },
+              { key: "tokenizer.ggml.eot_token_id", value: 3 }
+            ],
+            tensors: []
+          }),
+        load: () => Effect.succeed({ entries: [] })
+      }
+    }
+  } as unknown as Runtime.RuntimeService
+  const services = Layer.merge(
+    Registry.emptyLayer,
+    Layer.succeed(Runtime.Runtime, ggufRuntime)
+  )
+  return Effect.gen(function*() {
+    const registry = yield* Registry.Registry
+    yield* registry.register({
+      id: "gguf:generic-metadata-test",
+      create: () =>
+        Model.define({
+          parameters: [],
+          forward: (_, input) => Effect.succeed(input as Tensor.Lazy)
+        })
+    })
+    const loaded = yield* Gguf.load("generic.gguf")
+    expect(loaded.metadata.get("tokenizer.chat_template")).toBe("{{ messages }}")
+    expect(loaded.metadata.get("tokenizer.ggml.bos_token_id")).toBe(1)
+    expect(loaded.metadata.get("tokenizer.ggml.eos_token_id")).toBe(2)
+    expect(loaded.metadata.get("tokenizer.ggml.eot_token_id")).toBe(3)
+  }).pipe(Effect.provide(services))
+})
+
 it.effect("defines the exact load-only parameter catalog", () =>
   Effect.gen(function*() {
     const model = yield* MuseGlimmer.architecture.create(config())

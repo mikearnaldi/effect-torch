@@ -1,9 +1,11 @@
+use minijinja::{Environment, Error as MiniError, ErrorKind as MiniErrorKind, Value as MiniValue};
 use napi::bindgen_prelude::*;
 use napi::threadsafe_function::{ThreadsafeFunction, ThreadsafeFunctionCallMode};
 use napi_derive::napi;
 use rayon::prelude::*;
 use std::io::BufRead;
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokenizers::decoders::{
     byte_fallback::ByteFallback as ByteFallbackDecoder, byte_level::ByteLevel as ByteLevelDecoder,
     metaspace::Metaspace as MetaspaceDecoder, sequence::Sequence as SequenceDecoder,
@@ -41,6 +43,87 @@ fn to_napi_error<E: std::fmt::Display>(err: E) -> Error {
 
 fn to_join_error(error: tokio::task::JoinError) -> Error {
     Error::new(Status::GenericFailure, error.to_string())
+}
+
+fn civil_from_days(days: i64) -> (i64, u32, u32) {
+    let shifted = days + 719_468;
+    let era = shifted.div_euclid(146_097);
+    let day_of_era = shifted.rem_euclid(146_097) as u64;
+    let year_of_era =
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let year = year_of_era as i64 + era * 400;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_prime = (5 * day_of_year + 2) / 153;
+    let day = (day_of_year - (153 * month_prime + 2) / 5 + 1) as u32;
+    let month = if month_prime < 10 {
+        month_prime + 3
+    } else {
+        month_prime - 9
+    } as u32;
+    (if month <= 2 { year + 1 } else { year }, month, day)
+}
+
+type MiniResult<T> = std::result::Result<T, MiniError>;
+
+fn strftime_now(format: &str) -> MiniResult<String> {
+    let seconds = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| MiniError::new(MiniErrorKind::InvalidOperation, error.to_string()))?
+        .as_secs() as i64;
+    let days = seconds.div_euclid(86_400);
+    let time = seconds.rem_euclid(86_400) as u32;
+    let (year, month, day) = civil_from_days(days);
+    let replacements = [
+        ("Y", format!("{year:04}")),
+        ("m", format!("{month:02}")),
+        ("d", format!("{day:02}")),
+        ("H", format!("{:02}", time / 3_600)),
+        ("M", format!("{:02}", time % 3_600 / 60)),
+        ("S", format!("{:02}", time % 60)),
+        ("%", "%".to_string()),
+    ];
+    let mut rendered = String::new();
+    let mut chars = format.chars();
+    while let Some(char) = chars.next() {
+        if char != '%' {
+            rendered.push(char);
+            continue;
+        }
+        let code = chars.next().ok_or_else(|| {
+            MiniError::new(
+                MiniErrorKind::InvalidOperation,
+                "strftime_now format ends after '%'",
+            )
+        })?;
+        let replacement = replacements
+            .iter()
+            .find(|(candidate, _)| *candidate == code.to_string())
+            .map(|(_, replacement)| replacement)
+            .ok_or_else(|| {
+                MiniError::new(
+                    MiniErrorKind::InvalidOperation,
+                    format!("unsupported strftime_now format %{code}"),
+                )
+            })?;
+        rendered.push_str(replacement);
+    }
+    Ok(rendered)
+}
+
+fn render_chat_template(template: &str, context_json: &str) -> Result<String> {
+    let context: serde_json::Value = serde_json::from_str(context_json).map_err(to_napi_error)?;
+    let mut environment = Environment::new();
+    environment.add_function(
+        "raise_exception",
+        |message: String| -> MiniResult<MiniValue> {
+            Err(MiniError::new(MiniErrorKind::InvalidOperation, message))
+        },
+    );
+    environment.add_function("strftime_now", |format: String| strftime_now(&format));
+    environment
+        .template_from_str(template)
+        .and_then(|template| template.render(&MiniValue::from_serialize(&context)))
+        .map_err(to_napi_error)
 }
 
 // Splits `text` at occurrences of special-token strings, keeping every piece
@@ -127,9 +210,12 @@ impl TokenizerInner {
         self.tokenizer.encode(segment, false).map_err(to_napi_error)
     }
 
-    fn encode_ids(&self, text: &str) -> Result<Vec<u32>> {
+    fn encode_ids_with(&self, text: &str, add_special_tokens: bool) -> Result<Vec<u32>> {
         if self.parse_specials || self.specials.is_empty() {
-            let encoding = self.tokenizer.encode(text, true).map_err(to_napi_error)?;
+            let encoding = self
+                .tokenizer
+                .encode(text, add_special_tokens)
+                .map_err(to_napi_error)?;
             return Ok(encoding.get_ids().to_vec());
         }
         let segments = split_around_specials(text, &self.specials);
@@ -140,12 +226,18 @@ impl TokenizerInner {
             }
             merged.merge_with(self.encode_segment(segment)?, false);
         }
-        if let Some(post_processor) = self.tokenizer.get_post_processor() {
-            merged = post_processor
-                .process(merged, None, true)
-                .map_err(to_napi_error)?;
+        if add_special_tokens {
+            if let Some(post_processor) = self.tokenizer.get_post_processor() {
+                merged = post_processor
+                    .process(merged, None, true)
+                    .map_err(to_napi_error)?;
+            }
         }
         Ok(merged.get_ids().to_vec())
+    }
+
+    fn encode_ids(&self, text: &str) -> Result<Vec<u32>> {
+        self.encode_ids_with(text, true)
     }
 }
 
@@ -223,8 +315,11 @@ impl NativeTokenizer {
     }
 
     #[napi]
-    pub fn encode(&self, text: String) -> Result<Uint32Array> {
-        Ok(self.inner().encode_ids(&text)?.into())
+    pub fn encode(&self, text: String, add_special_tokens: Option<bool>) -> Result<Uint32Array> {
+        Ok(self
+            .inner()
+            .encode_ids_with(&text, add_special_tokens.unwrap_or(true))?
+            .into())
     }
 
     #[napi]
@@ -241,20 +336,29 @@ impl NativeTokenizer {
     }
 
     #[napi]
-    pub fn decode(&self, ids: Vec<u32>) -> Result<String> {
+    pub fn decode(&self, ids: Vec<u32>, skip_special_tokens: Option<bool>) -> Result<String> {
         self.inner()
             .tokenizer
-            .decode(&ids, false)
+            .decode(&ids, skip_special_tokens.unwrap_or(false))
             .map_err(to_napi_error)
     }
 
     #[napi]
-    pub fn decode_batch(&self, ids: Vec<Vec<u32>>) -> Result<Vec<String>> {
+    pub fn decode_batch(
+        &self,
+        ids: Vec<Vec<u32>>,
+        skip_special_tokens: Option<bool>,
+    ) -> Result<Vec<String>> {
         let refs: Vec<&[u32]> = ids.iter().map(|v| v.as_slice()).collect();
         self.inner()
             .tokenizer
-            .decode_batch(&refs, false)
+            .decode_batch(&refs, skip_special_tokens.unwrap_or(false))
             .map_err(to_napi_error)
+    }
+
+    #[napi]
+    pub fn apply_chat_template(&self, template: String, context_json: String) -> Result<String> {
+        render_chat_template(&template, &context_json)
     }
 }
 

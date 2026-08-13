@@ -32,6 +32,8 @@ export interface LoadedModel {
   readonly model: Model.Model
   /** The loaded tensors ordered according to the model's parameter catalog. */
   readonly params: ReadonlyArray<Tensor.Concrete>
+  /** The artifact's canonical metadata keys, including tokenizer configuration. */
+  readonly metadata: ReadonlyMap<string, unknown>
 }
 
 const fail = (op: GgufError["op"], message: string): GgufError => new GgufError({ op, message })
@@ -332,7 +334,7 @@ export const load = (
             if (params.some((tensor) => tensor === undefined)) {
               throw fail("validate", "loaded GGUF parameter bijection failed")
             }
-            return { model, params } satisfies LoadedModel
+            return { model, params, metadata: config } satisfies LoadedModel
           })
           return Effect.onExit(
             validated,

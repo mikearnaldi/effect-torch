@@ -28,10 +28,11 @@ export declare class NativeTokenizer {
   tokenToId(token: string): number | null
   idToToken(id: number): string | null
   save(path: string): void
-  encode(text: string): Uint32Array
+  encode(text: string, addSpecialTokens?: boolean): Uint32Array
   encodeBatch(texts: Array<string>): Promise<Array<Uint32Array>>
-  decode(ids: Array<number>): string
-  decodeBatch(ids: Array<Array<number>>): Array<string>
+  decode(ids: Array<number>, skipSpecialTokens?: boolean): string
+  decodeBatch(ids: Array<Array<number>>, skipSpecialTokens?: boolean): Array<string>
+  applyChatTemplate(template: string, contextJson: string): string
 }
 
 /** @internal */

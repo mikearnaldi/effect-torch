@@ -55,7 +55,7 @@ export type TokenizerTypeId = typeof TokenizerTypeId
  * @category errors
  */
 export class TokenizerError extends Data.TaggedError("TokenizerError")<{
-  /** One of `fromFile`, `fromJson`, `train`, `encode`, `encodeBatch`, `encodeBatchConcat`, `decode`, `decodeBatch`, or `save`. */
+  /** One of `fromFile`, `fromJson`, `train`, `encode`, `encodeBatch`, `encodeBatchConcat`, `decode`, `decodeBatch`, `applyChatTemplate`, or `save`. */
   readonly op: string
   /** Human-readable diagnostic from the wrapper or native implementation. */
   readonly message: string
@@ -224,6 +224,29 @@ export interface TokenIds {
 export type TokenIdInput = TokenIds | Uint32Array | ReadonlyArray<number>
 
 /**
+ * Per-call encoding behavior. `addSpecialTokens` controls serialized
+ * post-processor insertion, not parsing of special strings selected by
+ * {@link SpecialTokenPolicy}; it defaults to `true` for compatibility.
+ *
+ * @since 0.1.0
+ * @category models
+ */
+export interface EncodeOptions {
+  readonly addSpecialTokens?: boolean | undefined
+}
+
+/**
+ * Per-call decoding behavior. `skipSpecialTokens` omits registered special
+ * tokens from the rendered text and defaults to `false` for compatibility.
+ *
+ * @since 0.1.0
+ * @category models
+ */
+export interface DecodeOptions {
+  readonly skipSpecialTokens?: boolean | undefined
+}
+
+/**
  * Shared configuration with no facade padding or truncation and the `"Never"`
  * special-token policy. It does not disable native padding or truncation in a
  * loaded tokenizer, and `"Never"` has the limitations documented by
@@ -369,6 +392,35 @@ export interface TrainConfig<E, R> {
 }
 
 /**
+ * One conversational message for a model-provided Jinja chat template.
+ * Templates may read additional message fields through the index signature.
+ *
+ * @since 0.1.0
+ * @category models
+ */
+export interface ChatMessage {
+  readonly role: string
+  readonly content?: unknown | undefined
+  readonly [field: string]: unknown
+}
+
+/**
+ * Variables for a model-provided Jinja chat template. `variables` supplies
+ * template-defined fields such as `bos_token`, dates, tools, or cutoff
+ * metadata; reserved `messages` and `add_generation_prompt` values are always
+ * supplied by the wrapper and cannot be overridden.
+ *
+ * @since 0.1.0
+ * @category models
+ */
+export interface ChatTemplateOptions {
+  /** Appends the template's assistant generation prefix when supported. */
+  readonly addGenerationPrompt?: boolean | undefined
+  /** Additional variables exposed to the Jinja rendering context. */
+  readonly variables?: Readonly<Record<string, unknown>> | undefined
+}
+
+/**
  * A native-backed text tokenizer. The facade and retained configuration are
  * not runtime-frozen; concurrent use requires callers not to mutate either.
  * The native handle owns CPU heap and is reclaimed by GC finalization, so no
@@ -391,7 +443,8 @@ export interface Tokenizer extends Pipeable {
    * cannot be interrupted once the call starts.
    */
   readonly encode: (
-    text: string
+    text: string,
+    options?: EncodeOptions
   ) => Effect.Effect<TokenIds, TokenizerError>
   /**
    * Encodes a non-empty batch in parallel into caller-owned `[B, T]` `u32`
@@ -416,13 +469,15 @@ export interface Tokenizer extends Pipeable {
   ) => Effect.Effect<TokenIds, TokenizerError>
   /**
    * Decodes all supplied data as one flat sequence. A {@link TokenIds} shape
-   * is ignored, special tokens are included, and ids absent from the
-   * vocabulary are silently omitted. Decoding is pipeline-dependent and is
-   * not guaranteed to invert encoding. The native call runs synchronously on
-   * the JS thread and cannot be interrupted once started.
+   * is ignored, special tokens are included unless `skipSpecialTokens` is
+   * true, and ids absent from the vocabulary are silently omitted. Decoding
+   * is pipeline-dependent and is not guaranteed to invert encoding. The
+   * native call runs synchronously on the JS thread and cannot be interrupted
+   * once started.
    */
   readonly decode: (
-    ids: TokenIdInput
+    ids: TokenIdInput,
+    options?: DecodeOptions
   ) => Effect.Effect<string, TokenizerError>
   /**
    * Decodes each outer input as one sequence. Inner {@link TokenIds} shapes
@@ -432,8 +487,21 @@ export interface Tokenizer extends Pipeable {
    * It cannot be interrupted once started.
    */
   readonly decodeBatch: (
-    ids: ReadonlyArray<TokenIdInput>
+    ids: ReadonlyArray<TokenIdInput>,
+    options?: DecodeOptions
   ) => Effect.Effect<ReadonlyArray<string>, TokenizerError>
+  /**
+   * Renders a model-provided Jinja chat template with `messages` and
+   * `add_generation_prompt`. The native renderer provides the Jinja functions
+   * `raise_exception` and `strftime_now`, common model tests and filters, and
+   * `tojson`. Rendering runs synchronously on the JS thread and cannot be
+   * interrupted once started.
+   */
+  readonly applyChatTemplate: (
+    template: string,
+    messages: ReadonlyArray<ChatMessage>,
+    options?: ChatTemplateOptions
+  ) => Effect.Effect<string, TokenizerError>
   /** Synchronously returns the id for an exact vocabulary or added token. */
   readonly tokenToId: (token: string) => Option.Option<number>
   /**
@@ -521,10 +589,10 @@ const make = (
   const self = Object.create(TokenizerProto)
   self[TokenizerTypeId] = TokenizerTypeId
   self.vocabSize = handle.vocabSize
-  self.encode = (text: string) =>
+  self.encode = (text: string, options?: EncodeOptions) =>
     Effect.try({
       try: () => {
-        const data = truncate(handle.encode(text), config)
+        const data = truncate(handle.encode(text, options?.addSpecialTokens ?? true), config)
         return tokenIds(data, [data.length])
       },
       catch: toTokenizerError("encode")
@@ -549,23 +617,45 @@ const make = (
       },
       catch: toTokenizerError("encodeBatchConcat")
     })
-  self.decode = (ids: TokenIdInput) =>
+  self.decode = (ids: TokenIdInput, options?: DecodeOptions) =>
     Effect.flatMap(idsOf(ids), (resolved) =>
       Effect.try({
-        try: () => handle.decode(resolved as Array<number>),
+        try: () => handle.decode(resolved as Array<number>, options?.skipSpecialTokens ?? false),
         catch: toTokenizerError("decode")
       }))
   self.decodeBatch = (
-    batch: ReadonlyArray<TokenIdInput>
+    batch: ReadonlyArray<TokenIdInput>,
+    options?: DecodeOptions
   ) =>
     Effect.flatMap(
       Effect.forEach(batch, idsOf, { concurrency: "unbounded" }),
       (resolved) =>
         Effect.try({
-          try: () => handle.decodeBatch(resolved.map((row) => row as Array<number>)),
+          try: () =>
+            handle.decodeBatch(
+              resolved.map((row) => row as Array<number>),
+              options?.skipSpecialTokens ?? false
+            ),
           catch: toTokenizerError("decodeBatch")
         })
     )
+  self.applyChatTemplate = (
+    template: string,
+    messages: ReadonlyArray<ChatMessage>,
+    options?: ChatTemplateOptions
+  ) =>
+    Effect.try({
+      try: () =>
+        handle.applyChatTemplate(
+          template,
+          JSON.stringify({
+            ...options?.variables,
+            messages,
+            add_generation_prompt: options?.addGenerationPrompt ?? false
+          })
+        ),
+      catch: toTokenizerError("applyChatTemplate")
+    })
   self.tokenToId = (token: string) => Option.fromNullishOr(handle.tokenToId(token))
   self.idToToken = (id: number) => Option.fromNullishOr(handle.idToToken(id))
   self.save = (path: string) =>
