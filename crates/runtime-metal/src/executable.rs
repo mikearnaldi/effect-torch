@@ -8061,6 +8061,60 @@ mod tests {
     }
 
     #[test]
+    fn quantized_linear_mma_executes_large_exact_batches() {
+        let columns = 5120usize;
+        let vectors = 16usize;
+        let blocks = columns / 256;
+        for fixture in quantized_fixtures()
+            .into_iter()
+            .filter(|fixture| matches!(fixture.codec, GgmlKQuant::Q3K | GgmlKQuant::Q6K))
+        {
+            let rows = match fixture.codec {
+                GgmlKQuant::Q3K => 8192usize,
+                GgmlKQuant::Q6K => 4096usize,
+                _ => unreachable!(),
+            };
+            let encoded_row_bytes = fixture.bytes.len() * blocks;
+            assert!(rows * encoded_row_bytes >= 16 * 1024 * 1024);
+            let decoded = fixture
+                .expected()
+                .into_iter()
+                .cycle()
+                .take(columns)
+                .collect::<Vec<_>>();
+            let input_values = (0..vectors * columns)
+                .map(|index| ((index * 7 + index / columns * 3) % 17) as f32 * 0.125 - 1.0)
+                .collect::<Vec<_>>();
+            let packed = fixture
+                .bytes
+                .iter()
+                .copied()
+                .cycle()
+                .take(rows * encoded_row_bytes)
+                .collect::<Vec<_>>();
+            let root = Node::new(NodeKind::QuantizedLinear {
+                x: leaf_shape(input_values.clone(), vec![vectors, columns]),
+                weight: leaf_u8(&packed, vec![rows, encoded_row_bytes]),
+                bias: None,
+                codec: fixture.codec,
+                weight_shape: [rows, columns],
+            })
+            .unwrap();
+            let compilation = compile_graph(&[root], false);
+            let actual = run(&compilation)[0].to_f32_vec().unwrap();
+            let mut expected = Vec::with_capacity(vectors * rows);
+            for vector in 0..vectors {
+                let dot = input_values[vector * columns..(vector + 1) * columns]
+                    .iter()
+                    .zip(&decoded)
+                    .fold(0.0f32, |sum, (&input, &weight)| sum + input * weight);
+                expected.extend(std::iter::repeat_n(dot, rows));
+            }
+            assert_quantized_close(&actual, &expected);
+        }
+    }
+
+    #[test]
     fn quantized_embedding_executes_every_codec_for_u32_and_i64_indexes() {
         for fixture in quantized_fixtures() {
             let expected_row = fixture.expected();

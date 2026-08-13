@@ -291,6 +291,7 @@ fn validate_embedding(
 enum KernelKind {
     Linear,
     LinearBatched(u8),
+    LinearMma,
     Embedding,
 }
 
@@ -315,6 +316,7 @@ fn pipeline_key(kind: KernelKind, codec: GgmlKQuant, index_dtype: Option<DType>)
             2u8.hash(&mut hasher);
             vector_lanes.hash(&mut hasher);
         }
+        KernelKind::LinearMma => 3u8.hash(&mut hasher),
         KernelKind::Embedding => 1u8.hash(&mut hasher),
     }
     codec_tag(codec).hash(&mut hasher);
@@ -406,6 +408,101 @@ inline float et_decode_k(device const uchar* block, uint lane) {
     const uint scale_index = half_index * 8 + scale_lane + quarter * 2;
     const int scale = et_signed_byte(block[192 + scale_index]);
     return et_fp16_at(block, 208) * float(scale) * float(int(quant) - 32);
+#endif
+}
+
+inline void et_decode_k16(device const uchar* block, uint group, threadgroup float* destination, uint stride) {
+#if ET_CODEC == 2
+    const uint half_index = group / 8;
+    const uint within = group % 8;
+    const uint shift = (within / 2) * 2;
+    const uint quant_offset = (within % 2) * 16;
+    const uchar packed_scale = block[group];
+    const float scale = et_fp16_at(block, 80) * float(packed_scale & 15);
+    const float offset = et_fp16_at(block, 82) * float(packed_scale >> 4);
+    device const uchar* quants = block + 16 + half_index * 32 + quant_offset;
+    for (uint index = 0; index < 16; ++index) {
+        destination[index * stride] = scale * float((quants[index] >> shift) & 3) - offset;
+    }
+#elif ET_CODEC == 3
+    const uint half_index = group / 8;
+    const uint within = group % 8;
+    const uint quant_lane = within / 2;
+    const uint shift = quant_lane * 2;
+    const uint quant_offset = (within % 2) * 16;
+    const uchar low = group < 8 ? (block[96 + group] & 15) : (block[96 + group - 8] >> 4);
+    const uchar high = (block[104 + group % 4] >> (2 * (group / 4))) & 3;
+    const float scale = et_fp16_at(block, 108) * float(int(low | (high << 4)) - 32);
+    const uchar mask = uchar(1u << (half_index * 4 + quant_lane));
+    device const uchar* quants = block + 32 + half_index * 32 + quant_offset;
+    device const uchar* hmask = block + quant_offset;
+    for (uint index = 0; index < 16; ++index) {
+        const int low_quant = int((quants[index] >> shift) & 3);
+        const int high_quant = (hmask[index] & mask) == 0 ? 4 : 0;
+        destination[index * stride] = scale * float(low_quant - high_quant);
+    }
+#elif ET_CODEC == 4
+    const uint scale_group = group / 2;
+    const uint index_offset = (group % 2) * 16;
+    const uint pair = scale_group / 2;
+    const uint side = scale_group % 2;
+    uint packed_scale;
+    uint minimum;
+    if (scale_group < 4) {
+        packed_scale = uint(block[4 + scale_group] & 63);
+        minimum = uint(block[8 + scale_group] & 63);
+    } else {
+        packed_scale = uint(block[8 + scale_group] & 15) | (uint(block[scale_group]) >> 6) << 4;
+        minimum = uint(block[8 + scale_group] >> 4) | (uint(block[4 + scale_group]) >> 6) << 4;
+    }
+    const float d = et_fp16_at(block, 0);
+    const float dmin = et_fp16_at(block, 2);
+    for (uint index = 0; index < 16; ++index) {
+        const uint quant_index = index_offset + index;
+        const uchar packed = block[16 + pair * 32 + quant_index];
+        const uint quant = side == 0 ? uint(packed & 15) : uint(packed >> 4);
+        destination[index * stride] = d * float(packed_scale) * float(quant) - dmin * float(minimum);
+    }
+#elif ET_CODEC == 5
+    const uint scale_group = group / 2;
+    const uint index_offset = (group % 2) * 16;
+    const uint pair = scale_group / 2;
+    const uint side = scale_group % 2;
+    uint packed_scale;
+    uint minimum;
+    if (scale_group < 4) {
+        packed_scale = uint(block[4 + scale_group] & 63);
+        minimum = uint(block[8 + scale_group] & 63);
+    } else {
+        packed_scale = uint(block[8 + scale_group] & 15) | (uint(block[scale_group]) >> 6) << 4;
+        minimum = uint(block[8 + scale_group] >> 4) | (uint(block[4 + scale_group]) >> 6) << 4;
+    }
+    const float d = et_fp16_at(block, 0);
+    const float dmin = et_fp16_at(block, 2);
+    for (uint index = 0; index < 16; ++index) {
+        const uint quant_index = index_offset + index;
+        const uchar packed = block[48 + pair * 32 + quant_index];
+        const uint low_quant = side == 0 ? uint(packed & 15) : uint(packed >> 4);
+        const uchar mask = uchar(1u << (pair * 2 + side));
+        const uint quant = low_quant + ((block[16 + quant_index] & mask) == 0 ? 0u : 16u);
+        destination[index * stride] = d * float(packed_scale) * float(quant) - dmin * float(minimum);
+    }
+#else
+    const uint half_index = group / 8;
+    const uint within = (group % 8) * 16;
+    const uint quarter = within / 32;
+    const uint index_offset = within % 32;
+    const uint low_index = half_index * 64 + index_offset + ((quarter & 1) == 0 ? 0 : 32);
+    const uint low_shift = quarter < 2 ? 0 : 4;
+    const uint high_shift = quarter * 2;
+    const uint scale_lane = index_offset / 16;
+    const uint scale_index = half_index * 8 + scale_lane + quarter * 2;
+    const float scale = et_fp16_at(block, 208) * float(et_signed_byte(block[192 + scale_index]));
+    for (uint index = 0; index < 16; ++index) {
+        const uint quant = ((uint(block[low_index + index]) >> low_shift) & 15)
+            | (((uint(block[128 + half_index * 32 + index_offset + index]) >> high_shift) & 3) << 4);
+        destination[index * stride] = scale * float(int(quant) - 32);
+    }
 #endif
 }
 "#;
@@ -847,6 +944,93 @@ kernel void et_quantized_linear(
 }
 "#;
 
+const MMA_LINEAR_SOURCE: &str = r#"
+#include <metal_simdgroup_matrix>
+
+kernel void et_quantized_linear_mma(
+    device const float* input [[buffer(0)]],
+    device const uchar* weight [[buffer(1)]],
+    device const float* bias [[buffer(2)]],
+    device float* output [[buffer(3)]],
+    constant ulong& vectors [[buffer(4)]],
+    constant ulong& rows [[buffer(5)]],
+    constant ulong& columns [[buffer(6)]],
+    constant ulong& encoded_row_bytes [[buffer(7)]],
+    constant uint& has_bias [[buffer(8)]],
+    uint2 group [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]],
+    ushort simd_group [[simdgroup_index_in_threadgroup]]) {
+    constexpr uint tile_m = 16;
+    constexpr uint tile_n = 128;
+    constexpr uint tile_k = 64;
+    const ulong first_vector = ulong(group.y) * tile_m;
+    const ulong first_row = ulong(group.x) * tile_n;
+    threadgroup float tile_storage[tile_k * tile_n];
+    simdgroup_float8x8 accumulators[2][4];
+    for (uint i = 0; i < 2; ++i) {
+        for (uint j = 0; j < 4; ++j) {
+            accumulators[i][j] = simdgroup_float8x8(0.0f);
+        }
+    }
+
+    for (uint k0 = 0; k0 < uint(columns); k0 += tile_k) {
+        for (uint group_index = tid; group_index < tile_n * (tile_k / 16); group_index += 128) {
+            const uint row_offset = group_index / (tile_k / 16);
+            const uint group_offset = group_index % (tile_k / 16);
+            const ulong row = first_row + row_offset;
+            const uint group_column = k0 + group_offset * 16;
+            if (row < rows) {
+                device const uchar* block = weight + row * encoded_row_bytes +
+                    ulong(group_column / 256) * ET_BLOCK_BYTES;
+                et_decode_k16(
+                    block,
+                    (group_column % 256) / 16,
+                    &tile_storage[row_offset * tile_k + group_offset * 16],
+                    1
+                );
+            } else {
+                for (uint index = 0; index < 16; ++index) {
+                    tile_storage[row_offset * tile_k + group_offset * 16 + index] = 0.0f;
+                }
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        const uint n0 = uint(simd_group) * 32;
+        for (uint k = 0; k < tile_k; k += 8) {
+            for (uint i = 0; i < 2; ++i) {
+                simdgroup_float8x8 a;
+                simdgroup_load(a, input + (first_vector + i * 8) * columns + k0 + k, uint(columns));
+                for (uint j = 0; j < 4; ++j) {
+                    simdgroup_float8x8 b;
+                    simdgroup_load(b, &tile_storage[(n0 + j * 8) * tile_k + k], tile_k, 0, true);
+                    simdgroup_multiply_accumulate(accumulators[i][j], a, b, accumulators[i][j]);
+                }
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    const uint n0 = uint(simd_group) * 32;
+    for (uint i = 0; i < 2; ++i) {
+        for (uint j = 0; j < 4; ++j) {
+            simdgroup_store(accumulators[i][j], &tile_storage[(i * 8) * tile_n + n0 + j * 8], tile_n);
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint element = tid; element < tile_m * tile_n; element += 128) {
+        const uint vector_offset = element / tile_n;
+        const uint row_offset = element % tile_n;
+        const ulong vector = first_vector + vector_offset;
+        const ulong row = first_row + row_offset;
+        if (vector < vectors && row < rows) {
+            output[vector * rows + row] = tile_storage[vector_offset * tile_n + row_offset] +
+                (has_bias != 0 ? bias[row] : 0.0f);
+        }
+    }
+}
+"#;
+
 const EMBEDDING_SOURCE: &str = r#"
 #define ET_INDEX $INDEX_TYPE
 
@@ -882,6 +1066,7 @@ kernel void et_quantized_embedding(
 fn source(kind: KernelKind, codec: GgmlKQuant, index_dtype: Option<DType>) -> String {
     let kernel = match kind {
         KernelKind::Linear | KernelKind::LinearBatched(_) => LINEAR_SOURCE,
+        KernelKind::LinearMma => MMA_LINEAR_SOURCE,
         KernelKind::Embedding => EMBEDDING_SOURCE,
     };
     let mut source = String::with_capacity(DECODE_SOURCE.len() + kernel.len());
@@ -892,7 +1077,7 @@ fn source(kind: KernelKind, codec: GgmlKQuant, index_dtype: Option<DType>) -> St
     source = source.replace("$ROWS_PER_SIMD", &rows_per_simd(codec).to_string());
     let vector_lanes = match kind {
         KernelKind::LinearBatched(vector_lanes) => vector_lanes,
-        KernelKind::Linear | KernelKind::Embedding => 1,
+        KernelKind::Linear | KernelKind::LinearMma | KernelKind::Embedding => 1,
     };
     source = source.replace("$VECTOR_LANES", &vector_lanes.to_string());
     if matches!(kind, KernelKind::Embedding) {
@@ -915,6 +1100,7 @@ fn pipeline(
 ) -> Result<crate::device::Pipeline, String> {
     let name = match kind {
         KernelKind::Linear | KernelKind::LinearBatched(_) => "et_quantized_linear",
+        KernelKind::LinearMma => "et_quantized_linear_mma",
         KernelKind::Embedding => "et_quantized_embedding",
     };
     crate::device::MetalDevice::get().compile_lazy(
@@ -938,6 +1124,7 @@ fn cached_pipeline(
                 match kind {
                     KernelKind::Linear => "linear",
                     KernelKind::LinearBatched(_) => "linear_batched",
+                    KernelKind::LinearMma => "linear_mma",
                     KernelKind::Embedding => "embedding",
                 }
             )
@@ -945,6 +1132,12 @@ fn cached_pipeline(
 }
 
 fn linear_kernel_kind(requirements: &LinearRequirements) -> KernelKind {
+    if requirements.vectors >= 16
+        && requirements.vectors % 16 == 0
+        && requirements.rows * requirements.encoded_row_bytes >= 16 * 1024 * 1024
+    {
+        return KernelKind::LinearMma;
+    }
     if requirements.vectors >= 4 {
         match requirements.codec {
             GgmlKQuant::Q2K => KernelKind::LinearBatched(2),
@@ -958,14 +1151,30 @@ fn linear_kernel_kind(requirements: &LinearRequirements) -> KernelKind {
 
 pub fn warm_linear_exact(requirements: &LinearRequirements) -> Result<(), String> {
     if requirements.pipeline_count != 0 {
-        use objc2_metal::MTLComputePipelineState;
-        let pipeline = pipeline(linear_kernel_kind(requirements), requirements.codec, None)?;
+        use objc2_metal::{MTLComputePipelineState, MTLDevice as _};
+
+        let kernel_kind = linear_kernel_kind(requirements);
+        let pipeline = pipeline(kernel_kind, requirements.codec, None)?;
+        let required_threads = match kernel_kind {
+            KernelKind::LinearMma => 128,
+            _ => 64,
+        };
         if pipeline.as_raw().threadExecutionWidth() != 32
-            || pipeline.as_raw().maxTotalThreadsPerThreadgroup() < 64
+            || pipeline.as_raw().maxTotalThreadsPerThreadgroup() < required_threads
         {
             return Err(
-                "quantized_linear: Metal pipeline requires SIMD width 32 and 64-thread groups"
+                "quantized_linear: Metal pipeline requires SIMD width 32 and exact threadgroup capacity"
                     .to_string(),
+            );
+        }
+        if matches!(kernel_kind, KernelKind::LinearMma)
+            && crate::device::MetalDevice::get()
+                .raw()
+                .maxThreadgroupMemoryLength()
+                < 32 * 1024
+        {
+            return Err(
+                "quantized_linear_mma: Metal device requires 32 KB threadgroup memory".to_string(),
             );
         }
     }
@@ -1003,7 +1212,12 @@ pub fn linear_into(
     let columns = requirements.columns as u64;
     let encoded_row_bytes = requirements.encoded_row_bytes as u64;
     let rows_per_threadgroup = rows_per_simd(requirements.codec) * 2;
+    let (row_groups, threads_per_threadgroup) = match kernel_kind {
+        KernelKind::LinearMma => (requirements.rows.div_ceil(128), 128),
+        _ => (requirements.rows.div_ceil(rows_per_threadgroup), 64),
+    };
     let vector_groups = match kernel_kind {
+        KernelKind::LinearMma => requirements.vectors.div_ceil(16),
         KernelKind::LinearBatched(vector_lanes) => {
             requirements.vectors.div_ceil(usize::from(vector_lanes))
         }
@@ -1022,12 +1236,8 @@ pub fn linear_into(
         set_bytes(encoder, 7, &encoded_row_bytes);
         set_bytes(encoder, 8, &has_bias);
         encoder.dispatchThreadgroups_threadsPerThreadgroup(
-            MetalDevice::grid(
-                requirements.rows.div_ceil(rows_per_threadgroup),
-                vector_groups,
-                1,
-            ),
-            MetalDevice::grid(64, 1, 1),
+            MetalDevice::grid(row_groups, vector_groups, 1),
+            MetalDevice::grid(threads_per_threadgroup, 1, 1),
         );
     });
     Ok(())
@@ -1164,6 +1374,10 @@ mod tests {
             pipeline_key(KernelKind::LinearBatched(4), GgmlKQuant::Q2K, None)
         );
         assert_ne!(
+            pipeline_key(KernelKind::LinearBatched(4), GgmlKQuant::Q2K, None),
+            pipeline_key(KernelKind::LinearMma, GgmlKQuant::Q2K, None)
+        );
+        assert_ne!(
             pipeline_key(KernelKind::Linear, GgmlKQuant::Q4K, None),
             pipeline_key(KernelKind::Embedding, GgmlKQuant::Q4K, Some(DType::U32))
         );
@@ -1213,6 +1427,7 @@ mod tests {
             (GgmlKQuant::Q2K, 4096, 6656, 84),
             (GgmlKQuant::Q2K, 19968, 6656, 84),
             (GgmlKQuant::Q4K, 6656, 4096, 144),
+            (GgmlKQuant::Q5K, 6656, 6656, 176),
             (GgmlKQuant::Q6K, 202048, 6656, 210),
         ] {
             let vectors = 16usize;
