@@ -59,7 +59,7 @@ fn block_bytes(codec: GgmlKQuant) -> usize {
 fn rows_per_simd(codec: GgmlKQuant) -> usize {
     match codec {
         GgmlKQuant::Q2K => 2,
-        GgmlKQuant::Q3K => 4,
+        GgmlKQuant::Q3K => 3,
         GgmlKQuant::Q4K | GgmlKQuant::Q6K => 2,
         GgmlKQuant::Q5K => 1,
     }
@@ -526,8 +526,8 @@ kernel void et_quantized_linear(
         y4 += 4ul * ET_BLOCK_VALUES;
     }
 #elif ET_CODEC == 3
-    const ushort tid = lane / 4;
-    const ushort ix = lane % 4;
+    const ushort tid = (lane % 4) + 4 * (lane / 16);
+    const ushort ix = (lane % 16) / 4;
     const ushort ip = tid / 4;
     const ushort il = 2 * ((tid % 4) / 2);
     const ushort ir = tid % 2;
@@ -580,16 +580,22 @@ kernel void et_quantized_linear(
 
             float a0 = 0.0f, a1 = 0.0f, absent0 = 0.0f;
             float a2 = 0.0f, a3 = 0.0f, absent1 = 0.0f;
-            for (ushort i = 0; i < 8; i += 2) {
+            ET_UNROLL for (ushort i = 0; i < 8; i += 2) {
                 const int q = quants[i / 2];
-                a0 += values[i] * (q & quant_masks[il / 2][0]);
-                a1 += values[i + 1] * (q & quant_masks[il / 2][1]);
-                absent0 += (high[i / 2] & hm[0] ? 0.0f : values[i]) +
-                           (high[i / 2] & hm[1] ? 0.0f : values[i + 1]);
-                a2 += values[i + 16] * (q & quant_masks[il / 2][2]);
-                a3 += values[i + 17] * (q & quant_masks[il / 2][3]);
-                absent1 += (high[i / 2] & hm[2] ? 0.0f : values[i + 16]) +
-                           (high[i / 2] & hm[3] ? 0.0f : values[i + 17]);
+                const ushort h = high[i / 2];
+                const float4 dotted = float4(values[i], values[i + 1], values[i + 16], values[i + 17]) * float4(
+                    q & quant_masks[il / 2][0],
+                    q & quant_masks[il / 2][1],
+                    q & quant_masks[il / 2][2],
+                    q & quant_masks[il / 2][3]);
+                a0 += dotted[0];
+                a1 += dotted[1];
+                a2 += dotted[2];
+                a3 += dotted[3];
+                absent0 += (h & hm[0] ? 0.0f : values[i]) +
+                           (h & hm[1] ? 0.0f : values[i + 1]);
+                absent1 += (h & hm[2] ? 0.0f : values[i + 16]) +
+                           (h & hm[3] ? 0.0f : values[i + 17]);
             }
             const float d = float(block->d);
             float dot_low = d * (a0 + a1 / 256.0f - absent0 * absent_low);

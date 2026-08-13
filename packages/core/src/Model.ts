@@ -1765,12 +1765,8 @@ const traceInferenceProgram = (
   Effect.gen(function*() {
     const [programBatch, steps] = inputShape
     const tokenInput = yield* Tensor.zeros(inputShape, { dtype: config.tokenDtype })
-    const inputs: Array<Tensor.Lazy> = []
-    for (let i = 0; i < frozenParams.length; i++) {
-      inputs.push(yield* Tensor.makeInput(i, frozenParams[i]!))
-    }
-    inputs.push(yield* Tensor.makeInput(inputs.length, tokenInput))
-    const output = yield* model.forward(inputs.slice(0, frozenParams.length), inputs[inputs.length - 1]!)
+    const input = yield* Tensor.makeInput(0, tokenInput)
+    const output = yield* model.forward(frozenParams, input)
     yield* logitsVocab(output, programBatch, steps)
     return yield* Tensor.compileDecodeProgram([output], {
       maxTokens: config.maxTokens,
@@ -1918,11 +1914,6 @@ const prefillInput = (
     return input
   })
 
-const prefillInputs = (
-  frozenParams: ReadonlyArray<Tensor.Concrete>,
-  input: Tensor.Any
-): Effect.Effect<Array<Tensor.Any>, Tensor.TensorError, Runtime.Runtime> => Effect.succeed([...frozenParams, input])
-
 interface LiveEntry {
   readonly seq: GenerationSeq
 }
@@ -2018,10 +2009,9 @@ const openGeneration = (engine: InferenceEngine): Effect.Effect<Generation, neve
             let logits: Tensor.Concrete | undefined
             for (const chunk of planPrefillChunks(ids.length, matched, config.prefillChunk)) {
               const input = yield* prefillInput(materializedPrompt, chunk, config)
-              const inputs = yield* prefillInputs(engine.frozenParams, input)
               const [output] = yield* Tensor.runDecodeProgram(
                 programs.prefill,
-                inputs,
+                [input],
                 sequence,
                 ids.slice(chunk.offset, chunk.offset + chunk.real)
               )
@@ -2059,7 +2049,7 @@ const openGeneration = (engine: InferenceEngine): Effect.Effect<Generation, neve
             const input = yield* tokenTensor([entry.token], [1, 1], config.tokenDtype)
             const [output] = yield* Tensor.runDecodeProgram(
               programs.decode,
-              [...engine.frozenParams, input],
+              [input],
               entry.seq.sequence,
               [entry.token]
             )
@@ -2075,7 +2065,7 @@ const openGeneration = (engine: InferenceEngine): Effect.Effect<Generation, neve
           const input = yield* tokenTensor(ids, [entries.length, 1], config.tokenDtype)
           const outputs = yield* Tensor.runBatchedDecodeProgram(
             programs.batched,
-            [...engine.frozenParams, input],
+            [input],
             entries.map((entry) => entry.seq.sequence),
             ids.map((id) => [id])
           )
@@ -2112,8 +2102,8 @@ const openGeneration = (engine: InferenceEngine): Effect.Effect<Generation, neve
  *
  * `params` are borrowed and eagerly materialized once with
  * {@link Tensor.compute} before tracing. This freezes lazy initializer draws for every later prefill and
- * step. The concrete parameters remain native program inputs captured by
- * the artifact, so generation callers do not thread them. Caller-supplied
+ * step. Concrete parameters are retained by the compiled artifacts as
+ * immutable constants, so generation calls bind only token rows. Caller-supplied
  * concrete handles are not consumed; the artifact retains its own materialized
  * generation until it becomes unreachable.
  *

@@ -97,11 +97,11 @@ const program = Effect.gen(function*() {
   for (let step = 0; step < maxNewTokens; step++) {
     const current = logits!
     logits = undefined
-    const values = yield* Tensor.toNumberArray(current)
+    const values = yield* Tensor.toTypedArray(current)
     yield* Tensor.clear(current)
     let token = 0
     for (let index = 1; index < values.length; index++) {
-      if (values[index]! > values[token]!) token = index
+      if (Number(values[index]) > Number(values[token])) token = index
     }
     if (stopTokens.has(token)) break
     generated.push(token)
