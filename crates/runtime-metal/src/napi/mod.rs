@@ -4,6 +4,8 @@ mod runtime;
 pub(crate) mod safetensors;
 pub(crate) mod value;
 
+pub use gguf::{inspect_gguf, load_gguf};
+
 use crate::executable;
 use crate::executable::{ConvGeometry, KdaGeometry, KvStateSchema, MetalDecodeContext, SeqState};
 

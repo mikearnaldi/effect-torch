@@ -4,6 +4,7 @@ use crate::kernels;
 use crate::run::MetalTensor;
 use effect_torch_graph::Device;
 use effect_torch_runtime::{DType, Layout};
+#[cfg(feature = "napi-addon")]
 use std::sync::Arc;
 
 #[derive(Clone)]
@@ -76,6 +77,7 @@ pub(crate) fn value_from_bytes(
     }))
 }
 
+#[cfg(feature = "napi-addon")]
 pub(crate) fn empty_shared_value(shape: &[usize], dtype: DType) -> Result<Value, String> {
     let elements = shape
         .iter()
@@ -94,6 +96,7 @@ pub(crate) fn empty_shared_value(shape: &[usize], dtype: DType) -> Result<Value,
     }))
 }
 
+#[cfg(feature = "napi-addon")]
 pub(crate) fn write_value_bytes<R>(
     value: &mut Value,
     write: impl FnOnce(&mut [u8]) -> R,

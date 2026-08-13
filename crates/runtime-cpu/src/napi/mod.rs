@@ -3,6 +3,8 @@ mod gguf;
 mod safetensors;
 mod value;
 
+pub use gguf::{inspect_gguf, load_gguf};
+
 use self::err::to_napi_err;
 use self::value::Value;
 use crate::{composed, executable, pool, CpuBuffer, CpuDestination, Elem, Tensor};

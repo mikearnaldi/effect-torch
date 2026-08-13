@@ -652,6 +652,7 @@ impl<'a> CpuDestination<'a> {
         self.tensor.dtype()
     }
 
+    #[cfg(feature = "napi-addon")]
     pub(crate) fn write_bytes<R>(
         &mut self,
         operation: &str,
