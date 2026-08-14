@@ -76,8 +76,9 @@ pub use program::{
 };
 pub use sampling::{
     effective_probabilities, purpose_counter, random_unit, random_unit_at, rejection_sample,
-    sample_logits, sample_probabilities, sampling_coordinate, RejectionResult, SamplingCoordinate,
-    SamplingOptions, SamplingPurpose, MAX_SAMPLING_VOCABULARY,
+    sample_logits, sample_probabilities, sample_probabilities_at, sampling_coordinate,
+    target_sample_match, RejectionResult, SamplingCoordinate, SamplingOptions, SamplingPurpose,
+    TargetSampleMatchResult, MAX_SAMPLING_VOCABULARY,
 };
 pub use workspace::{
     LeasedWorkspace, WorkspaceAllocation, WorkspaceAllocator, WorkspaceLease, WorkspacePool,
