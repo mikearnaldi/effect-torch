@@ -840,6 +840,74 @@ onDevices("Inference", () => (it) => {
         expect(adaptive.message).toMatch(/adaptive/)
       }))
 
+    it.effect("validates target-coupled fingerprints and hidden taps before the runtime variant gate", () =>
+      Effect.gen(function*() {
+        const base = yield* makeGpt()
+        const target = yield* Model.define({
+          parameters: base.parameters,
+          target: { graphFingerprint: "gpt-test-v1", checkpointFingerprint: "weights-test-v1" },
+          forward: (params, input, trace) =>
+            Effect.gen(function*() {
+              const logits = yield* base.forward(params, input)
+              trace?.hidden(3, logits)
+              return logits
+            })
+        })
+        const params = yield* Tensor.compute(yield* base.init)
+        const coupled = (graphFingerprint: string, tapShape: Model.ProposerValueSchema["shape"]) =>
+          Speculation.artifact({
+            components: [{ model: base, params }],
+            plan: {
+              target: {
+                graphFingerprint,
+                checkpointFingerprint: "weights-test-v1",
+                vocabulary: VOCAB,
+                tokenMapFingerprint: "identity",
+                hiddenTaps: [{ layer: 3, dtype: "f32", shape: tapShape }],
+                sharedWeights: []
+              },
+              stages: [{
+                operation: { _tag: "ParallelBlock", component: 0, layout: { id: "tap-block-v1" } },
+                inputs: [{ slot: 0, value: { _tag: "TargetHidden", layer: 3 } }],
+                outputs: [
+                  { dtype: "u32", shape: ["Rows"] },
+                  { dtype: "f32", shape: ["Rows", "Vocabulary"] }
+                ]
+              }],
+              state: { _tag: "None" },
+              output: {
+                topology: "Chains",
+                probabilities: "CausalNormalized",
+                tokenIds: { _tag: "StageOutput", stage: 0, output: 0 },
+                probabilityRows: { _tag: "StageOutput", stage: 0, output: 1 }
+              },
+              tokenMap: { _tag: "Identity" },
+              trainedMaxRows: 2
+            }
+          })
+
+        const wrongGraph = yield* coupled("other-graph", ["Rows", "Vocabulary"])
+        const graphError = yield* Effect.flip(Model.inference(target, params, {
+          maxTokens: 32,
+          speculation: { proposer: wrongGraph, maxDraftTokens: 2 }
+        }))
+        expect(graphError.message).toMatch(/graphFingerprint.*gpt-test-v1/)
+
+        const wrongTap = yield* coupled("gpt-test-v1", ["Rows", 1])
+        const tapError = yield* Effect.flip(Model.inference(target, params, {
+          maxTokens: 32,
+          speculation: { proposer: wrongTap, maxDraftTokens: 2 }
+        }))
+        expect(tapError.message).toMatch(/hidden tap 3/)
+
+        const valid = yield* coupled("gpt-test-v1", ["Rows", "Vocabulary"])
+        const unsupported = yield* Effect.flip(Model.inference(target, params, {
+          maxTokens: 32,
+          speculation: { proposer: valid, maxDraftTokens: 2 }
+        }))
+        expect(unsupported.message).toMatch(/only one exact-chain Autoregressive proposer stage/)
+      }))
+
     it.effect("lane refill does not change a replacement sequence's RNG identity", () =>
       Effect.gen(function*() {
         const model = yield* makeGpt()

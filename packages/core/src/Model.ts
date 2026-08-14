@@ -116,6 +116,8 @@ export interface Model {
    * parameterless models have no names and arity zero.
    */
   readonly names: ReadonlyArray<string>
+  /** Optional stable identities used to validate target-coupled proposer artifacts. */
+  readonly target: InferenceTargetMetadata
   /**
    * Builds one initial parameter generation, usually as lazy graph values.
    * Materialize all roots together with {@link Tensor.compute} before retaining
@@ -134,7 +136,8 @@ export interface Model {
    */
   readonly forward: (
     params: Params,
-    input: Tensor.Any
+    input: Tensor.Any,
+    trace?: ForwardTrace
   ) => Effect.Effect<Tensor.Lazy, ModelError | Tensor.TensorError, Runtime.Runtime>
   /**
    * Runs the ordinary compiled forward path and returns one materialized output.
@@ -173,6 +176,18 @@ export interface Model {
   readonly clear: Effect.Effect<void>
 }
 
+/** Stable identities of the graph and parameter generation expected by a target-coupled proposer. */
+export interface InferenceTargetMetadata {
+  readonly graphFingerprint?: string
+  readonly checkpointFingerprint?: string
+}
+
+/** Compile-time-only target values requested while tracing an inference graph. */
+export interface ForwardTrace {
+  /** Exposes the residual activation after the zero-based target layer. */
+  readonly hidden: (layer: number, value: Tensor.Any) => void
+}
+
 /**
  * A custom model definition. {@link define} validates only the parameter
  * catalog: names must be nonempty and unique, and shape dimensions must be
@@ -189,6 +204,8 @@ export interface Definition {
   readonly parameters: ReadonlyArray<ParameterSpec>
   /** Optional lazy initializer returning values in `parameters` order. */
   readonly init?: Effect.Effect<Params, Tensor.TensorError, Runtime.Runtime>
+  /** Optional stable identities used only by target-coupled inference validation. */
+  readonly target?: InferenceTargetMetadata
   /** Pure lazy graph builder; responsible for its own tensor and arity checks. */
   readonly forward: Model["forward"]
 }
@@ -197,6 +214,7 @@ interface ModelDef {
   readonly parameters: ReadonlyArray<ParameterSpec>
   readonly init: Effect.Effect<Params, ModelError | Tensor.TensorError, Runtime.Runtime>
   readonly forward: Model["forward"]
+  readonly target?: InferenceTargetMetadata
 }
 
 type ModelInternal =
@@ -240,6 +258,7 @@ const make = (def: ModelDef): Model => {
   const self = Object.create(ModelProto) as ModelInternal
   self.parameters = def.parameters
   self.names = def.parameters.map((parameter) => parameter.name)
+  self.target = def.target ?? {}
   self.init = def.init
   self.forward = def.forward
   self._fn = undefined
@@ -277,13 +296,24 @@ export const define = (definition: Definition): Effect.Effect<Model, ModelError>
         }
       }
     }
+    for (
+      const [name, fingerprint] of [
+        ["graphFingerprint", definition.target?.graphFingerprint],
+        ["checkpointFingerprint", definition.target?.checkpointFingerprint]
+      ] as const
+    ) {
+      if (fingerprint !== undefined && fingerprint.length === 0) {
+        return yield* new ModelError({ op: "define", message: `target ${name} must not be empty` })
+      }
+    }
     return make({
       parameters: definition.parameters,
       init: definition.init ?? new ModelError({
         op: "init",
         message: "model has no initializer; load parameters before use"
       }),
-      forward: definition.forward
+      forward: definition.forward,
+      target: definition.target ?? {}
     })
   })
 
@@ -1495,44 +1525,172 @@ export interface ProposerComponent {
   readonly params: Params
 }
 
-/** Target compatibility required by the first autoregressive proposer. */
+/** A stable graph, checkpoint, tokenizer, layout, or path identity. */
+export type ProposerFingerprint = string
+
+/** Symbolic dimensions are resolved when proposer programs are compiled. */
+export type ProposerShapeDimension = number | "Rows" | "Vocabulary" | "Hidden"
+
+/** The logical tensor contract of one stage output. */
+export interface ProposerValueSchema {
+  readonly dtype: Runtime.DType
+  readonly shape: ReadonlyArray<ProposerShapeDimension>
+}
+
+/** One target hidden activation made available to proposer stages. */
+export interface HiddenTapContract extends ProposerValueSchema {
+  readonly layer: number
+}
+
+/** One immutable target weight made available to proposer stages. */
+export interface SharedWeightContract extends ProposerValueSchema {
+  readonly kind: "TokenEmbedding" | "LmHead"
+  readonly name: string
+}
+
+/** Target compatibility declared by a structurally complete proposer plan. */
+export interface TargetContract {
+  readonly graphFingerprint?: ProposerFingerprint
+  readonly checkpointFingerprint?: ProposerFingerprint
+  readonly vocabulary: number
+  readonly tokenMapFingerprint: ProposerFingerprint
+  readonly hiddenTaps: ReadonlyArray<HiddenTapContract>
+  readonly sharedWeights: ReadonlyArray<SharedWeightContract>
+}
+
+/** Legacy exact-chain target shorthand, normalized by {@link Speculation.artifact}. */
 export interface ProposerTargetContract {
   readonly vocabulary: number
+  readonly graphFingerprint?: ProposerFingerprint
+  readonly checkpointFingerprint?: ProposerFingerprint
+  readonly tokenMapFingerprint?: ProposerFingerprint
+  readonly hiddenTaps?: ReadonlyArray<HiddenTapContract>
+  readonly sharedWeights?: ReadonlyArray<SharedWeightContract>
 }
 
-/** One causal proposer stage. Later descriptor variants use the same stage list. */
+/** Values that may be bound to a stage input or exported as proposer output. */
+export type ValueRef =
+  | { readonly _tag: "PendingTokens" }
+  | { readonly _tag: "CandidatePrefix" }
+  | { readonly _tag: "CommittedHistory" }
+  | { readonly _tag: "TargetHidden"; readonly layer: number }
+  | { readonly _tag: "SharedTokenEmbedding" }
+  | { readonly _tag: "SharedLmHead" }
+  | { readonly _tag: "StageOutput"; readonly stage: number; readonly output: number }
+
+/** Explicit binding of a value to a compiled component input slot. */
+export interface InputBinding {
+  readonly slot: number
+  readonly value: ValueRef
+}
+
+/** Stable contracts interpreted by the corresponding compiled operation. */
+export interface BlockInputLayout {
+  readonly id: string
+}
+export interface TreeSearchLayout {
+  readonly id: string
+  readonly maxChildren: number
+}
+export interface HistoryLookupLayout {
+  readonly id: string
+}
+export type TargetPathId = string
+
+/** Structural operation performed by one proposer DAG stage. */
+export type StageOperation =
+  | { readonly _tag: "Autoregressive"; readonly component: number }
+  | { readonly _tag: "ParallelBlock"; readonly component: number; readonly layout: BlockInputLayout }
+  | { readonly _tag: "SequentialHead"; readonly component: number }
+  | { readonly _tag: "TreeExpand"; readonly component: number; readonly search: TreeSearchLayout }
+  | { readonly _tag: "TargetPath"; readonly path: TargetPathId }
+  | { readonly _tag: "HistoryLookup"; readonly layout: HistoryLookupLayout }
+
+/** One fully explicit stage in the proposer dataflow DAG. */
+export interface Stage {
+  readonly operation: StageOperation
+  readonly inputs: ReadonlyArray<InputBinding>
+  readonly outputs: ReadonlyArray<ProposerValueSchema>
+}
+
+/** Source-compatible shorthand for the original exact autoregressive chain. */
 export interface AutoregressiveProposerStage {
-  readonly operation: {
-    readonly _tag: "Autoregressive"
-    readonly component: number
-  }
+  readonly operation: { readonly _tag: "Autoregressive"; readonly component: number }
+  readonly inputs?: ReadonlyArray<InputBinding>
+  readonly outputs?: ReadonlyArray<ProposerValueSchema>
 }
 
-/** KV publication recipe for an autoregressive candidate chain. */
+/** The backend-owned decode-state layout for stateful proposer stages. */
+export interface DecodeStateSchema {
+  readonly id: string
+}
+
+/** State publication after target acceptance. */
+export type CommitPlan =
+  | { readonly _tag: "AutoregressiveChain"; readonly stage: number }
+  | { readonly _tag: "Replay"; readonly stages: ReadonlyArray<number> }
+
+/** Stateful or stateless proposer execution. */
+export type ProposerState =
+  | { readonly _tag: "None" }
+  | { readonly _tag: "Kv"; readonly schema: DecodeStateSchema; readonly commit: CommitPlan }
+
+/** Source-compatible shorthand for first-milestone KV state. */
 export interface AutoregressiveProposerState {
   readonly _tag: "Kv"
-  readonly commit: {
-    readonly _tag: "AutoregressiveChain"
-    readonly stage: number
-  }
+  readonly schema?: DecodeStateSchema
+  readonly commit: { readonly _tag: "AutoregressiveChain"; readonly stage: number }
 }
 
-/** Output semantics supported by the exact-chain milestone. */
+export type CandidateTopology = "Chains" | "Trees"
+export type ProposalProbabilityContract = "CausalNormalized" | "Deterministic" | "Unavailable"
+
+/** Explicit values exported from the proposer DAG. */
+export interface ProposerOutput {
+  readonly topology: CandidateTopology
+  readonly probabilities: ProposalProbabilityContract
+  readonly tokenIds: ValueRef
+  readonly probabilityRows?: ValueRef
+  readonly parents?: ValueRef
+  readonly confidence?: ValueRef
+}
+
+/** Source-compatible shorthand for the first exact-chain output. */
 export interface AutoregressiveProposerOutput {
   readonly topology: "Chains"
   readonly probabilities: "CausalNormalized"
+  readonly tokenIds?: ValueRef
+  readonly probabilityRows?: ValueRef
+  readonly parents?: ValueRef
+  readonly confidence?: ValueRef
 }
 
-/**
- * Structural first-milestone proposer recipe. It intentionally has no named
- * algorithm switch: one component is repeatedly executed as a causal KV model.
- */
+/** Vocabulary translation applied before target verification. */
+export type TokenMap =
+  | { readonly _tag: "Identity"; readonly fingerprint?: ProposerFingerprint }
+  | {
+    readonly _tag: "Table"
+    readonly fingerprint: ProposerFingerprint
+    readonly proposerVocabulary: number
+    readonly targetIds: ReadonlyArray<number>
+  }
+
+/** Immutable, structurally validated proposer recipe. */
 export interface ProposerPlan {
   readonly target: ProposerTargetContract
-  readonly stages: ReadonlyArray<AutoregressiveProposerStage>
-  readonly state: AutoregressiveProposerState
-  readonly output: AutoregressiveProposerOutput
-  readonly tokenMap: { readonly _tag: "Identity" }
+  readonly stages: ReadonlyArray<Stage | AutoregressiveProposerStage>
+  readonly state: ProposerState | AutoregressiveProposerState
+  readonly output: ProposerOutput | AutoregressiveProposerOutput
+  readonly tokenMap: TokenMap
+  readonly trainedMaxRows: number
+}
+
+interface NormalizedProposerPlan {
+  readonly target: TargetContract
+  readonly stages: ReadonlyArray<Stage>
+  readonly state: ProposerState
+  readonly output: ProposerOutput
+  readonly tokenMap: TokenMap
   readonly trainedMaxRows: number
 }
 
@@ -1542,12 +1700,78 @@ export interface ProposerArtifactInput {
   readonly plan: ProposerPlan
 }
 
+interface NormalizedProposerArtifactInput {
+  readonly components: ReadonlyArray<ProposerComponent>
+  readonly plan: NormalizedProposerPlan
+}
+
 /** Opaque validated proposer structure attached to {@link InferenceConfig}. */
 export interface ProposerArtifact {
   readonly [ProposerArtifactTypeId]: typeof ProposerArtifactTypeId
 }
 
-const proposerArtifactInputs = new WeakMap<ProposerArtifact, ProposerArtifactInput>()
+const proposerArtifactInputs = new WeakMap<ProposerArtifact, NormalizedProposerArtifactInput>()
+
+const u32 = (value: number): boolean => Number.isSafeInteger(value) && value >= 0 && value <= 0xffff_ffff
+const nonEmptyId = (value: string): boolean => typeof value === "string" && value.length > 0
+const dtypes: ReadonlySet<string> = new Set(["f32", "f64", "f16", "bf16", "i64", "u8", "u32"])
+const stageRef = (stage: number, output: number): ValueRef => ({ _tag: "StageOutput", stage, output })
+
+const invalidProposer = (message: string): InferenceError => new InferenceError({ op: "speculation", message })
+
+const validateSchema = (schema: ProposerValueSchema, where: string): InferenceError | undefined => {
+  if (typeof schema !== "object" || schema === null || !dtypes.has(schema.dtype) || !Array.isArray(schema.shape)) {
+    return invalidProposer(`${where} must declare a supported dtype and shape`)
+  }
+  for (const dimension of schema.shape) {
+    if (
+      typeof dimension === "number"
+        ? !u32(dimension)
+        : dimension !== "Rows" && dimension !== "Vocabulary" && dimension !== "Hidden"
+    ) {
+      return invalidProposer(`${where} has invalid shape dimension ${String(dimension)}`)
+    }
+  }
+}
+
+const validateValueRef = (
+  value: ValueRef,
+  stageLimit: number,
+  stages: ReadonlyArray<Stage>,
+  target: TargetContract,
+  where: string
+): InferenceError | undefined => {
+  if (typeof value !== "object" || value === null) return invalidProposer(`${where} is malformed`)
+  switch (value._tag) {
+    case "PendingTokens":
+    case "CandidatePrefix":
+    case "CommittedHistory":
+      return
+    case "TargetHidden":
+      return u32(value.layer) && target.hiddenTaps.some((tap) => tap.layer === value.layer)
+        ? undefined
+        : invalidProposer(`${where} references undeclared target hidden tap ${value.layer}`)
+    case "SharedTokenEmbedding":
+      return target.sharedWeights.some((weight) => weight.kind === "TokenEmbedding")
+        ? undefined
+        : invalidProposer(`${where} references an undeclared shared token embedding`)
+    case "SharedLmHead":
+      return target.sharedWeights.some((weight) => weight.kind === "LmHead")
+        ? undefined
+        : invalidProposer(`${where} references an undeclared shared LM head`)
+    case "StageOutput": {
+      if (!u32(value.stage) || value.stage >= stageLimit) {
+        return invalidProposer(`${where} must reference a backward stage, got stage ${value.stage}`)
+      }
+      const referenced = stages[value.stage]
+      return u32(value.output) && referenced !== undefined && value.output < referenced.outputs.length
+        ? undefined
+        : invalidProposer(`${where} references missing stage ${value.stage} output ${value.output}`)
+    }
+    default:
+      return invalidProposer(`${where} has an unsupported value reference`)
+  }
+}
 
 const makeProposerArtifact = (
   input: ProposerArtifactInput
@@ -1559,21 +1783,16 @@ const makeProposerArtifact = (
         message: "proposer artifact input must contain components"
       })
     }
-    if (input.components.length !== 1) {
-      return yield* new InferenceError({
-        op: "speculation",
-        message:
-          `the first speculative milestone requires exactly one proposer component, got ${input.components.length}`
-      })
+    for (let index = 0; index < input.components.length; index++) {
+      const component = input.components[index]
+      if (
+        typeof component !== "object" || component === null || typeof component.model !== "object" ||
+        component.model === null || !Array.isArray(component.model.names) || !Array.isArray(component.params)
+      ) {
+        return yield* invalidProposer(`proposer component ${index} is malformed`)
+      }
+      yield* checkArity(`Speculation.artifact component ${index}`, component.model.names, component.params)
     }
-    const component = input.components[0]
-    if (
-      typeof component !== "object" || component === null || typeof component.model !== "object" ||
-      component.model === null || !Array.isArray(component.model.names) || !Array.isArray(component.params)
-    ) {
-      return yield* new InferenceError({ op: "speculation", message: "proposer component 0 is malformed" })
-    }
-    yield* checkArity("Speculation.artifact", component.model.names, component.params)
     const plan = input.plan
     if (
       typeof plan !== "object" || plan === null || typeof plan.target !== "object" || plan.target === null ||
@@ -1581,58 +1800,262 @@ const makeProposerArtifact = (
       typeof plan.output !== "object" || plan.output === null || typeof plan.tokenMap !== "object" ||
       plan.tokenMap === null
     ) {
-      return yield* new InferenceError({ op: "speculation", message: "proposer plan is malformed" })
+      return yield* invalidProposer("proposer plan is malformed")
     }
     if (
       !Number.isSafeInteger(plan.target.vocabulary) || plan.target.vocabulary <= 0 ||
       plan.target.vocabulary > 0xffff_ffff
     ) {
-      return yield* new InferenceError({
-        op: "speculation",
-        message: `target vocabulary must be a positive integer, got ${plan.target.vocabulary}`
-      })
+      return yield* invalidProposer(`target vocabulary must be a positive integer, got ${plan.target.vocabulary}`)
     }
     if (
       !Number.isSafeInteger(plan.trainedMaxRows) || plan.trainedMaxRows <= 0 ||
       plan.trainedMaxRows > 0xffff_ffff
     ) {
-      return yield* new InferenceError({
-        op: "speculation",
-        message: `trainedMaxRows must be a positive integer, got ${plan.trainedMaxRows}`
-      })
+      return yield* invalidProposer(`trainedMaxRows must be a positive integer, got ${plan.trainedMaxRows}`)
     }
+    const tokenMapFingerprint = plan.target.tokenMapFingerprint ??
+      (plan.tokenMap._tag === "Identity" ? plan.tokenMap.fingerprint ?? "identity" : plan.tokenMap.fingerprint)
+    if (!nonEmptyId(tokenMapFingerprint)) return yield* invalidProposer("target tokenMapFingerprint must not be empty")
     if (
-      plan.stages.length !== 1 || typeof plan.stages[0] !== "object" || plan.stages[0] === null ||
-      typeof plan.stages[0].operation !== "object" || plan.stages[0].operation === null ||
-      plan.stages[0].operation._tag !== "Autoregressive" ||
-      plan.stages[0].operation.component !== 0
+      plan.target.graphFingerprint !== undefined && !nonEmptyId(plan.target.graphFingerprint) ||
+      plan.target.checkpointFingerprint !== undefined && !nonEmptyId(plan.target.checkpointFingerprint)
     ) {
-      return yield* new InferenceError({
-        op: "speculation",
-        message: "the first speculative milestone requires one Autoregressive stage over component 0"
-      })
+      return yield* invalidProposer("target graph and checkpoint fingerprints must not be empty")
     }
-    if (
-      plan.state._tag !== "Kv" || typeof plan.state.commit !== "object" || plan.state.commit === null ||
-      plan.state.commit._tag !== "AutoregressiveChain" ||
-      plan.state.commit.stage !== 0
-    ) {
-      return yield* new InferenceError({
-        op: "speculation",
-        message: "the proposer must use KV state with an AutoregressiveChain commit for stage 0"
-      })
+    const hiddenTaps = plan.target.hiddenTaps ?? []
+    const hiddenLayers = new Set<number>()
+    for (let index = 0; index < hiddenTaps.length; index++) {
+      const tap = hiddenTaps[index]
+      if (!u32(tap.layer)) return yield* invalidProposer(`target hidden tap ${index} has invalid layer ${tap.layer}`)
+      if (hiddenLayers.has(tap.layer)) return yield* invalidProposer(`duplicate target hidden tap layer ${tap.layer}`)
+      hiddenLayers.add(tap.layer)
+      const error = validateSchema(tap, `target hidden tap ${tap.layer}`)
+      if (error !== undefined) return yield* error
     }
-    if (plan.output.topology !== "Chains" || plan.output.probabilities !== "CausalNormalized") {
-      return yield* new InferenceError({
-        op: "speculation",
-        message: "the first speculative milestone requires chain topology and causal-normalized probabilities"
-      })
+    const sharedWeights = plan.target.sharedWeights ?? []
+    const sharedKinds = new Set<string>()
+    const sharedNames = new Set<string>()
+    for (let index = 0; index < sharedWeights.length; index++) {
+      const weight = sharedWeights[index]
+      if ((weight.kind !== "TokenEmbedding" && weight.kind !== "LmHead") || !nonEmptyId(weight.name)) {
+        return yield* invalidProposer(`target shared weight ${index} has an invalid kind or name`)
+      }
+      if (sharedKinds.has(weight.kind)) {
+        return yield* invalidProposer(`duplicate target shared weight kind ${weight.kind}`)
+      }
+      if (sharedNames.has(weight.name)) {
+        return yield* invalidProposer(`duplicate target shared weight name ${weight.name}`)
+      }
+      sharedKinds.add(weight.kind)
+      sharedNames.add(weight.name)
+      const error = validateSchema(weight, `target shared weight ${weight.name}`)
+      if (error !== undefined) return yield* error
     }
-    if (plan.tokenMap._tag !== "Identity") {
-      return yield* new InferenceError({
-        op: "speculation",
-        message: "the first speculative milestone requires an identity token map"
-      })
+    const target: TargetContract = {
+      ...(plan.target.graphFingerprint === undefined ? {} : { graphFingerprint: plan.target.graphFingerprint }),
+      ...(plan.target.checkpointFingerprint === undefined
+        ? {}
+        : { checkpointFingerprint: plan.target.checkpointFingerprint }),
+      vocabulary: plan.target.vocabulary,
+      tokenMapFingerprint,
+      hiddenTaps,
+      sharedWeights
+    }
+    let tokenMap: TokenMap
+    if (plan.tokenMap._tag === "Identity") {
+      const fingerprint = plan.tokenMap.fingerprint ?? "identity"
+      if (!nonEmptyId(fingerprint) || fingerprint !== tokenMapFingerprint) {
+        return yield* invalidProposer("identity token map fingerprint does not match the target contract")
+      }
+      tokenMap = { _tag: "Identity", fingerprint }
+    } else if (plan.tokenMap._tag === "Table") {
+      if (
+        !nonEmptyId(plan.tokenMap.fingerprint) || plan.tokenMap.fingerprint !== tokenMapFingerprint ||
+        !u32(plan.tokenMap.proposerVocabulary) || plan.tokenMap.proposerVocabulary === 0 ||
+        !Array.isArray(plan.tokenMap.targetIds) || plan.tokenMap.targetIds.length !== plan.tokenMap.proposerVocabulary
+      ) {
+        return yield* invalidProposer("table token map has an invalid fingerprint, vocabulary, or row count")
+      }
+      for (const token of plan.tokenMap.targetIds) {
+        if (!u32(token) || token >= target.vocabulary) {
+          return yield* invalidProposer(`table token map target id ${token} is outside the target vocabulary`)
+        }
+      }
+      tokenMap = plan.tokenMap
+    } else {
+      return yield* invalidProposer("token map has an unsupported variant")
+    }
+    const stages: Array<Stage> = []
+    for (let index = 0; index < plan.stages.length; index++) {
+      const source = plan.stages[index]
+      if (
+        typeof source !== "object" || source === null || typeof source.operation !== "object" ||
+        source.operation === null
+      ) return yield* invalidProposer(`stage ${index} is malformed`)
+      const operation = source.operation
+      switch (operation._tag) {
+        case "Autoregressive":
+        case "ParallelBlock":
+        case "SequentialHead":
+        case "TreeExpand":
+          if (!u32(operation.component) || operation.component >= input.components.length) {
+            return yield* invalidProposer(`stage ${index} references missing component ${operation.component}`)
+          }
+          if (operation._tag === "ParallelBlock" && !nonEmptyId(operation.layout?.id)) {
+            return yield* invalidProposer(`stage ${index} ParallelBlock layout id must not be empty`)
+          }
+          if (
+            operation._tag === "TreeExpand" &&
+            (!nonEmptyId(operation.search?.id) || !u32(operation.search.maxChildren) ||
+              operation.search.maxChildren === 0)
+          ) return yield* invalidProposer(`stage ${index} TreeExpand search contract is invalid`)
+          break
+        case "TargetPath":
+          if (!nonEmptyId(operation.path)) return yield* invalidProposer(`stage ${index} target path must not be empty`)
+          break
+        case "HistoryLookup":
+          if (!nonEmptyId(operation.layout?.id)) {
+            return yield* invalidProposer(`stage ${index} HistoryLookup layout id must not be empty`)
+          }
+          break
+        default:
+          return yield* invalidProposer(`stage ${index} has an unsupported operation`)
+      }
+      const inputs = source.inputs ?? (index === 0 && operation._tag === "Autoregressive"
+        ? [{ slot: 0, value: { _tag: "PendingTokens" } as const }]
+        : [])
+      const outputs = source.outputs ?? (index === 0 && operation._tag === "Autoregressive"
+        ? [
+          { dtype: "u32" as const, shape: ["Rows" as const] },
+          { dtype: "f32" as const, shape: ["Rows" as const, "Vocabulary" as const] }
+        ]
+        : [])
+      if (!Array.isArray(inputs) || !Array.isArray(outputs) || outputs.length === 0) {
+        return yield* invalidProposer(`stage ${index} must declare inputs and at least one output schema`)
+      }
+      const slots = new Set<number>()
+      for (let bindingIndex = 0; bindingIndex < inputs.length; bindingIndex++) {
+        const binding = inputs[bindingIndex]
+        if (typeof binding !== "object" || binding === null || !u32(binding.slot)) {
+          return yield* invalidProposer(`stage ${index} input ${bindingIndex} has an invalid slot`)
+        }
+        if (slots.has(binding.slot)) {
+          return yield* invalidProposer(`stage ${index} has duplicate input slot ${binding.slot}`)
+        }
+        slots.add(binding.slot)
+        const error = validateValueRef(binding.value, index, stages, target, `stage ${index} input ${binding.slot}`)
+        if (error !== undefined) return yield* error
+      }
+      for (let output = 0; output < outputs.length; output++) {
+        const error = validateSchema(outputs[output], `stage ${index} output ${output}`)
+        if (error !== undefined) return yield* error
+      }
+      stages.push({ operation, inputs, outputs })
+    }
+    if (stages.length === 0) return yield* invalidProposer("proposer plan must contain at least one stage")
+    let state: ProposerState
+    if (plan.state._tag === "None") {
+      if (stages.some((stage) => stage.operation._tag === "Autoregressive")) {
+        return yield* invalidProposer("state None does not cover an Autoregressive stage")
+      }
+      state = { _tag: "None" }
+    } else if (plan.state._tag === "Kv" && typeof plan.state.commit === "object" && plan.state.commit !== null) {
+      const schema = plan.state.schema ?? { id: "causal-kv" }
+      if (!nonEmptyId(schema.id)) return yield* invalidProposer("KV state schema id must not be empty")
+      const stateful = stages.flatMap((stage, index) => stage.operation._tag === "Autoregressive" ? [index] : [])
+      const commit = plan.state.commit
+      let covered: ReadonlyArray<number>
+      if (commit._tag === "AutoregressiveChain") {
+        if (!u32(commit.stage) || stages[commit.stage]?.operation._tag !== "Autoregressive") {
+          return yield* invalidProposer(`AutoregressiveChain commit references invalid stage ${commit.stage}`)
+        }
+        covered = [commit.stage]
+      } else if (commit._tag === "Replay" && Array.isArray(commit.stages)) {
+        const unique = new Set<number>()
+        for (const stage of commit.stages) {
+          if (!u32(stage) || stage >= stages.length) {
+            return yield* invalidProposer(`Replay references invalid stage ${stage}`)
+          }
+          if (unique.has(stage)) return yield* invalidProposer(`Replay contains duplicate stage ${stage}`)
+          unique.add(stage)
+        }
+        covered = commit.stages
+      } else return yield* invalidProposer("KV state has an invalid commit plan")
+      for (const stage of stateful) {
+        if (!covered.includes(stage)) {
+          return yield* invalidProposer(`commit plan does not cover stateful stage ${stage}`)
+        }
+      }
+      state = { _tag: "Kv", schema, commit }
+    } else return yield* invalidProposer("proposer state is malformed")
+    const tokenIds = plan.output.tokenIds ?? stageRef(0, 0)
+    const probabilityRows = plan.output.probabilityRows ??
+      (plan.output.probabilities === "CausalNormalized" ? stageRef(0, 1) : undefined)
+    const output: ProposerOutput = {
+      topology: plan.output.topology,
+      probabilities: plan.output.probabilities,
+      tokenIds,
+      ...(probabilityRows === undefined ? {} : { probabilityRows }),
+      ...(plan.output.parents === undefined ? {} : { parents: plan.output.parents }),
+      ...(plan.output.confidence === undefined ? {} : { confidence: plan.output.confidence })
+    }
+    if (output.topology !== "Chains" && output.topology !== "Trees") {
+      return yield* invalidProposer(`unsupported proposer topology ${String(output.topology)}`)
+    }
+    if (!["CausalNormalized", "Deterministic", "Unavailable"].includes(output.probabilities)) {
+      return yield* invalidProposer(`unsupported proposer probability contract ${String(output.probabilities)}`)
+    }
+    if (output.probabilities === "CausalNormalized" && output.probabilityRows === undefined) {
+      return yield* invalidProposer("CausalNormalized output requires probabilityRows")
+    }
+    if (output.probabilities !== "CausalNormalized" && output.probabilityRows !== undefined) {
+      return yield* invalidProposer(`${output.probabilities} output must not declare probabilityRows`)
+    }
+    if (output.topology === "Trees" && output.parents === undefined) {
+      return yield* invalidProposer("Trees output requires parents")
+    }
+    const outputRefs = [output.tokenIds, output.probabilityRows, output.parents, output.confidence]
+    for (let index = 0; index < outputRefs.length; index++) {
+      const value = outputRefs[index]
+      if (value === undefined) continue
+      const error = validateValueRef(value, stages.length, stages, target, `proposer output reference ${index}`)
+      if (error !== undefined) return yield* error
+    }
+    const tokenSchema = tokenIds._tag === "StageOutput" ? stages[tokenIds.stage]?.outputs[tokenIds.output] : undefined
+    if (tokenSchema !== undefined && (tokenSchema.shape.length !== 1 || !["u32", "i64"].includes(tokenSchema.dtype))) {
+      return yield* invalidProposer("tokenIds must reference a rank-1 integer output")
+    }
+    if (probabilityRows?._tag === "StageOutput") {
+      const schema = stages[probabilityRows.stage]?.outputs[probabilityRows.output]
+      if (
+        schema !== undefined && (schema.shape.length !== 2 || !schema.dtype.startsWith("f") && schema.dtype !== "bf16")
+      ) {
+        return yield* invalidProposer("probabilityRows must reference a rank-2 floating output")
+      }
+    }
+    if (output.parents?._tag === "StageOutput") {
+      const schema = stages[output.parents.stage]?.outputs[output.parents.output]
+      if (schema !== undefined && (schema.shape.length !== 1 || !["u32", "i64"].includes(schema.dtype))) {
+        return yield* invalidProposer("parents must reference a rank-1 integer output")
+      }
+    }
+    if (output.confidence?._tag === "StageOutput") {
+      const schema = stages[output.confidence.stage]?.outputs[output.confidence.output]
+      if (
+        schema !== undefined &&
+        (schema.shape.length !== 1 || !schema.dtype.startsWith("f") && schema.dtype !== "bf16")
+      ) {
+        return yield* invalidProposer("confidence must reference a rank-1 floating output")
+      }
+    }
+    const normalized: NormalizedProposerPlan = {
+      target,
+      stages,
+      state,
+      output,
+      tokenMap,
+      trainedMaxRows: plan.trainedMaxRows
     }
     const artifact: ProposerArtifact = {
       [ProposerArtifactTypeId]: ProposerArtifactTypeId
@@ -1641,22 +2064,84 @@ const makeProposerArtifact = (
     proposerArtifactInputs.set(
       artifact,
       Object.freeze({
-        components: Object.freeze([Object.freeze({
-          model: component.model,
-          params: Object.freeze([...component.params])
-        })]),
+        components: Object.freeze(input.components.map((component) =>
+          Object.freeze({
+            model: component.model,
+            params: Object.freeze([...component.params])
+          })
+        )),
         plan: Object.freeze({
-          target: Object.freeze({ ...plan.target }),
-          stages: Object.freeze(
-            plan.stages.map((stage) => Object.freeze({ operation: Object.freeze({ ...stage.operation }) }))
-          ),
-          state: Object.freeze({
-            _tag: plan.state._tag,
-            commit: Object.freeze({ ...plan.state.commit })
+          target: Object.freeze({
+            ...normalized.target,
+            hiddenTaps: Object.freeze(normalized.target.hiddenTaps.map((tap) =>
+              Object.freeze({
+                ...tap,
+                shape: Object.freeze([...tap.shape])
+              })
+            )),
+            sharedWeights: Object.freeze(normalized.target.sharedWeights.map((weight) =>
+              Object.freeze({
+                ...weight,
+                shape: Object.freeze([...weight.shape])
+              })
+            ))
           }),
-          output: Object.freeze({ ...plan.output }),
-          tokenMap: Object.freeze({ ...plan.tokenMap }),
-          trainedMaxRows: plan.trainedMaxRows
+          stages: Object.freeze(
+            normalized.stages.map((stage) =>
+              Object.freeze({
+                operation: Object.freeze(
+                  stage.operation._tag === "ParallelBlock"
+                    ? { ...stage.operation, layout: Object.freeze({ ...stage.operation.layout }) }
+                    : stage.operation._tag === "TreeExpand"
+                    ? { ...stage.operation, search: Object.freeze({ ...stage.operation.search }) }
+                    : stage.operation._tag === "HistoryLookup"
+                    ? { ...stage.operation, layout: Object.freeze({ ...stage.operation.layout }) }
+                    : { ...stage.operation }
+                ),
+                inputs: Object.freeze(stage.inputs.map((binding) =>
+                  Object.freeze({
+                    slot: binding.slot,
+                    value: Object.freeze({ ...binding.value })
+                  })
+                )),
+                outputs: Object.freeze(stage.outputs.map((schema) =>
+                  Object.freeze({
+                    dtype: schema.dtype,
+                    shape: Object.freeze([...schema.shape])
+                  })
+                ))
+              })
+            )
+          ),
+          state: normalized.state._tag === "None"
+            ? Object.freeze({ _tag: "None" as const })
+            : Object.freeze({
+              _tag: "Kv" as const,
+              schema: Object.freeze({ ...normalized.state.schema }),
+              commit: normalized.state.commit._tag === "Replay"
+                ? Object.freeze({
+                  ...normalized.state.commit,
+                  stages: Object.freeze([...normalized.state.commit.stages])
+                })
+                : Object.freeze({ ...normalized.state.commit })
+            }),
+          output: Object.freeze({
+            ...normalized.output,
+            tokenIds: Object.freeze({ ...normalized.output.tokenIds }),
+            ...(normalized.output.probabilityRows === undefined
+              ? {}
+              : { probabilityRows: Object.freeze({ ...normalized.output.probabilityRows }) }),
+            ...(normalized.output.parents === undefined
+              ? {}
+              : { parents: Object.freeze({ ...normalized.output.parents }) }),
+            ...(normalized.output.confidence === undefined
+              ? {}
+              : { confidence: Object.freeze({ ...normalized.output.confidence }) })
+          }),
+          tokenMap: normalized.tokenMap._tag === "Table"
+            ? Object.freeze({ ...normalized.tokenMap, targetIds: Object.freeze([...normalized.tokenMap.targetIds]) })
+            : Object.freeze({ ...normalized.tokenMap }),
+          trainedMaxRows: normalized.trainedMaxRows
         })
       })
     )
@@ -1935,7 +2420,7 @@ interface ResolvedInferenceConfig {
   readonly sampling: GenerationSamplingOptions
   readonly attentionWindow?: number
   readonly speculation?: {
-    readonly input: ProposerArtifactInput
+    readonly input: NormalizedProposerArtifactInput
     readonly maxDraftTokens: number
   }
 }
@@ -2102,6 +2587,100 @@ const logitsVocab = (
   return Effect.succeed(output.shape[2]!)
 }
 
+const exactChainRuntimePlan = (input: NormalizedProposerArtifactInput): boolean => {
+  const { plan } = input
+  return input.components.length === 1 && plan.stages.length === 1 &&
+    plan.stages[0]?.operation._tag === "Autoregressive" && plan.stages[0].operation.component === 0 &&
+    plan.stages[0].inputs.length === 1 && plan.stages[0].inputs[0]?.slot === 0 &&
+    plan.stages[0].inputs[0].value._tag === "PendingTokens" && plan.state._tag === "Kv" &&
+    plan.state.commit._tag === "AutoregressiveChain" && plan.state.commit.stage === 0 &&
+    plan.output.topology === "Chains" && plan.output.probabilities === "CausalNormalized" &&
+    plan.output.tokenIds._tag === "StageOutput" && plan.output.tokenIds.stage === 0 &&
+    plan.output.tokenIds.output === 0 && plan.output.probabilityRows?._tag === "StageOutput" &&
+    plan.output.probabilityRows.stage === 0 && plan.output.probabilityRows.output === 1 &&
+    plan.output.parents === undefined && plan.output.confidence === undefined && plan.tokenMap._tag === "Identity"
+}
+
+const schemaShapeMatches = (
+  declared: ReadonlyArray<ProposerShapeDimension>,
+  actual: ReadonlyArray<number | "Rows">,
+  vocabulary: number
+): boolean =>
+  declared.length === actual.length && declared.every((dimension, index) => {
+    const value = actual[index]
+    if (dimension === "Hidden") return typeof value === "number"
+    if (dimension === "Vocabulary") return value === vocabulary
+    return dimension === value
+  })
+
+const validateTargetContract = (
+  model: Model,
+  frozenParams: ReadonlyArray<Tensor.Concrete>,
+  config: ResolvedInferenceConfig,
+  vocabulary: number
+): Effect.Effect<void, InferenceError | ModelError | Tensor.TensorError, Runtime.Runtime> => {
+  const speculation = config.speculation
+  if (speculation === undefined) return Effect.void
+  const contract = speculation.input.plan.target
+  return Effect.gen(function*() {
+    if (contract.vocabulary !== vocabulary) {
+      return yield* invalidInferenceConfig(
+        `proposer target vocabulary must be ${contract.vocabulary}, got ${vocabulary}`
+      )
+    }
+    for (const key of ["graphFingerprint", "checkpointFingerprint"] as const) {
+      const expected = contract[key]
+      if (expected !== undefined && model.target[key] !== expected) {
+        return yield* invalidInferenceConfig(
+          `proposer target ${key} must be ${JSON.stringify(expected)}, got ${JSON.stringify(model.target[key])}`
+        )
+      }
+    }
+    for (const weight of contract.sharedWeights) {
+      const index = model.names.indexOf(weight.name)
+      const value = index < 0 ? undefined : frozenParams[index]
+      if (
+        value === undefined || value.dtype !== weight.dtype ||
+        !schemaShapeMatches(weight.shape, value.shape, vocabulary)
+      ) {
+        const actual = value === undefined ? "missing" : `${value.dtype}[${value.shape}]`
+        return yield* invalidInferenceConfig(
+          `proposer target shared weight ${
+            JSON.stringify(weight.name)
+          } requires ${weight.dtype}[${weight.shape}], got ${actual}`
+        )
+      }
+    }
+    if (contract.hiddenTaps.length === 0) return
+
+    const requested = new Set(contract.hiddenTaps.map((tap) => tap.layer))
+    const captured = new Map<number, Tensor.Any>()
+    const tokenInput = yield* Tensor.zeros([config.batchSize, 1], { dtype: config.tokenDtype })
+    const input = yield* Tensor.makeInput(0, tokenInput)
+    yield* model.forward(frozenParams, input, {
+      hidden: (layer, value) => {
+        if (requested.has(layer) && !captured.has(layer)) captured.set(layer, value)
+      }
+    })
+    for (const tap of contract.hiddenTaps) {
+      const value = captured.get(tap.layer)
+      const logicalShape: ReadonlyArray<number | "Rows"> | undefined = value === undefined ||
+          value.shape.length < 2 || value.shape[0] !== config.batchSize || value.shape[1] !== 1
+        ? undefined
+        : ["Rows", ...value.shape.slice(2)]
+      if (
+        value === undefined || logicalShape === undefined || value.dtype !== tap.dtype ||
+        !schemaShapeMatches(tap.shape, logicalShape, vocabulary)
+      ) {
+        const actual = value === undefined ? "missing" : `${value.dtype}[${value.shape}]`
+        return yield* invalidInferenceConfig(
+          `proposer target hidden tap ${tap.layer} requires ${tap.dtype}[${tap.shape}], got ${actual}`
+        )
+      }
+    }
+  })
+}
+
 const traceInferenceProgram = (
   model: Model,
   frozenParams: ReadonlyArray<Tensor.Concrete>,
@@ -2150,6 +2729,16 @@ const compileInferencePrograms = (
         op: "inference",
         message: "prefill and decode traces disagree on attention geometry or retention policy"
       })
+    }
+    const targetVocabulary = decode.outputs[0]?.shape[0]
+    if (targetVocabulary === undefined) {
+      return yield* new InferenceError({ op: "inference", message: "target decode did not expose a vocabulary row" })
+    }
+    yield* validateTargetContract(model, frozenParams, config, targetVocabulary)
+    if (config.speculation !== undefined && !exactChainRuntimePlan(config.speculation.input)) {
+      return yield* invalidInferenceConfig(
+        "this runtime path supports only one exact-chain Autoregressive proposer stage"
+      )
     }
     const pool = yield* Tensor.makeKvPool(
       geometry.layers,
@@ -2204,7 +2793,6 @@ const compileInferencePrograms = (
         message: "speculative proposer state must be KV-only with at least one attention layer"
       })
     }
-    const targetVocabulary = decode.outputs[0]?.shape[0]
     const proposerVocabulary = proposerDecode.outputs[0]?.shape[0]
     if (
       targetVocabulary !== config.speculation.input.plan.target.vocabulary ||
