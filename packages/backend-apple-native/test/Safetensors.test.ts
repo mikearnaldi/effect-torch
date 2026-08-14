@@ -26,6 +26,8 @@ const writeF64Archive = (file: string): Promise<void> => {
   return writeFile(file, archive)
 }
 
+// Real artifact coverage runs only with Metal available and never substitutes
+// CPU behavior; concrete execution and loaded handles are explicitly released.
 suite("Apple Metal tensor handles and direct safetensors", () => {
   it.effect("round trips direct Metal tensors and metadata", () =>
     withTempFile("effect-torch-metal-safetensors-", (file) =>

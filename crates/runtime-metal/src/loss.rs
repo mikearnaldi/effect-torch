@@ -7,6 +7,32 @@
 //! device-side active count, then probs − one_hot in one pass — no
 //! host round trip beyond the same zero-count check. CPU keeps the
 //! composed reference path.
+//!
+//! ## Kernel contracts
+//!
+//! - `et_ce_fwd`: one threadgroup of `NT = 128` threads per row; an
+//!   online (max, sum-exp) logsumexp over the row's `V` logits (folded
+//!   across simdgroups via threadgroup memory), then per-row nll and
+//!   flag bits into scratch. Flag bit0 = ignored (target ==
+//!   `ignore_index`), bit1 = invalid-but-active target (out of
+//!   `[0, V)`); both rows contribute 0 to the loss.
+//! - `et_ce_status`: a single threadgroup reduces nll + flags into
+//!   `loss` (mean over active rows when requested, else sum) and the
+//!   `[loss, active, invalid]` status triple the host reads back to
+//!   reproduce the composed path's error semantics.
+//! - `et_ce_count` / `et_ce_target_status`: device-side active (and
+//!   invalid) counts so the backward divides without a host round
+//!   trip; the target-only variant serves the chunked LM-head backward,
+//!   which recomputes logits chunk by chunk.
+//! - `et_ce_bwd`: `grad = (softmax(z) − one_hot(t)) (/ count)` for
+//!   active rows, zeros for ignored rows; re-derives the logsumexp.
+//! - `et_ce_bwd_scaled_f32`: chunked-head variant writing f32
+//!   gradients scaled by a device scalar, rounding through the logits
+//!   dtype first to preserve the composed path's rounding point.
+//!
+//! The `*_into` entry points validate contiguity/shape/dtype, mark
+//! destination buffers written, and allocate nothing; pipelines must
+//! be pre-warmed via the matching `warm_*` functions.
 
 use crate::runtime::dtype::DType;
 use crate::runtime::metal::run::MetalTensor;
@@ -41,11 +67,17 @@ fn test_counts() -> (usize, usize) {
     )
 }
 
+/// Planner-facing description of one device buffer a launch needs
+/// (shape, dtype, and derived element/byte counts, overflow-checked).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BufferRequirement {
+    /// Logical shape of the buffer.
     pub shape: Vec<usize>,
+    /// Element dtype.
     pub dtype: DType,
+    /// Total element count (product of `shape`).
     pub elements: usize,
+    /// Total byte count (`elements.max(1) * dtype.size_in_bytes()`).
     pub bytes: usize,
 }
 
@@ -68,40 +100,69 @@ impl BufferRequirement {
     }
 }
 
+/// Forward dispatch topology: per-row kernel followed by the
+/// single-threadgroup status kernel.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CeForwardTopology {
+    /// `et_ce_fwd` over `rows` threadgroups, then `et_ce_status` once.
     RowsThenStatus { threads: usize, dispatches: usize },
 }
 
+/// Planner-facing requirements of a fused cross-entropy forward.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CeForwardRequirements {
+    /// Scalar f32 loss output.
     pub loss: BufferRequirement,
+    /// f32 `[3]` status: `[loss, active_count, invalid_count]` — the
+    /// single host readback that preserves composed error semantics.
     pub status: BufferRequirement,
+    /// f32 `[rows]` per-row nll scratch shared between the two kernels.
     pub nll_scratch: BufferRequirement,
+    /// u32 `[rows]` per-row flag scratch (bit0 ignored, bit1 invalid).
     pub flags_scratch: BufferRequirement,
+    /// Selected dispatch topology.
     pub topology: CeForwardTopology,
+    /// Number of rows (`numel(logits) / classes`).
     pub rows: usize,
+    /// Number of classes (`logits.shape[last]`).
     pub classes: usize,
+    /// Logits dtype (f32/f16/bf16).
     pub logits_dtype: DType,
+    /// Target dtype (u32 or i64).
     pub target_dtype: DType,
+    /// Loss reduction (mean over active rows, or sum).
     pub reduction: crate::CeReduction,
 }
 
+/// Backward dispatch topology: row kernel alone (sum), or a device-side
+/// count kernel first (mean).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CeBackwardTopology {
+    /// Sum reduction: `et_ce_bwd` over `rows` threadgroups only.
     Rows { threads: usize, dispatches: usize },
+    /// Mean reduction: `et_ce_count` once, then `et_ce_bwd`.
     CountThenRows { threads: usize, dispatches: usize },
 }
 
+/// Planner-facing requirements of a fused cross-entropy backward.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CeBackwardRequirements {
+    /// Gradient output (same shape/dtype as the logits).
     pub grad: BufferRequirement,
+    /// f32 `[1]` device-side active count; present iff `reduction` is
+    /// mean.
     pub count_status: Option<BufferRequirement>,
+    /// Selected dispatch topology.
     pub topology: CeBackwardTopology,
+    /// Number of rows.
     pub rows: usize,
+    /// Number of classes.
     pub classes: usize,
+    /// Logits dtype (f32/f16/bf16).
     pub logits_dtype: DType,
+    /// Target dtype (u32 or i64).
     pub target_dtype: DType,
+    /// Loss reduction.
     pub reduction: crate::CeReduction,
 }
 
@@ -180,6 +241,8 @@ mod metal {
         Ok((rows, classes))
     }
 
+    /// Plans a fused cross-entropy forward for the given logits/target
+    /// geometry and reduction.
     pub fn ce_forward_requirements(
         logits_shape: &[usize],
         logits_dtype: DType,
@@ -205,6 +268,8 @@ mod metal {
         })
     }
 
+    /// Plans a fused cross-entropy backward; mean reduction adds the
+    /// device-side count status buffer and kernel.
     pub fn ce_backward_requirements(
         logits_shape: &[usize],
         logits_dtype: DType,
@@ -614,6 +679,8 @@ kernel void et_ce_bwd_scaled_f32(
             })
     }
 
+    /// Warms the forward pipelines (`et_ce_fwd`, `et_ce_status`) for
+    /// the (target, logits) dtype pair.
     pub fn warm_forward(logits: DType, target: DType) -> crate::err::Res<()> {
         geometry(&[1, 1], logits, &[1], target)?;
         pipeline(target, logits, "et_ce_fwd")?;
@@ -621,6 +688,7 @@ kernel void et_ce_bwd_scaled_f32(
         Ok(())
     }
 
+    /// Warms exactly the forward pipelines described by `requirements`.
     pub fn warm_forward_exact(requirements: &CeForwardRequirements) -> crate::err::Res<()> {
         pipeline(
             requirements.target_dtype,
@@ -635,6 +703,8 @@ kernel void et_ce_bwd_scaled_f32(
         Ok(())
     }
 
+    /// Warms the backward pipelines for the (target, logits) dtype
+    /// pair; mean reduction additionally warms `et_ce_count`.
     pub fn warm_backward(
         logits: DType,
         target: DType,
@@ -648,6 +718,7 @@ kernel void et_ce_bwd_scaled_f32(
         Ok(())
     }
 
+    /// Warms exactly the backward pipelines described by `requirements`.
     pub fn warm_backward_exact(requirements: &CeBackwardRequirements) -> crate::err::Res<()> {
         if requirements.reduction == crate::CeReduction::Mean {
             pipeline(
@@ -664,12 +735,16 @@ kernel void et_ce_bwd_scaled_f32(
         Ok(())
     }
 
+    /// Warms the scaled-f32 backward pipeline used by the chunked
+    /// LM-head backward.
     pub fn warm_backward_scaled_f32(logits: DType, target: DType) -> crate::err::Res<()> {
         geometry(&[1, 1], logits, &[1], target)?;
         pipeline(target, logits, "et_ce_bwd_scaled_f32")?;
         Ok(())
     }
 
+    /// Warms the target-only status pipeline used by the chunked
+    /// LM-head backward.
     pub fn warm_target_status(logits: DType, target: DType) -> crate::err::Res<()> {
         geometry(&[1, 1], logits, &[1], target)?;
         pipeline(target, logits, "et_ce_target_status")?;
@@ -707,6 +782,11 @@ kernel void et_ce_bwd_scaled_f32(
         );
     }
 
+    /// Non-allocating fused forward: writes the scalar `loss`, the
+    /// `[loss, active, invalid]` `status` triple, and the per-row
+    /// nll/flags scratch. All buffers must match the planner's exact
+    /// requirements; both pipelines must be warm. The caller reads back
+    /// `status` to enforce the composed path's error semantics.
     #[allow(clippy::too_many_arguments)]
     pub fn ce_forward_into(
         logits: &MetalTensor,
@@ -785,8 +865,9 @@ kernel void et_ce_bwd_scaled_f32(
         Ok(())
     }
 
-    // Returns (loss scalar, status [3]) without reading status. Validation
-    // remains deferred to the evaluator's existing status gate.
+    /// Allocating convenience wrapper around [`ce_forward_into`].
+    /// Returns `(loss scalar, status [3])` without reading status;
+    /// validation remains deferred to the evaluator's status gate.
     pub fn ce_forward(
         logits: &MetalTensor,
         target: &MetalTensor,
@@ -839,6 +920,10 @@ kernel void et_ce_bwd_scaled_f32(
         Ok((loss, status))
     }
 
+    /// Non-allocating fused backward: writes `grad` (same shape/dtype
+    /// as the logits). Mean reduction requires `count_status` (f32
+    /// `[1]`) and dispatches `et_ce_count` first; sum reduction forbids
+    /// it. Both required pipelines must be warm.
     pub fn ce_backward_into(
         logits: &MetalTensor,
         target: &MetalTensor,
@@ -937,6 +1022,10 @@ kernel void et_ce_bwd_scaled_f32(
         Ok(())
     }
 
+    /// Non-allocating target-only status dispatch: writes
+    /// `[0, active, invalid]` into `status` without touching logits.
+    /// Used once by the chunked LM-head backward before it recomputes
+    /// each logits chunk.
     pub fn ce_target_status_into(
         target: &MetalTensor,
         logits_dtype: DType,
@@ -976,6 +1065,9 @@ kernel void et_ce_bwd_scaled_f32(
         Ok(())
     }
 
+    /// Non-allocating scaled-f32 backward for the chunked LM head:
+    /// writes f32 `grad = round_to_logits_dtype(softmax − one_hot) *
+    /// scale`, where `scale` is an f32 `[1]` device scalar.
     pub fn ce_backward_scaled_f32_into(
         logits: &MetalTensor,
         target: &MetalTensor,
@@ -1018,7 +1110,10 @@ kernel void et_ce_bwd_scaled_f32(
         Ok(())
     }
 
-    // Returns (grad, count [1]); only mean reduction writes and checks count.
+    /// Allocating convenience wrapper around [`ce_backward_into`];
+    /// returns `(grad, count [1])`. Only mean reduction writes the
+    /// count; the buffer is allocated either way to preserve the
+    /// historical pair return.
     pub fn ce_backward(
         logits: &MetalTensor,
         target: &MetalTensor,

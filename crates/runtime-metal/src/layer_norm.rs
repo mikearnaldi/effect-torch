@@ -3,6 +3,27 @@
 //! one launch each way). The backward also emits x̂ so dw/db are two
 //! plain reduce ops host-side instead of another kernel family. CPU
 //! keeps the composed path in lib.rs.
+//!
+//! ## Kernel contracts
+//!
+//! - `et_ln_fwd`: one threadgroup of `NT = 1024` threads per row;
+//!   mean and variance are reduced with `simd_sum` plus a
+//!   threadgroup-memory tree across the `NT / 32` simdgroups. Input
+//!   elements load to f32 for the statistics; storage may be
+//!   f32/f16/bf16.
+//! - `et_rms_fwd` / `et_rms_fwd_registers`: RMS norm over the last
+//!   dim with an optional weight. The register variant keeps up to 8
+//!   elements per thread in registers and is selected when
+//!   `normalized_elements <= NT * 8`; its thread count is clamped to
+//!   `[32, NT]` and rounded to a full simdgroup (32 threads).
+//! - `et_ln_bwd`: recomputes mean/rstd, then
+//!   `dx = (g·w − mean(g·w) − x̂·mean(g·w·x̂)) · rstd`, also storing
+//!   `x̂` so the caller derives `dw`/`db` with plain reductions.
+//!
+//! The `*_into` entry points validate contiguity, shape, dtype, and
+//! storage bounds, mark destination buffers written, and allocate
+//! nothing; the allocating wrappers (`ln_forward`, `ln_backward`) are
+//! for use outside planned executables.
 
 use crate::runtime::metal::run::MetalTensor;
 
@@ -36,11 +57,17 @@ fn test_counts() -> (usize, usize) {
     )
 }
 
+/// Planner-facing description of one device buffer a launch needs
+/// (shape, dtype, and derived element/byte counts, overflow-checked).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BufferRequirement {
+    /// Logical shape of the buffer.
     pub shape: Vec<usize>,
+    /// Element dtype.
     pub dtype: crate::runtime::dtype::DType,
+    /// Total element count (product of `shape`).
     pub elements: usize,
+    /// Total byte count (`elements.max(1) * dtype.size_in_bytes()`).
     pub bytes: usize,
 }
 
@@ -68,27 +95,46 @@ impl BufferRequirement {
     }
 }
 
+/// Thread topology selected for a launch. Currently always row-parallel:
+/// one threadgroup per normalized row.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LayerNormTopology {
+    /// One threadgroup per row, `threads` threads each, `dispatches`
+    /// total kernel launches.
     Rows { threads: usize, dispatches: usize },
 }
 
+/// Planner-facing requirements of a forward (layer-norm or RMS-norm)
+/// launch.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LayerNormForwardRequirements {
+    /// Output buffer (same shape/dtype as the input).
     pub output: BufferRequirement,
+    /// Selected thread topology.
     pub topology: LayerNormTopology,
+    /// Number of normalized rows (`numel(x) / normalized_elements`).
     pub rows: usize,
+    /// Elements per normalized row.
     pub normalized_elements: usize,
+    /// Storage dtype (f32/f16/bf16).
     pub dtype: crate::runtime::dtype::DType,
 }
 
+/// Planner-facing requirements of a backward launch.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LayerNormBackwardRequirements {
+    /// `dx` output buffer (same shape/dtype as the input).
     pub dx: BufferRequirement,
+    /// `x̂` (normalized) output buffer, from which the caller derives
+    /// `dw`/`db` via plain reductions.
     pub normalized: BufferRequirement,
+    /// Selected thread topology.
     pub topology: LayerNormTopology,
+    /// Number of normalized rows.
     pub rows: usize,
+    /// Elements per normalized row.
     pub normalized_elements: usize,
+    /// Storage dtype (f32/f16/bf16).
     pub dtype: crate::runtime::dtype::DType,
 }
 
@@ -170,6 +216,9 @@ mod metal {
         Ok((rows, normalized_elements))
     }
 
+    /// Plans a layer-norm forward: validates the geometry (weight/bias
+    /// shapes must equal the normalized suffix of `x`; dtypes must
+    /// match) and returns the exact requirements.
     pub fn ln_forward_requirements(
         x_shape: &[usize],
         x_dtype: crate::runtime::dtype::DType,
@@ -198,6 +247,8 @@ mod metal {
         })
     }
 
+    /// Plans a layer-norm backward: like the forward, plus the
+    /// cotangent must match `x` exactly in shape and dtype.
     pub fn ln_backward_requirements(
         x_shape: &[usize],
         x_dtype: crate::runtime::dtype::DType,
@@ -228,6 +279,8 @@ mod metal {
         normalized_elements.clamp(32, NT).next_multiple_of(32)
     }
 
+    /// Plans an RMS-norm forward over the last dim with an optional
+    /// weight; selects the register-caching kernel for small rows.
     pub fn rms_forward_requirements(
         x_shape: &[usize],
         x_dtype: crate::runtime::dtype::DType,
@@ -557,11 +610,13 @@ kernel void et_ln_bwd(
             })
     }
 
+    /// Warms the forward layer-norm pipeline for `dtype`.
     pub fn warm_forward(dtype: crate::runtime::dtype::DType) -> crate::err::Res<()> {
         pipeline("et_ln_fwd", dtype, NT)?;
         Ok(())
     }
 
+    /// Warms exactly the pipeline described by `requirements`.
     pub fn warm_forward_exact(requirements: &LayerNormForwardRequirements) -> crate::err::Res<()> {
         warm_forward(requirements.dtype)
     }
@@ -574,6 +629,8 @@ kernel void et_ln_bwd(
         }
     }
 
+    /// Warms exactly the RMS pipeline (kernel variant and thread count)
+    /// described by `requirements`.
     pub fn warm_rms_exact(requirements: &LayerNormForwardRequirements) -> crate::err::Res<()> {
         pipeline(
             rms_kernel_name(requirements.normalized_elements),
@@ -583,11 +640,13 @@ kernel void et_ln_bwd(
         Ok(())
     }
 
+    /// Warms the backward layer-norm pipeline for `dtype`.
     pub fn warm_backward(dtype: crate::runtime::dtype::DType) -> crate::err::Res<()> {
         pipeline("et_ln_bwd", dtype, NT)?;
         Ok(())
     }
 
+    /// Warms exactly the pipeline described by `requirements`.
     pub fn warm_backward_exact(
         requirements: &LayerNormBackwardRequirements,
     ) -> crate::err::Res<()> {
@@ -606,6 +665,9 @@ kernel void et_ln_bwd(
         })
     }
 
+    /// Non-allocating layer-norm forward dispatch. All tensors must be
+    /// contiguous; `output` must match `x` in shape and dtype. Requires
+    /// the forward pipeline to be warm.
     pub fn ln_forward_into(
         x: &MetalTensor,
         weight: &MetalTensor,
@@ -652,6 +714,9 @@ kernel void et_ln_bwd(
         Ok(())
     }
 
+    /// Non-allocating RMS-norm forward dispatch. Recomputes the exact
+    /// plan from the arguments and rejects the call when it differs
+    /// from the immutable `requirements` the pipeline was warmed for.
     pub fn rms_forward_into(
         x: &MetalTensor,
         weight: Option<&MetalTensor>,
@@ -699,6 +764,7 @@ kernel void et_ln_bwd(
         Ok(())
     }
 
+    /// Allocating convenience wrapper around [`ln_forward_into`].
     pub fn ln_forward(
         x: &MetalTensor,
         weight: &MetalTensor,
@@ -726,6 +792,9 @@ kernel void et_ln_bwd(
         Ok(output)
     }
 
+    /// Non-allocating layer-norm backward dispatch: writes `dx` and the
+    /// normalized activations `x̂` (both same shape/dtype as `x`).
+    /// Requires the backward pipeline to be warm.
     pub fn ln_backward_into(
         x: &MetalTensor,
         weight: &MetalTensor,
@@ -779,7 +848,9 @@ kernel void et_ln_bwd(
         Ok(())
     }
 
-    // Returns (dx, x_hat); dw/db are computed by the caller from x_hat.
+    /// Allocating convenience wrapper around [`ln_backward_into`];
+    /// returns `(dx, x_hat)`. `dw`/`db` are computed by the caller from
+    /// `x_hat` via plain reductions.
     pub fn ln_backward(
         x: &MetalTensor,
         weight: &MetalTensor,

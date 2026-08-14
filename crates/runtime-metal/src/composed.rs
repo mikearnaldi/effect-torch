@@ -1,3 +1,17 @@
+//! Primitive-built numerical references for the fused kernels (tests
+//! only — `#[cfg(test)]` in lib.rs).
+//!
+//! Every function here implements one fused kernel's semantics using
+//! only the primitive `ops` runners (binary/unary/reduce/matmul/
+//! gather/...), so the parity tests compare fused destination kernels
+//! against an independent composition of already-verified primitives
+//! rather than against themselves. These references are deliberately
+//! naive: they materialize intermediates the fused kernels avoid (full
+//! score matrices, per-token states) and are the readability-first
+//! source of truth for the exact numerics contract — masking,
+//! scaling, ignore-index semantics, decay factoring, and reduction
+//! order — that the fused implementations must reproduce.
+
 use super::ops::{
     binary, broadcast_to, cast, cat, compare, fill, gather, matmul, permute, reduce, unary, where_,
     BinOp, UnOp,
@@ -62,6 +76,7 @@ fn mean_dims(t: &MetalTensor, dims: &[usize]) -> crate::err::Res<MetalTensor> {
     binary(&s, &c, BinOp::Div)
 }
 
+/// Reference softmax over the last dim (max-subtracted).
 pub fn softmax_lastdim(x: &MetalTensor) -> crate::err::Res<MetalTensor> {
     let r = rank(x);
     let m = reduce(x, &[r - 1], true, ReduceOp::Max)?;
@@ -70,6 +85,8 @@ pub fn softmax_lastdim(x: &MetalTensor) -> crate::err::Res<MetalTensor> {
     binary(&e, &s, BinOp::Div)
 }
 
+/// Reference logsumexp over the last dim (max-subtracted), kept
+/// reduced (same rank as the input).
 pub fn logsumexp_lastdim(x: &MetalTensor) -> crate::err::Res<MetalTensor> {
     let r = rank(x);
     let m = reduce(x, &[r - 1], true, ReduceOp::Max)?;
@@ -126,6 +143,8 @@ fn sdpa_scores(
     }
 }
 
+/// Reference scaled-dot-product attention forward:
+/// `softmax(q·kᵀ·scale + causal_mask)·v`.
 pub fn sdpa_forward(
     q: &MetalTensor,
     k: &MetalTensor,
@@ -138,6 +157,9 @@ pub fn sdpa_forward(
     matmul(&p, v)
 }
 
+/// Reference SDPA backward; returns `(dq, dk, dv)`. Recomputes the
+/// full score matrix and applies the softmax Jacobian
+/// `p ⊙ (dp − Σ(p ⊙ dp))` with the causal gate re-applied after.
 pub fn sdpa_backward(
     q: &MetalTensor,
     k: &MetalTensor,
@@ -166,6 +188,7 @@ pub fn sdpa_backward(
     Ok((dq, dk, dv))
 }
 
+/// Reference layer-norm forward over the trailing `weight`-sized dims.
 pub fn layer_norm_forward(
     x: &MetalTensor,
     weight: &MetalTensor,
@@ -191,6 +214,10 @@ pub fn layer_norm_forward(
     )
 }
 
+/// Reference layer-norm backward; returns `(dx, dw, db)`. Implements
+/// `dx = (g·w − mean(g·w) − x̂·mean(g·w·x̂)) · rstd` with x̂ the
+/// normalized activations, and `dw`/`db` as plain sums over the
+/// non-normalized dims.
 pub fn layer_norm_backward(
     x: &MetalTensor,
     weight: &MetalTensor,
@@ -322,6 +349,9 @@ fn target_to_ids(target: &MetalTensor) -> crate::err::Res<MetalTensor> {
     }
 }
 
+/// Reference cross-entropy forward with ignore-index masking, active
+/// count and label validation (mean over an all-ignored batch and
+/// out-of-range active labels are hard errors, in this order).
 pub fn cross_entropy_forward(
     logits: &MetalTensor,
     target: &MetalTensor,
@@ -357,6 +387,8 @@ pub fn cross_entropy_forward(
     }
 }
 
+/// Reference cross-entropy backward: `softmax − one_hot` at active
+/// positions, zeros at ignored ones, scaled by `1/active` for mean.
 pub fn cross_entropy_backward(
     logits: &MetalTensor,
     target: &MetalTensor,
@@ -393,6 +425,9 @@ pub fn cross_entropy_backward(
     }
 }
 
+/// Reference rotary embedding (GPT-NeoX half-split): builds the
+/// angle table host-side, rotates the two halves with cos/sin. `sign`
+/// = −1 yields the transpose rotation (the backward).
 pub fn rotary_forward(
     x: &MetalTensor,
     offsets: &[usize],
@@ -491,9 +526,11 @@ fn head_ce_check_target(t1: &MetalTensor, ignore_index: i64, vocab: usize) -> cr
     Ok(active as f64)
 }
 
-// Mean cross-entropy of Linear(x, weight, bias) against target,
-// evaluated one row-chunk at a time so the [rows, vocab] logits never
-// materialize whole.
+/// Reference chunked-head cross-entropy forward (RFC 0016 phase 2):
+/// mean CE of `Linear(x, weight, bias)` against `target`, evaluated
+/// one row-chunk at a time so the `[rows, vocab]` logits never
+/// materialize whole. Mean semantics match the plain path exactly:
+/// zero-active error before label checks, in the same order.
 pub fn chunked_head_ce_forward(
     x: &MetalTensor,
     weight: &MetalTensor,
@@ -543,9 +580,10 @@ pub fn chunked_head_ce_forward(
     }
 }
 
-// Closed-form adjoint: recomputes each chunk's logits and grad-logits
-// in a transient workspace and accumulates (dx, dw, db); grad-logits
-// never outlive their chunk.
+/// Reference chunked-head CE backward (closed-form adjoint):
+/// recomputes each chunk's logits and grad-logits in a transient
+/// workspace and accumulates `(dx, dw, db)`; grad-logits never outlive
+/// their chunk.
 pub fn chunked_head_ce_backward(
     x: &MetalTensor,
     weight: &MetalTensor,
@@ -721,12 +759,12 @@ fn cat_tree(
         .ok_or_else(|| "cat_tree: empty".to_string())
 }
 
-// Chunked gated delta-rule linear attention, reference implementation
-// (RFC 0018; FLA `naive_chunk_kda` equivalent). q/k/log_decay
-// [.., H, T, Dk], v [.., H, T, Dv], beta [.., H, T, 1]; computes in f32
-// from a zero initial state. Chunk 64, sub-chunk 16: intra-chunk blocks
-// use the pivot-factored decay exp(g_i - g_j) = exp(g_i - g_p) *
-// exp(g_p - g_j) so no reciprocal cumulative decay is ever formed.
+/// Reference chunked gated delta-rule linear attention (RFC 0018; FLA
+/// `naive_chunk_kda` equivalent). `q/k/log_decay [.., H, T, Dk]`,
+/// `v [.., H, T, Dv]`, `beta [.., H, T, 1]`; computes in f32 from a
+/// zero initial state. Chunk 64, sub-chunk 16: intra-chunk blocks use
+/// the pivot-factored decay `exp(g_i − g_j) = exp(g_i − g_p) *
+/// exp(g_p − g_j)` so no reciprocal cumulative decay is ever formed.
 pub fn kda_chunk_forward(
     q: &MetalTensor,
     k: &MetalTensor,
@@ -744,9 +782,10 @@ pub fn kda_chunk_forward(
     Ok(kda_chunk_with_state(q, k, v, log_decay, beta, scale, &initial)?.0)
 }
 
-// Stateful variant: starts from `initial_state` ([BH, Dk, Dv] f32) and
-// returns the output alongside the final state. The decode path drives
-// this per sequence slot.
+/// Stateful variant of [`kda_chunk_forward`]: starts from
+/// `initial_state` (`[BH, Dk, Dv]` f32) and returns the output
+/// alongside the final state. The decode path drives this per
+/// sequence slot.
 pub fn kda_chunk_with_state(
     q: &MetalTensor,
     k: &MetalTensor,
@@ -939,8 +978,8 @@ pub fn kda_chunk_with_state(
     Ok((super::ops::from_f32(&out, in_dtype)?, state))
 }
 
-// Causal depthwise short convolution over [.., T, C] with weight
-// [C, K] and zero history: y[t] = sum_j w[:, j] * x[t-K+1+j].
+/// Reference causal depthwise short convolution over `[.., T, C]` with
+/// weight `[C, K]` and zero history: `y[t] = Σ_j w[:, j] * x[t-K+1+j]`.
 pub fn short_conv1d_forward(x: &MetalTensor, weight: &MetalTensor) -> crate::err::Res<MetalTensor> {
     let dims = x.layout.shape().to_vec();
     let r = dims.len();
@@ -970,11 +1009,11 @@ pub fn short_conv1d_forward(x: &MetalTensor, weight: &MetalTensor) -> crate::err
     })
 }
 
-// Stateful per-slot variant: x [T, C], state [K-1, C]; returns the
-// output and the new window. `advance` is the count of real tokens
-// (chunked prefill right-pads): outputs are computed over the full
-// padded window — causal, so real rows never see padding — but the
-// stored window shifts in only the first `advance` rows.
+/// Stateful per-slot variant: `x [T, C]`, `state [K-1, C]`; returns
+/// the output and the new window. `advance` is the count of real
+/// tokens (chunked prefill right-pads): outputs are computed over the
+/// full padded window — causal, so real rows never see padding — but
+/// the stored window shifts in only the first `advance` rows.
 pub fn short_conv1d_with_state(
     x: &MetalTensor,
     weight: &MetalTensor,
@@ -998,10 +1037,10 @@ pub fn short_conv1d_with_state(
     Ok((acc, new_state))
 }
 
-// ShortConv1d adjoints (RFC 0018 phase 4). dx[s] = sum_j w[:, K-1-j] *
-// g[s+j] (full correlation over the right-zero-padded cotangent);
-// dw[:, j] = sum_t g[t] * x[t-K+1+j] (per-tap correlation over the
-// causal window). g and x are [.., T, C]; weight is [C, K].
+/// Reference ShortConv1d backward-x (RFC 0018 phase 4):
+/// `dx[s] = Σ_j w[:, K-1-j] * g[s+j]` — full correlation over the
+/// right-zero-padded cotangent. `g` and `x` are `[.., T, C]`; weight
+/// is `[C, K]`.
 pub fn short_conv1d_backward_x(
     x: &MetalTensor,
     weight: &MetalTensor,
@@ -1034,6 +1073,9 @@ pub fn short_conv1d_backward_x(
     })
 }
 
+/// Reference ShortConv1d backward-w: `dw[:, j] = Σ_t g[t] *
+/// x[t-K+1+j]` — per-tap correlation over the causal window, summed
+/// over batch and time into `[C, K]`.
 pub fn short_conv1d_backward_w(
     x: &MetalTensor,
     weight: &MetalTensor,
@@ -1074,22 +1116,26 @@ pub fn short_conv1d_backward_w(
     })
 }
 
-// Closed-form KDA backward (RFC 0018 phase 4). With S̃_t = Diag(α_t)
-// S_{t-1}, δ_t = v_t − S̃_tᵀ k_t, S_t = S̃_t + β_t k_t δ_tᵀ and o_t =
-// scale · S_tᵀ q_t, the adjoint state Λ_t = ∂L/∂S_t runs in reverse:
-//
-//   Λ_t   += scale · q_t g_tᵀ           (g = output cotangent)
-//   dq_t   = scale · S_t g_t
-//   dv_t   = β_t Λ_tᵀ k_t
-//   dk_t   = β_t (Λ_t δ_t − S̃_t (Λ_tᵀ k_t))
-//   dβ_t   = k_tᵀ Λ_t δ_t
-//   dα_t   = sum_dv(S_{t-1} ⊙ M_t), M_t = (I − β_t k_t k_tᵀ) Λ_t
-//   dg_t   = dα_t ⊙ α_t
-//   Λ_{t-1} = Diag(α_t) M_t
-//
-// Memory stays bounded: pass 1 retains only the 64-token chunk start
-// states; pass 2 walks chunks in reverse and recomputes the per-token
-// states within each chunk (transient, one chunk at a time).
+/// Reference closed-form KDA backward (RFC 0018 phase 4). With
+/// S̃_t = Diag(α_t) S_{t-1}, δ_t = v_t − S̃_tᵀ k_t,
+/// S_t = S̃_t + β_t k_t δ_tᵀ and o_t = scale · S_tᵀ q_t, the adjoint
+/// state Λ_t = ∂L/∂S_t runs in reverse:
+///
+/// ```text
+///   Λ_t   += scale · q_t g_tᵀ           (g = output cotangent)
+///   dq_t   = scale · S_t g_t
+///   dv_t   = β_t Λ_tᵀ k_t
+///   dk_t   = β_t (Λ_t δ_t − S̃_t (Λ_tᵀ k_t))
+///   dβ_t   = k_tᵀ Λ_t δ_t
+///   dα_t   = sum_dv(S_{t-1} ⊙ M_t), M_t = (I − β_t k_t k_tᵀ) Λ_t
+///   dg_t   = dα_t ⊙ α_t
+///   Λ_{t-1} = Diag(α_t) M_t
+/// ```
+///
+/// Memory stays bounded: pass 1 retains only the 64-token chunk start
+/// states; pass 2 walks chunks in reverse and recomputes the per-token
+/// states within each chunk (transient, one chunk at a time).
+/// Returns `(dq, dk, dv, dlog_decay, dbeta)` in the input dtype.
 #[allow(clippy::too_many_arguments)]
 pub fn kda_chunk_backward(
     q: &MetalTensor,

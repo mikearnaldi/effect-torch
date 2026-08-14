@@ -1,3 +1,17 @@
+//! Compile requests, options, and the invocation contract.
+//!
+//! A [`ProgramRequest`] couples a semantic graph (its roots) with everything
+//! that determines how a compiled program may be invoked: caller-visible
+//! bindings, runtime scalar/runtime-value declarations, output signatures,
+//! and the [`CompileOptions`] that pin every compile-time choice. Options —
+//! including the environment snapshot — are part of program identity: two
+//! requests that differ in any option must never share a cached executable.
+//!
+//! [`PreparedProgram`] is the validated result of preparation: it owns the
+//! program's single [`GraphIndex`], the resolved [`ProgramSignature`], and
+//! the optional state-cursor declaration, so later phases never re-derive
+//! (or disagree about) the contract.
+
 use crate::schedule::GraphIndex;
 use effect_torch_graph::Node;
 use effect_torch_runtime::{
@@ -7,8 +21,12 @@ use effect_torch_runtime::{
 };
 use std::sync::Arc;
 
+/// Default elementwise chunk extent (in elements) for compute-elementwise
+/// splitting: 2^26, chosen so chunked launches amortize without unbounded
+/// intermediate allocations.
 pub const DEFAULT_CE_CHUNK_SIZE: usize = 1 << 26;
 
+/// The semantic node type this compiler consumes.
 pub type ProgramNode = Node;
 
 /// Inference-only assumptions explicitly authorized by the caller.
@@ -21,15 +39,25 @@ pub struct InferenceOptions {
 ///
 /// The snapshot is carried by `CompileOptions`, so later phases never re-read
 /// process state that could change the lowered schedule or memory plan.
+/// Every field maps to one `EFFECT_TORCH_*` variable (see
+/// [`EnvironmentOptions::snapshot`]); unset variables select the defaults.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct EnvironmentOptions {
+    /// Elementwise/reduce fusion (`EFFECT_TORCH_NO_FUSION` disables).
     pub fusion: bool,
+    /// GEMM epilogue regions (`EFFECT_TORCH_NO_EPILOGUE` disables).
     pub gemm_epilogues: bool,
+    /// Multi-output elementwise merges (`EFFECT_TORCH_NO_MULTI_FUSION` disables).
     pub multi_output_fusion: bool,
+    /// Grouped AdamW regions (`EFFECT_TORCH_OPT_GROUPS` enables).
     pub optimizer_groups: bool,
+    /// Verbose fusion decisions on stderr (`EFFECT_TORCH_FUSION_DEBUG`).
     pub fusion_debug: bool,
+    /// Compute-elementwise chunk extent (`EFFECT_TORCH_CE_CHUNK_SIZE`).
     pub ce_chunk_size: usize,
+    /// Metal private-storage intermediates (`EFFECT_TORCH_PRIVATE_INTERMEDIATES`).
     pub metal_private_intermediates: bool,
+    /// Metal MMA lowering (`EFFECT_TORCH_NO_MMA` disables).
     pub metal_mma: bool,
 }
 
@@ -49,6 +77,9 @@ impl Default for EnvironmentOptions {
 }
 
 impl EnvironmentOptions {
+    /// Reads the process environment once, tolerantly: malformed or
+    /// non-positive numeric values fall back to defaults rather than failing
+    /// compilation.
     pub fn snapshot() -> Self {
         let positive_usize = |name: &str, default: usize| {
             std::env::var(name)
@@ -71,10 +102,17 @@ impl EnvironmentOptions {
     }
 }
 
+/// Every compile-time choice for one program. `Eq + Hash` by design: the
+/// options are part of the compiled artifact's cache identity, so a change
+/// in any field forces a fresh compile.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct CompileOptions {
+    /// Master switch for region selection; when false the plan covers no
+    /// regions and every node lowers independently.
     pub optimize: bool,
+    /// Caller-authorized inference-only assumptions.
     pub inference: Option<InferenceOptions>,
+    /// Frozen environment switches.
     pub environment: EnvironmentOptions,
 }
 
@@ -89,6 +127,8 @@ impl Default for CompileOptions {
 }
 
 impl CompileOptions {
+    /// Default options with the environment switches snapshotted from the
+    /// current process state.
     pub fn from_environment() -> Self {
         Self {
             environment: EnvironmentOptions::snapshot(),
@@ -96,6 +136,7 @@ impl CompileOptions {
         }
     }
 
+    /// Whether the caller authorized treating weights as constants.
     pub fn constant_weights(&self) -> bool {
         self.inference
             .as_ref()
@@ -121,6 +162,10 @@ pub struct ProgramRequest {
     derive_contract: bool,
 }
 
+/// Declares which input slot carries the runtime-driven state cursor (decode
+/// position), and whether it arrives as a scalar or an `i64 [batch]` tensor.
+/// The cursor is internal runtime metadata — it never becomes a
+/// caller-visible binding or scalar in the invocation contract.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct StateCursorSlot {
     pub slot: u32,
@@ -134,6 +179,8 @@ impl StateCursorSlot {
 }
 
 impl ProgramRequest {
+    /// A request with an explicit caller-supplied binding and invocation
+    /// contract; the signature is used verbatim during preparation.
     pub fn new(
         roots: Vec<Arc<ProgramNode>>,
         bindings: Vec<BindingDecl>,
@@ -168,12 +215,18 @@ impl ProgramRequest {
         self
     }
 
+    /// Validates the request, builds the shared graph index, and resolves
+    /// the invocation contract. See `driver::prepare_program`.
     pub fn prepare(self) -> Result<PreparedProgram, String> {
         PreparedProgram::from_request(self)
     }
 }
 
 /// A validated compile request and the graph analysis shared by later phases.
+///
+/// Invariants established by preparation: `roots` is non-empty and
+/// single-device; `index` is the program's only graph-index build; and
+/// `signature` is fully resolved (caller-supplied or graph-derived).
 #[derive(Clone)]
 pub struct PreparedProgram {
     pub roots: Box<[Arc<ProgramNode>]>,
@@ -181,6 +234,7 @@ pub struct PreparedProgram {
     pub signature: ProgramSignature,
     pub options: CompileOptions,
     pub state_cursor: Option<StateCursorSlot>,
+    /// Phase timings recorded during preparation (the graph-index build).
     pub(crate) preparation_phases: Box<[effect_torch_runtime::CompilePhaseTiming]>,
 }
 
@@ -189,6 +243,7 @@ impl PreparedProgram {
         crate::driver::prepare_program(request)
     }
 
+    /// The resolved invocation contract.
     pub fn signature(&self) -> &ProgramSignature {
         &self.signature
     }
@@ -214,6 +269,9 @@ pub(crate) fn request_parts(
     )
 }
 
+/// Maps a semantic device onto the runtime placement identity used in
+/// signatures: `cpu:0` for CPU, `metal:0` in the `shared` memory space for
+/// Metal.
 fn placement(device: &effect_torch_graph::Device) -> Placement {
     match device {
         effect_torch_graph::Device::Cpu => Placement::new(DeviceId::new("cpu:0")),
@@ -223,6 +281,12 @@ fn placement(device: &effect_torch_graph::Device) -> Placement {
     }
 }
 
+/// Derives the binding and invocation declarations from the graph index for
+/// a native request. Tensor slots become bindings (CPU tensors pinned to an
+/// exact contiguous layout, device tensors to zero-offset contiguous);
+/// scalar slots become typed invocation scalars named `slot_N`; the state
+/// cursor slot, when present, becomes internal runtime-value metadata and is
+/// validated against the declaration found in the graph.
 pub(crate) fn derive_graph_signature(
     index: &GraphIndex,
     state_cursor: Option<StateCursorSlot>,
@@ -282,6 +346,8 @@ pub(crate) fn derive_graph_signature(
     Ok(signature_with_contract(index, bindings, invocation))
 }
 
+/// Completes a signature by deriving the output declarations from the
+/// caller-ordered roots (duplicates preserved).
 pub(crate) fn signature_with_contract(
     index: &GraphIndex,
     bindings: Vec<BindingDecl>,

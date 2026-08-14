@@ -4,20 +4,59 @@
 //! launches at these sizes); the backward is the same kernel with
 //! negated angles (Rᵀ = R(−θ) for orthogonal rotations). CPU keeps the
 //! composed reference path in lib.rs.
+//!
+//! ## Kernel contract
+//!
+//! - Input `x` is `[.., T, D]` with an even head dimension `D`; the
+//!   leading dims are flattened to `rows`, and dim 0 is treated as the
+//!   batch for per-sequence position offsets.
+//! - Both `RotaryLayout::HalfSplit` (GPT-NeoX: pairs `(j, D/2 + j)`)
+//!   and `RotaryLayout::InterleavedPairs` (GPT-J: pairs `(2j, 2j+1)`)
+//!   are supported, selected at pipeline-compile time.
+//! - Angle for pair `j` at position `t` is
+//!   `(offset[batch] + t) * theta^(-2j/D)`, computed in f32 regardless
+//!   of the storage dtype; storage may be f32/f16/bf16.
+//! - `sign = -1.0` yields the transpose rotation, which is the exact
+//!   backward (rotations are orthogonal, so R⁻¹ = Rᵀ = R(−θ)).
+//!
+//! ## Resource contract
+//!
+//! The `*_into` entry points take exactly one f32 staging tensor of
+//! shape `[batch]` (holding the position offsets as f32) and no
+//! status/scratch views. [`requirements`] reports that layout so the
+//! executable planner can pre-allocate the staging view; everything
+//! else (`state_next`, `status`, `scratch`) is zero-sized and exactly
+//! one pipeline is required per (dtype, layout) pair.
 
 use crate::runtime::metal::run::MetalTensor;
 
+/// Static resource requirements of one fused rotary launch, as consumed
+/// by the executable planner to size outputs and staging views before
+/// any dispatch happens.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RotaryRequirements {
+    /// Storage dtype of input and output (f32, f16, or bf16).
     pub dtype: crate::runtime::dtype::DType,
+    /// Byte size of the output tensor (same shape as the input).
     pub output_bytes: usize,
+    /// Bytes of carried state written by the kernel; always 0 (rotary
+    /// is stateless).
     pub state_next_bytes: usize,
+    /// Bytes of staging: one f32 position offset per batch element.
     pub staging_bytes: usize,
+    /// Bytes of status output; always 0 (rotary cannot fail at runtime).
     pub status_bytes: usize,
+    /// Bytes of scratch; always 0 (the kernel needs no workspace).
     pub scratch_bytes: usize,
+    /// Number of compute pipelines used: exactly 1 per (dtype, layout).
     pub pipeline_count: usize,
 }
 
+/// Computes the resource requirements of a fused rotary launch for the
+/// given `dtype` and `shape` (`[.., T, D]`, rank ≥ 2, even `D`).
+///
+/// Returns an error for unsupported dtypes, degenerate shapes, or
+/// element/byte-count overflow.
 pub fn requirements(
     dtype: crate::runtime::dtype::DType,
     shape: &[usize],
@@ -52,6 +91,8 @@ pub fn requirements(
     })
 }
 
+/// Alias of [`requirements`] kept for the executable planner's naming
+/// convention (`<op>_requirements`).
 pub fn rotary_requirements(
     dtype: crate::runtime::dtype::DType,
     shape: &[usize],
@@ -104,13 +145,22 @@ mod metal {
 
     use objc2_metal::MTLComputeCommandEncoder;
 
+    /// Borrowed resource views supplied by the executable planner to
+    /// [`rotary_into`]. Exactly one f32 `[batch]` staging view (the
+    /// position offsets) is required; `status` and `scratch` must be
+    /// empty.
     #[derive(Clone, Copy)]
     pub struct IntoResources<'a> {
+        /// One f32 tensor of shape `[batch]` receiving the offsets.
         pub staging: &'a [MetalTensor],
+        /// Must be empty; rotary reports no runtime status.
         pub status: &'a [MetalTensor],
+        /// Must be empty; rotary needs no scratch workspace.
         pub scratch: &'a [MetalTensor],
     }
 
+    /// Threads per threadgroup; one thread handles one rotated pair
+    /// `(row, t, j)`, so the grid is `rows * T * (D / 2)` threads.
     const NT: usize = 256;
 
     // One thread per (row, t, j): angle = (offset + t) * theta^(-2j/D);
@@ -198,11 +248,16 @@ kernel void et_rotary(
             .ok_or_else(|| "rotary: exact pipeline is not warm; call warm".to_string())
     }
 
+    /// Pre-compiles (or fetches from cache) the rotary pipeline for the
+    /// given `dtype` and pair `layout`, so later `*_into` calls never
+    /// block on the Metal shader compiler.
     pub fn warm(dtype: crate::runtime::dtype::DType, layout: RotaryLayout) -> crate::err::Res<()> {
         pipeline(dtype, layout)?;
         Ok(())
     }
 
+    /// Warms exactly the pipeline described by `requirements`, as
+    /// emitted by the executable planner.
     pub fn warm_exact(
         requirements: &super::RotaryRequirements,
         layout: RotaryLayout,
@@ -211,7 +266,7 @@ kernel void et_rotary(
     }
 
     /// x [.., T, D] -> R(sign·angles) x. `offsets` is one position
-    /// offset per leading-dim-0 batch element (a single [0] for
+    /// offset per leading-dim-0 batch element (a single `[0]` for
     /// absolute positions).
     pub fn rotary_into(
         x: &MetalTensor,
@@ -287,6 +342,14 @@ kernel void et_rotary(
             return Err("rotary: offsets staging view exceeds its buffer".to_string());
         }
         let offset_ptr = unsafe {
+            // SAFETY: `contents_ptr()` on a shared-mode MTLBuffer is a
+            // valid host pointer for the whole buffer; the checks above
+            // guarantee `[offset, offset + batch)` f32 elements lie
+            // within the buffer's allocation. The staging view is
+            // exclusively owned by this dispatch (planner-allocated,
+            // not aliased by any in-flight kernel), and the writes
+            // happen on the host before the encoder submits work that
+            // reads them, so there is no data race.
             offsets_staging
                 .buffer
                 .contents_ptr()
@@ -299,6 +362,9 @@ kernel void et_rotary(
             } else {
                 offsets[index]
             };
+            // SAFETY: `index < batch` and the staging view was validated
+            // to hold at least `batch` f32 elements, so this write is in
+            // bounds of the allocation backing `offset_ptr`.
             unsafe { offset_ptr.add(index).write(value as f32) };
         }
         let pipe = cached_pipeline(x.dtype, layout)?;
@@ -340,6 +406,9 @@ kernel void et_rotary(
         Ok(())
     }
 
+    /// Allocating convenience wrapper: makes `x` contiguous, warms the
+    /// pipeline, allocates the output and the offsets staging view, and
+    /// dispatches via [`rotary_into`]. Used outside planned executables.
     pub fn rotary(
         x: &MetalTensor,
         offsets: &[usize],

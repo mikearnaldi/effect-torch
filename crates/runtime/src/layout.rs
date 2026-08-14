@@ -1,5 +1,28 @@
+//! Tensor shape/stride/offset geometry.
+//!
+//! A [`Layout`] maps logical coordinates to element offsets in a backing
+//! buffer: the offset of coordinate `c` is
+//! `offset + Σ c[d] * strides[d]`, expressed in *elements*, not bytes.
+//!
+//! # Invariants
+//!
+//! - `shape.len() == strides.len()` (enforced by [`Layout::new`] with a
+//!   panic; layouts are compiler-constructed values, so a rank mismatch is
+//!   a bug, not a user error).
+//! - Zero-sized dimensions are allowed; [`Layout::checked_max_index`]
+//!   reports 0 for any layout containing a zero dimension regardless of
+//!   offset or strides, so empty tensors never imply readable storage.
+//! - All size arithmetic has a checked form (`checked_numel`,
+//!   `checked_max_index`, `checked_byte_size`) returning `None` on
+//!   overflow; the panicking forms (`numel`, `max_index`, `byte_size`)
+//!   exist for contexts that have already validated the layout.
+//!
+//! Views (`permute`, `narrow`, `broadcast_to`) share the parent's offset
+//! and strides; `broadcast_to` uses stride 0 for broadcast dimensions.
+
 use crate::DType;
 
+/// Shape, strides (in elements) and element offset of a tensor view.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Layout {
     shape: Vec<usize>,
@@ -8,6 +31,11 @@ pub struct Layout {
 }
 
 impl Layout {
+    /// Creates a layout from explicit parts.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `shape.len() != strides.len()`.
     pub fn new(shape: Vec<usize>, strides: Vec<usize>, offset: usize) -> Self {
         assert_eq!(shape.len(), strides.len());
         Layout {
@@ -17,6 +45,11 @@ impl Layout {
         }
     }
 
+    /// Creates a contiguous (row-major, zero-offset) layout for `shape`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the stride computation overflows `usize`.
     pub fn contiguous(shape: Vec<usize>) -> Self {
         let mut strides = vec![0usize; shape.len()];
         let mut acc = 1usize;
@@ -33,32 +66,47 @@ impl Layout {
         }
     }
 
+    /// Size of each dimension, outermost first.
     pub fn shape(&self) -> &[usize] {
         &self.shape
     }
 
+    /// Element stride of each dimension, matching [`shape`](Self::shape).
     pub fn strides(&self) -> &[usize] {
         &self.strides
     }
 
+    /// Element offset of coordinate zero within the backing buffer.
     pub fn offset(&self) -> usize {
         self.offset
     }
 
+    /// Number of dimensions (may be 0 for a scalar).
     pub fn rank(&self) -> usize {
         self.shape.len()
     }
 
+    /// Total element count.
+    ///
+    /// # Panics
+    ///
+    /// Panics on `usize` overflow; use [`checked_numel`](Self::checked_numel)
+    /// for untrusted shapes.
     pub fn numel(&self) -> usize {
         self.checked_numel().expect("layout element count overflow")
     }
 
+    /// Checked total element count (`None` on overflow). Empty layouts and
+    /// scalars report 0 and 1 respectively.
     pub fn checked_numel(&self) -> Option<usize> {
         self.shape
             .iter()
             .try_fold(1usize, |count, &dim| count.checked_mul(dim))
     }
 
+    /// Whether the layout is densely packed row-major, ignoring dimensions
+    /// of size 1 (whose strides are irrelevant). Returns `false` if the
+    /// running stride product overflows.
     pub fn is_contiguous(&self) -> bool {
         let mut acc = 1usize;
         for d in (0..self.shape.len()).rev() {
@@ -75,6 +123,13 @@ impl Layout {
         true
     }
 
+    /// View with dimensions reordered by `axes` (`axes[i]` is the source
+    /// dimension of output dimension `i`). Shape and strides are permuted;
+    /// the offset is unchanged.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `axes.len() != self.rank()` or any axis is out of range.
     pub fn permute(&self, axes: &[usize]) -> Self {
         assert_eq!(axes.len(), self.rank());
         Layout {
@@ -84,6 +139,14 @@ impl Layout {
         }
     }
 
+    /// View broadcast to a higher-or-equal-rank `shape`. Dimensions of
+    /// size 1 that expand get stride 0; new leading dimensions also get
+    /// stride 0.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `shape` has lower rank, or if a non-1 source dimension
+    /// disagrees with the target.
     pub fn broadcast_to(&self, shape: &[usize]) -> Self {
         assert!(shape.len() >= self.rank());
         let extra = shape.len() - self.rank();
@@ -105,6 +168,12 @@ impl Layout {
         }
     }
 
+    /// View restricted to `start..start + len` along `dim`; the offset is
+    /// advanced by `start * strides[dim]` and strides are preserved.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `dim` is out of range or `start + len > shape[dim]`.
     pub fn narrow(&self, dim: usize, start: usize, len: usize) -> Self {
         assert!(start + len <= self.shape[dim]);
         let mut shape = self.shape.clone();
@@ -116,11 +185,21 @@ impl Layout {
         }
     }
 
+    /// Number of elements a backing buffer must have for this layout:
+    /// `offset + Σ (shape[d] - 1) * strides[d] + 1`.
+    ///
+    /// # Panics
+    ///
+    /// Panics on `usize` overflow; use
+    /// [`checked_max_index`](Self::checked_max_index) for untrusted layouts.
     pub fn max_index(&self) -> usize {
         self.checked_max_index()
             .expect("layout maximum index overflow")
     }
 
+    /// Checked form of [`max_index`](Self::max_index). Returns `Some(0)`
+    /// for layouts with any zero-sized dimension (no storage is addressable)
+    /// and `None` on arithmetic overflow.
     pub fn checked_max_index(&self) -> Option<usize> {
         if self.shape.contains(&0) {
             return Some(0);
@@ -132,16 +211,30 @@ impl Layout {
         index.checked_add(1)
     }
 
+    /// Checked byte size of the smallest buffer holding this layout at the
+    /// given dtype (`checked_max_index * dtype.size_in_bytes()`).
     pub fn checked_byte_size(&self, dtype: DType) -> Option<usize> {
         self.checked_max_index()?.checked_mul(dtype.size_in_bytes())
     }
 
+    /// Byte size of the smallest buffer holding this layout at `dtype`.
+    ///
+    /// # Panics
+    ///
+    /// Panics on `usize` overflow; use
+    /// [`checked_byte_size`](Self::checked_byte_size) for untrusted layouts.
     pub fn byte_size(&self, dtype: DType) -> usize {
         self.checked_byte_size(dtype)
             .expect("layout byte size overflow")
     }
 }
 
+/// Broadcasts two shapes NumPy-style: right-aligned, dimensions must be
+/// equal or 1, missing leading dimensions count as 1.
+///
+/// # Panics
+///
+/// Panics if any pair of dimensions is incompatible.
 pub fn broadcast_shape(a: &[usize], b: &[usize]) -> Vec<usize> {
     let rank = a.len().max(b.len());
     let mut out = vec![1usize; rank];

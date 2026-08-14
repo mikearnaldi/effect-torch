@@ -11,6 +11,8 @@ const values = (t: Tensor.Any) => Tensor.toNumberArray(t)
 
 const scalar = (t: Tensor.Any) => Effect.map(values(t), (v) => v[0])
 
+// Central differences run in f32 on each real backend. The shared epsilon
+// clears f32 rounding while the tolerance covers rounding and O(eps^2) error.
 const gradcheck = (
   f: (x: Tensor.Lazy) => Effect.Effect<Tensor.Lazy, Tensor.TensorError, Runtime.Runtime>,
   input: ReadonlyArray<number>,
@@ -115,8 +117,10 @@ onDevices("Loss", () => (it) => {
     it.effect("chunked head crossEntropy matches the unchunked head", () =>
       Effect.gen(function*() {
         // Force the RFC 0016 phase-2 rewrite on tiny shapes: one row per
-        // chunk. The linear->CE head is chunked + checkpointed; loss and
-        // gradients must match the plain Mean head.
+        // chunk. The fused linear + mean-CE node recomputes logits chunkwise in
+        // backward; loss and gradients must match the unfused graph.
+        // The switches are process-global compiler inputs, so bracket each run
+        // and restore absent variables as absent rather than as string values.
         const withChunkEnv = <A, E, R>(min: string, size: string, effect: Effect.Effect<A, E, R>) =>
           Effect.acquireUseRelease(
             Effect.sync(() => {

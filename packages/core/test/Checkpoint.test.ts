@@ -241,9 +241,36 @@ onDevices("Checkpoint", () => (it) => {
       const optimizer = yield* Optimizer.adamW()
       const p = yield* Tensor.fromTypedArray(floats([1, -1]), [2])
       const state = yield* optimizer.init([p])
+      // Placement identity, not just device type, prevents optimizer state from
+      // becoming a foreign handle when multiple runtime domains are present.
       for (const root of optimizer.stateRoots(state)) {
         expect(root.placement.id).toBe(p.placement.id)
       }
+    }))
+
+  it.effect("rejects invalid checkpoint arity and step before writing", () =>
+    Effect.gen(function*() {
+      const dir = yield* tmpdir
+      const file = path.join(dir, "invalid.safetensors")
+      const model = yield* Model.linear("fc", 2, 1)
+      const optimizer = yield* Optimizer.sgd()
+      const trainer = yield* Trainer.make(model, {
+        optimizer,
+        lr: LearningRate.constant(0.1),
+        loss: Loss.mse,
+        data: {
+          input: yield* Tensor.fromTypedArray(floats([0, 1]), [1, 2]),
+          target: yield* Tensor.fromTypedArray(floats([1]), [1, 1])
+        },
+        stop: () => true
+      })
+      const trained = yield* trainer.train()
+
+      const arity = yield* Effect.flip(Checkpoint.save(file, trainer, { ...trained, params: [] }))
+      expect(arity.message).toContain("parameters")
+      const step = yield* Effect.flip(Checkpoint.save(file, trainer, { ...trained, step: 0x1_0000_0000 }))
+      expect(step.message).toContain("step")
+      expect(fs.existsSync(file)).toBe(false)
     }))
 
   it.effect("fails with TensorError on a missing file", () =>

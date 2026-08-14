@@ -1,35 +1,94 @@
 //! Correctness-first GGML K-quant execution. Each linear output is accumulated
 //! directly from packed blocks, and embedding only visits selected packed rows.
+//!
+//! ## Packed layouts (GGML K-quants)
+//!
+//! Weights are opaque u8 tensors of `[rows, encoded_row_bytes]` where each
+//! row is `columns / 256` consecutive super-blocks of 256 values. Block
+//! sizes per codec: Q2_K 84 B, Q3_K 110 B, Q4_K 144 B, Q5_K 176 B,
+//! Q6_K 210 B. The MSL struct declarations in `LINEAR_SOURCE` mirror
+//! the GGML byte layouts exactly and are guarded by `static_assert`s on
+//! their sizes; `et_decode_k` (per-lane scalar decode) and
+//! `et_decode_k16` (16-value group decode into threadgroup memory) are
+//! the single source of truth for the bit-level formats: sub-block
+//! scales and mins packed at 4–6 bits, quants at 2–6 bits split into
+//! low nibbles plus high-bit masks, with an f16 super-scale `d` (and
+//! `dmin` where the format has one) per block.
+//!
+//! ## Metal SIMD assumptions
+//!
+//! - SIMD width is exactly 32 (`threadExecutionWidth` is asserted at
+//!   warm time); lane indexes drive the sub-block decomposition.
+//! - `et_quantized_linear`: threadgroups of 64 threads (2 simdgroups),
+//!   each simdgroup producing `rows_per_simd(codec)` output rows
+//!   (Q2K/Q4K/Q6K: 2, Q3K: 3, Q5K: 1). Partial dots fold with
+//!   `simd_sum` (decode) or a short `simd_shuffle_xor` tree (batched
+//!   multi-vector variants, `ET_VECTOR_LANES` ∈ {1, 2, 4}).
+//! - `et_quantized_linear_mma`: prefill path for `vectors ≥ 16` and
+//!   large weights — 16×128×64 tiles, blocks decoded to threadgroup
+//!   memory via `et_decode_k16`, then `simdgroup_float8x8` matrix
+//!   multiply-accumulate. Requires 32 KB of threadgroup memory
+//!   (asserted at warm time).
+//! - `et_quantized_embedding`: one threadgroup of 256 threads visits
+//!   only the selected packed rows; out-of-range indexes are skipped
+//!   and reported through a u32 status word (atomic store, relaxed).
+//!
+//! The packed weight must be **zero-offset contiguous** (the kernels
+//! index it byte-wise from the buffer base); input/output are f32.
 
 use crate::runtime::dtype::DType;
 use crate::runtime::metal::run::MetalTensor;
 use effect_torch_runtime::GgmlKQuant;
 
+/// Planner-facing requirements of a fused quantized linear
+/// (`y = x · dequant(W)ᵀ + b`) over packed GGML K-quant weights.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LinearRequirements {
+    /// The K-quant codec of the packed weight.
     pub codec: GgmlKQuant,
+    /// f32 input shape, rank ≥ 2, trailing dim = `columns`.
     pub input_shape: Box<[usize]>,
+    /// f32 output shape (`input_shape` with trailing dim = `rows`).
     pub output_shape: Box<[usize]>,
+    /// Logical weight rows (output width).
     pub rows: usize,
+    /// Logical weight columns (contraction width).
     pub columns: usize,
+    /// Number of input vectors (`numel(input) / columns`).
     pub vectors: usize,
+    /// Bytes of one packed row (`columns / 256 * block_bytes(codec)`).
     pub encoded_row_bytes: usize,
+    /// Whether an f32 `[rows]` bias participates.
     pub has_bias: bool,
+    /// Bytes of the f32 output.
     pub output_bytes: usize,
+    /// 1 when the problem is non-empty, 0 for zero-element outputs
+    /// (no dispatch needed).
     pub pipeline_count: usize,
 }
 
+/// Planner-facing requirements of a quantized embedding gather.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EmbeddingRequirements {
+    /// The K-quant codec of the packed table.
     pub codec: GgmlKQuant,
+    /// Index tensor shape (any rank).
     pub index_shape: Box<[usize]>,
+    /// Index dtype (u32 or i64).
     pub index_dtype: DType,
+    /// f32 output shape (`index_shape ++ [columns]`).
     pub output_shape: Box<[usize]>,
+    /// Table rows.
     pub rows: usize,
+    /// Table columns (embedding width).
     pub columns: usize,
+    /// Number of indexes (`numel(index_shape)`).
     pub indexes: usize,
+    /// Bytes of one packed row.
     pub encoded_row_bytes: usize,
+    /// Bytes of the f32 output.
     pub output_bytes: usize,
+    /// Always 1: a single embedding kernel per launch.
     pub pipeline_count: usize,
 }
 
@@ -65,6 +124,10 @@ fn rows_per_simd(codec: GgmlKQuant) -> usize {
     }
 }
 
+/// Plans a fused quantized linear: validates the f32 input geometry
+/// against the logical `[rows, columns]` weight, requires the packed
+/// weight to be exactly `[rows, encoded_row_bytes]` u8 and the bias
+/// (if any) `[rows]` f32, and computes the exact output plan.
 #[allow(clippy::too_many_arguments)]
 pub fn linear_requirements(
     input_shape: &[usize],
@@ -130,6 +193,9 @@ pub fn linear_requirements(
     })
 }
 
+/// Plans a quantized embedding gather: u32/i64 indexes into a packed
+/// `[rows, encoded_row_bytes]` u8 table, producing f32
+/// `index_shape ++ [columns]`.
 #[allow(clippy::too_many_arguments)]
 pub fn embedding_requirements(
     index_shape: &[usize],
@@ -1131,6 +1197,10 @@ fn cached_pipeline(
         })
 }
 
+/// Selects the linear kernel variant for a plan: MMA tiling for large
+/// prefill (≥16 vectors, vector count a multiple of 16, packed weight
+/// ≥ 16 MiB), batched multi-vector lanes for Q2K/Q3K with ≥4 vectors,
+/// else the plain decode kernel.
 fn linear_kernel_kind(requirements: &LinearRequirements) -> KernelKind {
     if requirements.vectors >= 16
         && requirements.vectors % 16 == 0
@@ -1149,6 +1219,10 @@ fn linear_kernel_kind(requirements: &LinearRequirements) -> KernelKind {
     }
 }
 
+/// Warms exactly the linear pipeline selected by `requirements` and
+/// asserts the Metal SIMD assumptions the kernels rely on (thread
+/// execution width 32, sufficient threadgroup capacity; 32 KB
+/// threadgroup memory for the MMA variant).
 pub fn warm_linear_exact(requirements: &LinearRequirements) -> Result<(), String> {
     if requirements.pipeline_count != 0 {
         use objc2_metal::{MTLComputePipelineState, MTLDevice as _};
@@ -1181,6 +1255,7 @@ pub fn warm_linear_exact(requirements: &LinearRequirements) -> Result<(), String
     Ok(())
 }
 
+/// Warms exactly the embedding pipeline described by `requirements`.
 pub fn warm_embedding_exact(requirements: &EmbeddingRequirements) -> Result<(), String> {
     pipeline(
         KernelKind::Embedding,
@@ -1190,6 +1265,10 @@ pub fn warm_embedding_exact(requirements: &EmbeddingRequirements) -> Result<(), 
     Ok(())
 }
 
+/// Non-allocating quantized linear dispatch: validates every argument
+/// against the immutable plan and encodes the selected kernel.
+/// Allocates nothing; requires the exact pipeline to be warm. A plan
+/// with `pipeline_count == 0` (empty output) is a no-op.
 pub fn linear_into(
     input: &MetalTensor,
     weight: &MetalTensor,
@@ -1243,6 +1322,10 @@ pub fn linear_into(
     Ok(())
 }
 
+/// Non-allocating quantized embedding dispatch: decodes the selected
+/// packed rows into `output` and zeroes then conditionally sets the
+/// u32 `status` word when any index is out of range. Allocates
+/// nothing; requires the exact pipeline to be warm.
 pub fn embedding_into(
     indexes: &MetalTensor,
     weight: &MetalTensor,
@@ -1255,6 +1338,12 @@ pub fn embedding_into(
 
     validate_embedding(indexes, weight, output, status, requirements)?;
     unsafe {
+        // SAFETY: `validate_embedding` just verified that `status` is a
+        // contiguous u32 `[1]` view whose byte range lies within its
+        // buffer, so `contents_ptr() + offset` addresses a valid u32.
+        // The buffer uses shared storage (host-visible), the view is
+        // exclusively owned by this dispatch, and the write lands
+        // before the encoder submits the kernel that reads it.
         status
             .buffer
             .contents_ptr()

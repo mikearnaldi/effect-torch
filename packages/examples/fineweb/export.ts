@@ -4,9 +4,14 @@ import { NodeRuntime } from "@effect/platform-node"
 import { Effect } from "effect"
 import { CHECKPOINT, createGpt, loadTokenizer, saveParams } from "./model.js"
 
-// Exports a training checkpoint as a model artifact: strips the optimizer
-// state, sampler state, and metadata, leaving bare parameter names that
-// infer.ts (or any safetensors consumer) can load. Usage:
+// Converts a compatible AdamW training archive into a bare model artifact.
+// Checkpoint.load reconstructs optimizer state only to decode the archive; the
+// subsequent save emits only model parameter names, omitting optimizer,
+// sampler, step, and metadata entries. Checkpoint.load releases unselected
+// imports; returned parameters/state remain caller-owned for this process. The
+// source has no embedded trainer provenance, so
+// this synthetic trainer must retain the source run's model/optimizer root
+// schema even though it never steps. The output is atomically replaced. Usage:
 //   pnpm tsx fineweb/export.ts <checkpoint.safetensors> [out.safetensors]
 
 const [, , source = new URL("../data/fineweb-epoch-ckpt.safetensors", import.meta.url).pathname, out = CHECKPOINT] =

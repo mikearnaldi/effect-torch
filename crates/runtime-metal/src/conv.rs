@@ -1,3 +1,31 @@
+//! Convolution kernels: conv1d/conv2d, transposed conv1d/conv2d, and
+//! weight-gradient (backward-w) conv1d/conv2d.
+//!
+//! # Design
+//!
+//! Direct convolutions — no im2col, no workspace: one thread per output
+//! element loops over the receptive field, accumulating in f32 regardless
+//! of storage dtype. Input and weight/gradient strides are baked into the
+//! emitted MSL as constant arithmetic, so arbitrary layouts (including
+//! strided views and nonzero offsets) are consumed directly; destinations
+//! must be contiguous. Grouped convolutions decompose channel indices at
+//! emission time.
+//!
+//! # Restrictions
+//!
+//! - dtypes: f16, bf16, and f32 only, and both operands must match.
+//! - 32-bit flat output indexing (one `uint gid` per output element).
+//! - Ranks are fixed: conv1d is [N, C, L] · [O, C/groups, K], conv2d is
+//!   [N, C, H, W] · [O, C/groups, KH, KW]; transposed convs take the
+//!   [C_in, C_out/groups, K...] weight convention.
+//!
+//! # Requirements contract
+//!
+//! `*_requirements` compute the exact output shape/bytes and pipeline
+//! count (convolutions need no scratch or staging); `compile_*_layouts` /
+//! `warm_*_layouts` precompile; the `*_into` entry points validate the
+//! destination, require the warm pipeline, and allocate nothing.
+
 use super::device::{set_buffer, MetalDevice, Pipeline};
 use super::run::MetalTensor;
 use crate::runtime::dtype::DType;
@@ -6,15 +34,19 @@ use objc2_metal::MTLComputeCommandEncoder;
 
 const HEADER: &str = "#include <metal_stdlib>\nusing namespace metal;\n";
 
+/// An exact tensor (contiguous shape + dtype) a convolution requires as
+/// its destination.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TensorRequirement {
     pub shape: Vec<usize>,
     pub dtype: DType,
 }
 
+/// Alias kept for the executable planner's vocabulary.
 pub type BufferRequirement = TensorRequirement;
 
 impl TensorRequirement {
+    /// Byte size of the described tensor, checked for overflow.
     pub fn bytes(&self) -> Result<usize, String> {
         checked_product(&self.shape)?
             .checked_mul(self.dtype.size_in_bytes())
@@ -31,12 +63,19 @@ impl TensorRequirement {
 /// workspace or host staging. Only the destination has to be provided.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConvRequirements {
+    /// The contiguous destination tensor.
     pub output: TensorRequirement,
+    /// `prod(output.shape)`.
     pub output_elements: usize,
+    /// `output_elements * dtype size`.
     pub output_bytes: usize,
+    /// Always zero: direct convolutions need no workspace.
     pub scratch_bytes: usize,
+    /// Always zero: no host staging.
     pub staging_bytes: usize,
+    /// Always zero: no per-invocation status buffer.
     pub status_bytes: usize,
+    /// 1 for a non-empty output, else 0.
     pub pipeline_count: usize,
 }
 
@@ -370,6 +409,8 @@ fn requirements(shape: Vec<usize>, dtype: DType) -> Result<ConvRequirements, Str
     })
 }
 
+/// Validates a conv1d problem ([N, C, L] × [O, C/groups, K]) and returns
+/// the exact output requirement.
 #[allow(clippy::too_many_arguments)]
 pub fn conv1d_requirements(
     x_layout: &Layout,
@@ -399,6 +440,8 @@ pub fn conv1d_requirements(
     )
 }
 
+/// Validates a conv2d problem ([N, C, H, W] × [O, C/groups, KH, KW]) and
+/// returns the exact output requirement.
 #[allow(clippy::too_many_arguments)]
 pub fn conv2d_requirements(
     x_layout: &Layout,
@@ -436,6 +479,8 @@ pub fn conv2d_requirements(
     )
 }
 
+/// Validates a transposed conv1d problem (weights are [C_in,
+/// C_out/groups, K]) and returns the exact output requirement.
 #[allow(clippy::too_many_arguments)]
 pub fn conv_transpose1d_requirements(
     x_layout: &Layout,
@@ -467,6 +512,8 @@ pub fn conv_transpose1d_requirements(
     requirements(vec![x_layout.shape()[0], out_channels, length], dtype)
 }
 
+/// Validates a transposed conv2d problem and returns the exact output
+/// requirement.
 #[allow(clippy::too_many_arguments)]
 pub fn conv_transpose2d_requirements(
     x_layout: &Layout,
@@ -510,6 +557,8 @@ pub fn conv_transpose2d_requirements(
     )
 }
 
+/// Validates a conv1d weight-gradient problem and returns the exact
+/// [O, C/groups, K] output requirement.
 #[allow(clippy::too_many_arguments)]
 pub fn conv1d_backward_w_requirements(
     x_layout: &Layout,
@@ -553,6 +602,8 @@ pub fn conv1d_backward_w_requirements(
     )
 }
 
+/// Validates a conv2d weight-gradient problem and returns the exact
+/// [O, C/groups, KH, KW] output requirement.
 #[allow(clippy::too_many_arguments)]
 pub fn conv2d_backward_w_requirements(
     x_layout: &Layout,
@@ -1041,6 +1092,8 @@ fn dispatch(
     );
 }
 
+/// Dispatches conv1d into `destination`; requires the precompiled pipeline
+/// for the exact layouts and hyperparameters.
 #[allow(clippy::too_many_arguments)]
 pub fn conv1d_into(
     dev: &MetalDevice,
@@ -1070,6 +1123,7 @@ pub fn conv1d_into(
     Ok(())
 }
 
+/// Destination form of [`conv2d`].
 #[allow(clippy::too_many_arguments)]
 pub fn conv2d_into(
     dev: &MetalDevice,
@@ -1099,6 +1153,7 @@ pub fn conv2d_into(
     Ok(())
 }
 
+/// Destination form of [`conv_transpose1d`].
 #[allow(clippy::too_many_arguments)]
 pub fn conv_transpose1d_into(
     dev: &MetalDevice,
@@ -1144,6 +1199,7 @@ pub fn conv_transpose1d_into(
     Ok(())
 }
 
+/// Destination form of [`conv_transpose2d`].
 #[allow(clippy::too_many_arguments)]
 pub fn conv_transpose2d_into(
     dev: &MetalDevice,
@@ -1189,6 +1245,7 @@ pub fn conv_transpose2d_into(
     Ok(())
 }
 
+/// Destination form of [`conv1d_backward_w`].
 #[allow(clippy::too_many_arguments)]
 pub fn conv1d_backward_w_into(
     dev: &MetalDevice,
@@ -1237,6 +1294,7 @@ pub fn conv1d_backward_w_into(
     Ok(())
 }
 
+/// Destination form of [`conv2d_backward_w`].
 #[allow(clippy::too_many_arguments)]
 pub fn conv2d_backward_w_into(
     dev: &MetalDevice,
@@ -1285,6 +1343,7 @@ pub fn conv2d_backward_w_into(
     Ok(())
 }
 
+/// Precompiles the conv1d pipeline for exact layouts/hyperparameters.
 #[allow(clippy::too_many_arguments)]
 pub fn compile_conv1d_layouts(
     dev: &MetalDevice,
@@ -1308,6 +1367,7 @@ pub fn compile_conv1d_layouts(
     Ok(())
 }
 
+/// Precompiles the conv2d pipeline for exact layouts/hyperparameters.
 #[allow(clippy::too_many_arguments)]
 pub fn compile_conv2d_layouts(
     dev: &MetalDevice,
@@ -1331,6 +1391,7 @@ pub fn compile_conv2d_layouts(
     Ok(())
 }
 
+/// Precompiles the transposed conv1d pipeline for exact layouts.
 #[allow(clippy::too_many_arguments)]
 pub fn compile_conv_transpose1d_layouts(
     dev: &MetalDevice,
@@ -1371,6 +1432,7 @@ pub fn compile_conv_transpose1d_layouts(
     Ok(())
 }
 
+/// Precompiles the transposed conv2d pipeline for exact layouts.
 #[allow(clippy::too_many_arguments)]
 pub fn compile_conv_transpose2d_layouts(
     dev: &MetalDevice,
@@ -1411,6 +1473,7 @@ pub fn compile_conv_transpose2d_layouts(
     Ok(())
 }
 
+/// Precompiles the conv1d weight-gradient pipeline for exact layouts.
 #[allow(clippy::too_many_arguments)]
 pub fn compile_conv1d_backward_w_layouts(
     dev: &MetalDevice,
@@ -1454,6 +1517,7 @@ pub fn compile_conv1d_backward_w_layouts(
     Ok(())
 }
 
+/// Precompiles the conv2d weight-gradient pipeline for exact layouts.
 #[allow(clippy::too_many_arguments)]
 pub fn compile_conv2d_backward_w_layouts(
     dev: &MetalDevice,
@@ -1497,6 +1561,7 @@ pub fn compile_conv2d_backward_w_layouts(
     Ok(())
 }
 
+/// [`compile_conv1d_layouts`] against the process-wide device.
 #[allow(clippy::too_many_arguments)]
 pub fn warm_conv1d_layouts(
     x_layout: &Layout,
@@ -1521,6 +1586,7 @@ pub fn warm_conv1d_layouts(
     )
 }
 
+/// [`compile_conv2d_layouts`] against the process-wide device.
 #[allow(clippy::too_many_arguments)]
 pub fn warm_conv2d_layouts(
     x_layout: &Layout,
@@ -1545,6 +1611,7 @@ pub fn warm_conv2d_layouts(
     )
 }
 
+/// [`compile_conv_transpose1d_layouts`] against the process-wide device.
 #[allow(clippy::too_many_arguments)]
 pub fn warm_conv_transpose1d_layouts(
     x_layout: &Layout,
@@ -1571,6 +1638,7 @@ pub fn warm_conv_transpose1d_layouts(
     )
 }
 
+/// [`compile_conv_transpose2d_layouts`] against the process-wide device.
 #[allow(clippy::too_many_arguments)]
 pub fn warm_conv_transpose2d_layouts(
     x_layout: &Layout,
@@ -1597,6 +1665,7 @@ pub fn warm_conv_transpose2d_layouts(
     )
 }
 
+/// [`compile_conv1d_backward_w_layouts`] against the process-wide device.
 #[allow(clippy::too_many_arguments)]
 pub fn warm_conv1d_backward_w_layouts(
     x_layout: &Layout,
@@ -1625,6 +1694,7 @@ pub fn warm_conv1d_backward_w_layouts(
     )
 }
 
+/// [`compile_conv2d_backward_w_layouts`] against the process-wide device.
 #[allow(clippy::too_many_arguments)]
 pub fn warm_conv2d_backward_w_layouts(
     x_layout: &Layout,
@@ -1653,6 +1723,7 @@ pub fn warm_conv2d_backward_w_layouts(
     )
 }
 
+/// [`warm_conv1d_layouts`] for contiguous f32 shapes.
 pub fn warm_conv1d(
     x_shape: &[usize],
     w_shape: &[usize],
@@ -1673,6 +1744,7 @@ pub fn warm_conv1d(
     )
 }
 
+/// [`warm_conv2d_layouts`] for contiguous f32 shapes.
 pub fn warm_conv2d(
     x_shape: &[usize],
     w_shape: &[usize],
@@ -1693,6 +1765,7 @@ pub fn warm_conv2d(
     )
 }
 
+/// [`warm_conv_transpose1d_layouts`] for contiguous f32 shapes.
 #[allow(clippy::too_many_arguments)]
 pub fn warm_conv_transpose1d(
     x_shape: &[usize],
@@ -1716,6 +1789,7 @@ pub fn warm_conv_transpose1d(
     )
 }
 
+/// [`warm_conv_transpose2d_layouts`] for contiguous f32 shapes.
 #[allow(clippy::too_many_arguments)]
 pub fn warm_conv_transpose2d(
     x_shape: &[usize],
@@ -1739,6 +1813,7 @@ pub fn warm_conv_transpose2d(
     )
 }
 
+/// [`warm_conv1d_backward_w_layouts`] for contiguous f32 shapes.
 #[allow(clippy::too_many_arguments)]
 pub fn warm_conv1d_backward_w(
     x_shape: &[usize],
@@ -1764,6 +1839,7 @@ pub fn warm_conv1d_backward_w(
     )
 }
 
+/// [`warm_conv2d_backward_w_layouts`] for contiguous f32 shapes.
 #[allow(clippy::too_many_arguments)]
 pub fn warm_conv2d_backward_w(
     x_shape: &[usize],
@@ -1789,6 +1865,8 @@ pub fn warm_conv2d_backward_w(
     )
 }
 
+/// Allocating conv1d: plans, precompiles, allocates the output, and
+/// dispatches.
 pub fn conv1d(
     dev: &MetalDevice,
     x: &MetalTensor,
@@ -1813,6 +1891,7 @@ pub fn conv1d(
     Ok(output)
 }
 
+/// Allocating conv2d.
 pub fn conv2d(
     dev: &MetalDevice,
     x: &MetalTensor,
@@ -1837,6 +1916,7 @@ pub fn conv2d(
     Ok(output)
 }
 
+/// Allocating transposed conv1d.
 #[allow(clippy::too_many_arguments)]
 pub fn conv_transpose1d(
     dev: &MetalDevice,
@@ -1890,6 +1970,7 @@ pub fn conv_transpose1d(
     Ok(output)
 }
 
+/// Allocating transposed conv2d.
 #[allow(clippy::too_many_arguments)]
 pub fn conv_transpose2d(
     dev: &MetalDevice,
@@ -1943,6 +2024,7 @@ pub fn conv_transpose2d(
     Ok(output)
 }
 
+/// Allocating conv1d weight gradient.
 #[allow(clippy::too_many_arguments)]
 pub fn conv1d_backward_w(
     dev: &MetalDevice,
@@ -2000,6 +2082,7 @@ pub fn conv1d_backward_w(
     Ok(output)
 }
 
+/// Allocating conv2d weight gradient.
 #[allow(clippy::too_many_arguments)]
 pub fn conv2d_backward_w(
     dev: &MetalDevice,

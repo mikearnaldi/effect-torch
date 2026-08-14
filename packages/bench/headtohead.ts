@@ -4,9 +4,17 @@ import { Console, Effect } from "effect"
 import { createRequire } from "node:module"
 import { performance } from "node:perf_hooks"
 
-// @frost-beta/mlx ships its .ts sources, which do not compile under this
-// repo's strict tsconfig — so the package is kept out of the type program
-// and typed minimally by hand. Runtime resolution is unaffected.
+// Median end-to-end comparison of dependent f32 matmul chains on Metal. Both
+// sides explicitly complete each BATCH-deep chain (`toTypedArray` versus
+// `mx.eval`) before the next iteration, and report chain wall time divided by
+// BATCH. effect-torch includes eager graph construction, compile/cache lookup,
+// and host readback; MLX includes graph construction and eval, so this is an API
+// path comparison rather than a kernel-only benchmark. Framework trials run in
+// fixed order and have no explicit untimed chain warmup.
+//
+// @frost-beta/mlx ships TypeScript sources incompatible with this repository's
+// strict type program, so runtime loading stays dynamic and this file declares
+// only the API surface it uses. The optional dependency must be installed.
 interface MlxArray {
   readonly shape: Array<number>
 }

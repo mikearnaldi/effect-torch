@@ -5,9 +5,37 @@
 //! Both are f32/Metal-only execution strategies for the semantic
 //! `Tensor.scaledDotProductAttention` node; CPU references remain the
 //! numerical oracle in tests.
+//!
+//! ## Kernel contracts
+//!
+//! - **Forward** (`et_sdpa_fwd`): one threadgroup of `THREADS` threads
+//!   per (query tile of `TILE_Q` rows, batch·head). Score tiles of
+//!   `TILE_Q × TILE_K` are computed into threadgroup memory, folded
+//!   into the running (max, sum) online softmax, and consumed by the
+//!   P·V accumulation in place. Everything shape-dependent (T, S, D,
+//!   DV, scale, causal, window, GQA group) is baked in as `#define`s
+//!   and keys the pipeline cache. Also writes the per-row f32
+//!   logsumexp `L` for the backward's P recomputation. Causal masking
+//!   is right-aligned (`OFFSET = S - T`); `window` restricts attention
+//!   to `k > q + OFFSET - WINDOW`.
+//! - **Backward** (three dispatches, no atomics):
+//!   `et_sdpa_bwd_d` computes the row dots `D[row] = ⟨G[row], O[row]⟩`
+//!   into f32 scratch; `et_sdpa_bwd_kv` (key-tiled) accumulates dk/dv
+//!   in registers across the full query sweep; `et_sdpa_bwd_q`
+//!   (query-tiled) accumulates dq. Score tiles are recomputed from
+//!   `L` once per tile pair in threadgroup memory and shared by all
+//!   four gradients. Grouped-query attention is **not** differentiable
+//!   and is rejected at plan time.
+//!
+//! The `*_into` entry points validate contiguity/shape/dtype, mark
+//! destinations written, allocate nothing, and require pipelines
+//! pre-warmed via `warm_*_exact`.
 
+/// Query rows per forward threadgroup tile.
 const TILE_Q: usize = 16;
+/// Key rows per tile streamed through the score buffer.
 const TILE_K: usize = 32;
+/// Threads per threadgroup for all flash kernels.
 const THREADS: usize = 128;
 
 #[cfg(test)]
@@ -40,11 +68,17 @@ fn test_counts() -> (usize, usize) {
     )
 }
 
+/// Planner-facing description of one device buffer a launch needs
+/// (shape, dtype, and derived element/byte counts, overflow-checked).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BufferRequirement {
+    /// Logical shape of the buffer.
     pub shape: Vec<usize>,
+    /// Element dtype.
     pub dtype: crate::runtime::dtype::DType,
+    /// Total element count (product of `shape`).
     pub elements: usize,
+    /// Total byte count (`elements.max(1) * dtype.size_in_bytes()`).
     pub bytes: usize,
 }
 
@@ -71,8 +105,10 @@ impl BufferRequirement {
     }
 }
 
+/// Forward dispatch topology: the single tiled online-softmax kernel.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SdpaForwardTopology {
+    /// One launch, threadgroups over (query tiles, batch·heads).
     Flash {
         query_tile: usize,
         key_tile: usize,
@@ -81,22 +117,36 @@ pub enum SdpaForwardTopology {
     },
 }
 
+/// Planner-facing requirements of a flash-attention forward.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SdpaForwardRequirements {
+    /// Attention output (`q_shape` with trailing dim = `value_depth`).
     pub output: BufferRequirement,
+    /// Per-row f32 logsumexp (`q_shape` minus the trailing dim),
+    /// consumed by the backward.
     pub logsumexp: BufferRequirement,
+    /// Selected dispatch topology.
     pub topology: SdpaForwardTopology,
+    /// `batch * heads` folded into one grid dim.
     pub batch_heads: usize,
+    /// GQA group size (`query_heads / kv_heads`; 1 for MHA).
     pub head_group_size: usize,
+    /// Query length `T`.
     pub query_len: usize,
+    /// Key/value length `S`.
     pub key_len: usize,
+    /// Query/key depth `D`.
     pub query_depth: usize,
+    /// Value depth `DV`.
     pub value_depth: usize,
+    /// Storage dtype (f32/f16/bf16).
     pub dtype: crate::runtime::dtype::DType,
 }
 
+/// Backward dispatch topology: the three-pass flash-2 recompute.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SdpaBackwardTopology {
+    /// `et_sdpa_bwd_d`, then `et_sdpa_bwd_kv`, then `et_sdpa_bwd_q`.
     FlashRecompute {
         query_tile: usize,
         key_tile: usize,
@@ -105,18 +155,31 @@ pub enum SdpaBackwardTopology {
     },
 }
 
+/// Planner-facing requirements of a flash-attention backward.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SdpaBackwardRequirements {
+    /// `dq` output (same shape/dtype as `q`).
     pub dq: BufferRequirement,
+    /// `dk` output (same shape/dtype as `k`).
     pub dk: BufferRequirement,
+    /// `dv` output (same shape/dtype as `v`).
     pub dv: BufferRequirement,
+    /// f32 row-dot scratch `D[row] = ⟨G[row], O[row]⟩`
+    /// (`q_shape` minus the trailing dim), shared by all three passes.
     pub d_vec_scratch: BufferRequirement,
+    /// Selected dispatch topology.
     pub topology: SdpaBackwardTopology,
+    /// `batch * heads` folded into one grid dim.
     pub batch_heads: usize,
+    /// Query length `T`.
     pub query_len: usize,
+    /// Key/value length `S`.
     pub key_len: usize,
+    /// Query/key depth `D`.
     pub query_depth: usize,
+    /// Value depth `DV`.
     pub value_depth: usize,
+    /// Storage dtype (f32/f16/bf16).
     pub dtype: crate::runtime::dtype::DType,
 }
 
@@ -223,6 +286,9 @@ mod metal {
         Ok((bh, t, s, d, dv, group))
     }
 
+    /// Plans a flash forward: validates the q/k/v geometry (shared
+    /// leading dims, GQA divisibility, matching depths) and sizes the
+    /// output and logsumexp buffers.
     pub fn forward_requirements(
         q_shape: &[usize],
         k_shape: &[usize],
@@ -258,6 +324,8 @@ mod metal {
         })
     }
 
+    /// Plans a flash backward; rejects grouped-query attention (not
+    /// differentiable in this implementation).
     pub fn backward_requirements(
         q_shape: &[usize],
         k_shape: &[usize],
@@ -556,6 +624,8 @@ kernel void et_sdpa_fwd(
             })
     }
 
+    /// Warms the forward pipeline for the given shapes, scale, masking,
+    /// and dtype.
     pub fn warm_forward(
         q_shape: &[usize],
         k_shape: &[usize],
@@ -569,6 +639,9 @@ kernel void et_sdpa_fwd(
         warm_forward_exact(&requirements, scale, causal, window)
     }
 
+    /// Warms exactly the forward pipeline described by `requirements`
+    /// plus the runtime (`scale`, `causal`, `window`) parameters, all
+    /// of which are baked into the pipeline key.
     pub fn warm_forward_exact(
         requirements: &SdpaForwardRequirements,
         scale: f64,
@@ -589,6 +662,10 @@ kernel void et_sdpa_fwd(
         Ok(())
     }
 
+    /// Non-allocating flash forward dispatch: writes the attention
+    /// output and the per-row f32 `logsumexp`. All tensors contiguous;
+    /// pipeline must be warm for the exact (shape, scale, causal,
+    /// window, dtype) combination.
     #[allow(clippy::too_many_arguments)]
     pub fn forward_into(
         q: &MetalTensor,
@@ -662,6 +739,8 @@ kernel void et_sdpa_fwd(
         Ok(())
     }
 
+    /// Allocating convenience wrapper around [`forward_into`]; returns
+    /// `(output, logsumexp)`.
     pub fn forward(
         q: &MetalTensor,
         k: &MetalTensor,
@@ -1042,6 +1121,8 @@ kernel void et_sdpa_bwd_q(
             })
     }
 
+    /// Warms the three backward pipelines for the given shapes, scale,
+    /// masking, and dtype.
     pub fn warm_backward(
         q_shape: &[usize],
         k_shape: &[usize],
@@ -1055,6 +1136,9 @@ kernel void et_sdpa_bwd_q(
         warm_backward_exact(&requirements, scale, causal, window)
     }
 
+    /// Warms exactly the three backward pipelines described by
+    /// `requirements` plus the runtime (`scale`, `causal`, `window`)
+    /// parameters.
     pub fn warm_backward_exact(
         requirements: &SdpaBackwardRequirements,
         scale: f64,
@@ -1074,6 +1158,11 @@ kernel void et_sdpa_bwd_q(
         Ok(())
     }
 
+    /// Non-allocating fused backward dispatch: given the forward's
+    /// output `o`, logsumexp `l`, and cotangent `g`, writes `dq`, `dk`,
+    /// `dv_out` and the `d_vec_scratch` row dots. All three pipelines
+    /// are resolved before any work is encoded, so a partial warmup
+    /// fails without a partially encoded operation. Allocates nothing.
     #[allow(clippy::too_many_arguments)]
     pub fn backward_fused_into(
         q: &MetalTensor,
@@ -1236,6 +1325,8 @@ kernel void et_sdpa_bwd_q(
         Ok(())
     }
 
+    /// Allocating convenience wrapper around [`backward_fused_into`];
+    /// returns `(dq, dk, dv)`.
     #[allow(clippy::too_many_arguments)]
     pub fn backward_fused(
         q: &MetalTensor,

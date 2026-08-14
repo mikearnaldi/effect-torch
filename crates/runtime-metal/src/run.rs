@@ -1,3 +1,34 @@
+//! [`MetalTensor`] and the fused elementwise/reduction runners.
+//!
+//! A `MetalTensor` is a buffer view plus a logical layout and dtype.
+//! Elementwise and reduction operations are executed by kernels
+//! synthesized per exact expression (`emit` module): the fusion IR is
+//! compiled to MSL once, cached under a structural hash key, and the
+//! runners only bind buffers and dispatch.
+//!
+//! # API shape
+//!
+//! Every operation comes in three layers:
+//!
+//! - `compile_*`/`warm_*` — emit and cache the pipeline for an exact
+//!   expression/layout without allocating or dispatching.
+//! - `run_*` — allocate destination tensors and dispatch (compiles on a
+//!   cache miss).
+//! - `run_*_into` — dispatch into caller-provided destinations; requires
+//!   the exact pipeline to be precompiled and performs no allocation, so
+//!   it is legal during executable dispatch.
+//!
+//! The `*_prekeyed` variants take a precomputed pipeline key so hot paths
+//! skip expression hashing and source emission entirely.
+//!
+//! # Dispatch conventions
+//!
+//! Grids are flat: one thread per output element, padded to the
+//! [`emit::BLOCK`] threadgroup size, widening to a 2-D grid with 64-bit
+//! indexing past `u32::MAX` elements. Buffer binding order is inputs,
+//! then the packed scalar buffer (if any), then outputs. All inputs must
+//! share one dtype (f32 or bf16) and all destinations must be contiguous.
+
 use super::device::{set_buffer, MetalDevice};
 use super::emit;
 use crate::fusion::{Expr, ReduceOp};
@@ -5,6 +36,9 @@ use crate::runtime::dtype::DType;
 use objc2_metal::MTLComputeCommandEncoder;
 use std::sync::Arc;
 
+/// A Metal tensor: shared buffer storage, a logical layout (shape,
+/// strides, element offset), and a dtype. Cloning is cheap — views share
+/// the buffer's physical allocation.
 #[derive(Clone)]
 pub struct MetalTensor {
     pub buffer: Arc<super::device::Buffer>,
@@ -13,6 +47,7 @@ pub struct MetalTensor {
 }
 
 impl MetalTensor {
+    /// Uploads f32 host data as a contiguous tensor.
     pub fn from_f32(dev: &MetalDevice, data: Vec<f32>, shape: Vec<usize>) -> Self {
         MetalTensor {
             buffer: dev.alloc_with_data(&data),
@@ -21,6 +56,8 @@ impl MetalTensor {
         }
     }
 
+    /// Allocates a contiguous tensor and asynchronously fills it with
+    /// zeros on the current submission stream.
     pub fn zeros(dev: &MetalDevice, shape: Vec<usize>, dtype: DType) -> Self {
         let n: usize = shape.iter().product();
         let buffer = dev.alloc(n.max(1), dtype);
@@ -49,10 +86,15 @@ impl MetalTensor {
         }
     }
 
+    /// Number of logical elements in the layout.
     pub fn numel(&self) -> usize {
         self.layout.numel()
     }
 
+    /// Validates `self` as the destination of `operation`: exact shape and
+    /// dtype, contiguous layout, in-bounds byte range — then registers the
+    /// current stream as the buffer's next writer (cross-stream hazard
+    /// synchronization).
     pub(crate) fn validate_destination(
         &self,
         operation: &str,
@@ -88,21 +130,32 @@ impl MetalTensor {
         Ok(())
     }
 
+    /// Synchronizes the producer stream and reads the logical contents
+    /// back to the host as f32.
     pub fn read_f32(&self) -> crate::err::Res<Vec<f32>> {
         crate::runtime::metal::device::MetalDevice::get().synchronize_buffer(&self.buffer)?;
         Ok(self.buffer.read_f32(self.layout.offset(), self.numel()))
     }
 
+    /// Synchronizes the producer stream and reads the contents back as
+    /// u32, widening from u8 or truncating from i64. Other dtypes are
+    /// rejected.
     pub fn to_u32_vec(&self) -> crate::err::Res<Vec<u32>> {
         crate::runtime::metal::device::MetalDevice::get().synchronize_buffer(&self.buffer)?;
         let n = self.numel();
         let size = self.dtype.size_in_bytes();
+        // SAFETY: synchronize_buffer above guarantees the GPU is done
+        // writing; the buffer is shared-mode so contents_ptr is a valid
+        // host mapping, and `offset * size + n * size` is within the
+        // logical tensor, which validate/alloc guarantees fits the buffer.
         let ptr = unsafe {
             self.buffer
                 .contents_ptr()
                 .cast::<u8>()
                 .add(self.layout.offset() * size)
         };
+        // SAFETY: `ptr` is valid for `n * size` bytes per the argument
+        // above.
         let bytes = unsafe { std::slice::from_raw_parts(ptr, n * size) };
         let mut out = Vec::with_capacity(n);
         match self.dtype {
@@ -121,6 +174,9 @@ impl MetalTensor {
     }
 }
 
+/// Structural pipeline cache key for a fused elementwise kernel: the
+/// expressions, per-input lane strides, output shape, element count,
+/// scalar count, and dtype.
 pub fn elementwise_key(
     exprs: &[Expr],
     lane_strides: &[Vec<usize>],
@@ -140,6 +196,7 @@ pub fn elementwise_key(
     hasher.finish()
 }
 
+/// Structural pipeline cache key for a fused reduction kernel.
 #[allow(clippy::too_many_arguments)]
 pub fn reduce_key(
     op: ReduceOp,
@@ -193,6 +250,7 @@ pub fn compile_elementwise(
     Ok(())
 }
 
+/// [`compile_elementwise`] against the process-wide device.
 pub fn warm_elementwise(
     dev: &MetalDevice,
     exprs: &[Expr],
@@ -248,6 +306,7 @@ pub fn compile_reduce(
     Ok(())
 }
 
+/// [`compile_reduce`] against the process-wide device.
 #[allow(clippy::too_many_arguments)]
 pub fn warm_reduce(
     dev: &MetalDevice,
@@ -273,6 +332,9 @@ pub fn warm_reduce(
     )
 }
 
+/// Allocates one destination per expression and runs the fused
+/// elementwise kernel, uploading `scalars` as the packed scalar buffer.
+#[allow(clippy::too_many_arguments)]
 pub fn run_elementwise(
     dev: &MetalDevice,
     exprs: &[Expr],
@@ -310,6 +372,8 @@ pub fn run_elementwise(
 
 // Same kernel as run_elementwise, but the packed scalar buffer is supplied
 // directly (already device-resident) — no host readback anywhere.
+/// Allocates destinations and dispatches the fused kernel with a
+/// device-resident scalar buffer (no host upload).
 #[allow(clippy::too_many_arguments)]
 pub fn run_elementwise_scalar_buf(
     dev: &MetalDevice,
@@ -337,6 +401,8 @@ pub fn run_elementwise_scalar_buf(
 
 // Fully prekeyed: no expr hashing, no source emission unless the pipeline
 // cache actually misses.
+/// Allocates destinations and dispatches the fused kernel for a
+/// precomputed pipeline `key` (compiling only on an actual cache miss).
 #[allow(clippy::too_many_arguments)]
 pub fn run_elementwise_prekeyed(
     dev: &MetalDevice,
@@ -382,6 +448,9 @@ pub fn run_elementwise_prekeyed(
     Ok(out_bufs)
 }
 
+/// Dispatches the fused elementwise kernel into caller-provided
+/// destinations, computing the pipeline key from the arguments. The exact
+/// pipeline must be precompiled; no allocation happens here.
 #[allow(clippy::too_many_arguments)]
 pub fn run_elementwise_into(
     dev: &MetalDevice,
@@ -413,6 +482,10 @@ pub fn run_elementwise_into(
     )
 }
 
+/// [`run_elementwise_into`] with a precomputed pipeline key. Validates
+/// the input/stride/expression/destination counts and every destination,
+/// then binds inputs, scalars, and outputs in declaration order and
+/// dispatches one thread per (padded) output element.
 #[allow(clippy::too_many_arguments)]
 pub fn run_elementwise_into_prekeyed(
     dev: &MetalDevice,
@@ -512,6 +585,8 @@ pub fn run_elementwise_into_prekeyed(
     Ok(())
 }
 
+/// Allocates the reduction output and dispatches the fused reduce kernel
+/// (compiling on a cache miss).
 #[allow(clippy::too_many_arguments)]
 pub fn run_reduce(
     dev: &MetalDevice,
@@ -552,6 +627,10 @@ pub fn run_reduce(
     Ok(out)
 }
 
+/// Dispatches the fused reduce kernel into a caller-provided contiguous
+/// destination. The exact pipeline must be precompiled via
+/// [`compile_reduce`]; one thread per output element loops over the
+/// (flattened) reduced dimensions.
 #[allow(clippy::too_many_arguments)]
 pub fn run_reduce_into(
     dev: &MetalDevice,

@@ -5,13 +5,18 @@ import { parquetMetadataAsync, parquetReadObjects } from "hyparquet"
 import { compressors } from "hyparquet-compressors"
 import fs from "node:fs"
 
-// FineWeb-Edu (sample-10BT, shard 000) → GPT-2 BPE token bins. Each
-// document is encoded and terminated by <|endoftext|> (id 50256, parsed
-// as a special token because the config is specialTokens: "Always");
-// ids fit u16 (vocab 50257), so the bins are plain little-endian u16 —
-// the same flat format nano-gpt trains from. Split is positional: the
-// first 99% of rows is train, the last 1% val (the shard is a random
-// sample, so position is an unbiased cut).
+// Converts FineWeb-Edu sample-10BT shard 000 into the flat token streams
+// consumed by the training examples. Each document is encoded independently
+// and terminated by <|endoftext|> (id 50256); `specialTokens: "Always"`
+// makes that sentinel a registered token rather than ordinary text. GPT-2's
+// 50,257 ids fit u16, so the output is headerless little-endian u16.
+//
+// The split is positional and nominally 99/1, but writes are kept whole at
+// processing-chunk boundaries. If `splitRow` falls inside a chunk, that entire
+// chunk goes to train; for the bundled 1,000-row groups validation therefore
+// begins at row 719,000 rather than the exact row 718,740. Output files are
+// truncated in place, not transactionally replaced, so interruption leaves
+// partial bins that have no embedded length or completion metadata.
 
 const PARQUET = new URL("../data/fineweb-10BT-000.parquet", import.meta.url).pathname
 const TOKENIZER_JSON = new URL("../data/gpt2-tokenizer.json", import.meta.url).pathname
@@ -20,9 +25,8 @@ const VAL_BIN = new URL("../data/fineweb-val.bin", import.meta.url).pathname
 const EOT = "<|endoftext|>"
 const VAL_FRACTION = 0.01
 
-// hyparquet reads through an AsyncBuffer; backed by the file descriptor
-// so the 2.15GB shard never materializes in memory — each slice() reads
-// exactly the column chunks of the requested rows.
+// This random-access AsyncBuffer lets hyparquet request byte ranges from the
+// descriptor instead of materializing the multi-GB parquet file in JavaScript.
 const parquetFile = (path: string) => {
   const fd = fs.openSync(path, "r")
   return {
@@ -41,7 +45,8 @@ const program = Effect.gen(function*() {
   const metadata = yield* Effect.tryPromise(() => parquetMetadataAsync(file))
   const rows = Number(metadata.num_rows)
   const splitRow = Math.floor(rows * (1 - VAL_FRACTION))
-  // One parquet row group per step: reads and tokenization stay chunked.
+  // The bundled shard has equal-sized row groups, so this count aligns each
+  // read and tokenization batch with one group.
   const group = Math.ceil(rows / metadata.row_groups.length)
   yield* Effect.log(`fineweb-prepare: ${rows} documents, split at row ${splitRow}`)
 

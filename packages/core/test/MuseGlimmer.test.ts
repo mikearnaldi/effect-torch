@@ -23,6 +23,9 @@ const configEntries = [
 
 const config = (): Registry.ModelConfig => new Map<string, unknown>(configEntries)
 
+// This shape-only runtime records graph requests and fabricates coherent handles;
+// it deliberately cannot compile or execute. Model validation still observes the
+// declared placement, dtype, and shape, so topology checks exercise the real API.
 const placement: Runtime.Placement = Object.freeze({
   id: "muse-test:0",
   deviceType: "test",
@@ -56,6 +59,7 @@ const handle = (
     }
   }) as unknown as Tensor.Any
 
+// Topology tests clear this module-local log immediately before building a graph.
 const requests: Array<Runtime.NodeRequest> = []
 
 const runtime = {
@@ -125,6 +129,8 @@ const runtime = {
 
 const runtimeLayer = Layer.succeed(Runtime.Runtime, runtime)
 
+// Rank-two parameters carry encoded storage so the graph takes quantized
+// embedding/linear paths without allocating the canonical model's huge weights.
 const modelParams = (parameters: ReadonlyArray<{ readonly shape: ReadonlyArray<number> }>): Array<Tensor.Any> =>
   parameters.map(({ shape }) =>
     handle(
@@ -192,11 +198,21 @@ it.effect("validates canonical configuration with Schema", () =>
       "attention.head_count"
     )
 
+    const oversizedBlocks = new Map(config())
+    oversizedBlocks.set("block_count", 1025)
+    expect((yield* Effect.flip(MuseGlimmer.architecture.create(oversizedBlocks))).message).toContain("block_count")
+
     const invalidRope = new Map(config())
     invalidRope.set("attention.key_length", 127)
     expect((yield* Effect.flip(MuseGlimmer.architecture.create(invalidRope))).message).toContain(
       "attention.key_length"
     )
+
+    const invalidValueWidth = new Map(config())
+    invalidValueWidth.set("attention.value_length", 126)
+    const invalidValueWidthError = yield* Effect.flip(MuseGlimmer.architecture.create(invalidValueWidth))
+    expect(invalidValueWidthError.message).toContain("attention.value_length")
+    expect(invalidValueWidthError.message).toContain("attention.key_length")
 
     const invalidWindow = new Map(config())
     invalidWindow.set("attention.sliding_window", 131073)
@@ -215,7 +231,7 @@ it.effect("derives the parameter catalog and graph from configuration", () =>
       ["attention.head_count", 2],
       ["attention.head_count_kv", 1],
       ["attention.key_length", 4],
-      ["attention.value_length", 3],
+      ["attention.value_length", 4],
       ["attention.layer_norm_rms_epsilon", 1e-4],
       ["attention.sliding_window", 8],
       ["attention.sliding_window_pattern", 2],
@@ -233,11 +249,11 @@ it.effect("derives the parameter catalog and graph from configuration", () =>
       { name: "blk.0.post_attention_norm.weight", shape: [8] },
       { name: "blk.0.attn_q.weight", shape: [8, 8] },
       { name: "blk.0.attn_k.weight", shape: [4, 8] },
-      { name: "blk.0.attn_v.weight", shape: [3, 8] },
+      { name: "blk.0.attn_v.weight", shape: [4, 8] },
       { name: "blk.0.attn_q_norm.weight", shape: [4] },
       { name: "blk.0.attn_k_norm.weight", shape: [4] },
-      { name: "blk.0.attn_gate.weight", shape: [6, 8] },
-      { name: "blk.0.attn_output.weight", shape: [8, 6] },
+      { name: "blk.0.attn_gate.weight", shape: [8, 8] },
+      { name: "blk.0.attn_output.weight", shape: [8, 8] },
       { name: "blk.0.ffn_norm.weight", shape: [8] },
       { name: "blk.0.post_ffw_norm.weight", shape: [8] },
       { name: "blk.0.ffn_gate.weight", shape: [16, 8] },

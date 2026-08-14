@@ -7,7 +7,7 @@ import { floats, GRADCHECK_EPS, GRADCHECK_TOL, onDevices } from "./utils/devices
 const values = (t: Tensor.Any) => Tensor.toNumberArray(t)
 
 // f32 accumulation orders differ between the composed chunk kernels and
-// the per-token oracle; 70 recurrent steps stay well within this.
+// the per-token oracle; the 129-step fixture stays within this relative bound.
 const TOL = 2e-3
 const close = (a: number, b: number): boolean => Math.abs(a - b) <= TOL * Math.max(1, Math.abs(b))
 
@@ -145,6 +145,8 @@ onDevices("Kda", (device) => (it) => {
         for (let which = 0; which < 5; which++) {
           const vals = yield* values(operands[which])
           const gradVals = yield* values(analytic[which])
+          // Probe boundaries and interior positions in every operand; exhaustive
+          // finite differences would rebuild the recurrent graph per element.
           const probes = [...new Set([0, 3, 7, 13, 19, Math.floor(vals.length / 2), vals.length - 1])]
             .filter((i) => i < vals.length)
           for (const i of probes) {

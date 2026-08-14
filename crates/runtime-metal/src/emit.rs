@@ -1,6 +1,36 @@
+//! First-party fusion IR → MSL emitter.
+//!
+//! Emits one specialized compute kernel per fused expression set
+//! (elementwise) or per reduction. Conventions:
+//!
+//! - **SSA form.** Expressions compile to flat `float tN = ...;`
+//!   temporaries, not nested parentheses: deep chains would exceed MSL's
+//!   bracket nesting limit, and temporaries dedupe shared subtrees
+//!   (memoized by node address). Emission is an iterative post-order walk
+//!   so kernel compilation never multiplies expression depth by the host
+//!   call stack.
+//! - **Clamped flat index.** Each kernel takes a thread-position parameter
+//!   and clamps it to `n - 1` instead of early-returning, so padded grids
+//!   are safe without divergent control flow. Past `u32::MAX` elements the
+//!   index widens to `ulong` over a 2-D grid of width [`WIDE`].
+//! - **Dtypes.** The IR only models float math: f32 lanes load/store
+//!   directly, bf16 lanes convert at the boundary (`float(...)` in,
+//!   `bfloat(...)` out). Any other storage dtype is an emitter bug
+//!   (`unreachable!`).
+//! - **Strides baked in.** Per-input lane offsets are emitted as constant
+//!   arithmetic on the output coordinates; a layout change is a different
+//!   kernel and a different pipeline key.
+//! - **Buffer binding order.** `in0..inK`, optional `scs` (packed f32
+//!   scalars), then `out0..outJ`, matching what the runners bind.
+//! - **Literals.** f32 constants are emitted via `{:e}` with explicit
+//!   handling of inf/NaN, so emitted source round-trips bit-exactly and
+//!   never depends on locale formatting.
+
 use super::device::MetalDevice;
 use crate::fusion::{Expr, ReduceOp};
 
+/// Threadgroup width (and grid padding quantum) for all flat fused
+/// kernels.
 pub const BLOCK: usize = 256;
 
 /// Grid width of 64-bit kernels: flat index = gid.y * WIDE + gid.x.
@@ -297,6 +327,8 @@ const PREAMBLE: &str = r#"
 using namespace metal;
 "#;
 
+/// Emits the fused multi-output elementwise kernel source: one thread per
+/// output element computes every expression from the strided input lanes.
 pub fn emit_elementwise(
     exprs: &[Expr],
     lane_strides: &[Vec<usize>],
@@ -350,6 +382,9 @@ pub fn emit_elementwise(
     src
 }
 
+/// Emits the fused reduction kernel source: one thread per output element
+/// accumulates the expression over the flattened reduced dimensions, in a
+/// fixed order (deterministic).
 #[allow(clippy::too_many_arguments)]
 pub fn emit_reduce(
     op: ReduceOp,

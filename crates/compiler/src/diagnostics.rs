@@ -1,9 +1,32 @@
+//! Compiler observability: structural work reports and executable
+//! diagnostics assembled from the pipeline's authoritative artifacts.
+//!
+//! Two distinct families of numbers live here, with a hard boundary between
+//! them:
+//!
+//! - **Structural counters** ([`CompilerWorkReport`], [`PassScanCount`]):
+//!   exact, deterministic tallies of what the compiler did — nodes indexed,
+//!   edges visited, passes scanned, regions selected, values and
+//!   instructions lowered. These are combined only from the authoritative
+//!   artifacts (graph index, optimization plan, lowered program), never
+//!   re-measured.
+//! - **Observational timings** (`CompilePhaseTiming` lists): wall-clock
+//!   measurements carried alongside the structural data. They must never
+//!   influence cache identity, equality, or hashing of any artifact.
+//!
+//! Executable diagnostics additionally present instruction-kind histograms
+//! in lexical order so reports are stable regardless of backend map
+//! implementations or insertion order.
+
 use crate::{GraphIndex, LoweredProgram, OptimizationWork};
 use effect_torch_runtime::{
     CompilePhaseTiming, ExecutableDiagnostics, InstructionCount, MemoryPlan,
 };
 use std::collections::BTreeMap;
 
+/// Counts measured by the backend driver outside the compiler's structural
+/// artifacts: pipeline/command/synchronization totals plus the phase timings
+/// to attach to the report.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct DiagnosticsInput {
     pub pipeline_count: usize,
@@ -12,6 +35,7 @@ pub struct DiagnosticsInput {
     pub compile_phases: Vec<CompilePhaseTiming>,
 }
 
+/// Semantic-node visits attributed to one named pass or pass group.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct PassScanCount {
     pub pass: String,
@@ -82,11 +106,16 @@ impl CompilerWorkReport {
         }
     }
 
+    /// Overrides the pass-scan list (used when a backend attributes scans
+    /// more finely than the default single "optimization" entry).
     pub fn with_pass_scans(mut self, pass_scans: impl Into<Box<[PassScanCount]>>) -> Self {
         self.pass_scans = pass_scans.into();
         self
     }
 
+    /// Attaches observational phase timings. These travel with the report
+    /// but are excluded from its `Eq` semantics' intent: they are
+    /// diagnostics, never identity.
     pub fn with_compile_phases(
         mut self,
         compile_phases: impl Into<Box<[CompilePhaseTiming]>>,

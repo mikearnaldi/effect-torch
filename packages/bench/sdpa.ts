@@ -1,3 +1,11 @@
+// End-to-end Metal bf16 causal-SDPA latency at one fixed transformer shape.
+// The untimed call warms compilation and pipelines. Each measured `toTypedArray`
+// evaluates a newly built eager graph, including fresh randn+bf16 q/k/v inputs,
+// and reads the full result to the host. Timing therefore includes graph
+// construction, compile/cache lookup, input generation, completed execution,
+// and readback rather than device-only attention time. ITERS is an unvalidated
+// environment override.
+
 import * as BackendApple from "@effect-torch/backend-apple-native"
 import { Tensor } from "@effect-torch/core"
 import { Console, Effect } from "effect"

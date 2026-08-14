@@ -1,8 +1,23 @@
+//! Tensor factories and pseudo-random generation.
+//!
+//! Deterministic factories (`arange`, `eye`) and random factories (`randn`,
+//! `uniform`) share the requirements/into/wrapper contract of the rest of the
+//! crate. Random values come from a process-global `xoroshiro128+` generator
+//! behind a mutex; [`reseed`] replaces its state. `randn` uses the
+//! Box–Muller transform with `u1` clamped away from zero.
+//!
+//! The executor does not use the global stream: it calls the seeded
+//! `*_seeded_into` variants with a per-invocation, per-node seed so compiled
+//! programs are reproducible regardless of global RNG state.
+
 use super::tensor::{CpuDestination, CpuOperationRequirements, CpuTensorRequirement, Elem, Tensor};
 use effect_torch_runtime::DType;
 use half::{bf16, f16};
 use std::sync::Mutex;
 
+/// xoroshiro128+ PRNG. The two 64-bit state words are seeded from a single
+/// `u64` by running an LCG-style bit mixer (xor-shift steps over a
+/// golden-ratio offset) twice.
 struct Xoroshiro128Plus {
     s0: u64,
     s1: u64,
@@ -33,6 +48,7 @@ impl Xoroshiro128Plus {
         result
     }
 
+    /// Next uniform double in `[0, 1)` (53-bit mantissa).
     fn next_f64(&mut self) -> f64 {
         (self.next_u64() >> 11) as f64 * (1.0 / 9007199254740992.0)
     }
@@ -40,12 +56,15 @@ impl Xoroshiro128Plus {
 
 static RNG: Mutex<Option<Xoroshiro128Plus>> = Mutex::new(None);
 
+/// Borrows the global generator, lazily seeding it with a fixed default
+/// (299792458) so unseeded runs are still reproducible within a process.
 fn with_rng<T>(function: impl FnOnce(&mut Xoroshiro128Plus) -> T) -> T {
     let mut guard = RNG.lock().unwrap();
     let rng = guard.get_or_insert_with(|| Xoroshiro128Plus::new(299792458));
     function(rng)
 }
 
+/// Replaces the global generator state with a fresh stream seeded by `seed`.
 pub fn reseed(seed: u64) {
     let mut guard = RNG.lock().unwrap();
     *guard = Some(Xoroshiro128Plus::new(seed));
@@ -184,6 +203,8 @@ impl Tensor {
         &[]
     }
 
+    /// Writes `start + i * step` into `destination`, whose length must equal
+    /// `ceil((end - start) / step)` (clamped at zero; `step` must be non-zero).
     pub fn arange_into(
         start: f64,
         end: f64,
@@ -219,6 +240,7 @@ impl Tensor {
         &[]
     }
 
+    /// Writes the `n × n` identity matrix into a square rank-2 destination.
     pub fn eye_into(destination: &mut CpuDestination<'_>) -> Result<(), String> {
         if destination.shape().len() != 2 || destination.shape()[0] != destination.shape()[1] {
             return Err(format!(
@@ -255,6 +277,8 @@ impl Tensor {
         &[]
     }
 
+    /// Fills `destination` with standard-normal samples from the global
+    /// stream (Box–Muller on `f64`, narrowed to the destination dtype).
     pub fn randn_into(destination: &mut CpuDestination<'_>) -> Result<(), String> {
         with_rng(|rng| randn_with_rng_into(destination, rng))
     }
@@ -297,6 +321,8 @@ impl Tensor {
         &[]
     }
 
+    /// Fills `destination` with samples uniform in `[lo, hi)` from the
+    /// global stream.
     pub fn uniform_into(
         lo: f64,
         hi: f64,

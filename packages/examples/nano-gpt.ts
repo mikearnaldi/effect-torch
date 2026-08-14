@@ -4,16 +4,12 @@ import * as Tokenizer from "@effect-torch/tokenizers"
 import { NodeRuntime } from "@effect/platform-node"
 import { Duration, Effect, Option } from "effect"
 
-// A GPT with a Unigram tokenizer (byte fallback, trained on the fly,
-// RFC 0009) on a few KB of public-domain verse: token embeddings,
-// pre-norm transformer blocks (causal multi-head attention with RoPE +
-// MLP, each under a residual connection), a final layer norm and a
-// vocabulary head. Everything is the stock Model combinators; training
-// attention is the fused flash kernel on Metal. Generation runs through
-// the compiled inference artifact (RFC 0010): paged kv cache, chunked
-// prefill, one pooled step per token, sliding-window attention over the
-// last BLOCK positions with dead blocks evicted — RoPE makes positions
-// relative, so generation is unbounded at O(BLOCK) footprint.
+// End-to-end GPT lifecycle on a small in-memory corpus: train a Unigram
+// tokenizer, construct a pre-norm RoPE transformer, train one compiled step
+// signature, then freeze the learned parameters into fixed-shape prefill and
+// decode artifacts. Inference uses a fixed 4,096-row paged pool; limiting every
+// attention layer to BLOCK cached positions permits eviction and lets the
+// logical cursor advance beyond pool capacity, subject to eventual EOS.
 
 const CORPUS = `Shall I compare thee to a summer's day?
 Thou art more lovely and more temperate:
@@ -84,15 +80,15 @@ const TOKENIZER_MODEL: Tokenizer.TrainModel = "Unigram"
 const BOS = "<|bos|>"
 const EOS = "<|eos|>"
 
-// The corpus is three poems: train and sample them as separate documents
-// wrapped in BOS/EOS, so the model learns both how texts start and how
-// they end (generation then stops at EOS instead of mid-sentence).
+// BOS/EOS mark the three documents before their ids are concatenated. Random
+// training windows can cross an EOS/BOS join; generation treats EOS as the
+// stopping token rather than imposing a separate token limit.
 const DOCUMENTS = CORPUS.split("\n\n").map((poem) => poem.trim() + "\n")
 
 const createGpt = (vocabSize: number) =>
   Effect.gen(function*() {
-    // Token embeddings; positions are relative (RoPE inside attention),
-    // so generation is unbounded — no position table to outgrow.
+    // Token embeddings; RoPE inside attention means the architecture has no
+    // learned position table to outgrow during windowed inference.
     const embeddings = yield* Model.embedding("wte", vocabSize, EMBED)
     const blocks: Array<Model.Model> = []
     for (let i = 0; i < LAYERS; i++) {
@@ -171,12 +167,10 @@ const init = (model: Model.Model) =>
     return params
   })
 
-// Generates a document from a prompt through the compiled inference
-// artifact (RFC 0010): the prompt is prefilled once into the sequence's
-// kv blocks, then each step appends one token, attending over the last
-// BLOCK cached positions (sliding window — exactly the distribution the
-// model trained on, since RoPE sees only relative offsets). Sampling
-// stops at EOS: documents end when the model says they end.
+// Generates through one session of the compiled artifact: prompt prefill fills
+// sequence blocks, then host sampling reads back and releases one logits row per
+// step. The sliding window caps attention at the model's maximum training span,
+// and EOS is the only application-level termination condition.
 const generate = (
   program: Model.InferenceProgram,
   tokenizer: Tokenizer.Tokenizer,

@@ -7,6 +7,8 @@ import { deep, floatDtype, floats, onDevices, TOL } from "./utils/devices.ts"
 const values = (t: Tensor.Any) =>
   Effect.map(Tensor.toTypedArray(t), (arr) => Array.from<number | bigint>(arr).map(Number))
 
+// The matrix uses the real CPU backend and available Metal backend; unsupported
+// Metal operations must fail explicitly rather than fall back to CPU.
 onDevices("Tensor", (device) => (it) => {
   describe("constructors", () => {
     it.effect("zeros/ones/full produce the right values and dtype", () =>
@@ -781,8 +783,8 @@ onDevices("Tensor", (device) => (it) => {
         const [lossValue] = yield* values(loss)
         expect(Number.isFinite(lossValue)).toBe(true)
         const expected = Math.log(1 + Math.exp(1) + Math.exp(-1))
-        // f32 computes lse - picked as (1e4 + 1.4) - 1e4: the subtraction
-        // cancels catastrophically, leaving ~1e-3 of rounding behind
+        // The stable log-sum-exp still ends with f32 subtraction near 1e4, so
+        // cancellation requires a wider absolute tolerance than ordinary ops.
         expect(Math.abs(lossValue - expected)).toBeLessThan(5e-3)
         const [grad] = yield* Gradient.grad(loss, [logits])
         ;(yield* values(grad)).forEach((g) => expect(Number.isFinite(g)).toBe(true))
@@ -906,6 +908,8 @@ onDevices("Tensor", (device) => (it) => {
   })
 
   describe("convolution and pooling", () => {
+    // This scalar NCHW reference uses no tensor operations, so both backends are
+    // checked against the same stride, padding, dilation, and grouping semantics.
     const refConv2d = (
       x: Array<number>,
       xShape: [number, number, number, number],

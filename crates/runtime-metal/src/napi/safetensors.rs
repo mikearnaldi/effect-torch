@@ -1,3 +1,12 @@
+//! Safetensors serialization for concrete Metal values.
+//!
+//! Reads synchronize the producing Metal work before touching shared buffer
+//! contents. Strided tensors are gathered in logical row-major order and
+//! scalar bytes are emitted little-endian as required by safetensors. Saves
+//! use a same-directory temporary file followed by rename, so a failed write
+//! cannot expose a partial target. Loads validate dtype/shape and upload each
+//! immutable payload into a concrete Metal `Value`.
+
 use super::err::{err, Res};
 use super::value::Value;
 use crate::device::MetalDevice;
@@ -35,6 +44,7 @@ fn runtime_dtype(dtype: Dtype) -> Res<DType> {
     }
 }
 
+/// Copies a logical tensor into canonical little-endian safetensors bytes.
 pub fn tensor_bytes(value: &Value) -> Res<Vec<u8>> {
     let tensor = &value.0;
     MetalDevice::get().synchronize()?;
@@ -54,6 +64,10 @@ pub fn tensor_bytes(value: &Value) -> Res<Vec<u8>> {
         ($type:ty) => {{
             let source = base.cast::<$type>();
             for index in 0..count {
+                // SAFETY: synchronization above completed all GPU writes;
+                // `logical_offset` is derived from the validated tensor
+                // layout and therefore indexes an initialized element inside
+                // the retained shared Metal buffer.
                 output.extend_from_slice(
                     &unsafe { *source.add(logical_offset(index)) }.to_le_bytes(),
                 );
@@ -66,6 +80,8 @@ pub fn tensor_bytes(value: &Value) -> Res<Vec<u8>> {
         DType::F16 | DType::BF16 => write_le!(u16),
         DType::U8 => {
             for index in 0..count {
+                // SAFETY: same bounds, initialization, and synchronization
+                // argument as `write_le`; u8 needs no endian conversion.
                 output.push(unsafe { *base.add(logical_offset(index)) });
             }
         }
@@ -75,6 +91,7 @@ pub fn tensor_bytes(value: &Value) -> Res<Vec<u8>> {
     Ok(output)
 }
 
+/// Uploads canonical tensor bytes into a concrete Metal value.
 pub fn value_from_bytes(bytes: &[u8], shape: &[usize], dtype: DType) -> Res<Value> {
     crate::value::value_from_bytes(bytes, shape, dtype)
 }

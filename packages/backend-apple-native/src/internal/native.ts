@@ -6,7 +6,16 @@ const require = createRequire(import.meta.url)
 const packageName = "@effect-torch/backend-apple-native"
 let native: NativeAddon | undefined
 
-/** @internal */
+/**
+ * Lazily selects and memoizes the package-local Darwin addon for the current
+ * architecture. Validation and `require` happen only on the first successful
+ * call, which keeps the public package import-safe on non-Darwin hosts. A failed
+ * selection/load is not cached and there is no download, search path, or CPU
+ * fallback. `.node` addons use the CommonJS native-module loader even though
+ * this package is ESM.
+ *
+ * @internal
+ */
 export const loadNative = (): NativeAddon => {
   if (native !== undefined) return native
   if (process.platform !== "darwin") {

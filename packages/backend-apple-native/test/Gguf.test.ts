@@ -25,6 +25,8 @@ const string = (value: string): Buffer => {
   return Buffer.concat([u64(bytes.length), bytes])
 }
 
+// The hand-built GGUF v3 artifact mixes dense F32 with Q2_K and Q4_K payloads
+// that have the same packed shape, proving codec identity is not shape-derived.
 const fixture = (): Buffer => {
   const header = Buffer.concat([
     Buffer.from("GGUF"),
@@ -79,6 +81,8 @@ const withFixture = <A, E, R>(use: (file: string) => Effect.Effect<A, E, R>) =>
 
 const suite = Effect.runSync(isAvailable) ? describe : describe.skip
 
+// Real-file cases require Metal. Adapter ownership cases below inject a fake
+// addon and therefore remain platform-independent.
 suite("Metal direct GGUF", () => {
   it.effect("loads exact payloads and rejects cross-codec physical collisions", () =>
     withFixture((file) =>
@@ -183,6 +187,8 @@ suite("Metal direct GGUF", () => {
     ))
 })
 
+// Each raw native wrapper must either become one public handle or be cleared
+// exactly once, including a success that races interruption.
 it.effect("rejects duplicate raw Metal GGUF ownership and clears it once", () => {
   const clear = vi.fn()
   const tensor = { shape: [1, 1008], dtype: "u8", device: "metal", clear } as unknown as NativeTensor

@@ -1,6 +1,6 @@
 /**
- * Checkpoint persistence for parameters, optimizer state, training progress,
- * and sampler state.
+ * Safetensors checkpoint persistence for parameters, positional optimizer
+ * tensor state, global training step, and optional sampler continuation state.
  *
  * @since 0.1.0
  * @category modules
@@ -16,7 +16,7 @@ export * as Checkpoint from "./Checkpoint.ts"
 export * as Chat from "./Chat.ts"
 
 /**
- * Reverse-mode automatic differentiation and graph-gradient transforms.
+ * Reverse-mode automatic differentiation and lazy graph-to-graph transforms.
  *
  * @since 0.1.0
  * @category modules
@@ -24,7 +24,8 @@ export * as Chat from "./Chat.ts"
 export * as Gradient from "./Gradient.ts"
 
 /**
- * Native GGUF inspection, model resolution, validation, and loading.
+ * Native GGUF v3 inspection, registry resolution, validation, and owned tensor
+ * loading.
  *
  * @since 0.1.0
  * @category modules
@@ -32,7 +33,7 @@ export * as Gradient from "./Gradient.ts"
 export * as Gguf from "./Gguf.ts"
 
 /**
- * Composable learning-rate schedules for training steps.
+ * Synchronous composable learning-rate schedules over global training steps.
  *
  * @since 0.1.0
  * @category modules
@@ -40,7 +41,7 @@ export * as Gguf from "./Gguf.ts"
 export * as LearningRate from "./LearningRate.ts"
 
 /**
- * Loss functions and reduction policies for lazy tensor graphs.
+ * Lazy loss graph builders, reduction policies, and validation boundaries.
  *
  * @since 0.1.0
  * @category modules
@@ -56,7 +57,8 @@ export * as Loss from "./Loss.ts"
 export * as Model from "./Model.ts"
 
 /**
- * Registration, exact-key lookup, and default Layers for model architectures.
+ * Effect-environment model-architecture registration, exact-key lookup, and
+ * default Layers.
  *
  * @since 0.1.0
  * @category modules
@@ -64,7 +66,8 @@ export * as Model from "./Model.ts"
 export * as Registry from "./Registry.ts"
 
 /**
- * Pure optimizer graph transforms and optimizer-state management.
+ * Pure optimizer update graphs, explicit tensor-state schemas, and gradient
+ * clipping.
  *
  * @since 0.1.0
  * @category modules
@@ -80,7 +83,7 @@ export * as Optimizer from "./Optimizer.ts"
 export * as Runtime from "./Runtime.ts"
 
 /**
- * Restorable shuffled epoch sampling for token-sequence training.
+ * Restorable shuffled epoch sampling of next-token training windows.
  *
  * @since 0.1.0
  * @category modules
@@ -96,7 +99,8 @@ export * as Sampler from "./Sampler.ts"
 export * as Tensor from "./Tensor.ts"
 
 /**
- * Compiled and uncompiled training-loop construction and execution.
+ * Stateful compiled and uncompiled training loops with explicit resume and
+ * cache semantics.
  *
  * @since 0.1.0
  * @category modules

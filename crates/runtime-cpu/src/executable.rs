@@ -1,3 +1,47 @@
+//! Compilation and execution of prepared graphs on the CPU runtime.
+//!
+//! # Execution planning
+//!
+//! [`compile`] lowers a prepared program (graph index + slots) into a
+//! [`CpuExecutable`]: every graph node becomes a [`CpuOp`] with a frozen
+//! [`CpuAlgorithmPlan`] (the exact requirement structs from the kernel
+//! modules), and every value receives a fixed [`Location`] in the
+//! compiler's memory plan — external (caller bindings), constant, planned
+//! (inside a workspace segment), or alias (a view of another value). Because
+//! plans freeze shapes, dtypes, layouts, algorithms, and scratch up front,
+//! [`execute`] can validate an invocation cheaply and then run the whole
+//! program without consulting shape logic again.
+//!
+//! # Allocation discipline
+//!
+//! All segments for one invocation are leased from the shared workspace pool
+//! (`acquire_segments`) before execution begins. Value resolution and the
+//! command loop then run under an [`ExecutableAllocationGuard`], so any
+//! accidental allocation on the execution path panics immediately. Outputs
+//! that alias workspace segments retain the lease, keeping the memory alive
+//! until the caller drops the returned values.
+//!
+//! # Destination safety
+//!
+//! Commands write outputs, scratch, staging, and state through
+//! `CpuDestination::from_planned`. That unsafe constructor is sound here
+//! because the memory plan assigns each value a fixed, non-overlapping byte
+//! range and the physical command list is executed linearly on one thread:
+//! while a command writes its ranges, no other live value can read or write
+//! them.
+//!
+//! # Cancellation and state
+//!
+//! The [`CancellationFlag`] is polled before and after every command (and
+//! inside long-running kernels); an aborted invocation rolls back the
+//! [`CpuState`] transaction instead of committing. [`CpuState`] implementations
+//! (e.g. the NAPI KV-cache context) observe `begin`/`commit`/`rollback`
+//! around the command loop to stage and publish decode state atomically.
+//!
+//! Random ops are deterministic per invocation: each `randn`/`uniform` node
+//! carries a provenance recorded at compile time that is mixed with the
+//! invocation nonce by `random_seed`.
+
 use crate::composed::{
     AdamWRequirements, ChunkedHeadCeBackwardRequirements, ChunkedHeadCeForwardRequirements,
     CrossEntropyBackwardRequirements, CrossEntropyForwardRequirements, KdaBackwardRequirements,
@@ -45,12 +89,16 @@ fn cpu_device() -> Device {
     Device::Cpu
 }
 
+/// Where a bound input value comes from: a declared slot of the program
+/// signature or a generated binding (materialized leaf collected at compile
+/// time).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CpuBindingSource {
     Declared(u32),
     Generated(u32),
 }
 
+/// Maps a program value to the invocation binding that supplies it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CpuBinding {
     pub value: ValueId,
@@ -76,6 +124,9 @@ enum CpuDeclaredSource {
     StateCursor,
 }
 
+/// Static plan for a decode state cursor: total state bytes, the signature
+/// slot carrying the cursor, whether the cursor is a tensor, and the batch
+/// width of the state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CpuStatePlan {
     pub bytes: usize,
@@ -91,6 +142,8 @@ struct CpuValueMetadata {
     pub layout: effect_torch_runtime::Layout,
 }
 
+/// A lowered program value: static shape/dtype/layout plus the compiler's
+/// memory declaration for it.
 #[derive(Debug, Clone)]
 pub struct CpuLoweredValue {
     pub shape: Box<[usize]>,
@@ -119,6 +172,7 @@ struct CpuConstant {
     payload: Value,
 }
 
+/// Unary operations expressible as one CPU command.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CpuUnaryOp {
     Neg,
@@ -142,6 +196,7 @@ pub enum CpuUnaryOp {
     Det,
 }
 
+/// Binary (and binary-shaped) operations expressible as one CPU command.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CpuBinaryOp {
     Add,
@@ -160,6 +215,7 @@ pub enum CpuBinaryOp {
     Solve,
 }
 
+/// Reduction operations expressible as one CPU command.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CpuReduceOp {
     Sum,
@@ -169,12 +225,17 @@ pub enum CpuReduceOp {
     Prod,
 }
 
+/// Whether an optimizer step runs the composed kernel or a fused expression
+/// program.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OptimizerImplementation {
     Composed,
     Fused,
 }
 
+/// One executable CPU operation: the semantic operation plus its frozen
+/// parameters. `Randn`/`Uniform` carry a compile-time `provenance` that is
+/// mixed with the invocation nonce to derive per-invocation seeds.
 #[derive(Debug, Clone)]
 pub enum CpuOp {
     Randn {
@@ -389,6 +450,7 @@ pub enum CpuOp {
 }
 
 impl CpuOp {
+    /// Stable diagnostic name of the operation.
     pub fn name(&self) -> &'static str {
         match self {
             Self::Randn { .. } => "randn",
@@ -453,6 +515,9 @@ impl CpuOp {
     }
 }
 
+/// The frozen algorithm plan attached to a [`CpuOp`]: exact requirements
+/// from the kernel module that implements the operation, or `None` for ops
+/// that need no plan (pure views, fused programs carry their own data).
 #[derive(Debug, Clone)]
 pub enum CpuAlgorithmPlan {
     None,
@@ -500,6 +565,9 @@ pub enum CpuAlgorithmPlan {
     Quantized(QuantizedRequirements),
 }
 
+/// One instruction kind in a lowered CPU program. `PrepareInvocation` and
+/// `FinalizeInvocation` bracket the operation sequence; the executor only
+/// dispatches `Operation` instructions.
 #[derive(Debug, Clone)]
 pub enum CpuInstruction {
     PrepareInvocation,
@@ -526,11 +594,16 @@ impl CpuInstruction {
 
 pub type CpuCommand = LoweredInstruction<CpuInstruction>;
 
+/// One physical command of a compiled executable: encode the referenced
+/// logical instruction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CpuPhysicalCommand {
     Encode(InstructionId),
 }
 
+/// A compiled, immutable CPU program: lowered instructions, physical command
+/// schedule, bindings, constants, memory plan, and diagnostics. Shared
+/// across invocations via `Arc`.
 pub struct CpuExecutable {
     pub signature: ProgramSignature,
     pub program: Arc<LoweredProgram<CpuInstruction, NativeMemorySpace, CpuLoweredValue>>,
@@ -566,6 +639,7 @@ impl fmt::Debug for CpuExecutable {
 }
 
 impl CpuExecutable {
+    /// Looks up a logical instruction by id, verifying the id matches.
     pub fn instruction(&self, id: InstructionId) -> Option<&CpuCommand> {
         self.program
             .instructions
@@ -574,6 +648,8 @@ impl CpuExecutable {
     }
 }
 
+/// Result of compiling a graph: the shared executable plus the signature
+/// slots and the generated (materialized leaf) bindings it expects.
 pub struct CpuCompilation {
     pub executable: Arc<CpuExecutable>,
     pub slots: Vec<ProgramSlot>,
@@ -581,6 +657,8 @@ pub struct CpuCompilation {
     pub generated_slots: Vec<usize>,
 }
 
+/// A generated binding collected from a graph leaf, validated against the
+/// graph index (identity, shape, dtype) at compile time.
 #[derive(Clone)]
 pub struct CpuGeneratedValue {
     node: DenseNodeId,
@@ -2968,6 +3046,8 @@ fn validate_cpu_support(node: &Node) -> Result<(), String> {
     }
 }
 
+/// Compiles graph roots into a [`CpuCompilation`] with default state
+/// handling (no state cursor).
 pub fn compile(
     roots: &[Arc<Node>],
     options: CompileOptions,
@@ -2976,6 +3056,8 @@ pub fn compile(
     compile_roots_internal(roots, options, ce_chunk_size, None, None)
 }
 
+/// Like [`compile`], additionally reporting `state_bytes` in the memory
+/// diagnostics (used when the caller manages decode state outside the plan).
 pub fn compile_with_state_bytes(
     roots: &[Arc<Node>],
     options: CompileOptions,
@@ -2985,6 +3067,8 @@ pub fn compile_with_state_bytes(
     compile_roots_internal(roots, options, ce_chunk_size, state_bytes, None)
 }
 
+/// Like [`compile`], with a full decode-state plan (cursor slot and state
+/// bytes) baked into the executable.
 pub fn compile_with_state(
     roots: &[Arc<Node>],
     options: CompileOptions,
@@ -3029,6 +3113,10 @@ fn validate_generated_payload(node: &Arc<Node>, payload: &Value) -> Result<(), S
     Ok(())
 }
 
+/// Collects and validates the generated (materialized leaf) bindings of a
+/// prepared program's graph index. Every leaf is checked for identity,
+/// shape, dtype, device, and payload layout so a stale or mutated binding
+/// fails at compile time.
 pub fn load_generated_values(index: &GraphIndex) -> Result<Vec<CpuGeneratedValue>, String> {
     index
         .leaves
@@ -3124,6 +3212,8 @@ fn validate_generated_values(
     Ok(())
 }
 
+/// Compiles an already-prepared program with pre-validated generated
+/// bindings, avoiding a second graph preparation pass.
 pub fn compile_prepared(
     program: &PreparedProgram,
     generated_values: &[CpuGeneratedValue],
@@ -3250,6 +3340,13 @@ fn compile_prepared_internal(
     Ok(compilation)
 }
 
+/// Transaction hooks for decode-state owners (KV caches, recurrent states).
+///
+/// The executor calls `begin` after value resolution, runs all commands
+/// (each also offered to `run_command` for state-aware kernels), then either
+/// `commit` — publishing staged state — or `rollback` on failure or
+/// cancellation. Implementations must tolerate `rollback` without a matching
+/// `commit`.
 pub trait CpuState: Send + Sync {
     fn begin(&self, _executable: &CpuExecutable, _values: &[Value]) -> Result<(), String> {
         Ok(())
@@ -3272,6 +3369,8 @@ pub trait CpuState: Send + Sync {
     fn rollback(&self) {}
 }
 
+/// Result of one invocation: the program outputs (which may retain workspace
+/// leases) plus the memory accounting report.
 #[derive(Debug)]
 pub struct CpuExecution {
     pub outputs: Vec<Value>,
@@ -3284,6 +3383,8 @@ fn resolved_destination(value: &Value) -> CpuDestination<'_> {
     unsafe { CpuDestination::from_planned(value.tensor()) }
 }
 
+/// Derives the per-invocation, per-node random seed by mixing the invocation
+/// nonce with the node's compile-time provenance (splitmix64 finalizer).
 fn random_seed(nonce: u64, provenance: u64) -> u64 {
     let mut value = nonce ^ provenance.wrapping_mul(0x9e37_79b9_7f4a_7c15);
     value ^= value >> 30;
@@ -3311,6 +3412,8 @@ fn resolve_physical_instruction<'a>(
     Ok(instruction)
 }
 
+/// Segment owners for one invocation plus the pool lease that keeps them
+/// counted as leased (not idle) until the invocation ends.
 struct InvocationSegments {
     owners: Box<[Arc<CpuSegment>]>,
     retentions: Box<[Option<CpuStorageRetention>]>,
@@ -3318,6 +3421,9 @@ struct InvocationSegments {
     actual_workspace_bytes: usize,
 }
 
+/// Leases every workspace segment of the memory plan from the shared pool in
+/// one atomic set acquisition (a failed request leases nothing). Provisional
+/// output segments are skipped: they are covered by the transaction ranges.
 fn acquire_segments(executable: &CpuExecutable) -> Result<InvocationSegments, String> {
     let mut workspace_indices = Vec::new();
     let mut workspace_requests = Vec::new();
@@ -3508,6 +3614,9 @@ fn resolve_values(
         let target = destination
             .tensor()
             .view(destination.tensor().layout.narrow(0, 0, active));
+        // SAFETY: `target` is a narrowed view of a planned padded-input range
+        // whose exclusivity the fixed schedule already guarantees; narrowing
+        // only shrinks the written range.
         let mut target = unsafe { CpuDestination::from_planned(&target) };
         source.tensor().copy_into(&mut target)?;
     }
@@ -4361,6 +4470,9 @@ fn dispatch_command<'a>(
     }
 }
 
+/// Runs an executable with declared and generated bindings, returning outputs
+/// plus the invocation memory report. Optionally drives a [`CpuState`]
+/// transaction; cancellation or any command failure rolls the state back.
 pub fn execute_reported(
     executable: &CpuExecutable,
     declared_bindings: &[Value],
@@ -4379,6 +4491,7 @@ pub fn execute_reported(
     )
 }
 
+/// Like [`execute_reported`], additionally binding scalar slots.
 pub fn execute_reported_with_scalars(
     executable: &CpuExecutable,
     declared_bindings: &[Value],
@@ -4549,6 +4662,7 @@ fn execute_reported_with_commit(
     })
 }
 
+/// Runs an executable and returns only its outputs; see [`execute_reported`].
 pub fn execute(
     executable: &CpuExecutable,
     declared_bindings: &[Value],
@@ -4566,6 +4680,7 @@ pub fn execute(
     .outputs)
 }
 
+/// Runs an executable with scalar bindings and returns only its outputs.
 pub fn execute_with_scalars(
     executable: &CpuExecutable,
     declared_bindings: &[Value],
@@ -4583,6 +4698,8 @@ pub fn execute_with_scalars(
     .outputs)
 }
 
+/// Runs an executable against a [`CpuState`] transaction, committing only
+/// when `commit_allowed` returns true after the command loop completes.
 pub fn execute_stateful(
     executable: &CpuExecutable,
     declared_bindings: &[Value],

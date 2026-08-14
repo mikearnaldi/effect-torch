@@ -8,7 +8,8 @@ const floats = (values: ReadonlyArray<number>) => new Float32Array(values)
 const as = (dtype: Tensor.DType, values: ReadonlyArray<number>, shape: ReadonlyArray<number>) =>
   Effect.flatMap(Tensor.fromTypedArray(floats(values), shape), (tensor) => Tensor.cast(tensor, dtype))
 
-// bf16 has 8 mantissa bits: two decimal digits at magnitude ~1.
+// bf16 has seven stored fraction bits, or eight significant bits including the
+// implicit leading bit. This bound also covers the finer f16 round-trips below.
 const BF16_TOL = 1e-2
 
 onDevices("Dtype", (device) => (it) => {

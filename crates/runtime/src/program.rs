@@ -1,28 +1,84 @@
+//! Program signatures and invocation validation.
+//!
+//! A compiled program declares its calling convention as a
+//! [`ProgramSignature`]: the tensor [`BindingDecl`]s it reads, the scalar
+//! and [`RuntimeValueDecl`] parameters it accepts per call, an optional
+//! [`RngDecl`], and its [`OutputSignature`]s. A call site assembles an
+//! [`Invocation`] and the runtime validates it against the signature via
+//! [`ProgramSignature::validate_invocation`] *before* any execution.
+//!
+//! # Validation rules
+//!
+//! [`validate_invocation`](ProgramSignature::validate_invocation) checks,
+//! in order: argument counts (bindings, scalars, runtime values, RNG
+//! presence and counter count); buffer ownership (every binding must carry
+//! the calling runtime's [`RuntimeId`]); per-binding dtype, placement,
+//! shape and layout policy; scalar types; and runtime-value bounds
+//! (declared `min..=max` ranges, array length caps and element ranges).
+//! Each failure is a distinct [`InvocationError`] variant.
+//!
+//! # Layout policies
+//!
+//! Each binding declares a [`BindingLayoutPolicy`]: either
+//! `Require(`[`LayoutConstraint`]`)` — the caller's buffer must satisfy
+//! the constraint (`Exact`, `Contiguous`, `ZeroOffsetContiguous` or
+//! `AnyStrided`) — or `Canonicalize { target }`, which accepts any layout
+//! at validation time because the backend will canonicalize the buffer to
+//! `target` before use. [`BindingAliasing`] records whether a binding may
+//! share storage with other bindings (`MayAlias`), provably does not
+//! (`Disjoint`), or is the sole writer of its storage (`Exclusive`).
+//!
+//! # RNG
+//!
+//! Randomness is explicit and replayable: [`RngDecl`] fixes the counter
+//! count at compile time and each [`RngInvocation`] supplies a seed, a
+//! nonce and exactly that many counters, so a frozen graph never replays
+//! stale random state.
+
 use crate::{DType, ErasedBuffer, Layout, Placement, RuntimeId};
 use std::error::Error;
 use std::fmt;
 
+/// Requirement imposed on a binding's layout.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum LayoutConstraint {
+    /// The layout must equal this exact shape/strides/offset triple.
     Exact(Layout),
+    /// Densely packed row-major (any offset).
     Contiguous,
+    /// Densely packed row-major with offset 0.
     ZeroOffsetContiguous,
+    /// Any strides are acceptable.
     AnyStrided,
 }
 
+/// How a binding's layout is treated at the call boundary.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum BindingLayoutPolicy {
+    /// The caller's buffer must already satisfy the constraint.
     Require(LayoutConstraint),
+    /// Any layout is accepted; the backend canonicalizes to `target`.
     Canonicalize { target: Layout },
 }
 
+/// Planner/backend assertion about whether a binding's storage may overlap
+/// other storage.
+///
+/// [`ProgramSignature::validate_invocation`] records but does not prove these
+/// relationships: invocation validation receives independent buffer handles,
+/// not a portable byte-range alias model. Backends that rely on `Disjoint` or
+/// `Exclusive` must enforce the assertion at their ownership boundary.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum BindingAliasing {
+    /// May share storage with other bindings.
     MayAlias,
+    /// Asserted to share no storage with any other binding.
     Disjoint,
+    /// Asserted to be the sole writer for the duration of the invocation.
     Exclusive,
 }
 
+/// Declaration of one tensor argument of a program.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct BindingDecl {
     pub shape: Vec<usize>,
@@ -32,6 +88,7 @@ pub struct BindingDecl {
     pub aliasing: BindingAliasing,
 }
 
+/// Type of a scalar argument.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ScalarType {
     Bool,
@@ -41,6 +98,8 @@ pub enum ScalarType {
     F64,
 }
 
+/// Value of a scalar argument; [`ScalarValue::scalar_type`] reports the
+/// matching [`ScalarType`].
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ScalarValue {
     Bool(bool),
@@ -51,6 +110,7 @@ pub enum ScalarValue {
 }
 
 impl ScalarValue {
+    /// The [`ScalarType`] this value belongs to.
     pub fn scalar_type(self) -> ScalarType {
         match self {
             ScalarValue::Bool(_) => ScalarType::Bool,
@@ -62,12 +122,19 @@ impl ScalarValue {
     }
 }
 
+/// Named declaration of one scalar argument.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ScalarDecl {
     pub name: String,
     pub scalar_type: ScalarType,
 }
 
+/// Declared domain of a runtime value: a bounded `u64` or a length-capped,
+/// element-bounded `u32` array.
+///
+/// Bounds are part of the *declaration* (not the value) so the compiler can
+/// specialize on them; a declaration with `min > max` is itself invalid and
+/// reported as [`RuntimeValueError::InvalidDeclaration`].
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum RuntimeValueKind {
     U64 {
@@ -81,6 +148,7 @@ pub enum RuntimeValueKind {
     },
 }
 
+/// Named declaration of one runtime value argument.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct RuntimeValueDecl {
     pub name: String,
@@ -88,6 +156,7 @@ pub struct RuntimeValueDecl {
 }
 
 impl RuntimeValueDecl {
+    /// Declares a `u64` runtime value accepted in `min..=max`.
     pub fn u64(name: impl Into<String>, min: u64, max: u64) -> Self {
         Self {
             name: name.into(),
@@ -95,6 +164,8 @@ impl RuntimeValueDecl {
         }
     }
 
+    /// Declares a `u32` array runtime value of at most `max_len` elements
+    /// spanning the full `u32` range.
     pub fn u32_array(name: impl Into<String>, max_len: usize) -> Self {
         Self {
             name: name.into(),
@@ -106,6 +177,7 @@ impl RuntimeValueDecl {
         }
     }
 
+    /// Validates `value` against the declared kind and bounds.
     pub fn validate(&self, value: &RuntimeValue) -> Result<(), RuntimeValueError> {
         match (&self.kind, value) {
             (RuntimeValueKind::U64 { min, max }, RuntimeValue::U64(value)) => {
@@ -164,17 +236,22 @@ impl RuntimeValueDecl {
     }
 }
 
+/// A runtime value supplied at invocation time.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum RuntimeValue {
     U64(u64),
     U32Array(Box<[u32]>),
 }
 
+/// Declared RNG requirement of a program: the exact number of counters an
+/// invocation must supply.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct RngDecl {
     pub counter_count: u32,
 }
 
+/// Per-invocation RNG state: seed, nonce and exactly
+/// [`RngDecl::counter_count`] counters.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct RngInvocation {
     pub seed: u64,
@@ -182,6 +259,8 @@ pub struct RngInvocation {
     pub counters: Box<[u64]>,
 }
 
+/// The non-tensor part of a signature: scalar, runtime-value and RNG
+/// declarations, in positional order.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Default)]
 pub struct InvocationSignature {
     pub scalars: Vec<ScalarDecl>,
@@ -189,6 +268,7 @@ pub struct InvocationSignature {
     pub rng: Option<RngDecl>,
 }
 
+/// Declared shape, dtype and placement of one program output.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct OutputSignature {
     pub shape: Vec<usize>,
@@ -196,6 +276,8 @@ pub struct OutputSignature {
     pub placement: Placement,
 }
 
+/// Full calling convention of a compiled program: positional tensor
+/// bindings, invocation parameters and outputs.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Default)]
 pub struct ProgramSignature {
     pub bindings: Vec<BindingDecl>,
@@ -203,6 +285,8 @@ pub struct ProgramSignature {
     pub outputs: Vec<OutputSignature>,
 }
 
+/// Arguments for one call of a program, positionally matched against the
+/// [`ProgramSignature`].
 #[derive(Debug, Clone, Default)]
 pub struct Invocation {
     pub bindings: Vec<ErasedBuffer>,
@@ -212,6 +296,8 @@ pub struct Invocation {
 }
 
 impl ProgramSignature {
+    /// Checks argument counts only (bindings, scalars, runtime values, RNG
+    /// presence and counter count) without inspecting any buffer metadata.
     pub fn validate_invocation_counts(
         &self,
         bindings: usize,
@@ -240,6 +326,9 @@ impl ProgramSignature {
         }
     }
 
+    /// Validates the metadata of binding `binding` (dtype, placement,
+    /// shape and layout policy) without an [`ErasedBuffer`], so callers
+    /// that track metadata separately can still check conformance.
     pub fn validate_binding_metadata(
         &self,
         binding: usize,
@@ -282,6 +371,7 @@ impl ProgramSignature {
         Ok(())
     }
 
+    /// Validates the type of scalar argument `scalar`.
     pub fn validate_scalar_metadata(
         &self,
         scalar: usize,
@@ -300,6 +390,8 @@ impl ProgramSignature {
         Ok(())
     }
 
+    /// Validates runtime value `runtime_value` against its declaration,
+    /// wrapping any [`RuntimeValueError`] with the argument's position.
     pub fn validate_runtime_value_metadata(
         &self,
         runtime_value: usize,
@@ -319,6 +411,9 @@ impl ProgramSignature {
             })
     }
 
+    /// Full validation of an invocation against this signature: counts,
+    /// buffer ownership by `runtime`, binding metadata, scalar types and
+    /// runtime-value bounds, in that order.
     pub fn validate_invocation(
         &self,
         runtime: RuntimeId,
@@ -374,25 +469,27 @@ fn validate_count(
     }
 }
 
+/// Why a single runtime value failed validation against its declaration.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RuntimeValueError {
-    InvalidDeclaration {
-        name: String,
-    },
-    KindMismatch {
-        name: String,
-    },
+    /// The declaration itself is inconsistent (`min > max`).
+    InvalidDeclaration { name: String },
+    /// The value's kind does not match the declared kind.
+    KindMismatch { name: String },
+    /// A scalar value outside its declared `min..=max` range.
     OutOfBounds {
         name: String,
         value: u64,
         min: u64,
         max: u64,
     },
+    /// An array longer than its declared `max_len`.
     TooLong {
         name: String,
         len: usize,
         max_len: usize,
     },
+    /// An array element outside its declared `min..=max` range.
     ArrayElementOutOfBounds {
         name: String,
         index: usize,
@@ -437,47 +534,45 @@ impl fmt::Display for RuntimeValueError {
 
 impl Error for RuntimeValueError {}
 
+/// Why an [`Invocation`] failed validation against a [`ProgramSignature`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InvocationError {
+    /// Wrong number of positional arguments of a kind (`"bindings"`,
+    /// `"scalars"` or `"runtime values"`).
     Count {
         kind: &'static str,
         expected: usize,
         actual: usize,
     },
+    /// A binding buffer is owned by a different runtime.
     InvalidOwner {
         binding: usize,
         expected: RuntimeId,
         actual: RuntimeId,
     },
+    /// A binding's dtype differs from the declaration.
     DTypeMismatch {
         binding: usize,
         expected: DType,
         actual: DType,
     },
-    PlacementMismatch {
-        binding: usize,
-    },
-    ShapeMismatch {
-        binding: usize,
-    },
-    LayoutMismatch {
-        binding: usize,
-    },
-    ScalarTypeMismatch {
-        scalar: usize,
-    },
+    /// A binding's placement differs from the declaration.
+    PlacementMismatch { binding: usize },
+    /// A binding's shape differs from the declaration.
+    ShapeMismatch { binding: usize },
+    /// A binding's layout violates the declared policy.
+    LayoutMismatch { binding: usize },
+    /// A scalar's type differs from the declaration.
+    ScalarTypeMismatch { scalar: usize },
+    /// A runtime value failed its declaration's checks.
     RuntimeValue {
         runtime_value: usize,
         source: RuntimeValueError,
     },
-    RngPresence {
-        expected: bool,
-        actual: bool,
-    },
-    RngCounterCount {
-        expected: usize,
-        actual: usize,
-    },
+    /// RNG state was supplied but not declared, or vice versa.
+    RngPresence { expected: bool, actual: bool },
+    /// The invocation supplied the wrong number of RNG counters.
+    RngCounterCount { expected: usize, actual: usize },
 }
 
 impl fmt::Display for InvocationError {

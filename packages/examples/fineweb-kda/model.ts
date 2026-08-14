@@ -2,23 +2,23 @@ import { Model } from "@effect-torch/core"
 import type { Tensor } from "@effect-torch/core"
 import { Effect } from "effect"
 
-// FineWeb KDA pilot: the fineweb GPT layout on the Kimi Linear / Kimi
-// K3 attention recipe (arXiv:2510.26692, arXiv:2607.24653) — a 3:1
-// hybrid: every fourth layer and the final layer are full causal
-// attention, the rest are Kimi Delta Attention
-// (Model.kimiDeltaAttention, RFC 0018). The full layers stand in for
-// K3's gated NoPE MLA; KDA's decayed delta-rule state transition is
-// itself the positional encoding, so the stack uses no position table
-// and no RoPE anywhere. (Pure linear attention measurably loses on
-// exact retrieval, which is why the global layers exist; adding RoPE
-// back to KDA layers hurts long-context performance.)
+// FineWeb KDA pilot: the FineWeb GPT layout with a Kimi Linear/K3-inspired
+// token-mixing pattern (arXiv:2510.26692, arXiv:2607.24653). Layers 1-3 and 5
+// use Kimi Delta Attention (Model.kimiDeltaAttention, RFC 0018); layers 4 and 6
+// use ordinary full causal attention. This is an overall 2:1 recurrent/full
+// split with the final layer forced to global attention, not K3's gated NoPE
+// MLA. KDA's decayed delta-rule transition supplies positional information for
+// recurrent layers, and this small stack uses neither a position table nor RoPE.
+// The cited NoPE result concerns the global attention layers rather than adding
+// RoPE to KDA itself.
 //
 // Generation runs through Model.inference, which rewrites the KDA layers
 // into stateful recurrent decode with fixed-size per-sequence state.
 // Training runs the closed-form KDA backward (RFC 0018 phase 4).
 //
-// Shared fineweb helpers (tokenizer, checkpoint I/O, data windows,
-// held-out loss) are re-exported from the sibling example.
+// Shared fineweb helpers (tokenizer, bare-parameter I/O, data windows,
+// held-out loss) are re-exported from the sibling example. FINEWEB_BLOCK is
+// Number-parsed at module load and is not encoded in the bare model artifact.
 
 export { EOT, heldOutLoss, loadBin, loadParams, loadTokenizer, saveParams, windows } from "../fineweb/model.js"
 

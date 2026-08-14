@@ -53,16 +53,22 @@ const makeTokenizer = (captured: {
   idToToken: (id) => Option.fromNullishOr([...controlIds.entries()].find(([, tokenId]) => tokenId === id)?.[0])
 })
 
+// The script models generation's contract: add returns logits for script[0],
+// each step advances once, and close records deterministic session cleanup.
+// Logits are real device tensors; only the scheduler/state machine is faked.
 const makeProgram = (
   script: ReadonlyArray<number>,
-  state: { closed: boolean }
+  state: { closed: boolean; logits?: Array<Tensor.Concrete> }
 ): Model.InferenceProgram => {
   let step = 0
-  const logitsFor = (token: number) => {
-    const values = new Float32Array(EOS + 1)
-    values[token] = 1
-    return Tensor.fromTypedArray(values, [values.length])
-  }
+  const logitsFor = (token: number) =>
+    Effect.gen(function*() {
+      const values = new Float32Array(EOS + 1)
+      values[token] = 1
+      const [logits] = yield* Tensor.compute([yield* Tensor.fromTypedArray(values, [values.length])])
+      state.logits?.push(logits)
+      return logits
+    })
   const seq = {
     sequence: {} as Tensor.KvSequence,
     cursor: () => Effect.succeed(0),
@@ -172,6 +178,28 @@ onDevices("Chat", () => (it) => {
           expect(done.result.stats.generatedTokens).toBe(2)
         }
         expect(programState.closed).toBe(true)
+      }))
+
+    it.effect("clears unread logits when downstream stops after prefill", () =>
+      Effect.gen(function*() {
+        const programState: { closed: boolean; logits: Array<Tensor.Concrete> } = { closed: false, logits: [] }
+        const events = Array.from(
+          yield* Stream.runCollect(
+            Chat.stream({
+              program: makeProgram([5], programState),
+              tokenizer: makeTokenizer({}),
+              template: "{{ messages }}",
+              messages: [{ role: "user", content: "hello" }],
+              controls: false,
+              stopTokens: [EOS]
+            }).pipe(Stream.take(1))
+          )
+        )
+
+        expect(events.map((event) => event._tag)).toEqual(["prefill"])
+        expect(programState.closed).toBe(true)
+        const error = yield* Effect.flip(Tensor.toNumberArray(programState.logits[0]!))
+        expect(error.message).toContain("cleared")
       }))
   })
 })

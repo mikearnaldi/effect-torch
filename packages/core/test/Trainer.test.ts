@@ -119,6 +119,8 @@ onDevices("Trainer", (device) => (it) => {
         })
         runs.push([])
         const first = yield* trainer.train()
+        // Final params and state roots transfer to the caller; release the first
+        // run before reusing the trainer so this lifecycle test leaks no buffers.
         const firstOwned = [
           ...first.params,
           ...trainer.config.optimizer.stateRoots(first.state).filter(Tensor.isTensor)
@@ -183,6 +185,8 @@ onDevices("Trainer", (device) => (it) => {
       }))
   })
 
+  // Compiled tests compare the cached trace loop with its uncompiled reference.
+  // Cache cleanup drops JS programs, not lower-level native pipeline artifacts.
   describe("compiled", () => {
     it.effect("agrees with the uncompiled loop step-for-step on a deterministic graph", () =>
       Effect.gen(function*() {

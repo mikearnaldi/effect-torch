@@ -1,16 +1,19 @@
 /**
- * Epoch samplers for language-model training. They draw a shuffled
- * permutation of the non-overlapping `block` windows in a token sequence,
- * without replacement within an epoch. If the window count is not a multiple
+ * Synchronous epoch samplers for next-token language-model training. They draw
+ * a shuffled permutation of input blocks at offsets `i * block`, where a caller
+ * can consume `block + 1` tokens to form a `block`-token input and its shifted
+ * target. Input blocks do not overlap; adjacent full input/target spans share
+ * their boundary token. Sampling is without replacement within the
+ * usable complete batches of an epoch. If the window count is not a multiple
  * of `batch`, the trailing partial batch is skipped before reshuffling. A
- * sampler returns only window offsets; the caller materializes the windows,
- * so any token storage can be used.
+ * sampler returns only offsets; the caller owns and materializes token storage.
  *
  * {@link Sampler.state} snapshots the configuration, permutation, cursor, and
  * epoch for checkpoint persistence and {@link restore}. A restored sampler
- * reproduces the remaining draws in that permutation exactly. The global
- * `Math.random` state is not captured, so a later reshuffle is a new random
- * event and need not match an uninterrupted sampler.
+ * reproduces every remaining complete batch in that permutation exactly. The
+ * global `Math.random` state is not captured, so a boundary that immediately
+ * reshuffles, or any later reshuffle, is a new random event and need not match
+ * an uninterrupted sampler.
  *
  * @since 0.1.0
  */
@@ -39,9 +42,9 @@ export class SamplerError extends Data.TaggedError("SamplerError")<{
  * @category models
  */
 export interface SamplerConfig {
-  /** Total token count used to derive the available window starts. */
+  /** Total token count; each start must leave `block` following tokens available. */
   readonly length: number
-  /** Window size and stride in tokens. */
+  /** Input length and stride in tokens; a shifted-target sample uses `block + 1` tokens. */
   readonly block: number
   /** Number of window offsets returned by each draw. */
   readonly batch: number
@@ -51,21 +54,30 @@ export interface SamplerConfig {
  * A detached, restorable snapshot of a sampler. {@link restore} validates the
  * configuration, permutation, cursor, and epoch before copying them. The
  * snapshot fixes only the current permutation; it does not contain
- * `Math.random` state for future reshuffles.
+ * `Math.random` state for future reshuffles. Runtime validation reconstructs
+ * rather than checks the incoming `_tag` discriminant.
  *
  * @since 0.1.0
  * @category models
  */
 export interface SamplerState {
-  /** Discriminant for serialized sampler state. */
+  /** Discriminant emitted by snapshots and checkpoint decoding. */
   readonly _tag: "SamplerState"
   /** The exact configuration under which `order` was generated. */
   readonly config: SamplerConfig
   /** A permutation of every index from `0` through `floor((length - 1) / block) - 1`. */
   readonly order: Uint32Array
-  /** Next unread position in `order`, in range and divisible by `config.batch`. */
+  /**
+   * Next unread position in `order`, in `0..order.length` and divisible by
+   * `config.batch`. It may point at a trailing incomplete batch, which the next
+   * draw skips before reshuffling.
+   */
   readonly cursor: number
-  /** One-based epoch number; restorable values are limited to a positive u32. */
+  /**
+   * One-based current-permutation label. It increments when `next` reshuffles,
+   * immediately before returning the new epoch's first batch, and wraps from
+   * `0xffff_ffff` to `1`.
+   */
   readonly epoch: number
 }
 
@@ -78,11 +90,13 @@ export interface SamplerState {
  */
 export interface Sampler {
   /**
-   * Draws the next complete batch of token offsets. At an epoch boundary it
-   * drops any trailing partial batch, reshuffles, and then draws.
+   * Draws the next complete batch of token offsets synchronously. At an epoch
+   * boundary it drops any trailing partial batch, reshuffles the whole order,
+   * increments the epoch, and then draws. The returned number array is detached
+   * from sampler state.
    */
   readonly next: () => ReadonlyArray<number>
-  /** Returns a copy of the current configuration, permutation, cursor, and epoch. */
+  /** Returns detached copies of the current configuration and permutation plus cursor and epoch. */
   readonly state: () => SamplerState
 }
 
@@ -133,7 +147,7 @@ const fromOrder = (config: SamplerConfig, order: Uint32Array, cursor: number, ep
     if (cursor + stableConfig.batch > windowCount) {
       shuffle(order)
       cursor = 0
-      epoch += 1
+      epoch = epoch === U32_MAX ? 1 : epoch + 1
     }
     const starts = new Array<number>(stableConfig.batch)
     for (let b = 0; b < stableConfig.batch; b++) {
@@ -190,9 +204,10 @@ const checkState = (
 }
 
 /**
- * Creates a sampler over a fresh permutation shuffled with `Math.random`.
- * The configuration is copied and must contain positive u32 integers with at
- * least `batch` derived windows; otherwise it fails with {@link SamplerError}.
+ * Creates a sampler over a fresh permutation shuffled with the process-global
+ * `Math.random`. The configuration is copied synchronously when `make` is
+ * called and must contain positive u32 integers with at least `batch` derived
+ * windows; otherwise the returned effect fails with {@link SamplerError}.
  *
  * @since 0.1.0
  * @category constructors
@@ -209,13 +224,17 @@ export const make = (config: SamplerConfig): Effect.Effect<Sampler, SamplerError
 
 /**
  * Restores a sampler from a previously captured {@link SamplerState}. The
- * requested configuration must exactly equal `state.config`; both must imply
- * the same window count. `order` must be a complete permutation, `cursor`
- * must be in range and batch-aligned, and `epoch` must be a positive u32.
+ * requested configuration must exactly equal `state.config`; both inputs are
+ * copied synchronously when `restore` is called, and both must imply the same
+ * window count. `order` must be a complete permutation, `cursor` must be in
+ * range and batch-aligned, and `epoch` must be a positive u32.
  * Invalid input fails with {@link SamplerError}; accepted input is copied.
  *
- * Remaining draws in the saved permutation are exact. A reshuffle after that
- * uses the process's current `Math.random` state, which is not persisted.
+ * Remaining complete batches in the saved permutation are exact. If fewer than
+ * `batch` entries remain, the first restored draw already reshuffles and is not
+ * reproducible from the snapshot alone. Reshuffling uses the process's current
+ * `Math.random` state, which is not persisted. Epoch is a one-based u32
+ * permutation counter and wraps from `0xffff_ffff` to `1`.
  *
  * @since 0.1.0
  * @category constructors

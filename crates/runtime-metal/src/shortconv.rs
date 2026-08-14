@@ -1,53 +1,106 @@
 //! Fused causal depthwise short convolution on Metal (RFC 0018): the
-//! KDA local-mixing conv y[t,c] = sum_j w[c,j] * x[t-K+1+j, c] with zero
+//! KDA local-mixing conv `y[t,c] = sum_j w[c,j] * x[t-K+1+j, c]` with zero
 //! or carried history. One launch per call replaces the composed
 //! pad/conv1d/transpose chain; the stateful ConvState decode/prefill
 //! path passes the slot's [K-1, C] window as history and receives the
 //! shifted window back (only the `advance` real rows shift in — chunked
 //! prefill right-pads). All channel counts and kernel sizes are
 //! supported; the dtype gate fails loud.
+//!
+//! ## Kernel contracts
+//!
+//! - **Forward** (`et_shortconv_fwd`): `x` is `[.., steps, C]`, `w` is
+//!   `[C, K]`; taps before step 0 read the optional f32 history window
+//!   `[K-1, C]`. When the window-write flag is set, the last `K-1` real
+//!   rows (of the `advance` prefix) plus surviving history are written
+//!   back as the shifted f32 window — this is the ConvState transaction.
+//!   History/state are single-sequence only (`batch == 1`).
+//! - **Backward-x** (`et_shortconv_bwd_x`): full correlation of the
+//!   cotangent against the time-reversed taps, `dx[s] = sum_j
+//!   w[c, K-1-j] * g[s+j, c]`, implicitly right-zero-padded.
+//! - **Backward-w** (`et_shortconv_bwd_w`): `dw[c, j] = sum_{b,t}
+//!   g[t, c] * x[t-K+1+j, c]` over the causal window, one thread per
+//!   (channel, tap) with serial time loops.
+//!
+//! All three kernels accumulate in f32 regardless of storage dtype
+//! (f32 or bf16) and require contiguous, offset-0-compatible views;
+//! the `*_into` entry points validate shapes and mark destination
+//! buffers written, but allocate nothing.
 
 use crate::runtime::dtype::DType;
 
+/// Planner-facing resource requirements of one forward launch
+/// (stateless or ConvState-transaction).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ForwardRequirements {
+    /// Storage dtype of input, weight, and output (f32 or bf16).
     pub dtype: DType,
+    /// Bytes of the `[batch, steps, channels]` output.
     pub output_bytes: usize,
+    /// Bytes of the f32 `[K-1, C]` next-window state; 0 when the call
+    /// does not carry state.
     pub state_next_bytes: usize,
+    /// Always 0: the kernels take no staging views.
     pub staging_bytes: usize,
+    /// Always 0: the kernels report no runtime status.
     pub status_bytes: usize,
+    /// Always 0: the kernels need no scratch workspace.
     pub scratch_bytes: usize,
+    /// Always 1: a single fused forward kernel per launch.
     pub pipeline_count: usize,
 }
 
+/// Planner-facing resource requirements of the combined backward
+/// (backward-x + backward-w, two launches).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BackwardRequirements {
+    /// Storage dtype of gradients and weights (f32 or bf16).
     pub dtype: DType,
+    /// Bytes of the `dx` output (`[batch, steps, channels]`).
     pub dx_bytes: usize,
+    /// Bytes of the `dweight` output (`[channels, kernel]`).
     pub dweight_bytes: usize,
+    /// Always 0: no staging views.
     pub staging_bytes: usize,
+    /// Always 0: no runtime status.
     pub status_bytes: usize,
+    /// Always 0: no scratch workspace.
     pub scratch_bytes: usize,
+    /// Always 2: backward-x and backward-w pipelines.
     pub pipeline_count: usize,
 }
 
+/// Planner-facing resource requirements of the backward-x launch alone.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BackwardXRequirements {
+    /// Storage dtype of cotangent and `dx` (f32 or bf16).
     pub dtype: DType,
+    /// Bytes of the `dx` output (`[batch, steps, channels]`).
     pub output_bytes: usize,
+    /// Always 0: no staging views.
     pub staging_bytes: usize,
+    /// Always 0: no runtime status.
     pub status_bytes: usize,
+    /// Always 0: no scratch workspace.
     pub scratch_bytes: usize,
+    /// Always 1: a single backward-x kernel per launch.
     pub pipeline_count: usize,
 }
 
+/// Planner-facing resource requirements of the backward-w launch alone.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BackwardWRequirements {
+    /// Storage dtype of `dweight` (f32 or bf16).
     pub dtype: DType,
+    /// Bytes of the `dweight` output (`[channels, kernel]`).
     pub output_bytes: usize,
+    /// Always 0: no staging views.
     pub staging_bytes: usize,
+    /// Always 0: no runtime status.
     pub status_bytes: usize,
+    /// Always 0: no scratch workspace.
     pub scratch_bytes: usize,
+    /// Always 1: a single backward-w kernel per launch.
     pub pipeline_count: usize,
 }
 
@@ -59,6 +112,9 @@ fn checked_bytes(elements: &[usize], dtype: DType, operation: &str) -> crate::er
         .ok_or_else(|| format!("{operation}: requirement byte size overflow"))
 }
 
+/// Requirements of a stateless forward over `batch` sequences of
+/// `steps` positions with `channels` channels and kernel size `kernel`.
+/// `write_state_next` additionally sizes the f32 next-window state.
 pub fn forward_requirements(
     dtype: DType,
     batch: usize,
@@ -89,6 +145,8 @@ pub fn forward_requirements(
     })
 }
 
+/// Requirements of a single-sequence ConvState transaction: forward
+/// plus the shifted-window state write.
 pub fn state_requirements(
     dtype: DType,
     steps: usize,
@@ -98,6 +156,7 @@ pub fn state_requirements(
     forward_requirements(dtype, 1, steps, channels, kernel, true)
 }
 
+/// Requirements of the combined backward (both dx and dweight launches).
 pub fn backward_requirements(
     dtype: DType,
     batch: usize,
@@ -118,6 +177,7 @@ pub fn backward_requirements(
     })
 }
 
+/// Requirements of the backward-x launch alone.
 pub fn backward_x_requirements(
     dtype: DType,
     batch: usize,
@@ -137,6 +197,7 @@ pub fn backward_x_requirements(
     })
 }
 
+/// Requirements of the backward-w launch alone.
 pub fn backward_w_requirements(
     dtype: DType,
     channels: usize,
@@ -189,6 +250,8 @@ mod requirement_tests {
     }
 }
 
+/// Whether the fused short-conv kernels support `dtype` (f32 or bf16;
+/// the kernels accumulate in f32).
 pub fn supported_dtype(dtype: DType) -> bool {
     matches!(dtype, DType::F32 | DType::BF16)
 }
@@ -209,14 +272,21 @@ mod metal {
 
     use objc2_metal::MTLComputeCommandEncoder;
 
+    /// Borrowed resource views supplied by the executable planner. All
+    /// short-conv kernels are self-contained, so every slice must be
+    /// empty; see [`IntoResources::empty`].
     #[derive(Clone, Copy)]
     pub struct IntoResources<'a> {
+        /// Must be empty.
         pub staging: &'a [MetalTensor],
+        /// Must be empty.
         pub status: &'a [MetalTensor],
+        /// Must be empty.
         pub scratch: &'a [MetalTensor],
     }
 
     impl IntoResources<'_> {
+        /// The (only) valid resource set for short-conv dispatches.
         pub const fn empty() -> Self {
             Self {
                 staging: &[],
@@ -440,6 +510,8 @@ kernel void et_shortconv_bwd_w(
         })
     }
 
+    /// Warms all three short-conv pipelines (forward, backward-x,
+    /// backward-w) for `dtype`.
     pub fn warm_all(dtype: DType) -> crate::err::Res<()> {
         pipeline(0xC041, dtype, "et_shortconv_fwd", || fwd_source(dtype))?;
         pipeline(0xC042, dtype, "et_shortconv_bwd_x", || bwd_x_source(dtype))?;
@@ -447,41 +519,50 @@ kernel void et_shortconv_bwd_w(
         Ok(())
     }
 
+    /// Warms the forward pipeline for `dtype`.
     pub fn warm_forward(dtype: DType) -> crate::err::Res<()> {
         pipeline(0xC041, dtype, "et_shortconv_fwd", || fwd_source(dtype))?;
         Ok(())
     }
 
+    /// Warms exactly the pipeline described by `requirements`.
     pub fn warm_forward_exact(requirements: &super::ForwardRequirements) -> crate::err::Res<()> {
         warm_forward(requirements.dtype)
     }
 
+    /// Warms the pipeline used by the ConvState transaction (same
+    /// kernel as the plain forward).
     pub fn warm_state(dtype: DType) -> crate::err::Res<()> {
         warm_forward(dtype)
     }
 
+    /// Warms the backward-x pipeline for `dtype`.
     pub fn warm_backward_x(dtype: DType) -> crate::err::Res<()> {
         pipeline(0xC042, dtype, "et_shortconv_bwd_x", || bwd_x_source(dtype))?;
         Ok(())
     }
 
+    /// Warms exactly the pipeline described by `requirements`.
     pub fn warm_backward_x_exact(
         requirements: &super::BackwardXRequirements,
     ) -> crate::err::Res<()> {
         warm_backward_x(requirements.dtype)
     }
 
+    /// Warms the backward-w pipeline for `dtype`.
     pub fn warm_backward_w(dtype: DType) -> crate::err::Res<()> {
         pipeline(0xC043, dtype, "et_shortconv_bwd_w", || bwd_w_source(dtype))?;
         Ok(())
     }
 
+    /// Warms exactly the pipeline described by `requirements`.
     pub fn warm_backward_w_exact(
         requirements: &super::BackwardWRequirements,
     ) -> crate::err::Res<()> {
         warm_backward_w(requirements.dtype)
     }
 
+    /// Warms both pipelines described by the combined backward plan.
     pub fn warm_backward_exact(requirements: &super::BackwardRequirements) -> crate::err::Res<()> {
         warm_backward_x(requirements.dtype)?;
         warm_backward_w(requirements.dtype)
@@ -504,9 +585,13 @@ kernel void et_shortconv_bwd_w(
         )
     }
 
-    // Forward: x [.., steps, C] (any leading batch without history; one
-    // sequence with history), weight [C, K]; optional f32 history
-    // [K-1, C]; when requested returns the shifted f32 window.
+    /// Non-allocating forward dispatch: `x [.., steps, C]`, `weight
+    /// [C, K]`, optional f32 `history [K-1, C]`, optional f32
+    /// `state_next [K-1, C]`. `advance` is the number of real rows (≤
+    /// `steps`; chunked prefill right-pads, so only the `advance`
+    /// prefix shifts into the window). History/state are
+    /// single-sequence only. Allocates nothing; requires the forward
+    /// pipeline to be warm.
     pub fn forward_into(
         x: &MetalTensor,
         weight: &MetalTensor,
@@ -600,6 +685,8 @@ kernel void et_shortconv_bwd_w(
         Ok(())
     }
 
+    /// ConvState transaction: [`forward_into`] with a mandatory
+    /// `state_next` window write.
     #[allow(clippy::too_many_arguments)]
     pub fn state_into(
         x: &MetalTensor,
@@ -621,6 +708,9 @@ kernel void et_shortconv_bwd_w(
         )
     }
 
+    /// Allocating convenience wrapper around [`forward_into`]: makes
+    /// inputs contiguous, warms the pipeline, and returns the output
+    /// plus the shifted window when `write_window` is set.
     pub fn forward(
         x: &MetalTensor,
         weight: &MetalTensor,
@@ -657,7 +747,9 @@ kernel void et_shortconv_bwd_w(
         Ok((output, state_next))
     }
 
-    // dx of the short conv: g [.., steps, C], weight [C, K] -> g's shape.
+    /// Non-allocating backward-x dispatch: cotangent `g [.., steps,
+    /// C]` and `weight [C, K]` produce `dx` with `g`'s shape. Allocates
+    /// nothing; requires the backward-x pipeline to be warm.
     pub fn backward_x_into(
         g: &MetalTensor,
         weight: &MetalTensor,
@@ -696,6 +788,7 @@ kernel void et_shortconv_bwd_w(
         Ok(())
     }
 
+    /// Allocating convenience wrapper around [`backward_x_into`].
     pub fn backward_x(g: &MetalTensor, weight: &MetalTensor) -> crate::err::Res<MetalTensor> {
         let shape = g.layout.shape().to_vec();
         let dtype = g.dtype;
@@ -707,8 +800,10 @@ kernel void et_shortconv_bwd_w(
         Ok(dx)
     }
 
-    // dw of the short conv: x and g [.., steps, C] -> [C, K] (summed over
-    // batch and time).
+    /// Non-allocating backward-w dispatch: `x` and cotangent `g` (both
+    /// `[.., steps, C]`) produce `dweight [C, kernel]`, summed over
+    /// batch and time. Allocates nothing; requires the backward-w
+    /// pipeline to be warm.
     pub fn backward_w_into(
         x: &MetalTensor,
         g: &MetalTensor,
@@ -752,6 +847,7 @@ kernel void et_shortconv_bwd_w(
         Ok(())
     }
 
+    /// Allocating convenience wrapper around [`backward_w_into`].
     pub fn backward_w(
         x: &MetalTensor,
         g: &MetalTensor,
@@ -767,6 +863,8 @@ kernel void et_shortconv_bwd_w(
         Ok(dweight)
     }
 
+    /// Combined non-allocating backward: dispatches backward-x into
+    /// `dx` and backward-w into `dweight` from one call.
     #[allow(clippy::too_many_arguments)]
     pub fn backward_into(
         x: &MetalTensor,

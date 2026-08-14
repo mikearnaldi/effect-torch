@@ -1,9 +1,37 @@
+//! GGML K-quant weight decoding and quantized inference kernels.
+//!
+//! Weights stored in GGUF K-quant formats ([`GgmlKQuant`]: `Q2_K`, `Q3_K`,
+//! `Q4_K`, `Q5_K`, `Q6_K`) are packed little-endian blocks of
+//! [`BLOCK_VALUES`] (256) values. Each block carries a few f16 global
+//! scale/min fields plus bit-packed per-group scales and quantized codes; the
+//! per-codec decoders below mirror `block_q*_K`/`dequantize_row_q*_K` in
+//! upstream ggml exactly.
+//!
+//! Two kernels consume packed weights without materializing them:
+//!
+//! - `quantized_linear` (`*_requirements`/`*_into`) computes
+//!   `input[.., columns] × weight[rows, columns]ᵀ (+ bias)`, decoding one
+//!   block at a time into a 256-element stack buffer and accumulating in
+//!   `f32`.
+//! - `quantized_embedding` decodes only the rows selected by `u32`/`i64`
+//!   indexes, producing `[indexes..., columns]` f32 output.
+//!
+//! Packed weights must be exact contiguous `[rows, encoded_row_bytes]` `u8`
+//! tensors with zero layout offset. Both kernels poll the
+//! [`CancellationFlag`] at vector and block granularity and abort with
+//! `"operation aborted"`.
+
 use crate::{CpuBuffer, CpuDestination, CpuTensorRequirement, Tensor};
 use effect_torch_runtime::{CancellationFlag, DType, GgmlKQuant};
 use half::f16;
 
+/// Number of logical values in one K-quant block, for all codecs.
 const BLOCK_VALUES: usize = 256;
 
+/// Frozen plan of one quantized linear or embedding invocation.
+///
+/// `output` is always f32; `encoded_row_bytes` is the packed size of one
+/// weight row (`columns / 256 * block_bytes(codec)`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QuantizedRequirements {
     pub(crate) output: CpuTensorRequirement,
@@ -27,6 +55,8 @@ fn checked_f32_output(shape: &[usize], operation: &str) -> Result<CpuTensorRequi
     Ok(CpuTensorRequirement::new(shape, DType::F32))
 }
 
+/// Packed byte size of one 256-value block for `codec` (matches ggml's
+/// `sizeof(block_q*_K)`).
 fn block_bytes(codec: GgmlKQuant) -> usize {
     match codec {
         GgmlKQuant::Q2K => 84,
@@ -37,10 +67,13 @@ fn block_bytes(codec: GgmlKQuant) -> usize {
     }
 }
 
+/// Reads a little-endian f16 field of a packed block as f32.
 fn fp16_at(block: &[u8], offset: usize) -> f32 {
     f16::from_bits(u16::from_le_bytes([block[offset], block[offset + 1]])).to_f32()
 }
 
+/// Unpacks the 6-bit (scale, min) pair for group `index` from the shared
+/// 12-byte scale field of Q4_K/Q5_K blocks (ggml's packed `get_scale_min_k4`).
 fn scale_min_k4(index: usize, scales: &[u8]) -> (u8, u8) {
     if index < 4 {
         (scales[index] & 63, scales[index + 4] & 63)
@@ -52,6 +85,8 @@ fn scale_min_k4(index: usize, scales: &[u8]) -> (u8, u8) {
     }
 }
 
+/// Decodes one packed block into 256 f32 values. `block` must be exactly the
+/// codec's block size.
 pub(crate) fn decode_block(
     codec: GgmlKQuant,
     block: &[u8],
@@ -77,6 +112,8 @@ pub(crate) fn decode_block(
 
 // These offsets and bit traversals mirror block_q*_K and dequantize_row_q*_K
 // in current ggml. K-quant blocks are little-endian GGUF payloads.
+/// Q2_K: 16 groups of 16, two-bit codes, 4-bit scale/min per group, f16
+/// global `d`/`dmin`.
 fn decode_q2_k(block: &[u8], output: &mut [f32; BLOCK_VALUES]) {
     let scales = &block[..16];
     let quants = &block[16..80];
@@ -100,6 +137,8 @@ fn decode_q2_k(block: &[u8], output: &mut [f32; BLOCK_VALUES]) {
     }
 }
 
+/// Q3_K: 16 groups of 16, two-bit codes plus a one-bit high mask, 6-bit
+/// signed group scales biased by 32, f16 global scale.
 fn decode_q3_k(block: &[u8], output: &mut [f32; BLOCK_VALUES]) {
     let hmask = &block[..32];
     let quants = &block[32..96];
@@ -136,6 +175,8 @@ fn decode_q3_k(block: &[u8], output: &mut [f32; BLOCK_VALUES]) {
     }
 }
 
+/// Q4_K: 8 groups of 32, four-bit codes, packed 6-bit scale/min pairs
+/// ([`scale_min_k4`]), f16 global `d`/`dmin`.
 fn decode_q4_k(block: &[u8], output: &mut [f32; BLOCK_VALUES]) {
     let d = fp16_at(block, 0);
     let dmin = fp16_at(block, 2);
@@ -157,6 +198,8 @@ fn decode_q4_k(block: &[u8], output: &mut [f32; BLOCK_VALUES]) {
     }
 }
 
+/// Q5_K: like Q4_K plus a 32-byte high-bit plane extending codes to five
+/// bits.
 fn decode_q5_k(block: &[u8], output: &mut [f32; BLOCK_VALUES]) {
     let d = fp16_at(block, 0);
     let dmin = fp16_at(block, 2);
@@ -190,6 +233,8 @@ fn decode_q5_k(block: &[u8], output: &mut [f32; BLOCK_VALUES]) {
     }
 }
 
+/// Q6_K: 16 groups of 16, six-bit codes (4 low bits + 2 high bits) biased by
+/// −32, signed 8-bit group scales, f16 global scale.
 fn decode_q6_k(block: &[u8], output: &mut [f32; BLOCK_VALUES]) {
     let low = &block[..128];
     let high = &block[128..192];
@@ -215,6 +260,9 @@ fn decode_q6_k(block: &[u8], output: &mut [f32; BLOCK_VALUES]) {
     }
 }
 
+/// Validates that `weight` is an exact contiguous packed `[rows,
+/// encoded_row_bytes]` u8 tensor for `codec`, returning the encoded row
+/// width.
 fn validate_weight(
     operation: &str,
     weight: &Tensor,
@@ -243,6 +291,9 @@ fn validate_weight(
     Ok(encoded_row_bytes)
 }
 
+/// Plans `quantized_linear`: validates the f32 rank ≥ 2 input, the packed
+/// weight, and the optional `[rows]` f32 bias, and computes the f32 output
+/// requirement with the trailing dimension replaced by `rows`.
 pub(crate) fn linear_requirements(
     input: &Tensor,
     weight: &Tensor,
@@ -284,6 +335,8 @@ pub(crate) fn linear_requirements(
     })
 }
 
+/// Plans `quantized_embedding`: validates u32/i64 indexes and the packed
+/// weight, and computes the `[indexes..., columns]` f32 output requirement.
 pub(crate) fn embedding_requirements(
     indexes: &Tensor,
     weight: &Tensor,
@@ -361,6 +414,8 @@ fn validate_linear_execution(
     Ok(vectors)
 }
 
+/// Executes a planned quantized linear allocation-free, decoding blocks on
+/// the fly and polling `cancelled` per vector and per block.
 pub(crate) fn linear_into(
     input: &Tensor,
     weight: &Tensor,
@@ -485,6 +540,9 @@ fn validate_embedding_execution(
     Ok(count)
 }
 
+/// Executes a planned quantized embedding allocation-free, decoding only the
+/// selected rows. Indexes are bounds-checked; negative i64 indexes are
+/// errors.
 pub(crate) fn embedding_into(
     indexes: &Tensor,
     weight: &Tensor,

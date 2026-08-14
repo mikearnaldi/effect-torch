@@ -36,6 +36,8 @@ const trainBpe = (
 
 const numbers = (ids: Tokenizer.TokenIds): Effect.Effect<Array<number>> => Effect.succeed(Array.from(ids.data))
 
+// These are native integration tests: model training and artifacts exercise the
+// package-local addon, while batching policies belong to the TypeScript facade.
 describe("Tokenizer", () => {
   describe("BPE", () => {
     it.effect("encodes to a [T] u32 tensor and decodes losslessly, including unicode", () =>

@@ -1,3 +1,38 @@
+//! Tiled matmul family: naive tiled gemm, simdgroup-MMA gemm, and split-K
+//! gemm, all with fused bias/residual/gelu epilogues.
+//!
+//! # Algorithms
+//!
+//! - [`GemmAlgorithm::Tiled`] — one threadgroup per 16×16 output tile,
+//!   threadgroup-memory staged; the reference path, used for small shapes
+//!   and when MMA is disabled (`EFFECT_TORCH_NO_MMA`).
+//! - [`GemmAlgorithm::SimdgroupMma`] — 8×8 simdgroup matrix
+//!   multiply-accumulate, one threadgroup per 64×64 (or 32×32 on smaller
+//!   threadgroup-memory devices) output tile. bf16/f16 stage and multiply
+//!   natively with an f32 accumulator; f32 stages as f32.
+//! - [`GemmAlgorithm::SplitK`] — for long-K narrow-output gemms (backward
+//!   dX/dW): K is partitioned across threadgroups writing f32 partials,
+//!   reduced by a second kernel in a fixed order (deterministic). Plain
+//!   epilogues only.
+//!
+//! # Restrictions
+//!
+//! - dtypes: f32, f16, bf16 only; M, N, K and batch strides must fit u32;
+//!   inputs and destinations must be contiguous (strides are the batch
+//!   strides `stride_a`/`stride_b`, row-major within a matrix).
+//! - The epilogue contract is fixed: `v = acc + bias + residual` (each
+//!   optional), stored plainly, through gelu, or — dual — both (plain
+//!   pre-activation for backward, gelu output for the next op).
+//!
+//! # Planning contract
+//!
+//! [`gemm_requirements`]/[`matmul_requirements`] compute the exact
+//! algorithm, output sizes, and split-K scratch for a shape; planning
+//! snapshots the MMA environment so later changes cannot alter a compiled
+//! executable. `precompile_*` caches exactly those pipelines; the
+//! `*_into` entry points validate every buffer against the requirements
+//! and dispatch without allocating.
+
 use super::device::{set_buffer, set_bytes, MetalDevice};
 use super::emit::ACT_FNS;
 use super::run::MetalTensor;
@@ -14,11 +49,17 @@ const TILE: usize = 16;
 /// writes both).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Epilogue {
+    /// Store `acc + bias` unchanged.
     None,
+    /// Store `acc + bias + R` (residual add, full-size extra input).
     Residual,
+    /// Store `gelu_erf(acc + bias)`.
     GeluErf,
+    /// Store `gelu_tanh(acc + bias)`.
     GeluTanh,
+    /// Dual store: plain pre-activation to `D`, `gelu_erf(v)` to `D2`.
     GeluErfDual,
+    /// Dual store: plain pre-activation to `D`, `gelu_tanh(v)` to `D2`.
     GeluTanhDual,
 }
 
@@ -173,6 +214,7 @@ fn mma_config(dev: &MetalDevice) -> MmaConfig {
     })
 }
 
+/// Batched gemm problem size: `batch` independent `m×k · k×n` products.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct GemmShape {
     pub batch: usize,
@@ -181,13 +223,15 @@ pub struct GemmShape {
     pub k: usize,
 }
 
+/// The kernel selected for a gemm shape (see the module docs).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum GemmAlgorithm {
+    /// 16×16 threadgroup-tiled reference kernel.
     Tiled,
-    SimdgroupMma {
-        tile: usize,
-        threads: usize,
-    },
+    /// Simdgroup-MMA kernel with the given tile/threads geometry.
+    SimdgroupMma { tile: usize, threads: usize },
+    /// Split-K: MMA partials over `splits` K-slices plus a deterministic
+    /// reduce kernel.
     SplitK {
         tile: usize,
         threads: usize,
@@ -205,6 +249,7 @@ impl GemmAlgorithm {
     }
 }
 
+/// Exact f32 partials buffer a split-K gemm needs: `[splits, batch, m, n]`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct SplitKScratchRequirement {
     pub dtype: DType,
@@ -218,15 +263,25 @@ pub struct SplitKScratchRequirement {
 /// cannot change the algorithm or its scratch requirement.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct GemmRequirements {
+    /// The batched problem shape.
     pub shape: GemmShape,
+    /// Element type of every operand and output (f32/f16/bf16).
     pub dtype: DType,
+    /// Whether a per-column bias vector is bound.
     pub has_bias: bool,
+    /// The fused epilogue.
     pub epilogue: Epilogue,
+    /// Whether MMA selection was enabled at planning time.
     pub mma: bool,
+    /// The selected kernel and its geometry.
     pub algorithm: GemmAlgorithm,
+    /// `batch * m * n`.
     pub output_elements: usize,
+    /// `output_elements * dtype size`.
     pub output_bytes: usize,
+    /// 1, or 2 for dual epilogues (plain + gelu outputs).
     pub output_count: usize,
+    /// f32 partials buffer required by the split-K algorithm.
     pub split_k_scratch: Option<SplitKScratchRequirement>,
 }
 
@@ -278,6 +333,10 @@ fn mma_candidate(
     Ok(None)
 }
 
+/// Plans a gemm: validates dtype/dimension limits, selects the algorithm
+/// (MMA only when `mma` and the shape saturates the GPU; split-K only for
+/// plain long-K narrow-output cases), and computes exact output/scratch
+/// sizes. Pure — no allocation or compilation.
 #[allow(clippy::too_many_arguments)]
 pub fn gemm_requirements(
     dev: &MetalDevice,
@@ -362,6 +421,8 @@ pub fn gemm_requirements(
     })
 }
 
+/// Plans a plain batched matmul from operand shapes (rank ≥ 2, inner dims
+/// equal, batch dims broadcast-compatible).
 pub fn matmul_requirements(
     dev: &MetalDevice,
     a_shape: &[usize],
@@ -851,6 +912,7 @@ pub fn precompile_gemm_fused(
     }
 }
 
+/// [`precompile_gemm_fused`] under its former name.
 pub fn precompile_gemm(
     dev: &MetalDevice,
     requirements: &GemmRequirements,
@@ -858,6 +920,7 @@ pub fn precompile_gemm(
     precompile_gemm_fused(dev, requirements)
 }
 
+/// [`precompile_gemm_fused`] for matmul requirements.
 pub fn precompile_matmul(
     dev: &MetalDevice,
     requirements: &GemmRequirements,
@@ -865,6 +928,7 @@ pub fn precompile_matmul(
     precompile_gemm_fused(dev, requirements)
 }
 
+/// Plans and precompiles in one call; returns the pipeline count.
 #[allow(clippy::too_many_arguments)]
 pub fn warm_gemm_fused(
     dev: &MetalDevice,
@@ -936,6 +1000,11 @@ fn validate_contiguous(
     Ok(())
 }
 
+/// Dispatches a fused gemm into caller-provided destinations, validating
+/// every operand, output, and scratch buffer against `requirements` (which
+/// must have been planned and precompiled for exactly these arguments).
+/// Buffer bindings: A=0, B=1, D=2, bias=3, dims/strides=4–8, residual=9,
+/// dual output=10. Performs no allocation.
 #[allow(clippy::too_many_arguments)]
 pub fn gemm_fused_into(
     dev: &MetalDevice,
@@ -1120,6 +1189,7 @@ pub fn gemm_fused_into(
     Ok(())
 }
 
+/// [`gemm_fused_into`] restricted to the plain single-output epilogue.
 #[allow(clippy::too_many_arguments)]
 pub fn gemm_into(
     dev: &MetalDevice,
@@ -1150,6 +1220,8 @@ pub fn gemm_into(
     )
 }
 
+/// Allocating fused gemm: plans, precompiles, allocates output(s) and any
+/// split-K scratch, and dispatches.
 #[allow(clippy::too_many_arguments)]
 pub fn gemm_fused(
     dev: &MetalDevice,
@@ -1199,6 +1271,7 @@ pub fn gemm_fused(
     Ok((out, out2))
 }
 
+/// Allocating plain gemm with optional bias.
 #[allow(clippy::too_many_arguments)]
 pub fn gemm(
     dev: &MetalDevice,
@@ -1229,6 +1302,9 @@ pub fn gemm(
     .map(|(out, _)| out)
 }
 
+/// Batched matmul into a caller-provided destination: validates the exact
+/// requirements, derives batch strides (0 when that operand broadcasts),
+/// and dispatches the plain epilogue.
 pub fn matmul_into(
     dev: &MetalDevice,
     a: &MetalTensor,
@@ -1305,6 +1381,7 @@ pub fn matmul_into(
     )
 }
 
+/// Allocating batched matmul with batch-dimension broadcasting.
 pub fn matmul(dev: &MetalDevice, a: &MetalTensor, b: &MetalTensor) -> Result<MetalTensor, String> {
     let requirements = matmul_requirements(
         dev,
@@ -1350,6 +1427,9 @@ mod tests {
         dev.synchronize().unwrap();
         let got = out.read_f32().unwrap();
         let mut want = vec![0f32; m * n];
+        // SAFETY: `a`, `b`, and `want` are live vectors of exactly the
+        // m*k, k*n, and m*n elements the sgemm signature reads/writes with
+        // the given row-major leading dimensions.
         unsafe {
             matrixmultiply::sgemm(
                 m,
@@ -1651,6 +1731,8 @@ mod tests {
         let gotb: Vec<f32> = {
             let n = outb.numel();
             let ptr = outb.buffer.contents_ptr().cast::<u16>();
+            // SAFETY: synchronized above; the bf16 buffer holds `n` u16
+            // elements and shared-mode contents are host-readable.
             let bits = unsafe { std::slice::from_raw_parts(ptr, n) };
             bits.iter()
                 .map(|b| half::bf16::from_bits(*b).to_f32())

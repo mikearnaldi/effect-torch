@@ -1,3 +1,10 @@
+// Canonical native release matrix shared by build and verification scripts.
+// `suffix` is the npm artifact/loader selector; `triple` identifies Cargo's
+// target output directory, while `buildTarget` may request cargo-zigbuild's
+// glibc-baseline target. Package `targets` are also the exact .node files placed
+// on each package's npm whitelist. Keep these values aligned with the loaders;
+// Linux loaders select GNU versus musl from Node's runtime glibc report.
+
 import path from "node:path"
 import { fileURLToPath } from "node:url"
 

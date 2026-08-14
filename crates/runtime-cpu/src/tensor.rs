@@ -1,3 +1,29 @@
+//! CPU tensors, buffers, element traits, and the destination capability.
+//!
+//! A [`Tensor`] pairs a dtype-tagged [`CpuBuffer`] (a typed view into an
+//! aligned [`CpuSegment`]) with a [`Layout`] describing the logical shape,
+//! strides, and storage offset. Views are cheap: cloning a tensor shares the
+//! buffer and only changes the layout.
+//!
+//! # Requirements and destinations
+//!
+//! Every operation exposes `*_requirements` planners returning
+//! [`CpuTensorRequirement`]s (shape, dtype, byte size, alignment) for the
+//! output and any scratch tensors, plus a `*_into` entry point that writes
+//! into a [`CpuDestination`] instead of allocating. The allocating wrapper
+//! (e.g. [`Tensor::full`]) is exactly `empty` + `destination` + `*_into`.
+//!
+//! # Destination safety rules
+//!
+//! [`CpuDestination`] is the only path to mutable tensor data. It can be
+//! created safely only when the buffer is uniquely owned (no aliasing views),
+//! and it is non-`Send`, non-cloneable, and borrows the tensor exclusively
+//! for its lifetime. The unsafe `CpuDestination::from_planned` constructor
+//! exists for the compiled executor, whose fixed memory plan and linear
+//! command schedule guarantee exclusive access to each planned range for the
+//! duration of the write. All destination writes validate dtype, shape,
+//! contiguity, and capacity before touching memory.
+
 use crate::storage::{
     assert_allocation_allowed, CpuElement, CpuSegment, CpuStorage, CpuStorageRetention,
     CPU_STORAGE_ALIGNMENT,
@@ -8,6 +34,10 @@ use std::marker::PhantomData;
 use std::rc::Rc;
 use std::sync::Arc;
 
+/// Dense element storage of a [`Tensor`], tagged by dtype.
+///
+/// Variants wrap [`CpuStorage`] views; cloning a buffer aliases the same
+/// segment bytes.
 #[derive(Debug, Clone)]
 pub enum CpuBuffer {
     F32(CpuStorage<f32>),
@@ -20,6 +50,7 @@ pub enum CpuBuffer {
 }
 
 impl CpuBuffer {
+    /// Dtype of the stored elements.
     pub fn dtype(&self) -> DType {
         match self {
             CpuBuffer::F32(_) => DType::F32,
@@ -32,6 +63,7 @@ impl CpuBuffer {
         }
     }
 
+    /// Number of elements covered by this view.
     pub fn len(&self) -> usize {
         match self {
             CpuBuffer::F32(v) => v.len(),
@@ -44,10 +76,13 @@ impl CpuBuffer {
         }
     }
 
+    /// Byte size of this view.
     pub fn byte_len(&self) -> usize {
         self.len() * self.dtype().size_in_bytes()
     }
 
+    /// Creates a dense buffer viewing `len` elements of `dtype` at
+    /// `byte_offset` within `owner`, validating alignment and bounds.
     pub fn from_segment(
         owner: Arc<CpuSegment>,
         byte_offset: usize,
@@ -95,12 +130,25 @@ impl CpuBuffer {
     }
 }
 
+/// Typed element operations used to write dtype-generic kernels once and
+/// dispatch them across the [`CpuBuffer`] variants.
+///
+/// `to_f64`/`from_f64` form the numeric conversion hub: mixed-dtype kernels
+/// (casts, linalg) route values through `f64`.
 pub trait Elem: CpuElement {
+    /// Copies a vector into freshly allocated, uniquely owned storage.
     fn buffer_of(v: Vec<Self>) -> CpuBuffer;
+    /// The runtime dtype corresponding to `Self`.
     fn dtype() -> DType;
+    /// Widens the element to `f64`.
     fn to_f64(self) -> f64;
+    /// Narrows an `f64` into the element type (rounding/truncating as the
+    /// type dictates).
     fn from_f64(x: f64) -> Self;
+    /// Returns the logical elements of `t` as a dense slice, or `None` if the
+    /// dtype does not match or the layout is not contiguous.
     fn slice_of(t: &Tensor) -> Option<&[Self]>;
+    /// Returns the storage of `buffer` if its variant matches `Self`.
     fn storage_of(buffer: &CpuBuffer) -> Option<&CpuStorage<Self>>;
 }
 
@@ -159,6 +207,10 @@ impl_elem!(u8, U8, DType::U8, |x| x as f64, |x| x as u8);
 impl_elem!(u32, U32, DType::U32, |x| x as f64, |x| x as u32);
 impl_elem!(i64, I64, DType::I64, |x| x as f64, |x| x as i64);
 
+/// Exact memory requirement of one tensor: shape, dtype, total bytes, and
+/// alignment. Produced by the `*_requirements` planners so callers (and the
+/// compiled executor's memory planner) can pre-allocate destinations and
+/// scratch before running allocation-free `*_into` kernels.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CpuTensorRequirement {
     pub shape: Vec<usize>,
@@ -168,6 +220,9 @@ pub struct CpuTensorRequirement {
 }
 
 impl CpuTensorRequirement {
+    /// Requirement of a dense tensor of `shape` and `dtype`, aligned to
+    /// [`CPU_STORAGE_ALIGNMENT`]. Panics on element-count or byte-size
+    /// overflow.
     pub fn new(shape: &[usize], dtype: DType) -> Self {
         let elements = shape
             .iter()
@@ -185,6 +240,7 @@ impl CpuTensorRequirement {
     }
 }
 
+/// Output plus scratch requirements of one operation invocation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CpuOperationRequirements {
     pub output: CpuTensorRequirement,
@@ -192,6 +248,7 @@ pub struct CpuOperationRequirements {
 }
 
 impl CpuOperationRequirements {
+    /// Requirement for an operation that needs only its output tensor.
     pub fn without_scratch(shape: &[usize], dtype: DType) -> Self {
         Self {
             output: CpuTensorRequirement::new(shape, dtype),
@@ -199,6 +256,7 @@ impl CpuOperationRequirements {
         }
     }
 
+    /// Total bytes of all scratch requirements. Panics on overflow.
     pub fn scratch_bytes(&self) -> usize {
         self.scratch
             .iter()
@@ -209,6 +267,10 @@ impl CpuOperationRequirements {
     }
 }
 
+/// A CPU tensor: shared element storage plus a logical layout.
+///
+/// The invariant `layout.max_index() <= buffer.len()` is checked at
+/// construction, so any element addressed through the layout is in bounds.
 #[derive(Debug, Clone)]
 pub struct Tensor {
     pub buffer: CpuBuffer,
@@ -216,11 +278,15 @@ pub struct Tensor {
 }
 
 impl Tensor {
+    /// Wraps a buffer with a layout; panics if the layout can address
+    /// elements beyond the buffer.
     pub fn new(buffer: CpuBuffer, layout: Layout) -> Self {
         assert!(layout.max_index() <= buffer.len(), "layout exceeds buffer");
         Tensor { buffer, layout }
     }
 
+    /// Creates a contiguous tensor viewing `shape.product()` elements of
+    /// `dtype` at `byte_offset` within `owner`.
     pub fn from_segment(
         owner: Arc<CpuSegment>,
         byte_offset: usize,
@@ -246,24 +312,32 @@ impl Tensor {
         Ok(Self::new(buffer, Layout::contiguous(shape)))
     }
 
+    /// Element dtype.
     pub fn dtype(&self) -> DType {
         self.buffer.dtype()
     }
 
+    /// Logical shape.
     pub fn shape(&self) -> &[usize] {
         self.layout.shape()
     }
 
+    /// Number of logical elements.
     pub fn numel(&self) -> usize {
         self.layout.numel()
     }
 
+    /// Copies `data` into a fresh contiguous tensor of `shape`.
+    ///
+    /// Panics under an active allocation guard, on shape/data length
+    /// mismatch, or on allocation failure.
     pub fn from_vec<T: Elem>(data: Vec<T>, shape: Vec<usize>) -> Self {
         assert_allocation_allowed("Tensor::from_vec");
         assert_eq!(data.len(), shape.iter().product::<usize>());
         Tensor::new(T::buffer_of(data), Layout::contiguous(shape))
     }
 
+    /// Writes `data` into `destination`, which must match `shape` exactly.
     pub fn from_slice_into<T: Elem>(
         data: &[T],
         shape: &[usize],
@@ -304,6 +378,10 @@ impl Tensor {
         Self::from_slice_into(data, shape, destination)
     }
 
+    /// Allocates a contiguous tensor of `shape` and `dtype` with
+    /// uninitialized-by-contract (in practice zeroed) storage.
+    ///
+    /// Panics under an active allocation guard or on allocation failure.
     pub fn empty(shape: &[usize], dtype: DType) -> Self {
         assert_allocation_allowed("Tensor::empty");
         let requirement = CpuTensorRequirement::new(shape, dtype);
@@ -313,16 +391,19 @@ impl Tensor {
             .expect("new CPU segment must contain its exact tensor view")
     }
 
+    /// Allocates a tensor filled with zero.
     pub fn zeros(shape: &[usize], dtype: DType) -> Self {
         assert_allocation_allowed("Tensor::zeros");
         Self::full(shape, 0.0, dtype)
     }
 
+    /// Allocates a tensor filled with one.
     pub fn ones(shape: &[usize], dtype: DType) -> Self {
         assert_allocation_allowed("Tensor::ones");
         Self::full(shape, 1.0, dtype)
     }
 
+    /// Allocates a tensor filled with `value` (converted to `dtype`).
     pub fn full(shape: &[usize], value: f64, dtype: DType) -> Self {
         assert_allocation_allowed("Tensor::full");
         let mut output = Self::empty(shape, dtype);
@@ -336,6 +417,7 @@ impl Tensor {
         output
     }
 
+    /// Requirement (output only) of [`Tensor::full`] for `shape`/`dtype`.
     pub fn full_requirements(shape: &[usize], dtype: DType) -> CpuOperationRequirements {
         CpuOperationRequirements::without_scratch(shape, dtype)
     }
@@ -381,6 +463,7 @@ impl Tensor {
         &[]
     }
 
+    /// Fills `destination` (whose dtype must equal `dtype`) with `value`.
     pub fn full_into(
         shape: &[usize],
         value: f64,
@@ -427,6 +510,8 @@ impl Tensor {
         Self::full_into(shape, 1.0, dtype, destination)
     }
 
+    /// Returns a view sharing this tensor's storage with a new layout.
+    /// Panics if the layout can address elements beyond the buffer.
     pub fn view(&self, layout: Layout) -> Self {
         assert!(layout.max_index() <= self.buffer.len());
         Tensor {
@@ -435,10 +520,17 @@ impl Tensor {
         }
     }
 
+    /// Acquires the mutable destination capability for this tensor.
+    ///
+    /// Fails when the buffer is shared: writing through an aliased view could
+    /// be observed by other tensor handles, so only uniquely owned storage
+    /// may become a safe destination.
     pub fn destination(&mut self) -> Result<CpuDestination<'_>, String> {
         CpuDestination::new(self)
     }
 
+    /// Requirement (output only) of gathering this tensor into contiguous
+    /// form: same shape and dtype.
     pub fn contiguous_requirements(&self) -> CpuOperationRequirements {
         CpuOperationRequirements::without_scratch(self.shape(), self.dtype())
     }
@@ -475,6 +567,9 @@ impl Tensor {
         &[]
     }
 
+    /// Returns a densely packed contiguous tensor. Already-compact tensors
+    /// (contiguous layout, zero offset, exact-size buffer) are cloned
+    /// cheaply; otherwise the elements are gathered into fresh storage.
     pub fn contiguous(&self) -> Self {
         if self.layout.is_contiguous()
             && self.layout.offset() == 0
@@ -494,6 +589,8 @@ impl Tensor {
         output
     }
 
+    /// Gathers this tensor's logical elements (following its strides) into
+    /// `destination`, which must match this tensor's shape and dtype.
     pub fn copy_into(&self, destination: &mut CpuDestination<'_>) -> Result<(), String> {
         macro_rules! copy {
             ($storage:expr, $type:ty) => {
@@ -513,14 +610,21 @@ impl Tensor {
         }
     }
 
+    /// `*_into` form of [`Tensor::contiguous`].
     pub fn contiguous_into(&self, destination: &mut CpuDestination<'_>) -> Result<(), String> {
         self.copy_into(destination)
     }
 
+    /// Alias of [`Tensor::contiguous_into`] used by the executor when
+    /// materializing a value into its planned location.
     pub fn materialize_into(&self, destination: &mut CpuDestination<'_>) -> Result<(), String> {
         self.contiguous_into(destination)
     }
 
+    /// Gathers this tensor into `destination` using the destination's own
+    /// shape, which must have the same element count and dtype. Used for
+    /// planned reshapes, where the logical shape changes but the element
+    /// order does not.
     pub fn materialize_reshaped_into(
         &self,
         destination: &mut CpuDestination<'_>,
@@ -546,6 +650,7 @@ impl Tensor {
         }
     }
 
+    /// Requirement (output only) of casting to `dtype`: same shape.
     pub fn cast_requirements(&self, dtype: DType) -> CpuOperationRequirements {
         CpuOperationRequirements::without_scratch(self.shape(), dtype)
     }
@@ -558,6 +663,8 @@ impl Tensor {
         &[]
     }
 
+    /// Converts every element to `dtype`, routing through `f64`. Same-dtype
+    /// casts are cheap clones.
     pub fn cast(&self, dtype: DType) -> Self {
         if self.dtype() == dtype {
             return self.clone();
@@ -574,6 +681,8 @@ impl Tensor {
         output
     }
 
+    /// `*_into` form of [`Tensor::cast`]; `destination` must have dtype
+    /// `dtype` and this tensor's shape.
     pub fn cast_into(
         &self,
         dtype: DType,
@@ -612,6 +721,25 @@ impl Tensor {
     }
 }
 
+/// Exclusive write capability for a tensor's storage.
+///
+/// This is the only way kernels obtain `&mut [T]` into tensor memory. It
+/// carries two compile-time proofs: `_exclusive` makes it behave like an
+/// `&mut Tensor` borrow (one live destination per tensor), and
+/// `_thread_owned` (`PhantomData<Rc<()>>`) makes it neither `Send` nor
+/// `Sync`, so a write capability can never cross a thread boundary.
+///
+/// Construction rules:
+///
+/// - [`CpuDestination::new`] (safe) requires uniquely owned storage — no
+///   other view may alias the bytes.
+/// - `CpuDestination::from_planned` (unsafe) is used by the compiled
+///   executor, which proves exclusivity through its fixed liveness schedule
+///   instead of through ownership.
+///
+/// Every write path re-validates dtype, contiguity, shape, and capacity
+/// against the destination before producing a mutable slice, so a stale or
+/// mismatched destination fails with an error rather than corrupting memory.
 pub struct CpuDestination<'a> {
     tensor: &'a Tensor,
     _exclusive: PhantomData<&'a mut Tensor>,
@@ -619,6 +747,7 @@ pub struct CpuDestination<'a> {
 }
 
 impl<'a> CpuDestination<'a> {
+    /// Creates a destination for uniquely owned storage.
     pub fn new(tensor: &'a mut Tensor) -> Result<Self, String> {
         if !tensor.buffer.is_uniquely_owned() {
             return Err("CPU destination storage is shared and cannot be published mutably".into());
@@ -644,14 +773,19 @@ impl<'a> CpuDestination<'a> {
         }
     }
 
+    /// Shape of the destination tensor.
     pub fn shape(&self) -> &[usize] {
         self.tensor.shape()
     }
 
+    /// Dtype of the destination tensor.
     pub fn dtype(&self) -> DType {
         self.tensor.dtype()
     }
 
+    /// Raw byte-range write into the destination's logical region (dtype
+    /// agnostic; used by the NAPI loaders to stream file bytes directly into
+    /// tensor storage). The destination must be contiguous.
     #[cfg(feature = "napi-addon")]
     pub(crate) fn write_bytes<R>(
         &mut self,
@@ -683,6 +817,9 @@ impl<'a> CpuDestination<'a> {
             ($storage:expr) => {{
                 // SAFETY: CpuDestination proves exclusive access to this storage.
                 let values = unsafe { $storage.as_mut_slice_for_destination() };
+                // SAFETY: reinterprets the exclusively borrowed `values` as
+                // bytes. `u8` has no invalid bit patterns and the byte slice
+                // covers exactly the same live range.
                 let bytes = unsafe {
                     std::slice::from_raw_parts_mut(
                         values.as_mut_ptr().cast::<u8>(),
@@ -709,6 +846,8 @@ impl<'a> CpuDestination<'a> {
         }
     }
 
+    /// Validates dtype, contiguity, and capacity of the destination for a
+    /// write of `T` over its current shape.
     pub(crate) fn validate_current<T: Elem>(&self, operation: &str) -> Result<(), String> {
         if self.dtype() != T::dtype() {
             return Err(format!(
@@ -733,6 +872,8 @@ impl<'a> CpuDestination<'a> {
         Ok(())
     }
 
+    /// Runs `write` with a mutable slice of the destination after checking
+    /// the destination shape equals `shape`.
     pub(crate) fn write<T: Elem, R>(
         &mut self,
         operation: &str,
@@ -748,6 +889,8 @@ impl<'a> CpuDestination<'a> {
         self.write_current(operation, write)
     }
 
+    /// Runs `write` with a mutable slice of the destination using its
+    /// current shape.
     pub(crate) fn write_current<T: Elem, R>(
         &mut self,
         operation: &str,
@@ -756,6 +899,9 @@ impl<'a> CpuDestination<'a> {
         self.write_current_shaped(operation, |_, output| write(output))
     }
 
+    /// Like [`CpuDestination::write_current`], additionally passing the
+    /// destination shape to the closure (used by kernels that index the
+    /// output by logical coordinates).
     pub(crate) fn write_current_shaped<T: Elem, R>(
         &mut self,
         operation: &str,
@@ -788,6 +934,9 @@ fn cast_strided<S: Elem, D: Elem>(
     })
 }
 
+/// Converts a linear output index into a storage index under `layout`
+/// (contiguous fast path, otherwise a row-major coordinate walk over the
+/// strides, offset included).
 pub(crate) fn source_index(layout: &Layout, output_index: usize) -> usize {
     if layout.is_contiguous() {
         return layout.offset() + output_index;
@@ -803,6 +952,7 @@ pub(crate) fn source_index(layout: &Layout, output_index: usize) -> usize {
     source
 }
 
+/// Copies the `layout`-addressed elements of `src` into dense `dst`.
 pub fn copy_strided<T: Copy>(src: &[T], layout: &Layout, dst: &mut [T]) {
     if layout.is_contiguous() {
         let start = layout.offset();

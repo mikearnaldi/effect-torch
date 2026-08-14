@@ -33,6 +33,8 @@ it.effect("rejects empty IDs and reports duplicate registrations", () =>
     expect(yield* registry.register(architecture(" "))).toBe(false)
   }).pipe(Effect.provide(Registry.emptyLayer)))
 
+// registerAll owns only registrations it actually inserted. Scope finalization
+// must remove those entries without consuming pre-existing shared-registry state.
 it.effect("registerAll scopes every architecture in the shared registry", () =>
   Effect.scoped(
     Effect.gen(function*() {
@@ -78,6 +80,72 @@ it.effect("registerAll preserves existing registrations and cleans up only new o
       )
       expect((yield* Effect.flip(registry.get("first")))._tag).toBe("RegistryError")
       expect(yield* registry.get("duplicate")).toBe(duplicate)
+    })
+  ))
+
+it.effect("registerAll finalization preserves a later replacement", () =>
+  Effect.scoped(
+    Effect.gen(function*() {
+      const context = yield* Layer.build(Registry.emptyLayer)
+      const registry = Context.get(context, Registry.Registry)
+      const first = architecture("shared")
+      const replacement = architecture("shared")
+      const registration = Registry.registerAll(first).pipe(
+        Layer.provide(Layer.succeed(Registry.Registry, registry))
+      )
+
+      yield* Effect.scoped(
+        Effect.gen(function*() {
+          yield* Layer.build(registration)
+          yield* registry.unregister("shared")
+          expect(yield* registry.register(replacement)).toBe(true)
+        })
+      )
+
+      expect(yield* registry.get("shared")).toBe(replacement)
+    })
+  ))
+
+it.effect("registerAll finalization does not remove an ABA replacement", () =>
+  Effect.scoped(
+    Effect.gen(function*() {
+      const context = yield* Layer.build(Registry.emptyLayer)
+      const registry = Context.get(context, Registry.Registry)
+      const shared = architecture("shared")
+      const registration = Registry.registerAll(shared).pipe(
+        Layer.provide(Layer.succeed(Registry.Registry, registry))
+      )
+
+      yield* Effect.scoped(
+        Effect.gen(function*() {
+          yield* Layer.build(registration)
+          yield* registry.unregister("shared")
+          expect(yield* registry.register(shared)).toBe(true)
+        })
+      )
+
+      expect(yield* registry.get("shared")).toBe(shared)
+    })
+  ))
+
+it.effect("registerAll finalization retains the insertion key when the object mutates", () =>
+  Effect.scoped(
+    Effect.gen(function*() {
+      const context = yield* Layer.build(Registry.emptyLayer)
+      const registry = Context.get(context, Registry.Registry)
+      const mutable = architecture("first") as { id: string } & Registry.ModelArchitecture
+      const registration = Registry.registerAll(mutable).pipe(
+        Layer.provide(Layer.succeed(Registry.Registry, registry))
+      )
+
+      yield* Effect.scoped(
+        Effect.gen(function*() {
+          yield* Layer.build(registration)
+          mutable.id = "second"
+        })
+      )
+
+      expect((yield* Effect.flip(registry.get("first")))._tag).toBe("RegistryError")
     })
   ))
 

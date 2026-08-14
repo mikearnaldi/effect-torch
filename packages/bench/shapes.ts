@@ -1,3 +1,12 @@
+// Metal bf16 GEMM shape survey approximating the dominant projections of the
+// 30M FineWeb training step. CHAIN independent roots are submitted together to
+// amortize eager graph/compile overhead. Their shared a/b inputs remain lazy, so
+// each sample also executes fresh randn+bf16 input generation; `Tensor.compute`
+// completes the run and every output is then released. ms/GFLOP/s counts only
+// GEMM arithmetic despite that extra work. `xN/step` is a rough hand-maintained
+// extrapolation, not a complete non-overlapping operation inventory or a measured
+// training step. ITERS and CHAIN are unvalidated environment overrides.
+
 import * as BackendApple from "@effect-torch/backend-apple-native"
 import { type Runtime, Tensor } from "@effect-torch/core"
 import { Console, Effect } from "effect"
@@ -15,8 +24,8 @@ const bench = <A extends Tensor.Any>(
   perStep: number
 ): Effect.Effect<void, Tensor.TensorError, Runtime.Runtime> =>
   Effect.gen(function*() {
-    // CHAIN identical matmuls as roots of one compute: one sync per
-    // iteration, so eager per-call overhead does not drown the kernel.
+    // Independent equal-shape roots share one compile/execute completion per
+    // sample; they are not a dependency chain.
     const lazies = yield* Effect.forEach(
       Array.from({ length: CHAIN }),
       () => Tensor.matmul(a, b)
@@ -43,7 +52,7 @@ const program = Effect.gen(function*() {
   const gemm = (m: number, k: number, n: number, perStep: number, label: string) =>
     Effect.flatMap(Effect.zip(mk([m, k]), mk([k, n])), ([a, b]) => bench(label, a, b, 2 * m * k * n, perStep))
 
-  // trunk: 6 layers, each fwd + dX + dW
+  // Selected trunk GEMM shapes and rough occurrence multipliers for six layers.
   yield* gemm(BT, 256, 768, 6, "qkv   [32k,256]x[256,768]    fwd")
   yield* gemm(BT, 256, 256, 6, "proj  [32k,256]x[256,256]    fwd")
   yield* gemm(BT, 256, 1024, 6, "fc    [32k,256]x[256,1024]   fwd")
@@ -52,7 +61,8 @@ const program = Effect.gen(function*() {
   yield* gemm(256, BT, 768, 6, "qkv   [256,32k]x[32k,768]    dW")
   yield* gemm(BT, 1024, 256, 12, "fc/p2 [32k,1024]x[1024,256]  dX (fc+proj2)")
   yield* gemm(256, BT, 1024, 12, "fc/p2 [256,32k]x[32k,1024]  dW (fc+proj2)")
-  // vocab head: 48 CE chunks of [BT/48,256]x[256,50257]
+  // Synthetic vocab-head projection split into 48 row chunks. This fixed count
+  // is not derived from the compiler's current EFFECT_TORCH_CE_CHUNK_SIZE.
   const rows = Math.ceil(BT / 48)
   yield* gemm(rows, 256, 50257, 48, `head  [${rows},256]x[256,50257] fwd x48`)
   yield* gemm(rows, 50257, 256, 48, `head  [${rows},50k]x[50k,256]  dX x48`)

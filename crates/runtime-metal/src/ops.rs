@@ -1,3 +1,28 @@
+//! Dispatch helpers used by executable commands for ordinary operations:
+//! binary/unary/compare/cast/matmul/contiguous/views plus the creation and
+//! conv families forwarded to [`crate::kernels`], [`crate::indexing`],
+//! [`crate::gemm`], and [`crate::conv`].
+//!
+//! # Dtype and layout rules
+//!
+//! - The fused emitter computes in f32 and stores f32/bf16, so elementwise
+//!   entry points accept f32/bf16 directly; anything else is promoted:
+//!   cast to f32, run the fused kernel, cast back (`*_promote` family).
+//!   Comparisons always produce u8 via an f32 intermediate.
+//! - Broadcasting follows NumPy rules; lane strides of 0 encode broadcast
+//!   dimensions directly in the emitted kernel.
+//! - Non-contiguous or offset inputs are materialized with
+//!   `kernels::strided_copy` on the allocating paths (`contig`); the
+//!   `*_into` forms take caller layouts as-is where the kernels support
+//!   them.
+//!
+//! # Scratch contract
+//!
+//! `*_scratch_requirements` report the exact intermediate tensors a
+//! promoted operation needs, in consumption order; `*_into` variants
+//! validate caller-provided scratch against them and allocate nothing.
+//! Allocating wrappers derive both and then delegate to the `*_into` form.
+
 use crate::fusion::{Expr, ReduceOp};
 use crate::runtime::dtype::DType;
 use crate::runtime::layout::Layout;
@@ -5,6 +30,8 @@ use crate::runtime::metal::device::MetalDevice;
 use crate::runtime::metal::run::MetalTensor;
 use crate::runtime::metal::{conv, gemm, indexing, kernels};
 
+/// Elementwise binary operators (comparisons produce 1.0/0.0 in the fused
+/// kernel; the `compare` wrappers then cast to u8).
 #[derive(Clone, Copy)]
 pub enum BinOp {
     Add,
@@ -21,6 +48,8 @@ pub enum BinOp {
     Ne,
 }
 
+/// Elementwise unary operators. `Sign` is lowered to a select expression;
+/// there is no dedicated IR node.
 #[derive(Clone, Copy)]
 pub enum UnOp {
     Neg,
@@ -40,6 +69,7 @@ pub enum UnOp {
     Sign,
 }
 
+/// One exact intermediate tensor an operation needs (contiguous, offset 0).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScratchRequirement {
     pub shape: Vec<usize>,
@@ -47,6 +77,7 @@ pub struct ScratchRequirement {
 }
 
 impl ScratchRequirement {
+    /// Byte size of the described tensor, checked for overflow.
     pub fn bytes(&self) -> crate::err::Res<usize> {
         self.shape
             .iter()
@@ -254,6 +285,8 @@ fn elementwise_into(
     )
 }
 
+/// Precompiles the fused elementwise kernel for a unary op on `shape`
+/// (f32 math; non-f32 storage is converted before the op).
 pub fn warm_unary(shape: &[usize], _dtype: DType, op: UnOp) -> crate::err::Res<()> {
     let expr = un_expr(&op, Expr::Input(0));
     crate::run::warm_elementwise(
@@ -268,6 +301,8 @@ pub fn warm_unary(shape: &[usize], _dtype: DType, op: UnOp) -> crate::err::Res<(
     )
 }
 
+/// Precompiles relu for `shape`; integer dtypes need no fused kernel
+/// (copy for u8/u32, a dedicated kernel for i64).
 pub fn warm_relu(shape: &[usize], dtype: DType) -> crate::err::Res<()> {
     if matches!(dtype, DType::U8 | DType::U32) {
         return Ok(());
@@ -289,6 +324,7 @@ pub fn warm_relu(shape: &[usize], dtype: DType) -> crate::err::Res<()> {
     )
 }
 
+/// Precompiles `x.powf(e)` for `shape`; the exponent is the f64 bits.
 pub fn warm_pow(shape: &[usize], exponent_bits: u64) -> crate::err::Res<()> {
     crate::run::warm_elementwise(
         MetalDevice::get(),
@@ -301,6 +337,8 @@ pub fn warm_pow(shape: &[usize], exponent_bits: u64) -> crate::err::Res<()> {
     )
 }
 
+/// Precompiles a broadcast binary op, applying the same dtype-selection
+/// rules as [`binary_promote`]/[`compare`].
 pub fn warm_binary(
     a_shape: &[usize],
     a_dtype: DType,
@@ -337,6 +375,7 @@ pub fn warm_binary(
     )
 }
 
+/// Precompiles a three-way broadcast select (`where`).
 pub fn warm_where(
     condition_shape: &[usize],
     a_shape: &[usize],
@@ -363,6 +402,7 @@ pub fn warm_where(
     )
 }
 
+/// Precompiles a plain (unfused expression) reduction over `dims`.
 pub fn warm_reduce(
     in_shape: &[usize],
     dtype: DType,
@@ -400,6 +440,7 @@ pub fn warm_reduce(
     )
 }
 
+/// Casts to f32; an f32 input is returned as-is (aliased).
 pub fn to_f32(t: &MetalTensor) -> crate::err::Res<MetalTensor> {
     if t.dtype == DType::F32 {
         return Ok(t.clone());
@@ -408,6 +449,7 @@ pub fn to_f32(t: &MetalTensor) -> crate::err::Res<MetalTensor> {
     Ok(f32t)
 }
 
+/// Casts an f32 tensor to `dtype`; f32 targets alias the input.
 pub fn from_f32(t: &MetalTensor, dtype: DType) -> crate::err::Res<MetalTensor> {
     if dtype == DType::F32 {
         return Ok(t.clone());
@@ -446,6 +488,8 @@ fn allocate_scratch(requirements: &[ScratchRequirement]) -> Vec<MetalTensor> {
         .collect()
 }
 
+/// Precompiles every pipeline [`binary_promote_into`] will need: scalar
+/// dtype promotion casts, the fused broadcast kernel, and the result cast.
 pub fn precompile_binary_promote(
     a: &MetalTensor,
     b: &MetalTensor,
@@ -504,6 +548,8 @@ pub fn precompile_binary_promote(
     Ok(())
 }
 
+/// Precompiles the compare pipeline set: f32 casts for both operands, the
+/// fused compare kernel, and the f32→u8 result cast.
 pub fn precompile_compare(a: &MetalTensor, b: &MetalTensor, op: BinOp) -> crate::err::Res<()> {
     let mut a_layout = a.layout.clone();
     let mut b_layout = b.layout.clone();
@@ -524,6 +570,8 @@ pub fn precompile_compare(a: &MetalTensor, b: &MetalTensor, op: BinOp) -> crate:
     kernels::compile_cast(MetalDevice::get(), &shape, DType::F32, DType::U8)
 }
 
+/// Precompiles the promote-cast, fused unary kernel, and cast-back
+/// pipeline set for a non-f32 (or directly for an f32) operand.
 pub fn precompile_unary_promote(a: &MetalTensor, op: UnOp) -> crate::err::Res<()> {
     if a.dtype == DType::F32 {
         return compile_elementwise_exact(
@@ -549,6 +597,8 @@ fn relu_expr() -> Expr {
     )
 }
 
+/// Precompiles the dtype-appropriate relu path (fused f32, cast round
+/// trip for f16/bf16, copy for u8/u32, dedicated kernel for i64).
 pub fn precompile_relu(a: &MetalTensor) -> crate::err::Res<()> {
     match a.dtype {
         DType::F32 => {
@@ -568,6 +618,8 @@ pub fn precompile_relu(a: &MetalTensor) -> crate::err::Res<()> {
     }
 }
 
+/// Precompiles the select kernel (and the condition cast when the
+/// condition dtype differs from the branch dtype).
 pub fn precompile_where(
     cond: &MetalTensor,
     a: &MetalTensor,
@@ -599,6 +651,8 @@ pub fn precompile_where(
     )
 }
 
+/// Precompiles the fused broadcast binary kernel for exact input
+/// layouts/dtypes.
 pub fn precompile_binary(a: &MetalTensor, b: &MetalTensor, op: BinOp) -> crate::err::Res<()> {
     let shape = broadcast_shape(a.layout.shape(), b.layout.shape())?;
     let exprs = [bin_expr(&op, Expr::Input(0), Expr::Input(1))];
@@ -609,6 +663,8 @@ pub fn precompile_binary(a: &MetalTensor, b: &MetalTensor, op: BinOp) -> crate::
     )
 }
 
+/// Allocating broadcast binary op; both operands must share one f32/bf16
+/// dtype.
 pub fn binary(a: &MetalTensor, b: &MetalTensor, op: BinOp) -> crate::err::Res<MetalTensor> {
     precompile_binary(a, b, op)?;
     let shape = broadcast_shape(a.layout.shape(), b.layout.shape())?;
@@ -617,6 +673,7 @@ pub fn binary(a: &MetalTensor, b: &MetalTensor, op: BinOp) -> crate::err::Res<Me
     Ok(out)
 }
 
+/// Destination form of [`binary`]; requires the precompiled pipeline.
 pub fn binary_into(
     a: &MetalTensor,
     b: &MetalTensor,
@@ -639,6 +696,9 @@ pub fn binary_into(
     elementwise_into(&exprs, &[a, b], vec![sa, sb], &shape, out)
 }
 
+/// Allocating binary op with dtype promotion: mismatched float dtypes
+/// promote a scalar operand to the tensor's dtype; non-f32/bf16 operands
+/// round-trip through f32.
 pub fn binary_promote(a: &MetalTensor, b: &MetalTensor, op: BinOp) -> crate::err::Res<MetalTensor> {
     precompile_binary_promote(a, b, op)?;
     let shape = broadcast_shape(a.layout.shape(), b.layout.shape())?;
@@ -664,6 +724,9 @@ fn binary_promote_output_dtype(a: &MetalTensor, b: &MetalTensor) -> DType {
     }
 }
 
+/// The exact intermediate tensors [`binary_promote_into`] consumes, in
+/// order: optional scalar-promotion cast, optional f32 casts, optional
+/// f32 result buffer.
 pub fn binary_promote_scratch_requirements(
     a: &MetalTensor,
     b: &MetalTensor,
@@ -718,6 +781,8 @@ pub fn binary_promote_scratch_requirements(
     Ok(requirements)
 }
 
+/// Destination form of [`binary_promote`]; `scratch` must match
+/// [`binary_promote_scratch_requirements`] exactly.
 pub fn binary_promote_into(
     a: &MetalTensor,
     b: &MetalTensor,
@@ -782,6 +847,7 @@ pub fn binary_promote_into(
     }
 }
 
+/// Allocating comparison producing u8 (1/0) via an f32 fused kernel.
 pub fn compare(a: &MetalTensor, b: &MetalTensor, op: BinOp) -> crate::err::Res<MetalTensor> {
     precompile_compare(a, b, op)?;
     let shape = broadcast_shape(a.layout.shape(), b.layout.shape())?;
@@ -793,6 +859,8 @@ pub fn compare(a: &MetalTensor, b: &MetalTensor, op: BinOp) -> crate::err::Res<M
     Ok(out)
 }
 
+/// The exact intermediates [`compare_into`] consumes: optional f32 casts
+/// of each operand, then the f32 broadcast result.
 pub fn compare_scratch_requirements(
     a: &MetalTensor,
     b: &MetalTensor,
@@ -817,6 +885,8 @@ pub fn compare_scratch_requirements(
     Ok(requirements)
 }
 
+/// Destination form of [`compare`]; `scratch` must match
+/// [`compare_scratch_requirements`] exactly.
 pub fn compare_into(
     a: &MetalTensor,
     b: &MetalTensor,
@@ -850,6 +920,7 @@ pub fn compare_into(
     kernels::cast_into(MetalDevice::get(), result, out)
 }
 
+/// Allocating unary op with f32 promotion for non-f32 storage dtypes.
 pub fn unary_promote(a: &MetalTensor, op: UnOp) -> crate::err::Res<MetalTensor> {
     precompile_unary_promote(a, op)?;
     let out = MetalTensor::empty(MetalDevice::get(), a.layout.shape().to_vec(), a.dtype);
@@ -860,6 +931,8 @@ pub fn unary_promote(a: &MetalTensor, op: UnOp) -> crate::err::Res<MetalTensor> 
     Ok(out)
 }
 
+/// The single f32 round-trip buffer [`unary_promote_into`] needs for
+/// non-f32 inputs (empty for f32).
 pub fn unary_promote_scratch_requirements(a: &MetalTensor) -> Vec<ScratchRequirement> {
     if a.dtype == DType::F32 {
         Vec::new()
@@ -871,6 +944,8 @@ pub fn unary_promote_scratch_requirements(a: &MetalTensor) -> Vec<ScratchRequire
     }
 }
 
+/// Destination form of [`unary_promote`]; for non-f32 inputs the fused
+/// kernel runs in-place on the f32 scratch buffer between the two casts.
 pub fn unary_promote_into(
     a: &MetalTensor,
     op: UnOp,
@@ -889,6 +964,7 @@ pub fn unary_promote_into(
     kernels::cast_into(MetalDevice::get(), value, out)
 }
 
+/// Precompiles the fused unary kernel for an exact layout/dtype.
 pub fn precompile_unary(a: &MetalTensor, op: UnOp) -> crate::err::Res<()> {
     compile_elementwise_exact(
         &[un_expr(&op, Expr::Input(0))],
@@ -897,6 +973,7 @@ pub fn precompile_unary(a: &MetalTensor, op: UnOp) -> crate::err::Res<()> {
     )
 }
 
+/// Allocating fused unary op (f32/bf16 storage only).
 pub fn unary(a: &MetalTensor, op: UnOp) -> crate::err::Res<MetalTensor> {
     precompile_unary(a, op)?;
     let out = MetalTensor::empty(MetalDevice::get(), a.layout.shape().to_vec(), a.dtype);
@@ -904,6 +981,7 @@ pub fn unary(a: &MetalTensor, op: UnOp) -> crate::err::Res<MetalTensor> {
     Ok(out)
 }
 
+/// Destination form of [`unary`]; requires the precompiled pipeline.
 pub fn unary_into(a: &MetalTensor, op: UnOp, out: &MetalTensor) -> crate::err::Res<()> {
     require_f32(a)?;
     let shape = a.layout.shape().to_vec();
@@ -912,6 +990,7 @@ pub fn unary_into(a: &MetalTensor, op: UnOp, out: &MetalTensor) -> crate::err::R
     elementwise_into(&exprs, &[a], vec![a.layout.strides().to_vec()], &shape, out)
 }
 
+/// Allocating relu with the dtype-appropriate path.
 pub fn relu(a: &MetalTensor) -> crate::err::Res<MetalTensor> {
     precompile_relu(a)?;
     let out = MetalTensor::empty(MetalDevice::get(), a.layout.shape().to_vec(), a.dtype);
@@ -922,6 +1001,8 @@ pub fn relu(a: &MetalTensor) -> crate::err::Res<MetalTensor> {
     Ok(out)
 }
 
+/// The f32 round-trip buffer relu needs for f16/bf16 inputs (none for
+/// f32 or integer dtypes).
 pub fn relu_scratch_requirements(a: &MetalTensor) -> crate::err::Res<Vec<ScratchRequirement>> {
     match a.dtype {
         DType::F16 | DType::BF16 => Ok(vec![ScratchRequirement {
@@ -933,6 +1014,8 @@ pub fn relu_scratch_requirements(a: &MetalTensor) -> crate::err::Res<Vec<Scratch
     }
 }
 
+/// Destination form of [`relu`]; integer dtypes pass through (u8/u32) or
+/// use the dedicated i64 kernel.
 pub fn relu_into(
     a: &MetalTensor,
     out: &MetalTensor,
@@ -977,6 +1060,7 @@ pub fn relu_into(
     }
 }
 
+/// Precompiles the fused powf kernel for an exact layout/dtype.
 pub fn precompile_powf(a: &MetalTensor, e: f64) -> crate::err::Res<()> {
     compile_elementwise_exact(
         &[Expr::Powf(Box::new(Expr::Input(0)), e.to_bits())],
@@ -985,6 +1069,7 @@ pub fn precompile_powf(a: &MetalTensor, e: f64) -> crate::err::Res<()> {
     )
 }
 
+/// Allocating `a.powf(e)`.
 pub fn powf(a: &MetalTensor, e: f64) -> crate::err::Res<MetalTensor> {
     precompile_powf(a, e)?;
     let out = MetalTensor::empty(MetalDevice::get(), a.layout.shape().to_vec(), a.dtype);
@@ -992,6 +1077,7 @@ pub fn powf(a: &MetalTensor, e: f64) -> crate::err::Res<MetalTensor> {
     Ok(out)
 }
 
+/// Destination form of [`powf`]; requires the precompiled pipeline.
 pub fn powf_into(a: &MetalTensor, e: f64, out: &MetalTensor) -> crate::err::Res<()> {
     require_f32(a)?;
     let shape = a.layout.shape().to_vec();
@@ -1000,6 +1086,7 @@ pub fn powf_into(a: &MetalTensor, e: f64, out: &MetalTensor) -> crate::err::Res<
     elementwise_into(&exprs, &[a], vec![a.layout.strides().to_vec()], &shape, out)
 }
 
+/// Allocating three-way broadcast select: `cond != 0 ? a : b` per lane.
 pub fn where_(
     cond: &MetalTensor,
     a: &MetalTensor,
@@ -1018,6 +1105,8 @@ pub fn where_(
     Ok(out)
 }
 
+/// The single cast buffer [`where_into`] needs when the condition dtype
+/// differs from the (f32/bf16) branch dtype.
 pub fn where_scratch_requirements(
     cond: &MetalTensor,
     a: &MetalTensor,
@@ -1040,6 +1129,7 @@ pub fn where_scratch_requirements(
         .collect())
 }
 
+/// Destination form of [`where_`].
 pub fn where_into(
     cond: &MetalTensor,
     a: &MetalTensor,
@@ -1071,6 +1161,8 @@ pub fn where_into(
     elementwise_into(&exprs, &[condition, a, b], vec![sc, sa, sb], &shape, out)
 }
 
+/// Allocating reduction over `dims` (f32/bf16 only; deterministic serial
+/// per-output accumulation).
 pub fn reduce(
     a: &MetalTensor,
     dims: &[usize],
@@ -1084,6 +1176,8 @@ pub fn reduce(
     Ok(out)
 }
 
+/// Precompiles the reduction pipeline for an exact input layout and
+/// dims/keepdims/op combination.
 pub fn precompile_reduce(
     a: &MetalTensor,
     dims: &[usize],
@@ -1127,6 +1221,7 @@ fn reduce_output_shape(in_shape: &[usize], dims: &[usize], keepdims: bool) -> Ve
     }
 }
 
+/// Destination form of [`reduce`]; requires the precompiled pipeline.
 pub fn reduce_into(
     a: &MetalTensor,
     dims: &[usize],
@@ -1157,6 +1252,8 @@ pub fn reduce_into(
     )
 }
 
+/// Allocating matmul (f32/f16/bf16); non-contiguous inputs are
+/// materialized first.
 pub fn matmul(a: &MetalTensor, b: &MetalTensor) -> crate::err::Res<MetalTensor> {
     if a.dtype != b.dtype {
         return Err(format!(
@@ -1172,6 +1269,8 @@ pub fn matmul(a: &MetalTensor, b: &MetalTensor) -> crate::err::Res<MetalTensor> 
     gemm::matmul(MetalDevice::get(), &an, &bn)
 }
 
+/// Destination form of [`matmul`]; forwards to [`gemm::matmul_into`] with
+/// caller-planned requirements.
 pub fn matmul_into(
     a: &MetalTensor,
     b: &MetalTensor,
@@ -1182,22 +1281,28 @@ pub fn matmul_into(
     gemm::matmul_into(MetalDevice::get(), a, b, out, split_k_scratch, requirements)
 }
 
+/// Forwards to [`kernels::cast`].
 pub fn cast(a: &MetalTensor, dtype: DType) -> crate::err::Res<MetalTensor> {
     kernels::cast(MetalDevice::get(), a, dtype)
 }
 
+/// Forwards to [`kernels::cast_into`].
 pub fn cast_into(a: &MetalTensor, out: &MetalTensor) -> crate::err::Res<()> {
     kernels::cast_into(MetalDevice::get(), a, out)
 }
 
+/// Materializes a contiguous offset-zero copy (aliases the input when it
+/// already is one).
 pub fn contiguous(t: &MetalTensor) -> crate::err::Res<MetalTensor> {
     contig(t)
 }
 
+/// Destination form of [`contiguous`]; forwards to [`kernels::copy_into`].
 pub fn contiguous_into(t: &MetalTensor, out: &MetalTensor) -> crate::err::Res<()> {
     kernels::copy_into(MetalDevice::get(), t, out)
 }
 
+/// Permutes dimensions, materializing a contiguous result.
 pub fn permute(t: &MetalTensor, dims: &[usize]) -> crate::err::Res<MetalTensor> {
     let p = MetalTensor {
         buffer: t.buffer.clone(),
@@ -1207,6 +1312,7 @@ pub fn permute(t: &MetalTensor, dims: &[usize]) -> crate::err::Res<MetalTensor> 
     contig(&p)
 }
 
+/// Destination form of [`permute`]: strided-copies the permuted view.
 pub fn permute_into(t: &MetalTensor, dims: &[usize], out: &MetalTensor) -> crate::err::Res<()> {
     let permuted = MetalTensor {
         buffer: t.buffer.clone(),
@@ -1216,6 +1322,7 @@ pub fn permute_into(t: &MetalTensor, dims: &[usize], out: &MetalTensor) -> crate
     kernels::copy_into(MetalDevice::get(), &permuted, out)
 }
 
+/// Broadcasts to `shape`, materializing a contiguous result.
 pub fn broadcast_to(t: &MetalTensor, shape: &[usize]) -> crate::err::Res<MetalTensor> {
     let b = MetalTensor {
         buffer: t.buffer.clone(),
@@ -1225,6 +1332,8 @@ pub fn broadcast_to(t: &MetalTensor, shape: &[usize]) -> crate::err::Res<MetalTe
     contig(&b)
 }
 
+/// Destination form of [`broadcast_to`]: strided-copies the broadcast
+/// view (zero-stride reads).
 pub fn broadcast_to_into(
     t: &MetalTensor,
     shape: &[usize],
@@ -1238,6 +1347,7 @@ pub fn broadcast_to_into(
     kernels::copy_into(MetalDevice::get(), &broadcast, out)
 }
 
+/// Forwards to [`indexing::index_select`] after materializing inputs.
 pub fn index_select(
     a: &MetalTensor,
     dim: usize,
@@ -1248,6 +1358,7 @@ pub fn index_select(
     indexing::index_select(MetalDevice::get(), &an, dim, &idn)
 }
 
+/// Forwards to [`indexing::index_select_into`].
 pub fn index_select_into(
     a: &MetalTensor,
     dim: usize,
@@ -1258,6 +1369,7 @@ pub fn index_select_into(
     indexing::index_select_into(MetalDevice::get(), a, dim, ids, out, ids_scratch)
 }
 
+/// Forwards to [`indexing::gather`] after materializing inputs.
 pub fn gather(
     a: &MetalTensor,
     dim: usize,
@@ -1269,6 +1381,7 @@ pub fn gather(
     indexing::gather(MetalDevice::get(), &an, dim, &idn, ids_shape)
 }
 
+/// Forwards to [`indexing::gather_into`].
 pub fn gather_into(
     a: &MetalTensor,
     dim: usize,
@@ -1280,6 +1393,7 @@ pub fn gather_into(
     indexing::gather_into(MetalDevice::get(), a, dim, ids, ids_shape, out, ids_scratch)
 }
 
+/// Forwards to [`indexing::scatter_add`] after materializing inputs.
 pub fn scatter_add(
     a: &MetalTensor,
     dim: usize,
@@ -1292,6 +1406,7 @@ pub fn scatter_add(
     indexing::scatter_add(MetalDevice::get(), &an, dim, &idn, &sn)
 }
 
+/// Forwards to [`indexing::scatter_add_into`].
 #[allow(clippy::too_many_arguments)]
 pub fn scatter_add_into(
     a: &MetalTensor,
@@ -1316,20 +1431,24 @@ pub fn scatter_add_into(
     )
 }
 
+/// Concatenates two tensors along `dim` (materializes inputs first).
 pub fn cat(a: &MetalTensor, b: &MetalTensor, dim: usize) -> crate::err::Res<MetalTensor> {
     let an = contig(a)?;
     let bn = contig(b)?;
     indexing::cat(MetalDevice::get(), &[&an, &bn], dim)
 }
 
+/// Forwards to [`indexing::cat_into`].
 pub fn cat_into(tensors: &[&MetalTensor], dim: usize, out: &MetalTensor) -> crate::err::Res<()> {
     indexing::cat_into(MetalDevice::get(), tensors, dim, out)
 }
 
+/// Forwards to [`kernels::argreduce`].
 pub fn argreduce(a: &MetalTensor, dim: usize, pick_max: bool) -> crate::err::Res<MetalTensor> {
     kernels::argreduce(MetalDevice::get(), a, dim, pick_max)
 }
 
+/// Forwards to [`kernels::argreduce_into`].
 pub fn argreduce_into(
     a: &MetalTensor,
     dim: usize,
@@ -1339,14 +1458,17 @@ pub fn argreduce_into(
     kernels::argreduce_into(MetalDevice::get(), a, dim, pick_max, out)
 }
 
+/// Forwards to [`kernels::cumsum`].
 pub fn cumsum(a: &MetalTensor, dim: usize) -> crate::err::Res<MetalTensor> {
     kernels::cumsum(MetalDevice::get(), a, dim)
 }
 
+/// Forwards to [`kernels::cumsum_into`].
 pub fn cumsum_into(a: &MetalTensor, dim: usize, out: &MetalTensor) -> crate::err::Res<()> {
     kernels::cumsum_into(MetalDevice::get(), a, dim, out)
 }
 
+/// Allocates a tensor of `shape` filled with `value`.
 pub fn fill(shape: &[usize], value: f64, dtype: DType) -> crate::err::Res<MetalTensor> {
     kernels::compile_fill(MetalDevice::get(), shape, value, dtype)?;
     let out = MetalTensor::empty(MetalDevice::get(), shape.to_vec(), dtype);
@@ -1354,42 +1476,52 @@ pub fn fill(shape: &[usize], value: f64, dtype: DType) -> crate::err::Res<MetalT
     Ok(out)
 }
 
+/// Forwards to [`kernels::fill_into`].
 pub fn fill_into(value: f64, out: &MetalTensor) -> crate::err::Res<()> {
     kernels::fill_into(MetalDevice::get(), out, value)
 }
 
+/// Forwards to [`kernels::arange`].
 pub fn arange(start: f64, end: f64, step: f64, dtype: DType) -> crate::err::Res<MetalTensor> {
     kernels::arange(MetalDevice::get(), start, end, step, dtype)
 }
 
+/// Forwards to [`kernels::arange_into`].
 pub fn arange_into(start: f64, end: f64, step: f64, out: &MetalTensor) -> crate::err::Res<()> {
     kernels::arange_into(MetalDevice::get(), start, end, step, out)
 }
 
+/// Forwards to [`kernels::eye`].
 pub fn eye(n: usize, dtype: DType) -> crate::err::Res<MetalTensor> {
     kernels::eye(MetalDevice::get(), n, dtype)
 }
 
+/// Forwards to [`kernels::eye_into`].
 pub fn eye_into(out: &MetalTensor) -> crate::err::Res<()> {
     kernels::eye_into(MetalDevice::get(), out)
 }
 
+/// Forwards to [`kernels::randn`].
 pub fn randn(shape: &[usize], seed: u64) -> crate::err::Res<MetalTensor> {
     kernels::randn(MetalDevice::get(), shape, seed)
 }
 
+/// Forwards to [`kernels::randn_into`].
 pub fn randn_into(out: &MetalTensor, seed: u64) -> crate::err::Res<()> {
     kernels::randn_into(MetalDevice::get(), out, seed)
 }
 
+/// Forwards to [`kernels::uniform`].
 pub fn uniform(lo: f64, hi: f64, shape: &[usize], seed: u64) -> crate::err::Res<MetalTensor> {
     kernels::uniform(MetalDevice::get(), lo, hi, shape, seed)
 }
 
+/// Forwards to [`kernels::uniform_into`].
 pub fn uniform_into(lo: f64, hi: f64, out: &MetalTensor, seed: u64) -> crate::err::Res<()> {
     kernels::uniform_into(MetalDevice::get(), lo, hi, out, seed)
 }
 
+/// Forwards to [`conv::conv1d`] after materializing inputs.
 pub fn conv1d(
     x: &MetalTensor,
     w: &MetalTensor,
@@ -1411,6 +1543,7 @@ pub fn conv1d(
     )
 }
 
+/// Forwards to [`conv::conv1d_into`].
 #[allow(clippy::too_many_arguments)]
 pub fn conv1d_into(
     x: &MetalTensor,
@@ -1433,6 +1566,7 @@ pub fn conv1d_into(
     )
 }
 
+/// Forwards to [`conv::conv2d`] after materializing inputs.
 pub fn conv2d(
     x: &MetalTensor,
     w: &MetalTensor,
@@ -1454,6 +1588,7 @@ pub fn conv2d(
     )
 }
 
+/// Forwards to [`conv::conv2d_into`].
 #[allow(clippy::too_many_arguments)]
 pub fn conv2d_into(
     x: &MetalTensor,
@@ -1476,6 +1611,7 @@ pub fn conv2d_into(
     )
 }
 
+/// Forwards to [`conv::conv_transpose1d`] after materializing inputs.
 #[allow(clippy::too_many_arguments)]
 pub fn conv_transpose1d(
     x: &MetalTensor,
@@ -1500,6 +1636,7 @@ pub fn conv_transpose1d(
     )
 }
 
+/// Forwards to [`conv::conv_transpose1d_into`].
 #[allow(clippy::too_many_arguments)]
 pub fn conv_transpose1d_into(
     x: &MetalTensor,
@@ -1524,6 +1661,7 @@ pub fn conv_transpose1d_into(
     )
 }
 
+/// Forwards to [`conv::conv_transpose2d`] after materializing inputs.
 #[allow(clippy::too_many_arguments)]
 pub fn conv_transpose2d(
     x: &MetalTensor,
@@ -1548,6 +1686,7 @@ pub fn conv_transpose2d(
     )
 }
 
+/// Forwards to [`conv::conv_transpose2d_into`].
 #[allow(clippy::too_many_arguments)]
 pub fn conv_transpose2d_into(
     x: &MetalTensor,
@@ -1572,6 +1711,7 @@ pub fn conv_transpose2d_into(
     )
 }
 
+/// Forwards to [`conv::conv2d_backward_w`] after materializing inputs.
 #[allow(clippy::too_many_arguments)]
 pub fn conv2d_backward_w(
     x: &MetalTensor,
@@ -1598,6 +1738,7 @@ pub fn conv2d_backward_w(
     )
 }
 
+/// Forwards to [`conv::conv2d_backward_w_into`].
 #[allow(clippy::too_many_arguments)]
 pub fn conv2d_backward_w_into(
     x: &MetalTensor,
@@ -1624,6 +1765,7 @@ pub fn conv2d_backward_w_into(
     )
 }
 
+/// Batched gemm with a broadcast bias (`w` is the [k, n] weight).
 pub fn gemm_bias(
     x: &MetalTensor,
     w: &MetalTensor,
@@ -1649,6 +1791,8 @@ pub fn gemm_bias(
     )
 }
 
+/// Destination form of [`gemm_bias`]; `requirements` must match the exact
+/// dimensions and carry `has_bias`.
 #[allow(clippy::too_many_arguments)]
 pub fn gemm_bias_into(
     x: &MetalTensor,
@@ -1683,6 +1827,8 @@ pub fn gemm_bias_into(
     )
 }
 
+/// `x @ w + bias` over the last two dimensions of `x` (leading dims
+/// flatten to the gemm batch), restoring the original leading shape.
 pub fn linear(
     x: &MetalTensor,
     w: &MetalTensor,
@@ -1718,6 +1864,8 @@ mod tests {
     fn bytes(tensor: &MetalTensor) -> Vec<u8> {
         let size = tensor.dtype.size_in_bytes();
         let offset = tensor.layout.offset() * size;
+        // SAFETY: tests call this only after `dev.synchronize()`; the
+        // layout's byte range fits the shared-mode buffer.
         unsafe {
             std::slice::from_raw_parts(
                 tensor.buffer.contents_ptr().cast::<u8>().add(offset),

@@ -1,3 +1,58 @@
+//! The semantic computation graph at the heart of effect-torch.
+//!
+//! A graph is a lazy DAG of [`Node`]s, each wrapping a [`NodeKind`] that
+//! describes one operation. Nodes are shared through `Arc`, so a value used
+//! by ten consumers exists once. Library construction goes through
+//! [`Node::new`], which computes the node's shape/dtype/device via
+//! [`NodeKind::metadata`] and rejects invalid programs immediately (shape
+//! mismatches, core dtype/device violations such as f64 on Metal, invalid
+//! attention or convolution geometry). [`Node`] fields remain public for
+//! low-level integration, so direct struct literals bypass these guarantees;
+//! backend-specific support is validated again during compilation.
+//!
+//! # Architecture
+//!
+//! - **Leaves** ([`NodeKind::Leaf`]) hold user tensors behind a
+//!   [`LeafSlot`], which supports one-shot clearing: dropping the slot's
+//!   value releases the underlying storage while the node keeps its cached
+//!   metadata, and any later use fails with [`ClearedLeaf`].
+//! - **Inputs** ([`NodeKind::Input`], [`NodeKind::ScalarInput`]) are
+//!   placeholder leaves for compiled programs; they evaluate only when a
+//!   compiled program binds them to call arguments (RFC 0008).
+//! - **Semantic nodes** (e.g. [`NodeKind::Sdpa`], [`NodeKind::Linear`],
+//!   [`NodeKind::RotaryEmbedding`], [`NodeKind::ChunkedHeadCe`]) keep
+//!   high-level operation semantics in the graph instead of composing them
+//!   from primitives, so that native backends can substitute fused kernels
+//!   and graph rewrites (autodiff, decode compilation, checkpoint
+//!   recompute) can recognize operations structurally. The evaluators compose
+//!   reference implementations from primitive ops; replacing them with fused
+//!   kernels never changes graph semantics.
+//! - **Decode/prefill nodes** ([`NodeKind::KvAttention`],
+//!   [`NodeKind::KdaRecurrence`], [`NodeKind::ConvState`],
+//!   [`NodeKind::LastTokenRow`]) are produced only by the decode rewrite —
+//!   never written by user code. They read/write per-sequence state through
+//!   the run's decode context, keeping the graph itself a pure function of
+//!   its inputs.
+//! - **Backward nodes** ([`NodeKind::SdpaBackward`],
+//!   [`NodeKind::KdaBackward`], [`NodeKind::ChunkedHeadCeBackward`], ...)
+//!   are closed-form adjoints emitted by autodiff. Each computes several
+//!   gradient tensors in one evaluation; the `*Out` companion variants
+//!   project out one result by index. Backward nodes are not themselves
+//!   differentiable (no second-order autodiff).
+//! - **Optimizer steps** ([`NodeKind::AdamWStep`], [`NodeKind::SgdStep`])
+//!   carry step-varying scalars (learning rate, bias corrections, first-step
+//!   flag) as 0-d tensor children rather than captured constants, so a
+//!   frozen compiled graph never replays a stale step count.
+//!
+//! # Traversal and memory safety
+//!
+//! [`node_children`] returns a node's direct children and
+//! [`remap_children`] rebuilds a kind with mapped children (used to
+//! deep-copy subgraphs with fresh ids). Graphs can be very deep, so
+//! [`Node`]'s `Drop` impl drains descendants through an explicit worklist
+//! instead of recursing, avoiding stack overflow when long chains are
+//! dropped on worker threads. The crate contains no `unsafe` code.
+
 use effect_torch_runtime::{DType, GgmlKQuant};
 use std::any::Any;
 use std::error::Error;
@@ -5,8 +60,12 @@ use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
+// IDs issued by Node::new are unique per process and monotonic. Public struct
+// literals can bypass this allocator, so external code must preserve identity
+// if it constructs Node directly.
 static NEXT_NODE_ID: AtomicU64 = AtomicU64::new(0);
 
+/// Compute device a tensor lives on.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Device {
     Cpu,
@@ -31,6 +90,7 @@ impl Device {
     }
 }
 
+/// How cross-entropy reduces per-element losses to the scalar result.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CrossEntropyReduction {
     Mean,
@@ -39,6 +99,8 @@ pub enum CrossEntropyReduction {
 
 type CeReduction = CrossEntropyReduction;
 
+/// Cached shape/dtype/device triple of a node, computed once at
+/// construction by [`NodeKind::metadata`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NodeMetadata {
     pub shape: Vec<usize>,
@@ -46,6 +108,12 @@ pub struct NodeMetadata {
     pub device: Device,
 }
 
+/// A user tensor stored in a graph leaf.
+///
+/// The graph only needs metadata (`shape`, `dtype`, `device`) plus a
+/// downcast path for evaluators; the concrete storage type is defined by
+/// the embedding crate. Implementations must be `Send + Sync` because
+/// graphs are shared across threads.
 pub trait LeafValue: Any + Send + Sync {
     fn shape(&self) -> Vec<usize>;
     fn dtype(&self) -> DType;
@@ -53,17 +121,31 @@ pub trait LeafValue: Any + Send + Sync {
     fn as_any(&self) -> &dyn Any;
 }
 
+/// Mutex-protected, one-shot-clearable holder for a leaf's value.
+///
+/// Clearing releases the underlying tensor storage while nodes that
+/// reference the slot remain valid as metadata. `clear` is idempotent in
+/// effect but reports whether it actually removed a value. The lock is
+/// held only for brief, non-recursive critical sections. A panic in user
+/// `LeafValue` clone/drop code can still poison it; accessors intentionally
+/// treat that as an invariant failure via `unwrap`.
 pub struct LeafSlot(Mutex<Option<Arc<dyn LeafValue>>>);
 
 impl LeafSlot {
+    /// Creates a slot holding `value`.
     pub fn new(value: impl LeafValue) -> Self {
         Self(Mutex::new(Some(Arc::new(value))))
     }
 
+    /// Removes the value, returning `true` if one was present. Afterwards
+    /// [`get`](Self::get) and node construction through this slot fail with
+    /// [`ClearedLeaf`].
     pub fn clear(&self) -> bool {
         self.0.lock().unwrap().take().is_some()
     }
 
+    /// Clones the value out, downcast to its concrete type. Fails with
+    /// [`ClearedLeaf`] if the slot was cleared or the type does not match.
     pub fn get<T: LeafValue + Clone>(&self) -> Result<T, ClearedLeaf> {
         self.0
             .lock()
@@ -87,6 +169,7 @@ impl LeafSlot {
     }
 }
 
+/// Error produced when a cleared [`LeafSlot`] is read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ClearedLeaf;
 impl fmt::Display for ClearedLeaf {
@@ -96,6 +179,7 @@ impl fmt::Display for ClearedLeaf {
 }
 impl Error for ClearedLeaf {}
 
+// Shared channel/dtype/device validation for Conv1d/Conv2d.
 fn conv_check(
     op: &str,
     x: &Node,
@@ -360,6 +444,9 @@ fn short_conv_check(op: &str, x: &Node, weight: &Node) -> Result<(), String> {
     Ok(())
 }
 
+// Output size of one convolution dimension: floor((in + 2*pad -
+// dilation*(kernel-1) - 1) / stride) + 1, rejecting kernels that exceed the
+// padded input.
 fn conv_out_dim(
     input: usize,
     kernel: usize,
@@ -376,22 +463,31 @@ fn conv_out_dim(
     }
     Ok((input + 2 * padding - effective) / stride + 1)
 }
-// Where a position-indexed semantic node reads its base position:
-// zero in user graphs, the sequence cursor in decode-rewritten ones.
+/// Where a position-indexed semantic node reads its base position:
+/// zero in user graphs, the sequence cursor in decode-rewritten ones.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum PositionOffset {
+    /// Positions are absolute (0-based) within the sequence.
     Absolute,
+    /// Positions are offset by the decode run's sequence cursor.
     Cursor,
 }
 
+/// Sliding-window configuration of an attention node.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum AttentionWindow {
+    /// Take the window from the enclosing model configuration.
     Inherit,
+    /// Attend to the whole context.
     Full,
+    /// Attend to at most the last `window` positions (must be positive).
     Local(usize),
 }
 
 impl AttentionWindow {
+    /// Resolves `Inherit` against the model-level `inherited` window;
+    /// `Full` and `Local` override it. Returns `Some(n)` for a local
+    /// window of `n`, `None` for full attention.
     pub const fn resolve(self, inherited: Option<usize>) -> Option<usize> {
         match self {
             Self::Inherit => inherited,
@@ -400,18 +496,37 @@ impl AttentionWindow {
         }
     }
 
+    /// The local window if this is `Local`, else `None`.
     pub const fn local(self) -> Option<usize> {
         self.resolve(None)
     }
 }
 
+/// How the last dimension of a rotary embedding is paired for rotation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum RotaryLayout {
+    /// GPT-NeoX style: pairs `(x[j], x[j + D/2])`.
     HalfSplit,
+    /// GPT-J style: pairs `(x[2j], x[2j + 1])`.
     InterleavedPairs,
 }
 
+/// One operation in the computation graph.
+///
+/// Variants fall into the families described in the crate documentation:
+/// leaves and placeholders, constants/generators, elementwise arithmetic
+/// and comparisons, reductions, indexing, neural-network semantic nodes
+/// (attention, convolutions, normalization, embedding, linear, quantized
+/// ops), closed-form backward nodes with their `*Out` projectors,
+/// decode/prefill state nodes, optimizer steps, and the autodiff control
+/// nodes [`Checkpoint`](NodeKind::Checkpoint) /
+/// [`StopGradient`](NodeKind::StopGradient).
+///
+/// Construction is always validated through [`Node::new`]; the per-variant
+/// contracts (operand shapes, dtypes, devices) are documented on the
+/// variants below and enforced by [`NodeKind::metadata`].
 pub enum NodeKind {
+    /// A user tensor held in a clearable [`LeafSlot`].
     Leaf(std::sync::Arc<LeafSlot>),
     // RFC 0008: placeholder leaves for compiled programs. An Input carries
     // the declared signature of one call argument; it evaluates only inside
@@ -427,6 +542,8 @@ pub enum NodeKind {
         dtype: DType,
         device: Device,
     },
+    /// Constant tensor decoded from raw bytes in `dtype`'s little-endian
+    /// representation.
     FromBytes {
         data: Vec<u8>,
         shape: Vec<usize>,
@@ -443,17 +560,21 @@ pub enum NodeKind {
         dtype: DType,
         device: Device,
     },
+    /// Tensor of `shape` filled with `value`.
     Full {
         shape: Vec<usize>,
         value: f64,
         dtype: DType,
         device: Device,
     },
+    /// Standard-normal random tensor; draws from the run's RNG state.
     Randn {
         shape: Vec<usize>,
         dtype: DType,
         device: Device,
     },
+    /// Uniform random tensor over `[lo, hi)`; requires a float dtype and
+    /// `lo < hi`.
     Uniform {
         lo: f64,
         hi: f64,
@@ -461,6 +582,8 @@ pub enum NodeKind {
         dtype: DType,
         device: Device,
     },
+    /// 1-D tensor of `ceil((end - start) / step)` values starting at
+    /// `start` (clamped at 0 elements).
     Arange {
         start: f64,
         end: f64,
@@ -468,82 +591,107 @@ pub enum NodeKind {
         dtype: DType,
         device: Device,
     },
+    /// The `n × n` identity matrix.
     Eye {
         n: usize,
         dtype: DType,
         device: Device,
     },
+    /// Elementwise binary arithmetic with NumPy-style broadcasting. A 0-d
+    /// float operand never promotes the other operand's dtype (PyTorch
+    /// scalar promotion rules).
     Add {
         a: Arc<Node>,
         b: Arc<Node>,
     },
+    /// Elementwise subtraction; see [`Add`](NodeKind::Add) for the
+    /// broadcasting and dtype rules.
     Sub {
         a: Arc<Node>,
         b: Arc<Node>,
     },
+    /// Elementwise multiplication; see [`Add`](NodeKind::Add).
     Mul {
         a: Arc<Node>,
         b: Arc<Node>,
     },
+    /// Elementwise division; see [`Add`](NodeKind::Add).
     Div {
         a: Arc<Node>,
         b: Arc<Node>,
     },
+    /// Elementwise comparison with broadcasting; the output dtype is u8.
     Eq {
         a: Arc<Node>,
         b: Arc<Node>,
     },
+    /// Elementwise `>`; u8 output, see [`Eq`](NodeKind::Eq).
     Gt {
         a: Arc<Node>,
         b: Arc<Node>,
     },
+    /// Elementwise `<`; u8 output, see [`Eq`](NodeKind::Eq).
     Lt {
         a: Arc<Node>,
         b: Arc<Node>,
     },
+    /// Elementwise `>=`; u8 output, see [`Eq`](NodeKind::Eq).
     Ge {
         a: Arc<Node>,
         b: Arc<Node>,
     },
+    /// Elementwise `<=`; u8 output, see [`Eq`](NodeKind::Eq).
     Le {
         a: Arc<Node>,
         b: Arc<Node>,
     },
+    /// Elementwise maximum with broadcasting; see [`Add`](NodeKind::Add).
     Maximum {
         a: Arc<Node>,
         b: Arc<Node>,
     },
+    /// Elementwise minimum with broadcasting; see [`Add`](NodeKind::Add).
     Minimum {
         a: Arc<Node>,
         b: Arc<Node>,
     },
+    /// Elementwise unary op preserving shape and dtype.
     Neg {
         a: Arc<Node>,
     },
+    /// Elementwise absolute value.
     Abs {
         a: Arc<Node>,
     },
+    /// Elementwise square root.
     Sqrt {
         a: Arc<Node>,
     },
+    /// Elementwise exponential.
     Exp {
         a: Arc<Node>,
     },
+    /// Elementwise natural logarithm.
     Log {
         a: Arc<Node>,
     },
+    /// Elementwise sine.
     Sin {
         a: Arc<Node>,
     },
+    /// Elementwise cosine.
     Cos {
         a: Arc<Node>,
     },
+    /// Elementwise hyperbolic tangent.
     Tanh {
         a: Arc<Node>,
     },
+    /// Elementwise rectified linear unit, `max(x, 0)`.
     Relu {
         a: Arc<Node>,
     },
+    /// Elementwise Gauss error function.
     Erf {
         a: Arc<Node>,
     },
@@ -554,90 +702,120 @@ pub enum NodeKind {
         a: Arc<Node>,
         approximate: bool,
     },
+    /// Elementwise floor.
     Floor {
         a: Arc<Node>,
     },
+    /// Elementwise ceiling.
     Ceil {
         a: Arc<Node>,
     },
+    /// Elementwise rounding to the nearest integer.
     Round {
         a: Arc<Node>,
     },
+    /// Elementwise sign (−1, 0 or 1).
     Sign {
         a: Arc<Node>,
     },
+    /// Selects from `a` or `b` per element of the u8 `cond`; all three
+    /// broadcast together, and `a`/`b` must share a dtype.
     Where {
         cond: Arc<Node>,
         a: Arc<Node>,
         b: Arc<Node>,
     },
+    /// Elementwise `a^exp` with a compile-time constant exponent.
     Pow {
         a: Arc<Node>,
         exp: f64,
     },
+    /// Elementwise cast to `dtype` (never a silent device-imposed
+    /// downcast; the target dtype is explicit in the graph).
     Cast {
         a: Arc<Node>,
         dtype: DType,
     },
+    /// Sum over `dims`; with `keepdims` the reduced dims become 1 instead
+    /// of being removed.
     Sum {
         a: Arc<Node>,
         dims: Vec<usize>,
         keepdims: bool,
     },
+    /// Mean over `dims`; see [`Sum`](NodeKind::Sum).
     Mean {
         a: Arc<Node>,
         dims: Vec<usize>,
         keepdims: bool,
     },
+    /// Maximum over `dims`; see [`Sum`](NodeKind::Sum).
     Max {
         a: Arc<Node>,
         dims: Vec<usize>,
         keepdims: bool,
     },
+    /// Minimum over `dims`; see [`Sum`](NodeKind::Sum).
     Min {
         a: Arc<Node>,
         dims: Vec<usize>,
         keepdims: bool,
     },
+    /// Product over `dims`; see [`Sum`](NodeKind::Sum).
     Prod {
         a: Arc<Node>,
         dims: Vec<usize>,
         keepdims: bool,
     },
+    /// Indices of the maxima along `dim` (removed from the shape); i64
+    /// output.
     Argmax {
         a: Arc<Node>,
         dim: usize,
     },
+    /// Indices of the minima along `dim`; i64 output.
     Argmin {
         a: Arc<Node>,
         dim: usize,
     },
+    /// Inclusive cumulative sum along `dim`, preserving shape.
     Cumsum {
         a: Arc<Node>,
         dim: usize,
     },
+    /// Selects rows along `dim` by 1-D i64/u32 `indexes`; output shape
+    /// replaces `dim` with `indexes.len()`.
     IndexSelect {
         a: Arc<Node>,
         dim: usize,
         indexes: Arc<Node>,
     },
+    /// Adds `src` into `a` along `dim` at `indexes` (i64/u32, same shape
+    /// as `src`); output shape and dtype are `a`'s.
     ScatterAdd {
         a: Arc<Node>,
         dim: usize,
         indexes: Arc<Node>,
         src: Arc<Node>,
     },
+    /// Gathers along `dim` with i64/u32 `indexes` of the same rank as `a`;
+    /// the output takes the indexes' shape.
     Gather {
         a: Arc<Node>,
         dim: usize,
         indexes: Arc<Node>,
     },
+    /// Cross-entropy of `logits [.., C]` against integer `target [..]`,
+    /// skipping targets equal to `ignore_index`; scalar output reduced per
+    /// `reduction`.
     CrossEntropy {
         logits: Arc<Node>,
         target: Arc<Node>,
         ignore_index: i64,
         reduction: CeReduction,
     },
+    /// Gradient of [`CrossEntropy`](NodeKind::CrossEntropy) w.r.t. the
+    /// logits (same shape as `logits`).
     CrossEntropyBackward {
         logits: Arc<Node>,
         target: Arc<Node>,
@@ -676,6 +854,8 @@ pub enum NodeKind {
         causal: bool,
         window: AttentionWindow,
     },
+    /// Projects out one output of [`SdpaBackward`](NodeKind::SdpaBackward):
+    /// `index` 0 = dq, 1 = dk, 2 = dv.
     SdpaBackwardOut {
         of: Arc<Node>,
         index: u8,
@@ -826,6 +1006,9 @@ pub enum NodeKind {
         g: Arc<Node>,
         ignore_index: i64,
     },
+    /// Projects out one output of
+    /// [`ChunkedHeadCeBackward`](NodeKind::ChunkedHeadCeBackward): `index`
+    /// 0 = dx, 1 = dweight, 2 = dbias.
     ChunkedHeadCeBackwardOut {
         of: Arc<Node>,
         index: u8,
@@ -909,6 +1092,10 @@ pub enum NodeKind {
         weight: Arc<Node>,
         bias: Arc<Node>,
     },
+    /// Linear layer over a packed K-quant weight: `x [.., columns]` (f32)
+    /// times the dequantized `weight_shape = [rows, columns]` matrix, plus
+    /// optional f32 bias `[rows]`; f32 output `[.., rows]`. `weight` is the
+    /// packed u8 tensor `[rows, encoded_row_bytes]`.
     QuantizedLinear {
         x: Arc<Node>,
         weight: Arc<Node>,
@@ -916,6 +1103,11 @@ pub enum NodeKind {
         codec: GgmlKQuant,
         weight_shape: [usize; 2],
     },
+    /// Embedding lookup over a packed K-quant table: `indexes` (i64/u32,
+    /// any shape) select rows of the dequantized
+    /// `weight_shape = [rows, columns]` table; f32 output
+    /// `[..indexes, columns]`. `padding_index`, when set, zeroes that row's
+    /// output and gradient.
     QuantizedEmbedding {
         indexes: Arc<Node>,
         weight: Arc<Node>,
@@ -923,6 +1115,8 @@ pub enum NodeKind {
         weight_shape: [usize; 2],
         padding_index: Option<usize>,
     },
+    /// 1-D convolution: x `[N, C_in, L]`, w `[C_out, C_in/groups, K]`;
+    /// output `[N, C_out, L_out]`.
     Conv1d {
         x: Arc<Node>,
         w: Arc<Node>,
@@ -931,6 +1125,7 @@ pub enum NodeKind {
         dilation: usize,
         groups: usize,
     },
+    /// 2-D convolution: x `[N, C_in, H, W]`, w `[C_out, C_in/groups, KH, KW]`.
     Conv2d {
         x: Arc<Node>,
         w: Arc<Node>,
@@ -939,6 +1134,9 @@ pub enum NodeKind {
         dilation: usize,
         groups: usize,
     },
+    /// Transposed 1-D convolution; output length
+    /// `(L-1)*stride + dilation*(K-1) + output_padding + 1 - 2*padding`,
+    /// channels `w[1] * groups`.
     ConvTranspose1d {
         x: Arc<Node>,
         w: Arc<Node>,
@@ -948,6 +1146,9 @@ pub enum NodeKind {
         dilation: usize,
         groups: usize,
     },
+    /// Transposed 2-D convolution; see
+    /// [`ConvTranspose1d`](NodeKind::ConvTranspose1d) for the size formula,
+    /// applied per spatial dimension.
     ConvTranspose2d {
         x: Arc<Node>,
         w: Arc<Node>,
@@ -957,6 +1158,8 @@ pub enum NodeKind {
         dilation: usize,
         groups: usize,
     },
+    /// Weight gradient of [`Conv1d`](NodeKind::Conv1d):
+    /// `[out_channels, C_in/groups, kernel]`.
     Conv1dBackwardW {
         x: Arc<Node>,
         g: Arc<Node>,
@@ -967,6 +1170,8 @@ pub enum NodeKind {
         dilation: usize,
         groups: usize,
     },
+    /// Weight gradient of [`Conv2d`](NodeKind::Conv2d):
+    /// `[out_channels, C_in/groups, kernel[0], kernel[1]]`.
     Conv2dBackwardW {
         x: Arc<Node>,
         g: Arc<Node>,
@@ -977,37 +1182,51 @@ pub enum NodeKind {
         dilation: usize,
         groups: usize,
     },
+    /// Reinterprets `a` with `shape`; the element count must be preserved.
     Reshape {
         a: Arc<Node>,
         shape: Vec<usize>,
     },
+    /// Reorders dimensions; `dims` must be a permutation of the rank.
     Permute {
         a: Arc<Node>,
         dims: Vec<usize>,
     },
+    /// Per-dimension strided view; each range is `(start, stop, stride)`
+    /// and the output dim is `ceil((stop - start) / stride)`.
     Slice {
         a: Arc<Node>,
         ranges: Vec<(usize, usize, usize)>,
     },
+    /// Concatenates `a` and `b` along `dim`; all other dims must match.
     Concat {
         a: Arc<Node>,
         b: Arc<Node>,
         dim: usize,
     },
+    /// Broadcasts `a` to the equal-or-higher-rank `shape`; non-1 source
+    /// dims must match the target.
     BroadcastTo {
         a: Arc<Node>,
         shape: Vec<usize>,
     },
+    /// Batched matrix product over the last two dims with broadcasting
+    /// leading dims: `[.., M, K] × [.., K, N] -> [.., M, N]`.
     Matmul {
         a: Arc<Node>,
         b: Arc<Node>,
     },
+    /// Matrix inverse over the last two (square, float) dims.
     Inverse {
         a: Arc<Node>,
     },
+    /// Determinant over the last two (square, float) dims; the output
+    /// drops both.
     Det {
         a: Arc<Node>,
     },
+    /// Solves `a·x = b` for `x`; `a` square float on the last two dims,
+    /// `b` `[.., N, NRHS]` matching `a`'s leading dims and size.
     Solve {
         a: Arc<Node>,
         b: Arc<Node>,
@@ -1028,6 +1247,8 @@ pub enum NodeKind {
         eps: f64,
         weight_decay: f64,
     },
+    /// Projects out one output of [`AdamWStep`](NodeKind::AdamWStep):
+    /// `index` 0 = updated param, 1 = first moment, 2 = second moment.
     AdamWOut {
         step: Arc<Node>,
         index: u8,
@@ -1046,18 +1267,33 @@ pub enum NodeKind {
         nesterov: bool,
         weight_decay: f64,
     },
+    /// Projects out one output of [`SgdStep`](NodeKind::SgdStep): `index`
+    /// 0 = updated param, 1 = updated velocity.
     SgdOut {
         step: Arc<Node>,
         index: u8,
     },
+    /// Identity in the forward pass; autodiff stops gradient propagation
+    /// at this node.
     StopGradient {
         a: Arc<Node>,
     },
+    /// Identity in the forward pass; autodiff recomputes the wrapped
+    /// subgraph during backward instead of retaining its activations.
     Checkpoint {
         a: Arc<Node>,
     },
 }
 
+/// One node of the computation graph: an identity, cached metadata, and the
+/// operation itself.
+///
+/// Nodes returned by [`Node::new`] are immutable behind `Arc`, have
+/// process-unique monotonically issued ids, and cache metadata derived from
+/// `kind`. Because the fields are public, direct struct construction is a
+/// low-level escape hatch: callers taking it must provide a unique/stable id
+/// and metadata exactly matching [`NodeKind::metadata`]. Identity is by `id`,
+/// not pointer.
 pub struct Node {
     pub id: u64,
     pub shape: Vec<usize>,
@@ -1098,6 +1334,10 @@ impl Drop for Node {
 }
 
 impl Node {
+    /// Validates `kind` (operand shapes, dtypes, devices — see
+    /// [`NodeKind::metadata`]) and, on success, returns the shared node
+    /// with its metadata cached. Prefer this over public struct construction;
+    /// it is the path that guarantees a fresh id and consistent metadata.
     pub fn new(kind: NodeKind) -> Result<Arc<Self>, String> {
         let metadata = kind.metadata()?;
         Ok(Arc::new(Self {
@@ -1186,6 +1426,10 @@ fn linear_out_shape(
     Ok(out)
 }
 impl NodeKind {
+    /// Computes the node's output metadata and validates all operand
+    /// contracts. Every constructor path (`Node::new`, including nodes
+    /// rebuilt by compiler rewrites) goes through this, ending with the
+    /// device/dtype capability check (`check_dtype_device`).
     pub fn metadata(&self) -> Result<NodeMetadata, String> {
         let (shape, dtype, device) = match self {
             NodeKind::Leaf(slot) => {
@@ -2269,6 +2513,11 @@ fn check_dtype_device(dtype: DType, device: &Device) -> std::result::Result<(), 
     }
     Ok(())
 }
+/// The direct children of a node, in operand order. Leaves, placeholders,
+/// constants and generators have none.
+///
+/// This is the canonical child enumeration: evaluators, autodiff, rewrites
+/// and the iterative [`Node`] destructor all rely on it being exhaustive.
 pub fn node_children(kind: &NodeKind) -> Vec<Arc<Node>> {
     match kind {
         NodeKind::Leaf(_)
@@ -2492,8 +2741,11 @@ pub fn node_children(kind: &NodeKind) -> Vec<Arc<Node>> {
     }
 }
 
-// Rebuilds a node kind with its children mapped through `f`. Used to
-// deep-copy subgraphs with fresh node ids (checkpoint recompute).
+/// Rebuilds a node kind with its children mapped through `f`. Used to
+/// deep-copy subgraphs with fresh node ids (checkpoint recompute).
+///
+/// Non-child fields are cloned verbatim; the result is not re-validated —
+/// pass it to [`Node::new`] for that.
 pub fn remap_children(kind: &NodeKind, f: &dyn Fn(&Arc<Node>) -> Arc<Node>) -> NodeKind {
     match kind {
         NodeKind::Leaf(t) => NodeKind::Leaf(t.clone()),

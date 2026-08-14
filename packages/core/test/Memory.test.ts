@@ -6,6 +6,8 @@ import { setFlagsFromString } from "node:v8"
 import { runInNewContext } from "node:vm"
 import { Runtime, Tensor } from "../src/index.ts"
 
+// These CPU-only diagnostics distinguish explicit handle release from V8
+// finalization. Forced GC makes objects eligible; native finalizers remain async.
 setFlagsFromString("--expose-gc")
 const collectGarbage = runInNewContext("gc") as () => void
 
@@ -19,6 +21,8 @@ const externalMemoryBytes = Effect.gen(function*() {
 })
 
 layer(BackendCpu.layer)("Memory", (it) => {
+  // Exact external-byte deltas are measured around live native handles, not RSS;
+  // allocator caching and process-global runtime memory are outside this counter.
   describe("external memory accounting", () => {
     it.effect("clear releases the bytes immediately, without GC", () =>
       Effect.gen(function*() {
@@ -45,6 +49,14 @@ layer(BackendCpu.layer)("Memory", (it) => {
         assert.strictEqual(yield* externalMemoryBytes, before)
       }))
 
+    it.effect("clearAll accepts iterable ownership collections", () =>
+      Effect.gen(function*() {
+        const tensors = yield* Tensor.compute([yield* Tensor.ones([4]), yield* Tensor.zeros([4])])
+        yield* Tensor.clearAll(new Set(tensors))
+        const error = yield* Effect.flip(Tensor.toNumberArray(tensors[0]))
+        expect(error.message).toContain("cleared")
+      }))
+
     it.effect("use after clear is a typed error, through the handle and the graph", () =>
       Effect.gen(function*() {
         const [t] = yield* Tensor.compute([yield* Tensor.zeros([4])])
@@ -65,6 +77,14 @@ layer(BackendCpu.layer)("Memory", (it) => {
         yield* Tensor.clear(copy)
         assert.deepStrictEqual(yield* Tensor.toNumberArray(source), [1, 1, 1, 1])
         yield* Tensor.clear(source)
+      }))
+
+    it.effect("lazy readback releases its private materialization", () =>
+      Effect.gen(function*() {
+        const before = yield* externalMemoryBytes
+        const values = yield* Tensor.toTypedArray(yield* Tensor.ones([4]))
+        assert.deepStrictEqual(Array.from<number | bigint>(values).map(Number), [1, 1, 1, 1])
+        assert.strictEqual(yield* externalMemoryBytes, before)
       }))
 
     it.effect("runtime tensor bytes are reported on compute and released on GC", () =>
@@ -95,6 +115,8 @@ layer(BackendCpu.layer)("Memory", (it) => {
   })
 
   describe("early free during evaluation", () => {
+    // A 512x512 f32 intermediate is 1 MiB. Retaining all 2,000 chain nodes would
+    // exceed 2 GiB; 512 MiB leaves headroom for runtime/JIT and allocator noise.
     it.effect("long chains free intermediates instead of holding the whole walk", () =>
       Effect.gen(function*() {
         const chain = Effect.gen(function*() {

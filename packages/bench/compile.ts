@@ -1,3 +1,17 @@
+// JSONL benchmark for native executable compilation and structural-cache lookup.
+// Each cold/warm pair rebuilds equivalent graph structure with one unique salt:
+// the first compile is a process-cache miss and the second can reuse that exact
+// structural artifact. Graph construction is outside the timer and executables
+// are never run; pipeline preparation performed by native compile remains part
+// of the cold sample. Pairs execute serially and the output records medians plus
+// cold artifact diagnostics; `compilePhases` belong to the cold compile that
+// created the artifact, not the warm lookup call.
+//
+// Compiler EFFECT_TORCH_* switches are snapshotted into compile options and
+// cache identity. This harness rejects EFFECT_TORCH_NO_EXECUTABLE_CACHE by mere
+// presence (even an empty or "0" value) and rejects constant weights because
+// either would invalidate the warm-cache measurement.
+
 import { Gradient, Optimizer, Runtime, Tensor } from "@effect-torch/core"
 import { Effect } from "effect"
 import { arch, cpus, platform, release, totalmem } from "node:os"

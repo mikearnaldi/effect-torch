@@ -16,14 +16,21 @@ import {
   windows
 } from "./model.js"
 
-// Full-epoch training, warm-started from the pilot checkpoint
-// (fineweb-model.safetensors, written by train.ts): parameters load from
-// disk, AdamW starts fresh, and the learning rate follows linear warmup
-// into a cosine decay over every complete batch in one pass through the
-// 745M-token bin, without replacement (see Sampler). Checkpoints land in a
-// separate file so a pilot checkpoint is never clobbered, and an
-// interrupted epoch resumes bit-exactly (params, optimizer, step, data
-// layout). The final parameters replace fineweb-model.safetensors.
+// Longer FineWeb training uses `CKPT` as a mutable resumable archive, rewritten
+// after every chunk and preferred when present. Without it, bare `CHECKPOINT`
+// parameters warm-start training with fresh AdamW and sampler state. `OUT`
+// receives final bare parameters; by default `OUT === CHECKPOINT`, so the final
+// save replaces the warm-start artifact while `CKPT` remains resumable state.
+//
+// By default `totalSteps` is every complete sampler batch in one permutation;
+// a trailing partial batch is skipped. FINEWEB_STEPS changes both the run and
+// cosine-schedule horizon, so an override is not necessarily one epoch. Resume
+// restores parameters, optimizer roots, step, and the remainder of the saved
+// permutation. Future reshuffles can diverge because Math.random state is not
+// checkpointed, and checkpoint files carry no hyperparameter provenance.
+// FINEWEB_BATCH and FINEWEB_STEPS are Number-parsed without early validation.
+// A completed `CKPT` remains present and wins on the next invocation; select or
+// remove it before intending a fresh warm start.
 
 const TRAIN_BIN = new URL("../data/fineweb-train.bin", import.meta.url).pathname
 const VAL_BIN = new URL("../data/fineweb-val.bin", import.meta.url).pathname
@@ -94,9 +101,9 @@ const program = Effect.gen(function*() {
     }
   })
 
-  // A saved epoch checkpoint resumes bit-exactly; otherwise start from the
-  // pilot's parameters with fresh optimizer state at step 0, falling back to
-  // the model's initial (random) parameters when no pilot exists.
+  // The resumable archive wins over the pilot artifact. Without it, loading
+  // bare pilot parameters deliberately creates fresh optimizer and sampler
+  // state; random model initialization is only the final fallback.
   let params: Model.Params
   let step = 0
   let resume: Trainer.Resume<Optimizer.AdamState> | undefined
@@ -123,8 +130,9 @@ const program = Effect.gen(function*() {
   )
 
   let chunkTarget = Math.min(step + CHECKPOINT_EVERY, totalSteps)
-  // One clock for the whole epoch: carried through every chunk's
-  // resume so TrainStep.elapsed never restarts at a checkpoint.
+  // One elapsed clock is carried across chunks in this process. Checkpoint
+  // persistence omits `startedAt`, so restarting the process starts a new
+  // elapsed/ETA clock even though the global training step resumes.
   const epochStartedAt = resume?.startedAt ?? Date.now()
   if (resume !== undefined) resume = { ...resume, startedAt: epochStartedAt }
   while (step < totalSteps) {
@@ -137,15 +145,15 @@ const program = Effect.gen(function*() {
     yield* Checkpoint.saveWithSampler(CKPT, trainer, trained, sampler)
     yield* Effect.log(`checkpoint at step ${step}`)
     chunkTarget = Math.min(step + CHECKPOINT_EVERY, totalSteps)
-    // The trainer returned replacement params/state; the previous chunk's
-    // generation is dead weight (params + moments, GBs at scale) — release
-    // it explicitly rather than on GC timing. Tensors the trainer cleared
-    // itself are skipped (clear is idempotent).
-    const stale = [
+    // Each chunk passes concrete params/state as caller-owned inputs, so the
+    // trainer does not release that generation after producing replacements.
+    // Clear its concrete roots exactly once rather than leaving GB-scale
+    // generations to native finalizers; lazy initial roots are skipped.
+    const stale = new Set([
       ...previous.filter(Tensor.isTensor),
       ...(previousState !== undefined ? optimizer.stateRoots(previousState).filter(Tensor.isTensor) : [])
-    ]
-    yield* Effect.forEach(stale, (tensor) => Tensor.clear(tensor), { discard: true })
+    ])
+    yield* Tensor.clearAll(stale)
   }
 
   yield* Effect.log(`3) held-out loss over ${VAL_BATCHES} val batches`)

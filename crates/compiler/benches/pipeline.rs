@@ -1,3 +1,16 @@
+//! Compiler graph-analysis benchmark (invoked via `cargo bench --bench pipeline`).
+//!
+//! Measures only the compiler's frontend: `GraphIndex` construction plus
+//! `OptimizationPlan` selection, over parameterized workloads (elementwise
+//! chains, wide fan-out, training with autodiff + optimizer steps, decode
+//! specialization, grouped optimizers, and 50k/100k-node stack-safety
+//! stress). No lowering, memory planning, or backend work is performed.
+//!
+//! Beyond timing, each sample asserts the structural invariants the rest of
+//! the pipeline depends on: exactly one graph-index build per program,
+//! zero semantic nodes rebuilt by optimization, and identical structural
+//! metrics across iterations (determinism). Run with `--help` for options.
+
 use effect_torch_autodiff::grad;
 use effect_torch_compiler::{specialize_decode, CompileOptions, GraphIndex, OptimizationPlan};
 use effect_torch_graph::{AttentionWindow, Device, Node, NodeKind, PositionOffset, RotaryLayout};
@@ -8,6 +21,8 @@ use std::time::Instant;
 
 const DEFAULT_ITERATIONS: usize = 7;
 
+/// The parameterized workloads; `Stack50k`/`Stack100k` are stress-only and
+/// run on a small-stack thread to prove the analysis is iterative.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Workload {
     Elementwise,
@@ -180,6 +195,8 @@ default excludes the 50k/100k stack workloads; stress selects them; all includes
     );
 }
 
+/// Structural counters captured per sample; compared across iterations to
+/// detect any nondeterminism in graph analysis.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Metrics {
     semantic_nodes: usize,
@@ -199,6 +216,9 @@ struct Metrics {
     planned_lowering_units: usize,
 }
 
+/// One measured run: graph build time is kept separate from the analysis
+/// phases it feeds, and `analysis_ns` is the scope reported as the headline
+/// number (index + optimization).
 struct Sample {
     graph_build_ns: u128,
     index_ns: u128,

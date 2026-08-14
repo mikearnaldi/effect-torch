@@ -1,3 +1,66 @@
+//! Executable planning and execution for the Metal backend.
+//!
+//! This module lowers a compiler-prepared program
+//! ([`PreparedProgram`]) into an immutable [`MetalExecutable`] and runs
+//! it against caller-supplied bindings. Compilation is a one-shot,
+//! fail-loud pipeline:
+//!
+//! 1. **Lowering** — the [`CompilerDriver`] walks the graph in
+//!    evaluation order and the [`Lowerer`] maps each semantic node to a
+//!    [`MetalOp`], recording value metadata, storage classes
+//!    ([`MetalValueStorage`]), constants, and bindings.
+//! 2. **Physical planning** — every operation gets an exact
+//!    [`MetalCommandPlan`] (the fused kernels' `*_requirements` types)
+//!    plus scratch/staging/status resource specs
+//!    ([`plan_command_resources`]), and the memory planner assigns each
+//!    value a [`Location`] inside shared workspace segments.
+//! 3. **Pipeline preparation** — every pipeline the physical plan can
+//!    reference is warmed up front (`MetalPreparedArtifacts` counts
+//!    them), so execution never blocks on the Metal shader compiler.
+//! 4. **Publication** — constants and compile-time submissions are
+//!    drained before the artifact becomes visible to callers.
+//!
+//! ## Execution
+//!
+//! [`execute_with_commit`] validates the invocation against the
+//! program signature (counts, dtypes, placements, zero-offset
+//! contiguity), acquires workspace segments per the memory plan,
+//! resolves every value to a concrete buffer, then walks the
+//! **physical command stream** ([`MetalPhysicalCommand`]):
+//!
+//! - `Encode(id)` dispatches one operation into the current command
+//!   buffer via [`execute_op_into`].
+//! - `StatusGate(id)` + `Commit` close the current command buffer
+//!   after a status-producing kernel (cross-entropy, quantized
+//!   embedding), so its device-side status word is readable on the
+//!   host while later commands keep encoding; the deferred checks run
+//!   after the final fence in command order.
+//! - `Complete` must be last — the stream is validated for exactly one
+//!   terminal completion.
+//!
+//! GPU synchronization happens **unconditionally** before any segment
+//! or output owner is released, and backend submission failures take
+//! precedence over host errors, panics (caught and re-raised as
+//! errors), and cancellation.
+//!
+//! ## Cancellation
+//!
+//! The [`CancellationFlag`] is polled before validation, before every
+//! encoded command, and again after synchronization; a set flag aborts
+//! with `"operation aborted"`. For stateful execution an additional
+//! `commit_allowed` gate runs after the GPU work completes.
+//!
+//! ## State transactions
+//!
+//! Decode executables carry a [`KvStateSchema`] and run against a
+//! [`MetalDecodeContext`] holding per-slot [`SeqState`]. Kernels write
+//! their next-state (KV slab rows, KDA state, conv window) into
+//! invocation-owned transaction buffers; only after the whole program
+//! succeeds does [`commit_state_transactions`] copy them into the
+//! slots' canonical state and advance cursors, so a failed or
+//! cancelled invocation never corrupts live decode state. Slot locking
+//! order is fixed (index order) and evictions apply only after commit.
+
 use crate::value::Value;
 use crate::{
     device, flash, fusion, kda, layer_norm, linear, loss, ops as metal_ops, quantized, rotary,
@@ -26,11 +89,17 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
+/// Monotonic per-invocation nonce; combined with each command's
+/// provenance token by [`random_seed`] so RNG kernels never replay a
+/// seed across invocations of the same executable.
 static INVOCATION_NONCE: AtomicU64 = AtomicU64::new(0);
 
 pub(crate) type Node = effect_torch_graph::Node;
 pub(crate) type NodeKind = effect_torch_graph::NodeKind;
 
+/// Static KDA (gated delta-rule) geometry of a decode executable:
+/// layer count, heads, key head dim, and value head dim. All zeros
+/// when the model has no KDA layers.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 pub(crate) struct KdaGeometry {
     pub layers: usize,
@@ -39,6 +108,9 @@ pub(crate) struct KdaGeometry {
     pub value_dim: usize,
 }
 
+/// Static short-conv geometry of a decode executable: layer count,
+/// channels, and kernel size. All zeros when the model has no conv
+/// layers.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 pub(crate) struct ConvGeometry {
     pub layers: usize,
@@ -46,6 +118,10 @@ pub(crate) struct ConvGeometry {
     pub kernel: usize,
 }
 
+/// Static schema of a decode executable's recurrent state: the KV
+/// pool shape and paging parameters plus the KDA and conv geometries.
+/// Compiled into the executable and compared against the decode
+/// context at invocation time — a mismatch is a hard error.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct KvStateSchema {
     pub max_tokens: usize,
@@ -165,31 +241,50 @@ impl KvStateSchema {
     }
 }
 
+/// Live per-slot decode state: the compact block table plus carried
+/// KDA/conv state tensors.
 pub(crate) struct SeqState {
     /// Compact live block table; `head` is the absolute logical index of `blocks[0]`.
     pub blocks: Vec<u32>,
+    /// Absolute logical index of `blocks[0]` (eviction frontier).
     pub head: usize,
+    /// Absolute logical position of the next token to be written.
     pub cursor: usize,
+    /// Tokens appended by the in-flight invocation (not yet committed).
     pub advance: usize,
+    /// Hash of the last prepared KV staging content (dedupes re-uploads).
     pub last_hash: u64,
+    /// Block indices reserved by the in-flight invocation.
     pub pending: Vec<u32>,
+    /// Per-layer KDA fp32 `[heads, Dk, Dv]` states.
     pub kda_states: Vec<crate::run::MetalTensor>,
+    /// Per-layer conv fp32 `[K-1, C]` window states.
     pub conv_states: Vec<crate::run::MetalTensor>,
 }
 
+/// Host-side decode context a stateful executable runs against:
+/// exposes the compiled [`KvStateSchema`], the per-slot states, and
+/// the hooks the executor calls around KV attention and state commit.
 pub(crate) trait MetalDecodeContext {
+    /// The compiled state schema; must equal the executable's.
     fn schema(&self) -> &KvStateSchema;
+    /// All sequence slots (one per batch row), locked in index order.
     fn slots(&self) -> &[Arc<Mutex<SeqState>>];
+    /// Number of slots actively participating in this invocation.
     fn active_batch(&self) -> usize {
         self.slots().len()
     }
+    /// Uploads/prepares the cursor state before dispatch.
     fn prepare_state(&self, cursor: &crate::run::MetalTensor) -> Result<(), String>;
+    /// Stages one layer's block tables/context lengths before its KV
+    /// attention kernel is encoded.
     fn prepare_kv_attention(
         &self,
         layer: u32,
         plan: &KvAttentionPlan,
         staging: &[crate::run::MetalTensor],
     ) -> Result<(), String>;
+    /// Non-allocating paged attention dispatch for one layer.
     #[allow(clippy::too_many_arguments)]
     fn kv_attention_into(
         &self,
@@ -202,34 +297,48 @@ pub(crate) trait MetalDecodeContext {
         output: &crate::run::MetalTensor,
         staging: &[crate::run::MetalTensor],
     ) -> Result<(), String>;
+    /// Drops table blocks before the absolute index `start` (applied
+    /// only after a successful commit).
     fn evict_before(&self, state: &mut SeqState, start: usize);
+    /// Publishes the slot's post-invocation cursor/advance (called
+    /// only after all kernels and deferred checks succeeded).
     fn commit_slot(&self, index: usize, state: &mut SeqState);
 }
 
+/// Where an executable input binding reads from: a caller-declared
+/// slot or a compiler-generated binding (weights/constants uploaded at
+/// compile time).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum MetalBindingSource {
     Declared(u32),
     Generated(u32),
 }
 
+/// One tensor input binding: the program value and where it reads from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct MetalBinding {
     pub value: ValueId,
     pub source: MetalBindingSource,
 }
 
+/// One scalar invocation parameter: the program value (a device scalar
+/// tensor written per call) and the index into the scalar argument list.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct MetalScalarBinding {
     value: ValueId,
     source: u32,
 }
 
+/// One bounded padded input: the program value (compiled at the padded
+/// capacity) and the declared slot whose smaller active prefix is
+/// copied in per call.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct MetalPaddedBinding {
     value: ValueId,
     source: u32,
 }
 
+/// Origin of a declared program slot in the compiled value table.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MetalDeclaredSource {
     Tensor(u32),
@@ -237,12 +346,15 @@ enum MetalDeclaredSource {
     StateCursor,
 }
 
+/// Static per-value metadata gathered during lowering.
 #[derive(Debug, Clone)]
 struct MetalValueMetadata {
     pub shape: Box<[usize]>,
     pub dtype: DType,
 }
 
+/// The Metal instantiation of a lowered value: shape/dtype plus the
+/// concrete contiguous layout and its declaration.
 #[derive(Debug, Clone)]
 pub(super) struct MetalLoweredValue {
     pub shape: Box<[usize]>,
@@ -257,19 +369,31 @@ impl LoweredValue<NativeMemorySpace> for MetalLoweredValue {
     }
 }
 
+/// Storage class assigned to each value during lowering; the memory
+/// planner maps these onto locations in workspace segments.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MetalValueStorage {
+    /// Caller- or weight-owned storage (never segment-allocated).
     External,
+    /// Compile-time constant uploaded once.
     Constant,
+    /// Ordinary intermediate.
     Dynamic,
+    /// A program output before publication.
     ProvisionalOutput,
+    /// A view into another value's storage at `byte_offset`.
     Alias { source: ValueId, byte_offset: usize },
+    /// Reusable workspace segment storage.
     Workspace,
+    /// Per-invocation staging (e.g. rotary offsets, KV block tables).
     InvocationStaging,
+    /// Device-written status word read back by a deferred host check.
     DeviceStatus,
+    /// Next-state buffer of a state transaction (KDA/conv/KV).
     StateTransaction,
 }
 
+/// Follows `Alias` links to the value that owns the underlying storage.
 fn storage_root(storage: &[MetalValueStorage], mut value: ValueId) -> ValueId {
     while let MetalValueStorage::Alias { source, .. } = storage[value.index()] {
         value = source;
@@ -277,12 +401,15 @@ fn storage_root(storage: &[MetalValueStorage], mut value: ValueId) -> ValueId {
     value
 }
 
+/// A compile-time constant: its program value and the already-uploaded
+/// payload.
 #[derive(Clone)]
 struct MetalConstant {
     value: ValueId,
     payload: Value,
 }
 
+/// Scalar/elementwise unary ops the executor can encode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum MetalUnaryOp {
     Neg,
@@ -304,6 +431,8 @@ pub(super) enum MetalUnaryOp {
     Cast { dtype: DType },
 }
 
+/// Binary (and binary-shaped) ops the executor can encode, including
+/// concat and matmul which share the two-input structure.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum MetalBinaryOp {
     Add,
@@ -321,6 +450,7 @@ pub(super) enum MetalBinaryOp {
     Matmul,
 }
 
+/// Reduction kinds supported by the reduce runner.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum MetalReduceOp {
     Sum,
@@ -330,17 +460,25 @@ pub(super) enum MetalReduceOp {
     Prod,
 }
 
+/// Implementation selector for semantic ops that have both fused and
+/// composed strategies. Only the native (fused) Metal strategy exists.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum MetalImplementation {
     Native,
 }
 
+/// Implementation selector for optimizer steps: the fused
+/// elementwise-expression form or the generic per-op form.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum OptimizerImplementation {
     Fused,
     Generic,
 }
 
+/// Every operation a Metal executable can encode. Variants carry the
+/// static parameters baked into the plan (scales, dtypes, chunk sizes,
+/// GQA geometry, rotary layouts, optimizer hyperparameters); shapes and
+/// resources live in the companion [`MetalCommandPlan`].
 #[derive(Debug, Clone)]
 pub(super) enum MetalOp {
     PrepareState,
@@ -663,6 +801,9 @@ fn quantized_linear_profile_name(codec: GgmlKQuant, vectors: usize) -> &'static 
     }
 }
 
+/// One lowered instruction: an invocation boundary marker or an
+/// operation with its exact plan, releasable values, and RNG seed
+/// token.
 #[derive(Debug, Clone)]
 pub(super) enum MetalInstruction {
     PrepareInvocation,
@@ -712,6 +853,8 @@ impl MetalInstruction {
     }
 }
 
+/// A lowered Metal instruction with its resource uses (alias of the
+/// generic lowered-instruction type).
 pub(super) type MetalCommand = LoweredInstruction<MetalInstruction>;
 
 trait MetalResourceId {
@@ -730,19 +873,36 @@ impl MetalResourceId for OutputDecl {
     }
 }
 
+/// One step of the physical execution stream. Encoding never blocks:
+/// status-producing kernels are followed by a `StatusGate`/`Commit`
+/// pair that closes the command buffer so the host can read the status
+/// word after the fence; `Complete` terminates the stream exactly once.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum MetalPhysicalCommand {
+    /// Encode one operation into the current command buffer.
     Encode(InstructionId),
+    /// Marks that the just-encoded instruction produces a status word
+    /// the host must read; must be followed by `Commit`.
     StatusGate(InstructionId),
+    /// Closes and submits the current command buffer for the pending
+    /// status gate.
     Commit,
+    /// Terminal marker; exactly one per executable, always last.
     Complete,
 }
 
+/// Artifacts prepared at compile time and reused by every invocation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct MetalPreparedArtifacts {
+    /// Number of compute pipelines prewarmed for this executable.
     pub pipeline_count: usize,
 }
 
+/// The exact, planner-computed resource requirements of one command.
+/// `Direct` covers ops whose dispatch is fully described by their
+/// operand metadata; every other variant carries the fused kernel's
+/// own requirements type, produced at plan time and re-validated at
+/// dispatch time.
 #[derive(Debug, Clone, Default)]
 #[allow(dead_code)] // Exact requirement records are also consumed by precompile.
 pub(super) enum MetalCommandPlan {
@@ -773,6 +933,8 @@ pub(super) enum MetalCommandPlan {
     KvAttention(KvAttentionPlan),
 }
 
+/// Plan of one paged KV-attention command: the decode batch and head
+/// geometry the staging preparation and dispatch are compiled for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct KvAttentionPlan {
     pub(crate) batch: usize,
@@ -782,6 +944,8 @@ pub(super) struct KvAttentionPlan {
     pub(crate) head_dim: usize,
 }
 
+/// One chunk-shape variant of the chunked-head CE forward: the gemm
+/// producing the chunk's logits plus the CE plan consuming them.
 #[derive(Debug, Clone)]
 struct ChunkedHeadForwardVariant {
     rows: usize,
@@ -789,6 +953,8 @@ struct ChunkedHeadForwardVariant {
     ce: crate::loss::CeForwardRequirements,
 }
 
+/// Plan of a chunked-head CE forward: full-chunk and (optional) tail
+/// variants so the `[rows, vocab]` logits never materialize whole.
 #[derive(Debug, Clone)]
 pub(super) struct ChunkedHeadForwardPlan {
     rows: usize,
@@ -800,6 +966,8 @@ pub(super) struct ChunkedHeadForwardPlan {
     split_k_elements: usize,
 }
 
+/// One chunk-shape variant of the chunked-head CE backward: gemms for
+/// the chunk's logits, dx, and dw contributions.
 #[derive(Debug, Clone)]
 struct ChunkedHeadBackwardVariant {
     rows: usize,
@@ -808,6 +976,8 @@ struct ChunkedHeadBackwardVariant {
     dw: crate::gemm::GemmRequirements,
 }
 
+/// Plan of a chunked-head CE backward: full-chunk and (optional) tail
+/// variants; grad-logits never outlive their chunk.
 #[derive(Debug, Clone)]
 pub(super) struct ChunkedHeadBackwardPlan {
     rows: usize,
@@ -855,6 +1025,8 @@ fn split_k_elements(requirements: &crate::gemm::GemmRequirements) -> usize {
         .map_or(0, |requirement| requirement.elements)
 }
 
+/// Scratch/staging/status resource one command needs, as declared by
+/// [`plan_command_resources`] and consumed by the memory planner.
 #[derive(Debug)]
 struct ResourceSpec {
     name: String,
@@ -863,6 +1035,7 @@ struct ResourceSpec {
     storage: MetalValueStorage,
 }
 
+/// The resources and exact plan of one lowered command.
 #[derive(Debug, Default)]
 struct CommandResources {
     scratch: Vec<ResourceSpec>,
@@ -937,6 +1110,10 @@ fn declaration_layout(value: &MetalValueMetadata) -> effect_torch_runtime::Layou
     effect_torch_runtime::Layout::contiguous(value.shape.to_vec())
 }
 
+/// Computes the exact plan (fused-kernel requirements plus
+/// scratch/staging/status resources) of one lowered command. This is
+/// the heart of physical planning: every byte and every pipeline an
+/// invocation can touch is fixed here, before any execution.
 fn plan_command_resources(
     command: &MetalCommand,
     values: &[MetalValueMetadata],
@@ -2032,6 +2209,9 @@ fn plan_command_resources(
     Ok(resources)
 }
 
+/// Compile-time environment switches mirrored from the compiler's
+/// `EnvironmentOptions`: private (device-only) storage for
+/// intermediates, and tensor-core (simdgroup matrix) gemm selection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct MetalEnvironment {
     pub private_intermediates: bool,
@@ -2047,21 +2227,38 @@ impl From<EnvironmentOptions> for MetalEnvironment {
     }
 }
 
+/// An immutable compiled Metal program: signature, lowered
+/// instructions, physical command stream, prewarmed pipelines, memory
+/// plan, and (for decode executables) the state schema. Execution
+/// borrows it; nothing inside is mutated per invocation except the
+/// memory report cell.
 pub(super) struct MetalExecutable {
+    /// Calling convention validated at every invocation.
     pub signature: ProgramSignature,
+    /// The lowered instruction stream and value table.
     pub program: Arc<LoweredProgram<MetalInstruction, NativeMemorySpace, MetalLoweredValue>>,
+    /// Physical execution stream (see [`MetalPhysicalCommand`]).
     pub physical: Box<[MetalPhysicalCommand]>,
+    /// Compile-time prepared pipelines.
     pub prepared: MetalPreparedArtifacts,
+    /// Tensor input bindings (declared + generated).
     pub bindings: Box<[MetalBinding]>,
     scalar_bindings: Box<[MetalScalarBinding]>,
     padded_bindings: Box<[MetalPaddedBinding]>,
     constants: Box<[MetalConstant]>,
+    /// Compile options the program was built with.
     pub options: CompileOptions,
+    /// Environment switches baked into the plan.
     pub environment: MetalEnvironment,
+    /// Decode state schema, when this is a stateful executable.
     pub state_schema: Option<KvStateSchema>,
+    /// Memory plan mapping every value to its location.
     pub memory: MemoryPlan<NativeMemorySpace>,
+    /// Per-executable diagnostics.
     pub diagnostics: ExecutableDiagnostics,
+    /// Compiler phase timings/work report.
     pub compiler_work: CompilerWorkReport,
+    /// Memory report of the most recent invocation (observability).
     pub last_invocation_memory: Mutex<Option<InvocationMemoryReport>>,
     state_cursor: Option<ValueId>,
 }
@@ -2124,6 +2321,8 @@ impl MetalExecutable {
     }
 }
 
+/// The product of compilation: the immutable executable plus the
+/// generated (weight/constant) bindings in slot order.
 pub(super) struct MetalCompilation {
     pub executable: Arc<MetalExecutable>,
     pub slots: Vec<ProgramSlot>,
@@ -2131,6 +2330,9 @@ pub(super) struct MetalCompilation {
     pub generated_order: Vec<usize>,
 }
 
+/// Lowering state: the value/storage/binding tables accumulated while
+/// the compiler driver walks the graph, plus the state schema and
+/// environment the plan is built against.
 struct Lowerer<'a> {
     values: Vec<MetalValueMetadata>,
     storage: Vec<MetalValueStorage>,
@@ -4998,6 +5200,9 @@ pub(super) fn load_generated_bindings(index: &GraphIndex) -> Result<Vec<Value>, 
         .collect()
 }
 
+/// Rejects graph nodes the Metal backend cannot execute (unsupported
+/// linalg, zero-step arange) or dtypes the KDA/short-conv kernels gate
+/// on. Fail loud at compile time, never degrade silently.
 fn validate_metal_support(node: &Node) -> Result<(), String> {
     match &node.kind {
         NodeKind::Inverse { .. } => Err("compile: inverse is not supported on Metal".to_string()),
@@ -5031,6 +5236,8 @@ fn validate_metal_support(node: &Node) -> Result<(), String> {
     }
 }
 
+/// Compiles graph roots into a stateless Metal executable (test
+/// entry point; production goes through [`compile_prepared_with_state`]).
 #[cfg(test)]
 pub(super) fn compile(
     roots: &[Arc<Node>],
@@ -5041,6 +5248,8 @@ pub(super) fn compile(
     compile_with_state(roots, options, ce_chunk_size, environment, None)
 }
 
+/// Compiles graph roots with an optional decode state schema (test
+/// entry point).
 #[cfg(test)]
 pub(super) fn compile_with_state(
     roots: &[Arc<Node>],
@@ -5064,6 +5273,11 @@ pub(super) fn compile_with_state(
     compile_prepared_with_state(&program, &generated_bindings, state_schema)
 }
 
+/// The production compilation entry point: lowers a prepared program,
+/// plans every command's exact resources, prewarms all pipelines, and
+/// drains compile-time GPU submissions before publishing the
+/// executable. Any failure aborts before publication, so a partially
+/// built artifact is never observable.
 pub(super) fn compile_prepared_with_state(
     program: &PreparedProgram,
     generated_bindings: &[Value],
@@ -5161,23 +5375,38 @@ pub(super) fn compile_prepared_with_state(
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
+/// The cross-entropy status protocol a deferred check enforces.
 enum CeCheck {
+    /// Forward, mean reduction: error when active == 0, then on any
+    /// invalid active label.
     ForwardMean,
+    /// Forward, sum reduction: error on any invalid active label.
     ForwardSum,
+    /// Backward, mean reduction: error when the device-side active
+    /// count is zero.
     BackwardMean,
 }
 
+/// A cross-entropy status readback deferred until after the GPU fence:
+/// the status buffer value, the protocol, and the class count for the
+/// error message. Preserves the composed path's exact error semantics
+/// without a synchronous readback per kernel.
 struct DeferredCeCheck {
     buffer: Value,
     kind: CeCheck,
     classes: usize,
 }
 
+/// A quantized-embedding status readback deferred until after the GPU
+/// fence: nonzero means an out-of-range index.
 struct DeferredQuantizedEmbeddingCheck {
     buffer: Value,
     rows: usize,
 }
 
+/// Runs all deferred cross-entropy status checks in command order,
+/// reproducing the composed path's error semantics (zero-active before
+/// invalid-label for mean forward).
 fn run_ce_checks(checks: &[DeferredCeCheck]) -> Result<(), String> {
     for check in checks {
         let tensor = check.buffer.as_metal()?;
@@ -5213,6 +5442,8 @@ fn run_ce_checks(checks: &[DeferredCeCheck]) -> Result<(), String> {
     Ok(())
 }
 
+/// Runs all deferred quantized-embedding status checks in command
+/// order; a nonzero status word means an index escaped `0..rows`.
 fn run_quantized_embedding_checks(
     checks: &[DeferredQuantizedEmbeddingCheck],
 ) -> Result<(), String> {
@@ -5233,6 +5464,9 @@ fn run_quantized_embedding_checks(
     Ok(())
 }
 
+/// Converts a caught dispatch panic into an error string, surfacing
+/// forbidden-allocation panics (a dispatch that tried to allocate
+/// inside an executable section) with their original message.
 fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
     if let Some(message) = payload.downcast_ref::<String>() {
         message.clone()
@@ -5319,6 +5553,8 @@ fn pack_optimizer_scalars(
     Ok(destination.clone())
 }
 
+/// Writes the `[1, T, 1]` advance mask (`1.0` for the first `advance`
+/// rows, `0.0` after) consumed by the KDA decode kernels.
 fn write_advance_mask(mask: &crate::run::MetalTensor, advance: usize) -> Result<(), String> {
     let shape = mask.layout.shape();
     if shape.len() != 3 || shape[0] != 1 || shape[2] != 1 || advance > shape[1] {
@@ -5328,6 +5564,13 @@ fn write_advance_mask(mask: &crate::run::MetalTensor, advance: usize) -> Result<
         ));
     }
     let offset = mask.layout.offset();
+    // SAFETY: the shape check above fixes the view at exactly
+    // `shape[1]` elements starting at `offset`; every mask buffer is
+    // allocated with at least `offset + shape[1]` elements of the mask
+    // dtype (the memory planner sized it from this same shape), and
+    // the buffer uses shared host-visible storage. The mask is
+    // invocation-owned staging written before any kernel that reads it
+    // is submitted, so no GPU/host race is possible.
     unsafe {
         match mask.dtype {
             DType::F32 => {
@@ -5426,6 +5669,12 @@ fn validate_conv_destination(
     )
 }
 
+/// Publishes the results of a successful stateful invocation: copies
+/// each state transaction (KDA state tiles, conv windows) into the
+/// slots' canonical state tensors, then commits cursors and applies
+/// window evictions. Runs only after every kernel, deferred check, and
+/// the cancellation gate have passed, so failed invocations never
+/// mutate live decode state.
 fn commit_state_transactions(
     executable: &MetalExecutable,
     resolved: &[Option<Value>],
@@ -5524,6 +5773,14 @@ fn commit_state_transactions(
         }
     }
     for copy in copies {
+        // SAFETY: `transaction_copy` verified both views are contiguous,
+        // dtype/shape-compatible, and fully in bounds of their buffers,
+        // and both buffers are shared-storage host-visible allocations.
+        // Source (invocation-owned transaction buffer) and destination
+        // (slot state) never overlap: the memory planner places
+        // transaction buffers in workspace segments disjoint from the
+        // externally owned state tensors. The GPU is fully synchronized
+        // before this point, so no in-flight kernel aliases either side.
         unsafe {
             std::ptr::copy_nonoverlapping(copy.source, copy.destination, copy.bytes);
         }
@@ -5541,12 +5798,17 @@ fn commit_state_transactions(
     Ok(())
 }
 
+/// A validated host-side copy of one state transaction: raw byte
+/// pointers plus length, produced by [`transaction_copy`].
 struct TransactionCopy {
     source: *const u8,
     destination: *mut u8,
     bytes: usize,
 }
 
+/// Validates a state-transaction copy (same dtype/shape, contiguous,
+/// in bounds) and snapshots the raw host pointers for the batched copy
+/// in [`commit_state_transactions`].
 fn transaction_copy(
     source: &crate::run::MetalTensor,
     destination: &crate::run::MetalTensor,
@@ -5583,6 +5845,13 @@ fn transaction_copy(
         return Err("state transaction copy exceeds its buffer".to_string());
     }
     Ok(TransactionCopy {
+        // SAFETY: the bounds checks above prove
+        // `[offset, offset + bytes)` lies within each buffer's
+        // allocation; `contents_ptr()` on these shared-storage buffers
+        // is a valid host pointer for the whole allocation. The raw
+        // pointers are used only by the batched copy in
+        // `commit_state_transactions`, which runs after GPU
+        // synchronization and before either buffer can be released.
         source: unsafe { source.buffer.contents_ptr().cast::<u8>().add(source_offset) },
         destination: unsafe {
             destination
@@ -5595,6 +5864,8 @@ fn transaction_copy(
     })
 }
 
+/// Writes one scalar invocation argument into its device scalar tensor
+/// (zero-offset scalar view), converting to the tensor's dtype.
 fn write_scalar_binding(tensor: &crate::run::MetalTensor, value: f64) -> Result<(), String> {
     if !tensor.layout.shape().is_empty() || tensor.layout.offset() != 0 {
         return Err("scalar binding destination must be a zero-offset scalar".to_string());
@@ -5606,6 +5877,11 @@ fn write_scalar_binding(tensor: &crate::run::MetalTensor, value: f64) -> Result<
     macro_rules! write {
         ($value:expr) => {{
             let value = $value;
+            // SAFETY: `destination` points at the start of a
+            // shared-storage buffer validated above to hold at least
+            // this dtype's size; `size_of_val(&value)` equals that
+            // size for the dtype matched below. The buffer is
+            // invocation-owned staging written before submission.
             unsafe {
                 std::ptr::copy_nonoverlapping(
                     (&raw const value).cast::<u8>(),
@@ -5627,6 +5903,10 @@ fn write_scalar_binding(tensor: &crate::run::MetalTensor, value: f64) -> Result<
     Ok(())
 }
 
+/// Copies a bounded padded input into its compiled-capacity buffer:
+/// zeroes the whole padded region, then copies the active prefix.
+/// Keeps stale rows from a longer previous invocation from leaking
+/// into the current one.
 fn write_padded_binding(
     destination: &crate::run::MetalTensor,
     source: &crate::run::MetalTensor,
@@ -5651,6 +5931,14 @@ fn write_padded_binding(
     if destination_bytes > destination.buffer.size || source_bytes > source.buffer.size {
         return Err("padded input exceeds its backing buffer".to_string());
     }
+    // SAFETY: the checks above prove both byte ranges fit their
+    // buffers and that source/destination share dtype with matching
+    // trailing dims; both buffers are shared-storage host-visible.
+    // Destination (invocation-owned padded staging) and source (a
+    // caller binding) are distinct allocations, so the zero-fill and
+    // the non-overlapping prefix copy cannot alias. The GPU is
+    // synchronized before invocation values resolve, so no in-flight
+    // kernel reads these bytes while they are written.
     unsafe {
         std::ptr::write_bytes(
             destination.buffer.contents_ptr().cast::<u8>(),
@@ -5696,6 +5984,7 @@ pub(super) fn execute(
     )
 }
 
+/// Executes a stateless invocation with scalar arguments (NAPI entry).
 pub(super) fn execute_with_scalars(
     executable: &MetalExecutable,
     declared_bindings: &[Value],
@@ -5714,6 +6003,9 @@ pub(super) fn execute_with_scalars(
     )
 }
 
+/// Executes a stateful (decode) invocation against `kv`, committing
+/// state transactions only when `commit_allowed` passes after the GPU
+/// work completes.
 pub(super) fn execute_stateful(
     executable: &MetalExecutable,
     declared_bindings: &[Value],

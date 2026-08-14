@@ -1,21 +1,69 @@
+/**
+ * Backend service-provider interface for effect-torch.
+ *
+ * `RuntimeService` is the trust boundary between the backend-neutral graph API
+ * and a concrete native implementation. The core submits immutable semantic
+ * node requests, then delegates autodiff, compilation, execution, transfer,
+ * and optional file or decode facilities to the runtime in the Effect
+ * environment. Application code normally uses `Tensor`; backend adapters
+ * implement this module.
+ *
+ * Handles are opaque capabilities, not structurally interchangeable records.
+ * An implementation must maintain native ownership and liveness out of band,
+ * reject forged, released, or foreign handles, and expose immutable logical
+ * metadata. `RuntimeService.identity` identifies exactly one interchangeable
+ * handle/cache domain; placement ids are meaningful only inside that domain.
+ *
+ * Effects that cross an asynchronous native boundary must cooperate with
+ * interruption. Once interrupted, they must not publish a late result, and
+ * must reclaim any native ownership produced after the caller stopped waiting.
+ * Inputs are borrowed for the duration of an operation. Successful methods
+ * that return concrete tensors or sequences transfer one ownership obligation
+ * per distinct returned handle unless their documentation says otherwise.
+ *
+ * @since 0.1.0
+ */
 import { Context, Data, type Effect } from "effect"
 import type { Pipeable } from "effect/Pipeable"
 
 /**
- * Element data types supported by tensor runtimes.
+ * Logical element data types understood by the common runtime protocol.
+ * Individual runtimes advertise a subset through {@link Capabilities}; an
+ * operation may impose a narrower subset. No implicit promotion rule is part
+ * of this low-level type.
  *
  * @since 0.1.0
  * @category models
  */
 export type DType = "f32" | "f64" | "f16" | "bf16" | "i64" | "u8" | "u32"
 
-/** Packed GGML K-quant encodings understood by native runtimes. */
+/**
+ * Packed GGML K-quant storage encodings understood by native runtimes.
+ *
+ * @since 0.1.0
+ * @category models
+ */
 export type TensorStorageEncoding = "Q2_K" | "Q3_K" | "Q4_K" | "Q5_K" | "Q6_K"
 
-/** Physical storage metadata for a logically dense encoded tensor. */
+/**
+ * Physical storage metadata for a logically `f32` encoded tensor. The logical
+ * shape remains on {@link TensorHandle}; `physicalShape` describes the packed
+ * `u8` buffer exposed by readback and binding validation. GGML K-quant rows
+ * flatten all logical leading dimensions, encode the final dimension in
+ * 256-element blocks, and use physical shape `[rows, rowBytes]`.
+ *
+ * Encoded storage is not a strided dense layout. Backends may accept it only in
+ * dedicated packed operations and must report `unsupported-layout` elsewhere.
+ *
+ * @since 0.1.0
+ * @category models
+ */
 export interface EncodedTensorStorage {
+  /** Packed encoding used for each logical row. */
   readonly encoding: TensorStorageEncoding
+  /** Shape of the packed byte buffer, independent of the logical shape. */
   readonly physicalShape: ReadonlyArray<number>
+  /** Physical packed elements are always bytes. */
   readonly physicalDtype: "u8"
 }
 
@@ -31,13 +79,15 @@ export interface BackendInfo {
 }
 
 /**
- * A runtime-owned device and memory placement.
+ * A runtime-owned device and memory placement. Placement records are immutable
+ * metadata; equality across runtime identities does not make handles
+ * interchangeable.
  *
  * @since 0.1.0
  * @category models
  */
 export interface Placement {
-  /** Stable identity for this placement within its runtime. */
+  /** Stable identity for this placement within its runtime identity domain. */
   readonly id: string
   /** Backend-neutral device family, such as `cpu` or `metal`. */
   readonly deviceType: string
@@ -50,7 +100,9 @@ export interface Placement {
 }
 
 /**
- * Capabilities advertised by a runtime.
+ * Capabilities advertised by a runtime. These are discovery metadata, not a
+ * substitute for operation-specific validation; backend methods remain
+ * authoritative and may reject unsupported dtype/layout combinations.
  *
  * @since 0.1.0
  * @category models
@@ -63,7 +115,9 @@ export interface Capabilities {
 }
 
 /**
- * Structured failures reported by backend runtimes.
+ * Structured failures reported by backend runtimes. Effect interruption may
+ * remain an interruption rather than becoming a `BackendError`; `cancelled` is
+ * available when a backend reports cancellation as an ordinary typed failure.
  *
  * @since 0.1.0
  * @category errors
@@ -111,7 +165,16 @@ declare const KvPoolHandleTypeId: unique symbol
 declare const KvSequenceHandleTypeId: unique symbol
 
 /**
- * A backend-owned tensor value with only backend-neutral static metadata.
+ * A backend-owned tensor capability with backend-neutral immutable metadata.
+ * `shape`, `dtype`, and optional `storage` describe the logical value and are
+ * available without execution. Dense handles expose no public strides: graph
+ * operations use logical row-major element order and a backend owns any
+ * internal view/materialization decisions.
+ *
+ * The TypeScript brands prevent accidental structural use at compile time but
+ * provide no runtime security. Every runtime method must also validate the
+ * handle's registered owner, kind, and liveness rather than trusting `_tag`,
+ * placement, or other public fields.
  *
  * @since 0.1.0
  * @category models
@@ -121,11 +184,11 @@ export interface TensorHandle extends Pipeable {
   readonly [TensorHandleTypeId]: typeof TensorHandleTypeId
   /** Whether this handle is lazy or materialized. */
   readonly _tag: "LazyTensor" | "Tensor"
-  /** Logical tensor dimensions. */
+  /** Logical dimensions; `[]` is a scalar and zero extents are permitted. */
   readonly shape: ReadonlyArray<number>
   /** Tensor element data type. */
   readonly dtype: DType
-  /** Omitted for dense storage; present when native storage is encoded. */
+  /** Omitted for dense storage; present for a packed logical `f32` value. */
   readonly storage?: EncodedTensorStorage
   /** Device family that owns the tensor. */
   readonly device: string
@@ -134,7 +197,10 @@ export interface TensorHandle extends Pipeable {
 }
 
 /**
- * A backend-owned lazy tensor value.
+ * A backend-owned lazy tensor value. It denotes an immutable semantic graph
+ * and carries no materialized result ownership of its own. A graph may retain
+ * concrete dependencies; releasing such a dependency invalidates later uses
+ * of that graph unless compilation explicitly retained it as executable state.
  *
  * @since 0.1.0
  * @category models
@@ -147,7 +213,11 @@ export interface LazyTensorHandle extends TensorHandle {
 }
 
 /**
- * A backend-owned materialized tensor value.
+ * A backend-owned materialized tensor value. Each distinct returned handle
+ * transfers one release obligation to the caller. Aliases may share physical
+ * storage, but releasing one handle invalidates only that ownership capability;
+ * physical reclamation can be delayed by aliases, exports, in-flight work, or
+ * allocator caches.
  *
  * @since 0.1.0
  * @category models
@@ -175,9 +245,11 @@ export interface ExecutableCompileOptions {
   readonly optimize?: boolean
   /**
    * Authorizes inference-only retention of eligible materialized graph leaves
-   * as executable constants. Their storage remains live with the executable,
-   * and bundled runtimes bypass structural executable-cache reuse in this mode.
-   * Defaults to `false`; do not enable for values expected to vary.
+   * as executable constants. The executable, rather than the source handle,
+   * retains the storage it needs. Bundled runtimes bypass structural
+   * executable-cache reuse in this mode because captured values are not part
+   * of a value-independent structural key. Defaults to `false`; do not enable
+   * for values expected to vary between invocations.
    */
   readonly constantWeights?: boolean
 }
@@ -326,6 +398,10 @@ export interface ExecutableDiagnostics {
 
 /**
  * Opaque backend-owned executable plus its optional public state contract.
+ * Executables are immutable and may be invoked concurrently. Stateful
+ * invocations must nevertheless use disjoint sequence handles. There is no
+ * common explicit release operation; implementations must finalize the native
+ * wrapper after executable and cache references become unreachable.
  *
  * @since 0.1.0
  * @category models
@@ -340,15 +416,20 @@ export interface ExecutableHandle {
 }
 
 /**
- * One semantic graph compilation request.
+ * One semantic graph compilation request. Compilation borrows the roots but
+ * may retain graph artifacts and any storage authorized by the options in the
+ * resulting executable. Implementations may use a bounded structural cache;
+ * root order, duplicate roots, options, state, and graph semantics all affect
+ * observable output ordering or cache identity.
  *
  * @since 0.1.0
  * @category models
  */
 export interface CompileRequest {
   /**
-   * Nonempty semantic roots owned by this runtime and belonging to one device.
-   * Root order, including duplicates, defines executable output order.
+   * Nonempty semantic roots owned by this runtime and belonging to one exact
+   * placement. Root order, including duplicates, defines executable output
+   * order.
    */
   readonly roots: ReadonlyArray<TensorHandle>
   /** Explicit controls that join the executable cache key. */
@@ -358,7 +439,9 @@ export interface CompileRequest {
 }
 
 /**
- * Per-invocation state supplied to a stateful executable.
+ * Per-invocation state supplied to a stateful executable. The listed sequences
+ * are mutably borrowed until the invocation finishes and must be distinct and
+ * absent from every concurrent invocation or sequence operation.
  *
  * @since 0.1.0
  * @category models
@@ -371,13 +454,15 @@ export interface ExecutionStateInvocation {
   readonly sequences: ReadonlyArray<KvSequenceHandle>
   /**
    * One equally sized, nonempty row of unsigned 32-bit token ids per sequence.
-   * Success commits state and advances cursors; pre-commit failure rolls back.
+   * Success commits state and advances cursors atomically across all rows;
+   * failure or interruption before commit rolls every row back.
    */
   readonly tokens: ReadonlyArray<ReadonlyArray<number>>
 }
 
 /**
- * Complete dynamic input to one immutable executable invocation.
+ * Complete dynamic input to one immutable executable invocation. Collections
+ * describe a single call and must not be mutated while its Effect is running.
  *
  * @since 0.1.0
  * @category models
@@ -386,7 +471,8 @@ export interface ExecutionInvocation {
   /**
    * Materialized tensor bindings in ascending shared-slot order with scalar
    * slots omitted. Counts, metadata, layout, ownership, and placement must
-   * match the compiled declarations.
+   * match the compiled declarations. They are borrowed, not consumed, and
+   * must not be released until the invocation completes.
    */
   readonly bindings: ReadonlyArray<ConcreteTensorHandle>
   /** Scalar bindings in ascending shared-slot order with tensor slots omitted. */
@@ -401,7 +487,10 @@ export interface ExecutionInvocation {
 }
 
 /**
- * Opaque backend-owned paged KV cache pool.
+ * Opaque backend-owned paged KV cache pool. A pool owns fixed-capacity storage
+ * shared by its sequences. The common protocol has no explicit pool release;
+ * it becomes finalizable only after the pool and all child sequence handles are
+ * unreachable or released as applicable.
  *
  * @since 0.1.0
  * @category models
@@ -412,7 +501,9 @@ export interface KvPoolHandle {
 }
 
 /**
- * Opaque backend-owned sequence allocated from a paged KV pool.
+ * Opaque backend-owned mutable sequence allocated from a paged KV pool. It
+ * retains its parent pool and must be released exactly once after its final
+ * operation; finalization is only a fallback.
  *
  * @since 0.1.0
  * @category models
@@ -423,7 +514,11 @@ export interface KvSequenceHandle {
 }
 
 /**
- * Inputs and attributes for every semantic graph operation.
+ * Inputs and attributes for every semantic graph operation. Requests are
+ * backend-neutral descriptions, not instructions to execute a kernel. A
+ * runtime validates every input capability, snapshots mutable attribute data
+ * where documented, and returns a lazy node with authoritative logical
+ * metadata. Compilation later performs typed lowering and layout selection.
  *
  * @since 0.1.0
  * @category models
@@ -805,7 +900,9 @@ export interface NodeOperationMap {
 }
 
 /**
- * A type-checked semantic graph construction request.
+ * A type-checked semantic graph construction request. The mapped union checks
+ * operation arity and attributes for implementors; runtime validation is still
+ * required for untyped JavaScript and native boundaries.
  *
  * @since 0.1.0
  * @category models
@@ -867,56 +964,118 @@ export interface PathSafetensorsLoadArchive {
 }
 
 /**
- * Optional runtime extension for direct path-based safetensors I/O.
+ * Optional runtime extension for direct path-based safetensors I/O. Extension
+ * methods are part of the same ownership domain as their parent runtime and
+ * must apply the same native handle owner/liveness checks as common methods.
  *
  * @since 0.1.0
  * @category models
  */
 export interface PathSafetensors {
-  /** Writes a borrowed dense archive without transferring tensor data through JavaScript. */
+  /**
+   * Writes a borrowed dense archive without transferring tensor data through
+   * JavaScript. Input handles remain caller-owned and usable after completion.
+   */
   readonly save: (path: string, archive: PathSafetensorsSaveArchive) => Effect.Effect<void, BackendError>
-  /** Reads an archive directly into materialized runtime tensors. */
+  /**
+   * Reads directly into materialized runtime tensors. On success, ownership of
+   * every distinct returned handle transfers to the caller. On failure or
+   * interruption, the implementation releases all partial and late results.
+   */
   readonly load: (path: string) => Effect.Effect<PathSafetensorsLoadArchive, BackendError>
 }
 
-/** A scalar GGUF metadata value after native validation. */
+/**
+ * A scalar GGUF metadata value after native validation.
+ *
+ * @since 0.1.0
+ * @category models
+ */
 export type GgufMetadataScalar = number | string | boolean
 
-/** One ordered GGUF metadata entry. */
+/**
+ * One ordered GGUF metadata entry.
+ *
+ * @since 0.1.0
+ * @category models
+ */
 export interface GgufMetadataEntry {
+  /** Original GGUF metadata key. */
   readonly key: string
+  /** Validated scalar or homogeneous scalar-array payload. */
   readonly value: GgufMetadataScalar | ReadonlyArray<GgufMetadataScalar>
 }
 
-/** Backend-neutral tensor catalog entry returned by native GGUF inspection. */
+/**
+ * Backend-neutral tensor catalog entry returned by native GGUF inspection.
+ * Logical shape order is the tensor API order; physical shape describes the
+ * bytes loaded into a concrete handle and can differ for packed formats.
+ *
+ * @since 0.1.0
+ * @category models
+ */
 export interface GgufTensorDescriptor {
+  /** Archive tensor name. */
   readonly name: string
+  /** Dense or packed on-disk representation supported by this protocol. */
   readonly format: "F32" | TensorStorageEncoding
+  /** Logical dimensions visible to tensor operations. */
   readonly logicalShape: ReadonlyArray<number>
+  /** Packed values decode to logical `f32`. */
   readonly logicalDtype: "f32"
+  /** Dense element shape or packed byte shape owned by the native tensor. */
   readonly physicalShape: ReadonlyArray<number>
+  /** Dense F32 storage uses `f32`; packed storage uses `u8`. */
   readonly physicalDtype: "f32" | "u8"
 }
 
-/** GGUF metadata and tensor descriptors without tensor payloads. */
+/**
+ * GGUF metadata and tensor descriptors without tensor payloads.
+ *
+ * @since 0.1.0
+ * @category models
+ */
 export interface GgufInspection {
+  /** Ordered validated metadata. */
   readonly metadata: ReadonlyArray<GgufMetadataEntry>
+  /** Ordered tensor catalog without loaded storage. */
   readonly tensors: ReadonlyArray<GgufTensorDescriptor>
 }
 
-/** One runtime-owned tensor returned by native GGUF loading. */
+/**
+ * One runtime-owned tensor returned by native GGUF loading.
+ *
+ * @since 0.1.0
+ * @category models
+ */
 export interface GgufLoadEntry {
+  /** Descriptor whose logical and physical metadata the tensor must match. */
   readonly descriptor: GgufTensorDescriptor
+  /** Caller-owned concrete handle after successful archive completion. */
   readonly tensor: ConcreteTensorHandle
 }
 
-/** Runtime-owned tensors returned by native GGUF loading. */
+/**
+ * Runtime-owned tensors returned by native GGUF loading.
+ *
+ * @since 0.1.0
+ * @category models
+ */
 export interface GgufLoadArchive {
+  /** Distinct owned handles in archive order. */
   readonly entries: ReadonlyArray<GgufLoadEntry>
 }
 
-/** Optional native GGUF parser and loader extension. */
+/**
+ * Optional native GGUF parser and loader extension. Inspection owns no tensor
+ * storage. Loading follows the parent runtime's cancellation and ownership
+ * rules.
+ *
+ * @since 0.1.0
+ * @category models
+ */
 export interface GgufRuntime {
+  /** Parses and validates metadata and tensor descriptors without loading payloads. */
   readonly inspect: (path: string) => Effect.Effect<GgufInspection, BackendError>
   /**
    * Loads runtime-owned tensors. The implementation owns every handle until
@@ -930,13 +1089,21 @@ export interface GgufRuntime {
  * Optional runtime extension for compiled paged-KV and recurrent inference.
  * Pool geometry must exactly match the executable schema. Attention geometry
  * and each recurrent family are independently either all zero or all positive;
- * capacities and paging units are positive with exact divisibility.
+ * capacities and paging units are positive with exact divisibility. Every
+ * opaque argument is runtime-owned and must be validated before native access.
+ * Sequence operations mutate state and therefore must not overlap for the same
+ * sequence, including with `RuntimeService.execute`.
  *
  * @since 0.1.0
  * @category models
  */
 export interface DecodeRuntime {
-  /** Allocates the fixed-capacity paged KV storage shared by sequences. */
+  /**
+   * Allocates a fixed-capacity decode-state pool. KV arenas and prefix-cache
+   * content are shared by child sequences, while each sequence owns independent
+   * mutable recurrent state. The returned pool belongs to this runtime and is
+   * retained by its child sequences.
+   */
   readonly makePool: (options: {
     /** Number of attention layers stored in the pool. */
     readonly layers: number
@@ -965,19 +1132,23 @@ export interface DecodeRuntime {
     /** Kernel size of each short-conv recurrent layer. */
     readonly convKernel: number
   }) => Effect.Effect<KvPoolHandle, BackendError>
-  /** Creates an empty sequence with independent cursor, block table, and recurrent state. */
+  /**
+   * Creates an empty caller-owned sequence with independent cursor, block
+   * table, and recurrent state, retaining the supplied pool.
+   */
   readonly makeSequence: (pool: KvPoolHandle) => Effect.Effect<KvSequenceHandle, BackendError>
   /**
    * On an empty sequence, attaches the longest resident whole-block proper KV
    * prefix, leaving one token when input is nonempty. Hybrid pools with
    * recurrent geometry resume from snapshots published at completed block
-   * boundaries; purely recurrent pools without KV blocks return zero.
+   * boundaries; purely recurrent pools without KV blocks return zero. This
+   * mutably borrows the sequence and must not overlap another operation on it.
    */
   readonly prefillMatch: (
     sequence: KvSequenceHandle,
     tokens: ReadonlyArray<number>
   ) => Effect.Effect<number, BackendError>
-  /** Returns the sequence's absolute token cursor. */
+  /** Returns the sequence's absolute token cursor; the sequence must be live. */
   readonly sequenceCursor: (sequence: KvSequenceHandle) => Effect.Effect<number, BackendError>
   /** Releases a sequence and its block references; call exactly once. */
   readonly releaseSequence: (sequence: KvSequenceHandle) => Effect.Effect<void, BackendError>
@@ -990,18 +1161,30 @@ export interface DecodeRuntime {
  * @category models
  */
 export interface RuntimeDiagnostics {
-  /** Current bytes of native memory attributed to JavaScript-reachable tensors. */
+  /**
+   * Current bytes of native memory attributed to JavaScript-reachable tensors.
+   * This is observational and may change concurrently; it is not total process
+   * memory or a deterministic leak detector.
+   */
   readonly externalMemoryBytes: Effect.Effect<number>
 }
 
 /**
- * A live tensor runtime bound to one default placement.
+ * A live tensor runtime bound to one default placement. Implementations are
+ * responsible for native capability validation, immutable metadata, handle
+ * ownership/liveness registries, interruption cleanup, and safe concurrent
+ * use of immutable graphs and executables. Closing a backend, if supported by
+ * its layer, invalidates all capabilities in this identity domain.
  *
  * @since 0.1.0
  * @category models
  */
 export interface RuntimeService {
-  /** Stable identity shared by equivalent service instances and used to isolate backend-owned caches. */
+  /**
+   * Stable object identity for the complete native ownership and cache domain.
+   * Service wrappers may share it only when each can accept the other's live
+   * handles. Core compilation caches use object identity, not serialization.
+   */
   readonly identity: object
   /** Backend implementation metadata. */
   readonly backend: BackendInfo
@@ -1009,41 +1192,70 @@ export interface RuntimeService {
   readonly placement: Placement
   /** Data types and optional features supported by this runtime. */
   readonly capabilities: Capabilities
-  /** Constructs one lazy semantic graph node. */
+  /**
+   * Constructs one lazy semantic graph node without executing tensor kernels.
+   * The runtime validates all input handles and snapshots caller-owned mutable
+   * attributes such as byte arrays before successful completion.
+   */
   readonly node: (request: NodeRequest) => Effect.Effect<LazyTensorHandle, BackendError>
-  /** Builds reverse-mode gradients of `loss` with respect to selected tensors. */
+  /**
+   * Builds lazy reverse-mode gradient graphs without materializing the loss.
+   * Inputs are borrowed, must be live and runtime-owned, and output order must
+   * match `wrt`, including duplicates.
+   */
   readonly grad: (
     loss: TensorHandle,
     wrt: ReadonlyArray<TensorHandle>
   ) => Effect.Effect<ReadonlyArray<LazyTensorHandle>, BackendError>
   /**
-   * Compiles nonempty, runtime-owned, single-device roots into one immutable
-   * executable. Tensor and scalar input declarations share one zero-based,
-   * gap-free slot namespace; repeated declarations must agree exactly.
+   * Compiles nonempty, live, runtime-owned, single-placement roots into one
+   * immutable executable. Tensor and scalar input declarations share one
+   * zero-based, gap-free slot namespace; repeated declarations must agree on
+   * kind and complete logical metadata. Root order and duplicates define
+   * output order. Implementations may reuse a structurally equivalent native
+   * artifact when value capture and state options permit it.
    */
   readonly compile: (request: CompileRequest) => Effect.Effect<ExecutableHandle, BackendError>
   /**
-   * Executes a runtime-owned immutable program with one complete invocation.
-   * Inputs are borrowed. Returned handles are caller-owned, survive later
-   * invocations, and require exactly one successful `release` for deterministic cleanup.
+   * Executes a live runtime-owned immutable program with one complete
+   * invocation. Inputs and state sequences are borrowed until completion.
+   * Returned handles are distinct caller-owned capabilities, survive later
+   * invocations, and each require exactly one successful `release` for
+   * deterministic cleanup. Concurrent calls are supported for stateless
+   * invocations and for stateful invocations using disjoint sequences.
+   *
+   * On failure or interruption, no output ownership transfers. The runtime
+   * must retire submitted work safely, release partial or late output handles,
+   * and roll back state not committed by a successful stateful invocation.
    */
   readonly execute: (
     executable: ExecutableHandle,
     invocation: ExecutionInvocation
   ) => Effect.Effect<ReadonlyArray<ConcreteTensorHandle>, BackendError>
   /**
-   * Exposes physical tensor storage through an `ArrayBuffer`. For encoded
-   * handles this is the packed byte representation, not logical f32 values. A
-   * backend may copy the data or directly export retained runtime storage;
-   * callers must not rely on either mode.
+   * Exposes the tensor's host-transfer representation through an `ArrayBuffer`.
+   * The concrete handle is borrowed for the operation. Dense `f16` and `bf16`
+   * values are widened to `f32`; other dense dtypes retain their logical dtype.
+   * For encoded handles this is the packed `u8` representation, not logical
+   * `f32` values. A backend may copy the data or directly export retained
+   * runtime storage; callers must not rely on either mode. The returned buffer
+   * remains readable after the handle is released; a direct export may defer
+   * physical cleanup until the buffer becomes unreachable. Interruption
+   * transfers no buffer.
    */
   readonly readback: (tensor: ConcreteTensorHandle) => Effect.Effect<ArrayBuffer, BackendError>
   /**
-   * Releases this concrete handle's ownership and invalidates it and lazy graphs
-   * that captured it. Call exactly once; other aliases may still retain storage.
+   * Releases this concrete handle's ownership and, on success, invalidates it
+   * and lazy graphs that directly captured it. Call exactly once. Other owned
+   * handles and executable-retained constants may still keep storage live.
+   * Failure leaves backend-defined liveness and must not be treated as a
+   * successful release.
    */
   readonly release: (tensor: ConcreteTensorHandle) => Effect.Effect<void, BackendError>
-  /** Optional backend facilities outside the common tensor runtime contract. */
+  /**
+   * Optional facilities in this same identity and placement domain. Presence
+   * advertises availability; each call still validates handles and arguments.
+   */
   readonly extensions: {
     /** Direct path-based safetensors I/O, when supported. */
     readonly pathSafetensors?: PathSafetensors

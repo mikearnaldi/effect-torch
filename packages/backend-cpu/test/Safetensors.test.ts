@@ -21,6 +21,8 @@ const f32Bytes = (values: ReadonlyArray<number>): Uint8Array => {
   return data
 }
 
+// This suite uses the host native addon and temporary on-disk artifacts. Every
+// concrete handle returned by execution or loading is explicitly released.
 describe("CPU tensor handles and direct safetensors", () => {
   it.effect("creates frozen metadata-only handles and accepts concrete tensors as node inputs", () =>
     Effect.gen(function*() {

@@ -1,3 +1,29 @@
+//! Graph discovery and the dense [`GraphIndex`] analysis shared by every
+//! later compilation stage.
+//!
+//! The semantic graph is an immutable DAG of `Arc<Node>` values referenced by
+//! caller-supplied roots. This module walks it once — iteratively, so deep
+//! graphs cannot overflow the stack — and freezes the result into a dense
+//! postorder representation. The invariants every consumer relies on:
+//!
+//! - **Deterministic order.** `order` is a postorder over roots and children
+//!   in caller order; shared subgraphs appear exactly once. Dense IDs are
+//!   positional indexes into this order, so they are stable for the lifetime
+//!   of one graph generation and meaningless across generations.
+//! - **Adjacency multiplicity.** `children` and `consumers` preserve
+//!   duplicate edges (a node used twice by the same parent appears twice),
+//!   matching the semantic edge structure exactly.
+//! - **Slot consistency.** Input and scalar-input slots are collected in
+//!   slot order; conflicting declarations of one slot, or slots declared but
+//!   never used, are hard errors.
+//! - **Identity, not ownership.** Generated-leaf bindings record the
+//!   `Arc`-pointer identity of their `LeafSlot` without retaining it, and
+//!   random sources are numbered in semantic postorder with their provenance
+//!   node ID.
+//!
+//! Hash tables are used only for membership and lookup; iteration order
+//! never leaks into the artifacts.
+
 use effect_torch_graph::{node_children, Device, Node as GraphNode, NodeKind as GraphNodeKind};
 use effect_torch_runtime::{DType, DenseId};
 use std::collections::{HashMap, HashSet};
@@ -7,12 +33,18 @@ use std::sync::Arc;
 type Node = GraphNode;
 type NodeKind = GraphNodeKind;
 
+/// Result of the iterative graph walk: the deduplicated postorder, each
+/// node's direct children keyed by semantic node ID, and the exact number of
+/// semantic edges visited (duplicates counted) for work reporting.
 struct GraphDiscovery {
     order: Vec<Arc<Node>>,
     children_by_node: HashMap<u64, Vec<u64>>,
     edge_visits: usize,
 }
 
+/// Two-phase iterative DFS: nodes are pushed once to be expanded and once to
+/// be emitted, yielding a postorder without any recursion. Children are
+/// pushed in reverse so the emitted order preserves caller child order.
 fn discover_graph(roots: &[Arc<Node>]) -> GraphDiscovery {
     let mut visited = HashSet::new();
     let mut order = Vec::new();
@@ -53,6 +85,9 @@ pub(crate) fn graph_post_order(roots: &[Arc<Node>]) -> Vec<Arc<Node>> {
     discover_graph(roots).order
 }
 
+/// Compile-time declaration of one caller-visible input slot: whether it is
+/// a runtime scalar, and for tensors its shape, dtype, and device. Slot
+/// declarations are part of the program's signature identity.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProgramSlot {
     pub scalar: bool,
@@ -62,6 +97,8 @@ pub struct ProgramSlot {
 }
 
 impl ProgramSlot {
+    /// Compact human-readable form used in conflict diagnostics, e.g.
+    /// `2x4:f32@cpu` or `scalar:i64@metal`.
     pub fn signature(&self) -> String {
         let shape = if self.scalar {
             "scalar".to_string()
@@ -76,6 +113,11 @@ impl ProgramSlot {
     }
 }
 
+/// Validates and collects slot declarations from an already-discovered
+/// postorder. Returns the dense slot table (contiguous, every slot used) and
+/// the `(node ID, slot)` pairs of the leaves that declared them, in
+/// postorder. Errors when one slot carries conflicting signatures or when a
+/// slot number is skipped.
 fn collect_program_slots_from_order(
     order: &[Arc<Node>],
 ) -> std::result::Result<(Vec<ProgramSlot>, Vec<(u64, u32)>), String> {
@@ -228,17 +270,27 @@ impl fmt::Display for RandomSourceId {
     }
 }
 
+/// Which sampling semantics a [`RandomSource`] draws from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum RandomSourceKind {
+    /// Standard-normal samples.
     Randn,
+    /// Uniform samples over a caller-provided half-open interval.
     Uniform,
 }
 
 /// Stable metadata for one semantic random operation.
+///
+/// `provenance` pins the source to the semantic node ID it was derived from,
+/// so the runtime can detect when a reused seed table no longer matches the
+/// graph that produced it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct RandomSource {
+    /// Dense random-source identity (position in `random_source_order`).
     pub id: RandomSourceId,
+    /// The graph node performing the draw.
     pub node: DenseNodeId,
+    /// Semantic node ID the source was derived from.
     pub provenance: u64,
     pub kind: RandomSourceKind,
 }
@@ -246,17 +298,26 @@ pub struct RandomSource {
 pub type RandomSourceMetadata = RandomSource;
 
 /// Metadata for a concrete graph leaf parameterized by native compilation.
-/// The concrete value remains owned only through the graph's `LeafSlot`.
+/// The concrete value remains owned only through the graph's `LeafSlot`;
+/// `slot_identity` is the raw `Arc` pointer address used purely as an
+/// identity token — it is never dereferenced and does not keep the slot
+/// alive.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GeneratedBinding {
+    /// The dense node this leaf occupies.
     pub node: DenseNodeId,
+    /// Semantic node ID of the leaf.
     pub node_id: u64,
+    /// `Arc`-pointer identity of the backing `LeafSlot` (see above).
     pub slot_identity: usize,
     pub shape: Vec<usize>,
     pub dtype: DType,
     pub device: Device,
 }
 
+/// Structural work counters for a single index build. `graph_index_builds`
+/// is always 1 for a constructed index; it exists so later stages can prove
+/// they reused this index instead of building another.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct GraphIndexWork {
     pub graph_index_builds: usize,
@@ -265,22 +326,50 @@ pub struct GraphIndexWork {
 }
 
 /// Dense, deterministic analysis of one immutable semantic graph generation.
+///
+/// This is the single authoritative graph view for the whole compilation:
+/// optimization, lowering, and diagnostics all address nodes by
+/// [`DenseNodeId`] into these tables rather than walking `Arc<Node>` again.
+/// Invariants established by [`GraphIndex::new`] and relied on downstream:
+///
+/// - `order`, `children`, and `consumers` are index-parallel; `dense_by_node`
+///   maps every semantic node ID in `order` to its position.
+/// - `children[i]` precede `i` in postorder; `consumers[i]` follows it.
+/// - `roots` preserves caller order, including duplicate roots.
+/// - `slots` is contiguous and complete (see `collect_program_slots_from_order`).
+/// - `leaves` and `random_source_order` are in postorder; `random_sources`
+///   is index-parallel to `order` with `Some` only on random nodes.
+/// - `work` records exactly one index build.
 #[derive(Clone)]
 pub struct GraphIndex {
+    /// Deduplicated semantic nodes in deterministic postorder.
     pub order: Box<[Arc<Node>]>,
+    /// Semantic node ID to dense ID, for every node in `order`.
     pub dense_by_node: HashMap<u64, DenseNodeId>,
+    /// Direct children of each node, in caller order, duplicate edges kept.
     pub children: Box<[Box<[DenseNodeId]>]>,
+    /// Direct consumers of each node, in discovery order, duplicates kept.
     pub consumers: Box<[Box<[DenseNodeId]>]>,
+    /// Caller-supplied roots in caller order, including duplicates.
     pub roots: Box<[DenseNodeId]>,
+    /// Contiguous caller-visible input slot declarations.
     pub slots: Box<[ProgramSlot]>,
+    /// `(leaf, slot)` pairs for every input/scalar-input leaf, in postorder.
     pub slot_leaves: Box<[(DenseNodeId, u32)]>,
+    /// Concrete generated-leaf bindings, in postorder.
     pub leaves: Box<[GeneratedBinding]>,
+    /// Random-source membership per dense node, index-parallel to `order`.
     pub random_sources: Box<[Option<RandomSourceId>]>,
+    /// Random operations in semantic postorder (dense execution order).
     pub random_source_order: Box<[RandomSource]>,
+    /// Work counters proving this is the program's only index build.
     pub work: GraphIndexWork,
 }
 
 impl GraphIndex {
+    /// Discovers the graph reachable from `roots` and builds every dense
+    /// table in one pass. Fails on slot conflicts, unused slots, or graphs
+    /// exceeding the dense `u32` identity space.
     pub fn new(roots: &[Arc<Node>]) -> Result<Self, String> {
         let GraphDiscovery {
             order,
@@ -400,18 +489,23 @@ impl GraphIndex {
         })
     }
 
+    /// Dense ID of a semantic node ID, when the node is part of this
+    /// generation's graph.
     pub fn dense_id(&self, node_id: u64) -> Option<DenseNodeId> {
         self.dense_by_node.get(&node_id).copied()
     }
 
+    /// The semantic node behind a dense ID.
     pub fn node(&self, id: DenseNodeId) -> Option<&Arc<Node>> {
         self.order.get(id.index())
     }
 
+    /// Direct children of a dense node, in caller order.
     pub fn children_of(&self, id: DenseNodeId) -> Option<&[DenseNodeId]> {
         self.children.get(id.index()).map(Box::as_ref)
     }
 
+    /// Direct consumers of a dense node, in discovery order.
     pub fn consumers_of(&self, id: DenseNodeId) -> Option<&[DenseNodeId]> {
         self.consumers.get(id.index()).map(Box::as_ref)
     }

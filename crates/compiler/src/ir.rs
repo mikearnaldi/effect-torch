@@ -4,8 +4,9 @@
 //! On Metal it is lowered to an SSA-form MSL kernel by the first-party
 //! emitter (`runtime::metal::emit`), compiled once per distinct expression
 //! (cached) and launched over the flattened input buffers; on CPU the same
-//! IR is interpreted per element in a single pass. GPU fusion is f32-only;
-//! the CPU interpreter covers f32 and f64.
+//! IR is interpreted per element in a single pass. Metal computes fused math
+//! in f32 and supports f32/bf16 storage at the lane boundary; the CPU
+//! interpreter covers f32 and f64.
 
 /// Row-major contiguous strides of `shape`, in elements.
 pub fn contiguous_strides(shape: &[usize]) -> Vec<usize> {
@@ -45,6 +46,13 @@ pub fn broadcast_compatible(lane: &[usize], out: &[usize]) -> bool {
     lane_strides(lane, out).is_some()
 }
 
+/// Scalar expression tree for one fused value.
+///
+/// The IR is deliberately `Eq + Hash`: floating-point constants are stored
+/// as their bit patterns so a whole expression can key the compiled-kernel
+/// cache. Cloning, equality, hashing, transformation, and destruction are
+/// all iterative — a long fused chain forms one deep tree whose depth is
+/// bounded by heap, never the call stack.
 #[derive(Debug)]
 pub enum KernelExpr {
     // per-element input lane k
@@ -388,6 +396,10 @@ impl std::hash::Hash for KernelExpr {
     }
 }
 
+/// Scalar arithmetic surface shared by the CPU interpreter and any other
+/// evaluator of the fusion IR. Comparisons yield 1.0/0.0 and `pick` is the
+/// select primitive; `from_f64` performs the narrowing conversion for
+/// constants.
 pub trait Scalar: Copy {
     fn from_f64(v: f64) -> Self;
     fn add(self, o: Self) -> Self;
@@ -680,6 +692,9 @@ pub struct CpuFusionProgram {
 }
 
 impl CpuFusionProgram {
+    /// Flattens every expression into one contiguous post-order op list.
+    /// Preparation computes the exact lane counts and the maximum value-stack
+    /// depth so evaluation never allocates or re-measures.
     pub fn new(exprs: &[KernelExpr]) -> Self {
         let mut ops = Vec::new();
         let mut plan_ends = Vec::with_capacity(exprs.len());
@@ -750,22 +765,28 @@ impl CpuFusionProgram {
         }
     }
 
+    /// Number of fused outputs (one plan per expression).
     pub fn output_count(&self) -> usize {
         self.plan_ends.len()
     }
 
+    /// Number of per-element input lanes referenced across all plans.
     pub fn input_count(&self) -> usize {
         self.input_count
     }
 
+    /// Number of launch-varying scalar lanes referenced across all plans.
     pub fn scalar_count(&self) -> usize {
         self.scalar_count
     }
 
+    /// Maximum value-stack depth any plan needs during evaluation.
     pub fn value_scratch_len(&self) -> usize {
         self.value_scratch_len
     }
 
+    /// Total caller-owned scratch elements required: cached input lanes plus
+    /// value stack.
     pub fn scratch_elements(&self) -> usize {
         self.input_count
             .checked_add(self.value_scratch_len)
@@ -893,6 +914,12 @@ fn strided_offset(index: usize, shape: &[usize], strides: &[usize]) -> usize {
     offset
 }
 
+/// Interprets a prepared program over `n` elements, writing every output.
+/// `slices` are the per-element input lanes; `strides` optionally supplies
+/// per-lane broadcast strides against `shape` (contiguous when `None`);
+/// `scalar_values` are the launch-varying scalar lanes. All scratch is
+/// caller-owned and asserted to be exactly sized via
+/// [`CpuFusionProgram::scratch_elements`].
 pub fn interpret_core_into<T: Scalar>(
     program: &CpuFusionProgram,
     slices: &[&[T]],
@@ -931,6 +958,8 @@ pub fn interpret_core_into<T: Scalar>(
     }
 }
 
+/// Owning wrapper around [`interpret_core_into`]: prepares a program,
+/// allocates outputs and scratch, and returns one vector per expression.
 pub fn interpret_core<T: Scalar>(
     exprs: &[KernelExpr],
     slices: &[&[T]],
@@ -985,6 +1014,12 @@ fn reduce_output_offset(
     out_offset
 }
 
+/// Interprets a fused-reduce program: the single expression is evaluated per
+/// input element inside the reduce loop and folded into the accumulator of
+/// its output cell, so the elementwise intermediate never materializes.
+/// `dims` are the reduced dimensions (sorted), `keepdims` controls whether
+/// they remain as size-1 in `out_shape`. `Mean` divides by the reduced
+/// extent after the fold.
 #[allow(clippy::too_many_arguments)]
 pub fn interpret_reduce_core_into<T: Scalar>(
     op: ReduceOp,
@@ -1030,6 +1065,7 @@ pub fn interpret_reduce_core_into<T: Scalar>(
     }
 }
 
+/// Owning wrapper around [`interpret_reduce_core_into`].
 #[allow(clippy::too_many_arguments)]
 pub fn interpret_reduce_core<T: Scalar>(
     op: ReduceOp,
@@ -1063,6 +1099,8 @@ pub fn interpret_reduce_core<T: Scalar>(
 // v] with scalar lanes [lr, 1 - beta1^t, 1 - beta2^t], mirroring the
 // composed update's operation order exactly. Step-dependent values are
 // scalar lanes so the compiled kernel is stable across steps.
+/// Expressions `[param', m', v']` of the fused AdamW update; see the note
+/// above for the lane layout.
 pub fn adamw_exprs(beta1: f64, beta2: f64, eps: f64, weight_decay: f64) -> [KernelExpr; 3] {
     adamw_exprs_with(
         beta1,
@@ -1146,6 +1184,9 @@ fn adamw_exprs_with(
 // The fused momentum-SGD update over lanes [param, grad, velocity] with
 // scalar lanes [lr, first], mirroring the composed update including the
 // first-step v = g initialization as a select on the 0-d `first` flag.
+/// Expressions `[param', velocity']` of the fused momentum-SGD update over
+/// lanes [param, grad, velocity] with scalar lanes [lr, first]; see the note
+/// above for the exact update mirrored by the expressions.
 pub fn sgd_exprs(
     momentum: f64,
     dampening: f64,
@@ -1224,6 +1265,8 @@ fn sgd_exprs_with(
     ]
 }
 
+/// Whether fusion supports a device/dtype pair: the CPU interpreter covers
+/// f32/f64; GPU (Metal) fusion covers f32 and bf16.
 pub fn is_supported(
     device: &effect_torch_graph::Device,
     dtype: effect_torch_runtime::DType,

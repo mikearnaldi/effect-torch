@@ -1,3 +1,23 @@
+//! Elementwise operations with broadcasting.
+//!
+//! Binary arithmetic (`add`/`sub`/`mul`/`div`/`maximum`/`minimum`/`pow`),
+//! comparisons (`eq`/`gt`/`lt`/`ge`/`le`, producing `u8` masks), ternary
+//! `where_`, and the float unary family (`sqrt`, `exp`, `log`, `sin`, `cos`,
+//! `tanh`, `erf`, `floor`, `ceil`, `round`, `abs`, `sign`, `powf`, `relu`,
+//! `neg`) all share one pattern: validate that both operand layouts broadcast
+//! to the destination shape, then walk output elements linearly and map each
+//! linear index back through `broadcast_offset` into each (possibly
+//! strided, possibly broadcast) operand.
+//!
+//! Half-precision inputs compute in `f32` and round back; `erf` uses `libm`.
+//! Broadcasting follows NumPy rules: ranks are right-aligned and size-1
+//! dimensions repeat without touching memory (stride 0 semantics fall out of
+//! the coordinate walk, since size-1 dimensions never advance the offset).
+//!
+//! Every operation follows the crate-wide contract: `*_requirements` fixes
+//! the output, `*_into` writes a caller destination allocation-free, and the
+//! plain wrapper composes the two.
+
 use super::tensor::{
     CpuBuffer, CpuDestination, CpuOperationRequirements, CpuTensorRequirement, Elem, Tensor,
 };

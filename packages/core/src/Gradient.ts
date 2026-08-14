@@ -1,10 +1,11 @@
 /**
- * Reverse-mode autodiff and graph transforms. The backward transform runs
- * natively on the graph itself — there is no tracing and no function
- * transformation: the loss is an ordinary lazy graph value and adjoints are
- * expressed as graph nodes. Higher-order derivatives can be requested by
- * applying {@link grad} again, but succeed only when the native autodiff
- * transform defines adjoints for every forward and backward node involved.
+ * Reverse-mode autodiff and graph-to-graph transforms. The backward transform
+ * runs natively on an existing lazy graph; there is no JavaScript function
+ * tracing or function transformation. Adjoint expressions are ordinary graph
+ * nodes and remain lazy until computed or compiled. Higher-order derivatives
+ * can be requested by applying {@link grad} again, but succeed only when the
+ * native autodiff transform defines adjoints for every forward and backward
+ * node involved.
  *
  * @since 0.1.0
  */
@@ -13,8 +14,9 @@ import * as Runtime from "./Runtime.ts"
 import * as Tensor from "./Tensor.ts"
 
 /**
- * Error raised by {@link grad} for wrapper precondition failures. Unsupported
- * or non-differentiable nodes in the native autodiff transform surface as
+ * Error raised by {@link grad} for wrapper-level loss or target validation.
+ * Unsupported or non-differentiable nodes, incompatible runtimes or
+ * placements, and invalid backend results surface as
  * {@link Tensor.TensorError}; the `"not-differentiable"` reason is reserved and
  * is not currently emitted.
  *
@@ -80,7 +82,7 @@ const validateResult = (
 
 /**
  * Computes the gradients of a scalar loss with respect to the given tensors.
- * The loss is an ordinary lazy graph value — there is no tracing and no
+ * The loss is an ordinary lazy graph value; there is no tracing and no
  * function transformation, the backward transform runs natively on the
  * graph itself, with adjoints expressed in the same node
  * vocabulary as the forward pass. Applying `grad` to a derivative graph can
@@ -92,8 +94,10 @@ const validateResult = (
  * autodiff transform surface as {@link Tensor.TensorError} rather than
  * `GradError`.
  *
- * The loss and every `wrt` tensor must use a floating dtype supported by the
- * active backend. Gradients are lazy tensors sharing the forward graph; a
+ * The loss and every `wrt` tensor must use `f32`, `f64`, `f16`, or `bf16`, and
+ * that dtype must be supported by the active backend. Returned gradients are
+ * lazy tensors with each target's shape, dtype, and placement. They capture and
+ * borrow the forward graph; this function does not evaluate or clear inputs. A
  * `wrt` tensor that does not influence the loss yields a zero gradient.
  * Because the loss and its gradients share the forward graph, evaluate them
  * together with
@@ -145,9 +149,10 @@ export const grad = (
   })
 
 /**
- * Stops gradient flow: the returned tensor has the same value as the input,
- * but the backward walk does not continue past it, so ancestors of the input
- * receive no gradient through this path.
+ * Stops gradient flow by adding a lazy identity node. The returned tensor has
+ * the same metadata and value as the input, but the backward walk does not
+ * continue past it, so ancestors of the input receive no gradient through this
+ * path. No tensor is evaluated or transferred.
  *
  * @since 0.1.0
  * @category autodiff
@@ -168,13 +173,14 @@ export const stopGradient = (
   })
 
 /**
- * Gradient checkpointing: the returned tensor has the same value as the
- * input, but during the backward pass the forward intermediates of the
- * subgraph that produced it are recomputed from a fresh copy instead of
- * being retained — trading one extra forward evaluation of the region for
- * its peak memory. Region inputs (nodes also reachable from outside the
- * checkpoint) and constructor leaves (including `randn` draws) are shared,
- * so recomputation is consistent with the forward pass.
+ * Gradient checkpointing: adds a lazy identity node with the input's metadata
+ * and value. When a backward walk crosses it, the transform rebuilds the
+ * checkpointed region with fresh node identities so its forward intermediates
+ * can be recomputed instead of retained. This trades recomputation for lower
+ * retained-intermediate pressure; the exact memory benefit is compiler and
+ * backend dependent. Region inputs (nodes also reachable from outside the
+ * checkpoint) and constructor leaves (including `randn` draws) are shared, so
+ * recomputation uses the same leaves as the forward pass.
  *
  * @since 0.1.0
  * @category autodiff
@@ -215,10 +221,11 @@ const checkSameShapeDtype = (
 /**
  * Vector-Jacobian product (reverse-mode pullback): given an output graph
  * `y` (built from `x` however you like), the primal `x`, and a cotangent
- * `v` with `y`'s shape, returns `J(x)ᵀ v` — the gradient of `sum(y * v)`
+ * `v` with `y`'s shape, returns `J(x)^T v`, the gradient of `sum(y * v)`
  * with respect to `x`. `v` must exactly match `y`'s shape and dtype and use a
  * compatible placement; `x` and the derived loss must satisfy {@link grad}'s
- * floating-dtype contract. A disconnected `x` produces zeros.
+ * floating-dtype contract. `v` is stopped before differentiation. A
+ * disconnected `x` produces zeros.
  *
  * @since 0.1.0
  * @category autodiff
@@ -242,8 +249,8 @@ export const vjp = (
  * construction uses second-order adjoints and therefore fails for operations
  * whose backward graph is not differentiable. `v` must exactly match `x`'s
  * shape and dtype and use a compatible placement; `x` and the derived losses
- * must satisfy {@link grad}'s floating-dtype contract. A disconnected `x`
- * produces zeros.
+ * must satisfy {@link grad}'s floating-dtype contract. The tangent is stopped
+ * before the outer reverse pass. A disconnected `x` produces zeros.
  *
  * @since 0.1.0
  * @category autodiff
@@ -255,7 +262,7 @@ export const jvp = (
 ): Effect.Effect<Tensor.Lazy, Tensor.TensorError | GradError, Runtime.Runtime> =>
   Effect.gen(function*() {
     yield* checkSameShapeDtype("jvp", x, v, "tangent")
-    // u is a free linearization point: g(u) = J(x)ᵀ u is linear in u, and
+    // u is a free linearization point: g(u) = J(x)^T u is linear in u, and
     // its own vjp at u = 0 with cotangent v is J(x) v
     const u = yield* Tensor.zerosLike(y)
     const loss1 = yield* Tensor.sum(yield* Tensor.mul(y, u))
@@ -270,14 +277,17 @@ export const jvp = (
  * output graph `y` built from the unbatched input `x`, and `batchedX`
  * equal to `x` with a batch dimension inserted at `dim`, returns the graph
  * of `y` applied elementwise along that dimension. `y` must depend on `x`.
- * The output batch axis is inserted at `min(dim, y.rank)`. This is a native graph rewrite with per-op batching
- * rules, not a slice-and-restack loop. Graph size remains linear in the source
- * graph and independent of batch length; some indexing rules add reshape and
- * broadcast helpers. Elementwise ops and matmul batch by broadcasting;
- * reductions and shape ops shift their metadata; `randn`/`uniform` draw
- * per batch element. Shared-index `indexSelect`/`take`, `gather`, and supported
- * `scatterAdd` forms have batching rules; indexes that depend on `x` and
- * unsupported fused, convolutional, recurrent, or decode operations fail.
+ * The output batch axis is inserted at `min(dim, y.rank)`. This is a native
+ * graph rewrite with per-op batching rules, not a slice-and-restack loop. Graph
+ * size remains linear in the source graph and independent of batch length;
+ * some indexing rules add reshape and broadcast helpers. Elementwise ops and
+ * matmul batch by broadcasting; reductions and shape ops shift their metadata;
+ * `randn`/`uniform` nodes in the mapped graph draw per batch element.
+ * Shared-index `indexSelect`/`take`, `gather`, and supported `scatterAdd` forms
+ * have batching rules; indexes that depend on `x` and unsupported fused,
+ * quantized, convolutional, recurrent, or decode operations fail with
+ * {@link Tensor.TensorError}. The transform is lazy and does not evaluate or
+ * clear any tensor.
  *
  * @since 0.1.0
  * @category autodiff

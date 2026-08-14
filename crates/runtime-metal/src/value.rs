@@ -1,3 +1,11 @@
+//! Leaf-value wrapper around [`MetalTensor`] for the graph layer.
+//!
+//! [`Value`] is the concrete `LeafValue` the compiler's graph walks carry:
+//! a thin newtype that exposes shape/dtype/device metadata and the
+//! constructors for uploading host bytes or reserving shared-memory
+//! destination storage (napi addon). f64 is rejected at the boundary —
+//! Metal has no double-precision compute support in this runtime.
+
 use crate::device::MetalDevice;
 #[cfg(test)]
 use crate::kernels;
@@ -7,34 +15,43 @@ use effect_torch_runtime::{DType, Layout};
 #[cfg(feature = "napi-addon")]
 use std::sync::Arc;
 
+/// A graph leaf value backed by a Metal tensor.
 #[derive(Clone)]
 pub struct Value(pub MetalTensor);
 
 impl Value {
+    /// The device kind this value lives on (always `Device::Metal`).
     pub fn device(&self) -> Device {
         Device::Metal
     }
 
+    /// The wrapped tensor (infallible: a `Value` is always Metal-backed).
     pub fn as_metal(&self) -> Result<&MetalTensor, String> {
         Ok(&self.0)
     }
 
+    /// Element type of the wrapped tensor.
     pub fn dtype(&self) -> DType {
         self.0.dtype
     }
 
+    /// Logical shape of the wrapped tensor.
     pub fn shape(&self) -> &[usize] {
         self.0.layout.shape()
     }
 
+    /// Number of logical elements.
     pub fn numel(&self) -> usize {
         self.0.numel()
     }
 
+    /// `numel * dtype.size_in_bytes()` — the contiguous byte footprint.
     pub fn byte_size(&self) -> usize {
         self.numel() * self.dtype().size_in_bytes()
     }
 
+    /// Synchronizes, copies to contiguous f32 on device, and reads back to
+    /// the host (tests only).
     #[cfg(test)]
     pub fn to_f32_vec(&self) -> Result<Vec<f32>, String> {
         let device = MetalDevice::get();
@@ -49,6 +66,8 @@ impl Value {
     }
 }
 
+/// Builds a contiguous value by uploading `bytes` (exactly
+/// `numel(shape) * dtype.size_in_bytes()` of them) to the device.
 pub(crate) fn value_from_bytes(
     bytes: &[u8],
     shape: &[usize],
@@ -77,6 +96,8 @@ pub(crate) fn value_from_bytes(
     }))
 }
 
+/// Allocates an uninitialized contiguous value in shared memory, suitable
+/// as a zero-copy destination for host writes via [`write_value_bytes`].
 #[cfg(feature = "napi-addon")]
 pub(crate) fn empty_shared_value(shape: &[usize], dtype: DType) -> Result<Value, String> {
     let elements = shape
@@ -96,6 +117,9 @@ pub(crate) fn empty_shared_value(shape: &[usize], dtype: DType) -> Result<Value,
     }))
 }
 
+/// Runs `write` against the value's raw bytes. Requires a contiguous
+/// layout at offset zero and unique (`Arc`) ownership of the storage, so
+/// no GPU work or other view can alias the bytes being written.
 #[cfg(feature = "napi-addon")]
 pub(crate) fn write_value_bytes<R>(
     value: &mut Value,
@@ -117,7 +141,10 @@ pub(crate) fn write_value_bytes<R>(
             buffer.size
         ));
     }
-    // SAFETY: this is a fresh shared MTLBuffer with unique Arc ownership.
+    // SAFETY: `Arc::get_mut` above proves unique ownership of the buffer,
+    // so no other host view or GPU consumer aliases it; the buffer is
+    // shared-mode so `contents_ptr()` is a valid host mapping, and the
+    // `byte_len > buffer.size` check above bounds the slice.
     let bytes =
         unsafe { std::slice::from_raw_parts_mut(buffer.contents_ptr().cast::<u8>(), byte_len) };
     Ok(write(bytes))

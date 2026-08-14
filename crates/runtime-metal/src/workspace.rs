@@ -1,3 +1,27 @@
+//! Workspace pool for planned executable invocations.
+//!
+//! Compiled executables declare their memory as [`SegmentDecl`]s; at
+//! dispatch time [`acquire`] leases each segment from a process-wide
+//! [`WorkspacePool`]. Pool invariants:
+//!
+//! - **Capacity classes.** Keys are `(memory space, alignment,
+//!   capacity_class)` where the class is the request rounded up to the
+//!   alignment. A lease is never served from a larger capacity class, so a
+//!   small plan cannot pin a huge idle buffer.
+//! - **Bounded idle bytes.** The pool keeps at most
+//!   `EFFECT_TORCH_WORKSPACE_POOL_MB` (default: one quarter of the
+//!   device's recommended working set) of idle storage; leases are
+//!   best-fit LRU within that bound.
+//! - **Retention.** `ProvisionalOutput` segments get their own lease that
+//!   is wrapped in a [`BufferRetention`] and attached to the output buffer
+//!   views, so an output handed to the caller keeps its pool storage alive
+//!   until the last view drops — the pool's leased count only falls when
+//!   the output is truly gone.
+//! - **Lifetime.** The returned [`InvocationResources`] must outlive the
+//!   encoded command buffers of the invocation; dropping it returns
+//!   workspace segments to the pool (use tokens in `device` still protect
+//!   in-flight storage from premature reuse).
+
 use crate::device::{Buffer, BufferRetention, MetalDevice};
 use effect_torch_runtime::{
     NativeMemorySpace, SegmentDecl, SegmentOwnership, WorkspaceAllocation, WorkspaceAllocator,
@@ -9,6 +33,9 @@ use std::sync::{Arc, OnceLock};
 #[cfg(test)]
 pub(crate) const DEFAULT_ALIGNMENT: usize = 256;
 
+/// Pool key: memory space, required alignment, and the alignment-rounded
+/// capacity class. Exact-class matching prevents small requests from
+/// pinning oversized idle buffers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct MetalWorkspaceKey {
     pub memory_space: NativeMemorySpace,
@@ -17,6 +44,8 @@ pub(crate) struct MetalWorkspaceKey {
 }
 
 impl MetalWorkspaceKey {
+    /// Builds a key for a `bytes` request; alignment must be a non-zero
+    /// power of two. Only `MetalShared` space is supported.
     fn new(bytes: usize, alignment: usize) -> Result<Self, String> {
         if alignment == 0 || !alignment.is_power_of_two() {
             return Err(format!("invalid Metal workspace alignment {alignment}"));
@@ -32,6 +61,8 @@ impl MetalWorkspaceKey {
     }
 }
 
+/// Allocates workspace segments straight from the device as right-sized,
+/// unpooled root buffers.
 #[derive(Debug)]
 pub(crate) struct MetalWorkspaceAllocator;
 
@@ -57,8 +88,12 @@ impl WorkspaceAllocator<MetalWorkspaceKey> for MetalWorkspaceAllocator {
 }
 
 pub(crate) type MetalWorkspacePool = WorkspacePool<MetalWorkspaceKey, MetalWorkspaceAllocator>;
+/// A live set of segment leases; dropping returns them to the pool.
 pub(crate) type MetalWorkspaceLease = WorkspaceLease<MetalWorkspaceKey, MetalWorkspaceAllocator>;
 
+/// The process-wide workspace pool, sized from
+/// `EFFECT_TORCH_WORKSPACE_POOL_MB` or one quarter of the recommended
+/// working set.
 pub(crate) fn workspace_pool() -> &'static MetalWorkspacePool {
     static POOL: OnceLock<MetalWorkspacePool> = OnceLock::new();
     POOL.get_or_init(|| {
@@ -81,6 +116,10 @@ fn request(bytes: usize, alignment: usize) -> Result<WorkspaceRequest<MetalWorks
     ))
 }
 
+/// Everything one executable invocation needs to keep alive: the leased
+/// segment buffers (one per declared segment, in declaration order), the
+/// retentions pinning provisional-output leases, the workspace lease
+/// itself, and the total workspace capacity actually acquired.
 pub(crate) struct InvocationResources {
     pub segments: Vec<Arc<Buffer>>,
     pub retentions: Vec<Option<BufferRetention>>,
@@ -88,6 +127,10 @@ pub(crate) struct InvocationResources {
     pub actual_workspace_bytes: usize,
 }
 
+/// Leases buffers for every declared segment: workspace/staging segments
+/// come from one pooled set acquisition, while each `ProvisionalOutput`
+/// segment gets an individual lease whose retention travels with the
+/// output views handed to the caller.
 pub(crate) fn acquire(
     segments: &[SegmentDecl<NativeMemorySpace>],
 ) -> Result<InvocationResources, String> {

@@ -4,10 +4,14 @@ import * as Tokenizer from "@effect-torch/tokenizers"
 import { Effect } from "effect"
 import fs from "node:fs"
 
-// Shared pieces of the FineWeb pre-training pilot (see train.ts
-// and infer.ts): the GPT-2-architecture model, its size
-// constants, the pretrained GPT-2 BPE tokenizer, and checkpoint
-// save/load (safetensors, keyed by model.names).
+// Shared FineWeb model and data contracts. The training scripts consume flat
+// u16 token streams, while inference consumes bare safetensors artifacts keyed
+// by `model.names`; resumable Checkpoint archives use a different key schema
+// and must be exported before `loadParams` can read them. Bare artifacts contain
+// no architecture metadata, and loading checks names only; incompatible tensor
+// shape/dtype semantics are deferred to later model execution.
+// FINEWEB_BLOCK is Number-parsed once at module load and is not stored in bare
+// artifacts; it controls both training windows and inference attention policy.
 
 export const TOKENIZER_JSON = new URL("../data/gpt2-tokenizer.json", import.meta.url).pathname
 export const CHECKPOINT = new URL("../data/fineweb-model.safetensors", import.meta.url).pathname
@@ -22,8 +26,8 @@ export const createGpt = (
   vocabSize: number
 ): Effect.Effect<Model.Model, Model.ModelError | Tensor.TensorError> =>
   Effect.gen(function*() {
-    // Token embeddings; positions are relative (RoPE inside attention),
-    // so generation is unbounded — no position table to outgrow.
+    // Token embeddings; RoPE inside attention means the architecture has no
+    // learned position table to outgrow during windowed inference.
     const embeddings = yield* Model.embedding("wte", vocabSize, EMBED)
     const blocks: Array<Model.Model> = []
     for (let i = 0; i < LAYERS; i++) {
@@ -54,23 +58,20 @@ export const loadTokenizer = Tokenizer.fromFile(TOKENIZER_JSON, {
   specialTokens: "Always"
 })
 
-/** Saves params as a safetensors checkpoint keyed by parameter name. */
+/** Saves a bare model artifact keyed by parameter name, without trainer state. */
 export const saveParams = (model: Model.Model, params: Model.Params, path: string) =>
   Tensor.save(path, Object.fromEntries(model.names.map((name, i) => [name, params[i]])))
 
-/** Loads a checkpoint back into the model's parameter order. */
+/**
+ * Loads named bare parameters into model order. `Tensor.load` imports the
+ * entire archive; {@link Model.load} releases extras and returns the required
+ * handles.
+ */
 export const loadParams = (
   model: Model.Model,
   path: string
-): Effect.Effect<Model.Params, Tensor.TensorError, Runtime.Runtime> =>
-  Effect.gen(function*() {
-    const tensors = yield* Tensor.load(path)
-    return model.names.map((name) => {
-      const tensor = tensors[name]
-      if (tensor === undefined) throw new Error(`checkpoint ${path} is missing parameter ${name}`)
-      return tensor
-    })
-  })
+): Effect.Effect<ReadonlyArray<Tensor.Concrete>, Model.ModelError | Tensor.TensorError, Runtime.Runtime> =>
+  Model.load(model, path)
 
 /** Reads a u16 token bin produced by prepare.ts. */
 export const loadBin = (path: string) => {
@@ -92,7 +93,7 @@ export const windows = (data: Uint16Array, starts: ReadonlyArray<number>, batch:
   return { inputs, targets }
 }
 
-/** Mean cross-entropy over `batches` random windows of `data`. */
+/** Mean cross-entropy over random windows sampled with replacement and no fixed seed. */
 export const heldOutLoss = (
   model: Model.Model,
   params: Model.Params,
@@ -102,10 +103,11 @@ export const heldOutLoss = (
   batches: number
 ) =>
   Effect.gen(function*() {
-    // Forward + loss as ONE frozen program: the chunked-head rewrite
-    // (RFC 0016 phase 2) fires inside it, so the full logits tensor is
-    // never materialized during evaluation, and the program's arena plan
-    // shares the training arena's memory instead of stacking on top.
+    // Forward and loss must be one compiled graph: this lets the chunked-head
+    // cross-entropy rewrite consume the linear head directly, so evaluation
+    // never exposes a full [batch, block, vocab] logits root. The compiled
+    // signature is reused across batches; each program call completes before
+    // its scalar loss is read back.
     return yield* Effect.acquireUseRelease(
       Tensor.compile((inputs) =>
         Effect.gen(function*() {

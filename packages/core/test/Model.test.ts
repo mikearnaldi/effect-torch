@@ -444,8 +444,6 @@ onDevices("Model", () => (it) => {
         const [a] = yield* Tensor.compute([yield* plain.forward(params, x)])
         const [b] = yield* Tensor.compute([yield* causal.forward(params, x)])
         expect(yield* values(a)).not.toEqual(yield* values(b))
-        // causal attention preserves the first position's output: position
-        // 0 attends only to itself in both variants' first row
         const loss = yield* Tensor.sum(yield* causal.forward(params, x))
         const grads = yield* Tensor.compute(yield* Gradient.grad(loss, params))
         expect(grads.length).toBe(4)

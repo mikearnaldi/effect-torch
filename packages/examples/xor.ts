@@ -7,17 +7,18 @@ const HIDDEN = 8
 const STEPS = 3000
 const LR = 0.1
 
+// Tutorial architecture: compose a 2 -> 8 -> 1 MLP from primitive models,
+// train full-batch with Trainer's cached step, then use cached model inference.
 const program = Effect.gen(function*() {
   const runtime = yield* Runtime.Runtime
   const x = yield* Tensor.fromTypedArray(new Float32Array([0, 0, 0, 1, 1, 0, 1, 1]), [4, 2])
   const y = yield* Tensor.fromTypedArray(new Float32Array([0, 1, 1, 0]), [4, 1])
 
-  // A 2 -> HIDDEN (tanh) -> 1 (sigmoid) MLP, composed from primitive models.
   yield* Effect.log(`1) creating model: 2 -> ${HIDDEN} (tanh) -> 1 (sigmoid) on ${runtime.placement.description}`)
   const model = yield* createModel
   const params = yield* init(model)
 
-  // Full-batch Adam on the MSE loss, one compiled program call per step
+  // Trainer traces the forward, loss, backward, and Adam update as one step.
   yield* Effect.log(`2) training: adam lr=${LR}, ${STEPS} steps (compiled)`)
   const trainer = yield* createTrainer(model, x, y)
   const trained = yield* trainer.train(params)
@@ -26,7 +27,6 @@ const program = Effect.gen(function*() {
   yield* evaluate(model, trained.params, x, y)
 })
 
-// Create the model
 const createModel = Effect.gen(function*() {
   const model = yield* Model.chain(
     yield* Model.linear("fc1", 2, HIDDEN),
@@ -37,7 +37,6 @@ const createModel = Effect.gen(function*() {
   return model
 })
 
-// Initialize the parameters
 const init = (model: Model.Model) =>
   Effect.gen(function*() {
     const params = yield* model.init
@@ -47,7 +46,6 @@ const init = (model: Model.Model) =>
     return params
   })
 
-// Create the trainer for the model, compiled
 const createTrainer = (
   model: Model.Model,
   x: Tensor.Any,
@@ -87,7 +85,8 @@ class MispredictionError extends Data.TaggedError("MispredictionError")<{
   }
 }
 
-// One forward pass per input, failing on the first misprediction
+// Model.execute traces once for [1, 2], then reuses that inference program for
+// each truth-table row; the first wrong classification fails the Effect.
 const evaluate = (
   model: Model.Model,
   params: Model.Params,

@@ -1,8 +1,33 @@
+//! Index-space operations: `gather`, `index_select`, `scatter_add`, `cat`.
+//!
+//! Index tensors may be `u8`, `u32`, or `i64`; `i64` indexes are range
+//! checked (negative values are errors) and all indexes are bounds checked
+//! against the addressed extent during execution. All kernels address the
+//! source through its layout, so strided inputs work without a contiguous
+//! copy.
+//!
+//! - `gather` reads `input[coord..., ids[..], coord...]` where the ids
+//!   tensor has the same rank as the input and the output takes the ids
+//!   shape.
+//! - `index_select` replaces dimension `dim` of the input with `ids.numel()`
+//!   selected slices.
+//! - `scatter_add` copies the input to the output, then accumulates `src`
+//!   into positions addressed by `ids` along `dim`.
+//! - `cat` concatenates same-rank, same-dtype tensors along `dim`, copying
+//!   each input in one outer × dim × inner blocked pass.
+//!
+//! [`IndexingRequirements`] freezes the output requirement, input layouts,
+//! and pass count ([`IndexingTopology`]) of one invocation for the executor.
+
 use super::tensor::{source_index, CpuBuffer, CpuDestination, CpuTensorRequirement, Elem, Tensor};
 use effect_torch_runtime::{DType, Layout};
 
+/// Execution strategy frozen into an [`IndexingRequirements`] plan.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IndexingTopology {
+    /// Single-pass direct indexing; `passes` counts the sweeps over the
+    /// output (e.g. `scatter_add` uses 2: copy, then accumulate; `cat` uses
+    /// one pass per input).
     Direct { passes: usize },
 }
 

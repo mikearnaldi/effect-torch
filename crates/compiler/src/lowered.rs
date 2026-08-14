@@ -1,6 +1,31 @@
+//! The backend-neutral lowered IR: dense value and instruction tables that
+//! sit between graph optimization and physical memory planning.
+//!
+//! A [`LoweredProgram`] is the authoritative artifact a backend lowering
+//! produces. Its contract, enforced by the planner's validation:
+//!
+//! - **Dense identity.** `values[i]` must carry `ValueId::from_index(i)` and
+//!   `instructions[i]` must carry `InstructionId::from_index(i)`. IDs are
+//!   table positions, so lookups are O(1) and mismatched tables are
+//!   structural errors, not runtime surprises.
+//! - **Declared effects.** Every value an instruction touches is listed in
+//!   exactly one resource category: logical `inputs`/`outputs`, plus
+//!   `scratch`, `staging`, `status`, and `state` for backend resources.
+//!   Liveness and scheduling see the union; effects that no declared use can
+//!   express live in [`InstructionEffects`].
+//! - **Storage intent.** Each value declares whether its storage is `Fixed`
+//!   (backend-assigned, outside the planner), `Planned` (packed into
+//!   planner-owned segments), or an `Alias` of another value at a byte
+//!   offset.
+//!
+//! The type parameters stay fully backend-defined: `K` is the instruction
+//! kind, `M` the memory-space type, and `V` the value record (which may wrap
+//! the authoritative [`ValueDecl`] with backend-only metadata).
+
 use effect_torch_runtime::{InstructionId, Location, SegmentOwnership, StorageClass, ValueId};
 use std::marker::PhantomData;
 
+/// How an instruction accesses one value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ValueAccess {
     Read,
@@ -18,6 +43,7 @@ impl ValueAccess {
     }
 }
 
+/// One declared use of a value by an instruction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ValueUse {
     pub value: ValueId,
@@ -47,6 +73,8 @@ impl ValueUse {
     }
 }
 
+/// A defining write: each entry names a value the instruction defines.
+/// Outputs are the only category treated as definitions for liveness.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct OutputDecl {
     pub value: ValueId,
@@ -70,22 +98,29 @@ pub struct InstructionEffects {
 /// Storage which is supplied outside the planner or is already assigned.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum ValueStorage<M> {
+    /// The backend already placed this value (external inputs, persistent
+    /// constants/state, escaping outputs, device status); the planner only
+    /// accounts for its bytes and never moves it.
     Fixed {
         class: StorageClass,
         location: Location,
     },
+    /// The planner must pack this value into a segment of `memory_space`
+    /// with the given byte alignment and ownership class.
     Planned {
         class: StorageClass,
         alignment: usize,
         memory_space: M,
         ownership: SegmentOwnership,
     },
-    Alias {
-        source: ValueId,
-        byte_offset: usize,
-    },
+    /// A view into another value at `byte_offset`. Aliases receive no
+    /// storage of their own; their uses fold into the root value's live
+    /// interval after alias normalization.
+    Alias { source: ValueId, byte_offset: usize },
 }
 
+/// Declaration of one lowered value: its dense identity, a human-readable
+/// name for diagnostics, its byte size, and its storage intent.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ValueDecl<M> {
     pub id: ValueId,
@@ -106,6 +141,8 @@ impl<M> LoweredValue<M> for ValueDecl<M> {
 }
 
 impl<M> ValueDecl<M> {
+    /// A workspace value the planner will pack into a segment of
+    /// `memory_space`.
     pub fn planned(
         id: ValueId,
         name: impl Into<String>,
@@ -127,6 +164,8 @@ impl<M> ValueDecl<M> {
         }
     }
 
+    /// A value declared as a `bytes`-sized view into `source` at
+    /// `byte_offset`. Bounds are checked during alias normalization.
     pub fn alias(
         id: ValueId,
         name: impl Into<String>,
@@ -145,6 +184,8 @@ impl<M> ValueDecl<M> {
         }
     }
 
+    /// The accounting class of this value's storage, or `None` for aliases
+    /// (whose bytes are accounted through their root).
     pub const fn storage_class(&self) -> Option<StorageClass> {
         match &self.storage {
             ValueStorage::Fixed { class, .. } | ValueStorage::Planned { class, .. } => Some(*class),
@@ -154,6 +195,13 @@ impl<M> ValueDecl<M> {
 }
 
 /// A backend-lowered logical instruction. `K` remains backend-defined.
+///
+/// The resource categories partition every value the instruction touches:
+/// `inputs` are logical reads, `outputs` are defining writes, `scratch` is
+/// transient per-invocation workspace, `staging` is invocation staging,
+/// `status` is device status, and `state` is persistent state. Nothing may
+/// be touched without appearing in one of these lists; undeclared effects
+/// belong to [`InstructionEffects`].
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct LoweredInstruction<K> {
     pub id: InstructionId,
@@ -168,6 +216,8 @@ pub struct LoweredInstruction<K> {
 }
 
 impl<K> LoweredInstruction<K> {
+    /// An instruction with no resource uses beyond its logical inputs and
+    /// outputs and no extra effects.
     pub fn new(
         id: InstructionId,
         kind: K,
@@ -187,6 +237,8 @@ impl<K> LoweredInstruction<K> {
         }
     }
 
+    /// Attaches the non-logical resource uses (scratch, staging, status,
+    /// state) in declaration order.
     pub fn with_resources(
         mut self,
         scratch: impl Into<Box<[ValueUse]>>,
@@ -224,6 +276,11 @@ impl<K> LoweredInstruction<K> {
 }
 
 /// Authoritative dense compiler IR consumed by planning and execution.
+///
+/// `values` and `instructions` are index-parallel to their dense IDs;
+/// `outputs` lists the values that must remain materialized through
+/// invocation completion. The `PhantomData<fn() -> M>` marker ties the
+/// memory-space type to the value records without owning one.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct LoweredProgram<K, M, V = ValueDecl<M>> {
     pub values: Box<[V]>,

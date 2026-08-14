@@ -5,16 +5,19 @@ import { Duration, Effect } from "effect"
 import fs from "node:fs"
 import { BLOCK, CHECKPOINT, createGpt, heldOutLoss, loadBin, loadTokenizer, saveParams, windows } from "./model.js"
 
-// FineWeb pre-training: trains the shared GPT on the token bins produced
-// by prepare.ts (~745M GPT-2 BPE tokens, u16), reports a held-out loss
-// estimate, and saves the trained parameters to a safetensors checkpoint
-// for infer.ts.
+// FineWeb pilot training over the u16 token streams produced by prepare.ts.
+// `CKPT` is a resumable training archive; after training, `CHECKPOINT` is a
+// separate bare-parameter artifact consumed by generate.ts and other model
+// loaders.
 //
-// Training checkpoints every CHECKPOINT_EVERY steps: one safetensors
-// file holding the parameters, the AdamW state, the global step, and the
-// data sampler's permutation (see Checkpoint), so an interrupted run
-// resumes bit-exactly — same optimizer moments, same step numbering,
-// same data layout.
+// Every checkpoint chunk atomically replaces one safetensors file containing
+// parameters, AdamW tensor state, global step, and the sampler's current
+// permutation/cursor. Resume preserves the remaining draws in that permutation,
+// but JavaScript RNG state is not persisted, so later epoch reshuffles need not
+// match an uninterrupted run. The archive also carries no model, optimizer,
+// learning-rate, or code-version provenance; those must remain compatible.
+// FINEWEB_STEPS and FINEWEB_CHECKPOINT_EVERY are parsed with Number and receive
+// no explicit finite/positive-integer validation in this script.
 
 const TRAIN_BIN = new URL("../data/fineweb-train.bin", import.meta.url).pathname
 const VAL_BIN = new URL("../data/fineweb-val.bin", import.meta.url).pathname
@@ -44,8 +47,9 @@ const program = Effect.gen(function*() {
 
   yield* Effect.log(`2) training: adamW lr=${LR}, ${STEPS} steps (checkpoint every ${CHECKPOINT_EVERY})`)
   let sampler: Sampler.Sampler
+  const optimizer = yield* Optimizer.adamW()
   const trainer = yield* Trainer.make(model, {
-    optimizer: yield* Optimizer.adamW(),
+    optimizer,
     lr: LearningRate.constant(LR),
     loss: Loss.crossEntropy,
     data: () =>
@@ -63,8 +67,9 @@ const program = Effect.gen(function*() {
       )
   })
 
-  // Resume when a checkpoint exists: parameters, optimizer state, global
-  // step, and the sampler's permutation all come back exactly as saved.
+  // A training archive takes precedence over a fresh initialization. Restore
+  // validates the saved token geometry and resumes the current permutation;
+  // it cannot reproduce a future reshuffle because Math.random is not saved.
   const samplerConfig = { length: train.length, block: BLOCK, batch: BATCH }
   let params = params0
   let step = 0
@@ -84,6 +89,8 @@ const program = Effect.gen(function*() {
 
   let chunkTarget = Math.min(step + CHECKPOINT_EVERY, STEPS)
   while (step < STEPS) {
+    const previous = params
+    const previousState = resume?.state
     const trained = yield* trainer.train(params, resume)
     params = trained.params
     step = trained.step
@@ -96,6 +103,12 @@ const program = Effect.gen(function*() {
     }
     yield* Effect.log(`checkpoint at step ${step}`)
     chunkTarget = Math.min(step + CHECKPOINT_EVERY, STEPS)
+    yield* Tensor.clearAll(
+      new Set([
+        ...previous.filter(Tensor.isTensor),
+        ...(previousState !== undefined ? optimizer.stateRoots(previousState).filter(Tensor.isTensor) : [])
+      ])
+    )
   }
 
   yield* Effect.log(`3) held-out loss over ${VAL_BATCHES} val batches`)

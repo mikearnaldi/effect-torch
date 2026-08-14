@@ -2,6 +2,25 @@
 //! addmm epilogue — bias rides the kernel's C source with ldc = 0,
 //! broadcast over rows and batch) instead of matmul + broadcast-add.
 //! CPU falls back to composed ops at the call site.
+//!
+//! ## Kernel contract
+//!
+//! - `x` is `[.., M, K]`, `weight` is `[K, N]` (row-major, transposed
+//!   view of the usual `[N, K]` linear weight), `bias` is `[N]`.
+//! - The fused variants additionally select a gemm epilogue: a residual
+//!   add (same-shape C source) or a gelu (erf or tanh approximation),
+//!   optionally dual-storing the pre-activation into a second output
+//!   for the backward pass.
+//! - All dispatch goes through the tiled gemm machinery (`gemm` module)
+//!   including its split-K scratch path when selected by the planner.
+//!
+//! ## Requirements protocol
+//!
+//! `linear_*_requirements` computes the exact shapes, epilogue, and
+//! gemm plan for a call; `precompile_*` warms every pipeline the plan
+//! needs; the `*_into` entry points then validate their arguments
+//! against the requirements and allocate nothing on the device, which
+//! is what allows them to run inside an executable dispatch section.
 
 use crate::runtime::metal::run::MetalTensor;
 
@@ -29,23 +48,43 @@ mod metal {
     use crate::runtime::metal::gemm::{self, Epilogue, GemmRequirements, SplitKScratchRequirement};
     use crate::runtime::metal::run::MetalTensor;
 
+    /// Exact, precomputed plan for one fused linear launch: problem
+    /// dims, epilogue, and the underlying gemm requirements (including
+    /// optional split-K scratch). Produced by [`linear_requirements`]
+    /// and consumed by the `precompile_*`/`*_into` entry points.
     #[derive(Clone, Copy, PartialEq, Eq, Debug)]
     pub struct LinearRequirements {
+        /// Element dtype shared by input, weight, bias, and output.
         pub dtype: DType,
+        /// Rank of the input (≥ 2); leading dims are folded into `batch`.
         pub rank: usize,
+        /// Product of the input's leading dims (batch of gemm problems).
         pub batch: usize,
+        /// Rows of each gemm problem (`x_shape[rank - 2]`).
         pub m: usize,
+        /// Columns of each gemm problem (`weight_shape[1]`).
         pub n: usize,
+        /// Contraction width (`weight_shape[0]` == `x_shape[rank - 1]`).
         pub k: usize,
+        /// Epilogue fused into the gemm (residual and/or gelu).
         pub epilogue: Epilogue,
+        /// Whether tensor-core (simdgroup matrix) gemm was selected.
         pub mma: bool,
+        /// Elements per output tensor.
         pub output_elements: usize,
+        /// Bytes per output tensor.
         pub output_bytes: usize,
+        /// Number of output tensors (1, or 2 for the dual gelu store).
         pub output_count: usize,
+        /// Split-K partial-sum scratch, when the gemm plan uses split-K.
         pub split_k_scratch: Option<SplitKScratchRequirement>,
+        /// The full gemm plan this linear lowers to.
         pub gemm: GemmRequirements,
     }
 
+    /// Plans a fused linear `y = x·W + b` (plus `epilogue`) for the
+    /// given shapes, validating ranks and the K-dim match. `mma`
+    /// requests the tensor-core gemm path when available.
     pub fn linear_requirements(
         dev: &MetalDevice,
         x_shape: &[usize],
@@ -91,6 +130,7 @@ mod metal {
         })
     }
 
+    /// Plans a plain linear (`Epilogue::None`, single output).
     pub fn linear_forward_requirements(
         dev: &MetalDevice,
         x_shape: &[usize],
@@ -115,6 +155,9 @@ mod metal {
         }
     }
 
+    /// Plans a fused linear with an optional residual add and/or gelu
+    /// epilogue. `gelu` is `Some((tanh_approx, dual_store))`; residual
+    /// and gelu are mutually exclusive.
     pub fn linear_forward_fused_requirements(
         dev: &MetalDevice,
         x_shape: &[usize],
@@ -134,6 +177,8 @@ mod metal {
         )
     }
 
+    /// Warms every pipeline the plan needs; returns the number of
+    /// pipelines compiled or fetched from cache.
     pub fn precompile_linear_forward_fused(
         dev: &MetalDevice,
         requirements: &LinearRequirements,
@@ -141,6 +186,8 @@ mod metal {
         gemm::precompile_gemm_fused(dev, &requirements.gemm)
     }
 
+    /// Warms the pipelines for a plain (non-fused) plan; rejects fused
+    /// requirements to catch planner/dispatch mismatches early.
     pub fn precompile_linear_forward(
         dev: &MetalDevice,
         requirements: &LinearRequirements,
@@ -168,6 +215,14 @@ mod metal {
         Ok(())
     }
 
+    /// Non-allocating fused dispatch: validates every argument against
+    /// `requirements` and encodes the gemm into the device's current
+    /// command buffer. `residual` is required iff the plan's epilogue
+    /// is residual; `out2` receives the gelu pre-activation iff the
+    /// plan dual-stores; `split_k_scratch` must match the plan.
+    ///
+    /// Allocates no device memory, so it is safe to call inside an
+    /// executable dispatch section (`begin_executable_dispatch`).
     #[allow(clippy::too_many_arguments)]
     pub fn linear_forward_fused_into(
         dev: &MetalDevice,
@@ -227,6 +282,8 @@ mod metal {
         )
     }
 
+    /// Non-allocating plain dispatch; requires a plan with
+    /// `Epilogue::None` and a single output.
     pub fn linear_forward_into(
         dev: &MetalDevice,
         x: &MetalTensor,
@@ -252,6 +309,8 @@ mod metal {
         )
     }
 
+    /// Allocating convenience wrapper for the plain linear; used
+    /// outside planned executables.
     pub fn linear_forward(
         x: &MetalTensor,
         weight: &MetalTensor,

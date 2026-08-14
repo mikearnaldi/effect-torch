@@ -21,8 +21,8 @@ const makeGpt = (options: { readonly causal?: boolean } = {}) =>
     return yield* Model.chain(embeddings, attn, head)
   })
 
-// The RoPE variant: relative positions, no position table — the model
-// sliding-window attention is trained for.
+// The RoPE variant has no absolute position table. Resetting a retained window
+// to positions 0..window-1 preserves its relative offsets.
 const makeRopeGpt = Effect.gen(function*() {
   const wte = yield* Model.embedding("wte", VOCAB, EMBED)
   const attn = yield* Model.multiHeadAttention("attn", EMBED, HEADS, { causal: true, rope: 10000 })
@@ -116,6 +116,33 @@ const cachedGenerate = (
 
 onDevices("Inference", () => (it) => {
   describe("Model.inference", () => {
+    it.effect("preserves the last-token-row policy in the completed decode schema", () =>
+      Effect.gen(function*() {
+        const root = yield* Tensor.zeros([1, 2, 3])
+        const compile = (lastTokenRow?: boolean) =>
+          Tensor.compileDecodeProgram([root], {
+            maxTokens: 4,
+            blockSize: 2,
+            kvDtype: "f32",
+            batch: 1,
+            ...(lastTokenRow === undefined ? {} : { lastTokenRow })
+          })
+
+        const selected = yield* compile(true)
+        expect(selected.lastTokenRow).toBe(true)
+        expect(selected.handle.state?.lastTokenRow).toBe(true)
+        expect(selected.outputs[0]?.shape).toEqual([3])
+
+        const retained = yield* compile(false)
+        expect(retained.lastTokenRow).toBe(false)
+        expect(retained.handle.state?.lastTokenRow).toBe(false)
+        expect(retained.outputs[0]?.shape).toEqual([1, 2, 3])
+
+        const omitted = yield* compile()
+        expect(omitted.lastTokenRow).toBeUndefined()
+        expect(omitted.handle.state?.lastTokenRow).toBeUndefined()
+      }))
+
     it.effect("legacy window retains history for mixed local/full attention", () =>
       Effect.gen(function*() {
         const qExemplar = yield* Tensor.zeros([1, 4, 4, 1])
@@ -251,8 +278,8 @@ onDevices("Inference", () => (it) => {
         const gen = yield* program.generation()
         yield* gen.add(yield* ids(Array.from({ length: 16 }, (_, i) => i % VOCAB))) // all 4 blocks
         expect(yield* gen.live()).toBe(1)
-        // The failed run allocated nothing; after finishing the first
-        // sequence, the same prompt fits the pool.
+        // A failed admission must roll back its temporary sequence and blocks;
+        // the original live sequence remains the sole pool owner.
         const error = yield* Effect.flip(gen.add(yield* ids([1, 2, 3, 4, 5, 6, 7, 8])))
         expect(error.message).toMatch(/pool exhausted/)
         expect(yield* gen.live()).toBe(1)
@@ -415,9 +442,10 @@ onDevices("Inference", () => (it) => {
         expect(sequentialA).toEqual(sequentialB)
       }))
 
-    // Half-precision pools (RFC 0012): rows quantized on write, widened
-    // on read. Teacher-forced — both sides see the same context — so
-    // the comparison is logits closeness, not argmax luck.
+    // Reduced-precision pools quantize rows on write and widen on read. Both
+    // sides are teacher-forced through identical contexts, avoiding argmax
+    // instability; bounds widen from f16 through bf16 to per-row int8 as cache
+    // quantization error accumulates in later logits.
     const halfPoolParity = (kvDtype: "f16" | "bf16" | "int8", tol: number) =>
       Effect.gen(function*() {
         const model = yield* makeGpt()
@@ -750,6 +778,9 @@ onDevices("Inference", () => (it) => {
         }
         const model = yield* makeGpt({ causal: false })
         const params = yield* Tensor.compute(yield* model.init)
+        // The baseline includes caller-owned params. Returning to it proves the
+        // failed artifact released only its retained generation; readability
+        // below proves it did not consume the caller's handles.
         const before = yield* diagnostics.externalMemoryBytes
         yield* Effect.flip(Model.inference(model, params, { maxTokens: 16, blockSize: 4 }))
         expect(yield* diagnostics.externalMemoryBytes).toBe(before)
@@ -765,6 +796,8 @@ onDevices("Inference", () => (it) => {
         }
         const model = yield* makeGpt({ causal: false })
         const params = yield* model.init
+        // Lazy params own no storage at this baseline; inference materializes a
+        // private generation that must be wholly released on construction error.
         const before = yield* diagnostics.externalMemoryBytes
         yield* Effect.flip(Model.inference(model, params, { maxTokens: 16, blockSize: 4 }))
         expect(yield* diagnostics.externalMemoryBytes).toBe(before)

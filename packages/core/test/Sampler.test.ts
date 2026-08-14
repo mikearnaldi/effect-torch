@@ -4,13 +4,14 @@ import { Sampler } from "../src/index.ts"
 
 const config = { length: 4 * 8 + 1, block: 8, batch: 2 }
 
+// Persisted state is a permutation plus a batch-aligned cursor. Restore
+// preserves remaining draws before a reshuffle and snapshots caller inputs.
 it.effect("every window exactly once in a divisible epoch, reshuffled at the boundary", () =>
   Effect.gen(function*() {
     const sampler = yield* Sampler.make(config)
     const first: Array<number> = []
     for (let i = 0; i < 2; i++) first.push(...sampler.next())
     expect(first.slice().sort((a, b) => a - b)).toEqual([0, 8, 16, 24])
-    // the epoch boundary: the next draw starts a new permutation
     const second = sampler.next()
     expect(second.every((start) => start % 8 === 0 && start < 32)).toBe(true)
   }))
@@ -40,6 +41,21 @@ it.effect("restore continues the permutation exactly where it stopped", () =>
     expect(restored.next()).toEqual(expected)
     expect(before).not.toEqual(expected)
     expect(restored.state().epoch).toBe(state.epoch)
+  }))
+
+it.effect("wraps the persisted epoch within the positive u32 range", () =>
+  Effect.gen(function*() {
+    const rolloverConfig = { length: 4, block: 1, batch: 2 }
+    const sampler = yield* Sampler.restore(rolloverConfig, {
+      _tag: "SamplerState",
+      config: rolloverConfig,
+      order: new Uint32Array([0, 1, 2]),
+      cursor: 2,
+      epoch: 0xffff_ffff
+    })
+    expect(sampler.next()).toHaveLength(2)
+    expect(sampler.state()).toMatchObject({ cursor: 2, epoch: 1 })
+    yield* Sampler.restore(rolloverConfig, sampler.state())
   }))
 
 it.effect("rejects impossible configs and mismatched states", () =>

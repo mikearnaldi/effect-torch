@@ -8,38 +8,91 @@
 //! natively; int8 slabs dequantize in registers with the per-(token,
 //! head) scale slab (RFC 0012). The primitive scatter+gather reference in
 //! lib.rs remains the reference and the CPU fallback.
+//!
+//! ## Cache invariants
+//!
+//! - The pool is a pair of slabs `[pool_rows, H_kv, D]` (or
+//!   `[pool_rows, H_kv * D]`) in `slab_dtype`; row addresses are
+//!   computed device-side from the per-slot block table
+//!   (`tables [B, maxBlocks] u32`), `ctxlens [B] u32` (post-run
+//!   frontier), `block_bases [B] u32` (first visible table index), and
+//!   `block_size`.
+//! - **Scatter** (`et_paged_scatter`): one threadgroup of one simdgroup
+//!   (32 threads) per (slot, head) writes rows `ctxlens[b] - advance
+//!   .. ctxlens[b]` of the new-token chunk into the slabs. Int8 slabs
+//!   quantize with an in-threadgroup absmax scale (`absmax/127 + eps`,
+//!   round, +128 offset) stored per (physical row, head).
+//! - **Attention** (`et_paged_decode`): one threadgroup of 128 threads
+//!   per (slot, head, chunk row); q is staged in threadgroup memory,
+//!   K/V rows stream through the table with 128-bit vector loads
+//!   (requires `D % 4 == 0` for the vector path; scalar fallback
+//!   otherwise), and each thread keeps a local online softmax
+//!   `(m, l, acc[D])` folded across simdgroups via shuffles and a
+//!   shared-memory combine. Causality is per chunk row: row `p`
+//!   attends through `cursor + p` (pads clamp to the real frontier).
+//! - Grouped-query attention maps query head `h` to K/V head
+//!   `h / (H_q / H_kv)`; `H_q` must be a multiple of `H_kv`.
+//! - A sliding `window` (0 = disabled) restricts the attended range to
+//!   `[ctx - window, ctx)`.
+//!
+//! The `*_into` entry points allocate nothing, require empty resource
+//! views, and need their exact pipelines pre-warmed.
 
-/// Whether the paged kernel can run this decode step: Metal, f32/// compute, head dim within the kernel's register budget, slabs in a
-/// supported storage dtype.
 use crate::runtime::dtype::DType;
 
+/// Planner-facing requirements of the paged scatter launch (writes
+/// new-token rows into the slabs in place; no outputs of its own).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ScatterRequirements {
+    /// Slab storage dtype (f32/f16/bf16, or u8 for int8-quantized).
     pub slab_dtype: DType,
+    /// Head dimension `D`.
     pub head_dim: usize,
+    /// Always 0: the scatter writes the slabs in place.
     pub output_bytes: usize,
+    /// Always 0: slab writes ARE the state transaction.
     pub state_next_bytes: usize,
+    /// Always 0: no staging views.
     pub staging_bytes: usize,
+    /// Always 0: no runtime status.
     pub status_bytes: usize,
+    /// Always 0: no scratch workspace.
     pub scratch_bytes: usize,
+    /// Always 1: a single scatter kernel per launch.
     pub pipeline_count: usize,
 }
 
+/// Planner-facing requirements of a paged attention (decode) launch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AttentionRequirements {
+    /// Slab storage dtype (f32/f16/bf16, or u8 for int8-quantized).
     pub slab_dtype: DType,
+    /// Head dimension `D` (≤ 128 for the kernel's register budget).
     pub head_dim: usize,
+    /// Query heads `H_q`.
     pub query_heads: usize,
+    /// K/V heads `H_kv` (must divide `H_q`).
     pub kv_heads: usize,
+    /// Softmax scale, stored as `f64::to_bits` so requirements stay
+    /// `Eq` and hashable for pipeline keys.
     pub scale_bits: u64,
+    /// Bytes of the f32 `[B, H_q, C, D]` output.
     pub output_bytes: usize,
+    /// Always 0: attention does not mutate the cache.
     pub state_next_bytes: usize,
+    /// Always 0: no staging views.
     pub staging_bytes: usize,
+    /// Always 0: no runtime status.
     pub status_bytes: usize,
+    /// Always 0: no scratch workspace (accumulators live in registers
+    /// and threadgroup memory).
     pub scratch_bytes: usize,
+    /// Always 1: a single decode kernel per launch.
     pub pipeline_count: usize,
 }
 
+/// Requirements of a scatter of `batch × heads × chunk × head_dim`
+/// new-token rows into slabs of `slab_dtype`.
 pub fn scatter_requirements(
     slab_dtype: DType,
     batch: usize,
@@ -72,6 +125,10 @@ pub fn scatter_requirements(
     })
 }
 
+/// Requirements of a paged attention launch over `batch` slots,
+/// `chunk` query rows each, with the given head geometry and softmax
+/// `scale`. Validates GQA divisibility and computes the f32 output
+/// size with overflow checks.
 pub fn attention_requirements(
     slab_dtype: DType,
     batch: usize,
@@ -113,6 +170,8 @@ pub fn attention_requirements(
     })
 }
 
+/// Alias of [`attention_requirements`] for the decode-step call site
+/// (chunk = 1 in decode; the same kernel serves chunked prefill).
 pub fn decode_requirements(
     slab_dtype: DType,
     batch: usize,
@@ -160,6 +219,9 @@ mod requirement_tests {
     }
 }
 
+/// Whether the paged kernel can run this decode step: Metal, f32
+/// compute, head dim within the kernel's register budget, slabs in a
+/// supported storage dtype.
 pub fn is_supported(
     q: &crate::runtime::metal::run::MetalTensor,
     slab_dtype: DType,
@@ -187,14 +249,21 @@ mod metal {
 
     use objc2_metal::MTLComputeCommandEncoder;
 
+    /// Borrowed resource views supplied by the executable planner. Both
+    /// paged kernels operate entirely on their explicit arguments, so
+    /// every slice must be empty; see [`IntoResources::empty`].
     #[derive(Clone, Copy)]
     pub struct IntoResources<'a> {
+        /// Must be empty.
         pub staging: &'a [MetalTensor],
+        /// Must be empty.
         pub status: &'a [MetalTensor],
+        /// Must be empty.
         pub scratch: &'a [MetalTensor],
     }
 
     impl IntoResources<'_> {
+        /// The (only) valid resource set for paged dispatches.
         pub const fn empty() -> Self {
             Self {
                 staging: &[],
@@ -344,9 +413,8 @@ kernel void et_paged_scatter(
         hasher.finish()
     }
 
-    // Fused batched scatter: k_new/v_new [B, H, C, D] f32 (C = 1 for
-    // decode, the chunk for prefill); write rows per slot are
-    // ctxlens[b] - advance .. ctxlens[b].
+    /// Warms the scatter and attention pipelines for every supported
+    /// slab dtype; returns the number of pipelines compiled or fetched.
     #[allow(clippy::too_many_arguments)]
     pub fn warm_all(
         d: usize,
@@ -365,6 +433,7 @@ kernel void et_paged_scatter(
         Ok(count)
     }
 
+    /// Warms the scatter pipeline for (`head_dim`, `slab_dtype`).
     pub fn warm_scatter(d: usize, slab_dtype: DType) -> crate::err::Res<()> {
         MetalDevice::get().compile_lazy(scatter_key(d, slab_dtype), "et_paged_scatter", || {
             scatter_source(d, slab_dtype)
@@ -372,10 +441,13 @@ kernel void et_paged_scatter(
         Ok(())
     }
 
+    /// Warms exactly the scatter pipeline described by `requirements`.
     pub fn warm_scatter_exact(requirements: &super::ScatterRequirements) -> crate::err::Res<()> {
         warm_scatter(requirements.head_dim, requirements.slab_dtype)
     }
 
+    /// Warms the attention pipeline for the given head geometry, slab
+    /// dtype, and softmax scale.
     pub fn warm_attention(
         d: usize,
         query_heads: usize,
@@ -387,6 +459,7 @@ kernel void et_paged_scatter(
         Ok(())
     }
 
+    /// Warms exactly the attention pipeline described by `requirements`.
     pub fn warm_attention_exact(
         requirements: &super::AttentionRequirements,
     ) -> crate::err::Res<()> {
@@ -399,6 +472,12 @@ kernel void et_paged_scatter(
         )
     }
 
+    /// Non-allocating fused batched scatter: `k_new`/`v_new [B, H, C,
+    /// D]` f32 (C = 1 for decode, the chunk for prefill) are written
+    /// into the slabs at rows `ctxlens[b] - advance .. ctxlens[b]` per
+    /// slot. `k_scales`/`v_scales` are required iff the slabs are int8.
+    /// Allocates nothing; requires the exact scatter pipeline to be
+    /// warm.
     #[allow(clippy::too_many_arguments)]
     pub fn scatter_into(
         k_new: &MetalTensor,
@@ -480,6 +559,8 @@ kernel void et_paged_scatter(
         Ok(())
     }
 
+    /// Allocating convenience wrapper around [`scatter_into`] (makes
+    /// inputs contiguous and warms the pipeline first).
     #[allow(clippy::too_many_arguments)]
     pub fn scatter(
         k_new: &MetalTensor,
@@ -759,11 +840,13 @@ kernel void et_paged_decode(
         )
     }
 
-    // One launch for the whole batch: q [B, H, C, D] contiguous
-    // (C = 1 for decode, the chunk for prefill), tables
-    // [B, maxBlocks] u32, ctxlens [B] u32 (post-run frontier; the
-    // kernel derives per-row causal lengths from `advance`). Returns
-    // [B, H, C, D] f32.
+    /// Non-allocating paged attention: one launch for the whole batch.
+    /// `q [B, H, C, D]` f32 contiguous (C = 1 for decode, the chunk for
+    /// prefill), `tables [B, maxBlocks]` u32, `ctxlens [B]` u32
+    /// (post-run frontier; the kernel derives per-row causal lengths
+    /// from `advance`), `block_bases [B]` u32. `output` must be
+    /// contiguous f32 `[B, H, C, D]`. Allocates nothing; requires the
+    /// exact attention pipeline to be warm.
     #[allow(clippy::too_many_arguments)]
     pub fn attention_into(
         q: &MetalTensor,
@@ -861,6 +944,8 @@ kernel void et_paged_decode(
         Ok(())
     }
 
+    /// Decode-step alias of [`attention_into`]; identical kernel and
+    /// contract, named for the decode call site.
     #[allow(clippy::too_many_arguments)]
     pub fn decode_into(
         q: &MetalTensor,
@@ -896,6 +981,8 @@ kernel void et_paged_decode(
         )
     }
 
+    /// Allocating convenience wrapper around [`decode_into`]; returns
+    /// the f32 `[B, H, C, D]` attention output.
     #[allow(clippy::too_many_arguments)]
     pub fn decode(
         q: &MetalTensor,

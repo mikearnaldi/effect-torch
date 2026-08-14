@@ -1,3 +1,8 @@
+/**
+ * Apple Metal package entry point. Importing this module is platform-safe:
+ * native selection stays deferred until {@link isAvailable}, {@link makeRuntime},
+ * or {@link layer} is evaluated.
+ */
 import { Runtime } from "@effect-torch/core"
 import { Effect, Layer } from "effect"
 import { makeRuntime as makeRuntimeAdapter } from "./internal/adapter.js"

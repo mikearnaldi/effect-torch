@@ -17,6 +17,8 @@ const sumOf = (
 ): ScalarFn =>
 (x) => Effect.flatMap(op(x), (t) => Tensor.sum(t))
 
+// Central differences run in f32 on each real backend. The shared epsilon
+// clears f32 rounding while the tolerance covers rounding and O(eps^2) error.
 const gradcheck = (f: ScalarFn, input: ReadonlyArray<number>, shape: ReadonlyArray<number>) =>
   Effect.gen(function*() {
     const x = yield* Tensor.fromTypedArray(floats(input), shape)

@@ -7,6 +7,8 @@ import { floats, onDevices, TOL } from "./utils/devices.ts"
 const values = (t: Tensor.Any) =>
   Effect.map(Tensor.toTypedArray(t), (arr) => Array.from<number | bigint>(arr).map(Number))
 
+// Fusion is selected from a process-global compiler input. Bracketing prevents
+// one oracle arm, failure included, from changing later compilations.
 const withFusion = <A, E, R>(enabled: boolean, effect: Effect.Effect<A, E, R>): Effect.Effect<A, E, R> =>
   Effect.acquireUseRelease(
     Effect.sync(() => {

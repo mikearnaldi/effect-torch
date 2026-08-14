@@ -1,39 +1,43 @@
 /**
- * Models pair pure parameter construction with a parameterised forward graph
- * builder — the Flax/Haiku design, flattened:
- * parameters are always a flat array of tensors, configuration lives in
- * the factory's closure, and the forward graph is an ordinary lazy graph,
- * so {@link Gradient.grad} differentiates it and an optimizer's `step`
- * updates it with zero model-specific code. There is no mutable module
- * state or backward mode. Each model object also lazily owns mutable
- * compiled-program cache state exposed through {@link Model.stats} and
- * {@link Model.clear}.
+ * Pure model graphs, ordinary compiled execution, and stateful generation.
  *
- * Everything that can fail returns an `Effect`: factories validate their
- * configuration (positive integer feature counts, unique parameter names)
- * into a {@link ModelError}; parameterized forwards check parameter arity;
- * and serialization reports arity and missing-key problems in the error
- * channel. Training lives in the `Trainer` module.
+ * A {@link Model} separates architecture from values. Its `parameters` catalog
+ * defines a stable flat order, `init` constructs values in that order, and
+ * `forward` extends the current lazy tensor graph from a parameter array and one
+ * input. Configuration is captured by constructors rather than stored in a
+ * mutable module tree. The resulting graph can be composed, differentiated by
+ * {@link Gradient.grad}, and updated by an optimizer without model-specific
+ * adapters. Models have no train/eval mode or non-parameter state; notably,
+ * {@link dropout} always applies, so evaluation should use a chain without it.
  *
- * Constructors cover dense and convolutional layers, token and position
- * embeddings, normalization, multi-head attention, activations, dropout,
- * flattening, and pooling. {@link chain}, {@link merge}, {@link add},
- * {@link residual}, {@link mapInput}, and {@link checkpoint} compose them.
- * `names` gives every parameter a stable, checkpoint-friendly identity
- * mapped by {@link save} and {@link load}. Every model also carries a
- * compiled execution path:
- * {@link Model.execute} runs the forward as a cached native executable,
- * traced on a signature miss and reused until eviction or clearing, while
- * {@link Model.forward} stays the lazy graph builder for training,
- * composition, and differentiation. {@link inference} builds the separate
- * paged-KV artifact used for autoregressive generation.
+ * There are two distinct compiled paths. {@link Model.execute} lazily traces the
+ * ordinary forward graph per runtime and input-metadata signature, retaining a
+ * small JavaScript LRU on that model object. It is suitable for repeated
+ * stateless evaluation, while `forward` remains the path for composition,
+ * training, and differentiation. {@link inference} instead materializes and
+ * freezes one parameter generation, eagerly compiles fixed-shape prefill and
+ * decode programs, and creates one shared decode-state pool. KV arenas and
+ * prefix-cache content are pool-wide, while recurrent state belongs to each
+ * sequence. That
+ * {@link InferenceProgram} is a separate artifact, not an entry in the model's
+ * `execute` cache and not reflected by `Model.stats`.
  *
- * Stateful layers (batchnorm running stats) are deliberately absent: the
- * pure design keeps non-trainable state out of the parameter array until
- * the `stateRoots`/`rebuildState` contract generalizes to models. Note
- * that {@link dropout} is the functional form — it always applies; build
- * the evaluation chain without it (parameterless stages add nothing to
- * the array, so one checkpoint serves both chains).
+ * Generation has three ownership levels. The inference artifact retains frozen
+ * parameters, immutable native programs, and the shared pool; each
+ * {@link Generation} session tracks its own live sequences; each
+ * {@link GenerationSeq} owns a mutable cursor, block references, and any
+ * recurrent state. Full KV blocks are addressed by chained token-prefix hashes
+ * across every session of one artifact. Finished or window-evicted blocks can
+ * remain as reclaimable LRU prefix-cache entries, so releasing a sequence drops
+ * its live references but does not necessarily erase cached content.
+ *
+ * Constructors perform targeted configuration checks and standard combinators
+ * enforce flat parameter arity and name uniqueness. This module does not
+ * generally prove that parameter tensors match {@link ParameterSpec}, that a
+ * custom {@link Definition} honors its catalog, that token ids fit a model's
+ * vocabulary, or that a graph is supported by a particular backend. Those
+ * errors remain graph-build, compilation, or execution failures. Training
+ * orchestration lives in the `Trainer` module.
  *
  * @since 0.1.0
  */
@@ -43,11 +47,14 @@ import * as Runtime from "./Runtime.ts"
 import * as Tensor from "./Tensor.ts"
 
 /**
- * A failure in model construction, parameter arity, or serialization:
+ * A failure in model construction, parameter arity, or serialization, such as
  * invalid layer configuration, duplicate parameter names, an incorrect
- * parameter count, or a missing checkpoint key. The tagged payload has an
- * operation label and a human-readable message; tensor-operation failures
- * stay {@link Tensor.TensorError}s.
+ * parameter count, or a missing checkpoint key. Tensor graph, compilation,
+ * backend, and ownership failures remain {@link Tensor.TensorError}s.
+ *
+ * `op` is diagnostic rather than an exhaustive discriminant. In particular,
+ * common parameter-arity checks use `"forward"` and identify the calling
+ * operation in `message`.
  *
  * @since 0.1.0
  * @category errors
@@ -66,15 +73,20 @@ export class ModelError extends Data.TaggedError("ModelError")<{
  * @category models
  */
 export interface ParameterSpec {
-  /** Stable parameter identity. */
+  /** Stable checkpoint key and parameter-array identity. */
   readonly name: string
-  /** Logical tensor shape, independent of its physical storage. */
+  /**
+   * Declared logical shape, independent of encoded physical storage. The
+   * catalog is descriptive: `forward`, {@link save}, and {@link load} do not
+   * universally compare supplied tensors against it.
+   */
   readonly shape: ReadonlyArray<number>
 }
 
 /**
- * A model's parameters in {@link Model.parameters} order. Its length is
- * the model arity; parameterless models use the empty array.
+ * A model's parameter values in {@link Model.parameters} order. The array
+ * length is the model arity; parameterless models use `[]`. Values may be lazy
+ * graph nodes or materialized tensors unless a narrower API says otherwise.
  *
  * @since 0.1.0
  * @category models
@@ -82,20 +94,21 @@ export interface ParameterSpec {
 export type Params = ReadonlyArray<Tensor.Any>
 
 /**
- * A model: stable parameter identities, an initializer that builds the
- * initial parameters as lazy graph values, and a forward function that
- * extends the graph — parameters and input in, lazy output out.
+ * A pure architecture plus a lazily allocated ordinary-execution cache.
+ * Parameters are a flat array in `parameters`/`names` order. The model borrows
+ * parameter and input handles; ownership transfers only for concrete outputs
+ * explicitly returned by `execute` or generation APIs.
  *
- * Parameters are a flat array of tensors in `names` order, so the existing
- * training path (`Gradient.grad` followed by an optimizer step) works on any
- * model with zero adapter code. Storage precision is tensor metadata and does
- * not change the model parameter contract.
+ * The parameter catalog records identities and logical shapes but is not a
+ * runtime schema validator. Built-in layers validate tensors while constructing
+ * their graph; custom definitions are responsible for making `init`,
+ * `parameters`, and `forward` agree.
  *
  * @since 0.1.0
  * @category models
  */
 export interface Model {
-  /** Logical parameter specifications in parameter-array order. */
+  /** Logical parameter specifications in flat parameter-array order. */
   readonly parameters: ReadonlyArray<ParameterSpec>
   /**
    * Stable parameter identities, one per parameter, in the same order
@@ -104,64 +117,79 @@ export interface Model {
    */
   readonly names: ReadonlyArray<string>
   /**
-   * Builds the initial parameters as lazy graph values. Materialize them
-   * once with {@link Tensor.compute} before retaining them across separate
-   * evaluations; {@link inference} performs that materialization eagerly.
+   * Builds one initial parameter generation, usually as lazy graph values.
+   * Materialize all roots together with {@link Tensor.compute} before retaining
+   * them across evaluations so random initializer nodes are sampled once.
+   * {@link inference} performs this materialization itself and retains an
+   * independent concrete generation.
    */
   readonly init: Effect.Effect<Params, ModelError | Tensor.TensorError, Runtime.Runtime>
   /**
-   * Extends the graph: parameters and input in, lazy output out.
-   * Single-input, single-output; differentiated as-is by
-   * `Gradient.grad`. Parameterized layers and arity-aware combinators fail
-   * with a {@link ModelError} if `params.length` is wrong. A directly
-   * invoked parameterless constructor ignores the array, but callers
-   * should still pass `[]`; {@link Model.execute} always enforces arity.
+   * Extends the lazy graph: borrowed parameters and one input in, one lazy
+   * output out. No evaluation or ownership transfer is implied. Built-in
+   * parameterized layers and arity-aware combinators fail with a
+   * {@link ModelError} if `params.length` is wrong. A directly invoked
+   * parameterless constructor ignores the array, but callers should still pass
+   * `[]`; {@link Model.execute} and {@link inference} enforce top-level arity.
    */
   readonly forward: (
     params: Params,
     input: Tensor.Any
   ) => Effect.Effect<Tensor.Lazy, ModelError | Tensor.TensorError, Runtime.Runtime>
   /**
-   * Runs the compiled forward program: parameters and input in,
-   * materialized output out. With concrete inputs, each invocation makes one
-   * native program call after the first call per signature pays the trace;
-   * lazy inputs are first materialized through the common executable path. The
-   * cache signature includes runtime identity and every parameter and input
-   * tensor's shape, dtype, storage encoding, and placement; values do not affect
-   * it. Any signature change traces a new program automatically. Ready entries
-   * use a 32-entry LRU, so
-   * eviction, clearing, or a failed trace can retrace a previously seen
-   * signature. `execute` borrows and does not retain parameter
-   * values, so materialize lazy initializers once before repeated calls. Use it
-   * for evaluation loops; use `forward` wherever a graph is being built
-   * (training, composition, differentiation). The returned concrete output is
-   * caller-owned and should be released with {@link Tensor.clear} when unused.
+   * Runs the ordinary compiled forward path and returns one materialized output.
+   * The first call for a runtime and ordered parameter/input metadata signature
+   * traces placeholders through `forward`; later calls reuse the immutable
+   * executable. The signature contains runtime identity, placement id, shape,
+   * dtype, and encoded-storage metadata, but not tensor values or handle
+   * identity. Ready entries use a 32-entry LRU. Failed traces, eviction, or
+   * clearing can therefore retrace a previously seen signature.
+   *
+   * Concrete arguments execute in one native program invocation. Lazy arguments
+   * are first materialized and can require additional work. Arguments are
+   * borrowed and are not retained as constants; materialize a lazy initializer
+   * once before an evaluation loop. Calls are independently executable and may
+   * overlap. The returned concrete output is caller-owned and should be released
+   * exactly once with {@link Tensor.clear} when unused. Use `forward`, not
+   * `execute`, while building a graph for training or differentiation.
    */
   readonly execute: (
     params: Params,
     input: Tensor.Any
   ) => Effect.Effect<Tensor.Concrete, ModelError | Tensor.TensorError, Runtime.Runtime>
   /**
-   * JavaScript signature-cache diagnostics. `compiled` counts trace attempts,
-   * including failures and retraces, rather than native cold compilations.
+   * Snapshot of this model's ordinary JavaScript signature cache. `cached`
+   * includes ready and in-flight entries. `compiled` is the cumulative number
+   * of trace attempts, including failures and retraces, not native cold
+   * compilations, inference-program compilations, or backend pipeline entries.
    */
   readonly stats: Effect.Effect<Tensor.CompileStats>
   /**
-   * Clears JavaScript forward-program entries without clearing parameters,
-   * outputs, native caches, or the cumulative trace-attempt count.
+   * Drops current ordinary JavaScript forward-cache entries and signature
+   * history. It does not clear parameters, outputs, inference artifacts, native
+   * structural/pipeline caches, or the cumulative trace-attempt count. An
+   * already in-flight trace may insert its result after this effect completes.
    */
   readonly clear: Effect.Effect<void>
 }
 
 /**
- * A public model definition. Omitting `init` creates a load-only model.
+ * A custom model definition. {@link define} validates only the parameter
+ * catalog: names must be nonempty and unique, and shape dimensions must be
+ * non-negative safe integers. It does not execute `init` or `forward`, compare
+ * initialized tensors with the catalog, freeze/copy the supplied arrays, or
+ * validate backend support. Omitting `init` creates a load-only model whose
+ * `model.init` fails with a {@link ModelError}.
  *
  * @since 0.1.0
  * @category models
  */
 export interface Definition {
+  /** Parameter catalog in the exact flat order accepted by `forward`. */
   readonly parameters: ReadonlyArray<ParameterSpec>
+  /** Optional lazy initializer returning values in `parameters` order. */
   readonly init?: Effect.Effect<Params, Tensor.TensorError, Runtime.Runtime>
+  /** Pure lazy graph builder; responsible for its own tensor and arity checks. */
   readonly forward: Model["forward"]
 }
 
@@ -177,26 +205,36 @@ type ModelInternal =
   }
   & { _fn: Tensor.CompiledFn<ModelError | Tensor.TensorError, Runtime.Runtime> | undefined }
 
-// Every model is compiled: `execute` runs the forward as a frozen
-// program on the shared prototype; the program cache is created on the
-// first execute and the trace runs on the first call per input
-// signature, so constructors stay device-free.
+// The shared prototype keeps model values small. Each instance allocates its
+// own CompiledFn on first execute; that function then traces once per metadata
+// signature, so model construction itself remains runtime- and device-free.
 const ModelProto = {
   execute(this: ModelInternal, params: Params, input: Tensor.Any) {
     const self = this
-    return Effect.gen(function*() {
-      yield* checkArity("execute", self.names, params)
-      if (self._fn === undefined) {
-        self._fn = yield* Tensor.compile<ModelError | Tensor.TensorError, Runtime.Runtime>(
-          (inputs) =>
-            Effect.map(
-              self.forward(inputs.slice(0, -1), inputs[inputs.length - 1]),
-              (output) => [output]
+    return Effect.suspend(() => {
+      let owned: ReadonlyArray<Tensor.Concrete> = []
+      return Effect.onExit(
+        Effect.gen(function*() {
+          yield* checkArity("execute", self.names, params)
+          if (self._fn === undefined) {
+            self._fn = yield* Tensor.compile<ModelError | Tensor.TensorError, Runtime.Runtime>(
+              (inputs) =>
+                Effect.map(
+                  self.forward(inputs.slice(0, -1), inputs[inputs.length - 1]),
+                  (output) => [output]
+                )
             )
-        )
-      }
-      const [output] = yield* self._fn.call([...params, input])
-      return output
+          }
+          const [output] = yield* Effect.uninterruptibleMask((restore) =>
+            Effect.tap(
+              restore(self._fn!.call([...params, input])),
+              (outputs) => Effect.sync(() => void (owned = outputs))
+            )
+          )
+          return output
+        }),
+        (exit) => Exit.isFailure(exit) ? Effect.ignore(Tensor.clearAll(owned)) : Effect.void
+      )
     })
   },
   get stats() {
@@ -220,7 +258,9 @@ const make = (def: ModelDef): Model => {
 }
 
 /**
- * Validates and constructs a model with the standard compiled execution path.
+ * Validates a custom parameter catalog and constructs a model with the standard
+ * ordinary compiled-execution path. This does not validate initializer output,
+ * forward behavior, tensor shape/dtype compatibility, or inference support.
  *
  * @since 0.1.0
  * @category constructors
@@ -455,7 +495,8 @@ export const conv2d = (
  * initialized row is returned normally (it is not zeroed) but receives no
  * gradient. Fails with a {@link ModelError} on an empty name, counts that
  * are not positive integers, or a `paddingIndex` that is not an integer in
- * `[0, numEmbeddings)`.
+ * `[0, numEmbeddings)`. Index dtype, placement, and bounds are checked by the
+ * tensor graph/backend rather than by this constructor.
  *
  * @since 0.1.0
  * @category constructors
@@ -506,6 +547,8 @@ export const embedding = (
  * `names = ["<name>.weight"]`, initialized unit-normal. Fails with a
  * {@link ModelError} on an empty name, counts that are not positive
  * integers, or an input whose sequence length exceeds `maxPositions`.
+ * A zero-length/rank-zero input reaches the tensor/backend position-operation
+ * checks rather than this constructor's upper-bound check.
  * Compiled inference offsets each gather by the sequence cursor, so the
  * total absolute cursor, including positions evaluated for padded prefill
  * chunks, must remain within `maxPositions`; an attention window does not
@@ -606,13 +649,13 @@ export interface MultiHeadAttentionOptions {
   readonly causal?: boolean
   /**
    * Applies RoPE to q and k per head with this theta base (for example,
-   * 10000). Use a positive finite base; it is not validated here. RoPE itself
-   * introduces no learned-position-table limit, but a separately composed
-   * position embedding still does. Cached generation can outgrow `maxTokens`
-   * only when inference also uses an attention window that evicts old KV
-   * blocks, and remains subject to backend numeric and resource limits. The
-   * per-head dimension must be even and the attention input must be f32 or
-   * bf16 when RoPE is enabled.
+   * `10000`). Use a positive finite base; this constructor passes it through
+   * without validation. RoPE has no learned table limit, but a separately
+   * composed position embedding still does. In compiled generation, positions
+   * are offset by the sequence's absolute cursor. Generation can outgrow the
+   * pool's finite row capacity only when every attention operation permits the
+   * configured window to evict old blocks. Per-head width and dtype constraints
+   * are tensor/backend validation concerns.
    */
   readonly rope?: number
 }
@@ -628,8 +671,9 @@ export interface MultiHeadAttentionOptions {
  * {@link linear}. Both weights use `randn * (1 / sqrt(embedDim))` and
  * biases are zero. Fails with a {@link ModelError} on an empty name,
  * counts that are not positive integers, or `embedDim` not divisible by
- * `numHeads`. RoPE-specific shape or dtype violations surface as
- * {@link Tensor.TensorError}s from `forward`.
+ * `numHeads`. The constructor does not validate the RoPE theta or even head
+ * width; RoPE-specific shape, dtype, and numeric constraints surface while the
+ * graph is built, compiled, or run.
  *
  * @since 0.1.0
  * @category constructors
@@ -651,9 +695,8 @@ export const multiHeadAttention = (
       })
     }
     const headDim = embedDim / numHeads
-    // Fused QKV projection: one [E, 3E] gemm+epilogue instead of three
-    // [E, E] linears — one launch forward, one per gradient direction
-    // backward, at 1/3 the matmul count.
+    // One [E, 3E] projection exposes q/k/v slices from one semantic matmul
+    // instead of constructing three independent [E, E] projections.
     const names = [
       `${name}.qkv.weight`,
       `${name}.qkv.bias`,
@@ -768,7 +811,8 @@ export interface KimiDeltaAttentionOptions {
  * integers, or `embedDim` not divisible by `numHeads`. The KDA and short-conv
  * cores provide first-order adjoints, so this model is trainable, including
  * mixed-bf16 training on supporting runtimes. Their backward nodes do not
- * provide second-order derivatives.
+ * provide second-order derivatives. `normEps` is passed through without a
+ * finite/positive check; invalid values are not rejected by this constructor.
  *
  * @since 0.1.0
  * @category constructors
@@ -890,9 +934,8 @@ export const kimiDeltaAttention = (
               const epsT = yield* Tensor.constantLike(ss, 1e-6)
               return yield* Tensor.mul(x, yield* Tensor.rsqrt(yield* Tensor.add(ss, epsT)))
             })
-          // One causal depthwise short convolution (kernel 4) + SiLU over
-          // the fused [.., T, 3E] projection — contiguous input, one
-          // launch — then the q/k/v slices.
+          // Apply the causal depthwise kernel to the fused [.., T, 3E]
+          // projection before taking q/k/v slices.
           const qkv = yield* Tensor.linear(input, qkvWeight, qkvBias)
           const convolved = yield* Tensor.silu(yield* Tensor.shortConv1d(qkv, convqkvWeight))
           const q = yield* Tensor.slice(convolved, {
@@ -1067,13 +1110,14 @@ export const flatten = (
 /**
  * Inverted dropout as a parameterless model: zeroes elements with
  * probability `p` (default `0.5`) and scales survivors by `1 / (1 - p)`.
- * This is the functional form — it **always applies**; build the
+ * This is the functional form: it always applies; build the
  * evaluation chain without it (dropout adds nothing to the parameter
  * array, so one checkpoint serves both chains). The mask follows
- * {@link Tensor.randn}'s per-invocation sharing rule: submit a loss and its
+ * {@link Tensor.uniform}'s per-invocation sharing rule: submit a loss and its
  * gradients as roots of the same invocation when they must share it. Fails
- * with a {@link ModelError} if `p` is outside `[0, 1)`. The range check does
- * not reject `NaN`; do not pass it as a probability.
+ * with a {@link ModelError} if `p` is numerically outside `[0, 1)`. This is not
+ * a full finite-number check: `NaN` currently passes through. Input dtype is
+ * checked by {@link Tensor.dropout}, which currently accepts f32 and f64 only.
  *
  * @since 0.1.0
  * @category constructors
@@ -1369,7 +1413,8 @@ export const chain = (...models: ReadonlyArray<Model>): Effect.Effect<Model, Mod
  * Saves a model's parameters to a safetensors file, zipping `model.names`
  * with the parameter array into the record {@link Tensor.save} takes.
  * Fails with a {@link ModelError} if the parameter array's length does
- * not match the model's arity. Saving borrows parameters and does not clear them.
+ * not match the model's arity. It does not compare tensor shapes or dtypes with
+ * {@link Model.parameters}. Saving borrows parameters and does not clear them.
  *
  * @since 0.1.0
  * @category destructors
@@ -1390,16 +1435,16 @@ export const save = (
     )
 
 /**
- * Loads a model's parameters from a safetensors file written by
- * {@link save}, returning the materialized tensors in `model.names` order
- * — the same array `forward` and optimizer steps expect. A missing key
- * fails with a {@link ModelError}; extra keys are ignored. {@link Tensor.load}
- * materializes the whole archive, so extra entries, and all imported entries
- * after a missing-key failure, are left to native finalization. Shape or dtype
- * mismatches against the architecture surface as graph-build errors on
- * first use. Loading for a parameterless model therefore returns `[]` and
- * ignores every stored tensor. Returned handles are caller-owned and should be
- * released with {@link Tensor.clear} when no longer needed.
+ * Loads a safetensors file and returns the tensors selected by `model.names` in
+ * parameter-array order. A missing key fails with a {@link ModelError}; extra
+ * keys are ignored. This is name/arity mapping, not architecture validation:
+ * shape, dtype, storage, and placement compatibility are left to first use.
+ *
+ * {@link Tensor.load} materializes the entire archive. This function releases
+ * unselected tensors before success and releases all imported tensors if
+ * validation fails or is interrupted. On success, the selected handles are
+ * caller-owned and each should be released exactly once with
+ * {@link Tensor.clear} when no longer needed.
  *
  * @since 0.1.0
  * @category destructors
@@ -1408,28 +1453,50 @@ export const load = (
   model: Model,
   path: string
 ): Effect.Effect<ReadonlyArray<Tensor.Concrete>, ModelError | Tensor.TensorError, Runtime.Runtime> =>
-  Effect.gen(function*() {
-    const record = yield* Tensor.load(path)
-    const params: Array<Tensor.Concrete> = []
-    for (const name of model.names) {
-      const param = record[name]
-      if (param === undefined) {
-        return yield* new ModelError({
-          op: "load",
-          message: `missing parameter "${name}" in ${path}`
-        })
-      }
-      params.push(param)
-    }
-    return params
+  Effect.suspend(() => {
+    const owned = new Set<Tensor.Concrete>()
+    const releaseOwned = () => Effect.ignore(Tensor.clearAll(owned))
+    return Effect.onExit(
+      Effect.gen(function*() {
+        const record = yield* Effect.uninterruptibleMask((restore) =>
+          Effect.tap(
+            restore(Tensor.load(path)),
+            (record) => Effect.sync(() => Object.values(record).forEach((tensor) => owned.add(tensor)))
+          )
+        )
+        const params: Array<Tensor.Concrete> = []
+        for (const name of model.names) {
+          const param = record[name]
+          if (param === undefined) {
+            return yield* new ModelError({
+              op: "load",
+              message: `missing parameter "${name}" in ${path}`
+            })
+          }
+          params.push(param)
+        }
+        const retained = new Set(params)
+        for (const tensor of owned) {
+          if (retained.has(tensor)) continue
+          yield* Effect.uninterruptible(
+            Tensor.clear(tensor).pipe(Effect.tap(() => Effect.sync(() => owned.delete(tensor))))
+          )
+        }
+        return params
+      }),
+      (exit) => Exit.isFailure(exit) ? releaseOwned() : Effect.void
+    )
   })
 
 /**
  * A failure in inference-artifact construction or generation: invalid
  * configuration or model structure, or misuse of the generation calling
- * convention. The `op` payload identifies `inference`, `add`, `prefill`,
- * or `step`; `message` is diagnostic text. Pool-capacity, position-table,
- * and other native execution failures stay {@link Tensor.TensorError}s.
+ * convention. Current operation labels include `inference`, `add`, `prefill`,
+ * and `step`; treat `message` as a diagnostic rather than a stable protocol.
+ * Decode compilation and pool-construction tensor errors are wrapped as
+ * `InferenceError("inference")`. Errors raised earlier by `model.forward`, and
+ * tensor/backend failures during `add`, `step`, cursor, or cleanup, retain their
+ * original types.
  *
  * @since 0.1.0
  * @category errors
@@ -1442,18 +1509,28 @@ export class InferenceError extends Data.TaggedError("InferenceError")<{
 }> {}
 
 /**
- * Deployment configuration for {@link inference}. Compilation is eager
- * and fixed-shape: prefill and single-sequence decode are always built,
- * with a third batched-decode program when `decodeBatch > 1`.
+ * Fixed deployment geometry for {@link inference}. Construction validates
+ * these scalar fields, then eagerly traces and compiles prefill
+ * `[1, prefillChunk]`, single-sequence decode `[1, 1]`, and, when
+ * `decodeBatch > 1`, batched decode `[decodeBatch, 1]`. There is no later
+ * shape-specialization cache.
+ *
+ * Validation is deliberately structural. It does not estimate whether the
+ * pool is large enough for a particular set of prompts, check token ids against
+ * the model vocabulary, prove that every model operation supports decode
+ * specialization, or prove that learned position tables cover future cursors.
+ * Those constraints fail when the graph is compiled or a sequence is run.
  *
  * @since 0.1.0
  * @category compilation
  */
 export interface InferenceConfig {
   /**
-   * KV capacity in token rows, shared by live sequences and the resident
-   * prefix cache. Must be a positive integer and an exact multiple of
-   * `blockSize`.
+   * Fixed pool capacity in token rows, shared by live sequences and
+   * unreferenced prefix-cache blocks across every session of the artifact.
+   * Must be a positive integer and an exact multiple of `blockSize`. Without
+   * an effective attention window it also bounds each sequence cursor; with a
+   * window, aggregate live frontiers can still exhaust the shared pool.
    */
   readonly maxTokens: number
   /**
@@ -1462,56 +1539,71 @@ export interface InferenceConfig {
    */
   readonly blockSize?: number
   /**
-   * Positive integer number of cached positions attended per step, no greater
-   * than `maxTokens`. Omit for full attention. A window permits old KV blocks to be evicted only
-   * when every attention operation resolves to a local window; an explicit full-attention
-   * operation retains full history. With RoPE and no other absolute-position state this can extend generation
-   * beyond `maxTokens` when the pool can hold the active window and block
-   * frontier, subject to backend numeric and resource limits. Learned
-   * position tables still impose their absolute cursor limit.
+   * Requested positive attention-retention window, no greater than
+   * `maxTokens`. Omit for full history. Decode specialization permits block
+   * eviction only if every attention operation resolves to bounded local
+   * attention; an explicit full-attention operation makes the compiled program
+   * retain full history. The effective window is part of the compiled geometry.
+   *
+   * With cursor-offset RoPE and no separately bounded absolute-position state,
+   * eviction can let a sequence advance beyond `maxTokens` while retaining only
+   * its live window and partial frontier. It does not reset the logical cursor,
+   * expand a learned position table, or guarantee enough aggregate pool capacity.
    */
   readonly attentionWindow?: number
   /**
-   * Positive integer fixed prompt-chunk length. Defaults to `blockSize`;
-   * the final chunk is zero-padded and only real rows enter the KV cache.
-   * Padded positions are still evaluated, so every chunk's cursor-offset
-   * extent must fit any learned position table.
+   * Positive fixed prompt-chunk length. Defaults to `blockSize`; it need not be
+   * a multiple of `blockSize`. Every prefill invocation has this tensor shape.
+   * The final suffix is zero-padded, but only its real token ids advance the
+   * sequence, enter state hashes, and select the returned logits row. Graph
+   * operations still evaluate the padded extent, so a cursor-offset learned
+   * position table must cover the entire compiled chunk at every invocation.
    */
   readonly prefillChunk?: number
   /**
-   * Token-id dtype used by the fixed programs. Defaults to `"u32"`;
-   * prompts passed to {@link Generation.add} must use this dtype.
+   * Token-tensor dtype used by all fixed programs. Defaults to `"u32"`;
+   * prompts passed to {@link Generation.add} must match exactly. Decode state
+   * and prefix hashes are u32-based even for `"i64"`, so prompt and step ids
+   * must still be non-negative and fit u32.
    */
   readonly tokenDtype?: "u32" | "i64"
   /**
    * KV storage dtype. Defaults to `"f32"`; `"f16"` and `"bf16"` narrow
    * rows on write and attention widens them to f32. `"int8"` uses symmetric
-   * per-token, per-head quantization with f32 scales.
+   * per-token, per-head quantization with f32 scales. KDA and short-convolution
+   * recurrent state remains f32 and is not controlled by this option.
    */
   readonly kvDtype?: "f32" | "f16" | "bf16" | "int8"
   /**
-   * Positive integer maximum live sequences per session and entries per
-   * step. Defaults to 8. Values above 1 compile a fixed `[decodeBatch, 1]`
-   * batched program in addition to the single-sequence program.
+   * Positive maximum live sequences tracked by each session and maximum active
+   * entries in one step. Defaults to `8`. Values above one compile a fixed
+   * `[decodeBatch, 1]` batched program in addition to the single-sequence
+   * program. This is not a global limit across sessions; all sessions still
+   * compete for one pool's token-row capacity.
    */
   readonly decodeBatch?: number
 }
 
 /**
- * One live sequence inside a {@link Generation} session: a block table and
- * logical token cursor. Created by {@link Generation.add}; there is no
- * `Scope` lifetime. Call {@link GenerationSeq.finish} or
- * {@link Generation.close} for deterministic release. Native finalization
- * is a fallback when an abandoned sequence becomes unreachable.
+ * One mutable sequence owned by a {@link Generation} session. Its backend state
+ * consists of an absolute logical cursor, KV block references when attention is
+ * present, and per-sequence KDA/short-convolution state when present. It is an
+ * ordinary value rather than a scoped resource.
+ *
+ * Call {@link GenerationSeq.finish} when the sequence leaves a scheduler, or
+ * {@link Generation.close} for all sequences in that session. Releasing drops
+ * live references; completed blocks may remain in the artifact's reclaimable
+ * prefix cache. Native finalization is only a fallback for abandoned handles.
  *
  * @since 0.1.0
  * @category compilation
  */
 export interface GenerationSeq {
   /**
-   * Low-level KV handle owned by this sequence. Do not release it directly;
-   * it becomes invalid after {@link GenerationSeq.finish} or its session's
-   * {@link Generation.close}.
+   * Low-level state handle owned by this sequence. Despite the `KvSequence`
+   * name it also carries cursor-only or recurrent-only state. Do not run or
+   * release it directly; bypassing the session breaks lifecycle coordination.
+   * It becomes invalid after `finish` or the session's `close`.
    */
   readonly sequence: Tensor.KvSequence
   /**
@@ -1520,16 +1612,18 @@ export interface GenerationSeq {
    */
   readonly cursor: () => Effect.Effect<number, Tensor.TensorError, Runtime.Runtime>
   /**
-   * Removes this sequence from its session and returns its KV blocks. Calls
-   * after it has already been finished or closed are no-ops.
+   * Removes this sequence from its session and releases its backend state.
+   * Completed KV blocks can become prefix-cache entries rather than immediately
+   * free blocks. Calls after it has already been finished or closed are no-ops.
    */
   readonly finish: () => Effect.Effect<void, Tensor.TensorError, Runtime.Runtime>
 }
 
 /**
- * The result of {@link Generation.add}: the new sequence's handle and
- * its prompt's final-position logits `[vocab]` — the distribution the
- * first generated token is sampled from.
+ * The result of {@link Generation.add}: a new live sequence and its prompt's
+ * final-real-position logits `[vocab]`, from which the first generated token is
+ * selected. The two returned values have independent lifetimes: finishing the
+ * sequence does not clear the logits.
  *
  * @since 0.1.0
  * @category compilation
@@ -1537,52 +1631,73 @@ export interface GenerationSeq {
 export interface GenerationEntry {
   /** The new live sequence handle. */
   readonly seq: GenerationSeq
-  /** Caller-owned final-prompt-position logits with shape `[vocab]`. */
+  /** Caller-owned logits with shape `[vocab]`; release exactly once with {@link Tensor.clear}. */
   readonly logits: Tensor.Concrete
 }
 
 /**
- * A generation session over an {@link InferenceProgram}'s pool. Sequences
- * are added individually with {@link Generation.add}, which performs
- * chunked prefill; {@link Generation.step} advances one or more in one
- * run. The entries are the batch: one entry uses the `[1, 1]` program and
- * more use one fixed-width batched run with native padding. The pool keeps a content-addressed prefix cache: prompts whose
- * leading blocks are already resident (computed by an earlier, since
- * finished or still-live sequence) reuse them and compute only their suffix.
- * Hybrid recurrent artifacts also publish KDA and short-convolution state
- * snapshots at completed block boundaries, so matching restores both. Purely
- * recurrent artifacts without KV blocks have no block-anchored prefix cache.
+ * A caller-scheduled generation session over one {@link InferenceProgram}.
+ * {@link Generation.add} creates and prefills an independent sequence;
+ * {@link Generation.step} commits one supplied token to each selected sequence
+ * and returns the logits after that token. One entry uses the `[1, 1]` program;
+ * multiple entries use the fixed `decodeBatch` program while the backend pads
+ * inactive lanes internally. There is no queue, automatic token selection, or
+ * fairness/admission policy beyond the documented checks.
  *
- * Sessions are ordinary values and require no `Scope`. Independent
- * sessions may run concurrently. Calls to `step` on one session are
- * serialized; `add`, `finish`, and `close` are not covered by that lock,
- * so callers must not overlap lifecycle mutations with other operations
- * on the same session.
+ * Prefix matching is pool-wide, not session-local. It uses chained hashes to
+ * reuse the longest resident proper prefix made of complete `blockSize` blocks,
+ * whether those blocks are referenced by another live sequence or retained
+ * unreferenced in the LRU cache. At least the final prompt token is always
+ * executed so `add` can return its logits. Hybrid KV/recurrent programs also
+ * require a published recurrent snapshot at the matched block boundary and
+ * restore it with the KV blocks. Programs without KV blocks, including purely
+ * recurrent and stateless graphs, have no block anchor and therefore no prefix
+ * match.
+ *
+ * Sessions are ordinary values and require no `Scope`. Sessions from the same
+ * artifact may run concurrently and share pool capacity/cache content. Calls to
+ * `step` on one session are serialized. `add`, `finish`, `cursor`, and `close`
+ * are outside that JavaScript lock, so callers must not overlap them with each
+ * other or with `step` on the same session/sequence. Native sequence locks are a
+ * safety backstop, not a supported concurrent lifecycle API.
  *
  * @since 0.1.0
  * @category compilation
  */
 export interface Generation {
   /**
-   * Prefills `prompt` (`[1, T]` token ids) as a new live sequence and
-   * returns its handle and final-position logits. `T` must be at least 1,
-   * and the tensor must use the inference runtime, placement, and configured
-   * `tokenDtype`. Adding beyond `decodeBatch` live sequences fails with an
-   * {@link InferenceError}; token/vocabulary and pool failures may surface
-   * as {@link Tensor.TensorError}s.
+   * Prefills `prompt` as a new sequence and returns its handle and final-real-
+   * token logits. The prompt must have shape `[1, T]` with `T >= 1`, use the
+   * current inference runtime/placement, and have the configured `tokenDtype`.
+   * It is borrowed and materialized internally; any temporary concrete copy is
+   * released before completion.
+   *
+   * Prefill first attaches a reusable whole-block proper prefix and then runs
+   * the remaining suffix in fixed, zero-padded chunks. Only real ids advance
+   * state. A failed or interrupted add releases the newly allocated sequence
+   * and does not add it to `live`; backend decode invocations roll back
+   * uncommitted state. Adding beyond this session's `decodeBatch` live-sequence
+   * limit fails with an {@link InferenceError}. Token bounds, position limits,
+   * and pool exhaustion may instead surface as {@link Tensor.TensorError}s.
    */
   readonly add: (
     prompt: Tensor.Any
   ) => Effect.Effect<GenerationEntry, InferenceError | ModelError | Tensor.TensorError, Runtime.Runtime>
   /**
-   * Advances every entry's sequence by one token in one run and returns
-   * caller-owned materialized `[vocab]` logits in entry order. Finishing a
-   * sequence or closing the session does not release previously returned
-   * logits. The array must be nonempty
-   * and contain at most `decodeBatch` distinct live sequences from this
-   * session. Each token must be a non-negative integer representable by the
-   * configured token dtype and valid for the model vocabulary. Calls on the
-   * same session serialize; admission and scheduling stay with the caller.
+   * Commits one supplied token to every entry's sequence in one invocation and
+   * returns caller-owned materialized `[vocab]` logits in entry order. The input
+   * must be nonempty and contain at most `decodeBatch` distinct live sequences
+   * from this session. JavaScript validation requires each token to be a
+   * non-negative integer; conversion/backend validation additionally requires
+   * it to fit u32. Vocabulary validity is not checked here as a model-level
+   * invariant and may fail in execution.
+   *
+   * A successful call advances each cursor by one. Native state updates are
+   * transactional across the active batch: execution failure or interruption
+   * before commit leaves every sequence unadvanced. Calls on this session
+   * serialize, but admission and scheduling remain with the caller. Returned
+   * logits are independent ownerships; clear each exactly once. Finishing a
+   * sequence or closing the session does not clear earlier logits.
    */
   readonly step: (
     entries: ReadonlyArray<{
@@ -1596,37 +1711,49 @@ export interface Generation {
     InferenceError | ModelError | Tensor.TensorError,
     Runtime.Runtime
   >
-  /** Returns the number of sequences currently live in this session. */
+  /**
+   * Returns this session's JavaScript live-sequence count. This is not a pool
+   * capacity, global-session, or prefix-cache statistic.
+   */
   readonly live: () => Effect.Effect<number>
   /**
-   * Releases every live sequence's blocks and invalidates their low-level
-   * handles. The session remains usable and can accept new sequences after
-   * closing. Without this call, native finalizers release abandoned
-   * sequences when the session and handles become unreachable.
+   * Attempts to release every currently live sequence and invalidate its
+   * low-level handle. Successfully released entries are removed even if a later
+   * release fails; failed entries remain live and a representative failure is
+   * returned, so callers may retry. Completed KV blocks may stay as reclaimable
+   * prefix-cache content. The session is resettable rather than terminal and
+   * may accept new sequences after a successful close. Previously returned
+   * logits are unaffected. Native finalizers are the fallback when sessions and
+   * sequence handles become unreachable.
    */
   readonly close: () => Effect.Effect<void, Tensor.TensorError, Runtime.Runtime>
 }
 
 /**
- * A compiled inference artifact: frozen chunked-prefill and
- * single-sequence-decode programs, plus a fixed-width batched-decode
- * program when `decodeBatch > 1`, and their shared KV pool. All programs
- * are derived from the model and compiled eagerly at construction. This is
- * not a {@link Model}; generation runs through {@link Generation} sessions.
- * The artifact is immutable and parallel-safe. It has no `Scope` or
- * explicit lifetime: native finalizers release unreachable programs, pool,
- * and abandoned sequences, while {@link Generation.close} and
- * {@link GenerationSeq.finish} provide deterministic block release.
+ * An immutable decode-specialized artifact. It retains one materialized
+ * parameter generation as native constants, fixed prefill/decode executables,
+ * and one shared decode-state pool. Its KV arenas and prefix cache are shared
+ * across sessions, while each sequence owns its mutable recurrent state. It is neither
+ * a {@link Model} nor part of `Model.execute`'s signature cache.
+ *
+ * The artifact is safe to share: immutable programs can run concurrently and
+ * different sessions coordinate through the native pool. It has no explicit
+ * release or `Scope` lifetime. Programs, frozen constants, and pool storage are
+ * finalized when the artifact and dependent sequence handles become
+ * unreachable. Sequence state is the capacity-sensitive resource that callers
+ * can release deterministically through {@link GenerationSeq.finish} or
+ * {@link Generation.close}.
  *
  * @since 0.1.0
  * @category compilation
  */
 export interface InferenceProgram {
   /**
-   * Opens an independent generation session. No `Scope` service is
-   * required. Use {@link Generation.close} for deterministic session
-   * cleanup or {@link GenerationSeq.finish} for one sequence; native
-   * finalizers are the fallback.
+   * Opens an empty caller-scheduled session. This allocates JavaScript
+   * coordination state, not a private pool; all sessions share the artifact's
+   * pool capacity and prefix cache. No `Scope` service is required. Use
+   * {@link Generation.close} for deterministic session cleanup or
+   * {@link GenerationSeq.finish} for one sequence.
    */
   readonly generation: () => Effect.Effect<Generation, InferenceError>
 }
@@ -1842,6 +1969,8 @@ const planPrefillChunks = (
   return chunks
 }
 
+// This checks the public add calling convention only. Token values and model
+// vocabulary/position bounds are validated later while reading or executing.
 const validatePrompt = (
   prompt: Tensor.Any,
   config: ResolvedInferenceConfig,
@@ -1918,18 +2047,20 @@ interface LiveEntry {
   readonly seq: GenerationSeq
 }
 
+// `live` is the session's ownership ledger. Removing the entry first would make
+// a failed native release unretryable, so splice only after successful release.
 const releaseLiveEntry = (live: Array<LiveEntry>, entry: LiveEntry) =>
-  Effect.gen(function*() {
+  Effect.uninterruptible(Effect.gen(function*() {
     const index = live.indexOf(entry)
     if (index < 0) return
     yield* Tensor.releaseKvSequence(entry.seq.sequence)
     live.splice(index, 1)
-  })
+  }))
 
 const closeLiveEntries = (
   live: Array<LiveEntry>
 ): Effect.Effect<void, Tensor.TensorError, Runtime.Runtime> =>
-  Effect.gen(function*() {
+  Effect.uninterruptible(Effect.gen(function*() {
     const entries = live.splice(0)
     let failure: Exit.Failure<void, Tensor.TensorError> | undefined
     for (const entry of entries) {
@@ -1942,8 +2073,10 @@ const closeLiveEntries = (
     if (failure !== undefined) {
       return yield* Effect.failCause(failure.cause)
     }
-  })
+  }))
 
+// Lifecycle mutations are intentionally not wrapped by the step semaphore;
+// Generation's contract requires callers to keep them disjoint.
 const validateStepEntries = (
   live: ReadonlyArray<LiveEntry>,
   decodeBatch: number,
@@ -1991,87 +2124,137 @@ const openGeneration = (engine: InferenceEngine): Effect.Effect<Generation, neve
     const config = engine.config
     const programs = engine.programs
     const add: Generation["add"] = (prompt) =>
-      Effect.gen(function*() {
-        const runtime = yield* Runtime.Runtime
-        if (live.length >= config.decodeBatch) {
-          return yield* new InferenceError({
-            op: "add",
-            message: `a session holds at most decodeBatch (${config.decodeBatch}) live sequences; finish one first`
-          })
-        }
-        yield* validatePrompt(prompt, config, runtime)
-        const [materializedPrompt] = yield* Tensor.compute([prompt])
-        return yield* Effect.gen(function*() {
-          const ids = yield* readTokenIds(materializedPrompt)
-          const sequence = yield* Tensor.makeKvSequence(programs.pool)
-          return yield* Effect.gen(function*() {
-            const matched = yield* Tensor.kvPrefillMatch(sequence, ids)
+      Effect.suspend(() => {
+        let materializedPrompt: Tensor.Concrete | undefined
+        let sequence: Tensor.KvSequence | undefined
+        let entry: LiveEntry | undefined
+        const ownedOutputs = new Set<Tensor.Concrete>()
+        return Effect.onExit(
+          Effect.gen(function*() {
+            const runtime = yield* Runtime.Runtime
+            if (live.length >= config.decodeBatch) {
+              return yield* new InferenceError({
+                op: "add",
+                message: `a session holds at most decodeBatch (${config.decodeBatch}) live sequences; finish one first`
+              })
+            }
+            yield* validatePrompt(prompt, config, runtime)
+            const [promptValue] = yield* Effect.uninterruptibleMask((restore) =>
+              Effect.tap(
+                restore(Tensor.compute([prompt])),
+                ([value]) => Effect.sync(() => void (materializedPrompt = value))
+              )
+            )
+            const ids = yield* readTokenIds(promptValue)
+            const sequenceValue = yield* Effect.uninterruptibleMask((restore) =>
+              Effect.tap(
+                restore(Tensor.makeKvSequence(programs.pool)),
+                (value) => Effect.sync(() => void (sequence = value))
+              )
+            )
+            const matched = yield* Tensor.kvPrefillMatch(sequenceValue, ids)
             let logits: Tensor.Concrete | undefined
             for (const chunk of planPrefillChunks(ids.length, matched, config.prefillChunk)) {
-              const input = yield* prefillInput(materializedPrompt, chunk, config)
-              const [output] = yield* Tensor.runDecodeProgram(
-                programs.prefill,
-                [input],
-                sequence,
-                ids.slice(chunk.offset, chunk.offset + chunk.real)
+              const input = yield* prefillInput(promptValue, chunk, config)
+              const [output] = yield* Effect.uninterruptibleMask((restore) =>
+                Effect.tap(
+                  restore(Tensor.runDecodeProgram(
+                    programs.prefill,
+                    [input],
+                    sequenceValue,
+                    ids.slice(chunk.offset, chunk.offset + chunk.real)
+                  )),
+                  (outputs) => Effect.sync(() => outputs.forEach((value) => ownedOutputs.add(value)))
+                )
               )
               if (chunk.final) {
                 logits = output
               } else {
-                yield* Tensor.clear(output)
+                yield* Effect.uninterruptible(
+                  Tensor.clear(output).pipe(Effect.tap(() => Effect.sync(() => ownedOutputs.delete(output))))
+                )
               }
             }
             if (logits === undefined) {
               return yield* new InferenceError({ op: "prefill", message: "prefill produced no logits" })
             }
-            const entry: LiveEntry = {
+            const publishedEntry: LiveEntry = {
               seq: {
-                sequence,
-                cursor: () => Tensor.kvSequenceCursor(sequence),
-                finish: () => releaseLiveEntry(live, entry)
+                sequence: sequenceValue,
+                cursor: () => Tensor.kvSequenceCursor(sequenceValue),
+                finish: () => releaseLiveEntry(live, publishedEntry)
               }
             }
-            live.push(entry)
-            return { seq: entry.seq, logits } satisfies GenerationEntry
-          }).pipe(
-            Effect.onExit((exit) =>
-              Exit.isFailure(exit) ? Effect.ignore(Tensor.releaseKvSequence(sequence)) : Effect.void
-            )
-          )
-        }).pipe(Effect.ensuring(Effect.ignore(Tensor.clear(materializedPrompt))))
+            entry = publishedEntry
+            live.push(publishedEntry)
+            return { seq: publishedEntry.seq, logits } satisfies GenerationEntry
+          }),
+          (exit) =>
+            Effect.gen(function*() {
+              if (materializedPrompt !== undefined) yield* Effect.ignore(Tensor.clear(materializedPrompt))
+              if (Exit.isSuccess(exit)) return
+              yield* Effect.ignore(Tensor.clearAll(ownedOutputs))
+              if (entry !== undefined) {
+                yield* Effect.ignore(releaseLiveEntry(live, entry))
+              } else if (sequence !== undefined) {
+                yield* Effect.ignore(Tensor.releaseKvSequence(sequence))
+              }
+            })
+        )
       })
     const step: Generation["step"] = (entries) =>
       roundLock.withPermits(1)(
-        Effect.gen(function*() {
-          yield* validateStepEntries(live, config.decodeBatch, entries)
-          if (entries.length === 1) {
-            const entry = entries[0]!
-            const input = yield* tokenTensor([entry.token], [1, 1], config.tokenDtype)
-            const [output] = yield* Tensor.runDecodeProgram(
-              programs.decode,
-              [input],
-              entry.seq.sequence,
-              [entry.token]
-            )
-            return [output]
-          }
-          if (programs.batched === undefined) {
-            return yield* new InferenceError({
-              op: "step",
-              message: `stepping ${entries.length} sequences needs decodeBatch > 1`
-            })
-          }
-          const ids = entries.map((entry) => entry.token)
-          const input = yield* tokenTensor(ids, [entries.length, 1], config.tokenDtype)
-          const outputs = yield* Tensor.runBatchedDecodeProgram(
-            programs.batched,
-            [input],
-            entries.map((entry) => entry.seq.sequence),
-            ids.map((id) => [id])
+        Effect.suspend(() => {
+          const owned = new Set<Tensor.Concrete>()
+          return Effect.onExit(
+            Effect.gen(function*() {
+              yield* validateStepEntries(live, config.decodeBatch, entries)
+              if (entries.length === 1) {
+                const entry = entries[0]!
+                const input = yield* tokenTensor([entry.token], [1, 1], config.tokenDtype)
+                const outputs = yield* Effect.uninterruptibleMask((restore) =>
+                  Effect.tap(
+                    restore(Tensor.runDecodeProgram(
+                      programs.decode,
+                      [input],
+                      entry.seq.sequence,
+                      [entry.token]
+                    )),
+                    (values) => Effect.sync(() => values.forEach((value) => owned.add(value)))
+                  )
+                )
+                return outputs
+              }
+              if (programs.batched === undefined) {
+                return yield* new InferenceError({
+                  op: "step",
+                  message: `stepping ${entries.length} sequences needs decodeBatch > 1`
+                })
+              }
+              const batched = programs.batched
+              const ids = entries.map((entry) => entry.token)
+              const input = yield* tokenTensor(ids, [entries.length, 1], config.tokenDtype)
+              const outputs = yield* Effect.uninterruptibleMask((restore) =>
+                Effect.tap(
+                  restore(Tensor.runBatchedDecodeProgram(
+                    batched,
+                    [input],
+                    entries.map((entry) => entry.seq.sequence),
+                    ids.map((id) => [id])
+                  )),
+                  (values) => Effect.sync(() => values.forEach((value) => owned.add(value)))
+                )
+              )
+              const selected = outputs.slice(0, entries.length)
+              for (const output of outputs.slice(entries.length)) {
+                yield* Effect.uninterruptible(
+                  Tensor.clear(output).pipe(Effect.tap(() => Effect.sync(() => owned.delete(output))))
+                )
+              }
+              return selected
+            }),
+            (exit) => Exit.isFailure(exit) ? Effect.ignore(Tensor.clearAll(owned)) : Effect.void
           )
-          const selected = outputs.slice(0, entries.length)
-          yield* Tensor.clearAll(outputs.slice(entries.length))
-          return selected
         })
       )
     return {
@@ -2083,35 +2266,39 @@ const openGeneration = (engine: InferenceEngine): Effect.Effect<Generation, neve
   })
 
 /**
- * Compiles a model for generation. The same `forward` graph builder is
- * traced with placeholders and decode-specialized natively: causal attention
- * becomes paged KV attention and position nodes become cursor-offset operations.
- * Construction eagerly freezes prefill `[1, prefillChunk]` and decode
- * `[1, 1]` programs, plus batched decode `[decodeBatch, 1]` when
- * `decodeBatch > 1`. There is no shape-keyed growth or later tracing.
+ * Materializes a model for stateful autoregressive generation and eagerly
+ * compiles its complete deployment geometry. The same `forward` builder is
+ * traced three times as needed: fixed prompt chunks, one-token single-sequence
+ * decode, and fixed-width batched decode. Decode specialization rewrites causal
+ * attention to paged KV attention, KDA and short convolution to per-sequence
+ * recurrent operations, and learned/rotary position nodes to absolute-cursor-
+ * offset forms. There is no shape-keyed growth or later tracing.
  *
- * The model must return logits exactly as `[batch, T, vocab]`, preserving
- * the two token-input axes; generation returns the advance-selected
- * final-position row as `[vocab]`, extracted natively by the decode
- * specialization (`lastTokenRow`). Stateless graphs are accepted. Causal attention, KDA,
- * short convolution, and position operations use incremental state or cursor
- * specialization when present. Non-causal attention and runtime scalar inputs
- * fail with an {@link InferenceError}. Learned position
- * embeddings remain bounded by their table's total absolute cursor, even
- * with an attention window.
+ * Every trace must return exactly `[batch, T, vocab]` with the traced batch and
+ * token dimensions preserved, and all traces must agree on state geometry and
+ * effective retention policy. Native `lastTokenRow` selection returns one
+ * caller-owned `[vocab]` row per active sequence. Stateless graphs are allowed.
+ * Non-causal attention, runtime scalar inputs, unsupported stateful operations,
+ * inconsistent traces, and invalid output rank/axes fail during construction.
+ * This does not establish semantic language-model correctness or validate a
+ * tokenizer/vocabulary contract.
  *
- * `params` are borrowed and eagerly materialized once with
- * {@link Tensor.compute} before tracing. This freezes lazy initializer draws for every later prefill and
- * step. Concrete parameters are retained by the compiled artifacts as
- * immutable constants, so generation calls bind only token rows. Caller-supplied
- * concrete handles are not consumed; the artifact retains its own materialized
- * generation until it becomes unreachable.
+ * `params` are borrowed and materialized together once with
+ * {@link Tensor.compute}. This samples lazy initializers once and produces a new
+ * concrete generation retained as immutable constants by every compiled
+ * program. Caller-supplied concrete handles are not consumed and may be cleared
+ * after this effect succeeds; the artifact's retained generation remains valid.
+ * If tracing or pool construction fails or is interrupted, the newly
+ * materialized parameter handles are cleared before the failure is returned.
+ * There is no explicit artifact release after success; native finalization
+ * reclaims its constants, programs, and pool when unreachable.
  *
- * The artifact and sessions require no `Scope`. Static programs and pool
- * memory are released by native finalizers when unreachable. Live sequences
- * pin pool blocks, so use {@link Generation.close} or
- * {@link GenerationSeq.finish} for prompt release under capacity pressure
- * rather than relying on GC timing.
+ * State capacity is separate from artifact lifetime. Live sequences pin blocks
+ * and recurrent state, while completed blocks may remain as evictable prefix
+ * cache. Use {@link GenerationSeq.finish} or {@link Generation.close} to remove
+ * live ownership promptly. An attention window can bound retained KV history
+ * without resetting the absolute cursor; learned position tables and other
+ * cursor-indexed state remain independently bounded.
  *
  * @since 0.1.0
  * @category compilation
@@ -2121,20 +2308,27 @@ export const inference = (
   params: Params,
   config: InferenceConfig
 ): Effect.Effect<InferenceProgram, InferenceError | ModelError | Tensor.TensorError, Runtime.Runtime> =>
-  Effect.gen(function*() {
-    yield* checkArity("inference", model.names, params)
-    const resolved = yield* resolveInferenceConfig(config)
-    const frozenParams = yield* Tensor.compute(params)
-    return yield* Effect.onExit(
+  Effect.suspend(() => {
+    let frozenParams: ReadonlyArray<Tensor.Concrete> = []
+    return Effect.onExit(
       Effect.gen(function*() {
+        yield* checkArity("inference", model.names, params)
+        const resolved = yield* resolveInferenceConfig(config)
+        frozenParams = yield* Effect.uninterruptibleMask((restore) =>
+          Effect.tap(
+            restore(Tensor.compute(params)),
+            (values) => Effect.sync(() => void (frozenParams = values))
+          )
+        )
         const programs = yield* compileInferencePrograms(model, frozenParams, resolved)
+        const retainedParams = frozenParams
         return {
-          generation: () => openGeneration({ config: resolved, frozenParams, programs })
+          generation: () => openGeneration({ config: resolved, frozenParams: retainedParams, programs })
         } satisfies InferenceProgram
       }),
       (exit) =>
         Exit.isFailure(exit)
-          ? Effect.forEach(frozenParams, (parameter) => Effect.ignore(Tensor.clear(parameter)), { discard: true })
+          ? Effect.ignore(Tensor.clearAll(frozenParams))
           : Effect.void
     )
   })

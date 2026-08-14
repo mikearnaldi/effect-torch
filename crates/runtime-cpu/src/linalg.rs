@@ -1,11 +1,33 @@
+//! Dense linear algebra: determinant, inverse, and solve.
+//!
+//! All three operations share one algorithm,
+//! [`LinalgAlgorithm::LuPartialPivotF64`]: the (possibly batched) input
+//! matrix is copied into an `f64` scratch buffer, factored in place with
+//! partial pivoting, and the factorization is then read out as a determinant
+//! (product of the diagonal times the pivot sign) or driven through
+//! forward/back substitution against a right-hand-side work buffer (the
+//! identity for `inverse`, the RHS for `solve`). Pivots below `1e-300` are
+//! treated as singular: determinants report 0 while `try_inverse`/`try_solve`
+//! return `"matrix is singular"`.
+//!
+//! Computing in `f64` regardless of the input dtype keeps half-precision and
+//! integer inputs stable; results are narrowed back to the input dtype on
+//! write-out. Scratch buffers (`[n, n]` LU, plus an `[n, rhs_columns]` work
+//! matrix for inverse/solve) are part of the frozen requirement structs, so
+//! the executor can plan them like any other workspace.
+
 use super::tensor::{source_index, CpuBuffer, CpuDestination, CpuTensorRequirement, Elem, Tensor};
 use effect_torch_runtime::{DType, Layout};
 
+/// Factorization strategy shared by all linalg operations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LinalgAlgorithm {
+    /// In-place LU with partial (row) pivoting, computed in `f64`.
     LuPartialPivotF64,
 }
 
+/// Frozen plan of one determinant invocation: `[batch..., n, n]` input,
+/// `[batch...]` output, one `[n, n]` f64 LU scratch.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeterminantRequirements {
     pub output: CpuTensorRequirement,
@@ -16,6 +38,8 @@ pub struct DeterminantRequirements {
     pub n: usize,
 }
 
+/// Frozen plan of one inverse invocation: `[batch..., n, n]` input and
+/// output, `[n, n]` f64 LU plus `[n, n]` f64 work scratch.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InverseRequirements {
     pub output: CpuTensorRequirement,
@@ -26,6 +50,9 @@ pub struct InverseRequirements {
     pub n: usize,
 }
 
+/// Frozen plan of one solve invocation: `[batch..., n, n]` matrix,
+/// `[batch..., n, rhs_columns]` right-hand side and output, f64 LU plus
+/// `[n, rhs_columns]` work scratch.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SolveRequirements {
     pub output: CpuTensorRequirement,
@@ -86,6 +113,10 @@ fn square_dimensions(tensor: &Tensor) -> Result<(usize, usize), &'static str> {
     Ok((n, checked_product(&tensor.shape()[..rank - 2])?))
 }
 
+/// In-place LU factorization with partial pivoting. `work` (row width
+/// `work_columns`) is row-swapped alongside `lu` so pivots apply to the
+/// right-hand side too. Returns the pivot sign (±1), or `None` when a pivot
+/// below 1e-300 marks the matrix singular.
 fn lu_decompose_in_place(
     lu: &mut [f64],
     n: usize,
@@ -127,6 +158,8 @@ fn lu_decompose_in_place(
     Some(sign)
 }
 
+/// Solves `LU * X = work` in place: forward substitution with the unit lower
+/// triangle, then back substitution with the upper triangle.
 fn lu_solve_in_place(lu: &[f64], work: &mut [f64], n: usize, columns: usize) {
     for row in 1..n {
         for previous in 0..row {
@@ -371,6 +404,8 @@ fn solve_rhs_typed<A: Elem>(
 }
 
 impl Tensor {
+    /// Plans a determinant: validates square rank ≥ 2 shape and freezes the
+    /// matrix layout, batch, and scratch.
     pub fn det_requirements(&self) -> Result<DeterminantRequirements, &'static str> {
         let (n, batch) = square_dimensions(self)?;
         let rank = self.shape().len();
@@ -397,6 +432,7 @@ impl Tensor {
         Ok(self.det_requirements()?.scratch)
     }
 
+    /// Executes a planned determinant allocation-free.
     pub fn det_into(
         &self,
         destination: &mut CpuDestination<'_>,
@@ -455,6 +491,7 @@ impl Tensor {
         }
     }
 
+    /// Allocating determinant wrapper. Panics on invalid input.
     pub fn det(&self) -> Tensor {
         let requirements = self
             .det_requirements()
@@ -477,6 +514,8 @@ impl Tensor {
         output
     }
 
+    /// Plans a matrix inverse (see [`Tensor::det_requirements`] for the
+    /// planning contract).
     pub fn inverse_requirements(&self) -> Result<InverseRequirements, &'static str> {
         let (n, batch) = square_dimensions(self)?;
         Ok(InverseRequirements {
@@ -500,6 +539,8 @@ impl Tensor {
         Ok(self.inverse_requirements()?.scratch)
     }
 
+    /// Executes a planned inverse allocation-free. Fails with
+    /// `"matrix is singular"` when a batch has no usable pivot.
     pub fn inverse_into(
         &self,
         destination: &mut CpuDestination<'_>,
@@ -548,11 +589,14 @@ impl Tensor {
         }
     }
 
+    /// Allocating inverse wrapper. Panics on invalid input or singularity;
+    /// use [`Tensor::try_inverse`] to handle singular matrices.
     pub fn inverse(&self) -> Tensor {
         self.try_inverse()
             .unwrap_or_else(|message| panic!("{message}"))
     }
 
+    /// Fallible allocating inverse.
     pub fn try_inverse(&self) -> Result<Tensor, &'static str> {
         let requirements = self
             .inverse_requirements()
@@ -585,6 +629,7 @@ impl Tensor {
         }
     }
 
+    /// Plans a solve of `self · x = rhs`; batch dimensions must match.
     pub fn solve_requirements(&self, rhs: &Tensor) -> Result<SolveRequirements, &'static str> {
         let (n, batch) = square_dimensions(self)?;
         if rhs.shape().len() < 2 {
@@ -627,6 +672,8 @@ impl Tensor {
         Ok(self.solve_requirements(rhs)?.scratch)
     }
 
+    /// Executes a planned solve allocation-free. The RHS may have any dtype;
+    /// it is widened to `f64` and the result is written in the matrix dtype.
     pub fn solve_into(
         &self,
         rhs: &Tensor,
@@ -695,11 +742,14 @@ impl Tensor {
         }
     }
 
+    /// Allocating solve wrapper. Panics on invalid input or singularity; use
+    /// [`Tensor::try_solve`] to handle singular matrices.
     pub fn solve(&self, rhs: &Tensor) -> Tensor {
         self.try_solve(rhs)
             .unwrap_or_else(|message| panic!("{message}"))
     }
 
+    /// Fallible allocating solve.
     pub fn try_solve(&self, rhs: &Tensor) -> Result<Tensor, &'static str> {
         let requirements = self
             .solve_requirements(rhs)

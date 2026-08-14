@@ -1,3 +1,23 @@
+//! Bridge that executes compiler-fused expression trees on CPU tensors.
+//!
+//! The compiler flattens fusible elementwise (and single-output reduction)
+//! subgraphs into expression trees and hands them here as a
+//! [`CpuFusionProgram`]. [`prepare`] compiles the trees once; the resulting
+//! program is immutable and reused for every execution.
+//!
+//! Execution ([`run_elementwise_into`], [`run_elementwise_multi_into`],
+//! [`run_reduce_into`]) is allocation-free: it writes into planned
+//! destinations and uses a caller-provided scratch tensor sized by
+//! [`scratch_requirement`]. The scratch holds a per-input lane cache followed
+//! by the program's value stack, both in the command's native dtype.
+//!
+//! Inputs are read through explicit per-lane strides when any lane is
+//! non-contiguous (broadcasting is expressed as stride-0 entries); contiguous
+//! inputs may omit strides and are read linearly. Every read offset is
+//! validated against the lane's storage before execution, so a mismatched
+//! plan fails cleanly instead of reading out of bounds. Only `f32` and `f64`
+//! are supported on this backend.
+
 use crate::value::Value;
 use crate::{CpuDestination, CpuTensorRequirement, Elem, Tensor};
 use effect_torch_compiler::{Expr, ReduceOp, Scalar};
@@ -8,6 +28,7 @@ type Res<T> = Result<T, String>;
 
 pub use effect_torch_compiler::{adamw_exprs, sgd_exprs, CpuFusionProgram};
 
+/// Whether this backend can execute a fused program for `device`/`dtype`.
 pub fn is_supported(device: &Device, dtype: DType) -> bool {
     device.is_cpu() && matches!(dtype, DType::F32 | DType::F64)
 }
@@ -234,6 +255,10 @@ fn bridge_elementwise_into<T: Scalar + Elem>(
     })?
 }
 
+/// Executes a multi-output fused elementwise program into `destinations`,
+/// one per program output, reading `inputs` under optional explicit
+/// `strides` and single-element `scalars`. `n` must equal the element count
+/// of `shape`.
 #[allow(clippy::too_many_arguments)]
 pub fn run_elementwise_multi_into(
     program: &CpuFusionProgram,
@@ -275,6 +300,8 @@ pub fn run_elementwise_multi_into(
     }
 }
 
+/// Single-output form of [`run_elementwise_multi_into`]; the program must
+/// have exactly one output.
 #[allow(clippy::too_many_arguments)]
 pub fn run_elementwise_into(
     program: &CpuFusionProgram,
@@ -585,6 +612,10 @@ fn bridge_reduce_into<T: Scalar + Elem>(
     })?
 }
 
+/// Executes a fused map-then-reduce: evaluates `program` at every input
+/// element (addressed through per-lane `strides` over `in_shape`) and folds
+/// the results with `op` into the `out_shape` destination. `Mean` divides by
+/// the reduced extent after the fold. Scalar lanes are unsupported.
 #[allow(clippy::too_many_arguments)]
 pub fn run_reduce_into(
     op: ReduceOp,
@@ -693,6 +724,11 @@ mod tests {
         }
     }
 
+    // Test-only allocator that counts allocations to prove planned execution
+    // is allocation-free.
+    // SAFETY: every method forwards to `System` with the unchanged layout and
+    // arguments supplied by the global allocator protocol; the only added
+    // behavior is a thread-local counter increment.
     unsafe impl GlobalAlloc for CountingAllocator {
         unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
             record_allocation();

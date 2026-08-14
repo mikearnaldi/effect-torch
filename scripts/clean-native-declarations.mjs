@@ -1,3 +1,9 @@
+// Post-processes one native package's TypeScript build output. napi-rs source
+// declarations are compile-time inputs only: package entry declarations expose
+// the supported public API, while generated internal .d.ts files and the stale
+// native-addon.js stub must not ship beside the hand-written runtime loader.
+// This script intentionally operates only from a native package directory.
+
 import fs from "node:fs"
 import path from "node:path"
 import { nativePackages } from "./native-packages.mjs"

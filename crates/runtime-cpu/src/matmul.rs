@@ -1,8 +1,24 @@
+//! Matrix multiplication with NumPy-style batch broadcasting.
+//!
+//! Shapes of rank ≥ 2 are treated as `batch..., m, k` × `batch..., k, n`;
+//! batch dimensions broadcast against each other. Both operands may carry
+//! arbitrary strided layouts — the kernel indexes them through their strides
+//! rather than materializing contiguous copies.
+//!
+//! The only algorithm currently selected is [`MatmulAlgorithm::Naive`]: a
+//! row-major `m × k × n` loop that accumulates directly into the destination.
+//! Floating-point dtypes accumulate with fused multiply-add; integer dtypes
+//! (`u8`, `u32`, `i64`) use wrapping-free plain `c + a * b` semantics in
+//! their own type. `f16`/`bf16` matmul is deliberately rejected at planning
+//! time.
+
 use super::tensor::{CpuBuffer, CpuDestination, CpuTensorRequirement, Elem, Tensor};
 use effect_torch_runtime::{DType, Layout};
 
+/// Kernel selected for a matmul invocation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MatmulAlgorithm {
+    /// Direct triple loop over the (possibly strided) operand layouts.
     Naive,
 }
 
@@ -215,6 +231,10 @@ where
 }
 
 impl Tensor {
+    /// Plans a matmul: validates dtypes/ranks/broadcasting, freezes the
+    /// operand layouts and algorithm, and computes the exact output
+    /// requirement. The returned plan is immutable; [`Tensor::matmul_into`]
+    /// rejects any operand or destination that deviates from it.
     pub fn matmul_requirements(&self, rhs: &Tensor) -> Result<MatmulRequirements, &'static str> {
         if self.dtype() != rhs.dtype() {
             return Err("mixed dtypes");
@@ -254,6 +274,9 @@ impl Tensor {
         Ok(self.matmul_requirements(rhs)?.scratch)
     }
 
+    /// Executes a previously planned matmul into `destination` without
+    /// allocating. Fails if inputs, destination, scratch, or the frozen plan
+    /// disagree.
     pub fn matmul_into(
         &self,
         rhs: &Tensor,
@@ -312,11 +335,14 @@ impl Tensor {
         }
     }
 
+    /// Allocating wrapper: plan, allocate, execute. Panics on invalid
+    /// operands.
     pub fn matmul(&self, rhs: &Tensor) -> Tensor {
         self.try_matmul(rhs)
             .unwrap_or_else(|message| panic!("{message}"))
     }
 
+    /// Fallible allocating wrapper around [`Tensor::matmul`].
     pub fn try_matmul(&self, rhs: &Tensor) -> Result<Tensor, &'static str> {
         let requirements = self.matmul_requirements(rhs)?;
         let mut output = Tensor::empty(&requirements.output.shape, requirements.output.dtype);

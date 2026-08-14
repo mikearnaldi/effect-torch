@@ -7,15 +7,16 @@ import type { Runtime } from "../../src/index.ts"
 
 export type TestDevice = "cpu" | "metal"
 
+// Availability is sampled once during suite registration. An unavailable Metal
+// backend omits that matrix entry rather than falling back to CPU under its name.
 export const metalAvailable: boolean = Effect.runSync(BackendApple.isAvailable)
 
-/** Tests settle on f32: it runs on every device, so one dtype and one set
- * of tolerances covers CPU and Metal alike. */
+/** Encodes common numerical fixtures as f32, the shared CPU/Metal dtype. */
 export const floats = (values: ReadonlyArray<number>): Float32Array => new Float32Array(values)
 
 export const floatDtype = "f32" as const
 
-/** Default numerical tolerance for f32 results. */
+/** Default absolute f32 tolerance; magnitude-sensitive suites scale it explicitly. */
 export const TOL = 1e-4
 
 /** Finite-difference step and tolerance for gradient checks in f32:
@@ -52,8 +53,8 @@ export const deep = (actual: unknown, expected: unknown): void => {
 type SuiteFn = Parameters<ReturnType<typeof layer<Runtime.Runtime, never>>>[1]
 
 /**
- * Registers the same suite once per device: always on CPU, and on Metal
- * when the machine has one.
+ * Registers the same suite with its real backend layer: always CPU, plus Metal
+ * when available. This matrix never emulates unsupported device behavior.
  */
 export const onDevices = (name: string, make: (device: TestDevice) => SuiteFn): void => {
   layer(BackendCpu.layer)(`${name} (cpu)`, make("cpu"))

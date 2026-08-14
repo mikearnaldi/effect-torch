@@ -1,3 +1,11 @@
+// Verifies package metadata and loader-selection prerequisites against
+// native-packages.mjs.
+// Run from the workspace root for every native package or from one package
+// directory for that package only. The default mode does not require built
+// files; `--artifacts` additionally checks the full dist matrix, architecture,
+// Darwin install/link/deployment contracts, GNU-versus-musl markers, and the
+// exact native file set emitted by `npm pack --dry-run`.
+
 import assert from "node:assert/strict"
 import fs from "node:fs"
 import path from "node:path"
@@ -88,15 +96,23 @@ for (const nativePackage of packagesToVerify) {
         assert.match(dependencies, /Metal\.framework/, `${nativePackage.npmName}: Apple addon does not link Metal`)
       }
     } else {
-      const binary = fs.readFileSync(artifact).toString("latin1")
       if (suffix.endsWith("-gnu")) {
-        assert.ok(binary.includes("GLIBC_"), `${nativePackage.npmName}: ${suffix} is not a GNU binary`)
-        const versions = [...binary.matchAll(/GLIBC_(\d+)\.(\d+)/g)]
+        const binary = fs.readFileSync(artifact).toString("latin1")
+        const names = [...new Set([...binary.matchAll(/GLIBC_[A-Z0-9_.]+/g)].map((match) => match[0]))]
+        assert.ok(names.length > 0, `${nativePackage.npmName}: ${suffix} is not a GNU binary`)
         assert.ok(
-          versions.every((match) => Number(match[1]) < 2 || Number(match[2]) <= 17),
+          names.every((name) => /^GLIBC_\d+(?:\.\d+)+$/.test(name)),
+          `${nativePackage.npmName}: ${suffix} has an unsupported glibc version namespace`
+        )
+        assert.ok(
+          names.every((name) => {
+            const [major, minor] = name.slice("GLIBC_".length).split(".").map(Number)
+            return major < 2 || (major === 2 && minor <= 17)
+          }),
           `${nativePackage.npmName}: ${suffix} requires glibc newer than 2.17`
         )
       } else {
+        const binary = fs.readFileSync(artifact).toString("latin1")
         assert.ok(binary.includes("libc.so"), `${nativePackage.npmName}: ${suffix} is not a musl binary`)
         assert.ok(!binary.includes("GLIBC_"), `${nativePackage.npmName}: ${suffix} unexpectedly references glibc`)
       }

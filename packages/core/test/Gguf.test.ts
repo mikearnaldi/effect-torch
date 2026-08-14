@@ -12,6 +12,9 @@ const placement: Runtime.Placement = Object.freeze({
   description: "GGUF test runtime"
 })
 
+// The fake runtime keeps logical model metadata separate from encoded storage
+// geometry. Its object handles are ownership tokens, so release assertions use
+// identity rather than descriptor equality.
 const denseDescriptor: Runtime.GgufTensorDescriptor = Object.freeze({
   name: "dense",
   format: "F32",
@@ -96,6 +99,8 @@ const string = (value: string): Buffer => {
   return Buffer.concat([u64(bytes.length), bytes])
 }
 
+// Minimal GGUF v3: one Q4_K tensor, three metadata entries, 32-byte alignment,
+// and exactly the encoded physical payload required for logical shape [2, 256].
 const fixture = (): Buffer => {
   const header = Buffer.concat([
     Buffer.from("GGUF"),
@@ -248,6 +253,8 @@ it.effect("releases every loaded tensor when load descriptors disagree with insp
   }).pipe(Effect.provide(provide(runtime)))
 })
 
+// A runtime archive may not transfer the same handle twice: cleanup must dedupe
+// by handle identity or a failed validation would double-release native storage.
 it.effect("rejects duplicate loaded handle ownership and releases it once", () => {
   const duplicate = tensor(encodedDescriptor)
   const released: Array<Tensor.Concrete> = []
@@ -297,6 +304,8 @@ it.effect("the runtime cleans up interruption before archive ownership transfers
       extensions: {
         gguf: {
           inspect: () => Effect.succeed(inspection),
+          // The deferred marks the archive's use phase, ensuring interruption
+          // occurs before load returns and transfers ownership to Gguf.load.
           load: () =>
             Effect.acquireUseRelease(
               Effect.succeed(archive),

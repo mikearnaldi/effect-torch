@@ -1,3 +1,12 @@
+//! GGUF archive inspection and loading over the napi boundary.
+//!
+//! [`inspect_gguf`] parses only the header (metadata + tensor catalog);
+//! [`load_gguf`] additionally reads every tensor payload directly into
+//! freshly allocated CPU tensor storage. F32 tensors map to f32 storage;
+//! every quantized/other format is delivered as packed `u8` storage whose
+//! physical shape the descriptor reports. Both functions are async and
+//! observe the cancellation token while parsing and reading.
+
 use super::{run_compute, CancellationToken, NativeTensor};
 use crate::{Tensor, Value};
 use effect_torch_runtime::{
@@ -142,6 +151,8 @@ fn open(path: &str) -> Result<File> {
     })
 }
 
+/// Parses the GGUF header at `path` and returns its metadata and tensor
+/// catalog without reading payloads.
 #[napi]
 pub async fn inspect_gguf(
     path: String,
@@ -158,6 +169,9 @@ pub async fn inspect_gguf(
     .await
 }
 
+/// Loads every tensor of the GGUF archive at `path` into CPU tensors.
+/// Direct f32 loading requires a little-endian target; quantized formats
+/// arrive as packed `u8` payloads.
 #[napi]
 pub async fn load_gguf(
     path: String,

@@ -1,16 +1,36 @@
+//! Error taxonomy shared by all backends.
+//!
+//! [`BackendError`] classifies failures by *phase* and *cause* rather than
+//! by backend, so callers can react uniformly: `Unavailable` (device or
+//! backend missing), `Unsupported` (operation/dtype/layout the backend
+//! cannot do), `InvalidHandle` (a buffer owned by another runtime — see the
+//! ownership model in the `backend` module), `Compilation`, `Execution`,
+//! `Transfer`, `Cancelled` (cooperative cancellation via
+//! [`CancellationFlag`](crate::CancellationFlag)) and `Closed` (use after
+//! runtime shutdown).
+//!
+//! Variants carry structured context fields (dtype, layout, placement, ...)
+//! instead of pre-formatted strings so embedders can both match on the
+//! category and render rich diagnostics.
+
 use crate::{DType, DeviceId, Layout, Placement, RuntimeId};
 use std::error::Error;
 use std::fmt;
 
+/// Result alias for backend operations.
 pub type BackendResult<T> = Result<T, BackendError>;
 
+/// A failure reported by a backend, classified by phase and cause.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BackendError {
+    /// The backend or requested device is not available on this system.
     Unavailable {
         backend: String,
         device: Option<DeviceId>,
         message: String,
     },
+    /// The backend cannot perform the requested operation, dtype, layout
+    /// or placement (whichever fields are present identify the mismatch).
     Unsupported {
         operation: Option<String>,
         dtype: Option<DType>,
@@ -18,32 +38,38 @@ pub enum BackendError {
         placement: Option<Placement>,
         message: String,
     },
+    /// A buffer or handle belongs to a different runtime than the one it
+    /// was used with. `actual_runtime` is `None` when the offending handle
+    /// carries no runtime id at all.
     InvalidHandle {
         expected_runtime: RuntimeId,
         actual_runtime: Option<RuntimeId>,
     },
+    /// Program compilation failed.
     Compilation {
         operation: Option<String>,
         message: String,
     },
+    /// Execution of a compiled program failed.
     Execution {
         operation: Option<String>,
         message: String,
     },
+    /// A host/device or device/device transfer failed.
     Transfer {
         source: Option<Placement>,
         destination: Option<Placement>,
         message: String,
     },
-    Cancelled {
-        operation: Option<String>,
-    },
-    Closed {
-        runtime: RuntimeId,
-    },
+    /// The operation observed a set cancellation flag and aborted.
+    Cancelled { operation: Option<String> },
+    /// The runtime has been closed and no longer accepts work.
+    Closed { runtime: RuntimeId },
 }
 
 impl BackendError {
+    /// Builds an [`InvalidHandle`](Self::InvalidHandle) error naming both
+    /// the expected and the actual owning runtime.
     pub fn invalid_handle(expected_runtime: RuntimeId, actual_runtime: RuntimeId) -> Self {
         Self::InvalidHandle {
             expected_runtime,

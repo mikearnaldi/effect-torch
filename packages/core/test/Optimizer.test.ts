@@ -8,6 +8,8 @@ const values = (t: Tensor.Any) => Tensor.toNumberArray(t)
 
 const scalar = (t: Tensor.Any) => Effect.map(values(t), (v) => v[0])
 
+// Optimizers return lazy params plus ordered state roots. Materializing them
+// together executes shared work once and rebuilds state with concrete roots.
 const runStep = <S>(
   optimizer: Optimizer.Optimizer<S>,
   params: ReadonlyArray<Tensor.Any>,
@@ -526,7 +528,6 @@ onDevices("Optimizer", () => (it) => {
         }
         expect(Math.abs(v2[0])).toBeLessThan(TOL)
         expect(Math.abs(v2[1] - 6)).toBeLessThan(TOL)
-        // below the norm: unchanged
         const [u1] = yield* Optimizer.clipByGlobalNorm([g1], 100)
         assert.deepStrictEqual(yield* values(u1), [3, 4])
       }))

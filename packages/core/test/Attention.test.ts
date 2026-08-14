@@ -38,7 +38,8 @@ const reference = (
     return yield* Tensor.matmul(yield* Tensor.softmax(scores), v)
   })
 
-// deterministic, asymmetric values
+// Deterministic asymmetric values avoid cancellation and symmetry hiding
+// indexing, masking, or head-layout errors in the reference comparisons.
 const pattern = (n: number): Array<number> => Array.from({ length: n }, (_, i) => ((i * 7 + 3) % 13 - 6) / 4)
 
 onDevices("Attention", () => (it) => {
@@ -126,7 +127,8 @@ onDevices("Attention", () => (it) => {
 
     it.effect("numeric gradcheck", () =>
       Effect.gen(function*() {
-        // gradcheck each of q, k, v element-wise against central differences
+        // Central differences evaluate fresh graphs so the numerical oracle is
+        // independent of the backward graph under test.
         const inputs = [pattern(8), pattern(8).map((x) => x * 0.7), pattern(8).map((x) => x * -0.5)]
         const shapes: Array<ReadonlyArray<number>> = [
           [1, 1, 2, 4],
@@ -312,8 +314,8 @@ onDevices("Attention", () => (it) => {
 
     it.effect("large-magnitude scores exercise the online rescaling", () =>
       Effect.gen(function*() {
-        // scores up to ~±60: exp overflow without max subtraction, and the
-        // running max must rescale across key tiles
+        // Scores span roughly -124 to 254: direct f32 exponentiation overflows,
+        // and the online running maximum must also rescale across key tiles.
         const shape = [1, 2, 40, 16]
         const n = shape.reduce((a, b) => a * b, 1)
         const q = yield* f32(pattern(n).map((x) => x * 8), shape)

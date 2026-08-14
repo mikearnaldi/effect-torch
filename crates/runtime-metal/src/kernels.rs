@@ -1,3 +1,31 @@
+//! Primitive kernels: fill, relu-i64, cast, strided copy, random
+//! (randn/uniform), arange, eye, argreduce, cumsum.
+//!
+//! # Conventions
+//!
+//! - **Kernel family per operation.** Each op follows the same four-layer
+//!   pattern: a private `*_pipeline` builder (emits MSL specialized to the
+//!   exact layout, dtype, and sizes), a public `compile_*`/`warm_*`
+//!   precompile entry point, an allocating wrapper, and a `*_into`
+//!   destination API that validates, requires the precompiled pipeline,
+//!   and dispatches without allocating.
+//! - **Layout-keyed pipelines.** Strided sources are handled by baking the
+//!   stride decomposition into the emitted source; the pipeline key hashes
+//!   shape and strides, so a different layout is a different kernel.
+//!   Destinations are always contiguous.
+//! - **Dtypes.** Unlike the fusion emitter (f32/bf16 only), these kernels
+//!   cover f32, f16, bf16, u8, u32, and i64; f64 has MSL syntax here but
+//!   is rejected at the value boundary (unsupported on Metal). Integer
+//!   fill/arange compute in 64-bit integer arithmetic — values above 2^24
+//!   have no exact f32 form.
+//! - **Dispatch topology.** One thread per output element over a padded
+//!   flat grid ([`MetalDevice::grid_flat`]), widening to 64-bit indexing
+//!   past `u32::MAX` elements; argreduce/cumsum use one thread per kept
+//!   slice and loop over the reduced dimension serially.
+//! - **RNG.** randn/uniform use a per-thread xoroshiro128+ seeded from the
+//!   global seed plus the element index, so results are deterministic per
+//!   seed regardless of dispatch shape.
+
 use super::device::{set_buffer, MetalDevice};
 use super::run::MetalTensor;
 use crate::runtime::dtype::DType;
@@ -108,6 +136,7 @@ kernel void et_fill(device {ty}* out [[buffer(0)]], constant ulong& raw [[buffer
     dev.compile_lazy(key(&[0xF111, dtype as u64, n as u64]), "et_fill", make_src)
 }
 
+/// Precompiles the fill pipeline for `shape`/`dtype` (no-op when empty).
 pub fn compile_fill(
     dev: &MetalDevice,
     shape: &[usize],
@@ -121,10 +150,14 @@ pub fn compile_fill(
     Ok(())
 }
 
+/// [`compile_fill`] against the process-wide device.
 pub fn warm_fill(shape: &[usize], value: f64, dtype: DType) -> Result<(), String> {
     compile_fill(MetalDevice::get(), shape, value, dtype)
 }
 
+/// Fills `out` with `value`. Integer dtypes cast from the f64 bits
+/// exactly; the fill value never round-trips through f32 for them.
+/// Requires the precompiled pipeline for the exact element count/dtype.
 pub fn fill_into(dev: &MetalDevice, out: &MetalTensor, value: f64) -> Result<(), String> {
     out.validate_destination("fill", out.layout.shape(), out.dtype)?;
     let n = out.numel();
@@ -158,6 +191,7 @@ pub fn fill_into(dev: &MetalDevice, out: &MetalTensor, value: f64) -> Result<(),
     Ok(())
 }
 
+/// [`fill_into`] that precompiles first.
 pub fn fill(dev: &MetalDevice, out: &MetalTensor, value: f64) -> Result<(), String> {
     compile_fill(dev, out.layout.shape(), value, out.dtype)?;
     fill_into(dev, out, value)
@@ -187,6 +221,8 @@ kernel void et_relu_i64(device const long* a [[buffer(0)]], device long* out [[b
     dev.compile_lazy(key(&[0x8E10, layout_key(layout)]), "et_relu_i64", make_src)
 }
 
+/// Precompiles the i64 relu pipeline for an exact (possibly strided)
+/// layout.
 pub fn compile_relu_i64_layout(
     dev: &MetalDevice,
     layout: &crate::runtime::layout::Layout,
@@ -197,6 +233,7 @@ pub fn compile_relu_i64_layout(
     Ok(())
 }
 
+/// [`compile_relu_i64_layout`] for a contiguous layout of `shape`.
 pub fn compile_relu_i64(dev: &MetalDevice, shape: &[usize]) -> Result<(), String> {
     compile_relu_i64_layout(
         dev,
@@ -204,10 +241,12 @@ pub fn compile_relu_i64(dev: &MetalDevice, shape: &[usize]) -> Result<(), String
     )
 }
 
+/// [`compile_relu_i64`] against the process-wide device.
 pub fn warm_relu_i64(shape: &[usize]) -> Result<(), String> {
     compile_relu_i64(MetalDevice::get(), shape)
 }
 
+/// Allocating i64 relu: clamps each element at zero.
 pub fn relu_i64(dev: &MetalDevice, x: &MetalTensor) -> Result<MetalTensor, String> {
     compile_relu_i64_layout(dev, &x.layout)?;
     let out = MetalTensor::empty(dev, x.layout.shape().to_vec(), DType::I64);
@@ -215,6 +254,7 @@ pub fn relu_i64(dev: &MetalDevice, x: &MetalTensor) -> Result<MetalTensor, Strin
     Ok(out)
 }
 
+/// Destination form of [`relu_i64`]; requires the precompiled pipeline.
 pub fn relu_i64_into(dev: &MetalDevice, x: &MetalTensor, out: &MetalTensor) -> Result<(), String> {
     if x.dtype != DType::I64 {
         return Err(format!("relu_i64 input must be i64, got {:?}", x.dtype));
@@ -274,6 +314,8 @@ kernel void et_cast(device const {src_ty}* a [[buffer(0)]], device {dst_ty}* out
     )
 }
 
+/// Precompiles the cast (or copy, when source == destination) pipeline
+/// for an exact layout and dtype pair.
 pub fn compile_cast_layout(
     dev: &MetalDevice,
     layout: &crate::runtime::layout::Layout,
@@ -290,6 +332,7 @@ pub fn compile_cast_layout(
     Ok(())
 }
 
+/// [`compile_cast_layout`] for a contiguous layout of `shape`.
 pub fn compile_cast(
     dev: &MetalDevice,
     shape: &[usize],
@@ -304,10 +347,12 @@ pub fn compile_cast(
     )
 }
 
+/// [`compile_cast`] against the process-wide device.
 pub fn warm_cast(shape: &[usize], source: DType, destination: DType) -> Result<(), String> {
     compile_cast(MetalDevice::get(), shape, source, destination)
 }
 
+/// Allocating cast; a same-dtype cast aliases the input (no copy).
 pub fn cast(dev: &MetalDevice, x: &MetalTensor, dtype: DType) -> Result<MetalTensor, String> {
     if x.dtype == dtype {
         return Ok(MetalTensor {
@@ -322,6 +367,8 @@ pub fn cast(dev: &MetalDevice, x: &MetalTensor, dtype: DType) -> Result<MetalTen
     Ok(out)
 }
 
+/// Destination form of [`cast`]; same-dtype degenerates to
+/// [`copy_into`]. Requires the precompiled pipeline.
 pub fn cast_into(dev: &MetalDevice, x: &MetalTensor, out: &MetalTensor) -> Result<(), String> {
     out.validate_destination("cast", x.layout.shape(), out.dtype)?;
     if x.dtype == out.dtype {
@@ -359,6 +406,8 @@ pub fn cast_into(dev: &MetalDevice, x: &MetalTensor, out: &MetalTensor) -> Resul
     Ok(())
 }
 
+/// Materializes any (possibly strided/offset) tensor as a fresh
+/// contiguous tensor; contiguous offset-zero inputs are returned as-is.
 pub fn strided_copy(dev: &MetalDevice, x: &MetalTensor) -> Result<MetalTensor, String> {
     if x.layout.is_contiguous() && x.layout.offset() == 0 {
         return Ok(x.clone());
@@ -399,11 +448,13 @@ kernel void et_scopy(device const {ty}* a [[buffer(0)]], device {ty}* out [[buff
     )
 }
 
+/// [`compile_copy_layout`] for a contiguous layout of `shape`.
 pub fn compile_copy(dev: &MetalDevice, shape: &[usize], dtype: DType) -> Result<(), String> {
     let layout = crate::runtime::layout::Layout::contiguous(shape.to_vec());
     compile_copy_layout(dev, &layout, dtype)
 }
 
+/// Precompiles the strided-copy pipeline for an exact source layout.
 pub fn compile_copy_layout(
     dev: &MetalDevice,
     layout: &crate::runtime::layout::Layout,
@@ -415,10 +466,12 @@ pub fn compile_copy_layout(
     Ok(())
 }
 
+/// [`compile_copy`] against the process-wide device.
 pub fn warm_copy(shape: &[usize], dtype: DType) -> Result<(), String> {
     compile_copy(MetalDevice::get(), shape, dtype)
 }
 
+/// [`compile_copy_layout`] against the process-wide device.
 pub fn warm_copy_layout(
     layout: &crate::runtime::layout::Layout,
     dtype: DType,
@@ -426,6 +479,9 @@ pub fn warm_copy_layout(
     compile_copy_layout(MetalDevice::get(), layout, dtype)
 }
 
+/// Copies `source` into `destination` (same shape/dtype; the source may
+/// be strided, the destination must be contiguous). Requires the
+/// precompiled pipeline.
 pub fn copy_into(
     dev: &MetalDevice,
     source: &MetalTensor,
@@ -519,6 +575,7 @@ kernel void et_randn(device float* out [[buffer(0)]], constant ulong& seed [[buf
     dev.compile_lazy(key(&[0x8A11, n as u64]), "et_randn", make_src)
 }
 
+/// Precompiles the deterministic randn pipeline for a given element count.
 pub fn compile_randn(dev: &MetalDevice, shape: &[usize]) -> Result<(), String> {
     if shape.iter().product::<usize>() != 0 {
         randn_pipeline(dev, shape.iter().product())?;
@@ -526,10 +583,13 @@ pub fn compile_randn(dev: &MetalDevice, shape: &[usize]) -> Result<(), String> {
     Ok(())
 }
 
+/// [`compile_randn`] against the process-wide device.
 pub fn warm_randn(shape: &[usize]) -> Result<(), String> {
     compile_randn(MetalDevice::get(), shape)
 }
 
+/// Allocates an f32 tensor of `shape` filled with standard-normal samples
+/// from `seed` (Box–Muller over a per-element seeded xoroshiro128+).
 pub fn randn(dev: &MetalDevice, shape: &[usize], seed: u64) -> Result<MetalTensor, String> {
     compile_randn(dev, shape)?;
     let out = MetalTensor::empty(dev, shape.to_vec(), DType::F32);
@@ -537,6 +597,7 @@ pub fn randn(dev: &MetalDevice, shape: &[usize], seed: u64) -> Result<MetalTenso
     Ok(out)
 }
 
+/// Destination form of [`randn`]; requires the precompiled pipeline.
 pub fn randn_into(dev: &MetalDevice, out: &MetalTensor, seed: u64) -> Result<(), String> {
     out.validate_destination("randn", out.layout.shape(), DType::F32)?;
     let n = out.numel();
@@ -562,6 +623,8 @@ pub fn randn_into(dev: &MetalDevice, out: &MetalTensor, seed: u64) -> Result<(),
     Ok(())
 }
 
+/// Allocates an f32 tensor of `shape` filled with uniform samples from
+/// `[lo, hi)`.
 pub fn uniform(
     dev: &MetalDevice,
     lo: f64,
@@ -575,6 +638,8 @@ pub fn uniform(
     Ok(out)
 }
 
+/// Destination form of [`uniform`]; requires the precompiled pipeline for
+/// the exact (n, lo, hi) triple.
 pub fn uniform_into(
     dev: &MetalDevice,
     lo: f64,
@@ -639,6 +704,7 @@ kernel void et_uniform(device float* out [[buffer(0)]], constant ulong& seed [[b
     )
 }
 
+/// Precompiles the uniform pipeline for (n, lo, hi).
 pub fn compile_uniform(dev: &MetalDevice, lo: f64, hi: f64, shape: &[usize]) -> Result<(), String> {
     if shape.iter().product::<usize>() != 0 {
         uniform_pipeline(dev, lo, hi, shape.iter().product())?;
@@ -646,10 +712,13 @@ pub fn compile_uniform(dev: &MetalDevice, lo: f64, hi: f64, shape: &[usize]) -> 
     Ok(())
 }
 
+/// [`compile_uniform`] against the process-wide device.
 pub fn warm_uniform(lo: f64, hi: f64, shape: &[usize]) -> Result<(), String> {
     compile_uniform(MetalDevice::get(), lo, hi, shape)
 }
 
+/// Number of elements `arange(start, end, step)` produces
+/// (`ceil((end - start) / step)`, clamped at zero).
 pub fn arange_len(start: f64, end: f64, step: f64) -> usize {
     ((end - start) / step).ceil().max(0.0) as usize
 }
@@ -697,6 +766,7 @@ kernel void et_arange(device {ty}* out [[buffer(0)]], uint2 gid2 [[thread_positi
     )
 }
 
+/// Precompiles the arange pipeline for (start, step, dtype, n).
 pub fn compile_arange(
     dev: &MetalDevice,
     start: f64,
@@ -711,10 +781,13 @@ pub fn compile_arange(
     Ok(())
 }
 
+/// [`compile_arange`] against the process-wide device.
 pub fn warm_arange(start: f64, end: f64, step: f64, dtype: DType) -> Result<(), String> {
     compile_arange(MetalDevice::get(), start, end, step, dtype)
 }
 
+/// Allocates the `start, start + step, ...` sequence (integer dtypes
+/// compute in exact 64-bit integer arithmetic).
 pub fn arange(
     dev: &MetalDevice,
     start: f64,
@@ -728,6 +801,7 @@ pub fn arange(
     Ok(out)
 }
 
+/// Destination form of [`arange`]; requires the precompiled pipeline.
 pub fn arange_into(
     dev: &MetalDevice,
     start: f64,
@@ -790,6 +864,7 @@ kernel void et_eye(device {ty}* out [[buffer(0)]], uint2 gid2 [[thread_position_
     dev.compile_lazy(key(&[0xE7E, dtype as u64, n as u64]), "et_eye", make_src)
 }
 
+/// Precompiles the eye pipeline (and the zero fill that precedes it).
 pub fn compile_eye(dev: &MetalDevice, n: usize, dtype: DType) -> Result<(), String> {
     compile_fill(dev, &[n, n], 0.0, dtype)?;
     if n != 0 {
@@ -798,10 +873,12 @@ pub fn compile_eye(dev: &MetalDevice, n: usize, dtype: DType) -> Result<(), Stri
     Ok(())
 }
 
+/// [`compile_eye`] against the process-wide device.
 pub fn warm_eye(n: usize, dtype: DType) -> Result<(), String> {
     compile_eye(MetalDevice::get(), n, dtype)
 }
 
+/// Allocates the n×n identity matrix.
 pub fn eye(dev: &MetalDevice, n: usize, dtype: DType) -> Result<MetalTensor, String> {
     compile_eye(dev, n, dtype)?;
     let out = MetalTensor::empty(dev, vec![n, n], dtype);
@@ -809,6 +886,7 @@ pub fn eye(dev: &MetalDevice, n: usize, dtype: DType) -> Result<MetalTensor, Str
     Ok(out)
 }
 
+/// Destination form of [`eye`]: zero-fills `out` then writes the diagonal.
 pub fn eye_into(dev: &MetalDevice, out: &MetalTensor) -> Result<(), String> {
     let shape = out.layout.shape();
     if shape.len() != 2 || shape[0] != shape[1] {
@@ -906,6 +984,8 @@ kernel void et_argred(
     )
 }
 
+/// Precompiles the argreduce pipeline for an exact layout/dim/direction.
+/// Errors on an out-of-range or empty reduced dimension.
 pub fn compile_argreduce_layout(
     dev: &MetalDevice,
     layout: &crate::runtime::layout::Layout,
@@ -934,6 +1014,7 @@ pub fn compile_argreduce_layout(
     Ok(())
 }
 
+/// [`compile_argreduce_layout`] for a contiguous layout of `shape`.
 pub fn compile_argreduce(
     dev: &MetalDevice,
     shape: &[usize],
@@ -950,6 +1031,7 @@ pub fn compile_argreduce(
     )
 }
 
+/// [`compile_argreduce`] against the process-wide device.
 pub fn warm_argreduce(
     shape: &[usize],
     dtype: DType,
@@ -959,6 +1041,9 @@ pub fn warm_argreduce(
     compile_argreduce(MetalDevice::get(), shape, dtype, dim, pick_max)
 }
 
+/// Allocating argreduce: per kept slice, the index of the max (or min,
+/// when `pick_max` is false) element along `dim`, as u32 with `keepdim`
+/// shape.
 pub fn argreduce(
     dev: &MetalDevice,
     x: &MetalTensor,
@@ -979,6 +1064,7 @@ pub fn argreduce(
     Ok(out)
 }
 
+/// Destination form of [`argreduce`]; requires the precompiled pipeline.
 pub fn argreduce_into(
     dev: &MetalDevice,
     x: &MetalTensor,
@@ -1088,6 +1174,8 @@ kernel void et_cumsum(
     )
 }
 
+/// Precompiles the cumsum pipeline for an exact layout/dim. Errors on an
+/// out-of-range dimension.
 pub fn compile_cumsum_layout(
     dev: &MetalDevice,
     layout: &crate::runtime::layout::Layout,
@@ -1112,6 +1200,7 @@ pub fn compile_cumsum_layout(
     Ok(())
 }
 
+/// [`compile_cumsum_layout`] for a contiguous layout of `shape`.
 pub fn compile_cumsum(
     dev: &MetalDevice,
     shape: &[usize],
@@ -1126,10 +1215,13 @@ pub fn compile_cumsum(
     )
 }
 
+/// [`compile_cumsum`] against the process-wide device.
 pub fn warm_cumsum(shape: &[usize], dtype: DType, dim: usize) -> Result<(), String> {
     compile_cumsum(MetalDevice::get(), shape, dtype, dim)
 }
 
+/// Allocating inclusive prefix sum along `dim` (one serial thread per
+/// slice — deterministic, O(n) per slice).
 pub fn cumsum(dev: &MetalDevice, x: &MetalTensor, dim: usize) -> Result<MetalTensor, String> {
     compile_cumsum_layout(dev, &x.layout, x.dtype, dim)?;
     let out = MetalTensor::empty(dev, x.layout.shape().to_vec(), x.dtype);
@@ -1137,6 +1229,7 @@ pub fn cumsum(dev: &MetalDevice, x: &MetalTensor, dim: usize) -> Result<MetalTen
     Ok(out)
 }
 
+/// Destination form of [`cumsum`]; requires the precompiled pipeline.
 pub fn cumsum_into(
     dev: &MetalDevice,
     x: &MetalTensor,
@@ -1190,6 +1283,9 @@ mod tests {
     fn bytes(tensor: &MetalTensor) -> Vec<u8> {
         let size = tensor.dtype.size_in_bytes();
         let offset = tensor.layout.offset() * size;
+        // SAFETY: tests call this only after `dev.synchronize()`, so the
+        // GPU is done writing; the buffer is shared-mode and the layout
+        // range fits the allocation.
         unsafe {
             std::slice::from_raw_parts(
                 tensor.buffer.contents_ptr().cast::<u8>().add(offset),
@@ -1201,6 +1297,9 @@ mod tests {
 
     fn from_i64(dev: &MetalDevice, values: &[i64], shape: Vec<usize>) -> MetalTensor {
         let tensor = MetalTensor::empty(dev, shape, DType::I64);
+        // SAFETY: fresh unique buffer with no GPU work encoded against it
+        // yet; `values.len() == numel` by construction, and shared-mode
+        // contents are host-writable.
         unsafe {
             std::ptr::copy_nonoverlapping(
                 values.as_ptr(),
@@ -1268,9 +1367,11 @@ mod tests {
         let a = arange(dev, 16_777_214.0, 16_777_220.0, 1.0, DType::I64).unwrap();
         dev.synchronize().unwrap();
         let raw = &out.buffer;
+        // SAFETY: synchronized above; the u32 buffer holds 2 elements.
         let words = unsafe { std::slice::from_raw_parts(raw.contents_ptr().cast::<u32>(), 2) };
         assert_eq!(words, &[744_841_714, 744_841_714]);
         let a_raw = &a.buffer;
+        // SAFETY: synchronized above; the i64 buffer holds 6 elements.
         let longs = unsafe { std::slice::from_raw_parts(a_raw.contents_ptr().cast::<i64>(), 6) };
         assert_eq!(
             longs,

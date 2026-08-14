@@ -1,3 +1,21 @@
+//! Compile-stage sequencing and phase timing for one prepared program.
+//!
+//! The driver exists to keep the compilation order — and its observability —
+//! identical across backends without introducing a backend trait object.
+//! Backends drive their cache-miss path through [`CompilerDriver`] with
+//! statically dispatched callbacks, and each stage boundary is recorded as a
+//! named [`CompilePhaseTiming`]. The canonical phase names are the
+//! `*_PHASE` constants below; their order of appearance is the order stages
+//! must run:
+//!
+//! `graph_index` (during preparation) → `optimization` → `lowering` →
+//! `lowered_program_validation` → `memory_planning` → backend phases
+//! (`physical_planning`, `pipeline_preparation`, `artifact_assembly`,
+//! `compile_submission`) → `publication`.
+//!
+//! Timings are diagnostics only: they are reported to callers but are never
+//! part of an executable's cache identity.
+
 use crate::request::{derive_graph_signature, request_parts, signature_with_contract};
 use crate::{
     CompilerWorkReport, GraphIndex, LoweredProgram, LoweredValue, LoweringUnit,
@@ -7,15 +25,25 @@ use effect_torch_runtime::{CompilePhaseTiming, MemoryPlan};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+/// Preparation stage: the program's single graph-index build.
 pub const GRAPH_INDEX_PHASE: &str = "graph_index";
+/// Region selection and lowering-order construction.
 pub const OPTIMIZATION_PHASE: &str = "optimization";
+/// Backend lowering of every planned lowering unit.
 pub const LOWERING_PHASE: &str = "lowering";
+/// Structural validation of the lowered dense tables before planning.
 pub const LOWERED_PROGRAM_VALIDATION_PHASE: &str = "lowered_program_validation";
+/// Liveness-driven logical memory planning.
 pub const MEMORY_PLANNING_PHASE: &str = "memory_planning";
+/// Backend translation of the logical memory plan into physical buffers.
 pub const PHYSICAL_PLANNING_PHASE: &str = "physical_planning";
+/// Backend pipeline/kernel preparation.
 pub const PIPELINE_PREPARATION_PHASE: &str = "pipeline_preparation";
+/// Assembly of the final executable artifact.
 pub const ARTIFACT_ASSEMBLY_PHASE: &str = "artifact_assembly";
+/// Submission of compiled artifacts to the device/runtime.
 pub const COMPILE_SUBMISSION_PHASE: &str = "compile_submission";
+/// Publication of the finished executable to the caller-facing cache.
 pub const PUBLICATION_PHASE: &str = "publication";
 
 fn timing(phase: &str, elapsed: Duration) -> CompilePhaseTiming {
@@ -26,6 +54,12 @@ fn timing(phase: &str, elapsed: Duration) -> CompilePhaseTiming {
 }
 
 /// Prepares one semantic graph generation and records its only graph-index build.
+///
+/// Validates the request (at least one root, sound options, a single device
+/// across the whole graph), builds the shared [`GraphIndex`], and resolves
+/// the invocation contract — caller-supplied, or derived from the graph for
+/// native requests. Everything later stages need is frozen into the
+/// returned [`PreparedProgram`].
 pub fn prepare_program(request: ProgramRequest) -> Result<PreparedProgram, String> {
     let (roots, bindings, invocation, options, state_cursor, derive_contract) =
         request_parts(request);
@@ -61,6 +95,12 @@ pub fn prepare_program(request: ProgramRequest) -> Result<PreparedProgram, Strin
 }
 
 /// Shared, statically-dispatched sequencing for one prepared cache miss.
+///
+/// Owns the optimization plan and the accumulated phase timings for a single
+/// compilation. Construct once per cache miss via [`CompilerDriver::new`],
+/// drive the backend through [`CompilerDriver::lower`], [`CompilerDriver::phase`],
+/// and [`CompilerDriver::plan_memory`], then consume with
+/// [`CompilerDriver::finish`] to obtain the structural work report.
 pub struct CompilerDriver<'a> {
     prepared: &'a PreparedProgram,
     optimization: OptimizationPlan,
@@ -68,6 +108,8 @@ pub struct CompilerDriver<'a> {
 }
 
 impl<'a> CompilerDriver<'a> {
+    /// Runs region selection for the prepared program, recording the
+    /// optimization phase after preparation's graph-index timing.
     pub fn new(prepared: &'a PreparedProgram) -> Result<Self, String> {
         let mut compile_phases = prepared.preparation_phases.to_vec();
         let started = Instant::now();
@@ -117,11 +159,16 @@ impl<'a> CompilerDriver<'a> {
         result
     }
 
+    /// Records an externally timed backend phase under a canonical name.
     pub fn record_phase(&mut self, phase: &'static str, elapsed: Duration) {
         self.compile_phases.push(timing(phase, elapsed));
     }
 
     /// Validates the lowered tables before timing logical memory planning.
+    ///
+    /// Validation and planning are separate recorded phases so a malformed
+    /// backend lowering is attributable (and cheap to diagnose) rather than
+    /// folded into planning time.
     pub fn plan_memory<K, M, V>(
         &mut self,
         lowered: &LoweredProgram<K, M, V>,
@@ -139,6 +186,9 @@ impl<'a> CompilerDriver<'a> {
         })
     }
 
+    /// Consumes the driver, combining structural counters from the graph
+    /// index, optimization plan, and lowered program with the recorded phase
+    /// timings.
     pub fn finish<K, M, V>(self, lowered: &LoweredProgram<K, M, V>) -> CompilerWorkReport
     where
         V: LoweredValue<M>,
@@ -147,6 +197,9 @@ impl<'a> CompilerDriver<'a> {
             .with_compile_phases(self.compile_phases.into_boxed_slice())
     }
 
+    /// Like [`CompilerDriver::finish`], but first records one final phase
+    /// measured from `started` (used when the last backend phase must be
+    /// timed across the report boundary, e.g. publication).
     pub fn finish_with_phase<K, M, V>(
         mut self,
         lowered: &LoweredProgram<K, M, V>,

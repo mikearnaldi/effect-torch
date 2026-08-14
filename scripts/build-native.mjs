@@ -1,3 +1,13 @@
+// Assembles native .node artifacts without generating JavaScript bindings.
+// `--host` must run from one native package directory; it removes non-preserved
+// dist outputs, retains configured non-host matrix binaries, then builds and
+// copies the selected host/profile artifact. `--matrix` runs on macOS from the workspace
+// root or one package directory, clears the selected package dist contents,
+// cross-builds configured Darwin/Linux release targets, copies/renames shared
+// libraries to loader-selected .node names, and requires the complete selected
+// matrix at the end. TypeScript build and package verification are separate
+// package-script stages.
+
 import fs from "node:fs"
 import path from "node:path"
 import { spawnSync } from "node:child_process"
@@ -23,6 +33,8 @@ const run = (command, args, environment = {}) => {
 }
 
 const darwinBuildEnvironment = (target) => {
+  // Avoid inheriting a Nix/Xcode selection into release artifacts: pin the
+  // system macOS SDK/toolchain and deployment target for both Darwin triples.
   const env = { ...process.env }
   delete env.DEVELOPER_DIR
   const sdk = spawnSync("/usr/bin/xcrun", ["--sdk", "macosx", "--show-sdk-path"], {
@@ -111,6 +123,7 @@ const targetForHost = (nativePackage) => {
     )
   }
 
+  // Match the runtime loaders: absence of glibcVersionRuntime selects musl.
   const libc = process.platform === "linux"
     ? process.report.getReport().header.glibcVersionRuntime === undefined ? "musl" : "gnu"
     : undefined
@@ -175,6 +188,9 @@ const buildMatrix = () => {
   for (const target of targets) {
     const packagesForTarget = selectedPackages.filter((nativePackage) => nativePackage.targets.includes(target.suffix))
     if (packagesForTarget.length === 0) continue
+    // Darwin uses Cargo plus the pinned SDK. Linux cross-builds use zigbuild;
+    // GNU buildTarget values enforce glibc 2.17, while musl leaves crt-static
+    // disabled so the loader can use the platform's dynamic musl runtime.
     const command = target.platform === "linux" ? "zigbuild" : "build"
     const environment = target.platform === "darwin"
       ? darwinBuildEnvironment(target)

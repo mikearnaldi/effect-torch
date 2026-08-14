@@ -1,3 +1,36 @@
+//! Graph-level program transformations: reverse-mode automatic
+//! differentiation ([`grad`]) and vectorization ([`vmap`]) over the semantic
+//! `Node` graph.
+//!
+//! Both transforms consume an immutable graph and produce a *new* graph
+//! generation built from ordinary `NodeKind`s; the compiler afterwards sees
+//! a plain forward graph and needs no autodiff awareness. Design contracts:
+//!
+//! - **Reverse mode** ([`grad`]) walks one topological order of the loss
+//!   graph backwards, accumulating a cotangent graph per node. Broadcasting
+//!   is undone with sum-to-shape reductions; non-float nodes stop gradient
+//!   flow (their mathematical gradient is zero almost everywhere); ops
+//!   without a closed form lower to dedicated backward nodes
+//!   (`SdpaBackward`, `LayerNormBackward`, `KdaBackward`, …) whose outputs
+//!   are selected per differentiable input. Backward nodes themselves are
+//!   deliberately *not* differentiable, so second derivatives fail loudly
+//!   instead of silently producing wrong graphs.
+//! - **Checkpoints** (`NodeKind::Checkpoint`) are rebuilt during the
+//!   backward walk: the region's interior is deep-copied with fresh node
+//!   IDs and the adjoint is built over the copy, so forward intermediates
+//!   are recomputed in the backward phase rather than retained. Region
+//!   inputs and constructor leaves stay shared — random draws and constants
+//!   are not re-run.
+//! - **Vectorization** ([`vmap`]) rebuilds only the subgraph that descends
+//!   from the mapped input, inserting a batch axis at the requested dim.
+//!   Elementwise ops and matmul are unchanged (broadcasting carries the
+//!   batch); shape, slice, permutation, and reduction metadata shifts around
+//!   the inserted axis; random sources draw per batch element; ops with
+//!   data-dependent indexing are rejected explicitly.
+//!
+//! All traversals are iterative; depth is bounded by heap, not the call
+//! stack.
+
 use effect_torch_graph::{
     node_children, remap_children, Device, Node as GraphNode, NodeKind as GraphNodeKind,
     PositionOffset,
@@ -9,6 +42,8 @@ use std::sync::Arc;
 type Node = GraphNode;
 type NodeKind = GraphNodeKind;
 
+/// Node constructor shorthand: every transform funnels through `Node::new`
+/// so shape/dtype validation is always applied to rebuilt graphs.
 fn mk(kind: NodeKind) -> std::result::Result<Arc<Node>, String> {
     Node::new(kind)
 }
@@ -221,6 +256,8 @@ fn expand_reduced(
     broadcast_to(g, target)
 }
 
+/// Iterative postorder from `loss`, deduplicated by node ID — the single
+/// order both `grad` and `vmap` build their transforms over.
 fn topo(loss: &Arc<Node>) -> Vec<Arc<Node>> {
     let mut visited = HashSet::new();
     let mut order = Vec::new();
@@ -465,6 +502,16 @@ fn vmap_rebuild(
     }
 }
 
+/// Maps the output of `y = f(x)` to `f` applied elementwise over a batch
+/// axis of `batched`, where `batched` is `x` with one extra dimension of
+/// size `batch` inserted at `dim`. The result is a graph computing the
+/// batched output with the batch axis at `dim`.
+///
+/// Only the subgraph descending from `x` is rebuilt; the rest is shared.
+/// Returns an error when shapes or dtypes don't match, when the output does
+/// not depend on the input, or when the subgraph contains an op with no
+/// batching rule (data-dependent indexing, stateful decode nodes, quantized
+/// ops, convolutions — see `vmap_rebuild`).
 pub fn vmap(
     y: &Arc<Node>,
     x: &Arc<Node>,
@@ -549,6 +596,15 @@ pub fn vmap(
     Ok(map.get(&y.id).expect("vmap root").clone())
 }
 
+/// Reverse-mode gradients of a scalar loss with respect to `wrt`, in the
+/// same order. A target the loss does not depend on receives an explicit
+/// zeros graph, keeping the walk total.
+///
+/// The loss must be 0-d and floating point, and every target must be
+/// floating point. Quantized (encoded) ops are inference-only and rejected
+/// up front; inference-only nodes (`KvAttention`, `LastTokenRow`, stateful
+/// decode nodes) and backward nodes (no second-order support) fail during
+/// the walk with an explicit error.
 pub fn grad(loss: &Arc<Node>, wrt: &[Arc<Node>]) -> std::result::Result<Vec<Arc<Node>>, String> {
     if !loss.shape.is_empty() {
         return Err(format!(
@@ -615,6 +671,12 @@ fn outside_set(order: &[Arc<Node>], checkpoint_id: u64) -> HashSet<u64> {
     visited
 }
 
+/// The reverse-mode walk: iterates the forward topological order backwards,
+/// extending `cotangents` with each node's adjoint contribution. Cotangents
+/// of nodes with multiple consumers accumulate with `Add` graphs, matching
+/// the total-derivative rule. Per-op adjoint rules are inline; ops with a
+/// closed multi-output adjoint emit one backward node plus one picker per
+/// differentiable input (the `SdpaBackward` pattern).
 fn backward(
     order: &[Arc<Node>],
     cotangents: &mut HashMap<u64, Arc<Node>>,

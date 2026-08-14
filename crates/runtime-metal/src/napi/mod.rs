@@ -1,3 +1,33 @@
+//! Node-API surface for the Metal backend.
+//!
+//! This module bridges JavaScript handles to the graph/compiler/runtime stack:
+//! [`LazyTensor`] owns immutable graph nodes, [`NativeTensor`] owns concrete
+//! Metal leaf slots and reports their external memory to V8, compiled
+//! executables retain frozen bindings/pipelines, and the KV pool/sequence
+//! types own paged decode and recurrent state. Long-running compile, execute,
+//! GGUF, and readback work runs on blocking workers through
+//! [`effect_torch_napi::CancellationState`]; cancellation wins or completion
+//! wins exactly once, so failed/cancelled work is never published halfway.
+//!
+//! # Readback ownership
+//!
+//! Small or strided readbacks copy into a Rust `Vec` whose allocation is
+//! transferred to an external `ArrayBuffer`. Large contiguous readbacks are
+//! zero-copy: the buffer address is registered, a cloned `value::Value`
+//! retains the Metal allocation, and the JS finalizer unregisters and drops it.
+//! `FinalizeHintGuard` restores Rust ownership if ArrayBuffer creation fails,
+//! guaranteeing every transferred allocation or retained tensor is released
+//! exactly once.
+//!
+//! # Decode state
+//!
+//! KV blocks are reference-counted and content-addressed for prefix reuse.
+//! Sequence cursors, block tables, KDA matrices, and short-convolution windows
+//! are prepared into planned staging buffers before dispatch and committed only
+//! after successful execution. Snapshot copies synchronize through the owning
+//! execution path; callers must not overlap direct state preparation with GPU
+//! writes to the same sequence.
+
 mod err;
 mod gguf;
 mod runtime;
@@ -106,6 +136,10 @@ unsafe extern "C" fn finalize_readback(
     _data: *mut std::ffi::c_void,
     hint: *mut std::ffi::c_void,
 ) {
+    // SAFETY: `hint` was created by `Box::into_raw` in `to_napi_value`, is
+    // handed to exactly one external ArrayBuffer, and Node invokes this
+    // finalizer at most once. Reconstructing the box transfers ownership back
+    // to Rust for the single release below.
     let hint = unsafe { Box::from_raw(hint as *mut FinalizeHint) };
     release_readback(*hint);
 }
@@ -117,6 +151,9 @@ fn release_readback(hint: FinalizeHint) {
             unregister_export(addr);
         }
         FinalizeHint::Owned { ptr, len, cap } => {
+            // SAFETY: `ptr`, `len`, and `cap` come unchanged from
+            // `vec_to_bytes`, which forgot exactly one Vec allocation. This
+            // branch is the unique owner and reconstructs it once for drop.
             drop(unsafe { Vec::from_raw_parts(ptr, len, cap) });
         }
     }
@@ -128,6 +165,9 @@ pub struct Readback {
     hint: Option<FinalizeHint>,
 }
 
+// SAFETY: `Readback` contains either uniquely owned Vec allocation metadata or
+// a raw pointer retained by an owned `Value`. No thread dereferences `data`
+// before conversion to an ArrayBuffer, and both ownership hints are Send.
 unsafe impl Send for Readback {}
 
 struct FinalizeHintGuard(*mut std::ffi::c_void);
@@ -135,6 +175,9 @@ struct FinalizeHintGuard(*mut std::ffi::c_void);
 impl Drop for FinalizeHintGuard {
     fn drop(&mut self) {
         if !self.0.is_null() {
+            // SAFETY: a non-null guard owns the Box produced by
+            // `Box::into_raw`; the pointer is nulled only after NAPI accepts
+            // ownership, so this failure path reconstructs it exactly once.
             let hint = unsafe { Box::from_raw(self.0 as *mut FinalizeHint) };
             release_readback(*hint);
         }
@@ -150,6 +193,13 @@ impl Drop for Readback {
 }
 
 impl ToNapiValue for Readback {
+    /// Transfers this readback's backing ownership to a Node ArrayBuffer.
+    ///
+    /// # Safety
+    ///
+    /// Called by NAPI with a live environment. `self.data` is valid for
+    /// `self.byte_len` bytes and retained by `self.hint`; the finalizer takes
+    /// over that hint exactly once if creation succeeds.
     unsafe fn to_napi_value(
         env: napi::sys::napi_env,
         mut value: Self,
@@ -163,6 +213,10 @@ impl ToNapiValue for Readback {
         let mut hint_guard = FinalizeHintGuard(hint);
         let mut result = std::ptr::null_mut();
         napi::check_status!(
+            // SAFETY: `data` is retained by `hint` for the ArrayBuffer's full
+            // lifetime, `byte_len` is the validated logical byte extent, and
+            // `finalize_readback` receives the same Box pointer for one-time
+            // release.
             unsafe {
                 napi::sys::napi_create_external_arraybuffer(
                     env,
@@ -507,6 +561,9 @@ fn readback_blocking(inner: &value::Value) -> Result<Readback> {
         ($type:ty) => {{
             let source = base.cast::<$type>();
             (0..count)
+                // SAFETY: the producing command stream was synchronized above;
+                // every logical offset comes from the tensor's validated
+                // shape/strides and indexes initialized shared-buffer storage.
                 .map(|index| unsafe { *source.add(logical_offset(index)) })
                 .collect::<Vec<$type>>()
         }};
@@ -550,6 +607,9 @@ fn readback_blocking(inner: &value::Value) -> Result<Readback> {
     // Small readbacks are copied so a short-lived scalar/metadata ArrayBuffer
     // cannot pin an entire pooled output segment until GC.
     if !base.is_null() && byte_len <= 4096 {
+        // SAFETY: synchronization completed all GPU writes, and the contiguous
+        // tensor view guarantees `offset..offset + byte_len` lies inside the
+        // retained shared buffer. A zero length does not dereference `base`.
         let bytes = unsafe { std::slice::from_raw_parts(base.add(offset), byte_len) }.to_vec();
         let (_, ptr, len, cap) = vec_to_bytes(bytes);
         return Ok(Readback {
@@ -571,6 +631,8 @@ fn readback_blocking(inner: &value::Value) -> Result<Readback> {
             });
         }
     }
+    // SAFETY: fallback copy after zero-copy registration failed; the same
+    // synchronized contiguous-view bounds as the small-copy branch apply.
     let bytes = unsafe { std::slice::from_raw_parts(base.add(offset), byte_len) }.to_vec();
     let (_, ptr, len, cap) = vec_to_bytes(bytes);
     Ok(Readback {
@@ -1715,6 +1777,10 @@ fn copy_f32_state(tensor: &runtime::metal::run::MetalTensor) -> Option<Box<[f32]
     if tensor.dtype != DType::F32 || !tensor.layout.is_contiguous() {
         return None;
     }
+    // SAFETY: dtype/contiguity were checked above; the layout offset addresses
+    // the first f32 of a retained shared buffer and `numel` is its logical
+    // contiguous extent. State capture is called only after producing work is
+    // synchronized by the decode execution path.
     let ptr = unsafe {
         tensor
             .buffer
@@ -1722,6 +1788,7 @@ fn copy_f32_state(tensor: &runtime::metal::run::MetalTensor) -> Option<Box<[f32]
             .cast::<f32>()
             .add(tensor.layout.offset())
     };
+    // SAFETY: `ptr` and the `numel` extent were established above.
     Some(unsafe { std::slice::from_raw_parts(ptr, tensor.numel()) }.into())
 }
 
@@ -1730,6 +1797,9 @@ fn write_f32_state(tensor: &runtime::metal::run::MetalTensor, data: &[f32]) -> e
     {
         return Err("recurrent state destination does not match its snapshot".to_string());
     }
+    // SAFETY: validation proves equal f32 element counts and contiguous
+    // destination storage. Snapshot storage is distinct host memory, so the
+    // source and destination ranges cannot overlap.
     unsafe {
         std::ptr::copy_nonoverlapping(
             data.as_ptr(),
@@ -1961,6 +2031,9 @@ fn persistent_f32_zeros(shape: Vec<usize>) -> err::Res<runtime::metal::run::Meta
         .checked_mul(std::mem::size_of::<f32>())
         .ok_or_else(|| "decode recurrent state byte size overflow".to_string())?;
     let buffer = device::MetalDevice::get().alloc_raw_checked(bytes)?;
+    // SAFETY: `alloc_raw_checked(bytes)` returned writable shared storage of
+    // at least `bytes`; no tensor view has been published yet, so zeroing the
+    // full allocation through its host pointer is exclusive.
     unsafe {
         std::ptr::write_bytes(buffer.contents_ptr().cast::<u8>(), 0, bytes);
     }
@@ -2092,6 +2165,9 @@ impl MetalDecodeContext for KvContext {
                 .lock()
                 .map_err(|error| format!("decode cursor: sequence lock poisoned: {error}"))?
                 .cursor as i64;
+            // SAFETY: `validate_destination` proved an i64 contiguous cursor
+            // buffer with enough elements for the fixed schema; each index is
+            // below `count` and slots are written once.
             unsafe {
                 cursor
                     .buffer
@@ -2178,6 +2254,10 @@ pub(crate) fn prepare_kv_attention(
         .checked_mul(max_blocks)
         .and_then(|elements| elements.checked_mul(DType::U32.size_in_bytes()))
         .ok_or_else(|| "kv attention: block table byte size overflow".to_string())?;
+    // SAFETY: destination validation above proves every staging tensor is a
+    // contiguous u32 buffer with the listed shape. The computed byte extents
+    // cover exactly those shapes, and preparation runs before GPU dispatch, so
+    // host writes are exclusive.
     unsafe {
         std::ptr::write_bytes(
             table
@@ -2217,6 +2297,9 @@ pub(crate) fn prepare_kv_attention(
         if state.blocks.len() > max_blocks {
             return Err("kv attention: block table exceeds its schema capacity".to_string());
         }
+        // SAFETY: the table row has `max_blocks` u32 entries and the preceding
+        // capacity check proves `state.blocks.len() <= max_blocks`; source and
+        // destination are distinct allocations.
         unsafe {
             let table_row = table
                 .buffer
@@ -2231,6 +2314,8 @@ pub(crate) fn prepare_kv_attention(
             state.advance as u32,
             plan.time.saturating_sub(state.advance) as u32,
         ]) {
+            // SAFETY: each scalar staging tensor was validated as `[batch]`
+            // contiguous u32 storage and `batch_index < active_batch <= batch`.
             unsafe {
                 tensor
                     .buffer
@@ -3937,6 +4022,9 @@ mod epilogue_tests {
             readback.hint.as_ref(),
             Some(FinalizeHint::ZeroCopy { .. })
         ));
+        // SAFETY: `readback` owns/retains `data` for `byte_len` bytes and the
+        // f32-producing tensor guarantees alignment and a multiple-of-four
+        // length for the duration of this copy.
         let expected = unsafe {
             std::slice::from_raw_parts(readback.data.cast::<f32>(), readback.byte_len / 4).to_vec()
         };
@@ -3947,6 +4035,8 @@ mod epilogue_tests {
         for _ in 0..4 {
             drop(run());
         }
+        // SAFETY: the zero-copy hint still retains the same Metal allocation
+        // after the tensor handle was cleared; extent/alignment are unchanged.
         let retained = unsafe {
             std::slice::from_raw_parts(readback.data.cast::<f32>(), readback.byte_len / 4).to_vec()
         };
@@ -4618,6 +4708,8 @@ mod epilogue_tests {
     }
 
     fn state_f32(tensor: &MetalTensor) -> Vec<f32> {
+        // SAFETY: test fixtures pass contiguous f32 state tensors; their
+        // retained buffers contain `numel` initialized values from `offset`.
         unsafe {
             std::slice::from_raw_parts(
                 tensor
@@ -4633,6 +4725,8 @@ mod epilogue_tests {
 
     fn set_state_f32(tensor: &MetalTensor, data: &[f32]) {
         assert_eq!(tensor.numel(), data.len());
+        // SAFETY: the assertion proves equal extents, fixtures use contiguous
+        // f32 state storage, and the host slice cannot overlap Metal memory.
         unsafe {
             std::ptr::copy_nonoverlapping(
                 data.as_ptr(),

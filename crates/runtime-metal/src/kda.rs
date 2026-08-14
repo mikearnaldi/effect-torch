@@ -8,56 +8,125 @@
 //! the ~45-launch primitive reference for the T=1 decode step. All head dims are supported:
 //! out-of-range lanes/rows are masked off (the project rule is to fail
 //! loud on genuinely unsupported input, never to degrade silently).
+//!
+//! ## Kernel contracts and state transactions
+//!
+//! - **Decode** (`et_kda_decode`): T=1 step. `q/k/g [H, Dk]`,
+//!   `v [H, Dv]`, `beta [H]`, fp32 state `[H, Dk, Dv]` read from
+//!   `state` and written in place to `state_next` (the same buffer for
+//!   the decode transaction). One threadgroup per (head, 4-column
+//!   value strip): 32 lanes × 4 strips.
+//! - **Forward** (`et_kda_forward`): the sequential gated delta-rule
+//!   scan over `steps` tokens, `q/k/g [BH, T, Dk]`, `v [BH, T, Dv]`,
+//!   `beta [BH, T]`; flag bit0 reads an fp32 initial state
+//!   `[BH, Dk, Dv]`, bit1 writes the final state. Register-resident at
+//!   Dk/Dv ≤ 128 where the scan beats the chunked WY form.
+//! - **Backward** (`et_kda_backward`): closed-form adjoint, one
+//!   threadgroup per batch·head (the dq/dk/dg/db gradients sum over
+//!   the full value dim). Phase A recomputes chunk-start states into
+//!   the f32 workspace; phase B walks 64-token chunks in reverse,
+//!   recomputing per-token states/deltas and stepping the adjoint L
+//!   back: `L += scale·q·doᵀ; dv = β·Lᵀk; dk = β·(Lδ − S̃(Lᵀk));
+//!   dβ = kᵀLδ; dg = α ⊙ Σ_dv(S_{t-1} ⊙ M); L ← Diag(α)M`.
+//!
+//! The backward requires exactly one f32 scratch view of
+//! `BackwardRequirements::scratch_bytes` (chunk-start states plus one
+//! chunk of per-token states and deltas per batch·head); forward and
+//! decode take no resource views.
 
 use crate::runtime::dtype::DType;
 
+/// Planner-facing requirements of the fused forward scan.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ForwardRequirements {
+    /// Storage dtype of activations (f32 or bf16); state is always f32.
     pub dtype: DType,
+    /// `batch * heads` folded into one grid dim.
     pub batch_heads: usize,
+    /// Sequence length `T`.
     pub steps: usize,
+    /// Key/query head dim `Dk` (any value; out-of-range lanes mask off).
     pub dk: usize,
+    /// Value head dim `Dv`.
     pub dv: usize,
+    /// Output scale, stored as `f64::to_bits` for `Eq`/pipeline keys.
     pub scale_bits: u64,
+    /// Bytes of the `[BH, T, Dv]` output.
     pub output_bytes: usize,
+    /// Bytes of the f32 `[BH, Dk, Dv]` final state; 0 when the call
+    /// does not write it.
     pub state_next_bytes: usize,
+    /// Always 0: no staging views.
     pub staging_bytes: usize,
+    /// Always 0: no runtime status.
     pub status_bytes: usize,
+    /// Always 0: the forward keeps its state in registers.
     pub scratch_bytes: usize,
+    /// Always 1: a single forward kernel per launch.
     pub pipeline_count: usize,
 }
 
+/// Planner-facing requirements of the fused closed-form backward.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BackwardRequirements {
+    /// Storage dtype of gradients (f32 or bf16).
     pub dtype: DType,
+    /// `batch * heads` folded into one grid dim.
     pub batch_heads: usize,
+    /// Sequence length `T`.
     pub steps: usize,
+    /// Key/query head dim `Dk`.
     pub dk: usize,
+    /// Value head dim `Dv`.
     pub dv: usize,
+    /// Output scale, stored as `f64::to_bits` for `Eq`/pipeline keys.
     pub scale_bits: u64,
+    /// Bytes of `dq` (`[BH, T, Dk]`).
     pub dq_bytes: usize,
+    /// Bytes of `dk` (`[BH, T, Dk]`).
     pub dk_bytes: usize,
+    /// Bytes of `dv` (`[BH, T, Dv]`).
     pub dv_bytes: usize,
+    /// Bytes of `dlog_decay` (`[BH, T, Dk]`).
     pub dg_bytes: usize,
+    /// Bytes of `dbeta` (`[BH, T]`).
     pub db_bytes: usize,
+    /// Always 0: no staging views.
     pub staging_bytes: usize,
+    /// Always 0: no runtime status.
     pub status_bytes: usize,
+    /// Bytes of the f32 workspace: per batch·head, `nchunks + 64`
+    /// chunk-state tiles of `Dk·Dv` plus `64·Dv` deltas.
     pub scratch_bytes: usize,
+    /// Always 1: a single backward kernel per launch.
     pub pipeline_count: usize,
 }
 
+/// Planner-facing requirements of the T=1 decode step.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DecodeRequirements {
+    /// Storage dtype of activations (f32 or bf16); state is always f32.
     pub dtype: DType,
+    /// Number of heads `H` (single sequence slot).
     pub heads: usize,
+    /// Key/query head dim `Dk`.
     pub dk: usize,
+    /// Value head dim `Dv`.
     pub dv: usize,
+    /// Output scale, stored as `f64::to_bits` for `Eq`/pipeline keys.
     pub scale_bits: u64,
+    /// Bytes of the `[H, Dv]` output.
     pub output_bytes: usize,
+    /// Bytes of the f32 `[H, Dk, Dv]` next state (always written; for
+    /// decode the same buffer as the input state).
     pub state_next_bytes: usize,
+    /// Always 0: no staging views.
     pub staging_bytes: usize,
+    /// Always 0: no runtime status.
     pub status_bytes: usize,
+    /// Always 0: the decode state lives in registers.
     pub scratch_bytes: usize,
+    /// Always 1: a single decode kernel per launch.
     pub pipeline_count: usize,
 }
 
@@ -69,6 +138,9 @@ fn checked_bytes(elements: &[usize], dtype: DType, operation: &str) -> crate::er
         .ok_or_else(|| format!("{operation}: requirement byte size overflow"))
 }
 
+/// Requirements of the forward scan over `steps` tokens for
+/// `batch_heads` batch·heads; `write_state_next` additionally sizes the
+/// f32 final-state output.
 pub fn forward_requirements(
     dtype: DType,
     batch_heads: usize,
@@ -101,6 +173,8 @@ pub fn forward_requirements(
     })
 }
 
+/// Requirements of the closed-form backward, including the f32
+/// chunk-state workspace.
 pub fn backward_requirements(
     dtype: DType,
     batch_heads: usize,
@@ -145,6 +219,7 @@ pub fn backward_requirements(
     })
 }
 
+/// Requirements of the T=1 decode step for `heads` heads.
 pub fn decode_requirements(
     dtype: DType,
     heads: usize,
@@ -223,14 +298,22 @@ mod metal {
 
     use objc2_metal::MTLComputeCommandEncoder;
 
+    /// Borrowed resource views supplied by the executable planner.
+    /// Forward and decode require all three slices empty; the backward
+    /// requires exactly one f32 scratch view of
+    /// [`super::BackwardRequirements::scratch_bytes`].
     #[derive(Clone, Copy)]
     pub struct IntoResources<'a> {
+        /// Must be empty.
         pub staging: &'a [MetalTensor],
+        /// Must be empty.
         pub status: &'a [MetalTensor],
+        /// Empty for forward/decode; exactly one f32 view for backward.
         pub scratch: &'a [MetalTensor],
     }
 
     impl IntoResources<'_> {
+        /// The resource set for forward and decode dispatches.
         pub const fn empty() -> Self {
             Self {
                 staging: &[],
@@ -394,11 +477,13 @@ kernel void et_kda_decode(
         )
     }
 
+    /// Warms the decode pipeline for (`dtype`, `dk`, `dv`, `scale`).
     pub fn warm_decode(dtype: DType, dk: usize, dv: usize, scale: f64) -> crate::err::Res<()> {
         pipeline(dtype, dk, dv, scale)?;
         Ok(())
     }
 
+    /// Warms exactly the decode pipeline described by `requirements`.
     pub fn warm_decode_exact(requirements: &super::DecodeRequirements) -> crate::err::Res<()> {
         warm_decode(
             requirements.dtype,
@@ -782,6 +867,10 @@ kernel void et_kda_backward(
         )
     }
 
+    /// Non-allocating decode dispatch: advances the fp32 state
+    /// `[H, Dk, Dv]` by one token and writes `output [H, Dv]`.
+    /// `state_next` may alias `state` (the in-place decode
+    /// transaction). All inputs contiguous; pipeline must be warm.
     #[allow(clippy::too_many_arguments)]
     pub fn decode_into(
         q: &MetalTensor,
@@ -859,6 +948,8 @@ kernel void et_kda_backward(
         Ok(())
     }
 
+    /// Allocating convenience wrapper around [`decode_into`]; updates
+    /// `state` in place and returns the `[H, Dv]` output.
     pub fn decode(
         q: &MetalTensor,
         k: &MetalTensor,
@@ -912,11 +1003,13 @@ kernel void et_kda_backward(
         )
     }
 
+    /// Warms the forward pipeline for (`dtype`, `dk`, `dv`, `scale`).
     pub fn warm_forward(dtype: DType, dk: usize, dv: usize, scale: f64) -> crate::err::Res<()> {
         fwd_pipeline(dtype, dk, dv, scale)?;
         Ok(())
     }
 
+    /// Warms exactly the forward pipeline described by `requirements`.
     pub fn warm_forward_exact(requirements: &super::ForwardRequirements) -> crate::err::Res<()> {
         warm_forward(
             requirements.dtype,
@@ -926,11 +1019,13 @@ kernel void et_kda_backward(
         )
     }
 
+    /// Warms the backward pipeline for (`dtype`, `dk`, `dv`, `scale`).
     pub fn warm_backward(dtype: DType, dk: usize, dv: usize, scale: f64) -> crate::err::Res<()> {
         bwd_pipeline(dtype, dk, dv, scale)?;
         Ok(())
     }
 
+    /// Warms exactly the backward pipeline described by `requirements`.
     pub fn warm_backward_exact(requirements: &super::BackwardRequirements) -> crate::err::Res<()> {
         warm_backward(
             requirements.dtype,
@@ -940,10 +1035,10 @@ kernel void et_kda_backward(
         )
     }
 
-    // Fused forward scan: q/k/g [BH, T, Dk], v [BH, T, Dv], beta [BH, T];
-    // optional fp32 initial state [BH, Dk, Dv] and final-state writeback.
-    // Returns (output [BH, T, Dv] in the input dtype, final state when
-    // requested).
+    /// Non-allocating fused forward scan: `q/k/g [BH, T, Dk]`,
+    /// `v [BH, T, Dv]`, `beta [BH, T]`; optional fp32 initial state
+    /// `[BH, Dk, Dv]` and final-state writeback into `state_next`.
+    /// Allocates nothing; pipeline must be warm.
     #[allow(clippy::too_many_arguments)]
     pub fn forward_into(
         q: &MetalTensor,
@@ -1041,6 +1136,8 @@ kernel void et_kda_backward(
         Ok(())
     }
 
+    /// Allocating convenience wrapper around [`forward_into`]; returns
+    /// `(output [BH, T, Dv], final state when requested)`.
     #[allow(clippy::too_many_arguments)]
     pub fn forward(
         q: &MetalTensor,
@@ -1086,9 +1183,12 @@ kernel void et_kda_backward(
         Ok((output, state_next))
     }
 
-    // Fused closed-form backward: same operand contract as the composed
-    // reference, g the output cotangent [BH, T, Dv]. Returns (dq, dk, dv,
-    // dlog_decay, dbeta) in the input dtype.
+    /// Non-allocating fused closed-form backward: same operand contract
+    /// as the composed reference, with `dout` the output cotangent
+    /// `[BH, T, Dv]`; writes `(dq, dk, dv, dlog_decay, dbeta)` in the
+    /// input dtype. Requires exactly one f32 scratch view of
+    /// [`super::BackwardRequirements::scratch_bytes`]. Allocates
+    /// nothing; pipeline must be warm.
     #[allow(clippy::too_many_arguments)]
     pub fn backward_into(
         q: &MetalTensor,
@@ -1185,6 +1285,9 @@ kernel void et_kda_backward(
         Ok(())
     }
 
+    /// Allocating convenience wrapper around [`backward_into`];
+    /// allocates the five gradient tensors and the f32 workspace, then
+    /// returns `(dq, dk, dv, dlog_decay, dbeta)`.
     #[allow(clippy::too_many_arguments)]
     pub fn backward(
         q: &MetalTensor,

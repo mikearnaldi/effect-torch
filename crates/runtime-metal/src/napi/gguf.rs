@@ -1,3 +1,13 @@
+//! Cancellable GGUF inspection and direct-to-Metal loading for Node.
+//!
+//! Inspection converts the strict backend-neutral GGUF catalog into
+//! JavaScript-safe object records. Loading parses the same catalog, allocates
+//! one shared Metal destination per tensor, and streams bytes directly into
+//! that destination on a blocking worker. Quantized tensors remain opaque u8
+//! storage with separate logical f32 metadata; F32 tensors retain f32 storage.
+//! Cancellation is polled by the parser and tensor reader, and partially built
+//! archives are dropped rather than published on failure.
+
 use super::{run_compute, value, CancellationToken, NativeTensor};
 use effect_torch_runtime::{
     parse_gguf, read_gguf_tensor_into, DType, GgufMetadataArray, GgufMetadataEntry,
@@ -7,6 +17,7 @@ use napi::bindgen_prelude::*;
 use napi_derive::napi;
 use std::fs::File;
 
+/// JavaScript representation of one scalar or homogeneous-array metadata item.
 #[napi(object, object_from_js = false)]
 pub struct NativeGgufMetadataEntry {
     pub key: String,
@@ -19,6 +30,7 @@ pub struct NativeGgufMetadataEntry {
     pub boolean_array: Option<Vec<bool>>,
 }
 
+/// JavaScript-safe logical and physical description of one GGUF tensor.
 #[napi(object, object_from_js = false)]
 pub struct NativeGgufTensorDescriptor {
     pub name: String,
@@ -29,18 +41,21 @@ pub struct NativeGgufTensorDescriptor {
     pub physical_dtype: String,
 }
 
+/// Header/catalog inspection result without loaded tensor data.
 #[napi(object, object_from_js = false)]
 pub struct NativeGgufInspection {
     pub metadata: Vec<NativeGgufMetadataEntry>,
     pub tensors: Vec<NativeGgufTensorDescriptor>,
 }
 
+/// One loaded tensor paired with the descriptor used to validate it.
 #[napi(object, object_from_js = false)]
 pub struct NativeGgufLoadedEntry {
     pub descriptor: NativeGgufTensorDescriptor,
     pub tensor: NativeTensor,
 }
 
+/// Complete loaded archive returned atomically to JavaScript.
 #[napi(object, object_from_js = false)]
 pub struct NativeGgufArchive {
     pub entries: Vec<NativeGgufLoadedEntry>,
@@ -141,6 +156,7 @@ fn open(path: &str) -> Result<File> {
     })
 }
 
+/// Parses and validates a GGUF file without loading tensor payloads.
 #[napi]
 pub async fn inspect_gguf(
     path: String,
@@ -157,6 +173,7 @@ pub async fn inspect_gguf(
     .await
 }
 
+/// Parses a GGUF file and loads every supported tensor into Metal storage.
 #[napi]
 pub async fn load_gguf(
     path: String,

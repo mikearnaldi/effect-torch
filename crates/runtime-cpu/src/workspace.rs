@@ -1,3 +1,22 @@
+//! Process-wide workspace pool backing executable scratch memory.
+//!
+//! Compiled executables describe their transient memory as a set of segment
+//! requests (bytes + alignment). This module keys those requests into
+//! [`CpuWorkspaceKey`] capacity classes, allocates backing [`CpuSegment`]s on
+//! demand, and returns them to a shared LRU [`WorkspacePool`] when a lease
+//! ends, so steady-state invocations of a compiled program reuse memory
+//! instead of hitting the global allocator.
+//!
+//! Pool sizing is controlled by the `EFFECT_TORCH_CPU_WORKSPACE_POOL_MB`
+//! environment variable (default 256 MiB of idle segments). Idle segments
+//! beyond the budget are evicted least-recently-used first.
+//!
+//! Ownership model: the pool hands out `Arc<CpuSegment>` owners plus a lease
+//! token. Output and scratch views created during an invocation keep the
+//! segment alive through the `Arc`, and optionally retain the lease itself
+//! (see `CpuStorageRetention`) so a published output tensor pins its pool
+//! segment until the last view is dropped.
+
 use crate::storage::CpuSegment;
 use effect_torch_runtime::{
     NativeMemorySpace, WorkspaceAllocation, WorkspaceAllocator, WorkspaceLease, WorkspacePool,
@@ -5,6 +24,11 @@ use effect_torch_runtime::{
 };
 use std::sync::{Arc, OnceLock};
 
+/// Pool key for one class of CPU workspace segments.
+///
+/// `capacity_class` is the requested byte count rounded up to a multiple of
+/// `alignment`; rounding keeps the pool's best-fit buckets coarse enough to
+/// reuse segments across slightly different requests.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct CpuWorkspaceKey {
     pub memory_space: NativeMemorySpace,
@@ -13,6 +37,8 @@ pub(crate) struct CpuWorkspaceKey {
 }
 
 impl CpuWorkspaceKey {
+    /// Builds a key, validating that `alignment` is a non-zero power of two
+    /// and that the rounded capacity class does not overflow.
     pub(crate) fn new(bytes: usize, alignment: usize) -> Result<Self, String> {
         if alignment == 0 || !alignment.is_power_of_two() {
             return Err(format!("invalid CPU workspace alignment {alignment}"));
@@ -28,6 +54,12 @@ impl CpuWorkspaceKey {
     }
 }
 
+/// Allocates fresh, zeroed, correctly aligned segments for the pool.
+///
+/// The allocator is stateless; all reuse policy lives in the generic
+/// [`WorkspacePool`]. Allocation is validated against the key's memory space,
+/// alignment, and capacity class so a mismatched request can never produce a
+/// segment smaller than expected.
 #[derive(Debug, Default)]
 pub(crate) struct CpuWorkspaceAllocator;
 
@@ -64,6 +96,8 @@ impl WorkspaceAllocator<CpuWorkspaceKey> for CpuWorkspaceAllocator {
 pub(crate) type CpuWorkspacePool = WorkspacePool<CpuWorkspaceKey, CpuWorkspaceAllocator>;
 pub(crate) type CpuWorkspaceLease = WorkspaceLease<CpuWorkspaceKey, CpuWorkspaceAllocator>;
 
+/// Returns the shared workspace pool, initializing it on first use from
+/// `EFFECT_TORCH_CPU_WORKSPACE_POOL_MB` (default: 256 MiB idle budget).
 pub(crate) fn workspace_pool() -> &'static CpuWorkspacePool {
     static POOL: OnceLock<CpuWorkspacePool> = OnceLock::new();
     POOL.get_or_init(|| {
@@ -76,6 +110,10 @@ pub(crate) fn workspace_pool() -> &'static CpuWorkspacePool {
     })
 }
 
+/// Builds a validated pool request for `bytes` at `alignment`.
+///
+/// Zero-byte requests are rounded up to one byte so every lease maps to a
+/// real (minimal) physical allocation.
 pub(crate) fn workspace_request(
     bytes: usize,
     alignment: usize,

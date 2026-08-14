@@ -1,18 +1,21 @@
 /**
- * Optimizers expressed as pure graph transforms. An optimizer's `step`
- * takes the current parameters, their gradients, and optimizer state, and
- * returns updated parameters and updated state as lazy graph values.
- * Nothing is mutated or materialized by the optimizer itself.
+ * Optimizers expressed as stateful-by-value, pure graph transforms. An
+ * optimizer's `step` takes the current parameters, their gradients, and
+ * optimizer state, and returns updated parameters and updated state as lazy
+ * graph values.
+ * Nothing is mutated or materialized by the optimizer itself; persistence and
+ * iteration are explicit at the caller boundary.
  * Because gradients share the loss's forward graph and the updates extend
  * the same graphs further, the loss, the updated parameters, and the
  * updated state can all be roots of one {@link Tensor.compute} invocation:
  * the shared forward and backward graph executes once, and the memory plan may
  * reuse intermediate buffers after their final consumer.
  *
- * The full-step {@link step} helper materializes updated state roots between
- * calls, so graph depth stays O(model depth) no matter how many steps run.
- * Built-in optimizers represent all step-varying state as tensors — the Adam
- * step count `t` is a 0-d tensor, not a JS number — so a compiled executable never
+ * The full-step {@link step} helper materializes updated state roots for the
+ * caller to pass to the next invocation, so repeated use keeps graph depth
+ * O(model depth).
+ * Built-in optimizers represent all step-varying state as tensors: the Adam
+ * step count `t` is a 0-d tensor, not a JS number, so a compiled executable never
  * replays a stale count, flag, or rate. The learning rate is not part of the
  * configuration: it is a per-step input to {@link Optimizer.step}, so
  * learning-rate schedules are ordinary data flowing through the same
@@ -38,7 +41,7 @@
  *
  * @since 0.1.0
  */
-import { Effect } from "effect"
+import { Effect, Exit } from "effect"
 import * as Gradient from "./Gradient.ts"
 import * as Runtime from "./Runtime.ts"
 import * as Tensor from "./Tensor.ts"
@@ -64,13 +67,17 @@ export interface SgdConfig {
 /**
  * State carried between SGD steps: one velocity tensor per parameter
  * (empty when momentum is disabled) and the 0-d `first` flag that selects
- * `v = g` on the first momentum update. The flag is unused without momentum.
+ * `v = g` on the first momentum update. Without momentum, `velocity` is empty,
+ * `stateRoots` is empty, and `first` is inert rather than persisted or rebound.
  *
  * @since 0.1.0
  * @category models
  */
 export interface SgdState {
-  /** Velocities in parameter order; empty when momentum is disabled. */
+  /**
+   * Velocities in parameter order; empty when momentum is disabled. With
+   * momentum these are followed by `first` in the stable root schema.
+   */
   readonly velocity: ReadonlyArray<Tensor.Any>
   /** A 0-d float flag: `1` before the first momentum update, then `0`; unused without momentum. */
   readonly first: Tensor.Any
@@ -118,11 +125,11 @@ export interface AdamWConfig extends AdamConfig {
  * @category models
  */
 export interface AdamState {
-  /** First-moment tensors in parameter order, matching parameter shapes and dtypes. */
+  /** First-moment tensors in parameter order; these are the first root-schema segment. */
   readonly m: ReadonlyArray<Tensor.Any>
-  /** Second-moment tensors in parameter order, matching parameter shapes and dtypes. */
+  /** Second-moment tensors in parameter order; these follow every `m` root. */
   readonly v: ReadonlyArray<Tensor.Any>
-  /** The completed-step count as a 0-d float tensor. */
+  /** The completed-step count as the final root, represented by a 0-d float tensor. */
   readonly t: Tensor.Any
 }
 
@@ -131,14 +138,17 @@ export interface AdamState {
  * state as lazy graph values, in the same order as the input parameters,
  * plus `stateRoots` listing every tensor value whose current value must cross
  * the next step or checkpoint boundary. Inert tensor fields need not appear.
- * The full-step
- * helper and trainer re-materialize these roots between calls so graph depth
- * stays O(model depth). Repack evaluated roots into a new state value with
+ * The arrays are borrowed graph values; extracting roots does not transfer or
+ * release ownership. The full-step helper and trainer re-materialize these
+ * roots between calls so graph depth stays O(model depth). Repack evaluated
+ * roots into a new state value with
  * `optimizer.rebuildState(state, evaluated)`.
  *
  * User-land optimizers implement the same contract. Every step-varying value
- * consumed by `step` must be represented by a stable root; dynamic non-root
- * JavaScript state is captured during compiled tracing and becomes stale.
+ * consumed by `step` must be represented by a stable root. Root count, order,
+ * meaning, shape, dtype, storage, and placement form both the compiled binding
+ * schema and the checkpoint schema. Dynamic non-root JavaScript state is
+ * captured during compiled tracing and becomes stale on cache hits.
  *
  * @since 0.1.0
  * @category models
@@ -153,19 +163,21 @@ export interface OptimizerUpdate<S> {
 }
 
 /**
- * A stateful optimizer as a pure graph transform. `init` validates parameters
- * and creates implementation-defined initial state; built-in optimizers create
- * their required moments, velocities, and scalar controls. `step` extends the
- * graph with update arithmetic. Neither evaluates anything.
+ * A stateful-by-value optimizer as a pure graph transform. `init` validates
+ * parameters and creates implementation-defined initial state; built-in
+ * optimizers create their required moments, velocities, and scalar controls.
+ * `step` extends the graph with update arithmetic. Neither evaluates anything.
  *
  * The learning rate is a per-step input: a 0-d float tensor on the same
  * device as the parameters. Pass a different value every step (a
  * `LearningRate` schedule evaluated by the training loop) without
- * rebuilding the optimizer — the rate flows through the graph as data.
+ * rebuilding the optimizer; the rate flows through the graph as data.
  *
  * {@link Optimizer.stateRoots} / {@link Optimizer.rebuildState} are the
- * canonical extraction and injection of a state's tensor leaves, in one
- * stable order — the boundary a compiled training step rebinds per call.
+ * canonical extraction and injection of a state's dynamic tensor leaves, in
+ * one stable order. That is the boundary a compiled training step rebinds per
+ * call and checkpoint persistence serializes positionally. Neither method
+ * changes tensor ownership.
  *
  * @since 0.1.0
  * @category models
@@ -185,6 +197,12 @@ export interface Optimizer<S> {
    * and placement. `state` must come from `init` or the preceding update
    * for those parameters. `lr` must be a 0-d float tensor on the same
    * placement; using the parameter dtype avoids backend coercion.
+   *
+   * Built-in wrapper validation checks parameter/gradient shapes and dtypes,
+   * moment or velocity shapes/dtypes, and that scalar controls are floating
+   * rank-0 tensors. It does not validate scalar state values or explicitly
+   * compare scalar dtype/placement with each parameter; runtime ownership and
+   * native graph validation enforce the remaining executable constraints.
    */
   readonly step: (
     params: ReadonlyArray<Tensor.Any>,
@@ -194,8 +212,9 @@ export interface Optimizer<S> {
   ) => Effect.Effect<OptimizerUpdate<S>, Tensor.TensorError, Runtime.Runtime>
   /**
    * Extracts every dynamic tensor value needed by the next step in a stable
-   * order. The result is the optimizer state's compiled-program input boundary;
-   * non-root structure must be immutable or reproducible by `init`.
+   * order. The returned array borrows the state's tensors and is the optimizer
+   * state's compiled-program and checkpoint boundary; non-root structure must
+   * be immutable or reproducible by `init`.
    */
   readonly stateRoots: (state: S) => ReadonlyArray<Tensor.Any>
   /**
@@ -210,7 +229,7 @@ export interface Optimizer<S> {
 const isFloat = (dtype: Tensor.DType): boolean => dtype === "f32" || dtype === "f64"
 
 // The step count lives on the ambient device like every other state
-// tensor — never a hidden device override. Its dtype follows the
+// tensor, never a hidden device override. Its dtype follows the
 // params' float width; f32 counts exactly to 2^24 (~16.7M steps),
 // beyond which bias correction is a no-op anyway.
 const stepCount = (
@@ -357,7 +376,9 @@ const validateResult = (
  * when Nesterov is requested without `momentum > 0` and `dampening = 0`.
  * `dampening` and `weightDecay` are not otherwise validated. Initialization
  * and stepping report tensor, state, and backend failures as
- * {@link Tensor.TensorError} in the returned effects.
+ * {@link Tensor.TensorError} in the returned effects. The constructor snapshots
+ * the resolved numeric options in its closure; `init` creates lazy state and
+ * does not materialize it.
  *
  * @since 0.1.0
  * @category constructors
@@ -586,7 +607,8 @@ const makeAdam = (op: string, config: ResolvedAdamConfig): Effect.Effect<Optimiz
  * finite and positive; invalid values throw synchronously while creating
  * the optimizer. For f32 parameters, `init` and `step` can instead fail
  * with {@link Tensor.TensorError} when the rounded first-step bias
- * correction differs by more than 1%.
+ * correction differs by more than 1%. The root schema is every `m`, then every
+ * `v`, then `t`.
  *
  * @since 0.1.0
  * @category constructors
@@ -604,7 +626,8 @@ export const adam = (config: AdamConfig = {}): Effect.Effect<Optimizer<AdamState
  * `0.01`), applied as `p -= lr * weightDecay * p` alongside the adaptive
  * update. The learning rate is a per-step input to `step`. Beta and epsilon
  * validation and errors are the same as {@link adam}; `weightDecay` is not
- * range-checked and may be set to `0` to disable decay.
+ * range-checked and may be set to `0` to disable decay. State and root ordering
+ * are identical to {@link adam}.
  *
  * @since 0.1.0
  * @category constructors
@@ -618,12 +641,13 @@ export const adamW = (config: AdamWConfig = {}): Effect.Effect<Optimizer<AdamSta
   })
 
 /**
- * Clips every gradient elementwise into `[min, max]`. A pure graph
- * transform, applied between {@link Gradient.grad} and
- * {@link Optimizer.step}. Either bound may be omitted; omitting both fails
- * with {@link Tensor.TensorError}. Bounds are not checked for finiteness or
- * ordering, so callers supplying both must ensure `min <= max`. Tensor and
- * backend constraints are reported as {@link Tensor.TensorError}.
+ * Clips every gradient elementwise into `[min, max]`. This borrows the input
+ * gradients and returns lazy graph values without mutation or evaluation. It
+ * is a pure graph transform applied between {@link Gradient.grad} and
+ * {@link Optimizer.step}. Either bound may be omitted; omitting both fails with
+ * {@link Tensor.TensorError}. Bounds are not checked for finiteness or ordering,
+ * so callers supplying both must ensure `min <= max`. Tensor and backend
+ * constraints are reported as {@link Tensor.TensorError}.
  *
  * @since 0.1.0
  * @category transforms
@@ -647,14 +671,14 @@ export const clipByValue = (
   })
 
 /**
- * Clips gradients by global norm (PyTorch semantics): the total norm is the
+ * Clips gradients by global L2 norm: the total norm is the
  * square root of the sum of squares over *all* gradients, and every
  * gradient is scaled by `maxNorm / (totalNorm + 1e-6)` when that factor is
  * below `1`. A pure graph transform, applied between
  * {@link Gradient.grad} and {@link Optimizer.step}. Gradients may have
  * different shapes but must be floating tensors with a common dtype and
  * placement so their scalar squared norms can be added. An empty array
- * returns an empty array. `maxNorm <= 0` fails with
+ * returns an empty array without requiring a runtime. `maxNorm <= 0` fails with
  * {@link Tensor.TensorError}; finiteness is not checked.
  *
  * @since 0.1.0
@@ -695,7 +719,7 @@ export const clipByGlobalNorm = (
 
 /**
  * Maps a parameter tuple/array to the same structure with materialized
- * tensors — tuple in, tuple out.
+ * tensors: tuple in, tuple out.
  *
  * @since 0.1.0
  * @category models
@@ -713,19 +737,23 @@ export type Materialized<P extends ReadonlyArray<Tensor.Any>> = {
  * tensors with the same length, order, shapes, and dtypes as the input
  * parameters (a tuple in, the same tuple out), and the state is rebuilt
  * from those materialized roots via `optimizer.rebuildState`; tensor fields
- * omitted from `stateRoots` remain as supplied by the optimizer. Both are plain leaves of the next step's graph, so graph depth stays
- * O(model depth) no matter how many steps run.
+ * omitted from `stateRoots` remain as supplied by the optimizer. Both are plain
+ * leaves of the next step's graph, so repeated calls keep graph depth O(model
+ * depth). Matching output count and metadata are part of the optimizer
+ * contract; this helper does not independently validate a custom optimizer's
+ * update arrays before retyping them.
  *
  * `lr` is the step's learning rate as a 0-d float tensor on the
- * parameters' device — lift the step's scheduled value with
+ * parameters' device; lift the step's scheduled value with
  * `Tensor.full([], schedule(step), { dtype: params[0].dtype })`.
  * `loss` must be scalar, and it and `params` must use autodiff-supported
  * floating dtypes. Additional parameter, state, and learning-rate constraints
  * are defined by `optimizer`; the built-in optimizers require non-empty
  * f32/f64 parameters and matching state metadata. Gradient, tensor, and
- * backend failures remain in the returned effect. The helper does not clear
- * its inputs or previous state; the caller owns both those tensors and the
- * returned materialized parameter/state roots.
+ * backend failures remain in the returned effect. The helper borrows and does
+ * not clear `loss`, `params`, `state`, or `lr`. Every returned concrete handle
+ * has independent ownership; the caller owns the materialized loss,
+ * parameters, and rebuilt state roots and must release them as appropriate.
  *
  * @since 0.1.0
  * @category destructors
@@ -741,14 +769,29 @@ export const step = <S, P extends ReadonlyArray<Tensor.Any>>(
   Gradient.GradError | Tensor.TensorError,
   Runtime.Runtime
 > =>
-  Effect.gen(function*() {
-    const grads = yield* Gradient.grad(loss, params)
-    const next = yield* optimizer.step(params, grads, state, lr)
-    const evaluated = yield* Tensor.compute([loss, ...next.params, ...next.stateRoots])
-    const [evaluatedLoss, ...rest] = evaluated
-    return {
-      loss: evaluatedLoss,
-      params: rest.slice(0, next.params.length) as Materialized<P>,
-      state: optimizer.rebuildState(next.state, rest.slice(next.params.length))
-    }
+  Effect.suspend(() => {
+    let owned: ReadonlyArray<Tensor.Concrete> = []
+    return Effect.onExit(
+      Effect.gen(function*() {
+        const grads = yield* Gradient.grad(loss, params)
+        const next = yield* optimizer.step(params, grads, state, lr)
+        const evaluated = yield* Effect.uninterruptibleMask((restore) =>
+          Effect.tap(
+            restore(Tensor.compute([loss, ...next.params, ...next.stateRoots])),
+            (values) => Effect.sync(() => void (owned = values))
+          )
+        )
+        const [evaluatedLoss, ...rest] = evaluated
+        const result = {
+          loss: evaluatedLoss,
+          params: rest.slice(0, next.params.length) as Materialized<P>,
+          state: optimizer.rebuildState(next.state, rest.slice(next.params.length))
+        }
+        return result
+      }),
+      (exit) =>
+        Exit.isFailure(exit)
+          ? Effect.ignore(Tensor.clearAll(owned))
+          : Effect.void
+    )
   })

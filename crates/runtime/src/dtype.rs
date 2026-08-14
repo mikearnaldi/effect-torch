@@ -1,5 +1,14 @@
+//! Element types shared by every backend.
+//!
+//! [`DType`] is a closed enumeration: new backends cannot extend it, so
+//! capability negotiation happens per backend via
+//! [`Capabilities`](crate::Capabilities) rather than through the type system.
+//! Quantized formats are deliberately absent — they are storage encodings
+//! (see [`GgmlKQuant`](crate::GgmlKQuant)), not compute dtypes.
+
 use std::fmt;
 
+/// Scalar element type of a tensor or buffer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum DType {
     F32,
@@ -12,6 +21,7 @@ pub enum DType {
 }
 
 impl DType {
+    /// Size of one element in bytes.
     pub fn size_in_bytes(self) -> usize {
         match self {
             DType::F32 => 4,
@@ -24,6 +34,7 @@ impl DType {
         }
     }
 
+    /// Stable lowercase name of the dtype (e.g. `"f32"`, `"bf16"`).
     pub fn name(self) -> &'static str {
         match self {
             DType::F32 => "f32",
@@ -36,6 +47,8 @@ impl DType {
         }
     }
 
+    /// Returns `true` for the floating-point dtypes (`F32`, `F64`, `F16`,
+    /// `BF16`); used by validation that requires real-valued operands.
     pub fn is_float(self) -> bool {
         matches!(self, DType::F32 | DType::F64 | DType::F16 | DType::BF16)
     }

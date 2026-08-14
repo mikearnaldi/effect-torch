@@ -8,6 +8,8 @@ const numberFromBits = (high: number, low: number): number => {
   return view.getFloat64(0, false)
 }
 
+// Exceptional IEEE-754 values and -0 are keyed by raw bits; ordinary finite
+// values remain numbers so structurally equal attributes share cache entries.
 describe("CPU executable structural cache", () => {
   it("keeps every representable special-number key distinct", () => {
     const values = [

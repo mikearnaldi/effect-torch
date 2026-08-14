@@ -1,3 +1,14 @@
+// Quantized Muse-Glimmer chat inference. Model and tokenizer paths are resolved
+// relative to this module, while optional generation/config controls come from
+// MUSE_GLIMMER_* environment variables and invalid configured values fail via
+// Effect Config. Gguf.load uses the provided Registry to select the architecture
+// implementation, validates its tensor catalog, and imports encoded weights on
+// the selected backend. Chat.stream owns the generation session, renders the
+// GGUF template, emits parsed reasoning/content segments incrementally, and
+// closes state on completion, failure, or interruption. The artifact has a
+// 4,096-token full-context pool, so prompt plus decode must fit even when the
+// optional application-side max-new-token limit is omitted.
+
 import * as BackendApple from "@effect-torch/backend-apple-native"
 import { Chat, Gguf, Model, Registry, Tensor } from "@effect-torch/core"
 import * as Tokenizers from "@effect-torch/tokenizers"
@@ -108,6 +119,8 @@ const program = Effect.gen(function*() {
     })
   )
 
+  // Model.inference materializes and retains its own immutable parameter
+  // generation, so the GGUF loader's handles can be released after compilation.
   yield* Tensor.clearAll(loaded.params)
 
   let sawSegment = false

@@ -1,3 +1,12 @@
+//! Safetensors archive IO for the napi boundary.
+//!
+//! Serialization gathers each (possibly strided) tensor into dense
+//! little-endian bytes; deserialization validates the byte length against
+//! the declared shape and dtype before decoding. Writes are atomic: the
+//! archive is serialized to a sibling temporary file (PID + sequence
+//! numbered) and renamed over the destination, with the temporary removed on
+//! failure.
+
 use super::err::{err, Res};
 use super::value::Value;
 use crate::{CpuBuffer, Tensor};
@@ -35,6 +44,7 @@ fn runtime_dtype(dtype: Dtype) -> Res<RuntimeDType> {
     }
 }
 
+/// Gathers a value's logical elements into dense little-endian bytes.
 pub fn tensor_bytes(value: &Value) -> Res<Vec<u8>> {
     let tensor = value.tensor();
     let mut output = Vec::with_capacity(tensor.numel() * tensor.dtype().size_in_bytes());
@@ -70,6 +80,8 @@ pub fn tensor_bytes(value: &Value) -> Res<Vec<u8>> {
     Ok(output)
 }
 
+/// Decodes dense little-endian bytes into a contiguous tensor of `shape`
+/// and `dtype`; the byte length must match exactly.
 pub fn value_from_bytes(bytes: &[u8], shape: &[usize], dtype: RuntimeDType) -> Res<Value> {
     let elements = shape
         .iter()
@@ -167,6 +179,8 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Res<()> {
     result
 }
 
+/// Serializes `tensors` and `metadata` into a safetensors archive at
+/// `path`, atomically replacing any existing file.
 pub fn save(
     tensors: &HashMap<String, Value>,
     metadata: &HashMap<String, String>,
@@ -192,11 +206,14 @@ pub fn save(
     atomic_write(Path::new(path), &encoded)
 }
 
+/// A loaded archive: name-sorted entries plus archive metadata.
 pub struct LoadedArchive {
     pub entries: Vec<(String, Value)>,
     pub metadata: HashMap<String, String>,
 }
 
+/// Loads the archive at `path`, decoding every tensor and returning entries
+/// sorted by name.
 pub fn load(path: &str) -> Res<LoadedArchive> {
     let raw = std::fs::read(path).map_err(|error| error.to_string())?;
     let (_, parsed_metadata) =

@@ -1,7 +1,7 @@
 #!/bin/sh
 # Downloads the FineWeb pre-training inputs into examples/data/
 # (gitignored): one FineWeb-Edu sample-10BT parquet shard (~2.15GB,
-# ~750M documents' worth of text) and the pretrained GPT-2 BPE
+# ~750M tokens across 726k documents) and the pretrained GPT-2 BPE
 # tokenizer. prepare.ts turns these into u16 token bins.
 set -e
 cd "$(dirname "$0")/.."

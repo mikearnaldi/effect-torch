@@ -1,3 +1,51 @@
+//! Metal device singleton, buffer pool allocator, encoder/submission
+//! management, and pipeline cache.
+//!
+//! # Ownership model
+//!
+//! - [`MetalDevice`] is created once (`MetalDevice::get`) and owns the
+//!   `MTLDevice`, one shared `MTLCommandQueue`, the bucketed buffer pool,
+//!   the pipeline cache, and a registry of live submission contexts.
+//! - [`Buffer`] wraps an `MTLBuffer` plus a byte `base` offset: planned
+//!   slices share one physical allocation and one `BufferUsage` token.
+//!   Every physical allocation is reference-counted through `BufferUsage`,
+//!   which also tracks how many pending/in-flight command buffers can
+//!   still touch the storage.
+//! - Encoding happens inside a `SubmissionContext` (explicit via
+//!   `begin_submission`, or an implicit per-thread one). Each context owns
+//!   its `EncoderManager`: one open command buffer + compute encoder at a
+//!   time, committed when full, on demand, or at synchronize.
+//!
+//! # Asynchronous command buffer hazards
+//!
+//! Metal executes committed command buffers asynchronously and may overlap
+//! them, and this allocator recycles buffers aggressively. Three
+//! mechanisms make that safe:
+//!
+//! 1. A shared `MTLEvent` serializes consecutive command buffers from one
+//!    context (commit order is not execution order on the GPU).
+//! 2. A `memoryBarrierWithScope(Buffers)` after every dispatch orders
+//!    dispatches within one command buffer (hazard tracking is untracked).
+//! 3. `BufferUse` tokens, attached to each committed command buffer, keep
+//!    physical storage alive and un-recyclable until the command buffer
+//!    completes; retired roots are reaped only at completion boundaries.
+//!
+//! Host reads must go through `synchronize`/`synchronize_buffer`, which
+//! drain in-flight work and surface GPU command buffer failures (device
+//! memory exhaustion surfaces as `kIOGPUCommandBufferCallbackErrorOutOfMemory`
+//! and is reported as a lost-work error, not silent corruption).
+//!
+//! # Memory policy
+//!
+//! Live driver-allocated root bytes are accounted in [`LIVE_BYTES`] with
+//! an optional hard cap (`EFFECT_TORCH_MEMORY_CAP_MB`). A soft budget
+//! (`EFFECT_TORCH_MEMORY_BUDGET_MB`, default half the recommended working
+//! set) triggers host-GPU backpressure: dead pool buckets are retired and
+//! the host waits on the oldest in-flight command buffer until pressure
+//! subsides. Environment policy is snapshotted once by
+//! [`snapshot_global_environment`]; later execution observes only the
+//! immutable snapshot.
+
 use crate::runtime::dtype::DType;
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
@@ -10,20 +58,32 @@ use std::collections::HashMap;
 use std::ptr::NonNull;
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
+/// Linear probes per pool bucket before allocating a fresh root buffer.
 const PROBES: usize = 8;
+/// Maximum cached buffers per size bucket.
 const MAX_BUCKET: usize = 4096;
+/// Dispatches after which an open command buffer is committed.
 const DISPATCHES_PER_BUFFER: usize = 4096;
 
+/// Total compute dispatches encoded since the last [`dispatch_stats_reset`].
 pub static DISPATCHES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Total device-wide synchronizations since the last reset.
 pub static SYNCS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Total nanoseconds spent inside `synchronize` since the last reset.
 pub static SYNC_NANOS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Pipeline cache misses that required a full MSL compile.
 pub static PIPELINE_COMPILE_MISSES: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
+/// Compile attempts rejected because executable dispatch forbids them.
 pub static EXECUTABLE_PIPELINE_MISS_ATTEMPTS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
+/// Allocation attempts rejected because executable dispatch forbids them.
 pub static EXECUTABLE_ALLOCATION_ATTEMPTS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
+/// Monotonic sequence number assigned to each committed command buffer;
+/// used to find the globally oldest in-flight submission for backpressure.
 static SUBMISSION_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Monotonic id for each created `MetalDevice` (multi-device tests).
 static DEVICE_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 #[cfg(test)]
@@ -31,6 +91,8 @@ thread_local! {
     static INJECTED_PRIOR_FAILURE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
+/// Arms a one-shot injected command buffer failure for the calling thread,
+/// consumed by the next `begin_submission`/`synchronize` (tests only).
 #[cfg(test)]
 pub fn inject_prior_command_buffer_failure_for_test() {
     INJECTED_PRIOR_FAILURE.with(|failure| failure.set(true));
@@ -106,7 +168,7 @@ fn live_bytes_untrack(size: usize) {
 // and a command buffer fails with kIOGPUCommandBufferCallbackError-
 // OutOfMemory (this is what the pre-RFC-0016 mid-step index readback
 // accidentally prevented by syncing every step). When live bytes pass
-// the budget — the env cap if set, else 3/4 of the device's
+// the budget — the env cap if set, else 1/2 of the device's
 // recommended working set — dead buckets are moved to the retired list
 // and the host waits on the oldest in-flight command buffer until
 // pressure subsides. Steps that fit never wait.
@@ -144,6 +206,7 @@ pub fn snapshot_global_environment() {
     let _ = memory_budget();
 }
 
+/// Resets and returns the (dispatches, syncs, sync-nanos) counters.
 pub fn dispatch_stats_reset() -> (u64, u64, u64) {
     let d = DISPATCHES.swap(0, std::sync::atomic::Ordering::Relaxed);
     let s = SYNCS.swap(0, std::sync::atomic::Ordering::Relaxed);
@@ -151,8 +214,13 @@ pub fn dispatch_stats_reset() -> (u64, u64, u64) {
     (d, s, n)
 }
 const SWEEP_MS: u64 = 100;
+/// Opaque owner kept alive by a buffer view: a workspace pool lease (or any
+/// other resource) whose drop releases the underlying allocation. Views
+/// clone it so dropping the root early cannot recycle pooled storage.
 pub(crate) type BufferRetention = Arc<dyn Send + Sync>;
 
+/// Per-physical-allocation bookkeeping shared by every [`Buffer`] view of
+/// the same storage.
 struct BufferUsage {
     // Keeps the physical allocation alive after its last Buffer wrapper drops
     // but while an encoded command buffer can still access it.
@@ -174,12 +242,16 @@ impl BufferUsage {
         }
     }
 
+    /// True while at least one pending or in-flight command buffer can
+    /// still read or write this storage; the allocator must not recycle it.
     fn in_use(&self) -> bool {
         self.pending_or_in_flight
             .load(std::sync::atomic::Ordering::Acquire)
             > 0
     }
 
+    /// Records `producer` as the submission context that will write this
+    /// storage next; clears any previously published producer failure.
     fn set_producer(&self, producer: &Arc<SubmissionContext>) {
         self.producer_failure
             .lock()
@@ -191,6 +263,10 @@ impl BufferUsage {
             .unwrap_or_else(|error| error.into_inner()) = Some(Arc::downgrade(producer));
     }
 
+    /// Blocks until the recorded producer of this storage has drained its
+    /// pending work, unless `consumer` is that same context (a context never
+    /// waits on itself). Propagates a recorded producer failure to every
+    /// dependent, once per dependent.
     fn synchronize_producer(
         &self,
         consumer: Option<&Arc<SubmissionContext>>,
@@ -224,6 +300,9 @@ impl BufferUsage {
         result
     }
 
+    /// Called when a producer context finishes synchronizing: clears the
+    /// producer registration and, on failure, publishes the error so later
+    /// consumers fail fast instead of reading lost GPU work.
     fn complete_producer(&self, producer: &SubmissionContext, result: &crate::err::Res<()>) {
         let mut current = self
             .producer
@@ -253,6 +332,10 @@ impl Drop for BufferUsage {
     }
 }
 
+/// A use-count token held by a command buffer for the lifetime of its
+/// pending/in-flight state. Constructing it increments
+/// `BufferUsage::pending_or_in_flight`; dropping decrements it. Also
+/// carries the buffer's retention so pool leases ride the command buffer.
 struct BufferUse {
     usage: Arc<BufferUsage>,
     _retention: Option<BufferRetention>,
@@ -279,6 +362,13 @@ impl Drop for BufferUse {
     }
 }
 
+/// A view onto Metal storage: an `MTLBuffer` handle plus a byte offset.
+///
+/// Root buffers own a driver allocation; suballocations (`suballoc`) clone
+/// the same handle with a nonzero `base` and keep the root alive through
+/// `_owner`. All views of one physical allocation share a single
+/// `BufferUsage`, so in-flight tracking and producer/consumer
+/// synchronization apply to the storage as a whole, not to any one view.
 pub struct Buffer {
     raw: Retained<ProtocolObject<dyn MTLBuffer>>,
     pub size: usize,
@@ -292,6 +382,8 @@ pub struct Buffer {
 }
 
 impl Buffer {
+    /// Wraps an already-created `MTLBuffer` as a root buffer of `size`
+    /// bytes, outside the pool and without live-byte accounting.
     pub fn from_raw(raw: Retained<ProtocolObject<dyn MTLBuffer>>, size: usize) -> Self {
         let usage = Arc::new(BufferUsage::new(&raw, None));
         Buffer {
@@ -304,10 +396,18 @@ impl Buffer {
         }
     }
 
+    /// Creates a `size`-byte view at byte offset `base` within `segment`,
+    /// inheriting the segment's retention.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `base + size` exceeds the segment size.
     pub fn suballoc(segment: &Arc<Buffer>, base: usize, size: usize) -> Self {
         Self::suballoc_with_retention(segment, base, size, segment._retention.clone())
     }
 
+    /// Creates a suballocation view that additionally retains `retention`
+    /// (e.g. the workspace pool lease backing the segment).
     pub(crate) fn suballoc_with_retention(
         segment: &Arc<Buffer>,
         base: usize,
@@ -325,7 +425,14 @@ impl Buffer {
         }
     }
 
+    /// Host pointer to the start of this view's contents (shared storage
+    /// mode only; the GPU may not have produced the bytes yet — synchronize
+    /// first).
     pub fn contents_ptr(&self) -> *mut std::ffi::c_void {
+        // SAFETY: `raw` is a live shared-mode MTLBuffer, so `contents()` is
+        // a valid host mapping for the allocation's full length; `base` is
+        // bounded by construction (`suballoc` asserts `base + size` fits), so
+        // the offset stays in bounds.
         unsafe {
             self.raw
                 .contents()
@@ -336,6 +443,7 @@ impl Buffer {
         }
     }
 
+    /// The underlying `MTLBuffer` handle (without the view's byte offset).
     pub fn as_raw(&self) -> &ProtocolObject<dyn MTLBuffer> {
         &self.raw
     }
@@ -344,10 +452,13 @@ impl Buffer {
         self.usage.in_use()
     }
 
+    /// Forwards to the shared usage token; see [`BufferUsage::set_producer`].
     fn set_producer(&self, producer: &Arc<SubmissionContext>) {
         self.usage.set_producer(producer);
     }
 
+    /// Forwards to the shared usage token; see
+    /// [`BufferUsage::synchronize_producer`].
     fn synchronize_producer(
         &self,
         consumer: Option<&Arc<SubmissionContext>>,
@@ -355,19 +466,44 @@ impl Buffer {
         self.usage.synchronize_producer(consumer)
     }
 
+    /// Copies `n` f32 elements starting at `offset_elems` (relative to this
+    /// view) to the host. The caller must have synchronized the producer.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the requested element range exceeds the view size.
     pub fn read_f32(&self, offset_elems: usize, n: usize) -> Vec<f32> {
         assert!(offset_elems * 4 + n * 4 <= self.size);
+        // SAFETY: the assert bounds the f32 element range within this view;
+        // contents_ptr is a valid host mapping of shared storage. The caller
+        // contract (post-synchronize) ensures the GPU is not concurrently
+        // writing these bytes.
         let ptr = unsafe { self.contents_ptr().cast::<f32>().add(offset_elems) };
+        // SAFETY: `ptr` is valid for `n` f32 reads per the bounds above.
         unsafe { std::slice::from_raw_parts(ptr, n) }.to_vec()
     }
 
+    /// Writes `data` into this view at `offset_elems`. Callers must ensure
+    /// no GPU work concurrently reads or writes the range.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the write range exceeds the view size.
     pub fn write_f32(&mut self, offset_elems: usize, data: &[f32]) {
         assert!(offset_elems * 4 + data.len() * 4 <= self.size);
+        // SAFETY: the assert bounds the write range within this view;
+        // `&mut self` guarantees no other host alias of this view, and the
+        // caller contract excludes concurrent GPU access.
         let ptr = unsafe { self.contents_ptr().cast::<f32>().add(offset_elems) };
+        // SAFETY: source and destination are valid for `data.len()` f32s and
+        // cannot overlap (one is host memory, one is device-shared storage).
         unsafe { std::ptr::copy_nonoverlapping(data.as_ptr(), ptr, data.len()) };
     }
 }
 
+/// Per-command-buffer set of physical allocations it can touch, keyed by
+/// the shared usage token. Besides keeping storage alive until completion,
+/// `referenced_bytes` drives the byte-budgeted early commit.
 #[derive(Default)]
 struct CommandBufferReferences {
     uses: HashMap<usize, BufferUse>,
@@ -375,6 +511,8 @@ struct CommandBufferReferences {
 }
 
 impl CommandBufferReferences {
+    /// Records that the open command buffer references `buffer`'s storage
+    /// (idempotent per physical allocation).
     fn track(&mut self, buffer: &Buffer) {
         let key = Arc::as_ptr(&buffer.usage) as usize;
         if self.uses.contains_key(&key) {
@@ -386,23 +524,30 @@ impl CommandBufferReferences {
         self.uses.insert(key, BufferUse::new(buffer));
     }
 
+    /// Hands the accumulated use tokens to a committing command buffer.
     fn take(&mut self) -> Vec<BufferUse> {
         self.referenced_bytes = 0;
         std::mem::take(&mut self.uses).into_values().collect()
     }
 }
 
+/// A compiled compute pipeline. Cheap to clone (retained handle); the
+/// device caches these by content key, so identical kernels compile once.
 #[derive(Clone)]
 pub struct Pipeline {
     raw: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
 }
 
 impl Pipeline {
+    /// The underlying `MTLComputePipelineState` handle.
     pub fn as_raw(&self) -> &ProtocolObject<dyn MTLComputePipelineState> {
         &self.raw
     }
 }
 
+/// Bucketed pool of root buffers, keyed by bucket size. Buffers whose only
+/// strong reference is the bucket's are candidates for reuse; busy or
+/// in-flight roots are never recycled.
 struct Allocator {
     buckets: HashMap<usize, Vec<Arc<Buffer>>>,
     cursor: usize,
@@ -439,6 +584,9 @@ impl Allocator {
     }
 }
 
+/// Owns one submission stream's encoding state: the open command
+/// buffer/encoder pair, the in-flight list, ordering event, and deferred
+/// failure records. One per `SubmissionContext`, always mutex-confined.
 struct EncoderManager {
     queue: Retained<ProtocolObject<dyn MTLCommandQueue>>,
     current: Option<(
@@ -475,6 +623,9 @@ struct EncoderManager {
     profile_samples: Vec<(&'static str, f64)>,
 }
 
+/// Resources carried by a committed command buffer until it completes:
+/// retired roots dropped into it and the use tokens of every referenced
+/// physical allocation.
 struct CommandBufferResources {
     _retired: Vec<Arc<Buffer>>,
     _uses: Vec<BufferUse>,
@@ -486,8 +637,9 @@ impl EncoderManager {
         device: &ProtocolObject<dyn MTLDevice>,
     ) -> Self {
         let event = device.newSharedEvent().expect("metal shared event");
-        // The wait/signal API takes the MTLEvent super-protocol; same
-        // object, rewrapped at the type level.
+        // SAFETY: `MTLSharedEvent` refines `MTLEvent` — same object,
+        // rewrapped at the type level for the wait/signal API, which takes
+        // the super-protocol.
         let order_event: Retained<ProtocolObject<dyn objc2_metal::MTLEvent>> =
             unsafe { Retained::cast_unchecked(event) };
         EncoderManager {
@@ -507,6 +659,8 @@ impl EncoderManager {
         self.profile_label = label;
     }
 
+    /// Records a failed command buffer's description in `failures`; the
+    /// error is surfaced by the next full `synchronize`, never mid-stream.
     fn record_failure(&mut self, sequence: u64, cb: &ProtocolObject<dyn MTLCommandBuffer>) {
         if cb.status() != objc2_metal::MTLCommandBufferStatus::Error {
             return;
@@ -518,6 +672,10 @@ impl EncoderManager {
         self.failures.push((sequence, description));
     }
 
+    /// Drops completed (or errored) command buffers from the head of the
+    /// in-flight list, releasing their carried resources back to the
+    /// driver mid-step. Stops at the first still-running buffer — the
+    /// queue is serial, so later buffers cannot have completed either.
     fn reap_completed(&mut self) {
         while let Some((_, cb, _, _)) = self.in_flight.first() {
             let done = matches!(
@@ -558,6 +716,8 @@ impl EncoderManager {
         true
     }
 
+    /// Creates the open command buffer + compute encoder pair if none is
+    /// open, wiring the cross-buffer ordering wait first.
     fn ensure_encoder(&mut self) {
         self.reap_completed();
         if self.current.is_none() {
@@ -572,6 +732,9 @@ impl EncoderManager {
         }
     }
 
+    /// Closes out one dispatch: intra-buffer memory barrier, counters,
+    /// and (unless the caller is a planned executable that commits
+    /// explicitly) a size/byte-budgeted automatic commit.
     fn finish_dispatch(
         &mut self,
         references: &mut CommandBufferReferences,
@@ -594,6 +757,9 @@ impl EncoderManager {
         }
     }
 
+    /// Ends encoding on the open command buffer, signals the ordering
+    /// event, commits, and moves it (with its retired roots and use
+    /// tokens) onto the in-flight list.
     fn commit(&mut self, references: &mut CommandBufferReferences, retired: &mut Vec<Arc<Buffer>>) {
         if let Some((cb, encoder)) = self.current.take() {
             encoder.endEncoding();
@@ -614,6 +780,10 @@ impl EncoderManager {
         }
     }
 
+    /// Commits any open buffer and blocks until every in-flight command
+    /// buffer has completed; then reports accumulated failures and drains
+    /// profiling samples. After this returns `Ok`, all GPU-visible writes
+    /// from this stream are host-visible.
     fn synchronize(
         &mut self,
         references: &mut CommandBufferReferences,
@@ -647,15 +817,19 @@ impl EncoderManager {
         result
     }
 
+    /// True when this stream has an open buffer, in-flight work, or an
+    /// unconsumed failure.
     fn has_pending_work(&self) -> bool {
         self.current.is_some() || !self.in_flight.is_empty() || !self.failures.is_empty()
     }
 
+    /// Submission sequence of the oldest in-flight command buffer.
     fn oldest_submission(&self) -> Option<u64> {
         self.in_flight.first().map(|(sequence, _, _, _)| *sequence)
     }
 }
 
+/// Folds recorded command buffer failures into one lost-work error.
 fn command_buffer_result(failures: Vec<(u64, String)>) -> crate::err::Res<()> {
     if failures.is_empty() {
         return Ok(());
@@ -671,6 +845,11 @@ fn command_buffer_result(failures: Vec<(u64, String)>) -> crate::err::Res<()> {
     ))
 }
 
+/// One isolated command stream: its encoder manager, the reference/retired
+/// lists riding its commits, a sticky failure slot, and the set of buffers
+/// it has been marked as writing (for producer/consumer synchronization).
+/// Contexts share the device queue but never share encoders, so concurrent
+/// host threads encode independently and failures stay isolated per stream.
 struct SubmissionContext {
     device_id: u64,
     manager: Mutex<EncoderManager>,
@@ -692,6 +871,9 @@ impl SubmissionContext {
         }
     }
 
+    /// Runs `f` against this stream's open compute encoder, then closes
+    /// out the dispatch. Panics if the stream already failed — continuing
+    /// to encode after lost GPU work would mask the corruption.
     fn with_encoder<R>(
         self: &Arc<Self>,
         allow_automatic_commit: bool,
@@ -725,6 +907,7 @@ impl SubmissionContext {
         out
     }
 
+    /// Commits the open command buffer without waiting.
     fn commit(&self) {
         let mut manager = self
             .manager
@@ -741,6 +924,9 @@ impl SubmissionContext {
         manager.commit(&mut references, &mut retired);
     }
 
+    /// Drains the stream (see [`EncoderManager::synchronize`]), sticks any
+    /// failure to the context, and publishes the outcome to every buffer
+    /// this stream was marked as writing.
     fn synchronize(&self) -> crate::err::Res<()> {
         if let Some(error) = self
             .failure
@@ -823,6 +1009,8 @@ impl SubmissionContext {
             .oldest_submission()
     }
 
+    /// Records `usage` as written by this stream so `publish_writes` can
+    /// complete its producer registration at the next drain.
     fn track_write(&self, usage: &Arc<BufferUsage>) {
         self.writes
             .lock()
@@ -830,6 +1018,8 @@ impl SubmissionContext {
             .insert(Arc::as_ptr(usage) as usize, Arc::downgrade(usage));
     }
 
+    /// Completes the producer registration of every buffer written by this
+    /// stream, propagating `result` (failures become visible to dependents).
     fn publish_writes(&self, result: &crate::err::Res<()>) {
         let writes = std::mem::take(
             &mut *self
@@ -844,6 +1034,8 @@ impl SubmissionContext {
 }
 
 impl Drop for SubmissionContext {
+    /// A dropped context drains its own stream first: no committed work
+    /// may outlive the context that owns its failure bookkeeping.
     fn drop(&mut self) {
         let result = {
             let manager = self
@@ -866,11 +1058,14 @@ impl Drop for SubmissionContext {
     }
 }
 
+/// Whether `[metal-profile]` reporting is on (`EFFECT_TORCH_METAL_PROFILE`).
 fn metal_profile_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| std::env::var_os("EFFECT_TORCH_METAL_PROFILE").is_some())
 }
 
+/// RAII region attributing committed command buffers to one profile label;
+/// dropping commits the stream and clears the label.
 pub(crate) struct MetalProfileRegion {
     context: Arc<SubmissionContext>,
 }
@@ -886,10 +1081,12 @@ impl Drop for MetalProfileRegion {
     }
 }
 
-// Metal command queues, command buffers, and encoders are thread-safe at the
-// API boundary. Each manager is mutex-confined and each encoder is used by one
-// host thread at a time.
+// SAFETY: Metal command queues, command buffers, and encoders are
+// thread-safe at the API boundary. Each EncoderManager is mutex-confined,
+// each encoder is used by one host thread at a time, and the reference /
+// retired / failure / writes fields are all independently mutex-guarded.
 unsafe impl Send for SubmissionContext {}
+// SAFETY: see the `Send` impl above; all shared state is synchronized.
 unsafe impl Sync for SubmissionContext {}
 
 thread_local! {
@@ -898,6 +1095,9 @@ thread_local! {
     static ENCODING_SUBMISSIONS: RefCell<Vec<Arc<SubmissionContext>>> = const { RefCell::new(Vec::new()) };
 }
 
+/// RAII guard marking `context` as the encoding submission while
+/// `with_encoder` runs its closure; lets free functions like [`set_buffer`]
+/// find the owning stream for reference tracking.
 struct EncodingContextGuard;
 
 impl EncodingContextGuard {
@@ -915,6 +1115,9 @@ impl Drop for EncodingContextGuard {
     }
 }
 
+/// RAII handle for an explicit submission (`begin_submission`): dropping
+/// it synchronizes any remaining work and pops the thread-local active
+/// stack.
 pub(crate) struct MetalSubmissionGuard<'a> {
     device: &'a MetalDevice,
     context: Arc<SubmissionContext>,
@@ -933,6 +1136,9 @@ impl Drop for MetalSubmissionGuard<'_> {
     }
 }
 
+/// The Metal device facade: raw device + shared command queue, the buffer
+/// pool, the pipeline cache, the device-level retired list, and a weak
+/// registry of live submission contexts (used for global backpressure).
 pub struct MetalDevice {
     id: u64,
     raw: Retained<ProtocolObject<dyn MTLDevice>>,
@@ -943,15 +1149,31 @@ pub struct MetalDevice {
     submissions: Mutex<Vec<Weak<SubmissionContext>>>,
 }
 
-// Buffers/pipelines are immutable after creation. Submission contexts isolate
-// command streams and failures while sharing one thread-safe command queue.
+// SAFETY: Metal device/queue/buffer/pipeline objects are thread-safe at the
+// API boundary. All mutable host-side state (allocator, caches, lists) is
+// mutex-confined; Buffer fields are immutable after construction except the
+// atomics/mutexes inside BufferUsage. GPU-side hazards are handled by the
+// ordering event, per-dispatch barriers, and use tokens documented at the
+// module level.
 unsafe impl Send for MetalDevice {}
+// SAFETY: see above; shared access only touches synchronized or immutable
+// state.
 unsafe impl Sync for MetalDevice {}
+// SAFETY: `raw` is an immutable retained handle; `size`/`base` are immutable
+// after construction; hazards on the shared storage go through the atomics
+// and mutexes in the shared `BufferUsage`.
 unsafe impl Send for Buffer {}
+// SAFETY: see the `Send` impl above.
 unsafe impl Sync for Buffer {}
+// SAFETY: fields are a retained handle, an atomic, and mutex-guarded
+// producer state — all safe to share across threads.
 unsafe impl Send for BufferUsage {}
+// SAFETY: see the `Send` impl above.
 unsafe impl Sync for BufferUsage {}
 
+/// Storage options for host-visible buffers: shared storage (unified
+/// memory) with untracked hazards — ordering is the runtime's job (event +
+/// barriers), not the driver's.
 static SHARED_OPTIONS: MTLResourceOptions = MTLResourceOptions(
     MTLResourceOptions::StorageModeShared.0 | MTLResourceOptions::HazardTrackingModeUntracked.0,
 );
@@ -968,6 +1190,8 @@ thread_local! {
     };
 }
 
+/// Panic payload raised when an allocation entry point is hit during
+/// executable dispatch (where every byte must come from the plan).
 #[derive(Debug)]
 pub(crate) struct ForbiddenExecutableAllocation {
     operation: &'static str,
@@ -983,6 +1207,9 @@ impl std::fmt::Display for ForbiddenExecutableAllocation {
     }
 }
 
+/// RAII guard for executable dispatch: while held on this thread,
+/// allocation and pipeline compilation are forbidden, and command buffers
+/// are only committed explicitly (no size-triggered automatic commit).
 pub(crate) struct ExecutableDispatchGuard;
 
 impl Drop for ExecutableDispatchGuard {
@@ -1020,6 +1247,9 @@ pub fn with_execution_environment<R>(private: bool, mma: bool, f: impl FnOnce() 
     })
 }
 
+/// Whether pool allocations default to private storage (only legal for
+/// intermediates the host never reads); thread-local policy with an
+/// `EFFECT_TORCH_PRIVATE_INTERMEDIATES` env default.
 fn private_intermediates() -> bool {
     PRIVATE_INTERMEDIATES.with(|policy| {
         policy.get().unwrap_or_else(|| {
@@ -1030,6 +1260,8 @@ fn private_intermediates() -> bool {
     })
 }
 
+/// Whether simdgroup-MMA kernels are enabled (thread-local policy;
+/// `EFFECT_TORCH_NO_MMA` forces the naive tiled path).
 pub fn mma_enabled() -> bool {
     MMA_ENABLED.with(|policy| {
         policy.get().unwrap_or_else(|| {
@@ -1039,6 +1271,8 @@ pub fn mma_enabled() -> bool {
     })
 }
 
+/// True when some Metal device can create a command queue and shared
+/// event — the two capabilities this runtime requires.
 pub fn is_available() -> bool {
     objc2_metal::MTLCopyAllDevices()
         .iter()
@@ -1046,11 +1280,19 @@ pub fn is_available() -> bool {
 }
 
 impl MetalDevice {
+    /// The process-wide device singleton (ordinal 0).
+    ///
+    /// # Panics
+    ///
+    /// Panics if no Metal device is available or the queue cannot be
+    /// created.
     pub fn get() -> &'static MetalDevice {
         static DEVICE: OnceLock<MetalDevice> = OnceLock::new();
         DEVICE.get_or_init(|| MetalDevice::new(0).expect("metal device"))
     }
 
+    /// Creates a device handle for `ordinal` (clamped to the last device)
+    /// with its own pool, caches, and submission registry.
     pub fn new(ordinal: usize) -> Result<Self, String> {
         let devices = objc2_metal::MTLCopyAllDevices();
         if devices.is_empty() {
@@ -1071,6 +1313,7 @@ impl MetalDevice {
         })
     }
 
+    /// The underlying `MTLDevice` handle.
     pub fn raw(&self) -> &ProtocolObject<dyn MTLDevice> {
         &self.raw
     }
@@ -1124,11 +1367,18 @@ impl MetalDevice {
         });
     }
 
+    /// The stream new dispatches encode into: the innermost active
+    /// explicit submission for this device on this thread, else the
+    /// thread's implicit (lazily created) stream.
     fn dispatch_submission(&self) -> Arc<SubmissionContext> {
         self.active_submission()
             .unwrap_or_else(|| self.implicit_submission())
     }
 
+    /// Opens an explicit submission for this device on the current thread.
+    /// Errors on nesting; drains a pending implicit stream first so the
+    /// explicit stream starts clean. Dropping the guard synchronizes any
+    /// remaining work.
     pub(crate) fn begin_submission(&self) -> Result<MetalSubmissionGuard<'_>, String> {
         if self.active_submission().is_some() {
             return Err("nested Metal submission is not supported".to_string());
@@ -1222,6 +1472,17 @@ impl MetalDevice {
         }
     }
 
+    /// Allocates a pooled root buffer of at least `elements * dtype` bytes.
+    ///
+    /// Small requests round up to a power-of-two bucket (min 16 bytes);
+    /// requests of 64 MiB or more round to 64 MiB pages so large
+    /// activations never pin 2x their size. Idle, non-in-flight buffers of
+    /// the same bucket are reused (up to `PROBES` linear probes).
+    ///
+    /// # Panics
+    ///
+    /// Panics during executable dispatch, on driver allocation failure,
+    /// or when the `EFFECT_TORCH_MEMORY_CAP_MB` live-byte cap trips.
     pub fn alloc(&self, elements: usize, dtype: DType) -> Arc<Buffer> {
         self.reject_executable_allocation("alloc");
         let size = elements * dtype.size_in_bytes();
@@ -1287,6 +1548,8 @@ impl MetalDevice {
             .unwrap_or_else(|error| panic!("{error}"))
     }
 
+    /// Fallible form of [`MetalDevice::alloc_raw`]: returns an error
+    /// instead of panicking when the cap trips or the driver refuses.
     pub fn alloc_raw_checked(&self, size: usize) -> Result<Arc<Buffer>, String> {
         self.reject_executable_allocation("alloc_raw_checked");
         self.backpressure();
@@ -1313,18 +1576,34 @@ impl MetalDevice {
         }))
     }
 
+    /// Uploads f32 host data into a fresh unpooled buffer.
     pub fn alloc_with_data(&self, data: &[f32]) -> Arc<Buffer> {
+        // SAFETY: `data` is a live slice of `data.len()` f32s, so the byte
+        // view covers `data.len() * 4` valid bytes; upload_bytes copies
+        // synchronously before returning.
         self.upload_bytes(unsafe {
             std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 4)
         })
     }
 
+    /// Uploads u32 host data into a fresh unpooled buffer.
     pub fn alloc_with_data_u32(&self, data: &[u32]) -> Arc<Buffer> {
+        // SAFETY: same argument as alloc_with_data, for u32 elements.
         self.upload_bytes(unsafe {
             std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 4)
         })
     }
 
+    /// Copies `data` into a fresh exactly-sized shared buffer.
+    ///
+    /// Uploads are never pooled and are retired until the next
+    /// `synchronize`, so concurrent walkers can never recycle the bytes
+    /// before the GPU has consumed them.
+    ///
+    /// # Panics
+    ///
+    /// Panics during executable dispatch, on driver allocation failure, or
+    /// when the live-byte cap trips.
     pub fn upload_bytes(&self, data: &[u8]) -> Arc<Buffer> {
         self.reject_executable_allocation("upload_bytes");
         // Length is exactly data.len(): newBufferWithBytes copies that
@@ -1333,9 +1612,19 @@ impl MetalDevice {
         // are never pooled, so bucketing buys nothing.
         let size = data.len().max(1);
         live_bytes_track(size);
+        let zero = 0u8;
+        let source = if data.is_empty() {
+            std::slice::from_ref(&zero)
+        } else {
+            data
+        };
+        // SAFETY: `source` is valid for exactly `size` bytes: non-empty input
+        // uses the caller's slice (`size == data.len()`), while empty input
+        // uses the live one-byte `zero` slice. Metal copies the bytes during
+        // this call and does not retain the host pointer.
         let Some(raw) = (unsafe {
             self.raw.newBufferWithBytes_length_options(
-                NonNull::new(data.as_ptr() as *const std::ffi::c_void as *mut std::ffi::c_void)
+                NonNull::new(source.as_ptr() as *const std::ffi::c_void as *mut std::ffi::c_void)
                     .unwrap(),
                 size,
                 SHARED_OPTIONS,
@@ -1361,6 +1650,8 @@ impl MetalDevice {
         buffer
     }
 
+    /// Returns the cached pipeline for `key`, compiling `source` on a
+    /// miss. `name` is the MSL kernel function name.
     pub fn compile(&self, key: u64, source: &str, name: &str) -> Result<Pipeline, String> {
         if let Some(p) = self.pipeline_cached(key) {
             return Ok(p);
@@ -1390,10 +1681,14 @@ impl MetalDevice {
         }
     }
 
+    /// Looks up the cached pipeline for `key` without compiling.
     pub fn pipeline_cached(&self, key: u64) -> Option<Pipeline> {
         self.pipelines.lock().unwrap().get(&key).cloned()
     }
 
+    /// Unconditionally compiles and caches `source` under `key` (fast math
+    /// disabled — bitwise-stable numerics across recompiles). Errors
+    /// instead of compiling during executable dispatch.
     pub fn compile_slow(&self, key: u64, source: &str, name: &str) -> Result<Pipeline, String> {
         let mut cache = self.pipelines.lock().unwrap();
         if let Some(p) = cache.get(&key) {
@@ -1427,6 +1722,9 @@ impl MetalDevice {
         Ok(pipeline)
     }
 
+    /// Encodes one dispatch: runs `f` with the current stream's compute
+    /// encoder. The closure must bind buffers via [`set_buffer`] (so the
+    /// stream tracks the reference) and end with a `dispatch*` call.
     pub fn with_encoder<R>(
         &self,
         f: impl FnOnce(&ProtocolObject<dyn MTLComputeCommandEncoder>) -> R,
@@ -1436,10 +1734,15 @@ impl MetalDevice {
             .with_encoder(allow_automatic_commit, f)
     }
 
+    /// Explicitly commits the current stream's open command buffer; used by
+    /// executable dispatch, which disables automatic commit.
     pub(crate) fn commit_executable_command(&self) {
         self.dispatch_submission().commit();
     }
 
+    /// Opens a labeled profiling region when `EFFECT_TORCH_METAL_PROFILE`
+    /// is set; command buffers committed inside are timed and reported at
+    /// the next synchronize.
     pub(crate) fn profile_region(&self, label: &'static str) -> Option<MetalProfileRegion> {
         if !metal_profile_enabled() {
             return None;
@@ -1454,6 +1757,9 @@ impl MetalDevice {
         Some(MetalProfileRegion { context })
     }
 
+    /// Marks this thread as executing a planned executable: allocation and
+    /// compilation become hard errors, and command buffers commit only
+    /// explicitly. Not nestable.
     pub(crate) fn begin_executable_dispatch(&self) -> Result<ExecutableDispatchGuard, String> {
         EXECUTABLE_DISPATCH_GUARD.with(|active| {
             if active.replace(true) {
@@ -1476,6 +1782,10 @@ impl MetalDevice {
         }
     }
 
+    /// Blocks until the calling thread's current stream (explicit or
+    /// implicit) is fully drained, then retires oversized idle pool roots.
+    /// Returns any GPU command buffer failure recorded since the last
+    /// drain. This is the only host-side completion fence.
     #[track_caller]
     pub fn synchronize(&self) -> crate::err::Res<()> {
         let t = std::time::Instant::now();
@@ -1521,6 +1831,9 @@ impl MetalDevice {
         Ok(())
     }
 
+    /// Waits for whatever stream produced `buffer` (possibly on another
+    /// thread), then performs a full [`MetalDevice::synchronize`]. The
+    /// host-side read fence for tensor contents.
     #[track_caller]
     pub(crate) fn synchronize_buffer(&self, buffer: &Buffer) -> crate::err::Res<()> {
         let consumer = self
@@ -1530,6 +1843,8 @@ impl MetalDevice {
         self.synchronize()
     }
 
+    /// Waits only for `buffer`'s producer stream, without draining the
+    /// caller's own stream.
     pub(crate) fn synchronize_buffer_producer(&self, buffer: &Buffer) -> crate::err::Res<()> {
         let consumer = self
             .active_submission()
@@ -1537,6 +1852,9 @@ impl MetalDevice {
         buffer.synchronize_producer(consumer.as_ref())
     }
 
+    /// Registers the current stream as `buffer`'s next writer: first waits
+    /// on any prior producer (cross-stream hazard), then records the new
+    /// producer so later readers synchronize against this stream.
     pub(crate) fn mark_buffer_write(&self, buffer: &Buffer) -> crate::err::Res<()> {
         let producer = self.dispatch_submission();
         buffer.synchronize_producer(Some(&producer))?;
@@ -1581,6 +1899,7 @@ impl MetalDevice {
         );
     }
 
+    /// Convenience constructor for an `MTLSize`.
     pub fn grid(width: usize, height: usize, depth: usize) -> MTLSize {
         MTLSize {
             width,
@@ -1633,6 +1952,8 @@ pub fn set_buffer(
 // dynamic allocator from recycling an eager intermediate across contexts.
 const CB_REF_BYTES: usize = 4 << 30;
 
+/// Copies the POD value `data` into the encoder's argument space at
+/// `index` (Metal copies the bytes immediately, so no lifetime hazard).
 pub fn set_bytes<T>(
     encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
     index: usize,
@@ -1640,6 +1961,10 @@ pub fn set_bytes<T>(
 ) {
     let size = std::mem::size_of::<T>();
     let ptr = NonNull::new(data as *const T as *mut std::ffi::c_void).unwrap();
+    // SAFETY: `ptr` points to `size` valid bytes of the live `data`
+    // reference; setBytes copies them synchronously into the command
+    // buffer's argument storage, so no borrow outlives this call. Callers
+    // pass only POD scalars whose layout matches the kernel signature.
     unsafe { encoder.setBytes_length_atIndex(ptr, size, index) };
 }
 

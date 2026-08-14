@@ -5,13 +5,16 @@ import { Duration, Effect } from "effect"
 import fs from "node:fs"
 import { BLOCK, CHECKPOINT, createKdaGpt, heldOutLoss, loadBin, loadTokenizer, saveParams, windows } from "./model.js"
 
-// FineWeb KDA pre-training: same pilot as fineweb/train.ts on the hybrid
-// Kimi Delta Attention model (see model.ts). The KDA layers train
-// through the closed-form backward (RFC 0018 phase 4); generation
-// (generate.ts) loads the checkpoint into the stateful recurrent-decode
-// path. Checkpoints every CHECKPOINT_EVERY steps hold parameters, AdamW
-// state, global step, and the sampler permutation, so an interrupted run
-// resumes bit-exactly.
+// FineWeb pilot training for the hybrid KDA model. Training uses the chunked
+// KDA forward/closed-form backward, while Model.inference later specializes the
+// same layers to per-sequence recurrent state. `CKPT` is a resumable archive;
+// `CHECKPOINT` is the final bare-parameter artifact used by generation.
+//
+// The archive preserves parameters, AdamW roots, global step, and the remainder
+// of the sampler's current permutation. It does not preserve Math.random state
+// for future reshuffles or any model/optimizer/hyperparameter provenance.
+// FINEWEB_STEPS and FINEWEB_CHECKPOINT_EVERY are Number-parsed without explicit
+// finite/positive-integer validation.
 
 const TRAIN_BIN = new URL("../data/fineweb-train.bin", import.meta.url).pathname
 const VAL_BIN = new URL("../data/fineweb-val.bin", import.meta.url).pathname
@@ -41,8 +44,9 @@ const program = Effect.gen(function*() {
 
   yield* Effect.log(`2) training: adamW lr=${LR}, ${STEPS} steps (checkpoint every ${CHECKPOINT_EVERY})`)
   let sampler: Sampler.Sampler
+  const optimizer = yield* Optimizer.adamW()
   const trainer = yield* Trainer.make(model, {
-    optimizer: yield* Optimizer.adamW(),
+    optimizer,
     lr: LearningRate.constant(LR),
     loss: Loss.crossEntropy,
     data: () =>
@@ -79,6 +83,8 @@ const program = Effect.gen(function*() {
 
   let chunkTarget = Math.min(step + CHECKPOINT_EVERY, STEPS)
   while (step < STEPS) {
+    const previous = params
+    const previousState = resume?.state
     const trained = yield* trainer.train(params, resume)
     params = trained.params
     step = trained.step
@@ -91,6 +97,12 @@ const program = Effect.gen(function*() {
     }
     yield* Effect.log(`checkpoint at step ${step}`)
     chunkTarget = Math.min(step + CHECKPOINT_EVERY, STEPS)
+    yield* Tensor.clearAll(
+      new Set([
+        ...previous.filter(Tensor.isTensor),
+        ...(previousState !== undefined ? optimizer.stateRoots(previousState).filter(Tensor.isTensor) : [])
+      ])
+    )
   }
 
   yield* Effect.log(`3) held-out loss over ${VAL_BATCHES} val batches`)

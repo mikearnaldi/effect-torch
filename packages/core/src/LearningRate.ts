@@ -1,10 +1,10 @@
 /**
- * Learning-rate schedules. A schedule is a plain function from the step
- * number (0-based) to the learning rate for that step. The training loop
- * (`Trainer.train`) evaluates it every step and lifts the value to a
- * 0-d tensor that flows into the optimizer update as graph data — the
- * rate is never baked into the optimizer or its graph, so one optimizer
- * (and one compiled step) serves the whole schedule:
+ * Pure learning-rate schedule constructors. A schedule is a synchronous plain
+ * function from the 0-based global step to that step's learning rate. The
+ * training loop (`Trainer.train`) evaluates it every step and binds the value
+ * as a 0-d tensor/scalar input to the optimizer update. The rate is not baked
+ * into optimizer configuration or a compiled trainer program, so one optimizer
+ * and one compiled signature serve the whole schedule:
  *
  * ```ts
  * const trainer = yield* Trainer.make(model, {
@@ -15,20 +15,24 @@
  * yield* trainer.train()
  * ```
  *
- * The trainer calls schedules with consecutive non-negative integer steps,
- * but a `LearningRate` is an ordinary function and does not enforce that
- * domain or validate returned rates. Constructor validation is synchronous
- * and limited to the comparisons documented below; except for `warmupSteps`,
- * values are not separately checked for finiteness or integrality. The guards
- * use direct JavaScript comparisons, so `NaN` is not rejected.
+ * A fresh trainer run calls schedules with consecutive non-negative integer
+ * steps; a caller-supplied resume step is not validated. A `LearningRate` is an
+ * ordinary function and does not enforce its domain, catch exceptions, or
+ * validate returned rates. Constructor validation is synchronous and limited
+ * to the comparisons documented below; except for `warmupSteps`, values are not
+ * separately checked for finiteness or integrality. The guards use direct
+ * JavaScript comparisons, so `NaN` is not rejected.
  *
  * @since 0.1.0
  */
 
 /**
- * A learning-rate schedule: maps a 0-based step number to a rate. The trainer
- * supplies non-negative integers; direct callers are responsible for using
- * that domain and for returning a finite rate suitable for their optimizer.
+ * A synchronous learning-rate schedule mapping a 0-based step number to a
+ * rate. Fresh trainer runs supply consecutive non-negative integers; resumed
+ * runs continue from the unvalidated `Resume.step` supplied by the caller.
+ * Direct callers are responsible for that domain and for returning a finite
+ * rate suitable for their optimizer. A thrown exception becomes a defect when
+ * called by the trainer, not a typed training failure.
  *
  * @since 0.1.0
  * @category models
@@ -115,13 +119,15 @@ export const cosine = (
 }
 
 /**
- * Prepends `warmupSteps` linearly scaled uses of `base(0)`. For
+ * Prepends `warmupSteps` linearly scaled calls to `base(0)`. For
  * `warmupSteps = N`, steps `0..N-1` return
  * `base(0) / N, 2 * base(0) / N, ..., base(0)`; step `N` then starts the
  * re-indexed base schedule at `base(0)`, followed by `base(1)`, and so on.
  * Thus the sequence does not emit zero and emits `base(0)` twice at the
  * boundary. `warmupSteps` must be a positive integer or construction throws
- * synchronously. The base schedule's outputs and call steps are not validated.
+ * synchronously. `base(0)` is called afresh for every warmup step rather than
+ * memoized, so callers should supply a pure schedule. The base schedule's
+ * outputs and call steps are not validated.
  *
  * @since 0.1.0
  * @category combinators

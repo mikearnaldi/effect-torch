@@ -1,8 +1,38 @@
+//! Stateful decode specialization for inference graphs.
+//!
+//! [`specialize_decode`] rewrites a training-style semantic graph into the
+//! stateful form used for autoregressive decode: causal attention becomes
+//! KV-cached attention, chunked KDA becomes a recurrence, short convolutions
+//! become conv-state updates, absolute rotary positions become
+//! cursor-relative, and learned position embeddings are rebuilt as
+//! cursor-indexed gathers. The rewrite produces an entirely new graph
+//! generation — fresh node IDs, shared subgraphs still shared — and never
+//! mutates the source graph.
+//!
+//! The returned [`DecodeGeometry`] is the contract between the compiler and
+//! the runtime's state allocator. Its invariants, established by validation
+//! during the rewrite:
+//!
+//! - Every stateful layer agrees on its family geometry (attention head
+//!   count/dim, KDA head/key/value dims, conv channels/kernel); mixed
+//!   geometries are rejected so state buffers can be sized uniformly.
+//! - Layer ordinals are assigned in the historical decode encounter order
+//!   (last root first), and are stable across repeated specialization of the
+//!   same graph.
+//! - The state cursor is a runtime-supplied value at `cursor_slot` — one
+//!   past the highest caller input slot — never a caller argument. It is a
+//!   scalar for batch 1 and an `i64 [batch]` tensor otherwise.
+//! - `allows_window_eviction` is true only when every attention layer has a
+//!   finite window; a global retention window that cannot hold an explicit
+//!   local window is a hard error.
+
 use effect_torch_graph::{node_children, remap_children, Node, NodeKind, PositionOffset};
 use effect_torch_runtime::DType;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+/// Uniform geometry of the KDA recurrence layers, used to size the
+/// recurrent state buffers. All-zeros when the graph has no KDA layers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct KdaGeometry {
     pub layers: usize,
@@ -24,6 +54,8 @@ impl Default for KdaGeometry {
     }
 }
 
+/// Uniform geometry of the short-conv state layers (channels and kernel
+/// width every layer agrees on). All-zeros when the graph has none.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 pub struct ConvGeometry {
     pub layers: usize,
@@ -31,6 +63,14 @@ pub struct ConvGeometry {
     pub kernel: usize,
 }
 
+/// The stateful-decode contract produced alongside the specialized roots.
+///
+/// `layers`, `kv_heads`, and `head_dim` describe the KV cache: `layers` is
+/// the number of attention layers and `kv_heads`/`head_dim` their (uniform)
+/// head geometry, or zero when the graph has no attention. `cursor_slot` and
+/// `cursor_tensor` locate the runtime-driven state cursor within the
+/// program's input slots; `allows_window_eviction` tells the runtime whether
+/// KV state may be evicted outside the maximum attention window.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct DecodeGeometry {
     pub layers: usize,
@@ -44,6 +84,8 @@ pub struct DecodeGeometry {
 }
 
 impl DecodeGeometry {
+    /// The state cursor as a request-level slot declaration: internal
+    /// runtime metadata, never a caller-visible argument.
     pub const fn state_cursor(&self) -> crate::request::StateCursorSlot {
         crate::request::StateCursorSlot::new(self.cursor_slot, self.cursor_tensor)
     }

@@ -1,8 +1,15 @@
 /**
- * Loss functions return lazy graph values. `"mean"` and `"sum"` reduce every
- * dimension of each function's loss-specific unreduced result to a scalar
- * suitable for `Gradient.grad`; `"none"` preserves that result, which may be
- * elementwise or per-example/per-position depending on the loss.
+ * Loss graph builders. They borrow predictions and targets and return lazy
+ * graph values without evaluating or clearing inputs. Shape, dtype, placement,
+ * and backend constraints are validated by each wrapper and the tensor
+ * operations it composes, with failures in the returned
+ * `Tensor.TensorError` channel; value-domain checks are intentionally limited
+ * and evaluation-only failures remain deferred until compute or execution.
+ *
+ * `"mean"` and `"sum"` reduce every dimension of each function's
+ * loss-specific unreduced result to a scalar suitable for `Gradient.grad`;
+ * `"none"` preserves that result, which may be elementwise or
+ * per-example/per-position depending on the loss.
  *
  * @since 0.1.0
  */
@@ -22,7 +29,8 @@ import * as Tensor from "./Tensor.ts"
 export type Reduction = "mean" | "sum" | "none"
 
 /**
- * Common options for all losses.
+ * Common options for loss graph builders. An unsupported runtime value is not
+ * normalized; use one of the three declared reductions.
  *
  * @since 0.1.0
  * @category models
@@ -75,6 +83,7 @@ const dualLoss = <T, O, R = Runtime.Runtime>(
 /**
  * Squared error `(pred - target)^2`, followed by the requested reduction.
  * With `"none"`, the result has the broadcast shape of `pred` and `target`.
+ * Dtype and placement compatibility follow the underlying tensor operations.
  *
  * @since 0.1.0
  * @category losses
@@ -89,6 +98,7 @@ export const mse = dualLoss<Tensor.Any, LossOptions>((pred, target, options) =>
 /**
  * Absolute error `|pred - target|`, followed by the requested reduction.
  * With `"none"`, the result has the broadcast shape of `pred` and `target`.
+ * Dtype and placement compatibility follow the underlying tensor operations.
  *
  * @since 0.1.0
  * @category losses
@@ -110,15 +120,17 @@ export const l1 = dualLoss<Tensor.Any, LossOptions>((pred, target, options) =>
 export interface HuberOptions extends LossOptions {
   /**
    * Positive transition point between quadratic and linear regions; defaults
-   * to `1`. Values `<= 0` fail. Finiteness is not checked: `NaN` may propagate
-   * non-finite results and positive infinity is accepted.
+   * to `1`. Values `<= 0` fail. Finiteness is not checked: `NaN` or positive
+   * infinity is accepted and may produce non-finite results.
    */
   readonly delta?: number
 }
 
 /**
- * Huber loss: quadratic for `|pred - target| <= delta`, linear beyond it.
- * Smooth like MSE near zero, robust to outliers like L1.
+ * Huber loss: `0.5 * e^2` for `e = |pred - target| <= delta`, and
+ * `delta * (e - 0.5 * delta)` beyond it, followed by the requested reduction.
+ * `delta <= 0` fails with {@link Tensor.TensorError} when the effect runs;
+ * other tensor compatibility checks are delegated to the composed operations.
  *
  * @since 0.1.0
  * @category losses
@@ -158,8 +170,9 @@ export interface BinaryCrossEntropyOptions extends LossOptions {
 
 /**
  * Binary cross entropy between probabilities, or logits when `fromLogits` is
- * true, and broadcast-compatible targets. Target values are not checked to be
- * in `[0, 1]`. The probability path requests a clamp to
+ * true, and broadcast-compatible targets. Prediction/target dtype and
+ * placement compatibility are delegated to tensor operations. Target values
+ * are not checked to be in `[0, 1]`. The probability path requests a clamp to
  * `[1e-12, 1 - 1e-12]`, but those bounds are represented in the tensor dtype
  * and can round to `0` or `1`; finite logarithms are therefore not guaranteed,
  * especially at reduced precision. Prefer the stable logits form when
@@ -222,7 +235,10 @@ const checkClassTargets = (
  * active index fails during evaluation, and the backward is not second-order
  * differentiable. `sum` and `none` instead use one-hot log-softmax; `none`
  * returns the target shape, and any index unmatched by `0..classes-1`
- * contributes zero because that path does not validate index values.
+ * contributes zero because that path does not validate index values. Logit
+ * dtype, target dtype/shape, and placement mismatches fail while building the
+ * graph; active target values on the fused mean path are validated only during
+ * execution.
  *
  * @since 0.1.0
  * @category losses
@@ -250,7 +266,8 @@ export const crossEntropy = dualLoss<Tensor.Any, LossOptions>((logits, targets, 
  * Negative log likelihood between `f32` or `f64` log-probabilities and `i64`
  * or `u32` class-index targets. The class dimension is last and `"none"`
  * returns the target shape. Index values are not range-checked: an index
- * unmatched by `0..classes-1` produces zero loss.
+ * unmatched by `0..classes-1` produces zero loss. This path materializes a
+ * one-hot graph and has no ignore-index convention.
  *
  * @since 0.1.0
  * @category losses
@@ -321,12 +338,14 @@ export const hinge = dualLoss<Tensor.Any, LossOptions>((pred, target, options) =
  * @category models
  */
 export interface CosineEmbeddingOptions extends LossOptions {
-  /** Threshold used by the non-positive-target branch; defaults to `0`. */
+  /** Threshold used by the non-positive-target branch; defaults to `0` and is not validated. */
   readonly margin?: number
 }
 
 /**
- * Cosine embedding loss over the last dimension. The cosine denominator is
+ * Cosine embedding loss over the last dimension; inputs must therefore have a
+ * last dimension, with rank/shape/dtype/placement compatibility delegated to
+ * the composed tensor operations. The cosine denominator is
  * `norm(a) * norm(b) + 1e-12`, with the epsilon represented in the input
  * dtype. In dtypes that represent it, zero vectors produce a cosine of zero;
  * in low-precision dtypes it may round to zero and permit non-finite results.

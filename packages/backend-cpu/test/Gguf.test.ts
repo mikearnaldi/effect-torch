@@ -25,6 +25,8 @@ const string = (value: string): Buffer => {
   return Buffer.concat([u64(bytes.length), bytes])
 }
 
+// The hand-built GGUF v3 artifact mixes dense F32 with Q2_K and Q4_K payloads
+// that have the same packed shape, proving codec identity is not shape-derived.
 const fixture = (): Buffer => {
   const header = Buffer.concat([
     Buffer.from("GGUF"),
@@ -179,6 +181,8 @@ it.effect("loads GGUF payloads directly and rejects cross-codec physical collisi
     })
   ))
 
+// Injected addons isolate adapter ownership from native I/O: each raw wrapper
+// must either become one public handle or be cleared exactly once.
 it.effect("rejects duplicate raw GGUF tensor ownership and clears it once", () => {
   const clear = vi.fn()
   const tensor = { shape: [1, 1008], dtype: "u8", device: "cpu", clear } as unknown as NativeTensor

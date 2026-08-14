@@ -1,18 +1,48 @@
+//! Indexing kernels: `index_select`, `gather`, `scatter_add`,
+//! `scatter_set`, and `cat`.
+//!
+//! # Conventions
+//!
+//! - **Strides baked in.** Input/output stride decompositions are emitted
+//!   as constant arithmetic over the flat thread id; pipeline keys hash
+//!   the exact layouts, so a layout change is a different kernel.
+//!   Destinations are contiguous; cat and the gather family consume
+//!   strided sources directly with no scratch copy.
+//! - **Index tensors.** Kernels read u32 indexes; other dtypes (or
+//!   non-contiguous index layouts) are converted by a layout-keyed
+//!   `et_index_convert` kernel into caller-provided `ids` scratch.
+//! - **scatter_add.** Runs in f32 with relaxed-order device atomics:
+//!   duplicate indexes accumulate in an unspecified (but lossless) order,
+//!   so results are deterministic in value for exact sums but not in
+//!   rounding. Non-f32 operands round-trip through f32 `accumulator` /
+//!   `source_cast` scratch.
+//! - **Requirements contract.** `*_requirements` report the exact output,
+//!   scratch, staging, and pipeline count; the `*_into` entry points
+//!   validate against them, require precompiled pipelines, and allocate
+//!   nothing.
+//! - **Dispatch.** One thread per output element (per source element for
+//!   scatter/cat), 256-wide threadgroups, 32-bit flat indexing — indexing
+//!   workloads are index-tensor sized, far from the u32 limit.
+
 use super::device::{set_buffer, set_bytes, MetalDevice, Pipeline};
 use super::run::MetalTensor;
 use crate::runtime::dtype::DType;
 use crate::runtime::layout::Layout;
 use objc2_metal::MTLComputeCommandEncoder;
 
+/// An exact tensor (contiguous shape + dtype) an indexing operation
+/// requires as output, scratch, or staging.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TensorRequirement {
     pub shape: Vec<usize>,
     pub dtype: DType,
 }
 
+/// Alias kept for the executable planner's vocabulary.
 pub type BufferRequirement = TensorRequirement;
 
 impl TensorRequirement {
+    /// Byte size of the described tensor, checked for overflow.
     pub fn bytes(&self) -> Result<usize, String> {
         checked_product(&self.shape)?
             .checked_mul(self.dtype.size_in_bytes())
@@ -33,15 +63,26 @@ impl TensorRequirement {
 /// copy scratch because their kernels consume source strides directly.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct IndexingRequirements {
+    /// The contiguous output tensor (absent for in-place scatter_set).
     pub output: Option<TensorRequirement>,
+    /// Converted contiguous u32 indexes (absent when the ids are already
+    /// contiguous u32).
     pub ids: Option<TensorRequirement>,
+    /// f32 accumulation buffer for non-f32 scatter_add.
     pub accumulator: Option<TensorRequirement>,
+    /// f32 cast of the scatter_add source for non-f32 inputs.
     pub source_cast: Option<TensorRequirement>,
+    /// Uploaded u32 index buffer for host-side scatter_set callers.
     pub staging: Option<TensorRequirement>,
+    /// Byte size of `output`.
     pub output_bytes: usize,
+    /// Combined byte size of `ids` + `accumulator` + `source_cast`.
     pub scratch_bytes: usize,
+    /// Byte size of `staging`.
     pub staging_bytes: usize,
+    /// Always zero for indexing: no per-invocation status buffer.
     pub status_bytes: usize,
+    /// Distinct pipelines the operation needs precompiled.
     pub pipeline_count: usize,
 }
 
@@ -60,6 +101,8 @@ fn finalize_requirements(
 }
 
 impl IndexingRequirements {
+    /// Combined byte size of the `ids`, `accumulator`, and `source_cast`
+    /// scratch tensors.
     pub fn scratch_bytes(&self) -> Result<usize, String> {
         [&self.ids, &self.accumulator, &self.source_cast]
             .into_iter()
@@ -71,6 +114,7 @@ impl IndexingRequirements {
             })
     }
 
+    /// Byte size of the `staging` tensor.
     pub fn staging_bytes(&self) -> Result<usize, String> {
         self.staging
             .as_ref()
@@ -399,6 +443,7 @@ fn prepare_ids<'a>(
     }
 }
 
+/// Uploads host u32 indexes as a contiguous device tensor.
 pub fn ids_from_host(dev: &MetalDevice, ids: &[u32]) -> MetalTensor {
     MetalTensor {
         buffer: dev.alloc_with_data_u32(ids),
@@ -407,6 +452,8 @@ pub fn ids_from_host(dev: &MetalDevice, ids: &[u32]) -> MetalTensor {
     }
 }
 
+/// Exact resources for `index_select(input, dim, ids)`: the output shape
+/// replaces `dim`'s extent with the index count.
 pub fn index_select_requirements(
     input_layout: &Layout,
     input_dtype: DType,
@@ -427,6 +474,8 @@ pub fn index_select_requirements(
     finalize_requirements(requirements, pipelines)
 }
 
+/// Exact resources for `gather(input, dim, ids)`; `ids_shape` must have
+/// the input's rank and may not exceed the input extent outside `dim`.
 pub fn gather_requirements(
     input_layout: &Layout,
     input_dtype: DType,
@@ -468,6 +517,8 @@ pub fn gather_requirements(
     finalize_requirements(requirements, pipelines)
 }
 
+/// Exact resources for `scatter_add(input, dim, ids, source)`; non-f32
+/// dtypes additionally require the f32 accumulator and source cast.
 pub fn scatter_add_requirements(
     input_layout: &Layout,
     input_dtype: DType,
@@ -518,6 +569,8 @@ pub fn scatter_add_requirements(
     finalize_requirements(requirements, pipelines)
 }
 
+/// Exact resources for concatenating same-rank, same-dtype tensors along
+/// `dim`.
 pub fn cat_requirements(
     layouts: &[&Layout],
     dtypes: &[DType],
@@ -558,6 +611,8 @@ pub fn cat_requirements(
     finalize_requirements(requirements, pipelines)
 }
 
+/// Exact resources for in-place `scatter_set(destination, dim, ids,
+/// source)` (no output allocation).
 pub fn scatter_set_requirements(
     destination_layout: &Layout,
     destination_dtype: DType,
@@ -596,6 +651,8 @@ pub fn scatter_set_requirements(
     finalize_requirements(requirements, pipelines)
 }
 
+/// [`scatter_set_requirements`] for host-supplied u32 indexes, adding the
+/// upload staging buffer.
 pub fn scatter_set_staging_requirements(
     destination_layout: &Layout,
     destination_dtype: DType,
@@ -856,6 +913,8 @@ kernel void et_sset(device {ty}* destination [[buffer(0)]], device const uint* i
     )
 }
 
+/// Destination form of [`index_select`]; `ids_scratch` must match the
+/// `ids` requirement (converted u32 indexes).
 pub fn index_select_into(
     dev: &MetalDevice,
     input: &MetalTensor,
@@ -891,6 +950,7 @@ pub fn index_select_into(
     Ok(())
 }
 
+/// Destination form of [`gather`].
 pub fn gather_into(
     dev: &MetalDevice,
     input: &MetalTensor,
@@ -933,6 +993,9 @@ pub fn gather_into(
     Ok(())
 }
 
+/// Destination form of [`scatter_add`]: copies/converts the input into
+/// the destination (or f32 accumulator), atomically accumulates the
+/// source, and casts back for non-f32 dtypes.
 #[allow(clippy::too_many_arguments)]
 pub fn scatter_add_into(
     dev: &MetalDevice,
@@ -1001,6 +1064,8 @@ pub fn scatter_add_into(
     Ok(())
 }
 
+/// Destination form of [`cat`]: one dispatch per non-empty input, each
+/// writing its slice at the running `dim` offset.
 pub fn cat_into(
     dev: &MetalDevice,
     tensors: &[&MetalTensor],
@@ -1043,6 +1108,8 @@ pub fn cat_into(
     Ok(())
 }
 
+/// In-place scatter-set: writes `source` slices into `destination` at the
+/// indexed positions along `dim`.
 pub fn scatter_set_into(
     dev: &MetalDevice,
     destination: &MetalTensor,
@@ -1087,6 +1154,8 @@ fn allocate_requirement(dev: &MetalDevice, requirement: &TensorRequirement) -> M
     MetalTensor::empty(dev, requirement.shape.clone(), requirement.dtype)
 }
 
+/// Allocating index_select: `output[.., ids[i], ..] = input[.., i, ..]`
+/// along `dim`.
 pub fn index_select(
     dev: &MetalDevice,
     input: &MetalTensor,
@@ -1115,6 +1184,7 @@ pub fn index_select(
     Ok(output)
 }
 
+/// Allocating gather: per output element, one index lookup along `dim`.
 pub fn gather(
     dev: &MetalDevice,
     input: &MetalTensor,
@@ -1156,6 +1226,8 @@ pub fn gather(
     Ok(output)
 }
 
+/// Allocating scatter_add: `input` plus `source` accumulated at the
+/// indexed positions along `dim`.
 pub fn scatter_add(
     dev: &MetalDevice,
     input: &MetalTensor,
@@ -1212,6 +1284,7 @@ pub fn scatter_add(
     Ok(output)
 }
 
+/// Allocating concatenation along `dim`.
 pub fn cat(dev: &MetalDevice, tensors: &[&MetalTensor], dim: usize) -> Result<MetalTensor, String> {
     let layouts = tensors
         .iter()
@@ -1228,6 +1301,8 @@ pub fn cat(dev: &MetalDevice, tensors: &[&MetalTensor], dim: usize) -> Result<Me
     Ok(output)
 }
 
+/// In-place scatter_set with host u32 indexes (uploaded through the
+/// staging buffer).
 pub fn scatter_set(
     dev: &MetalDevice,
     destination: &MetalTensor,
@@ -1259,6 +1334,8 @@ pub fn scatter_set(
     scatter_set_into(dev, destination, dim, &ids, source, None)
 }
 
+/// Precompiles the index conversion (if needed) and index_select pipelines
+/// for exact layouts.
 pub fn compile_index_select_layout_exact(
     dev: &MetalDevice,
     input_layout: &Layout,
@@ -1286,6 +1363,8 @@ pub fn compile_index_select_layout_exact(
     Ok(())
 }
 
+/// [`compile_index_select_layout_exact`] for contiguous shapes on the
+/// process-wide device.
 pub fn warm_index_select(
     shape: &[usize],
     dtype: DType,
@@ -1301,6 +1380,8 @@ pub fn warm_index_select(
     )
 }
 
+/// [`warm_index_select_layout_exact`] with contiguous u32 indexes of
+/// length `ids_len`.
 pub fn warm_index_select_layout(
     input_layout: &Layout,
     input_dtype: DType,
@@ -1316,6 +1397,8 @@ pub fn warm_index_select_layout(
     )
 }
 
+/// Precompiles the index conversion (if needed) and gather pipelines for
+/// exact layouts.
 pub fn compile_gather_layout(
     dev: &MetalDevice,
     input_layout: &Layout,
@@ -1350,6 +1433,8 @@ pub fn compile_gather_layout(
     Ok(())
 }
 
+/// [`compile_gather_layout`] for contiguous shapes on the process-wide
+/// device.
 pub fn warm_gather(
     shape: &[usize],
     dtype: DType,
@@ -1366,6 +1451,9 @@ pub fn warm_gather(
     )
 }
 
+/// Precompiles every pipeline scatter_add needs for exact layouts: ids
+/// conversion, f32 casts (non-f32 inputs), the atomic accumulation, and
+/// the cast back.
 #[allow(clippy::too_many_arguments)]
 pub fn compile_scatter_add_layouts(
     dev: &MetalDevice,
@@ -1416,6 +1504,8 @@ pub fn compile_scatter_add_layouts(
     Ok(())
 }
 
+/// [`compile_scatter_add_layouts`] for contiguous shapes on the
+/// process-wide device.
 pub fn warm_scatter_add(
     shape: &[usize],
     dtype: DType,
@@ -1433,6 +1523,7 @@ pub fn warm_scatter_add(
     )
 }
 
+/// Precompiles one cat pipeline per distinct non-empty input layout.
 pub fn compile_cat_layouts(
     dev: &MetalDevice,
     layouts: &[&Layout],
@@ -1449,6 +1540,8 @@ pub fn compile_cat_layouts(
     Ok(())
 }
 
+/// [`compile_cat_layouts`] for contiguous shapes on the process-wide
+/// device.
 pub fn warm_cat(shapes: &[&[usize]], dtype: DType, dim: usize) -> Result<(), String> {
     if shapes.is_empty() {
         return Ok(());
@@ -1461,6 +1554,8 @@ pub fn warm_cat(shapes: &[&[usize]], dtype: DType, dim: usize) -> Result<(), Str
     warm_cat_layouts(&references, &vec![dtype; shapes.len()], dim)
 }
 
+/// Precompiles the ids conversion (if needed) and scatter_set pipelines
+/// for exact layouts.
 pub fn compile_scatter_set_layouts(
     dev: &MetalDevice,
     destination_layout: &Layout,
@@ -1497,6 +1592,7 @@ pub fn compile_scatter_set_layouts(
     Ok(())
 }
 
+/// [`compile_index_select_layout_exact`] against the process-wide device.
 pub fn warm_index_select_layout_exact(
     input_layout: &Layout,
     input_dtype: DType,
@@ -1514,6 +1610,7 @@ pub fn warm_index_select_layout_exact(
     )
 }
 
+/// [`compile_gather_layout`] against the process-wide device.
 pub fn warm_gather_layout(
     input_layout: &Layout,
     input_dtype: DType,
@@ -1533,6 +1630,7 @@ pub fn warm_gather_layout(
     )
 }
 
+/// [`compile_scatter_add_layouts`] against the process-wide device.
 #[allow(clippy::too_many_arguments)]
 pub fn warm_scatter_add_layouts(
     input_layout: &Layout,
@@ -1555,10 +1653,12 @@ pub fn warm_scatter_add_layouts(
     )
 }
 
+/// [`compile_cat_layouts`] against the process-wide device.
 pub fn warm_cat_layouts(layouts: &[&Layout], dtypes: &[DType], dim: usize) -> Result<(), String> {
     compile_cat_layouts(MetalDevice::get(), layouts, dtypes, dim)
 }
 
+/// [`compile_scatter_set_layouts`] against the process-wide device.
 #[allow(clippy::too_many_arguments)]
 pub fn warm_scatter_set_layouts(
     destination_layout: &Layout,

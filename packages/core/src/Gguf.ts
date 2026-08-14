@@ -1,5 +1,10 @@
 /**
- * Native GGUF inspection, model resolution, validation, and loading.
+ * Native GGUF v3 inspection, registry-based model resolution, validation, and
+ * loading. The selected runtime parses the file and creates concrete tensor
+ * handles; this module canonicalizes metadata, resolves the exact
+ * `gguf:<architecture>` registration, constructs the model, and verifies that
+ * the inspected and loaded tensor catalogs form a bijection with its parameter
+ * catalog.
  *
  * @since 0.1.0
  */
@@ -10,19 +15,25 @@ import * as Runtime from "./Runtime.ts"
 import type * as Tensor from "./Tensor.ts"
 
 /**
- * A GGUF inspection, validation, or native loading failure.
+ * A native GGUF inspection/loading failure or a structural validation failure.
+ * Missing architecture registrations remain {@link Registry.RegistryError}s,
+ * and architecture construction failures remain `Model.ModelError`s.
  *
  * @since 0.1.0
  * @category errors
  */
 export class GgufError extends Data.TaggedError("GgufError")<{
+  /** Phase that inspected the file, validated metadata/catalogs, or loaded payloads. */
   readonly op: "inspect" | "validate" | "load"
+  /** Human-readable diagnostic; branch on the error tag and `op`, not this text. */
   readonly message: string
+  /** Original runtime failure for native inspection or payload loading. */
   readonly backend?: Runtime.BackendError
 }> {}
 
 /**
- * A constructed model and its concrete parameters in model order.
+ * A constructed model, its concrete parameters in model order, and the
+ * canonical configuration used to construct it.
  *
  * @since 0.1.0
  * @category models
@@ -30,9 +41,20 @@ export class GgufError extends Data.TaggedError("GgufError")<{
 export interface LoadedModel {
   /** The model constructed from the artifact's architecture configuration. */
   readonly model: Model.Model
-  /** The loaded tensors ordered according to the model's parameter catalog. */
+  /**
+   * Caller-owned loaded tensors in `model.parameters` order. Release every
+   * handle exactly once when no longer needed.
+   */
   readonly params: ReadonlyArray<Tensor.Concrete>
-  /** The artifact's canonical metadata keys, including tokenizer configuration. */
+  /**
+   * Canonical configuration passed to the architecture: the architecture
+   * prefix and `general.` are stripped, other keys are retained, and
+   * `vocab_size` may be derived from `tokenizer.ggml.tokens`. This is not the
+   * raw ordered GGUF metadata table; callers should treat the map and any array
+   * values as immutable. Original numeric kinds are erased to JavaScript
+   * numbers by the runtime boundary, so 64-bit integer values may already have
+   * lost precision.
+   */
   readonly metadata: ReadonlyMap<string, unknown>
 }
 
@@ -264,7 +286,34 @@ const clearLoaded = (
 }
 
 /**
- * Inspects, validates, and loads one native GGUF v3 file.
+ * Inspects, validates, and loads one native GGUF v3 file. Inspection happens
+ * first without payload materialization. `general.architecture` must be a
+ * non-empty string and resolves only the exact registry key
+ * `gguf:<architecture>`. Canonical metadata strips that architecture prefix and
+ * `general.`, derives `vocab_size` from tokenizer tokens when absent, and
+ * rejects empty or colliding canonical keys before calling the architecture's
+ * `create` effect.
+ *
+ * The inspected tensor catalog must exactly match the resulting model's names
+ * and logical shapes. A second native operation then loads every payload. This
+ * module supports dense F32 and GGML K-quant Q2_K through Q6_K descriptors;
+ * all returned handles are logically f32, while quantized handles retain
+ * encoded u8 storage metadata and are usable only by operations that support
+ * that encoding. Inspection and loading are separate path reads: loaded
+ * descriptors are compared with the inspected catalog, but metadata is not
+ * returned by the load operation, so the caller must keep the file stable
+ * between phases.
+ *
+ * Before the native `load` effect completes, the runtime owns partial results
+ * and is responsible for interruption cleanup. Ownership transfers with a
+ * successful archive. Validation then runs uninterruptibly: on validation
+ * failure this function attempts to release every distinct returned handle,
+ * ignores release failures so the validation error is preserved, and returns
+ * no tensors. On success ownership of every parameter transfers to the caller;
+ * release each handle exactly once. Inspection and load backend failures are
+ * {@link GgufError}s, exact-key lookup failures are
+ * {@link Registry.RegistryError}s, and architecture construction failures are
+ * `Model.ModelError`s.
  *
  * @since 0.1.0
  * @category loading

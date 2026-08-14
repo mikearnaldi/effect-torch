@@ -1,3 +1,59 @@
+//! Strict, resource-limited, cancellable parsing of GGUF v3 model files.
+//!
+//! [`parse_gguf`] reads the header (magic, version, metadata key/value
+//! table and tensor catalog) and returns a [`GgufFile`] describing every
+//! tensor's logical shape, on-disk format and absolute byte range, without
+//! reading any tensor payload. [`read_gguf_tensor_into`] then loads one
+//! tensor's payload into a caller-owned buffer using positioned reads, so
+//! the same file can be shared across threads.
+//!
+//! # Supported subset
+//!
+//! - GGUF version 3 only (`GGUF_VERSION`); little-endian throughout, per
+//!   the spec.
+//! - Tensor formats: `F32` and the K-quants `Q2_K`/`Q3_K`/`Q4_K`/`Q5_K`/
+//!   `Q6_K` ([`GgufTensorFormat`]). Any other GGML type code is rejected.
+//!   If any tensor is quantized, `general.quantization_version` must be
+//!   present, be `u32`, and equal 2.
+//! - `general.architecture` metadata is required and must be a non-empty
+//!   string. `general.alignment` is optional, must be a `u32` power of two
+//!   when present, and defaults to [`DEFAULT_ALIGNMENT`] (32).
+//! - Metadata values of every GGUF scalar type plus homogeneous arrays;
+//!   nested arrays (arrays of arrays) are rejected.
+//!
+//! # Tensor geometry
+//!
+//! GGUF stores dimensions least-major first; descriptors flip them into
+//! the runtime's row-major convention: [`GgufTensorDescriptor::logical_shape`]
+//! is the reversed (row-major) shape. For K-quant tensors the logical
+//! columns (GGUF dimension 0) must be divisible by the 256-element block,
+//! and [`GgufTensorDescriptor::physical_shape`] is `[rows, encoded_row_bytes]`
+//! — the actual packed byte layout. For F32, physical and logical shapes
+//! coincide and `byte_len` is `numel * 4`.
+//!
+//! # Resource limits and validation
+//!
+//! The parser defends against hostile files rather than trusting headers:
+//! the header is capped at [`MAX_HEADER_BYTES`]; metadata/tensor counts,
+//! key/name lengths, string lengths and array lengths are each capped
+//! (`MAX_*` constants) *and* cross-checked against the remaining file size
+//! before any allocation, so a malformed count cannot trigger a huge
+//! allocation. Every length/offset/product computation is overflow-checked.
+//! 64-bit metadata integers and tensor dimensions must fit the JavaScript
+//! safe-integer range ([`JS_SAFE_INTEGER`], 2^53 − 1) because the values
+//! flow to the Node.js embedding. Tensor data offsets must be aligned to
+//! the file's alignment, ranges must lie inside the file, and no two
+//! tensor ranges may overlap. Metadata keys and tensor names must be
+//! unique and non-empty; tensor rank must be in `1..=4`.
+//!
+//! # Cancellation
+//!
+//! Both entry points take an optional [`CancellationFlag`]. It is polled
+//! before the first I/O, between header read chunks, and between payload
+//! read chunks; observing a set flag aborts with
+//! [`GgufParseError::Cancelled`]. After cancellation, the caller's output
+//! buffer may be partially written.
+
 use crate::CancellationFlag;
 use std::collections::HashSet;
 use std::fmt;
@@ -19,10 +75,14 @@ const MAX_TENSOR_NAME_BYTES: u64 = 64;
 const MAX_METADATA_STRING_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_METADATA_ARRAY_ELEMENTS: u64 = 1_048_576;
 
+/// Why parsing or tensor loading failed.
 #[derive(Debug)]
 pub enum GgufParseError {
+    /// The file violates the GGUF format or this parser's constraints.
     Invalid(String),
+    /// An underlying I/O operation failed.
     Io(String),
+    /// The cancellation flag was observed set.
     Cancelled,
 }
 
@@ -31,6 +91,7 @@ impl GgufParseError {
         Self::Invalid(message.into())
     }
 
+    /// Whether this error is a cancellation (as opposed to bad input).
     pub fn is_cancelled(&self) -> bool {
         matches!(self, Self::Cancelled)
     }
@@ -48,6 +109,8 @@ impl fmt::Display for GgufParseError {
 
 impl std::error::Error for GgufParseError {}
 
+/// A typed GGUF metadata value. Numeric tags follow the GGUF spec's value
+/// type codes (0–12); arrays are homogeneous ([`GgufMetadataArray`]).
 #[derive(Clone, Debug, PartialEq)]
 pub enum GgufMetadataValue {
     U8(u8),
@@ -66,6 +129,8 @@ pub enum GgufMetadataValue {
 }
 
 impl GgufMetadataValue {
+    /// Name of the value's type tag (e.g. `"u32"`, `"string"`); arrays
+    /// report their element type.
     pub fn kind(&self) -> &'static str {
         match self {
             Self::U8(_) => "u8",
@@ -85,6 +150,7 @@ impl GgufMetadataValue {
     }
 }
 
+/// A homogeneous GGUF metadata array (all elements share one type).
 #[derive(Clone, Debug, PartialEq)]
 pub enum GgufMetadataArray {
     U8(Vec<u8>),
@@ -102,6 +168,7 @@ pub enum GgufMetadataArray {
 }
 
 impl GgufMetadataArray {
+    /// Name of the element type tag (e.g. `"f32"`).
     pub fn kind(&self) -> &'static str {
         match self {
             Self::U8(_) => "u8",
@@ -120,12 +187,14 @@ impl GgufMetadataArray {
     }
 }
 
+/// One key/value pair of the metadata table, in file order.
 #[derive(Clone, Debug, PartialEq)]
 pub struct GgufMetadataEntry {
     pub key: String,
     pub value: GgufMetadataValue,
 }
 
+/// A GGML K-quant block encoding (256 values per block).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GgmlKQuant {
     Q2K,
@@ -136,6 +205,7 @@ pub enum GgmlKQuant {
 }
 
 impl GgmlKQuant {
+    /// Canonical GGML name of the encoding (e.g. `"Q4_K"`).
     pub fn name(self) -> &'static str {
         match self {
             Self::Q2K => "Q2_K",
@@ -146,6 +216,7 @@ impl GgmlKQuant {
         }
     }
 
+    /// Parses a canonical GGML name; `None` for unknown encodings.
     pub fn from_name(name: &str) -> Option<Self> {
         match name {
             "Q2_K" => Some(Self::Q2K),
@@ -157,6 +228,7 @@ impl GgmlKQuant {
         }
     }
 
+    // Packed bytes per 256-element block, per the GGML K-quant layouts.
     fn block_bytes(self) -> usize {
         match self {
             Self::Q2K => 84,
@@ -167,6 +239,9 @@ impl GgmlKQuant {
         }
     }
 
+    /// Packed byte length of one logical row of `columns` elements, or
+    /// `None` if `columns` is not a multiple of the 256-element block (or
+    /// the result overflows).
     pub fn encoded_row_bytes(self, columns: usize) -> Option<usize> {
         columns
             .is_multiple_of(256)
@@ -175,6 +250,8 @@ impl GgmlKQuant {
     }
 }
 
+/// On-disk encoding of a tensor: dense little-endian `F32` or one of the
+/// supported K-quants.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GgufTensorFormat {
     F32,
@@ -186,6 +263,7 @@ pub enum GgufTensorFormat {
 }
 
 impl GgufTensorFormat {
+    /// Canonical name (`"F32"`, `"Q2_K"`, ...).
     pub fn name(self) -> &'static str {
         match self {
             Self::F32 => "F32",
@@ -197,6 +275,7 @@ impl GgufTensorFormat {
         }
     }
 
+    // GGML tensor type codes: 0 = F32, 10..=14 = Q2_K..Q6_K.
     fn from_code(code: u32) -> Result<Self, GgufParseError> {
         match code {
             0 => Ok(Self::F32),
@@ -215,6 +294,7 @@ impl GgufTensorFormat {
         self.quantization().map(GgmlKQuant::block_bytes)
     }
 
+    /// The K-quant encoding of this format, or `None` for `F32`.
     pub fn quantization(self) -> Option<GgmlKQuant> {
         match self {
             Self::F32 => None,
@@ -227,6 +307,14 @@ impl GgufTensorFormat {
     }
 }
 
+/// One tensor's catalog entry: name, format, shapes and absolute byte
+/// range in the file.
+///
+/// `logical_shape` is row-major (GGUF's least-major-first dimensions
+/// reversed). `physical_shape` describes the stored payload: for `F32` it
+/// equals `logical_shape`; for K-quants it is `[rows, encoded_row_bytes]`.
+/// `data_offset` and `byte_len` are validated at parse time to lie inside
+/// the file and not overlap any other tensor.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GgufTensorDescriptor {
     pub name: String,
@@ -238,15 +326,19 @@ pub struct GgufTensorDescriptor {
 }
 
 impl GgufTensorDescriptor {
+    /// Absolute file offset of the tensor's payload.
     pub fn data_offset(&self) -> u64 {
         self.data_offset
     }
 
+    /// Exact byte length of the tensor's payload.
     pub fn byte_len(&self) -> usize {
         self.byte_len
     }
 }
 
+/// Result of parsing a GGUF header: the architecture name, the full
+/// metadata table in file order, and the tensor catalog.
 #[derive(Clone, Debug, PartialEq)]
 pub struct GgufFile {
     pub architecture: String,
@@ -254,6 +346,10 @@ pub struct GgufFile {
     pub tensors: Vec<GgufTensorDescriptor>,
 }
 
+// Bounds-checked sequential cursor over the header region. `position`
+// never exceeds `file_len` or `MAX_HEADER_BYTES`; reads larger than
+// `HEADER_READ_CHUNK_BYTES` are chunked so cancellation latency stays
+// bounded even for multi-megabyte strings.
 struct HeaderReader<'a> {
     file: &'a mut File,
     file_len: u64,
@@ -363,6 +459,11 @@ impl HeaderReader<'_> {
         }
     }
 
+    // Validates a caller-supplied count against both the hard `maximum`
+    // and the bytes actually remaining in the file, *before* the
+    // corresponding allocation. `minimum_bytes` is the smallest possible
+    // serialized size of one element, so `value` elements provably do not
+    // fit when `value > remaining / minimum_bytes`.
     fn count(
         &self,
         value: u64,
@@ -388,6 +489,9 @@ impl HeaderReader<'_> {
             .map_err(|_| GgufParseError::invalid(format!("{what} count {value} is out of range")))
     }
 
+    // Length-prefixed UTF-8 string, capped at `maximum` bytes. Uses
+    // `try_reserve_exact` so an allocation failure becomes an error, not
+    // an abort.
     fn read_string(&mut self, what: &str, maximum: u64) -> Result<String, GgufParseError> {
         let byte_len = self.read_u64()?;
         let length = self.count(byte_len, what, 1, maximum)?;
@@ -402,6 +506,8 @@ impl HeaderReader<'_> {
     }
 }
 
+// Rejects 64-bit metadata outside ±2^53−1 so values survive the Node.js
+// embedding without silent precision loss.
 fn checked_u64_metadata(value: u64, what: &str) -> Result<u64, GgufParseError> {
     if value > JS_SAFE_INTEGER {
         Err(GgufParseError::invalid(format!(
@@ -536,6 +642,10 @@ fn read_metadata_value(
     })
 }
 
+// Tensor catalog entry as read from disk: GGUF least-major-first
+// dimensions and an offset relative to the (aligned) tensor-data section.
+// Converted to an absolute, validated `GgufTensorDescriptor` at the end of
+// parsing.
 #[derive(Debug)]
 struct RawTensorDescriptor {
     name: String,
@@ -552,6 +662,8 @@ fn checked_product(values: &[usize], what: &str) -> Result<usize, GgufParseError
     })
 }
 
+// `alignment` is validated as a non-zero power of two by the caller, so
+// the mask round-up is exact and only the addition can overflow.
 fn align_up(value: u64, alignment: u64) -> Result<u64, GgufParseError> {
     value
         .checked_add(alignment - 1)
@@ -559,6 +671,14 @@ fn align_up(value: u64, alignment: u64) -> Result<u64, GgufParseError> {
         .ok_or_else(|| GgufParseError::invalid("aligned tensor-data offset overflows"))
 }
 
+/// Parses the header of a GGUF v3 file, returning the metadata table and
+/// tensor catalog. Reads only header bytes; tensor payloads are validated
+/// for range/overlap but not loaded.
+///
+/// The file is seeked to offset 0 first. `cancellation`, when supplied, is
+/// polled between read chunks; a set flag aborts with
+/// [`GgufParseError::Cancelled`]. See the module documentation for the full
+/// validation and resource-limit contract.
 pub fn parse_gguf(
     file: &mut File,
     cancellation: Option<&CancellationFlag>,
@@ -827,6 +947,15 @@ pub fn parse_gguf(
     })
 }
 
+/// Loads one tensor's payload into `output` using positioned reads
+/// (`read_exact_at`), which leave the file cursor untouched so concurrent
+/// reads of the same file are safe.
+///
+/// `output.len()` must equal `tensor.byte_len()` exactly. The payload is
+/// read in `READ_CHUNK_BYTES` chunks with a cancellation poll before each
+/// chunk; on cancellation the already-written prefix of `output` is left
+/// as-is. The raw (possibly quantized) bytes are copied verbatim —
+/// dequantization is the caller's concern.
 pub fn read_gguf_tensor_into(
     file: &File,
     tensor: &GgufTensorDescriptor,
@@ -860,6 +989,9 @@ pub fn read_gguf_tensor_into(
     Ok(())
 }
 
+// Positioned read used for tensor payloads. On unix `read_exact_at` loops
+// internally; on Windows `seek_read` may short-read, so length is checked
+// explicitly and a short read is reported as a truncated payload.
 #[cfg(unix)]
 fn read_exact_at(file: &File, output: &mut [u8], offset: u64) -> Result<(), GgufParseError> {
     use std::os::unix::fs::FileExt;

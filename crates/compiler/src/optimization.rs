@@ -1,3 +1,40 @@
+//! Region selection: partitioning a semantic graph into codegen regions and
+//! the deterministic lowering order that ties them back together.
+//!
+//! Selection runs a fixed sequence of passes over the [`GraphIndex`], each
+//! reserving nodes for one region kind before the next pass sees them:
+//!
+//! 1. **GEMM epilogues** (Metal, fusion + epilogues enabled): `Linear` nodes
+//!    absorb a following residual `Add` or `Gelu` into a single
+//!    [`LinearResidualRegion`]/[`LinearGeluRegion`].
+//! 2. **Optimizer steps**: `AdamWStep`/`SgdStep` nodes (with their `*Out`
+//!    pickers) become [`AdamWRegion`]/[`SgdRegion`], or — with optimizer
+//!    groups enabled — batches of up to four compatible AdamW steps share
+//!    one [`AdamWGroupRegion`].
+//! 3. **Elementwise fusion**: chains of broadcast-compatible elementwise ops
+//!    grow into one [`ElementwiseRegion`] per chain endpoint (bounded by
+//!    `MAX_LANES`), and an elementwise chain feeding a reduction becomes an
+//!    [`ElementwiseReduceRegion`].
+//! 4. **Multi-output merge**: an elementwise region consumed by several
+//!    elementwise continuations of one shape merges with them into a
+//!    [`MultiOutputRegion`] (bounded by `MAX_BUFFERS` and `MAX_MERGED_OPS`),
+//!    with dependency analysis ensuring the merge never swallows a value the
+//!    rest of the graph still needs.
+//!
+//! Cross-cutting invariants, all verified by [`OptimizationPlan::validate`]
+//! before a plan is returned:
+//!
+//! - **Semantic identity is preserved.** Selection never rebuilds a semantic
+//!   node (`semantic_nodes_rebuilt == 0`); regions only *cover* nodes, and
+//!   every covered node belongs to exactly one region.
+//! - **Every value has exactly one source.** A semantic node's value is
+//!   either routed from one region output or materialized independently;
+//!   internal nodes of a region never escape it.
+//! - **The lowering order is a deterministic topological sort** over regions
+//!   and independent nodes, so backends never recover topology themselves.
+//! - **Determinism.** Identical graphs and options select identical regions;
+//!   all tie breaks are by dense ID.
+
 use crate::schedule::{DenseNodeId, GraphIndex};
 use crate::{
     adamw_exprs, broadcast_compatible, is_supported, lane_strides, pow_expr, sgd_exprs,
@@ -9,8 +46,13 @@ use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
 use std::fmt;
 
+/// Maximum per-element input lanes one fused expression may reference;
+/// bounded by backend kernel buffer limits.
 const MAX_LANES: usize = 30;
+/// Maximum total buffers (inputs + outputs) of a merged multi-output region.
 const MAX_BUFFERS: usize = 31;
+/// Maximum expression-node count of a merged multi-output region, bounding
+/// emitted kernel size.
 const MAX_MERGED_OPS: usize = 512;
 
 /// Dense identity of a selected code-generation region.
@@ -80,7 +122,8 @@ pub enum ValueSource {
     Region(RegionOutput),
 }
 
-/// Structural work counters. Region selection never creates semantic nodes.
+/// Structural work counters. Region selection never creates semantic nodes,
+/// so `semantic_nodes_rebuilt` is always zero and asserted as such.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct OptimizationWork {
     pub graph_index_builds: usize,
@@ -96,12 +139,18 @@ pub struct OptimizationWork {
     pub selected_regions: usize,
 }
 
+/// One fused expression paired with the semantic node whose value it
+/// computes.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ElementwiseOutput {
     pub semantic_node: DenseNodeId,
     pub expression: KernelExpr,
 }
 
+/// A chain of elementwise ops fused into a single kernel over named input
+/// lanes: `inputs` are the boundary nodes read per element, `lane_strides`
+/// their broadcast strides against `shape`, and `output` the fused
+/// expression computing the chain endpoint's value.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ElementwiseRegion {
     pub nodes: Box<[DenseNodeId]>,
@@ -113,6 +162,9 @@ pub struct ElementwiseRegion {
     pub device: Device,
 }
 
+/// An elementwise chain folded directly into a terminating reduction: the
+/// expression is evaluated per input element inside the reduce loop, so the
+/// chain's intermediate never materializes.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ElementwiseReduceRegion {
     pub nodes: Box<[DenseNodeId]>,
@@ -129,6 +181,9 @@ pub struct ElementwiseReduceRegion {
     pub device: Device,
 }
 
+/// Several elementwise continuations of a shared prefix, merged into one
+/// kernel that writes every continuation's output in a single pass over
+/// `shape`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct MultiOutputRegion {
     pub nodes: Box<[DenseNodeId]>,
@@ -140,6 +195,7 @@ pub struct MultiOutputRegion {
     pub device: Device,
 }
 
+/// A `Linear` GEMM with its residual `Add` absorbed into the epilogue.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LinearResidualRegion {
     pub nodes: Box<[DenseNodeId]>,
@@ -151,6 +207,9 @@ pub struct LinearResidualRegion {
     pub device: Device,
 }
 
+/// A `Linear` GEMM with a following `Gelu` absorbed into the epilogue.
+/// `dual` regions additionally materialize the pre-activation value because
+/// the graph consumes it elsewhere.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LinearGeluRegion {
     pub nodes: Box<[DenseNodeId]>,
@@ -165,6 +224,8 @@ pub struct LinearGeluRegion {
     pub device: Device,
 }
 
+/// Hyperparameters of one fused AdamW step, mirrored into the region's
+/// constant expressions.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct AdamWOptions {
     pub beta1: f64,
@@ -173,6 +234,7 @@ pub struct AdamWOptions {
     pub weight_decay: f64,
 }
 
+/// Hyperparameters of one fused momentum-SGD step.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SgdOptions {
     pub momentum: f64,
@@ -181,6 +243,8 @@ pub struct SgdOptions {
     pub weight_decay: f64,
 }
 
+/// Which physical output of a fused optimizer step an [`OptimizerOutput`]
+/// describes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum OptimizerOutputKind {
     Parameter,
@@ -189,6 +253,9 @@ pub enum OptimizerOutputKind {
     Velocity,
 }
 
+/// Routing from one physical optimizer output to the semantic nodes that
+/// read it: the step itself plus any `AdamWOut`/`SgdOut` pickers, which all
+/// alias the same physical buffer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OptimizerOutput {
     pub index: u32,
@@ -198,6 +265,8 @@ pub struct OptimizerOutput {
     pub semantic_nodes: Box<[DenseNodeId]>,
 }
 
+/// One AdamW step fused into a single elementwise kernel over
+/// `[param, grad, m, v]`, writing updated parameter and both moments.
 #[derive(Debug, Clone, PartialEq)]
 pub struct AdamWRegion {
     pub nodes: Box<[DenseNodeId]>,
@@ -214,6 +283,9 @@ pub struct AdamWRegion {
     pub device: Device,
 }
 
+/// Up to four AdamW steps with identical hyperparameters and shape fused
+/// into one kernel, interleaving their lanes to amortize launch and scalar
+/// binding costs.
 #[derive(Debug, Clone, PartialEq)]
 pub struct AdamWGroupRegion {
     pub nodes: Box<[DenseNodeId]>,
@@ -229,6 +301,8 @@ pub struct AdamWGroupRegion {
     pub device: Device,
 }
 
+/// One momentum-SGD step fused over `[param, grad, velocity]`, writing the
+/// updated parameter and velocity.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SgdRegion {
     pub nodes: Box<[DenseNodeId]>,
@@ -245,6 +319,9 @@ pub struct SgdRegion {
     pub device: Device,
 }
 
+/// A selected codegen region. Every variant covers a disjoint set of
+/// semantic nodes and routes at least one semantic output; see the module
+/// documentation for the selection order and covering invariants.
 #[derive(Debug, Clone, PartialEq)]
 pub enum NativeRegion {
     Elementwise(ElementwiseRegion),
@@ -258,6 +335,7 @@ pub enum NativeRegion {
 }
 
 impl NativeRegion {
+    /// Semantic nodes covered by this region (sorted, deduplicated).
     pub fn nodes(&self) -> &[DenseNodeId] {
         match self {
             Self::Elementwise(region) => &region.nodes,
@@ -271,6 +349,7 @@ impl NativeRegion {
         }
     }
 
+    /// Boundary nodes read by this region; never covered by the region.
     pub fn inputs(&self) -> &[DenseNodeId] {
         match self {
             Self::Elementwise(region) => &region.inputs,
@@ -284,6 +363,7 @@ impl NativeRegion {
         }
     }
 
+    /// Number of physical outputs the region writes.
     pub fn output_count(&self) -> usize {
         match self {
             Self::Elementwise(_) | Self::ElementwiseReduce(_) | Self::LinearResidual(_) => 1,
@@ -295,6 +375,8 @@ impl NativeRegion {
         }
     }
 
+    /// Semantic values routed from this region's physical outputs. Every
+    /// entry must name a covered node and a valid output index.
     pub fn semantic_outputs(&self) -> Vec<SemanticOutput> {
         match self {
             Self::Elementwise(region) => vec![SemanticOutput {
@@ -338,6 +420,9 @@ impl NativeRegion {
         }
     }
 
+    /// Deterministic ordering key: the smallest dense index among routed
+    /// outputs (falling back to covered nodes), so region order in the plan
+    /// reflects semantic postorder.
     fn ordering_key(&self) -> usize {
         self.semantic_outputs()
             .iter()
@@ -365,6 +450,16 @@ fn optimizer_semantic_outputs(outputs: &[OptimizerOutput]) -> Vec<SemanticOutput
 }
 
 /// Selected implementation regions and complete semantic-output routing.
+///
+/// The plan's tables are index-parallel to the graph index and mutually
+/// consistent (checked by [`OptimizationPlan::validate`]):
+///
+/// - `node_region[n]` is the region covering node `n`, if any.
+/// - `outputs[n]` is the region output implementing node `n`'s value, if it
+///   is region-routed; an independent node has neither entry, and a node
+///   internal to a region has `node_region` set but no `outputs` entry.
+/// - `lowering_order` is a topological order over regions and independent
+///   nodes; backends consume it directly.
 #[derive(Debug, Clone, PartialEq)]
 pub struct OptimizationPlan<R = NativeRegion> {
     pub regions: Box<[R]>,
@@ -375,14 +470,19 @@ pub struct OptimizationPlan<R = NativeRegion> {
 }
 
 impl OptimizationPlan<NativeRegion> {
+    /// Selects native regions for one indexed graph under the given options.
     pub fn select(index: &GraphIndex, options: &CompileOptions) -> Result<Self, String> {
         build_optimization_plan(index, options)
     }
 
+    /// Selects regions from a prepared program's shared index and options.
     pub fn from_prepared(program: &crate::PreparedProgram) -> Result<Self, String> {
         build_optimization_plan(&program.index, &program.options)
     }
 
+    /// Where a semantic node's value comes from: an independent lowering or
+    /// a region output. Fails for nodes internal to a region (their values
+    /// never materialize) and for out-of-range nodes.
     pub fn resolve(&self, node: DenseNodeId) -> Result<ValueSource, String> {
         let Some(output) = self.outputs.get(node.index()) else {
             return Err(format!("optimization: dense node {node} is out of range"));
@@ -398,6 +498,11 @@ impl OptimizationPlan<NativeRegion> {
         }
     }
 
+    /// Re-derives the ownership tables, output routing, and lowering order
+    /// from the region list and checks them against the stored tables; also
+    /// requires every graph root to have a materialized value. Selection
+    /// runs this before returning, so a stored plan is consistent by
+    /// construction — this exists to catch hand-built or mutated plans.
     pub fn validate(&self, index: &GraphIndex) -> Result<(), String> {
         let node_count = index.order.len();
         if self.node_region.len() != node_count || self.outputs.len() != node_count {
@@ -488,6 +593,7 @@ impl OptimizationPlan<NativeRegion> {
     }
 }
 
+/// Convenience wrapper around [`OptimizationPlan::select`].
 pub fn select_optimization_regions(
     index: &GraphIndex,
     options: &CompileOptions,
@@ -495,12 +601,16 @@ pub fn select_optimization_regions(
     build_optimization_plan(index, options)
 }
 
+/// Convenience wrapper around [`OptimizationPlan::from_prepared`].
 pub fn optimize_prepared_program(
     program: &crate::PreparedProgram,
 ) -> Result<OptimizationPlan, String> {
     OptimizationPlan::from_prepared(program)
 }
 
+/// Runs the selection pipeline described in the module documentation. With
+/// `optimize` disabled, returns an empty region set and a lowering order of
+/// independent nodes only. Every path ends in plan validation.
 pub fn build_optimization_plan(
     index: &GraphIndex,
     options: &CompileOptions,
@@ -546,11 +656,18 @@ pub fn build_optimization_plan(
     selector.finish()
 }
 
+/// A candidate region during selection: drafts may be deactivated by a
+/// later merge without being removed, so `active` gates every subsequent
+/// pass.
 struct DraftRegion {
     region: NativeRegion,
     active: bool,
 }
 
+/// Mutable selection state for one graph. `reserved` marks nodes already
+/// claimed by a committed region (later passes must leave them alone),
+/// `roots` marks graph roots (whose values must always materialize), and
+/// `drafts` accumulates candidates in creation order.
 struct RegionSelector<'a> {
     index: &'a GraphIndex,
     options: &'a CompileOptions,
@@ -990,6 +1107,12 @@ impl<'a> RegionSelector<'a> {
         }));
     }
 
+    /// Single forward pass over the dense postorder growing open elementwise
+    /// chains. A chain is closed (and emitted when profitable) at any node
+    /// whose consumer is not a fusible elementwise op, whose value is read
+    /// by multiple consumers, or which is a graph root; reductions either
+    /// absorb their open input chain into a fused-reduce region or close it
+    /// first.
     fn select_elementwise(&mut self) -> Result<(), String> {
         self.work.semantic_nodes_scanned += self.index.order.len();
         let mut open: Vec<Option<OpenRegion>> = (0..self.index.order.len()).map(|_| None).collect();
@@ -1356,6 +1479,11 @@ impl<'a> RegionSelector<'a> {
         }
     }
 
+    /// Emits a closed chain as an [`ElementwiseRegion`] when it is
+    /// profitable (at least two fused ops over at least one real input lane)
+    /// and representable (broadcast-compatible strides, element count within
+    /// backend index range). Unprofitable chains are dropped silently: their
+    /// nodes simply lower independently.
     fn emit_elementwise(
         &mut self,
         endpoint: DenseNodeId,
@@ -1394,6 +1522,15 @@ impl<'a> RegionSelector<'a> {
         Ok(())
     }
 
+    /// Merges elementwise regions that share a common prefix region into
+    /// multi-output regions. A prefix qualifies when its output fans out to
+    /// at least two elementwise continuations of one shape; the merge is
+    /// skipped when a continuation's extra inputs depend on the prefix's
+    /// other descendants (dependency analysis via `RegionDependencyIndex`),
+    /// when the prefix must stay materialized for external consumers but has
+    /// a different shape, or when buffer/op limits would be exceeded. On a
+    /// "split" merge the prefix region is preserved as a separate draft so
+    /// external consumers keep their value.
     fn select_multi_output(&mut self) {
         if self.options.environment.fusion_debug {
             let elementwise = self
@@ -1557,6 +1694,12 @@ impl<'a> RegionSelector<'a> {
         self.work.multi_output_dependency_queries = dependencies.queries;
     }
 
+    /// Constructs the merged multi-output region for one prefix and its
+    /// continuation group: prefix lanes are re-based into the output shape,
+    /// continuation expressions inline the prefix expression for their
+    /// shared lane, and the merge is refused when dtype/device disagree,
+    /// buffer or op limits would be exceeded, or the output is beyond
+    /// backend index range.
     fn merge_multi_region(
         &self,
         prefix: usize,
@@ -1680,6 +1823,10 @@ impl<'a> RegionSelector<'a> {
         })
     }
 
+    /// Finalizes selection: active drafts are sorted by their semantic
+    /// ordering key, ownership and routing tables are built with overlap and
+    /// double-routing rejected, and the lowering order is computed and
+    /// validated before the plan is returned.
     fn finish(mut self) -> Result<OptimizationPlan, String> {
         let mut active = self
             .drafts
@@ -1738,6 +1885,13 @@ impl<'a> RegionSelector<'a> {
     }
 }
 
+/// Dependency index over lowering units (draft regions plus independent
+/// nodes) used by the multi-output merge to answer two reachability queries
+/// without rebuilding adjacency per query: "does this input descend from a
+/// marked region" (forward, over consumers) and "does any of these inputs
+/// have a member of the merge group as an ancestor" (backward, over
+/// dependencies). Stamp generations (`seen`/`descendants`) replace per-pass
+/// visited sets; counters feed `OptimizationWork`.
 struct RegionDependencyIndex {
     unit_of_node: Vec<usize>,
     dependencies: Vec<Vec<usize>>,
@@ -1865,6 +2019,10 @@ impl RegionDependencyIndex {
     }
 }
 
+/// An elementwise chain under construction: the fused expression so far,
+/// the boundary nodes it reads (`inputs` with `lane_of` assigning each a
+/// stable lane index), the semantic nodes it covers, and the fused op count
+/// used by the `ops >= 2` emission threshold.
 struct OpenRegion {
     expression: KernelExpr,
     inputs: Vec<DenseNodeId>,
@@ -1884,6 +2042,8 @@ impl OpenRegion {
         }
     }
 
+    /// The lane expression for `node`, allocating a fresh input lane on
+    /// first use.
     fn lane(&mut self, node: DenseNodeId) -> KernelExpr {
         if let Some(&lane) = self.lane_of.get(&node) {
             return KernelExpr::Input(lane);
@@ -1894,6 +2054,10 @@ impl OpenRegion {
         KernelExpr::Input(lane)
     }
 
+    /// Merges another open region into this one: its inputs are appended
+    /// (deduplicated through `lane_of`), its covered nodes and op count are
+    /// transferred, and its expression is returned with lanes remapped into
+    /// the merged namespace.
     fn absorb(&mut self, other: OpenRegion) -> KernelExpr {
         let mut remap = HashMap::new();
         for (lane, input) in other.inputs.iter().enumerate() {
@@ -2050,6 +2214,11 @@ fn region_id(index: usize) -> Result<RegionId, String> {
     RegionId::from_index(index).ok_or_else(|| "optimization: too many selected regions".to_string())
 }
 
+/// Builds the plan's lowering order: one unit per region plus one per
+/// independent node, topologically sorted by dependency. Ready units pop in
+/// deterministic priority order (region ordering key before node index), so
+/// the result is stable for identical plans. A leftover indegree means a
+/// dependency cycle, which is reported with the first blocked units.
 fn build_lowering_order(
     index: &GraphIndex,
     plan: &OptimizationPlan,

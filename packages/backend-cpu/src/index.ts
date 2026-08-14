@@ -1,3 +1,8 @@
+/**
+ * CPU package entry point. Importing this module loads the host-specific native
+ * addon; {@link makeRuntime} and {@link layer} then expose one module-memoized
+ * adapter as either a direct service or an Effect dependency.
+ */
 import { Runtime } from "@effect-torch/core"
 import { Effect, Layer } from "effect"
 import { makeRuntime as makeRuntimeAdapter } from "./internal/adapter.js"

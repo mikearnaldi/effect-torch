@@ -62,6 +62,8 @@ onDevices("Compile", (device) => (it) => {
         const program = yield* Tensor.freezeProgram([yield* Tensor.neg(input)])
         expect("outputCapacity" in program.handle.diagnostics).toBe(false)
         expect(program.handle.diagnostics.memory.outputBytes).toBeGreaterThan(0)
+        // Each invocation transfers independent output ownership to the caller;
+        // later executions may reuse workspace but cannot overwrite these handles.
         const retained: Array<Tensor.Concrete> = []
         for (let i = 0; i < 8; i++) {
           const value = yield* Tensor.fromTypedArray(floats([i, i + 1]), [2])
