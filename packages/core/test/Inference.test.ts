@@ -143,9 +143,8 @@ onDevices("Inference", () => (it) => {
         expect(omitted.handle.state?.lastTokenRow).toBeUndefined()
       }))
 
-    it.effect("exposes fused sampling only when supported and samples add/step without logits", () =>
+    it.effect("samples add/step without publishing logits", () =>
       Effect.gen(function*() {
-        const runtime = yield* Runtime.Runtime
         const model = yield* makeGpt()
         const params = yield* Tensor.compute(yield* model.init)
         const program = yield* Model.inference(model, params, {
@@ -155,17 +154,6 @@ onDevices("Inference", () => (it) => {
           decodeBatch: 2
         })
         const generation = yield* program.generation()
-        const fusedSampling = runtime.extensions.sampling?.executeDecode !== undefined
-        expect(generation.sampled !== undefined).toBe(fusedSampling)
-        if (!fusedSampling) {
-          expect(generation.sampled).toBeUndefined()
-          return
-        }
-
-        const sampled = generation.sampled
-        expect(sampled).toBeDefined()
-        if (sampled === undefined) return
-
         const reference = yield* program.generation()
         const prompts = [
           [1, 5, 3, 8, 2, 11, 4, 7, 6],
@@ -184,7 +172,7 @@ onDevices("Inference", () => (it) => {
           expectedAdd.push(yield* Tensor.sample(expected.logits, sampling[index]!))
           yield* Tensor.clear(expected.logits)
 
-          const actual = yield* sampled.add(yield* ids(prompt), sampling[index]!)
+          const actual = yield* generation.addSampled(yield* ids(prompt), sampling[index]!)
           sampledEntries.push(actual)
           expect("logits" in actual).toBe(false)
           expect(actual.token).toBe(expectedAdd[index])
@@ -200,7 +188,7 @@ onDevices("Inference", () => (it) => {
           expectedStep.push(yield* Tensor.sample(logits, sampling[index]!))
           yield* Tensor.clear(logits)
         }
-        const actualStep = yield* sampled.step(
+        const actualStep = yield* generation.stepSampled(
           sampledEntries.map(({ seq }, index) => ({
             seq,
             token: inputTokens[index]!,
@@ -845,9 +833,6 @@ onDevices("Inference", () => (it) => {
       Effect.gen(function*() {
         const runtime = yield* Runtime.Runtime
         const diagnostics = runtime.extensions.diagnostics
-        if (diagnostics === undefined) {
-          return yield* Effect.die(new Error("runtime does not provide memory diagnostics"))
-        }
         const model = yield* makeGpt({ causal: false })
         const params = yield* Tensor.compute(yield* model.init)
         // The baseline includes caller-owned params. Returning to it proves the
@@ -863,9 +848,6 @@ onDevices("Inference", () => (it) => {
       Effect.gen(function*() {
         const runtime = yield* Runtime.Runtime
         const diagnostics = runtime.extensions.diagnostics
-        if (diagnostics === undefined) {
-          return yield* Effect.die(new Error("runtime does not provide memory diagnostics"))
-        }
         const model = yield* makeGpt({ causal: false })
         const params = yield* model.init
         // Lazy params own no storage at this baseline; inference materializes a

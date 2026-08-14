@@ -1614,7 +1614,7 @@ export interface GenerationEntry {
 }
 
 /**
- * The result of {@link GenerationSampling.add}: a new live sequence and the
+ * The result of {@link Generation.addSampled}: a new live sequence and the
  * token selected from its prompt's final-real-position logits. Fused execution
  * publishes no logits tensor, so the caller owns only the sequence. The token
  * is returned only after the prompt's native state update commits.
@@ -1627,48 +1627,6 @@ export interface GenerationSampledEntry {
   readonly seq: GenerationSeq
   /** The sampled next-token id. */
   readonly token: number
-}
-
-/**
- * Fused next-token sampling for one {@link Generation} session. This capability
- * is exposed through {@link Generation.sampled} only when the runtime that
- * constructs the inference artifact provides fused decode sampling. Prompt,
- * sequence, validation, batching, serialization, rollback, and cleanup behavior
- * otherwise matches {@link Generation.add} and {@link Generation.step}.
- *
- * @since 0.1.0
- * @category compilation
- */
-export interface GenerationSampling {
-  /**
-   * Prefills a new sequence and samples its first generated token during the
-   * final chunk's native decode invocation. Intermediate chunks execute ordinary
-   * decode and immediately clear their logits; no logits are published.
-   */
-  readonly add: (
-    prompt: Tensor.Any,
-    sampling: Tensor.SamplingOptions
-  ) => Effect.Effect<GenerationSampledEntry, InferenceError | ModelError | Tensor.TensorError, Runtime.Runtime>
-  /**
-   * Commits each supplied input token and samples the corresponding next token
-   * in the same native invocation. Entries must be distinct live sequences and
-   * results are returned in entry order. One entry uses single decode; multiple
-   * entries use the fixed batched decode program.
-   */
-  readonly step: (
-    entries: ReadonlyArray<{
-      /** A distinct live sequence created by this session. */
-      readonly seq: GenerationSeq
-      /** The input token id to commit, as a non-negative integer. */
-      readonly token: number
-      /** Sampling controls for this entry's resulting logits row. */
-      readonly sampling: Tensor.SamplingOptions
-    }>
-  ) => Effect.Effect<
-    ReadonlyArray<number>,
-    InferenceError | ModelError | Tensor.TensorError,
-    Runtime.Runtime
-  >
 }
 
 /**
@@ -1720,6 +1678,15 @@ export interface Generation {
     prompt: Tensor.Any
   ) => Effect.Effect<GenerationEntry, InferenceError | ModelError | Tensor.TensorError, Runtime.Runtime>
   /**
+   * Prefills a new sequence and samples its first generated token during the
+   * final chunk's native decode invocation. Intermediate chunks execute ordinary
+   * decode and immediately clear their logits; no logits are published.
+   */
+  readonly addSampled: (
+    prompt: Tensor.Any,
+    sampling: Tensor.SamplingOptions
+  ) => Effect.Effect<GenerationSampledEntry, InferenceError | ModelError | Tensor.TensorError, Runtime.Runtime>
+  /**
    * Commits one supplied token to every entry's sequence in one invocation and
    * returns caller-owned materialized `[vocab]` logits in entry order. The input
    * must be nonempty and contain at most `decodeBatch` distinct live sequences
@@ -1748,11 +1715,25 @@ export interface Generation {
     Runtime.Runtime
   >
   /**
-   * Fused decode sampling, present only when the runtime used to construct the
-   * inference artifact provides `Runtime.extensions.sampling.executeDecode`.
-   * Capability availability is fixed for the artifact's lifetime.
+   * Commits each supplied input token and samples the corresponding next token
+   * in the same native invocation. Entries must be distinct live sequences and
+   * results are returned in entry order. One entry uses single decode; multiple
+   * entries use the fixed batched decode program.
    */
-  readonly sampled?: GenerationSampling
+  readonly stepSampled: (
+    entries: ReadonlyArray<{
+      /** A distinct live sequence created by this session. */
+      readonly seq: GenerationSeq
+      /** The input token id to commit, as a non-negative integer. */
+      readonly token: number
+      /** Sampling controls for this entry's resulting logits row. */
+      readonly sampling: Tensor.SamplingOptions
+    }>
+  ) => Effect.Effect<
+    ReadonlyArray<number>,
+    InferenceError | ModelError | Tensor.TensorError,
+    Runtime.Runtime
+  >
   /**
    * Returns this session's JavaScript live-sequence count. This is not a pool
    * capacity, global-session, or prefix-cache statistic.
@@ -2159,7 +2140,6 @@ interface InferenceEngine {
   readonly config: ResolvedInferenceConfig
   readonly frozenParams: ReadonlyArray<Tensor.Concrete>
   readonly programs: InferencePrograms
-  readonly fusedSampling: boolean
 }
 
 const openGeneration = (engine: InferenceEngine): Effect.Effect<Generation, never> =>
@@ -2257,7 +2237,7 @@ const openGeneration = (engine: InferenceEngine): Effect.Effect<Generation, neve
         ),
         ({ seq, value: logits }) => ({ seq, logits })
       )
-    const sampledAdd: GenerationSampling["add"] = (prompt, sampling) =>
+    const addSampled: Generation["addSampled"] = (prompt, sampling) =>
       Effect.map(
         addSequence(
           prompt,
@@ -2324,7 +2304,7 @@ const openGeneration = (engine: InferenceEngine): Effect.Effect<Generation, neve
               )
           )
       )
-    const sampledStep: GenerationSampling["step"] = (entries) =>
+    const stepSampled: Generation["stepSampled"] = (entries) =>
       runStep(
         entries,
         (entry, input) =>
@@ -2349,8 +2329,9 @@ const openGeneration = (engine: InferenceEngine): Effect.Effect<Generation, neve
       )
     return {
       add,
+      addSampled,
       step,
-      ...(engine.fusedSampling ? { sampled: { add: sampledAdd, step: sampledStep } } : {}),
+      stepSampled,
       live: () => Effect.sync(() => live.length),
       close: () => closeLiveEntries(live)
     }
@@ -2402,14 +2383,12 @@ export const inference = (
   Effect.gen(function*() {
     yield* checkArity("inference", model.names, params)
     const resolved = yield* resolveInferenceConfig(config)
-    const runtime = yield* Runtime.Runtime
-    const fusedSampling = runtime.extensions.sampling?.executeDecode !== undefined
     return yield* Effect.flatMap(Tensor.compute(params), (frozenParams) =>
       Effect.onExit(
         Effect.gen(function*() {
           const programs = yield* compileInferencePrograms(model, frozenParams, resolved)
           return {
-            generation: () => openGeneration({ config: resolved, frozenParams, programs, fusedSampling })
+            generation: () => openGeneration({ config: resolved, frozenParams, programs })
           } satisfies InferenceProgram
         }),
         (exit) => Exit.isFailure(exit) ? Tensor.clearAll(frozenParams) : Effect.void

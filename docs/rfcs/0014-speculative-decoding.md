@@ -79,8 +79,11 @@ decides the ceiling; the engine is proposer-agnostic.
   only the winning id across N-API. Positive-temperature Metal top-p
   filtering requires top-k in `1..=64`; greedy and unfiltered categorical
   draws scan the complete vocabulary.
-- Metal generation additionally exposes sampled `add`/`step` operations.
-  Decode, bounded top-k/top-p selection, the final fence, and transactional
+- Generation additionally exposes required `addSampled`/`stepSampled`
+  operations on every backend.
+  CPU samples before publishing its native state transaction. Metal keeps the
+  stronger fused device path:
+  decode, bounded top-k/top-p selection, the final fence, and transactional
   state publication share one explicit submission, so no logits tensor is
   published and no second host synchronization is introduced. Existing
   logits-returning generation operations remain available for custom host

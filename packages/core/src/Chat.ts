@@ -36,7 +36,7 @@
  */
 import { Data, Effect, Option, Stream } from "effect"
 import type * as Model from "./Model.ts"
-import * as Runtime from "./Runtime.ts"
+import type * as Runtime from "./Runtime.ts"
 import * as Tensor from "./Tensor.ts"
 
 /**
@@ -630,11 +630,6 @@ export const stream = <E = never>(
     if (!Number.isSafeInteger(sampling.seed) || sampling.seed < 0) {
       return yield* fail("validate", `seed must be a non-negative safe integer, got ${sampling.seed}`)
     }
-    const runtime = yield* Runtime.Runtime
-    const nativeSampling = runtime.extensions.sampling !== undefined
-    if (samplingOptions !== undefined && !nativeSampling) {
-      return yield* fail("validate", `backend ${runtime.backend.name} does not provide native sampling`)
-    }
     const tokenizer = options.tokenizer
     const controls = options.controls === false
       ? undefined
@@ -678,20 +673,20 @@ export const stream = <E = never>(
       | { readonly _tag: "fused"; readonly token: number; readonly step: number }
       | { readonly _tag: "legacy"; readonly logits: Tensor.Concrete; readonly step: number }
 
-    const sampledGeneration = customSampler === undefined ? generation.sampled : undefined
+    const useSampledGeneration = customSampler === undefined
     const prefillStarted = Date.now()
     const prompt = yield* Tensor.fromTypedArray(encoded.data, [1, encoded.data.length])
     let sampleCounter = 0
     let seq: Model.GenerationSeq
     let initialRun: RunState
     let currentLogits: Tensor.Concrete | undefined
-    if (sampledGeneration === undefined) {
+    if (!useSampledGeneration) {
       const entry = yield* generation.add(prompt)
       seq = entry.seq
       currentLogits = entry.logits
       initialRun = { _tag: "legacy", logits: entry.logits, step: 0 }
     } else {
-      const entry = yield* sampledGeneration.add(prompt, { ...sampling, counter: 0 })
+      const entry = yield* generation.addSampled(prompt, { ...sampling, counter: 0 })
       sampleCounter++
       seq = entry.seq
       initialRun = { _tag: "fused", token: entry.token, step: 0 }
@@ -738,20 +733,16 @@ export const stream = <E = never>(
           } else {
             const logits = state.logits
             token = yield* Effect.ensuring(
-              customSampler === undefined && nativeSampling
-                ? Tensor.sample(logits, { ...sampling, counter: sampleCounter }).pipe(
-                  Effect.tap(() => Effect.sync(() => sampleCounter++))
-                )
-                : Effect.gen(function*() {
-                  const values = yield* Tensor.toTypedArray(logits)
-                  if (values.length === 0) {
-                    return yield* fail("sample", "model produced an empty logits row")
-                  }
-                  return yield* Effect.try({
-                    try: () => (customSampler ?? greedy)(values),
-                    catch: (error) => fail("sample", error instanceof Error ? error.message : String(error))
-                  })
-                }),
+              Effect.gen(function*() {
+                const values = yield* Tensor.toTypedArray(logits)
+                if (values.length === 0) {
+                  return yield* fail("sample", "model produced an empty logits row")
+                }
+                return yield* Effect.try({
+                  try: () => (customSampler ?? greedy)(values),
+                  catch: (error) => fail("sample", error instanceof Error ? error.message : String(error))
+                })
+              }),
               releaseLogits(logits)
             )
             if (!Number.isSafeInteger(token) || token < 0 || token >= logits.shape[0]) {
@@ -787,10 +778,7 @@ export const stream = <E = never>(
             return [events, Option.none<State>()]
           }
           if (state._tag === "fused") {
-            if (sampledGeneration === undefined) {
-              return yield* fail("sample", "fused generation capability became unavailable")
-            }
-            const [next] = yield* sampledGeneration.step([{
+            const [next] = yield* generation.stepSampled([{
               seq,
               token,
               sampling: { ...sampling, counter: sampleCounter }

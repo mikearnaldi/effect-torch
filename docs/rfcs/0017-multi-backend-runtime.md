@@ -16,7 +16,7 @@ evolved independently.
 Core will depend on one Effect service, `Runtime.Runtime`, whose value is
 a live `Runtime.RuntimeService` bound to a default placement. The runtime owns its
   devices, contexts, queues, allocators, compiler caches, tensor handles,
-  executables, and optional extensions. Backend packages acquire
+  executables, and required extension facilities. Backend packages acquire
 that runtime and provide it as a Layer at the application or test-program
 boundary. Tensors retain only opaque handles and static metadata; all
 backend dispatch uses the ambient service, which validates those handles.
@@ -304,7 +304,7 @@ Every runtime reports:
 - its backend package name;
 - a stable display description of its default placement;
 - dtype and placement constraints;
-- available optional features and extensions.
+- its required feature and extension implementations.
 
 The npm package graph is the compatibility mechanism. Backend packages
 declare a semver range for `@effect-torch/core` as a peer dependency, and
@@ -320,8 +320,10 @@ reject an operation/dtype/layout combination at graph construction or
 compile time, but the error must identify the unsupported capability at
 the earliest boundary.
 
-Capabilities that imply different state or lifecycle models are typed
-optional extensions. Initial candidates are:
+Core currently exposes no optional backend APIs: every facility present in
+`RuntimeService` is required, and an implementation missing one cannot be
+constructed as a runtime. Future candidates for separate services or required
+contract additions include:
 
 - compiled inference and stateful KV sessions;
 - paged attention and prefix caching;
@@ -449,7 +451,7 @@ returns `Uint32Array`; `Tensor.fromTypedArray` snapshots that token data into
 the selected runtime. The tokenizer cannot construct another addon's tensor
 handle.
 
-Safetensors is an optional direct-loading runtime extension. It consumes
+Safetensors is a required direct-loading runtime facility. It consumes
 runtime-owned tensor handles for writes and returns concrete tensor handles
 plus structured archive metadata for reads. Core does not define a second
 host-side tensor representation or a byte codec API.
@@ -459,7 +461,7 @@ distinguish client bytes, URLs or object-store references, and
 server-local paths. Requested placement is never silently changed while
 loading.
 
-Local runtimes may expose a structured path extension carrying named entries
+Local runtimes expose a structured path extension carrying named entries
 and metadata. The native extension uses the official Rust `safetensors` crate,
 writes through a same-directory temporary file and rename, rejects malformed
 layout and unsupported placement (including f64 on Metal), and never falls
@@ -653,8 +655,8 @@ isolated clients.
 
 1. Move tokenizer-native integration behind a tokenizer package returning
    token arrays.
-2. Move safetensors behind optional direct runtime I/O.
-3. Move decode/KV APIs behind an inference extension.
+2. Move safetensors behind required direct runtime I/O.
+3. Move decode/KV APIs behind a required inference extension.
 4. Remove hard-coded best-device selection and require an explicit backend Layer.
 
 ### Phase 3: Shared native crates (implemented)

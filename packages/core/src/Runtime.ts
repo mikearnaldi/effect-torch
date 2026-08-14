@@ -1104,11 +1104,10 @@ export interface SamplingOptions {
 }
 
 /**
- * Optional native next-token sampling extension. Direct sampling borrows one
- * live, dense, rank-one floating-point tensor. Fused decode execution, when
- * present, samples one rank-one output per active state sequence without
- * publishing output tensors. Both paths return only selected u32 offsets, so
- * no tensor ownership transfers.
+ * Native next-token sampling extension. Direct sampling borrows one live,
+ * dense, rank-one floating-point tensor. Fused decode execution samples one
+ * rank-one output per active state sequence without publishing output tensors.
+ * Both paths return only selected u32 offsets, so no tensor ownership transfers.
  *
  * @since 0.1.0
  * @category models
@@ -1120,12 +1119,12 @@ export interface SamplingRuntime {
     options: SamplingOptions
   ) => Effect.Effect<number, BackendError>
   /**
-   * Optionally executes one stateful decode invocation and samples its active
-   * outputs in order. The invocation follows `RuntimeService.execute`'s input,
-   * state, cancellation, and atomic-commit contract. `options` contains one
-   * normalized entry per active output.
+   * Executes one stateful decode invocation and samples its active outputs in
+   * order. The invocation follows `RuntimeService.execute`'s input, state,
+   * cancellation, and atomic-commit contract. `options` contains one normalized
+   * entry per active output.
    */
-  readonly executeDecode?: (
+  readonly executeDecode: (
     executable: ExecutableHandle,
     invocation: ExecutionInvocation,
     options: ReadonlyArray<SamplingOptions>
@@ -1202,7 +1201,7 @@ export interface DecodeRuntime {
 }
 
 /**
- * Optional runtime diagnostics that do not affect execution.
+ * Runtime diagnostics that do not affect execution.
  *
  * @since 0.1.0
  * @category models
@@ -1302,21 +1301,18 @@ export interface RuntimeService {
    * as a successful release.
    */
   readonly release: (tensor: ConcreteTensorHandle) => Effect.Effect<void, BackendError>
-  /**
-   * Optional facilities in this same identity and placement domain. Presence
-   * advertises availability; each call still validates handles and arguments.
-   */
+  /** Required facilities in this same identity and placement domain. */
   readonly extensions: {
-    /** Direct path-based safetensors I/O, when supported. */
-    readonly pathSafetensors?: PathSafetensors
-    /** Native GGUF inspection and loading, when supported. */
-    readonly gguf?: GgufRuntime
-    /** Native next-token sampling, optionally fused with stateful decode execution. */
-    readonly sampling?: SamplingRuntime
-    /** Compiled paged-KV inference, when supported. */
-    readonly decode?: DecodeRuntime
-    /** Runtime memory and execution diagnostics, when supported. */
-    readonly diagnostics?: RuntimeDiagnostics
+    /** Direct path-based safetensors I/O. */
+    readonly pathSafetensors: PathSafetensors
+    /** Native GGUF inspection and loading. */
+    readonly gguf: GgufRuntime
+    /** Native next-token sampling and fused stateful decode execution. */
+    readonly sampling: SamplingRuntime
+    /** Compiled paged-KV inference. */
+    readonly decode: DecodeRuntime
+    /** Runtime memory and execution diagnostics. */
+    readonly diagnostics: RuntimeDiagnostics
   }
 }
 

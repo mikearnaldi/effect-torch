@@ -329,7 +329,6 @@ export const load = (
     const runtime = yield* Runtime.Runtime
     const registry = yield* Registry.Registry
     const gguf = runtime.extensions.gguf
-    if (gguf === undefined) return yield* fail("inspect", "runtime does not provide native GGUF loading")
     const inspected = yield* fromBackend("inspect", gguf.inspect(path))
     const inspection = yield* validateEffect(() => validateInspection(inspected))
     const architectureEntry = inspection.metadata.find((entry) => entry.key === "general.architecture")

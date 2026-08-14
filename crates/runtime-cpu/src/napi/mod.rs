@@ -264,6 +264,44 @@ pub struct NativeCompileOptions {
 }
 
 #[napi(object)]
+pub struct NativeSamplingOptions {
+    pub temperature: f64,
+    pub top_k: f64,
+    pub top_p: f64,
+    pub seed: f64,
+    pub counter: f64,
+}
+
+fn non_negative_safe_integer(value: f64, name: &str) -> Result<u64> {
+    const MAX_SAFE_INTEGER: f64 = 9_007_199_254_740_991.0;
+    if !value.is_finite() || value < 0.0 || value.fract() != 0.0 || value > MAX_SAFE_INTEGER {
+        return Err(Error::new(
+            Status::InvalidArg,
+            format!("sample: {name} must be a non-negative safe integer, got {value}"),
+        ));
+    }
+    Ok(value as u64)
+}
+
+fn sampling_options(options: NativeSamplingOptions) -> Result<SamplingOptions> {
+    let top_k = non_negative_safe_integer(options.top_k, "topK")?;
+    Ok(SamplingOptions {
+        temperature: options.temperature,
+        top_k: if top_k == 0 {
+            None
+        } else {
+            Some(
+                usize::try_from(top_k)
+                    .map_err(|_| Error::new(Status::InvalidArg, "sample: topK is out of range"))?,
+            )
+        },
+        top_p: options.top_p,
+        seed: non_negative_safe_integer(options.seed, "seed")?,
+        counter: non_negative_safe_integer(options.counter, "counter")?,
+    })
+}
+
+#[napi(object)]
 pub struct NativeKvStateSchema {
     pub max_tokens: u32,
     pub block_size: u32,
@@ -515,31 +553,14 @@ impl NativeTensor {
         counter: f64,
         cancellation_token: Option<&CancellationToken>,
     ) -> Result<u32> {
-        fn safe_u64(value: f64, name: &str) -> Result<u64> {
-            const MAX_SAFE_INTEGER: f64 = 9_007_199_254_740_991.0;
-            if !value.is_finite() || value < 0.0 || value.fract() != 0.0 || value > MAX_SAFE_INTEGER
-            {
-                return Err(Error::new(
-                    Status::InvalidArg,
-                    format!("sample: {name} must be a non-negative safe integer, got {value}"),
-                ));
-            }
-            Ok(value as u64)
-        }
-
         let value = self.value_cloned()?;
-        let top_k = safe_u64(top_k, "topK")?;
-        let options = SamplingOptions {
+        let options = sampling_options(NativeSamplingOptions {
             temperature,
-            top_k: if top_k == 0 {
-                None
-            } else {
-                Some(top_k as usize)
-            },
+            top_k,
             top_p,
-            seed: safe_u64(seed, "seed")?,
-            counter: safe_u64(counter, "counter")?,
-        };
+            seed,
+            counter,
+        })?;
         run_compute(cancellation_token, move |cancelled, _state| {
             sample_blocking(&value, options, || cancelled.is_cancelled())
         })
@@ -3961,6 +3982,37 @@ fn validate_execution_mode(
     }
 }
 
+fn validate_sampled_execution_mode(
+    stateful: bool,
+    sequence_count: usize,
+    token_count: usize,
+    sampling_count: usize,
+) -> Result<()> {
+    if !stateful {
+        return Err(Error::new(
+            Status::InvalidArg,
+            "executeSampled: requires a stateful executable",
+        ));
+    }
+    if sequence_count != token_count {
+        return Err(Error::new(
+            Status::InvalidArg,
+            format!(
+                "executeSampled: expected one token list per sequence, got {token_count} for {sequence_count} sequences"
+            ),
+        ));
+    }
+    if sampling_count != sequence_count {
+        return Err(Error::new(
+            Status::InvalidArg,
+            format!(
+                "executeSampled: expected one sampling options object per active sequence/output, got {sampling_count} for {sequence_count} sequences"
+            ),
+        ));
+    }
+    Ok(())
+}
+
 fn validate_pool_schema(schema: &KvStateSchema, pool: &PoolInner) -> Result<()> {
     if schema
         .window
@@ -4123,13 +4175,88 @@ impl Executable {
         let advance = tokens.first().map(Vec::len).unwrap_or(1);
         tokens.extend(std::iter::repeat(vec![0; advance]).take(padding.len()));
         let output = self
-            .execute_stateful(inputs, sequences, tokens, active_batch, token)
+            .execute_stateful(
+                inputs,
+                sequences,
+                tokens,
+                active_batch,
+                StatefulInvocation::Tensors,
+                token,
+            )
             .await;
         for sequence in &padding {
             sequence.release();
         }
-        output
+        match output? {
+            StatefulExecutionOutput::Tensors(outputs) => Ok(outputs),
+            StatefulExecutionOutput::Samples(_) => {
+                unreachable!("ordinary stateful execution returned samples")
+            }
+        }
     }
+
+    /// Runs a stateful program and samples its active outputs before committing
+    /// the sequence transaction. No output tensor wrappers are published.
+    #[napi]
+    pub async fn execute_sampled(
+        &self,
+        inputs: Vec<&NativeTensor>,
+        sequences: Vec<&NativeKvSequence>,
+        tokens: Vec<Vec<u32>>,
+        sampling: Vec<NativeSamplingOptions>,
+        cancellation_token: Option<&CancellationToken>,
+    ) -> Result<Vec<u32>> {
+        validate_sampled_execution_mode(
+            self.state.is_some(),
+            sequences.len(),
+            tokens.len(),
+            sampling.len(),
+        )?;
+        let sampling = sampling
+            .into_iter()
+            .map(sampling_options)
+            .collect::<Result<Vec<_>>>()?;
+        let schema = self.state.expect("sampled state invocation was validated");
+        let active_batch = sequences.len();
+        validate_active_batch(&schema, active_batch)?;
+        let mut sequences = sequences;
+        let mut tokens = tokens;
+        let padding = (sequences.len()..schema.batch)
+            .map(|_| sequences[0].new_sequence_like())
+            .collect::<Vec<_>>();
+        sequences.extend(padding.iter());
+        let advance = tokens.first().map(Vec::len).unwrap_or(1);
+        tokens.extend(std::iter::repeat(vec![0; advance]).take(padding.len()));
+        let output = self
+            .execute_stateful(
+                inputs,
+                sequences,
+                tokens,
+                active_batch,
+                StatefulInvocation::Sampled(sampling),
+                cancellation_token,
+            )
+            .await;
+        for sequence in &padding {
+            sequence.release();
+        }
+        match output? {
+            StatefulExecutionOutput::Samples(tokens) => Ok(tokens),
+            StatefulExecutionOutput::Tensors(_) => {
+                unreachable!("sampled stateful execution returned tensors")
+            }
+        }
+    }
+}
+
+enum StatefulInvocation {
+    Tensors,
+    Sampled(Vec<SamplingOptions>),
+}
+
+enum StatefulExecutionOutput {
+    Tensors(Vec<NativeTensor>),
+    Samples(Vec<u32>),
 }
 
 impl Executable {
@@ -4139,8 +4266,9 @@ impl Executable {
         sequences: Vec<&NativeKvSequence>,
         tokens: Vec<Vec<u32>>,
         active_batch: usize,
+        invocation: StatefulInvocation,
         token: Option<&CancellationToken>,
-    ) -> Result<Vec<NativeTensor>> {
+    ) -> Result<StatefulExecutionOutput> {
         let schema = self.state.expect("stateful execution was validated");
         let batch = sequences.len();
         if tokens.len() != batch || tokens.iter().any(Vec::is_empty) {
@@ -4320,15 +4448,61 @@ impl Executable {
                     }
                 }
             };
-            let outputs = match executable::execute_stateful(
-                &executable,
-                &inputs,
-                &generated,
-                cancelled,
-                &context,
-                &|| cancellation.complete(),
-            ) {
-                Ok(outputs) => outputs.into_iter().map(NativeTensor::wrap).collect(),
+            let output = match invocation {
+                StatefulInvocation::Tensors => executable::execute_stateful(
+                    &executable,
+                    &inputs,
+                    &generated,
+                    cancelled,
+                    &context,
+                    &|| cancellation.complete(),
+                )
+                .map(|outputs| {
+                    StatefulExecutionOutput::Tensors(
+                        outputs.into_iter().map(NativeTensor::wrap).collect(),
+                    )
+                }),
+                StatefulInvocation::Sampled(sampling) => {
+                    let mut sampled = None;
+                    let mut sample_outputs = |outputs: &[Value]| {
+                        if sampling.len() > outputs.len() {
+                            return Err(format!(
+                                "executeSampled: executable has {} outputs for {} active sequences",
+                                outputs.len(),
+                                sampling.len()
+                            ));
+                        }
+                        sampled = Some(
+                            outputs
+                                .iter()
+                                .zip(&sampling)
+                                .map(|(output, options)| {
+                                    sample_blocking(output, *options, || cancelled.is_cancelled())
+                                        .map_err(|error| error.reason)
+                                })
+                                .collect::<std::result::Result<Vec<_>, _>>()?,
+                        );
+                        Ok(())
+                    };
+                    let result = executable::execute_stateful_before_commit(
+                        &executable,
+                        &inputs,
+                        &generated,
+                        cancelled,
+                        &context,
+                        &|| cancellation.complete(),
+                        &mut sample_outputs,
+                    );
+                    drop(sample_outputs);
+                    result.map(|()| {
+                        StatefulExecutionOutput::Samples(
+                            sampled.expect("successful sampled execution produced tokens"),
+                        )
+                    })
+                }
+            };
+            let output = match output {
+                Ok(output) => output,
                 Err(error) => {
                     rollback();
                     return Err(to_napi_err(error));
@@ -4342,7 +4516,7 @@ impl Executable {
                     context.pool.maybe_publish_recurrent_snapshot(&state);
                 }
             }
-            Ok(outputs)
+            Ok(output)
         })
         .await
     }

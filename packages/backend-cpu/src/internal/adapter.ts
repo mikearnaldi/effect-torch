@@ -1296,6 +1296,60 @@ export const makeRuntime = (
             options.counter,
             token
           )
+      ),
+    executeDecode: (handle, invocation, options) =>
+      cancellableFor(
+        "executeDecode",
+        "execute",
+        (token) => {
+          const executableRecord = nativeExecutable(handle, "executeDecode")
+          if (Object.keys(invocation.runtimeValues).length > 0) {
+            throw new Runtime.BackendError({
+              reason: "unsupported-operation",
+              backend: backendName,
+              operation: "executeDecode",
+              phase: "execute",
+              message: "executeDecode: CPU runtime values are not supported",
+              details: { device }
+            })
+          }
+          const value = executableRecord.value as NativeExecutable
+          const info = executableRecord.info as ExecutableInfo
+          const schema = info.state
+          if (schema === undefined) {
+            throw new Error("executeDecode: requires a stateful executable")
+          }
+          const state = invocation.state
+          if (state === undefined) {
+            throw new Error("executeDecode: stateful executable requires state")
+          }
+          if (invocation.scalars.length > 0) {
+            throw new Error("executeDecode: stateful executable does not accept scalar inputs")
+          }
+          if (invocation.bindings.length !== info.bindings.length) {
+            throw new Error(
+              `executeDecode: received ${invocation.bindings.length} tensor bindings, expected ${info.bindings.length}`
+            )
+          }
+          const inputs = invocation.bindings.map((input, index) =>
+            nativeBinding(
+              input,
+              info.bindings[index]!,
+              index,
+              index === info.bindings.length - 1
+                ? { compiled: schema.batch, active: state.sequences.length }
+                : undefined
+            )
+          )
+          const sequences = resolveExecutionState(schema, state, "executeDecode")
+          return value.executeSampled(
+            inputs,
+            [...sequences],
+            state.tokens.map((row) => [...row]),
+            options.map((option) => ({ ...option })),
+            token
+          )
+        }
       )
   }
   // Direct path I/O borrows tensors on save and transfers newly loaded native

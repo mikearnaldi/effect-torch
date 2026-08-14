@@ -346,7 +346,7 @@ It does not participate in Runtime.Runtime.
 `@effect-torch/core` defines the public contract:
 
 - `RuntimeService` describes graph construction, compilation/execution,
-  autodiff, readback, release, and optional extensions.
+  autodiff, readback, release, and its required extension facilities.
 - Tensor handles expose only immutable shape, dtype, device, and placement
   metadata.
 - Higher-level APIs build on the Runtime service without importing CPU or

@@ -14,9 +14,6 @@ const collectGarbage = runInNewContext("gc") as () => void
 const externalMemoryBytes = Effect.gen(function*() {
   const runtime = yield* Runtime.Runtime
   const diagnostics = runtime.extensions.diagnostics
-  if (diagnostics === undefined) {
-    return yield* Effect.die(new Error("runtime does not provide memory diagnostics"))
-  }
   return yield* diagnostics.externalMemoryBytes
 })
 

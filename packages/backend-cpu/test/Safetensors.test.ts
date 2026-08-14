@@ -78,11 +78,11 @@ describe("CPU tensor handles and direct safetensors", () => {
         })
         const executable = yield* runtime.compile({ roots: [lazy] })
         const [tensor] = yield* runtime.execute(executable, { bindings: [], scalars: [], runtimeValues: {} })
-        yield* runtime.extensions.pathSafetensors!.save(file, {
+        yield* runtime.extensions.pathSafetensors.save(file, {
           entries: [{ name, tensor }],
           metadata: { framework: "effect-torch", escaped: "\"\\\n" }
         })
-        const archive = yield* runtime.extensions.pathSafetensors!.load(file)
+        const archive = yield* runtime.extensions.pathSafetensors.load(file)
         expect(archive.entries.map((entry) => entry.name)).toEqual([name])
         expect(archive.metadata).toEqual({ framework: "effect-torch", escaped: "\"\\\n" })
         const loaded = archive.entries[0]!.tensor
@@ -96,7 +96,7 @@ describe("CPU tensor handles and direct safetensors", () => {
     withTempFile("effect-torch-cpu-safetensors-bad-", (file) =>
       Effect.gen(function*() {
         yield* Effect.tryPromise(() => writeFile(file, new Uint8Array([1, 2, 3])))
-        const error = yield* Effect.flip(runtime.extensions.pathSafetensors!.load(file))
+        const error = yield* Effect.flip(runtime.extensions.pathSafetensors.load(file))
         expect(error.reason).toBe("io-failed")
       })))
 })

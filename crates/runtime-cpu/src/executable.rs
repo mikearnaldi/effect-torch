@@ -4488,6 +4488,7 @@ pub fn execute_reported(
         cancelled,
         state,
         None,
+        None,
     )
 }
 
@@ -4507,6 +4508,7 @@ pub fn execute_reported_with_scalars(
         cancelled,
         None,
         None,
+        None,
     )
 }
 
@@ -4518,6 +4520,7 @@ fn execute_reported_with_commit(
     cancelled: &CancellationFlag,
     state: Option<&dyn CpuState>,
     commit_allowed: Option<&dyn Fn() -> bool>,
+    mut before_commit: Option<&mut dyn FnMut(&[Value]) -> Result<(), String>>,
 ) -> Result<CpuExecution, String> {
     if cancelled.load(Ordering::Acquire) {
         return Err("operation aborted".to_string());
@@ -4634,6 +4637,20 @@ fn execute_reported_with_commit(
         }
         return Err(error);
     }
+    let outputs = executable
+        .program
+        .outputs
+        .iter()
+        .map(|value| values[value.index()].clone())
+        .collect::<Vec<_>>();
+    if let Some(before_commit) = before_commit.as_mut() {
+        if let Err(error) = before_commit(&outputs) {
+            if let Some(state) = state {
+                state.rollback();
+            }
+            return Err(error);
+        }
+    }
     if commit_allowed.is_some_and(|allowed| !allowed()) {
         if let Some(state) = state {
             state.rollback();
@@ -4646,12 +4663,6 @@ fn execute_reported_with_commit(
             return Err(error);
         }
     }
-    let outputs = executable
-        .program
-        .outputs
-        .iter()
-        .map(|value| values[value.index()].clone())
-        .collect();
     Ok(CpuExecution {
         outputs,
         memory: InvocationMemoryReport {
@@ -4716,8 +4727,34 @@ pub fn execute_stateful(
         cancelled,
         Some(state),
         Some(commit_allowed),
+        None,
     )?
     .outputs)
+}
+
+/// Runs a stateful invocation and calls `before_commit` with its outputs before
+/// publishing any decode-state mutation. Callback failure rolls the transaction
+/// back exactly like execution failure or cancellation.
+pub fn execute_stateful_before_commit(
+    executable: &CpuExecutable,
+    declared_bindings: &[Value],
+    generated_bindings: &[Value],
+    cancelled: &CancellationFlag,
+    state: &dyn CpuState,
+    commit_allowed: &dyn Fn() -> bool,
+    before_commit: &mut dyn FnMut(&[Value]) -> Result<(), String>,
+) -> Result<(), String> {
+    execute_reported_with_commit(
+        executable,
+        declared_bindings,
+        generated_bindings,
+        &[],
+        cancelled,
+        Some(state),
+        Some(commit_allowed),
+        Some(before_commit),
+    )?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -6093,6 +6130,30 @@ mod tests {
         assert_eq!(error, "operation aborted");
         assert!(!cancelled.committed.load(Ordering::Acquire));
         assert!(cancelled.rolled_back.load(Ordering::Acquire));
+
+        let rejected = InjectedFailureState {
+            fail_command: false,
+            committed: AtomicBool::new(false),
+            rolled_back: AtomicBool::new(false),
+        };
+        let mut saw_outputs = false;
+        let error = execute_stateful_before_commit(
+            &compilation.executable,
+            &[],
+            &compilation.generated_bindings,
+            &CancellationFlag::new(),
+            &rejected,
+            &|| true,
+            &mut |outputs| {
+                saw_outputs = !outputs.is_empty();
+                Err("injected sampling failure".to_string())
+            },
+        )
+        .unwrap_err();
+        assert_eq!(error, "injected sampling failure");
+        assert!(saw_outputs);
+        assert!(!rejected.committed.load(Ordering::Acquire));
+        assert!(rejected.rolled_back.load(Ordering::Acquire));
     }
 
     #[test]

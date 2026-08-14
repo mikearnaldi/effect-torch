@@ -58,7 +58,7 @@ layer(BackendCpu.layer)("Runtime", (it) => {
       const releasedTensorError = yield* Effect.flip(cpu.readback(value))
       expect(releasedTensorError.reason).toBe("invalid-handle")
 
-      const decode = cpu.extensions.decode!
+      const decode = cpu.extensions.decode
       const pool = yield* decode.makePool({
         layers: 1,
         kvHeads: 1,

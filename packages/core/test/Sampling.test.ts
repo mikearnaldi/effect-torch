@@ -4,7 +4,7 @@ import { Effect } from "effect"
 import { Tensor } from "../src/index.ts"
 import { floats, onDevices } from "./utils/devices.ts"
 
-onDevices("Sampling", (device) => (it) => {
+onDevices("Sampling", () => (it) => {
   const logits = (values: ReadonlyArray<number>) =>
     Effect.gen(function*() {
       const [tensor] = yield* Tensor.compute([
@@ -89,27 +89,8 @@ onDevices("Sampling", (device) => (it) => {
         return yield* Effect.all(Array.from({ length: count }, () => Tensor.makeKvSequence(pool)))
       })
 
-    it.effect("requires a backend fused decode-sampling capability", () =>
-      Effect.gen(function*() {
-        if (device === "metal") return
-        const decode = yield* program(1, 4)
-        const [sequence] = yield* sequences(decode, 1)
-        const error = yield* Effect.flip(
-          Tensor.runDecodeProgramSampled(
-            decode,
-            [yield* Tensor.fromTypedArray(floats([1, 4, 2, 0]), [1, 1, 4])],
-            sequence,
-            [1],
-            { temperature: 0, seed: 0 }
-          )
-        )
-        expect(error.message).toContain("does not support fused decode sampling")
-        yield* Tensor.releaseKvSequence(sequence)
-      }))
-
     it.effect("validates and samples one decode output without publishing logits", () =>
       Effect.gen(function*() {
-        if (device !== "metal") return
         const decode = yield* program(1, 4)
         const [sequence] = yield* sequences(decode, 1)
         const invalid = yield* Effect.flip(
@@ -138,7 +119,6 @@ onDevices("Sampling", (device) => (it) => {
 
     it.effect("returns only tokens for active rows of a fixed-width batch", () =>
       Effect.gen(function*() {
-        if (device !== "metal") return
         const decode = yield* program(3, 4)
         const active = yield* sequences(decode, 2)
         const sampled = yield* Tensor.runBatchedDecodeProgramSampled(

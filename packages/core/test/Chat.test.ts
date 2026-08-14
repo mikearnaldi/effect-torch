@@ -62,8 +62,8 @@ interface ProgramState {
   }
 }
 
-// The script models both generation contracts: legacy add/step publish real
-// device logits, while sampled add/step return only the scripted token ids.
+// The script models both generation contracts: add/step publish real device
+// logits, while addSampled/stepSampled return only the scripted token ids.
 const makeProgram = (
   script: ReadonlyArray<number>,
   state: ProgramState
@@ -95,27 +95,21 @@ const makeProgram = (
             step++
             return [yield* logitsFor(script[step]!)]
           }),
-        ...(sampled === undefined
-          ? {}
-          : {
-            sampled: {
-              add: (_prompt: Tensor.Any, sampling: Tensor.SamplingOptions) =>
-                Effect.sync(() => {
-                  sampled.add.push(sampling)
-                  return { seq, token: script[0]! }
-                }),
-              step: (
-                entries: ReadonlyArray<{
-                  readonly token: number
-                  readonly sampling: Tensor.SamplingOptions
-                }>
-              ) =>
-                Effect.sync(() => {
-                  step++
-                  sampled.step.push(...entries.map(({ token, sampling }) => ({ token, sampling })))
-                  return [script[step]!]
-                })
-            }
+        addSampled: (_prompt: Tensor.Any, sampling: Tensor.SamplingOptions) =>
+          Effect.sync(() => {
+            sampled?.add.push(sampling)
+            return { seq, token: script[0]! }
+          }),
+        stepSampled: (
+          entries: ReadonlyArray<{
+            readonly token: number
+            readonly sampling: Tensor.SamplingOptions
+          }>
+        ) =>
+          Effect.sync(() => {
+            step++
+            sampled?.step.push(...entries.map(({ token, sampling }) => ({ token, sampling })))
+            return [script[step]!]
           }),
         live: () => Effect.succeed(1),
         close: () =>
@@ -222,7 +216,8 @@ onDevices("Chat", () => (it) => {
               template: "{{ messages }}",
               messages: [{ role: "user", content: "hello" }],
               controls: false,
-              stopTokens: [EOS]
+              stopTokens: [EOS],
+              sampling: Chat.greedy
             }).pipe(Stream.take(1))
           )
         )
@@ -244,7 +239,8 @@ onDevices("Chat", () => (it) => {
           messages: [{ role: "user", content: "hello" }],
           controls: false,
           stopTokens: [EOS],
-          maxTokens: 2
+          maxTokens: 2,
+          sampling: Chat.greedy
         }).pipe(
           Stream.tap((event) => {
             if (inspected || event._tag !== "start") return Effect.void

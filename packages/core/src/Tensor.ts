@@ -3912,12 +3912,6 @@ export const sample = (
     const runtime = yield* Runtime.Runtime
     const normalized = yield* normalizeSamplingOptions("sample", logits, options)
     const extension = runtime.extensions.sampling
-    if (extension === undefined) {
-      return yield* new TensorError({
-        op: "sample",
-        message: `sample: backend ${runtime.backend.name} does not provide native sampling`
-      })
-    }
     const token = yield* fromBackend(
       "sample",
       extension.sample(logits, normalized)
@@ -4164,7 +4158,7 @@ export interface SafetensorsArchive {
 }
 
 /**
- * Saves tensors through the runtime's optional direct path. All entries are
+ * Saves tensors through the runtime's direct path. All entries are
  * compiled and materialized together before the transfer service serializes
  * the resulting concrete tensors. After the save attempt, the wrapper attempts
  * to release every temporary in input order, independently ignoring release
@@ -4196,12 +4190,6 @@ export const save = (
   return Effect.gen(function*() {
     const runtime = yield* Runtime.Runtime
     const extension = runtime.extensions.pathSafetensors
-    if (extension === undefined) {
-      return yield* new TensorError({
-        op: "save",
-        message: `save: backend ${runtime.backend.name} does not support path-based safetensors`
-      })
-    }
     const metadata = yield* Effect.try({
       try: () => validateMetadata("save", options.metadata ?? {}),
       catch: (error) => caughtTensorError("save", error)
@@ -4221,8 +4209,8 @@ export const save = (
 }
 
 /**
- * Loads tensors and archive metadata through the runtime's optional direct
- * path. Returned concrete handles are validated against the active runtime and
+ * Loads tensors and archive metadata through the runtime's direct path.
+ * Returned concrete handles are validated against the active runtime and
  * independently own runtime storage; release each with {@link clear} when
  * deterministic cleanup is required. The extension owns partial/late cleanup
  * for failed or interrupted loads. If a successful archive fails wrapper
@@ -4242,12 +4230,6 @@ export const loadArchive = (
       Effect.gen(function*() {
         runtime = yield* Runtime.Runtime
         const extension = runtime.extensions.pathSafetensors
-        if (extension === undefined) {
-          return yield* new TensorError({
-            op: "loadArchive",
-            message: `loadArchive: backend ${runtime.backend.name} does not support path-based safetensors`
-          })
-        }
         const archive = yield* fromBackend("loadArchive", extension.load(path))
         const discovered = new Set<Concrete>()
         if (typeof archive === "object" && archive !== null && Array.isArray(archive.entries)) {
@@ -4806,12 +4788,6 @@ export const makeKvPool = (
   Effect.gen(function*() {
     const runtime = yield* Runtime.Runtime
     const extension = runtime.extensions.decode
-    if (extension === undefined) {
-      return yield* new TensorError({
-        op: "makeKvPool",
-        message: `makeKvPool: backend ${runtime.backend.name} does not support compiled inference`
-      })
-    }
     const handle = yield* fromBackend(
       "makeKvPool",
       extension.makePool({ layers, kvHeads, headDim, maxTokens, blockSize, dtype, ...recurrent })
@@ -4829,9 +4805,9 @@ export const makeKvPool = (
  * {@link runBatchedDecodeProgram}. Release it exactly once with
  * {@link releaseKvSequence} when it leaves the scheduler.
  *
- * Fails when the current runtime has no decode extension or when `pool` is not
- * owned by that runtime. Sequence operations, including creation from the same
- * pool, do not transfer or consume pool ownership.
+ * Fails when `pool` is not owned by the current runtime. Sequence operations,
+ * including creation from the same pool, do not transfer or consume pool
+ * ownership.
  *
  * @since 0.1.0
  * @category compilation
@@ -4840,12 +4816,6 @@ export const makeKvSequence = (pool: KvPool): Effect.Effect<KvSequence, TensorEr
   Effect.gen(function*() {
     const runtime = yield* Runtime.Runtime
     const extension = runtime.extensions.decode
-    if (extension === undefined) {
-      return yield* new TensorError({
-        op: "makeKvSequence",
-        message: "makeKvSequence: inference extension is unavailable"
-      })
-    }
     const handle = yield* fromBackend("makeKvSequence", extension.makeSequence(pool.handle))
     return { handle }
   })
@@ -4866,8 +4836,8 @@ export const makeKvSequence = (pool: KvPool): Effect.Effect<KvSequence, TensorEr
  * This mutates the sequence and must not overlap execution, cursor inspection,
  * another match, or release on the same handle. Token values are expected to be
  * non-negative integers representable as `u32`; this wrapper leaves validation
- * to the backend. Fails when the current runtime has no decode extension or when
- * `sequence` is invalid, released, or owned by another runtime.
+ * to the backend. Fails when `sequence` is invalid, released, or owned by
+ * another runtime.
  *
  * @since 0.1.0
  * @category compilation
@@ -4879,9 +4849,7 @@ export const kvPrefillMatch = (
   Effect.gen(function*() {
     const runtime = yield* Runtime.Runtime
     const extension = runtime.extensions.decode
-    return yield* extension === undefined
-      ? new TensorError({ op: "prefillMatch", message: "prefillMatch: inference extension is unavailable" })
-      : fromBackend("prefillMatch", extension.prefillMatch(sequence.handle, tokens))
+    return yield* fromBackend("prefillMatch", extension.prefillMatch(sequence.handle, tokens))
   })
 
 /**
@@ -4893,8 +4861,7 @@ export const kvPrefillMatch = (
  * attention window: window eviction may release old blocks without rewinding
  * the logical sequence position.
  *
- * Fails when the current runtime has no decode extension or when `sequence` is
- * invalid, released, or owned by another runtime.
+ * Fails when `sequence` is invalid, released, or owned by another runtime.
  *
  * @since 0.1.0
  * @category compilation
@@ -4903,9 +4870,7 @@ export const kvSequenceCursor = (sequence: KvSequence): Effect.Effect<number, Te
   Effect.gen(function*() {
     const runtime = yield* Runtime.Runtime
     const extension = runtime.extensions.decode
-    return yield* extension === undefined
-      ? new TensorError({ op: "sequenceCursor", message: "sequenceCursor: inference extension is unavailable" })
-      : fromBackend("sequenceCursor", extension.sequenceCursor(sequence.handle))
+    return yield* fromBackend("sequenceCursor", extension.sequenceCursor(sequence.handle))
   })
 
 /**
@@ -4916,8 +4881,8 @@ export const kvSequenceCursor = (sequence: KvSequence): Effect.Effect<number, Te
  * generation sessions should release each sequence exactly once; native
  * finalization is only a fallback for abandoned handles.
  *
- * Fails when the current runtime has no decode extension or when `sequence` is
- * invalid, already released, or owned by another runtime.
+ * Fails when `sequence` is invalid, already released, or owned by another
+ * runtime.
  *
  * @since 0.1.0
  * @category compilation
@@ -4926,9 +4891,7 @@ export const releaseKvSequence = (sequence: KvSequence): Effect.Effect<void, Ten
   Effect.gen(function*() {
     const runtime = yield* Runtime.Runtime
     const extension = runtime.extensions.decode
-    return yield* extension === undefined
-      ? new TensorError({ op: "releaseSequence", message: "releaseSequence: inference extension is unavailable" })
-      : fromBackend("releaseSequence", extension.releaseSequence(sequence.handle))
+    return yield* fromBackend("releaseSequence", extension.releaseSequence(sequence.handle))
   })
 
 /**
@@ -4957,13 +4920,6 @@ export const compileDecodeProgram = (
 ): Effect.Effect<DecodeProgram, TensorError, Runtime.Runtime> =>
   Effect.gen(function*() {
     const runtime = yield* Runtime.Runtime
-    const extension = runtime.extensions.decode
-    if (extension === undefined) {
-      return yield* new TensorError({
-        op: "compileDecode",
-        message: `compileDecode: backend ${runtime.backend.name} does not support compiled inference`
-      })
-    }
     const handle = yield* fromBackend(
       "compileDecode",
       runtime.compile({
@@ -5017,9 +4973,6 @@ export const runDecodeProgram = (
 ): Effect.Effect<Array<Concrete>, TensorError, Runtime.Runtime> =>
   Effect.gen(function*() {
     const runtime = yield* Runtime.Runtime
-    if (runtime.extensions.decode === undefined) {
-      return yield* new TensorError({ op: "decode", message: "decode: inference extension is unavailable" })
-    }
     return yield* withMaterializedInputs(runtime, inputs, (concrete) =>
       executeProgram(runtime, "decode", program, {
         bindings: concrete,
@@ -5032,8 +4985,7 @@ export const runDecodeProgram = (
 /**
  * Runs one sequence through a decode program and samples its first active
  * rank-one output in the same stateful native execution. Sampling options use
- * the defaults and validation of {@link sample}. The backend must provide both
- * decode and fused decode-sampling capabilities. Lazy inputs are materialized
+ * the defaults and validation of {@link sample}. Lazy inputs are materialized
  * and cleaned up exactly as in {@link runDecodeProgram}; no output tensor is
  * published or requires cleanup because the call returns only the token id.
  * Sequence mutation, cancellation, and rollback follow the ordinary decode
@@ -5051,19 +5003,7 @@ export const runDecodeProgramSampled = (
 ): Effect.Effect<number, TensorError, Runtime.Runtime> =>
   Effect.gen(function*() {
     const runtime = yield* Runtime.Runtime
-    if (runtime.extensions.decode === undefined) {
-      return yield* new TensorError({
-        op: "decodeSampled",
-        message: "decodeSampled: inference extension is unavailable"
-      })
-    }
-    const executeDecode = runtime.extensions.sampling?.executeDecode
-    if (executeDecode === undefined) {
-      return yield* new TensorError({
-        op: "decodeSampled",
-        message: `decodeSampled: backend ${runtime.backend.name} does not support fused decode sampling`
-      })
-    }
+    const executeDecode = runtime.extensions.sampling.executeDecode
     const output = program.outputs[0]
     if (output === undefined) {
       return yield* new TensorError({
@@ -5120,12 +5060,6 @@ export const runBatchedDecodeProgram = (
 ): Effect.Effect<Array<Concrete>, TensorError, Runtime.Runtime> =>
   Effect.gen(function*() {
     const runtime = yield* Runtime.Runtime
-    if (runtime.extensions.decode === undefined) {
-      return yield* new TensorError({
-        op: "decodeBatched",
-        message: "decodeBatched: inference extension is unavailable"
-      })
-    }
     return yield* withMaterializedInputs(runtime, inputs, (concrete) =>
       executeProgram(runtime, "decodeBatched", program, {
         bindings: concrete,
@@ -5162,19 +5096,7 @@ export const runBatchedDecodeProgramSampled = (
 ): Effect.Effect<Array<number>, TensorError, Runtime.Runtime> =>
   Effect.gen(function*() {
     const runtime = yield* Runtime.Runtime
-    if (runtime.extensions.decode === undefined) {
-      return yield* new TensorError({
-        op: "decodeBatchedSampled",
-        message: "decodeBatchedSampled: inference extension is unavailable"
-      })
-    }
-    const executeDecode = runtime.extensions.sampling?.executeDecode
-    if (executeDecode === undefined) {
-      return yield* new TensorError({
-        op: "decodeBatchedSampled",
-        message: `decodeBatchedSampled: backend ${runtime.backend.name} does not support fused decode sampling`
-      })
-    }
+    const executeDecode = runtime.extensions.sampling.executeDecode
     if (sampling.length !== seqs.length) {
       return yield* new TensorError({
         op: "decodeBatchedSampled",
