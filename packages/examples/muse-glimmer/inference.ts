@@ -168,7 +168,7 @@ const program = Effect.gen(function*() {
       },
       bosTokenId,
       maxTokens: maxNewTokens,
-      sampling: { temperature, topK, topP, ...(seed === undefined ? {} : { seed }) }
+      sampling: { temperature, topK, topP, seed }
     }),
     (event) =>
       Effect.sync(() => {
