@@ -253,10 +253,105 @@ export declare class NativeInferenceArtifact {
     maxDraftTokens: number | undefined | null,
     batchSize: number,
     tokenDtype: NativeDType,
-    sampling: NativeInferenceSamplingOptions
+    sampling: NativeInferenceSamplingOptions,
+    proposerPlan?: NativeProposerPlan | undefined | null,
+    stageExecutables?: Array<Executable> | undefined | null,
+    sharedTargetTensors?: Array<NativeTensor> | undefined | null
   )
   open(): NativeInferenceSession
   get inferenceDiagnostics(): NativeInferenceDiagnostics
+}
+
+/** Device-resident source for a generalized proposer stage binding. @internal */
+export interface NativeValueRef {
+  kind: "PendingTokens" | "CandidatePrefix" | "CommittedHistory" | "TargetHidden" | "SharedBinding" | "StageOutput"
+  layer?: number
+  binding?: number
+  stage?: number
+  output?: number
+  /** Optional leading logical row. Non-zero rows are copied on device when a binding requires offset zero. */
+  row?: number
+  /** Select the active target lane when the native DAG helper executes. */
+  selectRow?: boolean
+}
+
+/** Exact logical metadata retained for a routed value. @internal */
+export interface NativeProposerValueSchema {
+  shape: Array<number>
+  dtype: NativeDType
+}
+
+/** One target output root exported as an ephemeral hidden activation. @internal */
+export interface NativeTargetHiddenTap extends NativeProposerValueSchema {
+  layer: number
+  output: number
+}
+
+/** One immutable target tensor available through a named ValueRef. @internal */
+export interface NativeSharedTargetBinding extends NativeProposerValueSchema {
+  kind: "TokenEmbedding" | "LmHead"
+  name: string
+  tensor: number
+}
+
+/** Explicit stage input route. @internal */
+export interface NativeStageInputBinding {
+  slot: number
+  value: NativeValueRef
+}
+
+/** One executable in the generalized proposer DAG. @internal */
+export interface NativeProposerStage {
+  executable: number
+  operationId: string
+  layoutId?: string
+  inputs: Array<NativeStageInputBinding>
+  outputs: Array<NativeProposerValueSchema>
+}
+
+/** Stateful publication recipe retained with the proposer DAG. @internal */
+export interface NativeProposerStatePlan {
+  kind: "None" | "Kv"
+  schemaId?: string
+}
+
+/** Explicit state commit recipe. @internal */
+export interface NativeProposerCommitPlan {
+  kind: "AutoregressiveChain" | "Replay"
+  stage?: number
+  stages?: Array<number>
+}
+
+/** Values exported by the proposer DAG. @internal */
+export interface NativeProposerOutputPlan {
+  topology: "Chains" | "Trees"
+  probabilities: "CausalNormalized" | "Deterministic" | "Unavailable"
+  tokenIds: NativeValueRef
+  probabilityRows?: NativeValueRef
+  parents?: NativeValueRef
+  confidence?: NativeValueRef
+}
+
+/** Vocabulary translation retained by a generalized proposer artifact. @internal */
+export interface NativeTokenMapPlan {
+  kind: "Identity" | "Table"
+  fingerprint: string
+  proposerVocabulary?: number
+  targetIds?: Array<number>
+}
+
+/** Optional trailing constructor plan for native target-coupled proposer stages. @internal */
+export interface NativeProposerPlan {
+  targetPrefillTaps: Array<NativeTargetHiddenTap>
+  targetDecodeTaps: Array<NativeTargetHiddenTap>
+  targetVerifyTaps: Array<NativeTargetHiddenTap>
+  sharedTargetBindings: Array<NativeSharedTargetBinding>
+  stages: Array<NativeProposerStage>
+  state: NativeProposerStatePlan
+  commit?: NativeProposerCommitPlan
+  output: NativeProposerOutputPlan
+  tokenMap: NativeTokenMapPlan
+  trainedMaxRows: number
 }
 
 /** Native owner of lanes, paired KV state, policy, and durable receipts. @internal */

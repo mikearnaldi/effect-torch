@@ -1519,11 +1519,23 @@ export class InferenceError extends Data.TaggedError("InferenceError")<{
 /** Opaque identity carried by validated speculative proposer artifacts. */
 export const ProposerArtifactTypeId: unique symbol = Symbol.for("@effect-torch/core/Model/ProposerArtifact")
 
-/** A proposer component whose parameters are materialized with the target. */
-export interface ProposerComponent {
+/** A legacy autoregressive proposer component. */
+export interface AutoregressiveProposerComponent {
   readonly model: Model
   readonly params: Params
 }
+
+/** A multi-input, multi-output proposer graph component. */
+export interface ProposerGraphComponent {
+  readonly params: Params
+  readonly build: (
+    params: Params,
+    inputs: ReadonlyArray<Tensor.Any>
+  ) => Effect.Effect<ReadonlyArray<Tensor.Lazy>, ModelError | Tensor.TensorError, Runtime.Runtime>
+}
+
+/** A proposer component selected structurally, without a component tag. */
+export type ProposerComponent = AutoregressiveProposerComponent | ProposerGraphComponent
 
 /** A stable graph, checkpoint, tokenizer, layout, or path identity. */
 export type ProposerFingerprint = string
@@ -1719,6 +1731,11 @@ const stageRef = (stage: number, output: number): ValueRef => ({ _tag: "StageOut
 
 const invalidProposer = (message: string): InferenceError => new InferenceError({ op: "speculation", message })
 
+const isAutoregressiveComponent = (component: ProposerComponent): component is AutoregressiveProposerComponent =>
+  "model" in component
+
+const isGraphComponent = (component: ProposerComponent): component is ProposerGraphComponent => "build" in component
+
 const validateSchema = (schema: ProposerValueSchema, where: string): InferenceError | undefined => {
   if (typeof schema !== "object" || schema === null || !dtypes.has(schema.dtype) || !Array.isArray(schema.shape)) {
     return invalidProposer(`${where} must declare a supported dtype and shape`)
@@ -1786,12 +1803,19 @@ const makeProposerArtifact = (
     for (let index = 0; index < input.components.length; index++) {
       const component = input.components[index]
       if (
-        typeof component !== "object" || component === null || typeof component.model !== "object" ||
-        component.model === null || !Array.isArray(component.model.names) || !Array.isArray(component.params)
+        typeof component !== "object" || component === null || !Array.isArray(component.params) ||
+        (!("model" in component) && !("build" in component))
       ) {
         return yield* invalidProposer(`proposer component ${index} is malformed`)
       }
-      yield* checkArity(`Speculation.artifact component ${index}`, component.model.names, component.params)
+      if (isAutoregressiveComponent(component)) {
+        if (typeof component.model !== "object" || component.model === null || !Array.isArray(component.model.names)) {
+          return yield* invalidProposer(`proposer component ${index} is malformed`)
+        }
+        yield* checkArity(`Speculation.artifact component ${index}`, component.model.names, component.params)
+      } else if (typeof component.build !== "function") {
+        return yield* invalidProposer(`proposer component ${index} builder is malformed`)
+      }
     }
     const plan = input.plan
     if (
@@ -1902,6 +1926,12 @@ const makeProposerArtifact = (
           if (!u32(operation.component) || operation.component >= input.components.length) {
             return yield* invalidProposer(`stage ${index} references missing component ${operation.component}`)
           }
+          if (
+            operation._tag === "Autoregressive" &&
+            !isAutoregressiveComponent(input.components[operation.component]!)
+          ) {
+            return yield* invalidProposer(`stage ${index} Autoregressive component must provide a model`)
+          }
           if (operation._tag === "ParallelBlock" && !nonEmptyId(operation.layout?.id)) {
             return yield* invalidProposer(`stage ${index} ParallelBlock layout id must not be empty`)
           }
@@ -1946,6 +1976,9 @@ const makeProposerArtifact = (
         slots.add(binding.slot)
         const error = validateValueRef(binding.value, index, stages, target, `stage ${index} input ${binding.slot}`)
         if (error !== undefined) return yield* error
+      }
+      for (let slot = 0; slot < inputs.length; slot++) {
+        if (!slots.has(slot)) return yield* invalidProposer(`stage ${index} input slots must be contiguous from zero`)
       }
       for (let output = 0; output < outputs.length; output++) {
         const error = validateSchema(outputs[output], `stage ${index} output ${output}`)
@@ -2065,10 +2098,9 @@ const makeProposerArtifact = (
       artifact,
       Object.freeze({
         components: Object.freeze(input.components.map((component) =>
-          Object.freeze({
-            model: component.model,
-            params: Object.freeze([...component.params])
-          })
+          isAutoregressiveComponent(component)
+            ? Object.freeze({ model: component.model, params: Object.freeze([...component.params]) })
+            : Object.freeze({ build: component.build, params: Object.freeze([...component.params]) })
         )),
         plan: Object.freeze({
           target: Object.freeze({
@@ -2569,6 +2601,7 @@ interface InferencePrograms {
     readonly proposerDecode: Tensor.DecodeProgram
     readonly proposerPool: Tensor.KvPool
     readonly maxDraftTokens: number
+    readonly generalized?: NonNullable<Runtime.InferenceCompileRequest["generalizedProposer"]>
   }
 }
 
@@ -2651,34 +2684,12 @@ const validateTargetContract = (
         )
       }
     }
-    if (contract.hiddenTaps.length === 0) return
-
-    const requested = new Set(contract.hiddenTaps.map((tap) => tap.layer))
-    const captured = new Map<number, Tensor.Any>()
-    const tokenInput = yield* Tensor.zeros([config.batchSize, 1], { dtype: config.tokenDtype })
-    const input = yield* Tensor.makeInput(0, tokenInput)
-    yield* model.forward(frozenParams, input, {
-      hidden: (layer, value) => {
-        if (requested.has(layer) && !captured.has(layer)) captured.set(layer, value)
-      }
-    })
-    for (const tap of contract.hiddenTaps) {
-      const value = captured.get(tap.layer)
-      const logicalShape: ReadonlyArray<number | "Rows"> | undefined = value === undefined ||
-          value.shape.length < 2 || value.shape[0] !== config.batchSize || value.shape[1] !== 1
-        ? undefined
-        : ["Rows", ...value.shape.slice(2)]
-      if (
-        value === undefined || logicalShape === undefined || value.dtype !== tap.dtype ||
-        !schemaShapeMatches(tap.shape, logicalShape, vocabulary)
-      ) {
-        const actual = value === undefined ? "missing" : `${value.dtype}[${value.shape}]`
-        return yield* invalidInferenceConfig(
-          `proposer target hidden tap ${tap.layer} requires ${tap.dtype}[${tap.shape}], got ${actual}`
-        )
-      }
-    }
   })
+}
+
+interface TracedInferenceProgram {
+  readonly program: Tensor.DecodeProgram
+  readonly taps: ReadonlyArray<Runtime.InferenceTargetTapRoute>
 }
 
 const traceInferenceProgram = (
@@ -2687,9 +2698,10 @@ const traceInferenceProgram = (
   config: ResolvedInferenceConfig,
   inputShape: readonly [number, number],
   lastTokenRow = true,
-  packedCausalChains?: Runtime.PackedCausalChainsLayout
+  packedCausalChains?: Runtime.PackedCausalChainsLayout,
+  taps: ReadonlyArray<HiddenTapContract> = []
 ): Effect.Effect<
-  Tensor.DecodeProgram,
+  TracedInferenceProgram,
   InferenceError | ModelError | Tensor.TensorError,
   Runtime.Runtime
 > =>
@@ -2697,9 +2709,39 @@ const traceInferenceProgram = (
     const [graphRows, steps] = inputShape
     const tokenInput = yield* Tensor.zeros(inputShape, { dtype: config.tokenDtype })
     const input = yield* Tensor.makeInput(0, tokenInput)
-    const output = yield* model.forward(frozenParams, input)
+    const requested = new Set(taps.map((tap) => tap.layer))
+    const captured = new Map<number, Tensor.Any>()
+    const output = yield* model.forward(frozenParams, input, {
+      hidden: (layer, value) => {
+        if (requested.has(layer) && !captured.has(layer)) captured.set(layer, value)
+      }
+    })
     yield* logitsVocab(output, graphRows, steps)
-    return yield* Tensor.compileDecodeProgram([output], {
+    const roots: Array<Tensor.Any> = [output]
+    const routes: Array<Runtime.InferenceTargetTapRoute> = []
+    for (const tap of taps) {
+      const value = captured.get(tap.layer)
+      const logicalShape: ReadonlyArray<number | "Rows"> | undefined = value === undefined ||
+          value.shape.length < 2 || value.shape[0] !== graphRows || value.shape[1] !== steps
+        ? undefined
+        : ["Rows", ...value.shape.slice(2)]
+      if (
+        value === undefined || logicalShape === undefined || value.dtype !== tap.dtype ||
+        !schemaShapeMatches(tap.shape, logicalShape, config.speculation?.input.plan.target.vocabulary ?? 0)
+      ) {
+        const actual = value === undefined ? "missing" : `${value.dtype}[${value.shape}]`
+        return yield* invalidInferenceConfig(
+          `proposer target hidden tap ${tap.layer} requires ${tap.dtype}[${tap.shape}], got ${actual}`
+        )
+      }
+      roots.push(value)
+      routes.push({
+        layer: tap.layer,
+        outputRoot: roots.length - 1,
+        value: { dtype: value.dtype, shape: [graphRows, ...value.shape.slice(2)] }
+      })
+    }
+    const program = yield* Tensor.compileDecodeProgram(roots, {
       maxTokens: config.maxTokens,
       blockSize: config.blockSize,
       kvDtype: config.kvDtype,
@@ -2708,21 +2750,252 @@ const traceInferenceProgram = (
       ...(packedCausalChains === undefined ? {} : { packedCausalChains }),
       ...(config.attentionWindow === undefined ? {} : { window: config.attentionWindow })
     }).pipe(Effect.mapError((error) => new InferenceError({ op: "inference", message: error.message })))
+    return { program, taps: routes }
+  })
+
+const compileProposerPlan = (
+  input: NormalizedProposerArtifactInput,
+  componentParams: ReadonlyArray<ReadonlyArray<Tensor.Concrete>>,
+  config: ResolvedInferenceConfig,
+  vocabulary: number,
+  targetTaps: {
+    readonly prefill: ReadonlyArray<Runtime.InferenceTargetTapRoute>
+    readonly decode: ReadonlyArray<Runtime.InferenceTargetTapRoute>
+    readonly verify: ReadonlyArray<Runtime.InferenceTargetTapRoute>
+  },
+  frozenParams: ReadonlyArray<Tensor.Concrete>,
+  targetNames: ReadonlyArray<string>
+): Effect.Effect<
+  NonNullable<Runtime.InferenceCompileRequest["generalizedProposer"]>,
+  InferenceError | ModelError | Tensor.TensorError,
+  Runtime.Runtime
+> =>
+  Effect.gen(function*() {
+    const sharedTensors: Array<Tensor.Concrete> = []
+    const sharedMetadata: Array<Runtime.InferenceProposerPlan["sharedTensors"][number]> = []
+    for (const weight of input.plan.target.sharedWeights) {
+      const actual = frozenParams[targetNames.indexOf(weight.name)]
+      if (actual === undefined) {
+        return yield* invalidInferenceConfig(`proposer target shared weight ${JSON.stringify(weight.name)} is missing`)
+      }
+      sharedTensors.push(actual)
+      sharedMetadata.push({
+        kind: weight.kind,
+        name: weight.name,
+        value: { dtype: actual.dtype, shape: actual.shape }
+      })
+    }
+
+    const stageValues: Array<ReadonlyArray<Tensor.Lazy>> = []
+    const stageExecutables: Array<Runtime.ExecutableHandle> = []
+    const stages: Array<Runtime.InferenceProposerPlan["stages"][number]> = []
+    const tapRoutes = new Map(targetTaps.decode.map((tap) => [tap.layer, tap] as const))
+    const routeFor = (value: ValueRef, schema?: Runtime.InferenceValueSchema): Runtime.InferenceValueRoute => {
+      switch (value._tag) {
+        case "SharedTokenEmbedding":
+          return { kind: "SharedTokenEmbedding", ...(schema === undefined ? {} : { value: schema }) }
+        case "SharedLmHead":
+          return { kind: "SharedLmHead", ...(schema === undefined ? {} : { value: schema }) }
+        case "TargetHidden": {
+          const tap = tapRoutes.get(value.layer)
+          return {
+            kind: "TargetHidden",
+            ...(tap === undefined ? {} : { targetOutput: tap.outputRoot }),
+            ...(schema === undefined ? {} : { value: schema })
+          }
+        }
+        case "StageOutput":
+          return { kind: "StageOutput", stage: value.stage, output: value.output }
+        default:
+          return { kind: value._tag, ...(schema === undefined ? {} : { value: schema }) }
+      }
+    }
+    for (let stageIndex = 0; stageIndex < input.plan.stages.length; stageIndex++) {
+      const stage = input.plan.stages[stageIndex]!
+      if (stage.operation._tag === "TargetPath" || stage.operation._tag === "HistoryLookup") {
+        return yield* invalidInferenceConfig(
+          `stage ${stageIndex} ${stage.operation._tag} has no graph component to compile`
+        )
+      }
+      const component = input.components[stage.operation.component]!
+      if (!isGraphComponent(component)) {
+        return yield* invalidInferenceConfig(
+          "this runtime path supports only one exact-chain Autoregressive proposer stage or graph-builder stages"
+        )
+      }
+      const ordered = [...stage.inputs].sort((left, right) => left.slot - right.slot)
+      const inputPrograms: Array<Runtime.InferenceProposerPlan["stages"][number]["inputs"][number]> = []
+      const placeholders: Array<Tensor.Lazy> = []
+      for (const binding of ordered) {
+        let schema: Runtime.InferenceValueSchema
+        let exemplar: Tensor.Any
+        switch (binding.value._tag) {
+          case "PendingTokens":
+            schema = { dtype: config.tokenDtype, shape: [config.batchSize] }
+            exemplar = yield* Tensor.zeros(schema.shape, { dtype: schema.dtype })
+            break
+          case "CandidatePrefix":
+            schema = { dtype: config.tokenDtype, shape: [config.batchSize, config.speculation!.maxDraftTokens] }
+            exemplar = yield* Tensor.zeros(schema.shape, { dtype: schema.dtype })
+            break
+          case "CommittedHistory":
+            schema = { dtype: config.tokenDtype, shape: [config.batchSize, config.maxTokens] }
+            exemplar = yield* Tensor.zeros(schema.shape, { dtype: schema.dtype })
+            break
+          case "TargetHidden": {
+            const resolved = tapRoutes.get(binding.value.layer)?.value
+            if (resolved === undefined) {
+              return yield* invalidInferenceConfig(
+                `stage ${stageIndex} cannot resolve target hidden tap ${binding.value.layer}`
+              )
+            }
+            schema = resolved
+            exemplar = yield* Tensor.zeros(schema.shape, { dtype: schema.dtype })
+            break
+          }
+          case "SharedTokenEmbedding":
+          case "SharedLmHead": {
+            const kind = binding.value._tag === "SharedTokenEmbedding" ? "TokenEmbedding" : "LmHead"
+            const bindingIndex = sharedMetadata.findIndex((candidate) => candidate.kind === kind)
+            const resolved = sharedMetadata[bindingIndex]
+            const handle = sharedTensors[bindingIndex]
+            if (resolved === undefined || handle === undefined) {
+              return yield* invalidInferenceConfig(`stage ${stageIndex} cannot resolve shared ${kind} binding`)
+            }
+            schema = resolved.value
+            exemplar = handle
+            break
+          }
+          case "StageOutput": {
+            const resolved = stageValues[binding.value.stage]?.[binding.value.output]
+            if (resolved === undefined) {
+              return yield* invalidInferenceConfig(`stage ${stageIndex} cannot resolve a prior stage output`)
+            }
+            schema = { dtype: resolved.dtype, shape: resolved.shape }
+            exemplar = resolved
+            break
+          }
+        }
+        placeholders.push(yield* Tensor.makeInput(binding.slot, exemplar))
+        inputPrograms.push({ slot: binding.slot, value: routeFor(binding.value, schema) })
+      }
+      const outputs = yield* component.build(componentParams[stage.operation.component] ?? [], placeholders)
+      if (!Array.isArray(outputs) || outputs.length !== stage.outputs.length) {
+        return yield* invalidInferenceConfig(
+          `stage ${stageIndex} builder returned ${
+            Array.isArray(outputs) ? outputs.length : "a non-array"
+          } outputs; expected ${stage.outputs.length}`
+        )
+      }
+      const outputSchemas: Array<Runtime.InferenceValueSchema> = []
+      for (let outputIndex = 0; outputIndex < outputs.length; outputIndex++) {
+        const output = outputs[outputIndex]!
+        const declared = stage.outputs[outputIndex]!
+        const shapeMatches = declared.shape.length === output.shape.length &&
+          declared.shape.every((dimension, index) =>
+            dimension === "Rows"
+              ? output.shape[index] === config.batchSize
+              : dimension === "Vocabulary"
+              ? output.shape[index] === vocabulary
+              : dimension === "Hidden" || output.shape[index] === dimension
+          )
+        if (output.dtype !== declared.dtype || !shapeMatches) {
+          return yield* invalidInferenceConfig(
+            `stage ${stageIndex} output ${outputIndex} requires ${declared.dtype}[${declared.shape}], got ${output.dtype}[${output.shape}]`
+          )
+        }
+        outputSchemas.push({ dtype: output.dtype, shape: output.shape })
+      }
+      const program = yield* Tensor.freezeProgram(outputs, { constantWeights: true })
+      stageValues.push(outputs)
+      stageExecutables.push(program.handle)
+      const layoutId = stage.operation._tag === "ParallelBlock"
+        ? stage.operation.layout.id
+        : stage.operation._tag === "TreeExpand"
+        ? stage.operation.search.id
+        : undefined
+      stages.push({
+        operationId: stage.operation._tag,
+        ...(layoutId === undefined ? {} : { layoutId }),
+        inputs: inputPrograms,
+        outputs: outputSchemas
+      })
+    }
+    const outputRoute = (value: ValueRef): Runtime.InferenceValueRoute => routeFor(value)
+    const commit = input.plan.state._tag === "None" ? undefined : input.plan.state.commit
+    const plan: Runtime.InferenceProposerPlan = {
+      vocabulary,
+      tokenMapFingerprint: input.plan.target.tokenMapFingerprint,
+      hiddenTaps: targetTaps.decode,
+      sharedTensors: sharedMetadata,
+      stages,
+      state: {
+        kind: input.plan.state._tag,
+        ...(input.plan.state._tag === "Kv" ? { schemaId: input.plan.state.schema.id } : {}),
+        commitKind: commit?._tag ?? "None",
+        commitStages: commit === undefined
+          ? []
+          : commit._tag === "AutoregressiveChain"
+          ? [commit.stage]
+          : commit.stages
+      },
+      output: {
+        topology: input.plan.output.topology,
+        probabilities: input.plan.output.probabilities,
+        tokenIds: outputRoute(input.plan.output.tokenIds),
+        ...(input.plan.output.probabilityRows === undefined
+          ? {}
+          : { probabilityRows: outputRoute(input.plan.output.probabilityRows) }),
+        ...(input.plan.output.parents === undefined ? {} : { parents: outputRoute(input.plan.output.parents) }),
+        ...(input.plan.output.confidence === undefined
+          ? {}
+          : { confidence: outputRoute(input.plan.output.confidence) })
+      },
+      tokenMap: input.plan.tokenMap._tag === "Identity"
+        ? { kind: "Identity", fingerprint: input.plan.tokenMap.fingerprint ?? "identity" }
+        : {
+          kind: "Table",
+          fingerprint: input.plan.tokenMap.fingerprint,
+          proposerVocabulary: input.plan.tokenMap.proposerVocabulary,
+          targetIds: input.plan.tokenMap.targetIds
+        },
+      trainedMaxRows: input.plan.trainedMaxRows
+    }
+    return { plan, sharedTensors, stageExecutables, maxDraftTokens: config.speculation!.maxDraftTokens }
   })
 
 const compileInferencePrograms = (
   model: Model,
   frozenParams: ReadonlyArray<Tensor.Concrete>,
   config: ResolvedInferenceConfig,
-  proposerParams: ReadonlyArray<Tensor.Concrete> | undefined
+  proposerParams: ReadonlyArray<ReadonlyArray<Tensor.Concrete>> | undefined
 ): Effect.Effect<
   InferencePrograms,
   InferenceError | ModelError | Tensor.TensorError,
   Runtime.Runtime
 > =>
   Effect.gen(function*() {
-    const prefill = yield* traceInferenceProgram(model, frozenParams, config, [config.batchSize, config.prefillChunk])
-    const decode = yield* traceInferenceProgram(model, frozenParams, config, [config.batchSize, 1])
+    const taps = config.speculation?.input.plan.target.hiddenTaps ?? []
+    const prefillTrace = yield* traceInferenceProgram(
+      model,
+      frozenParams,
+      config,
+      [config.batchSize, config.prefillChunk],
+      true,
+      undefined,
+      taps
+    )
+    const decodeTrace = yield* traceInferenceProgram(
+      model,
+      frozenParams,
+      config,
+      [config.batchSize, 1],
+      true,
+      undefined,
+      taps
+    )
+    const prefill = prefillTrace.program
+    const decode = decodeTrace.program
     const geometry = decodeGeometry(prefill)
     if (!sameDecodeGeometry(geometry, decodeGeometry(decode))) {
       return yield* new InferenceError({
@@ -2735,11 +3008,6 @@ const compileInferencePrograms = (
       return yield* new InferenceError({ op: "inference", message: "target decode did not expose a vocabulary row" })
     }
     yield* validateTargetContract(model, frozenParams, config, targetVocabulary)
-    if (config.speculation !== undefined && !exactChainRuntimePlan(config.speculation.input)) {
-      return yield* invalidInferenceConfig(
-        "this runtime path supports only one exact-chain Autoregressive proposer stage"
-      )
-    }
     const pool = yield* Tensor.makeKvPool(
       geometry.layers,
       geometry.kvHeads,
@@ -2767,19 +3035,58 @@ const compileInferencePrograms = (
         message: "speculative target state must be KV-only with at least one attention layer"
       })
     }
-    const proposerModel = config.speculation.input.components[0]!.model
+    if (!exactChainRuntimePlan(config.speculation.input)) {
+      const verifyTrace = yield* traceInferenceProgram(
+        model,
+        frozenParams,
+        config,
+        [config.batchSize * (config.speculation.maxDraftTokens + 1), 1],
+        false,
+        { rowsPerSequence: config.speculation.maxDraftTokens + 1 },
+        taps
+      )
+      const generalized = yield* compileProposerPlan(
+        config.speculation.input,
+        proposerParams,
+        config,
+        targetVocabulary,
+        { prefill: prefillTrace.taps, decode: decodeTrace.taps, verify: verifyTrace.taps },
+        frozenParams,
+        model.names
+      )
+      return {
+        prefill,
+        decode,
+        geometry,
+        pool,
+        speculation: {
+          verify: verifyTrace.program,
+          proposerPrefill: { ...prefill, handle: generalized.stageExecutables[0]! },
+          proposerDecode: { ...decode, handle: generalized.stageExecutables[0]! },
+          proposerPool: pool,
+          maxDraftTokens: config.speculation.maxDraftTokens,
+          generalized
+        }
+      }
+    }
+    const proposerComponent = config.speculation.input.components[0]!
+    if (!isAutoregressiveComponent(proposerComponent)) {
+      return yield* invalidInferenceConfig("exact-chain Autoregressive proposer component must provide a model")
+    }
+    const proposerModel = proposerComponent.model
+    const exactParams = proposerParams[0] ?? []
     const proposerPrefill = yield* traceInferenceProgram(
       proposerModel,
-      proposerParams,
+      exactParams,
       config,
       [config.batchSize, config.prefillChunk]
-    )
+    ).pipe(Effect.map((trace) => trace.program))
     const proposerDecode = yield* traceInferenceProgram(
       proposerModel,
-      proposerParams,
+      exactParams,
       config,
       [config.batchSize, 1]
-    )
+    ).pipe(Effect.map((trace) => trace.program))
     const proposerGeometry = decodeGeometry(proposerPrefill)
     if (!sameDecodeGeometry(proposerGeometry, decodeGeometry(proposerDecode))) {
       return yield* new InferenceError({
@@ -2811,7 +3118,7 @@ const compileInferencePrograms = (
       [config.batchSize * (config.speculation.maxDraftTokens + 1), 1],
       false,
       { rowsPerSequence: config.speculation.maxDraftTokens + 1 }
-    )
+    ).pipe(Effect.map((trace) => trace.program))
     if (!sameDecodeGeometry(geometry, decodeGeometry(verify))) {
       return yield* new InferenceError({
         op: "inference",
@@ -3572,7 +3879,9 @@ export const inference = (
     const runtime = yield* Runtime.Runtime
     yield* checkArity("inference", model.names, params)
     const resolved = yield* resolveInferenceConfig(config)
-    const proposerSourceParams = resolved.speculation?.input.components[0]?.params ?? []
+    const proposerComponents = resolved.speculation?.input.components ?? []
+    const proposerSourceParams = proposerComponents.flatMap((component) => component.params)
+    const proposerArities = proposerComponents.map((component) => component.params.length)
     const targetArity = params.length
     return yield* Effect.flatMap(
       Tensor.compute([...params, ...proposerSourceParams]),
@@ -3580,9 +3889,14 @@ export const inference = (
         Effect.onExit(
           Effect.gen(function*() {
             const frozenParams = allFrozenParams.slice(0, targetArity)
+            let offset = targetArity
             const proposerParams = resolved.speculation === undefined
               ? undefined
-              : allFrozenParams.slice(targetArity)
+              : proposerArities.map((arity) => {
+                const values = allFrozenParams.slice(offset, offset + arity)
+                offset += arity
+                return values
+              })
             const programs = yield* compileInferencePrograms(model, frozenParams, resolved, proposerParams)
             const artifact = yield* inferenceBackend(
               "inferenceCompile",
@@ -3593,7 +3907,7 @@ export const inference = (
                   ...(programs.speculation === undefined ? {} : { verify: programs.speculation.verify.handle }),
                   pool: programs.pool.handle
                 },
-                ...(programs.speculation === undefined
+                ...(programs.speculation === undefined || programs.speculation.generalized !== undefined
                   ? {}
                   : {
                     proposer: {
@@ -3603,6 +3917,9 @@ export const inference = (
                       maxDraftTokens: programs.speculation.maxDraftTokens
                     }
                   }),
+                ...(programs.speculation?.generalized === undefined
+                  ? {}
+                  : { generalizedProposer: programs.speculation.generalized }),
                 batchSize: resolved.batchSize,
                 tokenDtype: resolved.tokenDtype,
                 sampling: nativeSampling(resolved.sampling)

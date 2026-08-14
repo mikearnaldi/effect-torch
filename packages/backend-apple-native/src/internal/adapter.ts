@@ -28,7 +28,9 @@ import type {
   NativeKvPool,
   NativeKvSequence,
   NativeKvStateSchema,
-  NativeTensor
+  NativeProposerPlan,
+  NativeTensor,
+  NativeValueRef
 } from "./native-addon.js"
 
 type CancellationToken = InstanceType<NativeAddon["CancellationToken"]>
@@ -1764,6 +1766,111 @@ export const makeRuntime = (
           const proposerPool = request.proposer === undefined
             ? undefined
             : record(request.proposer.pool, "kv-pool", "inferenceCompile", "compile")
+          const generalized = request.generalizedProposer
+          const valueRef = (route: Runtime.InferenceValueRoute): NativeValueRef => {
+            switch (route.kind) {
+              case "TargetHidden": {
+                const tap = generalized?.plan.hiddenTaps.find((tap) => tap.outputRoot === route.targetOutput)
+                if (tap === undefined) throw new Error("inference[compile]: target hidden route has no tap contract")
+                return {
+                  kind: route.kind,
+                  layer: tap.layer,
+                  ...(route.selectTargetRow === true ? { selectRow: true } : {})
+                }
+              }
+              case "SharedTokenEmbedding":
+              case "SharedLmHead": {
+                const kind = route.kind === "SharedTokenEmbedding" ? "TokenEmbedding" : "LmHead"
+                const binding = generalized?.plan.sharedTensors.findIndex((candidate) => candidate.kind === kind) ?? -1
+                if (binding < 0) throw new Error(`inference[compile]: ${route.kind} route has no shared binding`)
+                return { kind: "SharedBinding", binding }
+              }
+              case "StageOutput":
+                if (route.stage === undefined || route.output === undefined) {
+                  throw new Error("inference[compile]: stage output route is incomplete")
+                }
+                return { kind: route.kind, stage: route.stage, output: route.output }
+              default:
+                return { kind: route.kind }
+            }
+          }
+          const nativePlan: NativeProposerPlan | undefined = generalized === undefined
+            ? undefined
+            : {
+              targetPrefillTaps: [],
+              targetDecodeTaps: generalized.plan.hiddenTaps.map((tap) => ({
+                layer: tap.layer,
+                output: tap.outputRoot,
+                shape: [...tap.value.shape],
+                dtype: tap.value.dtype as NativeDType
+              })),
+              targetVerifyTaps: [],
+              sharedTargetBindings: generalized.plan.sharedTensors.map((binding, tensor) => ({
+                kind: binding.kind,
+                name: binding.name,
+                tensor,
+                shape: [...binding.value.shape],
+                dtype: binding.value.dtype as NativeDType
+              })),
+              stages: generalized.plan.stages.map((stage, executable) => ({
+                executable,
+                operationId: stage.operationId,
+                ...(stage.layoutId === undefined ? {} : { layoutId: stage.layoutId }),
+                inputs: stage.inputs.map((input) => ({ slot: input.slot, value: valueRef(input.value) })),
+                outputs: stage.outputs.map((output) => ({
+                  shape: [...output.shape],
+                  dtype: output.dtype as NativeDType
+                }))
+              })),
+              state: generalized.plan.state.kind === "None"
+                ? { kind: "None" }
+                : {
+                  kind: "Kv",
+                  ...(generalized.plan.state.schemaId === undefined
+                    ? {}
+                    : { schemaId: generalized.plan.state.schemaId })
+                },
+              ...(generalized.plan.state.commitKind === "None"
+                ? {}
+                : generalized.plan.state.commitKind === "AutoregressiveChain"
+                ? { commit: { kind: generalized.plan.state.commitKind, stage: generalized.plan.state.commitStages[0] } }
+                : {
+                  commit: { kind: generalized.plan.state.commitKind, stages: [...generalized.plan.state.commitStages] }
+                }),
+              output: {
+                topology: generalized.plan.output.topology,
+                probabilities: generalized.plan.output.probabilities,
+                tokenIds: valueRef(generalized.plan.output.tokenIds),
+                ...(generalized.plan.output.probabilityRows === undefined
+                  ? {}
+                  : { probabilityRows: valueRef(generalized.plan.output.probabilityRows) }),
+                ...(generalized.plan.output.parents === undefined
+                  ? {}
+                  : { parents: valueRef(generalized.plan.output.parents) }),
+                ...(generalized.plan.output.confidence === undefined
+                  ? {}
+                  : { confidence: valueRef(generalized.plan.output.confidence) })
+              },
+              tokenMap: generalized.plan.tokenMap.kind === "Identity"
+                ? { kind: "Identity", fingerprint: generalized.plan.tokenMap.fingerprint }
+                : {
+                  kind: "Table",
+                  fingerprint: generalized.plan.tokenMap.fingerprint,
+                  ...(generalized.plan.tokenMap.proposerVocabulary === undefined
+                    ? {}
+                    : { proposerVocabulary: generalized.plan.tokenMap.proposerVocabulary }),
+                  ...(generalized.plan.tokenMap.targetIds === undefined
+                    ? {}
+                    : { targetIds: [...generalized.plan.tokenMap.targetIds] })
+                },
+              trainedMaxRows: generalized.plan.trainedMaxRows
+            }
+          const stageExecutables = generalized?.stageExecutables.map((executable) =>
+            record(executable, "executable", "inferenceCompile", "compile").value as Executable
+          )
+          const sharedTargetTensors = generalized?.sharedTensors.map((tensor) =>
+            nativeTensor(tensor, "inferenceCompile", "compile")
+          )
           return inferenceArtifact(
             new native.NativeInferenceArtifact(
               targetPrefill.value as Executable,
@@ -1773,10 +1880,13 @@ export const makeRuntime = (
               proposerPrefill?.value as Executable | undefined,
               proposerDecode?.value as Executable | undefined,
               proposerPool?.value as NativeKvPool | undefined,
-              request.proposer?.maxDraftTokens,
+              request.proposer?.maxDraftTokens ?? generalized?.maxDraftTokens,
               request.batchSize,
               request.tokenDtype as NativeDType,
-              nativeInferenceSampling(sampling)
+              nativeInferenceSampling(sampling),
+              nativePlan,
+              stageExecutables,
+              sharedTargetTensors
             ),
             sampling
           )

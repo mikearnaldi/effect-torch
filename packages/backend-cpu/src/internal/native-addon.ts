@@ -80,6 +80,71 @@ export interface NativeInferenceSamplingOverrides {
   seed?: bigint
 }
 
+/** Concrete value contract retained by a generalized native proposer plan. @internal */
+export interface NativeInferenceValueMetadata {
+  dtype: NativeDType
+  shape: Array<number>
+}
+
+/** Native dataflow reference. External token/history references carry `value`. @internal */
+export interface NativeInferenceValueRef {
+  kind:
+    | "PendingTokens"
+    | "CandidatePrefix"
+    | "CommittedHistory"
+    | "TargetHidden"
+    | "SharedTokenEmbedding"
+    | "SharedLmHead"
+    | "StageOutput"
+  targetOutput?: number
+  stage?: number
+  output?: number
+  value?: NativeInferenceValueMetadata
+  selectTargetRow?: boolean
+}
+
+export interface NativeInferenceProposerPlan {
+  vocabulary: number
+  tokenMapFingerprint: string
+  hiddenTaps: Array<{
+    layer: number
+    outputRoot: number
+    value: NativeInferenceValueMetadata
+  }>
+  sharedTensors: Array<{
+    kind: "TokenEmbedding" | "LmHead"
+    name: string
+    value: NativeInferenceValueMetadata
+  }>
+  stages: Array<{
+    operationId: string
+    layoutId?: string
+    inputs: Array<{ slot: number; value: NativeInferenceValueRef }>
+    outputs: Array<NativeInferenceValueMetadata>
+  }>
+  state: {
+    kind: "None" | "Kv"
+    schemaId?: string
+    commitKind: "None" | "AutoregressiveChain" | "Replay"
+    commitStages: Array<number>
+  }
+  output: {
+    topology: "Chains" | "Trees"
+    probabilities: "CausalNormalized" | "Deterministic" | "Unavailable"
+    tokenIds: NativeInferenceValueRef
+    probabilityRows?: NativeInferenceValueRef
+    parents?: NativeInferenceValueRef
+    confidence?: NativeInferenceValueRef
+  }
+  tokenMap: {
+    kind: "Identity" | "Table"
+    fingerprint: string
+    proposerVocabulary?: number
+    targetIds?: Array<number>
+  }
+  trainedMaxRows: number
+}
+
 /** Immutable validated target/proposer inference bundle. @internal */
 export declare class NativeInferenceArtifact {
   open(): NativeInferenceSession
@@ -362,7 +427,10 @@ export declare function compileInference(
   maxDraftTokens: number,
   batchSize: number,
   tokenDtype: NativeDType,
-  sampling: NativeInferenceSamplingOptions
+  sampling: NativeInferenceSamplingOptions,
+  proposerPlan?: NativeInferenceProposerPlan | undefined | null,
+  sharedTensors?: Array<NativeTensor> | undefined | null,
+  stageExecutables?: Array<Executable> | undefined | null
 ): NativeInferenceArtifact
 
 /** Current bytes attributed to live native tensor wrappers. @internal */

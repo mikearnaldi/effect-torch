@@ -5965,6 +5965,292 @@ struct InferencePrograms {
     token_dtype: DType,
     #[allow(dead_code)]
     default_sampling: SamplingOptions,
+    // Phase 3 foundation only: sessions do not orchestrate this plan yet. Keeping
+    // it here makes validation and retention atomic with the exact-chain bundle.
+    #[allow(dead_code)]
+    proposer_plan: Option<ValidatedProposerPlan>,
+}
+
+#[napi(object)]
+#[derive(Clone)]
+pub struct NativeInferenceValueMetadata {
+    pub dtype: NativeDType,
+    pub shape: Vec<u32>,
+}
+
+#[napi(object)]
+#[derive(Clone)]
+pub struct NativeInferenceHiddenTap {
+    pub layer: u32,
+    /// Root index in each target executable. Root zero remains target logits.
+    pub output_root: u32,
+    pub value: NativeInferenceValueMetadata,
+}
+
+#[napi(object)]
+#[derive(Clone)]
+pub struct NativeInferenceSharedTensor {
+    /// `TokenEmbedding` or `LmHead`.
+    pub kind: String,
+    pub name: String,
+    pub value: NativeInferenceValueMetadata,
+}
+
+#[napi(object)]
+#[derive(Clone)]
+pub struct NativeInferenceValueRef {
+    /// PendingTokens, CandidatePrefix, CommittedHistory, TargetHidden,
+    /// SharedTokenEmbedding, SharedLmHead, or StageOutput.
+    pub kind: String,
+    pub target_output: Option<u32>,
+    pub stage: Option<u32>,
+    pub output: Option<u32>,
+    /// Required concrete metadata for external token/history values.
+    pub value: Option<NativeInferenceValueMetadata>,
+    /// Select `[physicalLane, ..]` as a one-row view. Valid only for TargetHidden.
+    pub select_target_row: Option<bool>,
+}
+
+#[napi(object)]
+#[derive(Clone)]
+pub struct NativeInferenceStageInput {
+    pub slot: u32,
+    pub value: NativeInferenceValueRef,
+}
+
+#[napi(object)]
+#[derive(Clone)]
+pub struct NativeInferenceStage {
+    /// Stable operation identifier, for example `ParallelBlock`.
+    pub operation_id: String,
+    /// Stable layout/search identifier when the operation has one.
+    pub layout_id: Option<String>,
+    pub inputs: Vec<NativeInferenceStageInput>,
+    pub outputs: Vec<NativeInferenceValueMetadata>,
+}
+
+#[napi(object)]
+#[derive(Clone)]
+pub struct NativeInferenceStatePlan {
+    /// `None` or `Kv`.
+    pub kind: String,
+    pub schema_id: Option<String>,
+    /// `None`, `AutoregressiveChain`, or `Replay`.
+    pub commit_kind: String,
+    pub commit_stages: Vec<u32>,
+}
+
+#[napi(object)]
+#[derive(Clone)]
+pub struct NativeInferenceOutputPlan {
+    pub topology: String,
+    pub probabilities: String,
+    pub token_ids: NativeInferenceValueRef,
+    pub probability_rows: Option<NativeInferenceValueRef>,
+    pub parents: Option<NativeInferenceValueRef>,
+    pub confidence: Option<NativeInferenceValueRef>,
+}
+
+#[napi(object)]
+#[derive(Clone)]
+pub struct NativeInferenceTokenMap {
+    /// `Identity` or `Table`.
+    pub kind: String,
+    pub fingerprint: String,
+    pub proposer_vocabulary: Option<u32>,
+    pub target_ids: Option<Vec<u32>>,
+}
+
+#[napi(object)]
+#[derive(Clone)]
+pub struct NativeInferenceProposerPlan {
+    pub vocabulary: u32,
+    pub token_map_fingerprint: String,
+    pub hidden_taps: Vec<NativeInferenceHiddenTap>,
+    pub shared_tensors: Vec<NativeInferenceSharedTensor>,
+    pub stages: Vec<NativeInferenceStage>,
+    pub state: NativeInferenceStatePlan,
+    pub output: NativeInferenceOutputPlan,
+    pub token_map: NativeInferenceTokenMap,
+    pub trained_max_rows: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ValueMetadata {
+    dtype: DType,
+    shape: Vec<usize>,
+}
+
+impl ValueMetadata {
+    fn native(value: &NativeInferenceValueMetadata) -> Self {
+        Self {
+            dtype: value.dtype.into(),
+            shape: value
+                .shape
+                .iter()
+                .map(|&dimension| dimension as usize)
+                .collect(),
+        }
+    }
+
+    fn value(value: &Value) -> Self {
+        Self {
+            dtype: value.dtype(),
+            shape: value.shape().to_vec(),
+        }
+    }
+}
+
+#[derive(Clone)]
+#[allow(dead_code)]
+struct ValidatedStage {
+    executable: Executable,
+    inputs: Vec<(usize, NativeInferenceValueRef)>,
+}
+
+#[derive(Clone)]
+#[allow(dead_code)]
+struct ValidatedProposerPlan {
+    schema: Option<Arc<NativeInferenceProposerPlan>>,
+    target_hidden: HashMap<usize, ValueMetadata>,
+    shared: HashMap<String, Value>,
+    stages: Vec<ValidatedStage>,
+}
+
+fn output_metadata(executable: &Executable, output: usize) -> Option<ValueMetadata> {
+    executable
+        .inner
+        .executable
+        .signature
+        .outputs
+        .get(output)
+        .map(|value| ValueMetadata {
+            dtype: value.dtype,
+            shape: value.shape.clone(),
+        })
+}
+
+#[allow(dead_code)]
+fn routed_target_row(value: &Value, physical_lane: usize) -> std::result::Result<Value, String> {
+    let layout = &value.tensor().layout;
+    if layout.rank() == 0 || physical_lane >= layout.shape()[0] {
+        return Err(format!(
+            "inference[proposer]: target hidden row {physical_lane} is outside shape {:?}",
+            layout.shape()
+        ));
+    }
+    Ok(Value(value.tensor().view(layout.narrow(
+        0,
+        physical_lane,
+        1,
+    ))))
+}
+
+fn resolved_route_metadata(
+    route: &NativeInferenceValueRef,
+    hidden: &HashMap<usize, ValueMetadata>,
+    shared: &HashMap<String, ValueMetadata>,
+    stage_outputs: &[Vec<ValueMetadata>],
+    current_stage: usize,
+) -> Result<Option<ValueMetadata>> {
+    let no_indexes =
+        || route.target_output.is_none() && route.stage.is_none() && route.output.is_none();
+    let selected = route.select_target_row.unwrap_or(false);
+    let metadata = match route.kind.as_str() {
+        "PendingTokens" | "CandidatePrefix" | "CommittedHistory" => {
+            if !no_indexes() || selected {
+                return Err(inference_error(
+                    "compile",
+                    "external ValueRef carries invalid indices",
+                ));
+            }
+            return route
+                .value
+                .as_ref()
+                .map(ValueMetadata::native)
+                .map(Some)
+                .ok_or_else(|| {
+                    inference_error("compile", "external ValueRef is missing metadata")
+                });
+        }
+        "TargetHidden" => {
+            if route.stage.is_some() || route.output.is_some() || route.value.is_some() {
+                return Err(inference_error(
+                    "compile",
+                    "TargetHidden carries stage indices",
+                ));
+            }
+            let root = route
+                .target_output
+                .ok_or_else(|| inference_error("compile", "TargetHidden is missing targetOutput"))?
+                as usize;
+            hidden.get(&root).cloned().ok_or_else(|| {
+                inference_error(
+                    "compile",
+                    "TargetHidden references an undeclared output root",
+                )
+            })?
+        }
+        "SharedTokenEmbedding" | "SharedLmHead" => {
+            if !no_indexes() || selected || route.value.is_some() {
+                return Err(inference_error(
+                    "compile",
+                    "shared ValueRef carries invalid indices",
+                ));
+            }
+            let kind = if route.kind == "SharedTokenEmbedding" {
+                "TokenEmbedding"
+            } else {
+                "LmHead"
+            };
+            shared.get(kind).cloned().ok_or_else(|| {
+                inference_error("compile", "ValueRef references an undeclared shared tensor")
+            })?
+        }
+        "StageOutput" => {
+            if route.target_output.is_some() || selected || route.value.is_some() {
+                return Err(inference_error(
+                    "compile",
+                    "StageOutput carries invalid routing metadata",
+                ));
+            }
+            let stage = route
+                .stage
+                .ok_or_else(|| inference_error("compile", "StageOutput is missing stage"))?
+                as usize;
+            let output = route
+                .output
+                .ok_or_else(|| inference_error("compile", "StageOutput is missing output"))?
+                as usize;
+            if stage >= current_stage {
+                return Err(inference_error(
+                    "compile",
+                    "StageOutput routes must point backward",
+                ));
+            }
+            stage_outputs
+                .get(stage)
+                .and_then(|outputs| outputs.get(output))
+                .cloned()
+                .ok_or_else(|| inference_error("compile", "StageOutput index is out of range"))?
+        }
+        _ => return Err(inference_error("compile", "unsupported ValueRef kind")),
+    };
+    if selected {
+        if route.kind != "TargetHidden" || metadata.shape.is_empty() || metadata.shape[0] == 0 {
+            return Err(inference_error(
+                "compile",
+                "row selection requires a nonempty TargetHidden",
+            ));
+        }
+        let mut shape = metadata.shape;
+        shape[0] = 1;
+        return Ok(Some(ValueMetadata {
+            dtype: metadata.dtype,
+            shape,
+        }));
+    }
+    Ok(Some(metadata))
 }
 
 #[derive(Default)]
@@ -6115,6 +6401,392 @@ fn validate_inference_program(
     Ok(schema)
 }
 
+fn validate_proposer_plan(
+    plan: NativeInferenceProposerPlan,
+    shared_tensors: Vec<&NativeTensor>,
+    stage_executables: Vec<&Executable>,
+    target_prefill: &Executable,
+    target_decode: &Executable,
+    target_verify: Option<&Executable>,
+) -> Result<ValidatedProposerPlan> {
+    if plan.vocabulary == 0 || plan.trained_max_rows == 0 || plan.token_map_fingerprint.is_empty() {
+        return Err(inference_error(
+            "compile",
+            "proposer plan has invalid target metadata",
+        ));
+    }
+    if plan.shared_tensors.len() != shared_tensors.len()
+        || plan.stages.len() != stage_executables.len()
+        || plan.stages.is_empty()
+    {
+        return Err(inference_error(
+            "compile",
+            "proposer plan handle arrays do not match their descriptors",
+        ));
+    }
+
+    let mut target_hidden = HashMap::new();
+    let mut hidden_layers = HashSet::new();
+    for tap in &plan.hidden_taps {
+        let root = tap.output_root as usize;
+        if root == 0 || !hidden_layers.insert(tap.layer) || target_hidden.contains_key(&root) {
+            return Err(inference_error(
+                "compile",
+                "target hidden taps must have unique layers and output roots after logits",
+            ));
+        }
+        let declared = ValueMetadata::native(&tap.value);
+        for executable in [Some(target_prefill), Some(target_decode), target_verify]
+            .into_iter()
+            .flatten()
+        {
+            if output_metadata(executable, root).as_ref() != Some(&declared) {
+                return Err(inference_error(
+                    "compile",
+                    "target hidden tap metadata does not match an executable output root",
+                ));
+            }
+        }
+        target_hidden.insert(root, declared);
+    }
+
+    let mut shared = HashMap::new();
+    let mut shared_metadata = HashMap::new();
+    let mut shared_names = HashSet::new();
+    for (descriptor, tensor) in plan.shared_tensors.iter().zip(shared_tensors) {
+        if !matches!(descriptor.kind.as_str(), "TokenEmbedding" | "LmHead")
+            || descriptor.name.is_empty()
+            || !shared_names.insert(descriptor.name.as_str())
+            || shared.contains_key(&descriptor.kind)
+        {
+            return Err(inference_error(
+                "compile",
+                "shared tensor keys and names must be unique",
+            ));
+        }
+        let value = tensor.value_cloned()?;
+        let declared = ValueMetadata::native(&descriptor.value);
+        if ValueMetadata::value(&value) != declared {
+            return Err(inference_error(
+                "compile",
+                "shared tensor metadata does not match its concrete handle",
+            ));
+        }
+        shared_metadata.insert(descriptor.kind.clone(), declared);
+        shared.insert(descriptor.kind.clone(), value);
+    }
+
+    let mut outputs = Vec::with_capacity(plan.stages.len());
+    let mut stages = Vec::with_capacity(plan.stages.len());
+    for (stage_index, (stage, executable)) in plan.stages.iter().zip(stage_executables).enumerate()
+    {
+        let layout_required = matches!(
+            stage.operation_id.as_str(),
+            "ParallelBlock" | "TreeExpand" | "HistoryLookup"
+        );
+        if !matches!(
+            stage.operation_id.as_str(),
+            "Autoregressive"
+                | "ParallelBlock"
+                | "SequentialHead"
+                | "TreeExpand"
+                | "TargetPath"
+                | "HistoryLookup"
+        ) || stage.layout_id.as_ref().is_some_and(|id| id.is_empty())
+            || layout_required != stage.layout_id.is_some()
+            || stage.outputs.is_empty()
+            || stage.outputs.len() != executable.inner.executable.signature.outputs.len()
+        {
+            return Err(inference_error(
+                "compile",
+                "stage operation or output metadata is invalid",
+            ));
+        }
+        let declared_outputs = stage
+            .outputs
+            .iter()
+            .map(ValueMetadata::native)
+            .collect::<Vec<_>>();
+        if declared_outputs
+            .iter()
+            .enumerate()
+            .any(|(output, declared)| {
+                output_metadata(executable, output).as_ref() != Some(declared)
+            })
+        {
+            return Err(inference_error(
+                "compile",
+                "stage output metadata does not match its executable",
+            ));
+        }
+
+        let schema = executable.state;
+        let tensor_slots = executable
+            .inner
+            .slots
+            .iter()
+            .enumerate()
+            .filter(|(slot, value)| {
+                !value.scalar
+                    && !schema.is_some_and(|state| {
+                        state.cursor_tensor && *slot as u32 == state.cursor_slot
+                    })
+            })
+            .map(|(slot, value)| (slot, value))
+            .collect::<Vec<_>>();
+        if executable.inner.slots.iter().any(|slot| slot.scalar)
+            || tensor_slots.len() != stage.inputs.len()
+        {
+            return Err(inference_error(
+                "compile",
+                "stage inputs do not cover its executable tensor slots",
+            ));
+        }
+        let mut seen = HashSet::new();
+        let mut validated_inputs = Vec::with_capacity(stage.inputs.len());
+        for input in &stage.inputs {
+            let slot = input.slot as usize;
+            if !seen.insert(slot) {
+                return Err(inference_error(
+                    "compile",
+                    "stage input slots must be unique",
+                ));
+            }
+            let declared_slot = tensor_slots
+                .iter()
+                .find_map(|(index, value)| (*index == slot).then_some(*value))
+                .ok_or_else(|| {
+                    inference_error("compile", "stage input slot is not a tensor slot")
+                })?;
+            let routed = resolved_route_metadata(
+                &input.value,
+                &target_hidden,
+                &shared_metadata,
+                &outputs,
+                stage_index,
+            )?
+            .expect("all native routes carry concrete metadata");
+            if routed.dtype != declared_slot.dtype || routed.shape != declared_slot.shape {
+                return Err(inference_error(
+                    "compile",
+                    "stage input route metadata does not match its executable slot",
+                ));
+            }
+            validated_inputs.push((slot, input.value.clone()));
+        }
+        validated_inputs.sort_by_key(|(slot, _)| *slot);
+        outputs.push(declared_outputs);
+        stages.push(ValidatedStage {
+            executable: (*executable).clone(),
+            inputs: validated_inputs,
+        });
+    }
+
+    let committed = plan
+        .state
+        .commit_stages
+        .iter()
+        .map(|&stage| stage as usize)
+        .collect::<HashSet<_>>();
+    let stateful = stages
+        .iter()
+        .enumerate()
+        .filter_map(|(index, stage)| stage.executable.state.is_some().then_some(index))
+        .collect::<HashSet<_>>();
+    match plan.state.kind.as_str() {
+        "None"
+            if plan.state.schema_id.is_none()
+                && plan.state.commit_kind == "None"
+                && plan.state.commit_stages.is_empty()
+                && stages.iter().all(|stage| stage.executable.state.is_none()) => {}
+        "Kv" if plan
+            .state
+            .schema_id
+            .as_ref()
+            .is_some_and(|id| !id.is_empty())
+            && matches!(
+                plan.state.commit_kind.as_str(),
+                "AutoregressiveChain" | "Replay"
+            )
+            && !plan.state.commit_stages.is_empty()
+            && committed.len() == plan.state.commit_stages.len()
+            && (plan.state.commit_kind != "AutoregressiveChain" || committed.len() == 1)
+            && stateful.iter().all(|stage| committed.contains(stage))
+            && plan
+                .state
+                .commit_stages
+                .iter()
+                .all(|&stage| (stage as usize) < stages.len()) => {}
+        _ => {
+            return Err(inference_error(
+                "compile",
+                "proposer state/commit metadata is invalid",
+            ))
+        }
+    }
+
+    let mut output_metadata = Vec::new();
+    for route in [
+        Some(&plan.output.token_ids),
+        plan.output.probability_rows.as_ref(),
+        plan.output.parents.as_ref(),
+        plan.output.confidence.as_ref(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        output_metadata.push(
+            resolved_route_metadata(
+                route,
+                &target_hidden,
+                &shared_metadata,
+                &outputs,
+                stages.len(),
+            )?
+            .expect("all native routes carry concrete metadata"),
+        );
+    }
+    if !matches!(plan.output.topology.as_str(), "Chains" | "Trees")
+        || !matches!(
+            plan.output.probabilities.as_str(),
+            "CausalNormalized" | "Deterministic" | "Unavailable"
+        )
+        || (plan.output.probabilities == "CausalNormalized")
+            != plan.output.probability_rows.is_some()
+        || (plan.output.topology == "Trees" && plan.output.parents.is_none())
+    {
+        return Err(inference_error(
+            "compile",
+            "proposer output metadata is invalid",
+        ));
+    }
+    let token_ids = &output_metadata[0];
+    if token_ids.shape.len() != 1 || !matches!(token_ids.dtype, DType::U32 | DType::I64) {
+        return Err(inference_error(
+            "compile",
+            "proposer tokenIds must be a rank-one integer value",
+        ));
+    }
+    if plan.token_map.fingerprint != plan.token_map_fingerprint {
+        return Err(inference_error(
+            "compile",
+            "token-map fingerprint does not match target contract",
+        ));
+    }
+    match plan.token_map.kind.as_str() {
+        "Identity"
+            if plan.token_map.proposer_vocabulary.is_none()
+                && plan.token_map.target_ids.is_none() => {}
+        "Table" => {
+            let vocabulary = plan.token_map.proposer_vocabulary.ok_or_else(|| {
+                inference_error("compile", "table token map is missing proposerVocabulary")
+            })? as usize;
+            let ids = plan.token_map.target_ids.as_ref().ok_or_else(|| {
+                inference_error("compile", "table token map is missing targetIds")
+            })?;
+            if vocabulary == 0
+                || ids.len() != vocabulary
+                || ids.iter().any(|&token| token >= plan.vocabulary)
+            {
+                return Err(inference_error(
+                    "compile",
+                    "table token map is out of range",
+                ));
+            }
+        }
+        _ => return Err(inference_error("compile", "token-map metadata is invalid")),
+    }
+
+    Ok(ValidatedProposerPlan {
+        schema: Some(Arc::new(plan)),
+        target_hidden,
+        shared,
+        stages,
+    })
+}
+
+/// Executes the stateless subset of a validated stage DAG with direct `Value`
+/// bindings. This is the future ParallelBlock/SequentialHead orchestration hook;
+/// stateful and external token/history routes remain session responsibilities.
+#[allow(dead_code)]
+fn execute_stateless_stage_dag(
+    plan: &ValidatedProposerPlan,
+    target_outputs: &[Value],
+    physical_lane: usize,
+    cancelled: &CancellationFlag,
+) -> std::result::Result<Vec<Vec<Value>>, String> {
+    if plan
+        .schema
+        .as_ref()
+        .is_some_and(|schema| schema.state.kind != "None")
+    {
+        return Err(
+            "inference[proposer]: stateless DAG helper received a stateful plan".to_string(),
+        );
+    }
+    let mut stage_outputs: Vec<Vec<Value>> = Vec::with_capacity(plan.stages.len());
+    for stage in &plan.stages {
+        if stage.executable.state.is_some() {
+            return Err(
+                "inference[proposer]: stateless DAG helper received a stateful stage".to_string(),
+            );
+        }
+        let mut inputs = Vec::with_capacity(stage.inputs.len());
+        for (_, route) in &stage.inputs {
+            let value = match route.kind.as_str() {
+                "TargetHidden" => {
+                    let root = route.target_output.expect("validated target output") as usize;
+                    let value = target_outputs.get(root).ok_or_else(|| {
+                        "inference[proposer]: target output is unavailable".to_string()
+                    })?;
+                    if plan.target_hidden.get(&root) != Some(&ValueMetadata::value(value)) {
+                        return Err(
+                            "inference[proposer]: target output metadata changed after compilation"
+                                .to_string(),
+                        );
+                    }
+                    if route.select_target_row.unwrap_or(false) {
+                        routed_target_row(value, physical_lane)?
+                    } else {
+                        value.clone()
+                    }
+                }
+                "SharedTokenEmbedding" => {
+                    plan.shared.get("TokenEmbedding").cloned().ok_or_else(|| {
+                        "inference[proposer]: shared embedding is unavailable".to_string()
+                    })?
+                }
+                "SharedLmHead" => plan.shared.get("LmHead").cloned().ok_or_else(|| {
+                    "inference[proposer]: shared LM head is unavailable".to_string()
+                })?,
+                "StageOutput" => stage_outputs
+                    .get(route.stage.expect("validated stage") as usize)
+                    .and_then(|values| values.get(route.output.expect("validated output") as usize))
+                    .cloned()
+                    .ok_or_else(|| {
+                        "inference[proposer]: stage output is unavailable".to_string()
+                    })?,
+                _ => {
+                    return Err(
+                        "inference[proposer]: external route requires session orchestration"
+                            .to_string(),
+                    )
+                }
+            };
+            inputs.push(value);
+        }
+        let outputs = executable::execute(
+            &stage.executable.inner.executable,
+            &inputs,
+            &stage.executable.inner.generated_bindings,
+            cancelled,
+            None,
+        )?;
+        stage_outputs.push(outputs);
+    }
+    Ok(stage_outputs)
+}
+
 #[napi]
 #[allow(clippy::too_many_arguments)]
 pub fn compile_inference(
@@ -6129,6 +6801,9 @@ pub fn compile_inference(
     batch_size: u32,
     token_dtype: NativeDType,
     sampling: NativeInferenceSamplingOptions,
+    proposer_plan: Option<NativeInferenceProposerPlan>,
+    shared_tensors: Option<Vec<&NativeTensor>>,
+    stage_executables: Option<Vec<&Executable>>,
 ) -> Result<NativeInferenceArtifact> {
     let batch_size = batch_size as usize;
     if batch_size == 0 {
@@ -6158,22 +6833,28 @@ pub fn compile_inference(
     }
     let proposer_present =
         proposer_prefill.is_some() || proposer_decode.is_some() || proposer_pool.is_some();
+    let generalized_present =
+        proposer_plan.is_some() || shared_tensors.is_some() || stage_executables.is_some();
+    if generalized_present
+        != (proposer_plan.is_some() && shared_tensors.is_some() && stage_executables.is_some())
+    {
+        return Err(inference_error(
+            "compile",
+            "incomplete generalized proposer plan arguments",
+        ));
+    }
     if proposer_present
         != (proposer_prefill.is_some() && proposer_decode.is_some() && proposer_pool.is_some())
-        || proposer_present != target_verify.is_some()
-        || proposer_present != (max_draft_tokens > 0)
+        || proposer_present && generalized_present
+        || (proposer_present || generalized_present) != target_verify.is_some()
+        || (proposer_present || generalized_present) != (max_draft_tokens > 0)
     {
         return Err(inference_error(
             "compile",
             "incomplete target/proposer inference bundle",
         ));
     }
-    if let (Some(verify), Some(prefill), Some(decode), Some(pool)) = (
-        target_verify,
-        proposer_prefill,
-        proposer_decode,
-        proposer_pool,
-    ) {
+    if let Some(verify) = target_verify {
         let width = max_draft_tokens as usize + 1;
         let verify_schema = validate_inference_program(
             verify,
@@ -6189,6 +6870,10 @@ pub fn compile_inference(
                 "target verifier state schema differs",
             ));
         }
+    }
+    if let (Some(prefill), Some(decode), Some(pool)) =
+        (proposer_prefill, proposer_decode, proposer_pool)
+    {
         let (_, proposer_steps, _) = inference_token_shape(prefill)?;
         let proposer_schema = validate_inference_program(
             prefill,
@@ -6209,6 +6894,24 @@ pub fn compile_inference(
             ));
         }
     }
+    let proposer_plan = match (proposer_plan, shared_tensors, stage_executables) {
+        (Some(plan), Some(shared), Some(stages)) => Some(validate_proposer_plan(
+            plan,
+            shared,
+            stages,
+            target_prefill,
+            target_decode,
+            target_verify,
+        )?),
+        (None, None, None) => None,
+        _ => unreachable!("generalized argument completeness checked"),
+    };
+    if proposer_plan.is_some() {
+        return Err(inference_error(
+            "compile",
+            "generalized proposer round orchestration is not implemented",
+        ));
+    }
     Ok(NativeInferenceArtifact {
         programs: Arc::new(InferencePrograms {
             target_prefill: target_prefill.clone(),
@@ -6222,6 +6925,7 @@ pub fn compile_inference(
             batch_size,
             token_dtype,
             default_sampling,
+            proposer_plan,
         }),
         diagnostics: Arc::new(Mutex::new(NativeInferenceDiagnosticsState {
             accepted_length_histogram: vec![0; max_draft_tokens as usize + 1],
@@ -7512,6 +8216,86 @@ mod tests {
             seed: 7,
             counter: 3,
         }
+    }
+
+    fn stateless_input_executable(shape: &[usize]) -> Executable {
+        let root = LazyTensor {
+            node: Node::new(NodeKind::Input {
+                slot: 0,
+                shape: shape.to_vec(),
+                dtype: DType::F32,
+                device: cpu_device(),
+            })
+            .unwrap(),
+        };
+        compile(vec![&root], None, None, None).unwrap()
+    }
+
+    fn value_ref(kind: &str) -> NativeInferenceValueRef {
+        NativeInferenceValueRef {
+            kind: kind.to_string(),
+            target_output: None,
+            stage: None,
+            output: None,
+            value: None,
+            select_target_row: None,
+        }
+    }
+
+    #[test]
+    fn target_hidden_row_selection_is_a_direct_value_view() {
+        let source = Value(Tensor::from_vec(
+            vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0],
+            vec![3, 2],
+        ));
+        let selected = routed_target_row(&source, 1).unwrap();
+
+        assert_eq!(selected.shape(), &[1, 2]);
+        assert_eq!(selected.tensor().layout.offset(), 2);
+        assert_eq!(selected.to_f32_vec().unwrap(), [3.0, 4.0]);
+        assert_eq!(source.to_f32_vec().unwrap(), [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+    }
+
+    #[test]
+    fn stateless_dag_routes_values_between_executables_without_wrappers() {
+        let executable = stateless_input_executable(&[2]);
+        let mut hidden_route = value_ref("TargetHidden");
+        hidden_route.target_output = Some(1);
+        let mut stage_route = value_ref("StageOutput");
+        stage_route.stage = Some(0);
+        stage_route.output = Some(0);
+        let plan = ValidatedProposerPlan {
+            schema: None,
+            target_hidden: HashMap::from([(
+                1,
+                ValueMetadata {
+                    dtype: DType::F32,
+                    shape: vec![2],
+                },
+            )]),
+            shared: HashMap::new(),
+            stages: vec![
+                ValidatedStage {
+                    executable: executable.clone(),
+                    inputs: vec![(0, hidden_route)],
+                },
+                ValidatedStage {
+                    executable,
+                    inputs: vec![(0, stage_route)],
+                },
+            ],
+        };
+        let target = vec![
+            Value(Tensor::from_vec(vec![0.0f32], vec![1])),
+            Value(Tensor::from_vec(vec![7.0f32, 11.0], vec![2])),
+        ];
+
+        let outputs =
+            execute_stateless_stage_dag(&plan, &target, 0, &CancellationFlag::new()).unwrap();
+
+        assert_eq!(outputs.len(), 2);
+        assert_eq!(outputs[0][0].to_f32_vec().unwrap(), [7.0, 11.0]);
+        assert_eq!(outputs[1][0].to_f32_vec().unwrap(), [7.0, 11.0]);
     }
 
     fn assert_strided_float_sampling<T: Elem>() {

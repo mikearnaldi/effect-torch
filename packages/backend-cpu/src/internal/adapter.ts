@@ -20,6 +20,7 @@ import type {
   NativeGgufMetadataEntry,
   NativeGgufTensorDescriptor,
   NativeInferenceArtifact,
+  NativeInferenceProposerPlan,
   NativeInferenceRoundResult,
   NativeInferenceSamplingOptions,
   NativeInferenceSamplingOverrides,
@@ -1411,6 +1412,63 @@ export const makeRuntime = (
     topP: override?.topP ?? defaults.topP,
     seed: override?.seed ?? defaults.seed
   })
+  const inferenceValueRef = (
+    value: Runtime.InferenceValueRoute
+  ): NativeInferenceProposerPlan["output"]["tokenIds"] => ({
+    kind: value.kind,
+    ...(value.targetOutput === undefined ? {} : { targetOutput: value.targetOutput }),
+    ...(value.stage === undefined ? {} : { stage: value.stage }),
+    ...(value.output === undefined ? {} : { output: value.output }),
+    ...(value.value === undefined
+      ? {}
+      : { value: { dtype: value.value.dtype as NativeDType, shape: [...value.value.shape] } }),
+    ...(value.selectTargetRow === undefined ? {} : { selectTargetRow: value.selectTargetRow })
+  })
+  const inferenceProposerPlan = (plan: Runtime.InferenceProposerPlan): NativeInferenceProposerPlan => ({
+    vocabulary: plan.vocabulary,
+    tokenMapFingerprint: plan.tokenMapFingerprint,
+    hiddenTaps: plan.hiddenTaps.map((tap) => ({
+      layer: tap.layer,
+      outputRoot: tap.outputRoot,
+      value: { dtype: tap.value.dtype as NativeDType, shape: [...tap.value.shape] }
+    })),
+    sharedTensors: plan.sharedTensors.map((tensor) => ({
+      kind: tensor.kind,
+      name: tensor.name,
+      value: { dtype: tensor.value.dtype as NativeDType, shape: [...tensor.value.shape] }
+    })),
+    stages: plan.stages.map((stage) => ({
+      operationId: stage.operationId,
+      ...(stage.layoutId === undefined ? {} : { layoutId: stage.layoutId }),
+      inputs: stage.inputs.map((input) => ({ slot: input.slot, value: inferenceValueRef(input.value) })),
+      outputs: stage.outputs.map((output) => ({ dtype: output.dtype as NativeDType, shape: [...output.shape] }))
+    })),
+    state: {
+      kind: plan.state.kind,
+      ...(plan.state.schemaId === undefined ? {} : { schemaId: plan.state.schemaId }),
+      commitKind: plan.state.commitKind,
+      commitStages: [...plan.state.commitStages]
+    },
+    output: {
+      topology: plan.output.topology,
+      probabilities: plan.output.probabilities,
+      tokenIds: inferenceValueRef(plan.output.tokenIds),
+      ...(plan.output.probabilityRows === undefined
+        ? {}
+        : { probabilityRows: inferenceValueRef(plan.output.probabilityRows) }),
+      ...(plan.output.parents === undefined ? {} : { parents: inferenceValueRef(plan.output.parents) }),
+      ...(plan.output.confidence === undefined ? {} : { confidence: inferenceValueRef(plan.output.confidence) })
+    },
+    tokenMap: {
+      kind: plan.tokenMap.kind,
+      fingerprint: plan.tokenMap.fingerprint,
+      ...(plan.tokenMap.proposerVocabulary === undefined
+        ? {}
+        : { proposerVocabulary: plan.tokenMap.proposerVocabulary }),
+      ...(plan.tokenMap.targetIds === undefined ? {} : { targetIds: [...plan.tokenMap.targetIds] })
+    },
+    trainedMaxRows: plan.trainedMaxRows
+  })
   const nativeInferenceArtifact = (handle: Runtime.InferenceArtifactHandle, operation: string): HandleRecord =>
     record(handle, "inference-artifact", operation, operation === "inferenceCompile" ? "compile" : "execute")
   const nativeInferenceSession = (handle: Runtime.InferenceSessionHandle, operation: string): HandleRecord =>
@@ -1530,6 +1588,7 @@ export const makeRuntime = (
     compile: (request) =>
       Effect.try({
         try: () => {
+          const generalized = request.generalizedProposer
           const targetPrefill = nativeExecutable(request.target.prefill, "inferenceCompile").value as NativeExecutable
           const targetDecode = nativeExecutable(request.target.decode, "inferenceCompile").value as NativeExecutable
           const targetVerify = request.target.verify === undefined
@@ -1553,10 +1612,15 @@ export const makeRuntime = (
             proposerPrefill,
             proposerDecode,
             proposerPool,
-            request.proposer?.maxDraftTokens ?? 0,
+            request.proposer?.maxDraftTokens ?? generalized?.maxDraftTokens ?? 0,
             request.batchSize,
             request.tokenDtype as NativeDType,
-            inferenceSampling(request.sampling)
+            inferenceSampling(request.sampling),
+            generalized === undefined ? undefined : inferenceProposerPlan(generalized.plan),
+            generalized?.sharedTensors.map((tensor) => nativeTensor(tensor, "inferenceCompile")),
+            generalized?.stageExecutables.map((stage) =>
+              nativeExecutable(stage, "inferenceCompile").value as NativeExecutable
+            )
           )
           return wrapOpaque<Runtime.InferenceArtifactHandle>(
             "inference-artifact",

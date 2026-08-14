@@ -908,6 +908,71 @@ onDevices("Inference", () => (it) => {
         expect(unsupported.message).toMatch(/only one exact-chain Autoregressive proposer stage/)
       }))
 
+    it.effect("validates graph-builder outputs before the generalized backend gate", () =>
+      Effect.gen(function*() {
+        const base = yield* makeGpt()
+        const target = yield* Model.define({
+          parameters: base.parameters,
+          forward: (params, input, trace) =>
+            Effect.gen(function*() {
+              const logits = yield* base.forward(params, input)
+              trace?.hidden(2, logits)
+              return logits
+            })
+        })
+        const params = yield* Tensor.compute(yield* base.init)
+        const makeArtifact = (outputs: number) =>
+          Speculation.artifact({
+            components: [{
+              params: [],
+              build: (_, inputs) =>
+                Effect.gen(function*() {
+                  const probabilities = yield* Tensor.softmax(inputs[0]!, { dims: [-1] })
+                  if (outputs === 1) return [probabilities]
+                  return [yield* Tensor.argmax(probabilities, -1), probabilities]
+                })
+            }],
+            plan: {
+              target: {
+                vocabulary: VOCAB,
+                hiddenTaps: [{ layer: 2, dtype: "f32", shape: ["Rows", "Vocabulary"] }],
+                sharedWeights: []
+              },
+              stages: [{
+                operation: { _tag: "SequentialHead", component: 0 },
+                inputs: [{ slot: 0, value: { _tag: "TargetHidden", layer: 2 } }],
+                outputs: [
+                  { dtype: "i64", shape: ["Rows"] },
+                  { dtype: "f32", shape: ["Rows", "Vocabulary"] }
+                ]
+              }],
+              state: { _tag: "None" },
+              output: {
+                topology: "Chains",
+                probabilities: "CausalNormalized",
+                tokenIds: { _tag: "StageOutput", stage: 0, output: 0 },
+                probabilityRows: { _tag: "StageOutput", stage: 0, output: 1 }
+              },
+              tokenMap: { _tag: "Identity" },
+              trainedMaxRows: 2
+            }
+          })
+
+        const malformed = yield* makeArtifact(1)
+        const validation = yield* Effect.flip(Model.inference(target, params, {
+          maxTokens: 32,
+          speculation: { proposer: malformed, maxDraftTokens: 2 }
+        }))
+        expect(validation.message).toMatch(/builder returned 1 outputs; expected 2/)
+
+        const valid = yield* makeArtifact(2)
+        const backend = yield* Effect.flip(Model.inference(target, params, {
+          maxTokens: 32,
+          speculation: { proposer: valid, maxDraftTokens: 2 }
+        }))
+        expect(backend.message).not.toMatch(/stage 0 output|builder returned|cannot resolve/)
+      }))
+
     it.effect("lane refill does not change a replacement sequence's RNG identity", () =>
       Effect.gen(function*() {
         const model = yield* makeGpt()

@@ -1,6 +1,6 @@
 import { describe, expect } from "@effect/vitest"
 import { Effect } from "effect"
-import { Model, Speculation } from "../src/index.ts"
+import { Model, Speculation, Tensor } from "../src/index.ts"
 import { onDevices } from "./utils/devices.ts"
 
 const plan = (overrides: Partial<Model.ProposerPlan> = {}): Model.ProposerPlan => ({
@@ -211,6 +211,33 @@ onDevices("Speculation", () => (it) => {
           plan: plan()
         }))
         expect(error._tag).toBe("ModelError")
+      }))
+
+    it.effect("accepts graph-builder components without a component tag", () =>
+      Effect.gen(function*() {
+        const artifact = yield* Speculation.artifact({
+          components: [{
+            params: [],
+            build: (_, inputs) => Effect.map(Tensor.relu(inputs[0]!), (output) => [output])
+          }],
+          plan: {
+            target: { vocabulary: 16 },
+            stages: [{
+              operation: { _tag: "SequentialHead", component: 0 },
+              inputs: [{ slot: 0, value: { _tag: "PendingTokens" } }],
+              outputs: [{ dtype: "u32", shape: ["Rows"] }]
+            }],
+            state: { _tag: "None" },
+            output: {
+              topology: "Chains",
+              probabilities: "Deterministic",
+              tokenIds: { _tag: "StageOutput", stage: 0, output: 0 }
+            },
+            tokenMap: { _tag: "Identity" },
+            trainedMaxRows: 4
+          }
+        })
+        expect(artifact[Speculation.ProposerArtifactTypeId]).toBe(Speculation.ProposerArtifactTypeId)
       }))
 
     it.effect("returns typed errors for malformed untyped artifacts", () =>

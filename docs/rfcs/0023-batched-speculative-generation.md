@@ -849,6 +849,13 @@ length, and concurrent sessions.
 
 ### Phase 3: target-coupled proposer stages
 
+**Status: In progress.** Structural plans, graph/checkpoint and target-value
+validation, multi-input/multi-output stage tracing, immutable stage compilation,
+and direct CPU/Metal native value-routing primitives are implemented. Native
+round orchestration still rejects generalized plans before sequence creation;
+`ParallelBlock`, `SequentialHead`, tree verification, and history lookup are not
+yet executable generation strategies.
+
 1. Add ephemeral native target hidden-tap routing and shared embedding/LM-head
    bindings declared by `ValueRef` and `TargetContract`.
 2. Implement `ParallelBlock` and fixed-length DFlash chain artifacts using

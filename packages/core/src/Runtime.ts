@@ -1192,9 +1192,81 @@ export interface InferenceCompileRequest {
     readonly pool: KvPoolHandle
     readonly maxDraftTokens: number
   }
+  readonly generalizedProposer?: {
+    readonly plan: InferenceProposerPlan
+    readonly sharedTensors: ReadonlyArray<ConcreteTensorHandle>
+    readonly stageExecutables: ReadonlyArray<ExecutableHandle>
+    readonly maxDraftTokens: number
+  }
   readonly batchSize: number
   readonly tokenDtype: "u32" | "i64"
   readonly sampling: InferenceSamplingOptions
+}
+
+/** Fully resolved logical schema of one value routed by an inference artifact. */
+export interface InferenceValueSchema {
+  readonly dtype: DType
+  readonly shape: ReadonlyArray<number>
+}
+
+/** Source of one ordered stage input. */
+export interface InferenceValueRoute {
+  readonly kind:
+    | "PendingTokens"
+    | "CandidatePrefix"
+    | "CommittedHistory"
+    | "TargetHidden"
+    | "SharedTokenEmbedding"
+    | "SharedLmHead"
+    | "StageOutput"
+  readonly targetOutput?: number
+  readonly stage?: number
+  readonly output?: number
+  readonly value?: InferenceValueSchema
+  readonly selectTargetRow?: boolean
+}
+
+/** One hidden activation exported by each target program for native routing. */
+export interface InferenceTargetTapRoute {
+  readonly layer: number
+  readonly outputRoot: number
+  readonly value: InferenceValueSchema
+}
+
+/** Complete generalized proposer schedule consumed by the native compiler. */
+export interface InferenceProposerPlan {
+  readonly vocabulary: number
+  readonly tokenMapFingerprint: string
+  readonly hiddenTaps: ReadonlyArray<InferenceTargetTapRoute>
+  readonly sharedTensors: ReadonlyArray<{
+    readonly kind: "TokenEmbedding" | "LmHead"
+    readonly name: string
+    readonly value: InferenceValueSchema
+  }>
+  readonly stages: ReadonlyArray<{
+    readonly operationId: string
+    readonly layoutId?: string
+    readonly inputs: ReadonlyArray<{ readonly slot: number; readonly value: InferenceValueRoute }>
+    readonly outputs: ReadonlyArray<InferenceValueSchema>
+  }>
+  readonly state: {
+    readonly kind: "None" | "Kv"
+    readonly schemaId?: string
+    readonly commitKind: "None" | "AutoregressiveChain" | "Replay"
+    readonly commitStages: ReadonlyArray<number>
+  }
+  readonly output: {
+    readonly topology: "Chains" | "Trees"
+    readonly probabilities: "CausalNormalized" | "Deterministic" | "Unavailable"
+    readonly tokenIds: InferenceValueRoute
+    readonly probabilityRows?: InferenceValueRoute
+    readonly parents?: InferenceValueRoute
+    readonly confidence?: InferenceValueRoute
+  }
+  readonly tokenMap:
+    & { readonly kind: "Identity" | "Table"; readonly fingerprint: string }
+    & { readonly proposerVocabulary?: number; readonly targetIds?: ReadonlyArray<number> }
+  readonly trainedMaxRows: number
 }
 
 /** Prompt policy and page-local sampling overrides transferred atomically. */

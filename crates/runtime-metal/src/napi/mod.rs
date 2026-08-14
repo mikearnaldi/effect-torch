@@ -3604,8 +3604,8 @@ impl Executable {
             .into_iter()
             .map(sampling_options)
             .collect::<Result<Vec<_>>>()?;
-        let target = validate_speculative_program(self, false)?;
-        let proposer = validate_speculative_program(proposer, true)?;
+        let target = validate_speculative_program(self, false, false)?;
+        let proposer = validate_speculative_program(proposer, true, false)?;
         validate_speculative_request(
             &target,
             &proposer,
@@ -3731,6 +3731,7 @@ struct SpeculativeProgram {
 fn validate_speculative_program(
     program: &Executable,
     proposer: bool,
+    allow_ephemeral_outputs: bool,
 ) -> Result<SpeculativeProgram> {
     let phase = if proposer { "proposer" } else { "target" };
     let state = program.state.as_ref().ok_or_else(|| {
@@ -3807,7 +3808,7 @@ fn validate_speculative_program(
         }
         first.shape[0]
     } else {
-        if outputs.len() != 1 {
+        if outputs.is_empty() || (!allow_ephemeral_outputs && outputs.len() != 1) {
             return Err(Error::new(
                 Status::InvalidArg,
                 "executeSpeculative: target must expose one [graphRows, 1, V] logits tensor",
@@ -3825,12 +3826,15 @@ fn validate_speculative_program(
         }
         output.shape[2]
     };
-    let valid_dtype = outputs.iter().all(|output| {
-        matches!(
-            values[output.index()].dtype,
-            DType::F16 | DType::BF16 | DType::F32
-        )
-    });
+    let valid_dtype = outputs
+        .iter()
+        .take(if proposer { outputs.len() } else { 1 })
+        .all(|output| {
+            matches!(
+                values[output.index()].dtype,
+                DType::F16 | DType::BF16 | DType::F32
+            )
+        });
     if !valid_dtype || vocabulary == 0 || vocabulary > MAX_SAMPLING_VOCABULARY {
         return Err(Error::new(
             Status::InvalidArg,
@@ -4847,6 +4851,7 @@ fn inference_program(
     program: &Executable,
     phase: &str,
     time_one: bool,
+    allow_ephemeral_outputs: bool,
 ) -> Result<SpeculativeProgram> {
     let state = program.state.as_ref().ok_or_else(|| {
         Error::new(
@@ -4884,7 +4889,9 @@ fn inference_program(
     }
     let outputs = &program.inner.executable.program.outputs;
     let values = &program.inner.executable.program.values;
-    if outputs.len() != state.schema.batch {
+    if outputs.len() < state.schema.batch
+        || (!allow_ephemeral_outputs && outputs.len() != state.schema.batch)
+    {
         return Err(Error::new(
             Status::InvalidArg,
             format!("inference[{phase}]: expected one last-token logits row per lane"),
@@ -4895,7 +4902,7 @@ fn inference_program(
         || first.shape[0] == 0
         || first.shape[0] > MAX_SAMPLING_VOCABULARY
         || !matches!(first.dtype, DType::F16 | DType::BF16 | DType::F32)
-        || outputs.iter().any(|output| {
+        || outputs.iter().take(state.schema.batch).any(|output| {
             let declaration = &values[output.index()];
             declaration.shape != first.shape || declaration.dtype != first.dtype
         })
@@ -5143,6 +5150,661 @@ struct InferencePrograms {
     max_draft_tokens: usize,
     batch: usize,
     sampling: InferenceSampling,
+    proposer_plan: Option<Arc<RetainedProposerPlan>>,
+}
+
+#[napi(object)]
+#[derive(Clone)]
+pub struct NativeValueRef {
+    pub kind: String,
+    pub layer: Option<u32>,
+    pub binding: Option<u32>,
+    pub stage: Option<u32>,
+    pub output: Option<u32>,
+    pub row: Option<u32>,
+    pub select_row: Option<bool>,
+}
+
+#[napi(object)]
+#[derive(Clone)]
+pub struct NativeProposerValueSchema {
+    pub shape: Vec<u32>,
+    pub dtype: NativeDType,
+}
+
+#[napi(object)]
+#[derive(Clone)]
+pub struct NativeTargetHiddenTap {
+    pub layer: u32,
+    pub output: u32,
+    pub shape: Vec<u32>,
+    pub dtype: NativeDType,
+}
+
+#[napi(object)]
+#[derive(Clone)]
+pub struct NativeSharedTargetBinding {
+    pub kind: String,
+    pub name: String,
+    pub tensor: u32,
+    pub shape: Vec<u32>,
+    pub dtype: NativeDType,
+}
+
+#[napi(object)]
+#[derive(Clone)]
+pub struct NativeStageInputBinding {
+    pub slot: u32,
+    pub value: NativeValueRef,
+}
+
+#[napi(object)]
+#[derive(Clone)]
+pub struct NativeProposerStage {
+    pub executable: u32,
+    pub operation_id: String,
+    pub layout_id: Option<String>,
+    pub inputs: Vec<NativeStageInputBinding>,
+    pub outputs: Vec<NativeProposerValueSchema>,
+}
+
+#[napi(object)]
+#[derive(Clone)]
+pub struct NativeProposerStatePlan {
+    pub kind: String,
+    pub schema_id: Option<String>,
+}
+
+#[napi(object)]
+#[derive(Clone)]
+pub struct NativeProposerCommitPlan {
+    pub kind: String,
+    pub stage: Option<u32>,
+    pub stages: Option<Vec<u32>>,
+}
+
+#[napi(object)]
+#[derive(Clone)]
+pub struct NativeProposerOutputPlan {
+    pub topology: String,
+    pub probabilities: String,
+    pub token_ids: NativeValueRef,
+    pub probability_rows: Option<NativeValueRef>,
+    pub parents: Option<NativeValueRef>,
+    pub confidence: Option<NativeValueRef>,
+}
+
+#[napi(object)]
+#[derive(Clone)]
+pub struct NativeTokenMapPlan {
+    pub kind: String,
+    pub fingerprint: String,
+    pub proposer_vocabulary: Option<u32>,
+    pub target_ids: Option<Vec<u32>>,
+}
+
+#[napi(object)]
+#[derive(Clone)]
+pub struct NativeProposerPlan {
+    pub target_prefill_taps: Vec<NativeTargetHiddenTap>,
+    pub target_decode_taps: Vec<NativeTargetHiddenTap>,
+    pub target_verify_taps: Vec<NativeTargetHiddenTap>,
+    pub shared_target_bindings: Vec<NativeSharedTargetBinding>,
+    pub stages: Vec<NativeProposerStage>,
+    pub state: NativeProposerStatePlan,
+    pub commit: Option<NativeProposerCommitPlan>,
+    pub output: NativeProposerOutputPlan,
+    pub token_map: NativeTokenMapPlan,
+    pub trained_max_rows: u32,
+}
+
+#[derive(Clone)]
+#[allow(dead_code)]
+struct RetainedStageProgram {
+    executable: Arc<executable::MetalExecutable>,
+    generated: Vec<value::Value>,
+}
+
+#[allow(dead_code)]
+struct RetainedProposerPlan {
+    schema: NativeProposerPlan,
+    stages: Vec<RetainedStageProgram>,
+    shared: Vec<value::Value>,
+    target_decode_prefix_outputs: usize,
+}
+
+fn plan_error(message: impl Into<String>) -> Error {
+    Error::new(
+        Status::InvalidArg,
+        format!("inference[compile]: proposer plan {}", message.into()),
+    )
+}
+
+fn schema_matches(schema: &NativeProposerValueSchema, shape: &[usize], dtype: DType) -> bool {
+    DType::from(schema.dtype) == dtype
+        && schema.shape.len() == shape.len()
+        && schema
+            .shape
+            .iter()
+            .zip(shape)
+            .all(|(declared, actual)| *declared as usize == *actual)
+}
+
+fn validate_plan_ref<'a>(
+    reference: &NativeValueRef,
+    before_stage: usize,
+    plan: &'a NativeProposerPlan,
+) -> Result<Option<NativeProposerValueSchema>> {
+    let metadata = match reference.kind.as_str() {
+        "PendingTokens" | "CandidatePrefix" | "CommittedHistory" => None,
+        "TargetHidden" => {
+            let layer = reference
+                .layer
+                .ok_or_else(|| plan_error("TargetHidden route is missing layer"))?;
+            let tap = plan
+                .target_decode_taps
+                .iter()
+                .find(|tap| tap.layer == layer)
+                .ok_or_else(|| {
+                    plan_error(format!("references undeclared target hidden layer {layer}"))
+                })?;
+            Some(NativeProposerValueSchema {
+                shape: tap.shape.clone(),
+                dtype: tap.dtype,
+            })
+        }
+        "SharedBinding" => {
+            let binding = plan
+                .shared_target_bindings
+                .get(
+                    reference
+                        .binding
+                        .ok_or_else(|| plan_error("SharedBinding route is missing binding"))?
+                        as usize,
+                )
+                .ok_or_else(|| plan_error("references an undeclared shared binding"))?;
+            Some(NativeProposerValueSchema {
+                shape: binding.shape.clone(),
+                dtype: binding.dtype,
+            })
+        }
+        "StageOutput" => {
+            let stage = reference
+                .stage
+                .ok_or_else(|| plan_error("StageOutput route is missing stage"))?
+                as usize;
+            let output = reference
+                .output
+                .ok_or_else(|| plan_error("StageOutput route is missing output"))?
+                as usize;
+            if stage >= before_stage {
+                return Err(plan_error(format!(
+                    "stage output {stage}:{output} is not a backward reference"
+                )));
+            }
+            Some(
+                plan.stages
+                    .get(stage)
+                    .and_then(|stage| stage.outputs.get(output))
+                    .cloned()
+                    .ok_or_else(|| {
+                        plan_error(format!("references missing stage output {stage}:{output}"))
+                    })?,
+            )
+        }
+        kind => return Err(plan_error(format!("has unknown ValueRef kind {kind}"))),
+    };
+    if reference.kind != "TargetHidden" && reference.layer.is_some()
+        || reference.kind != "SharedBinding" && reference.binding.is_some()
+        || reference.kind != "StageOutput"
+            && (reference.stage.is_some() || reference.output.is_some())
+        || reference.kind != "TargetHidden" && reference.select_row == Some(true)
+    {
+        return Err(plan_error(
+            "ValueRef has fields that do not belong to its kind",
+        ));
+    }
+    let Some(mut metadata) = metadata else {
+        if reference.row.is_some() || reference.select_row == Some(true) {
+            return Err(plan_error(
+                "cannot select a row from a dynamic token ValueRef",
+            ));
+        }
+        return Ok(None);
+    };
+    if reference.row.is_some() && reference.select_row == Some(true) {
+        return Err(plan_error(
+            "ValueRef cannot select both a fixed row and the active lane",
+        ));
+    }
+    if let Some(row) = reference
+        .row
+        .or(reference.select_row.filter(|selected| *selected).map(|_| 0))
+    {
+        let rows = metadata
+            .shape
+            .first()
+            .copied()
+            .ok_or_else(|| plan_error("cannot select a row from a scalar value"))?;
+        if row >= rows {
+            return Err(plan_error(format!(
+                "row {row} is outside leading dimension {rows}"
+            )));
+        }
+        metadata.shape.remove(0);
+    }
+    Ok(Some(metadata))
+}
+
+fn validate_and_retain_proposer_plan(
+    plan: NativeProposerPlan,
+    target_prefill: &Executable,
+    target_decode: &Executable,
+    target_verify: Option<&Executable>,
+    stage_executables: Vec<&Executable>,
+    shared_target_tensors: Vec<&NativeTensor>,
+) -> Result<RetainedProposerPlan> {
+    if plan.trained_max_rows == 0 || plan.token_map.fingerprint.is_empty() {
+        return Err(plan_error(
+            "has invalid trainedMaxRows or token-map fingerprint",
+        ));
+    }
+    match plan.token_map.kind.as_str() {
+        "Identity" if plan.token_map.target_ids.is_none() => {}
+        "Table" => {
+            let vocabulary = plan
+                .token_map
+                .proposer_vocabulary
+                .ok_or_else(|| plan_error("table token map is missing proposerVocabulary"))?
+                as usize;
+            let ids = plan
+                .token_map
+                .target_ids
+                .as_ref()
+                .ok_or_else(|| plan_error("table token map is missing targetIds"))?;
+            let target_vocabulary = target_decode
+                .inner
+                .executable
+                .program
+                .outputs
+                .first()
+                .map(|output| {
+                    target_decode.inner.executable.program.values[output.index()].shape[0]
+                })
+                .unwrap_or(0);
+            if ids.len() != vocabulary || ids.iter().any(|id| *id as usize >= target_vocabulary) {
+                return Err(plan_error("table token map has invalid target IDs"));
+            }
+        }
+        kind => return Err(plan_error(format!("has invalid token-map kind {kind}"))),
+    }
+    let validate_taps = |label: &str,
+                         taps: &[NativeTargetHiddenTap],
+                         executable: &Executable,
+                         prefix_outputs: usize|
+     -> Result<()> {
+        let outputs = &executable.inner.executable.program.outputs;
+        let values = &executable.inner.executable.program.values;
+        let mut layers = HashSet::new();
+        for tap in taps {
+            if !layers.insert(tap.layer) {
+                return Err(plan_error(format!(
+                    "declares {label} hidden layer {} twice",
+                    tap.layer
+                )));
+            }
+            let physical_output = (tap.output as usize)
+                .checked_sub(1)
+                .and_then(|root| prefix_outputs.checked_add(root))
+                .ok_or_else(|| {
+                    plan_error(format!(
+                        "{label} hidden tap must reference a non-logits output root"
+                    ))
+                })?;
+            let value = outputs
+                .get(physical_output)
+                .and_then(|output| values.get(output.index()))
+                .ok_or_else(|| {
+                    plan_error(format!("{label} hidden output {} is missing", tap.output))
+                })?;
+            if !schema_matches(
+                &NativeProposerValueSchema {
+                    shape: tap.shape.clone(),
+                    dtype: tap.dtype,
+                },
+                &value.shape,
+                value.dtype,
+            ) {
+                return Err(plan_error(format!(
+                    "{label} hidden output {} metadata does not match",
+                    tap.output
+                )));
+            }
+        }
+        Ok(())
+    };
+    let prefill_prefix = target_prefill
+        .state
+        .as_ref()
+        .map_or(1, |state| state.schema.batch);
+    let decode_prefix = target_decode
+        .state
+        .as_ref()
+        .map_or(1, |state| state.schema.batch);
+    validate_taps(
+        "prefill",
+        &plan.target_prefill_taps,
+        target_prefill,
+        prefill_prefix,
+    )?;
+    validate_taps(
+        "decode",
+        &plan.target_decode_taps,
+        target_decode,
+        decode_prefix,
+    )?;
+    if let Some(target_verify) = target_verify {
+        validate_taps("verify", &plan.target_verify_taps, target_verify, 1)?;
+    } else if !plan.target_verify_taps.is_empty() {
+        return Err(plan_error("declares verify taps without a target verifier"));
+    }
+    let mut shared_kinds = HashSet::new();
+    for binding in &plan.shared_target_bindings {
+        if !matches!(binding.kind.as_str(), "TokenEmbedding" | "LmHead")
+            || binding.name.is_empty()
+            || !shared_kinds.insert(binding.kind.clone())
+        {
+            return Err(plan_error(
+                "has an invalid or duplicate shared target binding",
+            ));
+        }
+        let tensor = shared_target_tensors
+            .get(binding.tensor as usize)
+            .ok_or_else(|| {
+                plan_error(format!("shared tensor index {} is missing", binding.tensor))
+            })?;
+        let value = tensor.val_cloned()?;
+        if !schema_matches(
+            &NativeProposerValueSchema {
+                shape: binding.shape.clone(),
+                dtype: binding.dtype,
+            },
+            value.shape(),
+            value.dtype(),
+        ) {
+            return Err(plan_error(format!(
+                "shared target tensor {} metadata does not match",
+                binding.name
+            )));
+        }
+    }
+    if plan.stages.is_empty() || stage_executables.len() != plan.stages.len() {
+        return Err(plan_error("stage executable count does not match stages"));
+    }
+    for (stage_index, stage) in plan.stages.iter().enumerate() {
+        if stage.executable as usize >= stage_executables.len()
+            || stage.operation_id.is_empty()
+            || stage.layout_id.as_ref().is_some_and(String::is_empty)
+        {
+            return Err(plan_error(format!(
+                "stage {stage_index} has invalid executable or IDs"
+            )));
+        }
+        let executable = stage_executables[stage.executable as usize];
+        let tensor_slots = executable
+            .inner
+            .slots
+            .iter()
+            .enumerate()
+            .filter(|(_, slot)| !slot.scalar)
+            .collect::<Vec<_>>();
+        if executable.inner.slots.iter().any(|slot| slot.scalar)
+            || stage.inputs.len() != tensor_slots.len()
+        {
+            return Err(plan_error(format!(
+                "stage {stage_index} input count does not match executable"
+            )));
+        }
+        let mut slots = HashSet::new();
+        for binding in &stage.inputs {
+            if !slots.insert(binding.slot) {
+                return Err(plan_error(format!(
+                    "stage {stage_index} binds slot {} twice",
+                    binding.slot
+                )));
+            }
+            let declared = executable
+                .inner
+                .slots
+                .get(binding.slot as usize)
+                .filter(|slot| !slot.scalar)
+                .ok_or_else(|| {
+                    plan_error(format!(
+                        "stage {stage_index} binds missing tensor slot {}",
+                        binding.slot
+                    ))
+                })?;
+            if let Some(source) = validate_plan_ref(&binding.value, stage_index, &plan)? {
+                if !schema_matches(&source, &declared.shape, declared.dtype) {
+                    return Err(plan_error(format!(
+                        "stage {stage_index} slot {} route metadata does not match",
+                        binding.slot
+                    )));
+                }
+            }
+        }
+        let outputs = &executable.inner.executable.program.outputs;
+        if stage.outputs.len() != outputs.len() {
+            return Err(plan_error(format!(
+                "stage {stage_index} output count does not match executable"
+            )));
+        }
+        for (schema, output) in stage.outputs.iter().zip(outputs) {
+            let value = &executable.inner.executable.program.values[output.index()];
+            if !schema_matches(schema, &value.shape, value.dtype) {
+                return Err(plan_error(format!(
+                    "stage {stage_index} output metadata does not match executable"
+                )));
+            }
+        }
+    }
+    for reference in [
+        Some(&plan.output.token_ids),
+        plan.output.probability_rows.as_ref(),
+        plan.output.parents.as_ref(),
+        plan.output.confidence.as_ref(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        validate_plan_ref(reference, plan.stages.len(), &plan)?;
+    }
+    if !matches!(plan.output.topology.as_str(), "Chains" | "Trees")
+        || !matches!(
+            plan.output.probabilities.as_str(),
+            "CausalNormalized" | "Deterministic" | "Unavailable"
+        )
+    {
+        return Err(plan_error(
+            "has invalid output topology or probability contract",
+        ));
+    }
+    match plan.state.kind.as_str() {
+        "None" if plan.state.schema_id.is_none() && plan.commit.is_none() => {}
+        "Kv" => match plan.commit.as_ref().map(|commit| commit.kind.as_str()) {
+            Some("AutoregressiveChain") => {
+                let stage = plan
+                    .commit
+                    .as_ref()
+                    .and_then(|commit| commit.stage)
+                    .ok_or_else(|| plan_error("KV chain commit is missing stage"))?;
+                if stage as usize >= plan.stages.len() {
+                    return Err(plan_error("KV chain commit stage is out of range"));
+                }
+            }
+            Some("Replay") => {
+                let stages = plan
+                    .commit
+                    .as_ref()
+                    .and_then(|commit| commit.stages.as_ref())
+                    .ok_or_else(|| plan_error("KV replay commit is missing stages"))?;
+                if stages.is_empty()
+                    || stages
+                        .iter()
+                        .any(|stage| *stage as usize >= plan.stages.len())
+                {
+                    return Err(plan_error("KV replay commit stages are invalid"));
+                }
+            }
+            _ => return Err(plan_error("KV state has an invalid commit plan")),
+        },
+        _ => return Err(plan_error("has invalid state metadata")),
+    }
+
+    // Validation above is side-effect free. Clone every retained native owner only now,
+    // so a failed constructor cannot leave a partially retained plan.
+    let stages = plan
+        .stages
+        .iter()
+        .map(|stage| {
+            let executable = stage_executables[stage.executable as usize];
+            RetainedStageProgram {
+                executable: executable.inner.executable.clone(),
+                generated: executable.inner.generated_bindings.clone(),
+            }
+        })
+        .collect();
+    let shared = plan
+        .shared_target_bindings
+        .iter()
+        .map(|binding| shared_target_tensors[binding.tensor as usize].val_cloned())
+        .collect::<Result<Vec<_>>>()?;
+    Ok(RetainedProposerPlan {
+        schema: plan,
+        stages,
+        shared,
+        target_decode_prefix_outputs: decode_prefix,
+    })
+}
+
+#[allow(dead_code)]
+fn resolve_routed_value(
+    plan: &RetainedProposerPlan,
+    reference: &NativeValueRef,
+    target_outputs: &[value::Value],
+    dynamic: &HashMap<String, value::Value>,
+    stage_outputs: &[Vec<value::Value>],
+    target_row: usize,
+) -> std::result::Result<value::Value, String> {
+    let value = match reference.kind.as_str() {
+        "PendingTokens" | "CandidatePrefix" | "CommittedHistory" => dynamic
+            .get(&reference.kind)
+            .cloned()
+            .ok_or_else(|| format!("route: {} is unbound", reference.kind))?,
+        "TargetHidden" => {
+            let layer = reference
+                .layer
+                .ok_or_else(|| "route: target hidden layer is missing".to_string())?;
+            let tap = plan
+                .schema
+                .target_decode_taps
+                .iter()
+                .find(|tap| tap.layer == layer)
+                .ok_or_else(|| format!("route: target hidden layer {layer} is undeclared"))?;
+            target_outputs
+                .get(
+                    (tap.output as usize)
+                        .checked_sub(1)
+                        .and_then(|root| plan.target_decode_prefix_outputs.checked_add(root))
+                        .ok_or_else(|| "route: target output index overflows".to_string())?,
+                )
+                .cloned()
+                .ok_or_else(|| format!("route: target output {} is unavailable", tap.output))?
+        }
+        "SharedBinding" => {
+            let index = reference
+                .binding
+                .ok_or_else(|| "route: shared binding index is missing".to_string())?
+                as usize;
+            plan.shared[index].clone()
+        }
+        "StageOutput" => stage_outputs
+            .get(
+                reference
+                    .stage
+                    .ok_or_else(|| "route: stage is missing".to_string())? as usize,
+            )
+            .and_then(|outputs| {
+                reference
+                    .output
+                    .and_then(|output| outputs.get(output as usize))
+            })
+            .cloned()
+            .ok_or_else(|| "route: stage output is unavailable".to_string())?,
+        kind => return Err(format!("route: unsupported ValueRef kind {kind}")),
+    };
+    match reference.row.map(|row| row as usize).or_else(|| {
+        reference
+            .select_row
+            .is_some_and(|selected| selected)
+            .then_some(target_row)
+    }) {
+        Some(row) => executable::route_leading_row(&value, row).map(|(value, _copied)| value),
+        None => Ok(value),
+    }
+}
+
+/// Executes the stateless subset of a retained proposer DAG. Intermediate
+/// values stay as native Metal Values and only the explicitly selected result
+/// is returned to its native caller; this helper never creates JS tensor
+/// wrappers or reads device storage back to the host.
+#[allow(dead_code)]
+fn execute_stateless_proposer_dag(
+    plan: &RetainedProposerPlan,
+    target_outputs: &[value::Value],
+    dynamic: &HashMap<String, value::Value>,
+    target_row: usize,
+    cancelled: &effect_torch_runtime::CancellationFlag,
+) -> std::result::Result<Vec<Vec<value::Value>>, String> {
+    if plan.schema.state.kind != "None" {
+        return Err(
+            "route: stateless DAG helper cannot execute a stateful proposer plan".to_string(),
+        );
+    }
+    let mut outputs = Vec::with_capacity(plan.stages.len());
+    for (index, (stage, retained)) in plan.schema.stages.iter().zip(&plan.stages).enumerate() {
+        if retained.executable.state_schema.is_some() {
+            return Err(format!("route: stateless stage {index} has decode state"));
+        }
+        let mut bindings = stage
+            .inputs
+            .iter()
+            .map(|binding| {
+                resolve_routed_value(
+                    plan,
+                    &binding.value,
+                    target_outputs,
+                    dynamic,
+                    &outputs,
+                    target_row,
+                )
+                .map(|value| (binding.slot, value))
+            })
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        bindings.sort_by_key(|(slot, _)| *slot);
+        let bindings = bindings
+            .into_iter()
+            .map(|(_, value)| value)
+            .collect::<Vec<_>>();
+        outputs.push(executable::execute_with_scalars(
+            &retained.executable,
+            &bindings,
+            &retained.generated,
+            &[],
+            cancelled,
+        )?);
+    }
+    Ok(outputs)
 }
 
 #[derive(Default)]
@@ -5212,19 +5874,49 @@ impl NativeInferenceArtifact {
         batch_size: u32,
         token_dtype: NativeDType,
         sampling: NativeInferenceSamplingOptions,
+        proposer_plan: Option<NativeProposerPlan>,
+        stage_executables: Option<Vec<&Executable>>,
+        shared_target_tensors: Option<Vec<&NativeTensor>>,
     ) -> Result<Self> {
-        let target_prefill = inference_program(target_prefill, "prefill", false)?;
-        let target_decode = inference_program(target_decode, "decode", true)?;
+        let generalized = proposer_plan.is_some();
+        if generalized
+            && (proposer_prefill.is_some()
+                || proposer_decode.is_some()
+                || proposer_pool.is_some()
+                || target_verify.is_none()
+                || !max_draft_tokens.is_some_and(|value| value > 0))
+        {
+            return Err(plan_error(
+                "generalized proposer requires only target verify and maxDraftTokens",
+            ));
+        }
+        let target_prefill_program = target_prefill;
+        let target_decode_program = target_decode;
+        let target_verify_program = target_verify;
+        let target_prefill = inference_program(target_prefill, "prefill", false, generalized)?;
+        let target_decode = inference_program(target_decode, "decode", true, generalized)?;
         let target_verify = target_verify
-            .map(|program| validate_speculative_program(program, false))
+            .map(|program| validate_speculative_program(program, false, generalized))
             .transpose()?;
-        let proposer_prefill = proposer_prefill
-            .map(|program| inference_program(program, "proposer", false))
-            .transpose()?;
-        let proposer_decode = proposer_decode
-            .map(|program| inference_program(program, "proposer", true))
-            .transpose()?;
-        let proposer_pool = proposer_pool.map(|pool| pool.inner.clone());
+        let proposer_prefill = if generalized {
+            None
+        } else {
+            proposer_prefill
+                .map(|program| inference_program(program, "proposer", false, false))
+                .transpose()?
+        };
+        let proposer_decode = if generalized {
+            None
+        } else {
+            proposer_decode
+                .map(|program| inference_program(program, "proposer", true, false))
+                .transpose()?
+        };
+        let proposer_pool = if generalized {
+            None
+        } else {
+            proposer_pool.map(|pool| pool.inner.clone())
+        };
         let proposer_complete = proposer_prefill.is_some()
             && proposer_decode.is_some()
             && proposer_pool.is_some()
@@ -5235,7 +5927,7 @@ impl NativeInferenceArtifact {
             && proposer_pool.is_none()
             && target_verify.is_none()
             && max_draft_tokens.is_none();
-        if !proposer_complete && !proposer_empty {
+        if !generalized && !proposer_complete && !proposer_empty {
             return Err(Error::new(
                 Status::InvalidArg,
                 "inference[compile]: proposer requires prefill, decode, pool, target verify and maxDraftTokens",
@@ -5285,6 +5977,34 @@ impl NativeInferenceArtifact {
             }
         }
         let sampling = inference_sampling(sampling)?;
+        let unexpected_plan_handles = proposer_plan.is_none()
+            && (stage_executables
+                .as_ref()
+                .is_some_and(|values| !values.is_empty())
+                || shared_target_tensors
+                    .as_ref()
+                    .is_some_and(|values| !values.is_empty()));
+        let proposer_plan = proposer_plan
+            .map(|plan| {
+                validate_and_retain_proposer_plan(
+                    plan,
+                    target_prefill_program,
+                    target_decode_program,
+                    target_verify_program,
+                    stage_executables.unwrap_or_default(),
+                    shared_target_tensors.unwrap_or_default(),
+                )
+                .map(Arc::new)
+            })
+            .transpose()?;
+        if unexpected_plan_handles {
+            return Err(plan_error("handle arrays require a proposerPlan"));
+        }
+        if proposer_plan.is_some() {
+            return Err(plan_error(
+                "generalized proposer round orchestration is not implemented",
+            ));
+        }
         Ok(Self {
             programs: Arc::new(InferencePrograms {
                 target_prefill,
@@ -5294,9 +6014,14 @@ impl NativeInferenceArtifact {
                 proposer_prefill,
                 proposer_decode,
                 proposer_pool,
-                max_draft_tokens: max_draft_tokens.unwrap_or(0) as usize,
+                max_draft_tokens: if generalized {
+                    0
+                } else {
+                    max_draft_tokens.unwrap_or(0) as usize
+                },
                 batch,
                 sampling,
+                proposer_plan,
             }),
             next_sequence_id: Arc::new(AtomicU64::new(0)),
             next_round_id: Arc::new(AtomicU64::new(0)),
@@ -5326,6 +6051,14 @@ impl NativeInferenceArtifact {
                 receipt: None,
             })),
         }
+    }
+
+    #[napi(getter)]
+    pub fn proposer_plan(&self) -> Option<NativeProposerPlan> {
+        self.programs
+            .proposer_plan
+            .as_ref()
+            .map(|plan| plan.schema.clone())
     }
 
     #[napi(getter)]
@@ -6941,6 +7674,79 @@ mod epilogue_tests {
     use super::*;
     use runtime::metal::device::MetalDevice;
     use runtime::metal::run::MetalTensor;
+
+    fn route(kind: &str) -> NativeValueRef {
+        NativeValueRef {
+            kind: kind.to_string(),
+            layer: None,
+            binding: None,
+            stage: None,
+            output: None,
+            row: None,
+            select_row: None,
+        }
+    }
+
+    fn routing_plan() -> NativeProposerPlan {
+        NativeProposerPlan {
+            target_prefill_taps: vec![],
+            target_decode_taps: vec![NativeTargetHiddenTap {
+                layer: 7,
+                output: 1,
+                shape: vec![2, 3],
+                dtype: NativeDType::F32,
+            }],
+            target_verify_taps: vec![],
+            shared_target_bindings: vec![],
+            stages: vec![NativeProposerStage {
+                executable: 0,
+                operation_id: "ParallelBlock".to_string(),
+                layout_id: Some("block-v1".to_string()),
+                inputs: vec![],
+                outputs: vec![NativeProposerValueSchema {
+                    shape: vec![3],
+                    dtype: NativeDType::F32,
+                }],
+            }],
+            state: NativeProposerStatePlan {
+                kind: "None".to_string(),
+                schema_id: None,
+            },
+            commit: None,
+            output: NativeProposerOutputPlan {
+                topology: "Chains".to_string(),
+                probabilities: "Deterministic".to_string(),
+                token_ids: route("PendingTokens"),
+                probability_rows: None,
+                parents: None,
+                confidence: None,
+            },
+            token_map: NativeTokenMapPlan {
+                kind: "Identity".to_string(),
+                fingerprint: "identity".to_string(),
+                proposer_vocabulary: None,
+                target_ids: None,
+            },
+            trained_max_rows: 2,
+        }
+    }
+
+    #[test]
+    fn proposer_routes_preserve_metadata_and_reject_forward_references() {
+        let plan = routing_plan();
+        let mut hidden = route("TargetHidden");
+        hidden.layer = Some(7);
+        hidden.select_row = Some(true);
+        let metadata = validate_plan_ref(&hidden, 0, &plan).unwrap().unwrap();
+        assert_eq!(metadata.shape, vec![3]);
+        assert_eq!(metadata.dtype, NativeDType::F32);
+
+        let mut prior = route("StageOutput");
+        prior.stage = Some(0);
+        prior.output = Some(0);
+        assert!(validate_plan_ref(&prior, 1, &plan).is_ok());
+        assert!(validate_plan_ref(&prior, 0, &plan).is_err());
+    }
 
     #[test]
     fn stateless_invocation_rejects_state() {

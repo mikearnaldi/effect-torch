@@ -6085,6 +6085,41 @@ pub(super) fn execute_with_scalars(
     }
 }
 
+/// Selects one leading logical row for a later executable binding without a
+/// host round trip. Row zero remains a zero-copy view when its offset is zero;
+/// other rows are materialized by a device copy because executable bindings
+/// deliberately require contiguous, zero-offset storage.
+#[allow(dead_code)] // Called by the retained N-API DAG foundation and its Metal tests.
+pub(super) fn route_leading_row(value: &Value, row: usize) -> Result<(Value, bool), String> {
+    let tensor = value.as_metal()?;
+    let rows = tensor
+        .layout
+        .shape()
+        .first()
+        .copied()
+        .ok_or_else(|| "route: cannot select a row from a scalar".to_string())?;
+    if row >= rows {
+        return Err(format!(
+            "route: row {row} is outside leading dimension {rows}"
+        ));
+    }
+    let layout = effect_torch_runtime::Layout::new(
+        tensor.layout.shape()[1..].to_vec(),
+        tensor.layout.strides()[1..].to_vec(),
+        tensor.layout.offset() + row * tensor.layout.strides()[0],
+    );
+    let view = crate::run::MetalTensor {
+        buffer: tensor.buffer.clone(),
+        layout,
+        dtype: tensor.dtype,
+    };
+    if view.layout.offset() == 0 && view.layout.is_contiguous() {
+        Ok((Value(view), false))
+    } else {
+        Ok((Value(metal_ops::contiguous(&view)?), true))
+    }
+}
+
 /// Executes a stateful (decode) invocation against `kv`, committing
 /// state transactions only when `commit_allowed` passes after the GPU
 /// work completes.
@@ -8273,6 +8308,31 @@ fn execute_op_into(
 mod tests {
     use super::*;
     use effect_torch_graph::{Device, LeafSlot};
+
+    #[test]
+    fn routed_leading_rows_use_view_then_device_copy() {
+        let source = Value(crate::run::MetalTensor::from_f32(
+            device::MetalDevice::get(),
+            vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+            vec![2, 3],
+        ));
+        let (first, first_copied) = route_leading_row(&source, 0).unwrap();
+        assert!(!first_copied);
+        assert_eq!(first.shape(), &[3]);
+        assert!(Arc::ptr_eq(
+            &source.as_metal().unwrap().buffer,
+            &first.as_metal().unwrap().buffer
+        ));
+
+        let (second, second_copied) = route_leading_row(&source, 1).unwrap();
+        assert!(second_copied);
+        assert_eq!(second.shape(), &[3]);
+        assert!(!Arc::ptr_eq(
+            &source.as_metal().unwrap().buffer,
+            &second.as_metal().unwrap().buffer
+        ));
+        assert_eq!(second.to_f32_vec().unwrap(), vec![4.0, 5.0, 6.0]);
+    }
 
     fn leaf(values: Vec<f32>) -> Arc<Node> {
         let length = values.len();
