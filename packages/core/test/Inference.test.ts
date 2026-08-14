@@ -32,6 +32,43 @@ const makeRopeGpt = Effect.gen(function*() {
 
 const ids = (tokens: ReadonlyArray<number>) => Tensor.fromTypedArray(new Uint32Array(tokens), [1, tokens.length])
 
+const historyLookup = (maxDraftTokens: number, minMatchTokens = 1) =>
+  Effect.gen(function*() {
+    const proposer = yield* Speculation.artifact({
+      components: [],
+      plan: {
+        target: { vocabulary: VOCAB },
+        stages: [{
+          operation: {
+            _tag: "HistoryLookup",
+            layout: { id: "suffix-ngram-v1", minMatchTokens, maxMatchTokens: 8 }
+          },
+          inputs: [],
+          outputs: [{ dtype: "u32", shape: ["Rows"] }]
+        }],
+        state: { _tag: "None" },
+        output: {
+          topology: "Chains",
+          probabilities: "Deterministic",
+          tokenIds: { _tag: "StageOutput", stage: 0, output: 0 }
+        },
+        tokenMap: { _tag: "Identity" },
+        trainedMaxRows: maxDraftTokens
+      }
+    })
+    return { proposer, maxDraftTokens }
+  })
+
+const constantOneGpt = Effect.gen(function*() {
+  const model = yield* makeGpt()
+  const initialized = yield* Tensor.compute(yield* model.init)
+  const headWeight = yield* Tensor.zeros([EMBED, VOCAB])
+  const biasValues = new Float32Array(VOCAB)
+  biasValues[1] = 20
+  const headBias = yield* Tensor.fromTypedArray(biasValues, [1, VOCAB])
+  return { model, params: [...initialized.slice(0, -2), headWeight, headBias] }
+})
+
 const argmaxOf = (logits: Tensor.Any) =>
   Effect.gen(function*() {
     const values = yield* Tensor.toNumberArray(logits)
@@ -394,6 +431,93 @@ onDevices("Inference", () => (it) => {
         expect(yield* speculativeFirst.seq.cursor()).toBe(11)
         yield* ordinary.close()
         yield* speculative.close()
+      }))
+
+    it.effect("history lookup is pathwise equal to ordinary seeded sampling", () =>
+      Effect.gen(function*() {
+        const model = yield* makeGpt()
+        const params = yield* Tensor.compute(yield* model.init)
+        const speculation = yield* historyLookup(3)
+        const base = {
+          maxTokens: 64,
+          blockSize: 4,
+          batchSize: 1,
+          sampling: { temperature: 0.8, topK: 8, topP: 0.9, seed: 0x1234_5678n }
+        } as const
+        const ordinary = yield* (yield* Model.inference(model, params, base)).generation()
+        const lookup = yield* (yield* Model.inference(model, params, { ...base, speculation })).generation()
+        let ordinaryPage = (yield* ordinary.add([{ prompt: yield* ids([1, 2, 1, 2]) }]))[0]!
+        let lookupPage = (yield* lookup.add([{ prompt: yield* ids([1, 2, 1, 2]) }]))[0]!
+        expect(lookupPage.tokens).toEqual(ordinaryPage.tokens)
+        for (let round = 0; round < 5; round++) {
+          lookupPage = (yield* lookup.step([{ seq: lookupPage.seq }]))[0]!
+          const expected: Array<number> = []
+          while (expected.length < lookupPage.tokens.length) {
+            ordinaryPage = (yield* ordinary.step([{ seq: ordinaryPage.seq }]))[0]!
+            expected.push(...ordinaryPage.tokens)
+          }
+          expect(lookupPage.tokens).toEqual(expected)
+        }
+        yield* ordinary.close()
+        yield* lookup.close()
+      }))
+
+    it.effect("history lookup emits one token without a match and multiple tokens for repetition", () =>
+      Effect.gen(function*() {
+        const { model, params } = yield* constantOneGpt
+        const noMatchProgram = yield* Model.inference(model, params, {
+          maxTokens: 64,
+          blockSize: 4,
+          batchSize: 1,
+          sampling: { temperature: 0, seed: 9 },
+          speculation: yield* historyLookup(3, 3)
+        })
+        const noMatch = yield* noMatchProgram.generation()
+        const noMatchFirst = (yield* noMatch.add([{ prompt: yield* ids([2, 3, 4]) }]))[0]!
+        const noMatchPage = (yield* noMatch.step([{ seq: noMatchFirst.seq }]))[0]!
+        expect(noMatchPage.tokens).toEqual([1])
+        yield* noMatch.close()
+
+        const repeatedProgram = yield* Model.inference(model, params, {
+          maxTokens: 64,
+          blockSize: 4,
+          batchSize: 1,
+          sampling: { temperature: 0, seed: 9 },
+          speculation: yield* historyLookup(3)
+        })
+        const repeated = yield* repeatedProgram.generation()
+        const repeatedFirst = (yield* repeated.add([{ prompt: yield* ids([1, 1, 1, 1]) }]))[0]!
+        const repeatedPage = (yield* repeated.step([{ seq: repeatedFirst.seq }]))[0]!
+        // The longest prior suffix has one token following it, then verification
+        // contributes the ordinary target bonus.
+        expect(repeatedPage.tokens).toEqual([1, 1])
+        yield* repeated.close()
+      }))
+
+    it.effect("history lookup supports ragged batches, sparse lanes, and output budgets", () =>
+      Effect.gen(function*() {
+        const { model, params } = yield* constantOneGpt
+        const program = yield* Model.inference(model, params, {
+          maxTokens: 64,
+          blockSize: 4,
+          batchSize: 2,
+          sampling: { temperature: 0, seed: 13 },
+          speculation: yield* historyLookup(3)
+        })
+        const generation = yield* program.generation()
+        const first = yield* generation.add([
+          { prompt: yield* ids([1, 1, 1]), maxTokens: 3 },
+          { prompt: yield* ids([2, 3, 4]), maxTokens: 8 }
+        ])
+        const pages = yield* generation.step(first.map(({ seq }) => ({ seq })))
+        expect(pages[0]!.tokens).toEqual([1, 1])
+        expect(pages[0]!.stopReason).toBe("maxTokens")
+        expect(pages[1]!.tokens).toEqual([1])
+        const idleCursor = yield* pages[1]!.seq.cursor()
+        const sparse = (yield* generation.step([{ seq: pages[1]!.seq }]))[0]!
+        expect(sparse.tokens.length).toBeGreaterThan(0)
+        expect(yield* pages[1]!.seq.cursor()).toBe(idleCursor + sparse.tokens.length)
+        yield* generation.close()
       }))
 
     it.effect("speculative pages stop exactly at the remaining output budget", () =>

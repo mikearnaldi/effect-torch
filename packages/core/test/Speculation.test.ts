@@ -92,6 +92,60 @@ onDevices("Speculation", () => (it) => {
         expect(artifact[Speculation.ProposerArtifactTypeId]).toBe(Speculation.ProposerArtifactTypeId)
       }))
 
+    it.effect("accepts only the canonical zero-component history lookup contract", () =>
+      Effect.gen(function*() {
+        const valid: Model.ProposerPlan = {
+          target: { vocabulary: 16 },
+          stages: [{
+            operation: {
+              _tag: "HistoryLookup",
+              layout: { id: "suffix-ngram-v1", minMatchTokens: 1, maxMatchTokens: 4 }
+            },
+            inputs: [],
+            outputs: [{ dtype: "u32", shape: ["Rows"] }]
+          }],
+          state: { _tag: "None" },
+          output: {
+            topology: "Chains",
+            probabilities: "Deterministic",
+            tokenIds: { _tag: "StageOutput", stage: 0, output: 0 }
+          },
+          tokenMap: { _tag: "Identity" },
+          trainedMaxRows: 4
+        }
+        const artifact = yield* Speculation.artifact({ components: [], plan: valid })
+        expect(artifact[Speculation.ProposerArtifactTypeId]).toBe(Speculation.ProposerArtifactTypeId)
+
+        const bounds = yield* Effect.flip(Speculation.artifact({
+          components: [],
+          plan: {
+            ...valid,
+            stages: [{
+              operation: {
+                _tag: "HistoryLookup",
+                layout: { id: "suffix-ngram-v1", minMatchTokens: 4, maxMatchTokens: 3 }
+              },
+              inputs: [],
+              outputs: [{ dtype: "u32", shape: ["Rows"] }]
+            }]
+          }
+        }))
+        expect(bounds.message).toMatch(/positive integer match bounds/)
+
+        const probabilityRows = yield* Effect.flip(Speculation.artifact({
+          components: [],
+          plan: {
+            ...valid,
+            output: {
+              ...valid.output,
+              probabilities: "CausalNormalized",
+              probabilityRows: { _tag: "StageOutput", stage: 0, output: 0 }
+            }
+          }
+        }))
+        expect(probabilityRows.message).toMatch(/probabilityRows|HistoryLookup requires/)
+      }))
+
     it.effect("rejects forward, missing-output, and duplicate-slot references", () =>
       Effect.gen(function*() {
         const block = yield* Model.embedding("block", 16, 8)

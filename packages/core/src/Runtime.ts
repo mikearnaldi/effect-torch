@@ -1246,6 +1246,12 @@ export interface InferenceProposerPlan {
   readonly stages: ReadonlyArray<{
     readonly operationId: string
     readonly layoutId?: string
+    /** Complete backend-neutral configuration of a deterministic history intrinsic. */
+    readonly historyLookup?: {
+      readonly id: "suffix-ngram-v1"
+      readonly minMatchTokens: number
+      readonly maxMatchTokens: number
+    }
     readonly inputs: ReadonlyArray<{ readonly slot: number; readonly value: InferenceValueRoute }>
     readonly outputs: ReadonlyArray<InferenceValueSchema>
   }>

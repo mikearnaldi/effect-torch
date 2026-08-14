@@ -1605,7 +1605,9 @@ export interface TreeSearchLayout {
   readonly maxChildren: number
 }
 export interface HistoryLookupLayout {
-  readonly id: string
+  readonly id: "suffix-ngram-v1"
+  readonly minMatchTokens: number
+  readonly maxMatchTokens: number
 }
 export type TargetPathId = string
 
@@ -1945,8 +1947,16 @@ const makeProposerArtifact = (
           if (!nonEmptyId(operation.path)) return yield* invalidProposer(`stage ${index} target path must not be empty`)
           break
         case "HistoryLookup":
-          if (!nonEmptyId(operation.layout?.id)) {
-            return yield* invalidProposer(`stage ${index} HistoryLookup layout id must not be empty`)
+          if (
+            operation.layout?.id !== "suffix-ngram-v1" ||
+            !Number.isSafeInteger(operation.layout.minMatchTokens) || operation.layout.minMatchTokens <= 0 ||
+            !Number.isSafeInteger(operation.layout.maxMatchTokens) ||
+            operation.layout.maxMatchTokens < operation.layout.minMatchTokens ||
+            operation.layout.maxMatchTokens > 0xffff_ffff
+          ) {
+            return yield* invalidProposer(
+              `stage ${index} HistoryLookup requires suffix-ngram-v1 with positive integer match bounds and minMatchTokens <= maxMatchTokens`
+            )
           }
           break
         default:
@@ -2080,6 +2090,24 @@ const makeProposerArtifact = (
         (schema.shape.length !== 1 || !schema.dtype.startsWith("f") && schema.dtype !== "bf16")
       ) {
         return yield* invalidProposer("confidence must reference a rank-1 floating output")
+      }
+    }
+    const historyLookup = stages[0]?.operation._tag === "HistoryLookup"
+    if (historyLookup || stages.some((stage) => stage.operation._tag === "HistoryLookup")) {
+      const stage = stages[0]
+      if (
+        input.components.length !== 0 || stages.length !== 1 || stage?.operation._tag !== "HistoryLookup" ||
+        stage.inputs.length !== 0 ||
+        stage.outputs.length !== 1 || stage.outputs[0]?.shape.length !== 1 ||
+        !["u32", "i64"].includes(stage.outputs[0].dtype) || state._tag !== "None" ||
+        output.topology !== "Chains" || output.probabilities !== "Deterministic" ||
+        output.tokenIds._tag !== "StageOutput" || output.tokenIds.stage !== 0 || output.tokenIds.output !== 0 ||
+        output.probabilityRows !== undefined || output.parents !== undefined || output.confidence !== undefined ||
+        tokenMap._tag !== "Identity"
+      ) {
+        return yield* invalidProposer(
+          "HistoryLookup requires zero components, one input-free stage with one integer token output, state None, Chains, Deterministic, an identity token map, and no probability, parent, or confidence rows"
+        )
       }
     }
     const normalized: NormalizedProposerPlan = {
@@ -2597,10 +2625,12 @@ interface InferencePrograms {
   readonly pool: Tensor.KvPool
   readonly speculation?: {
     readonly verify: Tensor.DecodeProgram
-    readonly proposerPrefill: Tensor.DecodeProgram
-    readonly proposerDecode: Tensor.DecodeProgram
-    readonly proposerPool: Tensor.KvPool
     readonly maxDraftTokens: number
+    readonly proposer?: {
+      readonly prefill: Tensor.DecodeProgram
+      readonly decode: Tensor.DecodeProgram
+      readonly pool: Tensor.KvPool
+    }
     readonly generalized?: NonNullable<Runtime.InferenceCompileRequest["generalizedProposer"]>
   }
 }
@@ -2812,7 +2842,20 @@ const compileProposerPlan = (
     }
     for (let stageIndex = 0; stageIndex < input.plan.stages.length; stageIndex++) {
       const stage = input.plan.stages[stageIndex]!
-      if (stage.operation._tag === "TargetPath" || stage.operation._tag === "HistoryLookup") {
+      if (stage.operation._tag === "HistoryLookup") {
+        const output = stage.outputs[0]!
+        const shape = [config.batchSize * config.speculation!.maxDraftTokens]
+        stages.push({
+          operationId: stage.operation._tag,
+          layoutId: stage.operation.layout.id,
+          historyLookup: stage.operation.layout,
+          inputs: [],
+          outputs: [{ dtype: output.dtype, shape }]
+        })
+        stageValues.push([])
+        continue
+      }
+      if (stage.operation._tag === "TargetPath") {
         return yield* invalidInferenceConfig(
           `stage ${stageIndex} ${stage.operation._tag} has no graph component to compile`
         )
@@ -3061,9 +3104,6 @@ const compileInferencePrograms = (
         pool,
         speculation: {
           verify: verifyTrace.program,
-          proposerPrefill: { ...prefill, handle: generalized.stageExecutables[0]! },
-          proposerDecode: { ...decode, handle: generalized.stageExecutables[0]! },
-          proposerPool: pool,
           maxDraftTokens: config.speculation.maxDraftTokens,
           generalized
         }
@@ -3140,10 +3180,8 @@ const compileInferencePrograms = (
       pool,
       speculation: {
         verify,
-        proposerPrefill,
-        proposerDecode,
-        proposerPool,
-        maxDraftTokens: config.speculation.maxDraftTokens
+        maxDraftTokens: config.speculation.maxDraftTokens,
+        proposer: { prefill: proposerPrefill, decode: proposerDecode, pool: proposerPool }
       }
     }
   })
@@ -3898,6 +3936,10 @@ export const inference = (
                 return values
               })
             const programs = yield* compileInferencePrograms(model, frozenParams, resolved, proposerParams)
+            const exactProposer = programs.speculation !== undefined &&
+                programs.speculation.generalized === undefined && programs.speculation.proposer !== undefined
+              ? { ...programs.speculation.proposer, maxDraftTokens: programs.speculation.maxDraftTokens }
+              : undefined
             const artifact = yield* inferenceBackend(
               "inferenceCompile",
               runtime.extensions.inference.compile({
@@ -3907,14 +3949,14 @@ export const inference = (
                   ...(programs.speculation === undefined ? {} : { verify: programs.speculation.verify.handle }),
                   pool: programs.pool.handle
                 },
-                ...(programs.speculation === undefined || programs.speculation.generalized !== undefined
+                ...(exactProposer === undefined
                   ? {}
                   : {
                     proposer: {
-                      prefill: programs.speculation.proposerPrefill.handle,
-                      decode: programs.speculation.proposerDecode.handle,
-                      pool: programs.speculation.proposerPool.handle,
-                      maxDraftTokens: programs.speculation.maxDraftTokens
+                      prefill: exactProposer.prefill.handle,
+                      decode: exactProposer.decode.handle,
+                      pool: exactProposer.pool.handle,
+                      maxDraftTokens: exactProposer.maxDraftTokens
                     }
                   }),
                 ...(programs.speculation?.generalized === undefined

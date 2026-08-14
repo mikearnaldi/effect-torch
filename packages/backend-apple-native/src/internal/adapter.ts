@@ -1812,16 +1812,27 @@ export const makeRuntime = (
                 shape: [...binding.value.shape],
                 dtype: binding.value.dtype as NativeDType
               })),
-              stages: generalized.plan.stages.map((stage, executable) => ({
-                executable,
-                operationId: stage.operationId,
-                ...(stage.layoutId === undefined ? {} : { layoutId: stage.layoutId }),
-                inputs: stage.inputs.map((input) => ({ slot: input.slot, value: valueRef(input.value) })),
-                outputs: stage.outputs.map((output) => ({
-                  shape: [...output.shape],
-                  dtype: output.dtype as NativeDType
-                }))
-              })),
+              stages: generalized.plan.stages.map((stage, executable) => {
+                return {
+                  ...(stage.operationId === "HistoryLookup" ? {} : { executable }),
+                  operationId: stage.operationId,
+                  ...(stage.layoutId === undefined ? {} : { layoutId: stage.layoutId }),
+                  ...(stage.historyLookup === undefined
+                    ? {}
+                    : {
+                      historyLookup: {
+                        id: stage.historyLookup.id,
+                        minMatchTokens: stage.historyLookup.minMatchTokens,
+                        maxMatchTokens: stage.historyLookup.maxMatchTokens
+                      }
+                    }),
+                  inputs: stage.inputs.map((input) => ({ slot: input.slot, value: valueRef(input.value) })),
+                  outputs: stage.outputs.map((output) => ({
+                    shape: [...output.shape],
+                    dtype: output.dtype as NativeDType
+                  }))
+                }
+              }),
               state: generalized.plan.state.kind === "None"
                 ? { kind: "None" }
                 : {

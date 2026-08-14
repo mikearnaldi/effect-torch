@@ -413,6 +413,13 @@ enum StageOperation {
     HistoryLookup { layout: HistoryLookupLayout },
 }
 
+struct HistoryLookupLayout {
+    // The only stable deterministic retrieval contract in Phase 3.
+    id: "suffix-ngram-v1",
+    min_match_tokens: u32,
+    max_match_tokens: u32,
+}
+
 enum ProposerState {
     None,
     Kv { schema: DecodeStateSchema, commit: CommitPlan },
@@ -715,6 +722,17 @@ no model state. It uses target-sample matching. It is useful for repetitive or
 editing workloads and as the simplest deterministic-proposer conformance test,
 but it is not the architecture or performance foundation.
 
+Phase 3 standardizes one layout, `suffix-ngram-v1`. For each lane it searches
+committed history for a previous occurrence of the longest suffix whose length
+is within inclusive `minMatchTokens..=maxMatchTokens`, then proposes the tokens
+that followed that occurrence, capped by `maxDraftTokens`. A miss produces no
+candidate rows, so the ordinary target draw publishes a one-token page. Ties
+between occurrences are resolved by the most recent occurrence. The artifact
+has zero components, `None` state, chain topology, deterministic probabilities,
+an input-free intrinsic stage, an identity token map, and no probability rows. Its generalized compile request
+contains no proposer executable or proposer pool: only target prefill, decode,
+and packed verification programs are compiled.
+
 ### Lookahead and Jacobi-style proposals
 
 Parallel fixed-point iterations can emit several chains. They lower to packed
@@ -851,10 +869,11 @@ length, and concurrent sessions.
 
 **Status: In progress.** Structural plans, graph/checkpoint and target-value
 validation, multi-input/multi-output stage tracing, immutable stage compilation,
-and direct CPU/Metal native value-routing primitives are implemented. Native
-round orchestration still rejects generalized plans before sequence creation;
-`ParallelBlock`, `SequentialHead`, tree verification, and history lookup are not
-yet executable generation strategies.
+direct CPU/Metal native value-routing primitives, and complete CPU/Metal
+`suffix-ngram-v1` history-lookup rounds are implemented. Native round
+orchestration for other generalized plans remains incomplete;
+`ParallelBlock`, `SequentialHead`, and tree verification are not yet executable
+generation strategies.
 
 1. Add ephemeral native target hidden-tap routing and shared embedding/LM-head
    bindings declared by `ValueRef` and `TargetContract`.

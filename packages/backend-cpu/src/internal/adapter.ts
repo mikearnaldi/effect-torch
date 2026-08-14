@@ -1440,6 +1440,15 @@ export const makeRuntime = (
     stages: plan.stages.map((stage) => ({
       operationId: stage.operationId,
       ...(stage.layoutId === undefined ? {} : { layoutId: stage.layoutId }),
+      ...(stage.historyLookup === undefined
+        ? {}
+        : {
+          historyLookup: {
+            id: stage.historyLookup.id,
+            minMatchTokens: stage.historyLookup.minMatchTokens,
+            maxMatchTokens: stage.historyLookup.maxMatchTokens
+          }
+        }),
       inputs: stage.inputs.map((input) => ({ slot: input.slot, value: inferenceValueRef(input.value) })),
       outputs: stage.outputs.map((output) => ({ dtype: output.dtype as NativeDType, shape: [...output.shape] }))
     })),

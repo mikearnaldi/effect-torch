@@ -119,6 +119,11 @@ export interface NativeInferenceProposerPlan {
   stages: Array<{
     operationId: string
     layoutId?: string
+    historyLookup?: {
+      id: "suffix-ngram-v1"
+      minMatchTokens: number
+      maxMatchTokens: number
+    }
     inputs: Array<{ slot: number; value: NativeInferenceValueRef }>
     outputs: Array<NativeInferenceValueMetadata>
   }>

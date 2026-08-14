@@ -302,9 +302,14 @@ export interface NativeStageInputBinding {
 
 /** One executable in the generalized proposer DAG. @internal */
 export interface NativeProposerStage {
-  executable: number
+  executable?: number
   operationId: string
   layoutId?: string
+  historyLookup?: {
+    id: "suffix-ngram-v1"
+    minMatchTokens: number
+    maxMatchTokens: number
+  }
   inputs: Array<NativeStageInputBinding>
   outputs: Array<NativeProposerValueSchema>
 }

@@ -4347,6 +4347,189 @@ fn cut_speculative_page(page: &mut Vec<u32>, eos_tokens: &[u32], page_limit: u32
     page.truncate(page_limit as usize);
 }
 
+fn history_lookup(
+    history: &[u32],
+    min_match_tokens: usize,
+    max_match_tokens: usize,
+    max_draft_tokens: usize,
+) -> Vec<u32> {
+    if max_draft_tokens == 0 || history.len() <= min_match_tokens {
+        return Vec::new();
+    }
+    let max_match_tokens = max_match_tokens.min(history.len() - 1);
+    for width in (min_match_tokens..=max_match_tokens).rev() {
+        let suffix = history.len() - width;
+        for start in (0..suffix).rev() {
+            if history[start..start + width] == history[suffix..] {
+                return history[start + width..]
+                    .iter()
+                    .copied()
+                    .take(max_draft_tokens)
+                    .collect();
+            }
+        }
+    }
+    Vec::new()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn execute_history_lookup_blocking(
+    target: &SpeculativeProgram,
+    target_shadow: &mut ShadowSequences,
+    slots: &[usize],
+    pending: &[u32],
+    histories: &[Vec<u32>],
+    sampling: &[SamplingOptions],
+    config: HistoryLookupConfig,
+    max_draft_tokens: usize,
+    page_limits: &[u32],
+    eos_tokens: &[Vec<u32>],
+    cancelled: &effect_torch_runtime::CancellationFlag,
+    sequence_ids: &[u64],
+    positions: &[u64],
+    stats: &mut SpeculativeStats,
+) -> err::Res<Vec<Vec<u32>>> {
+    let proposal_limits = target_shadow
+        .states
+        .iter()
+        .zip(page_limits)
+        .map(|(state, limit)| {
+            let cursor = state
+                .lock()
+                .map_err(|error| format!("speculative shadow lock poisoned: {error}"))?
+                .cursor;
+            if cursor >= target.schema.max_tokens {
+                return Err("executeSpeculative: exhausted target sequence cursor".to_string());
+            }
+            Ok(max_draft_tokens
+                .min(*limit as usize - 1)
+                .min(target.schema.max_tokens - cursor - 1))
+        })
+        .collect::<err::Res<Vec<_>>>()?;
+    let draft_started = std::time::Instant::now();
+    let candidates = histories
+        .iter()
+        .zip(&proposal_limits)
+        .map(|(history, limit)| {
+            history_lookup(
+                history,
+                config.min_match_tokens,
+                config.max_match_tokens,
+                *limit,
+            )
+        })
+        .collect::<Vec<_>>();
+    stats.proposed = candidates.iter().map(Vec::len).sum();
+    stats.draft_nanos = draft_started.elapsed().as_nanos().max(1) as u64;
+
+    let verify_tokens = pending
+        .iter()
+        .zip(&candidates)
+        .map(|(pending, candidates)| {
+            std::iter::once(*pending)
+                .chain(candidates.iter().copied())
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    let cursors = target_shadow
+        .states
+        .iter()
+        .map(|state| {
+            state
+                .lock()
+                .map(|state| state.cursor)
+                .map_err(|error| format!("speculative shadow lock poisoned: {error}"))
+        })
+        .collect::<err::Res<Vec<_>>>()?;
+    let packed = packed_verification_plan(
+        target.schema.graph_batch,
+        target
+            .packed_rows_per_sequence
+            .ok_or_else(|| "executeSpeculative: target packed layout is missing".to_string())?,
+        &cursors,
+        &verify_tokens,
+    )?;
+    let verify_started = std::time::Instant::now();
+    let outputs = run_speculative_program(
+        target,
+        target_shadow,
+        &(0..pending.len()).collect::<Vec<_>>(),
+        slots,
+        verify_tokens,
+        Some(&packed),
+        cancelled,
+    )?;
+    stats.verification_nanos = verify_started.elapsed().as_nanos().max(1) as u64;
+    let mut pages = Vec::with_capacity(pending.len());
+    for lane in 0..pending.len() {
+        let mut page = Vec::with_capacity(candidates[lane].len() + 1);
+        let mut accepted = 0;
+        let mut rejected = false;
+        for (candidate_index, &candidate) in candidates[lane].iter().enumerate() {
+            let (matrix, _) = executable::route_leading_row(
+                &outputs[0],
+                packed.row_offsets[lane] + candidate_index,
+            )?;
+            let (logits, _) = executable::route_leading_row(&matrix, 0)?;
+            let target = sample_blocking(
+                &logits,
+                SamplingOptions {
+                    seed: coordinate_seed(
+                        sampling[lane].seed,
+                        sequence_ids[lane],
+                        positions[lane] + candidate_index as u64,
+                        SamplingPurpose::Target,
+                        0,
+                    ),
+                    counter: 0,
+                    ..sampling[lane]
+                },
+                cancelled,
+            )
+            .map_err(|error| error.reason)?;
+            if target == candidate {
+                page.push(candidate);
+                accepted += 1;
+            } else {
+                page.push(target);
+                rejected = true;
+                break;
+            }
+        }
+        if !rejected {
+            let bonus_index = candidates[lane].len();
+            let (matrix, _) =
+                executable::route_leading_row(&outputs[0], packed.row_offsets[lane] + bonus_index)?;
+            let (logits, _) = executable::route_leading_row(&matrix, 0)?;
+            page.push(
+                sample_blocking(
+                    &logits,
+                    SamplingOptions {
+                        seed: coordinate_seed(
+                            sampling[lane].seed,
+                            sequence_ids[lane],
+                            positions[lane] + bonus_index as u64,
+                            SamplingPurpose::Target,
+                            0,
+                        ),
+                        counter: 0,
+                        ..sampling[lane]
+                    },
+                    cancelled,
+                )
+                .map_err(|error| error.reason)?,
+            );
+        }
+        cut_speculative_page(&mut page, &eos_tokens[lane], page_limits[lane]);
+        stats.accepted[lane] = accepted.min(page.len());
+        pages.push(page);
+    }
+    if cancelled.load(Ordering::Relaxed) {
+        return Err("operation aborted".to_string());
+    }
+    Ok(pages)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn execute_speculative_blocking(
     target: &SpeculativeProgram,
@@ -4498,6 +4681,7 @@ fn execute_speculative_blocking(
     for lane in 0..count {
         let mut page = Vec::new();
         let mut rejected = false;
+        let mut accepted = 0;
         for candidate_index in 0..candidates[lane].len() {
             let start = (packed.row_offsets[lane] + candidate_index) * row;
             let p = probabilities(
@@ -4532,9 +4716,7 @@ fn execute_speculative_blocking(
             };
             if accept {
                 page.push(token);
-                if let Some(stats) = stats.as_deref_mut() {
-                    stats.accepted[lane] += 1;
-                }
+                accepted += 1;
                 continue;
             }
             let residual = p
@@ -4607,6 +4789,9 @@ fn execute_speculative_blocking(
             });
         }
         cut_speculative_page(&mut page, &eos_tokens[lane], page_limits[lane]);
+        if let Some(stats) = stats.as_deref_mut() {
+            stats.accepted[lane] = accepted.min(page.len());
+        }
         pages.push(page);
     }
 
@@ -5151,6 +5336,7 @@ struct InferencePrograms {
     batch: usize,
     sampling: InferenceSampling,
     proposer_plan: Option<Arc<RetainedProposerPlan>>,
+    history_lookup: Option<HistoryLookupConfig>,
 }
 
 #[napi(object)]
@@ -5201,11 +5387,20 @@ pub struct NativeStageInputBinding {
 #[napi(object)]
 #[derive(Clone)]
 pub struct NativeProposerStage {
-    pub executable: u32,
+    pub executable: Option<u32>,
     pub operation_id: String,
     pub layout_id: Option<String>,
+    pub history_lookup: Option<NativeHistoryLookupLayout>,
     pub inputs: Vec<NativeStageInputBinding>,
     pub outputs: Vec<NativeProposerValueSchema>,
+}
+
+#[napi(object)]
+#[derive(Clone)]
+pub struct NativeHistoryLookupLayout {
+    pub id: String,
+    pub min_match_tokens: u32,
+    pub max_match_tokens: u32,
 }
 
 #[napi(object)]
@@ -5271,6 +5466,65 @@ struct RetainedProposerPlan {
     stages: Vec<RetainedStageProgram>,
     shared: Vec<value::Value>,
     target_decode_prefix_outputs: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct HistoryLookupConfig {
+    min_match_tokens: usize,
+    max_match_tokens: usize,
+}
+
+fn history_lookup_config(
+    plan: &NativeProposerPlan,
+    stage_executables: &[&Executable],
+    shared_target_tensors: &[&NativeTensor],
+) -> Result<Option<HistoryLookupConfig>> {
+    let is_history = plan.stages.len() == 1 && plan.stages[0].operation_id == "HistoryLookup";
+    if !is_history {
+        return Ok(None);
+    }
+    let stage = &plan.stages[0];
+    let layout = stage.history_lookup.as_ref();
+    let token_output = &plan.output.token_ids;
+    if layout.is_none_or(|layout| {
+        layout.id != "suffix-ngram-v1"
+            || layout.min_match_tokens == 0
+            || layout.min_match_tokens > layout.max_match_tokens
+    }) || stage.layout_id.as_deref() != Some("suffix-ngram-v1")
+        || stage.executable.is_some()
+        || !stage.inputs.is_empty()
+        || stage.outputs.len() != 1
+        || !matches!(DType::from(stage.outputs[0].dtype), DType::U32 | DType::I64)
+        || !stage_executables.is_empty()
+        || !shared_target_tensors.is_empty()
+        || !plan.shared_target_bindings.is_empty()
+        || !plan.target_prefill_taps.is_empty()
+        || !plan.target_decode_taps.is_empty()
+        || !plan.target_verify_taps.is_empty()
+        || plan.state.kind != "None"
+        || plan.state.schema_id.is_some()
+        || plan.commit.is_some()
+        || plan.output.topology != "Chains"
+        || plan.output.probabilities != "Deterministic"
+        || token_output.kind != "StageOutput"
+        || token_output.stage != Some(0)
+        || token_output.output != Some(0)
+        || plan.output.probability_rows.is_some()
+        || plan.output.parents.is_some()
+        || plan.output.confidence.is_some()
+        || plan.token_map.kind != "Identity"
+        || plan.token_map.proposer_vocabulary.is_some()
+        || plan.token_map.target_ids.is_some()
+    {
+        return Err(plan_error(
+            "HistoryLookup requires one native suffix-ngram-v1 deterministic identity chain",
+        ));
+    }
+    let layout = layout.expect("history layout was validated");
+    Ok(Some(HistoryLookupConfig {
+        min_match_tokens: layout.min_match_tokens as usize,
+        max_match_tokens: layout.max_match_tokens as usize,
+    }))
 }
 
 fn plan_error(message: impl Into<String>) -> Error {
@@ -5542,15 +5796,18 @@ fn validate_and_retain_proposer_plan(
         return Err(plan_error("stage executable count does not match stages"));
     }
     for (stage_index, stage) in plan.stages.iter().enumerate() {
-        if stage.executable as usize >= stage_executables.len()
+        if stage
+            .executable
+            .is_none_or(|executable| executable as usize >= stage_executables.len())
             || stage.operation_id.is_empty()
             || stage.layout_id.as_ref().is_some_and(String::is_empty)
+            || stage.history_lookup.is_some()
         {
             return Err(plan_error(format!(
                 "stage {stage_index} has invalid executable or IDs"
             )));
         }
-        let executable = stage_executables[stage.executable as usize];
+        let executable = stage_executables[stage.executable.unwrap() as usize];
         let tensor_slots = executable
             .inner
             .slots
@@ -5667,7 +5924,7 @@ fn validate_and_retain_proposer_plan(
         .stages
         .iter()
         .map(|stage| {
-            let executable = stage_executables[stage.executable as usize];
+            let executable = stage_executables[stage.executable.unwrap() as usize];
             RetainedStageProgram {
                 executable: executable.inner.executable.clone(),
                 generated: executable.inner.generated_bindings.clone(),
@@ -5976,6 +6233,25 @@ impl NativeInferenceArtifact {
                 ));
             }
         }
+        if generalized {
+            let verify = target_verify
+                .as_ref()
+                .expect("generalized verifier was required");
+            let draft = max_draft_tokens.unwrap() as usize;
+            if verify.batch != batch
+                || verify.token_dtype != dtype
+                || verify.vocabulary != target_decode.vocabulary
+                || verify
+                    .packed_rows_per_sequence
+                    .is_none_or(|rows| draft + 1 > rows)
+                || !compatible_pool(verify, &target_pool.inner)
+            {
+                return Err(Error::new(
+                    Status::InvalidArg,
+                    "inference[compile]: incompatible generalized target verifier",
+                ));
+            }
+        }
         let sampling = inference_sampling(sampling)?;
         let unexpected_plan_handles = proposer_plan.is_none()
             && (stage_executables
@@ -5984,23 +6260,51 @@ impl NativeInferenceArtifact {
                 || shared_target_tensors
                     .as_ref()
                     .is_some_and(|values| !values.is_empty()));
+        let stage_executables = stage_executables.unwrap_or_default();
+        let shared_target_tensors = shared_target_tensors.unwrap_or_default();
+        let history_lookup = proposer_plan
+            .as_ref()
+            .map(|plan| history_lookup_config(plan, &stage_executables, &shared_target_tensors))
+            .transpose()?
+            .flatten();
+        if history_lookup.is_some_and(|_| {
+            proposer_plan
+                .as_ref()
+                .is_some_and(|plan| plan.trained_max_rows < max_draft_tokens.unwrap_or(0))
+        }) {
+            return Err(plan_error(
+                "HistoryLookup maxDraftTokens exceeds trainedMaxRows",
+            ));
+        }
         let proposer_plan = proposer_plan
             .map(|plan| {
-                validate_and_retain_proposer_plan(
-                    plan,
-                    target_prefill_program,
-                    target_decode_program,
-                    target_verify_program,
-                    stage_executables.unwrap_or_default(),
-                    shared_target_tensors.unwrap_or_default(),
-                )
+                if history_lookup.is_some() {
+                    Ok(RetainedProposerPlan {
+                        schema: plan,
+                        stages: Vec::new(),
+                        shared: Vec::new(),
+                        target_decode_prefix_outputs: target_decode_program
+                            .state
+                            .as_ref()
+                            .map_or(1, |state| state.schema.batch),
+                    })
+                } else {
+                    validate_and_retain_proposer_plan(
+                        plan,
+                        target_prefill_program,
+                        target_decode_program,
+                        target_verify_program,
+                        stage_executables,
+                        shared_target_tensors,
+                    )
+                }
                 .map(Arc::new)
             })
             .transpose()?;
         if unexpected_plan_handles {
             return Err(plan_error("handle arrays require a proposerPlan"));
         }
-        if proposer_plan.is_some() {
+        if proposer_plan.is_some() && history_lookup.is_none() {
             return Err(plan_error(
                 "generalized proposer round orchestration is not implemented",
             ));
@@ -6014,14 +6318,11 @@ impl NativeInferenceArtifact {
                 proposer_prefill,
                 proposer_decode,
                 proposer_pool,
-                max_draft_tokens: if generalized {
-                    0
-                } else {
-                    max_draft_tokens.unwrap_or(0) as usize
-                },
+                max_draft_tokens: max_draft_tokens.unwrap_or(0) as usize,
                 batch,
                 sampling,
                 proposer_plan,
+                history_lookup,
             }),
             next_sequence_id: Arc::new(AtomicU64::new(0)),
             next_round_id: Arc::new(AtomicU64::new(0)),
@@ -6122,6 +6423,7 @@ struct InferenceLane {
     eos: Vec<u32>,
     terminal: Option<String>,
     sampling: InferenceSampling,
+    history: Vec<u32>,
 }
 
 #[derive(Clone)]
@@ -6450,6 +6752,11 @@ impl NativeInferenceSession {
                     // Admission overrides apply only to the first page; later
                     // rounds resolve sparse overrides from artifact defaults.
                     sampling: programs.sampling,
+                    history: prompts[index]
+                        .iter()
+                        .copied()
+                        .chain(std::iter::once(policies[index].0))
+                        .collect(),
                 });
             }
             let receipt = Receipt {
@@ -6604,7 +6911,59 @@ impl NativeInferenceSession {
                 .map(inference_options)
                 .collect::<Vec<_>>();
             let (pages, mut proposer_shadow, proposer_states) =
-                if let (Some(verify), Some(decode), Some(pool)) = (
+                if let (Some(verify), Some(config)) =
+                    (&programs.target_verify, programs.history_lookup)
+                {
+                    let histories = selected
+                        .iter()
+                        .map(|lane| lane.history.clone())
+                        .collect::<Vec<_>>();
+                    let mut stats = SpeculativeStats {
+                        accepted: vec![0; selected.len()],
+                        ..SpeculativeStats::default()
+                    };
+                    let pages = execute_history_lookup_blocking(
+                        verify,
+                        &mut target_shadow,
+                        &slots,
+                        &pending,
+                        &histories,
+                        &options,
+                        config,
+                        programs.max_draft_tokens,
+                        &page_limits,
+                        &eos,
+                        cancelled,
+                        &ids,
+                        &positions,
+                        &mut stats,
+                    )
+                    .map_err(to_napi_err)?;
+                    diagnostics
+                        .speculative_rounds
+                        .fetch_add(1, Ordering::Relaxed);
+                    diagnostics
+                        .proposed_tokens
+                        .fetch_add(stats.proposed as u64, Ordering::Relaxed);
+                    diagnostics.accepted_tokens.fetch_add(
+                        stats.accepted.iter().sum::<usize>() as u64,
+                        Ordering::Relaxed,
+                    );
+                    diagnostics
+                        .draft_nanos
+                        .fetch_add(stats.draft_nanos, Ordering::Relaxed);
+                    diagnostics
+                        .verification_nanos
+                        .fetch_add(stats.verification_nanos, Ordering::Relaxed);
+                    if let Ok(mut histogram) = diagnostics.accepted_length_histogram.lock() {
+                        for accepted in stats.accepted {
+                            if let Some(count) = histogram.get_mut(accepted) {
+                                *count += 1;
+                            }
+                        }
+                    }
+                    (pages, None, Vec::new())
+                } else if let (Some(verify), Some(decode), Some(pool)) = (
                     &programs.target_verify,
                     &programs.proposer_decode,
                     &programs.proposer_pool,
@@ -6716,6 +7075,7 @@ impl NativeInferenceSession {
                 let lane = session.lanes[slots[index]].as_mut().unwrap();
                 lane.pending = *page.last().expect("native pages are nonempty");
                 lane.generated += page.len() as u64;
+                lane.history.extend_from_slice(&page);
                 let terminal = if page.iter().any(|token| lane.eos.contains(token)) {
                     Some("eos".to_string())
                 } else if lane.max_tokens.is_some_and(|limit| lane.generated >= limit) {
@@ -7699,9 +8059,10 @@ mod epilogue_tests {
             target_verify_taps: vec![],
             shared_target_bindings: vec![],
             stages: vec![NativeProposerStage {
-                executable: 0,
+                executable: Some(0),
                 operation_id: "ParallelBlock".to_string(),
                 layout_id: Some("block-v1".to_string()),
+                history_lookup: None,
                 inputs: vec![],
                 outputs: vec![NativeProposerValueSchema {
                     shape: vec![3],
@@ -7746,6 +8107,46 @@ mod epilogue_tests {
         prior.output = Some(0);
         assert!(validate_plan_ref(&prior, 1, &plan).is_ok());
         assert!(validate_plan_ref(&prior, 0, &plan).is_err());
+    }
+
+    #[test]
+    fn only_exact_native_history_lookup_plan_is_recognized() {
+        let mut plan = routing_plan();
+        plan.target_decode_taps.clear();
+        plan.stages[0] = NativeProposerStage {
+            executable: None,
+            operation_id: "HistoryLookup".to_string(),
+            layout_id: Some("suffix-ngram-v1".to_string()),
+            history_lookup: Some(NativeHistoryLookupLayout {
+                id: "suffix-ngram-v1".to_string(),
+                min_match_tokens: 2,
+                max_match_tokens: 8,
+            }),
+            inputs: vec![],
+            outputs: vec![NativeProposerValueSchema {
+                shape: vec![8],
+                dtype: NativeDType::U32,
+            }],
+        };
+        plan.output.token_ids = NativeValueRef {
+            kind: "StageOutput".to_string(),
+            layer: None,
+            binding: None,
+            stage: Some(0),
+            output: Some(0),
+            row: None,
+            select_row: None,
+        };
+        assert_eq!(
+            history_lookup_config(&plan, &[], &[]).unwrap(),
+            Some(HistoryLookupConfig {
+                min_match_tokens: 2,
+                max_match_tokens: 8,
+            })
+        );
+
+        plan.output.topology = "Trees".to_string();
+        assert!(history_lookup_config(&plan, &[], &[]).is_err());
     }
 
     #[test]
@@ -7865,6 +8266,57 @@ mod epilogue_tests {
         assert!(packed_verification_plan(4, 2, &[0, 0], &[vec![1, 2], vec![3, 4, 5]]).is_err());
         assert!(packed_verification_plan(3, 2, &[0, 0], &[vec![1, 2], vec![3, 4]]).is_err());
         assert!(packed_verification_plan(4, 2, &[0], &[vec![1], vec![2]]).is_err());
+    }
+
+    #[test]
+    fn history_lookup_prefers_longest_suffix_then_most_recent_continuation() {
+        assert_eq!(
+            history_lookup(&[1, 2, 3, 7, 1, 2, 3, 8, 1, 2, 3], 2, 3, 4),
+            [8, 1, 2, 3]
+        );
+        assert_eq!(
+            history_lookup(&[4, 5, 6, 4, 5, 7, 4, 5], 2, 2, 3),
+            [7, 4, 5]
+        );
+        assert!(history_lookup(&[1, 2, 3], 2, 4, 3).is_empty());
+    }
+
+    #[test]
+    fn history_lookup_applies_independent_ragged_lane_caps() {
+        let histories = [vec![1, 2, 9, 1, 2], vec![3, 4, 5, 3, 4]];
+        let limits = [1, 3];
+        let candidates = histories
+            .iter()
+            .zip(limits)
+            .map(|(history, limit)| history_lookup(history, 2, 2, limit))
+            .collect::<Vec<_>>();
+        assert_eq!(candidates, [vec![9], vec![5, 3, 4]]);
+    }
+
+    #[test]
+    fn history_lookup_target_shadow_is_rollback_safe_and_publishes_only_cut_tokens() {
+        let pool = NativeKvPool::new(0, 0, 0, 16, Some(4), Some(NativeDType::F32), None).unwrap();
+        let sequence = seed_sequence(&pool, &[1, 2, 3]);
+        let states = vec![sequence.state.clone()];
+        let visible = vec![1, 2, 3, 10];
+        let before = canonical_snapshot(&sequence.state);
+        {
+            let shadow = ShadowSequences::new(pool.inner.clone(), &states).unwrap();
+            stage_speculative_rows(&shadow, &[10, 20, 21, 22]);
+        }
+        assert_eq!(canonical_snapshot(&sequence.state), before);
+        assert_eq!(visible, [1, 2, 3, 10]);
+
+        let mut shadow = ShadowSequences::new(pool.inner.clone(), &states).unwrap();
+        stage_speculative_rows(&shadow, &[10, 20, 21, 22]);
+        let mut page = vec![20, 21, 22, 99];
+        cut_speculative_page(&mut page, &[21], 3);
+        publish_speculative_states(&mut shadow, &states, &[10], std::slice::from_ref(&page));
+        let mut committed_history = visible;
+        committed_history.extend_from_slice(&page);
+        assert_eq!(page, [20, 21]);
+        assert_eq!(committed_history, [1, 2, 3, 10, 20, 21]);
+        assert_eq!(sequence.state.lock().unwrap().cursor, 5);
     }
 
     #[test]
