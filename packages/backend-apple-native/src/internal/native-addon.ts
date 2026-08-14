@@ -28,6 +28,7 @@ export declare class CancellationToken {
 export declare class Executable {
   get stateful(): boolean
   get batch(): number
+  get packedRowsPerSequence(): number | undefined
   get allowsWindowEviction(): boolean
   get layers(): number
   get kvHeads(): number
@@ -62,6 +63,18 @@ export declare class Executable {
     sampling: Array<NativeSamplingOptions>,
     token?: CancellationToken | undefined | null
   ): Promise<Array<number>>
+  executeSpeculative(
+    proposer: Executable,
+    targetSequences: Array<NativeKvSequence>,
+    proposerSequences: Array<NativeKvSequence>,
+    slots: Array<number>,
+    pendingTokens: Array<number>,
+    sampling: Array<NativeSamplingOptions>,
+    maxDraftTokens: number,
+    pageLimits: Array<number>,
+    eosTokens: Array<Array<number>>,
+    token?: CancellationToken | undefined | null
+  ): Promise<Array<Array<number>>>
 }
 
 /**
@@ -227,6 +240,109 @@ export declare class NativeKvSequence {
   prefillMatch(tokens: Array<number>): number
 }
 
+/** Immutable validated bundle used to open cohesive native inference sessions. @internal */
+export declare class NativeInferenceArtifact {
+  constructor(
+    targetPrefill: Executable,
+    targetDecode: Executable,
+    targetVerify: Executable | undefined | null,
+    targetPool: NativeKvPool,
+    proposerPrefill: Executable | undefined | null,
+    proposerDecode: Executable | undefined | null,
+    proposerPool: NativeKvPool | undefined | null,
+    maxDraftTokens: number | undefined | null,
+    batchSize: number,
+    tokenDtype: NativeDType,
+    sampling: NativeInferenceSamplingOptions
+  )
+  open(): NativeInferenceSession
+  get inferenceDiagnostics(): NativeInferenceDiagnostics
+}
+
+/** Native owner of lanes, paired KV state, policy, and durable receipts. @internal */
+export declare class NativeInferenceSession {
+  add(
+    prompts: Array<NativeTensor>,
+    sampling: Array<NativeInferenceSamplingOverride>,
+    maxTokens: Array<number | undefined>,
+    eosTokens: Array<Array<number>>,
+    token?: CancellationToken | undefined | null
+  ): Promise<NativeInferenceRoundResult>
+  runRound(
+    sequences: Array<NativeInferenceSequence>,
+    sampling: Array<NativeInferenceSamplingOverride>,
+    token?: CancellationToken | undefined | null
+  ): Promise<NativeInferenceRoundResult>
+  acknowledge(roundId: bigint): void
+  sequence(sequenceId: bigint): NativeInferenceSequence
+  finish(sequences: Array<NativeInferenceSequence>): void
+  inspect(sequence: NativeInferenceSequence): NativeInferenceInspection
+  close(): void
+}
+
+/** Session-provenanced native sequence identity. @internal */
+export declare class NativeInferenceSequence {
+  get sequenceId(): bigint
+}
+
+/** Lossless cohesive-inference sampling controls. @internal */
+export interface NativeInferenceSamplingOptions {
+  temperature: number
+  topK: number
+  topP: number
+  seed: bigint
+}
+
+/** Partial controls resolved against artifact/lane policy by native code. @internal */
+export interface NativeInferenceSamplingOverride {
+  temperature?: number
+  topK?: number
+  topP?: number
+  seed?: bigint
+}
+
+/** Native token page; the adapter restores its canonical opaque handle. @internal */
+export interface NativeInferencePage {
+  sequenceId: bigint
+  tokens: Array<number>
+  stopReason?: "eos" | "maxTokens"
+}
+
+/** Durable native result retained until `acknowledge`. @internal */
+export interface NativeInferenceRoundResult {
+  roundId: bigint
+  recovered: boolean
+  pages: Array<NativeInferencePage>
+}
+
+/** Native sequence policy/state inspection. @internal */
+export interface NativeInferenceInspection {
+  sequenceId: bigint
+  cursor: bigint
+  terminal?: "eos" | "maxTokens"
+}
+
+/** Artifact-wide cohesive inference counters. @internal */
+export interface NativeInferenceDiagnostics {
+  roundsStarted: bigint
+  roundsCompleted: bigint
+  roundsRecovered: bigint
+  ordinaryRounds: bigint
+  speculativeRounds: bigint
+  proposedTokens: bigint
+  acceptedTokens: bigint
+  emittedTokens: bigint
+  provisionalBlocks: bigint
+  rolledBackBlocks: bigint
+  draftNanos: bigint
+  verificationNanos: bigint
+  acceptedLengthHistogram: Array<bigint>
+  targetPoolHighWaterBlocks: bigint
+  proposerPoolHighWaterBlocks?: bigint
+  lastRoundId?: bigint
+  lastFailurePhase?: string
+}
+
 /** Owning JavaScript wrapper for one materialized Metal tensor. @internal */
 export declare class NativeTensor {
   /**
@@ -369,6 +485,7 @@ export interface NativeKvStateSchema {
   kvDtype: NativeDType
   window?: number
   batch: number
+  packedCausalChains?: { rowsPerSequence: number }
   lastTokenRow?: boolean
 }
 
@@ -442,6 +559,9 @@ export interface NativeAddon {
   readonly LazyTensor: typeof LazyTensor
   readonly NativeKvPool: typeof NativeKvPool
   readonly NativeKvSequence: typeof NativeKvSequence
+  readonly NativeInferenceArtifact: typeof NativeInferenceArtifact
+  readonly NativeInferenceSession: typeof NativeInferenceSession
+  readonly NativeInferenceSequence: typeof NativeInferenceSequence
   readonly NativeTensor: typeof NativeTensor
   readonly compile: typeof compile
   readonly externalMemoryBytes: typeof externalMemoryBytes

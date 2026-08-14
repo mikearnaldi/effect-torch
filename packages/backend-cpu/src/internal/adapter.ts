@@ -19,6 +19,12 @@ import type {
   NativeGgmlKQuant,
   NativeGgufMetadataEntry,
   NativeGgufTensorDescriptor,
+  NativeInferenceArtifact,
+  NativeInferenceRoundResult,
+  NativeInferenceSamplingOptions,
+  NativeInferenceSamplingOverrides,
+  NativeInferenceSequence,
+  NativeInferenceSession,
   NativeKvPool,
   NativeKvSequence,
   NativeKvStateSchema,
@@ -26,7 +32,15 @@ import type {
 } from "./native-addon.js"
 
 type CancellationToken = InstanceType<NativeAddon["CancellationToken"]>
-type HandleKind = "lazy-tensor" | "concrete-tensor" | "executable" | "kv-pool" | "kv-sequence"
+type HandleKind =
+  | "lazy-tensor"
+  | "concrete-tensor"
+  | "executable"
+  | "kv-pool"
+  | "kv-sequence"
+  | "inference-artifact"
+  | "inference-session"
+  | "inference-sequence"
 
 interface HandleRecord {
   readonly owner: object
@@ -126,6 +140,21 @@ interface KvSequenceInfo {
   readonly pool: KvPoolInfo
 }
 
+interface InferenceArtifactInfo {
+  readonly sampling: Runtime.InferenceSamplingOptions
+}
+
+interface InferenceSessionInfo {
+  readonly artifact: Runtime.InferenceArtifactHandle
+  readonly sequences: Map<bigint, Runtime.InferenceSequenceHandle>
+}
+
+interface InferenceSequenceInfo {
+  readonly session: Runtime.InferenceSessionHandle
+  readonly sequenceId: bigint
+  readonly sampling: Runtime.InferenceSamplingOptions
+}
+
 const handleRecords = new WeakMap<object, HandleRecord>()
 // Every adapter module keeps its records private. The shared weak set only lets
 // independently loaded backend modules distinguish a foreign opaque handle from
@@ -149,6 +178,11 @@ const backendError = (
     ? error
     : (() => {
       const message = error instanceof Error ? error.message : String(error)
+      const inferencePhase = message.match(
+        /inference\[(compile|open|admission|prefill|proposer|verify|sample|accept|publish|finish|close|inspect)\]/
+      )?.[1] as
+        | Runtime.InferenceFailurePhase
+        | undefined
       return new Runtime.BackendError({
         reason: message.includes("tensor was cleared")
           ? "invalid-handle"
@@ -159,7 +193,8 @@ const backendError = (
         operation,
         phase,
         message,
-        details: { device, error }
+        details: { device, error },
+        ...(inferencePhase === undefined ? {} : { inferencePhase })
       })
     })()
 
@@ -194,7 +229,7 @@ const cancellable = <A>(
     }
     const abort = () => {
       token.cancel()
-      clearLateValue()
+      if (token.cancelled) clearLateValue()
     }
     if (signal.aborted) abort()
     else signal.addEventListener("abort", abort, { once: true })
@@ -208,7 +243,7 @@ const cancellable = <A>(
     }
     pending.then(
       (value) => {
-        if (signal.aborted) {
+        if (signal.aborted && token.cancelled) {
           lateValue = value
           hasLateValue = true
           clearLateValue()
@@ -395,7 +430,7 @@ export const makeRuntime = (
       pipe(this: Runtime.TensorHandle) {
         return pipeArguments(this, arguments)
       }
-    }) as unknown as H
+    }) as H
   }
   // `node` calls are synchronous, so these fields safely carry one request's
   // JavaScript-only structure and declarations through the native constructor
@@ -1355,7 +1390,314 @@ export const makeRuntime = (
             token
           )
         }
+      ),
+    executeSpeculative: () =>
+      Effect.fail(
+        new Runtime.BackendError({
+          reason: "unsupported-operation",
+          backend: backendName,
+          operation: "executeSpeculative",
+          phase: "execute",
+          message: "executeSpeculative migrated to extensions.inference.runRound"
+        })
       )
+  }
+  const inferenceSampling = (
+    defaults: Runtime.InferenceSamplingOptions,
+    override?: Partial<Runtime.InferenceSamplingOptions>
+  ): NativeInferenceSamplingOptions => ({
+    temperature: override?.temperature ?? defaults.temperature,
+    topK: override?.topK ?? defaults.topK,
+    topP: override?.topP ?? defaults.topP,
+    seed: override?.seed ?? defaults.seed
+  })
+  const nativeInferenceArtifact = (handle: Runtime.InferenceArtifactHandle, operation: string): HandleRecord =>
+    record(handle, "inference-artifact", operation, operation === "inferenceCompile" ? "compile" : "execute")
+  const nativeInferenceSession = (handle: Runtime.InferenceSessionHandle, operation: string): HandleRecord =>
+    record(handle, "inference-session", operation, "execute")
+  const nativeInferenceSequence = (
+    session: Runtime.InferenceSessionHandle,
+    handle: Runtime.InferenceSequenceHandle,
+    operation: string
+  ): NativeInferenceSequence => {
+    const found = record(handle, "inference-sequence", operation, "execute")
+    if ((found.info as InferenceSequenceInfo).session !== session) {
+      throw invalidHandle(operation, "execute", "foreign-handle", "inference-sequence")
+    }
+    return found.value as NativeInferenceSequence
+  }
+  const mapInferenceResult = (
+    sessionHandle: Runtime.InferenceSessionHandle,
+    result: NativeInferenceRoundResult,
+    operation: string,
+    expected: {
+      readonly sequenceIds?: ReadonlyArray<bigint>
+      readonly addSampling?: ReadonlyArray<Runtime.InferenceSamplingOptions>
+    }
+  ): Runtime.InferenceRoundResult => {
+    const expectedCount = expected.sequenceIds?.length ?? expected.addSampling?.length
+    if (
+      typeof result.roundId !== "bigint" || result.roundId < 0n || typeof result.recovered !== "boolean" ||
+      !Array.isArray(result.pages) || expectedCount === undefined || result.pages.length !== expectedCount
+    ) {
+      throw new Error(`${operation}: native inference returned a malformed receipt`)
+    }
+    const sessionRecord = nativeInferenceSession(sessionHandle, operation)
+    const session = sessionRecord.value as NativeInferenceSession
+    const info = sessionRecord.info as InferenceSessionInfo
+    const seen = new Set<bigint>()
+    for (let index = 0; index < result.pages.length; index++) {
+      const page = result.pages[index]!
+      if (
+        typeof page.sequenceId !== "bigint" || page.sequenceId < 0n || seen.has(page.sequenceId) ||
+        (expected.sequenceIds !== undefined && page.sequenceId !== expected.sequenceIds[index]) ||
+        !Array.isArray(page.tokens) ||
+        page.tokens.length === 0 ||
+        page.tokens.some((token) => !Number.isInteger(token) || token < 0 || token > 0xffff_ffff) ||
+        (page.stopReason !== undefined && page.stopReason !== "eos" && page.stopReason !== "maxTokens")
+      ) throw new Error(`${operation}: native inference returned a malformed token page`)
+      seen.add(page.sequenceId)
+    }
+    if (
+      expected.addSampling !== undefined &&
+      result.pages.some((page, index) => index > 0 && page.sequenceId !== result.pages[0]!.sequenceId + BigInt(index))
+    ) throw new Error(`${operation}: native inference returned token pages out of order`)
+    const staged = result.pages.map((page, index) => {
+      const existing = info.sequences.get(page.sequenceId)
+      const sampling = expected.addSampling?.[index]
+      if (expected.sequenceIds !== undefined) {
+        if (existing === undefined) throw new Error(`${operation}: native inference returned an unknown sequence`)
+        return { id: page.sequenceId, sequence: existing, fresh: false as const }
+      }
+      if (existing !== undefined) {
+        const existingSampling =
+          (record(existing, "inference-sequence", operation, "execute").info as InferenceSequenceInfo)
+            .sampling
+        if (
+          !result.recovered || sampling === undefined || existingSampling.temperature !== sampling.temperature ||
+          existingSampling.topK !== sampling.topK || existingSampling.topP !== sampling.topP ||
+          existingSampling.seed !== sampling.seed
+        ) throw new Error(`${operation}: native inference returned an existing sequence`)
+        return { id: page.sequenceId, sequence: existing, fresh: false as const }
+      }
+      if (sampling === undefined) throw new Error(`${operation}: native inference returned an unknown sequence`)
+      return {
+        id: page.sequenceId,
+        sequence: wrapOpaque<Runtime.InferenceSequenceHandle>(
+          "inference-sequence",
+          session.sequence(page.sequenceId),
+          {
+            session: sessionHandle,
+            sequenceId: page.sequenceId,
+            sampling
+          } satisfies InferenceSequenceInfo
+        ),
+        fresh: true as const
+      }
+    })
+    for (const entry of staged) {
+      if (entry.fresh) info.sequences.set(entry.id, entry.sequence)
+    }
+    const pages = result.pages.map((page, index) => {
+      return Object.freeze({
+        sequence: staged[index]!.sequence,
+        sequenceId: page.sequenceId,
+        tokens: Object.freeze([...page.tokens]),
+        ...(page.stopReason === undefined ? {} : { stopReason: page.stopReason })
+      })
+    })
+    return Object.freeze({ roundId: result.roundId, recovered: result.recovered, pages: Object.freeze(pages) })
+  }
+  const inferenceRound = (
+    sessionHandle: Runtime.InferenceSessionHandle,
+    operation: string,
+    register: (session: NativeInferenceSession, token: CancellationToken) => Promise<NativeInferenceRoundResult>,
+    expected: Parameters<typeof mapInferenceResult>[3]
+  ): Effect.Effect<Runtime.InferenceRoundResult, Runtime.BackendError> =>
+    cancellableFor(
+      operation,
+      "execute",
+      (token) => register(nativeInferenceSession(sessionHandle, operation).value as NativeInferenceSession, token)
+    ).pipe(
+      Effect.flatMap((result) =>
+        Effect.try({
+          try: () => mapInferenceResult(sessionHandle, result, operation, expected),
+          catch: backendErrorFor(operation, "execute")
+        })
+      )
+    )
+  const inference: Runtime.InferenceRuntime = {
+    compile: (request) =>
+      Effect.try({
+        try: () => {
+          const targetPrefill = nativeExecutable(request.target.prefill, "inferenceCompile").value as NativeExecutable
+          const targetDecode = nativeExecutable(request.target.decode, "inferenceCompile").value as NativeExecutable
+          const targetVerify = request.target.verify === undefined
+            ? undefined
+            : nativeExecutable(request.target.verify, "inferenceCompile").value as NativeExecutable
+          const targetPool = nativePool(request.target.pool, "inferenceCompile").value as NativeKvPool
+          const proposerPrefill = request.proposer === undefined
+            ? undefined
+            : nativeExecutable(request.proposer.prefill, "inferenceCompile").value as NativeExecutable
+          const proposerDecode = request.proposer === undefined
+            ? undefined
+            : nativeExecutable(request.proposer.decode, "inferenceCompile").value as NativeExecutable
+          const proposerPool = request.proposer === undefined
+            ? undefined
+            : nativePool(request.proposer.pool, "inferenceCompile").value as NativeKvPool
+          const value = native.compileInference(
+            targetPrefill,
+            targetDecode,
+            targetVerify,
+            targetPool,
+            proposerPrefill,
+            proposerDecode,
+            proposerPool,
+            request.proposer?.maxDraftTokens ?? 0,
+            request.batchSize,
+            request.tokenDtype as NativeDType,
+            inferenceSampling(request.sampling)
+          )
+          return wrapOpaque<Runtime.InferenceArtifactHandle>(
+            "inference-artifact",
+            value,
+            {
+              sampling: Object.freeze({ ...request.sampling })
+            } satisfies InferenceArtifactInfo
+          )
+        },
+        catch: backendErrorFor("inferenceCompile", "compile", "compilation-failed")
+      }),
+    open: (artifact) =>
+      Effect.try({
+        try: () => {
+          const artifactRecord = nativeInferenceArtifact(artifact, "inferenceOpen")
+          return wrapOpaque<Runtime.InferenceSessionHandle>(
+            "inference-session",
+            (artifactRecord.value as NativeInferenceArtifact).open(),
+            { artifact, sequences: new Map() } satisfies InferenceSessionInfo
+          )
+        },
+        catch: backendErrorFor("inferenceOpen", "execute")
+      }),
+    add: (sessionHandle, request) => {
+      const sessionInfo = nativeInferenceSession(sessionHandle, "inferenceAdd").info as InferenceSessionInfo
+      const artifactInfo = nativeInferenceArtifact(sessionInfo.artifact, "inferenceAdd").info as InferenceArtifactInfo
+      const sampling = request.entries.map((entry) => inferenceSampling(artifactInfo.sampling, entry.sampling))
+      return inferenceRound(sessionHandle, "inferenceAdd", (session, token) =>
+        session.add(
+          request.entries.map((entry) => nativeTensor(entry.prompt, "inferenceAdd")),
+          sampling,
+          request.entries.map((entry) => entry.maxTokens ?? 0),
+          request.entries.map((entry) => [...entry.eosTokens]),
+          token
+        ), { addSampling: sampling.map((options) => Object.freeze({ ...options })) })
+    },
+    runRound: (sessionHandle, request) => {
+      const sessionInfo = nativeInferenceSession(sessionHandle, "inferenceRound").info as InferenceSessionInfo
+      nativeInferenceArtifact(sessionInfo.artifact, "inferenceRound")
+      const sequenceInfos = request.entries.map((entry) => {
+        nativeInferenceSequence(sessionHandle, entry.sequence, "inferenceRound")
+        return record(entry.sequence, "inference-sequence", "inferenceRound", "execute").info as InferenceSequenceInfo
+      })
+      return inferenceRound(sessionHandle, "inferenceRound", (session, token) =>
+        session.runRound(
+          request.entries.map((entry) => nativeInferenceSequence(sessionHandle, entry.sequence, "inferenceRound")),
+          request.entries.map((entry) => ({ ...entry.sampling } satisfies NativeInferenceSamplingOverrides)),
+          token
+        ), { sequenceIds: sequenceInfos.map((info) => info.sequenceId) })
+    },
+    acknowledge: (sessionHandle, roundId) =>
+      Effect.try({
+        try: () => {
+          if (typeof roundId !== "bigint" || roundId < 0n) {
+            throw new Error("inferenceAcknowledge: roundId must be an unsigned bigint")
+          }
+          const session = nativeInferenceSession(sessionHandle, "inferenceAcknowledge").value as NativeInferenceSession
+          session.acknowledge(roundId)
+        },
+        catch: backendErrorFor("inferenceAcknowledge", "execute")
+      }),
+    finish: (sessionHandle, sequences) =>
+      Effect.try({
+        try: () => {
+          const sessionRecord = nativeInferenceSession(sessionHandle, "inferenceFinish")
+          ;(sessionRecord.value as NativeInferenceSession).finish(
+            sequences.map((sequence) => nativeInferenceSequence(sessionHandle, sequence, "inferenceFinish"))
+          )
+          const info = sessionRecord.info as InferenceSessionInfo
+          for (const sequence of sequences) {
+            const found = record(sequence, "inference-sequence", "inferenceFinish", "execute")
+            found.disposed = true
+            info.sequences.delete((found.info as InferenceSequenceInfo).sequenceId)
+          }
+        },
+        catch: backendErrorFor("inferenceFinish", "execute")
+      }),
+    inspect: (sessionHandle, sequence) =>
+      Effect.try({
+        try: () => {
+          const session = nativeInferenceSession(sessionHandle, "inferenceInspect").value as NativeInferenceSession
+          const inspection = session.inspect(nativeInferenceSequence(sessionHandle, sequence, "inferenceInspect"))
+          if (typeof inspection.sequenceId !== "bigint" || typeof inspection.cursor !== "bigint") {
+            throw new Error("inferenceInspect: native inference returned malformed inspection")
+          }
+          return Object.freeze({ ...inspection })
+        },
+        catch: backendErrorFor("inferenceInspect", "execute")
+      }),
+    close: (sessionHandle) =>
+      Effect.try({
+        try: () => {
+          const existing = typeof sessionHandle === "object" && sessionHandle !== null
+            ? handleRecords.get(sessionHandle)
+            : undefined
+          if (
+            existing?.kind === "inference-session" && existing.owner === owner && existing.disposed
+          ) return
+          const sessionRecord = nativeInferenceSession(sessionHandle, "inferenceClose")
+          ;(sessionRecord.value as NativeInferenceSession).close()
+          const info = sessionRecord.info as InferenceSessionInfo
+          for (const sequence of info.sequences.values()) {
+            const found = handleRecords.get(sequence)
+            if (found !== undefined) found.disposed = true
+          }
+          info.sequences.clear()
+          sessionRecord.disposed = true
+        },
+        catch: backendErrorFor("inferenceClose", "execute")
+      }),
+    diagnostics: (artifact) =>
+      Effect.try({
+        try: () => {
+          const value = (nativeInferenceArtifact(artifact, "inferenceDiagnostics").value as NativeInferenceArtifact)
+            .diagnostics()
+          return Object.freeze({
+            roundsStarted: value.roundsStarted,
+            roundsCompleted: value.roundsCompleted,
+            roundsRecovered: value.roundsRecovered,
+            ordinaryRounds: value.ordinaryRounds,
+            speculativeRounds: value.speculativeRounds,
+            proposedTokens: value.proposedTokens,
+            acceptedTokens: value.acceptedTokens,
+            emittedTokens: value.emittedTokens,
+            provisionalBlocks: value.provisionalBlocks,
+            rolledBackBlocks: value.rolledBackBlocks,
+            draftNanos: value.draftNanos,
+            verificationNanos: value.verificationNanos,
+            acceptedLengthHistogram: Object.freeze([...value.acceptedLengthHistogram]),
+            targetPoolHighWaterBlocks: value.targetPoolHighWaterBlocks,
+            ...(value.proposerPoolHighWaterBlocks === undefined
+              ? {}
+              : { proposerPoolHighWaterBlocks: value.proposerPoolHighWaterBlocks }),
+            ...(value.lastRoundId === undefined ? {} : { lastRoundId: value.lastRoundId }),
+            ...(value.lastFailurePhase === undefined
+              ? {}
+              : { lastFailurePhase: value.lastFailurePhase as Runtime.InferenceFailurePhase })
+          })
+        },
+        catch: backendErrorFor("inferenceDiagnostics", "execute")
+      })
   }
   // Direct path I/O borrows tensors on save and transfers newly loaded native
   // tensors to caller-owned concrete handles on success. Safetensors has no
@@ -1609,6 +1951,9 @@ export const makeRuntime = (
               kvDtype: request.state.kvDtype as NativeDType,
               ...(request.state.window === undefined ? {} : { window: request.state.window }),
               batch: request.state.batch,
+              ...(request.state.packedCausalChains === undefined
+                ? {}
+                : { packedCausalChains: { rowsPerSequence: request.state.packedCausalChains.rowsPerSequence } }),
               ...(request.state.lastTokenRow === undefined ? {} : { lastTokenRow: request.state.lastTokenRow })
             }
           const value = native.compile(roots, options, state, executableCacheKey(request))
@@ -1657,6 +2002,13 @@ export const makeRuntime = (
               ? {}
               : { window: request.state.window }),
             ...(request.state.lastTokenRow === undefined ? {} : { lastTokenRow: request.state.lastTokenRow }),
+            ...(request.state.packedCausalChains === undefined
+              ? {}
+              : {
+                packedCausalChains: Object.freeze({
+                  rowsPerSequence: request.state.packedCausalChains.rowsPerSequence
+                })
+              }),
             batch: request.state.batch,
             ...geometry
           })
@@ -1787,6 +2139,7 @@ export const makeRuntime = (
       gguf,
       sampling,
       decode,
+      inference,
       diagnostics: {
         // This is current native memory attributed to live NativeTensor wrappers,
         // unlike executable diagnostics, which contain static planned byte totals.

@@ -1486,6 +1486,188 @@ export class InferenceError extends Data.TaggedError("InferenceError")<{
   readonly message: string
 }> {}
 
+/** Opaque identity carried by validated speculative proposer artifacts. */
+export const ProposerArtifactTypeId: unique symbol = Symbol.for("@effect-torch/core/Model/ProposerArtifact")
+
+/** A proposer component whose parameters are materialized with the target. */
+export interface ProposerComponent {
+  readonly model: Model
+  readonly params: Params
+}
+
+/** Target compatibility required by the first autoregressive proposer. */
+export interface ProposerTargetContract {
+  readonly vocabulary: number
+}
+
+/** One causal proposer stage. Later descriptor variants use the same stage list. */
+export interface AutoregressiveProposerStage {
+  readonly operation: {
+    readonly _tag: "Autoregressive"
+    readonly component: number
+  }
+}
+
+/** KV publication recipe for an autoregressive candidate chain. */
+export interface AutoregressiveProposerState {
+  readonly _tag: "Kv"
+  readonly commit: {
+    readonly _tag: "AutoregressiveChain"
+    readonly stage: number
+  }
+}
+
+/** Output semantics supported by the exact-chain milestone. */
+export interface AutoregressiveProposerOutput {
+  readonly topology: "Chains"
+  readonly probabilities: "CausalNormalized"
+}
+
+/**
+ * Structural first-milestone proposer recipe. It intentionally has no named
+ * algorithm switch: one component is repeatedly executed as a causal KV model.
+ */
+export interface ProposerPlan {
+  readonly target: ProposerTargetContract
+  readonly stages: ReadonlyArray<AutoregressiveProposerStage>
+  readonly state: AutoregressiveProposerState
+  readonly output: AutoregressiveProposerOutput
+  readonly tokenMap: { readonly _tag: "Identity" }
+  readonly trainedMaxRows: number
+}
+
+/** Input validated and retained by {@link Speculation.artifact}. */
+export interface ProposerArtifactInput {
+  readonly components: ReadonlyArray<ProposerComponent>
+  readonly plan: ProposerPlan
+}
+
+/** Opaque validated proposer structure attached to {@link InferenceConfig}. */
+export interface ProposerArtifact {
+  readonly [ProposerArtifactTypeId]: typeof ProposerArtifactTypeId
+}
+
+const proposerArtifactInputs = new WeakMap<ProposerArtifact, ProposerArtifactInput>()
+
+const makeProposerArtifact = (
+  input: ProposerArtifactInput
+): Effect.Effect<ProposerArtifact, InferenceError | ModelError> =>
+  Effect.gen(function*() {
+    if (typeof input !== "object" || input === null || !Array.isArray(input.components)) {
+      return yield* new InferenceError({
+        op: "speculation",
+        message: "proposer artifact input must contain components"
+      })
+    }
+    if (input.components.length !== 1) {
+      return yield* new InferenceError({
+        op: "speculation",
+        message:
+          `the first speculative milestone requires exactly one proposer component, got ${input.components.length}`
+      })
+    }
+    const component = input.components[0]
+    if (
+      typeof component !== "object" || component === null || typeof component.model !== "object" ||
+      component.model === null || !Array.isArray(component.model.names) || !Array.isArray(component.params)
+    ) {
+      return yield* new InferenceError({ op: "speculation", message: "proposer component 0 is malformed" })
+    }
+    yield* checkArity("Speculation.artifact", component.model.names, component.params)
+    const plan = input.plan
+    if (
+      typeof plan !== "object" || plan === null || typeof plan.target !== "object" || plan.target === null ||
+      !Array.isArray(plan.stages) || typeof plan.state !== "object" || plan.state === null ||
+      typeof plan.output !== "object" || plan.output === null || typeof plan.tokenMap !== "object" ||
+      plan.tokenMap === null
+    ) {
+      return yield* new InferenceError({ op: "speculation", message: "proposer plan is malformed" })
+    }
+    if (
+      !Number.isSafeInteger(plan.target.vocabulary) || plan.target.vocabulary <= 0 ||
+      plan.target.vocabulary > 0xffff_ffff
+    ) {
+      return yield* new InferenceError({
+        op: "speculation",
+        message: `target vocabulary must be a positive integer, got ${plan.target.vocabulary}`
+      })
+    }
+    if (
+      !Number.isSafeInteger(plan.trainedMaxRows) || plan.trainedMaxRows <= 0 ||
+      plan.trainedMaxRows > 0xffff_ffff
+    ) {
+      return yield* new InferenceError({
+        op: "speculation",
+        message: `trainedMaxRows must be a positive integer, got ${plan.trainedMaxRows}`
+      })
+    }
+    if (
+      plan.stages.length !== 1 || typeof plan.stages[0] !== "object" || plan.stages[0] === null ||
+      typeof plan.stages[0].operation !== "object" || plan.stages[0].operation === null ||
+      plan.stages[0].operation._tag !== "Autoregressive" ||
+      plan.stages[0].operation.component !== 0
+    ) {
+      return yield* new InferenceError({
+        op: "speculation",
+        message: "the first speculative milestone requires one Autoregressive stage over component 0"
+      })
+    }
+    if (
+      plan.state._tag !== "Kv" || typeof plan.state.commit !== "object" || plan.state.commit === null ||
+      plan.state.commit._tag !== "AutoregressiveChain" ||
+      plan.state.commit.stage !== 0
+    ) {
+      return yield* new InferenceError({
+        op: "speculation",
+        message: "the proposer must use KV state with an AutoregressiveChain commit for stage 0"
+      })
+    }
+    if (plan.output.topology !== "Chains" || plan.output.probabilities !== "CausalNormalized") {
+      return yield* new InferenceError({
+        op: "speculation",
+        message: "the first speculative milestone requires chain topology and causal-normalized probabilities"
+      })
+    }
+    if (plan.tokenMap._tag !== "Identity") {
+      return yield* new InferenceError({
+        op: "speculation",
+        message: "the first speculative milestone requires an identity token map"
+      })
+    }
+    const artifact: ProposerArtifact = {
+      [ProposerArtifactTypeId]: ProposerArtifactTypeId
+    }
+    Object.freeze(artifact)
+    proposerArtifactInputs.set(
+      artifact,
+      Object.freeze({
+        components: Object.freeze([Object.freeze({
+          model: component.model,
+          params: Object.freeze([...component.params])
+        })]),
+        plan: Object.freeze({
+          target: Object.freeze({ ...plan.target }),
+          stages: Object.freeze(
+            plan.stages.map((stage) => Object.freeze({ operation: Object.freeze({ ...stage.operation }) }))
+          ),
+          state: Object.freeze({
+            _tag: plan.state._tag,
+            commit: Object.freeze({ ...plan.state.commit })
+          }),
+          output: Object.freeze({ ...plan.output }),
+          tokenMap: Object.freeze({ ...plan.tokenMap }),
+          trainedMaxRows: plan.trainedMaxRows
+        })
+      })
+    )
+    return artifact
+  })
+
+/** Constructors for validated proposer artifacts. */
+export const Speculation = {
+  artifact: makeProposerArtifact
+} as const
+
 /**
  * Fixed deployment geometry for {@link inference}. Construction validates
  * these scalar fields, then eagerly traces and compiles prefill
@@ -1561,6 +1743,12 @@ export interface InferenceConfig {
    * sessions still compete for one pool's token-row capacity.
    */
   readonly batchSize?: number
+  /** Optional exact autoregressive chain proposer compiled with this target. */
+  readonly speculation?: {
+    readonly proposer: ProposerArtifact
+    readonly maxDraftTokens: number
+    readonly schedule?: "fixed" | "adaptive"
+  }
 }
 
 /**
@@ -1580,13 +1768,6 @@ export interface InferenceConfig {
 export interface GenerationSeq {
   readonly _tag: "GenerationSeq"
   /**
-   * Low-level state handle owned by this sequence. Despite the `KvSequence`
-   * name it also carries cursor-only or recurrent-only state. Do not run or
-   * release it directly; bypassing the session breaks lifecycle coordination.
-   * It becomes invalid after `finish` or the session's `close`.
-   */
-  readonly sequence: Tensor.KvSequence
-  /**
    * Returns the total logical token count, including evicted window
    * positions. Fails after the underlying sequence has been released.
    */
@@ -1600,11 +1781,18 @@ export interface GenerationSeq {
 }
 
 /** Sampling controls owned by generation; draw counters are sequence-managed. */
-export type GenerationSamplingOptions = Omit<Tensor.SamplingOptions, "counter">
+export interface GenerationSamplingOptions {
+  readonly temperature?: number
+  readonly topK?: number
+  readonly topP?: number
+  /** Unsigned 64-bit seed. Safe integer numbers remain accepted for convenience. */
+  readonly seed: bigint | number
+}
 
 /** One prompt admitted by {@link Generation.add}. */
 export interface GenerationAdd {
   readonly prompt: Tensor.Any
+  /** Overrides inference sampling defaults for the admission page only. */
   readonly sampling?: Partial<GenerationSamplingOptions>
   readonly maxTokens?: number
   readonly eosTokens?: ReadonlyArray<number>
@@ -1613,6 +1801,7 @@ export interface GenerationAdd {
 /** One live sequence selected by {@link Generation.step}. */
 export interface GenerationStep {
   readonly seq: GenerationSeq
+  /** Overrides inference sampling defaults for this page only. */
   readonly sampling?: Partial<GenerationSamplingOptions>
 }
 
@@ -1672,15 +1861,9 @@ export interface Generation {
    */
   readonly live: () => Effect.Effect<number>
   /**
-   * Attempts to release every currently live sequence and invalidate its
-   * low-level handle. Successfully released entries are removed even if a later
-   * release fails; failed entries remain live and a representative failure is
-   * returned, so callers may retry. Interruption stops the remaining attempts,
-   * leaving their entries live. Completed KV blocks may stay as reclaimable
-   * prefix-cache content. The session is resettable rather than terminal and may
-   * accept new sequences after a successful close. Previously returned token
-   * pages are unaffected. Native finalizers are the fallback when sessions and
-   * sequence handles become unreachable.
+   * Closes the native session and releases all live sequences atomically. A
+   * successful close invalidates previously returned sequences and the session
+   * accepts no later additions or rounds. Native finalizers remain a fallback.
    */
   readonly close: () => Effect.Effect<void, Tensor.TensorError, Runtime.Runtime>
 }
@@ -1738,6 +1921,8 @@ export interface InferenceProgram {
   readonly generation: () => Effect.Effect<Generation, InferenceError>
   /** Opens a lower-level caller-token/caller-owned-logits session. */
   readonly execution: () => Effect.Effect<StatefulExecution, InferenceError>
+  /** Native generation counters, phase timings, acceptance, and pool pressure. */
+  readonly diagnostics: () => Effect.Effect<Runtime.InferenceDiagnostics, Tensor.TensorError>
 }
 
 interface ResolvedInferenceConfig {
@@ -1749,6 +1934,10 @@ interface ResolvedInferenceConfig {
   readonly batchSize: number
   readonly sampling: GenerationSamplingOptions
   readonly attentionWindow?: number
+  readonly speculation?: {
+    readonly input: ProposerArtifactInput
+    readonly maxDraftTokens: number
+  }
 }
 
 const invalidInferenceConfig = (message: string): InferenceError => new InferenceError({ op: "inference", message })
@@ -1793,6 +1982,49 @@ const resolveInferenceConfig = (
     if (!Number.isInteger(batchSize) || batchSize <= 0) {
       return yield* invalidInferenceConfig(`batchSize must be a positive integer, got ${config.batchSize}`)
     }
+    const sampling = config.sampling ?? { seed: 0 }
+    if (
+      (typeof sampling.seed !== "bigint" && !Number.isSafeInteger(sampling.seed)) || sampling.seed < 0 ||
+      BigInt(sampling.seed) > 0xffff_ffff_ffff_ffffn
+    ) {
+      return yield* invalidInferenceConfig(`sampling.seed must be an unsigned 64-bit integer, got ${sampling.seed}`)
+    }
+    if (sampling.temperature !== undefined && (!Number.isFinite(sampling.temperature) || sampling.temperature < 0)) {
+      return yield* invalidInferenceConfig(
+        `sampling.temperature must be finite and non-negative, got ${sampling.temperature}`
+      )
+    }
+    if (sampling.topK !== undefined && (!Number.isSafeInteger(sampling.topK) || sampling.topK < 0)) {
+      return yield* invalidInferenceConfig(`sampling.topK must be a non-negative safe integer, got ${sampling.topK}`)
+    }
+    if (sampling.topP !== undefined && (!Number.isFinite(sampling.topP) || sampling.topP <= 0 || sampling.topP > 1)) {
+      return yield* invalidInferenceConfig(`sampling.topP must be in (0, 1], got ${sampling.topP}`)
+    }
+    let speculation: ResolvedInferenceConfig["speculation"]
+    if (config.speculation !== undefined) {
+      const proposer = config.speculation.proposer
+      const input = (typeof proposer === "object" && proposer !== null)
+        ? proposerArtifactInputs.get(proposer)
+        : undefined
+      if (input === undefined) {
+        return yield* invalidInferenceConfig("speculation.proposer is not an artifact created by Speculation.artifact")
+      }
+      if (
+        !Number.isSafeInteger(config.speculation.maxDraftTokens) || config.speculation.maxDraftTokens <= 0 ||
+        config.speculation.maxDraftTokens > input.plan.trainedMaxRows
+      ) {
+        return yield* invalidInferenceConfig(
+          `maxDraftTokens must be in [1, ${input.plan.trainedMaxRows}], got ${config.speculation.maxDraftTokens}`
+        )
+      }
+      if (config.speculation.schedule === "adaptive") {
+        return yield* invalidInferenceConfig("adaptive speculative scheduling is not implemented; use fixed")
+      }
+      if (config.attentionWindow !== undefined) {
+        return yield* invalidInferenceConfig("speculative execution does not yet support attentionWindow")
+      }
+      speculation = { input, maxDraftTokens: config.speculation.maxDraftTokens }
+    }
     return {
       maxTokens: config.maxTokens,
       blockSize,
@@ -1800,8 +2032,9 @@ const resolveInferenceConfig = (
       tokenDtype,
       kvDtype: configuredKvDtype === "int8" ? "u8" : configuredKvDtype,
       batchSize,
-      sampling: config.sampling ?? { seed: 0 },
-      ...(config.attentionWindow === undefined ? {} : { attentionWindow: config.attentionWindow })
+      sampling,
+      ...(config.attentionWindow === undefined ? {} : { attentionWindow: config.attentionWindow }),
+      ...(speculation === undefined ? {} : { speculation })
     }
   })
 
@@ -1845,6 +2078,13 @@ interface InferencePrograms {
   readonly decode: Tensor.DecodeProgram
   readonly geometry: DecodeGeometry
   readonly pool: Tensor.KvPool
+  readonly speculation?: {
+    readonly verify: Tensor.DecodeProgram
+    readonly proposerPrefill: Tensor.DecodeProgram
+    readonly proposerDecode: Tensor.DecodeProgram
+    readonly proposerPool: Tensor.KvPool
+    readonly maxDraftTokens: number
+  }
 }
 
 const logitsVocab = (
@@ -1866,24 +2106,27 @@ const traceInferenceProgram = (
   model: Model,
   frozenParams: ReadonlyArray<Tensor.Concrete>,
   config: ResolvedInferenceConfig,
-  inputShape: readonly [number, number]
+  inputShape: readonly [number, number],
+  lastTokenRow = true,
+  packedCausalChains?: Runtime.PackedCausalChainsLayout
 ): Effect.Effect<
   Tensor.DecodeProgram,
   InferenceError | ModelError | Tensor.TensorError,
   Runtime.Runtime
 > =>
   Effect.gen(function*() {
-    const [programBatch, steps] = inputShape
+    const [graphRows, steps] = inputShape
     const tokenInput = yield* Tensor.zeros(inputShape, { dtype: config.tokenDtype })
     const input = yield* Tensor.makeInput(0, tokenInput)
     const output = yield* model.forward(frozenParams, input)
-    yield* logitsVocab(output, programBatch, steps)
+    yield* logitsVocab(output, graphRows, steps)
     return yield* Tensor.compileDecodeProgram([output], {
       maxTokens: config.maxTokens,
       blockSize: config.blockSize,
       kvDtype: config.kvDtype,
-      batch: programBatch,
-      lastTokenRow: true,
+      batch: packedCausalChains === undefined ? graphRows : config.batchSize,
+      lastTokenRow,
+      ...(packedCausalChains === undefined ? {} : { packedCausalChains }),
       ...(config.attentionWindow === undefined ? {} : { window: config.attentionWindow })
     }).pipe(Effect.mapError((error) => new InferenceError({ op: "inference", message: error.message })))
   })
@@ -1891,7 +2134,8 @@ const traceInferenceProgram = (
 const compileInferencePrograms = (
   model: Model,
   frozenParams: ReadonlyArray<Tensor.Concrete>,
-  config: ResolvedInferenceConfig
+  config: ResolvedInferenceConfig,
+  proposerParams: ReadonlyArray<Tensor.Concrete> | undefined
 ): Effect.Effect<
   InferencePrograms,
   InferenceError | ModelError | Tensor.TensorError,
@@ -1924,7 +2168,89 @@ const compileInferencePrograms = (
         convKernel: geometry.convKernel
       }
     ).pipe(Effect.mapError((error) => new InferenceError({ op: "inference", message: error.message })))
-    return { prefill, decode, geometry, pool }
+    if (config.speculation === undefined) return { prefill, decode, geometry, pool }
+    if (proposerParams === undefined) {
+      return yield* new InferenceError({ op: "inference", message: "speculative proposer parameters are missing" })
+    }
+    if (geometry.layers === 0 || geometry.kdaLayers !== 0 || geometry.convLayers !== 0) {
+      return yield* new InferenceError({
+        op: "inference",
+        message: "speculative target state must be KV-only with at least one attention layer"
+      })
+    }
+    const proposerModel = config.speculation.input.components[0]!.model
+    const proposerPrefill = yield* traceInferenceProgram(
+      proposerModel,
+      proposerParams,
+      config,
+      [config.batchSize, config.prefillChunk]
+    )
+    const proposerDecode = yield* traceInferenceProgram(
+      proposerModel,
+      proposerParams,
+      config,
+      [config.batchSize, 1]
+    )
+    const proposerGeometry = decodeGeometry(proposerPrefill)
+    if (!sameDecodeGeometry(proposerGeometry, decodeGeometry(proposerDecode))) {
+      return yield* new InferenceError({
+        op: "inference",
+        message: "proposer prefill and decode traces disagree on state geometry"
+      })
+    }
+    if (proposerGeometry.layers === 0 || proposerGeometry.kdaLayers !== 0 || proposerGeometry.convLayers !== 0) {
+      return yield* new InferenceError({
+        op: "inference",
+        message: "speculative proposer state must be KV-only with at least one attention layer"
+      })
+    }
+    const targetVocabulary = decode.outputs[0]?.shape[0]
+    const proposerVocabulary = proposerDecode.outputs[0]?.shape[0]
+    if (
+      targetVocabulary !== config.speculation.input.plan.target.vocabulary ||
+      proposerVocabulary !== targetVocabulary
+    ) {
+      return yield* new InferenceError({
+        op: "inference",
+        message:
+          `speculative identity token map requires target/proposer vocabulary ${config.speculation.input.plan.target.vocabulary}, got target ${targetVocabulary} and proposer ${proposerVocabulary}`
+      })
+    }
+    const verify = yield* traceInferenceProgram(
+      model,
+      frozenParams,
+      config,
+      [config.batchSize * (config.speculation.maxDraftTokens + 1), 1],
+      false,
+      { rowsPerSequence: config.speculation.maxDraftTokens + 1 }
+    )
+    if (!sameDecodeGeometry(geometry, decodeGeometry(verify))) {
+      return yield* new InferenceError({
+        op: "inference",
+        message: "target verification trace disagrees with target decode state geometry"
+      })
+    }
+    const proposerPool = yield* Tensor.makeKvPool(
+      proposerGeometry.layers,
+      proposerGeometry.kvHeads,
+      proposerGeometry.headDim,
+      config.maxTokens,
+      config.blockSize,
+      config.kvDtype
+    ).pipe(Effect.mapError((error) => new InferenceError({ op: "inference", message: error.message })))
+    return {
+      prefill,
+      decode,
+      geometry,
+      pool,
+      speculation: {
+        verify,
+        proposerPrefill,
+        proposerDecode,
+        proposerPool,
+        maxDraftTokens: config.speculation.maxDraftTokens
+      }
+    }
   })
 
 interface PrefillChunkPlan {
@@ -2181,7 +2507,8 @@ interface InferenceEngine {
   readonly config: ResolvedInferenceConfig
   readonly frozenParams: ReadonlyArray<Tensor.Concrete>
   readonly programs: InferencePrograms
-  readonly allocateSessionId: () => bigint
+  readonly artifact: Runtime.InferenceArtifactHandle
+  readonly runtime: Runtime.RuntimeService
 }
 
 const openStatefulExecution = (engine: InferenceEngine): Effect.Effect<StatefulExecution, never> =>
@@ -2325,39 +2652,36 @@ const openStatefulExecution = (engine: InferenceEngine): Effect.Effect<StatefulE
     }
   })
 
-interface GenerationLiveEntry extends LiveEntry<GenerationSeq> {
+interface NativeGenerationEntry {
+  readonly seq: GenerationSeq
+  readonly handle: Runtime.InferenceSequenceHandle
   readonly id: bigint
-  pending: number
-  generated: number
-  readonly maxTokens?: number
-  readonly eosTokens: ReadonlySet<number>
   terminal: "eos" | "maxTokens" | undefined
 }
 
-const samplingAt = (
-  defaults: GenerationSamplingOptions,
-  override: Partial<GenerationSamplingOptions> | undefined,
-  sequenceId: bigint,
-  counter: number
-): Tensor.SamplingOptions => {
-  const seed = override?.seed ?? defaults.seed
-  const validSeed = Number.isSafeInteger(seed) && seed >= 0
-  const mixedSeed = validSeed
-    ? Number(
-      (BigInt(seed) * 0x1e37_79b9_7f4a_7c15n ^ sequenceId * 0x1656_67b1_9e37_79f9n) &
-        ((1n << 53n) - 1n)
-    )
-    : seed
+const inferenceBackend = <A>(op: string, effect: Effect.Effect<A, Runtime.BackendError>) =>
+  Effect.mapError(effect, (backend) => new Tensor.TensorError({ op, message: backend.message, backend }))
+
+const nativeSampling = (sampling: GenerationSamplingOptions): Runtime.InferenceSamplingOptions => {
+  const seed = sampling.seed
   return {
-    seed: mixedSeed,
-    counter,
-    ...(override?.temperature ?? defaults.temperature) === undefined
-      ? {}
-      : { temperature: override?.temperature ?? defaults.temperature },
-    ...(override?.topK ?? defaults.topK) === undefined ? {} : { topK: override?.topK ?? defaults.topK },
-    ...(override?.topP ?? defaults.topP) === undefined ? {} : { topP: override?.topP ?? defaults.topP }
+    temperature: sampling.temperature ?? 1,
+    topK: sampling.topK ?? 0,
+    topP: sampling.topP ?? 1,
+    seed: typeof seed === "bigint" ? seed : BigInt(seed)
   }
 }
+
+const nativeSamplingOverride = (
+  sampling: Partial<GenerationSamplingOptions>
+): Partial<Runtime.InferenceSamplingOptions> => ({
+  ...(sampling.temperature === undefined ? {} : { temperature: sampling.temperature }),
+  ...(sampling.topK === undefined ? {} : { topK: sampling.topK }),
+  ...(sampling.topP === undefined ? {} : { topP: sampling.topP }),
+  ...(sampling.seed === undefined
+    ? {}
+    : { seed: typeof sampling.seed === "bigint" ? sampling.seed : BigInt(sampling.seed) })
+})
 
 const validateGenerationAdd = (
   entry: GenerationAdd,
@@ -2365,10 +2689,13 @@ const validateGenerationAdd = (
   defaults: GenerationSamplingOptions
 ): Effect.Effect<void, InferenceError> =>
   Effect.gen(function*() {
-    if (entry.maxTokens !== undefined && (!Number.isSafeInteger(entry.maxTokens) || entry.maxTokens <= 0)) {
+    if (
+      entry.maxTokens !== undefined &&
+      (!Number.isSafeInteger(entry.maxTokens) || entry.maxTokens <= 0 || entry.maxTokens > 0xffff_ffff)
+    ) {
       return yield* new InferenceError({
         op: "add",
-        message: `entry ${index} maxTokens must be a positive integer, got ${entry.maxTokens}`
+        message: `entry ${index} maxTokens must be an unsigned 32-bit positive integer, got ${entry.maxTokens}`
       })
     }
     for (const token of entry.eosTokens ?? []) {
@@ -2380,10 +2707,13 @@ const validateGenerationAdd = (
       }
     }
     const sampling = { ...defaults, ...entry.sampling }
-    if (!Number.isSafeInteger(sampling.seed) || sampling.seed < 0) {
+    if (
+      (typeof sampling.seed !== "bigint" && !Number.isSafeInteger(sampling.seed)) || sampling.seed < 0 ||
+      BigInt(sampling.seed) > 0xffff_ffff_ffff_ffffn
+    ) {
       return yield* new InferenceError({
         op: "add",
-        message: `entry ${index} seed must be a non-negative safe integer, got ${sampling.seed}`
+        message: `entry ${index} seed must be an unsigned 64-bit integer, got ${sampling.seed}`
       })
     }
     if (sampling.temperature !== undefined && (!Number.isFinite(sampling.temperature) || sampling.temperature < 0)) {
@@ -2406,30 +2736,51 @@ const validateGenerationAdd = (
     }
   })
 
-const pageFor = (entry: GenerationLiveEntry, token: number): TokenPage => {
-  entry.pending = token
-  entry.generated += 1
-  const stopReason = entry.eosTokens.has(token)
-    ? "eos" as const
-    : entry.maxTokens !== undefined && entry.generated >= entry.maxTokens
-    ? "maxTokens" as const
-    : undefined
-  entry.terminal = stopReason
-  return {
-    seq: entry.seq,
-    tokens: [token],
-    ...(stopReason === undefined ? {} : { stopReason })
-  }
-}
-
-const openGeneration = (engine: InferenceEngine): Effect.Effect<Generation, never> =>
+const openGeneration = (engine: InferenceEngine): Effect.Effect<Generation, InferenceError> =>
   Effect.gen(function*() {
     const roundLock = yield* Semaphore.make(1)
-    const live: Array<GenerationLiveEntry> = []
+    const live: Array<NativeGenerationEntry> = []
     const config = engine.config
-    const programs = engine.programs
-    const sessionId = engine.allocateSessionId()
-    let nextSequenceId = 0n
+    const runtime = engine.runtime
+    const native = runtime.extensions.inference
+    const session = yield* Effect.mapError(
+      native.open(engine.artifact),
+      (error) => new InferenceError({ op: "generation", message: error.message })
+    )
+
+    const pagesFor = (
+      op: "add" | "step",
+      result: Runtime.InferenceRoundResult,
+      expected: ReadonlyArray<NativeGenerationEntry>
+    ): Effect.Effect<ReadonlyArray<TokenPage>, InferenceError> =>
+      Effect.gen(function*() {
+        if (
+          result.roundId < 0n || result.roundId > 0xffff_ffff_ffff_ffffn || typeof result.recovered !== "boolean" ||
+          result.pages.length !== expected.length
+        ) {
+          return yield* new InferenceError({
+            op,
+            message: `${op}: native inference returned a malformed round receipt`
+          })
+        }
+        const pages: Array<TokenPage> = []
+        for (const [index, page] of result.pages.entries()) {
+          const entry = expected[index]!
+          if (
+            page.sequence !== entry.handle || page.sequenceId !== entry.id || page.tokens.length === 0 ||
+            page.tokens.some((token) => !Number.isInteger(token) || token < 0 || token > 0xffff_ffff) ||
+            (page.stopReason !== undefined && page.stopReason !== "eos" && page.stopReason !== "maxTokens")
+          ) {
+            return yield* new InferenceError({ op, message: `${op}: native inference returned a malformed token page` })
+          }
+          pages.push({
+            seq: entry.seq,
+            tokens: page.tokens,
+            ...(page.stopReason === undefined ? {} : { stopReason: page.stopReason })
+          })
+        }
+        return pages
+      })
 
     const add: Generation["add"] = (requests) =>
       roundLock.withPermits(1)(
@@ -2446,88 +2797,82 @@ const openGeneration = (engine: InferenceEngine): Effect.Effect<Generation, neve
           for (const [index, request] of requests.entries()) {
             yield* validateGenerationAdd(request, index, config.sampling)
           }
-          const runtime = yield* Runtime.Runtime
           for (const request of requests) yield* validatePrompt(request.prompt, config, runtime)
           const promptValues = yield* Tensor.compute(requests.map((request) => request.prompt))
-          const initialSequenceId = nextSequenceId
-          const sequences: Array<Tensor.KvSequence> = []
-          const pages: Array<TokenPage> = []
           return yield* Effect.onExit(
             Effect.gen(function*() {
-              const tokenRows: Array<ReadonlyArray<number>> = []
-              for (const prompt of promptValues) tokenRows.push(yield* readTokenIds(prompt))
-              const sequenceIds = requests.map(() => {
-                const localId = nextSequenceId++
-                const sum = sessionId + localId
-                return sum * (sum + 1n) / 2n + localId
-              })
-              const freeSlots = Array.from({ length: config.batchSize }, (_, slot) => slot)
-                .filter((slot) => !live.some((entry) => entry.slot === slot))
-              const lanes: Array<PrefillLane> = []
-              for (const [index, tokens] of tokenRows.entries()) {
-                const sequence = yield* Tensor.makeKvSequence(programs.pool)
-                sequences.push(sequence)
-                const matched = yield* Tensor.kvPrefillMatch(sequence, tokens)
-                lanes.push({ slot: freeSlots[index]!, sequence, tokens, offset: matched })
-              }
-              const sampled = yield* runPrefillBatches(
-                programs.prefill,
-                config,
-                lanes,
-                (finals, input, tokens) =>
-                  Tensor.runBatchedDecodeProgramSampled(
-                    programs.prefill,
-                    [input],
-                    finals.map((lane) => lane.sequence),
-                    finals.map((lane) => lane.slot),
-                    tokens,
-                    finals.map((lane) => {
-                      const index = lanes.findIndex((source) => source.slot === lane.slot)
-                      return samplingAt(config.sampling, requests[index]!.sampling, sequenceIds[index]!, 0)
-                    })
-                  ),
-                () => Effect.void
+              const result = yield* inferenceBackend(
+                "inferenceAdd",
+                native.add(session, {
+                  entries: requests.map((request, index) => ({
+                    prompt: promptValues[index]!,
+                    ...(request.sampling === undefined
+                      ? {}
+                      : { sampling: nativeSamplingOverride(request.sampling) }),
+                    ...(request.maxTokens === undefined ? {} : { maxTokens: request.maxTokens }),
+                    eosTokens: request.eosTokens ?? []
+                  }))
+                })
               )
-              yield* Effect.sync(() => {
-                for (const [index, lane] of lanes.entries()) {
-                  let entry: GenerationLiveEntry
-                  const seq: GenerationSeq = {
-                    _tag: "GenerationSeq",
-                    sequence: lane.sequence,
-                    cursor: () => Tensor.kvSequenceCursor(lane.sequence),
-                    finish: () => releaseLiveEntry(live, entry)
-                  }
-                  entry = {
-                    seq,
-                    slot: lane.slot,
-                    id: sequenceIds[index]!,
-                    pending: sampled[index]!,
-                    generated: 0,
-                    terminal: undefined,
-                    ...(requests[index]!.maxTokens === undefined ? {} : { maxTokens: requests[index]!.maxTokens }),
-                    eosTokens: new Set(requests[index]!.eosTokens ?? [])
-                  }
-                  live.push(entry)
-                  pages.push(pageFor(entry, sampled[index]!))
+              if (result.pages.length !== requests.length) {
+                return yield* new InferenceError({
+                  op: "add",
+                  message: "add: native inference returned the wrong page count"
+                })
+              }
+              const added: Array<NativeGenerationEntry> = []
+              for (const page of result.pages) {
+                if (
+                  page.sequenceId < 0n || page.sequenceId > 0xffff_ffff_ffff_ffffn ||
+                  added.some((entry) => entry.handle === page.sequence || entry.id === page.sequenceId)
+                ) {
+                  return yield* new InferenceError({
+                    op: "add",
+                    message: "add: native inference returned invalid sequence identity"
+                  })
                 }
-              })
-              return pages
+                let entry: NativeGenerationEntry
+                const seq: GenerationSeq = {
+                  _tag: "GenerationSeq",
+                  cursor: () =>
+                    Effect.gen(function*() {
+                      const inspected = yield* inferenceBackend(
+                        "inferenceInspect",
+                        native.inspect(session, entry.handle)
+                      )
+                      if (
+                        inspected.sequenceId !== entry.id || inspected.cursor < 0n ||
+                        inspected.cursor > BigInt(Number.MAX_SAFE_INTEGER)
+                      ) {
+                        return yield* new Tensor.TensorError({
+                          op: "inferenceInspect",
+                          message: "native inference returned an invalid cursor"
+                        })
+                      }
+                      return Number(inspected.cursor)
+                    }),
+                  finish: () =>
+                    roundLock.withPermits(1)(
+                      Effect.gen(function*() {
+                        const index = live.indexOf(entry)
+                        if (index < 0) return
+                        yield* inferenceBackend("inferenceFinish", native.finish(session, [entry.handle]))
+                        live.splice(index, 1)
+                      })
+                    )
+                }
+                entry = { seq, handle: page.sequence, id: page.sequenceId, terminal: undefined }
+                added.push(entry)
+              }
+              const pages = yield* pagesFor("add", result, added)
+              return yield* Effect.uninterruptible(Effect.gen(function*() {
+                yield* inferenceBackend("inferenceAcknowledge", native.acknowledge(session, result.roundId))
+                for (const [index, entry] of added.entries()) entry.terminal = result.pages[index]!.stopReason
+                live.push(...added)
+                return pages
+              }))
             }),
-            (exit) =>
-              Effect.gen(function*() {
-                yield* Tensor.clearAll(promptValues)
-                if (Exit.isFailure(exit)) {
-                  for (const sequence of sequences) {
-                    const entry = live.find((entry) => entry.seq.sequence === sequence)
-                    if (entry === undefined) {
-                      yield* Tensor.releaseKvSequence(sequence)
-                    } else {
-                      yield* releaseLiveEntry(live, entry)
-                    }
-                  }
-                  nextSequenceId = initialSequenceId
-                }
-              })
+            () => Tensor.clearAll(promptValues)
           )
         })
       )
@@ -2544,7 +2889,7 @@ const openGeneration = (engine: InferenceEngine): Effect.Effect<Generation, neve
               message: `step accepts at most batchSize (${config.batchSize}) entries, got ${requests.length}`
             })
           }
-          const selected: Array<GenerationLiveEntry> = []
+          const selected: Array<NativeGenerationEntry> = []
           for (const [index, request] of requests.entries()) {
             const entry = live.find((entry) => entry.seq === request.seq)
             if (entry === undefined) {
@@ -2561,20 +2906,23 @@ const openGeneration = (engine: InferenceEngine): Effect.Effect<Generation, neve
             }
             selected.push(entry)
           }
-          const ids = selected.map((entry) => entry.pending)
-          const slots = selected.map((entry) => entry.slot)
-          const input = yield* slottedTokenTensor(ids, slots, config.batchSize, config.tokenDtype)
-          const sampled = yield* Tensor.runBatchedDecodeProgramSampled(
-            programs.decode,
-            [input],
-            selected.map((entry) => entry.seq.sequence),
-            slots,
-            ids.map((id) => [id]),
-            selected.map((entry, index) =>
-              samplingAt(config.sampling, requests[index]!.sampling, entry.id, entry.generated)
-            )
+          const result = yield* inferenceBackend(
+            "inferenceRound",
+            native.runRound(session, {
+              entries: selected.map((entry, index) => ({
+                sequence: entry.handle,
+                ...(requests[index]!.sampling === undefined
+                  ? {}
+                  : { sampling: nativeSamplingOverride(requests[index]!.sampling) })
+              }))
+            })
           )
-          return sampled.map((token, index) => pageFor(selected[index]!, token))
+          const pages = yield* pagesFor("step", result, selected)
+          return yield* Effect.uninterruptible(Effect.gen(function*() {
+            yield* inferenceBackend("inferenceAcknowledge", native.acknowledge(session, result.roundId))
+            for (const [index, entry] of selected.entries()) entry.terminal = result.pages[index]!.stopReason
+            return pages
+          }))
         })
       )
 
@@ -2582,7 +2930,10 @@ const openGeneration = (engine: InferenceEngine): Effect.Effect<Generation, neve
       add,
       step,
       live: () => Effect.sync(() => live.length),
-      close: () => closeLiveEntries(live)
+      close: () =>
+        roundLock.withPermits(1)(
+          Effect.tap(inferenceBackend("inferenceClose", native.close(session)), () => Effect.sync(() => live.splice(0)))
+        )
     }
   })
 
@@ -2630,24 +2981,60 @@ export const inference = (
   config: InferenceConfig
 ): Effect.Effect<InferenceProgram, InferenceError | ModelError | Tensor.TensorError, Runtime.Runtime> =>
   Effect.gen(function*() {
+    const runtime = yield* Runtime.Runtime
     yield* checkArity("inference", model.names, params)
     const resolved = yield* resolveInferenceConfig(config)
-    return yield* Effect.flatMap(Tensor.compute(params), (frozenParams) =>
-      Effect.onExit(
-        Effect.gen(function*() {
-          const programs = yield* compileInferencePrograms(model, frozenParams, resolved)
-          let nextSessionId = 0n
-          const engine: InferenceEngine = {
-            config: resolved,
-            frozenParams,
-            programs,
-            allocateSessionId: () => nextSessionId++
-          }
-          return {
-            generation: () => openGeneration(engine),
-            execution: () => openStatefulExecution(engine)
-          } satisfies InferenceProgram
-        }),
-        (exit) => Exit.isFailure(exit) ? Tensor.clearAll(frozenParams) : Effect.void
-      ))
+    const proposerSourceParams = resolved.speculation?.input.components[0]?.params ?? []
+    const targetArity = params.length
+    return yield* Effect.flatMap(
+      Tensor.compute([...params, ...proposerSourceParams]),
+      (allFrozenParams) =>
+        Effect.onExit(
+          Effect.gen(function*() {
+            const frozenParams = allFrozenParams.slice(0, targetArity)
+            const proposerParams = resolved.speculation === undefined
+              ? undefined
+              : allFrozenParams.slice(targetArity)
+            const programs = yield* compileInferencePrograms(model, frozenParams, resolved, proposerParams)
+            const artifact = yield* inferenceBackend(
+              "inferenceCompile",
+              runtime.extensions.inference.compile({
+                target: {
+                  prefill: programs.prefill.handle,
+                  decode: programs.decode.handle,
+                  ...(programs.speculation === undefined ? {} : { verify: programs.speculation.verify.handle }),
+                  pool: programs.pool.handle
+                },
+                ...(programs.speculation === undefined
+                  ? {}
+                  : {
+                    proposer: {
+                      prefill: programs.speculation.proposerPrefill.handle,
+                      decode: programs.speculation.proposerDecode.handle,
+                      pool: programs.speculation.proposerPool.handle,
+                      maxDraftTokens: programs.speculation.maxDraftTokens
+                    }
+                  }),
+                batchSize: resolved.batchSize,
+                tokenDtype: resolved.tokenDtype,
+                sampling: nativeSampling(resolved.sampling)
+              })
+            )
+            const engine: InferenceEngine = {
+              config: resolved,
+              frozenParams: allFrozenParams,
+              programs,
+              artifact,
+              runtime
+            }
+            return {
+              generation: () => openGeneration(engine),
+              execution: () => openStatefulExecution(engine),
+              diagnostics: () =>
+                inferenceBackend("inferenceDiagnostics", runtime.extensions.inference.diagnostics(artifact))
+            } satisfies InferenceProgram
+          }),
+          (exit) => Exit.isFailure(exit) ? Tensor.clearAll(allFrozenParams) : Effect.void
+        )
+    )
   })

@@ -23,7 +23,7 @@ effect-torch-graph = { path = "../graph" }
 effect-torch-napi = { path = "../napi", optional = true }
 effect-torch-runtime = { path = "../runtime" }
 half = "2"
-napi = { version = "3", features = ["async"], optional = true }
+napi = { version = "3", features = ["async", "napi6"], optional = true }
 napi-derive = { version = "3", optional = true }
 safetensors = { version = "0.6", optional = true }
 tokio = { version = "1", features = ["rt", "sync", "macros"], optional = true }

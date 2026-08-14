@@ -815,6 +815,15 @@ rounds with `pnpm bench:inference`.
 
 ### Phase 2: exact chain speculation
 
+**Status: Implemented.** CPU and Metal use packed causal-chain verification and
+cohesive native artifact/session/sequence handles with lossless keyed RNG,
+exact rejection/residual sampling, durable request-bound receipts, atomic paired
+prefix-cache publication, and real phase/acceptance/pool diagnostics. Native and
+cross-backend tests cover every acceptance cut, failure/interruption rollback,
+prefix reuse, high-bit seeds, and positive-temperature replay; benchmarks cover
+ordinary, perfect-draft, and independent-draft modes across batch width, context
+length, and concurrent sessions.
+
 1. Add `ProposerArtifact` and implement only the structural
    `Autoregressive`/KV/chain/`CausalNormalized` plan. Validate target/proposer
    runtime, vocabulary mapping, sampling transforms, and state geometry during

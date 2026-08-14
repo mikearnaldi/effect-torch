@@ -21,7 +21,7 @@
 //!   same graph.
 //! - The state cursor is a runtime-supplied value at `cursor_slot` — one
 //!   past the highest caller input slot — never a caller argument. It is a
-//!   scalar for batch 1 and an `i64 [batch]` tensor otherwise.
+//!   scalar for one dense graph row and an `i64 [graph_rows]` tensor otherwise.
 //! - `allows_window_eviction` is true only when every attention layer has a
 //!   finite window; a global retention window that cannot hold an explicit
 //!   local window is a hard error.
@@ -83,6 +83,57 @@ pub struct DecodeGeometry {
     pub cursor_tensor: bool,
 }
 
+/// Relationship between physical sequence lanes and rows in the traced graph.
+///
+/// Dense prefill/decode has one graph row per physical lane. Packed causal-chain
+/// verification instead traces every candidate position as an independent
+/// one-token graph row while retaining one state sequence per physical lane.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum DecodeLayout {
+    Dense {
+        batch: usize,
+    },
+    PackedCausalChains {
+        batch: usize,
+        rows_per_sequence: usize,
+    },
+}
+
+impl DecodeLayout {
+    pub const fn dense(batch: usize) -> Self {
+        Self::Dense { batch }
+    }
+
+    pub const fn packed_causal_chains(batch: usize, rows_per_sequence: usize) -> Self {
+        Self::PackedCausalChains {
+            batch,
+            rows_per_sequence,
+        }
+    }
+
+    pub const fn batch(self) -> usize {
+        match self {
+            Self::Dense { batch } | Self::PackedCausalChains { batch, .. } => batch,
+        }
+    }
+
+    pub fn graph_rows(self) -> Result<usize, String> {
+        let (batch, rows_per_sequence) = match self {
+            Self::Dense { batch } => (batch, 1),
+            Self::PackedCausalChains {
+                batch,
+                rows_per_sequence,
+            } => (batch, rows_per_sequence),
+        };
+        if batch == 0 || rows_per_sequence == 0 {
+            return Err("decode: batch and rows per sequence must be positive".to_string());
+        }
+        batch
+            .checked_mul(rows_per_sequence)
+            .ok_or_else(|| "decode: packed causal-chain graph row count overflow".to_string())
+    }
+}
+
 impl DecodeGeometry {
     /// The state cursor as a request-level slot declaration: internal
     /// runtime metadata, never a caller-visible argument.
@@ -108,6 +159,24 @@ pub fn specialize_decode(
     batch: usize,
     last_token_row: bool,
 ) -> Result<(Vec<Arc<Node>>, DecodeGeometry), String> {
+    specialize_decode_layout(roots, window, DecodeLayout::dense(batch), last_token_row)
+}
+
+/// Builds a stateful decode specialization with an explicit physical-to-graph
+/// row layout. Packed causal-chain roots remain all-row outputs.
+pub fn specialize_decode_layout(
+    roots: &[Arc<Node>],
+    window: Option<usize>,
+    layout: DecodeLayout,
+    last_token_row: bool,
+) -> Result<(Vec<Arc<Node>>, DecodeGeometry), String> {
+    let graph_rows = layout.graph_rows()?;
+    let batch = layout.batch();
+    if matches!(layout, DecodeLayout::PackedCausalChains { .. }) && last_token_row {
+        return Err(
+            "decode: packed causal-chain verification requires all-row outputs".to_string(),
+        );
+    }
     let mut maximum_slot = None;
     let mut visited = HashSet::new();
     let mut stack = roots.to_vec();
@@ -184,9 +253,9 @@ pub fn specialize_decode(
                     );
                 }
                 let rank = k.shape.len();
-                if rank != 4 || k.shape[..rank - 3].iter().product::<usize>() != batch {
+                if rank != 4 || k.shape[..rank - 3].iter().product::<usize>() != graph_rows {
                     return Err(format!(
-                        "decode: kv caching expects attention of shape [{batch}, H, T, D], got {:?}",
+                        "decode: kv caching expects attention of shape [{graph_rows}, H, T, D], got {:?}",
                         k.shape
                     ));
                 }
@@ -235,9 +304,9 @@ pub fn specialize_decode(
                 scale,
             } => {
                 let rank = q.shape.len();
-                if rank != 4 || q.shape[..rank - 3].iter().product::<usize>() != batch {
+                if rank != 4 || q.shape[..rank - 3].iter().product::<usize>() != graph_rows {
                     return Err(format!(
-                        "decode: kda state caching expects layers of shape [{batch}, H, T, D], got {:?}",
+                        "decode: kda state caching expects layers of shape [{graph_rows}, H, T, D], got {:?}",
                         q.shape
                     ));
                 }
@@ -287,9 +356,9 @@ pub fn specialize_decode(
             }
             NodeKind::ShortConv1d { x, weight } => {
                 let rank = x.shape.len();
-                if rank != 3 || x.shape[..rank - 2].iter().product::<usize>() != batch {
+                if rank != 3 || x.shape[..rank - 2].iter().product::<usize>() != graph_rows {
                     return Err(format!(
-                        "decode: conv state caching expects layers of shape [{batch}, T, C], got {:?}",
+                        "decode: conv state caching expects layers of shape [{graph_rows}, T, C], got {:?}",
                         x.shape
                     ));
                 }
@@ -328,18 +397,18 @@ pub fn specialize_decode(
                 let tokens = *seq_len;
                 let width = weight.shape[1];
                 let device = weight.device.clone();
-                if batch > 1 {
+                if graph_rows > 1 {
                     cursor_tensor = true;
                     let cursors = Node::new(NodeKind::Input {
                         slot: cursor_slot,
-                        shape: vec![batch],
+                        shape: vec![graph_rows],
                         dtype: DType::I64,
                         device: device.clone(),
                     })?;
                     let positions = Node::new(NodeKind::Add {
                         a: Node::new(NodeKind::Reshape {
                             a: cursors,
-                            shape: vec![batch, 1],
+                            shape: vec![graph_rows, 1],
                         })?,
                         b: Node::new(NodeKind::BroadcastTo {
                             a: Node::new(NodeKind::Reshape {
@@ -352,15 +421,15 @@ pub fn specialize_decode(
                                 })?,
                                 shape: vec![1, tokens],
                             })?,
-                            shape: vec![batch, tokens],
+                            shape: vec![graph_rows, tokens],
                         })?,
                     })?;
                     let indexes = Node::new(NodeKind::BroadcastTo {
                         a: Node::new(NodeKind::Reshape {
                             a: positions,
-                            shape: vec![batch * tokens, 1],
+                            shape: vec![graph_rows * tokens, 1],
                         })?,
-                        shape: vec![batch * tokens, width],
+                        shape: vec![graph_rows * tokens, width],
                     })?;
                     NodeKind::Reshape {
                         a: Node::new(NodeKind::Gather {
@@ -368,7 +437,7 @@ pub fn specialize_decode(
                             dim: 0,
                             indexes,
                         })?,
-                        shape: vec![batch, tokens, width],
+                        shape: vec![graph_rows, tokens, width],
                     }
                 } else {
                     let positions = Node::new(NodeKind::Add {
@@ -439,6 +508,16 @@ pub fn specialize_decode(
                 .unwrap_or_else(|| root.clone())
         })
         .collect::<Vec<_>>();
+    if matches!(layout, DecodeLayout::PackedCausalChains { .. }) {
+        for root in &roots {
+            if root.shape.len() != 3 || root.shape[0] != graph_rows || root.shape[1] != 1 {
+                return Err(format!(
+                    "decode: packed causal-chain roots must be [{graph_rows}, 1, V], got {:?}",
+                    root.shape
+                ));
+            }
+        }
+    }
     let roots = if last_token_row {
         let mut selected = Vec::new();
         for root in &roots {
@@ -1041,6 +1120,69 @@ mod tests {
                 "decode: last-token-row roots must be [1, T, V], got [2, 4, 8]"
             );
         }
+    }
+
+    #[test]
+    fn packed_causal_chains_separate_physical_batch_from_graph_rows() {
+        for device in [Device::Cpu, Device::Metal] {
+            let layout = DecodeLayout::packed_causal_chains(2, 3);
+            assert_eq!(layout.batch(), 2);
+            assert_eq!(layout.graph_rows().unwrap(), 6);
+
+            let stateful = attention(6, 2, 1, 4, 1.0, true, device.clone());
+            let logits = Node::new(NodeKind::Reshape {
+                a: stateful,
+                shape: vec![6, 1, 8],
+            })
+            .unwrap();
+            let positions = Node::new(NodeKind::PositionEmbedding {
+                weight: tensor(&[128, 8], DType::F32, device),
+                seq_len: 1,
+            })
+            .unwrap();
+
+            let (roots, geometry) =
+                specialize_decode_layout(&[logits, positions], None, layout, false).unwrap();
+
+            assert_eq!(roots[0].shape, [6, 1, 8]);
+            assert_eq!(roots[1].shape, [6, 1, 8]);
+            assert!(geometry.cursor_tensor);
+            let cursors = graph_post_order(&roots)
+                .into_iter()
+                .filter(|node| {
+                    matches!(
+                        &node.kind,
+                        NodeKind::Input { slot, shape, dtype: DType::I64, .. }
+                            if *slot == geometry.cursor_slot && shape == &[6]
+                    )
+                })
+                .count();
+            assert_eq!(cursors, 1);
+        }
+
+        let malformed = input(0, &[6, 2, 8], DType::F32, Device::Cpu);
+        assert_eq!(
+            specialize_decode_layout(
+                &[malformed],
+                None,
+                DecodeLayout::packed_causal_chains(2, 3),
+                false,
+            )
+            .err()
+            .unwrap(),
+            "decode: packed causal-chain roots must be [6, 1, V], got [6, 2, 8]"
+        );
+        assert_eq!(
+            specialize_decode_layout(
+                &[input(0, &[6, 1, 8], DType::F32, Device::Cpu)],
+                None,
+                DecodeLayout::packed_causal_chains(2, 3),
+                true,
+            )
+            .err()
+            .unwrap(),
+            "decode: packed causal-chain verification requires all-row outputs"
+        );
     }
 
     #[test]

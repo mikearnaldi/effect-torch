@@ -40,14 +40,18 @@ use crate::executable;
 use crate::executable::{ConvGeometry, KdaGeometry, KvStateSchema, MetalDecodeContext, SeqState};
 
 use effect_torch_compiler::{
-    specialize_decode, CompileOptions, ConvGeometry as DecodeConvGeometry, InferenceOptions,
-    KdaGeometry as DecodeKdaGeometry, PreparedProgram, ProgramRequest, ProgramSlot,
-    StateCursorSlot,
+    specialize_decode_layout, CompileOptions, ConvGeometry as DecodeConvGeometry, DecodeLayout,
+    InferenceOptions, KdaGeometry as DecodeKdaGeometry, PreparedProgram, ProgramRequest,
+    ProgramSlot, StateCursorSlot,
 };
 use effect_torch_graph::CrossEntropyReduction as CeReduction;
 use effect_torch_graph::{AttentionWindow, Device, PositionOffset, RotaryLayout};
 use effect_torch_napi::{try_register_export, unregister_export, vec_to_bytes, CancellationState};
-use effect_torch_runtime::{Buffer, GgmlKQuant, SamplingOptions, MAX_SAMPLING_VOCABULARY};
+use effect_torch_runtime::{
+    effective_probabilities, purpose_counter, random_unit, random_unit_at, sample_probabilities,
+    sampling_coordinate, Buffer, GgmlKQuant, SamplingOptions, SamplingPurpose,
+    MAX_SAMPLING_VOCABULARY,
+};
 use runtime::dtype::DType;
 pub type LeafSlot = effect_torch_graph::LeafSlot;
 pub(crate) type Node = effect_torch_graph::Node;
@@ -111,7 +115,7 @@ impl From<DecodeConvGeometry> for ConvGeometry {
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 
 use err::to_napi_err;
@@ -274,7 +278,13 @@ pub struct NativeKvStateSchema {
     pub kv_dtype: NativeDType,
     pub window: Option<u32>,
     pub batch: u32,
+    pub packed_causal_chains: Option<NativePackedCausalChainsLayout>,
     pub last_token_row: Option<bool>,
+}
+
+#[napi(object)]
+pub struct NativePackedCausalChainsLayout {
+    pub rows_per_sequence: u32,
 }
 
 #[napi(object)]
@@ -2015,14 +2025,44 @@ struct PoolInner {
 }
 
 impl PoolInner {
+    fn ref_block(&self, block: u32) -> err::Res<()> {
+        let mut store = self
+            .blocks
+            .lock()
+            .map_err(|error| format!("kv block store lock poisoned: {error}"))?;
+        let count = store
+            .refcounts
+            .get_mut(block as usize)
+            .ok_or_else(|| "kv block reference is out of range".to_string())?;
+        *count = count
+            .checked_add(1)
+            .ok_or_else(|| "kv block reference count exhausted".to_string())?;
+        Ok(())
+    }
+
+    fn live_blocks(&self) -> u64 {
+        self.blocks
+            .lock()
+            .map(|store| store.refcounts.iter().filter(|count| **count > 0).count() as u64)
+            .unwrap_or(0)
+    }
+
     // Takes a fresh block with refcount 1: free list first, then LRU
     // eviction of unreferenced cached blocks.
+    #[cfg(test)]
     fn alloc_block(&self) -> Option<u32> {
+        self.alloc_block_with_cache_eviction(true)
+    }
+
+    fn alloc_block_with_cache_eviction(&self, evict_cache: bool) -> Option<u32> {
         let mut store = self.blocks.lock().ok()?;
         if let Some(block) = store.free.pop() {
             store.refcounts[block as usize] = 1;
             store.hashes[block as usize] = None;
             return Some(block);
+        }
+        if !evict_cache {
+            return None;
         }
         while let Some(candidate) = store.lru.pop_front() {
             if !store.is_cached(candidate) {
@@ -2131,20 +2171,38 @@ impl SeqState {
     // correctly across prefill chunks and decode steps. Called with the
     // cursor still at its pre-run value.
     fn note_tokens(&mut self, pool: &PoolInner, tokens: &[u32]) {
+        self.note_tokens_with(tokens, pool.block_size, |block, hash| {
+            pool.set_hash(block, hash)
+        });
+    }
+
+    // Speculative roots update their rolling token metadata but do not make
+    // provisional or rejected blocks visible through the prefix cache.
+    fn note_tokens_provisional(&mut self, tokens: &[u32], block_size: usize) {
+        self.note_tokens_with(tokens, block_size, |_, _| {});
+        debug_assert!(self.pending.len() < block_size);
+    }
+
+    fn note_tokens_with(
+        &mut self,
+        tokens: &[u32],
+        block_size: usize,
+        mut publish: impl FnMut(u32, u64),
+    ) {
         for (i, &token) in tokens.iter().enumerate() {
             self.pending.push(token);
-            if self.pending.len() == pool.block_size {
+            if self.pending.len() == block_size {
                 let hash = chain_hash(self.last_hash, &self.pending);
                 self.last_hash = hash;
                 self.pending.clear();
                 // The block holding this token completed; it was
                 // allocated by the run that wrote its first row.
-                let block_index = (self.cursor + i) / pool.block_size;
+                let block_index = (self.cursor + i) / block_size;
                 if let Some(&block) = block_index
                     .checked_sub(self.head)
                     .and_then(|index| self.blocks.get(index))
                 {
-                    pool.set_hash(block, hash);
+                    publish(block, hash);
                 }
             }
         }
@@ -2261,6 +2319,11 @@ pub(crate) struct KvContext {
     schema: KvStateSchema,
     tokens: Vec<Vec<u32>>,
     lanes: Vec<usize>,
+    /// Packed graph row to compact request index. `None` rows are inert pads.
+    packed_rows: Option<Vec<Option<usize>>>,
+    /// Explicit absolute position for each packed graph row.
+    packed_positions: Option<Vec<usize>>,
+    publish_hashes: bool,
 }
 
 impl MetalDecodeContext for KvContext {
@@ -2287,15 +2350,29 @@ impl MetalDecodeContext for KvContext {
         self.slots.len()
     }
 
+    fn position_offsets(&self) -> err::Res<Vec<usize>> {
+        if let Some(positions) = &self.packed_positions {
+            return Ok(positions.clone());
+        }
+        let mut offsets = vec![0; self.schema.graph_batch];
+        for (request, slot) in self.slots.iter().enumerate() {
+            offsets[self.lanes[request]] = slot
+                .lock()
+                .map_err(|error| format!("decode position: sequence lock poisoned: {error}"))?
+                .cursor;
+        }
+        Ok(offsets)
+    }
+
     fn prepare_state(&self, cursor: &runtime::metal::run::MetalTensor) -> err::Res<()> {
         let shape = if self.schema.cursor_tensor {
-            vec![self.schema.batch]
+            vec![self.schema.graph_batch]
         } else {
             Vec::new()
         };
         cursor.validate_destination("decode cursor", &shape, DType::I64)?;
         let count = if self.schema.cursor_tensor {
-            self.schema.batch
+            self.schema.graph_batch
         } else {
             1
         };
@@ -2311,12 +2388,8 @@ impl MetalDecodeContext for KvContext {
                 count * DType::I64.size_in_bytes(),
             );
         }
-        for (request_index, slot) in self.slots.iter().enumerate() {
-            let index = self.lanes[request_index];
-            let value = slot
-                .lock()
-                .map_err(|error| format!("decode cursor: sequence lock poisoned: {error}"))?
-                .cursor as i64;
+        let positions = self.position_offsets()?;
+        for (index, value) in positions.into_iter().enumerate() {
             // SAFETY: `validate_destination` proved an i64 contiguous cursor
             // buffer with enough elements for the fixed schema; each index is
             // below `count` and slots are written once.
@@ -2326,7 +2399,7 @@ impl MetalDecodeContext for KvContext {
                     .contents_ptr()
                     .cast::<i64>()
                     .add(cursor.layout.offset() + index)
-                    .write(value);
+                    .write(value as i64);
             }
         }
         Ok(())
@@ -2360,10 +2433,16 @@ impl MetalDecodeContext for KvContext {
     }
 
     fn commit_slot(&self, index: usize, state: &mut SeqState) {
-        state.note_tokens(&self.pool, &self.tokens[index]);
+        if self.publish_hashes {
+            state.note_tokens(&self.pool, &self.tokens[index]);
+        } else {
+            state.note_tokens_provisional(&self.tokens[index], self.pool.block_size);
+        }
         state.cursor += state.advance;
         state.advance = 0;
-        self.pool.publish_recurrent_snapshot(state);
+        if self.publish_hashes {
+            self.pool.publish_recurrent_snapshot(state);
+        }
     }
 }
 
@@ -2380,21 +2459,20 @@ pub(crate) fn prepare_kv_attention(
         ));
     }
     let schema = kv.schema;
-    if plan.batch != schema.batch
+    if plan.batch != schema.graph_batch
         || plan.kv_heads != schema.kv_heads
         || plan.head_dim != schema.head_dim
-        || plan.batch != schema.batch
     {
         return Err(format!(
             "kv attention: fixed plan does not match the bound state schema"
         ));
     }
     let expected_shapes = [
-        vec![schema.batch, schema.max_tokens / schema.block_size],
-        vec![schema.batch],
-        vec![schema.batch],
-        vec![schema.batch],
-        vec![schema.batch],
+        vec![schema.graph_batch, schema.max_tokens / schema.block_size],
+        vec![schema.graph_batch],
+        vec![schema.graph_batch],
+        vec![schema.graph_batch],
+        vec![schema.graph_batch],
     ];
     for (tensor, shape) in staging.iter().zip(&expected_shapes) {
         tensor.validate_destination("kv staging", shape, DType::U32)?;
@@ -2402,7 +2480,7 @@ pub(crate) fn prepare_kv_attention(
     let table = &staging[0];
     let max_blocks = schema.max_tokens / schema.block_size;
     let table_bytes = schema
-        .batch
+        .graph_batch
         .checked_mul(max_blocks)
         .and_then(|elements| elements.checked_mul(DType::U32.size_in_bytes()))
         .ok_or_else(|| "kv attention: block table byte size overflow".to_string())?;
@@ -2428,11 +2506,86 @@ pub(crate) fn prepare_kv_attention(
                     .cast::<u8>()
                     .add(tensor.layout.offset() * DType::U32.size_in_bytes()),
                 0,
-                schema.batch * DType::U32.size_in_bytes(),
+                schema.graph_batch * DType::U32.size_in_bytes(),
             );
         }
     }
     let layer = layer as usize;
+    if let Some(rows) = &kv.packed_rows {
+        if rows.len() != schema.graph_batch
+            || kv
+                .packed_positions
+                .as_ref()
+                .is_none_or(|positions| positions.len() != rows.len())
+        {
+            return Err("kv attention: malformed packed row metadata".to_string());
+        }
+        // Reserve each physical sequence frontier once. Every graph row then
+        // references that same block table with its own context and position.
+        for slot in &kv.slots {
+            let mut state = slot
+                .lock()
+                .map_err(|error| format!("kv attention: sequence lock poisoned: {error}"))?;
+            let advance = state.advance;
+            kv_prepare(
+                &kv.pool,
+                &mut state,
+                layer,
+                schema.window,
+                plan.kv_heads,
+                plan.head_dim,
+                advance,
+                kv.publish_hashes,
+            )?;
+        }
+        let mut local_rows = vec![0usize; kv.slots.len()];
+        for (batch_index, request) in rows.iter().enumerate() {
+            let Some(request) = request else { continue };
+            let slot = kv.slots.get(*request).ok_or_else(|| {
+                "kv attention: packed row references an unknown sequence".to_string()
+            })?;
+            let state = slot
+                .lock()
+                .map_err(|error| format!("kv attention: sequence lock poisoned: {error}"))?;
+            if state.blocks.len() > max_blocks || local_rows[*request] >= state.advance {
+                return Err(
+                    "kv attention: packed row exceeds its logical sequence rows".to_string()
+                );
+            }
+            unsafe {
+                let table_row = table
+                    .buffer
+                    .contents_ptr()
+                    .cast::<u32>()
+                    .add(table.layout.offset() + batch_index * max_blocks);
+                std::ptr::copy_nonoverlapping(state.blocks.as_ptr(), table_row, state.blocks.len());
+            }
+            let context = state.cursor + local_rows[*request] + 1;
+            local_rows[*request] += 1;
+            for (tensor, value) in
+                staging[1..]
+                    .iter()
+                    .zip([context as u32, state.head as u32, 1, 0])
+            {
+                unsafe {
+                    tensor
+                        .buffer
+                        .contents_ptr()
+                        .cast::<u32>()
+                        .add(tensor.layout.offset() + batch_index)
+                        .write(value);
+                }
+            }
+        }
+        if local_rows
+            .iter()
+            .zip(&kv.slots)
+            .any(|(rows, slot)| slot.lock().map_or(true, |state| *rows != state.advance))
+        {
+            return Err("kv attention: packed logical row counts are inconsistent".to_string());
+        }
+        return Ok(());
+    }
     for (request_index, slot) in kv.slots.iter().enumerate() {
         let batch_index = kv.lanes[request_index];
         let mut state = slot
@@ -2446,6 +2599,7 @@ pub(crate) fn prepare_kv_attention(
             plan.kv_heads,
             plan.head_dim,
             plan.time,
+            kv.publish_hashes,
         )?;
         if state.blocks.len() > max_blocks {
             return Err("kv attention: block table exceeds its schema capacity".to_string());
@@ -2517,7 +2671,7 @@ pub(crate) fn kv_attention_into(
     {
         return Err("kv attention: incompatible grouped-query q/k/v shapes".to_string());
     }
-    if batch != kv.schema.batch || output.layout.shape() != q.layout.shape() {
+    if batch != kv.schema.graph_batch || output.layout.shape() != q.layout.shape() {
         return Err("kv attention: destination shape or decode batch is inconsistent".to_string());
     }
     if staging.len() != 5 {
@@ -2585,6 +2739,7 @@ fn kv_prepare(
     h: usize,
     d: usize,
     t: usize,
+    evict_cache: bool,
 ) -> err::Res<(usize, usize, usize)> {
     if layer >= pool.k.len() {
         return Err(format!(
@@ -2625,12 +2780,14 @@ fn kv_prepare(
     }
     let needed_blocks = needed.div_ceil(pool.block_size);
     while state.head + state.blocks.len() < needed_blocks {
-        let block = pool.alloc_block().ok_or_else(|| {
-            err::err_str(format!(
-                "kv attention: pool exhausted ({} tokens across live sequences)",
-                pool.max_tokens
-            ))
-        })?;
+        let block = pool
+            .alloc_block_with_cache_eviction(evict_cache)
+            .ok_or_else(|| {
+                err::err_str(format!(
+                    "kv attention: pool exhausted ({} tokens across live sequences)",
+                    pool.max_tokens
+                ))
+            })?;
         state.blocks.push(block);
     }
     Ok((cursor, needed, start))
@@ -3003,6 +3160,7 @@ struct StatefulExecutable {
     cursor_tensor: bool,
     allows_window_eviction: bool,
     schema: KvStateSchema,
+    packed_rows_per_sequence: Option<usize>,
 }
 
 fn validate_execution_mode(
@@ -3249,6 +3407,14 @@ impl Executable {
     }
 
     #[napi(getter)]
+    pub fn packed_rows_per_sequence(&self) -> Option<u32> {
+        self.state
+            .as_ref()
+            .and_then(|state| state.packed_rows_per_sequence)
+            .map(|rows| rows as u32)
+    }
+
+    #[napi(getter)]
     pub fn allows_window_eviction(&self) -> bool {
         self.state
             .as_ref()
@@ -3418,6 +3584,2616 @@ impl Executable {
             }
         }
     }
+
+    #[napi]
+    #[allow(clippy::too_many_arguments)]
+    pub async fn execute_speculative(
+        &self,
+        proposer: &Executable,
+        target_sequences: Vec<&NativeKvSequence>,
+        proposer_sequences: Vec<&NativeKvSequence>,
+        slots: Vec<u32>,
+        pending_tokens: Vec<u32>,
+        sampling: Vec<NativeSamplingOptions>,
+        max_draft_tokens: u32,
+        page_limits: Vec<u32>,
+        eos_tokens: Vec<Vec<u32>>,
+        cancellation_token: Option<&CancellationToken>,
+    ) -> Result<Vec<Vec<u32>>> {
+        let sampling = sampling
+            .into_iter()
+            .map(sampling_options)
+            .collect::<Result<Vec<_>>>()?;
+        let target = validate_speculative_program(self, false)?;
+        let proposer = validate_speculative_program(proposer, true)?;
+        validate_speculative_request(
+            &target,
+            &proposer,
+            &target_sequences,
+            &proposer_sequences,
+            &slots,
+            &pending_tokens,
+            &sampling,
+            max_draft_tokens as usize,
+            &page_limits,
+            &eos_tokens,
+        )?;
+
+        let target_states = target_sequences
+            .iter()
+            .map(|sequence| sequence.state.clone())
+            .collect::<Vec<_>>();
+        let proposer_states = proposer_sequences
+            .iter()
+            .map(|sequence| sequence.state.clone())
+            .collect::<Vec<_>>();
+        let target_pool = target_sequences[0].pool.clone();
+        let proposer_pool = proposer_sequences[0].pool.clone();
+        let mut locks = target_sequences
+            .iter()
+            .chain(&proposer_sequences)
+            .map(|sequence| sequence.run_lock.clone())
+            .collect::<Vec<_>>();
+        locks.sort_by_key(|lock| Arc::as_ptr(lock) as usize);
+        locks.dedup_by(|left, right| Arc::ptr_eq(left, right));
+        let released = target_sequences
+            .iter()
+            .chain(&proposer_sequences)
+            .map(|sequence| sequence.released.clone())
+            .collect::<Vec<_>>();
+        let slots = slots
+            .into_iter()
+            .map(|slot| slot as usize)
+            .collect::<Vec<_>>();
+
+        run_compute(cancellation_token, move |cancelled, cancellation| {
+            let _guards = locks
+                .iter()
+                .map(|lock| {
+                    lock.lock().map_err(|error| {
+                        Error::new(
+                            Status::GenericFailure,
+                            format!("speculative sequence lock poisoned: {error}"),
+                        )
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            if released
+                .iter()
+                .any(|released| released.load(Ordering::SeqCst))
+            {
+                return Err(Error::new(
+                    Status::GenericFailure,
+                    "speculative sequence is released".to_string(),
+                ));
+            }
+            let mut target_shadow =
+                ShadowSequences::new(target_pool, &target_states).map_err(to_napi_err)?;
+            let mut proposer_shadow =
+                ShadowSequences::new(proposer_pool, &proposer_states).map_err(to_napi_err)?;
+            let pages = execute_speculative_blocking(
+                &target,
+                &proposer,
+                &mut target_shadow,
+                &mut proposer_shadow,
+                &slots,
+                &pending_tokens,
+                &sampling,
+                max_draft_tokens as usize,
+                &page_limits,
+                &eos_tokens,
+                cancelled,
+                None,
+                None,
+            )
+            .map_err(to_napi_err)?;
+            if !cancellation.complete() {
+                return Err(Error::new(
+                    Status::GenericFailure,
+                    "operation aborted".to_string(),
+                ));
+            }
+            // Check every destination before the first mutation. The run locks
+            // exclude all other sequence operations through publication.
+            for state in target_states.iter().chain(&proposer_states) {
+                drop(state.lock().map_err(|error| {
+                    Error::new(
+                        Status::GenericFailure,
+                        format!("speculative state lock poisoned: {error}"),
+                    )
+                })?);
+            }
+            publish_speculative_states(&mut target_shadow, &target_states, &pending_tokens, &pages);
+            publish_speculative_states(
+                &mut proposer_shadow,
+                &proposer_states,
+                &pending_tokens,
+                &pages,
+            );
+            Ok(pages)
+        })
+        .await
+    }
+}
+
+#[derive(Clone)]
+struct SpeculativeProgram {
+    executable: Arc<executable::MetalExecutable>,
+    generated: Vec<value::Value>,
+    schema: KvStateSchema,
+    batch: usize,
+    time: usize,
+    vocabulary: usize,
+    token_dtype: DType,
+    packed_rows_per_sequence: Option<usize>,
+}
+
+fn validate_speculative_program(
+    program: &Executable,
+    proposer: bool,
+) -> Result<SpeculativeProgram> {
+    let phase = if proposer { "proposer" } else { "target" };
+    let state = program.state.as_ref().ok_or_else(|| {
+        Error::new(
+            Status::InvalidArg,
+            format!("executeSpeculative: {phase} must be stateful"),
+        )
+    })?;
+    if proposer == state.packed_rows_per_sequence.is_some() {
+        return Err(Error::new(
+            Status::InvalidArg,
+            format!("executeSpeculative: {phase} has the wrong dense/packed decode layout"),
+        ));
+    }
+    if state.schema.window.is_some()
+        || state.allows_window_eviction
+        || state.schema.kda.layers != 0
+        || state.schema.conv.layers != 0
+    {
+        return Err(Error::new(
+            Status::InvalidArg,
+            format!("executeSpeculative: {phase} window/KDA/convolution state is unsupported"),
+        ));
+    }
+    let tensor_slots = program
+        .inner
+        .slots
+        .iter()
+        .enumerate()
+        .filter(|(index, slot)| {
+            !slot.scalar && !(state.cursor_tensor && *index as u32 == state.cursor_slot)
+        })
+        .map(|(_, slot)| slot)
+        .collect::<Vec<_>>();
+    let expected_rows = state.schema.graph_batch;
+    if tensor_slots.len() != 1
+        || !matches!(tensor_slots[0].dtype, DType::U32 | DType::I64)
+        || tensor_slots[0].shape.len() != 2
+        || tensor_slots[0].shape[0] != expected_rows
+        || tensor_slots[0].shape[1] != 1
+    {
+        return Err(Error::new(
+            Status::InvalidArg,
+            format!("executeSpeculative: {phase} must have one u32/i64 [B, T] token input"),
+        ));
+    }
+    let time = tensor_slots[0].shape[1];
+    if time == 0 {
+        return Err(Error::new(
+            Status::InvalidArg,
+            format!("executeSpeculative: {phase} token width must be positive"),
+        ));
+    }
+    let outputs = &program.inner.executable.program.outputs;
+    let values = &program.inner.executable.program.values;
+    let vocabulary = if proposer {
+        if outputs.len() != state.schema.batch {
+            return Err(Error::new(
+                Status::InvalidArg,
+                "executeSpeculative: proposer must expose one last-row logits vector per fixed lane",
+            ));
+        }
+        let first = &values[outputs[0].index()];
+        if first.shape.len() != 1
+            || outputs.iter().any(|output| {
+                let declaration = &values[output.index()];
+                declaration.shape != first.shape || declaration.dtype != first.dtype
+            })
+        {
+            return Err(Error::new(
+                Status::InvalidArg,
+                "executeSpeculative: proposer outputs must be uniform rank-one logits",
+            ));
+        }
+        first.shape[0]
+    } else {
+        if outputs.len() != 1 {
+            return Err(Error::new(
+                Status::InvalidArg,
+                "executeSpeculative: target must expose one [graphRows, 1, V] logits tensor",
+            ));
+        }
+        let output = &values[outputs[0].index()];
+        if output.shape.len() != 3
+            || output.shape[0] != state.schema.graph_batch
+            || output.shape[1] != 1
+        {
+            return Err(Error::new(
+                Status::InvalidArg,
+                "executeSpeculative: target output must be [graphRows, 1, V]",
+            ));
+        }
+        output.shape[2]
+    };
+    let valid_dtype = outputs.iter().all(|output| {
+        matches!(
+            values[output.index()].dtype,
+            DType::F16 | DType::BF16 | DType::F32
+        )
+    });
+    if !valid_dtype || vocabulary == 0 || vocabulary > MAX_SAMPLING_VOCABULARY {
+        return Err(Error::new(
+            Status::InvalidArg,
+            format!("executeSpeculative: {phase} has invalid logits dtype or vocabulary"),
+        ));
+    }
+    Ok(SpeculativeProgram {
+        executable: program.inner.executable.clone(),
+        generated: program.inner.generated_bindings.clone(),
+        schema: state.schema,
+        batch: state.schema.batch,
+        time,
+        vocabulary,
+        token_dtype: tensor_slots[0].dtype,
+        packed_rows_per_sequence: state.packed_rows_per_sequence,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_speculative_request(
+    target: &SpeculativeProgram,
+    proposer: &SpeculativeProgram,
+    target_sequences: &[&NativeKvSequence],
+    proposer_sequences: &[&NativeKvSequence],
+    slots: &[u32],
+    pending: &[u32],
+    sampling: &[SamplingOptions],
+    max_draft_tokens: usize,
+    page_limits: &[u32],
+    eos_tokens: &[Vec<u32>],
+) -> Result<()> {
+    let count = target_sequences.len();
+    if count == 0
+        || count > target.batch
+        || proposer.batch != target.batch
+        || proposer.vocabulary != target.vocabulary
+        || proposer_sequences.len() != count
+        || slots.len() != count
+        || pending.len() != count
+        || sampling.len() != count
+        || page_limits.len() != count
+        || eos_tokens.len() != count
+        || target
+            .packed_rows_per_sequence
+            .is_none_or(|rows| max_draft_tokens + 1 > rows)
+    {
+        return Err(Error::new(
+            Status::InvalidArg,
+            "executeSpeculative: incompatible batch, vocabulary, arrays, or draft width",
+        ));
+    }
+    let mut sorted_slots = slots.to_vec();
+    sorted_slots.sort_unstable();
+    if sorted_slots.windows(2).any(|pair| pair[0] == pair[1])
+        || sorted_slots
+            .last()
+            .is_some_and(|slot| *slot as usize >= target.batch)
+        || pending
+            .iter()
+            .any(|token| *token as usize >= target.vocabulary)
+        || page_limits.iter().any(|limit| *limit == 0)
+    {
+        return Err(Error::new(
+            Status::InvalidArg,
+            "executeSpeculative: invalid fixed slots, token, EOS token, or page limit",
+        ));
+    }
+    for options in sampling {
+        if options.top_k.is_some_and(|top_k| top_k > target.vocabulary) {
+            return Err(Error::new(
+                Status::InvalidArg,
+                "executeSpeculative: topK exceeds the shared vocabulary",
+            ));
+        }
+    }
+    let mut all_states: Vec<*const Mutex<SeqState>> = Vec::with_capacity(count * 2);
+    for (phase, sequences, schema) in [
+        ("target", target_sequences, target.schema),
+        ("proposer", proposer_sequences, proposer.schema),
+    ] {
+        for (index, sequence) in sequences.iter().enumerate() {
+            if sequence.released.load(Ordering::SeqCst)
+                || !Arc::ptr_eq(&sequence.pool, &sequences[0].pool)
+                || sequence.pool.max_tokens != schema.max_tokens
+                || sequence.pool.block_size != schema.block_size
+                || sequence.pool.dtype != schema.kv_dtype
+                || sequence.pool.k.len() != schema.layers
+                || sequence.pool.kv_heads != schema.kv_heads
+                || sequence.pool.head_dim != schema.head_dim
+                || sequence.pool.kda != schema.kda
+                || sequence.pool.conv != schema.conv
+            {
+                return Err(Error::new(
+                    Status::InvalidArg,
+                    format!("executeSpeculative: {phase} sequence {index} is incompatible"),
+                ));
+            }
+            let pointer = Arc::as_ptr(&sequence.state);
+            if all_states.contains(&pointer) {
+                return Err(Error::new(
+                    Status::InvalidArg,
+                    "executeSpeculative: duplicate sequence across target/proposer batches",
+                ));
+            }
+            all_states.push(pointer);
+        }
+    }
+    Ok(())
+}
+
+struct ShadowSequences {
+    pool: Arc<PoolInner>,
+    states: Vec<Arc<Mutex<SeqState>>>,
+}
+
+impl ShadowSequences {
+    fn new(pool: Arc<PoolInner>, canonical: &[Arc<Mutex<SeqState>>]) -> err::Res<Self> {
+        let mut shadow = Self {
+            pool,
+            states: Vec::with_capacity(canonical.len()),
+        };
+        for state in canonical {
+            let state = state
+                .lock()
+                .map_err(|error| format!("speculative state lock poisoned: {error}"))?;
+            let mut retained = Vec::with_capacity(state.blocks.len());
+            for &block in &state.blocks {
+                if let Err(error) = shadow.pool.ref_block(block) {
+                    for block in retained {
+                        shadow.pool.unref_block(block);
+                    }
+                    return Err(error);
+                }
+                retained.push(block);
+            }
+            let mut provisional = match sequence_state(&shadow.pool, false) {
+                Ok(provisional) => provisional,
+                Err(error) => {
+                    for block in retained {
+                        shadow.pool.unref_block(block);
+                    }
+                    return Err(error);
+                }
+            };
+            if shadow.pool.kda.layers > 0 || shadow.pool.conv.layers > 0 {
+                let snapshot = RecurrentSnapshot::capture(&state).ok_or_else(|| {
+                    for &block in &retained {
+                        shadow.pool.unref_block(block);
+                    }
+                    "speculative recurrent state cannot be copied".to_string()
+                })?;
+                if let Err(error) = snapshot.restore_into(&mut provisional) {
+                    for block in retained {
+                        shadow.pool.unref_block(block);
+                    }
+                    return Err(error);
+                }
+            }
+            provisional.blocks = retained;
+            provisional.head = state.head;
+            provisional.cursor = state.cursor;
+            provisional.last_hash = state.last_hash;
+            provisional.pending = state.pending.clone();
+            shadow.states.push(Arc::new(Mutex::new(provisional)));
+        }
+        Ok(shadow)
+    }
+
+    fn provisional_blocks(&self, canonical: &[Arc<Mutex<SeqState>>]) -> u64 {
+        self.states
+            .iter()
+            .zip(canonical)
+            .map(|(provisional, canonical)| {
+                let provisional = provisional
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner());
+                let canonical = canonical.lock().unwrap_or_else(|error| error.into_inner());
+                provisional
+                    .blocks
+                    .iter()
+                    .filter(|block| !canonical.blocks.contains(block))
+                    .count() as u64
+            })
+            .sum()
+    }
+}
+
+impl Drop for ShadowSequences {
+    fn drop(&mut self) {
+        for state in &self.states {
+            let mut state = state.lock().unwrap_or_else(|error| error.into_inner());
+            for block in state.blocks.drain(..) {
+                self.pool.unref_block(block);
+            }
+        }
+    }
+}
+
+fn read_float_tensor(value: &value::Value) -> err::Res<Vec<f64>> {
+    let tensor = value.as_metal()?;
+    if !tensor.layout.is_contiguous() {
+        return Err("executeSpeculative: logits output must be contiguous".to_string());
+    }
+    let offset = tensor.layout.offset();
+    let elements = tensor.numel();
+    let end = offset
+        .checked_add(elements)
+        .and_then(|count| count.checked_mul(tensor.dtype.size_in_bytes()))
+        .ok_or_else(|| "executeSpeculative: logits layout overflow".to_string())?;
+    if end > tensor.buffer.size {
+        return Err("executeSpeculative: logits output exceeds its buffer".to_string());
+    }
+    let pointer = tensor.buffer.contents_ptr();
+    let values = (0..elements)
+        .map(|index| unsafe {
+            match tensor.dtype {
+                DType::F32 => *pointer.cast::<f32>().add(offset + index) as f64,
+                DType::F16 => {
+                    half::f16::from_bits(*pointer.cast::<u16>().add(offset + index)).to_f64()
+                }
+                DType::BF16 => {
+                    half::bf16::from_bits(*pointer.cast::<u16>().add(offset + index)).to_f64()
+                }
+                _ => unreachable!("validated logits dtype"),
+            }
+        })
+        .collect();
+    Ok(values)
+}
+
+fn token_input(
+    tokens: &[Vec<u32>],
+    lanes: &[usize],
+    batch: usize,
+    time: usize,
+    dtype: DType,
+) -> err::Res<value::Value> {
+    let mut dense = vec![0u32; batch * time];
+    for (tokens, lane) in tokens.iter().zip(lanes) {
+        if tokens.is_empty() || tokens.len() > time {
+            return Err("executeSpeculative: invalid logical token row".to_string());
+        }
+        dense[*lane * time..*lane * time + tokens.len()].copy_from_slice(tokens);
+    }
+    let bytes = match dtype {
+        DType::U32 => dense
+            .iter()
+            .flat_map(|token| token.to_ne_bytes())
+            .collect::<Vec<_>>(),
+        DType::I64 => dense
+            .iter()
+            .flat_map(|token| (*token as i64).to_ne_bytes())
+            .collect::<Vec<_>>(),
+        _ => return Err("executeSpeculative: token input must be u32 or i64".to_string()),
+    };
+    value::value_from_bytes(&bytes, &[batch, time], dtype)
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct PackedVerificationPlan {
+    row_offsets: Vec<usize>,
+    logical_rows: Vec<usize>,
+    row_to_request: Vec<Option<usize>>,
+    positions: Vec<usize>,
+    tokens: Vec<Vec<u32>>,
+}
+
+fn packed_verification_plan(
+    graph_rows: usize,
+    rows_per_sequence: usize,
+    cursors: &[usize],
+    tokens: &[Vec<u32>],
+) -> err::Res<PackedVerificationPlan> {
+    if cursors.len() != tokens.len() || tokens.is_empty() {
+        return Err("executeSpeculative: malformed packed sequence metadata".to_string());
+    }
+    let logical_rows = tokens.iter().map(Vec::len).collect::<Vec<_>>();
+    if logical_rows
+        .iter()
+        .any(|rows| *rows == 0 || *rows > rows_per_sequence)
+    {
+        return Err(
+            "executeSpeculative: packed logical rows exceed the compiled layout".to_string(),
+        );
+    }
+    let mut row_offsets = Vec::with_capacity(tokens.len() + 1);
+    row_offsets.push(0usize);
+    for rows in &logical_rows {
+        row_offsets.push(
+            row_offsets
+                .last()
+                .copied()
+                .unwrap()
+                .checked_add(*rows)
+                .ok_or_else(|| "executeSpeculative: packed row offset overflow".to_string())?,
+        );
+    }
+    if row_offsets.last().copied().unwrap_or(0) > graph_rows {
+        return Err("executeSpeculative: packed rows exceed graphRows".to_string());
+    }
+    let mut dense_tokens = vec![vec![0]; graph_rows];
+    let mut row_to_request = vec![None; graph_rows];
+    let mut positions = vec![0; graph_rows];
+    for (request, row) in tokens.iter().enumerate() {
+        let start = row_offsets[request];
+        for (local, token) in row.iter().enumerate() {
+            dense_tokens[start + local][0] = *token;
+            row_to_request[start + local] = Some(request);
+            positions[start + local] = cursors[request]
+                .checked_add(local)
+                .ok_or_else(|| "executeSpeculative: packed position overflow".to_string())?;
+        }
+    }
+    Ok(PackedVerificationPlan {
+        row_offsets,
+        logical_rows,
+        row_to_request,
+        positions,
+        tokens: dense_tokens,
+    })
+}
+
+fn run_speculative_program(
+    program: &SpeculativeProgram,
+    shadow: &ShadowSequences,
+    request_indices: &[usize],
+    slots: &[usize],
+    tokens: Vec<Vec<u32>>,
+    packed: Option<&PackedVerificationPlan>,
+    cancelled: &effect_torch_runtime::CancellationFlag,
+) -> err::Res<Vec<value::Value>> {
+    let states = request_indices
+        .iter()
+        .map(|index| shadow.states[*index].clone())
+        .collect::<Vec<_>>();
+    let lanes = request_indices
+        .iter()
+        .map(|index| slots[*index])
+        .collect::<Vec<_>>();
+    for (state, tokens) in states.iter().zip(&tokens) {
+        state
+            .lock()
+            .map_err(|error| format!("speculative shadow lock poisoned: {error}"))?
+            .advance = tokens.len();
+    }
+    let (input_tokens, input_lanes, packed_rows, packed_positions) = if let Some(packed) = packed {
+        (
+            packed.tokens.as_slice(),
+            (0..program.schema.graph_batch).collect::<Vec<_>>(),
+            Some(packed.row_to_request.clone()),
+            Some(packed.positions.clone()),
+        )
+    } else {
+        (tokens.as_slice(), lanes.clone(), None, None)
+    };
+    let input = token_input(
+        input_tokens,
+        &input_lanes,
+        program.schema.graph_batch,
+        program.time,
+        program.token_dtype,
+    )?;
+    let context = KvContext {
+        pool: shadow.pool.clone(),
+        slots: states,
+        schema: program.schema,
+        tokens,
+        lanes,
+        packed_rows,
+        packed_positions,
+        publish_hashes: false,
+    };
+    executable::execute_stateful(
+        &program.executable,
+        &[input],
+        &program.generated,
+        cancelled,
+        &context,
+        &|| true,
+    )
+}
+
+fn run_prefill_program(
+    program: &SpeculativeProgram,
+    shadow: &ShadowSequences,
+    slots: &[usize],
+    prompts: &[Vec<u32>],
+    cancelled: &effect_torch_runtime::CancellationFlag,
+) -> err::Res<Vec<value::Value>> {
+    let mut offsets = shadow
+        .states
+        .iter()
+        .zip(prompts)
+        .map(|(state, prompt)| {
+            let cursor = state
+                .lock()
+                .map_err(|error| format!("inference prefill shadow lock: {error}"))?
+                .cursor;
+            if cursor >= prompt.len() {
+                return Err("inference[prefill]: matched prefix includes final token".to_string());
+            }
+            Ok(cursor)
+        })
+        .collect::<err::Res<Vec<_>>>()?;
+    let mut final_outputs = vec![None; prompts.len()];
+    loop {
+        let active = (0..prompts.len())
+            .filter(|index| offsets[*index] < prompts[*index].len())
+            .collect::<Vec<_>>();
+        if active.is_empty() {
+            break;
+        }
+        let tokens = active
+            .iter()
+            .map(|index| {
+                let end = (offsets[*index] + program.time).min(prompts[*index].len());
+                let chunk = prompts[*index][offsets[*index]..end].to_vec();
+                offsets[*index] = end;
+                chunk
+            })
+            .collect::<Vec<_>>();
+        let outputs =
+            run_speculative_program(program, shadow, &active, slots, tokens, None, cancelled)?;
+        for index in active {
+            final_outputs[index] = Some(outputs[slots[index]].clone());
+        }
+    }
+    final_outputs
+        .into_iter()
+        .map(|output| {
+            output.ok_or_else(|| "inference[prefill]: prompt produced no output".to_string())
+        })
+        .collect()
+}
+
+fn coordinate_seed(
+    seed: u64,
+    sequence_id: u64,
+    position: u64,
+    purpose: SamplingPurpose,
+    subcounter: u64,
+) -> u64 {
+    let mut key = seed;
+    for component in [sequence_id, position, purpose as u64, subcounter] {
+        key = purpose_counter(key, SamplingPurpose::Target, component);
+    }
+    key
+}
+
+fn run_sampled_program(
+    program: &SpeculativeProgram,
+    shadow: &ShadowSequences,
+    slots: &[usize],
+    tokens: Vec<Vec<u32>>,
+    sampling: &[SamplingOptions],
+    cancelled: &effect_torch_runtime::CancellationFlag,
+) -> err::Res<Vec<u32>> {
+    let states = shadow.states.clone();
+    for state in &states {
+        state
+            .lock()
+            .map_err(|error| format!("inference decode shadow lock: {error}"))?
+            .advance = 1;
+    }
+    let input = token_input(
+        &tokens,
+        slots,
+        program.schema.graph_batch,
+        program.time,
+        program.token_dtype,
+    )?;
+    let context = KvContext {
+        pool: shadow.pool.clone(),
+        slots: states,
+        schema: program.schema,
+        tokens,
+        lanes: slots.to_vec(),
+        packed_rows: None,
+        packed_positions: None,
+        publish_hashes: false,
+    };
+    executable::execute_stateful_sampled(
+        &program.executable,
+        &[input],
+        &program.generated,
+        cancelled,
+        &context,
+        &|| true,
+        sampling,
+    )
+}
+
+fn probabilities(
+    logits: &[f64],
+    options: SamplingOptions,
+    cancelled: &effect_torch_runtime::CancellationFlag,
+) -> err::Res<Vec<f64>> {
+    effective_probabilities(
+        logits.len(),
+        |index| logits[index],
+        options,
+        || cancelled.load(Ordering::Relaxed),
+    )
+}
+
+fn cut_speculative_page(page: &mut Vec<u32>, eos_tokens: &[u32], page_limit: u32) {
+    if let Some(index) = page.iter().position(|token| eos_tokens.contains(token)) {
+        page.truncate(index + 1);
+    }
+    page.truncate(page_limit as usize);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn execute_speculative_blocking(
+    target: &SpeculativeProgram,
+    proposer: &SpeculativeProgram,
+    target_shadow: &mut ShadowSequences,
+    proposer_shadow: &mut ShadowSequences,
+    slots: &[usize],
+    pending: &[u32],
+    sampling: &[SamplingOptions],
+    max_draft_tokens: usize,
+    page_limits: &[u32],
+    eos_tokens: &[Vec<u32>],
+    cancelled: &effect_torch_runtime::CancellationFlag,
+    coordinates: Option<(&[u64], &[u64])>,
+    mut stats: Option<&mut SpeculativeStats>,
+) -> err::Res<Vec<Vec<u32>>> {
+    let count = pending.len();
+    let proposal_limits = page_limits
+        .iter()
+        .enumerate()
+        .map(|(lane, limit)| {
+            let target_cursor = target_shadow.states[lane]
+                .lock()
+                .map_err(|error| format!("speculative shadow lock poisoned: {error}"))?
+                .cursor;
+            let proposer_cursor = proposer_shadow.states[lane]
+                .lock()
+                .map_err(|error| format!("speculative shadow lock poisoned: {error}"))?
+                .cursor;
+            if target_cursor != proposer_cursor
+                || target_cursor >= target.schema.max_tokens
+                || proposer_cursor >= proposer.schema.max_tokens
+            {
+                return Err(
+                    "executeSpeculative: incompatible or exhausted sequence cursors".to_string(),
+                );
+            }
+            let remaining = (target.schema.max_tokens - target_cursor)
+                .min(proposer.schema.max_tokens - proposer_cursor);
+            Ok(max_draft_tokens.min(*limit as usize - 1).min(remaining - 1))
+        })
+        .collect::<err::Res<Vec<_>>>()?;
+    let mut candidates = vec![Vec::<u32>::new(); count];
+    let mut proposal_probabilities = vec![Vec::<Vec<f64>>::new(); count];
+    let draft_started = std::time::Instant::now();
+    for candidate_index in 0..proposal_limits.iter().copied().max().unwrap_or(0) {
+        let active = (0..count)
+            .filter(|lane| candidate_index < proposal_limits[*lane])
+            .collect::<Vec<_>>();
+        let tokens = active
+            .iter()
+            .map(|lane| {
+                vec![if candidate_index == 0 {
+                    pending[*lane]
+                } else {
+                    candidates[*lane][candidate_index - 1]
+                }]
+            })
+            .collect::<Vec<_>>();
+        let outputs = run_speculative_program(
+            proposer,
+            proposer_shadow,
+            &active,
+            slots,
+            tokens,
+            None,
+            cancelled,
+        )?;
+        for lane in active {
+            let logits = read_float_tensor(&outputs[slots[lane]])?;
+            let mut options = sampling[lane];
+            options.counter = purpose_counter(
+                options.counter + candidate_index as u64,
+                SamplingPurpose::Proposal,
+                0,
+            );
+            let q = probabilities(&logits, options, cancelled)?;
+            let token = if let Some((sequence_ids, positions)) = coordinates {
+                sample_at(
+                    &q,
+                    InferenceSampling {
+                        temperature: options.temperature,
+                        top_k: options.top_k,
+                        top_p: options.top_p,
+                        seed: options.seed,
+                    },
+                    sequence_ids[lane],
+                    positions[lane] + candidate_index as u64,
+                    SamplingPurpose::Proposal,
+                    0,
+                )
+            } else {
+                sample_probabilities(&q, options.seed, options.counter, || {
+                    cancelled.load(Ordering::Relaxed)
+                })?
+            };
+            candidates[lane].push(token);
+            proposal_probabilities[lane].push(q);
+        }
+    }
+    if let Some(stats) = stats.as_deref_mut() {
+        stats.proposed = proposal_limits.iter().sum();
+        stats.draft_nanos = draft_started.elapsed().as_nanos().max(1) as u64;
+    }
+
+    let all = (0..count).collect::<Vec<_>>();
+    let verify_tokens = (0..count)
+        .map(|lane| {
+            let mut row = Vec::with_capacity(candidates[lane].len() + 1);
+            row.push(pending[lane]);
+            row.extend_from_slice(&candidates[lane]);
+            row
+        })
+        .collect::<Vec<_>>();
+    let target_cursors = target_shadow
+        .states
+        .iter()
+        .map(|state| {
+            state
+                .lock()
+                .map(|state| state.cursor)
+                .map_err(|error| format!("speculative shadow lock poisoned: {error}"))
+        })
+        .collect::<err::Res<Vec<_>>>()?;
+    let packed = packed_verification_plan(
+        target.schema.graph_batch,
+        target
+            .packed_rows_per_sequence
+            .ok_or_else(|| "executeSpeculative: target packed layout is missing".to_string())?,
+        &target_cursors,
+        &verify_tokens,
+    )?;
+    let verify_started = std::time::Instant::now();
+    let target_outputs = run_speculative_program(
+        target,
+        target_shadow,
+        &all,
+        slots,
+        verify_tokens,
+        Some(&packed),
+        cancelled,
+    )?;
+    if let Some(stats) = stats.as_deref_mut() {
+        stats.verification_nanos = verify_started.elapsed().as_nanos().max(1) as u64;
+    }
+    let target_logits = read_float_tensor(&target_outputs[0])?;
+    let row = target.vocabulary;
+    let mut pages = Vec::with_capacity(count);
+    for lane in 0..count {
+        let mut page = Vec::new();
+        let mut rejected = false;
+        for candidate_index in 0..candidates[lane].len() {
+            let start = (packed.row_offsets[lane] + candidate_index) * row;
+            let p = probabilities(
+                &target_logits[start..start + row],
+                sampling[lane],
+                cancelled,
+            )?;
+            let q = &proposal_probabilities[lane][candidate_index];
+            let token = candidates[lane][candidate_index];
+            let accept = if sampling[lane].temperature == 0.0 {
+                p[token as usize] > 0.0
+            } else {
+                let probability = (p[token as usize] / q[token as usize]).min(1.0);
+                if let Some((sequence_ids, positions)) = coordinates {
+                    random_unit_at(sampling_coordinate(
+                        sampling[lane].seed,
+                        sequence_ids[lane],
+                        positions[lane] + candidate_index as u64,
+                        SamplingPurpose::Accept,
+                        0,
+                    )) < probability
+                } else {
+                    random_unit(
+                        sampling[lane].seed,
+                        purpose_counter(
+                            sampling[lane].counter + candidate_index as u64,
+                            SamplingPurpose::Accept,
+                            0,
+                        ),
+                    ) < probability
+                }
+            };
+            if accept {
+                page.push(token);
+                if let Some(stats) = stats.as_deref_mut() {
+                    stats.accepted[lane] += 1;
+                }
+                continue;
+            }
+            let residual = p
+                .iter()
+                .zip(q)
+                .map(|(p, q)| (p - q).max(0.0))
+                .collect::<Vec<_>>();
+            page.push(if let Some((sequence_ids, positions)) = coordinates {
+                sample_at(
+                    &residual,
+                    InferenceSampling {
+                        temperature: sampling[lane].temperature,
+                        top_k: sampling[lane].top_k,
+                        top_p: sampling[lane].top_p,
+                        seed: sampling[lane].seed,
+                    },
+                    sequence_ids[lane],
+                    positions[lane] + candidate_index as u64,
+                    SamplingPurpose::Residual,
+                    0,
+                )
+            } else {
+                sample_probabilities(
+                    &residual,
+                    sampling[lane].seed,
+                    purpose_counter(
+                        sampling[lane].counter + candidate_index as u64,
+                        SamplingPurpose::Residual,
+                        0,
+                    ),
+                    || cancelled.load(Ordering::Relaxed),
+                )?
+            });
+            rejected = true;
+            break;
+        }
+        if !rejected {
+            let bonus_index = candidates[lane].len();
+            let start = (packed.row_offsets[lane] + bonus_index) * row;
+            let p = probabilities(
+                &target_logits[start..start + row],
+                sampling[lane],
+                cancelled,
+            )?;
+            page.push(if let Some((sequence_ids, positions)) = coordinates {
+                sample_at(
+                    &p,
+                    InferenceSampling {
+                        temperature: sampling[lane].temperature,
+                        top_k: sampling[lane].top_k,
+                        top_p: sampling[lane].top_p,
+                        seed: sampling[lane].seed,
+                    },
+                    sequence_ids[lane],
+                    positions[lane] + bonus_index as u64,
+                    SamplingPurpose::Target,
+                    0,
+                )
+            } else {
+                sample_probabilities(
+                    &p,
+                    sampling[lane].seed,
+                    purpose_counter(
+                        sampling[lane].counter + bonus_index as u64,
+                        SamplingPurpose::Target,
+                        0,
+                    ),
+                    || cancelled.load(Ordering::Relaxed),
+                )?
+            });
+        }
+        cut_speculative_page(&mut page, &eos_tokens[lane], page_limits[lane]);
+        pages.push(page);
+    }
+
+    // A full chain has not consumed its final candidate in the proposer. The
+    // zero-draft case similarly has not consumed the old pending token.
+    let mut catchup = Vec::new();
+    let mut catchup_tokens = Vec::new();
+    for lane in 0..count {
+        let old_cursor = proposer_shadow.states[lane]
+            .lock()
+            .map_err(|error| format!("speculative shadow lock poisoned: {error}"))?
+            .cursor
+            .saturating_sub(proposal_limits[lane]);
+        let desired = old_cursor + pages[lane].len();
+        let current = proposer_shadow.states[lane]
+            .lock()
+            .map_err(|error| format!("speculative shadow lock poisoned: {error}"))?
+            .cursor;
+        if desired > current {
+            let consumed = std::iter::once(pending[lane])
+                .chain(pages[lane].iter().copied())
+                .take(pages[lane].len())
+                .collect::<Vec<_>>();
+            catchup.push(lane);
+            catchup_tokens.push(vec![consumed[current - old_cursor]]);
+        }
+    }
+    if !catchup.is_empty() {
+        run_speculative_program(
+            proposer,
+            proposer_shadow,
+            &catchup,
+            slots,
+            catchup_tokens,
+            None,
+            cancelled,
+        )?;
+    }
+    if cancelled.load(Ordering::Relaxed) {
+        return Err("operation aborted".to_string());
+    }
+    Ok(pages)
+}
+
+#[derive(Default)]
+struct SpeculativeStats {
+    proposed: usize,
+    accepted: Vec<usize>,
+    draft_nanos: u64,
+    verification_nanos: u64,
+}
+
+fn publish_speculative_states(
+    shadow: &mut ShadowSequences,
+    canonical: &[Arc<Mutex<SeqState>>],
+    pending: &[u32],
+    pages: &[Vec<u32>],
+) -> u64 {
+    let mut rolled_back = 0;
+    for (index, (shadow_state, canonical_state)) in shadow.states.iter().zip(canonical).enumerate()
+    {
+        let mut provisional = shadow_state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let mut canonical = canonical_state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let consumed = std::iter::once(pending[index])
+            .chain(pages[index].iter().copied())
+            .take(pages[index].len())
+            .collect::<Vec<_>>();
+        let desired_cursor = canonical.cursor + consumed.len();
+        let retained = desired_cursor
+            .div_ceil(shadow.pool.block_size)
+            .saturating_sub(provisional.head);
+        for block in provisional.blocks.drain(retained..) {
+            if !canonical.blocks.contains(&block) {
+                rolled_back += 1;
+            }
+            shadow.pool.unref_block(block);
+        }
+        let old_blocks = std::mem::replace(
+            &mut canonical.blocks,
+            std::mem::take(&mut provisional.blocks),
+        );
+        canonical.head = provisional.head;
+        canonical.advance = 0;
+        canonical.note_tokens(&shadow.pool, &consumed);
+        canonical.cursor = desired_cursor;
+        for block in old_blocks {
+            shadow.pool.unref_block(block);
+        }
+    }
+    rolled_back
+}
+
+// Cohesive inference owns lane assignment, paired state, policy and receipts in
+// one native object. The lower-level stateful execution API above remains a
+// separate primitive for callers that need logits or direct KV control.
+#[derive(Clone, Copy)]
+struct InferenceSampling {
+    temperature: f64,
+    top_k: Option<usize>,
+    top_p: f64,
+    seed: u64,
+}
+
+#[napi(object)]
+pub struct NativeInferenceSamplingOptions {
+    pub temperature: f64,
+    pub top_k: u32,
+    pub top_p: f64,
+    pub seed: BigInt,
+}
+
+#[napi(object)]
+pub struct NativeInferenceSamplingOverride {
+    pub temperature: Option<f64>,
+    pub top_k: Option<u32>,
+    pub top_p: Option<f64>,
+    pub seed: Option<BigInt>,
+}
+
+fn inference_sampling(value: NativeInferenceSamplingOptions) -> Result<InferenceSampling> {
+    let (negative, seed, lossless) = value.seed.get_u64();
+    if negative || !lossless {
+        return Err(Error::new(
+            Status::InvalidArg,
+            "inference: seed must be an unsigned 64-bit integer",
+        ));
+    }
+    let options = sampling_options(NativeSamplingOptions {
+        temperature: value.temperature,
+        top_k: value.top_k as f64,
+        top_p: value.top_p,
+        seed: 0.0,
+        counter: 0.0,
+    })?;
+    Ok(InferenceSampling {
+        temperature: options.temperature,
+        top_k: options.top_k,
+        top_p: options.top_p,
+        seed,
+    })
+}
+
+fn inference_sampling_override(
+    base: InferenceSampling,
+    value: NativeInferenceSamplingOverride,
+) -> Result<InferenceSampling> {
+    inference_sampling(NativeInferenceSamplingOptions {
+        temperature: value.temperature.unwrap_or(base.temperature),
+        top_k: value.top_k.unwrap_or(base.top_k.unwrap_or(0) as u32),
+        top_p: value.top_p.unwrap_or(base.top_p),
+        seed: value.seed.unwrap_or_else(|| bigint(base.seed)),
+    })
+}
+
+fn fingerprint_word(hash: &mut u64, value: u64) {
+    for byte in value.to_le_bytes() {
+        *hash ^= byte as u64;
+        *hash = hash.wrapping_mul(HASH_PRIME);
+    }
+}
+
+fn fingerprint_sampling(hash: &mut u64, value: InferenceSampling) {
+    fingerprint_word(hash, value.temperature.to_bits());
+    fingerprint_word(hash, value.top_k.map_or(u64::MAX, |value| value as u64));
+    fingerprint_word(hash, value.top_p.to_bits());
+    fingerprint_word(hash, value.seed);
+}
+
+fn add_fingerprint(
+    prompts: &[Vec<u32>],
+    sampling: &[InferenceSampling],
+    max_tokens: &[Option<u32>],
+    eos_tokens: &[Vec<u32>],
+) -> u64 {
+    let mut hash = HASH_SEED;
+    fingerprint_word(&mut hash, 1);
+    fingerprint_word(&mut hash, prompts.len() as u64);
+    for index in 0..prompts.len() {
+        fingerprint_word(&mut hash, prompts[index].len() as u64);
+        for &token in &prompts[index] {
+            fingerprint_word(&mut hash, token as u64);
+        }
+        fingerprint_sampling(&mut hash, sampling[index]);
+        fingerprint_word(&mut hash, max_tokens[index].map_or(u64::MAX, u64::from));
+        fingerprint_word(&mut hash, eos_tokens[index].len() as u64);
+        for &token in &eos_tokens[index] {
+            fingerprint_word(&mut hash, token as u64);
+        }
+    }
+    hash
+}
+
+fn round_fingerprint(ids: &[u64], sampling: &[InferenceSampling]) -> u64 {
+    let mut hash = HASH_SEED;
+    fingerprint_word(&mut hash, 2);
+    fingerprint_word(&mut hash, ids.len() as u64);
+    for (&id, &sampling) in ids.iter().zip(sampling) {
+        fingerprint_word(&mut hash, id);
+        fingerprint_sampling(&mut hash, sampling);
+    }
+    hash
+}
+
+fn record_inference_failure(
+    diagnostics: &InferenceDiagnosticsState,
+    error: &Error,
+    fallback: &str,
+) {
+    let reason = &error.reason;
+    let phase = reason
+        .split_once("inference[")
+        .and_then(|(_, rest)| rest.split_once(']'))
+        .map_or(fallback, |(phase, _)| phase);
+    *diagnostics
+        .last_failure_phase
+        .lock()
+        .unwrap_or_else(|error| error.into_inner()) = Some(phase.to_string());
+}
+
+fn inference_options(value: InferenceSampling) -> SamplingOptions {
+    SamplingOptions {
+        temperature: value.temperature,
+        top_k: value.top_k,
+        top_p: value.top_p,
+        seed: value.seed,
+        counter: 0,
+    }
+}
+
+fn bigint(value: u64) -> BigInt {
+    BigInt {
+        sign_bit: false,
+        words: vec![value],
+    }
+}
+
+fn inference_program(
+    program: &Executable,
+    phase: &str,
+    time_one: bool,
+) -> Result<SpeculativeProgram> {
+    let state = program.state.as_ref().ok_or_else(|| {
+        Error::new(
+            Status::InvalidArg,
+            format!("inference[{phase}]: executable must be stateful"),
+        )
+    })?;
+    if state.packed_rows_per_sequence.is_some() {
+        return Err(Error::new(
+            Status::InvalidArg,
+            format!("inference[{phase}]: executable must use dense lanes"),
+        ));
+    }
+    let tensor_slots = program
+        .inner
+        .slots
+        .iter()
+        .enumerate()
+        .filter(|(index, slot)| {
+            !slot.scalar && !(state.cursor_tensor && *index as u32 == state.cursor_slot)
+        })
+        .map(|(_, slot)| slot)
+        .collect::<Vec<_>>();
+    if tensor_slots.len() != 1
+        || !matches!(tensor_slots[0].dtype, DType::U32 | DType::I64)
+        || tensor_slots[0].shape.len() != 2
+        || tensor_slots[0].shape[0] != state.schema.graph_batch
+        || tensor_slots[0].shape[1] == 0
+        || (time_one && tensor_slots[0].shape[1] != 1)
+    {
+        return Err(Error::new(
+            Status::InvalidArg,
+            format!("inference[{phase}]: expected one compatible [B, T] token input"),
+        ));
+    }
+    let outputs = &program.inner.executable.program.outputs;
+    let values = &program.inner.executable.program.values;
+    if outputs.len() != state.schema.batch {
+        return Err(Error::new(
+            Status::InvalidArg,
+            format!("inference[{phase}]: expected one last-token logits row per lane"),
+        ));
+    }
+    let first = &values[outputs[0].index()];
+    if first.shape.len() != 1
+        || first.shape[0] == 0
+        || first.shape[0] > MAX_SAMPLING_VOCABULARY
+        || !matches!(first.dtype, DType::F16 | DType::BF16 | DType::F32)
+        || outputs.iter().any(|output| {
+            let declaration = &values[output.index()];
+            declaration.shape != first.shape || declaration.dtype != first.dtype
+        })
+    {
+        return Err(Error::new(
+            Status::InvalidArg,
+            format!("inference[{phase}]: invalid last-token logits outputs"),
+        ));
+    }
+    Ok(SpeculativeProgram {
+        executable: program.inner.executable.clone(),
+        generated: program.inner.generated_bindings.clone(),
+        schema: state.schema,
+        batch: state.schema.batch,
+        time: tensor_slots[0].shape[1],
+        vocabulary: first.shape[0],
+        token_dtype: tensor_slots[0].dtype,
+        packed_rows_per_sequence: None,
+    })
+}
+
+fn compatible_pool(program: &SpeculativeProgram, pool: &Arc<PoolInner>) -> bool {
+    pool.max_tokens == program.schema.max_tokens
+        && pool.block_size == program.schema.block_size
+        && pool.dtype == program.schema.kv_dtype
+        && pool.k.len() == program.schema.layers
+        && pool.kv_heads == program.schema.kv_heads
+        && pool.head_dim == program.schema.head_dim
+        && pool.kda == program.schema.kda
+        && pool.conv == program.schema.conv
+}
+
+fn read_prompt(tensor: &NativeTensor, dtype: DType, max_time: usize) -> Result<Vec<u32>> {
+    let value = tensor.val_cloned()?;
+    if value.dtype() != dtype || value.shape().len() != 2 || value.shape()[0] != 1 {
+        return Err(Error::new(
+            Status::InvalidArg,
+            "inference[prefill]: prompt must be one token row with the artifact dtype",
+        ));
+    }
+    let length = value.shape()[1];
+    if length == 0 || length > max_time {
+        return Err(Error::new(
+            Status::InvalidArg,
+            format!("inference[prefill]: prompt length must be in 1..={max_time}"),
+        ));
+    }
+    let tensor = value.as_metal().map_err(to_napi_err)?;
+    if !tensor.layout.is_contiguous() || tensor.layout.offset() != 0 {
+        return Err(Error::new(
+            Status::InvalidArg,
+            "inference[prefill]: prompt must be contiguous",
+        ));
+    }
+    let pointer = tensor.buffer.contents_ptr();
+    let tokens = (0..length)
+        .map(|index| unsafe {
+            match dtype {
+                DType::U32 => Ok(*pointer.cast::<u32>().add(index)),
+                DType::I64 => u32::try_from(*pointer.cast::<i64>().add(index)).map_err(|_| {
+                    Error::new(
+                        Status::InvalidArg,
+                        "inference[prefill]: token is outside u32",
+                    )
+                }),
+                _ => unreachable!("inference token dtype was validated"),
+            }
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(tokens)
+}
+
+fn make_managed_sequence(pool: &Arc<PoolInner>) -> Result<NativeKvSequence> {
+    Ok(NativeKvSequence {
+        pool: pool.clone(),
+        state: Arc::new(Mutex::new(
+            sequence_state(pool, false).map_err(to_napi_err)?,
+        )),
+        run_lock: Arc::new(Mutex::new(())),
+        released: Arc::new(AtomicBool::new(false)),
+    })
+}
+
+fn publish_shadow(shadow: &mut ShadowSequences, canonical: &[Arc<Mutex<SeqState>>]) {
+    for (provisional, canonical) in shadow.states.iter().zip(canonical) {
+        let mut provisional = provisional
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let mut canonical = canonical.lock().unwrap_or_else(|error| error.into_inner());
+        let old_blocks = std::mem::replace(
+            &mut canonical.blocks,
+            std::mem::take(&mut provisional.blocks),
+        );
+        canonical.head = provisional.head;
+        canonical.cursor = provisional.cursor;
+        canonical.advance = 0;
+        canonical.last_hash = provisional.last_hash;
+        canonical.pending = std::mem::take(&mut provisional.pending);
+        canonical.kda_states = std::mem::take(&mut provisional.kda_states);
+        canonical.conv_states = std::mem::take(&mut provisional.conv_states);
+        for block in old_blocks {
+            shadow.pool.unref_block(block);
+        }
+    }
+}
+
+struct StagedCacheMetadata {
+    pool: Arc<PoolInner>,
+    blocks: Vec<(u32, u64)>,
+    snapshots: Vec<(u64, Arc<RecurrentSnapshot>)>,
+}
+
+fn stage_cache_metadata(shadow: &ShadowSequences, prompts: &[Vec<u32>]) -> StagedCacheMetadata {
+    let mut blocks = Vec::new();
+    let mut snapshots = Vec::new();
+    for (state, prompt) in shadow.states.iter().zip(prompts) {
+        let state = state.lock().unwrap_or_else(|error| error.into_inner());
+        let mut hash = HASH_SEED;
+        for (absolute, tokens) in prompt.chunks_exact(shadow.pool.block_size).enumerate() {
+            hash = chain_hash(hash, tokens);
+            if let Some(&block) = absolute
+                .checked_sub(state.head)
+                .and_then(|index| state.blocks.get(index))
+            {
+                blocks.push((block, hash));
+            }
+        }
+        if !shadow.pool.k.is_empty()
+            && (shadow.pool.kda.layers > 0 || shadow.pool.conv.layers > 0)
+            && state.cursor > 0
+            && state.cursor % shadow.pool.block_size == 0
+            && state.kda_states.len() == shadow.pool.kda.layers
+            && state.conv_states.len() == shadow.pool.conv.layers
+        {
+            if let Some(captured) = RecurrentSnapshot::capture(&state) {
+                snapshots.push((state.last_hash, Arc::new(captured)));
+            }
+        }
+    }
+    StagedCacheMetadata {
+        pool: shadow.pool.clone(),
+        blocks,
+        snapshots,
+    }
+}
+
+fn publish_cache_metadata(store: &mut BlockStore, metadata: &StagedCacheMetadata) {
+    for &(block, hash) in &metadata.blocks {
+        if store.hashes[block as usize].is_none() {
+            store.hashes[block as usize] = Some(hash);
+            store.by_hash.entry(hash).or_default().push(block);
+        }
+    }
+    for (hash, snapshot) in &metadata.snapshots {
+        if store.by_hash.contains_key(hash) {
+            store.snapshots.insert(*hash, snapshot.clone());
+        }
+    }
+}
+
+fn publish_paired_cache_metadata(
+    target: &StagedCacheMetadata,
+    proposer: Option<&StagedCacheMetadata>,
+) {
+    let Some(proposer) = proposer else {
+        let mut store = target
+            .pool
+            .blocks
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        publish_cache_metadata(&mut store, target);
+        return;
+    };
+    if Arc::ptr_eq(&target.pool, &proposer.pool) {
+        let mut store = target
+            .pool
+            .blocks
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        publish_cache_metadata(&mut store, target);
+        publish_cache_metadata(&mut store, proposer);
+        return;
+    }
+
+    let target_first = Arc::as_ptr(&target.pool) < Arc::as_ptr(&proposer.pool);
+    let (first, second) = if target_first {
+        (target, proposer)
+    } else {
+        (proposer, target)
+    };
+    let mut first_store = first
+        .pool
+        .blocks
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let mut second_store = second
+        .pool
+        .blocks
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    publish_cache_metadata(&mut first_store, first);
+    publish_cache_metadata(&mut second_store, second);
+}
+
+fn sample_at(
+    probabilities: &[f64],
+    sampling: InferenceSampling,
+    sequence_id: u64,
+    position: u64,
+    purpose: SamplingPurpose,
+    subcounter: u64,
+) -> u32 {
+    if sampling.temperature == 0.0 {
+        return probabilities
+            .iter()
+            .position(|probability| *probability > 0.0)
+            .unwrap_or(0) as u32;
+    }
+    let total: f64 = probabilities.iter().sum();
+    let mut draw = random_unit_at(sampling_coordinate(
+        sampling.seed,
+        sequence_id,
+        position,
+        purpose,
+        subcounter,
+    )) * total;
+    for (token, probability) in probabilities.iter().enumerate() {
+        draw -= probability;
+        if draw < 0.0 {
+            return token as u32;
+        }
+    }
+    probabilities.len().saturating_sub(1) as u32
+}
+
+#[derive(Clone)]
+struct InferencePrograms {
+    target_prefill: SpeculativeProgram,
+    target_decode: SpeculativeProgram,
+    target_verify: Option<SpeculativeProgram>,
+    target_pool: Arc<PoolInner>,
+    proposer_prefill: Option<SpeculativeProgram>,
+    proposer_decode: Option<SpeculativeProgram>,
+    proposer_pool: Option<Arc<PoolInner>>,
+    max_draft_tokens: usize,
+    batch: usize,
+    sampling: InferenceSampling,
+}
+
+#[derive(Default)]
+struct InferenceDiagnosticsState {
+    rounds_started: AtomicU64,
+    rounds_completed: AtomicU64,
+    rounds_recovered: AtomicU64,
+    ordinary_rounds: AtomicU64,
+    speculative_rounds: AtomicU64,
+    proposed_tokens: AtomicU64,
+    accepted_tokens: AtomicU64,
+    emitted_tokens: AtomicU64,
+    provisional_blocks: AtomicU64,
+    rolled_back_blocks: AtomicU64,
+    draft_nanos: AtomicU64,
+    verification_nanos: AtomicU64,
+    accepted_length_histogram: Mutex<Vec<u64>>,
+    target_pool_high_water_blocks: AtomicU64,
+    proposer_pool_high_water_blocks: AtomicU64,
+    last_round_id: AtomicU64,
+    has_round: AtomicBool,
+    last_failure_phase: Mutex<Option<String>>,
+}
+
+#[napi]
+pub struct NativeInferenceArtifact {
+    programs: Arc<InferencePrograms>,
+    next_sequence_id: Arc<AtomicU64>,
+    next_round_id: Arc<AtomicU64>,
+    diagnostics: Arc<InferenceDiagnosticsState>,
+}
+
+#[napi(object)]
+pub struct NativeInferenceDiagnostics {
+    pub rounds_started: BigInt,
+    pub rounds_completed: BigInt,
+    pub rounds_recovered: BigInt,
+    pub ordinary_rounds: BigInt,
+    pub speculative_rounds: BigInt,
+    pub proposed_tokens: BigInt,
+    pub accepted_tokens: BigInt,
+    pub emitted_tokens: BigInt,
+    pub provisional_blocks: BigInt,
+    pub rolled_back_blocks: BigInt,
+    pub draft_nanos: BigInt,
+    pub verification_nanos: BigInt,
+    pub accepted_length_histogram: Vec<BigInt>,
+    pub target_pool_high_water_blocks: BigInt,
+    pub proposer_pool_high_water_blocks: Option<BigInt>,
+    pub last_round_id: Option<BigInt>,
+    pub last_failure_phase: Option<String>,
+}
+
+#[napi]
+impl NativeInferenceArtifact {
+    #[napi(constructor)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        target_prefill: &Executable,
+        target_decode: &Executable,
+        target_verify: Option<&Executable>,
+        target_pool: &NativeKvPool,
+        proposer_prefill: Option<&Executable>,
+        proposer_decode: Option<&Executable>,
+        proposer_pool: Option<&NativeKvPool>,
+        max_draft_tokens: Option<u32>,
+        batch_size: u32,
+        token_dtype: NativeDType,
+        sampling: NativeInferenceSamplingOptions,
+    ) -> Result<Self> {
+        let target_prefill = inference_program(target_prefill, "prefill", false)?;
+        let target_decode = inference_program(target_decode, "decode", true)?;
+        let target_verify = target_verify
+            .map(|program| validate_speculative_program(program, false))
+            .transpose()?;
+        let proposer_prefill = proposer_prefill
+            .map(|program| inference_program(program, "proposer", false))
+            .transpose()?;
+        let proposer_decode = proposer_decode
+            .map(|program| inference_program(program, "proposer", true))
+            .transpose()?;
+        let proposer_pool = proposer_pool.map(|pool| pool.inner.clone());
+        let proposer_complete = proposer_prefill.is_some()
+            && proposer_decode.is_some()
+            && proposer_pool.is_some()
+            && target_verify.is_some()
+            && max_draft_tokens.is_some_and(|value| value > 0);
+        let proposer_empty = proposer_prefill.is_none()
+            && proposer_decode.is_none()
+            && proposer_pool.is_none()
+            && target_verify.is_none()
+            && max_draft_tokens.is_none();
+        if !proposer_complete && !proposer_empty {
+            return Err(Error::new(
+                Status::InvalidArg,
+                "inference[compile]: proposer requires prefill, decode, pool, target verify and maxDraftTokens",
+            ));
+        }
+        let batch = batch_size as usize;
+        let dtype: DType = token_dtype.into();
+        if batch == 0
+            || target_prefill.batch != batch
+            || target_decode.batch != batch
+            || target_prefill.token_dtype != dtype
+            || target_decode.token_dtype != dtype
+            || target_prefill.vocabulary != target_decode.vocabulary
+            || !compatible_pool(&target_prefill, &target_pool.inner)
+            || !compatible_pool(&target_decode, &target_pool.inner)
+        {
+            return Err(Error::new(
+                Status::InvalidArg,
+                "inference[compile]: incompatible target programs, pool, batch or token dtype",
+            ));
+        }
+        if proposer_complete {
+            let prefill = proposer_prefill.as_ref().unwrap();
+            let decode = proposer_decode.as_ref().unwrap();
+            let verify = target_verify.as_ref().unwrap();
+            let pool = proposer_pool.as_ref().unwrap();
+            let draft = max_draft_tokens.unwrap() as usize;
+            if prefill.batch != batch
+                || decode.batch != batch
+                || verify.batch != batch
+                || prefill.token_dtype != dtype
+                || decode.token_dtype != dtype
+                || prefill.vocabulary != target_decode.vocabulary
+                || decode.vocabulary != target_decode.vocabulary
+                || verify.vocabulary != target_decode.vocabulary
+                || verify
+                    .packed_rows_per_sequence
+                    .is_none_or(|rows| draft + 1 > rows)
+                || !compatible_pool(prefill, pool)
+                || !compatible_pool(decode, pool)
+                || !compatible_pool(verify, &target_pool.inner)
+            {
+                return Err(Error::new(
+                    Status::InvalidArg,
+                    "inference[compile]: incompatible proposer/verify artifact bundle",
+                ));
+            }
+        }
+        let sampling = inference_sampling(sampling)?;
+        Ok(Self {
+            programs: Arc::new(InferencePrograms {
+                target_prefill,
+                target_decode,
+                target_verify,
+                target_pool: target_pool.inner.clone(),
+                proposer_prefill,
+                proposer_decode,
+                proposer_pool,
+                max_draft_tokens: max_draft_tokens.unwrap_or(0) as usize,
+                batch,
+                sampling,
+            }),
+            next_sequence_id: Arc::new(AtomicU64::new(0)),
+            next_round_id: Arc::new(AtomicU64::new(0)),
+            diagnostics: Arc::new(InferenceDiagnosticsState {
+                accepted_length_histogram: Mutex::new(vec![
+                    0;
+                    max_draft_tokens.unwrap_or(0) as usize
+                        + 1
+                ]),
+                ..InferenceDiagnosticsState::default()
+            }),
+        })
+    }
+
+    #[napi]
+    pub fn open(&self) -> NativeInferenceSession {
+        static NEXT_SESSION: AtomicU64 = AtomicU64::new(1);
+        NativeInferenceSession {
+            programs: self.programs.clone(),
+            next_sequence_id: self.next_sequence_id.clone(),
+            next_round_id: self.next_round_id.clone(),
+            diagnostics: self.diagnostics.clone(),
+            state: Arc::new(Mutex::new(InferenceSessionState {
+                id: NEXT_SESSION.fetch_add(1, Ordering::Relaxed),
+                closed: false,
+                lanes: (0..self.programs.batch).map(|_| None).collect(),
+                receipt: None,
+            })),
+        }
+    }
+
+    #[napi(getter)]
+    pub fn inference_diagnostics(&self) -> NativeInferenceDiagnostics {
+        NativeInferenceDiagnostics {
+            rounds_started: bigint(self.diagnostics.rounds_started.load(Ordering::Relaxed)),
+            rounds_completed: bigint(self.diagnostics.rounds_completed.load(Ordering::Relaxed)),
+            rounds_recovered: bigint(self.diagnostics.rounds_recovered.load(Ordering::Relaxed)),
+            ordinary_rounds: bigint(self.diagnostics.ordinary_rounds.load(Ordering::Relaxed)),
+            speculative_rounds: bigint(self.diagnostics.speculative_rounds.load(Ordering::Relaxed)),
+            proposed_tokens: bigint(self.diagnostics.proposed_tokens.load(Ordering::Relaxed)),
+            accepted_tokens: bigint(self.diagnostics.accepted_tokens.load(Ordering::Relaxed)),
+            emitted_tokens: bigint(self.diagnostics.emitted_tokens.load(Ordering::Relaxed)),
+            provisional_blocks: bigint(self.diagnostics.provisional_blocks.load(Ordering::Relaxed)),
+            rolled_back_blocks: bigint(self.diagnostics.rolled_back_blocks.load(Ordering::Relaxed)),
+            draft_nanos: bigint(self.diagnostics.draft_nanos.load(Ordering::Relaxed)),
+            verification_nanos: bigint(self.diagnostics.verification_nanos.load(Ordering::Relaxed)),
+            accepted_length_histogram: self
+                .diagnostics
+                .accepted_length_histogram
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .iter()
+                .copied()
+                .map(bigint)
+                .collect(),
+            target_pool_high_water_blocks: bigint(
+                self.diagnostics
+                    .target_pool_high_water_blocks
+                    .load(Ordering::Relaxed),
+            ),
+            proposer_pool_high_water_blocks: self.programs.proposer_pool.as_ref().map(|_| {
+                bigint(
+                    self.diagnostics
+                        .proposer_pool_high_water_blocks
+                        .load(Ordering::Relaxed),
+                )
+            }),
+            last_round_id: self
+                .diagnostics
+                .has_round
+                .load(Ordering::Relaxed)
+                .then(|| bigint(self.diagnostics.last_round_id.load(Ordering::Relaxed))),
+            last_failure_phase: self
+                .diagnostics
+                .last_failure_phase
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .clone(),
+        }
+    }
+}
+
+struct InferenceLane {
+    sequence_id: u64,
+    target: NativeKvSequence,
+    proposer: Option<NativeKvSequence>,
+    pending: u32,
+    generated: u64,
+    max_tokens: Option<u64>,
+    eos: Vec<u32>,
+    terminal: Option<String>,
+    sampling: InferenceSampling,
+}
+
+#[derive(Clone)]
+struct ReceiptPage {
+    sequence_id: u64,
+    tokens: Vec<u32>,
+    stop_reason: Option<String>,
+}
+
+#[derive(Clone)]
+struct Receipt {
+    round_id: u64,
+    fingerprint: u64,
+    pages: Vec<ReceiptPage>,
+}
+
+fn recover_receipt(receipt: &Option<Receipt>, fingerprint: u64) -> Result<Option<&Receipt>> {
+    match receipt {
+        Some(receipt) if receipt.fingerprint == fingerprint => Ok(Some(receipt)),
+        Some(_) => Err(Error::new(
+            Status::InvalidArg,
+            "inference[admission]: pending receipt belongs to a different request",
+        )),
+        None => Ok(None),
+    }
+}
+
+fn acknowledge_receipt(receipt: &mut Option<Receipt>, round_id: u64) -> Result<()> {
+    match receipt {
+        Some(pending) if pending.round_id == round_id => *receipt = None,
+        _ => {
+            return Err(Error::new(
+                Status::InvalidArg,
+                "inference[publish]: receipt is not pending",
+            ))
+        }
+    }
+    Ok(())
+}
+
+struct InferenceSessionState {
+    id: u64,
+    closed: bool,
+    lanes: Vec<Option<InferenceLane>>,
+    receipt: Option<Receipt>,
+}
+
+#[napi]
+pub struct NativeInferenceSequence {
+    session_id: u64,
+    sequence_id: u64,
+}
+
+#[napi]
+impl NativeInferenceSequence {
+    #[napi(getter)]
+    pub fn sequence_id(&self) -> BigInt {
+        bigint(self.sequence_id)
+    }
+}
+
+#[napi(object)]
+pub struct NativeInferencePage {
+    pub sequence_id: BigInt,
+    pub tokens: Vec<u32>,
+    pub stop_reason: Option<String>,
+}
+
+#[napi(object)]
+pub struct NativeInferenceRoundResult {
+    pub round_id: BigInt,
+    pub recovered: bool,
+    pub pages: Vec<NativeInferencePage>,
+}
+
+#[napi(object)]
+pub struct NativeInferenceInspection {
+    pub sequence_id: BigInt,
+    pub cursor: BigInt,
+    pub terminal: Option<String>,
+}
+
+fn native_receipt(
+    _session_id: u64,
+    receipt: &Receipt,
+    recovered: bool,
+) -> NativeInferenceRoundResult {
+    NativeInferenceRoundResult {
+        round_id: bigint(receipt.round_id),
+        recovered,
+        pages: receipt
+            .pages
+            .iter()
+            .map(|page| NativeInferencePage {
+                sequence_id: bigint(page.sequence_id),
+                tokens: page.tokens.clone(),
+                stop_reason: page.stop_reason.clone(),
+            })
+            .collect(),
+    }
+}
+
+fn next_monotonic(counter: &AtomicU64, name: &str) -> Result<u64> {
+    counter
+        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |value| {
+            value.checked_add(1)
+        })
+        .map_err(|_| {
+            Error::new(
+                Status::GenericFailure,
+                format!("inference: {name} exhausted"),
+            )
+        })
+}
+
+#[napi]
+pub struct NativeInferenceSession {
+    programs: Arc<InferencePrograms>,
+    next_sequence_id: Arc<AtomicU64>,
+    next_round_id: Arc<AtomicU64>,
+    diagnostics: Arc<InferenceDiagnosticsState>,
+    state: Arc<Mutex<InferenceSessionState>>,
+}
+
+#[napi]
+impl NativeInferenceSession {
+    #[napi]
+    pub async fn add(
+        &self,
+        prompts: Vec<&NativeTensor>,
+        sampling: Vec<NativeInferenceSamplingOverride>,
+        max_tokens: Vec<Option<u32>>,
+        eos_tokens: Vec<Vec<u32>>,
+        cancellation_token: Option<&CancellationToken>,
+    ) -> Result<NativeInferenceRoundResult> {
+        if prompts.is_empty()
+            || prompts.len() != sampling.len()
+            || prompts.len() != max_tokens.len()
+            || prompts.len() != eos_tokens.len()
+            || max_tokens.iter().flatten().any(|value| *value == 0)
+        {
+            return Err(Error::new(
+                Status::InvalidArg,
+                "inference[admission]: add arrays must be nonempty and equal length with positive maxTokens",
+            ));
+        }
+        {
+            let state = self.state.lock().map_err(|error| {
+                Error::new(
+                    Status::GenericFailure,
+                    format!("inference session lock: {error}"),
+                )
+            })?;
+            if state.closed {
+                return Err(Error::new(
+                    Status::GenericFailure,
+                    "inference[admission]: session is closed",
+                ));
+            }
+            if state.receipt.is_none()
+                && prompts.len() > state.lanes.iter().filter(|lane| lane.is_none()).count()
+            {
+                return Err(Error::new(
+                    Status::InvalidArg,
+                    "inference[admission]: insufficient free lanes",
+                ));
+            }
+        }
+        let prompts = prompts
+            .iter()
+            .map(|prompt| {
+                read_prompt(
+                    prompt,
+                    self.programs.target_prefill.token_dtype,
+                    self.programs.target_prefill.schema.max_tokens,
+                )
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let sampling = sampling
+            .into_iter()
+            .map(|value| inference_sampling_override(self.programs.sampling, value))
+            .collect::<Result<Vec<_>>>()?;
+        let fingerprint = add_fingerprint(&prompts, &sampling, &max_tokens, &eos_tokens);
+        let programs = self.programs.clone();
+        let state = self.state.clone();
+        let diagnostics = self.diagnostics.clone();
+        let sequence_counter = self.next_sequence_id.clone();
+        let round_counter = self.next_round_id.clone();
+        let failure_diagnostics = diagnostics.clone();
+        let result = run_compute(cancellation_token, move |cancelled, cancellation| {
+            let mut session = state.lock().map_err(|error| {
+                Error::new(
+                    Status::GenericFailure,
+                    format!("inference session lock: {error}"),
+                )
+            })?;
+            if session.closed {
+                return Err(Error::new(
+                    Status::GenericFailure,
+                    "inference[admission]: session is closed",
+                ));
+            }
+            if let Some(receipt) = recover_receipt(&session.receipt, fingerprint)? {
+                diagnostics.rounds_recovered.fetch_add(1, Ordering::Relaxed);
+                return Ok(native_receipt(session.id, receipt, true));
+            }
+            diagnostics.rounds_started.fetch_add(1, Ordering::Relaxed);
+            let slots = session
+                .lanes
+                .iter()
+                .enumerate()
+                .filter_map(|(slot, lane)| lane.is_none().then_some(slot))
+                .take(prompts.len())
+                .collect::<Vec<_>>();
+            if slots.len() != prompts.len() {
+                return Err(Error::new(
+                    Status::InvalidArg,
+                    "inference[admission]: insufficient free lanes",
+                ));
+            }
+            let ids = (0..prompts.len())
+                .map(|_| next_monotonic(&sequence_counter, "sequence IDs"))
+                .collect::<Result<Vec<_>>>()?;
+            let target = (0..prompts.len())
+                .map(|_| make_managed_sequence(&programs.target_pool))
+                .collect::<Result<Vec<_>>>()?;
+            for (sequence, prompt) in target.iter().zip(&prompts) {
+                sequence.prefill_match(prompt.clone())?;
+            }
+            let target_states = target
+                .iter()
+                .map(|sequence| sequence.state.clone())
+                .collect::<Vec<_>>();
+            let mut target_shadow =
+                ShadowSequences::new(programs.target_pool.clone(), &target_states)
+                    .map_err(to_napi_err)?;
+            let outputs = run_prefill_program(
+                &programs.target_prefill,
+                &target_shadow,
+                &slots,
+                &prompts,
+                cancelled,
+            )
+            .map_err(to_napi_err)?;
+            let (proposer, mut proposer_shadow, proposer_states) =
+                if let (Some(prefill), Some(pool)) =
+                    (&programs.proposer_prefill, &programs.proposer_pool)
+                {
+                    let sequences = (0..prompts.len())
+                        .map(|_| make_managed_sequence(pool))
+                        .collect::<Result<Vec<_>>>()?;
+                    for (sequence, prompt) in sequences.iter().zip(&prompts) {
+                        sequence.prefill_match(prompt.clone())?;
+                    }
+                    let states = sequences
+                        .iter()
+                        .map(|sequence| sequence.state.clone())
+                        .collect::<Vec<_>>();
+                    let shadow =
+                        ShadowSequences::new(pool.clone(), &states).map_err(to_napi_err)?;
+                    run_prefill_program(prefill, &shadow, &slots, &prompts, cancelled)
+                        .map_err(to_napi_err)?;
+                    (Some(sequences), Some(shadow), states)
+                } else {
+                    (None, None, Vec::new())
+                };
+            let mut pages = Vec::with_capacity(prompts.len());
+            let mut policies = Vec::with_capacity(prompts.len());
+            for index in 0..prompts.len() {
+                let logits = read_float_tensor(&outputs[index]).map_err(to_napi_err)?;
+                let probabilities =
+                    probabilities(&logits, inference_options(sampling[index]), cancelled)
+                        .map_err(to_napi_err)?;
+                let token = sample_at(
+                    &probabilities,
+                    sampling[index],
+                    ids[index],
+                    0,
+                    SamplingPurpose::Target,
+                    0,
+                );
+                let terminal = if eos_tokens[index].contains(&token) {
+                    Some("eos".to_string())
+                } else if max_tokens[index] == Some(1) {
+                    Some("maxTokens".to_string())
+                } else {
+                    None
+                };
+                pages.push(ReceiptPage {
+                    sequence_id: ids[index],
+                    tokens: vec![token],
+                    stop_reason: terminal.clone(),
+                });
+                policies.push((token, terminal));
+            }
+            if !cancellation.complete() {
+                return Err(Error::new(Status::GenericFailure, "operation aborted"));
+            }
+            let round_id = next_monotonic(&round_counter, "round IDs")?;
+            let mut provisional_blocks = target_shadow.provisional_blocks(&target_states);
+            if let Some(shadow) = proposer_shadow.as_ref() {
+                provisional_blocks += shadow.provisional_blocks(&proposer_states);
+            }
+            let target_cache = stage_cache_metadata(&target_shadow, &prompts);
+            let proposer_cache = proposer_shadow
+                .as_ref()
+                .map(|shadow| stage_cache_metadata(shadow, &prompts));
+            publish_shadow(&mut target_shadow, &target_states);
+            if let Some(shadow) = proposer_shadow.as_mut() {
+                publish_shadow(shadow, &proposer_states);
+            }
+            let mut target = target.into_iter();
+            let mut proposer = proposer.map(Vec::into_iter);
+            for index in 0..prompts.len() {
+                session.lanes[slots[index]] = Some(InferenceLane {
+                    sequence_id: ids[index],
+                    target: target.next().expect("target sequence exists"),
+                    proposer: proposer
+                        .as_mut()
+                        .map(|values| values.next().expect("proposer sequence exists")),
+                    pending: policies[index].0,
+                    generated: 1,
+                    max_tokens: max_tokens[index].map(u64::from),
+                    eos: eos_tokens[index].clone(),
+                    terminal: policies[index].1.clone(),
+                    // Admission overrides apply only to the first page; later
+                    // rounds resolve sparse overrides from artifact defaults.
+                    sampling: programs.sampling,
+                });
+            }
+            let receipt = Receipt {
+                round_id,
+                fingerprint,
+                pages,
+            };
+            diagnostics.rounds_completed.fetch_add(1, Ordering::Relaxed);
+            diagnostics
+                .emitted_tokens
+                .fetch_add(prompts.len() as u64, Ordering::Relaxed);
+            diagnostics
+                .provisional_blocks
+                .fetch_add(provisional_blocks, Ordering::Relaxed);
+            diagnostics
+                .target_pool_high_water_blocks
+                .fetch_max(programs.target_pool.live_blocks(), Ordering::Relaxed);
+            if let Some(pool) = &programs.proposer_pool {
+                diagnostics
+                    .proposer_pool_high_water_blocks
+                    .fetch_max(pool.live_blocks(), Ordering::Relaxed);
+            }
+            diagnostics.last_round_id.store(round_id, Ordering::Relaxed);
+            diagnostics.has_round.store(true, Ordering::Relaxed);
+            session.receipt = Some(receipt.clone());
+            publish_paired_cache_metadata(&target_cache, proposer_cache.as_ref());
+            Ok(native_receipt(session.id, &receipt, false))
+        })
+        .await;
+        if let Err(error) = &result {
+            record_inference_failure(&failure_diagnostics, error, "prefill");
+        }
+        result
+    }
+
+    #[napi]
+    pub async fn run_round(
+        &self,
+        sequences: Vec<&NativeInferenceSequence>,
+        sampling: Vec<NativeInferenceSamplingOverride>,
+        cancellation_token: Option<&CancellationToken>,
+    ) -> Result<NativeInferenceRoundResult> {
+        if sequences.is_empty() || sequences.len() != sampling.len() {
+            return Err(Error::new(
+                Status::InvalidArg,
+                "inference[admission]: round arrays must be nonempty and equal",
+            ));
+        }
+        let identities = sequences
+            .iter()
+            .map(|sequence| (sequence.session_id, sequence.sequence_id))
+            .collect::<Vec<_>>();
+        let programs = self.programs.clone();
+        let state = self.state.clone();
+        let diagnostics = self.diagnostics.clone();
+        let round_counter = self.next_round_id.clone();
+        let failure_diagnostics = diagnostics.clone();
+        let result = run_compute(cancellation_token, move |cancelled, cancellation| {
+            let mut session = state.lock().map_err(|error| {
+                Error::new(
+                    Status::GenericFailure,
+                    format!("inference session lock: {error}"),
+                )
+            })?;
+            if session.closed {
+                return Err(Error::new(
+                    Status::GenericFailure,
+                    "inference[admission]: session is closed",
+                ));
+            }
+            let mut slots = Vec::with_capacity(identities.len());
+            for (owner, id) in &identities {
+                if *owner != session.id
+                    || slots.iter().any(|slot: &usize| {
+                        session.lanes[*slot]
+                            .as_ref()
+                            .is_some_and(|lane| lane.sequence_id == *id)
+                    })
+                {
+                    return Err(Error::new(
+                        Status::InvalidArg,
+                        "inference[admission]: foreign or duplicate sequence",
+                    ));
+                }
+                let slot = session
+                    .lanes
+                    .iter()
+                    .position(|lane| lane.as_ref().is_some_and(|lane| lane.sequence_id == *id))
+                    .ok_or_else(|| {
+                        Error::new(
+                            Status::InvalidArg,
+                            "inference[admission]: sequence is not live",
+                        )
+                    })?;
+                if session.lanes[slot].as_ref().unwrap().terminal.is_some() {
+                    return Err(Error::new(
+                        Status::InvalidArg,
+                        "inference[admission]: sequence is terminal",
+                    ));
+                }
+                slots.push(slot);
+            }
+            let selected = slots
+                .iter()
+                .map(|slot| session.lanes[*slot].as_ref().unwrap())
+                .collect::<Vec<_>>();
+            let sampling = sampling
+                .into_iter()
+                .zip(&selected)
+                .map(|(value, lane)| inference_sampling_override(lane.sampling, value))
+                .collect::<Result<Vec<_>>>()?;
+            let ids = selected
+                .iter()
+                .map(|lane| lane.sequence_id)
+                .collect::<Vec<_>>();
+            let fingerprint = round_fingerprint(&ids, &sampling);
+            if let Some(receipt) = recover_receipt(&session.receipt, fingerprint)? {
+                diagnostics.rounds_recovered.fetch_add(1, Ordering::Relaxed);
+                return Ok(native_receipt(session.id, receipt, true));
+            }
+            diagnostics.rounds_started.fetch_add(1, Ordering::Relaxed);
+            let target_states = selected
+                .iter()
+                .map(|lane| lane.target.state.clone())
+                .collect::<Vec<_>>();
+            let mut target_shadow =
+                ShadowSequences::new(programs.target_pool.clone(), &target_states)
+                    .map_err(to_napi_err)?;
+            let pending = selected.iter().map(|lane| lane.pending).collect::<Vec<_>>();
+            let positions = selected
+                .iter()
+                .map(|lane| lane.generated)
+                .collect::<Vec<_>>();
+            let page_limits = selected
+                .iter()
+                .map(|lane| {
+                    lane.max_tokens
+                        .map_or(programs.max_draft_tokens as u64 + 1, |limit| {
+                            limit - lane.generated
+                        })
+                        .min(programs.max_draft_tokens as u64 + 1)
+                        .max(1) as u32
+                })
+                .collect::<Vec<_>>();
+            let eos = selected
+                .iter()
+                .map(|lane| lane.eos.clone())
+                .collect::<Vec<_>>();
+            let options = sampling
+                .iter()
+                .copied()
+                .map(inference_options)
+                .collect::<Vec<_>>();
+            let (pages, mut proposer_shadow, proposer_states) =
+                if let (Some(verify), Some(decode), Some(pool)) = (
+                    &programs.target_verify,
+                    &programs.proposer_decode,
+                    &programs.proposer_pool,
+                ) {
+                    let proposer_states = selected
+                        .iter()
+                        .map(|lane| {
+                            lane.proposer
+                                .as_ref()
+                                .expect("validated proposer")
+                                .state
+                                .clone()
+                        })
+                        .collect::<Vec<_>>();
+                    let mut proposer_shadow = ShadowSequences::new(pool.clone(), &proposer_states)
+                        .map_err(to_napi_err)?;
+                    let mut stats = SpeculativeStats {
+                        accepted: vec![0; selected.len()],
+                        ..SpeculativeStats::default()
+                    };
+                    let pages = execute_speculative_blocking(
+                        verify,
+                        decode,
+                        &mut target_shadow,
+                        &mut proposer_shadow,
+                        &slots,
+                        &pending,
+                        &options,
+                        programs.max_draft_tokens,
+                        &page_limits,
+                        &eos,
+                        cancelled,
+                        Some((&ids, &positions)),
+                        Some(&mut stats),
+                    )
+                    .map_err(to_napi_err)?;
+                    diagnostics
+                        .speculative_rounds
+                        .fetch_add(1, Ordering::Relaxed);
+                    diagnostics
+                        .proposed_tokens
+                        .fetch_add(stats.proposed as u64, Ordering::Relaxed);
+                    diagnostics.accepted_tokens.fetch_add(
+                        stats.accepted.iter().sum::<usize>() as u64,
+                        Ordering::Relaxed,
+                    );
+                    diagnostics
+                        .draft_nanos
+                        .fetch_add(stats.draft_nanos, Ordering::Relaxed);
+                    diagnostics
+                        .verification_nanos
+                        .fetch_add(stats.verification_nanos, Ordering::Relaxed);
+                    if let Ok(mut histogram) = diagnostics.accepted_length_histogram.lock() {
+                        for accepted in stats.accepted {
+                            if let Some(count) = histogram.get_mut(accepted) {
+                                *count += 1;
+                            }
+                        }
+                    }
+                    (pages, Some(proposer_shadow), proposer_states)
+                } else {
+                    diagnostics.ordinary_rounds.fetch_add(1, Ordering::Relaxed);
+                    let fused_sampling = sampling
+                        .iter()
+                        .enumerate()
+                        .map(|(index, sampling)| SamplingOptions {
+                            seed: coordinate_seed(
+                                sampling.seed,
+                                ids[index],
+                                positions[index],
+                                SamplingPurpose::Target,
+                                0,
+                            ),
+                            counter: 0,
+                            ..inference_options(*sampling)
+                        })
+                        .collect::<Vec<_>>();
+                    let sampled = run_sampled_program(
+                        &programs.target_decode,
+                        &target_shadow,
+                        &slots,
+                        pending.iter().map(|token| vec![*token]).collect(),
+                        &fused_sampling,
+                        cancelled,
+                    )
+                    .map_err(to_napi_err)?;
+                    (
+                        sampled.into_iter().map(|token| vec![token]).collect(),
+                        None,
+                        Vec::new(),
+                    )
+                };
+            if !cancellation.complete() {
+                return Err(Error::new(Status::GenericFailure, "operation aborted"));
+            }
+            let round_id = next_monotonic(&round_counter, "round IDs")?;
+            let mut provisional_blocks = target_shadow.provisional_blocks(&target_states);
+            if let Some(shadow) = proposer_shadow.as_ref() {
+                provisional_blocks += shadow.provisional_blocks(&proposer_states);
+            }
+            let mut rolled_back =
+                publish_speculative_states(&mut target_shadow, &target_states, &pending, &pages);
+            if let Some(shadow) = proposer_shadow.as_mut() {
+                rolled_back +=
+                    publish_speculative_states(shadow, &proposer_states, &pending, &pages);
+            }
+            let mut receipt_pages = Vec::with_capacity(pages.len());
+            for (index, page) in pages.into_iter().enumerate() {
+                let lane = session.lanes[slots[index]].as_mut().unwrap();
+                lane.pending = *page.last().expect("native pages are nonempty");
+                lane.generated += page.len() as u64;
+                let terminal = if page.iter().any(|token| lane.eos.contains(token)) {
+                    Some("eos".to_string())
+                } else if lane.max_tokens.is_some_and(|limit| lane.generated >= limit) {
+                    Some("maxTokens".to_string())
+                } else {
+                    None
+                };
+                lane.terminal = terminal.clone();
+                receipt_pages.push(ReceiptPage {
+                    sequence_id: lane.sequence_id,
+                    tokens: page,
+                    stop_reason: terminal,
+                });
+            }
+            let receipt = Receipt {
+                round_id,
+                fingerprint,
+                pages: receipt_pages,
+            };
+            diagnostics.rounds_completed.fetch_add(1, Ordering::Relaxed);
+            diagnostics.emitted_tokens.fetch_add(
+                receipt
+                    .pages
+                    .iter()
+                    .map(|page| page.tokens.len() as u64)
+                    .sum(),
+                Ordering::Relaxed,
+            );
+            diagnostics
+                .provisional_blocks
+                .fetch_add(provisional_blocks, Ordering::Relaxed);
+            diagnostics
+                .rolled_back_blocks
+                .fetch_add(rolled_back, Ordering::Relaxed);
+            diagnostics
+                .target_pool_high_water_blocks
+                .fetch_max(programs.target_pool.live_blocks(), Ordering::Relaxed);
+            if let Some(pool) = &programs.proposer_pool {
+                diagnostics
+                    .proposer_pool_high_water_blocks
+                    .fetch_max(pool.live_blocks(), Ordering::Relaxed);
+            }
+            diagnostics.last_round_id.store(round_id, Ordering::Relaxed);
+            diagnostics.has_round.store(true, Ordering::Relaxed);
+            session.receipt = Some(receipt.clone());
+            Ok(native_receipt(session.id, &receipt, false))
+        })
+        .await;
+        if let Err(error) = &result {
+            record_inference_failure(&failure_diagnostics, error, "verify");
+        }
+        result
+    }
+
+    #[napi]
+    pub fn acknowledge(&self, round_id: BigInt) -> Result<()> {
+        let (negative, round_id, lossless) = round_id.get_u64();
+        if negative || !lossless {
+            return Err(Error::new(
+                Status::InvalidArg,
+                "inference[publish]: invalid round ID",
+            ));
+        }
+        let mut state = self.state.lock().map_err(|error| {
+            Error::new(
+                Status::GenericFailure,
+                format!("inference session lock: {error}"),
+            )
+        })?;
+        acknowledge_receipt(&mut state.receipt, round_id)
+    }
+
+    #[napi]
+    pub fn sequence(&self, sequence_id: BigInt) -> Result<NativeInferenceSequence> {
+        let (negative, sequence_id, lossless) = sequence_id.get_u64();
+        if negative || !lossless {
+            return Err(Error::new(
+                Status::InvalidArg,
+                "inference[inspect]: invalid sequence ID",
+            ));
+        }
+        let state = self.state.lock().map_err(|error| {
+            Error::new(
+                Status::GenericFailure,
+                format!("inference session lock: {error}"),
+            )
+        })?;
+        if state.closed
+            || !state
+                .lanes
+                .iter()
+                .flatten()
+                .any(|lane| lane.sequence_id == sequence_id)
+        {
+            return Err(Error::new(
+                Status::InvalidArg,
+                "inference[inspect]: sequence is not live",
+            ));
+        }
+        Ok(NativeInferenceSequence {
+            session_id: state.id,
+            sequence_id,
+        })
+    }
+
+    #[napi]
+    pub fn finish(&self, sequences: Vec<&NativeInferenceSequence>) -> Result<()> {
+        let mut state = self.state.lock().map_err(|error| {
+            Error::new(
+                Status::GenericFailure,
+                format!("inference session lock: {error}"),
+            )
+        })?;
+        if state.closed {
+            return Err(Error::new(
+                Status::GenericFailure,
+                "inference[finish]: session is closed",
+            ));
+        }
+        if state.receipt.is_some() {
+            return Err(Error::new(
+                Status::GenericFailure,
+                "inference[finish]: unacknowledged receipt",
+            ));
+        }
+        let mut slots = Vec::with_capacity(sequences.len());
+        for sequence in sequences {
+            if sequence.session_id != state.id {
+                return Err(Error::new(
+                    Status::InvalidArg,
+                    "inference[finish]: foreign sequence",
+                ));
+            }
+            let slot = state
+                .lanes
+                .iter()
+                .position(|lane| {
+                    lane.as_ref()
+                        .is_some_and(|lane| lane.sequence_id == sequence.sequence_id)
+                })
+                .ok_or_else(|| {
+                    Error::new(
+                        Status::InvalidArg,
+                        "inference[finish]: sequence is not live",
+                    )
+                })?;
+            if slots.contains(&slot) {
+                return Err(Error::new(
+                    Status::InvalidArg,
+                    "inference[finish]: duplicate sequence",
+                ));
+            }
+            slots.push(slot);
+        }
+        for slot in slots {
+            state.lanes[slot] = None;
+        }
+        Ok(())
+    }
+
+    #[napi]
+    pub fn inspect(&self, sequence: &NativeInferenceSequence) -> Result<NativeInferenceInspection> {
+        let state = self.state.lock().map_err(|error| {
+            Error::new(
+                Status::GenericFailure,
+                format!("inference session lock: {error}"),
+            )
+        })?;
+        if state.closed {
+            return Err(Error::new(
+                Status::GenericFailure,
+                "inference[inspect]: session is closed",
+            ));
+        }
+        if sequence.session_id != state.id {
+            return Err(Error::new(
+                Status::InvalidArg,
+                "inference[inspect]: foreign sequence",
+            ));
+        }
+        let lane = state
+            .lanes
+            .iter()
+            .flatten()
+            .find(|lane| lane.sequence_id == sequence.sequence_id)
+            .ok_or_else(|| {
+                Error::new(
+                    Status::InvalidArg,
+                    "inference[inspect]: sequence is not live",
+                )
+            })?;
+        Ok(NativeInferenceInspection {
+            sequence_id: bigint(lane.sequence_id),
+            cursor: bigint(lane.target.cursor() as u64),
+            terminal: lane.terminal.clone(),
+        })
+    }
+
+    #[napi]
+    pub fn close(&self) -> Result<()> {
+        let mut state = self.state.lock().map_err(|error| {
+            Error::new(
+                Status::GenericFailure,
+                format!("inference session lock: {error}"),
+            )
+        })?;
+        state.lanes.fill_with(|| None);
+        state.receipt = None;
+        state.closed = true;
+        Ok(())
+    }
 }
 
 enum StatefulInvocation {
@@ -3566,6 +6342,9 @@ impl Executable {
             schema,
             tokens: tokens.clone(),
             lanes: lanes.clone(),
+            packed_rows: None,
+            packed_positions: None,
+            publish_hashes: true,
         });
         // Lock every sequence in address order; overlapping batches
         // acquire the same locks in the same order, so no deadlock.
@@ -3903,10 +6682,29 @@ pub fn compile(
                 "compile: KV window must be in 1..=max_tokens".to_string(),
             ));
         }
-        let (rewritten, geometry) = specialize_decode(
+        let packed_rows_per_sequence = state
+            .packed_causal_chains
+            .as_ref()
+            .map(|layout| layout.rows_per_sequence as usize);
+        if packed_rows_per_sequence == Some(0)
+            || (packed_rows_per_sequence.is_some() && state.last_token_row.unwrap_or(false))
+        {
+            return Err(Error::new(
+                Status::InvalidArg,
+                "compile: packed causal-chain rows must be positive and use all-row outputs",
+            ));
+        }
+        let layout = packed_rows_per_sequence.map_or_else(
+            || DecodeLayout::dense(state.batch as usize),
+            |rows| DecodeLayout::packed_causal_chains(state.batch as usize, rows),
+        );
+        let graph_batch = layout
+            .graph_rows()
+            .map_err(|error| Error::new(Status::InvalidArg, error))?;
+        let (rewritten, geometry) = specialize_decode_layout(
             &nodes,
             requested_window,
-            state.batch as usize,
+            layout,
             state.last_token_row.unwrap_or(false),
         )
         .map_err(|error| Error::new(Status::GenericFailure, error))?;
@@ -3924,6 +6722,7 @@ pub fn compile(
             kv_dtype: state.kv_dtype.into(),
             window,
             batch: state.batch as usize,
+            graph_batch,
             layers: geometry.layers,
             kv_heads: geometry.kv_heads,
             head_dim: geometry.head_dim,
@@ -3937,6 +6736,7 @@ pub fn compile(
             cursor_tensor: geometry.cursor_tensor,
             allows_window_eviction: geometry.allows_window_eviction,
             schema,
+            packed_rows_per_sequence,
         });
         Some(schema)
     } else {
@@ -4213,6 +7013,559 @@ mod epilogue_tests {
         );
     }
 
+    #[test]
+    fn speculative_rng_domains_are_candidate_keyed_and_slot_free() {
+        let base = 91;
+        let first = purpose_counter(base, SamplingPurpose::Proposal, 0);
+        assert_eq!(first, purpose_counter(base, SamplingPurpose::Proposal, 0));
+        assert_ne!(
+            first,
+            purpose_counter(base + 1, SamplingPurpose::Proposal, 0)
+        );
+        assert_ne!(first, purpose_counter(base, SamplingPurpose::Accept, 0));
+        assert_ne!(
+            purpose_counter(base + 3, SamplingPurpose::Residual, 0),
+            purpose_counter(base + 3, SamplingPurpose::Target, 0)
+        );
+    }
+
+    #[test]
+    fn packed_verification_metadata_handles_ragged_rows_positions_and_padding() {
+        let plan = packed_verification_plan(8, 4, &[11, 29], &[vec![7, 8, 9], vec![10]]).unwrap();
+        assert_eq!(plan.row_offsets, [0, 3, 4]);
+        assert_eq!(plan.logical_rows, [3, 1]);
+        assert_eq!(
+            plan.row_to_request,
+            [Some(0), Some(0), Some(0), Some(1), None, None, None, None]
+        );
+        assert_eq!(plan.positions, [11, 12, 13, 29, 0, 0, 0, 0]);
+        assert_eq!(
+            plan.tokens,
+            [
+                vec![7],
+                vec![8],
+                vec![9],
+                vec![10],
+                vec![0],
+                vec![0],
+                vec![0],
+                vec![0]
+            ]
+        );
+    }
+
+    #[test]
+    fn packed_verification_metadata_rejects_malformed_layouts() {
+        assert!(packed_verification_plan(4, 2, &[0, 0], &[vec![1, 2], vec![3, 4, 5]]).is_err());
+        assert!(packed_verification_plan(3, 2, &[0, 0], &[vec![1, 2], vec![3, 4]]).is_err());
+        assert!(packed_verification_plan(4, 2, &[0], &[vec![1], vec![2]]).is_err());
+    }
+
+    #[test]
+    fn speculative_effective_distributions_cover_greedy_and_residual_sampling() {
+        let mut options = greedy_sampling_options();
+        let greedy =
+            effective_probabilities(3, |index| [2.0, 2.0, 1.0][index], options, || false).unwrap();
+        assert_eq!(greedy, [1.0, 0.0, 0.0]);
+
+        options.temperature = 1.0;
+        options.top_k = None;
+        options.top_p = 1.0;
+        let target = effective_probabilities(
+            2,
+            |index| [0.7_f64.ln(), 0.3_f64.ln()][index],
+            options,
+            || false,
+        )
+        .unwrap();
+        let proposal = effective_probabilities(
+            2,
+            |index| [0.2_f64.ln(), 0.8_f64.ln()][index],
+            options,
+            || false,
+        )
+        .unwrap();
+        let residual = target
+            .iter()
+            .zip(proposal)
+            .map(|(target, proposal)| (target - proposal).max(0.0))
+            .collect::<Vec<_>>();
+        assert_eq!(sample_probabilities(&residual, 7, 11, || false).unwrap(), 0);
+    }
+
+    #[test]
+    fn speculative_shadow_failure_releases_only_new_blocks() {
+        let pool = NativeKvPool::new(0, 0, 0, 16, Some(4), Some(NativeDType::F32), None).unwrap();
+        let sequence = pool.make_sequence().unwrap();
+        let before = pool.free_blocks();
+        {
+            let shadow =
+                ShadowSequences::new(pool.inner.clone(), &[sequence.state.clone()]).unwrap();
+            shadow.states[0]
+                .lock()
+                .unwrap()
+                .blocks
+                .push(pool.inner.alloc_block().unwrap());
+            assert_eq!(pool.free_blocks(), before - 1);
+        }
+        assert_eq!(pool.free_blocks(), before);
+        assert!(sequence.state.lock().unwrap().blocks.is_empty());
+    }
+
+    #[test]
+    fn shadow_window_eviction_does_not_release_canonical_ownership() {
+        let pool = NativeKvPool::new(0, 0, 0, 16, Some(4), Some(NativeDType::F32), None).unwrap();
+        let sequence = pool.make_sequence().unwrap();
+        let first = pool.inner.alloc_block().unwrap();
+        let second = pool.inner.alloc_block().unwrap();
+        {
+            let mut canonical = sequence.state.lock().unwrap();
+            canonical.blocks = vec![first, second];
+            canonical.cursor = 8;
+        }
+        let before = pool.free_blocks();
+        {
+            let shadow =
+                ShadowSequences::new(pool.inner.clone(), &[sequence.state.clone()]).unwrap();
+            {
+                let mut provisional = shadow.states[0].lock().unwrap();
+                kv_evict(&pool.inner, &mut provisional, 4);
+                assert_eq!(provisional.blocks, [second]);
+                assert_eq!(provisional.head, 1);
+            }
+            let canonical = sequence.state.lock().unwrap();
+            assert_eq!(canonical.blocks, [first, second]);
+            assert_eq!(canonical.head, 0);
+            assert_eq!(pool.free_blocks(), before);
+        }
+        assert_eq!(sequence.state.lock().unwrap().blocks, [first, second]);
+        assert_eq!(pool.free_blocks(), before);
+    }
+
+    #[test]
+    fn inference_fingerprints_bind_operation_order_and_effective_policy() {
+        let greedy = InferenceSampling {
+            temperature: 0.0,
+            top_k: None,
+            top_p: 1.0,
+            seed: 7,
+        };
+        let changed = InferenceSampling { seed: 8, ..greedy };
+        let add = add_fingerprint(&[vec![1, 2]], &[greedy], &[Some(3)], &[vec![9]]);
+        assert_eq!(
+            add,
+            add_fingerprint(&[vec![1, 2]], &[greedy], &[Some(3)], &[vec![9]])
+        );
+        assert_ne!(
+            add,
+            add_fingerprint(&[vec![1, 3]], &[greedy], &[Some(3)], &[vec![9]])
+        );
+        assert_ne!(
+            add,
+            add_fingerprint(&[vec![1, 2]], &[changed], &[Some(3)], &[vec![9]])
+        );
+        assert_ne!(
+            round_fingerprint(&[1, 2], &[greedy, changed]),
+            round_fingerprint(&[2, 1], &[changed, greedy])
+        );
+        assert_ne!(add, round_fingerprint(&[1], &[greedy]));
+    }
+
+    #[test]
+    fn exhausted_round_counter_does_not_wrap() {
+        let counter = AtomicU64::new(u64::MAX);
+        assert!(next_monotonic(&counter, "round IDs").is_err());
+        assert_eq!(counter.load(Ordering::SeqCst), u64::MAX);
+    }
+
+    #[test]
+    fn speculative_publication_keeps_final_token_pending_and_hashes_only_consumed_rows() {
+        let pool = NativeKvPool::new(0, 0, 0, 16, Some(4), Some(NativeDType::F32), None).unwrap();
+        let sequence = pool.make_sequence().unwrap();
+        let states = vec![sequence.state.clone()];
+
+        let mut first = ShadowSequences::new(pool.inner.clone(), &states).unwrap();
+        first.states[0]
+            .lock()
+            .unwrap()
+            .blocks
+            .push(pool.inner.alloc_block().unwrap());
+        publish_speculative_states(&mut first, &states, &[9], &[vec![10, 11, 12]]);
+        {
+            let state = sequence.state.lock().unwrap();
+            assert_eq!(state.cursor, 3);
+            assert_eq!(state.pending, [9, 10, 11]);
+            assert_eq!(state.last_hash, HASH_SEED);
+        }
+        assert!(pool.inner.blocks.lock().unwrap().by_hash.is_empty());
+
+        let mut second = ShadowSequences::new(pool.inner.clone(), &states).unwrap();
+        publish_speculative_states(&mut second, &states, &[12], &[vec![13]]);
+        let state = sequence.state.lock().unwrap();
+        assert_eq!(state.cursor, 4);
+        assert!(state.pending.is_empty());
+        let expected = chain_hash(HASH_SEED, &[9, 10, 11, 12]);
+        assert_eq!(state.last_hash, expected);
+        let block = state.blocks[0];
+        assert_eq!(
+            pool.inner.blocks.lock().unwrap().hashes[block as usize],
+            Some(expected)
+        );
+    }
+
+    #[test]
+    fn provisional_token_metadata_never_publishes_prefix_hashes() {
+        let pool = NativeKvPool::new(0, 0, 0, 16, Some(4), Some(NativeDType::F32), None).unwrap();
+        let sequence = pool.make_sequence().unwrap();
+        let block = pool.inner.alloc_block().unwrap();
+        let mut state = sequence.state.lock().unwrap();
+        state.blocks.push(block);
+        state.note_tokens_provisional(&[1, 2, 3, 4], pool.inner.block_size);
+        state.cursor = 4;
+        assert_ne!(state.last_hash, HASH_SEED);
+        assert!(pool.inner.blocks.lock().unwrap().by_hash.is_empty());
+    }
+
+    fn seed_sequence(pool: &NativeKvPool, tokens: &[u32]) -> NativeKvSequence {
+        let sequence = pool.make_sequence().unwrap();
+        let mut state = sequence.state.lock().unwrap();
+        while state.blocks.len() < tokens.len().div_ceil(pool.inner.block_size) {
+            state.blocks.push(pool.inner.alloc_block().unwrap());
+        }
+        state.note_tokens(&pool.inner, tokens);
+        state.cursor = tokens.len();
+        drop(state);
+        sequence
+    }
+
+    fn stage_speculative_rows(shadow: &ShadowSequences, tokens: &[u32]) {
+        let mut state = shadow.states[0].lock().unwrap();
+        let desired = (state.cursor + tokens.len())
+            .div_ceil(shadow.pool.block_size)
+            .saturating_sub(state.head);
+        while state.blocks.len() < desired {
+            state.blocks.push(shadow.pool.alloc_block().unwrap());
+        }
+        state.note_tokens_provisional(tokens, shadow.pool.block_size);
+        state.cursor += tokens.len();
+    }
+
+    fn assert_committed_store(pool: &NativeKvPool, state: &SeqState) {
+        let store = pool.inner.blocks.lock().unwrap();
+        for ids in store.by_hash.values() {
+            assert!(ids.iter().all(|block| state.blocks.contains(block)));
+        }
+        for (block, count) in store.refcounts.iter().enumerate() {
+            if state.blocks.contains(&(block as u32)) {
+                assert_eq!(*count, 1, "canonical block {block} must have one owner");
+            } else {
+                assert_eq!(*count, 0, "provisional block {block} retained an owner");
+                assert!(
+                    !store.is_cached(block as u32),
+                    "provisional block {block} became cache-visible"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn every_acceptance_cut_synchronizes_target_and_proposer_publication() {
+        const CANDIDATES: [u32; 3] = [20, 21, 22];
+        const ANCHOR: u32 = 10;
+
+        for cut in 0..=CANDIDATES.len() {
+            let target_pool =
+                NativeKvPool::new(0, 0, 0, 16, Some(4), Some(NativeDType::F32), None).unwrap();
+            let proposer_pool =
+                NativeKvPool::new(0, 0, 0, 16, Some(4), Some(NativeDType::F32), None).unwrap();
+            let target = seed_sequence(&target_pool, &[1, 2, 3]);
+            let proposer = seed_sequence(&proposer_pool, &[1, 2, 3]);
+            let target_states = vec![target.state.clone()];
+            let proposer_states = vec![proposer.state.clone()];
+            let mut target_shadow =
+                ShadowSequences::new(target_pool.inner.clone(), &target_states).unwrap();
+            let mut proposer_shadow =
+                ShadowSequences::new(proposer_pool.inner.clone(), &proposer_states).unwrap();
+
+            stage_speculative_rows(&target_shadow, &[ANCHOR, 20, 21, 22]);
+            stage_speculative_rows(&proposer_shadow, &[ANCHOR, 20, 21]);
+            let page = if cut == CANDIDATES.len() {
+                stage_speculative_rows(&proposer_shadow, &[22]);
+                vec![20, 21, 22, 99]
+            } else {
+                let mut page = CANDIDATES[..cut].to_vec();
+                page.push(90 + cut as u32);
+                page
+            };
+
+            publish_speculative_states(
+                &mut target_shadow,
+                &target_states,
+                &[ANCHOR],
+                std::slice::from_ref(&page),
+            );
+            publish_speculative_states(
+                &mut proposer_shadow,
+                &proposer_states,
+                &[ANCHOR],
+                std::slice::from_ref(&page),
+            );
+
+            let target_state = target.state.lock().unwrap();
+            let proposer_state = proposer.state.lock().unwrap();
+            let consumed = std::iter::once(ANCHOR)
+                .chain(page.iter().copied())
+                .take(page.len())
+                .collect::<Vec<_>>();
+            let all_consumed = [vec![1, 2, 3], consumed].concat();
+            let complete = all_consumed.len() / target_pool.inner.block_size;
+            let mut expected_hash = HASH_SEED;
+            for block in all_consumed.chunks_exact(target_pool.inner.block_size) {
+                expected_hash = chain_hash(expected_hash, block);
+            }
+
+            assert_eq!(target_state.cursor, 3 + page.len(), "acceptance cut {cut}");
+            assert_eq!(
+                proposer_state.cursor, target_state.cursor,
+                "acceptance cut {cut}"
+            );
+            assert_eq!(
+                target_state.last_hash, expected_hash,
+                "acceptance cut {cut}"
+            );
+            assert_eq!(
+                proposer_state.last_hash, expected_hash,
+                "acceptance cut {cut}"
+            );
+            assert_eq!(target_state.pending, all_consumed[complete * 4..]);
+            assert_eq!(proposer_state.pending, target_state.pending);
+            assert_eq!(target_state.blocks.len(), (3 + page.len()).div_ceil(4));
+            assert_eq!(proposer_state.blocks.len(), target_state.blocks.len());
+            assert_eq!(
+                page.last(),
+                Some(&(if cut == 3 { 99 } else { 90 + cut as u32 }))
+            );
+            assert_committed_store(&target_pool, &target_state);
+            assert_committed_store(&proposer_pool, &proposer_state);
+        }
+    }
+
+    #[test]
+    fn eos_and_budget_cut_each_candidate_correction_and_bonus_boundary() {
+        let full = vec![20, 21, 22, 99];
+        for (index, eos) in full.iter().copied().enumerate() {
+            let mut page = full.clone();
+            cut_speculative_page(&mut page, &[eos], u32::MAX);
+            assert_eq!(page, full[..=index], "EOS at full-chain index {index}");
+        }
+        for cut in 0..3 {
+            let mut raw = [20, 21, 22][..cut].to_vec();
+            let correction = 90 + cut as u32;
+            raw.push(correction);
+            let mut page = raw.clone();
+            cut_speculative_page(&mut page, &[correction], u32::MAX);
+            assert_eq!(page, raw, "EOS at rejection correction {cut}");
+        }
+        for budget in 1..=full.len() {
+            let mut page = full.clone();
+            cut_speculative_page(&mut page, &[], budget as u32);
+            assert_eq!(page, full[..budget], "budget cut {budget}");
+        }
+        let mut eos_before_budget = full.clone();
+        cut_speculative_page(&mut eos_before_budget, &[21], 4);
+        assert_eq!(eos_before_budget, [20, 21]);
+        let mut budget_before_eos = full;
+        cut_speculative_page(&mut budget_before_eos, &[22], 2);
+        assert_eq!(budget_before_eos, [20, 21]);
+    }
+
+    fn canonical_snapshot(state: &Arc<Mutex<SeqState>>) -> (Vec<u32>, usize, usize, u64, Vec<u32>) {
+        let state = state.lock().unwrap();
+        (
+            state.blocks.clone(),
+            state.head,
+            state.cursor,
+            state.last_hash,
+            state.pending.clone(),
+        )
+    }
+
+    fn assert_failed_speculation_is_invisible(phase: &str, cancel: bool) {
+        let target_pool =
+            NativeKvPool::new(0, 0, 0, 16, Some(4), Some(NativeDType::F32), None).unwrap();
+        let proposer_pool =
+            NativeKvPool::new(0, 0, 0, 16, Some(4), Some(NativeDType::F32), None).unwrap();
+        let target = seed_sequence(&target_pool, &[1, 2, 3, 4, 5]);
+        let proposer = seed_sequence(&proposer_pool, &[1, 2, 3, 4, 5]);
+        let target_before = canonical_snapshot(&target.state);
+        let proposer_before = canonical_snapshot(&proposer.state);
+        let target_available = target_pool.inner.available();
+        let proposer_available = proposer_pool.inner.available();
+        let target_hashes = target_pool.inner.blocks.lock().unwrap().by_hash.clone();
+        let proposer_hashes = proposer_pool.inner.blocks.lock().unwrap().by_hash.clone();
+        {
+            let target_shadow =
+                ShadowSequences::new(target_pool.inner.clone(), &[target.state.clone()]).unwrap();
+            let proposer_shadow =
+                ShadowSequences::new(proposer_pool.inner.clone(), &[proposer.state.clone()])
+                    .unwrap();
+            if cancel {
+                stage_speculative_rows(&proposer_shadow, &[10, 20, 21]);
+                stage_speculative_rows(&target_shadow, &[10, 20, 21, 22]);
+                let cancellation = CancellationState::new();
+                assert!(cancellation.cancel());
+                assert!(cancellation.flag().is_cancelled());
+                assert!(!cancellation.complete());
+                // The same gate used by add/runRound rejects publication, so
+                // dropping both shadows is the complete cancellation path.
+            } else {
+                let failed = (|| -> err::Res<()> {
+                    stage_speculative_rows(&proposer_shadow, &[10, 20, 21]);
+                    if phase != "proposer" {
+                        stage_speculative_rows(&target_shadow, &[10, 20, 21, 22]);
+                    }
+                    Err(format!("forced {phase} failure"))
+                })();
+                assert_eq!(failed.unwrap_err(), format!("forced {phase} failure"));
+            }
+        }
+        assert_eq!(canonical_snapshot(&target.state), target_before, "{phase}");
+        assert_eq!(
+            canonical_snapshot(&proposer.state),
+            proposer_before,
+            "{phase}"
+        );
+        assert_eq!(target_pool.inner.available(), target_available, "{phase}");
+        assert_eq!(
+            proposer_pool.inner.available(),
+            proposer_available,
+            "{phase}"
+        );
+        assert_eq!(
+            target_pool.inner.blocks.lock().unwrap().by_hash,
+            target_hashes
+        );
+        assert_eq!(
+            proposer_pool.inner.blocks.lock().unwrap().by_hash,
+            proposer_hashes
+        );
+    }
+
+    #[test]
+    fn forced_phase_failures_leave_canonical_state_and_cache_unchanged() {
+        for phase in ["proposer", "verifier", "sampler", "acceptance"] {
+            assert_failed_speculation_is_invisible(phase, false);
+        }
+    }
+
+    #[test]
+    fn prepublication_cancellation_discards_both_provisional_roots() {
+        assert_failed_speculation_is_invisible("publication", true);
+    }
+
+    #[test]
+    fn cohesive_prefill_commit_matches_each_pool_at_its_own_cursor() {
+        let target_pool =
+            NativeKvPool::new(0, 0, 0, 16, Some(4), Some(NativeDType::F32), None).unwrap();
+        let proposer_pool =
+            NativeKvPool::new(0, 0, 0, 16, Some(4), Some(NativeDType::F32), None).unwrap();
+        let prompt = (1..=9).collect::<Vec<_>>();
+
+        let target = target_pool.make_sequence().unwrap();
+        let target_states = vec![target.state.clone()];
+        let mut target_shadow =
+            ShadowSequences::new(target_pool.inner.clone(), &target_states).unwrap();
+        stage_speculative_rows(&target_shadow, &prompt);
+        let target_cache = stage_cache_metadata(&target_shadow, std::slice::from_ref(&prompt));
+
+        let proposer = proposer_pool.make_sequence().unwrap();
+        let proposer_states = vec![proposer.state.clone()];
+        let mut proposer_shadow =
+            ShadowSequences::new(proposer_pool.inner.clone(), &proposer_states).unwrap();
+        stage_speculative_rows(&proposer_shadow, &prompt[..4]);
+        let proposer_cache = stage_cache_metadata(&proposer_shadow, &[prompt[..4].to_vec()]);
+
+        assert!(target_pool.inner.blocks.lock().unwrap().by_hash.is_empty());
+        assert!(proposer_pool
+            .inner
+            .blocks
+            .lock()
+            .unwrap()
+            .by_hash
+            .is_empty());
+        let boundary_hash = chain_hash(HASH_SEED, &prompt[..4]);
+        let barrier = Arc::new(std::sync::Barrier::new(3));
+        let (target_lookup, proposer_lookup) = std::thread::scope(|scope| {
+            let target_barrier = barrier.clone();
+            let target_pool = target_pool.inner.clone();
+            let target = scope.spawn(move || {
+                target_barrier.wait();
+                target_pool.take_block(boundary_hash)
+            });
+            let proposer_barrier = barrier.clone();
+            let proposer_pool = proposer_pool.inner.clone();
+            let proposer = scope.spawn(move || {
+                proposer_barrier.wait();
+                proposer_pool.take_block(boundary_hash)
+            });
+            barrier.wait();
+            (target.join().unwrap(), proposer.join().unwrap())
+        });
+        assert_eq!((target_lookup, proposer_lookup), (None, None));
+        publish_shadow(&mut target_shadow, &target_states);
+        publish_shadow(&mut proposer_shadow, &proposer_states);
+        publish_paired_cache_metadata(&target_cache, Some(&proposer_cache));
+
+        let later_target = target_pool.make_sequence().unwrap();
+        let later_proposer = proposer_pool.make_sequence().unwrap();
+        assert_eq!(later_target.prefill_match(prompt.clone()).unwrap(), 8);
+        assert_eq!(later_proposer.prefill_match(prompt.clone()).unwrap(), 4);
+        assert_eq!(prompt.len() - later_target.cursor() as usize, 1);
+        assert_eq!(prompt.len() - later_proposer.cursor() as usize, 5);
+    }
+
+    #[test]
+    fn provisional_pool_exhaustion_does_not_evict_committed_cache() {
+        let pool = NativeKvPool::new(0, 0, 0, 8, Some(4), Some(NativeDType::F32), None).unwrap();
+        let cached = seed_sequence(&pool, &[1, 2, 3, 4]);
+        cached.release();
+        let before = pool.inner.blocks.lock().unwrap().by_hash.clone();
+        let live = pool.inner.alloc_block().unwrap();
+
+        assert!(pool.inner.alloc_block_with_cache_eviction(false).is_none());
+        let store = pool.inner.blocks.lock().unwrap();
+        assert_eq!(store.by_hash, before);
+        assert_eq!(store.refcounts[live as usize], 1);
+        assert_eq!(store.cached(), 1);
+    }
+
+    #[test]
+    fn exact_receipt_recovery_requires_matching_request_and_explicit_ack() {
+        let mut pending = Some(Receipt {
+            round_id: 17,
+            fingerprint: 23,
+            pages: vec![ReceiptPage {
+                sequence_id: 5,
+                tokens: vec![7, 8],
+                stop_reason: None,
+            }],
+        });
+
+        assert!(recover_receipt(&pending, 24).is_err());
+        assert_eq!(pending.as_ref().unwrap().round_id, 17);
+        let recovered = recover_receipt(&pending, 23).unwrap().unwrap();
+        assert_eq!(recovered.pages[0].tokens, [7, 8]);
+        assert!(
+            pending.is_some(),
+            "recovery must retain the receipt until ack"
+        );
+        assert!(acknowledge_receipt(&mut pending, 18).is_err());
+        assert_eq!(pending.as_ref().unwrap().round_id, 17);
+        acknowledge_receipt(&mut pending, 17).unwrap();
+        assert!(pending.is_none());
+        assert!(acknowledge_receipt(&mut pending, 17).is_err());
+    }
+
     fn mleaf(data: Vec<f32>, shape: Vec<usize>) -> Arc<Node> {
         let t = MetalTensor::from_f32(MetalDevice::get(), data, shape);
         Node::new(NodeKind::Leaf(std::sync::Arc::new(LeafSlot::new(
@@ -4324,6 +7677,7 @@ mod epilogue_tests {
                 kv_dtype: NativeDType::F32,
                 window: None,
                 batch: 1,
+                packed_causal_chains: None,
                 last_token_row: Some(true),
             }),
             None,
@@ -4682,6 +8036,7 @@ mod epilogue_tests {
             kv_dtype: DType::F32,
             window: Some(16),
             batch: 1,
+            graph_batch: 1,
             layers: 1,
             kv_heads: 1,
             head_dim: 2,
@@ -4696,6 +8051,9 @@ mod epilogue_tests {
             schema,
             tokens: vec![vec![1, 2, 3]],
             lanes: vec![0],
+            packed_rows: None,
+            packed_positions: None,
+            publish_hashes: true,
         };
         let staging = [[1, 2].as_slice(), &[1], &[1], &[1], &[1]]
             .into_iter()
@@ -4735,6 +8093,88 @@ mod epilogue_tests {
     }
 
     #[test]
+    fn packed_kv_staging_duplicates_sequences_and_keeps_padding_inactive() {
+        let pool = NativeKvPool::new(1, 1, 2, 32, Some(4), Some(NativeDType::F32), None).unwrap();
+        let first = pool.make_sequence().unwrap();
+        let second = pool.make_sequence().unwrap();
+        {
+            let mut state = first.state.lock().unwrap();
+            state.cursor = 4;
+            state.advance = 3;
+        }
+        {
+            let mut state = second.state.lock().unwrap();
+            state.cursor = 9;
+            state.advance = 1;
+        }
+        let context = KvContext {
+            pool: pool.inner.clone(),
+            slots: vec![first.state.clone(), second.state.clone()],
+            schema: KvStateSchema {
+                max_tokens: 32,
+                block_size: 4,
+                kv_dtype: DType::F32,
+                window: None,
+                batch: 2,
+                graph_batch: 8,
+                layers: 1,
+                kv_heads: 1,
+                head_dim: 2,
+                kda: KdaGeometry::default(),
+                conv: ConvGeometry::default(),
+                cursor_slot: u32::MAX,
+                cursor_tensor: true,
+            },
+            tokens: vec![vec![1, 2, 3], vec![4]],
+            lanes: vec![1, 0],
+            packed_rows: Some(vec![
+                Some(0),
+                Some(0),
+                Some(0),
+                Some(1),
+                None,
+                None,
+                None,
+                None,
+            ]),
+            packed_positions: Some(vec![4, 5, 6, 9, 0, 0, 0, 0]),
+            publish_hashes: false,
+        };
+        assert_eq!(
+            context.position_offsets().unwrap(),
+            [4, 5, 6, 9, 0, 0, 0, 0]
+        );
+        let staging = [[8, 8].as_slice(), &[8], &[8], &[8], &[8]]
+            .into_iter()
+            .map(|shape| MetalTensor {
+                buffer: MetalDevice::get()
+                    .alloc_raw(shape.iter().product::<usize>() * DType::U32.size_in_bytes()),
+                layout: runtime::layout::Layout::contiguous(shape.to_vec()),
+                dtype: DType::U32,
+            })
+            .collect::<Vec<_>>();
+        let plan = executable::KvAttentionPlan {
+            batch: 8,
+            query_heads: 1,
+            kv_heads: 1,
+            time: 1,
+            head_dim: 2,
+        };
+        {
+            let _guard = MetalDevice::get().begin_executable_dispatch().unwrap();
+            context.prepare_kv_attention(0, &plan, &staging).unwrap();
+        }
+        assert_eq!(staging[1].to_u32_vec().unwrap(), [5, 6, 7, 10, 0, 0, 0, 0]);
+        assert_eq!(staging[3].to_u32_vec().unwrap(), [1, 1, 1, 1, 0, 0, 0, 0]);
+        let tables = staging[0].to_u32_vec().unwrap();
+        assert_eq!(&tables[0..8], &tables[8..16]);
+        assert_eq!(&tables[8..16], &tables[16..24]);
+        assert!(tables[32..].iter().all(|value| *value == 0));
+        assert_eq!(first.state.lock().unwrap().blocks.len(), 2);
+        assert_eq!(second.state.lock().unwrap().blocks.len(), 3);
+    }
+
+    #[test]
     fn windowed_kv_staging_rebases_the_compact_live_block_table() {
         let pool = NativeKvPool::new(1, 1, 2, 16, Some(4), Some(NativeDType::F32), None).unwrap();
         let sequence = pool.make_sequence().unwrap();
@@ -4755,6 +8195,7 @@ mod epilogue_tests {
             kv_dtype: DType::F32,
             window: Some(8),
             batch: 1,
+            graph_batch: 1,
             layers: 1,
             kv_heads: 1,
             head_dim: 2,
@@ -4769,6 +8210,9 @@ mod epilogue_tests {
             schema,
             tokens: vec![vec![7]],
             lanes: vec![0],
+            packed_rows: None,
+            packed_positions: None,
+            publish_hashes: true,
         };
         let staging = [[1, 4].as_slice(), &[1], &[1], &[1], &[1]]
             .into_iter()
@@ -4816,6 +8260,7 @@ mod epilogue_tests {
             kv_dtype: DType::F32,
             window: None,
             batch: 8,
+            graph_batch: 8,
             layers: 1,
             kv_heads: 1,
             head_dim: 2,
@@ -4830,6 +8275,9 @@ mod epilogue_tests {
             schema,
             tokens: vec![vec![1]; 2],
             lanes: vec![1, 6],
+            packed_rows: None,
+            packed_positions: None,
+            publish_hashes: true,
         };
         let staging = [[8, 2].as_slice(), &[8], &[8], &[8], &[8]]
             .into_iter()
@@ -4888,6 +8336,7 @@ mod epilogue_tests {
                 kv_dtype: NativeDType::F32,
                 window: None,
                 batch: 1,
+                packed_causal_chains: None,
                 last_token_row: None,
             }),
             None,
@@ -4902,6 +8351,9 @@ mod epilogue_tests {
             schema: program.state.as_ref().unwrap().schema,
             tokens: vec![vec![1, 2, 3]],
             lanes: vec![0],
+            packed_rows: None,
+            packed_positions: None,
+            publish_hashes: true,
         };
         let output = executable::execute_stateful(
             &program.inner.executable,
@@ -4994,6 +8446,7 @@ mod epilogue_tests {
                 kv_dtype: NativeDType::F32,
                 window: None,
                 batch: 1,
+                packed_causal_chains: None,
                 last_token_row: None,
             }),
             None,
@@ -5008,6 +8461,9 @@ mod epilogue_tests {
             schema: program.state.as_ref().unwrap().schema,
             tokens: vec![vec![1, 2, 3]],
             lanes: vec![0],
+            packed_rows: None,
+            packed_positions: None,
+            publish_hashes: true,
         };
         let output = executable::execute_stateful(
             &program.inner.executable,
@@ -5175,6 +8631,7 @@ mod epilogue_tests {
                 kv_dtype: NativeDType::F16,
                 window: Some(32),
                 batch: 1,
+                packed_causal_chains: None,
                 last_token_row: None,
             }),
             None,
@@ -5198,6 +8655,7 @@ mod epilogue_tests {
                 kv_dtype: DType::F16,
                 window: Some(32),
                 batch: 1,
+                graph_batch: 1,
                 layers: 1,
                 kv_heads: 1,
                 head_dim: 2,
@@ -5248,6 +8706,7 @@ mod epilogue_tests {
             kv_dtype: DType::F32,
             window: None,
             batch: 1,
+            graph_batch: 1,
             layers: 1,
             kv_heads: 1,
             head_dim: 2,
@@ -5307,6 +8766,9 @@ mod epilogue_tests {
             schema: hybrid_schema(pool.inner.max_tokens, pool.inner.block_size),
             tokens: vec![tokens.to_vec()],
             lanes: vec![0],
+            packed_rows: None,
+            packed_positions: None,
+            publish_hashes: true,
         };
         let mut state = sequence.state.lock().unwrap();
         let needed = (state.cursor + tokens.len()).div_ceil(pool.inner.block_size);
@@ -5359,6 +8821,9 @@ mod epilogue_tests {
             schema: hybrid_schema(32, 4),
             tokens: vec![vec![1, 2, 3, 4], vec![1, 2, 3, 4]],
             lanes: vec![0],
+            packed_rows: None,
+            packed_positions: None,
+            publish_hashes: true,
         };
         let mut states = context
             .slots

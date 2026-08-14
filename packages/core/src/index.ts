@@ -55,6 +55,7 @@ export * as Loss from "./Loss.ts"
  * @category modules
  */
 export * as Model from "./Model.ts"
+export * as Speculation from "./Speculation.ts"
 
 /**
  * Effect-environment model-architecture registration, exact-key lookup, and

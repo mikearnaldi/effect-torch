@@ -74,7 +74,11 @@ pub use program::{
     RngInvocation, RuntimeValue, RuntimeValueDecl, RuntimeValueError, RuntimeValueKind, ScalarDecl,
     ScalarType, ScalarValue,
 };
-pub use sampling::{sample_logits, SamplingOptions, MAX_SAMPLING_VOCABULARY};
+pub use sampling::{
+    effective_probabilities, purpose_counter, random_unit, random_unit_at, rejection_sample,
+    sample_logits, sample_probabilities, sampling_coordinate, RejectionResult, SamplingCoordinate,
+    SamplingOptions, SamplingPurpose, MAX_SAMPLING_VOCABULARY,
+};
 pub use workspace::{
     LeasedWorkspace, WorkspaceAllocation, WorkspaceAllocator, WorkspaceLease, WorkspacePool,
     WorkspacePoolError, WorkspacePoolStats, WorkspaceRequest,

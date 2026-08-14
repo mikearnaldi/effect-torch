@@ -85,7 +85,6 @@ const makeProgram = (
     })
   const generationSeq: Model.GenerationSeq = {
     _tag: "GenerationSeq",
-    sequence: {} as Tensor.KvSequence,
     cursor: () => Effect.succeed(0),
     finish: () => Effect.void
   }
@@ -156,6 +155,23 @@ const makeProgram = (
           Effect.sync(() => {
             state.closed = true
           })
+      }),
+    diagnostics: () =>
+      Effect.succeed({
+        roundsStarted: 0n,
+        roundsCompleted: 0n,
+        roundsRecovered: 0n,
+        ordinaryRounds: 0n,
+        speculativeRounds: 0n,
+        proposedTokens: 0n,
+        acceptedTokens: 0n,
+        emittedTokens: 0n,
+        provisionalBlocks: 0n,
+        rolledBackBlocks: 0n,
+        draftNanos: 0n,
+        verificationNanos: 0n,
+        acceptedLengthHistogram: [],
+        targetPoolHighWaterBlocks: 0n
       })
   }
 }
@@ -252,7 +268,6 @@ onDevices("Chat", () => (it) => {
         let steps = 0
         const seq: Model.GenerationSeq = {
           _tag: "GenerationSeq",
-          sequence: {} as Tensor.KvSequence,
           cursor: () => Effect.succeed(0),
           finish: () => Effect.void
         }

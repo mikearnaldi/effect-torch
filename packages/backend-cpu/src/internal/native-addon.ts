@@ -64,6 +64,92 @@ export declare class Executable {
   ): Promise<Array<number>>
 }
 
+/** Lossless controls for the cohesive inference ABI. @internal */
+export interface NativeInferenceSamplingOptions {
+  temperature: number
+  topK: number
+  topP: number
+  seed: bigint
+}
+
+/** Sparse per-round controls merged against native artifact defaults. @internal */
+export interface NativeInferenceSamplingOverrides {
+  temperature?: number
+  topK?: number
+  topP?: number
+  seed?: bigint
+}
+
+/** Immutable validated target/proposer inference bundle. @internal */
+export declare class NativeInferenceArtifact {
+  open(): NativeInferenceSession
+  diagnostics(): NativeInferenceDiagnostics
+}
+
+/** Session-owned sequence capability. @internal */
+export declare class NativeInferenceSequence {
+  get sequenceId(): bigint
+}
+
+export interface NativeInferenceTokenPage {
+  sequenceId: bigint
+  tokens: Array<number>
+  stopReason?: "eos" | "maxTokens"
+}
+
+export interface NativeInferenceRoundResult {
+  roundId: bigint
+  recovered: boolean
+  pages: Array<NativeInferenceTokenPage>
+}
+
+export interface NativeInferenceInspection {
+  sequenceId: bigint
+  cursor: bigint
+  terminal?: "eos" | "maxTokens"
+}
+
+export interface NativeInferenceDiagnostics {
+  roundsStarted: bigint
+  roundsCompleted: bigint
+  roundsRecovered: bigint
+  lastRoundId?: bigint
+  lastFailurePhase?: string
+  ordinaryRounds: bigint
+  speculativeRounds: bigint
+  proposedTokens: bigint
+  acceptedTokens: bigint
+  emittedTokens: bigint
+  provisionalBlocks: bigint
+  rolledBackBlocks: bigint
+  draftNanos: bigint
+  verificationNanos: bigint
+  acceptedLengthHistogram: Array<bigint>
+  targetPoolHighWaterBlocks: bigint
+  proposerPoolHighWaterBlocks?: bigint
+}
+
+/** Serialized cohesive native generation session. @internal */
+export declare class NativeInferenceSession {
+  sequence(sequenceId: bigint): NativeInferenceSequence
+  add(
+    prompts: Array<NativeTensor>,
+    sampling: Array<NativeInferenceSamplingOptions>,
+    maxTokens: Array<number>,
+    eosTokens: Array<Array<number>>,
+    token?: CancellationToken | undefined | null
+  ): Promise<NativeInferenceRoundResult>
+  runRound(
+    sequences: Array<NativeInferenceSequence>,
+    sampling: Array<NativeInferenceSamplingOverrides>,
+    token?: CancellationToken | undefined | null
+  ): Promise<NativeInferenceRoundResult>
+  acknowledge(roundId: bigint): void
+  finish(sequences: Array<NativeInferenceSequence>): void
+  inspect(sequence: NativeInferenceSequence): NativeInferenceInspection
+  close(): void
+}
+
 /**
  * Native semantic-graph node. Constructors and methods build graph structure
  * synchronously; they do not materialize tensors. `fromMaterialized` retains a
@@ -264,6 +350,21 @@ export declare function compile(
   cacheKey?: string | undefined | null
 ): Executable
 
+/** Validates and retains a complete cohesive inference bundle. @internal */
+export declare function compileInference(
+  targetPrefill: Executable,
+  targetDecode: Executable,
+  targetVerify: Executable | undefined,
+  targetPool: NativeKvPool,
+  proposerPrefill: Executable | undefined,
+  proposerDecode: Executable | undefined,
+  proposerPool: NativeKvPool | undefined,
+  maxDraftTokens: number,
+  batchSize: number,
+  tokenDtype: NativeDType,
+  sampling: NativeInferenceSamplingOptions
+): NativeInferenceArtifact
+
 /** Current bytes attributed to live native tensor wrappers. @internal */
 export declare function externalMemoryBytes(): number
 
@@ -368,7 +469,13 @@ export interface NativeKvStateSchema {
   kvDtype: NativeDType
   window?: number
   batch: number
+  packedCausalChains?: NativePackedCausalChainsLayout
   lastTokenRow?: boolean
+}
+
+/** Packed verifier graph rows reserved per physical sequence. @internal */
+export interface NativePackedCausalChainsLayout {
+  rowsPerSequence: number
 }
 
 /** Optional per-sequence recurrent geometry allocated beside KV state. @internal */
@@ -441,8 +548,12 @@ export interface NativeAddon {
   readonly LazyTensor: typeof LazyTensor
   readonly NativeKvPool: typeof NativeKvPool
   readonly NativeKvSequence: typeof NativeKvSequence
+  readonly NativeInferenceArtifact: typeof NativeInferenceArtifact
+  readonly NativeInferenceSequence: typeof NativeInferenceSequence
+  readonly NativeInferenceSession: typeof NativeInferenceSession
   readonly NativeTensor: typeof NativeTensor
   readonly compile: typeof compile
+  readonly compileInference: typeof compileInference
   readonly externalMemoryBytes: typeof externalMemoryBytes
   readonly grad: typeof grad
   readonly isAvailable: typeof isAvailable

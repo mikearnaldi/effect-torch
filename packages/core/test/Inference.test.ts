@@ -1,6 +1,6 @@
 import { describe, expect } from "@effect/vitest"
 import { Effect } from "effect"
-import { LearningRate, Loss, Model, Optimizer, Runtime, Tensor, Trainer } from "../src/index.ts"
+import { LearningRate, Loss, Model, Optimizer, Runtime, Speculation, Tensor, Trainer } from "../src/index.ts"
 import { deep, onDevices, TOL } from "./utils/devices.ts"
 
 const VOCAB = 12
@@ -116,6 +116,20 @@ const cachedGenerate = (
 
 onDevices("Inference", () => (it) => {
   describe("Model.inference", () => {
+    it("defines packed verification rows independently of physical batch", () => {
+      const state: Runtime.DecodeStateRequest = {
+        maxTokens: 64,
+        blockSize: 4,
+        kvDtype: "f32",
+        batch: 2,
+        packedCausalChains: { rowsPerSequence: 5 }
+      }
+
+      expect(state.batch).toBe(2)
+      expect(state.packedCausalChains?.rowsPerSequence).toBe(5)
+      expect(state.batch * state.packedCausalChains!.rowsPerSequence).toBe(10)
+    })
+
     it.effect("preserves the last-token-row policy in the completed decode schema", () =>
       Effect.gen(function*() {
         const root = yield* Tensor.zeros([1, 2, 3])
@@ -267,6 +281,12 @@ onDevices("Inference", () => (it) => {
         ]))
         expect(invalid.message).toContain("shape [1, T]")
         expect(yield* generation.live()).toBe(0)
+        const budget = yield* Effect.flip(generation.add([{
+          prompt: yield* ids([1, 2]),
+          maxTokens: 0x1_0000_0000
+        }]))
+        expect(budget.message).toContain("unsigned 32-bit")
+        expect(yield* generation.live()).toBe(0)
         const pages = yield* generation.add([
           { prompt: yield* ids([1, 2]) },
           { prompt: yield* ids([3, 4]) }
@@ -320,6 +340,504 @@ onDevices("Inference", () => (it) => {
         expect(next!.tokens).toHaveLength(1)
         expect(yield* first!.seq.cursor()).toBe(4)
         yield* generation.close()
+      }))
+
+    it.effect("exact chain speculation matches greedy ordinary generation", () =>
+      Effect.gen(function*() {
+        const model = yield* makeGpt()
+        const params = yield* Tensor.compute(yield* model.init)
+        const proposer = yield* Speculation.artifact({
+          components: [{ model, params }],
+          plan: {
+            target: { vocabulary: VOCAB },
+            stages: [{ operation: { _tag: "Autoregressive", component: 0 } }],
+            state: { _tag: "Kv", commit: { _tag: "AutoregressiveChain", stage: 0 } },
+            output: { topology: "Chains", probabilities: "CausalNormalized" },
+            tokenMap: { _tag: "Identity" },
+            trainedMaxRows: 3
+          }
+        })
+        const ordinaryProgram = yield* Model.inference(model, params, {
+          maxTokens: 64,
+          blockSize: 4,
+          batchSize: 1,
+          sampling: { temperature: 0, seed: 7 }
+        })
+        const speculativeProgram = yield* Model.inference(model, params, {
+          maxTokens: 64,
+          blockSize: 4,
+          batchSize: 1,
+          sampling: { temperature: 0, seed: 7 },
+          speculation: { proposer, maxDraftTokens: 3 }
+        })
+        const ordinary = yield* ordinaryProgram.generation()
+        const speculative = yield* speculativeProgram.generation()
+        let ordinaryPage = (yield* ordinary.add([{ prompt: yield* ids([1, 2, 3]) }]))[0]!
+        const speculativeFirst = (yield* speculative.add([{ prompt: yield* ids([1, 2, 3]) }]))[0]!
+        expect(speculativeFirst.tokens).toEqual(ordinaryPage.tokens)
+        const expected: Array<number> = []
+        for (let index = 0; index < 4; index++) {
+          ordinaryPage = (yield* ordinary.step([{ seq: ordinaryPage.seq }]))[0]!
+          expected.push(...ordinaryPage.tokens)
+        }
+        const speculativePage = (yield* speculative.step([{ seq: speculativeFirst.seq }]))[0]!
+        expect(speculativePage.tokens).toEqual(expected)
+        expect(speculativePage.tokens).toHaveLength(4)
+        expect(yield* speculativeFirst.seq.cursor()).toBe(7)
+        const expectedNext: Array<number> = []
+        for (let index = 0; index < 4; index++) {
+          ordinaryPage = (yield* ordinary.step([{ seq: ordinaryPage.seq }]))[0]!
+          expectedNext.push(...ordinaryPage.tokens)
+        }
+        const speculativeNext = (yield* speculative.step([{ seq: speculativeFirst.seq }]))[0]!
+        expect(speculativeNext.tokens).toEqual(expectedNext)
+        expect(yield* speculativeFirst.seq.cursor()).toBe(11)
+        yield* ordinary.close()
+        yield* speculative.close()
+      }))
+
+    it.effect("speculative pages stop exactly at the remaining output budget", () =>
+      Effect.gen(function*() {
+        const model = yield* makeGpt()
+        const params = yield* Tensor.compute(yield* model.init)
+        const proposer = yield* Speculation.artifact({
+          components: [{ model, params }],
+          plan: {
+            target: { vocabulary: VOCAB },
+            stages: [{ operation: { _tag: "Autoregressive", component: 0 } }],
+            state: { _tag: "Kv", commit: { _tag: "AutoregressiveChain", stage: 0 } },
+            output: { topology: "Chains", probabilities: "CausalNormalized" },
+            tokenMap: { _tag: "Identity" },
+            trainedMaxRows: 4
+          }
+        })
+        const program = yield* Model.inference(model, params, {
+          maxTokens: 64,
+          blockSize: 4,
+          batchSize: 1,
+          sampling: { temperature: 0, seed: 11 },
+          speculation: { proposer, maxDraftTokens: 4 }
+        })
+        const generation = yield* program.generation()
+        const first = (yield* generation.add([{ prompt: yield* ids([1, 2]), maxTokens: 3 }]))[0]!
+        const page = (yield* generation.step([{ seq: first.seq }]))[0]!
+        expect(page.tokens).toHaveLength(2)
+        expect(page.stopReason).toBe("maxTokens")
+        expect(yield* first.seq.cursor()).toBe(4)
+        yield* generation.close()
+      }))
+
+    it.effect("one speculative batch publishes different nonzero page lengths", () =>
+      Effect.gen(function*() {
+        const model = yield* makeGpt()
+        const params = yield* Tensor.compute(yield* model.init)
+        const proposer = yield* Speculation.artifact({
+          components: [{ model, params }],
+          plan: {
+            target: { vocabulary: VOCAB },
+            stages: [{ operation: { _tag: "Autoregressive", component: 0 } }],
+            state: { _tag: "Kv", commit: { _tag: "AutoregressiveChain", stage: 0 } },
+            output: { topology: "Chains", probabilities: "CausalNormalized" },
+            tokenMap: { _tag: "Identity" },
+            trainedMaxRows: 3
+          }
+        })
+        const program = yield* Model.inference(model, params, {
+          maxTokens: 128,
+          blockSize: 4,
+          batchSize: 2,
+          sampling: { temperature: 0, seed: 13 },
+          speculation: { proposer, maxDraftTokens: 3 }
+        })
+        const generation = yield* program.generation()
+        const first = yield* generation.add([
+          { prompt: yield* ids([1, 2, 3]), maxTokens: 2 },
+          { prompt: yield* ids([4, 5, 6]), maxTokens: 4 }
+        ])
+        const pages = yield* generation.step(first.map(({ seq }) => ({ seq })))
+        expect(pages.map((page) => page.tokens.length)).toEqual([1, 3])
+        expect(pages.map((page) => page.stopReason)).toEqual(["maxTokens", "maxTokens"])
+        const terminal = yield* Effect.flip(generation.step([{ seq: pages[0]!.seq }]))
+        expect(terminal.message).toMatch(/terminal/)
+        expect(yield* pages[0]!.seq.cursor()).toBe(4)
+        expect(yield* pages[1]!.seq.cursor()).toBe(6)
+        yield* generation.close()
+      }))
+
+    it.effect("speculative EOS cuts discard the computed suffix and make the lane terminal", () =>
+      Effect.gen(function*() {
+        const model = yield* makeGpt()
+        const params = yield* Tensor.compute(yield* model.init)
+        const proposer = yield* Speculation.artifact({
+          components: [{ model, params }],
+          plan: {
+            target: { vocabulary: VOCAB },
+            stages: [{ operation: { _tag: "Autoregressive", component: 0 } }],
+            state: { _tag: "Kv", commit: { _tag: "AutoregressiveChain", stage: 0 } },
+            output: { topology: "Chains", probabilities: "CausalNormalized" },
+            tokenMap: { _tag: "Identity" },
+            trainedMaxRows: 3
+          }
+        })
+        const speculativeProgram = yield* Model.inference(model, params, {
+          maxTokens: 64,
+          blockSize: 4,
+          batchSize: 1,
+          sampling: { temperature: 0, seed: 17 },
+          speculation: { proposer, maxDraftTokens: 3 }
+        })
+        let selectedPrompt: ReadonlyArray<number> | undefined
+        let baselinePage: Model.TokenPage | undefined
+        let eosIndex = -1
+        for (let start = 1; start <= 32 && baselinePage === undefined; start++) {
+          const prompt = [start % VOCAB, (start + 1) % VOCAB, (start + 2) % VOCAB]
+          const baseline = yield* speculativeProgram.generation()
+          const baselineFirst = (yield* baseline.add([{ prompt: yield* ids(prompt) }]))[0]!
+          const candidate = (yield* baseline.step([{ seq: baselineFirst.seq }]))[0]!
+          const index = candidate.tokens
+            .slice(0, -1)
+            .findIndex((token) => token !== baselineFirst.tokens[0])
+          yield* baseline.close()
+          if (index >= 0) {
+            selectedPrompt = prompt
+            baselinePage = candidate
+            eosIndex = index
+          }
+        }
+        expect(selectedPrompt).toBeDefined()
+        expect(baselinePage).toBeDefined()
+        if (selectedPrompt === undefined || baselinePage === undefined) {
+          throw new Error("test model did not produce an interior EOS token")
+        }
+        const eos = baselinePage.tokens[eosIndex]!
+
+        const speculative = yield* speculativeProgram.generation()
+        const first = (yield* speculative.add([{ prompt: yield* ids(selectedPrompt), eosTokens: [eos] }]))[0]!
+        const page = (yield* speculative.step([{ seq: first.seq }]))[0]!
+        expect(page.tokens).toEqual(baselinePage.tokens.slice(0, eosIndex + 1))
+        expect(page.stopReason).toBe("eos")
+        const cursor = 3 + page.tokens.length
+        expect(yield* first.seq.cursor()).toBe(cursor)
+        expect(cursor).toBeLessThan(3 + baselinePage.tokens.length)
+        const terminal = yield* Effect.flip(speculative.step([{ seq: first.seq }]))
+        expect(terminal.message).toMatch(/terminal/)
+        expect(yield* first.seq.cursor()).toBe(cursor)
+        yield* speculative.close()
+      }))
+
+    it.effect("reports native speculative phase, acceptance, and pool diagnostics", () =>
+      Effect.gen(function*() {
+        const model = yield* makeGpt()
+        const params = yield* Tensor.compute(yield* model.init)
+        const proposer = yield* Speculation.artifact({
+          components: [{ model, params }],
+          plan: {
+            target: { vocabulary: VOCAB },
+            stages: [{ operation: { _tag: "Autoregressive", component: 0 } }],
+            state: { _tag: "Kv", commit: { _tag: "AutoregressiveChain", stage: 0 } },
+            output: { topology: "Chains", probabilities: "CausalNormalized" },
+            tokenMap: { _tag: "Identity" },
+            trainedMaxRows: 2
+          }
+        })
+        const program = yield* Model.inference(model, params, {
+          maxTokens: 32,
+          blockSize: 4,
+          batchSize: 1,
+          sampling: { temperature: 0, seed: 19n },
+          speculation: { proposer, maxDraftTokens: 2 }
+        })
+        const generation = yield* program.generation()
+        const first = (yield* generation.add([{ prompt: yield* ids([1, 2, 3]) }]))[0]!
+        yield* generation.step([{ seq: first.seq }])
+        const diagnostics = yield* program.diagnostics()
+        expect(diagnostics.roundsStarted).toBe(2n)
+        expect(diagnostics.roundsCompleted).toBe(2n)
+        expect(diagnostics.speculativeRounds).toBe(1n)
+        expect(diagnostics.proposedTokens).toBe(2n)
+        expect(diagnostics.acceptedTokens).toBe(2n)
+        expect(diagnostics.emittedTokens).toBe(4n)
+        expect(diagnostics.draftNanos).toBeGreaterThan(0n)
+        expect(diagnostics.verificationNanos).toBeGreaterThan(0n)
+        expect(diagnostics.acceptedLengthHistogram[2]).toBe(1n)
+        expect(diagnostics.targetPoolHighWaterBlocks).toBeGreaterThan(0n)
+        expect(diagnostics.proposerPoolHighWaterBlocks).toBeGreaterThan(0n)
+        yield* generation.close()
+      }))
+
+    it.effect("positive-temperature speculative replay ignores request order", () =>
+      Effect.gen(function*() {
+        const model = yield* makeGpt()
+        const params = yield* Tensor.compute(yield* model.init)
+        const proposer = yield* Speculation.artifact({
+          components: [{ model, params }],
+          plan: {
+            target: { vocabulary: VOCAB },
+            stages: [{ operation: { _tag: "Autoregressive", component: 0 } }],
+            state: { _tag: "Kv", commit: { _tag: "AutoregressiveChain", stage: 0 } },
+            output: { topology: "Chains", probabilities: "CausalNormalized" },
+            tokenMap: { _tag: "Identity" },
+            trainedMaxRows: 3
+          }
+        })
+        const config = {
+          maxTokens: 128,
+          blockSize: 4,
+          batchSize: 2,
+          sampling: { temperature: 0.8, topK: 8, topP: 0.9, seed: 37 },
+          speculation: { proposer, maxDraftTokens: 3 }
+        } as const
+        const programA = yield* Model.inference(model, params, config)
+        const programB = yield* Model.inference(model, params, config)
+        const generationA = yield* programA.generation()
+        const generationB = yield* programB.generation()
+        const firstA = yield* generationA.add([
+          { prompt: yield* ids([1, 2, 3]) },
+          { prompt: yield* ids([4, 5, 6]) }
+        ])
+        const firstB = yield* generationB.add([
+          { prompt: yield* ids([1, 2, 3]) },
+          { prompt: yield* ids([4, 5, 6]) }
+        ])
+        const pagesA = yield* generationA.step(firstA.map(({ seq }) => ({ seq })))
+        const pagesB = yield* generationB.step([...firstB].reverse().map(({ seq }) => ({ seq })))
+        expect(pagesA[0]!.tokens).toEqual(pagesB[1]!.tokens)
+        expect(pagesA[1]!.tokens).toEqual(pagesB[0]!.tokens)
+        expect(pagesA[0]!.tokens.length).toBeGreaterThan(0)
+        expect(pagesA[1]!.tokens.length).toBeGreaterThan(0)
+        yield* generationA.close()
+        yield* generationB.close()
+      }))
+
+    it.effect("round sampling overrides preserve unspecified artifact defaults", () =>
+      Effect.gen(function*() {
+        const model = yield* makeGpt()
+        const params = yield* Tensor.compute(yield* model.init)
+        const config = {
+          maxTokens: 64,
+          blockSize: 4,
+          batchSize: 1,
+          sampling: { temperature: 1, topK: 0, topP: 1, seed: 7n }
+        } as const
+        const programA = yield* Model.inference(model, params, config)
+        const programB = yield* Model.inference(model, params, config)
+        const generationA = yield* programA.generation()
+        const generationB = yield* programB.generation()
+        let pageA = (yield* generationA.add([{ prompt: yield* ids([1, 2, 3]) }]))[0]!
+        let pageB = (yield* generationB.add([{ prompt: yield* ids([1, 2, 3]) }]))[0]!
+        expect(pageA.tokens).toEqual(pageB.tokens)
+        for (let round = 0; round < 4; round++) {
+          pageA = (yield* generationA.step([{ seq: pageA.seq, sampling: { topK: 4 } }]))[0]!
+          pageB = (yield* generationB.step([{
+            seq: pageB.seq,
+            sampling: { ...config.sampling, topK: 4 }
+          }]))[0]!
+          expect(pageA.tokens).toEqual(pageB.tokens)
+        }
+        yield* generationA.close()
+        yield* generationB.close()
+      }))
+
+    it.effect("preserves high seed bits through native generation", () =>
+      Effect.gen(function*() {
+        const model = yield* makeGpt()
+        const params = yield* Tensor.compute(yield* model.init)
+        const generate = (seed: bigint) =>
+          Effect.gen(function*() {
+            const program = yield* Model.inference(model, params, {
+              maxTokens: 64,
+              blockSize: 4,
+              batchSize: 1,
+              sampling: { temperature: 1, seed }
+            })
+            const generation = yield* program.generation()
+            let page = (yield* generation.add([{ prompt: yield* ids([1, 2, 3]) }]))[0]!
+            const tokens = [...page.tokens]
+            for (let round = 0; round < 7; round++) {
+              page = (yield* generation.step([{ seq: page.seq }]))[0]!
+              tokens.push(...page.tokens)
+            }
+            yield* generation.close()
+            return tokens
+          })
+        const low = 1n
+        const high = (1n << 63n) | low
+        const lowA = yield* generate(low)
+        const lowB = yield* generate(low)
+        const highA = yield* generate(high)
+        const highB = yield* generate(high)
+        expect(lowA).toEqual(lowB)
+        expect(highA).toEqual(highB)
+        expect(lowA).not.toEqual(highA)
+      }))
+
+    it.effect("speculative rounds accept sparse physical lanes", () =>
+      Effect.gen(function*() {
+        const model = yield* makeGpt()
+        const params = yield* Tensor.compute(yield* model.init)
+        const proposer = yield* Speculation.artifact({
+          components: [{ model, params }],
+          plan: {
+            target: { vocabulary: VOCAB },
+            stages: [{ operation: { _tag: "Autoregressive", component: 0 } }],
+            state: { _tag: "Kv", commit: { _tag: "AutoregressiveChain", stage: 0 } },
+            output: { topology: "Chains", probabilities: "CausalNormalized" },
+            tokenMap: { _tag: "Identity" },
+            trainedMaxRows: 2
+          }
+        })
+        const program = yield* Model.inference(model, params, {
+          maxTokens: 128,
+          blockSize: 4,
+          batchSize: 2,
+          sampling: { temperature: 0, seed: 19 },
+          speculation: { proposer, maxDraftTokens: 2 }
+        })
+        const generation = yield* program.generation()
+        const first = yield* generation.add([
+          { prompt: yield* ids([1, 2, 3]) },
+          { prompt: yield* ids([4, 5, 6]) }
+        ])
+        const secondCursor = yield* first[1]!.seq.cursor()
+        const page = (yield* generation.step([{ seq: first[0]!.seq }]))[0]!
+        expect(page.tokens).toHaveLength(3)
+        expect(yield* first[0]!.seq.cursor()).toBe(6)
+        expect(yield* first[1]!.seq.cursor()).toBe(secondCursor)
+        yield* generation.close()
+      }))
+
+    it.effect("speculation shortens a page at the remaining state capacity", () =>
+      Effect.gen(function*() {
+        const model = yield* makeGpt()
+        const params = yield* Tensor.compute(yield* model.init)
+        const proposer = yield* Speculation.artifact({
+          components: [{ model, params }],
+          plan: {
+            target: { vocabulary: VOCAB },
+            stages: [{ operation: { _tag: "Autoregressive", component: 0 } }],
+            state: { _tag: "Kv", commit: { _tag: "AutoregressiveChain", stage: 0 } },
+            output: { topology: "Chains", probabilities: "CausalNormalized" },
+            tokenMap: { _tag: "Identity" },
+            trainedMaxRows: 4
+          }
+        })
+        const program = yield* Model.inference(model, params, {
+          maxTokens: 8,
+          blockSize: 4,
+          batchSize: 1,
+          sampling: { temperature: 0, seed: 23 },
+          speculation: { proposer, maxDraftTokens: 4 }
+        })
+        const generation = yield* program.generation()
+        const first = (yield* generation.add([{ prompt: yield* ids([1, 2, 3, 4, 5]) }]))[0]!
+        const page = (yield* generation.step([{ seq: first.seq }]))[0]!
+        expect(page.tokens).toHaveLength(3)
+        expect(yield* first.seq.cursor()).toBe(8)
+        yield* generation.close()
+      }))
+
+    it.effect("speculation supports i64 token programs", () =>
+      Effect.gen(function*() {
+        const model = yield* makeGpt()
+        const params = yield* Tensor.compute(yield* model.init)
+        const proposer = yield* Speculation.artifact({
+          components: [{ model, params }],
+          plan: {
+            target: { vocabulary: VOCAB },
+            stages: [{ operation: { _tag: "Autoregressive", component: 0 } }],
+            state: { _tag: "Kv", commit: { _tag: "AutoregressiveChain", stage: 0 } },
+            output: { topology: "Chains", probabilities: "CausalNormalized" },
+            tokenMap: { _tag: "Identity" },
+            trainedMaxRows: 2
+          }
+        })
+        const program = yield* Model.inference(model, params, {
+          maxTokens: 32,
+          blockSize: 4,
+          batchSize: 1,
+          tokenDtype: "i64",
+          sampling: { temperature: 0, seed: 31 },
+          speculation: { proposer, maxDraftTokens: 2 }
+        })
+        const generation = yield* program.generation()
+        const prompt = yield* Tensor.fromTypedArray(BigInt64Array.from([1n, 2n, 3n]), [1, 3])
+        const first = (yield* generation.add([{ prompt }]))[0]!
+        const page = (yield* generation.step([{ seq: first.seq }]))[0]!
+        expect(page.tokens).toHaveLength(3)
+        expect(yield* first.seq.cursor()).toBe(6)
+        yield* generation.close()
+      }))
+
+    it.effect("greedy correction from a different draft preserves target tokens", () =>
+      Effect.gen(function*() {
+        const model = yield* makeGpt()
+        const targetParams = yield* Tensor.compute(yield* model.init)
+        const draftParams = yield* Tensor.compute(yield* model.init)
+        const proposer = yield* Speculation.artifact({
+          components: [{ model, params: draftParams }],
+          plan: {
+            target: { vocabulary: VOCAB },
+            stages: [{ operation: { _tag: "Autoregressive", component: 0 } }],
+            state: { _tag: "Kv", commit: { _tag: "AutoregressiveChain", stage: 0 } },
+            output: { topology: "Chains", probabilities: "CausalNormalized" },
+            tokenMap: { _tag: "Identity" },
+            trainedMaxRows: 3
+          }
+        })
+        const ordinaryProgram = yield* Model.inference(model, targetParams, {
+          maxTokens: 64,
+          blockSize: 4,
+          batchSize: 1,
+          sampling: { temperature: 0, seed: 5 }
+        })
+        const speculativeProgram = yield* Model.inference(model, targetParams, {
+          maxTokens: 64,
+          blockSize: 4,
+          batchSize: 1,
+          sampling: { temperature: 0, seed: 5 },
+          speculation: { proposer, maxDraftTokens: 3 }
+        })
+        const ordinary = yield* ordinaryProgram.generation()
+        const speculative = yield* speculativeProgram.generation()
+        let ordinaryPage = (yield* ordinary.add([{ prompt: yield* ids([2, 3, 4]) }]))[0]!
+        const speculativeFirst = (yield* speculative.add([{ prompt: yield* ids([2, 3, 4]) }]))[0]!
+        const expected: Array<number> = []
+        for (let index = 0; index < 4; index++) {
+          ordinaryPage = (yield* ordinary.step([{ seq: ordinaryPage.seq }]))[0]!
+          expected.push(...ordinaryPage.tokens)
+        }
+        const actual = (yield* speculative.step([{ seq: speculativeFirst.seq }]))[0]!
+        expect(actual.tokens).toEqual(expected.slice(0, actual.tokens.length))
+        expect(yield* speculativeFirst.seq.cursor()).toBe(3 + actual.tokens.length)
+        yield* ordinary.close()
+        yield* speculative.close()
+      }))
+
+    it.effect("rejects unsupported speculative schedules and draft limits before compilation", () =>
+      Effect.gen(function*() {
+        const model = yield* makeGpt()
+        const params = yield* Tensor.compute(yield* model.init)
+        const proposer = yield* Speculation.artifact({
+          components: [{ model, params }],
+          plan: {
+            target: { vocabulary: VOCAB },
+            stages: [{ operation: { _tag: "Autoregressive", component: 0 } }],
+            state: { _tag: "Kv", commit: { _tag: "AutoregressiveChain", stage: 0 } },
+            output: { topology: "Chains", probabilities: "CausalNormalized" },
+            tokenMap: { _tag: "Identity" },
+            trainedMaxRows: 2
+          }
+        })
+        const limit = yield* Effect.flip(Model.inference(model, params, {
+          maxTokens: 32,
+          speculation: { proposer, maxDraftTokens: 3 }
+        }))
+        expect(limit.message).toMatch(/maxDraftTokens/)
+        const adaptive = yield* Effect.flip(Model.inference(model, params, {
+          maxTokens: 32,
+          speculation: { proposer, maxDraftTokens: 2, schedule: "adaptive" }
+        }))
+        expect(adaptive.message).toMatch(/adaptive/)
       }))
 
     it.effect("lane refill does not change a replacement sequence's RNG identity", () =>
@@ -1086,7 +1604,8 @@ onDevices("Inference", () => (it) => {
           [{ maxTokens: 16, blockSize: 0 }, /blockSize/],
           [{ maxTokens: 16, blockSize: 4, attentionWindow: 17 }, /attentionWindow/],
           [{ maxTokens: 16, blockSize: 4, prefillChunk: 0 }, /prefillChunk/],
-          [{ maxTokens: 16, blockSize: 4, batchSize: 0 }, /batchSize/]
+          [{ maxTokens: 16, blockSize: 4, batchSize: 0 }, /batchSize/],
+          [{ maxTokens: 16, blockSize: 4, sampling: { seed: 1n << 64n } }, /unsigned 64-bit/]
         ] as const
         for (const [config, message] of badConfigs) {
           const error = yield* Effect.flip(Model.inference(model, params, config))

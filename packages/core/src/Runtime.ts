@@ -151,6 +151,8 @@ export class BackendError extends Data.TaggedError("BackendError")<{
   readonly message: string
   /** Optional backend-specific diagnostic payload. */
   readonly details?: unknown
+  /** Cohesive inference phase, when the operation belongs to that contract. */
+  readonly inferencePhase?: InferenceFailurePhase
 }> {}
 
 /** Internal nominal brand for all tensor handles. */
@@ -165,6 +167,12 @@ declare const ExecutableHandleTypeId: unique symbol
 declare const KvPoolHandleTypeId: unique symbol
 /** Internal nominal brand for paged KV sequence handles. */
 declare const KvSequenceHandleTypeId: unique symbol
+/** Internal nominal brand for a cohesive native inference artifact. */
+declare const InferenceArtifactHandleTypeId: unique symbol
+/** Internal nominal brand for a native generation session. */
+declare const InferenceSessionHandleTypeId: unique symbol
+/** Internal nominal brand for a native generation sequence. */
+declare const InferenceSequenceHandleTypeId: unique symbol
 
 /**
  * A backend-owned tensor capability with backend-neutral immutable metadata.
@@ -278,11 +286,24 @@ export interface DecodeStateRequest {
   /** Positive unsigned 32-bit fixed compiled batch width. */
   readonly batch: number
   /**
+   * Packed causal-chain verification layout. The traced graph has
+   * `batch * rowsPerSequence` independent one-token rows while `batch` remains
+   * the physical sequence width. Backends stage one explicit position per graph
+   * row and expose all graph rows as outputs.
+   */
+  readonly packedCausalChains?: PackedCausalChainsLayout
+  /**
    * When true, every root must be `[batch, T, V]` and the decode rewrite
    * returns native state-driven last-token selectors: one `[V]` root for
    * batch 1, otherwise `batch` `[V]` roots in row order. Defaults to false.
    */
   readonly lastTokenRow?: boolean
+}
+
+/** Static row layout for packed causal-chain target verification. */
+export interface PackedCausalChainsLayout {
+  /** Positive number of verifier rows reserved for each physical sequence. */
+  readonly rowsPerSequence: number
 }
 
 /**
@@ -527,6 +548,21 @@ export interface KvPoolHandle {
 export interface KvSequenceHandle {
   /** Nominal KV-sequence-handle brand. */
   readonly [KvSequenceHandleTypeId]: typeof KvSequenceHandleTypeId
+}
+
+/** Opaque backend-owned cohesive inference artifact. */
+export interface InferenceArtifactHandle {
+  readonly [InferenceArtifactHandleTypeId]: typeof InferenceArtifactHandleTypeId
+}
+
+/** Opaque backend-owned generation session. */
+export interface InferenceSessionHandle {
+  readonly [InferenceSessionHandleTypeId]: typeof InferenceSessionHandleTypeId
+}
+
+/** Opaque backend-owned sequence within one generation session. */
+export interface InferenceSequenceHandle {
+  readonly [InferenceSequenceHandleTypeId]: typeof InferenceSequenceHandleTypeId
 }
 
 /**
@@ -1117,6 +1153,160 @@ export interface SamplingOptions {
   readonly counter: number
 }
 
+/** Lossless normalized controls used by cohesive native inference. */
+export interface InferenceSamplingOptions {
+  readonly temperature: number
+  readonly topK: number
+  readonly topP: number
+  /** Unsigned 64-bit seed; it must never be folded through a JavaScript number. */
+  readonly seed: bigint
+}
+
+/** A phase that can fail without partially publishing an inference round. */
+export type InferenceFailurePhase =
+  | "compile"
+  | "open"
+  | "admission"
+  | "prefill"
+  | "proposer"
+  | "verify"
+  | "sample"
+  | "accept"
+  | "publish"
+  | "finish"
+  | "close"
+  | "inspect"
+
+/** Programs and state pools bundled into one native inference artifact. */
+export interface InferenceCompileRequest {
+  readonly target: {
+    readonly prefill: ExecutableHandle
+    readonly decode: ExecutableHandle
+    /** Packed all-row verifier; omitted for the zero-draft ordinary path. */
+    readonly verify?: ExecutableHandle
+    readonly pool: KvPoolHandle
+  }
+  readonly proposer?: {
+    readonly prefill: ExecutableHandle
+    readonly decode: ExecutableHandle
+    readonly pool: KvPoolHandle
+    readonly maxDraftTokens: number
+  }
+  readonly batchSize: number
+  readonly tokenDtype: "u32" | "i64"
+  readonly sampling: InferenceSamplingOptions
+}
+
+/** Prompt policy and page-local sampling overrides transferred atomically. */
+export interface InferenceAddEntry {
+  readonly prompt: ConcreteTensorHandle
+  readonly sampling?: Partial<InferenceSamplingOptions>
+  readonly maxTokens?: number
+  readonly eosTokens: ReadonlyArray<number>
+}
+
+export interface InferenceAddRequest {
+  readonly entries: ReadonlyArray<InferenceAddEntry>
+}
+
+/** A selected native sequence and optional controls for this round only. */
+export interface InferenceRoundEntry {
+  readonly sequence: InferenceSequenceHandle
+  readonly sampling?: Partial<InferenceSamplingOptions>
+}
+
+export interface InferenceRoundRequest {
+  readonly entries: ReadonlyArray<InferenceRoundEntry>
+}
+
+/** One request-ordered, nonempty page published by a native round. */
+export interface InferenceTokenPage {
+  readonly sequence: InferenceSequenceHandle
+  readonly sequenceId: bigint
+  readonly tokens: ReadonlyArray<number>
+  readonly stopReason?: "eos" | "maxTokens"
+}
+
+/**
+ * Durable completion receipt. `recovered` is true when the backend recovered a
+ * previously committed result after completion won a cancellation/error race.
+ */
+export interface InferenceRoundResult {
+  readonly roundId: bigint
+  readonly recovered: boolean
+  readonly pages: ReadonlyArray<InferenceTokenPage>
+}
+
+export interface InferenceSequenceInspection {
+  readonly sequenceId: bigint
+  readonly cursor: bigint
+  readonly terminal?: "eos" | "maxTokens"
+}
+
+export interface InferenceDiagnostics {
+  readonly roundsStarted: bigint
+  readonly roundsCompleted: bigint
+  readonly roundsRecovered: bigint
+  readonly ordinaryRounds: bigint
+  readonly speculativeRounds: bigint
+  readonly proposedTokens: bigint
+  readonly acceptedTokens: bigint
+  readonly emittedTokens: bigint
+  readonly provisionalBlocks: bigint
+  readonly rolledBackBlocks: bigint
+  readonly draftNanos: bigint
+  readonly verificationNanos: bigint
+  /** Index is accepted candidate count; values are completed-lane counts. */
+  readonly acceptedLengthHistogram: ReadonlyArray<bigint>
+  readonly targetPoolHighWaterBlocks: bigint
+  readonly proposerPoolHighWaterBlocks?: bigint
+  readonly lastRoundId?: bigint
+  readonly lastFailurePhase?: InferenceFailurePhase
+}
+
+/** Legacy low-level exact-chain request retained for direct decode consumers. */
+export interface SpeculativeRoundRequest {
+  readonly targetVerify: ExecutableHandle
+  readonly proposerDecode: ExecutableHandle
+  readonly targetSequences: ReadonlyArray<KvSequenceHandle>
+  readonly proposerSequences: ReadonlyArray<KvSequenceHandle>
+  readonly slots: ReadonlyArray<number>
+  readonly pendingTokens: ReadonlyArray<number>
+  readonly sampling: ReadonlyArray<SamplingOptions>
+  readonly maxDraftTokens: number
+  readonly pageLimits: ReadonlyArray<number>
+  readonly eosTokens: ReadonlyArray<ReadonlyArray<number>>
+}
+
+/** Required cohesive native artifact/session contract for sampled generation. */
+export interface InferenceRuntime {
+  readonly compile: (request: InferenceCompileRequest) => Effect.Effect<InferenceArtifactHandle, BackendError>
+  readonly open: (artifact: InferenceArtifactHandle) => Effect.Effect<InferenceSessionHandle, BackendError>
+  readonly add: (
+    session: InferenceSessionHandle,
+    request: InferenceAddRequest
+  ) => Effect.Effect<InferenceRoundResult, BackendError>
+  readonly runRound: (
+    session: InferenceSessionHandle,
+    request: InferenceRoundRequest
+  ) => Effect.Effect<InferenceRoundResult, BackendError>
+  /** Releases a validated durable receipt after the caller accepted it. */
+  readonly acknowledge: (
+    session: InferenceSessionHandle,
+    roundId: bigint
+  ) => Effect.Effect<void, BackendError>
+  readonly finish: (
+    session: InferenceSessionHandle,
+    sequences: ReadonlyArray<InferenceSequenceHandle>
+  ) => Effect.Effect<void, BackendError>
+  readonly inspect: (
+    session: InferenceSessionHandle,
+    sequence: InferenceSequenceHandle
+  ) => Effect.Effect<InferenceSequenceInspection, BackendError>
+  readonly close: (session: InferenceSessionHandle) => Effect.Effect<void, BackendError>
+  readonly diagnostics: (artifact: InferenceArtifactHandle) => Effect.Effect<InferenceDiagnostics, BackendError>
+}
+
 /**
  * Native next-token sampling extension. Direct sampling borrows one live,
  * dense, rank-one floating-point tensor. Fused decode execution samples one
@@ -1143,6 +1333,10 @@ export interface SamplingRuntime {
     invocation: ExecutionInvocation,
     options: ReadonlyArray<SamplingOptions>
   ) => Effect.Effect<ReadonlyArray<number>, BackendError>
+  /** @deprecated Generation uses {@link InferenceRuntime.runRound}. */
+  readonly executeSpeculative: (
+    request: SpeculativeRoundRequest
+  ) => Effect.Effect<ReadonlyArray<ReadonlyArray<number>>, BackendError>
 }
 
 /**
@@ -1325,6 +1519,8 @@ export interface RuntimeService {
     readonly sampling: SamplingRuntime
     /** Compiled paged-KV inference. */
     readonly decode: DecodeRuntime
+    /** Cohesive native sampled inference artifacts and sessions. */
+    readonly inference: InferenceRuntime
     /** Runtime memory and execution diagnostics. */
     readonly diagnostics: RuntimeDiagnostics
   }

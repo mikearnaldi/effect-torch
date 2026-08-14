@@ -4906,7 +4906,10 @@ export const releaseKvSequence = (sequence: KvSequence): Effect.Effect<void, Ten
  * must divide `maxTokens`, and `window` must be an unsigned 32-bit integer in
  * `1..=maxTokens`. With `state.lastTokenRow`, every root must be `[batch, T, V]`
  * and the program outputs become advance-selected `[V]` rows: one for batch 1,
- * otherwise `batch` rows in row order. Compilation retains captured concrete
+ * otherwise `batch` rows in row order. `state.packedCausalChains` instead keeps
+ * physical `batch` separate from the traced graph's
+ * `batch * rowsPerSequence` one-token rows and requires all-row outputs.
+ * Compilation retains captured concrete
  * leaves as constants independently of their source handles and therefore
  * bypasses bundled runtimes' native structural executable cache. The returned
  * program has no explicit release operation.
@@ -4939,6 +4942,7 @@ export const compileDecodeProgram = (
     return {
       handle,
       ...handle.state,
+      ...(state.packedCausalChains === undefined ? {} : { packedCausalChains: state.packedCausalChains }),
       outputs: roots.flatMap((root) => {
         const base = { dtype: root.dtype, placement: root.placement }
         if (state.lastTokenRow !== true) return [{ shape: root.shape, ...base }]

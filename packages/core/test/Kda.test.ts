@@ -1,7 +1,7 @@
 import { describe, expect } from "@effect/vitest"
 import * as assert from "@effect/vitest/utils"
 import { Effect } from "effect"
-import { Gradient, LearningRate, Loss, Model, Optimizer, Tensor, Trainer } from "../src/index.ts"
+import { Gradient, LearningRate, Loss, Model, Optimizer, Speculation, Tensor, Trainer } from "../src/index.ts"
 import { floats, GRADCHECK_EPS, GRADCHECK_TOL, onDevices } from "./utils/devices.ts"
 
 const values = (t: Tensor.Any) => Tensor.toNumberArray(t)
@@ -344,6 +344,29 @@ onDevices("Kda", (device) => (it) => {
         if (Tensor.isTensor(logits)) yield* Tensor.clear(logits)
         return values.reduce((best, value, index) => (value > values[best] ? index : best), 0)
       })
+
+    it.effect("rejects speculative configuration for recurrent target state", () =>
+      Effect.gen(function*() {
+        const model = yield* makeHybrid
+        const params = yield* Tensor.compute(yield* model.init)
+        const proposer = yield* Speculation.artifact({
+          components: [{ model, params }],
+          plan: {
+            target: { vocabulary: VOCAB },
+            stages: [{ operation: { _tag: "Autoregressive", component: 0 } }],
+            state: { _tag: "Kv", commit: { _tag: "AutoregressiveChain", stage: 0 } },
+            output: { topology: "Chains", probabilities: "CausalNormalized" },
+            tokenMap: { _tag: "Identity" },
+            trainedMaxRows: 2
+          }
+        })
+        const error = yield* Effect.flip(Model.inference(model, params, {
+          maxTokens: 32,
+          blockSize: 4,
+          speculation: { proposer, maxDraftTokens: 2 }
+        }))
+        expect(error.message).toMatch(/KV-only/)
+      }))
 
     // The reference: greedy generation through the ordinary forward
     // graph, recomputing the whole context every step.

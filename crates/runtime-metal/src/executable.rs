@@ -129,6 +129,9 @@ pub(crate) struct KvStateSchema {
     pub kv_dtype: DType,
     pub window: Option<usize>,
     pub batch: usize,
+    /// Number of independent rows traced in the graph. Dense execution uses
+    /// `batch`; packed verification may use more rows over the same sequences.
+    pub graph_batch: usize,
     pub layers: usize,
     pub kv_heads: usize,
     pub head_dim: usize,
@@ -148,8 +151,8 @@ impl KvStateSchema {
                 "compile: KV max_tokens must be positive and divisible by block_size".to_string(),
             );
         }
-        if self.batch == 0 {
-            return Err("compile: KV batch must be positive".to_string());
+        if self.batch == 0 || self.graph_batch < self.batch {
+            return Err("compile: KV physical and graph batch geometry is invalid".to_string());
         }
         if !matches!(
             self.kv_dtype,
@@ -281,6 +284,18 @@ pub(crate) trait MetalDecodeContext {
     /// Number of slots actively participating in this invocation.
     fn active_batch(&self) -> usize {
         self.slots().len()
+    }
+    /// Absolute position offset for every graph row.
+    fn position_offsets(&self) -> Result<Vec<usize>, String> {
+        let mut offsets = vec![0; self.schema().graph_batch];
+        for request in 0..self.active_batch() {
+            let lane = self.active_lane(request);
+            offsets[lane] = self.slots()[request]
+                .lock()
+                .map_err(|error| format!("decode position: sequence lock poisoned: {error}"))?
+                .cursor;
+        }
+        Ok(offsets)
     }
     /// Uploads/prepares the cursor state before dispatch.
     fn prepare_state(&self, cursor: &crate::run::MetalTensor) -> Result<(), String>;
@@ -2048,7 +2063,7 @@ fn plan_command_resources(
             let schema = state_schema.ok_or_else(|| {
                 "compile: paged KV attention requires an explicit state schema".to_string()
             })?;
-            if plan.batch != schema.batch
+            if plan.batch != schema.graph_batch
                 || plan.kv_heads != schema.kv_heads
                 || plan.head_dim != schema.head_dim
                 || (*layer as usize) >= schema.layers
@@ -2060,7 +2075,7 @@ fn plan_command_resources(
                     plan.kv_heads,
                     plan.head_dim,
                     layer,
-                    schema.batch,
+                    schema.graph_batch,
                     schema.kv_heads,
                     schema.head_dim,
                     schema.layers
@@ -2069,13 +2084,13 @@ fn plan_command_resources(
             resources.staging.extend([
                 staging(
                     "kv_block_table",
-                    &[schema.batch, schema.max_blocks()],
+                    &[schema.graph_batch, schema.max_blocks()],
                     DType::U32,
                 ),
-                staging("kv_context_lengths", &[schema.batch], DType::U32),
-                staging("kv_block_bases", &[schema.batch], DType::U32),
-                staging("kv_token_advances", &[schema.batch], DType::U32),
-                staging("kv_padding", &[schema.batch], DType::U32),
+                staging("kv_context_lengths", &[schema.graph_batch], DType::U32),
+                staging("kv_block_bases", &[schema.graph_batch], DType::U32),
+                staging("kv_token_advances", &[schema.graph_batch], DType::U32),
+                staging("kv_padding", &[schema.graph_batch], DType::U32),
             ]);
             resources.plan = MetalCommandPlan::KvAttention(plan);
         }
@@ -3071,7 +3086,7 @@ impl<'a> Lowerer<'a> {
                         if is_state_cursor {
                             let schema = self.state_schema.expect("state cursor has a schema");
                             let expected_shape = if schema.cursor_tensor {
-                                vec![schema.batch]
+                                vec![schema.graph_batch]
                             } else {
                                 Vec::new()
                             };
@@ -3083,9 +3098,9 @@ impl<'a> Lowerer<'a> {
                         }
                         let padded = self.padded_slot == Some(*slot)
                             && matches!(source, MetalDeclaredSource::Tensor(_))
-                            && self
-                                .state_schema
-                                .is_some_and(|schema| node.shape.first() == Some(&schema.batch));
+                            && self.state_schema.is_some_and(|schema| {
+                                node.shape.first() == Some(&schema.graph_batch)
+                            });
                         let value = self.value(
                             &node.shape,
                             node.dtype,
@@ -7646,14 +7661,7 @@ fn execute_op_into(
                 kv.ok_or_else(|| {
                     "rotary embedding: cursor offset requires a decode context".to_string()
                 })?
-                .slots()
-                .iter()
-                .map(|slot| {
-                    slot.lock().map(|state| state.cursor).map_err(|error| {
-                        format!("rotary embedding: sequence lock poisoned: {error}")
-                    })
-                })
-                .collect::<Result<Vec<_>, _>>()?
+                .position_offsets()?
             } else {
                 vec![0]
             };
@@ -8922,6 +8930,7 @@ mod tests {
                     kv_dtype: DType::F32,
                     window: None,
                     batch,
+                    graph_batch: batch,
                     layers: geometry.layers,
                     kv_heads: geometry.kv_heads,
                     head_dim: geometry.head_dim,
@@ -9020,6 +9029,7 @@ mod tests {
             kv_dtype: DType::F32,
             window: None,
             batch: 2,
+            graph_batch: 2,
             layers: 0,
             kv_heads: 0,
             head_dim: 0,
@@ -9843,6 +9853,7 @@ mod tests {
                 kv_dtype: DType::F32,
                 window: None,
                 batch: 1,
+                graph_batch: 1,
                 layers: 0,
                 kv_heads: 0,
                 head_dim: 0,
@@ -10024,6 +10035,7 @@ mod tests {
             kv_dtype: DType::F16,
             window: None,
             batch: 1,
+            graph_batch: 1,
             layers: 1,
             kv_heads: 1,
             head_dim: 2,
@@ -10079,6 +10091,7 @@ mod tests {
                 kv_dtype: DType::F32,
                 window: None,
                 batch: 1,
+                graph_batch: 1,
                 layers: 0,
                 kv_heads: 0,
                 head_dim: 0,
@@ -10402,6 +10415,7 @@ mod tests {
                 kv_dtype: DType::F32,
                 window: None,
                 batch: 2,
+                graph_batch: 2,
                 layers: 0,
                 kv_heads: 0,
                 head_dim: 0,
@@ -10462,6 +10476,7 @@ mod tests {
                 kv_dtype: DType::F32,
                 window: None,
                 batch: 2,
+                graph_batch: 2,
                 layers: 0,
                 kv_heads: 0,
                 head_dim: 0,
@@ -10548,6 +10563,7 @@ mod tests {
             kv_dtype: DType::F32,
             window: None,
             batch: 1,
+            graph_batch: 1,
             layers: 0,
             kv_heads: 0,
             head_dim: 0,
@@ -10577,6 +10593,7 @@ mod tests {
     fn last_token_row_context_for_lanes(advances: &[usize]) -> TestDecodeContext {
         let mut schema = last_token_row_schema();
         schema.batch = advances.len();
+        schema.graph_batch = advances.len();
         TestDecodeContext {
             schema,
             slots: advances
@@ -10651,6 +10668,7 @@ mod tests {
         .unwrap();
         let mut schema = last_token_row_schema();
         schema.batch = 2;
+        schema.graph_batch = 2;
         let compilation = compile_graph_with_state(&[first, second], false, schema);
         let context = last_token_row_context_for_lanes(&[3, 2]);
 
@@ -10833,6 +10851,7 @@ mod tests {
             kv_dtype: DType::F32,
             window: None,
             batch: 1,
+            graph_batch: 1,
             layers: 0,
             kv_heads: 0,
             head_dim: 0,

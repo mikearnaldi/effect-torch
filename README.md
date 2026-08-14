@@ -1027,6 +1027,36 @@ Generation sessions support:
 - Sliding-window attention.
 - RoPE with bounded active context and unbounded sequence cursors.
 
+Exact autoregressive chain speculation uses the same token-page API. The first
+milestone accepts one KV-only proposer with an identity vocabulary map and
+causal-normalized proposal distributions:
+
+```ts
+import { Model, Speculation } from "@effect-torch/core"
+
+const proposer = yield* Speculation.artifact({
+  components: [{ model: draftModel, params: draftParams }],
+  plan: {
+    target: { vocabulary: 32_000 },
+    stages: [{ operation: { _tag: "Autoregressive", component: 0 } }],
+    state: { _tag: "Kv", commit: { _tag: "AutoregressiveChain", stage: 0 } },
+    output: { topology: "Chains", probabilities: "CausalNormalized" },
+    tokenMap: { _tag: "Identity" },
+    trainedMaxRows: 4
+  }
+})
+
+const inference = yield* Model.inference(targetModel, targetParams, {
+  maxTokens: 8192,
+  speculation: { proposer, maxDraftTokens: 4 },
+  sampling: { temperature: 0.8, topK: 40, topP: 0.95, seed: 7 }
+})
+```
+
+Proposal, verification, exact rejection/residual sampling, and paired target /
+proposer publication execute inside one native round. Returned pages may contain
+multiple tokens; consumers continue to append every token in each page.
+
 `kvDtype: "int8"` is a KV storage tier, not a normal tensor dtype. Cached rows
 are quantized with per-token, per-head scales and widened for attention math.
 
