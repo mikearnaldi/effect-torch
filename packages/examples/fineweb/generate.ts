@@ -50,11 +50,11 @@ const program = Effect.scoped(Effect.gen(function*() {
   })
 
   const gen = yield* Effect.acquireRelease(
-    inference.generation(),
+    inference.execution(),
     (gen) => Effect.ignore(gen.close())
   )
   const encoded = yield* tokenizer.encode(prompt)
-  const entry = yield* gen.add(yield* Tensor.fromTypedArray(encoded.data, [1, encoded.shape[0]]))
+  const entry = (yield* gen.add([yield* Tensor.fromTypedArray(encoded.data, [1, encoded.shape[0]])]))[0]!
   let logits = entry.logits
   // Incremental decode: re-decode the sequence per token, but hold back a
   // trailing run of U+FFFD - a merge boundary can split a multi-byte

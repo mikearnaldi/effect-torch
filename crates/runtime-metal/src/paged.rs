@@ -15,10 +15,10 @@
 //!   `[pool_rows, H_kv * D]`) in `slab_dtype`; row addresses are
 //!   computed device-side from the per-slot block table
 //!   (`tables [B, maxBlocks] u32`), `ctxlens [B] u32` (post-run
-//!   frontier), `block_bases [B] u32` (first visible table index), and
-//!   `block_size`.
+//!   frontier), `block_bases [B] u32` (first visible table index),
+//!   `advances [B] u32`, and `block_size`.
 //! - **Scatter** (`et_paged_scatter`): one threadgroup of one simdgroup
-//!   (32 threads) per (slot, head) writes rows `ctxlens[b] - advance
+//!   (32 threads) per (slot, head) writes rows `ctxlens[b] - advances[b]
 //!   .. ctxlens[b]` of the new-token chunk into the slabs. Int8 slabs
 //!   quantize with an in-threadgroup absmax scale (`absmax/127 + eps`,
 //!   round, +128 offset) stored per (physical row, head).
@@ -315,6 +315,40 @@ mod metal {
         Ok(())
     }
 
+    fn validate_advances(
+        advances: &MetalTensor,
+        ctxlens: &MetalTensor,
+        batch: usize,
+        chunk: usize,
+        operation: &str,
+    ) -> crate::err::Res<()> {
+        advances.validate_destination(operation, &[batch], DType::U32)?;
+        ctxlens.validate_destination(operation, &[batch], DType::U32)?;
+        for lane in 0..batch {
+            // Both tensors are validated contiguous shared u32 staging buffers.
+            let advance = unsafe {
+                *advances
+                    .buffer
+                    .contents_ptr()
+                    .cast::<u32>()
+                    .add(advances.layout.offset() + lane)
+            } as usize;
+            let context = unsafe {
+                *ctxlens
+                    .buffer
+                    .contents_ptr()
+                    .cast::<u32>()
+                    .add(ctxlens.layout.offset() + lane)
+            } as usize;
+            if advance > chunk || advance > context {
+                return Err(format!(
+                    "{operation}: lane {lane} advance {advance} exceeds chunk {chunk} or context {context}"
+                ));
+            }
+        }
+        Ok(())
+    }
+
     // Writes the new-token row of every slot into the slabs in one
     // launch (per layer): one threadgroup per (slot, head) computes
     // its row's physical address and stores D values, quantizing with
@@ -350,7 +384,7 @@ kernel void et_paged_scatter(
     constant uint& blockSize [[buffer(8)]],
     constant uint& maxBlocks [[buffer(9)]],
     constant uint& H [[buffer(10)]],
-    constant uint& advance [[buffer(11)]],
+    device const uint* advances [[buffer(11)]],
     device const uint* blockBases [[buffer(12)]],
     uint3 gridDim [[threadgroups_per_grid]],
     uint3 tgid [[threadgroup_position_in_grid]],
@@ -360,7 +394,8 @@ kernel void et_paged_scatter(
     const uint h = tgid.x;
     const uint tid = tpitg.x;
     const uint C = gridDim.z;
-    if (ctxlens[b] == 0) {{ return; }}
+    const uint advance = advances[b];
+    if (advance == 0 || ctxlens[b] == 0) {{ return; }}
     const uint cursor = ctxlens[b] - advance;
     // Rows cursor..needed, one per new token; D-wide within each row.
     for (uint p = 0; p < advance; p++) {{
@@ -474,7 +509,7 @@ kernel void et_paged_scatter(
 
     /// Non-allocating fused batched scatter: `k_new`/`v_new [B, H, C,
     /// D]` f32 (C = 1 for decode, the chunk for prefill) are written
-    /// into the slabs at rows `ctxlens[b] - advance .. ctxlens[b]` per
+    /// into the slabs at rows `ctxlens[b] - advances[b] .. ctxlens[b]` per
     /// slot. `k_scales`/`v_scales` are required iff the slabs are int8.
     /// Allocates nothing; requires the exact scatter pipeline to be
     /// warm.
@@ -490,7 +525,7 @@ kernel void et_paged_scatter(
         ctxlens: &MetalTensor,
         block_bases: &MetalTensor,
         block_size: usize,
-        advance: usize,
+        advances: &MetalTensor,
         resources: IntoResources<'_>,
     ) -> crate::err::Res<()> {
         let (b, h, c, d) = (
@@ -501,6 +536,7 @@ kernel void et_paged_scatter(
         );
         let slab_dtype = slab_dtype(k_slab);
         validate_empty_resources(resources, "paged scatter")?;
+        validate_advances(advances, ctxlens, b, c, "paged scatter")?;
         if !k_new.layout.is_contiguous() || !v_new.layout.is_contiguous() {
             return Err(
                 "paged scatter: new K/V inputs must be contiguous before scatter_into".to_string(),
@@ -536,7 +572,7 @@ kernel void et_paged_scatter(
             set_bytes(e, 8, &(block_size as u32));
             set_bytes(e, 9, &max_blocks);
             set_bytes(e, 10, &(h as u32));
-            set_bytes(e, 11, &(advance as u32));
+            set_buffer(e, 11, &advances.buffer, u32_off(advances.layout.offset()));
             set_buffer(
                 e,
                 12,
@@ -573,7 +609,7 @@ kernel void et_paged_scatter(
         ctxlens: &MetalTensor,
         block_bases: &MetalTensor,
         block_size: usize,
-        advance: usize,
+        advances: &MetalTensor,
     ) -> crate::err::Res<()> {
         let k_new = wrap_contig(k_new)?;
         let v_new = wrap_contig(v_new)?;
@@ -589,7 +625,7 @@ kernel void et_paged_scatter(
             ctxlens,
             block_bases,
             block_size,
-            advance,
+            advances,
             IntoResources::empty(),
         )
     }
@@ -661,7 +697,7 @@ kernel void et_paged_decode(
     constant uint& maxBlocks [[buffer(9)]],
     constant uint& window [[buffer(10)]],
     constant uint& H [[buffer(11)]],
-    constant uint& advance [[buffer(12)]],
+    device const uint* advances [[buffer(12)]],
     device const uint* blockBases [[buffer(13)]],
     uint3 gridDim [[threadgroups_per_grid]],
     uint3 tgid [[threadgroup_position_in_grid]],
@@ -674,7 +710,8 @@ kernel void et_paged_decode(
     const uint C = gridDim.z;
     const uint tid = tpitg.x;
     const uint needed = ctxlens[b];
-    if (needed == 0) {{
+    const uint advance = advances[b];
+    if (advance == 0 || needed == 0) {{
         if (tid == 0) {{
             device float* o = O + ((ulong)b * QH * C + h * C + p) * D;
             for (int d = 0; d < D; d++) {{ o[d] = 0.0f; }}
@@ -844,7 +881,7 @@ kernel void et_paged_decode(
     /// `q [B, H, C, D]` f32 contiguous (C = 1 for decode, the chunk for
     /// prefill), `tables [B, maxBlocks]` u32, `ctxlens [B]` u32
     /// (post-run frontier; the kernel derives per-row causal lengths
-    /// from `advance`), `block_bases [B]` u32. `output` must be
+    /// from `advances [B]`), `block_bases [B]` u32. `output` must be
     /// contiguous f32 `[B, H, C, D]`. Allocates nothing; requires the
     /// exact attention pipeline to be warm.
     #[allow(clippy::too_many_arguments)]
@@ -860,7 +897,7 @@ kernel void et_paged_decode(
         window: Option<usize>,
         scale: f64,
         block_size: usize,
-        advance: usize,
+        advances: &MetalTensor,
         output: &MetalTensor,
         resources: IntoResources<'_>,
     ) -> crate::err::Res<()> {
@@ -876,6 +913,7 @@ kernel void et_paged_decode(
         }
         let slab_dtype = slab_dtype(k_slab);
         validate_empty_resources(resources, "paged attention")?;
+        validate_advances(advances, ctxlens, b, c, "paged attention")?;
         if !q.layout.is_contiguous() {
             return Err(
                 "paged attention: query must be contiguous before attention_into".to_string(),
@@ -921,7 +959,7 @@ kernel void et_paged_decode(
             set_bytes(e, 9, &(max_blocks as u32));
             set_bytes(e, 10, &(window.unwrap_or(0) as u32));
             set_bytes(e, 11, &(h as u32));
-            set_bytes(e, 12, &(advance as u32));
+            set_buffer(e, 12, &advances.buffer, u32_off(advances.layout.offset()));
             set_buffer(
                 e,
                 13,
@@ -959,7 +997,7 @@ kernel void et_paged_decode(
         window: Option<usize>,
         scale: f64,
         block_size: usize,
-        advance: usize,
+        advances: &MetalTensor,
         output: &MetalTensor,
         resources: IntoResources<'_>,
     ) -> crate::err::Res<()> {
@@ -975,7 +1013,7 @@ kernel void et_paged_decode(
             window,
             scale,
             block_size,
-            advance,
+            advances,
             output,
             resources,
         )
@@ -996,7 +1034,7 @@ kernel void et_paged_decode(
         window: Option<usize>,
         scale: f64,
         block_size: usize,
-        advance: usize,
+        advances: &MetalTensor,
     ) -> crate::err::Res<MetalTensor> {
         let shape = q.layout.shape().to_vec();
         let q = wrap_contig(q)?;
@@ -1016,7 +1054,7 @@ kernel void et_paged_decode(
             window,
             scale,
             block_size,
-            advance,
+            advances,
             &output,
             IntoResources::empty(),
         )?;
@@ -1080,6 +1118,7 @@ mod tests {
         let tables = u32_tensor(dev, &[0], vec![b, 1]);
         let ctxlens = u32_tensor(dev, &[1], vec![b]);
         let block_bases = u32_tensor(dev, &[0], vec![b]);
+        let advances = u32_tensor(dev, &[1], vec![b]);
         let scale = 1.0 / (d as f64).sqrt();
 
         super::metal::scatter(
@@ -1093,7 +1132,7 @@ mod tests {
             &ctxlens,
             &block_bases,
             2,
-            1,
+            &advances,
         )
         .unwrap();
         let expected_output = super::metal::decode(
@@ -1108,7 +1147,7 @@ mod tests {
             None,
             scale,
             2,
-            1,
+            &advances,
         )
         .unwrap();
         let actual_output = MT::empty(dev, vec![b, h, c, d], DType::F32);
@@ -1131,7 +1170,7 @@ mod tests {
             &ctxlens,
             &block_bases,
             2,
-            1,
+            &advances,
             super::metal::IntoResources::empty(),
         )
         .unwrap();
@@ -1147,7 +1186,7 @@ mod tests {
             None,
             scale,
             2,
-            1,
+            &advances,
             &actual_output,
             super::metal::IntoResources::empty(),
         )
@@ -1191,6 +1230,7 @@ mod tests {
         let tables = u32_tensor(dev, &[0], vec![batch, 1]);
         let ctxlens = u32_tensor(dev, &[1], vec![batch]);
         let block_bases = u32_tensor(dev, &[0], vec![batch]);
+        let advances = u32_tensor(dev, &[1], vec![batch]);
         super::metal::scatter(
             &k_new,
             &v_new,
@@ -1202,7 +1242,7 @@ mod tests {
             &ctxlens,
             &block_bases,
             2,
-            1,
+            &advances,
         )
         .unwrap();
         let output = super::metal::decode(
@@ -1217,13 +1257,81 @@ mod tests {
             None,
             1.0,
             2,
-            1,
+            &advances,
         )
         .unwrap();
         dev.synchronize().unwrap();
         assert_eq!(
             output.read_f32().unwrap(),
             vec![1.0, 2.0, 3.0, 4.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 5.0, 6.0, 7.0, 8.0,]
+        );
+    }
+
+    #[test]
+    fn paged_kernels_apply_each_physical_lanes_advance() {
+        let dev = MetalDevice::get();
+        let (batch, heads, chunk, dimension) = (2usize, 1usize, 2usize, 4usize);
+        let q = MT::from_f32(
+            dev,
+            vec![0.0; batch * heads * chunk * dimension],
+            vec![batch, heads, chunk, dimension],
+        );
+        let k_new = MT::from_f32(
+            dev,
+            vec![0.0; batch * heads * chunk * dimension],
+            vec![batch, heads, chunk, dimension],
+        );
+        let v_new = MT::from_f32(
+            dev,
+            [1.0, 99.0, 2.0, 4.0]
+                .into_iter()
+                .flat_map(|value| [value; 4])
+                .collect(),
+            vec![batch, heads, chunk, dimension],
+        );
+        let k_slab = MT::from_f32(dev, vec![0.0; 8 * dimension], vec![8, heads, dimension]);
+        let v_slab = MT::from_f32(dev, vec![0.0; 8 * dimension], vec![8, heads, dimension]);
+        let tables = u32_tensor(dev, &[0, 1], vec![batch, 1]);
+        let ctxlens = u32_tensor(dev, &[1, 2], vec![batch]);
+        let block_bases = u32_tensor(dev, &[0, 0], vec![batch]);
+        let advances = u32_tensor(dev, &[1, 2], vec![batch]);
+
+        super::metal::scatter(
+            &k_new,
+            &v_new,
+            &k_slab,
+            &v_slab,
+            None,
+            None,
+            &tables,
+            &ctxlens,
+            &block_bases,
+            4,
+            &advances,
+        )
+        .unwrap();
+        let output = super::metal::decode(
+            &q,
+            &k_slab,
+            &v_slab,
+            None,
+            None,
+            &tables,
+            &ctxlens,
+            &block_bases,
+            None,
+            1.0,
+            4,
+            &advances,
+        )
+        .unwrap();
+        dev.synchronize().unwrap();
+        assert_eq!(
+            output.read_f32().unwrap(),
+            [1.0, 1.0, 2.0, 3.0]
+                .into_iter()
+                .flat_map(|value| [value; 4])
+                .collect::<Vec<_>>()
         );
     }
 }

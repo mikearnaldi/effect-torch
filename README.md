@@ -976,7 +976,7 @@ const generate = (
   model: Model.Model,
   params: Model.Params,
   promptTensor: Tensor.Any,
-  generatedTokens: ReadonlyArray<number>
+  maxNewTokens: number
 ) =>
   Effect.gen(function*() {
     const inference = yield* Model.inference(model, params, {
@@ -985,21 +985,25 @@ const generate = (
       prefillChunk: 16,
       attentionWindow: 256,
       kvDtype: "bf16",
-      decodeBatch: 8
+      batchSize: 8,
+      sampling: { temperature: 0, seed: 0 }
     })
 
     const generation = yield* inference.generation()
-    const entry = yield* generation.add(promptTensor)
-    let logits = entry.logits
+    const [first] = yield* generation.add([{
+      prompt: promptTensor,
+      maxTokens: maxNewTokens
+    }])
+    const tokens = [...first!.tokens]
+    let page = first!
 
-    for (const token of generatedTokens) {
-      ;[logits] = yield* generation.step([
-        { seq: entry.seq, token }
-      ])
+    while (page.stopReason === undefined) {
+      ;[page] = yield* generation.step([{ seq: page.seq }])
+      tokens.push(...page!.tokens)
     }
 
-    yield* entry.seq.finish()
-    return logits
+    yield* page.seq.finish()
+    return tokens
   })
 ```
 
@@ -1010,15 +1014,14 @@ The inference transform:
 - Rewrites causal attention into paged KV-cache operations.
 - Rewrites supported position operations to cursor-aware forms.
 - Allocates one shared block pool.
-- Compiles fixed-shape prefill, single-sequence decode, and optional batched
-  decode programs.
+- Compiles fixed-shape prefill and one fixed-width batched decode program.
 - Rejects models without cacheable causal attention.
 
 Generation sessions support:
 
 - Chunked prompt prefill.
-- Single and batched token steps.
-- Ragged batches padded internally by native code.
+- One sampled batched token-page API; batch size one is the ordinary case.
+- Stable physical lanes with explicit inactive slots and ragged prefill lengths.
 - Content-addressed whole-block prefix reuse.
 - Explicit sequence finish and session close.
 - Sliding-window attention.

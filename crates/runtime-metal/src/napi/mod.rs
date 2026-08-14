@@ -2255,14 +2255,12 @@ fn rollback_sequence_setup(
 
 pub(crate) struct KvContext {
     pool: Arc<PoolInner>,
-    // One slot per leading batch element of the program's signature:
-    // slot b owns batch row b of every KvAttention's q/k/v — its block
-    // table, cursor, window, advance. Single-sequence runs have one
-    // slot (RFC 0013).
+    // Compact request-order sequence state. `lanes` maps each entry to
+    // its fixed physical batch row; inactive rows have no sequence.
     pub(crate) slots: Vec<Arc<Mutex<SeqState>>>,
     schema: KvStateSchema,
     tokens: Vec<Vec<u32>>,
-    active_batch: usize,
+    lanes: Vec<usize>,
 }
 
 impl MetalDecodeContext for KvContext {
@@ -2274,8 +2272,19 @@ impl MetalDecodeContext for KvContext {
         &self.slots
     }
 
+    fn active_lane(&self, request_index: usize) -> usize {
+        self.lanes[request_index]
+    }
+
+    fn physical_slot(&self, lane: usize) -> Option<&Arc<Mutex<SeqState>>> {
+        self.lanes
+            .iter()
+            .position(|physical| *physical == lane)
+            .and_then(|request| self.slots.get(request))
+    }
+
     fn active_batch(&self) -> usize {
-        self.active_batch
+        self.slots.len()
     }
 
     fn prepare_state(&self, cursor: &runtime::metal::run::MetalTensor) -> err::Res<()> {
@@ -2286,11 +2295,24 @@ impl MetalDecodeContext for KvContext {
         };
         cursor.validate_destination("decode cursor", &shape, DType::I64)?;
         let count = if self.schema.cursor_tensor {
-            self.slots.len()
+            self.schema.batch
         } else {
             1
         };
-        for (index, slot) in self.slots.iter().take(count).enumerate() {
+        // Inactive physical lanes have a zero cursor.
+        unsafe {
+            std::ptr::write_bytes(
+                cursor
+                    .buffer
+                    .contents_ptr()
+                    .cast::<u8>()
+                    .add(cursor.layout.offset() * DType::I64.size_in_bytes()),
+                0,
+                count * DType::I64.size_in_bytes(),
+            );
+        }
+        for (request_index, slot) in self.slots.iter().enumerate() {
+            let index = self.lanes[request_index];
             let value = slot
                 .lock()
                 .map_err(|error| format!("decode cursor: sequence lock poisoned: {error}"))?
@@ -2361,7 +2383,7 @@ pub(crate) fn prepare_kv_attention(
     if plan.batch != schema.batch
         || plan.kv_heads != schema.kv_heads
         || plan.head_dim != schema.head_dim
-        || plan.batch != kv.slots.len()
+        || plan.batch != schema.batch
     {
         return Err(format!(
             "kv attention: fixed plan does not match the bound state schema"
@@ -2411,7 +2433,8 @@ pub(crate) fn prepare_kv_attention(
         }
     }
     let layer = layer as usize;
-    for (batch_index, slot) in kv.slots.iter().take(kv.active_batch).enumerate() {
+    for (request_index, slot) in kv.slots.iter().enumerate() {
+        let batch_index = kv.lanes[request_index];
         let mut state = slot
             .lock()
             .map_err(|error| format!("kv attention: sequence lock poisoned: {error}"))?;
@@ -2494,29 +2517,14 @@ pub(crate) fn kv_attention_into(
     {
         return Err("kv attention: incompatible grouped-query q/k/v shapes".to_string());
     }
-    if batch != kv.slots.len() || output.layout.shape() != q.layout.shape() {
+    if batch != kv.schema.batch || output.layout.shape() != q.layout.shape() {
         return Err("kv attention: destination shape or decode batch is inconsistent".to_string());
-    }
-    let advances = kv
-        .slots
-        .iter()
-        .take(kv.active_batch)
-        .map(|slot| {
-            slot.lock()
-                .map(|state| state.advance)
-                .map_err(|error| format!("kv attention: sequence lock poisoned: {error}"))
-        })
-        .collect::<std::result::Result<Vec<_>, _>>()?;
-    let advance = advances.first().copied().unwrap_or(0);
-    if advance == 0 || advance > time || advances.iter().any(|value| *value != advance) {
-        return Err(format!(
-            "kv attention: paged batch requires one non-zero uniform advance, got {advances:?}"
-        ));
     }
     if staging.len() != 5 {
         return Err("kv attention: planned invocation staging is missing".to_string());
     }
-    let (tables, context_lengths, block_bases) = (&staging[0], &staging[1], &staging[2]);
+    let (tables, context_lengths, block_bases, advances) =
+        (&staging[0], &staging[1], &staging[2], &staging[3]);
     let layer = layer as usize;
     let slab_dtype = kv.pool.k[layer].dtype();
     if !paged::is_supported(q, slab_dtype, head_dim) {
@@ -2542,7 +2550,7 @@ pub(crate) fn kv_attention_into(
         context_lengths,
         block_bases,
         kv.pool.block_size,
-        advance,
+        advances,
         paged::IntoResources::empty(),
     )?;
     paged::attention_into(
@@ -2557,7 +2565,7 @@ pub(crate) fn kv_attention_into(
         window,
         scale,
         kv.pool.block_size,
-        advance,
+        advances,
         output,
         paged::IntoResources::empty(),
     )?;
@@ -2835,6 +2843,7 @@ impl ObjectFinalize for NativeKvSequence {
 impl NativeKvSequence {
     // A fresh empty sequence on this sequence's pool (used for internal
     // pad slots in ragged batched runs).
+    #[cfg(test)]
     fn new_sequence_like(&self) -> Self {
         NativeKvSequence {
             pool: self.pool.clone(),
@@ -3000,6 +3009,10 @@ fn validate_execution_mode(
     stateful: bool,
     scalar_count: usize,
     sequence_count: Option<usize>,
+    slots: Option<&[u32]>,
+    active_mask: Option<&[bool]>,
+    valid_lengths: Option<&[u32]>,
+    advances: Option<&[u32]>,
     token_count: Option<usize>,
 ) -> Result<()> {
     if stateful {
@@ -3009,9 +3022,20 @@ fn validate_execution_mode(
                 "execute: stateful executables do not accept scalar inputs".to_string(),
             ));
         }
-        match (sequence_count, token_count) {
-            (Some(sequences), Some(tokens)) if sequences == tokens => Ok(()),
-            (Some(sequences), Some(tokens)) => Err(Error::new(
+        match (
+            sequence_count,
+            slots,
+            active_mask,
+            valid_lengths,
+            advances,
+            token_count,
+        ) {
+            (Some(sequences), Some(slots), Some(_), Some(_), Some(_), Some(tokens))
+                if sequences == tokens && sequences == slots.len() =>
+            {
+                Ok(())
+            }
+            (Some(sequences), _, _, _, _, Some(tokens)) => Err(Error::new(
                 Status::InvalidArg,
                 format!(
                     "execute: expected one token list per sequence, got {tokens} for {sequences} sequences"
@@ -3019,10 +3043,16 @@ fn validate_execution_mode(
             )),
             _ => Err(Error::new(
                 Status::InvalidArg,
-                "execute: stateful executables require sequence and token arrays".to_string(),
+                "execute: stateful executables require sequences, slots, activeMask, validLengths, advances, and tokens".to_string(),
             )),
         }
-    } else if sequence_count.is_some() || token_count.is_some() {
+    } else if sequence_count.is_some()
+        || slots.is_some()
+        || active_mask.is_some()
+        || valid_lengths.is_some()
+        || advances.is_some()
+        || token_count.is_some()
+    {
         Err(Error::new(
             Status::InvalidArg,
             "execute: stateless executables do not accept state".to_string(),
@@ -3123,25 +3153,59 @@ fn validate_sampled_outputs(
     Ok(())
 }
 
+fn validate_fixed_lanes(
+    batch: usize,
+    sequence_count: usize,
+    slots: &[u32],
+    active_mask: &[bool],
+    valid_lengths: &[u32],
+    advances: &[u32],
+    tokens: &[Vec<u32>],
+) -> Result<Vec<usize>> {
+    if slots.len() != sequence_count
+        || tokens.len() != sequence_count
+        || active_mask.len() != batch
+        || valid_lengths.len() != batch
+        || advances.len() != batch
+    {
+        return Err(Error::new(
+            Status::InvalidArg,
+            format!("kv run: slots and tokens must be compact and activeMask/validLengths/advances must have fixed batch length {batch}"),
+        ));
+    }
+    let lanes = slots.iter().map(|slot| *slot as usize).collect::<Vec<_>>();
+    if lanes.iter().any(|lane| *lane >= batch)
+        || lanes
+            .iter()
+            .enumerate()
+            .any(|(i, lane)| lanes[..i].contains(lane))
+        || active_mask.iter().filter(|active| **active).count() != sequence_count
+        || lanes.iter().any(|lane| !active_mask[*lane])
+        || active_mask.iter().enumerate().any(|(lane, active)| {
+            *active != lanes.contains(&lane)
+                || valid_lengths[lane] != advances[lane]
+                || (!*active && advances[lane] != 0)
+        })
+        || lanes.iter().enumerate().any(|(request, lane)| {
+            advances[*lane] == 0 || tokens[request].len() != advances[*lane] as usize
+        })
+    {
+        return Err(Error::new(
+            Status::InvalidArg,
+            "kv run: invalid fixed-lane mask, lengths, advances, slots, or token rows".to_string(),
+        ));
+    }
+    Ok(lanes)
+}
+
 fn validate_stateful_tensor_input(
     input: &NativeTensor,
     slot: usize,
     declared: &ProgramSlot,
-    active_batch: usize,
-    compiled_batch: usize,
-    bounded_batch: bool,
 ) -> Result<()> {
     let got = input.val_cloned()?;
     let shape = got.shape();
-    let shape_matches = if bounded_batch {
-        declared.shape.first() == Some(&compiled_batch)
-            && shape.first() == Some(&active_batch)
-            && shape.len() == declared.shape.len()
-            && shape[1..] == declared.shape[1..]
-    } else {
-        shape == declared.shape
-    };
-    if !shape_matches
+    if shape != declared.shape
         || got.dtype() != declared.dtype
         || device_key(&got.device()) != device_key(&declared.device)
     {
@@ -3267,6 +3331,10 @@ impl Executable {
         inputs: Vec<&NativeTensor>,
         scalars: Vec<f64>,
         sequences: Option<Vec<&NativeKvSequence>>,
+        slots: Option<Vec<u32>>,
+        active_mask: Option<Vec<bool>>,
+        valid_lengths: Option<Vec<u32>>,
+        advances: Option<Vec<u32>>,
         tokens: Option<Vec<Vec<u32>>>,
         token: Option<&CancellationToken>,
     ) -> Result<Vec<NativeTensor>> {
@@ -3274,6 +3342,10 @@ impl Executable {
             self.state.is_some(),
             scalars.len(),
             sequences.as_ref().map(Vec::len),
+            slots.as_deref(),
+            active_mask.as_deref(),
+            valid_lengths.as_deref(),
+            advances.as_deref(),
             tokens.as_ref().map(Vec::len),
         )?;
         if self.state.is_none() {
@@ -3284,6 +3356,10 @@ impl Executable {
             .execute_stateful(
                 inputs,
                 sequences.expect("state invocation was validated"),
+                slots.expect("state invocation was validated"),
+                active_mask.expect("state invocation was validated"),
+                valid_lengths.expect("state invocation was validated"),
+                advances.expect("state invocation was validated"),
                 tokens.expect("state invocation was validated"),
                 StatefulInvocation::Tensors,
                 token,
@@ -3302,6 +3378,10 @@ impl Executable {
         &self,
         inputs: Vec<&NativeTensor>,
         sequences: Vec<&NativeKvSequence>,
+        slots: Vec<u32>,
+        active_mask: Vec<bool>,
+        valid_lengths: Vec<u32>,
+        advances: Vec<u32>,
         tokens: Vec<Vec<u32>>,
         sampling: Vec<NativeSamplingOptions>,
         cancellation_token: Option<&CancellationToken>,
@@ -3322,6 +3402,10 @@ impl Executable {
             .execute_stateful(
                 inputs,
                 sequences,
+                slots,
+                active_mask,
+                valid_lengths,
+                advances,
                 tokens,
                 StatefulInvocation::Sampled(sampling),
                 cancellation_token,
@@ -3347,12 +3431,14 @@ enum StatefulExecutionOutput {
 }
 
 impl Executable {
-    // Ragged stateful batches pad to the executable's fixed width with
-    // throwaway sequences and zero token rows.
     async fn execute_stateful(
         &self,
         inputs: Vec<&NativeTensor>,
         seqs: Vec<&NativeKvSequence>,
+        slots: Vec<u32>,
+        active_mask: Vec<bool>,
+        valid_lengths: Vec<u32>,
+        advances: Vec<u32>,
         tokens: Vec<Vec<u32>>,
         invocation: StatefulInvocation,
         token: Option<&CancellationToken>,
@@ -3368,22 +3454,18 @@ impl Executable {
                 ),
             ));
         }
-        let active_batch = seqs.len();
-        let pad: Vec<NativeKvSequence> = (active_batch..batch)
-            .map(|_| seqs[0].new_sequence_like())
-            .collect();
-        let mut all: Vec<&NativeKvSequence> = seqs;
-        all.extend(pad.iter());
-        let mut all_tokens = tokens;
-        let advance = all_tokens.first().map(|t| t.len()).unwrap_or(1);
-        all_tokens.extend(std::iter::repeat_n(vec![0u32; advance], pad.len()));
-        let out = self
-            .execute_stateful_inner(inputs, all, all_tokens, active_batch, invocation, token)
-            .await;
-        for p in &pad {
-            p.release();
-        }
-        out
+        self.execute_stateful_inner(
+            inputs,
+            seqs,
+            slots,
+            active_mask,
+            valid_lengths,
+            advances,
+            tokens,
+            invocation,
+            token,
+        )
+        .await
     }
 }
 
@@ -3392,25 +3474,30 @@ impl Executable {
         &self,
         inputs: Vec<&NativeTensor>,
         seqs: Vec<&NativeKvSequence>,
+        slots: Vec<u32>,
+        active_mask: Vec<bool>,
+        valid_lengths: Vec<u32>,
+        advances: Vec<u32>,
         tokens: Vec<Vec<u32>>,
-        active_batch: usize,
         invocation: StatefulInvocation,
         token: Option<&CancellationToken>,
     ) -> Result<StatefulExecutionOutput> {
-        let batch = seqs.len();
-        if tokens.len() != batch || tokens.iter().any(|t| t.is_empty()) {
+        let batch = self.state.as_ref().expect("state checked").schema.batch;
+        if tokens.len() != seqs.len() || tokens.iter().any(|t| t.is_empty()) {
             return Err(Error::new(
                 Status::InvalidArg,
                 "kv run: expected one non-empty token list per sequence".to_string(),
             ));
         }
-        let advance = tokens[0].len();
-        if tokens.iter().any(|t| t.len() != advance) {
-            return Err(Error::new(
-                Status::InvalidArg,
-                "kv run: batched runs advance every sequence by the same count".to_string(),
-            ));
-        }
+        let lanes = validate_fixed_lanes(
+            batch,
+            seqs.len(),
+            &slots,
+            &active_mask,
+            &valid_lengths,
+            &advances,
+            &tokens,
+        )?;
         for (i, seq) in seqs.iter().enumerate() {
             if seq.released.load(Ordering::SeqCst) {
                 return Err(Error::new(
@@ -3458,13 +3545,6 @@ impl Executable {
             .signature
             .validate_invocation_counts(inputs.len(), 0, runtime_values, None)
             .map_err(|error| Error::new(Status::InvalidArg, error.to_string()))?;
-        let bounded_slot = inner
-            .slots
-            .iter()
-            .enumerate()
-            .rev()
-            .find(|(slot, declared)| !declared.scalar && *slot as u32 != stateful.cursor_slot)
-            .map(|(slot, _)| slot);
         for (slot, declared) in inner.slots.iter().enumerate() {
             if declared.scalar || (stateful.cursor_tensor && slot as u32 == stateful.cursor_slot) {
                 continue;
@@ -3472,14 +3552,7 @@ impl Executable {
             let input_index = slot
                 - inner.slots.iter().take(slot).filter(|s| s.scalar).count()
                 - usize::from(stateful.cursor_tensor && (slot as u32) > stateful.cursor_slot);
-            validate_stateful_tensor_input(
-                inputs[input_index],
-                slot,
-                declared,
-                active_batch,
-                schema.batch,
-                bounded_slot == Some(slot),
-            )?;
+            validate_stateful_tensor_input(inputs[input_index], slot, declared)?;
         }
         let executable = inner.executable.clone();
         let generated = inner.generated_bindings.clone();
@@ -3492,7 +3565,7 @@ impl Executable {
             slots: seqs.iter().map(|seq| seq.state.clone()).collect(),
             schema,
             tokens: tokens.clone(),
-            active_batch,
+            lanes: lanes.clone(),
         });
         // Lock every sequence in address order; overlapping batches
         // acquire the same locks in the same order, so no deadlock.
@@ -3523,7 +3596,7 @@ impl Executable {
                     ));
                 }
             }
-            for (index, state) in slot_states.iter().take(active_batch).enumerate() {
+            for (index, state) in slot_states.iter().enumerate() {
                 let cursor = state
                     .lock()
                     .map_err(|e| {
@@ -3576,11 +3649,7 @@ impl Executable {
                             format!("kv sequence lock poisoned: {e}"),
                         )
                     })?
-                    .advance = if index < active_batch {
-                    tokens[index].len()
-                } else {
-                    0
-                };
+                    .advance = advances[lanes[index]] as usize;
             }
             let output = {
                 let commit = || cancellation.complete();
@@ -4075,14 +4144,45 @@ mod epilogue_tests {
 
     #[test]
     fn stateless_invocation_rejects_state() {
-        assert!(validate_execution_mode(false, 0, Some(1), Some(1)).is_err());
+        assert!(
+            validate_execution_mode(false, 0, Some(1), None, None, None, None, Some(1)).is_err()
+        );
     }
 
     #[test]
     fn stateful_invocation_rejects_scalars_and_mismatched_state() {
-        assert!(validate_execution_mode(true, 1, Some(1), Some(1)).is_err());
-        assert!(validate_execution_mode(true, 0, Some(2), Some(1)).is_err());
-        assert!(validate_execution_mode(true, 0, Some(1), None).is_err());
+        assert!(
+            validate_execution_mode(true, 1, Some(1), None, None, None, None, Some(1)).is_err()
+        );
+        assert!(
+            validate_execution_mode(true, 0, Some(2), None, None, None, None, Some(1)).is_err()
+        );
+        assert!(validate_execution_mode(true, 0, Some(1), None, None, None, None, None).is_err());
+    }
+
+    #[test]
+    fn fixed_lane_validation_accepts_ragged_request_order() {
+        let lanes = validate_fixed_lanes(
+            4,
+            2,
+            &[3, 1],
+            &[false, true, false, true],
+            &[0, 2, 0, 1],
+            &[0, 2, 0, 1],
+            &[vec![7], vec![8, 9]],
+        )
+        .unwrap();
+        assert_eq!(lanes, [3, 1]);
+        assert!(validate_fixed_lanes(
+            4,
+            2,
+            &[3, 1],
+            &[false, true, false, true],
+            &[0, 1, 0, 1],
+            &[0, 2, 0, 1],
+            &[vec![7], vec![8, 9]],
+        )
+        .is_err());
     }
 
     #[test]
@@ -4237,6 +4337,10 @@ mod epilogue_tests {
             .execute_sampled(
                 Vec::new(),
                 vec![&sequence],
+                vec![0],
+                vec![true],
+                vec![2],
+                vec![2],
                 vec![vec![1, 2]],
                 vec![NativeSamplingOptions {
                     temperature: 0.0,
@@ -4591,7 +4695,7 @@ mod epilogue_tests {
             slots: vec![sequence.state.clone()],
             schema,
             tokens: vec![vec![1, 2, 3]],
-            active_batch: 1,
+            lanes: vec![0],
         };
         let staging = [[1, 2].as_slice(), &[1], &[1], &[1], &[1]]
             .into_iter()
@@ -4664,7 +4768,7 @@ mod epilogue_tests {
             slots: vec![sequence.state.clone()],
             schema,
             tokens: vec![vec![7]],
-            active_batch: 1,
+            lanes: vec![0],
         };
         let staging = [[1, 4].as_slice(), &[1], &[1], &[1], &[1]]
             .into_iter()
@@ -4697,12 +4801,12 @@ mod epilogue_tests {
     }
 
     #[test]
-    fn inactive_padding_slots_do_not_consume_kv_blocks() {
+    fn inactive_physical_lanes_have_no_sequence_and_consume_no_blocks() {
         let pool = NativeKvPool::new(1, 1, 2, 8, Some(4), Some(NativeDType::F32), None).unwrap();
-        let slots = (0..8)
-            .map(|index| {
-                let mut state = sequence_state(&pool.inner, index >= 2).unwrap();
-                state.advance = usize::from(index < 2);
+        let slots = (0..2)
+            .map(|_| {
+                let mut state = sequence_state(&pool.inner, false).unwrap();
+                state.advance = 1;
                 Arc::new(Mutex::new(state))
             })
             .collect::<Vec<_>>();
@@ -4724,8 +4828,8 @@ mod epilogue_tests {
             pool: pool.inner.clone(),
             slots: slots.clone(),
             schema,
-            tokens: vec![vec![1]; 8],
-            active_batch: 2,
+            tokens: vec![vec![1]; 2],
+            lanes: vec![1, 6],
         };
         let staging = [[8, 2].as_slice(), &[8], &[8], &[8], &[8]]
             .into_iter()
@@ -4750,16 +4854,10 @@ mod epilogue_tests {
             context.prepare_kv_attention(0, &plan, &staging).unwrap();
         }
         assert_eq!(pool.free_blocks(), 0);
-        assert!(slots[..2]
+        assert!(slots
             .iter()
             .all(|state| state.lock().unwrap().blocks.len() == 1));
-        assert!(slots[2..]
-            .iter()
-            .all(|state| state.lock().unwrap().blocks.is_empty()));
-        assert_eq!(&staging[1].to_u32_vec().unwrap()[..2], &[1, 1]);
-        assert!(staging[1].to_u32_vec().unwrap()[2..]
-            .iter()
-            .all(|value| *value == 0));
+        assert_eq!(staging[1].to_u32_vec().unwrap(), [0, 1, 0, 0, 0, 0, 1, 0]);
     }
 
     #[test]
@@ -4803,7 +4901,7 @@ mod epilogue_tests {
             slots: vec![sequence.state.clone()],
             schema: program.state.as_ref().unwrap().schema,
             tokens: vec![vec![1, 2, 3]],
-            active_batch: 1,
+            lanes: vec![0],
         };
         let output = executable::execute_stateful(
             &program.inner.executable,
@@ -4909,7 +5007,7 @@ mod epilogue_tests {
             slots: vec![sequence.state.clone()],
             schema: program.state.as_ref().unwrap().schema,
             tokens: vec![vec![1, 2, 3]],
-            active_batch: 1,
+            lanes: vec![0],
         };
         let output = executable::execute_stateful(
             &program.inner.executable,
@@ -5208,7 +5306,7 @@ mod epilogue_tests {
             slots: vec![sequence.state.clone()],
             schema: hybrid_schema(pool.inner.max_tokens, pool.inner.block_size),
             tokens: vec![tokens.to_vec()],
-            active_batch: 1,
+            lanes: vec![0],
         };
         let mut state = sequence.state.lock().unwrap();
         let needed = (state.cursor + tokens.len()).div_ceil(pool.inner.block_size);
@@ -5260,7 +5358,7 @@ mod epilogue_tests {
             slots: vec![sequence.state.clone(), padding.state.clone()],
             schema: hybrid_schema(32, 4),
             tokens: vec![vec![1, 2, 3, 4], vec![1, 2, 3, 4]],
-            active_batch: 1,
+            lanes: vec![0],
         };
         let mut states = context
             .slots
@@ -5273,7 +5371,7 @@ mod epilogue_tests {
             state.advance = 4;
             set_state_f32(&state.kda_states[0], &[1.0, 2.0, 3.0, 4.0]);
         }
-        for (index, state) in states.iter_mut().take(context.active_batch).enumerate() {
+        for (index, state) in states.iter_mut().take(context.active_batch()).enumerate() {
             context.commit_slot(index, state);
         }
         assert_eq!(states[1].cursor, 0);

@@ -1182,18 +1182,28 @@ export const makeRuntime = (
       firstPool.convChannels !== schema.convChannels ||
       firstPool.convKernel !== schema.convKernel ||
       sequenceRecords.length > schema.batch ||
+      invocation.slots.length !== sequenceRecords.length ||
+      invocation.tokens.length !== sequenceRecords.length ||
+      invocation.activeMask.length !== schema.batch ||
+      invocation.validLengths.length !== schema.batch ||
+      invocation.advances.length !== schema.batch ||
+      invocation.slots.some((slot) => !Number.isSafeInteger(slot) || slot < 0 || slot >= schema.batch) ||
+      new Set(invocation.slots).size !== sequenceRecords.length ||
+      invocation.activeMask.some((active, slot) => active !== invocation.slots.includes(slot)) ||
+      invocation.validLengths.some((length, slot) =>
+        !Number.isSafeInteger(length) || length < 0 ||
+        (invocation.activeMask[slot] ? length === 0 : length !== 0)
+      ) ||
+      invocation.advances.some((advance, slot) => advance !== invocation.validLengths[slot]) ||
+      invocation.tokens.some((row, index) => row.length !== invocation.advances[invocation.slots[index]!]!) ||
       new Set(invocation.sequences).size !== sequenceRecords.length
     ) {
       throw invalidHandle(operation, "execute", "invalid-handle", "kv-sequence")
     }
-    if (invocation.tokens.length !== sequenceRecords.length) {
-      throw new Error(`${operation}: expected one token row per sequence`)
-    }
-    const advance = invocation.tokens[0]?.length ?? 0
     if (
-      advance === 0 ||
+      invocation.tokens.some((row) => row.length === 0) ||
       invocation.tokens.some((row) =>
-        row.length !== advance || row.some((token) => !Number.isSafeInteger(token) || token < 0 || token > 0xffff_ffff)
+        row.some((token) => !Number.isSafeInteger(token) || token < 0 || token > 0xffff_ffff)
       )
     ) {
       throw new Error(`${operation}: invalid token rows for compiled state schema`)
@@ -1331,20 +1341,15 @@ export const makeRuntime = (
               `executeDecode: received ${invocation.bindings.length} tensor bindings, expected ${info.bindings.length}`
             )
           }
-          const inputs = invocation.bindings.map((input, index) =>
-            nativeBinding(
-              input,
-              info.bindings[index]!,
-              index,
-              index === info.bindings.length - 1
-                ? { compiled: schema.batch, active: state.sequences.length }
-                : undefined
-            )
-          )
+          const inputs = invocation.bindings.map((input, index) => nativeBinding(input, info.bindings[index]!, index))
           const sequences = resolveExecutionState(schema, state, "executeDecode")
           return value.executeSampled(
             inputs,
             [...sequences],
+            [...state.slots],
+            [...state.activeMask],
+            [...state.validLengths],
+            [...state.advances],
             state.tokens.map((row) => [...row]),
             options.map((option) => ({ ...option })),
             token
@@ -1686,23 +1691,24 @@ export const makeRuntime = (
               `execute: received ${invocation.bindings.length} tensor bindings, expected ${info.bindings.length}`
             )
           }
-          const inputs = invocation.bindings.map((input, index) =>
-            nativeBinding(
-              input,
-              info.bindings[index]!,
-              index,
-              info.state !== undefined && invocation.state !== undefined && index === info.bindings.length - 1
-                ? { compiled: info.state.batch, active: invocation.state.sequences.length }
-                : undefined
-            )
-          )
+          const inputs = invocation.bindings.map((input, index) => nativeBinding(input, info.bindings[index]!, index))
           const scalars = [...invocation.scalars]
           const schema = info.state
           if (schema === undefined) {
             if (invocation.state !== undefined) {
               throw new Error("execute: stateless executable does not accept state")
             }
-            return value.execute(inputs, scalars, undefined, undefined, token)
+            return value.execute(
+              inputs,
+              scalars,
+              undefined,
+              undefined,
+              undefined,
+              undefined,
+              undefined,
+              undefined,
+              token
+            )
           }
           if (invocation.state === undefined) {
             throw new Error("execute: stateful executable requires state")
@@ -1715,6 +1721,10 @@ export const makeRuntime = (
             inputs,
             scalars,
             [...sequences],
+            [...invocation.state.slots],
+            [...invocation.state.activeMask],
+            [...invocation.state.validLengths],
+            [...invocation.state.advances],
             invocation.state.tokens.map((row) => [...row]),
             token
           )

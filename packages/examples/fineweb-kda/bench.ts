@@ -19,11 +19,11 @@ const program = Effect.scoped(Effect.gen(function*() {
   yield* Tensor.clearAllScoped(params)
   const inference = yield* Model.inference(model, params, { maxTokens: 4096, blockSize: 16, attentionWindow: 256 })
   const gen = yield* Effect.acquireRelease(
-    inference.generation(),
+    inference.execution(),
     (gen) => Effect.ignore(gen.close())
   )
   const encoded = yield* tokenizer.encode("The history of the printing press is a long one")
-  const entry = yield* gen.add(yield* Tensor.fromTypedArray(encoded.data, [1, encoded.shape[0]]))
+  const entry = (yield* gen.add([yield* Tensor.fromTypedArray(encoded.data, [1, encoded.shape[0]])]))[0]!
   let logits = entry.logits
   const argmax = (vals: Array<number>) => vals.reduce((best, v, j) => (v > vals[best] ? j : best), 0)
   // Warm the fixed decode artifact and backend pipelines before timing.

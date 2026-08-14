@@ -117,7 +117,7 @@ onDevices("Sampling", () => (it) => {
         yield* Tensor.releaseKvSequence(sequence)
       }))
 
-    it.effect("returns only tokens for active rows of a fixed-width batch", () =>
+    it.effect("returns request-ordered tokens from sparse physical slots", () =>
       Effect.gen(function*() {
         const decode = yield* program(3, 4)
         const active = yield* sequences(decode, 2)
@@ -126,25 +126,48 @@ onDevices("Sampling", () => (it) => {
           [
             yield* Tensor.fromTypedArray(
               floats([
-                0,
-                3,
-                1,
-                2,
                 9,
                 1,
                 2,
-                3
+                3,
+                0,
+                0,
+                0,
+                0,
+                1,
+                2,
+                3,
+                8
               ]),
-              [2, 1, 4]
+              [3, 1, 4]
             )
           ],
           active,
+          [2, 0],
           [[1], [2]],
           [{ temperature: 0, seed: 1 }, { temperature: 0, seed: 2 }]
         )
-        expect(sampled).toEqual([1, 0])
+        expect(sampled).toEqual([3, 0])
         expect(yield* Effect.all(active.map(Tensor.kvSequenceCursor))).toEqual([1, 1])
         yield* Effect.forEach(active, Tensor.releaseKvSequence)
+      }))
+
+    it.effect("zeroes inactive last-token outputs", () =>
+      Effect.gen(function*() {
+        const decode = yield* program(3, 4)
+        const [sequence] = yield* sequences(decode, 1)
+        const outputs = yield* Tensor.runBatchedDecodeProgram(
+          decode,
+          [yield* Tensor.fromTypedArray(floats([9, 8, 7, 6, 5, 4, 3, 2, 1, 2, 3, 4]), [3, 1, 4])],
+          [sequence],
+          [2],
+          [[1]]
+        )
+        expect(yield* Tensor.toNumberArray(outputs[0]!)).toEqual([0, 0, 0, 0])
+        expect(yield* Tensor.toNumberArray(outputs[1]!)).toEqual([0, 0, 0, 0])
+        expect(yield* Tensor.toNumberArray(outputs[2]!)).toEqual([1, 2, 3, 4])
+        yield* Tensor.clearAll(outputs)
+        yield* Tensor.releaseKvSequence(sequence)
       }))
   })
 })

@@ -270,6 +270,14 @@ pub(crate) trait MetalDecodeContext {
     fn schema(&self) -> &KvStateSchema;
     /// All sequence slots (one per batch row), locked in index order.
     fn slots(&self) -> &[Arc<Mutex<SeqState>>];
+    /// Physical batch lane occupied by the compact request slot.
+    fn active_lane(&self, request_index: usize) -> usize {
+        request_index
+    }
+    /// State bound to a physical batch lane, if that lane is active.
+    fn physical_slot(&self, lane: usize) -> Option<&Arc<Mutex<SeqState>>> {
+        self.slots().get(lane)
+    }
     /// Number of slots actively participating in this invocation.
     fn active_batch(&self) -> usize {
         self.slots().len()
@@ -4882,7 +4890,8 @@ impl<'a> Lowerer<'a> {
                             let layout =
                                 effect_torch_runtime::Layout::contiguous(vec![input.shape[2]]);
                             crate::kernels::warm_copy_layout(&layout, input.dtype)?;
-                            pipeline_count += usize::from(layout.numel() != 0);
+                            crate::kernels::warm_fill(&[input.shape[2]], 0.0, input.dtype)?;
+                            pipeline_count += 2 * usize::from(layout.numel() != 0);
                         }
                     }
                     MetalOp::Reduce { op, dims, keepdims } => {
@@ -5713,7 +5722,9 @@ fn commit_state_transactions(
                     .checked_mul(geometry.head_dim)
                     .and_then(|value| value.checked_mul(geometry.value_dim))
                     .ok_or_else(|| "KDA state transaction size overflow".to_string())?;
-                for (batch_index, state) in states.iter().take(context.active_batch()).enumerate() {
+                for (request_index, state) in states.iter().take(context.active_batch()).enumerate()
+                {
+                    let batch_index = context.active_lane(request_index);
                     let destination = state
                         .kda_states
                         .get(*layer as usize)
@@ -5740,7 +5751,9 @@ fn commit_state_transactions(
                     .saturating_sub(1)
                     .checked_mul(geometry.channels)
                     .ok_or_else(|| "conv state transaction size overflow".to_string())?;
-                for (batch_index, state) in states.iter().take(context.active_batch()).enumerate() {
+                for (request_index, state) in states.iter().take(context.active_batch()).enumerate()
+                {
+                    let batch_index = context.active_lane(request_index);
                     let destination = state
                         .conv_states
                         .get(*layer as usize)
@@ -6127,7 +6140,12 @@ fn execute_with_commit(
         if sampling.is_empty() {
             return Err("sample: at least one sampling option is required".to_string());
         }
-        if sampling.len() > executable.program.outputs.len() {
+        if sampling.len() > executable.program.outputs.len()
+            || kv.is_some_and(|context| {
+                (0..sampling.len())
+                    .any(|request| context.active_lane(request) >= executable.program.outputs.len())
+            })
+        {
             return Err(format!(
                 "sample: got {} sampling options for {} program outputs",
                 sampling.len(),
@@ -6308,7 +6326,8 @@ fn execute_with_commit(
     let metal = device::MetalDevice::get();
     let sampling_result = if let Some(sampling) = sampling {
         for (index, options) in sampling.iter().copied().enumerate() {
-            let output = executable.program.outputs[index];
+            let output_index = kv.map_or(index, |context| context.active_lane(index));
+            let output = executable.program.outputs[output_index];
             let logits = resolved
                 .get(output.index())
                 .and_then(Option::as_ref)
@@ -6418,6 +6437,17 @@ fn execute_with_commit(
                                 &status,
                                 &state,
                                 kv,
+                                if matches!(op, MetalOp::LastTokenRow) {
+                                    command.outputs.first().and_then(|output| {
+                                        executable
+                                            .program
+                                            .outputs
+                                            .iter()
+                                            .position(|value| *value == output.value)
+                                    })
+                                } else {
+                                    None
+                                },
                                 &mut ce_checks,
                                 &mut quantized_embedding_checks,
                                 random_seed(invocation_nonce, *random_seed_token),
@@ -6453,7 +6483,8 @@ fn execute_with_commit(
                 }
                 if let (Some(sampling), Some(result)) = (sampling, sampling_result.as_ref()) {
                     for (index, options) in sampling.iter().copied().enumerate() {
-                        let output = executable.program.outputs[index];
+                        let output_index = kv.map_or(index, |context| context.active_lane(index));
+                        let output = executable.program.outputs[output_index];
                         let logits = resolved
                             .get(output.index())
                             .and_then(Option::as_ref)
@@ -6531,6 +6562,7 @@ fn execute_op_into(
     status: &[Value],
     state: &[Value],
     kv: Option<&dyn MetalDecodeContext>,
+    decode_lane: Option<usize>,
     ce_checks: &mut Vec<DeferredCeCheck>,
     quantized_embedding_checks: &mut Vec<DeferredQuantizedEmbeddingCheck>,
     random_seed: u64,
@@ -7265,10 +7297,10 @@ fn execute_op_into(
             let rank = q.layout.shape().len();
             let time = q.layout.shape()[rank - 2];
             let batch = q.layout.shape()[..rank - 3].iter().product::<usize>();
-            if batch != context.slots().len() || time == 0 {
+            if batch != context.schema().batch || time == 0 {
                 return Err(format!(
                     "kda recurrence shape has batch {batch} and time {time} for {} decode slots",
-                    context.slots().len()
+                    context.schema().batch
                 ));
             }
             let view = |value: &Value,
@@ -7298,7 +7330,10 @@ fn execute_op_into(
             };
             let state_next_root = state_tensors[0];
             let mask_root = staging.first().map(Value::as_metal).transpose()?;
-            for (batch_index, slot) in context.slots().iter().enumerate() {
+            for batch_index in 0..context.schema().batch {
+                let Some(slot) = context.physical_slot(batch_index) else {
+                    continue;
+                };
                 let state = slot
                     .lock()
                     .map_err(|error| format!("kda recurrence sequence lock poisoned: {error}"))?;
@@ -7489,10 +7524,10 @@ fn execute_op_into(
             let rank = source.layout.shape().len();
             let time = source.layout.shape()[rank - 2];
             let batch = source.layout.shape()[..rank - 2].iter().product::<usize>();
-            if batch != context.slots().len() || time == 0 {
+            if batch != context.schema().batch || time == 0 {
                 return Err(format!(
                     "conv state shape has batch {batch} and time {time} for {} decode slots",
-                    context.slots().len()
+                    context.schema().batch
                 ));
             }
             let MetalCommandPlan::ShortConvState(_) = plan else {
@@ -7519,7 +7554,10 @@ fn execute_op_into(
                     })
                 };
             let state_next_root = state_tensors[0];
-            for (batch_index, slot) in context.slots().iter().enumerate() {
+            for batch_index in 0..context.schema().batch {
+                let Some(slot) = context.physical_slot(batch_index) else {
+                    continue;
+                };
                 let state = slot
                     .lock()
                     .map_err(|error| format!("conv state sequence lock poisoned: {error}"))?;
@@ -8060,10 +8098,12 @@ fn execute_op_into(
                 ));
             }
             let (time, width) = (shape[1], shape[2]);
-            let advance = context
-                .slots()
-                .first()
-                .ok_or_else(|| "last token row requires a decode slot".to_string())?
+            let lane =
+                decode_lane.ok_or_else(|| "last token row must be a program output".to_string())?;
+            let Some(slot) = context.physical_slot(lane) else {
+                return metal_ops::fill_into(0.0, output(0)?.as_metal()?);
+            };
+            let advance = slot
                 .lock()
                 .map_err(|error| format!("last token row sequence lock poisoned: {error}"))?
                 .advance;
@@ -10534,6 +10574,29 @@ mod tests {
         }
     }
 
+    fn last_token_row_context_for_lanes(advances: &[usize]) -> TestDecodeContext {
+        let mut schema = last_token_row_schema();
+        schema.batch = advances.len();
+        TestDecodeContext {
+            schema,
+            slots: advances
+                .iter()
+                .map(|advance| {
+                    Arc::new(Mutex::new(SeqState {
+                        blocks: Vec::with_capacity(4),
+                        head: 0,
+                        cursor: 0,
+                        advance: *advance,
+                        last_hash: 0,
+                        pending: Vec::new(),
+                        kda_states: Vec::new(),
+                        conv_states: Vec::new(),
+                    }))
+                })
+                .collect(),
+        }
+    }
+
     fn compile_last_token_row() -> MetalCompilation {
         let logits = Node::new(NodeKind::LastTokenRow {
             a: leaf_shape((0..12).map(|value| value as f32).collect(), vec![1, 3, 4]),
@@ -10586,9 +10649,10 @@ mod tests {
             ),
         })
         .unwrap();
-        let compilation =
-            compile_graph_with_state(&[first, second], false, last_token_row_schema());
-        let context = last_token_row_context(2);
+        let mut schema = last_token_row_schema();
+        schema.batch = 2;
+        let compilation = compile_graph_with_state(&[first, second], false, schema);
+        let context = last_token_row_context_for_lanes(&[3, 2]);
 
         let tokens = execute_stateful_sampled(
             &compilation.executable,
@@ -10603,8 +10667,10 @@ mod tests {
 
         assert_eq!(tokens, [3, 1]);
         let state = context.slots[0].lock().unwrap();
-        assert_eq!(state.cursor, 2);
+        assert_eq!(state.cursor, 3);
         assert_eq!(state.advance, 0);
+        drop(state);
+        assert_eq!(context.slots[1].lock().unwrap().cursor, 2);
     }
 
     #[test]

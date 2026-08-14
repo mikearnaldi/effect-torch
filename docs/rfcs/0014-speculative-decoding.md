@@ -1,9 +1,14 @@
 # RFC 0014: Speculative Decoding — Verification as a Primitive
 
-- **Status**: Draft
+- **Status**: Superseded by RFC 0023
 - **Created**: 2026-08-02
 - **Depends on**: RFC 0010 (inference), RFC 0013 (batched decode)
 - **Updates**: —
+
+RFC 0023 replaces this draft. In particular, implementations must not add the
+public truncation API or single-sequence native engine proposed below. RFC 0023
+defines batch-first token-page generation, exact positive-temperature
+acceptance, and internal round transactions instead.
 
 ## Summary
 

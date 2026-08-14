@@ -1260,14 +1260,28 @@ export const makeRuntime = (
     schema: Runtime.DecodeStateSchema | undefined,
     invocation: Runtime.ExecutionStateInvocation | undefined
   ):
-    | readonly [sequences: Array<NativeKvSequence>, tokens: Array<Array<number>>]
-    | readonly [sequences: undefined, tokens: undefined] =>
+    | readonly [
+      sequences: Array<NativeKvSequence>,
+      slots: Array<number>,
+      activeMask: Array<boolean>,
+      validLengths: Array<number>,
+      advances: Array<number>,
+      tokens: Array<Array<number>>
+    ]
+    | readonly [
+      sequences: undefined,
+      slots: undefined,
+      activeMask: undefined,
+      validLengths: undefined,
+      advances: undefined,
+      tokens: undefined
+    ] =>
   {
     if (schema === undefined) {
       if (invocation !== undefined) {
         throw executionError("execute: stateless executable does not accept state")
       }
-      return [undefined, undefined]
+      return [undefined, undefined, undefined, undefined, undefined, undefined]
     }
     if (invocation === undefined) {
       throw executionError("execute: stateful executable requires state")
@@ -1275,7 +1289,11 @@ export const makeRuntime = (
     if (
       invocation.sequences.length === 0 ||
       invocation.sequences.length > schema.batch ||
-      invocation.tokens.length !== invocation.sequences.length
+      invocation.slots.length !== invocation.sequences.length ||
+      invocation.tokens.length !== invocation.sequences.length ||
+      invocation.activeMask.length !== schema.batch ||
+      invocation.validLengths.length !== schema.batch ||
+      invocation.advances.length !== schema.batch
     ) {
       throw executionError(
         `execute: expected 1..=${schema.batch} sequences with one token row each`
@@ -1287,6 +1305,15 @@ export const makeRuntime = (
     if (
       sequenceInfos.some((entry) => entry.pool.key !== firstPool.key) ||
       new Set(invocation.sequences).size !== sequenceRecords.length ||
+      invocation.slots.some((slot) => !Number.isSafeInteger(slot) || slot < 0 || slot >= schema.batch) ||
+      new Set(invocation.slots).size !== sequenceRecords.length ||
+      invocation.activeMask.some((active, slot) => active !== invocation.slots.includes(slot)) ||
+      invocation.validLengths.some((length, slot) =>
+        !Number.isSafeInteger(length) || length < 0 ||
+        (invocation.activeMask[slot] ? length === 0 : length !== 0)
+      ) ||
+      invocation.advances.some((advance, slot) => advance !== invocation.validLengths[slot]) ||
+      invocation.tokens.some((row, index) => row.length !== invocation.advances[invocation.slots[index]!]!) ||
       firstPool.maxTokens !== schema.maxTokens ||
       firstPool.blockSize !== schema.blockSize ||
       firstPool.dtype !== schema.kvDtype ||
@@ -1303,23 +1330,28 @@ export const makeRuntime = (
     ) {
       throw invalidHandle("execute", "execute", "invalid-handle", "kv-sequence")
     }
-    const advance = invocation.tokens[0]!.length
     if (
-      advance === 0 ||
+      invocation.tokens.some((row) => row.length === 0) ||
       invocation.tokens.some((row) =>
-        row.length !== advance || row.some((token) => !Number.isSafeInteger(token) || token < 0 || token > 0xffff_ffff)
+        row.some((token) => !Number.isSafeInteger(token) || token < 0 || token > 0xffff_ffff)
       )
     ) {
       throw executionError("execute: invalid token rows for compiled state schema")
     }
     if (
       schema.window === undefined &&
-      sequenceRecords.some((entry) => (entry.value as NativeKvSequence).cursor + advance > schema.maxTokens)
+      sequenceRecords.some((entry, index) =>
+        (entry.value as NativeKvSequence).cursor + invocation.tokens[index]!.length > schema.maxTokens
+      )
     ) {
       throw executionError(`execute: sequence context exceeds pool capacity ${schema.maxTokens}`)
     }
     return [
       sequenceRecords.map((entry) => entry.value as NativeKvSequence),
+      [...invocation.slots],
+      [...invocation.activeMask],
+      [...invocation.validLengths],
+      [...invocation.advances],
       invocation.tokens.map((row) => [...row])
     ]
   }
@@ -1340,26 +1372,24 @@ export const makeRuntime = (
         `execute: received ${invocation.bindings.length} tensor bindings, expected ${info.bindings.length}`
       )
     }
-    const inputs = invocation.bindings.map((input, index) =>
-      nativeBinding(
-        input,
-        info.bindings[index]!,
-        index,
-        info.state !== undefined && invocation.state !== undefined && index === info.bindings.length - 1
-          ? { compiled: info.state.batch, active: invocation.state.sequences.length }
-          : undefined
-      )
-    )
+    const inputs = invocation.bindings.map((input, index) => nativeBinding(input, info.bindings[index]!, index))
     if (info.state !== undefined && invocation.scalars.length !== 0) {
       throw executionError("execute: stateful executable does not accept scalar inputs")
     }
-    const [sequences, tokens] = resolveExecutionState(info.state, invocation.state)
+    const [sequences, slots, activeMask, validLengths, advances, tokens] = resolveExecutionState(
+      info.state,
+      invocation.state
+    )
     return {
       executable: executableRecord.value as Executable,
       info,
       inputs,
       scalars: [...invocation.scalars],
       sequences,
+      slots,
+      activeMask,
+      validLengths,
+      advances,
       tokens
     }
   }
@@ -1461,6 +1491,10 @@ export const makeRuntime = (
           return resolved.executable.executeSampled(
             resolved.inputs,
             resolved.sequences ?? [],
+            resolved.slots ?? [],
+            resolved.activeMask ?? [],
+            resolved.validLengths ?? [],
+            resolved.advances ?? [],
             resolved.tokens ?? [],
             options.map((option) => ({ ...option })),
             token
@@ -1750,6 +1784,10 @@ export const makeRuntime = (
             resolved.inputs,
             resolved.scalars,
             resolved.sequences,
+            resolved.slots,
+            resolved.activeMask,
+            resolved.validLengths,
+            resolved.advances,
             resolved.tokens,
             token
           )

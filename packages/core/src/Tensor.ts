@@ -4972,13 +4972,26 @@ export const runDecodeProgram = (
   tokens: ReadonlyArray<number>
 ): Effect.Effect<Array<Concrete>, TensorError, Runtime.Runtime> =>
   Effect.gen(function*() {
+    if (program.batch !== 1) {
+      return yield* new TensorError({
+        op: "decode",
+        message: `decode: single-sequence execution requires a batch-one program, got batch ${program.batch}`
+      })
+    }
     const runtime = yield* Runtime.Runtime
     return yield* withMaterializedInputs(runtime, inputs, (concrete) =>
       executeProgram(runtime, "decode", program, {
         bindings: concrete,
         scalars: [],
         runtimeValues: {},
-        state: { sequences: [seq.handle], tokens: [tokens] }
+        state: {
+          sequences: [seq.handle],
+          slots: [0],
+          activeMask: [true],
+          validLengths: [tokens.length],
+          advances: [tokens.length],
+          tokens: [tokens]
+        }
       }))
   })
 
@@ -5002,6 +5015,12 @@ export const runDecodeProgramSampled = (
   sampling: SamplingOptions
 ): Effect.Effect<number, TensorError, Runtime.Runtime> =>
   Effect.gen(function*() {
+    if (program.batch !== 1) {
+      return yield* new TensorError({
+        op: "decodeSampled",
+        message: `decodeSampled: single-sequence execution requires a batch-one program, got batch ${program.batch}`
+      })
+    }
     const runtime = yield* Runtime.Runtime
     const executeDecode = runtime.extensions.sampling.executeDecode
     const output = program.outputs[0]
@@ -5020,7 +5039,14 @@ export const runDecodeProgramSampled = (
             bindings: concrete,
             scalars: [],
             runtimeValues: {},
-            state: { sequences: [seq.handle], tokens: [tokens] }
+            state: {
+              sequences: [seq.handle],
+              slots: [0],
+              activeMask: [true],
+              validLengths: [tokens.length],
+              advances: [tokens.length],
+              tokens: [tokens]
+            }
           }, [normalized])
         )
         if (sampled.length !== 1) {
@@ -5036,13 +5062,11 @@ export const runDecodeProgramSampled = (
 /**
  * Runs a frozen batched decode program against one active sequence per batch
  * row. The active count must be from `1` through `program.batch`; the backend
- * pads unused rows to the fixed compiled width. Sequences must be distinct,
- * live, from one compatible pool and runtime, and `tokens` must provide one
- * equally sized, nonempty real-token row per sequence. Every sequence advances
- * by that row length, normally `1` for decode. The highest-slot tensor input
- * may have any positive rank and use the active count as its leading dimension
- * when remaining dimensions match; the backend zero-pads that dimension to the
- * compiled width. Every other input must exactly match its declaration.
+ * uses explicit physical `slots`; every tensor input already has the fixed
+ * compiled width. Sequences must be distinct, live, from one compatible pool
+ * and runtime, and `tokens` must provide one nonempty real-token row per
+ * sequence. Rows may have different lengths and every sequence advances by its
+ * row length, normally `1` for decode.
  * Returned outputs retain the fixed compiled batch width, so padded rows must
  * be ignored. All sequences are exclusively borrowed and must be absent from
  * every concurrent invocation or sequence operation. Constraint, execution,
@@ -5056,6 +5080,7 @@ export const runBatchedDecodeProgram = (
   program: DecodeProgram,
   inputs: ReadonlyArray<Any>,
   seqs: ReadonlyArray<KvSequence>,
+  slots: ReadonlyArray<number>,
   tokens: ReadonlyArray<ReadonlyArray<number>>
 ): Effect.Effect<Array<Concrete>, TensorError, Runtime.Runtime> =>
   Effect.gen(function*() {
@@ -5069,6 +5094,16 @@ export const runBatchedDecodeProgram = (
           sequences: seqs.map((sequence) =>
             sequence.handle
           ),
+          slots,
+          activeMask: Array.from({ length: program.batch }, (_, slot) => slots.includes(slot)),
+          validLengths: Array.from({ length: program.batch }, (_, slot) => {
+            const index = slots.indexOf(slot)
+            return index < 0 ? 0 : tokens[index]!.length
+          }),
+          advances: Array.from({ length: program.batch }, (_, slot) => {
+            const index = slots.indexOf(slot)
+            return index < 0 ? 0 : tokens[index]!.length
+          }),
           tokens
         }
       }))
@@ -5091,6 +5126,7 @@ export const runBatchedDecodeProgramSampled = (
   program: DecodeProgram,
   inputs: ReadonlyArray<Any>,
   seqs: ReadonlyArray<KvSequence>,
+  slots: ReadonlyArray<number>,
   tokens: ReadonlyArray<ReadonlyArray<number>>,
   sampling: ReadonlyArray<SamplingOptions>
 ): Effect.Effect<Array<number>, TensorError, Runtime.Runtime> =>
@@ -5105,7 +5141,8 @@ export const runBatchedDecodeProgramSampled = (
       })
     }
     const normalized = yield* Effect.forEach(sampling, (options, index) => {
-      const output = program.outputs[index]
+      const slot = slots[index]
+      const output = slot === undefined ? undefined : program.outputs[slot]
       return output === undefined
         ? new TensorError({
           op: "decodeBatchedSampled",
@@ -5123,6 +5160,16 @@ export const runBatchedDecodeProgramSampled = (
             runtimeValues: {},
             state: {
               sequences: seqs.map((sequence) => sequence.handle),
+              slots,
+              activeMask: Array.from({ length: program.batch }, (_, slot) => slots.includes(slot)),
+              validLengths: Array.from({ length: program.batch }, (_, slot) => {
+                const index = slots.indexOf(slot)
+                return index < 0 ? 0 : tokens[index]!.length
+              }),
+              advances: Array.from({ length: program.batch }, (_, slot) => {
+                const index = slots.indexOf(slot)
+                return index < 0 ? 0 : tokens[index]!.length
+              }),
               tokens
             }
           }, normalized)
@@ -5136,7 +5183,7 @@ export const runBatchedDecodeProgramSampled = (
         }
         return yield* Effect.forEach(
           sampled,
-          (token, index) => validateSampledToken("decodeBatchedSampled", token, program.outputs[index]!)
+          (token, index) => validateSampledToken("decodeBatchedSampled", token, program.outputs[slots[index]!]!)
         )
       }))
   })

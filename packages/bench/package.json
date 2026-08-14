@@ -6,6 +6,7 @@
   "scripts": {
     "bench": "tsx matmul.ts",
     "bench:compile": "tsx compile.ts",
+    "bench:inference": "tsx inference.ts",
     "bench:mlx": "tsx headtohead.ts",
     "typecheck": "tsc -p tsconfig.json"
   },

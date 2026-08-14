@@ -11,6 +11,7 @@
     "lint-fix": "oxlint --fix && dprint fmt",
     "bench": "pnpm --filter @effect-torch/bench bench",
     "bench:compile": "pnpm --filter @effect-torch/bench bench:compile",
+    "bench:inference": "pnpm --filter @effect-torch/bench bench:inference",
     "bench:mlx": "pnpm --filter @effect-torch/bench bench:mlx",
     "verify:native-packages": "node scripts/verify-native-packages.mjs"
   },

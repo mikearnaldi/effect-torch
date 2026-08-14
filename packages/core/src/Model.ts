@@ -1489,9 +1489,8 @@ export class InferenceError extends Data.TaggedError("InferenceError")<{
 /**
  * Fixed deployment geometry for {@link inference}. Construction validates
  * these scalar fields, then eagerly traces and compiles prefill
- * `[1, prefillChunk]`, single-sequence decode `[1, 1]`, and, when
- * `decodeBatch > 1`, batched decode `[decodeBatch, 1]`. There is no later
- * shape-specialization cache.
+ * `[batchSize, prefillChunk]` and fixed-width decode `[batchSize, 1]`. Batch size one
+ * uses the same decode path. There is no later shape-specialization cache.
  *
  * Validation is deliberately structural. It does not estimate whether the
  * pool is large enough for a particular set of prompts, check token ids against
@@ -1552,14 +1551,16 @@ export interface InferenceConfig {
    * recurrent state remains f32 and is not controlled by this option.
    */
   readonly kvDtype?: "f32" | "f16" | "bf16" | "int8"
+  /** Default sampling controls for generation. Defaults to `{ seed: 0 }`. */
+  readonly sampling?: GenerationSamplingOptions
   /**
-   * Positive maximum live sequences tracked by each session and maximum active
-   * entries in one step. Defaults to `8`. Values above one compile a fixed
-   * `[decodeBatch, 1]` batched program in addition to the single-sequence
-   * program. This is not a global limit across sessions; all sessions still
-   * compete for one pool's token-row capacity.
+   * Positive fixed decode width, maximum live sequences tracked by each
+   * session, and maximum active entries in one step. Defaults to `8`. The one
+   * decode program has shape `[batchSize, 1]`; batch size one is the ordinary
+   * single-sequence case. This is not a global limit across sessions; all
+   * sessions still compete for one pool's token-row capacity.
    */
-  readonly decodeBatch?: number
+  readonly batchSize?: number
 }
 
 /**
@@ -1577,6 +1578,7 @@ export interface InferenceConfig {
  * @category compilation
  */
 export interface GenerationSeq {
+  readonly _tag: "GenerationSeq"
   /**
    * Low-level state handle owned by this sequence. Despite the `KvSequence`
    * name it also carries cursor-only or recurrent-only state. Do not run or
@@ -1597,52 +1599,42 @@ export interface GenerationSeq {
   readonly finish: () => Effect.Effect<void, Tensor.TensorError, Runtime.Runtime>
 }
 
-/**
- * The result of {@link Generation.add}: a new live sequence and its prompt's
- * final-real-position logits `[vocab]`, from which the first generated token is
- * selected. The two returned values have independent lifetimes: finishing the
- * sequence does not clear the logits.
- *
- * @since 0.1.0
- * @category compilation
- */
-export interface GenerationEntry {
-  /** The new live sequence handle. */
-  readonly seq: GenerationSeq
-  /** Caller-owned logits with shape `[vocab]`; release with {@link Tensor.clear} when unused. */
-  readonly logits: Tensor.Concrete
+/** Sampling controls owned by generation; draw counters are sequence-managed. */
+export type GenerationSamplingOptions = Omit<Tensor.SamplingOptions, "counter">
+
+/** One prompt admitted by {@link Generation.add}. */
+export interface GenerationAdd {
+  readonly prompt: Tensor.Any
+  readonly sampling?: Partial<GenerationSamplingOptions>
+  readonly maxTokens?: number
+  readonly eosTokens?: ReadonlyArray<number>
 }
 
-/**
- * The result of {@link Generation.addSampled}: a new live sequence and the
- * token selected from its prompt's final-real-position logits. Fused execution
- * publishes no logits tensor, so the caller owns only the sequence. The token
- * is returned only after the prompt's native state update commits.
- *
- * @since 0.1.0
- * @category compilation
- */
-export interface GenerationSampledEntry {
-  /** The new live sequence handle. */
+/** One live sequence selected by {@link Generation.step}. */
+export interface GenerationStep {
   readonly seq: GenerationSeq
-  /** The sampled next-token id. */
-  readonly token: number
+  readonly sampling?: Partial<GenerationSamplingOptions>
+}
+
+/** A nonempty page of sampled tokens for one sequence. */
+export interface TokenPage {
+  readonly seq: GenerationSeq
+  readonly tokens: ReadonlyArray<number>
+  readonly stopReason?: "eos" | "maxTokens"
 }
 
 /**
  * A caller-scheduled generation session over one {@link InferenceProgram}.
- * {@link Generation.add} creates and prefills an independent sequence;
- * {@link Generation.step} commits one supplied token to each selected sequence
- * and returns the logits after that token. One entry uses the `[1, 1]` program;
- * multiple entries use the fixed `decodeBatch` program while the backend pads
- * inactive lanes internally. There is no queue, automatic token selection, or
- * fairness/admission policy beyond the documented checks.
+ * {@link Generation.add} creates and prefills independent sequences and samples
+ * their first token. {@link Generation.step} commits each sequence's pending
+ * token and samples its successor. Every active count uses the fixed
+ * `[batchSize, 1]` program with explicit inactive lanes.
  *
  * Prefix matching is pool-wide, not session-local. It uses chained hashes to
  * reuse the longest resident proper prefix made of complete `blockSize` blocks,
  * whether those blocks are referenced by another live sequence or retained
  * unreferenced in the LRU cache. At least the final prompt token is always
- * executed so `add` can return its logits. Hybrid KV/recurrent programs also
+ * executed so `add` can sample the first pending token. Hybrid KV/recurrent programs also
  * require a published recurrent snapshot at the matched block boundary and
  * restore it with the KV blocks. Programs without KV blocks, including purely
  * recurrent and stateless graphs, have no block anchor and therefore no prefix
@@ -1650,90 +1642,30 @@ export interface GenerationSampledEntry {
  *
  * Sessions are ordinary values and require no `Scope`. Sessions from the same
  * artifact may run concurrently and share pool capacity/cache content. Calls to
- * `step` on one session are serialized. `add`, `finish`, `cursor`, and `close`
- * are outside that JavaScript lock, so callers must not overlap them with each
- * other or with `step` on the same session/sequence. Native sequence locks are a
- * safety backstop, not a supported concurrent lifecycle API.
+ * `add` and `step` on one session are serialized. `finish`, `cursor`, and
+ * `close` are outside that JavaScript lock, so callers must not overlap them
+ * with admission or stepping on the same session/sequence. Native sequence
+ * locks are a safety backstop, not a supported concurrent lifecycle API.
  *
  * @since 0.1.0
  * @category compilation
  */
 export interface Generation {
   /**
-   * Prefills `prompt` as a new sequence and returns its handle and final-real-
-   * token logits. The prompt must have shape `[1, T]` with `T >= 1`, use the
-   * current inference runtime/placement, and have the configured `tokenDtype`.
-   * It is borrowed and materialized internally; any temporary concrete copy is
-   * released before completion.
-   *
-   * Prefill first attaches a reusable whole-block proper prefix and then runs
-   * the remaining suffix in fixed, zero-padded chunks. Only real ids advance
-   * state. A failed or interrupted add releases the newly allocated sequence
-   * and does not add it to `live`; backend decode invocations roll back
-   * uncommitted state. Adding beyond this session's `decodeBatch` live-sequence
-   * limit fails with an {@link InferenceError}. Token bounds, position limits,
-   * and pool exhaustion may instead surface as {@link Tensor.TensorError}s.
+   * Atomically admits a nonempty array of prompts. Capacity and policy are
+   * validated for every entry before any sequence is allocated. Results preserve
+   * input order and ordinary generation returns one token per page.
    */
   readonly add: (
-    prompt: Tensor.Any
-  ) => Effect.Effect<GenerationEntry, InferenceError | ModelError | Tensor.TensorError, Runtime.Runtime>
+    entries: ReadonlyArray<GenerationAdd>
+  ) => Effect.Effect<ReadonlyArray<TokenPage>, InferenceError | ModelError | Tensor.TensorError, Runtime.Runtime>
   /**
-   * Prefills a new sequence and samples its first generated token during the
-   * final chunk's native decode invocation. Intermediate chunks execute ordinary
-   * decode and immediately clear their logits; no logits are published.
-   */
-  readonly addSampled: (
-    prompt: Tensor.Any,
-    sampling: Tensor.SamplingOptions
-  ) => Effect.Effect<GenerationSampledEntry, InferenceError | ModelError | Tensor.TensorError, Runtime.Runtime>
-  /**
-   * Commits one supplied token to every entry's sequence in one invocation and
-   * returns caller-owned materialized `[vocab]` logits in entry order. The input
-   * must be nonempty and contain at most `decodeBatch` distinct live sequences
-   * from this session. JavaScript validation requires each token to be a
-   * non-negative integer; conversion/backend validation additionally requires
-   * it to fit u32. Vocabulary validity is not checked here as a model-level
-   * invariant and may fail in execution.
-   *
-   * A successful call advances each cursor by one. Native state updates are
-   * transactional across the active batch: execution failure or interruption
-   * before commit leaves every sequence unadvanced. Calls on this session
-   * serialize, but admission and scheduling remain with the caller. Returned
-   * logits are independent ownerships; clear each when no longer needed. Finishing a
-   * sequence or closing the session does not clear earlier logits.
+   * Commits each selected sequence's pending token and samples one successor.
+   * Terminal sequences fail validation before native execution.
    */
   readonly step: (
-    entries: ReadonlyArray<{
-      /** A distinct live sequence created by this session. */
-      readonly seq: GenerationSeq
-      /** The next token id, as a non-negative integer. */
-      readonly token: number
-    }>
-  ) => Effect.Effect<
-    ReadonlyArray<Tensor.Concrete>,
-    InferenceError | ModelError | Tensor.TensorError,
-    Runtime.Runtime
-  >
-  /**
-   * Commits each supplied input token and samples the corresponding next token
-   * in the same native invocation. Entries must be distinct live sequences and
-   * results are returned in entry order. One entry uses single decode; multiple
-   * entries use the fixed batched decode program.
-   */
-  readonly stepSampled: (
-    entries: ReadonlyArray<{
-      /** A distinct live sequence created by this session. */
-      readonly seq: GenerationSeq
-      /** The input token id to commit, as a non-negative integer. */
-      readonly token: number
-      /** Sampling controls for this entry's resulting logits row. */
-      readonly sampling: Tensor.SamplingOptions
-    }>
-  ) => Effect.Effect<
-    ReadonlyArray<number>,
-    InferenceError | ModelError | Tensor.TensorError,
-    Runtime.Runtime
-  >
+    entries: ReadonlyArray<GenerationStep>
+  ) => Effect.Effect<ReadonlyArray<TokenPage>, InferenceError | Tensor.TensorError, Runtime.Runtime>
   /**
    * Returns this session's JavaScript live-sequence count. This is not a pool
    * capacity, global-session, or prefix-cache statistic.
@@ -1746,10 +1678,34 @@ export interface Generation {
    * returned, so callers may retry. Interruption stops the remaining attempts,
    * leaving their entries live. Completed KV blocks may stay as reclaimable
    * prefix-cache content. The session is resettable rather than terminal and may
-   * accept new sequences after a successful close. Previously returned logits
-   * are unaffected. Native finalizers are the fallback when sessions and
+   * accept new sequences after a successful close. Previously returned token
+   * pages are unaffected. Native finalizers are the fallback when sessions and
    * sequence handles become unreachable.
    */
+  readonly close: () => Effect.Effect<void, Tensor.TensorError, Runtime.Runtime>
+}
+
+/** A caller-driven stateful sequence used only by {@link StatefulExecution}. */
+export interface StatefulExecutionSeq {
+  readonly _tag: "StatefulExecutionSeq"
+  readonly sequence: Tensor.KvSequence
+  readonly cursor: () => Effect.Effect<number, Tensor.TensorError, Runtime.Runtime>
+  readonly finish: () => Effect.Effect<void, Tensor.TensorError, Runtime.Runtime>
+}
+
+/** Lower-level stateful logits execution for custom host samplers. */
+export interface StatefulExecution {
+  readonly add: (
+    prompts: ReadonlyArray<Tensor.Any>
+  ) => Effect.Effect<
+    ReadonlyArray<{ readonly seq: StatefulExecutionSeq; readonly logits: Tensor.Concrete }>,
+    InferenceError | ModelError | Tensor.TensorError,
+    Runtime.Runtime
+  >
+  readonly step: (
+    entries: ReadonlyArray<{ readonly seq: StatefulExecutionSeq; readonly token: number }>
+  ) => Effect.Effect<ReadonlyArray<Tensor.Concrete>, InferenceError | Tensor.TensorError, Runtime.Runtime>
+  readonly live: () => Effect.Effect<number>
   readonly close: () => Effect.Effect<void, Tensor.TensorError, Runtime.Runtime>
 }
 
@@ -1780,6 +1736,8 @@ export interface InferenceProgram {
    * {@link GenerationSeq.finish} for one sequence.
    */
   readonly generation: () => Effect.Effect<Generation, InferenceError>
+  /** Opens a lower-level caller-token/caller-owned-logits session. */
+  readonly execution: () => Effect.Effect<StatefulExecution, InferenceError>
 }
 
 interface ResolvedInferenceConfig {
@@ -1788,7 +1746,8 @@ interface ResolvedInferenceConfig {
   readonly prefillChunk: number
   readonly tokenDtype: "u32" | "i64"
   readonly kvDtype: Tensor.DType
-  readonly decodeBatch: number
+  readonly batchSize: number
+  readonly sampling: GenerationSamplingOptions
   readonly attentionWindow?: number
 }
 
@@ -1830,9 +1789,9 @@ const resolveInferenceConfig = (
     if (!["f32", "f16", "bf16", "int8"].includes(configuredKvDtype)) {
       return yield* invalidInferenceConfig(`unsupported kvDtype ${String(config.kvDtype)}`)
     }
-    const decodeBatch = config.decodeBatch ?? 8
-    if (!Number.isInteger(decodeBatch) || decodeBatch <= 0) {
-      return yield* invalidInferenceConfig(`decodeBatch must be a positive integer, got ${config.decodeBatch}`)
+    const batchSize = config.batchSize ?? 8
+    if (!Number.isInteger(batchSize) || batchSize <= 0) {
+      return yield* invalidInferenceConfig(`batchSize must be a positive integer, got ${config.batchSize}`)
     }
     return {
       maxTokens: config.maxTokens,
@@ -1840,7 +1799,8 @@ const resolveInferenceConfig = (
       prefillChunk,
       tokenDtype,
       kvDtype: configuredKvDtype === "int8" ? "u8" : configuredKvDtype,
-      decodeBatch,
+      batchSize,
+      sampling: config.sampling ?? { seed: 0 },
       ...(config.attentionWindow === undefined ? {} : { attentionWindow: config.attentionWindow })
     }
   })
@@ -1883,7 +1843,6 @@ const sameDecodeGeometry = (left: DecodeGeometry, right: DecodeGeometry): boolea
 interface InferencePrograms {
   readonly prefill: Tensor.DecodeProgram
   readonly decode: Tensor.DecodeProgram
-  readonly batched: Tensor.DecodeProgram | undefined
   readonly geometry: DecodeGeometry
   readonly pool: Tensor.KvPool
 }
@@ -1939,16 +1898,10 @@ const compileInferencePrograms = (
   Runtime.Runtime
 > =>
   Effect.gen(function*() {
-    const prefill = yield* traceInferenceProgram(model, frozenParams, config, [1, config.prefillChunk])
-    const decode = yield* traceInferenceProgram(model, frozenParams, config, [1, 1])
-    const batched = config.decodeBatch > 1
-      ? yield* traceInferenceProgram(model, frozenParams, config, [config.decodeBatch, 1])
-      : undefined
+    const prefill = yield* traceInferenceProgram(model, frozenParams, config, [config.batchSize, config.prefillChunk])
+    const decode = yield* traceInferenceProgram(model, frozenParams, config, [config.batchSize, 1])
     const geometry = decodeGeometry(prefill)
-    if (
-      !sameDecodeGeometry(geometry, decodeGeometry(decode)) ||
-      (batched !== undefined && !sameDecodeGeometry(geometry, decodeGeometry(batched)))
-    ) {
+    if (!sameDecodeGeometry(geometry, decodeGeometry(decode))) {
       return yield* new InferenceError({
         op: "inference",
         message: "prefill and decode traces disagree on attention geometry or retention policy"
@@ -1971,26 +1924,13 @@ const compileInferencePrograms = (
         convKernel: geometry.convKernel
       }
     ).pipe(Effect.mapError((error) => new InferenceError({ op: "inference", message: error.message })))
-    return { prefill, decode, batched, geometry, pool }
+    return { prefill, decode, geometry, pool }
   })
 
 interface PrefillChunkPlan {
   readonly offset: number
   readonly real: number
   readonly final: boolean
-}
-
-const planPrefillChunks = (
-  total: number,
-  matched: number,
-  chunk: number
-): ReadonlyArray<PrefillChunkPlan> => {
-  const chunks: Array<PrefillChunkPlan> = []
-  for (let offset = matched; offset < total; offset += chunk) {
-    const real = Math.min(chunk, total - offset)
-    chunks.push({ offset, real, final: offset + real === total })
-  }
-  return chunks
 }
 
 // This checks the public add calling convention only. Token values and model
@@ -2048,32 +1988,128 @@ const tokenTensor = (
 ): Effect.Effect<Tensor.Lazy, Tensor.TensorError, Runtime.Runtime> =>
   Tensor.fromTypedArray(dtype === "i64" ? BigInt64Array.from(ids.map(BigInt)) : Uint32Array.from(ids), shape)
 
-const prefillInput = (
-  prompt: Tensor.Any,
-  chunk: PrefillChunkPlan,
+const slottedTokenTensor = (
+  ids: ReadonlyArray<number>,
+  slots: ReadonlyArray<number>,
+  batchSize: number,
+  dtype: "u32" | "i64"
+): Effect.Effect<Tensor.Any, Tensor.TensorError, Runtime.Runtime> => {
+  const values = Array<number>(batchSize).fill(0)
+  for (const [index, slot] of slots.entries()) values[slot] = ids[index]!
+  return tokenTensor(values, [batchSize, 1], dtype)
+}
+
+interface PrefillLane {
+  readonly slot: number
+  readonly sequence: Tensor.KvSequence
+  readonly tokens: ReadonlyArray<number>
+  offset: number
+}
+
+interface PrefillRoundLane extends PrefillLane {
+  readonly chunk: PrefillChunkPlan
+}
+
+const slottedPrefillTensor = (
+  lanes: ReadonlyArray<PrefillRoundLane>,
   config: ResolvedInferenceConfig
-): Effect.Effect<Tensor.Lazy, Tensor.TensorError, Runtime.Runtime> =>
-  Effect.gen(function*() {
-    let input = yield* Tensor.slice(prompt, {
-      start: [0, chunk.offset],
-      end: [1, chunk.offset + chunk.real]
-    })
-    if (chunk.real < config.prefillChunk) {
-      input = yield* Tensor.concat([
-        input,
-        yield* Tensor.zeros([1, config.prefillChunk - chunk.real], { dtype: config.tokenDtype })
-      ], { dim: 1 })
+): Effect.Effect<Tensor.Lazy, Tensor.TensorError, Runtime.Runtime> => {
+  const values = Array<number>(config.batchSize * config.prefillChunk).fill(0)
+  for (const lane of lanes) {
+    const tokens = lane.tokens.slice(lane.chunk.offset, lane.chunk.offset + lane.chunk.real)
+    for (const [index, token] of tokens.entries()) {
+      values[lane.slot * config.prefillChunk + index] = token
     }
-    return input
+  }
+  return tokenTensor(values, [config.batchSize, config.prefillChunk], config.tokenDtype)
+}
+
+const selectSlottedOutputs = (
+  outputs: ReadonlyArray<Tensor.Concrete>,
+  slots: ReadonlyArray<number>
+): Effect.Effect<Array<Tensor.Concrete>, never, Runtime.Runtime> =>
+  Effect.gen(function*() {
+    const selected = slots.map((slot) => outputs[slot]!)
+    const selectedSlots = new Set(slots)
+    for (const [slot, output] of outputs.entries()) {
+      if (!selectedSlots.has(slot)) yield* Tensor.clear(output)
+    }
+    return selected
   })
 
-interface LiveEntry {
-  readonly seq: GenerationSeq
+const runPrefillBatches = <A>(
+  program: Tensor.DecodeProgram,
+  config: ResolvedInferenceConfig,
+  lanes: ReadonlyArray<PrefillLane>,
+  runFinal: (
+    lanes: ReadonlyArray<PrefillRoundLane>,
+    input: Tensor.Any,
+    tokens: ReadonlyArray<ReadonlyArray<number>>
+  ) => Effect.Effect<ReadonlyArray<A>, Tensor.TensorError, Runtime.Runtime>,
+  clearFinalValues: (values: ReadonlyArray<A>) => Effect.Effect<void, never, Runtime.Runtime>
+): Effect.Effect<ReadonlyArray<A>, InferenceError | Tensor.TensorError, Runtime.Runtime> =>
+  Effect.suspend(() => {
+    const results = new Map<number, A>()
+    return Effect.onExit(
+      Effect.gen(function*() {
+        while (results.size < lanes.length) {
+          const round = lanes
+            .filter((lane) => !results.has(lane.slot))
+            .map((lane): PrefillRoundLane => {
+              const real = Math.min(config.prefillChunk, lane.tokens.length - lane.offset)
+              return {
+                ...lane,
+                chunk: { offset: lane.offset, real, final: lane.offset + real === lane.tokens.length }
+              }
+            })
+          for (const final of [false, true]) {
+            const group = round.filter((lane) => lane.chunk.final === final)
+            if (group.length === 0) continue
+            const input = yield* slottedPrefillTensor(group, config)
+            const tokens = group.map((lane) =>
+              lane.tokens.slice(lane.chunk.offset, lane.chunk.offset + lane.chunk.real)
+            )
+            if (final) {
+              const values = yield* runFinal(group, input, tokens)
+              if (values.length !== group.length) {
+                yield* clearFinalValues(values)
+                return yield* new InferenceError({
+                  op: "prefill",
+                  message: `prefill returned ${values.length} final values for ${group.length} lanes`
+                })
+              }
+              for (const [index, lane] of group.entries()) results.set(lane.slot, values[index]!)
+            } else {
+              const outputs = yield* Tensor.runBatchedDecodeProgram(
+                program,
+                [input],
+                group.map((lane) => lane.sequence),
+                group.map((lane) => lane.slot),
+                tokens
+              )
+              yield* Tensor.clearAll(outputs)
+            }
+            for (const lane of group) lanes.find((source) => source.slot === lane.slot)!.offset += lane.chunk.real
+          }
+        }
+        return lanes.map((lane) => results.get(lane.slot)!)
+      }),
+      (exit) => Exit.isFailure(exit) ? clearFinalValues(Array.from(results.values())) : Effect.void
+    )
+  })
+
+interface SessionSeq {
+  readonly sequence: Tensor.KvSequence
+}
+
+interface LiveEntry<Seq extends SessionSeq> {
+  readonly seq: Seq
+  readonly slot: number
 }
 
 // Keep entries live until backend release succeeds so a failed or interrupted
 // release remains retryable.
-const releaseLiveEntry = (live: Array<LiveEntry>, entry: LiveEntry) =>
+const releaseLiveEntry = <Seq extends SessionSeq>(live: Array<LiveEntry<Seq>>, entry: LiveEntry<Seq>) =>
   Effect.gen(function*() {
     const index = live.indexOf(entry)
     if (index < 0) return
@@ -2081,12 +2117,13 @@ const releaseLiveEntry = (live: Array<LiveEntry>, entry: LiveEntry) =>
     live.splice(index, 1)
   })
 
-const closeLiveEntries = (
-  live: Array<LiveEntry>
+const releaseLiveEntries = <Seq extends SessionSeq>(
+  live: Array<LiveEntry<Seq>>,
+  entries: ReadonlyArray<LiveEntry<Seq>>
 ): Effect.Effect<void, Tensor.TensorError, Runtime.Runtime> =>
   Effect.gen(function*() {
     let failure: Tensor.TensorError | undefined
-    for (const entry of live.slice()) {
+    for (const entry of entries) {
       yield* Effect.matchEffect(releaseLiveEntry(live, entry), {
         onFailure: (error) =>
           Effect.sync(() => {
@@ -2100,21 +2137,25 @@ const closeLiveEntries = (
     }
   })
 
+const closeLiveEntries = <Seq extends SessionSeq>(
+  live: Array<LiveEntry<Seq>>
+): Effect.Effect<void, Tensor.TensorError, Runtime.Runtime> => releaseLiveEntries(live, live.slice())
+
 // Lifecycle mutations are intentionally not wrapped by the step semaphore;
 // Generation's contract requires callers to keep them disjoint.
 const validateStepEntries = (
-  live: ReadonlyArray<LiveEntry>,
-  decodeBatch: number,
-  entries: ReadonlyArray<{ readonly seq: GenerationSeq; readonly token: number }>
+  live: ReadonlyArray<LiveEntry<StatefulExecutionSeq>>,
+  batchSize: number,
+  entries: ReadonlyArray<{ readonly seq: StatefulExecutionSeq; readonly token: number }>
 ): Effect.Effect<void, InferenceError> =>
   Effect.gen(function*() {
     if (entries.length === 0) {
       return yield* new InferenceError({ op: "step", message: "step expects at least one entry" })
     }
-    if (entries.length > decodeBatch) {
+    if (entries.length > batchSize) {
       return yield* new InferenceError({
         op: "step",
-        message: `step accepts at most decodeBatch (${decodeBatch}) entries, got ${entries.length}`
+        message: `step accepts at most batchSize (${batchSize}) entries, got ${entries.length}`
       })
     }
     for (const [index, entry] of entries.entries()) {
@@ -2140,162 +2181,134 @@ interface InferenceEngine {
   readonly config: ResolvedInferenceConfig
   readonly frozenParams: ReadonlyArray<Tensor.Concrete>
   readonly programs: InferencePrograms
+  readonly allocateSessionId: () => bigint
 }
 
-const openGeneration = (engine: InferenceEngine): Effect.Effect<Generation, never> =>
+const openStatefulExecution = (engine: InferenceEngine): Effect.Effect<StatefulExecution, never> =>
   Effect.gen(function*() {
     const roundLock = yield* Semaphore.make(1)
-    const live: Array<LiveEntry> = []
+    const live: Array<LiveEntry<StatefulExecutionSeq>> = []
     const config = engine.config
     const programs = engine.programs
-    const addSequence = <A>(
-      prompt: Tensor.Any,
-      runFinalChunk: (
-        input: Tensor.Any,
-        sequence: Tensor.KvSequence,
-        tokens: ReadonlyArray<number>
-      ) => Effect.Effect<A, Tensor.TensorError, Runtime.Runtime>,
-      clearFinalValue: (value: A) => Effect.Effect<void, never, Runtime.Runtime>
-    ): Effect.Effect<
-      { readonly seq: GenerationSeq; readonly value: A },
-      InferenceError | ModelError | Tensor.TensorError,
-      Runtime.Runtime
-    > =>
-      Effect.suspend(() => {
-        let materializedPrompt: Tensor.Concrete | undefined
-        let sequence: Tensor.KvSequence | undefined
-        let entry: LiveEntry | undefined
-        let finalValue: { readonly value: A } | undefined
-        return Effect.onExit(
-          Effect.gen(function*() {
-            const runtime = yield* Runtime.Runtime
-            if (live.length >= config.decodeBatch) {
-              return yield* new InferenceError({
-                op: "add",
-                message: `a session holds at most decodeBatch (${config.decodeBatch}) live sequences; finish one first`
-              })
-            }
-            yield* validatePrompt(prompt, config, runtime)
-            const [promptValue] = yield* Tensor.compute([prompt])
-            materializedPrompt = promptValue
-            const ids = yield* readTokenIds(promptValue)
-            const sequenceValue = yield* Tensor.makeKvSequence(programs.pool)
-            sequence = sequenceValue
-            const matched = yield* Tensor.kvPrefillMatch(sequenceValue, ids)
-            for (const chunk of planPrefillChunks(ids.length, matched, config.prefillChunk)) {
-              const input = yield* prefillInput(promptValue, chunk, config)
-              const tokens = ids.slice(chunk.offset, chunk.offset + chunk.real)
-              if (chunk.final) {
-                finalValue = { value: yield* runFinalChunk(input, sequenceValue, tokens) }
-                continue
-              }
-              const [output] = yield* Tensor.runDecodeProgram(
-                programs.prefill,
-                [input],
-                sequenceValue,
-                tokens
-              )
-              yield* Tensor.clear(output)
-            }
-            if (finalValue === undefined) {
-              return yield* new InferenceError({ op: "prefill", message: "prefill produced no logits" })
-            }
-            const publishedEntry: LiveEntry = {
-              seq: {
-                sequence: sequenceValue,
-                cursor: () => Tensor.kvSequenceCursor(sequenceValue),
-                finish: () => releaseLiveEntry(live, publishedEntry)
-              }
-            }
-            entry = publishedEntry
-            live.push(publishedEntry)
-            return { seq: publishedEntry.seq, value: finalValue.value }
-          }),
-          (exit) =>
-            Effect.gen(function*() {
-              if (materializedPrompt !== undefined) yield* Tensor.clear(materializedPrompt)
-              if (Exit.isSuccess(exit)) return
-              if (finalValue !== undefined) yield* clearFinalValue(finalValue.value)
-              if (entry !== undefined) {
-                yield* Effect.ignore(releaseLiveEntry(live, entry))
-              } else if (sequence !== undefined) {
-                yield* Effect.ignore(Tensor.releaseKvSequence(sequence))
-              }
+    const add: StatefulExecution["add"] = (prompts) =>
+      roundLock.withPermits(1)(
+        Effect.gen(function*() {
+          if (prompts.length === 0) {
+            return yield* new InferenceError({ op: "add", message: "add expects at least one prompt" })
+          }
+          if (live.length + prompts.length > config.batchSize) {
+            return yield* new InferenceError({
+              op: "add",
+              message: `add needs ${prompts.length} free lanes, but only ${config.batchSize - live.length} remain`
             })
-        )
-      })
-    const add: Generation["add"] = (prompt) =>
-      Effect.map(
-        addSequence(
-          prompt,
-          (input, sequence, tokens) =>
-            Effect.map(
-              Tensor.runDecodeProgram(programs.prefill, [input], sequence, tokens),
-              ([logits]) => logits
-            ),
-          Tensor.clear
-        ),
-        ({ seq, value: logits }) => ({ seq, logits })
+          }
+          const runtime = yield* Runtime.Runtime
+          for (const prompt of prompts) yield* validatePrompt(prompt, config, runtime)
+          const promptValues = yield* Tensor.compute(prompts)
+          const sequences: Array<Tensor.KvSequence> = []
+          const added: Array<{ readonly seq: StatefulExecutionSeq; readonly logits: Tensor.Concrete }> = []
+          return yield* Effect.onExit(
+            Effect.gen(function*() {
+              const tokenRows: Array<ReadonlyArray<number>> = []
+              for (const prompt of promptValues) tokenRows.push(yield* readTokenIds(prompt))
+              const freeSlots = Array.from({ length: config.batchSize }, (_, slot) => slot)
+                .filter((slot) => !live.some((entry) => entry.slot === slot))
+              const lanes: Array<PrefillLane> = []
+              for (const [index, tokens] of tokenRows.entries()) {
+                const sequence = yield* Tensor.makeKvSequence(programs.pool)
+                sequences.push(sequence)
+                const matched = yield* Tensor.kvPrefillMatch(sequence, tokens)
+                lanes.push({ slot: freeSlots[index]!, sequence, tokens, offset: matched })
+              }
+              const logits = yield* runPrefillBatches(
+                programs.prefill,
+                config,
+                lanes,
+                (finals, input, tokens) =>
+                  Effect.flatMap(
+                    Tensor.runBatchedDecodeProgram(
+                      programs.prefill,
+                      [input],
+                      finals.map((lane) => lane.sequence),
+                      finals.map((lane) => lane.slot),
+                      tokens
+                    ),
+                    (outputs) => selectSlottedOutputs(outputs, finals.map((lane) => lane.slot))
+                  ),
+                Tensor.clearAll
+              )
+              yield* Effect.sync(() => {
+                for (const [index, lane] of lanes.entries()) {
+                  let entry: LiveEntry<StatefulExecutionSeq>
+                  const seq: StatefulExecutionSeq = {
+                    _tag: "StatefulExecutionSeq",
+                    sequence: lane.sequence,
+                    cursor: () => Tensor.kvSequenceCursor(lane.sequence),
+                    finish: () => releaseLiveEntry(live, entry)
+                  }
+                  entry = { seq, slot: lane.slot }
+                  live.push(entry)
+                  added.push({ seq, logits: logits[index]! })
+                }
+              })
+              return added
+            }),
+            (exit) =>
+              Effect.gen(function*() {
+                yield* Tensor.clearAll(promptValues)
+                if (Exit.isFailure(exit)) {
+                  yield* Tensor.clearAll(added.map((entry) => entry.logits))
+                  for (const sequence of sequences) {
+                    const entry = live.find((entry) => entry.seq.sequence === sequence)
+                    if (entry === undefined) {
+                      yield* Tensor.releaseKvSequence(sequence)
+                    } else {
+                      yield* releaseLiveEntry(live, entry)
+                    }
+                  }
+                }
+              })
+          )
+        })
       )
-    const addSampled: Generation["addSampled"] = (prompt, sampling) =>
-      Effect.map(
-        addSequence(
-          prompt,
-          (input, sequence, tokens) =>
-            Tensor.runDecodeProgramSampled(programs.prefill, [input], sequence, tokens, sampling),
-          () => Effect.void
-        ),
-        ({ seq, value: token }) => ({ seq, token })
-      )
-    const runStep = <A, Entry extends { readonly seq: GenerationSeq; readonly token: number }>(
+    const runStep = <A, Entry extends { readonly seq: StatefulExecutionSeq; readonly token: number }>(
       entries: ReadonlyArray<Entry>,
-      runSingle: (
-        entry: Entry,
-        input: Tensor.Any
-      ) => Effect.Effect<ReadonlyArray<A>, Tensor.TensorError, Runtime.Runtime>,
       runBatched: (
         entries: ReadonlyArray<Entry>,
         input: Tensor.Any,
         ids: ReadonlyArray<number>,
+        slots: ReadonlyArray<number>,
         program: Tensor.DecodeProgram
       ) => Effect.Effect<ReadonlyArray<A>, Tensor.TensorError, Runtime.Runtime>
     ): Effect.Effect<ReadonlyArray<A>, InferenceError | Tensor.TensorError, Runtime.Runtime> =>
       roundLock.withPermits(1)(
         Effect.gen(function*() {
-          yield* validateStepEntries(live, config.decodeBatch, entries)
-          if (entries.length === 1) {
-            const entry = entries[0]!
-            const input = yield* tokenTensor([entry.token], [1, 1], config.tokenDtype)
-            return yield* runSingle(entry, input)
-          }
-          if (programs.batched === undefined) {
-            return yield* new InferenceError({
-              op: "step",
-              message: `stepping ${entries.length} sequences needs decodeBatch > 1`
-            })
-          }
+          yield* validateStepEntries(live, config.batchSize, entries)
           const ids = entries.map((entry) => entry.token)
-          const input = yield* tokenTensor(ids, [entries.length, 1], config.tokenDtype)
-          return yield* runBatched(entries, input, ids, programs.batched)
+          const slots = entries.map((entry) => live.find((liveEntry) => liveEntry.seq === entry.seq)!.slot)
+          const input = yield* slottedTokenTensor(ids, slots, config.batchSize, config.tokenDtype)
+          return yield* runBatched(entries, input, ids, slots, programs.decode)
         })
       )
-    const step: Generation["step"] = (entries) =>
+    const step: StatefulExecution["step"] = (entries) =>
       runStep(
         entries,
-        (entry, input) => Tensor.runDecodeProgram(programs.decode, [input], entry.seq.sequence, [entry.token]),
-        (entries, input, ids, batched) =>
+        (entries, input, ids, slots, batched) =>
           Effect.flatMap(
             Tensor.runBatchedDecodeProgram(
               batched,
               [input],
               entries.map((entry) => entry.seq.sequence),
+              slots,
               ids.map((id) => [id])
             ),
             (outputs) =>
               Effect.onExit(
                 Effect.gen(function*() {
-                  const selected = outputs.slice(0, entries.length)
-                  for (const output of outputs.slice(entries.length)) {
+                  const selected = slots.map((slot) => outputs[slot]!)
+                  const selectedSlots = new Set(slots)
+                  for (const [slot, output] of outputs.entries()) {
+                    if (selectedSlots.has(slot)) continue
                     yield* Tensor.clear(output)
                   }
                   return selected
@@ -2304,34 +2317,270 @@ const openGeneration = (engine: InferenceEngine): Effect.Effect<Generation, neve
               )
           )
       )
-    const stepSampled: Generation["stepSampled"] = (entries) =>
-      runStep(
-        entries,
-        (entry, input) =>
-          Effect.map(
-            Tensor.runDecodeProgramSampled(
-              programs.decode,
-              [input],
-              entry.seq.sequence,
-              [entry.token],
-              entry.sampling
-            ),
-            (token) => [token]
-          ),
-        (entries, input, ids, batched) =>
-          Tensor.runBatchedDecodeProgramSampled(
-            batched,
-            [input],
-            entries.map((entry) => entry.seq.sequence),
-            ids.map((id) => [id]),
-            entries.map((entry) => entry.sampling)
-          )
-      )
     return {
       add,
-      addSampled,
       step,
-      stepSampled,
+      live: () => Effect.sync(() => live.length),
+      close: () => closeLiveEntries(live)
+    }
+  })
+
+interface GenerationLiveEntry extends LiveEntry<GenerationSeq> {
+  readonly id: bigint
+  pending: number
+  generated: number
+  readonly maxTokens?: number
+  readonly eosTokens: ReadonlySet<number>
+  terminal: "eos" | "maxTokens" | undefined
+}
+
+const samplingAt = (
+  defaults: GenerationSamplingOptions,
+  override: Partial<GenerationSamplingOptions> | undefined,
+  sequenceId: bigint,
+  counter: number
+): Tensor.SamplingOptions => {
+  const seed = override?.seed ?? defaults.seed
+  const validSeed = Number.isSafeInteger(seed) && seed >= 0
+  const mixedSeed = validSeed
+    ? Number(
+      (BigInt(seed) * 0x1e37_79b9_7f4a_7c15n ^ sequenceId * 0x1656_67b1_9e37_79f9n) &
+        ((1n << 53n) - 1n)
+    )
+    : seed
+  return {
+    seed: mixedSeed,
+    counter,
+    ...(override?.temperature ?? defaults.temperature) === undefined
+      ? {}
+      : { temperature: override?.temperature ?? defaults.temperature },
+    ...(override?.topK ?? defaults.topK) === undefined ? {} : { topK: override?.topK ?? defaults.topK },
+    ...(override?.topP ?? defaults.topP) === undefined ? {} : { topP: override?.topP ?? defaults.topP }
+  }
+}
+
+const validateGenerationAdd = (
+  entry: GenerationAdd,
+  index: number,
+  defaults: GenerationSamplingOptions
+): Effect.Effect<void, InferenceError> =>
+  Effect.gen(function*() {
+    if (entry.maxTokens !== undefined && (!Number.isSafeInteger(entry.maxTokens) || entry.maxTokens <= 0)) {
+      return yield* new InferenceError({
+        op: "add",
+        message: `entry ${index} maxTokens must be a positive integer, got ${entry.maxTokens}`
+      })
+    }
+    for (const token of entry.eosTokens ?? []) {
+      if (!Number.isInteger(token) || token < 0 || token > 0xffff_ffff) {
+        return yield* new InferenceError({
+          op: "add",
+          message: `entry ${index} eosTokens must contain unsigned 32-bit token ids, got ${token}`
+        })
+      }
+    }
+    const sampling = { ...defaults, ...entry.sampling }
+    if (!Number.isSafeInteger(sampling.seed) || sampling.seed < 0) {
+      return yield* new InferenceError({
+        op: "add",
+        message: `entry ${index} seed must be a non-negative safe integer, got ${sampling.seed}`
+      })
+    }
+    if (sampling.temperature !== undefined && (!Number.isFinite(sampling.temperature) || sampling.temperature < 0)) {
+      return yield* new InferenceError({
+        op: "add",
+        message: `entry ${index} temperature must be finite and non-negative, got ${sampling.temperature}`
+      })
+    }
+    if (sampling.topK !== undefined && (!Number.isSafeInteger(sampling.topK) || sampling.topK < 0)) {
+      return yield* new InferenceError({
+        op: "add",
+        message: `entry ${index} topK must be a non-negative safe integer, got ${sampling.topK}`
+      })
+    }
+    if (sampling.topP !== undefined && (!Number.isFinite(sampling.topP) || sampling.topP <= 0 || sampling.topP > 1)) {
+      return yield* new InferenceError({
+        op: "add",
+        message: `entry ${index} topP must be in (0, 1], got ${sampling.topP}`
+      })
+    }
+  })
+
+const pageFor = (entry: GenerationLiveEntry, token: number): TokenPage => {
+  entry.pending = token
+  entry.generated += 1
+  const stopReason = entry.eosTokens.has(token)
+    ? "eos" as const
+    : entry.maxTokens !== undefined && entry.generated >= entry.maxTokens
+    ? "maxTokens" as const
+    : undefined
+  entry.terminal = stopReason
+  return {
+    seq: entry.seq,
+    tokens: [token],
+    ...(stopReason === undefined ? {} : { stopReason })
+  }
+}
+
+const openGeneration = (engine: InferenceEngine): Effect.Effect<Generation, never> =>
+  Effect.gen(function*() {
+    const roundLock = yield* Semaphore.make(1)
+    const live: Array<GenerationLiveEntry> = []
+    const config = engine.config
+    const programs = engine.programs
+    const sessionId = engine.allocateSessionId()
+    let nextSequenceId = 0n
+
+    const add: Generation["add"] = (requests) =>
+      roundLock.withPermits(1)(
+        Effect.gen(function*() {
+          if (requests.length === 0) {
+            return yield* new InferenceError({ op: "add", message: "add expects at least one entry" })
+          }
+          if (live.length + requests.length > config.batchSize) {
+            return yield* new InferenceError({
+              op: "add",
+              message: `add needs ${requests.length} free lanes, but only ${config.batchSize - live.length} remain`
+            })
+          }
+          for (const [index, request] of requests.entries()) {
+            yield* validateGenerationAdd(request, index, config.sampling)
+          }
+          const runtime = yield* Runtime.Runtime
+          for (const request of requests) yield* validatePrompt(request.prompt, config, runtime)
+          const promptValues = yield* Tensor.compute(requests.map((request) => request.prompt))
+          const initialSequenceId = nextSequenceId
+          const sequences: Array<Tensor.KvSequence> = []
+          const pages: Array<TokenPage> = []
+          return yield* Effect.onExit(
+            Effect.gen(function*() {
+              const tokenRows: Array<ReadonlyArray<number>> = []
+              for (const prompt of promptValues) tokenRows.push(yield* readTokenIds(prompt))
+              const sequenceIds = requests.map(() => {
+                const localId = nextSequenceId++
+                const sum = sessionId + localId
+                return sum * (sum + 1n) / 2n + localId
+              })
+              const freeSlots = Array.from({ length: config.batchSize }, (_, slot) => slot)
+                .filter((slot) => !live.some((entry) => entry.slot === slot))
+              const lanes: Array<PrefillLane> = []
+              for (const [index, tokens] of tokenRows.entries()) {
+                const sequence = yield* Tensor.makeKvSequence(programs.pool)
+                sequences.push(sequence)
+                const matched = yield* Tensor.kvPrefillMatch(sequence, tokens)
+                lanes.push({ slot: freeSlots[index]!, sequence, tokens, offset: matched })
+              }
+              const sampled = yield* runPrefillBatches(
+                programs.prefill,
+                config,
+                lanes,
+                (finals, input, tokens) =>
+                  Tensor.runBatchedDecodeProgramSampled(
+                    programs.prefill,
+                    [input],
+                    finals.map((lane) => lane.sequence),
+                    finals.map((lane) => lane.slot),
+                    tokens,
+                    finals.map((lane) => {
+                      const index = lanes.findIndex((source) => source.slot === lane.slot)
+                      return samplingAt(config.sampling, requests[index]!.sampling, sequenceIds[index]!, 0)
+                    })
+                  ),
+                () => Effect.void
+              )
+              yield* Effect.sync(() => {
+                for (const [index, lane] of lanes.entries()) {
+                  let entry: GenerationLiveEntry
+                  const seq: GenerationSeq = {
+                    _tag: "GenerationSeq",
+                    sequence: lane.sequence,
+                    cursor: () => Tensor.kvSequenceCursor(lane.sequence),
+                    finish: () => releaseLiveEntry(live, entry)
+                  }
+                  entry = {
+                    seq,
+                    slot: lane.slot,
+                    id: sequenceIds[index]!,
+                    pending: sampled[index]!,
+                    generated: 0,
+                    terminal: undefined,
+                    ...(requests[index]!.maxTokens === undefined ? {} : { maxTokens: requests[index]!.maxTokens }),
+                    eosTokens: new Set(requests[index]!.eosTokens ?? [])
+                  }
+                  live.push(entry)
+                  pages.push(pageFor(entry, sampled[index]!))
+                }
+              })
+              return pages
+            }),
+            (exit) =>
+              Effect.gen(function*() {
+                yield* Tensor.clearAll(promptValues)
+                if (Exit.isFailure(exit)) {
+                  for (const sequence of sequences) {
+                    const entry = live.find((entry) => entry.seq.sequence === sequence)
+                    if (entry === undefined) {
+                      yield* Tensor.releaseKvSequence(sequence)
+                    } else {
+                      yield* releaseLiveEntry(live, entry)
+                    }
+                  }
+                  nextSequenceId = initialSequenceId
+                }
+              })
+          )
+        })
+      )
+
+    const step: Generation["step"] = (requests) =>
+      roundLock.withPermits(1)(
+        Effect.gen(function*() {
+          if (requests.length === 0) {
+            return yield* new InferenceError({ op: "step", message: "step expects at least one entry" })
+          }
+          if (requests.length > config.batchSize) {
+            return yield* new InferenceError({
+              op: "step",
+              message: `step accepts at most batchSize (${config.batchSize}) entries, got ${requests.length}`
+            })
+          }
+          const selected: Array<GenerationLiveEntry> = []
+          for (const [index, request] of requests.entries()) {
+            const entry = live.find((entry) => entry.seq === request.seq)
+            if (entry === undefined) {
+              return yield* new InferenceError({ op: "step", message: `entry ${index} is not a live sequence` })
+            }
+            if (selected.includes(entry)) {
+              return yield* new InferenceError({ op: "step", message: "step entries must be distinct sequences" })
+            }
+            if (entry.terminal !== undefined) {
+              return yield* new InferenceError({
+                op: "step",
+                message: `entry ${index} is terminal (${entry.terminal})`
+              })
+            }
+            selected.push(entry)
+          }
+          const ids = selected.map((entry) => entry.pending)
+          const slots = selected.map((entry) => entry.slot)
+          const input = yield* slottedTokenTensor(ids, slots, config.batchSize, config.tokenDtype)
+          const sampled = yield* Tensor.runBatchedDecodeProgramSampled(
+            programs.decode,
+            [input],
+            selected.map((entry) => entry.seq.sequence),
+            slots,
+            ids.map((id) => [id]),
+            selected.map((entry, index) =>
+              samplingAt(config.sampling, requests[index]!.sampling, entry.id, entry.generated)
+            )
+          )
+          return sampled.map((token, index) => pageFor(selected[index]!, token))
+        })
+      )
+
+    return {
+      add,
+      step,
       live: () => Effect.sync(() => live.length),
       close: () => closeLiveEntries(live)
     }
@@ -2340,8 +2589,8 @@ const openGeneration = (engine: InferenceEngine): Effect.Effect<Generation, neve
 /**
  * Materializes a model for stateful autoregressive generation and eagerly
  * compiles its complete deployment geometry. The same `forward` builder is
- * traced three times as needed: fixed prompt chunks, one-token single-sequence
- * decode, and fixed-width batched decode. Decode specialization rewrites causal
+ * traced twice: fixed prompt chunks and fixed-width batched decode. Decode
+ * specialization rewrites causal
  * attention to paged KV attention, KDA and short convolution to per-sequence
  * recurrent operations, and learned/rotary position nodes to absolute-cursor-
  * offset forms. There is no shape-keyed growth or later tracing.
@@ -2387,8 +2636,16 @@ export const inference = (
       Effect.onExit(
         Effect.gen(function*() {
           const programs = yield* compileInferencePrograms(model, frozenParams, resolved)
+          let nextSessionId = 0n
+          const engine: InferenceEngine = {
+            config: resolved,
+            frozenParams,
+            programs,
+            allocateSessionId: () => nextSessionId++
+          }
           return {
-            generation: () => openGeneration({ config: resolved, frozenParams, programs })
+            generation: () => openGeneration(engine),
+            execution: () => openStatefulExecution(engine)
           } satisfies InferenceProgram
         }),
         (exit) => Exit.isFailure(exit) ? Tensor.clearAll(frozenParams) : Effect.void

@@ -313,7 +313,9 @@ pub enum CpuOp {
     ConvState {
         layer: u32,
     },
-    LastTokenRow,
+    LastTokenRow {
+        lane: usize,
+    },
     PositionEmbedding {
         seq_len: usize,
     },
@@ -476,7 +478,7 @@ impl CpuOp {
             Self::ShortConv1dBackwardX => "short_conv1d_backward_x",
             Self::ShortConv1dBackwardW => "short_conv1d_backward_w",
             Self::ConvState { .. } => "conv_state",
-            Self::LastTokenRow => "last_token_row",
+            Self::LastTokenRow { .. } => "last_token_row",
             Self::PositionEmbedding { .. } => "position_embedding",
             Self::KvAttention { .. } => "kv_attention",
             Self::RotaryEmbedding { .. } => "rotary_embedding",
@@ -2404,7 +2406,12 @@ impl Lowerer {
             NodeKind::ShortConv1dBackwardX { .. } => CpuOp::ShortConv1dBackwardX,
             NodeKind::ShortConv1dBackwardW { .. } => CpuOp::ShortConv1dBackwardW,
             NodeKind::ConvState { layer, .. } => CpuOp::ConvState { layer: *layer },
-            NodeKind::LastTokenRow { .. } => CpuOp::LastTokenRow,
+            NodeKind::LastTokenRow { a } => CpuOp::LastTokenRow {
+                lane: match &a.kind {
+                    NodeKind::Slice { ranges, .. } => ranges.first().map_or(0, |range| range.0),
+                    _ => 0,
+                },
+            },
             NodeKind::PositionEmbedding { seq_len, .. } => {
                 CpuOp::PositionEmbedding { seq_len: *seq_len }
             }
@@ -4007,7 +4014,7 @@ fn dispatch_command<'a>(
         CpuOp::KdaRecurrence { .. }
         | CpuOp::ConvState { .. }
         | CpuOp::KvAttention { .. }
-        | CpuOp::LastTokenRow => state
+        | CpuOp::LastTokenRow { .. } => state
             .ok_or_else(|| format!("{}: operation requires a state context", op.name()))?
             .run_command(
                 command,

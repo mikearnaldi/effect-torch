@@ -180,7 +180,7 @@ const generate = (
     const bosId = Option.getOrThrow(tokenizer.tokenToId(BOS))
     const eosId = Option.getOrThrow(tokenizer.tokenToId(EOS))
     const promptIds = Array.from((yield* tokenizer.encode(prompt)).data)
-    const gen = yield* program.generation()
+    const gen = yield* program.execution()
     const sample = (logits: Tensor.Any) =>
       Effect.gen(function*() {
         const row = yield* Tensor.toNumberArray(logits)
@@ -195,7 +195,7 @@ const generate = (
         }
         return exps.length - 1
       })
-    const entry = yield* gen.add(yield* ids([bosId, ...promptIds], [1, 1 + promptIds.length]))
+    const entry = (yield* gen.add([yield* ids([bosId, ...promptIds], [1, 1 + promptIds.length])]))[0]!
     let logits = entry.logits
     const generated: Array<number> = []
     for (;;) {

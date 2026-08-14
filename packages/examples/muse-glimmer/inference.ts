@@ -145,7 +145,7 @@ const program = Effect.gen(function*() {
       blockSize: 16,
       kvDtype: "f16",
       prefillChunk: 16,
-      decodeBatch: 1
+      batchSize: 1
     })
   )
 

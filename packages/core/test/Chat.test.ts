@@ -57,18 +57,23 @@ interface ProgramState {
   closed: boolean
   logits?: Array<Tensor.Concrete>
   sampled?: {
-    add: Array<Tensor.SamplingOptions>
-    step: Array<{ readonly token: number; readonly sampling: Tensor.SamplingOptions }>
+    add: Array<{
+      readonly sampling: Partial<Model.GenerationSamplingOptions> | undefined
+      readonly maxTokens: number | undefined
+      readonly eosTokens: ReadonlyArray<number> | undefined
+    }>
+    step: Array<{ readonly sampling: Partial<Model.GenerationSamplingOptions> | undefined }>
   }
 }
 
-// The script models both generation contracts: add/step publish real device
-// logits, while addSampled/stepSampled return only the scripted token ids.
+// The script models sampled generation and lower-level logits execution.
 const makeProgram = (
   script: ReadonlyArray<number>,
   state: ProgramState
 ): Model.InferenceProgram => {
   let step = 0
+  let maxTokens: number | undefined
+  let eosTokens: ReadonlyArray<number> = []
   const sampled = state.sampled
   const logitsFor = (token: number) =>
     Effect.gen(function*() {
@@ -78,7 +83,14 @@ const makeProgram = (
       state.logits?.push(logits)
       return logits
     })
-  const seq = {
+  const generationSeq: Model.GenerationSeq = {
+    _tag: "GenerationSeq",
+    sequence: {} as Tensor.KvSequence,
+    cursor: () => Effect.succeed(0),
+    finish: () => Effect.void
+  }
+  const executionSeq: Model.StatefulExecutionSeq = {
+    _tag: "StatefulExecutionSeq",
     sequence: {} as Tensor.KvSequence,
     cursor: () => Effect.succeed(0),
     finish: () => Effect.void
@@ -86,30 +98,58 @@ const makeProgram = (
   return {
     generation: () =>
       Effect.succeed({
-        add: (_prompt: Tensor.Any) =>
+        add: (entries: ReadonlyArray<Model.GenerationAdd>) =>
+          Effect.sync(() => {
+            const entry = entries[0]!
+            maxTokens = entry.maxTokens
+            eosTokens = entry.eosTokens ?? []
+            sampled?.add.push({
+              sampling: entry.sampling,
+              maxTokens: entry.maxTokens,
+              eosTokens: entry.eosTokens
+            })
+            const token = script[0]!
+            return [{
+              seq: generationSeq,
+              tokens: [token],
+              ...(entry.eosTokens?.includes(token)
+                ? { stopReason: "eos" as const }
+                : entry.maxTokens === 1
+                ? { stopReason: "maxTokens" as const }
+                : {})
+            }]
+          }),
+        step: (entries: ReadonlyArray<Model.GenerationStep>) =>
+          Effect.sync(() => {
+            step++
+            sampled?.step.push(...entries.map(({ sampling }) => ({ sampling })))
+            const token = script[step]!
+            return [{
+              seq: generationSeq,
+              tokens: [token],
+              ...(eosTokens.includes(token)
+                ? { stopReason: "eos" as const }
+                : maxTokens !== undefined && step + 1 >= maxTokens
+                ? { stopReason: "maxTokens" as const }
+                : {})
+            }]
+          }),
+        live: () => Effect.succeed(1),
+        close: () =>
+          Effect.sync(() => {
+            state.closed = true
+          })
+      }),
+    execution: () =>
+      Effect.succeed({
+        add: (_prompts: ReadonlyArray<Tensor.Any>) =>
           Effect.gen(function*() {
-            return { seq, logits: yield* logitsFor(script[0]!) }
+            return [{ seq: executionSeq, logits: yield* logitsFor(script[0]!) }]
           }),
         step: () =>
           Effect.gen(function*() {
             step++
             return [yield* logitsFor(script[step]!)]
-          }),
-        addSampled: (_prompt: Tensor.Any, sampling: Tensor.SamplingOptions) =>
-          Effect.sync(() => {
-            sampled?.add.push(sampling)
-            return { seq, token: script[0]! }
-          }),
-        stepSampled: (
-          entries: ReadonlyArray<{
-            readonly token: number
-            readonly sampling: Tensor.SamplingOptions
-          }>
-        ) =>
-          Effect.sync(() => {
-            step++
-            sampled?.step.push(...entries.map(({ token, sampling }) => ({ token, sampling })))
-            return [script[step]!]
           }),
         live: () => Effect.succeed(1),
         close: () =>
@@ -117,7 +157,7 @@ const makeProgram = (
             state.closed = true
           })
       })
-  } as unknown as Model.InferenceProgram
+  }
 }
 
 onDevices("Chat", () => (it) => {
@@ -205,6 +245,53 @@ onDevices("Chat", () => (it) => {
         expect(programState.closed).toBe(true)
       }))
 
+    it.effect("consumes every token in a terminal page without another step", () =>
+      Effect.gen(function*() {
+        const programState = { closed: false }
+        const base = makeProgram([5, 6], programState)
+        let steps = 0
+        const seq: Model.GenerationSeq = {
+          _tag: "GenerationSeq",
+          sequence: {} as Tensor.KvSequence,
+          cursor: () => Effect.succeed(0),
+          finish: () => Effect.void
+        }
+        const program: Model.InferenceProgram = {
+          ...base,
+          generation: () =>
+            Effect.succeed({
+              add: () => Effect.succeed([{ seq, tokens: [5, 6], stopReason: "maxTokens" as const }]),
+              step: () =>
+                Effect.sync(() => {
+                  steps++
+                  return []
+                }),
+              live: () => Effect.succeed(1),
+              close: () => Effect.void
+            })
+        }
+        const events = Array.from(
+          yield* Stream.runCollect(Chat.stream({
+            program,
+            tokenizer: makeTokenizer({}),
+            template: "{{ messages }}",
+            messages: [{ role: "user", content: "hello" }],
+            controls: false,
+            stopTokens: [EOS],
+            maxTokens: 2
+          }))
+        )
+
+        const done = events.at(-1)
+        expect(done?._tag).toBe("done")
+        if (done?._tag === "done") {
+          expect(done.result.content).toBe("plain text")
+          expect(done.result.finishReason).toBe("maxTokens")
+          expect(done.result.stats.generatedTokens).toBe(2)
+        }
+        expect(steps).toBe(0)
+      }))
+
     it.effect("clears unread logits when downstream stops after prefill", () =>
       Effect.gen(function*() {
         const programState: { closed: boolean; logits: Array<Tensor.Concrete> } = { closed: false, logits: [] }
@@ -280,21 +367,12 @@ onDevices("Chat", () => (it) => {
         expect(events[0]?._tag).toBe("prefill")
         expect(events.at(-1)?._tag).toBe("done")
         expect(programState.sampled?.add).toEqual([{
-          temperature: 0,
-          topK: 0,
-          topP: 1,
-          seed: 7,
-          counter: 0
+          sampling: { temperature: 0, topK: 0, topP: 1, seed: 7 },
+          maxTokens: 2,
+          eosTokens: [EOS]
         }])
         expect(programState.sampled?.step).toEqual([{
-          token: 5,
-          sampling: {
-            temperature: 0,
-            topK: 0,
-            topP: 1,
-            seed: 7,
-            counter: 1
-          }
+          sampling: { temperature: 0, topK: 0, topP: 1, seed: 7 }
         }])
         expect(publishedLogits).toEqual([])
         expect(programState.closed).toBe(true)

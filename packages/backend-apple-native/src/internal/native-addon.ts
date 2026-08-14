@@ -44,12 +44,20 @@ export declare class Executable {
     inputs: Array<NativeTensor>,
     scalars: Array<number>,
     sequences?: Array<NativeKvSequence> | undefined | null,
+    slots?: Array<number> | undefined | null,
+    activeMask?: Array<boolean> | undefined | null,
+    validLengths?: Array<number> | undefined | null,
+    advances?: Array<number> | undefined | null,
     tokens?: Array<Array<number>> | undefined | null,
     token?: CancellationToken | undefined | null
   ): Promise<Array<NativeTensor>>
   executeSampled(
     inputs: Array<NativeTensor>,
     sequences: Array<NativeKvSequence>,
+    slots: Array<number>,
+    activeMask: Array<boolean>,
+    validLengths: Array<number>,
+    advances: Array<number>,
     tokens: Array<Array<number>>,
     sampling: Array<NativeSamplingOptions>,
     token?: CancellationToken | undefined | null

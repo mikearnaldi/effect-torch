@@ -451,13 +451,27 @@ export interface CompileRequest {
 export interface ExecutionStateInvocation {
   /**
    * From `1` through the compiled batch width, distinct live sequences from
-   * one schema-compatible pool.
+   * one schema-compatible pool, listed in API result order.
    */
   readonly sequences: ReadonlyArray<KvSequenceHandle>
   /**
-   * One equally sized, nonempty row of unsigned 32-bit token ids per sequence.
-   * Success commits state and advances cursors atomically across all rows;
-   * failure or interruption before commit rolls every row back.
+   * One distinct physical executable slot per sequence. Slots are integers in
+   * `[0, batch)`. Array order may differ from slot order and does not move
+   * sequence state between lanes.
+   */
+  readonly slots: ReadonlyArray<number>
+  /** Fixed-width activity mask; true entries must exactly equal `slots`. */
+  readonly activeMask: ReadonlyArray<boolean>
+  /** Fixed-width real-row count; inactive slots are zero. */
+  readonly validLengths: ReadonlyArray<number>
+  /** Fixed-width committed advances; Phase 1 requires `advances === validLengths`. */
+  readonly advances: ReadonlyArray<number>
+  /**
+   * One nonempty row of unsigned 32-bit token ids per sequence. Rows may have
+   * different lengths; each length matches that physical lane's valid length.
+   * Unlisted slots have zero advance. Success commits state and advances
+   * cursors atomically across all rows; failure or interruption before commit
+   * rolls every row back.
    */
   readonly tokens: ReadonlyArray<ReadonlyArray<number>>
 }
@@ -1132,7 +1146,7 @@ export interface SamplingRuntime {
 }
 
 /**
- * Optional runtime extension for compiled paged-KV and recurrent inference.
+ * Required runtime extension for compiled paged-KV and recurrent inference.
  * Pool geometry must exactly match the executable schema. Attention geometry
  * and each recurrent family are independently either all zero or all positive;
  * capacities and paging units are positive with exact divisibility. Every

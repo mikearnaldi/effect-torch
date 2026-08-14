@@ -2007,31 +2007,8 @@ fn validate_stateful_tensor_input(
     input: &NativeTensor,
     slot: usize,
     declared: &ProgramSlot,
-    active_batch: usize,
-    compiled_batch: usize,
-    bounded_batch: bool,
 ) -> Result<()> {
-    let got = input.value_cloned()?;
-    let shape_matches = if bounded_batch {
-        declared.shape.first() == Some(&compiled_batch)
-            && got.shape().first() == Some(&active_batch)
-            && got.shape().len() == declared.shape.len()
-            && got.shape()[1..] == declared.shape[1..]
-    } else {
-        got.shape() == declared.shape
-    };
-    if !shape_matches || got.dtype() != declared.dtype || !declared.device.is_cpu() {
-        return Err(Error::new(
-            Status::InvalidArg,
-            format!(
-                "input slot {slot}: expected bounded {}, got {:?}:{}@cpu",
-                declared.signature(),
-                got.shape(),
-                got.dtype().name(),
-            ),
-        ));
-    }
-    Ok(())
+    validate_tensor_input(input, slot, declared)
 }
 
 impl Executable {
@@ -2655,8 +2632,8 @@ impl SeqState {
 /// publishes them on `commit` (dropping staged work on `rollback`).
 struct KvContext {
     pool: Arc<PoolInner>,
-    slots: Vec<Arc<Mutex<SeqState>>>,
-    active_batch: usize,
+    slots: Vec<Option<Arc<Mutex<SeqState>>>>,
+    advances: Vec<usize>,
     window: Option<usize>,
     kda: KdaGeometry,
     conv: ConvGeometry,
@@ -2664,7 +2641,7 @@ struct KvContext {
 }
 
 struct CpuStateTransaction {
-    frontiers: Vec<usize>,
+    frontiers: Vec<Option<usize>>,
     advances: Vec<usize>,
     cursors: Vec<usize>,
     eviction_starts: Vec<usize>,
@@ -2679,7 +2656,13 @@ impl executable::CpuState for Arc<KvContext> {
         let mut frontiers = Vec::with_capacity(self.slots.len());
         let mut advances = Vec::with_capacity(self.slots.len());
         let mut cursors = Vec::with_capacity(self.slots.len());
-        for slot in &self.slots {
+        for (lane, slot) in self.slots.iter().enumerate() {
+            let Some(slot) = slot else {
+                frontiers.push(None);
+                advances.push(0);
+                cursors.push(0);
+                continue;
+            };
             let mut state = slot
                 .lock()
                 .map_err(|error| format!("decode state lock poisoned: {error}"))?;
@@ -2689,8 +2672,8 @@ impl executable::CpuState for Arc<KvContext> {
                 .div_ceil(self.pool.block_size)
                 .saturating_sub(state.blocks.len());
             state.blocks.reserve(additional);
-            frontiers.push(state.blocks.len());
-            advances.push(state.advance);
+            frontiers.push(Some(state.blocks.len()));
+            advances.push(self.advances[lane]);
             cursors.push(state.cursor);
         }
         if let Some(cursor) = executable.state_cursor {
@@ -2738,10 +2721,11 @@ impl executable::CpuState for Arc<KvContext> {
                 .get(shape.len().saturating_sub(2))
                 .copied()
                 .ok_or_else(|| "decode state input has no token dimension".to_string())?;
-            if advances
+            if self
+                .slots
                 .iter()
-                .take(self.active_batch)
-                .any(|advance| *advance == 0 || *advance > steps)
+                .zip(&advances)
+                .any(|(slot, advance)| slot.is_some() && (*advance == 0 || *advance > steps))
             {
                 return Err(format!(
                     "decode token advance must be in 1..={steps} for {}",
@@ -2809,8 +2793,18 @@ impl executable::CpuState for Arc<KvContext> {
                     &mut state_outputs[0],
                 )
             }
-            executable::CpuOp::LastTokenRow => {
-                last_token_row_into(&inputs[0], transaction.advances[0], &mut outputs[0])
+            executable::CpuOp::LastTokenRow { lane } => {
+                let lane = *lane;
+                if lane >= self.slots.len() {
+                    return Err(format!(
+                        "last token row: physical lane {lane} is out of range"
+                    ));
+                }
+                if self.slots[lane].is_some() {
+                    last_token_row_into(&inputs[0], transaction.advances[lane], &mut outputs[0])
+                } else {
+                    zero_last_token_row(&inputs[0], &mut outputs[0])
+                }
             }
             executable::CpuOp::KvAttention {
                 scale,
@@ -2855,17 +2849,13 @@ impl executable::CpuState for Arc<KvContext> {
             let transaction = transaction
                 .as_ref()
                 .ok_or_else(|| "decode commit has no active transaction".to_string())?;
-            let mut states = self
-                .slots
-                .iter()
-                .map(|slot| {
-                    slot.lock()
-                        .map_err(|error| format!("decode state lock poisoned: {error}"))
-                })
-                .collect::<err::Res<Vec<_>>>()?;
-            for (state, start) in states.iter_mut().zip(&transaction.eviction_starts) {
+            for (slot, start) in self.slots.iter().zip(&transaction.eviction_starts) {
+                let Some(slot) = slot else { continue };
+                let mut state = slot
+                    .lock()
+                    .map_err(|error| format!("decode state lock poisoned: {error}"))?;
                 if *start != usize::MAX {
-                    kv_evict(&self.pool, state, *start);
+                    kv_evict(&self.pool, &mut state, *start);
                 }
             }
         }
@@ -2886,9 +2876,11 @@ impl executable::CpuState for Arc<KvContext> {
             return;
         };
         for (slot, frontier) in self.slots.iter().zip(transaction.frontiers) {
-            if let Ok(mut state) = slot.lock() {
-                for block in state.blocks.split_off(frontier) {
-                    self.pool.unref_block(block);
+            if let (Some(slot), Some(frontier)) = (slot, frontier) {
+                if let Ok(mut state) = slot.lock() {
+                    for block in state.blocks.split_off(frontier) {
+                        self.pool.unref_block(block);
+                    }
                 }
             }
         }
@@ -2948,6 +2940,7 @@ fn write_kda_initial<T: Elem>(
     destination.write::<T, _>("kda initial state", &expected, |output| {
         output.fill(T::default());
         for (batch, slot) in context.slots.iter().enumerate() {
+            let Some(slot) = slot else { continue };
             let state = slot.lock().expect("decode run owns an unpoisoned sequence");
             let Some(source) = state.kda_states.get(layer) else {
                 continue;
@@ -3034,6 +3027,7 @@ fn prepare_conv_staging(context: &KvContext, layer: u32, staging: &Value) -> err
     destination.write::<f32, _>("conv initial state", staging.tensor().shape(), |output| {
         output.fill(0.0);
         for (batch, slot) in context.slots.iter().enumerate() {
+            let Some(slot) = slot else { continue };
             let state = slot.lock().expect("decode run owns an unpoisoned sequence");
             let Some(source) = state.conv_states.get(layer as usize) else {
                 continue;
@@ -3089,6 +3083,31 @@ fn last_token_row_into(
         DType::U8 => last_token_row_into_impl::<u8>(source.tensor(), advance, destination),
         DType::U32 => last_token_row_into_impl::<u32>(source.tensor(), advance, destination),
         DType::I64 => last_token_row_into_impl::<i64>(source.tensor(), advance, destination),
+    }
+}
+
+fn zero_last_token_row_impl<T: Elem>(
+    source: &Tensor,
+    destination: &mut CpuDestination<'_>,
+) -> err::Res<()> {
+    let shape = source.shape();
+    if shape.len() != 3 || shape[0] != 1 || destination.shape() != [shape[2]] {
+        return Err("last token row: state command geometry must be [1, T, V] -> [V]".to_string());
+    }
+    destination.write::<T, _>("inactive last token row", &[shape[2]], |output| {
+        output.fill(T::default());
+    })
+}
+
+fn zero_last_token_row(source: &Value, destination: &mut CpuDestination<'_>) -> err::Res<()> {
+    match source.dtype() {
+        DType::F32 => zero_last_token_row_impl::<f32>(source.tensor(), destination),
+        DType::F64 => zero_last_token_row_impl::<f64>(source.tensor(), destination),
+        DType::F16 => zero_last_token_row_impl::<half::f16>(source.tensor(), destination),
+        DType::BF16 => zero_last_token_row_impl::<half::bf16>(source.tensor(), destination),
+        DType::U8 => zero_last_token_row_impl::<u8>(source.tensor(), destination),
+        DType::U32 => zero_last_token_row_impl::<u32>(source.tensor(), destination),
+        DType::I64 => zero_last_token_row_impl::<i64>(source.tensor(), destination),
     }
 }
 
@@ -3260,15 +3279,6 @@ fn commit_recurrent_state(
     values: &[Value],
 ) -> err::Res<()> {
     let batch = context.slots.len();
-    let mut states = context
-        .slots
-        .iter()
-        .map(|slot| {
-            slot.lock()
-                .map_err(|error| format!("decode state lock poisoned: {error}"))
-        })
-        .collect::<err::Res<Vec<_>>>()?;
-
     for physical in &executable.physical {
         let executable::CpuPhysicalCommand::Encode(id) = *physical;
         let command = executable
@@ -3286,7 +3296,11 @@ fn commit_recurrent_state(
             executable::CpuOp::KdaRecurrence { layer, .. } => {
                 let per_batch = context.kda.heads;
                 let updates = recurrent_state_slices(value, batch, per_batch, false);
-                for (state, update) in states.iter_mut().zip(updates) {
+                for (slot, update) in context.slots.iter().zip(updates) {
+                    let Some(slot) = slot else { continue };
+                    let mut state = slot
+                        .lock()
+                        .map_err(|error| format!("decode state lock poisoned: {error}"))?;
                     let layer = *layer as usize;
                     let target = state.kda_states.get_mut(layer).ok_or_else(|| {
                         format!("KDA state commit destination {layer} is missing")
@@ -3299,7 +3313,11 @@ fn commit_recurrent_state(
             }
             executable::CpuOp::ConvState { layer } => {
                 let updates = recurrent_state_slices(value, batch, 1, true);
-                for (state, update) in states.iter_mut().zip(updates) {
+                for (slot, update) in context.slots.iter().zip(updates) {
+                    let Some(slot) = slot else { continue };
+                    let mut state = slot
+                        .lock()
+                        .map_err(|error| format!("decode state lock poisoned: {error}"))?;
                     let layer = *layer as usize;
                     let target = state.conv_states.get_mut(layer).ok_or_else(|| {
                         format!("convolution state commit destination {layer} is missing")
@@ -3369,7 +3387,8 @@ fn kv_attention_into(
     let layer_index = layer as usize;
     output.write::<f32, _>("kv attention output", &dimensions, |out| -> err::Res<()> {
         out.fill(0.0);
-        for (batch_index, slot) in context.slots.iter().take(context.active_batch).enumerate() {
+        for (batch_index, slot) in context.slots.iter().enumerate() {
+            let Some(slot) = slot else { continue };
             let mut state = slot
                 .lock()
                 .map_err(|error| format!("kv attention: sequence lock poisoned: {error}"))?;
@@ -3477,7 +3496,7 @@ fn kv_attention_into(
                 };
                 for head in 0..query_heads {
                     let kv_head = head / (query_heads / kv_heads);
-                    for query in 0..tokens {
+                    for query in 0..advance {
                         let end = (cursor + query + 1).min(needed);
                         let begin =
                             window.map_or(start, |window| end.saturating_sub(window).max(start));
@@ -3818,10 +3837,6 @@ impl NativeKvSequence {
         }
     }
 
-    fn new_sequence_like(&self) -> Self {
-        Self::new(self.pool.clone())
-    }
-
     fn return_blocks(&self) {
         if self.released.swap(true, Ordering::SeqCst) {
             return;
@@ -3950,6 +3965,10 @@ fn validate_execution_mode(
     stateful: bool,
     scalar_count: usize,
     sequence_count: Option<usize>,
+    slots: Option<&[u32]>,
+    active_mask: Option<&[bool]>,
+    valid_lengths: Option<&[u32]>,
+    advances: Option<&[u32]>,
     token_count: Option<usize>,
 ) -> Result<()> {
     if stateful {
@@ -3959,20 +3978,27 @@ fn validate_execution_mode(
                 "execute: stateful executables do not accept scalar inputs",
             ));
         }
-        match (sequence_count, token_count) {
-            (Some(sequences), Some(tokens)) if sequences == tokens => Ok(()),
-            (Some(sequences), Some(tokens)) => Err(Error::new(
+        if sequence_count.is_none()
+            || slots.is_none()
+            || active_mask.is_none()
+            || valid_lengths.is_none()
+            || advances.is_none()
+            || token_count.is_none()
+        {
+            Err(Error::new(
                 Status::InvalidArg,
-                format!(
-                    "execute: expected one token list per sequence, got {tokens} for {sequences} sequences"
-                ),
-            )),
-            _ => Err(Error::new(
-                Status::InvalidArg,
-                "execute: stateful executables require sequence and token arrays",
-            )),
+                "execute: stateful executables require sequences, slots, activeMask, validLengths, advances, and tokens",
+            ))
+        } else {
+            Ok(())
         }
-    } else if sequence_count.is_some() || token_count.is_some() {
+    } else if sequence_count.is_some()
+        || slots.is_some()
+        || active_mask.is_some()
+        || valid_lengths.is_some()
+        || advances.is_some()
+        || token_count.is_some()
+    {
         Err(Error::new(
             Status::InvalidArg,
             "execute: stateless executables do not accept state",
@@ -4054,15 +4080,65 @@ fn validate_recurrent_state_schema(schema: &KvStateSchema, state: &SeqState) -> 
     Ok(())
 }
 
-fn validate_active_batch(schema: &KvStateSchema, sequences: usize) -> Result<()> {
-    if sequences == 0 || sequences > schema.batch {
+fn validate_fixed_lanes(
+    schema: &KvStateSchema,
+    sequences: usize,
+    slots: &[u32],
+    active_mask: &[bool],
+    valid_lengths: &[u32],
+    advances: &[u32],
+    tokens: &[Vec<u32>],
+) -> Result<()> {
+    if sequences == 0
+        || sequences > schema.batch
+        || slots.len() != sequences
+        || tokens.len() != sequences
+    {
         return Err(Error::new(
             Status::InvalidArg,
             format!(
-                "execute: executable accepts 1..={} sequences, got {sequences}",
+                "execute: executable accepts 1..={} compact sequences with matching slots and token rows, got {sequences}",
                 schema.batch
             ),
         ));
+    }
+    if active_mask.len() != schema.batch
+        || valid_lengths.len() != schema.batch
+        || advances.len() != schema.batch
+    {
+        return Err(Error::new(
+            Status::InvalidArg,
+            format!(
+                "execute: activeMask, validLengths, and advances must have fixed width {}",
+                schema.batch
+            ),
+        ));
+    }
+    let mut seen = vec![false; schema.batch];
+    for (request, &slot) in slots.iter().enumerate() {
+        let slot = slot as usize;
+        if slot >= schema.batch || seen[slot] {
+            return Err(Error::new(
+                Status::InvalidArg,
+                "execute: slots must be unique physical lane IDs in range",
+            ));
+        }
+        seen[slot] = true;
+        if tokens[request].is_empty() || tokens[request].len() != advances[slot] as usize {
+            return Err(Error::new(Status::InvalidArg, format!("execute: token row {request} must contain exactly the valid tokens for slot {slot}")));
+        }
+    }
+    for lane in 0..schema.batch {
+        if active_mask[lane] != seen[lane]
+            || valid_lengths[lane] != advances[lane]
+            || (seen[lane] && advances[lane] == 0)
+            || (!seen[lane] && advances[lane] != 0)
+        {
+            return Err(Error::new(
+                Status::InvalidArg,
+                format!("execute: inconsistent fixed-lane metadata at slot {lane}"),
+            ));
+        }
     }
     Ok(())
 }
@@ -4152,42 +4228,55 @@ impl Executable {
         inputs: Vec<&NativeTensor>,
         scalars: Vec<f64>,
         sequences: Option<Vec<&NativeKvSequence>>,
+        slots: Option<Vec<u32>>,
+        active_mask: Option<Vec<bool>>,
+        valid_lengths: Option<Vec<u32>>,
+        advances: Option<Vec<u32>>,
         tokens: Option<Vec<Vec<u32>>>,
-        token: Option<&CancellationToken>,
+        cancellation_token: Option<&CancellationToken>,
     ) -> Result<Vec<NativeTensor>> {
         validate_execution_mode(
             self.state.is_some(),
             scalars.len(),
             sequences.as_ref().map(Vec::len),
+            slots.as_deref(),
+            active_mask.as_deref(),
+            valid_lengths.as_deref(),
+            advances.as_deref(),
             tokens.as_ref().map(Vec::len),
         )?;
         let Some(schema) = self.state else {
-            return self.execute_stateless(inputs, scalars, token).await;
+            return self
+                .execute_stateless(inputs, scalars, cancellation_token)
+                .await;
         };
-        let mut sequences = sequences.expect("state invocation was validated");
-        let mut tokens = tokens.expect("state invocation was validated");
-        let active_batch = sequences.len();
-        validate_active_batch(&schema, active_batch)?;
-        let padding = (sequences.len()..schema.batch)
-            .map(|_| sequences[0].new_sequence_like())
-            .collect::<Vec<_>>();
-        sequences.extend(padding.iter());
-        let advance = tokens.first().map(Vec::len).unwrap_or(1);
-        tokens.extend(std::iter::repeat(vec![0; advance]).take(padding.len()));
-        let output = self
+        let sequences = sequences.expect("state invocation was validated");
+        let slots = slots.expect("state invocation was validated");
+        let active_mask = active_mask.expect("state invocation was validated");
+        let valid_lengths = valid_lengths.expect("state invocation was validated");
+        let advances = advances.expect("state invocation was validated");
+        let tokens = tokens.expect("state invocation was validated");
+        validate_fixed_lanes(
+            &schema,
+            sequences.len(),
+            &slots,
+            &active_mask,
+            &valid_lengths,
+            &advances,
+            &tokens,
+        )?;
+        match self
             .execute_stateful(
                 inputs,
                 sequences,
+                slots,
+                advances,
                 tokens,
-                active_batch,
                 StatefulInvocation::Tensors,
-                token,
+                cancellation_token,
             )
-            .await;
-        for sequence in &padding {
-            sequence.release();
-        }
-        match output? {
+            .await?
+        {
             StatefulExecutionOutput::Tensors(outputs) => Ok(outputs),
             StatefulExecutionOutput::Samples(_) => {
                 unreachable!("ordinary stateful execution returned samples")
@@ -4202,6 +4291,10 @@ impl Executable {
         &self,
         inputs: Vec<&NativeTensor>,
         sequences: Vec<&NativeKvSequence>,
+        slots: Vec<u32>,
+        active_mask: Vec<bool>,
+        valid_lengths: Vec<u32>,
+        advances: Vec<u32>,
         tokens: Vec<Vec<u32>>,
         sampling: Vec<NativeSamplingOptions>,
         cancellation_token: Option<&CancellationToken>,
@@ -4217,30 +4310,27 @@ impl Executable {
             .map(sampling_options)
             .collect::<Result<Vec<_>>>()?;
         let schema = self.state.expect("sampled state invocation was validated");
-        let active_batch = sequences.len();
-        validate_active_batch(&schema, active_batch)?;
-        let mut sequences = sequences;
-        let mut tokens = tokens;
-        let padding = (sequences.len()..schema.batch)
-            .map(|_| sequences[0].new_sequence_like())
-            .collect::<Vec<_>>();
-        sequences.extend(padding.iter());
-        let advance = tokens.first().map(Vec::len).unwrap_or(1);
-        tokens.extend(std::iter::repeat(vec![0; advance]).take(padding.len()));
-        let output = self
+        validate_fixed_lanes(
+            &schema,
+            sequences.len(),
+            &slots,
+            &active_mask,
+            &valid_lengths,
+            &advances,
+            &tokens,
+        )?;
+        match self
             .execute_stateful(
                 inputs,
                 sequences,
+                slots,
+                advances,
                 tokens,
-                active_batch,
                 StatefulInvocation::Sampled(sampling),
                 cancellation_token,
             )
-            .await;
-        for sequence in &padding {
-            sequence.release();
-        }
-        match output? {
+            .await?
+        {
             StatefulExecutionOutput::Samples(tokens) => Ok(tokens),
             StatefulExecutionOutput::Tensors(_) => {
                 unreachable!("sampled stateful execution returned tensors")
@@ -4264,26 +4354,14 @@ impl Executable {
         &self,
         inputs: Vec<&NativeTensor>,
         sequences: Vec<&NativeKvSequence>,
+        physical_slots: Vec<u32>,
+        advances: Vec<u32>,
         tokens: Vec<Vec<u32>>,
-        active_batch: usize,
         invocation: StatefulInvocation,
         token: Option<&CancellationToken>,
     ) -> Result<StatefulExecutionOutput> {
         let schema = self.state.expect("stateful execution was validated");
-        let batch = sequences.len();
-        if tokens.len() != batch || tokens.iter().any(Vec::is_empty) {
-            return Err(Error::new(
-                Status::InvalidArg,
-                "kv run: expected one non-empty token list per sequence",
-            ));
-        }
-        let advance = tokens[0].len();
-        if tokens.iter().any(|row| row.len() != advance) {
-            return Err(Error::new(
-                Status::InvalidArg,
-                "kv run: batched runs advance every sequence by the same count",
-            ));
-        }
+        let batch = schema.batch;
         for (index, sequence) in sequences.iter().enumerate() {
             if sequence.released.load(Ordering::SeqCst) {
                 return Err(Error::new(
@@ -4316,14 +4394,6 @@ impl Executable {
             .signature
             .validate_invocation_counts(inputs.len(), 0, runtime_values, None)
             .map_err(|error| Error::new(Status::InvalidArg, error.to_string()))?;
-        let bounded_slot = self
-            .inner
-            .slots
-            .iter()
-            .enumerate()
-            .rev()
-            .find(|(slot, declared)| !declared.scalar && *slot as u32 != schema.cursor_slot)
-            .map(|(slot, _)| slot);
         for (slot, declared) in self.inner.slots.iter().enumerate() {
             if declared.scalar || (schema.cursor_tensor && slot as u32 == schema.cursor_slot) {
                 continue;
@@ -4337,14 +4407,7 @@ impl Executable {
                     .filter(|declared| declared.scalar)
                     .count()
                 - usize::from(schema.cursor_tensor && slot as u32 > schema.cursor_slot);
-            validate_stateful_tensor_input(
-                inputs[input_index],
-                slot,
-                declared,
-                active_batch,
-                schema.batch,
-                bounded_slot == Some(slot),
-            )?;
+            validate_stateful_tensor_input(inputs[input_index], slot, declared)?;
         }
         let executable = self.inner.executable.clone();
         let generated = self.inner.generated_bindings.clone();
@@ -4352,13 +4415,14 @@ impl Executable {
             .iter()
             .map(|input| input.value_cloned())
             .collect::<Result<Vec<_>>>()?;
+        let mut lane_states = vec![None; batch];
+        for (sequence, &slot) in sequences.iter().zip(&physical_slots) {
+            lane_states[slot as usize] = Some(sequence.state.clone());
+        }
         let context = Arc::new(KvContext {
             pool: sequences[0].pool.clone(),
-            slots: sequences
-                .iter()
-                .map(|sequence| sequence.state.clone())
-                .collect(),
-            active_batch,
+            slots: lane_states,
+            advances: advances.iter().map(|&advance| advance as usize).collect(),
             window: schema.window,
             kda: schema.kda,
             conv: schema.conv,
@@ -4399,7 +4463,7 @@ impl Executable {
                     ));
                 }
             }
-            for (index, state) in states.iter().take(active_batch).enumerate() {
+            for (index, state) in states.iter().enumerate() {
                 let state = state.lock().map_err(|error| {
                     Error::new(
                         Status::GenericFailure,
@@ -4428,11 +4492,7 @@ impl Executable {
                             format!("kv sequence lock poisoned: {error}"),
                         )
                     })?
-                    .advance = if index < active_batch {
-                    tokens[index].len()
-                } else {
-                    0
-                };
+                    .advance = tokens[index].len();
             }
             let frontiers = states
                 .iter()
@@ -4473,10 +4533,13 @@ impl Executable {
                             ));
                         }
                         sampled = Some(
-                            outputs
+                            physical_slots
                                 .iter()
                                 .zip(&sampling)
-                                .map(|(output, options)| {
+                                .map(|(&slot, options)| {
+                                    let output = outputs.get(slot as usize).ok_or_else(|| format!(
+                                        "executeSampled: executable has no output for physical slot {slot}"
+                                    ))?;
                                     sample_blocking(output, *options, || cancelled.is_cancelled())
                                         .map_err(|error| error.reason)
                                 })
@@ -4508,7 +4571,7 @@ impl Executable {
                     return Err(to_napi_err(error));
                 }
             };
-            for (index, state) in states.iter().take(active_batch).enumerate() {
+            for (index, state) in states.iter().enumerate() {
                 if let Ok(mut state) = state.lock() {
                     state.note_tokens(&context.pool, &tokens[index]);
                     state.cursor += state.advance;
@@ -4851,17 +4914,72 @@ mod tests {
 
     #[test]
     fn invocation_mode_rejects_stateless_and_stateful_mismatches() {
-        assert!(validate_execution_mode(false, 1, None, None).is_ok());
-        assert!(validate_execution_mode(false, 0, Some(1), Some(1)).is_err());
-        assert!(validate_execution_mode(true, 1, Some(1), Some(1)).is_err());
-        assert!(validate_execution_mode(true, 0, None, None).is_err());
-        assert!(validate_execution_mode(true, 0, Some(2), Some(1)).is_err());
-        assert!(validate_execution_mode(true, 0, Some(2), Some(2)).is_ok());
+        assert!(validate_execution_mode(false, 1, None, None, None, None, None, None).is_ok());
+        assert!(validate_execution_mode(
+            false,
+            0,
+            Some(1),
+            Some(&[0]),
+            Some(&[true]),
+            Some(&[1]),
+            Some(&[1]),
+            Some(1)
+        )
+        .is_err());
+        assert!(validate_execution_mode(
+            true,
+            1,
+            Some(1),
+            Some(&[0]),
+            Some(&[true]),
+            Some(&[1]),
+            Some(&[1]),
+            Some(1)
+        )
+        .is_err());
+        assert!(validate_execution_mode(true, 0, None, None, None, None, None, None).is_err());
+        assert!(validate_execution_mode(
+            true,
+            0,
+            Some(1),
+            Some(&[0]),
+            Some(&[true]),
+            Some(&[1]),
+            Some(&[1]),
+            Some(1)
+        )
+        .is_ok());
         let schema = test_state_schema();
-        assert!(validate_active_batch(&schema, 0).is_err());
-        assert!(validate_active_batch(&schema, 1).is_ok());
-        assert!(validate_active_batch(&schema, 2).is_ok());
-        assert!(validate_active_batch(&schema, 3).is_err());
+        assert!(validate_fixed_lanes(
+            &schema,
+            1,
+            &[1],
+            &[false, true],
+            &[0, 2],
+            &[0, 2],
+            &[vec![4, 5]]
+        )
+        .is_ok());
+        assert!(validate_fixed_lanes(
+            &schema,
+            1,
+            &[1],
+            &[true, false],
+            &[0, 2],
+            &[0, 2],
+            &[vec![4, 5]]
+        )
+        .is_err());
+        assert!(validate_fixed_lanes(
+            &schema,
+            1,
+            &[1],
+            &[false, true],
+            &[0, 2],
+            &[0, 1],
+            &[vec![4]]
+        )
+        .is_err());
     }
 
     #[test]
@@ -4987,8 +5105,8 @@ mod tests {
         }));
         let context = KvContext {
             pool,
-            slots: vec![state.clone()],
-            active_batch: 1,
+            slots: vec![Some(state.clone())],
+            advances: vec![3],
             window: None,
             kda: KdaGeometry::default(),
             conv: ConvGeometry::default(),
@@ -5083,8 +5201,8 @@ mod tests {
         }));
         let context = Arc::new(KvContext {
             pool,
-            slots: vec![state.clone()],
-            active_batch: 1,
+            slots: vec![Some(state.clone())],
+            advances: vec![2],
             window: None,
             kda: KdaGeometry {
                 layers: 1,
@@ -5187,7 +5305,7 @@ mod tests {
                 conv: ConvGeometry::default(),
                 blocks: Mutex::new(BlockStore::new(2)),
             }),
-            slots: vec![Arc::new(Mutex::new(SeqState {
+            slots: vec![Some(Arc::new(Mutex::new(SeqState {
                 blocks: Vec::new(),
                 head: 0,
                 cursor: 0,
@@ -5196,8 +5314,8 @@ mod tests {
                 pending: Vec::new(),
                 kda_states: Vec::new(),
                 conv_states: Vec::new(),
-            }))],
-            active_batch: 1,
+            })))],
+            advances: vec![advance],
             window: None,
             kda: KdaGeometry::default(),
             conv: ConvGeometry::default(),
@@ -5239,6 +5357,64 @@ mod tests {
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].shape(), &[4]);
         assert_eq!(outputs[0].to_f32_vec().unwrap(), [4.0, 5.0, 6.0, 7.0]);
+    }
+
+    #[test]
+    fn last_token_rows_use_physical_lane_advances_and_skip_inactive_lanes() {
+        let source = leaf(Tensor::from_vec(
+            (0..24).map(|value| value as f32).collect(),
+            vec![2, 3, 4],
+        ));
+        let row = |lane| {
+            Node::new(NodeKind::LastTokenRow {
+                a: Node::new(NodeKind::Slice {
+                    a: source.clone(),
+                    ranges: vec![(lane, lane + 1, 1), (0, 3, 1), (0, 4, 1)],
+                })
+                .unwrap(),
+            })
+            .unwrap()
+        };
+        let compilation = executable::compile(
+            &[row(0), row(1)],
+            CompileOptions {
+                optimize: false,
+                ..CompileOptions::default()
+            },
+            1024,
+        )
+        .unwrap();
+        let active = Arc::new(Mutex::new(SeqState {
+            blocks: Vec::new(),
+            head: 0,
+            cursor: 7,
+            advance: 2,
+            last_hash: HASH_SEED,
+            pending: Vec::new(),
+            kda_states: Vec::new(),
+            conv_states: Vec::new(),
+        }));
+        let context = Arc::new(KvContext {
+            pool: Arc::new(block_store_pool(2)),
+            slots: vec![None, Some(active)],
+            advances: vec![0, 2],
+            window: None,
+            kda: KdaGeometry::default(),
+            conv: ConvGeometry::default(),
+            transaction: Mutex::new(None),
+        });
+
+        let outputs = executable::execute(
+            &compilation.executable,
+            &[],
+            &compilation.generated_bindings,
+            &CancellationFlag::new(),
+            Some(&context),
+        )
+        .unwrap();
+
+        assert_eq!(outputs[0].to_f32_vec().unwrap(), [0.0; 4]);
+        assert_eq!(outputs[1].to_f32_vec().unwrap(), [16.0, 17.0, 18.0, 19.0]);
     }
 
     #[test]
@@ -5326,8 +5502,8 @@ mod tests {
         }));
         let context = Arc::new(KvContext {
             pool,
-            slots: vec![state.clone()],
-            active_batch: 1,
+            slots: vec![Some(state.clone())],
+            advances: vec![2],
             window: None,
             kda: KdaGeometry::default(),
             conv: ConvGeometry {

@@ -22,11 +22,11 @@ const program = Effect.scoped(Effect.gen(function*() {
     attentionWindow: 256
   })
   const gen = yield* Effect.acquireRelease(
-    inference.generation(),
+    inference.execution(),
     (gen) => Effect.ignore(gen.close())
   )
   const encoded = yield* tokenizer.encode("The history of the printing press")
-  const entry = yield* gen.add(yield* Tensor.fromTypedArray(encoded.data, [1, encoded.shape[0]]))
+  const entry = (yield* gen.add([yield* Tensor.fromTypedArray(encoded.data, [1, encoded.shape[0]])]))[0]!
   let logits = entry.logits
   for (let i = 0; i < 8; i++) {
     const vals = yield* Tensor.toNumberArray(logits).pipe(

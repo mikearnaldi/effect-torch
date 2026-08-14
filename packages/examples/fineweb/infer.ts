@@ -54,11 +54,11 @@ const program = Effect.scoped(Effect.gen(function*() {
     const generated: Array<number> = []
     yield* Effect.scoped(Effect.gen(function*() {
       const gen = yield* Effect.acquireRelease(
-        inference.generation(),
+        inference.execution(),
         (gen) => Effect.ignore(gen.close())
       )
       const encoded = yield* tokenizer.encode(prompt)
-      const entry = yield* gen.add(yield* Tensor.fromTypedArray(encoded.data, [1, encoded.shape[0]]))
+      const entry = (yield* gen.add([yield* Tensor.fromTypedArray(encoded.data, [1, encoded.shape[0]])]))[0]!
       let logits = entry.logits
       for (let i = 0; i < MAX_NEW_TOKENS; i++) {
         const values = yield* Tensor.toNumberArray(logits).pipe(

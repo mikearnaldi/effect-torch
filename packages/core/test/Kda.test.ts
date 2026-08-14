@@ -367,9 +367,9 @@ onDevices("Kda", (device) => (it) => {
 
     const cachedGenerate = (program: Model.InferenceProgram, prompt: ReadonlyArray<number>, steps: number) =>
       Effect.gen(function*() {
-        const gen = yield* program.generation()
+        const gen = yield* program.execution()
         const context = [...prompt]
-        const entry = yield* gen.add(yield* ids(prompt))
+        const entry = (yield* gen.add([yield* ids(prompt)]))[0]!
         let logits = entry.logits
         for (let i = 0; i < steps; i++) {
           const next = yield* argmaxOf(logits)
@@ -425,9 +425,9 @@ onDevices("Kda", (device) => (it) => {
           blockSize: 4,
           prefillChunk: 4
         })
-        const gen = yield* program.generation()
-        const first = yield* gen.add(yield* ids(prompt))
-        const second = yield* gen.add(yield* ids(prompt))
+        const gen = yield* program.execution()
+        const first = (yield* gen.add([yield* ids(prompt)]))[0]!
+        const second = (yield* gen.add([yield* ids(prompt)]))[0]!
         const firstValues = yield* Tensor.toNumberArray(first.logits)
         const secondValues = yield* Tensor.toNumberArray(second.logits)
         secondValues.forEach((value, index) => assert.assertTrue(close(value, firstValues[index]!)))
@@ -535,11 +535,11 @@ onDevices("Kda", (device) => (it) => {
           maxTokens: 64,
           blockSize: 4,
           prefillChunk: 4,
-          decodeBatch: 4
+          batchSize: 4
         })
-        const gen = yield* program.generation()
-        const a = yield* gen.add(yield* ids([1, 5, 3]))
-        const b = yield* gen.add(yield* ids([2, 7]))
+        const gen = yield* program.execution()
+        const a = (yield* gen.add([yield* ids([1, 5, 3])]))[0]!
+        const b = (yield* gen.add([yield* ids([2, 7])]))[0]!
         const naiveA = yield* naiveGenerate(model, params, [1, 5, 3], 5)
         const naiveB = yield* naiveGenerate(model, params, [2, 7], 5)
         const contextA = [1, 5, 3]
@@ -562,6 +562,48 @@ onDevices("Kda", (device) => (it) => {
         }
         expect(contextA).toEqual(naiveA)
         expect(contextB).toEqual(naiveB)
+      }))
+
+    it.effect("hybrid recurrent state stays physical across sparse refill and reversed requests", () =>
+      Effect.gen(function*() {
+        const model = yield* makeHybrid
+        const params = yield* Tensor.compute(yield* model.init)
+        const program = yield* Model.inference(model, params, {
+          maxTokens: 64,
+          blockSize: 4,
+          prefillChunk: 4,
+          batchSize: 2
+        })
+        const referenceB = yield* program.execution()
+        const bRef = (yield* referenceB.add([yield* ids([2, 7])]))[0]!
+        yield* Tensor.clear(bRef.logits)
+        const [bRefFirst] = yield* referenceB.step([{ seq: bRef.seq, token: 3 }])
+        const [bRefSecond] = yield* referenceB.step([{ seq: bRef.seq, token: 4 }])
+        const referenceC = yield* program.execution()
+        const cRef = (yield* referenceC.add([yield* ids([4, 1, 6])]))[0]!
+        yield* Tensor.clear(cRef.logits)
+        const [cRefNext] = yield* referenceC.step([{ seq: cRef.seq, token: 5 }])
+
+        const gen = yield* program.execution()
+        const entries = yield* gen.add([yield* ids([1, 5, 3]), yield* ids([2, 7])])
+        yield* Tensor.clearAll(entries.map((entry) => entry.logits))
+        yield* entries[0]!.seq.finish()
+        const [bFirst] = yield* gen.step([{ seq: entries[1]!.seq, token: 3 }])
+        const [c] = yield* gen.add([yield* ids([4, 1, 6])])
+        yield* Tensor.clear(c!.logits)
+        const [bSecond, cNext] = yield* gen.step([
+          { seq: entries[1]!.seq, token: 4 },
+          { seq: c!.seq, token: 5 }
+        ])
+        for (const [actual, expected] of [[bFirst, bRefFirst], [bSecond, bRefSecond], [cNext, cRefNext]] as const) {
+          const actualValues = yield* Tensor.toNumberArray(actual!)
+          const expectedValues = yield* Tensor.toNumberArray(expected!)
+          actualValues.forEach((value, index) => assert.assertTrue(close(value, expectedValues[index]!)))
+        }
+        yield* Tensor.clearAll([bFirst!, bRefFirst!, bSecond!, bRefSecond!, cNext!, cRefNext!])
+        yield* gen.close()
+        yield* referenceB.close()
+        yield* referenceC.close()
       }))
   })
 })

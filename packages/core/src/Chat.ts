@@ -664,32 +664,49 @@ export const stream = <E = never>(
       }
     })
     const encoded = yield* tokenizer.encode(rendered, { addSpecialTokens: false })
-    const generation = yield* Effect.acquireRelease(
-      options.program.generation(),
-      (generation) => Effect.ignore(generation.close()),
-      { interruptible: true }
-    )
+    const useSampledGeneration = customSampler === undefined
+    const generation = useSampledGeneration
+      ? yield* Effect.acquireRelease(
+        options.program.generation(),
+        (session) => Effect.ignore(session.close()),
+        { interruptible: true }
+      )
+      : undefined
+    const execution = useSampledGeneration
+      ? undefined
+      : yield* Effect.acquireRelease(
+        options.program.execution(),
+        (session) => Effect.ignore(session.close()),
+        { interruptible: true }
+      )
     type RunState =
-      | { readonly _tag: "fused"; readonly token: number; readonly step: number }
+      | { readonly _tag: "fused"; readonly page: Model.TokenPage; readonly offset: number; readonly step: number }
       | { readonly _tag: "legacy"; readonly logits: Tensor.Concrete; readonly step: number }
 
-    const useSampledGeneration = customSampler === undefined
     const prefillStarted = Date.now()
     const prompt = yield* Tensor.fromTypedArray(encoded.data, [1, encoded.data.length])
-    let sampleCounter = 0
-    let seq: Model.GenerationSeq
+    let seq: Model.GenerationSeq | undefined
+    let executionSeq: Model.StatefulExecutionSeq | undefined
     let initialRun: RunState
     let currentLogits: Tensor.Concrete | undefined
     if (!useSampledGeneration) {
-      const entry = yield* generation.add(prompt)
-      seq = entry.seq
+      if (execution === undefined) return yield* fail("sample", "execution session is unavailable")
+      const [entry] = yield* execution.add([prompt])
+      if (entry === undefined) return yield* fail("sample", "execution returned no sequence")
+      executionSeq = entry.seq
       currentLogits = entry.logits
       initialRun = { _tag: "legacy", logits: entry.logits, step: 0 }
     } else {
-      const entry = yield* generation.addSampled(prompt, { ...sampling, counter: 0 })
-      sampleCounter++
-      seq = entry.seq
-      initialRun = { _tag: "fused", token: entry.token, step: 0 }
+      if (generation === undefined) return yield* fail("sample", "generation session is unavailable")
+      const [page] = yield* generation.add([{
+        prompt,
+        sampling,
+        ...(options.maxTokens === undefined ? {} : { maxTokens: options.maxTokens }),
+        eosTokens: Array.from(stopTokens)
+      }])
+      if (page === undefined) return yield* fail("sample", "generation returned no token page")
+      seq = page.seq
+      initialRun = { _tag: "fused", page, offset: 0, step: 0 }
     }
     const releaseLogits = (logits: Tensor.Concrete) =>
       Tensor.clear(logits).pipe(
@@ -729,7 +746,9 @@ export const stream = <E = never>(
         return Effect.gen(function*() {
           let token: number
           if (state._tag === "fused") {
-            token = state.token
+            const pageToken = state.page.tokens[state.offset]
+            if (pageToken === undefined) return yield* fail("sample", "generation returned an empty token page")
+            token = pageToken
           } else {
             const logits = state.logits
             token = yield* Effect.ensuring(
@@ -752,9 +771,15 @@ export const stream = <E = never>(
           const events = yield* parser.accept(token)
           const stopped = stopTokens.has(token)
           if (!stopped) generatedTokens++
-          if (stopped || (options.maxTokens !== undefined && state.step + 1 >= options.maxTokens)) {
-            const finishReason = stopped ? "stop" : "maxTokens"
-            events.push(...parser.finish(stopped ? "turn" : "limit"))
+          const pageStopped = state._tag === "fused" && state.offset + 1 === state.page.tokens.length
+            ? state.page.stopReason
+            : undefined
+          if (
+            stopped || pageStopped !== undefined ||
+            (options.maxTokens !== undefined && state.step + 1 >= options.maxTokens)
+          ) {
+            const finishReason = stopped || pageStopped === "eos" ? "stop" : "maxTokens"
+            events.push(...parser.finish(finishReason === "stop" ? "turn" : "limit"))
             const decodeMs = Date.now() - decodeStarted
             const segments = parser.segments()
             const result: ChatResult = {
@@ -778,21 +803,25 @@ export const stream = <E = never>(
             return [events, Option.none<State>()]
           }
           if (state._tag === "fused") {
-            const [next] = yield* generation.stepSampled([{
-              seq,
-              token,
-              sampling: { ...sampling, counter: sampleCounter }
-            }])
-            if (next === undefined) {
-              return yield* fail("sample", "fused generation returned no sampled token")
+            if (state.offset + 1 < state.page.tokens.length) {
+              return [
+                events,
+                Option.some({ ...state, offset: state.offset + 1, step: state.step + 1 } satisfies State)
+              ]
             }
-            sampleCounter++
+            if (seq === undefined) return yield* fail("sample", "generation sequence is unavailable")
+            if (generation === undefined) return yield* fail("sample", "generation session is unavailable")
+            const [next] = yield* generation.step([{ seq, sampling }])
+            if (next === undefined) return yield* fail("sample", "generation returned no token page")
             return [
               events,
-              Option.some({ _tag: "fused", token: next, step: state.step + 1 } satisfies State)
+              Option.some({ _tag: "fused", page: next, offset: 0, step: state.step + 1 } satisfies State)
             ]
           }
-          const [next] = yield* generation.step([{ seq, token }])
+          if (executionSeq === undefined) return yield* fail("sample", "execution sequence is unavailable")
+          if (execution === undefined) return yield* fail("sample", "execution session is unavailable")
+          const [next] = yield* execution.step([{ seq: executionSeq, token }])
+          if (next === undefined) return yield* fail("sample", "execution returned no logits")
           currentLogits = next
           return [
             events,
