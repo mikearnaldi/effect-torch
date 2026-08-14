@@ -8,7 +8,7 @@
  */
 import { Context, Data, Effect, Layer } from "effect"
 import type * as Model from "./Model.ts"
-import { MuseGlimmer } from "./models/index.ts"
+import * as MuseGlimmer from "./models/MuseGlimmer.ts"
 
 /**
  * Canonical architecture configuration values. Producers define the key

@@ -1,15 +1,14 @@
 /**
- * Built-in model architectures exported by `@effect-torch/core/models`.
+ * Built-in model architectures and target-coupled checkpoint artifacts exported
+ * by `@effect-torch/core/models`.
  *
- * Architecture modules define configuration-to-model translation only: they
- * neither load artifacts nor mutate a registry. `Gguf.load` resolves a source-
- * qualified identifier in the active `Registry`, invokes the matching
- * architecture, validates its exact parameter catalog against the artifact,
- * and returns loaded parameters in model order. `Registry.layer` owns default
- * registration of the architectures exported here.
+ * Ordinary architecture modules are resolved by `Gguf.load` through the active
+ * `Registry`. Target-coupled modules such as DFlash use a dedicated loader and
+ * return proposer artifacts instead of pretending to be one-input models.
  *
  * @since 0.1.0
  */
+import * as DFlash from "./DFlash.ts"
 import * as MuseGlimmer from "./MuseGlimmer.ts"
 
 /**
@@ -21,4 +20,4 @@ import * as MuseGlimmer from "./MuseGlimmer.ts"
  * @since 0.1.0
  * @category models
  */
-export { MuseGlimmer }
+export { DFlash, MuseGlimmer }
