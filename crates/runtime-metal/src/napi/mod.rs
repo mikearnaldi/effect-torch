@@ -47,7 +47,7 @@ use effect_torch_compiler::{
 use effect_torch_graph::CrossEntropyReduction as CeReduction;
 use effect_torch_graph::{AttentionWindow, Device, PositionOffset, RotaryLayout};
 use effect_torch_napi::{try_register_export, unregister_export, vec_to_bytes, CancellationState};
-use effect_torch_runtime::{Buffer, GgmlKQuant};
+use effect_torch_runtime::{Buffer, GgmlKQuant, SamplingOptions, MAX_SAMPLING_VOCABULARY};
 use runtime::dtype::DType;
 pub type LeafSlot = effect_torch_graph::LeafSlot;
 pub(crate) type Node = effect_torch_graph::Node;
@@ -369,6 +369,77 @@ pub struct NativeCompileOptions {
     pub constant_weights: Option<bool>,
 }
 
+#[napi(object)]
+pub struct NativeSamplingOptions {
+    pub temperature: f64,
+    pub top_k: f64,
+    pub top_p: f64,
+    pub seed: f64,
+    pub counter: f64,
+}
+
+fn non_negative_safe_integer(value: f64, name: &str) -> Result<u64> {
+    const MAX_SAFE_INTEGER: f64 = 9_007_199_254_740_991.0;
+    if !value.is_finite() || value < 0.0 || value.fract() != 0.0 || value > MAX_SAFE_INTEGER {
+        return Err(Error::new(
+            Status::InvalidArg,
+            format!("sample: {name} must be a non-negative safe integer, got {value}"),
+        ));
+    }
+    Ok(value as u64)
+}
+
+fn sampling_options(options: NativeSamplingOptions) -> Result<SamplingOptions> {
+    let top_k = non_negative_safe_integer(options.top_k, "topK")?;
+    let top_k = if top_k == 0 {
+        None
+    } else {
+        Some(
+            usize::try_from(top_k)
+                .map_err(|_| Error::new(Status::InvalidArg, "sample: topK is out of range"))?,
+        )
+    };
+    if !options.temperature.is_finite() || options.temperature < 0.0 {
+        return Err(Error::new(
+            Status::InvalidArg,
+            format!(
+                "sample: temperature must be finite and non-negative, got {}",
+                options.temperature
+            ),
+        ));
+    }
+    if !options.top_p.is_finite() || options.top_p <= 0.0 || options.top_p > 1.0 {
+        return Err(Error::new(
+            Status::InvalidArg,
+            format!(
+                "sample: topP must be finite and in (0, 1], got {}",
+                options.top_p
+            ),
+        ));
+    }
+    if options.temperature > 0.0 {
+        if top_k.is_none() && options.top_p < 1.0 {
+            return Err(Error::new(
+                Status::InvalidArg,
+                "sample: topP < 1 requires topK in [1, 64] for positive-temperature Metal sampling",
+            ));
+        }
+        if let Some(top_k) = top_k.filter(|top_k| *top_k > 64) {
+            return Err(Error::new(
+                Status::InvalidArg,
+                format!("sample: topK {top_k} exceeds Metal positive-temperature limit 64"),
+            ));
+        }
+    }
+    Ok(SamplingOptions {
+        temperature: options.temperature,
+        top_k,
+        top_p: options.top_p,
+        seed: non_negative_safe_integer(options.seed, "seed")?,
+        counter: non_negative_safe_integer(options.counter, "counter")?,
+    })
+}
+
 fn dtype_name(dtype: DType) -> &'static str {
     dtype.name()
 }
@@ -536,6 +607,65 @@ impl NativeTensor {
             Ok(value)
         })
         .await
+    }
+
+    #[napi]
+    #[allow(clippy::too_many_arguments)]
+    pub async fn sample(
+        &self,
+        temperature: f64,
+        top_k: f64,
+        top_p: f64,
+        seed: f64,
+        counter: f64,
+        cancellation_token: Option<&CancellationToken>,
+    ) -> Result<u32> {
+        let options = sampling_options(NativeSamplingOptions {
+            temperature,
+            top_k,
+            top_p,
+            seed,
+            counter,
+        })?;
+        let inner = self.val_cloned()?;
+        run_compute(cancellation_token, move |cancelled, _state| {
+            sample_blocking(&inner, options, cancelled)
+        })
+        .await
+    }
+}
+
+fn sample_blocking(
+    inner: &value::Value,
+    options: SamplingOptions,
+    cancelled: &effect_torch_runtime::CancellationFlag,
+) -> Result<u32> {
+    let tensor = inner.as_metal().map_err(to_napi_err)?;
+    if cancelled.is_cancelled() {
+        return Err(Error::new(Status::Cancelled, "operation aborted"));
+    }
+    let result = crate::sampling::sample(tensor, options).map_err(to_napi_err)?;
+    runtime::metal::device::MetalDevice::get()
+        .synchronize_buffer(&result.buffer)
+        .map_err(to_napi_err)?;
+    if cancelled.is_cancelled() {
+        return Err(Error::new(Status::Cancelled, "operation aborted"));
+    }
+    let offset = result.layout.offset();
+    let values = result.buffer.contents_ptr().cast::<u32>();
+    // SAFETY: `sampling::sample` returns an eight-byte shared u32 allocation,
+    // and synchronization above completed the only GPU writer.
+    let (status, token) = unsafe { (*values.add(offset), *values.add(offset + 1)) };
+    match status {
+        0 => Ok(token),
+        crate::sampling::STATUS_NONFINITE => Err(Error::new(
+            Status::InvalidArg,
+            format!("sample: logit {token} is not finite"),
+        )),
+        _ => Err(Error::new(
+            Status::GenericFailure,
+            format!("sample: GPU sampler returned unknown status {status}"),
+        )),
     }
 }
 
@@ -2902,6 +3032,97 @@ fn validate_execution_mode(
     }
 }
 
+fn validate_sampled_execution_mode(
+    stateful: bool,
+    sequence_count: usize,
+    token_count: usize,
+    sampling_count: usize,
+) -> Result<()> {
+    if !stateful {
+        return Err(Error::new(
+            Status::InvalidArg,
+            "executeSampled: requires a stateful executable",
+        ));
+    }
+    if sequence_count != token_count {
+        return Err(Error::new(
+            Status::InvalidArg,
+            format!(
+                "executeSampled: expected one token list per sequence, got {token_count} for {sequence_count} sequences"
+            ),
+        ));
+    }
+    if sampling_count != sequence_count {
+        return Err(Error::new(
+            Status::InvalidArg,
+            format!(
+                "executeSampled: expected one sampling options object per active sequence/output, got {sampling_count} for {sequence_count} sequences"
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_sampled_outputs(
+    executable: &executable::MetalExecutable,
+    sampling: &[SamplingOptions],
+) -> Result<()> {
+    if sampling.len() > executable.program.outputs.len() {
+        return Err(Error::new(
+            Status::InvalidArg,
+            format!(
+                "executeSampled: executable has {} outputs for {} active sequences",
+                executable.program.outputs.len(),
+                sampling.len()
+            ),
+        ));
+    }
+    for (index, options) in sampling.iter().enumerate() {
+        let output = executable.program.outputs[index];
+        let declaration = &executable.program.values[output.index()];
+        if declaration.shape.len() != 1 {
+            return Err(Error::new(
+                Status::InvalidArg,
+                format!(
+                    "sample: logits must be rank 1, got rank {}",
+                    declaration.shape.len()
+                ),
+            ));
+        }
+        if !matches!(declaration.dtype, DType::F16 | DType::BF16 | DType::F32) {
+            return Err(Error::new(
+                Status::InvalidArg,
+                format!(
+                    "sample: logits dtype must be f16, bf16, or f32, got {}",
+                    declaration.dtype.name()
+                ),
+            ));
+        }
+        let vocabulary = declaration.shape[0];
+        if vocabulary == 0 {
+            return Err(Error::new(
+                Status::InvalidArg,
+                "sample: logits must be non-empty",
+            ));
+        }
+        if vocabulary > MAX_SAMPLING_VOCABULARY {
+            return Err(Error::new(
+                Status::InvalidArg,
+                format!("sample: vocabulary {vocabulary} exceeds limit {MAX_SAMPLING_VOCABULARY}"),
+            ));
+        }
+        if let Some(top_k) = options.top_k {
+            if top_k > vocabulary {
+                return Err(Error::new(
+                    Status::InvalidArg,
+                    format!("sample: topK must be in [1, {vocabulary}], got {top_k}"),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn validate_stateful_tensor_input(
     input: &NativeTensor,
     slot: usize,
@@ -3059,14 +3280,70 @@ impl Executable {
             return self.execute_stateless(inputs, scalars, token).await;
         }
 
-        self.execute_stateful(
-            inputs,
-            sequences.expect("state invocation was validated"),
-            tokens.expect("state invocation was validated"),
-            token,
-        )
-        .await
+        match self
+            .execute_stateful(
+                inputs,
+                sequences.expect("state invocation was validated"),
+                tokens.expect("state invocation was validated"),
+                StatefulInvocation::Tensors,
+                token,
+            )
+            .await?
+        {
+            StatefulExecutionOutput::Tensors(outputs) => Ok(outputs),
+            StatefulExecutionOutput::Samples(_) => {
+                unreachable!("ordinary stateful execution returned samples")
+            }
+        }
     }
+
+    #[napi]
+    pub async fn execute_sampled(
+        &self,
+        inputs: Vec<&NativeTensor>,
+        sequences: Vec<&NativeKvSequence>,
+        tokens: Vec<Vec<u32>>,
+        sampling: Vec<NativeSamplingOptions>,
+        cancellation_token: Option<&CancellationToken>,
+    ) -> Result<Vec<u32>> {
+        validate_sampled_execution_mode(
+            self.state.is_some(),
+            sequences.len(),
+            tokens.len(),
+            sampling.len(),
+        )?;
+        let sampling = sampling
+            .into_iter()
+            .map(sampling_options)
+            .collect::<Result<Vec<_>>>()?;
+        validate_sampled_outputs(&self.inner.executable, &sampling)?;
+
+        match self
+            .execute_stateful(
+                inputs,
+                sequences,
+                tokens,
+                StatefulInvocation::Sampled(sampling),
+                cancellation_token,
+            )
+            .await?
+        {
+            StatefulExecutionOutput::Samples(tokens) => Ok(tokens),
+            StatefulExecutionOutput::Tensors(_) => {
+                unreachable!("sampled stateful execution returned tensors")
+            }
+        }
+    }
+}
+
+enum StatefulInvocation {
+    Tensors,
+    Sampled(Vec<SamplingOptions>),
+}
+
+enum StatefulExecutionOutput {
+    Tensors(Vec<NativeTensor>),
+    Samples(Vec<u32>),
 }
 
 impl Executable {
@@ -3077,8 +3354,9 @@ impl Executable {
         inputs: Vec<&NativeTensor>,
         seqs: Vec<&NativeKvSequence>,
         tokens: Vec<Vec<u32>>,
+        invocation: StatefulInvocation,
         token: Option<&CancellationToken>,
-    ) -> Result<Vec<NativeTensor>> {
+    ) -> Result<StatefulExecutionOutput> {
         let batch = self.state.as_ref().expect("state checked").schema.batch;
         if seqs.is_empty() || seqs.len() > batch {
             return Err(Error::new(
@@ -3100,7 +3378,7 @@ impl Executable {
         let advance = all_tokens.first().map(|t| t.len()).unwrap_or(1);
         all_tokens.extend(std::iter::repeat_n(vec![0u32; advance], pad.len()));
         let out = self
-            .execute_stateful_inner(inputs, all, all_tokens, active_batch, token)
+            .execute_stateful_inner(inputs, all, all_tokens, active_batch, invocation, token)
             .await;
         for p in &pad {
             p.release();
@@ -3116,8 +3394,9 @@ impl Executable {
         seqs: Vec<&NativeKvSequence>,
         tokens: Vec<Vec<u32>>,
         active_batch: usize,
+        invocation: StatefulInvocation,
         token: Option<&CancellationToken>,
-    ) -> Result<Vec<NativeTensor>> {
+    ) -> Result<StatefulExecutionOutput> {
         let batch = seqs.len();
         if tokens.len() != batch || tokens.iter().any(|t| t.is_empty()) {
             return Err(Error::new(
@@ -3303,24 +3582,42 @@ impl Executable {
                     0
                 };
             }
-            let outputs = {
+            let output = {
                 let commit = || cancellation.complete();
-                match executable::execute_stateful(
-                    &executable,
-                    &inputs,
-                    &generated,
-                    cancelled,
-                    kv.as_ref(),
-                    &commit,
-                ) {
-                    Ok(outputs) => outputs.into_iter().map(NativeTensor::wrap).collect(),
+                let result = match invocation {
+                    StatefulInvocation::Tensors => executable::execute_stateful(
+                        &executable,
+                        &inputs,
+                        &generated,
+                        cancelled,
+                        kv.as_ref(),
+                        &commit,
+                    )
+                    .map(|outputs| {
+                        StatefulExecutionOutput::Tensors(
+                            outputs.into_iter().map(NativeTensor::wrap).collect(),
+                        )
+                    }),
+                    StatefulInvocation::Sampled(sampling) => executable::execute_stateful_sampled(
+                        &executable,
+                        &inputs,
+                        &generated,
+                        cancelled,
+                        kv.as_ref(),
+                        &commit,
+                        &sampling,
+                    )
+                    .map(StatefulExecutionOutput::Samples),
+                };
+                match result {
+                    Ok(output) => output,
                     Err(error) => {
                         rollback()?;
                         return Err(to_napi_err(error));
                     }
                 }
             };
-            Ok(outputs)
+            Ok(output)
         })
         .await
     }
@@ -3788,12 +4085,177 @@ mod epilogue_tests {
         assert!(validate_execution_mode(true, 0, Some(1), None).is_err());
     }
 
+    #[test]
+    fn sampled_invocation_requires_state_and_one_option_per_active_output() {
+        assert!(validate_sampled_execution_mode(false, 1, 1, 1).is_err());
+        assert!(validate_sampled_execution_mode(true, 2, 1, 2).is_err());
+        assert!(validate_sampled_execution_mode(true, 2, 2, 1).is_err());
+        assert!(validate_sampled_execution_mode(true, 2, 2, 3).is_err());
+        validate_sampled_execution_mode(true, 2, 2, 2).unwrap();
+    }
+
+    #[test]
+    fn native_sampling_options_require_safe_integer_controls() {
+        let options = |top_k, seed, counter| NativeSamplingOptions {
+            temperature: 0.0,
+            top_k,
+            top_p: 1.0,
+            seed,
+            counter,
+        };
+        assert!(sampling_options(options(-1.0, 0.0, 0.0)).is_err());
+        assert!(sampling_options(options(1.5, 0.0, 0.0)).is_err());
+        assert!(sampling_options(options(0.0, f64::INFINITY, 0.0)).is_err());
+        assert!(sampling_options(options(0.0, 0.0, 9_007_199_254_740_992.0)).is_err());
+        assert_eq!(
+            sampling_options(options(0.0, 7.0, 3.0)).unwrap(),
+            greedy_sampling_options()
+        );
+    }
+
     fn mleaf(data: Vec<f32>, shape: Vec<usize>) -> Arc<Node> {
         let t = MetalTensor::from_f32(MetalDevice::get(), data, shape);
         Node::new(NodeKind::Leaf(std::sync::Arc::new(LeafSlot::new(
             value::Value(t),
         ))))
         .unwrap()
+    }
+
+    fn greedy_sampling_options() -> SamplingOptions {
+        SamplingOptions {
+            temperature: 0.0,
+            top_k: None,
+            top_p: 1.0,
+            seed: 7,
+            counter: 3,
+        }
+    }
+
+    #[test]
+    fn sampling_reads_strided_native_float_storage() {
+        let values = [100.0_f32, 1.0, -100.0, 5.0, -100.0, 3.0];
+        let cases = [
+            (
+                DType::F32,
+                values
+                    .iter()
+                    .flat_map(|value| value.to_ne_bytes())
+                    .collect::<Vec<_>>(),
+            ),
+            (
+                DType::F16,
+                values
+                    .iter()
+                    .flat_map(|value| half::f16::from_f32(*value).to_bits().to_ne_bytes())
+                    .collect::<Vec<_>>(),
+            ),
+            (
+                DType::BF16,
+                values
+                    .iter()
+                    .flat_map(|value| half::bf16::from_f32(*value).to_bits().to_ne_bytes())
+                    .collect::<Vec<_>>(),
+            ),
+        ];
+
+        for (dtype, bytes) in cases {
+            let logits = value::Value(MetalTensor {
+                buffer: MetalDevice::get().upload_bytes(&bytes),
+                layout: runtime::layout::Layout::new(vec![3], vec![2], 1),
+                dtype,
+            });
+            assert_eq!(
+                sample_blocking(
+                    &logits,
+                    greedy_sampling_options(),
+                    &effect_torch_runtime::CancellationFlag::new(),
+                )
+                .unwrap(),
+                1,
+                "{dtype}"
+            );
+        }
+    }
+
+    #[test]
+    fn sampling_rejects_non_vector_empty_and_nonfloat_logits() {
+        let device = MetalDevice::get();
+        let cancelled = effect_torch_runtime::CancellationFlag::new();
+        let matrix = value::Value(MetalTensor::from_f32(device, vec![1.0, 2.0], vec![1, 2]));
+        let empty = value::Value(MetalTensor::empty(device, vec![0], DType::F32));
+        let integers = value::Value(MetalTensor {
+            buffer: device.alloc_with_data_u32(&[1, 2]),
+            layout: runtime::layout::Layout::contiguous(vec![2]),
+            dtype: DType::U32,
+        });
+
+        assert!(sample_blocking(&matrix, greedy_sampling_options(), &cancelled).is_err());
+        assert!(sample_blocking(&empty, greedy_sampling_options(), &cancelled).is_err());
+        assert!(sample_blocking(&integers, greedy_sampling_options(), &cancelled).is_err());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn sampled_execution_failure_rolls_back_sequence_setup() {
+        let root = LazyTensor {
+            node: mleaf(
+                vec![
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    4.0,
+                    f32::NAN,
+                    6.0,
+                    7.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                ],
+                vec![1, 3, 4],
+            ),
+        };
+        let executable = compile(
+            vec![&root],
+            None,
+            Some(NativeKvStateSchema {
+                max_tokens: 32,
+                block_size: 4,
+                kv_dtype: NativeDType::F32,
+                window: None,
+                batch: 1,
+                last_token_row: Some(true),
+            }),
+            None,
+        )
+        .unwrap();
+        let pool = NativeKvPool::new(0, 0, 0, 32, Some(4), Some(NativeDType::F32), None).unwrap();
+        let sequence = pool.make_sequence().unwrap();
+        let free_blocks = pool.free_blocks();
+
+        let error = executable
+            .execute_sampled(
+                Vec::new(),
+                vec![&sequence],
+                vec![vec![1, 2]],
+                vec![NativeSamplingOptions {
+                    temperature: 0.0,
+                    top_k: 0.0,
+                    top_p: 1.0,
+                    seed: 7.0,
+                    counter: 3.0,
+                }],
+                None,
+            )
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("sample: logit 1 is not finite"));
+        let state = sequence.state.lock().unwrap();
+        assert_eq!(state.cursor, 0);
+        assert_eq!(state.advance, 0);
+        assert!(state.blocks.is_empty());
+        assert_eq!(pool.free_blocks(), free_blocks);
     }
 
     #[test]

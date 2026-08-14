@@ -10,16 +10,18 @@
  *
  * Handles are opaque capabilities, not structurally interchangeable records.
  * An implementation must maintain native ownership and liveness out of band,
- * reject forged, released, or foreign handles, and expose immutable logical
- * metadata. `RuntimeService.identity` identifies exactly one interchangeable
- * handle/cache domain; placement ids are meaningful only inside that domain.
+ * reject forged, foreign, or released handles except for idempotent release,
+ * and expose immutable logical metadata. `RuntimeService.identity` identifies
+ * exactly one interchangeable handle/cache domain; placement ids are meaningful
+ * only inside that domain.
  *
  * Effects that cross an asynchronous native boundary must cooperate with
  * interruption. Once interrupted, they must not publish a late result, and
  * must reclaim any native ownership produced after the caller stopped waiting.
  * Inputs are borrowed for the duration of an operation. Successful methods
- * that return concrete tensors or sequences transfer one ownership obligation
- * per distinct returned handle unless their documentation says otherwise.
+ * that return concrete tensors transfer cleanup responsibility per distinct
+ * returned handle unless their documentation says otherwise. Tensor release is
+ * idempotent; ownership does not impose an exact-once call requirement.
  *
  * @since 0.1.0
  */
@@ -214,10 +216,10 @@ export interface LazyTensorHandle extends TensorHandle {
 
 /**
  * A backend-owned materialized tensor value. Each distinct returned handle
- * transfers one release obligation to the caller. Aliases may share physical
- * storage, but releasing one handle invalidates only that ownership capability;
- * physical reclamation can be delayed by aliases, exports, in-flight work, or
- * allocator caches.
+ * transfers cleanup responsibility to the caller, but release is idempotent and
+ * may be requested repeatedly. Aliases may share physical storage, but releasing
+ * one handle invalidates only that ownership capability; physical reclamation
+ * can be delayed by aliases, exports, in-flight work, or allocator caches.
  *
  * @since 0.1.0
  * @category models
@@ -1086,6 +1088,51 @@ export interface GgufRuntime {
 }
 
 /**
+ * Normalized controls for one stateless native token draw from a logits row.
+ * `topK = 0` disables top-k filtering. The same seed and counter replay the
+ * same draw on a given backend.
+ *
+ * @since 0.1.0
+ * @category models
+ */
+export interface SamplingOptions {
+  readonly temperature: number
+  readonly topK: number
+  readonly topP: number
+  readonly seed: number
+  readonly counter: number
+}
+
+/**
+ * Optional native next-token sampling extension. Direct sampling borrows one
+ * live, dense, rank-one floating-point tensor. Fused decode execution, when
+ * present, samples one rank-one output per active state sequence without
+ * publishing output tensors. Both paths return only selected u32 offsets, so
+ * no tensor ownership transfers.
+ *
+ * @since 0.1.0
+ * @category models
+ */
+export interface SamplingRuntime {
+  /** Samples one already-materialized logits row without consuming it. */
+  readonly sample: (
+    logits: ConcreteTensorHandle,
+    options: SamplingOptions
+  ) => Effect.Effect<number, BackendError>
+  /**
+   * Optionally executes one stateful decode invocation and samples its active
+   * outputs in order. The invocation follows `RuntimeService.execute`'s input,
+   * state, cancellation, and atomic-commit contract. `options` contains one
+   * normalized entry per active output.
+   */
+  readonly executeDecode?: (
+    executable: ExecutableHandle,
+    invocation: ExecutionInvocation,
+    options: ReadonlyArray<SamplingOptions>
+  ) => Effect.Effect<ReadonlyArray<number>, BackendError>
+}
+
+/**
  * Optional runtime extension for compiled paged-KV and recurrent inference.
  * Pool geometry must exactly match the executable schema. Attention geometry
  * and each recurrent family are independently either all zero or all positive;
@@ -1220,9 +1267,9 @@ export interface RuntimeService {
    * Executes a live runtime-owned immutable program with one complete
    * invocation. Inputs and state sequences are borrowed until completion.
    * Returned handles are distinct caller-owned capabilities, survive later
-   * invocations, and each require exactly one successful `release` for
-   * deterministic cleanup. Concurrent calls are supported for stateless
-   * invocations and for stateful invocations using disjoint sequences.
+   * invocations, and should be passed to idempotent `release` for deterministic
+   * cleanup. Concurrent calls are supported for stateless invocations and for
+   * stateful invocations using disjoint sequences.
    *
    * On failure or interruption, no output ownership transfers. The runtime
    * must retire submitted work safely, release partial or late output handles,
@@ -1245,11 +1292,14 @@ export interface RuntimeService {
    */
   readonly readback: (tensor: ConcreteTensorHandle) => Effect.Effect<ArrayBuffer, BackendError>
   /**
-   * Releases this concrete handle's ownership and, on success, invalidates it
-   * and lazy graphs that directly captured it. Call exactly once. Other owned
-   * handles and executable-retained constants may still keep storage live.
-   * Failure leaves backend-defined liveness and must not be treated as a
-   * successful release.
+   * Releases this concrete handle's ownership and, on first success, invalidates
+   * it and lazy graphs that directly captured it. Release is idempotent: repeated
+   * calls for a handle successfully released by this runtime must also succeed,
+   * although every other operation must continue to reject that cleared handle.
+   * Forged, foreign, or wrong-kind handles still fail. Other owned handles and
+   * executable-retained constants may keep storage live. A failure for a handle
+   * not already released leaves backend-defined liveness and must not be treated
+   * as a successful release.
    */
   readonly release: (tensor: ConcreteTensorHandle) => Effect.Effect<void, BackendError>
   /**
@@ -1261,6 +1311,8 @@ export interface RuntimeService {
     readonly pathSafetensors?: PathSafetensors
     /** Native GGUF inspection and loading, when supported. */
     readonly gguf?: GgufRuntime
+    /** Native next-token sampling, optionally fused with stateful decode execution. */
+    readonly sampling?: SamplingRuntime
     /** Compiled paged-KV inference, when supported. */
     readonly decode?: DecodeRuntime
     /** Runtime memory and execution diagnostics, when supported. */

@@ -7,7 +7,10 @@
 // GGUF template, emits parsed reasoning/content segments incrementally, and
 // closes state on completion, failure, or interruption. The artifact has a
 // 4,096-token full-context pool, so prompt plus decode must fit even when the
-// optional application-side max-new-token limit is omitted.
+// optional application-side max-new-token limit is omitted. Native sampling
+// defaults to temperature 0.7, top-p 0.95, and top-k 40;
+// MUSE_GLIMMER_TEMPERATURE=0 selects greedy decoding and MUSE_GLIMMER_SEED
+// makes stochastic runs replayable.
 
 import * as BackendApple from "@effect-torch/backend-apple-native"
 import { Chat, Gguf, Model, Registry, Tensor } from "@effect-torch/core"
@@ -51,6 +54,33 @@ const program = Effect.gen(function*() {
 
   const reasoningStrength = yield* Config.nonEmptyString("MUSE_GLIMMER_REASONING_STRENGTH").pipe(
     Config.withDefault("high")
+  )
+
+  const temperature = yield* Config.schema(
+    Schema.Finite.check(Schema.isGreaterThanOrEqualTo(0)),
+    "MUSE_GLIMMER_TEMPERATURE"
+  ).pipe(
+    Config.withDefault(0.7)
+  )
+
+  const topP = yield* Config.schema(
+    Schema.Finite.check(Schema.isGreaterThan(0), Schema.isLessThanOrEqualTo(1)),
+    "MUSE_GLIMMER_TOP_P"
+  ).pipe(
+    Config.withDefault(0.95)
+  )
+
+  const topK = yield* Config.schema(
+    Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
+    "MUSE_GLIMMER_TOP_K"
+  ).pipe(
+    Config.withDefault(40)
+  )
+
+  const seed = yield* Config.option(
+    Config.schema(Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)), "MUSE_GLIMMER_SEED")
+  ).pipe(
+    Config.map(Option.getOrUndefined)
   )
 
   const diagnostics = yield* Config.boolean("MUSE_GLIMMER_DIAGNOSTICS").pipe(
@@ -137,7 +167,8 @@ const program = Effect.gen(function*() {
         reasoning_strength: reasoningStrength
       },
       bosTokenId,
-      maxTokens: maxNewTokens
+      maxTokens: maxNewTokens,
+      sampling: { temperature, topK, topP, ...(seed === undefined ? {} : { seed }) }
     }),
     (event) =>
       Effect.sync(() => {

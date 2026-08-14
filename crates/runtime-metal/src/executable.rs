@@ -5963,6 +5963,52 @@ fn random_seed(nonce: u64, provenance: u64) -> u64 {
     value ^ (value >> 31)
 }
 
+enum ExecutionOutput {
+    Values(Vec<Value>),
+    Sampled(Vec<u32>),
+}
+
+fn read_sampling_results(
+    result: &crate::run::MetalTensor,
+    sample_count: usize,
+) -> Result<Vec<u32>, String> {
+    let required_elements = sample_count
+        .checked_mul(2)
+        .ok_or_else(|| "sample: result element count overflows".to_string())?;
+    let end = result
+        .layout
+        .offset()
+        .checked_add(required_elements)
+        .and_then(|elements| elements.checked_mul(DType::U32.size_in_bytes()))
+        .ok_or_else(|| "sample: result layout overflows".to_string())?;
+    if result.dtype != DType::U32 || end > result.buffer.size {
+        return Err("sample: result buffer is invalid".to_string());
+    }
+
+    let values = result.buffer.contents_ptr().cast::<u32>();
+    let offset = result.layout.offset();
+    let mut tokens = Vec::with_capacity(sample_count);
+    let mut first_error = None;
+    for index in 0..sample_count {
+        let pair = offset + index * 2;
+        // SAFETY: the checked range above covers every status/token pair, and
+        // the executor's final synchronization completed all GPU writers.
+        let (status, token) = unsafe { (*values.add(pair), *values.add(pair + 1)) };
+        match status {
+            crate::sampling::STATUS_OK => tokens.push(token),
+            crate::sampling::STATUS_NONFINITE => {
+                first_error.get_or_insert_with(|| format!("sample: logit {token} is not finite"));
+            }
+            _ => {
+                first_error.get_or_insert_with(|| {
+                    format!("sample: GPU sampler returned unknown status {status}")
+                });
+            }
+        }
+    }
+    first_error.map_or(Ok(tokens), Err)
+}
+
 /// Executes one already-lowered program, including invocation-owned Metal
 /// submission, synchronization, deferred statuses, and state publication.
 #[cfg(test)]
@@ -5973,7 +6019,7 @@ pub(super) fn execute(
     cancelled: &CancellationFlag,
     kv: Option<&dyn MetalDecodeContext>,
 ) -> Result<Vec<Value>, String> {
-    execute_with_commit(
+    match execute_with_commit(
         executable,
         declared_bindings,
         generated_bindings,
@@ -5981,7 +6027,11 @@ pub(super) fn execute(
         cancelled,
         kv,
         None,
-    )
+        None,
+    )? {
+        ExecutionOutput::Values(outputs) => Ok(outputs),
+        ExecutionOutput::Sampled(_) => unreachable!("ordinary execution returned samples"),
+    }
 }
 
 /// Executes a stateless invocation with scalar arguments (NAPI entry).
@@ -5992,7 +6042,7 @@ pub(super) fn execute_with_scalars(
     scalar_bindings: &[f64],
     cancelled: &CancellationFlag,
 ) -> Result<Vec<Value>, String> {
-    execute_with_commit(
+    match execute_with_commit(
         executable,
         declared_bindings,
         generated_bindings,
@@ -6000,7 +6050,11 @@ pub(super) fn execute_with_scalars(
         cancelled,
         None,
         None,
-    )
+        None,
+    )? {
+        ExecutionOutput::Values(outputs) => Ok(outputs),
+        ExecutionOutput::Sampled(_) => unreachable!("ordinary execution returned samples"),
+    }
 }
 
 /// Executes a stateful (decode) invocation against `kv`, committing
@@ -6014,7 +6068,7 @@ pub(super) fn execute_stateful(
     kv: &dyn MetalDecodeContext,
     commit_allowed: &dyn Fn() -> bool,
 ) -> Result<Vec<Value>, String> {
-    execute_with_commit(
+    match execute_with_commit(
         executable,
         declared_bindings,
         generated_bindings,
@@ -6022,7 +6076,38 @@ pub(super) fn execute_stateful(
         cancelled,
         Some(kv),
         Some(commit_allowed),
-    )
+        None,
+    )? {
+        ExecutionOutput::Values(outputs) => Ok(outputs),
+        ExecutionOutput::Sampled(_) => unreachable!("ordinary execution returned samples"),
+    }
+}
+
+/// Executes a stateful invocation and samples the corresponding leading
+/// program outputs before committing its decode state.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn execute_stateful_sampled(
+    executable: &MetalExecutable,
+    declared_bindings: &[Value],
+    generated_bindings: &[Value],
+    cancelled: &CancellationFlag,
+    kv: &dyn MetalDecodeContext,
+    commit_allowed: &dyn Fn() -> bool,
+    sampling: &[effect_torch_runtime::SamplingOptions],
+) -> Result<Vec<u32>, String> {
+    match execute_with_commit(
+        executable,
+        declared_bindings,
+        generated_bindings,
+        &[],
+        cancelled,
+        Some(kv),
+        Some(commit_allowed),
+        Some(sampling),
+    )? {
+        ExecutionOutput::Sampled(tokens) => Ok(tokens),
+        ExecutionOutput::Values(_) => unreachable!("sampled execution returned tensor outputs"),
+    }
 }
 
 fn execute_with_commit(
@@ -6033,9 +6118,22 @@ fn execute_with_commit(
     cancelled: &CancellationFlag,
     kv: Option<&dyn MetalDecodeContext>,
     commit_allowed: Option<&dyn Fn() -> bool>,
-) -> Result<Vec<Value>, String> {
+    sampling: Option<&[effect_torch_runtime::SamplingOptions]>,
+) -> Result<ExecutionOutput, String> {
     if cancelled.load(Ordering::Relaxed) {
         return Err("operation aborted".to_string());
+    }
+    if let Some(sampling) = sampling {
+        if sampling.is_empty() {
+            return Err("sample: at least one sampling option is required".to_string());
+        }
+        if sampling.len() > executable.program.outputs.len() {
+            return Err(format!(
+                "sample: got {} sampling options for {} program outputs",
+                sampling.len(),
+                executable.program.outputs.len()
+            ));
+        }
     }
     match (&executable.state_schema, kv) {
         (Some(schema), Some(context)) if context.schema() == schema => {}
@@ -6207,11 +6305,35 @@ fn execute_with_commit(
         write_padded_binding(destination, source)?;
     }
 
+    let metal = device::MetalDevice::get();
+    let sampling_result = if let Some(sampling) = sampling {
+        for (index, options) in sampling.iter().copied().enumerate() {
+            let output = executable.program.outputs[index];
+            let logits = resolved
+                .get(output.index())
+                .and_then(Option::as_ref)
+                .ok_or_else(|| format!("internal error: output value {output} is unavailable"))?
+                .as_metal()?;
+            crate::sampling::warm_exact(logits, options)?;
+        }
+        let elements = sampling
+            .len()
+            .checked_mul(2)
+            .ok_or_else(|| "sample: result element count overflows".to_string())?;
+        let bytes = crate::sampling::required_result_allocation_bytes(elements)?;
+        Some(crate::run::MetalTensor {
+            buffer: metal.alloc_raw_checked(bytes)?,
+            layout: effect_torch_runtime::Layout::contiguous(vec![elements]),
+            dtype: DType::U32,
+        })
+    } else {
+        None
+    };
     let mut ce_checks = Vec::new();
     let mut quantized_embedding_checks = Vec::new();
-    let metal = device::MetalDevice::get();
     let _submission = metal.begin_submission()?;
     let invocation_nonce = INVOCATION_NONCE.fetch_add(1, Ordering::AcqRel);
+    let mut sampling_encoded = 0;
     let dispatch_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let _dispatch_guard = metal.begin_executable_dispatch()?;
         device::with_execution_environment(
@@ -6329,6 +6451,20 @@ fn execute_with_commit(
                 if !completed {
                     return Err("physical program has no final completion".to_string());
                 }
+                if let (Some(sampling), Some(result)) = (sampling, sampling_result.as_ref()) {
+                    for (index, options) in sampling.iter().copied().enumerate() {
+                        let output = executable.program.outputs[index];
+                        let logits = resolved
+                            .get(output.index())
+                            .and_then(Option::as_ref)
+                            .ok_or_else(|| {
+                                format!("internal error: output value {output} is unavailable")
+                            })?
+                            .as_metal()?;
+                        crate::sampling::sample_into(logits, result, index * 2, options)?;
+                        sampling_encoded += 1;
+                    }
+                }
                 Ok(())
             },
         )
@@ -6340,8 +6476,19 @@ fn execute_with_commit(
     gpu_result?;
     // Status command buffers retain their boundaries, but one final fence is
     // sufficient for every deferred host check in command order.
-    run_ce_checks(&ce_checks)?;
-    run_quantized_embedding_checks(&quantized_embedding_checks)?;
+    let sampled_tokens = if let Some(result) = sampling_result.as_ref() {
+        let ce_result = run_ce_checks(&ce_checks);
+        let quantized_embedding_result =
+            run_quantized_embedding_checks(&quantized_embedding_checks);
+        let sampled_result = read_sampling_results(result, sampling_encoded);
+        ce_result?;
+        quantized_embedding_result?;
+        Some(sampled_result?)
+    } else {
+        run_ce_checks(&ce_checks)?;
+        run_quantized_embedding_checks(&quantized_embedding_checks)?;
+        None
+    };
     match dispatch_result {
         Ok(result) => result?,
         Err(payload) => return Err(panic_message(payload)),
@@ -6355,17 +6502,22 @@ fn execute_with_commit(
     if kv.is_some() {
         commit_state_transactions(executable, &resolved, kv)?;
     }
-    executable
-        .program
-        .outputs
-        .iter()
-        .map(|value| {
-            resolved[value.index()]
-                .as_ref()
-                .cloned()
-                .ok_or_else(|| format!("internal error: output value {value} is unavailable"))
-        })
-        .collect()
+    if let Some(tokens) = sampled_tokens {
+        Ok(ExecutionOutput::Sampled(tokens))
+    } else {
+        executable
+            .program
+            .outputs
+            .iter()
+            .map(|value| {
+                resolved[value.index()]
+                    .as_ref()
+                    .cloned()
+                    .ok_or_else(|| format!("internal error: output value {value} is unavailable"))
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .map(ExecutionOutput::Values)
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -10390,6 +10542,16 @@ mod tests {
         compile_graph_with_state(&[logits], false, last_token_row_schema())
     }
 
+    fn greedy_sampling_options() -> effect_torch_runtime::SamplingOptions {
+        effect_torch_runtime::SamplingOptions {
+            temperature: 0.0,
+            top_k: None,
+            top_p: 1.0,
+            seed: 0,
+            counter: 0,
+        }
+    }
+
     #[test]
     fn last_token_row_copies_the_advanced_row() {
         let compilation = compile_last_token_row();
@@ -10407,6 +10569,138 @@ mod tests {
         assert_eq!(outputs[0].shape(), &[4]);
         assert_eq!(outputs[0].to_f32_vec().unwrap(), [4.0, 5.0, 6.0, 7.0]);
         assert_eq!(context.slots[0].lock().unwrap().cursor, 2);
+    }
+
+    #[test]
+    fn stateful_sampled_samples_each_leading_output_and_then_commits() {
+        let first = Node::new(NodeKind::LastTokenRow {
+            a: leaf_shape((0..12).map(|value| value as f32).collect(), vec![1, 3, 4]),
+        })
+        .unwrap();
+        let second = Node::new(NodeKind::LastTokenRow {
+            a: leaf_shape(
+                vec![
+                    0.0, 0.0, 0.0, 0.0, 10.0, 30.0, 20.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+                ],
+                vec![1, 3, 4],
+            ),
+        })
+        .unwrap();
+        let compilation =
+            compile_graph_with_state(&[first, second], false, last_token_row_schema());
+        let context = last_token_row_context(2);
+
+        let tokens = execute_stateful_sampled(
+            &compilation.executable,
+            &[],
+            &compilation.generated_bindings,
+            &CancellationFlag::new(),
+            &context,
+            &|| true,
+            &[greedy_sampling_options(), greedy_sampling_options()],
+        )
+        .unwrap();
+
+        assert_eq!(tokens, [3, 1]);
+        let state = context.slots[0].lock().unwrap();
+        assert_eq!(state.cursor, 2);
+        assert_eq!(state.advance, 0);
+    }
+
+    #[test]
+    fn stateful_sampled_validates_options_and_does_not_commit_nonfinite_logits() {
+        let compilation = compile_last_token_row();
+        let context = last_token_row_context(2);
+        assert_eq!(
+            execute_stateful_sampled(
+                &compilation.executable,
+                &[],
+                &compilation.generated_bindings,
+                &CancellationFlag::new(),
+                &context,
+                &|| true,
+                &[],
+            )
+            .unwrap_err(),
+            "sample: at least one sampling option is required"
+        );
+        assert_eq!(
+            execute_stateful_sampled(
+                &compilation.executable,
+                &[],
+                &compilation.generated_bindings,
+                &CancellationFlag::new(),
+                &context,
+                &|| true,
+                &[greedy_sampling_options(), greedy_sampling_options()],
+            )
+            .unwrap_err(),
+            "sample: got 2 sampling options for 1 program outputs"
+        );
+
+        let logits = Node::new(NodeKind::LastTokenRow {
+            a: leaf_shape(
+                vec![
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    4.0,
+                    f32::NAN,
+                    6.0,
+                    7.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                ],
+                vec![1, 3, 4],
+            ),
+        })
+        .unwrap();
+        let compilation = compile_graph_with_state(&[logits], false, last_token_row_schema());
+        let context = last_token_row_context(2);
+        let commit_called = std::sync::atomic::AtomicBool::new(false);
+        let error = execute_stateful_sampled(
+            &compilation.executable,
+            &[],
+            &compilation.generated_bindings,
+            &CancellationFlag::new(),
+            &context,
+            &|| {
+                commit_called.store(true, Ordering::Relaxed);
+                true
+            },
+            &[greedy_sampling_options()],
+        )
+        .unwrap_err();
+
+        assert_eq!(error, "sample: logit 1 is not finite");
+        assert!(!commit_called.load(Ordering::Relaxed));
+        let state = context.slots[0].lock().unwrap();
+        assert_eq!(state.cursor, 0);
+        assert_eq!(state.advance, 2);
+        drop(state);
+
+        device::inject_prior_command_buffer_failure_for_test();
+        let error = execute_stateful_sampled(
+            &compilation.executable,
+            &[],
+            &compilation.generated_bindings,
+            &CancellationFlag::new(),
+            &context,
+            &|| {
+                commit_called.store(true, Ordering::Relaxed);
+                true
+            },
+            &[greedy_sampling_options()],
+        )
+        .unwrap_err();
+        assert!(error.contains("GPU command buffer failure"));
+        assert!(!commit_called.load(Ordering::Relaxed));
+        let state = context.slots[0].lock().unwrap();
+        assert_eq!(state.cursor, 0);
+        assert_eq!(state.advance, 2);
     }
 
     #[test]

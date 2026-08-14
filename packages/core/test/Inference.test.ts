@@ -143,6 +143,78 @@ onDevices("Inference", () => (it) => {
         expect(omitted.handle.state?.lastTokenRow).toBeUndefined()
       }))
 
+    it.effect("exposes fused sampling only when supported and samples add/step without logits", () =>
+      Effect.gen(function*() {
+        const runtime = yield* Runtime.Runtime
+        const model = yield* makeGpt()
+        const params = yield* Tensor.compute(yield* model.init)
+        const program = yield* Model.inference(model, params, {
+          maxTokens: 64,
+          blockSize: 4,
+          prefillChunk: 4,
+          decodeBatch: 2
+        })
+        const generation = yield* program.generation()
+        const fusedSampling = runtime.extensions.sampling?.executeDecode !== undefined
+        expect(generation.sampled !== undefined).toBe(fusedSampling)
+        if (!fusedSampling) {
+          expect(generation.sampled).toBeUndefined()
+          return
+        }
+
+        const sampled = generation.sampled
+        expect(sampled).toBeDefined()
+        if (sampled === undefined) return
+
+        const reference = yield* program.generation()
+        const prompts = [
+          [1, 5, 3, 8, 2, 11, 4, 7, 6],
+          [2, 4, 6, 8, 10, 0]
+        ]
+        const sampling: ReadonlyArray<Tensor.SamplingOptions> = [
+          { temperature: 0, seed: 7 },
+          { temperature: 0, seed: 11 }
+        ]
+        const referenceEntries: Array<Model.GenerationEntry> = []
+        const sampledEntries: Array<Model.GenerationSampledEntry> = []
+        const expectedAdd: Array<number> = []
+        for (const [index, prompt] of prompts.entries()) {
+          const expected = yield* reference.add(yield* ids(prompt))
+          referenceEntries.push(expected)
+          expectedAdd.push(yield* Tensor.sample(expected.logits, sampling[index]!))
+          yield* Tensor.clear(expected.logits)
+
+          const actual = yield* sampled.add(yield* ids(prompt), sampling[index]!)
+          sampledEntries.push(actual)
+          expect("logits" in actual).toBe(false)
+          expect(actual.token).toBe(expectedAdd[index])
+          expect(yield* actual.seq.cursor()).toBe(prompt.length)
+        }
+
+        const inputTokens = [7, 3]
+        const referenceLogits = yield* reference.step(
+          referenceEntries.map(({ seq }, index) => ({ seq, token: inputTokens[index]! }))
+        )
+        const expectedStep: Array<number> = []
+        for (const [index, logits] of referenceLogits.entries()) {
+          expectedStep.push(yield* Tensor.sample(logits, sampling[index]!))
+          yield* Tensor.clear(logits)
+        }
+        const actualStep = yield* sampled.step(
+          sampledEntries.map(({ seq }, index) => ({
+            seq,
+            token: inputTokens[index]!,
+            sampling: sampling[index]!
+          }))
+        )
+        expect(actualStep).toEqual(expectedStep)
+        for (const [index, entry] of sampledEntries.entries()) {
+          expect(yield* entry.seq.cursor()).toBe(prompts[index]!.length + 1)
+        }
+        yield* reference.close()
+        yield* generation.close()
+      }))
+
     it.effect("legacy window retains history for mixed local/full attention", () =>
       Effect.gen(function*() {
         const qExemplar = yield* Tensor.zeros([1, 4, 4, 1])

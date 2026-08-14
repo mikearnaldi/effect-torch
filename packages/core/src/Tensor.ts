@@ -17,11 +17,12 @@
  * physical layout, and backend-specific support.
  *
  * Lazy handles need no explicit disposal, but they can retain concrete leaves.
- * Concrete handles carry independent ownership and should be released exactly
- * once with {@link clear} or {@link clearAll}; native finalization is a
- * nondeterministic fallback. Releasing a concrete leaf invalidates lazy graphs
- * that captured that handle. Compilation can retain authorized concrete leaves
- * independently as executable constants.
+ * Concrete handles carry independent ownership and should be released with
+ * {@link clear} or {@link clearAll}; both operations are idempotent, so repeated
+ * cleanup is valid. Native finalization is a nondeterministic fallback.
+ * Releasing a concrete leaf invalidates lazy graphs that captured that handle.
+ * Compilation can retain authorized concrete leaves independently as
+ * executable constants.
  *
  * Compilation has three distinct reuse layers: {@link compile} owns a
  * JavaScript signature LRU and single-flights traces, runtimes may structurally
@@ -33,7 +34,7 @@
  *
  * @since 0.1.0
  */
-import { Data, Deferred, Effect, Exit } from "effect"
+import { Data, Deferred, Effect, Exit, type Scope } from "effect"
 import { dual } from "effect/Function"
 import * as Runtime from "./Runtime.ts"
 
@@ -122,11 +123,11 @@ export type Lazy = Runtime.LazyTensorHandle
 
 /**
  * A materialized tensor whose ownership capability was returned by evaluation,
- * compiled execution, or loading. Each distinct handle must be cleared exactly
- * once for deterministic cleanup. Physical storage may be shared and outlive
- * the handle because of aliases, executable constants, readback exports,
- * in-flight work, or allocator caches. Using a successfully cleared handle, or
- * a lazy graph that captured it, fails.
+ * compiled execution, or loading. Clear owned handles for deterministic
+ * cleanup; repeated cleanup of the same handle is valid. Physical storage may
+ * be shared and outlive the handle because of aliases, executable constants,
+ * readback exports, in-flight work, or allocator caches. Using a successfully
+ * cleared handle, or a lazy graph that captured it, still fails.
  *
  * @since 0.1.0
  * @category models
@@ -3745,10 +3746,11 @@ export const compute = <Roots extends ReadonlyArray<Any>>(
     return yield* Effect.onExit(
       Effect.gen(function*() {
         const executable = yield* fromBackend("compile", runtime.compile({ roots }))
-        const values = yield* captureSuccess(
-          fromBackend("execute", runtime.execute(executable, { bindings: [], scalars: [], runtimeValues: {} })),
-          (values) => void (owned = values)
+        const values = yield* fromBackend(
+          "execute",
+          runtime.execute(executable, { bindings: [], scalars: [], runtimeValues: {} })
         )
+        owned = values
         if (values.length !== roots.length) {
           return yield* new TensorError({
             op: "execute",
@@ -3792,43 +3794,222 @@ const typedArrayConstructor = (dtype: DType) => {
 }
 
 /**
- * Deterministically releases this concrete handle's ownership and invalidates
- * it and lazy graphs that captured it. Call exactly once. This does not
- * guarantee immediate physical deallocation: aliases, in-flight invocations,
- * exported readback buffers, retained generated bindings or constants, and
- * allocator caches may still retain backing storage. Independently owned
- * handles remain valid.
+ * Controls one stateless native token draw from a concrete `[vocab]` logits
+ * row. Temperature defaults to `1`; `0` selects greedy argmax. `topK` defaults
+ * to `0` (disabled), and `topP` defaults to `1` (disabled). `seed` and
+ * `counter` identify the random draw without mutable global sampler state. The
+ * Metal GPU sampler requires `topK` in `1..=64` when positive-temperature
+ * `topP` filtering is enabled and rejects positive-temperature `topK > 64`.
+ *
+ * @since 0.1.0
+ * @category models
+ */
+export interface SamplingOptions {
+  readonly temperature?: number
+  readonly topK?: number
+  readonly topP?: number
+  readonly seed: number
+  readonly counter?: number
+}
+
+const MAX_SAMPLING_VOCABULARY = 1_048_576
+
+type SamplingLogits = Pick<CompiledProgram["outputs"][number], "shape" | "dtype" | "storage">
+
+const normalizeSamplingOptions = (
+  op: string,
+  logits: SamplingLogits,
+  options: SamplingOptions
+): Effect.Effect<Runtime.SamplingOptions, TensorError> =>
+  Effect.gen(function*() {
+    if (logits.shape.length !== 1 || logits.shape[0] === 0) {
+      return yield* new TensorError({
+        op,
+        message: `${op}: logits must have non-empty rank-one shape, got [${logits.shape}]`
+      })
+    }
+    const vocabulary = logits.shape[0]!
+    if (vocabulary > MAX_SAMPLING_VOCABULARY) {
+      return yield* new TensorError({
+        op,
+        message: `${op}: vocabulary ${vocabulary} exceeds limit ${MAX_SAMPLING_VOCABULARY}`
+      })
+    }
+    if (logits.storage !== undefined || !["f16", "bf16", "f32", "f64"].includes(logits.dtype)) {
+      return yield* new TensorError({
+        op,
+        message: `${op}: logits must be a dense floating-point tensor, got ${logits.dtype}`
+      })
+    }
+    const temperature = options.temperature ?? 1
+    const requestedTopK = options.topK ?? 0
+    const topP = options.topP ?? 1
+    const counter = options.counter ?? 0
+    if (!Number.isFinite(temperature) || temperature < 0) {
+      return yield* new TensorError({
+        op,
+        message: `${op}: temperature must be finite and non-negative, got ${temperature}`
+      })
+    }
+    if (!Number.isSafeInteger(requestedTopK) || requestedTopK < 0 || requestedTopK > vocabulary) {
+      return yield* new TensorError({
+        op,
+        message: `${op}: topK must be an integer in [0, ${vocabulary}], got ${requestedTopK}`
+      })
+    }
+    const topK = requestedTopK === vocabulary ? 0 : requestedTopK
+    if (!Number.isFinite(topP) || topP <= 0 || topP > 1) {
+      return yield* new TensorError({
+        op,
+        message: `${op}: topP must be finite and in (0, 1], got ${topP}`
+      })
+    }
+    if (!Number.isSafeInteger(options.seed) || options.seed < 0) {
+      return yield* new TensorError({
+        op,
+        message: `${op}: seed must be a non-negative safe integer, got ${options.seed}`
+      })
+    }
+    if (!Number.isSafeInteger(counter) || counter < 0) {
+      return yield* new TensorError({
+        op,
+        message: `${op}: counter must be a non-negative safe integer, got ${counter}`
+      })
+    }
+    return { temperature, topK, topP, seed: options.seed, counter }
+  })
+
+const validateSampledToken = (
+  op: string,
+  token: number,
+  logits: SamplingLogits
+): Effect.Effect<number, TensorError> => {
+  const vocabulary = logits.shape[0]!
+  return !Number.isSafeInteger(token) || token < 0 || token >= vocabulary
+    ? new TensorError({
+      op,
+      message: `${op}: backend returned invalid token ${token} for vocabulary ${vocabulary}`
+    })
+    : Effect.succeed(token)
+}
+
+/**
+ * Selects one token natively from a live, dense, rank-one floating-point logits
+ * tensor and returns its u32 offset as a JavaScript number. Sampling borrows the
+ * tensor and transfers no ownership. Top-k filtering is applied before top-p;
+ * equal greedy logits select the lower token id. Rows wider than 1,048,576 are
+ * rejected to bound candidate storage and cancellation latency. Identical
+ * tensor values, options, seed, and counter replay on the same backend.
  *
  * @since 0.1.0
  * @category destructors
  */
-export const clear = (self: Concrete): Effect.Effect<void, TensorError, Runtime.Runtime> =>
+export const sample = (
+  logits: Concrete,
+  options: SamplingOptions
+): Effect.Effect<number, TensorError, Runtime.Runtime> =>
   Effect.gen(function*() {
     const runtime = yield* Runtime.Runtime
-    yield* fromBackend("clear", runtime.release(self))
+    const normalized = yield* normalizeSamplingOptions("sample", logits, options)
+    const extension = runtime.extensions.sampling
+    if (extension === undefined) {
+      return yield* new TensorError({
+        op: "sample",
+        message: `sample: backend ${runtime.backend.name} does not provide native sampling`
+      })
+    }
+    const token = yield* fromBackend(
+      "sample",
+      extension.sample(logits, normalized)
+    )
+    return yield* validateSampledToken("sample", token, logits)
   })
 
 /**
- * Attempts to release every concrete handle in input order. Each handle must
- * have independent ownership and must be supplied exactly once. If releases
- * fail, processing continues and the first failure is returned after every
- * handle has been attempted; successful releases remain invalidated.
+ * Deterministically releases this concrete handle's ownership and invalidates
+ * it and lazy graphs that captured it. Cleanup is idempotent: clearing an
+ * already-cleared handle succeeds, while trying to use that handle still fails.
+ * The effect is non-failing; backend rejection of an invalid, foreign, or
+ * wrong-kind value is ignored. This does not guarantee immediate physical
+ * deallocation: aliases, in-flight invocations, exported readback buffers,
+ * retained generated bindings or constants, and allocator caches may still
+ * retain backing storage. Independently owned handles remain valid.
+ *
+ * @since 0.1.0
+ * @category destructors
+ */
+export const clear = (self: Concrete): Effect.Effect<void, never, Runtime.Runtime> =>
+  Effect.gen(function*() {
+    const runtime = yield* Runtime.Runtime
+    yield* Effect.ignore(runtime.release(self))
+  })
+
+const clearAllWithRuntime = (
+  runtime: Runtime.RuntimeService,
+  tensors: Iterable<Concrete>
+): Effect.Effect<void> => Effect.forEach(tensors, (tensor) => Effect.ignore(runtime.release(tensor)), { discard: true })
+
+/**
+ * Attempts to release every concrete handle in input order. Cleanup is
+ * non-failing and idempotent: duplicate, already-cleared, invalid, foreign, or
+ * wrong-kind handles do not fail the effect. Ordinary interruption stops
+ * processing.
  *
  * @since 0.1.0
  * @category destructors
  */
 export const clearAll = (
   tensors: Iterable<Concrete>
-): Effect.Effect<void, TensorError, Runtime.Runtime> =>
-  Effect.uninterruptible(Effect.gen(function*() {
+): Effect.Effect<void, never, Runtime.Runtime> =>
+  Effect.gen(function*() {
     const runtime = yield* Runtime.Runtime
-    let failure: Exit.Failure<void, TensorError> | undefined
-    for (const tensor of tensors) {
-      const exit = yield* Effect.exit(fromBackend("clearAll", runtime.release(tensor)))
-      if (Exit.isFailure(exit)) failure ??= exit
-    }
-    if (failure !== undefined) return yield* Effect.failCause(failure.cause)
-  }))
+    yield* clearAllWithRuntime(runtime, tensors)
+  })
+
+/**
+ * Registers an arbitrary already-owned concrete handle for best-effort cleanup
+ * when the current Effect scope closes, then returns the same handle for
+ * composition. This only registers cleanup: it does not compute, acquire, or
+ * validate the tensor. Finalizer errors are ignored, and clearing the handle
+ * before scope closure is valid because cleanup is idempotent. This is an
+ * application ownership helper; library combinators should release tensors at
+ * their actual operation boundary rather than extending them to an ambient
+ * scope.
+ *
+ * @since 0.1.0
+ * @category destructors
+ */
+export const clearScoped = <A extends Concrete>(
+  self: A
+): Effect.Effect<A, never, Runtime.Runtime | Scope.Scope> =>
+  Effect.gen(function*() {
+    const runtime = yield* Runtime.Runtime
+    yield* Effect.addFinalizer(() => Effect.ignore(runtime.release(self)))
+    return self
+  })
+
+/**
+ * Registers arbitrary already-owned concrete handles for best-effort cleanup
+ * when the current Effect scope closes, then returns the original iterable for
+ * composition. The iterable's handle identities, order, and duplicates are
+ * snapshotted when this registration Effect runs, so later iterable mutation
+ * does not change the finalizer. This does not compute or acquire tensors, and
+ * finalizer errors are ignored. This is intended for application-owned resource
+ * scopes, not as internal lifetime management for streams or library
+ * combinators.
+ *
+ * @since 0.1.0
+ * @category destructors
+ */
+export const clearAllScoped = <Tensors extends Iterable<Concrete>>(
+  tensors: Tensors
+): Effect.Effect<Tensors, never, Runtime.Runtime | Scope.Scope> =>
+  Effect.gen(function*() {
+    const snapshot = Array.from(tensors)
+    const runtime = yield* Runtime.Runtime
+    yield* Effect.addFinalizer(() => clearAllWithRuntime(runtime, snapshot))
+    return tensors
+  })
 
 /**
  * Evaluates a dense tensor and returns its logical row-major values in a host
@@ -3858,15 +4039,13 @@ export const toTypedArray = (self: Any): Effect.Effect<TypedArray, TensorError, 
       const buffer = yield* fromBackend("toTypedArray", runtime.readback(self))
       return new (typedArrayConstructor(self.dtype))(buffer)
     }
-    return yield* Effect.uninterruptibleMask((restore) =>
-      Effect.flatMap(restore(compute([self])), ([evaluated]) =>
-        Effect.ensuring(
-          restore(Effect.map(
-            fromBackend("toTypedArray", runtime.readback(evaluated)),
-            (buffer) => new (typedArrayConstructor(evaluated.dtype))(buffer)
-          )),
-          Effect.ignore(runtime.release(evaluated))
-        ))
+    const [evaluated] = yield* compute([self])
+    return yield* Effect.ensuring(
+      Effect.map(
+        fromBackend("toTypedArray", runtime.readback(evaluated)),
+        (buffer) => new (typedArrayConstructor(evaluated.dtype))(buffer)
+      ),
+      Effect.ignore(runtime.release(evaluated))
     )
   })
 
@@ -3906,9 +4085,6 @@ const releaseTensors = (
   values: ReadonlyArray<Concrete>
 ): Effect.Effect<void> => Effect.forEach(values, (value) => Effect.ignore(runtime.release(value)), { discard: true })
 
-const captureSuccess = <A, E, R>(effect: Effect.Effect<A, E, R>, capture: (value: A) => void): Effect.Effect<A, E, R> =>
-  Effect.uninterruptibleMask((restore) => Effect.tap(restore(effect), (value) => Effect.sync(() => capture(value))))
-
 const withMaterializedInputs = <A, E, R>(
   runtime: Runtime.RuntimeService,
   inputs: ReadonlyArray<Any>,
@@ -3916,13 +4092,15 @@ const withMaterializedInputs = <A, E, R>(
 ): Effect.Effect<A, E | TensorError, R | Runtime.Runtime> => {
   const lazy = inputs.filter((input) => !isTensor(input))
   if (lazy.length === 0) return use(inputs as ReadonlyArray<Concrete>)
-  return Effect.uninterruptibleMask((restore) =>
-    Effect.flatMap(restore(compute(lazy)), (materialized) => {
-      let index = 0
-      const concrete = inputs.map((input) => isTensor(input) ? input : materialized[index++]!)
-      return Effect.ensuring(restore(use(concrete)), releaseTensors(runtime, materialized))
-    })
-  )
+  return Effect.gen(function*() {
+    const materialized = yield* compute(lazy)
+    let index = 0
+    const concrete = inputs.map((input) => isTensor(input) ? input : materialized[index++]!)
+    return yield* Effect.ensuring(
+      use(concrete),
+      releaseTensors(runtime, materialized)
+    )
+  })
 }
 
 const executeProgram = (
@@ -3935,10 +4113,8 @@ const executeProgram = (
     let owned: ReadonlyArray<Concrete> = []
     return Effect.onExit(
       Effect.gen(function*() {
-        const values = yield* captureSuccess(
-          fromBackend(op, runtime.execute(program.handle, invocation)),
-          (values) => void (owned = values)
-        )
+        const values = yield* fromBackend(op, runtime.execute(program.handle, invocation))
+        owned = values
         if (values.length !== program.outputs.length) {
           return yield* new TensorError({
             op,
@@ -4030,18 +4206,16 @@ export const save = (
       try: () => validateMetadata("save", options.metadata ?? {}),
       catch: (error) => caughtTensorError("save", error)
     })
-    yield* Effect.uninterruptibleMask((restore) =>
-      Effect.flatMap(restore(compute(entries.map(([, tensor]) => tensor))), (materialized) =>
-        Effect.ensuring(
-          restore(fromBackend(
-            "save",
-            extension.save(path, {
-              entries: entries.map(([name], index) => ({ name, tensor: materialized[index] })),
-              metadata
-            })
-          )),
-          releaseTensors(runtime, materialized)
-        ))
+    const materialized = yield* compute(entries.map(([, tensor]) => tensor))
+    yield* Effect.ensuring(
+      fromBackend(
+        "save",
+        extension.save(path, {
+          entries: entries.map(([name], index) => ({ name, tensor: materialized[index] })),
+          metadata
+        })
+      ),
+      releaseTensors(runtime, materialized)
     )
   })
 }
@@ -4074,18 +4248,19 @@ export const loadArchive = (
             message: `loadArchive: backend ${runtime.backend.name} does not support path-based safetensors`
           })
         }
-        const archive = yield* captureSuccess(fromBackend("loadArchive", extension.load(path)), (archive) => {
-          const discovered = new Set<Concrete>()
-          if (typeof archive === "object" && archive !== null && Array.isArray(archive.entries)) {
-            for (const entry of archive.entries) {
-              if (
-                typeof entry === "object" && entry !== null && typeof entry.tensor === "object" &&
-                entry.tensor !== null
-              ) discovered.add(entry.tensor as Concrete)
+        const archive = yield* fromBackend("loadArchive", extension.load(path))
+        const discovered = new Set<Concrete>()
+        if (typeof archive === "object" && archive !== null && Array.isArray(archive.entries)) {
+          for (const entry of archive.entries) {
+            if (
+              typeof entry === "object" && entry !== null && typeof entry.tensor === "object" &&
+              entry.tensor !== null
+            ) {
+              discovered.add(entry.tensor as Concrete)
             }
           }
-          candidates = Array.from(discovered)
-        })
+        }
+        candidates = Array.from(discovered)
         const checked = yield* Effect.try({
           try: () => {
             if (typeof archive !== "object" || archive === null || !Array.isArray(archive.entries)) {
@@ -4662,30 +4837,17 @@ export const makeKvPool = (
  * @category compilation
  */
 export const makeKvSequence = (pool: KvPool): Effect.Effect<KvSequence, TensorError, Runtime.Runtime> =>
-  Effect.suspend(() => {
-    let extension: Runtime.DecodeRuntime | undefined
-    let owned: Runtime.KvSequenceHandle | undefined
-    return Effect.onExit(
-      Effect.gen(function*() {
-        const runtime = yield* Runtime.Runtime
-        extension = runtime.extensions.decode
-        if (extension === undefined) {
-          return yield* new TensorError({
-            op: "makeKvSequence",
-            message: "makeKvSequence: inference extension is unavailable"
-          })
-        }
-        const handle = yield* captureSuccess(
-          fromBackend("makeKvSequence", extension.makeSequence(pool.handle)),
-          (handle) => void (owned = handle)
-        )
-        return { handle }
-      }),
-      (exit) =>
-        Exit.isFailure(exit) && extension !== undefined && owned !== undefined
-          ? Effect.ignore(extension.releaseSequence(owned))
-          : Effect.void
-    )
+  Effect.gen(function*() {
+    const runtime = yield* Runtime.Runtime
+    const extension = runtime.extensions.decode
+    if (extension === undefined) {
+      return yield* new TensorError({
+        op: "makeKvSequence",
+        message: "makeKvSequence: inference extension is unavailable"
+      })
+    }
+    const handle = yield* fromBackend("makeKvSequence", extension.makeSequence(pool.handle))
+    return { handle }
   })
 
 /**
@@ -4868,6 +5030,70 @@ export const runDecodeProgram = (
   })
 
 /**
+ * Runs one sequence through a decode program and samples its first active
+ * rank-one output in the same stateful native execution. Sampling options use
+ * the defaults and validation of {@link sample}. The backend must provide both
+ * decode and fused decode-sampling capabilities. Lazy inputs are materialized
+ * and cleaned up exactly as in {@link runDecodeProgram}; no output tensor is
+ * published or requires cleanup because the call returns only the token id.
+ * Sequence mutation, cancellation, and rollback follow the ordinary decode
+ * execution contract.
+ *
+ * @since 0.1.0
+ * @category compilation
+ */
+export const runDecodeProgramSampled = (
+  program: DecodeProgram,
+  inputs: ReadonlyArray<Any>,
+  seq: KvSequence,
+  tokens: ReadonlyArray<number>,
+  sampling: SamplingOptions
+): Effect.Effect<number, TensorError, Runtime.Runtime> =>
+  Effect.gen(function*() {
+    const runtime = yield* Runtime.Runtime
+    if (runtime.extensions.decode === undefined) {
+      return yield* new TensorError({
+        op: "decodeSampled",
+        message: "decodeSampled: inference extension is unavailable"
+      })
+    }
+    const executeDecode = runtime.extensions.sampling?.executeDecode
+    if (executeDecode === undefined) {
+      return yield* new TensorError({
+        op: "decodeSampled",
+        message: `decodeSampled: backend ${runtime.backend.name} does not support fused decode sampling`
+      })
+    }
+    const output = program.outputs[0]
+    if (output === undefined) {
+      return yield* new TensorError({
+        op: "decodeSampled",
+        message: "decodeSampled: program has no active output to sample"
+      })
+    }
+    const normalized = yield* normalizeSamplingOptions("decodeSampled", output, sampling)
+    return yield* withMaterializedInputs(runtime, inputs, (concrete) =>
+      Effect.gen(function*() {
+        const sampled = yield* fromBackend(
+          "decodeSampled",
+          executeDecode(program.handle, {
+            bindings: concrete,
+            scalars: [],
+            runtimeValues: {},
+            state: { sequences: [seq.handle], tokens: [tokens] }
+          }, [normalized])
+        )
+        if (sampled.length !== 1) {
+          return yield* new TensorError({
+            op: "decodeSampled",
+            message: `decodeSampled: backend returned ${sampled.length} tokens for 1 active output`
+          })
+        }
+        return yield* validateSampledToken("decodeSampled", sampled[0]!, output)
+      }))
+  })
+
+/**
  * Runs a frozen batched decode program against one active sequence per batch
  * row. The active count must be from `1` through `program.batch`; the backend
  * pads unused rows to the fixed compiled width. Sequences must be distinct,
@@ -4911,6 +5137,85 @@ export const runBatchedDecodeProgram = (
           ),
           tokens
         }
+      }))
+  })
+
+/**
+ * Runs a fixed-width batched decode program for its active sequences and
+ * samples one corresponding rank-one output per active row in the same native
+ * execution. `sampling` must contain one options object per active sequence;
+ * each object uses {@link sample}'s normalization and validation against that
+ * output's vocabulary metadata. The returned array contains only active token
+ * ids in sequence order. The backend publishes no output tensors, while lazy
+ * input cleanup and state transaction semantics match
+ * {@link runBatchedDecodeProgram}.
+ *
+ * @since 0.1.0
+ * @category compilation
+ */
+export const runBatchedDecodeProgramSampled = (
+  program: DecodeProgram,
+  inputs: ReadonlyArray<Any>,
+  seqs: ReadonlyArray<KvSequence>,
+  tokens: ReadonlyArray<ReadonlyArray<number>>,
+  sampling: ReadonlyArray<SamplingOptions>
+): Effect.Effect<Array<number>, TensorError, Runtime.Runtime> =>
+  Effect.gen(function*() {
+    const runtime = yield* Runtime.Runtime
+    if (runtime.extensions.decode === undefined) {
+      return yield* new TensorError({
+        op: "decodeBatchedSampled",
+        message: "decodeBatchedSampled: inference extension is unavailable"
+      })
+    }
+    const executeDecode = runtime.extensions.sampling?.executeDecode
+    if (executeDecode === undefined) {
+      return yield* new TensorError({
+        op: "decodeBatchedSampled",
+        message: `decodeBatchedSampled: backend ${runtime.backend.name} does not support fused decode sampling`
+      })
+    }
+    if (sampling.length !== seqs.length) {
+      return yield* new TensorError({
+        op: "decodeBatchedSampled",
+        message:
+          `decodeBatchedSampled: expected one sampling options object per active sequence, got ${sampling.length} for ${seqs.length}`
+      })
+    }
+    const normalized = yield* Effect.forEach(sampling, (options, index) => {
+      const output = program.outputs[index]
+      return output === undefined
+        ? new TensorError({
+          op: "decodeBatchedSampled",
+          message: `decodeBatchedSampled: program has no output for active index ${index}`
+        })
+        : normalizeSamplingOptions("decodeBatchedSampled", output, options)
+    })
+    return yield* withMaterializedInputs(runtime, inputs, (concrete) =>
+      Effect.gen(function*() {
+        const sampled = yield* fromBackend(
+          "decodeBatchedSampled",
+          executeDecode(program.handle, {
+            bindings: concrete,
+            scalars: [],
+            runtimeValues: {},
+            state: {
+              sequences: seqs.map((sequence) => sequence.handle),
+              tokens
+            }
+          }, normalized)
+        )
+        if (sampled.length !== normalized.length) {
+          return yield* new TensorError({
+            op: "decodeBatchedSampled",
+            message:
+              `decodeBatchedSampled: backend returned ${sampled.length} tokens for ${normalized.length} active outputs`
+          })
+        }
+        return yield* Effect.forEach(
+          sampled,
+          (token, index) => validateSampledToken("decodeBatchedSampled", token, program.outputs[index]!)
+        )
       }))
   })
 

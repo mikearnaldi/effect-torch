@@ -223,6 +223,14 @@ export declare class NativeTensor {
   get dtype(): string
   get device(): string
   readback(token?: CancellationToken | undefined | null): Promise<ArrayBuffer>
+  sample(
+    temperature: number,
+    topK: number,
+    topP: number,
+    seed: number,
+    counter: number,
+    cancellationToken?: CancellationToken | undefined | null
+  ): Promise<number>
 }
 
 /**

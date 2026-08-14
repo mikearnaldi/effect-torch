@@ -150,7 +150,7 @@ export interface Model {
    * borrowed and are not retained as constants; materialize a lazy initializer
    * once before an evaluation loop. Calls are independently executable and may
    * overlap. The returned concrete output is caller-owned and should be released
-   * exactly once with {@link Tensor.clear} when unused. Use `forward`, not
+   * with {@link Tensor.clear} when unused. Use `forward`, not
    * `execute`, while building a graph for training or differentiation.
    */
   readonly execute: (
@@ -211,30 +211,19 @@ type ModelInternal =
 const ModelProto = {
   execute(this: ModelInternal, params: Params, input: Tensor.Any) {
     const self = this
-    return Effect.suspend(() => {
-      let owned: ReadonlyArray<Tensor.Concrete> = []
-      return Effect.onExit(
-        Effect.gen(function*() {
-          yield* checkArity("execute", self.names, params)
-          if (self._fn === undefined) {
-            self._fn = yield* Tensor.compile<ModelError | Tensor.TensorError, Runtime.Runtime>(
-              (inputs) =>
-                Effect.map(
-                  self.forward(inputs.slice(0, -1), inputs[inputs.length - 1]),
-                  (output) => [output]
-                )
+    return Effect.gen(function*() {
+      yield* checkArity("execute", self.names, params)
+      if (self._fn === undefined) {
+        self._fn = yield* Tensor.compile<ModelError | Tensor.TensorError, Runtime.Runtime>(
+          (inputs) =>
+            Effect.map(
+              self.forward(inputs.slice(0, -1), inputs[inputs.length - 1]),
+              (output) => [output]
             )
-          }
-          const [output] = yield* Effect.uninterruptibleMask((restore) =>
-            Effect.tap(
-              restore(self._fn!.call([...params, input])),
-              (outputs) => Effect.sync(() => void (owned = outputs))
-            )
-          )
-          return output
-        }),
-        (exit) => Exit.isFailure(exit) ? Effect.ignore(Tensor.clearAll(owned)) : Effect.void
-      )
+        )
+      }
+      const [output] = yield* self._fn.call([...params, input])
+      return output
     })
   },
   get stats() {
@@ -1443,7 +1432,7 @@ export const save = (
  * {@link Tensor.load} materializes the entire archive. This function releases
  * unselected tensors before success and releases all imported tensors if
  * validation fails or is interrupted. On success, the selected handles are
- * caller-owned and each should be released exactly once with
+ * caller-owned and should be released with
  * {@link Tensor.clear} when no longer needed.
  *
  * @since 0.1.0
@@ -1453,17 +1442,9 @@ export const load = (
   model: Model,
   path: string
 ): Effect.Effect<ReadonlyArray<Tensor.Concrete>, ModelError | Tensor.TensorError, Runtime.Runtime> =>
-  Effect.suspend(() => {
-    const owned = new Set<Tensor.Concrete>()
-    const releaseOwned = () => Effect.ignore(Tensor.clearAll(owned))
-    return Effect.onExit(
+  Effect.flatMap(Tensor.load(path), (record) =>
+    Effect.onExit(
       Effect.gen(function*() {
-        const record = yield* Effect.uninterruptibleMask((restore) =>
-          Effect.tap(
-            restore(Tensor.load(path)),
-            (record) => Effect.sync(() => Object.values(record).forEach((tensor) => owned.add(tensor)))
-          )
-        )
         const params: Array<Tensor.Concrete> = []
         for (const name of model.names) {
           const param = record[name]
@@ -1476,17 +1457,14 @@ export const load = (
           params.push(param)
         }
         const retained = new Set(params)
-        for (const tensor of owned) {
+        for (const tensor of Object.values(record)) {
           if (retained.has(tensor)) continue
-          yield* Effect.uninterruptible(
-            Tensor.clear(tensor).pipe(Effect.tap(() => Effect.sync(() => owned.delete(tensor))))
-          )
+          yield* Tensor.clear(tensor)
         }
         return params
       }),
-      (exit) => Exit.isFailure(exit) ? releaseOwned() : Effect.void
-    )
-  })
+      (exit) => Exit.isFailure(exit) ? Tensor.clearAll(Object.values(record)) : Effect.void
+    ))
 
 /**
  * A failure in inference-artifact construction or generation: invalid
@@ -1631,8 +1609,66 @@ export interface GenerationSeq {
 export interface GenerationEntry {
   /** The new live sequence handle. */
   readonly seq: GenerationSeq
-  /** Caller-owned logits with shape `[vocab]`; release exactly once with {@link Tensor.clear}. */
+  /** Caller-owned logits with shape `[vocab]`; release with {@link Tensor.clear} when unused. */
   readonly logits: Tensor.Concrete
+}
+
+/**
+ * The result of {@link GenerationSampling.add}: a new live sequence and the
+ * token selected from its prompt's final-real-position logits. Fused execution
+ * publishes no logits tensor, so the caller owns only the sequence. The token
+ * is returned only after the prompt's native state update commits.
+ *
+ * @since 0.1.0
+ * @category compilation
+ */
+export interface GenerationSampledEntry {
+  /** The new live sequence handle. */
+  readonly seq: GenerationSeq
+  /** The sampled next-token id. */
+  readonly token: number
+}
+
+/**
+ * Fused next-token sampling for one {@link Generation} session. This capability
+ * is exposed through {@link Generation.sampled} only when the runtime that
+ * constructs the inference artifact provides fused decode sampling. Prompt,
+ * sequence, validation, batching, serialization, rollback, and cleanup behavior
+ * otherwise matches {@link Generation.add} and {@link Generation.step}.
+ *
+ * @since 0.1.0
+ * @category compilation
+ */
+export interface GenerationSampling {
+  /**
+   * Prefills a new sequence and samples its first generated token during the
+   * final chunk's native decode invocation. Intermediate chunks execute ordinary
+   * decode and immediately clear their logits; no logits are published.
+   */
+  readonly add: (
+    prompt: Tensor.Any,
+    sampling: Tensor.SamplingOptions
+  ) => Effect.Effect<GenerationSampledEntry, InferenceError | ModelError | Tensor.TensorError, Runtime.Runtime>
+  /**
+   * Commits each supplied input token and samples the corresponding next token
+   * in the same native invocation. Entries must be distinct live sequences and
+   * results are returned in entry order. One entry uses single decode; multiple
+   * entries use the fixed batched decode program.
+   */
+  readonly step: (
+    entries: ReadonlyArray<{
+      /** A distinct live sequence created by this session. */
+      readonly seq: GenerationSeq
+      /** The input token id to commit, as a non-negative integer. */
+      readonly token: number
+      /** Sampling controls for this entry's resulting logits row. */
+      readonly sampling: Tensor.SamplingOptions
+    }>
+  ) => Effect.Effect<
+    ReadonlyArray<number>,
+    InferenceError | ModelError | Tensor.TensorError,
+    Runtime.Runtime
+  >
 }
 
 /**
@@ -1696,7 +1732,7 @@ export interface Generation {
    * transactional across the active batch: execution failure or interruption
    * before commit leaves every sequence unadvanced. Calls on this session
    * serialize, but admission and scheduling remain with the caller. Returned
-   * logits are independent ownerships; clear each exactly once. Finishing a
+   * logits are independent ownerships; clear each when no longer needed. Finishing a
    * sequence or closing the session does not clear earlier logits.
    */
   readonly step: (
@@ -1712,6 +1748,12 @@ export interface Generation {
     Runtime.Runtime
   >
   /**
+   * Fused decode sampling, present only when the runtime used to construct the
+   * inference artifact provides `Runtime.extensions.sampling.executeDecode`.
+   * Capability availability is fixed for the artifact's lifetime.
+   */
+  readonly sampled?: GenerationSampling
+  /**
    * Returns this session's JavaScript live-sequence count. This is not a pool
    * capacity, global-session, or prefix-cache statistic.
    */
@@ -1720,10 +1762,11 @@ export interface Generation {
    * Attempts to release every currently live sequence and invalidate its
    * low-level handle. Successfully released entries are removed even if a later
    * release fails; failed entries remain live and a representative failure is
-   * returned, so callers may retry. Completed KV blocks may stay as reclaimable
-   * prefix-cache content. The session is resettable rather than terminal and
-   * may accept new sequences after a successful close. Previously returned
-   * logits are unaffected. Native finalizers are the fallback when sessions and
+   * returned, so callers may retry. Interruption stops the remaining attempts,
+   * leaving their entries live. Completed KV blocks may stay as reclaimable
+   * prefix-cache content. The session is resettable rather than terminal and may
+   * accept new sequences after a successful close. Previously returned logits
+   * are unaffected. Native finalizers are the fallback when sessions and
    * sequence handles become unreachable.
    */
   readonly close: () => Effect.Effect<void, Tensor.TensorError, Runtime.Runtime>
@@ -2047,33 +2090,34 @@ interface LiveEntry {
   readonly seq: GenerationSeq
 }
 
-// `live` is the session's ownership ledger. Removing the entry first would make
-// a failed native release unretryable, so splice only after successful release.
+// Keep entries live until backend release succeeds so a failed or interrupted
+// release remains retryable.
 const releaseLiveEntry = (live: Array<LiveEntry>, entry: LiveEntry) =>
-  Effect.uninterruptible(Effect.gen(function*() {
+  Effect.gen(function*() {
     const index = live.indexOf(entry)
     if (index < 0) return
     yield* Tensor.releaseKvSequence(entry.seq.sequence)
     live.splice(index, 1)
-  }))
+  })
 
 const closeLiveEntries = (
   live: Array<LiveEntry>
 ): Effect.Effect<void, Tensor.TensorError, Runtime.Runtime> =>
-  Effect.uninterruptible(Effect.gen(function*() {
-    const entries = live.splice(0)
-    let failure: Exit.Failure<void, Tensor.TensorError> | undefined
-    for (const entry of entries) {
-      const exit = yield* Effect.exit(Tensor.releaseKvSequence(entry.seq.sequence))
-      if (Exit.isFailure(exit)) {
-        live.push(entry)
-        failure ??= exit
-      }
+  Effect.gen(function*() {
+    let failure: Tensor.TensorError | undefined
+    for (const entry of live.slice()) {
+      yield* Effect.matchEffect(releaseLiveEntry(live, entry), {
+        onFailure: (error) =>
+          Effect.sync(() => {
+            failure ??= error
+          }),
+        onSuccess: () => Effect.void
+      })
     }
     if (failure !== undefined) {
-      return yield* Effect.failCause(failure.cause)
+      return yield* Effect.fail(failure)
     }
-  }))
+  })
 
 // Lifecycle mutations are intentionally not wrapped by the step semaphore;
 // Generation's contract requires callers to keep them disjoint.
@@ -2115,6 +2159,7 @@ interface InferenceEngine {
   readonly config: ResolvedInferenceConfig
   readonly frozenParams: ReadonlyArray<Tensor.Concrete>
   readonly programs: InferencePrograms
+  readonly fusedSampling: boolean
 }
 
 const openGeneration = (engine: InferenceEngine): Effect.Effect<Generation, never> =>
@@ -2123,12 +2168,24 @@ const openGeneration = (engine: InferenceEngine): Effect.Effect<Generation, neve
     const live: Array<LiveEntry> = []
     const config = engine.config
     const programs = engine.programs
-    const add: Generation["add"] = (prompt) =>
+    const addSequence = <A>(
+      prompt: Tensor.Any,
+      runFinalChunk: (
+        input: Tensor.Any,
+        sequence: Tensor.KvSequence,
+        tokens: ReadonlyArray<number>
+      ) => Effect.Effect<A, Tensor.TensorError, Runtime.Runtime>,
+      clearFinalValue: (value: A) => Effect.Effect<void, never, Runtime.Runtime>
+    ): Effect.Effect<
+      { readonly seq: GenerationSeq; readonly value: A },
+      InferenceError | ModelError | Tensor.TensorError,
+      Runtime.Runtime
+    > =>
       Effect.suspend(() => {
         let materializedPrompt: Tensor.Concrete | undefined
         let sequence: Tensor.KvSequence | undefined
         let entry: LiveEntry | undefined
-        const ownedOutputs = new Set<Tensor.Concrete>()
+        let finalValue: { readonly value: A } | undefined
         return Effect.onExit(
           Effect.gen(function*() {
             const runtime = yield* Runtime.Runtime
@@ -2139,43 +2196,28 @@ const openGeneration = (engine: InferenceEngine): Effect.Effect<Generation, neve
               })
             }
             yield* validatePrompt(prompt, config, runtime)
-            const [promptValue] = yield* Effect.uninterruptibleMask((restore) =>
-              Effect.tap(
-                restore(Tensor.compute([prompt])),
-                ([value]) => Effect.sync(() => void (materializedPrompt = value))
-              )
-            )
+            const [promptValue] = yield* Tensor.compute([prompt])
+            materializedPrompt = promptValue
             const ids = yield* readTokenIds(promptValue)
-            const sequenceValue = yield* Effect.uninterruptibleMask((restore) =>
-              Effect.tap(
-                restore(Tensor.makeKvSequence(programs.pool)),
-                (value) => Effect.sync(() => void (sequence = value))
-              )
-            )
+            const sequenceValue = yield* Tensor.makeKvSequence(programs.pool)
+            sequence = sequenceValue
             const matched = yield* Tensor.kvPrefillMatch(sequenceValue, ids)
-            let logits: Tensor.Concrete | undefined
             for (const chunk of planPrefillChunks(ids.length, matched, config.prefillChunk)) {
               const input = yield* prefillInput(promptValue, chunk, config)
-              const [output] = yield* Effect.uninterruptibleMask((restore) =>
-                Effect.tap(
-                  restore(Tensor.runDecodeProgram(
-                    programs.prefill,
-                    [input],
-                    sequenceValue,
-                    ids.slice(chunk.offset, chunk.offset + chunk.real)
-                  )),
-                  (outputs) => Effect.sync(() => outputs.forEach((value) => ownedOutputs.add(value)))
-                )
-              )
+              const tokens = ids.slice(chunk.offset, chunk.offset + chunk.real)
               if (chunk.final) {
-                logits = output
-              } else {
-                yield* Effect.uninterruptible(
-                  Tensor.clear(output).pipe(Effect.tap(() => Effect.sync(() => ownedOutputs.delete(output))))
-                )
+                finalValue = { value: yield* runFinalChunk(input, sequenceValue, tokens) }
+                continue
               }
+              const [output] = yield* Tensor.runDecodeProgram(
+                programs.prefill,
+                [input],
+                sequenceValue,
+                tokens
+              )
+              yield* Tensor.clear(output)
             }
-            if (logits === undefined) {
+            if (finalValue === undefined) {
               return yield* new InferenceError({ op: "prefill", message: "prefill produced no logits" })
             }
             const publishedEntry: LiveEntry = {
@@ -2187,13 +2229,13 @@ const openGeneration = (engine: InferenceEngine): Effect.Effect<Generation, neve
             }
             entry = publishedEntry
             live.push(publishedEntry)
-            return { seq: publishedEntry.seq, logits } satisfies GenerationEntry
+            return { seq: publishedEntry.seq, value: finalValue.value }
           }),
           (exit) =>
             Effect.gen(function*() {
-              if (materializedPrompt !== undefined) yield* Effect.ignore(Tensor.clear(materializedPrompt))
+              if (materializedPrompt !== undefined) yield* Tensor.clear(materializedPrompt)
               if (Exit.isSuccess(exit)) return
-              yield* Effect.ignore(Tensor.clearAll(ownedOutputs))
+              if (finalValue !== undefined) yield* clearFinalValue(finalValue.value)
               if (entry !== undefined) {
                 yield* Effect.ignore(releaseLiveEntry(live, entry))
               } else if (sequence !== undefined) {
@@ -2202,64 +2244,113 @@ const openGeneration = (engine: InferenceEngine): Effect.Effect<Generation, neve
             })
         )
       })
-    const step: Generation["step"] = (entries) =>
+    const add: Generation["add"] = (prompt) =>
+      Effect.map(
+        addSequence(
+          prompt,
+          (input, sequence, tokens) =>
+            Effect.map(
+              Tensor.runDecodeProgram(programs.prefill, [input], sequence, tokens),
+              ([logits]) => logits
+            ),
+          Tensor.clear
+        ),
+        ({ seq, value: logits }) => ({ seq, logits })
+      )
+    const sampledAdd: GenerationSampling["add"] = (prompt, sampling) =>
+      Effect.map(
+        addSequence(
+          prompt,
+          (input, sequence, tokens) =>
+            Tensor.runDecodeProgramSampled(programs.prefill, [input], sequence, tokens, sampling),
+          () => Effect.void
+        ),
+        ({ seq, value: token }) => ({ seq, token })
+      )
+    const runStep = <A, Entry extends { readonly seq: GenerationSeq; readonly token: number }>(
+      entries: ReadonlyArray<Entry>,
+      runSingle: (
+        entry: Entry,
+        input: Tensor.Any
+      ) => Effect.Effect<ReadonlyArray<A>, Tensor.TensorError, Runtime.Runtime>,
+      runBatched: (
+        entries: ReadonlyArray<Entry>,
+        input: Tensor.Any,
+        ids: ReadonlyArray<number>,
+        program: Tensor.DecodeProgram
+      ) => Effect.Effect<ReadonlyArray<A>, Tensor.TensorError, Runtime.Runtime>
+    ): Effect.Effect<ReadonlyArray<A>, InferenceError | Tensor.TensorError, Runtime.Runtime> =>
       roundLock.withPermits(1)(
-        Effect.suspend(() => {
-          const owned = new Set<Tensor.Concrete>()
-          return Effect.onExit(
-            Effect.gen(function*() {
-              yield* validateStepEntries(live, config.decodeBatch, entries)
-              if (entries.length === 1) {
-                const entry = entries[0]!
-                const input = yield* tokenTensor([entry.token], [1, 1], config.tokenDtype)
-                const outputs = yield* Effect.uninterruptibleMask((restore) =>
-                  Effect.tap(
-                    restore(Tensor.runDecodeProgram(
-                      programs.decode,
-                      [input],
-                      entry.seq.sequence,
-                      [entry.token]
-                    )),
-                    (values) => Effect.sync(() => values.forEach((value) => owned.add(value)))
-                  )
-                )
-                return outputs
-              }
-              if (programs.batched === undefined) {
-                return yield* new InferenceError({
-                  op: "step",
-                  message: `stepping ${entries.length} sequences needs decodeBatch > 1`
-                })
-              }
-              const batched = programs.batched
-              const ids = entries.map((entry) => entry.token)
-              const input = yield* tokenTensor(ids, [entries.length, 1], config.tokenDtype)
-              const outputs = yield* Effect.uninterruptibleMask((restore) =>
-                Effect.tap(
-                  restore(Tensor.runBatchedDecodeProgram(
-                    batched,
-                    [input],
-                    entries.map((entry) => entry.seq.sequence),
-                    ids.map((id) => [id])
-                  )),
-                  (values) => Effect.sync(() => values.forEach((value) => owned.add(value)))
-                )
-              )
-              const selected = outputs.slice(0, entries.length)
-              for (const output of outputs.slice(entries.length)) {
-                yield* Effect.uninterruptible(
-                  Tensor.clear(output).pipe(Effect.tap(() => Effect.sync(() => owned.delete(output))))
-                )
-              }
-              return selected
-            }),
-            (exit) => Exit.isFailure(exit) ? Effect.ignore(Tensor.clearAll(owned)) : Effect.void
-          )
+        Effect.gen(function*() {
+          yield* validateStepEntries(live, config.decodeBatch, entries)
+          if (entries.length === 1) {
+            const entry = entries[0]!
+            const input = yield* tokenTensor([entry.token], [1, 1], config.tokenDtype)
+            return yield* runSingle(entry, input)
+          }
+          if (programs.batched === undefined) {
+            return yield* new InferenceError({
+              op: "step",
+              message: `stepping ${entries.length} sequences needs decodeBatch > 1`
+            })
+          }
+          const ids = entries.map((entry) => entry.token)
+          const input = yield* tokenTensor(ids, [entries.length, 1], config.tokenDtype)
+          return yield* runBatched(entries, input, ids, programs.batched)
         })
+      )
+    const step: Generation["step"] = (entries) =>
+      runStep(
+        entries,
+        (entry, input) => Tensor.runDecodeProgram(programs.decode, [input], entry.seq.sequence, [entry.token]),
+        (entries, input, ids, batched) =>
+          Effect.flatMap(
+            Tensor.runBatchedDecodeProgram(
+              batched,
+              [input],
+              entries.map((entry) => entry.seq.sequence),
+              ids.map((id) => [id])
+            ),
+            (outputs) =>
+              Effect.onExit(
+                Effect.gen(function*() {
+                  const selected = outputs.slice(0, entries.length)
+                  for (const output of outputs.slice(entries.length)) {
+                    yield* Tensor.clear(output)
+                  }
+                  return selected
+                }),
+                (exit) => Exit.isFailure(exit) ? Tensor.clearAll(outputs) : Effect.void
+              )
+          )
+      )
+    const sampledStep: GenerationSampling["step"] = (entries) =>
+      runStep(
+        entries,
+        (entry, input) =>
+          Effect.map(
+            Tensor.runDecodeProgramSampled(
+              programs.decode,
+              [input],
+              entry.seq.sequence,
+              [entry.token],
+              entry.sampling
+            ),
+            (token) => [token]
+          ),
+        (entries, input, ids, batched) =>
+          Tensor.runBatchedDecodeProgramSampled(
+            batched,
+            [input],
+            entries.map((entry) => entry.seq.sequence),
+            ids.map((id) => [id]),
+            entries.map((entry) => entry.sampling)
+          )
       )
     return {
       add,
       step,
+      ...(engine.fusedSampling ? { sampled: { add: sampledAdd, step: sampledStep } } : {}),
       live: () => Effect.sync(() => live.length),
       close: () => closeLiveEntries(live)
     }
@@ -2308,27 +2399,19 @@ export const inference = (
   params: Params,
   config: InferenceConfig
 ): Effect.Effect<InferenceProgram, InferenceError | ModelError | Tensor.TensorError, Runtime.Runtime> =>
-  Effect.suspend(() => {
-    let frozenParams: ReadonlyArray<Tensor.Concrete> = []
-    return Effect.onExit(
-      Effect.gen(function*() {
-        yield* checkArity("inference", model.names, params)
-        const resolved = yield* resolveInferenceConfig(config)
-        frozenParams = yield* Effect.uninterruptibleMask((restore) =>
-          Effect.tap(
-            restore(Tensor.compute(params)),
-            (values) => Effect.sync(() => void (frozenParams = values))
-          )
-        )
-        const programs = yield* compileInferencePrograms(model, frozenParams, resolved)
-        const retainedParams = frozenParams
-        return {
-          generation: () => openGeneration({ config: resolved, frozenParams: retainedParams, programs })
-        } satisfies InferenceProgram
-      }),
-      (exit) =>
-        Exit.isFailure(exit)
-          ? Effect.ignore(Tensor.clearAll(frozenParams))
-          : Effect.void
-    )
+  Effect.gen(function*() {
+    yield* checkArity("inference", model.names, params)
+    const resolved = yield* resolveInferenceConfig(config)
+    const runtime = yield* Runtime.Runtime
+    const fusedSampling = runtime.extensions.sampling?.executeDecode !== undefined
+    return yield* Effect.flatMap(Tensor.compute(params), (frozenParams) =>
+      Effect.onExit(
+        Effect.gen(function*() {
+          const programs = yield* compileInferencePrograms(model, frozenParams, resolved)
+          return {
+            generation: () => openGeneration({ config: resolved, frozenParams, programs, fusedSampling })
+          } satisfies InferenceProgram
+        }),
+        (exit) => Exit.isFailure(exit) ? Tensor.clearAll(frozenParams) : Effect.void
+      ))
   })

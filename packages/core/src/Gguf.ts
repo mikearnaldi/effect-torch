@@ -42,8 +42,8 @@ export interface LoadedModel {
   /** The model constructed from the artifact's architecture configuration. */
   readonly model: Model.Model
   /**
-   * Caller-owned loaded tensors in `model.parameters` order. Release every
-   * handle exactly once when no longer needed.
+   * Caller-owned loaded tensors in `model.parameters` order. Release each
+   * handle when no longer needed; repeated releases are no-ops.
    */
   readonly params: ReadonlyArray<Tensor.Concrete>
   /**
@@ -306,12 +306,12 @@ const clearLoaded = (
  *
  * Before the native `load` effect completes, the runtime owns partial results
  * and is responsible for interruption cleanup. Ownership transfers with a
- * successful archive. Validation then runs uninterruptibly: on validation
- * failure this function attempts to release every distinct returned handle,
- * ignores release failures so the validation error is preserved, and returns
- * no tensors. On success ownership of every parameter transfers to the caller;
- * release each handle exactly once. Inspection and load backend failures are
- * {@link GgufError}s, exact-key lookup failures are
+ * successful archive. On validation failure or interruption after validation
+ * begins, this function attempts to release every distinct returned handle,
+ * ignores release failures so the original exit is preserved, and returns no
+ * tensors. On success ownership of every parameter transfers to the caller;
+ * release each handle when no longer needed. Inspection and load backend
+ * failures are {@link GgufError}s, exact-key lookup failures are
  * {@link Registry.RegistryError}s, and architecture construction failures are
  * `Model.ModelError`s.
  *
@@ -341,55 +341,50 @@ export const load = (
     const config = yield* validateEffect(() => modelConfig(inspection, architecture))
     const model = yield* implementation.create(config)
     yield* validateEffect(() => validateCatalog(model, inspection.tensors))
-    return yield* Effect.uninterruptibleMask((restore) =>
-      Effect.flatMap(
-        restore(fromBackend("load", gguf.load(path))),
-        (archive) => {
-          const validArchive = typeof archive === "object" && archive !== null && Array.isArray(archive.entries)
-          const entries = validArchive ? archive.entries : []
-          const validated = validateEffect(() => {
-            if (!validArchive) {
-              throw fail("validate", "native GGUF load returned an invalid archive")
-            }
-            if (entries.length !== inspection.tensors.length) {
-              throw fail("validate", "loaded GGUF tensor count differs from inspection")
-            }
-            const owned = new Set<Runtime.ConcreteTensorHandle>()
-            for (const entry of entries) {
-              if (typeof entry === "object" && entry !== null && owned.has(entry.tensor)) {
-                throw fail("validate", "loaded GGUF archive contains duplicate tensor ownership")
-              }
-              if (
-                typeof entry === "object" && entry !== null && typeof entry.tensor === "object" && entry.tensor !== null
-              ) {
-                owned.add(entry.tensor)
-              }
-            }
-            const inspected = new Map(inspection.tensors.map((descriptor) => [descriptor.name, descriptor]))
-            const loaded = new Map<string, Runtime.ConcreteTensorHandle>()
-            for (const entry of entries) {
-              const descriptor = validateDescriptor(entry.descriptor)
-              const expected = inspected.get(descriptor.name)
-              if (expected === undefined || !descriptorEqual(descriptor, expected) || loaded.has(descriptor.name)) {
-                throw fail(
-                  "validate",
-                  `loaded GGUF descriptor for ${JSON.stringify(descriptor.name)} differs from inspection`
-                )
-              }
-              validateTensor(runtime, descriptor, entry.tensor)
-              loaded.set(descriptor.name, entry.tensor)
-            }
-            const params = model.parameters.map((parameter) => loaded.get(parameter.name)!)
-            if (params.some((tensor) => tensor === undefined)) {
-              throw fail("validate", "loaded GGUF parameter bijection failed")
-            }
-            return { model, params, metadata: config } satisfies LoadedModel
-          })
-          return Effect.onExit(
-            validated,
-            (exit) => Exit.isFailure(exit) ? clearLoaded(runtime, entries) : Effect.void
-          )
+    return yield* Effect.flatMap(fromBackend("load", gguf.load(path)), (archive) => {
+      const validArchive = typeof archive === "object" && archive !== null && Array.isArray(archive.entries)
+      const entries = validArchive ? archive.entries : []
+      const validated = validateEffect(() => {
+        if (!validArchive) {
+          throw fail("validate", "native GGUF load returned an invalid archive")
         }
+        if (entries.length !== inspection.tensors.length) {
+          throw fail("validate", "loaded GGUF tensor count differs from inspection")
+        }
+        const owned = new Set<Runtime.ConcreteTensorHandle>()
+        for (const entry of entries) {
+          if (typeof entry === "object" && entry !== null && owned.has(entry.tensor)) {
+            throw fail("validate", "loaded GGUF archive contains duplicate tensor ownership")
+          }
+          if (
+            typeof entry === "object" && entry !== null && typeof entry.tensor === "object" && entry.tensor !== null
+          ) {
+            owned.add(entry.tensor)
+          }
+        }
+        const inspected = new Map(inspection.tensors.map((descriptor) => [descriptor.name, descriptor]))
+        const loaded = new Map<string, Runtime.ConcreteTensorHandle>()
+        for (const entry of entries) {
+          const descriptor = validateDescriptor(entry.descriptor)
+          const expected = inspected.get(descriptor.name)
+          if (expected === undefined || !descriptorEqual(descriptor, expected) || loaded.has(descriptor.name)) {
+            throw fail(
+              "validate",
+              `loaded GGUF descriptor for ${JSON.stringify(descriptor.name)} differs from inspection`
+            )
+          }
+          validateTensor(runtime, descriptor, entry.tensor)
+          loaded.set(descriptor.name, entry.tensor)
+        }
+        const params = model.parameters.map((parameter) => loaded.get(parameter.name)!)
+        if (params.some((tensor) => tensor === undefined)) {
+          throw fail("validate", "loaded GGUF parameter bijection failed")
+        }
+        return { model, params, metadata: config } satisfies LoadedModel
+      })
+      return Effect.onExit(
+        validated,
+        (exit) => Exit.isFailure(exit) ? clearLoaded(runtime, entries) : Effect.void
       )
-    )
+    })
   })

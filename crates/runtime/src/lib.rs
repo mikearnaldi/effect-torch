@@ -45,6 +45,7 @@ mod gguf;
 mod layout;
 mod memory;
 mod program;
+mod sampling;
 mod workspace;
 
 pub use backend::{
@@ -73,6 +74,7 @@ pub use program::{
     RngInvocation, RuntimeValue, RuntimeValueDecl, RuntimeValueError, RuntimeValueKind, ScalarDecl,
     ScalarType, ScalarValue,
 };
+pub use sampling::{sample_logits, SamplingOptions, MAX_SAMPLING_VOCABULARY};
 pub use workspace::{
     LeasedWorkspace, WorkspaceAllocation, WorkspaceAllocator, WorkspaceLease, WorkspacePool,
     WorkspacePoolError, WorkspacePoolStats, WorkspaceRequest,

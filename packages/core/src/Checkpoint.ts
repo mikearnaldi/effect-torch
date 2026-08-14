@@ -185,7 +185,7 @@ export const saveWithSampler = <S, EL, RL, ED, RD, EO, RO>(
  * same trainer semantics and a stable `stateRoots`/`rebuildState` contract.
  * The returned resume contains the u32 global step but no `startedAt` anchor.
  * Loaded parameters and state roots are caller-owned independent handles;
- * retain them while resuming and release each owned handle exactly once with
+ * retain them while resuming and release each owned handle with
  * {@link Tensor.clear} when no longer needed. All archive tensors are imported
  * before selection. Unreturned metadata and extra entries are released before
  * success; every imported entry is released if validation fails or is
@@ -270,32 +270,21 @@ const withLoadedTensors = <A, E, R>(
   use: (tensors: Record<string, Tensor.Concrete>) => Effect.Effect<A, E, R>,
   retain: (value: A) => ReadonlyArray<Tensor.Concrete>
 ): Effect.Effect<A, E | Tensor.TensorError, R | Runtime.Runtime> =>
-  Effect.suspend(() => {
-    const owned = new Set<Tensor.Concrete>()
-    const releaseOwned = () => Effect.ignore(Tensor.clearAll(owned))
-    return Effect.onExit(
+  Effect.flatMap(Tensor.load(path), (tensors) =>
+    Effect.onExit(
       Effect.gen(function*() {
-        const tensors = yield* Effect.uninterruptibleMask((restore) =>
-          Effect.tap(restore(Tensor.load(path)), (tensors) =>
-            Effect.sync(() => Object.values(tensors).forEach((tensor) => owned.add(tensor))))
-        )
         const value = yield* use(tensors)
         const retained = new Set(retain(value))
-        for (const tensor of owned) {
+        for (const tensor of Object.values(tensors)) {
           if (retained.has(tensor)) {
             continue
           }
-          yield* Effect.uninterruptible(
-            Tensor.clear(tensor).pipe(Effect.tap(() =>
-              Effect.sync(() => owned.delete(tensor))
-            ))
-          )
+          yield* Tensor.clear(tensor)
         }
         return value
       }),
-      (exit) => Exit.isFailure(exit) ? releaseOwned() : Effect.void
-    )
-  })
+      (exit) => Exit.isFailure(exit) ? Tensor.clearAll(Object.values(tensors)) : Effect.void
+    ))
 
 const trainerEntries = <S, EL, RL, ED, RD, EO, RO>(
   trainer: Trainer.Trainer<S, EL, RL, ED, RD, EO, RO>,

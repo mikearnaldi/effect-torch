@@ -35,6 +35,15 @@ layer(BackendCpu.layer)("Memory", (it) => {
         assert.strictEqual(yield* externalMemoryBytes, before)
       }))
 
+    it.effect("clear is idempotent while cleared handles remain invalid", () =>
+      Effect.gen(function*() {
+        const [tensor] = yield* Tensor.compute([yield* Tensor.ones([4])])
+        yield* Tensor.clear(tensor)
+        yield* Tensor.clear(tensor)
+        const error = yield* Effect.flip(Tensor.toNumberArray(tensor))
+        expect(error.message).toContain("cleared")
+      }))
+
     it.effect("clearAll releases every tensor immediately", () =>
       Effect.gen(function*() {
         const bytes = 2 * 1024 * 1024 * 4
@@ -55,6 +64,49 @@ layer(BackendCpu.layer)("Memory", (it) => {
         yield* Tensor.clearAll(new Set(tensors))
         const error = yield* Effect.flip(Tensor.toNumberArray(tensors[0]))
         expect(error.message).toContain("cleared")
+      }))
+
+    it.effect("clearAll accepts duplicate and already-cleared handles", () =>
+      Effect.gen(function*() {
+        const [tensor] = yield* Tensor.compute([yield* Tensor.ones([4])])
+        yield* Tensor.clearAll([tensor, tensor])
+        yield* Tensor.clearAll([tensor, tensor])
+        const error = yield* Effect.flip(Tensor.toNumberArray(tensor))
+        expect(error.message).toContain("cleared")
+      }))
+
+    it.effect("clearScoped releases an already-owned handle when its scope closes", () =>
+      Effect.gen(function*() {
+        const tensor = yield* Effect.scoped(
+          Effect.gen(function*() {
+            const [owned] = yield* Tensor.compute([yield* Tensor.ones([4])])
+            expect(yield* Tensor.clearScoped(owned)).toBe(owned)
+            assert.deepStrictEqual(yield* Tensor.toNumberArray(owned), [1, 1, 1, 1])
+            return owned
+          })
+        )
+        const error = yield* Effect.flip(Tensor.toNumberArray(tensor))
+        expect(error.message).toContain("cleared")
+      }))
+
+    it.effect("clearAllScoped snapshots iterable identities at registration", () =>
+      Effect.gen(function*() {
+        const [first, second] = yield* Effect.scoped(
+          Effect.gen(function*() {
+            const [first, second] = yield* Tensor.compute([
+              yield* Tensor.ones([4]),
+              yield* Tensor.zeros([4])
+            ])
+            const owned = [first]
+            expect(yield* Tensor.clearAllScoped(owned)).toBe(owned)
+            owned[0] = second
+            return [first, second] as const
+          })
+        )
+        const firstError = yield* Effect.flip(Tensor.toNumberArray(first))
+        expect(firstError.message).toContain("cleared")
+        assert.deepStrictEqual(yield* Tensor.toNumberArray(second), [0, 0, 0, 0])
+        yield* Tensor.clear(second)
       }))
 
     it.effect("use after clear is a typed error, through the handle and the graph", () =>

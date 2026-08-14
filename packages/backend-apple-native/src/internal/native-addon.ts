@@ -19,7 +19,9 @@ export declare class CancellationToken {
  * programs; `diagnostics` describes the frozen plan. `execute` borrows inputs
  * and sequences until its Promise settles and returns newly owned tensor
  * wrappers. Stateful execution requires paired sequence/token arrays, rejects
- * scalar inputs, and commits sequence updates only on success.
+ * scalar inputs, and commits sequence updates only on success. `executeSampled`
+ * follows the same stateful transaction but returns one token per active output
+ * without creating output tensor wrappers.
  *
  * @internal
  */
@@ -45,6 +47,13 @@ export declare class Executable {
     tokens?: Array<Array<number>> | undefined | null,
     token?: CancellationToken | undefined | null
   ): Promise<Array<NativeTensor>>
+  executeSampled(
+    inputs: Array<NativeTensor>,
+    sequences: Array<NativeKvSequence>,
+    tokens: Array<Array<number>>,
+    sampling: Array<NativeSamplingOptions>,
+    token?: CancellationToken | undefined | null
+  ): Promise<Array<number>>
 }
 
 /**
@@ -223,6 +232,14 @@ export declare class NativeTensor {
   get dtype(): string
   get device(): string
   readback(token?: CancellationToken | undefined | null): Promise<ArrayBuffer>
+  sample(
+    temperature: number,
+    topK: number,
+    topP: number,
+    seed: number,
+    counter: number,
+    cancellationToken?: CancellationToken | undefined | null
+  ): Promise<number>
 }
 
 /**
@@ -326,6 +343,15 @@ export type NativeRotaryLayout = "HalfSplit" | "InterleavedPairs"
 export interface NativeCompileOptions {
   optimize?: boolean
   constantWeights?: boolean
+}
+
+/** Normalized controls for one output sampled by fused decode execution. @internal */
+export interface NativeSamplingOptions {
+  temperature: number
+  topK: number
+  topP: number
+  seed: number
+  counter: number
 }
 
 /** Decode specialization request passed to native compilation. @internal */

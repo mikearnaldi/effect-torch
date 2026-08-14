@@ -770,17 +770,13 @@ export const step = <S, P extends ReadonlyArray<Tensor.Any>>(
   Runtime.Runtime
 > =>
   Effect.suspend(() => {
-    let owned: ReadonlyArray<Tensor.Concrete> = []
+    const owned: Array<Tensor.Concrete> = []
     return Effect.onExit(
       Effect.gen(function*() {
         const grads = yield* Gradient.grad(loss, params)
         const next = yield* optimizer.step(params, grads, state, lr)
-        const evaluated = yield* Effect.uninterruptibleMask((restore) =>
-          Effect.tap(
-            restore(Tensor.compute([loss, ...next.params, ...next.stateRoots])),
-            (values) => Effect.sync(() => void (owned = values))
-          )
-        )
+        const evaluated = yield* Tensor.compute([loss, ...next.params, ...next.stateRoots])
+        owned.push(...evaluated)
         const [evaluatedLoss, ...rest] = evaluated
         const result = {
           loss: evaluatedLoss,
@@ -791,7 +787,7 @@ export const step = <S, P extends ReadonlyArray<Tensor.Any>>(
       }),
       (exit) =>
         Exit.isFailure(exit)
-          ? Effect.ignore(Tensor.clearAll(owned))
+          ? Tensor.clearAll(owned)
           : Effect.void
     )
   })

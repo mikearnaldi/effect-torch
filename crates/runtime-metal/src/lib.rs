@@ -94,7 +94,7 @@ pub mod runtime {
         pub use crate::composed;
         pub use crate::{
             conv, device, emit, flash, gemm, indexing, kda, kernels, layer_norm, linear, loss, ops,
-            paged, quantized, rotary, run, shortconv,
+            paged, quantized, rotary, run, sampling, shortconv,
         };
     }
 }
@@ -129,6 +129,7 @@ pub mod loss;
 pub mod paged;
 pub mod quantized;
 pub mod rotary;
+pub mod sampling;
 pub mod shortconv;
 pub(crate) mod value;
 mod workspace;

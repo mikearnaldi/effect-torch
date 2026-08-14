@@ -1323,6 +1323,46 @@ export const makeRuntime = (
       invocation.tokens.map((row) => [...row])
     ]
   }
+  const resolveExecutableInvocation = (
+    handle: Runtime.ExecutableHandle,
+    invocation: Runtime.ExecutionInvocation
+  ) => {
+    const executableRecord = nativeExecutable(handle, "execute")
+    if (Object.keys(invocation.runtimeValues).length !== 0) {
+      throw executionError(
+        "execute: runtime values are not supported by the Apple Metal backend",
+        "unsupported-operation"
+      )
+    }
+    const info = executableRecord.info as ExecutableInfo
+    if (invocation.bindings.length !== info.bindings.length) {
+      throw executionError(
+        `execute: received ${invocation.bindings.length} tensor bindings, expected ${info.bindings.length}`
+      )
+    }
+    const inputs = invocation.bindings.map((input, index) =>
+      nativeBinding(
+        input,
+        info.bindings[index]!,
+        index,
+        info.state !== undefined && invocation.state !== undefined && index === info.bindings.length - 1
+          ? { compiled: info.state.batch, active: invocation.state.sequences.length }
+          : undefined
+      )
+    )
+    if (info.state !== undefined && invocation.scalars.length !== 0) {
+      throw executionError("execute: stateful executable does not accept scalar inputs")
+    }
+    const [sequences, tokens] = resolveExecutionState(info.state, invocation.state)
+    return {
+      executable: executableRecord.value as Executable,
+      info,
+      inputs,
+      scalars: [...invocation.scalars],
+      sequences,
+      tokens
+    }
+  }
   // Pools own fixed KV slabs, prefix-cache state, and recurrent geometry;
   // sequence wrappers retain KV block references and per-sequence recurrent
   // tensors. releaseSequence invalidates the public sequence and returns its
@@ -1396,6 +1436,37 @@ export const makeRuntime = (
         },
         catch: backendErrorFor("releaseSequence", "execute")
       })
+  }
+  const sampling: Runtime.SamplingRuntime = {
+    sample: (handle, options) =>
+      cancellableFor(
+        "sample",
+        "execute",
+        (token) =>
+          nativeTensor(handle, "sample").sample(
+            options.temperature,
+            options.topK,
+            options.topP,
+            options.seed,
+            options.counter,
+            token
+          )
+      ),
+    executeDecode: (handle, invocation, options) =>
+      cancellableFor(
+        "executeDecode",
+        "execute",
+        (token) => {
+          const resolved = resolveExecutableInvocation(handle, invocation)
+          return resolved.executable.executeSampled(
+            resolved.inputs,
+            resolved.sequences ?? [],
+            resolved.tokens ?? [],
+            options.map((option) => ({ ...option })),
+            token
+          )
+        }
+      )
   }
   // Direct path I/O borrows tensors on save and transfers newly loaded native
   // tensors to caller-owned concrete handles on success. Safetensors has no
@@ -1549,8 +1620,9 @@ export const makeRuntime = (
   // Inspection returns validated metadata and logical/physical descriptors but
   // no payloads. Loading streams supported F32 and K-quant payloads directly to
   // Metal shared storage; quantized handles retain logical f32 metadata over
-  // packed u8 storage. The uninterruptible transfer section ensures every
-  // native wrapper is either cleared or published exactly once.
+  // packed u8 storage. Interrupted native loading and mapping failures clear
+  // unpublished wrappers; successful mapping transfers them to caller-owned
+  // concrete handles.
   const gguf: Runtime.GgufRuntime = {
     inspect: (path) =>
       cancellableFor("inspectGguf", "io", (token) => native.inspectGguf(path, token), undefined, "io-failed").pipe(
@@ -1566,49 +1638,47 @@ export const makeRuntime = (
         )
       ),
     load: (path) =>
-      Effect.uninterruptibleMask(() =>
-        Effect.interruptible(cancellableFor(
-          "loadGguf",
-          "io",
-          (token) => native.loadGguf(path, token),
-          (archive) => clearBuffers(archive.entries.map((entry) => entry.tensor)),
-          "io-failed"
-        )).pipe(
-          Effect.flatMap((archive) =>
-            Effect.try({
-              try: () => {
-                const values = archive.entries.map((entry) => entry.tensor)
-                try {
-                  if (new Set(values).size !== values.length) {
-                    throw new Error("native runtime returned duplicate tensor ownership")
-                  }
-                  const entries = archive.entries.map((entry) => {
-                    const descriptor = ggufDescriptor(entry.descriptor)
-                    const storage: Runtime.EncodedTensorStorage | undefined = descriptor.format === "F32"
-                      ? undefined
-                      : {
-                        encoding: descriptor.format,
-                        physicalShape: descriptor.physicalShape,
-                        physicalDtype: "u8"
-                      }
-                    return Object.freeze({
-                      descriptor,
-                      tensor: concreteHandle(entry.tensor, {
-                        shape: descriptor.logicalShape,
-                        dtype: "f32",
-                        ...(storage === undefined ? {} : { storage })
-                      })
+      cancellableFor(
+        "loadGguf",
+        "io",
+        (token) => native.loadGguf(path, token),
+        (archive) => clearBuffers(archive.entries.map((entry) => entry.tensor)),
+        "io-failed"
+      ).pipe(
+        Effect.flatMap((archive) =>
+          Effect.try({
+            try: () => {
+              const values = archive.entries.map((entry) => entry.tensor)
+              try {
+                if (new Set(values).size !== values.length) {
+                  throw new Error("native runtime returned duplicate tensor ownership")
+                }
+                const entries = archive.entries.map((entry) => {
+                  const descriptor = ggufDescriptor(entry.descriptor)
+                  const storage: Runtime.EncodedTensorStorage | undefined = descriptor.format === "F32"
+                    ? undefined
+                    : {
+                      encoding: descriptor.format,
+                      physicalShape: descriptor.physicalShape,
+                      physicalDtype: "u8"
+                    }
+                  return Object.freeze({
+                    descriptor,
+                    tensor: concreteHandle(entry.tensor, {
+                      shape: descriptor.logicalShape,
+                      dtype: "f32",
+                      ...(storage === undefined ? {} : { storage })
                     })
                   })
-                  return Object.freeze({ entries: Object.freeze(entries) })
-                } catch (error) {
-                  clearBuffers(values)
-                  throw error
-                }
-              },
-              catch: backendErrorFor("loadGguf", "io", "io-failed")
-            })
-          )
+                })
+                return Object.freeze({ entries: Object.freeze(entries) })
+              } catch (error) {
+                clearBuffers(values)
+                throw error
+              }
+            },
+            catch: backendErrorFor("loadGguf", "io", "io-failed")
+          })
         )
       )
   }
@@ -1675,41 +1745,12 @@ export const makeRuntime = (
         "execute",
         "execute",
         (token) => {
-          const executableRecord = nativeExecutable(handle, "execute")
-          if (Object.keys(invocation.runtimeValues).length !== 0) {
-            throw executionError(
-              "execute: runtime values are not supported by the Apple Metal backend",
-              "unsupported-operation"
-            )
-          }
-          const info = executableRecord.info as ExecutableInfo
-          if (invocation.bindings.length !== info.bindings.length) {
-            throw executionError(
-              `execute: received ${invocation.bindings.length} tensor bindings, expected ${info.bindings.length}`
-            )
-          }
-          const inputs = invocation.bindings.map((input, index) =>
-            nativeBinding(
-              input,
-              info.bindings[index]!,
-              index,
-              info.state !== undefined && invocation.state !== undefined && index === info.bindings.length - 1
-                ? { compiled: info.state.batch, active: invocation.state.sequences.length }
-                : undefined
-            )
-          )
-          if (info.state !== undefined && invocation.scalars.length !== 0) {
-            throw executionError("execute: stateful executable does not accept scalar inputs")
-          }
-          const [sequences, tokens] = resolveExecutionState(
-            info.state,
-            invocation.state
-          )
-          return (executableRecord.value as Executable).execute(
-            inputs,
-            [...invocation.scalars],
-            sequences,
-            tokens,
+          const resolved = resolveExecutableInvocation(handle, invocation)
+          return resolved.executable.execute(
+            resolved.inputs,
+            resolved.scalars,
+            resolved.sequences,
+            resolved.tokens,
             token
           )
         },
@@ -1736,15 +1777,30 @@ export const makeRuntime = (
         (token) => nativeTensor(handle, "readback", "readback").readback(token)
       ),
     // Deterministic release clears this concrete wrapper and marks its public
-    // handle invalid. Native aliases, executable constants, in-flight work, or
-    // exported readback buffers may still retain the underlying allocation.
+    // handle invalid for other operations. Releasing it again is a no-op. Native
+    // aliases, executable constants, in-flight work, or exported readback
+    // buffers may still retain the underlying allocation.
     release: (handle) =>
       Effect.try({
         try: () => {
-          const tensor = tensorRecord(handle, "clear", "execute")
+          const tensor = typeof handle === "object" && handle !== null ? handleRecords.get(handle) : undefined
+          if (tensor === undefined) {
+            throw invalidHandle(
+              "clear",
+              "execute",
+              typeof handle === "object" && handle !== null && backendHandles.has(handle)
+                ? "foreign-handle"
+                : "invalid-handle",
+              "concrete-tensor"
+            )
+          }
+          if (tensor.owner !== owner) {
+            throw invalidHandle("clear", "execute", "foreign-handle", "concrete-tensor")
+          }
           if (tensor.kind !== "concrete-tensor" || tensor.value === undefined) {
             throw invalidHandle("clear", "execute", "invalid-handle", "concrete-tensor")
           }
+          if (tensor.disposed) return
           const value = tensor.value as NativeTensor
           value.clear()
           tensor.disposed = true
@@ -1754,6 +1810,7 @@ export const makeRuntime = (
     extensions: {
       pathSafetensors,
       gguf,
+      sampling,
       decode,
       diagnostics: {
         // This is current native memory attributed to live NativeTensor wrappers,

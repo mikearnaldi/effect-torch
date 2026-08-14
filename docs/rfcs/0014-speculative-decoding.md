@@ -63,19 +63,28 @@ decides the ceiling; the engine is proposer-agnostic.
 
 ### Native seeded sampling
 
-`Tensor.sample(logits, { temperature, topP?, seed })`:
+`Tensor.sample(logits, { temperature, topK?, topP?, seed, counter? })`:
 
 - `temperature: 0` — argmax (the greedy path; exact-token speculative
   verification compares these).
-- `temperature > 0` — categorical via gumbel-max over
-  `logits / temperature` (no sort needed; top-p applies a small-vocab
-  partial sort when set).
-- Seeded SplitMix64 in Rust: one stream per generation sequence
-  (seeded at sequence creation from a config seed), so sampling is
-  deterministic across runs and — critically for speculative sampling
-  — draft and target can be driven by *independent but reproducible*
-  streams. Logits stay on device through softmax/argmax; only the
-  winning id crosses to the host per sampled token.
+- `temperature > 0` — numerically stable categorical sampling;
+  top-k is applied before the smallest top-p prefix containing the
+  crossing token.
+- Seeded SplitMix64 in Rust keys each stateless draw by
+  `(seed, counter)`, so retries and concurrent generations share no
+  hidden mutable RNG and draft/target streams can remain independent
+  but reproducible.
+- The direct runtime extension borrows native logits storage. CPU scans
+  its tensor buffer directly; Metal samples with GPU kernels and returns
+  only the winning id across N-API. Positive-temperature Metal top-p
+  filtering requires top-k in `1..=64`; greedy and unfiltered categorical
+  draws scan the complete vocabulary.
+- Metal generation additionally exposes sampled `add`/`step` operations.
+  Decode, bounded top-k/top-p selection, the final fence, and transactional
+  state publication share one explicit submission, so no logits tensor is
+  published and no second host synchronization is introduced. Existing
+  logits-returning generation operations remain available for custom host
+  samplers and other consumers.
 
 ### Sequence truncation (`Sequence.truncate(position)`)
 

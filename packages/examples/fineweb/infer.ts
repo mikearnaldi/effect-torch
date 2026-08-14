@@ -37,10 +37,8 @@ const program = Effect.scoped(Effect.gen(function*() {
   const eotId = Option.getOrThrow(tokenizer.tokenToId(EOT))
   const model = yield* createGpt(tokenizer.vocabSize)
   yield* Effect.log(`fineweb-infer: loading checkpoint ${CHECKPOINT}`)
-  const params = yield* Effect.acquireRelease(
-    loadParams(model, CHECKPOINT),
-    (params) => Effect.ignore(Tensor.clearAll(params))
-  )
+  const params = yield* loadParams(model, CHECKPOINT)
+  yield* Tensor.clearAllScoped(params)
 
   const inference = yield* Model.inference(model, params, {
     maxTokens: 8192,

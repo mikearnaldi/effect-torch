@@ -45,7 +45,9 @@ use effect_torch_compiler::{
 use effect_torch_graph::CrossEntropyReduction as CeReduction;
 use effect_torch_graph::{AttentionWindow, Device, PositionOffset, RotaryLayout};
 use effect_torch_napi::{try_register_export, unregister_export, vec_to_bytes, CancellationState};
-use effect_torch_runtime::{Buffer, CancellationFlag, DType, GgmlKQuant, Layout};
+use effect_torch_runtime::{
+    sample_logits, Buffer, CancellationFlag, DType, GgmlKQuant, Layout, SamplingOptions,
+};
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -501,6 +503,101 @@ impl NativeTensor {
         })
         .await
     }
+
+    #[napi]
+    #[allow(clippy::too_many_arguments)]
+    pub async fn sample(
+        &self,
+        temperature: f64,
+        top_k: f64,
+        top_p: f64,
+        seed: f64,
+        counter: f64,
+        cancellation_token: Option<&CancellationToken>,
+    ) -> Result<u32> {
+        fn safe_u64(value: f64, name: &str) -> Result<u64> {
+            const MAX_SAFE_INTEGER: f64 = 9_007_199_254_740_991.0;
+            if !value.is_finite() || value < 0.0 || value.fract() != 0.0 || value > MAX_SAFE_INTEGER
+            {
+                return Err(Error::new(
+                    Status::InvalidArg,
+                    format!("sample: {name} must be a non-negative safe integer, got {value}"),
+                ));
+            }
+            Ok(value as u64)
+        }
+
+        let value = self.value_cloned()?;
+        let top_k = safe_u64(top_k, "topK")?;
+        let options = SamplingOptions {
+            temperature,
+            top_k: if top_k == 0 {
+                None
+            } else {
+                Some(top_k as usize)
+            },
+            top_p,
+            seed: safe_u64(seed, "seed")?,
+            counter: safe_u64(counter, "counter")?,
+        };
+        run_compute(cancellation_token, move |cancelled, _state| {
+            sample_blocking(&value, options, || cancelled.is_cancelled())
+        })
+        .await
+    }
+}
+
+fn sample_blocking(
+    value: &Value,
+    options: SamplingOptions,
+    cancelled: impl FnMut() -> bool,
+) -> Result<u32> {
+    let tensor = value.tensor();
+    if tensor.layout.rank() != 1 {
+        return Err(Error::new(
+            Status::InvalidArg,
+            format!(
+                "sample: logits must be rank 1, got rank {}",
+                tensor.layout.rank()
+            ),
+        ));
+    }
+    let length = tensor.numel();
+    let offset = tensor.layout.offset();
+    let stride = tensor.layout.strides()[0];
+    macro_rules! sample {
+        ($values:expr) => {
+            sample_logits(
+                length,
+                |index| $values[offset + index * stride].to_f64(),
+                options,
+                cancelled,
+            )
+        };
+    }
+    let result = match &tensor.buffer {
+        CpuBuffer::F16(values) => sample!(values),
+        CpuBuffer::BF16(values) => sample!(values),
+        CpuBuffer::F32(values) => sample!(values),
+        CpuBuffer::F64(values) => sample!(values),
+        _ => {
+            return Err(Error::new(
+                Status::InvalidArg,
+                format!(
+                    "sample: logits must have a floating-point dtype, got {}",
+                    tensor.dtype()
+                ),
+            ))
+        }
+    };
+    result.map_err(|message| {
+        let status = if message == "operation aborted" {
+            Status::Cancelled
+        } else {
+            Status::InvalidArg
+        };
+        Error::new(status, message)
+    })
 }
 
 fn readback_blocking(value: &Value) -> Result<Readback> {
@@ -4257,6 +4354,62 @@ mod tests {
 
     fn leaf(tensor: Tensor) -> Arc<Node> {
         Node::new(NodeKind::Leaf(Arc::new(LeafSlot::new(Value(tensor))))).unwrap()
+    }
+
+    fn sampling_options() -> SamplingOptions {
+        SamplingOptions {
+            temperature: 0.0,
+            top_k: None,
+            top_p: 1.0,
+            seed: 7,
+            counter: 3,
+        }
+    }
+
+    fn assert_strided_float_sampling<T: Elem>() {
+        let tensor = Tensor::from_vec(
+            [99.0, 1.0, 99.0, 5.0, 99.0, 3.0]
+                .into_iter()
+                .map(T::from_f64)
+                .collect(),
+            vec![6],
+        )
+        .view(Layout::new(vec![3], vec![2], 1));
+        assert_eq!(
+            sample_blocking(&Value(tensor), sampling_options(), || false).unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn sampling_borrows_strided_float_logits() {
+        assert_strided_float_sampling::<half::f16>();
+        assert_strided_float_sampling::<half::bf16>();
+        assert_strided_float_sampling::<f32>();
+        assert_strided_float_sampling::<f64>();
+    }
+
+    #[test]
+    fn sampling_rejects_invalid_tensor_inputs_and_reports_cancellation() {
+        let integer = Value(Tensor::from_vec(vec![1u32, 2, 3], vec![3]));
+        let error = sample_blocking(&integer, sampling_options(), || false).unwrap_err();
+        assert_eq!(error.status, Status::InvalidArg);
+        assert!(error.reason.contains("floating-point dtype"));
+
+        let matrix = Value(Tensor::from_vec(vec![1.0f32, 2.0], vec![1, 2]));
+        let error = sample_blocking(&matrix, sampling_options(), || false).unwrap_err();
+        assert_eq!(error.status, Status::InvalidArg);
+        assert!(error.reason.contains("rank 1"));
+
+        let empty = Value(Tensor::from_vec(Vec::<f32>::new(), vec![0]));
+        let error = sample_blocking(&empty, sampling_options(), || false).unwrap_err();
+        assert_eq!(error.status, Status::InvalidArg);
+        assert!(error.reason.contains("non-empty"));
+
+        let logits = Value(Tensor::from_vec(vec![1.0f32, 2.0], vec![2]));
+        let error = sample_blocking(&logits, sampling_options(), || true).unwrap_err();
+        assert_eq!(error.status, Status::Cancelled);
+        assert_eq!(error.reason, "operation aborted");
     }
 
     #[test]

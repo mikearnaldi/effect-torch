@@ -6,10 +6,13 @@
  * {@link ChatTokenizer}, and a decode-specialized {@link Model.InferenceProgram}.
  * {@link stream} renders messages once, encodes the complete prompt with
  * tokenizer-added special tokens disabled, prefills one generation sequence,
- * then repeatedly reads one logits row, selects a token synchronously, parses
- * it into {@link ChatEvent}s, and steps the sequence. It does not own a template
- * language, tokenizer vocabulary, conversation history store, tool executor,
- * or general sampling policy.
+ * then repeatedly samples and parses one token into {@link ChatEvent}s before
+ * stepping the sequence. On supported Metal runtimes, standard temperature,
+ * top-k, and top-p sampling is fused with decode and publishes no logits.
+ * Other runtimes use standalone native sampling, or host-greedy sampling when
+ * that extension is absent; a custom host callback always reads logits back.
+ * Chat does not own a template language, tokenizer vocabulary, conversation
+ * history store, or tool executor.
  *
  * Structured parsing targets start/header/message/end control-token formats.
  * Parser delimiters and tokenizer-derived default stops must be atomic tokens
@@ -24,16 +27,16 @@
  *
  * The returned stream acquires one ordinary {@link Model.Generation} session
  * and attempts to close all of its live sequence state on normal completion,
- * failure, or interruption. Generated logits are internal tensors rather than event
- * payloads. `done` is emitted only for normal stop-token or `maxTokens`
- * termination; failure, interruption, or downstream cancellation may end the
- * stream without `end` or `done` events.
+ * failure, or interruption. When the fallback path produces logits, they remain
+ * internal tensors rather than event payloads. `done` is emitted only for normal
+ * stop-token or `maxTokens` termination; failure, interruption, or downstream
+ * cancellation may end the stream without `end` or `done` events.
  *
  * @since 0.1.0
  */
 import { Data, Effect, Option, Stream } from "effect"
 import type * as Model from "./Model.ts"
-import type * as Runtime from "./Runtime.ts"
+import * as Runtime from "./Runtime.ts"
 import * as Tensor from "./Tensor.ts"
 
 /**
@@ -116,17 +119,38 @@ export interface ChatTokenizer<E = never> {
 }
 
 /**
- * Synchronously selects one vocabulary index from a host logits row. The array
- * is raw model output, not probabilities; its concrete typed-array class follows
- * the logits tensor dtype/readback rules. Return a non-negative safe integer
- * less than `logits.length`. Thrown exceptions become `ChatError("sample")`.
- * The default is {@link greedy}; temperature, penalties, top-k/top-p filtering,
- * randomness, and sampler state are application concerns.
+ * Custom host-side vocabulary selector. Supplying one requires full logits
+ * readback; prefer {@link ChatSamplingOptions} for native temperature, top-k,
+ * and top-p sampling. Return a non-negative safe integer less than
+ * `logits.length`. Thrown exceptions become `ChatError("sample")`.
  *
  * @since 0.1.0
  * @category models
  */
 export type ChatSampler = (logits: Tensor.TypedArray) => number
+
+/**
+ * Standard next-token sampling controls. Temperature defaults to `0` (greedy),
+ * `topK` to `0` (disabled), and `topP` to `1` (disabled). A missing seed is
+ * generated once per stream; each successful draw advances a stream-local
+ * counter, so no process-global sampler state is shared. Supported Metal
+ * generation artifacts fuse these controls with prefill/decode; otherwise chat
+ * samples the standalone logits tensor natively. Metal requires `topK` in
+ * `1..=64` for positive-temperature `topP` filtering and rejects positive-
+ * temperature `topK > 64`.
+ *
+ * @since 0.1.0
+ * @category models
+ */
+export interface ChatSamplingOptions {
+  readonly temperature?: number | undefined
+  readonly topK?: number | undefined
+  readonly topP?: number | undefined
+  readonly seed?: number | undefined
+}
+
+/** Standard sampling controls or a custom host-side logits callback. */
+export type ChatSampling = ChatSamplingOptions | ChatSampler
 
 /**
  * Greedy argmax sampling. Ties select the lowest index. Values are compared as
@@ -243,7 +267,8 @@ export interface CompletedChatSegment extends ChatSegment {
  * Durations are coarse elapsed times and are not monotonic device-kernel
  * profiling. Prompt rendering/encoding and control validation happen before
  * `prefillMs`; `decodeMs` starts after prefill and includes event consumption
- * backpressure, readback, sampling, tokenizer decoding, and decode steps.
+ * backpressure, native sampling or custom-sampler readback, tokenizer decoding,
+ * and decode steps.
  *
  * @since 0.1.0
  * @category models
@@ -253,7 +278,7 @@ export interface ChatStats {
   readonly promptTokens: number
   /** Sampled non-stop ids, including parser controls and ignored/header ids. */
   readonly generatedTokens: number
-  /** Elapsed milliseconds for prompt tensor construction plus `Generation.add`. */
+  /** Elapsed milliseconds for prompt construction plus fused or logits-returning generation add. */
   readonly prefillMs: number
   /** Elapsed milliseconds from completed prefill until normal termination. */
   readonly decodeMs: number
@@ -292,9 +317,9 @@ export interface ChatResult {
  * header tokens generally emit no event. `delta.text` is a decoded string
  * suffix, not necessarily one token or one Unicode code point. A sampled stop
  * id is offered to the parser before stopping, is excluded from
- * `generatedTokens`, and is never passed to `Generation.step`. At `maxTokens`,
+ * `generatedTokens`, and is never passed to a generation step. At `maxTokens`,
  * the final sampled non-stop token is parsed and counted but likewise is not
- * stepped because no subsequent logits are needed.
+ * stepped because no subsequent token or logits are needed.
  *
  * Stream failure, interruption, or downstream cancellation performs scoped
  * cleanup but emits no synthetic `end` or `done` event.
@@ -362,8 +387,15 @@ export interface ChatStreamOptions<E = never> {
    * is no implicit safety limit.
    */
   readonly maxTokens?: number | undefined
-  /** Synchronous next-token selector; defaults to {@link greedy}. */
-  readonly sample?: ChatSampler | undefined
+  /**
+   * Standard sampling controls or a custom host-side selector. On supported
+   * Metal artifacts an options object, including the default options, fuses
+   * sampling with generation and publishes no logits. Other runtimes sample a
+   * standalone logits tensor natively. A function always reads back the complete
+   * logits row, and omitted greedy sampling falls back to the host only when the
+   * runtime has no native sampling extension.
+   */
+  readonly sampling?: ChatSampling | undefined
   /**
    * Partial override of the default segmented control strings, or `false` for
    * one unsegmented assistant response. In segmented mode the structural
@@ -528,19 +560,24 @@ const makeParser = <E>(
  * uses `addSpecialTokens: false`; templates are therefore responsible for all
  * model-required BOS/EOS/control text.
  *
- * Sampling reads the complete chat-owned logits tensor to a host typed array
- * and clears that tensor even if readback fails or is interrupted. A valid
- * non-stop token is parsed before being committed with `Generation.step`; the
- * final stop/limit token is parsed but not stepped because its successor logits
- * are not needed. Stop ids are protocol delimiters, not output filtering: a
- * custom stop id that decodes as text can emit a final delta before termination.
+ * On supported Metal generation artifacts, standard sampling is fused with
+ * prefill/decode and returns only token ids without allocating output logits.
+ * Otherwise standard sampling borrows the chat-owned logits tensor natively,
+ * with host-greedy fallback when native sampling is unavailable. A custom
+ * `sampling` callback always reads the complete row to a host typed array. A
+ * legacy-path tensor is cleared if sampling, readback, or the callback fails or
+ * is interrupted. A valid non-stop token is parsed before being committed with
+ * a generation step; the final stop/limit token is parsed but not stepped because
+ * its successor is not needed. Stop ids are protocol delimiters, not output
+ * filtering: a custom stop id that decodes as text can emit a final delta before
+ * termination.
  *
- * The stream is scoped. Its generation session is closed on normal completion,
- * tokenizer/parser/model failure, interruption, or downstream cancellation.
- * Cleanup errors are ignored so they do not replace the primary exit. A logits
- * row is cleared after readback; each row also has a scoped fallback finalizer,
- * so an unread pagination row is released on downstream cancellation. Normal
- * termination emits `done`; other exits do not synthesize terminal events.
+ * Its generation session is closed on normal completion, tokenizer/parser/model
+ * failure, interruption, or downstream cancellation. Cleanup errors are ignored
+ * so they do not replace the primary exit. In the non-fused path, a logits row
+ * is cleared after its token is selected; the stream retains only the current
+ * unread row and releases it on downstream cancellation. Normal termination
+ * emits `done`; other exits do not synthesize terminal events.
  *
  * Validation is intentionally narrow: the template and messages must be
  * nonempty, `maxTokens` must be a positive safe integer, parser controls,
@@ -560,7 +597,7 @@ export const stream = <E = never>(
   ChatError | E | Model.InferenceError | Model.ModelError | Tensor.TensorError,
   Runtime.Runtime
 > =>
-  Stream.scoped(Stream.unwrap(Effect.gen(function*() {
+  Stream.unwrap(Effect.gen(function*() {
     if (options.template.length === 0) {
       return yield* fail("template", "chat template must be non-empty")
     }
@@ -572,6 +609,31 @@ export const stream = <E = never>(
       (!Number.isSafeInteger(options.maxTokens) || options.maxTokens <= 0)
     ) {
       return yield* fail("validate", `maxTokens must be a positive integer, got ${options.maxTokens}`)
+    }
+    const customSampler = typeof options.sampling === "function" ? options.sampling : undefined
+    const samplingOptions = typeof options.sampling === "object" ? options.sampling : undefined
+    const sampling = {
+      temperature: samplingOptions?.temperature ?? 0,
+      topK: samplingOptions?.topK ?? 0,
+      topP: samplingOptions?.topP ?? 1,
+      seed: samplingOptions?.seed ?? Math.floor(Math.random() * 0x1_0000_0000)
+    }
+    if (!Number.isFinite(sampling.temperature) || sampling.temperature < 0) {
+      return yield* fail("validate", `temperature must be finite and non-negative, got ${sampling.temperature}`)
+    }
+    if (!Number.isSafeInteger(sampling.topK) || sampling.topK < 0) {
+      return yield* fail("validate", `topK must be a non-negative integer, got ${sampling.topK}`)
+    }
+    if (!Number.isFinite(sampling.topP) || sampling.topP <= 0 || sampling.topP > 1) {
+      return yield* fail("validate", `topP must be finite and in (0, 1], got ${sampling.topP}`)
+    }
+    if (!Number.isSafeInteger(sampling.seed) || sampling.seed < 0) {
+      return yield* fail("validate", `seed must be a non-negative safe integer, got ${sampling.seed}`)
+    }
+    const runtime = yield* Runtime.Runtime
+    const nativeSampling = runtime.extensions.sampling !== undefined
+    if (samplingOptions !== undefined && !nativeSampling) {
+      return yield* fail("validate", `backend ${runtime.backend.name} does not provide native sampling`)
     }
     const tokenizer = options.tokenizer
     const controls = options.controls === false
@@ -612,23 +674,36 @@ export const stream = <E = never>(
       (generation) => Effect.ignore(generation.close()),
       { interruptible: true }
     )
-    const ownedLogits = new Set<Tensor.Concrete>()
-    const releaseLogits = (logits: Tensor.Concrete) =>
-      !ownedLogits.has(logits)
-        ? Effect.void
-        : Tensor.clear(logits).pipe(
-          Effect.tap(() => Effect.sync(() => ownedLogits.delete(logits))),
-          Effect.ignore
-        )
-    yield* Effect.addFinalizer(() => Effect.ignore(Tensor.clearAll(ownedLogits)))
+    type RunState =
+      | { readonly _tag: "fused"; readonly token: number; readonly step: number }
+      | { readonly _tag: "legacy"; readonly logits: Tensor.Concrete; readonly step: number }
+
+    const sampledGeneration = customSampler === undefined ? generation.sampled : undefined
     const prefillStarted = Date.now()
     const prompt = yield* Tensor.fromTypedArray(encoded.data, [1, encoded.data.length])
-    const entry = yield* Effect.uninterruptibleMask((restore) =>
-      Effect.tap(
-        restore(generation.add(prompt)),
-        (entry) => Effect.sync(() => ownedLogits.add(entry.logits))
+    let sampleCounter = 0
+    let seq: Model.GenerationSeq
+    let initialRun: RunState
+    let currentLogits: Tensor.Concrete | undefined
+    if (sampledGeneration === undefined) {
+      const entry = yield* generation.add(prompt)
+      seq = entry.seq
+      currentLogits = entry.logits
+      initialRun = { _tag: "legacy", logits: entry.logits, step: 0 }
+    } else {
+      const entry = yield* sampledGeneration.add(prompt, { ...sampling, counter: 0 })
+      sampleCounter++
+      seq = entry.seq
+      initialRun = { _tag: "fused", token: entry.token, step: 0 }
+    }
+    const releaseLogits = (logits: Tensor.Concrete) =>
+      Tensor.clear(logits).pipe(
+        Effect.tap(() =>
+          Effect.sync(() => {
+            if (currentLogits === logits) currentLogits = undefined
+          })
+        )
       )
-    )
     const prefillMs = Date.now() - prefillStarted
     const parser = makeParser(
       tokenizer,
@@ -639,12 +714,10 @@ export const stream = <E = never>(
     const decodeStarted = Date.now()
     let generatedTokens = 0
 
-    type State =
-      | { readonly _tag: "prefill" }
-      | { readonly _tag: "run"; readonly logits: Tensor.Concrete; readonly step: number }
+    type State = { readonly _tag: "prefill" } | RunState
 
-    // The current logits ownership travels in pagination state. Each run page
-    // reads and clears it before either terminating or installing the next one.
+    // Fused pages carry only sampled ids. Legacy pages carry the current logits
+    // ownership and clear it before terminating or installing the next row.
     return Stream.paginate(
       { _tag: "prefill" } satisfies State as State,
       (state): Effect.Effect<
@@ -655,23 +728,35 @@ export const stream = <E = never>(
         if (state._tag === "prefill") {
           return Effect.succeed([
             [{ _tag: "prefill", tokens: encoded.data.length, durationMs: prefillMs }] satisfies Array<ChatEvent>,
-            Option.some({ _tag: "run", logits: entry.logits, step: 0 } satisfies State)
+            Option.some(initialRun)
           ])
         }
         return Effect.gen(function*() {
-          const logits = state.logits
-          const values = yield* Tensor.toTypedArray(logits).pipe(
-            Effect.ensuring(releaseLogits(logits))
-          )
-          if (values.length === 0) {
-            return yield* fail("sample", "model produced an empty logits row")
-          }
-          const token = yield* Effect.try({
-            try: () => (options.sample ?? greedy)(values),
-            catch: (error) => fail("sample", error instanceof Error ? error.message : String(error))
-          })
-          if (!Number.isSafeInteger(token) || token < 0 || token >= values.length) {
-            return yield* fail("sample", `sampler returned invalid token ${token} for ${values.length} logits`)
+          let token: number
+          if (state._tag === "fused") {
+            token = state.token
+          } else {
+            const logits = state.logits
+            token = yield* Effect.ensuring(
+              customSampler === undefined && nativeSampling
+                ? Tensor.sample(logits, { ...sampling, counter: sampleCounter }).pipe(
+                  Effect.tap(() => Effect.sync(() => sampleCounter++))
+                )
+                : Effect.gen(function*() {
+                  const values = yield* Tensor.toTypedArray(logits)
+                  if (values.length === 0) {
+                    return yield* fail("sample", "model produced an empty logits row")
+                  }
+                  return yield* Effect.try({
+                    try: () => (customSampler ?? greedy)(values),
+                    catch: (error) => fail("sample", error instanceof Error ? error.message : String(error))
+                  })
+                }),
+              releaseLogits(logits)
+            )
+            if (!Number.isSafeInteger(token) || token < 0 || token >= logits.shape[0]) {
+              return yield* fail("sample", `sampler returned invalid token ${token} for ${logits.shape[0]} logits`)
+            }
           }
           const events = yield* parser.accept(token)
           const stopped = stopTokens.has(token)
@@ -701,17 +786,33 @@ export const stream = <E = never>(
             events.push({ _tag: "done", result })
             return [events, Option.none<State>()]
           }
-          const [next] = yield* Effect.uninterruptibleMask((restore) =>
-            Effect.tap(
-              restore(generation.step([{ seq: entry.seq, token }])),
-              (outputs) => Effect.sync(() => outputs.forEach((output) => ownedLogits.add(output)))
-            )
-          )
+          if (state._tag === "fused") {
+            if (sampledGeneration === undefined) {
+              return yield* fail("sample", "fused generation capability became unavailable")
+            }
+            const [next] = yield* sampledGeneration.step([{
+              seq,
+              token,
+              sampling: { ...sampling, counter: sampleCounter }
+            }])
+            if (next === undefined) {
+              return yield* fail("sample", "fused generation returned no sampled token")
+            }
+            sampleCounter++
+            return [
+              events,
+              Option.some({ _tag: "fused", token: next, step: state.step + 1 } satisfies State)
+            ]
+          }
+          const [next] = yield* generation.step([{ seq, token }])
+          currentLogits = next
           return [
             events,
-            Option.some({ _tag: "run", logits: next, step: state.step + 1 } satisfies State)
+            Option.some({ _tag: "legacy", logits: next, step: state.step + 1 } satisfies State)
           ]
         })
       }
+    ).pipe(
+      Stream.ensuring(Effect.suspend(() => currentLogits === undefined ? Effect.void : releaseLogits(currentLogits)))
     )
-  })))
+  }))

@@ -40,10 +40,8 @@ const program = Effect.scoped(Effect.gen(function*() {
   const tokenizer = yield* loadTokenizer
   const eotId = Option.getOrThrow(tokenizer.tokenToId(EOT))
   const model = yield* createKdaGpt(tokenizer.vocabSize)
-  const params = yield* Effect.acquireRelease(
-    loadParams(model, CHECKPOINT),
-    (params) => Effect.ignore(Tensor.clearAll(params))
-  )
+  const params = yield* loadParams(model, CHECKPOINT)
+  yield* Tensor.clearAllScoped(params)
 
   const inference = yield* Model.inference(model, params, {
     maxTokens: 8192,

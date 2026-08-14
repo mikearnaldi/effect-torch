@@ -356,7 +356,7 @@ const uncompiledStep = <S, EL, RL, ED, RD, EO, RO>(
   Runtime.Runtime | RL
 > =>
   Effect.suspend(() => {
-    let owned: ReadonlyArray<Tensor.Concrete> = []
+    const owned: Array<Tensor.Concrete> = []
     return Effect.onExit(
       Effect.gen(function*() {
         const forwardParams = config.precision === "mixedBf16"
@@ -365,31 +365,19 @@ const uncompiledStep = <S, EL, RL, ED, RD, EO, RO>(
         const prediction = yield* model.forward(forwardParams, data.input)
         const lossTensor = yield* config.loss(prediction, data.target)
         const lr = yield* Tensor.constantLike(params[0], config.lr(step - 1))
-        const result = yield* Effect.uninterruptibleMask((restore) =>
-          Effect.tap(restore(Optimizer.step(config.optimizer, lossTensor, params, state, lr)), (result) =>
-            Effect.sync(() => {
-              const transferred = [
-                ...result.params,
-                ...config.optimizer.stateRoots(result.state).filter(Tensor.isTensor)
-              ]
-              owned = Array.from(new Set([result.loss, ...transferred]))
-            }))
+        const result = yield* Optimizer.step(config.optimizer, lossTensor, params, state, lr)
+        owned.push(
+          result.loss,
+          ...result.params,
+          ...config.optimizer.stateRoots(result.state).filter(Tensor.isTensor)
         )
         const loss = (yield* Tensor.toNumberArray(result.loss))[0]
-        yield* Effect.uninterruptible(
-          Tensor.clear(result.loss).pipe(
-            Effect.tap(() =>
-              Effect.sync(() =>
-                void (owned = owned.filter((tensor) => tensor !== result.loss))
-              )
-            )
-          )
-        )
+        yield* Tensor.clear(result.loss)
         return { loss, params: result.params, state: result.state }
       }),
       (exit) =>
         Exit.isFailure(exit)
-          ? Effect.ignore(Tensor.clearAll(owned))
+          ? Tensor.clearAll(owned)
           : Effect.void
     )
   })
@@ -467,28 +455,20 @@ const compiledStep = <S, EL, RL, ED, RD, EO, RO>(
       Tensor.signatureOf(inputs, runtime),
       () => traceStep(model, config, params, stateRoots, state, data)
     )
-    let owned: ReadonlyArray<Tensor.Concrete> = []
+    const owned: Array<Tensor.Concrete> = []
     return yield* Effect.onExit(
       Effect.gen(function*() {
-        const outputs = yield* Effect.uninterruptibleMask((restore) =>
-          Effect.tap(
-            restore(Tensor.runProgram(program, inputs, [config.lr(step - 1)])),
-            (values) => Effect.sync(() => void (owned = values))
-          )
-        )
+        const outputs = yield* Tensor.runProgram(program, inputs, [config.lr(step - 1)])
+        owned.push(...outputs)
         const loss = (yield* Tensor.toNumberArray(outputs[0]))[0]
         const trained = outputs.slice(1, 1 + params.length)
         const nextState = optimizer.rebuildState(state, outputs.slice(1 + params.length))
-        yield* Effect.uninterruptible(
-          Tensor.clear(outputs[0]).pipe(
-            Effect.tap(() => Effect.sync(() => void (owned = owned.filter((tensor) => tensor !== outputs[0]))))
-          )
-        )
+        yield* Tensor.clear(outputs[0])
         return { loss, params: trained, state: nextState }
       }),
       (exit) =>
         Exit.isFailure(exit)
-          ? Effect.ignore(Tensor.clearAll(owned))
+          ? Tensor.clearAll(owned)
           : Effect.void
     )
   })
@@ -497,9 +477,9 @@ const compiledStep = <S, EL, RL, ED, RD, EO, RO>(
 // `model.init` when omitted), then step until `stop` says otherwise (at
 // least one step always runs), calling `onStep` after every step.
 // Without a cache each step builds and evaluates the full step graph;
-// with one each step is a single frozen-program call. An ownership ledger
-// retains the current generated roots across callbacks and releases them on
-// replacement or unsuccessful exit.
+// with one each step is a single frozen-program call. The current generation
+// is released on replacement and retained for failure cleanup until ownership
+// transfers to the next generation.
 const trainLoop = <S, EL = never, RL = never, ED = never, RD = never, EO = never, RO = never>(
   model: Model.Model,
   config: TrainConfig<S, EL, RL, ED, RD, EO, RO>,
@@ -513,19 +493,15 @@ const trainLoop = <S, EL = never, RL = never, ED = never, RD = never, EO = never
 > =>
   Effect.suspend(() => {
     let owned: ReadonlyArray<Tensor.Concrete> = []
-    const releaseOwned = (tensors: ReadonlyArray<Tensor.Concrete>) => Tensor.clearAll(new Set(tensors))
+    const releaseOwned = (tensors: ReadonlyArray<Tensor.Concrete>) => Tensor.clearAll(tensors)
     return Effect.onExit(
       Effect.gen(function*() {
         let params: Model.Params
         if (initial !== undefined) {
           params = initial
         } else {
-          params = yield* Effect.uninterruptibleMask((restore) =>
-            Effect.tap(
-              restore(model.init),
-              (params) => Effect.sync(() => void (owned = params.filter(Tensor.isTensor)))
-            )
-          )
+          params = yield* model.init
+          owned = params.filter(Tensor.isTensor)
         }
         const runtime = yield* Runtime.Runtime
         if (config.precision === "mixedBf16" && !runtime.capabilities.features.includes("mixed-bf16")) {
@@ -535,18 +511,20 @@ const trainLoop = <S, EL = never, RL = never, ED = never, RD = never, EO = never
               `mixedBf16 precision is not supported by ${runtime.backend.name} on ${runtime.placement.description}`
           })
         }
-        let state = resume !== undefined
-          ? resume.state
-          : yield* Effect.uninterruptibleMask((restore) =>
-            Effect.tap(restore(config.optimizer.init(params)), (state) =>
-              Effect.sync(() => {
-                const roots = config.optimizer.stateRoots(state).filter(Tensor.isTensor)
-                const callerOwnedParams = initial === undefined
-                  ? new Set<Tensor.Concrete>()
-                  : new Set(params.filter(Tensor.isTensor))
-                owned = Array.from(new Set([...owned, ...roots.filter((root) => !callerOwnedParams.has(root))]))
-              }))
-          )
+        let state: S
+        if (resume !== undefined) {
+          state = resume.state
+        } else {
+          state = yield* config.optimizer.init(params)
+          const roots = config.optimizer.stateRoots(state).filter(Tensor.isTensor)
+          const callerOwnedParams = initial === undefined
+            ? undefined
+            : new Set(params.filter(Tensor.isTensor))
+          const stateOwned = callerOwnedParams === undefined
+            ? roots
+            : roots.filter((root) => !callerOwnedParams.has(root))
+          owned = [...owned, ...stateOwned]
+        }
         let step = resume?.step ?? 0
         let loss = Number.NaN
         let trained: ReadonlyArray<Tensor.Concrete>
@@ -557,17 +535,12 @@ const trainLoop = <S, EL = never, RL = never, ED = never, RD = never, EO = never
           // once up front; every later step returns materialized values.
           const roots = [...params, ...config.optimizer.stateRoots(state)]
           const previousOwned = owned
-          const materialized = yield* Effect.uninterruptibleMask((restore) =>
-            Effect.tap(
-              restore(Tensor.compute(roots)),
-              (values) => Effect.sync(() => void (owned = [...previousOwned, ...values]))
-            )
-          )
+          const materialized = yield* Tensor.compute(roots)
+          owned = [...previousOwned, ...materialized]
           params = materialized.slice(0, params.length)
           state = config.optimizer.rebuildState(state, materialized.slice(params.length))
-          yield* Effect.uninterruptible(
-            releaseOwned(previousOwned).pipe(Effect.tap(() => Effect.sync(() => void (owned = materialized))))
-          )
+          yield* releaseOwned(previousOwned)
+          owned = materialized
         }
         do {
           step++
@@ -575,27 +548,16 @@ const trainLoop = <S, EL = never, RL = never, ED = never, RD = never, EO = never
             ? yield* config.data(step)
             : config.data
           const previousOwned = owned
-          let nextOwned: ReadonlyArray<Tensor.Concrete> = []
-          const result = yield* Effect.uninterruptibleMask((restore) =>
-            Effect.tap(
-              restore(
-                cache !== undefined
-                  ? compiledStep(model, config, cache, params, state, data, step)
-                  : uncompiledStep(model, config, params, state, data, step)
-              ),
-              (result) =>
-                Effect.sync(() => {
-                  nextOwned = [
-                    ...result.params,
-                    ...config.optimizer.stateRoots(result.state).filter(Tensor.isTensor)
-                  ]
-                  owned = [...previousOwned, ...nextOwned]
-                })
-            )
-          )
-          yield* Effect.uninterruptible(
-            releaseOwned(previousOwned).pipe(Effect.tap(() => Effect.sync(() => void (owned = nextOwned))))
-          )
+          const result = yield* (cache !== undefined
+            ? compiledStep(model, config, cache, params, state, data, step)
+            : uncompiledStep(model, config, params, state, data, step))
+          const nextOwned = [
+            ...result.params,
+            ...config.optimizer.stateRoots(result.state).filter(Tensor.isTensor)
+          ]
+          owned = [...previousOwned, ...nextOwned]
+          yield* releaseOwned(previousOwned)
+          owned = nextOwned
           loss = result.loss
           trained = result.params
           params = result.params
@@ -612,6 +574,6 @@ const trainLoop = <S, EL = never, RL = never, ED = never, RD = never, EO = never
         } while (true)
         return { params: trained, state, loss, step }
       }),
-      (exit) => Exit.isFailure(exit) ? Effect.ignore(releaseOwned(owned)) : Effect.void
+      (exit) => Exit.isFailure(exit) ? releaseOwned(owned) : Effect.void
     )
   })

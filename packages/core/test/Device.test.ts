@@ -80,13 +80,11 @@ layer(BackendCpu.layer)("Runtime", (it) => {
       expect(releasedSequenceError.reason).toBe("invalid-handle")
     }))
 
-  it.effect("clearAll attempts every release after an earlier failure", () =>
+  it.effect("clearAll ignores invalid handles and continues", () =>
     Effect.gen(function*() {
-      const first = (yield* Tensor.compute([yield* Tensor.ones([1])]))[0]
+      const invalid = (yield* Tensor.ones([1])) as unknown as Tensor.Concrete
       const second = (yield* Tensor.compute([yield* Tensor.zeros([1])]))[0]
-      yield* Tensor.clear(first)
-      const error = yield* Effect.flip(Tensor.clearAll([first, second]))
-      expect(error.op).toBe("clearAll")
+      yield* Tensor.clearAll([invalid, second])
       const secondError = yield* Effect.flip(Tensor.toNumberArray(second))
       expect(secondError.message).toContain("cleared")
     }))

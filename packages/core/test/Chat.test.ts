@@ -53,14 +53,23 @@ const makeTokenizer = (captured: {
   idToToken: (id) => Option.fromNullishOr([...controlIds.entries()].find(([, tokenId]) => tokenId === id)?.[0])
 })
 
-// The script models generation's contract: add returns logits for script[0],
-// each step advances once, and close records deterministic session cleanup.
-// Logits are real device tensors; only the scheduler/state machine is faked.
+interface ProgramState {
+  closed: boolean
+  logits?: Array<Tensor.Concrete>
+  sampled?: {
+    add: Array<Tensor.SamplingOptions>
+    step: Array<{ readonly token: number; readonly sampling: Tensor.SamplingOptions }>
+  }
+}
+
+// The script models both generation contracts: legacy add/step publish real
+// device logits, while sampled add/step return only the scripted token ids.
 const makeProgram = (
   script: ReadonlyArray<number>,
-  state: { closed: boolean; logits?: Array<Tensor.Concrete> }
+  state: ProgramState
 ): Model.InferenceProgram => {
   let step = 0
+  const sampled = state.sampled
   const logitsFor = (token: number) =>
     Effect.gen(function*() {
       const values = new Float32Array(EOS + 1)
@@ -85,6 +94,28 @@ const makeProgram = (
           Effect.gen(function*() {
             step++
             return [yield* logitsFor(script[step]!)]
+          }),
+        ...(sampled === undefined
+          ? {}
+          : {
+            sampled: {
+              add: (_prompt: Tensor.Any, sampling: Tensor.SamplingOptions) =>
+                Effect.sync(() => {
+                  sampled.add.push(sampling)
+                  return { seq, token: script[0]! }
+                }),
+              step: (
+                entries: ReadonlyArray<{
+                  readonly token: number
+                  readonly sampling: Tensor.SamplingOptions
+                }>
+              ) =>
+                Effect.sync(() => {
+                  step++
+                  sampled.step.push(...entries.map(({ token, sampling }) => ({ token, sampling })))
+                  return [script[step]!]
+                })
+            }
           }),
         live: () => Effect.succeed(1),
         close: () =>
@@ -199,6 +230,110 @@ onDevices("Chat", () => (it) => {
         expect(events.map((event) => event._tag)).toEqual(["prefill"])
         expect(programState.closed).toBe(true)
         const error = yield* Effect.flip(Tensor.toNumberArray(programState.logits[0]!))
+        expect(error.message).toContain("cleared")
+      }))
+
+    it.effect("clears each consumed logits row before the stream ends", () =>
+      Effect.gen(function*() {
+        const programState: { closed: boolean; logits: Array<Tensor.Concrete> } = { closed: false, logits: [] }
+        let inspected = false
+        yield* Chat.stream({
+          program: makeProgram([5, 6], programState),
+          tokenizer: makeTokenizer({}),
+          template: "{{ messages }}",
+          messages: [{ role: "user", content: "hello" }],
+          controls: false,
+          stopTokens: [EOS],
+          maxTokens: 2
+        }).pipe(
+          Stream.tap((event) => {
+            if (inspected || event._tag !== "start") return Effect.void
+            inspected = true
+            return Effect.gen(function*() {
+              const firstError = yield* Effect.flip(Tensor.toNumberArray(programState.logits[0]!))
+              expect(firstError.message).toContain("cleared")
+              expect(yield* Tensor.toNumberArray(programState.logits[1]!)).toHaveLength(EOS + 1)
+            })
+          }),
+          Stream.runDrain
+        )
+        expect(inspected).toBe(true)
+      }))
+
+    it.effect("uses fused add and step for standard sampling without publishing logits", () =>
+      Effect.gen(function*() {
+        const publishedLogits: Array<Tensor.Concrete> = []
+        const programState: ProgramState = {
+          closed: false,
+          logits: publishedLogits,
+          sampled: { add: [], step: [] }
+        }
+        const events = Array.from(
+          yield* Stream.runCollect(Chat.stream({
+            program: makeProgram([5, 6], programState),
+            tokenizer: makeTokenizer({}),
+            template: "{{ messages }}",
+            messages: [{ role: "user", content: "hello" }],
+            controls: false,
+            stopTokens: [EOS],
+            maxTokens: 2,
+            sampling: { seed: 7 }
+          }))
+        )
+
+        expect(events[0]?._tag).toBe("prefill")
+        expect(events.at(-1)?._tag).toBe("done")
+        expect(programState.sampled?.add).toEqual([{
+          temperature: 0,
+          topK: 0,
+          topP: 1,
+          seed: 7,
+          counter: 0
+        }])
+        expect(programState.sampled?.step).toEqual([{
+          token: 5,
+          sampling: {
+            temperature: 0,
+            topK: 0,
+            topP: 1,
+            seed: 7,
+            counter: 1
+          }
+        }])
+        expect(publishedLogits).toEqual([])
+        expect(programState.closed).toBe(true)
+      }))
+
+    it.effect("keeps custom samplers on the logits path when fused sampling is available", () =>
+      Effect.gen(function*() {
+        let calls = 0
+        const publishedLogits: Array<Tensor.Concrete> = []
+        const programState: ProgramState = {
+          closed: false,
+          logits: publishedLogits,
+          sampled: { add: [], step: [] }
+        }
+        const events = Array.from(
+          yield* Stream.runCollect(Chat.stream({
+            program: makeProgram([5], programState),
+            tokenizer: makeTokenizer({}),
+            template: "{{ messages }}",
+            messages: [{ role: "user", content: "hello" }],
+            controls: false,
+            stopTokens: [EOS],
+            maxTokens: 1,
+            sampling: (logits) => {
+              calls++
+              expect(logits.length).toBe(EOS + 1)
+              return 5
+            }
+          }))
+        )
+        expect(calls).toBe(1)
+        expect(events.at(-1)?._tag).toBe("done")
+        expect(programState.sampled).toEqual({ add: [], step: [] })
+        expect(publishedLogits).toHaveLength(1)
+        const error = yield* Effect.flip(Tensor.toNumberArray(publishedLogits[0]!))
         expect(error.message).toContain("cleared")
       }))
   })
