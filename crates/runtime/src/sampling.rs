@@ -185,6 +185,23 @@ pub fn sample_probabilities(
     counter: u64,
     mut cancelled: impl FnMut() -> bool,
 ) -> Result<u32, String> {
+    sample_probabilities_with_draw(probabilities, random_unit(seed, counter), &mut cancelled)
+}
+
+/// Samples non-negative weights at a full-width logical RNG coordinate.
+pub fn sample_probabilities_at(
+    probabilities: &[f64],
+    coordinate: SamplingCoordinate,
+    mut cancelled: impl FnMut() -> bool,
+) -> Result<u32, String> {
+    sample_probabilities_with_draw(probabilities, random_unit_at(coordinate), &mut cancelled)
+}
+
+fn sample_probabilities_with_draw(
+    probabilities: &[f64],
+    unit_draw: f64,
+    mut cancelled: impl FnMut() -> bool,
+) -> Result<u32, String> {
     if probabilities.is_empty() || probabilities.len() > u32::MAX as usize {
         return Err("sample: probability row has invalid vocabulary size".to_string());
     }
@@ -201,7 +218,7 @@ pub fn sample_probabilities(
     if !total.is_finite() || total <= 0.0 {
         return Err("sample: probability row has no positive mass".to_string());
     }
-    let mut draw = random_unit(seed, counter) * total;
+    let mut draw = unit_draw * total;
     for (token, &probability) in probabilities.iter().enumerate() {
         draw -= probability;
         if draw < 0.0 {
@@ -209,6 +226,36 @@ pub fn sample_probabilities(
         }
     }
     Ok((probabilities.len() - 1) as u32)
+}
+
+/// Result of drawing from the target distribution and comparing that draw with
+/// one deterministic or non-factorized proposal token.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TargetSampleMatchResult {
+    Accepted,
+    Rejected(u32),
+}
+
+/// Implements exact target-sample matching for one candidate position. The
+/// target draw uses the supplied full-width coordinate and is returned as the
+/// correction when it does not equal `candidate`.
+pub fn target_sample_match(
+    target: &[f64],
+    candidate: u32,
+    coordinate: SamplingCoordinate,
+    cancelled: impl FnMut() -> bool,
+) -> Result<TargetSampleMatchResult, String> {
+    let candidate = usize::try_from(candidate)
+        .map_err(|_| "target sample match: candidate is outside the vocabulary".to_string())?;
+    if candidate >= target.len() {
+        return Err("target sample match: candidate is outside the vocabulary".to_string());
+    }
+    let sampled = sample_probabilities_at(target, coordinate, cancelled)?;
+    if sampled as usize == candidate {
+        Ok(TargetSampleMatchResult::Accepted)
+    } else {
+        Ok(TargetSampleMatchResult::Rejected(sampled))
+    }
 }
 
 /// Result of one exact speculative rejection test.
@@ -601,6 +648,31 @@ mod tests {
         ] {
             assert_ne!(random_unit_at(coordinate), random_unit_at(distinct));
         }
+    }
+
+    #[test]
+    fn target_sample_matching_replays_acceptance_and_correction() {
+        let coordinate = sampling_coordinate(17, 29, 41, SamplingPurpose::Target, 0);
+        let target = [0.0, 0.0, 1.0];
+        assert_eq!(
+            target_sample_match(&target, 2, coordinate, || false).unwrap(),
+            TargetSampleMatchResult::Accepted
+        );
+        assert_eq!(
+            target_sample_match(&target, 1, coordinate, || false).unwrap(),
+            TargetSampleMatchResult::Rejected(2)
+        );
+        assert_eq!(
+            sample_probabilities_at(&target, coordinate, || false).unwrap(),
+            2
+        );
+        assert!(target_sample_match(&target, 3, coordinate, || false)
+            .unwrap_err()
+            .contains("outside the vocabulary"));
+        assert_eq!(
+            target_sample_match(&target, 1, coordinate, || false).unwrap(),
+            TargetSampleMatchResult::Rejected(2)
+        );
     }
 
     #[test]
