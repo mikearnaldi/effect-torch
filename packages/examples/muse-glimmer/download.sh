@@ -1,5 +1,5 @@
 #!/bin/sh
-# Downloads the pinned text GGUF and matching tokenizer into examples/data/.
+# Downloads the pinned text/draft GGUFs and matching tokenizer into examples/data/.
 # curl resumes partial transfers; completed files are always size/hash checked.
 set -eu
 
@@ -11,6 +11,12 @@ MODEL_REVISION="faa5b025c584459c13febfa5c59883516710ae39"
 MODEL_FILE="Muse-Glimmer-30B-UD-Q2_K_XL.gguf"
 MODEL_BYTES="12444212256"
 MODEL_SHA256="3d63a1daff23fdc2a6927316151e855cacffe89b5cb9b9397a5aec0c412ec08d"
+
+DFLASH_REPOSITORY="meta-models/Muse-Glimmer-30B-GGUF"
+DFLASH_REVISION="43c7eadd41352a299ea8e0a36b3157978dd63596"
+DFLASH_FILE="dflash-Muse-Glimmer-30B-Q4_K_M.gguf"
+DFLASH_BYTES="1631208128"
+DFLASH_SHA256="b2e808bf656086fe86bd0d0bd990f01d33e377537a07c02d45371517c8b264ef"
 
 TOKENIZER_REPOSITORY="unsloth/Muse-Glimmer-30B"
 TOKENIZER_REVISION="55a49b91a33d176bc99db7569f678d4c64cd91a1"
@@ -73,6 +79,14 @@ download \
   "data/$MODEL_FILE" \
   "$MODEL_BYTES" \
   "$MODEL_SHA256"
+
+download \
+  "$DFLASH_REPOSITORY" \
+  "$DFLASH_REVISION" \
+  "$DFLASH_FILE" \
+  "data/$DFLASH_FILE" \
+  "$DFLASH_BYTES" \
+  "$DFLASH_SHA256"
 
 download \
   "$TOKENIZER_REPOSITORY" \
