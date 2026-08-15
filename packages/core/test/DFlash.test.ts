@@ -1,4 +1,4 @@
-import { DFlash } from "@effect-torch/core/models"
+import { DFlash } from "@effect-torch/core/proposers"
 import { expect, it } from "@effect/vitest"
 import { Effect, Layer } from "effect"
 import { Runtime, type Tensor } from "../src/index.ts"
@@ -175,7 +175,7 @@ const tinyParams = (withOutputNorm = true): Array<Tensor.Any> => {
 
 it.effect("derives the reference checkpoint parameter catalog", () =>
   Effect.gen(function*() {
-    const parameters = yield* DFlash.definition.parameters(metadata(), catalog())
+    const parameters = yield* DFlash.definition.parameterSpecs(metadata(), catalog())
     expect(DFlash.architecture).toBe("dflash")
     expect(parameters).toHaveLength(58)
     expect(parameters.slice(0, 2)).toEqual([
@@ -197,7 +197,7 @@ it.effect("derives the reference checkpoint parameter catalog", () =>
     ])
     expect(parameters.at(-1)).toEqual({ name: "output_norm.weight", shape: [6656] })
 
-    const requiredCatalog = yield* DFlash.definition.parameters(metadata(), catalog(false))
+    const requiredCatalog = yield* DFlash.definition.parameterSpecs(metadata(), catalog(false))
     expect(requiredCatalog).toHaveLength(58)
     expect(requiredCatalog.at(-1)).toEqual({ name: "output_norm.weight", shape: [6656] })
   }))
@@ -254,7 +254,7 @@ it.effect("derives catalogs and artifacts from changed valid metadata", () =>
     ) changed.set(key, value)
 
     const config = yield* DFlash.configuration(changed)
-    const parameters = yield* DFlash.definition.parameters(changed, catalog())
+    const parameters = yield* DFlash.definition.parameterSpecs(changed, catalog())
     const artifact = DFlash.artifact(config, [])
 
     expect(config.targetResidualTaps).toEqual([0, 3, 8])

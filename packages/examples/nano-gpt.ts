@@ -158,8 +158,8 @@ const createTrainer = (model: Model.Model, data: ReadonlyArray<number>) =>
 
 const init = (model: Model.Model) =>
   Effect.gen(function*() {
-    const params = yield* model.init
-    for (const [i, name] of model.names.entries()) {
+    const params = yield* Model.initialize(model)
+    for (const [i, { name }] of model.parameterSpecs.entries()) {
       yield* Effect.log(`  ${name} [${params[i].shape}] ${params[i].dtype} initialized`)
     }
     const total = params.reduce((sum, param) => sum + param.shape.reduce((a, b) => a * b, 1), 0)
@@ -240,7 +240,7 @@ const program = Effect.gen(function*() {
 
   yield* Effect.log("1) creating model")
   const model = yield* createGpt(vocabSize)
-  yield* Effect.log(`${model.names.length} tensors of parameters`)
+  yield* Effect.log(`${model.parameterSpecs.length} tensors of parameters`)
   const params0 = yield* init(model)
 
   yield* Effect.log(`2) training: adamW lr=${LR}, ${STEPS} steps (compiled)`)

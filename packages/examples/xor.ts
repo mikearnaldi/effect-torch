@@ -39,8 +39,8 @@ const createModel = Effect.gen(function*() {
 
 const init = (model: Model.Model) =>
   Effect.gen(function*() {
-    const params = yield* model.init
-    for (const [i, name] of model.names.entries()) {
+    const params = yield* Model.initialize(model)
+    for (const [i, { name }] of model.parameterSpecs.entries()) {
       yield* Effect.log(`  ${name} [${params[i].shape}] ${params[i].dtype} initialized`)
     }
     return params

@@ -16,19 +16,22 @@ import { Effect } from "effect"
 // into stateful recurrent decode with fixed-size per-sequence state.
 // Training runs the closed-form KDA backward (RFC 0018 phase 4).
 //
-// Shared fineweb helpers (tokenizer, bare-parameter I/O, data windows,
-// held-out loss) are re-exported from the sibling example. FINEWEB_BLOCK is
-// Number-parsed at module load and is not encoded in the bare model artifact.
-
+/** Shared tokenizer, parameter I/O, data-window, and evaluation helpers. */
 export { EOT, heldOutLoss, loadBin, loadParams, loadTokenizer, saveParams, windows } from "../fineweb/model.js"
 
+/** Default path for bare hybrid-KDA model parameters. */
 export const CHECKPOINT = new URL("../data/fineweb-kda-model.safetensors", import.meta.url).pathname
 
+/** Training sequence length and full-attention inference window. */
 export const BLOCK = Number(process.env.FINEWEB_BLOCK ?? 256)
+/** Transformer residual width. */
 export const EMBED = 256
+/** Number of token-mixing heads per transformer block. */
 export const HEADS = 4
+/** Number of transformer blocks. */
 export const LAYERS = 6
 
+/** Builds the FineWeb hybrid KDA/full-attention model for a vocabulary size. */
 export const createKdaGpt = (
   vocabSize: number
 ): Effect.Effect<Model.Model, Model.ModelError | Tensor.TensorError> =>

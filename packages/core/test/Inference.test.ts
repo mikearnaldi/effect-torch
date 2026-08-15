@@ -34,10 +34,10 @@ const makeParallelFixture = Effect.gen(function*() {
   const embedding = yield* Model.embedding("token_embd", VOCAB, EMBED)
   const attention = yield* Model.multiHeadAttention("attn", EMBED, 1, { causal: true, rope: 10_000 })
   const head = yield* Model.linear("output", EMBED, VOCAB)
-  const embeddingCount = embedding.names.length
-  const attentionCount = attention.names.length
+  const embeddingCount = embedding.parameterSpecs.map(({ name }) => name).length
+  const attentionCount = attention.parameterSpecs.map(({ name }) => name).length
   const model = yield* Model.define({
-    parameters: [...embedding.parameters, ...attention.parameters, ...head.parameters],
+    parameterSpecs: [...embedding.parameterSpecs, ...attention.parameterSpecs, ...head.parameterSpecs],
     forward: (params, input, trace) =>
       Effect.gen(function*() {
         let hidden = yield* embedding.forward(params.slice(0, embeddingCount), input)
@@ -50,8 +50,8 @@ const makeParallelFixture = Effect.gen(function*() {
       })
   })
   const params = yield* Tensor.compute([
-    ...yield* embedding.init,
-    ...yield* attention.init,
+    ...yield* Model.initialize(embedding),
+    ...yield* Model.initialize(attention),
     yield* Tensor.zeros([EMBED, VOCAB]),
     yield* Tensor.zeros([1, VOCAB])
   ])
@@ -110,7 +110,7 @@ const historyLookup = (maxDraftTokens: number, minMatchTokens = 1) =>
 
 const constantOneGpt = Effect.gen(function*() {
   const model = yield* makeGpt()
-  const initialized = yield* Tensor.compute(yield* model.init)
+  const initialized = yield* Tensor.compute(yield* Model.initialize(model))
   const headWeight = yield* Tensor.zeros([EMBED, VOCAB])
   const biasValues = new Float32Array(VOCAB)
   biasValues[1] = 20
@@ -246,7 +246,7 @@ onDevices("Inference", () => (it) => {
     it.effect("samples add/step without publishing logits", () =>
       Effect.gen(function*() {
         const model = yield* makeGpt()
-        const params = yield* Tensor.compute(yield* model.init)
+        const params = yield* Tensor.compute(yield* Model.initialize(model))
         const program = yield* Model.inference(model, params, {
           maxTokens: 64,
           blockSize: 4,
@@ -302,7 +302,7 @@ onDevices("Inference", () => (it) => {
     it.effect("generation owns pending tokens and terminal output policy", () =>
       Effect.gen(function*() {
         const model = yield* makeGpt()
-        const params = yield* Tensor.compute(yield* model.init)
+        const params = yield* Tensor.compute(yield* Model.initialize(model))
         const program = yield* Model.inference(model, params, {
           maxTokens: 64,
           blockSize: 4,
@@ -346,7 +346,7 @@ onDevices("Inference", () => (it) => {
     it.effect("batched generation admission is all-or-nothing", () =>
       Effect.gen(function*() {
         const model = yield* makeGpt()
-        const params = yield* Tensor.compute(yield* model.init)
+        const params = yield* Tensor.compute(yield* Model.initialize(model))
         const program = yield* Model.inference(model, params, {
           maxTokens: 64,
           blockSize: 4,
@@ -385,7 +385,7 @@ onDevices("Inference", () => (it) => {
     it.effect("generation sampling follows sequence identity when step order changes", () =>
       Effect.gen(function*() {
         const model = yield* makeGpt()
-        const params = yield* Tensor.compute(yield* model.init)
+        const params = yield* Tensor.compute(yield* Model.initialize(model))
         const config = {
           maxTokens: 64,
           blockSize: 4,
@@ -412,7 +412,7 @@ onDevices("Inference", () => (it) => {
     it.effect("batch size one uses the sampled fixed-lane path", () =>
       Effect.gen(function*() {
         const model = yield* makeGpt()
-        const params = yield* Tensor.compute(yield* model.init)
+        const params = yield* Tensor.compute(yield* Model.initialize(model))
         const program = yield* Model.inference(model, params, {
           maxTokens: 32,
           blockSize: 4,
@@ -431,7 +431,7 @@ onDevices("Inference", () => (it) => {
     it.effect("exact chain speculation matches greedy ordinary generation", () =>
       Effect.gen(function*() {
         const model = yield* makeGpt()
-        const params = yield* Tensor.compute(yield* model.init)
+        const params = yield* Tensor.compute(yield* Model.initialize(model))
         const proposer = Speculation.autoregressive(model, params, { vocabulary: VOCAB, maxDraftTokens: 3 })
         const ordinaryProgram = yield* Model.inference(model, params, {
           maxTokens: 64,
@@ -514,7 +514,7 @@ onDevices("Inference", () => (it) => {
     it.effect("history lookup is pathwise equal to ordinary seeded sampling", () =>
       Effect.gen(function*() {
         const model = yield* makeGpt()
-        const params = yield* Tensor.compute(yield* model.init)
+        const params = yield* Tensor.compute(yield* Model.initialize(model))
         const speculation = yield* historyLookup(3)
         const base = {
           maxTokens: 64,
@@ -601,7 +601,7 @@ onDevices("Inference", () => (it) => {
     it.effect("speculative pages stop exactly at the remaining output budget", () =>
       Effect.gen(function*() {
         const model = yield* makeGpt()
-        const params = yield* Tensor.compute(yield* model.init)
+        const params = yield* Tensor.compute(yield* Model.initialize(model))
         const proposer = Speculation.autoregressive(model, params, { vocabulary: VOCAB, maxDraftTokens: 4 })
         const program = yield* Model.inference(model, params, {
           maxTokens: 64,
@@ -622,7 +622,7 @@ onDevices("Inference", () => (it) => {
     it.effect("one speculative batch publishes different nonzero page lengths", () =>
       Effect.gen(function*() {
         const model = yield* makeGpt()
-        const params = yield* Tensor.compute(yield* model.init)
+        const params = yield* Tensor.compute(yield* Model.initialize(model))
         const proposer = Speculation.autoregressive(model, params, { vocabulary: VOCAB, maxDraftTokens: 3 })
         const program = yield* Model.inference(model, params, {
           maxTokens: 128,
@@ -649,7 +649,7 @@ onDevices("Inference", () => (it) => {
     it.effect("speculative EOS cuts discard the computed suffix and make the lane terminal", () =>
       Effect.gen(function*() {
         const model = yield* makeGpt()
-        const params = yield* Tensor.compute(yield* model.init)
+        const params = yield* Tensor.compute(yield* Model.initialize(model))
         const proposer = Speculation.autoregressive(model, params, { vocabulary: VOCAB, maxDraftTokens: 3 })
         const speculativeProgram = yield* Model.inference(model, params, {
           maxTokens: 64,
@@ -700,7 +700,7 @@ onDevices("Inference", () => (it) => {
     it.effect("reports native speculative phase, acceptance, and pool diagnostics", () =>
       Effect.gen(function*() {
         const model = yield* makeGpt()
-        const params = yield* Tensor.compute(yield* model.init)
+        const params = yield* Tensor.compute(yield* Model.initialize(model))
         const proposer = Speculation.autoregressive(model, params, { vocabulary: VOCAB, maxDraftTokens: 2 })
         const program = yield* Model.inference(model, params, {
           maxTokens: 32,
@@ -730,7 +730,7 @@ onDevices("Inference", () => (it) => {
     it.effect("positive-temperature speculative replay ignores request order", () =>
       Effect.gen(function*() {
         const model = yield* makeGpt()
-        const params = yield* Tensor.compute(yield* model.init)
+        const params = yield* Tensor.compute(yield* Model.initialize(model))
         const proposer = Speculation.autoregressive(model, params, { vocabulary: VOCAB, maxDraftTokens: 3 })
         const config = {
           maxTokens: 128,
@@ -764,7 +764,7 @@ onDevices("Inference", () => (it) => {
     it.effect("round sampling overrides preserve unspecified artifact defaults", () =>
       Effect.gen(function*() {
         const model = yield* makeGpt()
-        const params = yield* Tensor.compute(yield* model.init)
+        const params = yield* Tensor.compute(yield* Model.initialize(model))
         const config = {
           maxTokens: 64,
           blockSize: 4,
@@ -793,7 +793,7 @@ onDevices("Inference", () => (it) => {
     it.effect("preserves high seed bits through native generation", () =>
       Effect.gen(function*() {
         const model = yield* makeGpt()
-        const params = yield* Tensor.compute(yield* model.init)
+        const params = yield* Tensor.compute(yield* Model.initialize(model))
         const generate = (seed: bigint) =>
           Effect.gen(function*() {
             const program = yield* Model.inference(model, params, {
@@ -826,7 +826,7 @@ onDevices("Inference", () => (it) => {
     it.effect("speculative rounds accept sparse physical lanes", () =>
       Effect.gen(function*() {
         const model = yield* makeGpt()
-        const params = yield* Tensor.compute(yield* model.init)
+        const params = yield* Tensor.compute(yield* Model.initialize(model))
         const proposer = Speculation.autoregressive(model, params, { vocabulary: VOCAB, maxDraftTokens: 2 })
         const program = yield* Model.inference(model, params, {
           maxTokens: 128,
@@ -851,7 +851,7 @@ onDevices("Inference", () => (it) => {
     it.effect("speculation shortens a page at the remaining state capacity", () =>
       Effect.gen(function*() {
         const model = yield* makeGpt()
-        const params = yield* Tensor.compute(yield* model.init)
+        const params = yield* Tensor.compute(yield* Model.initialize(model))
         const proposer = Speculation.autoregressive(model, params, { vocabulary: VOCAB, maxDraftTokens: 4 })
         const program = yield* Model.inference(model, params, {
           maxTokens: 8,
@@ -871,7 +871,7 @@ onDevices("Inference", () => (it) => {
     it.effect("speculation supports i64 token programs", () =>
       Effect.gen(function*() {
         const model = yield* makeGpt()
-        const params = yield* Tensor.compute(yield* model.init)
+        const params = yield* Tensor.compute(yield* Model.initialize(model))
         const proposer = Speculation.autoregressive(model, params, { vocabulary: VOCAB, maxDraftTokens: 2 })
         const program = yield* Model.inference(model, params, {
           maxTokens: 32,
@@ -893,8 +893,8 @@ onDevices("Inference", () => (it) => {
     it.effect("greedy correction from a different draft preserves target tokens", () =>
       Effect.gen(function*() {
         const model = yield* makeGpt()
-        const targetParams = yield* Tensor.compute(yield* model.init)
-        const draftParams = yield* Tensor.compute(yield* model.init)
+        const targetParams = yield* Tensor.compute(yield* Model.initialize(model))
+        const draftParams = yield* Tensor.compute(yield* Model.initialize(model))
         const proposer = Speculation.autoregressive(model, draftParams, { vocabulary: VOCAB, maxDraftTokens: 3 })
         const ordinaryProgram = yield* Model.inference(model, targetParams, {
           maxTokens: 64,
@@ -928,7 +928,7 @@ onDevices("Inference", () => (it) => {
     it.effect("rejects unsupported speculative schedules and draft limits before compilation", () =>
       Effect.gen(function*() {
         const model = yield* makeGpt()
-        const params = yield* Tensor.compute(yield* model.init)
+        const params = yield* Tensor.compute(yield* Model.initialize(model))
         const proposer = Speculation.autoregressive(model, params, { vocabulary: VOCAB, maxDraftTokens: 2 })
         const limit = yield* Effect.flip(Model.inference(model, params, {
           maxTokens: 32,
@@ -945,7 +945,7 @@ onDevices("Inference", () => (it) => {
     it.effect("lane refill does not change a replacement sequence's RNG identity", () =>
       Effect.gen(function*() {
         const model = yield* makeGpt()
-        const params = yield* Tensor.compute(yield* model.init)
+        const params = yield* Tensor.compute(yield* Model.initialize(model))
         const config = {
           maxTokens: 64,
           blockSize: 4,
@@ -1053,7 +1053,7 @@ onDevices("Inference", () => (it) => {
     it.effect("matches naive greedy generation token-for-token across pool block boundaries", () =>
       Effect.gen(function*() {
         const model = yield* makeGpt()
-        const params = yield* Tensor.compute(yield* model.init)
+        const params = yield* Tensor.compute(yield* Model.initialize(model))
         const prompt = [1, 5, 3]
         const steps = 9 // context grows to 12, crossing block boundaries (blockSize 4)
         const program = yield* Model.inference(model, params, { maxTokens: 32, blockSize: 4 })
@@ -1066,7 +1066,7 @@ onDevices("Inference", () => (it) => {
     it.effect("serves every prompt length from the two eagerly compiled programs", () =>
       Effect.gen(function*() {
         const model = yield* makeGpt()
-        const params = yield* Tensor.compute(yield* model.init)
+        const params = yield* Tensor.compute(yield* Model.initialize(model))
         const program = yield* Model.inference(model, params, { maxTokens: 64, blockSize: 4 })
         const a = yield* cachedGenerate(program, [1, 5, 3], 6)
         const b = yield* cachedGenerate(program, [2, 4, 6], 6)
@@ -1079,7 +1079,7 @@ onDevices("Inference", () => (it) => {
     it.effect("chunked prefill: a long prompt runs in fixed-shape chunks with parity", () =>
       Effect.gen(function*() {
         const model = yield* makeGpt()
-        const params = yield* Tensor.compute(yield* model.init)
+        const params = yield* Tensor.compute(yield* Model.initialize(model))
         const prompt = [1, 5, 3, 8, 2, 11, 4, 7, 6] // 3 chunks of 4: 4 + 4 + 1(padded)
         const steps = 6
         const program = yield* Model.inference(model, params, { maxTokens: 64, blockSize: 4, prefillChunk: 4 })
@@ -1091,7 +1091,7 @@ onDevices("Inference", () => (it) => {
     it.effect("runs concurrent sessions exactly like sequential ones", () =>
       Effect.gen(function*() {
         const model = yield* makeGpt()
-        const params = yield* Tensor.compute(yield* model.init)
+        const params = yield* Tensor.compute(yield* Model.initialize(model))
         const program = yield* Model.inference(model, params, { maxTokens: 64, blockSize: 4 })
         const sequentialA = yield* cachedGenerate(program, [1, 2], 6)
         const sequentialB = yield* cachedGenerate(program, [3, 4], 6)
@@ -1106,7 +1106,7 @@ onDevices("Inference", () => (it) => {
     it.effect("pool exhaustion fails an add and finish frees the room", () =>
       Effect.gen(function*() {
         const model = yield* makeGpt()
-        const params = yield* Tensor.compute(yield* model.init)
+        const params = yield* Tensor.compute(yield* Model.initialize(model))
         const program = yield* Model.inference(model, params, { maxTokens: 16, blockSize: 4 })
         const gen = yield* program.execution()
         yield* gen.add([yield* ids(Array.from({ length: 16 }, (_, i) => i % VOCAB))]) // all 4 blocks
@@ -1121,7 +1121,7 @@ onDevices("Inference", () => (it) => {
     it.effect("fails a sequence whose context outgrows the pool capacity", () =>
       Effect.gen(function*() {
         const model = yield* makeGpt()
-        const params = yield* Tensor.compute(yield* model.init)
+        const params = yield* Tensor.compute(yield* Model.initialize(model))
         const program = yield* Model.inference(model, params, { maxTokens: 8, blockSize: 4 })
         const gen = yield* program.execution()
         const entry = (yield* gen.add([yield* ids([1, 2, 3, 4, 5, 6, 7, 8])]))[0]!
@@ -1134,7 +1134,7 @@ onDevices("Inference", () => (it) => {
     it.effect("returns a finished sequence's blocks to the pool", () =>
       Effect.gen(function*() {
         const model = yield* makeGpt()
-        const params = yield* Tensor.compute(yield* model.init)
+        const params = yield* Tensor.compute(yield* Model.initialize(model))
         const program = yield* Model.inference(model, params, { maxTokens: 16, blockSize: 4 })
         const gen = yield* program.execution()
         const entry = (yield* gen.add([yield* ids([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 0])]))[0]! // 3 of 4 blocks
@@ -1148,7 +1148,7 @@ onDevices("Inference", () => (it) => {
     it.effect("prefix cache: a resident prefix is shared, not recomputed", () =>
       Effect.gen(function*() {
         const model = yield* makeGpt()
-        const params = yield* Tensor.compute(yield* model.init)
+        const params = yield* Tensor.compute(yield* Model.initialize(model))
         // 5 blocks: two independent 3-block prompts would need 6 — the
         // second prefill fits only by sharing its 2 full prefix blocks.
         const program = yield* Model.inference(model, params, { maxTokens: 20, blockSize: 4 })
@@ -1162,7 +1162,7 @@ onDevices("Inference", () => (it) => {
     it.effect("prefix cache: divergent suffixes after a shared prefix stay correct", () =>
       Effect.gen(function*() {
         const model = yield* makeGpt()
-        const params = yield* Tensor.compute(yield* model.init)
+        const params = yield* Tensor.compute(yield* Model.initialize(model))
         const program = yield* Model.inference(model, params, { maxTokens: 64, blockSize: 4 })
         const shared = [1, 2, 3, 4, 5, 6, 7, 8] // 2 full blocks
         const promptA = [...shared, 9, 10, 11, 0]
@@ -1185,7 +1185,7 @@ onDevices("Inference", () => (it) => {
     it.effect("prefix cache: cached blocks are reclaimed under pressure", () =>
       Effect.gen(function*() {
         const model = yield* makeGpt()
-        const params = yield* Tensor.compute(yield* model.init)
+        const params = yield* Tensor.compute(yield* Model.initialize(model))
         // Exactly one 3-block prompt fits; a second, different prompt
         // succeeds only by evicting the first's cached blocks.
         const program = yield* Model.inference(model, params, { maxTokens: 12, blockSize: 4 })
@@ -1211,7 +1211,7 @@ onDevices("Inference", () => (it) => {
     it.effect("prefix cache: window-evicted blocks stay reusable", () =>
       Effect.gen(function*() {
         const model = yield* makeRopeGpt
-        const params = yield* Tensor.compute(yield* model.init)
+        const params = yield* Tensor.compute(yield* Model.initialize(model))
         const prompt = [1, 3, 5, 7, 9, 11, 2, 4]
         const program = yield* Model.inference(model, params, {
           maxTokens: 32,
@@ -1245,7 +1245,7 @@ onDevices("Inference", () => (it) => {
     it.effect("each add starts a fresh, independent sequence", () =>
       Effect.gen(function*() {
         const model = yield* makeGpt()
-        const params = yield* Tensor.compute(yield* model.init)
+        const params = yield* Tensor.compute(yield* Model.initialize(model))
         const program = yield* Model.inference(model, params, { maxTokens: 16, blockSize: 4 })
         const gen = yield* program.execution()
         const a = (yield* gen.add([yield* ids([1, 2, 3])]))[0]!
@@ -1258,7 +1258,7 @@ onDevices("Inference", () => (it) => {
     it.effect("prefix cache: concurrent same-prefix prefills stay exact", () =>
       Effect.gen(function*() {
         const model = yield* makeGpt()
-        const params = yield* Tensor.compute(yield* model.init)
+        const params = yield* Tensor.compute(yield* Model.initialize(model))
         const program = yield* Model.inference(model, params, { maxTokens: 64, blockSize: 4 })
         const prompt = [1, 2, 3, 4, 5, 6, 7, 8] // 1 matchable block; +6 steps stays within BLOCK
         // However the two prefills interleave — one takes the other's
@@ -1282,7 +1282,7 @@ onDevices("Inference", () => (it) => {
     const halfPoolParity = (kvDtype: "f16" | "bf16" | "int8", tol: number) =>
       Effect.gen(function*() {
         const model = yield* makeGpt()
-        const params = yield* Tensor.compute(yield* model.init)
+        const params = yield* Tensor.compute(yield* Model.initialize(model))
         const program = yield* Model.inference(model, params, { maxTokens: 64, blockSize: 4, kvDtype })
         const prompt = [1, 5, 3, 8, 2]
         const trajectory = [4, 9, 0, 7, 6]
@@ -1332,7 +1332,7 @@ onDevices("Inference", () => (it) => {
         // the same context agree (this would FAIL for window-relative
         // positions, which are the RoPE-only regime).
         const model = yield* makeGpt()
-        const params = yield* Tensor.compute(yield* model.init)
+        const params = yield* Tensor.compute(yield* Model.initialize(model))
         const program = yield* Model.inference(model, params, {
           maxTokens: 32,
           blockSize: 4,
@@ -1363,7 +1363,7 @@ onDevices("Inference", () => (it) => {
     it.effect("batched step matches per-sequence step logits exactly", () =>
       Effect.gen(function*() {
         const model = yield* makeGpt()
-        const params = yield* Tensor.compute(yield* model.init)
+        const params = yield* Tensor.compute(yield* Model.initialize(model))
         const program = yield* Model.inference(model, params, { maxTokens: 64, blockSize: 4, batchSize: 4 })
         const prompts = [
           [1, 2, 3],
@@ -1398,7 +1398,7 @@ onDevices("Inference", () => (it) => {
     it.effect("ragged batches pad internally and stay exact", () =>
       Effect.gen(function*() {
         const model = yield* makeGpt()
-        const params = yield* Tensor.compute(yield* model.init)
+        const params = yield* Tensor.compute(yield* Model.initialize(model))
         // Three blocks fit the reference plus two active sequences exactly;
         // inactive padding rows must not reserve KV capacity.
         const program = yield* Model.inference(model, params, { maxTokens: 12, blockSize: 4, batchSize: 8 })
@@ -1422,7 +1422,7 @@ onDevices("Inference", () => (it) => {
     it.effect("batched step with divergent cursors and a shared prefix", () =>
       Effect.gen(function*() {
         const model = yield* makeRopeGpt
-        const params = yield* Tensor.compute(yield* model.init)
+        const params = yield* Tensor.compute(yield* Model.initialize(model))
         const program = yield* Model.inference(model, params, {
           maxTokens: 64,
           blockSize: 4,
@@ -1465,7 +1465,7 @@ onDevices("Inference", () => (it) => {
     it.effect("batched step rolls back every slot on pool exhaustion", () =>
       Effect.gen(function*() {
         const model = yield* makeGpt()
-        const params = yield* Tensor.compute(yield* model.init)
+        const params = yield* Tensor.compute(yield* Model.initialize(model))
         // Pool holds both prompts exactly; the batched step needs one
         // more block per sequence and must fail cleanly.
         const program = yield* Model.inference(model, params, { maxTokens: 24, blockSize: 4, batchSize: 2 })
@@ -1488,7 +1488,7 @@ onDevices("Inference", () => (it) => {
     it.effect("add beyond batchSize fails typed", () =>
       Effect.gen(function*() {
         const model = yield* makeGpt()
-        const params = yield* Tensor.compute(yield* model.init)
+        const params = yield* Tensor.compute(yield* Model.initialize(model))
         const program = yield* Model.inference(model, params, { maxTokens: 64, blockSize: 4, batchSize: 2 })
         const gen = yield* program.execution()
         yield* gen.add([yield* ids([1, 2, 3])])
@@ -1501,7 +1501,7 @@ onDevices("Inference", () => (it) => {
     it.effect("finishing a sequence mid-session removes it from the round", () =>
       Effect.gen(function*() {
         const model = yield* makeGpt()
-        const params = yield* Tensor.compute(yield* model.init)
+        const params = yield* Tensor.compute(yield* Model.initialize(model))
         const program = yield* Model.inference(model, params, { maxTokens: 64, blockSize: 4, batchSize: 2 })
         const reference = yield* program.execution()
         const expectedEntry = (yield* reference.add([yield* ids([4, 5, 6])]))[0]!
@@ -1526,7 +1526,7 @@ onDevices("Inference", () => (it) => {
     it.effect("f16 pool: prefix cache and sliding window still hold", () =>
       Effect.gen(function*() {
         const model = yield* makeRopeGpt
-        const params = yield* Tensor.compute(yield* model.init)
+        const params = yield* Tensor.compute(yield* Model.initialize(model))
         const prompt = [1, 3, 5, 7, 9, 11, 2, 4]
         const program = yield* Model.inference(model, params, {
           maxTokens: 32,
@@ -1575,7 +1575,7 @@ onDevices("Inference", () => (it) => {
           yield* Model.embedding("wte", VOCAB, EMBED),
           yield* Model.linear("head", EMBED, VOCAB)
         )
-        const params = yield* Tensor.compute(yield* model.init)
+        const params = yield* Tensor.compute(yield* Model.initialize(model))
         const program = yield* Model.inference(model, params, { maxTokens: 16, blockSize: 4 })
         const gen = yield* program.execution()
         const entry = (yield* gen.add([yield* ids([1, 3, 5])]))[0]!
@@ -1605,7 +1605,7 @@ onDevices("Inference", () => (it) => {
     it.effect("rejects non-causal attention at construction", () =>
       Effect.gen(function*() {
         const model = yield* makeGpt({ causal: false })
-        const params = yield* Tensor.compute(yield* model.init)
+        const params = yield* Tensor.compute(yield* Model.initialize(model))
         const error = yield* Effect.flip(Model.inference(model, params, { maxTokens: 16, blockSize: 4 }))
         expect(error._tag).toBe("InferenceError")
         expect(error.message).toMatch(/only causal attention is cacheable/)
@@ -1616,7 +1616,7 @@ onDevices("Inference", () => (it) => {
         const runtime = yield* Runtime.Runtime
         const diagnostics = runtime.extensions.diagnostics
         const model = yield* makeGpt({ causal: false })
-        const params = yield* Tensor.compute(yield* model.init)
+        const params = yield* Tensor.compute(yield* Model.initialize(model))
         // The baseline includes caller-owned params. Returning to it proves the
         // failed artifact released only its retained generation; readability
         // below proves it did not consume the caller's handles.
@@ -1631,7 +1631,7 @@ onDevices("Inference", () => (it) => {
         const runtime = yield* Runtime.Runtime
         const diagnostics = runtime.extensions.diagnostics
         const model = yield* makeGpt({ causal: false })
-        const params = yield* model.init
+        const params = yield* Model.initialize(model)
         // Lazy params own no storage at this baseline; inference materializes a
         // private generation that must be wholly released on construction error.
         const before = yield* diagnostics.externalMemoryBytes
@@ -1642,7 +1642,7 @@ onDevices("Inference", () => (it) => {
     it.effect("returns direct logits rows for single and batched decode", () =>
       Effect.gen(function*() {
         const model = yield* makeGpt()
-        const params = yield* Tensor.compute(yield* model.init)
+        const params = yield* Tensor.compute(yield* Model.initialize(model))
         const program = yield* Model.inference(model, params, {
           maxTokens: 64,
           blockSize: 4,
@@ -1668,7 +1668,7 @@ onDevices("Inference", () => (it) => {
     it.effect("rejects a model whose output is not batch-by-time-by-vocab logits", () =>
       Effect.gen(function*() {
         const model = yield* Model.define({
-          parameters: [],
+          parameterSpecs: [],
           forward: (_, input) => Tensor.cast(input, "f32")
         })
         const error = yield* Effect.flip(Model.inference(model, [], { maxTokens: 16, blockSize: 4 }))
@@ -1679,7 +1679,7 @@ onDevices("Inference", () => (it) => {
     it.effect("validates step entries and keeps finished logits owned by the caller", () =>
       Effect.gen(function*() {
         const model = yield* makeGpt()
-        const params = yield* Tensor.compute(yield* model.init)
+        const params = yield* Tensor.compute(yield* Model.initialize(model))
         const program = yield* Model.inference(model, params, { maxTokens: 32, blockSize: 4, batchSize: 2 })
         const gen = yield* program.execution()
         const entry = (yield* gen.add([yield* ids([1, 5, 3])]))[0]!
@@ -1701,7 +1701,7 @@ onDevices("Inference", () => (it) => {
     it.effect("validates inference config and prompt dtype before compilation or execution", () =>
       Effect.gen(function*() {
         const model = yield* makeGpt()
-        const params = yield* Tensor.compute(yield* model.init)
+        const params = yield* Tensor.compute(yield* Model.initialize(model))
         const badConfigs = [
           [{ maxTokens: 16, blockSize: 0 }, /blockSize/],
           [{ maxTokens: 16, blockSize: 4, attentionWindow: 17 }, /attentionWindow/],
@@ -1726,7 +1726,7 @@ onDevices("Inference", () => (it) => {
     it.effect("runs i64 token programs without truncating token state", () =>
       Effect.gen(function*() {
         const model = yield* makeGpt()
-        const params = yield* Tensor.compute(yield* model.init)
+        const params = yield* Tensor.compute(yield* Model.initialize(model))
         const program = yield* Model.inference(model, params, {
           maxTokens: 32,
           blockSize: 4,
@@ -1752,7 +1752,7 @@ onDevices("Inference", () => (it) => {
     it.effect("validates the add calling convention", () =>
       Effect.gen(function*() {
         const model = yield* makeGpt()
-        const params = yield* Tensor.compute(yield* model.init)
+        const params = yield* Tensor.compute(yield* Model.initialize(model))
         const program = yield* Model.inference(model, params, { maxTokens: 16, blockSize: 4 })
         const gen = yield* program.execution()
         const batched = yield* Effect.flip(gen.add([yield* Tensor.fromTypedArray(new Uint32Array(6), [2, 3])]))
@@ -1766,7 +1766,7 @@ onDevices("Inference", () => (it) => {
     it.effect("matches the naive logits numerically, not just on argmax", () =>
       Effect.gen(function*() {
         const model = yield* makeGpt()
-        const params = yield* Tensor.compute(yield* model.init)
+        const params = yield* Tensor.compute(yield* Model.initialize(model))
         const program = yield* Model.inference(model, params, { maxTokens: 32, blockSize: 4 })
         const gen = yield* program.execution()
         const entry = (yield* gen.add([yield* ids([1, 5, 3])]))[0]!
@@ -1783,7 +1783,7 @@ onDevices("Inference", () => (it) => {
     it.effect("RoPE: matches naive greedy generation with full attention", () =>
       Effect.gen(function*() {
         const model = yield* makeRopeGpt
-        const params = yield* Tensor.compute(yield* model.init)
+        const params = yield* Tensor.compute(yield* Model.initialize(model))
         const prompt = [1, 5, 3]
         const steps = 8
         const program = yield* Model.inference(model, params, { maxTokens: 32, blockSize: 4 })
@@ -1795,7 +1795,7 @@ onDevices("Inference", () => (it) => {
     it.effect("RoPE + attention window: matches the window-relative recompute token-for-token, unbounded", () =>
       Effect.gen(function*() {
         const model = yield* makeRopeGpt
-        const params = yield* Tensor.compute(yield* model.init)
+        const params = yield* Tensor.compute(yield* Model.initialize(model))
         const prompt = [1, 5]
         const window = 8
         const steps = 24 // the context grows to 26: far past the window
@@ -1833,7 +1833,7 @@ onDevices("Inference", () => (it) => {
           stop: ({ step }) => step >= 50,
           onStep: ({ loss }) => Effect.sync(() => losses.push(loss))
         })
-        yield* trainer.train()
+        yield* trainer.train(yield* Model.initialize(trainer.model))
         expect(losses.length).toBe(50)
         expect(Number.isFinite(losses[49])).toBe(true)
         expect(losses[49]).toBeLessThan(losses[0])

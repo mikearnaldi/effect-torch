@@ -167,7 +167,7 @@ onDevices("Kda", (device) => (it) => {
     it.effect("runs a finite forward pass at the declared shapes", () =>
       Effect.gen(function*() {
         const model = yield* Model.kimiDeltaAttention("kda", 32, 4)
-        expect(model.names).toEqual([
+        expect(model.parameterSpecs.map(({ name }) => name)).toEqual([
           "kda.qkv.weight",
           "kda.qkv.bias",
           "kda.convqkv.weight",
@@ -182,7 +182,7 @@ onDevices("Kda", (device) => (it) => {
           "kda.wo.weight",
           "kda.wo.bias"
         ])
-        const params = yield* Tensor.compute(yield* model.init)
+        const params = yield* Tensor.compute(yield* Model.initialize(model))
         const x = yield* Tensor.fromTypedArray(
           floats(Array.from({ length: 2 * 10 * 32 }, (_, i) => ((i * 5 + 1) % 11 - 5) / 5)),
           [2, 10, 32]
@@ -203,7 +203,7 @@ onDevices("Kda", (device) => (it) => {
     it.effect("gradients flow to every parameter", () =>
       Effect.gen(function*() {
         const model = yield* Model.kimiDeltaAttention("kda", 16, 4)
-        const params = yield* Tensor.compute(yield* model.init)
+        const params = yield* Tensor.compute(yield* Model.initialize(model))
         const x = yield* Tensor.fromTypedArray(
           floats(Array.from({ length: 2 * 9 * 16 }, (_, i) => ((i * 5 + 1) % 11 - 5) / 5)),
           [2, 9, 16]
@@ -216,7 +216,7 @@ onDevices("Kda", (device) => (it) => {
           const gv = yield* values(g)
           assert.assertTrue(
             gv.every(Number.isFinite) && gv.some((x) => x !== 0),
-            `param ${model.names[i]} has a degenerate gradient`
+            `param ${model.parameterSpecs.map(({ name }) => name)[i]} has a degenerate gradient`
           )
         }
       }))
@@ -243,12 +243,14 @@ onDevices("Kda", (device) => (it) => {
           })
         })
         if (device !== "metal") {
-          const error = yield* Effect.flip(Effect.flatMap(makeTrainer, (trainer) => trainer.train()))
+          const error = yield* Effect.flip(
+            Effect.flatMap(makeTrainer, (trainer) => Effect.flatMap(Model.initialize(model), trainer.train))
+          )
           expect(error._tag).toBe("ModelError")
           return
         }
         const trainer = yield* makeTrainer
-        const { params, step } = yield* trainer.train()
+        const { params, step } = yield* trainer.train(yield* Model.initialize(trainer.model))
         expect(step).toBe(4)
         expect(params.every((p) => p.dtype === "f32")).toBe(true)
         const forwardParams = yield* Effect.all(params.map((param) => Tensor.cast(param, "bf16")))
@@ -348,7 +350,7 @@ onDevices("Kda", (device) => (it) => {
     it.effect("rejects speculative configuration for recurrent target state", () =>
       Effect.gen(function*() {
         const model = yield* makeHybrid
-        const params = yield* Tensor.compute(yield* model.init)
+        const params = yield* Tensor.compute(yield* Model.initialize(model))
         const proposer = Speculation.autoregressive(model, params, { vocabulary: VOCAB, maxDraftTokens: 2 })
         const error = yield* Effect.flip(Model.inference(model, params, {
           maxTokens: 32,
@@ -398,7 +400,7 @@ onDevices("Kda", (device) => (it) => {
     it.effect("hybrid KDA + NoPE attention matches naive greedy generation token-for-token", () =>
       Effect.gen(function*() {
         const model = yield* makeHybrid
-        const params = yield* Tensor.compute(yield* model.init)
+        const params = yield* Tensor.compute(yield* Model.initialize(model))
         const prompt = [1, 5, 3]
         const steps = 9
         const program = yield* Model.inference(model, params, {
@@ -415,7 +417,7 @@ onDevices("Kda", (device) => (it) => {
     it.effect("hybrid KDA multi-chunk prefill matches the naive reference", () =>
       Effect.gen(function*() {
         const model = yield* makeHybrid
-        const params = yield* Tensor.compute(yield* model.init)
+        const params = yield* Tensor.compute(yield* Model.initialize(model))
         const prompt = [1, 5, 3, 8, 2, 11, 4, 7, 6]
         const steps = 4
         const program = yield* Model.inference(model, params, {
@@ -431,7 +433,7 @@ onDevices("Kda", (device) => (it) => {
     it.effect("recurrent pools restore shared prefixes across sequences", () =>
       Effect.gen(function*() {
         const model = yield* makeHybrid
-        const params = yield* Tensor.compute(yield* model.init)
+        const params = yield* Tensor.compute(yield* Model.initialize(model))
         const prompt = [1, 5, 3, 8, 2]
         const program = yield* Model.inference(model, params, {
           maxTokens: 64,
@@ -453,7 +455,7 @@ onDevices("Kda", (device) => (it) => {
     it.effect("prefillMatch restores a recurrent snapshot at a block boundary", () =>
       Effect.gen(function*() {
         const model = yield* makeHybrid
-        const params = yield* Tensor.compute(yield* model.init)
+        const params = yield* Tensor.compute(yield* Model.initialize(model))
         const exemplar = yield* Tensor.zeros([1, 4], { dtype: "u32" })
         const placeholders: Array<Tensor.Lazy> = []
         for (let index = 0; index < params.length; index++) {
@@ -527,7 +529,7 @@ onDevices("Kda", (device) => (it) => {
     it.effect("a pure-KDA stack (zero KV layers) generates through the decode programs", () =>
       Effect.gen(function*() {
         const model = yield* makePureKda
-        const params = yield* Tensor.compute(yield* model.init)
+        const params = yield* Tensor.compute(yield* Model.initialize(model))
         const prompt = [2, 4]
         const steps = 7
         const program = yield* Model.inference(model, params, {
@@ -543,7 +545,7 @@ onDevices("Kda", (device) => (it) => {
     it.effect("batched decode steps two hybrid sequences independently", () =>
       Effect.gen(function*() {
         const model = yield* makeHybrid
-        const params = yield* Tensor.compute(yield* model.init)
+        const params = yield* Tensor.compute(yield* Model.initialize(model))
         const program = yield* Model.inference(model, params, {
           maxTokens: 64,
           blockSize: 4,
@@ -580,7 +582,7 @@ onDevices("Kda", (device) => (it) => {
     it.effect("hybrid recurrent state stays physical across sparse refill and reversed requests", () =>
       Effect.gen(function*() {
         const model = yield* makeHybrid
-        const params = yield* Tensor.compute(yield* model.init)
+        const params = yield* Tensor.compute(yield* Model.initialize(model))
         const program = yield* Model.inference(model, params, {
           maxTokens: 64,
           blockSize: 4,

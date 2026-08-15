@@ -89,11 +89,22 @@ export class TokenizerError extends Data.TaggedError("TokenizerError")<{
  * @category models
  */
 export type Padding =
-  | { readonly _tag: "None" }
-  | { readonly _tag: "Longest"; readonly padId: number }
   | {
+    /** Selects no facade padding. */
+    readonly _tag: "None"
+  }
+  | {
+    /** Selects padding to the longest row in the batch. */
+    readonly _tag: "Longest"
+    /** Token id written into padded positions. */
+    readonly padId: number
+  }
+  | {
+    /** Selects padding to an explicit row length. */
     readonly _tag: "MaxLength"
+    /** Exact number of columns in the padded batch. */
     readonly maxLength: number
+    /** Token id written into padded positions. */
     readonly padId: number
   }
 
@@ -144,8 +155,16 @@ export const paddingMaxLength = (
  * @category models
  */
 export type Truncation =
-  | { readonly _tag: "None" }
-  | { readonly _tag: "MaxLength"; readonly maxLength: number }
+  | {
+    /** Selects no facade truncation. */
+    readonly _tag: "None"
+  }
+  | {
+    /** Selects truncation to an explicit sequence length. */
+    readonly _tag: "MaxLength"
+    /** Maximum number of token ids retained from a sequence. */
+    readonly maxLength: number
+  }
 
 /**
  * Disables truncation.
@@ -262,6 +281,7 @@ export type TokenIdInput = TokenIds | Uint32Array | ReadonlyArray<number>
  * @category models
  */
 export interface EncodeOptions {
+  /** Whether the native postprocessor may add its configured special tokens. */
   readonly addSpecialTokens?: boolean | undefined
 }
 
@@ -274,6 +294,7 @@ export interface EncodeOptions {
  * @category models
  */
 export interface DecodeOptions {
+  /** Whether registered special-token ids are omitted from decoded text. */
   readonly skipSpecialTokens?: boolean | undefined
 }
 
@@ -322,8 +343,18 @@ export type TrainModel = "BPE" | "WordPiece" | "Unigram" | "WordLevel"
  * @category models
  */
 export type TrainSource =
-  | { readonly _tag: "Files"; readonly paths: ReadonlyArray<string> }
-  | { readonly _tag: "Texts"; readonly texts: ReadonlyArray<string> }
+  | {
+    /** Selects a corpus streamed from files. */
+    readonly _tag: "Files"
+    /** UTF-8 corpus files consumed in this order. */
+    readonly paths: ReadonlyArray<string>
+  }
+  | {
+    /** Selects an in-memory corpus. */
+    readonly _tag: "Texts"
+    /** Strings supplied as independent training sequences. */
+    readonly texts: ReadonlyArray<string>
+  }
 
 /**
  * Creates a file source without copying `paths`.
@@ -372,7 +403,10 @@ export const trainTexts = (texts: ReadonlyArray<string>): TrainSource => ({
  * @category models
  */
 export type TrainProgress<E, R> =
-  | { readonly _tag: "None" }
+  | {
+    /** Selects no progress reporting. */
+    readonly _tag: "None"
+  }
   | {
     /** Selects Effect-based progress reporting. */
     readonly _tag: "Report"
@@ -444,8 +478,11 @@ export interface TrainConfig<E, R> {
  * @category models
  */
 export interface ChatMessage {
+  /** Conversation role exposed to the template. */
   readonly role: string
+  /** Optional message payload exposed to the template. */
   readonly content?: unknown | undefined
+  /** Additional caller-defined fields exposed to the template. */
   readonly [field: string]: unknown
 }
 

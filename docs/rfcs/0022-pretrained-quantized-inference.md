@@ -37,7 +37,7 @@ local GGUF path
   -> Gguf.load validates metadata and descriptors
   -> Registry.get("gguf:" + exact general.architecture)
   -> architecture.create(canonical config)
-  -> name/shape bijection with model.parameters
+  -> name/shape bijection with model.parameterSpecs
   -> active runtime loads GGUF natively
   -> Gguf.load validates returned descriptors and opaque tensor handles
   -> ordinary Model.Model + Model.Params
@@ -192,17 +192,13 @@ definition contract:
 export interface ParameterSpec {
   readonly name: string
   readonly shape: ReadonlyArray<number>
+  readonly initializer: ParameterInitializer
 }
 
 export type Params = ReadonlyArray<Tensor.Any>
 
 export interface Definition {
-  readonly parameters: ReadonlyArray<ParameterSpec>
-  readonly init?: Effect.Effect<
-    Model.Params,
-    Tensor.TensorError,
-    Runtime.Runtime
-  >
+  readonly parameterSpecs: ReadonlyArray<ParameterSpec>
   readonly forward: Model.Model["forward"]
 }
 
@@ -211,16 +207,12 @@ export declare const define: (
 ) => Effect.Effect<Model.Model, Model.ModelError>
 ```
 
-`Model.define` validates non-empty unique names and logical shapes and attaches
-the existing compiled execution machinery. `model.names` is the ordered
-projection of `model.parameters`. The specification describes model semantics,
-not physical storage, codecs, files, or runtime ownership.
+`Model.define` validates non-empty unique names, logical shapes, and initializer
+descriptors, then attaches the existing compiled execution machinery. The
+specification describes model semantics, not physical storage, codecs, files,
+or runtime ownership.
 
-When `init` is omitted, `model.init` fails immediately with `ModelError` before
-requesting a runtime or allocating a tensor. This is the load-only behavior used
-by Muse.
-
-The model parameter order remains exactly `model.names`. A tied logical use
+The model parameter order remains exactly `model.parameterSpecs`. A tied logical use
 reuses one parameter index. Existing dense constructors, training, save/load,
 and inference retain their current behavior. GGUF loading does not add
 format-specific model parameter behavior.
@@ -314,12 +306,12 @@ export declare const load: (
 5. Convert GGUF metadata into canonical `ModelConfig`.
 6. Call `architecture.create(config)` to build the model template.
 7. Prove a bijection between GGUF tensor names/logical shapes and
-   `model.parameters`.
+   `model.parameterSpecs`.
 8. Call native backend `load(path)`.
 9. Validate every loaded descriptor against inspection and every opaque handle
    against the runtime placement, logical f32 shape/dtype, and encoded storage
    metadata.
-10. Order the returned tensors by `model.parameters` and return
+10. Order the returned tensors by `model.parameterSpecs` and return
     `{ model, params }`.
 11. If loading, cancellation, or post-load validation fails, release every
     handle created by that load attempt.
@@ -719,7 +711,7 @@ blk.N.ffn_up.weight
 blk.N.ffn_down.weight
 ```
 
-The architecture uses those names directly as `model.names`. The loader proves
+The architecture uses those names directly in `model.parameterSpecs`. The loader proves
 that every source tensor is consumed exactly once with no missing or extra
 entry.
 

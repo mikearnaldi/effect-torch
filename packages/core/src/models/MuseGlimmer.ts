@@ -177,28 +177,30 @@ const makeParameters = (config: Config): ReadonlyArray<Model.ParameterSpec> => {
   const keySize = config["attention.head_count_kv"] * config["attention.key_length"]
   const valueSize = config["attention.head_count_kv"] * config["attention.value_length"]
   const attentionSize = config["attention.head_count"] * config["attention.value_length"]
+  const normal = (fanIn: number): Model.ParameterInitializer => ({ _tag: "Normal", scale: 1 / Math.sqrt(fanIn) })
+  const one: Model.ParameterInitializer = { _tag: "Constant", value: 1 }
   const specs: Array<Model.ParameterSpec> = [
-    { name: "token_embd.weight", shape: [config.vocab_size, hiddenSize] },
-    { name: "output_norm.weight", shape: [hiddenSize] },
-    { name: "output.weight", shape: [config.vocab_size, hiddenSize] }
+    { name: "token_embd.weight", shape: [config.vocab_size, hiddenSize], initializer: normal(hiddenSize) },
+    { name: "output_norm.weight", shape: [hiddenSize], initializer: one },
+    { name: "output.weight", shape: [config.vocab_size, hiddenSize], initializer: normal(hiddenSize) }
   ]
   for (let layer = 0; layer < config.block_count; layer++) {
     const prefix = `blk.${layer}`
     specs.push(
-      { name: `${prefix}.attn_norm.weight`, shape: [hiddenSize] },
-      { name: `${prefix}.post_attention_norm.weight`, shape: [hiddenSize] },
-      { name: `${prefix}.attn_q.weight`, shape: [querySize, hiddenSize] },
-      { name: `${prefix}.attn_k.weight`, shape: [keySize, hiddenSize] },
-      { name: `${prefix}.attn_v.weight`, shape: [valueSize, hiddenSize] },
-      { name: `${prefix}.attn_q_norm.weight`, shape: [config["attention.key_length"]] },
-      { name: `${prefix}.attn_k_norm.weight`, shape: [config["attention.key_length"]] },
-      { name: `${prefix}.attn_gate.weight`, shape: [attentionSize, hiddenSize] },
-      { name: `${prefix}.attn_output.weight`, shape: [hiddenSize, attentionSize] },
-      { name: `${prefix}.ffn_norm.weight`, shape: [hiddenSize] },
-      { name: `${prefix}.post_ffw_norm.weight`, shape: [hiddenSize] },
-      { name: `${prefix}.ffn_gate.weight`, shape: [feedForwardSize, hiddenSize] },
-      { name: `${prefix}.ffn_up.weight`, shape: [feedForwardSize, hiddenSize] },
-      { name: `${prefix}.ffn_down.weight`, shape: [hiddenSize, feedForwardSize] }
+      { name: `${prefix}.attn_norm.weight`, shape: [hiddenSize], initializer: one },
+      { name: `${prefix}.post_attention_norm.weight`, shape: [hiddenSize], initializer: one },
+      { name: `${prefix}.attn_q.weight`, shape: [querySize, hiddenSize], initializer: normal(hiddenSize) },
+      { name: `${prefix}.attn_k.weight`, shape: [keySize, hiddenSize], initializer: normal(hiddenSize) },
+      { name: `${prefix}.attn_v.weight`, shape: [valueSize, hiddenSize], initializer: normal(hiddenSize) },
+      { name: `${prefix}.attn_q_norm.weight`, shape: [config["attention.key_length"]], initializer: one },
+      { name: `${prefix}.attn_k_norm.weight`, shape: [config["attention.key_length"]], initializer: one },
+      { name: `${prefix}.attn_gate.weight`, shape: [attentionSize, hiddenSize], initializer: normal(hiddenSize) },
+      { name: `${prefix}.attn_output.weight`, shape: [hiddenSize, attentionSize], initializer: normal(attentionSize) },
+      { name: `${prefix}.ffn_norm.weight`, shape: [hiddenSize], initializer: one },
+      { name: `${prefix}.post_ffw_norm.weight`, shape: [hiddenSize], initializer: one },
+      { name: `${prefix}.ffn_gate.weight`, shape: [feedForwardSize, hiddenSize], initializer: normal(hiddenSize) },
+      { name: `${prefix}.ffn_up.weight`, shape: [feedForwardSize, hiddenSize], initializer: normal(hiddenSize) },
+      { name: `${prefix}.ffn_down.weight`, shape: [hiddenSize, feedForwardSize], initializer: normal(feedForwardSize) }
     )
   }
   return specs
@@ -219,8 +221,7 @@ const rms = (
  * only model-level forward checks; this function does not require positive
  * `B` or `S`. Individual tensor operations validate parameter shape, dtype,
  * placement, and token dtype; out-of-vocabulary token IDs fail when the
- * embedding executes. Because no initializer is supplied to `Model.define`,
- * `model.init` fails and parameters must be loaded.
+ * embedding executes.
  *
  * For each layer, Q/K/V have shapes `[B, Hq, S, Dk]`,
  * `[B, Hkv, S, Dk]`, and `[B, Hkv, S, Dv]`. Causal GQA produces
@@ -248,7 +249,7 @@ const rms = (
  * an explicit local-layer window.
  */
 const makeModel = (config: Config): Effect.Effect<Model.Model, Model.ModelError> => {
-  const parameters = makeParameters(config)
+  const parameterSpecs = makeParameters(config)
   const queryHeads = config["attention.head_count"]
   const keyValueHeads = config["attention.head_count_kv"]
   const keyLength = config["attention.key_length"]
@@ -257,13 +258,13 @@ const makeModel = (config: Config): Effect.Effect<Model.Model, Model.ModelError>
   const rmsEpsilon = config["attention.layer_norm_rms_epsilon"]
   const slidingWindowPattern = config["attention.sliding_window_pattern"]
   return Model.define({
-    parameters,
+    parameterSpecs,
     forward: (params, input, trace) =>
       Effect.gen(function*() {
-        if (params.length !== parameters.length) {
+        if (params.length !== parameterSpecs.length) {
           return yield* new Model.ModelError({
             op: "forward",
-            message: `MuseGlimmer.forward: expected ${parameters.length} parameters, got ${params.length}`
+            message: `MuseGlimmer.forward: expected ${parameterSpecs.length} parameters, got ${params.length}`
           })
         }
         if (input.shape.length !== 2) {
@@ -378,7 +379,12 @@ const makeModel = (config: Config): Effect.Effect<Model.Model, Model.ModelError>
 export const create = (config: Gguf.ModelConfig): Effect.Effect<Model.Model, Model.ModelError> =>
   Effect.flatMap(decodeConfig(config), makeModel)
 
-/** Explicit GGUF model definition used by {@link loadGGUF}. */
+/**
+ * Explicit GGUF model definition used by {@link loadGGUF}.
+ *
+ * @since 0.1.0
+ * @category models
+ */
 export const definition: Gguf.ModelDefinition = {
   architecture,
   create

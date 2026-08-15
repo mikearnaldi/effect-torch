@@ -7,7 +7,7 @@ onDevices("Speculation", () => (it) => {
   it.effect("constructs an exact autoregressive artifact", () =>
     Effect.gen(function*() {
       const model = yield* Model.embedding("draft", 16, 8)
-      const params = yield* model.init
+      const params = yield* Model.initialize(model)
       expect(Speculation.autoregressive(model, params, { vocabulary: 16, maxDraftTokens: 4 })).toEqual({
         _tag: "Autoregressive",
         model,

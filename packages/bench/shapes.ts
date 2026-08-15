@@ -2,7 +2,7 @@
 // 30M FineWeb training step. CHAIN independent roots are submitted together to
 // amortize eager graph/compile overhead. Their shared a/b inputs remain lazy, so
 // each sample also executes fresh randn+bf16 input generation; `Tensor.compute`
-// completes the run and every output is then released. ms/GFLOP/s counts only
+// completes the run and every output is then released. Reported GFLOP/s counts
 // GEMM arithmetic despite that extra work. `xN/step` is a rough hand-maintained
 // extrapolation, not a complete non-overlapping operation inventory or a measured
 // training step. ITERS and CHAIN are unvalidated environment overrides.
@@ -44,7 +44,7 @@ const bench = <A extends Tensor.Any>(
     )
   })
 
-// real 30M fineweb model: EMBED=256, HEADS=4, LAYERS=6, BLOCK=256
+// FineWeb 30M model dimensions: EMBED=256, HEADS=4, LAYERS=6, BLOCK=256.
 const BT = 128 * 256 // tokens per step at batch 128
 
 const program = Effect.gen(function*() {

@@ -820,7 +820,7 @@ const runModel = (input: Tensor.Any) =>
       yield* Model.sigmoid
     )
 
-    const params = yield* Tensor.compute(yield* model.init)
+    const params = yield* Tensor.compute(yield* Model.initialize(model))
     const lazyOutput = yield* model.forward(params, input)
     const concreteOutput = yield* model.execute(params, input)
     return { lazyOutput, concreteOutput }
@@ -903,7 +903,7 @@ const train = (model: Model.Model, input: Tensor.Any, target: Tensor.Any) =>
           : Effect.void
     })
 
-    return yield* trainer.train()
+    return yield* trainer.train(yield* Model.initialize(model))
   })
 ```
 

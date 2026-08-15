@@ -5,6 +5,7 @@
   "exports": {
     ".": "./src/index.ts",
     "./models": "./src/models/index.ts",
+    "./proposers": "./src/proposers/index.ts",
     "./package.json": "./package.json"
   },
   "main": "src/index.ts",
@@ -16,6 +17,7 @@
     "exports": {
       ".": "./dist/index.js",
       "./models": "./dist/models/index.js",
+      "./proposers": "./dist/proposers/index.js",
       "./package.json": "./package.json"
     },
     "main": "dist/index.js",

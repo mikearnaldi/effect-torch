@@ -108,7 +108,7 @@ onDevices("Checkpoint", () => (it) => {
       const input = yield* Tensor.fromTypedArray(floats([0, 1, 1, 0]), [2, 2])
       const target = yield* Tensor.fromTypedArray(floats([1, 0]), [2, 1])
       const optimizer = yield* Optimizer.adam()
-      const initial = yield* Tensor.compute(yield* model.init)
+      const initial = yield* Tensor.compute(yield* Model.initialize(model))
       const makeTrainer = (stopStep: number) =>
         Effect.gen(function*() {
           const config: Trainer.TrainConfig<Optimizer.AdamState, Tensor.TensorError> = {
@@ -154,7 +154,7 @@ onDevices("Checkpoint", () => (it) => {
       const samplerConfig = { length: 4 * 8 + 1, block: 8, batch: 2 }
       const sampler = yield* Sampler.make(samplerConfig)
       sampler.next()
-      const trained = yield* trainer.train()
+      const trained = yield* trainer.train(yield* Model.initialize(trainer.model))
       yield* Checkpoint.saveWithSampler(file, trainer, trained, sampler)
       const expected = sampler.next()
       const checkpoint = yield* Checkpoint.loadWithSampler(file, trainer)
@@ -180,7 +180,7 @@ onDevices("Checkpoint", () => (it) => {
         data: { input, target },
         stop: ({ step }) => step >= 1
       })
-      const trained = yield* trainer.train()
+      const trained = yield* trainer.train(yield* Model.initialize(trainer.model))
       const samplerConfig = { length: 4 * 8 + 1, block: 8, batch: 2 }
       const sampler = yield* Sampler.make(samplerConfig)
       sampler.next()
@@ -264,7 +264,7 @@ onDevices("Checkpoint", () => (it) => {
         },
         stop: () => true
       })
-      const trained = yield* trainer.train()
+      const trained = yield* trainer.train(yield* Model.initialize(trainer.model))
 
       const arity = yield* Effect.flip(Checkpoint.save(file, trainer, { ...trained, params: [] }))
       expect(arity.message).toContain("parameters")

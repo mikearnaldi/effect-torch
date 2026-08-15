@@ -6,22 +6,30 @@ import fs from "node:fs"
 
 // Shared FineWeb model and data contracts. The training scripts consume flat
 // u16 token streams, while inference consumes bare safetensors artifacts keyed
-// by `model.names`; resumable Checkpoint archives use a different key schema
-// and must be exported before `loadParams` can read them. Bare artifacts contain
-// no architecture metadata, and loading checks names only; incompatible tensor
-// shape/dtype semantics are deferred to later model execution.
+// by `model.parameterSpecs`; resumable Checkpoint archives use a different key
+// schema and must be exported before `loadParams` can read them. Bare artifacts
+// contain no architecture metadata, and loading checks names only; incompatible
+// tensor shape/dtype semantics are deferred to later model execution.
 // FINEWEB_BLOCK is Number-parsed once at module load and is not stored in bare
 // artifacts; it controls both training windows and inference attention policy.
 
+/** Filesystem path to the shared GPT-2 tokenizer definition. */
 export const TOKENIZER_JSON = new URL("../data/gpt2-tokenizer.json", import.meta.url).pathname
+/** Default path for bare FineWeb model parameters. */
 export const CHECKPOINT = new URL("../data/fineweb-model.safetensors", import.meta.url).pathname
+/** GPT-2 end-of-text token used to delimit documents and stop generation. */
 export const EOT = "<|endoftext|>"
 
+/** Training sequence length and inference attention window. */
 export const BLOCK = Number(process.env.FINEWEB_BLOCK ?? 256)
+/** Transformer residual width. */
 export const EMBED = 256
+/** Number of attention heads per transformer block. */
 export const HEADS = 4
+/** Number of transformer blocks. */
 export const LAYERS = 6
 
+/** Builds the FineWeb causal transformer for the supplied vocabulary size. */
 export const createGpt = (
   vocabSize: number
 ): Effect.Effect<Model.Model, Model.ModelError | Tensor.TensorError> =>
@@ -52,15 +60,19 @@ export const createGpt = (
     return model
   })
 
+/** Loads the shared GPT-2 tokenizer without padding or truncation. */
 export const loadTokenizer = Tokenizer.fromFile(TOKENIZER_JSON, {
   padding: Tokenizer.paddingNone,
   truncation: Tokenizer.truncationNone,
   specialTokens: "Always"
 })
 
-/** Saves a bare model artifact keyed by parameter name, without trainer state. */
+/**
+ * Saves parameters in model order as a bare named artifact without trainer
+ * state. The caller must supply one parameter for every parameter spec.
+ */
 export const saveParams = (model: Model.Model, params: Model.Params, path: string) =>
-  Tensor.save(path, Object.fromEntries(model.names.map((name, i) => [name, params[i]])))
+  Tensor.save(path, Object.fromEntries(model.parameterSpecs.map(({ name }, i) => [name, params[i]])))
 
 /**
  * Loads named bare parameters into model order. `Tensor.load` imports the
@@ -73,14 +85,17 @@ export const loadParams = (
 ): Effect.Effect<ReadonlyArray<Tensor.Concrete>, Model.ModelError | Tensor.TensorError, Runtime.Runtime> =>
   Model.load(model, path)
 
-/** Reads a u16 token bin produced by prepare.ts. */
+/** Reads a headerless u16 token bin produced by `prepare.ts`. */
 export const loadBin = (path: string) => {
   const buffer = fs.readFileSync(path)
   if (buffer.byteOffset % 2 !== 0) throw new Error("misaligned token bin buffer")
   return new Uint16Array(buffer.buffer, buffer.byteOffset, buffer.byteLength / 2)
 }
 
-/** Materializes batch windows (start offsets) into input/target id arrays. */
+/**
+ * Materializes supplied start offsets as next-token input and target rows.
+ * Starts must identify complete `block + 1` token spans in `data`.
+ */
 export const windows = (data: Uint16Array, starts: ReadonlyArray<number>, batch: number, block: number) => {
   const inputs = new Uint32Array(batch * block)
   const targets = new Uint32Array(batch * block)
@@ -93,7 +108,7 @@ export const windows = (data: Uint16Array, starts: ReadonlyArray<number>, batch:
   return { inputs, targets }
 }
 
-/** Mean cross-entropy over random windows sampled with replacement and no fixed seed. */
+/** Computes mean cross-entropy over random held-out windows with no fixed seed. */
 export const heldOutLoss = (
   model: Model.Model,
   params: Model.Params,

@@ -3805,10 +3805,15 @@ const typedArrayConstructor = (dtype: DType) => {
  * @category models
  */
 export interface SamplingOptions {
+  /** Non-negative temperature; defaults to `1`, while zero selects argmax. */
   readonly temperature?: number
+  /** Candidate count before top-p filtering; defaults to `0` (disabled). */
   readonly topK?: number
+  /** Cumulative probability threshold; defaults to `1` (disabled). */
   readonly topP?: number
+  /** Non-negative safe integer identifying the deterministic random stream. */
   readonly seed: number
+  /** Non-negative safe integer identifying a draw within the stream; defaults to `0`. */
   readonly counter?: number
 }
 
@@ -4745,12 +4750,19 @@ export interface KvPool {
  * @category compilation
  */
 export interface KvRecurrentGeometry {
+  /** Number of KDA recurrent layers, or zero when absent. */
   readonly kdaLayers: number
+  /** Number of heads in each KDA recurrent layer. */
   readonly kdaHeads: number
+  /** Key width of each KDA recurrent head. */
   readonly kdaHeadDim: number
+  /** Value width of each KDA recurrent head. */
   readonly kdaValueDim: number
+  /** Number of short-convolution recurrent layers, or zero when absent. */
   readonly convLayers: number
+  /** Channel count of each short-convolution layer. */
   readonly convChannels: number
+  /** Kernel size of each short-convolution layer. */
   readonly convKernel: number
 }
 

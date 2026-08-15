@@ -250,9 +250,9 @@ export interface Trainer<S, EL = never, RL = never, ED = never, RD = never, EO =
    */
   readonly config: TrainConfig<S, EL, RL, ED, RD, EO, RO>
   /**
-   * Runs at least one step, starting from `params` or `model.init`, and calls
-   * `onStep` before checking `stop`. A `resume` must be accompanied by its
-   * matching `params`; omitting `resume` initializes fresh optimizer state.
+   * Runs at least one step from `params` and calls `onStep` before checking
+   * `stop`. A `resume` must be accompanied by its matching `params`; omitting
+   * `resume` initializes fresh optimizer state.
    *
    * The loop owns every parameter/state generation it materializes and releases
    * each superseded generation after the next step consumes it. Supplied
@@ -266,7 +266,7 @@ export interface Trainer<S, EL = never, RL = never, ED = never, RD = never, EO =
    * defects rather than typed failures.
    */
   readonly train: (
-    params?: Model.Params,
+    params: Model.Params,
     resume?: Resume<S>
   ) => Effect.Effect<
     Trained<S>,
@@ -473,8 +473,8 @@ const compiledStep = <S, EL, RL, ED, RD, EO, RO>(
     )
   })
 
-// The training loop shared by both forms: initialize with `initial` (or
-// `model.init` when omitted), then step until `stop` says otherwise (at
+// The training loop shared by both forms: start with the supplied parameters,
+// then step until `stop` says otherwise (at
 // least one step always runs), calling `onStep` after every step.
 // Without a cache each step builds and evaluates the full step graph;
 // with one each step is a single frozen-program call. The current generation
@@ -483,7 +483,7 @@ const compiledStep = <S, EL, RL, ED, RD, EO, RO>(
 const trainLoop = <S, EL = never, RL = never, ED = never, RD = never, EO = never, RO = never>(
   model: Model.Model,
   config: TrainConfig<S, EL, RL, ED, RD, EO, RO>,
-  initial: Model.Params | undefined,
+  initial: Model.Params,
   resume: Resume<S> | undefined,
   cache: Tensor.ProgramCache | undefined
 ): Effect.Effect<
@@ -496,13 +496,7 @@ const trainLoop = <S, EL = never, RL = never, ED = never, RD = never, EO = never
     const releaseOwned = (tensors: ReadonlyArray<Tensor.Concrete>) => Tensor.clearAll(tensors)
     return Effect.onExit(
       Effect.gen(function*() {
-        let params: Model.Params
-        if (initial !== undefined) {
-          params = initial
-        } else {
-          params = yield* model.init
-          owned = params.filter(Tensor.isTensor)
-        }
+        let params: Model.Params = initial
         const runtime = yield* Runtime.Runtime
         if (config.precision === "mixedBf16" && !runtime.capabilities.features.includes("mixed-bf16")) {
           return yield* new Model.ModelError({
@@ -517,12 +511,8 @@ const trainLoop = <S, EL = never, RL = never, ED = never, RD = never, EO = never
         } else {
           state = yield* config.optimizer.init(params)
           const roots = config.optimizer.stateRoots(state).filter(Tensor.isTensor)
-          const callerOwnedParams = initial === undefined
-            ? undefined
-            : new Set(params.filter(Tensor.isTensor))
-          const stateOwned = callerOwnedParams === undefined
-            ? roots
-            : roots.filter((root) => !callerOwnedParams.has(root))
+          const callerOwnedParams = new Set(params.filter(Tensor.isTensor))
+          const stateOwned = roots.filter((root) => !callerOwnedParams.has(root))
           owned = [...owned, ...stateOwned]
         }
         let step = resume?.step ?? 0

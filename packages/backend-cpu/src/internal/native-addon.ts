@@ -103,6 +103,7 @@ export interface NativeInferenceValueRef {
   selectTargetRow?: boolean
 }
 
+/** Generalized proposer graph, state, output, and token-map contract. @internal */
 export interface NativeInferenceProposerPlan {
   vocabulary: number
   tokenMapFingerprint: string
@@ -171,24 +172,28 @@ export declare class NativeInferenceSequence {
   get sequenceId(): bigint
 }
 
+/** Native token page emitted for one inference sequence. @internal */
 export interface NativeInferenceTokenPage {
   sequenceId: bigint
   tokens: Array<number>
   stopReason?: "eos" | "maxTokens"
 }
 
+/** Durable inference round result retained until acknowledged. @internal */
 export interface NativeInferenceRoundResult {
   roundId: bigint
   recovered: boolean
   pages: Array<NativeInferenceTokenPage>
 }
 
+/** Snapshot of one native inference sequence's cursor and terminal state. @internal */
 export interface NativeInferenceInspection {
   sequenceId: bigint
   cursor: bigint
   terminal?: "eos" | "maxTokens"
 }
 
+/** Artifact-wide cohesive inference counters and timing totals. @internal */
 export interface NativeInferenceDiagnostics {
   roundsStarted: bigint
   roundsCompleted: bigint

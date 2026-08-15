@@ -12,7 +12,7 @@
  *   lr: LearningRate.withWarmup(LearningRate.cosine(1e-3, { totalSteps }), 100),
  *   ...
  * })
- * yield* trainer.train()
+ * yield* trainer.train(yield* Model.initialize(model))
  * ```
  *
  * A fresh trainer run calls schedules with consecutive non-negative integer

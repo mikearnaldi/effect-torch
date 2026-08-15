@@ -1,4 +1,12 @@
-/** DFlash proposer graph and GGUF loader. */
+/**
+ * DFlash fixed-width parallel proposer graph and GGUF loader.
+ *
+ * The loader validates a target-coupled checkpoint, while {@link artifact}
+ * describes the target residual taps and shared weights needed by native
+ * speculative inference.
+ *
+ * @since 0.1.0
+ */
 import { Effect } from "effect"
 import * as Schema from "effect/Schema"
 import * as Gguf from "../Gguf.ts"
@@ -7,37 +15,75 @@ import type * as Runtime from "../Runtime.ts"
 import * as Speculation from "../Speculation.ts"
 import * as Tensor from "../Tensor.ts"
 
-/** Exact GGUF architecture value accepted by this loader. */
+/**
+ * Exact `general.architecture` value accepted by {@link loadGGUF}.
+ *
+ * @since 0.1.0
+ * @category identifiers
+ */
 export const architecture = "dflash"
 
-/** Validated canonical DFlash GGUF configuration. */
+/**
+ * Validated canonical DFlash GGUF configuration.
+ *
+ * @since 0.1.0
+ * @category models
+ */
 export interface Configuration {
+  /** Number of proposer transformer blocks. */
   readonly blockCount: number
+  /** Maximum sequence length declared by the artifact. */
   readonly contextLength: number
+  /** Hidden-state width. */
   readonly embeddingLength: number
+  /** Feed-forward intermediate width. */
   readonly feedForwardLength: number
+  /** Number of query attention heads. */
   readonly queryHeads: number
+  /** Number of key/value attention heads. */
   readonly kvHeads: number
+  /** Width of each key head. */
   readonly keyLength: number
+  /** Width of each value head. */
   readonly valueLength: number
+  /** Epsilon used by RMS normalization. */
   readonly rmsEpsilon: number
+  /** Causal attention window used by every proposer block. */
   readonly slidingWindow: number
+  /** Base frequency used by rotary position embeddings. */
   readonly ropeBase: number
+  /** Proposal block width including its anchor token. */
   readonly blockSize: number
+  /** Number of target token ids. */
   readonly vocabularySize: number
+  /** Vocabulary id inserted in unresolved proposal rows. */
   readonly maskToken: number
+  /** One-based target layers named by the artifact. */
   readonly targetLayers: ReadonlyArray<number>
+  /** Zero-based target residual layers consumed by replay. */
   readonly targetResidualTaps: ReadonlyArray<number>
+  /** Per-proposer-layer sliding-window flags; validation requires all true. */
   readonly slidingWindowPattern: ReadonlyArray<boolean>
 }
 
-/** Loaded parameters, canonical metadata, and target-coupled proposer artifact. */
+/**
+ * Loaded parameters, canonical metadata, and target-coupled proposer artifact.
+ *
+ * @since 0.1.0
+ * @category models
+ */
 export interface Loaded {
+  /** Caller-owned proposer tensors in `parameterSpecs` order. */
   readonly params: ReadonlyArray<Tensor.Concrete>
+  /** Canonical metadata used to validate the configuration. */
   readonly metadata: ReadonlyMap<string, unknown>
-  readonly parameters: ReadonlyArray<Model.ParameterSpec>
+  /** Exact validated GGUF tensor catalog. */
+  readonly parameterSpecs: ReadonlyArray<Gguf.TensorSpec>
+  /** Decoded DFlash architecture configuration. */
   readonly config: Configuration
+  /** Maximum candidates emitted per proposal block, equal to `blockSize - 1`. */
   readonly maxDraftTokens: number
+  /** Parallel-block artifact ready for model inference compilation. */
   readonly artifact: Speculation.ParallelBlock
 }
 
@@ -119,7 +165,14 @@ const Config = Schema.Struct({
 
 type Config = Schema.Schema.Type<typeof Config>
 
-/** Decodes and relationally validates canonical GGUF metadata. */
+/**
+ * Decodes canonical GGUF metadata and validates cross-field DFlash invariants.
+ * The metadata must already use the normalization performed by
+ * {@link Gguf.loadParameters}.
+ *
+ * @since 0.1.0
+ * @category constructors
+ */
 export const configuration = (
   metadata: ReadonlyMap<string, unknown>
 ): Effect.Effect<Configuration, Model.ModelError> =>
@@ -148,11 +201,11 @@ export const configuration = (
 
 const makeParameters = (
   metadata: ReadonlyMap<string, unknown>
-): Effect.Effect<ReadonlyArray<Model.ParameterSpec>, Model.ModelError> =>
+): Effect.Effect<ReadonlyArray<Gguf.TensorSpec>, Model.ModelError> =>
   Effect.gen(function*() {
     const config = yield* configuration(metadata)
 
-    const parameters: Array<Model.ParameterSpec> = [
+    const parameterSpecs: Array<Gguf.TensorSpec> = [
       {
         name: "fc.weight",
         shape: [config.embeddingLength, config.targetLayers.length * config.embeddingLength]
@@ -161,7 +214,7 @@ const makeParameters = (
     ]
     for (let layer = 0; layer < config.blockCount; layer++) {
       const prefix = `blk.${layer}`
-      parameters.push(
+      parameterSpecs.push(
         { name: `${prefix}.attn_norm.weight`, shape: [config.embeddingLength] },
         { name: `${prefix}.ffn_down.weight`, shape: [config.embeddingLength, config.feedForwardLength] },
         { name: `${prefix}.ffn_gate.weight`, shape: [config.feedForwardLength, config.embeddingLength] },
@@ -178,14 +231,19 @@ const makeParameters = (
         { name: `${prefix}.attn_v.weight`, shape: [config.kvHeads * config.valueLength, config.embeddingLength] }
       )
     }
-    parameters.push({ name: "output_norm.weight", shape: [config.embeddingLength] })
-    return parameters
+    parameterSpecs.push({ name: "output_norm.weight", shape: [config.embeddingLength] })
+    return parameterSpecs
   })
 
-/** Explicit GGUF definition used by {@link loadGGUF} and focused catalog tests. */
+/**
+ * Explicit GGUF parameter-artifact definition used by {@link loadGGUF}.
+ *
+ * @since 0.1.0
+ * @category models
+ */
 export const definition: Gguf.ParameterArtifactDefinition = {
   architecture,
-  parameters: makeParameters
+  parameterSpecs: makeParameters
 }
 
 const graphError = (op: string, message: string) => new Model.ModelError({ op, message })
@@ -372,7 +430,14 @@ const buildGraph = (config: Configuration) => {
   return { build, buildWithProbabilities: buildOutput, replay }
 }
 
-/** Constructs the replayable DFlash parallel-block artifact. */
+/**
+ * Constructs the replayable DFlash parallel-block artifact from validated
+ * configuration and caller-owned parameters. Construction performs no tracing,
+ * compilation, or ownership transfer.
+ *
+ * @since 0.1.0
+ * @category constructors
+ */
 export const artifact = (
   config: Configuration,
   params: ReadonlyArray<Tensor.Concrete>
@@ -404,7 +469,15 @@ export const artifact = (
   })
 }
 
-/** Loads a DFlash GGUF checkpoint as a target-coupled proposer. */
+/**
+ * Inspects, validates, and loads a DFlash GGUF checkpoint as a target-coupled
+ * proposer. The returned parameter handles are caller-owned. If configuration
+ * or artifact construction fails after loading, all loaded handles receive a
+ * best-effort release attempt.
+ *
+ * @since 0.1.0
+ * @category loading
+ */
 export const loadGGUF = (
   path: string
 ): Effect.Effect<Loaded, Gguf.GgufError | Model.ModelError, Runtime.Runtime> =>

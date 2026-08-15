@@ -55,6 +55,14 @@ export * as Loss from "./Loss.ts"
  * @category modules
  */
 export * as Model from "./Model.ts"
+
+/**
+ * Speculative decoding artifact descriptions for autoregressive, history, and
+ * parallel-block proposers.
+ *
+ * @since 0.1.0
+ * @category modules
+ */
 export * as Speculation from "./Speculation.ts"
 
 /**

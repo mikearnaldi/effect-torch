@@ -1,5 +1,5 @@
 import * as BackendApple from "@effect-torch/backend-apple-native"
-import { Checkpoint, LearningRate, Loss, Optimizer, Sampler, Tensor, Trainer } from "@effect-torch/core"
+import { Checkpoint, LearningRate, Loss, Model, Optimizer, Sampler, Tensor, Trainer } from "@effect-torch/core"
 import { NodeRuntime } from "@effect/platform-node"
 import { Duration, Effect } from "effect"
 import fs from "node:fs"
@@ -41,7 +41,7 @@ const program = Effect.gen(function*() {
 
   yield* Effect.log("1) creating model")
   const model = yield* createGpt(tokenizer.vocabSize)
-  const params0 = yield* model.init
+  const params0 = yield* Model.initialize(model)
   const total = params0.reduce((sum, param) => sum + param.shape.reduce((a, b) => a * b, 1), 0)
   yield* Effect.log(`  total: ${total.toLocaleString()} parameters`)
 

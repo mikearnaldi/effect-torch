@@ -143,6 +143,9 @@ const modelParams = (parameters: ReadonlyArray<{ readonly shape: ReadonlyArray<n
     )
   )
 
+const descriptors = (parameterSpecs: ReadonlyArray<Model.ParameterSpec>) =>
+  parameterSpecs.map(({ name, shape }) => ({ name, shape }))
+
 const expectedLayer = (layer: number) => {
   const prefix = `blk.${layer}`
   return [
@@ -262,7 +265,7 @@ it.effect("derives the parameter catalog and graph from configuration", () =>
       ["vocab_size", 12]
     ])
     const model = yield* MuseGlimmer.create(custom)
-    expect(model.parameters).toEqual([
+    expect(descriptors(model.parameterSpecs)).toEqual([
       { name: "token_embd.weight", shape: [12, 8] },
       { name: "output_norm.weight", shape: [8] },
       { name: "output.weight", shape: [12, 8] },
@@ -283,7 +286,7 @@ it.effect("derives the parameter catalog and graph from configuration", () =>
     ])
 
     requests.length = 0
-    const output = yield* model.forward(modelParams(model.parameters), handle("Tensor", [1, 2], "i64"))
+    const output = yield* model.forward(modelParams(model.parameterSpecs), handle("Tensor", [1, 2], "i64"))
     expect(output.shape).toEqual([1, 2, 12])
     const attention = requests.find(
       (request): request is Runtime.NodeRequest<"scaledDotProductAttention"> =>
@@ -301,7 +304,7 @@ it.effect("derives the parameter catalog and graph from configuration", () =>
     expect(normalizations.some(({ attributes }) => attributes.eps === 1e-8)).toBe(true)
 
     const contextError = yield* Effect.flip(
-      model.forward(modelParams(model.parameters), handle("Tensor", [1, 17], "i64"))
+      model.forward(modelParams(model.parameterSpecs), handle("Tensor", [1, 17], "i64"))
     )
     expect(contextError.message).toContain("exceeds context length 16")
   }).pipe(Effect.provide(runtimeLayer)))
@@ -331,7 +334,7 @@ it.effect("receives vocab_size from generic GGUF tokenizer token translation", (
       create: (canonical) => {
         vocabSize = canonical.get("vocab_size")
         return Model.define({
-          parameters: [],
+          parameterSpecs: [],
           forward: (_, input) => Effect.succeed(input as Tensor.Lazy)
         })
       }
@@ -366,7 +369,7 @@ it.effect("exposes canonical tokenizer metadata from GGUF loading", () => {
       architecture: "generic-metadata-test",
       create: () =>
         Model.define({
-          parameters: [],
+          parameterSpecs: [],
           forward: (_, input) => Effect.succeed(input as Tensor.Lazy)
         })
     })
@@ -377,23 +380,19 @@ it.effect("exposes canonical tokenizer metadata from GGUF loading", () => {
   }).pipe(Effect.provide(services))
 })
 
-it.effect("defines the exact load-only parameter catalog", () =>
+it.effect("defines the exact parameter catalog", () =>
   Effect.gen(function*() {
     const model = yield* MuseGlimmer.create(config())
-    expect(model.parameters).toHaveLength(731)
-    expect(model.parameters.slice(0, 3)).toEqual([
+    expect(model.parameterSpecs).toHaveLength(731)
+    expect(descriptors(model.parameterSpecs.slice(0, 3))).toEqual([
       { name: "token_embd.weight", shape: [202048, 6656] },
       { name: "output_norm.weight", shape: [6656] },
       { name: "output.weight", shape: [202048, 6656] }
     ])
-    expect(model.parameters.slice(3, 17)).toEqual(expectedLayer(0))
-    expect(model.parameters.slice(3 + 27 * 14, 3 + 28 * 14)).toEqual(expectedLayer(27))
-    expect(model.parameters.slice(-14)).toEqual(expectedLayer(51))
-    expect(model.names).toEqual(model.parameters.map(({ name }) => name))
-
-    const initError = yield* Effect.flip(model.init)
-    expect(initError._tag).toBe("ModelError")
-    expect(initError.op).toBe("init")
+    expect(descriptors(model.parameterSpecs.slice(3, 17))).toEqual(expectedLayer(0))
+    expect(descriptors(model.parameterSpecs.slice(3 + 27 * 14, 3 + 28 * 14))).toEqual(expectedLayer(27))
+    expect(descriptors(model.parameterSpecs.slice(-14))).toEqual(expectedLayer(51))
+    expect(model.parameterSpecs.every(({ initializer }) => initializer !== undefined)).toBe(true)
   }).pipe(Effect.provide(runtimeLayer)))
 
 it.effect("reports parameter arity and token rank through ModelError", () =>
@@ -403,7 +402,7 @@ it.effect("reports parameter arity and token rank through ModelError", () =>
     expect(arityError._tag).toBe("ModelError")
     expect(arityError.message).toContain("expected 731 parameters")
 
-    const rankError = yield* Effect.flip(model.forward(modelParams(model.parameters), handle("Tensor", [1], "i64")))
+    const rankError = yield* Effect.flip(model.forward(modelParams(model.parameterSpecs), handle("Tensor", [1], "i64")))
     expect(rankError._tag).toBe("ModelError")
     expect(rankError.message).toContain("[B, S]")
   }).pipe(Effect.provide(runtimeLayer)))
@@ -412,7 +411,7 @@ it.effect("builds the canonical graph with 39 local and 13 global layers", () =>
   Effect.gen(function*() {
     requests.length = 0
     const model = yield* MuseGlimmer.create(config())
-    const output = yield* model.forward(modelParams(model.parameters), handle("Tensor", [1, 2], "i64"))
+    const output = yield* model.forward(modelParams(model.parameterSpecs), handle("Tensor", [1, 2], "i64"))
     expect(output.shape).toEqual([1, 2, 202048])
 
     const attention = requests.filter(

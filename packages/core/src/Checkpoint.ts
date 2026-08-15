@@ -76,7 +76,7 @@ const U32_MAX = 0xffff_ffff
  * @category models
  */
 export interface Checkpoint<S> {
-  /** Caller-owned materialized parameters in the supplied trainer's `model.names` order. */
+  /** Caller-owned materialized parameters in the supplied trainer's parameter-spec order. */
   readonly params: ReadonlyArray<Tensor.Concrete>
   /**
    * The optimizer state rebuilt from caller-owned loaded roots and the
@@ -100,7 +100,7 @@ export interface CheckpointWithSampler<S> extends Checkpoint<S> {
 }
 
 /**
- * Saves parameters by `trainer.model.names`, optimizer state roots by stable
+ * Saves parameters by the trainer model's parameter specs, optimizer state roots by stable
  * positional index, and the global step as a u32 scalar. For a faithful round
  * trip, `trained.step` must be an integer in `0..4294967295`; values outside
  * that range fail before serialization. Optimizer values not
@@ -291,10 +291,11 @@ const trainerEntries = <S, EL, RL, ED, RD, EO, RO>(
   trained: Trainer.Trained<S>
 ): Effect.Effect<Record<string, Tensor.Any>, Tensor.TensorError, Runtime.Runtime> =>
   Effect.gen(function*() {
-    if (trained.params.length !== trainer.model.names.length) {
+    if (trained.params.length !== trainer.model.parameterSpecs.length) {
       return yield* new Tensor.TensorError({
         op: "checkpoint.save",
-        message: `checkpoint.save: model has ${trainer.model.names.length} parameters, got ${trained.params.length}`
+        message:
+          `checkpoint.save: model has ${trainer.model.parameterSpecs.length} parameters, got ${trained.params.length}`
       })
     }
     if (!Number.isSafeInteger(trained.step) || trained.step < 0 || trained.step > U32_MAX) {
@@ -304,7 +305,7 @@ const trainerEntries = <S, EL, RL, ED, RD, EO, RO>(
       })
     }
     const entries: Record<string, Tensor.Any> = Object.fromEntries(
-      trainer.model.names.map((name, i) => [`${PARAM_PREFIX}${name}`, trained.params[i]])
+      trainer.model.parameterSpecs.map((parameter, i) => [`${PARAM_PREFIX}${parameter.name}`, trained.params[i]])
     )
     for (const [i, root] of trainer.config.optimizer.stateRoots(trained.state).entries()) {
       entries[`${STATE_PREFIX}${i}`] = root
@@ -395,7 +396,7 @@ const trainerCheckpoint = <S, EL, RL, ED, RD, EO, RO>(
   Effect.gen(function*() {
     const optimizer = trainer.config.optimizer
     const params: Array<Tensor.Concrete> = []
-    for (const name of trainer.model.names) {
+    for (const { name } of trainer.model.parameterSpecs) {
       params.push(yield* required(path, tensors, `${PARAM_PREFIX}${name}`))
     }
     const template = yield* optimizer.init(params)

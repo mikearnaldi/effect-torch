@@ -15,7 +15,7 @@ import { createKdaGpt, loadTokenizer } from "./model.js"
 const program = Effect.scoped(Effect.gen(function*() {
   const tokenizer = yield* loadTokenizer
   const model = yield* createKdaGpt(tokenizer.vocabSize)
-  const params = yield* Tensor.compute(yield* model.init)
+  const params = yield* Tensor.compute(yield* Model.initialize(model))
   yield* Tensor.clearAllScoped(params)
   const inference = yield* Model.inference(model, params, { maxTokens: 4096, blockSize: 16, attentionWindow: 256 })
   const gen = yield* Effect.acquireRelease(

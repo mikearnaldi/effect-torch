@@ -62,7 +62,7 @@ export interface LoadedModel {
   /** The model constructed from the artifact's architecture configuration. */
   readonly model: Model.Model
   /**
-   * Caller-owned loaded tensors in `model.parameters` order. Release each
+   * Caller-owned loaded tensors in `model.parameterSpecs` order. Release each
    * handle when no longer needed; repeated releases are no-ops.
    */
   readonly params: ReadonlyArray<Tensor.Concrete>
@@ -78,25 +78,50 @@ export interface LoadedModel {
   readonly metadata: ReadonlyMap<string, unknown>
 }
 
-/** Loaded GGUF parameters for an artifact that is not an ordinary one-input model. */
+/**
+ * One required GGUF tensor's stable archive name and logical shape.
+ *
+ * @since 0.1.0
+ * @category models
+ */
+export interface TensorSpec {
+  /** Exact tensor name expected in the archive. */
+  readonly name: string
+  /** Logical tensor dimensions expected by the artifact. */
+  readonly shape: ReadonlyArray<number>
+}
+
+/**
+ * Loaded GGUF parameters for an artifact that is not an ordinary one-input
+ * model.
+ *
+ * @since 0.1.0
+ * @category models
+ */
 export interface LoadedParameters {
   /** Validated parameter specifications in the same order as `params`. */
-  readonly parameters: ReadonlyArray<Model.ParameterSpec>
+  readonly parameterSpecs: ReadonlyArray<TensorSpec>
   /** Caller-owned tensors in the requested parameter-catalog order. */
   readonly params: ReadonlyArray<Tensor.Concrete>
   /** Canonical metadata using the same normalization as {@link loadModel}. */
   readonly metadata: ReadonlyMap<string, unknown>
 }
 
-/** Definition used by {@link loadParameters} after inspection and metadata normalization. */
+/**
+ * Definition used by {@link loadParameters} after inspection and metadata
+ * normalization.
+ *
+ * @since 0.1.0
+ * @category models
+ */
 export interface ParameterArtifactDefinition {
   /** Exact value required for `general.architecture`. */
   readonly architecture: string
   /** Builds the exact tensor catalog from canonical metadata and inspected descriptors. */
-  readonly parameters: (
+  readonly parameterSpecs: (
     metadata: ReadonlyMap<string, unknown>,
     tensors: ReadonlyArray<Runtime.GgufTensorDescriptor>
-  ) => Effect.Effect<ReadonlyArray<Model.ParameterSpec>, Model.ModelError>
+  ) => Effect.Effect<ReadonlyArray<TensorSpec>, Model.ModelError>
 }
 
 const fail = (op: GgufError["op"], message: string): GgufError => new GgufError({ op, message })
@@ -247,17 +272,17 @@ const modelConfig = (
 }
 
 const validateCatalog = (
-  parameters: ReadonlyArray<Model.ParameterSpec>,
+  parameterSpecs: ReadonlyArray<TensorSpec>,
   tensors: ReadonlyArray<Runtime.GgufTensorDescriptor>
 ): void => {
-  if (parameters.length !== tensors.length) {
+  if (parameterSpecs.length !== tensors.length) {
     throw fail(
       "validate",
-      `GGUF tensor catalog has ${tensors.length} entries but artifact requires ${parameters.length}`
+      `GGUF tensor catalog has ${tensors.length} entries but artifact requires ${parameterSpecs.length}`
     )
   }
   const catalog = new Map(tensors.map((tensor) => [tensor.name, tensor]))
-  for (const parameter of parameters) {
+  for (const parameter of parameterSpecs) {
     const tensor = catalog.get(parameter.name)
     if (tensor === undefined) {
       throw fail("validate", `GGUF is missing model parameter ${JSON.stringify(parameter.name)}`)
@@ -281,7 +306,7 @@ const loadArchive = (
   path: string,
   runtime: Runtime.RuntimeService,
   inspection: Runtime.GgufInspection,
-  parameters: ReadonlyArray<Model.ParameterSpec>,
+  parameterSpecs: ReadonlyArray<TensorSpec>,
   metadata: ReadonlyMap<string, unknown>
 ): Effect.Effect<LoadedParameters, GgufError> =>
   Effect.flatMap(fromBackend("load", runtime.extensions.gguf.load(path)), (archive) => {
@@ -315,12 +340,12 @@ const loadArchive = (
         validateTensor(runtime, descriptor, entry.tensor)
         loaded.set(descriptor.name, entry.tensor)
       }
-      const params = parameters.map((parameter) => loaded.get(parameter.name))
+      const params = parameterSpecs.map((parameter) => loaded.get(parameter.name))
       if (params.some((tensor) => tensor === undefined)) {
         throw fail("validate", "loaded GGUF parameter bijection failed")
       }
       return {
-        parameters,
+        parameterSpecs,
         params: params.filter((tensor) => tensor !== undefined),
         metadata
       } satisfies LoadedParameters
@@ -331,6 +356,13 @@ const loadArchive = (
 /**
  * Loads an exact GGUF tensor catalog without constructing a {@link Model.Model}.
  * This is the artifact path for target-coupled checkpoints such as DFlash.
+ * Inspection, architecture validation, catalog construction, and loading follow
+ * the same two-read and ownership rules as {@link loadModel}. On success the
+ * caller owns every tensor in `params`; on post-load validation failure every
+ * discoverable returned handle receives a best-effort release attempt.
+ *
+ * @since 0.1.0
+ * @category loading
  */
 export const loadParameters = (
   path: string,
@@ -348,9 +380,9 @@ export const loadParameters = (
       )
     }
     const metadata = yield* validateEffect(() => modelConfig(inspection, definition.architecture))
-    const parameters = yield* definition.parameters(metadata, inspection.tensors)
-    yield* validateEffect(() => validateCatalog(parameters, inspection.tensors))
-    return yield* loadArchive(path, runtime, inspection, parameters, metadata)
+    const parameterSpecs = yield* definition.parameterSpecs(metadata, inspection.tensors)
+    yield* validateEffect(() => validateCatalog(parameterSpecs, inspection.tensors))
+    return yield* loadArchive(path, runtime, inspection, parameterSpecs, metadata)
   })
 
 const expectedStorage = (
@@ -454,7 +486,7 @@ export const loadModel = (
     }
     const config = yield* validateEffect(() => modelConfig(inspection, definition.architecture))
     const model = yield* definition.create(config)
-    yield* validateEffect(() => validateCatalog(model.parameters, inspection.tensors))
-    const loaded = yield* loadArchive(path, runtime, inspection, model.parameters, config)
-    return { model, ...loaded }
+    yield* validateEffect(() => validateCatalog(model.parameterSpecs, inspection.tensors))
+    const loaded = yield* loadArchive(path, runtime, inspection, model.parameterSpecs, config)
+    return { model, params: loaded.params, metadata: loaded.metadata }
   })

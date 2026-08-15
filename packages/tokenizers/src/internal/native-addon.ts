@@ -30,7 +30,9 @@ export interface NativeTrainConfig {
   readonly vocabSize: number
   /** Node-API converts this JavaScript number to a Rust `u32`. */
   readonly minFrequency: number
+  /** Tokens registered as special while constructing the vocabulary. */
   readonly specialTokens: Array<string>
+  /** Corpus source consumed by the native trainer. */
   readonly source: NativeTrainSource
 }
 
@@ -85,5 +87,6 @@ export declare class NativeTokenizer {
 
 /** Runtime export map expected from the selected addon binary. @internal */
 export interface NativeAddon {
+  /** Native tokenizer constructor exported by the addon binary. */
   readonly NativeTokenizer: typeof NativeTokenizer
 }

@@ -1,8 +1,8 @@
 /**
  * Pure model graphs, ordinary compiled execution, and stateful generation.
  *
- * A {@link Model} separates architecture from values. Its `parameters` catalog
- * defines a stable flat order, `init` constructs values in that order, and
+ * A {@link Model} separates architecture from values. Its `parameterSpecs`
+ * catalog defines a stable flat order and how to initialize fresh values, while
  * `forward` extends the current lazy tensor graph from a parameter array and one
  * input. Configuration is captured by constructors rather than stored in a
  * mutable module tree. The resulting graph can be composed, differentiated by
@@ -82,10 +82,32 @@ export interface ParameterSpec {
    * universally compare supplied tensors against it.
    */
   readonly shape: ReadonlyArray<number>
+  /** Declarative recipe for creating one fresh parameter value. */
+  readonly initializer: ParameterInitializer
 }
 
 /**
- * A model's parameter values in {@link Model.parameters} order. The array
+ * Declarative recipe for creating one fresh parameter value.
+ *
+ * @since 0.1.0
+ * @category models
+ */
+export type ParameterInitializer =
+  | {
+    /** Selects a zero-mean normal draw. */
+    readonly _tag: "Normal"
+    /** Positive standard-deviation multiplier applied to the unit-normal draw. */
+    readonly scale: number
+  }
+  | {
+    /** Selects a constant-filled tensor. */
+    readonly _tag: "Constant"
+    /** Finite value assigned to every tensor element. */
+    readonly value: number
+  }
+
+/**
+ * A model's parameter values in {@link Model.parameterSpecs} order. The array
  * length is the model arity; parameterless models use `[]`. Values may be lazy
  * graph nodes or materialized tensors unless a narrower API says otherwise.
  *
@@ -96,37 +118,21 @@ export type Params = ReadonlyArray<Tensor.Any>
 
 /**
  * A pure architecture plus a lazily allocated ordinary-execution cache.
- * Parameters are a flat array in `parameters`/`names` order. The model borrows
+ * Parameters are a flat array in `parameterSpecs` order. The model borrows
  * parameter and input handles; ownership transfers only for concrete outputs
  * explicitly returned by `execute` or generation APIs.
  *
  * The parameter catalog records identities and logical shapes but is not a
  * runtime schema validator. Built-in layers validate tensors while constructing
- * their graph; custom definitions are responsible for making `init`,
- * `parameters`, and `forward` agree.
+ * their graph; custom definitions are responsible for making `parameterSpecs`
+ * and `forward` agree.
  *
  * @since 0.1.0
  * @category models
  */
 export interface Model {
   /** Logical parameter specifications in flat parameter-array order. */
-  readonly parameters: ReadonlyArray<ParameterSpec>
-  /**
-   * Stable parameter identities, one per parameter, in the same order
-   * as the parameter array. Also serves as the model's arity;
-   * parameterless models have no names and arity zero.
-   */
-  readonly names: ReadonlyArray<string>
-  /** Optional stable identities used to validate target-coupled proposer artifacts. */
-  readonly target: InferenceTargetMetadata
-  /**
-   * Builds one initial parameter generation, usually as lazy graph values.
-   * Materialize all roots together with {@link Tensor.compute} before retaining
-   * them across evaluations so random initializer nodes are sampled once.
-   * {@link inference} performs this materialization itself and retains an
-   * independent concrete generation.
-   */
-  readonly init: Effect.Effect<Params, ModelError | Tensor.TensorError, Runtime.Runtime>
+  readonly parameterSpecs: ReadonlyArray<ParameterSpec>
   /**
    * Extends the lazy graph: borrowed parameters and one input in, one lazy
    * output out. No evaluation or ownership transfer is implied. Built-in
@@ -177,13 +183,12 @@ export interface Model {
   readonly clear: Effect.Effect<void>
 }
 
-/** Stable identities of the graph and parameter generation expected by a target-coupled proposer. */
-export interface InferenceTargetMetadata {
-  readonly graphFingerprint?: string
-  readonly checkpointFingerprint?: string
-}
-
-/** Compile-time-only target values requested while tracing an inference graph. */
+/**
+ * Compile-time-only target values requested while tracing an inference graph.
+ *
+ * @since 0.1.0
+ * @category compilation
+ */
 export interface ForwardTrace {
   /** Exposes the residual activation after the zero-based target layer. */
   readonly hidden: (layer: number, value: Tensor.Any) => void
@@ -191,31 +196,24 @@ export interface ForwardTrace {
 
 /**
  * A custom model definition. {@link define} validates only the parameter
- * catalog: names must be nonempty and unique, and shape dimensions must be
- * non-negative safe integers. It does not execute `init` or `forward`, compare
- * initialized tensors with the catalog, freeze/copy the supplied arrays, or
- * validate backend support. Omitting `init` creates a load-only model whose
- * `model.init` fails with a {@link ModelError}.
+ * catalog: names must be nonempty and unique, shape dimensions must be
+ * non-negative safe integers, and initializer values must be finite. It does
+ * not execute initializers or `forward`, freeze/copy the supplied arrays, or
+ * validate backend support.
  *
  * @since 0.1.0
  * @category models
  */
 export interface Definition {
   /** Parameter catalog in the exact flat order accepted by `forward`. */
-  readonly parameters: ReadonlyArray<ParameterSpec>
-  /** Optional lazy initializer returning values in `parameters` order. */
-  readonly init?: Effect.Effect<Params, Tensor.TensorError, Runtime.Runtime>
-  /** Optional stable identities used only by target-coupled inference validation. */
-  readonly target?: InferenceTargetMetadata
+  readonly parameterSpecs: ReadonlyArray<ParameterSpec>
   /** Pure lazy graph builder; responsible for its own tensor and arity checks. */
   readonly forward: Model["forward"]
 }
 
 interface ModelDef {
-  readonly parameters: ReadonlyArray<ParameterSpec>
-  readonly init: Effect.Effect<Params, ModelError | Tensor.TensorError, Runtime.Runtime>
+  readonly parameterSpecs: ReadonlyArray<ParameterSpec>
   readonly forward: Model["forward"]
-  readonly target?: InferenceTargetMetadata
 }
 
 type ModelInternal =
@@ -231,7 +229,7 @@ const ModelProto = {
   execute(this: ModelInternal, params: Params, input: Tensor.Any) {
     const self = this
     return Effect.gen(function*() {
-      yield* checkArity("execute", self.names, params)
+      yield* checkArity("execute", self.parameterSpecs.map((parameter) => parameter.name), params)
       if (self._fn === undefined) {
         self._fn = yield* Tensor.compile<ModelError | Tensor.TensorError, Runtime.Runtime>(
           (inputs) =>
@@ -257,10 +255,7 @@ const ModelProto = {
 
 const make = (def: ModelDef): Model => {
   const self = Object.create(ModelProto) as ModelInternal
-  self.parameters = def.parameters
-  self.names = def.parameters.map((parameter) => parameter.name)
-  self.target = def.target ?? {}
-  self.init = def.init
+  self.parameterSpecs = def.parameterSpecs
   self.forward = def.forward
   self._fn = undefined
   return self
@@ -277,7 +272,7 @@ const make = (def: ModelDef): Model => {
 export const define = (definition: Definition): Effect.Effect<Model, ModelError> =>
   Effect.gen(function*() {
     const seen = new Set<string>()
-    for (const parameter of definition.parameters) {
+    for (const parameter of definition.parameterSpecs) {
       if (typeof parameter.name !== "string" || parameter.name.length === 0) {
         return yield* new ModelError({ op: "define", message: "parameter name must not be empty" })
       }
@@ -296,25 +291,56 @@ export const define = (definition: Definition): Effect.Effect<Model, ModelError>
           })
         }
       }
-    }
-    for (
-      const [name, fingerprint] of [
-        ["graphFingerprint", definition.target?.graphFingerprint],
-        ["checkpointFingerprint", definition.target?.checkpointFingerprint]
-      ] as const
-    ) {
-      if (fingerprint !== undefined && fingerprint.length === 0) {
-        return yield* new ModelError({ op: "define", message: `target ${name} must not be empty` })
+      const initializer = parameter.initializer
+      if (typeof initializer !== "object" || initializer === null) {
+        return yield* new ModelError({ op: "define", message: `${parameter.name}: initializer must be an object` })
+      }
+      if (initializer._tag === "Normal") {
+        if (!Number.isFinite(initializer.scale) || initializer.scale <= 0) {
+          return yield* new ModelError({
+            op: "define",
+            message: `${parameter.name}: normal initializer scale must be positive and finite`
+          })
+        }
+      } else if (initializer._tag === "Constant") {
+        if (Number.isFinite(initializer.value)) continue
+        return yield* new ModelError({
+          op: "define",
+          message: `${parameter.name}: constant initializer value must be finite`
+        })
+      } else {
+        return yield* new ModelError({
+          op: "define",
+          message: `${parameter.name}: initializer must be Normal or Constant`
+        })
       }
     }
     return make({
-      parameters: definition.parameters,
-      init: definition.init ?? new ModelError({
-        op: "init",
-        message: "model has no initializer; load parameters before use"
-      }),
-      forward: definition.forward,
-      target: definition.target ?? {}
+      parameterSpecs: definition.parameterSpecs,
+      forward: definition.forward
+    })
+  })
+
+/**
+ * Creates one fresh lazy parameter generation from the model's declared
+ * initializers, in {@link Model.parameterSpecs} order. Normal draws remain lazy;
+ * materialize the returned roots together before retaining them so each draw is
+ * sampled once.
+ *
+ * @since 0.1.0
+ * @category constructors
+ */
+export const initialize = (model: Model): Effect.Effect<Params, Tensor.TensorError, Runtime.Runtime> =>
+  Effect.forEach(model.parameterSpecs, (parameter) => {
+    const initializer = parameter.initializer
+    if (initializer._tag === "Constant") {
+      return Tensor.full(parameter.shape, initializer.value)
+    }
+    return Effect.gen(function*() {
+      const drawn = yield* Tensor.randn(parameter.shape)
+      return initializer.scale === 1
+        ? drawn
+        : yield* Tensor.mul(drawn, yield* Tensor.constantLike(drawn, initializer.scale))
     })
   })
 
@@ -325,6 +351,9 @@ const checkPositiveInt = (op: string, field: string, value: number): Effect.Effe
   Number.isInteger(value) && value >= 1
     ? Effect.void
     : new ModelError({ op, message: `${field} must be a positive integer, got ${value}` })
+
+const normal = (scale: number): ParameterInitializer => ({ _tag: "Normal", scale })
+const constant = (value: number): ParameterInitializer => ({ _tag: "Constant", value })
 
 const checkArity = (
   who: string,
@@ -342,8 +371,7 @@ const parameterless = (
   apply: (self: Tensor.Any) => Effect.Effect<Tensor.Lazy, Tensor.TensorError, Runtime.Runtime>
 ): Effect.Effect<Model> =>
   Effect.succeed(make({
-    parameters: [],
-    init: Effect.succeed<Params>([]),
+    parameterSpecs: [],
     forward: (_, input) => apply(input)
   }))
 
@@ -368,16 +396,10 @@ export const linear = (
     yield* checkPositiveInt("linear", "outFeatures", outFeatures)
     const names = [`${name}.weight`, `${name}.bias`]
     return make({
-      parameters: [
-        { name: names[0], shape: [inFeatures, outFeatures] },
-        { name: names[1], shape: [1, outFeatures] }
+      parameterSpecs: [
+        { name: names[0], shape: [inFeatures, outFeatures], initializer: normal(1 / Math.sqrt(inFeatures)) },
+        { name: names[1], shape: [1, outFeatures], initializer: constant(0) }
       ],
-      init: Effect.gen(function*() {
-        const drawn = yield* Tensor.randn([inFeatures, outFeatures])
-        const weight = yield* Tensor.mul(drawn, yield* Tensor.constantLike(drawn, 1 / Math.sqrt(inFeatures)))
-        const bias = yield* Tensor.zeros([1, outFeatures])
-        return [weight, bias] as const
-      }),
       forward: (params, input) =>
         Effect.gen(function*() {
           yield* checkArity(name, names, params)
@@ -425,16 +447,14 @@ export const conv1d = (
     const names = [`${name}.weight`, `${name}.bias`]
     const fanIn = (inChannels / groups) * kernelSize
     return make({
-      parameters: [
-        { name: names[0], shape: [outChannels, inChannels / groups, kernelSize] },
-        { name: names[1], shape: [outChannels] }
+      parameterSpecs: [
+        {
+          name: names[0],
+          shape: [outChannels, inChannels / groups, kernelSize],
+          initializer: normal(1 / Math.sqrt(fanIn))
+        },
+        { name: names[1], shape: [outChannels], initializer: constant(0) }
       ],
-      init: Effect.gen(function*() {
-        const drawn = yield* Tensor.randn([outChannels, inChannels / groups, kernelSize])
-        const weight = yield* Tensor.mul(drawn, yield* Tensor.constantLike(drawn, 1 / Math.sqrt(fanIn)))
-        const bias = yield* Tensor.zeros([outChannels])
-        return [weight, bias] as const
-      }),
       forward: (params, input) =>
         Effect.gen(function*() {
           yield* checkArity(name, names, params)
@@ -486,16 +506,14 @@ export const conv2d = (
     const names = [`${name}.weight`, `${name}.bias`]
     const fanIn = (inChannels / groups) * kh * kw
     return make({
-      parameters: [
-        { name: names[0], shape: [outChannels, inChannels / groups, kh, kw] },
-        { name: names[1], shape: [outChannels] }
+      parameterSpecs: [
+        {
+          name: names[0],
+          shape: [outChannels, inChannels / groups, kh, kw],
+          initializer: normal(1 / Math.sqrt(fanIn))
+        },
+        { name: names[1], shape: [outChannels], initializer: constant(0) }
       ],
-      init: Effect.gen(function*() {
-        const drawn = yield* Tensor.randn([outChannels, inChannels / groups, kh, kw])
-        const weight = yield* Tensor.mul(drawn, yield* Tensor.constantLike(drawn, 1 / Math.sqrt(fanIn)))
-        const bias = yield* Tensor.zeros([outChannels])
-        return [weight, bias] as const
-      }),
       forward: (params, input) =>
         Effect.gen(function*() {
           yield* checkArity(name, names, params)
@@ -543,11 +561,7 @@ export const embedding = (
     }
     const names = [`${name}.weight`]
     return make({
-      parameters: [{ name: names[0], shape: [numEmbeddings, embeddingDim] }],
-      init: Effect.gen(function*() {
-        const weight = yield* Tensor.randn([numEmbeddings, embeddingDim])
-        return [weight] as const
-      }),
+      parameterSpecs: [{ name: names[0], shape: [numEmbeddings, embeddingDim], initializer: normal(1) }],
       forward: (params, input) =>
         Effect.gen(function*() {
           yield* checkArity(name, names, params)
@@ -588,11 +602,7 @@ export const positionEmbedding = (
     yield* checkPositiveInt("positionEmbedding", "embeddingDim", embeddingDim)
     const names = [`${name}.weight`]
     return make({
-      parameters: [{ name: names[0], shape: [maxPositions, embeddingDim] }],
-      init: Effect.gen(function*() {
-        const weight = yield* Tensor.randn([maxPositions, embeddingDim])
-        return [weight] as const
-      }),
+      parameterSpecs: [{ name: names[0], shape: [maxPositions, embeddingDim], initializer: normal(1) }],
       forward: (params, input) =>
         Effect.gen(function*() {
           yield* checkArity(name, names, params)
@@ -640,15 +650,10 @@ export const layerNorm = (
     }
     const names = [`${name}.weight`, `${name}.bias`]
     return make({
-      parameters: [
-        { name: names[0], shape },
-        { name: names[1], shape }
+      parameterSpecs: [
+        { name: names[0], shape, initializer: constant(1) },
+        { name: names[1], shape, initializer: constant(0) }
       ],
-      init: Effect.gen(function*() {
-        const weight = yield* Tensor.ones(shape)
-        const bias = yield* Tensor.zeros(shape)
-        return [weight, bias] as const
-      }),
       forward: (params, input) =>
         Effect.gen(function*() {
           yield* checkArity(name, names, params)
@@ -725,21 +730,12 @@ export const multiHeadAttention = (
     ]
     const causal = options.causal ?? false
     return make({
-      parameters: [
-        { name: names[0], shape: [embedDim, 3 * embedDim] },
-        { name: names[1], shape: [1, 3 * embedDim] },
-        { name: names[2], shape: [embedDim, embedDim] },
-        { name: names[3], shape: [1, embedDim] }
+      parameterSpecs: [
+        { name: names[0], shape: [embedDim, 3 * embedDim], initializer: normal(1 / Math.sqrt(embedDim)) },
+        { name: names[1], shape: [1, 3 * embedDim], initializer: constant(0) },
+        { name: names[2], shape: [embedDim, embedDim], initializer: normal(1 / Math.sqrt(embedDim)) },
+        { name: names[3], shape: [1, embedDim], initializer: constant(0) }
       ],
-      init: Effect.gen(function*() {
-        const qkvDrawn = yield* Tensor.randn([embedDim, 3 * embedDim])
-        const qkvWeight = yield* Tensor.mul(qkvDrawn, yield* Tensor.constantLike(qkvDrawn, 1 / Math.sqrt(embedDim)))
-        const qkvBias = yield* Tensor.zeros([1, 3 * embedDim])
-        const woDrawn = yield* Tensor.randn([embedDim, embedDim])
-        const woWeight = yield* Tensor.mul(woDrawn, yield* Tensor.constantLike(woDrawn, 1 / Math.sqrt(embedDim)))
-        const woBias = yield* Tensor.zeros([1, embedDim])
-        return [qkvWeight, qkvBias, woWeight, woBias] as const
-      }),
       forward: (params, input) =>
         Effect.gen(function*() {
           yield* checkArity(name, names, params)
@@ -870,44 +866,22 @@ export const kimiDeltaAttention = (
       `${name}.wo.weight`,
       `${name}.wo.bias`
     ]
-    const scaled = (fanIn: number, shape: ReadonlyArray<number>) =>
-      Effect.gen(function*() {
-        const drawn = yield* Tensor.randn(shape)
-        return yield* Tensor.mul(drawn, yield* Tensor.constantLike(drawn, 1 / Math.sqrt(fanIn)))
-      })
     return make({
-      parameters: [
-        { name: names[0], shape: [embedDim, 3 * embedDim] },
-        { name: names[1], shape: [1, 3 * embedDim] },
-        { name: names[2], shape: [3 * embedDim, 4] },
-        { name: names[3], shape: [embedDim, headDim] },
-        { name: names[4], shape: [headDim, embedDim] },
-        { name: names[5], shape: [numHeads] },
-        { name: names[6], shape: [embedDim] },
-        { name: names[7], shape: [embedDim, numHeads] },
-        { name: names[8], shape: [embedDim, headDim] },
-        { name: names[9], shape: [headDim, embedDim] },
-        { name: names[10], shape: [headDim] },
-        { name: names[11], shape: [embedDim, embedDim] },
-        { name: names[12], shape: [1, embedDim] }
+      parameterSpecs: [
+        { name: names[0], shape: [embedDim, 3 * embedDim], initializer: normal(1 / Math.sqrt(embedDim)) },
+        { name: names[1], shape: [1, 3 * embedDim], initializer: constant(0) },
+        { name: names[2], shape: [3 * embedDim, 4], initializer: normal(1 / Math.sqrt(4)) },
+        { name: names[3], shape: [embedDim, headDim], initializer: normal(1 / Math.sqrt(embedDim)) },
+        { name: names[4], shape: [headDim, embedDim], initializer: normal(1 / Math.sqrt(headDim)) },
+        { name: names[5], shape: [numHeads], initializer: constant(0) },
+        { name: names[6], shape: [embedDim], initializer: constant(0) },
+        { name: names[7], shape: [embedDim, numHeads], initializer: normal(1 / Math.sqrt(embedDim)) },
+        { name: names[8], shape: [embedDim, headDim], initializer: normal(1 / Math.sqrt(embedDim)) },
+        { name: names[9], shape: [headDim, embedDim], initializer: normal(1 / Math.sqrt(headDim)) },
+        { name: names[10], shape: [headDim], initializer: constant(1) },
+        { name: names[11], shape: [embedDim, embedDim], initializer: normal(1 / Math.sqrt(embedDim)) },
+        { name: names[12], shape: [1, embedDim], initializer: constant(0) }
       ],
-      init: Effect.gen(function*() {
-        return [
-          yield* scaled(embedDim, [embedDim, 3 * embedDim]),
-          yield* Tensor.zeros([1, 3 * embedDim]),
-          yield* scaled(4, [3 * embedDim, 4]),
-          yield* scaled(embedDim, [embedDim, headDim]),
-          yield* scaled(headDim, [headDim, embedDim]),
-          yield* Tensor.zeros([numHeads]),
-          yield* Tensor.zeros([embedDim]),
-          yield* scaled(embedDim, [embedDim, numHeads]),
-          yield* scaled(embedDim, [embedDim, headDim]),
-          yield* scaled(headDim, [headDim, embedDim]),
-          yield* Tensor.full([headDim], 1),
-          yield* scaled(embedDim, [embedDim, embedDim]),
-          yield* Tensor.zeros([1, embedDim])
-        ] as const
-      }),
       forward: (params, input) =>
         Effect.gen(function*() {
           yield* checkArity(name, names, params)
@@ -1149,8 +1123,7 @@ export const dropout = (options: Tensor.DropoutOptions = {}): Effect.Effect<Mode
       return yield* new ModelError({ op: "dropout", message: `p must be in [0, 1), got ${p}` })
     }
     return make({
-      parameters: [],
-      init: Effect.succeed<Params>([]),
+      parameterSpecs: [],
       forward: (_, input) => Tensor.dropout(input, { p })
     })
   })
@@ -1181,8 +1154,7 @@ const pool = (
       })
     }
     return make({
-      parameters: [],
-      init: Effect.succeed<Params>([]),
+      parameterSpecs: [],
       forward: (_, input) => apply(input, options)
     })
   })
@@ -1239,14 +1211,13 @@ export const avgPool2d = (options: Tensor.PoolOptions): Effect.Effect<Model, Mod
  */
 export const checkpoint = (model: Model): Effect.Effect<Model> =>
   Effect.succeed(make({
-    parameters: model.parameters,
-    init: model.init,
+    parameterSpecs: model.parameterSpecs,
     forward: (params, input) => Effect.flatMap(model.forward(params, input), Gradient.checkpoint)
   }))
 
 /**
  * Adds a residual (skip) connection around a sub-model: the forward is
- * `input + block(input)`. Names and init are the sub-model's; the
+ * `input + block(input)`. Parameter specs are the sub-model's; the
  * sub-model's output must be broadcast-compatible with its input (an
  * equal shape in the standard usage — transformer blocks, ResNet
  * stages).
@@ -1256,8 +1227,7 @@ export const checkpoint = (model: Model): Effect.Effect<Model> =>
  */
 export const residual = (model: Model): Effect.Effect<Model> =>
   Effect.succeed(make({
-    parameters: model.parameters,
-    init: model.init,
+    parameterSpecs: model.parameterSpecs,
     forward: (params, input) =>
       Effect.gen(function*() {
         const out = yield* model.forward(params, input)
@@ -1267,8 +1237,8 @@ export const residual = (model: Model): Effect.Effect<Model> =>
 
 /**
  * Transforms a model's input before it enters the sub-model:
- * `forward(params, input) = model.forward(params, f(input))`. Names and
- * init are the sub-model's. Use it for input derived from the raw
+ * `forward(params, input) = model.forward(params, f(input))`. Parameter
+ * specs are the sub-model's. Use it for input derived from the raw
  * input's shape or values when no dedicated layer covers the case
  * (position embeddings have their own: {@link positionEmbedding}).
  *
@@ -1280,17 +1250,15 @@ export const mapInput = (
   f: (input: Tensor.Any) => Effect.Effect<Tensor.Any, Tensor.TensorError, Runtime.Runtime>
 ): Effect.Effect<Model> =>
   Effect.succeed(make({
-    parameters: model.parameters,
-    init: model.init,
+    parameterSpecs: model.parameterSpecs,
     forward: (params, input) => Effect.flatMap(f(input), (mapped) => model.forward(params, mapped))
   }))
 
 /**
  * Fans one input into several sub-models and combines their outputs:
  * `forward(params, input) = f(...models.map(m => m.forward(mParams,
- * input)))`. `names` is the concatenation of the models' names (in
- * order), sliced by arity in `forward`; `init` runs each model's `init`
- * in order. The combiner is variadic with one argument per model, in
+ * input)))`. Parameter specs are concatenated in model order and sliced
+ * by arity in `forward`. The combiner is variadic with one argument per model, in
  * the same order (inferred from the tuple). Fails with a
  * {@link ModelError} when the array is empty or when parameter names
  * collide.
@@ -1309,8 +1277,8 @@ export const merge = <const M extends ReadonlyArray<Model>>(
   if (models.length === 0) {
     return new ModelError({ op: "merge", message: "at least one model is required" })
   }
-  const parameters = models.flatMap((model) => model.parameters)
-  const names = parameters.map((parameter) => parameter.name)
+  const parameterSpecs = models.flatMap((model) => model.parameterSpecs)
+  const names = parameterSpecs.map((parameter) => parameter.name)
   const seen = new Set<string>()
   const duplicates = new Set<string>()
   for (const name of names) {
@@ -1325,16 +1293,9 @@ export const merge = <const M extends ReadonlyArray<Model>>(
       message: `duplicate parameter names: [${[...duplicates].join(", ")}]`
     })
   }
-  const arities = models.map((model) => model.names.length)
+  const arities = models.map((model) => model.parameterSpecs.length)
   return Effect.succeed(make({
-    parameters,
-    init: Effect.gen(function*() {
-      const params: Array<Tensor.Any> = []
-      for (const model of models) {
-        params.push(...(yield* model.init))
-      }
-      return params
-    }),
+    parameterSpecs,
     forward: (params, input) =>
       Effect.gen(function*() {
         yield* checkArity("merge", names, params)
@@ -1355,7 +1316,7 @@ export const merge = <const M extends ReadonlyArray<Model>>(
  * each model's parameters sliced by arity from the concatenated array.
  * The standard non-sequential top — token + position embeddings is
  * `add(wte, wpe)`; {@link residual} is the special case where one branch
- * is the identity. `names` and `init` follow {@link merge}. Fails with a
+ * is the identity. Parameter specs follow {@link merge}. Fails with a
  * {@link ModelError} when the chain is empty or parameter names collide.
  *
  * @since 0.1.0
@@ -1374,9 +1335,8 @@ export const add = (...models: ReadonlyArray<Model>): Effect.Effect<Model, Model
 /**
  * Composes models into a single model that threads its input through each
  * child in order, slicing each child's share of the concatenated
- * parameter array by its arity (`names.length`). `names` is the
- * concatenation of the children's names and `init` runs each child's
- * `init` in order.
+ * parameter array by its parameter-spec arity. The result concatenates the
+ * children's parameter specs.
  *
  * Fails with a {@link ModelError} when the chain is empty or when
  * parameter names collide — a collision would silently overwrite entries
@@ -1389,8 +1349,8 @@ export const chain = (...models: ReadonlyArray<Model>): Effect.Effect<Model, Mod
   if (models.length === 0) {
     return new ModelError({ op: "chain", message: "at least one model is required" })
   }
-  const parameters = models.flatMap((model) => model.parameters)
-  const names = parameters.map((parameter) => parameter.name)
+  const parameterSpecs = models.flatMap((model) => model.parameterSpecs)
+  const names = parameterSpecs.map((parameter) => parameter.name)
   const seen = new Set<string>()
   const duplicates = new Set<string>()
   for (const name of names) {
@@ -1405,16 +1365,9 @@ export const chain = (...models: ReadonlyArray<Model>): Effect.Effect<Model, Mod
       message: `duplicate parameter names: [${[...duplicates].join(", ")}]`
     })
   }
-  const arities = models.map((model) => model.names.length)
+  const arities = models.map((model) => model.parameterSpecs.length)
   return Effect.succeed(make({
-    parameters,
-    init: Effect.gen(function*() {
-      const params: Array<Tensor.Any> = []
-      for (const model of models) {
-        params.push(...(yield* model.init))
-      }
-      return params
-    }),
+    parameterSpecs,
     forward: (params, input) =>
       Effect.gen(function*() {
         yield* checkArity("chain", names, params)
@@ -1430,11 +1383,11 @@ export const chain = (...models: ReadonlyArray<Model>): Effect.Effect<Model, Mod
 }
 
 /**
- * Saves a model's parameters to a safetensors file, zipping `model.names`
+ * Saves a model's parameters to a safetensors file, zipping parameter-spec names
  * with the parameter array into the record {@link Tensor.save} takes.
  * Fails with a {@link ModelError} if the parameter array's length does
  * not match the model's arity. It does not compare tensor shapes or dtypes with
- * {@link Model.parameters}. Saving borrows parameters and does not clear them.
+ * {@link Model.parameterSpecs}. Saving borrows parameters and does not clear them.
  *
  * @since 0.1.0
  * @category destructors
@@ -1444,18 +1397,18 @@ export const save = (
   params: Params,
   path: string
 ): Effect.Effect<void, ModelError | Tensor.TensorError, Runtime.Runtime> =>
-  params.length !== model.names.length
+  params.length !== model.parameterSpecs.length
     ? new ModelError({
       op: "save",
-      message: `model has ${model.names.length} parameters, got ${params.length}`
+      message: `model has ${model.parameterSpecs.length} parameters, got ${params.length}`
     })
     : Tensor.save(
       path,
-      Object.fromEntries(model.names.map((name, i) => [name, params[i]]))
+      Object.fromEntries(model.parameterSpecs.map((parameter, i) => [parameter.name, params[i]]))
     )
 
 /**
- * Loads a safetensors file and returns the tensors selected by `model.names` in
+ * Loads a safetensors file and returns tensors selected by parameter-spec names in
  * parameter-array order. A missing key fails with a {@link ModelError}; extra
  * keys are ignored. This is name/arity mapping, not architecture validation:
  * shape, dtype, storage, and placement compatibility are left to first use.
@@ -1477,7 +1430,7 @@ export const load = (
     Effect.onExit(
       Effect.gen(function*() {
         const params: Array<Tensor.Concrete> = []
-        for (const name of model.names) {
+        for (const { name } of model.parameterSpecs) {
           const param = record[name]
           if (param === undefined) {
             return yield* new ModelError({
@@ -1594,8 +1547,11 @@ export interface InferenceConfig {
   readonly batchSize?: number
   /** Optional high-level proposer compiled with this target. */
   readonly speculation?: {
+    /** Proposer artifact whose vocabulary and target contract must match this model. */
     readonly proposer: Speculation.Artifact
+    /** Maximum proposal width, bounded by the artifact's trained capacity. */
     readonly maxDraftTokens: number
+    /** Proposal-width policy; only `"fixed"` is currently implemented. */
     readonly schedule?: "fixed" | "adaptive"
   }
 }
@@ -1615,6 +1571,7 @@ export interface InferenceConfig {
  * @category compilation
  */
 export interface GenerationSeq {
+  /** Runtime discriminant for a sampled-generation sequence. */
   readonly _tag: "GenerationSeq"
   /**
    * Returns the total logical token count, including evicted window
@@ -1629,35 +1586,65 @@ export interface GenerationSeq {
   readonly finish: () => Effect.Effect<void, Tensor.TensorError, Runtime.Runtime>
 }
 
-/** Sampling controls owned by generation; draw counters are sequence-managed. */
+/**
+ * Sampling controls owned by generation; draw counters are sequence-managed.
+ *
+ * @since 0.1.0
+ * @category compilation
+ */
 export interface GenerationSamplingOptions {
+  /** Non-negative temperature; `0` selects greedy sampling. */
   readonly temperature?: number
+  /** Non-negative candidate count; `0` disables top-k filtering. */
   readonly topK?: number
+  /** Nucleus probability in `(0, 1]`; `1` disables top-p filtering. */
   readonly topP?: number
   /** Unsigned 64-bit seed. Safe integer numbers remain accepted for convenience. */
   readonly seed: bigint | number
 }
 
-/** One prompt admitted by {@link Generation.add}. */
+/**
+ * One prompt admitted by {@link Generation.add}.
+ *
+ * @since 0.1.0
+ * @category compilation
+ */
 export interface GenerationAdd {
+  /** Nonempty `[1, T]` token tensor matching the artifact's token dtype and placement. */
   readonly prompt: Tensor.Any
   /** Overrides inference sampling defaults for the admission page only. */
   readonly sampling?: Partial<GenerationSamplingOptions>
+  /** Optional positive generation limit for this sequence. */
   readonly maxTokens?: number
+  /** Token ids that terminate this sequence when sampled. */
   readonly eosTokens?: ReadonlyArray<number>
 }
 
-/** One live sequence selected by {@link Generation.step}. */
+/**
+ * One live sequence selected by {@link Generation.step}.
+ *
+ * @since 0.1.0
+ * @category compilation
+ */
 export interface GenerationStep {
+  /** Sequence whose pending token is committed. */
   readonly seq: GenerationSeq
   /** Overrides inference sampling defaults for this page only. */
   readonly sampling?: Partial<GenerationSamplingOptions>
 }
 
-/** A nonempty page of sampled tokens for one sequence. */
+/**
+ * A nonempty page of sampled tokens for one sequence.
+ *
+ * @since 0.1.0
+ * @category compilation
+ */
 export interface TokenPage {
+  /** Sequence that owns this page. */
   readonly seq: GenerationSeq
+  /** Sampled token ids in generation order. */
   readonly tokens: ReadonlyArray<number>
+  /** Terminal policy reached by the final token, when the page ends the sequence. */
   readonly stopReason?: "eos" | "maxTokens"
 }
 
@@ -1717,16 +1704,32 @@ export interface Generation {
   readonly close: () => Effect.Effect<void, Tensor.TensorError, Runtime.Runtime>
 }
 
-/** A caller-driven stateful sequence used only by {@link StatefulExecution}. */
+/**
+ * A caller-driven stateful sequence used only by {@link StatefulExecution}.
+ *
+ * @since 0.1.0
+ * @category compilation
+ */
 export interface StatefulExecutionSeq {
+  /** Runtime discriminant for a caller-token execution sequence. */
   readonly _tag: "StatefulExecutionSeq"
+  /** Underlying decode-state sequence handle. */
   readonly sequence: Tensor.KvSequence
+  /** Returns the sequence's absolute logical token count. */
   readonly cursor: () => Effect.Effect<number, Tensor.TensorError, Runtime.Runtime>
+  /** Releases this sequence; repeated calls are no-ops. */
   readonly finish: () => Effect.Effect<void, Tensor.TensorError, Runtime.Runtime>
 }
 
-/** Lower-level stateful logits execution for custom host samplers. */
+/**
+ * Lower-level stateful logits execution for custom host samplers. Unlike
+ * {@link Generation}, callers select tokens and own each returned logits row.
+ *
+ * @since 0.1.0
+ * @category compilation
+ */
 export interface StatefulExecution {
+  /** Prefills nonempty prompts and returns one sequence and caller-owned logits row per prompt. */
   readonly add: (
     prompts: ReadonlyArray<Tensor.Any>
   ) => Effect.Effect<
@@ -1734,10 +1737,13 @@ export interface StatefulExecution {
     InferenceError | ModelError | Tensor.TensorError,
     Runtime.Runtime
   >
+  /** Commits one caller-selected token per sequence and returns caller-owned successor logits. */
   readonly step: (
     entries: ReadonlyArray<{ readonly seq: StatefulExecutionSeq; readonly token: number }>
   ) => Effect.Effect<ReadonlyArray<Tensor.Concrete>, InferenceError | Tensor.TensorError, Runtime.Runtime>
+  /** Returns this session's current live-sequence count. */
   readonly live: () => Effect.Effect<number>
+  /** Closes the session and releases all of its live sequences. */
   readonly close: () => Effect.Effect<void, Tensor.TensorError, Runtime.Runtime>
 }
 
@@ -1976,7 +1982,7 @@ const validateTargetContract = (
     }
     if (proposer._tag !== "ParallelBlock") return
     for (const weight of [proposer.tokenEmbedding, proposer.lmHead]) {
-      const index = model.names.indexOf(weight.name)
+      const index = model.parameterSpecs.findIndex((parameter) => parameter.name === weight.name)
       const value = index < 0 ? undefined : frozenParams[index]
       if (
         value === undefined || value.dtype !== weight.dtype ||
@@ -2379,7 +2385,7 @@ const compileInferencePrograms = (
         targetVocabulary,
         { prefill: prefillTrace.taps, decode: decodeTrace.taps, verify: verifyTrace.taps },
         frozenParams,
-        model.names
+        model.parameterSpecs.map((parameter) => parameter.name)
       )
       return {
         prefill,
@@ -3195,7 +3201,7 @@ export const inference = (
 ): Effect.Effect<InferenceProgram, InferenceError | ModelError | Tensor.TensorError, Runtime.Runtime> =>
   Effect.gen(function*() {
     const runtime = yield* Runtime.Runtime
-    yield* checkArity("inference", model.names, params)
+    yield* checkArity("inference", model.parameterSpecs.map((parameter) => parameter.name), params)
     const resolved = yield* resolveInferenceConfig(config)
     const proposerSourceParams = resolved.speculation?.proposer._tag === "HistoryLookup"
       ? []

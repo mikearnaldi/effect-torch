@@ -233,10 +233,9 @@ into a new `Trainer` module whose value encapsulates the configuration:
 export interface Trainer<S, EL, RL, ED, RD, EO, RO> {
   readonly model: Model.Model
   readonly config: TrainConfig<S, EL, RL, ED, RD, EO, RO>
-  /** The training loop, identical semantics for both forms. The initial
-      parameters are the argument — omitted means `model.init`. */
+  /** The training loop, identical semantics for both forms. */
   readonly train: (
-    params?: Model.Params
+    params: Model.Params
   ) => Effect.Effect<Trained<S>, ...>
 }
 

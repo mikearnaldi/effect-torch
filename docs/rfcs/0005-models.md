@@ -27,7 +27,7 @@ Primitives (`linear`, `tanh`, `sigmoid`) are models; `chain` composes
 models into a model with the **same interface**, so sub-models compose
 recursively. Parameters are always a **flat tuple of tensors**, which makes
 the existing training path (`Tensor.grad`, `Optimizer.step`) work on any
-model with zero adapter code. `names` gives every parameter a stable,
+model with zero adapter code. Parameter specs give every parameter a stable,
 checkpoint-friendly identity that maps directly onto `Tensor.save` /
 `Tensor.load`.
 
@@ -74,12 +74,8 @@ Flax/Haiku design — but without a library form:
 ### The `Model` interface
 
 ```ts
-export interface Model<P extends ReadonlyArray<Tensor.Any>> {
-  /** Stable parameter identities, one per tensor in `P`, in the same
-      order. Also serves as the arity of `P` at runtime. */
-  readonly names: ReadonlyArray<string>
-  /** Builds the initial parameters as lazy graph values. */
-  readonly init: Effect.Effect<P, Tensor.TensorError, Device.CurrentDevice>
+export interface Model {
+  readonly parameterSpecs: ReadonlyArray<ParameterSpec>
   /** Extends the graph: parameters and input in, lazy output out. */
   readonly forward: (
     params: P,
@@ -87,8 +83,11 @@ export interface Model<P extends ReadonlyArray<Tensor.Any>> {
   ) => Effect.Effect<Tensor.Lazy, Tensor.TensorError>
 }
 
-/** Any model, for constraints. */
-export type Any = Model<any>
+export interface ParameterSpec {
+  readonly name: string
+  readonly shape: ReadonlyArray<number>
+  readonly initializer: ParameterInitializer
+}
 ```
 
 Notes:
@@ -96,13 +95,14 @@ Notes:
 - `P` is constrained to a **tuple of tensors** — "expect a tuple, ask for
   a tuple". Configuration (feature counts, activation choice) lives in the
   closure of the factory, never in `P`.
-- `init` returns **lazy** tensors: it is pure graph-building, consistent
+- `Model.initialize` returns **lazy** tensors: it interprets the declarative
+  initializer in each parameter spec and is pure graph-building, consistent
   with every other constructor. Materialization happens in the first
   `Optimizer.step` walk (or an explicit `Tensor.compute`), so initial
   `randn` draws are consistent with the first loss within that walk.
 - `forward` is single-input, single-output. DAGs (skip connections,
   multi-head) are explicitly out of scope (see Future work).
-- Both `init` and `forward` return `Effect`s, like the rest of the Tensor
+- Both `initialize` and `forward` return `Effect`s, like the rest of the Tensor
   API; failures are `TensorError`s in the error channel.
 
 ### Primitives
@@ -119,12 +119,12 @@ export const sigmoid: Model<readonly []>
 export const relu: Model<readonly []>
 ```
 
-- `linear("fc1", 2, 8)` has `names = ["fc1.weight", "fc1.bias"]`,
+- `linear("fc1", 2, 8)` has specs named `"fc1.weight"` and `"fc1.bias"`,
   `forward = add(matmul(input, w), b)`.
 - Weight init: `randn([in, out]) * (1 / sqrt(in))`, bias zeros. (PyTorch
   uses kaiming-uniform with the same bound; we have no `uniform` op yet —
   scaled `randn` is adequate for v1, noted under Future work.)
-- Activations are parameterless models (`names = []`, `forward` is the
+- Activations are parameterless models (`parameterSpecs = []`, `forward` is the
   op). This uniformity is what makes `chain` total: every stage of a
   network is the same kind of value.
 - `relu` is backed by a native `Relu` node (single kernel,
@@ -153,13 +153,12 @@ export type ParamsOf<Ms> = Ms extends readonly [infer H, ...infer T]
 
 Runtime behaviour:
 
-- `names` is the concatenation of the children's names. **Duplicate names
+- Parameter specs are concatenated in child order. **Duplicate names
   throw at construction time** — a name collision would silently overwrite
   entries in `Tensor.save`'s record, so it is construction-time misuse,
   consistent with invalid optimizer configs throwing from the factory.
-- `init` runs each child's `init` in order and concatenates the tuples.
 - `forward` threads the input through each child in order, slicing each
-  child's share of the parameter tuple by `names.length` (the arity).
+  child's share of the parameter tuple by `parameterSpecs.length` (the arity).
 - At least one model is required (an empty `chain` would be an identity
   with an ambiguous output type; not worth the special case).
 
@@ -181,7 +180,7 @@ Because `P` is already a flat tuple of tensors, the approved
 RFC-0004 path applies verbatim:
 
 ```ts
-const params = yield* model.init
+const params = yield* Model.initialize(model)
 const state = yield* optimizer.init(params)
 // per step:
 const loss = yield* Tensor.mse(yield* model.forward(params, x), y)
@@ -210,12 +209,11 @@ export const load: (
 ) => Effect.Effect<Array<Tensor.Concrete>, Tensor.TensorError, Device.CurrentDevice>
 ```
 
-`save` zips `model.names` with the param tuple into the record
+`save` zips names from `model.parameterSpecs` with the param tuple into the record
 `Tensor.save` already takes (arity mismatch throws — misuse). `load` reads
-the file with `Tensor.load` and returns the tensors in `names` order;
+the file with `Tensor.load` and returns tensors in parameter-spec order;
 missing keys fail with a `TensorError`. Shape/dtype validation against the
-architecture is left to graph-build-time checks on first use (running
-`init` just to compare shapes would draw random values for nothing).
+architecture is left to graph-build-time checks on first use.
 
 ## Validation and errors
 

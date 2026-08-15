@@ -2,9 +2,10 @@
 // and optional generation/config controls come from
 // MUSE_GLIMMER_* environment variables and invalid configured values fail via
 // Effect Config. Each model module validates its exact GGUF architecture,
-// tensor catalog, and encoded weights on the selected backend. Chat.stream owns the generation session, renders the
-// GGUF template, emits parsed reasoning/content segments incrementally, and
-// closes state on completion, failure, or interruption. The artifact has a
+// tensor catalog, and encoded weights on the selected backend. Chat.stream owns
+// the generation session, renders the GGUF template, emits parsed
+// reasoning/content segments incrementally, and closes state on completion,
+// failure, or interruption. The artifact has a
 // 4,096-token full-context pool, so prompt plus decode must fit even when the
 // optional application-side max-new-token limit is omitted. Native sampling
 // defaults to temperature 0.7, top-p 0.95, and top-k 40;
@@ -13,7 +14,8 @@
 
 import * as BackendApple from "@effect-torch/backend-apple-native"
 import { Chat, Model, Tensor } from "@effect-torch/core"
-import { DFlash, MuseGlimmer } from "@effect-torch/core/models"
+import { MuseGlimmer } from "@effect-torch/core/models"
+import { DFlash } from "@effect-torch/core/proposers"
 import * as Tokenizers from "@effect-torch/tokenizers"
 import { NodeRuntime } from "@effect/platform-node"
 import { Config, Effect, Option, Schema, Stream } from "effect"

@@ -12,7 +12,7 @@ import { createKdaGpt, loadTokenizer } from "./model.js"
 const program = Effect.scoped(Effect.gen(function*() {
   const tokenizer = yield* loadTokenizer
   const model = yield* createKdaGpt(tokenizer.vocabSize)
-  const params = yield* Tensor.compute(yield* model.init)
+  const params = yield* Tensor.compute(yield* Model.initialize(model))
   yield* Tensor.clearAllScoped(params)
   const total = params.reduce((sum, p) => sum + p.shape.reduce((a, b) => a * b, 1), 0)
   yield* Effect.log(`params: ${total.toLocaleString()}`)

@@ -71,9 +71,9 @@ const definition = (
   create: (config) => {
     capture(config)
     return Model.define({
-      parameters: [
-        { name: "dense", shape: [2] },
-        { name: "packed", shape: [2, 256] }
+      parameterSpecs: [
+        { name: "dense", shape: [2], initializer: { _tag: "Normal", scale: 1 } },
+        { name: "packed", shape: [2, 256], initializer: { _tag: "Normal", scale: 1 } }
       ],
       forward: (_, input) => Effect.succeed(input as Tensor.Lazy)
     })
@@ -166,7 +166,7 @@ it.effect("loads by exact architecture and returns tensors in model parameter or
       ["context_length", 32],
       ["name", "fixture"]
     ])
-    expect(loaded.model.names).toEqual(["dense", "packed"])
+    expect(loaded.model.parameterSpecs.map(({ name }) => name)).toEqual(["dense", "packed"])
     expect(loaded.params).toEqual([dense, packed])
     expect(loaded.params[1].storage).toEqual({
       encoding: "Q4_K",
@@ -329,7 +329,11 @@ onDevices("GGUF", () => (it) => {
         architecture: "compiled-identity",
         create: () =>
           Model.define({
-            parameters: [{ name: "packed", shape: [2, 256] }],
+            parameterSpecs: [{
+              name: "packed",
+              shape: [2, 256],
+              initializer: { _tag: "Normal", scale: 1 }
+            }],
             forward: (_, input) => Effect.succeed(input as Tensor.Lazy)
           })
       })

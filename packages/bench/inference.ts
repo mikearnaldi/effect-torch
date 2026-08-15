@@ -28,8 +28,8 @@ const makeModel = Effect.gen(function*() {
 const suite = Effect.gen(function*() {
   const runtime = yield* Runtime.Runtime
   const model = yield* makeModel
-  const params = yield* Tensor.compute(yield* model.init)
-  const draftParams = yield* Tensor.compute(yield* model.init)
+  const params = yield* Tensor.compute(yield* Model.initialize(model))
+  const draftParams = yield* Tensor.compute(yield* Model.initialize(model))
   const makeProposer = (componentParams: Model.Params) =>
     Speculation.autoregressive(model, componentParams, { vocabulary: VOCAB, maxDraftTokens: 4 })
   const perfectProposer = makeProposer(params)

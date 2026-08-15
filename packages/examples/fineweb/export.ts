@@ -11,7 +11,8 @@ import { CHECKPOINT, createGpt, loadTokenizer, saveParams } from "./model.js"
 // imports; returned parameters/state remain caller-owned for this process. The
 // source has no embedded trainer provenance, so
 // this synthetic trainer must retain the source run's model/optimizer root
-// schema even though it never steps. The output is atomically replaced. Usage:
+// schema even though it never steps. The bundled Metal backend atomically
+// replaces the output. Usage:
 //   pnpm tsx fineweb/export.ts <checkpoint.safetensors> [out.safetensors]
 
 const [, , source = new URL("../data/fineweb-epoch-ckpt.safetensors", import.meta.url).pathname, out = CHECKPOINT] =
@@ -21,7 +22,7 @@ const program = Effect.gen(function*() {
   const tokenizer = yield* loadTokenizer
   const model = yield* createGpt(tokenizer.vocabSize)
   // Checkpoint.load rebuilds optimizer state through the trainer's
-  // optimizer, so it needs one — but it is never stepped here.
+  // optimizer, so it needs one, but it is never stepped here.
   const zero = yield* Tensor.zeros([1, 1])
   const trainer = yield* Trainer.make(model, {
     optimizer: yield* Optimizer.adamW(),

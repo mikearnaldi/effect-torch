@@ -5,32 +5,39 @@ import * as assert from "@effect/vitest/utils"
 import { Effect } from "effect"
 import type { Runtime } from "../../src/index.ts"
 
+/** Backends included in the shared numerical test matrix. */
 export type TestDevice = "cpu" | "metal"
 
-// Availability is sampled once during suite registration. An unavailable Metal
-// backend omits that matrix entry rather than falling back to CPU under its name.
+/**
+ * Whether Metal was available when the test suite was registered. An
+ * unavailable backend is omitted rather than silently replaced with CPU.
+ */
 export const metalAvailable: boolean = Effect.runSync(BackendApple.isAvailable)
 
-/** Encodes common numerical fixtures as f32, the shared CPU/Metal dtype. */
+/** Encodes numerical fixtures as f32, the shared CPU/Metal dtype. */
 export const floats = (values: ReadonlyArray<number>): Float32Array => new Float32Array(values)
 
+/** Shared floating-point dtype used by CPU and Metal fixtures. */
 export const floatDtype = "f32" as const
 
 /** Default absolute f32 tolerance; magnitude-sensitive suites scale it explicitly. */
 export const TOL = 1e-4
 
-/** Finite-difference step and tolerance for gradient checks in f32:
- * large enough that f(x±eps) clears f32 rounding, small enough that the
- * central-difference truncation stays well below the tolerance. */
+/**
+ * Finite-difference step for f32 gradient checks. It clears f32 rounding while
+ * keeping central-difference truncation below the matching tolerance.
+ */
 export const GRADCHECK_EPS = 2e-3
+
+/** Absolute tolerance used with {@link GRADCHECK_EPS}. */
 export const GRADCHECK_TOL = 2e-2
 
 const closeEnough = (a: number, b: number): boolean =>
   a === b || (Number.isNaN(a) && Number.isNaN(b)) || Math.abs(a - b) <= TOL
 
 /**
- * deepStrictEqual with the f32 tolerance for numeric content: exact for
- * shapes, dtypes and strings; elementwise-close for numbers.
+ * Compares structures exactly except for numeric arrays, which use the shared
+ * f32 tolerance.
  */
 export const deep = (actual: unknown, expected: unknown): void => {
   if (typeof actual === "number" && typeof expected === "number") {

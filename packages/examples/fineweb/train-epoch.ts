@@ -1,6 +1,5 @@
 import * as BackendApple from "@effect-torch/backend-apple-native"
-import type { Model } from "@effect-torch/core"
-import { Checkpoint, LearningRate, Loss, Optimizer, Sampler, Tensor, Trainer } from "@effect-torch/core"
+import { Checkpoint, LearningRate, Loss, Model, Optimizer, Sampler, Tensor, Trainer } from "@effect-torch/core"
 import { NodeRuntime } from "@effect/platform-node"
 import { Duration, Effect } from "effect"
 import fs from "node:fs"
@@ -122,7 +121,7 @@ const program = Effect.gen(function*() {
     yield* Effect.log(`warm start from ${CHECKPOINT}`)
   } else {
     sampler = yield* Sampler.make(samplerConfig)
-    params = yield* model.init
+    params = yield* Model.initialize(model)
     yield* Effect.log(`cold start from random init (no checkpoint at ${CHECKPOINT})`)
   }
   yield* Effect.log(

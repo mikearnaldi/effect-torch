@@ -143,13 +143,22 @@ export type ChatSampler = (logits: Tensor.TypedArray) => number
  * @category models
  */
 export interface ChatSamplingOptions {
+  /** Non-negative sampling temperature; `0` selects greedy sampling. Defaults to `0`. */
   readonly temperature?: number | undefined
+  /** Non-negative top-k candidate count; `0` disables top-k filtering. Defaults to `0`. */
   readonly topK?: number | undefined
+  /** Nucleus probability in `(0, 1]`; `1` disables top-p filtering. Defaults to `1`. */
   readonly topP?: number | undefined
+  /** Non-negative safe-integer seed; omitted seeds are generated once per stream. */
   readonly seed?: number | undefined
 }
 
-/** Standard sampling controls or a custom host-side logits callback. */
+/**
+ * Standard sampling controls or a custom host-side logits callback.
+ *
+ * @since 0.1.0
+ * @category models
+ */
 export type ChatSampling = ChatSamplingOptions | ChatSampler
 
 /**
@@ -258,7 +267,9 @@ export type ChatSegmentFinish = "message" | "turn" | "limit"
  * @category models
  */
 export interface CompletedChatSegment extends ChatSegment {
+  /** Final full decoded content for this segment. */
   readonly content: string
+  /** Reason the segment closed. */
   readonly finish: ChatSegmentFinish
 }
 

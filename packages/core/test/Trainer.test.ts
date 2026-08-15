@@ -36,7 +36,7 @@ onDevices("Trainer", (device) => (it) => {
           stop: ({ step, loss }) => loss < 0.2 || step >= 2500,
           onStep: () => Effect.sync(() => steps++)
         })
-        const { loss } = yield* trainer.train()
+        const { loss } = yield* trainer.train(yield* Model.initialize(trainer.model))
         expect(loss).toBeLessThan(0.2)
         expect(steps).toBeLessThan(2500)
       }))
@@ -54,7 +54,7 @@ onDevices("Trainer", (device) => (it) => {
           data: { input, target },
           stop: () => --patience === 0
         })
-        const { loss } = yield* trainer.train()
+        const { loss } = yield* trainer.train(yield* Model.initialize(trainer.model))
         expect(patience).toBe(0)
         expect(Number.isFinite(loss)).toBe(true)
       }))
@@ -72,7 +72,7 @@ onDevices("Trainer", (device) => (it) => {
           data,
           stop: ({ step }) => step >= 2500
         })
-        const { params, loss } = yield* trainer.train()
+        const { params, loss } = yield* trainer.train(yield* Model.initialize(trainer.model))
         expect(loss).toBeLessThan(0.05)
         const [pred] = yield* Tensor.compute([yield* model.forward(params, data.input)])
         expect((yield* values(pred)).map((v) => (v > 0.5 ? 1 : 0))).toEqual([0, 1, 1, 0])
@@ -92,7 +92,7 @@ onDevices("Trainer", (device) => (it) => {
           stop: ({ step }) => step >= 10,
           onStep: (info) => Effect.sync(() => seen.push(info))
         })
-        yield* trainer.train()
+        yield* trainer.train(yield* Model.initialize(trainer.model))
         expect(seen.map(({ step }) => step)).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10])
         expect(seen.every(({ loss }) => Number.isFinite(loss))).toBe(true)
         expect(seen.every(({ elapsed }) => Duration.toMillis(elapsed) >= 0)).toBe(true)
@@ -118,7 +118,7 @@ onDevices("Trainer", (device) => (it) => {
             )
         })
         runs.push([])
-        const first = yield* trainer.train()
+        const first = yield* trainer.train(yield* Model.initialize(trainer.model))
         // Final params and state roots transfer to the caller; release the first
         // run before reusing the trainer so this lifecycle test leaks no buffers.
         const firstOwned = [
@@ -127,7 +127,7 @@ onDevices("Trainer", (device) => (it) => {
         ]
         yield* Effect.forEach(Array.from(new Set(firstOwned)), (tensor) => Tensor.clear(tensor), { discard: true })
         runs.push([])
-        yield* trainer.train()
+        yield* trainer.train(yield* Model.initialize(trainer.model))
         expect(runs).toEqual([[0, 100, 200], [0, 100, 200]])
       }))
 
@@ -155,7 +155,7 @@ onDevices("Trainer", (device) => (it) => {
             }),
           stop: ({ step }) => step >= 7
         })
-        yield* trainer.train()
+        yield* trainer.train(yield* Model.initialize(trainer.model))
         expect(drawn).toEqual([1, 2, 3, 4, 5, 6, 7])
       }))
 
@@ -163,7 +163,7 @@ onDevices("Trainer", (device) => (it) => {
       Effect.gen(function*() {
         const model = yield* mlp
         const data = yield* xor
-        const initial = yield* Tensor.compute(yield* model.init)
+        const initial = yield* Tensor.compute(yield* Model.initialize(model))
         const lossOf = (params: Model.Params) =>
           Effect.gen(function*() {
             const [value] = yield* Tensor.compute([
@@ -193,7 +193,7 @@ onDevices("Trainer", (device) => (it) => {
         const model = yield* mlp
         const input = yield* Tensor.fromTypedArray(floats([0, 1, 1, 0]), [2, 2])
         const target = yield* Tensor.fromTypedArray(floats([1, 0]), [2, 1])
-        const initial = yield* Tensor.compute(yield* model.init)
+        const initial = yield* Tensor.compute(yield* Model.initialize(model))
         const config: Trainer.TrainConfig<Optimizer.SgdState, Tensor.TensorError> = {
           optimizer: yield* Optimizer.sgd({ momentum: 0.9 }),
           lr: LearningRate.constant(0.05),
@@ -233,12 +233,14 @@ onDevices("Trainer", (device) => (it) => {
           })
         })
         if (device !== "metal") {
-          const error = yield* Effect.flip(Effect.flatMap(makeMixed, (trainer) => trainer.train()))
+          const error = yield* Effect.flip(
+            Effect.flatMap(makeMixed, (trainer) => Effect.flatMap(Model.initialize(model), trainer.train))
+          )
           expect(error._tag).toBe("ModelError")
           return
         }
         const trainer = yield* makeMixed
-        const { params, loss } = yield* trainer.train()
+        const { params, loss } = yield* trainer.train(yield* Model.initialize(trainer.model))
         expect(loss).toBeLessThan(0.1)
         // masters stay f32 — the optimizer's update arithmetic is f32
         expect(params.every((p) => p.dtype === "f32")).toBe(true)
@@ -252,7 +254,7 @@ onDevices("Trainer", (device) => (it) => {
         const model = yield* mlp
         const input = yield* Tensor.fromTypedArray(floats([0, 1, 1, 0]), [2, 2])
         const target = yield* Tensor.fromTypedArray(floats([1, 0]), [2, 1])
-        const initial = yield* Tensor.compute(yield* model.init)
+        const initial = yield* Tensor.compute(yield* Model.initialize(model))
         const makeTrainer = (stopStep: number) =>
           Effect.gen(function*() {
             return yield* Trainer.make(model, {
@@ -279,7 +281,7 @@ onDevices("Trainer", (device) => (it) => {
       Effect.gen(function*() {
         const model = yield* mlp
         const data = yield* xor
-        const initial = yield* Tensor.compute(yield* model.init)
+        const initial = yield* Tensor.compute(yield* Model.initialize(model))
         const config: Trainer.TrainConfig<Optimizer.AdamState, Tensor.TensorError> = {
           optimizer: yield* Optimizer.adam(),
           lr: LearningRate.cosine(0.1, { totalSteps: 30 }),
@@ -306,7 +308,7 @@ onDevices("Trainer", (device) => (it) => {
           data,
           stop: ({ step }) => step >= 2500
         })
-        const { params, loss } = yield* trainer.train()
+        const { params, loss } = yield* trainer.train(yield* Model.initialize(trainer.model))
         expect(loss).toBeLessThan(0.05)
         const [pred] = yield* Tensor.compute([yield* model.forward(params, data.input)])
         expect((yield* values(pred)).map((v) => (v > 0.5 ? 1 : 0))).toEqual([0, 1, 1, 0])
@@ -328,7 +330,7 @@ onDevices("Trainer", (device) => (it) => {
           data: (step) => Effect.succeed(step % 2 === 1 ? small : large),
           stop: ({ step }) => step >= 6
         })
-        const { loss } = yield* trainer.train()
+        const { loss } = yield* trainer.train(yield* Model.initialize(trainer.model))
         expect(Number.isFinite(loss)).toBe(true)
         expect(yield* trainer.stats).toEqual({ cached: 2, compiled: 2 })
       }))
@@ -346,7 +348,7 @@ onDevices("Trainer", (device) => (it) => {
           stop: ({ step }) => step >= 10,
           onStep: (info) => Effect.sync(() => seen.push(info))
         })
-        yield* trainer.train()
+        yield* trainer.train(yield* Model.initialize(trainer.model))
         expect(seen.map(({ step }) => step)).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10])
         expect(seen.every(({ loss }) => Number.isFinite(loss))).toBe(true)
       }))
@@ -362,7 +364,7 @@ onDevices("Trainer", (device) => (it) => {
           data,
           stop: ({ step }) => step >= 3
         })
-        yield* trainer.train()
+        yield* trainer.train(yield* Model.initialize(trainer.model))
         expect((yield* trainer.stats).cached).toBe(1)
         yield* trainer.clear
         expect(yield* trainer.stats).toEqual({ cached: 0, compiled: 1 })
