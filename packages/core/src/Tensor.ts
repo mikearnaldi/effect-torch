@@ -4899,14 +4899,18 @@ export const releaseKvSequence = (sequence: KvSequence): Effect.Effect<void, Ten
  * immutable executable. Stateless graphs are allowed. Causal
  * {@link scaledDotProductAttention}, KDA, short convolution, and position
  * operations are converted to their incremental state or cursor forms when
- * present; every attention operation must be causal, and runtime scalar inputs
- * are rejected. Specialization creates one new semantic graph before ordinary
+ * present. Non-causal attention is accepted only with
+ * `state.currentBlockAttention: "Bidirectional"`, which preserves full current
+ * block visibility alongside committed cache rows. Runtime scalar inputs are
+ * rejected. Specialization creates one new semantic graph before ordinary
  * single-index compilation; later fusion remains side-table planning. State
  * capacities and `batch` must be positive unsigned 32-bit integers, `blockSize`
  * must divide `maxTokens`, and `window` must be an unsigned 32-bit integer in
  * `1..=maxTokens`. With `state.lastTokenRow`, every root must be `[batch, T, V]`
  * and the program outputs become advance-selected `[V]` rows: one for batch 1,
- * otherwise `batch` rows in row order. `state.packedCausalChains` instead keeps
+ * otherwise `batch` rows in row order. `state.outputSelections` applies that
+ * split policy, a single batched `[batch, V]` policy, or all-row retention per
+ * source root in stable source-root order. `state.packedCausalChains` instead keeps
  * physical `batch` separate from the traced graph's
  * `batch * rowsPerSequence` one-token rows and requires all-row outputs.
  * Compilation retains captured concrete
@@ -4943,9 +4947,12 @@ export const compileDecodeProgram = (
       handle,
       ...handle.state,
       ...(state.packedCausalChains === undefined ? {} : { packedCausalChains: state.packedCausalChains }),
-      outputs: roots.flatMap((root) => {
+      outputs: roots.flatMap((root, index) => {
         const base = { dtype: root.dtype, placement: root.placement }
-        if (state.lastTokenRow !== true) return [{ shape: root.shape, ...base }]
+        const selection = state.outputSelections?.[index]
+          ?? (state.lastTokenRow === true ? "splitLastTokenRow" : "allRows")
+        if (selection === "allRows") return [{ shape: root.shape, ...base }]
+        if (selection === "batchedLastTokenRow") return [{ shape: [state.batch, root.shape[2]!], ...base }]
         return Array.from({ length: state.batch }, () => ({ shape: [root.shape[2]!], ...base }))
       })
     }

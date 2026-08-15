@@ -1,9 +1,8 @@
-// Quantized Muse-Glimmer chat inference. Model and tokenizer paths are resolved
-// relative to this module, while optional generation/config controls come from
+// Quantized Muse-Glimmer chat inference with its official DFlash draft. Paths
+// and optional generation/config controls come from
 // MUSE_GLIMMER_* environment variables and invalid configured values fail via
-// Effect Config. Gguf.load uses the provided Registry to select the architecture
-// implementation, validates its tensor catalog, and imports encoded weights on
-// the selected backend. Chat.stream owns the generation session, renders the
+// Effect Config. Each model module validates its exact GGUF architecture,
+// tensor catalog, and encoded weights on the selected backend. Chat.stream owns the generation session, renders the
 // GGUF template, emits parsed reasoning/content segments incrementally, and
 // closes state on completion, failure, or interruption. The artifact has a
 // 4,096-token full-context pool, so prompt plus decode must fit even when the
@@ -13,7 +12,8 @@
 // makes stochastic runs replayable.
 
 import * as BackendApple from "@effect-torch/backend-apple-native"
-import { Chat, Gguf, Model, Registry, Tensor } from "@effect-torch/core"
+import { Chat, Model, Tensor } from "@effect-torch/core"
+import { DFlash, MuseGlimmer } from "@effect-torch/core/models"
 import * as Tokenizers from "@effect-torch/tokenizers"
 import { NodeRuntime } from "@effect/platform-node"
 import { Config, Effect, Option, Schema, Stream } from "effect"
@@ -21,8 +21,9 @@ import path from "node:path"
 import { fileURLToPath } from "node:url"
 
 const directory = path.dirname(fileURLToPath(import.meta.url))
-const modelPath = path.join(directory, "../data/Muse-Glimmer-30B-UD-Q2_K_XL.gguf")
-const tokenizerPath = path.join(directory, "../data/muse-glimmer-tokenizer.json")
+const defaultModelPath = path.join(directory, "../data/Muse-Glimmer-30B-UD-Q2_K_XL.gguf")
+const defaultDraftPath = path.join(directory, "../data/dflash-Muse-Glimmer-30B-Q4_K_M.gguf")
+const defaultTokenizerPath = path.join(directory, "../data/muse-glimmer-tokenizer.json")
 
 const timed = <A, E, R>(label: string, effect: Effect.Effect<A, E, R>): Effect.Effect<A, E, R> =>
   Effect.gen(function*() {
@@ -87,6 +88,27 @@ const program = Effect.gen(function*() {
     Config.withDefault(false)
   )
 
+  const useDFlash = yield* Config.boolean("MUSE_GLIMMER_DFLASH").pipe(
+    Config.withDefault(true)
+  )
+
+  const draftTokens = yield* Config.schema(
+    Schema.Int.check(Schema.isGreaterThan(0), Schema.isLessThanOrEqualTo(15)),
+    "MUSE_GLIMMER_DRAFT_TOKENS"
+  ).pipe(
+    Config.withDefault(7)
+  )
+
+  const modelPath = yield* Config.nonEmptyString("MUSE_GLIMMER_MODEL_PATH").pipe(
+    Config.withDefault(defaultModelPath)
+  )
+  const draftPath = yield* Config.nonEmptyString("MUSE_GLIMMER_DRAFT_PATH").pipe(
+    Config.withDefault(defaultDraftPath)
+  )
+  const tokenizerPath = yield* Config.nonEmptyString("MUSE_GLIMMER_TOKENIZER_PATH").pipe(
+    Config.withDefault(defaultTokenizerPath)
+  )
+
   const tokenizer = yield* timed(
     "Loading tokenizer",
     Tokenizers.fromFile(tokenizerPath, {
@@ -95,7 +117,8 @@ const program = Effect.gen(function*() {
     })
   )
 
-  const loaded = yield* timed("Loading model", Gguf.load(modelPath))
+  const loaded = yield* timed("Loading model", MuseGlimmer.loadGGUF(modelPath))
+  const draft = useDFlash ? yield* timed("Loading DFlash draft", DFlash.loadGGUF(draftPath)) : undefined
 
   const chatTemplate = loaded.metadata.get("tokenizer.chat_template")
 
@@ -145,13 +168,17 @@ const program = Effect.gen(function*() {
       blockSize: 16,
       kvDtype: "f16",
       prefillChunk: 16,
-      batchSize: 1
+      batchSize: 1,
+      ...(draft === undefined
+        ? {}
+        : { speculation: { proposer: draft.artifact, maxDraftTokens: Math.min(draftTokens, draft.maxDraftTokens) } })
     })
   )
 
   // Model.inference materializes and retains its own immutable parameter
   // generation, so the GGUF loader's handles can be released after compilation.
   yield* Tensor.clearAll(loaded.params)
+  if (draft !== undefined) yield* Tensor.clearAll(draft.params)
 
   let sawSegment = false
 
@@ -208,12 +235,21 @@ const program = Effect.gen(function*() {
         }
       })
   )
+  if (diagnostics) {
+    const stats = yield* inference.diagnostics()
+    const acceptance = stats.proposedTokens === 0n
+      ? 0
+      : Number(stats.acceptedTokens) / Number(stats.proposedTokens)
+    process.stderr.write(
+      `speculation: ${stats.acceptedTokens}/${stats.proposedTokens} accepted (${(acceptance * 100).toFixed(1)}%), ` +
+        `draft ${(Number(stats.draftNanos) / 1e9).toFixed(2)}s, verify ${
+          (Number(stats.verificationNanos) / 1e9).toFixed(2)
+        }s\n`
+    )
+  }
   if (!sawSegment) process.stdout.write("\n")
 })
 
 NodeRuntime.runMain(
-  program.pipe(
-    Effect.provide(Registry.layer),
-    Effect.provide(BackendApple.layer)
-  )
+  program.pipe(Effect.provide(BackendApple.layer))
 )

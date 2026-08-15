@@ -26,7 +26,9 @@
 //!   finite window; a global retention window that cannot hold an explicit
 //!   local window is a hard error.
 
-use effect_torch_graph::{node_children, remap_children, Node, NodeKind, PositionOffset};
+use effect_torch_graph::{
+    node_children, remap_children, KvAttentionMode, Node, NodeKind, PositionOffset,
+};
 use effect_torch_runtime::DType;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -97,6 +99,35 @@ pub enum DecodeLayout {
         batch: usize,
         rows_per_sequence: usize,
     },
+}
+
+/// Output-row policy for one decode root. Policies are applied in source-root
+/// order; split roots retain lane order within their source root.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum DecodeOutputSelection {
+    /// Preserve every row produced by the semantic root.
+    AllRows,
+    /// Emit one last-valid `[V]` output root per physical lane.
+    SplitLastTokenRow,
+    /// Emit one batched last-valid `[batch, V]` output root.
+    BatchedLastTokenRow,
+}
+
+/// Visibility policy for rows staged by one decode invocation.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub enum CurrentBlockAttention {
+    #[default]
+    Causal,
+    Bidirectional,
+}
+
+impl CurrentBlockAttention {
+    const fn kv_mode(self) -> KvAttentionMode {
+        match self {
+            Self::Causal => KvAttentionMode::Causal,
+            Self::Bidirectional => KvAttentionMode::BidirectionalBlock,
+        }
+    }
 }
 
 impl DecodeLayout {
@@ -170,11 +201,67 @@ pub fn specialize_decode_layout(
     layout: DecodeLayout,
     last_token_row: bool,
 ) -> Result<(Vec<Arc<Node>>, DecodeGeometry), String> {
+    let output_selections = vec![
+        if last_token_row {
+            DecodeOutputSelection::SplitLastTokenRow
+        } else {
+            DecodeOutputSelection::AllRows
+        };
+        roots.len()
+    ];
+    specialize_decode_layout_outputs(roots, window, layout, &output_selections)
+}
+
+/// Builds a stateful decode specialization with an explicit output-row policy
+/// for every source root.
+pub fn specialize_decode_layout_outputs(
+    roots: &[Arc<Node>],
+    window: Option<usize>,
+    layout: DecodeLayout,
+    output_selections: &[DecodeOutputSelection],
+) -> Result<(Vec<Arc<Node>>, DecodeGeometry), String> {
+    specialize_decode_layout_outputs_with_attention(
+        roots,
+        window,
+        layout,
+        output_selections,
+        CurrentBlockAttention::Causal,
+    )
+}
+
+/// Builds a stateful decode specialization with explicit output and current
+/// block attention policies.
+pub fn specialize_decode_layout_outputs_with_attention(
+    roots: &[Arc<Node>],
+    window: Option<usize>,
+    layout: DecodeLayout,
+    output_selections: &[DecodeOutputSelection],
+    current_block_attention: CurrentBlockAttention,
+) -> Result<(Vec<Arc<Node>>, DecodeGeometry), String> {
     let graph_rows = layout.graph_rows()?;
     let batch = layout.batch();
-    if matches!(layout, DecodeLayout::PackedCausalChains { .. }) && last_token_row {
+    if output_selections.len() != roots.len() {
+        return Err(format!(
+            "decode: expected one output selection per root ({}), got {}",
+            roots.len(),
+            output_selections.len()
+        ));
+    }
+    if matches!(layout, DecodeLayout::PackedCausalChains { .. })
+        && output_selections
+            .iter()
+            .any(|selection| *selection != DecodeOutputSelection::AllRows)
+    {
         return Err(
             "decode: packed causal-chain verification requires all-row outputs".to_string(),
+        );
+    }
+    if matches!(layout, DecodeLayout::PackedCausalChains { .. })
+        && current_block_attention == CurrentBlockAttention::Bidirectional
+    {
+        return Err(
+            "decode: packed causal-chain verification requires causal current-block attention"
+                .to_string(),
         );
     }
     let mut maximum_slot = None;
@@ -246,7 +333,7 @@ pub fn specialize_decode_layout(
                 causal,
                 window: attention_window,
             } => {
-                if !causal {
+                if !causal && current_block_attention != CurrentBlockAttention::Bidirectional {
                     return Err(
                         "decode: only causal attention is cacheable, found a non-causal sdpa"
                             .to_string(),
@@ -293,6 +380,7 @@ pub fn specialize_decode_layout(
                     scale: *scale,
                     layer: layer as u32,
                     window: resolved_window,
+                    mode: current_block_attention.kv_mode(),
                 }
             }
             NodeKind::KdaChunk {
@@ -518,34 +606,58 @@ pub fn specialize_decode_layout(
             }
         }
     }
-    let roots = if last_token_row {
-        let mut selected = Vec::new();
-        for root in &roots {
-            if root.shape.len() != 3 || root.shape[0] != batch {
-                return Err(format!(
-                    "decode: last-token-row roots must be [{batch}, T, V], got {:?}",
-                    root.shape
-                ));
-            }
-            let (tokens, width) = (root.shape[1], root.shape[2]);
-            if batch == 1 {
-                selected.push(Node::new(NodeKind::LastTokenRow { a: root.clone() })?);
-            } else {
+    let mut selected = Vec::new();
+    for (root, selection) in roots.iter().zip(output_selections) {
+        match selection {
+            DecodeOutputSelection::AllRows => selected.push(root.clone()),
+            DecodeOutputSelection::SplitLastTokenRow
+            | DecodeOutputSelection::BatchedLastTokenRow => {
+                if root.shape.len() != 3 || root.shape[0] != batch {
+                    return Err(format!(
+                        "decode: last-token-row roots must be [{batch}, T, V], got {:?}",
+                        root.shape
+                    ));
+                }
+                let (tokens, width) = (root.shape[1], root.shape[2]);
+                let mut rows = Vec::with_capacity(batch);
                 for row in 0..batch {
-                    let slice = Node::new(NodeKind::Slice {
-                        a: root.clone(),
-                        ranges: vec![(row, row + 1, 1), (0, tokens, 1), (0, width, 1)],
+                    let source = if batch == 1 {
+                        root.clone()
+                    } else {
+                        Node::new(NodeKind::Slice {
+                            a: root.clone(),
+                            ranges: vec![(row, row + 1, 1), (0, tokens, 1), (0, width, 1)],
+                        })?
+                    };
+                    rows.push(Node::new(NodeKind::LastTokenRow { a: source })?);
+                }
+                if *selection == DecodeOutputSelection::SplitLastTokenRow {
+                    selected.extend(rows);
+                } else {
+                    let mut rows = rows.into_iter();
+                    let first = rows.next().expect("decode batch is positive");
+                    let mut batched = Node::new(NodeKind::Reshape {
+                        a: first,
+                        shape: vec![1, width],
                     })?;
-                    selected.push(Node::new(NodeKind::LastTokenRow { a: slice })?);
+                    for row in rows {
+                        let row = Node::new(NodeKind::Reshape {
+                            a: row,
+                            shape: vec![1, width],
+                        })?;
+                        batched = Node::new(NodeKind::Concat {
+                            a: batched,
+                            b: row,
+                            dim: 0,
+                        })?;
+                    }
+                    selected.push(batched);
                 }
             }
         }
-        selected
-    } else {
-        roots
-    };
+    }
     Ok((
-        roots,
+        selected,
         DecodeGeometry {
             layers,
             kv_heads,
@@ -723,6 +835,65 @@ mod tests {
             assert!(geometry.allows_window_eviction);
             assert_eq!(geometry.kda.layers, 1);
             assert_eq!(geometry.conv.layers, 1);
+        }
+    }
+
+    #[test]
+    fn bidirectional_mode_specializes_non_causal_attention_and_rejects_packed_layout() {
+        for device in [Device::Cpu, Device::Metal] {
+            let causal = attention(1, 2, 3, 4, 0.5, true, device.clone());
+            let (causal_specialized, _) = specialize_decode_layout_outputs(
+                &[causal],
+                None,
+                DecodeLayout::dense(1),
+                &[DecodeOutputSelection::AllRows],
+            )
+            .unwrap();
+            assert!(matches!(
+                causal_specialized[0].kind,
+                NodeKind::KvAttention {
+                    mode: KvAttentionMode::Causal,
+                    ..
+                }
+            ));
+
+            let root = attention(1, 2, 3, 4, 0.5, false, device);
+            let causal_error = specialize_decode_layout_outputs(
+                std::slice::from_ref(&root),
+                None,
+                DecodeLayout::dense(1),
+                &[DecodeOutputSelection::AllRows],
+            )
+            .err()
+            .expect("causal mode must reject non-causal SDPA");
+            assert!(causal_error.contains("non-causal sdpa"));
+
+            let (specialized, _) = specialize_decode_layout_outputs_with_attention(
+                std::slice::from_ref(&root),
+                None,
+                DecodeLayout::dense(1),
+                &[DecodeOutputSelection::AllRows],
+                CurrentBlockAttention::Bidirectional,
+            )
+            .unwrap();
+            assert!(matches!(
+                specialized[0].kind,
+                NodeKind::KvAttention {
+                    mode: KvAttentionMode::BidirectionalBlock,
+                    ..
+                }
+            ));
+
+            let packed_error = specialize_decode_layout_outputs_with_attention(
+                &[root],
+                None,
+                DecodeLayout::packed_causal_chains(1, 1),
+                &[DecodeOutputSelection::AllRows],
+                CurrentBlockAttention::Bidirectional,
+            )
+            .err()
+            .expect("packed layouts must reject bidirectional current blocks");
+            assert!(packed_error.contains("requires causal current-block attention"));
         }
     }
 
@@ -1120,6 +1291,55 @@ mod tests {
                 "decode: last-token-row roots must be [1, T, V], got [2, 4, 8]"
             );
         }
+    }
+
+    #[test]
+    fn per_root_output_selection_keeps_mapping_and_batches_hidden_rows() {
+        for device in [Device::Cpu, Device::Metal] {
+            let logits = input(0, &[2, 4, 8], DType::F32, device.clone());
+            let hidden = input(1, &[2, 4, 6], DType::F32, device);
+            let (roots, _) = specialize_decode_layout_outputs(
+                &[logits, hidden],
+                None,
+                DecodeLayout::dense(2),
+                &[
+                    DecodeOutputSelection::SplitLastTokenRow,
+                    DecodeOutputSelection::BatchedLastTokenRow,
+                ],
+            )
+            .unwrap();
+
+            assert_eq!(roots.len(), 3);
+            assert_eq!(roots[0].shape, [8]);
+            assert_eq!(roots[1].shape, [8]);
+            assert_eq!(roots[2].shape, [2, 6]);
+            assert!(matches!(roots[0].kind, NodeKind::LastTokenRow { .. }));
+            assert!(matches!(roots[1].kind, NodeKind::LastTokenRow { .. }));
+            assert!(matches!(roots[2].kind, NodeKind::Concat { .. }));
+        }
+
+        let root = input(0, &[2, 1, 8], DType::F32, Device::Cpu);
+        let error = specialize_decode_layout_outputs(
+            std::slice::from_ref(&root),
+            None,
+            DecodeLayout::dense(2),
+            &[],
+        )
+        .err()
+        .expect("selection count must be validated");
+        assert!(error.contains("one output selection per root"));
+        let error = specialize_decode_layout_outputs(
+            &[root],
+            None,
+            DecodeLayout::packed_causal_chains(1, 2),
+            &[DecodeOutputSelection::BatchedLastTokenRow],
+        )
+        .err()
+        .expect("packed roots must retain all rows");
+        assert_eq!(
+            error,
+            "decode: packed causal-chain verification requires all-row outputs"
+        );
     }
 
     #[test]

@@ -1,11 +1,12 @@
 /**
  * The load-only Muse-Glimmer transformer architecture used by GGUF artifacts.
  *
- * {@link architecture} consumes the canonical configuration prepared by
- * `Gguf.load`; it does not inspect a file or load weights. The resulting
- * {@link Model.Model} declares the GGUF tensor names and logical shapes, then
- * builds a stateless full-sequence graph. `Model.inference` can subsequently
- * specialize that same graph into paged-KV prefill and decode programs.
+ * {@link loadGGUF} consumes the canonical configuration prepared from a GGUF
+ * artifact, validates its tensor catalog, and loads owned parameters. The
+ * resulting {@link Model.Model} declares the GGUF tensor names and logical
+ * shapes, then builds a stateless full-sequence graph. `Model.inference` can
+ * subsequently specialize that same graph into paged-KV prefill and decode
+ * programs.
  *
  * The implementation is storage-independent at the architecture boundary.
  * Dense F32 parameters and `Q2_K`, `Q3_K`, `Q4_K`, `Q5_K`, or `Q6_K` matrices
@@ -19,27 +20,25 @@
  * use GGML's interleaved-pair RoPE convention, and centered normalization
  * scales have already been shifted into multiplicative RMS weights (including
  * the artifact's Q- and K-normalization scales). Neither this architecture nor
- * `Gguf.load` repeats those conversions or synthesizes replacement tensors.
+ * `loadGGUF` repeats those conversions or synthesizes replacement tensors.
  *
  * @since 0.1.0
  */
 import { Effect } from "effect"
 import * as Schema from "effect/Schema"
+import * as Gguf from "../Gguf.ts"
 import * as Model from "../Model.ts"
-import type * as Registry from "../Registry.ts"
+import type * as Runtime from "../Runtime.ts"
 import * as Tensor from "../Tensor.ts"
 
 /**
- * The exact registry identifier for Muse-Glimmer GGUF artifacts.
- *
- * `Gguf.load` reads `general.architecture = "muse-glimmer"`, prefixes it with
- * `"gguf:"`, and performs an exact registry lookup. There are no unqualified,
- * case-insensitive, or alternate aliases for this identifier.
+ * The exact `general.architecture` value required in a Muse-Glimmer GGUF
+ * artifact.
  *
  * @since 0.1.0
  * @category identifiers
  */
-export const id = "gguf:muse-glimmer"
+export const architecture = "muse-glimmer"
 
 const PositiveInt = Schema.Int.check(Schema.isGreaterThan(0))
 const PositiveFinite = Schema.Finite.check(Schema.isGreaterThan(0))
@@ -48,7 +47,7 @@ const MAX_BLOCKS = 1024
 /**
  * Architecture fields after GGUF metadata has been canonicalized.
  *
- * For a Muse-Glimmer artifact, `Gguf.load` removes the `muse-glimmer.` prefix
+ * For a Muse-Glimmer artifact, `loadGGUF` removes the `muse-glimmer.` prefix
  * from architecture metadata, removes `general.` from general metadata, and
  * derives `vocab_size` from `tokenizer.ggml.tokens.length` when the metadata
  * does not provide it. This schema then requires the fifteen fields below.
@@ -118,13 +117,13 @@ const Config = Schema.Struct({
 type Config = Schema.Schema.Type<typeof Config>
 
 /**
- * Converts the canonical registry map to the validated architecture closure.
+ * Converts the canonical GGUF metadata map to the validated architecture closure.
  * Translation from container-qualified GGUF metadata has already happened in
- * `Gguf.load`; direct callers of `architecture.create` must therefore provide
- * these canonical keys themselves. Schema failures become `ModelError` with
+ * `Gguf.loadModel`; direct callers of `create` must therefore provide these
+ * canonical keys themselves. Schema failures become `ModelError` with
  * `op = "create"` before a parameter catalog is exposed.
  */
-const decodeConfig = (config: Registry.ModelConfig): Effect.Effect<Config, Model.ModelError> =>
+const decodeConfig = (config: Gguf.ModelConfig): Effect.Effect<Config, Model.ModelError> =>
   Schema.decodeUnknownEffect(Config)(Object.fromEntries(config)).pipe(
     Effect.mapError((error) =>
       new Model.ModelError({
@@ -167,7 +166,7 @@ const decodeConfig = (config: Registry.ModelConfig): Effect.Effect<Config, Model
  * 14. `blk.N.ffn_down.weight [E, F]`
  *
  * The model arity is consequently `3 + 14 * L`. The spelling `post_ffw` is
- * the source tensor name, not a normalized API alias. `Gguf.load` proves an
+ * the source tensor name, not a normalized API alias. `loadGGUF` proves an
  * exact name/shape bijection with this catalog and reorders loaded handles into
  * this array order before returning them.
  */
@@ -370,19 +369,29 @@ const makeModel = (config: Config): Effect.Effect<Model.Model, Model.ModelError>
 }
 
 /**
- * The Muse-Glimmer GGUF model architecture.
- *
- * `create` validates canonical metadata and returns a load-only model template;
- * it performs no runtime access, file I/O, weight loading, or registration.
- * The architecture is re-exported from `@effect-torch/core/models`, while the
- * core `Registry.layer` installs it under the exact {@link id}. Custom
- * registries must register this value explicitly before `Gguf.load` can resolve
- * a Muse-Glimmer artifact.
+ * Validates canonical Muse-Glimmer metadata and returns a load-only model
+ * template. This performs no runtime access, file I/O, or weight loading.
  *
  * @since 0.1.0
  * @category models
  */
-export const architecture: Registry.ModelArchitecture = {
-  id,
-  create: (config) => Effect.flatMap(decodeConfig(config), makeModel)
+export const create = (config: Gguf.ModelConfig): Effect.Effect<Model.Model, Model.ModelError> =>
+  Effect.flatMap(decodeConfig(config), makeModel)
+
+/** Explicit GGUF model definition used by {@link loadGGUF}. */
+export const definition: Gguf.ModelDefinition = {
+  architecture,
+  create
 }
+
+/**
+ * Inspects, validates, and loads a Muse-Glimmer GGUF artifact. The artifact's
+ * `general.architecture` must equal {@link architecture} exactly.
+ *
+ * @since 0.1.0
+ * @category loading
+ */
+export const loadGGUF = (
+  path: string
+): Effect.Effect<Gguf.LoadedModel, Gguf.GgufError | Model.ModelError, Runtime.Runtime> =>
+  Gguf.loadModel(path, definition)

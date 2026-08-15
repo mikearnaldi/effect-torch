@@ -1,23 +1,21 @@
 /**
- * Native GGUF v3 inspection, registry-based model resolution, validation, and
+ * Native GGUF v3 inspection, explicit artifact definition, validation, and
  * loading. The selected runtime parses the file and creates concrete tensor
- * handles; this module canonicalizes metadata, resolves the exact
- * `gguf:<architecture>` registration, constructs the model, and verifies that
- * the inspected and loaded tensor catalogs form a bijection with its parameter
- * catalog.
+ * handles; this module canonicalizes metadata, verifies the exact architecture
+ * expected by the caller, constructs the model or parameter catalog, and
+ * verifies that the inspected and loaded tensor catalogs form a bijection with
+ * it.
  *
  * @since 0.1.0
  */
 import { Data, Effect, Exit } from "effect"
 import type * as Model from "./Model.ts"
-import * as Registry from "./Registry.ts"
 import * as Runtime from "./Runtime.ts"
 import type * as Tensor from "./Tensor.ts"
 
 /**
  * A native GGUF inspection/loading failure or a structural validation failure.
- * Missing architecture registrations remain {@link Registry.RegistryError}s,
- * and architecture construction failures remain `Model.ModelError`s.
+ * Model construction failures remain `Model.ModelError`s.
  *
  * @since 0.1.0
  * @category errors
@@ -30,6 +28,28 @@ export class GgufError extends Data.TaggedError("GgufError")<{
   /** Original runtime failure for native inspection or payload loading. */
   readonly backend?: Runtime.BackendError
 }> {}
+
+/**
+ * Canonical architecture configuration produced from GGUF metadata.
+ *
+ * @since 0.1.0
+ * @category models
+ */
+export type ModelConfig = ReadonlyMap<string, unknown>
+
+/**
+ * An explicitly selected GGUF model definition. Model modules provide one
+ * definition to their dedicated loader; there is no ambient registry lookup.
+ *
+ * @since 0.1.0
+ * @category models
+ */
+export interface ModelDefinition {
+  /** Exact value required for `general.architecture`. */
+  readonly architecture: string
+  /** Constructs a model template from canonical metadata. */
+  readonly create: (metadata: ModelConfig) => Effect.Effect<Model.Model, Model.ModelError>
+}
 
 /**
  * A constructed model, its concrete parameters in model order, and the
@@ -64,7 +84,7 @@ export interface LoadedParameters {
   readonly parameters: ReadonlyArray<Model.ParameterSpec>
   /** Caller-owned tensors in the requested parameter-catalog order. */
   readonly params: ReadonlyArray<Tensor.Concrete>
-  /** Canonical metadata using the same normalization as {@link load}. */
+  /** Canonical metadata using the same normalization as {@link loadModel}. */
   readonly metadata: ReadonlyMap<string, unknown>
 }
 
@@ -194,7 +214,7 @@ const descriptorEqual = (left: Runtime.GgufTensorDescriptor, right: Runtime.Gguf
 const modelConfig = (
   inspection: Runtime.GgufInspection,
   architecture: string
-): Registry.ModelConfig => {
+): ModelConfig => {
   const prefix = `${architecture}.`
   const entries = inspection.metadata.map((entry) => ({
     source: entry.key,
@@ -386,13 +406,12 @@ const clearLoaded = (
 }
 
 /**
- * Inspects, validates, and loads one native GGUF v3 file. Inspection happens
- * first without payload materialization. `general.architecture` must be a
- * non-empty string and resolves only the exact registry key
- * `gguf:<architecture>`. Canonical metadata strips that architecture prefix and
+ * Inspects, validates, and loads one native GGUF v3 file for an explicitly
+ * selected model definition. Inspection happens first without payload
+ * materialization. `general.architecture` must equal the definition's exact
+ * architecture value. Canonical metadata strips that architecture prefix and
  * `general.`, derives `vocab_size` from tokenizer tokens when absent, and
- * rejects empty or colliding canonical keys before calling the architecture's
- * `create` effect.
+ * rejects empty or colliding canonical keys before calling `create`.
  *
  * The inspected tensor catalog must exactly match the resulting model's names
  * and logical shapes. A second native operation then loads every payload. This
@@ -410,35 +429,31 @@ const clearLoaded = (
  * begins, this function attempts to release every distinct returned handle,
  * ignores release failures so the original exit is preserved, and returns no
  * tensors. On success ownership of every parameter transfers to the caller;
- * release each handle when no longer needed. Inspection and load backend
- * failures are {@link GgufError}s, exact-key lookup failures are
- * {@link Registry.RegistryError}s, and architecture construction failures are
- * `Model.ModelError`s.
+ * release each handle when no longer needed. Inspection, loading, and
+ * architecture mismatches are {@link GgufError}s; model construction failures
+ * are `Model.ModelError`s.
  *
  * @since 0.1.0
  * @category loading
  */
-export const load = (
-  path: string
-): Effect.Effect<
-  LoadedModel,
-  GgufError | Registry.RegistryError | Model.ModelError,
-  Runtime.Runtime | Registry.Registry
-> =>
+export const loadModel = (
+  path: string,
+  definition: ModelDefinition
+): Effect.Effect<LoadedModel, GgufError | Model.ModelError, Runtime.Runtime> =>
   Effect.gen(function*() {
     const runtime = yield* Runtime.Runtime
-    const registry = yield* Registry.Registry
     const gguf = runtime.extensions.gguf
     const inspected = yield* fromBackend("inspect", gguf.inspect(path))
     const inspection = yield* validateEffect(() => validateInspection(inspected))
     const architectureEntry = inspection.metadata.find((entry) => entry.key === "general.architecture")
-    if (typeof architectureEntry?.value !== "string" || architectureEntry.value.length === 0) {
-      return yield* fail("validate", "GGUF general.architecture must be a non-empty string")
+    if (architectureEntry?.value !== definition.architecture) {
+      return yield* fail(
+        "validate",
+        `GGUF general.architecture must be exactly ${JSON.stringify(definition.architecture)}`
+      )
     }
-    const architecture = architectureEntry.value
-    const implementation = yield* registry.get(`gguf:${architecture}`)
-    const config = yield* validateEffect(() => modelConfig(inspection, architecture))
-    const model = yield* implementation.create(config)
+    const config = yield* validateEffect(() => modelConfig(inspection, definition.architecture))
+    const model = yield* definition.create(config)
     yield* validateEffect(() => validateCatalog(model.parameters, inspection.tensors))
     const loaded = yield* loadArchive(path, runtime, inspection, model.parameters, config)
     return { model, ...loaded }

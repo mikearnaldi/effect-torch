@@ -111,6 +111,16 @@ export interface NativeInferenceProposerPlan {
     outputRoot: number
     value: NativeInferenceValueMetadata
   }>
+  prefillHiddenTaps?: Array<{
+    layer: number
+    outputRoot: number
+    value: NativeInferenceValueMetadata
+  }>
+  verifyHiddenTaps?: Array<{
+    layer: number
+    outputRoot: number
+    value: NativeInferenceValueMetadata
+  }>
   sharedTensors: Array<{
     kind: "TokenEmbedding" | "LmHead"
     name: string
@@ -435,7 +445,11 @@ export declare function compileInference(
   sampling: NativeInferenceSamplingOptions,
   proposerPlan?: NativeInferenceProposerPlan | undefined | null,
   sharedTensors?: Array<NativeTensor> | undefined | null,
-  stageExecutables?: Array<Executable> | undefined | null
+  stageExecutables?: Array<Executable> | undefined | null,
+  replayPrefill?: Executable | undefined | null,
+  replayDecode?: Executable | undefined | null,
+  replayVerify?: Executable | undefined | null,
+  replayPool?: NativeKvPool | undefined | null
 ): NativeInferenceArtifact
 
 /** Current bytes attributed to live native tensor wrappers. @internal */
@@ -544,7 +558,12 @@ export interface NativeKvStateSchema {
   batch: number
   packedCausalChains?: NativePackedCausalChainsLayout
   lastTokenRow?: boolean
+  outputSelections?: ReadonlyArray<NativeDecodeOutputSelection>
+  currentBlockAttention?: "Causal" | "Bidirectional"
 }
+
+/** Native spelling of per-root decode output selection. @internal */
+export type NativeDecodeOutputSelection = "AllRows" | "SplitLastTokenRow" | "BatchedLastTokenRow"
 
 /** Packed verifier graph rows reserved per physical sequence. @internal */
 export interface NativePackedCausalChainsLayout {

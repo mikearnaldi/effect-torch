@@ -39,11 +39,12 @@ use self::err::to_napi_err;
 use self::value::Value;
 use crate::{composed, executable, pool, CpuBuffer, CpuDestination, Elem, Tensor};
 use effect_torch_compiler::{
-    specialize_decode_layout, CompileOptions, DecodeGeometry, DecodeLayout, InferenceOptions,
-    PreparedProgram, ProgramRequest, ProgramSlot, StateCursorSlot,
+    specialize_decode_layout_outputs_with_attention, CompileOptions, CurrentBlockAttention,
+    DecodeGeometry, DecodeLayout, DecodeOutputSelection, InferenceOptions, PreparedProgram,
+    ProgramRequest, ProgramSlot, StateCursorSlot,
 };
 use effect_torch_graph::CrossEntropyReduction as CeReduction;
-use effect_torch_graph::{AttentionWindow, Device, PositionOffset, RotaryLayout};
+use effect_torch_graph::{AttentionWindow, Device, KvAttentionMode, PositionOffset, RotaryLayout};
 use effect_torch_napi::{try_register_export, unregister_export, vec_to_bytes, CancellationState};
 use effect_torch_runtime::{
     effective_probabilities, purpose_counter, random_unit_at, sample_logits, sample_probabilities,
@@ -317,6 +318,42 @@ pub struct NativeKvStateSchema {
     pub batch: u32,
     pub packed_causal_chains: Option<NativePackedCausalChainsLayout>,
     pub last_token_row: Option<bool>,
+    pub output_selections: Option<Vec<NativeDecodeOutputSelection>>,
+    pub current_block_attention: Option<NativeCurrentBlockAttention>,
+}
+
+#[napi(string_enum)]
+#[derive(Clone, Copy)]
+pub enum NativeCurrentBlockAttention {
+    Causal,
+    Bidirectional,
+}
+
+impl From<NativeCurrentBlockAttention> for CurrentBlockAttention {
+    fn from(mode: NativeCurrentBlockAttention) -> Self {
+        match mode {
+            NativeCurrentBlockAttention::Causal => Self::Causal,
+            NativeCurrentBlockAttention::Bidirectional => Self::Bidirectional,
+        }
+    }
+}
+
+#[napi(string_enum)]
+#[derive(Clone, Copy)]
+pub enum NativeDecodeOutputSelection {
+    AllRows,
+    SplitLastTokenRow,
+    BatchedLastTokenRow,
+}
+
+impl From<NativeDecodeOutputSelection> for DecodeOutputSelection {
+    fn from(selection: NativeDecodeOutputSelection) -> Self {
+        match selection {
+            NativeDecodeOutputSelection::AllRows => Self::AllRows,
+            NativeDecodeOutputSelection::SplitLastTokenRow => Self::SplitLastTokenRow,
+            NativeDecodeOutputSelection::BatchedLastTokenRow => Self::BatchedLastTokenRow,
+        }
+    }
 }
 
 #[napi(object)]
@@ -2173,7 +2210,25 @@ pub fn compile(
             }
             let batch = native.batch as usize;
             let window = native.window.map(|window| window as usize);
-            let last_token_row = native.last_token_row.unwrap_or(false);
+            if native.last_token_row.is_some() && native.output_selections.is_some() {
+                return Err(Error::new(
+                    Status::InvalidArg,
+                    "compile: last_token_row and output_selections are mutually exclusive",
+                ));
+            }
+            let output_selections = native.output_selections.clone().map_or_else(
+                || {
+                    vec![
+                        if native.last_token_row.unwrap_or(false) {
+                            DecodeOutputSelection::SplitLastTokenRow
+                        } else {
+                            DecodeOutputSelection::AllRows
+                        };
+                        roots.len()
+                    ]
+                },
+                |selections| selections.into_iter().map(Into::into).collect(),
+            );
             let layout =
                 native
                     .packed_causal_chains
@@ -2181,9 +2236,17 @@ pub fn compile(
                     .map_or(DecodeLayout::dense(batch), |packed| {
                         DecodeLayout::packed_causal_chains(batch, packed.rows_per_sequence as usize)
                     });
-            let (rewritten, geometry) =
-                specialize_decode_layout(&roots, window, layout, last_token_row)
-                    .map_err(|error| Error::new(Status::GenericFailure, error))?;
+            let (rewritten, geometry) = specialize_decode_layout_outputs_with_attention(
+                &roots,
+                window,
+                layout,
+                &output_selections,
+                native
+                    .current_block_attention
+                    .map(Into::into)
+                    .unwrap_or_default(),
+            )
+            .map_err(|error| Error::new(Status::GenericFailure, error))?;
             roots = rewritten;
             state_cursor = Some(geometry.state_cursor());
             Some(KvStateSchema::from_native(native, geometry)?)
@@ -3008,6 +3071,7 @@ impl executable::CpuState for Arc<KvContext> {
                 scale,
                 layer,
                 window,
+                mode,
             } => kv_attention_into(
                 self,
                 *layer,
@@ -3016,6 +3080,7 @@ impl executable::CpuState for Arc<KvContext> {
                 &inputs[2],
                 *scale,
                 *window,
+                *mode,
                 &mut outputs[0],
                 &mut transaction.eviction_starts,
             ),
@@ -3541,6 +3606,7 @@ fn kv_attention_into(
     v: &Value,
     scale: f64,
     window: Option<usize>,
+    mode: KvAttentionMode,
     output: &mut CpuDestination<'_>,
     eviction_starts: &mut [usize],
 ) -> err::Res<()> {
@@ -3607,6 +3673,7 @@ fn kv_attention_into(
                 &mut state,
                 layer_index,
                 context.window,
+                mode,
                 kv_heads,
                 width,
                 planned_tokens,
@@ -3719,9 +3786,18 @@ fn kv_attention_into(
                 for head in 0..query_heads {
                     let kv_head = head / (query_heads / kv_heads);
                     for query in 0..row_advance {
-                        let end = (row_position + query + 1).min(needed);
-                        let begin =
-                            window.map_or(start, |window| end.saturating_sub(window).max(start));
+                        let end = if mode == KvAttentionMode::BidirectionalBlock {
+                            needed
+                        } else {
+                            (row_position + query + 1).min(needed)
+                        };
+                        let begin = window.map_or(start, |window| {
+                            if mode == KvAttentionMode::BidirectionalBlock {
+                                row_position.saturating_sub(window).max(start)
+                            } else {
+                                end.saturating_sub(window).max(start)
+                            }
+                        });
                         let mut maximum = f64::NEG_INFINITY;
                         for position in begin..end {
                             let mut score = 0.0f64;
@@ -3811,6 +3887,7 @@ fn kv_prepare(
     state: &mut SeqState,
     layer: usize,
     window: Option<usize>,
+    mode: KvAttentionMode,
     heads: usize,
     width: usize,
     tokens: usize,
@@ -3835,7 +3912,13 @@ fn kv_prepare(
         ));
     }
     let needed = cursor + advance;
-    let start = window.map_or(0, |window| needed.saturating_sub(window));
+    let start = window.map_or(0, |window| {
+        if mode == KvAttentionMode::BidirectionalBlock {
+            cursor.saturating_sub(window)
+        } else {
+            needed.saturating_sub(window)
+        }
+    });
     if needed.saturating_sub(start) > pool.max_tokens {
         return Err(format!(
             "kv attention: live context {} exceeds pool capacity {}",
@@ -4433,6 +4516,39 @@ fn speculative_probabilities(
         CpuBuffer::F64(values) => probabilities!(values),
         _ => Err(format!(
             "executeSpeculative: logits must be floating point, got {}",
+            tensor.dtype()
+        )),
+    }
+}
+
+fn speculative_normalized_row(
+    value: &Value,
+    row: (usize, usize),
+) -> std::result::Result<Vec<f64>, String> {
+    let tensor = value.tensor();
+    let shape = tensor.shape();
+    if tensor.layout.rank() != 3 || row.0 >= shape[0] || row.1 >= shape[1] {
+        return Err("executeSpeculative: probability row is out of range".to_string());
+    }
+    let length = shape[2];
+    let offset = tensor.layout.offset()
+        + row.0 * tensor.layout.strides()[0]
+        + row.1 * tensor.layout.strides()[1];
+    let stride = tensor.layout.strides()[2];
+    macro_rules! values {
+        ($values:expr) => {
+            Ok((0..length)
+                .map(|index| $values[offset + index * stride].to_f64())
+                .collect())
+        };
+    }
+    match &tensor.buffer {
+        CpuBuffer::F16(values) => values!(values),
+        CpuBuffer::BF16(values) => values!(values),
+        CpuBuffer::F32(values) => values!(values),
+        CpuBuffer::F64(values) => values!(values),
+        _ => Err(format!(
+            "executeSpeculative: probabilities must be floating point, got {}",
             tensor.dtype()
         )),
     }
@@ -6087,10 +6203,26 @@ impl Executable {
         for (sequence, &slot) in sequences.iter().zip(&physical_slots) {
             lane_states[slot as usize] = Some(sequence.state.clone());
         }
+        if advances.len() != batch && advances.len() != physical_slots.len() {
+            return Err(Error::new(
+                Status::InvalidArg,
+                "kv run: advances must be physical-batch or compact-sequence aligned",
+            ));
+        }
         let context = Arc::new(KvContext {
             pool: sequences[0].pool.clone(),
             slots: lane_states,
-            advances: advances.iter().map(|&advance| advance as usize).collect(),
+            advances: {
+                let mut lanes = vec![0; batch];
+                for (index, &slot) in physical_slots.iter().enumerate() {
+                    lanes[slot as usize] = if advances.len() == batch {
+                        advances[slot as usize]
+                    } else {
+                        advances[index]
+                    } as usize;
+                }
+                lanes
+            },
             packed: None,
             window: schema.window,
             kda: schema.kda,
@@ -6451,6 +6583,11 @@ struct InferencePrograms {
     proposer_prefill: Option<Executable>,
     proposer_decode: Option<Executable>,
     proposer_pool: Option<Arc<PoolInner>>,
+    replay_prefill: Option<Executable>,
+    #[allow(dead_code)]
+    replay_decode: Option<Executable>,
+    replay_verify: Option<Executable>,
+    replay_pool: Option<Arc<PoolInner>>,
     max_draft_tokens: usize,
     batch_size: usize,
     token_dtype: DType,
@@ -6568,6 +6705,8 @@ pub struct NativeInferenceProposerPlan {
     pub vocabulary: u32,
     pub token_map_fingerprint: String,
     pub hidden_taps: Vec<NativeInferenceHiddenTap>,
+    pub prefill_hidden_taps: Option<Vec<NativeInferenceHiddenTap>>,
+    pub verify_hidden_taps: Option<Vec<NativeInferenceHiddenTap>>,
     pub shared_tensors: Vec<NativeInferenceSharedTensor>,
     pub stages: Vec<NativeInferenceStage>,
     pub state: NativeInferenceStatePlan,
@@ -6616,6 +6755,8 @@ struct ValidatedProposerPlan {
     target_hidden: HashMap<usize, ValueMetadata>,
     shared: HashMap<String, Value>,
     stages: Vec<ValidatedStage>,
+    prefill_taps: Vec<(usize, usize)>,
+    verify_taps: Vec<(usize, usize)>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -6699,6 +6840,10 @@ fn output_metadata(executable: &Executable, output: usize) -> Option<ValueMetada
             dtype: value.dtype,
             shape: value.shape.clone(),
         })
+}
+
+fn dense_tap_output(batch: usize, semantic_root: usize) -> usize {
+    batch + semantic_root - 1
 }
 
 #[allow(dead_code)]
@@ -6972,6 +7117,51 @@ fn validate_inference_program(
     Ok(schema)
 }
 
+fn validate_replay_program(
+    executable: &Executable,
+    pool: &NativeKvPool,
+    batch: usize,
+    taps: &[(usize, usize)],
+    target: &Executable,
+) -> Result<KvStateSchema> {
+    let schema = executable
+        .state
+        .ok_or_else(|| inference_error("compile", "replay program is stateless"))?;
+    validate_pool_schema(&schema, &pool.inner)
+        .map_err(|error| inference_error("compile", error.reason))?;
+    let slots = executable
+        .inner
+        .slots
+        .iter()
+        .enumerate()
+        .filter(|(index, slot)| {
+            !slot.scalar && !(schema.cursor_tensor && *index as u32 == schema.cursor_slot)
+        })
+        .map(|(_, slot)| slot)
+        .collect::<Vec<_>>();
+    if schema.batch != batch
+        || schema.packed_rows_per_sequence.is_some()
+        || slots.len() != taps.len()
+        || executable.inner.slots.iter().any(|slot| slot.scalar)
+    {
+        return Err(inference_error(
+            "compile",
+            "replay state or input count does not match its tap phase",
+        ));
+    }
+    for (slot, &(_, physical)) in slots.iter().zip(taps) {
+        let source = output_metadata(target, physical)
+            .ok_or_else(|| inference_error("compile", "replay tap output is missing"))?;
+        if slot.dtype != source.dtype || slot.shape != source.shape {
+            return Err(inference_error(
+                "compile",
+                "replay input metadata does not match its target tap",
+            ));
+        }
+    }
+    Ok(schema)
+}
+
 fn validate_proposer_plan(
     plan: NativeInferenceProposerPlan,
     shared_tensors: Vec<&NativeTensor>,
@@ -7007,19 +7197,68 @@ fn validate_proposer_plan(
             ));
         }
         let declared = ValueMetadata::native(&tap.value);
-        for executable in [Some(target_prefill), Some(target_decode), target_verify]
-            .into_iter()
-            .flatten()
-        {
-            if output_metadata(executable, root).as_ref() != Some(&declared) {
-                return Err(inference_error(
-                    "compile",
-                    "target hidden tap metadata does not match an executable output root",
-                ));
-            }
+        let decode_output = target_decode
+            .state
+            .map_or(root, |schema| dense_tap_output(schema.batch, root));
+        if output_metadata(target_decode, decode_output).as_ref() != Some(&declared) {
+            return Err(inference_error(
+                "compile",
+                "decode hidden tap metadata does not match its split physical output",
+            ));
         }
         target_hidden.insert(root, declared);
     }
+
+    let validate_phase_taps = |taps: &[NativeInferenceHiddenTap],
+                               executable: &Executable,
+                               split: bool|
+     -> Result<Vec<(usize, usize)>> {
+        let mut layers = HashSet::new();
+        let mut roots = HashSet::new();
+        taps.iter()
+            .map(|tap| {
+                let root = tap.output_root as usize;
+                if root == 0 || !layers.insert(tap.layer) || !roots.insert(root) {
+                    return Err(inference_error(
+                        "compile",
+                        "phase hidden taps must have unique layers and nonzero roots",
+                    ));
+                }
+                let physical = if split {
+                    dense_tap_output(batch_size_from(executable)?, root)
+                } else {
+                    root
+                };
+                if output_metadata(executable, physical).as_ref()
+                    != Some(&ValueMetadata::native(&tap.value))
+                {
+                    return Err(inference_error(
+                        "compile",
+                        "phase hidden tap metadata does not match its physical output",
+                    ));
+                }
+                Ok((root, physical))
+            })
+            .collect()
+    };
+    let prefill_taps = validate_phase_taps(
+        plan.prefill_hidden_taps
+            .as_deref()
+            .unwrap_or(&plan.hidden_taps),
+        target_prefill,
+        true,
+    )?;
+    let verify_taps = if let Some(verify) = target_verify {
+        validate_phase_taps(
+            plan.verify_hidden_taps
+                .as_deref()
+                .unwrap_or(&plan.hidden_taps),
+            verify,
+            false,
+        )?
+    } else {
+        Vec::new()
+    };
 
     let mut shared = HashMap::new();
     let mut shared_metadata = HashMap::new();
@@ -7037,12 +7276,6 @@ fn validate_proposer_plan(
         }
         let value = tensor.value_cloned()?;
         let declared = ValueMetadata::native(&descriptor.value);
-        if ValueMetadata::value(&value) != declared {
-            return Err(inference_error(
-                "compile",
-                "shared tensor metadata does not match its concrete handle",
-            ));
-        }
         shared_metadata.insert(descriptor.kind.clone(), declared);
         shared.insert(descriptor.kind.clone(), value);
     }
@@ -7137,7 +7370,13 @@ fn validate_proposer_plan(
                 stage_index,
             )?
             .expect("all native routes carry concrete metadata");
-            if routed.dtype != declared_slot.dtype || routed.shape != declared_slot.shape {
+            let shared = matches!(
+                input.value.kind.as_str(),
+                "SharedTokenEmbedding" | "SharedLmHead"
+            );
+            if !shared
+                && (routed.dtype != declared_slot.dtype || routed.shape != declared_slot.shape)
+            {
                 return Err(inference_error(
                     "compile",
                     "stage input route metadata does not match its executable slot",
@@ -7232,7 +7471,11 @@ fn validate_proposer_plan(
         ));
     }
     let token_ids = &output_metadata[0];
-    if token_ids.shape.len() != 1 || !matches!(token_ids.dtype, DType::U32 | DType::I64) {
+    let parallel = plan.stages.len() == 1 && plan.stages[0].operation_id == "ParallelBlock";
+    if (!parallel && token_ids.shape.len() != 1)
+        || (parallel && token_ids.shape.len() != 2)
+        || !matches!(token_ids.dtype, DType::U32 | DType::I64)
+    {
         return Err(inference_error(
             "compile",
             "proposer tokenIds must be a rank-one integer value",
@@ -7273,7 +7516,16 @@ fn validate_proposer_plan(
         target_hidden,
         shared,
         stages,
+        prefill_taps,
+        verify_taps,
     })
+}
+
+fn batch_size_from(executable: &Executable) -> Result<usize> {
+    executable
+        .state
+        .map(|schema| schema.batch)
+        .ok_or_else(|| inference_error("compile", "tap executable must be stateful"))
 }
 
 /// Executes the stateless subset of a validated stage DAG with direct `Value`
@@ -7375,6 +7627,10 @@ pub fn compile_inference(
     proposer_plan: Option<NativeInferenceProposerPlan>,
     shared_tensors: Option<Vec<&NativeTensor>>,
     stage_executables: Option<Vec<&Executable>>,
+    replay_prefill: Option<&Executable>,
+    replay_decode: Option<&Executable>,
+    replay_verify: Option<&Executable>,
+    replay_pool: Option<&NativeKvPool>,
 ) -> Result<NativeInferenceArtifact> {
     let batch_size = batch_size as usize;
     if batch_size == 0 {
@@ -7406,6 +7662,10 @@ pub fn compile_inference(
         proposer_prefill.is_some() || proposer_decode.is_some() || proposer_pool.is_some();
     let generalized_present =
         proposer_plan.is_some() || shared_tensors.is_some() || stage_executables.is_some();
+    let replay_present = replay_prefill.is_some()
+        || replay_decode.is_some()
+        || replay_verify.is_some()
+        || replay_pool.is_some();
     if generalized_present
         != (proposer_plan.is_some() && shared_tensors.is_some() && stage_executables.is_some())
     {
@@ -7419,6 +7679,11 @@ pub fn compile_inference(
         || proposer_present && generalized_present
         || (proposer_present || generalized_present) != target_verify.is_some()
         || (proposer_present || generalized_present) != (max_draft_tokens > 0)
+        || replay_present
+            != (replay_prefill.is_some()
+                && replay_decode.is_some()
+                && replay_verify.is_some()
+                && replay_pool.is_some())
     {
         return Err(inference_error(
             "compile",
@@ -7499,26 +7764,144 @@ pub fn compile_inference(
                 }
                 (None, Some(config))
             } else {
-                (
-                    Some(validate_proposer_plan(
-                        plan,
-                        shared,
-                        stages,
-                        target_prefill,
-                        target_decode,
-                        target_verify,
-                    )?),
-                    None,
-                )
+                let validated = validate_proposer_plan(
+                    plan,
+                    shared,
+                    stages,
+                    target_prefill,
+                    target_decode,
+                    target_verify,
+                )?;
+                (Some(validated), None)
             }
         }
         (None, None, None) => (None, None),
         _ => unreachable!("generalized argument completeness checked"),
     };
-    if proposer_plan.is_some() {
+    if let Some(plan) = &proposer_plan {
+        let schema = plan.schema.as_ref().expect("validated plan retains schema");
+        let has_probability_rows = schema.output.probability_rows.is_some();
+        let valid_probability_route = if has_probability_rows {
+            schema.output.probabilities == "CausalNormalized"
+                && schema.stages[0].outputs.len() == 2
+                && schema
+                    .output
+                    .probability_rows
+                    .as_ref()
+                    .is_some_and(|route| {
+                        route.kind == "StageOutput"
+                            && route.stage == Some(0)
+                            && route.output == Some(1)
+                    })
+        } else {
+            schema.output.probabilities == "Unavailable" && schema.stages[0].outputs.len() == 1
+        };
+        let parallel = schema.stages.len() == 1
+            && schema.stages[0].operation_id == "ParallelBlock"
+            && schema.stages[0].layout_id.as_deref() == Some("parallel-block")
+            && schema.state.kind == "Kv"
+            && schema.state.commit_kind == "Replay"
+            && schema.state.commit_stages == [0]
+            && schema.output.topology == "Chains"
+            && valid_probability_route
+            && schema.output.token_ids.kind == "StageOutput"
+            && schema.output.token_ids.stage == Some(0)
+            && schema.output.token_ids.output == Some(0)
+            && schema.output.parents.is_none()
+            && schema.output.confidence.is_none()
+            && schema.token_map.kind == "Identity"
+            && schema.trained_max_rows >= max_draft_tokens
+            && schema.stages[0].history_lookup.is_none()
+            && schema.stages[0]
+                .inputs
+                .iter()
+                .filter(|input| input.value.kind == "PendingTokens")
+                .count()
+                == 1
+            && schema.stages[0].inputs.iter().all(|input| {
+                matches!(
+                    input.value.kind.as_str(),
+                    "PendingTokens" | "SharedTokenEmbedding" | "SharedLmHead"
+                )
+            });
+        if !parallel || !replay_present {
+            return Err(inference_error(
+                "compile",
+                "generalized execution requires one ParallelBlock stage and a complete replay bundle",
+            ));
+        }
+        let replay_pool = replay_pool.expect("complete replay bundle");
+        let replay_prefill = replay_prefill.expect("complete replay bundle");
+        let replay_decode = replay_decode.expect("complete replay bundle");
+        let replay_verify = replay_verify.expect("complete replay bundle");
+        let prefill_schema = validate_replay_program(
+            replay_prefill,
+            replay_pool,
+            batch_size,
+            &plan.prefill_taps,
+            target_prefill,
+        )?;
+        let decode_replay_schema = validate_replay_program(
+            replay_decode,
+            replay_pool,
+            batch_size,
+            &plan
+                .schema
+                .as_ref()
+                .expect("schema")
+                .hidden_taps
+                .iter()
+                .map(|tap| {
+                    (
+                        tap.output_root as usize,
+                        dense_tap_output(batch_size, tap.output_root as usize),
+                    )
+                })
+                .collect::<Vec<_>>(),
+            target_decode,
+        )?;
+        let verify_replay_schema = validate_replay_program(
+            replay_verify,
+            replay_pool,
+            batch_size,
+            &plan.verify_taps,
+            target_verify.expect("parallel bundle has verifier"),
+        )?;
+        let stage_schema = plan.stages[0]
+            .executable
+            .state
+            .ok_or_else(|| inference_error("compile", "ParallelBlock stage must be stateful"))?;
+        let stage_output = output_metadata(&plan.stages[0].executable, 0);
+        let probability_output = output_metadata(&plan.stages[0].executable, 1);
+        let expected_probability_output = has_probability_rows.then(|| ValueMetadata {
+            dtype: DType::F32,
+            shape: vec![
+                batch_size,
+                schema.trained_max_rows as usize,
+                schema.vocabulary as usize,
+            ],
+        });
+        if !same_state(prefill_schema, decode_replay_schema)
+            || !same_state(prefill_schema, verify_replay_schema)
+            || !same_state(prefill_schema, stage_schema)
+            || stage_schema.packed_rows_per_sequence.is_some()
+            || stage_output
+                != Some(ValueMetadata {
+                    dtype: DType::U32,
+                    shape: vec![batch_size, schema.trained_max_rows as usize],
+                })
+            || probability_output != expected_probability_output
+            || target_schema.max_tokens != prefill_schema.max_tokens
+        {
+            return Err(inference_error(
+                "compile",
+                "ParallelBlock stage/replay geometry or candidate output is invalid",
+            ));
+        }
+    } else if replay_present {
         return Err(inference_error(
             "compile",
-            "generalized proposer round orchestration is not implemented",
+            "replay bundle requires ParallelBlock",
         ));
     }
     Ok(NativeInferenceArtifact {
@@ -7530,6 +7913,10 @@ pub fn compile_inference(
             proposer_prefill: proposer_prefill.cloned(),
             proposer_decode: proposer_decode.cloned(),
             proposer_pool: proposer_pool.map(|pool| pool.inner.clone()),
+            replay_prefill: replay_prefill.cloned(),
+            replay_decode: replay_decode.cloned(),
+            replay_verify: replay_verify.cloned(),
+            replay_pool: replay_pool.map(|pool| pool.inner.clone()),
             max_draft_tokens: max_draft_tokens as usize,
             batch_size,
             token_dtype,
@@ -7808,6 +8195,16 @@ fn token_value(dtype: DType, values: Vec<u32>, shape: Vec<usize>) -> Value {
     }
 }
 
+fn shadow_sequence(pool: Arc<PoolInner>, state: Arc<Mutex<SeqState>>) -> NativeKvSequence {
+    NativeKvSequence {
+        pool,
+        state,
+        run_lock: Arc::new(Mutex::new(())),
+        released: Arc::new(AtomicBool::new(false)),
+        finalize_releases: false,
+    }
+}
+
 fn install_prefix_metadata(store: &mut BlockStore, metadata: DeferredPrefixMetadata) {
     for (block, hash) in metadata.hashes {
         store.hashes[block as usize] = Some(hash);
@@ -7907,6 +8304,7 @@ async fn prefill_sequences(
     sample: Option<&[(SamplingOptions, u64)]>,
     cancellation_token: Option<&CancellationToken>,
     prefix_metadata: Arc<Mutex<DeferredPrefixMetadata>>,
+    replay: Option<PrefillReplay<'_>>,
 ) -> Result<Vec<Option<u32>>> {
     let schema = executable.state.expect("inference prefill was validated");
     let (_, chunk, _) = inference_token_shape(executable)?;
@@ -7979,6 +8377,43 @@ async fn prefill_sequences(
         let StatefulExecutionOutput::Tensors(outputs) = output else {
             unreachable!("prefill tensor execution returned samples")
         };
+        if let Some(replay) = &replay {
+            let replay_inputs = replay
+                .taps
+                .iter()
+                .map(|&(_, physical)| {
+                    outputs.get(physical).ok_or_else(|| {
+                        inference_error("proposer", "prefill hidden tap output is missing")
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            replay
+                .executable
+                .execute_stateful_with_prefix_metadata(
+                    replay_inputs,
+                    active
+                        .iter()
+                        .map(|&index| &replay.sequences[index])
+                        .collect(),
+                    active_slots.clone(),
+                    active
+                        .iter()
+                        .map(|&index| chunk.min(prompts[index].len() - offsets[index]) as u32)
+                        .collect(),
+                    active
+                        .iter()
+                        .map(|&index| {
+                            let real = chunk.min(prompts[index].len() - offsets[index]);
+                            prompts[index][offsets[index]..offsets[index] + real].to_vec()
+                        })
+                        .collect(),
+                    StatefulInvocation::Tensors,
+                    cancellation_token,
+                    Some(replay.prefix_metadata.clone()),
+                )
+                .await
+                .map_err(|error| inference_error("proposer", error.reason))?;
+        }
         if let Some(sampling) = sample {
             for (active_index, &index) in active.iter().enumerate() {
                 if finals[active_index] {
@@ -8002,6 +8437,748 @@ async fn prefill_sequences(
         }
     }
     Ok(sampled)
+}
+
+struct PrefillReplay<'a> {
+    executable: &'a Executable,
+    sequences: &'a [NativeKvSequence],
+    taps: &'a [(usize, usize)],
+    prefix_metadata: Arc<Mutex<DeferredPrefixMetadata>>,
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn execute_packed_shadow(
+    executable: &Executable,
+    pool: Arc<PoolInner>,
+    states: Vec<Arc<Mutex<SeqState>>>,
+    slots: Vec<u32>,
+    advances: Vec<usize>,
+    tokens: Vec<Vec<u32>>,
+    packed: PackedCausalRows,
+    input: Value,
+    cancellation_token: Option<&CancellationToken>,
+) -> Result<(Vec<Value>, DeferredPrefixMetadata)> {
+    let schema = executable.state.expect("packed verifier was validated");
+    let program = executable.inner.executable.clone();
+    let generated_bindings = executable.inner.generated_bindings.clone();
+    let context = Arc::new(KvContext {
+        pool: pool.clone(),
+        slots: {
+            let mut lanes = vec![None; schema.batch];
+            for (state, &slot) in states.iter().zip(&slots) {
+                lanes[slot as usize] = Some(state.clone());
+            }
+            lanes
+        },
+        advances: {
+            let mut lanes = vec![0; schema.batch];
+            for (&slot, &advance) in slots.iter().zip(&advances) {
+                lanes[slot as usize] = advance;
+            }
+            lanes
+        },
+        packed: Some(packed),
+        window: schema.window,
+        kda: schema.kda,
+        conv: schema.conv,
+        transaction: Mutex::new(None),
+    });
+    run_compute_pending(cancellation_token, move |cancelled, _| {
+        let frontiers = states
+            .iter()
+            .map(|state| state.lock().map(|state| state.blocks.len()).unwrap_or(0))
+            .collect::<Vec<_>>();
+        for (state, &advance) in states.iter().zip(&advances) {
+            state
+                .lock()
+                .map_err(|error| to_napi_err(error.to_string()))?
+                .advance = advance;
+        }
+        let outputs = match executable::execute_stateful(
+            &program,
+            &[input],
+            &generated_bindings,
+            cancelled,
+            &context,
+            &|| true,
+        ) {
+            Ok(outputs) => outputs,
+            Err(error) => {
+                for (index, state) in states.iter().enumerate() {
+                    if let Ok(mut state) = state.lock() {
+                        for block in state.blocks.split_off(frontiers[index]) {
+                            pool.unref_block(block);
+                        }
+                        state.advance = 0;
+                    }
+                }
+                return Err(to_napi_err(error));
+            }
+        };
+        let mut metadata = DeferredPrefixMetadata::default();
+        for ((state, row), &advance) in states.iter().zip(&tokens).zip(&advances) {
+            let mut state = state
+                .lock()
+                .map_err(|error| to_napi_err(error.to_string()))?;
+            metadata
+                .hashes
+                .extend(state.note_tokens_deferred(&pool, row));
+            state.cursor += advance;
+            state.advance = 0;
+            pool.stage_recurrent_snapshot(&state, &mut metadata);
+        }
+        Ok((outputs, metadata))
+    })
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn execute_parallel_block_detailed(
+    programs: &InferencePrograms,
+    target_sequences: Vec<&NativeKvSequence>,
+    proposer_sequences: Vec<&NativeKvSequence>,
+    slots: Vec<u32>,
+    pending_tokens: Vec<u32>,
+    sampling: Vec<SamplingOptions>,
+    sequence_ids: Vec<u64>,
+    absolute_positions: Vec<u64>,
+    page_limits: Vec<u32>,
+    eos_tokens: Vec<Vec<u32>>,
+    cancellation_token: Option<&CancellationToken>,
+) -> Result<SpeculativeExecution> {
+    let count = target_sequences.len();
+    let plan = programs
+        .proposer_plan
+        .as_ref()
+        .ok_or_else(|| inference_error("proposer", "ParallelBlock plan is missing"))?;
+    let stage = &plan.stages[0];
+    let replay = programs
+        .replay_verify
+        .as_ref()
+        .ok_or_else(|| inference_error("proposer", "verify replay is missing"))?;
+    let verifier = programs
+        .target_verify
+        .as_ref()
+        .ok_or_else(|| inference_error("verify", "target verifier is missing"))?;
+    let target_pool = programs.target_pool.clone();
+    let proposer_pool = programs
+        .replay_pool
+        .as_ref()
+        .expect("parallel validation retained replay pool")
+        .clone();
+    if count == 0
+        || proposer_sequences.len() != count
+        || slots.len() != count
+        || pending_tokens.len() != count
+        || sampling.len() != count
+        || sequence_ids.len() != count
+        || absolute_positions.len() != count
+        || page_limits.len() != count
+        || eos_tokens.len() != count
+    {
+        return Err(inference_error(
+            "admission",
+            "inconsistent ParallelBlock round arrays",
+        ));
+    }
+
+    let initial_target = target_sequences
+        .iter()
+        .map(|sequence| {
+            let state = sequence
+                .state
+                .lock()
+                .map_err(|error| inference_error("verify", error))?;
+            Ok((
+                state.cursor,
+                state.last_hash,
+                state.pending.clone(),
+                state.blocks.len(),
+            ))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let initial_proposer = proposer_sequences
+        .iter()
+        .map(|sequence| {
+            let state = sequence
+                .state
+                .lock()
+                .map_err(|error| inference_error("proposer", error))?;
+            Ok((
+                state.cursor,
+                state.last_hash,
+                state.pending.clone(),
+                state.blocks.len(),
+            ))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    if initial_target
+        .iter()
+        .zip(&initial_proposer)
+        .any(|(target, proposer)| target.0 != proposer.0)
+    {
+        return Err(inference_error(
+            "proposer",
+            "target and replay cursors differ",
+        ));
+    }
+    let mut target_shadow = Vec::with_capacity(count);
+    let mut proposer_shadow = Vec::with_capacity(count);
+    for index in 0..count {
+        match clone_speculative_state(&target_pool, &target_sequences[index].state) {
+            Ok(state) => target_shadow.push(state),
+            Err(error) => {
+                discard_speculative_states(&target_pool, &target_shadow);
+                discard_speculative_states(&proposer_pool, &proposer_shadow);
+                return Err(inference_error("verify", error));
+            }
+        }
+        match clone_speculative_state(&proposer_pool, &proposer_sequences[index].state) {
+            Ok(state) => proposer_shadow.push(state),
+            Err(error) => {
+                discard_speculative_states(&target_pool, &target_shadow);
+                discard_speculative_states(&proposer_pool, &proposer_shadow);
+                return Err(inference_error("proposer", error));
+            }
+        }
+    }
+
+    let result = async {
+        let draft_lengths = (0..count)
+            .map(|index| {
+                programs
+                    .max_draft_tokens
+                    .min((page_limits[index] as usize).saturating_sub(1))
+                    .min(
+                        target_pool
+                            .max_tokens
+                            .saturating_sub(initial_target[index].0 + 1),
+                    )
+                    .min(
+                        proposer_pool
+                            .max_tokens
+                            .saturating_sub(initial_proposer[index].0 + 1),
+                    )
+            })
+            .collect::<Vec<_>>();
+        let draft_started = std::time::Instant::now();
+        let trained_draft_tokens = plan
+            .schema
+            .as_ref()
+            .expect("parallel plan retains schema")
+            .trained_max_rows as usize;
+        let mut candidates = vec![Vec::new(); count];
+        let mut proposal_probabilities = vec![Vec::<Vec<f64>>::new(); count];
+        let mut draft_provisional_blocks = 0u64;
+        let proposal_active = (0..count)
+            .filter(|&index| draft_lengths[index] != 0)
+            .collect::<Vec<_>>();
+        if !proposal_active.is_empty() {
+            let mut draft_states = Vec::with_capacity(proposal_active.len());
+            for &index in &proposal_active {
+                match clone_speculative_state(&proposer_pool, &proposer_shadow[index]) {
+                    Ok(state) => draft_states.push(state),
+                    Err(error) => {
+                        discard_speculative_states(&proposer_pool, &draft_states);
+                        return Err(inference_error("proposer", error));
+                    }
+                }
+            }
+            let draft_sequences = draft_states
+                .iter()
+                .map(|state| shadow_sequence(proposer_pool.clone(), state.clone()))
+                .collect::<Vec<_>>();
+            let pending = NativeTensor::wrap(token_value(
+                programs.token_dtype,
+                {
+                    let mut values = vec![0; programs.batch_size];
+                    for index in 0..count {
+                        values[slots[index] as usize] = pending_tokens[index];
+                    }
+                    values
+                },
+                vec![programs.batch_size],
+            ));
+            let mut owned_inputs = Vec::new();
+            for (_, route) in &stage.inputs {
+                let value =
+                    match route.kind.as_str() {
+                        "PendingTokens" => pending.value_cloned()?,
+                        "SharedTokenEmbedding" => {
+                            plan.shared.get("TokenEmbedding").cloned().ok_or_else(|| {
+                                inference_error("proposer", "shared token embedding is missing")
+                            })?
+                        }
+                        "SharedLmHead" => plan.shared.get("LmHead").cloned().ok_or_else(|| {
+                            inference_error("proposer", "shared LM head is missing")
+                        })?,
+                        _ => {
+                            return Err(inference_error(
+                                "proposer",
+                                "unsupported ParallelBlock input route",
+                            ))
+                        }
+                    };
+                owned_inputs.push(NativeTensor::wrap(value));
+            }
+            let proposal_metadata = Arc::new(Mutex::new(DeferredPrefixMetadata::default()));
+            let output_result = stage
+                .executable
+                .execute_stateful_with_prefix_metadata(
+                    owned_inputs.iter().collect(),
+                    draft_sequences.iter().collect(),
+                    proposal_active.iter().map(|&index| slots[index]).collect(),
+                    proposal_active
+                        .iter()
+                        .map(|_| (trained_draft_tokens + 1) as u32)
+                        .collect(),
+                    proposal_active
+                        .iter()
+                        .map(|&index| vec![pending_tokens[index]; trained_draft_tokens + 1])
+                        .collect(),
+                    StatefulInvocation::Tensors,
+                    cancellation_token,
+                    Some(proposal_metadata),
+                )
+                .await;
+            draft_provisional_blocks = draft_states
+                .iter()
+                .zip(&proposal_active)
+                .map(|(state, &index)| {
+                    state
+                        .lock()
+                        .map(|state| {
+                            state.blocks.len().saturating_sub(initial_proposer[index].3) as u64
+                        })
+                        .unwrap_or(0)
+                })
+                .sum();
+            discard_speculative_states(&proposer_pool, &draft_states);
+            let output =
+                output_result.map_err(|error| inference_error("proposer", error.reason))?;
+            let StatefulExecutionOutput::Tensors(outputs) = output else {
+                unreachable!("ParallelBlock returned sampled output")
+            };
+            if outputs.len() == 2 {
+                let probabilities = outputs[1]
+                    .value_cloned()
+                    .map_err(|error| inference_error("proposer", error))?;
+                for index in 0..count {
+                    for step in 0..draft_lengths[index] {
+                        if cancellation_token.is_some_and(|token| token.cancelled()) {
+                            return Err(inference_error("proposer", "operation aborted"));
+                        }
+                        let q = speculative_normalized_row(
+                            &probabilities,
+                            (slots[index] as usize, step),
+                        )
+                        .map_err(|error| inference_error("proposer", error))?;
+                        let candidate = sample_probabilities(
+                            &q,
+                            coordinate_seed(
+                                sampling[index].seed,
+                                sequence_ids[index],
+                                absolute_positions[index] + step as u64,
+                                SamplingPurpose::Proposal,
+                                0,
+                            ),
+                            0,
+                            || cancellation_token.is_some_and(|token| token.cancelled()),
+                        )
+                        .map_err(|error| inference_error("proposer", error))?;
+                        candidates[index].push(candidate);
+                        proposal_probabilities[index].push(q);
+                    }
+                }
+            } else {
+                let values = outputs
+                    .first()
+                    .ok_or_else(|| inference_error("proposer", "candidate output is missing"))?
+                    .value_cloned()?
+                    .to_u32_vec()
+                    .map_err(|error| inference_error("proposer", error))?;
+                for index in 0..count {
+                    let start = slots[index] as usize * trained_draft_tokens;
+                    candidates[index]
+                        .extend_from_slice(&values[start..start + draft_lengths[index]]);
+                }
+            }
+        }
+        let draft_nanos = u64::try_from(draft_started.elapsed().as_nanos())
+            .unwrap_or(u64::MAX)
+            .max(1);
+
+        let width = programs.max_draft_tokens + 1;
+        let graph_rows = programs.batch_size * width;
+        let chain_lengths = candidates
+            .iter()
+            .map(|tokens| tokens.len() + 1)
+            .collect::<Vec<_>>();
+        let packed = PackedCausalRows::build(
+            graph_rows,
+            programs.batch_size,
+            &slots.iter().map(|slot| *slot as usize).collect::<Vec<_>>(),
+            &initial_target
+                .iter()
+                .map(|state| state.0)
+                .collect::<Vec<_>>(),
+            &chain_lengths,
+        )
+        .map_err(|error| inference_error("verify", error))?;
+        let mut verify_tokens = vec![0; graph_rows];
+        let mut token_rows = Vec::with_capacity(count);
+        for index in 0..count {
+            let mut row = Vec::with_capacity(chain_lengths[index]);
+            row.push(pending_tokens[index]);
+            row.extend_from_slice(&candidates[index]);
+            verify_tokens[packed.row_offsets[index]..packed.row_offsets[index] + row.len()]
+                .copy_from_slice(&row);
+            token_rows.push(row);
+        }
+        let verification_started = std::time::Instant::now();
+        let (target_outputs, _) = execute_packed_shadow(
+            verifier,
+            target_pool.clone(),
+            target_shadow.clone(),
+            slots.clone(),
+            chain_lengths.clone(),
+            token_rows,
+            packed.clone(),
+            speculative_token_input(programs.token_dtype, graph_rows, &verify_tokens, 1)
+                .map_err(|error| inference_error("verify", error))?,
+            cancellation_token,
+        )
+        .await?;
+        let target_peak_blocks = target_shadow
+            .iter()
+            .zip(&initial_target)
+            .map(|(state, initial)| {
+                state
+                    .lock()
+                    .map(|state| state.blocks.len().saturating_sub(initial.3) as u64)
+                    .unwrap_or(0)
+            })
+            .sum::<u64>();
+        let logits = target_outputs
+            .first()
+            .ok_or_else(|| inference_error("verify", "target logits are missing"))?;
+        let mut pages = Vec::with_capacity(count);
+        let mut accepted = Vec::with_capacity(count);
+        for index in 0..count {
+            let mut page = Vec::with_capacity(candidates[index].len() + 1);
+            let mut accepted_count = 0;
+            let mut rejected = false;
+            for (step, &candidate) in candidates[index].iter().enumerate() {
+                if cancellation_token.is_some_and(|token| token.cancelled()) {
+                    return Err(inference_error("verify", "operation aborted"));
+                }
+                if !proposal_probabilities[index].is_empty() {
+                    let p = speculative_probabilities(
+                        logits,
+                        Some((packed.row_offsets[index] + step, 0)),
+                        sampling[index],
+                        &AtomicBool::new(false),
+                    )
+                    .map_err(|error| inference_error("verify", error))?;
+                    let q = &proposal_probabilities[index][step];
+                    let accepted = if sampling[index].temperature == 0.0 {
+                        p[candidate as usize] == 1.0
+                    } else {
+                        random_unit_at(sampling_coordinate(
+                            sampling[index].seed,
+                            sequence_ids[index],
+                            absolute_positions[index] + step as u64,
+                            SamplingPurpose::Accept,
+                            0,
+                        )) < (p[candidate as usize] / q[candidate as usize]).min(1.0)
+                    };
+                    if accepted {
+                        page.push(candidate);
+                        accepted_count += 1;
+                        continue;
+                    }
+                    let residual = p
+                        .iter()
+                        .zip(q)
+                        .map(|(&p, &q)| (p - q).max(0.0))
+                        .collect::<Vec<_>>();
+                    page.push(
+                        sample_probabilities(
+                            &residual,
+                            coordinate_seed(
+                                sampling[index].seed,
+                                sequence_ids[index],
+                                absolute_positions[index] + step as u64,
+                                SamplingPurpose::Residual,
+                                0,
+                            ),
+                            0,
+                            || cancellation_token.is_some_and(|token| token.cancelled()),
+                        )
+                        .map_err(|error| inference_error("verify", error))?,
+                    );
+                    rejected = true;
+                    break;
+                }
+                let target = speculative_sample_logits(
+                    logits,
+                    (packed.row_offsets[index] + step, 0),
+                    SamplingOptions {
+                        seed: coordinate_seed(
+                            sampling[index].seed,
+                            sequence_ids[index],
+                            absolute_positions[index] + step as u64,
+                            SamplingPurpose::Target,
+                            0,
+                        ),
+                        counter: 0,
+                        ..sampling[index]
+                    },
+                    &AtomicBool::new(false),
+                )
+                .map_err(|error| inference_error("verify", error))?;
+                page.push(target);
+                if target == candidate {
+                    accepted_count += 1;
+                } else {
+                    rejected = true;
+                    break;
+                }
+            }
+            if !rejected {
+                if cancellation_token.is_some_and(|token| token.cancelled()) {
+                    return Err(inference_error("verify", "operation aborted"));
+                }
+                let step = candidates[index].len();
+                page.push(if !proposal_probabilities[index].is_empty() {
+                    let p = speculative_probabilities(
+                        logits,
+                        Some((packed.row_offsets[index] + step, 0)),
+                        sampling[index],
+                        &AtomicBool::new(false),
+                    )
+                    .map_err(|error| inference_error("verify", error))?;
+                    sample_probabilities(
+                        &p,
+                        coordinate_seed(
+                            sampling[index].seed,
+                            sequence_ids[index],
+                            absolute_positions[index] + step as u64,
+                            SamplingPurpose::Target,
+                            0,
+                        ),
+                        0,
+                        || cancellation_token.is_some_and(|token| token.cancelled()),
+                    )
+                    .map_err(|error| inference_error("verify", error))?
+                } else {
+                    speculative_sample_logits(
+                        logits,
+                        (packed.row_offsets[index] + step, 0),
+                        SamplingOptions {
+                            seed: coordinate_seed(
+                                sampling[index].seed,
+                                sequence_ids[index],
+                                absolute_positions[index] + step as u64,
+                                SamplingPurpose::Target,
+                                0,
+                            ),
+                            counter: 0,
+                            ..sampling[index]
+                        },
+                        &AtomicBool::new(false),
+                    )
+                    .map_err(|error| inference_error("verify", error))?
+                });
+            }
+            if let Some(position) = page
+                .iter()
+                .position(|token| eos_tokens[index].contains(token))
+            {
+                page.truncate(position + 1);
+            }
+            page.truncate(page_limits[index] as usize);
+            accepted.push(accepted_count.min(page.len()));
+            pages.push(page);
+        }
+
+        let consumed = pages.iter().map(Vec::len).collect::<Vec<_>>();
+        let mut target_metadata = DeferredPrefixMetadata::default();
+        let mut retained_rows = Vec::with_capacity(count);
+        for index in 0..count {
+            let retained = std::iter::once(pending_tokens[index])
+                .chain(
+                    pages[index]
+                        .iter()
+                        .take(consumed[index].saturating_sub(1))
+                        .copied(),
+                )
+                .collect::<Vec<_>>();
+            retained_rows.push(retained.clone());
+            let mut state = target_shadow[index]
+                .lock()
+                .map_err(|error| inference_error("verify", error))?;
+            let needed =
+                (initial_target[index].0 + consumed[index]).div_ceil(target_pool.block_size);
+            for block in state.blocks.drain(needed..) {
+                target_pool.unref_block(block);
+            }
+            state.cursor = initial_target[index].0;
+            state.last_hash = initial_target[index].1;
+            state.pending = initial_target[index].2.clone();
+            state.advance = 0;
+            target_metadata.hashes.extend(speculative_note_tokens(
+                &mut state,
+                &target_pool,
+                &retained,
+            ));
+            state.cursor += consumed[index];
+        }
+
+        let replay_inputs = plan
+            .verify_taps
+            .iter()
+            .map(|&(_, physical)| {
+                target_outputs
+                    .get(physical)
+                    .cloned()
+                    .map(NativeTensor::wrap)
+                    .ok_or_else(|| {
+                        inference_error("proposer", "verify hidden tap output is missing")
+                    })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let replay_sequences = proposer_shadow
+            .iter()
+            .map(|state| shadow_sequence(proposer_pool.clone(), state.clone()))
+            .collect::<Vec<_>>();
+        let replay_metadata = Arc::new(Mutex::new(DeferredPrefixMetadata::default()));
+        replay
+            .execute_stateful_with_prefix_metadata(
+                replay_inputs.iter().collect(),
+                replay_sequences.iter().collect(),
+                slots.clone(),
+                consumed.iter().map(|&length| length as u32).collect(),
+                retained_rows,
+                StatefulInvocation::Tensors,
+                cancellation_token,
+                Some(replay_metadata.clone()),
+            )
+            .await
+            .map_err(|error| inference_error("proposer", error.reason))?;
+        let paired_peak_blocks = target_shadow
+            .iter()
+            .zip(&initial_target)
+            .map(|(state, initial)| {
+                state
+                    .lock()
+                    .map(|state| state.blocks.len().saturating_sub(initial.3) as u64)
+                    .unwrap_or(0)
+            })
+            .sum::<u64>()
+            + proposer_shadow
+                .iter()
+                .zip(&initial_proposer)
+                .map(|(state, initial)| {
+                    state
+                        .lock()
+                        .map(|state| state.blocks.len().saturating_sub(initial.3) as u64)
+                        .unwrap_or(0)
+                })
+                .sum::<u64>();
+        if cancellation_token.is_some_and(|token| !token.state.complete()) {
+            return Err(inference_error("publish", "operation aborted"));
+        }
+        let target_metadata = Arc::new(Mutex::new(target_metadata));
+        let mut old_target_blocks = Vec::new();
+        let mut old_proposer_blocks = Vec::new();
+        publish_deferred_prefixes(
+            &target_pool,
+            &target_metadata,
+            Some((&proposer_pool, &replay_metadata)),
+            || {
+                for index in 0..count {
+                    for (canonical, shadow, old_blocks) in [
+                        (
+                            &target_sequences[index].state,
+                            &target_shadow[index],
+                            &mut old_target_blocks,
+                        ),
+                        (
+                            &proposer_sequences[index].state,
+                            &proposer_shadow[index],
+                            &mut old_proposer_blocks,
+                        ),
+                    ] {
+                        let mut canonical =
+                            canonical.lock().unwrap_or_else(|error| error.into_inner());
+                        let mut shadow = shadow.lock().unwrap_or_else(|error| error.into_inner());
+                        let replacement = SeqState {
+                            blocks: std::mem::take(&mut shadow.blocks),
+                            head: shadow.head,
+                            cursor: shadow.cursor,
+                            advance: 0,
+                            last_hash: shadow.last_hash,
+                            pending: std::mem::take(&mut shadow.pending),
+                            kda_states: std::mem::take(&mut shadow.kda_states),
+                            conv_states: std::mem::take(&mut shadow.conv_states),
+                        };
+                        let old = std::mem::replace(&mut *canonical, replacement);
+                        old_blocks.extend(old.blocks);
+                    }
+                }
+            },
+        )?;
+        for block in old_target_blocks {
+            target_pool.unref_block(block);
+        }
+        for block in old_proposer_blocks {
+            proposer_pool.unref_block(block);
+        }
+        let verification_nanos = u64::try_from(verification_started.elapsed().as_nanos())
+            .unwrap_or(u64::MAX)
+            .max(1);
+        let baseline_blocks = initial_target
+            .iter()
+            .map(|state| state.3 as u64)
+            .sum::<u64>()
+            + initial_proposer
+                .iter()
+                .map(|state| state.3 as u64)
+                .sum::<u64>();
+        let retained_blocks = target_sequences
+            .iter()
+            .chain(&proposer_sequences)
+            .map(|sequence| {
+                sequence
+                    .state
+                    .lock()
+                    .map(|state| state.blocks.len() as u64)
+                    .unwrap_or(0)
+            })
+            .sum::<u64>();
+        let retained_growth = retained_blocks.saturating_sub(baseline_blocks);
+        let provisional_blocks = draft_provisional_blocks
+            .max(target_peak_blocks)
+            .max(paired_peak_blocks);
+        Ok(SpeculativeExecution {
+            proposed: candidates
+                .iter()
+                .zip(&pages)
+                .map(|(candidates, page)| candidates.len().min(page.len()))
+                .sum::<usize>() as u64,
+            pages,
+            accepted,
+            provisional_blocks,
+            rolled_back_blocks: provisional_blocks.saturating_sub(retained_growth),
+            draft_nanos,
+            verification_nanos,
+        })
+    }
+    .await;
+    discard_speculative_states(&target_pool, &target_shadow);
+    discard_speculative_states(&proposer_pool, &proposer_shadow);
+    result
 }
 
 #[napi]
@@ -8057,6 +9234,7 @@ impl NativeInferenceArtifact {
                 .programs
                 .proposer_pool
                 .as_ref()
+                .or(self.programs.replay_pool.as_ref())
                 .map(|_| u64_bigint(diagnostics.proposer_pool_high_water_blocks)),
         })
     }
@@ -8223,12 +9401,20 @@ impl NativeInferenceSession {
         let mut target = (0..count)
             .map(|_| NativeKvSequence::new(self.inner.programs.target_pool.clone()))
             .collect::<Vec<_>>();
-        let mut proposer = self.inner.programs.proposer_pool.as_ref().map(|pool| {
+        let proposer_state_pool = self.inner.programs.proposer_pool.as_ref().or(self
+            .inner
+            .programs
+            .replay_pool
+            .as_ref());
+        let mut proposer = proposer_state_pool.map(|pool| {
             (0..count)
                 .map(|_| NativeKvSequence::new(pool.clone()))
                 .collect::<Vec<_>>()
         });
         for (sequence, prompt) in target.iter().zip(&prompts) {
+            if self.inner.programs.replay_pool.is_some() {
+                continue;
+            }
             if let Err(error) = sequence.prefill_match(prompt.clone()) {
                 for sequence in &target {
                     sequence.return_blocks();
@@ -8242,7 +9428,8 @@ impl NativeInferenceSession {
                 return Err(inference_error("prefill", error.reason));
             }
         }
-        if let Some(proposer) = &proposer {
+        if self.inner.programs.proposer_prefill.is_some() {
+            let proposer = proposer.as_ref().expect("exact proposer has state");
             for (sequence, prompt) in proposer.iter().zip(&prompts) {
                 if let Err(error) = sequence.prefill_match(prompt.clone()) {
                     for sequence in &target {
@@ -8280,6 +9467,27 @@ impl NativeInferenceSession {
             Some(&keyed),
             cancellation_token,
             target_prefix_metadata.clone(),
+            self.inner
+                .programs
+                .replay_prefill
+                .as_ref()
+                .map(|executable| {
+                    let plan = self
+                        .inner
+                        .programs
+                        .proposer_plan
+                        .as_ref()
+                        .expect("replay bundle has proposer plan");
+                    PrefillReplay {
+                        executable,
+                        sequences: proposer.as_ref().expect("replay bundle has proposer state"),
+                        taps: &plan.prefill_taps,
+                        prefix_metadata: proposer_prefix_metadata
+                            .as_ref()
+                            .expect("replay admission has proposer metadata")
+                            .clone(),
+                    }
+                }),
         )
         .await
         {
@@ -8314,6 +9522,7 @@ impl NativeInferenceSession {
                     .as_ref()
                     .expect("paired admission has proposer prefix metadata")
                     .clone(),
+                None,
             )
             .await
             {
@@ -8390,6 +9599,7 @@ impl NativeInferenceSession {
             .programs
             .proposer_pool
             .as_ref()
+            .or(self.inner.programs.replay_pool.as_ref())
             .zip(proposer_prefix_metadata.as_ref());
         let result = publish_deferred_prefixes(
             &self.inner.programs.target_pool,
@@ -8426,7 +9636,12 @@ impl NativeInferenceSession {
             diagnostics.target_pool_high_water_blocks = diagnostics
                 .target_pool_high_water_blocks
                 .max((target_capacity - self.inner.programs.target_pool.available()) as u64);
-            if let Some(pool) = &self.inner.programs.proposer_pool {
+            if let Some(pool) = self.inner.programs.proposer_pool.as_ref().or(self
+                .inner
+                .programs
+                .replay_pool
+                .as_ref())
+            {
                 let capacity = pool.max_tokens / pool.block_size;
                 diagnostics.proposer_pool_high_water_blocks = diagnostics
                     .proposer_pool_high_water_blocks
@@ -8509,7 +9724,57 @@ impl NativeInferenceSession {
             .iter()
             .map(|sequence| &sequence.target)
             .collect::<Vec<_>>();
-        let (token_pages, speculative_metrics) = if let (Some(verify), Some(config)) = (
+        let (token_pages, speculative_metrics) = if self.inner.programs.replay_verify.is_some() {
+            let proposer = selected
+                .iter()
+                .map(|sequence| {
+                    sequence
+                        .proposer
+                        .as_ref()
+                        .expect("parallel artifact has replay sequence state")
+                })
+                .collect::<Vec<_>>();
+            let page_limits = selected
+                .iter()
+                .map(|sequence| {
+                    sequence
+                        .budget
+                        .map_or(u64::MAX, |budget| budget.saturating_sub(sequence.generated))
+                        .min(self.inner.programs.max_draft_tokens as u64 + 1)
+                        .max(1) as u32
+                })
+                .collect();
+            let execution = execute_parallel_block_detailed(
+                &self.inner.programs,
+                target,
+                proposer,
+                slots.clone(),
+                selected.iter().map(|sequence| sequence.pending).collect(),
+                sampling.clone(),
+                selected.iter().map(|sequence| sequence.id).collect(),
+                selected.iter().map(|sequence| sequence.generated).collect(),
+                page_limits,
+                selected
+                    .iter()
+                    .map(|sequence| sequence.eos.clone())
+                    .collect(),
+                cancellation_token,
+            )
+            .await
+            .map_err(|error| {
+                self.note_failure("verify");
+                error
+            })?;
+            let metrics = (
+                execution.proposed,
+                execution.accepted,
+                execution.provisional_blocks,
+                execution.rolled_back_blocks,
+                execution.draft_nanos,
+                execution.verification_nanos,
+            );
+            (execution.pages, Some(metrics))
+        } else if let (Some(verify), Some(config)) = (
             &self.inner.programs.target_verify,
             self.inner.programs.history_lookup,
         ) {
@@ -8715,7 +9980,12 @@ impl NativeInferenceSession {
             diagnostics.target_pool_high_water_blocks = diagnostics
                 .target_pool_high_water_blocks
                 .max((target_capacity - self.inner.programs.target_pool.available()) as u64);
-            if let Some(pool) = &self.inner.programs.proposer_pool {
+            if let Some(pool) = self.inner.programs.proposer_pool.as_ref().or(self
+                .inner
+                .programs
+                .replay_pool
+                .as_ref())
+            {
                 let capacity = pool.max_tokens / pool.block_size;
                 diagnostics.proposer_pool_high_water_blocks = diagnostics
                     .proposer_pool_high_water_blocks
@@ -8925,6 +10195,13 @@ mod tests {
     }
 
     #[test]
+    fn split_logits_translate_semantic_tap_roots_after_lane_outputs() {
+        assert_eq!(dense_tap_output(3, 1), 3);
+        assert_eq!(dense_tap_output(3, 2), 4);
+        assert_eq!(dense_tap_output(1, 4), 4);
+    }
+
+    #[test]
     fn target_hidden_row_selection_is_a_direct_value_view() {
         let source = Value(Tensor::from_vec(
             vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0],
@@ -8966,6 +10243,8 @@ mod tests {
                     inputs: vec![(0, stage_route)],
                 },
             ],
+            prefill_taps: Vec::new(),
+            verify_taps: Vec::new(),
         };
         let target = vec![
             Value(Tensor::from_vec(vec![0.0f32], vec![1])),
@@ -9534,6 +10813,7 @@ mod tests {
             &v,
             1.0,
             None,
+            KvAttentionMode::Causal,
             &mut destination,
             &mut eviction_starts,
         )
@@ -9629,6 +10909,7 @@ mod tests {
                 &v,
                 0.5,
                 None,
+                KvAttentionMode::Causal,
                 &mut destination,
                 &mut eviction_starts,
             )
@@ -9637,7 +10918,75 @@ mod tests {
         drop(destination);
         let actual = Value(actual).to_f32_vec().unwrap();
         assert_close(&actual, &expected, 1e-6, "kv attention");
+
+        let expected_block = Value(composed::sdpa_forward(
+            q.tensor(),
+            &repeat_heads(k.tensor()),
+            &repeat_heads(v.tensor()),
+            0.5,
+            false,
+        ))
+        .to_f32_vec()
+        .unwrap();
+        let mut block = Tensor::zeros(&q.shape(), DType::F32);
+        let mut block_destination = CpuDestination::new(&mut block).unwrap();
+        kv_attention_into(
+            &context,
+            0,
+            &q,
+            &k,
+            &v,
+            0.5,
+            None,
+            KvAttentionMode::BidirectionalBlock,
+            &mut block_destination,
+            &mut eviction_starts,
+        )
+        .unwrap();
+        drop(block_destination);
+        let block = Value(block).to_f32_vec().unwrap();
+        assert_close(&block, &expected_block, 1e-6, "block kv attention");
+        assert_ne!(block, actual);
         assert_eq!(state.lock().unwrap().advance, 3);
+    }
+
+    #[test]
+    fn block_attention_window_retains_committed_rows_plus_current_block() {
+        let pool = Arc::new(PoolInner {
+            k: vec![pool::Slab::new(8, 1, DType::F32)],
+            v: vec![pool::Slab::new(8, 1, DType::F32)],
+            scales: Vec::new(),
+            kv_dtype: DType::F32,
+            kv_heads: 1,
+            head_dim: 1,
+            block_size: 4,
+            max_tokens: 8,
+            kda: KdaGeometry::default(),
+            conv: ConvGeometry::default(),
+            blocks: Mutex::new(BlockStore::new(2)),
+        });
+        let mut state = SeqState {
+            blocks: Vec::new(),
+            head: 0,
+            cursor: 6,
+            advance: 2,
+            last_hash: HASH_SEED,
+            pending: Vec::new(),
+            kda_states: Vec::new(),
+            conv_states: Vec::new(),
+        };
+        let (cursor, needed, start) = kv_prepare(
+            &pool,
+            &mut state,
+            0,
+            Some(3),
+            KvAttentionMode::BidirectionalBlock,
+            1,
+            1,
+            2,
+        )
+        .unwrap();
+        assert_eq!((cursor, needed, start), (6, 8, 3));
     }
 
     #[test]
@@ -9940,11 +11289,54 @@ mod tests {
             batch: 1,
             packed_causal_chains: None,
             last_token_row: Some(true),
+            output_selections: None,
+            current_block_attention: None,
         };
         let executable = compile(vec![&root], None, Some(schema), None).unwrap();
         let outputs = &executable.inner.executable.signature.outputs;
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].shape, vec![8]);
+    }
+
+    #[test]
+    fn per_root_decode_outputs_split_logits_and_batch_hidden_rows() {
+        let logits = LazyTensor {
+            node: Node::new(NodeKind::Leaf(Arc::new(LeafSlot::new(Value(
+                Tensor::zeros(&[2, 3, 8], DType::F32),
+            )))))
+            .unwrap(),
+        };
+        let hidden = LazyTensor {
+            node: Node::new(NodeKind::Leaf(Arc::new(LeafSlot::new(Value(
+                Tensor::zeros(&[2, 3, 6], DType::F32),
+            )))))
+            .unwrap(),
+        };
+        let executable = compile(
+            vec![&logits, &hidden],
+            None,
+            Some(NativeKvStateSchema {
+                max_tokens: 8,
+                block_size: 4,
+                kv_dtype: NativeDType::F32,
+                window: None,
+                batch: 2,
+                packed_causal_chains: None,
+                last_token_row: None,
+                output_selections: Some(vec![
+                    NativeDecodeOutputSelection::SplitLastTokenRow,
+                    NativeDecodeOutputSelection::BatchedLastTokenRow,
+                ]),
+                current_block_attention: None,
+            }),
+            None,
+        )
+        .unwrap();
+        let outputs = &executable.inner.executable.signature.outputs;
+        assert_eq!(outputs.len(), 3);
+        assert_eq!(outputs[0].shape, vec![8]);
+        assert_eq!(outputs[1].shape, vec![8]);
+        assert_eq!(outputs[2].shape, vec![2, 6]);
     }
 
     #[test]
@@ -9963,6 +11355,8 @@ mod tests {
             batch: 2,
             packed_causal_chains: Some(NativePackedCausalChainsLayout { rows_per_sequence }),
             last_token_row: None,
+            output_selections: None,
+            current_block_attention: None,
         };
         let executable = compile(vec![&root], None, Some(schema(3)), None).unwrap();
         assert_eq!(

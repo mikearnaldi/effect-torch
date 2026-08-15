@@ -91,6 +91,18 @@ pub struct AttentionRequirements {
     pub pipeline_count: usize,
 }
 
+/// Visibility semantics for query rows in the current attention chunk.
+///
+/// This is independent of the processor architecture; Metal uses it to
+/// specialize the paged-attention pipeline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum AttentionMode {
+    /// Query row `p` sees the committed prefix and current rows through `p`.
+    Causal,
+    /// Every query row sees the committed prefix and the entire current block.
+    BidirectionalBlock,
+}
+
 /// Requirements of a scatter of `batch × heads × chunk × head_dim`
 /// new-token rows into slabs of `slab_dtype`.
 pub fn scatter_requirements(
@@ -237,7 +249,8 @@ pub fn is_supported(
 
 #[cfg(target_os = "macos")]
 pub use metal::{
-    attention_into, decode, decode_into, scatter, scatter_into, warm_all, warm_attention,
+    attention_block, attention_block_into, attention_into, decode, decode_into, scatter,
+    scatter_into, warm_all, warm_attention, warm_attention_block, warm_attention_block_exact,
     warm_attention_exact, warm_scatter, warm_scatter_exact, IntoResources,
 };
 
@@ -462,7 +475,14 @@ kernel void et_paged_scatter(
             MetalDevice::get().compile_lazy(scatter_key(d, dtype), "et_paged_scatter", || {
                 scatter_source(d, dtype)
             })?;
-            pipeline(d, query_heads, kv_heads, dtype, scale)?;
+            pipeline(
+                d,
+                query_heads,
+                kv_heads,
+                dtype,
+                scale,
+                super::AttentionMode::Causal,
+            )?;
             count += 2;
         }
         Ok(count)
@@ -490,7 +510,33 @@ kernel void et_paged_scatter(
         slab_dtype: DType,
         scale: f64,
     ) -> crate::err::Res<()> {
-        pipeline(d, query_heads, kv_heads, slab_dtype, scale)?;
+        pipeline(
+            d,
+            query_heads,
+            kv_heads,
+            slab_dtype,
+            scale,
+            super::AttentionMode::Causal,
+        )?;
+        Ok(())
+    }
+
+    /// Warms block-bidirectional attention for the given geometry and scale.
+    pub fn warm_attention_block(
+        d: usize,
+        query_heads: usize,
+        kv_heads: usize,
+        slab_dtype: DType,
+        scale: f64,
+    ) -> crate::err::Res<()> {
+        pipeline(
+            d,
+            query_heads,
+            kv_heads,
+            slab_dtype,
+            scale,
+            super::AttentionMode::BidirectionalBlock,
+        )?;
         Ok(())
     }
 
@@ -499,6 +545,19 @@ kernel void et_paged_scatter(
         requirements: &super::AttentionRequirements,
     ) -> crate::err::Res<()> {
         warm_attention(
+            requirements.head_dim,
+            requirements.query_heads,
+            requirements.kv_heads,
+            requirements.slab_dtype,
+            f64::from_bits(requirements.scale_bits),
+        )
+    }
+
+    /// Warms block-bidirectional attention described by `requirements`.
+    pub fn warm_attention_block_exact(
+        requirements: &super::AttentionRequirements,
+    ) -> crate::err::Res<()> {
+        warm_attention_block(
             requirements.head_dim,
             requirements.query_heads,
             requirements.kv_heads,
@@ -643,6 +702,7 @@ kernel void et_paged_scatter(
         kv_heads: usize,
         slab_dtype: DType,
         scale: f64,
+        mode: super::AttentionMode,
     ) -> String {
         let (kv_ty, int8) = match slab_dtype {
             DType::F32 => ("float", 0),
@@ -652,6 +712,7 @@ kernel void et_paged_scatter(
             other => unreachable!("paged decode: unsupported slab dtype {other:?}"),
         };
         let vec4 = usize::from(d % 4 == 0);
+        let bidirectional_block = usize::from(mode == super::AttentionMode::BidirectionalBlock);
         // One 128-bit slab-row load, dequantized to float4.
         let load4 = match slab_dtype {
             DType::F32 => "float4(*(device const packed_float4*)base) * s".to_string(),
@@ -678,6 +739,7 @@ using namespace metal;
 #define QH {query_heads}
 #define KVH {kv_heads}
 #define GROUP {head_group_size}
+#define BIDIRECTIONAL_BLOCK {bidirectional_block}
 
 inline float4 kv_load4(device const T_KV* base, float s) {{
     {load4_prelude}
@@ -718,12 +780,19 @@ kernel void et_paged_decode(
         }}
         return;
     }}
+    const uint cursor = needed - advance;
+#if BIDIRECTIONAL_BLOCK
+    // The whole current block is visible. A local window retains W
+    // committed rows in addition to every row in the current block.
+    const uint ctx = needed;
+    const uint start = (window > 0 && cursor > window) ? cursor - window : 0;
+#else
     // Causal per q row: row p of the new chunk attends through
     // cursor + p (pads clamp to the real frontier; their outputs are
     // discarded downstream).
-    const uint cursor = needed - advance;
     const uint ctx = min(cursor + p + 1, needed);
     const uint start = (window > 0 && ctx > window) ? ctx - window : 0;
+#endif
     device const uint* table = tables + (ulong)b * maxBlocks;
 
     // Stage q once: the whole threadgroup reads threadgroup memory
@@ -840,6 +909,7 @@ kernel void et_paged_decode(
             query_heads = query_heads,
             kv_heads = kv_heads,
             head_group_size = query_heads / kv_heads,
+            bidirectional_block = bidirectional_block,
             load4_prelude = load4_prelude,
             load4 = load4,
         )
@@ -851,12 +921,13 @@ kernel void et_paged_decode(
         kv_heads: usize,
         slab_dtype: DType,
         scale: f64,
+        mode: super::AttentionMode,
     ) -> u64 {
         use std::collections::hash_map::DefaultHasher;
         use std::hash::{Hash, Hasher};
 
         let mut hasher = DefaultHasher::new();
-        (d, query_heads, kv_heads, slab_dtype, scale.to_bits()).hash(&mut hasher);
+        (d, query_heads, kv_heads, slab_dtype, scale.to_bits(), mode).hash(&mut hasher);
         hasher.finish()
     }
 
@@ -866,14 +937,15 @@ kernel void et_paged_decode(
         kv_heads: usize,
         slab_dtype: DType,
         scale: f64,
+        mode: super::AttentionMode,
     ) -> crate::err::Res<Pipeline> {
         if kv_heads == 0 || !query_heads.is_multiple_of(kv_heads) {
             return Err("paged attention: query heads must be divisible by K/V heads".to_string());
         }
         MetalDevice::get().compile_lazy(
-            attention_key(d, query_heads, kv_heads, slab_dtype, scale),
+            attention_key(d, query_heads, kv_heads, slab_dtype, scale, mode),
             "et_paged_decode",
-            || kernel_source(d, query_heads, kv_heads, slab_dtype, scale),
+            || kernel_source(d, query_heads, kv_heads, slab_dtype, scale, mode),
         )
     }
 
@@ -885,7 +957,7 @@ kernel void et_paged_decode(
     /// contiguous f32 `[B, H, C, D]`. Allocates nothing; requires the
     /// exact attention pipeline to be warm.
     #[allow(clippy::too_many_arguments)]
-    pub fn attention_into(
+    fn attention_into_mode(
         q: &MetalTensor,
         k_slab: &MetalTensor,
         v_slab: &MetalTensor,
@@ -898,6 +970,7 @@ kernel void et_paged_decode(
         scale: f64,
         block_size: usize,
         advances: &MetalTensor,
+        mode: super::AttentionMode,
         output: &MetalTensor,
         resources: IntoResources<'_>,
     ) -> crate::err::Res<()> {
@@ -929,7 +1002,7 @@ kernel void et_paged_decode(
         }
         MetalDevice::get().mark_buffer_write(&output.buffer)?;
         let pipe = MetalDevice::get()
-            .pipeline_cached(attention_key(d, h, kv_heads, slab_dtype, scale))
+            .pipeline_cached(attention_key(d, h, kv_heads, slab_dtype, scale, mode))
             .ok_or_else(|| {
                 "paged attention: exact pipeline is not warm; call warm_attention".to_string()
             })?;
@@ -980,6 +1053,84 @@ kernel void et_paged_decode(
             );
         });
         Ok(())
+    }
+
+    /// Non-allocating causal paged attention. This preserves the original
+    /// per-row visibility semantics used by decode and prefill callers.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_into(
+        q: &MetalTensor,
+        k_slab: &MetalTensor,
+        v_slab: &MetalTensor,
+        k_scales: Option<&MetalTensor>,
+        v_scales: Option<&MetalTensor>,
+        tables: &MetalTensor,
+        ctxlens: &MetalTensor,
+        block_bases: &MetalTensor,
+        window: Option<usize>,
+        scale: f64,
+        block_size: usize,
+        advances: &MetalTensor,
+        output: &MetalTensor,
+        resources: IntoResources<'_>,
+    ) -> crate::err::Res<()> {
+        attention_into_mode(
+            q,
+            k_slab,
+            v_slab,
+            k_scales,
+            v_scales,
+            tables,
+            ctxlens,
+            block_bases,
+            window,
+            scale,
+            block_size,
+            advances,
+            super::AttentionMode::Causal,
+            output,
+            resources,
+        )
+    }
+
+    /// Non-allocating block-bidirectional paged attention. `ctxlens` is the
+    /// post-scatter frontier and `advances` is the real current-block length;
+    /// every query sees all `advances` current rows. If `window` is set, it
+    /// retains that many committed rows plus the entire current block.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_block_into(
+        q: &MetalTensor,
+        k_slab: &MetalTensor,
+        v_slab: &MetalTensor,
+        k_scales: Option<&MetalTensor>,
+        v_scales: Option<&MetalTensor>,
+        tables: &MetalTensor,
+        ctxlens: &MetalTensor,
+        block_bases: &MetalTensor,
+        window: Option<usize>,
+        scale: f64,
+        block_size: usize,
+        advances: &MetalTensor,
+        output: &MetalTensor,
+        resources: IntoResources<'_>,
+    ) -> crate::err::Res<()> {
+        attention_into_mode(
+            q,
+            k_slab,
+            v_slab,
+            k_scales,
+            v_scales,
+            tables,
+            ctxlens,
+            block_bases,
+            window,
+            scale,
+            block_size,
+            advances,
+            super::AttentionMode::BidirectionalBlock,
+            output,
+            resources,
+        )
     }
 
     /// Decode-step alias of [`attention_into`]; identical kernel and
@@ -1060,6 +1211,47 @@ kernel void et_paged_decode(
         )?;
         Ok(output)
     }
+
+    /// Allocating convenience wrapper around [`attention_block_into`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_block(
+        q: &MetalTensor,
+        k_slab: &MetalTensor,
+        v_slab: &MetalTensor,
+        k_scales: Option<&MetalTensor>,
+        v_scales: Option<&MetalTensor>,
+        tables: &MetalTensor,
+        ctxlens: &MetalTensor,
+        block_bases: &MetalTensor,
+        window: Option<usize>,
+        scale: f64,
+        block_size: usize,
+        advances: &MetalTensor,
+    ) -> crate::err::Res<MetalTensor> {
+        let shape = q.layout.shape().to_vec();
+        let q = wrap_contig(q)?;
+        let d = q.layout.shape()[3];
+        let kv_heads = slab_heads(k_slab, d)?;
+        warm_attention_block(d, q.layout.shape()[1], kv_heads, k_slab.dtype, scale)?;
+        let output = MetalTensor::empty(MetalDevice::get(), shape, DType::F32);
+        attention_block_into(
+            &q,
+            k_slab,
+            v_slab,
+            k_scales,
+            v_scales,
+            tables,
+            ctxlens,
+            block_bases,
+            window,
+            scale,
+            block_size,
+            advances,
+            &output,
+            IntoResources::empty(),
+        )?;
+        Ok(output)
+    }
 }
 
 #[cfg(all(test, target_os = "macos"))]
@@ -1084,6 +1276,44 @@ mod tests {
             .zip(b.read_f32().unwrap())
             .map(|(a, b)| (a - b).abs())
             .fold(0.0, f32::max)
+    }
+
+    fn dense_bidirectional(
+        q: &[f32],
+        k: &[f32],
+        v: &[f32],
+        dimension: usize,
+        scale: f32,
+        start: usize,
+    ) -> Vec<f32> {
+        let rows = k.len() / dimension;
+        let mut output = Vec::with_capacity(q.len());
+        for query in q.chunks_exact(dimension) {
+            let scores: Vec<f32> = (start..rows)
+                .map(|row| {
+                    query
+                        .iter()
+                        .zip(&k[row * dimension..(row + 1) * dimension])
+                        .map(|(q, k)| q * k)
+                        .sum::<f32>()
+                        * scale
+                })
+                .collect();
+            let max = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            let weights: Vec<f32> = scores.iter().map(|score| (score - max).exp()).collect();
+            let denominator: f32 = weights.iter().sum();
+            for column in 0..dimension {
+                output.push(
+                    weights
+                        .iter()
+                        .enumerate()
+                        .map(|(index, weight)| weight * v[(start + index) * dimension + column])
+                        .sum::<f32>()
+                        / denominator,
+                );
+            }
+        }
+        output
     }
 
     #[test]
@@ -1333,5 +1563,132 @@ mod tests {
                 .flat_map(|value| [value; 4])
                 .collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn current_block_is_bidirectional_and_window_keeps_committed_rows() {
+        let dev = MetalDevice::get();
+        let (batch, heads, chunk, dimension) = (1usize, 1usize, 3usize, 4usize);
+        let scale = 0.5f64;
+        let q_values = vec![
+            1.0, 0.0, 0.5, -0.25, 0.0, 1.0, -0.5, 0.25, 0.3, -0.2, 0.7, 1.0,
+        ];
+        let committed_k = vec![1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0];
+        let current_k = vec![0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.5, 0.5, 0.5, 0.5];
+        let committed_v = vec![1.0, 2.0, 3.0, 4.0, -2.0, 1.0, 0.5, 3.0];
+        let current_v = vec![
+            4.0, -1.0, 2.0, 0.0, 0.5, 3.0, -2.0, 1.0, 5.0, 2.0, 1.0, -3.0,
+        ];
+        let q = MT::from_f32(dev, q_values.clone(), vec![batch, heads, chunk, dimension]);
+        let k_new = MT::from_f32(dev, current_k.clone(), vec![batch, heads, chunk, dimension]);
+        let v_new = MT::from_f32(dev, current_v.clone(), vec![batch, heads, chunk, dimension]);
+        let mut initial_k = committed_k.clone();
+        initial_k.resize(8 * dimension, 0.0);
+        let mut initial_v = committed_v.clone();
+        initial_v.resize(8 * dimension, 0.0);
+        let k_slab = MT::from_f32(dev, initial_k, vec![8, heads, dimension]);
+        let v_slab = MT::from_f32(dev, initial_v, vec![8, heads, dimension]);
+        let tables = u32_tensor(dev, &[0, 1], vec![batch, 2]);
+        let ctxlens = u32_tensor(dev, &[5], vec![batch]);
+        let block_bases = u32_tensor(dev, &[0], vec![batch]);
+        let advances = u32_tensor(dev, &[3], vec![batch]);
+
+        super::metal::scatter(
+            &k_new,
+            &v_new,
+            &k_slab,
+            &v_slab,
+            None,
+            None,
+            &tables,
+            &ctxlens,
+            &block_bases,
+            4,
+            &advances,
+        )
+        .unwrap();
+        let requirements =
+            super::attention_requirements(DType::F32, batch, heads, heads, chunk, dimension, scale)
+                .unwrap();
+        super::metal::warm_attention_block_exact(&requirements).unwrap();
+        let block_output = MT::empty(dev, vec![batch, heads, chunk, dimension], DType::F32);
+        super::metal::attention_block_into(
+            &q,
+            &k_slab,
+            &v_slab,
+            None,
+            None,
+            &tables,
+            &ctxlens,
+            &block_bases,
+            None,
+            scale,
+            4,
+            &advances,
+            &block_output,
+            super::metal::IntoResources::empty(),
+        )
+        .unwrap();
+        let causal_output = super::metal::decode(
+            &q,
+            &k_slab,
+            &v_slab,
+            None,
+            None,
+            &tables,
+            &ctxlens,
+            &block_bases,
+            None,
+            scale,
+            4,
+            &advances,
+        )
+        .unwrap();
+        let window_output = super::metal::attention_block(
+            &q,
+            &k_slab,
+            &v_slab,
+            None,
+            None,
+            &tables,
+            &ctxlens,
+            &block_bases,
+            Some(1),
+            scale,
+            4,
+            &advances,
+        )
+        .unwrap();
+        dev.synchronize().unwrap();
+
+        let logical_k = [committed_k, current_k].concat();
+        let logical_v = [committed_v, current_v].concat();
+        let dense = dense_bidirectional(
+            &q_values,
+            &logical_k,
+            &logical_v,
+            dimension,
+            scale as f32,
+            0,
+        );
+        let dense_window = dense_bidirectional(
+            &q_values,
+            &logical_k,
+            &logical_v,
+            dimension,
+            scale as f32,
+            1,
+        );
+        let actual = block_output.read_f32().unwrap();
+        let actual_window = window_output.read_f32().unwrap();
+        assert!(actual
+            .iter()
+            .zip(&dense)
+            .all(|(actual, expected)| (actual - expected).abs() < 2e-5));
+        assert!(actual_window
+            .iter()
+            .zip(&dense_window)
+            .all(|(actual, expected)| (actual - expected).abs() < 2e-5));
+        assert!(max_diff(&block_output, &causal_output) > 1e-2);
     }
 }

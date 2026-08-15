@@ -23,8 +23,9 @@ const FILTER_SCRATCH_BYTES: usize =
     PARTIAL_VALUES_BYTES + PARTIAL_TOKENS_BYTES + PARTIAL_INVALIDS_BYTES;
 pub const STATUS_OK: u32 = 0;
 pub const STATUS_NONFINITE: u32 = 1;
-const PIPELINE_REVISION: u64 = 6;
+const PIPELINE_REVISION: u64 = 7;
 const KERNEL_NAME: &str = "et_sample_logits";
+const GREEDY_ROWS_KERNEL_NAME: &str = "et_sample_greedy_rows";
 const PARTIALS_KERNEL_NAME: &str = "et_sample_filtered_partials";
 const MERGE_KERNEL_NAME: &str = "et_sample_filtered_merge";
 
@@ -131,6 +132,7 @@ fn validate(logits: &MetalTensor, options: SamplingOptions) -> crate::err::Res<D
 #[derive(Clone, Copy, Hash)]
 enum Kernel {
     Base,
+    GreedyRows,
     Partials,
     Merge,
 }
@@ -139,6 +141,7 @@ impl Kernel {
     fn name(self) -> &'static str {
         match self {
             Self::Base => KERNEL_NAME,
+            Self::GreedyRows => GREEDY_ROWS_KERNEL_NAME,
             Self::Partials => PARTIALS_KERNEL_NAME,
             Self::Merge => MERGE_KERNEL_NAME,
         }
@@ -251,6 +254,48 @@ inline float et_scaled_delta(float value, float maximum, float temperature) {{
 inline float et_draw(ulong seed, ulong counter, float total) {{
     // f32 multiplication can round a unit draw up to the closed endpoint.
     return min(et_random_unit(seed, counter) * total, nextafter(total, 0.0f));
+}}
+
+kernel void et_sample_greedy_rows(
+    device const {ty}* logits [[buffer(0)]],
+    device uint* result [[buffer(1)]],
+    constant uint& length [[buffer(2)]],
+    uint row [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]]) {{
+    constexpr uint threads = 256u;
+    threadgroup uint invalids[threads];
+    threadgroup float values[threads];
+    threadgroup uint tokens[threads];
+    const ulong base = ulong(row) * ulong(length);
+    uint invalid = ET_INVALID;
+    float best_value = -INFINITY;
+    uint best_token = ET_INVALID;
+    for (uint token = tid; token < length; token += threads) {{
+        const float value = float(logits[base + token]);
+        if (!isfinite(value)) invalid = min(invalid, token);
+        else if (et_better(value, token, best_value, best_token)) {{
+            best_value = value;
+            best_token = token;
+        }}
+    }}
+    invalids[tid] = invalid;
+    values[tid] = best_value;
+    tokens[tid] = best_token;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint offset = threads / 2u; offset > 0u; offset >>= 1u) {{
+        if (tid < offset) {{
+            invalids[tid] = min(invalids[tid], invalids[tid + offset]);
+            if (et_better(values[tid + offset], tokens[tid + offset], values[tid], tokens[tid])) {{
+                values[tid] = values[tid + offset];
+                tokens[tid] = tokens[tid + offset];
+            }}
+        }}
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }}
+    if (tid == 0u) {{
+        result[row * 2u] = invalids[0] == ET_INVALID ? 0u : 1u;
+        result[row * 2u + 1u] = invalids[0] == ET_INVALID ? tokens[0] : invalids[0];
+    }}
 }}
 
 kernel void et_sample_logits(
@@ -709,6 +754,65 @@ pub fn sample(logits: &MetalTensor, options: SamplingOptions) -> crate::err::Res
     Ok(result)
 }
 
+/// Greedily samples every contiguous leading row in one dispatch. The returned
+/// flat u32 tensor stores `[status, token]` for each row.
+pub fn sample_greedy_rows(logits: &MetalTensor) -> crate::err::Res<MetalTensor> {
+    if logits.layout.rank() < 2 || !logits.layout.is_contiguous() {
+        return Err(
+            "sample greedy rows: logits must be contiguous with rank at least two".to_string(),
+        );
+    }
+    if !matches!(logits.dtype, DType::F16 | DType::BF16 | DType::F32) {
+        return Err(format!(
+            "sample greedy rows: unsupported logits dtype {}",
+            logits.dtype.name()
+        ));
+    }
+    let length = *logits
+        .layout
+        .shape()
+        .last()
+        .ok_or_else(|| "sample greedy rows: logits shape is empty".to_string())?;
+    if length == 0 || length > MAX_SAMPLING_VOCABULARY {
+        return Err(format!(
+            "sample greedy rows: vocabulary must be in [1, {MAX_SAMPLING_VOCABULARY}], got {length}"
+        ));
+    }
+    let rows = logits.numel() / length;
+    let elements = rows
+        .checked_mul(2)
+        .ok_or_else(|| "sample greedy rows: result size overflows".to_string())?;
+    let bytes = elements
+        .checked_mul(DType::U32.size_in_bytes())
+        .ok_or_else(|| "sample greedy rows: result byte size overflows".to_string())?;
+    let device = MetalDevice::get();
+    let pipeline = compile_pipeline(logits.dtype, Kernel::GreedyRows)?;
+    let result = MetalTensor {
+        buffer: device.alloc_raw_checked(bytes)?,
+        layout: crate::runtime::layout::Layout::contiguous(vec![elements]),
+        dtype: DType::U32,
+    };
+    device.synchronize_buffer_producer(&logits.buffer)?;
+    device.mark_buffer_write(&result.buffer)?;
+    let length = length as u32;
+    device.with_encoder(|encoder| {
+        encoder.setComputePipelineState(pipeline.as_raw());
+        set_buffer(
+            encoder,
+            0,
+            &logits.buffer,
+            logits.layout.offset() * logits.dtype.size_in_bytes(),
+        );
+        set_buffer(encoder, 1, &result.buffer, 0);
+        set_bytes(encoder, 2, &length);
+        encoder.dispatchThreadgroups_threadsPerThreadgroup(
+            MetalDevice::grid(rows, 1, 1),
+            MetalDevice::grid(256, 1, 1),
+        );
+    });
+    Ok(result)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -722,6 +826,26 @@ mod tests {
             seed: 7,
             counter: 3,
         }
+    }
+
+    #[test]
+    fn greedy_rows_batches_ties_and_nonfinite_status() {
+        let device = MetalDevice::get();
+        let width = 2048usize;
+        let mut values = vec![-1.0f32; 3 * width];
+        values[17] = 4.0;
+        values[width + 511] = 7.0;
+        values[width + 1535] = 7.0;
+        values[2 * width + 123] = f32::NAN;
+        let logits = MetalTensor::from_f32(device, values, vec![3, width]);
+        let result = sample_greedy_rows(&logits).unwrap();
+        device.synchronize().unwrap();
+        let words = result.buffer.contents_ptr().cast::<u32>();
+        let values = unsafe { std::slice::from_raw_parts(words, 6) };
+        assert_eq!(
+            values,
+            &[STATUS_OK, 17, STATUS_OK, 511, STATUS_NONFINITE, 123]
+        );
     }
 
     fn result(logits: &MetalTensor, options: SamplingOptions) -> [u32; 2] {

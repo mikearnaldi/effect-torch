@@ -1,37 +1,107 @@
-/** Public proposer-artifact constructors and structural contracts. */
-import * as Model from "./Model.ts"
+/**
+ * High-level speculative decoding artifacts.
+ *
+ * TypeScript describes the proposer and builds its Tensor graphs. Model
+ * inference traces those graphs and lowers the selected variant to Runtime
+ * wire plans; native runtimes own execution, state, sampling, and acceptance.
+ */
+import type { Effect } from "effect"
+import type { Model, ModelError, Params } from "./Model.ts"
+import type * as Runtime from "./Runtime.ts"
+import type * as Tensor from "./Tensor.ts"
 
-export const ProposerArtifactTypeId: typeof Model.ProposerArtifactTypeId = Model.ProposerArtifactTypeId
+/** One layer of authoritative proposer K/V rows rebuilt after acceptance. */
+export interface KeyValue {
+  readonly key: Tensor.Lazy
+  readonly value: Tensor.Lazy
+}
 
-export type ProposerArtifact = Model.ProposerArtifact
-export type ProposerArtifactInput = Model.ProposerArtifactInput
-export type ProposerComponent = Model.ProposerComponent
-export type AutoregressiveProposerComponent = Model.AutoregressiveProposerComponent
-export type ProposerGraphComponent = Model.ProposerGraphComponent
-export type ProposerPlan = Model.ProposerPlan
-export type ProposerTargetContract = Model.ProposerTargetContract
-export type TargetContract = Model.TargetContract
-export type HiddenTapContract = Model.HiddenTapContract
-export type SharedWeightContract = Model.SharedWeightContract
-export type ProposerValueSchema = Model.ProposerValueSchema
-export type ProposerShapeDimension = Model.ProposerShapeDimension
-export type ValueRef = Model.ValueRef
-export type InputBinding = Model.InputBinding
-export type BlockInputLayout = Model.BlockInputLayout
-export type TreeSearchLayout = Model.TreeSearchLayout
-export type HistoryLookupLayout = Model.HistoryLookupLayout
-export type TargetPathId = Model.TargetPathId
-export type StageOperation = Model.StageOperation
-export type Stage = Model.Stage
-export type DecodeStateSchema = Model.DecodeStateSchema
-export type CommitPlan = Model.CommitPlan
-export type ProposerState = Model.ProposerState
-export type CandidateTopology = Model.CandidateTopology
-export type ProposalProbabilityContract = Model.ProposalProbabilityContract
-export type ProposerOutput = Model.ProposerOutput
-export type TokenMap = Model.TokenMap
-export type AutoregressiveProposerStage = Model.AutoregressiveProposerStage
-export type AutoregressiveProposerState = Model.AutoregressiveProposerState
-export type AutoregressiveProposerOutput = Model.AutoregressiveProposerOutput
+/** A target residual activation consumed by a replayable parallel block. */
+export interface HiddenTap {
+  readonly layer: number
+  readonly dtype: Runtime.DType
+  readonly shape: ReadonlyArray<number | "Rows">
+}
 
-export const artifact = Model.Speculation.artifact
+/** A target weight shared with a replayable parallel block. */
+export interface SharedWeight {
+  readonly name: string
+  readonly dtype: Runtime.DType
+  readonly shape: ReadonlyArray<number>
+}
+
+/** Exact autoregressive draft model with the same token vocabulary as the target. */
+export interface Autoregressive {
+  readonly _tag: "Autoregressive"
+  readonly model: Model
+  readonly params: Params
+  readonly vocabulary: number
+  readonly maxDraftTokens: number
+}
+
+/** Deterministic suffix n-gram lookup over each sequence's committed history. */
+export interface HistoryLookup {
+  readonly _tag: "HistoryLookup"
+  readonly vocabulary: number
+  readonly maxDraftTokens: number
+  readonly minMatchTokens: number
+  readonly maxMatchTokens: number
+}
+
+export interface ParallelBlockOutput {
+  readonly tokenIds: Tensor.Lazy
+  readonly probabilityRows?: Tensor.Lazy
+}
+
+/** One replayable fixed-width parallel proposal graph, as used by DFlash. */
+export interface ParallelBlock {
+  readonly _tag: "ParallelBlock"
+  readonly params: Params
+  readonly vocabulary: number
+  readonly maxDraftTokens: number
+  readonly hiddenTaps: ReadonlyArray<HiddenTap>
+  readonly tokenEmbedding: SharedWeight
+  readonly lmHead: SharedWeight
+  readonly currentBlockAttention?: "Causal" | "Bidirectional"
+  readonly attentionWindow?: number
+  readonly build: (
+    params: Params,
+    anchorTokens: Tensor.Any,
+    tokenEmbedding: Tensor.Any,
+    lmHead: Tensor.Any,
+    maxDraftTokens: number
+  ) => Effect.Effect<Tensor.Lazy, ModelError | Tensor.TensorError, Runtime.Runtime>
+  readonly buildWithProbabilities?: (
+    params: Params,
+    anchorTokens: Tensor.Any,
+    tokenEmbedding: Tensor.Any,
+    lmHead: Tensor.Any,
+    maxDraftTokens: number
+  ) => Effect.Effect<ParallelBlockOutput, ModelError | Tensor.TensorError, Runtime.Runtime>
+  readonly replay: (
+    params: Params,
+    targetRows: ReadonlyArray<Tensor.Any>
+  ) => Effect.Effect<ReadonlyArray<KeyValue>, ModelError | Tensor.TensorError, Runtime.Runtime>
+}
+
+/** The complete public speculation language. */
+export type Artifact = Autoregressive | HistoryLookup | ParallelBlock
+
+/** Constructs an exact autoregressive proposer. */
+export const autoregressive = (
+  model: Model,
+  params: Params,
+  options: { readonly vocabulary: number; readonly maxDraftTokens: number }
+): Autoregressive => ({ _tag: "Autoregressive", model, params, ...options })
+
+/** Constructs a deterministic suffix n-gram history proposer. */
+export const historyLookup = (options: Omit<HistoryLookup, "_tag">): HistoryLookup => ({
+  _tag: "HistoryLookup",
+  ...options
+})
+
+/** Constructs one replayable fixed-width parallel-block proposer. */
+export const parallelBlock = (options: Omit<ParallelBlock, "_tag">): ParallelBlock => ({
+  _tag: "ParallelBlock",
+  ...options
+})

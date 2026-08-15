@@ -349,17 +349,7 @@ onDevices("Kda", (device) => (it) => {
       Effect.gen(function*() {
         const model = yield* makeHybrid
         const params = yield* Tensor.compute(yield* model.init)
-        const proposer = yield* Speculation.artifact({
-          components: [{ model, params }],
-          plan: {
-            target: { vocabulary: VOCAB },
-            stages: [{ operation: { _tag: "Autoregressive", component: 0 } }],
-            state: { _tag: "Kv", commit: { _tag: "AutoregressiveChain", stage: 0 } },
-            output: { topology: "Chains", probabilities: "CausalNormalized" },
-            tokenMap: { _tag: "Identity" },
-            trainedMaxRows: 2
-          }
-        })
+        const proposer = Speculation.autoregressive(model, params, { vocabulary: VOCAB, maxDraftTokens: 2 })
         const error = yield* Effect.flip(Model.inference(model, params, {
           maxTokens: 32,
           blockSize: 4,

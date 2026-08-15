@@ -3,7 +3,7 @@ import { Deferred, Effect, Fiber, Layer } from "effect"
 import * as fs from "node:fs"
 import * as os from "node:os"
 import * as path from "node:path"
-import { Gguf, Model, Registry, Runtime, Tensor } from "../src/index.ts"
+import { Gguf, Model, Runtime, Tensor } from "../src/index.ts"
 import { onDevices } from "./utils/devices.ts"
 
 const placement: Runtime.Placement = Object.freeze({
@@ -63,10 +63,11 @@ const inspection: Runtime.GgufInspection = Object.freeze({
   tensors: Object.freeze([encodedDescriptor, denseDescriptor])
 })
 
-const architecture = (
-  capture: (config: Registry.ModelConfig) => void
-): Registry.ModelArchitecture => ({
-  id: "gguf:test-model",
+const definition = (
+  capture: (config: Gguf.ModelConfig) => void,
+  architecture = "test-model"
+): Gguf.ModelDefinition => ({
+  architecture,
   create: (config) => {
     capture(config)
     return Model.define({
@@ -79,8 +80,7 @@ const architecture = (
   }
 })
 
-const provide = (runtime: Runtime.RuntimeService) =>
-  Layer.merge(Registry.emptyLayer, Layer.succeed(Runtime.Runtime, runtime))
+const provide = (runtime: Runtime.RuntimeService) => Layer.succeed(Runtime.Runtime, runtime)
 
 const u32 = (value: number): Buffer => {
   const bytes = Buffer.alloc(4)
@@ -155,12 +155,10 @@ it.effect("loads by exact architecture and returns tensors in model parameter or
     },
     release: (value: Tensor.Concrete) => Effect.sync(() => void released.push(value))
   } as unknown as Runtime.RuntimeService
-  let config: Registry.ModelConfig | undefined
+  let config: Gguf.ModelConfig | undefined
 
   return Effect.gen(function*() {
-    const registry = yield* Registry.Registry
-    yield* registry.register(architecture((value) => config = value))
-    const loaded = yield* Gguf.load("model.gguf")
+    const loaded = yield* Gguf.loadModel("model.gguf", definition((value) => config = value))
 
     expect(paths).toEqual(["inspect:model.gguf", "load:model.gguf"])
     expect([...config!]).toEqual([
@@ -179,7 +177,7 @@ it.effect("loads by exact architecture and returns tensors in model parameter or
   }).pipe(Effect.provide(provide(runtime)))
 })
 
-it.effect("uses only the source-qualified architecture ID", () => {
+it.effect("rejects an architecture mismatch before model creation", () => {
   const runtime = {
     placement,
     extensions: {
@@ -190,15 +188,11 @@ it.effect("uses only the source-qualified architecture ID", () => {
     }
   } as unknown as Runtime.RuntimeService
   return Effect.gen(function*() {
-    const registry = yield* Registry.Registry
-    yield* registry.register({
-      ...architecture(() => {}),
-      id: "test-model"
-    })
-    const error = yield* Effect.flip(Gguf.load("model.gguf"))
-    expect(error._tag).toBe("RegistryError")
-    if (error._tag !== "RegistryError") throw error
-    expect(error.message).toContain("gguf:test-model")
+    const error = yield* Effect.flip(Gguf.loadModel("model.gguf", definition(() => {}, "other-model")))
+    expect(error._tag).toBe("GgufError")
+    if (error._tag !== "GgufError") throw error
+    expect(error.op).toBe("validate")
+    expect(error.message).toContain("\"other-model\"")
   }).pipe(Effect.provide(provide(runtime)))
 })
 
@@ -242,9 +236,7 @@ it.effect("releases every loaded tensor when load descriptors disagree with insp
   } as unknown as Runtime.RuntimeService
 
   return Effect.gen(function*() {
-    const registry = yield* Registry.Registry
-    yield* registry.register(architecture(() => {}))
-    const error = yield* Effect.flip(Gguf.load("model.gguf"))
+    const error = yield* Effect.flip(Gguf.loadModel("model.gguf", definition(() => {})))
 
     expect(error._tag).toBe("GgufError")
     if (error._tag !== "GgufError") throw error
@@ -276,9 +268,7 @@ it.effect("rejects duplicate loaded handle ownership and releases it once", () =
   } as unknown as Runtime.RuntimeService
 
   return Effect.gen(function*() {
-    const registry = yield* Registry.Registry
-    yield* registry.register(architecture(() => {}))
-    const error = yield* Effect.flip(Gguf.load("duplicate.gguf"))
+    const error = yield* Effect.flip(Gguf.loadModel("duplicate.gguf", definition(() => {})))
 
     expect(error._tag).toBe("GgufError")
     if (error._tag !== "GgufError") throw error
@@ -320,11 +310,7 @@ it.effect("the runtime cleans up interruption before archive ownership transfers
       release: (value: Tensor.Concrete) => Effect.sync(() => void released.push(value))
     } as unknown as Runtime.RuntimeService
     const layer = provide(runtime)
-    const program = Effect.gen(function*() {
-      const registry = yield* Registry.Registry
-      yield* registry.register(architecture(() => {}))
-      return yield* Gguf.load("handoff.gguf")
-    }).pipe(Effect.provide(layer))
+    const program = Gguf.loadModel("handoff.gguf", definition(() => {})).pipe(Effect.provide(layer))
     const target = yield* program.pipe(Effect.forkChild({ startImmediately: true }))
     yield* Deferred.await(waiting)
     yield* Fiber.interrupt(target)
@@ -339,16 +325,14 @@ onDevices("GGUF", () => (it) => {
     fs.writeFileSync(file, fixture())
 
     return Effect.gen(function*() {
-      const registry = yield* Registry.Registry
-      yield* registry.register({
-        id: "gguf:compiled-identity",
+      const loaded = yield* Gguf.loadModel(file, {
+        architecture: "compiled-identity",
         create: () =>
           Model.define({
             parameters: [{ name: "packed", shape: [2, 256] }],
             forward: (_, input) => Effect.succeed(input as Tensor.Lazy)
           })
       })
-      const loaded = yield* Gguf.load(file)
       const compiled = yield* Tensor.compile(([input]) => Effect.succeed([input]))
       const [identity] = yield* compiled.call([loaded.params[0]])
 
@@ -376,7 +360,6 @@ onDevices("GGUF", () => (it) => {
       yield* Tensor.clear(identity)
       yield* Tensor.clearAll(loaded.params)
     }).pipe(
-      Effect.provide(Registry.emptyLayer),
       Effect.ensuring(Effect.sync(() => fs.rmSync(directory, { recursive: true, force: true })))
     )
   })

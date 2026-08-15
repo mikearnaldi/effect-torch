@@ -31,19 +31,9 @@ const suite = Effect.gen(function*() {
   const params = yield* Tensor.compute(yield* model.init)
   const draftParams = yield* Tensor.compute(yield* model.init)
   const makeProposer = (componentParams: Model.Params) =>
-    Speculation.artifact({
-      components: [{ model, params: componentParams }],
-      plan: {
-        target: { vocabulary: VOCAB },
-        stages: [{ operation: { _tag: "Autoregressive", component: 0 } }],
-        state: { _tag: "Kv", commit: { _tag: "AutoregressiveChain", stage: 0 } },
-        output: { topology: "Chains", probabilities: "CausalNormalized" },
-        tokenMap: { _tag: "Identity" },
-        trainedMaxRows: 4
-      }
-    })
-  const perfectProposer = yield* makeProposer(params)
-  const independentProposer = yield* makeProposer(draftParams)
+    Speculation.autoregressive(model, componentParams, { vocabulary: VOCAB, maxDraftTokens: 4 })
+  const perfectProposer = makeProposer(params)
+  const independentProposer = makeProposer(draftParams)
   const modes = [
     { name: "ordinary", draftTokens: 0, proposer: undefined },
     { name: "perfect", draftTokens: 4, proposer: perfectProposer },

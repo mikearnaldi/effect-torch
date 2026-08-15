@@ -948,7 +948,48 @@ fn argreduce_pipeline(
             ));
         }
     }
+    let parallel = dtype == DType::F32 && dstride == 1 && n >= 1024;
     let make_src = || {
+        if parallel {
+            return format!(
+                r#"
+#include <metal_stdlib>
+using namespace metal;
+kernel void et_argred(
+    device const float* x [[buffer(0)]],
+    device uint* out [[buffer(1)]],
+    uint gid [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]]
+) {{
+    if (gid >= {kept_n}u) return;
+    ulong base = 0ul;
+{decompose}    uint best = tid;
+    float best_v = x[base + tid];
+    for (uint i = tid + 256u; i < {n}u; i += 256u) {{
+        float v = x[base + i];
+        if (v {cmp} best_v) {{ best_v = v; best = i; }}
+    }}
+    threadgroup float values[256];
+    threadgroup uint indexes[256];
+    values[tid] = best_v;
+    indexes[tid] = best;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint offset = 128u; offset > 0u; offset >>= 1u) {{
+        if (tid < offset) {{
+            float v = values[tid + offset];
+            uint i = indexes[tid + offset];
+            if (v {cmp} values[tid] || (v == values[tid] && i < indexes[tid])) {{
+                values[tid] = v;
+                indexes[tid] = i;
+            }}
+        }}
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }}
+    if (tid == 0u) out[gid] = indexes[0];
+}}
+"#
+            );
+        }
         format!(
             r#"
 #include <metal_stdlib>
@@ -1099,12 +1140,17 @@ pub fn argreduce_into(
         ]),
         "et_argred",
     )?;
-    let padded = kept_n.div_ceil(256) * 256;
     dev.with_encoder(|e| {
         e.setComputePipelineState(pipeline.as_raw());
         set_buffer(e, 0, &x.buffer, x.layout.offset() * x.dtype.size_in_bytes());
         set_buffer(e, 1, &out.buffer, out.layout.offset() * 4);
-        {
+        if x.dtype == DType::F32 && x.layout.strides()[dim] == 1 && x.layout.shape()[dim] >= 1024 {
+            e.dispatchThreadgroups_threadsPerThreadgroup(
+                MetalDevice::grid(kept_n, 1, 1),
+                MetalDevice::grid(256, 1, 1),
+            );
+        } else {
+            let padded = kept_n.div_ceil(256) * 256;
             let (g, tg) = MetalDevice::grid_flat(padded);
             e.dispatchThreads_threadsPerThreadgroup(g, tg);
         }
@@ -1354,6 +1400,25 @@ mod tests {
         let e = eye(dev, 2, DType::F32).unwrap();
         dev.synchronize().unwrap();
         assert_eq!(e.read_f32().unwrap(), vec![1., 0., 0., 1.]);
+    }
+
+    #[test]
+    fn parallel_argmax_reduces_large_rows_and_keeps_first_tie() {
+        let dev = MetalDevice::get();
+        let width = 2048usize;
+        let mut values = vec![-1.0f32; 3 * width];
+        values[17] = 4.0;
+        values[width + 1023] = 7.0;
+        values[2 * width + 511] = 9.0;
+        values[2 * width + 1535] = 9.0;
+        let input = MetalTensor::from_f32(dev, values, vec![3, width]);
+        let output = argreduce(dev, &input, 1, true).unwrap();
+        dev.synchronize().unwrap();
+
+        // SAFETY: synchronization completed and the output contains three u32 indexes.
+        let indexes =
+            unsafe { std::slice::from_raw_parts(output.buffer.contents_ptr().cast::<u32>(), 3) };
+        assert_eq!(indexes, &[17, 1023, 511]);
     }
 
     // Integer scalars must not round-trip through f32: values above

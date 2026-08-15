@@ -77,7 +77,9 @@ use effect_torch_compiler::{
     COMPILE_SUBMISSION_PHASE, PHYSICAL_PLANNING_PHASE, PIPELINE_PREPARATION_PHASE,
     PUBLICATION_PHASE,
 };
-use effect_torch_graph::{node_children, CrossEntropyReduction, PositionOffset, RotaryLayout};
+use effect_torch_graph::{
+    node_children, CrossEntropyReduction, KvAttentionMode, PositionOffset, RotaryLayout,
+};
 use effect_torch_runtime::{
     Buffer, CancellationFlag, DType, ExecutableDiagnostics, GgmlKQuant, InstructionId,
     InvocationMemoryReport, Location, MemoryPlan, NativeMemorySpace, ProgramSignature,
@@ -317,6 +319,7 @@ pub(crate) trait MetalDecodeContext {
         v: &crate::run::MetalTensor,
         scale: f64,
         window: Option<usize>,
+        mode: KvAttentionMode,
         output: &crate::run::MetalTensor,
         staging: &[crate::run::MetalTensor],
     ) -> Result<(), String>;
@@ -590,6 +593,7 @@ pub(super) enum MetalOp {
         scale: f64,
         layer: u32,
         window: Option<usize>,
+        mode: KvAttentionMode,
     },
     RotaryEmbedding {
         theta: f64,
@@ -965,6 +969,7 @@ pub(super) struct KvAttentionPlan {
     pub(crate) kv_heads: usize,
     pub(crate) time: usize,
     pub(crate) head_dim: usize,
+    pub(crate) mode: KvAttentionMode,
 }
 
 /// One chunk-shape variant of the chunked-head CE forward: the gemm
@@ -2035,7 +2040,7 @@ fn plan_command_resources(
             }
         }
         MetalOp::AdamW { .. } | MetalOp::AdamWGroup { .. } | MetalOp::Sgd { .. } => {}
-        MetalOp::KvAttention { layer, .. } => {
+        MetalOp::KvAttention { layer, mode, .. } => {
             let q = input(0)?;
             let k = input(1)?;
             if q.shape.len() < 3 || q.dtype != DType::F32 {
@@ -2053,6 +2058,7 @@ fn plan_command_resources(
                 kv_heads: k.shape[rank - 3],
                 time: q.shape[rank - 2],
                 head_dim: q.shape[rank - 1],
+                mode: *mode,
             };
             if plan.time == 0 || plan.head_dim > 128 {
                 return Err(format!(
@@ -3409,11 +3415,13 @@ impl<'a> Lowerer<'a> {
                 scale,
                 layer,
                 window,
+                mode,
                 ..
             } => MetalOp::KvAttention {
                 scale: *scale,
                 layer: *layer,
                 window: *window,
+                mode: *mode,
             },
             NodeKind::RotaryEmbedding {
                 x,
@@ -4502,7 +4510,7 @@ impl<'a> Lowerer<'a> {
                         shortconv::warm_forward_exact(requirements)?;
                         pipeline_count += requirements.pipeline_count;
                     }
-                    MetalOp::KvAttention { scale, .. } => {
+                    MetalOp::KvAttention { scale, mode, .. } => {
                         let query = &self.values[command.inputs[0].index()];
                         let key = &self.values[command.inputs[1].index()];
                         let rank = query.shape.len();
@@ -4512,6 +4520,21 @@ impl<'a> Lowerer<'a> {
                             key.shape[rank - 3],
                             *scale,
                         )?;
+                        if *mode == KvAttentionMode::BidirectionalBlock {
+                            crate::paged::warm_attention_block(
+                                query.shape[rank - 1],
+                                query.shape[rank - 3],
+                                key.shape[rank - 3],
+                                self.state_schema
+                                    .as_ref()
+                                    .ok_or_else(|| {
+                                        "compile: block attention requires state schema".to_string()
+                                    })?
+                                    .kv_dtype,
+                                *scale,
+                            )?;
+                            pipeline_count += 1;
+                        }
                     }
                     MetalOp::RotaryEmbedding {
                         layout,
@@ -7655,6 +7678,7 @@ fn execute_op_into(
             scale,
             layer,
             window,
+            mode,
         } => {
             let MetalCommandPlan::KvAttention(requirements) = plan else {
                 return Err("KV attention is missing exact paged requirements".to_string());
@@ -7682,6 +7706,7 @@ fn execute_op_into(
                 input(2)?.as_metal()?,
                 *scale,
                 *window,
+                *mode,
                 output(0)?.as_metal()?,
                 &staging_tensors,
             )
@@ -10075,6 +10100,7 @@ mod tests {
             scale: 1.0,
             layer: 0,
             window: None,
+            mode: KvAttentionMode::Causal,
         })
         .unwrap();
         let error = compile(
@@ -10602,6 +10628,7 @@ mod tests {
             _v: &crate::run::MetalTensor,
             _scale: f64,
             _window: Option<usize>,
+            _mode: KvAttentionMode,
             _output: &crate::run::MetalTensor,
             _staging: &[crate::run::MetalTensor],
         ) -> Result<(), String> {

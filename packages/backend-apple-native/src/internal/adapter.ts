@@ -1250,6 +1250,9 @@ export const makeRuntime = (
       blockSize: uint32(state.blockSize, "state.blockSize", false),
       kvDtype: state.kvDtype,
       ...(state.window === undefined ? {} : { window: uint32(state.window, "state.window", true) }),
+      ...(state.currentBlockAttention === undefined
+        ? {}
+        : { currentBlockAttention: state.currentBlockAttention }),
       batch: uint32(state.batch, "state.batch", false),
       ...(state.packedCausalChains === undefined
         ? {}
@@ -1262,7 +1265,10 @@ export const makeRuntime = (
             )
           }
         }),
-      ...(state.lastTokenRow === undefined ? {} : { lastTokenRow: state.lastTokenRow })
+      ...(state.lastTokenRow === undefined ? {} : { lastTokenRow: state.lastTokenRow }),
+      ...(state.outputSelections === undefined
+        ? {}
+        : { outputSelections: Object.freeze([...state.outputSelections]) })
     }
     return {
       request,
@@ -1271,11 +1277,25 @@ export const makeRuntime = (
         blockSize: request.blockSize,
         kvDtype: request.kvDtype as NativeDType,
         ...(request.window === undefined ? {} : { window: request.window }),
+        ...(request.currentBlockAttention === undefined
+          ? {}
+          : { currentBlockAttention: request.currentBlockAttention }),
         batch: request.batch,
         ...(request.packedCausalChains === undefined
           ? {}
           : { packedCausalChains: { rowsPerSequence: request.packedCausalChains.rowsPerSequence } }),
-        ...(request.lastTokenRow === undefined ? {} : { lastTokenRow: request.lastTokenRow })
+        ...(request.lastTokenRow === undefined ? {} : { lastTokenRow: request.lastTokenRow }),
+        ...(request.outputSelections === undefined
+          ? {}
+          : {
+            outputSelections: request.outputSelections.map((selection) =>
+              selection === "allRows"
+                ? "AllRows" as const
+                : selection === "splitLastTokenRow"
+                ? "SplitLastTokenRow" as const
+                : "BatchedLastTokenRow" as const
+            )
+          })
       }
     }
   }
@@ -1326,7 +1346,13 @@ export const makeRuntime = (
       blockSize: state.blockSize,
       kvDtype: state.kvDtype,
       ...(state.window === undefined || !value.allowsWindowEviction ? {} : { window: state.window }),
+      ...(state.currentBlockAttention === undefined
+        ? {}
+        : { currentBlockAttention: state.currentBlockAttention }),
       ...(state.lastTokenRow === undefined ? {} : { lastTokenRow: state.lastTokenRow }),
+      ...(state.outputSelections === undefined
+        ? {}
+        : { outputSelections: Object.freeze([...state.outputSelections]) }),
       ...(state.packedCausalChains === undefined
         ? {}
         : {
@@ -1797,14 +1823,24 @@ export const makeRuntime = (
           const nativePlan: NativeProposerPlan | undefined = generalized === undefined
             ? undefined
             : {
-              targetPrefillTaps: [],
+              targetPrefillTaps: (generalized.plan.prefillHiddenTaps ?? []).map((tap) => ({
+                layer: tap.layer,
+                output: tap.outputRoot,
+                shape: [...tap.value.shape],
+                dtype: tap.value.dtype as NativeDType
+              })),
               targetDecodeTaps: generalized.plan.hiddenTaps.map((tap) => ({
                 layer: tap.layer,
                 output: tap.outputRoot,
                 shape: [...tap.value.shape],
                 dtype: tap.value.dtype as NativeDType
               })),
-              targetVerifyTaps: [],
+              targetVerifyTaps: (generalized.plan.verifyHiddenTaps ?? []).map((tap) => ({
+                layer: tap.layer,
+                output: tap.outputRoot,
+                shape: [...tap.value.shape],
+                dtype: tap.value.dtype as NativeDType
+              })),
               sharedTargetBindings: generalized.plan.sharedTensors.map((binding, tensor) => ({
                 kind: binding.kind,
                 name: binding.name,
@@ -1882,6 +1918,7 @@ export const makeRuntime = (
           const sharedTargetTensors = generalized?.sharedTensors.map((tensor) =>
             nativeTensor(tensor, "inferenceCompile", "compile")
           )
+          const replay = generalized?.replay
           return inferenceArtifact(
             new native.NativeInferenceArtifact(
               targetPrefill.value as Executable,
@@ -1897,7 +1934,19 @@ export const makeRuntime = (
               nativeInferenceSampling(sampling),
               nativePlan,
               stageExecutables,
-              sharedTargetTensors
+              sharedTargetTensors,
+              replay === undefined
+                ? undefined
+                : record(replay.prefill, "executable", "inferenceCompile", "compile").value as Executable,
+              replay === undefined
+                ? undefined
+                : record(replay.decode, "executable", "inferenceCompile", "compile").value as Executable,
+              replay === undefined
+                ? undefined
+                : record(replay.verify, "executable", "inferenceCompile", "compile").value as Executable,
+              replay === undefined
+                ? undefined
+                : record(replay.pool, "kv-pool", "inferenceCompile", "compile").value as NativeKvPool
             ),
             sampling
           )
@@ -2384,13 +2433,18 @@ export const makeRuntime = (
           const options = mapCompileOptions(request.options)
           const state = mapStateRequest(request.state)
           const value = native.compile(roots, options, state?.native, executableCacheKey(request))
-          const outputs = request.roots.flatMap((root) => {
+          const outputs = request.roots.flatMap((root, index) => {
             const base = {
               dtype: root.dtype,
               ...(root.storage === undefined ? {} : { storage: root.storage })
             }
-            if (state?.request.lastTokenRow !== true) return [{ shape: root.shape, ...base }]
-            return Array.from({ length: state.request.batch }, () => ({ shape: [root.shape[2]!], ...base }))
+            const selection = state?.request.outputSelections?.[index]
+              ?? (state?.request.lastTokenRow === true ? "splitLastTokenRow" : "allRows")
+            if (selection === "allRows") return [{ shape: root.shape, ...base }]
+            if (selection === "batchedLastTokenRow") {
+              return [{ shape: [state!.request.batch, root.shape[2]!], ...base }]
+            }
+            return Array.from({ length: state!.request.batch }, () => ({ shape: [root.shape[2]!], ...base }))
           })
           return executable(value, bindings, outputs, completeStateSchema(value, state?.request))
         },

@@ -1432,6 +1432,24 @@ export const makeRuntime = (
       outputRoot: tap.outputRoot,
       value: { dtype: tap.value.dtype as NativeDType, shape: [...tap.value.shape] }
     })),
+    ...(plan.prefillHiddenTaps === undefined
+      ? {}
+      : {
+        prefillHiddenTaps: plan.prefillHiddenTaps.map((tap) => ({
+          layer: tap.layer,
+          outputRoot: tap.outputRoot,
+          value: { dtype: tap.value.dtype as NativeDType, shape: [...tap.value.shape] }
+        }))
+      }),
+    ...(plan.verifyHiddenTaps === undefined
+      ? {}
+      : {
+        verifyHiddenTaps: plan.verifyHiddenTaps.map((tap) => ({
+          layer: tap.layer,
+          outputRoot: tap.outputRoot,
+          value: { dtype: tap.value.dtype as NativeDType, shape: [...tap.value.shape] }
+        }))
+      }),
     sharedTensors: plan.sharedTensors.map((tensor) => ({
       kind: tensor.kind,
       name: tensor.name,
@@ -1613,6 +1631,7 @@ export const makeRuntime = (
           const proposerPool = request.proposer === undefined
             ? undefined
             : nativePool(request.proposer.pool, "inferenceCompile").value as NativeKvPool
+          const replay = generalized?.replay
           const value = native.compileInference(
             targetPrefill,
             targetDecode,
@@ -1629,7 +1648,17 @@ export const makeRuntime = (
             generalized?.sharedTensors.map((tensor) => nativeTensor(tensor, "inferenceCompile")),
             generalized?.stageExecutables.map((stage) =>
               nativeExecutable(stage, "inferenceCompile").value as NativeExecutable
-            )
+            ),
+            replay === undefined
+              ? undefined
+              : nativeExecutable(replay.prefill, "inferenceCompile").value as NativeExecutable,
+            replay === undefined
+              ? undefined
+              : nativeExecutable(replay.decode, "inferenceCompile").value as NativeExecutable,
+            replay === undefined
+              ? undefined
+              : nativeExecutable(replay.verify, "inferenceCompile").value as NativeExecutable,
+            replay === undefined ? undefined : nativePool(replay.pool, "inferenceCompile").value as NativeKvPool
           )
           return wrapOpaque<Runtime.InferenceArtifactHandle>(
             "inference-artifact",
@@ -2023,20 +2052,39 @@ export const makeRuntime = (
               blockSize: request.state.blockSize,
               kvDtype: request.state.kvDtype as NativeDType,
               ...(request.state.window === undefined ? {} : { window: request.state.window }),
+              ...(request.state.currentBlockAttention === undefined
+                ? {}
+                : { currentBlockAttention: request.state.currentBlockAttention }),
               batch: request.state.batch,
               ...(request.state.packedCausalChains === undefined
                 ? {}
                 : { packedCausalChains: { rowsPerSequence: request.state.packedCausalChains.rowsPerSequence } }),
-              ...(request.state.lastTokenRow === undefined ? {} : { lastTokenRow: request.state.lastTokenRow })
+              ...(request.state.lastTokenRow === undefined ? {} : { lastTokenRow: request.state.lastTokenRow }),
+              ...(request.state.outputSelections === undefined
+                ? {}
+                : {
+                  outputSelections: request.state.outputSelections.map((selection) =>
+                    selection === "allRows"
+                      ? "AllRows" as const
+                      : selection === "splitLastTokenRow"
+                      ? "SplitLastTokenRow" as const
+                      : "BatchedLastTokenRow" as const
+                  )
+                })
             }
           const value = native.compile(roots, options, state, executableCacheKey(request))
-          const outputs = request.roots.flatMap((root) => {
+          const outputs = request.roots.flatMap((root, index) => {
             const base = {
               dtype: root.dtype,
               ...(root.storage === undefined ? {} : { storage: root.storage })
             }
-            if (request.state?.lastTokenRow !== true) return [{ shape: root.shape, ...base }]
-            return Array.from({ length: request.state.batch }, () => ({ shape: [root.shape[2]!], ...base }))
+            const selection = request.state?.outputSelections?.[index]
+              ?? (request.state?.lastTokenRow === true ? "splitLastTokenRow" : "allRows")
+            if (selection === "allRows") return [{ shape: root.shape, ...base }]
+            if (selection === "batchedLastTokenRow") {
+              return [{ shape: [request.state!.batch, root.shape[2]!], ...base }]
+            }
+            return Array.from({ length: request.state!.batch }, () => ({ shape: [root.shape[2]!], ...base }))
           })
           if (value.stateful !== (request.state !== undefined)) {
             throw new Error("compile: native executable state does not match the request")
@@ -2074,7 +2122,13 @@ export const makeRuntime = (
             ...(request.state.window === undefined || !value.allowsWindowEviction
               ? {}
               : { window: request.state.window }),
+            ...(request.state.currentBlockAttention === undefined
+              ? {}
+              : { currentBlockAttention: request.state.currentBlockAttention }),
             ...(request.state.lastTokenRow === undefined ? {} : { lastTokenRow: request.state.lastTokenRow }),
+            ...(request.state.outputSelections === undefined
+              ? {}
+              : { outputSelections: Object.freeze([...request.state.outputSelections]) }),
             ...(request.state.packedCausalChains === undefined
               ? {}
               : {

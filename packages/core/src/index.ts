@@ -24,8 +24,8 @@ export * as Chat from "./Chat.ts"
 export * as Gradient from "./Gradient.ts"
 
 /**
- * Native GGUF v3 inspection, registry resolution, validation, and owned tensor
- * loading.
+ * Native GGUF v3 inspection, explicit model definition, validation, and owned
+ * tensor loading.
  *
  * @since 0.1.0
  * @category modules
@@ -56,15 +56,6 @@ export * as Loss from "./Loss.ts"
  */
 export * as Model from "./Model.ts"
 export * as Speculation from "./Speculation.ts"
-
-/**
- * Effect-environment model-architecture registration, exact-key lookup, and
- * default Layers.
- *
- * @since 0.1.0
- * @category modules
- */
-export * as Registry from "./Registry.ts"
 
 /**
  * Pure optimizer update graphs, explicit tensor-state schemas, and gradient

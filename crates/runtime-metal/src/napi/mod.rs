@@ -38,14 +38,16 @@ pub use gguf::{inspect_gguf, load_gguf};
 
 use crate::executable;
 use crate::executable::{ConvGeometry, KdaGeometry, KvStateSchema, MetalDecodeContext, SeqState};
+use crate::run::MetalTensor;
 
 use effect_torch_compiler::{
-    specialize_decode_layout, CompileOptions, ConvGeometry as DecodeConvGeometry, DecodeLayout,
+    specialize_decode_layout_outputs_with_attention, CompileOptions,
+    ConvGeometry as DecodeConvGeometry, CurrentBlockAttention, DecodeLayout, DecodeOutputSelection,
     InferenceOptions, KdaGeometry as DecodeKdaGeometry, PreparedProgram, ProgramRequest,
     ProgramSlot, StateCursorSlot,
 };
 use effect_torch_graph::CrossEntropyReduction as CeReduction;
-use effect_torch_graph::{AttentionWindow, Device, PositionOffset, RotaryLayout};
+use effect_torch_graph::{AttentionWindow, Device, KvAttentionMode, PositionOffset, RotaryLayout};
 use effect_torch_napi::{try_register_export, unregister_export, vec_to_bytes, CancellationState};
 use effect_torch_runtime::{
     effective_probabilities, purpose_counter, random_unit, random_unit_at, sample_probabilities,
@@ -280,6 +282,42 @@ pub struct NativeKvStateSchema {
     pub batch: u32,
     pub packed_causal_chains: Option<NativePackedCausalChainsLayout>,
     pub last_token_row: Option<bool>,
+    pub output_selections: Option<Vec<NativeDecodeOutputSelection>>,
+    pub current_block_attention: Option<NativeCurrentBlockAttention>,
+}
+
+#[napi(string_enum)]
+#[derive(Clone, Copy)]
+pub enum NativeCurrentBlockAttention {
+    Causal,
+    Bidirectional,
+}
+
+impl From<NativeCurrentBlockAttention> for CurrentBlockAttention {
+    fn from(mode: NativeCurrentBlockAttention) -> Self {
+        match mode {
+            NativeCurrentBlockAttention::Causal => Self::Causal,
+            NativeCurrentBlockAttention::Bidirectional => Self::Bidirectional,
+        }
+    }
+}
+
+#[napi(string_enum)]
+#[derive(Clone, Copy)]
+pub enum NativeDecodeOutputSelection {
+    AllRows,
+    SplitLastTokenRow,
+    BatchedLastTokenRow,
+}
+
+impl From<NativeDecodeOutputSelection> for DecodeOutputSelection {
+    fn from(selection: NativeDecodeOutputSelection) -> Self {
+        match selection {
+            NativeDecodeOutputSelection::AllRows => Self::AllRows,
+            NativeDecodeOutputSelection::SplitLastTokenRow => Self::SplitLastTokenRow,
+            NativeDecodeOutputSelection::BatchedLastTokenRow => Self::BatchedLastTokenRow,
+        }
+    }
 }
 
 #[napi(object)]
@@ -2422,10 +2460,11 @@ impl MetalDecodeContext for KvContext {
         v: &runtime::metal::run::MetalTensor,
         scale: f64,
         window: Option<usize>,
+        mode: KvAttentionMode,
         output: &runtime::metal::run::MetalTensor,
         staging: &[runtime::metal::run::MetalTensor],
     ) -> err::Res<()> {
-        kv_attention_into(self, layer, q, k, v, scale, window, output, staging)
+        kv_attention_into(self, layer, q, k, v, scale, window, mode, output, staging)
     }
 
     fn evict_before(&self, state: &mut SeqState, start: usize) {
@@ -2532,6 +2571,7 @@ pub(crate) fn prepare_kv_attention(
                 &mut state,
                 layer,
                 schema.window,
+                plan.mode,
                 plan.kv_heads,
                 plan.head_dim,
                 advance,
@@ -2596,6 +2636,7 @@ pub(crate) fn prepare_kv_attention(
             &mut state,
             layer,
             schema.window,
+            plan.mode,
             plan.kv_heads,
             plan.head_dim,
             plan.time,
@@ -2645,6 +2686,7 @@ pub(crate) fn kv_attention_into(
     v: &runtime::metal::run::MetalTensor,
     scale: f64,
     window: Option<usize>,
+    mode: KvAttentionMode,
     output: &runtime::metal::run::MetalTensor,
     staging: &[runtime::metal::run::MetalTensor],
 ) -> err::Res<()> {
@@ -2707,7 +2749,12 @@ pub(crate) fn kv_attention_into(
         advances,
         paged::IntoResources::empty(),
     )?;
-    paged::attention_into(
+    let attend = if mode == KvAttentionMode::BidirectionalBlock {
+        paged::attention_block_into
+    } else {
+        paged::attention_into
+    };
+    attend(
         q,
         kv.pool.k[layer].metal()?,
         kv.pool.v[layer].metal()?,
@@ -2736,6 +2783,7 @@ fn kv_prepare(
     state: &mut SeqState,
     layer: usize,
     window: Option<usize>,
+    mode: KvAttentionMode,
     h: usize,
     d: usize,
     t: usize,
@@ -2770,7 +2818,13 @@ fn kv_prepare(
     // frontier on. Blocks fully below the frontier are dead and their
     // capacity is reclaimed, so a windowed sequence's footprint is
     // O(window) however long it generates.
-    let start = window.map_or(0, |w| needed.saturating_sub(w));
+    let start = window.map_or(0, |w| {
+        if mode == KvAttentionMode::BidirectionalBlock {
+            cursor.saturating_sub(w)
+        } else {
+            needed.saturating_sub(w)
+        }
+    });
     if needed - start > pool.max_tokens {
         return Err(format!(
             "kv attention: live context {} exceeds pool capacity {}",
@@ -4033,6 +4087,77 @@ impl Drop for ShadowSequences {
     }
 }
 
+fn contiguous_f32_tensor(value: &value::Value, operation: &str) -> err::Res<MetalTensor> {
+    let tensor = value.as_metal()?;
+    if tensor.dtype != DType::F32 || !tensor.layout.is_contiguous() {
+        return Err(format!("{operation}: expected a contiguous f32 tensor"));
+    }
+    Ok(tensor.clone())
+}
+
+fn f32_values(tensor: &MetalTensor) -> &[f32] {
+    // SAFETY: `contiguous_f32_tensor` validated dtype/layout, stateful execution
+    // synchronized the buffer before returning outputs, and the tensor owns the
+    // underlying Metal allocation for the lifetime of the returned slice.
+    unsafe {
+        std::slice::from_raw_parts(
+            tensor
+                .buffer
+                .contents_ptr()
+                .cast::<f32>()
+                .add(tensor.layout.offset()),
+            tensor.numel(),
+        )
+    }
+}
+
+fn probabilities_f32(
+    logits: &[f32],
+    options: SamplingOptions,
+    cancelled: &effect_torch_runtime::CancellationFlag,
+) -> err::Res<Vec<f64>> {
+    effective_probabilities(
+        logits.len(),
+        |index| logits[index] as f64,
+        options,
+        || cancelled.load(Ordering::Relaxed),
+    )
+}
+
+fn sample_f32_at(
+    probabilities: &[f32],
+    sampling: InferenceSampling,
+    sequence_id: u64,
+    position: u64,
+    purpose: SamplingPurpose,
+    subcounter: u64,
+) -> u32 {
+    if sampling.temperature == 0.0 {
+        return probabilities
+            .iter()
+            .position(|probability| *probability > 0.0)
+            .unwrap_or(0) as u32;
+    }
+    let total: f64 = probabilities
+        .iter()
+        .map(|probability| *probability as f64)
+        .sum();
+    let mut draw = random_unit_at(sampling_coordinate(
+        sampling.seed,
+        sequence_id,
+        position,
+        purpose,
+        subcounter,
+    )) * total;
+    for (token, probability) in probabilities.iter().enumerate() {
+        draw -= *probability as f64;
+        if draw < 0.0 {
+            return token as u32;
+        }
+    }
+    probabilities.len().saturating_sub(1) as u32
+}
+
 fn read_float_tensor(value: &value::Value) -> err::Res<Vec<f64>> {
     let tensor = value.as_metal()?;
     if !tensor.layout.is_contiguous() {
@@ -4091,6 +4216,30 @@ fn token_input(
         _ => return Err("executeSpeculative: token input must be u32 or i64".to_string()),
     };
     value::value_from_bytes(&bytes, &[batch, time], dtype)
+}
+
+fn token_vector(
+    tokens: &[u32],
+    lanes: &[usize],
+    batch: usize,
+    dtype: DType,
+) -> err::Res<value::Value> {
+    let mut dense = vec![0u32; batch];
+    for (token, lane) in tokens.iter().zip(lanes) {
+        dense[*lane] = *token;
+    }
+    let bytes = match dtype {
+        DType::U32 => dense
+            .iter()
+            .flat_map(|token| token.to_ne_bytes())
+            .collect::<Vec<_>>(),
+        DType::I64 => dense
+            .iter()
+            .flat_map(|token| (*token as i64).to_ne_bytes())
+            .collect::<Vec<_>>(),
+        _ => return Err("ParallelBlock anchor input must be u32 or i64".to_string()),
+    };
+    value::value_from_bytes(&bytes, &[batch], dtype)
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -4215,6 +4364,203 @@ fn run_speculative_program(
         &context,
         &|| true,
     )
+}
+
+fn run_stateful_values(
+    executable: &Arc<executable::MetalExecutable>,
+    generated: &[value::Value],
+    schema: KvStateSchema,
+    shadow: &ShadowSequences,
+    request_indices: &[usize],
+    lanes: &[usize],
+    bindings: &[value::Value],
+    tokens: Vec<Vec<u32>>,
+    cancelled: &effect_torch_runtime::CancellationFlag,
+) -> err::Res<Vec<value::Value>> {
+    let states = request_indices
+        .iter()
+        .map(|index| shadow.states[*index].clone())
+        .collect::<Vec<_>>();
+    for (state, tokens) in states.iter().zip(&tokens) {
+        state
+            .lock()
+            .map_err(|error| format!("parallel replay shadow lock poisoned: {error}"))?
+            .advance = tokens.len();
+    }
+    let context = KvContext {
+        pool: shadow.pool.clone(),
+        slots: states,
+        schema,
+        tokens,
+        lanes: lanes.to_vec(),
+        packed_rows: None,
+        packed_positions: None,
+        publish_hashes: false,
+    };
+    executable::execute_stateful(
+        executable,
+        bindings,
+        generated,
+        cancelled,
+        &context,
+        &|| true,
+    )
+}
+
+fn replay_outputs(
+    replay: &ReplayProgram,
+    shadow: &ShadowSequences,
+    source_outputs: &[value::Value],
+    tap_outputs: &[usize],
+    request_indices: &[usize],
+    lanes: &[usize],
+    tokens: Vec<Vec<u32>>,
+    cancelled: &effect_torch_runtime::CancellationFlag,
+) -> err::Res<()> {
+    let bindings = tap_outputs
+        .iter()
+        .map(|output| {
+            source_outputs
+                .get(*output)
+                .cloned()
+                .ok_or_else(|| "parallel replay target tap is unavailable".to_string())
+        })
+        .collect::<err::Res<Vec<_>>>()?;
+    run_stateful_values(
+        &replay.executable,
+        &replay.generated,
+        replay.schema,
+        shadow,
+        request_indices,
+        lanes,
+        &bindings,
+        tokens,
+        cancelled,
+    )?;
+    Ok(())
+}
+
+fn run_parallel_prefill(
+    target: &SpeculativeProgram,
+    replay: &ReplayProgram,
+    plan: &RetainedProposerPlan,
+    target_shadow: &ShadowSequences,
+    proposer_shadow: &ShadowSequences,
+    slots: &[usize],
+    prompts: &[Vec<u32>],
+    cancelled: &effect_torch_runtime::CancellationFlag,
+) -> err::Res<Vec<value::Value>> {
+    let mut offsets = vec![0usize; prompts.len()];
+    let mut final_outputs = vec![None; prompts.len()];
+    loop {
+        let active = (0..prompts.len())
+            .filter(|index| offsets[*index] < prompts[*index].len())
+            .collect::<Vec<_>>();
+        if active.is_empty() {
+            break;
+        }
+        let tokens = active
+            .iter()
+            .map(|index| {
+                let end = (offsets[*index] + target.time).min(prompts[*index].len());
+                let chunk = prompts[*index][offsets[*index]..end].to_vec();
+                offsets[*index] = end;
+                chunk
+            })
+            .collect::<Vec<_>>();
+        let outputs = run_speculative_program(
+            target,
+            target_shadow,
+            &active,
+            slots,
+            tokens.clone(),
+            None,
+            cancelled,
+        )?;
+        replay_outputs(
+            replay,
+            proposer_shadow,
+            &outputs,
+            &plan.prefill_tap_outputs,
+            &active,
+            &active.iter().map(|index| slots[*index]).collect::<Vec<_>>(),
+            tokens,
+            cancelled,
+        )?;
+        for index in active {
+            final_outputs[index] = Some(outputs[slots[index]].clone());
+        }
+    }
+    for (target, proposer) in target_shadow.states.iter().zip(&proposer_shadow.states) {
+        let target_cursor = target
+            .lock()
+            .map_err(|error| format!("parallel target prefill shadow lock poisoned: {error}"))?
+            .cursor;
+        let proposer_cursor = proposer
+            .lock()
+            .map_err(|error| format!("parallel replay prefill shadow lock poisoned: {error}"))?
+            .cursor;
+        if target_cursor != proposer_cursor {
+            return Err("parallel prefill target/proposer cursors diverged".to_string());
+        }
+    }
+    final_outputs
+        .into_iter()
+        .map(|output| output.ok_or_else(|| "parallel prefill produced no logits".to_string()))
+        .collect()
+}
+
+fn read_u32_tensor(value: &value::Value) -> err::Res<Vec<u32>> {
+    let tensor = value.as_metal()?;
+    if tensor.dtype != DType::U32 || !tensor.layout.is_contiguous() {
+        return Err("ParallelBlock candidate output must be contiguous u32".to_string());
+    }
+    let offset = tensor.layout.offset();
+    if offset + tensor.numel() > tensor.buffer.size / DType::U32.size_in_bytes() {
+        return Err("ParallelBlock candidate output exceeds its buffer".to_string());
+    }
+    Ok((0..tensor.numel())
+        .map(|index| unsafe {
+            *tensor
+                .buffer
+                .contents_ptr()
+                .cast::<u32>()
+                .add(offset + index)
+        })
+        .collect())
+}
+
+fn sample_greedy_verification_rows(
+    outputs: &[value::Value],
+    packed: &PackedVerificationPlan,
+    sampling: &[SamplingOptions],
+    cancelled: &effect_torch_runtime::CancellationFlag,
+) -> err::Res<Option<(Vec<usize>, Vec<u32>)>> {
+    if !sampling.iter().all(|options| options.temperature == 0.0) {
+        return Ok(None);
+    }
+    let result = crate::sampling::sample_greedy_rows(outputs[0].as_metal()?)?;
+    device::MetalDevice::get().synchronize_buffer(&result.buffer)?;
+    if cancelled.is_cancelled() {
+        return Err("parallel greedy sampling was cancelled".to_string());
+    }
+    let values = result.buffer.contents_ptr().cast::<u32>();
+    let rows = result.numel() / 2;
+    let mut tokens = Vec::with_capacity(rows);
+    for row in 0..rows {
+        let status = unsafe { *values.add(row * 2) };
+        let token = unsafe { *values.add(row * 2 + 1) };
+        if status == crate::sampling::STATUS_NONFINITE {
+            return Err(format!("sample: logit {token} is not finite"));
+        }
+        if status != crate::sampling::STATUS_OK {
+            return Err(format!(
+                "sample: GPU sampler returned unknown status {status}"
+            ));
+        }
+        tokens.push(token);
+    }
+    Ok(Some((packed.row_offsets.clone(), tokens)))
 }
 
 fn run_prefill_program(
@@ -4523,6 +4869,362 @@ fn execute_history_lookup_blocking(
         cut_speculative_page(&mut page, &eos_tokens[lane], page_limits[lane]);
         stats.accepted[lane] = accepted.min(page.len());
         pages.push(page);
+    }
+    if cancelled.load(Ordering::Relaxed) {
+        return Err("operation aborted".to_string());
+    }
+    Ok(pages)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn execute_parallel_blocking(
+    target: &SpeculativeProgram,
+    replay: &ReplayProgram,
+    plan: &RetainedProposerPlan,
+    target_shadow: &mut ShadowSequences,
+    proposal_shadow: &ShadowSequences,
+    replay_shadow: &ShadowSequences,
+    slots: &[usize],
+    pending: &[u32],
+    sampling: &[SamplingOptions],
+    max_draft_tokens: usize,
+    page_limits: &[u32],
+    eos_tokens: &[Vec<u32>],
+    cancelled: &effect_torch_runtime::CancellationFlag,
+    sequence_ids: &[u64],
+    positions: &[u64],
+    stats: &mut SpeculativeStats,
+) -> err::Res<Vec<Vec<u32>>> {
+    let stage = &plan.stages[0];
+    let stage_schema = stage
+        .schema
+        .ok_or_else(|| "ParallelBlock stage state is unavailable".to_string())?;
+    let proposal_limits = target_shadow
+        .states
+        .iter()
+        .zip(page_limits)
+        .map(|(state, limit)| {
+            let cursor = state
+                .lock()
+                .map_err(|error| format!("parallel target shadow lock poisoned: {error}"))?
+                .cursor;
+            if cursor >= target.schema.max_tokens {
+                return Err("ParallelBlock target cursor is exhausted".to_string());
+            }
+            Ok(max_draft_tokens
+                .min(*limit as usize - 1)
+                .min(target.schema.max_tokens - cursor - 1))
+        })
+        .collect::<err::Res<Vec<_>>>()?;
+    let pending_value = token_vector(pending, slots, stage_schema.graph_batch, target.token_dtype)?;
+    let mut dynamic = HashMap::new();
+    dynamic.insert("PendingTokens".to_string(), pending_value);
+    let mut bindings = plan.schema.stages[0]
+        .inputs
+        .iter()
+        .map(|binding| {
+            resolve_routed_value(plan, &binding.value, &[], &dynamic, &[], 0)
+                .map(|value| (binding.slot, value))
+        })
+        .collect::<err::Res<Vec<_>>>()?;
+    bindings.sort_by_key(|(slot, _)| *slot);
+    let bindings = bindings
+        .into_iter()
+        .map(|(_, value)| value)
+        .collect::<Vec<_>>();
+    let proposal_active = (0..pending.len())
+        .filter(|index| proposal_limits[*index] > 0)
+        .collect::<Vec<_>>();
+    let trained_draft_tokens = plan.schema.trained_max_rows as usize;
+    let proposal_tokens = proposal_active
+        .iter()
+        .map(|index| vec![pending[*index]; trained_draft_tokens + 1])
+        .collect::<Vec<_>>();
+    let started = std::time::Instant::now();
+    let (dense_candidates, draft_probabilities) = if proposal_active.is_empty() {
+        (vec![0; stage_schema.batch * trained_draft_tokens], None)
+    } else {
+        let proposal_outputs = run_stateful_values(
+            &stage.executable,
+            &stage.generated,
+            stage_schema,
+            proposal_shadow,
+            &proposal_active,
+            &proposal_active
+                .iter()
+                .map(|index| slots[*index])
+                .collect::<Vec<_>>(),
+            &bindings,
+            proposal_tokens,
+            cancelled,
+        )?;
+        if proposal_outputs.len() == 2 {
+            let tensor = contiguous_f32_tensor(
+                &proposal_outputs[1],
+                "ParallelBlock proposal probabilities",
+            )?;
+            let probabilities = f32_values(&tensor);
+            let mut sampled = vec![0; stage_schema.batch * trained_draft_tokens];
+            for lane in &proposal_active {
+                for row in 0..proposal_limits[*lane] {
+                    let start = (slots[*lane] * trained_draft_tokens + row) * target.vocabulary;
+                    let q = &probabilities[start..start + target.vocabulary];
+                    sampled[slots[*lane] * trained_draft_tokens + row] = sample_f32_at(
+                        q,
+                        InferenceSampling {
+                            temperature: sampling[*lane].temperature,
+                            top_k: sampling[*lane].top_k,
+                            top_p: sampling[*lane].top_p,
+                            seed: sampling[*lane].seed,
+                        },
+                        sequence_ids[*lane],
+                        positions[*lane] + row as u64,
+                        SamplingPurpose::Proposal,
+                        0,
+                    );
+                }
+            }
+            (sampled, Some(tensor))
+        } else {
+            (read_u32_tensor(&proposal_outputs[0])?, None)
+        }
+    };
+    let candidates = slots
+        .iter()
+        .zip(&proposal_limits)
+        .map(|(slot, limit)| {
+            dense_candidates[*slot * trained_draft_tokens..*slot * trained_draft_tokens + *limit]
+                .to_vec()
+        })
+        .collect::<Vec<_>>();
+    stats.proposed = candidates.iter().map(Vec::len).sum();
+    stats.draft_nanos = started.elapsed().as_nanos().max(1) as u64;
+
+    let verify_tokens = pending
+        .iter()
+        .zip(&candidates)
+        .map(|(pending, candidates)| {
+            std::iter::once(*pending)
+                .chain(candidates.iter().copied())
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    let cursors = target_shadow
+        .states
+        .iter()
+        .map(|state| {
+            state
+                .lock()
+                .map(|state| state.cursor)
+                .map_err(|error| format!("parallel target shadow lock poisoned: {error}"))
+        })
+        .collect::<err::Res<Vec<_>>>()?;
+    let packed = packed_verification_plan(
+        target.schema.graph_batch,
+        target
+            .packed_rows_per_sequence
+            .ok_or_else(|| "ParallelBlock verifier packed layout is missing".to_string())?,
+        &cursors,
+        &verify_tokens,
+    )?;
+    let verify_started = std::time::Instant::now();
+    let outputs = run_speculative_program(
+        target,
+        target_shadow,
+        &(0..pending.len()).collect::<Vec<_>>(),
+        slots,
+        verify_tokens,
+        Some(&packed),
+        cancelled,
+    )?;
+    stats.verification_nanos = verify_started.elapsed().as_nanos().max(1) as u64;
+    let target_logits = if draft_probabilities.is_some() {
+        Some(contiguous_f32_tensor(
+            &outputs[0],
+            "ParallelBlock target logits",
+        )?)
+    } else {
+        None
+    };
+    let greedy_samples = if draft_probabilities.is_none() {
+        sample_greedy_verification_rows(&outputs, &packed, sampling, cancelled)?
+    } else {
+        None
+    };
+    let mut pages = Vec::with_capacity(pending.len());
+    for lane in 0..pending.len() {
+        let mut page = Vec::with_capacity(candidates[lane].len() + 1);
+        let mut rejected = false;
+        let mut accepted = 0;
+        for (candidate_index, &candidate) in candidates[lane].iter().enumerate() {
+            let (matrix, _) = executable::route_leading_row(
+                &outputs[0],
+                packed.row_offsets[lane] + candidate_index,
+            )?;
+            let (logits, _) = executable::route_leading_row(&matrix, 0)?;
+            let sampled = if let Some(proposal_probabilities) = &draft_probabilities {
+                let target_start = (packed.row_offsets[lane] + candidate_index) * target.vocabulary;
+                let target_values = f32_values(
+                    target_logits
+                        .as_ref()
+                        .expect("probability-routed ParallelBlock retains target logits"),
+                );
+                let p = probabilities_f32(
+                    &target_values[target_start..target_start + target.vocabulary],
+                    sampling[lane],
+                    cancelled,
+                )?;
+                let proposal_start =
+                    (slots[lane] * trained_draft_tokens + candidate_index) * target.vocabulary;
+                let proposal_values = f32_values(proposal_probabilities);
+                let q = &proposal_values[proposal_start..proposal_start + target.vocabulary];
+                let accept = if sampling[lane].temperature == 0.0 {
+                    p[candidate as usize] > 0.0
+                } else {
+                    let probability =
+                        (p[candidate as usize] / q[candidate as usize] as f64).min(1.0);
+                    random_unit_at(sampling_coordinate(
+                        sampling[lane].seed,
+                        sequence_ids[lane],
+                        positions[lane] + candidate_index as u64,
+                        SamplingPurpose::Accept,
+                        0,
+                    )) < probability
+                };
+                if accept {
+                    candidate
+                } else {
+                    let residual = p
+                        .iter()
+                        .zip(q)
+                        .map(|(p, q)| (p - *q as f64).max(0.0))
+                        .collect::<Vec<_>>();
+                    sample_at(
+                        &residual,
+                        InferenceSampling {
+                            temperature: sampling[lane].temperature,
+                            top_k: sampling[lane].top_k,
+                            top_p: sampling[lane].top_p,
+                            seed: sampling[lane].seed,
+                        },
+                        sequence_ids[lane],
+                        positions[lane] + candidate_index as u64,
+                        SamplingPurpose::Residual,
+                        0,
+                    )
+                }
+            } else if let Some((offsets, tokens)) = &greedy_samples {
+                tokens[offsets[lane] + candidate_index]
+            } else {
+                sample_blocking(
+                    &logits,
+                    SamplingOptions {
+                        seed: coordinate_seed(
+                            sampling[lane].seed,
+                            sequence_ids[lane],
+                            positions[lane] + candidate_index as u64,
+                            SamplingPurpose::Target,
+                            0,
+                        ),
+                        counter: 0,
+                        ..sampling[lane]
+                    },
+                    cancelled,
+                )
+                .map_err(|error| error.reason)?
+            };
+            if sampled == candidate {
+                page.push(candidate);
+                accepted += 1;
+            } else {
+                page.push(sampled);
+                rejected = true;
+                break;
+            }
+        }
+        if !rejected {
+            let bonus = candidates[lane].len();
+            let (matrix, _) =
+                executable::route_leading_row(&outputs[0], packed.row_offsets[lane] + bonus)?;
+            let (logits, _) = executable::route_leading_row(&matrix, 0)?;
+            page.push(if draft_probabilities.is_some() {
+                let target_start = (packed.row_offsets[lane] + bonus) * target.vocabulary;
+                let target_values = f32_values(
+                    target_logits
+                        .as_ref()
+                        .expect("probability-routed ParallelBlock retains target logits"),
+                );
+                let p = probabilities_f32(
+                    &target_values[target_start..target_start + target.vocabulary],
+                    sampling[lane],
+                    cancelled,
+                )?;
+                sample_at(
+                    &p,
+                    InferenceSampling {
+                        temperature: sampling[lane].temperature,
+                        top_k: sampling[lane].top_k,
+                        top_p: sampling[lane].top_p,
+                        seed: sampling[lane].seed,
+                    },
+                    sequence_ids[lane],
+                    positions[lane] + bonus as u64,
+                    SamplingPurpose::Target,
+                    0,
+                )
+            } else if let Some((offsets, tokens)) = &greedy_samples {
+                tokens[offsets[lane] + bonus]
+            } else {
+                sample_blocking(
+                    &logits,
+                    SamplingOptions {
+                        seed: coordinate_seed(
+                            sampling[lane].seed,
+                            sequence_ids[lane],
+                            positions[lane] + bonus as u64,
+                            SamplingPurpose::Target,
+                            0,
+                        ),
+                        counter: 0,
+                        ..sampling[lane]
+                    },
+                    cancelled,
+                )
+                .map_err(|error| error.reason)?
+            });
+        }
+        cut_speculative_page(&mut page, &eos_tokens[lane], page_limits[lane]);
+        stats.accepted[lane] = accepted.min(page.len());
+        pages.push(page);
+    }
+    let consumed = pending
+        .iter()
+        .zip(&pages)
+        .map(|(pending, page)| {
+            std::iter::once(*pending)
+                .chain(page.iter().copied())
+                .take(page.len())
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    replay_outputs(
+        replay,
+        replay_shadow,
+        &outputs,
+        &plan.verify_tap_outputs,
+        &(0..pending.len()).collect::<Vec<_>>(),
+        &(0..pending.len()).collect::<Vec<_>>(),
+        consumed,
+        cancelled,
+    )?;
+    for (lane, state) in replay_shadow.states.iter().enumerate() {
+        let cursor = state
+            .lock()
+            .map_err(|error| format!("parallel replay shadow lock poisoned: {error}"))?
+            .cursor;
+        if cursor != cursors[lane] + pages[lane].len() {
+            return Err("ParallelBlock replay did not preserve target cursor parity".to_string());
+        }
     }
     if cancelled.load(Ordering::Relaxed) {
         return Err("operation aborted".to_string());
@@ -5120,6 +5822,82 @@ fn compatible_pool(program: &SpeculativeProgram, pool: &Arc<PoolInner>) -> bool 
         && pool.conv == program.schema.conv
 }
 
+fn same_inference_state(left: KvStateSchema, right: KvStateSchema) -> bool {
+    left.max_tokens == right.max_tokens
+        && left.block_size == right.block_size
+        && left.kv_dtype == right.kv_dtype
+        && left.window == right.window
+        && left.batch == right.batch
+        && left.graph_batch == right.graph_batch
+        && left.layers == right.layers
+        && left.kv_heads == right.kv_heads
+        && left.head_dim == right.head_dim
+        && left.kda == right.kda
+        && left.conv == right.conv
+}
+
+fn validate_replay_program(
+    replay: &Executable,
+    pool: &Arc<PoolInner>,
+    batch: usize,
+    target: &Executable,
+    tap_outputs: &[usize],
+) -> Result<ReplayProgram> {
+    let state = replay
+        .state
+        .as_ref()
+        .ok_or_else(|| plan_error("ParallelBlock replay executable must be stateful"))?;
+    let slots = replay
+        .inner
+        .slots
+        .iter()
+        .enumerate()
+        .filter(|(index, slot)| {
+            !slot.scalar && !(state.cursor_tensor && *index as u32 == state.cursor_slot)
+        })
+        .map(|(_, slot)| slot)
+        .collect::<Vec<_>>();
+    let outputs = &target.inner.executable.program.outputs;
+    let values = &target.inner.executable.program.values;
+    if state.schema.batch != batch
+        || state.packed_rows_per_sequence.is_some()
+        || !compatible_pool_schema(state.schema, pool)
+        || slots.len() != tap_outputs.len()
+        || replay.inner.slots.iter().any(|slot| slot.scalar)
+    {
+        return Err(plan_error(
+            "ParallelBlock replay state or input count is invalid",
+        ));
+    }
+    for (slot, &physical) in slots.iter().zip(tap_outputs) {
+        let source = outputs
+            .get(physical)
+            .and_then(|output| values.get(output.index()))
+            .ok_or_else(|| plan_error("ParallelBlock replay tap output is missing"))?;
+        if slot.dtype != source.dtype || slot.shape.as_slice() != source.shape.as_ref() {
+            return Err(plan_error(
+                "ParallelBlock replay input does not match its physical target tap",
+            ));
+        }
+    }
+    Ok(ReplayProgram {
+        executable: replay.inner.executable.clone(),
+        generated: replay.inner.generated_bindings.clone(),
+        schema: state.schema,
+    })
+}
+
+fn compatible_pool_schema(schema: KvStateSchema, pool: &Arc<PoolInner>) -> bool {
+    pool.max_tokens == schema.max_tokens
+        && pool.block_size == schema.block_size
+        && pool.dtype == schema.kv_dtype
+        && pool.k.len() == schema.layers
+        && pool.kv_heads == schema.kv_heads
+        && pool.head_dim == schema.head_dim
+        && pool.kda == schema.kda
+        && pool.conv == schema.conv
+}
+
 fn read_prompt(tensor: &NativeTensor, dtype: DType, max_time: usize) -> Result<Vec<u32>> {
     let value = tensor.val_cloned()?;
     if value.dtype() != dtype || value.shape().len() != 2 || value.shape()[0] != 1 {
@@ -5332,6 +6110,11 @@ struct InferencePrograms {
     proposer_prefill: Option<SpeculativeProgram>,
     proposer_decode: Option<SpeculativeProgram>,
     proposer_pool: Option<Arc<PoolInner>>,
+    replay_prefill: Option<ReplayProgram>,
+    #[allow(dead_code)]
+    replay_decode: Option<ReplayProgram>,
+    replay_verify: Option<ReplayProgram>,
+    replay_pool: Option<Arc<PoolInner>>,
     max_draft_tokens: usize,
     batch: usize,
     sampling: InferenceSampling,
@@ -5458,6 +6241,8 @@ pub struct NativeProposerPlan {
 struct RetainedStageProgram {
     executable: Arc<executable::MetalExecutable>,
     generated: Vec<value::Value>,
+    schema: Option<KvStateSchema>,
+    packed_rows_per_sequence: Option<usize>,
 }
 
 #[allow(dead_code)]
@@ -5466,6 +6251,15 @@ struct RetainedProposerPlan {
     stages: Vec<RetainedStageProgram>,
     shared: Vec<value::Value>,
     target_decode_prefix_outputs: usize,
+    prefill_tap_outputs: Vec<usize>,
+    verify_tap_outputs: Vec<usize>,
+}
+
+#[derive(Clone)]
+struct ReplayProgram {
+    executable: Arc<executable::MetalExecutable>,
+    generated: Vec<value::Value>,
+    schema: KvStateSchema,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -5700,11 +6494,11 @@ fn validate_and_retain_proposer_plan(
         let outputs = &executable.inner.executable.program.outputs;
         let values = &executable.inner.executable.program.values;
         let mut layers = HashSet::new();
+        let mut roots = HashSet::new();
         for tap in taps {
-            if !layers.insert(tap.layer) {
+            if !layers.insert(tap.layer) || !roots.insert(tap.output) {
                 return Err(plan_error(format!(
-                    "declares {label} hidden layer {} twice",
-                    tap.layer
+                    "declares duplicate {label} hidden layer or output root"
                 )));
             }
             let physical_output = (tap.output as usize)
@@ -5778,19 +6572,10 @@ fn validate_and_retain_proposer_plan(
                 plan_error(format!("shared tensor index {} is missing", binding.tensor))
             })?;
         let value = tensor.val_cloned()?;
-        if !schema_matches(
-            &NativeProposerValueSchema {
-                shape: binding.shape.clone(),
-                dtype: binding.dtype,
-            },
-            value.shape(),
-            value.dtype(),
-        ) {
-            return Err(plan_error(format!(
-                "shared target tensor {} metadata does not match",
-                binding.name
-            )));
-        }
+        // GGUF leaves expose encoded physical storage here. The logical schema
+        // is validated in TypeScript and the executable validates the physical
+        // binding before execution.
+        drop(value);
     }
     if plan.stages.is_empty() || stage_executables.len() != plan.stages.len() {
         return Err(plan_error("stage executable count does not match stages"));
@@ -5808,12 +6593,18 @@ fn validate_and_retain_proposer_plan(
             )));
         }
         let executable = stage_executables[stage.executable.unwrap() as usize];
+        let state = executable.state.as_ref();
         let tensor_slots = executable
             .inner
             .slots
             .iter()
             .enumerate()
-            .filter(|(_, slot)| !slot.scalar)
+            .filter(|(index, slot)| {
+                !slot.scalar
+                    && !state.is_some_and(|state| {
+                        state.cursor_tensor && *index as u32 == state.cursor_slot
+                    })
+            })
             .collect::<Vec<_>>();
         if executable.inner.slots.iter().any(|slot| slot.scalar)
             || stage.inputs.len() != tensor_slots.len()
@@ -5842,7 +6633,9 @@ fn validate_and_retain_proposer_plan(
                     ))
                 })?;
             if let Some(source) = validate_plan_ref(&binding.value, stage_index, &plan)? {
-                if !schema_matches(&source, &declared.shape, declared.dtype) {
+                if binding.value.kind != "SharedBinding"
+                    && !schema_matches(&source, &declared.shape, declared.dtype)
+                {
                     return Err(plan_error(format!(
                         "stage {stage_index} slot {} route metadata does not match",
                         binding.slot
@@ -5928,6 +6721,11 @@ fn validate_and_retain_proposer_plan(
             RetainedStageProgram {
                 executable: executable.inner.executable.clone(),
                 generated: executable.inner.generated_bindings.clone(),
+                schema: executable.state.as_ref().map(|state| state.schema),
+                packed_rows_per_sequence: executable
+                    .state
+                    .as_ref()
+                    .and_then(|state| state.packed_rows_per_sequence),
             }
         })
         .collect();
@@ -5936,11 +6734,23 @@ fn validate_and_retain_proposer_plan(
         .iter()
         .map(|binding| shared_target_tensors[binding.tensor as usize].val_cloned())
         .collect::<Result<Vec<_>>>()?;
+    let prefill_tap_outputs = plan
+        .target_prefill_taps
+        .iter()
+        .map(|tap| prefill_prefix + tap.output as usize - 1)
+        .collect();
+    let verify_tap_outputs = plan
+        .target_verify_taps
+        .iter()
+        .map(|tap| tap.output as usize)
+        .collect();
     Ok(RetainedProposerPlan {
         schema: plan,
         stages,
         shared,
         target_decode_prefix_outputs: decode_prefix,
+        prefill_tap_outputs,
+        verify_tap_outputs,
     })
 }
 
@@ -6134,6 +6944,10 @@ impl NativeInferenceArtifact {
         proposer_plan: Option<NativeProposerPlan>,
         stage_executables: Option<Vec<&Executable>>,
         shared_target_tensors: Option<Vec<&NativeTensor>>,
+        replay_prefill: Option<&Executable>,
+        replay_decode: Option<&Executable>,
+        replay_verify: Option<&Executable>,
+        replay_pool: Option<&NativeKvPool>,
     ) -> Result<Self> {
         let generalized = proposer_plan.is_some();
         if generalized
@@ -6207,11 +7021,11 @@ impl NativeInferenceArtifact {
             ));
         }
         if proposer_complete {
+            let draft = max_draft_tokens.unwrap() as usize;
             let prefill = proposer_prefill.as_ref().unwrap();
             let decode = proposer_decode.as_ref().unwrap();
             let verify = target_verify.as_ref().unwrap();
             let pool = proposer_pool.as_ref().unwrap();
-            let draft = max_draft_tokens.unwrap() as usize;
             if prefill.batch != batch
                 || decode.batch != batch
                 || verify.batch != batch
@@ -6253,6 +7067,20 @@ impl NativeInferenceArtifact {
             }
         }
         let sampling = inference_sampling(sampling)?;
+        let replay_present = replay_prefill.is_some()
+            || replay_decode.is_some()
+            || replay_verify.is_some()
+            || replay_pool.is_some();
+        if replay_present
+            != (replay_prefill.is_some()
+                && replay_decode.is_some()
+                && replay_verify.is_some()
+                && replay_pool.is_some())
+        {
+            return Err(plan_error(
+                "ParallelBlock requires a complete replay bundle",
+            ));
+        }
         let unexpected_plan_handles = proposer_plan.is_none()
             && (stage_executables
                 .as_ref()
@@ -6287,6 +7115,8 @@ impl NativeInferenceArtifact {
                             .state
                             .as_ref()
                             .map_or(1, |state| state.schema.batch),
+                        prefill_tap_outputs: Vec::new(),
+                        verify_tap_outputs: Vec::new(),
                     })
                 } else {
                     validate_and_retain_proposer_plan(
@@ -6304,11 +7134,153 @@ impl NativeInferenceArtifact {
         if unexpected_plan_handles {
             return Err(plan_error("handle arrays require a proposerPlan"));
         }
-        if proposer_plan.is_some() && history_lookup.is_none() {
-            return Err(plan_error(
-                "generalized proposer round orchestration is not implemented",
-            ));
-        }
+        let (replay_prefill, replay_decode, replay_verify, replay_pool) = if let Some(plan) =
+            proposer_plan.as_ref().filter(|_| history_lookup.is_none())
+        {
+            let schema = &plan.schema;
+            let has_probability_rows = schema.output.probability_rows.is_some();
+            let valid_probability_route = if has_probability_rows {
+                schema.output.probabilities == "CausalNormalized"
+                    && schema.stages[0].outputs.len() == 2
+                    && schema
+                        .output
+                        .probability_rows
+                        .as_ref()
+                        .is_some_and(|route| {
+                            route.kind == "StageOutput"
+                                && route.stage == Some(0)
+                                && route.output == Some(1)
+                                && route.row.is_none()
+                                && route.select_row != Some(true)
+                        })
+            } else {
+                schema.output.probabilities == "Unavailable" && schema.stages[0].outputs.len() == 1
+            };
+            let parallel = schema.stages.len() == 1
+                && schema.stages[0].operation_id == "ParallelBlock"
+                && schema.stages[0].layout_id.as_deref() == Some("parallel-block")
+                && valid_probability_route
+                && schema.state.kind == "Kv"
+                && schema
+                    .state
+                    .schema_id
+                    .as_ref()
+                    .is_some_and(|id| !id.is_empty())
+                && schema.commit.as_ref().is_some_and(|commit| {
+                    commit.kind == "Replay"
+                        && commit.stage.is_none()
+                        && commit.stages.as_deref() == Some(&[0])
+                })
+                && schema.output.topology == "Chains"
+                && schema.output.parents.is_none()
+                && schema.output.confidence.is_none()
+                && schema.output.token_ids.kind == "StageOutput"
+                && schema.output.token_ids.stage == Some(0)
+                && schema.output.token_ids.output == Some(0)
+                && schema.output.token_ids.row.is_none()
+                && schema.output.token_ids.select_row != Some(true)
+                && schema.token_map.kind == "Identity"
+                && schema.token_map.proposer_vocabulary.is_none()
+                && schema.token_map.target_ids.is_none()
+                && schema.trained_max_rows >= max_draft_tokens.unwrap_or(0);
+            let stage_routes = &schema.stages[0].inputs;
+            let valid_routes = stage_routes
+                .iter()
+                .filter(|binding| binding.value.kind == "PendingTokens")
+                .count()
+                == 1
+                && stage_routes.iter().all(|binding| {
+                    matches!(
+                        binding.value.kind.as_str(),
+                        "PendingTokens" | "SharedBinding"
+                    )
+                });
+            if !parallel || !valid_routes || !replay_present {
+                return Err(plan_error(
+                    "generalized execution requires one replayable ParallelBlock stage",
+                ));
+            }
+            let stage = &plan.stages[0];
+            let stage_schema = stage
+                .schema
+                .ok_or_else(|| plan_error("ParallelBlock stage must be stateful"))?;
+            let stage_outputs = &stage.executable.program.outputs;
+            let stage_values = &stage.executable.program.values;
+            if stage.packed_rows_per_sequence.is_some()
+                || stage_outputs.len() != if has_probability_rows { 2 } else { 1 }
+                || stage_outputs
+                    .first()
+                    .and_then(|output| stage_values.get(output.index()))
+                    .is_none_or(|output| {
+                        output.dtype != DType::U32
+                            || output.shape.as_ref() != [batch, schema.trained_max_rows as usize]
+                    })
+                || (has_probability_rows
+                    && stage_outputs
+                        .get(1)
+                        .and_then(|output| stage_values.get(output.index()))
+                        .is_none_or(|output| {
+                            output.dtype != DType::F32
+                                || output.shape.as_ref()
+                                    != schema.stages[0].outputs[1]
+                                        .shape
+                                        .iter()
+                                        .map(|dimension| *dimension as usize)
+                                        .collect::<Vec<_>>()
+                        }))
+            {
+                return Err(plan_error(
+                    "ParallelBlock stage must output one u32 [batch, trainedMaxRows] tensor",
+                ));
+            }
+            let pool = &replay_pool.expect("complete replay bundle").inner;
+            let prefill = validate_replay_program(
+                replay_prefill.expect("complete replay bundle"),
+                pool,
+                batch,
+                target_prefill_program,
+                &plan.prefill_tap_outputs,
+            )?;
+            let decode_taps = schema
+                .target_decode_taps
+                .iter()
+                .map(|tap| batch + tap.output as usize - 1)
+                .collect::<Vec<_>>();
+            let decode = validate_replay_program(
+                replay_decode.expect("complete replay bundle"),
+                pool,
+                batch,
+                target_decode_program,
+                &decode_taps,
+            )?;
+            let verify = validate_replay_program(
+                replay_verify.expect("complete replay bundle"),
+                pool,
+                batch,
+                target_verify_program.expect("parallel verifier"),
+                &plan.verify_tap_outputs,
+            )?;
+            if !same_inference_state(prefill.schema, decode.schema)
+                || !same_inference_state(prefill.schema, verify.schema)
+                || !same_inference_state(prefill.schema, stage_schema)
+                || prefill.schema.max_tokens != target_prefill.schema.max_tokens
+            {
+                return Err(plan_error(
+                    "ParallelBlock proposal and replay state geometry is incompatible",
+                ));
+            }
+            (
+                Some(prefill),
+                Some(decode),
+                Some(verify),
+                Some(pool.clone()),
+            )
+        } else {
+            if replay_present {
+                return Err(plan_error("replay bundle requires ParallelBlock"));
+            }
+            (None, None, None, None)
+        };
         Ok(Self {
             programs: Arc::new(InferencePrograms {
                 target_prefill,
@@ -6318,6 +7290,10 @@ impl NativeInferenceArtifact {
                 proposer_prefill,
                 proposer_decode,
                 proposer_pool,
+                replay_prefill,
+                replay_decode,
+                replay_verify,
+                replay_pool,
                 max_draft_tokens: max_draft_tokens.unwrap_or(0) as usize,
                 batch,
                 sampling,
@@ -6391,13 +7367,18 @@ impl NativeInferenceArtifact {
                     .target_pool_high_water_blocks
                     .load(Ordering::Relaxed),
             ),
-            proposer_pool_high_water_blocks: self.programs.proposer_pool.as_ref().map(|_| {
-                bigint(
-                    self.diagnostics
-                        .proposer_pool_high_water_blocks
-                        .load(Ordering::Relaxed),
-                )
-            }),
+            proposer_pool_high_water_blocks: self
+                .programs
+                .proposer_pool
+                .as_ref()
+                .or(self.programs.replay_pool.as_ref())
+                .map(|_| {
+                    bigint(
+                        self.diagnostics
+                            .proposer_pool_high_water_blocks
+                            .load(Ordering::Relaxed),
+                    )
+                }),
             last_round_id: self
                 .diagnostics
                 .has_round
@@ -6650,8 +7631,10 @@ impl NativeInferenceSession {
             let target = (0..prompts.len())
                 .map(|_| make_managed_sequence(&programs.target_pool))
                 .collect::<Result<Vec<_>>>()?;
-            for (sequence, prompt) in target.iter().zip(&prompts) {
-                sequence.prefill_match(prompt.clone())?;
+            if programs.replay_prefill.is_none() {
+                for (sequence, prompt) in target.iter().zip(&prompts) {
+                    sequence.prefill_match(prompt.clone())?;
+                }
             }
             let target_states = target
                 .iter()
@@ -6660,14 +7643,6 @@ impl NativeInferenceSession {
             let mut target_shadow =
                 ShadowSequences::new(programs.target_pool.clone(), &target_states)
                     .map_err(to_napi_err)?;
-            let outputs = run_prefill_program(
-                &programs.target_prefill,
-                &target_shadow,
-                &slots,
-                &prompts,
-                cancelled,
-            )
-            .map_err(to_napi_err)?;
             let (proposer, mut proposer_shadow, proposer_states) =
                 if let (Some(prefill), Some(pool)) =
                     (&programs.proposer_prefill, &programs.proposer_pool)
@@ -6687,9 +7662,45 @@ impl NativeInferenceSession {
                     run_prefill_program(prefill, &shadow, &slots, &prompts, cancelled)
                         .map_err(to_napi_err)?;
                     (Some(sequences), Some(shadow), states)
+                } else if let Some(pool) = &programs.replay_pool {
+                    let sequences = (0..prompts.len())
+                        .map(|_| make_managed_sequence(pool))
+                        .collect::<Result<Vec<_>>>()?;
+                    let states = sequences
+                        .iter()
+                        .map(|sequence| sequence.state.clone())
+                        .collect::<Vec<_>>();
+                    let shadow =
+                        ShadowSequences::new(pool.clone(), &states).map_err(to_napi_err)?;
+                    (Some(sequences), Some(shadow), states)
                 } else {
                     (None, None, Vec::new())
                 };
+            let outputs = if let (Some(replay), Some(plan), Some(proposer_shadow)) = (
+                &programs.replay_prefill,
+                &programs.proposer_plan,
+                proposer_shadow.as_ref(),
+            ) {
+                run_parallel_prefill(
+                    &programs.target_prefill,
+                    replay,
+                    plan,
+                    &target_shadow,
+                    proposer_shadow,
+                    &slots,
+                    &prompts,
+                    cancelled,
+                )
+            } else {
+                run_prefill_program(
+                    &programs.target_prefill,
+                    &target_shadow,
+                    &slots,
+                    &prompts,
+                    cancelled,
+                )
+            }
+            .map_err(to_napi_err)?;
             let mut pages = Vec::with_capacity(prompts.len());
             let mut policies = Vec::with_capacity(prompts.len());
             for index in 0..prompts.len() {
@@ -6774,7 +7785,11 @@ impl NativeInferenceSession {
             diagnostics
                 .target_pool_high_water_blocks
                 .fetch_max(programs.target_pool.live_blocks(), Ordering::Relaxed);
-            if let Some(pool) = &programs.proposer_pool {
+            if let Some(pool) = programs
+                .proposer_pool
+                .as_ref()
+                .or(programs.replay_pool.as_ref())
+            {
                 diagnostics
                     .proposer_pool_high_water_blocks
                     .fetch_max(pool.live_blocks(), Ordering::Relaxed);
@@ -6911,7 +7926,90 @@ impl NativeInferenceSession {
                 .map(inference_options)
                 .collect::<Vec<_>>();
             let (pages, mut proposer_shadow, proposer_states) =
-                if let (Some(verify), Some(config)) =
+                if let (Some(verify), Some(replay), Some(pool), Some(plan)) = (
+                    &programs.target_verify,
+                    &programs.replay_verify,
+                    &programs.replay_pool,
+                    programs.proposer_plan.as_ref(),
+                ) {
+                    let proposer_states = selected
+                        .iter()
+                        .map(|lane| {
+                            lane.proposer
+                                .as_ref()
+                                .expect("validated ParallelBlock proposer")
+                                .state
+                                .clone()
+                        })
+                        .collect::<Vec<_>>();
+                    for (target, proposer) in target_states.iter().zip(&proposer_states) {
+                        let target_cursor = target
+                            .lock()
+                            .map_err(|error| Error::new(Status::GenericFailure, error.to_string()))?
+                            .cursor;
+                        let proposer_cursor = proposer
+                            .lock()
+                            .map_err(|error| Error::new(Status::GenericFailure, error.to_string()))?
+                            .cursor;
+                        if target_cursor != proposer_cursor {
+                            return Err(Error::new(
+                                Status::GenericFailure,
+                                "inference[proposal]: target/proposer cursors diverged",
+                            ));
+                        }
+                    }
+                    let proposal_shadow = ShadowSequences::new(pool.clone(), &proposer_states)
+                        .map_err(to_napi_err)?;
+                    let replay_shadow = ShadowSequences::new(pool.clone(), &proposer_states)
+                        .map_err(to_napi_err)?;
+                    let mut stats = SpeculativeStats {
+                        accepted: vec![0; selected.len()],
+                        ..SpeculativeStats::default()
+                    };
+                    let pages = execute_parallel_blocking(
+                        verify,
+                        replay,
+                        plan,
+                        &mut target_shadow,
+                        &proposal_shadow,
+                        &replay_shadow,
+                        &slots,
+                        &pending,
+                        &options,
+                        programs.max_draft_tokens,
+                        &page_limits,
+                        &eos,
+                        cancelled,
+                        &ids,
+                        &positions,
+                        &mut stats,
+                    )
+                    .map_err(to_napi_err)?;
+                    diagnostics
+                        .speculative_rounds
+                        .fetch_add(1, Ordering::Relaxed);
+                    diagnostics
+                        .proposed_tokens
+                        .fetch_add(stats.proposed as u64, Ordering::Relaxed);
+                    diagnostics.accepted_tokens.fetch_add(
+                        stats.accepted.iter().sum::<usize>() as u64,
+                        Ordering::Relaxed,
+                    );
+                    diagnostics
+                        .draft_nanos
+                        .fetch_add(stats.draft_nanos, Ordering::Relaxed);
+                    diagnostics
+                        .verification_nanos
+                        .fetch_add(stats.verification_nanos, Ordering::Relaxed);
+                    if let Ok(mut histogram) = diagnostics.accepted_length_histogram.lock() {
+                        for accepted in stats.accepted {
+                            if let Some(count) = histogram.get_mut(accepted) {
+                                *count += 1;
+                            }
+                        }
+                    }
+                    (pages, Some(replay_shadow), proposer_states)
+                } else if let (Some(verify), Some(config)) =
                     (&programs.target_verify, programs.history_lookup)
                 {
                     let histories = selected
@@ -7113,7 +8211,11 @@ impl NativeInferenceSession {
             diagnostics
                 .target_pool_high_water_blocks
                 .fetch_max(programs.target_pool.live_blocks(), Ordering::Relaxed);
-            if let Some(pool) = &programs.proposer_pool {
+            if let Some(pool) = programs
+                .proposer_pool
+                .as_ref()
+                .or(programs.replay_pool.as_ref())
+            {
                 diagnostics
                     .proposer_pool_high_water_blocks
                     .fetch_max(pool.live_blocks(), Ordering::Relaxed);
@@ -7779,9 +8881,7 @@ pub fn compile(
             .packed_causal_chains
             .as_ref()
             .map(|layout| layout.rows_per_sequence as usize);
-        if packed_rows_per_sequence == Some(0)
-            || (packed_rows_per_sequence.is_some() && state.last_token_row.unwrap_or(false))
-        {
+        if packed_rows_per_sequence == Some(0) {
             return Err(Error::new(
                 Status::InvalidArg,
                 "compile: packed causal-chain rows must be positive and use all-row outputs",
@@ -7794,11 +8894,34 @@ pub fn compile(
         let graph_batch = layout
             .graph_rows()
             .map_err(|error| Error::new(Status::InvalidArg, error))?;
-        let (rewritten, geometry) = specialize_decode_layout(
+        if state.last_token_row.is_some() && state.output_selections.is_some() {
+            return Err(Error::new(
+                Status::InvalidArg,
+                "compile: last_token_row and output_selections are mutually exclusive",
+            ));
+        }
+        let output_selections = state.output_selections.clone().map_or_else(
+            || {
+                vec![
+                    if state.last_token_row.unwrap_or(false) {
+                        DecodeOutputSelection::SplitLastTokenRow
+                    } else {
+                        DecodeOutputSelection::AllRows
+                    };
+                    nodes.len()
+                ]
+            },
+            |selections| selections.into_iter().map(Into::into).collect(),
+        );
+        let (rewritten, geometry) = specialize_decode_layout_outputs_with_attention(
             &nodes,
             requested_window,
             layout,
-            state.last_token_row.unwrap_or(false),
+            &output_selections,
+            state
+                .current_block_attention
+                .map(Into::into)
+                .unwrap_or_default(),
         )
         .map_err(|error| Error::new(Status::GenericFailure, error))?;
         nodes = rewritten;
@@ -8937,6 +10060,8 @@ mod epilogue_tests {
                 batch: 1,
                 packed_causal_chains: None,
                 last_token_row: Some(true),
+                output_selections: None,
+                current_block_attention: None,
             }),
             None,
         )
@@ -8972,6 +10097,41 @@ mod epilogue_tests {
         assert_eq!(state.advance, 0);
         assert!(state.blocks.is_empty());
         assert_eq!(pool.free_blocks(), free_blocks);
+    }
+
+    #[test]
+    fn per_root_decode_outputs_split_logits_and_batch_hidden_rows() {
+        let logits = LazyTensor {
+            node: mleaf(vec![0.0; 2 * 3 * 8], vec![2, 3, 8]),
+        };
+        let hidden = LazyTensor {
+            node: mleaf(vec![0.0; 2 * 3 * 6], vec![2, 3, 6]),
+        };
+        let executable = compile(
+            vec![&logits, &hidden],
+            None,
+            Some(NativeKvStateSchema {
+                max_tokens: 8,
+                block_size: 4,
+                kv_dtype: NativeDType::F32,
+                window: None,
+                batch: 2,
+                packed_causal_chains: None,
+                last_token_row: None,
+                output_selections: Some(vec![
+                    NativeDecodeOutputSelection::SplitLastTokenRow,
+                    NativeDecodeOutputSelection::BatchedLastTokenRow,
+                ]),
+                current_block_attention: None,
+            }),
+            None,
+        )
+        .unwrap();
+        let outputs = &executable.inner.executable.signature.outputs;
+        assert_eq!(outputs.len(), 3);
+        assert_eq!(outputs[0].shape, vec![8]);
+        assert_eq!(outputs[1].shape, vec![8]);
+        assert_eq!(outputs[2].shape, vec![2, 6]);
     }
 
     #[test]
@@ -9330,6 +10490,7 @@ mod epilogue_tests {
             kv_heads: 1,
             time: 4,
             head_dim: 2,
+            mode: KvAttentionMode::Causal,
         };
         let allocation_attempts = device::EXECUTABLE_ALLOCATION_ATTEMPTS.load(Ordering::Relaxed);
         {
@@ -9417,6 +10578,7 @@ mod epilogue_tests {
             kv_heads: 1,
             time: 1,
             head_dim: 2,
+            mode: KvAttentionMode::Causal,
         };
         {
             let _guard = MetalDevice::get().begin_executable_dispatch().unwrap();
@@ -9489,6 +10651,7 @@ mod epilogue_tests {
             kv_heads: 1,
             time: 1,
             head_dim: 2,
+            mode: KvAttentionMode::Causal,
         };
         {
             let _guard = MetalDevice::get().begin_executable_dispatch().unwrap();
@@ -9554,6 +10717,7 @@ mod epilogue_tests {
             kv_heads: 1,
             time: 1,
             head_dim: 2,
+            mode: KvAttentionMode::Causal,
         };
         {
             let _guard = MetalDevice::get().begin_executable_dispatch().unwrap();
@@ -9596,6 +10760,8 @@ mod epilogue_tests {
                 batch: 1,
                 packed_causal_chains: None,
                 last_token_row: None,
+                output_selections: None,
+                current_block_attention: None,
             }),
             None,
         )
@@ -9706,6 +10872,8 @@ mod epilogue_tests {
                 batch: 1,
                 packed_causal_chains: None,
                 last_token_row: None,
+                output_selections: None,
+                current_block_attention: None,
             }),
             None,
         )
@@ -9891,6 +11059,8 @@ mod epilogue_tests {
                 batch: 1,
                 packed_causal_chains: None,
                 last_token_row: None,
+                output_selections: None,
+                current_block_attention: None,
             }),
             None,
         )

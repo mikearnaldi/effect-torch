@@ -256,7 +256,11 @@ export declare class NativeInferenceArtifact {
     sampling: NativeInferenceSamplingOptions,
     proposerPlan?: NativeProposerPlan | undefined | null,
     stageExecutables?: Array<Executable> | undefined | null,
-    sharedTargetTensors?: Array<NativeTensor> | undefined | null
+    sharedTargetTensors?: Array<NativeTensor> | undefined | null,
+    replayPrefill?: Executable | undefined | null,
+    replayDecode?: Executable | undefined | null,
+    replayVerify?: Executable | undefined | null,
+    replayPool?: NativeKvPool | undefined | null
   )
   open(): NativeInferenceSession
   get inferenceDiagnostics(): NativeInferenceDiagnostics
@@ -587,7 +591,12 @@ export interface NativeKvStateSchema {
   batch: number
   packedCausalChains?: { rowsPerSequence: number }
   lastTokenRow?: boolean
+  outputSelections?: ReadonlyArray<NativeDecodeOutputSelection>
+  currentBlockAttention?: "Causal" | "Bidirectional"
 }
+
+/** Native spelling of per-root decode output selection. @internal */
+export type NativeDecodeOutputSelection = "AllRows" | "SplitLastTokenRow" | "BatchedLastTokenRow"
 
 /** Optional per-sequence recurrent geometry allocated beside KV state. @internal */
 export interface NativeRecurrentStateSchema {

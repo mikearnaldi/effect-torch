@@ -30,33 +30,82 @@ const makeRopeGpt = Effect.gen(function*() {
   return yield* Model.chain(wte, attn, head)
 })
 
+const makeParallelFixture = Effect.gen(function*() {
+  const embedding = yield* Model.embedding("token_embd", VOCAB, EMBED)
+  const attention = yield* Model.multiHeadAttention("attn", EMBED, 1, { causal: true, rope: 10_000 })
+  const head = yield* Model.linear("output", EMBED, VOCAB)
+  const embeddingCount = embedding.names.length
+  const attentionCount = attention.names.length
+  const model = yield* Model.define({
+    parameters: [...embedding.parameters, ...attention.parameters, ...head.parameters],
+    forward: (params, input, trace) =>
+      Effect.gen(function*() {
+        let hidden = yield* embedding.forward(params.slice(0, embeddingCount), input)
+        trace?.hidden(0, hidden)
+        hidden = yield* attention.forward(
+          params.slice(embeddingCount, embeddingCount + attentionCount),
+          hidden
+        )
+        return yield* head.forward(params.slice(embeddingCount + attentionCount), hidden)
+      })
+  })
+  const params = yield* Tensor.compute([
+    ...yield* embedding.init,
+    ...yield* attention.init,
+    yield* Tensor.zeros([EMBED, VOCAB]),
+    yield* Tensor.zeros([1, VOCAB])
+  ])
+  const headsFirst = (hidden: Tensor.Any) =>
+    Effect.gen(function*() {
+      const [batch, rows] = hidden.shape
+      return yield* Tensor.transpose(yield* Tensor.reshape(hidden, [batch!, rows!, 1, EMBED]), [0, 2, 1, 3])
+    })
+  const proposer = Speculation.parallelBlock({
+    params: [],
+    vocabulary: VOCAB,
+    maxDraftTokens: 3,
+    hiddenTaps: [{ layer: 0, dtype: "f32", shape: ["Rows", EMBED] }],
+    tokenEmbedding: { name: "token_embd.weight", dtype: "f32", shape: [VOCAB, EMBED] },
+    lmHead: { name: "output.weight", dtype: "f32", shape: [EMBED, VOCAB] },
+    currentBlockAttention: "Bidirectional",
+    build: (_params, anchorTokens, tokenEmbedding, lmHead) =>
+      Effect.gen(function*() {
+        const batch = anchorTokens.shape[0]!
+        const tokens = yield* Tensor.concat([
+          yield* Tensor.reshape(anchorTokens, [batch, 1]),
+          yield* Tensor.zeros([batch, 3], { dtype: anchorTokens.dtype })
+        ], { dim: 1 })
+        const hidden = yield* Tensor.embedding(tokens, { weight: tokenEmbedding })
+        const heads = yield* headsFirst(hidden)
+        const attended = yield* Tensor.scaledDotProductAttention(heads, heads, heads, {
+          causal: false,
+          scale: 1 / Math.sqrt(EMBED)
+        })
+        const merged = yield* Tensor.reshape(yield* Tensor.transpose(attended, [0, 2, 1, 3]), [batch, 4, EMBED])
+        const logits = yield* Tensor.matmul(merged, lmHead)
+        const candidates = yield* Tensor.slice(logits, { start: [0, 1, 0], end: [batch, 4, VOCAB] })
+        return yield* Tensor.cast(yield* Tensor.argmax(candidates, -1), "u32")
+      }),
+    replay: (_params, [hidden]) =>
+      Effect.gen(function*() {
+        const heads = yield* headsFirst(hidden!)
+        return [{ key: heads, value: heads }]
+      })
+  })
+  return { model, params, proposer }
+})
+
 const ids = (tokens: ReadonlyArray<number>) => Tensor.fromTypedArray(new Uint32Array(tokens), [1, tokens.length])
 
 const historyLookup = (maxDraftTokens: number, minMatchTokens = 1) =>
-  Effect.gen(function*() {
-    const proposer = yield* Speculation.artifact({
-      components: [],
-      plan: {
-        target: { vocabulary: VOCAB },
-        stages: [{
-          operation: {
-            _tag: "HistoryLookup",
-            layout: { id: "suffix-ngram-v1", minMatchTokens, maxMatchTokens: 8 }
-          },
-          inputs: [],
-          outputs: [{ dtype: "u32", shape: ["Rows"] }]
-        }],
-        state: { _tag: "None" },
-        output: {
-          topology: "Chains",
-          probabilities: "Deterministic",
-          tokenIds: { _tag: "StageOutput", stage: 0, output: 0 }
-        },
-        tokenMap: { _tag: "Identity" },
-        trainedMaxRows: maxDraftTokens
-      }
-    })
-    return { proposer, maxDraftTokens }
+  Effect.succeed({
+    proposer: Speculation.historyLookup({
+      vocabulary: VOCAB,
+      maxDraftTokens,
+      minMatchTokens,
+      maxMatchTokens: 8
+    }),
+    maxDraftTokens
   })
 
 const constantOneGpt = Effect.gen(function*() {
@@ -383,17 +432,7 @@ onDevices("Inference", () => (it) => {
       Effect.gen(function*() {
         const model = yield* makeGpt()
         const params = yield* Tensor.compute(yield* model.init)
-        const proposer = yield* Speculation.artifact({
-          components: [{ model, params }],
-          plan: {
-            target: { vocabulary: VOCAB },
-            stages: [{ operation: { _tag: "Autoregressive", component: 0 } }],
-            state: { _tag: "Kv", commit: { _tag: "AutoregressiveChain", stage: 0 } },
-            output: { topology: "Chains", probabilities: "CausalNormalized" },
-            tokenMap: { _tag: "Identity" },
-            trainedMaxRows: 3
-          }
-        })
+        const proposer = Speculation.autoregressive(model, params, { vocabulary: VOCAB, maxDraftTokens: 3 })
         const ordinaryProgram = yield* Model.inference(model, params, {
           maxTokens: 64,
           blockSize: 4,
@@ -431,6 +470,45 @@ onDevices("Inference", () => (it) => {
         expect(yield* speculativeFirst.seq.cursor()).toBe(11)
         yield* ordinary.close()
         yield* speculative.close()
+      }))
+
+    it.effect("parallel replay matches greedy generation across prompt chunks and rounds", () =>
+      Effect.gen(function*() {
+        const { model, params, proposer } = yield* makeParallelFixture
+        const base = {
+          maxTokens: 32,
+          blockSize: 4,
+          prefillChunk: 4,
+          batchSize: 1,
+          sampling: { temperature: 0, seed: 17 }
+        } as const
+        const ordinaryProgram = yield* Model.inference(model, params, base)
+        const parallelProgram = yield* Model.inference(model, params, {
+          ...base,
+          speculation: { proposer, maxDraftTokens: 2 }
+        })
+        const ordinary = yield* ordinaryProgram.generation()
+        const parallel = yield* parallelProgram.generation()
+        let ordinaryPage = (yield* ordinary.add([{ prompt: yield* ids([1, 2, 3, 4, 5, 6]) }]))[0]!
+        const parallelFirst = (yield* parallel.add([{ prompt: yield* ids([1, 2, 3, 4, 5, 6]) }]))[0]!
+        expect(parallelFirst.tokens).toEqual(ordinaryPage.tokens)
+
+        for (let round = 0; round < 2; round++) {
+          const parallelPage = (yield* parallel.step([{ seq: parallelFirst.seq }]))[0]!
+          expect(parallelPage.tokens).toHaveLength(3)
+          const expected: Array<number> = []
+          for (let index = 0; index < parallelPage.tokens.length; index++) {
+            ordinaryPage = (yield* ordinary.step([{ seq: ordinaryPage.seq }]))[0]!
+            expected.push(...ordinaryPage.tokens)
+          }
+          expect(parallelPage.tokens).toEqual(expected)
+        }
+        expect(yield* parallelFirst.seq.cursor()).toBe(yield* ordinaryPage.seq.cursor())
+        const diagnostics = yield* parallelProgram.diagnostics()
+        expect(diagnostics.proposedTokens).toBe(4n)
+        expect(diagnostics.acceptedTokens).toBe(4n)
+        yield* ordinary.close()
+        yield* parallel.close()
       }))
 
     it.effect("history lookup is pathwise equal to ordinary seeded sampling", () =>
@@ -524,17 +602,7 @@ onDevices("Inference", () => (it) => {
       Effect.gen(function*() {
         const model = yield* makeGpt()
         const params = yield* Tensor.compute(yield* model.init)
-        const proposer = yield* Speculation.artifact({
-          components: [{ model, params }],
-          plan: {
-            target: { vocabulary: VOCAB },
-            stages: [{ operation: { _tag: "Autoregressive", component: 0 } }],
-            state: { _tag: "Kv", commit: { _tag: "AutoregressiveChain", stage: 0 } },
-            output: { topology: "Chains", probabilities: "CausalNormalized" },
-            tokenMap: { _tag: "Identity" },
-            trainedMaxRows: 4
-          }
-        })
+        const proposer = Speculation.autoregressive(model, params, { vocabulary: VOCAB, maxDraftTokens: 4 })
         const program = yield* Model.inference(model, params, {
           maxTokens: 64,
           blockSize: 4,
@@ -555,17 +623,7 @@ onDevices("Inference", () => (it) => {
       Effect.gen(function*() {
         const model = yield* makeGpt()
         const params = yield* Tensor.compute(yield* model.init)
-        const proposer = yield* Speculation.artifact({
-          components: [{ model, params }],
-          plan: {
-            target: { vocabulary: VOCAB },
-            stages: [{ operation: { _tag: "Autoregressive", component: 0 } }],
-            state: { _tag: "Kv", commit: { _tag: "AutoregressiveChain", stage: 0 } },
-            output: { topology: "Chains", probabilities: "CausalNormalized" },
-            tokenMap: { _tag: "Identity" },
-            trainedMaxRows: 3
-          }
-        })
+        const proposer = Speculation.autoregressive(model, params, { vocabulary: VOCAB, maxDraftTokens: 3 })
         const program = yield* Model.inference(model, params, {
           maxTokens: 128,
           blockSize: 4,
@@ -592,17 +650,7 @@ onDevices("Inference", () => (it) => {
       Effect.gen(function*() {
         const model = yield* makeGpt()
         const params = yield* Tensor.compute(yield* model.init)
-        const proposer = yield* Speculation.artifact({
-          components: [{ model, params }],
-          plan: {
-            target: { vocabulary: VOCAB },
-            stages: [{ operation: { _tag: "Autoregressive", component: 0 } }],
-            state: { _tag: "Kv", commit: { _tag: "AutoregressiveChain", stage: 0 } },
-            output: { topology: "Chains", probabilities: "CausalNormalized" },
-            tokenMap: { _tag: "Identity" },
-            trainedMaxRows: 3
-          }
-        })
+        const proposer = Speculation.autoregressive(model, params, { vocabulary: VOCAB, maxDraftTokens: 3 })
         const speculativeProgram = yield* Model.inference(model, params, {
           maxTokens: 64,
           blockSize: 4,
@@ -653,17 +701,7 @@ onDevices("Inference", () => (it) => {
       Effect.gen(function*() {
         const model = yield* makeGpt()
         const params = yield* Tensor.compute(yield* model.init)
-        const proposer = yield* Speculation.artifact({
-          components: [{ model, params }],
-          plan: {
-            target: { vocabulary: VOCAB },
-            stages: [{ operation: { _tag: "Autoregressive", component: 0 } }],
-            state: { _tag: "Kv", commit: { _tag: "AutoregressiveChain", stage: 0 } },
-            output: { topology: "Chains", probabilities: "CausalNormalized" },
-            tokenMap: { _tag: "Identity" },
-            trainedMaxRows: 2
-          }
-        })
+        const proposer = Speculation.autoregressive(model, params, { vocabulary: VOCAB, maxDraftTokens: 2 })
         const program = yield* Model.inference(model, params, {
           maxTokens: 32,
           blockSize: 4,
@@ -693,17 +731,7 @@ onDevices("Inference", () => (it) => {
       Effect.gen(function*() {
         const model = yield* makeGpt()
         const params = yield* Tensor.compute(yield* model.init)
-        const proposer = yield* Speculation.artifact({
-          components: [{ model, params }],
-          plan: {
-            target: { vocabulary: VOCAB },
-            stages: [{ operation: { _tag: "Autoregressive", component: 0 } }],
-            state: { _tag: "Kv", commit: { _tag: "AutoregressiveChain", stage: 0 } },
-            output: { topology: "Chains", probabilities: "CausalNormalized" },
-            tokenMap: { _tag: "Identity" },
-            trainedMaxRows: 3
-          }
-        })
+        const proposer = Speculation.autoregressive(model, params, { vocabulary: VOCAB, maxDraftTokens: 3 })
         const config = {
           maxTokens: 128,
           blockSize: 4,
@@ -799,17 +827,7 @@ onDevices("Inference", () => (it) => {
       Effect.gen(function*() {
         const model = yield* makeGpt()
         const params = yield* Tensor.compute(yield* model.init)
-        const proposer = yield* Speculation.artifact({
-          components: [{ model, params }],
-          plan: {
-            target: { vocabulary: VOCAB },
-            stages: [{ operation: { _tag: "Autoregressive", component: 0 } }],
-            state: { _tag: "Kv", commit: { _tag: "AutoregressiveChain", stage: 0 } },
-            output: { topology: "Chains", probabilities: "CausalNormalized" },
-            tokenMap: { _tag: "Identity" },
-            trainedMaxRows: 2
-          }
-        })
+        const proposer = Speculation.autoregressive(model, params, { vocabulary: VOCAB, maxDraftTokens: 2 })
         const program = yield* Model.inference(model, params, {
           maxTokens: 128,
           blockSize: 4,
@@ -834,17 +852,7 @@ onDevices("Inference", () => (it) => {
       Effect.gen(function*() {
         const model = yield* makeGpt()
         const params = yield* Tensor.compute(yield* model.init)
-        const proposer = yield* Speculation.artifact({
-          components: [{ model, params }],
-          plan: {
-            target: { vocabulary: VOCAB },
-            stages: [{ operation: { _tag: "Autoregressive", component: 0 } }],
-            state: { _tag: "Kv", commit: { _tag: "AutoregressiveChain", stage: 0 } },
-            output: { topology: "Chains", probabilities: "CausalNormalized" },
-            tokenMap: { _tag: "Identity" },
-            trainedMaxRows: 4
-          }
-        })
+        const proposer = Speculation.autoregressive(model, params, { vocabulary: VOCAB, maxDraftTokens: 4 })
         const program = yield* Model.inference(model, params, {
           maxTokens: 8,
           blockSize: 4,
@@ -864,17 +872,7 @@ onDevices("Inference", () => (it) => {
       Effect.gen(function*() {
         const model = yield* makeGpt()
         const params = yield* Tensor.compute(yield* model.init)
-        const proposer = yield* Speculation.artifact({
-          components: [{ model, params }],
-          plan: {
-            target: { vocabulary: VOCAB },
-            stages: [{ operation: { _tag: "Autoregressive", component: 0 } }],
-            state: { _tag: "Kv", commit: { _tag: "AutoregressiveChain", stage: 0 } },
-            output: { topology: "Chains", probabilities: "CausalNormalized" },
-            tokenMap: { _tag: "Identity" },
-            trainedMaxRows: 2
-          }
-        })
+        const proposer = Speculation.autoregressive(model, params, { vocabulary: VOCAB, maxDraftTokens: 2 })
         const program = yield* Model.inference(model, params, {
           maxTokens: 32,
           blockSize: 4,
@@ -897,17 +895,7 @@ onDevices("Inference", () => (it) => {
         const model = yield* makeGpt()
         const targetParams = yield* Tensor.compute(yield* model.init)
         const draftParams = yield* Tensor.compute(yield* model.init)
-        const proposer = yield* Speculation.artifact({
-          components: [{ model, params: draftParams }],
-          plan: {
-            target: { vocabulary: VOCAB },
-            stages: [{ operation: { _tag: "Autoregressive", component: 0 } }],
-            state: { _tag: "Kv", commit: { _tag: "AutoregressiveChain", stage: 0 } },
-            output: { topology: "Chains", probabilities: "CausalNormalized" },
-            tokenMap: { _tag: "Identity" },
-            trainedMaxRows: 3
-          }
-        })
+        const proposer = Speculation.autoregressive(model, draftParams, { vocabulary: VOCAB, maxDraftTokens: 3 })
         const ordinaryProgram = yield* Model.inference(model, targetParams, {
           maxTokens: 64,
           blockSize: 4,
@@ -941,17 +929,7 @@ onDevices("Inference", () => (it) => {
       Effect.gen(function*() {
         const model = yield* makeGpt()
         const params = yield* Tensor.compute(yield* model.init)
-        const proposer = yield* Speculation.artifact({
-          components: [{ model, params }],
-          plan: {
-            target: { vocabulary: VOCAB },
-            stages: [{ operation: { _tag: "Autoregressive", component: 0 } }],
-            state: { _tag: "Kv", commit: { _tag: "AutoregressiveChain", stage: 0 } },
-            output: { topology: "Chains", probabilities: "CausalNormalized" },
-            tokenMap: { _tag: "Identity" },
-            trainedMaxRows: 2
-          }
-        })
+        const proposer = Speculation.autoregressive(model, params, { vocabulary: VOCAB, maxDraftTokens: 2 })
         const limit = yield* Effect.flip(Model.inference(model, params, {
           maxTokens: 32,
           speculation: { proposer, maxDraftTokens: 3 }
@@ -962,139 +940,6 @@ onDevices("Inference", () => (it) => {
           speculation: { proposer, maxDraftTokens: 2, schedule: "adaptive" }
         }))
         expect(adaptive.message).toMatch(/adaptive/)
-      }))
-
-    it.effect("validates target-coupled fingerprints and hidden taps before the runtime variant gate", () =>
-      Effect.gen(function*() {
-        const base = yield* makeGpt()
-        const target = yield* Model.define({
-          parameters: base.parameters,
-          target: { graphFingerprint: "gpt-test-v1", checkpointFingerprint: "weights-test-v1" },
-          forward: (params, input, trace) =>
-            Effect.gen(function*() {
-              const logits = yield* base.forward(params, input)
-              trace?.hidden(3, logits)
-              return logits
-            })
-        })
-        const params = yield* Tensor.compute(yield* base.init)
-        const coupled = (graphFingerprint: string, tapShape: Model.ProposerValueSchema["shape"]) =>
-          Speculation.artifact({
-            components: [{ model: base, params }],
-            plan: {
-              target: {
-                graphFingerprint,
-                checkpointFingerprint: "weights-test-v1",
-                vocabulary: VOCAB,
-                tokenMapFingerprint: "identity",
-                hiddenTaps: [{ layer: 3, dtype: "f32", shape: tapShape }],
-                sharedWeights: []
-              },
-              stages: [{
-                operation: { _tag: "ParallelBlock", component: 0, layout: { id: "tap-block-v1" } },
-                inputs: [{ slot: 0, value: { _tag: "TargetHidden", layer: 3 } }],
-                outputs: [
-                  { dtype: "u32", shape: ["Rows"] },
-                  { dtype: "f32", shape: ["Rows", "Vocabulary"] }
-                ]
-              }],
-              state: { _tag: "None" },
-              output: {
-                topology: "Chains",
-                probabilities: "CausalNormalized",
-                tokenIds: { _tag: "StageOutput", stage: 0, output: 0 },
-                probabilityRows: { _tag: "StageOutput", stage: 0, output: 1 }
-              },
-              tokenMap: { _tag: "Identity" },
-              trainedMaxRows: 2
-            }
-          })
-
-        const wrongGraph = yield* coupled("other-graph", ["Rows", "Vocabulary"])
-        const graphError = yield* Effect.flip(Model.inference(target, params, {
-          maxTokens: 32,
-          speculation: { proposer: wrongGraph, maxDraftTokens: 2 }
-        }))
-        expect(graphError.message).toMatch(/graphFingerprint.*gpt-test-v1/)
-
-        const wrongTap = yield* coupled("gpt-test-v1", ["Rows", 1])
-        const tapError = yield* Effect.flip(Model.inference(target, params, {
-          maxTokens: 32,
-          speculation: { proposer: wrongTap, maxDraftTokens: 2 }
-        }))
-        expect(tapError.message).toMatch(/hidden tap 3/)
-
-        const valid = yield* coupled("gpt-test-v1", ["Rows", "Vocabulary"])
-        const unsupported = yield* Effect.flip(Model.inference(target, params, {
-          maxTokens: 32,
-          speculation: { proposer: valid, maxDraftTokens: 2 }
-        }))
-        expect(unsupported.message).toMatch(/only one exact-chain Autoregressive proposer stage/)
-      }))
-
-    it.effect("validates graph-builder outputs before the generalized backend gate", () =>
-      Effect.gen(function*() {
-        const base = yield* makeGpt()
-        const target = yield* Model.define({
-          parameters: base.parameters,
-          forward: (params, input, trace) =>
-            Effect.gen(function*() {
-              const logits = yield* base.forward(params, input)
-              trace?.hidden(2, logits)
-              return logits
-            })
-        })
-        const params = yield* Tensor.compute(yield* base.init)
-        const makeArtifact = (outputs: number) =>
-          Speculation.artifact({
-            components: [{
-              params: [],
-              build: (_, inputs) =>
-                Effect.gen(function*() {
-                  const probabilities = yield* Tensor.softmax(inputs[0]!, { dims: [-1] })
-                  if (outputs === 1) return [probabilities]
-                  return [yield* Tensor.argmax(probabilities, -1), probabilities]
-                })
-            }],
-            plan: {
-              target: {
-                vocabulary: VOCAB,
-                hiddenTaps: [{ layer: 2, dtype: "f32", shape: ["Rows", "Vocabulary"] }],
-                sharedWeights: []
-              },
-              stages: [{
-                operation: { _tag: "SequentialHead", component: 0 },
-                inputs: [{ slot: 0, value: { _tag: "TargetHidden", layer: 2 } }],
-                outputs: [
-                  { dtype: "i64", shape: ["Rows"] },
-                  { dtype: "f32", shape: ["Rows", "Vocabulary"] }
-                ]
-              }],
-              state: { _tag: "None" },
-              output: {
-                topology: "Chains",
-                probabilities: "CausalNormalized",
-                tokenIds: { _tag: "StageOutput", stage: 0, output: 0 },
-                probabilityRows: { _tag: "StageOutput", stage: 0, output: 1 }
-              },
-              tokenMap: { _tag: "Identity" },
-              trainedMaxRows: 2
-            }
-          })
-
-        const malformed = yield* makeArtifact(1)
-        const validation = yield* Effect.flip(Model.inference(target, params, {
-          maxTokens: 32,
-          speculation: { proposer: malformed, maxDraftTokens: 2 }
-        }))
-        expect(validation.message).toMatch(/builder returned 1 outputs; expected 2/)
-
-        const valid = yield* makeArtifact(2)
-        const backend = yield* Effect.flip(Model.inference(target, params, {
-          maxTokens: 32,
-          speculation: { proposer: valid, maxDraftTokens: 2 }
-        }))
-        expect(backend.message).not.toMatch(/stage 0 output|builder returned|cannot resolve/)
       }))
 
     it.effect("lane refill does not change a replacement sequence's RNG identity", () =>

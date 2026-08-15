@@ -1,55 +1,34 @@
-/** Load-only DFlash proposer artifacts for the official Muse-Glimmer checkpoint. */
+/** DFlash proposer graph and GGUF loader. */
 import { Effect } from "effect"
+import * as Schema from "effect/Schema"
 import * as Gguf from "../Gguf.ts"
 import * as Model from "../Model.ts"
 import type * as Runtime from "../Runtime.ts"
+import * as Speculation from "../Speculation.ts"
 import * as Tensor from "../Tensor.ts"
 
 /** Exact GGUF architecture value accepted by this loader. */
 export const architecture = "dflash"
 
-/** GGUF layer-input IDs stored by the checkpoint. */
-export const targetLayers = [2, 14, 26, 38, 50] as const
-
-/** Zero-based Muse residual taps corresponding to {@link targetLayers}. */
-export const targetResidualTaps = [1, 13, 25, 37, 49] as const
-
-export const blockSize = 16
-export const maxDraftTokens = blockSize - 1
-export const hiddenSize = 6656
-export const feedForwardSize = 19968
-export const vocabularySize = 202048
-
-/** One native stateful program required by the DFlash component. */
-export type Program =
-  | {
-    readonly kind: "FeatureFusionKvInjection"
-    readonly targetResidualTaps: typeof targetResidualTaps
-    readonly fusedWidth: number
-    readonly hiddenSize: number
-    readonly kvLayers: number
-    readonly kvHeads: number
-    readonly headDim: number
-  }
-  | {
-    readonly kind: "MaskedNonCausalBlockDecode"
-    readonly blockSize: number
-    readonly maskToken: number
-    readonly hiddenSize: number
-    readonly feedForwardSize: number
-    readonly queryHeads: number
-    readonly kvHeads: number
-    readonly headDim: number
-    readonly slidingWindow: number
-    readonly ropeBase: number
-    readonly rmsEpsilon: number
-    readonly sharedTokenEmbedding: "token_embd.weight"
-    readonly sharedLmHead: "output.weight"
-  }
-
-/** DFlash proposer component retained by the generic proposer artifact. */
-export interface Component extends Model.ProposerGraphComponent {
-  readonly programs: readonly [Program, Program]
+/** Validated canonical DFlash GGUF configuration. */
+export interface Configuration {
+  readonly blockCount: number
+  readonly contextLength: number
+  readonly embeddingLength: number
+  readonly feedForwardLength: number
+  readonly queryHeads: number
+  readonly kvHeads: number
+  readonly keyLength: number
+  readonly valueLength: number
+  readonly rmsEpsilon: number
+  readonly slidingWindow: number
+  readonly ropeBase: number
+  readonly blockSize: number
+  readonly vocabularySize: number
+  readonly maskToken: number
+  readonly targetLayers: ReadonlyArray<number>
+  readonly targetResidualTaps: ReadonlyArray<number>
+  readonly slidingWindowPattern: ReadonlyArray<boolean>
 }
 
 /** Loaded parameters, canonical metadata, and target-coupled proposer artifact. */
@@ -57,192 +36,388 @@ export interface Loaded {
   readonly params: ReadonlyArray<Tensor.Concrete>
   readonly metadata: ReadonlyMap<string, unknown>
   readonly parameters: ReadonlyArray<Model.ParameterSpec>
-  readonly component: Component
-  readonly artifact: Model.ProposerArtifact
+  readonly config: Configuration
+  readonly maxDraftTokens: number
+  readonly artifact: Speculation.ParallelBlock
 }
 
-/** The two native programs required by the checkpoint. */
-export const programs: readonly [Program, Program] = [
-  {
-    kind: "FeatureFusionKvInjection",
-    targetResidualTaps,
-    fusedWidth: targetLayers.length * hiddenSize,
-    hiddenSize,
-    kvLayers: 5,
-    kvHeads: 8,
-    headDim: 128
-  },
-  {
-    kind: "MaskedNonCausalBlockDecode",
-    blockSize,
-    maskToken: 201818,
-    hiddenSize,
-    feedForwardSize,
-    queryHeads: 32,
-    kvHeads: 8,
-    headDim: 128,
-    slidingWindow: 2048,
-    ropeBase: 500000,
-    rmsEpsilon: 1e-5,
-    sharedTokenEmbedding: "token_embd.weight",
-    sharedLmHead: "output.weight"
-  }
-]
+const PositiveInt = Schema.Int.check(Schema.isGreaterThan(0))
+const NonNegativeInt = Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))
+const PositiveFinite = Schema.Finite.check(Schema.isGreaterThan(0))
 
-/** Complete generic proposer contract attached by {@link load}. */
-export const plan: Model.ProposerPlan = {
-  target: {
-    vocabulary: vocabularySize,
-    hiddenTaps: targetResidualTaps.map((layer) => ({ layer, dtype: "f32", shape: ["Rows", hiddenSize] })),
-    sharedWeights: [
-      { kind: "TokenEmbedding", name: "token_embd.weight", dtype: "f32", shape: [vocabularySize, hiddenSize] },
-      { kind: "LmHead", name: "output.weight", dtype: "f32", shape: [vocabularySize, hiddenSize] }
-    ]
-  },
-  stages: [{
-    operation: { _tag: "ParallelBlock", component: 0, layout: { id: "dflash-block-16-v1" } },
-    inputs: [
-      ...targetResidualTaps.map((layer, slot) => ({ slot, value: { _tag: "TargetHidden" as const, layer } })),
-      { slot: 5, value: { _tag: "PendingTokens" } },
-      { slot: 6, value: { _tag: "SharedTokenEmbedding" } },
-      { slot: 7, value: { _tag: "SharedLmHead" } }
-    ],
-    outputs: [{ dtype: "u32", shape: ["Rows"] }]
-  }],
-  state: {
-    _tag: "Kv",
-    schema: { id: "dflash-kv-5x8x128-swa2048-v1" },
-    commit: { _tag: "Replay", stages: [0] }
-  },
-  output: {
-    topology: "Chains",
-    probabilities: "Unavailable",
-    tokenIds: { _tag: "StageOutput", stage: 0, output: 0 }
-  },
-  tokenMap: { _tag: "Identity" },
-  trainedMaxRows: maxDraftTokens
-}
-
-const field = (metadata: ReadonlyMap<string, unknown>, key: string): unknown => metadata.get(key)
-
-const exact = (
-  metadata: ReadonlyMap<string, unknown>,
-  key: string,
-  expected: number
-): Effect.Effect<void, Model.ModelError> => {
-  const actual = field(metadata, key)
-  return actual === expected
-    ? Effect.void
-    : new Model.ModelError({
-      op: "create",
-      message: `DFlash ${key} must be ${expected}, got ${JSON.stringify(actual)}`
-    })
-}
-
-const exactArray = (
-  metadata: ReadonlyMap<string, unknown>,
-  key: string,
-  expected: ReadonlyArray<number | boolean>
-): Effect.Effect<void, Model.ModelError> => {
-  const actual = field(metadata, key)
-  const matches = Array.isArray(actual) && actual.length === expected.length &&
-    actual.every((value, index) => value === expected[index])
-  return matches
-    ? Effect.void
-    : new Model.ModelError({
-      op: "create",
-      message: `DFlash ${key} must be [${expected}], got ${JSON.stringify(actual)}`
-    })
-}
-
-const makeParameters = (
-  metadata: ReadonlyMap<string, unknown>,
-  tensors: ReadonlyArray<Runtime.GgufTensorDescriptor>
-): Effect.Effect<ReadonlyArray<Model.ParameterSpec>, Model.ModelError> =>
-  Effect.gen(function*() {
-    if (field(metadata, "architecture") !== architecture) {
-      return yield* new Model.ModelError({
-        op: "create",
-        message: `DFlash architecture must be exactly ${JSON.stringify(architecture)}`
+const Config = Schema.Struct({
+  architecture: Schema.Literal(architecture),
+  block_count: PositiveInt,
+  context_length: PositiveInt,
+  embedding_length: PositiveInt,
+  feed_forward_length: PositiveInt,
+  "attention.head_count": PositiveInt,
+  "attention.head_count_kv": PositiveInt,
+  "attention.key_length": PositiveInt,
+  "attention.value_length": PositiveInt,
+  "attention.layer_norm_rms_epsilon": PositiveFinite,
+  "attention.sliding_window": PositiveInt,
+  "attention.sliding_window_pattern": Schema.Array(Schema.Boolean),
+  "rope.freq_base": PositiveFinite,
+  block_size: PositiveInt,
+  vocab_size: PositiveInt,
+  "tokenizer.ggml.mask_token_id": NonNegativeInt,
+  target_layers: Schema.Array(PositiveInt)
+}).check(
+  Schema.makeFilter((config) => {
+    const issues: Array<Schema.FilterIssue> = []
+    if (config["attention.head_count"] % config["attention.head_count_kv"] !== 0) {
+      issues.push({
+        path: ["attention.head_count"],
+        issue: "attention.head_count must be divisible by attention.head_count_kv"
       })
     }
-    yield* exact(metadata, "block_count", 5)
-    yield* exact(metadata, "context_length", 131072)
-    yield* exact(metadata, "embedding_length", hiddenSize)
-    yield* exact(metadata, "feed_forward_length", feedForwardSize)
-    yield* exact(metadata, "attention.head_count", 32)
-    yield* exact(metadata, "attention.head_count_kv", 8)
-    yield* exact(metadata, "attention.key_length", 128)
-    yield* exact(metadata, "attention.value_length", 128)
-    yield* exact(metadata, "attention.layer_norm_rms_epsilon", Math.fround(1e-5))
-    yield* exact(metadata, "attention.sliding_window", 2048)
-    yield* exact(metadata, "rope.freq_base", 500000)
-    yield* exact(metadata, "block_size", blockSize)
-    yield* exact(metadata, "vocab_size", vocabularySize)
-    yield* exact(metadata, "tokenizer.ggml.mask_token_id", 201818)
-    yield* exactArray(metadata, "target_layers", targetLayers)
-    yield* exactArray(metadata, "attention.sliding_window_pattern", [true, true, true, true, true])
+    if (config["attention.key_length"] !== config["attention.value_length"]) {
+      issues.push({
+        path: ["attention.value_length"],
+        issue: "attention.value_length must equal attention.key_length"
+      })
+    }
+    if (config["attention.key_length"] % 2 !== 0) {
+      issues.push({ path: ["attention.key_length"], issue: "attention.key_length must be even" })
+    }
+    if (config["attention.sliding_window"] > config.context_length) {
+      issues.push({
+        path: ["attention.sliding_window"],
+        issue: "attention.sliding_window must not exceed context_length"
+      })
+    }
+    if (config.block_size < 2 || config.block_size > config.context_length) {
+      issues.push({ path: ["block_size"], issue: "block_size must be in 2..=context_length" })
+    }
+    if (config["tokenizer.ggml.mask_token_id"] >= config.vocab_size) {
+      issues.push({
+        path: ["tokenizer.ggml.mask_token_id"],
+        issue: "tokenizer.ggml.mask_token_id must be less than vocab_size"
+      })
+    }
+    if (config.target_layers.length < 2) {
+      issues.push({ path: ["target_layers"], issue: "target_layers must contain at least two layers" })
+    } else if (new Set(config.target_layers).size !== config.target_layers.length) {
+      issues.push({ path: ["target_layers"], issue: "target_layers must not contain duplicates" })
+    }
+    const pattern = config["attention.sliding_window_pattern"]
+    if (pattern.length !== config.block_count) {
+      issues.push({
+        path: ["attention.sliding_window_pattern"],
+        issue: "attention.sliding_window_pattern length must equal block_count"
+      })
+    } else if (pattern.some((sliding) => !sliding)) {
+      issues.push({
+        path: ["attention.sliding_window_pattern"],
+        issue: "all draft layers must use sliding-window attention"
+      })
+    }
+    return issues
+  })
+)
+
+type Config = Schema.Schema.Type<typeof Config>
+
+/** Decodes and relationally validates canonical GGUF metadata. */
+export const configuration = (
+  metadata: ReadonlyMap<string, unknown>
+): Effect.Effect<Configuration, Model.ModelError> =>
+  Schema.decodeUnknownEffect(Config)(Object.fromEntries(metadata)).pipe(
+    Effect.map((config: Config) => ({
+      blockCount: config.block_count,
+      contextLength: config.context_length,
+      embeddingLength: config.embedding_length,
+      feedForwardLength: config.feed_forward_length,
+      queryHeads: config["attention.head_count"],
+      kvHeads: config["attention.head_count_kv"],
+      keyLength: config["attention.key_length"],
+      valueLength: config["attention.value_length"],
+      rmsEpsilon: config["attention.layer_norm_rms_epsilon"],
+      slidingWindow: config["attention.sliding_window"],
+      ropeBase: config["rope.freq_base"],
+      blockSize: config.block_size,
+      vocabularySize: config.vocab_size,
+      maskToken: config["tokenizer.ggml.mask_token_id"],
+      targetLayers: config.target_layers,
+      targetResidualTaps: config.target_layers.map((layer) => layer - 1),
+      slidingWindowPattern: config["attention.sliding_window_pattern"]
+    })),
+    Effect.mapError((error) => new Model.ModelError({ op: "create", message: `DFlash config: ${error.message}` }))
+  )
+
+const makeParameters = (
+  metadata: ReadonlyMap<string, unknown>
+): Effect.Effect<ReadonlyArray<Model.ParameterSpec>, Model.ModelError> =>
+  Effect.gen(function*() {
+    const config = yield* configuration(metadata)
 
     const parameters: Array<Model.ParameterSpec> = [
-      { name: "fc.weight", shape: [hiddenSize, targetLayers.length * hiddenSize] },
-      { name: "enc.output_norm.weight", shape: [hiddenSize] }
+      {
+        name: "fc.weight",
+        shape: [config.embeddingLength, config.targetLayers.length * config.embeddingLength]
+      },
+      { name: "enc.output_norm.weight", shape: [config.embeddingLength] }
     ]
-    for (let layer = 0; layer < 5; layer++) {
+    for (let layer = 0; layer < config.blockCount; layer++) {
       const prefix = `blk.${layer}`
       parameters.push(
-        { name: `${prefix}.attn_norm.weight`, shape: [hiddenSize] },
-        { name: `${prefix}.ffn_down.weight`, shape: [hiddenSize, feedForwardSize] },
-        { name: `${prefix}.ffn_gate.weight`, shape: [feedForwardSize, hiddenSize] },
-        { name: `${prefix}.ffn_up.weight`, shape: [feedForwardSize, hiddenSize] },
-        { name: `${prefix}.ffn_norm.weight`, shape: [hiddenSize] },
-        { name: `${prefix}.attn_k_norm.weight`, shape: [128] },
-        { name: `${prefix}.attn_k.weight`, shape: [8 * 128, hiddenSize] },
-        { name: `${prefix}.attn_output.weight`, shape: [hiddenSize, 32 * 128] },
-        { name: `${prefix}.attn_q_norm.weight`, shape: [128] },
-        { name: `${prefix}.attn_q.weight`, shape: [32 * 128, hiddenSize] },
-        { name: `${prefix}.attn_v.weight`, shape: [8 * 128, hiddenSize] }
+        { name: `${prefix}.attn_norm.weight`, shape: [config.embeddingLength] },
+        { name: `${prefix}.ffn_down.weight`, shape: [config.embeddingLength, config.feedForwardLength] },
+        { name: `${prefix}.ffn_gate.weight`, shape: [config.feedForwardLength, config.embeddingLength] },
+        { name: `${prefix}.ffn_up.weight`, shape: [config.feedForwardLength, config.embeddingLength] },
+        { name: `${prefix}.ffn_norm.weight`, shape: [config.embeddingLength] },
+        { name: `${prefix}.attn_k_norm.weight`, shape: [config.keyLength] },
+        { name: `${prefix}.attn_k.weight`, shape: [config.kvHeads * config.keyLength, config.embeddingLength] },
+        {
+          name: `${prefix}.attn_output.weight`,
+          shape: [config.embeddingLength, config.queryHeads * config.valueLength]
+        },
+        { name: `${prefix}.attn_q_norm.weight`, shape: [config.keyLength] },
+        { name: `${prefix}.attn_q.weight`, shape: [config.queryHeads * config.keyLength, config.embeddingLength] },
+        { name: `${prefix}.attn_v.weight`, shape: [config.kvHeads * config.valueLength, config.embeddingLength] }
       )
     }
-    if (tensors.some((tensor) => tensor.name === "output_norm.weight")) {
-      parameters.push({ name: "output_norm.weight", shape: [hiddenSize] })
-    }
+    parameters.push({ name: "output_norm.weight", shape: [config.embeddingLength] })
     return parameters
   })
 
-/** Registry-free GGUF definition used by {@link load} and focused catalog tests. */
+/** Explicit GGUF definition used by {@link loadGGUF} and focused catalog tests. */
 export const definition: Gguf.ParameterArtifactDefinition = {
   architecture,
   parameters: makeParameters
 }
 
-const makeComponent = (params: ReadonlyArray<Tensor.Concrete>): Component => ({
-  params,
-  programs,
-  build: () =>
-    new Model.ModelError({
-      op: "dflashCompile",
-      message:
-        "DFlash requires native feature-fusion/KV-injection and masked non-causal block-decode programs; the generic ParallelBlock tensor graph cannot represent this stateful contract"
+const graphError = (op: string, message: string) => new Model.ModelError({ op, message })
+
+const buildGraph = (config: Configuration) => {
+  const parameterCount = 2 + config.blockCount * 11
+  const checkParams = (op: string, params: Model.Params) =>
+    params.length === parameterCount + 1
+      ? Effect.void
+      : graphError(op, `expected ${parameterCount + 1} parameters, got ${params.length}`)
+  const layerOffset = (layer: number) => 2 + layer * 11
+  const headsFirst = (
+    value: Tensor.Any,
+    heads: number,
+    rows: number,
+    batch?: number
+  ) =>
+    batch === undefined
+      ? Effect.gen(function*() {
+        return yield* Tensor.transpose(
+          yield* Tensor.reshape(value, [rows, heads, config.keyLength]),
+          [1, 0, 2]
+        )
+      })
+      : Effect.gen(function*() {
+        return yield* Tensor.transpose(
+          yield* Tensor.reshape(value, [batch, rows, heads, config.keyLength]),
+          [0, 2, 1, 3]
+        )
+      })
+  const fuse = (params: Model.Params, targetRows: ReadonlyArray<Tensor.Any>) =>
+    Effect.gen(function*() {
+      yield* checkParams("dflashReplay", params)
+      if (targetRows.length !== config.targetResidualTaps.length || targetRows.length < 2) {
+        return yield* graphError(
+          "dflashReplay",
+          `expected ${config.targetResidualTaps.length} target taps, got ${targetRows.length}`
+        )
+      }
+      const features = yield* Tensor.concat(
+        targetRows as readonly [Tensor.Any, Tensor.Any, ...ReadonlyArray<Tensor.Any>],
+        { dim: -1 }
+      )
+      return yield* Tensor.rmsNorm(
+        yield* Tensor.linearRows(features, params[0]!),
+        params[1],
+        config.rmsEpsilon
+      )
     })
-})
 
-const makeArtifact = (
-  component: Component
-): Effect.Effect<Model.ProposerArtifact, Model.InferenceError | Model.ModelError> =>
-  Model.Speculation.artifact({
-    components: [component],
-    plan
+  const replay = (params: Model.Params, targetRows: ReadonlyArray<Tensor.Any>) =>
+    Effect.gen(function*() {
+      const fused = yield* fuse(params, targetRows)
+      if (fused.shape.length !== 2 && fused.shape.length !== 3) {
+        return yield* graphError("dflashReplay", `expected [Rows, E] or [Batch, Rows, E], got [${fused.shape}]`)
+      }
+      const batch = fused.shape.length === 3 ? fused.shape[0] : undefined
+      const rows = fused.shape.length === 3 ? fused.shape[1]! : fused.shape[0]!
+      const layers: Array<Speculation.KeyValue> = []
+      for (let layer = 0; layer < config.blockCount; layer++) {
+        const offset = layerOffset(layer)
+        let key = yield* headsFirst(
+          yield* Tensor.linearRows(fused, params[offset + 6]!),
+          config.kvHeads,
+          rows,
+          batch
+        )
+        const value = yield* headsFirst(
+          yield* Tensor.linearRows(fused, params[offset + 10]!),
+          config.kvHeads,
+          rows,
+          batch
+        )
+        key = yield* Tensor.rmsNorm(key, params[offset + 5], config.rmsEpsilon)
+        key = yield* Tensor.rotaryEmbedding(key, rows, config.ropeBase, { layout: "HalfSplit" })
+        layers.push({ key, value })
+      }
+      return layers
+    })
+
+  const buildOutput = (
+    params: Model.Params,
+    anchorTokens: Tensor.Any,
+    sharedTokenEmbedding: Tensor.Any,
+    sharedLmHead: Tensor.Any,
+    maxDraftTokens: number
+  ) =>
+    Effect.gen(function*() {
+      yield* checkParams("dflashBlock", params)
+      if (anchorTokens.shape.length !== 1) {
+        return yield* graphError("dflashBlock", `expected anchor token rows [Batch], got [${anchorTokens.shape}]`)
+      }
+      const batch = anchorTokens.shape[0]!
+      const blockRows = maxDraftTokens + 1
+      if (maxDraftTokens < 1 || blockRows > config.blockSize) {
+        return yield* graphError(
+          "dflashBlock",
+          `maxDraftTokens must be in [1, ${config.blockSize - 1}], got ${maxDraftTokens}`
+        )
+      }
+      const anchor = yield* Tensor.reshape(anchorTokens, [batch, 1])
+      const masks = yield* Tensor.full([batch, maxDraftTokens], config.maskToken, {
+        dtype: anchorTokens.dtype
+      })
+      const tokens = yield* Tensor.concat([anchor, masks], { dim: 1 })
+      let hidden: Tensor.Any = yield* Tensor.embedding(tokens, { weight: sharedTokenEmbedding })
+
+      for (let layer = 0; layer < config.blockCount; layer++) {
+        const offset = layerOffset(layer)
+        const attentionInput = yield* Tensor.rmsNorm(hidden, params[offset], config.rmsEpsilon)
+        let query = yield* headsFirst(
+          yield* Tensor.linearRows(attentionInput, params[offset + 9]!),
+          config.queryHeads,
+          blockRows,
+          batch
+        )
+        let key = yield* headsFirst(
+          yield* Tensor.linearRows(attentionInput, params[offset + 6]!),
+          config.kvHeads,
+          blockRows,
+          batch
+        )
+        const value = yield* headsFirst(
+          yield* Tensor.linearRows(attentionInput, params[offset + 10]!),
+          config.kvHeads,
+          blockRows,
+          batch
+        )
+        query = yield* Tensor.rmsNorm(query, params[offset + 8], config.rmsEpsilon)
+        key = yield* Tensor.rmsNorm(key, params[offset + 5], config.rmsEpsilon)
+        query = yield* Tensor.rotaryEmbedding(query, blockRows, config.ropeBase, {
+          layout: "HalfSplit"
+        })
+        key = yield* Tensor.rotaryEmbedding(key, blockRows, config.ropeBase, {
+          layout: "HalfSplit"
+        })
+        let attention = yield* Tensor.scaledDotProductAttention(query, key, value, {
+          causal: false,
+          scale: 1 / Math.sqrt(config.keyLength)
+        })
+        attention = yield* Tensor.linearRows(
+          yield* Tensor.reshape(
+            yield* Tensor.transpose(attention, [0, 2, 1, 3]),
+            [batch, blockRows, config.queryHeads * config.valueLength]
+          ),
+          params[offset + 7]!
+        )
+        hidden = yield* Tensor.add(hidden, attention)
+
+        const ffnInput = yield* Tensor.rmsNorm(hidden, params[offset + 4], config.rmsEpsilon)
+        const ffn = yield* Tensor.linearRows(
+          yield* Tensor.mul(
+            yield* Tensor.silu(yield* Tensor.linearRows(ffnInput, params[offset + 2]!)),
+            yield* Tensor.linearRows(ffnInput, params[offset + 3]!)
+          ),
+          params[offset + 1]!
+        )
+        hidden = yield* Tensor.add(hidden, ffn)
+      }
+
+      hidden = yield* Tensor.rmsNorm(hidden, params[parameterCount], config.rmsEpsilon)
+      const logits = yield* Tensor.linearRows(hidden, sharedLmHead)
+      const candidateLogits = yield* Tensor.slice(logits, {
+        start: [0, 1, 0],
+        end: [batch, blockRows, config.vocabularySize]
+      })
+      const tokenIds = yield* Tensor.cast(yield* Tensor.argmax(candidateLogits, -1), "u32")
+      const probabilityRows = yield* Tensor.softmax(candidateLogits, { dims: [-1] })
+      return { tokenIds, probabilityRows }
+    })
+
+  const build = (
+    params: Model.Params,
+    anchorTokens: Tensor.Any,
+    sharedTokenEmbedding: Tensor.Any,
+    sharedLmHead: Tensor.Any,
+    maxDraftTokens: number
+  ): Effect.Effect<Tensor.Lazy, Model.ModelError | Tensor.TensorError, Runtime.Runtime> =>
+    Effect.map(
+      buildOutput(params, anchorTokens, sharedTokenEmbedding, sharedLmHead, maxDraftTokens),
+      ({ tokenIds }) => tokenIds
+    )
+
+  return { build, buildWithProbabilities: buildOutput, replay }
+}
+
+/** Constructs the replayable DFlash parallel-block artifact. */
+export const artifact = (
+  config: Configuration,
+  params: ReadonlyArray<Tensor.Concrete>
+): Speculation.ParallelBlock => {
+  const graph = buildGraph(config)
+  return Speculation.parallelBlock({
+    params,
+    vocabulary: config.vocabularySize,
+    maxDraftTokens: config.blockSize - 1,
+    hiddenTaps: config.targetResidualTaps.map((layer) => ({
+      layer,
+      dtype: "f32",
+      shape: ["Rows", config.embeddingLength]
+    })),
+    tokenEmbedding: {
+      name: "token_embd.weight",
+      dtype: "f32",
+      shape: [config.vocabularySize, config.embeddingLength]
+    },
+    lmHead: {
+      name: "output.weight",
+      dtype: "f32",
+      shape: [config.vocabularySize, config.embeddingLength]
+    },
+    currentBlockAttention: "Bidirectional",
+    attentionWindow: config.slidingWindow,
+    build: graph.build,
+    replay: graph.replay
   })
+}
 
-/** Loads the official Muse-Glimmer DFlash checkpoint as a target-coupled proposer. */
-export const load = (
+/** Loads a DFlash GGUF checkpoint as a target-coupled proposer. */
+export const loadGGUF = (
   path: string
-): Effect.Effect<Loaded, Gguf.GgufError | Model.ModelError | Model.InferenceError, Runtime.Runtime> =>
+): Effect.Effect<Loaded, Gguf.GgufError | Model.ModelError, Runtime.Runtime> =>
   Effect.gen(function*() {
     const loaded = yield* Gguf.loadParameters(path, definition)
-    const component = makeComponent(loaded.params)
-    const artifact = yield* makeArtifact(component).pipe(
-      Effect.onError(() => Effect.ignore(Tensor.clearAll(loaded.params)))
-    )
-    return { ...loaded, component, artifact }
+    return yield* Effect.gen(function*() {
+      const config = yield* configuration(loaded.metadata)
+      const proposer = artifact(config, loaded.params)
+      return {
+        ...loaded,
+        config,
+        maxDraftTokens: config.blockSize - 1,
+        artifact: proposer
+      }
+    }).pipe(Effect.onError(() => Tensor.clearAll(loaded.params)))
   })

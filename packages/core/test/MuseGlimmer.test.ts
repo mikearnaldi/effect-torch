@@ -1,7 +1,7 @@
 import { MuseGlimmer } from "@effect-torch/core/models"
 import { expect, it } from "@effect/vitest"
 import { Effect, Layer } from "effect"
-import { Gguf, Model, Registry, Runtime, type Tensor } from "../src/index.ts"
+import { Gguf, Model, Runtime, type Tensor } from "../src/index.ts"
 
 const configEntries = [
   ["block_count", 52],
@@ -21,7 +21,7 @@ const configEntries = [
   ["vocab_size", 202048]
 ] as const
 
-const config = (): Registry.ModelConfig => new Map<string, unknown>(configEntries)
+const config = (): Gguf.ModelConfig => new Map<string, unknown>(configEntries)
 
 // This shape-only runtime records graph requests and fabricates coherent handles;
 // it deliberately cannot compile or execute. Model validation still observes the
@@ -163,60 +163,81 @@ const expectedLayer = (layer: number) => {
   ]
 }
 
-it.effect("exports and registers only the exact Muse-Glimmer architecture", () => {
+it.effect("exports the exact Muse-Glimmer GGUF definition and loader", () =>
+  Effect.sync(() => {
+    expect(Object.keys(MuseGlimmer).sort()).toEqual(["architecture", "create", "definition", "loadGGUF"])
+    expect(MuseGlimmer.architecture).toBe("muse-glimmer")
+    expect(MuseGlimmer.definition).toEqual({
+      architecture: "muse-glimmer",
+      create: MuseGlimmer.create
+    })
+  }))
+
+it.effect("loadGGUF rejects artifacts for another architecture", () => {
+  const ggufRuntime = {
+    ...runtime,
+    extensions: {
+      gguf: {
+        inspect: () =>
+          Effect.succeed({
+            metadata: [{ key: "general.architecture", value: "other-model" }],
+            tensors: []
+          }),
+        load: () => Effect.die(new Error("load must not be called"))
+      }
+    }
+  } as unknown as Runtime.RuntimeService
   return Effect.gen(function*() {
-    expect(Object.keys(MuseGlimmer).sort()).toEqual(["architecture", "id"])
-    expect(MuseGlimmer.id).toBe("gguf:muse-glimmer")
-    expect(MuseGlimmer.architecture.id).toBe("gguf:muse-glimmer")
-    const registry = yield* Registry.Registry
-    expect(yield* registry.get("gguf:muse-glimmer")).toBe(MuseGlimmer.architecture)
-    expect((yield* Effect.flip(registry.get("muse-glimmer")))._tag).toBe("RegistryError")
-    expect((yield* Effect.flip(registry.get("Muse-Glimmer")))._tag).toBe("RegistryError")
-  }).pipe(Effect.provide(Registry.layer))
+    const error = yield* Effect.flip(MuseGlimmer.loadGGUF("other.gguf"))
+    expect(error._tag).toBe("GgufError")
+    if (error._tag !== "GgufError") throw error
+    expect(error.op).toBe("validate")
+    expect(error.message).toContain("\"muse-glimmer\"")
+  }).pipe(Effect.provide(Layer.succeed(Runtime.Runtime, ggufRuntime)))
 })
 
 it.effect("validates canonical configuration with Schema", () =>
   Effect.gen(function*() {
-    yield* MuseGlimmer.architecture.create(config())
+    yield* MuseGlimmer.create(config())
     for (const [key] of configEntries) {
       const missing = new Map(config())
       missing.delete(key)
-      const missingError = yield* Effect.flip(MuseGlimmer.architecture.create(missing))
+      const missingError = yield* Effect.flip(MuseGlimmer.create(missing))
       expect(missingError._tag).toBe("ModelError")
       expect(missingError.message).toContain(key)
 
       const invalid = new Map(config())
       invalid.set(key, 0)
-      const invalidError = yield* Effect.flip(MuseGlimmer.architecture.create(invalid))
+      const invalidError = yield* Effect.flip(MuseGlimmer.create(invalid))
       expect(invalidError._tag).toBe("ModelError")
       expect(invalidError.message).toContain(key)
     }
 
     const invalidGqa = new Map(config())
     invalidGqa.set("attention.head_count", 31)
-    expect((yield* Effect.flip(MuseGlimmer.architecture.create(invalidGqa))).message).toContain(
+    expect((yield* Effect.flip(MuseGlimmer.create(invalidGqa))).message).toContain(
       "attention.head_count"
     )
 
     const oversizedBlocks = new Map(config())
     oversizedBlocks.set("block_count", 1025)
-    expect((yield* Effect.flip(MuseGlimmer.architecture.create(oversizedBlocks))).message).toContain("block_count")
+    expect((yield* Effect.flip(MuseGlimmer.create(oversizedBlocks))).message).toContain("block_count")
 
     const invalidRope = new Map(config())
     invalidRope.set("attention.key_length", 127)
-    expect((yield* Effect.flip(MuseGlimmer.architecture.create(invalidRope))).message).toContain(
+    expect((yield* Effect.flip(MuseGlimmer.create(invalidRope))).message).toContain(
       "attention.key_length"
     )
 
     const invalidValueWidth = new Map(config())
     invalidValueWidth.set("attention.value_length", 126)
-    const invalidValueWidthError = yield* Effect.flip(MuseGlimmer.architecture.create(invalidValueWidth))
+    const invalidValueWidthError = yield* Effect.flip(MuseGlimmer.create(invalidValueWidth))
     expect(invalidValueWidthError.message).toContain("attention.value_length")
     expect(invalidValueWidthError.message).toContain("attention.key_length")
 
     const invalidWindow = new Map(config())
     invalidWindow.set("attention.sliding_window", 131073)
-    expect((yield* Effect.flip(MuseGlimmer.architecture.create(invalidWindow))).message).toContain(
+    expect((yield* Effect.flip(MuseGlimmer.create(invalidWindow))).message).toContain(
       "attention.sliding_window"
     )
   }))
@@ -240,7 +261,7 @@ it.effect("derives the parameter catalog and graph from configuration", () =>
       ["final_logit_softcapping", 10],
       ["vocab_size", 12]
     ])
-    const model = yield* MuseGlimmer.architecture.create(custom)
+    const model = yield* MuseGlimmer.create(custom)
     expect(model.parameters).toEqual([
       { name: "token_embd.weight", shape: [12, 8] },
       { name: "output_norm.weight", shape: [8] },
@@ -303,14 +324,10 @@ it.effect("receives vocab_size from generic GGUF tokenizer token translation", (
       }
     }
   } as unknown as Runtime.RuntimeService
-  const services = Layer.merge(
-    Registry.emptyLayer,
-    Layer.succeed(Runtime.Runtime, ggufRuntime)
-  )
+  const services = Layer.succeed(Runtime.Runtime, ggufRuntime)
   return Effect.gen(function*() {
-    const registry = yield* Registry.Registry
-    yield* registry.register({
-      id: "gguf:generic-vocab-test",
+    yield* Gguf.loadModel("generic.gguf", {
+      architecture: "generic-vocab-test",
       create: (canonical) => {
         vocabSize = canonical.get("vocab_size")
         return Model.define({
@@ -319,7 +336,6 @@ it.effect("receives vocab_size from generic GGUF tokenizer token translation", (
         })
       }
     })
-    yield* Gguf.load("generic.gguf")
     expect(vocabSize).toBe(3)
   }).pipe(Effect.provide(services))
 })
@@ -344,21 +360,16 @@ it.effect("exposes canonical tokenizer metadata from GGUF loading", () => {
       }
     }
   } as unknown as Runtime.RuntimeService
-  const services = Layer.merge(
-    Registry.emptyLayer,
-    Layer.succeed(Runtime.Runtime, ggufRuntime)
-  )
+  const services = Layer.succeed(Runtime.Runtime, ggufRuntime)
   return Effect.gen(function*() {
-    const registry = yield* Registry.Registry
-    yield* registry.register({
-      id: "gguf:generic-metadata-test",
+    const loaded = yield* Gguf.loadModel("generic.gguf", {
+      architecture: "generic-metadata-test",
       create: () =>
         Model.define({
           parameters: [],
           forward: (_, input) => Effect.succeed(input as Tensor.Lazy)
         })
     })
-    const loaded = yield* Gguf.load("generic.gguf")
     expect(loaded.metadata.get("tokenizer.chat_template")).toBe("{{ messages }}")
     expect(loaded.metadata.get("tokenizer.ggml.bos_token_id")).toBe(1)
     expect(loaded.metadata.get("tokenizer.ggml.eos_token_id")).toBe(2)
@@ -368,7 +379,7 @@ it.effect("exposes canonical tokenizer metadata from GGUF loading", () => {
 
 it.effect("defines the exact load-only parameter catalog", () =>
   Effect.gen(function*() {
-    const model = yield* MuseGlimmer.architecture.create(config())
+    const model = yield* MuseGlimmer.create(config())
     expect(model.parameters).toHaveLength(731)
     expect(model.parameters.slice(0, 3)).toEqual([
       { name: "token_embd.weight", shape: [202048, 6656] },
@@ -387,7 +398,7 @@ it.effect("defines the exact load-only parameter catalog", () =>
 
 it.effect("reports parameter arity and token rank through ModelError", () =>
   Effect.gen(function*() {
-    const model = yield* MuseGlimmer.architecture.create(config())
+    const model = yield* MuseGlimmer.create(config())
     const arityError = yield* Effect.flip(model.forward([], handle("Tensor", [1, 1], "i64")))
     expect(arityError._tag).toBe("ModelError")
     expect(arityError.message).toContain("expected 731 parameters")
@@ -400,7 +411,7 @@ it.effect("reports parameter arity and token rank through ModelError", () =>
 it.effect("builds the canonical graph with 39 local and 13 global layers", () =>
   Effect.gen(function*() {
     requests.length = 0
-    const model = yield* MuseGlimmer.architecture.create(config())
+    const model = yield* MuseGlimmer.create(config())
     const output = yield* model.forward(modelParams(model.parameters), handle("Tensor", [1, 2], "i64"))
     expect(output.shape).toEqual([1, 2, 202048])
 

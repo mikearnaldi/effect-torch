@@ -68,8 +68,8 @@ use effect_torch_compiler::{
     ValueStorage, ValueUse, ARTIFACT_ASSEMBLY_PHASE, PHYSICAL_PLANNING_PHASE, PUBLICATION_PHASE,
 };
 use effect_torch_graph::{
-    node_children, CrossEntropyReduction, Device, Node as GraphNode, NodeKind, PositionOffset,
-    RotaryLayout,
+    node_children, CrossEntropyReduction, Device, KvAttentionMode, Node as GraphNode, NodeKind,
+    PositionOffset, RotaryLayout,
 };
 use effect_torch_runtime::{
     Buffer, CancellationFlag, DType, ExecutableDiagnostics, GgmlKQuant, InstructionId,
@@ -323,6 +323,7 @@ pub enum CpuOp {
         scale: f64,
         layer: u32,
         window: Option<usize>,
+        mode: KvAttentionMode,
     },
     RotaryEmbedding {
         theta: f64,
@@ -2419,6 +2420,7 @@ impl Lowerer {
                 scale,
                 layer,
                 window,
+                mode,
                 ..
             } => {
                 if node.dtype != DType::F32 {
@@ -2431,6 +2433,7 @@ impl Lowerer {
                     scale: *scale,
                     layer: *layer,
                     window: *window,
+                    mode: *mode,
                 }
             }
             NodeKind::RotaryEmbedding {

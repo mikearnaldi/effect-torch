@@ -511,6 +511,15 @@ pub enum RotaryLayout {
     InterleavedPairs,
 }
 
+/// Visibility of newly staged rows in stateful KV attention.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum KvAttentionMode {
+    /// Query row `p` sees committed rows and current rows through `p`.
+    Causal,
+    /// Every query sees committed rows and the complete current block.
+    BidirectionalBlock,
+}
+
 /// One operation in the computation graph.
 ///
 /// Variants fall into the families described in the crate documentation:
@@ -874,8 +883,10 @@ pub enum NodeKind {
     // produced by the decode rewrite (never written by user code —
     // `compile_decode` turns each causal Sdpa into one). Scatters the
     // new tokens' k/v into the sequence's pool blocks at the cursor,
-    // then attends q causally over the last `window` cached positions
-    // (None: the whole context). q, k and v are [1, H, T, D]/[1, H, T, Dv]
+    // then attends q according to `mode` over cached positions. A local
+    // `window` retains that many committed rows; block-bidirectional mode also
+    // retains every current row (None: the whole context). q, k and v are
+    // [1, H, T, D]/[1, H, T, Dv]
     // with a shared T (the new tokens); the pool, block table and
     // cursor arrive via the run's kv context, keeping the graph a pure
     // function of its inputs. Not differentiable.
@@ -886,6 +897,7 @@ pub enum NodeKind {
         scale: f64,
         layer: u32,
         window: Option<usize>,
+        mode: KvAttentionMode,
     },
     // Kimi Delta Attention (RFC 0018): gated delta-rule linear attention
     // as one semantic node (the Sdpa precedent — semantics in the graph,
@@ -2953,6 +2965,7 @@ pub fn remap_children(kind: &NodeKind, f: &dyn Fn(&Arc<Node>) -> Arc<Node>) -> N
             scale,
             layer,
             window,
+            mode,
         } => NodeKind::KvAttention {
             q: f(q),
             k: f(k),
@@ -2960,6 +2973,7 @@ pub fn remap_children(kind: &NodeKind, f: &dyn Fn(&Arc<Node>) -> Arc<Node>) -> N
             scale: *scale,
             layer: *layer,
             window: *window,
+            mode: *mode,
         },
         NodeKind::KdaChunk {
             q,

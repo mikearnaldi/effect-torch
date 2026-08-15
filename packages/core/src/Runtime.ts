@@ -283,6 +283,12 @@ export interface DecodeStateRequest {
    * resolved attention operation is windowed.
    */
   readonly window?: number
+  /**
+   * Visibility of rows staged by the current invocation. `Causal` preserves
+   * autoregressive row-by-row visibility. `Bidirectional` exposes the complete
+   * current block, in addition to committed cache rows. Defaults to `Causal`.
+   */
+  readonly currentBlockAttention?: "Causal" | "Bidirectional"
   /** Positive unsigned 32-bit fixed compiled batch width. */
   readonly batch: number
   /**
@@ -298,7 +304,18 @@ export interface DecodeStateRequest {
    * batch 1, otherwise `batch` `[V]` roots in row order. Defaults to false.
    */
   readonly lastTokenRow?: boolean
+  /**
+   * Root-indexed output policy. The array must have exactly one entry per
+   * compile root. `splitLastTokenRow` preserves the legacy lane-split logits
+   * outputs, `batchedLastTokenRow` emits one `[batch, V]` output, and `allRows`
+   * preserves the root. Mutually exclusive with `lastTokenRow`; packed
+   * causal-chain compilation accepts only `allRows`.
+   */
+  readonly outputSelections?: ReadonlyArray<DecodeOutputSelection>
 }
+
+/** Row retention policy for one decode compile root. */
+export type DecodeOutputSelection = "allRows" | "splitLastTokenRow" | "batchedLastTokenRow"
 
 /** Static row layout for packed causal-chain target verification. */
 export interface PackedCausalChainsLayout {
@@ -1196,6 +1213,12 @@ export interface InferenceCompileRequest {
     readonly plan: InferenceProposerPlan
     readonly sharedTensors: ReadonlyArray<ConcreteTensorHandle>
     readonly stageExecutables: ReadonlyArray<ExecutableHandle>
+    readonly replay?: {
+      readonly prefill: ExecutableHandle
+      readonly decode: ExecutableHandle
+      readonly verify: ExecutableHandle
+      readonly pool: KvPoolHandle
+    }
     readonly maxDraftTokens: number
   }
   readonly batchSize: number
@@ -1229,6 +1252,7 @@ export interface InferenceValueRoute {
 /** One hidden activation exported by each target program for native routing. */
 export interface InferenceTargetTapRoute {
   readonly layer: number
+  /** Semantic source-root index; backends resolve any lane-split outputs before this root. */
   readonly outputRoot: number
   readonly value: InferenceValueSchema
 }
@@ -1238,6 +1262,8 @@ export interface InferenceProposerPlan {
   readonly vocabulary: number
   readonly tokenMapFingerprint: string
   readonly hiddenTaps: ReadonlyArray<InferenceTargetTapRoute>
+  readonly prefillHiddenTaps?: ReadonlyArray<InferenceTargetTapRoute>
+  readonly verifyHiddenTaps?: ReadonlyArray<InferenceTargetTapRoute>
   readonly sharedTensors: ReadonlyArray<{
     readonly kind: "TokenEmbedding" | "LmHead"
     readonly name: string
