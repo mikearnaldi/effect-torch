@@ -2536,6 +2536,23 @@ fn check_dtype_device(dtype: DType, device: &Device) -> std::result::Result<(), 
 /// The direct children of a node, in operand order. Leaves, placeholders,
 /// constants and generators have none.
 ///
+/// A permute of contiguous storage that reorders only extent-1 axes leaves
+/// the linearization unchanged, so it lowers to a zero-cost alias instead of
+/// a transpose kernel. `dims` maps output axis → source axis; the check
+/// compares the sequence of non-unit source axes in output order against
+/// input order.
+pub fn permute_moves_only_unit_axes(shape: &[usize], dims: &[usize]) -> bool {
+    let non_unit = shape
+        .iter()
+        .enumerate()
+        .filter(|(_, extent)| **extent != 1)
+        .map(|(axis, _)| axis);
+    dims.iter()
+        .filter(|source| shape[**source] != 1)
+        .copied()
+        .eq(non_unit)
+}
+
 /// This is the canonical child enumeration: evaluators, autodiff, rewrites
 /// and the iterative [`Node`] destructor all rely on it being exhaustive.
 pub fn node_children(kind: &NodeKind) -> Vec<Arc<Node>> {
@@ -3420,6 +3437,18 @@ pub fn remap_children(kind: &NodeKind, f: &dyn Fn(&Arc<Node>) -> Arc<Node>) -> N
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn permute_moves_only_unit_axes_predicate() {
+        // heads-first on [B, 1, H, W]: only the unit sequence axis moves.
+        assert!(permute_moves_only_unit_axes(&[2, 1, 2, 2], &[0, 2, 1, 3]));
+        // [1, 3] transposed to [3, 1] is a linearization no-op.
+        assert!(permute_moves_only_unit_axes(&[1, 3], &[1, 0]));
+        assert!(permute_moves_only_unit_axes(&[2, 3], &[0, 1]));
+        // Real transposes and reorderings are not elided.
+        assert!(!permute_moves_only_unit_axes(&[2, 3], &[1, 0]));
+        assert!(!permute_moves_only_unit_axes(&[2, 2, 1], &[1, 0, 2]));
+    }
 
     #[derive(Clone)]
     struct TestLeaf {

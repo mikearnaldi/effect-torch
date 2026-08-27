@@ -3460,6 +3460,17 @@ impl<'a> Lowerer<'a> {
                 self.node_values.insert(node.id, Box::new([value]));
                 return Ok(());
             }
+            // A permute that reorders only extent-1 axes is a contiguous
+            // no-op: alias it like a reshape instead of emitting a kernel.
+            NodeKind::Permute { a, dims }
+                if effect_torch_graph::permute_moves_only_unit_axes(&a.shape, dims) =>
+            {
+                let source = self.child_value(a)?;
+                let value =
+                    self.alias_value(source, &node.shape, format!("{}_permute", node.id))?;
+                self.node_values.insert(node.id, Box::new([value]));
+                return Ok(());
+            }
             _ => {}
         }
 
@@ -11939,6 +11950,51 @@ mod tests {
         assert_eq!(outputs[0].shape(), &[4]);
         // State commits and cursor bookkeeping still happen.
         assert_eq!(context.slots[0].lock().unwrap().cursor, 2);
+    }
+
+    #[test]
+    fn unit_axis_permute_is_aliased_without_a_kernel() {
+        let input = leaf_shape((0..8).map(|value| value as f32).collect(), vec![2, 1, 2, 2]);
+        let permute = Node::new(NodeKind::Permute {
+            a: input,
+            dims: vec![0, 2, 1, 3],
+        })
+        .unwrap();
+        let compilation = compile_graph(&[permute], false);
+        // No transpose kernel: the alias leaves zero encodes in the program.
+        assert!(compilation
+            .executable
+            .physical
+            .iter()
+            .all(|command| !matches!(command, MetalPhysicalCommand::Encode(_))));
+        let outputs = run(&compilation);
+        assert_eq!(outputs[0].shape(), &[2, 2, 1, 2]);
+        assert_eq!(
+            outputs[0].to_f32_vec().unwrap(),
+            [0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0]
+        );
+    }
+
+    #[test]
+    fn real_permute_still_encodes_a_kernel() {
+        let input = leaf_shape((0..6).map(|value| value as f32).collect(), vec![2, 3]);
+        let permute = Node::new(NodeKind::Permute {
+            a: input,
+            dims: vec![1, 0],
+        })
+        .unwrap();
+        let compilation = compile_graph(&[permute], false);
+        assert!(compilation
+            .executable
+            .physical
+            .iter()
+            .any(|command| matches!(command, MetalPhysicalCommand::Encode(_))));
+        let outputs = run(&compilation);
+        assert_eq!(outputs[0].shape(), &[3, 2]);
+        assert_eq!(
+            outputs[0].to_f32_vec().unwrap(),
+            [0.0, 3.0, 1.0, 4.0, 2.0, 5.0]
+        );
     }
 
     #[test]

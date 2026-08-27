@@ -277,13 +277,10 @@ const makeModel = (config: Config): Effect.Effect<Model.Model, Model.ModelError>
         }
         let hidden = yield* Tensor.embedding(input, { weight: params[0] })
         hidden = yield* Tensor.rmsNorm(hidden, undefined, rmsEpsilon)
-        // S=1 is already heads-first after reshape; longer sequences need the
-        // sequence and head axes exchanged. mergeHeads is the exact inverse.
+        // [B, S, H * W] <-> [B, H, S, W]; unit-axis permutes lower to
+        // zero-cost aliases, so the S=1 decode path needs no special case.
         const headsFirst = (value: Tensor.Any, heads: number, width: number) =>
           Effect.gen(function*() {
-            if (sequence === 1) {
-              return yield* Tensor.reshape(value, [batch, heads, sequence, width])
-            }
             return yield* Tensor.transpose(
               yield* Tensor.reshape(value, [batch, sequence, heads, width]),
               [0, 2, 1, 3]
@@ -291,9 +288,6 @@ const makeModel = (config: Config): Effect.Effect<Model.Model, Model.ModelError>
           })
         const mergeHeads = (value: Tensor.Any) =>
           Effect.gen(function*() {
-            if (sequence === 1) {
-              return yield* Tensor.reshape(value, [batch, sequence, attentionSize])
-            }
             return yield* Tensor.reshape(
               yield* Tensor.transpose(value, [0, 2, 1, 3]),
               [batch, sequence, attentionSize]

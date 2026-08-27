@@ -1745,7 +1745,7 @@ impl LazyTensor {
                     tensor: LazyTensor { node: a.clone() },
                 });
             }
-            stack.extend(effect_torch_graph::node_children(&node.kind));
+            stack.extend(node_children(&node.kind));
         }
         Ok(found)
     }
