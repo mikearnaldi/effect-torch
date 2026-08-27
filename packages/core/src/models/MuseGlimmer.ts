@@ -354,7 +354,7 @@ const makeModel = (config: Config): Effect.Effect<Model.Model, Model.ModelError>
           )
           ffn = yield* Tensor.linearRows(ffn, params[offset + 13])
           hidden = yield* Tensor.add(hidden, yield* rms(ffn, 1e-8, params[offset + 10]))
-          hidden = yield* Tensor.expose(hidden, `layers.${layer}.hidden`)
+          hidden = yield* Tensor.expose(hidden, Model.hiddenExposure(layer))
         }
 
         hidden = yield* rms(hidden, rmsEpsilon, params[1])

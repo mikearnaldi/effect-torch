@@ -31,41 +31,20 @@ const makeRopeGpt = Effect.gen(function*() {
   return yield* Model.chain(wte, attn, head)
 })
 
-const makeParallelFixture = Effect.gen(function*() {
-  const embedding = yield* Model.embedding("token_embd", VOCAB, EMBED)
-  const attention = yield* Model.multiHeadAttention("attn", EMBED, 1, { causal: true, rope: 10_000 })
-  const head = yield* Model.linear("output", EMBED, VOCAB)
-  const embeddingCount = embedding.parameterSpecs.map(({ name }) => name).length
-  const attentionCount = attention.parameterSpecs.map(({ name }) => name).length
-  const model = yield* Model.define({
-    parameterSpecs: [...embedding.parameterSpecs, ...attention.parameterSpecs, ...head.parameterSpecs],
-    forward: (params, input) =>
-      Effect.gen(function*() {
-        let hidden = yield* embedding.forward(params.slice(0, embeddingCount), input)
-        hidden = yield* Tensor.expose(hidden, "layers.0.hidden")
-        hidden = yield* attention.forward(
-          params.slice(embeddingCount, embeddingCount + attentionCount),
-          hidden
-        )
-        return yield* head.forward(params.slice(embeddingCount + attentionCount), hidden)
-      })
+const headsFirst = (hidden: Tensor.Any) =>
+  Effect.gen(function*() {
+    const [batch, rows] = hidden.shape
+    return yield* Tensor.transpose(yield* Tensor.reshape(hidden, [batch!, rows!, 1, EMBED]), [0, 2, 1, 3])
   })
-  const params = yield* Tensor.compute([
-    ...yield* Model.initialize(embedding),
-    ...yield* Model.initialize(attention),
-    yield* Tensor.zeros([EMBED, VOCAB]),
-    yield* Tensor.zeros([1, VOCAB])
-  ])
-  const headsFirst = (hidden: Tensor.Any) =>
-    Effect.gen(function*() {
-      const [batch, rows] = hidden.shape
-      return yield* Tensor.transpose(yield* Tensor.reshape(hidden, [batch!, rows!, 1, EMBED]), [0, 2, 1, 3])
-    })
-  const proposer = Speculation.parallelBlock({
+
+// The synthetic replayable block proposer, parameterized by the exposure it
+// taps: different speculators subscribe to different names on one base model.
+const parallelProposer = (tapName: string) =>
+  Speculation.parallelBlock({
     params: [],
     vocabulary: VOCAB,
     maxDraftTokens: 3,
-    hiddenTaps: [{ name: "layers.0.hidden", dtype: "f32", shape: ["Rows", EMBED] }],
+    hiddenTaps: [{ name: tapName, dtype: "f32", shape: ["Rows", EMBED] }],
     tokenEmbedding: { name: "token_embd.weight", dtype: "f32", shape: [VOCAB, EMBED] },
     lmHead: { name: "output.weight", dtype: "f32", shape: [EMBED, VOCAB] },
     currentBlockAttention: "Bidirectional",
@@ -93,6 +72,33 @@ const makeParallelFixture = Effect.gen(function*() {
         return [{ key: heads, value: heads }]
       })
   })
+
+const makeParallelFixture = Effect.gen(function*() {
+  const embedding = yield* Model.embedding("token_embd", VOCAB, EMBED)
+  const attention = yield* Model.multiHeadAttention("attn", EMBED, 1, { causal: true, rope: 10_000 })
+  const head = yield* Model.linear("output", EMBED, VOCAB)
+  const embeddingCount = embedding.parameterSpecs.map(({ name }) => name).length
+  const attentionCount = attention.parameterSpecs.map(({ name }) => name).length
+  const model = yield* Model.define({
+    parameterSpecs: [...embedding.parameterSpecs, ...attention.parameterSpecs, ...head.parameterSpecs],
+    forward: (params, input) =>
+      Effect.gen(function*() {
+        let hidden = yield* embedding.forward(params.slice(0, embeddingCount), input)
+        hidden = yield* Tensor.expose(hidden, Model.hiddenExposure(0))
+        hidden = yield* attention.forward(
+          params.slice(embeddingCount, embeddingCount + attentionCount),
+          hidden
+        )
+        return yield* head.forward(params.slice(embeddingCount + attentionCount), hidden)
+      })
+  })
+  const params = yield* Tensor.compute([
+    ...yield* Model.initialize(embedding),
+    ...yield* Model.initialize(attention),
+    yield* Tensor.zeros([EMBED, VOCAB]),
+    yield* Tensor.zeros([1, VOCAB])
+  ])
+  const proposer = parallelProposer(Model.hiddenExposure(0))
   return { model, params, proposer }
 })
 
@@ -1278,6 +1284,64 @@ onDevices("Inference", () => (it) => {
         expect(parallelPage.tokens).toEqual(expected)
         yield* ordinary.close()
         yield* parallel.close()
+      }))
+
+    it.effect("one base model serves multiple speculative proposers", () =>
+      Effect.gen(function*() {
+        // The model publishes every exposure once; each proposer subscribes
+        // to its own name and compiles an independent program set.
+        const embedding = yield* Model.embedding("token_embd", VOCAB, EMBED)
+        const attention = yield* Model.multiHeadAttention("attn", EMBED, 1, { causal: true, rope: 10_000 })
+        const head = yield* Model.linear("output", EMBED, VOCAB)
+        const embeddingCount = embedding.parameterSpecs.length
+        const attentionCount = attention.parameterSpecs.length
+        const model = yield* Model.define({
+          parameterSpecs: [...embedding.parameterSpecs, ...attention.parameterSpecs, ...head.parameterSpecs],
+          forward: (params, input) =>
+            Effect.gen(function*() {
+              let hidden = yield* embedding.forward(params.slice(0, embeddingCount), input)
+              hidden = yield* Tensor.expose(hidden, Model.hiddenExposure(0))
+              hidden = yield* attention.forward(
+                params.slice(embeddingCount, embeddingCount + attentionCount),
+                hidden
+              )
+              hidden = yield* Tensor.expose(hidden, Model.hiddenExposure(1))
+              return yield* head.forward(params.slice(embeddingCount + attentionCount), hidden)
+            })
+        })
+        const params = yield* Tensor.compute(yield* Model.initialize(model))
+        const base = {
+          maxTokens: 32,
+          blockSize: 4,
+          prefillChunks: [4],
+          batchSize: 1,
+          sampling: { temperature: 0, seed: 17 }
+        } as const
+        const ordinary = yield* (yield* Model.inference(model, params, base)).generation()
+        const prompt = [1, 2, 3, 4, 5, 6]
+        let ordinaryPage = (yield* ordinary.add([{ prompt: yield* ids(prompt) }]))[0]!
+        const expected: Array<number> = [...ordinaryPage.tokens]
+        for (let round = 0; round < 6; round++) {
+          ordinaryPage = (yield* ordinary.step([{ seq: ordinaryPage.seq }]))[0]!
+          expected.push(...ordinaryPage.tokens)
+        }
+        yield* ordinary.close()
+        // Two different speculators on the same base model, interleaved.
+        for (const tapName of [Model.hiddenExposure(0), Model.hiddenExposure(1)]) {
+          const proposer = parallelProposer(tapName)
+          const speculative = yield* (yield* Model.inference(model, params, {
+            ...base,
+            speculation: { proposer, maxDraftTokens: 2 }
+          })).generation()
+          let page = (yield* speculative.add([{ prompt: yield* ids(prompt) }]))[0]!
+          const actual: Array<number> = [...page.tokens]
+          while (actual.length < expected.length) {
+            page = (yield* speculative.step([{ seq: page.seq }]))[0]!
+            actual.push(...page.tokens)
+          }
+          expect(actual.slice(0, expected.length)).toEqual(expected)
+          yield* speculative.close()
+        }
       }))
 
     it.effect("Muse-Glimmer compiles and generates with parity", () =>

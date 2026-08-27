@@ -2308,8 +2308,8 @@ export const slice: {
  * Attaches a stable exposure name to a tensor without changing its value.
  * The node is an identity in the graph: ordinary execution and autodiff
  * treat it as transparent, and compilation lowers it to a zero-cost alias.
- * Model authors use it to publish intermediates (convention:
- * `layers.{n}.hidden` for the residual after zero-based layer `n`) that
+ * Model authors use it to publish intermediates (see
+ * {@link Model.hiddenExposure} for the per-layer residual contract) that
  * inference consumers such as speculative proposers request by name.
  *
  * @since 0.1.0

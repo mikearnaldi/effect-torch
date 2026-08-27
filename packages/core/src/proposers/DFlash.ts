@@ -60,7 +60,7 @@ export interface Configuration {
   readonly maskToken: number
   /** One-based target layers named by the artifact. */
   readonly targetLayers: ReadonlyArray<number>
-  /** Zero-based target residual layers consumed by replay; each is routed from the target's `layers.{n}.hidden` exposure. */
+  /** Zero-based target residual layers consumed by replay; each is routed from the target's {@link Model.hiddenExposure} exposure. */
   readonly targetResidualTaps: ReadonlyArray<number>
   /** Per-proposer-layer sliding-window flags; validation requires all true. */
   readonly slidingWindowPattern: ReadonlyArray<boolean>
@@ -448,7 +448,7 @@ export const artifact = (
     vocabulary: config.vocabularySize,
     maxDraftTokens: config.blockSize - 1,
     hiddenTaps: config.targetResidualTaps.map((layer) => ({
-      name: `layers.${layer}.hidden`,
+      name: Model.hiddenExposure(layer),
       dtype: "f32",
       shape: ["Rows", config.embeddingLength]
     })),

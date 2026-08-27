@@ -117,6 +117,19 @@ export type ParameterInitializer =
 export type Params = ReadonlyArray<Tensor.Any>
 
 /**
+ * The stable exposure name of the residual activation after zero-based model
+ * layer `layer` — the single definition of the shared contract between models
+ * that publish hidden states via `Tensor.expose` and speculative proposers
+ * that request them via {@link Speculation.HiddenTap}. A model publishes any
+ * number of exposures once; any number of proposers may subscribe to any
+ * subset of them.
+ *
+ * @since 0.1.0
+ * @category models
+ */
+export const hiddenExposure = (layer: number): string => `layers.${layer}.hidden`
+
+/**
  * A pure architecture plus a lazily allocated ordinary-execution cache.
  * Parameters are a flat array in `parameterSpecs` order. The model borrows
  * parameter and input handles; ownership transfers only for concrete outputs

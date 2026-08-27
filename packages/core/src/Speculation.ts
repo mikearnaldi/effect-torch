@@ -34,8 +34,8 @@ export interface KeyValue {
 export interface HiddenTap {
   /**
    * Name of the target-model exposure routed to the proposer, matching a
-   * `trace.expose` call in the target's `forward` (convention:
-   * `layers.{n}.hidden` for the residual after zero-based layer `n`).
+   * `Tensor.expose` call in the target's `forward` (see
+   * {@link Model.hiddenExposure} for the per-layer residual contract).
    */
   readonly name: string
   /** Required residual element dtype. */
