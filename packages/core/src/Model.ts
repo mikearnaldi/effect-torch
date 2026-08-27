@@ -1472,8 +1472,9 @@ export class InferenceError extends Data.TaggedError("InferenceError")<{
 
 /**
  * Fixed deployment geometry for {@link inference}. Construction validates
- * these scalar fields, then eagerly traces and compiles prefill
- * `[batchSize, prefillChunk]` and fixed-width decode `[batchSize, 1]`. Batch size one
+ * these scalar fields, then eagerly traces and compiles one prefill program
+ * per `prefillChunks` width `[batchSize, chunk]` and fixed-width decode
+ * `[batchSize, 1]`. Batch size one
  * uses the same decode path. There is no later shape-specialization cache.
  *
  * Validation is deliberately structural. It does not estimate whether the
@@ -1513,14 +1514,18 @@ export interface InferenceConfig {
    */
   readonly attentionWindow?: number
   /**
-   * Positive fixed prompt-chunk length. Defaults to `blockSize`; it need not be
-   * a multiple of `blockSize`. Every prefill invocation has this tensor shape.
-   * The final suffix is zero-padded, but only its real token ids advance the
-   * sequence, enter state hashes, and select the returned logits row. Graph
-   * operations still evaluate the padded extent, so a cursor-offset learned
-   * position table must cover the entire compiled chunk at every invocation.
+   * Fixed prompt-chunk token widths, ascending: one prefill program is
+   * compiled per entry and the runtime serves each prompt chunk from the
+   * largest compiled width covering its remaining tokens, so smaller widths
+   * only bound zero-padding waste on short prompts. Entries must be positive
+   * safe integers; they need not be multiples of `blockSize`. Every prefill
+   * invocation has one of the compiled shapes. The final suffix is
+   * zero-padded, but only its real token ids advance the sequence, enter
+   * state hashes, and select the returned logits row. Graph operations still
+   * evaluate the padded extent, so a cursor-offset learned position table
+   * must cover the largest compiled chunk at every invocation.
    */
-  readonly prefillChunk?: number
+  readonly prefillChunks: ReadonlyArray<number>
   /**
    * Token-tensor dtype used by all fixed programs. Defaults to `"u32"`;
    * prompts passed to {@link Generation.add} must match exactly. Decode state
@@ -1783,7 +1788,7 @@ export interface InferenceProgram {
 interface ResolvedInferenceConfig {
   readonly maxTokens: number
   readonly blockSize: number
-  readonly prefillChunk: number
+  readonly prefillChunks: ReadonlyArray<number>
   readonly tokenDtype: "u32" | "i64"
   readonly kvDtype: Tensor.DType
   readonly batchSize: number
@@ -1821,10 +1826,15 @@ const resolveInferenceConfig = (
         `attentionWindow must be a positive integer no greater than maxTokens, got ${config.attentionWindow}`
       )
     }
-    const prefillChunk = config.prefillChunk ?? blockSize
-    if (!Number.isInteger(prefillChunk) || prefillChunk <= 0) {
-      return yield* invalidInferenceConfig(`prefillChunk must be a positive integer, got ${config.prefillChunk}`)
+    if (
+      config.prefillChunks.length === 0 ||
+      config.prefillChunks.some((chunk) => !Number.isSafeInteger(chunk) || chunk <= 0)
+    ) {
+      return yield* invalidInferenceConfig(
+        `prefillChunks must be positive safe integers, got [${config.prefillChunks}]`
+      )
     }
+    const prefillChunks = [...new Set(config.prefillChunks)].sort((left, right) => left - right)
     const tokenDtype = config.tokenDtype ?? "u32"
     if (tokenDtype !== "u32" && tokenDtype !== "i64") {
       return yield* invalidInferenceConfig(`tokenDtype must be u32 or i64, got ${String(config.tokenDtype)}`)
@@ -1883,7 +1893,7 @@ const resolveInferenceConfig = (
     return {
       maxTokens: config.maxTokens,
       blockSize,
-      prefillChunk,
+      prefillChunks,
       tokenDtype,
       kvDtype: configuredKvDtype === "int8" ? "u8" : configuredKvDtype,
       batchSize,
@@ -1929,7 +1939,7 @@ const sameDecodeGeometry = (left: DecodeGeometry, right: DecodeGeometry): boolea
   left.convKernel === right.convKernel && left.window === right.window
 
 interface InferencePrograms {
-  readonly prefill: Tensor.DecodeProgram
+  readonly prefill: ReadonlyArray<Tensor.DecodeProgram>
   readonly decode: Tensor.DecodeProgram
   readonly geometry: DecodeGeometry
   readonly pool: Tensor.KvPool
@@ -2078,7 +2088,8 @@ const compileProposerPlan = (
   config: ResolvedInferenceConfig,
   vocabulary: number,
   targetTaps: {
-    readonly prefill: ReadonlyArray<Runtime.InferenceTargetTapRoute>
+    /** Target hidden taps per prefill chunk shape, in ascending shape order. */
+    readonly prefill: ReadonlyArray<ReadonlyArray<Runtime.InferenceTargetTapRoute>>
     readonly decode: ReadonlyArray<Runtime.InferenceTargetTapRoute>
     readonly verify: ReadonlyArray<Runtime.InferenceTargetTapRoute>
   },
@@ -2228,11 +2239,15 @@ const compileProposerPlan = (
           ...(proposer.attentionWindow === undefined ? {} : { window: proposer.attentionWindow })
         }).pipe(Effect.mapError((error) => new InferenceError({ op: "inference", message: error.message })))
       })
-    const replayPrefill = yield* compileReplay(targetTaps.prefill)
+    const replayPrefills: Array<Tensor.DecodeProgram> = []
+    for (const taps of targetTaps.prefill) {
+      replayPrefills.push(yield* compileReplay(taps))
+    }
     const replayDecode = yield* compileReplay(targetTaps.decode)
     const replayVerify = yield* compileReplay(targetTaps.verify, config.speculation!.maxDraftTokens + 1)
-    const replayGeometry = decodeGeometry(replayPrefill)
+    const replayGeometry = decodeGeometry(replayPrefills[replayPrefills.length - 1]!)
     if (
+      replayPrefills.some((program) => !sameDecodeGeometry(replayGeometry, decodeGeometry(program))) ||
       !sameDecodeGeometry(replayGeometry, decodeGeometry(replayDecode)) ||
       !sameDecodeGeometry(replayGeometry, decodeGeometry(replayVerify)) ||
       !sameDecodeGeometry(replayGeometry, decodeGeometry(program))
@@ -2256,7 +2271,7 @@ const compileProposerPlan = (
       vocabulary,
       tokenMapFingerprint: "identity",
       hiddenTaps: targetTaps.decode,
-      prefillHiddenTaps: targetTaps.prefill,
+      prefillHiddenTaps: targetTaps.prefill[targetTaps.prefill.length - 1]!,
       verifyHiddenTaps: targetTaps.verify,
       sharedTensors: sharedMetadata,
       stages: [{
@@ -2287,7 +2302,7 @@ const compileProposerPlan = (
       sharedTensors,
       stageExecutables: [program.handle],
       replay: {
-        prefill: replayPrefill.handle,
+        prefill: replayPrefills.map((program) => program.handle),
         decode: replayDecode.handle,
         verify: replayVerify.handle,
         pool: pool.handle
@@ -2309,15 +2324,23 @@ const compileInferencePrograms = (
   Effect.gen(function*() {
     const proposer = config.speculation?.proposer
     const taps = proposer?._tag === "ParallelBlock" ? proposer.hiddenTaps : []
-    const prefillTrace = yield* traceInferenceProgram(
-      model,
-      frozenParams,
-      config,
-      [config.batchSize, config.prefillChunk],
-      true,
-      undefined,
-      taps
-    )
+    // One prefill program per compiled chunk width, ascending; the runtime
+    // serves each prompt chunk from the largest width covering its remaining
+    // tokens and skips the LM-head chain for non-final chunks.
+    const prefillTraces: Array<TracedInferenceProgram> = []
+    for (const chunk of config.prefillChunks) {
+      prefillTraces.push(
+        yield* traceInferenceProgram(
+          model,
+          frozenParams,
+          config,
+          [config.batchSize, chunk],
+          true,
+          undefined,
+          taps
+        )
+      )
+    }
     const decodeTrace = yield* traceInferenceProgram(
       model,
       frozenParams,
@@ -2327,10 +2350,13 @@ const compileInferencePrograms = (
       undefined,
       taps
     )
-    const prefill = prefillTrace.program
+    const prefill = prefillTraces.map((trace) => trace.program)
     const decode = decodeTrace.program
-    const geometry = decodeGeometry(prefill)
-    if (!sameDecodeGeometry(geometry, decodeGeometry(decode))) {
+    const geometry = decodeGeometry(prefill[prefill.length - 1]!)
+    if (
+      prefill.some((program) => !sameDecodeGeometry(geometry, decodeGeometry(program))) ||
+      !sameDecodeGeometry(geometry, decodeGeometry(decode))
+    ) {
       return yield* new InferenceError({
         op: "inference",
         message: "prefill and decode traces disagree on attention geometry or retention policy"
@@ -2358,7 +2384,9 @@ const compileInferencePrograms = (
         convKernel: geometry.convKernel
       }
     ).pipe(Effect.mapError((error) => new InferenceError({ op: "inference", message: error.message })))
-    if (config.speculation === undefined) return { prefill, decode, geometry, pool }
+    if (config.speculation === undefined) {
+      return { prefill, decode, geometry, pool }
+    }
     if (proposerParams === undefined) {
       return yield* new InferenceError({ op: "inference", message: "speculative proposer parameters are missing" })
     }
@@ -2383,7 +2411,11 @@ const compileInferencePrograms = (
         proposerParams,
         config,
         targetVocabulary,
-        { prefill: prefillTrace.taps, decode: decodeTrace.taps, verify: verifyTrace.taps },
+        {
+          prefill: prefillTraces.map((trace) => trace.taps),
+          decode: decodeTrace.taps,
+          verify: verifyTrace.taps
+        },
         frozenParams,
         model.parameterSpecs.map((parameter) => parameter.name)
       )
@@ -2405,7 +2437,7 @@ const compileInferencePrograms = (
       proposerModel,
       exactParams,
       config,
-      [config.batchSize, config.prefillChunk]
+      [config.batchSize, config.prefillChunks[config.prefillChunks.length - 1]!]
     ).pipe(Effect.map((trace) => trace.program))
     const proposerDecode = yield* traceInferenceProgram(
       proposerModel,
@@ -2559,14 +2591,16 @@ const slottedPrefillTensor = (
   lanes: ReadonlyArray<PrefillRoundLane>,
   config: ResolvedInferenceConfig
 ): Effect.Effect<Tensor.Lazy, Tensor.TensorError, Runtime.Runtime> => {
-  const values = Array<number>(config.batchSize * config.prefillChunk).fill(0)
+  // The generic session driver always runs the largest compiled chunk.
+  const prefillChunk = config.prefillChunks[config.prefillChunks.length - 1]!
+  const values = Array<number>(config.batchSize * prefillChunk).fill(0)
   for (const lane of lanes) {
     const tokens = lane.tokens.slice(lane.chunk.offset, lane.chunk.offset + lane.chunk.real)
     for (const [index, token] of tokens.entries()) {
-      values[lane.slot * config.prefillChunk + index] = token
+      values[lane.slot * prefillChunk + index] = token
     }
   }
-  return tokenTensor(values, [config.batchSize, config.prefillChunk], config.tokenDtype)
+  return tokenTensor(values, [config.batchSize, prefillChunk], config.tokenDtype)
 }
 
 const selectSlottedOutputs = (
@@ -2601,7 +2635,10 @@ const runPrefillBatches = <A>(
           const round = lanes
             .filter((lane) => !results.has(lane.slot))
             .map((lane): PrefillRoundLane => {
-              const real = Math.min(config.prefillChunk, lane.tokens.length - lane.offset)
+              const real = Math.min(
+                config.prefillChunks[config.prefillChunks.length - 1]!,
+                lane.tokens.length - lane.offset
+              )
               return {
                 ...lane,
                 chunk: { offset: lane.offset, real, final: lane.offset + real === lane.tokens.length }
@@ -2767,13 +2804,13 @@ const openStatefulExecution = (engine: InferenceEngine): Effect.Effect<StatefulE
                 lanes.push({ slot: freeSlots[index]!, sequence, tokens, offset: matched })
               }
               const logits = yield* runPrefillBatches(
-                programs.prefill,
+                programs.prefill[programs.prefill.length - 1]!,
                 config,
                 lanes,
                 (finals, input, tokens) =>
                   Effect.flatMap(
                     Tensor.runBatchedDecodeProgram(
-                      programs.prefill,
+                      programs.prefill[programs.prefill.length - 1]!,
                       [input],
                       finals.map((lane) => lane.sequence),
                       finals.map((lane) => lane.slot),
@@ -3225,7 +3262,7 @@ export const inference = (
               "inferenceCompile",
               runtime.extensions.inference.compile({
                 target: {
-                  prefill: programs.prefill.handle,
+                  prefill: programs.prefill.map((program) => program.handle),
                   decode: programs.decode.handle,
                   ...(programs.speculation === undefined ? {} : { verify: programs.speculation.verify.handle }),
                   pool: programs.pool.handle

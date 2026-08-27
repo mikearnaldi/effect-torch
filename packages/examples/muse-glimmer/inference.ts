@@ -101,6 +101,11 @@ const program = Effect.gen(function*() {
     Config.withDefault(7)
   )
 
+  // Compiled prefill chunk widths: the runtime chunks any prompt to the
+  // largest width covering its remaining tokens; the small width only
+  // bounds zero-padding waste on short prompts.
+  const prefillChunks = [32, 256]
+
   const modelPath = yield* Config.nonEmptyString("MUSE_GLIMMER_MODEL_PATH").pipe(
     Config.withDefault(defaultModelPath)
   )
@@ -163,13 +168,15 @@ const program = Effect.gen(function*() {
     process.stderr.write(`partial linear threadgroups: ${JSON.stringify(Object.fromEntries(tails))}\n`)
   }
 
+  const currentDate = new Date().toISOString().slice(0, 10)
+
   const inference = yield* timed(
     "Compiling inference",
     Model.inference(loaded.model, loaded.params, {
       maxTokens: 4096,
       blockSize: 16,
       kvDtype: "f16",
-      prefillChunk: 16,
+      prefillChunks,
       batchSize: 1,
       ...(draft === undefined
         ? {}
@@ -192,7 +199,7 @@ const program = Effect.gen(function*() {
       messages: [{ role: "user", content: prompt }],
       addGenerationPrompt: true,
       variables: {
-        current_date: new Date().toISOString().slice(0, 10),
+        current_date: currentDate,
         reasoning_strength: reasoningStrength
       },
       bosTokenId,
@@ -244,6 +251,7 @@ const program = Effect.gen(function*() {
       : Number(stats.acceptedTokens) / Number(stats.proposedTokens)
     process.stderr.write(
       `speculation: ${stats.acceptedTokens}/${stats.proposedTokens} accepted (${(acceptance * 100).toFixed(1)}%), ` +
+        `rounds ordinary=${stats.ordinaryRounds} speculative=${stats.speculativeRounds}, ` +
         `draft ${(Number(stats.draftNanos) / 1e9).toFixed(2)}s, verify ${
           (Number(stats.verificationNanos) / 1e9).toFixed(2)
         }s\n`

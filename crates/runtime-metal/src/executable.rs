@@ -41,14 +41,19 @@
 //! GPU synchronization happens **unconditionally** before any segment
 //! or output owner is released, and backend submission failures take
 //! precedence over host errors, panics (caught and re-raised as
-//! errors), and cancellation.
+//! errors), and cancellation. The one exception is the deferred path
+//! ([`execute_stateful_deferred`]): prefill chunk loops encode each
+//! chunk onto one shared submission stream and return a
+//! [`PendingExecution`] that keeps the workspace lease and resolved
+//! values alive until a single batched drain fences the stream.
 //!
 //! ## Cancellation
 //!
 //! The [`CancellationFlag`] is polled before validation, before every
 //! encoded command, and again after synchronization; a set flag aborts
 //! with `"operation aborted"`. For stateful execution an additional
-//! `commit_allowed` gate runs after the GPU work completes.
+//! `commit_allowed` gate runs after the GPU work completes (right after
+//! encoding on the deferred path).
 //!
 //! ## State transactions
 //!
@@ -60,6 +65,11 @@
 //! slots' canonical state and advance cursors, so a failed or
 //! cancelled invocation never corrupts live decode state. Slot locking
 //! order is fixed (index order) and evictions apply only after commit.
+//! On the deferred path the copies are encoded as GPU-ordered device
+//! copies on the chunk's stream (ordered after the chunk's kernels and
+//! before the next chunk's readers) while cursor commits and evictions
+//! apply immediately, so consecutive chunks pipeline without a host
+//! fence.
 
 use crate::value::Value;
 use crate::{
@@ -309,7 +319,9 @@ pub(crate) trait MetalDecodeContext {
         plan: &KvAttentionPlan,
         staging: &[crate::run::MetalTensor],
     ) -> Result<(), String>;
-    /// Non-allocating paged attention dispatch for one layer.
+    /// Non-allocating paged attention dispatch for one layer. `scratch`
+    /// carries the planned split partial-records workspace (exactly one
+    /// tensor when the plan splits the decode, empty otherwise).
     #[allow(clippy::too_many_arguments)]
     fn kv_attention_into(
         &self,
@@ -322,6 +334,7 @@ pub(crate) trait MetalDecodeContext {
         mode: KvAttentionMode,
         output: &crate::run::MetalTensor,
         staging: &[crate::run::MetalTensor],
+        scratch: &[crate::run::MetalTensor],
     ) -> Result<(), String>;
     /// Drops table blocks before the absolute index `start` (applied
     /// only after a successful commit).
@@ -613,6 +626,10 @@ pub(super) enum MetalOp {
         codec: GgmlKQuant,
         weight_shape: [usize; 2],
     },
+    QuantizedLinearGroup {
+        codec: GgmlKQuant,
+        weight_shapes: Box<[[usize; 2]]>,
+    },
     QuantizedEmbedding {
         codec: GgmlKQuant,
         weight_shape: [usize; 2],
@@ -768,6 +785,7 @@ impl MetalOp {
                 "linear_native"
             }
             Self::QuantizedLinear { .. } => "quantized_linear",
+            Self::QuantizedLinearGroup { .. } => "quantized_linear_grouped",
             Self::QuantizedEmbedding { .. } => "quantized_embedding",
             Self::LayerNorm { .. } | Self::LayerNormBackward { .. } => "layer_norm_native",
             Self::RmsNorm { .. } => "rms_norm_native",
@@ -956,6 +974,7 @@ pub(super) enum MetalCommandPlan {
     ShortConvBackwardW(crate::shortconv::BackwardWRequirements),
     Rotary(crate::rotary::RotaryRequirements),
     QuantizedLinear(crate::quantized::LinearRequirements),
+    QuantizedLinearGroup(crate::quantized::GroupedLinearRequirements),
     QuantizedEmbedding(crate::quantized::EmbeddingRequirements),
     KvAttention(KvAttentionPlan),
 }
@@ -970,6 +989,10 @@ pub(super) struct KvAttentionPlan {
     pub(crate) time: usize,
     pub(crate) head_dim: usize,
     pub(crate) mode: KvAttentionMode,
+    /// Flash-decoding split count: > 1 (fixed 8) only for causal
+    /// one-token decode, where a partial + combine kernel pair runs;
+    /// 1 keeps the single row-parallel kernel.
+    pub(crate) splits: usize,
 }
 
 /// One chunk-shape variant of the chunked-head CE forward: the gemm
@@ -1142,6 +1165,106 @@ fn declaration_layout(value: &MetalValueMetadata) -> effect_torch_runtime::Layou
 /// scratch/staging/status resources) of one lowered command. This is
 /// the heart of physical planning: every byte and every pipeline an
 /// invocation can touch is fixed here, before any execution.
+/// Merges independent decode-time quantized linears that share one
+/// input value and codec into a single `QuantizedLinearGroup` command
+/// (2..=4 members, bias-free, non-MMA packed-dot shapes only). Member
+/// outputs stay distinct outputs of the merged command; an intervening
+/// instruction that writes the shared input or a member weight stops
+/// the scan, so reordered members never observe a stale or future
+/// value. Liveness is computed after this pass, so member releases
+/// stay exact.
+fn group_quantized_linear_commands(
+    instructions: &mut Vec<MetalCommand>,
+    values: &[MetalValueMetadata],
+) {
+    fn candidate(
+        command: &MetalCommand,
+        values: &[MetalValueMetadata],
+    ) -> Option<(GgmlKQuant, [usize; 2], ValueId)> {
+        let MetalInstruction::Operation {
+            op:
+                MetalOp::QuantizedLinear {
+                    codec,
+                    weight_shape,
+                },
+            ..
+        } = &command.kind
+        else {
+            return None;
+        };
+        // Biased projections (three inputs) are never grouped.
+        if command.inputs.len() != 2 || command.outputs.len() != 1 {
+            return None;
+        }
+        let input = command.inputs[0].value;
+        let metadata = values.get(input.index())?;
+        if metadata.shape.len() < 2 || metadata.shape.last() != Some(&weight_shape[1]) {
+            return None;
+        }
+        let vectors = metadata.shape[..metadata.shape.len() - 1]
+            .iter()
+            .product::<usize>();
+        // Only non-MMA packed-dot decode shapes group.
+        if vectors == 0 || vectors >= 8 {
+            return None;
+        }
+        Some((*codec, *weight_shape, input))
+    }
+
+    let mut index = 0;
+    while index < instructions.len() {
+        let Some((codec, weight_shape, input)) = candidate(&instructions[index], values) else {
+            index += 1;
+            continue;
+        };
+        let mut members = vec![index];
+        let mut weights = vec![instructions[index].inputs[1].value];
+        let mut weight_shapes = vec![weight_shape];
+        let mut outputs = vec![instructions[index].outputs[0].value];
+        let mut scan = index + 1;
+        while scan < instructions.len() && members.len() < 4 {
+            let command = &instructions[scan];
+            if command
+                .outputs
+                .iter()
+                .any(|output| output.value == input || weights.contains(&output.value))
+            {
+                break;
+            }
+            if let Some((member_codec, member_shape, member_input)) = candidate(command, values) {
+                let output = command.outputs[0].value;
+                if member_codec == codec && member_input == input && !outputs.contains(&output) {
+                    members.push(scan);
+                    weights.push(command.inputs[1].value);
+                    weight_shapes.push(member_shape);
+                    outputs.push(output);
+                }
+            }
+            scan += 1;
+        }
+        if members.len() >= 2 {
+            let command = &mut instructions[index];
+            command.kind = MetalInstruction::Operation {
+                op: MetalOp::QuantizedLinearGroup {
+                    codec,
+                    weight_shapes: weight_shapes.into_boxed_slice(),
+                },
+                plan: MetalCommandPlan::Direct,
+                release: Box::new([]),
+                random_seed_token: 0,
+            };
+            command.inputs = std::iter::once(ValueUse::read(input))
+                .chain(weights.iter().copied().map(ValueUse::read))
+                .collect();
+            command.outputs = outputs.iter().copied().map(OutputDecl::new).collect();
+            for &member in members[1..].iter().rev() {
+                instructions.remove(member);
+            }
+        }
+        index += 1;
+    }
+}
+
 fn plan_command_resources(
     command: &MetalCommand,
     values: &[MetalValueMetadata],
@@ -1716,6 +1839,38 @@ fn plan_command_resources(
                 *weight_shape,
             )?);
         }
+        MetalOp::QuantizedLinearGroup {
+            codec,
+            weight_shapes,
+        } => {
+            let x = input(0)?;
+            if command.inputs.len() != weight_shapes.len() + 1
+                || command.outputs.len() != weight_shapes.len()
+            {
+                return Err(
+                    "compile: quantized linear group arity does not match its members".to_string(),
+                );
+            }
+            let mut members = Vec::with_capacity(weight_shapes.len());
+            for (index, weight_shape) in weight_shapes.iter().enumerate() {
+                let weight = input(1 + index)?;
+                let member_output = output(index)?;
+                members.push(quantized::linear_requirements(
+                    &x.shape,
+                    x.dtype,
+                    &weight.shape,
+                    weight.dtype,
+                    None,
+                    &member_output.shape,
+                    member_output.dtype,
+                    *codec,
+                    *weight_shape,
+                )?);
+            }
+            resources.plan = MetalCommandPlan::QuantizedLinearGroup(
+                quantized::grouped_linear_requirements(&members)?,
+            );
+        }
         MetalOp::QuantizedEmbedding {
             codec,
             weight_shape,
@@ -2049,6 +2204,7 @@ fn plan_command_resources(
                 );
             }
             let rank = q.shape.len();
+            let time = q.shape[rank - 2];
             let plan = KvAttentionPlan {
                 batch: q.shape[..rank - 3]
                     .iter()
@@ -2056,9 +2212,14 @@ fn plan_command_resources(
                     .ok_or_else(|| "compile: KV attention batch size overflow".to_string())?,
                 query_heads: q.shape[rank - 3],
                 kv_heads: k.shape[rank - 3],
-                time: q.shape[rank - 2],
+                time,
                 head_dim: q.shape[rank - 1],
                 mode: *mode,
+                splits: if *mode == KvAttentionMode::Causal && time == 1 {
+                    8
+                } else {
+                    1
+                },
             };
             if plan.time == 0 || plan.head_dim > 128 {
                 return Err(format!(
@@ -2098,6 +2259,13 @@ fn plan_command_resources(
                 staging("kv_token_advances", &[schema.graph_batch], DType::U32),
                 staging("kv_padding", &[schema.graph_batch], DType::U32),
             ]);
+            if plan.splits > 1 {
+                resources.scratch.push(scratch(
+                    "kv_attention_split_partials",
+                    &[plan.batch, plan.query_heads, plan.splits, plan.head_dim + 2],
+                    DType::F32,
+                ));
+            }
             resources.plan = MetalCommandPlan::KvAttention(plan);
         }
         MetalOp::Conv1d {
@@ -2268,6 +2436,10 @@ pub(super) struct MetalExecutable {
     pub program: Arc<LoweredProgram<MetalInstruction, NativeMemorySpace, MetalLoweredValue>>,
     /// Physical execution stream (see [`MetalPhysicalCommand`]).
     pub physical: Box<[MetalPhysicalCommand]>,
+    /// Per-physical-command mark: the command's results feed only program
+    /// output 0 (the logits row), so headless invocations may skip it.
+    /// See [`mark_head_only_commands`].
+    head_only: Box<[bool]>,
     /// Compile-time prepared pipelines.
     pub prepared: MetalPreparedArtifacts,
     /// Tensor input bindings (declared + generated).
@@ -2290,6 +2462,86 @@ pub(super) struct MetalExecutable {
     /// Memory report of the most recent invocation (observability).
     pub last_invocation_memory: Mutex<Option<InvocationMemoryReport>>,
     state_cursor: Option<ValueId>,
+}
+
+/// Marks physical encode commands whose results feed only program output
+/// 0 — the logits row of a last-token-row prefill program. A headless
+/// invocation (a prefill chunk that does not finish a prompt) skips them:
+/// decode-state side effects and tap outputs still execute, the LM head
+/// and its epilogue do not. The mark is a pure function of the dataflow —
+/// reverse liveness seeded from every output except 0 plus every
+/// state-effect instruction — and callers choose elision per invocation.
+fn mark_head_only_commands(
+    program: &LoweredProgram<MetalInstruction, NativeMemorySpace, MetalLoweredValue>,
+    physical: &[MetalPhysicalCommand],
+    storage: &[MetalValueStorage],
+) -> Box<[bool]> {
+    let mut live = vec![false; program.values.len()];
+    // Consumers reference derived view values (slices/reshapes), while the
+    // producer instruction owns the alias source: liveness must flow through
+    // the alias chain or the producing op is wrongly marked head-only.
+    fn mark_live(live: &mut [bool], storage: &[MetalValueStorage], mut value: ValueId) {
+        loop {
+            if live[value.index()] {
+                break;
+            }
+            live[value.index()] = true;
+            match storage.get(value.index()) {
+                Some(MetalValueStorage::Alias { source, .. }) => value = *source,
+                _ => break,
+            }
+        }
+    }
+    for output in program.outputs.iter().skip(1) {
+        mark_live(&mut live, storage, *output);
+    }
+    let mut instruction_live = vec![false; program.instructions.len()];
+    // Instructions are in topological order, so one reverse pass exacts
+    // liveness: forced-live (state side effects) or producing a live
+    // value makes every consumed value live.
+    for instruction in program.instructions.iter().rev() {
+        // Only encodable operations force liveness; prepare/finalize
+        // markers name every program output without producing anything.
+        let forced = instruction.kind.operation().is_some()
+            && (instruction.effects.has_side_effects
+                || !instruction.state.is_empty()
+                || matches!(
+                    instruction.kind.operation().map(|(op, _)| op),
+                    Some(MetalOp::KvAttention { .. })
+                ));
+        let produces_live = instruction
+            .outputs
+            .iter()
+            .any(|output| live[output.value.index()])
+            || instruction
+                .state
+                .iter()
+                .any(|use_| live[use_.value.index()]);
+        let is_live = forced || produces_live;
+        instruction_live[instruction.id.index()] = is_live;
+        if is_live {
+            for use_ in instruction
+                .inputs
+                .iter()
+                .chain(instruction.staging.iter())
+                .chain(instruction.status.iter())
+                .chain(instruction.scratch.iter())
+            {
+                mark_live(&mut live, storage, use_.value);
+            }
+        }
+    }
+    physical
+        .iter()
+        .map(|command| match command {
+            MetalPhysicalCommand::Encode(id) => {
+                !instruction_live.get(id.index()).copied().unwrap_or(false)
+            }
+            MetalPhysicalCommand::StatusGate(_)
+            | MetalPhysicalCommand::Commit
+            | MetalPhysicalCommand::Complete => false,
+        })
+        .collect()
 }
 
 fn program_instruction<'a>(
@@ -3673,6 +3925,7 @@ impl<'a> Lowerer<'a> {
         outputs: Vec<ValueId>,
         driver: &mut CompilerDriver<'_>,
     ) -> Result<(MetalExecutable, Vec<Value>, Vec<usize>), String> {
+        group_quantized_linear_commands(&mut self.instructions, &self.values);
         if let Some(cursor) = self.state_cursor {
             self.instructions.insert(
                 0,
@@ -4200,6 +4453,16 @@ impl<'a> Lowerer<'a> {
                         quantized::warm_linear_exact(requirements)?;
                         pipeline_count += requirements.pipeline_count;
                     }
+                    MetalOp::QuantizedLinearGroup { .. } => {
+                        let MetalCommandPlan::QuantizedLinearGroup(requirements) = command_plan
+                        else {
+                            return Err(
+                                "compile: quantized linear group plan is missing".to_string()
+                            );
+                        };
+                        quantized::warm_linear_grouped_exact(requirements)?;
+                        pipeline_count += requirements.pipeline_count;
+                    }
                     MetalOp::QuantizedEmbedding { .. } => {
                         let MetalCommandPlan::QuantizedEmbedding(requirements) = command_plan
                         else {
@@ -4519,7 +4782,19 @@ impl<'a> Lowerer<'a> {
                             query.shape[rank - 3],
                             key.shape[rank - 3],
                             *scale,
+                            query.shape[rank - 2],
                         )?;
+                        if let MetalCommandPlan::KvAttention(plan) = command_plan {
+                            if plan.splits > 1 {
+                                pipeline_count += crate::paged::warm_all_split(
+                                    query.shape[rank - 1],
+                                    query.shape[rank - 3],
+                                    key.shape[rank - 3],
+                                    *scale,
+                                    plan.splits,
+                                )?;
+                            }
+                        }
                         if *mode == KvAttentionMode::BidirectionalBlock {
                             crate::paged::warm_attention_block(
                                 query.shape[rank - 1],
@@ -4532,6 +4807,7 @@ impl<'a> Lowerer<'a> {
                                     })?
                                     .kv_dtype,
                                 *scale,
+                                query.shape[rank - 2],
                             )?;
                             pipeline_count += 1;
                         }
@@ -5095,11 +5371,13 @@ impl<'a> Lowerer<'a> {
             },
             MetalInstruction::name,
         );
+        let head_only = mark_head_only_commands(&program, &physical, &self.storage);
         Ok((
             MetalExecutable {
                 signature: driver.prepared().signature.clone(),
                 program,
                 physical: physical.into_boxed_slice(),
+                head_only,
                 prepared: MetalPreparedArtifacts { pipeline_count },
                 bindings: self.bindings.into_boxed_slice(),
                 scalar_bindings: self.scalar_bindings.into_boxed_slice(),
@@ -5716,16 +5994,32 @@ fn validate_conv_destination(
     )
 }
 
+/// How state-transaction copies reach the slots' canonical tensors.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TransactionCopyMode {
+    /// Host memcpy after a full GPU fence (the synchronous path).
+    Host,
+    /// Device copies encoded on the current stream, ordered after this
+    /// invocation's kernels and before the next deferred invocation's
+    /// readers by the stream's per-dispatch barriers (the deferred path).
+    Device,
+}
+
 /// Publishes the results of a successful stateful invocation: copies
 /// each state transaction (KDA state tiles, conv windows) into the
 /// slots' canonical state tensors, then commits cursors and applies
 /// window evictions. Runs only after every kernel, deferred check, and
-/// the cancellation gate have passed, so failed invocations never
-/// mutate live decode state.
+/// the cancellation gate have passed on the synchronous path
+/// ([`TransactionCopyMode::Host`]), or — for the deferred path
+/// ([`TransactionCopyMode::Device`]) — right after the invocation's
+/// kernels were encoded, with the copies themselves encoded as
+/// GPU-ordered device copies and only the cursor/eviction metadata
+/// applied on the host.
 fn commit_state_transactions(
     executable: &MetalExecutable,
     resolved: &[Option<Value>],
     context: Option<&dyn MetalDecodeContext>,
+    mode: TransactionCopyMode,
 ) -> Result<(), String> {
     let context = context.ok_or_else(|| "state commit requires a decode context".to_string())?;
     let mut states = context
@@ -5823,17 +6117,51 @@ fn commit_state_transactions(
             _ => {}
         }
     }
-    for copy in copies {
-        // SAFETY: `transaction_copy` verified both views are contiguous,
-        // dtype/shape-compatible, and fully in bounds of their buffers,
-        // and both buffers are shared-storage host-visible allocations.
-        // Source (invocation-owned transaction buffer) and destination
-        // (slot state) never overlap: the memory planner places
-        // transaction buffers in workspace segments disjoint from the
-        // externally owned state tensors. The GPU is fully synchronized
-        // before this point, so no in-flight kernel aliases either side.
-        unsafe {
-            std::ptr::copy_nonoverlapping(copy.source, copy.destination, copy.bytes);
+    match mode {
+        TransactionCopyMode::Host => {
+            for copy in &copies {
+                // SAFETY: `transaction_copy` verified both views are
+                // contiguous, dtype/shape-compatible, and fully in bounds of
+                // their buffers, and both buffers are shared-storage
+                // host-visible allocations. Source (invocation-owned
+                // transaction buffer) and destination (slot state) never
+                // overlap: the memory planner places transaction buffers in
+                // workspace segments disjoint from the externally owned
+                // state tensors. The GPU is fully synchronized before this
+                // point, so no in-flight kernel aliases either side.
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        copy.source
+                            .contents_ptr()
+                            .cast::<u8>()
+                            .add(copy.source_offset),
+                        copy.destination
+                            .contents_ptr()
+                            .cast::<u8>()
+                            .add(copy.destination_offset),
+                        copy.bytes,
+                    );
+                }
+            }
+        }
+        TransactionCopyMode::Device => {
+            // GPU-ordered copies on the current stream: each is dispatched
+            // after this invocation's kernels (which write the sources) and
+            // before the next deferred invocation's readers of the canonical
+            // state, with ordering provided by the stream's per-dispatch
+            // barriers and cross-buffer ordering events. The pending
+            // execution keeps every source buffer alive until the drain.
+            let metal = device::MetalDevice::get();
+            for copy in &copies {
+                crate::kernels::copy_bytes_into(
+                    metal,
+                    &copy.source,
+                    copy.source_offset,
+                    &copy.destination,
+                    copy.destination_offset,
+                    copy.bytes,
+                )?;
+            }
         }
     }
     for (index, state) in states.iter_mut().take(context.active_batch()).enumerate() {
@@ -5849,17 +6177,22 @@ fn commit_state_transactions(
     Ok(())
 }
 
-/// A validated host-side copy of one state transaction: raw byte
-/// pointers plus length, produced by [`transaction_copy`].
+/// A validated copy of one state transaction: buffer handles plus byte
+/// ranges, produced by [`transaction_copy`]. No raw pointers are stored
+/// so the plan can cross the deferral boundary; the host path recomputes
+/// pointers after the GPU fence, the device path binds the buffers to a
+/// copy kernel.
 struct TransactionCopy {
-    source: *const u8,
-    destination: *mut u8,
+    source: Arc<device::Buffer>,
+    source_offset: usize,
+    destination: Arc<device::Buffer>,
+    destination_offset: usize,
     bytes: usize,
 }
 
 /// Validates a state-transaction copy (same dtype/shape, contiguous,
-/// in bounds) and snapshots the raw host pointers for the batched copy
-/// in [`commit_state_transactions`].
+/// in bounds) and snapshots the buffers and byte ranges for the batched
+/// copy in [`commit_state_transactions`].
 fn transaction_copy(
     source: &crate::run::MetalTensor,
     destination: &crate::run::MetalTensor,
@@ -5896,21 +6229,10 @@ fn transaction_copy(
         return Err("state transaction copy exceeds its buffer".to_string());
     }
     Ok(TransactionCopy {
-        // SAFETY: the bounds checks above prove
-        // `[offset, offset + bytes)` lies within each buffer's
-        // allocation; `contents_ptr()` on these shared-storage buffers
-        // is a valid host pointer for the whole allocation. The raw
-        // pointers are used only by the batched copy in
-        // `commit_state_transactions`, which runs after GPU
-        // synchronization and before either buffer can be released.
-        source: unsafe { source.buffer.contents_ptr().cast::<u8>().add(source_offset) },
-        destination: unsafe {
-            destination
-                .buffer
-                .contents_ptr()
-                .cast::<u8>()
-                .add(destination_offset)
-        },
+        source: source.buffer.clone(),
+        source_offset,
+        destination: destination.buffer.clone(),
+        destination_offset,
         bytes,
     })
 }
@@ -6079,6 +6401,7 @@ pub(super) fn execute(
         kv,
         None,
         None,
+        false,
     )? {
         ExecutionOutput::Values(outputs) => Ok(outputs),
         ExecutionOutput::Sampled(_) => unreachable!("ordinary execution returned samples"),
@@ -6102,6 +6425,7 @@ pub(super) fn execute_with_scalars(
         None,
         None,
         None,
+        false,
     )? {
         ExecutionOutput::Values(outputs) => Ok(outputs),
         ExecutionOutput::Sampled(_) => unreachable!("ordinary execution returned samples"),
@@ -6153,6 +6477,7 @@ pub(super) fn execute_stateful(
     cancelled: &CancellationFlag,
     kv: &dyn MetalDecodeContext,
     commit_allowed: &dyn Fn() -> bool,
+    headless: bool,
 ) -> Result<Vec<Value>, String> {
     match execute_with_commit(
         executable,
@@ -6163,6 +6488,7 @@ pub(super) fn execute_stateful(
         Some(kv),
         Some(commit_allowed),
         None,
+        headless,
     )? {
         ExecutionOutput::Values(outputs) => Ok(outputs),
         ExecutionOutput::Sampled(_) => unreachable!("ordinary execution returned samples"),
@@ -6190,22 +6516,51 @@ pub(super) fn execute_stateful_sampled(
         Some(kv),
         Some(commit_allowed),
         Some(sampling),
+        false,
     )? {
         ExecutionOutput::Sampled(tokens) => Ok(tokens),
         ExecutionOutput::Values(_) => unreachable!("sampled execution returned tensor outputs"),
     }
 }
 
-fn execute_with_commit(
+/// Everything one encoded-but-not-yet-drained invocation owns: the
+/// acquired workspace segments, the resolved value table, the deferred
+/// host checks, the sampling result allocation, the dispatch outcome,
+/// and (for the synchronous path) the submission guard that drains on
+/// drop. Kept whole until the final fence so no buffer the GPU may
+/// still touch is recycled early.
+struct PreparedExecution {
+    resolved: Vec<Option<Value>>,
+    sampling_result: Option<crate::run::MetalTensor>,
+    sampling_encoded: usize,
+    ce_checks: Vec<DeferredCeCheck>,
+    quantized_embedding_checks: Vec<DeferredQuantizedEmbeddingCheck>,
+    dispatch_result: Result<(), String>,
+    _resources: crate::workspace::InvocationResources,
+    _submission: Option<device::MetalSubmissionGuard<'static>>,
+}
+
+/// Validates, resolves, and encodes one invocation without any host
+/// fence: every physical command is dispatched and the outcome is
+/// packaged as a [`PreparedExecution`]. When `submission` is `None` an
+/// owned explicit submission is opened (and stored in the result); when
+/// `Some`, the caller's stream is used so consecutive deferred
+/// invocations pipeline on one Metal submission. A `headless` invocation
+/// skips commands marked by [`mark_head_only_commands`] (the LM-head
+/// chain); program output 0 then holds unwritten buffer contents and
+/// must not be consumed.
+#[allow(clippy::too_many_arguments)]
+fn prepare_execution(
     executable: &MetalExecutable,
     declared_bindings: &[Value],
     generated_bindings: &[Value],
     scalar_bindings: &[f64],
     cancelled: &CancellationFlag,
     kv: Option<&dyn MetalDecodeContext>,
-    commit_allowed: Option<&dyn Fn() -> bool>,
     sampling: Option<&[effect_torch_runtime::SamplingOptions]>,
-) -> Result<ExecutionOutput, String> {
+    submission: Option<&device::MetalSubmissionGuard<'_>>,
+    headless: bool,
+) -> Result<PreparedExecution, String> {
     if cancelled.load(Ordering::Relaxed) {
         return Err("operation aborted".to_string());
     }
@@ -6423,7 +6778,10 @@ fn execute_with_commit(
     };
     let mut ce_checks = Vec::new();
     let mut quantized_embedding_checks = Vec::new();
-    let _submission = metal.begin_submission()?;
+    let owned_submission = match submission {
+        Some(_) => None,
+        None => Some(metal.begin_submission()?),
+    };
     let invocation_nonce = INVOCATION_NONCE.fetch_add(1, Ordering::AcqRel);
     let mut sampling_encoded = 0;
     let dispatch_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -6435,12 +6793,15 @@ fn execute_with_commit(
                 let mut last_encoded = None;
                 let mut pending_status_gate = None;
                 let mut completed = false;
-                for physical in &executable.physical {
+                for (command_index, physical) in executable.physical.iter().enumerate() {
                     if completed {
                         return Err("physical completion is not final".to_string());
                     }
                     match *physical {
                         MetalPhysicalCommand::Encode(id) => {
+                            if headless && executable.head_only[command_index] {
+                                continue;
+                            }
                             if pending_status_gate.is_some() {
                                 return Err(
                                     "physical status gate is missing its command-buffer commit"
@@ -6573,6 +6934,35 @@ fn execute_with_commit(
             },
         )
     }));
+    let dispatch_result = match dispatch_result {
+        Ok(result) => result,
+        Err(payload) => Err(panic_message(payload)),
+    };
+    Ok(PreparedExecution {
+        resolved,
+        sampling_result,
+        sampling_encoded,
+        ce_checks,
+        quantized_embedding_checks,
+        dispatch_result,
+        _resources: resources,
+        _submission: owned_submission,
+    })
+}
+
+/// Synchronous completion of a [`PreparedExecution`]: one full GPU fence,
+/// the deferred host checks in command order, the dispatch outcome, the
+/// cancellation/commit gates, and (for stateful invocations) the host-side
+/// state-transaction commit. Backend submission failures take precedence
+/// over host errors, panics, and cancellation.
+fn finish_prepared(
+    prepared: PreparedExecution,
+    executable: &MetalExecutable,
+    cancelled: &CancellationFlag,
+    commit_allowed: Option<&dyn Fn() -> bool>,
+    kv: Option<&dyn MetalDecodeContext>,
+) -> Result<ExecutionOutput, String> {
+    let metal = device::MetalDevice::get();
     // Synchronize unconditionally before any segment or output owner can be
     // released. Backend submission failures take precedence over host errors,
     // panics, and cancellation.
@@ -6580,23 +6970,20 @@ fn execute_with_commit(
     gpu_result?;
     // Status command buffers retain their boundaries, but one final fence is
     // sufficient for every deferred host check in command order.
-    let sampled_tokens = if let Some(result) = sampling_result.as_ref() {
-        let ce_result = run_ce_checks(&ce_checks);
+    let sampled_tokens = if let Some(result) = prepared.sampling_result.as_ref() {
+        let ce_result = run_ce_checks(&prepared.ce_checks);
         let quantized_embedding_result =
-            run_quantized_embedding_checks(&quantized_embedding_checks);
-        let sampled_result = read_sampling_results(result, sampling_encoded);
+            run_quantized_embedding_checks(&prepared.quantized_embedding_checks);
+        let sampled_result = read_sampling_results(result, prepared.sampling_encoded);
         ce_result?;
         quantized_embedding_result?;
         Some(sampled_result?)
     } else {
-        run_ce_checks(&ce_checks)?;
-        run_quantized_embedding_checks(&quantized_embedding_checks)?;
+        run_ce_checks(&prepared.ce_checks)?;
+        run_quantized_embedding_checks(&prepared.quantized_embedding_checks)?;
         None
     };
-    match dispatch_result {
-        Ok(result) => result?,
-        Err(payload) => return Err(panic_message(payload)),
-    }
+    prepared.dispatch_result?;
     if cancelled.load(Ordering::Relaxed) {
         return Err("operation aborted".to_string());
     }
@@ -6604,7 +6991,12 @@ fn execute_with_commit(
         return Err("operation aborted".to_string());
     }
     if kv.is_some() {
-        commit_state_transactions(executable, &resolved, kv)?;
+        commit_state_transactions(
+            executable,
+            &prepared.resolved,
+            kv,
+            TransactionCopyMode::Host,
+        )?;
     }
     if let Some(tokens) = sampled_tokens {
         Ok(ExecutionOutput::Sampled(tokens))
@@ -6614,13 +7006,199 @@ fn execute_with_commit(
             .outputs
             .iter()
             .map(|value| {
-                resolved[value.index()]
+                prepared.resolved[value.index()]
                     .as_ref()
                     .cloned()
                     .ok_or_else(|| format!("internal error: output value {value} is unavailable"))
             })
             .collect::<Result<Vec<_>, _>>()
             .map(ExecutionOutput::Values)
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn execute_with_commit(
+    executable: &MetalExecutable,
+    declared_bindings: &[Value],
+    generated_bindings: &[Value],
+    scalar_bindings: &[f64],
+    cancelled: &CancellationFlag,
+    kv: Option<&dyn MetalDecodeContext>,
+    commit_allowed: Option<&dyn Fn() -> bool>,
+    sampling: Option<&[effect_torch_runtime::SamplingOptions]>,
+    headless: bool,
+) -> Result<ExecutionOutput, String> {
+    let prepared = prepare_execution(
+        executable,
+        declared_bindings,
+        generated_bindings,
+        scalar_bindings,
+        cancelled,
+        kv,
+        sampling,
+        None,
+        headless,
+    )?;
+    finish_prepared(prepared, executable, cancelled, commit_allowed, kv)
+}
+
+/// One invocation whose GPU work is encoded but not yet fenced. Owns the
+/// invocation's workspace lease and resolved values so nothing the GPU may
+/// still touch is recycled before [`PendingExecution::drain_batch`] (or the
+/// drop fence). State transactions were already encoded as GPU-ordered
+/// device copies and the CPU-side cursor commits applied, so only the host
+/// checks remain.
+pub(crate) struct PendingExecution {
+    prepared: PreparedExecution,
+    outputs: Vec<Value>,
+    drained: std::cell::Cell<bool>,
+}
+
+impl PendingExecution {
+    /// The program outputs, available immediately: GPU-ordered consumers
+    /// (a deferred replay executable) may bind them before the drain, host
+    /// readers must wait for it.
+    pub(crate) fn outputs(&self) -> &[Value] {
+        &self.outputs
+    }
+
+    /// Runs this pending's deferred host checks in command order. Call only
+    /// after the stream fence.
+    fn run_host_checks(&self) -> Result<(), String> {
+        run_ce_checks(&self.prepared.ce_checks)?;
+        run_quantized_embedding_checks(&self.prepared.quantized_embedding_checks)
+    }
+
+    /// Fences the stream once and finishes every pending in order, then
+    /// releases their workspaces. On failure the error is returned and the
+    /// remaining pendings are dropped (already fenced, so safely); CPU-side
+    /// cursor metadata for optimistically committed chunks may then be
+    /// inconsistent — the session errors out, as a synchronous failure
+    /// would.
+    pub(crate) fn drain_batch(pendings: Vec<PendingExecution>) -> Result<(), String> {
+        if pendings.is_empty() {
+            return Ok(());
+        }
+        let gpu_result = device::MetalDevice::get().synchronize();
+        for pending in &pendings {
+            pending.drained.set(true);
+        }
+        gpu_result?;
+        for pending in &pendings {
+            pending.run_host_checks()?;
+        }
+        Ok(())
+    }
+
+    /// Fences the stream and returns this pending's outputs.
+    #[cfg(test)]
+    pub(crate) fn drain(mut self) -> Result<Vec<Value>, String> {
+        let gpu_result = device::MetalDevice::get().synchronize();
+        self.drained.set(true);
+        gpu_result?;
+        self.run_host_checks()?;
+        Ok(std::mem::take(&mut self.outputs))
+    }
+}
+
+impl Drop for PendingExecution {
+    /// A pending abandoned without a drain (error paths between chunks)
+    /// fences the stream first so its workspace and resolved values are
+    /// never recycled underneath in-flight GPU work.
+    fn drop(&mut self) {
+        if !self.drained.get() {
+            let _ = device::MetalDevice::get().synchronize();
+        }
+    }
+}
+
+/// Executes a stateful invocation without a host fence: validates,
+/// resolves, and dispatches every physical command onto the caller's
+/// submission stream, encodes the state transactions as GPU-ordered
+/// device copies (so the next deferred chunk's kernels read canonical
+/// state in stream order), applies the CPU-side cursor commits and
+/// evictions immediately, and returns a [`PendingExecution`] that keeps
+/// the workspace and resolved values alive until the drain.
+///
+/// Unlike the synchronous path there is no sampling support and the
+/// `commit_allowed`/cancellation gates are evaluated right after encoding
+/// (prefill passes an always-true gate); a gate failure finishes the
+/// invocation synchronously without committing. Dispatch (encoding)
+/// failures also fence immediately, preserving the synchronous path's
+/// GPU-failure precedence.
+pub(crate) fn execute_stateful_deferred(
+    executable: &MetalExecutable,
+    declared_bindings: &[Value],
+    generated_bindings: &[Value],
+    cancelled: &CancellationFlag,
+    kv: &dyn MetalDecodeContext,
+    commit_allowed: &dyn Fn() -> bool,
+    submission: &device::MetalSubmissionGuard<'_>,
+    headless: bool,
+) -> Result<PendingExecution, String> {
+    let prepared = match prepare_execution(
+        executable,
+        declared_bindings,
+        generated_bindings,
+        &[],
+        cancelled,
+        Some(kv),
+        None,
+        Some(submission),
+        headless,
+    ) {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            // Fence before releasing anything the earlier deferred chunks
+            // may still have in flight on this stream.
+            let _ = device::MetalDevice::get().synchronize();
+            return Err(error);
+        }
+    };
+    if prepared.dispatch_result.is_err() || cancelled.load(Ordering::Relaxed) || !commit_allowed() {
+        // Reuse the synchronous finisher: it fences, runs the deferred
+        // checks in order, surfaces the dispatch error, and — because one
+        // of the gates above failed — never commits state.
+        let result = finish_prepared(
+            prepared,
+            executable,
+            cancelled,
+            Some(commit_allowed),
+            Some(kv),
+        );
+        return Err(result
+            .err()
+            .unwrap_or_else(|| "operation aborted".to_string()));
+    }
+    let deferred = (|| {
+        commit_state_transactions(
+            executable,
+            &prepared.resolved,
+            Some(kv),
+            TransactionCopyMode::Device,
+        )?;
+        executable
+            .program
+            .outputs
+            .iter()
+            .map(|value| {
+                prepared.resolved[value.index()]
+                    .as_ref()
+                    .cloned()
+                    .ok_or_else(|| format!("internal error: output value {value} is unavailable"))
+            })
+            .collect::<Result<Vec<_>, _>>()
+    })();
+    match deferred {
+        Ok(outputs) => Ok(PendingExecution {
+            prepared,
+            outputs,
+            drained: std::cell::Cell::new(false),
+        }),
+        Err(error) => {
+            let _ = device::MetalDevice::get().synchronize();
+            Err(error)
+        }
     }
 }
 
@@ -7699,6 +8277,10 @@ fn execute_op_into(
                 .iter()
                 .map(|value| value.as_metal().cloned())
                 .collect::<Result<Vec<_>, _>>()?;
+            let kv_scratch_tensors = scratch
+                .iter()
+                .map(|value| value.as_metal().cloned())
+                .collect::<Result<Vec<_>, _>>()?;
             context.kv_attention_into(
                 *layer,
                 query,
@@ -7709,6 +8291,7 @@ fn execute_op_into(
                 *mode,
                 output(0)?.as_metal()?,
                 &staging_tensors,
+                &kv_scratch_tensors,
             )
         }
         MetalOp::RotaryEmbedding {
@@ -7804,6 +8387,25 @@ fn execute_op_into(
                 output(0)?.as_metal()?,
                 requirements,
             )
+        }
+        MetalOp::QuantizedLinearGroup { .. } => {
+            let MetalCommandPlan::QuantizedLinearGroup(requirements) = plan else {
+                return Err("quantized linear group is missing exact requirements".to_string());
+            };
+            if inputs.len() != requirements.members.len() + 1
+                || outputs.len() != requirements.members.len()
+            {
+                return Err(
+                    "quantized linear group arity does not match its requirements".to_string(),
+                );
+            }
+            let members = requirements
+                .members
+                .iter()
+                .enumerate()
+                .map(|(index, _)| Ok((inputs[1 + index].as_metal()?, outputs[index].as_metal()?)))
+                .collect::<Result<Vec<_>, String>>()?;
+            quantized::linear_grouped_into(input(0)?.as_metal()?, &members, requirements)
         }
         MetalOp::QuantizedEmbedding { .. } => {
             let MetalCommandPlan::QuantizedEmbedding(requirements) = plan else {
@@ -8166,8 +8768,7 @@ fn execute_op_into(
                 ));
             }
             let (time, width) = (shape[1], shape[2]);
-            let lane =
-                decode_lane.ok_or_else(|| "last token row must be a program output".to_string())?;
+            let lane = decode_lane.unwrap_or(0);
             let Some(slot) = context.physical_slot(lane) else {
                 return metal_ops::fill_into(0.0, output(0)?.as_metal()?);
             };
@@ -8692,6 +9293,232 @@ mod tests {
     }
 
     #[test]
+    fn quantized_linear_group_merges_same_input_same_codec_decode_projections() {
+        let fixtures = quantized_fixtures();
+        let q4 = fixtures
+            .iter()
+            .find(|fixture| fixture.codec == GgmlKQuant::Q4K)
+            .unwrap();
+        let q2 = fixtures
+            .iter()
+            .find(|fixture| fixture.codec == GgmlKQuant::Q2K)
+            .unwrap();
+        let columns = 512usize;
+        let input = leaf_shape(vec![0.5; columns], vec![1, columns]);
+        let projection = |fixture: &QuantizedFixture, rows: usize| {
+            let packed = fixture
+                .bytes
+                .iter()
+                .copied()
+                .cycle()
+                .take(rows * fixture.bytes.len() * (columns / 256))
+                .collect::<Vec<_>>();
+            Node::new(NodeKind::QuantizedLinear {
+                x: input.clone(),
+                weight: leaf_u8(&packed, vec![rows, fixture.bytes.len() * (columns / 256)]),
+                bias: None,
+                codec: fixture.codec,
+                weight_shape: [rows, columns],
+            })
+            .unwrap()
+        };
+        // Muse-Glimmer order: Q and gate share a codec but are
+        // separated by the K/V pair of another codec.
+        let q = projection(q4, 2);
+        let k = projection(q2, 3);
+        let v = projection(q2, 4);
+        let gate = projection(q4, 5);
+        let compilation = compile_graph(&[q, k, v, gate], false);
+        let commands = compilation.executable.commands();
+        assert_eq!(commands.len(), 2);
+        for (command, (codec, rows)) in commands
+            .iter()
+            .zip([(GgmlKQuant::Q4K, vec![2, 5]), (GgmlKQuant::Q2K, vec![3, 4])])
+        {
+            let (op, plan) = operation(command);
+            let MetalOp::QuantizedLinearGroup { .. } = op else {
+                panic!("expected a grouped quantized linear, got {}", op.name());
+            };
+            let MetalCommandPlan::QuantizedLinearGroup(requirements) = plan else {
+                panic!("expected grouped quantized linear requirements");
+            };
+            assert_eq!(requirements.codec, codec);
+            assert_eq!(
+                requirements
+                    .members
+                    .iter()
+                    .map(|member| member.rows)
+                    .collect::<Vec<_>>(),
+                rows
+            );
+            assert_eq!(command.inputs.len(), 3);
+            assert_eq!(command.outputs.len(), 2);
+        }
+    }
+
+    #[test]
+    fn quantized_linear_group_is_not_formed_for_unsupported_shapes() {
+        let fixture = quantized_fixtures()
+            .into_iter()
+            .find(|fixture| fixture.codec == GgmlKQuant::Q4K)
+            .unwrap();
+        let columns = 512usize;
+        let projection = |x: Arc<Node>, codec: GgmlKQuant, bias: bool| {
+            let encoded_row_bytes = codec.encoded_row_bytes(columns).unwrap();
+            let packed = fixture
+                .bytes
+                .iter()
+                .copied()
+                .cycle()
+                .take(2 * encoded_row_bytes)
+                .collect::<Vec<_>>();
+            Node::new(NodeKind::QuantizedLinear {
+                x,
+                weight: leaf_u8(&packed, vec![2, encoded_row_bytes]),
+                bias: bias.then(|| leaf_shape(vec![0.25, -0.5], vec![2])),
+                codec,
+                weight_shape: [2, columns],
+            })
+            .unwrap()
+        };
+        let count_plain = |compilation: &MetalCompilation| {
+            compilation
+                .executable
+                .commands()
+                .iter()
+                .filter(|command| matches!(operation(command).0, MetalOp::QuantizedLinear { .. }))
+                .count()
+        };
+
+        // Mixed codecs never group.
+        let input = leaf_shape(vec![0.5; columns], vec![1, columns]);
+        let compilation = compile_graph(
+            &[
+                projection(input.clone(), GgmlKQuant::Q4K, false),
+                projection(input, GgmlKQuant::Q6K, false),
+            ],
+            false,
+        );
+        assert_eq!(count_plain(&compilation), 2);
+
+        // Biased members never group.
+        let input = leaf_shape(vec![0.5; columns], vec![1, columns]);
+        let compilation = compile_graph(
+            &[
+                projection(input.clone(), GgmlKQuant::Q4K, true),
+                projection(input, GgmlKQuant::Q4K, false),
+            ],
+            false,
+        );
+        assert_eq!(count_plain(&compilation), 2);
+
+        // MMA prefill shapes (vectors >= 8) never group.
+        let input = leaf_shape(vec![0.5; 16 * columns], vec![16, columns]);
+        let compilation = compile_graph(
+            &[
+                projection(input.clone(), GgmlKQuant::Q4K, false),
+                projection(input, GgmlKQuant::Q4K, false),
+            ],
+            false,
+        );
+        assert_eq!(count_plain(&compilation), 2);
+
+        // Dependent inputs never group.
+        let input = leaf_shape(vec![0.5; columns], vec![1, columns]);
+        let encoded_row_bytes = GgmlKQuant::Q4K.encoded_row_bytes(columns).unwrap();
+        let wide = fixture
+            .bytes
+            .iter()
+            .copied()
+            .cycle()
+            .take(columns * encoded_row_bytes)
+            .collect::<Vec<_>>();
+        let first = Node::new(NodeKind::QuantizedLinear {
+            x: input,
+            weight: leaf_u8(&wide, vec![columns, encoded_row_bytes]),
+            bias: None,
+            codec: GgmlKQuant::Q4K,
+            weight_shape: [columns, columns],
+        })
+        .unwrap();
+        let compilation = compile_graph(
+            &[first.clone(), projection(first, GgmlKQuant::Q4K, false)],
+            false,
+        );
+        assert_eq!(count_plain(&compilation), 2);
+    }
+
+    #[test]
+    fn quantized_linear_grouped_execution_matches_reference_values() {
+        for fixture in quantized_fixtures() {
+            let columns = 512usize;
+            let decoded = fixture
+                .expected()
+                .into_iter()
+                .cycle()
+                .take(columns)
+                .collect::<Vec<_>>();
+            for vectors in [1usize, 4] {
+                let input_values = (0..vectors * columns)
+                    .map(|index| ((index * 7 + index / columns * 3) % 17) as f32 * 0.125 - 1.0)
+                    .collect::<Vec<_>>();
+                let input = leaf_shape(input_values.clone(), vec![vectors, columns]);
+                let mut roots = Vec::new();
+                for rows in [2usize, 3] {
+                    let packed = fixture
+                        .bytes
+                        .iter()
+                        .copied()
+                        .cycle()
+                        .take(rows * fixture.bytes.len() * (columns / 256))
+                        .collect::<Vec<_>>();
+                    roots.push(
+                        Node::new(NodeKind::QuantizedLinear {
+                            x: input.clone(),
+                            weight: leaf_u8(
+                                &packed,
+                                vec![rows, fixture.bytes.len() * (columns / 256)],
+                            ),
+                            bias: None,
+                            codec: fixture.codec,
+                            weight_shape: [rows, columns],
+                        })
+                        .unwrap(),
+                    );
+                }
+                let compilation = compile_graph(&roots, false);
+                let commands = compilation.executable.commands();
+                assert_eq!(
+                    commands.len(),
+                    1,
+                    "{} should form one group",
+                    fixture.codec.name()
+                );
+                let (op, plan) = operation(commands[0]);
+                assert!(matches!(op, MetalOp::QuantizedLinearGroup { .. }));
+                let MetalCommandPlan::QuantizedLinearGroup(requirements) = plan else {
+                    panic!("expected grouped quantized linear requirements");
+                };
+                assert_eq!(requirements.members.len(), 2);
+
+                let actual = run(&compilation);
+                for (root, rows) in actual.iter().zip([2usize, 3]) {
+                    let actual = root.to_f32_vec().unwrap();
+                    let mut expected = Vec::with_capacity(vectors * rows);
+                    for vector in 0..vectors {
+                        let dot = input_values[vector * columns..(vector + 1) * columns]
+                            .iter()
+                            .zip(&decoded)
+                            .fold(0.0f32, |sum, (&input, &weight)| sum + input * weight);
+                        expected.extend(std::iter::repeat_n(dot, rows));
+                    }
+                    assert_quantized_close(&actual, &expected);
+                }
+            }
+        }
+    }
+
+    #[test]
     fn quantized_embedding_executes_every_codec_for_u32_and_i64_indexes() {
         for fixture in quantized_fixtures() {
             let expected_row = fixture.expected();
@@ -9150,6 +9977,7 @@ mod tests {
             &CancellationFlag::new(),
             &context,
             &|| true,
+            false,
         )
         .unwrap();
         assert_eq!(output[0].to_f32_vec().unwrap(), [3.0, 4.0, 1.0, 1.0]);
@@ -10631,6 +11459,7 @@ mod tests {
             _mode: KvAttentionMode,
             _output: &crate::run::MetalTensor,
             _staging: &[crate::run::MetalTensor],
+            _scratch: &[crate::run::MetalTensor],
         ) -> Result<(), String> {
             Err("unexpected KV attention".to_string())
         }
@@ -10730,6 +11559,7 @@ mod tests {
             &CancellationFlag::new(),
             &context,
             &|| true,
+            false,
         )
         .unwrap();
         assert_eq!(outputs.len(), 1);
@@ -10906,6 +11736,7 @@ mod tests {
                 &CancellationFlag::new(),
                 &context,
                 &|| true,
+                false,
             )
             .err()
             .unwrap();
@@ -10980,6 +11811,7 @@ mod tests {
             &CancellationFlag::new(),
             &context,
             &|| true,
+            false,
         )
         .err()
         .unwrap();
@@ -10994,10 +11826,228 @@ mod tests {
             &CancellationFlag::new(),
             &context,
             &|| false,
+            false,
         )
         .err()
         .unwrap();
         assert_eq!(error, "operation aborted");
+        assert_eq!(persistent.read_f32().unwrap(), vec![0.0; 4]);
+        let state = context.slots[0].lock().unwrap();
+        assert_eq!(state.cursor, 0);
+        assert_eq!(state.advance, 1);
+    }
+
+    fn kda_recurrence_compilation_and_context(
+        initial: Vec<f32>,
+    ) -> (MetalCompilation, TestDecodeContext, crate::run::MetalTensor) {
+        let q = leaf_shape(vec![0.2, 0.4], vec![1, 1, 1, 2]);
+        let recurrence = Node::new(NodeKind::KdaRecurrence {
+            q: q.clone(),
+            k: q.clone(),
+            v: q,
+            log_decay: leaf_shape(vec![-0.1, -0.2], vec![1, 1, 1, 2]),
+            beta: leaf_shape(vec![0.5], vec![1, 1, 1, 1]),
+            scale: 0.5,
+            layer: 0,
+        })
+        .unwrap();
+        let schema = KvStateSchema {
+            max_tokens: 64,
+            block_size: 16,
+            kv_dtype: DType::F32,
+            window: None,
+            batch: 1,
+            graph_batch: 1,
+            layers: 0,
+            kv_heads: 0,
+            head_dim: 0,
+            kda: KdaGeometry {
+                layers: 1,
+                heads: 1,
+                head_dim: 2,
+                value_dim: 2,
+            },
+            conv: ConvGeometry::default(),
+            cursor_slot: u32::MAX,
+            cursor_tensor: false,
+        };
+        let compilation = compile_graph_with_state(&[recurrence], false, schema);
+        let persistent =
+            crate::run::MetalTensor::from_f32(device::MetalDevice::get(), initial, vec![1, 2, 2]);
+        let context = TestDecodeContext {
+            schema,
+            slots: vec![Arc::new(Mutex::new(SeqState {
+                blocks: Vec::with_capacity(4),
+                head: 0,
+                cursor: 0,
+                advance: 1,
+                last_hash: 0,
+                pending: Vec::new(),
+                kda_states: vec![persistent.clone()],
+                conv_states: Vec::new(),
+            }))],
+        };
+        (compilation, context, persistent)
+    }
+
+    #[test]
+    fn headless_execution_skips_the_logits_chain_but_commits_state() {
+        let compilation = compile_last_token_row();
+        // The last-token selector is the only encode and feeds only output 0.
+        let marked = compilation
+            .executable
+            .physical
+            .iter()
+            .zip(compilation.executable.head_only.iter())
+            .filter(|(command, mark)| **mark && matches!(command, MetalPhysicalCommand::Encode(_)))
+            .count();
+        assert_eq!(
+            marked,
+            1,
+            "marks={:?} effects={:?}",
+            compilation.executable.head_only,
+            compilation
+                .executable
+                .program
+                .instructions
+                .iter()
+                .map(|i| (
+                    i.kind.name(),
+                    i.effects.has_side_effects,
+                    i.state.len(),
+                    i.outputs.len()
+                ))
+                .collect::<Vec<_>>()
+        );
+        let context = last_token_row_context(2);
+        let outputs = execute_stateful(
+            &compilation.executable,
+            &[],
+            &compilation.generated_bindings,
+            &CancellationFlag::new(),
+            &context,
+            &|| true,
+            true,
+        )
+        .unwrap();
+        // Output 0's producer was skipped: the value exists (its buffer was
+        // planned) but must be treated as unwritten by headless callers.
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0].shape(), &[4]);
+        // State commits and cursor bookkeeping still happen.
+        assert_eq!(context.slots[0].lock().unwrap().cursor, 2);
+    }
+
+    #[test]
+    fn head_only_liveness_flows_through_alias_views() {
+        // The neg consumes a reshaped (zero-copy alias) view of the relu
+        // output; reshape introduces no instruction, so liveness must walk
+        // the alias chain to keep the relu unmarked.
+        let leaf = leaf_shape((0..12).map(|value| value as f32).collect(), vec![1, 3, 4]);
+        let relu = Node::new(NodeKind::Relu { a: leaf.clone() }).unwrap();
+        let view = Node::new(NodeKind::Reshape {
+            a: relu,
+            shape: vec![3, 4],
+        })
+        .unwrap();
+        let neg = Node::new(NodeKind::Neg { a: view }).unwrap();
+        let head = Node::new(NodeKind::LastTokenRow { a: leaf }).unwrap();
+        let compilation = compile_graph(&[head, neg], false);
+        let marked: Vec<&MetalPhysicalCommand> = compilation
+            .executable
+            .physical
+            .iter()
+            .zip(compilation.executable.head_only.iter())
+            .filter(|(_, mark)| **mark)
+            .map(|(command, _)| command)
+            .collect();
+        assert_eq!(marked.len(), 1, "only the head chain is head-eligible");
+        assert!(matches!(marked[0], MetalPhysicalCommand::Encode(_)));
+    }
+
+    #[test]
+    fn deferred_stateful_executions_pipeline_and_commit_like_the_synchronous_path() {
+        let (compilation, sync_context, sync_persistent) =
+            kda_recurrence_compilation_and_context(vec![0.0; 4]);
+        // Synchronous baseline: two sequential committed invocations.
+        let mut expected_outputs = Vec::new();
+        for _ in 0..2 {
+            expected_outputs = execute_stateful(
+                &compilation.executable,
+                &[],
+                &compilation.generated_bindings,
+                &CancellationFlag::new(),
+                &sync_context,
+                &|| true,
+                false,
+            )
+            .unwrap();
+            sync_context.slots[0].lock().unwrap().advance = 1;
+        }
+        let expected_state = sync_persistent.read_f32().unwrap();
+        assert_eq!(sync_context.slots[0].lock().unwrap().cursor, 2);
+
+        let (compilation, deferred_context, deferred_persistent) =
+            kda_recurrence_compilation_and_context(vec![0.0; 4]);
+        let submission = device::MetalDevice::get().begin_submission().unwrap();
+        let first = execute_stateful_deferred(
+            &compilation.executable,
+            &[],
+            &compilation.generated_bindings,
+            &CancellationFlag::new(),
+            &deferred_context,
+            &|| true,
+            &submission,
+            false,
+        )
+        .unwrap();
+        // CPU-side cursor metadata commits immediately, before the fence.
+        assert_eq!(deferred_context.slots[0].lock().unwrap().cursor, 1);
+        deferred_context.slots[0].lock().unwrap().advance = 1;
+        let second = execute_stateful_deferred(
+            &compilation.executable,
+            &[],
+            &compilation.generated_bindings,
+            &CancellationFlag::new(),
+            &deferred_context,
+            &|| true,
+            &submission,
+            false,
+        )
+        .unwrap();
+        assert_eq!(deferred_context.slots[0].lock().unwrap().cursor, 2);
+        // One fence finishes the first chunk; the second (whose KDA initial
+        // state depends on the first chunk's GPU-ordered transaction copy)
+        // drains right after.
+        PendingExecution::drain_batch(vec![first]).unwrap();
+        let outputs = second.drain().unwrap();
+        drop(submission);
+        assert_eq!(deferred_persistent.read_f32().unwrap(), expected_state);
+        assert_eq!(outputs.len(), expected_outputs.len());
+        for (output, expected) in outputs.iter().zip(&expected_outputs) {
+            assert_eq!(output.to_f32_vec().unwrap(), expected.to_f32_vec().unwrap());
+        }
+    }
+
+    #[test]
+    fn deferred_commit_gate_failure_aborts_without_committing() {
+        let (compilation, context, persistent) =
+            kda_recurrence_compilation_and_context(vec![0.0; 4]);
+        let submission = device::MetalDevice::get().begin_submission().unwrap();
+        let error = execute_stateful_deferred(
+            &compilation.executable,
+            &[],
+            &compilation.generated_bindings,
+            &CancellationFlag::new(),
+            &context,
+            &|| false,
+            &submission,
+            false,
+        )
+        .err()
+        .unwrap();
+        assert_eq!(error, "operation aborted");
+        drop(submission);
         assert_eq!(persistent.read_f32().unwrap(), vec![0.0; 4]);
         let state = context.slots[0].lock().unwrap();
         assert_eq!(state.cursor, 0);

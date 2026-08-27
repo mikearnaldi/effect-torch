@@ -13,6 +13,7 @@
     "bench:compile": "pnpm --filter @effect-torch/bench bench:compile",
     "bench:inference": "pnpm --filter @effect-torch/bench bench:inference",
     "bench:mlx": "pnpm --filter @effect-torch/bench bench:mlx",
+    "bench:muse-glimmer": "pnpm --filter @effect-torch/bench bench:muse-glimmer",
     "verify:native-packages": "node scripts/verify-native-packages.mjs"
   },
   "devDependencies": {

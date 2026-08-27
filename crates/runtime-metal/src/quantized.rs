@@ -24,11 +24,16 @@
 //!   (Q2K/Q4K/Q6K: 2, Q3K: 3, Q5K: 1). Partial dots fold with
 //!   `simd_sum` (decode) or a short `simd_shuffle_xor` tree (batched
 //!   multi-vector variants, `ET_VECTOR_LANES` ∈ {1, 2, 4}).
-//! - `et_quantized_linear_mma`: prefill path for `vectors ≥ 16` and
-//!   large weights — 16×128×64 tiles, blocks decoded to threadgroup
-//!   memory via `et_decode_k16`, then `simdgroup_float8x8` matrix
-//!   multiply-accumulate. Requires 32 KB of threadgroup memory
-//!   (asserted at warm time).
+//! - `et_quantized_linear_mma`: prefill path for `vectors ≥ 8` and
+//!   large weights — blocks decoded to threadgroup memory via
+//!   `et_decode_k16`, then 8×8 simdgroup matrix multiply-accumulate.
+//!   The default-selected variants (`et_quantized_linear_mma_half`)
+//!   dequantize weights and stage the input tile as `threadgroup half`
+//!   with `simdgroup_half8x8` A/B operands and `simdgroup_float8x8`
+//!   accumulators in the llama.cpp `mul_mm` tile geometry; f32-operand
+//!   variants remain compiled for rollback and parity tests.
+//!   Threadgroup usage stays under 16 KB (8 KB for the half variants),
+//!   asserted at warm time.
 //! - `et_quantized_embedding`: one threadgroup of 256 threads visits
 //!   only the selected packed rows; out-of-range indexes are skipped
 //!   and reported through a u32 status word (atomic store, relaxed).
@@ -63,6 +68,33 @@ pub struct LinearRequirements {
     /// Bytes of the f32 output.
     pub output_bytes: usize,
     /// 1 when the problem is non-empty, 0 for zero-element outputs
+    /// (no dispatch needed).
+    pub pipeline_count: usize,
+}
+
+/// Planner-facing requirements of a decode-time grouped quantized
+/// linear: 2–4 independent bias-free members that share one f32 input
+/// and codec, dispatched as a single `et_quantized_linear_grouped`
+/// command. Restricted to the packed-dot decode kernels
+/// (`KernelKind::Linear`/`LinearBatched`, vectors < 8); MMA prefill
+/// shapes are never grouped.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GroupedLinearRequirements {
+    /// The shared K-quant codec of every packed weight.
+    pub codec: GgmlKQuant,
+    /// The shared f32 input shape, rank ≥ 2, trailing dim = `columns`.
+    pub input_shape: Box<[usize]>,
+    /// Shared contraction width.
+    pub columns: usize,
+    /// Shared number of input vectors (`numel(input) / columns`).
+    pub vectors: usize,
+    /// Shared bytes of one packed row.
+    pub encoded_row_bytes: usize,
+    /// Exact per-member plans; row counts and output shapes may differ.
+    pub members: Box<[LinearRequirements]>,
+    /// Total bytes of all f32 member outputs.
+    pub output_bytes: usize,
+    /// 1 when any member is non-empty, 0 for all-empty groups
     /// (no dispatch needed).
     pub pipeline_count: usize,
 }
@@ -190,6 +222,72 @@ pub fn linear_requirements(
         has_bias: bias.is_some(),
         output_bytes,
         pipeline_count: usize::from(output_elements != 0),
+    })
+}
+
+/// Plans a decode-time grouped quantized linear from 2–4 exact member
+/// plans. Members must share codec, input geometry (shape, columns,
+/// vectors, encoded row bytes), and be bias-free; row counts may
+/// differ. Only non-MMA packed-dot decode shapes (vectors < 8) group.
+pub fn grouped_linear_requirements(
+    members: &[LinearRequirements],
+) -> Result<GroupedLinearRequirements, String> {
+    if !(2..=4).contains(&members.len()) {
+        return Err(format!(
+            "quantized_linear_group: expected 2..=4 members, got {}",
+            members.len()
+        ));
+    }
+    let first = &members[0];
+    for member in members {
+        if member.codec != first.codec
+            || member.input_shape != first.input_shape
+            || member.columns != first.columns
+            || member.vectors != first.vectors
+            || member.encoded_row_bytes != first.encoded_row_bytes
+        {
+            return Err(
+                "quantized_linear_group: members must share codec and exact input geometry"
+                    .to_string(),
+            );
+        }
+        if member.has_bias {
+            return Err("quantized_linear_group: biased members are not grouped".to_string());
+        }
+        let mut expected_output = first.input_shape.to_vec();
+        *expected_output
+            .last_mut()
+            .expect("member input rank was validated") = member.rows;
+        if member.output_shape.as_ref() != expected_output.as_slice() {
+            return Err(
+                "quantized_linear_group: member output does not match the shared input shape"
+                    .to_string(),
+            );
+        }
+        if !matches!(
+            linear_kernel_kind(member),
+            KernelKind::Linear | KernelKind::LinearBatched(_)
+        ) {
+            return Err(
+                "quantized_linear_group: only non-MMA packed-dot decode shapes group".to_string(),
+            );
+        }
+    }
+    let output_bytes = members
+        .iter()
+        .try_fold(0usize, |total, member| {
+            total.checked_add(member.output_bytes)
+        })
+        .ok_or_else(|| "quantized_linear_group: output byte size overflow".to_string())?;
+    Ok(GroupedLinearRequirements {
+        codec: first.codec,
+        input_shape: first.input_shape.clone(),
+        columns: first.columns,
+        vectors: first.vectors,
+        encoded_row_bytes: first.encoded_row_bytes,
+        members: members.to_vec().into_boxed_slice(),
+        output_bytes,
+        pipeline_count: usize::from(members.iter().any(|member| member.pipeline_count != 0)),
     })
 }
 
@@ -353,14 +451,25 @@ fn validate_embedding(
     status.validate_destination("quantized_embedding", &[1], DType::U32)
 }
 
-#[derive(Clone, Copy)]
+#[allow(dead_code)] // f32 MMA variants remain warm-selectable rollback kernels.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum KernelKind {
     Linear,
     LinearBatched(u8),
+    LinearGrouped(u8),
     LinearMma,
     LinearMmaSimple,
+    LinearMma32,
+    LinearMma32Simple,
     LinearMma8,
     LinearMma8Simple,
+    LinearMmaHalf,
+    LinearMmaSimpleHalf,
+    LinearMma32Half,
+    LinearMma32SimpleHalf,
+    LinearMma8Half,
+    LinearMma8SimpleHalf,
+    LinearMma32SwzHalf,
     Embedding,
 }
 
@@ -385,10 +494,23 @@ fn pipeline_key(kind: KernelKind, codec: GgmlKQuant, index_dtype: Option<DType>)
             2u8.hash(&mut hasher);
             vector_lanes.hash(&mut hasher);
         }
+        KernelKind::LinearGrouped(vector_lanes) => {
+            9u8.hash(&mut hasher);
+            vector_lanes.hash(&mut hasher);
+        }
         KernelKind::LinearMma => 3u8.hash(&mut hasher),
         KernelKind::LinearMmaSimple => 4u8.hash(&mut hasher),
+        KernelKind::LinearMma32 => 7u8.hash(&mut hasher),
+        KernelKind::LinearMma32Simple => 8u8.hash(&mut hasher),
         KernelKind::LinearMma8 => 5u8.hash(&mut hasher),
         KernelKind::LinearMma8Simple => 6u8.hash(&mut hasher),
+        KernelKind::LinearMmaHalf => 10u8.hash(&mut hasher),
+        KernelKind::LinearMmaSimpleHalf => 11u8.hash(&mut hasher),
+        KernelKind::LinearMma32Half => 12u8.hash(&mut hasher),
+        KernelKind::LinearMma32SimpleHalf => 13u8.hash(&mut hasher),
+        KernelKind::LinearMma8Half => 14u8.hash(&mut hasher),
+        KernelKind::LinearMma8SimpleHalf => 15u8.hash(&mut hasher),
+        KernelKind::LinearMma32SwzHalf => 17u8.hash(&mut hasher),
         KernelKind::Embedding => 1u8.hash(&mut hasher),
     }
     codec_tag(codec).hash(&mut hasher);
@@ -483,7 +605,8 @@ inline float et_decode_k(device const uchar* block, uint lane) {
 #endif
 }
 
-inline void et_decode_k16(device const uchar* block, uint group, threadgroup float* destination, uint stride) {
+template <typename P>
+inline void et_decode_k16(device const uchar* block, uint group, P destination, uint stride) {
 #if ET_CODEC == 2
     const uint half_index = group / 8;
     const uint within = group % 8;
@@ -580,6 +703,170 @@ inline void et_decode_k16(device const uchar* block, uint group, threadgroup flo
     }
 #endif
 }
+
+// Specialized 16-value group decode for the half MMA path. Q2_K/Q3_K
+// load the 16 quant bytes with wide loads (Q2_K's qs field is 4-byte
+// aligned in every block; Q3_K's fields are only 2-byte aligned, so
+// ushort pairs), unpack the 2-bit fields SIMD-in-register, and convert
+// through the half magic constant (0x6400 | v encodes 1024 + v
+// exactly). The f32 scale arithmetic and the single rounding to half
+// match et_decode_k16 bit for bit; other codecs fall back to it.
+inline void et_decode_k16_half(device const uchar* block, uint group, thread half* destination) {
+#if ET_CODEC == 2
+    const uint half_index = group / 8;
+    const uint within = group % 8;
+    const uint shift = (within / 2) * 2;
+    const uint quant_offset = (within % 2) * 16;
+    const uchar packed_scale = block[group];
+    const float scale = et_fp16_at(block, 80) * float(packed_scale & 15);
+    const float offset = et_fp16_at(block, 82) * float(packed_scale >> 4);
+    device const uint* quants = reinterpret_cast<device const uint*>(
+        block + 16 + half_index * 32 + quant_offset);
+    const uint4 q = uint4(quants[0], quants[1], quants[2], quants[3]);
+    const uint4 u = (q >> shift) & uint4(0x03030303u);
+    for (uint word = 0; word < 4; ++word) {
+        // Magic-lane split yields byte order (b0, b2) / (b1, b3).
+        const uint lo = (u[word] & 0x00FF00FFu) | 0x64006400u;
+        const uint hi = ((u[word] >> 8) & 0x00FF00FFu) | 0x64006400u;
+        const half2 even = as_type<half2>(lo);
+        const half2 odd = as_type<half2>(hi);
+        const half4 unpacked = half4(even.x, odd.x, even.y, odd.y) - half4(1024.0h);
+        const float4 values = float4(unpacked) * scale - offset;
+        *reinterpret_cast<thread half4*>(destination + 4 * word) = half4(values);
+    }
+#elif ET_CODEC == 3
+    const uint half_index = group / 8;
+    const uint within = group % 8;
+    const uint quant_lane = within / 2;
+    const uint shift = quant_lane * 2;
+    const uint quant_offset = (within % 2) * 16;
+    const uchar low = group < 8 ? (block[96 + group] & 15) : (block[96 + group - 8] >> 4);
+    const uchar high = (block[104 + group % 4] >> (2 * (group / 4))) & 3;
+    const float scale = et_fp16_at(block, 108) * float(int(low | (high << 4)) - 32);
+    device const ushort* quants = reinterpret_cast<device const ushort*>(
+        block + 32 + half_index * 32 + quant_offset);
+    device const ushort* hmask = reinterpret_cast<device const ushort*>(block + quant_offset);
+    uint4 q;
+    uint4 h;
+    for (uint word = 0; word < 4; ++word) {
+        q[word] = uint(quants[2 * word]) | (uint(quants[2 * word + 1]) << 16);
+        h[word] = uint(hmask[2 * word]) | (uint(hmask[2 * word + 1]) << 16);
+    }
+    const uint4 u = ((q >> shift) & uint4(0x03030303u))
+        | (((h >> (half_index * 4 + quant_lane)) & uint4(0x01010101u)) << 2);
+    for (uint word = 0; word < 4; ++word) {
+        // Magic-lane split yields byte order (b0, b2) / (b1, b3).
+        const uint lo = (u[word] & 0x00FF00FFu) | 0x64006400u;
+        const uint hi = ((u[word] >> 8) & 0x00FF00FFu) | 0x64006400u;
+        const half2 even = as_type<half2>(lo);
+        const half2 odd = as_type<half2>(hi);
+        const half4 unpacked = half4(even.x, odd.x, even.y, odd.y) - half4(1028.0h);
+        const float4 values = float4(unpacked) * scale;
+        *reinterpret_cast<thread half4*>(destination + 4 * word) = half4(values);
+    }
+#else
+    et_decode_k16(block, group, destination, 1);
+#endif
+}
+// Paired variant of et_decode_k16_half: decodes groups `group` and
+// `group + 2`, which share the same 16 quant bytes (fields at shifts
+// s and s+2) and, for Q3_K, the same 16 hmask bytes (bits b and b+1).
+// Halves the device loads per decoded value. Writes 32 halves: the
+// first 16 for `group`, the next 16 for `group + 2`.
+#if ET_CODEC == 2
+inline void et_decode_k16_half2(device const uchar* block, uint group, thread half* destination) {
+    const uint half_index = group / 8;
+    const uint within = group % 8;
+    const uint shift = (within / 2) * 2;
+    const uint quant_offset = (within % 2) * 16;
+    const uchar packed_scale_a = block[group];
+    const uchar packed_scale_b = block[group + 2];
+    const float d = et_fp16_at(block, 80);
+    const float dmin = et_fp16_at(block, 82);
+    const float scale_a = d * float(packed_scale_a & 15);
+    const float offset_a = dmin * float(packed_scale_a >> 4);
+    const float scale_b = d * float(packed_scale_b & 15);
+    const float offset_b = dmin * float(packed_scale_b >> 4);
+    device const uint* quants = reinterpret_cast<device const uint*>(
+        block + 16 + half_index * 32 + quant_offset);
+    const uint4 q = uint4(quants[0], quants[1], quants[2], quants[3]);
+    // Per byte: quant fields a|b<<2 side by side.
+    const uint4 both = (q >> shift) & uint4(0x0F0F0F0Fu);
+    const uint4 u_a = both & uint4(0x03030303u);
+    const uint4 u_b = (both >> 2) & uint4(0x03030303u);
+    for (uint word = 0; word < 4; ++word) {
+        const uint lo_a = (u_a[word] & 0x00FF00FFu) | 0x64006400u;
+        const uint hi_a = ((u_a[word] >> 8) & 0x00FF00FFu) | 0x64006400u;
+        const half2 even_a = as_type<half2>(lo_a);
+        const half2 odd_a = as_type<half2>(hi_a);
+        const float4 values_a =
+            float4(half4(even_a.x, odd_a.x, even_a.y, odd_a.y) - half4(1024.0h)) * scale_a
+            - offset_a;
+        *reinterpret_cast<thread half4*>(destination + 4 * word) = half4(values_a);
+        const uint lo_b = (u_b[word] & 0x00FF00FFu) | 0x64006400u;
+        const uint hi_b = ((u_b[word] >> 8) & 0x00FF00FFu) | 0x64006400u;
+        const half2 even_b = as_type<half2>(lo_b);
+        const half2 odd_b = as_type<half2>(hi_b);
+        const float4 values_b =
+            float4(half4(even_b.x, odd_b.x, even_b.y, odd_b.y) - half4(1024.0h)) * scale_b
+            - offset_b;
+        *reinterpret_cast<thread half4*>(destination + 16 + 4 * word) = half4(values_b);
+    }
+}
+#elif ET_CODEC == 3
+inline void et_decode_k16_half2(device const uchar* block, uint group, thread half* destination) {
+    const uint half_index = group / 8;
+    const uint within = group % 8;
+    const uint quant_lane = within / 2;
+    const uint shift = quant_lane * 2;
+    const uint quant_offset = (within % 2) * 16;
+    const uchar low_a = group < 8 ? (block[96 + group] & 15) : (block[96 + group - 8] >> 4);
+    const uchar low_b = group + 2 < 8 ? (block[96 + group + 2] & 15) : (block[96 + group - 6] >> 4);
+    const uchar high_a = (block[104 + group % 4] >> (2 * (group / 4))) & 3;
+    const uchar high_b = (block[104 + (group + 2) % 4] >> (2 * ((group + 2) / 4))) & 3;
+    const float d = et_fp16_at(block, 108);
+    const float scale_a = d * float(int(low_a | (high_a << 4)) - 32);
+    const float scale_b = d * float(int(low_b | (high_b << 4)) - 32);
+    device const ushort* quants = reinterpret_cast<device const ushort*>(
+        block + 32 + half_index * 32 + quant_offset);
+    device const ushort* hmask = reinterpret_cast<device const ushort*>(block + quant_offset);
+    uint4 q;
+    uint4 h;
+    for (uint word = 0; word < 4; ++word) {
+        q[word] = uint(quants[2 * word]) | (uint(quants[2 * word + 1]) << 16);
+        h[word] = uint(hmask[2 * word]) | (uint(hmask[2 * word + 1]) << 16);
+    }
+    const uint bit = half_index * 4 + quant_lane;
+    // Per byte: quant fields a|b<<2 in v, hmask bits b|b+1 in w.
+    const uint4 v = (q >> shift) & uint4(0x0F0F0F0Fu);
+    const uint4 w = (h >> bit) & uint4(0x03030303u);
+    const uint4 u_a = (v & uint4(0x03030303u)) | ((w & uint4(0x01010101u)) << 2);
+    const uint4 u_b = ((v >> 2) & uint4(0x03030303u)) | ((w & uint4(0x02020202u)) << 1);
+    for (uint word = 0; word < 4; ++word) {
+        const uint lo_a = (u_a[word] & 0x00FF00FFu) | 0x64006400u;
+        const uint hi_a = ((u_a[word] >> 8) & 0x00FF00FFu) | 0x64006400u;
+        const half2 even_a = as_type<half2>(lo_a);
+        const half2 odd_a = as_type<half2>(hi_a);
+        const float4 values_a =
+            float4(half4(even_a.x, odd_a.x, even_a.y, odd_a.y) - half4(1028.0h)) * scale_a;
+        *reinterpret_cast<thread half4*>(destination + 4 * word) = half4(values_a);
+        const uint lo_b = (u_b[word] & 0x00FF00FFu) | 0x64006400u;
+        const uint hi_b = ((u_b[word] >> 8) & 0x00FF00FFu) | 0x64006400u;
+        const half2 even_b = as_type<half2>(lo_b);
+        const half2 odd_b = as_type<half2>(hi_b);
+        const float4 values_b =
+            float4(half4(even_b.x, odd_b.x, even_b.y, odd_b.y) - half4(1028.0h)) * scale_b;
+        *reinterpret_cast<thread half4*>(destination + 16 + 4 * word) = half4(values_b);
+    }
+}
+#else
+// Never called (pair_decode is false for other codecs); defined so the
+// dead branch in the half MMA kernel still compiles.
+inline void et_decode_k16_half2(device const uchar* block, uint group, thread half* destination) {
+    et_decode_k16_half(block, group, destination);
+    et_decode_k16_half(block, group + 2, destination + 16);
+}
+#endif
 "#;
 
 const LINEAR_SOURCE: &str = r#"
@@ -637,19 +924,19 @@ static_assert(sizeof(et_block_q4_k) == 144, "invalid Q4_K block layout");
 static_assert(sizeof(et_block_q5_k) == 176, "invalid Q5_K block layout");
 static_assert(sizeof(et_block_q6_k) == 210, "invalid Q6_K block layout");
 
-kernel void et_quantized_linear(
-    device const float* input [[buffer(0)]],
-    device const uchar* weight [[buffer(1)]],
-    device const float* bias [[buffer(2)]],
-    device float* output [[buffer(3)]],
-    constant ulong& vectors [[buffer(4)]],
-    constant ulong& rows [[buffer(5)]],
-    constant ulong& columns [[buffer(6)]],
-    constant ulong& encoded_row_bytes [[buffer(7)]],
-    constant uint& has_bias [[buffer(8)]],
-    uint2 group [[threadgroup_position_in_grid]],
-    ushort lane [[thread_index_in_simdgroup]],
-    ushort simd_group [[simdgroup_index_in_threadgroup]]) {
+inline void et_quantized_linear_body(
+    device const float* input,
+    device const uchar* weight,
+    device const float* bias,
+    device float* output,
+    const ulong vectors,
+    const ulong rows,
+    const ulong columns,
+    const ulong encoded_row_bytes,
+    const uint has_bias,
+    const uint2 group,
+    const ushort lane,
+    const ushort simd_group) {
     const ulong first_row = (ulong(group.x) * ET_SIMD_GROUPS + ulong(simd_group)) * ET_ROWS_PER_SIMD;
 #if ET_VECTOR_LANES == 1
     const ulong vector = ulong(group.y);
@@ -1017,6 +1304,84 @@ kernel void et_quantized_linear(
 #endif
     }
 }
+
+kernel void et_quantized_linear(
+    device const float* input [[buffer(0)]],
+    device const uchar* weight [[buffer(1)]],
+    device const float* bias [[buffer(2)]],
+    device float* output [[buffer(3)]],
+    constant ulong& vectors [[buffer(4)]],
+    constant ulong& rows [[buffer(5)]],
+    constant ulong& columns [[buffer(6)]],
+    constant ulong& encoded_row_bytes [[buffer(7)]],
+    constant uint& has_bias [[buffer(8)]],
+    uint2 group [[threadgroup_position_in_grid]],
+    ushort lane [[thread_index_in_simdgroup]],
+    ushort simd_group [[simdgroup_index_in_threadgroup]]) {
+    et_quantized_linear_body(
+        input,
+        weight,
+        bias,
+        output,
+        vectors,
+        rows,
+        columns,
+        encoded_row_bytes,
+        has_bias,
+        group,
+        lane,
+        simd_group
+    );
+}
+"#;
+
+/// Grouped decode projection: 2–4 members share one input and codec.
+/// `group.z` selects the member; each member binds its own packed
+/// weight and output and reads its own row count. Bias-free only
+/// (grouping rejects biased members), so the bias slot of the shared
+/// body receives the member output pointer and `has_bias == 0`.
+const LINEAR_GROUPED_SOURCE: &str = r#"
+kernel void et_quantized_linear_grouped(
+    device const float* input [[buffer(0)]],
+    device const uchar* weight0 [[buffer(1)]],
+    device const uchar* weight1 [[buffer(2)]],
+    device const uchar* weight2 [[buffer(3)]],
+    device const uchar* weight3 [[buffer(4)]],
+    device float* output0 [[buffer(5)]],
+    device float* output1 [[buffer(6)]],
+    device float* output2 [[buffer(7)]],
+    device float* output3 [[buffer(8)]],
+    constant ulong& vectors [[buffer(9)]],
+    constant ulong* member_rows [[buffer(10)]],
+    constant ulong& columns [[buffer(11)]],
+    constant ulong& encoded_row_bytes [[buffer(12)]],
+    uint3 group3 [[threadgroup_position_in_grid]],
+    ushort lane [[thread_index_in_simdgroup]],
+    ushort simd_group [[simdgroup_index_in_threadgroup]]) {
+    const uint member = group3.z;
+    device const uchar* weight = member == 0 ? weight0
+        : member == 1 ? weight1
+        : member == 2 ? weight2
+        : weight3;
+    device float* output = member == 0 ? output0
+        : member == 1 ? output1
+        : member == 2 ? output2
+        : output3;
+    et_quantized_linear_body(
+        input,
+        weight,
+        output,
+        output,
+        vectors,
+        member_rows[member],
+        columns,
+        encoded_row_bytes,
+        0u,
+        uint2(group3.x, group3.y),
+        lane,
+        simd_group
+    );
+}
 "#;
 
 const MMA_LINEAR_SOURCE: &str = r#"
@@ -1073,13 +1438,12 @@ kernel void et_quantized_linear_mma(
     constexpr uint tile_m = ET_TILE_M;
     constexpr uint tile_n = 16;
     constexpr uint tile_k = 128;
+    constexpr uint decode_storage = ET_PIPELINED ? 2 * tile_k * tile_n : tile_k * tile_n;
+    constexpr uint output_storage = 4 * tile_m * tile_n;
+    constexpr uint storage_len = decode_storage > output_storage ? decode_storage : output_storage;
+    threadgroup float tile_storage[storage_len];
     const ulong first_vector = ulong(group.y) * tile_m;
     const ulong first_row = ulong(group.x) * tile_n;
-#if ET_PIPELINED
-    threadgroup float tile_storage[2 * tile_k * tile_n];
-#else
-    threadgroup float tile_storage[tile_k * tile_n];
-#endif
     simdgroup_float8x8 accumulators[ET_TILE_M / 8][2];
     for (uint i = 0; i < ET_TILE_M / 8; ++i) {
         for (uint j = 0; j < 2; ++j) {
@@ -1108,14 +1472,15 @@ kernel void et_quantized_linear_mma(
             const uint n0 = 0;
             const uint k_begin = uint(simd_group) * 32;
             for (uint k = k_begin; k < k_begin + 32; k += 8) {
+                simdgroup_float8x8 b0;
+                simdgroup_load(b0, &tile_storage[current + (n0 + 0) * tile_k + k], tile_k, 0, true);
+                simdgroup_float8x8 b1;
+                simdgroup_load(b1, &tile_storage[current + (n0 + 8) * tile_k + k], tile_k, 0, true);
                 for (uint i = 0; i < ET_TILE_M / 8; ++i) {
                     simdgroup_float8x8 a;
                     simdgroup_load(a, input + (first_vector + i * 8) * columns + k0 + k, uint(columns));
-                    for (uint j = 0; j < 2; ++j) {
-                        simdgroup_float8x8 b;
-                        simdgroup_load(b, &tile_storage[current + (n0 + j * 8) * tile_k + k], tile_k, 0, true);
-                        simdgroup_multiply_accumulate(accumulators[i][j], a, b, accumulators[i][j]);
-                    }
+                    simdgroup_multiply_accumulate(accumulators[i][0], a, b0, accumulators[i][0]);
+                    simdgroup_multiply_accumulate(accumulators[i][1], a, b1, accumulators[i][1]);
                 }
             }
         } else if (k0 + tile_k < uint(columns)) {
@@ -1150,14 +1515,15 @@ kernel void et_quantized_linear_mma(
         const uint n0 = 0;
         const uint k_begin = uint(simd_group) * 32;
         for (uint k = k_begin; k < k_begin + 32; k += 8) {
+            simdgroup_float8x8 b0;
+            simdgroup_load(b0, &tile_storage[(n0 + 0) * tile_k + k], tile_k, 0, true);
+            simdgroup_float8x8 b1;
+            simdgroup_load(b1, &tile_storage[(n0 + 8) * tile_k + k], tile_k, 0, true);
             for (uint i = 0; i < ET_TILE_M / 8; ++i) {
                 simdgroup_float8x8 a;
                 simdgroup_load(a, input + (first_vector + i * 8) * columns + k0 + k, uint(columns));
-                for (uint j = 0; j < 2; ++j) {
-                    simdgroup_float8x8 b;
-                    simdgroup_load(b, &tile_storage[(n0 + j * 8) * tile_k + k], tile_k, 0, true);
-                    simdgroup_multiply_accumulate(accumulators[i][j], a, b, accumulators[i][j]);
-                }
+                simdgroup_multiply_accumulate(accumulators[i][0], a, b0, accumulators[i][0]);
+                simdgroup_multiply_accumulate(accumulators[i][1], a, b1, accumulators[i][1]);
             }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -1199,6 +1565,452 @@ kernel void et_quantized_linear_mma(
 }
 "#;
 
+/// Half-operand twin of `MMA_LINEAR_SOURCE`, following the shipped
+/// llama.cpp `mul_mm` geometry: weight tiles are dequantized into
+/// `threadgroup half`, the input tile is staged into `threadgroup half`
+/// once per K tile, A/B operands are `simdgroup_half8x8`, and
+/// accumulation stays in `simdgroup_float8x8`. Each threadgroup covers
+/// ET_TILE_N rows (32 by default, 64 in the wide geometry) x ET_TILE_M
+/// vectors over a 2048-element K tile; every simdgroup owns the full
+/// output tile over one quarter of the tile's K blocks (K-split), so
+/// each 8x8 threadgroup block is loaded once per K tile instead of
+/// once per output quadrant pair, and the four partial reductions are
+/// folded through threadgroup memory after the K loop. Decode runs
+/// into registers before the tile barrier so it overlaps the previous
+/// tile's MMA. Tiles use the interleaved 8x8-block layout (64
+/// contiguous halves per block, ld=8 loads, no transposes) and stay
+/// under 8 KB of threadgroup memory.
+const MMA_LINEAR_HALF_SOURCE: &str = r#"
+#include <metal_simdgroup_matrix>
+
+#define ET_TILE_M $TILE_M
+#define ET_TILE_N $TILE_N
+#define ET_SWIZZLE $SWIZZLE
+
+kernel void et_quantized_linear_mma_half(
+    device const float* input [[buffer(0)]],
+    device const uchar* weight [[buffer(1)]],
+    device const float* bias [[buffer(2)]],
+    device float* output [[buffer(3)]],
+    constant ulong& vectors [[buffer(4)]],
+    constant ulong& rows [[buffer(5)]],
+    constant ulong& columns [[buffer(6)]],
+    constant ulong& encoded_row_bytes [[buffer(7)]],
+    constant uint& has_bias [[buffer(8)]],
+    uint2 group [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]],
+    ushort simd_group [[simdgroup_index_in_threadgroup]]) {
+    constexpr uint tile_m = ET_TILE_M;
+    constexpr uint tile_n = ET_TILE_N;
+    // Q2_K/Q3_K can decode groups in shift-adjacent pairs (chunks c
+    // and c + 2 share their 16 quant bytes) over a doubled K tile;
+    // measured neutral against the unpaired 2048-element footprint,
+    // so it stays available for probes but off by default.
+    constexpr bool pair_decode = false;
+    constexpr uint tile_k = 2048 / tile_n;
+    constexpr uint k_blocks = tile_k / 8;
+    constexpr uint decode_chunks = tile_k / 16;
+    constexpr uint temp_groups = pair_decode ? 2 : 1;
+    constexpr uint decode_units = pair_decode ? decode_chunks / 2 : decode_chunks;
+    constexpr uint decode_items = tile_n * decode_units;
+    constexpr uint decode_rounds = (decode_items + 127) / 128;
+    constexpr uint w_halves = tile_n * tile_k;
+    constexpr uint a_halves = tile_m * tile_k;
+    constexpr uint half_floats = (w_halves + a_halves + 1) / 2;
+    constexpr uint out_floats = tile_n * tile_m;
+    constexpr uint storage_floats = half_floats > out_floats ? half_floats : out_floats;
+    constexpr uint storage_quads = storage_floats / 4;
+    // K-split simdgroup geometry: each simdgroup owns the full output
+    // tile (a_count x b_count 8x8 blocks) over k_blocks / 4 of the K
+    // tile, so every 8x8 weight/input block is loaded from threadgroup
+    // memory exactly once per K tile (halving load traffic against the
+    // 2x2 output-quadrant split). The four K-quarter partials are
+    // folded through threadgroup memory after the K loop.
+    constexpr uint n_blocks = tile_n / 8;
+    constexpr uint b_count = n_blocks;
+    constexpr uint a_count = tile_m / 8;
+    // Input staging: 8-element chunks, at most `stage_rounds` per thread.
+    constexpr uint stage_chunks = tile_m * tile_k / 8;
+    constexpr uint stage_rounds = (stage_chunks + 127) / 128;
+    threadgroup uint4 storage[storage_quads];
+    // Weight tile: [k][n] 8x8 blocks, block (nb, kb) at
+    // (nb * k_blocks + kb) * 64.
+    threadgroup half* wt = reinterpret_cast<threadgroup half*>(storage);
+    // Input tile: [m][k] 8x8 blocks, block (mb, kb) at
+    // (mb * k_blocks + kb) * 64.
+    threadgroup half* it = wt + w_halves;
+    // Output staging: [m][n] f32, aliases the half tiles (written only
+    // after the last tile read).
+    threadgroup float* st = reinterpret_cast<threadgroup float*>(storage);
+#if ET_SWIZZLE
+    // Vector-tile-fastest dispatch order: co-resident threadgroups share
+    // one 32-row weight tile, so the L2 absorbs the M-tile replication
+    // instead of DRAM (llama.cpp mul_mm grid order).
+    const ulong first_vector = ulong(group.x) * tile_m;
+    const ulong first_row = ulong(group.y) * tile_n;
+#else
+    const ulong first_vector = ulong(group.y) * tile_m;
+    const ulong first_row = ulong(group.x) * tile_n;
+#endif
+    simdgroup_float8x8 accumulators[a_count][b_count];
+    for (uint i = 0; i < a_count; ++i) {
+        for (uint j = 0; j < b_count; ++j) {
+            accumulators[i][j] = simdgroup_float8x8(0.0f);
+        }
+    }
+
+    // Per-round decode coordinates (loop-invariant): item =
+    // tid + round * 128 covers the tile_n x decode_units grid. In the
+    // paired Q2_K/Q3_K path each item covers groups (c, c + 2) of one
+    // superblock; chunk order interleaves so both stay in-block.
+    uint decode_row_r[decode_rounds];
+    uint decode_chunk_r[decode_rounds][2];
+    for (uint round = 0; round < decode_rounds; ++round) {
+        const uint item = tid + round * 128;
+        const bool active = item < decode_items;
+        decode_row_r[round] = active ? item / decode_units : 0;
+        const uint unit = active ? item % decode_units : 0;
+        if (pair_decode) {
+            const uint first_chunk = (unit % 2) + (unit / 2) * (decode_chunks / 2);
+            decode_chunk_r[round][0] = first_chunk;
+            decode_chunk_r[round][1] = first_chunk + 2;
+        } else {
+            decode_chunk_r[round][0] = unit;
+        }
+    }
+    const bool stage_active = tid < stage_chunks || stage_rounds > 1;
+    const uint stage_m0 = tid / k_blocks;
+    const uint stage_k0 = (tid % k_blocks) * 8;
+    for (uint k0 = 0; k0 < uint(columns); k0 += tile_k) {
+        // Dequantize 16 values of one row into registers before the
+        // barrier, so the decode overlaps the previous tile's MMA
+        // (llama.cpp mul_mm ordering). half4 storage keeps the
+        // vectorized Q2_K/Q3_K decode stores aligned.
+        half4 temp[decode_rounds][temp_groups][4];
+        for (uint round = 0; round < decode_rounds; ++round) {
+            const uint item = tid + round * 128;
+            thread half* temp_h = reinterpret_cast<thread half*>(temp[round]);
+            if (item < decode_items && first_row + decode_row_r[round] < rows) {
+                const uint group_column = k0 + decode_chunk_r[round][0] * 16;
+                device const uchar* block =
+                    weight + (first_row + decode_row_r[round]) * encoded_row_bytes +
+                    ulong(group_column / 256) * ET_BLOCK_BYTES;
+                if (pair_decode) {
+                    et_decode_k16_half2(block, (group_column % 256) / 16, temp_h);
+                } else {
+                    et_decode_k16_half(block, (group_column % 256) / 16, temp_h);
+                }
+            } else {
+                for (uint g = 0; g < temp_groups; ++g) {
+                    for (uint index = 0; index < 4; ++index) {
+                        temp[round][g][index] = half4(0.0h);
+                    }
+                }
+            }
+        }
+        // Likewise fetch this thread's input chunks early. The staged
+        // offsets are always 16-byte aligned (columns and tile_k are
+        // multiples of 256 and stage_k0 a multiple of 8), so float4
+        // loads are safe.
+        float4 staged[stage_rounds][2];
+        if (stage_active) {
+            for (uint round = 0; round < stage_rounds; ++round) {
+                const uint m = stage_m0 + round * (128 / k_blocks);
+                if (m < tile_m) {
+                    device const float4* source =
+                        reinterpret_cast<device const float4*>(
+                            input + (first_vector + m) * columns + k0 + stage_k0);
+                    staged[round][0] = source[0];
+                    staged[round][1] = source[1];
+                }
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        // Stride 8 lands the two 8-value halves in adjacent k blocks.
+        for (uint round = 0; round < decode_rounds; ++round) {
+            if (tid + round * 128 < decode_items) {
+                for (uint g = 0; g < temp_groups; ++g) {
+                    threadgroup half* base =
+                        &wt[((decode_row_r[round] / 8) * k_blocks +
+                                decode_chunk_r[round][g] * 2) * 64 +
+                            decode_row_r[round] % 8];
+                    thread const half* temp_h =
+                        reinterpret_cast<thread const half*>(temp[round][g]);
+                    for (uint index = 0; index < 16; ++index) {
+                        base[index * 8] = temp_h[index];
+                    }
+                }
+            }
+        }
+        if (stage_active) {
+            for (uint round = 0; round < stage_rounds; ++round) {
+                const uint m = stage_m0 + round * (128 / k_blocks);
+                if (m < tile_m) {
+                    threadgroup half4* base = reinterpret_cast<threadgroup half4*>(
+                        it + ((m / 8) * k_blocks + stage_k0 / 8) * 64 + (m % 8) * 8
+                    );
+                    base[0] = half4(staged[round][0]);
+                    base[1] = half4(staged[round][1]);
+                }
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        // K-split MMA: simdgroup s reduces K blocks s, s + 4, ... over
+        // the full output tile; 2x the MACs per threadgroup load of
+        // the output-quadrant split.
+        for (uint kb = uint(simd_group); kb < k_blocks; kb += 4) {
+            simdgroup_half8x8 a[a_count];
+            for (uint i = 0; i < a_count; ++i) {
+                simdgroup_load(a[i], it + (i * k_blocks + kb) * 64, 8);
+            }
+            simdgroup_half8x8 b[b_count];
+            for (uint j = 0; j < b_count; ++j) {
+                simdgroup_load(b[j], wt + (j * k_blocks + kb) * 64, 8);
+            }
+            for (uint i = 0; i < a_count; ++i) {
+                for (uint j = 0; j < b_count; ++j) {
+                    simdgroup_multiply_accumulate(
+                        accumulators[i][j],
+                        a[i],
+                        b[j],
+                        accumulators[i][j]
+                    );
+                }
+            }
+        }
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    // Fold the four K-quarter partial reductions into st: each
+    // simdgroup adds its accumulators onto the running sum in turn.
+    for (uint turn = 0; turn < 4; ++turn) {
+        if (uint(simd_group) == turn) {
+            for (uint i = 0; i < a_count; ++i) {
+                for (uint j = 0; j < b_count; ++j) {
+                    threadgroup float* dst = &st[(i * 8) * tile_n + j * 8];
+                    if (turn == 0) {
+                        simdgroup_store(accumulators[i][j], dst, tile_n);
+                    } else {
+                        simdgroup_float8x8 partial;
+                        simdgroup_load(partial, dst, tile_n);
+                        for (uint e = 0; e < 2; ++e) {
+                            partial.thread_elements()[e] +=
+                                accumulators[i][j].thread_elements()[e];
+                        }
+                        simdgroup_store(partial, dst, tile_n);
+                    }
+                }
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    for (uint element = tid; element < tile_n * tile_m; element += 128) {
+        const uint vector_offset = element / tile_n;
+        const uint row_offset = element % tile_n;
+        const ulong vector = first_vector + vector_offset;
+        const ulong out_row = first_row + row_offset;
+        if (vector < vectors && out_row < rows) {
+            output[vector * rows + out_row] =
+                st[element] + (has_bias != 0 ? bias[out_row] : 0.0f);
+        }
+    }
+}
+
+// Warp-specialized pipelined twin (probe candidate): 256 threads, of
+// which simdgroups 0-3 run the MMA over the current K tile while
+// simdgroups 4-7 dequantize and stage the next K tile into the other
+// half of the double-buffered tiles. One barrier per tile; decode and
+// staging overlap the MMA within the threadgroup instead of relying on
+// co-resident threadgroups.
+template <uint TILE_M, uint TILE_N>
+inline void et_mma_half_ws_fill(
+    device const uchar* weight,
+    device const float* input,
+    ulong rows,
+    ulong encoded_row_bytes,
+    ulong first_row,
+    ulong first_vector,
+    ulong columns,
+    uint k0,
+    uint dtid,
+    threadgroup half* wt_nxt,
+    threadgroup half* it_nxt
+) {
+    constexpr uint tile_m = TILE_M;
+    constexpr uint tile_k = 2048 / TILE_N;
+    constexpr uint k_blocks = tile_k / 8;
+    constexpr uint decode_chunks = tile_k / 16;
+    constexpr uint stage_rounds = (tile_m * tile_k / 8 + 127) / 128;
+    const uint decode_row = dtid / decode_chunks;
+    const uint decode_chunk = dtid % decode_chunks;
+    const ulong decode_row_global = first_row + decode_row;
+    const uint stage_m0 = dtid / k_blocks;
+    const uint stage_k0 = (dtid % k_blocks) * 8;
+    half4 temp[4];
+    if (decode_row_global < rows) {
+        const uint group_column = k0 + decode_chunk * 16;
+        device const uchar* block = weight +
+            decode_row_global * encoded_row_bytes +
+            ulong(group_column / 256) * ET_BLOCK_BYTES;
+        et_decode_k16_half(
+            block,
+            (group_column % 256) / 16,
+            reinterpret_cast<thread half*>(temp)
+        );
+    } else {
+        for (uint index = 0; index < 4; ++index) {
+            temp[index] = half4(0.0h);
+        }
+    }
+    float4 staged[stage_rounds][2];
+    for (uint round = 0; round < stage_rounds; ++round) {
+        const uint m = stage_m0 + round * (128 / k_blocks);
+        if (m < tile_m) {
+            device const float4* source = reinterpret_cast<device const float4*>(
+                input + (first_vector + m) * columns + k0 + stage_k0);
+            staged[round][0] = source[0];
+            staged[round][1] = source[1];
+        }
+    }
+    threadgroup half* base =
+        &wt_nxt[((decode_row / 8) * k_blocks + decode_chunk * 2) * 64 + decode_row % 8];
+    thread const half* temp_h = reinterpret_cast<thread const half*>(temp);
+    for (uint index = 0; index < 16; ++index) {
+        base[index * 8] = temp_h[index];
+    }
+    for (uint round = 0; round < stage_rounds; ++round) {
+        const uint m = stage_m0 + round * (128 / k_blocks);
+        if (m < tile_m) {
+            threadgroup half4* stage_base = reinterpret_cast<threadgroup half4*>(
+                it_nxt + ((m / 8) * k_blocks + stage_k0 / 8) * 64 + (m % 8) * 8
+            );
+            stage_base[0] = half4(staged[round][0]);
+            stage_base[1] = half4(staged[round][1]);
+        }
+    }
+}
+
+kernel void et_quantized_linear_mma_half_ws(
+    device const float* input [[buffer(0)]],
+    device const uchar* weight [[buffer(1)]],
+    device const float* bias [[buffer(2)]],
+    device float* output [[buffer(3)]],
+    constant ulong& vectors [[buffer(4)]],
+    constant ulong& rows [[buffer(5)]],
+    constant ulong& columns [[buffer(6)]],
+    constant ulong& encoded_row_bytes [[buffer(7)]],
+    constant uint& has_bias [[buffer(8)]],
+    uint2 group [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]],
+    ushort simd_group [[simdgroup_index_in_threadgroup]]) {
+    constexpr uint tile_m = ET_TILE_M;
+    constexpr uint tile_n = ET_TILE_N;
+    constexpr uint tile_k = 2048 / tile_n;
+    constexpr uint k_blocks = tile_k / 8;
+    constexpr uint decode_chunks = tile_k / 16;
+    constexpr uint decode_items = tile_n * decode_chunks;
+    static_assert(decode_items == 128, "ws geometry decodes one group per thread");
+    constexpr uint w_halves = tile_n * tile_k;
+    constexpr uint a_halves = tile_m * tile_k;
+    constexpr uint buf_halves = w_halves + a_halves;
+    constexpr uint out_floats = tile_n * tile_m;
+    constexpr uint storage_floats = buf_halves > out_floats ? buf_halves : out_floats;
+    constexpr uint storage_quads = storage_floats / 4;
+    constexpr uint n_blocks = tile_n / 8;
+    constexpr uint sg_n = tile_m >= 16 ? (n_blocks >= 2 ? 2 : 1)
+        : (n_blocks >= 4 ? 4 : n_blocks);
+    constexpr uint sg_m = 4 / sg_n;
+    constexpr uint b_count = n_blocks / sg_n;
+    constexpr uint a_count = tile_m / 8 / sg_m;
+    threadgroup uint4 storage[storage_quads];
+    // Double-buffered: [wt0|wt1] then [it0|it1].
+    threadgroup half* wt = reinterpret_cast<threadgroup half*>(storage);
+    threadgroup half* it = wt + 2 * w_halves;
+    threadgroup float* st = reinterpret_cast<threadgroup float*>(storage);
+    const ulong first_vector = ulong(group.y) * tile_m;
+    const ulong first_row = ulong(group.x) * tile_n;
+    const bool mma_side = tid < 128;
+    const uint dtid = tid >= 128 ? tid - 128 : tid;
+    const uint block_row = (uint(simd_group) % sg_n) * b_count;
+    const uint block_vector = (uint(simd_group) / sg_n) * a_count;
+    simdgroup_float8x8 accumulators[a_count][b_count];
+    for (uint i = 0; i < a_count; ++i) {
+        for (uint j = 0; j < b_count; ++j) {
+            accumulators[i][j] = simdgroup_float8x8(0.0f);
+        }
+    }
+
+    // Prologue: decode side fills buffer 0 for the first K tile.
+    if (!mma_side) {
+        et_mma_half_ws_fill<ET_TILE_M, ET_TILE_N>(
+            weight, input, rows, encoded_row_bytes, first_row, first_vector,
+            columns, 0, dtid, wt, it
+        );
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint k0 = 0, turn = 0; k0 < uint(columns); k0 += tile_k, ++turn) {
+        const uint cur = (turn & 1) * w_halves;
+        const uint cur_in = (turn & 1) * a_halves;
+        if (mma_side) {
+            threadgroup const half* wt_cur = wt + cur;
+            threadgroup const half* it_cur = it + cur_in;
+            for (uint kb = 0; kb < k_blocks; ++kb) {
+                simdgroup_half8x8 a[a_count];
+                for (uint i = 0; i < a_count; ++i) {
+                    simdgroup_load(a[i], it_cur + ((block_vector + i) * k_blocks + kb) * 64, 8);
+                }
+                simdgroup_half8x8 b[b_count];
+                for (uint j = 0; j < b_count; ++j) {
+                    simdgroup_load(b[j], wt_cur + ((block_row + j) * k_blocks + kb) * 64, 8);
+                }
+                for (uint i = 0; i < a_count; ++i) {
+                    for (uint j = 0; j < b_count; ++j) {
+                        simdgroup_multiply_accumulate(
+                            accumulators[i][j],
+                            a[i],
+                            b[j],
+                            accumulators[i][j]
+                        );
+                    }
+                }
+            }
+        } else if (k0 + tile_k < uint(columns)) {
+            const uint nxt = ((turn + 1) & 1) * w_halves;
+            const uint nxt_in = ((turn + 1) & 1) * a_halves;
+            et_mma_half_ws_fill<ET_TILE_M, ET_TILE_N>(
+                weight, input, rows, encoded_row_bytes, first_row, first_vector,
+                columns, k0 + tile_k, dtid, wt + nxt, it + nxt_in
+            );
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (mma_side) {
+        for (uint i = 0; i < a_count; ++i) {
+            for (uint j = 0; j < b_count; ++j) {
+                simdgroup_store(
+                    accumulators[i][j],
+                    &st[(block_vector * 8 + i * 8) * tile_n + (block_row + j) * 8],
+                    tile_n
+                );
+            }
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint element = tid; element < tile_n * tile_m; element += 256) {
+        const uint vector_offset = element / tile_n;
+        const uint row_offset = element % tile_n;
+        const ulong vector = first_vector + vector_offset;
+        const ulong out_row = first_row + row_offset;
+        if (vector < vectors && out_row < rows) {
+            output[vector * rows + out_row] =
+                st[element] + (has_bias != 0 ? bias[out_row] : 0.0f);
+        }
+    }
+}
+"#;
+
 const EMBEDDING_SOURCE: &str = r#"
 #define ET_INDEX $INDEX_TYPE
 
@@ -1233,32 +2045,67 @@ kernel void et_quantized_embedding(
 
 fn source(kind: KernelKind, codec: GgmlKQuant, index_dtype: Option<DType>) -> String {
     let kernel = match kind {
-        KernelKind::Linear | KernelKind::LinearBatched(_) => LINEAR_SOURCE,
+        KernelKind::Linear | KernelKind::LinearBatched(_) => LINEAR_SOURCE.to_string(),
+        KernelKind::LinearGrouped(_) => {
+            let mut grouped =
+                String::with_capacity(LINEAR_SOURCE.len() + LINEAR_GROUPED_SOURCE.len());
+            grouped.push_str(LINEAR_SOURCE);
+            grouped.push_str(LINEAR_GROUPED_SOURCE);
+            grouped
+        }
         KernelKind::LinearMma
         | KernelKind::LinearMmaSimple
+        | KernelKind::LinearMma32
+        | KernelKind::LinearMma32Simple
         | KernelKind::LinearMma8
-        | KernelKind::LinearMma8Simple => MMA_LINEAR_SOURCE,
-        KernelKind::Embedding => EMBEDDING_SOURCE,
+        | KernelKind::LinearMma8Simple => MMA_LINEAR_SOURCE.to_string(),
+        KernelKind::LinearMmaHalf
+        | KernelKind::LinearMmaSimpleHalf
+        | KernelKind::LinearMma32Half
+        | KernelKind::LinearMma32SimpleHalf
+        | KernelKind::LinearMma8Half
+        | KernelKind::LinearMma8SimpleHalf
+        | KernelKind::LinearMma32SwzHalf => MMA_LINEAR_HALF_SOURCE.to_string(),
+        KernelKind::Embedding => EMBEDDING_SOURCE.to_string(),
     };
     let mut source = String::with_capacity(DECODE_SOURCE.len() + kernel.len());
     source.push_str(DECODE_SOURCE);
-    source.push_str(kernel);
+    source.push_str(&kernel);
     source = source.replace("$CODEC", &codec_tag(codec).to_string());
     source = source.replace("$BLOCK_BYTES", &block_bytes(codec).to_string());
     source = source.replace("$ROWS_PER_SIMD", &rows_per_simd(codec).to_string());
     let vector_lanes = match kind {
-        KernelKind::LinearBatched(vector_lanes) => vector_lanes,
+        KernelKind::LinearBatched(vector_lanes) | KernelKind::LinearGrouped(vector_lanes) => {
+            vector_lanes
+        }
         KernelKind::Linear
         | KernelKind::LinearMma
         | KernelKind::LinearMmaSimple
+        | KernelKind::LinearMma32
+        | KernelKind::LinearMma32Simple
         | KernelKind::LinearMma8
         | KernelKind::LinearMma8Simple
+        | KernelKind::LinearMmaHalf
+        | KernelKind::LinearMmaSimpleHalf
+        | KernelKind::LinearMma32Half
+        | KernelKind::LinearMma32SimpleHalf
+        | KernelKind::LinearMma8Half
+        | KernelKind::LinearMma8SimpleHalf
+        | KernelKind::LinearMma32SwzHalf
         | KernelKind::Embedding => 1,
     };
     source = source.replace("$VECTOR_LANES", &vector_lanes.to_string());
     source = source.replace(
         "$PIPELINED",
-        if matches!(kind, KernelKind::LinearMma | KernelKind::LinearMma8) {
+        if matches!(
+            kind,
+            KernelKind::LinearMma
+                | KernelKind::LinearMma32
+                | KernelKind::LinearMma8
+                | KernelKind::LinearMmaHalf
+                | KernelKind::LinearMma32Half
+                | KernelKind::LinearMma8Half
+        ) {
             "1"
         } else {
             "0"
@@ -1266,10 +2113,47 @@ fn source(kind: KernelKind, codec: GgmlKQuant, index_dtype: Option<DType>) -> St
     );
     source = source.replace(
         "$TILE_M",
-        if matches!(kind, KernelKind::LinearMma8 | KernelKind::LinearMma8Simple) {
+        if matches!(
+            kind,
+            KernelKind::LinearMma8
+                | KernelKind::LinearMma8Simple
+                | KernelKind::LinearMma8Half
+                | KernelKind::LinearMma8SimpleHalf
+        ) {
             "8"
+        } else if matches!(
+            kind,
+            KernelKind::LinearMma32
+                | KernelKind::LinearMma32Simple
+                | KernelKind::LinearMma32Half
+                | KernelKind::LinearMma32SimpleHalf
+                | KernelKind::LinearMma32SwzHalf
+        ) {
+            "32"
         } else {
             "16"
+        },
+    );
+    source = source.replace(
+        "$TILE_N",
+        if matches!(
+            kind,
+            KernelKind::LinearMmaSimpleHalf
+                | KernelKind::LinearMma32SimpleHalf
+                | KernelKind::LinearMma8SimpleHalf
+                | KernelKind::LinearMma32SwzHalf
+        ) {
+            "32"
+        } else {
+            "64"
+        },
+    );
+    source = source.replace(
+        "$SWIZZLE",
+        if matches!(kind, KernelKind::LinearMma32SwzHalf) {
+            "1"
+        } else {
+            "0"
         },
     );
     if matches!(kind, KernelKind::Embedding) {
@@ -1292,10 +2176,20 @@ fn pipeline(
 ) -> Result<crate::device::Pipeline, String> {
     let name = match kind {
         KernelKind::Linear | KernelKind::LinearBatched(_) => "et_quantized_linear",
+        KernelKind::LinearGrouped(_) => "et_quantized_linear_grouped",
         KernelKind::LinearMma
         | KernelKind::LinearMmaSimple
+        | KernelKind::LinearMma32
+        | KernelKind::LinearMma32Simple
         | KernelKind::LinearMma8
         | KernelKind::LinearMma8Simple => "et_quantized_linear_mma",
+        KernelKind::LinearMmaHalf
+        | KernelKind::LinearMmaSimpleHalf
+        | KernelKind::LinearMma32Half
+        | KernelKind::LinearMma32SimpleHalf
+        | KernelKind::LinearMma8Half
+        | KernelKind::LinearMma8SimpleHalf
+        | KernelKind::LinearMma32SwzHalf => "et_quantized_linear_mma_half",
         KernelKind::Embedding => "et_quantized_embedding",
     };
     crate::device::MetalDevice::get().compile_lazy(
@@ -1319,34 +2213,42 @@ fn cached_pipeline(
                 match kind {
                     KernelKind::Linear => "linear",
                     KernelKind::LinearBatched(_) => "linear_batched",
+                    KernelKind::LinearGrouped(_) => "linear_grouped",
                     KernelKind::LinearMma => "linear_mma",
                     KernelKind::LinearMmaSimple => "linear_mma_simple",
+                    KernelKind::LinearMma32 => "linear_mma32",
+                    KernelKind::LinearMma32Simple => "linear_mma32_simple",
                     KernelKind::LinearMma8 => "linear_mma8",
                     KernelKind::LinearMma8Simple => "linear_mma8_simple",
+                    KernelKind::LinearMmaHalf => "linear_mma_half",
+                    KernelKind::LinearMmaSimpleHalf => "linear_mma_simple_half",
+                    KernelKind::LinearMma32Half => "linear_mma32_half",
+                    KernelKind::LinearMma32SimpleHalf => "linear_mma32_simple_half",
+                    KernelKind::LinearMma8Half => "linear_mma8_half",
+                    KernelKind::LinearMma8SimpleHalf => "linear_mma8_simple_half",
+                    KernelKind::LinearMma32SwzHalf => "linear_mma32_swz_half",
                     KernelKind::Embedding => "embedding",
                 }
             )
         })
 }
 
-/// Selects the exact MMA tile for 8/16-vector batches, using pipelined
-/// double-buffering where it wins and the simpler half-threadgroup kernel for
-/// Q2/Q6 and narrow Q3 matrices. Smaller batches use the existing packed-dot
-/// kernels.
+/// Selects the exact MMA tile for 8/16/32-vector batches. The default
+/// MMA variants use half A/B operands with f32 accumulation (matching
+/// the llama.cpp K-quant `mul_mm` scheme) in the 32-row tile geometry,
+/// which measures fastest across codecs on Apple silicon; the 64-row
+/// half geometry and the f32-operand `LinearMma*` variants remain
+/// available for rollback and parity tests. Smaller batches use the
+/// existing packed-dot kernels.
 fn linear_kernel_kind(requirements: &LinearRequirements) -> KernelKind {
+    if requirements.vectors >= 32 && requirements.vectors % 32 == 0 {
+        return KernelKind::LinearMma32SimpleHalf;
+    }
     if requirements.vectors >= 16 && requirements.vectors % 16 == 0 {
-        return match requirements.codec {
-            GgmlKQuant::Q2K | GgmlKQuant::Q6K => KernelKind::LinearMmaSimple,
-            GgmlKQuant::Q3K if requirements.columns <= 4096 => KernelKind::LinearMmaSimple,
-            _ => KernelKind::LinearMma,
-        };
+        return KernelKind::LinearMmaSimpleHalf;
     }
     if requirements.vectors >= 8 && requirements.vectors % 8 == 0 {
-        return match requirements.codec {
-            GgmlKQuant::Q2K | GgmlKQuant::Q6K => KernelKind::LinearMma8Simple,
-            GgmlKQuant::Q3K if requirements.columns <= 4096 => KernelKind::LinearMma8Simple,
-            _ => KernelKind::LinearMma8,
-        };
+        return KernelKind::LinearMma8SimpleHalf;
     }
     if requirements.vectors >= 4 {
         match requirements.codec {
@@ -1362,7 +2264,8 @@ fn linear_kernel_kind(requirements: &LinearRequirements) -> KernelKind {
 /// Warms exactly the linear pipeline selected by `requirements` and
 /// asserts the Metal SIMD assumptions the kernels rely on (thread
 /// execution width 32, sufficient threadgroup capacity; 16 KB
-/// threadgroup memory for the MMA variant).
+/// threadgroup memory for the f32 MMA variants, 8 KB for the
+/// default half variants).
 pub fn warm_linear_exact(requirements: &LinearRequirements) -> Result<(), String> {
     if requirements.pipeline_count != 0 {
         use objc2_metal::{MTLComputePipelineState, MTLDevice as _};
@@ -1370,8 +2273,17 @@ pub fn warm_linear_exact(requirements: &LinearRequirements) -> Result<(), String
         let kernel_kind = linear_kernel_kind(requirements);
         let pipeline = pipeline(kernel_kind, requirements.codec, None)?;
         let required_threads = match kernel_kind {
-            KernelKind::LinearMma | KernelKind::LinearMma8 => 256,
-            KernelKind::LinearMmaSimple | KernelKind::LinearMma8Simple => 128,
+            KernelKind::LinearMma | KernelKind::LinearMma32 | KernelKind::LinearMma8 => 256,
+            KernelKind::LinearMmaSimple
+            | KernelKind::LinearMma32Simple
+            | KernelKind::LinearMma8Simple
+            | KernelKind::LinearMmaHalf
+            | KernelKind::LinearMmaSimpleHalf
+            | KernelKind::LinearMma32Half
+            | KernelKind::LinearMma32SimpleHalf
+            | KernelKind::LinearMma8Half
+            | KernelKind::LinearMma8SimpleHalf
+            | KernelKind::LinearMma32SwzHalf => 128,
             _ => 64,
         };
         if pipeline.as_raw().threadExecutionWidth() != 32
@@ -1383,8 +2295,21 @@ pub fn warm_linear_exact(requirements: &LinearRequirements) -> Result<(), String
             );
         }
         let required_memory = match kernel_kind {
-            KernelKind::LinearMma | KernelKind::LinearMma8 => 16 * 1024,
-            KernelKind::LinearMmaSimple | KernelKind::LinearMma8Simple => 8 * 1024,
+            KernelKind::LinearMma | KernelKind::LinearMma32 | KernelKind::LinearMma8 => 16 * 1024,
+            KernelKind::LinearMmaSimple
+            | KernelKind::LinearMma32Simple
+            | KernelKind::LinearMma8Simple => 8 * 1024,
+            // Half decode tiles free room for the staged input tile; the
+            // 64-row x 32-vector half tile peaks at 8 KB (output staging
+            // aliased onto the 6 KB of half tiles). The 32-row x 64-vector
+            // tile needs 12 KB (2048 weight + 4096 input halves).
+            KernelKind::LinearMmaHalf
+            | KernelKind::LinearMmaSimpleHalf
+            | KernelKind::LinearMma32Half
+            | KernelKind::LinearMma32SimpleHalf
+            | KernelKind::LinearMma8Half
+            | KernelKind::LinearMma8SimpleHalf
+            | KernelKind::LinearMma32SwzHalf => 8 * 1024,
             _ => 0,
         };
         if crate::device::MetalDevice::get()
@@ -1411,6 +2336,144 @@ pub fn warm_embedding_exact(requirements: &EmbeddingRequirements) -> Result<(), 
     Ok(())
 }
 
+/// Selects the grouped packed-dot kernel matching the members' shared
+/// vector/codec geometry. Grouped requirements reject MMA shapes, so
+/// this always yields a `LinearGrouped` variant.
+fn grouped_kernel_kind(requirements: &GroupedLinearRequirements) -> KernelKind {
+    match linear_kernel_kind(
+        requirements
+            .members
+            .first()
+            .expect("grouped requirements hold 2..=4 members"),
+    ) {
+        KernelKind::Linear => KernelKind::LinearGrouped(1),
+        KernelKind::LinearBatched(vector_lanes) => KernelKind::LinearGrouped(vector_lanes),
+        _ => unreachable!("grouped requirements reject MMA shapes"),
+    }
+}
+
+/// Warms exactly the grouped linear pipeline selected by
+/// `requirements` and asserts the Metal SIMD assumptions the shared
+/// kernel body relies on (thread execution width 32, 64-thread
+/// threadgroups).
+pub fn warm_linear_grouped_exact(requirements: &GroupedLinearRequirements) -> Result<(), String> {
+    if requirements.pipeline_count != 0 {
+        use objc2_metal::MTLComputePipelineState;
+
+        let pipeline = pipeline(grouped_kernel_kind(requirements), requirements.codec, None)?;
+        if pipeline.as_raw().threadExecutionWidth() != 32
+            || pipeline.as_raw().maxTotalThreadsPerThreadgroup() < 64
+        {
+            return Err(
+                "quantized_linear_group: Metal pipeline requires SIMD width 32 and exact threadgroup capacity"
+                    .to_string(),
+            );
+        }
+    }
+    Ok(())
+}
+
+fn validate_grouped_member(
+    weight: &MetalTensor,
+    output: &MetalTensor,
+    requirements: &LinearRequirements,
+) -> Result<(), String> {
+    if weight.dtype != DType::U8
+        || weight.layout.shape() != [requirements.rows, requirements.encoded_row_bytes]
+    {
+        return Err(format!(
+            "quantized_linear_group: expected exact contiguous packed {} weight [{}, {}] u8",
+            requirements.codec.name(),
+            requirements.rows,
+            requirements.encoded_row_bytes
+        ));
+    }
+    require_contiguous(weight, "quantized_linear_group", "packed weight", true)?;
+    output.validate_destination(
+        "quantized_linear_group",
+        &requirements.output_shape,
+        DType::F32,
+    )
+}
+
+/// Non-allocating grouped quantized linear dispatch: validates every
+/// member against the immutable plan and encodes one
+/// `et_quantized_linear_grouped` command covering all members.
+/// Allocates nothing; requires the exact pipeline to be warm. A plan
+/// with `pipeline_count == 0` (all-empty outputs) is a no-op.
+pub fn linear_grouped_into(
+    input: &MetalTensor,
+    members: &[(&MetalTensor, &MetalTensor)],
+    requirements: &GroupedLinearRequirements,
+) -> Result<(), String> {
+    use crate::runtime::metal::device::{set_buffer, set_bytes, MetalDevice};
+    use objc2_metal::MTLComputeCommandEncoder;
+
+    if members.len() != requirements.members.len() {
+        return Err(format!(
+            "quantized_linear_group: expected {} members, got {}",
+            requirements.members.len(),
+            members.len()
+        ));
+    }
+    if input.dtype != DType::F32 || input.layout.shape() != requirements.input_shape.as_ref() {
+        return Err("quantized_linear_group: input does not match the immutable plan".to_string());
+    }
+    require_contiguous(input, "quantized_linear_group", "input", false)?;
+    for (&(weight, output), member) in members.iter().zip(requirements.members.iter()) {
+        validate_grouped_member(weight, output, member)?;
+    }
+    if requirements.pipeline_count == 0 {
+        return Ok(());
+    }
+    let kernel_kind = grouped_kernel_kind(requirements);
+    let pipeline = cached_pipeline(kernel_kind, requirements.codec, None)?;
+    let vectors = requirements.vectors as u64;
+    let columns = requirements.columns as u64;
+    let encoded_row_bytes = requirements.encoded_row_bytes as u64;
+    let mut member_rows = [0u64; 4];
+    for (index, member) in requirements.members.iter().enumerate() {
+        member_rows[index] = member.rows as u64;
+    }
+    let rows_per_threadgroup = rows_per_simd(requirements.codec) * 2;
+    let row_groups = requirements
+        .members
+        .iter()
+        .map(|member| member.rows.div_ceil(rows_per_threadgroup))
+        .max()
+        .expect("grouped requirements hold 2..=4 members");
+    let vector_groups = match kernel_kind {
+        KernelKind::LinearGrouped(1) => requirements.vectors,
+        KernelKind::LinearGrouped(vector_lanes) => {
+            requirements.vectors.div_ceil(usize::from(vector_lanes))
+        }
+        _ => unreachable!("grouped kernel kind is always LinearGrouped"),
+    };
+    MetalDevice::get().with_encoder(|encoder| {
+        encoder.setComputePipelineState(pipeline.as_raw());
+        set_buffer(encoder, 0, &input.buffer, input.layout.offset() * 4);
+        for slot in 0..4 {
+            let (weight, output) = members.get(slot).copied().unwrap_or_else(|| members[0]);
+            set_buffer(encoder, 1 + slot, &weight.buffer, 0);
+            set_buffer(
+                encoder,
+                5 + slot,
+                &output.buffer,
+                output.layout.offset() * 4,
+            );
+        }
+        set_bytes(encoder, 9, &vectors);
+        set_bytes(encoder, 10, &member_rows);
+        set_bytes(encoder, 11, &columns);
+        set_bytes(encoder, 12, &encoded_row_bytes);
+        encoder.dispatchThreadgroups_threadsPerThreadgroup(
+            MetalDevice::grid(row_groups, vector_groups, requirements.members.len()),
+            MetalDevice::grid(64, 1, 1),
+        );
+    });
+    Ok(())
+}
+
 /// Non-allocating quantized linear dispatch: validates every argument
 /// against the immutable plan and encodes the selected kernel.
 /// Allocates nothing; requires the exact pipeline to be warm. A plan
@@ -1422,14 +2485,34 @@ pub fn linear_into(
     output: &MetalTensor,
     requirements: &LinearRequirements,
 ) -> Result<(), String> {
-    use crate::runtime::metal::device::{set_buffer, set_bytes, MetalDevice};
-    use objc2_metal::MTLComputeCommandEncoder;
-
     validate_linear(input, weight, bias, output, requirements)?;
     if requirements.pipeline_count == 0 {
         return Ok(());
     }
-    let kernel_kind = linear_kernel_kind(requirements);
+    encode_linear(
+        input,
+        weight,
+        bias,
+        output,
+        requirements,
+        linear_kernel_kind(requirements),
+    )
+}
+
+/// Encodes one quantized linear dispatch with an explicit kernel kind.
+/// `linear_into` passes the selected kind; tests use this to run the
+/// f32-operand MMA variants against the default half-operand ones.
+fn encode_linear(
+    input: &MetalTensor,
+    weight: &MetalTensor,
+    bias: Option<&MetalTensor>,
+    output: &MetalTensor,
+    requirements: &LinearRequirements,
+    kernel_kind: KernelKind,
+) -> Result<(), String> {
+    use crate::runtime::metal::device::{set_buffer, set_bytes, MetalDevice};
+    use objc2_metal::MTLComputeCommandEncoder;
+
     let pipeline = cached_pipeline(kernel_kind, requirements.codec, None)?;
     let has_bias = u32::from(requirements.has_bias);
     let vectors = requirements.vectors as u64;
@@ -1438,19 +2521,42 @@ pub fn linear_into(
     let encoded_row_bytes = requirements.encoded_row_bytes as u64;
     let rows_per_threadgroup = rows_per_simd(requirements.codec) * 2;
     let (row_groups, threads_per_threadgroup) = match kernel_kind {
-        KernelKind::LinearMma | KernelKind::LinearMma8 => (requirements.rows.div_ceil(16), 256),
-        KernelKind::LinearMmaSimple | KernelKind::LinearMma8Simple => {
-            (requirements.rows.div_ceil(16), 128)
+        KernelKind::LinearMma | KernelKind::LinearMma32 | KernelKind::LinearMma8 => {
+            (requirements.rows.div_ceil(16), 256)
         }
+        KernelKind::LinearMmaSimple
+        | KernelKind::LinearMma32Simple
+        | KernelKind::LinearMma8Simple => (requirements.rows.div_ceil(16), 128),
+        KernelKind::LinearMmaHalf | KernelKind::LinearMma32Half | KernelKind::LinearMma8Half => {
+            (requirements.rows.div_ceil(64), 128)
+        }
+        KernelKind::LinearMmaSimpleHalf
+        | KernelKind::LinearMma32SimpleHalf
+        | KernelKind::LinearMma8SimpleHalf
+        | KernelKind::LinearMma32SwzHalf => (requirements.rows.div_ceil(32), 128),
         _ => (requirements.rows.div_ceil(rows_per_threadgroup), 64),
     };
     let vector_groups = match kernel_kind {
-        KernelKind::LinearMma | KernelKind::LinearMmaSimple => requirements.vectors.div_ceil(16),
-        KernelKind::LinearMma8 | KernelKind::LinearMma8Simple => requirements.vectors.div_ceil(8),
+        KernelKind::LinearMma
+        | KernelKind::LinearMmaSimple
+        | KernelKind::LinearMmaHalf
+        | KernelKind::LinearMmaSimpleHalf => requirements.vectors.div_ceil(16),
+        KernelKind::LinearMma32
+        | KernelKind::LinearMma32Simple
+        | KernelKind::LinearMma32Half
+        | KernelKind::LinearMma32SimpleHalf => requirements.vectors.div_ceil(32),
+        KernelKind::LinearMma32SwzHalf => requirements.vectors.div_ceil(32),
+        KernelKind::LinearMma8
+        | KernelKind::LinearMma8Simple
+        | KernelKind::LinearMma8Half
+        | KernelKind::LinearMma8SimpleHalf => requirements.vectors.div_ceil(8),
         KernelKind::LinearBatched(vector_lanes) => {
             requirements.vectors.div_ceil(usize::from(vector_lanes))
         }
         KernelKind::Linear | KernelKind::Embedding => requirements.vectors,
+        KernelKind::LinearGrouped(_) => {
+            unreachable!("grouped dispatch computes its own grid")
+        }
     };
     MetalDevice::get().with_encoder(|encoder| {
         encoder.setComputePipelineState(pipeline.as_raw());
@@ -1464,8 +2570,13 @@ pub fn linear_into(
         set_bytes(encoder, 6, &columns);
         set_bytes(encoder, 7, &encoded_row_bytes);
         set_bytes(encoder, 8, &has_bias);
+        let (grid_x, grid_y) = if kernel_kind == KernelKind::LinearMma32SwzHalf {
+            (vector_groups, row_groups)
+        } else {
+            (row_groups, vector_groups)
+        };
         encoder.dispatchThreadgroups_threadsPerThreadgroup(
-            MetalDevice::grid(row_groups, vector_groups, 1),
+            MetalDevice::grid(grid_x, grid_y, 1),
             MetalDevice::grid(threads_per_threadgroup, 1, 1),
         );
     });
@@ -1657,23 +2768,262 @@ mod tests {
     }
 
     #[test]
+    fn grouped_requirements_validate_members() {
+        let member = |rows: usize, vectors: usize, codec: GgmlKQuant, bias: bool| {
+            let encoded_row_bytes = codec.encoded_row_bytes(256).unwrap();
+            let bias_shape = [rows];
+            linear_requirements(
+                &[vectors, 256],
+                DType::F32,
+                &[rows, encoded_row_bytes],
+                DType::U8,
+                bias.then_some((&bias_shape[..], DType::F32)),
+                &[vectors, rows],
+                DType::F32,
+                codec,
+                [rows, 256],
+            )
+            .unwrap()
+        };
+        let grouped = grouped_linear_requirements(&[
+            member(3, 1, GgmlKQuant::Q4K, false),
+            member(5, 1, GgmlKQuant::Q4K, false),
+        ])
+        .unwrap();
+        assert_eq!(grouped.members.len(), 2);
+        assert_eq!(grouped.output_bytes, (3 + 5) * 4);
+        assert_eq!(grouped.pipeline_count, 1);
+        assert!(matches!(
+            grouped_kernel_kind(&grouped),
+            KernelKind::LinearGrouped(1)
+        ));
+
+        assert!(
+            grouped_linear_requirements(&[member(3, 1, GgmlKQuant::Q4K, false)])
+                .unwrap_err()
+                .contains("2..=4")
+        );
+        assert!(
+            grouped_linear_requirements(&vec![member(1, 1, GgmlKQuant::Q4K, false); 5])
+                .unwrap_err()
+                .contains("2..=4")
+        );
+        assert!(grouped_linear_requirements(&[
+            member(3, 1, GgmlKQuant::Q4K, false),
+            member(3, 1, GgmlKQuant::Q6K, false),
+        ])
+        .unwrap_err()
+        .contains("share codec"));
+        assert!(grouped_linear_requirements(&[
+            member(3, 1, GgmlKQuant::Q4K, false),
+            member(3, 2, GgmlKQuant::Q4K, false),
+        ])
+        .unwrap_err()
+        .contains("share codec"));
+        assert!(grouped_linear_requirements(&[
+            member(3, 1, GgmlKQuant::Q4K, true),
+            member(3, 1, GgmlKQuant::Q4K, false),
+        ])
+        .unwrap_err()
+        .contains("bias"));
+        assert!(grouped_linear_requirements(&[
+            member(3, 16, GgmlKQuant::Q4K, false),
+            member(5, 16, GgmlKQuant::Q4K, false),
+        ])
+        .unwrap_err()
+        .contains("non-MMA"));
+    }
+
+    #[test]
+    fn grouped_linear_preserves_values_across_members_and_codecs() {
+        let device = MetalDevice::get();
+        let columns = 512usize;
+        let vectors = 1usize;
+        let input_values = (0..vectors * columns)
+            .map(|index| ((index * 7 + 3) % 17) as f32 * 0.125 - 1.0)
+            .collect::<Vec<_>>();
+        let input = MetalTensor::from_f32(device, input_values, vec![vectors, columns]);
+        for codec in [
+            GgmlKQuant::Q2K,
+            GgmlKQuant::Q3K,
+            GgmlKQuant::Q4K,
+            GgmlKQuant::Q5K,
+            GgmlKQuant::Q6K,
+        ] {
+            let encoded_row_bytes = codec.encoded_row_bytes(columns).unwrap();
+            let mut weights = Vec::new();
+            let mut plans = Vec::new();
+            let mut references = Vec::new();
+            for (member_index, rows) in [3usize, 5].into_iter().enumerate() {
+                let mut packed = (0..rows * encoded_row_bytes)
+                    .map(|index| ((index * 31 + member_index * 17 + 7) % 251) as u8)
+                    .collect::<Vec<_>>();
+                // Keep the f16 super-scales finite so the dotted sums
+                // stay meaningful (other bytes may decode to anything).
+                let block_bytes = encoded_row_bytes / (columns / 256);
+                for block in packed.chunks_exact_mut(block_bytes) {
+                    match codec {
+                        GgmlKQuant::Q2K => block[80..84].copy_from_slice(&[0x00, 0x3c, 0x00, 0x38]),
+                        GgmlKQuant::Q3K => block[108..110].copy_from_slice(&[0x00, 0x3c]),
+                        GgmlKQuant::Q4K | GgmlKQuant::Q5K => {
+                            block[0..4].copy_from_slice(&[0x00, 0x3c, 0x00, 0x38])
+                        }
+                        GgmlKQuant::Q6K => block[208..210].copy_from_slice(&[0x00, 0x38]),
+                    }
+                }
+                let weight = MetalTensor {
+                    buffer: device.upload_bytes(&packed),
+                    layout: Layout::contiguous(vec![rows, encoded_row_bytes]),
+                    dtype: DType::U8,
+                };
+                let requirements = linear_requirements(
+                    &[vectors, columns],
+                    DType::F32,
+                    &[rows, encoded_row_bytes],
+                    DType::U8,
+                    None,
+                    &[vectors, rows],
+                    DType::F32,
+                    codec,
+                    [rows, columns],
+                )
+                .unwrap();
+                let reference =
+                    MetalTensor::from_f32(device, vec![0.0; vectors * rows], vec![vectors, rows]);
+                warm_linear_exact(&requirements).unwrap();
+                linear_into(&input, &weight, None, &reference, &requirements).unwrap();
+                weights.push(weight);
+                plans.push(requirements);
+                references.push(reference);
+            }
+            let grouped = grouped_linear_requirements(&plans).unwrap();
+            let outputs = plans
+                .iter()
+                .map(|member| {
+                    MetalTensor::from_f32(
+                        device,
+                        vec![f32::NAN; member.vectors * member.rows],
+                        vec![member.vectors, member.rows],
+                    )
+                })
+                .collect::<Vec<_>>();
+            warm_linear_grouped_exact(&grouped).unwrap();
+            let members = weights
+                .iter()
+                .zip(&outputs)
+                .map(|(weight, output)| (weight, output))
+                .collect::<Vec<_>>();
+            linear_grouped_into(&input, &members, &grouped).unwrap();
+            device.synchronize().unwrap();
+
+            for (member_index, ((plan, output), reference)) in
+                plans.iter().zip(&outputs).zip(&references).enumerate()
+            {
+                let actual = output.buffer.contents_ptr().cast::<f32>();
+                let expected = reference.buffer.contents_ptr().cast::<f32>();
+                for index in 0..plan.vectors * plan.rows {
+                    let (actual, expected) = unsafe { (*actual.add(index), *expected.add(index)) };
+                    assert_eq!(
+                        actual.to_bits(),
+                        expected.to_bits(),
+                        "{} member={member_index} index={index}: {actual} != {expected}",
+                        codec.name()
+                    );
+                    assert!(!actual.is_nan(), "{} produced NaN", codec.name());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn grouped_execution_rejects_nonzero_offset_packed_rows() {
+        let member = linear_requirements(
+            &[1, 256],
+            DType::F32,
+            &[1, 144],
+            DType::U8,
+            None,
+            &[1, 1],
+            DType::F32,
+            GgmlKQuant::Q4K,
+            [1, 256],
+        )
+        .unwrap();
+        let grouped = grouped_linear_requirements(&[member.clone(), member]).unwrap();
+        let device = MetalDevice::get();
+        let input = MetalTensor::from_f32(device, vec![0.0; 256], vec![1, 256]);
+        let weight = MetalTensor {
+            buffer: device.upload_bytes(&[0; 145]),
+            layout: Layout::new(vec![1, 144], vec![144, 1], 1),
+            dtype: DType::U8,
+        };
+        let output = MetalTensor {
+            buffer: Arc::new(crate::device::Buffer::suballoc(&device.alloc_raw(4), 0, 4)),
+            layout: Layout::contiguous(vec![1, 1]),
+            dtype: DType::F32,
+        };
+        let error =
+            linear_grouped_into(&input, &[(&weight, &output), (&weight, &output)], &grouped)
+                .unwrap_err();
+        assert!(error.contains("packed weight must be zero-offset contiguous"));
+    }
+
+    #[test]
     #[ignore = "manual prefill kernel bandwidth probe"]
     fn kquant_prefill_bandwidth_probe() {
+        // Ramp GPU clocks with throwaway dispatches before timing.
+        {
+            let device = MetalDevice::get();
+            let requirements = linear_requirements(
+                &[32, 4096],
+                DType::F32,
+                &[8192, 1760],
+                DType::U8,
+                None,
+                &[32, 8192],
+                DType::F32,
+                GgmlKQuant::Q3K,
+                [8192, 4096],
+            )
+            .unwrap();
+            let input = MetalTensor::from_f32(device, vec![1.0; 32 * 4096], vec![32, 4096]);
+            let weight = MetalTensor {
+                buffer: device.upload_bytes(&vec![0u8; 8192 * 1760]),
+                layout: Layout::contiguous(vec![8192, 1760]),
+                dtype: DType::U8,
+            };
+            let output = MetalTensor::from_f32(device, vec![0.0; 32 * 8192], vec![32, 8192]);
+            warm_linear_exact(&requirements).unwrap();
+            for _ in 0..100 {
+                linear_into(&input, &weight, None, &output, &requirements).unwrap();
+            }
+            device.synchronize().unwrap();
+        }
         for (codec, vectors, rows, columns, block_bytes) in [
+            (GgmlKQuant::Q3K, 32usize, 6656usize, 4096usize, 110usize),
             (GgmlKQuant::Q3K, 16usize, 6656usize, 4096usize, 110usize),
             (GgmlKQuant::Q3K, 8, 6656, 4096, 110),
+            (GgmlKQuant::Q3K, 32, 19968, 6656, 110),
+            (GgmlKQuant::Q3K, 256, 19968, 6656, 110),
+            (GgmlKQuant::Q3K, 256, 6656, 4096, 110),
             (GgmlKQuant::Q3K, 16, 19968, 6656, 110),
             (GgmlKQuant::Q3K, 8, 19968, 6656, 110),
             (GgmlKQuant::Q3K, 16, 6656, 19968, 110),
             (GgmlKQuant::Q3K, 8, 6656, 19968, 110),
+            (GgmlKQuant::Q2K, 32, 4096, 6656, 84),
             (GgmlKQuant::Q2K, 16, 4096, 6656, 84),
             (GgmlKQuant::Q2K, 8, 4096, 6656, 84),
+            (GgmlKQuant::Q2K, 32, 19968, 6656, 84),
+            (GgmlKQuant::Q2K, 256, 19968, 6656, 84),
+            (GgmlKQuant::Q2K, 256, 4096, 6656, 84),
             (GgmlKQuant::Q2K, 16, 19968, 6656, 84),
             (GgmlKQuant::Q2K, 8, 19968, 6656, 84),
+            (GgmlKQuant::Q4K, 32, 6656, 4096, 144),
             (GgmlKQuant::Q4K, 16, 6656, 4096, 144),
             (GgmlKQuant::Q4K, 8, 6656, 4096, 144),
             (GgmlKQuant::Q5K, 16, 6656, 6656, 176),
             (GgmlKQuant::Q5K, 8, 6656, 6656, 176),
+            (GgmlKQuant::Q6K, 32, 202048, 6656, 210),
             (GgmlKQuant::Q6K, 16, 202048, 6656, 210),
             (GgmlKQuant::Q6K, 8, 202048, 6656, 210),
         ] {
@@ -1701,6 +3051,21 @@ mod tests {
             let output =
                 MetalTensor::from_f32(device, vec![0.0; vectors * rows], vec![vectors, rows]);
             warm_linear_exact(&requirements).unwrap();
+            // Same-session before/after: time the f32-operand MMA twin
+            // alongside the default-selected (half) kernel.
+            let kernel_kind = linear_kernel_kind(&requirements);
+            let f32_kind = match kernel_kind {
+                KernelKind::LinearMmaHalf => Some(KernelKind::LinearMma),
+                KernelKind::LinearMmaSimpleHalf => Some(KernelKind::LinearMmaSimple),
+                KernelKind::LinearMma32Half => Some(KernelKind::LinearMma32),
+                KernelKind::LinearMma32SimpleHalf => Some(KernelKind::LinearMma32Simple),
+                KernelKind::LinearMma8Half => Some(KernelKind::LinearMma8),
+                KernelKind::LinearMma8SimpleHalf => Some(KernelKind::LinearMma8Simple),
+                _ => None,
+            };
+            if let Some(f32_kind) = f32_kind {
+                pipeline(f32_kind, codec, None).unwrap();
+            }
             for _ in 0..5 {
                 linear_into(&input, &weight, None, &output, &requirements).unwrap();
             }
@@ -1718,6 +3083,75 @@ mod tests {
                 seconds * 50.0,
                 bytes * 20.0 / seconds / 1e9
             );
+            if let Some(f32_kind) = f32_kind {
+                for _ in 0..5 {
+                    encode_linear(&input, &weight, None, &output, &requirements, f32_kind).unwrap();
+                }
+                device.synchronize().unwrap();
+                let started = std::time::Instant::now();
+                for _ in 0..20 {
+                    encode_linear(&input, &weight, None, &output, &requirements, f32_kind).unwrap();
+                }
+                device.synchronize().unwrap();
+                let seconds = started.elapsed().as_secs_f64();
+                eprintln!(
+                    "{} {vectors}x{rows}x{columns} [f32 operands]: {:.3} ms/call, {:.1} GB/s packed",
+                    codec.name(),
+                    seconds * 50.0,
+                    bytes * 20.0 / seconds / 1e9
+                );
+            }
+            // Alternate row-tile geometry (64 vs 32 rows).
+            let alt = match kernel_kind {
+                KernelKind::LinearMmaHalf => Some(KernelKind::LinearMmaSimpleHalf),
+                KernelKind::LinearMmaSimpleHalf => Some(KernelKind::LinearMmaHalf),
+                KernelKind::LinearMma32Half => Some(KernelKind::LinearMma32SimpleHalf),
+                KernelKind::LinearMma32SimpleHalf => Some(KernelKind::LinearMma32Half),
+                KernelKind::LinearMma8Half => Some(KernelKind::LinearMma8SimpleHalf),
+                KernelKind::LinearMma8SimpleHalf => Some(KernelKind::LinearMma8Half),
+                _ => None,
+            };
+            if let Some(alt) = alt {
+                pipeline(alt, codec, None).unwrap();
+                for _ in 0..5 {
+                    encode_linear(&input, &weight, None, &output, &requirements, alt).unwrap();
+                }
+                device.synchronize().unwrap();
+                let started = std::time::Instant::now();
+                for _ in 0..20 {
+                    encode_linear(&input, &weight, None, &output, &requirements, alt).unwrap();
+                }
+                device.synchronize().unwrap();
+                let seconds = started.elapsed().as_secs_f64();
+                eprintln!(
+                    "{} {vectors}x{rows}x{columns} [other tile_n]: {:.3} ms/call, {:.1} GB/s packed",
+                    codec.name(),
+                    seconds * 50.0,
+                    bytes * 20.0 / seconds / 1e9
+                );
+            }
+            // 64-vector tile (halves the weight-tile dequant replication).
+            if kernel_kind == KernelKind::LinearMma32SimpleHalf {
+                for (m64, tag) in [(KernelKind::LinearMma32SwzHalf, "swizzled")] {
+                    pipeline(m64, codec, None).unwrap();
+                    for _ in 0..5 {
+                        encode_linear(&input, &weight, None, &output, &requirements, m64).unwrap();
+                    }
+                    device.synchronize().unwrap();
+                    let started = std::time::Instant::now();
+                    for _ in 0..20 {
+                        encode_linear(&input, &weight, None, &output, &requirements, m64).unwrap();
+                    }
+                    device.synchronize().unwrap();
+                    let seconds = started.elapsed().as_secs_f64();
+                    eprintln!(
+                        "{} {vectors}x{rows}x{columns} [{tag}]: {:.3} ms/call, {:.1} GB/s packed",
+                        codec.name(),
+                        seconds * 50.0,
+                        bytes * 20.0 / seconds / 1e9
+                    );
+                }
+            }
         }
     }
 
@@ -1741,7 +3175,7 @@ mod tests {
         .unwrap();
         assert!(matches!(
             linear_kernel_kind(&requirements),
-            KernelKind::LinearMmaSimple
+            KernelKind::LinearMmaSimpleHalf
         ));
 
         let mut packed = vec![0u8; encoded_row_bytes * rows];
@@ -1793,7 +3227,7 @@ mod tests {
         .unwrap();
         assert!(matches!(
             linear_kernel_kind(&requirements),
-            KernelKind::LinearMma8Simple
+            KernelKind::LinearMma8SimpleHalf
         ));
 
         let mut packed = vec![0u8; encoded_row_bytes * rows];
@@ -1826,7 +3260,7 @@ mod tests {
     }
 
     #[test]
-    fn kquant_pipelined_mma_preserves_values_for_16_and_8_vectors() {
+    fn kquant_pipelined_mma_preserves_values_for_32_16_and_8_vectors() {
         let rows = 33usize;
         let columns = 4352usize;
         let encoded_row_bytes = 1870usize;
@@ -1838,7 +3272,7 @@ mod tests {
             }
         }
         let device = MetalDevice::get();
-        for vectors in [16usize, 8] {
+        for vectors in [32usize, 16, 8] {
             let requirements = linear_requirements(
                 &[vectors, columns],
                 DType::F32,
@@ -1853,7 +3287,10 @@ mod tests {
             .unwrap();
             assert!(matches!(
                 linear_kernel_kind(&requirements),
-                KernelKind::LinearMma | KernelKind::LinearMma8
+                KernelKind::LinearMma32SimpleHalf
+                    | KernelKind::LinearMma32SwzHalf
+                    | KernelKind::LinearMmaSimpleHalf
+                    | KernelKind::LinearMma8SimpleHalf
             ));
             let input =
                 MetalTensor::from_f32(device, vec![1.0; vectors * columns], vec![vectors, columns]);
@@ -1875,6 +3312,147 @@ mod tests {
                     assert_eq!(actual, 128.0 * columns as f32, "vector={vector} row={row}");
                 }
             }
+        }
+    }
+
+    #[test]
+    fn kquant_mma_half_matches_f32_mma_within_half_precision() {
+        // Non-half-exact inputs and decodes: the only difference between
+        // the default half-operand kernels and the f32 MMA kernels is
+        // rounding both operands to half (11-bit significand, ≤ 2^-11
+        // relative per operand, ≤ 2^-10 per product). Products accumulate
+        // in f32 in both kernels, so errors stay near sqrt(K) * 2^-10 of
+        // the per-product magnitude — far below 1% of the largest dot.
+        let device = MetalDevice::get();
+        for (codec, vectors, rows, columns, block_bytes, f32_kind, half_kind) in [
+            (
+                GgmlKQuant::Q3K,
+                32usize,
+                65usize,
+                4352usize,
+                110usize,
+                KernelKind::LinearMma32,
+                KernelKind::LinearMma32SimpleHalf,
+            ),
+            (
+                GgmlKQuant::Q2K,
+                16,
+                33,
+                2560,
+                84,
+                KernelKind::LinearMmaSimple,
+                KernelKind::LinearMmaSimpleHalf,
+            ),
+            (
+                GgmlKQuant::Q6K,
+                8,
+                17,
+                768,
+                210,
+                KernelKind::LinearMma8Simple,
+                KernelKind::LinearMma8SimpleHalf,
+            ),
+        ] {
+            let encoded_row_bytes = columns / 256 * block_bytes;
+            let requirements = linear_requirements(
+                &[vectors, columns],
+                DType::F32,
+                &[rows, encoded_row_bytes],
+                DType::U8,
+                None,
+                &[vectors, rows],
+                DType::F32,
+                codec,
+                [rows, columns],
+            )
+            .unwrap();
+            assert_eq!(linear_kernel_kind(&requirements), half_kind);
+
+            let mut packed = (0..rows * encoded_row_bytes)
+                .map(|index| ((index * 31 + 7) % 251) as u8)
+                .collect::<Vec<_>>();
+            // Keep the f16 super-scales finite and modest so dots stay
+            // in a meaningful range (other bytes may decode to anything).
+            for block in packed.chunks_exact_mut(block_bytes) {
+                match codec {
+                    GgmlKQuant::Q2K => block[80..84].copy_from_slice(&[0x00, 0x3c, 0x00, 0x38]),
+                    GgmlKQuant::Q3K => block[108..110].copy_from_slice(&[0x00, 0x3c]),
+                    GgmlKQuant::Q6K => block[208..210].copy_from_slice(&[0x00, 0x38]),
+                    _ => unreachable!(),
+                }
+            }
+            let input_values = (0..vectors * columns)
+                .map(|index| ((index * 13 + 5) % 97) as f32 * 0.013 - 0.6)
+                .collect::<Vec<_>>();
+            let input = MetalTensor::from_f32(device, input_values, vec![vectors, columns]);
+            let weight = MetalTensor {
+                buffer: device.upload_bytes(&packed),
+                layout: Layout::contiguous(vec![rows, encoded_row_bytes]),
+                dtype: DType::U8,
+            };
+            let half_output =
+                MetalTensor::from_f32(device, vec![0.0; vectors * rows], vec![vectors, rows]);
+            let f32_output =
+                MetalTensor::from_f32(device, vec![0.0; vectors * rows], vec![vectors, rows]);
+            // The 64-row (wide) half geometry is covered against the
+            // same f32 reference.
+            let wide_kind = match half_kind {
+                KernelKind::LinearMma32SimpleHalf | KernelKind::LinearMma32SwzHalf => {
+                    KernelKind::LinearMma32Half
+                }
+                KernelKind::LinearMmaSimpleHalf => KernelKind::LinearMmaHalf,
+                KernelKind::LinearMma8SimpleHalf => KernelKind::LinearMma8Half,
+                _ => unreachable!("parity test uses simple half kinds"),
+            };
+            let wide_output =
+                MetalTensor::from_f32(device, vec![0.0; vectors * rows], vec![vectors, rows]);
+            warm_linear_exact(&requirements).unwrap();
+            pipeline(f32_kind, codec, None).unwrap();
+            pipeline(wide_kind, codec, None).unwrap();
+            linear_into(&input, &weight, None, &half_output, &requirements).unwrap();
+            encode_linear(&input, &weight, None, &f32_output, &requirements, f32_kind).unwrap();
+            encode_linear(
+                &input,
+                &weight,
+                None,
+                &wide_output,
+                &requirements,
+                wide_kind,
+            )
+            .unwrap();
+            device.synchronize().unwrap();
+
+            let half_values = half_output.buffer.contents_ptr().cast::<f32>();
+            let wide_values = wide_output.buffer.contents_ptr().cast::<f32>();
+            let f32_values = f32_output.buffer.contents_ptr().cast::<f32>();
+            let mut largest = 0.0f32;
+            let mut worst = 0.0f32;
+            for index in 0..vectors * rows {
+                let (half, wide, f32) = unsafe {
+                    (
+                        *half_values.add(index),
+                        *wide_values.add(index),
+                        *f32_values.add(index),
+                    )
+                };
+                assert!(
+                    half.is_finite() && wide.is_finite(),
+                    "{} index={index} produced {half}/{wide}",
+                    codec.name()
+                );
+                largest = largest.max(f32.abs());
+                worst = worst.max((half - f32).abs()).max((wide - f32).abs());
+            }
+            let tolerance = 0.01 * largest.max(1.0);
+            eprintln!(
+                "{} {vectors}x{rows}x{columns}: worst |half - f32| = {worst}, tolerance {tolerance}",
+                codec.name()
+            );
+            assert!(
+                worst <= tolerance,
+                "{} {vectors}x{rows}x{columns}: worst |half - f32| = {worst} exceeds {tolerance}",
+                codec.name()
+            );
         }
     }
 
@@ -1930,6 +3508,330 @@ mod tests {
                 seconds * 10.0,
                 bytes * 100.0 / seconds / 1e9
             );
+        }
+    }
+
+    /// Same-session A/B timing of patched `et_quantized_linear_mma_half`
+    /// variants against the default-selected kernel, for kernel micro-
+    /// optimization experiments. Variants are source-level patches of
+    /// the exact production source of the selected kernel kind.
+    #[test]
+    #[ignore = "manual prefill kernel variant A/B probe"]
+    fn kquant_prefill_variant_probe() {
+        use crate::runtime::metal::device::{set_buffer, set_bytes};
+        use objc2_metal::MTLComputeCommandEncoder;
+        use std::hash::{Hash, Hasher};
+
+        // Ramp GPU clocks with throwaway dispatches before timing.
+        {
+            let device = MetalDevice::get();
+            let requirements = linear_requirements(
+                &[32, 4096],
+                DType::F32,
+                &[8192, 1760],
+                DType::U8,
+                None,
+                &[32, 8192],
+                DType::F32,
+                GgmlKQuant::Q3K,
+                [8192, 4096],
+            )
+            .unwrap();
+            let input = MetalTensor::from_f32(device, vec![1.0; 32 * 4096], vec![32, 4096]);
+            let weight = MetalTensor {
+                buffer: device.upload_bytes(&vec![0u8; 8192 * 1760]),
+                layout: Layout::contiguous(vec![8192, 1760]),
+                dtype: DType::U8,
+            };
+            let output = MetalTensor::from_f32(device, vec![0.0; 32 * 8192], vec![32, 8192]);
+            warm_linear_exact(&requirements).unwrap();
+            for _ in 0..100 {
+                linear_into(&input, &weight, None, &output, &requirements).unwrap();
+            }
+            device.synchronize().unwrap();
+        }
+
+        for (codec, vectors, rows, columns, block_bytes) in [
+            (GgmlKQuant::Q3K, 32usize, 6656usize, 4096usize, 110usize),
+            (GgmlKQuant::Q3K, 32, 19968, 6656, 110),
+            (GgmlKQuant::Q3K, 16, 19968, 6656, 110),
+            (GgmlKQuant::Q2K, 32, 4096, 6656, 84),
+            (GgmlKQuant::Q2K, 32, 19968, 6656, 84),
+            (GgmlKQuant::Q2K, 16, 19968, 6656, 84),
+        ] {
+            let encoded_row_bytes = columns / 256 * block_bytes;
+            let requirements = linear_requirements(
+                &[vectors, columns],
+                DType::F32,
+                &[rows, encoded_row_bytes],
+                DType::U8,
+                None,
+                &[vectors, rows],
+                DType::F32,
+                codec,
+                [rows, columns],
+            )
+            .unwrap();
+            let device = MetalDevice::get();
+            let input =
+                MetalTensor::from_f32(device, vec![1.0; vectors * columns], vec![vectors, columns]);
+            let weight = MetalTensor {
+                buffer: device.upload_bytes(&vec![0u8; requirements.encoded_row_bytes * rows]),
+                layout: Layout::contiguous(vec![rows, requirements.encoded_row_bytes]),
+                dtype: DType::U8,
+            };
+            let output =
+                MetalTensor::from_f32(device, vec![0.0; vectors * rows], vec![vectors, rows]);
+            warm_linear_exact(&requirements).unwrap();
+            let kind = linear_kernel_kind(&requirements);
+            let (tile_n, tile_m) = match kind {
+                KernelKind::LinearMma32SimpleHalf => (32usize, 32usize),
+                KernelKind::LinearMmaSimpleHalf => (32, 16),
+                KernelKind::LinearMma8SimpleHalf => (32, 8),
+                _ => unreachable!("probe shapes select simple half kinds"),
+            };
+            let variants: [(&str, &str, u64, Box<dyn FnOnce(String) -> String>); 14] = [
+                // Default production source (current selection).
+                (
+                    "current",
+                    "et_quantized_linear_mma_half",
+                    128,
+                    Box::new(|src| src),
+                ),
+                // Warp-specialized double-buffered twin, 256 threads.
+                (
+                    "ws",
+                    "et_quantized_linear_mma_half_ws",
+                    256,
+                    Box::new(|src| src),
+                ),
+                // Warp-specialized twin on the 64-row geometry.
+                (
+                    "ws tile_n 64",
+                    "et_quantized_linear_mma_half_ws",
+                    256,
+                    Box::new(|src| src.replace("#define ET_TILE_N 32", "#define ET_TILE_N 64")),
+                ),
+                // Paired decode (chunk c and c + 2 share quant bytes).
+                (
+                    "paired",
+                    "et_quantized_linear_mma_half",
+                    128,
+                    Box::new(|src| {
+                        src.replace(
+                            "constexpr bool pair_decode = false;",
+                            "constexpr bool pair_decode = ET_CODEC == 2 || ET_CODEC == 3;",
+                        )
+                    }),
+                ),
+                // Generic per-byte decode (pre-optimization).
+                (
+                    "generic-decode",
+                    "et_quantized_linear_mma_half",
+                    128,
+                    Box::new(|src| {
+                        src.replace(
+                            "et_decode_k16_half(block, (group_column % 256) / 16, temp_h);",
+                            "et_decode_k16(block, (group_column % 256) / 16, temp_h, 1);",
+                        )
+                    }),
+                ),
+                // Geometry: 64-row tile.
+                (
+                    "tile_n 64",
+                    "et_quantized_linear_mma_half",
+                    128,
+                    Box::new(|src| src.replace("#define ET_TILE_N 32", "#define ET_TILE_N 64")),
+                ),
+                // Geometry: doubled K tile (fewer barriers, each superblock
+                // loaded half as often).
+                (
+                    "tile_k 128",
+                    "et_quantized_linear_mma_half",
+                    128,
+                    Box::new(|src| {
+                        src.replacen(
+                            "constexpr uint tile_k = 2048 / tile_n;",
+                            "constexpr uint tile_k = 4096 / tile_n;",
+                            1,
+                        )
+                    }),
+                ),
+                // Geometry: quadrupled K tile (full superblock per tile).
+                (
+                    "tile_k 256",
+                    "et_quantized_linear_mma_half",
+                    128,
+                    Box::new(|src| {
+                        src.replacen(
+                            "constexpr uint tile_k = 2048 / tile_n;",
+                            "constexpr uint tile_k = 8192 / tile_n;",
+                            1,
+                        )
+                    }),
+                ),
+                // Diagnostics: skip the MMA loop (decode+stage+barriers).
+                (
+                    "no-mma",
+                    "et_quantized_linear_mma_half",
+                    128,
+                    Box::new(|src| {
+                        src.replace(
+                            "for (uint kb = uint(simd_group); kb < k_blocks; kb += 4) {",
+                            "for (uint kb = 0; kb < 0; ++kb) {",
+                        )
+                    }),
+                ),
+                // Diagnostics: skip weight decode (MMA+stage+barriers).
+                (
+                    "no-decode",
+                    "et_quantized_linear_mma_half",
+                    128,
+                    Box::new(|src| {
+                        src.replace(
+                            "if (item < decode_items && first_row + decode_row_r[round] < rows) {",
+                            "if (false) {",
+                        )
+                    }),
+                ),
+                // Diagnostics: skip input staging loads and stores.
+                (
+                    "no-stage",
+                    "et_quantized_linear_mma_half",
+                    128,
+                    Box::new(|src| src.replace("if (stage_active) {", "if (false) {")),
+                ),
+                // Diagnostics: no decode, no staging (MMA+stores+barriers).
+                (
+                    "mma-only",
+                    "et_quantized_linear_mma_half",
+                    128,
+                    Box::new(|src| {
+                        src.replace(
+                            "if (item < decode_items && first_row + decode_row_r[round] < rows) {",
+                            "if (false) {",
+                        )
+                        .replace("if (stage_active) {", "if (false) {")
+                    }),
+                ),
+                // Diagnostics: drop both in-loop barriers (racy; timing
+                // floor for the fully pipelined structure).
+                (
+                    "no-barrier",
+                    "et_quantized_linear_mma_half",
+                    128,
+                    Box::new(|src| {
+                        src.replace(
+                        "        threadgroup_barrier(mem_flags::mem_threadgroup);\n        // Stride 8 lands",
+                        "        // Stride 8 lands",
+                    )
+                    .replace(
+                        "        threadgroup_barrier(mem_flags::mem_threadgroup);\n        // K-split MMA",
+                        "        // K-split MMA",
+                    )
+                    }),
+                ),
+                // Diagnostics: no-mma without the in-loop barriers.
+                (
+                    "loads-only",
+                    "et_quantized_linear_mma_half",
+                    128,
+                    Box::new(|src| {
+                        src.replace(
+                        "for (uint kb = uint(simd_group); kb < k_blocks; kb += 4) {",
+                        "for (uint kb = 0; kb < 0; ++kb) {",
+                    )
+                    .replace(
+                        "        threadgroup_barrier(mem_flags::mem_threadgroup);\n        // Stride 8 lands",
+                        "        // Stride 8 lands",
+                    )
+                    .replace(
+                        "        threadgroup_barrier(mem_flags::mem_threadgroup);\n        // K-split MMA",
+                        "        // K-split MMA",
+                    )
+                    }),
+                ),
+            ];
+            let vectors64 = requirements.vectors as u64;
+            let rows64 = requirements.rows as u64;
+            let columns64 = requirements.columns as u64;
+            let encoded64 = requirements.encoded_row_bytes as u64;
+            let mut runners = Vec::new();
+            let mut names = Vec::new();
+            for (label, entry, threads, patch) in variants {
+                let patched = patch(source(kind, codec, None));
+                let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                "kquant_prefill_variant_probe".hash(&mut hasher);
+                label.hash(&mut hasher);
+                patched.hash(&mut hasher);
+                let pipeline = device.compile(hasher.finish(), &patched, entry).unwrap();
+                if label == "current" {
+                    use objc2_metal::MTLComputePipelineState;
+                    eprintln!(
+                        "    [occupancy]: maxThreads {} staticTgMem {}",
+                        pipeline.as_raw().maxTotalThreadsPerThreadgroup(),
+                        pipeline.as_raw().staticThreadgroupMemoryLength()
+                    );
+                }
+                let tile_n = if label.contains("tile_n 64") {
+                    64
+                } else {
+                    tile_n
+                };
+                let row_groups = requirements.rows.div_ceil(tile_n);
+                let vector_groups = requirements.vectors.div_ceil(tile_m);
+                let input_buffer = input.buffer.clone();
+                let input_offset = input.layout.offset();
+                let weight_buffer = weight.buffer.clone();
+                let output_buffer = output.buffer.clone();
+                let output_offset = output.layout.offset();
+                names.push(label);
+                runners.push(move || {
+                    device.with_encoder(|encoder| {
+                        encoder.setComputePipelineState(pipeline.as_raw());
+                        set_buffer(encoder, 0, &input_buffer, input_offset * 4);
+                        set_buffer(encoder, 1, &weight_buffer, 0);
+                        set_buffer(encoder, 2, &output_buffer, output_offset * 4);
+                        set_buffer(encoder, 3, &output_buffer, output_offset * 4);
+                        set_bytes(encoder, 4, &vectors64);
+                        set_bytes(encoder, 5, &rows64);
+                        set_bytes(encoder, 6, &columns64);
+                        set_bytes(encoder, 7, &encoded64);
+                        set_bytes(encoder, 8, &0u32);
+                        encoder.dispatchThreadgroups_threadsPerThreadgroup(
+                            MetalDevice::grid(row_groups, vector_groups, 1),
+                            MetalDevice::grid(threads as usize, 1, 1),
+                        );
+                    });
+                });
+            }
+            // Interleave variants round-robin so thermal throttling
+            // affects them equally; report the best of 3 repetitions.
+            let mut best = vec![f64::INFINITY; runners.len()];
+            for _ in 0..3 {
+                for (index, run) in runners.iter().enumerate() {
+                    for _ in 0..3 {
+                        run();
+                    }
+                    device.synchronize().unwrap();
+                    let started = std::time::Instant::now();
+                    for _ in 0..10 {
+                        run();
+                    }
+                    device.synchronize().unwrap();
+                    best[index] = best[index].min(started.elapsed().as_secs_f64());
+                }
+            }
+            let bytes = (requirements.encoded_row_bytes * requirements.rows) as f64;
+            eprintln!("{} {vectors}x{rows}x{columns}:", codec.name());
+            for (label, seconds) in names.iter().zip(best.iter()) {
+                eprintln!(
+                    "    [{}]: {:.3} ms/call, {:.1} GB/s packed",
+                    label,
+                    seconds * 100.0,
+                    bytes * 10.0 / seconds / 1e9
+                );
+            }
         }
     }
 }

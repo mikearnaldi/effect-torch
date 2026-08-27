@@ -1616,7 +1616,11 @@ export const makeRuntime = (
       Effect.try({
         try: () => {
           const generalized = request.generalizedProposer
-          const targetPrefill = nativeExecutable(request.target.prefill, "inferenceCompile").value as NativeExecutable
+          // CPU serves every prompt from the largest compiled prefill chunk.
+          const targetPrefill = nativeExecutable(
+            request.target.prefill[request.target.prefill.length - 1]!,
+            "inferenceCompile"
+          ).value as NativeExecutable
           const targetDecode = nativeExecutable(request.target.decode, "inferenceCompile").value as NativeExecutable
           const targetVerify = request.target.verify === undefined
             ? undefined
@@ -1651,7 +1655,8 @@ export const makeRuntime = (
             ),
             replay === undefined
               ? undefined
-              : nativeExecutable(replay.prefill, "inferenceCompile").value as NativeExecutable,
+              : nativeExecutable(replay.prefill[replay.prefill.length - 1]!, "inferenceCompile")
+                .value as NativeExecutable,
             replay === undefined
               ? undefined
               : nativeExecutable(replay.decode, "inferenceCompile").value as NativeExecutable,

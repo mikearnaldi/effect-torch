@@ -260,7 +260,9 @@ export declare class NativeInferenceArtifact {
     replayPrefill?: Executable | undefined | null,
     replayDecode?: Executable | undefined | null,
     replayVerify?: Executable | undefined | null,
-    replayPool?: NativeKvPool | undefined | null
+    replayPool?: NativeKvPool | undefined | null,
+    prefillBuckets?: Array<Executable> | undefined | null,
+    replayPrefillBuckets?: Array<Executable> | undefined | null
   )
   open(): NativeInferenceSession
   get inferenceDiagnostics(): NativeInferenceDiagnostics

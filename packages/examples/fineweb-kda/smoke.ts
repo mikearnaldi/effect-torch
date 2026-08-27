@@ -19,6 +19,7 @@ const program = Effect.scoped(Effect.gen(function*() {
   const inference = yield* Model.inference(model, params, {
     maxTokens: 1024,
     blockSize: 16,
+    prefillChunks: [16],
     attentionWindow: 256
   })
   const gen = yield* Effect.acquireRelease(

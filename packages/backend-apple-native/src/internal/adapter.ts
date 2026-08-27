@@ -1777,7 +1777,11 @@ export const makeRuntime = (
       Effect.try({
         try: () => {
           const sampling = normalizedInferenceSampling(request.sampling, undefined, "inference[compile]")
-          const targetPrefill = record(request.target.prefill, "executable", "inferenceCompile", "compile")
+          const targetPrefills = request.target.prefill.map((handle) =>
+            record(handle, "executable", "inferenceCompile", "compile").value as Executable
+          )
+          const targetPrefill = targetPrefills[targetPrefills.length - 1]!
+          const targetPrefillBuckets = targetPrefills.slice(0, -1)
           const targetDecode = record(request.target.decode, "executable", "inferenceCompile", "compile")
           const targetVerify = request.target.verify === undefined
             ? undefined
@@ -1919,9 +1923,12 @@ export const makeRuntime = (
             nativeTensor(tensor, "inferenceCompile", "compile")
           )
           const replay = generalized?.replay
+          const replayPrefills = replay?.prefill.map((handle) =>
+            record(handle, "executable", "inferenceCompile", "compile").value as Executable
+          )
           return inferenceArtifact(
             new native.NativeInferenceArtifact(
-              targetPrefill.value as Executable,
+              targetPrefill,
               targetDecode.value as Executable,
               targetVerify?.value as Executable | undefined,
               targetPool.value as NativeKvPool,
@@ -1935,9 +1942,7 @@ export const makeRuntime = (
               nativePlan,
               stageExecutables,
               sharedTargetTensors,
-              replay === undefined
-                ? undefined
-                : record(replay.prefill, "executable", "inferenceCompile", "compile").value as Executable,
+              replayPrefills === undefined ? undefined : replayPrefills[replayPrefills.length - 1]!,
               replay === undefined
                 ? undefined
                 : record(replay.decode, "executable", "inferenceCompile", "compile").value as Executable,
@@ -1946,7 +1951,9 @@ export const makeRuntime = (
                 : record(replay.verify, "executable", "inferenceCompile", "compile").value as Executable,
               replay === undefined
                 ? undefined
-                : record(replay.pool, "kv-pool", "inferenceCompile", "compile").value as NativeKvPool
+                : record(replay.pool, "kv-pool", "inferenceCompile", "compile").value as NativeKvPool,
+              targetPrefillBuckets,
+              replayPrefills?.slice(0, -1)
             ),
             sampling
           )

@@ -982,7 +982,7 @@ const generate = (
     const inference = yield* Model.inference(model, params, {
       maxTokens: 8192,
       blockSize: 16,
-      prefillChunk: 16,
+      prefillChunks: [16],
       attentionWindow: 256,
       kvDtype: "bf16",
       batchSize: 8,
@@ -1378,6 +1378,7 @@ The examples include:
 pnpm bench
 pnpm bench:compile
 pnpm bench:mlx
+pnpm bench:muse-glimmer
 
 cargo bench -p effect-torch-compiler --bench pipeline
 cargo bench -p effect-torch-compiler --bench pipeline -- --workload stress
@@ -1387,7 +1388,11 @@ The benchmark package contains configurable matmul, shape, compiled-program,
 native cold-compile/warm-structural-cache, attention, and optional MLX
 comparisons. `N`, `ITERS`, and `METAL_ONLY` control the default matmul
 benchmark. `pnpm bench:compile -- --help` lists backend, workload, size,
-iteration, and optimization controls.
+iteration, and optimization controls. `pnpm bench:muse-glimmer` measures the
+local Muse-Glimmer GGUF across ordinary and DFlash modes at multiple context
+depths, writing JSONL records under `bench-results/`; set `LLAMA_CPP_BIN` to a
+directory containing `llama-bench`, `llama-cli`, and `llama-speculative-simple`
+to add matched llama.cpp kernel and end-to-end rows.
 
 The Rust compiler benchmark measures `GraphIndex` plus side-table optimization
 separately from graph construction and reports deterministic structural work.

@@ -212,6 +212,92 @@ pub fn specialize_decode_layout(
     specialize_decode_layout_outputs(roots, window, layout, &output_selections)
 }
 
+fn push_last_token_row_through_head(
+    root: &Arc<Node>,
+    batched: bool,
+) -> Result<Option<Arc<Node>>, String> {
+    fn descend(node: &Arc<Node>) -> Result<Option<Arc<Node>>, String> {
+        match &node.kind {
+            NodeKind::QuantizedLinear {
+                x,
+                weight,
+                bias,
+                codec,
+                weight_shape,
+            } if x.shape.len() == 3 && x.shape[0] == 1 => {
+                let columns = x.shape[2];
+                let selected = Node::new(NodeKind::LastTokenRow { a: x.clone() })?;
+                let selected = Node::new(NodeKind::Reshape {
+                    a: selected,
+                    shape: vec![1, columns],
+                })?;
+                Node::new(NodeKind::QuantizedLinear {
+                    x: selected,
+                    weight: weight.clone(),
+                    bias: bias.clone(),
+                    codec: *codec,
+                    weight_shape: *weight_shape,
+                })
+                .map(Some)
+            }
+            NodeKind::Linear { x, weight, bias } if x.shape.len() == 3 && x.shape[0] == 1 => {
+                let columns = x.shape[2];
+                let selected = Node::new(NodeKind::LastTokenRow { a: x.clone() })?;
+                let selected = Node::new(NodeKind::Reshape {
+                    a: selected,
+                    shape: vec![1, columns],
+                })?;
+                Node::new(NodeKind::Linear {
+                    x: selected,
+                    weight: weight.clone(),
+                    bias: bias.clone(),
+                })
+                .map(Some)
+            }
+            NodeKind::Tanh { a } => match descend(a)? {
+                Some(a) => Node::new(NodeKind::Tanh { a }).map(Some),
+                None => Ok(None),
+            },
+            NodeKind::Mul { a, b } | NodeKind::Div { a, b } => {
+                let (sequence, scalar, sequence_is_left) = if a.shape.is_empty() {
+                    (b, a, false)
+                } else if b.shape.is_empty() {
+                    (a, b, true)
+                } else {
+                    return Ok(None);
+                };
+                let Some(sequence) = descend(sequence)? else {
+                    return Ok(None);
+                };
+                let (a, b) = if sequence_is_left {
+                    (sequence, scalar.clone())
+                } else {
+                    (scalar.clone(), sequence)
+                };
+                let kind = match &node.kind {
+                    NodeKind::Mul { .. } => NodeKind::Mul { a, b },
+                    NodeKind::Div { .. } => NodeKind::Div { a, b },
+                    _ => unreachable!(),
+                };
+                Node::new(kind).map(Some)
+            }
+            _ => Ok(None),
+        }
+    }
+    let Some(pushed) = descend(root)? else {
+        return Ok(None);
+    };
+    if pushed.shape.len() != 2 || pushed.shape[0] != 1 {
+        return Ok(None);
+    }
+    let width = pushed.shape[1];
+    Node::new(NodeKind::Reshape {
+        a: pushed,
+        shape: if batched { vec![1, width] } else { vec![width] },
+    })
+    .map(Some)
+}
+
 /// Builds a stateful decode specialization with an explicit output-row policy
 /// for every source root.
 pub fn specialize_decode_layout_outputs(
@@ -619,6 +705,15 @@ pub fn specialize_decode_layout_outputs_with_attention(
                     ));
                 }
                 let (tokens, width) = (root.shape[1], root.shape[2]);
+                if batch == 1 {
+                    if let Some(pushed) = push_last_token_row_through_head(
+                        root,
+                        *selection == DecodeOutputSelection::BatchedLastTokenRow,
+                    )? {
+                        selected.push(pushed);
+                        continue;
+                    }
+                }
                 let mut rows = Vec::with_capacity(batch);
                 for row in 0..batch {
                     let source = if batch == 1 {
@@ -1236,6 +1331,47 @@ mod tests {
             Err(error) => error,
         };
         assert!(error.contains("cannot retain explicit local window 13"));
+    }
+
+    #[test]
+    fn last_token_row_moves_through_scalar_head_epilogue_before_linear() {
+        let x = input(0, &[1, 4, 256], DType::F32, Device::Cpu);
+        let weight = tensor(&[256, 4], DType::F32, Device::Cpu);
+        let bias = tensor(&[4], DType::F32, Device::Cpu);
+        let scalar = tensor(&[], DType::F32, Device::Cpu);
+        let head = Node::new(NodeKind::Linear { x, weight, bias }).unwrap();
+        let scaled = Node::new(NodeKind::Mul {
+            a: head,
+            b: scalar.clone(),
+        })
+        .unwrap();
+        let divided = Node::new(NodeKind::Div {
+            a: scaled,
+            b: scalar.clone(),
+        })
+        .unwrap();
+        let activated = Node::new(NodeKind::Tanh { a: divided }).unwrap();
+        let root = Node::new(NodeKind::Mul {
+            a: activated,
+            b: scalar,
+        })
+        .unwrap();
+
+        let (roots, _) = specialize_decode(&[root], None, 1, true).unwrap();
+        assert_eq!(roots[0].shape, [4]);
+        let mut stack = vec![roots[0].clone()];
+        let mut found_selector = false;
+        let mut head_input_shape = None;
+        while let Some(node) = stack.pop() {
+            match &node.kind {
+                NodeKind::LastTokenRow { .. } => found_selector = true,
+                NodeKind::Linear { x, .. } => head_input_shape = Some(x.shape.clone()),
+                _ => {}
+            }
+            stack.extend(node_children(&node.kind));
+        }
+        assert!(found_selector);
+        assert_eq!(head_input_shape.as_deref(), Some(&[1, 256][..]));
     }
 
     #[test]

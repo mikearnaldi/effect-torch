@@ -2463,8 +2463,11 @@ impl MetalDecodeContext for KvContext {
         mode: KvAttentionMode,
         output: &runtime::metal::run::MetalTensor,
         staging: &[runtime::metal::run::MetalTensor],
+        scratch: &[runtime::metal::run::MetalTensor],
     ) -> err::Res<()> {
-        kv_attention_into(self, layer, q, k, v, scale, window, mode, output, staging)
+        kv_attention_into(
+            self, layer, q, k, v, scale, window, mode, output, staging, scratch,
+        )
     }
 
     fn evict_before(&self, state: &mut SeqState, start: usize) {
@@ -2575,7 +2578,6 @@ pub(crate) fn prepare_kv_attention(
                 plan.kv_heads,
                 plan.head_dim,
                 advance,
-                kv.publish_hashes,
             )?;
         }
         let mut local_rows = vec![0usize; kv.slots.len()];
@@ -2640,7 +2642,6 @@ pub(crate) fn prepare_kv_attention(
             plan.kv_heads,
             plan.head_dim,
             plan.time,
-            kv.publish_hashes,
         )?;
         if state.blocks.len() > max_blocks {
             return Err("kv attention: block table exceeds its schema capacity".to_string());
@@ -2689,6 +2690,7 @@ pub(crate) fn kv_attention_into(
     mode: KvAttentionMode,
     output: &runtime::metal::run::MetalTensor,
     staging: &[runtime::metal::run::MetalTensor],
+    scratch: &[runtime::metal::run::MetalTensor],
 ) -> err::Res<()> {
     if q.dtype != DType::F32 || k.dtype != DType::F32 || v.dtype != DType::F32 {
         return Err("kv attention: paged destination path requires f32 q/k/v".to_string());
@@ -2754,22 +2756,75 @@ pub(crate) fn kv_attention_into(
     } else {
         paged::attention_into
     };
-    attend(
-        q,
-        kv.pool.k[layer].metal()?,
-        kv.pool.v[layer].metal()?,
-        k_scales,
-        v_scales,
-        tables,
-        context_lengths,
-        block_bases,
-        window,
-        scale,
-        kv.pool.block_size,
-        advances,
-        output,
-        paged::IntoResources::empty(),
-    )?;
+    let use_split = if scratch.is_empty() {
+        false
+    } else {
+        // Splitting pays off once the context is long enough to saturate the
+        // GPU; below that, the extra partial/combine dispatch is pure overhead.
+        let lengths = unsafe {
+            std::slice::from_raw_parts(
+                context_lengths
+                    .buffer
+                    .contents_ptr()
+                    .cast::<u32>()
+                    .add(context_lengths.layout.offset()),
+                context_lengths.layout.shape()[0],
+            )
+        };
+        lengths.iter().any(|&context| context >= 512)
+    };
+    if !use_split {
+        attend(
+            q,
+            kv.pool.k[layer].metal()?,
+            kv.pool.v[layer].metal()?,
+            k_scales,
+            v_scales,
+            tables,
+            context_lengths,
+            block_bases,
+            window,
+            scale,
+            kv.pool.block_size,
+            advances,
+            output,
+            paged::IntoResources::empty(),
+        )?;
+    } else {
+        // Split flash-decoding path: planned only for causal one-token
+        // decode; the scratch shape fixes the split count.
+        if mode == KvAttentionMode::BidirectionalBlock {
+            return Err("kv attention: split decode scratch is causal-only".to_string());
+        }
+        if scratch.len() != 1 || time != 1 {
+            return Err(
+                "kv attention: split decode requires one scratch tensor and one-token decode"
+                    .to_string(),
+            );
+        }
+        let splits = scratch[0].layout.shape().get(2).copied().unwrap_or(0);
+        paged::attention_split_into(
+            q,
+            kv.pool.k[layer].metal()?,
+            kv.pool.v[layer].metal()?,
+            k_scales,
+            v_scales,
+            tables,
+            context_lengths,
+            block_bases,
+            window,
+            scale,
+            kv.pool.block_size,
+            advances,
+            splits,
+            output,
+            paged::IntoResources {
+                staging: &[],
+                status: &[],
+                scratch,
+            },
+        )?;
+    }
     Ok(())
 }
 
@@ -2787,7 +2842,6 @@ fn kv_prepare(
     h: usize,
     d: usize,
     t: usize,
-    evict_cache: bool,
 ) -> err::Res<(usize, usize, usize)> {
     if layer >= pool.k.len() {
         return Err(format!(
@@ -2834,14 +2888,14 @@ fn kv_prepare(
     }
     let needed_blocks = needed.div_ceil(pool.block_size);
     while state.head + state.blocks.len() < needed_blocks {
-        let block = pool
-            .alloc_block_with_cache_eviction(evict_cache)
-            .ok_or_else(|| {
-                err::err_str(format!(
-                    "kv attention: pool exhausted ({} tokens across live sequences)",
-                    pool.max_tokens
-                ))
-            })?;
+        // Provisional and durable executions may both reclaim unreferenced
+        // prefix-cache blocks under pressure. Live blocks are never eligible.
+        let block = pool.alloc_block_with_cache_eviction(true).ok_or_else(|| {
+            err::err_str(format!(
+                "kv attention: pool exhausted ({} tokens across live sequences)",
+                pool.max_tokens
+            ))
+        })?;
         state.blocks.push(block);
     }
     Ok((cursor, needed, start))
@@ -4306,15 +4360,14 @@ fn packed_verification_plan(
     })
 }
 
-fn run_speculative_program(
+fn speculative_invocation(
     program: &SpeculativeProgram,
     shadow: &ShadowSequences,
     request_indices: &[usize],
     slots: &[usize],
     tokens: Vec<Vec<u32>>,
     packed: Option<&PackedVerificationPlan>,
-    cancelled: &effect_torch_runtime::CancellationFlag,
-) -> err::Res<Vec<value::Value>> {
+) -> err::Res<(KvContext, value::Value)> {
     let states = request_indices
         .iter()
         .map(|index| shadow.states[*index].clone())
@@ -4356,6 +4409,21 @@ fn run_speculative_program(
         packed_positions,
         publish_hashes: false,
     };
+    Ok((context, input))
+}
+
+fn run_speculative_program(
+    program: &SpeculativeProgram,
+    shadow: &ShadowSequences,
+    request_indices: &[usize],
+    slots: &[usize],
+    tokens: Vec<Vec<u32>>,
+    packed: Option<&PackedVerificationPlan>,
+    cancelled: &effect_torch_runtime::CancellationFlag,
+    headless: bool,
+) -> err::Res<Vec<value::Value>> {
+    let (context, input) =
+        speculative_invocation(program, shadow, request_indices, slots, tokens, packed)?;
     executable::execute_stateful(
         &program.executable,
         &[input],
@@ -4363,9 +4431,70 @@ fn run_speculative_program(
         cancelled,
         &context,
         &|| true,
+        headless,
     )
 }
 
+/// Deferred twin of [`run_speculative_program`]: encodes the chunk onto the
+/// caller's submission stream, publishes its state transactions as
+/// GPU-ordered device copies, advances the CPU-side cursors immediately,
+/// and returns a pending whose drain performs the single host fence.
+#[allow(clippy::too_many_arguments)]
+fn run_speculative_program_deferred(
+    program: &SpeculativeProgram,
+    shadow: &ShadowSequences,
+    request_indices: &[usize],
+    slots: &[usize],
+    tokens: Vec<Vec<u32>>,
+    packed: Option<&PackedVerificationPlan>,
+    cancelled: &effect_torch_runtime::CancellationFlag,
+    submission: &device::MetalSubmissionGuard<'_>,
+    headless: bool,
+) -> err::Res<executable::PendingExecution> {
+    let (context, input) =
+        speculative_invocation(program, shadow, request_indices, slots, tokens, packed)?;
+    executable::execute_stateful_deferred(
+        &program.executable,
+        &[input],
+        &program.generated,
+        cancelled,
+        &context,
+        &|| true,
+        submission,
+        headless,
+    )
+}
+
+fn stateful_invocation(
+    schema: KvStateSchema,
+    shadow: &ShadowSequences,
+    request_indices: &[usize],
+    lanes: &[usize],
+    tokens: Vec<Vec<u32>>,
+) -> err::Res<KvContext> {
+    let states = request_indices
+        .iter()
+        .map(|index| shadow.states[*index].clone())
+        .collect::<Vec<_>>();
+    for (state, tokens) in states.iter().zip(&tokens) {
+        state
+            .lock()
+            .map_err(|error| format!("parallel replay shadow lock poisoned: {error}"))?
+            .advance = tokens.len();
+    }
+    Ok(KvContext {
+        pool: shadow.pool.clone(),
+        slots: states,
+        schema,
+        tokens,
+        lanes: lanes.to_vec(),
+        packed_rows: None,
+        packed_positions: None,
+        publish_hashes: false,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
 fn run_stateful_values(
     executable: &Arc<executable::MetalExecutable>,
     generated: &[value::Value],
@@ -4377,26 +4506,7 @@ fn run_stateful_values(
     tokens: Vec<Vec<u32>>,
     cancelled: &effect_torch_runtime::CancellationFlag,
 ) -> err::Res<Vec<value::Value>> {
-    let states = request_indices
-        .iter()
-        .map(|index| shadow.states[*index].clone())
-        .collect::<Vec<_>>();
-    for (state, tokens) in states.iter().zip(&tokens) {
-        state
-            .lock()
-            .map_err(|error| format!("parallel replay shadow lock poisoned: {error}"))?
-            .advance = tokens.len();
-    }
-    let context = KvContext {
-        pool: shadow.pool.clone(),
-        slots: states,
-        schema,
-        tokens,
-        lanes: lanes.to_vec(),
-        packed_rows: None,
-        packed_positions: None,
-        publish_hashes: false,
-    };
+    let context = stateful_invocation(schema, shadow, request_indices, lanes, tokens)?;
     executable::execute_stateful(
         executable,
         bindings,
@@ -4404,6 +4514,35 @@ fn run_stateful_values(
         cancelled,
         &context,
         &|| true,
+        false,
+    )
+}
+
+/// Deferred twin of [`run_stateful_values`]; see
+/// [`run_speculative_program_deferred`].
+#[allow(clippy::too_many_arguments)]
+fn run_stateful_values_deferred(
+    executable: &Arc<executable::MetalExecutable>,
+    generated: &[value::Value],
+    schema: KvStateSchema,
+    shadow: &ShadowSequences,
+    request_indices: &[usize],
+    lanes: &[usize],
+    bindings: &[value::Value],
+    tokens: Vec<Vec<u32>>,
+    cancelled: &effect_torch_runtime::CancellationFlag,
+    submission: &device::MetalSubmissionGuard<'_>,
+) -> err::Res<executable::PendingExecution> {
+    let context = stateful_invocation(schema, shadow, request_indices, lanes, tokens)?;
+    executable::execute_stateful_deferred(
+        executable,
+        bindings,
+        generated,
+        cancelled,
+        &context,
+        &|| true,
+        submission,
+        false,
     )
 }
 
@@ -4417,15 +4556,7 @@ fn replay_outputs(
     tokens: Vec<Vec<u32>>,
     cancelled: &effect_torch_runtime::CancellationFlag,
 ) -> err::Res<()> {
-    let bindings = tap_outputs
-        .iter()
-        .map(|output| {
-            source_outputs
-                .get(*output)
-                .cloned()
-                .ok_or_else(|| "parallel replay target tap is unavailable".to_string())
-        })
-        .collect::<err::Res<Vec<_>>>()?;
+    let bindings = tap_bindings(source_outputs, tap_outputs)?;
     run_stateful_values(
         &replay.executable,
         &replay.generated,
@@ -4440,9 +4571,58 @@ fn replay_outputs(
     Ok(())
 }
 
-fn run_parallel_prefill(
-    target: &SpeculativeProgram,
+fn tap_bindings(
+    source_outputs: &[value::Value],
+    tap_outputs: &[usize],
+) -> err::Res<Vec<value::Value>> {
+    tap_outputs
+        .iter()
+        .map(|output| {
+            source_outputs
+                .get(*output)
+                .cloned()
+                .ok_or_else(|| "parallel replay target tap is unavailable".to_string())
+        })
+        .collect()
+}
+
+/// Deferred twin of [`replay_outputs`]: the target tap outputs are GPU
+/// buffers produced earlier on the same stream, so the replay chains after
+/// them without a host fence.
+#[allow(clippy::too_many_arguments)]
+fn replay_outputs_deferred(
     replay: &ReplayProgram,
+    shadow: &ShadowSequences,
+    source_outputs: &[value::Value],
+    tap_outputs: &[usize],
+    request_indices: &[usize],
+    lanes: &[usize],
+    tokens: Vec<Vec<u32>>,
+    cancelled: &effect_torch_runtime::CancellationFlag,
+    submission: &device::MetalSubmissionGuard<'_>,
+) -> err::Res<executable::PendingExecution> {
+    let bindings = tap_bindings(source_outputs, tap_outputs)?;
+    run_stateful_values_deferred(
+        &replay.executable,
+        &replay.generated,
+        replay.schema,
+        shadow,
+        request_indices,
+        lanes,
+        &bindings,
+        tokens,
+        cancelled,
+        submission,
+    )
+}
+
+/// Maximum number of deferred prefill invocations allowed in flight before
+/// a single shared drain; bounds the workspace leases held by pendings
+/// (each deferred chunk pins its own workspace until the fence).
+const PREFILL_IN_FLIGHT_LIMIT: usize = 8;
+
+fn run_parallel_prefill(
+    buckets: &[PrefillBucket],
     plan: &RetainedProposerPlan,
     target_shadow: &ShadowSequences,
     proposer_shadow: &ShadowSequences,
@@ -4452,6 +4632,8 @@ fn run_parallel_prefill(
 ) -> err::Res<Vec<value::Value>> {
     let mut offsets = vec![0usize; prompts.len()];
     let mut final_outputs = vec![None; prompts.len()];
+    let mut pendings: Vec<executable::PendingExecution> = Vec::new();
+    let mut submission: Option<device::MetalSubmissionGuard<'_>> = None;
     loop {
         let active = (0..prompts.len())
             .filter(|index| offsets[*index] < prompts[*index].len())
@@ -4459,23 +4641,94 @@ fn run_parallel_prefill(
         if active.is_empty() {
             break;
         }
+        // Buckets are chosen conservatively from the longest active lane;
+        // shorter lanes zero-pad to the same compiled chunk.
+        let remaining = active
+            .iter()
+            .map(|index| prompts[*index].len() - offsets[*index])
+            .max()
+            .expect("active lanes are nonempty");
+        let bucket = prefill_bucket(buckets, remaining);
+        let time = bucket.prefill.time;
+        if std::env::var_os("EFFECT_TORCH_DEBUG_PREFILL").is_some() {
+            eprintln!(
+                "[prefill-debug] buckets={:?} remaining={remaining} chosen={time}",
+                buckets
+                    .iter()
+                    .map(|bucket| bucket.prefill.time)
+                    .collect::<Vec<_>>()
+            );
+        }
+        let replay = bucket
+            .replay
+            .as_ref()
+            .expect("parallel prefill bucket has a replay program");
+        let mut finishes = false;
         let tokens = active
             .iter()
             .map(|index| {
-                let end = (offsets[*index] + target.time).min(prompts[*index].len());
+                let end = (offsets[*index] + time).min(prompts[*index].len());
                 let chunk = prompts[*index][offsets[*index]..end].to_vec();
                 offsets[*index] = end;
+                // Mixed-length lanes share one invocation, so a chunk that
+                // finishes any prompt conservatively computes the head.
+                finishes |= end == prompts[*index].len();
                 chunk
             })
             .collect::<Vec<_>>();
+        let headless = !finishes;
+        if headless {
+            // Deferred: the target chunk and its proposer replay chain on
+            // one submission stream; the replay binds the chunk's tap
+            // outputs as GPU buffers, so no host fence is needed between
+            // them.
+            if submission.is_none() {
+                submission = Some(device::MetalDevice::get().begin_submission()?);
+            }
+            let guard = submission.as_ref().expect("prefill submission opened");
+            let pending = run_speculative_program_deferred(
+                &bucket.prefill,
+                target_shadow,
+                &active,
+                slots,
+                tokens.clone(),
+                None,
+                cancelled,
+                guard,
+                true,
+            )?;
+            let outputs = pending.outputs().to_vec();
+            pendings.push(pending);
+            let replay_pending = replay_outputs_deferred(
+                replay,
+                proposer_shadow,
+                &outputs,
+                &plan.prefill_tap_outputs,
+                &active,
+                &active.iter().map(|index| slots[*index]).collect::<Vec<_>>(),
+                tokens,
+                cancelled,
+                guard,
+            )?;
+            pendings.push(replay_pending);
+            if pendings.len() >= PREFILL_IN_FLIGHT_LIMIT {
+                executable::PendingExecution::drain_batch(std::mem::take(&mut pendings))?;
+            }
+            continue;
+        }
+        // A headed chunk forces a drain of every pending deferred chunk
+        // with one fence, then runs on the synchronous path as before.
+        executable::PendingExecution::drain_batch(std::mem::take(&mut pendings))?;
+        drop(submission.take());
         let outputs = run_speculative_program(
-            target,
+            &bucket.prefill,
             target_shadow,
             &active,
             slots,
             tokens.clone(),
             None,
             cancelled,
+            false,
         )?;
         replay_outputs(
             replay,
@@ -4491,6 +4744,10 @@ fn run_parallel_prefill(
             final_outputs[index] = Some(outputs[slots[index]].clone());
         }
     }
+    // The loop always ends on a headed chunk (every prompt's final chunk
+    // finishes its lane), but drain defensively if it did not.
+    executable::PendingExecution::drain_batch(std::mem::take(&mut pendings))?;
+    drop(submission.take());
     for (target, proposer) in target_shadow.states.iter().zip(&proposer_shadow.states) {
         let target_cursor = target
             .lock()
@@ -4564,7 +4821,7 @@ fn sample_greedy_verification_rows(
 }
 
 fn run_prefill_program(
-    program: &SpeculativeProgram,
+    buckets: &[PrefillBucket],
     shadow: &ShadowSequences,
     slots: &[usize],
     prompts: &[Vec<u32>],
@@ -4586,6 +4843,8 @@ fn run_prefill_program(
         })
         .collect::<err::Res<Vec<_>>>()?;
     let mut final_outputs = vec![None; prompts.len()];
+    let mut pendings: Vec<executable::PendingExecution> = Vec::new();
+    let mut submission: Option<device::MetalSubmissionGuard<'_>> = None;
     loop {
         let active = (0..prompts.len())
             .filter(|index| offsets[*index] < prompts[*index].len())
@@ -4593,21 +4852,87 @@ fn run_prefill_program(
         if active.is_empty() {
             break;
         }
+        // Buckets are chosen conservatively from the longest active lane;
+        // shorter lanes zero-pad to the same compiled chunk.
+        let remaining = active
+            .iter()
+            .map(|index| prompts[*index].len() - offsets[*index])
+            .max()
+            .expect("active lanes are nonempty");
+        let bucket = prefill_bucket(buckets, remaining);
+        let time = bucket.prefill.time;
+        if std::env::var_os("EFFECT_TORCH_DEBUG_PREFILL").is_some() {
+            eprintln!(
+                "[prefill-debug] buckets={:?} remaining={remaining} chosen={time}",
+                buckets
+                    .iter()
+                    .map(|bucket| bucket.prefill.time)
+                    .collect::<Vec<_>>()
+            );
+        }
+        let mut finishes = false;
         let tokens = active
             .iter()
             .map(|index| {
-                let end = (offsets[*index] + program.time).min(prompts[*index].len());
+                let end = (offsets[*index] + time).min(prompts[*index].len());
                 let chunk = prompts[*index][offsets[*index]..end].to_vec();
                 offsets[*index] = end;
+                // Mixed-length lanes share one invocation, so a chunk that
+                // finishes any prompt conservatively computes the head.
+                finishes |= end == prompts[*index].len();
                 chunk
             })
             .collect::<Vec<_>>();
-        let outputs =
-            run_speculative_program(program, shadow, &active, slots, tokens, None, cancelled)?;
+        // Non-final chunks run headless: the compiler-marked LM-head chain
+        // is skipped at dispatch, only state and tap outputs are computed.
+        let headless = !finishes;
+        if headless {
+            // Deferred: consecutive headless chunks pipeline on one
+            // submission stream with GPU-ordered state transactions; the
+            // single host fence happens at the next headed chunk (or when
+            // the in-flight limit bounds the leased workspaces).
+            if submission.is_none() {
+                submission = Some(device::MetalDevice::get().begin_submission()?);
+            }
+            let pending = run_speculative_program_deferred(
+                &bucket.prefill,
+                shadow,
+                &active,
+                slots,
+                tokens,
+                None,
+                cancelled,
+                submission.as_ref().expect("prefill submission opened"),
+                true,
+            )?;
+            pendings.push(pending);
+            if pendings.len() >= PREFILL_IN_FLIGHT_LIMIT {
+                executable::PendingExecution::drain_batch(std::mem::take(&mut pendings))?;
+            }
+            continue;
+        }
+        // A headed chunk forces a drain of every pending deferred chunk
+        // with one fence, then runs on the synchronous path as before.
+        executable::PendingExecution::drain_batch(std::mem::take(&mut pendings))?;
+        drop(submission.take());
+        let outputs = run_speculative_program(
+            &bucket.prefill,
+            shadow,
+            &active,
+            slots,
+            tokens,
+            None,
+            cancelled,
+            false,
+        )?;
         for index in active {
             final_outputs[index] = Some(outputs[slots[index]].clone());
         }
     }
+    // The loop always ends on a headed chunk (every prompt's final chunk
+    // finishes its lane), but drain defensively if it did not.
+    executable::PendingExecution::drain_batch(std::mem::take(&mut pendings))?;
+    drop(submission.take());
     final_outputs
         .into_iter()
         .map(|output| {
@@ -4804,6 +5129,7 @@ fn execute_history_lookup_blocking(
         verify_tokens,
         Some(&packed),
         cancelled,
+        false,
     )?;
     stats.verification_nanos = verify_started.elapsed().as_nanos().max(1) as u64;
     let mut pages = Vec::with_capacity(pending.len());
@@ -5036,6 +5362,7 @@ fn execute_parallel_blocking(
         verify_tokens,
         Some(&packed),
         cancelled,
+        false,
     )?;
     stats.verification_nanos = verify_started.elapsed().as_nanos().max(1) as u64;
     let target_logits = if draft_probabilities.is_some() {
@@ -5299,6 +5626,7 @@ fn execute_speculative_blocking(
             tokens,
             None,
             cancelled,
+            false,
         )?;
         for lane in active {
             let logits = read_float_tensor(&outputs[slots[lane]])?;
@@ -5373,6 +5701,7 @@ fn execute_speculative_blocking(
         verify_tokens,
         Some(&packed),
         cancelled,
+        false,
     )?;
     if let Some(stats) = stats.as_deref_mut() {
         stats.verification_nanos = verify_started.elapsed().as_nanos().max(1) as u64;
@@ -5530,6 +5859,7 @@ fn execute_speculative_blocking(
             catchup_tokens,
             None,
             cancelled,
+            false,
         )?;
     }
     if cancelled.load(Ordering::Relaxed) {
@@ -6101,9 +6431,33 @@ fn sample_at(
     probabilities.len().saturating_sub(1) as u32
 }
 
+/// One compiled prefill shape bucket: a headed program plus its optional
+/// headless body, sharing the decode program's state geometry and pool.
+#[derive(Clone)]
+struct PrefillBucket {
+    prefill: SpeculativeProgram,
+    /// This bucket's proposer replay program (parallel-block configs).
+    replay: Option<ReplayProgram>,
+}
+
+// Largest compiled bucket covering the remaining tokens of the longest
+// active lane; shorter remainders fall back to the smallest bucket, so every
+// chunk keeps one fixed compiled shape and buckets only bound padding waste.
+fn prefill_bucket(buckets: &[PrefillBucket], remaining: usize) -> &PrefillBucket {
+    buckets
+        .iter()
+        .rev()
+        .find(|bucket| bucket.prefill.time <= remaining)
+        .unwrap_or(&buckets[0])
+}
+
 #[derive(Clone)]
 struct InferencePrograms {
     target_prefill: SpeculativeProgram,
+    /// Every compiled prefill shape bucket sorted by time ascending; the last
+    /// entry always mirrors the primary prefill program and its optional
+    /// headless body.
+    prefill_buckets: Vec<PrefillBucket>,
     target_decode: SpeculativeProgram,
     target_verify: Option<SpeculativeProgram>,
     target_pool: Arc<PoolInner>,
@@ -6948,6 +7302,8 @@ impl NativeInferenceArtifact {
         replay_decode: Option<&Executable>,
         replay_verify: Option<&Executable>,
         replay_pool: Option<&NativeKvPool>,
+        prefill_buckets: Option<Vec<&Executable>>,
+        replay_prefill_buckets: Option<Vec<&Executable>>,
     ) -> Result<Self> {
         let generalized = proposer_plan.is_some();
         if generalized
@@ -7020,6 +7376,49 @@ impl NativeInferenceArtifact {
                 "inference[compile]: incompatible target programs, pool, batch or token dtype",
             ));
         }
+        // Smaller prefill shape buckets share the primary prefill's state
+        // schema, pool, batch, and token dtype; only the compiled time
+        // dimension differs. They are stored ascending with the primary
+        // (largest) bucket last.
+        let prefill_bucket_programs = prefill_buckets.unwrap_or_default();
+        let mut bucket_pairs = Vec::new();
+        for bucket in &prefill_bucket_programs {
+            let bucket_prefill = inference_program(bucket, "prefill", false, generalized)?;
+            if bucket_prefill.batch != batch
+                || bucket_prefill.token_dtype != dtype
+                || bucket_prefill.vocabulary != target_decode.vocabulary
+                || bucket_prefill.time >= target_prefill.time
+                || !same_inference_state(bucket_prefill.schema, target_prefill.schema)
+                || !compatible_pool(&bucket_prefill, &target_pool.inner)
+            {
+                return Err(Error::new(
+                    Status::InvalidArg,
+                    "inference[compile]: incompatible prefill bucket program, pool, batch or token dtype",
+                ));
+            }
+            bucket_pairs.push((*bucket, bucket_prefill));
+        }
+        bucket_pairs.sort_by_key(|(_, program)| program.time);
+        if bucket_pairs
+            .windows(2)
+            .any(|pair| pair[0].1.time == pair[1].1.time)
+        {
+            return Err(Error::new(
+                Status::InvalidArg,
+                "inference[compile]: prefill bucket times must be distinct",
+            ));
+        }
+        let mut prefill_buckets: Vec<PrefillBucket> = bucket_pairs
+            .iter()
+            .map(|(_, program)| PrefillBucket {
+                prefill: program.clone(),
+                replay: None,
+            })
+            .collect();
+        prefill_buckets.push(PrefillBucket {
+            prefill: target_prefill.clone(),
+            replay: None,
+        });
         if proposer_complete {
             let draft = max_draft_tokens.unwrap() as usize;
             let prefill = proposer_prefill.as_ref().unwrap();
@@ -7070,7 +7469,10 @@ impl NativeInferenceArtifact {
         let replay_present = replay_prefill.is_some()
             || replay_decode.is_some()
             || replay_verify.is_some()
-            || replay_pool.is_some();
+            || replay_pool.is_some()
+            || replay_prefill_buckets
+                .as_ref()
+                .is_some_and(|buckets| !buckets.is_empty());
         if replay_present
             != (replay_prefill.is_some()
                 && replay_decode.is_some()
@@ -7241,6 +7643,38 @@ impl NativeInferenceArtifact {
                 target_prefill_program,
                 &plan.prefill_tap_outputs,
             )?;
+            // Every prefill shape bucket replays through its own program,
+            // compiled against that bucket's tap shapes and aligned with
+            // the sorted (ascending) bucket order.
+            let replay_bucket_programs = replay_prefill_buckets.unwrap_or_default();
+            if replay_bucket_programs.len() != bucket_pairs.len() {
+                return Err(plan_error(
+                    "ParallelBlock replay prefill buckets must align with the prefill buckets",
+                ));
+            }
+            let mut bucket_replays = Vec::with_capacity(bucket_pairs.len());
+            for (replay, (target, _)) in replay_bucket_programs.iter().zip(&bucket_pairs) {
+                let bucket_replay = validate_replay_program(
+                    replay,
+                    pool,
+                    batch,
+                    target,
+                    &plan.prefill_tap_outputs,
+                )?;
+                if !same_inference_state(bucket_replay.schema, prefill.schema) {
+                    return Err(plan_error(
+                        "ParallelBlock replay bucket state geometry is incompatible",
+                    ));
+                }
+                bucket_replays.push(bucket_replay);
+            }
+            for (bucket, replay) in prefill_buckets.iter_mut().zip(
+                bucket_replays
+                    .into_iter()
+                    .chain(std::iter::once(prefill.clone())),
+            ) {
+                bucket.replay = Some(replay);
+            }
             let decode_taps = schema
                 .target_decode_taps
                 .iter()
@@ -7284,6 +7718,7 @@ impl NativeInferenceArtifact {
         Ok(Self {
             programs: Arc::new(InferencePrograms {
                 target_prefill,
+                prefill_buckets,
                 target_decode,
                 target_verify,
                 target_pool: target_pool.inner.clone(),
@@ -7326,6 +7761,9 @@ impl NativeInferenceArtifact {
                 closed: false,
                 lanes: (0..self.programs.batch).map(|_| None).collect(),
                 receipt: None,
+                parallel_speculation_enabled: true,
+                parallel_proposed_tokens: 0,
+                parallel_accepted_tokens: 0,
             })),
         }
     }
@@ -7450,7 +7888,13 @@ struct InferenceSessionState {
     closed: bool,
     lanes: Vec<Option<InferenceLane>>,
     receipt: Option<Receipt>,
+    parallel_speculation_enabled: bool,
+    parallel_proposed_tokens: u64,
+    parallel_accepted_tokens: u64,
 }
+
+const PARALLEL_SPECULATION_MIN_PROPOSED: u64 = 64;
+const PARALLEL_SPECULATION_MIN_ACCEPT_PERCENT: u64 = 35;
 
 #[napi]
 pub struct NativeInferenceSequence {
@@ -7504,6 +7948,21 @@ fn native_receipt(
                 stop_reason: page.stop_reason.clone(),
             })
             .collect(),
+    }
+}
+
+fn update_parallel_speculation_policy(
+    session: &mut InferenceSessionState,
+    proposed: usize,
+    accepted: u64,
+) {
+    session.parallel_proposed_tokens += proposed as u64;
+    session.parallel_accepted_tokens += accepted;
+    if session.parallel_proposed_tokens >= PARALLEL_SPECULATION_MIN_PROPOSED
+        && session.parallel_accepted_tokens * 100
+            < session.parallel_proposed_tokens * PARALLEL_SPECULATION_MIN_ACCEPT_PERCENT
+    {
+        session.parallel_speculation_enabled = false;
     }
 }
 
@@ -7659,8 +8118,19 @@ impl NativeInferenceSession {
                         .collect::<Vec<_>>();
                     let shadow =
                         ShadowSequences::new(pool.clone(), &states).map_err(to_napi_err)?;
-                    run_prefill_program(prefill, &shadow, &slots, &prompts, cancelled)
-                        .map_err(to_napi_err)?;
+                    // Proposer programs are never bucketed.
+                    let proposer_bucket = PrefillBucket {
+                        prefill: prefill.clone(),
+                        replay: None,
+                    };
+                    run_prefill_program(
+                        std::slice::from_ref(&proposer_bucket),
+                        &shadow,
+                        &slots,
+                        &prompts,
+                        cancelled,
+                    )
+                    .map_err(to_napi_err)?;
                     (Some(sequences), Some(shadow), states)
                 } else if let Some(pool) = &programs.replay_pool {
                     let sequences = (0..prompts.len())
@@ -7676,14 +8146,13 @@ impl NativeInferenceSession {
                 } else {
                     (None, None, Vec::new())
                 };
-            let outputs = if let (Some(replay), Some(plan), Some(proposer_shadow)) = (
+            let outputs = if let (Some(_), Some(plan), Some(proposer_shadow)) = (
                 &programs.replay_prefill,
                 &programs.proposer_plan,
                 proposer_shadow.as_ref(),
             ) {
                 run_parallel_prefill(
-                    &programs.target_prefill,
-                    replay,
+                    &programs.prefill_buckets,
                     plan,
                     &target_shadow,
                     proposer_shadow,
@@ -7693,7 +8162,7 @@ impl NativeInferenceSession {
                 )
             } else {
                 run_prefill_program(
-                    &programs.target_prefill,
+                    &programs.prefill_buckets,
                     &target_shadow,
                     &slots,
                     &prompts,
@@ -7925,13 +8394,18 @@ impl NativeInferenceSession {
                 .copied()
                 .map(inference_options)
                 .collect::<Vec<_>>();
-            let (pages, mut proposer_shadow, proposer_states) =
-                if let (Some(verify), Some(replay), Some(pool), Some(plan)) = (
-                    &programs.target_verify,
-                    &programs.replay_verify,
-                    &programs.replay_pool,
+            let parallel = if session.parallel_speculation_enabled {
+                (
+                    programs.target_verify.as_ref(),
+                    programs.replay_verify.as_ref(),
+                    programs.replay_pool.as_ref(),
                     programs.proposer_plan.as_ref(),
-                ) {
+                )
+            } else {
+                (None, None, None, None)
+            };
+            let (pages, mut proposer_shadow, proposer_states) =
+                if let (Some(verify), Some(replay), Some(pool), Some(plan)) = parallel {
                     let proposer_states = selected
                         .iter()
                         .map(|lane| {
@@ -7985,16 +8459,21 @@ impl NativeInferenceSession {
                         &mut stats,
                     )
                     .map_err(to_napi_err)?;
+                    let accepted_total = stats.accepted.iter().sum::<usize>() as u64;
+                    update_parallel_speculation_policy(
+                        &mut session,
+                        stats.proposed,
+                        accepted_total,
+                    );
                     diagnostics
                         .speculative_rounds
                         .fetch_add(1, Ordering::Relaxed);
                     diagnostics
                         .proposed_tokens
                         .fetch_add(stats.proposed as u64, Ordering::Relaxed);
-                    diagnostics.accepted_tokens.fetch_add(
-                        stats.accepted.iter().sum::<usize>() as u64,
-                        Ordering::Relaxed,
-                    );
+                    diagnostics
+                        .accepted_tokens
+                        .fetch_add(accepted_total, Ordering::Relaxed);
                     diagnostics
                         .draft_nanos
                         .fetch_add(stats.draft_nanos, Ordering::Relaxed);
@@ -8635,6 +9114,7 @@ impl Executable {
                         cancelled,
                         kv.as_ref(),
                         &commit,
+                        false,
                     )
                     .map(|outputs| {
                         StatefulExecutionOutput::Tensors(
@@ -9157,6 +9637,32 @@ mod epilogue_tests {
     use super::*;
     use runtime::metal::device::MetalDevice;
     use runtime::metal::run::MetalTensor;
+
+    #[test]
+    fn parallel_speculation_policy_disables_only_after_sustained_low_acceptance() {
+        let make_state = || InferenceSessionState {
+            id: 1,
+            closed: false,
+            lanes: Vec::new(),
+            receipt: None,
+            parallel_speculation_enabled: true,
+            parallel_proposed_tokens: 0,
+            parallel_accepted_tokens: 0,
+        };
+        let mut state = make_state();
+        update_parallel_speculation_policy(&mut state, 63, 0);
+        assert!(state.parallel_speculation_enabled);
+        update_parallel_speculation_policy(&mut state, 1, 0);
+        assert!(!state.parallel_speculation_enabled);
+
+        let mut accepted = make_state();
+        update_parallel_speculation_policy(
+            &mut accepted,
+            PARALLEL_SPECULATION_MIN_PROPOSED as usize,
+            23,
+        );
+        assert!(accepted.parallel_speculation_enabled);
+    }
 
     fn route(kind: &str) -> NativeValueRef {
         NativeValueRef {
@@ -10491,6 +10997,7 @@ mod epilogue_tests {
             time: 4,
             head_dim: 2,
             mode: KvAttentionMode::Causal,
+            splits: 1,
         };
         let allocation_attempts = device::EXECUTABLE_ALLOCATION_ATTEMPTS.load(Ordering::Relaxed);
         {
@@ -10579,6 +11086,7 @@ mod epilogue_tests {
             time: 1,
             head_dim: 2,
             mode: KvAttentionMode::Causal,
+            splits: 1,
         };
         {
             let _guard = MetalDevice::get().begin_executable_dispatch().unwrap();
@@ -10652,6 +11160,7 @@ mod epilogue_tests {
             time: 1,
             head_dim: 2,
             mode: KvAttentionMode::Causal,
+            splits: 1,
         };
         {
             let _guard = MetalDevice::get().begin_executable_dispatch().unwrap();
@@ -10718,6 +11227,7 @@ mod epilogue_tests {
             time: 1,
             head_dim: 2,
             mode: KvAttentionMode::Causal,
+            splits: 1,
         };
         {
             let _guard = MetalDevice::get().begin_executable_dispatch().unwrap();
@@ -10786,6 +11296,7 @@ mod epilogue_tests {
             &effect_torch_runtime::CancellationFlag::new(),
             &context,
             &|| true,
+            false,
         )
         .unwrap();
 
@@ -10902,12 +11413,93 @@ mod epilogue_tests {
             &effect_torch_runtime::CancellationFlag::new(),
             &context,
             &|| true,
+            false,
         )
         .unwrap()[0]
             .to_f32_vec()
             .unwrap();
 
         assert_close(&output[..12], &reference[..12], 1e-6, "projected prefill");
+    }
+
+    #[test]
+    fn planned_stateful_one_token_decode_uses_split_attention() {
+        let q = mleaf(vec![0.0; 2], vec![1, 1, 1, 2]);
+        let k = mleaf(vec![0.0; 2], vec![1, 1, 1, 2]);
+        let v = mleaf(vec![5.0, 7.0], vec![1, 1, 1, 2]);
+        let root = LazyTensor {
+            node: Node::new(NodeKind::Sdpa {
+                q,
+                k,
+                v,
+                scale: 1.0,
+                causal: true,
+                window: AttentionWindow::Inherit,
+            })
+            .unwrap(),
+        };
+        let program = compile(
+            vec![&root],
+            None,
+            Some(NativeKvStateSchema {
+                max_tokens: 32,
+                block_size: 4,
+                kv_dtype: NativeDType::F32,
+                window: None,
+                batch: 1,
+                packed_causal_chains: None,
+                last_token_row: None,
+                output_selections: None,
+                current_block_attention: None,
+            }),
+            None,
+        )
+        .unwrap();
+        let plan = program
+            .inner
+            .executable
+            .commands()
+            .iter()
+            .filter_map(|command| command.kind.operation())
+            .find_map(|(op, plan)| match (op, plan) {
+                (
+                    executable::MetalOp::KvAttention { .. },
+                    executable::MetalCommandPlan::KvAttention(plan),
+                ) => Some(*plan),
+                _ => None,
+            })
+            .expect("compiled KV attention plan");
+        assert_eq!(plan.splits, 8);
+        let pool = NativeKvPool::new(1, 1, 2, 32, Some(4), Some(NativeDType::F32), None).unwrap();
+        let sequence = pool.make_sequence().unwrap();
+        sequence.state.lock().unwrap().advance = 1;
+        let context = KvContext {
+            pool: pool.inner.clone(),
+            slots: vec![sequence.state.clone()],
+            schema: program.state.as_ref().unwrap().schema,
+            tokens: vec![vec![7]],
+            lanes: vec![0],
+            packed_rows: None,
+            packed_positions: None,
+            publish_hashes: true,
+        };
+        let output = executable::execute_stateful(
+            &program.inner.executable,
+            &[],
+            &program.inner.generated_bindings,
+            &effect_torch_runtime::CancellationFlag::new(),
+            &context,
+            &|| true,
+            false,
+        )
+        .unwrap();
+
+        assert_close(
+            &output[0].to_f32_vec().unwrap(),
+            &[5.0, 7.0],
+            1e-6,
+            "split decode",
+        );
     }
 
     #[test]

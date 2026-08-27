@@ -26,7 +26,7 @@
 //!   global seed plus the element index, so results are deterministic per
 //!   seed regardless of dispatch shape.
 
-use super::device::{set_buffer, MetalDevice};
+use super::device::{set_buffer, set_bytes, Buffer, MetalDevice};
 use super::run::MetalTensor;
 use crate::runtime::dtype::DType;
 use objc2_metal::MTLComputeCommandEncoder;
@@ -521,6 +521,68 @@ pub fn copy_into(
             &destination.buffer,
             destination.layout.offset() * destination.dtype.size_in_bytes(),
         );
+        {
+            let (g, tg) = MetalDevice::grid_flat(padded);
+            e.dispatchThreads_threadsPerThreadgroup(g, tg);
+        }
+    });
+    Ok(())
+}
+
+/// Copies `bytes` from `source` at `source_offset` into `destination` at
+/// `destination_offset` with a flat device kernel on the current stream.
+/// Used for GPU-ordered state-transaction copies between deferred
+/// invocations: the stream's per-dispatch barriers order it after the
+/// kernels that produced `source` and before later readers of
+/// `destination`, so no host fence is needed. Both buffers must be large
+/// enough; the caller (executable state commits) validates the ranges.
+pub fn copy_bytes_into(
+    dev: &MetalDevice,
+    source: &Buffer,
+    source_offset: usize,
+    destination: &Buffer,
+    destination_offset: usize,
+    bytes: usize,
+) -> Result<(), String> {
+    if bytes == 0 {
+        return Ok(());
+    }
+    if source_offset.saturating_add(bytes) > source.size
+        || destination_offset.saturating_add(bytes) > destination.size
+    {
+        return Err("metal byte copy exceeds its buffer".to_string());
+    }
+    let wide = MetalDevice::WIDE;
+    let pipeline = dev.compile_lazy(
+        key(&[0xBC09]),
+        "et_bcopy",
+        || {
+            format!(
+                r#"
+#include <metal_stdlib>
+using namespace metal;
+kernel void et_bcopy(device const uchar* src [[buffer(0)]], device uchar* dst [[buffer(1)]], constant ulong& n [[buffer(2)]], uint2 gid2 [[thread_position_in_grid]]) {{
+    const ulong i = ulong(gid2.y) * {wide}ul + ulong(gid2.x);
+    const ulong base = i * 4ul;
+    if (base < n) {{
+        const ulong end = min(base + 4ul, n);
+        for (ulong j = base; j < end; j++) {{
+            dst[j] = src[j];
+        }}
+    }}
+}}
+"#
+            )
+        },
+    )?;
+    let words = bytes.div_ceil(4);
+    let padded = words.div_ceil(256) * 256;
+    let n = bytes as u64;
+    dev.with_encoder(|e| {
+        e.setComputePipelineState(pipeline.as_raw());
+        set_buffer(e, 0, source, source_offset);
+        set_buffer(e, 1, destination, destination_offset);
+        set_bytes(e, 2, &n);
         {
             let (g, tg) = MetalDevice::grid_flat(padded);
             e.dispatchThreads_threadsPerThreadgroup(g, tg);

@@ -1249,8 +1249,16 @@ export type InferenceFailurePhase =
 export interface InferenceCompileRequest {
   /** Target-model programs and their compatible state pool. */
   readonly target: {
-    /** Target prompt-prefill executable. */
-    readonly prefill: ExecutableHandle
+    /**
+     * Target prompt-prefill executables, one per compiled chunk shape in
+     * `prefillChunks` order (ascending token width; the last entry is the
+     * largest). Every entry shares the decode program's state geometry and
+     * `pool`. The runtime serves each prompt chunk from the largest
+     * executable covering its remaining length and skips the LM-head chain
+     * for chunks that do not finish a prompt; backends without chunk
+     * selection may serve every prompt from the last (largest) entry.
+     */
+    readonly prefill: ReadonlyArray<ExecutableHandle>
     /** Target one-token decode executable. */
     readonly decode: ExecutableHandle
     /** Packed all-row verifier; omitted for the zero-draft ordinary path. */
@@ -1279,8 +1287,11 @@ export interface InferenceCompileRequest {
     readonly stageExecutables: ReadonlyArray<ExecutableHandle>
     /** Optional autoregressive state replay programs. */
     readonly replay?: {
-      /** Replay prompt-prefill executable. */
-      readonly prefill: ExecutableHandle
+      /**
+       * Replay prompt-prefill executables aligned with `target.prefill`:
+       * entry N replays the target hidden taps of chunk shape N.
+       */
+      readonly prefill: ReadonlyArray<ExecutableHandle>
       /** Replay one-token decode executable. */
       readonly decode: ExecutableHandle
       /** Replay packed verification executable. */

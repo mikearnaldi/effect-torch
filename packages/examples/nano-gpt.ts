@@ -252,6 +252,7 @@ const program = Effect.gen(function*() {
   const inference = yield* Model.inference(model, params, {
     maxTokens: 4096,
     blockSize: 16,
+    prefillChunks: [16],
     attentionWindow: BLOCK
   })
   const prompts = [

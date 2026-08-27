@@ -355,6 +355,7 @@ onDevices("Kda", (device) => (it) => {
         const error = yield* Effect.flip(Model.inference(model, params, {
           maxTokens: 32,
           blockSize: 4,
+          prefillChunks: [4],
           speculation: { proposer, maxDraftTokens: 2 }
         }))
         expect(error.message).toMatch(/KV-only/)
@@ -406,7 +407,7 @@ onDevices("Kda", (device) => (it) => {
         const program = yield* Model.inference(model, params, {
           maxTokens: 64,
           blockSize: 4,
-          prefillChunk: 4
+          prefillChunks: [4]
         })
         const naive = yield* naiveGenerate(model, params, prompt, steps)
         const cached = yield* cachedGenerate(program, prompt, steps)
@@ -423,7 +424,7 @@ onDevices("Kda", (device) => (it) => {
         const program = yield* Model.inference(model, params, {
           maxTokens: 64,
           blockSize: 4,
-          prefillChunk: 4
+          prefillChunks: [4]
         })
         const naive = yield* naiveGenerate(model, params, prompt, steps)
         const cached = yield* cachedGenerate(program, prompt, steps)
@@ -438,7 +439,7 @@ onDevices("Kda", (device) => (it) => {
         const program = yield* Model.inference(model, params, {
           maxTokens: 64,
           blockSize: 4,
-          prefillChunk: 4
+          prefillChunks: [4]
         })
         const gen = yield* program.execution()
         const first = (yield* gen.add([yield* ids(prompt)]))[0]!
@@ -535,7 +536,7 @@ onDevices("Kda", (device) => (it) => {
         const program = yield* Model.inference(model, params, {
           maxTokens: 64,
           blockSize: 4,
-          prefillChunk: 4
+          prefillChunks: [4]
         })
         const naive = yield* naiveGenerate(model, params, prompt, steps)
         const cached = yield* cachedGenerate(program, prompt, steps)
@@ -549,7 +550,7 @@ onDevices("Kda", (device) => (it) => {
         const program = yield* Model.inference(model, params, {
           maxTokens: 64,
           blockSize: 4,
-          prefillChunk: 4,
+          prefillChunks: [4],
           batchSize: 4
         })
         const gen = yield* program.execution()
@@ -586,7 +587,7 @@ onDevices("Kda", (device) => (it) => {
         const program = yield* Model.inference(model, params, {
           maxTokens: 64,
           blockSize: 4,
-          prefillChunk: 4,
+          prefillChunks: [4],
           batchSize: 2
         })
         const referenceB = yield* program.execution()

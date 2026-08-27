@@ -47,7 +47,7 @@ const suite = Effect.gen(function*() {
       const program = yield* Model.inference(model, params, {
         maxTokens,
         blockSize: 16,
-        prefillChunk: 16,
+        prefillChunks: [16],
         batchSize,
         sampling: { temperature: 0.8, topK: 64, topP: 0.95, seed: 0 },
         ...(mode.proposer === undefined

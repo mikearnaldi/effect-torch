@@ -73,6 +73,9 @@ importers:
       '@effect-torch/core':
         specifier: workspace:*
         version: link:../core
+      '@effect-torch/tokenizers':
+        specifier: workspace:*
+        version: link:../tokenizers
       '@types/node':
         specifier: ^22.0.0
         version: 22.20.1
