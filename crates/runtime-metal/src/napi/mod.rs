@@ -7834,9 +7834,6 @@ impl NativeInferenceArtifact {
                 closed: false,
                 lanes: (0..self.programs.batch).map(|_| None).collect(),
                 receipt: None,
-                parallel_speculation_enabled: true,
-                parallel_proposed_tokens: 0,
-                parallel_accepted_tokens: 0,
             })),
         }
     }
@@ -7961,13 +7958,7 @@ struct InferenceSessionState {
     closed: bool,
     lanes: Vec<Option<InferenceLane>>,
     receipt: Option<Receipt>,
-    parallel_speculation_enabled: bool,
-    parallel_proposed_tokens: u64,
-    parallel_accepted_tokens: u64,
 }
-
-const PARALLEL_SPECULATION_MIN_PROPOSED: u64 = 64;
-const PARALLEL_SPECULATION_MIN_ACCEPT_PERCENT: u64 = 35;
 
 #[napi]
 pub struct NativeInferenceSequence {
@@ -8021,21 +8012,6 @@ fn native_receipt(
                 stop_reason: page.stop_reason.clone(),
             })
             .collect(),
-    }
-}
-
-fn update_parallel_speculation_policy(
-    session: &mut InferenceSessionState,
-    proposed: usize,
-    accepted: u64,
-) {
-    session.parallel_proposed_tokens += proposed as u64;
-    session.parallel_accepted_tokens += accepted;
-    if session.parallel_proposed_tokens >= PARALLEL_SPECULATION_MIN_PROPOSED
-        && session.parallel_accepted_tokens * 100
-            < session.parallel_proposed_tokens * PARALLEL_SPECULATION_MIN_ACCEPT_PERCENT
-    {
-        session.parallel_speculation_enabled = false;
     }
 }
 
@@ -8467,16 +8443,12 @@ impl NativeInferenceSession {
                 .copied()
                 .map(inference_options)
                 .collect::<Vec<_>>();
-            let parallel = if session.parallel_speculation_enabled {
-                (
-                    programs.target_verify.as_ref(),
-                    programs.replay_verify.as_ref(),
-                    programs.replay_pool.as_ref(),
-                    programs.proposer_plan.as_ref(),
-                )
-            } else {
-                (None, None, None, None)
-            };
+            let parallel = (
+                programs.target_verify.as_ref(),
+                programs.replay_verify.as_ref(),
+                programs.replay_pool.as_ref(),
+                programs.proposer_plan.as_ref(),
+            );
             let (pages, mut proposer_shadow, proposer_states) =
                 if let (Some(verify), Some(replay), Some(pool), Some(plan)) = parallel {
                     let proposer_states = selected
@@ -8533,11 +8505,6 @@ impl NativeInferenceSession {
                     )
                     .map_err(to_napi_err)?;
                     let accepted_total = stats.accepted.iter().sum::<usize>() as u64;
-                    update_parallel_speculation_policy(
-                        &mut session,
-                        stats.proposed,
-                        accepted_total,
-                    );
                     diagnostics
                         .speculative_rounds
                         .fetch_add(1, Ordering::Relaxed);
@@ -9710,32 +9677,6 @@ mod epilogue_tests {
     use super::*;
     use runtime::metal::device::MetalDevice;
     use runtime::metal::run::MetalTensor;
-
-    #[test]
-    fn parallel_speculation_policy_disables_only_after_sustained_low_acceptance() {
-        let make_state = || InferenceSessionState {
-            id: 1,
-            closed: false,
-            lanes: Vec::new(),
-            receipt: None,
-            parallel_speculation_enabled: true,
-            parallel_proposed_tokens: 0,
-            parallel_accepted_tokens: 0,
-        };
-        let mut state = make_state();
-        update_parallel_speculation_policy(&mut state, 63, 0);
-        assert!(state.parallel_speculation_enabled);
-        update_parallel_speculation_policy(&mut state, 1, 0);
-        assert!(!state.parallel_speculation_enabled);
-
-        let mut accepted = make_state();
-        update_parallel_speculation_policy(
-            &mut accepted,
-            PARALLEL_SPECULATION_MIN_PROPOSED as usize,
-            23,
-        );
-        assert!(accepted.parallel_speculation_enabled);
-    }
 
     fn route(kind: &str) -> NativeValueRef {
         NativeValueRef {
