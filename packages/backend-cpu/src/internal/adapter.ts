@@ -1624,9 +1624,14 @@ export const makeRuntime = (
             "inferenceCompile"
           ).value as NativeExecutable
           const targetDecode = nativeExecutable(request.target.decode, "inferenceCompile").value as NativeExecutable
-          const targetVerify = request.target.verify === undefined
+          // CPU verifies at the widest compiled width: it is the
+          // correctness reference; adaptive width selection is a Metal
+          // throughput feature.
+          const verifyHandles = request.target.verify ?? []
+          const targetVerify = verifyHandles.length === 0
             ? undefined
-            : nativeExecutable(request.target.verify, "inferenceCompile").value as NativeExecutable
+            : nativeExecutable(verifyHandles[verifyHandles.length - 1]!, "inferenceCompile")
+              .value as NativeExecutable
           const targetPool = nativePool(request.target.pool, "inferenceCompile").value as NativeKvPool
           const proposerPrefill = request.proposer === undefined
             ? undefined
@@ -1664,7 +1669,9 @@ export const makeRuntime = (
               : nativeExecutable(replay.decode, "inferenceCompile").value as NativeExecutable,
             replay === undefined
               ? undefined
-              : nativeExecutable(replay.verify, "inferenceCompile").value as NativeExecutable,
+              // CPU replays at the widest compiled verify width.
+              : nativeExecutable(replay.verify[replay.verify.length - 1]!, "inferenceCompile")
+                .value as NativeExecutable,
             replay === undefined ? undefined : nativePool(replay.pool, "inferenceCompile").value as NativeKvPool
           )
           return wrapOpaque<Runtime.InferenceArtifactHandle>(

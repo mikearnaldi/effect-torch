@@ -8836,9 +8836,20 @@ async fn execute_parallel_block_detailed(
                         if cancellation_token.is_some_and(|token| token.cancelled()) {
                             return Err(inference_error("proposer", "operation aborted"));
                         }
-                        let q = speculative_normalized_row(
+                        // Proposals are tempered like the target but never
+                        // truncated: top-k/top-p would shrink the draft's
+                        // support away from the target's nucleus and crater
+                        // acceptance; the residual covers the target's
+                        // truncated mass.
+                        let q = speculative_probabilities(
                             &probabilities,
-                            (slots[index] as usize, step),
+                            Some((slots[index] as usize, step)),
+                            SamplingOptions {
+                                top_k: None,
+                                top_p: 1.0,
+                                ..sampling[index]
+                            },
+                            &AtomicBool::new(false),
                         )
                         .map_err(|error| inference_error("proposer", error))?;
                         let candidate = sample_probabilities(

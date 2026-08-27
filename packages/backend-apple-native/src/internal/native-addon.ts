@@ -253,7 +253,7 @@ export declare class NativeInferenceArtifact {
   constructor(
     targetPrefill: Executable,
     targetDecode: Executable,
-    targetVerify: Executable | undefined | null,
+    targetVerify: Array<Executable> | undefined | null,
     targetPool: NativeKvPool,
     proposerPrefill: Executable | undefined | null,
     proposerDecode: Executable | undefined | null,
@@ -267,7 +267,7 @@ export declare class NativeInferenceArtifact {
     sharedTargetTensors?: Array<NativeTensor> | undefined | null,
     replayPrefill?: Executable | undefined | null,
     replayDecode?: Executable | undefined | null,
-    replayVerify?: Executable | undefined | null,
+    replayVerify?: Array<Executable> | undefined | null,
     replayPool?: NativeKvPool | undefined | null,
     prefillBuckets?: Array<Executable> | undefined | null,
     replayPrefillBuckets?: Array<Executable> | undefined | null

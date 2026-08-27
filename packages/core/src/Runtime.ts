@@ -1270,8 +1270,13 @@ export interface InferenceCompileRequest {
     readonly prefill: ReadonlyArray<ExecutableHandle>
     /** Target one-token decode executable. */
     readonly decode: ExecutableHandle
-    /** Packed all-row verifier; omitted for the zero-draft ordinary path. */
-    readonly verify?: ExecutableHandle
+    /**
+     * Packed all-row verifiers, one per compiled rows-per-sequence width and
+     * ascending (widest last); omitted for the zero-draft ordinary path. Exact
+     * proposers use the widest; generalized plans adapt the width per round
+     * from measured token rates.
+     */
+    readonly verify?: ReadonlyArray<ExecutableHandle>
     /** State pool compatible with every supplied target executable. */
     readonly pool: KvPoolHandle
   }
@@ -1303,8 +1308,8 @@ export interface InferenceCompileRequest {
       readonly prefill: ReadonlyArray<ExecutableHandle>
       /** Replay one-token decode executable. */
       readonly decode: ExecutableHandle
-      /** Replay packed verification executable. */
-      readonly verify: ExecutableHandle
+      /** Replay packed verification executables, one per verify width, ascending. */
+      readonly verify: ReadonlyArray<ExecutableHandle>
       /** State pool compatible with all replay executables. */
       readonly pool: KvPoolHandle
     }

@@ -5360,12 +5360,25 @@ fn execute_parallel_blocking(
             )?;
             let probabilities = f32_values(&tensor);
             let mut sampled = vec![0; stage_schema.batch * trained_draft_tokens];
+            let mut effective: Vec<Vec<Vec<f64>>> = vec![Vec::new(); pending.len()];
             for lane in &proposal_active {
                 for row in 0..proposal_limits[*lane] {
                     let start = (slots[*lane] * trained_draft_tokens + row) * target.vocabulary;
-                    let q = &probabilities[start..start + target.vocabulary];
-                    sampled[slots[*lane] * trained_draft_tokens + row] = sample_f32_at(
-                        q,
+                    // Proposals are tempered like the target but never
+                    // truncated: top-k/top-p would shrink the draft's support
+                    // away from the target's nucleus and crater acceptance;
+                    // the residual covers the target's truncated mass.
+                    let q = probabilities_f32(
+                        &probabilities[start..start + target.vocabulary],
+                        SamplingOptions {
+                            top_k: None,
+                            top_p: 1.0,
+                            ..sampling[*lane]
+                        },
+                        cancelled,
+                    )?;
+                    sampled[slots[*lane] * trained_draft_tokens + row] = sample_at(
+                        &q,
                         InferenceSampling {
                             temperature: sampling[*lane].temperature,
                             top_k: sampling[*lane].top_k,
@@ -5377,9 +5390,10 @@ fn execute_parallel_blocking(
                         SamplingPurpose::Proposal,
                         0,
                     );
+                    effective[*lane].push(q);
                 }
             }
-            (sampled, Some(tensor))
+            (sampled, Some(effective))
         } else {
             (read_u32_tensor(&proposal_outputs[0])?, None)
         }
@@ -5470,15 +5484,11 @@ fn execute_parallel_blocking(
                     sampling[lane],
                     cancelled,
                 )?;
-                let proposal_start =
-                    (slots[lane] * trained_draft_tokens + candidate_index) * target.vocabulary;
-                let proposal_values = f32_values(proposal_probabilities);
-                let q = &proposal_values[proposal_start..proposal_start + target.vocabulary];
+                let q = &proposal_probabilities[lane][candidate_index];
                 let accept = if sampling[lane].temperature == 0.0 {
                     p[candidate as usize] > 0.0
                 } else {
-                    let probability =
-                        (p[candidate as usize] / q[candidate as usize] as f64).min(1.0);
+                    let probability = (p[candidate as usize] / q[candidate as usize]).min(1.0);
                     random_unit_at(sampling_coordinate(
                         sampling[lane].seed,
                         sequence_ids[lane],
@@ -5493,7 +5503,7 @@ fn execute_parallel_blocking(
                     let residual = p
                         .iter()
                         .zip(q)
-                        .map(|(p, q)| (p - *q as f64).max(0.0))
+                        .map(|(p, q)| (p - *q).max(0.0))
                         .collect::<Vec<_>>();
                     sample_at(
                         &residual,
@@ -5705,7 +5715,19 @@ fn execute_speculative_blocking(
                 SamplingPurpose::Proposal,
                 0,
             );
-            let q = probabilities(&logits, options, cancelled)?;
+            // Proposals are tempered like the target but never truncated:
+            // top-k/top-p would shrink the draft's support away from the
+            // target's nucleus and crater acceptance; the residual covers
+            // the target's truncated mass.
+            let q = probabilities(
+                &logits,
+                SamplingOptions {
+                    top_k: None,
+                    top_p: 1.0,
+                    ..options
+                },
+                cancelled,
+            )?;
             let token = if let Some((sequence_ids, positions)) = coordinates {
                 sample_at(
                     &q,
@@ -6528,7 +6550,8 @@ struct InferencePrograms {
     /// headless body.
     prefill_buckets: Vec<PrefillBucket>,
     target_decode: SpeculativeProgram,
-    target_verify: Option<SpeculativeProgram>,
+    /// Verify programs per packed rows-per-sequence width, ascending.
+    target_verify: Vec<SpeculativeProgram>,
     target_pool: Arc<PoolInner>,
     proposer_prefill: Option<SpeculativeProgram>,
     proposer_decode: Option<SpeculativeProgram>,
@@ -6536,7 +6559,8 @@ struct InferencePrograms {
     replay_prefill: Option<ReplayProgram>,
     #[allow(dead_code)]
     replay_decode: Option<ReplayProgram>,
-    replay_verify: Option<ReplayProgram>,
+    /// Replay programs per verify width, aligned with target_verify.
+    replay_verify: Vec<ReplayProgram>,
     replay_pool: Option<Arc<PoolInner>>,
     max_draft_tokens: usize,
     batch: usize,
@@ -7359,7 +7383,7 @@ impl NativeInferenceArtifact {
     pub fn new(
         target_prefill: &Executable,
         target_decode: &Executable,
-        target_verify: Option<&Executable>,
+        target_verify: Vec<&Executable>,
         target_pool: &NativeKvPool,
         proposer_prefill: Option<&Executable>,
         proposer_decode: Option<&Executable>,
@@ -7373,7 +7397,7 @@ impl NativeInferenceArtifact {
         shared_target_tensors: Option<Vec<&NativeTensor>>,
         replay_prefill: Option<&Executable>,
         replay_decode: Option<&Executable>,
-        replay_verify: Option<&Executable>,
+        replay_verify: Vec<&Executable>,
         replay_pool: Option<&NativeKvPool>,
         prefill_buckets: Option<Vec<&Executable>>,
         replay_prefill_buckets: Option<Vec<&Executable>>,
@@ -7383,7 +7407,7 @@ impl NativeInferenceArtifact {
             && (proposer_prefill.is_some()
                 || proposer_decode.is_some()
                 || proposer_pool.is_some()
-                || target_verify.is_none()
+                || target_verify.is_empty()
                 || !max_draft_tokens.is_some_and(|value| value > 0))
         {
             return Err(plan_error(
@@ -7392,12 +7416,28 @@ impl NativeInferenceArtifact {
         }
         let target_prefill_program = target_prefill;
         let target_decode_program = target_decode;
-        let target_verify_program = target_verify;
+        let target_verify_program = target_verify.last().copied();
+        let target_verify_executables = target_verify.clone();
         let target_prefill = inference_program(target_prefill, "prefill", false, generalized)?;
         let target_decode = inference_program(target_decode, "decode", true, generalized)?;
         let target_verify = target_verify
+            .iter()
             .map(|program| validate_speculative_program(program, false, generalized))
-            .transpose()?;
+            .collect::<Result<Vec<_>>>()?;
+        // Widths ascend by packed rows per sequence; duplicates or a
+        // missing packed layout make the runtime width selection ambiguous.
+        let mut verify_rows = Vec::new();
+        for program in &target_verify {
+            let rows = program.packed_rows_per_sequence.ok_or_else(|| {
+                plan_error("speculative verify program requires a packed rows layout")
+            })?;
+            if verify_rows.last().is_some_and(|last| *last >= rows) {
+                return Err(plan_error(
+                    "speculative verify widths must be strictly ascending",
+                ));
+            }
+            verify_rows.push(rows);
+        }
         let proposer_prefill = if generalized {
             None
         } else {
@@ -7420,12 +7460,12 @@ impl NativeInferenceArtifact {
         let proposer_complete = proposer_prefill.is_some()
             && proposer_decode.is_some()
             && proposer_pool.is_some()
-            && target_verify.is_some()
+            && !target_verify.is_empty()
             && max_draft_tokens.is_some_and(|value| value > 0);
         let proposer_empty = proposer_prefill.is_none()
             && proposer_decode.is_none()
             && proposer_pool.is_none()
-            && target_verify.is_none()
+            && target_verify.is_empty()
             && max_draft_tokens.is_none();
         if !generalized && !proposer_complete && !proposer_empty {
             return Err(Error::new(
@@ -7496,7 +7536,7 @@ impl NativeInferenceArtifact {
             let draft = max_draft_tokens.unwrap() as usize;
             let prefill = proposer_prefill.as_ref().unwrap();
             let decode = proposer_decode.as_ref().unwrap();
-            let verify = target_verify.as_ref().unwrap();
+            let verify = target_verify.last().unwrap();
             let pool = proposer_pool.as_ref().unwrap();
             if prefill.batch != batch
                 || decode.batch != batch
@@ -7520,28 +7560,25 @@ impl NativeInferenceArtifact {
             }
         }
         if generalized {
-            let verify = target_verify
-                .as_ref()
-                .expect("generalized verifier was required");
             let draft = max_draft_tokens.unwrap() as usize;
-            if verify.batch != batch
-                || verify.token_dtype != dtype
-                || verify.vocabulary != target_decode.vocabulary
-                || verify
-                    .packed_rows_per_sequence
-                    .is_none_or(|rows| draft + 1 > rows)
-                || !compatible_pool(verify, &target_pool.inner)
-            {
-                return Err(Error::new(
-                    Status::InvalidArg,
-                    "inference[compile]: incompatible generalized target verifier",
-                ));
+            for (index, verify) in target_verify.iter().enumerate() {
+                if verify.batch != batch
+                    || verify.token_dtype != dtype
+                    || verify.vocabulary != target_decode.vocabulary
+                    || (index == target_verify.len() - 1 && draft + 1 > verify_rows[index])
+                    || !compatible_pool(verify, &target_pool.inner)
+                {
+                    return Err(Error::new(
+                        Status::InvalidArg,
+                        "inference[compile]: incompatible generalized target verifier",
+                    ));
+                }
             }
         }
         let sampling = inference_sampling(sampling)?;
         let replay_present = replay_prefill.is_some()
             || replay_decode.is_some()
-            || replay_verify.is_some()
+            || !replay_verify.is_empty()
             || replay_pool.is_some()
             || replay_prefill_buckets
                 .as_ref()
@@ -7549,7 +7586,7 @@ impl NativeInferenceArtifact {
         if replay_present
             != (replay_prefill.is_some()
                 && replay_decode.is_some()
-                && replay_verify.is_some()
+                && !replay_verify.is_empty()
                 && replay_pool.is_some())
         {
             return Err(plan_error(
@@ -7760,15 +7797,22 @@ impl NativeInferenceArtifact {
                 target_decode_program,
                 &decode_taps,
             )?;
-            let verify = validate_replay_program(
-                replay_verify.expect("complete replay bundle"),
-                pool,
-                batch,
-                target_verify_program.expect("parallel verifier"),
-                &plan.verify_tap_outputs,
-            )?;
+            if replay_verify.len() != target_verify.len() {
+                return Err(plan_error(
+                    "ParallelBlock replay requires one program per verify width",
+                ));
+            }
+            let verify = replay_verify
+                .iter()
+                .zip(target_verify_executables.iter())
+                .map(|(replay, target)| {
+                    validate_replay_program(replay, pool, batch, target, &plan.verify_tap_outputs)
+                })
+                .collect::<Result<Vec<_>, _>>()?;
             if !same_inference_state(prefill.schema, decode.schema)
-                || !same_inference_state(prefill.schema, verify.schema)
+                || verify
+                    .iter()
+                    .any(|program| !same_inference_state(prefill.schema, program.schema))
                 || !same_inference_state(prefill.schema, stage_schema)
                 || prefill.schema.max_tokens != target_prefill.schema.max_tokens
             {
@@ -7776,17 +7820,12 @@ impl NativeInferenceArtifact {
                     "ParallelBlock proposal and replay state geometry is incompatible",
                 ));
             }
-            (
-                Some(prefill),
-                Some(decode),
-                Some(verify),
-                Some(pool.clone()),
-            )
+            (Some(prefill), Some(decode), verify, Some(pool.clone()))
         } else {
             if replay_present {
                 return Err(plan_error("replay bundle requires ParallelBlock"));
             }
-            (None, None, None, None)
+            (None, None, Vec::new(), None)
         };
         Ok(Self {
             programs: Arc::new(InferencePrograms {
@@ -7834,6 +7873,8 @@ impl NativeInferenceArtifact {
                 closed: false,
                 lanes: (0..self.programs.batch).map(|_| None).collect(),
                 receipt: None,
+                spec_proposed: 0,
+                spec_accepted: 0,
             })),
         }
     }
@@ -7958,6 +7999,32 @@ struct InferenceSessionState {
     closed: bool,
     lanes: Vec<Option<InferenceLane>>,
     receipt: Option<Receipt>,
+    /// Cumulative proposal/acceptance counts driving the adaptive verify
+    /// width. Deterministic per session (no wall-clock inputs), so seeded
+    /// runs replay identically.
+    spec_proposed: u64,
+    spec_accepted: u64,
+}
+
+/// One more verified row costs a fraction of an ordinary decode step
+/// (measured ~0.2 on the reference machine); a draft row is worth its rows
+/// while the chain-acceptance probability of reaching it clears that ratio.
+const MARGINAL_ROW_ACCEPTANCE: f64 = 0.2;
+
+/// Deterministic adaptive verify width: an optimistic full-width start, then
+/// the widest width whose marginal draft rows clear the cumulative
+/// acceptance rate. Deterministic given the session's token stream.
+fn select_verify_rows(proposed: u64, accepted: u64, max_rows: usize) -> usize {
+    let acceptance = if proposed == 0 {
+        1.0
+    } else {
+        accepted as f64 / proposed as f64
+    };
+    let mut rows = 2;
+    while rows < max_rows && acceptance.powi((rows - 1) as i32) >= MARGINAL_ROW_ACCEPTANCE {
+        rows += 1;
+    }
+    rows
 }
 
 #[napi]
@@ -8444,13 +8511,36 @@ impl NativeInferenceSession {
                 .map(inference_options)
                 .collect::<Vec<_>>();
             let parallel = (
-                programs.target_verify.as_ref(),
-                programs.replay_verify.as_ref(),
+                (!programs.target_verify.is_empty()).then_some(&programs.target_verify),
+                (!programs.replay_verify.is_empty()).then_some(&programs.replay_verify),
                 programs.replay_pool.as_ref(),
                 programs.proposer_plan.as_ref(),
             );
             let (pages, mut proposer_shadow, proposer_states) =
-                if let (Some(verify), Some(replay), Some(pool), Some(plan)) = parallel {
+                if let (Some(verifies), Some(replays), Some(pool), Some(plan)) = parallel {
+                    // Adaptive verify width from the session's cumulative
+                    // acceptance, rounded down to a compiled width.
+                    let wanted = select_verify_rows(
+                        session.spec_proposed,
+                        session.spec_accepted,
+                        verifies
+                            .last()
+                            .and_then(|verify| verify.packed_rows_per_sequence)
+                            .unwrap_or(1),
+                    );
+                    let arm = verifies
+                        .iter()
+                        .rposition(|verify| {
+                            verify
+                                .packed_rows_per_sequence
+                                .is_some_and(|rows| rows <= wanted)
+                        })
+                        .unwrap_or(0);
+                    let verify = &verifies[arm];
+                    let arm_drafts = verify
+                        .packed_rows_per_sequence
+                        .expect("verified packed layout")
+                        - 1;
                     let proposer_states = selected
                         .iter()
                         .map(|lane| {
@@ -8487,7 +8577,7 @@ impl NativeInferenceSession {
                     };
                     let pages = execute_parallel_blocking(
                         verify,
-                        replay,
+                        &replays[arm],
                         plan,
                         &mut target_shadow,
                         &proposal_shadow,
@@ -8495,7 +8585,7 @@ impl NativeInferenceSession {
                         &slots,
                         &pending,
                         &options,
-                        programs.max_draft_tokens,
+                        programs.max_draft_tokens.min(arm_drafts),
                         &page_limits,
                         &eos,
                         cancelled,
@@ -8504,6 +8594,8 @@ impl NativeInferenceSession {
                         &mut stats,
                     )
                     .map_err(to_napi_err)?;
+                    session.spec_proposed += stats.proposed as u64;
+                    session.spec_accepted += stats.accepted.iter().sum::<usize>() as u64;
                     let accepted_total = stats.accepted.iter().sum::<usize>() as u64;
                     diagnostics
                         .speculative_rounds
@@ -8529,7 +8621,7 @@ impl NativeInferenceSession {
                     }
                     (pages, Some(replay_shadow), proposer_states)
                 } else if let (Some(verify), Some(config)) =
-                    (&programs.target_verify, programs.history_lookup)
+                    (&programs.target_verify.last(), programs.history_lookup)
                 {
                     let histories = selected
                         .iter()
@@ -8581,7 +8673,7 @@ impl NativeInferenceSession {
                     }
                     (pages, None, Vec::new())
                 } else if let (Some(verify), Some(decode), Some(pool)) = (
-                    &programs.target_verify,
+                    &programs.target_verify.last(),
                     &programs.proposer_decode,
                     &programs.proposer_pool,
                 ) {

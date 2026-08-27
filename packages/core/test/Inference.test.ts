@@ -39,39 +39,65 @@ const headsFirst = (hidden: Tensor.Any) =>
 
 // The synthetic replayable block proposer, parameterized by the exposure it
 // taps: different speculators subscribe to different names on one base model.
-const parallelProposer = (tapName: string) =>
-  Speculation.parallelBlock({
-    params: [],
+// withProbabilities adds the f32 probability rows that exercise the exact
+// speculative-sampling acceptance path.
+const parallelProposer = (tapName: string, withProbabilities = false) => {
+  const buildBlock = (
+    anchorTokens: Tensor.Any,
+    tokenEmbedding: Tensor.Any,
+    lmHead: Tensor.Any
+  ) =>
+    Effect.gen(function*() {
+      const batch = anchorTokens.shape[0]!
+      const tokens = yield* Tensor.concat([
+        yield* Tensor.reshape(anchorTokens, [batch, 1]),
+        yield* Tensor.zeros([batch, 3], { dtype: anchorTokens.dtype })
+      ], { dim: 1 })
+      const hidden = yield* Tensor.embedding(tokens, { weight: tokenEmbedding })
+      const heads = yield* headsFirst(hidden)
+      const attended = yield* Tensor.scaledDotProductAttention(heads, heads, heads, {
+        causal: false,
+        scale: 1 / Math.sqrt(EMBED)
+      })
+      const merged = yield* Tensor.reshape(yield* Tensor.transpose(attended, [0, 2, 1, 3]), [batch, 4, EMBED])
+      const logits = yield* Tensor.matmul(merged, lmHead)
+      return yield* Tensor.slice(logits, { start: [0, 1, 0], end: [batch, 4, VOCAB] })
+    })
+  const base = {
+    params: [] as Model.Params,
     vocabulary: VOCAB,
     maxDraftTokens: 3,
-    hiddenTaps: [{ name: tapName, dtype: "f32", shape: ["Rows", EMBED] }],
-    tokenEmbedding: { name: "token_embd.weight", dtype: "f32", shape: [VOCAB, EMBED] },
-    lmHead: { name: "output.weight", dtype: "f32", shape: [EMBED, VOCAB] },
-    currentBlockAttention: "Bidirectional",
-    build: (_params, anchorTokens, tokenEmbedding, lmHead) =>
-      Effect.gen(function*() {
-        const batch = anchorTokens.shape[0]!
-        const tokens = yield* Tensor.concat([
-          yield* Tensor.reshape(anchorTokens, [batch, 1]),
-          yield* Tensor.zeros([batch, 3], { dtype: anchorTokens.dtype })
-        ], { dim: 1 })
-        const hidden = yield* Tensor.embedding(tokens, { weight: tokenEmbedding })
-        const heads = yield* headsFirst(hidden)
-        const attended = yield* Tensor.scaledDotProductAttention(heads, heads, heads, {
-          causal: false,
-          scale: 1 / Math.sqrt(EMBED)
-        })
-        const merged = yield* Tensor.reshape(yield* Tensor.transpose(attended, [0, 2, 1, 3]), [batch, 4, EMBED])
-        const logits = yield* Tensor.matmul(merged, lmHead)
-        const candidates = yield* Tensor.slice(logits, { start: [0, 1, 0], end: [batch, 4, VOCAB] })
-        return yield* Tensor.cast(yield* Tensor.argmax(candidates, -1), "u32")
-      }),
-    replay: (_params, [hidden]) =>
+    hiddenTaps: [{ name: tapName, dtype: "f32" as const, shape: ["Rows", EMBED] as ReadonlyArray<number | "Rows"> }],
+    tokenEmbedding: { name: "token_embd.weight", dtype: "f32" as const, shape: [VOCAB, EMBED] },
+    lmHead: { name: "output.weight", dtype: "f32" as const, shape: [EMBED, VOCAB] },
+    currentBlockAttention: "Bidirectional" as const,
+    replay: (_params: Model.Params, [hidden]: ReadonlyArray<Tensor.Any>) =>
       Effect.gen(function*() {
         const heads = yield* headsFirst(hidden!)
         return [{ key: heads, value: heads }]
       })
+  }
+  const build = (_params: Model.Params, anchorTokens: Tensor.Any, tokenEmbedding: Tensor.Any, lmHead: Tensor.Any) =>
+    Effect.gen(function*() {
+      const candidates = yield* buildBlock(anchorTokens, tokenEmbedding, lmHead)
+      return yield* Tensor.cast(yield* Tensor.argmax(candidates, -1), "u32")
+    })
+  if (!withProbabilities) {
+    return Speculation.parallelBlock({ ...base, build })
+  }
+  return Speculation.parallelBlock({
+    ...base,
+    build,
+    buildWithProbabilities: (_params, anchorTokens, tokenEmbedding, lmHead) =>
+      Effect.gen(function*() {
+        const candidates = yield* buildBlock(anchorTokens, tokenEmbedding, lmHead)
+        return {
+          tokenIds: yield* Tensor.cast(yield* Tensor.argmax(candidates, -1), "u32"),
+          probabilityRows: yield* Tensor.softmax(candidates, { dims: [-1] })
+        }
+      })
   })
+}
 
 const makeParallelFixture = Effect.gen(function*() {
   const embedding = yield* Model.embedding("token_embd", VOCAB, EMBED)
@@ -103,6 +129,51 @@ const makeParallelFixture = Effect.gen(function*() {
 })
 
 const ids = (tokens: ReadonlyArray<number>) => Tensor.fromTypedArray(new Uint32Array(tokens), [1, tokens.length])
+
+const CONSTANT_BIAS_TARGET = [3, 2, 1.5, 1, 0.5, 0, -0.5, -1, -1.5, -2, -2.5, -3]
+
+// A target whose logits are a fixed bias vector at every position, so its
+// sampling distribution p = softmax(bias) is known exactly and independent of
+// context. The attention layer stays live for the KV-state contract; its
+// contribution to the logits is numerically negligible.
+const makeConstantBiasModel = Effect.gen(function*() {
+  const embedding = yield* Model.embedding("token_embd", VOCAB, EMBED)
+  const attention = yield* Model.multiHeadAttention("attn", EMBED, 1, { causal: true })
+  const embeddingCount = embedding.parameterSpecs.length
+  const attentionCount = attention.parameterSpecs.length
+  const model = yield* Model.define({
+    parameterSpecs: [
+      ...embedding.parameterSpecs,
+      ...attention.parameterSpecs,
+      { name: "output.weight", shape: [EMBED, VOCAB], initializer: { _tag: "Constant", value: 0 } },
+      { name: "logit_bias.weight", shape: [VOCAB], initializer: { _tag: "Constant", value: 0 } }
+    ],
+    forward: (params, input) =>
+      Effect.gen(function*() {
+        const [batch, steps] = input.shape
+        let hidden = yield* embedding.forward(params.slice(0, embeddingCount), input)
+        hidden = yield* attention.forward(
+          params.slice(embeddingCount, embeddingCount + attentionCount),
+          hidden
+        )
+        hidden = yield* Tensor.expose(hidden, Model.hiddenExposure(0))
+        const pooled = yield* Tensor.mean(hidden, { dims: [2], keepdims: true })
+        const negligible = yield* Tensor.mul(pooled, yield* Tensor.constantLike(pooled, 1e-30))
+        const bias = yield* Tensor.broadcastTo(
+          yield* Tensor.reshape(params[embeddingCount + attentionCount + 1]!, [1, 1, VOCAB]),
+          [batch!, steps!, VOCAB]
+        )
+        return yield* Tensor.add(bias, negligible)
+      })
+  })
+  const params = yield* Tensor.compute([
+    ...yield* Model.initialize(embedding),
+    ...yield* Model.initialize(attention),
+    yield* Tensor.zeros([EMBED, VOCAB]),
+    yield* Tensor.fromTypedArray(Float32Array.from(CONSTANT_BIAS_TARGET), [VOCAB])
+  ])
+  return { model, params }
+})
 
 const historyLookup = (maxDraftTokens: number, minMatchTokens = 1) =>
   Effect.succeed({
@@ -1191,6 +1262,84 @@ onDevices("Inference", () => (it) => {
         )
         const singleChunkRequest = observed.request as Runtime.InferenceCompileRequest | undefined
         expect(singleChunkRequest?.target.prefill).toHaveLength(1)
+      }))
+
+    it.effect("parallel speculation preserves the exact target distribution", () =>
+      Effect.gen(function*() {
+        // p = softmax(bias) is constant per position by construction; the
+        // draft's q varies but shares support. The emitted sequence must be
+        // an exact draw from p regardless of how rounds draft, accept, or
+        // resample — and identical seeds must replay identically.
+        const { model, params } = yield* makeConstantBiasModel
+        const proposer = parallelProposer(Model.hiddenExposure(0), true)
+        const sampling = { temperature: 1, topK: 8, topP: 0.9, seed: 0x5eed_5eedn } as const
+        const base = {
+          maxTokens: 2048,
+          blockSize: 4,
+          prefillChunks: [4],
+          batchSize: 1,
+          sampling
+        } as const
+        const samples = 600
+        const generate = Effect.gen(function*() {
+          const generation = yield* (yield* Model.inference(model, params, {
+            ...base,
+            speculation: { proposer, maxDraftTokens: 3 }
+          })).generation()
+          const tokens: Array<number> = []
+          let page = (yield* generation.add([{ prompt: yield* ids([1, 2, 3]) }]))[0]!
+          tokens.push(...page.tokens)
+          while (tokens.length < samples) {
+            page = (yield* generation.step([{ seq: page.seq }]))[0]!
+            tokens.push(...page.tokens)
+          }
+          yield* generation.close()
+          return tokens.slice(0, samples)
+        })
+        const first = yield* generate
+        const second = yield* generate
+        // Deterministic replay: identical seeds produce identical sequences.
+        expect(second).toEqual(first)
+
+        const histogram = new Array<number>(VOCAB).fill(0)
+        for (const token of first) {
+          histogram[token]! += 1
+        }
+        // The engine's effective distribution: top-k truncate, temperature
+        // softmax, top-p cutoff at cumulative >= topP of the pre-cutoff
+        // total, renormalize. Replicated exactly from the sampler contract.
+        const sorted = CONSTANT_BIAS_TARGET
+          .map((value, token) => ({ token, value }))
+          .sort((a, b) => b.value - a.value)
+          .slice(0, sampling.topK)
+        const max = sorted[0]!.value
+        const weights = sorted.map(({ token, value }) => ({
+          token,
+          weight: Math.exp((value - max) / sampling.temperature)
+        }))
+        const total = weights.reduce((sum, { weight }) => sum + weight, 0)
+        let cumulative = 0
+        let retained = weights.length
+        for (const [index, { weight }] of weights.entries()) {
+          cumulative += weight
+          if (cumulative >= sampling.topP * total) {
+            retained = index + 1
+            break
+          }
+        }
+        const effective = new Array<number>(VOCAB).fill(0)
+        const retainedTotal = weights.slice(0, retained).reduce((sum, { weight }) => sum + weight, 0)
+        for (const { token, weight } of weights.slice(0, retained)) {
+          effective[token] = weight / retainedTotal
+        }
+        const chiSquare = effective.reduce((statistic, probability, token) => {
+          const expected = samples * probability
+          return probability === 0 ? statistic : statistic + (histogram[token]! - expected) ** 2 / expected
+        }, 0)
+        // 11 degrees of freedom; a correct sampler sits far below this bound
+        // (deterministic given the seed), while a misrouted or renormalized
+        // acceptance path blows past it systematically.
+        expect(chiSquare).toBeLessThan(60)
       }))
 
     it.effect("compiles one replay prefill per chunk shape for parallel-block speculation", () =>

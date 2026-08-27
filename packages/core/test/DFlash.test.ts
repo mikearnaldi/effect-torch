@@ -321,6 +321,10 @@ it.effect("derives the reference checkpoint replay artifact", () =>
     expect([artifact.tokenEmbedding.name, artifact.lmHead.name]).toEqual(["token_embd.weight", "output.weight"])
     expect(artifact.maxDraftTokens).toBe(15)
     expect(artifact.currentBlockAttention).toBe("Bidirectional")
+    // The draft ships probability rows for exact rejection sampling; without
+    // them the engine falls back to token-mode matching, which collapses
+    // acceptance at nonzero temperature.
+    expect(artifact.buildWithProbabilities).toBeDefined()
   }))
 
 it.effect("builds replay and noncausal block graphs at tiny geometry", () => {

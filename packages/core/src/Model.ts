@@ -1945,7 +1945,8 @@ interface InferencePrograms {
   readonly geometry: DecodeGeometry
   readonly pool: Tensor.KvPool
   readonly speculation?: {
-    readonly verify: Tensor.DecodeProgram
+    /** Verify programs per packed rows-per-sequence width, ascending. */
+    readonly verify: ReadonlyArray<Tensor.DecodeProgram>
     readonly maxDraftTokens: number
     readonly proposer?: {
       readonly prefill: Tensor.DecodeProgram
@@ -1954,6 +1955,22 @@ interface InferencePrograms {
     }
     readonly generalized?: NonNullable<Runtime.InferenceCompileRequest["generalizedProposer"]>
   }
+}
+
+/**
+ * Packed verify widths compiled for a speculative plan: the widest width
+ * (`maxDraftTokens + 1`). Narrower widths stay uncompiled while their kernel
+ * plans are slower per token than the widest (see the body comment).
+ */
+const verifyWidths = (maxDraftTokens: number): ReadonlyArray<number> => {
+  const widest = maxDraftTokens + 1
+  // Only the widest width pays today: the quantized linear kernels have no
+  // efficient small-row plans (on Q2_K a 4-row verify measures slower than
+  // an 8-row one), so narrowing costs more than it saves. The runtime's
+  // acceptance-driven width selection and the per-width replay pairing are
+  // built and tested; widening this set (e.g. powers of two up to widest) is
+  // a one-line change once narrow-width kernels are competitive.
+  return [widest]
 }
 
 const logitsVocab = (
@@ -2096,7 +2113,11 @@ const compileProposerPlan = (
     /** Target hidden taps per prefill chunk shape, in ascending shape order. */
     readonly prefill: ReadonlyArray<ReadonlyArray<Runtime.InferenceTargetTapRoute>>
     readonly decode: ReadonlyArray<Runtime.InferenceTargetTapRoute>
-    readonly verify: ReadonlyArray<Runtime.InferenceTargetTapRoute>
+    /** Target hidden taps per verify width, in ascending width order. */
+    readonly verify: ReadonlyArray<{
+      readonly width: number
+      readonly taps: ReadonlyArray<Runtime.InferenceTargetTapRoute>
+    }>
   },
   frozenParams: ReadonlyArray<Tensor.Concrete>,
   targetNames: ReadonlyArray<string>
@@ -2249,12 +2270,16 @@ const compileProposerPlan = (
       replayPrefills.push(yield* compileReplay(taps))
     }
     const replayDecode = yield* compileReplay(targetTaps.decode)
-    const replayVerify = yield* compileReplay(targetTaps.verify, config.speculation!.maxDraftTokens + 1)
+    // One replay program per verify width: tap row counts follow the width.
+    const replayVerifies: Array<Tensor.DecodeProgram> = []
+    for (const { width, taps } of targetTaps.verify) {
+      replayVerifies.push(yield* compileReplay(taps, width))
+    }
     const replayGeometry = decodeGeometry(replayPrefills[replayPrefills.length - 1]!)
     if (
       replayPrefills.some((program) => !sameDecodeGeometry(replayGeometry, decodeGeometry(program))) ||
       !sameDecodeGeometry(replayGeometry, decodeGeometry(replayDecode)) ||
-      !sameDecodeGeometry(replayGeometry, decodeGeometry(replayVerify)) ||
+      replayVerifies.some((program) => !sameDecodeGeometry(replayGeometry, decodeGeometry(program))) ||
       !sameDecodeGeometry(replayGeometry, decodeGeometry(program))
     ) {
       return yield* invalidInferenceConfig("parallel block and replay graphs disagree on state geometry")
@@ -2277,7 +2302,9 @@ const compileProposerPlan = (
       tokenMapFingerprint: "identity",
       hiddenTaps: targetTaps.decode,
       prefillHiddenTaps: targetTaps.prefill[targetTaps.prefill.length - 1]!,
-      verifyHiddenTaps: targetTaps.verify,
+      // Tap routes are width-independent in root order; the widest width's
+      // metadata validates the plan.
+      verifyHiddenTaps: targetTaps.verify[targetTaps.verify.length - 1]!.taps,
       sharedTensors: sharedMetadata,
       stages: [{
         operationId: "ParallelBlock",
@@ -2309,7 +2336,7 @@ const compileProposerPlan = (
       replay: {
         prefill: replayPrefills.map((program) => program.handle),
         decode: replayDecode.handle,
-        verify: replayVerify.handle,
+        verify: replayVerifies.map((program) => program.handle),
         pool: pool.handle
       },
       maxDraftTokens: config.speculation!.maxDraftTokens
@@ -2402,15 +2429,26 @@ const compileInferencePrograms = (
       })
     }
     if (proposer?._tag !== "Autoregressive") {
-      const verifyTrace = yield* traceInferenceProgram(
-        model,
-        frozenParams,
-        config,
-        [config.batchSize * (config.speculation.maxDraftTokens + 1), 1],
-        false,
-        { rowsPerSequence: config.speculation.maxDraftTokens + 1 },
-        taps
-      )
+      // ParallelBlock compiles one verify program per packed width and the
+      // runtime adaptively selects the width per round from measured token
+      // rates; HistoryLookup verifies full-width (its drafts are free).
+      const widths = proposer?._tag === "ParallelBlock"
+        ? verifyWidths(config.speculation.maxDraftTokens)
+        : [config.speculation.maxDraftTokens + 1]
+      const verifyTraces: Array<TracedInferenceProgram> = []
+      for (const width of widths) {
+        verifyTraces.push(
+          yield* traceInferenceProgram(
+            model,
+            frozenParams,
+            config,
+            [config.batchSize * width, 1],
+            false,
+            { rowsPerSequence: width },
+            taps
+          )
+        )
+      }
       const generalized = yield* compileProposerPlan(
         proposer!,
         proposerParams,
@@ -2419,7 +2457,7 @@ const compileInferencePrograms = (
         {
           prefill: prefillTraces.map((trace) => trace.taps),
           decode: decodeTrace.taps,
-          verify: verifyTrace.taps
+          verify: verifyTraces.map((trace, index) => ({ width: widths[index]!, taps: trace.taps }))
         },
         frozenParams,
         model.parameterSpecs.map((parameter) => parameter.name)
@@ -2430,7 +2468,7 @@ const compileInferencePrograms = (
         geometry,
         pool,
         speculation: {
-          verify: verifyTrace.program,
+          verify: verifyTraces.map((trace) => trace.program),
           maxDraftTokens: config.speculation.maxDraftTokens,
           generalized
         }
@@ -2502,7 +2540,8 @@ const compileInferencePrograms = (
       geometry,
       pool,
       speculation: {
-        verify,
+        // Exact proposers keep a single full-width verify program.
+        verify: [verify],
         maxDraftTokens: config.speculation.maxDraftTokens,
         proposer: { prefill: proposerPrefill, decode: proposerDecode, pool: proposerPool }
       }
@@ -3269,7 +3308,9 @@ export const inference = (
                 target: {
                   prefill: programs.prefill.map((program) => program.handle),
                   decode: programs.decode.handle,
-                  ...(programs.speculation === undefined ? {} : { verify: programs.speculation.verify.handle }),
+                  ...(programs.speculation === undefined
+                    ? {}
+                    : { verify: programs.speculation.verify.map((program) => program.handle) }),
                   pool: programs.pool.handle
                 },
                 ...(exactProposer === undefined
