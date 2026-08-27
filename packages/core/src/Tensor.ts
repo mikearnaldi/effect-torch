@@ -2305,6 +2305,36 @@ export const slice: {
 )
 
 /**
+ * Attaches a stable exposure name to a tensor without changing its value.
+ * The node is an identity in the graph: ordinary execution and autodiff
+ * treat it as transparent, and compilation lowers it to a zero-cost alias.
+ * Model authors use it to publish intermediates (convention:
+ * `layers.{n}.hidden` for the residual after zero-based layer `n`) that
+ * inference consumers such as speculative proposers request by name.
+ *
+ * @since 0.1.0
+ * @category graph operations
+ */
+export const expose: {
+  (name: string): (self: Any) => Effect.Effect<Lazy, TensorError, Runtime.Runtime>
+  (self: Any, name: string): Effect.Effect<Lazy, TensorError, Runtime.Runtime>
+} = dual(
+  2,
+  (self: Any, name: string): Effect.Effect<Lazy, TensorError, Runtime.Runtime> =>
+    graphTry("expose", () => {
+      if (name.length === 0) {
+        throw new Error("expose: name must be nonempty")
+      }
+      return {
+        request: { op: "expose", inputs: [self], attributes: { name } },
+        shape: [...self.shape],
+        dtype: self.dtype,
+        placement: self.placement
+      }
+    })
+)
+
+/**
  * Concatenates two or more tensors along an existing dimension. All tensors
  * must have the same rank, dtype and exact placement, and match on every
  * dimension except the concatenated one.

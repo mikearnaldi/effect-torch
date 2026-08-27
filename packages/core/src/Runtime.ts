@@ -752,6 +752,15 @@ export interface NodeOperationMap {
   readonly det: { readonly inputs: readonly [self: TensorHandle] }
   /** Preserves the value while stopping reverse-mode gradient propagation. */
   readonly stopGradient: { readonly inputs: readonly [self: TensorHandle] }
+  /**
+   * Identity node carrying a stable exposure name. The wrapped value stays
+   * in the graph and is discoverable through {@link RuntimeService.exposures};
+   * compilation lowers it to a zero-cost alias.
+   */
+  readonly expose: {
+    readonly inputs: readonly [self: TensorHandle]
+    readonly attributes: { readonly name: string }
+  }
   /** Marks a value for recomputation during reverse-mode differentiation. */
   readonly checkpoint: { readonly inputs: readonly [self: TensorHandle] }
   /** Applies the Gaussian error linear unit. */
@@ -1797,6 +1806,20 @@ export interface RuntimeDiagnostics {
 }
 
 /**
+ * One named exposure discovered in a lazy graph: the name given to
+ * `Tensor.expose` and the wrapped tensor.
+ *
+ * @since 0.1.0
+ * @category models
+ */
+export interface NamedExposure {
+  /** The exposure name. */
+  readonly name: string
+  /** The wrapped tensor (the exposure node's identity input). */
+  readonly tensor: LazyTensorHandle
+}
+
+/**
  * A live tensor runtime bound to one default placement. Implementations are
  * responsible for native capability validation, immutable metadata, handle
  * ownership/liveness registries, interruption cleanup, and safe concurrent
@@ -1825,6 +1848,14 @@ export interface RuntimeService {
    * attributes such as byte arrays before successful completion.
    */
   readonly node: (request: NodeRequest) => Effect.Effect<LazyTensorHandle, BackendError>
+  /**
+   * Walks the lazy graph reachable from `root` and returns every `expose`
+   * exposure in deterministic first-visit order. Fails on duplicate names.
+   * Discovery walks the traced graph only; nothing executes.
+   */
+  readonly exposures: (
+    root: LazyTensorHandle
+  ) => Effect.Effect<ReadonlyArray<NamedExposure>, BackendError>
   /**
    * Builds lazy reverse-mode gradient graphs without materializing the loss.
    * Inputs are borrowed, must be live and runtime-owned, and output order must

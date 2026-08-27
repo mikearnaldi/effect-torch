@@ -1295,6 +1295,13 @@ pub enum NodeKind {
     Checkpoint {
         a: Arc<Node>,
     },
+    /// Identity carrying a stable name: marks the wrapped value as an
+    /// inference exposure discoverable by graph walks. Autodiff treats it
+    /// as identity; lowering aliases it away with no cost.
+    Expose {
+        a: Arc<Node>,
+        name: String,
+    },
 }
 
 /// One node of the computation graph: an identity, cached metadata, and the
@@ -1545,7 +1552,8 @@ impl NodeKind {
             | NodeKind::Round { a }
             | NodeKind::Sign { a }
             | NodeKind::Checkpoint { a }
-            | NodeKind::StopGradient { a } => (a.shape.clone(), a.dtype, a.device.clone()),
+            | NodeKind::StopGradient { a }
+            | NodeKind::Expose { a, .. } => (a.shape.clone(), a.dtype, a.device.clone()),
             NodeKind::Pow { a, .. } => (a.shape.clone(), a.dtype, a.device.clone()),
             NodeKind::Where { cond, a, b } => {
                 if cond.dtype != DType::U8 {
@@ -2589,7 +2597,8 @@ pub fn node_children(kind: &NodeKind) -> Vec<Arc<Node>> {
         | NodeKind::Slice { a, .. }
         | NodeKind::BroadcastTo { a, .. }
         | NodeKind::Checkpoint { a }
-        | NodeKind::StopGradient { a } => vec![a.clone()],
+        | NodeKind::StopGradient { a }
+        | NodeKind::Expose { a, .. } => vec![a.clone()],
         NodeKind::Where { cond, a, b } => vec![cond.clone(), a.clone(), b.clone()],
         NodeKind::IndexSelect { a, indexes, .. } => vec![a.clone(), indexes.clone()],
         NodeKind::Gather { a, indexes, .. } => vec![a.clone(), indexes.clone()],
@@ -3344,6 +3353,10 @@ pub fn remap_children(kind: &NodeKind, f: &dyn Fn(&Arc<Node>) -> Arc<Node>) -> N
         NodeKind::BroadcastTo { a, shape } => NodeKind::BroadcastTo {
             a: f(a),
             shape: shape.clone(),
+        },
+        NodeKind::Expose { a, name } => NodeKind::Expose {
+            a: f(a),
+            name: name.clone(),
         },
         NodeKind::Checkpoint { a } => NodeKind::Checkpoint { a: f(a) },
         NodeKind::StopGradient { a } => NodeKind::StopGradient { a: f(a) },

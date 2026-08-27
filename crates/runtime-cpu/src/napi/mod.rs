@@ -887,6 +887,29 @@ pub struct LazyTensor {
     node: Arc<Node>,
 }
 
+/// One named exposure discovered in a lazy graph: the name and the wrapped
+/// tensor handle (the exposure node's child).
+#[napi]
+pub struct NativeExposure {
+    name: String,
+    tensor: LazyTensor,
+}
+
+#[napi]
+impl NativeExposure {
+    #[napi(getter)]
+    pub fn name(&self) -> String {
+        self.name.clone()
+    }
+
+    #[napi(getter)]
+    pub fn tensor(&self) -> LazyTensor {
+        LazyTensor {
+            node: self.tensor.node.clone(),
+        }
+    }
+}
+
 macro_rules! lazy_ctor {
     ($body:expr) => {
         match $body {
@@ -1629,6 +1652,50 @@ impl LazyTensor {
         lazy_ctor!(Node::new(NodeKind::StopGradient {
             a: self.node.clone()
         }))
+    }
+
+    #[napi]
+    pub fn expose(&self, name: String) -> Result<Self> {
+        if name.is_empty() {
+            return Err(Error::new(
+                Status::InvalidArg,
+                "expose: name must be nonempty".to_string(),
+            ));
+        }
+        lazy_ctor!(Node::new(NodeKind::Expose {
+            a: self.node.clone(),
+            name
+        }))
+    }
+
+    /// Walks the lazy graph reachable from this node and returns every
+    /// exposure (name plus the wrapped tensor) in deterministic first-visit
+    /// order; duplicate names are a caller error.
+    #[napi]
+    pub fn exposures(&self) -> Result<Vec<NativeExposure>> {
+        let mut seen = HashSet::new();
+        let mut names = HashSet::new();
+        let mut found = Vec::new();
+        let mut stack = vec![self.node.clone()];
+        while let Some(node) = stack.pop() {
+            if !seen.insert(node.id) {
+                continue;
+            }
+            if let NodeKind::Expose { a, name } = &node.kind {
+                if !names.insert(name.clone()) {
+                    return Err(Error::new(
+                        Status::InvalidArg,
+                        format!("expose: duplicate exposure name \"{name}\""),
+                    ));
+                }
+                found.push(NativeExposure {
+                    name: name.clone(),
+                    tensor: LazyTensor { node: a.clone() },
+                });
+            }
+            stack.extend(effect_torch_graph::node_children(&node.kind));
+        }
+        Ok(found)
     }
 
     #[napi]

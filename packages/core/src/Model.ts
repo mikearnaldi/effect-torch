@@ -143,8 +143,7 @@ export interface Model {
    */
   readonly forward: (
     params: Params,
-    input: Tensor.Any,
-    trace?: ForwardTrace
+    input: Tensor.Any
   ) => Effect.Effect<Tensor.Lazy, ModelError | Tensor.TensorError, Runtime.Runtime>
   /**
    * Runs the ordinary compiled forward path and returns one materialized output.
@@ -181,24 +180,6 @@ export interface Model {
    * already in-flight trace may insert its result after this effect completes.
    */
   readonly clear: Effect.Effect<void>
-}
-
-/**
- * Compile-time-only target values requested while tracing an inference graph.
- *
- * @since 0.1.0
- * @category compilation
- */
-export interface ForwardTrace {
-  /**
-   * Exposes a named intermediate value to the inference compiler. Names are
-   * model-defined and stable; the convention for the residual activation
-   * after the zero-based layer `n` is `layers.{n}.hidden`. The first expose
-   * of a name wins within one trace. Exposed values cost nothing unless an
-   * inference consumer (e.g. a speculative proposer's hidden taps) requests
-   * the name, in which case the value is routed as an extra program output.
-   */
-  readonly expose: (name: string, value: Tensor.Any) => void
 }
 
 /**
@@ -2038,20 +2019,19 @@ const traceInferenceProgram = (
     const [graphRows, steps] = inputShape
     const tokenInput = yield* Tensor.zeros(inputShape, { dtype: config.tokenDtype })
     const input = yield* Tensor.makeInput(0, tokenInput)
-    const requested = new Set(taps.map((tap) => tap.name))
-    const captured = new Map<string, Tensor.Any>()
-    const exposed: Array<string> = []
-    const output = yield* model.forward(frozenParams, input, {
-      expose: (name, value) => {
-        if (!exposed.includes(name)) exposed.push(name)
-        if (requested.has(name) && !captured.has(name)) captured.set(name, value)
-      }
-    })
+    const output = yield* model.forward(frozenParams, input)
     yield* logitsVocab(output, graphRows, steps)
+    // Exposures live in the graph itself (Tensor.expose identity nodes), so
+    // composition can never drop them; discovery is one walk from the root.
+    const runtime = yield* Runtime.Runtime
+    const discovered = yield* runtime.exposures(output).pipe(
+      Effect.mapError((error) => new InferenceError({ op: "inference", message: error.message }))
+    )
+    const exposed = new Map(discovered.map((entry) => [entry.name, entry.tensor]))
     const roots: Array<Tensor.Any> = [output]
     const routes: Array<Runtime.InferenceTargetTapRoute> = []
     for (const tap of taps) {
-      const value = captured.get(tap.name)
+      const value = exposed.get(tap.name)
       const logicalShape: ReadonlyArray<number | "Rows"> | undefined = value === undefined ||
           value.shape.length < 2 || value.shape[0] !== graphRows || value.shape[1] !== steps
         ? undefined
@@ -2060,8 +2040,9 @@ const traceInferenceProgram = (
         value === undefined || logicalShape === undefined || value.dtype !== tap.dtype ||
         !schemaShapeMatches(tap.shape, logicalShape)
       ) {
+        const available = discovered.map((entry) => entry.name).sort()
         const actual = value === undefined
-          ? `missing; model exposes ${exposed.length === 0 ? "nothing" : exposed.join(", ")}`
+          ? `missing; model exposes ${available.length === 0 ? "nothing" : available.join(", ")}`
           : `${value.dtype}[${value.shape}]`
         return yield* invalidInferenceConfig(
           `proposer target hidden tap "${tap.name}" requires ${tap.dtype}[${tap.shape}], got ${actual}`

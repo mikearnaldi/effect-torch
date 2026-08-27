@@ -85,6 +85,12 @@ export declare class Executable {
  *
  * @internal
  */
+/** One named exposure discovered in a lazy graph. @internal */
+export declare class NativeExposure {
+  readonly name: string
+  readonly tensor: LazyTensor
+}
+
 export declare class LazyTensor {
   get shape(): Array<number>
   get dtype(): string
@@ -176,6 +182,8 @@ export declare class LazyTensor {
   concat(other: LazyTensor, dim: number): LazyTensor
   broadcastTo(shape: Array<number>): LazyTensor
   stopGradient(): LazyTensor
+  expose(name: string): LazyTensor
+  exposures(): Array<NativeExposure>
   checkpoint(): LazyTensor
   vmap(x: LazyTensor, batchedX: LazyTensor, dim: number): LazyTensor
   adamwStep(

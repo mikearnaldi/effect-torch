@@ -121,6 +121,8 @@ const runtime = {
         case "rotaryEmbedding":
         case "tanh":
           return handle("LazyTensor", request.inputs[0].shape, request.inputs[0].dtype) as Tensor.Lazy
+        case "expose":
+          return request.inputs[0] as Tensor.Lazy
         default:
           throw new Error(`unexpected Muse-Glimmer graph operation ${request.op}`)
       }

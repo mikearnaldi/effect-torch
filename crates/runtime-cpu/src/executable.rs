@@ -2146,7 +2146,9 @@ impl Lowerer {
             NodeKind::LayerNormBackwardOut { of, index } => {
                 return self.selector(node, of, *index as usize);
             }
-            NodeKind::StopGradient { a } | NodeKind::Checkpoint { a } => {
+            NodeKind::StopGradient { a }
+            | NodeKind::Checkpoint { a }
+            | NodeKind::Expose { a, .. } => {
                 let value = self.child_value(a)?;
                 self.node_values.insert(node.id, Box::new([value]));
                 return Ok(());
@@ -2664,7 +2666,8 @@ impl Lowerer {
             | NodeKind::AdamWOut { .. }
             | NodeKind::SgdOut { .. }
             | NodeKind::StopGradient { .. }
-            | NodeKind::Checkpoint { .. } => {
+            | NodeKind::Checkpoint { .. }
+            | NodeKind::Expose { .. } => {
                 unreachable!("zero-command nodes return before operation lowering")
             }
         };

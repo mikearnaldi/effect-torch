@@ -39,10 +39,10 @@ const makeParallelFixture = Effect.gen(function*() {
   const attentionCount = attention.parameterSpecs.map(({ name }) => name).length
   const model = yield* Model.define({
     parameterSpecs: [...embedding.parameterSpecs, ...attention.parameterSpecs, ...head.parameterSpecs],
-    forward: (params, input, trace) =>
+    forward: (params, input) =>
       Effect.gen(function*() {
         let hidden = yield* embedding.forward(params.slice(0, embeddingCount), input)
-        trace?.expose("layers.0.hidden", hidden)
+        hidden = yield* Tensor.expose(hidden, "layers.0.hidden")
         hidden = yield* attention.forward(
           params.slice(embeddingCount, embeddingCount + attentionCount),
           hidden
@@ -1234,6 +1234,48 @@ onDevices("Inference", () => (it) => {
           }
           expect(parallelPage.tokens).toEqual(expected)
         }
+        yield* ordinary.close()
+        yield* parallel.close()
+      }))
+
+    it.effect("exposures survive chain composition for proposer taps", () =>
+      Effect.gen(function*() {
+        // The exposure is a node in the graph, so combinator composition
+        // (which never saw a trace callback even at inference-trace time)
+        // cannot drop it.
+        const embedding = yield* Model.embedding("token_embd", VOCAB, EMBED)
+        const attention = yield* Model.multiHeadAttention("attn", EMBED, 1, { causal: true, rope: 10_000 })
+        const head = yield* Model.linear("output", EMBED, VOCAB)
+        const exposingEmbed = yield* Model.define({
+          parameterSpecs: embedding.parameterSpecs,
+          forward: (params, input) =>
+            Effect.flatMap(embedding.forward(params, input), (hidden) => Tensor.expose(hidden, "layers.0.hidden"))
+        })
+        const chained = yield* Model.chain(exposingEmbed, attention, head)
+        const params = yield* Tensor.compute(yield* Model.initialize(chained))
+        const { proposer } = yield* makeParallelFixture
+        const base = {
+          maxTokens: 32,
+          blockSize: 4,
+          prefillChunks: [4],
+          batchSize: 1,
+          sampling: { temperature: 0, seed: 17 }
+        } as const
+        const ordinary = yield* (yield* Model.inference(chained, params, base)).generation()
+        const parallel = yield* (yield* Model.inference(chained, params, {
+          ...base,
+          speculation: { proposer, maxDraftTokens: 2 }
+        })).generation()
+        let ordinaryPage = (yield* ordinary.add([{ prompt: yield* ids([1, 2, 3, 4, 5, 6]) }]))[0]!
+        const parallelFirst = (yield* parallel.add([{ prompt: yield* ids([1, 2, 3, 4, 5, 6]) }]))[0]!
+        expect(parallelFirst.tokens).toEqual(ordinaryPage.tokens)
+        const parallelPage = (yield* parallel.step([{ seq: parallelFirst.seq }]))[0]!
+        const expected: Array<number> = []
+        for (let index = 0; index < parallelPage.tokens.length; index++) {
+          ordinaryPage = (yield* ordinary.step([{ seq: ordinaryPage.seq }]))[0]!
+          expected.push(...ordinaryPage.tokens)
+        }
+        expect(parallelPage.tokens).toEqual(expected)
         yield* ordinary.close()
         yield* parallel.close()
       }))

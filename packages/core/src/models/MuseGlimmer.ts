@@ -259,7 +259,7 @@ const makeModel = (config: Config): Effect.Effect<Model.Model, Model.ModelError>
   const slidingWindowPattern = config["attention.sliding_window_pattern"]
   return Model.define({
     parameterSpecs,
-    forward: (params, input, trace) =>
+    forward: (params, input) =>
       Effect.gen(function*() {
         if (params.length !== parameterSpecs.length) {
           return yield* new Model.ModelError({
@@ -354,7 +354,7 @@ const makeModel = (config: Config): Effect.Effect<Model.Model, Model.ModelError>
           )
           ffn = yield* Tensor.linearRows(ffn, params[offset + 13])
           hidden = yield* Tensor.add(hidden, yield* rms(ffn, 1e-8, params[offset + 10]))
-          trace?.expose(`layers.${layer}.hidden`, hidden)
+          hidden = yield* Tensor.expose(hidden, `layers.${layer}.hidden`)
         }
 
         hidden = yield* rms(hidden, rmsEpsilon, params[1])

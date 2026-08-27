@@ -1201,6 +1201,10 @@ fn backward(
                 )?;
             }
             NodeKind::StopGradient { .. } => {}
+            NodeKind::Expose { a, .. } => {
+                // Identity forward: the adjoint flows through unchanged.
+                accumulate(a, Ok(g.clone()))?;
+            }
             NodeKind::CrossEntropy {
                 logits,
                 target,

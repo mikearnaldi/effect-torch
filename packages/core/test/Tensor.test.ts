@@ -1,7 +1,7 @@
 import { describe, expect } from "@effect/vitest"
 import * as assert from "@effect/vitest/utils"
 import { Effect, Exit } from "effect"
-import { Gradient, Loss, Tensor } from "../src/index.ts"
+import { Gradient, Loss, Runtime, Tensor } from "../src/index.ts"
 import { deep, floatDtype, floats, onDevices, TOL } from "./utils/devices.ts"
 
 const values = (t: Tensor.Any) =>
@@ -242,6 +242,45 @@ onDevices("Tensor", (device) => (it) => {
         const ints = yield* Tensor.fromTypedArray(new BigInt64Array([1n]), [1])
         const error = yield* Effect.flip(Tensor.toNumberArray(ints))
         expect(error.message).toContain("i64")
+      }))
+  })
+
+  describe("expose", () => {
+    const matrix = Tensor.fromTypedArray(new Float32Array([1, 2, 3, 4, 5, 6]), [2, 3])
+
+    it.effect("is a value-preserving identity in ordinary execution", () =>
+      Effect.gen(function*() {
+        const exposed = yield* Tensor.expose(yield* matrix, "layers.0.hidden")
+        deep(exposed.shape, [2, 3])
+        deep(yield* values(exposed), [1, 2, 3, 4, 5, 6])
+      }))
+
+    it.effect("exposures discovers named tensors from the graph root", () =>
+      Effect.gen(function*() {
+        const a = yield* matrix
+        const mid = yield* Tensor.expose(yield* Tensor.add(a, a), "layers.0.hidden")
+        const out = yield* Tensor.expose(yield* Tensor.mul(mid, a), "layers.1.hidden")
+        const runtime = yield* Runtime.Runtime
+        const found = yield* runtime.exposures(out)
+        deep(found.map(({ name }) => name), ["layers.1.hidden", "layers.0.hidden"])
+        deep(found[0]!.tensor.shape, [2, 3])
+        // The discovered handle is the wrapped tensor: executable with values.
+        deep(yield* values(found[1]!.tensor), [2, 4, 6, 8, 10, 12])
+        deep(yield* values(found[0]!.tensor), [2, 8, 18, 32, 50, 72])
+      }))
+
+    it.effect("rejects empty and duplicate exposure names", () =>
+      Effect.gen(function*() {
+        const empty = yield* Effect.exit(Effect.flatMap(matrix, (m) => Tensor.expose(m, "")))
+        assert.assertTrue(Exit.isFailure(empty))
+        const a = yield* matrix
+        const root = yield* Tensor.add(
+          yield* Tensor.expose(a, "dup"),
+          yield* Tensor.expose(a, "dup")
+        )
+        const runtime = yield* Runtime.Runtime
+        const duplicate = yield* Effect.exit(runtime.exposures(root))
+        assert.assertTrue(Exit.isFailure(duplicate))
       }))
   })
 

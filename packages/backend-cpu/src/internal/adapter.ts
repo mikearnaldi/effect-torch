@@ -936,6 +936,8 @@ export const makeRuntime = (
             return graph(nativeGraph(request.inputs[0], operation).det())
           case "stopGradient":
             return graph(nativeGraph(request.inputs[0], operation).stopGradient())
+          case "expose":
+            return graph(nativeGraph(request.inputs[0], operation).expose(request.attributes.name))
           case "checkpoint":
             return graph(nativeGraph(request.inputs[0], operation).checkpoint())
           case "gelu":
@@ -2015,6 +2017,18 @@ export const makeRuntime = (
       features: []
     },
     node,
+    exposures: (root) =>
+      Effect.try({
+        try: () => {
+          pendingStructure = undefined
+          pendingDeclarations = undefined
+          return nativeGraph(root, "exposures").exposures().map((entry) => ({
+            name: entry.name,
+            tensor: graph(entry.tensor)
+          }))
+        },
+        catch: backendErrorFor("exposures", "graph")
+      }),
     grad: (loss, wrt) =>
       Effect.try({
         try: () => {
