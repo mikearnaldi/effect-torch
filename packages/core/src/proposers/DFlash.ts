@@ -465,7 +465,6 @@ export const artifact = (
     currentBlockAttention: "Bidirectional",
     attentionWindow: config.slidingWindow,
     build: graph.build,
-    buildWithProbabilities: graph.buildWithProbabilities,
     replay: graph.replay
   })
 }

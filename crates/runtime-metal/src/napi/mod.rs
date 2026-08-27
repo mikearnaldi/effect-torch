@@ -5360,25 +5360,12 @@ fn execute_parallel_blocking(
             )?;
             let probabilities = f32_values(&tensor);
             let mut sampled = vec![0; stage_schema.batch * trained_draft_tokens];
-            let mut effective: Vec<Vec<Vec<f64>>> = vec![Vec::new(); pending.len()];
             for lane in &proposal_active {
                 for row in 0..proposal_limits[*lane] {
                     let start = (slots[*lane] * trained_draft_tokens + row) * target.vocabulary;
-                    // Proposals are tempered like the target but never
-                    // truncated: top-k/top-p would shrink the draft's support
-                    // away from the target's nucleus and crater acceptance;
-                    // the residual covers the target's truncated mass.
-                    let q = probabilities_f32(
-                        &probabilities[start..start + target.vocabulary],
-                        SamplingOptions {
-                            top_k: None,
-                            top_p: 1.0,
-                            ..sampling[*lane]
-                        },
-                        cancelled,
-                    )?;
-                    sampled[slots[*lane] * trained_draft_tokens + row] = sample_at(
-                        &q,
+                    let q = &probabilities[start..start + target.vocabulary];
+                    sampled[slots[*lane] * trained_draft_tokens + row] = sample_f32_at(
+                        q,
                         InferenceSampling {
                             temperature: sampling[*lane].temperature,
                             top_k: sampling[*lane].top_k,
@@ -5390,10 +5377,9 @@ fn execute_parallel_blocking(
                         SamplingPurpose::Proposal,
                         0,
                     );
-                    effective[*lane].push(q);
                 }
             }
-            (sampled, Some(effective))
+            (sampled, Some(tensor))
         } else {
             (read_u32_tensor(&proposal_outputs[0])?, None)
         }
@@ -5484,11 +5470,15 @@ fn execute_parallel_blocking(
                     sampling[lane],
                     cancelled,
                 )?;
-                let q = &proposal_probabilities[lane][candidate_index];
+                let proposal_start =
+                    (slots[lane] * trained_draft_tokens + candidate_index) * target.vocabulary;
+                let proposal_values = f32_values(proposal_probabilities);
+                let q = &proposal_values[proposal_start..proposal_start + target.vocabulary];
                 let accept = if sampling[lane].temperature == 0.0 {
                     p[candidate as usize] > 0.0
                 } else {
-                    let probability = (p[candidate as usize] / q[candidate as usize]).min(1.0);
+                    let probability =
+                        (p[candidate as usize] / q[candidate as usize] as f64).min(1.0);
                     random_unit_at(sampling_coordinate(
                         sampling[lane].seed,
                         sequence_ids[lane],
@@ -5503,7 +5493,7 @@ fn execute_parallel_blocking(
                     let residual = p
                         .iter()
                         .zip(q)
-                        .map(|(p, q)| (p - *q).max(0.0))
+                        .map(|(p, q)| (p - *q as f64).max(0.0))
                         .collect::<Vec<_>>();
                     sample_at(
                         &residual,
@@ -5715,19 +5705,7 @@ fn execute_speculative_blocking(
                 SamplingPurpose::Proposal,
                 0,
             );
-            // Proposals are tempered like the target but never truncated:
-            // top-k/top-p would shrink the draft's support away from the
-            // target's nucleus and crater acceptance; the residual covers
-            // the target's truncated mass.
-            let q = probabilities(
-                &logits,
-                SamplingOptions {
-                    top_k: None,
-                    top_p: 1.0,
-                    ..options
-                },
-                cancelled,
-            )?;
+            let q = probabilities(&logits, options, cancelled)?;
             let token = if let Some((sequence_ids, positions)) = coordinates {
                 sample_at(
                     &q,
