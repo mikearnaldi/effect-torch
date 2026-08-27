@@ -32,8 +32,12 @@ export interface KeyValue {
  * @category models
  */
 export interface HiddenTap {
-  /** Zero-based target layer whose residual output is routed to the proposer. */
-  readonly layer: number
+  /**
+   * Name of the target-model exposure routed to the proposer, matching a
+   * `trace.expose` call in the target's `forward` (convention:
+   * `layers.{n}.hidden` for the residual after zero-based layer `n`).
+   */
+  readonly name: string
   /** Required residual element dtype. */
   readonly dtype: Runtime.DType
   /** Logical shape, with `"Rows"` denoting the runtime-selected row extent. */

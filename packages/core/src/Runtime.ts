@@ -1358,8 +1358,8 @@ export interface InferenceValueRoute {
  * @category models
  */
 export interface InferenceTargetTapRoute {
-  /** Zero-based target-model layer represented by this tap. */
-  readonly layer: number
+  /** Name of the target-model exposure represented by this tap. */
+  readonly name: string
   /** Semantic source-root index; backends resolve any lane-split outputs before this root. */
   readonly outputRoot: number
   /** Logical schema after any runtime row selection. */

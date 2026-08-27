@@ -1804,7 +1804,7 @@ export const makeRuntime = (
                 if (tap === undefined) throw new Error("inference[compile]: target hidden route has no tap contract")
                 return {
                   kind: route.kind,
-                  layer: tap.layer,
+                  name: tap.name,
                   ...(route.selectTargetRow === true ? { selectRow: true } : {})
                 }
               }
@@ -1828,19 +1828,19 @@ export const makeRuntime = (
             ? undefined
             : {
               targetPrefillTaps: (generalized.plan.prefillHiddenTaps ?? []).map((tap) => ({
-                layer: tap.layer,
+                name: tap.name,
                 output: tap.outputRoot,
                 shape: [...tap.value.shape],
                 dtype: tap.value.dtype as NativeDType
               })),
               targetDecodeTaps: generalized.plan.hiddenTaps.map((tap) => ({
-                layer: tap.layer,
+                name: tap.name,
                 output: tap.outputRoot,
                 shape: [...tap.value.shape],
                 dtype: tap.value.dtype as NativeDType
               })),
               targetVerifyTaps: (generalized.plan.verifyHiddenTaps ?? []).map((tap) => ({
-                layer: tap.layer,
+                name: tap.name,
                 output: tap.outputRoot,
                 shape: [...tap.value.shape],
                 dtype: tap.value.dtype as NativeDType

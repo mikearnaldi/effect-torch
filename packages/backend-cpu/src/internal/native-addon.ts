@@ -108,17 +108,17 @@ export interface NativeInferenceProposerPlan {
   vocabulary: number
   tokenMapFingerprint: string
   hiddenTaps: Array<{
-    layer: number
+    name: string
     outputRoot: number
     value: NativeInferenceValueMetadata
   }>
   prefillHiddenTaps?: Array<{
-    layer: number
+    name: string
     outputRoot: number
     value: NativeInferenceValueMetadata
   }>
   verifyHiddenTaps?: Array<{
-    layer: number
+    name: string
     outputRoot: number
     value: NativeInferenceValueMetadata
   }>

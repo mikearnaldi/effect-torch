@@ -1428,7 +1428,7 @@ export const makeRuntime = (
     vocabulary: plan.vocabulary,
     tokenMapFingerprint: plan.tokenMapFingerprint,
     hiddenTaps: plan.hiddenTaps.map((tap) => ({
-      layer: tap.layer,
+      name: tap.name,
       outputRoot: tap.outputRoot,
       value: { dtype: tap.value.dtype as NativeDType, shape: [...tap.value.shape] }
     })),
@@ -1436,7 +1436,7 @@ export const makeRuntime = (
       ? {}
       : {
         prefillHiddenTaps: plan.prefillHiddenTaps.map((tap) => ({
-          layer: tap.layer,
+          name: tap.name,
           outputRoot: tap.outputRoot,
           value: { dtype: tap.value.dtype as NativeDType, shape: [...tap.value.shape] }
         }))
@@ -1445,7 +1445,7 @@ export const makeRuntime = (
       ? {}
       : {
         verifyHiddenTaps: plan.verifyHiddenTaps.map((tap) => ({
-          layer: tap.layer,
+          name: tap.name,
           outputRoot: tap.outputRoot,
           value: { dtype: tap.value.dtype as NativeDType, shape: [...tap.value.shape] }
         }))

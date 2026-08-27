@@ -6610,7 +6610,7 @@ pub struct NativeInferenceValueMetadata {
 #[napi(object)]
 #[derive(Clone)]
 pub struct NativeInferenceHiddenTap {
-    pub layer: u32,
+    pub name: String,
     /// Root index in each target executable. Root zero remains target logits.
     pub output_root: u32,
     pub value: NativeInferenceValueMetadata,
@@ -7190,10 +7190,11 @@ fn validate_proposer_plan(
     let mut hidden_layers = HashSet::new();
     for tap in &plan.hidden_taps {
         let root = tap.output_root as usize;
-        if root == 0 || !hidden_layers.insert(tap.layer) || target_hidden.contains_key(&root) {
+        if root == 0 || !hidden_layers.insert(tap.name.clone()) || target_hidden.contains_key(&root)
+        {
             return Err(inference_error(
                 "compile",
-                "target hidden taps must have unique layers and output roots after logits",
+                "target hidden taps must have unique names and output roots after logits",
             ));
         }
         let declared = ValueMetadata::native(&tap.value);
@@ -7213,15 +7214,15 @@ fn validate_proposer_plan(
                                executable: &Executable,
                                split: bool|
      -> Result<Vec<(usize, usize)>> {
-        let mut layers = HashSet::new();
+        let mut names = HashSet::new();
         let mut roots = HashSet::new();
         taps.iter()
             .map(|tap| {
                 let root = tap.output_root as usize;
-                if root == 0 || !layers.insert(tap.layer) || !roots.insert(root) {
+                if root == 0 || !names.insert(tap.name.clone()) || !roots.insert(root) {
                     return Err(inference_error(
                         "compile",
-                        "phase hidden taps must have unique layers and nonzero roots",
+                        "phase hidden taps must have unique names and nonzero roots",
                     ));
                 }
                 let physical = if split {

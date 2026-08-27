@@ -41,7 +41,7 @@ onDevices("Speculation", () => (it) => {
         params: [],
         vocabulary: 16,
         maxDraftTokens: 4,
-        hiddenTaps: [{ layer: 2, dtype: "f32", shape: ["Rows", 8] }],
+        hiddenTaps: [{ name: "layers.2.hidden", dtype: "f32", shape: ["Rows", 8] }],
         tokenEmbedding: { name: "wte.weight", dtype: "f32", shape: [16, 8] },
         lmHead: { name: "head.weight", dtype: "f32", shape: [16, 8] },
         build,

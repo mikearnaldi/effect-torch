@@ -42,7 +42,7 @@ const makeParallelFixture = Effect.gen(function*() {
     forward: (params, input, trace) =>
       Effect.gen(function*() {
         let hidden = yield* embedding.forward(params.slice(0, embeddingCount), input)
-        trace?.hidden(0, hidden)
+        trace?.expose("layers.0.hidden", hidden)
         hidden = yield* attention.forward(
           params.slice(embeddingCount, embeddingCount + attentionCount),
           hidden
@@ -65,7 +65,7 @@ const makeParallelFixture = Effect.gen(function*() {
     params: [],
     vocabulary: VOCAB,
     maxDraftTokens: 3,
-    hiddenTaps: [{ layer: 0, dtype: "f32", shape: ["Rows", EMBED] }],
+    hiddenTaps: [{ name: "layers.0.hidden", dtype: "f32", shape: ["Rows", EMBED] }],
     tokenEmbedding: { name: "token_embd.weight", dtype: "f32", shape: [VOCAB, EMBED] },
     lmHead: { name: "output.weight", dtype: "f32", shape: [EMBED, VOCAB] },
     currentBlockAttention: "Bidirectional",

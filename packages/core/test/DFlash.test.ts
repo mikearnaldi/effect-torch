@@ -267,10 +267,10 @@ it.effect("derives catalogs and artifacts from changed valid metadata", () =>
     expect(parameters.find(({ name }) => name === "blk.2.attn_q.weight")?.shape).toEqual([16, 12])
     expect(parameters.find(({ name }) => name === "blk.2.attn_v.weight")?.shape).toEqual([8, 12])
     expect(parameters.at(-1)).toEqual({ name: "output_norm.weight", shape: [12] })
-    expect(artifact.hiddenTaps.map(({ layer, shape }) => ({ layer, shape }))).toEqual([
-      { layer: 0, shape: ["Rows", 12] },
-      { layer: 3, shape: ["Rows", 12] },
-      { layer: 8, shape: ["Rows", 12] }
+    expect(artifact.hiddenTaps.map(({ name, shape }) => ({ name, shape }))).toEqual([
+      { name: "layers.0.hidden", shape: ["Rows", 12] },
+      { name: "layers.3.hidden", shape: ["Rows", 12] },
+      { name: "layers.8.hidden", shape: ["Rows", 12] }
     ])
     expect([artifact.tokenEmbedding.shape, artifact.lmHead.shape]).toEqual([[64, 12], [64, 12]])
     expect(artifact.maxDraftTokens).toBe(7)
@@ -311,7 +311,13 @@ it.effect("derives the reference checkpoint replay artifact", () =>
     const artifact = DFlash.artifact(config, [])
     expect(config.targetLayers).toEqual([2, 14, 26, 38, 50])
     expect(config.targetResidualTaps).toEqual([1, 13, 25, 37, 49])
-    expect(artifact.hiddenTaps.map(({ layer }) => layer)).toEqual([1, 13, 25, 37, 49])
+    expect(artifact.hiddenTaps.map(({ name }) => name)).toEqual([
+      "layers.1.hidden",
+      "layers.13.hidden",
+      "layers.25.hidden",
+      "layers.37.hidden",
+      "layers.49.hidden"
+    ])
     expect([artifact.tokenEmbedding.name, artifact.lmHead.name]).toEqual(["token_embd.weight", "output.weight"])
     expect(artifact.maxDraftTokens).toBe(15)
     expect(artifact.currentBlockAttention).toBe("Bidirectional")

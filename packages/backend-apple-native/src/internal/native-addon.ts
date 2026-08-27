@@ -271,7 +271,7 @@ export declare class NativeInferenceArtifact {
 /** Device-resident source for a generalized proposer stage binding. @internal */
 export interface NativeValueRef {
   kind: "PendingTokens" | "CandidatePrefix" | "CommittedHistory" | "TargetHidden" | "SharedBinding" | "StageOutput"
-  layer?: number
+  name?: string
   binding?: number
   stage?: number
   output?: number
@@ -289,7 +289,7 @@ export interface NativeProposerValueSchema {
 
 /** One target output root exported as an ephemeral hidden activation. @internal */
 export interface NativeTargetHiddenTap extends NativeProposerValueSchema {
-  layer: number
+  name: string
   output: number
 }
 

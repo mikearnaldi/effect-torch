@@ -6480,7 +6480,7 @@ struct InferencePrograms {
 #[derive(Clone)]
 pub struct NativeValueRef {
     pub kind: String,
-    pub layer: Option<u32>,
+    pub name: Option<String>,
     pub binding: Option<u32>,
     pub stage: Option<u32>,
     pub output: Option<u32>,
@@ -6498,7 +6498,7 @@ pub struct NativeProposerValueSchema {
 #[napi(object)]
 #[derive(Clone)]
 pub struct NativeTargetHiddenTap {
-    pub layer: u32,
+    pub name: String,
     pub output: u32,
     pub shape: Vec<u32>,
     pub dtype: NativeDType,
@@ -6700,15 +6700,18 @@ fn validate_plan_ref<'a>(
     let metadata = match reference.kind.as_str() {
         "PendingTokens" | "CandidatePrefix" | "CommittedHistory" => None,
         "TargetHidden" => {
-            let layer = reference
-                .layer
-                .ok_or_else(|| plan_error("TargetHidden route is missing layer"))?;
+            let name = reference
+                .name
+                .as_deref()
+                .ok_or_else(|| plan_error("TargetHidden route is missing name"))?;
             let tap = plan
                 .target_decode_taps
                 .iter()
-                .find(|tap| tap.layer == layer)
+                .find(|tap| tap.name == name)
                 .ok_or_else(|| {
-                    plan_error(format!("references undeclared target hidden layer {layer}"))
+                    plan_error(format!(
+                        "references undeclared target hidden exposure {name}"
+                    ))
                 })?;
             Some(NativeProposerValueSchema {
                 shape: tap.shape.clone(),
@@ -6756,7 +6759,7 @@ fn validate_plan_ref<'a>(
         }
         kind => return Err(plan_error(format!("has unknown ValueRef kind {kind}"))),
     };
-    if reference.kind != "TargetHidden" && reference.layer.is_some()
+    if reference.kind != "TargetHidden" && reference.name.is_some()
         || reference.kind != "SharedBinding" && reference.binding.is_some()
         || reference.kind != "StageOutput"
             && (reference.stage.is_some() || reference.output.is_some())
@@ -6847,12 +6850,12 @@ fn validate_and_retain_proposer_plan(
      -> Result<()> {
         let outputs = &executable.inner.executable.program.outputs;
         let values = &executable.inner.executable.program.values;
-        let mut layers = HashSet::new();
+        let mut names = HashSet::new();
         let mut roots = HashSet::new();
         for tap in taps {
-            if !layers.insert(tap.layer) || !roots.insert(tap.output) {
+            if !names.insert(tap.name.clone()) || !roots.insert(tap.output) {
                 return Err(plan_error(format!(
-                    "declares duplicate {label} hidden layer or output root"
+                    "declares duplicate {label} hidden exposure or output root"
                 )));
             }
             let physical_output = (tap.output as usize)
@@ -7123,15 +7126,16 @@ fn resolve_routed_value(
             .cloned()
             .ok_or_else(|| format!("route: {} is unbound", reference.kind))?,
         "TargetHidden" => {
-            let layer = reference
-                .layer
-                .ok_or_else(|| "route: target hidden layer is missing".to_string())?;
+            let name = reference
+                .name
+                .as_deref()
+                .ok_or_else(|| "route: target hidden name is missing".to_string())?;
             let tap = plan
                 .schema
                 .target_decode_taps
                 .iter()
-                .find(|tap| tap.layer == layer)
-                .ok_or_else(|| format!("route: target hidden layer {layer} is undeclared"))?;
+                .find(|tap| tap.name == name)
+                .ok_or_else(|| format!("route: target hidden exposure {name} is undeclared"))?;
             target_outputs
                 .get(
                     (tap.output as usize)
@@ -9667,7 +9671,7 @@ mod epilogue_tests {
     fn route(kind: &str) -> NativeValueRef {
         NativeValueRef {
             kind: kind.to_string(),
-            layer: None,
+            name: None,
             binding: None,
             stage: None,
             output: None,
@@ -9680,7 +9684,7 @@ mod epilogue_tests {
         NativeProposerPlan {
             target_prefill_taps: vec![],
             target_decode_taps: vec![NativeTargetHiddenTap {
-                layer: 7,
+                name: "layers.7.hidden".to_string(),
                 output: 1,
                 shape: vec![2, 3],
                 dtype: NativeDType::F32,
@@ -9725,7 +9729,7 @@ mod epilogue_tests {
     fn proposer_routes_preserve_metadata_and_reject_forward_references() {
         let plan = routing_plan();
         let mut hidden = route("TargetHidden");
-        hidden.layer = Some(7);
+        hidden.name = Some("layers.7.hidden".to_string());
         hidden.select_row = Some(true);
         let metadata = validate_plan_ref(&hidden, 0, &plan).unwrap().unwrap();
         assert_eq!(metadata.shape, vec![3]);
@@ -9759,7 +9763,7 @@ mod epilogue_tests {
         };
         plan.output.token_ids = NativeValueRef {
             kind: "StageOutput".to_string(),
-            layer: None,
+            name: None,
             binding: None,
             stage: Some(0),
             output: Some(0),
