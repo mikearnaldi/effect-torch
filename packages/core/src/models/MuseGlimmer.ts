@@ -206,12 +206,6 @@ const makeParameters = (config: Config): ReadonlyArray<Model.ParameterSpec> => {
   return specs
 }
 
-const rms = (
-  input: Tensor.Any,
-  epsilon: number,
-  scale?: Tensor.Any
-) => Tensor.rmsNorm(input, scale, epsilon)
-
 /**
  * Defines the load-only forward graph.
  *
@@ -282,9 +276,9 @@ const makeModel = (config: Config): Effect.Effect<Model.Model, Model.ModelError>
           })
         }
         let hidden = yield* Tensor.embedding(input, { weight: params[0] })
-        hidden = yield* rms(hidden, rmsEpsilon)
+        hidden = yield* Tensor.rmsNorm(hidden, undefined, rmsEpsilon)
         // S=1 is already heads-first after reshape; longer sequences need the
-        // sequence and head axes exchanged.
+        // sequence and head axes exchanged. mergeHeads is the exact inverse.
         const headsFirst = (value: Tensor.Any, heads: number, width: number) =>
           Effect.gen(function*() {
             if (sequence === 1) {
@@ -295,10 +289,20 @@ const makeModel = (config: Config): Effect.Effect<Model.Model, Model.ModelError>
               [0, 2, 1, 3]
             )
           })
+        const mergeHeads = (value: Tensor.Any) =>
+          Effect.gen(function*() {
+            if (sequence === 1) {
+              return yield* Tensor.reshape(value, [batch, sequence, attentionSize])
+            }
+            return yield* Tensor.reshape(
+              yield* Tensor.transpose(value, [0, 2, 1, 3]),
+              [batch, sequence, attentionSize]
+            )
+          })
 
         for (let layer = 0; layer < config.block_count; layer++) {
           const offset = 3 + layer * 14
-          const attentionInput = yield* rms(hidden, rmsEpsilon, params[offset])
+          const attentionInput = yield* Tensor.rmsNorm(hidden, params[offset], rmsEpsilon)
           let query = yield* headsFirst(
             yield* Tensor.linearRows(attentionInput, params[offset + 2]),
             queryHeads,
@@ -316,8 +320,8 @@ const makeModel = (config: Config): Effect.Effect<Model.Model, Model.ModelError>
           )
           const gate = yield* Tensor.linearRows(attentionInput, params[offset + 7])
 
-          query = yield* rms(query, rmsEpsilon, params[offset + 5])
-          key = yield* rms(key, rmsEpsilon, params[offset + 6])
+          query = yield* Tensor.rmsNorm(query, params[offset + 5], rmsEpsilon)
+          key = yield* Tensor.rmsNorm(key, params[offset + 6], rmsEpsilon)
           // Every Pth one-based layer is explicitly global/NoPE; all other
           // layers are explicitly local and use interleaved-pair RoPE.
           const local = (layer + 1) % slidingWindowPattern !== 0
@@ -335,29 +339,22 @@ const makeModel = (config: Config): Effect.Effect<Model.Model, Model.ModelError>
             causal: true,
             window: local ? config["attention.sliding_window"] : null
           })
-          if (sequence === 1) {
-            attention = yield* Tensor.reshape(attention, [batch, sequence, attentionSize])
-          } else {
-            attention = yield* Tensor.reshape(
-              yield* Tensor.transpose(attention, [0, 2, 1, 3]),
-              [batch, sequence, attentionSize]
-            )
-          }
+          attention = yield* mergeHeads(attention)
           attention = yield* Tensor.mul(attention, yield* Tensor.sigmoid(gate))
           attention = yield* Tensor.linearRows(attention, params[offset + 8])
-          hidden = yield* Tensor.add(hidden, yield* rms(attention, 1e-8, params[offset + 1]))
+          hidden = yield* Tensor.add(hidden, yield* Tensor.rmsNorm(attention, params[offset + 1], 1e-8))
 
-          const ffnInput = yield* rms(hidden, rmsEpsilon, params[offset + 9])
+          const ffnInput = yield* Tensor.rmsNorm(hidden, params[offset + 9], rmsEpsilon)
           let ffn = yield* Tensor.mul(
             yield* Tensor.silu(yield* Tensor.linearRows(ffnInput, params[offset + 11])),
             yield* Tensor.linearRows(ffnInput, params[offset + 12])
           )
           ffn = yield* Tensor.linearRows(ffn, params[offset + 13])
-          hidden = yield* Tensor.add(hidden, yield* rms(ffn, 1e-8, params[offset + 10]))
+          hidden = yield* Tensor.add(hidden, yield* Tensor.rmsNorm(ffn, params[offset + 10], 1e-8))
           hidden = yield* Tensor.expose(hidden, Model.hiddenExposure(layer))
         }
 
-        hidden = yield* rms(hidden, rmsEpsilon, params[1])
+        hidden = yield* Tensor.rmsNorm(hidden, params[1], rmsEpsilon)
         let logits = yield* Tensor.linearRows(hidden, params[2])
         logits = yield* Tensor.mul(logits, yield* Tensor.constantLike(logits, config.logit_scale))
         logits = yield* Tensor.div(logits, yield* Tensor.constantLike(logits, config.final_logit_softcapping))
