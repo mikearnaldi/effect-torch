@@ -618,6 +618,43 @@ onDevices("Inference", () => (it) => {
         yield* parallel.close()
       }))
 
+    it.effect("parallel target-sample matching is pathwise equal to ordinary seeded sampling", () =>
+      Effect.gen(function*() {
+        const { model, params, proposer } = yield* makeParallelFixture
+        const base = {
+          maxTokens: 128,
+          blockSize: 4,
+          prefillChunks: [4],
+          batchSize: 1,
+          sampling: { temperature: 0.8, topK: 8, topP: 0.9, seed: 0x5eed_1234n }
+        } as const
+        const ordinary = yield* (yield* Model.inference(model, params, base)).generation()
+        const parallelProgram = yield* Model.inference(model, params, {
+          ...base,
+          speculation: { proposer, maxDraftTokens: 2 }
+        })
+        const parallel = yield* parallelProgram.generation()
+        let ordinaryPage = (yield* ordinary.add([{ prompt: yield* ids([1, 2, 3, 4, 5, 6]) }]))[0]!
+        let parallelPage = (yield* parallel.add([{ prompt: yield* ids([1, 2, 3, 4, 5, 6]) }]))[0]!
+        expect(parallelPage.tokens).toEqual(ordinaryPage.tokens)
+
+        for (let round = 0; round < 8; round++) {
+          parallelPage = (yield* parallel.step([{ seq: parallelPage.seq }]))[0]!
+          const expected: Array<number> = []
+          while (expected.length < parallelPage.tokens.length) {
+            ordinaryPage = (yield* ordinary.step([{ seq: ordinaryPage.seq }]))[0]!
+            expected.push(...ordinaryPage.tokens)
+          }
+          expect(parallelPage.tokens).toEqual(expected)
+        }
+        expect(yield* parallelPage.seq.cursor()).toBe(yield* ordinaryPage.seq.cursor())
+        const diagnostics = yield* parallelProgram.diagnostics()
+        expect(diagnostics.proposedTokens).toBeGreaterThan(0n)
+        expect(diagnostics.acceptedTokens).toBeLessThan(diagnostics.proposedTokens)
+        yield* ordinary.close()
+        yield* parallel.close()
+      }))
+
     it.effect("history lookup is pathwise equal to ordinary seeded sampling", () =>
       Effect.gen(function*() {
         const model = yield* makeGpt()
@@ -1267,11 +1304,10 @@ onDevices("Inference", () => (it) => {
     it.effect("parallel speculation preserves the exact target distribution", () =>
       Effect.gen(function*() {
         // p = softmax(bias) is constant per position by construction; the
-        // draft's q varies but shares support. The emitted sequence must be
-        // an exact draw from p regardless of how rounds draft, accept, or
-        // resample — and identical seeds must replay identically.
+        // emitted sequence must be an exact draw from p whether the draft
+        // supplies a causal q or uses target-sample matching. Identical seeds
+        // must replay identically in both branches.
         const { model, params } = yield* makeConstantBiasModel
-        const proposer = parallelProposer(Model.hiddenExposure(0), true)
         const sampling = { temperature: 1, topK: 8, topP: 0.9, seed: 0x5eed_5eedn } as const
         const base = {
           maxTokens: 2048,
@@ -1281,30 +1317,6 @@ onDevices("Inference", () => (it) => {
           sampling
         } as const
         const samples = 600
-        const generate = Effect.gen(function*() {
-          const generation = yield* (yield* Model.inference(model, params, {
-            ...base,
-            speculation: { proposer, maxDraftTokens: 3 }
-          })).generation()
-          const tokens: Array<number> = []
-          let page = (yield* generation.add([{ prompt: yield* ids([1, 2, 3]) }]))[0]!
-          tokens.push(...page.tokens)
-          while (tokens.length < samples) {
-            page = (yield* generation.step([{ seq: page.seq }]))[0]!
-            tokens.push(...page.tokens)
-          }
-          yield* generation.close()
-          return tokens.slice(0, samples)
-        })
-        const first = yield* generate
-        const second = yield* generate
-        // Deterministic replay: identical seeds produce identical sequences.
-        expect(second).toEqual(first)
-
-        const histogram = new Array<number>(VOCAB).fill(0)
-        for (const token of first) {
-          histogram[token]! += 1
-        }
         // The engine's effective distribution: top-k truncate, temperature
         // softmax, top-p cutoff at cumulative >= topP of the pre-cutoff
         // total, renormalize. Replicated exactly from the sampler contract.
@@ -1332,14 +1344,40 @@ onDevices("Inference", () => (it) => {
         for (const { token, weight } of weights.slice(0, retained)) {
           effective[token] = weight / retainedTotal
         }
-        const chiSquare = effective.reduce((statistic, probability, token) => {
-          const expected = samples * probability
-          return probability === 0 ? statistic : statistic + (histogram[token]! - expected) ** 2 / expected
-        }, 0)
-        // 11 degrees of freedom; a correct sampler sits far below this bound
-        // (deterministic given the seed), while a misrouted or renormalized
-        // acceptance path blows past it systematically.
-        expect(chiSquare).toBeLessThan(60)
+
+        for (const withProbabilities of [false, true]) {
+          const proposer = parallelProposer(Model.hiddenExposure(0), withProbabilities)
+          const generate = Effect.gen(function*() {
+            const generation = yield* (yield* Model.inference(model, params, {
+              ...base,
+              speculation: { proposer, maxDraftTokens: 3 }
+            })).generation()
+            const tokens: Array<number> = []
+            let page = (yield* generation.add([{ prompt: yield* ids([1, 2, 3]) }]))[0]!
+            tokens.push(...page.tokens)
+            while (tokens.length < samples) {
+              page = (yield* generation.step([{ seq: page.seq }]))[0]!
+              tokens.push(...page.tokens)
+            }
+            yield* generation.close()
+            return tokens.slice(0, samples)
+          })
+          const first = yield* generate
+          const second = yield* generate
+          expect(second).toEqual(first)
+
+          const histogram = new Array<number>(VOCAB).fill(0)
+          for (const token of first) {
+            histogram[token]! += 1
+          }
+          const chiSquare = effective.reduce((statistic, probability, token) => {
+            const expected = samples * probability
+            return probability === 0 ? statistic : statistic + (histogram[token]! - expected) ** 2 / expected
+          }, 0)
+          // A correct sampler sits far below this loose deterministic bound;
+          // a misrouted or incorrectly normalized branch fails systematically.
+          expect(chiSquare).toBeLessThan(60)
+        }
       }))
 
     it.effect("compiles one replay prefill per chunk shape for parallel-block speculation", () =>

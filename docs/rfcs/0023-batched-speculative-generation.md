@@ -869,11 +869,11 @@ length, and concurrent sessions.
 
 **Status: In progress.** Structural plans, graph/checkpoint and target-value
 validation, multi-input/multi-output stage tracing, immutable stage compilation,
-direct CPU/Metal native value-routing primitives, and complete CPU/Metal
-`suffix-ngram-v1` history-lookup rounds are implemented. Native round
-orchestration for other generalized plans remains incomplete;
-`ParallelBlock`, `SequentialHead`, and tree verification are not yet executable
-generation strategies.
+direct CPU/Metal native value routing, complete `suffix-ngram-v1` history-lookup
+rounds, and fixed-block `ParallelBlock` generation are implemented on CPU and
+Metal. `ParallelBlock` covers target-sample matching, normalized-row rejection,
+target-feature replay, and transactional publication. `SequentialHead` and tree
+verification are not yet executable generation strategies.
 
 1. Add ephemeral native target hidden-tap routing and shared embedding/LM-head
    bindings declared by `ValueRef` and `TargetContract`.
