@@ -38,6 +38,9 @@
 //!   variants remain compiled for rollback and parity tests.
 //!   Threadgroup usage stays under 16 KB (8 KB for the half variants),
 //!   asserted at warm time.
+//! - packed causal verifier plans require decode-faithful arithmetic and
+//!   dispatch independent `et_quantized_linear` vector lanes instead of
+//!   the half-operand MMA path.
 //! - `et_quantized_embedding`: one threadgroup of 256 threads visits
 //!   only the selected packed rows; out-of-range indexes are skipped
 //!   and reported through a u32 status word (atomic store, relaxed).
@@ -69,6 +72,9 @@ pub struct LinearRequirements {
     pub encoded_row_bytes: usize,
     /// Whether an f32 `[rows]` bias participates.
     pub has_bias: bool,
+    /// Whether every vector must preserve the ordinary M=1 packed-dot
+    /// arithmetic used by exact speculative verification.
+    pub decode_faithful: bool,
     /// Bytes of the f32 output.
     pub output_bytes: usize,
     /// 1 when the problem is non-empty, 0 for zero-element outputs
@@ -224,6 +230,7 @@ pub fn linear_requirements(
         vectors,
         encoded_row_bytes,
         has_bias: bias.is_some(),
+        decode_faithful: false,
         output_bytes,
         pipeline_count: usize::from(output_elements != 0),
     })
@@ -249,6 +256,7 @@ pub fn grouped_linear_requirements(
             || member.columns != first.columns
             || member.vectors != first.vectors
             || member.encoded_row_bytes != first.encoded_row_bytes
+            || member.decode_faithful != first.decode_faithful
         {
             return Err(
                 "quantized_linear_group: members must share codec and exact input geometry"
@@ -2640,6 +2648,9 @@ fn cached_pipeline(
 /// candidates: serializing vectors inside each SIMD lane loses to both
 /// parallel qmv and M=8 MMA on Apple silicon.
 fn linear_kernel_kind(requirements: &LinearRequirements) -> KernelKind {
+    if requirements.decode_faithful {
+        return KernelKind::Linear;
+    }
     if requirements.vectors >= 32 && requirements.vectors % 32 == 0 {
         return KernelKind::LinearMma32SimpleHalf;
     }
@@ -3491,6 +3502,37 @@ mod tests {
                         );
                     }
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn decode_faithful_rows_select_independent_m1_arithmetic() {
+        for codec in [
+            GgmlKQuant::Q2K,
+            GgmlKQuant::Q3K,
+            GgmlKQuant::Q4K,
+            GgmlKQuant::Q5K,
+            GgmlKQuant::Q6K,
+        ] {
+            let columns = 512usize;
+            let rows = 5usize;
+            let encoded_row_bytes = codec.encoded_row_bytes(columns).unwrap();
+            for vectors in (2usize..=8).chain(std::iter::once(16)) {
+                let mut requirements = linear_requirements(
+                    &[vectors, columns],
+                    DType::F32,
+                    &[rows, encoded_row_bytes],
+                    DType::U8,
+                    None,
+                    &[vectors, rows],
+                    DType::F32,
+                    codec,
+                    [rows, columns],
+                )
+                .unwrap();
+                requirements.decode_faithful = true;
+                assert_eq!(linear_kernel_kind(&requirements), KernelKind::Linear);
             }
         }
     }
