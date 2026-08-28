@@ -3529,6 +3529,7 @@ mod tests {
         for (codec, vectors, rows, columns, block_bytes) in [
             (GgmlKQuant::Q3K, 32usize, 6656usize, 4096usize, 110usize),
             (GgmlKQuant::Q3K, 16usize, 6656usize, 4096usize, 110usize),
+            (GgmlKQuant::Q3K, 1, 6656, 4096, 110),
             (GgmlKQuant::Q3K, 2, 6656, 4096, 110),
             (GgmlKQuant::Q3K, 3, 6656, 4096, 110),
             (GgmlKQuant::Q3K, 4, 6656, 4096, 110),
@@ -3545,6 +3546,7 @@ mod tests {
             (GgmlKQuant::Q3K, 8, 6656, 19968, 110),
             (GgmlKQuant::Q2K, 32, 4096, 6656, 84),
             (GgmlKQuant::Q2K, 16, 4096, 6656, 84),
+            (GgmlKQuant::Q2K, 1, 4096, 6656, 84),
             (GgmlKQuant::Q2K, 2, 4096, 6656, 84),
             (GgmlKQuant::Q2K, 3, 4096, 6656, 84),
             (GgmlKQuant::Q2K, 4, 4096, 6656, 84),
