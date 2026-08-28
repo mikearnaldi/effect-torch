@@ -167,6 +167,7 @@ interface BenchRecord {
   readonly timestamp: string
   readonly engine: "effect" | "llama-bench" | "llama-cli" | "llama-speculative-simple"
   readonly mode: Mode
+  readonly caseId?: number | undefined
   readonly context: number
   readonly run: number
   readonly requestedTokens: number
@@ -451,6 +452,13 @@ const metadataInt = (metadata: ReadonlyMap<string, unknown>, key: string): numbe
   return value
 }
 
+const benchmarkCaseId = (config: Config, context: number, run: number): number => {
+  const configured = config.contexts.indexOf(context)
+  const external = config.llamaE2eContexts.indexOf(context)
+  const contextIndex = configured >= 0 ? configured : config.contexts.length + external
+  return contextIndex * (config.warmup + config.runs) + config.warmup + run
+}
+
 // ---------------------------------------------------------------------------
 // effect-torch suite
 // ---------------------------------------------------------------------------
@@ -510,6 +518,7 @@ const runEffectCase = (
         timestamp: new Date().toISOString(),
         engine: "effect" as const,
         mode: input.mode,
+        caseId: input.caseId,
         context: input.context,
         run: input.run,
         requestedTokens: config.maxNew,
@@ -553,7 +562,7 @@ const effectSuite = (
   records: Array<BenchRecord>
 ): Effect.Effect<void, unknown, Runtime.Runtime> =>
   Effect.gen(function*() {
-    let caseId = 0
+    let completedCases = 0
     const tokenizer = yield* Tokenizers.fromFile(config.tokenizerPath, {
       ...Tokenizers.strictConfig,
       specialTokens: "Always"
@@ -591,8 +600,9 @@ const effectSuite = (
       })
       const compileMs = performance.now() - compileStarted
       process.stderr.write(`compiled ${mode} inference: ${(compileMs / 1000).toFixed(2)}s\n`)
-      for (const context of config.contexts) {
-        if (caseId > 0 && config.cooldownMs > 0) {
+      for (const [contextIndex, context] of config.contexts.entries()) {
+        const caseBase = contextIndex * (config.warmup + config.runs)
+        if (completedCases > 0 && config.cooldownMs > 0) {
           yield* Effect.sleep(Duration.millis(config.cooldownMs))
         }
         for (let warmup = 0; warmup < config.warmup; warmup++) {
@@ -603,11 +613,12 @@ const effectSuite = (
             mode,
             context,
             run: -1 - warmup,
-            caseId: caseId++,
+            caseId: caseBase + warmup,
             loadMs,
             compileMs,
             config
           })
+          completedCases++
           process.stderr.write(`warmup ${warmup + 1}/${config.warmup} done: ${mode} context=${context}\n`)
           if (config.cooldownMs > 0) yield* Effect.sleep(Duration.millis(config.cooldownMs))
         }
@@ -619,12 +630,36 @@ const effectSuite = (
             mode,
             context,
             run,
-            caseId: caseId++,
+            caseId: caseBase + config.warmup + run,
             loadMs,
             compileMs,
             config
           })
           records.push(record)
+          completedCases++
+        }
+      }
+    }
+
+    if (config.modes.length === 2) {
+      const ordinary = new Map(
+        records
+          .filter((record) => record.engine === "effect" && record.mode === "ordinary" && record.run >= 0)
+          .map((record) => [record.caseId, record] as const)
+      )
+      for (const record of records) {
+        if (record.engine !== "effect" || record.mode !== "dflash" || record.run < 0) continue
+        const baseline = ordinary.get(record.caseId)
+        if (baseline === undefined) {
+          return yield* Effect.die(new Error(`missing ordinary pair for case ${record.caseId}`))
+        }
+        if (baseline.generatedTokens !== record.generatedTokens || baseline.outputHash !== record.outputHash) {
+          return yield* Effect.die(
+            new Error(
+              `case ${record.caseId} output mismatch: ordinary ${baseline.generatedTokens}/${baseline.outputHash}, ` +
+                `dflash ${record.generatedTokens}/${record.outputHash}`
+            )
+          )
         }
       }
     }
@@ -772,7 +807,8 @@ const runLlamaCliE2e = async (
 ): Promise<void> => {
   for (const context of config.llamaE2eContexts) {
     if (context !== config.llamaE2eContexts[0]) await cooldown(config)
-    const prompt = await Effect.runPromise(buildPrompt(tokenizer, config.seed, 100_000 + context, context))
+    const caseId = benchmarkCaseId(config, context, 0)
+    const prompt = await Effect.runPromise(buildPrompt(tokenizer, config.seed, caseId, context))
     const args = [
       "-m",
       config.modelPath,
@@ -826,6 +862,7 @@ const runLlamaCliE2e = async (
       timestamp: new Date().toISOString(),
       engine: "llama-cli",
       mode: "ordinary",
+      caseId,
       context,
       run: 0,
       requestedTokens: config.maxNew,
@@ -852,7 +889,8 @@ const runLlamaSpeculativeE2e = async (
 ): Promise<void> => {
   for (const context of config.llamaE2eContexts) {
     if (context !== config.llamaE2eContexts[0]) await cooldown(config)
-    const prompt = await Effect.runPromise(buildPrompt(tokenizer, config.seed, 200_000 + context, context))
+    const caseId = benchmarkCaseId(config, context, 0)
+    const prompt = await Effect.runPromise(buildPrompt(tokenizer, config.seed, caseId, context))
     const args = [
       "-m",
       config.modelPath,
@@ -891,6 +929,7 @@ const runLlamaSpeculativeE2e = async (
       timestamp: new Date().toISOString(),
       engine: "llama-speculative-simple",
       mode: "dflash",
+      caseId,
       context: promptTokens ?? context,
       run: 0,
       requestedTokens: config.maxNew,
