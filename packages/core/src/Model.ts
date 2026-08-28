@@ -1957,19 +1957,13 @@ interface InferencePrograms {
   }
 }
 
-/**
- * Packed verify widths compiled for a speculative plan: the widest width
- * (`maxDraftTokens + 1`). Narrower widths stay uncompiled while their kernel
- * plans are slower per token than the widest (see the body comment).
- */
+/** Packed verify widths compiled for a speculative plan, in ascending order. */
 const verifyWidths = (maxDraftTokens: number): ReadonlyArray<number> => {
   const widest = maxDraftTokens + 1
-  // Only the widest width pays today: the quantized linear kernels have no
-  // efficient small-row plans (on Q2_K a 4-row verify measures slower than
-  // an 8-row one), so narrowing costs more than it saves. The runtime's
-  // acceptance-driven width selection and the per-width replay pairing are
-  // built and tested; widening this set (e.g. powers of two up to widest) is
-  // a one-line change once narrow-width kernels are competitive.
+  // M=8 and M=16 have dedicated Metal MMA paths. With a 15-token DFlash
+  // block, keep both so the runtime can widen only for high-acceptance
+  // sessions; non-aligned narrow widths remain slower than M=8.
+  if (widest === 16) return [8, 16]
   return [widest]
 }
 

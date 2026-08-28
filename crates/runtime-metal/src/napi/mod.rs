@@ -2132,18 +2132,29 @@ struct PoolInner {
 }
 
 impl PoolInner {
-    fn ref_block(&self, block: u32) -> err::Res<()> {
+    fn ref_blocks(&self, blocks: &[u32]) -> err::Res<()> {
         let mut store = self
             .blocks
             .lock()
             .map_err(|error| format!("kv block store lock poisoned: {error}"))?;
-        let count = store
-            .refcounts
-            .get_mut(block as usize)
-            .ok_or_else(|| "kv block reference is out of range".to_string())?;
-        *count = count
-            .checked_add(1)
-            .ok_or_else(|| "kv block reference count exhausted".to_string())?;
+        for (index, &block) in blocks.iter().enumerate() {
+            let result = store
+                .refcounts
+                .get_mut(block as usize)
+                .ok_or_else(|| "kv block reference is out of range".to_string())
+                .and_then(|count| {
+                    *count = count
+                        .checked_add(1)
+                        .ok_or_else(|| "kv block reference count exhausted".to_string())?;
+                    Ok(())
+                });
+            if let Err(error) = result {
+                for &retained in &blocks[..index] {
+                    store.unref(retained);
+                }
+                return Err(error);
+            }
+        }
         Ok(())
     }
 
@@ -2199,6 +2210,14 @@ impl PoolInner {
     fn unref_block(&self, block: u32) {
         if let Ok(mut store) = self.blocks.lock() {
             store.unref(block);
+        }
+    }
+
+    fn unref_blocks(&self, blocks: &[u32]) {
+        if let Ok(mut store) = self.blocks.lock() {
+            for &block in blocks {
+                store.unref(block);
+            }
         }
     }
 
@@ -2431,6 +2450,7 @@ pub(crate) struct KvContext {
     /// Explicit absolute position for each packed graph row.
     packed_positions: Option<Vec<usize>>,
     publish_hashes: bool,
+    state_only: bool,
 }
 
 impl MetalDecodeContext for KvContext {
@@ -2820,6 +2840,9 @@ pub(crate) fn kv_attention_into(
         advances,
         paged::IntoResources::empty(),
     )?;
+    if kv.state_only {
+        return Ok(());
+    }
     let attend = if mode == KvAttentionMode::BidirectionalBlock {
         paged::attention_block_into
     } else {
@@ -4137,36 +4160,22 @@ impl ShadowSequences {
             let state = state
                 .lock()
                 .map_err(|error| format!("speculative state lock poisoned: {error}"))?;
-            let mut retained = Vec::with_capacity(state.blocks.len());
-            for &block in &state.blocks {
-                if let Err(error) = shadow.pool.ref_block(block) {
-                    for block in retained {
-                        shadow.pool.unref_block(block);
-                    }
-                    return Err(error);
-                }
-                retained.push(block);
-            }
+            shadow.pool.ref_blocks(&state.blocks)?;
+            let retained = state.blocks.clone();
             let mut provisional = match sequence_state(&shadow.pool, false) {
                 Ok(provisional) => provisional,
                 Err(error) => {
-                    for block in retained {
-                        shadow.pool.unref_block(block);
-                    }
+                    shadow.pool.unref_blocks(&retained);
                     return Err(error);
                 }
             };
             if shadow.pool.kda.layers > 0 || shadow.pool.conv.layers > 0 {
                 let snapshot = RecurrentSnapshot::capture(&state).ok_or_else(|| {
-                    for &block in &retained {
-                        shadow.pool.unref_block(block);
-                    }
+                    shadow.pool.unref_blocks(&retained);
                     "speculative recurrent state cannot be copied".to_string()
                 })?;
                 if let Err(error) = snapshot.restore_into(&mut provisional) {
-                    for block in retained {
-                        shadow.pool.unref_block(block);
-                    }
+                    shadow.pool.unref_blocks(&retained);
                     return Err(error);
                 }
             }
@@ -4201,12 +4210,12 @@ impl ShadowSequences {
 
 impl Drop for ShadowSequences {
     fn drop(&mut self) {
+        let mut blocks = Vec::new();
         for state in &self.states {
             let mut state = state.lock().unwrap_or_else(|error| error.into_inner());
-            for block in state.blocks.drain(..) {
-                self.pool.unref_block(block);
-            }
+            blocks.append(&mut state.blocks);
         }
+        self.pool.unref_blocks(&blocks);
     }
 }
 
@@ -4477,6 +4486,7 @@ fn speculative_invocation(
         packed_rows,
         packed_positions,
         publish_hashes: false,
+        state_only: false,
     };
     Ok((context, input))
 }
@@ -4540,6 +4550,7 @@ fn stateful_invocation(
     request_indices: &[usize],
     lanes: &[usize],
     tokens: Vec<Vec<u32>>,
+    state_only: bool,
 ) -> err::Res<KvContext> {
     let states = request_indices
         .iter()
@@ -4560,6 +4571,7 @@ fn stateful_invocation(
         packed_rows: None,
         packed_positions: None,
         publish_hashes: false,
+        state_only,
     })
 }
 
@@ -4574,8 +4586,9 @@ fn run_stateful_values(
     bindings: &[value::Value],
     tokens: Vec<Vec<u32>>,
     cancelled: &effect_torch_runtime::CancellationFlag,
+    state_only: bool,
 ) -> err::Res<Vec<value::Value>> {
-    let context = stateful_invocation(schema, shadow, request_indices, lanes, tokens)?;
+    let context = stateful_invocation(schema, shadow, request_indices, lanes, tokens, state_only)?;
     executable::execute_stateful(
         executable,
         bindings,
@@ -4601,8 +4614,9 @@ fn run_stateful_values_deferred(
     tokens: Vec<Vec<u32>>,
     cancelled: &effect_torch_runtime::CancellationFlag,
     submission: &device::MetalSubmissionGuard<'_>,
+    state_only: bool,
 ) -> err::Res<executable::PendingExecution> {
-    let context = stateful_invocation(schema, shadow, request_indices, lanes, tokens)?;
+    let context = stateful_invocation(schema, shadow, request_indices, lanes, tokens, state_only)?;
     executable::execute_stateful_deferred(
         executable,
         bindings,
@@ -4636,6 +4650,7 @@ fn replay_outputs(
         &bindings,
         tokens,
         cancelled,
+        true,
     )?;
     Ok(())
 }
@@ -4682,6 +4697,7 @@ fn replay_outputs_deferred(
         tokens,
         cancelled,
         submission,
+        true,
     )
 }
 
@@ -4856,24 +4872,105 @@ fn read_u32_tensor(value: &value::Value) -> err::Res<Vec<u32>> {
         .collect())
 }
 
-fn sample_greedy_verification_rows(
+fn sample_verification_rows(
     outputs: &[value::Value],
     packed: &PackedVerificationPlan,
     sampling: &[SamplingOptions],
+    sequence_ids: &[u64],
+    positions: &[u64],
     cancelled: &effect_torch_runtime::CancellationFlag,
-) -> err::Res<Option<(Vec<usize>, Vec<u32>)>> {
-    if !sampling.iter().all(|options| options.temperature == 0.0) {
-        return Ok(None);
+) -> err::Res<(Vec<usize>, Vec<u32>)> {
+    if sampling.iter().all(|options| options.temperature == 0.0) {
+        let result = crate::sampling::sample_greedy_rows(outputs[0].as_metal()?)?;
+        device::MetalDevice::get().synchronize_buffer(&result.buffer)?;
+        if cancelled.is_cancelled() {
+            return Err("parallel greedy sampling was cancelled".to_string());
+        }
+        let values = result.buffer.contents_ptr().cast::<u32>();
+        let rows = result.numel() / 2;
+        let mut tokens = Vec::with_capacity(rows);
+        for row in 0..rows {
+            let status = unsafe { *values.add(row * 2) };
+            let token = unsafe { *values.add(row * 2 + 1) };
+            if status == crate::sampling::STATUS_NONFINITE {
+                return Err(format!("sample: logit {token} is not finite"));
+            }
+            if status != crate::sampling::STATUS_OK {
+                return Err(format!(
+                    "sample: GPU sampler returned unknown status {status}"
+                ));
+            }
+            tokens.push(token);
+        }
+        return Ok((packed.row_offsets.clone(), tokens));
     }
-    let result = crate::sampling::sample_greedy_rows(outputs[0].as_metal()?)?;
+
+    let logits = outputs[0].as_metal()?;
+    if !logits.layout.is_contiguous() || logits.layout.rank() < 2 {
+        return Err("parallel target logits must be contiguous with rank at least two".to_string());
+    }
+    let vocabulary = *logits
+        .layout
+        .shape()
+        .last()
+        .ok_or_else(|| "parallel target logits shape is empty".to_string())?;
+    let rows = logits.numel() / vocabulary;
+    if rows != packed.row_to_request.len()
+        || sampling.len() != sequence_ids.len()
+        || sampling.len() != positions.len()
+    {
+        return Err("parallel target sampling geometry is inconsistent".to_string());
+    }
+    let result_elements = rows
+        .checked_mul(2)
+        .ok_or_else(|| "parallel target sampling result size overflows".to_string())?;
+    let result = runtime::metal::run::MetalTensor {
+        buffer: device::MetalDevice::get().alloc_raw_checked(
+            crate::sampling::required_result_allocation_bytes(result_elements)?,
+        )?,
+        layout: runtime::layout::Layout::contiguous(vec![result_elements]),
+        dtype: DType::U32,
+    };
+    for (row, request) in packed.row_to_request.iter().enumerate() {
+        let Some(request) = request else {
+            continue;
+        };
+        let candidate_index = row - packed.row_offsets[*request];
+        let options = SamplingOptions {
+            seed: coordinate_seed(
+                sampling[*request].seed,
+                sequence_ids[*request],
+                positions[*request] + candidate_index as u64,
+                SamplingPurpose::Target,
+                0,
+            ),
+            counter: 0,
+            ..sampling[*request]
+        };
+        let row_logits = runtime::metal::run::MetalTensor {
+            buffer: logits.buffer.clone(),
+            layout: runtime::layout::Layout::new(
+                vec![vocabulary],
+                vec![1],
+                logits.layout.offset() + row * vocabulary,
+            ),
+            dtype: logits.dtype,
+        };
+        if candidate_index == 0 {
+            crate::sampling::warm_exact(&row_logits, options)?;
+        }
+        crate::sampling::sample_into(&row_logits, &result, row * 2, options)?;
+    }
     device::MetalDevice::get().synchronize_buffer(&result.buffer)?;
     if cancelled.is_cancelled() {
-        return Err("parallel greedy sampling was cancelled".to_string());
+        return Err("parallel target sampling was cancelled".to_string());
     }
     let values = result.buffer.contents_ptr().cast::<u32>();
-    let rows = result.numel() / 2;
-    let mut tokens = Vec::with_capacity(rows);
-    for row in 0..rows {
+    let mut tokens = vec![0; rows];
+    for (row, request) in packed.row_to_request.iter().enumerate() {
+        if request.is_none() {
+            continue;
+        }
         let status = unsafe { *values.add(row * 2) };
         let token = unsafe { *values.add(row * 2 + 1) };
         if status == crate::sampling::STATUS_NONFINITE {
@@ -4884,9 +4981,9 @@ fn sample_greedy_verification_rows(
                 "sample: GPU sampler returned unknown status {status}"
             ));
         }
-        tokens.push(token);
+        tokens[row] = token;
     }
-    Ok(Some((packed.row_offsets.clone(), tokens)))
+    Ok((packed.row_offsets.clone(), tokens))
 }
 
 fn run_prefill_program(
@@ -5055,6 +5152,7 @@ fn run_sampled_program(
         packed_rows: None,
         packed_positions: None,
         publish_hashes: false,
+        state_only: false,
     };
     executable::execute_stateful_sampled(
         &program.executable,
@@ -5352,6 +5450,7 @@ fn execute_parallel_blocking(
             &bindings,
             proposal_tokens,
             cancelled,
+            false,
         )?;
         if proposal_outputs.len() == 2 {
             let tensor = contiguous_f32_tensor(
@@ -5434,16 +5533,23 @@ fn execute_parallel_blocking(
         false,
     )?;
     stats.verification_nanos = verify_started.elapsed().as_nanos().max(1) as u64;
+    let target_samples = if draft_probabilities.is_none() {
+        Some(sample_verification_rows(
+            &outputs,
+            &packed,
+            sampling,
+            sequence_ids,
+            positions,
+            cancelled,
+        )?)
+    } else {
+        None
+    };
     let target_logits = if draft_probabilities.is_some() {
         Some(contiguous_f32_tensor(
             &outputs[0],
             "ParallelBlock target logits",
         )?)
-    } else {
-        None
-    };
-    let greedy_samples = if draft_probabilities.is_none() {
-        sample_greedy_verification_rows(&outputs, &packed, sampling, cancelled)?
     } else {
         None
     };
@@ -5453,11 +5559,6 @@ fn execute_parallel_blocking(
         let mut rejected = false;
         let mut accepted = 0;
         for (candidate_index, &candidate) in candidates[lane].iter().enumerate() {
-            let (matrix, _) = executable::route_leading_row(
-                &outputs[0],
-                packed.row_offsets[lane] + candidate_index,
-            )?;
-            let (logits, _) = executable::route_leading_row(&matrix, 0)?;
             let sampled = if let Some(proposal_probabilities) = &draft_probabilities {
                 let target_start = (packed.row_offsets[lane] + candidate_index) * target.vocabulary;
                 let target_values = f32_values(
@@ -5509,9 +5610,14 @@ fn execute_parallel_blocking(
                         0,
                     )
                 }
-            } else if let Some((offsets, tokens)) = &greedy_samples {
+            } else if let Some((offsets, tokens)) = &target_samples {
                 tokens[offsets[lane] + candidate_index]
             } else {
+                let (matrix, _) = executable::route_leading_row(
+                    &outputs[0],
+                    packed.row_offsets[lane] + candidate_index,
+                )?;
+                let (logits, _) = executable::route_leading_row(&matrix, 0)?;
                 sample_blocking(
                     &logits,
                     SamplingOptions {
@@ -5540,9 +5646,6 @@ fn execute_parallel_blocking(
         }
         if !rejected {
             let bonus = candidates[lane].len();
-            let (matrix, _) =
-                executable::route_leading_row(&outputs[0], packed.row_offsets[lane] + bonus)?;
-            let (logits, _) = executable::route_leading_row(&matrix, 0)?;
             page.push(if draft_probabilities.is_some() {
                 let target_start = (packed.row_offsets[lane] + bonus) * target.vocabulary;
                 let target_values = f32_values(
@@ -5568,9 +5671,12 @@ fn execute_parallel_blocking(
                     SamplingPurpose::Target,
                     0,
                 )
-            } else if let Some((offsets, tokens)) = &greedy_samples {
+            } else if let Some((offsets, tokens)) = &target_samples {
                 tokens[offsets[lane] + bonus]
             } else {
+                let (matrix, _) =
+                    executable::route_leading_row(&outputs[0], packed.row_offsets[lane] + bonus)?;
+                let (logits, _) = executable::route_leading_row(&matrix, 0)?;
                 sample_blocking(
                     &logits,
                     SamplingOptions {
@@ -7989,15 +8095,14 @@ struct InferenceSessionState {
 /// while the chain-acceptance probability of reaching it clears that ratio.
 const MARGINAL_ROW_ACCEPTANCE: f64 = 0.2;
 
-/// Deterministic adaptive verify width: an optimistic full-width start, then
-/// the widest width whose marginal draft rows clear the cumulative
+/// Deterministic adaptive verify width: start on the efficient M=8 arm, then
+/// use the widest width whose marginal draft rows clear the cumulative
 /// acceptance rate. Deterministic given the session's token stream.
 fn select_verify_rows(proposed: u64, accepted: u64, max_rows: usize) -> usize {
-    let acceptance = if proposed == 0 {
-        1.0
-    } else {
-        accepted as f64 / proposed as f64
-    };
+    if proposed == 0 {
+        return max_rows.min(8);
+    }
+    let acceptance = accepted as f64 / proposed as f64;
     let mut rows = 2;
     while rows < max_rows && acceptance.powi((rows - 1) as i32) >= MARGINAL_ROW_ACCEPTANCE {
         rows += 1;
@@ -9129,6 +9234,7 @@ impl Executable {
             packed_rows: None,
             packed_positions: None,
             publish_hashes: true,
+            state_only: false,
         });
         // Lock every sequence in address order; overlapping batches
         // acquire the same locks in the same order, so no deadlock.
@@ -9947,6 +10053,14 @@ mod epilogue_tests {
             purpose_counter(base + 3, SamplingPurpose::Residual, 0),
             purpose_counter(base + 3, SamplingPurpose::Target, 0)
         );
+    }
+
+    #[test]
+    fn adaptive_verification_starts_at_eight_and_widens_for_acceptance() {
+        assert_eq!(select_verify_rows(0, 0, 16), 8);
+        assert_eq!(select_verify_rows(0, 0, 4), 4);
+        assert_eq!(select_verify_rows(100, 95, 16), 16);
+        assert!(select_verify_rows(100, 50, 16) < 8);
     }
 
     #[test]
@@ -11062,6 +11176,7 @@ mod epilogue_tests {
             packed_rows: None,
             packed_positions: None,
             publish_hashes: true,
+            state_only: false,
         };
         let staging = [[1, 2].as_slice(), &[1], &[1], &[1], &[1]]
             .into_iter()
@@ -11149,6 +11264,7 @@ mod epilogue_tests {
             ]),
             packed_positions: Some(vec![4, 5, 6, 9, 0, 0, 0, 0]),
             publish_hashes: false,
+            state_only: false,
         };
         assert_eq!(
             context.position_offsets().unwrap(),
@@ -11225,6 +11341,7 @@ mod epilogue_tests {
             packed_rows: None,
             packed_positions: None,
             publish_hashes: true,
+            state_only: false,
         };
         let staging = [[1, 4].as_slice(), &[1], &[1], &[1], &[1]]
             .into_iter()
@@ -11292,6 +11409,7 @@ mod epilogue_tests {
             packed_rows: None,
             packed_positions: None,
             publish_hashes: true,
+            state_only: false,
         };
         let staging = [[8, 2].as_slice(), &[8], &[8], &[8], &[8]]
             .into_iter()
@@ -11372,6 +11490,7 @@ mod epilogue_tests {
             packed_rows: None,
             packed_positions: None,
             publish_hashes: true,
+            state_only: false,
         };
         let output = executable::execute_stateful(
             &program.inner.executable,
@@ -11485,6 +11604,7 @@ mod epilogue_tests {
             packed_rows: None,
             packed_positions: None,
             publish_hashes: true,
+            state_only: false,
         };
         let output = executable::execute_stateful(
             &program.inner.executable,
@@ -11566,6 +11686,7 @@ mod epilogue_tests {
             packed_rows: None,
             packed_positions: None,
             publish_hashes: true,
+            state_only: false,
         };
         let output = executable::execute_stateful(
             &program.inner.executable,
@@ -11873,6 +11994,7 @@ mod epilogue_tests {
             packed_rows: None,
             packed_positions: None,
             publish_hashes: true,
+            state_only: false,
         };
         let mut state = sequence.state.lock().unwrap();
         let needed = (state.cursor + tokens.len()).div_ceil(pool.inner.block_size);
@@ -11928,6 +12050,7 @@ mod epilogue_tests {
             packed_rows: None,
             packed_positions: None,
             publish_hashes: true,
+            state_only: false,
         };
         let mut states = context
             .slots

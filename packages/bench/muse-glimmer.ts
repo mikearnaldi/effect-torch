@@ -180,6 +180,8 @@ interface BenchRecord {
   readonly decodeTokPerSec?: number | undefined
   readonly roundP50Ms?: number | undefined
   readonly roundP95Ms?: number | undefined
+  readonly draftMs?: number | undefined
+  readonly verificationMs?: number | undefined
   readonly acceptedTokens?: number | undefined
   readonly proposedTokens?: number | undefined
   readonly acceptanceRate?: number | undefined
@@ -527,7 +529,9 @@ const runEffectCase = (
             proposedTokens: proposed,
             acceptanceRate: proposed > 0 ? accepted / proposed : undefined,
             speculativeRounds,
-            ordinaryRounds
+            ordinaryRounds,
+            draftMs: Number(after.draftNanos - before.draftNanos) / 1e6,
+            verificationMs: Number(after.verificationNanos - before.verificationNanos) / 1e6
           }
           : {}),
         targetPoolHighWaterBlocks: Number(after.targetPoolHighWaterBlocks),
@@ -958,6 +962,14 @@ const fixed = (value: number | undefined, digits: number, width: number): string
 
 const printRow = (record: BenchRecord): void => {
   const acceptance = record.acceptanceRate === undefined ? "-" : `${(record.acceptanceRate * 100).toFixed(1)}%`
+  const draftPerRound = record.draftMs === undefined || record.speculativeRounds === undefined
+      || record.speculativeRounds === 0
+    ? undefined
+    : record.draftMs / record.speculativeRounds
+  const verifyPerRound = record.verificationMs === undefined || record.speculativeRounds === undefined
+      || record.speculativeRounds === 0
+    ? undefined
+    : record.verificationMs / record.speculativeRounds
   const ordinary = record.mode === "dflash" && record.ordinaryRounds !== undefined && record.ordinaryRounds > 0
     ? ` ordinaryRounds=${record.ordinaryRounds}`
     : ""
@@ -966,9 +978,9 @@ const printRow = (record: BenchRecord): void => {
       `run=${String(record.run).padStart(2)} gen=${String(record.generatedTokens ?? "-").padStart(4)} ` +
       `prefill=${fixed(record.prefillMs, 1, 9)} ms decode=${fixed(record.decodeMs, 1, 9)} ms ` +
       `e2e=${fixed(record.e2eMs, 1, 9)} ms tok/s=${fixed(record.decodeTokPerSec, 2, 7)} ` +
-      `p50=${fixed(record.roundP50Ms, 2, 7)} ms p95=${
-        fixed(record.roundP95Ms, 2, 7)
-      } ms accept=${acceptance}${ordinary}\n`
+      `p50=${fixed(record.roundP50Ms, 2, 7)} ms p95=${fixed(record.roundP95Ms, 2, 7)} ms draft=${
+        fixed(draftPerRound, 2, 7)
+      } ms verify=${fixed(verifyPerRound, 2, 7)} ms accept=${acceptance}${ordinary}\n`
   )
 }
 
@@ -998,9 +1010,24 @@ const printSummary = (records: ReadonlyArray<BenchRecord>): void => {
     const prefill = median(group.flatMap((record) => record.prefillTokPerSec ?? []))
     const decode = median(group.flatMap((record) => record.decodeTokPerSec ?? []))
     const acceptance = median(group.flatMap((record) => record.acceptanceRate ?? []))
+    const draft = median(
+      group.flatMap((record) =>
+        record.draftMs === undefined || record.speculativeRounds === undefined || record.speculativeRounds === 0
+          ? []
+          : record.draftMs / record.speculativeRounds
+      )
+    )
+    const verify = median(
+      group.flatMap((record) =>
+        record.verificationMs === undefined || record.speculativeRounds === undefined || record.speculativeRounds === 0
+          ? []
+          : record.verificationMs / record.speculativeRounds
+      )
+    )
     process.stdout.write(
       `${first.engine.padEnd(24)} ${first.mode.padEnd(8)} ctx=${String(first.context).padStart(4)} ` +
         `prefill=${fixed(prefill, 2, 8)} tok/s decode=${fixed(decode, 2, 8)} tok/s ` +
+        `draft=${fixed(draft, 2, 7)} ms verify=${fixed(verify, 2, 7)} ms ` +
         `accept=${acceptance === undefined ? "-" : `${(acceptance * 100).toFixed(1)}%`}\n`
     )
   }

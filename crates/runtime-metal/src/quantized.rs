@@ -487,7 +487,7 @@ fn pipeline_key(kind: KernelKind, codec: GgmlKQuant, index_dtype: Option<DType>)
     use std::hash::{Hash, Hasher};
 
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    "effect_torch_quantized_k_v2".hash(&mut hasher);
+    "effect_torch_quantized_k_v6".hash(&mut hasher);
     match kind {
         KernelKind::Linear => 0u8.hash(&mut hasher),
         KernelKind::LinearBatched(vector_lanes) => {
@@ -704,13 +704,12 @@ inline void et_decode_k16(device const uchar* block, uint group, P destination, 
 #endif
 }
 
-// Specialized 16-value group decode for the half MMA path. Q2_K/Q3_K
-// load the 16 quant bytes with wide loads (Q2_K's qs field is 4-byte
-// aligned in every block; Q3_K's fields are only 2-byte aligned, so
-// ushort pairs), unpack the 2-bit fields SIMD-in-register, and convert
-// through the half magic constant (0x6400 | v encodes 1024 + v
-// exactly). The f32 scale arithmetic and the single rounding to half
-// match et_decode_k16 bit for bit; other codecs fall back to it.
+// Specialized 16-value group decode for the half MMA path. Q2_K/Q4_K/Q5_K
+// load aligned uints; Q3_K/Q6_K fields are only 2-byte aligned, so they
+// load ushort pairs. Packed fields are unpacked SIMD-in-register and converted
+// through the half magic constant (0x6400 | v encodes 1024 + v exactly).
+// The f32 scale arithmetic and single rounding to half match et_decode_k16
+// bit for bit.
 inline void et_decode_k16_half(device const uchar* block, uint group, thread half* destination) {
 #if ET_CODEC == 2
     const uint half_index = group / 8;
@@ -761,6 +760,79 @@ inline void et_decode_k16_half(device const uchar* block, uint group, thread hal
         const half2 even = as_type<half2>(lo);
         const half2 odd = as_type<half2>(hi);
         const half4 unpacked = half4(even.x, odd.x, even.y, odd.y) - half4(1028.0h);
+        const float4 values = float4(unpacked) * scale;
+        *reinterpret_cast<thread half4*>(destination + 4 * word) = half4(values);
+    }
+#elif ET_CODEC == 4 || ET_CODEC == 5
+    const uint scale_group = group / 2;
+    const uint index_offset = (group % 2) * 16;
+    const uint pair = scale_group / 2;
+    const uint side = scale_group % 2;
+    uint packed_scale;
+    uint minimum;
+    if (scale_group < 4) {
+        packed_scale = uint(block[4 + scale_group] & 63);
+        minimum = uint(block[8 + scale_group] & 63);
+    } else {
+        packed_scale = uint(block[8 + scale_group] & 15) | (uint(block[scale_group]) >> 6) << 4;
+        minimum = uint(block[8 + scale_group] >> 4) | (uint(block[4 + scale_group]) >> 6) << 4;
+    }
+    const float scale = et_fp16_at(block, 0) * float(packed_scale);
+    const float offset = et_fp16_at(block, 2) * float(minimum);
+#if ET_CODEC == 4
+    device const uint* quants = reinterpret_cast<device const uint*>(
+        block + 16 + pair * 32 + index_offset);
+#else
+    device const uint* quants = reinterpret_cast<device const uint*>(
+        block + 48 + pair * 32 + index_offset);
+    device const uint* high_bits = reinterpret_cast<device const uint*>(block + 16 + index_offset);
+#endif
+    uint4 u;
+    for (uint word = 0; word < 4; ++word) {
+        const uint low = side == 0
+            ? quants[word] & 0x0F0F0F0Fu
+            : (quants[word] >> 4) & 0x0F0F0F0Fu;
+#if ET_CODEC == 4
+        u[word] = low;
+#else
+        u[word] = low | (((high_bits[word] >> (pair * 2 + side)) & 0x01010101u) << 4);
+#endif
+    }
+    for (uint word = 0; word < 4; ++word) {
+        const uint lo = (u[word] & 0x00FF00FFu) | 0x64006400u;
+        const uint hi = ((u[word] >> 8) & 0x00FF00FFu) | 0x64006400u;
+        const half2 even = as_type<half2>(lo);
+        const half2 odd = as_type<half2>(hi);
+        const half4 unpacked = half4(even.x, odd.x, even.y, odd.y) - half4(1024.0h);
+        const float4 values = float4(unpacked) * scale - offset;
+        *reinterpret_cast<thread half4*>(destination + 4 * word) = half4(values);
+    }
+#elif ET_CODEC == 6
+    const uint half_index = group / 8;
+    const uint within = group % 8;
+    const uint quarter = within / 2;
+    const uint index_offset = (within % 2) * 16;
+    const uint low_offset = half_index * 64 + index_offset + ((quarter & 1) == 0 ? 0 : 32);
+    const uint low_shift = quarter < 2 ? 0 : 4;
+    const uint high_shift = quarter * 2;
+    const float scale = et_fp16_at(block, 208) * float(et_signed_byte(block[192 + group]));
+    device const ushort* lows = reinterpret_cast<device const ushort*>(block + low_offset);
+    device const ushort* highs = reinterpret_cast<device const ushort*>(
+        block + 128 + half_index * 32 + index_offset);
+    uint4 low;
+    uint4 high;
+    for (uint word = 0; word < 4; ++word) {
+        low[word] = uint(lows[2 * word]) | (uint(lows[2 * word + 1]) << 16);
+        high[word] = uint(highs[2 * word]) | (uint(highs[2 * word + 1]) << 16);
+    }
+    const uint4 u = ((low >> low_shift) & uint4(0x0F0F0F0Fu))
+        | (((high >> high_shift) & uint4(0x03030303u)) << 4);
+    for (uint word = 0; word < 4; ++word) {
+        const uint lo = (u[word] & 0x00FF00FFu) | 0x64006400u;
+        const uint hi = ((u[word] >> 8) & 0x00FF00FFu) | 0x64006400u;
+        const half2 even = as_type<half2>(lo);
+        const half2 odd = as_type<half2>(hi);
+        const half4 unpacked = half4(even.x, odd.x, even.y, odd.y) - half4(1056.0h);
         const float4 values = float4(unpacked) * scale;
         *reinterpret_cast<thread half4*>(destination + 4 * word) = half4(values);
     }
@@ -1571,11 +1643,10 @@ kernel void et_quantized_linear_mma(
 /// once per K tile, A/B operands are `simdgroup_half8x8`, and
 /// accumulation stays in `simdgroup_float8x8`. Each threadgroup covers
 /// ET_TILE_N rows (32 by default, 64 in the wide geometry) x ET_TILE_M
-/// vectors over a 2048-element K tile; every simdgroup owns the full
-/// output tile over one quarter of the tile's K blocks (K-split), so
-/// each 8x8 threadgroup block is loaded once per K tile instead of
-/// once per output quadrant pair, and the four partial reductions are
-/// folded through threadgroup memory after the K loop. Decode runs
+/// vectors over a 2048-element K tile. The production M=8/M=16 paths
+/// partition complete output blocks among simdgroups and avoid a final
+/// reduction; M=32 and rollback variants split K four ways and fold the
+/// partials through threadgroup memory after the K loop. Decode runs
 /// into registers before the tile barrier so it overlaps the previous
 /// tile's MMA. Tiles use the interleaved 8x8-block layout (64
 /// contiguous halves per block, ld=8 loads, no transposes) and stay
@@ -1586,6 +1657,7 @@ const MMA_LINEAR_HALF_SOURCE: &str = r#"
 #define ET_TILE_M $TILE_M
 #define ET_TILE_N $TILE_N
 #define ET_SWIZZLE $SWIZZLE
+#define ET_OUTPUT_SPLIT $OUTPUT_SPLIT
 
 kernel void et_quantized_linear_mma_half(
     device const float* input [[buffer(0)]],
@@ -1602,10 +1674,8 @@ kernel void et_quantized_linear_mma_half(
     ushort simd_group [[simdgroup_index_in_threadgroup]]) {
     constexpr uint tile_m = ET_TILE_M;
     constexpr uint tile_n = ET_TILE_N;
-    // Q2_K/Q3_K can decode groups in shift-adjacent pairs (chunks c
-    // and c + 2 share their 16 quant bytes) over a doubled K tile;
-    // measured neutral against the unpaired 2048-element footprint,
-    // so it stays available for probes but off by default.
+    // The paired Q2_K/Q3_K decoder is retained as reference code but stays
+    // disabled: enabling it does not preserve nonzero-weight parity.
     constexpr bool pair_decode = false;
     constexpr uint tile_k = 2048 / tile_n;
     constexpr uint k_blocks = tile_k / 8;
@@ -1652,12 +1722,19 @@ kernel void et_quantized_linear_mma_half(
     const ulong first_vector = ulong(group.y) * tile_m;
     const ulong first_row = ulong(group.x) * tile_n;
 #endif
+#if ET_OUTPUT_SPLIT
+    simdgroup_float8x8 output_accumulators[a_count];
+    for (uint j = 0; j < a_count; ++j) {
+        output_accumulators[j] = simdgroup_float8x8(0.0f);
+    }
+#else
     simdgroup_float8x8 accumulators[a_count][b_count];
     for (uint i = 0; i < a_count; ++i) {
         for (uint j = 0; j < b_count; ++j) {
             accumulators[i][j] = simdgroup_float8x8(0.0f);
         }
     }
+#endif
 
     // Per-round decode coordinates (loop-invariant): item =
     // tid + round * 128 covers the tile_n x decode_units grid. In the
@@ -1755,6 +1832,26 @@ kernel void et_quantized_linear_mma_half(
             }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
+#if ET_OUTPUT_SPLIT
+        // Each simdgroup owns `a_count` output blocks across full K.
+        // This rereads threadgroup tiles but needs no split-K reduction.
+        const uint output_i = uint(simd_group) * a_count / 4;
+        const uint output_j = uint(simd_group) * a_count % b_count;
+        for (uint kb = 0; kb < k_blocks; ++kb) {
+            simdgroup_half8x8 a;
+            simdgroup_load(a, it + (output_i * k_blocks + kb) * 64, 8);
+            for (uint j = 0; j < a_count; ++j) {
+                simdgroup_half8x8 b;
+                simdgroup_load(b, wt + ((output_j + j) * k_blocks + kb) * 64, 8);
+                simdgroup_multiply_accumulate(
+                    output_accumulators[j],
+                    a,
+                    b,
+                    output_accumulators[j]
+                );
+            }
+        }
+#else
         // K-split MMA: simdgroup s reduces K blocks s, s + 4, ... over
         // the full output tile; 2x the MACs per threadgroup load of
         // the output-quadrant split.
@@ -1778,9 +1875,22 @@ kernel void et_quantized_linear_mma_half(
                 }
             }
         }
+#endif
     }
 
     threadgroup_barrier(mem_flags::mem_threadgroup);
+#if ET_OUTPUT_SPLIT
+    const uint output_i = uint(simd_group) * a_count / 4;
+    const uint output_j = uint(simd_group) * a_count % b_count;
+    for (uint j = 0; j < a_count; ++j) {
+        simdgroup_store(
+            output_accumulators[j],
+            &st[(output_i * 8) * tile_n + (output_j + j) * 8],
+            tile_n
+        );
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+#else
     // Fold the four K-quarter partial reductions into st: each
     // simdgroup adds its accumulators onto the running sum in turn.
     for (uint turn = 0; turn < 4; ++turn) {
@@ -1804,6 +1914,7 @@ kernel void et_quantized_linear_mma_half(
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
+#endif
     for (uint element = tid; element < tile_n * tile_m; element += 128) {
         const uint vector_offset = element / tile_n;
         const uint row_offset = element % tile_n;
@@ -2151,6 +2262,17 @@ fn source(kind: KernelKind, codec: GgmlKQuant, index_dtype: Option<DType>) -> St
     source = source.replace(
         "$SWIZZLE",
         if matches!(kind, KernelKind::LinearMma32SwzHalf) {
+            "1"
+        } else {
+            "0"
+        },
+    );
+    source = source.replace(
+        "$OUTPUT_SPLIT",
+        if matches!(
+            kind,
+            KernelKind::LinearMmaSimpleHalf | KernelKind::LinearMma8SimpleHalf
+        ) {
             "1"
         } else {
             "0"
@@ -3352,6 +3474,24 @@ mod tests {
                 KernelKind::LinearMma8Simple,
                 KernelKind::LinearMma8SimpleHalf,
             ),
+            (
+                GgmlKQuant::Q4K,
+                8,
+                19,
+                768,
+                144,
+                KernelKind::LinearMma8Simple,
+                KernelKind::LinearMma8SimpleHalf,
+            ),
+            (
+                GgmlKQuant::Q5K,
+                8,
+                35,
+                768,
+                176,
+                KernelKind::LinearMma8Simple,
+                KernelKind::LinearMma8SimpleHalf,
+            ),
         ] {
             let encoded_row_bytes = columns / 256 * block_bytes;
             let requirements = linear_requirements(
@@ -3377,8 +3517,10 @@ mod tests {
                 match codec {
                     GgmlKQuant::Q2K => block[80..84].copy_from_slice(&[0x00, 0x3c, 0x00, 0x38]),
                     GgmlKQuant::Q3K => block[108..110].copy_from_slice(&[0x00, 0x3c]),
+                    GgmlKQuant::Q4K | GgmlKQuant::Q5K => {
+                        block[..4].copy_from_slice(&[0x00, 0x38, 0x00, 0x34])
+                    }
                     GgmlKQuant::Q6K => block[208..210].copy_from_slice(&[0x00, 0x38]),
-                    _ => unreachable!(),
                 }
             }
             let input_values = (0..vectors * columns)
@@ -3555,9 +3697,17 @@ mod tests {
             (GgmlKQuant::Q3K, 32usize, 6656usize, 4096usize, 110usize),
             (GgmlKQuant::Q3K, 32, 19968, 6656, 110),
             (GgmlKQuant::Q3K, 16, 19968, 6656, 110),
+            (GgmlKQuant::Q3K, 8, 6656, 4096, 110),
+            (GgmlKQuant::Q3K, 8, 19968, 6656, 110),
+            (GgmlKQuant::Q3K, 8, 6656, 19968, 110),
             (GgmlKQuant::Q2K, 32, 4096, 6656, 84),
             (GgmlKQuant::Q2K, 32, 19968, 6656, 84),
             (GgmlKQuant::Q2K, 16, 19968, 6656, 84),
+            (GgmlKQuant::Q2K, 8, 4096, 6656, 84),
+            (GgmlKQuant::Q2K, 8, 19968, 6656, 84),
+            (GgmlKQuant::Q4K, 8, 6656, 4096, 144),
+            (GgmlKQuant::Q5K, 8, 6656, 6656, 176),
+            (GgmlKQuant::Q6K, 8, 202048, 6656, 210),
         ] {
             let encoded_row_bytes = columns / 256 * block_bytes;
             let requirements = linear_requirements(
@@ -3590,13 +3740,32 @@ mod tests {
                 KernelKind::LinearMma8SimpleHalf => (32, 8),
                 _ => unreachable!("probe shapes select simple half kinds"),
             };
-            let variants: [(&str, &str, u64, Box<dyn FnOnce(String) -> String>); 14] = [
+            let variants: [(&str, &str, u64, Box<dyn FnOnce(String) -> String>); 15] = [
                 // Default production source (current selection).
                 (
                     "current",
                     "et_quantized_linear_mma_half",
                     128,
                     Box::new(|src| src),
+                ),
+                // Rollback geometry for selected output-partition kernels.
+                (
+                    "k-split",
+                    "et_quantized_linear_mma_half",
+                    128,
+                    Box::new(|src| {
+                        src.replace("#define ET_OUTPUT_SPLIT 1", "#define ET_OUTPUT_SPLIT 0")
+                    }),
+                ),
+                // Assign complete output blocks to simdgroups and remove
+                // the four-way split-K reduction.
+                (
+                    "output-split",
+                    "et_quantized_linear_mma_half",
+                    128,
+                    Box::new(|src| {
+                        src.replace("#define ET_OUTPUT_SPLIT 0", "#define ET_OUTPUT_SPLIT 1")
+                    }),
                 ),
                 // Warp-specialized double-buffered twin, 256 threads.
                 (
@@ -3611,18 +3780,6 @@ mod tests {
                     "et_quantized_linear_mma_half_ws",
                     256,
                     Box::new(|src| src.replace("#define ET_TILE_N 32", "#define ET_TILE_N 64")),
-                ),
-                // Paired decode (chunk c and c + 2 share quant bytes).
-                (
-                    "paired",
-                    "et_quantized_linear_mma_half",
-                    128,
-                    Box::new(|src| {
-                        src.replace(
-                            "constexpr bool pair_decode = false;",
-                            "constexpr bool pair_decode = ET_CODEC == 2 || ET_CODEC == 3;",
-                        )
-                    }),
                 ),
                 // Generic per-byte decode (pre-optimization).
                 (
