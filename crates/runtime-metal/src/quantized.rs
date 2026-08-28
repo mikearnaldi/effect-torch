@@ -22,8 +22,12 @@
 //! - `et_quantized_linear`: threadgroups of 64 threads (2 simdgroups),
 //!   each simdgroup producing `rows_per_simd(codec)` output rows
 //!   (Q2K/Q4K/Q6K: 2, Q3K: 3, Q5K: 1). Partial dots fold with
-//!   `simd_sum` (decode) or a short `simd_shuffle_xor` tree (batched
-//!   multi-vector variants, `ET_VECTOR_LANES` ∈ {1, 2, 4}).
+//!   `simd_sum` (decode) or a short `simd_shuffle_xor` tree (legacy
+//!   batched multi-vector variants, `ET_VECTOR_LANES` ∈ {1, 2, 4}).
+//! - `LinearDirect`: exact Q2_K/Q3_K candidate for 2–8 input vectors.
+//!   One simdgroup owns one output row and reuses each packed fragment
+//!   across a compile-time vector tile while retaining M=1 f32
+//!   arithmetic, accumulation order, and `simd_sum` for every vector.
 //! - `et_quantized_linear_mma`: prefill path for `vectors ≥ 8` and
 //!   large weights — blocks decoded to threadgroup memory via
 //!   `et_decode_k16`, then 8×8 simdgroup matrix multiply-accumulate.
@@ -456,6 +460,7 @@ fn validate_embedding(
 enum KernelKind {
     Linear,
     LinearBatched(u8),
+    LinearDirect(u8),
     LinearGrouped(u8),
     LinearMma,
     LinearMmaSimple,
@@ -493,6 +498,10 @@ fn pipeline_key(kind: KernelKind, codec: GgmlKQuant, index_dtype: Option<DType>)
         KernelKind::LinearBatched(vector_lanes) => {
             2u8.hash(&mut hasher);
             vector_lanes.hash(&mut hasher);
+        }
+        KernelKind::LinearDirect(vectors) => {
+            18u8.hash(&mut hasher);
+            vectors.hash(&mut hasher);
         }
         KernelKind::LinearGrouped(vector_lanes) => {
             9u8.hash(&mut hasher);
@@ -1407,6 +1416,249 @@ kernel void et_quantized_linear(
 }
 "#;
 
+// Q2_K/Q3_K small-row verifier path. The lane decomposition, block stride,
+// expressions, and simd_sum reduction intentionally mirror the one-vector
+// packed-dot body above. Only the loop nesting changes: packed fields are
+// loaded before the compile-time vector-tile loop and reused within that tile.
+const LINEAR_DIRECT_SOURCE: &str = r#"
+#define ET_DIRECT_VECTORS $DIRECT_VECTORS
+#define ET_DIRECT_TILE $DIRECT_TILE
+
+inline void et_quantized_linear_direct_body(
+    device const float* input,
+    device const uchar* weight,
+    device const float* bias,
+    device float* output,
+    const ulong vectors,
+    const ulong rows,
+    const ulong columns,
+    const ulong encoded_row_bytes,
+    const uint has_bias,
+    const uint group_x,
+    const uint group_y,
+    const ushort lane,
+    const ushort simd_group) {
+    const ulong first_row =
+        (ulong(group_x) * ET_SIMD_GROUPS + ulong(simd_group)) * ET_ROWS_PER_SIMD;
+    const ulong first_vector = ulong(group_y) * ET_DIRECT_TILE;
+    if (first_row >= rows || first_vector >= vectors || vectors != ET_DIRECT_VECTORS) {
+        return;
+    }
+    const ushort active_vectors = ushort(min(ulong(ET_DIRECT_TILE), vectors - first_vector));
+    const ulong blocks = columns / ET_BLOCK_VALUES;
+    float sums[ET_ROWS_PER_SIMD][ET_DIRECT_TILE] = { 0.0f };
+
+#if ET_CODEC == 2
+    const ushort ix = lane / 8;
+    const ushort it = lane % 8;
+    const ushort iq = it / 4;
+    const ushort ir = it % 4;
+    const ushort scale_offset = ir / 2;
+    const uint packed_blocks = uint(blocks);
+    for (uint block_index = ix; block_index < packed_blocks; block_index += 4) {
+        ET_UNROLL for (ushort row_offset = 0;
+                       row_offset < ET_ROWS_PER_SIMD && first_row + row_offset < rows;
+                       ++row_offset) {
+            device const et_block_q2_k* block = reinterpret_cast<device const et_block_q2_k*>(
+                weight + (first_row + row_offset) * encoded_row_bytes + block_index * ET_BLOCK_BYTES);
+            device const uchar* scales = block->scales + 8 * iq + scale_offset;
+            device const ushort* quants =
+                reinterpret_cast<device const ushort*>(block->qs) + 16 * iq + 4 * ir;
+            const uchar4 packed_scales = uchar4(scales[0], scales[2], scales[4], scales[6]);
+            const ushort4 packed_quants = ushort4(quants[0], quants[1], quants[2], quants[3]);
+            const float d = float(block->d);
+            const float dmin = float(block->dmin) / 16.0f;
+            ET_UNROLL for (ushort vector = 0; vector < ET_DIRECT_TILE; ++vector) {
+                if (vector >= active_vectors) {
+                    continue;
+                }
+                device const float* y4 = input + (first_vector + ulong(vector)) * columns +
+                    ulong(block_index) * ET_BLOCK_VALUES + 128ul * iq + 8ul * ir;
+                float values[32];
+                float4 input_sums = 0.0f;
+                ET_UNROLL for (ushort i = 0; i < 8; ++i) {
+                    values[i] = y4[i];
+                    values[i + 8] = y4[i + 32];
+                    values[i + 16] = y4[i + 64];
+                    values[i + 24] = y4[i + 96];
+                    input_sums += float4(values[i], values[i + 8], values[i + 16], values[i + 24]);
+                }
+                float4 low = 0.0f;
+                float4 high = 0.0f;
+                ET_UNROLL for (ushort i = 0; i < 8; i += 2) {
+                    const ushort q = packed_quants[i / 2];
+                    low[0] += values[i] * (q & 0x0003);
+                    high[0] += values[i + 1] * (q & 0x0300);
+                    low[1] += values[i + 8] * (q & 0x000c);
+                    high[1] += values[i + 9] * (q & 0x0c00);
+                    low[2] += values[i + 16] * (q & 0x0030);
+                    high[2] += values[i + 17] * (q & 0x3000);
+                    low[3] += values[i + 24] * (q & 0x00c0);
+                    high[3] += values[i + 25] * (q & 0xc000);
+                }
+                sums[row_offset][vector] += d * (
+                    (low[0] + high[0] / 256.0f) * (packed_scales[0] & 0x0f) +
+                    (low[1] + high[1] / 256.0f) * (packed_scales[1] & 0x0f) / 4.0f +
+                    (low[2] + high[2] / 256.0f) * (packed_scales[2] & 0x0f) / 16.0f +
+                    (low[3] + high[3] / 256.0f) * (packed_scales[3] & 0x0f) / 64.0f) -
+                    dmin * (input_sums[0] * (packed_scales[0] & 0xf0) +
+                            input_sums[1] * (packed_scales[1] & 0xf0) +
+                            input_sums[2] * (packed_scales[2] & 0xf0) +
+                            input_sums[3] * (packed_scales[3] & 0xf0));
+            }
+        }
+    }
+#elif ET_CODEC == 3
+    const ushort tid = (lane % 4) + 4 * (lane / 16);
+    const ushort ix = (lane % 16) / 4;
+    const ushort ip = tid / 4;
+    const ushort il = 2 * ((tid % 4) / 2);
+    const ushort ir = tid % 2;
+    const ushort l0 = 8 * ir;
+    const ushort4 high_masks[4] = {
+        ushort4(0x0001, 0x0100, 0x0002, 0x0200),
+        ushort4(0x0004, 0x0400, 0x0008, 0x0800),
+        ushort4(0x0010, 0x1000, 0x0020, 0x2000),
+        ushort4(0x0040, 0x4000, 0x0080, 0x8000)
+    };
+    const int4 quant_masks[2] = {
+        int4(0x0003, 0x0300, 0x000c, 0x0c00),
+        int4(0x0030, 0x3000, 0x00c0, 0xc000)
+    };
+    const ushort4 hm = high_masks[2 * ip + il / 2];
+    const ushort scale_shift_low = 4 * ip;
+    const ushort scale_shift_high = scale_shift_low + il;
+    const ushort quant_offset = 32 * ip + l0;
+    const ushort input_offset = 128 * ip + 32 * il + l0;
+    const float absent_low = il == 0 ? 4.0f : 64.0f;
+    const float absent_high = 4.0f * absent_low;
+    float sums_high[ET_ROWS_PER_SIMD][ET_DIRECT_TILE] = { 0.0f };
+    const uint packed_blocks = uint(blocks);
+    for (uint block_index = ix; block_index < packed_blocks; block_index += 4) {
+        ET_UNROLL for (ushort row_offset = 0;
+                       row_offset < ET_ROWS_PER_SIMD && first_row + row_offset < rows;
+                       ++row_offset) {
+            device const et_block_q3_k* block = reinterpret_cast<device const et_block_q3_k*>(
+                weight + (first_row + row_offset) * encoded_row_bytes + block_index * ET_BLOCK_BYTES);
+            device const ushort* quants = reinterpret_cast<device const ushort*>(block->qs + quant_offset);
+            device const ushort* high = reinterpret_cast<device const ushort*>(block->hmask + l0);
+            const ushort4 quants_low = ushort4(quants[0], quants[1], quants[2], quants[3]);
+            const ushort4 quants_high = ushort4(quants[8], quants[9], quants[10], quants[11]);
+            const ushort4 high_low = ushort4(high[0], high[1], high[2], high[3]);
+            const ushort4 high_high = ushort4(high[8], high[9], high[10], high[11]);
+            device const ushort* packed_scales = reinterpret_cast<device const ushort*>(block->scales);
+            uint packed;
+            uint scale_high;
+            thread ushort* packed16 = reinterpret_cast<thread ushort*>(&packed);
+            thread const char* scales = reinterpret_cast<thread const char*>(&packed);
+            packed16[0] = packed_scales[4];
+            packed16[1] = packed_scales[5];
+            scale_high = ((packed >> scale_shift_high) << 4) & 0x30303030;
+            packed16[0] = packed_scales[il];
+            packed16[1] = packed_scales[il + 1];
+            packed = ((packed >> scale_shift_low) & 0x0f0f0f0f) | scale_high;
+            const char4 block_scales = char4(scales[0], scales[1], scales[2], scales[3]);
+            const float d = float(block->d);
+            ET_UNROLL for (ushort vector = 0; vector < ET_DIRECT_TILE; ++vector) {
+                if (vector >= active_vectors) {
+                    continue;
+                }
+                device const float* y1 = input + (first_vector + ulong(vector)) * columns +
+                    ulong(block_index) * ET_BLOCK_VALUES + input_offset;
+                float values[32];
+                ET_UNROLL for (ushort i = 0; i < 8; ++i) {
+                    values[i] = y1[i];
+                    values[i + 8] = y1[i + 16];
+                    values[i + 16] = y1[i + 32];
+                    values[i + 24] = y1[i + 48];
+                }
+                float a0 = 0.0f, a1 = 0.0f, absent0 = 0.0f;
+                float a2 = 0.0f, a3 = 0.0f, absent1 = 0.0f;
+                ET_UNROLL for (ushort i = 0; i < 8; i += 2) {
+                    const int q = quants_low[i / 2];
+                    const ushort h = high_low[i / 2];
+                    const float4 dotted = float4(values[i], values[i + 1], values[i + 16], values[i + 17]) *
+                        float4(q & quant_masks[il / 2][0], q & quant_masks[il / 2][1],
+                               q & quant_masks[il / 2][2], q & quant_masks[il / 2][3]);
+                    a0 += dotted[0];
+                    a1 += dotted[1];
+                    a2 += dotted[2];
+                    a3 += dotted[3];
+                    absent0 += (h & hm[0] ? 0.0f : values[i]) +
+                               (h & hm[1] ? 0.0f : values[i + 1]);
+                    absent1 += (h & hm[2] ? 0.0f : values[i + 16]) +
+                               (h & hm[3] ? 0.0f : values[i + 17]);
+                }
+                float dot_low = d * (a0 + a1 / 256.0f - absent0 * absent_low);
+                float dot_high = d * (a2 + a3 / 256.0f - absent1 * absent_high);
+                sums[row_offset][vector] += dot_low * (block_scales[0] - 32);
+                sums_high[row_offset][vector] += dot_high * (block_scales[2] - 32);
+
+                a0 = a1 = absent0 = a2 = a3 = absent1 = 0.0f;
+                ET_UNROLL for (ushort i = 0; i < 8; i += 2) {
+                    const int q = quants_high[i / 2];
+                    const ushort h = high_high[i / 2];
+                    a0 += values[i + 8] * (q & quant_masks[il / 2][0]);
+                    a1 += values[i + 9] * (q & quant_masks[il / 2][1]);
+                    absent0 += (h & hm[0] ? 0.0f : values[i + 8]) +
+                               (h & hm[1] ? 0.0f : values[i + 9]);
+                    a2 += values[i + 24] * (q & quant_masks[il / 2][2]);
+                    a3 += values[i + 25] * (q & quant_masks[il / 2][3]);
+                    absent1 += (h & hm[2] ? 0.0f : values[i + 24]) +
+                               (h & hm[3] ? 0.0f : values[i + 25]);
+                }
+                dot_low = d * (a0 + a1 / 256.0f - absent0 * absent_low);
+                dot_high = d * (a2 + a3 / 256.0f - absent1 * absent_high);
+                sums[row_offset][vector] += dot_low * (block_scales[1] - 32);
+                sums_high[row_offset][vector] += dot_high * (block_scales[3] - 32);
+            }
+        }
+    }
+    ET_UNROLL for (ushort row_offset = 0; row_offset < ET_ROWS_PER_SIMD; ++row_offset) {
+        ET_UNROLL for (ushort vector = 0; vector < ET_DIRECT_TILE; ++vector) {
+            sums[row_offset][vector] =
+                (sums[row_offset][vector] + 0.25f * sums_high[row_offset][vector]) /
+                float(1 << (2 * il));
+        }
+    }
+#else
+#error et_quantized_linear_direct only supports Q2_K and Q3_K
+#endif
+
+    ET_UNROLL for (ushort row_offset = 0;
+                   row_offset < ET_ROWS_PER_SIMD && first_row + row_offset < rows;
+                   ++row_offset) {
+        ET_UNROLL for (ushort vector = 0; vector < ET_DIRECT_TILE; ++vector) {
+            float sum = simd_sum(sums[row_offset][vector]);
+            if (lane == 0 && vector < active_vectors) {
+                const ulong row = first_row + row_offset;
+                output[(first_vector + ulong(vector)) * rows + row] =
+                    sum + (has_bias != 0 ? bias[row] : 0.0f);
+            }
+        }
+    }
+}
+
+kernel void et_quantized_linear_direct(
+    device const float* input [[buffer(0)]],
+    device const uchar* weight [[buffer(1)]],
+    device const float* bias [[buffer(2)]],
+    device float* output [[buffer(3)]],
+    constant ulong& vectors [[buffer(4)]],
+    constant ulong& rows [[buffer(5)]],
+    constant ulong& columns [[buffer(6)]],
+    constant ulong& encoded_row_bytes [[buffer(7)]],
+    constant uint& has_bias [[buffer(8)]],
+    uint2 group [[threadgroup_position_in_grid]],
+    ushort lane [[thread_index_in_simdgroup]],
+    ushort simd_group [[simdgroup_index_in_threadgroup]]) {
+    et_quantized_linear_direct_body(
+        input, weight, bias, output, vectors, rows, columns, encoded_row_bytes,
+        has_bias, group.x, group.y, lane, simd_group
+    );
+}
+"#;
+
 /// Grouped decode projection: 2–4 members share one input and codec.
 /// `group.z` selects the member; each member binds its own packed
 /// weight and output and reads its own row count. Bias-free only
@@ -2157,6 +2409,13 @@ kernel void et_quantized_embedding(
 fn source(kind: KernelKind, codec: GgmlKQuant, index_dtype: Option<DType>) -> String {
     let kernel = match kind {
         KernelKind::Linear | KernelKind::LinearBatched(_) => LINEAR_SOURCE.to_string(),
+        KernelKind::LinearDirect(_) => {
+            let mut direct =
+                String::with_capacity(LINEAR_SOURCE.len() + LINEAR_DIRECT_SOURCE.len());
+            direct.push_str(LINEAR_SOURCE);
+            direct.push_str(LINEAR_DIRECT_SOURCE);
+            direct
+        }
         KernelKind::LinearGrouped(_) => {
             let mut grouped =
                 String::with_capacity(LINEAR_SOURCE.len() + LINEAR_GROUPED_SOURCE.len());
@@ -2184,7 +2443,12 @@ fn source(kind: KernelKind, codec: GgmlKQuant, index_dtype: Option<DType>) -> St
     source.push_str(&kernel);
     source = source.replace("$CODEC", &codec_tag(codec).to_string());
     source = source.replace("$BLOCK_BYTES", &block_bytes(codec).to_string());
-    source = source.replace("$ROWS_PER_SIMD", &rows_per_simd(codec).to_string());
+    let source_rows_per_simd = if matches!(kind, KernelKind::LinearDirect(_)) {
+        1
+    } else {
+        rows_per_simd(codec)
+    };
+    source = source.replace("$ROWS_PER_SIMD", &source_rows_per_simd.to_string());
     let vector_lanes = match kind {
         KernelKind::LinearBatched(vector_lanes) | KernelKind::LinearGrouped(vector_lanes) => {
             vector_lanes
@@ -2203,9 +2467,23 @@ fn source(kind: KernelKind, codec: GgmlKQuant, index_dtype: Option<DType>) -> St
         | KernelKind::LinearMma8Half
         | KernelKind::LinearMma8SimpleHalf
         | KernelKind::LinearMma32SwzHalf
+        | KernelKind::LinearDirect(_)
         | KernelKind::Embedding => 1,
     };
     source = source.replace("$VECTOR_LANES", &vector_lanes.to_string());
+    if let KernelKind::LinearDirect(vectors) = kind {
+        source = source.replace("$DIRECT_VECTORS", &vectors.to_string());
+        source = source.replace(
+            "$DIRECT_TILE",
+            &usize::from(vectors)
+                .min(match codec {
+                    GgmlKQuant::Q2K => 4,
+                    GgmlKQuant::Q3K => 2,
+                    _ => unreachable!("direct row reuse only supports Q2_K/Q3_K"),
+                })
+                .to_string(),
+        );
+    }
     source = source.replace(
         "$PIPELINED",
         if matches!(
@@ -2298,6 +2576,7 @@ fn pipeline(
 ) -> Result<crate::device::Pipeline, String> {
     let name = match kind {
         KernelKind::Linear | KernelKind::LinearBatched(_) => "et_quantized_linear",
+        KernelKind::LinearDirect(_) => "et_quantized_linear_direct",
         KernelKind::LinearGrouped(_) => "et_quantized_linear_grouped",
         KernelKind::LinearMma
         | KernelKind::LinearMmaSimple
@@ -2335,6 +2614,7 @@ fn cached_pipeline(
                 match kind {
                     KernelKind::Linear => "linear",
                     KernelKind::LinearBatched(_) => "linear_batched",
+                    KernelKind::LinearDirect(_) => "linear_direct",
                     KernelKind::LinearGrouped(_) => "linear_grouped",
                     KernelKind::LinearMma => "linear_mma",
                     KernelKind::LinearMmaSimple => "linear_mma_simple",
@@ -2355,13 +2635,10 @@ fn cached_pipeline(
         })
 }
 
-/// Selects the exact MMA tile for 8/16/32-vector batches. The default
-/// MMA variants use half A/B operands with f32 accumulation (matching
-/// the llama.cpp K-quant `mul_mm` scheme) in the 32-row tile geometry,
-/// which measures fastest across codecs on Apple silicon; the 64-row
-/// half geometry and the f32-operand `LinearMma*` variants remain
-/// available for rollback and parity tests. Smaller batches use the
-/// existing packed-dot kernels.
+/// Selects the measured production kernel. Direct f32-faithful
+/// Q2_K/Q3_K row-reuse variants remain explicit parity/profiling
+/// candidates: serializing vectors inside each SIMD lane loses to both
+/// parallel qmv and M=8 MMA on Apple silicon.
 fn linear_kernel_kind(requirements: &LinearRequirements) -> KernelKind {
     if requirements.vectors >= 32 && requirements.vectors % 32 == 0 {
         return KernelKind::LinearMma32SimpleHalf;
@@ -2656,6 +2933,7 @@ fn encode_linear(
         | KernelKind::LinearMma32SimpleHalf
         | KernelKind::LinearMma8SimpleHalf
         | KernelKind::LinearMma32SwzHalf => (requirements.rows.div_ceil(32), 128),
+        KernelKind::LinearDirect(_) => (requirements.rows.div_ceil(2), 64),
         _ => (requirements.rows.div_ceil(rows_per_threadgroup), 64),
     };
     let vector_groups = match kernel_kind {
@@ -2674,6 +2952,15 @@ fn encode_linear(
         | KernelKind::LinearMma8SimpleHalf => requirements.vectors.div_ceil(8),
         KernelKind::LinearBatched(vector_lanes) => {
             requirements.vectors.div_ceil(usize::from(vector_lanes))
+        }
+        KernelKind::LinearDirect(vectors) => {
+            requirements
+                .vectors
+                .div_ceil(usize::from(vectors).min(match requirements.codec {
+                    GgmlKQuant::Q2K => 4,
+                    GgmlKQuant::Q3K => 2,
+                    _ => unreachable!("direct row reuse only supports Q2_K/Q3_K"),
+                }))
         }
         KernelKind::Linear | KernelKind::Embedding => requirements.vectors,
         KernelKind::LinearGrouped(_) => {
@@ -2848,6 +3135,10 @@ mod tests {
         assert_ne!(
             pipeline_key(KernelKind::LinearBatched(4), GgmlKQuant::Q2K, None),
             pipeline_key(KernelKind::LinearMma, GgmlKQuant::Q2K, None)
+        );
+        assert_ne!(
+            pipeline_key(KernelKind::LinearDirect(2), GgmlKQuant::Q2K, None),
+            pipeline_key(KernelKind::LinearDirect(8), GgmlKQuant::Q2K, None)
         );
         assert_ne!(
             pipeline_key(KernelKind::Linear, GgmlKQuant::Q4K, None),
@@ -3091,6 +3382,120 @@ mod tests {
     }
 
     #[test]
+    fn q2_q3_direct_rows_match_sequential_decode_bitwise() {
+        let device = MetalDevice::get();
+        let rows = 5usize;
+        let columns = 512usize;
+        for codec in [GgmlKQuant::Q2K, GgmlKQuant::Q3K] {
+            let encoded_row_bytes = codec.encoded_row_bytes(columns).unwrap();
+            let block_bytes = block_bytes(codec);
+            let mut packed = (0..rows * encoded_row_bytes)
+                .map(|index| ((index * 31 + 7) % 251) as u8)
+                .collect::<Vec<_>>();
+            for block in packed.chunks_exact_mut(block_bytes) {
+                match codec {
+                    GgmlKQuant::Q2K => block[80..84].copy_from_slice(&[0x00, 0x38, 0x00, 0x34]),
+                    GgmlKQuant::Q3K => block[108..110].copy_from_slice(&[0x00, 0x38]),
+                    _ => unreachable!(),
+                }
+            }
+            let weight = MetalTensor {
+                buffer: device.upload_bytes(&packed),
+                layout: Layout::contiguous(vec![rows, encoded_row_bytes]),
+                dtype: DType::U8,
+            };
+            let bias_values = (0..rows)
+                .map(|row| row as f32 * 0.03125 - 0.0625)
+                .collect::<Vec<_>>();
+            let bias = MetalTensor::from_f32(device, bias_values, vec![rows]);
+            for vectors in 2usize..=8 {
+                let input_values = (0..vectors * columns)
+                    .map(|index| ((index * 13 + vectors * 5) % 97) as f32 * 0.013 - 0.6)
+                    .collect::<Vec<_>>();
+                let input =
+                    MetalTensor::from_f32(device, input_values.clone(), vec![vectors, columns]);
+                let requirements = linear_requirements(
+                    &[vectors, columns],
+                    DType::F32,
+                    &[rows, encoded_row_bytes],
+                    DType::U8,
+                    Some((&[rows], DType::F32)),
+                    &[vectors, rows],
+                    DType::F32,
+                    codec,
+                    [rows, columns],
+                )
+                .unwrap();
+                let direct_kind = KernelKind::LinearDirect(vectors as u8);
+                let output = MetalTensor::from_f32(
+                    device,
+                    vec![f32::NAN; vectors * rows],
+                    vec![vectors, rows],
+                );
+                pipeline(direct_kind, codec, None).unwrap();
+                encode_linear(
+                    &input,
+                    &weight,
+                    Some(&bias),
+                    &output,
+                    &requirements,
+                    direct_kind,
+                )
+                .unwrap();
+
+                let mut references = Vec::with_capacity(vectors);
+                for vector in 0..vectors {
+                    let reference_input = MetalTensor::from_f32(
+                        device,
+                        input_values[vector * columns..(vector + 1) * columns].to_vec(),
+                        vec![1, columns],
+                    );
+                    let reference_requirements = linear_requirements(
+                        &[1, columns],
+                        DType::F32,
+                        &[rows, encoded_row_bytes],
+                        DType::U8,
+                        Some((&[rows], DType::F32)),
+                        &[1, rows],
+                        DType::F32,
+                        codec,
+                        [rows, columns],
+                    )
+                    .unwrap();
+                    let reference =
+                        MetalTensor::from_f32(device, vec![f32::NAN; rows], vec![1, rows]);
+                    warm_linear_exact(&reference_requirements).unwrap();
+                    linear_into(
+                        &reference_input,
+                        &weight,
+                        Some(&bias),
+                        &reference,
+                        &reference_requirements,
+                    )
+                    .unwrap();
+                    references.push(reference);
+                }
+                device.synchronize().unwrap();
+
+                let actual = output.buffer.contents_ptr().cast::<f32>();
+                for (vector, reference) in references.iter().enumerate() {
+                    let expected = reference.buffer.contents_ptr().cast::<f32>();
+                    for row in 0..rows {
+                        let (actual, expected) =
+                            unsafe { (*actual.add(vector * rows + row), *expected.add(row)) };
+                        assert_eq!(
+                            actual.to_bits(),
+                            expected.to_bits(),
+                            "{} vectors={vectors} vector={vector} row={row}: {actual} != {expected}",
+                            codec.name()
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     #[ignore = "manual prefill kernel bandwidth probe"]
     fn kquant_prefill_bandwidth_probe() {
         // Ramp GPU clocks with throwaway dispatches before timing.
@@ -3124,6 +3529,12 @@ mod tests {
         for (codec, vectors, rows, columns, block_bytes) in [
             (GgmlKQuant::Q3K, 32usize, 6656usize, 4096usize, 110usize),
             (GgmlKQuant::Q3K, 16usize, 6656usize, 4096usize, 110usize),
+            (GgmlKQuant::Q3K, 2, 6656, 4096, 110),
+            (GgmlKQuant::Q3K, 3, 6656, 4096, 110),
+            (GgmlKQuant::Q3K, 4, 6656, 4096, 110),
+            (GgmlKQuant::Q3K, 5, 6656, 4096, 110),
+            (GgmlKQuant::Q3K, 6, 6656, 4096, 110),
+            (GgmlKQuant::Q3K, 7, 6656, 4096, 110),
             (GgmlKQuant::Q3K, 8, 6656, 4096, 110),
             (GgmlKQuant::Q3K, 32, 19968, 6656, 110),
             (GgmlKQuant::Q3K, 256, 19968, 6656, 110),
@@ -3134,6 +3545,12 @@ mod tests {
             (GgmlKQuant::Q3K, 8, 6656, 19968, 110),
             (GgmlKQuant::Q2K, 32, 4096, 6656, 84),
             (GgmlKQuant::Q2K, 16, 4096, 6656, 84),
+            (GgmlKQuant::Q2K, 2, 4096, 6656, 84),
+            (GgmlKQuant::Q2K, 3, 4096, 6656, 84),
+            (GgmlKQuant::Q2K, 4, 4096, 6656, 84),
+            (GgmlKQuant::Q2K, 5, 4096, 6656, 84),
+            (GgmlKQuant::Q2K, 6, 4096, 6656, 84),
+            (GgmlKQuant::Q2K, 7, 4096, 6656, 84),
             (GgmlKQuant::Q2K, 8, 4096, 6656, 84),
             (GgmlKQuant::Q2K, 32, 19968, 6656, 84),
             (GgmlKQuant::Q2K, 256, 19968, 6656, 84),
@@ -3263,6 +3680,47 @@ mod tests {
                     let started = std::time::Instant::now();
                     for _ in 0..20 {
                         encode_linear(&input, &weight, None, &output, &requirements, m64).unwrap();
+                    }
+                    device.synchronize().unwrap();
+                    let seconds = started.elapsed().as_secs_f64();
+                    eprintln!(
+                        "{} {vectors}x{rows}x{columns} [{tag}]: {:.3} ms/call, {:.1} GB/s packed",
+                        codec.name(),
+                        seconds * 50.0,
+                        bytes * 20.0 / seconds / 1e9
+                    );
+                }
+            }
+            if (2..=8).contains(&requirements.vectors)
+                && matches!(codec, GgmlKQuant::Q2K | GgmlKQuant::Q3K)
+            {
+                let legacy = match codec {
+                    GgmlKQuant::Q2K => KernelKind::LinearBatched(2),
+                    GgmlKQuant::Q3K => KernelKind::LinearBatched(4),
+                    _ => unreachable!(),
+                };
+                let mut candidates = vec![
+                    (
+                        KernelKind::LinearDirect(requirements.vectors as u8),
+                        "direct-row-reuse",
+                    ),
+                    (KernelKind::Linear, "sequential-qmv"),
+                    (legacy, "legacy-batched"),
+                ];
+                if requirements.vectors == 8 {
+                    candidates.push((KernelKind::LinearMma8SimpleHalf, "half-mma"));
+                }
+                for (candidate, tag) in candidates {
+                    pipeline(candidate, codec, None).unwrap();
+                    for _ in 0..5 {
+                        encode_linear(&input, &weight, None, &output, &requirements, candidate)
+                            .unwrap();
+                    }
+                    device.synchronize().unwrap();
+                    let started = std::time::Instant::now();
+                    for _ in 0..20 {
+                        encode_linear(&input, &weight, None, &output, &requirements, candidate)
+                            .unwrap();
                     }
                     device.synchronize().unwrap();
                     let seconds = started.elapsed().as_secs_f64();
