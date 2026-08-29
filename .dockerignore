@@ -1,0 +1,17 @@
+.git
+.bench
+.cuda-devbox.env
+.cuda-devbox-known-hosts
+.direnv
+.DS_Store
+bench-results
+node_modules
+outputs
+target
+**/bench-results
+**/dist
+**/node_modules
+**/target
+**/*.node
+packages/examples/backup
+packages/examples/data

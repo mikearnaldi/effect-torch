@@ -77,6 +77,46 @@ pnpm install
 pnpm --filter @effect-torch/backend-cpu build:debug
 ```
 
+Manage a disposable Blackwell CUDA devbox from the default Nix shell:
+
+```bash
+nix develop
+cp .cuda-devbox.env.example .cuda-devbox.env
+runpodctl doctor
+./scripts/cuda-devbox.sh template
+./scripts/cuda-devbox.sh create
+./scripts/cuda-devbox.sh bootstrap
+# Work on the pod, then stop billing when finished.
+./scripts/cuda-devbox.sh destroy
+```
+
+The `CUDA devbox image` GitHub workflow publishes
+`ghcr.io/mikearnaldi/effect-torch:cuda-devbox` when its dependency inputs change
+on `main`. The GHCR package must be public before RunPod can pull it. Run
+`template` after the first image build. It resolves the image tag to an immutable
+digest, creates or updates a RunPod template, and saves the template ID in the
+ignored `.cuda-devbox.env`. Later image builds require another `template` run to
+move that RunPod template to the new digest.
+
+The image extends RunPod's pinned Ubuntu base. It contains Determinate Nix, the
+`.#cuda` closure, the Rust toolchain, and warm pnpm and Cargo caches. `bootstrap`
+still reconciles changed lockfiles and runs the CUDA kernel, NVRTC, and cuBLASLt
+checks. If no managed template exists, `create` falls back to the official RunPod
+PyTorch template and `bootstrap` performs the full installation.
+
+`create` requests one RTX PRO 6000 Blackwell and saves the pod ID, SSH address,
+and port. Change the GPU, cloud, disk size, or other creation settings in
+`.cuda-devbox.env`. Community Cloud requires `CUDA_DEVBOX_PUBLIC_IP=1` for
+direct SSH. You can use an existing pod by setting `CUDA_DEVBOX_POD_ID`,
+`CUDA_DEVBOX_ADDRESS`, and `CUDA_DEVBOX_PORT`.
+
+`sync` uploads the non-ignored worktree. The flake pins CUDA 12.9 and compiles
+the check for Blackwell `sm_120`. The default development shell remains
+CUDA-free on macOS. Use `./scripts/cuda-devbox.sh ssh` for an interactive
+connection or `./scripts/cuda-devbox.sh run <command>` to run a command in the
+remote repository. Set `EFFECT_TORCH_CUDA_DEVBOX_CONFIG` to use a config file
+outside the repository.
+
 The following is the minimal application shape:
 
 ```ts

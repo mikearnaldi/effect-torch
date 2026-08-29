@@ -1,0 +1,35 @@
+FROM runpod/base:1.0.2-ubuntu2404@sha256:e93bf61149910d35407fc865078ceb9b2887e986befd2b7c0eee322abe47ac59
+
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+
+# hadolint ignore=DL3008
+RUN apt-get update && \
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+      ca-certificates \
+      curl \
+      git \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN curl --proto '=https' --tlsv1.2 -fsSL https://install.determinate.systems/nix | \
+    sh -s -- install linux \
+      --diagnostic-endpoint "" \
+      --extra-conf "sandbox = false" \
+      --init none \
+      --no-confirm
+
+ENV PATH="/nix/var/nix/profiles/default/bin:$PATH"
+
+WORKDIR /root/effect-torch
+COPY . .
+
+# Keep a Git index so Nix ignores generated dependency and build directories.
+RUN git init --quiet && \
+    git add . && \
+    nix develop .#cuda --command bash -euo pipefail -c ' \
+      pnpm install --frozen-lockfile; \
+      cargo fetch --locked \
+    ' && \
+    find . -name node_modules -type d -prune -exec rm -rf '{}' + && \
+    rm -rf target
+
+# Inherit the RunPod base image's /start.sh command for SSH and web terminal setup.

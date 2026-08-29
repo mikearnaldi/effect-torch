@@ -4,3 +4,5 @@ target/
 *.node
 .direnv/
 bench-results/
+.cuda-devbox.env
+.cuda-devbox-known-hosts
