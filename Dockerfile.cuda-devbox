@@ -1,4 +1,4 @@
-FROM runpod/base:1.0.2-ubuntu2404@sha256:e93bf61149910d35407fc865078ceb9b2887e986befd2b7c0eee322abe47ac59 AS prewarmed
+FROM runpod/base:1.0.2-ubuntu2404@sha256:e93bf61149910d35407fc865078ceb9b2887e986befd2b7c0eee322abe47ac59
 
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 
@@ -25,32 +25,15 @@ COPY . .
 # Keep a Git index so Nix ignores generated dependency and build directories.
 RUN git init --quiet && \
     git add . && \
+    mkdir -p /nix/var/nix/gcroots && \
+    nix build .#devShells.x86_64-linux.cuda \
+      --out-link /nix/var/nix/gcroots/effect-torch-cuda && \
     nix develop .#cuda --command bash -euo pipefail -c ' \
       pnpm install --frozen-lockfile; \
       cargo fetch --locked \
     ' && \
     find . -name node_modules -type d -prune -exec rm -rf '{}' + && \
-    rm -rf target
+    rm -rf target && \
+    nix store gc
 
-# RunPod hosts can share a heavily used registry IP. A single final layer avoids
-# concurrent GHCR blob requests while preserving the prewarmed filesystem.
-FROM scratch
-COPY --from=prewarmed / /
-
-ENV PATH="/nix/var/nix/profiles/default/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
-    SHELL="/bin/bash" \
-    PYTHONUNBUFFERED="True" \
-    DEBIAN_FRONTEND="noninteractive" \
-    RP_WORKSPACE="/workspace" \
-    HF_HOME="/workspace/.cache/huggingface/" \
-    VIRTUALENV_OVERRIDE_APP_DATA="/workspace/.cache/virtualenv/" \
-    PIP_CACHE_DIR="/workspace/.cache/pip/" \
-    UV_CACHE_DIR="/workspace/.cache/uv/" \
-    HF_HUB_ENABLE_HF_TRANSFER="1" \
-    HF_XET_HIGH_PERFORMANCE="1" \
-    PIP_BREAK_SYSTEM_PACKAGES="1" \
-    PIP_ROOT_USER_ACTION="ignore" \
-    TZ="Etc/UTC"
-
-WORKDIR /root/effect-torch
-CMD ["/start.sh"]
+# Inherit the RunPod base image's /start.sh command for SSH and web terminal setup.
