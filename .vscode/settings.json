@@ -1,4 +1,6 @@
 {
+  "js/ts.experimental.useTsgo": true,
+  "js/ts.tsdk.path": "./node_modules/typescript",
   "rust-analyzer.cargo.features": ["napi-addon"],
   "editor.formatOnSave": true,
   "dprint.configPath": "${workspaceFolder}/dprint.json",

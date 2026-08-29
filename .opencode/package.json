@@ -1,0 +1,11 @@
+{
+  "name": "@effect-torch/opencode",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "typecheck": "tsc -p tsconfig.json"
+  },
+  "dependencies": {
+    "@opencode-ai/plugin": "beta"
+  }
+}

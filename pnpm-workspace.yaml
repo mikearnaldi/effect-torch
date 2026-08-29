@@ -1,5 +1,6 @@
 packages:
   - "packages/*"
+  - ".opencode"
 
 onlyBuiltDependencies:
   - "@frost-beta/mlx"

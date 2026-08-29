@@ -1827,7 +1827,7 @@ fn plan_command_resources(
                 None
             };
             let output = output(0)?;
-            let mut requirements = quantized::linear_requirements(
+            resources.plan = MetalCommandPlan::QuantizedLinear(quantized::linear_requirements(
                 &x.shape,
                 x.dtype,
                 &weight.shape,
@@ -1837,10 +1837,7 @@ fn plan_command_resources(
                 output.dtype,
                 *codec,
                 *weight_shape,
-            )?;
-            requirements.decode_faithful =
-                state_schema.is_some_and(|schema| schema.graph_batch > schema.batch);
-            resources.plan = MetalCommandPlan::QuantizedLinear(requirements);
+            )?);
         }
         MetalOp::QuantizedLinearGroup {
             codec,
@@ -1858,7 +1855,7 @@ fn plan_command_resources(
             for (index, weight_shape) in weight_shapes.iter().enumerate() {
                 let weight = input(1 + index)?;
                 let member_output = output(index)?;
-                let mut requirements = quantized::linear_requirements(
+                members.push(quantized::linear_requirements(
                     &x.shape,
                     x.dtype,
                     &weight.shape,
@@ -1868,10 +1865,7 @@ fn plan_command_resources(
                     member_output.dtype,
                     *codec,
                     *weight_shape,
-                )?;
-                requirements.decode_faithful =
-                    state_schema.is_some_and(|schema| schema.graph_batch > schema.batch);
-                members.push(requirements);
+                )?);
             }
             resources.plan = MetalCommandPlan::QuantizedLinearGroup(
                 quantized::grouped_linear_requirements(&members)?,
@@ -9256,57 +9250,6 @@ mod tests {
                 assert_quantized_close(&actual, &expected);
             }
         }
-    }
-
-    #[test]
-    fn packed_verifier_quantized_linears_require_decode_faithful_arithmetic() {
-        let fixture = quantized_fixtures()
-            .into_iter()
-            .find(|fixture| fixture.codec == GgmlKQuant::Q3K)
-            .unwrap();
-        let vectors = 8usize;
-        let columns = 512usize;
-        let rows = 5usize;
-        let encoded_row_bytes = fixture.bytes.len() * (columns / 256);
-        let packed = fixture
-            .bytes
-            .iter()
-            .copied()
-            .cycle()
-            .take(rows * encoded_row_bytes)
-            .collect::<Vec<_>>();
-        let root = Node::new(NodeKind::QuantizedLinear {
-            x: leaf_shape(vec![0.5; vectors * columns], vec![vectors, columns]),
-            weight: leaf_u8(&packed, vec![rows, encoded_row_bytes]),
-            bias: None,
-            codec: fixture.codec,
-            weight_shape: [rows, columns],
-        })
-        .unwrap();
-        let compilation = compile_graph_with_state(
-            &[root],
-            false,
-            KvStateSchema {
-                max_tokens: 64,
-                block_size: 16,
-                kv_dtype: DType::F16,
-                window: None,
-                batch: 1,
-                graph_batch: vectors,
-                layers: 0,
-                kv_heads: 0,
-                head_dim: 0,
-                kda: KdaGeometry::default(),
-                conv: ConvGeometry::default(),
-                cursor_slot: u32::MAX,
-                cursor_tensor: false,
-            },
-        );
-        let (_, plan) = operation(&compilation.executable.commands()[0]);
-        let MetalCommandPlan::QuantizedLinear(requirements) = plan else {
-            panic!("expected quantized linear requirements");
-        };
-        assert!(requirements.decode_faithful);
     }
 
     #[test]
