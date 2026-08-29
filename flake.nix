@@ -14,7 +14,44 @@
         "aarch64-linux"
       ];
       forAllSystems = nixpkgs.lib.genAttrs systems;
-      commonPackages = pkgs: with pkgs; [
+      runpodctlSources = {
+        aarch64-darwin = {
+          suffix = "darwin-arm64";
+          hash = "sha256-6l2TbA2d8j97L/ZnSAy1qDRKwpt8dpdRGCxhgPQndAg=";
+        };
+        x86_64-darwin = {
+          suffix = "darwin-amd64";
+          hash = "sha256-FrQgVRv0v6hKo3dJA5O02PRrn6uhEtD1D6JE2wSfNgY=";
+        };
+        x86_64-linux = {
+          suffix = "linux-amd64";
+          hash = "sha256-8nNVW5NZY5JeaW6V82qIPKaMXIRe/Ik9ufj3AXSchHQ=";
+        };
+        aarch64-linux = {
+          suffix = "linux-arm64";
+          hash = "sha256-djM2vdDfIqL34NqOV/UWCfwcZUZyJHOXmVQJ2wuS9RQ=";
+        };
+      };
+      runpodctlFor = pkgs: system:
+        let
+          source = runpodctlSources.${system};
+        in
+        pkgs.stdenvNoCC.mkDerivation {
+          pname = "runpodctl";
+          version = "2.12.0";
+          src = pkgs.fetchurl {
+            url = "https://github.com/runpod/runpodctl/releases/download/v2.12.0/runpodctl-${source.suffix}";
+            inherit (source) hash;
+          };
+          dontUnpack = true;
+          installPhase = ''
+            runHook preInstall
+            install -Dm755 "$src" "$out/bin/runpodctl"
+            runHook postInstall
+          '';
+          meta.mainProgram = "runpodctl";
+        };
+      commonPackages = pkgs: system: with pkgs; [
         nodejs_22
         corepack
         rustup
@@ -25,7 +62,7 @@
         pkg-config
         git
         jq
-        runpodctl
+        (runpodctlFor pkgs system)
         crane
       ];
     in
@@ -37,7 +74,7 @@
             config.allowUnfree = true;
           };
           default = pkgs.mkShell {
-            packages = commonPackages pkgs;
+            packages = commonPackages pkgs system;
           };
         in
         {
@@ -76,7 +113,7 @@
           in
           {
             cuda = pkgs.mkShell {
-              packages = commonPackages pkgs ++ [
+              packages = commonPackages pkgs system ++ [
                 cudaToolkit
                 cuda.cuda_nvcc
                 cuda.cuda_cudart

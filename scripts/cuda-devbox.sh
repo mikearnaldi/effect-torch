@@ -77,8 +77,10 @@ template_id=${managed_template_id:-${base_template_id}}
 template_image=${CUDA_DEVBOX_TEMPLATE_IMAGE:-ghcr.io/mikearnaldi/effect-torch:cuda-devbox}
 template_image_digest=${CUDA_DEVBOX_TEMPLATE_IMAGE_DIGEST:-}
 template_name=${CUDA_DEVBOX_TEMPLATE_NAME:-effect-torch-cuda}
+registry_auth_id=${CUDA_DEVBOX_REGISTRY_AUTH_ID:-}
 image=${CUDA_DEVBOX_IMAGE:-}
 cloud_type=${CUDA_DEVBOX_CLOUD_TYPE:-SECURE}
+data_center_ids=${CUDA_DEVBOX_DATA_CENTER_IDS:-}
 public_ip=${CUDA_DEVBOX_PUBLIC_IP:-0}
 gpu_count=${CUDA_DEVBOX_GPU_COUNT:-1}
 container_disk_gb=${CUDA_DEVBOX_CONTAINER_DISK_GB:-40}
@@ -139,6 +141,7 @@ write_template_state() {
 
 manage_template() {
   local digest pinned_image response new_template_id
+  local -a registry_arguments=()
 
   require_command runpodctl
   require_command jq
@@ -150,6 +153,9 @@ manage_template() {
   fi
   [[ ${digest} =~ ^sha256:[0-9a-f]{64}$ ]] || fail "registry returned an invalid image digest: ${digest}"
   pinned_image="${template_image}@${digest}"
+  if [[ -n ${registry_auth_id} ]]; then
+    registry_arguments=(--registry-auth-id "${registry_auth_id}")
+  fi
 
   if [[ -n ${managed_template_id} ]]; then
     printf 'Updating RunPod template %s...\n' "${managed_template_id}"
@@ -159,6 +165,7 @@ manage_template() {
       --container-disk-in-gb "${container_disk_gb}" \
       --ports 22/tcp \
       --port-labels 22=SSH \
+      "${registry_arguments[@]}" \
       --output json
     new_template_id=${managed_template_id}
   else
@@ -169,6 +176,7 @@ manage_template() {
       --container-disk-in-gb "${container_disk_gb}" \
       --ports 22/tcp \
       --port-labels 22=SSH \
+      "${registry_arguments[@]}" \
       --output json)
     if ! new_template_id=$(printf '%s' "${response}" | jq -er '.id | select(type == "string" and length > 0)'); then
       printf '%s\n' "${response}" >&2
@@ -184,7 +192,8 @@ manage_template() {
 }
 
 wait_for_connection() {
-  local response ip resolved_port resolved_identity_file
+  local response ip resolved_port resolved_identity_file runtime_status runtime_reason
+  local startup_failure startup_failure_count startup_failure_message
   local deadline=$((SECONDS + wait_seconds))
 
   printf 'Waiting up to %s seconds for the direct SSH endpoint...\n' "${wait_seconds}"
@@ -203,6 +212,30 @@ wait_for_connection() {
         rm -f "${known_hosts}"
         printf 'Devbox ready: %s:%s (pod %s)\n' "${address}" "${port}" "${pod_id}"
         return 0
+      fi
+    fi
+
+    if response=$(runpodctl pod get "${pod_id}" --output json 2>/dev/null); then
+      runtime_status=$(printf '%s' "${response}" | jq -r '.runtimeStatus // empty')
+      runtime_reason=$(printf '%s' "${response}" | jq -r '.runtimeStatusReason // .lastStatusChange // empty')
+      case ${runtime_status} in
+        stopped|terminated)
+          fail "pod ${pod_id} became ${runtime_status}: ${runtime_reason:-reason unavailable}"
+          ;;
+      esac
+    fi
+
+    if response=$(runpodctl pod logs "${pod_id}" --source system --tail 100 --max-wait 2s 2>/dev/null); then
+      startup_failure=$(printf '%s' "${response}" | jq -rs '
+        [.[] | select(.source == "system" and (.line | startswith("error creating container:")))] as $errors
+        | select($errors | length >= 3)
+        | [($errors | length), $errors[-1].line]
+        | @tsv
+      ')
+      if [[ -n ${startup_failure} ]]; then
+        startup_failure_count=${startup_failure%%$'\t'*}
+        startup_failure_message=${startup_failure#*$'\t'}
+        fail "pod ${pod_id} failed to create its container ${startup_failure_count} times: ${startup_failure_message}"
       fi
     fi
     sleep 5
@@ -244,6 +277,9 @@ create_devbox() {
     arguments+=(--image "${image}")
   else
     arguments+=(--template-id "${template_id}")
+  fi
+  if [[ -n ${data_center_ids} ]]; then
+    arguments+=(--data-center-ids "${data_center_ids}")
   fi
   if enabled "${public_ip}"; then
     arguments+=(--public-ip)
@@ -332,9 +368,9 @@ case ${command} in
     destroy_devbox
     ;;
   show)
-    printf 'pod_id=%s\ntemplate_id=%s\ntemplate_image=%s\ntemplate_digest=%s\naddress=%s\nport=%s\ndirectory=%s\nidentity_file=%s\nknown_hosts=%s\n' \
-      "${pod_id}" "${template_id}" "${template_image}" "${template_image_digest}" \
-      "${address}" "${port}" "${remote_directory}" "${identity_file}" "${known_hosts}"
+    printf 'pod_id=%s\ntemplate_id=%s\ntemplate_image=%s\ntemplate_digest=%s\nregistry_auth_id=%s\ndata_center_ids=%s\naddress=%s\nport=%s\ndirectory=%s\nidentity_file=%s\nknown_hosts=%s\n' \
+      "${pod_id}" "${template_id}" "${template_image}" "${template_image_digest}" "${registry_auth_id}" \
+      "${data_center_ids}" "${address}" "${port}" "${remote_directory}" "${identity_file}" "${known_hosts}"
     ;;
   check)
     prepare_ssh
