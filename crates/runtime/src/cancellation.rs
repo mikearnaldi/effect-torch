@@ -1,10 +1,10 @@
 //! Cooperative cancellation for long-running runtime operations.
 //!
-//! Cancellation is never preemptive: producers call [`CancellationFlag::cancel`]
-//! and workers poll [`CancellationFlag::is_cancelled`] at well-defined points
-//! (per header chunk while parsing GGUF, per read chunk while loading tensor
-//! payloads) and abort with a dedicated `Cancelled` error. A flag is one-shot —
-//! once set it stays set — and safe to share across threads behind a reference.
+//! Cancellation is cooperative, not preemptive. Producers call
+//! [`CancellationFlag::cancel`]. Workers poll
+//! [`CancellationFlag::is_cancelled`] once per GGUF header or tensor payload
+//! chunk and abort with a `Cancelled` error. Once set, a flag stays set.
+//! Callers can share a reference across threads.
 
 use std::ops::Deref;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -18,7 +18,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 pub struct CancellationFlag(AtomicBool);
 
 impl CancellationFlag {
-    /// Creates a flag in the not-cancelled state.
+    /// Creates an unset flag.
     pub fn new() -> Self {
         Self::default()
     }
@@ -28,7 +28,7 @@ impl CancellationFlag {
         self.0.store(true, Ordering::Release);
     }
 
-    /// Returns `true` once [`cancel`](Self::cancel) has been observed.
+    /// Returns `true` after [`cancel`](Self::cancel) sets the flag.
     pub fn is_cancelled(&self) -> bool {
         self.0.load(Ordering::Acquire)
     }

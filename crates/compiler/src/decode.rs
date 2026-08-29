@@ -1,30 +1,25 @@
-//! Stateful decode specialization for inference graphs.
+//! Specializes inference graphs for stateful decode.
 //!
-//! [`specialize_decode`] rewrites a training-style semantic graph into the
-//! stateful form used for autoregressive decode: causal attention becomes
-//! KV-cached attention, chunked KDA becomes a recurrence, short convolutions
-//! become conv-state updates, absolute rotary positions become
-//! cursor-relative, and learned position embeddings are rebuilt as
-//! cursor-indexed gathers. The rewrite produces an entirely new graph
-//! generation — fresh node IDs, shared subgraphs still shared — and never
-//! mutates the source graph.
+//! [`specialize_decode`] converts training-style operations to their stateful
+//! autoregressive forms. It replaces causal attention with KV-cached attention,
+//! chunked KDA with a recurrence, and short convolutions with state updates. It
+//! also makes rotary positions cursor-relative and rebuilds learned position
+//! embeddings as cursor-indexed gathers. The function creates a new graph with
+//! fresh node IDs, preserves shared subgraphs, and does not mutate the source.
 //!
-//! The returned [`DecodeGeometry`] is the contract between the compiler and
-//! the runtime's state allocator. Its invariants, established by validation
-//! during the rewrite:
+//! The returned [`DecodeGeometry`] tells the runtime how to allocate state.
+//! Rewrite validation enforces these rules:
 //!
-//! - Every stateful layer agrees on its family geometry (attention head
-//!   count/dim, KDA head/key/value dims, conv channels/kernel); mixed
-//!   geometries are rejected so state buffers can be sized uniformly.
-//! - Layer ordinals are assigned in the historical decode encounter order
-//!   (last root first), and are stable across repeated specialization of the
-//!   same graph.
-//! - The state cursor is a runtime-supplied value at `cursor_slot` — one
-//!   past the highest caller input slot — never a caller argument. It is a
-//!   scalar for one dense graph row and an `i64 [graph_rows]` tensor otherwise.
-//! - `allows_window_eviction` is true only when every attention layer has a
-//!   finite window; a global retention window that cannot hold an explicit
-//!   local window is a hard error.
+//! - Stateful layers in each family use the same geometry. Mixed attention,
+//!   KDA, or convolution geometry is an error.
+//! - Layer ordinals follow the historical encounter order, with the last root
+//!   first. Repeated specialization of the same graph produces the same order.
+//! - The runtime provides the state cursor at `cursor_slot`, one slot after
+//!   the highest caller input. It is not a caller argument. One dense graph row
+//!   uses a scalar. Multiple rows use an `i64 [graph_rows]` tensor.
+//! - `allows_window_eviction` is true only if every attention layer has a
+//!   finite window. A global retention window smaller than an explicit local
+//!   window is an error.
 
 use effect_torch_graph::{
     node_children, remap_children, KvAttentionMode, Node, NodeKind, PositionOffset,
@@ -33,8 +28,8 @@ use effect_torch_runtime::DType;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-/// Uniform geometry of the KDA recurrence layers, used to size the
-/// recurrent state buffers. All-zeros when the graph has no KDA layers.
+/// Uniform KDA recurrence geometry used to size recurrent state buffers.
+/// All fields are zero when the graph has no KDA layers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct KdaGeometry {
     pub layers: usize,
@@ -56,8 +51,8 @@ impl Default for KdaGeometry {
     }
 }
 
-/// Uniform geometry of the short-conv state layers (channels and kernel
-/// width every layer agrees on). All-zeros when the graph has none.
+/// Uniform channel count and kernel width for short-convolution state layers.
+/// All fields are zero when the graph has no such layers.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 pub struct ConvGeometry {
     pub layers: usize,
@@ -65,14 +60,13 @@ pub struct ConvGeometry {
     pub kernel: usize,
 }
 
-/// The stateful-decode contract produced alongside the specialized roots.
+/// Stateful decode geometry returned with the specialized roots.
 ///
-/// `layers`, `kv_heads`, and `head_dim` describe the KV cache: `layers` is
-/// the number of attention layers and `kv_heads`/`head_dim` their (uniform)
-/// head geometry, or zero when the graph has no attention. `cursor_slot` and
-/// `cursor_tensor` locate the runtime-driven state cursor within the
-/// program's input slots; `allows_window_eviction` tells the runtime whether
-/// KV state may be evicted outside the maximum attention window.
+/// `layers` is the attention layer count. `kv_heads` and `head_dim` define
+/// their uniform KV-cache geometry. All three are zero when the graph has no
+/// attention. `cursor_slot` and `cursor_tensor` locate the runtime state
+/// cursor among the program inputs. `allows_window_eviction` says whether the
+/// runtime may evict KV state outside the maximum attention window.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct DecodeGeometry {
     pub layers: usize,
@@ -85,11 +79,11 @@ pub struct DecodeGeometry {
     pub cursor_tensor: bool,
 }
 
-/// Relationship between physical sequence lanes and rows in the traced graph.
+/// Maps physical sequence lanes to rows in the traced graph.
 ///
-/// Dense prefill/decode has one graph row per physical lane. Packed causal-chain
-/// verification instead traces every candidate position as an independent
-/// one-token graph row while retaining one state sequence per physical lane.
+/// Dense prefill and decode use one graph row per physical lane. Packed
+/// causal-chain verification traces each candidate position as a separate
+/// one-token row but retains one state sequence per physical lane.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum DecodeLayout {
     Dense {
@@ -101,8 +95,8 @@ pub enum DecodeLayout {
     },
 }
 
-/// Output-row policy for one decode root. Policies are applied in source-root
-/// order; split roots retain lane order within their source root.
+/// Output-row policy for one decode root. Policies follow source-root order,
+/// and split roots retain lane order within each source root.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum DecodeOutputSelection {
     /// Preserve every row produced by the semantic root.
@@ -166,8 +160,8 @@ impl DecodeLayout {
 }
 
 impl DecodeGeometry {
-    /// The state cursor as a request-level slot declaration: internal
-    /// runtime metadata, never a caller-visible argument.
+    /// Declares the state cursor slot as internal runtime metadata, not a
+    /// caller-visible argument.
     pub const fn state_cursor(&self) -> crate::request::StateCursorSlot {
         crate::request::StateCursorSlot::new(self.cursor_slot, self.cursor_tensor)
     }
@@ -175,15 +169,14 @@ impl DecodeGeometry {
 
 /// Builds the stateful decode specialization of an inference graph.
 ///
-/// Traversal and reconstruction are iterative. Layer ordinals retain the
-/// historical decode order: roots and children are encountered from last to
-/// first, while returned roots remain in caller order.
+/// Traversal and reconstruction are iterative. Layer ordinals follow the
+/// historical decode order. This order visits roots and children from last to
+/// first. Returned roots remain in caller order.
 ///
-/// With `last_token_row`, every rewritten root must be `[batch, T, V]`;
-/// the returned roots are inference-only `LastTokenRow` selectors — one for
-/// batch 1, otherwise `batch` roots per source root, each over a static
-/// one-row slice in row order. The default (`false`) returns the rewritten
-/// roots unchanged.
+/// With `last_token_row`, every rewritten root must be `[batch, T, V]`.
+/// Batch 1 returns one inference-only `LastTokenRow` selector. Larger batches
+/// return `batch` selectors per source root, each over a static one-row slice
+/// in row order. The default value, `false`, returns rewritten roots unchanged.
 pub fn specialize_decode(
     roots: &[Arc<Node>],
     window: Option<usize>,

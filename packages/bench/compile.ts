@@ -1,30 +1,30 @@
-// JSONL benchmark for native executable compilation and structural-cache lookup.
-// Each cold/warm pair rebuilds equivalent graph structure with one unique salt:
-// the first compile is a process-cache miss and the second can reuse that exact
-// structural artifact. Graph construction is outside the timer and executables
-// are never run; pipeline preparation performed by native compile remains part
-// of the cold sample. Pairs execute serially and the output records medians plus
-// cold artifact diagnostics; `compilePhases` belong to the cold compile that
-// created the artifact, not the warm lookup call.
+// JSONL benchmark of native executable compilation and structural-cache lookup.
+// Each cold/warm pair builds the same graph structure twice with a unique salt.
+// The first compile misses the process cache. The second can reuse its structural
+// artifact. Graph construction is not timed, and the executables never run.
+// Native pipeline preparation remains part of the cold sample. Pairs run
+// serially. The output reports medians and diagnostics for the cold artifact.
+// `compilePhases` come from the cold compile, not the warm lookup.
 //
-// Compiler EFFECT_TORCH_* switches are snapshotted into compile options and
-// cache identity. This harness rejects EFFECT_TORCH_NO_EXECUTABLE_CACHE by mere
-// presence (even an empty or "0" value) and rejects constant weights because
-// either would invalidate the warm-cache measurement.
+// The compiler snapshots EFFECT_TORCH_* switches in the compile options and
+// cache identity. The benchmark rejects EFFECT_TORCH_NO_EXECUTABLE_CACHE whenever
+// it is present, even with an empty or "0" value. It also rejects constant
+// weights. Either setting invalidates the warm-cache measurement.
 
 import { Gradient, Optimizer, Runtime, Tensor } from "@effect-torch/core"
 import { Effect } from "effect"
 import { arch, cpus, platform, release, totalmem } from "node:os"
 import { performance } from "node:perf_hooks"
 
-type WorkloadName = "elementwise" | "wide" | "training" | "decode"
+const workloadNames = ["elementwise", "wide", "training", "decode"] as const
+type WorkloadName = (typeof workloadNames)[number]
 type RuntimeName = "cpu" | "metal"
 
 interface Config {
   readonly workloads: ReadonlyArray<WorkloadName>
   readonly runtimes: ReadonlyArray<RuntimeName>
   readonly iterations: number
-  readonly size?: number
+  readonly size: number | undefined
   readonly options: Runtime.ExecutableCompileOptions
 }
 
@@ -33,14 +33,12 @@ interface GraphSpec {
   readonly state?: Runtime.DecodeStateRequest
 }
 
-const defaultSizes: Readonly<Record<WorkloadName, number>> = {
+const defaultSizes = {
   elementwise: 64,
   wide: 24,
   training: 3,
   decode: 4
-}
-
-const workloadNames = Object.keys(defaultSizes) as Array<WorkloadName>
+} satisfies Readonly<Record<WorkloadName, number>>
 
 const positiveInteger = (value: string, name: string): number => {
   const parsed = Number(value)
@@ -59,9 +57,12 @@ const commaList = <A extends string>(
   for (const item of value.split(",")) {
     if (item === "all") {
       output.push(...all)
-    } else if ((all as ReadonlyArray<string>).includes(item)) {
-      output.push(item as A)
     } else {
+      const match = all.find((candidate) => candidate === item)
+      if (match !== undefined) {
+        output.push(match)
+        continue
+      }
       throw new Error(`unknown ${name} ${JSON.stringify(item)}; expected ${all.join(", ")}, or all`)
     }
   }
@@ -148,7 +149,7 @@ const parseConfig = (args: ReadonlyArray<string>): Config | undefined => {
     workloads,
     runtimes,
     iterations,
-    ...(size === undefined ? {} : { size }),
+    size,
     options: optimize === undefined ? {} : { optimize }
   }
 }
@@ -334,7 +335,7 @@ const benchmarkWorkload = (
       const cold = yield* runtime.compile({
         roots: coldGraph.roots,
         options: config.options,
-        ...(coldGraph.state === undefined ? {} : { state: coldGraph.state })
+        state: coldGraph.state
       })
       coldMilliseconds.push(performance.now() - coldStarted)
 
@@ -354,7 +355,7 @@ const benchmarkWorkload = (
       yield* runtime.compile({
         roots: warmGraph.roots,
         options: config.options,
-        ...(warmGraph.state === undefined ? {} : { state: warmGraph.state })
+        state: warmGraph.state
       })
       warmMilliseconds.push(performance.now() - warmStarted)
     }
@@ -391,8 +392,8 @@ const benchmarkWorkload = (
     }
   })
 
-const writeJson = (value: unknown): void => {
-  process.stdout.write(`${JSON.stringify(value)}\n`)
+const writeJson = (json: string): void => {
+  process.stdout.write(`${json}\n`)
 }
 
 const suite = (config: Config): Effect.Effect<void, unknown, Runtime.Runtime> =>
@@ -407,7 +408,7 @@ const suite = (config: Config): Effect.Effect<void, unknown, Runtime.Runtime> =>
         config.size ?? defaultSizes[workload],
         config
       )
-      yield* Effect.sync(() => writeJson(result))
+      yield* Effect.sync(() => writeJson(JSON.stringify(result) ?? "undefined"))
     }
   })
 
@@ -420,27 +421,29 @@ const main = async (): Promise<void> => {
     )
   }
   const cpuInfo = cpus()
-  writeJson({
-    kind: "metadata",
-    schema: "effect-torch.compile-benchmark.v2",
-    machine: {
-      platform: platform(),
-      arch: arch(),
-      release: release(),
-      cpuModel: cpuInfo[0]?.model ?? "unknown",
-      logicalCpus: cpuInfo.length,
-      totalMemoryBytes: totalmem(),
-      node: process.version
-    },
-    selection: {
-      mode: "cold_native_compile_and_warm_structural_cache_lookup",
-      runtimes: config.runtimes,
-      workloads: config.workloads,
-      iterations: config.iterations,
-      ...(config.size === undefined ? { sizes: defaultSizes } : { size: config.size })
-    },
-    options: config.options
-  })
+  writeJson(
+    JSON.stringify({
+      kind: "metadata",
+      schema: "effect-torch.compile-benchmark.v2",
+      machine: {
+        platform: platform(),
+        arch: arch(),
+        release: release(),
+        cpuModel: cpuInfo[0]?.model ?? "unknown",
+        logicalCpus: cpuInfo.length,
+        totalMemoryBytes: totalmem(),
+        node: process.version
+      },
+      selection: {
+        mode: "cold_native_compile_and_warm_structural_cache_lookup",
+        runtimes: config.runtimes,
+        workloads: config.workloads,
+        iterations: config.iterations,
+        ...(config.size === undefined ? { sizes: defaultSizes } : { size: config.size })
+      },
+      options: config.options
+    }) ?? "undefined"
+  )
 
   if (config.runtimes.includes("cpu")) {
     const BackendCpu = await import("@effect-torch/backend-cpu")
@@ -451,7 +454,7 @@ const main = async (): Promise<void> => {
     if (await Effect.runPromise(BackendApple.isAvailable)) {
       await Effect.runPromise(Effect.provide(suite(config), BackendApple.layer))
     } else {
-      writeJson({ kind: "skipped", runtime: "metal", reason: "unavailable" })
+      writeJson(JSON.stringify({ kind: "skipped", runtime: "metal", reason: "unavailable" }) ?? "undefined")
     }
   }
 }

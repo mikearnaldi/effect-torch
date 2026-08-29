@@ -1,8 +1,8 @@
-//! Fused layer normalization on Metal: one kernel per direction over
-//! per-row threadgroups (two in-kernel passes — mean, then variance —
-//! one launch each way). The backward also emits x̂ so dw/db are two
-//! plain reduce ops host-side instead of another kernel family. CPU
-//! keeps the composed path in lib.rs.
+//! Fused layer normalization on Metal uses one kernel per direction and one
+//! threadgroup per row. Each kernel computes mean and then variance in two
+//! passes. The backward also emits x̂, so the host can compute dw/db with two
+//! reductions instead of another kernel family. CPU uses the composed path in
+//! `lib.rs`.
 //!
 //! ## Kernel contracts
 //!
@@ -20,10 +20,10 @@
 //!   `dx = (g·w − mean(g·w) − x̂·mean(g·w·x̂)) · rstd`, also storing
 //!   `x̂` so the caller derives `dw`/`db` with plain reductions.
 //!
-//! The `*_into` entry points validate contiguity, shape, dtype, and
-//! storage bounds, mark destination buffers written, and allocate
-//! nothing; the allocating wrappers (`ln_forward`, `ln_backward`) are
-//! for use outside planned executables.
+//! The `*_into` functions validate contiguity, shape, dtype, and storage
+//! bounds. They mark destination buffers written and allocate nothing. Use the
+//! allocating `ln_forward` and `ln_backward` wrappers outside planned
+//! executables.
 
 use crate::runtime::metal::run::MetalTensor;
 
@@ -57,8 +57,8 @@ fn test_counts() -> (usize, usize) {
     )
 }
 
-/// Planner-facing description of one device buffer a launch needs
-/// (shape, dtype, and derived element/byte counts, overflow-checked).
+/// Device buffer required by one launch, including overflow-checked shape,
+/// dtype, element count, and byte count.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BufferRequirement {
     /// Logical shape of the buffer.
@@ -95,8 +95,7 @@ impl BufferRequirement {
     }
 }
 
-/// Thread topology selected for a launch. Currently always row-parallel:
-/// one threadgroup per normalized row.
+/// Thread topology for a launch. It currently uses one threadgroup per row.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LayerNormTopology {
     /// One threadgroup per row, `threads` threads each, `dispatches`
@@ -104,8 +103,7 @@ pub enum LayerNormTopology {
     Rows { threads: usize, dispatches: usize },
 }
 
-/// Planner-facing requirements of a forward (layer-norm or RMS-norm)
-/// launch.
+/// Requirements for a forward layer-norm or RMS-norm launch.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LayerNormForwardRequirements {
     /// Output buffer (same shape/dtype as the input).
@@ -120,7 +118,7 @@ pub struct LayerNormForwardRequirements {
     pub dtype: crate::runtime::dtype::DType,
 }
 
-/// Planner-facing requirements of a backward launch.
+/// Requirements for a backward launch.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LayerNormBackwardRequirements {
     /// `dx` output buffer (same shape/dtype as the input).
@@ -138,7 +136,7 @@ pub struct LayerNormBackwardRequirements {
     pub dtype: crate::runtime::dtype::DType,
 }
 
-/// Whether the fused layer-norm path can run: Metal, f32, last-dim norm.
+/// Returns whether Metal can run f32 layer norm over the last dimension.
 pub fn is_supported(x: &MetalTensor, weight: &MetalTensor) -> bool {
     matches!(
         x.dtype,
@@ -216,9 +214,8 @@ mod metal {
         Ok((rows, normalized_elements))
     }
 
-    /// Plans a layer-norm forward: validates the geometry (weight/bias
-    /// shapes must equal the normalized suffix of `x`; dtypes must
-    /// match) and returns the exact requirements.
+    /// Plans a layer-norm forward. Weight and bias shapes must match the
+    /// normalized suffix of `x`, and all dtypes must match.
     pub fn ln_forward_requirements(
         x_shape: &[usize],
         x_dtype: crate::runtime::dtype::DType,
@@ -247,8 +244,8 @@ mod metal {
         })
     }
 
-    /// Plans a layer-norm backward: like the forward, plus the
-    /// cotangent must match `x` exactly in shape and dtype.
+    /// Plans a layer-norm backward. The cotangent must match `x` in shape
+    /// and dtype, in addition to the forward requirements.
     pub fn ln_backward_requirements(
         x_shape: &[usize],
         x_dtype: crate::runtime::dtype::DType,
@@ -279,8 +276,8 @@ mod metal {
         normalized_elements.clamp(32, NT).next_multiple_of(32)
     }
 
-    /// Plans an RMS-norm forward over the last dim with an optional
-    /// weight; selects the register-caching kernel for small rows.
+    /// Plans RMS norm over the last dimension with an optional weight. Small
+    /// rows use the register-caching kernel.
     pub fn rms_forward_requirements(
         x_shape: &[usize],
         x_dtype: crate::runtime::dtype::DType,
@@ -616,7 +613,7 @@ kernel void et_ln_bwd(
         Ok(())
     }
 
-    /// Warms exactly the pipeline described by `requirements`.
+    /// Warms the pipeline described by `requirements`.
     pub fn warm_forward_exact(requirements: &LayerNormForwardRequirements) -> crate::err::Res<()> {
         warm_forward(requirements.dtype)
     }
@@ -629,8 +626,7 @@ kernel void et_ln_bwd(
         }
     }
 
-    /// Warms exactly the RMS pipeline (kernel variant and thread count)
-    /// described by `requirements`.
+    /// Warms the RMS kernel variant and thread count in `requirements`.
     pub fn warm_rms_exact(requirements: &LayerNormForwardRequirements) -> crate::err::Res<()> {
         pipeline(
             rms_kernel_name(requirements.normalized_elements),
@@ -646,7 +642,7 @@ kernel void et_ln_bwd(
         Ok(())
     }
 
-    /// Warms exactly the pipeline described by `requirements`.
+    /// Warms the pipeline described by `requirements`.
     pub fn warm_backward_exact(
         requirements: &LayerNormBackwardRequirements,
     ) -> crate::err::Res<()> {
@@ -665,9 +661,8 @@ kernel void et_ln_bwd(
         })
     }
 
-    /// Non-allocating layer-norm forward dispatch. All tensors must be
-    /// contiguous; `output` must match `x` in shape and dtype. Requires
-    /// the forward pipeline to be warm.
+    /// Dispatches layer-norm forward without allocating. All tensors must be
+    /// contiguous, `output` must match `x`, and the pipeline must be warm.
     pub fn ln_forward_into(
         x: &MetalTensor,
         weight: &MetalTensor,
@@ -714,9 +709,8 @@ kernel void et_ln_bwd(
         Ok(())
     }
 
-    /// Non-allocating RMS-norm forward dispatch. Recomputes the exact
-    /// plan from the arguments and rejects the call when it differs
-    /// from the immutable `requirements` the pipeline was warmed for.
+    /// Dispatches RMS-norm forward without allocating. It recomputes the plan
+    /// and rejects arguments that differ from the warmed `requirements`.
     pub fn rms_forward_into(
         x: &MetalTensor,
         weight: Option<&MetalTensor>,
@@ -764,7 +758,7 @@ kernel void et_ln_bwd(
         Ok(())
     }
 
-    /// Allocating convenience wrapper around [`ln_forward_into`].
+    /// Allocates the output and calls [`ln_forward_into`].
     pub fn ln_forward(
         x: &MetalTensor,
         weight: &MetalTensor,
@@ -792,9 +786,9 @@ kernel void et_ln_bwd(
         Ok(output)
     }
 
-    /// Non-allocating layer-norm backward dispatch: writes `dx` and the
-    /// normalized activations `x̂` (both same shape/dtype as `x`).
-    /// Requires the backward pipeline to be warm.
+    /// Dispatches layer-norm backward without allocating. It writes `dx` and
+    /// normalized activations `x̂`, both with the shape and dtype of `x`. The
+    /// backward pipeline must be warm.
     pub fn ln_backward_into(
         x: &MetalTensor,
         weight: &MetalTensor,
@@ -848,9 +842,9 @@ kernel void et_ln_bwd(
         Ok(())
     }
 
-    /// Allocating convenience wrapper around [`ln_backward_into`];
-    /// returns `(dx, x_hat)`. `dw`/`db` are computed by the caller from
-    /// `x_hat` via plain reductions.
+    /// Allocates outputs, calls [`ln_backward_into`], and returns
+    /// `(dx, x_hat)`. The caller computes `dw`/`db` from `x_hat` with
+    /// reductions.
     pub fn ln_backward(
         x: &MetalTensor,
         weight: &MetalTensor,

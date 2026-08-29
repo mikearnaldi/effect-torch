@@ -1,22 +1,17 @@
-//! Compiler observability: structural work reports and executable
-//! diagnostics assembled from the pipeline's authoritative artifacts.
+//! Compiler work reports and diagnostics built from pipeline artifacts.
 //!
-//! Two distinct families of numbers live here, with a hard boundary between
-//! them:
+//! This module keeps structural counters separate from wall-clock timings:
 //!
-//! - **Structural counters** ([`CompilerWorkReport`], [`PassScanCount`]):
-//!   exact, deterministic tallies of what the compiler did — nodes indexed,
-//!   edges visited, passes scanned, regions selected, values and
-//!   instructions lowered. These are combined only from the authoritative
-//!   artifacts (graph index, optimization plan, lowered program), never
-//!   re-measured.
-//! - **Observational timings** (`CompilePhaseTiming` lists): wall-clock
-//!   measurements carried alongside the structural data. They must never
-//!   influence cache identity, equality, or hashing of any artifact.
+//! - [`CompilerWorkReport`] and [`PassScanCount`] count nodes, edges, pass
+//!   scans, selected regions, and lowered values and instructions. The graph
+//!   index, optimization plan, and lowered program provide these exact,
+//!   deterministic counts. The compiler does not measure them again.
+//! - `CompilePhaseTiming` lists carry wall-clock measurements with the
+//!   structural data. Timings must not affect artifact equality, hashing, or
+//!   cache identity.
 //!
-//! Executable diagnostics additionally present instruction-kind histograms
-//! in lexical order so reports are stable regardless of backend map
-//! implementations or insertion order.
+//! Executable diagnostics sort instruction-kind histograms lexically. Reports
+//! remain stable across backend map implementations and insertion orders.
 
 use crate::{GraphIndex, LoweredProgram, OptimizationWork};
 use effect_torch_runtime::{
@@ -24,9 +19,8 @@ use effect_torch_runtime::{
 };
 use std::collections::BTreeMap;
 
-/// Counts measured by the backend driver outside the compiler's structural
-/// artifacts: pipeline/command/synchronization totals plus the phase timings
-/// to attach to the report.
+/// Backend-driver counts not stored in compiler artifacts, including pipeline,
+/// command, and synchronization totals and the report's phase timings.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct DiagnosticsInput {
     pub pipeline_count: usize,
@@ -52,10 +46,10 @@ impl PassScanCount {
     }
 }
 
-/// Structural compiler work plus observational phase timings.
+/// Structural compiler work and wall-clock phase timings.
 ///
-/// This type intentionally does not implement `Hash`: wall-clock timings are
-/// diagnostics and must never become part of executable cache identity.
+/// This type omits `Hash` because wall-clock timings are diagnostics, not
+/// executable cache identity.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct CompilerWorkReport {
     pub semantic_nodes: usize,
@@ -75,7 +69,7 @@ pub struct CompilerWorkReport {
 }
 
 impl CompilerWorkReport {
-    /// Combines structural counters from the compiler's authoritative artifacts.
+    /// Combines counters from the graph index, optimization plan, and lowered program.
     pub fn from_artifacts<K, M, V>(
         index: &GraphIndex,
         optimization: &OptimizationWork,
@@ -106,16 +100,15 @@ impl CompilerWorkReport {
         }
     }
 
-    /// Overrides the pass-scan list (used when a backend attributes scans
-    /// more finely than the default single "optimization" entry).
+    /// Overrides the pass-scan list when a backend uses finer attribution than
+    /// the default single "optimization" entry.
     pub fn with_pass_scans(mut self, pass_scans: impl Into<Box<[PassScanCount]>>) -> Self {
         self.pass_scans = pass_scans.into();
         self
     }
 
-    /// Attaches observational phase timings. These travel with the report
-    /// but are excluded from its `Eq` semantics' intent: they are
-    /// diagnostics, never identity.
+    /// Attaches phase timings to the report. Timings are diagnostics, not
+    /// artifact identity.
     pub fn with_compile_phases(
         mut self,
         compile_phases: impl Into<Box<[CompilePhaseTiming]>>,

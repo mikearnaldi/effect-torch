@@ -59,25 +59,64 @@ const placement: Runtime.Placement = {
   description: "DFlash shape-only graph runtime"
 }
 
-const tensor = (
+type RuntimeDouble = Partial<Omit<Runtime.RuntimeService, "extensions">> & {
+  readonly extensions?: Partial<Runtime.RuntimeService["extensions"]>
+}
+type TestHandle = Pick<Tensor.Any, "_tag" | "shape" | "dtype" | "storage" | "device" | "placement" | "pipe">
+
+const runtimeDouble = (value: RuntimeDouble): Runtime.RuntimeService => {
+  // SAFETY: Each test supplies every runtime member reached by the code under test.
+  return value as Runtime.RuntimeService
+}
+
+const brandedHandle = (value: TestHandle): Tensor.Any => {
+  // SAFETY: The handle factory supplies all public metadata; only Runtime's private brands are absent.
+  return value as Tensor.Any
+}
+
+function handle(
+  tag: "LazyTensor",
+  shape: ReadonlyArray<number>,
+  dtype?: Tensor.DType,
+  storage?: Runtime.EncodedTensorStorage
+): Tensor.Lazy
+function handle(
+  tag: "Tensor",
+  shape: ReadonlyArray<number>,
+  dtype?: Tensor.DType,
+  storage?: Runtime.EncodedTensorStorage
+): Tensor.Concrete
+function handle(
+  tag: "LazyTensor" | "Tensor",
   shape: ReadonlyArray<number>,
   dtype: Tensor.DType = "f32",
   storage?: Runtime.EncodedTensorStorage
-): Tensor.Any =>
-  ({
-    _tag: "LazyTensor",
+): Tensor.Any {
+  const value = {
+    _tag: tag,
     shape,
     dtype,
-    ...(storage === undefined ? {} : { storage }),
     device: placement.deviceType,
     placement,
     pipe() {
       throw new Error("unused test tensor pipe")
     }
-  }) as unknown as Tensor.Any
+  } satisfies TestHandle
+  if (storage !== undefined) Object.assign(value, { storage })
+  return brandedHandle(value)
+}
+
+const lazyTensor = (shape: ReadonlyArray<number>, dtype: Tensor.DType = "f32"): Tensor.Lazy =>
+  handle("LazyTensor", shape, dtype)
+
+const tensor = (
+  shape: ReadonlyArray<number>,
+  dtype: Tensor.DType = "f32",
+  storage?: Runtime.EncodedTensorStorage
+): Tensor.Concrete => handle("Tensor", shape, dtype, storage)
 
 const graphRequests: Array<Runtime.NodeRequest> = []
-const graphRuntime = {
+const graphRuntime = runtimeDouble({
   identity: {},
   backend: { name: "dflash-test" },
   placement,
@@ -89,48 +128,48 @@ const graphRuntime = {
       const first = request.inputs[0]!
       switch (request.op) {
         case "constant":
-          return tensor([], request.attributes.dtype) as Tensor.Lazy
+          return lazyTensor([], request.attributes.dtype)
         case "full":
-          return tensor(request.attributes.shape, request.attributes.dtype) as Tensor.Lazy
+          return lazyTensor(request.attributes.shape, request.attributes.dtype)
         case "quantizedEmbedding":
-          return tensor(
+          return lazyTensor(
             [...request.inputs[0].shape, request.attributes.logicalShape[1]],
             "f32"
-          ) as Tensor.Lazy
+          )
         case "quantizedLinear":
-          return tensor(
+          return lazyTensor(
             [...request.inputs[0].shape.slice(0, -1), request.attributes.logicalShape[0]],
             "f32"
-          ) as Tensor.Lazy
+          )
         case "concat": {
           const shape = [...request.inputs[0].shape]
           shape[request.attributes.dim] += request.inputs[1].shape[request.attributes.dim]
-          return tensor(shape, first.dtype) as Tensor.Lazy
+          return lazyTensor(shape, first.dtype)
         }
         case "reshape":
-          return tensor(request.attributes.shape, first.dtype) as Tensor.Lazy
+          return lazyTensor(request.attributes.shape, first.dtype)
         case "permute":
-          return tensor(request.attributes.dims.map((axis) => first.shape[axis]), first.dtype) as Tensor.Lazy
+          return lazyTensor(request.attributes.dims.map((axis) => first.shape[axis]), first.dtype)
         case "slice":
-          return tensor(
+          return lazyTensor(
             request.attributes.ranges.map(([start, stop, stride]) => Math.ceil((stop - start) / stride)),
             first.dtype
-          ) as Tensor.Lazy
+          )
         case "argmax":
-          return tensor(first.shape.filter((_, axis) => axis !== request.attributes.dim), "i64") as Tensor.Lazy
+          return lazyTensor(first.shape.filter((_, axis) => axis !== request.attributes.dim), "i64")
         case "cast":
-          return tensor(first.shape, request.attributes.dtype) as Tensor.Lazy
+          return lazyTensor(first.shape, request.attributes.dtype)
         case "scaledDotProductAttention":
-          return tensor([...first.shape.slice(0, -1), request.inputs[2].shape.at(-1)!], first.dtype) as Tensor.Lazy
+          return lazyTensor([...first.shape.slice(0, -1), request.inputs[2].shape.at(-1)!], first.dtype)
         case "max":
         case "sum": {
           const dims = new Set(request.attributes.dims)
-          return tensor(
+          return lazyTensor(
             first.shape.flatMap((dimension, axis) =>
               dims.has(axis) ? request.attributes.keepdims ? [1] : [] : [dimension]
             ),
             first.dtype
-          ) as Tensor.Lazy
+          )
         }
         case "rmsNorm":
         case "rotaryEmbedding":
@@ -140,20 +179,20 @@ const graphRuntime = {
         case "exp":
         case "mul":
         case "sub":
-          return tensor(first.shape, first.dtype) as Tensor.Lazy
+          return lazyTensor(first.shape, first.dtype)
         default:
           throw new Error(`unexpected DFlash graph operation ${request.op}`)
       }
     })
-} as unknown as Runtime.RuntimeService
+})
 
 const graphLayer = Layer.succeed(Runtime.Runtime, graphRuntime)
 
-const packed = (shape: ReadonlyArray<number>): Tensor.Any =>
+const packed = (shape: ReadonlyArray<number>): Tensor.Concrete =>
   tensor(shape, "f32", { encoding: "Q2_K", physicalShape: [shape[0], 1], physicalDtype: "u8" })
 
-const tinyParams = (withOutputNorm = true): Array<Tensor.Any> => {
-  const params: Array<Tensor.Any> = [packed([8, 40]), tensor([8])]
+const tinyParams = (withOutputNorm = true): Array<Tensor.Concrete> => {
+  const params: Array<Tensor.Concrete> = [packed([8, 40]), tensor([8])]
   for (let layer = 0; layer < 5; layer++) {
     params.push(
       tensor([8]),
@@ -204,7 +243,7 @@ it.effect("derives the reference checkpoint parameter catalog", () =>
 
 it.effect("loadGGUF rejects artifacts for another architecture", () => {
   let loaded = false
-  const ggufRuntime = {
+  const ggufRuntime = runtimeDouble({
     extensions: {
       gguf: {
         inspect: () =>
@@ -219,7 +258,7 @@ it.effect("loadGGUF rejects artifacts for another architecture", () => {
           })
       }
     }
-  } as unknown as Runtime.RuntimeService
+  })
   return Effect.gen(function*() {
     const error = yield* Effect.flip(DFlash.loadGGUF("target.gguf"))
     expect(error._tag).toBe("GgufError")
@@ -346,7 +385,7 @@ it.effect("builds replay and noncausal block graphs at tiny geometry", () => {
   return Effect.gen(function*() {
     graphRequests.length = 0
     const params = tinyParams()
-    const artifact = DFlash.artifact(config, params as unknown as ReadonlyArray<Tensor.Concrete>)
+    const artifact = DFlash.artifact(config, params)
     const replay = yield* artifact.replay(params, Array.from({ length: 5 }, () => tensor([2, 8])))
     expect(replay).toHaveLength(5)
     expect(replay.map(({ key, value }) => ({

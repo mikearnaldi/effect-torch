@@ -1,57 +1,50 @@
-//! The semantic computation graph at the heart of effect-torch.
+//! Computation graph types for effect-torch.
 //!
-//! A graph is a lazy DAG of [`Node`]s, each wrapping a [`NodeKind`] that
-//! describes one operation. Nodes are shared through `Arc`, so a value used
-//! by ten consumers exists once. Library construction goes through
-//! [`Node::new`], which computes the node's shape/dtype/device via
-//! [`NodeKind::metadata`] and rejects invalid programs immediately (shape
-//! mismatches, core dtype/device violations such as f64 on Metal, invalid
-//! attention or convolution geometry). [`Node`] fields remain public for
-//! low-level integration, so direct struct literals bypass these guarantees;
-//! backend-specific support is validated again during compilation.
+//! A graph is a lazy DAG of [`Node`]s. Each node wraps one [`NodeKind`]
+//! operation. Nodes share values through `Arc`, so ten consumers can refer to
+//! one value. [`Node::new`] calls [`NodeKind::metadata`] to compute the
+//! node's shape, dtype, and device. It rejects shape mismatches, core dtype or
+//! device violations such as f64 on Metal, and invalid attention or
+//! convolution geometry. [`Node`] keeps its fields public for low-level
+//! integration. Direct struct literals bypass these checks, and backends
+//! validate their own constraints again during compilation.
 //!
 //! # Architecture
 //!
-//! - **Leaves** ([`NodeKind::Leaf`]) hold user tensors behind a
-//!   [`LeafSlot`], which supports one-shot clearing: dropping the slot's
-//!   value releases the underlying storage while the node keeps its cached
-//!   metadata, and any later use fails with [`ClearedLeaf`].
-//! - **Inputs** ([`NodeKind::Input`], [`NodeKind::ScalarInput`]) are
-//!   placeholder leaves for compiled programs; they evaluate only when a
-//!   compiled program binds them to call arguments (RFC 0008).
-//! - **Semantic nodes** (e.g. [`NodeKind::Sdpa`], [`NodeKind::Linear`],
-//!   [`NodeKind::RotaryEmbedding`], [`NodeKind::ChunkedHeadCe`]) keep
-//!   high-level operation semantics in the graph instead of composing them
-//!   from primitives, so that native backends can substitute fused kernels
-//!   and graph rewrites (autodiff, decode compilation, checkpoint
-//!   recompute) can recognize operations structurally. The evaluators compose
-//!   reference implementations from primitive ops; replacing them with fused
-//!   kernels never changes graph semantics.
-//! - **Decode/prefill nodes** ([`NodeKind::KvAttention`],
-//!   [`NodeKind::KdaRecurrence`], [`NodeKind::ConvState`],
-//!   [`NodeKind::LastTokenRow`]) are produced only by the decode rewrite —
-//!   never written by user code. They read/write per-sequence state through
-//!   the run's decode context, keeping the graph itself a pure function of
-//!   its inputs.
-//! - **Backward nodes** ([`NodeKind::SdpaBackward`],
-//!   [`NodeKind::KdaBackward`], [`NodeKind::ChunkedHeadCeBackward`], ...)
-//!   are closed-form adjoints emitted by autodiff. Each computes several
-//!   gradient tensors in one evaluation; the `*Out` companion variants
-//!   project out one result by index. Backward nodes are not themselves
-//!   differentiable (no second-order autodiff).
-//! - **Optimizer steps** ([`NodeKind::AdamWStep`], [`NodeKind::SgdStep`])
-//!   carry step-varying scalars (learning rate, bias corrections, first-step
-//!   flag) as 0-d tensor children rather than captured constants, so a
-//!   frozen compiled graph never replays a stale step count.
+//! - [`NodeKind::Leaf`] stores a user tensor in a [`LeafSlot`]. Clearing
+//!   the slot releases its storage but preserves the node's cached metadata.
+//!   Later use fails with [`ClearedLeaf`].
+//! - [`NodeKind::Input`] and [`NodeKind::ScalarInput`] are placeholders
+//!   for compiled programs. They evaluate only after a compiled program binds
+//!   them to call arguments as specified by RFC 0008.
+//! - Operations such as [`NodeKind::Sdpa`], [`NodeKind::Linear`],
+//!   [`NodeKind::RotaryEmbedding`], and [`NodeKind::ChunkedHeadCe`] retain
+//!   their high-level semantics in the graph. Native backends can replace
+//!   their reference implementations with fused kernels. Graph rewrites such
+//!   as autodiff, decode compilation, and checkpoint recomputation can identify
+//!   the operations by structure. Fused kernels do not change graph semantics.
+//! - The decode rewrite creates [`NodeKind::KvAttention`],
+//!   [`NodeKind::KdaRecurrence`], [`NodeKind::ConvState`], and
+//!   [`NodeKind::LastTokenRow`]. User code does not create them. They access
+//!   per-sequence state through the run's decode context, while the graph stays
+//!   a pure function of its inputs.
+//! - Autodiff emits closed-form adjoints such as [`NodeKind::SdpaBackward`],
+//!   [`NodeKind::KdaBackward`], and [`NodeKind::ChunkedHeadCeBackward`].
+//!   Each computes several gradient tensors in one evaluation. Its `*Out`
+//!   variants select one result by index. Backward nodes do not support
+//!   second-order autodiff.
+//! - [`NodeKind::AdamWStep`] and [`NodeKind::SgdStep`] store the learning
+//!   rate, bias corrections, and first-step flag as 0-d tensor children rather
+//!   than captured constants, so a frozen compiled graph cannot replay a stale
+//!   step count.
 //!
 //! # Traversal and memory safety
 //!
-//! [`node_children`] returns a node's direct children and
-//! [`remap_children`] rebuilds a kind with mapped children (used to
-//! deep-copy subgraphs with fresh ids). Graphs can be very deep, so
-//! [`Node`]'s `Drop` impl drains descendants through an explicit worklist
-//! instead of recursing, avoiding stack overflow when long chains are
-//! dropped on worker threads. The crate contains no `unsafe` code.
+//! [`node_children`] returns a node's direct children. [`remap_children`]
+//! rebuilds a kind with mapped children so callers can copy subgraphs with
+//! fresh ids. Graphs can be deep, so [`Node`]'s `Drop` implementation uses
+//! an explicit worklist instead of recursion. This prevents long chains from
+//! overflowing worker-thread stacks. The crate contains no `unsafe` code.
 
 use effect_torch_runtime::{DType, GgmlKQuant};
 use std::any::Any;
@@ -60,12 +53,11 @@ use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-// IDs issued by Node::new are unique per process and monotonic. Public struct
-// literals can bypass this allocator, so external code must preserve identity
-// if it constructs Node directly.
+// Node::new issues monotonic IDs that are unique within the process. External
+// code that constructs Node directly must preserve this identity.
 static NEXT_NODE_ID: AtomicU64 = AtomicU64::new(0);
 
-/// Compute device a tensor lives on.
+/// A tensor's compute device.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Device {
     Cpu,
@@ -99,8 +91,9 @@ pub enum CrossEntropyReduction {
 
 type CeReduction = CrossEntropyReduction;
 
-/// Cached shape/dtype/device triple of a node, computed once at
-/// construction by [`NodeKind::metadata`].
+/// A node's cached shape, dtype, and device.
+///
+/// [`NodeKind::metadata`] computes these values at construction.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NodeMetadata {
     pub shape: Vec<usize>,
@@ -110,10 +103,9 @@ pub struct NodeMetadata {
 
 /// A user tensor stored in a graph leaf.
 ///
-/// The graph only needs metadata (`shape`, `dtype`, `device`) plus a
-/// downcast path for evaluators; the concrete storage type is defined by
-/// the embedding crate. Implementations must be `Send + Sync` because
-/// graphs are shared across threads.
+/// The graph needs metadata and a downcast path for evaluators. The embedding
+/// crate defines the concrete storage type. Implementations must be
+/// `Send + Sync` because threads share graphs.
 pub trait LeafValue: Any + Send + Sync {
     fn shape(&self) -> Vec<usize>;
     fn dtype(&self) -> DType;
@@ -121,14 +113,14 @@ pub trait LeafValue: Any + Send + Sync {
     fn as_any(&self) -> &dyn Any;
 }
 
-/// Mutex-protected, one-shot-clearable holder for a leaf's value.
+/// A mutex-protected leaf slot with one-shot clearing.
 ///
-/// Clearing releases the underlying tensor storage while nodes that
-/// reference the slot remain valid as metadata. `clear` is idempotent in
-/// effect but reports whether it actually removed a value. The lock is
-/// held only for brief, non-recursive critical sections. A panic in user
-/// `LeafValue` clone/drop code can still poison it; accessors intentionally
-/// treat that as an invariant failure via `unwrap`.
+/// [`LeafSlot::clear`] releases the tensor storage but leaves cached node
+/// metadata valid. It returns whether it removed a value and has no effect
+/// after the first successful call. Accessors hold the lock only for brief,
+/// non-recursive sections. A panic in user `LeafValue` clone or drop code can
+/// poison the lock. Accessors treat this as an invariant failure and call
+/// `unwrap`.
 pub struct LeafSlot(Mutex<Option<Arc<dyn LeafValue>>>);
 
 impl LeafSlot {
@@ -137,14 +129,14 @@ impl LeafSlot {
         Self(Mutex::new(Some(Arc::new(value))))
     }
 
-    /// Removes the value, returning `true` if one was present. Afterwards
+    /// Removes the value, returning `true` if one was present. Afterward,
     /// [`get`](Self::get) and node construction through this slot fail with
     /// [`ClearedLeaf`].
     pub fn clear(&self) -> bool {
         self.0.lock().unwrap().take().is_some()
     }
 
-    /// Clones the value out, downcast to its concrete type. Fails with
+    /// Clones and downcasts the value to its concrete type. Fails with
     /// [`ClearedLeaf`] if the slot was cleared or the type does not match.
     pub fn get<T: LeafValue + Clone>(&self) -> Result<T, ClearedLeaf> {
         self.0
@@ -169,7 +161,7 @@ impl LeafSlot {
     }
 }
 
-/// Error produced when a cleared [`LeafSlot`] is read.
+/// Error returned when code reads a cleared [`LeafSlot`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ClearedLeaf;
 impl fmt::Display for ClearedLeaf {
@@ -179,7 +171,7 @@ impl fmt::Display for ClearedLeaf {
 }
 impl Error for ClearedLeaf {}
 
-// Shared channel/dtype/device validation for Conv1d/Conv2d.
+// Validates channels, dtypes, and devices for Conv1d and Conv2d.
 fn conv_check(
     op: &str,
     x: &Node,
@@ -220,8 +212,8 @@ fn conv_check(
     Ok(())
 }
 
-// Validates rank-2 attention or q [.., Hq, T, D], k [.., Hkv, S, D],
-// v [.., Hkv, S, Dv] and returns the output shape [.., Hq, T, Dv].
+// Validates rank-2 attention and batched forms with q [.., Hq, T, D],
+// k [.., Hkv, S, D], and v [.., Hkv, S, Dv]. Returns [.., Hq, T, Dv].
 fn sdpa_check(op: &str, q: &Node, k: &Node, v: &Node) -> Result<Vec<usize>, String> {
     let rank = q.shape.len();
     if rank < 2 || k.shape.len() != rank || v.shape.len() != rank {
@@ -284,9 +276,9 @@ fn sdpa_check(op: &str, q: &Node, k: &Node, v: &Node) -> Result<Vec<usize>, Stri
     Ok(out)
 }
 
-// Validates kda_chunk operands: q, k and log_decay [.., H, T, Dk], v
-// [.., H, T, Dv], beta [.., H, T, 1]; returns the output shape
-// [.., H, T, Dv]. Leading dims must match exactly.
+// Validates kda_chunk operands. The shapes are q, k, and log_decay
+// [.., H, T, Dk], v [.., H, T, Dv], and beta [.., H, T, 1]. Leading
+// dimensions must match exactly. Returns [.., H, T, Dv].
 fn kda_check(
     op: &str,
     q: &Node,
@@ -349,8 +341,8 @@ fn kda_check(
     Ok(out)
 }
 
-// Validates a chunked head CE operand set: x [.., K], weight [K, V],
-// bias [1, V] or [V], target [..] integer. Returns the vocab.
+// Validates chunked head CE operands: x [.., K], weight [K, V], bias [1, V]
+// or [V], and integer target [..]. Returns the vocabulary size.
 fn head_ce_check(
     op: &str,
     x: &Node,
@@ -414,7 +406,7 @@ fn head_ce_check(
     Ok(v)
 }
 
-// Validates a short_conv1d pair: x [.., T, C], weight [C, K].
+// Validates short_conv1d operands x [.., T, C] and weight [C, K].
 fn short_conv_check(op: &str, x: &Node, weight: &Node) -> Result<(), String> {
     if x.shape.len() < 2 || weight.shape.len() != 2 {
         return Err(format!(
@@ -444,9 +436,9 @@ fn short_conv_check(op: &str, x: &Node, weight: &Node) -> Result<(), String> {
     Ok(())
 }
 
-// Output size of one convolution dimension: floor((in + 2*pad -
-// dilation*(kernel-1) - 1) / stride) + 1, rejecting kernels that exceed the
-// padded input.
+// Computes one convolution output dimension as
+// floor((in + 2*pad - dilation*(kernel-1) - 1) / stride) + 1. Rejects kernels
+// that exceed the padded input.
 fn conv_out_dim(
     input: usize,
     kernel: usize,
@@ -463,11 +455,12 @@ fn conv_out_dim(
     }
     Ok((input + 2 * padding - effective) / stride + 1)
 }
-/// Where a position-indexed semantic node reads its base position:
-/// zero in user graphs, the sequence cursor in decode-rewritten ones.
+/// The base position for a position-indexed operation.
+///
+/// User graphs start at zero. Decode-rewritten graphs use the sequence cursor.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum PositionOffset {
-    /// Positions are absolute (0-based) within the sequence.
+    /// Positions are zero-based within the sequence.
     Absolute,
     /// Positions are offset by the decode run's sequence cursor.
     Cursor,
@@ -480,14 +473,15 @@ pub enum AttentionWindow {
     Inherit,
     /// Attend to the whole context.
     Full,
-    /// Attend to at most the last `window` positions (must be positive).
+    /// Attend to at most the last `window` positions. The window must be
+    /// positive.
     Local(usize),
 }
 
 impl AttentionWindow {
-    /// Resolves `Inherit` against the model-level `inherited` window;
+    /// Resolves `Inherit` against the model-level `inherited` window.
     /// `Full` and `Local` override it. Returns `Some(n)` for a local
-    /// window of `n`, `None` for full attention.
+    /// window of `n` and `None` for full attention.
     pub const fn resolve(self, inherited: Option<usize>) -> Option<usize> {
         match self {
             Self::Inherit => inherited,
@@ -496,18 +490,18 @@ impl AttentionWindow {
         }
     }
 
-    /// The local window if this is `Local`, else `None`.
+    /// Returns the local window, or `None` for other variants.
     pub const fn local(self) -> Option<usize> {
         self.resolve(None)
     }
 }
 
-/// How the last dimension of a rotary embedding is paired for rotation.
+/// Pairing layout for the last dimension of a rotary embedding.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum RotaryLayout {
-    /// GPT-NeoX style: pairs `(x[j], x[j + D/2])`.
+    /// GPT-NeoX pairs `(x[j], x[j + D/2])`.
     HalfSplit,
-    /// GPT-J style: pairs `(x[2j], x[2j + 1])`.
+    /// GPT-J pairs `(x[2j], x[2j + 1])`.
     InterleavedPairs,
 }
 
@@ -522,24 +516,21 @@ pub enum KvAttentionMode {
 
 /// One operation in the computation graph.
 ///
-/// Variants fall into the families described in the crate documentation:
-/// leaves and placeholders, constants/generators, elementwise arithmetic
-/// and comparisons, reductions, indexing, neural-network semantic nodes
-/// (attention, convolutions, normalization, embedding, linear, quantized
-/// ops), closed-form backward nodes with their `*Out` projectors,
-/// decode/prefill state nodes, optimizer steps, and the autodiff control
-/// nodes [`Checkpoint`](NodeKind::Checkpoint) /
+/// Variants represent leaves, placeholders, constants, generators,
+/// elementwise operations, reductions, indexing, and neural network
+/// operations. They also represent closed-form backward operations and their
+/// `*Out` projectors, decode and prefill state, optimizer steps,
+/// [`Checkpoint`](NodeKind::Checkpoint), and
 /// [`StopGradient`](NodeKind::StopGradient).
 ///
-/// Construction is always validated through [`Node::new`]; the per-variant
-/// contracts (operand shapes, dtypes, devices) are documented on the
-/// variants below and enforced by [`NodeKind::metadata`].
+/// [`Node::new`] validates every variant. [`NodeKind::metadata`] enforces
+/// the operand shape, dtype, and device contracts documented below.
 pub enum NodeKind {
     /// A user tensor held in a clearable [`LeafSlot`].
     Leaf(std::sync::Arc<LeafSlot>),
-    // RFC 0008: placeholder leaves for compiled programs. An Input carries
-    // the declared signature of one call argument; it evaluates only inside
-    // CompiledProgram::run, which binds the slot to an argument buffer.
+    // RFC 0008 placeholder for a compiled program. An Input declares one call
+    // argument's signature. CompiledProgram::run binds its slot to an argument
+    // buffer before evaluation.
     Input {
         slot: u32,
         shape: Vec<usize>,
@@ -551,8 +542,8 @@ pub enum NodeKind {
         dtype: DType,
         device: Device,
     },
-    /// Constant tensor decoded from raw bytes in `dtype`'s little-endian
-    /// representation.
+    /// A constant tensor decoded from the little-endian representation of
+    /// `dtype`.
     FromBytes {
         data: Vec<u8>,
         shape: Vec<usize>,
@@ -576,13 +567,13 @@ pub enum NodeKind {
         dtype: DType,
         device: Device,
     },
-    /// Standard-normal random tensor; draws from the run's RNG state.
+    /// A standard-normal random tensor drawn from the run's RNG state.
     Randn {
         shape: Vec<usize>,
         dtype: DType,
         device: Device,
     },
-    /// Uniform random tensor over `[lo, hi)`; requires a float dtype and
+    /// A uniform random tensor over `[lo, hi)`. Requires a float dtype and
     /// `lo < hi`.
     Uniform {
         lo: f64,
@@ -591,8 +582,8 @@ pub enum NodeKind {
         dtype: DType,
         device: Device,
     },
-    /// 1-D tensor of `ceil((end - start) / step)` values starting at
-    /// `start` (clamped at 0 elements).
+    /// A 1-D tensor of `ceil((end - start) / step)` values starting at
+    /// `start`. Negative lengths become zero.
     Arange {
         start: f64,
         end: f64,
@@ -607,59 +598,59 @@ pub enum NodeKind {
         device: Device,
     },
     /// Elementwise binary arithmetic with NumPy-style broadcasting. A 0-d
-    /// float operand never promotes the other operand's dtype (PyTorch
-    /// scalar promotion rules).
+    /// float operand never promotes the other operand's dtype. This follows
+    /// PyTorch scalar promotion rules.
     Add {
         a: Arc<Node>,
         b: Arc<Node>,
     },
-    /// Elementwise subtraction; see [`Add`](NodeKind::Add) for the
+    /// Elementwise subtraction. See [`Add`](NodeKind::Add) for the
     /// broadcasting and dtype rules.
     Sub {
         a: Arc<Node>,
         b: Arc<Node>,
     },
-    /// Elementwise multiplication; see [`Add`](NodeKind::Add).
+    /// Elementwise multiplication. See [`Add`](NodeKind::Add).
     Mul {
         a: Arc<Node>,
         b: Arc<Node>,
     },
-    /// Elementwise division; see [`Add`](NodeKind::Add).
+    /// Elementwise division. See [`Add`](NodeKind::Add).
     Div {
         a: Arc<Node>,
         b: Arc<Node>,
     },
-    /// Elementwise comparison with broadcasting; the output dtype is u8.
+    /// Elementwise comparison with broadcasting. The output dtype is u8.
     Eq {
         a: Arc<Node>,
         b: Arc<Node>,
     },
-    /// Elementwise `>`; u8 output, see [`Eq`](NodeKind::Eq).
+    /// Elementwise `>` with u8 output. See [`Eq`](NodeKind::Eq).
     Gt {
         a: Arc<Node>,
         b: Arc<Node>,
     },
-    /// Elementwise `<`; u8 output, see [`Eq`](NodeKind::Eq).
+    /// Elementwise `<` with u8 output. See [`Eq`](NodeKind::Eq).
     Lt {
         a: Arc<Node>,
         b: Arc<Node>,
     },
-    /// Elementwise `>=`; u8 output, see [`Eq`](NodeKind::Eq).
+    /// Elementwise `>=` with u8 output. See [`Eq`](NodeKind::Eq).
     Ge {
         a: Arc<Node>,
         b: Arc<Node>,
     },
-    /// Elementwise `<=`; u8 output, see [`Eq`](NodeKind::Eq).
+    /// Elementwise `<=` with u8 output. See [`Eq`](NodeKind::Eq).
     Le {
         a: Arc<Node>,
         b: Arc<Node>,
     },
-    /// Elementwise maximum with broadcasting; see [`Add`](NodeKind::Add).
+    /// Elementwise maximum with broadcasting. See [`Add`](NodeKind::Add).
     Maximum {
         a: Arc<Node>,
         b: Arc<Node>,
     },
-    /// Elementwise minimum with broadcasting; see [`Add`](NodeKind::Add).
+    /// Elementwise minimum with broadcasting. See [`Add`](NodeKind::Add).
     Minimum {
         a: Arc<Node>,
         b: Arc<Node>,
@@ -704,9 +695,9 @@ pub enum NodeKind {
     Erf {
         a: Arc<Node>,
     },
-    // Gaussian error linear unit as a single node (Tensor.gelu).
-    // `approximate` selects the tanh form over the exact erf form. A
-    // pointwise unary op: folds into fusion regions like tanh/erf.
+    // Tensor.gelu as one Gaussian error linear unit node. `approximate`
+    // selects the tanh form instead of the exact erf form. This pointwise
+    // unary operation folds into fusion regions like tanh and erf.
     Gelu {
         a: Arc<Node>,
         approximate: bool,
@@ -723,12 +714,12 @@ pub enum NodeKind {
     Round {
         a: Arc<Node>,
     },
-    /// Elementwise sign (−1, 0 or 1).
+    /// Elementwise sign with values -1, 0, or 1.
     Sign {
         a: Arc<Node>,
     },
-    /// Selects from `a` or `b` per element of the u8 `cond`; all three
-    /// broadcast together, and `a`/`b` must share a dtype.
+    /// Selects from `a` or `b` for each element of the u8 `cond`. All
+    /// three broadcast together, and `a` and `b` must share a dtype.
     Where {
         cond: Arc<Node>,
         a: Arc<Node>,
@@ -739,50 +730,50 @@ pub enum NodeKind {
         a: Arc<Node>,
         exp: f64,
     },
-    /// Elementwise cast to `dtype` (never a silent device-imposed
-    /// downcast; the target dtype is explicit in the graph).
+    /// Elementwise cast to `dtype`. The graph records the target dtype, so
+    /// device constraints never cause a silent downcast.
     Cast {
         a: Arc<Node>,
         dtype: DType,
     },
-    /// Sum over `dims`; with `keepdims` the reduced dims become 1 instead
-    /// of being removed.
+    /// Sum over `dims`. With `keepdims`, reduced dimensions have size 1.
+    /// Otherwise, the output omits them.
     Sum {
         a: Arc<Node>,
         dims: Vec<usize>,
         keepdims: bool,
     },
-    /// Mean over `dims`; see [`Sum`](NodeKind::Sum).
+    /// Mean over `dims`. See [`Sum`](NodeKind::Sum).
     Mean {
         a: Arc<Node>,
         dims: Vec<usize>,
         keepdims: bool,
     },
-    /// Maximum over `dims`; see [`Sum`](NodeKind::Sum).
+    /// Maximum over `dims`. See [`Sum`](NodeKind::Sum).
     Max {
         a: Arc<Node>,
         dims: Vec<usize>,
         keepdims: bool,
     },
-    /// Minimum over `dims`; see [`Sum`](NodeKind::Sum).
+    /// Minimum over `dims`. See [`Sum`](NodeKind::Sum).
     Min {
         a: Arc<Node>,
         dims: Vec<usize>,
         keepdims: bool,
     },
-    /// Product over `dims`; see [`Sum`](NodeKind::Sum).
+    /// Product over `dims`. See [`Sum`](NodeKind::Sum).
     Prod {
         a: Arc<Node>,
         dims: Vec<usize>,
         keepdims: bool,
     },
-    /// Indices of the maxima along `dim` (removed from the shape); i64
-    /// output.
+    /// Indices of the maxima along `dim` with i64 output. The output shape
+    /// omits `dim`.
     Argmax {
         a: Arc<Node>,
         dim: usize,
     },
-    /// Indices of the minima along `dim`; i64 output.
+    /// Indices of the minima along `dim` with i64 output.
     Argmin {
         a: Arc<Node>,
         dim: usize,
@@ -792,51 +783,51 @@ pub enum NodeKind {
         a: Arc<Node>,
         dim: usize,
     },
-    /// Selects rows along `dim` by 1-D i64/u32 `indexes`; output shape
-    /// replaces `dim` with `indexes.len()`.
+    /// Selects rows along `dim` using 1-D i64 or u32 `indexes`. The output
+    /// shape replaces `dim` with `indexes.len()`.
     IndexSelect {
         a: Arc<Node>,
         dim: usize,
         indexes: Arc<Node>,
     },
-    /// Adds `src` into `a` along `dim` at `indexes` (i64/u32, same shape
-    /// as `src`); output shape and dtype are `a`'s.
+    /// Adds `src` into `a` along `dim` at i64 or u32 `indexes` with the
+    /// same shape as `src`. The output keeps `a`'s shape and dtype.
     ScatterAdd {
         a: Arc<Node>,
         dim: usize,
         indexes: Arc<Node>,
         src: Arc<Node>,
     },
-    /// Gathers along `dim` with i64/u32 `indexes` of the same rank as `a`;
-    /// the output takes the indexes' shape.
+    /// Gathers along `dim` with i64 or u32 `indexes` of the same rank as
+    /// `a`. The output takes the indexes' shape.
     Gather {
         a: Arc<Node>,
         dim: usize,
         indexes: Arc<Node>,
     },
-    /// Cross-entropy of `logits [.., C]` against integer `target [..]`,
-    /// skipping targets equal to `ignore_index`; scalar output reduced per
-    /// `reduction`.
+    /// Cross-entropy of `logits [.., C]` against integer `target [..]`.
+    /// Skips targets equal to `ignore_index` and reduces the scalar output
+    /// according to `reduction`.
     CrossEntropy {
         logits: Arc<Node>,
         target: Arc<Node>,
         ignore_index: i64,
         reduction: CeReduction,
     },
-    /// Gradient of [`CrossEntropy`](NodeKind::CrossEntropy) w.r.t. the
-    /// logits (same shape as `logits`).
+    /// Gradient of [`CrossEntropy`](NodeKind::CrossEntropy) with respect to
+    /// the logits. The shape matches `logits`.
     CrossEntropyBackward {
         logits: Arc<Node>,
         target: Arc<Node>,
         ignore_index: i64,
         reduction: CeReduction,
     },
-    // Scaled dot-product attention as one semantic node (the SgdStep
-    // precedent: semantics in the graph, execution strategy native). The
-    // eval arms compose candle ops as the reference implementation; a
-    // fused flash kernel can replace them without touching the graph or
-    // its adjoints. Shapes: q [.., T, D], k [.., S, D], v [.., S, Dv]
-    // with equal leading dims; the output is [.., T, Dv].
+    // Scaled dot-product attention as one operation. The graph records its
+    // semantics, while native code chooses how to execute it. Evaluators
+    // compose candle operations as the reference implementation. A fused
+    // flash kernel can replace them without changing the graph or its
+    // adjoints. The shapes are q [.., T, D], k [.., S, D], and
+    // v [.., S, Dv] with equal leading dimensions. The output is [.., T, Dv].
     Sdpa {
         q: Arc<Node>,
         k: Arc<Node>,
@@ -845,14 +836,14 @@ pub enum NodeKind {
         causal: bool,
         window: AttentionWindow,
     },
-    // Closed-form backward: recomputes P = softmax(scores) from q/k and
-    // produces (dq, dk, dv) in one eval; consumers read them through
-    // SdpaBackwardOut. On Metal the forward's flash kernel stashes the
-    // per-row logsumexp in the evaluator, and this node runs the
-    // chunked-recompute backward against it (bounded memory); elsewhere
-    // it recomputes P with composed candle ops. `fwd` is the Sdpa node
-    // this is the adjoint of (reads its output and stashed L). Not
-    // differentiable (no second-order).
+    // The closed-form backward pass recomputes P = softmax(scores) from q and
+    // k, then produces dq, dk, and dv in one evaluation. Consumers read them
+    // through SdpaBackwardOut. On Metal, the forward flash kernel stores the
+    // per-row logsumexp in the evaluator. This node uses it for a chunked
+    // backward pass with bounded memory. Other backends recompute P with
+    // composed candle operations. `fwd` is the Sdpa node whose adjoint this
+    // node computes. It reads that node's output and stored L. This node does
+    // not support second-order differentiation.
     SdpaBackward {
         q: Arc<Node>,
         k: Arc<Node>,
@@ -863,33 +854,31 @@ pub enum NodeKind {
         causal: bool,
         window: AttentionWindow,
     },
-    /// Projects out one output of [`SdpaBackward`](NodeKind::SdpaBackward):
-    /// `index` 0 = dq, 1 = dk, 2 = dv.
+    /// Selects one output of [`SdpaBackward`](NodeKind::SdpaBackward).
+    /// `index` 0 selects dq, 1 selects dk, and 2 selects dv.
     SdpaBackwardOut {
         of: Arc<Node>,
         index: u8,
     },
-    // Absolute position embedding as one semantic node: rows 0..seq_len
-    // of the [max_positions, E] weight table (the Sdpa precedent —
-    // semantics in the graph, execution strategy native). Semantic so
-    // the RFC 0010 decode rewrite can offset the positions by the
-    // runtime cursor instead of re-deriving "this gather is a position
-    // embedding" from composed ops.
+    // Absolute position embedding as one operation. It selects rows
+    // 0..seq_len from the [max_positions, E] weight table. This representation
+    // lets the RFC 0010 decode rewrite offset positions by the runtime cursor
+    // without inferring a position embedding from composed operations.
     PositionEmbedding {
         weight: Arc<Node>,
         seq_len: usize,
     },
-    // RFC 0010: paged KV attention, the decode/prefill semantic node
-    // produced by the decode rewrite (never written by user code —
-    // `compile_decode` turns each causal Sdpa into one). Scatters the
-    // new tokens' k/v into the sequence's pool blocks at the cursor,
-    // then attends q according to `mode` over cached positions. A local
-    // `window` retains that many committed rows; block-bidirectional mode also
-    // retains every current row (None: the whole context). q, k and v are
-    // [1, H, T, D]/[1, H, T, Dv]
-    // with a shared T (the new tokens); the pool, block table and
-    // cursor arrive via the run's kv context, keeping the graph a pure
-    // function of its inputs. Not differentiable.
+    // RFC 0010 paged KV attention for decode and prefill. The decode rewrite
+    // creates this node, and user code does not. `compile_decode` replaces
+    // each causal Sdpa with one. It scatters the new tokens' k and v into the
+    // sequence's pool blocks at the cursor, then attends q over cached
+    // positions according to `mode`. A local `window` retains that many
+    // committed rows. Block-bidirectional mode also retains every current
+    // row. None retains the whole context. q and k have shape [1, H, T, D],
+    // and v has shape [1, H, T, Dv]. T is the shared new-token length.
+    // The run's KV context supplies the pool, block table, and cursor. The
+    // graph remains a pure function of its inputs. This node is not
+    // differentiable.
     KvAttention {
         q: Arc<Node>,
         k: Arc<Node>,
@@ -899,21 +888,20 @@ pub enum NodeKind {
         window: Option<usize>,
         mode: KvAttentionMode,
     },
-    // Kimi Delta Attention (RFC 0018): gated delta-rule linear attention
-    // as one semantic node (the Sdpa precedent — semantics in the graph,
-    // execution strategy native). q, k and log_decay are [.., H, T, Dk],
-    // v is [.., H, T, Dv] and beta is [.., H, T, 1], all with equal
-    // leading dims. log_decay holds the raw per-channel log decay rates
-    // (<= 0, pre-cumsum; the gate activation lives upstream) and beta is
-    // already sigmoided into [0, 1]. The recurrence is
+    // RFC 0018 Kimi Delta Attention implements gated delta-rule linear
+    // attention as one operation. q, k, and log_decay are [.., H, T, Dk].
+    // v is [.., H, T, Dv], and beta is [.., H, T, 1]. Their leading
+    // dimensions match. log_decay contains raw per-channel log decay rates
+    // before cumsum, with values <= 0. The gate activation occurs upstream.
+    // beta is already sigmoid-transformed into [0, 1]. The recurrence is
     // S_t = (I - beta_t k_t k_t^T) Diag(exp(log_decay_t)) S_{t-1}
     //     + beta_t k_t v_t^T,   o_t = scale * S_t^T q_t
-    // starting from a zero state; the output is [.., H, T, Dv]. The
-    // eval arms compose the chunked parallel form (chunk 64, WY
-    // representation + UT transform) as the reference implementation;
-    // fused kernels can replace them without touching the graph. The
-    // decode rewrite turns this into a stateful KdaRecurrence. Not yet
-    // differentiable (phase 4 adds the closed-form backward).
+    // starting from a zero state. The output is [.., H, T, Dv]. Evaluators use
+    // the chunked parallel form with chunk size 64, a WY representation, and a
+    // UT transform as the reference implementation. Fused kernels can replace
+    // it without changing the graph. The decode rewrite replaces this node
+    // with a stateful KdaRecurrence. It is not yet differentiable. Phase 4
+    // adds the closed-form backward pass.
     KdaChunk {
         q: Arc<Node>,
         k: Arc<Node>,
@@ -922,13 +910,12 @@ pub enum NodeKind {
         beta: Arc<Node>,
         scale: f64,
     },
-    // RFC 0018: stateful KDA recurrence, the decode/prefill semantic
-    // node produced by the decode rewrite (never written by user code —
-    // `compile_decode` turns each KdaChunk into one). Same operand
-    // contract as KdaChunk, but the initial state comes from the
-    // sequence's slot in the run's decode context and the final state is
-    // written back to it, keeping the graph a pure function of its
-    // inputs. Not differentiable.
+    // RFC 0018 stateful KDA recurrence for decode and prefill. The decode
+    // rewrite creates this node, and user code does not. `compile_decode`
+    // replaces each KdaChunk with one. It has the same operand contract as
+    // KdaChunk. The initial state comes from the sequence's slot in the run's
+    // decode context, and the node writes the final state back there. The graph
+    // remains a pure function of its inputs. This node is not differentiable.
     KdaRecurrence {
         q: Arc<Node>,
         k: Arc<Node>,
@@ -938,14 +925,14 @@ pub enum NodeKind {
         scale: f64,
         layer: u32,
     },
-    // Closed-form KDA backward (RFC 0018 phase 4): produces (dq, dk, dv,
-    // dlog_decay, dbeta) in one eval from the saved operands and the
-    // output cotangent g (same shape as the forward output); consumers
-    // read them through KdaBackwardOut. The eval arms run the adjoint
-    // delta-rule recurrence in reverse with per-chunk recompute (chunk
-    // start states retained, per-token states recomputed within the
-    // chunk) — bounded memory, no O(T) state retention. Not
-    // differentiable (no second-order).
+    // The RFC 0018 phase 4 closed-form KDA backward pass produces dq, dk, dv,
+    // dlog_decay, and dbeta in one evaluation. It uses the saved operands and
+    // output cotangent g, which has the same shape as the forward output.
+    // Consumers read the results through KdaBackwardOut. Evaluators run the
+    // adjoint delta-rule recurrence in reverse and recompute each chunk. They
+    // retain chunk start states and recompute per-token states within each
+    // chunk. This bounds memory without retaining O(T) states. This node does
+    // not support second-order differentiation.
     KdaBackward {
         q: Arc<Node>,
         k: Arc<Node>,
@@ -959,45 +946,42 @@ pub enum NodeKind {
         of: Arc<Node>,
         index: u8,
     },
-    // Causal depthwise short convolution over [.., T, C] with weight
-    // [C, K] as one semantic node: y[t, c] = sum_j w[c, j] * x[t-K+1+j, c]
-    // with zero history (left zero-padding of K-1). Semantic so the
-    // decode rewrite can carry the K-1-token window as sequence state
-    // instead of re-deriving "this pad+conv is a short conv" from
-    // composed ops.
+    // Causal depthwise short convolution over [.., T, C] with weight [C, K].
+    // It computes y[t, c] = sum_j w[c, j] * x[t-K+1+j, c] with zero history,
+    // which is left zero-padding of K-1. This representation lets the decode
+    // rewrite carry the K-1-token window as sequence state without inferring
+    // a short convolution from composed operations.
     ShortConv1d {
         x: Arc<Node>,
         weight: Arc<Node>,
     },
-    // RFC 0018: stateful short convolution, the decode/prefill semantic
-    // node produced by the decode rewrite (never written by user code).
-    // Same contract as ShortConv1d, but the K-1 previous inputs ride the
-    // sequence's slot and the new window is written back. Not
-    // differentiable.
+    // RFC 0018 stateful short convolution for decode and prefill. The decode
+    // rewrite creates this node, and user code does not. It has the same
+    // contract as ShortConv1d. The sequence's slot stores the previous K-1
+    // inputs and receives the new window. This node is not differentiable.
     ConvState {
         x: Arc<Node>,
         weight: Arc<Node>,
         layer: u32,
     },
-    // Inference-only decode output selector produced by the decode
-    // rewrite (never written by user code — `compile_decode` with the
-    // last-token-row flag wraps each [1, T, V] root in one). Copies the
-    // row selected by the run's token advance (advance - 1) out of the
-    // sequence dimension, producing [V]; the row index is read from the
-    // decode context at execution, so the graph stays a pure function of
-    // its inputs. Not differentiable and rejected under vmap.
+    // Inference-only decode output selector created by the decode rewrite.
+    // User code does not create it. With the last-token-row flag,
+    // `compile_decode` wraps each [1, T, V] root in one. It copies the row at
+    // the run's token advance minus one from the sequence dimension and
+    // produces [V]. At execution, it reads the row index from the decode
+    // context, so the graph remains a pure function of its inputs. This node
+    // is not differentiable and vmap rejects it.
     LastTokenRow {
         a: Arc<Node>,
     },
-    // RFC 0016 phase 2 (as-built revision): the chunked head +
-    // cross-entropy as one semantic node. Forward semantics are exactly
-    // Mean cross-entropy of Linear(x, weight, bias) against target, but
-    // evaluation processes one row-chunk at a time so the [rows, vocab]
-    // logits never materialize whole. Semantic so the adjoint can run
-    // the same chunk loop with a single transient grad-logits workspace
-    // — the graph-rewrite version (per-chunk CE nodes) kept every
-    // chunk's backward workspace alive until the head-parameter roots
-    // evaluated, which consumer-count release cannot fix.
+    // RFC 0016 phase 2, as built, combines the chunked head and cross-entropy
+    // in one operation. Its forward result is the mean cross-entropy of
+    // Linear(x, weight, bias) against target. Evaluation processes one row
+    // chunk at a time and never materializes the full [rows, vocab] logits.
+    // The adjoint can use the same chunk loop with one temporary grad-logits
+    // workspace. The graph-rewrite version used one CE node per chunk and kept
+    // every backward workspace alive until the head-parameter roots evaluated.
+    // Consumer-count release cannot shorten those lifetimes.
     ChunkedHeadCe {
         x: Arc<Node>,
         weight: Arc<Node>,
@@ -1005,11 +989,11 @@ pub enum NodeKind {
         target: Arc<Node>,
         ignore_index: i64,
     },
-    // Closed-form adjoint: one eval loops the chunks, recomputing each
-    // chunk's logits and grad-logits in a transient workspace and
-    // accumulating (dx, dw, db); consumers read them through
-    // ChunkedHeadCeBackwardOut. g is the scalar cotangent of the loss.
-    // Not differentiable (no second-order).
+    // The closed-form adjoint loops over the chunks in one evaluation. It
+    // recomputes each chunk's logits and grad-logits in a temporary workspace,
+    // then accumulates dx, dw, and db. Consumers read them through
+    // ChunkedHeadCeBackwardOut. g is the loss's scalar cotangent. This node
+    // does not support second-order differentiation.
     ChunkedHeadCeBackward {
         x: Arc<Node>,
         weight: Arc<Node>,
@@ -1018,18 +1002,18 @@ pub enum NodeKind {
         g: Arc<Node>,
         ignore_index: i64,
     },
-    /// Projects out one output of
-    /// [`ChunkedHeadCeBackward`](NodeKind::ChunkedHeadCeBackward): `index`
-    /// 0 = dx, 1 = dweight, 2 = dbias.
+    /// Selects one output of
+    /// [`ChunkedHeadCeBackward`](NodeKind::ChunkedHeadCeBackward). `index`
+    /// 0 selects dx, 1 selects dweight, and 2 selects dbias.
     ChunkedHeadCeBackwardOut {
         of: Arc<Node>,
         index: u8,
     },
-    // ShortConv1d adjoints (RFC 0018 phase 4): dx is the full
-    // correlation of the cotangent with the (unflipped) weight, dw the
-    // per-tap correlation of cotangent and input over the zero-padded
-    // causal window. x rides along for shape/dtype metadata. Not
-    // differentiable (no second-order).
+    // RFC 0018 phase 4 ShortConv1d adjoints. dx is the full correlation of the
+    // cotangent with the unflipped weight. dw is the per-tap correlation of
+    // the cotangent and input over the zero-padded causal window. x supplies
+    // shape and dtype metadata. These nodes do not support second-order
+    // differentiation.
     ShortConv1dBackwardX {
         x: Arc<Node>,
         weight: Arc<Node>,
@@ -1040,14 +1024,14 @@ pub enum NodeKind {
         weight: Arc<Node>,
         g: Arc<Node>,
     },
-    // RoPE (GPT-NeoX half-split rotary) as one semantic node: x is
-    // [.., T, D] with D even; the last dim rotates in half pairs by
-    // (offset + position) * theta^(-2j/D). Absolute positions ride the
-    // tensor, attention sees only offsets — so cached K/V stay valid as
-    // the context grows, which learned absolute embeddings cannot do.
-    // `offset` is Absolute in user graphs; the decode rewrite flips it
-    // to Cursor (the run's kv cursor) instead of re-deriving "this
-    // arange is a position" from composed ops.
+    // RoPE with GPT-NeoX half-split rotation. x has shape [.., T, D] with even
+    // D. The last dimension rotates in half pairs by
+    // (offset + position) * theta^(-2j/D). The tensor stores absolute
+    // positions, while attention sees only offsets. This keeps cached K and V
+    // valid as the context grows, unlike learned absolute embeddings.
+    // User graphs set `offset` to Absolute. The decode rewrite changes it to
+    // Cursor, which uses the run's KV cursor, without inferring positions from
+    // composed operations.
     RotaryEmbedding {
         x: Arc<Node>,
         seq_len: usize,
@@ -1055,9 +1039,9 @@ pub enum NodeKind {
         offset: PositionOffset,
         layout: RotaryLayout,
     },
-    // Backward of RotaryEmbedding (absolute positions only): the
-    // transpose rotation, evaluated by the same fused kernel with
-    // negated angles. Carries the input's shape/seq_len for metadata.
+    // Backward pass for RotaryEmbedding with absolute positions only. It
+    // applies the transpose rotation through the same fused kernel with
+    // negated angles. The input shape and seq_len provide metadata.
     RotaryEmbeddingBackward {
         g: Arc<Node>,
         shape: Vec<usize>,
@@ -1065,48 +1049,49 @@ pub enum NodeKind {
         theta: f64,
         layout: RotaryLayout,
     },
-    // Layer normalization over the last dim: y = (x − μ)/√(σ² + eps) ·
-    // weight + bias. Semantic node (like RotaryEmbedding) so the fused
-    // Metal kernel handles it as one launch and decode compilation can
-    // pass it through.
+    // Layer normalization over the last dimension:
+    // y = (x - mean) / sqrt(variance + eps) * weight + bias.
+    // The fused Metal kernel handles this operation in one launch, and decode
+    // compilation can pass it through.
     LayerNorm {
         x: Arc<Node>,
         weight: Arc<Node>,
         bias: Arc<Node>,
         eps: f64,
     },
-    // RMS normalization over the last dimension:
-    // y = x / sqrt(mean(x^2) + eps), optionally multiplied by weight.
+    // RMS normalization over the last dimension. It computes
+    // y = x / sqrt(mean(x^2) + eps), with an optional weight multiplier.
     RmsNorm {
         x: Arc<Node>,
         weight: Option<Arc<Node>>,
         eps: f64,
     },
-    // Backward of LayerNorm: evaluates dx (its own value) and stores
-    // (dw, db) for LayerNormBackwardOut, like the optimizer steps.
+    // The LayerNorm backward pass evaluates dx as its own value and stores dw
+    // and db for LayerNormBackwardOut, as optimizer steps do.
     LayerNormBackward {
         x: Arc<Node>,
         weight: Arc<Node>,
         g: Arc<Node>,
         eps: f64,
     },
-    // Reads one weight-side output of a LayerNormBackward (1 = dw,
-    // 2 = db).
+    // Reads one weight-side output of LayerNormBackward. Index 1 selects dw,
+    // and index 2 selects db.
     LayerNormBackwardOut {
         of: Arc<Node>,
         index: u8,
     },
-    // Fused linear layer: y = x·W + b in one gemm launch (addmm
-    // epilogue on Metal). Semantic node — Model.linear and attention
-    // projections build it directly.
+    // Fused linear layer computing y = x * W + b in one GEMM launch. Metal
+    // uses an addmm epilogue. Model.linear and attention projections build
+    // this node directly.
     Linear {
         x: Arc<Node>,
         weight: Arc<Node>,
         bias: Arc<Node>,
     },
-    /// Linear layer over a packed K-quant weight: `x [.., columns]` (f32)
-    /// times the dequantized `weight_shape = [rows, columns]` matrix, plus
-    /// optional f32 bias `[rows]`; f32 output `[.., rows]`. `weight` is the
+    /// A linear layer with packed K-quant weights. It multiplies f32
+    /// `x [.., columns]` by the dequantized
+    /// `weight_shape = [rows, columns]` matrix and adds an optional f32 bias
+    /// `[rows]`. The f32 output has shape `[.., rows]`. `weight` is the
     /// packed u8 tensor `[rows, encoded_row_bytes]`.
     QuantizedLinear {
         x: Arc<Node>,
@@ -1115,10 +1100,10 @@ pub enum NodeKind {
         codec: GgmlKQuant,
         weight_shape: [usize; 2],
     },
-    /// Embedding lookup over a packed K-quant table: `indexes` (i64/u32,
-    /// any shape) select rows of the dequantized
-    /// `weight_shape = [rows, columns]` table; f32 output
-    /// `[..indexes, columns]`. `padding_index`, when set, zeroes that row's
+    /// An embedding lookup over a packed K-quant table. The i64 or u32
+    /// `indexes` may have any shape and select rows of the dequantized
+    /// `weight_shape = [rows, columns]` table. The f32 output has shape
+    /// `[..indexes, columns]`. When set, `padding_index` zeroes that row's
     /// output and gradient.
     QuantizedEmbedding {
         indexes: Arc<Node>,
@@ -1127,8 +1112,8 @@ pub enum NodeKind {
         weight_shape: [usize; 2],
         padding_index: Option<usize>,
     },
-    /// 1-D convolution: x `[N, C_in, L]`, w `[C_out, C_in/groups, K]`;
-    /// output `[N, C_out, L_out]`.
+    /// A 1-D convolution with x `[N, C_in, L]` and
+    /// w `[C_out, C_in/groups, K]`. The output is `[N, C_out, L_out]`.
     Conv1d {
         x: Arc<Node>,
         w: Arc<Node>,
@@ -1137,7 +1122,8 @@ pub enum NodeKind {
         dilation: usize,
         groups: usize,
     },
-    /// 2-D convolution: x `[N, C_in, H, W]`, w `[C_out, C_in/groups, KH, KW]`.
+    /// A 2-D convolution with x `[N, C_in, H, W]` and
+    /// w `[C_out, C_in/groups, KH, KW]`.
     Conv2d {
         x: Arc<Node>,
         w: Arc<Node>,
@@ -1146,9 +1132,9 @@ pub enum NodeKind {
         dilation: usize,
         groups: usize,
     },
-    /// Transposed 1-D convolution; output length
+    /// A transposed 1-D convolution with output length
     /// `(L-1)*stride + dilation*(K-1) + output_padding + 1 - 2*padding`,
-    /// channels `w[1] * groups`.
+    /// and `w[1] * groups` channels.
     ConvTranspose1d {
         x: Arc<Node>,
         w: Arc<Node>,
@@ -1158,7 +1144,7 @@ pub enum NodeKind {
         dilation: usize,
         groups: usize,
     },
-    /// Transposed 2-D convolution; see
+    /// A transposed 2-D convolution. See
     /// [`ConvTranspose1d`](NodeKind::ConvTranspose1d) for the size formula,
     /// applied per spatial dimension.
     ConvTranspose2d {
@@ -1194,58 +1180,61 @@ pub enum NodeKind {
         dilation: usize,
         groups: usize,
     },
-    /// Reinterprets `a` with `shape`; the element count must be preserved.
+    /// Reinterprets `a` with `shape`. The element count must stay the same.
     Reshape {
         a: Arc<Node>,
         shape: Vec<usize>,
     },
-    /// Reorders dimensions; `dims` must be a permutation of the rank.
+    /// Reorders dimensions. `dims` must be a permutation of the rank.
     Permute {
         a: Arc<Node>,
         dims: Vec<usize>,
     },
-    /// Per-dimension strided view; each range is `(start, stop, stride)`
-    /// and the output dim is `ceil((stop - start) / stride)`.
+    /// A strided view for each dimension. Each range is
+    /// `(start, stop, stride)`, and the output dimension is
+    /// `ceil((stop - start) / stride)`.
     Slice {
         a: Arc<Node>,
         ranges: Vec<(usize, usize, usize)>,
     },
-    /// Concatenates `a` and `b` along `dim`; all other dims must match.
+    /// Concatenates `a` and `b` along `dim`. All other dimensions must
+    /// match.
     Concat {
         a: Arc<Node>,
         b: Arc<Node>,
         dim: usize,
     },
-    /// Broadcasts `a` to the equal-or-higher-rank `shape`; non-1 source
-    /// dims must match the target.
+    /// Broadcasts `a` to `shape`, which must have equal or higher rank.
+    /// Source dimensions other than 1 must match the target.
     BroadcastTo {
         a: Arc<Node>,
         shape: Vec<usize>,
     },
-    /// Batched matrix product over the last two dims with broadcasting
-    /// leading dims: `[.., M, K] × [.., K, N] -> [.., M, N]`.
+    /// A batched matrix product over the last two dimensions with broadcast
+    /// leading dimensions: `[.., M, K] @ [.., K, N] -> [.., M, N]`.
     Matmul {
         a: Arc<Node>,
         b: Arc<Node>,
     },
-    /// Matrix inverse over the last two (square, float) dims.
+    /// Matrix inverse over the last two square float dimensions.
     Inverse {
         a: Arc<Node>,
     },
-    /// Determinant over the last two (square, float) dims; the output
-    /// drops both.
+    /// Determinant over the last two square float dimensions. The output drops
+    /// both dimensions.
     Det {
         a: Arc<Node>,
     },
-    /// Solves `a·x = b` for `x`; `a` square float on the last two dims,
-    /// `b` `[.., N, NRHS]` matching `a`'s leading dims and size.
+    /// Solves `a * x = b` for `x`. The last two dimensions of `a` form a
+    /// square float matrix. `b [.., N, NRHS]` matches `a`'s leading
+    /// dimensions and size.
     Solve {
         a: Arc<Node>,
         b: Arc<Node>,
     },
-    // lr, c1 (1 - beta1^t) and c2 (1 - beta2^t) are 0-d tensor children:
-    // step-varying values flow through the graph so a frozen graph (RFC
-    // 0008) never replays a stale step count or learning rate.
+    // lr, c1 = 1 - beta1^t, and c2 = 1 - beta2^t are 0-d tensor children.
+    // Their changing values flow through the graph, so an RFC 0008 frozen
+    // graph never replays a stale step count or learning rate.
     AdamWStep {
         param: Arc<Node>,
         grad: Arc<Node>,
@@ -1259,15 +1248,17 @@ pub enum NodeKind {
         eps: f64,
         weight_decay: f64,
     },
-    /// Projects out one output of [`AdamWStep`](NodeKind::AdamWStep):
-    /// `index` 0 = updated param, 1 = first moment, 2 = second moment.
+    /// Selects one output of [`AdamWStep`](NodeKind::AdamWStep). `index` 0
+    /// selects the updated parameter, 1 the first moment, and 2 the second
+    /// moment.
     AdamWOut {
         step: Arc<Node>,
         index: u8,
     },
-    // `first` is a 0-d flag (1.0 on the first step, 0.0 after) selecting
-    // v = g over v = momentum * v + (1 - dampening) * g; velocity is always
-    // a real buffer (zeros at init), so no placeholder is needed.
+    // `first` is a 0-d flag that is 1.0 on the first step and 0.0 afterward.
+    // It selects v = g instead of v = momentum * v + (1 - dampening) * g.
+    // Velocity always has a real buffer initialized to zero, so it needs no
+    // placeholder.
     SgdStep {
         param: Arc<Node>,
         grad: Arc<Node>,
@@ -1279,40 +1270,39 @@ pub enum NodeKind {
         nesterov: bool,
         weight_decay: f64,
     },
-    /// Projects out one output of [`SgdStep`](NodeKind::SgdStep): `index`
-    /// 0 = updated param, 1 = updated velocity.
+    /// Selects one output of [`SgdStep`](NodeKind::SgdStep). `index` 0
+    /// selects the updated parameter, and 1 selects the updated velocity.
     SgdOut {
         step: Arc<Node>,
         index: u8,
     },
-    /// Identity in the forward pass; autodiff stops gradient propagation
-    /// at this node.
+    /// Identity in the forward pass. Autodiff stops gradient propagation at
+    /// this node.
     StopGradient {
         a: Arc<Node>,
     },
-    /// Identity in the forward pass; autodiff recomputes the wrapped
-    /// subgraph during backward instead of retaining its activations.
+    /// Identity in the forward pass. During the backward pass, autodiff
+    /// recomputes the wrapped subgraph instead of retaining its activations.
     Checkpoint {
         a: Arc<Node>,
     },
-    /// Identity carrying a stable name: marks the wrapped value as an
-    /// inference exposure discoverable by graph walks. Autodiff treats it
-    /// as identity; lowering aliases it away with no cost.
+    /// Identity with a stable name. Graph walks can discover the wrapped value
+    /// as an inference exposure. Autodiff treats it as identity, and lowering
+    /// aliases it away at no cost.
     Expose {
         a: Arc<Node>,
         name: String,
     },
 }
 
-/// One node of the computation graph: an identity, cached metadata, and the
-/// operation itself.
+/// One computation graph node with an identity, cached metadata, and an
+/// operation.
 ///
-/// Nodes returned by [`Node::new`] are immutable behind `Arc`, have
-/// process-unique monotonically issued ids, and cache metadata derived from
-/// `kind`. Because the fields are public, direct struct construction is a
-/// low-level escape hatch: callers taking it must provide a unique/stable id
-/// and metadata exactly matching [`NodeKind::metadata`]. Identity is by `id`,
-/// not pointer.
+/// [`Node::new`] returns immutable nodes behind `Arc`. It issues monotonic
+/// process-unique ids and caches metadata derived from `kind`. Public fields
+/// allow low-level direct construction. Callers that construct a node directly
+/// must provide a unique, stable id and metadata that exactly matches
+/// [`NodeKind::metadata`]. The `id`, not the pointer, determines identity.
 pub struct Node {
     pub id: u64,
     pub shape: Vec<usize>,
@@ -1323,13 +1313,13 @@ pub struct Node {
 
 impl Drop for Node {
     fn drop(&mut self) {
-        // Deep graphs (long op chains, large fused backward graphs)
-        // recurse in default destructor glue through Arc<Node> children
-        // and overflow worker-thread stacks, so descendants drain into a
-        // worklist: children are cloned out BEFORE their parent's kind
-        // drops (so no Node destructor can fire mid-drain), uniquely
-        // owned nodes are unwrapped and their kind swapped for a dummy
-        // leaf, and their children rejoin the worklist.
+        // Default destruction follows Arc<Node> children recursively. Deep
+        // operation chains and large fused backward graphs can overflow worker
+        // thread stacks, so this destructor drains descendants through a
+        // worklist. It clones children before dropping their parent's kind,
+        // which prevents a Node destructor from running during that step. It
+        // unwraps uniquely owned nodes, swaps each kind for a dummy leaf, and
+        // adds their children to the worklist.
         let dummy = || NodeKind::Zeros {
             shape: Vec::new(),
             dtype: DType::F32,
@@ -1344,8 +1334,8 @@ impl Drop for Node {
                 continue;
             };
             let kind = std::mem::replace(&mut node.kind, dummy());
-            // `node` drops at the end of this iteration with a dummy
-            // kind; its Drop sees no children and returns immediately.
+            // `node` drops with a dummy kind at the end of this iteration.
+            // Its Drop finds no children and returns.
             worklist.extend(node_children(&kind));
             drop(kind);
         }
@@ -1353,10 +1343,10 @@ impl Drop for Node {
 }
 
 impl Node {
-    /// Validates `kind` (operand shapes, dtypes, devices — see
-    /// [`NodeKind::metadata`]) and, on success, returns the shared node
-    /// with its metadata cached. Prefer this over public struct construction;
-    /// it is the path that guarantees a fresh id and consistent metadata.
+    /// Validates `kind` and returns a shared node with cached metadata. See
+    /// [`NodeKind::metadata`] for operand shape, dtype, and device checks.
+    /// Unlike direct struct construction, this function guarantees a fresh id
+    /// and consistent metadata.
     pub fn new(kind: NodeKind) -> Result<Arc<Self>, String> {
         let metadata = kind.metadata()?;
         Ok(Arc::new(Self {
@@ -1391,10 +1381,10 @@ fn broadcast_shapes(a: &[usize], b: &[usize]) -> std::result::Result<Vec<usize>,
     Ok(out)
 }
 
-// A 0-d float operand never promotes a float tensor's dtype: scalar ×
-// tensor keeps the tensor's dtype (the scalar is cast to it at
-// evaluation), matching PyTorch's scalar promotion rules. Mismatches
-// involving integer dtypes keep the legacy first-operand rule.
+// A 0-d float operand never promotes a float tensor's dtype. A scalar-tensor
+// operation keeps the tensor's dtype and casts the scalar to it during
+// evaluation, matching PyTorch's scalar promotion rules. Integer dtype
+// mismatches keep the existing first-operand rule.
 fn scalar_aware_binary_dtype(a: &Node, b: &Node) -> DType {
     if a.dtype != b.dtype
         && a.dtype.is_float()
@@ -1445,10 +1435,10 @@ fn linear_out_shape(
     Ok(out)
 }
 impl NodeKind {
-    /// Computes the node's output metadata and validates all operand
-    /// contracts. Every constructor path (`Node::new`, including nodes
-    /// rebuilt by compiler rewrites) goes through this, ending with the
-    /// device/dtype capability check (`check_dtype_device`).
+    /// Computes output metadata and validates all operand contracts.
+    /// `Node::new` calls this for every node, including nodes rebuilt by
+    /// compiler rewrites. The final check, `check_dtype_device`, validates
+    /// device and dtype support.
     pub fn metadata(&self) -> Result<NodeMetadata, String> {
         let (shape, dtype, device) = match self {
             NodeKind::Leaf(slot) => {
@@ -1823,8 +1813,8 @@ impl NodeKind {
                     ));
                 }
                 if rank < 3 {
-                    // Leading dims are the batch (one per kv slot);
-                    // slot counts are checked at run time (RFC 0013).
+                    // Leading dimensions form the batch, with one per KV slot.
+                    // RFC 0013 checks slot counts at run time.
                     return Err(format!(
                         "kv_attention: expected shape [B..., H, T, D], got {:?}",
                         q.shape
@@ -2519,11 +2509,11 @@ impl NodeKind {
         })
     }
 }
-// RFC 0012: device dtype capabilities, enforced at graph construction
-// (Node::new is the single choke point — every lazy node, including
-// from-bytes leaves and nodes rebuilt by compile/fuse rewrites, passes
-// through here). Metal's shading language has no f64. Never a silent
-// downcast, never deferred to compute time.
+// RFC 0012 device dtype capabilities. Node::new enforces them during graph
+// construction. Every lazy node passes through this check, including
+// from-bytes leaves and nodes rebuilt by compiler or fusion rewrites. Metal's
+// shading language has no f64. This check never downcasts or defers failure to
+// compute time.
 fn check_dtype_device(dtype: DType, device: &Device) -> std::result::Result<(), String> {
     if matches!(dtype, DType::F64) && matches!(device, Device::Metal) {
         return Err(
@@ -2536,11 +2526,10 @@ fn check_dtype_device(dtype: DType, device: &Device) -> std::result::Result<(), 
 /// The direct children of a node, in operand order. Leaves, placeholders,
 /// constants and generators have none.
 ///
-/// A permute of contiguous storage that reorders only extent-1 axes leaves
-/// the linearization unchanged, so it lowers to a zero-cost alias instead of
-/// a transpose kernel. `dims` maps output axis → source axis; the check
-/// compares the sequence of non-unit source axes in output order against
-/// input order.
+/// Permuting contiguous storage only along extent-1 axes leaves its
+/// linearization unchanged. Lowering can use a zero-cost alias instead of a
+/// transpose kernel. `dims` maps each output axis to a source axis. This
+/// check compares non-unit source axes in output order with input order.
 pub fn permute_moves_only_unit_axes(shape: &[usize], dims: &[usize]) -> bool {
     let non_unit = shape
         .iter()
@@ -2553,8 +2542,8 @@ pub fn permute_moves_only_unit_axes(shape: &[usize], dims: &[usize]) -> bool {
         .eq(non_unit)
 }
 
-/// This is the canonical child enumeration: evaluators, autodiff, rewrites
-/// and the iterative [`Node`] destructor all rely on it being exhaustive.
+/// The canonical child enumeration. Evaluators, autodiff, rewrites, and the
+/// iterative [`Node`] destructor require it to be exhaustive.
 pub fn node_children(kind: &NodeKind) -> Vec<Arc<Node>> {
     match kind {
         NodeKind::Leaf(_)
@@ -2779,11 +2768,11 @@ pub fn node_children(kind: &NodeKind) -> Vec<Arc<Node>> {
     }
 }
 
-/// Rebuilds a node kind with its children mapped through `f`. Used to
-/// deep-copy subgraphs with fresh node ids (checkpoint recompute).
+/// Rebuilds a node kind with its children mapped through `f`. Checkpoint
+/// recomputation uses it to copy subgraphs with fresh node ids.
 ///
-/// Non-child fields are cloned verbatim; the result is not re-validated —
-/// pass it to [`Node::new`] for that.
+/// Clones non-child fields without validation. Pass the result to
+/// [`Node::new`] to validate it.
 pub fn remap_children(kind: &NodeKind, f: &dyn Fn(&Arc<Node>) -> Arc<Node>) -> NodeKind {
     match kind {
         NodeKind::Leaf(t) => NodeKind::Leaf(t.clone()),

@@ -36,7 +36,12 @@ onDevices("Speculation", () => (it) => {
     Effect.gen(function*() {
       const build = (_: Model.Params, input: Tensor.Any) => Tensor.relu(input)
       const replay = (_: Model.Params, inputs: ReadonlyArray<Tensor.Any>) =>
-        Effect.succeed(inputs.map((input) => ({ key: input as Tensor.Lazy, value: input as Tensor.Lazy })))
+        Effect.sync(() =>
+          inputs.map((input) => {
+            if (!Tensor.isLazyTensor(input)) throw new Error("replay inputs must be lazy tensors")
+            return { key: input, value: input }
+          })
+        )
       const artifact = Speculation.parallelBlock({
         params: [],
         vocabulary: 16,

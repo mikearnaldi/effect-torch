@@ -3,13 +3,11 @@
 //!
 //! # Design
 //!
-//! Direct convolutions — no im2col, no workspace: one thread per output
-//! element loops over the receptive field, accumulating in f32 regardless
-//! of storage dtype. Input and weight/gradient strides are baked into the
-//! emitted MSL as constant arithmetic, so arbitrary layouts (including
-//! strided views and nonzero offsets) are consumed directly; destinations
-//! must be contiguous. Grouped convolutions decompose channel indices at
-//! emission time.
+//! Direct convolutions use no im2col or workspace. One thread per output
+//! element loops over the receptive field and accumulates in f32 regardless
+//! of storage dtype. Input and weight or gradient strides become constants
+//! in the emitted MSL, so arbitrary layouts need no copy. Destinations must
+//! be contiguous. Grouped convolutions decompose channel indices at emission.
 //!
 //! # Restrictions
 //!
@@ -21,10 +19,10 @@
 //!
 //! # Requirements contract
 //!
-//! `*_requirements` compute the exact output shape/bytes and pipeline
-//! count (convolutions need no scratch or staging); `compile_*_layouts` /
-//! `warm_*_layouts` precompile; the `*_into` entry points validate the
-//! destination, require the warm pipeline, and allocate nothing.
+//! `*_requirements` compute output shape, bytes, and pipeline count.
+//! Convolutions need no scratch or staging. `compile_*_layouts` and
+//! `warm_*_layouts` precompile the pipelines. The `*_into` functions validate
+//! destinations, require a warm pipeline, and allocate nothing.
 
 use super::device::{set_buffer, MetalDevice, Pipeline};
 use super::run::MetalTensor;

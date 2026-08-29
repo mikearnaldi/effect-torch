@@ -151,8 +151,8 @@ export class BackendError extends Data.TaggedError("BackendError")<{
   readonly message: string
   /** Optional backend-specific diagnostic payload. */
   readonly details?: unknown
-  /** Cohesive inference phase, when the operation belongs to that contract. */
-  readonly inferencePhase?: InferenceFailurePhase
+  /** Inference phase, when the operation belongs to that interface. */
+  readonly inferencePhase?: InferenceFailurePhase | undefined
 }> {}
 
 /** Internal nominal brand for all tensor handles. */
@@ -167,7 +167,7 @@ declare const ExecutableHandleTypeId: unique symbol
 declare const KvPoolHandleTypeId: unique symbol
 /** Internal nominal brand for paged KV sequence handles. */
 declare const KvSequenceHandleTypeId: unique symbol
-/** Internal nominal brand for a cohesive native inference artifact. */
+/** Internal nominal brand for a native inference artifact. */
 declare const InferenceArtifactHandleTypeId: unique symbol
 /** Internal nominal brand for a native generation session. */
 declare const InferenceSessionHandleTypeId: unique symbol
@@ -199,7 +199,7 @@ export interface TensorHandle extends Pipeable {
   /** Tensor element data type. */
   readonly dtype: DType
   /** Omitted for dense storage; present for a packed logical `f32` value. */
-  readonly storage?: EncodedTensorStorage
+  readonly storage?: EncodedTensorStorage | undefined
   /** Device family that owns the tensor. */
   readonly device: string
   /** Exact runtime placement that owns the tensor. */
@@ -252,7 +252,7 @@ export interface ExecutableCompileOptions {
    * the semantic graph; it does not rewrite that graph. `false` uses the same
    * typed lowering, memory planner, and executor with optional regions disabled.
    */
-  readonly optimize?: boolean
+  readonly optimize?: boolean | undefined
   /**
    * Authorizes inference-only retention of eligible materialized graph leaves
    * as executable constants. The executable, rather than the source handle,
@@ -261,7 +261,7 @@ export interface ExecutableCompileOptions {
    * of a value-independent structural key. Defaults to `false`; do not enable
    * for values expected to vary between invocations.
    */
-  readonly constantWeights?: boolean
+  readonly constantWeights?: boolean | undefined
 }
 
 /**
@@ -282,13 +282,13 @@ export interface DecodeStateRequest {
    * A completed schema retains it as the KV eviction window only when every
    * resolved attention operation is windowed.
    */
-  readonly window?: number
+  readonly window?: number | undefined
   /**
    * Visibility of rows staged by the current invocation. `Causal` preserves
    * autoregressive row-by-row visibility. `Bidirectional` exposes the complete
    * current block, in addition to committed cache rows. Defaults to `Causal`.
    */
-  readonly currentBlockAttention?: "Causal" | "Bidirectional"
+  readonly currentBlockAttention?: "Causal" | "Bidirectional" | undefined
   /** Positive unsigned 32-bit fixed compiled batch width. */
   readonly batch: number
   /**
@@ -297,13 +297,13 @@ export interface DecodeStateRequest {
    * the physical sequence width. Backends stage one explicit position per graph
    * row and expose all graph rows as outputs.
    */
-  readonly packedCausalChains?: PackedCausalChainsLayout
+  readonly packedCausalChains?: PackedCausalChainsLayout | undefined
   /**
    * When true, every root must be `[batch, T, V]` and the decode rewrite
    * returns native state-driven last-token selectors: one `[V]` root for
    * batch 1, otherwise `batch` `[V]` roots in row order. Defaults to false.
    */
-  readonly lastTokenRow?: boolean
+  readonly lastTokenRow?: boolean | undefined
   /**
    * Root-indexed output policy. The array must have exactly one entry per
    * compile root. `splitLastTokenRow` preserves the legacy lane-split logits
@@ -311,7 +311,7 @@ export interface DecodeStateRequest {
    * preserves the root. Mutually exclusive with `lastTokenRow`; packed
    * causal-chain compilation accepts only `allRows`.
    */
-  readonly outputSelections?: ReadonlyArray<DecodeOutputSelection>
+  readonly outputSelections?: ReadonlyArray<DecodeOutputSelection> | undefined
 }
 
 /**
@@ -460,7 +460,7 @@ export interface ExecutableHandle {
   /** Nominal executable-handle brand. */
   readonly [ExecutableHandleTypeId]: typeof ExecutableHandleTypeId
   /** Complete state schema for generation executables. */
-  readonly state?: DecodeStateSchema
+  readonly state?: DecodeStateSchema | undefined
   /** Immutable lowering and static-memory summary. */
   readonly diagnostics: ExecutableDiagnostics
 }
@@ -483,9 +483,9 @@ export interface CompileRequest {
    */
   readonly roots: ReadonlyArray<TensorHandle>
   /** Explicit controls that join the executable cache key. */
-  readonly options?: ExecutableCompileOptions
+  readonly options?: ExecutableCompileOptions | undefined
   /** Optional bounded persistent-state contract. */
-  readonly state?: DecodeStateRequest
+  readonly state?: DecodeStateRequest | undefined
 }
 
 /**
@@ -547,7 +547,7 @@ export interface ExecutionInvocation {
    */
   readonly runtimeValues: Readonly<Record<string, number | Uint32Array>>
   /** Stateful generation invocation, omitted for ordinary programs. */
-  readonly state?: ExecutionStateInvocation
+  readonly state?: ExecutionStateInvocation | undefined
 }
 
 /**
@@ -578,13 +578,13 @@ export interface KvSequenceHandle {
 }
 
 /**
- * Opaque backend-owned cohesive inference artifact.
+ * Opaque backend-owned inference artifact.
  *
  * @since 0.1.0
  * @category models
  */
 export interface InferenceArtifactHandle {
-  /** Nominal cohesive-inference-artifact brand. */
+  /** Nominal inference-artifact brand. */
   readonly [InferenceArtifactHandleTypeId]: typeof InferenceArtifactHandleTypeId
 }
 
@@ -679,7 +679,7 @@ export interface NodeOperationMap {
       readonly slot: number
       readonly shape: ReadonlyArray<number>
       readonly dtype: DType
-      readonly storage?: EncodedTensorStorage
+      readonly storage?: EncodedTensorStorage | undefined
     }
   }
   /** Declares a scalar input slot in a compiled program. */
@@ -823,7 +823,7 @@ export interface NodeOperationMap {
     readonly attributes: {
       readonly scale: number
       readonly causal: boolean
-      readonly window?: number | null
+      readonly window?: number | null | undefined
     }
   }
   /** Computes Kimi Delta Attention (gated delta-rule linear attention) in chunked form. */
@@ -886,7 +886,7 @@ export interface NodeOperationMap {
     readonly attributes: {
       readonly encoding: TensorStorageEncoding
       readonly logicalShape: readonly [rows: number, columns: number]
-      readonly paddingIndex?: number
+      readonly paddingIndex?: number | undefined
     }
   }
   /** Applies a one-dimensional grouped convolution. */
@@ -1213,7 +1213,7 @@ export interface SamplingOptions {
 }
 
 /**
- * Lossless normalized controls used by cohesive native inference.
+ * Lossless normalized controls used by native inference.
  *
  * @since 0.1.0
  * @category models
@@ -1227,6 +1227,14 @@ export interface InferenceSamplingOptions {
   readonly topP: number
   /** Unsigned 64-bit seed; it must never be folded through a JavaScript number. */
   readonly seed: bigint
+}
+
+/** Per-round or per-sequence overrides of native inference sampling controls. */
+export interface InferenceSamplingOverrides {
+  readonly temperature?: number | undefined
+  readonly topK?: number | undefined
+  readonly topP?: number | undefined
+  readonly seed?: bigint | undefined
 }
 
 /**
@@ -1276,7 +1284,7 @@ export interface InferenceCompileRequest {
      * proposers use the widest; generalized plans adapt the width per round
      * from measured token rates.
      */
-    readonly verify?: ReadonlyArray<ExecutableHandle>
+    readonly verify?: ReadonlyArray<ExecutableHandle> | undefined
     /** State pool compatible with every supplied target executable. */
     readonly pool: KvPoolHandle
   }
@@ -1290,7 +1298,7 @@ export interface InferenceCompileRequest {
     readonly pool: KvPoolHandle
     /** Maximum draft length compiled into the proposer contract. */
     readonly maxDraftTokens: number
-  }
+  } | undefined
   /** Optional backend-neutral generalized proposer schedule. */
   readonly generalizedProposer?: {
     /** Fully resolved routing and stage schedule. */
@@ -1315,7 +1323,7 @@ export interface InferenceCompileRequest {
     }
     /** Maximum candidate count produced by the generalized proposer. */
     readonly maxDraftTokens: number
-  }
+  } | undefined
   /** Fixed physical sequence width of the artifact. */
   readonly batchSize: number
   /** Integer dtype used by token tensors. */
@@ -1453,7 +1461,7 @@ export interface InferenceProposerPlan {
     /** Route containing candidate token ids. */
     readonly tokenIds: InferenceValueRoute
     /** Optional route containing normalized candidate distributions. */
-    readonly probabilityRows?: InferenceValueRoute
+    readonly probabilityRows?: InferenceValueRoute | undefined
     /** Optional route containing parent indexes for tree proposals. */
     readonly parents?: InferenceValueRoute
     /** Optional route containing proposer confidence values. */
@@ -1487,9 +1495,9 @@ export interface InferenceAddEntry {
   /** Borrowed dense rank-one token tensor. */
   readonly prompt: ConcreteTensorHandle
   /** Per-sequence overrides of the artifact's default sampling policy. */
-  readonly sampling?: Partial<InferenceSamplingOptions>
+  readonly sampling?: InferenceSamplingOverrides | undefined
   /** Optional maximum number of generated tokens for this sequence. */
-  readonly maxTokens?: number
+  readonly maxTokens?: number | undefined
   /** Token ids that terminate generation after publication. */
   readonly eosTokens: ReadonlyArray<number>
 }
@@ -1515,7 +1523,7 @@ export interface InferenceRoundEntry {
   /** Live sequence selected for this round. */
   readonly sequence: InferenceSequenceHandle
   /** Sampling overrides that do not alter the sequence's stored policy. */
-  readonly sampling?: Partial<InferenceSamplingOptions>
+  readonly sampling?: InferenceSamplingOverrides | undefined
 }
 
 /**
@@ -1543,7 +1551,7 @@ export interface InferenceTokenPage {
   /** Newly committed target-vocabulary token ids. */
   readonly tokens: ReadonlyArray<number>
   /** Terminal policy satisfied by the final published token, when any. */
-  readonly stopReason?: "eos" | "maxTokens"
+  readonly stopReason?: "eos" | "maxTokens" | undefined
 }
 
 /**
@@ -1574,7 +1582,7 @@ export interface InferenceSequenceInspection {
   /** Number of prompt and generated tokens committed to the sequence. */
   readonly cursor: bigint
   /** Terminal generation policy already satisfied by this sequence. */
-  readonly terminal?: "eos" | "maxTokens"
+  readonly terminal?: "eos" | "maxTokens" | undefined
 }
 
 /**
@@ -1613,16 +1621,16 @@ export interface InferenceDiagnostics {
   /** Highest simultaneous target-pool block usage. */
   readonly targetPoolHighWaterBlocks: bigint
   /** Highest simultaneous proposer-pool block usage, when applicable. */
-  readonly proposerPoolHighWaterBlocks?: bigint
+  readonly proposerPoolHighWaterBlocks?: bigint | undefined
   /** Most recently allocated round identifier. */
-  readonly lastRoundId?: bigint
+  readonly lastRoundId?: bigint | undefined
   /** Phase of the most recent inference failure. */
-  readonly lastFailurePhase?: InferenceFailurePhase
+  readonly lastFailurePhase?: InferenceFailurePhase | undefined
 }
 
 /**
  * Legacy low-level exact-chain request retained for direct decode consumers.
- * Prefer {@link InferenceRuntime.runRound} for cohesive generation.
+ * Prefer {@link InferenceRuntime.runRound} for sampled generation.
  *
  * @since 0.1.0
  * @category models
@@ -1651,8 +1659,8 @@ export interface SpeculativeRoundRequest {
 }
 
 /**
- * Required cohesive native artifact/session contract for sampled generation.
- * Session operations are transactional: a round either publishes a durable
+ * Required native artifact and session interface for sampled generation.
+ * Session operations are transactional. A round either publishes a durable
  * receipt or leaves no partially visible result.
  *
  * @since 0.1.0
@@ -1712,7 +1720,7 @@ export interface SamplingRuntime {
   /**
    * Executes one stateful decode invocation and samples its active outputs in
    * order. The invocation follows `RuntimeService.execute`'s input, state,
-   * cancellation, and atomic-commit contract. `options` contains one normalized
+   * cancellation, and atomic-commit rules. `options` contains one normalized
    * entry per active output.
    */
   readonly executeDecode: (
@@ -1811,7 +1819,7 @@ export interface RuntimeDiagnostics {
 }
 
 /**
- * One named exposure discovered in a lazy graph: the name given to
+ * One named exposure discovered in a lazy graph. It contains the name given to
  * `Tensor.expose` and the wrapped tensor.
  *
  * @since 0.1.0
@@ -1928,7 +1936,7 @@ export interface RuntimeService {
     readonly sampling: SamplingRuntime
     /** Compiled paged-KV inference. */
     readonly decode: DecodeRuntime
-    /** Cohesive native sampled inference artifacts and sessions. */
+    /** Native sampled inference artifacts and sessions. */
     readonly inference: InferenceRuntime
     /** Runtime memory and execution diagnostics. */
     readonly diagnostics: RuntimeDiagnostics
@@ -1936,7 +1944,7 @@ export interface RuntimeService {
 }
 
 /**
- * The authoritative tensor runtime for the current Effect program.
+ * The tensor runtime for the current Effect program.
  *
  * @since 0.1.0
  * @category services

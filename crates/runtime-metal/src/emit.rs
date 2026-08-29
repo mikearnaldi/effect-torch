@@ -1,30 +1,23 @@
-//! First-party fusion IR → MSL emitter.
+//! Fusion IR to MSL emitter.
 //!
-//! Emits one specialized compute kernel per fused expression set
-//! (elementwise) or per reduction. Conventions:
+//! Each fused expression set or reduction gets one specialized compute kernel.
 //!
-//! - **SSA form.** Expressions compile to flat `float tN = ...;`
-//!   temporaries, not nested parentheses: deep chains would exceed MSL's
-//!   bracket nesting limit, and temporaries dedupe shared subtrees
-//!   (memoized by node address). Emission is an iterative post-order walk
-//!   so kernel compilation never multiplies expression depth by the host
-//!   call stack.
-//! - **Clamped flat index.** Each kernel takes a thread-position parameter
-//!   and clamps it to `n - 1` instead of early-returning, so padded grids
-//!   are safe without divergent control flow. Past `u32::MAX` elements the
-//!   index widens to `ulong` over a 2-D grid of width [`WIDE`].
-//! - **Dtypes.** The IR only models float math: f32 lanes load/store
-//!   directly, bf16 lanes convert at the boundary (`float(...)` in,
-//!   `bfloat(...)` out). Any other storage dtype is an emitter bug
-//!   (`unreachable!`).
-//! - **Strides baked in.** Per-input lane offsets are emitted as constant
-//!   arithmetic on the output coordinates; a layout change is a different
-//!   kernel and a different pipeline key.
-//! - **Buffer binding order.** `in0..inK`, optional `scs` (packed f32
-//!   scalars), then `out0..outJ`, matching what the runners bind.
-//! - **Literals.** f32 constants are emitted via `{:e}` with explicit
-//!   handling of inf/NaN, so emitted source round-trips bit-exactly and
-//!   never depends on locale formatting.
+//! - Expressions compile to flat `float tN = ...;` temporaries instead of
+//!   nested parentheses. Deep chains would exceed MSL's nesting limit. The
+//!   temporaries also deduplicate subtrees by node address. An iterative
+//!   post-order walk keeps expression depth off the host call stack.
+//! - Each kernel clamps its thread position to `n - 1`. This makes padded
+//!   grids safe without divergent control flow. Past `u32::MAX` elements,
+//!   the index widens to `ulong` over a 2-D grid of width [`WIDE`].
+//! - The IR only models float math. f32 lanes load and store directly. bf16
+//!   lanes convert at the boundary with `float(...)` and `bfloat(...)`. Any
+//!   other storage dtype is an emitter bug handled by `unreachable!`.
+//! - Per-input lane offsets are constant arithmetic on output coordinates. A
+//!   layout change therefore produces a different kernel and pipeline key.
+//! - Buffer bindings are `in0..inK`, optional `scs` for packed f32 scalars,
+//!   then `out0..outJ`.
+//! - f32 constants use `{:e}` with explicit inf/NaN handling. The emitted
+//!   source round-trips exactly and does not depend on locale formatting.
 
 use super::device::MetalDevice;
 use crate::fusion::{Expr, ReduceOp};
@@ -36,9 +29,8 @@ pub const BLOCK: usize = 256;
 /// Grid width of 64-bit kernels: flat index = gid.y * WIDE + gid.x.
 pub const WIDE: usize = MetalDevice::WIDE;
 
-/// The shader index type for a tensor of `n` elements: 32-bit math on
-/// the fast path; 64-bit once a flat offset can exceed u32 — any model
-/// worth training has a logits or weight tensor past 4G elements.
+/// The shader index type for a tensor of `n` elements. Uses 32-bit math
+/// unless a flat offset can exceed u32.
 pub fn idx_ty(n: usize) -> &'static str {
     if n <= u32::MAX as usize {
         "uint"
@@ -71,9 +63,8 @@ fn gid_decl(n: usize) -> (String, String) {
     }
 }
 
-// Storage dtype of the lanes and outputs: bf16 kernels load into float,
-// compute in float, and store back as bfloat — the fusion IR only models
-// float math, so dtype support is purely a load/store concern.
+// bf16 kernels load into float, compute in float, and store as bfloat.
+// The fusion IR only models float math, so dtype support affects loads and stores.
 fn storage_ty(dtype: crate::runtime::dtype::DType) -> &'static str {
     match dtype {
         crate::runtime::dtype::DType::F32 => "float",
@@ -630,8 +621,8 @@ mod tests {
 
     #[test]
     fn wide_indexing_past_u32() {
-        // Past u32::MAX elements the flat index widens: 2-D grid,
-        // ulong math — a 5G-element tensor is addressable.
+        // Past u32::MAX elements, a 2-D grid and ulong math widen the flat
+        // index so it can address a 5G-element tensor.
         let big = 5_000_000_000usize;
         let exprs = vec![Expr::Input(0)];
         let src = emit_elementwise(

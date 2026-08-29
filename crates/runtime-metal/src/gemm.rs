@@ -1,37 +1,35 @@
-//! Tiled matmul family: naive tiled gemm, simdgroup-MMA gemm, and split-K
-//! gemm, all with fused bias/residual/gelu epilogues.
+//! Tiled matmul family with fused bias, residual, and gelu epilogues.
 //!
 //! # Algorithms
 //!
-//! - [`GemmAlgorithm::Tiled`] — one threadgroup per 16×16 output tile,
-//!   threadgroup-memory staged; the reference path, used for small shapes
-//!   and when MMA is disabled (`EFFECT_TORCH_NO_MMA`).
-//! - [`GemmAlgorithm::SimdgroupMma`] — 8×8 simdgroup matrix
-//!   multiply-accumulate, one threadgroup per 64×64 (or 32×32 on smaller
-//!   threadgroup-memory devices) output tile. bf16/f16 stage and multiply
-//!   natively with an f32 accumulator; f32 stages as f32.
-//! - [`GemmAlgorithm::SplitK`] — for long-K narrow-output gemms (backward
-//!   dX/dW): K is partitioned across threadgroups writing f32 partials,
-//!   reduced by a second kernel in a fixed order (deterministic). Plain
-//!   epilogues only.
+//! - [`GemmAlgorithm::Tiled`] uses one threadgroup per 16×16 output tile and
+//!   stages through threadgroup memory. It is the reference path for small
+//!   shapes and for `EFFECT_TORCH_NO_MMA`.
+//! - [`GemmAlgorithm::SimdgroupMma`] uses 8×8 simdgroup matrix operations and
+//!   one threadgroup per 64×64 output tile, or 32×32 on devices with less
+//!   threadgroup memory. bf16/f16 multiply natively with f32 accumulation; f32
+//!   stages as f32.
+//! - [`GemmAlgorithm::SplitK`] handles long-K gemms with narrow outputs, such
+//!   as backward dX/dW. Threadgroups partition K and write f32 partials. A
+//!   second kernel reduces them in a fixed order for deterministic results. Only
+//!   plain epilogues apply.
 //!
 //! # Restrictions
 //!
-//! - dtypes: f32, f16, bf16 only; M, N, K and batch strides must fit u32;
-//!   inputs and destinations must be contiguous (strides are the batch
-//!   strides `stride_a`/`stride_b`, row-major within a matrix).
-//! - The epilogue contract is fixed: `v = acc + bias + residual` (each
-//!   optional), stored plainly, through gelu, or — dual — both (plain
-//!   pre-activation for backward, gelu output for the next op).
+//! - Dtypes are f32, f16, and bf16. M, N, K, and batch strides must fit u32.
+//!   Inputs and destinations must be contiguous. `stride_a` and `stride_b`
+//!   are batch strides; each matrix is row-major.
+//! - The epilogue computes `v = acc + bias + residual` with optional bias and
+//!   residual. It stores v, gelu(v), or both. The dual form writes the plain
+//!   pre-activation for backward and the gelu output for the next operation.
 //!
 //! # Planning contract
 //!
-//! [`gemm_requirements`]/[`matmul_requirements`] compute the exact
-//! algorithm, output sizes, and split-K scratch for a shape; planning
-//! snapshots the MMA environment so later changes cannot alter a compiled
-//! executable. `precompile_*` caches exactly those pipelines; the
-//! `*_into` entry points validate every buffer against the requirements
-//! and dispatch without allocating.
+//! [`gemm_requirements`] and [`matmul_requirements`] choose the algorithm
+//! and compute output sizes and split-K scratch. Planning snapshots the MMA
+//! environment so later changes cannot alter a compiled executable.
+//! `precompile_*` caches the required pipelines. The `*_into` functions
+//! validate every buffer and dispatch without allocating.
 
 use super::device::{set_buffer, set_bytes, MetalDevice};
 use super::emit::ACT_FNS;
@@ -42,11 +40,10 @@ use objc2_metal::MTLDevice as _;
 
 const TILE: usize = 16;
 
-/// RFC 0016 phase 3: gemm epilogues. The accumulator is finalized as
-/// `v = acc + bias + residual` (each term optional), then stored either
-/// plainly, through gelu, or — `dual` — both (the plain pre-activation
-/// feeds backward, the gelu output feeds the next op, one gemm launch
-/// writes both).
+/// RFC 0016 phase 3 gemm epilogues. The kernel computes
+/// `v = acc + bias + residual` with optional terms, then stores v, gelu(v), or
+/// both. The dual form writes the plain pre-activation for backward and the gelu
+/// output for the next operation in one gemm launch.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Epilogue {
     /// Store `acc + bias` unchanged.
@@ -336,7 +333,7 @@ fn mma_candidate(
 /// Plans a gemm: validates dtype/dimension limits, selects the algorithm
 /// (MMA only when `mma` and the shape saturates the GPU; split-K only for
 /// plain long-K narrow-output cases), and computes exact output/scratch
-/// sizes. Pure — no allocation or compilation.
+/// sizes without allocating or compiling.
 #[allow(clippy::too_many_arguments)]
 pub fn gemm_requirements(
     dev: &MetalDevice,
@@ -638,9 +635,9 @@ fn splitk_key(
 // output grid alone starves the GPU and every threadgroup re-reads all
 // of A and B, so K is partitioned across threadgroups; each element
 // is read once, writing f32 partials that a second kernel reduces in
-// a fixed order (deterministic). Biases and epilogues are unsupported;
-// only plain backward gemms take this path. Staging intentionally stays
-// single-buffered: double buffering wins the head-dX microbench but
+// a fixed order for deterministic results. Biases and epilogues are
+// unsupported. Only plain backward gemms take this path. Staging stays
+// single-buffered. Double buffering wins the head-dX microbench but
 // loses 6.5% over 400 FineWeb steps on M4 Max due to thermal throttling.
 fn gemm_splitk_source(
     ty: &str,
@@ -1003,7 +1000,7 @@ fn validate_contiguous(
 /// Dispatches a fused gemm into caller-provided destinations, validating
 /// every operand, output, and scratch buffer against `requirements` (which
 /// must have been planned and precompiled for exactly these arguments).
-/// Buffer bindings: A=0, B=1, D=2, bias=3, dims/strides=4–8, residual=9,
+/// Buffer bindings: A=0, B=1, D=2, bias=3, dims/strides=4 through 8, residual=9,
 /// dual output=10. Performs no allocation.
 #[allow(clippy::too_many_arguments)]
 pub fn gemm_fused_into(

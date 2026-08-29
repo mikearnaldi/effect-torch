@@ -41,7 +41,7 @@ onDevices("Trainer", (device) => (it) => {
         expect(steps).toBeLessThan(2500)
       }))
 
-    it.effect("stops on any condition — a step count, a loss target, or external state", () =>
+    it.effect("stops on a step count, loss target, or external state", () =>
       Effect.gen(function*() {
         const model = yield* mlp
         const input = yield* Tensor.fromTypedArray(floats([0, 1, 1, 0]), [2, 2])
@@ -215,9 +215,8 @@ onDevices("Trainer", (device) => (it) => {
       Effect.gen(function*() {
         const model = yield* mlp
         const raw = yield* xor
-        // mixed precision casts the parameters; the input pipeline is the
-        // app's domain (an LM gets bf16 activations from its bf16
-        // embedding) — feed bf16 features.
+        // Mixed precision casts parameters but does not cast input data. An LM
+        // gets bf16 activations from its bf16 embedding, so feed bf16 features.
         const data = {
           input: yield* Tensor.cast(raw.input, "bf16"),
           target: yield* Tensor.cast(raw.target, "bf16")
@@ -242,7 +241,7 @@ onDevices("Trainer", (device) => (it) => {
         const trainer = yield* makeMixed
         const { params, loss } = yield* trainer.train(yield* Model.initialize(trainer.model))
         expect(loss).toBeLessThan(0.1)
-        // masters stay f32 — the optimizer's update arithmetic is f32
+        // Masters stay f32 because the optimizer's update arithmetic is f32.
         expect(params.every((p) => p.dtype === "f32")).toBe(true)
         const forwardParams = yield* Effect.all(params.map((param) => Tensor.cast(param, "bf16")))
         const [pred] = yield* Tensor.compute([yield* model.forward(forwardParams, data.input)])

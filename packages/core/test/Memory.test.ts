@@ -9,7 +9,7 @@ import { Runtime, Tensor } from "../src/index.ts"
 // These CPU-only diagnostics distinguish explicit handle release from V8
 // finalization. Forced GC makes objects eligible; native finalizers remain async.
 setFlagsFromString("--expose-gc")
-const collectGarbage = runInNewContext("gc") as () => void
+const collectGarbage: () => void = runInNewContext("gc")
 
 const externalMemoryBytes = Effect.gen(function*() {
   const runtime = yield* Runtime.Runtime

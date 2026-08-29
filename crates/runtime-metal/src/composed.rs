@@ -1,16 +1,12 @@
-//! Primitive-built numerical references for the fused kernels (tests
-//! only — `#[cfg(test)]` in lib.rs).
+//! Numerical references for fused kernels. This module compiles only in tests.
 //!
-//! Every function here implements one fused kernel's semantics using
-//! only the primitive `ops` runners (binary/unary/reduce/matmul/
-//! gather/...), so the parity tests compare fused destination kernels
-//! against an independent composition of already-verified primitives
-//! rather than against themselves. These references are deliberately
-//! naive: they materialize intermediates the fused kernels avoid (full
-//! score matrices, per-token states) and are the readability-first
-//! source of truth for the exact numerics contract — masking,
-//! scaling, ignore-index semantics, decay factoring, and reduction
-//! order — that the fused implementations must reproduce.
+//! Each function composes the primitive `ops` runners for binary, unary,
+//! reduction, matmul, and gather operations. Parity tests compare fused
+//! destination kernels against these compositions. The references materialize
+//! intermediates that fused kernels avoid, including full score matrices and
+//! per-token states. Their masking, scaling, ignore-index handling, decay
+//! factoring, and reduction order define the behavior fused implementations
+//! must match.
 
 use super::ops::{
     binary, broadcast_to, cast, cat, compare, fill, gather, matmul, permute, reduce, unary, where_,
@@ -1009,11 +1005,11 @@ pub fn short_conv1d_forward(x: &MetalTensor, weight: &MetalTensor) -> crate::err
     })
 }
 
-/// Stateful per-slot variant: `x [T, C]`, `state [K-1, C]`; returns
-/// the output and the new window. `advance` is the count of real
-/// tokens (chunked prefill right-pads): outputs are computed over the
-/// full padded window — causal, so real rows never see padding — but
-/// the stored window shifts in only the first `advance` rows.
+/// Stateful per-slot variant with `x [T, C]` and `state [K-1, C]`. Returns
+/// the output and the new window. `advance` is the number of real tokens in a
+/// right-padded prefill chunk. Outputs cover the full padded window, but causal
+/// masking keeps padding out of real rows. The stored window shifts in only
+/// the first `advance` rows.
 pub fn short_conv1d_with_state(
     x: &MetalTensor,
     weight: &MetalTensor,
@@ -1037,10 +1033,10 @@ pub fn short_conv1d_with_state(
     Ok((acc, new_state))
 }
 
-/// Reference ShortConv1d backward-x (RFC 0018 phase 4):
-/// `dx[s] = Σ_j w[:, K-1-j] * g[s+j]` — full correlation over the
-/// right-zero-padded cotangent. `g` and `x` are `[.., T, C]`; weight
-/// is `[C, K]`.
+/// ShortConv1d backward-x from RFC 0018 phase 4.
+/// `dx[s] = Σ_j w[:, K-1-j] * g[s+j]` is a full correlation over the
+/// right-zero-padded cotangent. `g` and `x` are `[.., T, C]`; weight is
+/// `[C, K]`.
 pub fn short_conv1d_backward_x(
     x: &MetalTensor,
     weight: &MetalTensor,
@@ -1073,9 +1069,9 @@ pub fn short_conv1d_backward_x(
     })
 }
 
-/// Reference ShortConv1d backward-w: `dw[:, j] = Σ_t g[t] *
-/// x[t-K+1+j]` — per-tap correlation over the causal window, summed
-/// over batch and time into `[C, K]`.
+/// ShortConv1d backward-w. `dw[:, j] = Σ_t g[t] * x[t-K+1+j]` computes
+/// per-tap correlation over the causal window, then sums over batch and time
+/// into `[C, K]`.
 pub fn short_conv1d_backward_w(
     x: &MetalTensor,
     weight: &MetalTensor,

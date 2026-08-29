@@ -1,9 +1,8 @@
-//! Diagnostics produced when a program is compiled into an executable.
+//! Diagnostics from compiling a program into an executable.
 //!
-//! These are plain data structures (no behavior): backends fill them in
-//! during compilation and callers use them for profiling, logging and
-//! regression testing of the compilation pipeline itself. All fields are
-//! snapshots taken at compile time and never mutate afterwards.
+//! These data structures contain no behavior. Backends fill them during
+//! compilation and do not update them afterward. Callers use the snapshots
+//! for profiling, logging, and regression tests.
 
 use crate::MemoryReport;
 
@@ -21,7 +20,7 @@ pub struct CompilePhaseTiming {
     pub nanoseconds: u64,
 }
 
-/// Aggregate statistics describing one compiled executable.
+/// Statistics for one compiled executable.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Default)]
 pub struct ExecutableDiagnostics {
     pub semantic_nodes_before_optimization: usize,

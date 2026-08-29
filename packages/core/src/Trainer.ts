@@ -1,6 +1,6 @@
 /**
- * Training as an encapsulated value. A {@link Trainer} pairs a model with
- * an optimizer, learning-rate schedule, loss, data source, and stop policy.
+ * A {@link Trainer} pairs a model with an optimizer, learning-rate schedule,
+ * loss, data source, and stop policy.
  * Its {@link Trainer.train} method repeatedly builds or runs
  * `loss(forward(params, input), target)`, differentiates it, applies the
  * optimizer, and materializes loss, parameters, and state together.
@@ -29,7 +29,7 @@
  *
  * @since 0.1.0
  */
-import { Clock, Duration, Effect, Exit } from "effect"
+import { Clock, Duration, Effect, Exit, Predicate } from "effect"
 import * as Gradient from "./Gradient.ts"
 import type { LearningRate } from "./LearningRate.ts"
 import * as Model from "./Model.ts"
@@ -97,9 +97,10 @@ export interface TrainStep {
  * and targets are not cast, and every selected model/loss operation must
  * support its resulting dtypes. This mode requires the runtime's
  * `mixed-bf16` feature, currently provided by the bundled Metal runtime;
- * unsupported runtimes fail when training starts. It is a parameter-cast policy, not general AMP or
- * autocast: it performs no automatic activation/loss casting beyond the model
- * graph, loss scaling, finite-gradient detection, overflow skipping, or dynamic
+ * unsupported runtimes fail when training starts. It is a parameter-cast
+ * policy, not general AMP or autocast. It performs no automatic activation or
+ * loss casting beyond the model graph, loss scaling, finite-gradient detection,
+ * overflow skipping, or dynamic
  * scale adjustment.
  *
  * @since 0.1.0
@@ -108,32 +109,29 @@ export interface TrainStep {
 export type Precision = "f32" | "mixedBf16"
 
 /**
- * Configuration for {@link make} and {@link makeUncompiled}. `loss` is any loss
- * function in the shape of `Loss.mse`,
- * `(prediction, target) => Effect<Lazy>`, so the `Loss` module's exports slot
- * in directly. `lr` is the
- * learning-rate schedule (see the `LearningRate` module): it is evaluated
- * with the 0-based step number on every step and the value flows into the
- * update as a 0-d tensor; `LearningRate.constant(0.1)` is the fixed-rate
- * case. `onStep` runs after every step with the step's loss value;
- * throttle inside the callback.
+ * Configuration for {@link make} and {@link makeUncompiled}. `loss` accepts any
+ * function shaped like `Loss.mse`,
+ * `(prediction, target) => Effect<Lazy>`. Exports from the `Loss` module can be
+ * passed directly. `lr` is a learning-rate schedule from the `LearningRate`
+ * module. The trainer evaluates it with the 0-based step number and passes the
+ * value to the update as a 0-d tensor. `LearningRate.constant(0.1)` provides a
+ * fixed rate. `onStep` runs after every step with the loss value. Throttle
+ * inside the callback.
  *
- * `stop` decides when training ends; it is checked after every step (at
- * least one step always runs), so any policy is a plain function:
+ * `stop` decides when training ends. The trainer checks it after every step, so
+ * at least one step always runs. A policy is a plain function. For example,
  * `({ step }) => step >= 3000` stops on a step count,
  * `({ loss }) => loss < 0.01` stops on a loss target,
  * `({ elapsed }) => Duration.toSeconds(elapsed) > 60` stops on a
- * wall-clock budget, and the three compose with `||`, or close over any
- * other state you track.
+ * wall-clock budget. Combine conditions with `||`, or close over other state.
  *
  * `data` is either a fixed `(input, target)` pair used every step
  * (full-batch) or a sampler producing each step's batch (mini-batch).
  *
- * The effectful fields carry their own error and requirement channels
- * (`EL`/`RL` for `loss`, `ED`/`RD` for `data`, `EO`/`RO` for `onStep`),
- * inferred at the call site, so a loss needing the current device, a
- * sampler hitting a dataset, and a logging `onStep` compose without being
- * pre-widened to a common environment. `ModelError`, `TensorError`, and
+ * Each effectful field keeps its own error and requirement channels:
+ * `EL`/`RL` for `loss`, `ED`/`RD` for `data`, and `EO`/`RO` for `onStep`. The
+ * call site infers them, so the fields do not need a shared environment in
+ * advance. `ModelError`, `TensorError`, and
  * `GradError` are added by the trainer itself. The synchronous `lr` and `stop`
  * functions have no typed error channel; thrown exceptions are defects.
  *
@@ -179,8 +177,8 @@ export interface TrainConfig<
 }
 
 /**
- * The result of {@link Trainer.train}: the trained parameters (materialized
- * leaves, ready for `forward`, `save`, or more training), the final
+ * The result of {@link Trainer.train}. It contains the trained parameters as
+ * materialized leaves ready for `forward`, `save`, or more training, the final
  * optimizer state, and the final step's loss.
  *
  * @since 0.1.0
@@ -191,8 +189,8 @@ export interface Trained<S> {
   readonly params: ReadonlyArray<Tensor.Concrete>
   /**
    * Final optimizer state. Every concrete tensor returned by
-   * `optimizer.stateRoots(state)` is caller-owned; inert non-root fields retain
-   * the optimizer's own semantics.
+   * `optimizer.stateRoots(state)` is caller-owned. Inert non-root fields remain
+   * as supplied by the optimizer.
    */
   readonly state: S
   /** Final step's scalar loss. */
@@ -202,12 +200,12 @@ export interface Trained<S> {
 }
 
 /**
- * A resumable training position: optimizer state and global step count from
+ * A resumable training position with optimizer state and global step count from
  * a previous {@link Trained} value. Resume it only together with that value's
  * matching `params`, using the same model, training configuration, and
  * parameter order. The trainer does not validate that relationship up front;
  * mismatched state is rejected only where tensor metadata can be checked and
- * otherwise produces incorrect continuation semantics. Carrying `startedAt`
+ * otherwise resumes incorrectly. Carrying `startedAt`
  * also preserves one elapsed-time clock across calls.
  *
  * @since 0.1.0
@@ -223,8 +221,9 @@ export interface Resume<S> {
    * with the live clock this is Unix-epoch time. When set,
    * {@link TrainStep.elapsed} measures from this point instead of the
    * current `train` invocation, so a run chunked into several `train`
-   * calls keeps one continuous clock. Absent means: start now. The value is not
-   * validated, so an incompatible or future anchor can yield meaningless elapsed time.
+   * calls keeps one continuous clock. When absent, the clock starts now. The
+   * trainer does not validate this value, so an incompatible or future anchor
+   * can yield meaningless elapsed time.
    */
   readonly startedAt?: number
 }
@@ -384,8 +383,8 @@ const uncompiledStep = <S, EL, RL, ED, RD, EO, RO>(
 
 // Traces the step graph against placeholder leaves: parameter, state-root,
 // input, and target tensor slots, then one scalar slot for the learning
-// rate. The roots are [loss, ...nextParams, ...nextStateRoots] - the same
-// graph transform the uncompiled step computes, differentiated at trace
+// rate. The roots are [loss, ...nextParams, ...nextStateRoots]. This is the
+// graph transform that the uncompiled step computes, differentiated at trace
 // time. The placeholders take their signatures from the current step's
 // tensors, so the trace is valid for exactly one cache-key signature.
 const traceStep = <S, EL, RL, ED, RD, EO, RO>(
@@ -415,7 +414,7 @@ const traceStep = <S, EL, RL, ED, RD, EO, RO>(
     const input = yield* Tensor.makeInput(paramCount + stateCount, data.input)
     const target = yield* Tensor.makeInput(paramCount + stateCount + 1, data.target)
     // The learning rate is the step's only runtime scalar, declared with
-    // the parameters' dtype - the same lifting the uncompiled loop
+    // the parameters' dtype. This matches the lifting that the uncompiled loop
     // applies with Tensor.constant.
     const lr = yield* Tensor.makeScalarInput(
       paramCount + stateCount + 2,
@@ -473,9 +472,8 @@ const compiledStep = <S, EL, RL, ED, RD, EO, RO>(
     )
   })
 
-// The training loop shared by both forms: start with the supplied parameters,
-// then step until `stop` says otherwise (at
-// least one step always runs), calling `onStep` after every step.
+// Both forms start with the supplied parameters, call `onStep` after each step,
+// and continue until `stop` says otherwise. At least one step always runs.
 // Without a cache each step builds and evaluates the full step graph;
 // with one each step is a single frozen-program call. The current generation
 // is released on replacement and retained for failure cleanup until ownership
@@ -520,7 +518,7 @@ const trainLoop = <S, EL = never, RL = never, ED = never, RD = never, EO = never
         let trained: ReadonlyArray<Tensor.Concrete>
         const started = resume?.startedAt ?? (yield* Clock.currentTimeMillis)
         if (cache !== undefined) {
-          // Program inputs must be materialized buffers: the initial
+          // Program inputs must be materialized buffers. The initial
           // parameters and state are lazy graph values, so evaluate them
           // once up front; every later step returns materialized values.
           const roots = [...params, ...config.optimizer.stateRoots(state)]
@@ -534,7 +532,7 @@ const trainLoop = <S, EL = never, RL = never, ED = never, RD = never, EO = never
         }
         do {
           step++
-          const data: TrainData = typeof config.data === "function"
+          const data: TrainData = Predicate.isFunction(config.data)
             ? yield* config.data(step)
             : config.data
           const previousOwned = owned

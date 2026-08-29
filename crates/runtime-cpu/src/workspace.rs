@@ -1,21 +1,19 @@
 //! Process-wide workspace pool backing executable scratch memory.
 //!
-//! Compiled executables describe their transient memory as a set of segment
-//! requests (bytes + alignment). This module keys those requests into
-//! [`CpuWorkspaceKey`] capacity classes, allocates backing [`CpuSegment`]s on
-//! demand, and returns them to a shared LRU [`WorkspacePool`] when a lease
-//! ends, so steady-state invocations of a compiled program reuse memory
-//! instead of hitting the global allocator.
+//! Compiled executables describe transient memory with segment requests for a
+//! byte size and alignment. [`CpuWorkspaceKey`] groups requests into capacity
+//! classes. The module allocates [`CpuSegment`] values on demand and returns
+//! them to a shared LRU [`WorkspacePool`] when leases end. Steady-state
+//! invocations then reuse memory instead of calling the global allocator.
 //!
-//! Pool sizing is controlled by the `EFFECT_TORCH_CPU_WORKSPACE_POOL_MB`
-//! environment variable (default 256 MiB of idle segments). Idle segments
-//! beyond the budget are evicted least-recently-used first.
+//! `EFFECT_TORCH_CPU_WORKSPACE_POOL_MB` sets the idle-segment budget, which
+//! defaults to 256 MiB. The pool evicts least-recently-used idle segments when
+//! they exceed the budget.
 //!
-//! Ownership model: the pool hands out `Arc<CpuSegment>` owners plus a lease
-//! token. Output and scratch views created during an invocation keep the
-//! segment alive through the `Arc`, and optionally retain the lease itself
-//! (see `CpuStorageRetention`) so a published output tensor pins its pool
-//! segment until the last view is dropped.
+//! The pool returns `Arc<CpuSegment>` owners with a lease token. Output and
+//! scratch views keep the segment alive through the `Arc`. A view can also
+//! retain the lease through `CpuStorageRetention`, so a published output
+//! tensor pins its pool segment until the last view drops.
 
 use crate::storage::CpuSegment;
 use effect_torch_runtime::{
@@ -26,9 +24,9 @@ use std::sync::{Arc, OnceLock};
 
 /// Pool key for one class of CPU workspace segments.
 ///
-/// `capacity_class` is the requested byte count rounded up to a multiple of
-/// `alignment`; rounding keeps the pool's best-fit buckets coarse enough to
-/// reuse segments across slightly different requests.
+/// `capacity_class` rounds the requested byte count up to a multiple of
+/// `alignment`. Rounding lets the pool reuse segments for requests with
+/// slightly different sizes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct CpuWorkspaceKey {
     pub memory_space: NativeMemorySpace,
@@ -56,10 +54,10 @@ impl CpuWorkspaceKey {
 
 /// Allocates fresh, zeroed, correctly aligned segments for the pool.
 ///
-/// The allocator is stateless; all reuse policy lives in the generic
-/// [`WorkspacePool`]. Allocation is validated against the key's memory space,
-/// alignment, and capacity class so a mismatched request can never produce a
-/// segment smaller than expected.
+/// The allocator is stateless. The generic [`WorkspacePool`] owns the reuse
+/// policy. Allocation checks the key's memory space, alignment, and capacity
+/// class, so a mismatched request cannot produce a segment smaller than
+/// expected.
 #[derive(Debug, Default)]
 pub(crate) struct CpuWorkspaceAllocator;
 
@@ -112,8 +110,8 @@ pub(crate) fn workspace_pool() -> &'static CpuWorkspacePool {
 
 /// Builds a validated pool request for `bytes` at `alignment`.
 ///
-/// Zero-byte requests are rounded up to one byte so every lease maps to a
-/// real (minimal) physical allocation.
+/// Rounds zero-byte requests up to one byte so every lease maps to a real,
+/// minimal physical allocation.
 pub(crate) fn workspace_request(
     bytes: usize,
     alignment: usize,

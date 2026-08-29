@@ -1,38 +1,43 @@
-// Muse-Glimmer benchmark harness comparing effect-torch (ordinary and DFlash
-// speculative modes) against llama.cpp in one orchestrated run. The effect
-// side loads MuseGlimmer.loadGGUF and DFlash.loadGGUF once, compiles one
-// Model.inference artifact per mode, and drives the low-level
-// Generation.add/step API directly (no Chat parsing or detokenization in the
-// timed path). The llama.cpp side runs llama-bench once over all
-// contexts/max-new plus representative llama-cli and llama-speculative-simple
-// end-to-end cases when LLAMA_CPP_BIN points at a binary directory.
+// Compares Muse-Glimmer on effect-torch and llama.cpp in one run. effect-torch
+// calls MuseGlimmer.loadGGUF once. If the selected modes include DFlash, it also
+// calls DFlash.loadGGUF once. It compiles one Model.inference program per mode
+// and calls the low-level Generation.add/step API directly. The timed path
+// excludes Chat parsing and detokenization.
 //
-// Prompts are deterministic plain text with exact token counts built through
-// tokenizer encode/decode round-trips; each case gets a unique prefix so the
-// effect prefix cache cannot share blocks across runs. The effect prompt
-// includes the GGUF BOS id explicitly while llama receives BOS-less text,
-// matching llama.cpp's default BOS insertion. Prompt construction dies loudly
-// when a round-trip changes the token count.
+// When LLAMA_CPP_BIN points to available binaries, ordinary mode launches
+// llama-bench twice. One invocation measures prompt processing for every
+// configured context. The other measures MAX_NEW decoded tokens with each
+// context used as the KV-cache depth. Ordinary mode also runs one llama-cli
+// end-to-end case per LLAMA_E2E_CONTEXTS entry. DFlash mode runs the same cases
+// through llama-speculative-simple.
 //
-// Env knobs: ENGINE=effect|llama|all (default all), MODE=ordinary|dflash|both
-// (default both), CONTEXTS (csv, default 64,512,1024,2048,3072), MAX_NEW
-// (default 128), RUNS (default 2), WARMUP (default 1), MAX_TOKENS (default
-// 4096), COOLDOWN_MS (default 5000), SEED (default 0),
-// TEMPERATURE (default 0, greedy), TOP_K (default 0), TOP_P (default 1),
-// PREFILL_CHUNK (single chunk size or csv shape buckets, default 256),
-// DRAFT_TOKENS
-// (default 7), OUTPUT (default
-// <repo>/bench-results/muse-glimmer/<timestamp>.jsonl), MODEL_PATH, DRAFT_PATH,
-// TOKENIZER_PATH, LLAMA_CPP_BIN (llama.cpp
-// binary directory; enables the llama side when ENGINE asks for it),
-// LLAMA_E2E_CONTEXTS (csv, default 3072).
+// The benchmark builds deterministic plain-text prompts and verifies their exact
+// token IDs with tokenizer encode/decode round trips. Each case has a unique
+// prefix, so the effect prefix cache cannot share blocks across runs. The
+// effect-torch prompt starts with the GGUF BOS ID. llama.cpp receives the same
+// text without BOS because it inserts BOS by default. Prompt construction fails
+// if a round trip changes any token ID.
+//
+// ENGINE=effect|llama|all selects the engine and defaults to all.
+// MODE=ordinary|dflash|both selects the generation mode and defaults to both.
+// CONTEXTS is CSV and defaults to 64,512,1024,2048,3072. MAX_NEW defaults to
+// 128. RUNS defaults to 2 and controls effect-torch cases and llama-bench
+// repetitions. WARMUP defaults to 1 and applies to effect-torch.
+// MAX_TOKENS defaults to 4096. COOLDOWN_MS is in milliseconds and defaults to
+// 5000. SEED defaults to 0. TEMPERATURE defaults to 0 for greedy sampling. TOP_K
+// defaults to 0, and TOP_P defaults to 1. PREFILL_CHUNK accepts one chunk size or
+// CSV shape buckets and defaults to 256. DRAFT_TOKENS defaults to 7.
+// OUTPUT defaults to <repo>/bench-results/muse-glimmer/<timestamp>.jsonl.
+// MODEL_PATH, DRAFT_PATH, and TOKENIZER_PATH override the bundled paths.
+// LLAMA_CPP_BIN points to the llama.cpp binary directory and enables llama.cpp
+// when ENGINE includes it. LLAMA_E2E_CONTEXTS is CSV and defaults to 3072.
 
 import * as BackendApple from "@effect-torch/backend-apple-native"
 import { Model, type Runtime, Tensor } from "@effect-torch/core"
 import { MuseGlimmer } from "@effect-torch/core/models"
 import { DFlash } from "@effect-torch/core/proposers"
 import * as Tokenizers from "@effect-torch/tokenizers"
-import { Duration, Effect } from "effect"
+import { Duration, Effect, Option, Predicate, Schema } from "effect"
 import { execFile } from "node:child_process"
 import * as fs from "node:fs"
 import path from "node:path"
@@ -333,7 +338,7 @@ const WORDS = [
   "voice"
 ] as const
 
-// Single-token suffix candidates tried when a small exact gap remains.
+// Short suffix candidates used when up to eight token IDs remain.
 const FILLERS = [".", ",", "!", "?", ";", ":", "\n", " the", " a", " and", " of", " to", " in", " is"] as const
 
 const mulberry32 = (seed: number): () => number => {
@@ -348,9 +353,9 @@ const mulberry32 = (seed: number): () => number => {
 }
 
 interface Prompt {
-  /** BOS-less canonical text handed to llama.cpp. */
+  /** llama.cpp receives this canonical text without BOS. */
   readonly text: string
-  /** Exact `context - 1` token ids; the caller prepends BOS for effect-torch. */
+  /** Exactly `context - 1` token IDs. The caller prepends BOS for effect-torch. */
   readonly ids: Uint32Array
 }
 
@@ -360,7 +365,7 @@ const encodePlain = (
 ): Effect.Effect<Uint32Array, Tokenizers.TokenizerError> =>
   Effect.map(tokenizer.encode(text, { addSpecialTokens: false }), (ids) => ids.data)
 
-/** Exported for smoke tests; the harness entrypoint stays guarded below. */
+/** Smoke tests import this function. The guarded entry point remains below. */
 export const buildPrompt = (
   tokenizer: Tokenizers.Tokenizer,
   seed: number,
@@ -368,13 +373,13 @@ export const buildPrompt = (
   context: number
 ): Effect.Effect<Prompt, Tokenizers.TokenizerError> =>
   Effect.gen(function*() {
-    // One id is reserved for the explicit BOS prepended by the caller.
+    // Leave one token slot for the BOS that the caller prepends.
     const target = context - 1
     if (target < 8) {
       return yield* Effect.die(new Error(`context ${context} leaves only ${target} prompt tokens`))
     }
     const random = mulberry32((seed ^ Math.imul(caseId + 1, 0x9e3779b9)) >>> 0)
-    // The unique per-case prefix defeats prefix-cache reuse across runs.
+    // A unique prefix for each case prevents prefix-cache reuse across runs.
     let text = `Muse Glimmer benchmark case ${caseId} context ${context}.`
     let ids = yield* encodePlain(tokenizer, text)
     for (let attempt = 0; attempt < 8192 && ids.length !== target; attempt++) {
@@ -411,8 +416,8 @@ export const buildPrompt = (
         new Error(`prompt case ${caseId}: produced ${ids.length} tokens, wanted exactly ${target}`)
       )
     }
-    // Canonicalize the text through decode and prove the round-trip is stable,
-    // so llama.cpp tokenizes the received text into the same ids.
+    // Decode into canonical text, then verify that re-encoding preserves every
+    // token ID. llama.cpp receives that text and tokenizes it into the same IDs.
     const roundTripText = yield* tokenizer.decode(ids)
     const roundTripIds = yield* encodePlain(tokenizer, roundTripText)
     const stable = roundTripIds.length === ids.length && roundTripIds.every((id, index) => id === ids[index])
@@ -444,9 +449,17 @@ const fnv1a = (tokens: ReadonlyArray<number>): string => {
   return (hash >>> 0).toString(16).padStart(8, "0")
 }
 
+const decodeLlamaBenchRow = Schema.decodeUnknownSync(Schema.fromJsonString(Schema.Struct({
+  n_prompt: Schema.optional(Schema.Json),
+  n_gen: Schema.optional(Schema.Json),
+  n_depth: Schema.optional(Schema.Json),
+  avg_ns: Schema.optional(Schema.Json),
+  avg_ts: Schema.optional(Schema.Json)
+})))
+
 const metadataInt = (metadata: ReadonlyMap<string, unknown>, key: string): number => {
-  const value = metadata.get(key)
-  if (typeof value !== "number" || !Number.isSafeInteger(value)) {
+  const value = Option.getOrUndefined(Schema.decodeUnknownOption(Schema.Int)(metadata.get(key)))
+  if (value === undefined) {
     return fail(`GGUF metadata ${key} must be an integer`)
   }
   return value
@@ -532,17 +545,15 @@ const runEffectCase = (
         decodeTokPerSec: decodeTokens > 0 && decodeMs > 0 ? decodeTokens / (decodeMs / 1000) : undefined,
         roundP50Ms: percentile(sortedRounds, 0.5),
         roundP95Ms: percentile(sortedRounds, 0.95),
-        ...(input.mode === "dflash"
-          ? {
-            acceptedTokens: accepted,
-            proposedTokens: proposed,
-            acceptanceRate: proposed > 0 ? accepted / proposed : undefined,
-            speculativeRounds,
-            ordinaryRounds,
-            draftMs: Number(after.draftNanos - before.draftNanos) / 1e6,
-            verificationMs: Number(after.verificationNanos - before.verificationNanos) / 1e6
-          }
-          : {}),
+        acceptedTokens: input.mode === "dflash" ? accepted : undefined,
+        proposedTokens: input.mode === "dflash" ? proposed : undefined,
+        acceptanceRate: input.mode === "dflash" && proposed > 0 ? accepted / proposed : undefined,
+        speculativeRounds: input.mode === "dflash" ? speculativeRounds : undefined,
+        ordinaryRounds: input.mode === "dflash" ? ordinaryRounds : undefined,
+        draftMs: input.mode === "dflash" ? Number(after.draftNanos - before.draftNanos) / 1e6 : undefined,
+        verificationMs: input.mode === "dflash"
+          ? Number(after.verificationNanos - before.verificationNanos) / 1e6
+          : undefined,
         targetPoolHighWaterBlocks: Number(after.targetPoolHighWaterBlocks),
         proposerPoolHighWaterBlocks: after.proposerPoolHighWaterBlocks === undefined
           ? undefined
@@ -589,14 +600,12 @@ const effectSuite = (
           topP: config.topP,
           seed: config.seed
         },
-        ...(mode === "dflash" && draft !== undefined
+        speculation: mode === "dflash" && draft !== undefined
           ? {
-            speculation: {
-              proposer: draft.artifact,
-              maxDraftTokens: Math.min(config.draftTokens, draft.maxDraftTokens)
-            }
+            proposer: draft.artifact,
+            maxDraftTokens: Math.min(config.draftTokens, draft.maxDraftTokens)
           }
-          : {})
+          : undefined
       })
       const compileMs = performance.now() - compileStarted
       process.stderr.write(`compiled ${mode} inference: ${(compileMs / 1000).toFixed(2)}s\n`)
@@ -664,14 +673,14 @@ const effectSuite = (
       }
     }
 
-    // Model.inference retains its own materialized parameter generation, so
-    // the loader handles can be released after both modes are compiled.
+    // Each Model.inference program retains its materialized parameter tensors.
+    // All cases are done here, so the benchmark clears the loader tensors.
     yield* Tensor.clearAll(loaded.params)
     if (draft !== undefined) yield* Tensor.clearAll(draft.params)
   })
 
 // ---------------------------------------------------------------------------
-// llama.cpp orchestration
+// llama.cpp suite
 // ---------------------------------------------------------------------------
 
 interface CommandResult {
@@ -733,9 +742,9 @@ const runLlamaBench = async (config: Config, binary: string, records: Array<Benc
     "jsonl"
   ]
   const commands = [
-    // Prompt-processing sweep at each requested context.
+    // Measure prompt processing at each requested context.
     [...common, "-p", config.contexts.join(","), "-n", "0"],
-    // Decode sweep with the KV cache pre-populated to each requested depth.
+    // Measure decoding with the KV cache populated to each requested depth.
     [...common, "-p", "0", "-n", String(config.maxNew), "-d", config.contexts.join(",")]
   ]
   for (const args of commands) {
@@ -749,14 +758,14 @@ const runLlamaBench = async (config: Config, binary: string, records: Array<Benc
       continue
     }
     for (const line of lines) {
-      const row = JSON.parse(line) as Record<string, unknown>
+      const row = decodeLlamaBenchRow(line)
       const nPrompt = Number(row.n_prompt ?? 0)
       const nGen = Number(row.n_gen ?? 0)
       const nDepth = Number(row.n_depth ?? 0)
       const avgNs = Number(row.avg_ns ?? NaN)
       const avgMs = Number.isFinite(avgNs) ? avgNs / 1e6 : undefined
       const tokens = nGen > 0 ? nGen : nPrompt
-      const avgTs = typeof row.avg_ts === "number"
+      const avgTs = Predicate.isNumber(row.avg_ts)
         ? row.avg_ts
         : avgMs !== undefined && avgMs > 0
         ? tokens / (avgMs / 1000)
@@ -1080,7 +1089,7 @@ const writeOutput = (config: Config, records: ReadonlyArray<BenchRecord>): void 
 }
 
 // ---------------------------------------------------------------------------
-// Entrypoint
+// Entry point
 // ---------------------------------------------------------------------------
 
 const main = async (): Promise<void> => {

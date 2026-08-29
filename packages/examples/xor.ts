@@ -7,8 +7,8 @@ const HIDDEN = 8
 const STEPS = 3000
 const LR = 0.1
 
-// Tutorial architecture: compose a 2 -> 8 -> 1 MLP from primitive models,
-// train full-batch with Trainer's cached step, then use cached model inference.
+// Trains a 2 -> 8 -> 1 MLP with Trainer's cached step, then evaluates it with
+// cached model inference.
 const program = Effect.gen(function*() {
   const runtime = yield* Runtime.Runtime
   const x = yield* Tensor.fromTypedArray(new Float32Array([0, 0, 0, 1, 1, 0, 1, 1]), [4, 2])

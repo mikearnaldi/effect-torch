@@ -5,8 +5,8 @@
  * Effect, and running that Effect asks the active {@link Runtime.Runtime}
  * service to create immutable semantic graph nodes rather than execute kernels.
  * Static metadata is available immediately on the resulting {@link Lazy}
- * handle. {@link compute}, readback, saving, and compiled-program execution are
- * the materialization boundaries.
+ * handle. {@link compute}, readback, saving, and compiled-program execution
+ * materialize tensors.
  *
  * A tensor belongs to one runtime identity and exact placement. Shapes are
  * logical non-negative integer dimensions (`[]` is a scalar and zero extents
@@ -34,7 +34,7 @@
  *
  * @since 0.1.0
  */
-import { Data, Deferred, Effect, Exit, type Scope } from "effect"
+import { Data, Deferred, Effect, Exit, Predicate, type Scope } from "effect"
 import { dual } from "effect/Function"
 import * as Runtime from "./Runtime.ts"
 
@@ -95,7 +95,7 @@ export class TensorError extends Data.TaggedError("TensorError")<{
   /** Human-readable description of the failed validation or backend work. */
   readonly message: string
   /** Original backend failure when the error crossed the runtime boundary. */
-  readonly backend?: Runtime.BackendError
+  readonly backend?: Runtime.BackendError | undefined
 }> {}
 
 /**
@@ -137,7 +137,7 @@ export type Concrete = Runtime.ConcreteTensorHandle
 /**
  * A backend-owned immutable executable and the metadata expected for its
  * outputs. The opaque handle retains its typed lowered program, static plans,
- * prepared artifacts, captured generated bindings or constants, and
+ * prepared backend resources, captured generated bindings or constants, and
  * diagnostics. It may be called concurrently; each invocation owns its output
  * handles and workspace independently. There is no explicit program-release
  * operation; drop JavaScript and cache references to make the wrapper eligible
@@ -156,7 +156,7 @@ export interface CompiledProgram {
     /** Expected output dtype. */
     readonly dtype: DType
     /** Expected encoded storage, when the output is an encoded identity. */
-    readonly storage?: Runtime.EncodedTensorStorage
+    readonly storage?: Runtime.EncodedTensorStorage | undefined
     /** Expected output placement. */
     readonly placement: Runtime.Placement
   }>
@@ -174,7 +174,7 @@ export const isLazyTensor = (self: Any): self is Lazy => self._tag === "LazyTens
 
 /**
  * Refines a handle by its public concrete tag. This is not an ownership or
- * liveness check: a cleared or forged value can retain the tag but fail at the
+ * liveness check. A cleared or forged value can retain the tag but fail at the
  * runtime boundary.
  *
  * @since 0.1.0
@@ -234,12 +234,12 @@ const checkCompatible = (op: string, a: Any, b: Any): void => {
 
 const backendMessage = (error: Runtime.BackendError): string => error.message
 
-const caughtTensorError = (op: string, error: unknown): TensorError =>
-  error instanceof TensorError
-    ? error
-    : error instanceof Runtime.BackendError
-    ? new TensorError({ op, message: error.message, backend: error })
-    : new TensorError({ op, message: error instanceof Error ? error.message : String(error) })
+const caughtTensorError = (op: string, cause: unknown): TensorError =>
+  cause instanceof TensorError
+    ? cause
+    : cause instanceof Runtime.BackendError
+    ? new TensorError({ op, message: cause.message, backend: cause })
+    : new TensorError({ op, message: cause instanceof Error ? cause.message : String(cause) })
 
 const fromBackend = <A>(op: string, effect: Effect.Effect<A, Runtime.BackendError>): Effect.Effect<A, TensorError> =>
   Effect.mapError(effect, (error) => new TensorError({ op, message: backendMessage(error), backend: error }))
@@ -248,7 +248,7 @@ interface GraphResult {
   readonly request: Runtime.NodeRequest
   readonly shape: ReadonlyArray<number>
   readonly dtype: DType
-  readonly storage?: Runtime.EncodedTensorStorage
+  readonly storage?: Runtime.EncodedTensorStorage | undefined
   readonly placement: Runtime.Placement
 }
 
@@ -299,34 +299,33 @@ const validStorage = (value: Runtime.TensorHandle): boolean => {
 
 const isTensorHandleValue = (value: unknown): value is Any =>
   typeof value === "object" && value !== null &&
-  ((value as { readonly _tag?: unknown })._tag === "LazyTensor" ||
-    (value as { readonly _tag?: unknown })._tag === "Tensor")
+  "_tag" in value && (value._tag === "LazyTensor" || value._tag === "Tensor")
 
-const validateTensorHandle = <T extends "LazyTensor" | "Tensor">(
+const validateTensorHandle = <T extends Runtime.TensorHandle>(
   op: string,
   runtime: Runtime.RuntimeService,
-  value: Runtime.TensorHandle,
+  value: T,
   expected: {
-    readonly _tag: T
+    readonly _tag: T["_tag"]
     readonly shape?: ReadonlyArray<number>
     readonly dtype?: DType
-    readonly storage?: Runtime.EncodedTensorStorage
+    readonly storage?: Runtime.EncodedTensorStorage | undefined
     readonly placement?: Runtime.Placement
   }
-): T extends "LazyTensor" ? Lazy : Concrete => {
+): T => {
   const validDtypes: ReadonlyArray<string> = ["f32", "f64", "f16", "bf16", "i64", "u8", "u32"]
   if (
     !isTensorHandleValue(value) || value._tag !== expected._tag || !Array.isArray(value.shape) ||
     !value.shape.every((dimension) => Number.isSafeInteger(dimension) && dimension >= 0) ||
-    !validDtypes.includes(value.dtype) || !validStorage(value) || typeof value.device !== "string" ||
-    typeof value.placement !== "object" || value.placement === null || value.device !== value.placement.deviceType ||
+    !validDtypes.includes(value.dtype) || !validStorage(value) || !Predicate.isString(value.device) ||
+    !Predicate.isObjectOrArray(value.placement) || value.device !== value.placement.deviceType ||
     !samePlacement(value.placement, runtime.placement) ||
     (expected.shape !== undefined && !sameShape(value.shape, expected.shape)) ||
     (expected.dtype !== undefined && value.dtype !== expected.dtype) ||
     !sameStorage(value.storage, expected.storage) ||
     (expected.placement !== undefined && !samePlacement(value.placement, expected.placement))
   ) {
-    const candidate = value as Partial<Runtime.TensorHandle>
+    const candidate = value
     throw new TensorError({
       op,
       message: `${op}: backend returned invalid ${
@@ -338,7 +337,7 @@ const validateTensorHandle = <T extends "LazyTensor" | "Tensor">(
       }`
     })
   }
-  return value as T extends "LazyTensor" ? Lazy : Concrete
+  return value
 }
 
 const graphTry = (
@@ -366,7 +365,7 @@ const isFloatDtype = (dtype: string): boolean => dtype === "f32" || dtype === "f
  * a semantic leaf but executes no tensor kernel. Native backends use a bounded
  * process-local pool keyed by value bits, dtype, and device, so a resident entry
  * may be reused; graph-node identity is not a public guarantee. Use {@link full}
- * for non-scalar shapes. Runtime-varying values must be declared as inputs: use
+ * for non-scalar shapes. Declare runtime-varying values as inputs. Use
  * {@link makeScalarInput} for a plain number or {@link makeInput}/{@link compile}
  * for tensor bindings.
  *
@@ -683,11 +682,11 @@ export const eye = (
 const dtypeOfTypedArray = (data: TypedArray): DType => {
   if (data instanceof Float32Array) return "f32"
   if (data instanceof Float64Array) return "f64"
-  if (typeof Float16Array !== "undefined" && data instanceof Float16Array) return "f16"
+  if ("Float16Array" in globalThis && data instanceof globalThis.Float16Array) return "f16"
   if (data instanceof BigInt64Array) return "i64"
   if (data instanceof Uint8Array) return "u8"
   if (data instanceof Uint32Array) return "u32"
-  throw new Error(`fromTypedArray: unsupported typed array ${(data as object).constructor.name}`)
+  throw new Error(`fromTypedArray: unsupported typed array ${data.constructor.name}`)
 }
 
 /**
@@ -1374,7 +1373,7 @@ export const scaledDotProductAttention = (
         attributes: {
           scale,
           causal: options.causal ?? false,
-          ...(options.window === undefined ? {} : { window: options.window })
+          window: options.window
         }
       },
       shape: [...q.shape.slice(0, -1), v.shape[rank - 1]],
@@ -1406,10 +1405,10 @@ export interface KdaChunkOptions {
  * `q`, `k` and `logDecay` are `[..., H, T, Dk]`, `v` is `[..., H, T, Dv]`
  * and `beta` is `[..., H, T, 1]`, all with equal leading dimensions and
  * a shared dtype; the output is `[..., H, T, Dv]`. `logDecay` holds raw
- * per-channel log decay rates (`<= 0`, before any cumulative summation —
- * the gate activation lives upstream) and `beta` must already lie in
- * `[0, 1]` (e.g. sigmoided). Because positional information is carried
- * by the learnable decayed transition itself, KDA layers use no
+ * per-channel log decay rates. These are `<= 0` before any cumulative
+ * summation because the gate activation lives upstream. `beta` must already
+ * lie in `[0, 1]`, for example after a sigmoid. The learnable decayed transition
+ * itself carries positional information, so KDA layers use no
  * positional encoding.
  *
  * The implementation computes in f32 (f64 stays f64) with chunk size 64
@@ -1482,11 +1481,11 @@ export const kdaChunk = (
  * `[C, K]` weight as a single semantic operation:
  * `y[t, c] = sum_j weight[c, j] · x[t - K + 1 + j, c]` with zero history
  * (a left zero-padding of `K - 1` tokens). The output has the input's
- * shape. This is the KDA-style local mixing convolution; kept semantic so
- * compiled generation can carry the `K - 1`-token window as per-sequence
- * state instead of re-deriving it from composed ops. Dedicated first-order
- * gradients are provided for input and weight, but their backward nodes are not
- * differentiable, so second-order derivatives are unavailable.
+ * shape. This KDA-style local mixing convolution remains one graph operation,
+ * allowing compiled generation to carry the `K - 1`-token window as
+ * per-sequence state instead of rebuilding it from composed ops. Dedicated
+ * first-order gradients are provided for input and weight, but their backward
+ * nodes are not differentiable, so second-order derivatives are unavailable.
  *
  * @since 0.1.0
  * @category neural network
@@ -1677,13 +1676,12 @@ export interface ClampOptions {
 export const clamp = dualOptions(
   (self: Any, options: ClampOptions = {}): Effect.Effect<Lazy, TensorError, Runtime.Runtime> =>
     Effect.gen(function*() {
-      if (options.min === undefined && options.max === undefined) {
-        return yield* new TensorError({ op: "clamp", message: "clamp: at least one of min and max is required" })
+      if (options.min !== undefined) {
+        const out = yield* maximum(self, yield* constantLike(self, options.min))
+        return options.max === undefined ? out : yield* minimum(out, yield* constantLike(self, options.max))
       }
-      let out: Any = self
-      if (options.min !== undefined) out = yield* maximum(out, yield* constantLike(self, options.min))
-      if (options.max !== undefined) out = yield* minimum(out, yield* constantLike(self, options.max))
-      return out as Lazy
+      if (options.max !== undefined) return yield* minimum(self, yield* constantLike(self, options.max))
+      return yield* new TensorError({ op: "clamp", message: "clamp: at least one of min and max is required" })
     })
 )
 
@@ -1774,7 +1772,7 @@ export const pow: {
  * Batched matrix multiplication over the last two dimensions, with
  * broadcasting of the leading batch dimensions. Both operands must have rank
  * at least 2, matching inner dimensions, dtype, and exact placement. This API
- * intentionally does not apply vector/matrix rank promotion.
+ * does not apply vector/matrix rank promotion.
  *
  * @since 0.1.0
  * @category operations
@@ -2347,7 +2345,7 @@ export const concat = (
   options: { readonly dim?: number } = {}
 ): Effect.Effect<Lazy, TensorError, Runtime.Runtime> =>
   Effect.gen(function*() {
-    const [first, ...rest] = tensors
+    const [first, second, ...rest] = tensors
     const dim = options.dim ?? 0
     const rank = first.shape.length
     const axis = dim < 0 ? dim + rank : dim
@@ -2357,9 +2355,8 @@ export const concat = (
         message: `concat: dimension ${dim} out of range for rank ${rank}`
       })
     }
-    let out: Any = first
-    for (const next of rest) {
-      out = yield* graphTry("concat", () => {
+    const append = (out: Any, next: Any) =>
+      graphTry("concat", () => {
         checkCompatible("concat", first, next)
         if (next.shape.length !== rank) {
           throw new Error(`concat: rank mismatch, [${out.shape}] vs [${next.shape}]`)
@@ -2376,8 +2373,11 @@ export const concat = (
           placement: first.placement
         }
       })
+    let out = yield* append(first, second)
+    for (const next of rest) {
+      out = yield* append(out, next)
     }
-    return out as Lazy
+    return out
   })
 
 /**
@@ -2425,7 +2425,7 @@ export const broadcastTo: {
 export const flatten = dualOptions(
   (
     self: Any,
-    options: { readonly startDim?: number; readonly endDim?: number } = {}
+    options: { readonly startDim?: number; readonly endDim?: number | undefined } = {}
   ): Effect.Effect<Lazy, TensorError, Runtime.Runtime> =>
     Effect.gen(function*() {
       const rank = self.shape.length
@@ -2524,11 +2524,15 @@ export const stack = (
         message: `stack: dimension ${dim} out of range for rank ${rank}`
       })
     }
-    const expanded: Array<Lazy> = []
-    for (const t of tensors) {
+    const [first, second, ...rest] = tensors
+    const expanded: [Lazy, Lazy, ...Array<Lazy>] = [
+      yield* unsqueeze(first, d),
+      yield* unsqueeze(second, d)
+    ]
+    for (const t of rest) {
       expanded.push(yield* unsqueeze(t, d))
     }
-    return yield* concat(expanded as unknown as [Any, Any, ...Array<Any>], { dim: d })
+    return yield* concat(expanded, { dim: d })
   })
 
 /**
@@ -2551,7 +2555,7 @@ export const split = (
     const d = normalizeDim("split", self.shape.length, dim)
     const n = self.shape[d]
     let sizes: ReadonlyArray<number>
-    if (typeof sections === "number") {
+    if (Predicate.isNumber(sections)) {
       if (!Number.isInteger(sections) || sections <= 0) {
         return yield* new TensorError({ op: "split", message: `split: section size must be positive, got ${sections}` })
       }
@@ -2608,17 +2612,17 @@ export const chunk = (
  * @since 0.1.0
  * @category shape operations
  */
-export const tile = (
-  self: Any,
+export const tile = <Self extends Any>(
+  self: Self,
   reps: ReadonlyArray<number>
-): Effect.Effect<Lazy, TensorError, Runtime.Runtime> =>
+): Effect.Effect<Self | Lazy, TensorError, Runtime.Runtime> =>
   Effect.gen(function*() {
     for (const r of reps) {
       if (!Number.isInteger(r) || r < 1) {
         return yield* new TensorError({ op: "tile", message: `tile: reps must be positive integers, got [${reps}]` })
       }
     }
-    let cur: Any = self
+    let cur: Self | Lazy = self
     if (reps.length > self.shape.length) {
       const extra = reps.length - self.shape.length
       cur = yield* reshape(cur, [...Array<number>(extra).fill(1), ...self.shape])
@@ -2641,7 +2645,7 @@ export const tile = (
       merged.splice(i + 1, 1)
       cur = yield* reshape(wide, merged)
     }
-    return cur as Lazy
+    return cur
   })
 
 /**
@@ -2651,10 +2655,10 @@ export const tile = (
  * @since 0.1.0
  * @category shape operations
  */
-export const pad = (
-  self: Any,
+export const pad = <Self extends Any>(
+  self: Self,
   pads: ReadonlyArray<readonly [before: number, after: number]>
-): Effect.Effect<Lazy, TensorError, Runtime.Runtime> =>
+): Effect.Effect<Self | Lazy, TensorError, Runtime.Runtime> =>
   Effect.gen(function*() {
     if (pads.length > self.shape.length) {
       return yield* new TensorError({
@@ -2662,30 +2666,30 @@ export const pad = (
         message: `pad: ${pads.length} pad specs for a rank-${self.shape.length} tensor`
       })
     }
-    let cur: Any = self
+    let cur: Self | Lazy = self
     for (let d = 0; d < pads.length; d++) {
       const [before, after] = pads[d]
       if (before < 0 || after < 0) {
         return yield* new TensorError({ op: "pad", message: `pad: negative padding [${before}, ${after}]` })
       }
       if (before > 0) {
-        const shape = [...cur.shape]
+        const shape: Array<number> = [...cur.shape]
         shape[d] = before
         cur = yield* concat([yield* zeros(shape, { dtype: cur.dtype }), cur], { dim: d })
       }
       if (after > 0) {
-        const shape = [...cur.shape]
+        const shape: Array<number> = [...cur.shape]
         shape[d] = after
         cur = yield* concat([cur, yield* zeros(shape, { dtype: cur.dtype })], { dim: d })
       }
     }
-    return cur as Lazy
+    return cur
   })
 
 /**
- * Gathers rows (or slices along `dim`) by integer indexes: the inverse of
+ * Gathers rows or slices along `dim` by integer indexes. This is the inverse of
  * one-hot. `indexes` must be a 1-D `i64` or `u32` tensor on the same device.
- * Differentiable: gradients scatter-add back into the input positions.
+ * Gradients scatter-add back into the input positions.
  *
  * @since 0.1.0
  * @category shape operations
@@ -2840,20 +2844,20 @@ export const scatterAdd = (
  * @since 0.1.0
  * @category shape operations
  */
-export const flip = (
-  self: Any,
+export const flip = <Self extends Any>(
+  self: Self,
   dims: ReadonlyArray<number>
-): Effect.Effect<Lazy, TensorError, Runtime.Runtime> =>
+): Effect.Effect<Self | Lazy, TensorError, Runtime.Runtime> =>
   Effect.gen(function*() {
     const normalized = normalizeDims("flip", self.shape.length, dims)
-    let cur: Any = self
+    let cur: Self | Lazy = self
     for (const d of normalized) {
       const n = self.shape[d]
       const r = yield* arange(n, undefined, { dtype: "i64" })
       const idx = yield* add(yield* mul(r, yield* constantLike(r, -1)), yield* constantLike(r, n - 1))
       cur = yield* take(cur, idx, { dim: d })
     }
-    return cur as Lazy
+    return cur
   })
 
 /**
@@ -2885,11 +2889,11 @@ export const oneHot = (
   })
 
 /**
- * Cross entropy between class logits of shape `[..., classes]` and
- * integer class-index targets of the leading shape: the scalar mean of
- * `logsumexp(logits) - logits[target]` over active positions, computed
- * stably (max subtraction) without materializing softmax intermediates or a
- * one-hot tensor in the graph. Positions where the target equals
+ * Cross entropy between class logits of shape `[..., classes]` and integer
+ * class-index targets of the leading shape. It computes the scalar mean of
+ * `logsumexp(logits) - logits[target]` over active positions. Max subtraction
+ * keeps the computation stable without materializing softmax intermediates or
+ * a one-hot tensor in the graph. Positions where the target equals
  * `ignoreIndex` (default `-100`) contribute zero loss and zero gradient and
  * are excluded from the mean. Evaluation fails when every position is
  * ignored or an active target is out of range. The backward is not
@@ -2960,7 +2964,7 @@ export const embedding = (
   indexes: Any,
   options: {
     readonly weight: Any
-    readonly paddingIndex?: number
+    readonly paddingIndex?: number | undefined
   }
 ): Effect.Effect<Lazy, TensorError, Runtime.Runtime> =>
   Effect.gen(function*() {
@@ -3007,7 +3011,7 @@ export const embedding = (
           attributes: {
             encoding: weight.storage!.encoding,
             logicalShape: [vocab, hidden],
-            ...(paddingIndex === undefined ? {} : { paddingIndex })
+            paddingIndex
           }
         },
         shape: [...indexes.shape, hidden],
@@ -3429,11 +3433,14 @@ const convTranspose2dImpl = (
     } else {
       const xs = yield* split(self, Array<number>(groups).fill(cIn / groups), { dim: 1 })
       const ws = yield* split(weight, Array<number>(groups).fill(wIn / groups), { dim: 0 })
-      const outs: Array<Lazy> = []
-      for (let i = 0; i < groups; i++) {
+      const outs: [Lazy, Lazy, ...Array<Lazy>] = [
+        yield* convGroup(xs[0], ws[0]),
+        yield* convGroup(xs[1], ws[1])
+      ]
+      for (let i = 2; i < groups; i++) {
         outs.push(yield* convGroup(xs[i], ws[i]))
       }
-      out = yield* concat(outs as unknown as [Any, Any, ...Array<Any>], { dim: 1 })
+      out = yield* concat(outs, { dim: 1 })
     }
     if (outputPads[0] > 0 || outputPads[1] > 0) {
       out = yield* pad(out, [[0, 0], [0, 0], [0, outputPads[0]], [0, outputPads[1]]])
@@ -3445,8 +3452,8 @@ const convTranspose2dImpl = (
  * 2-D transposed convolution ("deconvolution", the gradient of conv2d):
  * `self` is `[N, C_in, H, W]`, `weight` is `[C_in, C_out/groups, KH, KW]`.
  * Composed as input dilation (zero-interleave) followed by a regular
- * {@link conv2d} with the spatially flipped, channel-swapped kernel — so
- * it runs on every backend and differentiates through ordinary adjoints.
+ * {@link conv2d} with the spatially flipped, channel-swapped kernel. It runs
+ * on every backend and differentiates through ordinary adjoints.
  *
  * @since 0.1.0
  * @category neural network
@@ -3552,14 +3559,14 @@ const pool2d = (
         message: `${op}: expected a rank-4 [N, C, H, W] input, got rank ${self.shape.length}`
       })
     }
-    const [kh, kw] = typeof options.kernelSize === "number"
-      ? [options.kernelSize, options.kernelSize]
-      : options.kernelSize
+    const [kh, kw] = Array.isArray(options.kernelSize)
+      ? options.kernelSize
+      : [options.kernelSize, options.kernelSize]
     const [sy, sx] = options.stride === undefined
       ? [kh, kw]
-      : typeof options.stride === "number"
-      ? [options.stride, options.stride]
-      : options.stride
+      : Array.isArray(options.stride)
+      ? options.stride
+      : [options.stride, options.stride]
     const padding = options.padding ?? 0
     if (kh < 1 || kw < 1 || sy < 1 || sx < 1 || padding < 0) {
       return yield* new TensorError({
@@ -3593,10 +3600,9 @@ const pool2d = (
         )
       }
     }
-    const stacked = yield* stack(
-      windows as unknown as [Any, Any, ...Array<Any>],
-      { dim: 0 }
-    )
+    const stacked = windows.length === 1
+      ? yield* unsqueeze(windows[0], 0)
+      : yield* stack([windows[0], windows[1], ...windows.slice(2)], { dim: 0 })
     return yield* reduce(stacked)
   })
 
@@ -3769,7 +3775,9 @@ export const compute = <Roots extends ReadonlyArray<Any>>(
   Effect.gen(function*() {
     if (roots.length === 0) {
       yield* Runtime.Runtime
-      return [] as unknown as { readonly [K in keyof Roots]: Concrete }
+      const empty = Array<Concrete>()
+      // SAFETY: Zero roots correspond to an empty concrete-output tuple or array.
+      return empty as { readonly [K in keyof Roots]: Concrete }
     }
     const runtime = yield* Runtime.Runtime
     let owned: ReadonlyArray<Concrete> = []
@@ -3787,6 +3795,7 @@ export const compute = <Roots extends ReadonlyArray<Any>>(
             message: `execute: backend returned ${values.length} tensors for ${roots.length} roots`
           })
         }
+        // SAFETY: The length check aligns every validated concrete value with the root at the same tuple index.
         return (yield* Effect.forEach(values, (value, index) =>
           Effect.try({
             try: () =>
@@ -3794,7 +3803,7 @@ export const compute = <Roots extends ReadonlyArray<Any>>(
                 _tag: "Tensor",
                 shape: roots[index].shape,
                 dtype: roots[index].dtype,
-                ...(roots[index].storage === undefined ? {} : { storage: roots[index].storage }),
+                storage: roots[index].storage,
                 placement: roots[index].placement
               }),
             catch: (error) => caughtTensorError("execute", error)
@@ -3998,7 +4007,7 @@ export const clearAll = (
 /**
  * Registers an arbitrary already-owned concrete handle for best-effort cleanup
  * when the current Effect scope closes, then returns the same handle for
- * composition. This only registers cleanup: it does not compute, acquire, or
+ * composition. This only registers cleanup. It does not compute, acquire, or
  * validate the tensor. Finalizer errors are ignored, and clearing the handle
  * before scope closure is valid because cleanup is idempotent. This is an
  * application ownership helper; library combinators should release tensors at
@@ -4093,15 +4102,15 @@ export const toNumberArray = (self: Any): Effect.Effect<Array<number>, TensorErr
       op: "toNumberArray",
       message: "toNumberArray: i64 tensors may contain values not representable as numbers"
     })
-    : Effect.map(toTypedArray(self), (arr) => Array.from(arr as Float32Array | Float64Array | Uint8Array | Uint32Array))
+    : Effect.map(toTypedArray(self), (arr) => Array.from(arr, Number))
 
 const validateMetadata = (op: string, metadata: Readonly<Record<string, string>>): Readonly<Record<string, string>> => {
-  if (typeof metadata !== "object" || metadata === null || Array.isArray(metadata)) {
+  if (!Predicate.isObject(metadata)) {
     throw new TensorError({ op, message: `${op}: metadata must be a record of strings` })
   }
-  const output = Object.create(null) as Record<string, string>
+  const output: Record<string, string> = Object.create(null)
   for (const [key, value] of Object.entries(metadata)) {
-    if (typeof value !== "string") {
+    if (!Predicate.isString(value)) {
       throw new TensorError({ op, message: `${op}: metadata ${JSON.stringify(key)} must be a string` })
     }
     output[key] = value
@@ -4119,8 +4128,8 @@ const withMaterializedInputs = <A, E, R>(
   inputs: ReadonlyArray<Any>,
   use: (inputs: ReadonlyArray<Concrete>) => Effect.Effect<A, E, R>
 ): Effect.Effect<A, E | TensorError, R | Runtime.Runtime> => {
-  const lazy = inputs.filter((input) => !isTensor(input))
-  if (lazy.length === 0) return use(inputs as ReadonlyArray<Concrete>)
+  if (inputs.every(isTensor)) return use(inputs)
+  const lazy = inputs.filter(isLazyTensor)
   return Effect.gen(function*() {
     const materialized = yield* compute(lazy)
     let index = 0
@@ -4266,30 +4275,30 @@ export const loadArchive = (
         runtime = yield* Runtime.Runtime
         const extension = runtime.extensions.pathSafetensors
         const archive = yield* fromBackend("loadArchive", extension.load(path))
+        const loadedArchive = archive
         const discovered = new Set<Concrete>()
-        if (typeof archive === "object" && archive !== null && Array.isArray(archive.entries)) {
-          for (const entry of archive.entries) {
-            if (
-              typeof entry === "object" && entry !== null && typeof entry.tensor === "object" &&
-              entry.tensor !== null
-            ) {
-              discovered.add(entry.tensor as Concrete)
+        if (Predicate.isObjectOrArray(archive) && Array.isArray(archive.entries)) {
+          for (const entry of loadedArchive.entries) {
+            const loadedEntry = entry
+            if (Predicate.isObjectOrArray(entry) && Predicate.isObjectOrArray(loadedEntry.tensor)) {
+              discovered.add(loadedEntry.tensor)
             }
           }
         }
         candidates = Array.from(discovered)
         const checked = yield* Effect.try({
           try: () => {
-            if (typeof archive !== "object" || archive === null || !Array.isArray(archive.entries)) {
+            if (!Predicate.isObjectOrArray(archive) || !Array.isArray(archive.entries)) {
               throw new TensorError({ op: "loadArchive", message: "loadArchive: backend returned an invalid archive" })
             }
-            const metadata = validateMetadata("loadArchive", archive.metadata)
+            const metadata = validateMetadata("loadArchive", loadedArchive.metadata)
             const names = new Set<string>()
             const handles = new Set<Concrete>()
-            const tensors = Object.create(null) as Record<string, Concrete>
-            for (const entry of archive.entries) {
+            const tensors: Record<string, Concrete> = Object.create(null)
+            for (const entry of loadedArchive.entries) {
+              const loadedEntry = entry
               if (
-                typeof entry !== "object" || entry === null || typeof entry.name !== "string" ||
+                !Predicate.isObjectOrArray(entry) || !Predicate.isString(entry.name) ||
                 entry.name === "__metadata__" || names.has(entry.name)
               ) {
                 throw new TensorError({
@@ -4297,8 +4306,8 @@ export const loadArchive = (
                   message: "loadArchive: backend returned invalid tensor names"
                 })
               }
-              names.add(entry.name)
-              const tensor = validateTensorHandle("loadArchive", runtime!, entry.tensor, { _tag: "Tensor" })
+              names.add(loadedEntry.name)
+              const tensor = validateTensorHandle("loadArchive", runtime!, loadedEntry.tensor, { _tag: "Tensor" })
               if (handles.has(tensor)) {
                 throw new TensorError({
                   op: "loadArchive",
@@ -4306,7 +4315,7 @@ export const loadArchive = (
                 })
               }
               handles.add(tensor)
-              tensors[entry.name] = tensor
+              tensors[loadedEntry.name] = tensor
             }
             return Object.freeze({ tensors: Object.freeze(tensors), metadata })
           },
@@ -4336,7 +4345,7 @@ export const load = (
       new TensorError({
         op: "load",
         message: error.message,
-        ...(error.backend === undefined ? {} : { backend: error.backend })
+        backend: error.backend
       })
     )
   )
@@ -4448,7 +4457,7 @@ export interface ProgramCache {
   readonly clear: Effect.Effect<void>
 }
 
-/** Mutable internals — the public surface is {@link ProgramCache}. */
+/** Mutable internals. Callers use {@link ProgramCache}. */
 type ProgramCacheState = ProgramCache
 
 type ProgramCacheEntry =
@@ -4503,11 +4512,11 @@ const evictProgramCache = (cache: ProgramCacheState): void => {
 
 /**
  * Looks up the program for `key`, running `trace` once on a miss.
- * The thunk is only invoked on a miss — cache hits never build a
- * trace effect. Concurrent misses on the same key share one trace
- * (single-flight): the first caller traces, the rest await the same
- * deferred. Waiter interruption does not cancel the owner fiber's trace; the
- * shared attempt continues for remaining waiters. A failed trace is removed
+ * The thunk runs only on a miss. Cache hits never build a trace effect.
+ * Concurrent misses on the same key share one trace. The first caller traces,
+ * and the rest await the same deferred. Waiter interruption does not cancel the
+ * owner fiber's trace. The shared attempt continues for remaining waiters. A
+ * failed trace is removed
  * from `entries` but still increments `compiled` and remains in signature
  * history until clear. Ready entries are evicted after successful traces;
  * pending entries can exceed capacity.
@@ -4525,6 +4534,7 @@ export const cachedProgram = <E, R>(
     if (hit !== undefined) {
       cache.entries.delete(key)
       cache.entries.set(key, hit)
+      // SAFETY: Callers use each cache/key pair with one trace error type, so a pending error is `E`.
       return hit._tag === "ready"
         ? Effect.succeed(hit.program)
         : Deferred.await(hit.deferred) as Effect.Effect<CompiledProgram, E>
@@ -4607,12 +4617,12 @@ export const makeInput = (slot: number, exemplar: Any): Effect.Effect<Lazy, Tens
         slot,
         shape: [...exemplar.shape],
         dtype: exemplar.dtype,
-        ...(exemplar.storage === undefined ? {} : { storage: exemplar.storage })
+        storage: exemplar.storage
       }
     },
     shape: exemplar.shape,
     dtype: exemplar.dtype,
-    ...(exemplar.storage === undefined ? {} : { storage: exemplar.storage }),
+    storage: exemplar.storage,
     placement: runtime.placement
   }))
 
@@ -4645,7 +4655,7 @@ export const makeScalarInput = (
  * recorded as side-table regions; compilation does not insert fused semantic
  * nodes or rebuild the graph. Backend lowering then creates the authoritative
  * typed instruction, memory, and physical plans and prepares required
- * artifacts. Compilation borrows roots; `constantWeights` may additionally
+ * artifacts. Compilation borrows roots; `constantWeights` may also
  * retain eligible concrete storage in the executable. Root order and duplicates
  * define output order. There is no explicit executable release operation.
  *
@@ -4664,7 +4674,7 @@ export const freezeProgram = (
       outputs: roots.map((root) => ({
         shape: root.shape,
         dtype: root.dtype,
-        ...(root.storage === undefined ? {} : { storage: root.storage }),
+        storage: root.storage,
         placement: root.placement
       }))
     }
@@ -4741,9 +4751,9 @@ export interface DecodeProgram extends Runtime.DecodeStateSchema {
 }
 
 /**
- * A backend-owned KV sequence: a mutable block table, logical token cursor, and
- * recurrent state over one {@link KvPool}. Operations on one sequence must be
- * serialized; do not execute, match, inspect, or release it concurrently.
+ * A backend-owned KV sequence with a mutable block table, logical token cursor,
+ * and recurrent state over one {@link KvPool}. Operations on one sequence must
+ * be serialized; do not execute, match, inspect, or release it concurrently.
  * Release live sequences deterministically with {@link releaseKvSequence};
  * native finalization is a fallback.
  *
@@ -4988,7 +4998,7 @@ export const compileDecodeProgram = (
     return {
       handle,
       ...handle.state,
-      ...(state.packedCausalChains === undefined ? {} : { packedCausalChains: state.packedCausalChains }),
+      packedCausalChains: state.packedCausalChains,
       outputs: roots.flatMap((root, index) => {
         const base = { dtype: root.dtype, placement: root.placement }
         const selection = state.outputSelections?.[index]
@@ -5243,8 +5253,8 @@ export const runBatchedDecodeProgramSampled = (
 
 /**
  * Fused linear layer as a single semantic operation: `y = x · weight +
- * bias` over the last dim (the addmm epilogue — one gemm launch on
- * Metal).
+ * bias` over the last dimension. The addmm epilogue uses one GEMM launch on
+ * Metal.
  *
  * @since 0.1.0
  * @category neural network
@@ -5475,7 +5485,7 @@ export interface RotaryEmbeddingOptions {
  * compilation rebase positions on the runtime cursor. Input rank, `seqLen`,
  * even head width, and dtype constraints are backend-validated. `theta` is
  * passed through without validation and should be positive and finite.
- * Generation beyond a pool's finite capacity additionally requires an
+ * Generation beyond a pool's finite capacity also requires an
  * attention window that can evict old blocks.
  *
  * @since 0.1.0
@@ -5519,8 +5529,8 @@ export const rotaryEmbedding = (
  * arbitrary custom ids can collide. Ready programs
  * use least-recently-used eviction at `cacheCapacity`; an evicted signature is
  * traced again if used.
- * Materializing a tensor inside `build` fails at trace time — a compiled
- * builder is a pure graph builder over its placeholders. Runtime-varying
+ * Materializing a tensor inside `build` fails at trace time. A compiled builder
+ * can only build a graph over its placeholders. Runtime-varying
  * scalars require the manual {@link makeScalarInput}, {@link freezeProgram},
  * and {@link runProgram} path because `CompiledFn.call` binds tensors only.
  * The JavaScript signature LRU, native structural executable cache, and backend
@@ -5548,8 +5558,8 @@ export const compile = <E = never, R = never>(
         }
         const roots = yield* build(placeholders)
         const compileOptions: Runtime.ExecutableCompileOptions = {
-          ...(options.optimize === undefined ? {} : { optimize: options.optimize }),
-          ...(options.constantWeights === undefined ? {} : { constantWeights: options.constantWeights })
+          optimize: options.optimize,
+          constantWeights: options.constantWeights
         }
         return yield* freezeProgram(roots, compileOptions)
       })

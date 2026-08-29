@@ -1,16 +1,14 @@
 //! Dtype-generic KV-cache slabs used by stateful CPU decoding.
 //!
-//! A [`Slab`] is a two-dimensional (`rows` × `row_width`) buffer of one of the
-//! supported KV dtypes (`f32`, `f16`, `bf16`, or quantized `u8`). Rows are
-//! addressed by token position and read/written in batches behind an
-//! [`RwLock`], so decode sequences can share a slab across the NAPI worker
-//! pool without holding references into the raw storage.
+//! A [`Slab`] is a two-dimensional `rows` × `row_width` buffer of `f32`,
+//! `f16`, `bf16`, or quantized `u8`. Token positions address rows. Batched
+//! reads and writes use an [`RwLock`], so decode sequences can share a slab
+//! across the NAPI worker pool without holding references into raw storage.
 //!
-//! This module also hosts the symmetric int8 quantization helpers
-//! ([`quantize_int8`]/[`dequantize_int8`]) used to shrink KV state. Values are
-//! quantized per `(row, head)` group with an absmax scale and stored biased by
-//! +128 so they fit in `u8`; the small `1e-12` scale epsilon keeps all-zero
-//! groups finite.
+//! [`quantize_int8`] and [`dequantize_int8`] provide symmetric int8
+//! quantization for smaller KV state. They quantize each `(row, head)` group
+//! with an absmax scale and bias stored codes by +128 to fit in `u8`. A
+//! `1e-12` scale epsilon keeps all-zero groups finite.
 
 use effect_torch_runtime::DType;
 use half::{bf16, f16};
@@ -26,9 +24,9 @@ pub enum SlabData {
 
 /// A row-addressable, lock-protected cache slab.
 ///
-/// `rows * row_width` elements are stored contiguously, row-major. All access
-/// goes through closure-based [`Slab::read`]/[`Slab::write`] or the row
-/// batch helpers so lock scope never escapes into callers.
+/// Stores `rows * row_width` elements contiguously in row-major order. All
+/// access goes through [`Slab::read`], [`Slab::write`], or the row batch
+/// helpers so callers cannot extend the lock scope.
 pub struct Slab {
     data: RwLock<SlabData>,
     pub dtype: DType,
@@ -45,8 +43,8 @@ pub enum SlabReader<'a> {
 }
 
 impl SlabReader<'_> {
-    /// Reads one element, converting half-precision and quantized storage to
-    /// `f32` (u8 values are returned as their raw biased code).
+    /// Reads one element as `f32`. Returns half-precision values after
+    /// conversion and `u8` values as their raw biased code.
     pub fn get_f32(&self, index: usize) -> f32 {
         match self {
             Self::F32(values) => values[index],
@@ -66,9 +64,9 @@ pub enum SlabWriter<'a> {
 }
 
 impl SlabWriter<'_> {
-    /// Writes one element, rounding into half precision when the slab stores
-    /// `f16`/`bf16`. Panics on a `u8` slab: quantized rows must be encoded
-    /// first (see [`quantize_int8`]) and written with [`SlabWriter::set_u8`].
+    /// Writes one element and rounds to half precision for `f16` or `bf16`
+    /// slabs. Panics on a `u8` slab. Encode quantized rows with
+    /// [`quantize_int8`] and write them with [`SlabWriter::set_u8`].
     pub fn set_f32(&mut self, index: usize, value: f32) {
         match self {
             Self::F32(values) => values[index] = value,
@@ -88,8 +86,8 @@ impl SlabWriter<'_> {
 }
 
 impl Slab {
-    /// Allocates a zero-initialized slab. Only `F32`, `F16`, `BF16`, and `U8`
-    /// are supported; other dtypes panic.
+    /// Allocates a zero-initialized slab. Supports only `F32`, `F16`, `BF16`,
+    /// and `U8`. Other dtypes panic.
     pub fn new(rows: usize, row_width: usize, dtype: DType) -> Self {
         let n = rows * row_width;
         let data = match dtype {
@@ -218,9 +216,9 @@ impl Slab {
     }
 }
 
-/// Symmetrically quantizes a `[rows, h, d]` f32 tensor to int8 codes biased
-/// by +128 inside `u8` storage, returning the codes and one absmax scale per
-/// `(row, head)` group. Values are rounded and clamped to ±127.
+/// Symmetrically quantizes a `[rows, h, d]` f32 tensor. Returns int8 codes
+/// biased by +128 in `u8` storage and one absmax scale per `(row, head)`
+/// group. Rounds and clamps values to ±127.
 pub fn quantize_int8(x: &[f32], rows: usize, h: usize, d: usize) -> (Vec<u8>, Vec<f32>) {
     let mut q = vec![0u8; rows * h * d];
     let mut scales = vec![0f32; rows * h];
@@ -239,8 +237,8 @@ pub fn quantize_int8(x: &[f32], rows: usize, h: usize, d: usize) -> (Vec<u8>, Ve
     (q, scales)
 }
 
-/// Inverse of [`quantize_int8`]. `q` holds the biased codes as f32 (e.g.
-/// freshly widened from the stored `u8`s) and `scales` the per-group absmax
+/// Inverse of [`quantize_int8`]. `q` contains biased codes as f32, usually
+/// widened from stored `u8` values. `scales` contains the per-group absmax
 /// scales produced by quantization.
 pub fn dequantize_int8(q: &[f32], scales: &[f32], rows: usize, h: usize, d: usize) -> Vec<f32> {
     let mut out = vec![0f32; rows * h * d];

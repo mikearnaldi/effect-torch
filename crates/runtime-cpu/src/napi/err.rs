@@ -1,5 +1,5 @@
-//! Shared string-error helpers for the napi module: internal helpers use
-//! `String` errors and convert to `napi::Error` once at the boundary.
+//! Shared error helpers for the napi module. Internal helpers return `String`
+//! errors and convert them to `napi::Error` at the boundary.
 
 pub type Res<T> = Result<T, String>;
 

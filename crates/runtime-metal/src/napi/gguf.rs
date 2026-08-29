@@ -1,12 +1,13 @@
 //! Cancellable GGUF inspection and direct-to-Metal loading for Node.
 //!
 //! Inspection converts the strict backend-neutral GGUF catalog into
-//! JavaScript-safe object records. Loading parses the same catalog, allocates
-//! one shared Metal destination per tensor, and streams bytes directly into
-//! that destination on a blocking worker. Quantized tensors remain opaque u8
-//! storage with separate logical f32 metadata; F32 tensors retain f32 storage.
-//! Cancellation is polled by the parser and tensor reader, and partially built
-//! archives are dropped rather than published on failure.
+//! JavaScript-safe object records. Loading parses the same catalog and allocates
+//! one shared Metal destination per tensor. A blocking worker streams bytes
+//! into each destination.
+//! Quantized tensors remain opaque u8 storage with separate logical f32
+//! metadata. F32 tensors retain f32 storage. The parser and tensor reader poll
+//! for cancellation. On failure, the loader drops partially built archives
+//! instead of publishing them.
 
 use super::{run_compute, value, CancellationToken, NativeTensor};
 use effect_torch_runtime::{

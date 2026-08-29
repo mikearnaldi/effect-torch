@@ -5,10 +5,10 @@
  * artifact, validates its tensor catalog, and loads owned parameters. The
  * resulting {@link Model.Model} declares the GGUF tensor names and logical
  * shapes, then builds a stateless full-sequence graph. `Model.inference` can
- * subsequently specialize that same graph into paged-KV prefill and decode
+ * then specialize that same graph into paged-KV prefill and decode
  * programs.
  *
- * The implementation is storage-independent at the architecture boundary.
+ * The graph treats supported storage formats alike.
  * Dense F32 parameters and `Q2_K`, `Q3_K`, `Q4_K`, `Q5_K`, or `Q6_K` matrices
  * have the same logical catalog. Packed parameters retain logical F32 shape
  * and dtype over row-packed U8 storage; their last logical dimension must be a
@@ -165,10 +165,10 @@ const decodeConfig = (config: Gguf.ModelConfig): Effect.Effect<Config, Model.Mod
  * 13. `blk.N.ffn_up.weight [F, E]`
  * 14. `blk.N.ffn_down.weight [E, F]`
  *
- * The model arity is consequently `3 + 14 * L`. The spelling `post_ffw` is
- * the source tensor name, not a normalized API alias. `loadGGUF` proves an
- * exact name/shape bijection with this catalog and reorders loaded handles into
- * this array order before returning them.
+ * The model arity is `3 + 14 * L`. The spelling `post_ffw` is
+ * the source tensor name, not a normalized API alias. `loadGGUF` checks that
+ * names and shapes match this catalog one-to-one, then reorders loaded handles
+ * into this array order before returning them.
  */
 const makeParameters = (config: Config): ReadonlyArray<Model.ParameterSpec> => {
   const hiddenSize = config.embedding_length

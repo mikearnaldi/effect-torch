@@ -1,12 +1,13 @@
+import { Runtime } from "@effect-torch/core"
 import { expect, it } from "@effect/vitest"
 import { Deferred, Effect, Fiber } from "effect"
 import { mkdtemp, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import path from "node:path"
 import { vi } from "vitest"
-import { makeRuntime } from "../src/index.ts"
-import { makeRuntime as makeRuntimeAdapter } from "../src/internal/adapter.ts"
-import type { NativeAddon, NativeGgufTensorDescriptor, NativeTensor } from "../src/internal/native-addon.ts"
+import { layer as backendLayer } from "../src/index.ts"
+import { createRuntimeAdapter } from "../src/internal/adapter.ts"
+import type { NativeAddon, NativeGgufTensorDescriptor } from "../src/internal/native-addon.js"
 
 const u32 = (value: number): Buffer => {
   const bytes = Buffer.alloc(4)
@@ -25,8 +26,9 @@ const string = (value: string): Buffer => {
   return Buffer.concat([u64(bytes.length), bytes])
 }
 
-// The hand-built GGUF v3 artifact mixes dense F32 with Q2_K and Q4_K payloads
-// that have the same packed shape, proving codec identity is not shape-derived.
+// The hand-built GGUF v3 artifact mixes dense F32 with Q2_K and Q4_K payloads.
+// The quantized payloads have the same packed shape, so shape does not identify
+// their codecs.
 const fixture = (): Buffer => {
   const header = Buffer.concat([
     Buffer.from("GGUF"),
@@ -79,10 +81,31 @@ const withFixture = <A, E, R>(use: (file: string) => Effect.Effect<A, E, R>) =>
     ({ directory }) => Effect.promise(() => rm(directory, { recursive: true, force: true }))
   )
 
-it.effect("loads GGUF payloads directly and rejects cross-codec physical collisions", () =>
+type GgufLoadDouble = (
+  ...args: Parameters<NativeAddon["loadGguf"]>
+) => Promise<{
+  entries: Array<{
+    descriptor: NativeGgufTensorDescriptor
+    tensor: { clear(): void; device: string; dtype: string; shape: Array<number> }
+  }>
+}>
+
+const makeNativeAddonDouble = (loadGguf: GgufLoadDouble): NativeAddon => {
+  class Token {
+    cancelled = false
+    cancel() {
+      this.cancelled = true
+    }
+  }
+  const addon = { CancellationToken: Token, loadGguf }
+  // SAFETY: GGUF ownership tests use only the typed loadGguf and CancellationToken fields.
+  return addon as NativeAddon
+}
+
+it.effect("loads GGUF payloads and rejects codec mismatches for matching physical shapes", () =>
   withFixture((file) =>
     Effect.gen(function*() {
-      const runtime = makeRuntime()
+      const runtime = yield* Runtime.Runtime
       const archive = yield* runtime.extensions.gguf.load(file)
       const dense = archive.entries.find((entry) => entry.descriptor.name === "dense")!
       const q2 = archive.entries.find((entry) => entry.descriptor.name === "q2")!
@@ -179,13 +202,13 @@ it.effect("loads GGUF payloads directly and rejects cross-codec physical collisi
       for (const value of values) yield* runtime.release(value)
       for (const entry of archive.entries) yield* runtime.release(entry.tensor)
     })
-  ))
+  ).pipe(Effect.provide(backendLayer)))
 
-// Injected addons isolate adapter ownership from native I/O: each raw wrapper
-// must either become one public handle or be cleared exactly once.
+// Injected addons isolate adapter ownership from native I/O. Each raw wrapper
+// must become one public handle or be cleared exactly once.
 it.effect("rejects duplicate raw GGUF tensor ownership and clears it once", () => {
   const clear = vi.fn()
-  const tensor = { shape: [1, 1008], dtype: "u8", device: "cpu", clear } as unknown as NativeTensor
+  const tensor = { shape: [1, 1008], dtype: "u8", device: "cpu", clear }
   const descriptor: NativeGgufTensorDescriptor = {
     name: "q2",
     format: "Q2_K",
@@ -194,19 +217,12 @@ it.effect("rejects duplicate raw GGUF tensor ownership and clears it once", () =
     physicalShape: [1, 1008],
     physicalDtype: "u8"
   }
-  class Token {
-    cancelled = false
-    cancel() {
-      this.cancelled = true
-    }
-  }
-  const native = {
-    CancellationToken: Token,
-    loadGguf: async () => ({
+  const native = makeNativeAddonDouble(
+    async () => ({
       entries: [{ descriptor, tensor }, { descriptor: { ...descriptor, name: "other" }, tensor }]
     })
-  } as unknown as NativeAddon
-  const runtime = makeRuntimeAdapter(native)
+  )
+  const runtime = createRuntimeAdapter(native)
 
   return Effect.gen(function*() {
     const error = yield* Effect.flip(runtime.extensions.gguf.load("duplicate.gguf"))
@@ -215,11 +231,11 @@ it.effect("rejects duplicate raw GGUF tensor ownership and clears it once", () =
   })
 })
 
-it.effect("clears a late native GGUF success after interruptible I/O is cancelled", () =>
+it.effect("clears a late GGUF result after interrupting I/O", () =>
   Effect.gen(function*() {
     const started = yield* Deferred.make<void>()
     const clear = vi.fn()
-    const tensor = { shape: [2], dtype: "f32", device: "cpu", clear } as unknown as NativeTensor
+    const tensor = { shape: [2], dtype: "f32", device: "cpu", clear }
     const descriptor: NativeGgufTensorDescriptor = {
       name: "dense",
       format: "F32",
@@ -229,22 +245,17 @@ it.effect("clears a late native GGUF success after interruptible I/O is cancelle
       physicalDtype: "f32"
     }
     let resolve!: (
-      archive: { entries: Array<{ descriptor: NativeGgufTensorDescriptor; tensor: NativeTensor }> }
+      archive: { entries: Array<{ descriptor: NativeGgufTensorDescriptor; tensor: typeof tensor }> }
     ) => void
-    class Token {
-      cancelled = false
-      cancel() {
-        this.cancelled = true
-      }
-    }
-    const native = {
-      CancellationToken: Token,
-      loadGguf: () => {
+    const native = makeNativeAddonDouble(
+      () => {
         Effect.runSync(Deferred.succeed(started, undefined))
-        return new Promise((resume) => resolve = resume)
+        return new Promise<{ entries: Array<{ descriptor: NativeGgufTensorDescriptor; tensor: typeof tensor }> }>(
+          (resume) => resolve = resume
+        )
       }
-    } as unknown as NativeAddon
-    const runtime = makeRuntimeAdapter(native)
+    )
+    const runtime = createRuntimeAdapter(native)
     const fiber = yield* runtime.extensions.gguf.load("late.gguf").pipe(
       Effect.forkChild({ startImmediately: true })
     )

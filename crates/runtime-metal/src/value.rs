@@ -1,10 +1,10 @@
 //! Leaf-value wrapper around [`MetalTensor`] for the graph layer.
 //!
-//! [`Value`] is the concrete `LeafValue` the compiler's graph walks carry:
-//! a thin newtype that exposes shape/dtype/device metadata and the
-//! constructors for uploading host bytes or reserving shared-memory
-//! destination storage (napi addon). f64 is rejected at the boundary —
-//! Metal has no double-precision compute support in this runtime.
+//! [`Value`] is the concrete `LeafValue` used by compiler graph walks. This
+//! thin newtype exposes shape, dtype, and device metadata. It also provides
+//! constructors to upload host bytes or reserve shared-memory destination
+//! storage for the NAPI addon. The boundary rejects f64 because
+//! this runtime has no double-precision Metal support.
 
 use crate::device::MetalDevice;
 #[cfg(test)]
@@ -45,7 +45,7 @@ impl Value {
         self.0.numel()
     }
 
-    /// `numel * dtype.size_in_bytes()` — the contiguous byte footprint.
+    /// Contiguous byte size: `numel * dtype.size_in_bytes()`.
     pub fn byte_size(&self) -> usize {
         self.numel() * self.dtype().size_in_bytes()
     }

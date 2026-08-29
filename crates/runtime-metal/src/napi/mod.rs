@@ -1,31 +1,31 @@
-//! Node-API surface for the Metal backend.
+//! Node-API bindings for the Metal backend.
 //!
-//! This module bridges JavaScript handles to the graph/compiler/runtime stack:
-//! [`LazyTensor`] owns immutable graph nodes, [`NativeTensor`] owns concrete
-//! Metal leaf slots and reports their external memory to V8, compiled
-//! executables retain frozen bindings/pipelines, and the KV pool/sequence
-//! types own paged decode and recurrent state. Long-running compile, execute,
-//! GGUF, and readback work runs on blocking workers through
-//! [`effect_torch_napi::CancellationState`]; cancellation wins or completion
-//! wins exactly once, so failed/cancelled work is never published halfway.
+//! This module connects JavaScript handles to the graph, compiler, and runtime.
+//! [`LazyTensor`] owns immutable graph nodes. [`NativeTensor`] owns concrete
+//! Metal leaf slots and reports their external memory to V8. Compiled
+//! executables keep frozen bindings and pipelines. KV pool and sequence types
+//! own paged decode and recurrent state. Compile, execute, GGUF, and readback
+//! work runs on blocking workers through
+//! [`effect_torch_napi::CancellationState`]. Cancellation or completion wins
+//! exactly once, so the runtime never publishes failed or cancelled work.
 //!
 //! # Readback ownership
 //!
-//! Small or strided readbacks copy into a Rust `Vec` whose allocation is
-//! transferred to an external `ArrayBuffer`. Large contiguous readbacks are
-//! zero-copy: the buffer address is registered, a cloned `value::Value`
-//! retains the Metal allocation, and the JS finalizer unregisters and drops it.
-//! `FinalizeHintGuard` restores Rust ownership if ArrayBuffer creation fails,
-//! guaranteeing every transferred allocation or retained tensor is released
+//! Small or strided readbacks copy into a Rust `Vec` and transfer its
+//! allocation to an external `ArrayBuffer`. Large contiguous readbacks avoid
+//! a copy. The runtime registers the buffer address, retains the Metal
+//! allocation through a cloned `value::Value`, and unregisters and drops it in
+//! the JS finalizer. `FinalizeHintGuard` restores Rust ownership if ArrayBuffer
+//! creation fails. Every transferred allocation or retained tensor is released
 //! exactly once.
 //!
 //! # Decode state
 //!
-//! KV blocks are reference-counted and content-addressed for prefix reuse.
-//! Sequence cursors, block tables, KDA matrices, and short-convolution windows
-//! are prepared into planned staging buffers before dispatch and committed only
-//! after successful execution. Snapshot copies synchronize through the owning
-//! execution path; callers must not overlap direct state preparation with GPU
+//! KV blocks use reference counts and content hashes for prefix reuse. Before
+//! dispatch, the runtime writes sequence cursors, block tables, KDA matrices,
+//! and short-convolution windows into planned staging buffers. It commits them
+//! only after successful execution. Snapshot copies synchronize through their
+//! execution path. Callers must not overlap direct state preparation with GPU
 //! writes to the same sequence.
 
 mod err;
@@ -506,13 +506,11 @@ pub struct NativeTensor {
 
 impl NativeTensor {
     fn wrap(inner: value::Value) -> Self {
-        // Buffers cost at least a memory page regardless of the tensor's
-        // logical size (Metal allocates 4KB-granular, malloc similar). Without
-        // reporting that floor, a stream of tiny tensors looks free to V8 and
-        // collection is deferred indefinitely — the backend allocator then
-        // can't reuse the pooled buffers (the pool requires
-        // strong_count == 1) and both memory and per-allocation cost grow
-        // without bound.
+        // Buffers cost at least one memory page regardless of logical tensor size.
+        // Metal allocates in 4 KB units, and malloc behaves similarly. Without
+        // this floor, tiny tensors look free to V8, which delays collection. The
+        // backend then cannot reuse pooled buffers because the pool requires
+        // strong_count == 1, so memory and per-allocation costs keep growing.
         let bytes = inner.byte_size().max(4096) as i64;
         // Accounting is native-only: every handle that reaches JS is counted
         // here at creation and subtracted in the finalizer/dispose. V8 is
@@ -604,9 +602,8 @@ impl CancellationToken {
 
 #[napi]
 impl NativeTensor {
-    /// Releases the tensor's buffer early instead of waiting for the
-    /// garbage collector. Using the handle — or any lazy graph built
-    /// from it — afterwards is a typed error.
+    /// Releases the tensor's buffer before garbage collection. Later use of the
+    /// handle or a lazy graph built from it returns a typed error.
     #[napi]
     pub fn clear(&mut self, env: Env) -> Result<()> {
         if self.slot.clear() {
@@ -867,14 +864,13 @@ fn cached_constant(
     Ok(node)
 }
 
-// RFC 0016 phase 2 — chunked head. cross_entropy(Linear(x, w, b)) with a
-// huge logits tensor (LM vocab heads) is rewritten at graph construction
-// into per-chunk Sum cross-entropies, each wrapped in a Checkpoint so the
-// chunk logits live one chunk at a time (recomputed in backward) instead
-// of the full [rows, vocab] tensor being retained for the whole walk.
-// The chunk sums are combined in f32 and divided by the exact active
-// count, reproducing the Mean reduction bit-closely; model code is
-// untouched and the rewrite is backend-agnostic.
+// RFC 0016 phase 2 chunks cross_entropy(Linear(x, w, b)) when an LM head
+// produces a large logits tensor. Graph construction rewrites it into Sum
+// cross-entropies wrapped in Checkpoints. Each chunk's logits live only until
+// use and are recomputed during backward, instead of retaining the full
+// [rows, vocab] tensor. The runtime combines chunk sums in f32 and divides by
+// the active count, matching Mean reduction closely. Model code does not
+// change, and the rewrite works across backends.
 const CHUNKED_CE_MIN_LOGITS: usize = 1 << 28;
 const CHUNKED_CE_CHUNK_LOGITS: usize = 1 << 26;
 const CHUNKED_CE_MAX_CHUNKS: usize = 64;
@@ -1901,23 +1897,20 @@ fn compile_prepared_metal(
     executable::compile_prepared_with_state(program, generated_bindings, state_schema)
 }
 
-// RFC 0010: paged KV inference. A `NativeKvPool` is a fixed-capacity
-// store of key/value rows per attention layer, allocated once per
-// inference artifact; a `NativeKvSequence` is a block table and cursor
-// over the pool (the OS paging model: blocks are pages, sequences are
-// processes). Stateful `compile` rewrites a traced forward graph for
-// generation — causal Sdpa becomes KvAttention (scatter the new tokens
-// into the pool, attend over the cached context), PositionEmbedding
-// becomes a cursor-offset gather — and freezes the result like
-// `compile`. The frozen graph stays a pure function of its inputs: the
-// pool and sequence travel through the run's kv context, parallel runs
-// of one program write disjoint blocks, and per-sequence runs serialize
-// on the sequence's run lock.
+// RFC 0010 defines paged KV inference. A `NativeKvPool` is a fixed-capacity
+// store of key and value rows for each attention layer, allocated once per
+// inference artifact. A `NativeKvSequence` is a block table and cursor over
+// the pool, analogous to a process over OS pages. Stateful `compile` rewrites
+// a traced forward graph for generation. Causal Sdpa becomes KvAttention, which
+// scatters new tokens into the pool and attends over cached context.
+// PositionEmbedding becomes a cursor-offset gather. Compilation then freezes
+// the result. The frozen graph remains a pure function of its inputs. The run's
+// KV context carries the pool and sequence. Parallel runs write disjoint blocks,
+// and a sequence's run lock serializes its runs.
 
-// Chained FNV-1a over a token block: the hash of block i covers the
-// whole prefix through block i, so equal hashes imply equal tokens at
-// equal absolute positions — with RoPE that makes the cached rows
-// bit-identical to a recompute.
+// Chained FNV-1a over token blocks. The hash of block i covers the prefix
+// through block i. Equal hashes therefore mean equal tokens at equal absolute
+// positions, so RoPE produces cached rows identical to a recompute.
 const HASH_SEED: u64 = 0xcbf2_9ce4_8422_2325;
 const HASH_PRIME: u64 = 0x0000_0100_0000_01b3;
 
@@ -1932,12 +1925,11 @@ fn chain_hash(prev: u64, tokens: &[u32]) -> u64 {
     hash
 }
 
-// Block ownership and the prefix cache. Blocks carry a refcount and,
-// once fully written, a chained content hash. Sharing is
-// content-addressed and works across LIVE sequences: a prompt whose
-// prefix is resident — held by a running sequence or unreferenced in
-// the cache — takes a reference instead of recomputing. Unreferenced
-// hashed blocks form the LRU cache, reclaimed under pressure.
+// Blocks have a reference count and gain a chained content hash once fully
+// written. Content hashes allow sharing across live sequences. A prompt can
+// reference a resident prefix held by another sequence or the cache instead of
+// recomputing it. Unreferenced hashed blocks form an LRU cache reclaimed under
+// pressure.
 struct BlockStore {
     free: Vec<u32>,
     refcounts: Vec<u32>,
@@ -2114,8 +2106,8 @@ struct PoolInner {
     // occupies rows b*block_size..(b+1)*block_size. Slab dtype u8 means
     // int8-quantized storage (RFC 0012 storage tier): rows are
     // symmetric-quantized with a per-(token, head) absmax scale held in
-    // `scales` — two slabs per layer (k then v) when the data slabs are
-    // u8, empty otherwise.
+    // `scales` contains two slabs per layer, k then v, when data slabs are
+    // u8. It is empty otherwise.
     k: Vec<PoolSlab>,
     v: Vec<PoolSlab>,
     scales: Vec<PoolSlab>,
@@ -2993,8 +2985,8 @@ fn kv_prepare(
     Ok((cursor, needed, start))
 }
 
-// again. The last reference lands them in the prefix cache — their
-// content is still valid for a matching prompt.
+// Remove blocks before `start`. When the sequence holds the last reference,
+// `unref_block` moves the block to the prefix cache for matching prompts.
 fn kv_evict(pool: &PoolInner, state: &mut SeqState, start: usize) {
     while !state.blocks.is_empty() && (state.head + 1) * pool.block_size <= start {
         let dead = state.blocks.remove(0);
@@ -3188,8 +3180,8 @@ pub struct NativeKvSequence {
     released: Arc<AtomicBool>,
 }
 
-// Blocks return to the pool when the sequence is collected — GC alone is
-// sufficient for lifecycle; `release()` only returns them early.
+// Garbage collection returns sequence blocks to the pool. `release()` returns
+// them earlier but is not required for cleanup.
 impl ObjectFinalize for NativeKvSequence {
     fn finalize(self, _env: Env) -> Result<()> {
         self.return_blocks();
@@ -3294,16 +3286,14 @@ impl NativeKvSequence {
         self.return_blocks();
     }
 
-    // Claims the longest resident prefix of the prompt from the pool's
-    // prefix cache and returns its token length; the caller prefills
-    // only the remaining suffix. Only whole blocks match (a partial
-    // tail block's content is not final), and the block holding the
-    // last prompt token is always computed — its logits are prefill's
-    // result. Hybrid pools (KV blocks plus recurrent state) match only
-    // boundaries with a published recurrent snapshot and restore that
-    // state into the sequence. Sharing is content-addressed: two
-    // prompts that merely begin alike share; nothing about the match
-    // is visible to callers.
+    // Claims the longest resident prompt prefix and returns its token length.
+    // The caller prefills only the remaining suffix. Only whole blocks match
+    // because a partial tail block is not final. The block containing the last
+    // prompt token is always computed because its logits are the prefill
+    // result. Hybrid pools with KV blocks and recurrent state match only at
+    // boundaries with a published recurrent snapshot, then restore that state
+    // into the sequence. Content addressing lets prompts share a common prefix
+    // without exposing the match to callers.
     #[napi]
     pub fn prefill_match(&self, tokens: Vec<u32>) -> Result<u32> {
         let _run_guard = self.run_lock.lock().map_err(|e| {

@@ -283,8 +283,9 @@ const buildGraph = (config: Configuration) => {
           `expected ${config.targetResidualTaps.length} target taps, got ${targetRows.length}`
         )
       }
+      const [first, second, ...rest] = targetRows
       const features = yield* Tensor.concat(
-        targetRows as readonly [Tensor.Any, Tensor.Any, ...ReadonlyArray<Tensor.Any>],
+        [first!, second!, ...rest],
         { dim: -1 }
       )
       return yield* Tensor.rmsNorm(

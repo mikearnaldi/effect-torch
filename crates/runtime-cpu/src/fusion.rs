@@ -1,22 +1,21 @@
 //! Bridge that executes compiler-fused expression trees on CPU tensors.
 //!
-//! The compiler flattens fusible elementwise (and single-output reduction)
-//! subgraphs into expression trees and hands them here as a
-//! [`CpuFusionProgram`]. [`prepare`] compiles the trees once; the resulting
-//! program is immutable and reused for every execution.
+//! The compiler flattens fusible elementwise subgraphs and single-output
+//! reductions into expression trees and passes them here as a
+//! [`CpuFusionProgram`]. [`prepare`] compiles each tree once. Every
+//! execution reuses the resulting immutable program.
 //!
-//! Execution ([`run_elementwise_into`], [`run_elementwise_multi_into`],
-//! [`run_reduce_into`]) is allocation-free: it writes into planned
-//! destinations and uses a caller-provided scratch tensor sized by
-//! [`scratch_requirement`]. The scratch holds a per-input lane cache followed
-//! by the program's value stack, both in the command's native dtype.
+//! [`run_elementwise_into`], [`run_elementwise_multi_into`], and
+//! [`run_reduce_into`] write to planned destinations without allocating.
+//! They use a caller-provided scratch tensor sized by [`scratch_requirement`].
+//! The scratch holds a cache for each input lane followed by the program's
+//! value stack, all in the command's native dtype.
 //!
-//! Inputs are read through explicit per-lane strides when any lane is
-//! non-contiguous (broadcasting is expressed as stride-0 entries); contiguous
-//! inputs may omit strides and are read linearly. Every read offset is
-//! validated against the lane's storage before execution, so a mismatched
-//! plan fails cleanly instead of reading out of bounds. Only `f32` and `f64`
-//! are supported on this backend.
+//! Non-contiguous lanes use explicit per-lane strides, with stride 0 for
+//! broadcasting. Contiguous inputs may omit strides and use linear reads. The
+//! runtime checks every read offset against lane storage before execution, so
+//! a mismatched plan returns an error instead of reading out of bounds. This
+//! backend supports only `f32` and `f64`.
 
 use crate::value::Value;
 use crate::{CpuDestination, CpuTensorRequirement, Elem, Tensor};
@@ -33,8 +32,8 @@ pub fn is_supported(device: &Device, dtype: DType) -> bool {
     device.is_cpu() && matches!(dtype, DType::F32 | DType::F64)
 }
 
-/// Flattens expression trees once. A compiled CPU command must retain the
-/// returned immutable program and reuse it for every execution.
+/// Flattens expression trees into an immutable program. A compiled CPU command
+/// must retain and reuse the returned program for every execution.
 pub fn prepare(exprs: &[Expr]) -> CpuFusionProgram {
     CpuFusionProgram::new(exprs)
 }
@@ -255,10 +254,9 @@ fn bridge_elementwise_into<T: Scalar + Elem>(
     })?
 }
 
-/// Executes a multi-output fused elementwise program into `destinations`,
-/// one per program output, reading `inputs` under optional explicit
-/// `strides` and single-element `scalars`. `n` must equal the element count
-/// of `shape`.
+/// Executes a fused elementwise program with one destination per output. Reads
+/// `inputs` with optional explicit `strides` and single-element `scalars`.
+/// `n` must equal the element count of `shape`.
 #[allow(clippy::too_many_arguments)]
 pub fn run_elementwise_multi_into(
     program: &CpuFusionProgram,
@@ -300,7 +298,7 @@ pub fn run_elementwise_multi_into(
     }
 }
 
-/// Single-output form of [`run_elementwise_multi_into`]; the program must
+/// Single-output form of [`run_elementwise_multi_into`]. The program must
 /// have exactly one output.
 #[allow(clippy::too_many_arguments)]
 pub fn run_elementwise_into(
@@ -612,10 +610,10 @@ fn bridge_reduce_into<T: Scalar + Elem>(
     })?
 }
 
-/// Executes a fused map-then-reduce: evaluates `program` at every input
-/// element (addressed through per-lane `strides` over `in_shape`) and folds
-/// the results with `op` into the `out_shape` destination. `Mean` divides by
-/// the reduced extent after the fold. Scalar lanes are unsupported.
+/// Executes a fused map followed by a reduction. Evaluates `program` at every
+/// input element, using per-lane `strides` over `in_shape`, then folds the
+/// results with `op` into the `out_shape` destination. `Mean` divides by
+/// the reduced extent after the fold. Does not support scalar lanes.
 #[allow(clippy::too_many_arguments)]
 pub fn run_reduce_into(
     op: ReduceOp,

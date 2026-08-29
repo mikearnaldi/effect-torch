@@ -1,54 +1,43 @@
-//! Metal backend. Everything Metal lives here:
+//! Metal backend.
 //!
-//! - `device` — device singleton, pool allocator, encoder manager,
-//!   pipeline cache.
-//! - `emit` — first-party IR → MSL emitter (SSA form).
-//! - `run` — `MetalTensor` and the fused elementwise/reduce runners.
-//! - `kernels`, `indexing`, `conv`, `gemm` — primitive kernels
-//!   (creation/cast/copy/random/reductions, gather/scatter/select/cat,
-//!   conv family, tiled matmul).
-//! - `ops` — dispatch helpers used by executable commands for ordinary
-//!   operations (binary/unary/compare/cast/matmul/contiguous/views).
-//! - `composed` (tests only) — primitive-built numerical references for
-//!   destination-kernel parity tests.
-//! - `flash`, `loss`, `layer_norm`, `rotary`, `paged`, `linear`, `quantized` —
-//!   semantic fused kernels.
+//! - `device` owns the device singleton, pool allocator, encoder manager,
+//!   and pipeline cache.
+//! - `emit` converts the fusion IR to MSL in SSA form.
+//! - `run` defines `MetalTensor` and the fused elementwise and reduction runners.
+//! - `kernels`, `indexing`, `conv`, and `gemm` implement primitive kernels.
+//! - `ops` dispatches ordinary executable operations.
+//! - `composed` provides numerical references for tests.
+//! - `flash`, `loss`, `layer_norm`, `rotary`, `paged`, `linear`, and
+//!   `quantized` implement fused operations.
 //!
 //! # Runtime invariants
 //!
-//! - **Device/queue ownership.** One process-wide [`device::MetalDevice`]
-//!   singleton owns the `MTLDevice` and a single `MTLCommandQueue`. All
-//!   encoding goes through per-stream submission contexts; the queue is
-//!   shared and thread-safe at the Metal API boundary.
-//! - **Asynchronous execution.** Kernels are encoded ahead of GPU
-//!   execution. Host reads of buffer contents are only defined after a
-//!   `synchronize`/`synchronize_buffer` that drains the producing command
-//!   stream; the pool allocator never recycles a buffer while a command
-//!   buffer can still reference it.
-//! - **Precompilation contract.** Every `*_into` destination API requires
-//!   its exact pipeline to be warm: call the matching `compile_*`/`warm_*`
-//!   (or let the allocating wrapper do it) before dispatch. During
-//!   executable dispatch, allocation and compilation are hard errors.
-//! - **Memory policy.** `EFFECT_TORCH_MEMORY_CAP_MB` sets a hard live-byte
-//!   ceiling (panic); `EFFECT_TORCH_MEMORY_BUDGET_MB` sets the soft
-//!   backpressure budget; `EFFECT_TORCH_PRIVATE_INTERMEDIATES`,
-//!   `EFFECT_TORCH_NO_MMA`, `EFFECT_TORCH_METAL_PROFILE`, and
-//!   `EFFECT_TORCH_SYNC_TRACE` toggle storage mode, MMA selection,
-//!   profiling, and sync tracing. All are snapshotted once.
-//! - **Dtype/layout.** The fusion emitter computes in f32 and stores
-//!   f32/bf16; primitive kernels cover the full `DType` set except f64
-//!   (unsupported on Metal). Destinations must be contiguous; inputs may
-//!   carry arbitrary strides, which are baked into the emitted source.
+//! - One process-wide [`device::MetalDevice`] singleton owns the `MTLDevice`
+//!   and one `MTLCommandQueue`. Per-stream submission contexts handle all
+//!   encoding. The queue is thread-safe at the Metal API boundary.
+//! - Kernels are encoded ahead of GPU execution. Host reads require
+//!   `synchronize` or `synchronize_buffer` to drain the producing stream.
+//!   The pool never recycles a buffer while a command buffer can reference it.
+//! - Every `*_into` API requires its pipeline to be warm. Call the matching
+//!   `compile_*` or `warm_*` function, or use the allocating wrapper, before
+//!   dispatch. Executable dispatch rejects allocation and compilation.
+//! - `EFFECT_TORCH_MEMORY_CAP_MB` sets a hard live-byte ceiling.
+//!   `EFFECT_TORCH_MEMORY_BUDGET_MB` sets the soft backpressure budget.
+//!   `EFFECT_TORCH_PRIVATE_INTERMEDIATES`, `EFFECT_TORCH_NO_MMA`,
+//!   `EFFECT_TORCH_METAL_PROFILE`, and `EFFECT_TORCH_SYNC_TRACE` control
+//!   storage mode, MMA selection, profiling, and sync tracing. The runtime
+//!   snapshots all six variables once.
+//! - The fusion emitter computes in f32 and stores f32/bf16. Primitive kernels
+//!   support every `DType` except f64, which Metal does not support.
+//!   Destinations must be contiguous. Input strides become constants in the
+//!   emitted source.
 
 #![cfg(target_os = "macos")]
 #![cfg_attr(not(feature = "napi-addon"), allow(dead_code))]
 
-/// Error plumbing shared by every Metal module: stringly-typed `Res<T>`
-/// plus the `err`/`err_str` constructors used on hot paths.
+/// String-based errors shared by every Metal module.
 pub mod err {
-    /// The Metal runtime's uniform result type: errors are human-readable
-    /// strings (validation failures, compile errors, GPU command buffer
-    /// failures) with no error taxonomy.
+    /// The Metal runtime's result type. Errors have no taxonomy.
     pub type Res<T> = Result<T, String>;
 
     /// Builds an `Err` from anything string-like.
@@ -68,9 +57,7 @@ pub mod fusion {
     pub use effect_torch_compiler::*;
 }
 
-/// Runtime-facing facade mirroring the cross-runtime module layout:
-/// dtype/layout re-exports, the CPU runtime (tests only, for parity
-/// references), and the Metal module tree itself.
+/// Re-exports arranged to match the cross-runtime module layout.
 pub mod runtime {
     /// Tensor element types supported across runtimes.
     pub mod dtype {

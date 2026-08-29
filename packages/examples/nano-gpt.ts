@@ -4,12 +4,11 @@ import * as Tokenizer from "@effect-torch/tokenizers"
 import { NodeRuntime } from "@effect/platform-node"
 import { Duration, Effect, Option } from "effect"
 
-// End-to-end GPT lifecycle on a small in-memory corpus: train a Unigram
-// tokenizer, construct a pre-norm RoPE transformer, train one compiled step
-// signature, then freeze the learned parameters into fixed-shape prefill and
-// decode artifacts. Inference uses a fixed 4,096-row paged pool; limiting every
-// attention layer to BLOCK cached positions permits eviction and lets the
-// logical cursor advance beyond pool capacity, subject to eventual EOS.
+// Trains a Unigram tokenizer and pre-norm RoPE transformer on a small in-memory
+// corpus, then freezes the learned parameters for compiled prefill and decode.
+// Inference uses a 4,096-row paged pool and caches at most BLOCK positions per
+// attention layer, so the logical cursor can advance past pool capacity until
+// EOS.
 
 const CORPUS = `Shall I compare thee to a summer's day?
 Thou art more lovely and more temperate:

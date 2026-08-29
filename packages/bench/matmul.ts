@@ -1,12 +1,11 @@
-// End-to-end eager matmul-chain throughput on CPU and, when available, Metal.
-// One untimed iteration warms compilation and backend pipelines. Each measured
-// iteration constructs a BATCH-deep dependent graph and `toTypedArray` executes
-// it to completion and copies its final result to the host. Reported ms/op
-// divides that chain wall time by BATCH, so it includes graph construction,
-// compile/cache lookup, execution, and readback rather than isolated GEMM kernel
-// time. N and ITERS are unvalidated Number-parsed environment values. CPU is
-// excluded only when METAL_ONLY is nonempty: "0" excludes it, while an empty
-// value behaves as unset.
+// Measures end-to-end eager matmul-chain throughput on CPU and, when available,
+// Metal. One untimed iteration warms compilation and backend pipelines. Each
+// measured iteration builds a BATCH-deep dependent graph. `toTypedArray` runs it
+// to completion and copies the final result to the host. Reported ms/op is the
+// chain wall time divided by BATCH. It includes graph construction, compile/cache
+// lookup, execution, and readback. It does not isolate GEMM kernel time. N and
+// ITERS pass through `Number` without validation. Any nonempty METAL_ONLY value
+// skips CPU, including "0". An empty or unset value enables CPU.
 
 import * as BackendApple from "@effect-torch/backend-apple-native"
 import * as BackendCpu from "@effect-torch/backend-cpu"

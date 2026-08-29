@@ -1,35 +1,31 @@
-//! Flash attention on Metal: a single-kernel forward (tiled, online
-//! softmax, the score matrix never materializes) and a chunked-recompute
-//! backward (three native passes in a flash-2 structure, so memory stays
-//! bounded by one row-dot scratch vector instead of the full [T, S] score matrix).
-//! Both are f32/Metal-only execution strategies for the semantic
-//! `Tensor.scaledDotProductAttention` node; CPU references remain the
-//! numerical oracle in tests.
+//! Flash attention on Metal uses one tiled online-softmax kernel for the
+//! forward pass. The score matrix never materializes. The backward recomputes
+//! chunks in three FlashAttention-2 passes, so scratch stays bounded by one
+//! row-dot vector instead of the full [T, S] score matrix. Both paths support
+//! only f32 on Metal. Tests use CPU references for
+//! `Tensor.scaledDotProductAttention`.
 //!
 //! ## Kernel contracts
 //!
-//! - **Forward** (`et_sdpa_fwd`): one threadgroup of `THREADS` threads
-//!   per (query tile of `TILE_Q` rows, batch·head). Score tiles of
-//!   `TILE_Q × TILE_K` are computed into threadgroup memory, folded
-//!   into the running (max, sum) online softmax, and consumed by the
-//!   P·V accumulation in place. Everything shape-dependent (T, S, D,
-//!   DV, scale, causal, window, GQA group) is baked in as `#define`s
-//!   and keys the pipeline cache. Also writes the per-row f32
-//!   logsumexp `L` for the backward's P recomputation. Causal masking
-//!   is right-aligned (`OFFSET = S - T`); `window` restricts attention
-//!   to `k > q + OFFSET - WINDOW`.
-//! - **Backward** (three dispatches, no atomics):
-//!   `et_sdpa_bwd_d` computes the row dots `D[row] = ⟨G[row], O[row]⟩`
-//!   into f32 scratch; `et_sdpa_bwd_kv` (key-tiled) accumulates dk/dv
-//!   in registers across the full query sweep; `et_sdpa_bwd_q`
-//!   (query-tiled) accumulates dq. Score tiles are recomputed from
-//!   `L` once per tile pair in threadgroup memory and shared by all
-//!   four gradients. Grouped-query attention is **not** differentiable
-//!   and is rejected at plan time.
+//! - `et_sdpa_fwd` uses one `THREADS`-wide threadgroup per query tile of
+//!   `TILE_Q` rows and batch·head. It computes `TILE_Q × TILE_K` score tiles
+//!   in threadgroup memory, folds them into an online softmax, and accumulates
+//!   P·V in place. T, S, D, DV, scale, causal mode, window, and GQA group are
+//!   `#define` values that key the pipeline cache. The kernel also writes the
+//!   per-row f32 logsumexp `L` used to recompute P in the backward. Causal
+//!   masking is right-aligned with `OFFSET = S - T`; `window` restricts
+//!   attention to `k > q + OFFSET - WINDOW`.
+//! - The backward uses three dispatches without atomics. `et_sdpa_bwd_d` writes
+//!   row dots `D[row] = ⟨G[row], O[row]⟩` to f32 scratch. The key-tiled
+//!   `et_sdpa_bwd_kv` accumulates dk/dv in registers across the query sweep.
+//!   The query-tiled `et_sdpa_bwd_q` accumulates dq. Each tile pair recomputes
+//!   scores from `L` once in threadgroup memory and shares them across all
+//!   gradients. Planning rejects grouped-query attention because this backward
+//!   does not support it.
 //!
-//! The `*_into` entry points validate contiguity/shape/dtype, mark
-//! destinations written, allocate nothing, and require pipelines
-//! pre-warmed via `warm_*_exact`.
+//! The `*_into` functions validate contiguity, shape, and dtype. They mark
+//! destinations written, allocate nothing, and require `warm_*_exact` to
+//! precompile the pipelines.
 
 /// Query rows per forward threadgroup tile.
 const TILE_Q: usize = 16;
@@ -68,8 +64,8 @@ fn test_counts() -> (usize, usize) {
     )
 }
 
-/// Planner-facing description of one device buffer a launch needs
-/// (shape, dtype, and derived element/byte counts, overflow-checked).
+/// Device buffer required by one launch, including overflow-checked shape,
+/// dtype, element count, and byte count.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BufferRequirement {
     /// Logical shape of the buffer.
@@ -117,7 +113,7 @@ pub enum SdpaForwardTopology {
     },
 }
 
-/// Planner-facing requirements of a flash-attention forward.
+/// Requirements for a flash-attention forward.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SdpaForwardRequirements {
     /// Attention output (`q_shape` with trailing dim = `value_depth`).
@@ -155,7 +151,7 @@ pub enum SdpaBackwardTopology {
     },
 }
 
-/// Planner-facing requirements of a flash-attention backward.
+/// Requirements for a flash-attention backward.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SdpaBackwardRequirements {
     /// `dq` output (same shape/dtype as `q`).
@@ -398,7 +394,7 @@ mod metal {
     // The forward kernel: one threadgroup per (query tile, batch*head).
     // Scores for a key tile are computed into threadgroup memory, folded
     // into the running (max, sum) online softmax, and consumed by the
-    // P·V accumulation in place — the [T, S] matrix never exists.
+    // P·V accumulates in place, so the [T, S] matrix never exists.
     // Everything shape-dependent is baked in as #defines (keying the
     // pipeline cache): T, S, D, DV, the scale, causal.
     fn kernel_source(
@@ -739,7 +735,7 @@ kernel void et_sdpa_fwd(
         Ok(())
     }
 
-    /// Allocating convenience wrapper around [`forward_into`]; returns
+    /// Allocates outputs, calls [`forward_into`], and returns
     /// `(output, logsumexp)`.
     pub fn forward(
         q: &MetalTensor,
@@ -780,13 +776,11 @@ kernel void et_sdpa_fwd(
         forward_into(&q, &k, &v, scale, causal, window, &o, &l)?;
         Ok((o, l))
     }
-    // The fused gradient passes use no atomics. Pass A (key-tiled)
-    // accumulates dk/dv — thread (kj-cell) owns its accumulator in
-    // registers across the whole query sweep. Pass B (query-tiled)
-    // accumulates dq. The score tile is recomputed once per tile pair
-    // in threadgroup memory and consumed by all four gradients — the
-    // shared-data win over the composed recompute (~12 DRAM round
-    // trips per tile).
+    // The fused gradient passes use no atomics. In key-tiled pass A, each
+    // kj-cell thread keeps its dk/dv accumulator in registers across the query
+    // sweep. Query-tiled pass B accumulates dq. Each tile pair recomputes its
+    // score tile once in threadgroup memory for all four gradients. The
+    // composed version makes about 12 DRAM round trips per tile.
     fn bwd_source(
         t: usize,
         s: usize,
@@ -1325,8 +1319,8 @@ kernel void et_sdpa_bwd_q(
         Ok(())
     }
 
-    /// Allocating convenience wrapper around [`backward_fused_into`];
-    /// returns `(dq, dk, dv)`.
+    /// Allocates outputs, calls [`backward_fused_into`], and returns
+    /// `(dq, dk, dv)`.
     #[allow(clippy::too_many_arguments)]
     pub fn backward_fused(
         q: &MetalTensor,

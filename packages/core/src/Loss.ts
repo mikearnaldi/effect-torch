@@ -1,10 +1,10 @@
 /**
  * Loss graph builders. They borrow predictions and targets and return lazy
  * graph values without evaluating or clearing inputs. Shape, dtype, placement,
- * and backend constraints are validated by each wrapper and the tensor
- * operations it composes, with failures in the returned
- * `Tensor.TensorError` channel; value-domain checks are intentionally limited
- * and evaluation-only failures remain deferred until compute or execution.
+ * and backend constraints are checked by each wrapper and its tensor
+ * operations. Failures use the returned `Tensor.TensorError` channel.
+ * Value-domain checks are limited, and failures that require evaluation remain
+ * deferred until compute or execution.
  *
  * `"mean"` and `"sum"` reduce every dimension of each function's
  * loss-specific unreduced result to a scalar suitable for `Gradient.grad`;
@@ -54,7 +54,7 @@ const applyReduction = (
   }
 }
 
-const isTarget = (value: unknown): boolean =>
+const isTarget = (value: unknown): value is { readonly _tag: unknown } =>
   value !== undefined && value !== null && typeof value === "object" && "_tag" in value
 
 const dualLoss = <T, O, R = Runtime.Runtime>(
@@ -75,6 +75,7 @@ const dualLoss = <T, O, R = Runtime.Runtime>(
     options?: O
   ): Effect.Effect<Tensor.Lazy, Tensor.TensorError, R>
 } =>
+  // SAFETY: Effect.dual implements these overloads; the predicate selects by arity and target position.
   dual(
     (args) => args.length === 3 || (args.length === 2 && isTarget(args[1])),
     impl
@@ -130,7 +131,7 @@ export interface HuberOptions extends LossOptions {
  * Huber loss: `0.5 * e^2` for `e = |pred - target| <= delta`, and
  * `delta * (e - 0.5 * delta)` beyond it, followed by the requested reduction.
  * `delta <= 0` fails with {@link Tensor.TensorError} when the effect runs;
- * other tensor compatibility checks are delegated to the composed operations.
+ * the composed operations perform other tensor compatibility checks.
  *
  * @since 0.1.0
  * @category losses
@@ -170,8 +171,8 @@ export interface BinaryCrossEntropyOptions extends LossOptions {
 
 /**
  * Binary cross entropy between probabilities, or logits when `fromLogits` is
- * true, and broadcast-compatible targets. Prediction/target dtype and
- * placement compatibility are delegated to tensor operations. Target values
+ * true, and broadcast-compatible targets. Tensor operations check prediction
+ * and target dtype and placement compatibility. Target values
  * are not checked to be in `[0, 1]`. The probability path requests a clamp to
  * `[1e-12, 1 - 1e-12]`, but those bounds are represented in the tensor dtype
  * and can round to `0` or `1`; finite logarithms are therefore not guaranteed,
@@ -265,7 +266,7 @@ export const crossEntropy = dualLoss<Tensor.Any, LossOptions>((logits, targets, 
 /**
  * Negative log likelihood between `f32` or `f64` log-probabilities and `i64`
  * or `u32` class-index targets. The class dimension is last and `"none"`
- * returns the target shape. Index values are not range-checked: an index
+ * returns the target shape. Index values are not range-checked. An index
  * unmatched by `0..classes-1` produces zero loss. This path materializes a
  * one-hot graph and has no ignore-index convention.
  *

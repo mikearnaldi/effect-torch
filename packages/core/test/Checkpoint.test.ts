@@ -187,7 +187,7 @@ onDevices("Checkpoint", () => (it) => {
       yield* Checkpoint.saveWithSampler(base, trainer, trained, sampler)
       const corrupt = (name: string, mutate: (entries: Record<string, Tensor.Any>) => void) =>
         Effect.gen(function*() {
-          const entries: Record<string, Tensor.Any> = { ...yield* Tensor.load(base) }
+          const entries = { ...yield* Tensor.load(base) }
           mutate(entries)
           const file = path.join(dir, name)
           yield* Tensor.save(file, entries)

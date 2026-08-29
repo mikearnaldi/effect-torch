@@ -1,12 +1,11 @@
-//! Elementwise expression IR and single-kernel fusion (RFC 0007).
+//! Elementwise expression IR and single-kernel fusion from RFC 0007.
 //!
-//! A fused region is a small scalar expression DAG over named input lanes.
-//! On Metal it is lowered to an SSA-form MSL kernel by the first-party
-//! emitter (`runtime::metal::emit`), compiled once per distinct expression
-//! (cached) and launched over the flattened input buffers; on CPU the same
-//! IR is interpreted per element in a single pass. Metal computes fused math
-//! in f32 and supports f32/bf16 storage at the lane boundary; the CPU
-//! interpreter covers f32 and f64.
+//! A fused region is a scalar expression DAG over named input lanes. On Metal,
+//! `runtime::metal::emit` emits an SSA-form MSL kernel. The runtime caches one
+//! compiled kernel per expression and launches it over flattened input buffers.
+//! On CPU, the interpreter evaluates the same IR once per element. Metal uses
+//! f32 for fused math and supports f32 or bf16 lane storage. The CPU interpreter
+//! supports f32 and f64.
 
 /// Row-major contiguous strides of `shape`, in elements.
 pub fn contiguous_strides(shape: &[usize]) -> Vec<usize> {
@@ -17,10 +16,9 @@ pub fn contiguous_strides(shape: &[usize]) -> Vec<usize> {
     strides
 }
 
-/// Strides with which a lane of shape `lane` is read when the region's
-/// output has shape `out`: right-aligned broadcasting, where a lane dim of
-/// 1 (or a missing leading dim) gets stride 0. `None` when the shapes are
-/// not broadcast-compatible.
+/// Computes strides for reading a `lane` shape into output shape `out` with
+/// right-aligned broadcasting. A lane dimension of 1 or a missing leading
+/// dimension gets stride 0. Returns `None` for incompatible shapes.
 pub fn lane_strides(lane: &[usize], out: &[usize]) -> Option<Vec<usize>> {
     if lane.len() > out.len() {
         return None;
@@ -41,27 +39,26 @@ pub fn lane_strides(lane: &[usize], out: &[usize]) -> Option<Vec<usize>> {
     Some(strides)
 }
 
-/// Whether `lane` broadcasts into `out` (right-aligned, dims equal or 1).
+/// Whether `lane` broadcasts right-aligned into `out` with equal or unit dimensions.
 pub fn broadcast_compatible(lane: &[usize], out: &[usize]) -> bool {
     lane_strides(lane, out).is_some()
 }
 
 /// Scalar expression tree for one fused value.
 ///
-/// The IR is deliberately `Eq + Hash`: floating-point constants are stored
-/// as their bit patterns so a whole expression can key the compiled-kernel
-/// cache. Cloning, equality, hashing, transformation, and destruction are
-/// all iterative — a long fused chain forms one deep tree whose depth is
-/// bounded by heap, never the call stack.
+/// The IR implements `Eq + Hash` by storing floating-point constants as bit
+/// patterns. An expression can therefore key the compiled-kernel cache.
+/// Iterative cloning, equality, hashing, transformation, and destruction keep
+/// deep fused chains off the call stack.
 #[derive(Debug)]
 pub enum KernelExpr {
-    // per-element input lane k
+    // Per-element input lane k.
     Input(u32),
-    // scalar input k: a one-element tensor read at offset 0. Used for
-    // values that vary between launches (step counts, scheduled learning
-    // rates) so they do not poison the compiled-kernel cache key.
+    // Scalar input k reads a one-element tensor at offset 0. Launch-varying
+    // values such as step counts and scheduled learning rates remain outside
+    // the compiled-kernel cache key.
     Scalar(u32),
-    // f64 bits, so the IR is Eq + Hash and can key the pipeline cache
+    // f64 bits let the Eq + Hash IR key the pipeline cache.
     Const(u64),
     Add(Box<KernelExpr>, Box<KernelExpr>),
     Sub(Box<KernelExpr>, Box<KernelExpr>),
@@ -69,15 +66,15 @@ pub enum KernelExpr {
     Div(Box<KernelExpr>, Box<KernelExpr>),
     Min(Box<KernelExpr>, Box<KernelExpr>),
     Max(Box<KernelExpr>, Box<KernelExpr>),
-    // Comparisons yield 1.0 / 0.0; they exist to feed Select.
+    // Comparisons return 1.0 or 0.0 for Select.
     Lt(Box<KernelExpr>, Box<KernelExpr>),
     Le(Box<KernelExpr>, Box<KernelExpr>),
     Gt(Box<KernelExpr>, Box<KernelExpr>),
     Ge(Box<KernelExpr>, Box<KernelExpr>),
     Eq(Box<KernelExpr>, Box<KernelExpr>),
     Ne(Box<KernelExpr>, Box<KernelExpr>),
-    // cond != 0 ? lhs : rhs — a true select that does not propagate NaN
-    // from the unselected side (unlike an arithmetic mask).
+    // `cond != 0 ? lhs : rhs` is a true select. Unlike an arithmetic mask,
+    // it does not propagate NaN from the unselected side.
     Select(Box<KernelExpr>, Box<KernelExpr>, Box<KernelExpr>),
     Neg(Box<KernelExpr>),
     Sqrt(Box<KernelExpr>),
@@ -90,15 +87,14 @@ pub enum KernelExpr {
     Floor(Box<KernelExpr>),
     Ceil(Box<KernelExpr>),
     Round(Box<KernelExpr>),
-    // constant exponent (f64 bits, keeping the IR Eq + Hash). Common
-    // exponents lower to multiplies/sqrt; the rest lower to the platform
-    // pow.
+    // The exponent uses f64 bits to keep the IR Eq + Hash. Common exponents
+    // lower to multiplies or sqrt. The rest use the platform pow.
     Powf(Box<KernelExpr>, u64),
-    // Exact in the CPU interpreter; lowered to a stable expansion in ug
-    // ops for GPU kernels (Metal has no erf).
+    // The CPU interpreter computes erf directly. GPU kernels use a stable ug
+    // expansion because Metal has no erf.
     Erf(Box<KernelExpr>),
-    // gelu with the exact erf form / the tanh approximation; emitted as
-    // one helper so gemm epilogues and elementwise regions share it.
+    // GELU uses either the exact erf form or the tanh approximation. One
+    // emitted helper serves GEMM epilogues and elementwise regions.
     Gelu(Box<KernelExpr>),
     GeluTanh(Box<KernelExpr>),
 }
@@ -106,8 +102,8 @@ pub enum KernelExpr {
 pub type Expr = KernelExpr;
 
 impl KernelExpr {
-    // Moves child boxes into the worklist, leaving cheap leaves behind;
-    // used by Drop so destructor glue never recurses.
+    // Moves child boxes into the worklist and leaves cheap leaves behind.
+    // Drop uses this to avoid recursive destructor glue.
     fn drain_children(&mut self, worklist: &mut Vec<Box<KernelExpr>>) {
         fn dummy() -> Box<KernelExpr> {
             Box::new(KernelExpr::Const(0))
@@ -155,11 +151,10 @@ impl KernelExpr {
 
 impl Drop for KernelExpr {
     fn drop(&mut self) {
-        // A long elementwise chain fuses into one deep KernelExpr; default
-        // destructor glue recurses over the Box chain and overflows the
-        // (worker-thread) stack, so descendants drain into a worklist.
-        // Worklist entries drop with dummy leaves in place, so their own
-        // Drop returns immediately.
+        // Default destructor glue recurses through a deep KernelExpr box chain
+        // and can overflow a worker thread's stack. Drain descendants into a
+        // worklist instead. Each entry has dummy leaves when it drops, so its
+        // own Drop returns immediately.
         let mut worklist = Vec::new();
         self.drain_children(&mut worklist);
         while let Some(mut node) = worklist.pop() {
@@ -168,8 +163,8 @@ impl Drop for KernelExpr {
     }
 }
 
-/// `x^e` with special cases for the common exponents: exact multiplies
-/// and sqrt are faster and more accurate than the platform pow.
+/// Builds `x^e`, using exact multiplies and sqrt for common exponents because
+/// they are faster and more accurate than the platform pow.
 pub fn pow_expr(x: KernelExpr, e: f64) -> KernelExpr {
     match e {
         0.0 => KernelExpr::cst(1.0),
@@ -189,10 +184,9 @@ pub fn pow_expr(x: KernelExpr, e: f64) -> KernelExpr {
     }
 }
 
-/// The reduce that terminates a fused-reduce region (RFC 0007 phase 3a):
-/// the elementwise expression is evaluated per input element inside the
-/// reduce loop and folded into an accumulator, so the chain's
-/// intermediate never materializes.
+/// The reduction that terminates a fused-reduce region from RFC 0007 phase 3a.
+/// The reduce loop evaluates the expression for each input element and folds
+/// it into an accumulator without materializing the chain's intermediate.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ReduceOp {
     Sum,
@@ -262,7 +256,7 @@ impl KernelExpr {
         }
     }
 
-    // Rebuilds the same variant with new children (left-to-right).
+    // Rebuilds the same variant with new children in left-to-right order.
     fn rebuild(&self, mut children: Vec<KernelExpr>) -> KernelExpr {
         let mut next = || Box::new(children.remove(0));
         match self {
@@ -300,10 +294,9 @@ impl KernelExpr {
         }
     }
 
-    // Iterative post-order rebuild: `f` may substitute a leaf (Some) or
-    // keep it (None); internal nodes rebuild from already-transformed
-    // children. Tree transforms must never recurse — deep fused regions
-    // are bounded by heap, not the call stack.
+    // Iterative postorder rebuild. `f` may replace a leaf with Some or keep
+    // it with None. Internal nodes rebuild from transformed children. Tree
+    // transforms stay off the call stack for deep fused regions.
     fn transform(&self, f: &mut dyn FnMut(&KernelExpr) -> Option<KernelExpr>) -> KernelExpr {
         let mut stack: Vec<(&KernelExpr, bool)> = vec![(self, false)];
         let mut out: Vec<KernelExpr> = Vec::new();
@@ -327,14 +320,14 @@ impl KernelExpr {
         out.pop().expect("transform result")
     }
 
-    /// Remaps per-element lane indices through `remap` (which must cover
-    /// every lane the expression references).
+    /// Remaps per-element lane indices through `remap`. The map must cover
+    /// every referenced lane.
     pub fn remap_lanes(&self, remap: &std::collections::HashMap<u32, u32>) -> Self {
         self.remap_inputs(&mut |k| remap[&k])
     }
 
-    /// Number of nodes in the expression tree (shared subtrees count per
-    /// occurrence: this bounds emitted kernel size, not SSA values).
+    /// Counts expression-tree nodes. Shared subtrees count once per occurrence.
+    /// This bounds emitted kernel size rather than SSA values.
     pub fn ops(&self) -> usize {
         let mut count = 0usize;
         let mut stack = vec![self];
@@ -352,12 +345,11 @@ impl KernelExpr {
         })
     }
 
-    /// Inlines `replacement` for `lane` and remaps the remaining lanes
-    /// through `remap` (used by the multi-output merge to absorb a shared
-    /// prefix into its continuations). Each occurrence is decided by its
-    /// original index in a single pass, so a remapped index that collides
-    /// with `lane` cannot be mistaken for the inlined one. The
-    /// replacement's own indices must already be in the merged namespace.
+    /// Inlines `replacement` for `lane` and remaps other lanes through
+    /// `remap`. Multi-output merging uses this to absorb a shared prefix into
+    /// its continuations. Each occurrence uses its original index, so a
+    /// remapped index that equals `lane` is not mistaken for the inlined lane.
+    /// The replacement indices must already use the merged namespace.
     pub fn merge_lane(
         &self,
         lane: u32,
@@ -372,8 +364,8 @@ impl KernelExpr {
     }
 }
 
-// Clone, equality and hashing are manual and iterative (via the
-// post-order plan): derived glue would recurse over deep Box chains.
+// Clone, equality, and hashing use a manual iterative postorder plan because
+// derived implementations would recurse through deep box chains.
 impl Clone for KernelExpr {
     fn clone(&self) -> Self {
         self.transform(&mut |_| None)
@@ -396,10 +388,9 @@ impl std::hash::Hash for KernelExpr {
     }
 }
 
-/// Scalar arithmetic surface shared by the CPU interpreter and any other
-/// evaluator of the fusion IR. Comparisons yield 1.0/0.0 and `pick` is the
-/// select primitive; `from_f64` performs the narrowing conversion for
-/// constants.
+/// Scalar arithmetic interface for fusion IR evaluators, including the CPU
+/// interpreter. Comparisons return 1.0 or 0.0, `pick` selects a value, and
+/// `from_f64` narrows constants.
 pub trait Scalar: Copy {
     fn from_f64(v: f64) -> Self;
     fn add(self, o: Self) -> Self;
@@ -548,11 +539,10 @@ macro_rules! impl_scalar {
 impl_scalar!(f32, libm::erff);
 impl_scalar!(f64, libm::erf);
 
-// A fused expression flattened to a post-order plan. A long elementwise
-// chain fuses into one deep KernelExpr, and the interpreter runs once per
-// element — a recursive tree walk would multiply the chain depth by the
-// call stack of every element. Prepared CPU programs retain this plan and
-// evaluate it with caller-owned scratch.
+// A fused expression flattened into a postorder plan. The interpreter runs a
+// deep KernelExpr once per element, so a recursive walk would consume stack
+// space for every element. Prepared CPU programs retain this plan and evaluate
+// it with caller-owned scratch.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum Flat {
     Input(u32),
@@ -588,8 +578,8 @@ enum Flat {
     GeluTanh,
 }
 
-// Iterative post-order flattening (the traversal is stack-safe like the
-// evaluator below).
+// Iterative postorder flattening keeps the traversal off the call stack, as
+// does the evaluator below.
 fn flatten_into(e: &KernelExpr, out: &mut Vec<Flat>) {
     let mut stack: Vec<(&KernelExpr, bool)> = vec![(e, false)];
     while let Some((node, processed)) = stack.pop() {
@@ -679,9 +669,9 @@ fn flatten(e: &KernelExpr) -> Vec<Flat> {
 
 /// Immutable flattened expression plans retained by a compiled CPU command.
 ///
-/// `scratch_elements` is the exact number of native scalar elements needed
-/// to cache referenced input lanes and evaluate the deepest plan. Preparation
-/// allocates; evaluation does not.
+/// `scratch_elements` is the exact native scalar count needed to cache input
+/// lanes and evaluate the deepest plan. Preparation allocates this storage.
+/// Evaluation does not allocate.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CpuFusionProgram {
     ops: Box<[Flat]>,
@@ -692,9 +682,9 @@ pub struct CpuFusionProgram {
 }
 
 impl CpuFusionProgram {
-    /// Flattens every expression into one contiguous post-order op list.
-    /// Preparation computes the exact lane counts and the maximum value-stack
-    /// depth so evaluation never allocates or re-measures.
+    /// Flattens every expression into one contiguous postorder operation list.
+    /// Preparation computes exact lane counts and maximum value-stack depth,
+    /// so evaluation neither allocates nor measures them again.
     pub fn new(exprs: &[KernelExpr]) -> Self {
         let mut ops = Vec::new();
         let mut plan_ends = Vec::with_capacity(exprs.len());
@@ -765,7 +755,7 @@ impl CpuFusionProgram {
         }
     }
 
-    /// Number of fused outputs (one plan per expression).
+    /// Number of fused outputs, with one plan per expression.
     pub fn output_count(&self) -> usize {
         self.plan_ends.len()
     }
@@ -785,8 +775,7 @@ impl CpuFusionProgram {
         self.value_scratch_len
     }
 
-    /// Total caller-owned scratch elements required: cached input lanes plus
-    /// value stack.
+    /// Total caller-owned scratch elements for cached input lanes and the value stack.
     pub fn scratch_elements(&self) -> usize {
         self.input_count
             .checked_add(self.value_scratch_len)
@@ -914,12 +903,11 @@ fn strided_offset(index: usize, shape: &[usize], strides: &[usize]) -> usize {
     offset
 }
 
-/// Interprets a prepared program over `n` elements, writing every output.
-/// `slices` are the per-element input lanes; `strides` optionally supplies
-/// per-lane broadcast strides against `shape` (contiguous when `None`);
-/// `scalar_values` are the launch-varying scalar lanes. All scratch is
-/// caller-owned and asserted to be exactly sized via
-/// [`CpuFusionProgram::scratch_elements`].
+/// Interprets a prepared program over `n` elements and writes every output.
+/// `slices` contains per-element input lanes. `strides` optionally supplies
+/// each lane's broadcast strides against `shape`. `None` means contiguous.
+/// `scalar_values` contains launch-varying scalar lanes. The caller owns all
+/// scratch. [`CpuFusionProgram::scratch_elements`] gives its exact size.
 pub fn interpret_core_into<T: Scalar>(
     program: &CpuFusionProgram,
     slices: &[&[T]],
@@ -958,8 +946,8 @@ pub fn interpret_core_into<T: Scalar>(
     }
 }
 
-/// Owning wrapper around [`interpret_core_into`]: prepares a program,
-/// allocates outputs and scratch, and returns one vector per expression.
+/// Prepares a program, allocates outputs and scratch, and calls
+/// [`interpret_core_into`]. Returns one vector per expression.
 pub fn interpret_core<T: Scalar>(
     exprs: &[KernelExpr],
     slices: &[&[T]],
@@ -1014,12 +1002,11 @@ fn reduce_output_offset(
     out_offset
 }
 
-/// Interprets a fused-reduce program: the single expression is evaluated per
-/// input element inside the reduce loop and folded into the accumulator of
-/// its output cell, so the elementwise intermediate never materializes.
-/// `dims` are the reduced dimensions (sorted), `keepdims` controls whether
-/// they remain as size-1 in `out_shape`. `Mean` divides by the reduced
-/// extent after the fold.
+/// Interprets a fused-reduce program. The reduce loop evaluates the expression
+/// per input element and folds it into the output cell's accumulator without
+/// materializing an elementwise intermediate. `dims` contains sorted reduced
+/// dimensions. `keepdims` keeps them as size 1 in `out_shape`. `Mean`
+/// divides by the reduced extent after the fold.
 #[allow(clippy::too_many_arguments)]
 pub fn interpret_reduce_core_into<T: Scalar>(
     op: ReduceOp,
@@ -1095,12 +1082,12 @@ pub fn interpret_reduce_core<T: Scalar>(
     );
     output
 }
-// The fused AdamW update as three expressions over lanes [param, grad, m,
-// v] with scalar lanes [lr, 1 - beta1^t, 1 - beta2^t], mirroring the
-// composed update's operation order exactly. Step-dependent values are
-// scalar lanes so the compiled kernel is stable across steps.
-/// Expressions `[param', m', v']` of the fused AdamW update; see the note
-/// above for the lane layout.
+// The fused AdamW update uses three expressions over lanes [param, grad, m, v]
+// and scalar lanes [lr, 1 - beta1^t, 1 - beta2^t]. It matches the composed
+// update's operation order. Keeping step-dependent values in scalar lanes
+// makes the compiled kernel stable across steps.
+/// Returns the fused AdamW expressions `[param', m', v']` with the lane layout
+/// described above.
 pub fn adamw_exprs(beta1: f64, beta2: f64, eps: f64, weight_decay: f64) -> [KernelExpr; 3] {
     adamw_exprs_with(
         beta1,
@@ -1181,12 +1168,11 @@ fn adamw_exprs_with(
     ]
 }
 
-// The fused momentum-SGD update over lanes [param, grad, velocity] with
-// scalar lanes [lr, first], mirroring the composed update including the
-// first-step v = g initialization as a select on the 0-d `first` flag.
-/// Expressions `[param', velocity']` of the fused momentum-SGD update over
-/// lanes [param, grad, velocity] with scalar lanes [lr, first]; see the note
-/// above for the exact update mirrored by the expressions.
+// The fused momentum-SGD update uses lanes [param, grad, velocity] and scalar
+// lanes [lr, first]. It matches the composed update, including first-step
+// v = g initialization selected by the zero-dimensional `first` flag.
+/// Returns fused momentum-SGD expressions `[param', velocity']` with tensor
+/// lanes [param, grad, velocity] and scalar lanes [lr, first].
 pub fn sgd_exprs(
     momentum: f64,
     dampening: f64,
@@ -1265,8 +1251,8 @@ fn sgd_exprs_with(
     ]
 }
 
-/// Whether fusion supports a device/dtype pair: the CPU interpreter covers
-/// f32/f64; GPU (Metal) fusion covers f32 and bf16.
+/// Whether fusion supports a device and dtype pair. CPU supports f32 and f64.
+/// Metal supports f32 and bf16.
 pub fn is_supported(
     device: &effect_torch_graph::Device,
     dtype: effect_torch_runtime::DType,

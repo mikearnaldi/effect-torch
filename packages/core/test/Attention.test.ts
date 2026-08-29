@@ -201,7 +201,11 @@ onDevices("Attention", () => (it) => {
                 })
                 for (let group = 0; group < queryHeads / kvHeads; group++) heads.push(current)
               }
-              return yield* Tensor.concat(heads as [Tensor.Any, Tensor.Any, ...Array<Tensor.Any>], { dim: 1 })
+              const [first, second, ...rest] = heads
+              if (first === undefined || second === undefined) {
+                throw new Error("GQA reference must produce at least two heads")
+              }
+              return yield* Tensor.concat([first, second, ...rest], { dim: 1 })
             })
           const repeatedK = yield* repeatHeads(k, 2)
           const repeatedV = yield* repeatHeads(v, 3)

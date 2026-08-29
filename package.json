@@ -7,8 +7,10 @@
     "build:native:matrix": "node scripts/build-native.mjs --matrix && pnpm --filter @effect-torch/backend-cpu --filter @effect-torch/backend-apple-native --filter @effect-torch/tokenizers run build:ts && node scripts/verify-native-packages.mjs --artifacts",
     "test": "pnpm -r test",
     "typecheck": "pnpm -r typecheck",
-    "lint": "oxlint -f unix && dprint check",
-    "lint-fix": "oxlint --fix && dprint fmt",
+    "generate:native-types": "node scripts/generate-native-declarations.mjs",
+    "check:native-types": "node scripts/generate-native-declarations.mjs --check",
+    "lint": "NODE_OPTIONS=--experimental-strip-types oxlint -f unix && dprint check",
+    "lint-fix": "NODE_OPTIONS=--experimental-strip-types oxlint --fix && dprint fmt",
     "bench": "pnpm --filter @effect-torch/bench bench",
     "bench:compile": "pnpm --filter @effect-torch/bench bench:compile",
     "bench:inference": "pnpm --filter @effect-torch/bench bench:inference",
@@ -17,8 +19,10 @@
     "verify:native-packages": "node scripts/verify-native-packages.mjs"
   },
   "devDependencies": {
+    "@napi-rs/cli": "3.8.6",
+    "@oxlint/plugins": "1.80.0",
     "dprint": "^0.55.2",
-    "oxlint": "^1.77.0",
+    "oxlint": "1.80.0",
     "typescript": "^7.0.2"
   }
 }

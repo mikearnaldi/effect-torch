@@ -1,5 +1,5 @@
-//! Correctness-first GGML K-quant execution. Each linear output is accumulated
-//! directly from packed blocks, and embedding only visits selected packed rows.
+//! GGML K-quant execution. Linear operations accumulate each output directly
+//! from packed blocks. Embedding operations visit only selected packed rows.
 //!
 //! ## Packed layouts (GGML K-quants)
 //!
@@ -10,10 +10,9 @@
 //! the GGML byte layouts exactly and are guarded by `static_assert`s on
 //! their sizes; `et_decode_k` (per-lane scalar decode) and
 //! `et_decode_k16` (16-value group decode into threadgroup memory) are
-//! the single source of truth for the bit-level formats: sub-block
-//! scales and mins packed at 4–6 bits, quants at 2–6 bits split into
-//! low nibbles plus high-bit masks, with an f16 super-scale `d` (and
-//! `dmin` where the format has one) per block.
+//! define the bit-level formats. Sub-block scales and mins use 4 to 6 bits.
+//! Quants use 2 to 6 bits split into low nibbles and high-bit masks. Each block
+//! has an f16 super-scale `d` and, where required, `dmin`.
 //!
 //! ## Metal SIMD assumptions
 //!
@@ -24,12 +23,12 @@
 //!   (Q2K/Q4K/Q6K: 2, Q3K: 3, Q5K: 1). Partial dots fold with
 //!   `simd_sum` (decode) or a short `simd_shuffle_xor` tree (legacy
 //!   batched multi-vector variants, `ET_VECTOR_LANES` ∈ {1, 2, 4}).
-//! - `LinearDirect`: exact Q2_K/Q3_K candidate for 2–8 input vectors.
+//! - `LinearDirect` is an exact Q2_K/Q3_K candidate for 2 to 8 input vectors.
 //!   One simdgroup owns one output row and reuses each packed fragment
 //!   across a compile-time vector tile while retaining M=1 f32
 //!   arithmetic, accumulation order, and `simd_sum` for every vector.
-//! - `et_quantized_linear_mma`: prefill path for `vectors ≥ 8` and
-//!   large weights — blocks decoded to threadgroup memory via
+//! - `et_quantized_linear_mma` is the prefill path for `vectors ≥ 8` and
+//!   large weights. It decodes blocks to threadgroup memory with
 //!   `et_decode_k16`, then 8×8 simdgroup matrix multiply-accumulate.
 //!   The default-selected variants (`et_quantized_linear_mma_half`)
 //!   dequantize weights and stage the input tile as `threadgroup half`
@@ -42,14 +41,14 @@
 //!   only the selected packed rows; out-of-range indexes are skipped
 //!   and reported through a u32 status word (atomic store, relaxed).
 //!
-//! The packed weight must be **zero-offset contiguous** (the kernels
-//! index it byte-wise from the buffer base); input/output are f32.
+//! Packed weights must be zero-offset contiguous because kernels index them
+//! byte-wise from the buffer base. Inputs and outputs are f32.
 
 use crate::runtime::dtype::DType;
 use crate::runtime::metal::run::MetalTensor;
 use effect_torch_runtime::GgmlKQuant;
 
-/// Planner-facing requirements of a fused quantized linear
+/// Requirements for a fused quantized linear
 /// (`y = x · dequant(W)ᵀ + b`) over packed GGML K-quant weights.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LinearRequirements {
@@ -76,8 +75,8 @@ pub struct LinearRequirements {
     pub pipeline_count: usize,
 }
 
-/// Planner-facing requirements of a decode-time grouped quantized
-/// linear: 2–4 independent bias-free members that share one f32 input
+/// Requirements for a decode-time grouped quantized
+/// linear with 2 to 4 independent bias-free members sharing one f32 input
 /// and codec, dispatched as a single `et_quantized_linear_grouped`
 /// command. Restricted to the packed-dot decode kernels
 /// (`KernelKind::Linear`/`LinearBatched`, vectors < 8); MMA prefill
@@ -103,7 +102,7 @@ pub struct GroupedLinearRequirements {
     pub pipeline_count: usize,
 }
 
-/// Planner-facing requirements of a quantized embedding gather.
+/// Requirements for a quantized embedding gather.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EmbeddingRequirements {
     /// The K-quant codec of the packed table.
@@ -229,7 +228,7 @@ pub fn linear_requirements(
     })
 }
 
-/// Plans a decode-time grouped quantized linear from 2–4 exact member
+/// Plans a decode-time grouped quantized linear from 2 to 4 member
 /// plans. Members must share codec, input geometry (shape, columns,
 /// vectors, encoded row bytes), and be bias-free; row counts may
 /// differ. Only non-MMA packed-dot decode shapes (vectors < 8) group.
@@ -1417,8 +1416,8 @@ kernel void et_quantized_linear(
 "#;
 
 // Q2_K/Q3_K small-row verifier path. The lane decomposition, block stride,
-// expressions, and simd_sum reduction intentionally mirror the one-vector
-// packed-dot body above. Only the loop nesting changes: packed fields are
+// expressions, and simd_sum reduction match the one-vector packed-dot body
+// above. Only the loop nesting changes. Packed fields are
 // loaded before the compile-time vector-tile loop and reused within that tile.
 const LINEAR_DIRECT_SOURCE: &str = r#"
 #define ET_DIRECT_VECTORS $DIRECT_VECTORS
@@ -1659,7 +1658,7 @@ kernel void et_quantized_linear_direct(
 }
 "#;
 
-/// Grouped decode projection: 2–4 members share one input and codec.
+/// Grouped decode projection in which 2 to 4 members share an input and codec.
 /// `group.z` selects the member; each member binds its own packed
 /// weight and output and reads its own row count. Bias-free only
 /// (grouping rejects biased members), so the bias slot of the shared
@@ -3902,9 +3901,9 @@ mod tests {
         // Non-half-exact inputs and decodes: the only difference between
         // the default half-operand kernels and the f32 MMA kernels is
         // rounding both operands to half (11-bit significand, ≤ 2^-11
-        // relative per operand, ≤ 2^-10 per product). Products accumulate
-        // in f32 in both kernels, so errors stay near sqrt(K) * 2^-10 of
-        // the per-product magnitude — far below 1% of the largest dot.
+        // relative per operand, ≤ 2^-10 per product). Both kernels accumulate
+        // in f32, so errors stay near sqrt(K) * 2^-10 of the per-product
+        // magnitude, far below 1% of the largest dot.
         let device = MetalDevice::get();
         for (codec, vectors, rows, columns, block_bytes, f32_kind, half_kind) in [
             (

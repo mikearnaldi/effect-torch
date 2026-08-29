@@ -4,14 +4,14 @@ import { NodeRuntime } from "@effect/platform-node"
 import { Effect, Option } from "effect"
 import { BLOCK, CHECKPOINT, createGpt, EOT, loadParams, loadTokenizer } from "./model.js"
 
-// Single-sequence streaming generation from the bare model artifact written by
-// train.ts or export.ts. Prompt prefill is chunked; each logits readback then
-// transfers a completed decode row for host-side sampling. The BLOCK attention
-// window and RoPE allow the logical cursor to advance beyond the 8,192-row KV
-// capacity, but there is no application token limit: only <|endoftext|>
-// terminates the loop, and the JavaScript id/text buffers continue to grow. Usage:
+// Streams one sequence from the bare model artifact that train.ts or export.ts
+// writes. The script splits prompt prefill into chunks. After each decode, it
+// transfers the full logits row to the host for sampling. The BLOCK attention
+// window and RoPE let the logical cursor advance beyond the 8,192-row KV
+// capacity. The script sets no token limit. Only <|endoftext|> stops the loop,
+// and the JavaScript ID and text buffers keep growing until then. Usage:
 //   pnpm tsx fineweb/generate.ts "The history of the printing press"
-// FINEWEB_TEMPERATURE is Number-parsed without range validation.
+// The script parses FINEWEB_TEMPERATURE with Number but does not validate its range.
 
 const TEMPERATURE = Number(process.env.FINEWEB_TEMPERATURE ?? 0.2)
 
@@ -57,10 +57,10 @@ const program = Effect.scoped(Effect.gen(function*() {
   const encoded = yield* tokenizer.encode(prompt)
   const entry = (yield* gen.add([yield* Tensor.fromTypedArray(encoded.data, [1, encoded.shape[0]])]))[0]!
   let logits = entry.logits
-  // Incremental decode: re-decode the sequence per token, but hold back a
-  // trailing run of U+FFFD - a merge boundary can split a multi-byte
-  // codepoint, and the next token may complete it (genuine invalid bytes
-  // still print, one token later; everything flushes at the end).
+  // Decode the full generated sequence after each token. Hold back trailing
+  // U+FFFD characters because a token boundary may split a multibyte codepoint.
+  // The next token may complete it. Genuine invalid bytes print one token later,
+  // and the final write flushes everything.
   const ids: Array<number> = []
   let emitted = 0
   let text = ""

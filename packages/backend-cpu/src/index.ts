@@ -1,41 +1,27 @@
 /**
- * CPU package entry point. Importing this module loads the host-specific native
- * addon; {@link makeRuntime} and {@link layer} then expose one module-memoized
- * adapter as either a direct service or an Effect dependency.
+ * CPU package entry point. Importing this module loads the native addon for the
+ * current host. {@link layer} provides its cached adapter as an Effect
+ * dependency.
  */
 import { Runtime } from "@effect-torch/core"
 import { Effect, Layer } from "effect"
-import { makeRuntime as makeRuntimeAdapter } from "./internal/adapter.js"
+import { createRuntimeAdapter } from "./internal/adapter.js"
 import native from "./internal/native.js"
 
 let runtime: Runtime.RuntimeService | undefined
 
 /**
- * Returns the memoized CPU runtime singleton for this package module.
+ * Provides the cached CPU runtime as a reusable Layer.
  *
- * Importing `@effect-torch/backend-cpu` eagerly selects the native binary for
- * the current platform, architecture, and Linux C library, then loads that
- * addon. Unsupported hosts and addon-loading failures therefore throw during
- * module evaluation, before this function can be called. Runtime adapter
- * construction is synchronous on the first call and is cached only after it
- * succeeds; later calls return the same service, while a failed construction
- * can be retried.
- *
- * @since 0.1.0
- * @category constructors
- */
-export const makeRuntime = (): Runtime.RuntimeService => runtime ??= makeRuntimeAdapter(native)
-
-/**
- * A reusable Layer that provides the memoized CPU runtime singleton.
- *
- * Runtime adapter construction is deferred until the Layer is built, and
- * successful builds all install the same service returned by {@link makeRuntime}.
- * Native binary loading has already happened at package import time. If runtime
- * construction throws during a build, `Effect.sync` reports the exception as a
- * defect; no runtime is memoized, so a later independent build can retry.
+ * The Layer defers runtime adapter construction until it is built. Successful
+ * builds share the same service. The package import has already loaded the
+ * native binary. If construction throws, `Effect.sync` reports the exception as
+ * a defect. The failed runtime is not cached, so a later build can retry.
  *
  * @since 0.1.0
  * @category layers
  */
-export const layer: Layer.Layer<Runtime.Runtime> = Layer.effect(Runtime.Runtime, Effect.sync(makeRuntime))
+export const layer: Layer.Layer<Runtime.Runtime> = Layer.effect(
+  Runtime.Runtime,
+  Effect.sync(() => runtime ??= createRuntimeAdapter(native))
+)

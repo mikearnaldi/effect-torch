@@ -41,7 +41,7 @@ export * as Gguf from "./Gguf.ts"
 export * as LearningRate from "./LearningRate.ts"
 
 /**
- * Lazy loss graph builders, reduction policies, and validation boundaries.
+ * Lazy loss graph builders, reduction policies, and input checks.
  *
  * @since 0.1.0
  * @category modules
@@ -75,7 +75,7 @@ export * as Speculation from "./Speculation.ts"
 export * as Optimizer from "./Optimizer.ts"
 
 /**
- * Backend-neutral runtime services, handles, and execution contracts.
+ * Backend-neutral runtime services, handles, and execution rules.
  *
  * @since 0.1.0
  * @category modules
@@ -100,7 +100,7 @@ export * as Tensor from "./Tensor.ts"
 
 /**
  * Stateful compiled and uncompiled training loops with explicit resume and
- * cache semantics.
+ * cache behavior.
  *
  * @since 0.1.0
  * @category modules

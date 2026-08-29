@@ -1,24 +1,25 @@
 //! GGML K-quant weight decoding and quantized inference kernels.
 //!
-//! Weights stored in GGUF K-quant formats ([`GgmlKQuant`]: `Q2_K`, `Q3_K`,
-//! `Q4_K`, `Q5_K`, `Q6_K`) are packed little-endian blocks of
-//! [`BLOCK_VALUES`] (256) values. Each block carries a few f16 global
-//! scale/min fields plus bit-packed per-group scales and quantized codes; the
-//! per-codec decoders below mirror `block_q*_K`/`dequantize_row_q*_K` in
-//! upstream ggml exactly.
+//! The GGUF K-quant formats in [`GgmlKQuant`] are `Q2_K`, `Q3_K`, `Q4_K`,
+//! `Q5_K`, and `Q6_K`. They store weights in packed little-endian blocks.
+//! Each block encodes [`BLOCK_VALUES`] values, which equals 256, along with
+//! f16 global scale and minimum fields, bit-packed per-group scales, and
+//! quantized codes.
+//! The codec decoders mirror upstream ggml's `block_q*_K` and
+//! `dequantize_row_q*_K` exactly.
 //!
 //! Two kernels consume packed weights without materializing them:
 //!
-//! - `quantized_linear` (`*_requirements`/`*_into`) computes
+//! - `quantized_linear`, through `*_requirements` and `*_into`, computes
 //!   `input[.., columns] × weight[rows, columns]ᵀ (+ bias)`, decoding one
 //!   block at a time into a 256-element stack buffer and accumulating in
 //!   `f32`.
-//! - `quantized_embedding` decodes only the rows selected by `u32`/`i64`
+//! - `quantized_embedding` decodes only rows selected by `u32` or `i64`
 //!   indexes, producing `[indexes..., columns]` f32 output.
 //!
 //! Packed weights must be exact contiguous `[rows, encoded_row_bytes]` `u8`
-//! tensors with zero layout offset. Both kernels poll the
-//! [`CancellationFlag`] at vector and block granularity and abort with
+//! tensors with zero layout offset. Both kernels check the
+//! [`CancellationFlag`] for each vector and block and abort with
 //! `"operation aborted"`.
 
 use crate::{CpuBuffer, CpuDestination, CpuTensorRequirement, Tensor};
@@ -28,9 +29,9 @@ use half::f16;
 /// Number of logical values in one K-quant block, for all codecs.
 const BLOCK_VALUES: usize = 256;
 
-/// Frozen plan of one quantized linear or embedding invocation.
+/// Plan for one quantized linear or embedding invocation.
 ///
-/// `output` is always f32; `encoded_row_bytes` is the packed size of one
+/// `output` is always f32. `encoded_row_bytes` is the packed size of one
 /// weight row (`columns / 256 * block_bytes(codec)`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QuantizedRequirements {
@@ -291,9 +292,9 @@ fn validate_weight(
     Ok(encoded_row_bytes)
 }
 
-/// Plans `quantized_linear`: validates the f32 rank ≥ 2 input, the packed
-/// weight, and the optional `[rows]` f32 bias, and computes the f32 output
-/// requirement with the trailing dimension replaced by `rows`.
+/// Plans `quantized_linear`. Validates the f32 input of rank ≥ 2, the packed
+/// weight, and the optional `[rows]` f32 bias. Computes the f32 output
+/// requirement with `rows` as the trailing dimension.
 pub(crate) fn linear_requirements(
     input: &Tensor,
     weight: &Tensor,
@@ -335,8 +336,8 @@ pub(crate) fn linear_requirements(
     })
 }
 
-/// Plans `quantized_embedding`: validates u32/i64 indexes and the packed
-/// weight, and computes the `[indexes..., columns]` f32 output requirement.
+/// Plans `quantized_embedding`. Validates u32 or i64 indexes and the packed
+/// weight, then computes the `[indexes..., columns]` f32 output requirement.
 pub(crate) fn embedding_requirements(
     indexes: &Tensor,
     weight: &Tensor,
@@ -414,8 +415,8 @@ fn validate_linear_execution(
     Ok(vectors)
 }
 
-/// Executes a planned quantized linear allocation-free, decoding blocks on
-/// the fly and polling `cancelled` per vector and per block.
+/// Executes a planned quantized linear without allocating. Decodes blocks as
+/// needed and checks `cancelled` for each vector and block.
 pub(crate) fn linear_into(
     input: &Tensor,
     weight: &Tensor,
@@ -540,9 +541,8 @@ fn validate_embedding_execution(
     Ok(count)
 }
 
-/// Executes a planned quantized embedding allocation-free, decoding only the
-/// selected rows. Indexes are bounds-checked; negative i64 indexes are
-/// errors.
+/// Executes a planned quantized embedding without allocating and decodes only
+/// selected rows. Checks index bounds and rejects negative i64 indexes.
 pub(crate) fn embedding_into(
     indexes: &Tensor,
     weight: &Tensor,

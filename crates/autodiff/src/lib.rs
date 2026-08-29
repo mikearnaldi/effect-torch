@@ -1,35 +1,33 @@
-//! Graph-level program transformations: reverse-mode automatic
-//! differentiation ([`grad`]) and vectorization ([`vmap`]) over the semantic
-//! `Node` graph.
+//! Graph transforms over the semantic `Node` graph: reverse-mode automatic
+//! differentiation ([`grad`]) and vectorization ([`vmap`]).
 //!
-//! Both transforms consume an immutable graph and produce a *new* graph
-//! generation built from ordinary `NodeKind`s; the compiler afterwards sees
-//! a plain forward graph and needs no autodiff awareness. Design contracts:
+//! Both transforms read an immutable graph and produce a new graph made of
+//! ordinary `NodeKind`s. The compiler receives a plain forward graph and needs
+//! no autodiff support.
 //!
-//! - **Reverse mode** ([`grad`]) walks one topological order of the loss
-//!   graph backwards, accumulating a cotangent graph per node. Broadcasting
-//!   is undone with sum-to-shape reductions; non-float nodes stop gradient
-//!   flow (their mathematical gradient is zero almost everywhere); ops
-//!   without a closed form lower to dedicated backward nodes
-//!   (`SdpaBackward`, `LayerNormBackward`, `KdaBackward`, …) whose outputs
-//!   are selected per differentiable input. Backward nodes themselves are
-//!   deliberately *not* differentiable, so second derivatives fail loudly
-//!   instead of silently producing wrong graphs.
-//! - **Checkpoints** (`NodeKind::Checkpoint`) are rebuilt during the
-//!   backward walk: the region's interior is deep-copied with fresh node
-//!   IDs and the adjoint is built over the copy, so forward intermediates
-//!   are recomputed in the backward phase rather than retained. Region
-//!   inputs and constructor leaves stay shared — random draws and constants
-//!   are not re-run.
-//! - **Vectorization** ([`vmap`]) rebuilds only the subgraph that descends
-//!   from the mapped input, inserting a batch axis at the requested dim.
-//!   Elementwise ops and matmul are unchanged (broadcasting carries the
-//!   batch); shape, slice, permutation, and reduction metadata shifts around
-//!   the inserted axis; random sources draw per batch element; ops with
-//!   data-dependent indexing are rejected explicitly.
+//! - [`grad`] walks a topological order of the loss graph in reverse and
+//!   accumulates a cotangent graph for each node. Sum-to-shape reductions undo
+//!   broadcasting. Non-float nodes stop gradient flow because their
+//!   mathematical gradient is zero almost everywhere. The transform lowers ops
+//!   without a closed form to dedicated backward nodes such as `SdpaBackward`,
+//!   `LayerNormBackward`, and `KdaBackward`. It selects one output for each
+//!   differentiable input. Backward nodes are not differentiable, so requests
+//!   for second derivatives return an error instead of producing an incorrect
+//!   graph.
+//! - During the backward walk, `NodeKind::Checkpoint` copies every node in the
+//!   region's interior with a fresh node ID and builds the adjoint over the
+//!   copy. The backward phase recomputes forward intermediates instead of
+//!   retaining them. Region inputs and constructor leaves stay shared, so
+//!   random draws and constants are not rerun.
+//! - [`vmap`] inserts a batch axis at the requested dimension and rebuilds only
+//!   the subgraph that depends on the mapped input. Elementwise ops and matmul
+//!   need no changes because broadcasting carries the batch. The transform
+//!   shifts shape, slice, permutation, and reduction metadata around the new
+//!   axis. Random sources draw separately for each batch element. The
+//!   transform rejects ops with data-dependent indexing.
 //!
-//! All traversals are iterative; depth is bounded by heap, not the call
-//! stack.
+//! All traversals are iterative. The heap, not the call stack, limits graph
+//! depth.
 
 use effect_torch_graph::{
     node_children, remap_children, Device, Node as GraphNode, NodeKind as GraphNodeKind,
@@ -42,8 +40,8 @@ use std::sync::Arc;
 type Node = GraphNode;
 type NodeKind = GraphNodeKind;
 
-/// Node constructor shorthand: every transform funnels through `Node::new`
-/// so shape/dtype validation is always applied to rebuilt graphs.
+/// Constructs transform nodes through `Node::new`, which validates the shape
+/// and dtype of every rebuilt node.
 fn mk(kind: NodeKind) -> std::result::Result<Arc<Node>, String> {
     Node::new(kind)
 }
@@ -205,7 +203,7 @@ fn transpose2(a: &Arc<Node>) -> std::result::Result<Arc<Node>, String> {
     mk(NodeKind::Permute { a: a.clone(), dims })
 }
 
-// Sum g over the dims that broadcasting expanded, then reshape to target.
+// Sum `g` over dimensions expanded by broadcasting, then reshape to `target`.
 fn sum_to_shape(g: &Arc<Node>, target: &[usize]) -> std::result::Result<Arc<Node>, String> {
     if g.shape == target {
         return Ok(g.clone());
@@ -235,8 +233,8 @@ fn sum_to_shape(g: &Arc<Node>, target: &[usize]) -> std::result::Result<Arc<Node
     reshape(out, target.to_vec())
 }
 
-// Broadcast a reduced cotangent (and output) back to the input shape,
-// re-inserting size-1 dims when keepdims was false.
+// Broadcast a reduced cotangent and output to the input shape. Insert size-1
+// dimensions when `keepdims` is false.
 fn expand_reduced(
     g: &Arc<Node>,
     dims: &[usize],
@@ -256,8 +254,8 @@ fn expand_reduced(
     broadcast_to(g, target)
 }
 
-/// Iterative postorder from `loss`, deduplicated by node ID — the single
-/// order both `grad` and `vmap` build their transforms over.
+/// Computes an iterative postorder from `loss`, deduplicated by node ID. Both
+/// `grad` and `vmap` build their transforms over this order.
 fn topo(loss: &Arc<Node>) -> Vec<Arc<Node>> {
     let mut visited = HashSet::new();
     let mut order = Vec::new();
@@ -278,8 +276,8 @@ fn topo(loss: &Arc<Node>) -> Vec<Arc<Node>> {
     order
 }
 
-// Nodes of `root`'s graph whose subtree contains `x_id` — the subgraph
-// that must be rebuilt under vmap.
+// Find nodes in `root` whose subtree contains `x_id`. The transform must rebuild
+// this subgraph.
 fn descendants_of(root: &Arc<Node>, x_id: u64) -> HashSet<u64> {
     let mut set = HashSet::new();
     for node in topo(root) {
@@ -308,8 +306,8 @@ fn insert_batch(shape: &[usize], dim: usize, batch: usize) -> Vec<usize> {
     out
 }
 
-// Unsqueezes shared indexes at the batch dim and broadcasts them across
-// it, so rank-matched indexing kernels apply per batch element.
+// Unsqueeze shared indexes at the batch dimension and broadcast them across
+// it. This lets rank-matched indexing kernels run for each batch element.
 fn broadcast_batch_indexes(
     indexes: &Arc<Node>,
     dim: usize,
@@ -325,12 +323,11 @@ fn broadcast_batch_indexes(
     })
 }
 
-// Per-op batching rules: rebuild a node for a graph whose input gained
-// a leading-dim-style batch axis at `dim`. Elementwise ops, matmul and
-// wrappers are unchanged (broadcasting carries the batch); shape and
-// reduction metadata shifts around the inserted axis; random sources
-// draw per batch element; indexing with data-dependent indexes and
-// gather/scatter are rejected for now.
+// Rebuild a node after its input gains a batch axis at `dim` with
+// leading-dimension semantics. Elementwise ops, matmul, and wrappers need no
+// changes because broadcasting carries the batch. Shape and reduction metadata
+// shift around the inserted axis. Random sources draw separately for each batch
+// element. These rules reject data-dependent indexes and gather/scatter.
 fn vmap_rebuild(
     node: &Node,
     dim: usize,
@@ -502,16 +499,15 @@ fn vmap_rebuild(
     }
 }
 
-/// Maps the output of `y = f(x)` to `f` applied elementwise over a batch
-/// axis of `batched`, where `batched` is `x` with one extra dimension of
-/// size `batch` inserted at `dim`. The result is a graph computing the
-/// batched output with the batch axis at `dim`.
+/// Applies the graph `y = f(x)` over a batch axis of `batched`. The shape of
+/// `batched` is the shape of `x` with a dimension of size `batch` inserted at
+/// `dim`. The resulting graph places the output batch axis at `dim`.
 ///
-/// Only the subgraph descending from `x` is rebuilt; the rest is shared.
-/// Returns an error when shapes or dtypes don't match, when the output does
-/// not depend on the input, or when the subgraph contains an op with no
-/// batching rule (data-dependent indexing, stateful decode nodes, quantized
-/// ops, convolutions — see `vmap_rebuild`).
+/// The transform rebuilds only the subgraph that depends on `x` and shares the
+/// rest. It returns an error if shapes or dtypes do not match, the output does
+/// not depend on the input, or the subgraph contains an op with no batching
+/// rule. Unsupported ops include data-dependent indexing, stateful decode
+/// nodes, quantized ops, and convolutions. See `vmap_rebuild`.
 pub fn vmap(
     y: &Arc<Node>,
     x: &Arc<Node>,
@@ -547,9 +543,9 @@ pub fn vmap(
     let mut map: HashMap<u64, Arc<Node>> = HashMap::new();
     map.insert(x.id, batched.clone());
     for node in topo(y) {
-        // random sources inside the mapped graph draw per batch element
-        // even when they do not depend on the input; everything else is
-        // rebuilt only when it descends from the input
+        // Random sources inside the mapped graph draw for each batch element,
+        // even when they do not depend on the input. The transform rebuilds
+        // other nodes only when they depend on the input.
         let is_random = matches!(node.kind, NodeKind::Randn { .. } | NodeKind::Uniform { .. });
         if node.id == x.id || (!is_random && !descendants.contains(&node.id)) {
             continue;
@@ -557,9 +553,9 @@ pub fn vmap(
         let child_of =
             |child: &Arc<Node>| map.get(&child.id).cloned().unwrap_or_else(|| child.clone());
         let rebuilt = match &node.kind {
-            // shared indexes are reshaped and broadcast across the batch
-            // dim so the rank-matched gather/scatter kernels apply per
-            // batch element
+            // Reshape shared indexes and broadcast them across the batch
+            // dimension so rank-matched gather/scatter kernels run for each
+            // batch element.
             NodeKind::Gather { a, dim: d, indexes }
                 if !descendants.contains(&indexes.id) && !is_random =>
             {
@@ -596,15 +592,16 @@ pub fn vmap(
     Ok(map.get(&y.id).expect("vmap root").clone())
 }
 
-/// Reverse-mode gradients of a scalar loss with respect to `wrt`, in the
-/// same order. A target the loss does not depend on receives an explicit
-/// zeros graph, keeping the walk total.
+/// Returns reverse-mode gradients of a scalar loss with respect to `wrt`, in
+/// the same order. A target that does not affect the loss receives an explicit
+/// zeros graph.
 ///
-/// The loss must be 0-d and floating point, and every target must be
-/// floating point. Quantized (encoded) ops are inference-only and rejected
-/// up front; inference-only nodes (`KvAttention`, `LastTokenRow`, stateful
-/// decode nodes) and backward nodes (no second-order support) fail during
-/// the walk with an explicit error.
+/// The loss must be zero-dimensional and floating point. Every target must also
+/// be floating point. Encoded quantized ops support inference only, so the
+/// function rejects them before the walk. During the walk, it returns an error
+/// for inference-only nodes such as `KvAttention`, `LastTokenRow`, and stateful
+/// decode nodes. It also rejects backward nodes because they do not support
+/// second-order differentiation.
 pub fn grad(loss: &Arc<Node>, wrt: &[Arc<Node>]) -> std::result::Result<Vec<Arc<Node>>, String> {
     if !loss.shape.is_empty() {
         return Err(format!(
@@ -650,8 +647,8 @@ pub fn grad(loss: &Arc<Node>, wrt: &[Arc<Node>]) -> std::result::Result<Vec<Arc<
         .collect())
 }
 
-// Nodes reachable from the walk's root without passing through the
-// checkpoint — these are the region's inputs and stay shared.
+// Nodes reachable from the walk's root without passing through the checkpoint
+// are region inputs and stay shared.
 fn outside_set(order: &[Arc<Node>], checkpoint_id: u64) -> HashSet<u64> {
     let mut visited = HashSet::new();
     if let Some(root) = order.last() {
@@ -671,12 +668,12 @@ fn outside_set(order: &[Arc<Node>], checkpoint_id: u64) -> HashSet<u64> {
     visited
 }
 
-/// The reverse-mode walk: iterates the forward topological order backwards,
-/// extending `cotangents` with each node's adjoint contribution. Cotangents
-/// of nodes with multiple consumers accumulate with `Add` graphs, matching
-/// the total-derivative rule. Per-op adjoint rules are inline; ops with a
-/// closed multi-output adjoint emit one backward node plus one picker per
-/// differentiable input (the `SdpaBackward` pattern).
+/// Walks the forward topological order in reverse and adds each node's adjoint
+/// contribution to `cotangents`. For nodes with multiple consumers, `Add`
+/// graphs combine the contributions according to the total-derivative rule.
+/// Per-op adjoint rules are inline. A closed multi-output adjoint emits one
+/// backward node and one output picker for each differentiable input, following
+/// the `SdpaBackward` pattern.
 fn backward(
     order: &[Arc<Node>],
     cotangents: &mut HashMap<u64, Arc<Node>>,
@@ -685,9 +682,9 @@ fn backward(
         let Some(g) = cotangents.get(&node.id).cloned() else {
             continue;
         };
-        // Gradients do not flow through non-float nodes (comparisons,
-        // integer arithmetic): their mathematical gradient is zero
-        // almost everywhere, so the cotangent is dropped here.
+        // Gradients do not flow through non-float nodes such as comparisons and
+        // integer arithmetic. Their mathematical gradient is zero almost
+        // everywhere, so drop the cotangent here.
         if !node.dtype.is_float() {
             continue;
         }
@@ -726,7 +723,7 @@ fn backward(
             }
             NodeKind::Maximum { a, b } | NodeKind::Minimum { a, b } => {
                 let is_max = matches!(&node.kind, NodeKind::Maximum { .. });
-                // ties route the gradient to the left operand
+                // Ties route the gradient to the left operand.
                 let (mask_a, mask_b) = if is_max {
                     (
                         mk(NodeKind::Ge {
@@ -814,9 +811,9 @@ fn backward(
                 })?;
                 accumulate(a, mul(mul(g, c)?, e))?;
             }
-            // exact: d/dx gelu(x) = Φ(x) + x·φ(x) with
+            // Exact derivative: d/dx gelu(x) = Φ(x) + x·φ(x), where
             // Φ(x) = ½(1+erf(x/√2)), φ(x) = e^{-x²/2}/√(2π).
-            // tanh: ½(1+t) + ½x(1-t²)·c(1+3k·x²) with
+            // Tanh approximation: ½(1+t) + ½x(1-t²)·c(1+3k·x²), where
             // t = tanh(c(x+kx³)), c = √(2/π), k = 0.044715.
             NodeKind::Gelu { a, approximate } => {
                 let dt = a.dtype;
@@ -855,8 +852,8 @@ fn backward(
                 };
                 accumulate(a, mul(g, dg))?;
             }
-            // zero almost everywhere; the cotangent is an explicit zero
-            // rather than a drop so higher-order walks stay total
+            // These gradients are zero almost everywhere. Record an explicit
+            // zero cotangent so higher-order walks remain total.
             NodeKind::Floor { a }
             | NodeKind::Ceil { a }
             | NodeKind::Round { a }
@@ -879,8 +876,8 @@ fn backward(
                 accumulate(b, sum_to_shape(&gb, &b.shape))?;
             }
             NodeKind::Cumsum { a, dim } => {
-                // d out[i] / d x[j] = 1 when i >= j, so the adjoint is the
-                // reverse cumulative sum: total - cumsum(g) + g
+                // d out[i] / d x[j] = 1 when i >= j. The adjoint is the reverse
+                // cumulative sum, computed as total - cumsum(g) + g.
                 let total = mk(NodeKind::Sum {
                     a: g.clone(),
                     dims: vec![*dim],
@@ -894,8 +891,8 @@ fn backward(
                 accumulate(a, add(g.clone(), sub(total, cs)?))?;
             }
             NodeKind::IndexSelect { a, dim, indexes } => {
-                // scatter the cotangent back into a zero tensor of the
-                // input shape at the selected positions
+                // Scatter the cotangent into a zero tensor of the input shape at
+                // the selected positions.
                 let mut ishape = vec![1usize; a.shape.len()];
                 ishape[*dim] = indexes.shape[0];
                 let idx = reshape(indexes.clone(), ishape)?;
@@ -927,9 +924,9 @@ fn backward(
                 )?;
             }
             NodeKind::Gather { a, dim, indexes } => {
-                // the scatter kernel requires src to match the target
-                // outside dim, so pad the cotangent and the indexes with
-                // harmless zeros (index 0, value 0) where they are smaller
+                // The scatter kernel requires `src` to match the target outside
+                // `dim`. Where the cotangent and indexes are smaller, pad both
+                // with zeros. Index 0 is harmless because its source value is 0.
                 let mut g_padded = g;
                 let mut idx_padded = indexes.clone();
                 for i in 0..a.shape.len() {
@@ -973,8 +970,9 @@ fn backward(
                 )?;
             }
             NodeKind::Prod { a, dims, keepdims } => {
-                // d prod / d x_i = prod / x_i; undefined when any factor
-                // is zero (the true adjoint needs the zero-free subproducts)
+                // d prod / d x_i = prod / x_i. This formula is undefined when
+                // any factor is zero. The true adjoint then needs zero-free
+                // subproducts.
                 let out_b = expand_reduced(&node.clone(), dims, *keepdims, &a.shape)?;
                 let g_b = expand_reduced(&g, dims, *keepdims, &a.shape)?;
                 accumulate(a, div(mul(g_b, out_b)?, a.clone()))?;
@@ -1056,9 +1054,9 @@ fn backward(
                 for (dim, &(start, stop, stride)) in ranges.iter().enumerate() {
                     let n = a.shape[dim];
                     if stride != 1 && cur.shape[dim] > 0 {
-                        // dilate the cotangent along the sliced dim by
-                        // interleaving stride-1 zeros, so it lines up with
-                        // the positions the forward pass actually read
+                        // Dilate the cotangent along the sliced dimension by
+                        // interleaving stride-1 zeros. This aligns it with the
+                        // positions read by the forward pass.
                         let len = cur.shape[dim];
                         let mut g_shape = cur.shape.clone();
                         g_shape.insert(dim + 1, 1);
@@ -1175,8 +1173,8 @@ fn backward(
                 )?;
             }
             NodeKind::Det { a } => {
-                // d det = det * inv^T; the batch-shaped det and cotangent
-                // are expanded across the matrix dimensions
+                // d det = det * inv^T. Expand the batch-shaped determinant and
+                // cotangent across the matrix dimensions.
                 let inv_t = transpose2(&mk(NodeKind::Inverse { a: a.clone() })?)?;
                 let rank = a.shape.len();
                 let dims = vec![rank - 2, rank - 1];
@@ -1226,9 +1224,9 @@ fn backward(
                 target,
                 ignore_index,
             } => {
-                // Closed-form chunked adjoint: one backward node, one
-                // picker per differentiable input (the SdpaBackward
-                // pattern).
+                // Build one backward node for the closed-form chunked adjoint
+                // and one output picker for each differentiable input. This
+                // follows the SdpaBackward pattern.
                 let bw = mk(NodeKind::ChunkedHeadCeBackward {
                     x: x.clone(),
                     weight: weight.clone(),
@@ -1298,8 +1296,8 @@ fn backward(
                 return Err("grad: RMS norm is not differentiable yet".to_string());
             }
             NodeKind::Linear { x, weight, bias } => {
-                // y = x·W + b over the last dim: dx = g·Wᵀ,
-                // dw = xᵀ·g (reduced over leading dims), db = Σ g.
+                // For y = x·W + b over the last dimension, dx = g·Wᵀ. Compute
+                // dw = xᵀ·g by reducing over leading dimensions. db = Σ g.
                 let wt = mk(NodeKind::Permute {
                     a: weight.clone(),
                     dims: vec![1, 0],
@@ -1389,10 +1387,10 @@ fn backward(
                 );
             }
             NodeKind::PositionEmbedding { weight, seq_len } => {
-                // dW: rows 0..seq_len-1 accumulate the cotangent, the
-                // rest stay zero — scatter-add of g into zeros_like(W)
-                // at rows arange(seq_len) (indexes padded to g's shape
-                // per the scatter contract).
+                // Rows 0..seq_len-1 of dW accumulate the cotangent. The other
+                // rows stay zero. Scatter-add g into zeros_like(W) at rows
+                // arange(seq_len), padding indexes to g's shape as required by
+                // the scatter contract.
                 let t = *seq_len;
                 let e = weight.shape[1];
                 let rows = mk(NodeKind::Arange {
@@ -1440,9 +1438,9 @@ fn backward(
                 beta,
                 scale,
             } => {
-                // Closed-form adjoint (RFC 0018 phase 4): one backward
-                // node, one picker per differentiable input — the
-                // SdpaBackward pattern.
+                // The closed-form adjoint from RFC 0018 phase 4 uses one
+                // backward node and one output picker for each differentiable
+                // input, following the SdpaBackward pattern.
                 let bw = mk(NodeKind::KdaBackward {
                     q: q.clone(),
                     k: k.clone(),
@@ -1474,7 +1472,7 @@ fn backward(
             }
             NodeKind::ShortConv1d { x, weight } => {
                 // dx is the full correlation of the cotangent with the
-                // (unflipped) weight; dw is the per-tap correlation of
+                // unflipped weight. dw is the per-tap correlation of the
                 // cotangent and input over the causal window.
                 accumulate(
                     x,
@@ -1511,9 +1509,9 @@ fn backward(
                         "grad: cursor-offset rotary embedding is not differentiable".to_string()
                     );
                 }
-                // y = R x with R orthogonal per position: dx = Rᵀ g,
-                // the same rotation with negated angles — a single
-                // semantic node (the fused kernel's sign flip).
+                // For y = R x with R orthogonal at each position, dx = Rᵀ g.
+                // This is the same rotation with negated angles. A sign flip in
+                // the fused kernel keeps it in one semantic node.
                 accumulate(
                     x,
                     mk(NodeKind::RotaryEmbeddingBackward {
@@ -1533,11 +1531,10 @@ fn backward(
                 dilation,
                 groups,
             } => {
-                // dX is the full convolution of the cotangent with the
-                // weight: a transposed convolution whose output_padding
-                // fills the stride remainder; since our forward is a
-                // correlation, the same unflipped weight is the adjoint
-                // kernel.
+                // dX is the full convolution of the cotangent with the weight.
+                // A transposed convolution's output_padding fills the stride
+                // remainder. The forward op is a correlation, so the adjoint
+                // kernel uses the same unflipped weight.
                 let out_pad = x.shape[2]
                     - ((g.shape[2] - 1) * stride + dilation * (w.shape[2] - 1) + 1 - 2 * padding);
                 accumulate(
@@ -1578,11 +1575,10 @@ fn backward(
                     - ((g.shape[2] - 1) * stride + dilation * (w.shape[2] - 1) + 1 - 2 * padding);
                 let out_pad_w = x.shape[3]
                     - ((g.shape[3] - 1) * stride + dilation * (w.shape[3] - 1) + 1 - 2 * padding);
-                // candle's conv_transpose2d takes a single output_padding;
-                // when the per-dim stride remainders differ, compute with
-                // the smaller one and append the missing strip explicitly
-                // — remainder strips beyond the full convolution are
-                // always zeros, so this is exact
+                // candle's conv_transpose2d accepts one output_padding. When the
+                // stride remainders differ by dimension, use the smaller one
+                // and append the missing strip. Strips beyond the full
+                // convolution are always zero, so this is exact.
                 let min_pad = out_pad_h.min(out_pad_w);
                 let mut dx = mk(NodeKind::ConvTranspose2d {
                     x: g.clone(),
@@ -1639,12 +1635,12 @@ fn backward(
                 return Err("grad: optimizer update nodes are not differentiable".to_string());
             }
             NodeKind::Checkpoint { a } => {
-                // Deep-copy the region's interior with fresh node ids and
-                // build the adjoint over the copy: forward intermediates
-                // are recomputed in the backward phase instead of being
-                // retained. Region inputs (nodes also reachable from
-                // outside the checkpoint) and constructor leaves are
-                // shared, so randn draws and constants are not re-run.
+                // Copy every interior node with a fresh ID and build the adjoint
+                // over the copy. The backward phase recomputes forward
+                // intermediates instead of retaining them. The transform shares
+                // region inputs reachable from outside the checkpoint and all
+                // constructor leaves. This prevents a second randn draw or
+                // constant construction.
                 let outside = outside_set(order, node.id);
                 let region_topo = topo(a);
                 let mut map: HashMap<u64, Arc<Node>> = HashMap::new();

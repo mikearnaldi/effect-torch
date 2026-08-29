@@ -1,11 +1,13 @@
-// Metal bf16 GEMM shape survey approximating the dominant projections of the
-// 30M FineWeb training step. CHAIN independent roots are submitted together to
-// amortize eager graph/compile overhead. Their shared a/b inputs remain lazy, so
-// each sample also executes fresh randn+bf16 input generation; `Tensor.compute`
-// completes the run and every output is then released. Reported GFLOP/s counts
-// GEMM arithmetic despite that extra work. `xN/step` is a rough hand-maintained
-// extrapolation, not a complete non-overlapping operation inventory or a measured
-// training step. ITERS and CHAIN are unvalidated environment overrides.
+// Surveys Metal bf16 GEMM shapes that approximate the main projections in the
+// 30M FineWeb training step. Each sample submits CHAIN independent roots
+// together. One submission shares eager graph and compilation overhead across
+// the roots. Their shared a/b inputs stay lazy, so each sample also generates
+// fresh randn+bf16 inputs. `Tensor.compute` waits for the run to finish. The
+// benchmark then releases every output. The GFLOP/s numerator counts GEMM
+// arithmetic.
+// `xN/step` is a rough, manually maintained extrapolation. It is not a complete
+// non-overlapping operation count or a measured training step. ITERS and CHAIN
+// pass through `Number` without validation.
 
 import * as BackendApple from "@effect-torch/backend-apple-native"
 import { type Runtime, Tensor } from "@effect-torch/core"
@@ -24,8 +26,8 @@ const bench = <A extends Tensor.Any>(
   perStep: number
 ): Effect.Effect<void, Tensor.TensorError, Runtime.Runtime> =>
   Effect.gen(function*() {
-    // Independent equal-shape roots share one compile/execute completion per
-    // sample; they are not a dependency chain.
+    // One compile/execute call completes all independent equal-shape roots in a
+    // sample. The roots do not form a dependency chain.
     const lazies = yield* Effect.forEach(
       Array.from({ length: CHAIN }),
       () => Tensor.matmul(a, b)
@@ -61,8 +63,8 @@ const program = Effect.gen(function*() {
   yield* gemm(256, BT, 768, 6, "qkv   [256,32k]x[32k,768]    dW")
   yield* gemm(BT, 1024, 256, 12, "fc/p2 [32k,1024]x[1024,256]  dX (fc+proj2)")
   yield* gemm(256, BT, 1024, 12, "fc/p2 [256,32k]x[32k,1024]  dW (fc+proj2)")
-  // Synthetic vocab-head projection split into 48 row chunks. This fixed count
-  // is not derived from the compiler's current EFFECT_TORCH_CE_CHUNK_SIZE.
+  // The synthetic vocab-head projection uses 48 row chunks. This fixed count
+  // does not follow the compiler's current EFFECT_TORCH_CE_CHUNK_SIZE.
   const rows = Math.ceil(BT / 48)
   yield* gemm(rows, 256, 50257, 48, `head  [${rows},256]x[256,50257] fwd x48`)
   yield* gemm(rows, 50257, 256, 48, `head  [${rows},50k]x[50k,256]  dX x48`)

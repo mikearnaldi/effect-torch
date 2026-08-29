@@ -1,8 +1,8 @@
-// Checkpoint-free plumbing smoke test: random initialized weights exercise
-// chunked prefill and eight stateful recurrent/KV advances. Each logits row used
-// to choose an advance must be finite. This validates inference specialization
-// and state updates, not model quality; generate.ts separately requires a bare
-// trained-parameter artifact.
+// Inference smoke test that does not need a checkpoint. Randomly initialized
+// weights run chunked prefill and eight stateful recurrent/KV decode steps. Each
+// logits row used to choose the next token must contain only finite values. This
+// checks inference specialization and state updates, not model quality.
+// generate.ts requires a trained bare-parameter artifact.
 import * as BackendApple from "@effect-torch/backend-apple-native"
 import { Model, Tensor } from "@effect-torch/core"
 import { NodeRuntime } from "@effect/platform-node"

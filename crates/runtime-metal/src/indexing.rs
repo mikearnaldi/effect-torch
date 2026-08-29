@@ -3,26 +3,23 @@
 //!
 //! # Conventions
 //!
-//! - **Strides baked in.** Input/output stride decompositions are emitted
-//!   as constant arithmetic over the flat thread id; pipeline keys hash
-//!   the exact layouts, so a layout change is a different kernel.
-//!   Destinations are contiguous; cat and the gather family consume
-//!   strided sources directly with no scratch copy.
-//! - **Index tensors.** Kernels read u32 indexes; other dtypes (or
-//!   non-contiguous index layouts) are converted by a layout-keyed
-//!   `et_index_convert` kernel into caller-provided `ids` scratch.
-//! - **scatter_add.** Runs in f32 with relaxed-order device atomics:
-//!   duplicate indexes accumulate in an unspecified (but lossless) order,
-//!   so results are deterministic in value for exact sums but not in
-//!   rounding. Non-f32 operands round-trip through f32 `accumulator` /
-//!   `source_cast` scratch.
-//! - **Requirements contract.** `*_requirements` report the exact output,
-//!   scratch, staging, and pipeline count; the `*_into` entry points
-//!   validate against them, require precompiled pipelines, and allocate
-//!   nothing.
-//! - **Dispatch.** One thread per output element (per source element for
-//!   scatter/cat), 256-wide threadgroups, 32-bit flat indexing — indexing
-//!   workloads are index-tensor sized, far from the u32 limit.
+//! - Input and output stride decompositions become constant arithmetic over
+//!   the flat thread id. Pipeline keys hash layouts, so each layout gets a
+//!   different kernel. Destinations are contiguous. Cat and gather operations
+//!   read strided sources without a scratch copy.
+//! - Kernels read u32 indexes. A layout-keyed `et_index_convert` kernel
+//!   converts other dtypes and non-contiguous index layouts into caller-owned
+//!   `ids` scratch.
+//! - `scatter_add` uses relaxed-order f32 device atomics. Duplicate indexes
+//!   accumulate in unspecified order. Exact sums keep the same value, but
+//!   floating-point rounding may differ. Non-f32 operands use f32
+//!   `accumulator` and `source_cast` scratch.
+//! - `*_requirements` report output, scratch, staging, and pipeline counts.
+//!   The `*_into` functions validate those requirements, require precompiled
+//!   pipelines, and allocate nothing.
+//! - Dispatch uses one thread per output element, or per source element for
+//!   scatter and cat, in 256-wide threadgroups with 32-bit flat indexes.
+//!   Indexing workloads are bounded by index tensor size and stay below u32.
 
 use super::device::{set_buffer, set_bytes, MetalDevice, Pipeline};
 use super::run::MetalTensor;
@@ -518,7 +515,7 @@ pub fn gather_requirements(
 }
 
 /// Exact resources for `scatter_add(input, dim, ids, source)`; non-f32
-/// dtypes additionally require the f32 accumulator and source cast.
+/// dtypes also require the f32 accumulator and source cast.
 pub fn scatter_add_requirements(
     input_layout: &Layout,
     input_dtype: DType,

@@ -1,32 +1,30 @@
 //! Node.js (napi-rs) bindings for the CPU runtime.
 //!
-//! Exported surface:
+//! The bindings export:
 //!
-//! - [`NativeTensor`]: a materialized CPU tensor held in a graph leaf slot.
-//!   Its byte size is tracked in `EXTERNAL_MEMORY_BYTES` and mirrored to V8's
-//!   external-memory accounting so the JS garbage collector sees tensor
-//!   pressure. [`NativeTensor::readback`] exports the bytes as a JS
-//!   `ArrayBuffer` — zero-copy when the buffer is large, contiguous, and not
-//!   already exported, otherwise through an owned copy.
-//! - [`LazyTensor`]: a lazy graph node; every method builds graph structure
-//!   without executing.
-//! - [`compile`]/[`Executable`]: compiles roots into a cached
-//!   `CpuExecutable` and runs it (async, on the tokio worker pool) with
+//! - [`NativeTensor`] is a materialized CPU tensor held in a graph leaf slot.
+//!   `EXTERNAL_MEMORY_BYTES` tracks its byte size and mirrors it to V8's
+//!   external-memory accounting. [`NativeTensor::readback`] exports a JS
+//!   `ArrayBuffer`. Large, contiguous buffers not previously exported use
+//!   zero-copy readback. Other buffers use an owned copy.
+//! - [`LazyTensor`] is a lazy graph node whose methods build graph structure
+//!   without running it.
+//! - [`compile`] and [`Executable`] compile roots into a cached
+//!   `CpuExecutable` and run it asynchronously on the tokio worker pool with
 //!   optional scalar bindings and cancellation.
-//! - [`CancellationToken`]: cooperative cancellation shared with the runtime
-//!   [`CancellationFlag`]; compute tasks poll it and abort with a
+//! - [`CancellationToken`] provides cooperative cancellation shared with the
+//!   runtime [`CancellationFlag`]. Compute tasks poll it and abort with a
 //!   `Cancelled` status.
-//! - [`NativeKvPool`]/[`NativeKvSequence`]: paged KV-cache management for
-//!   stateful decoding; the pool context implements `executable::CpuState`
-//!   to stage and commit cache updates transactionally.
-//! - `save_tensors`/`load_tensors` (safetensors) and
-//!   [`inspect_gguf`]/[`load_gguf`] (GGUF) archive IO.
+//! - [`NativeKvPool`] and [`NativeKvSequence`] manage paged KV caches for
+//!   stateful decoding. The pool context implements `executable::CpuState` to
+//!   stage and commit cache updates as a transaction.
+//! - `save_tensors` and `load_tensors` handle safetensors archives.
+//!   [`inspect_gguf`] and [`load_gguf`] handle GGUF archives.
 //!
-//! Readback safety: exported buffers either deep-copy into an owned
-//! allocation (`FinalizeHint::Owned`) or keep the source tensor alive and
-//! register the address so the same range is never exported twice
-//! (`FinalizeHint::ZeroCopy`); both are released exactly once by the
-//! napi finalizer.
+//! Exported buffers either deep-copy into an owned allocation with
+//! `FinalizeHint::Owned`, or use `FinalizeHint::ZeroCopy` to keep the source
+//! tensor alive and register its address. Registration prevents exporting the
+//! same range twice. The N-API finalizer releases either kind exactly once.
 
 mod err;
 mod gguf;
@@ -101,14 +99,14 @@ fn ggml_k_quant(value: &str) -> Result<GgmlKQuant> {
     })
 }
 
-/// How an exported readback buffer is released when V8 finalizes the
+/// Describes how to release an exported readback buffer when V8 finalizes its
 /// external `ArrayBuffer`.
 enum FinalizeHint {
-    /// The buffer aliases live tensor storage: dropping the clone releases
-    /// the tensor reference, and the address is unregistered so it may be
-    /// exported again.
+    /// The buffer aliases live tensor storage. Dropping the clone releases the
+    /// tensor reference and unregisters the address, allowing another export.
     ZeroCopy { value: Value, addr: usize },
-    /// The buffer is a leaked `Vec<u8>` copy to reconstruct and drop.
+    /// The buffer owns a leaked `Vec<u8>` copy that the finalizer reconstructs
+    /// and drops.
     Owned {
         ptr: *mut u8,
         len: usize,
@@ -116,18 +114,18 @@ enum FinalizeHint {
     },
 }
 
-/// napi finalize callback for external array buffers.
+/// N-API finalizer for external array buffers.
 ///
 /// # Safety
-/// Called by Node exactly once per external buffer, with the `hint` pointer
-/// produced by `Box::into_raw` in `to_napi_value`.
+/// Node must call this exactly once per external buffer. `hint` must be the
+/// pointer produced by `Box::into_raw` in `to_napi_value`.
 unsafe extern "C" fn finalize_readback(
     _env: napi::sys::napi_env,
     _data: *mut std::ffi::c_void,
     hint: *mut std::ffi::c_void,
 ) {
-    // SAFETY: `hint` came from `Box::into_raw` and this is its only
-    // reclamation point (see the call-site guard).
+    // SAFETY: `hint` came from `Box::into_raw`. The call-site guard makes
+    // this its only reclamation point.
     let hint = unsafe { Box::from_raw(hint as *mut FinalizeHint) };
     release_readback(*hint);
 }
@@ -140,7 +138,7 @@ fn release_readback(hint: FinalizeHint) {
         }
         FinalizeHint::Owned { ptr, len, cap } => {
             // SAFETY: `ptr/len/cap` came from a leaked `Vec<u8>` via
-            // `vec_to_bytes` and are reconstructed exactly once here.
+            // `vec_to_bytes`. The finalizer reconstructs them exactly once.
             drop(unsafe { Vec::from_raw_parts(ptr, len, cap) });
         }
     }
@@ -148,29 +146,28 @@ fn release_readback(hint: FinalizeHint) {
 
 /// Byte buffer returned to JS as an external `ArrayBuffer`.
 ///
-/// Owns the release plan for its bytes (`hint`); `Drop` releases eagerly if
-/// the value was never handed to napi.
+/// Owns the byte release plan in `hint`. `Drop` releases it immediately if
+/// the value never reaches N-API.
 pub struct Readback {
     data: *mut u8,
     byte_len: usize,
     hint: Option<FinalizeHint>,
 }
 
-// SAFETY: the raw pointer is only dereferenced by Node while the buffer is
-// alive; the hint keeps the backing storage (tensor clone or owned Vec)
-// alive until the finalizer runs, and all access is synchronized by the napi
-// runtime's env model.
+// SAFETY: Node dereferences the raw pointer only while the buffer is alive.
+// The hint keeps its tensor clone or owned Vec alive until the finalizer runs.
+// The N-API runtime's env model synchronizes all access.
 unsafe impl Send for Readback {}
 
-/// Releases the hint unless the napi call succeeded (signalled by nulling
-/// the pointer), so a failed `to_napi_value` cannot leak or double-free.
+/// Releases the hint unless a successful N-API call nulls the pointer. This
+/// prevents a failed `to_napi_value` from leaking or freeing twice.
 struct FinalizeHintGuard(*mut std::ffi::c_void);
 
 impl Drop for FinalizeHintGuard {
     fn drop(&mut self) {
         if !self.0.is_null() {
-            // SAFETY: non-null means ownership was never transferred to napi,
-            // so this is the sole reclamation.
+            // SAFETY: a non-null pointer means N-API never took ownership, so
+            // this is the only reclamation.
             let hint = unsafe { Box::from_raw(self.0 as *mut FinalizeHint) };
             release_readback(*hint);
         }
@@ -190,10 +187,9 @@ impl ToNapiValue for Readback {
     /// owns the release hint.
     ///
     /// # Safety
-    /// Upholds the napi value-conversion contract: the returned value keeps
-    /// `value.data` valid for its lifetime by moving the release hint into
-    /// the finalizer, and the hint is released exactly once on every path
-    /// (by the finalizer on success, by `hint_guard` on failure).
+    /// The returned value keeps `value.data` valid by moving the release hint
+    /// into the finalizer. The finalizer releases the hint once on success.
+    /// `hint_guard` releases it once on failure.
     unsafe fn to_napi_value(
         env: napi::sys::napi_env,
         mut value: Self,
@@ -207,9 +203,9 @@ impl ToNapiValue for Readback {
         let mut hint_guard = FinalizeHintGuard(hint);
         let mut result = std::ptr::null_mut();
         napi::check_status!(
-            // SAFETY: `env` is the live env of this conversion, `value.data`
-            // points to `value.byte_len` bytes kept alive by the hint, and
-            // the finalizer/hint pair is valid heap state.
+            // SAFETY: `env` is live for this conversion. `value.data` points
+            // to `value.byte_len` bytes kept alive by the hint. The finalizer
+            // and hint form valid heap state.
             unsafe {
                 napi::sys::napi_create_external_arraybuffer(
                     env,
@@ -444,9 +440,9 @@ fn executable_diagnostics(
 
 /// A materialized CPU tensor exported to JavaScript.
 ///
-/// Wraps the value in a graph [`LeafSlot`] so it can also feed compiled
-/// programs as a generated binding. The tracked byte size is mirrored into
-/// V8's external memory accounting on wrap, clear, and finalize.
+/// Wraps the value in a graph [`LeafSlot`] so it can feed compiled programs
+/// as a generated binding. Wrap, clear, and finalize mirror the tracked byte
+/// size to V8's external memory accounting.
 #[napi(custom_finalize)]
 pub struct NativeTensor {
     pub(crate) slot: Arc<LeafSlot>,
@@ -506,8 +502,8 @@ impl ObjectFinalize for NativeTensor {
 /// Cooperative cancellation handle shared with async compute tasks.
 ///
 /// `cancel()` sets the flag and wakes the tokio notifier so a blocked
-/// executor can abort promptly; kernels additionally poll the flag at loop
-/// granularity and return `Status::Cancelled` ("operation aborted").
+/// executor can abort. Kernels also poll the flag inside their loops
+/// and return `Status::Cancelled` with "operation aborted".
 #[napi]
 pub struct CancellationToken {
     state: Arc<CancellationState>,
@@ -737,8 +733,8 @@ fn readback_blocking(value: &Value) -> Result<Readback> {
     let byte_len = count * element_size;
     if !base.is_null() && byte_len <= 4096 {
         // SAFETY: the tensor view keeps the segment alive and covers
-        // `offset..offset + byte_len` initialized bytes (small tensors are
-        // always copied, never aliased into JS).
+        // `offset..offset + byte_len` initialized bytes. Small tensors are
+        // always copied and never aliased into JS.
         let bytes = unsafe { std::slice::from_raw_parts(base.add(offset), byte_len) }.to_vec();
         let (_, ptr, len, cap) = vec_to_bytes(bytes);
         return Ok(Readback {
@@ -865,11 +861,10 @@ fn chunked_head_ce_with(
     if chunks < 2 {
         return Ok(plain);
     }
-    // The semantic node: evaluation runs the chunk loop natively, so the
-    // [rows, vocab] logits never materialize whole, and the closed-form
-    // backward holds one chunk of grad-logits workspace at a time (the
-    // graph-chain version retained every chunk's workspace until the
-    // head-parameter roots ran).
+    // Evaluation runs the chunk loop directly, so it never materializes the
+    // full [rows, vocab] logits. The closed-form backward keeps one chunk of
+    // grad-logits workspace at a time. The graph-chain version kept every
+    // chunk's workspace until the head-parameter roots ran.
     Node::new(NodeKind::ChunkedHeadCe {
         x: x.clone(),
         weight: weight.clone(),
@@ -879,16 +874,16 @@ fn chunked_head_ce_with(
     })
 }
 
-/// A lazy CPU computation: a graph node handle whose methods build graph
-/// structure without executing. Materialize with `compile` + `execute`, or
-/// `grad` for reverse-mode gradients.
+/// A lazy CPU graph node whose methods build graph structure without running
+/// it. Materialize it with `compile` and `execute`. Use `grad` for
+/// reverse-mode gradients.
 #[napi]
 pub struct LazyTensor {
     node: Arc<Node>,
 }
 
-/// One named exposure discovered in a lazy graph: the name and the wrapped
-/// tensor handle (the exposure node's child).
+/// One named exposure in a lazy graph. Contains the name and wrapped tensor
+/// handle from the exposure node's child.
 #[napi]
 pub struct NativeExposure {
     name: String,
@@ -1668,9 +1663,9 @@ impl LazyTensor {
         }))
     }
 
-    /// Walks the lazy graph reachable from this node and returns every
-    /// exposure (name plus the wrapped tensor) in deterministic first-visit
-    /// order; duplicate names are a caller error.
+    /// Walks the lazy graph reachable from this node and returns each exposure's
+    /// name and wrapped tensor in deterministic first-visit order. Duplicate
+    /// names are a caller error.
     #[napi]
     pub fn exposures(&self) -> Result<Vec<NativeExposure>> {
         let mut seen = HashSet::new();
@@ -1804,14 +1799,14 @@ pub fn grad(loss: &LazyTensor, wrt: Vec<&LazyTensor>) -> Result<Vec<LazyTensor>>
         .collect())
 }
 
-/// Always `true`: the CPU backend is available on every target.
+/// Returns `true` because the CPU backend is available on every target.
 #[napi]
 pub fn is_available() -> bool {
     true
 }
 
-/// Runs a blocking compute closure on the napi worker pool, wiring the
-/// token's cancellation state (or a fresh one) and notify handle into it.
+/// Runs a blocking compute closure on the N-API worker pool. Passes it the
+/// token's cancellation state, or a new state, and the notify handle.
 async fn run_compute<T: Send + 'static>(
     token: Option<&CancellationToken>,
     compute: impl FnOnce(&CancellationFlag, &CancellationState) -> Result<T> + Send + 'static,
@@ -1824,8 +1819,8 @@ async fn run_compute<T: Send + 'static>(
 }
 
 /// Runs one stage of a larger transaction without completing the caller's
-/// one-shot cancellation arbitration. The transaction completes it only when
-/// all stages are ready to publish.
+/// one-shot cancellation arbitration. The transaction completes arbitration
+/// only after all stages are ready to publish.
 async fn run_compute_pending<T: Send + 'static>(
     token: Option<&CancellationToken>,
     compute: impl FnOnce(&CancellationFlag, &CancellationState) -> Result<T> + Send + 'static,
@@ -1972,10 +1967,10 @@ fn generated_match(values: &[Value], expected: &[GeneratedBindingSignature]) -> 
         })
 }
 
-/// A compiled CPU program exported to JavaScript. Executables are cached by
-/// structural hash (see `ProgramCache`, LRU-bounded at 64 entries) so
-/// repeated compiles of the same graph reuse the artifact; generated
-/// bindings are re-validated against cached signatures on each hit.
+/// A compiled CPU program exported to JavaScript. `ProgramCache` stores up to
+/// 64 executables in an LRU cache keyed by structural hash. Compiling the same
+/// graph reuses the cached artifact. Each hit revalidates generated bindings
+/// against the cached signature.
 #[napi]
 #[derive(Clone)]
 pub struct Executable {
@@ -2231,9 +2226,9 @@ fn resolve_compile_options(native: Option<NativeCompileOptions>, stateful: bool)
     options
 }
 
-/// Compiles lazy roots into an [`Executable`]. With a KV `state` schema the
-/// graph is first specialized for decode (paged KV attention, state cursor),
-/// then compiled with the state plan baked in. `cache_key` opts into the
+/// Compiles lazy roots into an [`Executable`]. A KV `state` schema first
+/// specializes the graph for paged KV attention and a state cursor, then
+/// includes that state plan in the executable. `cache_key` enables the
 /// process-wide executable cache.
 #[napi]
 pub fn compile(
@@ -2432,8 +2427,8 @@ pub fn compile(
     })
 }
 
-/// Serializes tensors to a safetensors archive (atomically, via a temporary
-/// file + rename), with names validated for uniqueness.
+/// Serializes tensors to a safetensors archive. Writes a temporary file and
+/// renames it atomically after validating that names are unique.
 #[napi]
 pub async fn save_tensors(
     path: String,
@@ -2493,7 +2488,7 @@ pub struct NativeSafetensorsEntry {
     pub tensor: NativeTensor,
 }
 
-/// A loaded safetensors archive: entries sorted by name plus metadata.
+/// A loaded safetensors archive with entries sorted by name and metadata.
 #[napi(object, object_from_js = false)]
 pub struct NativeSafetensorsArchive {
     pub entries: Vec<NativeSafetensorsEntry>,
@@ -2530,8 +2525,8 @@ pub async fn load_tensors(
     .await
 }
 
-/// Total bytes currently attributed to live [`NativeTensor`]s (the value
-/// mirrored into V8's external memory accounting).
+/// Total bytes attributed to live [`NativeTensor`] values. V8's external
+/// memory accounting mirrors this value.
 #[napi]
 pub fn external_memory_bytes() -> i64 {
     EXTERNAL_MEMORY_BYTES.load(Ordering::Relaxed)
@@ -2833,8 +2828,8 @@ struct SeqState {
     advance: usize,
     last_hash: u64,
     pending: Vec<u32>,
-    // Per-layer recurrent state is allocated when the sequence is created:
-    // [H, Dk, Dv] f32 per KDA layer and [K-1, C] f32 per short-conv layer.
+    // Sequence creation allocates per-layer recurrent state: [H, Dk, Dv] f32
+    // per KDA layer and [K-1, C] f32 per short-conv layer.
     kda_states: Vec<Tensor>,
     conv_states: Vec<Tensor>,
 }
@@ -2864,9 +2859,9 @@ impl SeqState {
     }
 }
 
-/// Per-execution decode context: the [`executable::CpuState`]
-/// implementation that stages KV/KDA/conv updates during `run_command` and
-/// publishes them on `commit` (dropping staged work on `rollback`).
+/// Per-execution decode context implementing [`executable::CpuState`]. It
+/// stages KV, KDA, and convolution updates during `run_command`, publishes
+/// them on `commit`, and drops staged work on `rollback`.
 struct KvContext {
     pool: Arc<PoolInner>,
     slots: Vec<Option<Arc<Mutex<SeqState>>>>,
@@ -3007,8 +3002,8 @@ impl executable::CpuState for Arc<KvContext> {
                 return Err("decode cursor staging must use i64".to_string());
             }
             // SAFETY: the cursor staging value belongs to this invocation's
-            // exclusive planned staging range; `begin` runs before any
-            // command reads it.
+            // exclusive planned staging range. `begin` runs before any command
+            // reads it.
             let mut destination = unsafe { CpuDestination::from_planned(value.tensor()) };
             destination.write::<i64, _>("decode cursor", &value.shape(), |output| {
                 if output.len() == 1 && graph_cursors.len() == 1 {
@@ -4014,11 +4009,10 @@ fn kv_evict(pool: &PoolInner, state: &mut SeqState, start: usize) {
 
 /// Paged KV-cache pool for stateful decoding.
 ///
-/// The pool owns per-layer key/value slabs (`f32`, `f16`, `bf16`, or
-/// int8-quantized `u8`) of `max_tokens` positions, allocated to sequences in
-/// `block_size` pages with prefix-hash sharing (identical token prefixes
-/// reuse cached blocks). Optional recurrent (KDA) and convolution state
-/// geometry is validated and allocated alongside.
+/// The pool owns per-layer key and value slabs of `max_tokens` positions in
+/// `f32`, `f16`, `bf16`, or int8-quantized `u8`. Sequences lease
+/// `block_size` pages. Identical token prefixes share cached blocks. The pool
+/// also validates and allocates optional recurrent KDA and convolution state.
 #[napi]
 pub struct NativeKvPool {
     inner: Arc<PoolInner>,
@@ -4026,9 +4020,9 @@ pub struct NativeKvPool {
 
 #[napi]
 impl NativeKvPool {
-    /// Creates a pool; geometries must be consistent (all-zero or
-    /// all-positive) and `max_tokens` a positive multiple of `block_size`
-    /// (default 16).
+    /// Creates a pool. Geometries must be all zero or all positive.
+    /// `max_tokens` must be a positive multiple of `block_size`, whose
+    /// default is 16.
     #[napi(constructor)]
     pub fn new(
         layers: u32,
@@ -4162,10 +4156,10 @@ impl NativeKvPool {
     }
 }
 
-/// One decode sequence's handle into a [`NativeKvPool`]: leased blocks, the
-/// committed cursor, pending tokens, and recurrent/conv state. Blocks are
-/// returned to the pool exactly once — on `release`, drop, or JS finalize —
-/// and `run_lock` serializes execution against release.
+/// One decode sequence's handle into a [`NativeKvPool`]. It holds leased
+/// blocks, the committed cursor, pending tokens, and recurrent or convolution
+/// state. `release`, drop, or JS finalization returns blocks to the pool
+/// exactly once. `run_lock` serializes execution against release.
 #[napi(custom_finalize)]
 pub struct NativeKvSequence {
     pool: Arc<PoolInner>,
@@ -4805,10 +4799,10 @@ impl Executable {
 
     /// Runs the program asynchronously on the worker pool.
     ///
-    /// Stateless executables take `inputs` (+ `scalars`); stateful (decode)
-    /// executables additionally take one [`NativeKvSequence`] and its new
-    /// tokens per batch lane, run under a `CpuState` transaction, and
-    /// commit cache updates only if not cancelled. Cancellation yields
+    /// Stateless executables take `inputs` and optional `scalars`. Stateful
+    /// decode executables also take one [`NativeKvSequence`] and its new tokens
+    /// for each batch lane. They run under a `CpuState` transaction and commit
+    /// cache updates only if not cancelled. Cancellation returns
     /// `Status::Cancelled` and leaves all sequence state uncommitted.
     #[napi]
     pub async fn execute(
@@ -4873,7 +4867,7 @@ impl Executable {
     }
 
     /// Runs a stateful program and samples its active outputs before committing
-    /// the sequence transaction. No output tensor wrappers are published.
+    /// the sequence transaction. Does not publish output tensor wrappers.
     #[napi]
     pub async fn execute_sampled(
         &self,
@@ -6660,8 +6654,8 @@ struct InferencePrograms {
     token_dtype: DType,
     #[allow(dead_code)]
     default_sampling: SamplingOptions,
-    // Phase 3 foundation only: sessions do not orchestrate this plan yet. Keeping
-    // it here makes validation and retention atomic with the exact-chain bundle.
+    // Sessions do not orchestrate this stage plan yet. Storing it here keeps
+    // validation and retention atomic with the exact-chain bundle.
     #[allow(dead_code)]
     proposer_plan: Option<ValidatedProposerPlan>,
     history_lookup: Option<HistoryLookupConfig>,
@@ -7597,8 +7591,9 @@ fn batch_size_from(executable: &Executable) -> Result<usize> {
 }
 
 /// Executes the stateless subset of a validated stage DAG with direct `Value`
-/// bindings. This is the future ParallelBlock/SequentialHead orchestration hook;
-/// stateful and external token/history routes remain session responsibilities.
+/// bindings. ParallelBlock and SequentialHead orchestration can call this
+/// function. Sessions still handle stateful and external token or history
+/// routes.
 #[allow(dead_code)]
 fn execute_stateless_stage_dag(
     plan: &ValidatedProposerPlan,
@@ -9635,7 +9630,7 @@ impl NativeInferenceSession {
                 budget,
                 eos: eos_tokens[index].clone(),
                 terminal: terminal.clone(),
-                // Admission overrides apply only to the first page; later
+                // Admission overrides apply only to the first page. Later
                 // rounds resolve sparse overrides from artifact defaults.
                 sampling: self.inner.programs.default_sampling,
             });

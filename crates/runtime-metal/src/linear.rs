@@ -1,30 +1,29 @@
-//! Fused linear layer on Metal: y = x·W + b in one gemm launch (the
-//! addmm epilogue — bias rides the kernel's C source with ldc = 0,
-//! broadcast over rows and batch) instead of matmul + broadcast-add.
-//! CPU falls back to composed ops at the call site.
+//! Fused linear layer on Metal. It computes y = x·W + b in one gemm launch
+//! instead of a matmul and broadcast add. The addmm epilogue uses the kernel's
+//! C source for bias with `ldc = 0`, broadcasting it over rows and batches.
+//! CPU uses composed operations.
 //!
 //! ## Kernel contract
 //!
-//! - `x` is `[.., M, K]`, `weight` is `[K, N]` (row-major, transposed
-//!   view of the usual `[N, K]` linear weight), `bias` is `[N]`.
-//! - The fused variants additionally select a gemm epilogue: a residual
-//!   add (same-shape C source) or a gelu (erf or tanh approximation),
-//!   optionally dual-storing the pre-activation into a second output
-//!   for the backward pass.
-//! - All dispatch goes through the tiled gemm machinery (`gemm` module)
-//!   including its split-K scratch path when selected by the planner.
+//! - `x` is `[.., M, K]`, `weight` is `[K, N]`, and `bias` is `[N]`.
+//!   The weight is a row-major transposed view of the usual `[N, K]` linear
+//!   weight.
+//! - Fused variants can add a same-shape residual or apply gelu with the erf or
+//!   tanh approximation. They can also write the pre-activation to a second
+//!   output for backward.
+//! - Dispatch uses the tiled gemm implementation, including split-K scratch
+//!   when the planner selects it.
 //!
-//! ## Requirements protocol
+//! ## Requirements
 //!
-//! `linear_*_requirements` computes the exact shapes, epilogue, and
-//! gemm plan for a call; `precompile_*` warms every pipeline the plan
-//! needs; the `*_into` entry points then validate their arguments
-//! against the requirements and allocate nothing on the device, which
-//! is what allows them to run inside an executable dispatch section.
+//! `linear_*_requirements` computes shapes, the epilogue, and the gemm plan.
+//! `precompile_*` warms each required pipeline. The `*_into` functions
+//! validate their arguments and allocate nothing, so executable dispatch can
+//! call them.
 
 use crate::runtime::metal::run::MetalTensor;
 
-/// Whether the fused linear path can run: Metal, f32, 2-D weight.
+/// Returns whether Metal supports the input dtype and rank-2 weight.
 pub fn is_supported(x: &MetalTensor, weight: &MetalTensor) -> bool {
     matches!(
         x.dtype,
@@ -48,10 +47,8 @@ mod metal {
     use crate::runtime::metal::gemm::{self, Epilogue, GemmRequirements, SplitKScratchRequirement};
     use crate::runtime::metal::run::MetalTensor;
 
-    /// Exact, precomputed plan for one fused linear launch: problem
-    /// dims, epilogue, and the underlying gemm requirements (including
-    /// optional split-K scratch). Produced by [`linear_requirements`]
-    /// and consumed by the `precompile_*`/`*_into` entry points.
+    /// Precomputed plan for one fused linear launch, including dimensions,
+    /// epilogue, gemm requirements, and optional split-K scratch.
     #[derive(Clone, Copy, PartialEq, Eq, Debug)]
     pub struct LinearRequirements {
         /// Element dtype shared by input, weight, bias, and output.
@@ -82,9 +79,8 @@ mod metal {
         pub gemm: GemmRequirements,
     }
 
-    /// Plans a fused linear `y = x·W + b` (plus `epilogue`) for the
-    /// given shapes, validating ranks and the K-dim match. `mma`
-    /// requests the tensor-core gemm path when available.
+    /// Plans `y = x·W + b` with the given `epilogue`. It validates ranks
+    /// and K dimensions. Set `mma` to request tensor-core gemm when available.
     pub fn linear_requirements(
         dev: &MetalDevice,
         x_shape: &[usize],
@@ -309,8 +305,7 @@ mod metal {
         )
     }
 
-    /// Allocating convenience wrapper for the plain linear; used
-    /// outside planned executables.
+    /// Allocates output for a plain linear outside planned executables.
     pub fn linear_forward(
         x: &MetalTensor,
         weight: &MetalTensor,

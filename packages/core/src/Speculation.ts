@@ -1,5 +1,6 @@
 /**
- * High-level speculative decoding artifacts.
+ * Defines autoregressive, history lookup, and parallel block proposers for
+ * speculative decoding.
  *
  * TypeScript describes the proposer and builds its Tensor graphs. Model
  * inference traces those graphs and lowers the selected variant to Runtime

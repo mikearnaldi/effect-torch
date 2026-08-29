@@ -1,11 +1,12 @@
 /**
- * Eager runtime loader for the tokenizer Node-API addon.
+ * Runtime loader for the tokenizer Node-API addon.
  *
- * Importing this module validates the published host matrix, derives one
- * package-local binary name, and loads it with `require`. There is no download,
- * source-build, WebAssembly, or pure-JavaScript fallback. Selection and loading
- * errors therefore occur during module evaluation rather than in an Effect.
- * `native-addon.ts` supplies only the compile-time shape of the loaded value.
+ * Importing this module checks the supported platforms and architectures. It
+ * chooses a package-local binary and loads it with `require`. It does not
+ * download or build a binary. It has no WebAssembly or pure-JavaScript fallback.
+ * Selection and loading errors occur during module evaluation, outside an
+ * Effect.
+ * The generated `native-addon.d.ts` declares the loaded value's TypeScript type.
  *
  * @internal
  */
@@ -27,21 +28,23 @@ if (process.arch !== "arm64" && process.arch !== "x64") {
   )
 }
 
+// SAFETY: Node diagnostic reports expose header.glibcVersionRuntime, though @types/node returns object.
 const report = process.report.getReport() as {
   readonly header?: { readonly glibcVersionRuntime?: string }
 }
-// Linux hosts reporting a glibc runtime select GNU; every other Linux host is
-// classified as musl. The package publishes both variants for arm64 and x64.
+// Linux hosts that report a glibc runtime use GNU. Other Linux hosts use musl.
+// The package includes both variants for arm64 and x64.
 const target = process.platform === "darwin"
   ? `darwin-${process.arch}`
   : `linux-${process.arch}-${report.header?.glibcVersionRuntime === undefined ? "musl" : "gnu"}`
-// This resolves to the package's dist/internal directory both from source and
-// from the compiled dist/internal/native.js. The selected file must exist and
-// be loadable by the current Node-API runtime.
+// This resolves to the package's dist/internal directory from both source and
+// compiled dist/internal/native.js. The file must exist, and the current
+// Node-API runtime must be able to load it.
 const binary = new URL(
   `../../dist/internal/effect-torch-tokenizers.${target}.node`,
   import.meta.url
 )
 
-/** The eagerly loaded runtime addon, typed by the private ABI declaration. @internal */
+/** Runtime addon loaded during import and typed by the private ABI declaration. @internal */
+// SAFETY: the selected package binary is generated with the NativeAddon Node-API exports.
 export default require(fileURLToPath(binary)) as NativeAddon

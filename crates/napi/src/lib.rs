@@ -1,21 +1,20 @@
-//! N-API support utilities: cooperative cancellation of blocking compute
-//! and ownership hand-off of Rust buffers to JavaScript.
+//! Utilities for cooperative cancellation of blocking N-API work and for
+//! transferring Rust buffer ownership to JavaScript.
 //!
-//! Cancellation model: JS-facing async operations share a
-//! [`CancellationState`] between the caller (who may cancel) and the worker
-//! (who completes). Exactly one side wins — a completed operation returns
-//! its result even if a cancel raced in afterwards, and a cancelled
-//! operation discards its result and reports `Status::Cancelled`. The state
-//! is a one-shot: neither `cancel` nor `complete` has any effect once the
-//! other has committed.
+//! The caller and worker for a JS-facing async operation share a
+//! [`CancellationState`]. The caller can cancel the operation. The worker can
+//! complete it. The first transition wins. If completion wins, the operation
+//! returns its result even when cancellation races with it or arrives later.
+//! If cancellation wins, the worker drops the result and reports
+//! `Status::Cancelled`. The state is one-shot. `cancel` and `complete` cannot
+//! change it after either method commits.
 //!
-//! Buffer ownership: [`vec_to_bytes`] leaks a `Vec`'s allocation so it can
-//! be wrapped in a JS `Buffer`/`ArrayBuffer` whose finalizer later
-//! reconstructs and drops the `Vec`. The debug-only export registry
-//! ([`try_register_export`]/[`unregister_export`]) detects double-exports of
-//! one allocation during development; in release builds the registration is
-//! compiled out and correctness rests on each leaked allocation being
-//! exported exactly once.
+//! [`vec_to_bytes`] leaks a `Vec` allocation so the caller can wrap it in a
+//! JavaScript `Buffer` or `ArrayBuffer`. The buffer's finalizer must
+//! reconstruct and drop the `Vec`. In debug builds,
+//! [`try_register_export`] and [`unregister_export`] detect attempts to
+//! export one allocation twice. Release builds omit this registry, so callers
+//! must export each leaked allocation exactly once.
 
 use effect_torch_runtime::CancellationFlag;
 use napi::{Error, Result, Status};
@@ -26,12 +25,13 @@ use std::sync::Arc;
 #[cfg(debug_assertions)]
 use std::sync::{Mutex, OnceLock};
 
-/// One-shot cancellation/commit arbitration for a single async operation.
+/// Coordinates cancellation and completion for one async operation.
 ///
-/// `phase` encodes the lifecycle: `0` = in flight, `1` = cancelled,
-/// `2` = completed. Transitions happen only from `0`, so the first of
-/// [`CancellationState::cancel`] and [`CancellationState::complete`] to
-/// commit wins and the loser observes the winner's phase.
+/// `phase` stores the lifecycle state. `0` means in flight, `1` means
+/// cancelled, and `2` means completed. Only a transition from `0` can
+/// commit. The first call to [`CancellationState::cancel`] or
+/// [`CancellationState::complete`] that commits wins. A losing call reads the
+/// committed phase.
 pub struct CancellationState {
     cancelled: CancellationFlag,
     phase: AtomicU8,
@@ -45,14 +45,14 @@ impl CancellationState {
         }
     }
 
-    /// The cooperative flag compute loops poll between chunks of work.
+    /// Returns the cooperative flag that compute loops poll between chunks.
     pub fn flag(&self) -> &CancellationFlag {
         &self.cancelled
     }
 
-    /// Attempts to cancel the operation. Returns `true` for the caller that
-    /// actually committed the cancellation; `false` if the operation already
-    /// completed or was already cancelled.
+    /// Attempts to cancel the operation. Returns `true` only when this call
+    /// commits cancellation. Returns `false` if the operation completed or
+    /// another call already cancelled it.
     pub fn cancel(&self) -> bool {
         if self
             .phase
@@ -66,10 +66,10 @@ impl CancellationState {
         }
     }
 
-    /// Attempts to commit the operation's result. Returns `true` when the
-    /// result should be delivered (this call committed, or completion
-    /// already won); `false` when cancellation won and the result must be
-    /// discarded.
+    /// Attempts to commit the operation's result. Returns `true` if this call
+    /// commits completion or another completion call already won. Returns
+    /// `false` if cancellation won, in which case the caller must discard the
+    /// result.
     pub fn complete(&self) -> bool {
         match self
             .phase
@@ -88,17 +88,17 @@ impl Default for CancellationState {
     }
 }
 
-/// Runs blocking `compute` on a blocking thread and races it against an
-/// optional external cancellation notification.
+/// Runs the blocking `compute` closure on a blocking thread and races its
+/// result against an optional external cancellation notification.
 ///
-/// The compute closure receives the cooperative flag and the state; when it
-/// returns, [`CancellationState::complete`] arbitrates the outcome — a
-/// cancelled operation's result is dropped and `Status::Cancelled` is
-/// reported instead. With `notify` present, whichever of the worker
-/// finishing or the notification firing comes first decides the await's
-/// result; the biased select prefers a finished worker so a same-instant
-/// completion is not lost to a late notification. The worker is always
-/// awaited before returning, so no detached compute outlives the call.
+/// `compute` receives the cooperative flag and shared state. After it
+/// returns, [`CancellationState::complete`] chooses the outcome. If
+/// cancellation won, the worker drops the result and reports
+/// `Status::Cancelled`. When `notify` is present, its signal races worker
+/// completion. Whichever becomes ready first determines the result. If both
+/// are ready, the biased select checks the worker first and returns its
+/// result. The function awaits the worker in every branch, so `compute`
+/// cannot outlive the call.
 pub async fn run_compute<T: Send + 'static>(
     state: Arc<CancellationState>,
     notify: Option<Arc<tokio::sync::Notify>>,
@@ -133,22 +133,24 @@ pub async fn run_compute<T: Send + 'static>(
     }
 }
 
-/// Converts a worker-task join failure (panic or abort) into a N-API error.
+/// Converts a worker task's join error from a panic or abort into an N-API
+/// error.
 pub fn to_join_error(error: tokio::task::JoinError) -> Error {
     Error::new(Status::GenericFailure, error.to_string())
 }
 
-/// Debug-build registry of exported buffer base addresses, used to assert
-/// the exactly-once export contract (see the module documentation).
+/// Stores exported buffer base addresses in debug builds to detect attempts
+/// to export one allocation twice.
 #[cfg(debug_assertions)]
 fn exported_buffers() -> &'static Mutex<HashSet<usize>> {
     static BUFFERS: OnceLock<Mutex<HashSet<usize>>> = OnceLock::new();
     BUFFERS.get_or_init(|| Mutex::new(HashSet::new()))
 }
 
-/// Registers an allocation base address as exported to JS. Returns `false`
-/// in debug builds when the address is already exported (a double-export
-/// bug); release builds always succeed and perform no bookkeeping.
+/// Registers an allocation's base address as exported to JavaScript. In debug
+/// builds, it returns `false` for an address already in the registry because
+/// the caller tried to export one allocation twice. In release builds, it
+/// skips the registry and returns `true`.
 pub fn try_register_export(addr: usize) -> bool {
     #[cfg(debug_assertions)]
     {
@@ -161,7 +163,7 @@ pub fn try_register_export(addr: usize) -> bool {
     }
 }
 
-/// Marks an exported allocation as reclaimed by its JS finalizer.
+/// Records that a JavaScript finalizer reclaimed an exported allocation.
 pub fn unregister_export(addr: usize) {
     #[cfg(debug_assertions)]
     exported_buffers().lock().unwrap().remove(&addr);
@@ -169,19 +171,22 @@ pub fn unregister_export(addr: usize) {
     let _ = addr;
 }
 
-/// Leaks a `Vec`'s allocation for hand-off to JavaScript, returning the
-/// base address (for the export registry), the raw byte pointer, the live
-/// byte length, and the byte capacity.
+/// Leaks a `Vec` allocation so JavaScript can take ownership. Returns the
+/// base address for the export registry, the raw byte pointer, the live byte
+/// length, and the byte capacity.
 ///
-/// SAFETY: this is an ownership transfer out of Rust's tracking. The caller
-/// must guarantee that (1) the returned pointer/length/capacity are used to
-/// reconstruct exactly one `Vec<T>` — typically via `Vec::from_raw_parts` in
-/// the JS buffer's finalizer — and drop it exactly once; (2) the allocation
-/// is not accessed through Rust while JS owns it; and (3) `T`'s element
-/// layout is what the JS side expects, since the pointer is type-erased to
-/// bytes. Violating exactly-once reconstruction is a leak (never reclaimed)
-/// or a double-free (reclaimed twice); the debug export registry exists to
-/// catch the double-export half of this contract.
+/// SAFETY: This transfers ownership outside Rust's tracking. The caller must:
+///
+/// 1. Reconstruct exactly one `Vec<T>` from the returned pointer, length, and
+///    capacity, then drop it exactly once. A JavaScript buffer finalizer can
+///    do this with `Vec::from_raw_parts`.
+/// 2. Do not access the allocation through Rust while JavaScript owns it.
+/// 3. Make sure `T`'s element layout matches what JavaScript expects. The
+///    returned byte pointer erases the element type.
+///
+/// If the caller never reconstructs the `Vec`, the allocation leaks.
+/// Reconstructing it more than once causes a double-free. The debug export
+/// registry catches attempts to export the same allocation twice.
 pub fn vec_to_bytes<T>(mut vec: Vec<T>) -> (usize, *mut u8, usize, usize) {
     let ptr = vec.as_mut_ptr().cast::<u8>();
     let len = std::mem::size_of_val(vec.as_slice());

@@ -15,21 +15,21 @@ import {
   windows
 } from "./model.js"
 
-// Longer hybrid-KDA training uses `CKPT` as a mutable resumable archive,
-// rewritten after every chunk. Without it, bare `CHECKPOINT` parameters
-// warm-start fresh AdamW and sampler state. `OUT` receives final bare
-// parameters; by default `OUT === CHECKPOINT`, while `CKPT` remains separate.
-// Future reshuffles are not reproducible because Math.random state is not persisted.
+// `CKPT` stores resumable training state. The script rewrites it after every chunk.
+// Without it, bare `CHECKPOINT` parameters start with fresh AdamW and sampler
+// state. `OUT` receives the final bare parameters. By default,
+// `OUT === CHECKPOINT` and `CKPT` remains separate. Future reshuffles are not
+// reproducible because checkpoints do not save Math.random state.
 //
-// By default the run covers every complete batch in one permutation and the
-// warmup/cosine schedule spans that count. FINEWEB_STEPS overrides both the run
-// and schedule horizon, so it may stop early or cross an epoch boundary.
-// Precision defaults to mixedBf16; FINEWEB_PRECISION=f32 opts out. This casts
-// forward parameters at the model boundary while retaining f32 master weights
-// and optimizer state; it is not general autocast or loss scaling. The precision
-// environment value is asserted rather than parsed, so unknown strings currently
-// fall through to f32 behavior. Numeric overrides likewise lack early validation.
-// A completed `CKPT` remains present and takes precedence on the next invocation.
+// By default, the run covers every complete batch in one permutation. The
+// warmup and cosine schedule use the same step count. FINEWEB_STEPS overrides
+// both counts, so training may stop before an epoch ends or continue into the
+// next one. Precision defaults to mixedBf16. FINEWEB_PRECISION=f32 disables it.
+// mixedBf16 casts forward parameters at the model boundary but keeps f32 master
+// weights and optimizer state. It does not enable general autocast or loss
+// scaling. Values other than mixedBf16 use f32 behavior. The script parses
+// FINEWEB_BATCH and FINEWEB_STEPS with Number but does not validate them early.
+// An existing `CKPT` takes precedence on the next run.
 
 const TRAIN_BIN = new URL("../data/fineweb-train.bin", import.meta.url).pathname
 const VAL_BIN = new URL("../data/fineweb-val.bin", import.meta.url).pathname
@@ -41,7 +41,10 @@ const PEAK_LR = 3e-4
 const MIN_LR = 3e-5
 const WARMUP_FRACTION = 0.005
 const CHECKPOINT_EVERY = 100
-const PRECISION: Trainer.Precision = (process.env.FINEWEB_PRECISION as Trainer.Precision) ?? "mixedBf16"
+const PRECISION: Trainer.Precision = process.env.FINEWEB_PRECISION === undefined ||
+    process.env.FINEWEB_PRECISION === "mixedBf16"
+  ? "mixedBf16"
+  : "f32"
 const VAL_BATCHES = 40
 
 const formatEta = (ms: number) => {
@@ -83,10 +86,9 @@ const program = Effect.gen(function*() {
     stop: ({ step }) => step >= chunkTarget,
     precision: PRECISION,
     onStep: ({ step, loss, elapsed }) => {
-      // ETA from the mean step time since the epoch began, excluding
-      // the first step seen (its compile overhead would skew
-      // the average); the clock is continuous across checkpoint chunks
-      // via Resume.startedAt.
+      // Estimate ETA from the mean elapsed time per step. Exclude the first
+      // observed step because it includes compilation. Resume.startedAt keeps
+      // elapsed time continuous across checkpoint chunks in this process.
       const ms = Duration.toMillis(elapsed)
       if (firstStep === undefined) firstStep = { step, ms }
       const done = step - firstStep.step
@@ -100,9 +102,9 @@ const program = Effect.gen(function*() {
     }
   })
 
-  // The resumable archive wins over the pilot artifact. Without it, loading
-  // bare pilot parameters deliberately creates fresh optimizer and sampler
-  // state; random model initialization is only the final fallback.
+  // Use the resumable archive before the bare pilot artifact. Loading bare
+  // parameters starts fresh optimizer and sampler state. If neither file
+  // exists, initialize random model parameters.
   let params: Model.Params
   let step = 0
   let resume: Trainer.Resume<Optimizer.AdamState> | undefined
@@ -129,8 +131,8 @@ const program = Effect.gen(function*() {
   )
 
   let chunkTarget = Math.min(step + CHECKPOINT_EVERY, totalSteps)
-  // One elapsed clock is carried across chunks in this process. Checkpoint
-  // persistence omits `startedAt`, so a process restart starts a new ETA clock.
+  // Reuse one elapsed-time origin across chunks in this process. Checkpoints
+  // omit `startedAt`, so restarting the process resets the ETA clock.
   const epochStartedAt = resume?.startedAt ?? Date.now()
   if (resume !== undefined) resume = { ...resume, startedAt: epochStartedAt }
   while (step < totalSteps) {
@@ -143,10 +145,10 @@ const program = Effect.gen(function*() {
     yield* Checkpoint.saveWithSampler(CKPT, trainer, trained, sampler)
     yield* Effect.log(`checkpoint at step ${step}`)
     chunkTarget = Math.min(step + CHECKPOINT_EVERY, totalSteps)
-    // Concrete params/state supplied to a chunk remain caller-owned after the
-    // trainer returns replacements. Release those roots exactly once instead
-    // of leaving GB-scale generations to native finalizers; lazy roots from a
-    // cold initialization are skipped.
+    // The caller retains ownership of concrete parameters and state passed to a
+    // chunk. Clear stale roots once after the trainer returns replacements
+    // instead of waiting for native finalizers. Skip lazy roots from a cold
+    // initialization.
     const stale = new Set([
       ...previous.filter(Tensor.isTensor),
       ...(previousState !== undefined ? optimizer.stateRoots(previousState).filter(Tensor.isTensor) : [])

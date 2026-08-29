@@ -1,9 +1,9 @@
-// Ordinary and exact-chain sampled-generation latency through fixed lanes.
-// Compilation and prompt prefill are outside the timer. One untimed step warms
-// backend pipelines; measured rounds report latency percentiles, throughput,
-// acceptance, native phase timings, and pool pressure. Set CONTEXT to select a
-// prompt length, CONCURRENCY to select simultaneous sessions, and ITERS to
-// control the measured round count.
+// Measures ordinary and exact-chain sampled-generation latency through fixed
+// lanes. The timer excludes compilation and prompt prefill. One untimed step
+// warms backend pipelines. Measured rounds report latency percentiles,
+// throughput, acceptance, native phase timings, and pool high-water marks.
+// CONTEXT sets the prompt length, CONCURRENCY sets the number of simultaneous
+// sessions, and ITERS sets the measured round count.
 
 import * as BackendApple from "@effect-torch/backend-apple-native"
 import * as BackendCpu from "@effect-torch/backend-cpu"
@@ -50,9 +50,9 @@ const suite = Effect.gen(function*() {
         prefillChunks: [16],
         batchSize,
         sampling: { temperature: 0.8, topK: 64, topP: 0.95, seed: 0 },
-        ...(mode.proposer === undefined
-          ? {}
-          : { speculation: { proposer: mode.proposer, maxDraftTokens: mode.draftTokens } })
+        speculation: mode.proposer === undefined
+          ? undefined
+          : { proposer: mode.proposer, maxDraftTokens: mode.draftTokens }
       })
       const generations: Array<Model.Generation> = []
       const pagesBySession: Array<ReadonlyArray<Model.TokenPage>> = []

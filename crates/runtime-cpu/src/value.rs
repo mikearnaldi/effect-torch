@@ -1,9 +1,8 @@
-//! [`Value`]: the graph-leaf payload wrapper around a CPU [`Tensor`].
+//! [`Value`] wraps a CPU [`Tensor`] as a graph-leaf payload.
 //!
-//! The graph and compiler crates talk about opaque leaf values through the
-//! [`effect_torch_graph::LeafValue`] trait; this module adapts CPU tensors to
-//! that interface and provides the typed read-back helpers used by the NAPI
-//! boundary and tests.
+//! The graph and compiler crates use the [`effect_torch_graph::LeafValue`]
+//! trait for opaque leaf values. This module implements that interface for CPU
+//! tensors and provides typed readback helpers for the NAPI boundary and tests.
 
 use crate::{CpuBuffer, Tensor};
 use effect_torch_graph::Device;
@@ -11,8 +10,8 @@ use effect_torch_runtime::DType;
 
 /// A CPU tensor packaged as a graph leaf value.
 ///
-/// Cloning is cheap: the underlying buffer is reference-counted, so a cloned
-/// `Value` aliases the same storage as the original.
+/// Cloning shares the reference-counted buffer, so the new `Value` aliases
+/// the original storage.
 #[derive(Clone, Debug)]
 pub struct Value(pub Tensor);
 
@@ -27,7 +26,7 @@ impl Value {
         self.0
     }
 
-    /// Always [`Device::Cpu`]; this runtime only produces CPU values.
+    /// Always [`Device::Cpu`] because this runtime only produces CPU values.
     pub fn device(&self) -> Device {
         Device::Cpu
     }
@@ -47,8 +46,8 @@ impl Value {
         self.0.numel()
     }
 
-    /// Logical size in bytes (`numel * dtype size`); ignores any padding the
-    /// backing allocation may carry.
+    /// Logical size in bytes, `numel * dtype size`. Ignores padding in the
+    /// backing allocation.
     pub fn byte_size(&self) -> usize {
         self.numel() * self.dtype().size_in_bytes()
     }

@@ -5,14 +5,13 @@ import { Effect } from "effect"
 import { CHECKPOINT, createGpt, loadTokenizer, saveParams } from "./model.js"
 
 // Converts a compatible AdamW training archive into a bare model artifact.
-// Checkpoint.load reconstructs optimizer state only to decode the archive; the
-// subsequent save emits only model parameter names, omitting optimizer,
-// sampler, step, and metadata entries. Checkpoint.load releases unselected
-// imports; returned parameters/state remain caller-owned for this process. The
-// source has no embedded trainer provenance, so
-// this synthetic trainer must retain the source run's model/optimizer root
-// schema even though it never steps. The bundled Metal backend atomically
-// replaces the output. Usage:
+// Checkpoint.load reconstructs optimizer state to decode the archive. The
+// subsequent save writes only model parameters. It omits optimizer, sampler,
+// step, and metadata entries. Checkpoint.load releases unselected imports, but
+// the returned parameters and state remain caller-owned. The archive does not
+// identify its trainer configuration, so this temporary trainer must use the
+// source run's model and optimizer root schema even though it never steps. The
+// bundled Metal backend atomically replaces the output. Usage:
 //   pnpm tsx fineweb/export.ts <checkpoint.safetensors> [out.safetensors]
 
 const [, , source = new URL("../data/fineweb-epoch-ckpt.safetensors", import.meta.url).pathname, out = CHECKPOINT] =
@@ -21,8 +20,8 @@ const [, , source = new URL("../data/fineweb-epoch-ckpt.safetensors", import.met
 const program = Effect.gen(function*() {
   const tokenizer = yield* loadTokenizer
   const model = yield* createGpt(tokenizer.vocabSize)
-  // Checkpoint.load rebuilds optimizer state through the trainer's
-  // optimizer, so it needs one, but it is never stepped here.
+  // Checkpoint.load uses the trainer's optimizer to rebuild state. The trainer
+  // needs an optimizer even though it never steps here.
   const zero = yield* Tensor.zeros([1, 1])
   const trainer = yield* Trainer.make(model, {
     optimizer: yield* Optimizer.adamW(),

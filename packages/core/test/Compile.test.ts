@@ -157,7 +157,8 @@ onDevices("Compile", (device) => (it) => {
         const x = yield* Tensor.fromTypedArray(floats([1, -2]), [2])
         const y = yield* Tensor.fromTypedArray(new BigInt64Array([3n, -4n]), [2])
         expect(yield* values((yield* fn.call([x]))[0])).toEqual([1, 0])
-        const ints = (yield* Tensor.toTypedArray((yield* fn.call([y]))[0])) as BigInt64Array
+        const ints = yield* Tensor.toTypedArray((yield* fn.call([y]))[0])
+        if (!(ints instanceof BigInt64Array)) throw new Error("i64 readback must use BigInt64Array")
         expect(Array.from(ints)).toEqual([3n, 0n])
         expect(yield* fn.stats).toEqual({ cached: 2, compiled: 2 })
       }))

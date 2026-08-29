@@ -1,23 +1,21 @@
 //! Aligned raw memory and typed views for the CPU runtime.
 //!
-//! [`CpuSegment`] is the single owner of a heap allocation: a zeroed,
-//! power-of-two-aligned byte range with an exact capacity. [`CpuStorage<T>`]
-//! is a typed, bounds-checked view into a segment; many views may alias one
-//! segment, and each view keeps the segment alive through an `Arc`. Views may
-//! additionally carry a *retention* token (for example a workspace pool
-//! lease) that is released only when the last view of the allocation drops.
+//! [`CpuSegment`] owns one zeroed, power-of-two-aligned heap allocation with
+//! an exact capacity. [`CpuStorage<T>`] is a typed, bounds-checked view into a
+//! segment. Many views may alias one segment, and each keeps it alive through
+//! an `Arc`. A view may also carry a retention token such as a workspace pool
+//! lease. Dropping the last view of the allocation releases the token.
 //!
-//! Mutation discipline: the public API of `CpuStorage` is read-only. Interior
-//! writes are possible only through a `CpuDestination` capability (see
-//! `crate::tensor`), whose constructors prove either unique ownership of the
-//! segment or — inside a compiled executable — that the fixed liveness
-//! schedule keeps the written range free of concurrent access.
+//! The public `CpuStorage` API is read-only. Interior writes require a
+//! `CpuDestination` capability. See `crate::tensor`. Its constructors
+//! require either unique ownership of the segment or a compiled executable
+//! whose fixed liveness schedule prevents concurrent access to the written
+//! range.
 //!
-//! [`ExecutableAllocationGuard`] is a thread-local, nestable guard that makes
-//! every ambient allocation entry point panic while active. Compiled
-//! executables run under the guard to prove that all memory was acquired up
-//! front from the workspace pool and that kernels never allocate on the
-//! execution path.
+//! [`ExecutableAllocationGuard`] is thread-local and nestable. While active,
+//! every ambient allocation entry point panics. Compiled executables use it to
+//! verify that they acquired all memory from the workspace pool before running
+//! and that kernels do not allocate during execution.
 
 use half::{bf16, f16};
 use std::alloc::{alloc_zeroed, dealloc, Layout as AllocationLayout};
@@ -30,11 +28,11 @@ use std::ptr::NonNull;
 use std::rc::Rc;
 use std::sync::Arc;
 
-/// Alignment of every tensor storage allocation: one cache line, which also
-/// satisfies the widest SIMD loads used by downstream kernels.
+/// Alignment of every tensor storage allocation. One cache line also satisfies
+/// the widest SIMD loads used by downstream kernels.
 pub const CPU_STORAGE_ALIGNMENT: usize = 64;
-/// Opaque keep-alive token attached to a storage view, typically a workspace
-/// pool lease. Dropped only when the last view of the segment drops.
+/// Opaque keep-alive token attached to a storage view, usually a workspace
+/// pool lease. The last view of the segment drops the token.
 pub(crate) type CpuStorageRetention = Arc<dyn Send + Sync + std::panic::RefUnwindSafe>;
 
 thread_local! {
@@ -42,11 +40,11 @@ thread_local! {
 }
 
 /// Rejects ambient CPU tensor storage allocation on the current executor thread.
-/// Segment leases must be acquired before entering the guard.
+/// Callers must acquire segment leases before entering the guard.
 ///
-/// The guard is nestable (a depth counter, not a flag) and bound to the
-/// entering thread via `PhantomData<Rc<()>>`, so it is neither `Send` nor
-/// `Sync` and cannot leak the restriction to — or from — another thread.
+/// The guard uses a depth counter so it can nest. `PhantomData<Rc<()>>` binds
+/// it to the entering thread and makes it neither `Send` nor `Sync`. The
+/// allocation restriction cannot move to or from another thread.
 #[derive(Debug)]
 pub struct ExecutableAllocationGuard {
     _thread_owned: PhantomData<Rc<()>>,
@@ -144,7 +142,7 @@ impl Error for CpuStorageError {}
 ///
 /// Segments are the unit the workspace pool recycles and the unit tensor
 /// views reference-count. `capacity` is the logical byte size requested by
-/// the caller; the physical allocation is at least one byte so zero-capacity
+/// the caller. The physical allocation is at least one byte so zero-capacity
 /// segments still own a valid, dereferenceable-to-zero-extent pointer.
 pub struct CpuSegment {
     pointer: NonNull<u8>,
@@ -154,14 +152,14 @@ pub struct CpuSegment {
 }
 
 impl CpuSegment {
-    /// Allocates a segment; see [`CpuSegment::allocate`].
+    /// Allocates a segment. See [`CpuSegment::allocate`].
     pub fn new(bytes: usize, alignment: usize) -> Result<Arc<Self>, CpuStorageError> {
         Self::allocate(bytes, alignment)
     }
 
     /// Allocates `bytes` zeroed bytes at `alignment`.
     ///
-    /// Panics under an active [`ExecutableAllocationGuard`]: executables must
+    /// Panics under an active [`ExecutableAllocationGuard`]. Executables must
     /// lease segments from the workspace pool before entering the guard.
     pub fn allocate(bytes: usize, alignment: usize) -> Result<Arc<Self>, CpuStorageError> {
         assert_allocation_allowed("CpuSegment::allocate");
@@ -171,7 +169,8 @@ impl CpuSegment {
         let allocation_bytes = bytes.max(1);
         let layout = AllocationLayout::from_size_align(allocation_bytes, alignment)
             .map_err(|_| CpuStorageError::InvalidAlignment(alignment))?;
-        // SAFETY: `layout` is valid and the returned allocation is owned by the segment.
+        // SAFETY: `layout` is valid, and the segment owns the returned
+        // allocation.
         let pointer = NonNull::new(unsafe { alloc_zeroed(layout) })
             .ok_or(CpuStorageError::AllocationFailed { bytes, alignment })?;
         Ok(Arc::new(Self {
@@ -187,7 +186,7 @@ impl CpuSegment {
         self.capacity
     }
 
-    /// Alignment the allocation was created with.
+    /// Alignment used to create the allocation.
     pub fn alignment(&self) -> usize {
         self.alignment
     }
@@ -221,14 +220,15 @@ impl Drop for CpuSegment {
     fn drop(&mut self) {
         let layout = AllocationLayout::from_size_align(self.allocation_bytes, self.alignment)
             .expect("CPU segment retained its validated allocation layout");
-        // SAFETY: this pointer was allocated with `layout` and this is its only deallocation.
+        // SAFETY: the allocator created this pointer with `layout`, and this
+        // is its only deallocation.
         unsafe { dealloc(self.pointer.as_ptr(), layout) };
     }
 }
 
-// SAFETY: public views are immutable. Interior writes are available only through
-// CpuDestination; planned writes additionally require executor liveness to prove
-// that no read or write overlaps this range on another thread.
+// SAFETY: public views are immutable. Interior writes require CpuDestination.
+// Planned writes also rely on executor liveness to ensure no read or write on
+// another thread overlaps this range.
 unsafe impl Send for CpuSegment {}
 unsafe impl Sync for CpuSegment {}
 
@@ -238,9 +238,9 @@ mod sealed {
 
 /// Element types allowed in [`CpuStorage`].
 ///
-/// Sealed to `f32`, `f64`, `f16`, `bf16`, `u8`, `u32`, and `i64`: plain-data
-/// types for which every bit pattern is valid, so a raw byte range can always
-/// be viewed as a slice of `T` without a validity invariant.
+/// Sealed to `f32`, `f64`, `f16`, `bf16`, `u8`, `u32`, and `i64`.
+/// Every bit pattern is valid for these plain-data types, so a raw byte range
+/// can always be viewed as a slice of `T`.
 pub trait CpuElement: sealed::Sealed + Copy + Default + Send + Sync + 'static {}
 
 macro_rules! cpu_elements {
@@ -257,9 +257,9 @@ cpu_elements!(f32, f64, f16, bf16, u8, u32, i64);
 /// A typed, bounds-checked view of `len` elements of `T` at `byte_offset`
 /// within an owned [`CpuSegment`].
 ///
-/// Cloning a view aliases the same bytes; uniqueness is observable via
-/// `is_uniquely_owned` and is what the safe destination constructor requires
-/// before handing out mutable access.
+/// Cloning a view aliases the same bytes. `is_uniquely_owned` reports whether
+/// the view meets the safe destination constructor's requirement for mutable
+/// access.
 #[derive(Clone)]
 pub struct CpuStorage<T: CpuElement> {
     owner: Arc<CpuSegment>,
@@ -279,9 +279,9 @@ impl<T: CpuElement> CpuStorage<T> {
         Self::from_segment_with_retention(owner, byte_offset, len, None)
     }
 
-    /// Like [`CpuStorage::from_segment`], additionally attaching a retention
-    /// token that outlives individual views (used to pin workspace pool
-    /// leases for as long as any published output aliases the segment).
+    /// Like [`CpuStorage::from_segment`], but attaches a retention token. The
+    /// token pins a workspace pool lease while any published output aliases
+    /// the segment.
     pub(crate) fn from_segment_with_retention(
         owner: Arc<CpuSegment>,
         byte_offset: usize,
@@ -327,8 +327,8 @@ impl<T: CpuElement> CpuStorage<T> {
             .ok_or(CpuStorageError::ByteRangeOverflow)?;
         let owner = CpuSegment::allocate(bytes, CPU_STORAGE_ALIGNMENT)?;
         let storage = Self::from_segment(owner, 0, values.len())?;
-        // SAFETY: the segment is newly allocated and unpublished, and both slices
-        // contain exactly `values.len()` initialized values of the same type.
+        // SAFETY: the segment is new and unpublished. Both slices contain
+        // exactly `values.len()` initialized values of the same type.
         unsafe {
             std::ptr::copy_nonoverlapping(
                 values.as_ptr(),
@@ -372,7 +372,7 @@ impl<T: CpuElement> CpuStorage<T> {
     }
 
     /// Whether this view holds the only strong reference to the segment.
-    /// Unique ownership is what allows safe mutable access: no other view can
+    /// Unique ownership allows safe mutable access because no other view can
     /// observe or alias the bytes.
     pub(crate) fn is_uniquely_owned(&self) -> bool {
         Arc::strong_count(&self.owner) == 1
@@ -382,19 +382,19 @@ impl<T: CpuElement> CpuStorage<T> {
     ///
     /// # Safety
     /// The caller must hold a `CpuDestination` capability covering this exact
-    /// range: either the segment is uniquely owned (no aliases exist), or the
-    /// executable's fixed liveness schedule guarantees no concurrent
-    /// read/write overlaps this range.
+    /// range. Either the segment is uniquely owned with no aliases, or the
+    /// executable's fixed liveness schedule prevents concurrent reads and
+    /// writes from overlapping this range.
     pub(crate) unsafe fn as_mut_slice_for_destination(&self) -> &mut [T] {
         // SAFETY: the caller holds a CpuDestination capability. Its constructor
-        // either proves unique ownership or delegates non-overlap to executable
-        // liveness for a planned segment.
+        // requires unique ownership or relies on executable liveness to prevent
+        // overlap in a planned segment.
         unsafe { std::slice::from_raw_parts_mut(self.pointer().cast::<T>(), self.len) }
     }
 
     fn pointer(&self) -> *mut u8 {
-        // Raw allocation storage is the narrowly contained interior-mutation
-        // mechanism; no mutable pointer is exposed by the public API.
+        // Raw allocation storage contains the interior mutation. The public API
+        // does not expose a mutable pointer.
         // SAFETY: `byte_offset` was bounds-checked against the segment
         // capacity at construction, so the offset stays within the allocation.
         unsafe { self.owner.pointer.as_ptr().add(self.byte_offset) }

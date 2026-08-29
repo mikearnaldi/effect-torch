@@ -1,26 +1,24 @@
-//! Fused causal depthwise short convolution on Metal (RFC 0018): the
-//! KDA local-mixing conv `y[t,c] = sum_j w[c,j] * x[t-K+1+j, c]` with zero
-//! or carried history. One launch per call replaces the composed
-//! pad/conv1d/transpose chain; the stateful ConvState decode/prefill
-//! path passes the slot's [K-1, C] window as history and receives the
-//! shifted window back (only the `advance` real rows shift in — chunked
-//! prefill right-pads). All channel counts and kernel sizes are
-//! supported; the dtype gate fails loud.
+//! Fused causal depthwise short convolution on Metal for RFC 0018. It computes
+//! `y[t,c] = sum_j w[c,j] * x[t-K+1+j, c]` with zero or carried history. One
+//! launch replaces the composed pad, conv1d, and transpose chain. Stateful
+//! ConvState decode and prefill pass the slot's [K-1, C] window as history and
+//! receive the shifted window. Only the `advance` real rows shift in because
+//! chunked prefill right-pads. The kernel supports all channel counts and
+//! kernel sizes and rejects unsupported dtypes.
 //!
 //! ## Kernel contracts
 //!
-//! - **Forward** (`et_shortconv_fwd`): `x` is `[.., steps, C]`, `w` is
-//!   `[C, K]`; taps before step 0 read the optional f32 history window
-//!   `[K-1, C]`. When the window-write flag is set, the last `K-1` real
-//!   rows (of the `advance` prefix) plus surviving history are written
-//!   back as the shifted f32 window — this is the ConvState transaction.
-//!   History/state are single-sequence only (`batch == 1`).
-//! - **Backward-x** (`et_shortconv_bwd_x`): full correlation of the
-//!   cotangent against the time-reversed taps, `dx[s] = sum_j
-//!   w[c, K-1-j] * g[s+j, c]`, implicitly right-zero-padded.
-//! - **Backward-w** (`et_shortconv_bwd_w`): `dw[c, j] = sum_{b,t}
-//!   g[t, c] * x[t-K+1+j, c]` over the causal window, one thread per
-//!   (channel, tap) with serial time loops.
+//! - `et_shortconv_fwd` takes `x [.., steps, C]` and `w [C, K]`. Taps
+//!   before step 0 read the optional f32 `[K-1, C]` history window. When the
+//!   window-write flag is set, the kernel writes the last `K-1` real rows of
+//!   the `advance` prefix plus surviving history as the shifted f32 window.
+//!   This write is the ConvState transaction. History and state require
+//!   `batch == 1`.
+//! - `et_shortconv_bwd_x` computes a full correlation against reversed taps:
+//!   `dx[s] = sum_j w[c, K-1-j] * g[s+j, c]`, with implicit right zero-padding.
+//! - `et_shortconv_bwd_w` computes
+//!   `dw[c, j] = sum_{b,t} g[t, c] * x[t-K+1+j, c]` over the causal window.
+//!   Each channel and tap gets one thread with a serial time loop.
 //!
 //! All three kernels accumulate in f32 regardless of storage dtype
 //! (f32 or bf16) and require contiguous, offset-0-compatible views;
@@ -29,7 +27,7 @@
 
 use crate::runtime::dtype::DType;
 
-/// Planner-facing resource requirements of one forward launch
+/// Resource requirements for one forward launch
 /// (stateless or ConvState-transaction).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ForwardRequirements {
@@ -50,7 +48,7 @@ pub struct ForwardRequirements {
     pub pipeline_count: usize,
 }
 
-/// Planner-facing resource requirements of the combined backward
+/// Resource requirements for the combined backward
 /// (backward-x + backward-w, two launches).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BackwardRequirements {
@@ -70,7 +68,7 @@ pub struct BackwardRequirements {
     pub pipeline_count: usize,
 }
 
-/// Planner-facing resource requirements of the backward-x launch alone.
+/// Resource requirements for the backward-x launch alone.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BackwardXRequirements {
     /// Storage dtype of cotangent and `dx` (f32 or bf16).
@@ -87,7 +85,7 @@ pub struct BackwardXRequirements {
     pub pipeline_count: usize,
 }
 
-/// Planner-facing resource requirements of the backward-w launch alone.
+/// Resource requirements for the backward-w launch alone.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BackwardWRequirements {
     /// Storage dtype of `dweight` (f32 or bf16).
@@ -114,7 +112,7 @@ fn checked_bytes(elements: &[usize], dtype: DType, operation: &str) -> crate::er
 
 /// Requirements of a stateless forward over `batch` sequences of
 /// `steps` positions with `channels` channels and kernel size `kernel`.
-/// `write_state_next` additionally sizes the f32 next-window state.
+/// `write_state_next` also includes the f32 next-window state.
 pub fn forward_requirements(
     dtype: DType,
     batch: usize,
@@ -363,7 +361,7 @@ using namespace metal;
 #define T {ty}
 
 // One thread per output element, addressed by a 3D grid (channel, row,
-// batch) — no div/mod index math. x [.., steps, C], optional f32
+// batch). This avoids div/mod index math. x [.., steps, C], optional f32
 // history [K-1, C] (single-sequence use only), y mirrors x; when flag 2
 // is set the last K-1 real rows (of `advance`) plus surviving history
 // write the shifted window to WIN.
@@ -708,9 +706,8 @@ kernel void et_shortconv_bwd_w(
         )
     }
 
-    /// Allocating convenience wrapper around [`forward_into`]: makes
-    /// inputs contiguous, warms the pipeline, and returns the output
-    /// plus the shifted window when `write_window` is set.
+    /// Makes inputs contiguous, warms the pipeline, allocates outputs, and calls
+    /// [`forward_into`]. Returns the shifted window when `write_window` is set.
     pub fn forward(
         x: &MetalTensor,
         weight: &MetalTensor,
@@ -788,7 +785,7 @@ kernel void et_shortconv_bwd_w(
         Ok(())
     }
 
-    /// Allocating convenience wrapper around [`backward_x_into`].
+    /// Allocates outputs and calls [`backward_x_into`].
     pub fn backward_x(g: &MetalTensor, weight: &MetalTensor) -> crate::err::Res<MetalTensor> {
         let shape = g.layout.shape().to_vec();
         let dtype = g.dtype;
@@ -847,7 +844,7 @@ kernel void et_shortconv_bwd_w(
         Ok(())
     }
 
-    /// Allocating convenience wrapper around [`backward_w_into`].
+    /// Allocates outputs and calls [`backward_w_into`].
     pub fn backward_w(
         x: &MetalTensor,
         g: &MetalTensor,

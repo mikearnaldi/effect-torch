@@ -18,8 +18,7 @@
  * freezes one parameter generation, eagerly compiles fixed-shape prefill and
  * decode programs, and creates one shared decode-state pool. KV arenas and
  * prefix-cache content are pool-wide, while recurrent state belongs to each
- * sequence. That
- * {@link InferenceProgram} is a separate artifact, not an entry in the model's
+ * sequence. The {@link InferenceProgram} is separate from the model's
  * `execute` cache and not reflected by `Model.stats`.
  *
  * Generation has three ownership levels. The inference artifact retains frozen
@@ -31,17 +30,17 @@
  * remain as reclaimable LRU prefix-cache entries, so releasing a sequence drops
  * its live references but does not necessarily erase cached content.
  *
- * Constructors perform targeted configuration checks and standard combinators
- * enforce flat parameter arity and name uniqueness. This module does not
+ * Constructors check selected configuration fields. Standard combinators
+ * enforce flat parameter arity and unique names. This module does not
  * generally prove that parameter tensors match {@link ParameterSpec}, that a
  * custom {@link Definition} honors its catalog, that token ids fit a model's
  * vocabulary, or that a graph is supported by a particular backend. Those
  * errors remain graph-build, compilation, or execution failures. Training
- * orchestration lives in the `Trainer` module.
+ * loops live in the `Trainer` module.
  *
  * @since 0.1.0
  */
-import { Data, Effect, Exit, Semaphore } from "effect"
+import { Data, Effect, Exit, Predicate, Semaphore } from "effect"
 import * as Gradient from "./Gradient.ts"
 import * as Runtime from "./Runtime.ts"
 import type * as Speculation from "./Speculation.ts"
@@ -118,9 +117,9 @@ export type Params = ReadonlyArray<Tensor.Any>
 
 /**
  * The stable exposure name of the residual activation after zero-based model
- * layer `layer` — the single definition of the shared contract between models
- * that publish hidden states via `Tensor.expose` and speculative proposers
- * that request them via {@link Speculation.HiddenTap}. A model publishes any
+ * layer `layer`. This defines the shared name used by models
+ * publishing hidden states via `Tensor.expose` and speculative proposers
+ * requesting them via {@link Speculation.HiddenTap}. A model publishes any
  * number of exposures once; any number of proposers may subscribe to any
  * subset of them.
  *
@@ -226,8 +225,8 @@ type ModelInternal =
 // The shared prototype keeps model values small. Each instance allocates its
 // own CompiledFn on first execute; that function then traces once per metadata
 // signature, so model construction itself remains runtime- and device-free.
-const ModelProto = {
-  execute(this: ModelInternal, params: Params, input: Tensor.Any) {
+const ModelProto: Pick<Model, "execute" | "stats" | "clear"> & ThisType<ModelInternal> = {
+  execute(params, input) {
     const self = this
     return Effect.gen(function*() {
       yield* checkArity("execute", self.parameterSpecs.map((parameter) => parameter.name), params)
@@ -245,16 +244,15 @@ const ModelProto = {
     })
   },
   get stats() {
-    const self = this as ModelInternal
-    return Effect.suspend(() => self._fn?.stats ?? Effect.succeed({ cached: 0, compiled: 0 }))
+    return Effect.suspend(() => this._fn?.stats ?? Effect.succeed({ cached: 0, compiled: 0 }))
   },
   get clear() {
-    const self = this as ModelInternal
-    return Effect.suspend(() => self._fn?.clear ?? Effect.void)
+    return Effect.suspend(() => this._fn?.clear ?? Effect.void)
   }
 }
 
 const make = (def: ModelDef): Model => {
+  // SAFETY: ModelProto supplies the methods; all ModelInternal fields are initialized before return.
   const self = Object.create(ModelProto) as ModelInternal
   self.parameterSpecs = def.parameterSpecs
   self.forward = def.forward
@@ -274,7 +272,7 @@ export const define = (definition: Definition): Effect.Effect<Model, ModelError>
   Effect.gen(function*() {
     const seen = new Set<string>()
     for (const parameter of definition.parameterSpecs) {
-      if (typeof parameter.name !== "string" || parameter.name.length === 0) {
+      if (!Predicate.isString(parameter.name) || parameter.name.length === 0) {
         return yield* new ModelError({ op: "define", message: "parameter name must not be empty" })
       }
       if (seen.has(parameter.name)) {
@@ -293,7 +291,7 @@ export const define = (definition: Definition): Effect.Effect<Model, ModelError>
         }
       }
       const initializer = parameter.initializer
-      if (typeof initializer !== "object" || initializer === null) {
+      if (!Predicate.isObjectOrArray(initializer)) {
         return yield* new ModelError({ op: "define", message: `${parameter.name}: initializer must be an object` })
       }
       if (initializer._tag === "Normal") {
@@ -493,7 +491,7 @@ export const conv2d = (
     yield* checkName("conv2d", name)
     yield* checkPositiveInt("conv2d", "inChannels", inChannels)
     yield* checkPositiveInt("conv2d", "outChannels", outChannels)
-    const [kh, kw] = typeof kernelSize === "number" ? [kernelSize, kernelSize] as const : kernelSize
+    const [kh, kw] = Array.isArray(kernelSize) ? kernelSize : [kernelSize, kernelSize] as const
     yield* checkPositiveInt("conv2d", "kernelSize", kh)
     yield* checkPositiveInt("conv2d", "kernelSize", kw)
     const groups = options.groups ?? 1
@@ -568,7 +566,7 @@ export const embedding = (
           yield* checkArity(name, names, params)
           return yield* Tensor.embedding(input, {
             weight: params[0],
-            ...(options.paddingIndex !== undefined ? { paddingIndex: options.paddingIndex } : {})
+            paddingIndex: options.paddingIndex
           })
         })
     })
@@ -577,8 +575,8 @@ export const embedding = (
 /**
  * A learned absolute position embedding (GPT-style `wpe`): looks up rows
  * `0..t-1` of a `[maxPositions, embeddingDim]` table, where `t` is the
- * input's last dimension — the input's values and leading dimensions are
- * ignored. The output is `[t, embeddingDim]` (with no copied batch axis).
+ * input's last dimension. It ignores the input's values and leading dimensions.
+ * The output is `[t, embeddingDim]` with no copied batch axis.
  * `names = ["<name>.weight"]`, initialized unit-normal. Fails with a
  * {@link ModelError} on an empty name, counts that are not positive
  * integers, or an input whose sequence length exceeds `maxPositions`.
@@ -638,7 +636,7 @@ export const layerNorm = (
 ): Effect.Effect<Model, ModelError> =>
   Effect.gen(function*() {
     yield* checkName("layerNorm", name)
-    const shape: ReadonlyArray<number> = typeof normalizedShape === "number" ? [normalizedShape] : normalizedShape
+    const shape: ReadonlyArray<number> = Array.isArray(normalizedShape) ? normalizedShape : [normalizedShape]
     if (shape.length === 0) {
       return yield* new ModelError({ op: "layerNorm", message: "normalizedShape must not be empty" })
     }
@@ -697,9 +695,9 @@ export interface MultiHeadAttentionOptions {
  * {@link linear}. Both weights use `randn * (1 / sqrt(embedDim))` and
  * biases are zero. Fails with a {@link ModelError} on an empty name,
  * counts that are not positive integers, or `embedDim` not divisible by
- * `numHeads`. The constructor does not validate the RoPE theta or even head
- * width; RoPE-specific shape, dtype, and numeric constraints surface while the
- * graph is built, compiled, or run.
+ * `numHeads`. The constructor does not validate the RoPE theta or head width.
+ * RoPE-specific shape, dtype, and numeric checks can fail while building,
+ * compiling, or running the graph.
  *
  * @since 0.1.0
  * @category constructors
@@ -776,7 +774,7 @@ export const multiHeadAttention = (
             end: [...leading.map((d) => d), t, 3 * embedDim]
           })
           const maybeRope = (x: Tensor.Any) =>
-            options.rope !== undefined ? Tensor.rotaryEmbedding(x, t, options.rope) : Effect.succeed(x as Tensor.Any)
+            options.rope !== undefined ? Tensor.rotaryEmbedding(x, t, options.rope) : Effect.succeed(x)
           const attended = yield* Tensor.scaledDotProductAttention(
             yield* maybeRope(yield* splitHeads(q)),
             yield* maybeRope(yield* splitHeads(k)),
@@ -812,9 +810,9 @@ export interface KimiDeltaAttentionOptions {
  * core, and a sigmoid-gated per-head RMS normalization before the output
  * projection. The head dimension is `embedDim / numHeads` for both keys
  * and values. KDA layers carry positional information in their learnable
- * decayed state transition and apply **no** positional encoding; in a
- * hybrid stack the full-attention layers can therefore omit RoPE (the
- * Kimi K3 configuration).
+ * decayed state transition and apply no positional encoding. In a hybrid
+ * stack, the full-attention layers can therefore omit RoPE, as in the
+ * Kimi K3 configuration.
  *
  * Names are exactly `["<name>.qkv.weight", "<name>.qkv.bias",
  * "<name>.convqkv.weight", "<name>.fa.weight", "<name>.fb.weight",
@@ -1083,11 +1081,11 @@ export const logSoftmax = (dim: number = -1): Effect.Effect<Model> =>
   parameterless((input) => Tensor.logSoftmax(input, { dims: [dim] }))
 
 /**
- * Flattens the input into `[batch, features]` as a parameterless model:
- * `startDim` defaults to **1** (the batch dimension is preserved, the
- * common case between the convolutional and the fully-connected part of a
- * network) and `endDim` to the last dimension. Both must be integer axes
- * in range, and `endDim` must not precede `startDim`.
+ * Flattens the input into `[batch, features]` as a parameterless model.
+ * `startDim` defaults to `1`, preserving the batch dimension between the
+ * convolutional and fully connected parts of a network. `endDim` defaults to
+ * the last dimension. Both must be integer axes in range, and `endDim` must not
+ * precede `startDim`.
  *
  * @since 0.1.0
  * @category constructors
@@ -1098,16 +1096,16 @@ export const flatten = (
   parameterless((input) =>
     Tensor.flatten(input, {
       startDim: options.startDim ?? 1,
-      ...(options.endDim !== undefined ? { endDim: options.endDim } : {})
+      endDim: options.endDim
     })
   )
 
 /**
  * Inverted dropout as a parameterless model: zeroes elements with
  * probability `p` (default `0.5`) and scales survivors by `1 / (1 - p)`.
- * This is the functional form: it always applies; build the
- * evaluation chain without it (dropout adds nothing to the parameter
- * array, so one checkpoint serves both chains). The mask follows
+ * This functional form always applies. Build the evaluation chain without it.
+ * Dropout adds nothing to the parameter array, so one checkpoint serves both
+ * chains. The mask follows
  * {@link Tensor.uniform}'s per-invocation sharing rule: submit a loss and its
  * gradients as roots of the same invocation when they must share it. Fails
  * with a {@link ModelError} if `p` is numerically outside `[0, 1)`. This is not
@@ -1138,13 +1136,15 @@ const pool = (
   options: Tensor.PoolOptions
 ): Effect.Effect<Model, ModelError> =>
   Effect.gen(function*() {
-    const [kh, kw] = typeof options.kernelSize === "number"
-      ? [options.kernelSize, options.kernelSize] as const
-      : options.kernelSize
+    const [kh, kw] = Array.isArray(options.kernelSize)
+      ? options.kernelSize
+      : [options.kernelSize, options.kernelSize] as const
     yield* checkPositiveInt(op, "kernelSize", kh)
     yield* checkPositiveInt(op, "kernelSize", kw)
     if (options.stride !== undefined) {
-      const [sh, sw] = typeof options.stride === "number" ? [options.stride, options.stride] as const : options.stride
+      const [sh, sw] = Array.isArray(options.stride)
+        ? options.stride
+        : [options.stride, options.stride] as const
       yield* checkPositiveInt(op, "stride", sh)
       yield* checkPositiveInt(op, "stride", sw)
     }
@@ -1185,15 +1185,15 @@ export const avgPool2d = (options: Tensor.PoolOptions): Effect.Effect<Model, Mod
   pool("avgPool2d", Tensor.avgPool2d, options)
 
 /**
- * Wraps a sub-model in a gradient-checkpoint boundary: the forward value
+ * Wraps a sub-model in a gradient-checkpoint boundary. The forward value
  * is unchanged, but during the backward pass the sub-model's forward
- * intermediates are recomputed from a fresh copy instead of being
- * retained — trading one extra forward evaluation of the block for its
- * peak activation memory. Region inputs (parameters, the incoming
- * activation, constructor draws) stay shared, so recomputation is
- * consistent with the forward pass.
+ * intermediates are recomputed from a fresh copy instead of retained. This
+ * trades one extra forward evaluation of the block for lower peak activation
+ * memory. Region inputs stay shared, including parameters, the incoming
+ * activation, and constructor draws. Recomputation therefore matches the
+ * forward pass.
  *
- * Apply it per block, not to the whole model: checkpointing the full
+ * Apply it per block, not to the whole model. Checkpointing the full
  * network just moves the peak into the backward pass. The standard
  * recipe is one boundary per expensive stage:
  *
@@ -1205,7 +1205,7 @@ export const avgPool2d = (options: Tensor.PoolOptions): Effect.Effect<Model, Mod
  * )
  * ```
  *
- * This is the recompute mechanism — meaningful on every target.
+ * This recomputation works on every target.
  *
  * @since 0.1.0
  * @category combinators
@@ -1217,11 +1217,10 @@ export const checkpoint = (model: Model): Effect.Effect<Model> =>
   }))
 
 /**
- * Adds a residual (skip) connection around a sub-model: the forward is
+ * Adds a residual (skip) connection around a sub-model. Its forward pass is
  * `input + block(input)`. Parameter specs are the sub-model's; the
- * sub-model's output must be broadcast-compatible with its input (an
- * equal shape in the standard usage — transformer blocks, ResNet
- * stages).
+ * sub-model's output must be broadcast-compatible with its input. Transformer
+ * blocks and ResNet stages normally use equal shapes.
  *
  * @since 0.1.0
  * @category combinators
@@ -1240,8 +1239,8 @@ export const residual = (model: Model): Effect.Effect<Model> =>
  * Transforms a model's input before it enters the sub-model:
  * `forward(params, input) = model.forward(params, f(input))`. Parameter
  * specs are the sub-model's. Use it for input derived from the raw
- * input's shape or values when no dedicated layer covers the case
- * (position embeddings have their own: {@link positionEmbedding}).
+ * input's shape or values when no dedicated layer covers the case. Position
+ * embeddings have their own {@link positionEmbedding} layer.
  *
  * @since 0.1.0
  * @category combinators
@@ -1264,8 +1263,8 @@ export const mapInput = (
  * {@link ModelError} when the array is empty or when parameter names
  * collide.
  *
- * The common case — adding the branches, as in token + position
- * embeddings — has its own combinator: {@link add}. {@link residual} is
+ * Adding branches, such as token and position embeddings, has its own
+ * combinator, {@link add}. {@link residual} is
  * the special case where one branch is the identity.
  *
  * @since 0.1.0
@@ -1273,7 +1272,11 @@ export const mapInput = (
  */
 export const merge = <const M extends ReadonlyArray<Model>>(
   models: M,
-  f: (...outputs: { [K in keyof M]: Tensor.Lazy }) => Effect.Effect<Tensor.Lazy, Tensor.TensorError, Runtime.Runtime>
+  f: (...outputs: { -readonly [K in keyof M]: Tensor.Lazy }) => Effect.Effect<
+    Tensor.Lazy,
+    Tensor.TensorError,
+    Runtime.Runtime
+  >
 ): Effect.Effect<Model, ModelError> => {
   if (models.length === 0) {
     return new ModelError({ op: "merge", message: "at least one model is required" })
@@ -1306,7 +1309,8 @@ export const merge = <const M extends ReadonlyArray<Model>>(
           outputs.push(yield* models[i].forward(params.slice(offset, offset + arities[i]), input))
           offset += arities[i]
         }
-        return yield* f(...(outputs as { [K in keyof M]: Tensor.Lazy }))
+        // SAFETY: the loop adds exactly one output for every combiner parameter, in the same order.
+        return yield* f(...(outputs as Parameters<typeof f>))
       })
   }))
 }
@@ -1315,8 +1319,8 @@ export const merge = <const M extends ReadonlyArray<Model>>(
  * Adds the outputs of several models over a shared input elementwise:
  * `forward(params, input) = Σᵢ models[i].forward(paramsᵢ, input)` with
  * each model's parameters sliced by arity from the concatenated array.
- * The standard non-sequential top — token + position embeddings is
- * `add(wte, wpe)`; {@link residual} is the special case where one branch
+ * For example, token and position embeddings use `add(wte, wpe)`.
+ * {@link residual} is the special case where one branch
  * is the identity. Parameter specs follow {@link merge}. Fails with a
  * {@link ModelError} when the chain is empty or parameter names collide.
  *
@@ -1326,11 +1330,11 @@ export const merge = <const M extends ReadonlyArray<Model>>(
 export const add = (...models: ReadonlyArray<Model>): Effect.Effect<Model, ModelError> =>
   merge(models, (first, ...rest) =>
     Effect.gen(function*() {
-      let acc: Tensor.Any = first
+      let acc = first
       for (const output of rest) {
         acc = yield* Tensor.add(acc, output)
       }
-      return acc as Tensor.Lazy
+      return acc
     }))
 
 /**
@@ -1339,9 +1343,9 @@ export const add = (...models: ReadonlyArray<Model>): Effect.Effect<Model, Model
  * parameter array by its parameter-spec arity. The result concatenates the
  * children's parameter specs.
  *
- * Fails with a {@link ModelError} when the chain is empty or when
- * parameter names collide — a collision would silently overwrite entries
- * in a saved checkpoint.
+ * Fails with a {@link ModelError} when the chain is empty or when parameter
+ * names collide. A collision would silently overwrite entries in a saved
+ * checkpoint.
  *
  * @since 0.1.0
  * @category combinators
@@ -1372,13 +1376,13 @@ export const chain = (...models: ReadonlyArray<Model>): Effect.Effect<Model, Mod
     forward: (params, input) =>
       Effect.gen(function*() {
         yield* checkArity("chain", names, params)
-        let current: Tensor.Any = input
-        let offset = 0
-        for (let i = 0; i < models.length; i++) {
+        let current = yield* models[0].forward(params.slice(0, arities[0]), input)
+        let offset = arities[0]
+        for (let i = 1; i < models.length; i++) {
           current = yield* models[i].forward(params.slice(offset, offset + arities[i]), current)
           offset += arities[i]
         }
-        return current as Tensor.Lazy
+        return current
       })
   }))
 }
@@ -1411,8 +1415,9 @@ export const save = (
 /**
  * Loads a safetensors file and returns tensors selected by parameter-spec names in
  * parameter-array order. A missing key fails with a {@link ModelError}; extra
- * keys are ignored. This is name/arity mapping, not architecture validation:
- * shape, dtype, storage, and placement compatibility are left to first use.
+ * keys are ignored. This maps names and arity but does not validate the
+ * architecture. It leaves shape, dtype, storage, and placement compatibility
+ * unchecked until first use.
  *
  * {@link Tensor.load} materializes the entire archive. This function releases
  * unselected tensors before success and releases all imported tensors if
@@ -1478,7 +1483,7 @@ export class InferenceError extends Data.TaggedError("InferenceError")<{
  * `[batchSize, 1]`. Batch size one
  * uses the same decode path. There is no later shape-specialization cache.
  *
- * Validation is deliberately structural. It does not estimate whether the
+ * Validation checks structure only. It does not estimate whether the
  * pool is large enough for a particular set of prompts, check token ids against
  * the model vocabulary, prove that every model operation supports decode
  * specialization, or prove that learned position tables cover future cursors.
@@ -1515,9 +1520,9 @@ export interface InferenceConfig {
    */
   readonly attentionWindow?: number
   /**
-   * Fixed prompt-chunk token widths, ascending: one prefill program is
-   * compiled per entry and the runtime serves each prompt chunk from the
-   * largest compiled width covering its remaining tokens, so smaller widths
+   * Fixed prompt-chunk token widths in ascending order. The compiler creates
+   * one prefill program per entry. The runtime serves each prompt chunk from
+   * the largest compiled width covering its remaining tokens, so smaller widths
    * only bound zero-padding waste on short prompts. Entries must be positive
    * safe integers; they need not be multiples of `blockSize`. Every prefill
    * invocation has one of the compiled shapes. The final suffix is
@@ -1559,7 +1564,7 @@ export interface InferenceConfig {
     readonly maxDraftTokens: number
     /** Proposal-width policy; only `"fixed"` is currently implemented. */
     readonly schedule?: "fixed" | "adaptive"
-  }
+  } | undefined
 }
 
 /**
@@ -1621,7 +1626,7 @@ export interface GenerationAdd {
   /** Overrides inference sampling defaults for the admission page only. */
   readonly sampling?: Partial<GenerationSamplingOptions>
   /** Optional positive generation limit for this sequence. */
-  readonly maxTokens?: number
+  readonly maxTokens?: number | undefined
   /** Token ids that terminate this sequence when sampled. */
   readonly eosTokens?: ReadonlyArray<number>
 }
@@ -1651,7 +1656,7 @@ export interface TokenPage {
   /** Sampled token ids in generation order. */
   readonly tokens: ReadonlyArray<number>
   /** Terminal policy reached by the final token, when the page ends the sequence. */
-  readonly stopReason?: "eos" | "maxTokens"
+  readonly stopReason?: "eos" | "maxTokens" | undefined
 }
 
 /**
@@ -1661,15 +1666,15 @@ export interface TokenPage {
  * token and samples its successor. Every active count uses the fixed
  * `[batchSize, 1]` program with explicit inactive lanes.
  *
- * Prefix matching is pool-wide, not session-local. It uses chained hashes to
- * reuse the longest resident proper prefix made of complete `blockSize` blocks,
+ * Prefix matching spans the pool, not just one session. It uses chained hashes
+ * to reuse the longest resident proper prefix made of complete `blockSize` blocks,
  * whether those blocks are referenced by another live sequence or retained
  * unreferenced in the LRU cache. At least the final prompt token is always
  * executed so `add` can sample the first pending token. Hybrid KV/recurrent programs also
  * require a published recurrent snapshot at the matched block boundary and
- * restore it with the KV blocks. Programs without KV blocks, including purely
- * recurrent and stateless graphs, have no block anchor and therefore no prefix
- * match.
+ * restore it with the KV blocks. Programs without KV blocks have no block
+ * anchor and therefore no prefix match. This includes purely recurrent and
+ * stateless graphs.
  *
  * Sessions are ordinary values and require no `Scope`. Sessions from the same
  * artifact may run concurrently and share pool capacity/cache content. Calls to
@@ -1794,11 +1799,11 @@ interface ResolvedInferenceConfig {
   readonly kvDtype: Tensor.DType
   readonly batchSize: number
   readonly sampling: GenerationSamplingOptions
-  readonly attentionWindow?: number
-  readonly speculation?: {
+  readonly attentionWindow: number | undefined
+  readonly speculation: {
     readonly proposer: Speculation.Artifact
     readonly maxDraftTokens: number
-  }
+  } | undefined
 }
 
 const invalidInferenceConfig = (message: string): InferenceError => new InferenceError({ op: "inference", message })
@@ -1850,7 +1855,7 @@ const resolveInferenceConfig = (
     }
     const sampling = config.sampling ?? { seed: 0 }
     if (
-      (typeof sampling.seed !== "bigint" && !Number.isSafeInteger(sampling.seed)) || sampling.seed < 0 ||
+      (!Predicate.isBigInt(sampling.seed) && !Number.isSafeInteger(sampling.seed)) || sampling.seed < 0 ||
       BigInt(sampling.seed) > 0xffff_ffff_ffff_ffffn
     ) {
       return yield* invalidInferenceConfig(`sampling.seed must be an unsigned 64-bit integer, got ${sampling.seed}`)
@@ -1870,7 +1875,7 @@ const resolveInferenceConfig = (
     if (config.speculation !== undefined) {
       const proposer = config.speculation.proposer
       if (
-        typeof proposer !== "object" || proposer === null ||
+        !Predicate.isObjectOrArray(proposer) ||
         !["Autoregressive", "HistoryLookup", "ParallelBlock"].includes(proposer._tag)
       ) {
         return yield* invalidInferenceConfig("speculation.proposer is not a supported speculation artifact")
@@ -1899,8 +1904,8 @@ const resolveInferenceConfig = (
       kvDtype: configuredKvDtype === "int8" ? "u8" : configuredKvDtype,
       batchSize,
       sampling,
-      ...(config.attentionWindow === undefined ? {} : { attentionWindow: config.attentionWindow }),
-      ...(speculation === undefined ? {} : { speculation })
+      attentionWindow: config.attentionWindow,
+      speculation
     }
   })
 
@@ -1915,7 +1920,7 @@ interface DecodeGeometry {
   readonly convLayers: number
   readonly convChannels: number
   readonly convKernel: number
-  readonly window?: number
+  readonly window: number | undefined
 }
 
 const decodeGeometry = (program: Tensor.DecodeProgram): DecodeGeometry => ({
@@ -1929,7 +1934,7 @@ const decodeGeometry = (program: Tensor.DecodeProgram): DecodeGeometry => ({
   convLayers: program.convLayers,
   convChannels: program.convChannels,
   convKernel: program.convKernel,
-  ...(program.window === undefined ? {} : { window: program.window })
+  window: program.window
 })
 
 const sameDecodeGeometry = (left: DecodeGeometry, right: DecodeGeometry): boolean =>
@@ -1957,7 +1962,7 @@ interface InferencePrograms {
   }
 }
 
-/** Packed verify widths compiled for a speculative plan, in ascending order. */
+/** Speculative-plan verify widths, compiled in ascending order. */
 const verifyWidths = (maxDraftTokens: number): ReadonlyArray<number> => {
   const widest = maxDraftTokens + 1
   // M=8 and M=16 have dedicated Metal MMA paths. With a 15-token DFlash
@@ -2092,8 +2097,8 @@ const traceInferenceProgram = (
             ...taps.map(() => "allRows" as const)
           ]
         }),
-      ...(packedCausalChains === undefined ? {} : { packedCausalChains }),
-      ...(config.attentionWindow === undefined ? {} : { window: config.attentionWindow })
+      packedCausalChains,
+      window: config.attentionWindow
     }).pipe(Effect.mapError((error) => new InferenceError({ op: "inference", message: error.message })))
     return { program, taps: routes }
   })
@@ -2219,7 +2224,7 @@ const compileProposerPlan = (
       kvDtype: config.kvDtype,
       batch: config.batchSize,
       currentBlockAttention: proposer.currentBlockAttention ?? "Causal",
-      ...(proposer.attentionWindow === undefined ? {} : { window: proposer.attentionWindow })
+      window: proposer.attentionWindow
     }).pipe(Effect.mapError((error) => new InferenceError({ op: "inference", message: error.message })))
     const compileReplay = (
       taps: ReadonlyArray<Runtime.InferenceTargetTapRoute>,
@@ -2241,8 +2246,8 @@ const compileProposerPlan = (
         // Decode specialization assigns independent state roots from last to first.
         // Reverse replay roots so semantic proposer layer N writes KV cache layer N.
         for (const { key, value } of [...keyValues].reverse()) {
-          // Stateful attention supplies transactional K/V append and cursor-relative transforms;
-          // replay orchestration discards these query outputs.
+          // Stateful attention appends K/V transactionally and applies cursor-relative
+          // transforms. Replay discards the query outputs.
           roots.push(
             yield* Tensor.scaledDotProductAttention(yield* Tensor.zerosLike(key), key, value, {
               causal: true,
@@ -2256,7 +2261,7 @@ const compileProposerPlan = (
           kvDtype: config.kvDtype,
           batch: config.batchSize,
           outputSelections: roots.map(() => "allRows" as const),
-          ...(proposer.attentionWindow === undefined ? {} : { window: proposer.attentionWindow })
+          window: proposer.attentionWindow
         }).pipe(Effect.mapError((error) => new InferenceError({ op: "inference", message: error.message })))
       })
     const replayPrefills: Array<Tensor.DecodeProgram> = []
@@ -2316,9 +2321,9 @@ const compileProposerPlan = (
         topology: "Chains",
         probabilities: output.probabilityRows === undefined ? "Unavailable" : "CausalNormalized",
         tokenIds: { kind: "StageOutput", stage: 0, output: 0 },
-        ...(output.probabilityRows === undefined
-          ? {}
-          : { probabilityRows: { kind: "StageOutput" as const, stage: 0, output: 1 } })
+        probabilityRows: output.probabilityRows === undefined
+          ? undefined
+          : { kind: "StageOutput" as const, stage: 0, output: 1 }
       },
       tokenMap: { kind: "Identity", fingerprint: "identity" },
       trainedMaxRows: proposer.maxDraftTokens
@@ -2548,8 +2553,8 @@ interface PrefillChunkPlan {
   readonly final: boolean
 }
 
-// This checks the public add calling convention only. Token values and model
-// vocabulary/position bounds are validated later while reading or executing.
+// This checks only the public add calling convention. Reading or execution
+// later validates token values and model vocabulary and position bounds.
 const validatePrompt = (
   prompt: Tensor.Any,
   config: ResolvedInferenceConfig,
@@ -2579,7 +2584,7 @@ const readTokenIds = (tokens: Tensor.Any): Effect.Effect<Array<number>, Inferenc
       const values = yield* Tensor.toTypedArray(tokens)
       const ids: Array<number> = []
       for (const value of values) {
-        if (typeof value !== "bigint" || value < 0n || value > 0xffff_ffffn) {
+        if (!Predicate.isBigInt(value) || value < 0n || value > 0xffff_ffffn) {
           return yield* new InferenceError({
             op: "prefill",
             message: `token ids must fit u32 for decode state, got ${String(value)}`
@@ -2761,8 +2766,8 @@ const closeLiveEntries = <Seq extends SessionSeq>(
   live: Array<LiveEntry<Seq>>
 ): Effect.Effect<void, Tensor.TensorError, Runtime.Runtime> => releaseLiveEntries(live, live.slice())
 
-// Lifecycle mutations are intentionally not wrapped by the step semaphore;
-// Generation's contract requires callers to keep them disjoint.
+// The step semaphore does not cover lifecycle mutations. Generation requires
+// callers to keep them disjoint.
 const validateStepEntries = (
   live: ReadonlyArray<LiveEntry<StatefulExecutionSeq>>,
   batchSize: number,
@@ -2962,19 +2967,17 @@ const nativeSampling = (sampling: GenerationSamplingOptions): Runtime.InferenceS
     temperature: sampling.temperature ?? 1,
     topK: sampling.topK ?? 0,
     topP: sampling.topP ?? 1,
-    seed: typeof seed === "bigint" ? seed : BigInt(seed)
+    seed: BigInt(seed)
   }
 }
 
 const nativeSamplingOverride = (
   sampling: Partial<GenerationSamplingOptions>
-): Partial<Runtime.InferenceSamplingOptions> => ({
-  ...(sampling.temperature === undefined ? {} : { temperature: sampling.temperature }),
-  ...(sampling.topK === undefined ? {} : { topK: sampling.topK }),
-  ...(sampling.topP === undefined ? {} : { topP: sampling.topP }),
-  ...(sampling.seed === undefined
-    ? {}
-    : { seed: typeof sampling.seed === "bigint" ? sampling.seed : BigInt(sampling.seed) })
+): Runtime.InferenceSamplingOverrides => ({
+  temperature: sampling.temperature,
+  topK: sampling.topK,
+  topP: sampling.topP,
+  seed: sampling.seed === undefined ? undefined : BigInt(sampling.seed)
 })
 
 const validateGenerationAdd = (
@@ -3002,7 +3005,7 @@ const validateGenerationAdd = (
     }
     const sampling = { ...defaults, ...entry.sampling }
     if (
-      (typeof sampling.seed !== "bigint" && !Number.isSafeInteger(sampling.seed)) || sampling.seed < 0 ||
+      (!Predicate.isBigInt(sampling.seed) && !Number.isSafeInteger(sampling.seed)) || sampling.seed < 0 ||
       BigInt(sampling.seed) > 0xffff_ffff_ffff_ffffn
     ) {
       return yield* new InferenceError({
@@ -3049,7 +3052,8 @@ const openGeneration = (engine: InferenceEngine): Effect.Effect<Generation, Infe
     ): Effect.Effect<ReadonlyArray<TokenPage>, InferenceError> =>
       Effect.gen(function*() {
         if (
-          result.roundId < 0n || result.roundId > 0xffff_ffff_ffff_ffffn || typeof result.recovered !== "boolean" ||
+          result.roundId < 0n || result.roundId > 0xffff_ffff_ffff_ffffn ||
+          !Predicate.isBoolean(result.recovered) ||
           result.pages.length !== expected.length
         ) {
           return yield* new InferenceError({
@@ -3070,7 +3074,7 @@ const openGeneration = (engine: InferenceEngine): Effect.Effect<Generation, Infe
           pages.push({
             seq: entry.seq,
             tokens: page.tokens,
-            ...(page.stopReason === undefined ? {} : { stopReason: page.stopReason })
+            stopReason: page.stopReason
           })
         }
         return pages
@@ -3100,10 +3104,10 @@ const openGeneration = (engine: InferenceEngine): Effect.Effect<Generation, Infe
                 native.add(session, {
                   entries: requests.map((request, index) => ({
                     prompt: promptValues[index]!,
-                    ...(request.sampling === undefined
-                      ? {}
-                      : { sampling: nativeSamplingOverride(request.sampling) }),
-                    ...(request.maxTokens === undefined ? {} : { maxTokens: request.maxTokens }),
+                    sampling: request.sampling === undefined
+                      ? undefined
+                      : nativeSamplingOverride(request.sampling),
+                    maxTokens: request.maxTokens,
                     eosTokens: request.eosTokens ?? []
                   }))
                 })
@@ -3205,9 +3209,9 @@ const openGeneration = (engine: InferenceEngine): Effect.Effect<Generation, Infe
             native.runRound(session, {
               entries: selected.map((entry, index) => ({
                 sequence: entry.handle,
-                ...(requests[index]!.sampling === undefined
-                  ? {}
-                  : { sampling: nativeSamplingOverride(requests[index]!.sampling) })
+                sampling: requests[index]!.sampling === undefined
+                  ? undefined
+                  : nativeSamplingOverride(requests[index]!.sampling)
               }))
             })
           )
@@ -3234,9 +3238,9 @@ const openGeneration = (engine: InferenceEngine): Effect.Effect<Generation, Infe
 /**
  * Materializes a model for stateful autoregressive generation and eagerly
  * compiles its complete deployment geometry. The same `forward` builder is
- * traced twice: fixed prompt chunks and fixed-width batched decode. Decode
- * specialization rewrites causal
- * attention to paged KV attention, KDA and short convolution to per-sequence
+ * traced twice, once for fixed prompt chunks and once for fixed-width batched
+ * decode. Decode specialization rewrites causal attention to paged KV
+ * attention, KDA and short convolution to per-sequence
  * recurrent operations, and learned/rotary position nodes to absolute-cursor-
  * offset forms. There is no shape-keyed growth or later tracing.
  *
@@ -3302,24 +3306,18 @@ export const inference = (
                 target: {
                   prefill: programs.prefill.map((program) => program.handle),
                   decode: programs.decode.handle,
-                  ...(programs.speculation === undefined
-                    ? {}
-                    : { verify: programs.speculation.verify.map((program) => program.handle) }),
+                  verify: programs.speculation?.verify.map((program) => program.handle),
                   pool: programs.pool.handle
                 },
-                ...(exactProposer === undefined
-                  ? {}
+                proposer: exactProposer === undefined
+                  ? undefined
                   : {
-                    proposer: {
-                      prefill: exactProposer.prefill.handle,
-                      decode: exactProposer.decode.handle,
-                      pool: exactProposer.pool.handle,
-                      maxDraftTokens: exactProposer.maxDraftTokens
-                    }
-                  }),
-                ...(programs.speculation?.generalized === undefined
-                  ? {}
-                  : { generalizedProposer: programs.speculation.generalized }),
+                    prefill: exactProposer.prefill.handle,
+                    decode: exactProposer.decode.handle,
+                    pool: exactProposer.pool.handle,
+                    maxDraftTokens: exactProposer.maxDraftTokens
+                  },
+                generalizedProposer: programs.speculation?.generalized,
                 batchSize: resolved.batchSize,
                 tokenDtype: resolved.tokenDtype,
                 sampling: nativeSampling(resolved.sampling)

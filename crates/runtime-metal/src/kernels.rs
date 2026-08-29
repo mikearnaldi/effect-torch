@@ -3,28 +3,24 @@
 //!
 //! # Conventions
 //!
-//! - **Kernel family per operation.** Each op follows the same four-layer
-//!   pattern: a private `*_pipeline` builder (emits MSL specialized to the
-//!   exact layout, dtype, and sizes), a public `compile_*`/`warm_*`
-//!   precompile entry point, an allocating wrapper, and a `*_into`
-//!   destination API that validates, requires the precompiled pipeline,
-//!   and dispatches without allocating.
-//! - **Layout-keyed pipelines.** Strided sources are handled by baking the
-//!   stride decomposition into the emitted source; the pipeline key hashes
-//!   shape and strides, so a different layout is a different kernel.
-//!   Destinations are always contiguous.
-//! - **Dtypes.** Unlike the fusion emitter (f32/bf16 only), these kernels
-//!   cover f32, f16, bf16, u8, u32, and i64; f64 has MSL syntax here but
-//!   is rejected at the value boundary (unsupported on Metal). Integer
-//!   fill/arange compute in 64-bit integer arithmetic — values above 2^24
-//!   have no exact f32 form.
-//! - **Dispatch topology.** One thread per output element over a padded
-//!   flat grid ([`MetalDevice::grid_flat`]), widening to 64-bit indexing
-//!   past `u32::MAX` elements; argreduce/cumsum use one thread per kept
-//!   slice and loop over the reduced dimension serially.
-//! - **RNG.** randn/uniform use a per-thread xoroshiro128+ seeded from the
-//!   global seed plus the element index, so results are deterministic per
-//!   seed regardless of dispatch shape.
+//! - Each operation has a private `*_pipeline` builder for its layout, dtype,
+//!   and sizes. A public `compile_*` or `warm_*` function precompiles it.
+//!   Allocating wrappers create destinations, while `*_into` functions
+//!   validate and dispatch without allocating.
+//! - Strided sources bake stride decomposition into the emitted source. The
+//!   pipeline key hashes shape and strides, so each layout gets a different
+//!   kernel. Destinations are contiguous.
+//! - These kernels support f32, f16, bf16, u8, u32, and i64. The fusion emitter
+//!   supports only f32 and bf16. f64 has MSL syntax here but the value boundary
+//!   rejects it because Metal does not support it. Integer fill and arange use
+//!   64-bit arithmetic because values above 2^24 have no exact f32 form.
+//! - Dispatch uses one thread per output element over a padded flat grid
+//!   ([`MetalDevice::grid_flat`]) and widens to 64-bit indexing past
+//!   `u32::MAX`. Argreduce and cumsum use one thread per kept slice and loop
+//!   serially over the reduced dimension.
+//! - randn and uniform use per-thread xoroshiro128+ seeded from the global seed
+//!   and element index. Results are deterministic for a seed regardless of
+//!   dispatch shape.
 
 use super::device::{set_buffer, set_bytes, Buffer, MetalDevice};
 use super::run::MetalTensor;
@@ -651,7 +647,7 @@ pub fn warm_randn(shape: &[usize]) -> Result<(), String> {
 }
 
 /// Allocates an f32 tensor of `shape` filled with standard-normal samples
-/// from `seed` (Box–Muller over a per-element seeded xoroshiro128+).
+/// from `seed` using Box-Muller over per-element seeded xoroshiro128+.
 pub fn randn(dev: &MetalDevice, shape: &[usize], seed: u64) -> Result<MetalTensor, String> {
     compile_randn(dev, shape)?;
     let out = MetalTensor::empty(dev, shape.to_vec(), DType::F32);
@@ -1328,8 +1324,8 @@ pub fn warm_cumsum(shape: &[usize], dtype: DType, dim: usize) -> Result<(), Stri
     compile_cumsum(MetalDevice::get(), shape, dtype, dim)
 }
 
-/// Allocating inclusive prefix sum along `dim` (one serial thread per
-/// slice — deterministic, O(n) per slice).
+/// Allocating inclusive prefix sum along `dim`. Each slice uses one serial
+/// thread, making the operation deterministic and O(n) per slice.
 pub fn cumsum(dev: &MetalDevice, x: &MetalTensor, dim: usize) -> Result<MetalTensor, String> {
     compile_cumsum_layout(dev, &x.layout, x.dtype, dim)?;
     let out = MetalTensor::empty(dev, x.layout.shape().to_vec(), x.dtype);

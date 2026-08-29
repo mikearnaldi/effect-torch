@@ -1,25 +1,24 @@
 //! [`MetalTensor`] and the fused elementwise/reduction runners.
 //!
-//! A `MetalTensor` is a buffer view plus a logical layout and dtype.
-//! Elementwise and reduction operations are executed by kernels
-//! synthesized per exact expression (`emit` module): the fusion IR is
-//! compiled to MSL once, cached under a structural hash key, and the
-//! runners only bind buffers and dispatch.
+//! A `MetalTensor` is a buffer view with a logical layout and dtype. The
+//! `emit` module synthesizes elementwise and reduction kernels for each
+//! expression. It compiles the fusion IR to MSL once and caches it under a
+//! structural hash. Runners only bind buffers and dispatch.
 //!
 //! # API shape
 //!
 //! Every operation comes in three layers:
 //!
-//! - `compile_*`/`warm_*` — emit and cache the pipeline for an exact
-//!   expression/layout without allocating or dispatching.
-//! - `run_*` — allocate destination tensors and dispatch (compiles on a
-//!   cache miss).
-//! - `run_*_into` — dispatch into caller-provided destinations; requires
-//!   the exact pipeline to be precompiled and performs no allocation, so
-//!   it is legal during executable dispatch.
+//! - `compile_*` and `warm_*` emit and cache a pipeline for an expression
+//!   and layout without allocating or dispatching.
+//! - `run_*` allocates destination tensors and dispatches. It compiles on a
+//!   cache miss.
+//! - `run_*_into` dispatches into caller-owned destinations. The pipeline
+//!   must be precompiled, and the function does not allocate, so executable
+//!   dispatch can call it.
 //!
 //! The `*_prekeyed` variants take a precomputed pipeline key so hot paths
-//! skip expression hashing and source emission entirely.
+//! skip both expression hashing and source emission.
 //!
 //! # Dispatch conventions
 //!
@@ -36,9 +35,8 @@ use crate::runtime::dtype::DType;
 use objc2_metal::MTLComputeCommandEncoder;
 use std::sync::Arc;
 
-/// A Metal tensor: shared buffer storage, a logical layout (shape,
-/// strides, element offset), and a dtype. Cloning is cheap — views share
-/// the buffer's physical allocation.
+/// Shared Metal buffer storage with a logical layout and dtype. Cloned views
+/// share the physical allocation.
 #[derive(Clone)]
 pub struct MetalTensor {
     pub buffer: Arc<super::device::Buffer>,
@@ -91,10 +89,9 @@ impl MetalTensor {
         self.layout.numel()
     }
 
-    /// Validates `self` as the destination of `operation`: exact shape and
-    /// dtype, contiguous layout, in-bounds byte range — then registers the
-    /// current stream as the buffer's next writer (cross-stream hazard
-    /// synchronization).
+    /// Validates the destination's shape, dtype, contiguous layout, and byte
+    /// range. It then registers the current stream as the next writer for
+    /// cross-stream synchronization.
     pub(crate) fn validate_destination(
         &self,
         operation: &str,
@@ -371,7 +368,7 @@ pub fn run_elementwise(
 }
 
 // Same kernel as run_elementwise, but the packed scalar buffer is supplied
-// directly (already device-resident) — no host readback anywhere.
+// directly because it is already device-resident. This needs no host readback.
 /// Allocates destinations and dispatches the fused kernel with a
 /// device-resident scalar buffer (no host upload).
 #[allow(clippy::too_many_arguments)]

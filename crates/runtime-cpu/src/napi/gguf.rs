@@ -1,11 +1,11 @@
 //! GGUF archive inspection and loading over the napi boundary.
 //!
-//! [`inspect_gguf`] parses only the header (metadata + tensor catalog);
-//! [`load_gguf`] additionally reads every tensor payload directly into
-//! freshly allocated CPU tensor storage. F32 tensors map to f32 storage;
-//! every quantized/other format is delivered as packed `u8` storage whose
-//! physical shape the descriptor reports. Both functions are async and
-//! observe the cancellation token while parsing and reading.
+//! [`inspect_gguf`] parses only the header, which contains metadata and the
+//! tensor catalog. [`load_gguf`] also reads every tensor payload directly
+//! into new CPU tensor storage. F32 tensors use f32 storage. Quantized and
+//! other formats use packed `u8` storage with the physical shape from the
+//! descriptor. Both functions are async and check the cancellation token
+//! while parsing and reading.
 
 use super::{run_compute, CancellationToken, NativeTensor};
 use crate::{Tensor, Value};
@@ -170,8 +170,8 @@ pub async fn inspect_gguf(
 }
 
 /// Loads every tensor of the GGUF archive at `path` into CPU tensors.
-/// Direct f32 loading requires a little-endian target; quantized formats
-/// arrive as packed `u8` payloads.
+/// Direct f32 loading requires a little-endian target. Quantized formats use
+/// packed `u8` payloads.
 #[napi]
 pub async fn load_gguf(
     path: String,

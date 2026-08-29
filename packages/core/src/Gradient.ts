@@ -16,7 +16,7 @@ import * as Tensor from "./Tensor.ts"
 /**
  * Error raised by {@link grad} for wrapper-level loss or target validation.
  * Unsupported or non-differentiable nodes, incompatible runtimes or
- * placements, and invalid backend results surface as
+ * placements, and invalid backend results are reported as
  * {@link Tensor.TensorError}; the `"not-differentiable"` reason is reserved and
  * is not currently emitted.
  *
@@ -56,8 +56,8 @@ const validateResult = (
     readonly dtype: Tensor.DType
     readonly placement: Runtime.Placement
   }
-): Tensor.Lazy => {
-  const candidate = value as Partial<Runtime.LazyTensorHandle>
+): Effect.Effect<Tensor.Lazy, Tensor.TensorError> => {
+  const candidate = value
   const placement = candidate.placement
   if (
     candidate._tag !== "LazyTensor" || candidate.dtype !== expected.dtype || !Array.isArray(candidate.shape) ||
@@ -69,7 +69,7 @@ const validateResult = (
     placement.ordinal !== expected.placement.ordinal || placement.memorySpace !== expected.placement.memorySpace ||
     placement.id !== runtime.placement.id || placement.deviceType !== runtime.placement.deviceType
   ) {
-    throw new Tensor.TensorError({
+    return new Tensor.TensorError({
       op,
       message:
         `${op}: backend returned invalid lazy tensor metadata; expected ${expected.dtype} [${expected.shape}], got ${
@@ -77,21 +77,21 @@ const validateResult = (
         } [${Array.isArray(candidate.shape) ? candidate.shape : "invalid shape"}]`
     })
   }
-  return value
+  return Effect.succeed(value)
 }
 
 /**
  * Computes the gradients of a scalar loss with respect to the given tensors.
- * The loss is an ordinary lazy graph value; there is no tracing and no
- * function transformation, the backward transform runs natively on the
- * graph itself, with adjoints expressed in the same node
- * vocabulary as the forward pass. Applying `grad` to a derivative graph can
- * produce higher-order derivatives only where all participating forward ops
- * and generated adjoint ops are themselves differentiable. Dedicated semantic
+ * The loss is an ordinary lazy graph value. The backward transform runs
+ * natively on the graph itself, without tracing or function transformation.
+ * Adjoints use the same node vocabulary as the forward pass. Applying `grad`
+ * to a derivative graph can produce higher-order derivatives only where all
+ * participating forward ops and generated adjoint ops are themselves
+ * differentiable. Dedicated semantic
  * backward nodes for cross entropy, RoPE, layer normalization, attention,
  * KDA, short convolution, and convolution do not currently provide a
  * second-order path. Unsupported or non-differentiable nodes in the native
- * autodiff transform surface as {@link Tensor.TensorError} rather than
+ * autodiff transform are reported as {@link Tensor.TensorError} rather than
  * `GradError`.
  *
  * The loss and every `wrt` tensor must use `f32`, `f64`, `f16`, or `bf16`, and
@@ -100,10 +100,9 @@ const validateResult = (
  * borrow the forward graph; this function does not evaluate or clear inputs. A
  * `wrt` tensor that does not influence the loss yields a zero gradient.
  * Because the loss and its gradients share the forward graph, evaluate them
- * together with
- * {@link Tensor.compute}: evaluating them separately recomputes the forward
- * pass and, if the graph contains `randn`, produces values from different
- * random draws.
+ * together with {@link Tensor.compute}. Evaluating them separately recomputes
+ * the forward pass. If the graph contains `randn`, the separate evaluations use
+ * different random draws.
  *
  * @since 0.1.0
  * @category autodiff
@@ -142,10 +141,7 @@ export const grad = (
         message: `grad: backend returned ${grads.length} tensors for ${wrt.length} targets`
       })
     }
-    return yield* Effect.try({
-      try: () => grads.map((value, index) => validateResult("grad", runtime, value, wrt[index])),
-      catch: (error) => error as Tensor.TensorError
-    })
+    return yield* Effect.forEach(grads, (value, index) => validateResult("grad", runtime, value, wrt[index]))
   })
 
 /**
@@ -166,14 +162,11 @@ export const stopGradient = (
       "stopGradient",
       runtime.node({ op: "stopGradient", inputs: [self] })
     )
-    return yield* Effect.try({
-      try: () => validateResult("stopGradient", runtime, handle, self),
-      catch: (error) => error as Tensor.TensorError
-    })
+    return yield* validateResult("stopGradient", runtime, handle, self)
   })
 
 /**
- * Gradient checkpointing: adds a lazy identity node with the input's metadata
+ * Gradient checkpointing adds a lazy identity node with the input's metadata
  * and value. When a backward walk crosses it, the transform rebuilds the
  * checkpointed region with fresh node identities so its forward intermediates
  * can be recomputed instead of retained. This trades recomputation for lower
@@ -191,10 +184,7 @@ export const checkpoint = (
   Effect.gen(function*() {
     const runtime = yield* Runtime.Runtime
     const handle = yield* fromBackend("checkpoint", runtime.node({ op: "checkpoint", inputs: [self] }))
-    return yield* Effect.try({
-      try: () => validateResult("checkpoint", runtime, handle, self),
-      catch: (error) => error as Tensor.TensorError
-    })
+    return yield* validateResult("checkpoint", runtime, handle, self)
   })
 
 const checkSameShapeDtype = (
@@ -219,7 +209,7 @@ const checkSameShapeDtype = (
   })
 
 /**
- * Vector-Jacobian product (reverse-mode pullback): given an output graph
+ * Vector-Jacobian product, or reverse-mode pullback. Given an output graph
  * `y` (built from `x` however you like), the primal `x`, and a cotangent
  * `v` with `y`'s shape, returns `J(x)^T v`, the gradient of `sum(y * v)`
  * with respect to `x`. `v` must exactly match `y`'s shape and dtype and use a
@@ -243,8 +233,8 @@ export const vjp = (
   })
 
 /**
- * Jacobian-vector product (forward-mode pushforward via
- * forward-over-reverse): given an output graph `y` built from `x`, the
+ * Jacobian-vector product, using a forward-mode pushforward through
+ * forward-over-reverse. Given an output graph `y` built from `x`, the
  * primal `x`, and a tangent `v` with `x`'s shape, returns `J(x) v`. This
  * construction uses second-order adjoints and therefore fails for operations
  * whose backward graph is not differentiable. `v` must exactly match `x`'s
@@ -262,8 +252,8 @@ export const jvp = (
 ): Effect.Effect<Tensor.Lazy, Tensor.TensorError | GradError, Runtime.Runtime> =>
   Effect.gen(function*() {
     yield* checkSameShapeDtype("jvp", x, v, "tangent")
-    // u is a free linearization point: g(u) = J(x)^T u is linear in u, and
-    // its own vjp at u = 0 with cotangent v is J(x) v
+    // u is a free linearization point. g(u) = J(x)^T u is linear in u, and
+    // its own vjp at u = 0 with cotangent v is J(x) v.
     const u = yield* Tensor.zerosLike(y)
     const loss1 = yield* Tensor.sum(yield* Tensor.mul(y, u))
     const [gradX] = yield* grad(loss1, [x])
@@ -273,8 +263,8 @@ export const jvp = (
   })
 
 /**
- * Maps the function implicit in a graph over a batch dimension: given an
- * output graph `y` built from the unbatched input `x`, and `batchedX`
+ * Maps the function implicit in a graph over a batch dimension. Given an output
+ * graph `y` built from the unbatched input `x`, and `batchedX`
  * equal to `x` with a batch dimension inserted at `dim`, returns the graph
  * of `y` applied elementwise along that dimension. `y` must depend on `x`.
  * The output batch axis is inserted at `min(dim, y.rank)`. This is a native
@@ -337,8 +327,9 @@ export const vmap = (
         attributes: { dim }
       })
     )
-    return yield* Effect.try({
-      try: () => validateResult("vmap", runtime, handle, { shape: outShape, dtype: y.dtype, placement: y.placement }),
-      catch: (error) => error as Tensor.TensorError
+    return yield* validateResult("vmap", runtime, handle, {
+      shape: outShape,
+      dtype: y.dtype,
+      placement: y.placement
     })
   })

@@ -2,81 +2,67 @@
 //!
 //! # Special-token segmentation
 //!
-//! [`NativeTokenizer::from_file`] and [`NativeTokenizer::from_json`] take a
-//! `parse_specials` flag. When it is `false`, encoding follows the tiktoken
-//! `allowed_special = "none"` discipline: raw text must never resolve to a
-//! special-token id. [`split_around_specials`] splits the input at every
-//! occurrence of a special-token string (longest match first), each segment
-//! is encoded separately with added-token matching disabled, and the piece
-//! encodings are merged. A segment that *is* exactly a special string is
-//! recursively split in half until no piece is itself special, defeating
-//! whole-word vocabulary lookups that would otherwise return the special
-//! id (see [`TokenizerInner::encode_segment`]). When `parse_specials` is
-//! `true` (or the tokenizer defines no special tokens), the input is
-//! passed to the underlying tokenizer untouched and specials parse
-//! normally.
+//! [`NativeTokenizer::from_file`] and [`NativeTokenizer::from_json`] accept a
+//! `parse_specials` flag. When it is `false`, raw text must not resolve to a
+//! special-token id, matching tiktoken's `allowed_special = "none"` policy.
+//! [`split_around_specials`] matches special-token strings longest first. It
+//! encodes each segment without added special tokens, then merges the results.
+//! [`TokenizerInner::encode_segment`] splits an exact special-token match until
+//! no piece is itself special. This prevents a whole-token vocabulary lookup
+//! from returning the special id. When `parse_specials` is `true`, or the
+//! tokenizer has no special tokens, the underlying tokenizer receives the
+//! input unchanged and parses special tokens normally.
 //!
-//! # Post-processor behavior
+//! # Postprocessor behavior
 //!
-//! In the segmented path the model pipeline runs per segment with
-//! `add_special_tokens = false`, so template post-processors (e.g. BERT's
-//! `[CLS]`/`[SEP]` insertion) do not fire per segment. Instead, after all
-//! segments are merged, the tokenizer's post-processor — if any — is
-//! applied exactly once to the merged encoding when the caller requested
-//! `add_special_tokens`. This mirrors encoding the whole text at once.
+//! The segmented path encodes each segment with `add_special_tokens = false`,
+//! so a template postprocessor does not add tokens such as BERT's `[CLS]` and
+//! `[SEP]` to every segment. If the caller requests special tokens, the code
+//! applies the tokenizer's postprocessor once after merging all segments.
 //!
-//! # Chat-template rendering
+//! # Chat template rendering
 //!
 //! [`NativeTokenizer::apply_chat_template`] renders a Hugging Face chat
-//! template with `minijinja`. The environment registers two helpers
-//! compatible with the Jinja environment used by `transformers`:
+//! template with `minijinja`. Its environment provides two helpers compatible
+//! with the Jinja environment in `transformers`.
 //!
-//! - `raise_exception(message)` — aborts rendering with `message` as the
-//!   error, letting templates fail loudly on unsupported inputs.
-//! - `strftime_now(format)` — formats the current UTC time. Supported
-//!   conversion codes are `%Y` (4-digit year), `%m` (month), `%d` (day),
-//!   `%H` (hour), `%M` (minute), `%S` (second), and `%%` (a literal `%`);
-//!   any other code is an error. The calendar conversion is the
-//!   civil-from-days algorithm ([`civil_from_days`]); no external date
-//!   library is involved.
+//! - `raise_exception(message)` stops rendering and returns `message` as the
+//!   error.
+//! - `strftime_now(format)` formats the current UTC time. It accepts `%Y`,
+//!   `%m`, `%d`, `%H`, `%M`, `%S`, and `%%`. Any other conversion code is an
+//!   error. [`civil_from_days`] performs the calendar conversion without an
+//!   external date library.
 //!
-//! The template context is supplied as a JSON string and deserialized to
-//! `serde_json::Value` before rendering.
+//! The renderer parses the JSON context into `serde_json::Value`.
 //!
-//! # Training: progress, cancellation, and threading
+//! # Training
 //!
-//! [`NativeTokenizer::train`] runs the whole training job inside
-//! `tokio::task::spawn_blocking`, so the CPU-bound feed and merge phases
-//! execute on the blocking thread pool and never stall the Node.js event
-//! loop. The returned promise resolves when training completes.
+//! [`NativeTokenizer::train`] runs the feed and merge phases in
+//! `tokio::task::spawn_blocking` so they do not block the Node.js event loop.
+//! The returned promise resolves when training finishes.
 //!
-//! The `tokenizers` crate exposes no progress hook, so progress is
-//! measured at the corpus feed: [`corpus_iter`] streams sequences from
-//! files (line by line, with byte totals from file metadata) or from
-//! in-memory texts, and [`ProgressFeed`] counts corpus bytes as the
-//! trainer pulls them, invoking the JS callback with
-//! `(processedBytes, totalBytes)` every `progressEveryBytes` bytes. A
-//! final `(total, total)` report pins completion when the feed is
-//! exhausted; the subsequent merge phase reports nothing. Passing
-//! `progressEveryBytes = 0` disables reporting entirely. The callback is a
-//! [`ThreadsafeFunction`] invoked in `NonBlocking` mode: calls are
-//! enqueued to the JS thread without awaiting execution, and failures to
-//! enqueue (e.g. after the JS side has torn down) are ignored.
+//! The `tokenizers` crate has no progress hook, so progress covers only the
+//! corpus feed. [`corpus_iter`] streams files line by line or reads in-memory
+//! texts. File totals come from metadata. [`ProgressFeed`] calls JavaScript
+//! with `(processedBytes, totalBytes)` after each `progressEveryBytes` bytes.
+//! It reports `(total, total)` when the feed ends. The merge phase sends no
+//! reports, and `progressEveryBytes = 0` disables reporting. The callback is a
+//! [`ThreadsafeFunction`] called in `NonBlocking` mode. Calls wait in the
+//! JavaScript queue without blocking training. The code ignores enqueue
+//! failures, including failures after JavaScript has shut down.
 //!
-//! There is **no cancellation**: once started, training runs to completion
-//! (or failure) on the blocking thread; dropping the promise on the JS
-//! side does not stop the underlying work.
+//! Training cannot be cancelled. Dropping the JavaScript promise does not stop
+//! the blocking task.
 //!
 //! # NAPI ownership
 //!
-//! [`NativeTokenizer`] holds its state behind an [`Arc`]<[`TokenizerInner`]>
-//! containing only CPU-heap data (vocabulary tables, merge rules, regexes).
-//! The `Arc` is cloned into `spawn_blocking` closures for batch encoding,
-//! keeping the tokenizer alive for the duration of background work while
-//! allowing concurrent use from JS. The native object owns no device
-//! buffers or file handles, so there is no explicit `dispose` — memory is
-//! reclaimed by NAPI finalization when the JS wrapper is garbage
-//! collected.
+//! [`NativeTokenizer`] stores CPU data such as vocabulary tables, merge rules,
+//! and regular expressions in an [`Arc`]<[`TokenizerInner`]>. Batch encoding
+//! clones the `Arc` into `spawn_blocking` tasks. This keeps the tokenizer alive
+//! during background work and permits concurrent JavaScript calls. The native
+//! object owns no device buffers or file handles. NAPI finalization frees its
+//! memory after JavaScript collects the wrapper, so it needs no explicit
+//! `dispose`.
 //!
 //! This module contains no `unsafe` code.
 
@@ -105,12 +91,11 @@ use tokenizers::{AddedToken, Encoding, PostProcessor, Tokenizer};
 
 /// Training corpus selector for [`NativeTokenizer::train`].
 ///
-/// Exactly one of `paths`/`texts` is expected, chosen by `tag`:
-/// `tag = "Files"` streams the files at `paths` line by line, while
-/// `tag = "Texts"` trains from the in-memory strings in `texts`.
+/// `tag = "Files"` requires `paths` and streams those files line by line.
+/// `tag = "Texts"` requires `texts` and trains from those in-memory strings.
 #[napi(object)]
 pub struct NativeTrainSource {
-    /// Corpus kind: `"Files"` or `"Texts"`.
+    /// Corpus kind. Must be `"Files"` or `"Texts"`.
     pub tag: String,
     /// File paths to stream when `tag` is `"Files"`.
     pub paths: Option<Vec<String>>,
@@ -121,16 +106,16 @@ pub struct NativeTrainSource {
 /// Configuration for [`NativeTokenizer::train`].
 #[napi(object)]
 pub struct NativeTrainConfig {
-    /// Model architecture: `"BPE"`, `"WordPiece"`, `"Unigram"`, or
-    /// `"WordLevel"`. Each architecture pairs the model with a fixed
-    /// normalizer/pre-tokenizer/decoder pipeline (see `train_tokenizer`).
+    /// Model architecture. Accepts `"BPE"`, `"WordPiece"`, `"Unigram"`, or
+    /// `"WordLevel"`. `train_tokenizer` defines each architecture's fixed
+    /// normalizer, pre-tokenizer, and decoder pipeline.
     pub model: String,
     /// Target vocabulary size, including special tokens.
     pub vocab_size: u32,
     /// Minimum corpus frequency for a token to enter the vocabulary.
     pub min_frequency: u32,
-    /// Special tokens to register (e.g. `"<|endoftext|>"`). They are added
-    /// to the vocabulary as special added tokens after training.
+    /// Special tokens to register, such as `"<|endoftext|>"`. Training adds
+    /// them to the vocabulary as special added tokens.
     pub special_tokens: Vec<String>,
     /// Training corpus.
     pub source: NativeTrainSource,
@@ -209,9 +194,8 @@ fn strftime_now(format: &str) -> MiniResult<String> {
     Ok(rendered)
 }
 
-/// Renders `template` against the JSON context `context_json` using the
-/// `minijinja` environment described in the module docs (with the
-/// `raise_exception` and `strftime_now` helpers registered).
+/// Renders `template` against `context_json` with the module's `minijinja`
+/// environment and its `raise_exception` and `strftime_now` helpers.
 fn render_chat_template(template: &str, context_json: &str) -> Result<String> {
     let context: serde_json::Value = serde_json::from_str(context_json).map_err(to_napi_error)?;
     let mut environment = Environment::new();
@@ -228,11 +212,9 @@ fn render_chat_template(template: &str, context_json: &str) -> Result<String> {
         .map_err(to_napi_error)
 }
 
-// Splits `text` at occurrences of special-token strings, keeping every piece
-// (the special occurrences included) as its own segment. Encoding each
-// segment separately through the model then guarantees that parsing raw text
-// can never produce a special-token id — the tiktoken `allowed_special`
-// discipline — while the special strings still tokenize as ordinary text.
+// Split around special-token strings and keep each match as a segment. Encoding
+// the segments separately prevents raw text from producing a special-token id
+// while still tokenizing the special strings as ordinary text.
 fn split_around_specials<'a>(text: &'a str, specials: &[String]) -> Vec<&'a str> {
     if specials.is_empty() {
         return vec![text];
@@ -286,10 +268,8 @@ impl TokenizerInner {
         }
     }
 
-    // Encodes one segment in the "never parse specials" path. A segment that
-    // is exactly a special-token string must tokenize as ordinary text, but
-    // the model's whole-word vocabulary lookup would resolve it to the
-    // special id directly — so split it until no piece is itself special.
+    // An exact special-token string must tokenize as ordinary text. Split it
+    // until no piece can resolve to the special id through a whole-token lookup.
     fn encode_segment(&self, segment: &str) -> Result<Encoding> {
         if segment.chars().count() > 1 && self.specials.iter().any(|sp| sp == segment) {
             let mut mid = segment.len() / 2;
@@ -345,17 +325,14 @@ impl TokenizerInner {
 
 /// A tokenizer instance exposed to JavaScript.
 ///
-/// Wraps a [`tokenizers::Tokenizer`] plus its special-token policy in an
-/// [`Arc`] so background batch work can hold a clone while the JS object
-/// remains usable. The instance is immutable after construction: encoding
-/// and decoding are safe to call concurrently, and there is no `dispose` —
-/// the memory (CPU heap only) is reclaimed by NAPI finalization when the
-/// JS wrapper is garbage-collected.
+/// An [`Arc`] holds the [`tokenizers::Tokenizer`] and its special-token policy
+/// while batch work runs in the background. The instance is immutable after
+/// construction, so encoding and decoding may run concurrently. NAPI
+/// finalization frees its CPU memory after JavaScript collects the wrapper.
 #[napi]
 pub struct NativeTokenizer {
-    // CPU-heap only (vocab tables, merges, regexes): reclaimed by napi
-    // finalization when the JS wrapper is garbage-collected, so there is no
-    // explicit dispose — unlike device-buffer handles.
+    // This holds only CPU data. NAPI finalization frees it, so unlike a device
+    // buffer handle, it needs no explicit dispose operation.
     inner: Arc<TokenizerInner>,
 }
 
@@ -365,12 +342,10 @@ impl NativeTokenizer {
         &self.inner
     }
 
-    /// Loads a tokenizer from a JSON file on disk (the Hugging Face
-    /// `tokenizer.json` format).
+    /// Loads a Hugging Face `tokenizer.json` file.
     ///
-    /// `parse_specials` selects the special-token policy described in the
-    /// module docs: `true` parses special-token strings in the input to
-    /// their ids; `false` guarantees raw text never produces a special id.
+    /// With `parse_specials = true`, special-token strings resolve to their
+    /// ids. With `false`, raw text does not produce a special id.
     #[napi(factory)]
     pub fn from_file(path: String, parse_specials: bool) -> Result<Self> {
         let tokenizer = Tokenizer::from_file(path).map_err(to_napi_error)?;
@@ -379,9 +354,8 @@ impl NativeTokenizer {
         })
     }
 
-    /// Loads a tokenizer from a JSON string (the Hugging Face
-    /// `tokenizer.json` format). Same `parse_specials` semantics as
-    /// [`NativeTokenizer::from_file`].
+    /// Loads a Hugging Face `tokenizer.json` string. `parse_specials` behaves
+    /// as described by [`NativeTokenizer::from_file`].
     #[napi(factory)]
     pub fn from_json(json: String, parse_specials: bool) -> Result<Self> {
         let tokenizer = Tokenizer::from_bytes(json.as_bytes()).map_err(to_napi_error)?;
@@ -392,13 +366,12 @@ impl NativeTokenizer {
 
     /// Trains a new tokenizer according to `config`.
     ///
-    /// The job runs on the tokio blocking thread pool; see the module docs
-    /// for the progress reporting contract (`progress` receives
-    /// `[processedBytes, totalBytes]` every `progressEveryBytes` bytes,
-    /// with a final `[total, total]` on feed completion; `0` disables
-    /// reports), the absence of cancellation, and the per-architecture
-    /// pipeline setup. `parse_specials` has the same meaning as in
-    /// [`NativeTokenizer::from_file`].
+    /// The job runs on Tokio's blocking thread pool and cannot be cancelled.
+    /// During the corpus feed, `progress` receives
+    /// `[processedBytes, totalBytes]` every `progressEveryBytes` bytes and a
+    /// final `[total, total]`. A zero interval disables reports. The module
+    /// docs describe each architecture's pipeline. `parse_specials` behaves as
+    /// described by [`NativeTokenizer::from_file`].
     #[napi(
         factory,
         ts_args_type = "config: NativeTrainConfig, parseSpecials: boolean, progress: (event: [number, number]) => void, progressEveryBytes: number"
@@ -419,7 +392,7 @@ impl NativeTokenizer {
         })
     }
 
-    /// Total vocabulary size, including added/special tokens.
+    /// Total vocabulary size, including added and special tokens.
     #[napi(getter)]
     pub fn vocab_size(&self) -> Result<u32> {
         Ok(self.inner().tokenizer.get_vocab_size(true) as u32)
@@ -439,8 +412,8 @@ impl NativeTokenizer {
         Ok(self.inner().tokenizer.id_to_token(id))
     }
 
-    /// Serializes the tokenizer to `path` in the Hugging Face
-    /// `tokenizer.json` format (without pretty-printing).
+    /// Saves the tokenizer to `path` as a compact Hugging Face
+    /// `tokenizer.json` file.
     #[napi]
     pub fn save(&self, path: String) -> Result<()> {
         self.inner()
@@ -451,10 +424,9 @@ impl NativeTokenizer {
 
     /// Encodes `text` to token ids.
     ///
-    /// `add_special_tokens` (default `true`) controls whether the
-    /// tokenizer's post-processor template tokens (e.g. `[CLS]`/`[SEP]`)
-    /// are added. The special-token segmentation behavior is governed by
-    /// the `parse_specials` flag chosen at construction, not by this flag.
+    /// `add_special_tokens` defaults to `true` and controls whether the
+    /// postprocessor adds template tokens such as `[CLS]` and `[SEP]`. The
+    /// `parse_specials` flag chosen at construction controls input segmentation.
     #[napi]
     pub fn encode(&self, text: String, add_special_tokens: Option<bool>) -> Result<Uint32Array> {
         Ok(self
@@ -465,8 +437,8 @@ impl NativeTokenizer {
 
     /// Encodes a batch of texts, always adding special tokens.
     ///
-    /// Runs on the tokio blocking thread pool and parallelizes across
-    /// texts with rayon; the input order is preserved in the output.
+    /// Tokio runs the job on its blocking thread pool. Rayon processes the
+    /// texts in parallel while preserving input order.
     #[napi]
     pub async fn encode_batch(&self, texts: Vec<String>) -> Result<Vec<Uint32Array>> {
         let inner = self.inner().clone();
@@ -480,9 +452,8 @@ impl NativeTokenizer {
         .map_err(to_join_error)?
     }
 
-    /// Decodes token ids back to text. `skip_special_tokens` (default
-    /// `false`) drops special tokens from the output instead of rendering
-    /// their string form.
+    /// Decodes token ids to text. `skip_special_tokens` defaults to `false`.
+    /// When enabled, it omits special tokens instead of rendering their strings.
     #[napi]
     pub fn decode(&self, ids: Vec<u32>, skip_special_tokens: Option<bool>) -> Result<String> {
         self.inner()
@@ -491,8 +462,8 @@ impl NativeTokenizer {
             .map_err(to_napi_error)
     }
 
-    /// Decodes a batch of id sequences; same `skip_special_tokens`
-    /// semantics as [`NativeTokenizer::decode`].
+    /// Decodes a batch of id sequences. `skip_special_tokens` behaves as
+    /// described by [`NativeTokenizer::decode`].
     #[napi]
     pub fn decode_batch(
         &self,
@@ -506,9 +477,9 @@ impl NativeTokenizer {
             .map_err(to_napi_error)
     }
 
-    /// Renders a Hugging Face chat template against a JSON context. See
-    /// the module docs for the rendering environment and the supported
-    /// `raise_exception`/`strftime_now` helpers.
+    /// Renders a Hugging Face chat template against a JSON context. The module
+    /// docs describe the environment and its `raise_exception` and
+    /// `strftime_now` helpers.
     #[napi]
     pub fn apply_chat_template(&self, template: String, context_json: String) -> Result<String> {
         render_chat_template(&template, &context_json)
@@ -524,12 +495,9 @@ fn added_specials(special_tokens: &[String]) -> Vec<AddedToken> {
 
 type ProgressCallback = ThreadsafeFunction<(f64, f64), Unknown<'static>, (f64, f64), Status, false>;
 
-// The crate offers no progress hook (its indicatif bars are internal and
-// disabled above), but it consumes the corpus through an iterator we own:
-// count corpus bytes as they are pulled and forward (processed, total) to
-// JS. The feed phase is the dominant cost on large corpora; the merge phase
-// afterwards is a black box, so completion of the feed is signalled by one
-// final (total, total) report when the iterator is exhausted.
+// The crate exposes no progress hook, and its internal indicatif bars are
+// disabled. Count bytes as the trainer pulls from this iterator. Report feed
+// completion as (total, total); the later merge phase exposes no progress.
 struct ProgressFeed<I> {
     inner: I,
     processed: u64,
@@ -548,7 +516,7 @@ impl<I: Iterator<Item = String>> Iterator for ProgressFeed<I> {
             Some(item) => {
                 self.processed += item.len() as u64;
                 if let Some(callback) = &self.report {
-                    // step 0 disables reporting entirely.
+                    // A zero step disables all reports.
                     if self.step > 0 && self.processed - self.last_reported >= self.step {
                         self.last_reported = self.processed;
                         let _ = callback.call(
@@ -562,9 +530,8 @@ impl<I: Iterator<Item = String>> Iterator for ProgressFeed<I> {
             None => {
                 if !self.finished {
                     self.finished = true;
-                    // Completion pins (total, total): Texts reach it exactly
-                    // (skip if already reported), Files undershoot by the
-                    // stripped newlines and need the pin.
+                    // Texts reach the total exactly. Files can fall short after
+                    // stripping newlines, so report (total, total) at the end.
                     if self.step > 0 && self.last_reported != self.total {
                         if let Some(callback) = &self.report {
                             let _ = callback.call(
@@ -584,9 +551,8 @@ impl<I: Iterator<Item = String>> Iterator for ProgressFeed<I> {
     }
 }
 
-// Streams the corpus as an iterator of sequences with a byte-exact total:
-// Texts from memory, Files line-by-line (so feeding GBs does not load them)
-// with totals from file metadata. Both sources share one training path.
+// Stream files line by line instead of loading the whole corpus. In-memory
+// texts use the same training path. File metadata provides byte totals.
 fn corpus_iter(
     source: NativeTrainSource,
     report: Option<ProgressCallback>,
@@ -610,8 +576,8 @@ fn corpus_iter(
                     |e| Error::new(Status::GenericFailure, format!("train: {path}: {e}")),
                 )?));
             }
-            // Line lengths exclude the stripped newline; +1 per line
-            // approximates raw bytes and the completion event pins total.
+            // Line lengths omit stripped newlines, so the completion event
+            // supplies the exact file-metadata total.
             let lines = readers
                 .into_iter()
                 .flat_map(|reader| reader.lines().map_while(|line| line.ok()))
@@ -658,12 +624,11 @@ fn run_trainer(
     Ok(())
 }
 
-// Rebuilds a trained Unigram model with byte_fallback enabled: the 256
-// `<0xXX>` byte pieces are appended to the trained vocab (existing ids are
-// stable) so text the trained pieces cannot cover — newlines, emoji,
-// scripts absent from the corpus — encodes as byte pieces and decodes back
-// losslessly, instead of collapsing to <unk>. The trainer's unk token
-// stays at id 0 for anything even bytes cannot rescue.
+// Rebuild the trained Unigram model with byte fallback. Append all 256
+// `<0xXX>` pieces without changing existing ids. Text outside the trained
+// vocabulary, including newlines, emoji, and unseen scripts, can then round
+// trip through byte pieces instead of collapsing to <unk>. The trainer's
+// unknown token remains at id 0.
 fn enable_byte_fallback(tokenizer: &mut Tokenizer) -> Result<()> {
     let ModelWrapper::Unigram(unigram) = tokenizer.get_model() else {
         return Err(Error::new(
@@ -675,8 +640,7 @@ fn enable_byte_fallback(tokenizer: &mut Tokenizer) -> Result<()> {
         .iter()
         .map(|(token, score)| (token.clone(), *score))
         .collect();
-    // Byte pieces get the lowest score: last-resort tokens, never chosen
-    // over a trained piece.
+    // Give byte pieces the lowest score so trained pieces win when available.
     let byte_score = pieces
         .iter()
         .map(|(_, score)| *score)
@@ -705,9 +669,8 @@ fn train_tokenizer(
     match config.model.as_str() {
         "BPE" => {
             let mut tokenizer = Tokenizer::new(BPE::default());
-            // GPT-2 byte-level setup: no prefix space, regex splitting on;
-            // the full 256-byte alphabet is seeded so bytes absent from a
-            // small corpus still encode (and decode) losslessly.
+            // Match GPT-2 byte-level behavior with no prefix space and regex
+            // splitting. Seed all 256 bytes so unseen bytes still round trip.
             tokenizer.with_pre_tokenizer(Some(ByteLevel::new(false, true, true)));
             tokenizer.with_decoder(Some(ByteLevelDecoder::default()));
             let mut trainer = TrainerWrapper::from(
@@ -750,14 +713,14 @@ fn train_tokenizer(
         "Unigram" => {
             let mut tokenizer = Tokenizer::new(Unigram::default());
             tokenizer.with_pre_tokenizer(Some(Metaspace::default()));
-            // LLaMA-style decoding: byte-fallback pieces back to bytes,
-            // then ▁ → space.
+            // Decode byte-fallback pieces to bytes, then replace the LLaMA
+            // metaspace marker with a space.
             tokenizer.with_decoder(Some(SequenceDecoder::new(vec![
                 ByteFallbackDecoder::default().into(),
                 MetaspaceDecoder::default().into(),
             ])));
-            // SentencePiece convention: <unk> at id 0 with model.unk_id set
-            // (the builder defaults unk_token to None).
+            // SentencePiece reserves id 0 for <unk>. The builder otherwise
+            // defaults unk_token to None.
             let mut specials = vec![AddedToken::from("<unk>".to_string(), true)];
             specials.extend(special_tokens);
             let mut trainer = TrainerWrapper::from(

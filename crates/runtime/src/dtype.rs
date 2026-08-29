@@ -1,10 +1,9 @@
 //! Element types shared by every backend.
 //!
-//! [`DType`] is a closed enumeration: new backends cannot extend it, so
-//! capability negotiation happens per backend via
-//! [`Capabilities`](crate::Capabilities) rather than through the type system.
-//! Quantized formats are deliberately absent — they are storage encodings
-//! (see [`GgmlKQuant`](crate::GgmlKQuant)), not compute dtypes.
+//! [`DType`] is a closed enumeration, so backends report their supported
+//! types through [`Capabilities`](crate::Capabilities). Quantized formats
+//! such as [`GgmlKQuant`](crate::GgmlKQuant) are storage encodings, not
+//! compute dtypes, and do not appear here.
 
 use std::fmt;
 
@@ -47,8 +46,7 @@ impl DType {
         }
     }
 
-    /// Returns `true` for the floating-point dtypes (`F32`, `F64`, `F16`,
-    /// `BF16`); used by validation that requires real-valued operands.
+    /// Returns `true` for `F32`, `F64`, `F16`, and `BF16`.
     pub fn is_float(self) -> bool {
         matches!(self, DType::F32 | DType::F64 | DType::F16 | DType::BF16)
     }

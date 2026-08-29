@@ -1,74 +1,65 @@
 //! Executable planning and execution for the Metal backend.
 //!
-//! This module lowers a compiler-prepared program
-//! ([`PreparedProgram`]) into an immutable [`MetalExecutable`] and runs
-//! it against caller-supplied bindings. Compilation is a one-shot,
-//! fail-loud pipeline:
+//! This module lowers a compiler-prepared [`PreparedProgram`] into an
+//! immutable [`MetalExecutable`] and runs it with caller bindings. Compilation
+//! runs once and returns errors immediately.
 //!
-//! 1. **Lowering** — the [`CompilerDriver`] walks the graph in
-//!    evaluation order and the [`Lowerer`] maps each semantic node to a
-//!    [`MetalOp`], recording value metadata, storage classes
-//!    ([`MetalValueStorage`]), constants, and bindings.
-//! 2. **Physical planning** — every operation gets an exact
-//!    [`MetalCommandPlan`] (the fused kernels' `*_requirements` types)
-//!    plus scratch/staging/status resource specs
-//!    ([`plan_command_resources`]), and the memory planner assigns each
-//!    value a [`Location`] inside shared workspace segments.
-//! 3. **Pipeline preparation** — every pipeline the physical plan can
-//!    reference is warmed up front (`MetalPreparedArtifacts` counts
-//!    them), so execution never blocks on the Metal shader compiler.
-//! 4. **Publication** — constants and compile-time submissions are
-//!    drained before the artifact becomes visible to callers.
+//! 1. The [`CompilerDriver`] walks the graph in evaluation order. The
+//!    [`Lowerer`] maps each semantic node to a [`MetalOp`] and records value
+//!    metadata, [`MetalValueStorage`] classes, constants, and bindings.
+//! 2. Each operation gets a [`MetalCommandPlan`] from its fused kernel
+//!    `*_requirements`, plus scratch, staging, and status resources from
+//!    [`plan_command_resources`]. The memory planner assigns each value a
+//!    [`Location`] in shared workspace segments.
+//! 3. Compilation warms every pipeline the physical plan can reference and
+//!    records the count in `MetalPreparedArtifacts`. Execution therefore does
+//!    not block on the Metal shader compiler.
+//! 4. Publication drains constants and compile-time submissions before callers
+//!    can access the artifact.
 //!
 //! ## Execution
 //!
-//! [`execute_with_commit`] validates the invocation against the
-//! program signature (counts, dtypes, placements, zero-offset
-//! contiguity), acquires workspace segments per the memory plan,
-//! resolves every value to a concrete buffer, then walks the
-//! **physical command stream** ([`MetalPhysicalCommand`]):
+//! [`execute_with_commit`] validates counts, dtypes, placements, and zero-offset
+//! contiguity against the program signature. It acquires workspace segments
+//! from the memory plan, resolves each value to a buffer, and walks the
+//! [`MetalPhysicalCommand`] stream.
 //!
-//! - `Encode(id)` dispatches one operation into the current command
-//!   buffer via [`execute_op_into`].
-//! - `StatusGate(id)` + `Commit` close the current command buffer
-//!   after a status-producing kernel (cross-entropy, quantized
-//!   embedding), so its device-side status word is readable on the
-//!   host while later commands keep encoding; the deferred checks run
-//!   after the final fence in command order.
-//! - `Complete` must be last — the stream is validated for exactly one
-//!   terminal completion.
+//! - `Encode(id)` calls [`execute_op_into`] to dispatch one operation into the
+//!   current command buffer.
+//! - `StatusGate(id)` followed by `Commit` closes the command buffer after a
+//!   status-producing cross-entropy or quantized embedding kernel. The host can
+//!   then read its status word while later commands continue encoding. Deferred
+//!   checks run in command order after the final fence.
+//! - `Complete` must be the stream's single final command.
 //!
-//! GPU synchronization happens **unconditionally** before any segment
-//! or output owner is released, and backend submission failures take
-//! precedence over host errors, panics (caught and re-raised as
-//! errors), and cancellation. The one exception is the deferred path
-//! ([`execute_stateful_deferred`]): prefill chunk loops encode each
-//! chunk onto one shared submission stream and return a
-//! [`PendingExecution`] that keeps the workspace lease and resolved
-//! values alive until a single batched drain fences the stream.
+//! The runtime always synchronizes the GPU before releasing segment or output
+//! owners. Backend submission failures take precedence over host errors,
+//! cancellation, and panics caught and returned as errors.
+//! [`execute_stateful_deferred`] is the exception: prefill chunk loops encode
+//! onto one shared stream and return [`PendingExecution`]. It keeps the
+//! workspace lease and resolved values alive until one batched drain fences the
+//! stream.
 //!
 //! ## Cancellation
 //!
-//! The [`CancellationFlag`] is polled before validation, before every
-//! encoded command, and again after synchronization; a set flag aborts
-//! with `"operation aborted"`. For stateful execution an additional
-//! `commit_allowed` gate runs after the GPU work completes (right after
-//! encoding on the deferred path).
+//! The runtime polls [`CancellationFlag`] before validation, before each
+//! encoded command, and after synchronization. A set flag returns
+//! `"operation aborted"`. Stateful execution also checks `commit_allowed`
+//! after GPU work completes, or after encoding on the deferred path.
 //!
 //! ## State transactions
 //!
-//! Decode executables carry a [`KvStateSchema`] and run against a
-//! [`MetalDecodeContext`] holding per-slot [`SeqState`]. Kernels write
-//! their next-state (KV slab rows, KDA state, conv window) into
-//! invocation-owned transaction buffers; only after the whole program
-//! succeeds does [`commit_state_transactions`] copy them into the
-//! slots' canonical state and advance cursors, so a failed or
-//! cancelled invocation never corrupts live decode state. Slot locking
-//! order is fixed (index order) and evictions apply only after commit.
-//! On the deferred path the copies are encoded as GPU-ordered device
-//! copies on the chunk's stream (ordered after the chunk's kernels and
-//! before the next chunk's readers) while cursor commits and evictions
-//! apply immediately, so consecutive chunks pipeline without a host
+//! Decode executables carry a [`KvStateSchema`] and use per-slot [`SeqState`]
+//! from [`MetalDecodeContext`]. Kernels write next-state KV slab rows, KDA
+//! state, and convolution windows into invocation-owned transaction buffers.
+//! After the program succeeds, [`commit_state_transactions`] copies them into
+//! canonical slot state and advances cursors. Failed or cancelled invocations
+//! cannot corrupt live decode state. Slots lock in index order, and evictions
+//! apply only after commit.
+//!
+//! The deferred path encodes GPU-ordered copies on the chunk's stream after its
+//! kernels and before the next chunk's readers. Cursor commits and evictions
+//! apply immediately, allowing consecutive chunks to pipeline without a host
 //! fence.
 
 use crate::value::Value;
@@ -130,10 +121,9 @@ pub(crate) struct ConvGeometry {
     pub kernel: usize,
 }
 
-/// Static schema of a decode executable's recurrent state: the KV
-/// pool shape and paging parameters plus the KDA and conv geometries.
-/// Compiled into the executable and compared against the decode
-/// context at invocation time — a mismatch is a hard error.
+/// Static recurrent-state schema for a decode executable. It contains the KV
+/// pool shape, paging parameters, and KDA and convolution geometries. Each
+/// invocation compares it with the decode context and rejects mismatches.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct KvStateSchema {
     pub max_tokens: usize,
@@ -1161,12 +1151,8 @@ fn declaration_layout(value: &MetalValueMetadata) -> effect_torch_runtime::Layou
     effect_torch_runtime::Layout::contiguous(value.shape.to_vec())
 }
 
-/// Computes the exact plan (fused-kernel requirements plus
-/// scratch/staging/status resources) of one lowered command. This is
-/// the heart of physical planning: every byte and every pipeline an
-/// invocation can touch is fixed here, before any execution.
-/// Merges independent decode-time quantized linears that share one
-/// input value and codec into a single `QuantizedLinearGroup` command
+/// Merges independent decode-time quantized linears that share an input and
+/// codec into one `QuantizedLinearGroup` command
 /// (2..=4 members, bias-free, non-MMA packed-dot shapes only). Member
 /// outputs stay distinct outputs of the merged command; an intervening
 /// instruction that writes the shared input or a member weight stops
@@ -2464,13 +2450,12 @@ pub(super) struct MetalExecutable {
     state_cursor: Option<ValueId>,
 }
 
-/// Marks physical encode commands whose results feed only program output
-/// 0 — the logits row of a last-token-row prefill program. A headless
-/// invocation (a prefill chunk that does not finish a prompt) skips them:
-/// decode-state side effects and tap outputs still execute, the LM head
-/// and its epilogue do not. The mark is a pure function of the dataflow —
-/// reverse liveness seeded from every output except 0 plus every
-/// state-effect instruction — and callers choose elision per invocation.
+/// Marks encode commands whose results feed only output 0, the logits row of a
+/// last-token-row prefill program. A headless prefill chunk skips those commands
+/// when it does not finish a prompt. Decode-state effects and tap outputs still
+/// run, but the LM head and its epilogue do not. Reverse liveness over every
+/// output except 0 and every state-effect instruction determines the mark.
+/// Callers choose whether to skip marked commands for each invocation.
 fn mark_head_only_commands(
     program: &LoweredProgram<MetalInstruction, NativeMemorySpace, MetalLoweredValue>,
     physical: &[MetalPhysicalCommand],
@@ -6019,16 +6004,13 @@ enum TransactionCopyMode {
     Device,
 }
 
-/// Publishes the results of a successful stateful invocation: copies
-/// each state transaction (KDA state tiles, conv windows) into the
-/// slots' canonical state tensors, then commits cursors and applies
-/// window evictions. Runs only after every kernel, deferred check, and
-/// the cancellation gate have passed on the synchronous path
-/// ([`TransactionCopyMode::Host`]), or — for the deferred path
-/// ([`TransactionCopyMode::Device`]) — right after the invocation's
-/// kernels were encoded, with the copies themselves encoded as
-/// GPU-ordered device copies and only the cursor/eviction metadata
-/// applied on the host.
+/// Publishes a successful stateful invocation. It copies each KDA state tile
+/// and convolution window into canonical slot state, commits cursors, and
+/// applies window evictions. [`TransactionCopyMode::Host`] runs only after all
+/// kernels, deferred checks, and the cancellation gate pass.
+/// [`TransactionCopyMode::Device`] runs after the deferred path encodes the
+/// invocation's kernels. It encodes GPU-ordered state copies and applies only
+/// cursor and eviction metadata on the host.
 fn commit_state_transactions(
     executable: &MetalExecutable,
     resolved: &[Option<Value>],
@@ -6449,8 +6431,8 @@ pub(super) fn execute_with_scalars(
 /// Selects one leading logical row for a later executable binding without a
 /// host round trip. Row zero remains a zero-copy view when its offset is zero;
 /// other rows are materialized by a device copy because executable bindings
-/// deliberately require contiguous, zero-offset storage.
-#[allow(dead_code)] // Called by the retained N-API DAG foundation and its Metal tests.
+/// require contiguous, zero-offset storage.
+#[allow(dead_code)] // Used by the N-API DAG code and Metal tests.
 pub(super) fn route_leading_row(value: &Value, row: usize) -> Result<(Value, bool), String> {
     let tensor = value.as_metal()?;
     let rows = tensor
@@ -7083,12 +7065,11 @@ impl PendingExecution {
         run_quantized_embedding_checks(&self.prepared.quantized_embedding_checks)
     }
 
-    /// Fences the stream once and finishes every pending in order, then
-    /// releases their workspaces. On failure the error is returned and the
-    /// remaining pendings are dropped (already fenced, so safely); CPU-side
-    /// cursor metadata for optimistically committed chunks may then be
-    /// inconsistent — the session errors out, as a synchronous failure
-    /// would.
+    /// Fences the stream once, finishes each pending in order, and releases its
+    /// workspace. On failure it returns the error and safely drops the remaining
+    /// pendings after the fence. Optimistically committed CPU cursor metadata
+    /// may then be inconsistent, so the session returns an error as the
+    /// synchronous path would.
     pub(crate) fn drain_batch(pendings: Vec<PendingExecution>) -> Result<(), String> {
         if pendings.is_empty() {
             return Ok(());
@@ -7170,9 +7151,9 @@ pub(crate) fn execute_stateful_deferred(
         }
     };
     if prepared.dispatch_result.is_err() || cancelled.load(Ordering::Relaxed) || !commit_allowed() {
-        // Reuse the synchronous finisher: it fences, runs the deferred
-        // checks in order, surfaces the dispatch error, and — because one
-        // of the gates above failed — never commits state.
+        // The synchronous finisher fences, runs deferred checks in order, and
+        // returns the dispatch error. It does not commit state because one of
+        // the gates above failed.
         let result = finish_prepared(
             prepared,
             executable,

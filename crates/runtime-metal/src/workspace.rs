@@ -4,23 +4,18 @@
 //! dispatch time [`acquire`] leases each segment from a process-wide
 //! [`WorkspacePool`]. Pool invariants:
 //!
-//! - **Capacity classes.** Keys are `(memory space, alignment,
-//!   capacity_class)` where the class is the request rounded up to the
-//!   alignment. A lease is never served from a larger capacity class, so a
-//!   small plan cannot pin a huge idle buffer.
-//! - **Bounded idle bytes.** The pool keeps at most
-//!   `EFFECT_TORCH_WORKSPACE_POOL_MB` (default: one quarter of the
-//!   device's recommended working set) of idle storage; leases are
-//!   best-fit LRU within that bound.
-//! - **Retention.** `ProvisionalOutput` segments get their own lease that
-//!   is wrapped in a [`BufferRetention`] and attached to the output buffer
-//!   views, so an output handed to the caller keeps its pool storage alive
-//!   until the last view drops — the pool's leased count only falls when
-//!   the output is truly gone.
-//! - **Lifetime.** The returned [`InvocationResources`] must outlive the
-//!   encoded command buffers of the invocation; dropping it returns
-//!   workspace segments to the pool (use tokens in `device` still protect
-//!   in-flight storage from premature reuse).
+//! - Keys contain memory space, alignment, and the request rounded up to that
+//!   alignment. A lease never comes from a larger capacity class, so a small
+//!   plan cannot pin a large idle buffer.
+//! - The pool keeps at most `EFFECT_TORCH_WORKSPACE_POOL_MB` of idle storage.
+//!   The default is one quarter of the device's recommended working set. It
+//!   uses best-fit LRU within that bound.
+//! - Each `ProvisionalOutput` gets its own lease. A [`BufferRetention`] on
+//!   the output views keeps pool storage alive until the last view drops. The
+//!   pool's leased count falls only when the output is gone.
+//! - [`InvocationResources`] must outlive the invocation's encoded command
+//!   buffers. Dropping it returns workspace segments to the pool. Use tokens
+//!   in `device` still prevent reuse while the GPU can access the storage.
 
 use crate::device::{Buffer, BufferRetention, MetalDevice};
 use effect_torch_runtime::{

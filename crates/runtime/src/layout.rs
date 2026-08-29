@@ -1,24 +1,22 @@
 //! Tensor shape/stride/offset geometry.
 //!
 //! A [`Layout`] maps logical coordinates to element offsets in a backing
-//! buffer: the offset of coordinate `c` is
+//! buffer. The offset of coordinate `c` is
 //! `offset + Σ c[d] * strides[d]`, expressed in *elements*, not bytes.
 //!
 //! # Invariants
 //!
-//! - `shape.len() == strides.len()` (enforced by [`Layout::new`] with a
-//!   panic; layouts are compiler-constructed values, so a rank mismatch is
-//!   a bug, not a user error).
-//! - Zero-sized dimensions are allowed; [`Layout::checked_max_index`]
-//!   reports 0 for any layout containing a zero dimension regardless of
-//!   offset or strides, so empty tensors never imply readable storage.
-//! - All size arithmetic has a checked form (`checked_numel`,
-//!   `checked_max_index`, `checked_byte_size`) returning `None` on
-//!   overflow; the panicking forms (`numel`, `max_index`, `byte_size`)
-//!   exist for contexts that have already validated the layout.
+//! - `shape.len() == strides.len()`. [`Layout::new`] panics on a mismatch
+//!   because the compiler constructs layouts and a mismatched rank is a bug.
+//! - Zero-sized dimensions are allowed. [`Layout::checked_max_index`] returns
+//!   0 for a layout containing a zero dimension, regardless of its offset or
+//!   strides. An empty tensor therefore has no readable storage.
+//! - Checked size methods (`checked_numel`, `checked_max_index`, and
+//!   `checked_byte_size`) return `None` on overflow. Their panicking
+//!   counterparts (`numel`, `max_index`, and `byte_size`) panic.
 //!
-//! Views (`permute`, `narrow`, `broadcast_to`) share the parent's offset
-//! and strides; `broadcast_to` uses stride 0 for broadcast dimensions.
+//! Views (`permute`, `narrow`, and `broadcast_to`) share the parent's offset
+//! and strides. `broadcast_to` uses stride 0 for broadcast dimensions.
 
 use crate::DType;
 
@@ -81,7 +79,7 @@ impl Layout {
         self.offset
     }
 
-    /// Number of dimensions (may be 0 for a scalar).
+    /// Number of dimensions. Scalars have rank 0.
     pub fn rank(&self) -> usize {
         self.shape.len()
     }
@@ -90,23 +88,23 @@ impl Layout {
     ///
     /// # Panics
     ///
-    /// Panics on `usize` overflow; use [`checked_numel`](Self::checked_numel)
-    /// for untrusted shapes.
+    /// Panics on `usize` overflow. Use
+    /// [`checked_numel`](Self::checked_numel) for untrusted shapes.
     pub fn numel(&self) -> usize {
         self.checked_numel().expect("layout element count overflow")
     }
 
-    /// Checked total element count (`None` on overflow). Empty layouts and
-    /// scalars report 0 and 1 respectively.
+    /// Returns the total element count, or `None` on overflow. Empty layouts
+    /// have 0 elements. Scalars have 1.
     pub fn checked_numel(&self) -> Option<usize> {
         self.shape
             .iter()
             .try_fold(1usize, |count, &dim| count.checked_mul(dim))
     }
 
-    /// Whether the layout is densely packed row-major, ignoring dimensions
-    /// of size 1 (whose strides are irrelevant). Returns `false` if the
-    /// running stride product overflows.
+    /// Returns `true` for a densely packed row-major layout. Strides do not
+    /// matter for dimensions of size 1. Returns `false` if the running stride
+    /// product overflows.
     pub fn is_contiguous(&self) -> bool {
         let mut acc = 1usize;
         for d in (0..self.shape.len()).rev() {
@@ -123,9 +121,9 @@ impl Layout {
         true
     }
 
-    /// View with dimensions reordered by `axes` (`axes[i]` is the source
-    /// dimension of output dimension `i`). Shape and strides are permuted;
-    /// the offset is unchanged.
+    /// Returns a view with dimensions reordered by `axes`. `axes[i]` is the
+    /// source dimension of output dimension `i`. The view permutes shape and
+    /// strides but keeps the offset.
     ///
     /// # Panics
     ///
@@ -139,9 +137,8 @@ impl Layout {
         }
     }
 
-    /// View broadcast to a higher-or-equal-rank `shape`. Dimensions of
-    /// size 1 that expand get stride 0; new leading dimensions also get
-    /// stride 0.
+    /// Returns a view broadcast to a `shape` of equal or higher rank.
+    /// Expanded dimensions of size 1 and new leading dimensions get stride 0.
     ///
     /// # Panics
     ///
@@ -168,8 +165,9 @@ impl Layout {
         }
     }
 
-    /// View restricted to `start..start + len` along `dim`; the offset is
-    /// advanced by `start * strides[dim]` and strides are preserved.
+    /// Returns a view restricted to `start..start + len` along `dim`. The
+    /// method advances the offset by `start * strides[dim]` and preserves the
+    /// strides.
     ///
     /// # Panics
     ///
@@ -185,12 +183,12 @@ impl Layout {
         }
     }
 
-    /// Number of elements a backing buffer must have for this layout:
+    /// Number of elements a backing buffer must have for this layout,
     /// `offset + Σ (shape[d] - 1) * strides[d] + 1`.
     ///
     /// # Panics
     ///
-    /// Panics on `usize` overflow; use
+    /// Panics on `usize` overflow. Use
     /// [`checked_max_index`](Self::checked_max_index) for untrusted layouts.
     pub fn max_index(&self) -> usize {
         self.checked_max_index()
@@ -198,8 +196,8 @@ impl Layout {
     }
 
     /// Checked form of [`max_index`](Self::max_index). Returns `Some(0)`
-    /// for layouts with any zero-sized dimension (no storage is addressable)
-    /// and `None` on arithmetic overflow.
+    /// for a layout with any zero-sized dimension because it cannot address
+    /// storage. Returns `None` on arithmetic overflow.
     pub fn checked_max_index(&self) -> Option<usize> {
         if self.shape.contains(&0) {
             return Some(0);
@@ -221,7 +219,7 @@ impl Layout {
     ///
     /// # Panics
     ///
-    /// Panics on `usize` overflow; use
+    /// Panics on `usize` overflow. Use
     /// [`checked_byte_size`](Self::checked_byte_size) for untrusted layouts.
     pub fn byte_size(&self, dtype: DType) -> usize {
         self.checked_byte_size(dtype)
@@ -229,8 +227,8 @@ impl Layout {
     }
 }
 
-/// Broadcasts two shapes NumPy-style: right-aligned, dimensions must be
-/// equal or 1, missing leading dimensions count as 1.
+/// Broadcasts two shapes using NumPy rules. Dimensions align from the right,
+/// must be equal or 1, and missing leading dimensions count as 1.
 ///
 /// # Panics
 ///

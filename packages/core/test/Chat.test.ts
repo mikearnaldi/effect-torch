@@ -25,11 +25,13 @@ const tokenTexts = new Map([
   [6, " text"]
 ])
 
-const makeTokenizer = (captured: {
+interface TokenizerCapture {
   rendered?: string
   addSpecialTokens?: boolean
-  variables?: Readonly<Record<string, unknown>>
-}): Chat.ChatTokenizer => ({
+  variables?: Parameters<Chat.ChatTokenizer["applyChatTemplate"]>[2]["variables"]
+}
+
+const makeTokenizer = (captured: TokenizerCapture): Chat.ChatTokenizer => ({
   applyChatTemplate: (_template, messages, options) =>
     Effect.sync(() => {
       captured.variables = options.variables ?? {}
@@ -88,6 +90,7 @@ const makeProgram = (
     cursor: () => Effect.succeed(0),
     finish: () => Effect.void
   }
+  // SAFETY: The scripted program never submits this opaque sequence placeholder to a runtime.
   const executionSeq: Model.StatefulExecutionSeq = {
     _tag: "StatefulExecutionSeq",
     sequence: {} as Tensor.KvSequence,
@@ -180,11 +183,7 @@ onDevices("Chat", () => (it) => {
   describe("Chat.stream", () => {
     it.effect("streams structured reasoning and content segments from control tokens", () =>
       Effect.gen(function*() {
-        const captured: {
-          rendered?: string
-          addSpecialTokens?: boolean
-          variables?: Readonly<Record<string, unknown>>
-        } = {}
+        const captured: TokenizerCapture = {}
         const programState = { closed: false }
         const events = Array.from(
           yield* Stream.runCollect(Chat.stream({
@@ -309,7 +308,7 @@ onDevices("Chat", () => (it) => {
 
     it.effect("clears unread logits when downstream stops after prefill", () =>
       Effect.gen(function*() {
-        const programState: { closed: boolean; logits: Array<Tensor.Concrete> } = { closed: false, logits: [] }
+        const programState = { closed: false, logits: Array<Tensor.Concrete>() } satisfies ProgramState
         const events = Array.from(
           yield* Stream.runCollect(
             Chat.stream({
@@ -332,7 +331,7 @@ onDevices("Chat", () => (it) => {
 
     it.effect("clears each consumed logits row before the stream ends", () =>
       Effect.gen(function*() {
-        const programState: { closed: boolean; logits: Array<Tensor.Concrete> } = { closed: false, logits: [] }
+        const programState = { closed: false, logits: Array<Tensor.Concrete>() } satisfies ProgramState
         let inspected = false
         yield* Chat.stream({
           program: makeProgram([5, 6], programState),

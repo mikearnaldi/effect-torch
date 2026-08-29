@@ -1,11 +1,11 @@
-// Metal compiled-program timing at one training-scale bf16 QKV shape.
-// `Tensor.compile` traces and compiles lazily, so the untimed call pays the
-// trace/native compile and warms pipelines. The supplied a/b values remain lazy,
-// however: every timed `call` first materializes fresh randn+bf16 inputs, then
-// runs the cached matmul program and clears its output. Reported GFLOP/s counts
-// only GEMM arithmetic despite including input generation, dispatch, completed
-// execution, and release, so it is not isolated GEMM throughput. ITERS is an
-// unvalidated environment override.
+// Times a Metal compiled program at one training-scale bf16 QKV shape.
+// `Tensor.compile` traces and compiles lazily. The untimed call triggers tracing
+// and native compilation, then warms the pipelines. The supplied a/b values stay
+// lazy. Every timed `call` materializes fresh randn+bf16 inputs, runs the cached
+// matmul program, waits for execution, and clears the output. The GFLOP/s
+// numerator counts GEMM arithmetic. Its timing denominator includes input
+// generation, dispatch, execution, and release, so this is not isolated GEMM
+// throughput. ITERS passes through `Number` without validation.
 
 import * as BackendApple from "@effect-torch/backend-apple-native"
 import { Tensor } from "@effect-torch/core"

@@ -10,7 +10,10 @@ const tmpdir = Effect.sync(() => fs.mkdtempSync(path.join(os.tmpdir(), "effect-t
 
 const values = (t: Tensor.Any) => Tensor.toNumberArray(t)
 
-const identityForward: Model.Definition["forward"] = (_, input) => Effect.succeed(input as Tensor.Lazy)
+const identityForward: Model.Definition["forward"] = (_, input) => {
+  if (!Tensor.isLazyTensor(input)) return Effect.die("identity test model requires a lazy input")
+  return Effect.succeed(input)
+}
 
 const mlp = Effect.gen(function*() {
   return yield* Model.chain(
@@ -717,7 +720,7 @@ onDevices("Model", () => (it) => {
 
     it.effect("merge rejects an empty array and duplicate parameter names", () =>
       Effect.gen(function*() {
-        const empty = yield* Effect.flip(Model.merge([], () => Effect.succeed(null as never)))
+        const empty = yield* Effect.flip(Model.merge([], () => Effect.die("empty merge callback must not run")))
         expect(empty.message).toContain("at least one")
         const error = yield* Effect.flip(
           Model.merge([yield* Model.linear("fc", 2, 2), yield* Model.linear("fc", 2, 2)], (x, y) => Tensor.add(x, y))

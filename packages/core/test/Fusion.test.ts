@@ -103,8 +103,8 @@ onDevices("Fusion", () => (it) => {
       Effect.gen(function*() {
         const build = Effect.gen(function*() {
           const x = yield* Tensor.fromTypedArray(floats([0.5, -1, 2, -3, 0.25, 1.5]), [2, 3])
-          // sigmoid and silu are composed from tanh; gelu from erf — all
-          // should ride the same fused regions
+          // Sigmoid and SiLU are composed from tanh, and GELU from erf. They
+          // should all use the same fused regions.
           const y = yield* Tensor.silu(yield* Tensor.tanh(x))
           const z = yield* Tensor.gelu(yield* Tensor.abs(y))
           const loss = yield* Tensor.sum(yield* Tensor.mul(z, y))
@@ -221,8 +221,8 @@ onDevices("Fusion", () => (it) => {
     it.effect("a shared fused prefix compiles to one multi-output kernel", () =>
       Effect.gen(function*() {
         const build = Effect.gen(function*() {
-          // y is a fused region with several consumers: the fused
-          // continuations (z, w) merge with it into one multi-output
+          // y is a fused region with several consumers. The fused continuations
+          // (z, w) merge with it into one multi-output
           // kernel, while the unfused consumer (sum) keeps y materialized.
           // Small magnitudes: sin of a large argument would amplify the
           // (valid) rounding difference between inlined and materialized y
@@ -254,8 +254,8 @@ onDevices("Fusion", () => (it) => {
 
     it.effect("regions folding to zero lanes evaluate plainly", () =>
       Effect.gen(function*() {
-        // relu(full + full): both operands fold to constants, leaving a
-        // region with no input lanes — it must not reach the fused node
+        // Both operands in relu(full + full) fold to constants. The resulting
+        // region has no input lanes and must not reach the fused node.
         const y = yield* Tensor.relu(yield* Tensor.add(yield* Tensor.full([], 1), yield* Tensor.full([], 2)))
         const fused = yield* withFusion(true, values(y))
         const unfused = yield* withFusion(false, values(y))
@@ -391,8 +391,8 @@ onDevices("Fusion", () => (it) => {
     it.effect("select does not propagate NaN from the unselected side (klDiv with zero targets)", () =>
       Effect.gen(function*() {
         const build = Effect.gen(function*() {
-          // log(0) = -inf and 0 * -inf = NaN in the masked branch: an
-          // arithmetic mask would poison the result, a true select must not
+          // log(0) = -inf and 0 * -inf = NaN in the masked branch. An
+          // arithmetic mask would poison the result, but a true select must not.
           const probs = yield* Tensor.fromTypedArray(floats([0, 0.3, 0, 0.1, 0, 0.25]), [2, 3])
           const logPred = yield* Tensor.log(
             yield* Tensor.fromTypedArray(
@@ -600,16 +600,16 @@ onDevices("Fusion", () => (it) => {
 
     it.effect("nested shared prefixes with deep lane ancestry merge and terminate", () =>
       Effect.gen(function*() {
-        // Regression: the multi-output merge used to keep the original
+        // The multi-output merge used to keep the original
         // lane nodes alive in the merged kernel's inputs, so every round
-        // retained and re-merged the old subgraph — the rewrite grew
+        // retained and re-merged the old subgraph. The rewrite grew
         // without bound on graphs with nested sharing (deep lane
         // ancestry). Each level here shares a fused prefix between fused
         // continuations and a reduce consumer, which is exactly the
         // shape that blew up.
         const build = Effect.gen(function*() {
           const x = yield* Tensor.fromTypedArray(floats([0.5, -1, 2, -3, 0.25, 1.5]), [2, 3])
-          let acc = x as Tensor.Any
+          let acc = x
           const terms: Array<Tensor.Any> = []
           for (let level = 0; level < 6; level++) {
             const shared = yield* Tensor.tanh(

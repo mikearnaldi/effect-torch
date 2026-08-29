@@ -8,10 +8,10 @@ const numberFromBits = (high: number, low: number): number => {
   return view.getFloat64(0, false)
 }
 
-// Exceptional IEEE-754 values and -0 are keyed by raw bits; ordinary finite
+// Cache keys use raw bits for exceptional IEEE-754 values and -0. Ordinary finite
 // values remain numbers so structurally equal attributes share cache entries.
 describe("CPU executable structural cache", () => {
-  it("keeps every representable special-number key distinct", () => {
+  it("distinguishes special numbers by raw bits", () => {
     const values = [
       numberFromBits(0x7ff8_0000, 0x0000_0001),
       numberFromBits(0x7ff8_0000, 0x0000_0002),
@@ -31,7 +31,7 @@ describe("CPU executable structural cache", () => {
     expect(normalizedStructure(-0)).toEqual({ $number: "8000000000000000" })
   })
 
-  it("keeps finite keys deterministic and preserves attribute normalization", () => {
+  it("normalizes finite values and attributes deterministically", () => {
     const nextAfterOne = numberFromBits(0x3ff0_0000, 0x0000_0001)
     expect(normalizedStructure(1)).toBe(1)
     expect(normalizedStructure(nextAfterOne)).toBe(nextAfterOne)

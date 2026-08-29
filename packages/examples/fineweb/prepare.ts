@@ -6,17 +6,18 @@ import { compressors } from "hyparquet-compressors"
 import fs from "node:fs"
 
 // Converts FineWeb-Edu sample-10BT shard 000 into the flat token streams
-// consumed by the training examples. Each document is encoded independently
-// and terminated by <|endoftext|> (id 50256); `specialTokens: "Always"`
-// makes that sentinel a registered token rather than ordinary text. GPT-2's
-// 50,257 ids fit u16, so the output is headerless little-endian u16.
+// consumed by the training examples. The script encodes each document
+// separately and appends <|endoftext|> (id 50256). The tokenizer file must
+// already register that sentinel. `specialTokens: "Always"` enables matching
+// it as a special token. GPT-2's 50,257 IDs fit in u16, so the output uses
+// headerless little-endian u16 values.
 //
-// The split is positional and nominally 99/1, but writes are kept whole at
-// processing-chunk boundaries. If `splitRow` falls inside a chunk, that entire
-// chunk goes to train; for the bundled 1,000-row groups validation therefore
-// begins at row 719,000 rather than the exact row 718,740. Output files are
-// truncated in place, not transactionally replaced, so interruption leaves
-// partial bins that have no embedded length or completion metadata.
+// The positional split targets 99/1, but output switches only at processing
+// chunk boundaries. If `splitRow` falls inside a chunk, the whole chunk goes to
+// training. With the bundled 1,000-row groups, validation starts at row 719,000
+// instead of row 718,740. The script truncates output files in place instead of
+// replacing them atomically. An interrupted run leaves partial bins with no
+// embedded length or completion marker.
 
 const PARQUET = new URL("../data/fineweb-10BT-000.parquet", import.meta.url).pathname
 const TOKENIZER_JSON = new URL("../data/gpt2-tokenizer.json", import.meta.url).pathname
@@ -25,8 +26,8 @@ const VAL_BIN = new URL("../data/fineweb-val.bin", import.meta.url).pathname
 const EOT = "<|endoftext|>"
 const VAL_FRACTION = 0.01
 
-// This random-access AsyncBuffer lets hyparquet request byte ranges from the
-// descriptor instead of materializing the multi-GB parquet file in JavaScript.
+// This random-access AsyncBuffer lets hyparquet read byte ranges from the file
+// descriptor without loading the multi-GB parquet file into JavaScript memory.
 const parquetFile = (path: string) => {
   const fd = fs.openSync(path, "r")
   return {

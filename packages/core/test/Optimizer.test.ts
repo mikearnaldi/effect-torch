@@ -51,7 +51,7 @@ onDevices("Optimizer", () => (it) => {
       Effect.gen(function*() {
         const optimizer = yield* Optimizer.sgd({ momentum: 0.9 })
         const g = yield* f32([0.5, -0.5])
-        let params = [yield* f32([1, 2])] as ReadonlyArray<Tensor.Any>
+        let params: ReadonlyArray<Tensor.Any> = [yield* f32([1, 2])]
         let state = yield* optimizer.init(params)
         const expected = [
           [0.95, 2.05],
@@ -103,7 +103,7 @@ onDevices("Optimizer", () => (it) => {
       Effect.gen(function*() {
         const optimizer = yield* Optimizer.adam()
         const g = yield* f32([0.1])
-        let params = [yield* f32([1])] as ReadonlyArray<Tensor.Any>
+        let params: ReadonlyArray<Tensor.Any> = [yield* f32([1])]
         let state = yield* optimizer.init(params)
         for (let i = 0; i < 2; i++) {
           const next = yield* runStep(optimizer, params, [g], state, 0.1)
@@ -228,7 +228,7 @@ onDevices("Optimizer", () => (it) => {
       }))
   })
 
-  describe("user-land optimizers", () => {
+  describe("custom optimizers", () => {
     it.effect("a custom optimizer with tensor state implements the same contract", () =>
       Effect.gen(function*() {
         interface AvgState {

@@ -1,40 +1,40 @@
 /**
- * Template-driven, streaming chat orchestration over compiled generation.
+ * Streams templated chat messages through a compiled generation program.
  *
- * This module is the boundary between four independently supplied contracts:
- * structured {@link ChatMessage}s, a Jinja-compatible chat template, a
+ * This module connects four caller-supplied pieces: structured
+ * {@link ChatMessage}s, a Jinja-compatible chat template, a
  * {@link ChatTokenizer}, and a decode-specialized {@link Model.InferenceProgram}.
  * {@link stream} renders messages once, encodes the complete prompt with
- * tokenizer-added special tokens disabled, prefills one generation sequence,
- * then repeatedly samples and parses one token into {@link ChatEvent}s before
- * stepping the sequence. On supported Metal runtimes, standard temperature,
- * top-k, and top-p sampling is fused with decode and publishes no logits.
- * Other runtimes use standalone native sampling, or host-greedy sampling when
- * that extension is absent; a custom host callback always reads logits back.
+ * tokenizer-added special tokens disabled, prefills one model sequence, then
+ * repeatedly parses one sampled token into {@link ChatEvent}s before stepping
+ * the sequence. Standard sampling uses a {@link Model.Generation} session and
+ * exposes no logits. A custom host callback uses a
+ * {@link Model.StatefulExecution} session and reads each logits row back.
  * Chat does not own a template language, tokenizer vocabulary, conversation
  * history store, or tool executor.
  *
  * Structured parsing targets start/header/message/end control-token formats.
  * Parser delimiters and tokenizer-derived default stops must be atomic tokens
- * addressable through `tokenToId`; generated headers are decoded as a
+ * addressable through `tokenToId`. The parser decodes generated headers as a
  * whitespace-delimited role with an optional unquoted `to=<recipient>` field.
- * Setting `controls: false`
- * bypasses that protocol and treats the generated text as one assistant content
- * segment. In either mode, deltas are computed by repeatedly decoding all
- * accumulated content ids and slicing the newly appended suffix. Tokenizer
- * decode must therefore be prefix-stable for emitted ids; this event protocol
- * has no replacement/retraction event for a decoder that revises prior text.
+ * Setting `controls: false` bypasses that protocol and treats the generated
+ * text as one assistant content segment. In either mode, chat computes deltas
+ * by repeatedly decoding all accumulated content ids and slicing the newly
+ * appended suffix. Tokenizer decode must be prefix-stable for emitted ids. The
+ * event protocol has no replacement/retraction event for a decoder that revises
+ * prior text.
  *
- * The returned stream acquires one ordinary {@link Model.Generation} session
- * and attempts to close all of its live sequence state on normal completion,
- * failure, or interruption. When the fallback path produces logits, they remain
- * internal tensors rather than event payloads. `done` is emitted only for normal
- * stop-token or `maxTokens` termination; failure, interruption, or downstream
+ * The returned stream opens one {@link Model.Generation} session for standard
+ * sampling or one {@link Model.StatefulExecution} session for a custom sampler.
+ * It attempts to close the session and all live sequence state on normal
+ * completion, failure, or interruption. Custom-sampler logits remain internal
+ * tensors rather than event payloads. `done` is emitted only for normal
+ * stop-token or `maxTokens` termination. Failure, interruption, or downstream
  * cancellation may end the stream without `end` or `done` events.
  *
  * @since 0.1.0
  */
-import { Data, Effect, Option, Stream } from "effect"
+import { Data, Effect, Option, Predicate, Stream } from "effect"
 import type * as Model from "./Model.ts"
 import type * as Runtime from "./Runtime.ts"
 import * as Tensor from "./Tensor.ts"
@@ -65,22 +65,23 @@ export class ChatError extends Data.TaggedError("ChatError")<{
  * @since 0.1.0
  * @category models
  */
-export interface ChatMessage {
+export interface ChatMessage<Value = unknown> {
   /** Template-defined role label, conventionally `system`, `user`, `assistant`, or `tool`. */
   readonly role: string
   /** Optional template-defined payload; strings are not required. */
-  readonly content?: unknown | undefined
+  readonly content?: Value | undefined
   /** Additional template-specific message fields. */
-  readonly [field: string]: unknown
+  readonly [field: string]: Value | string | undefined
 }
 
 /**
  * The template/tokenizer operations required by {@link stream}.
  *
- * Chat owns orchestration but not normalization or vocabulary semantics. The
- * implementation must use one vocabulary consistently across template special
- * token strings, `encode`, `decode`, `tokenToId`, `idToToken`, and the inference
- * program's logits indices. `decode` is called repeatedly on growing id arrays
+ * Chat coordinates these operations but does not define normalization or
+ * vocabulary rules. The implementation must use one vocabulary consistently
+ * across template special token strings, `encode`, `decode`, `tokenToId`,
+ * `idToToken`, and the inference program's logits indices. Chat repeatedly
+ * calls `decode` on growing id arrays
  * with `skipSpecialTokens: true`; emitted text assumes each result starts with
  * the previous result. Control strings must map directly to one id rather than
  * requiring `encode` into multiple ids.
@@ -88,14 +89,14 @@ export interface ChatMessage {
  * @since 0.1.0
  * @category models
  */
-export interface ChatTokenizer<E = never> {
+export interface ChatTokenizer<E = never, Value = unknown> {
   /** Renders messages with the caller's template and variables. */
   readonly applyChatTemplate: (
     template: string,
-    messages: ReadonlyArray<ChatMessage>,
+    messages: ReadonlyArray<ChatMessage<Value>>,
     options: {
       readonly addGenerationPrompt?: boolean | undefined
-      readonly variables?: Readonly<Record<string, unknown>> | undefined
+      readonly variables?: Readonly<Record<string, Value | string | undefined>> | undefined
     }
   ) => Effect.Effect<string, E>
   /**
@@ -132,12 +133,12 @@ export type ChatSampler = (logits: Tensor.TypedArray) => number
 /**
  * Standard next-token sampling controls. Temperature defaults to `0` (greedy),
  * `topK` to `0` (disabled), and `topP` to `1` (disabled). A missing seed is
- * generated once per stream; each successful draw advances a stream-local
- * counter, so no process-global sampler state is shared. Supported Metal
- * generation artifacts fuse these controls with prefill/decode; otherwise chat
- * samples the standalone logits tensor natively. Metal requires `topK` in
- * `1..=64` for positive-temperature `topP` filtering and rejects positive-
- * temperature `topK > 64`.
+ * generated once per stream. Each successful draw advances a stream-local
+ * counter, so draws share no process-global sampler state. Chat forwards these
+ * controls to a {@link Model.Generation} session, which returns token ids
+ * without exposing logits. Metal requires `topK` in `1..=64` for
+ * positive-temperature `topP` filtering and rejects positive-temperature
+ * `topK > 64`.
  *
  * @since 0.1.0
  * @category models
@@ -177,8 +178,8 @@ export const greedy: ChatSampler = (logits) => {
 }
 
 /**
- * Atomic control-token strings for a start/header/message segmented response.
- * The expected generated wire form is conceptually
+ * Atomic control-token strings for a segmented start/header/message response.
+ * The generated wire form is
  * `<start><role> [to=<recipient>]<message><content><endOfMessage|endOfTurn>`.
  * With a generation prompt, parsing starts inside the first header and assumes
  * the template has already established the start/assistant context. Without
@@ -216,9 +217,9 @@ const defaultControls: ChatControlTokens = {
 }
 
 /**
- * Heuristic structured-response classification derived from the parsed role
- * and recipient. Assistant-to-self is `reasoning`; assistant with no recipient
- * or recipient `user` is `content`; other assistant recipients are `tool`; a
+ * Chat uses a fixed heuristic to classify the parsed role and recipient.
+ * Assistant-to-self is `reasoning`. Assistant with no recipient or recipient
+ * `user` is `content`. Other assistant recipients are `tool`, and a
  * non-assistant role is `other`.
  *
  * @since 0.1.0
@@ -228,9 +229,9 @@ export type ChatSegmentKind = "content" | "reasoning" | "tool" | "other"
 
 /**
  * Identity and classification of one parsed response segment. The same value is
- * attached to that segment's `start`, `delta`, and `end` events. Indexes are
- * zero-based and increase only when a header reaches `message` (or when the
- * unsegmented parser accepts its first token).
+ * attached to that segment's `start`, `delta`, and `end` events. Indexes start
+ * at zero. They increase only when a header reaches `message` or the
+ * unsegmented parser accepts its first token.
  *
  * @since 0.1.0
  * @category models
@@ -260,7 +261,7 @@ export type ChatSegmentFinish = "message" | "turn" | "limit"
 
 /**
  * A completed response segment with the latest full decoded content. Only
- * segments that emitted `start` and subsequently ended appear in results;
+ * segments that emitted `start` and later ended appear in results;
  * ignored pre-header tokens and incomplete headers do not.
  *
  * @since 0.1.0
@@ -275,11 +276,11 @@ export interface CompletedChatSegment extends ChatSegment {
 
 /**
  * Prompt and decode statistics measured with wall-clock `Date.now()`.
- * Durations are coarse elapsed times and are not monotonic device-kernel
- * profiling. Prompt rendering/encoding and control validation happen before
- * `prefillMs`; `decodeMs` starts after prefill and includes event consumption
- * backpressure, native sampling or custom-sampler readback, tokenizer decoding,
- * and decode steps.
+ * Durations are coarse elapsed times, not monotonic device-kernel profiling.
+ * Prompt rendering, encoding, and control validation happen before `prefillMs`.
+ * `decodeMs` starts after prefill. It includes event-consumption backpressure,
+ * native sampling or custom-sampler readback, tokenizer decoding, and decode
+ * steps.
  *
  * @since 0.1.0
  * @category models
@@ -289,7 +290,7 @@ export interface ChatStats {
   readonly promptTokens: number
   /** Sampled non-stop ids, including parser controls and ignored/header ids. */
   readonly generatedTokens: number
-  /** Elapsed milliseconds for prompt construction plus fused or logits-returning generation add. */
+  /** Elapsed milliseconds for prompt construction plus sampled or logits-returning session add. */
   readonly prefillMs: number
   /** Elapsed milliseconds from completed prefill until normal termination. */
   readonly decodeMs: number
@@ -352,26 +353,27 @@ export type ChatEvent =
 
 /**
  * Configuration for one {@link stream} invocation. The program and tokenizer
- * must describe the same token-id vocabulary: encoded prompt ids are fed to the
- * program, logits indexes are returned to the tokenizer/parser, and control and
- * stop ids are compared numerically. Chat cannot validate that cross-component
- * agreement.
+ * must describe the same token-id vocabulary. Chat feeds encoded prompt ids to
+ * the program and uses logits indexes with the tokenizer and parser. It
+ * compares control and stop ids numerically but cannot validate that the
+ * components agree.
  *
  * @since 0.1.0
  * @category models
  */
-export interface ChatStreamOptions<E = never> {
+export interface ChatStreamOptions<E = never, Value = unknown> {
   /**
-   * Compiled inference artifact used to open one generation session. It must
-   * use `tokenDtype: "u32"`, matching `ChatTokenizer.encode`.
+   * Compiled inference artifact used to open one generation or stateful
+   * execution session. It must use `tokenDtype: "u32"`, matching
+   * `ChatTokenizer.encode`.
    */
   readonly program: Model.InferenceProgram
   /** Template/token vocabulary implementation paired with `program`. */
-  readonly tokenizer: ChatTokenizer<E>
+  readonly tokenizer: ChatTokenizer<E, Value>
   /** Nonempty Jinja-compatible template passed verbatim to `applyChatTemplate`. */
   readonly template: string
   /** Nonempty structured history passed verbatim to the template engine. */
-  readonly messages: ReadonlyArray<ChatMessage>
+  readonly messages: ReadonlyArray<ChatMessage<Value>>
   /**
    * Passed to the template engine; defaults to `true`. It also selects the
    * parser's initial state: `true` assumes generation starts inside an assistant
@@ -384,7 +386,7 @@ export interface ChatStreamOptions<E = never> {
    * injects its token string as `bos_token`, then these variables are spread on
    * top and may override that value.
    */
-  readonly variables?: Readonly<Record<string, unknown>> | undefined
+  readonly variables?: Readonly<Record<string, Value | string | undefined>> | undefined
   /**
    * Optional tokenizer id resolved with `idToToken` and exposed to the template
    * as `bos_token`. This does not prepend an id and prompt encoding still uses
@@ -399,12 +401,11 @@ export interface ChatStreamOptions<E = never> {
    */
   readonly maxTokens?: number | undefined
   /**
-   * Standard sampling controls or a custom host-side selector. On supported
-   * Metal artifacts an options object, including the default options, fuses
-   * sampling with generation and publishes no logits. Other runtimes sample a
-   * standalone logits tensor natively. A function always reads back the complete
-   * logits row, and omitted greedy sampling falls back to the host only when the
-   * runtime has no native sampling extension.
+   * Standard sampling controls or a custom host-side selector. An options
+   * object, including the defaults, opens a {@link Model.Generation} session
+   * that publishes token ids without logits. A function opens a
+   * {@link Model.StatefulExecution} session and reads each complete logits row
+   * into a host typed array.
    */
   readonly sampling?: ChatSampling | undefined
   /**
@@ -425,8 +426,8 @@ export interface ChatStreamOptions<E = never> {
 
 const fail = (op: ChatError["op"], message: string): ChatError => new ChatError({ op, message })
 
-const requireTokenId = <E>(
-  tokenizer: ChatTokenizer<E>,
+const requireTokenId = <E, Value>(
+  tokenizer: ChatTokenizer<E, Value>,
   token: string
 ): Effect.Effect<number, ChatError> =>
   Option.match(tokenizer.tokenToId(token), {
@@ -456,12 +457,12 @@ interface Parser<E> {
   readonly segments: () => ReadonlyArray<CompletedChatSegment>
 }
 
-// The parser is intentionally token-level: delimiters must be atomic ids. Text
-// is decoded from each complete accumulated id list so byte/BPE fragments can
-// settle before a delta is emitted. Append-only events require prefix-stable
-// decode output; a tokenizer that revises old text cannot be represented here.
-const makeParser = <E>(
-  tokenizer: ChatTokenizer<E>,
+// The parser works at the token level, so delimiters must be atomic ids. It
+// decodes each complete accumulated id list, allowing byte/BPE fragments to
+// settle before emitting a delta. Append-only events require prefix-stable
+// output and cannot represent a tokenizer that revises old text.
+const makeParser = <E, Value>(
+  tokenizer: ChatTokenizer<E, Value>,
   controls: ResolvedControls | undefined,
   initialRole: string,
   startsInHeader: boolean
@@ -480,7 +481,7 @@ const makeParser = <E>(
     current = {
       index: segmentIndex++,
       role,
-      ...(recipient === undefined ? {} : { recipient }),
+      recipient,
       kind: segmentKind(role, recipient)
     }
     return { _tag: "start", segment: current }
@@ -571,29 +572,27 @@ const makeParser = <E>(
  * uses `addSpecialTokens: false`; templates are therefore responsible for all
  * model-required BOS/EOS/control text.
  *
- * On supported Metal generation artifacts, standard sampling is fused with
- * prefill/decode and returns only token ids without allocating output logits.
- * Otherwise standard sampling borrows the chat-owned logits tensor natively,
- * with host-greedy fallback when native sampling is unavailable. A custom
- * `sampling` callback always reads the complete row to a host typed array. A
- * legacy-path tensor is cleared if sampling, readback, or the callback fails or
- * is interrupted. A valid non-stop token is parsed before being committed with
- * a generation step; the final stop/limit token is parsed but not stepped because
- * its successor is not needed. Stop ids are protocol delimiters, not output
- * filtering: a custom stop id that decodes as text can emit a final delta before
- * termination.
+ * Standard sampling opens a {@link Model.Generation} session and returns token
+ * ids without output logits. A custom `sampling` callback opens a
+ * {@link Model.StatefulExecution} session and reads each complete logits row to
+ * a host typed array. Chat clears that row if sampling, readback, or the
+ * callback fails or is interrupted. Chat parses a valid non-stop token before
+ * committing it with a session step. It parses the final stop or limit token
+ * but does not step it because no successor is needed. Stop ids delimit the
+ * protocol. They do not filter output. A custom stop id that decodes as text
+ * can emit a final delta before termination.
  *
- * Its generation session is closed on normal completion, tokenizer/parser/model
- * failure, interruption, or downstream cancellation. Cleanup errors are ignored
- * so they do not replace the primary exit. In the non-fused path, a logits row
- * is cleared after its token is selected; the stream retains only the current
- * unread row and releases it on downstream cancellation. Normal termination
- * emits `done`; other exits do not synthesize terminal events.
+ * The selected session is closed on normal completion, tokenizer/parser/model
+ * failure, interruption, or downstream cancellation. Cleanup errors are
+ * ignored so they do not replace the primary exit. With a custom sampler, each
+ * logits row is cleared after its token is selected. The stream retains only
+ * the current unread row and releases it on downstream cancellation. Normal
+ * termination emits `done`; other exits do not synthesize terminal events.
  *
- * Validation is intentionally narrow: the template and messages must be
- * nonempty, `maxTokens` must be a positive safe integer, parser controls,
- * default token-derived stops, and `bosTokenId` must resolve when used, and
- * sampler output must index the logits row.
+ * Validation covers only a few conditions. The template and messages must be
+ * nonempty, and `maxTokens` must be a positive safe integer. Parser controls,
+ * default token-derived stops, and `bosTokenId` must resolve when used. Sampler
+ * output must index the logits row.
  * Chat does not validate message schemas, template syntax, prompt non-emptiness
  * after encoding, stop-id ranges, control-id distinctness, tokenizer/program
  * vocabulary agreement, model vocabulary semantics, or decode prefix stability.
@@ -601,8 +600,8 @@ const makeParser = <E>(
  * @since 0.1.0
  * @category constructors
  */
-export const stream = <E = never>(
-  options: ChatStreamOptions<E>
+export const stream = <E = never, Value = unknown>(
+  options: ChatStreamOptions<E, Value>
 ): Stream.Stream<
   ChatEvent,
   ChatError | E | Model.InferenceError | Model.ModelError | Tensor.TensorError,
@@ -621,8 +620,13 @@ export const stream = <E = never>(
     ) {
       return yield* fail("validate", `maxTokens must be a positive integer, got ${options.maxTokens}`)
     }
-    const customSampler = typeof options.sampling === "function" ? options.sampling : undefined
-    const samplingOptions = typeof options.sampling === "object" ? options.sampling : undefined
+    let customSampler: ChatSampler | undefined
+    let samplingOptions: ChatSamplingOptions | undefined
+    if (Predicate.isFunction(options.sampling)) {
+      customSampler = options.sampling
+    } else {
+      samplingOptions = options.sampling
+    }
     const sampling = {
       temperature: samplingOptions?.temperature ?? 0,
       topK: samplingOptions?.topK ?? 0,
@@ -670,7 +674,7 @@ export const stream = <E = never>(
     const rendered = yield* tokenizer.applyChatTemplate(options.template, options.messages, {
       addGenerationPrompt: options.addGenerationPrompt ?? true,
       variables: {
-        ...(Option.isSome(bosToken) ? { bos_token: bosToken.value } : {}),
+        bos_token: Option.isSome(bosToken) ? bosToken.value : undefined,
         ...options.variables
       }
     })
@@ -712,7 +716,7 @@ export const stream = <E = never>(
       const [page] = yield* generation.add([{
         prompt,
         sampling,
-        ...(options.maxTokens === undefined ? {} : { maxTokens: options.maxTokens }),
+        maxTokens: options.maxTokens,
         eosTokens: Array.from(stopTokens)
       }])
       if (page === undefined) return yield* fail("sample", "generation returned no token page")
@@ -738,11 +742,12 @@ export const stream = <E = never>(
     let generatedTokens = 0
 
     type State = { readonly _tag: "prefill" } | RunState
+    const initialState: State = { _tag: "prefill" }
 
     // Fused pages carry only sampled ids. Legacy pages carry the current logits
     // ownership and clear it before terminating or installing the next row.
     return Stream.paginate(
-      { _tag: "prefill" } satisfies State as State,
+      initialState,
       (state): Effect.Effect<
         readonly [ReadonlyArray<ChatEvent>, Option.Option<State>],
         ChatError | E | Model.InferenceError | Model.ModelError | Tensor.TensorError,

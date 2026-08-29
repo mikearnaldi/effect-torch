@@ -1,39 +1,29 @@
-//! Backend-neutral graph compiler: from a semantic `Node` graph to a
-//! validated, memory-planned program ready for backend execution.
+//! Compiles a semantic `Node` graph into a validated, memory-planned program
+//! for backend execution.
 //!
-//! Compilation proceeds through a fixed sequence of stages, each producing
-//! an immutable artifact consumed by the next:
+//! Compilation produces one immutable artifact at each stage:
 //!
-//! 1. **Request/preparation** (`request`, `driver`): a [`ProgramRequest`]
-//!    is validated (non-empty roots, single device, sound options) and its
-//!    invocation contract — bindings, scalars, outputs — is either taken
-//!    from the caller or derived from the graph.
-//! 2. **Graph indexing** (`schedule`): the semantic graph is discovered
-//!    iteratively into a [`GraphIndex`], a dense postorder with child/consumer
-//!    adjacency, slot declarations, and random-source metadata. Exactly one
-//!    index is built per program generation.
-//! 3. **Optimization** (`optimization`): region selection fuses eligible
-//!    nodes into codegen regions (elementwise, fused-reduce, GEMM epilogues,
-//!    optimizer steps, multi-output merges) without ever rebuilding a
-//!    semantic node, and emits a deterministic topological lowering order.
-//! 4. **Decode specialization** (`decode`, optional, ahead of indexing):
-//!    training-time ops are rewritten into their stateful inference
-//!    counterparts (KV attention, KDA recurrence, conv state) with the
-//!    geometry contract the runtime must honor.
-//! 5. **Lowering** (`lowered`): backends translate lowering units into a
-//!    dense [`LoweredProgram`] of instructions and value declarations.
-//! 6. **Memory planning** (`planner`): liveness analysis and alias
-//!    normalization drive a deterministic best-fit segment packer that
-//!    guarantees overlapping live intervals never share address space and
-//!    records reuse edges for the runtime.
-//! 7. **Diagnostics** (`diagnostics`): structural work counters and phase
-//!    timings are assembled into reports; timings are observational only and
-//!    never part of cache identity.
+//! 1. `request` and `driver` validate the [`ProgramRequest`] and resolve its
+//!    bindings, scalars, and outputs from either the caller or the graph.
+//! 2. Optional `decode` specialization replaces training-time operations with
+//!    stateful KV attention, KDA recurrence, and convolution state operations.
+//!    It also defines the geometry contract for runtime state.
+//! 3. `schedule` builds one [`GraphIndex`] per program generation. The index
+//!    contains a dense postorder, adjacency, slot declarations, and random
+//!    source metadata.
+//! 4. `optimization` selects codegen regions without rebuilding semantic
+//!    nodes and produces a deterministic topological lowering order.
+//! 5. Backends lower those units into a dense [`LoweredProgram`] of
+//!    instructions and value declarations.
+//! 6. `planner` normalizes aliases, analyzes liveness, and packs segments.
+//!    Overlapping live intervals never share address space, and reuse edges
+//!    tell the runtime when storage changes owners.
+//! 7. `diagnostics` combines structural counters and phase timings. Timings
+//!    do not affect cache identity.
 //!
-//! The elementwise fusion IR itself lives in `ir`. Throughout, all
-//! traversals are iterative so compiler depth is bounded by heap, not stack,
-//! and every stage is deterministic: identical inputs yield identical
-//! artifacts.
+//! The elementwise fusion IR lives in `ir`. Iterative traversals keep graph
+//! depth on the heap rather than the call stack. Identical inputs produce
+//! identical artifacts at every stage.
 
 mod decode;
 mod diagnostics;

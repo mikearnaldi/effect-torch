@@ -1,4 +1,6 @@
 // Assembles native .node artifacts without generating JavaScript bindings.
+// It refreshes private TypeScript declarations from napi-rs metadata before
+// compiling the selected native packages.
 // `--host` must run from one native package directory; it removes non-preserved
 // dist outputs, retains configured non-host matrix binaries, then builds and
 // copies the selected host/profile artifact. `--matrix` runs on macOS from the workspace
@@ -107,6 +109,16 @@ const addPackageArguments = (args, nativePackage) => {
   }
 }
 
+const generateDeclarations = (packages) => {
+  for (const nativePackage of packages) {
+    run(process.execPath, [
+      path.join(rootDirectory, "scripts/generate-native-declarations.mjs"),
+      "--package",
+      nativePackage.npmName
+    ])
+  }
+}
+
 const targetForHost = (nativePackage) => {
   if (!nativePackage.os.includes(process.platform)) {
     fail(
@@ -143,6 +155,7 @@ const buildHost = (profile) => {
   }
 
   const target = targetForHost(nativePackage)
+  generateDeclarations([nativePackage])
   const currentFile = path.basename(nativeFile(nativePackage, target.suffix))
   const preserve = new Set(
     nativeFiles(nativePackage).map((file) => path.basename(file)).filter((file) => file !== currentFile)
@@ -183,6 +196,7 @@ const preflightMatrix = (packages) => {
 const buildMatrix = () => {
   const selectedPackages = packagesForWorkingDirectory()
   preflightMatrix(selectedPackages)
+  generateDeclarations(selectedPackages)
   for (const nativePackage of selectedPackages) cleanPackage(nativePackage, new Set())
 
   for (const target of targets) {

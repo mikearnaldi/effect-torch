@@ -18,9 +18,9 @@
  * A fresh trainer run calls schedules with consecutive non-negative integer
  * steps; a caller-supplied resume step is not validated. A `LearningRate` is an
  * ordinary function and does not enforce its domain, catch exceptions, or
- * validate returned rates. Constructor validation is synchronous and limited
- * to the comparisons documented below; except for `warmupSteps`, values are not
- * separately checked for finiteness or integrality. The guards use direct
+ * validate returned rates. Constructors synchronously perform only the checks
+ * documented below. Except for `warmupSteps`, they do not separately check
+ * finiteness or integrality. The guards use direct
  * JavaScript comparisons, so `NaN` is not rejected.
  *
  * @since 0.1.0

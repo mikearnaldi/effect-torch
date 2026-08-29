@@ -1,13 +1,12 @@
-//! Paged decode attention on Metal (RFC 0013, stage 2): one kernel
-//! launch attends q [B, H, 1, D] over pool slabs IN PLACE — K/V rows
-//! are read through the block table (pages), never gathered into a
-//! contiguous copy. One threadgroup per (sequence slot, head) streams
-//! its slot's blocks with online-softmax accumulation, so the context
-//! length is a runtime value (unlike the training flash pipeline,
-//! nothing shape-dependent is baked). Slab dtypes f16/bf16 load
-//! natively; int8 slabs dequantize in registers with the per-(token,
-//! head) scale slab (RFC 0012). The primitive scatter+gather reference in
-//! lib.rs remains the reference and the CPU fallback.
+//! Paged decode attention on Metal for RFC 0013 stage 2. One kernel attends
+//! q [B, H, 1, D] over pool slabs in place. It reads K/V rows through the block
+//! table without gathering a contiguous copy. One threadgroup per sequence
+//! slot and head streams that slot's blocks and accumulates an online softmax.
+//! Context length is a runtime value; unlike the training flash pipeline, the
+//! kernel bakes in no context-dependent shape. f16/bf16 slabs load natively.
+//! int8 slabs dequantize in registers with the per-token, per-head scale slab
+//! from RFC 0012. The primitive scatter and gather implementation in `lib.rs`
+//! remains the reference and CPU fallback.
 //!
 //! ## Cache invariants
 //!
@@ -17,24 +16,23 @@
 //!   (`tables [B, maxBlocks] u32`), `ctxlens [B] u32` (post-run
 //!   frontier), `block_bases [B] u32` (first visible table index),
 //!   `advances [B] u32`, and `block_size`.
-//! - **Scatter** (`et_paged_scatter`): one threadgroup of one simdgroup
-//!   (32 threads) per (slot, head) writes rows `ctxlens[b] - advances[b]
-//!   .. ctxlens[b]` of the new-token chunk into the slabs. Int8 slabs
-//!   quantize with an in-threadgroup absmax scale (`absmax/127 + eps`,
-//!   round, +128 offset) stored per (physical row, head).
-//! - **Attention** (`et_paged_decode`): one threadgroup of 256 threads
-//!   (8 simdgroups) per (slot, head, chunk row); q is staged in
-//!   threadgroup memory, K/V rows stream through the table row-parallel
-//!   — each simdgroup owns one context row at a time and each lane owns
-//!   a `D/32`-wide slice of the head (a single 128-bit float4 load per
-//!   lane when `D == 128`; scalar lane loop otherwise), so per-lane
-//!   online-softmax state is just `(m, l, acc[LANE_D])`. Group partials
-//!   fold in threadgroup memory and lane 0 of group 0 writes the
-//!   normalized output. Causality is per chunk row: row `p` attends
-//!   through `cursor + p` (pads clamp to the real frontier).
-//! - **Chunked prefill** (`et_paged_prefill_mma`,
-//!   `et_paged_prefill`): causal chunks of `PREFILL_MIN_CHUNK` or more
-//!   rows route to a query-tiled kernel, so each K/V row is streamed
+//! - `et_paged_scatter` uses one 32-thread simdgroup per slot and head. It
+//!   writes rows `ctxlens[b] - advances[b] .. ctxlens[b]` of the new-token
+//!   chunk into the slabs. Int8 slabs use an in-threadgroup absmax scale of
+//!   `absmax/127 + eps`, then round with a +128 offset. The scale is stored per
+//!   physical row and head.
+//! - `et_paged_decode` uses one 256-thread threadgroup with eight simdgroups
+//!   per slot, head, and chunk row. It stages q in threadgroup memory and
+//!   streams K/V rows through the table. Each simdgroup owns one context row at
+//!   a time. Each lane owns a `D/32`-wide head slice, using one 128-bit float4
+//!   load when `D == 128` and a scalar loop otherwise. Per-lane online-softmax
+//!   state is `(m, l, acc[LANE_D])`. Group partials fold in threadgroup memory,
+//!   and lane 0 of group 0 writes the normalized output. Causality applies per
+//!   chunk row: row `p` attends through `cursor + p`, with pads clamped to
+//!   the real frontier.
+//! - `et_paged_prefill_mma` and `et_paged_prefill` handle causal chunks of
+//!   `PREFILL_MIN_CHUNK` or more rows with a query-tiled kernel, so each K/V
+//!   row is streamed
 //!   from DRAM once per tile instead of once per query row. f16 slabs
 //!   with `D % 8 == 0` use the MMA kernel: one 128-thread threadgroup
 //!   per (slot, head, 32-row tile); each simdgroup owns 8 query rows
@@ -60,7 +58,7 @@
 
 use crate::runtime::dtype::DType;
 
-/// Planner-facing requirements of the paged scatter launch (writes
+/// Requirements for the paged scatter launch (writes
 /// new-token rows into the slabs in place; no outputs of its own).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ScatterRequirements {
@@ -82,7 +80,7 @@ pub struct ScatterRequirements {
     pub pipeline_count: usize,
 }
 
-/// Planner-facing requirements of a paged attention (decode) launch.
+/// Requirements for a paged attention (decode) launch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AttentionRequirements {
     /// Slab storage dtype (f32/f16/bf16, or u8 for int8-quantized).
@@ -819,8 +817,8 @@ kernel void et_paged_scatter(
         Ok(())
     }
 
-    /// Allocating convenience wrapper around [`scatter_into`] (makes
-    /// inputs contiguous and warms the pipeline first).
+    /// Makes inputs contiguous, warms the pipeline, allocates outputs, and calls
+    /// [`scatter_into`].
     #[allow(clippy::too_many_arguments)]
     pub fn scatter(
         k_new: &MetalTensor,
@@ -1073,9 +1071,9 @@ kernel void et_paged_decode(
     /// simd reduction, and running an independent online softmax per
     /// owned row entirely in registers. Every simdgroup reads the same
     /// K/V rows, so each row misses DRAM at most once per tile (the rest
-    /// hit L1/L2) — a `QT`-fold traffic reduction over the row-parallel
-    /// kernel, which re-reads the context for every query row. Per-row
-    /// causal visibility matches `et_paged_decode` exactly: absolute row
+    /// hit L1/L2). This reduces traffic by a factor of `QT` compared with the
+    /// row-parallel kernel, which re-reads the context for every query row.
+    /// Per-row causal visibility matches `et_paged_decode` exactly: absolute row
     /// `p` attends `[start_p, min(cursor + p + 1, needed))` with
     /// `start_p = ctx_p - window` when a window is set.
     fn prefill_kernel_source(
@@ -1312,11 +1310,10 @@ kernel void et_paged_prefill(
     /// reductions via `simd_shuffle_xor`), converts the probabilities
     /// to a half fragment in place, and accumulates `P x V` into
     /// persistent per-row accumulator tiles. No K/V staging, no
-    /// threadgroup barriers in the walk, no cross-simdgroup reduction
-    /// — every K/V row misses DRAM at most once per 8-row group of
-    /// query rows, and score computation is matrix-unit bound instead
-    /// of shuffle bound. Per-row causal visibility matches
-    /// `et_paged_decode` exactly. Requires `D % 8 == 0`, `D <= 128`
+    /// threadgroup barriers in the walk, and no cross-simdgroup reduction. Each
+    /// K/V row misses DRAM at most once per eight query rows, and score
+    /// computation is matrix-unit bound instead of shuffle bound. Per-row
+    /// causal visibility matches `et_paged_decode` exactly. Requires `D % 8 == 0`, `D <= 128`
     /// (accumulator register budget). f32/bf16/u8 slabs route to
     /// `et_paged_prefill` instead (half loads would break f32
     /// reference precision and cannot convert bf16/int8 rows).
@@ -1394,8 +1391,8 @@ kernel void et_paged_prefill_mma(
 
     // Fragment layout (verified by simdgroup_float8x8_layout_probe):
     // lane t owns row (t/16)*4 + (t%8)/2 and columns ((t%16)/8)*4 +
-    // (t%2)*2 + {{0, 1}} of each 8x8 tile — one row per lane, so per-row
-    // online-softmax state is lane-local and row reductions are quad
+    // (t%2)*2 + {{0, 1}} of each 8x8 tile. Each lane owns one row, so its
+    // online-softmax state is local and row reductions are quad
     // shuffles (lanes of a row are closed under xor masks 1 and 8).
     const uint fr = (lane / 16) * 4 + ((lane % 8) / 2);
     const uint fc = ((lane % 16) / 8) * 4 + (lane % 2) * 2;
@@ -1774,9 +1771,9 @@ kernel void et_paged_decode_split(
 
     /// Split combine kernel: one threadgroup of 32 threads per
     /// `(head, slot)` reduces the `SPLITS` partial records in scratch
-    /// `[B, H, S, D + 2]` — max `m`, then `l` and `acc` weighted by
-    /// `exp(m_s - M)` in fixed split order — and writes the normalized
-    /// output row `[B, H, 1, D]`. An all-empty slot writes zeros.
+    /// `[B, H, S, D + 2]`. It reduces max `m`, then weights `l` and `acc`
+    /// by `exp(m_s - M)` in fixed split order, and writes the normalized
+    /// `[B, H, 1, D]` output row. An all-empty slot writes zeros.
     fn combine_kernel_source(d: usize, query_heads: usize, splits: usize) -> String {
         format!(
             r#"
@@ -2405,10 +2402,9 @@ kernel void et_paged_decode_combine(
         )
     }
 
-    /// Non-allocating query-tiled causal prefill attention with the
-    /// default tile size ([`PREFILL_QT`]). Identical contract to
-    /// [`attention_into`], always dispatched through
-    /// `et_paged_prefill` regardless of chunk length.
+    /// Non-allocating query-tiled causal prefill attention using the default
+    /// tile size `PREFILL_QT`. It follows the [`attention_into`] contract and
+    /// always dispatches through `et_paged_prefill`, regardless of chunk length.
     #[allow(clippy::too_many_arguments)]
     pub fn attention_prefill_into(
         q: &MetalTensor,
@@ -2772,8 +2768,8 @@ kernel void et_paged_decode_combine(
         )
     }
 
-    /// Allocating convenience wrapper around [`decode_into`]; returns
-    /// the f32 `[B, H, C, D]` attention output.
+    /// Allocates output, calls [`decode_into`], and returns the f32
+    /// `[B, H, C, D]` attention result.
     #[allow(clippy::too_many_arguments)]
     pub fn decode(
         q: &MetalTensor,
@@ -2821,7 +2817,7 @@ kernel void et_paged_decode_combine(
         Ok(output)
     }
 
-    /// Allocating convenience wrapper around [`attention_block_into`].
+    /// Allocates outputs and calls [`attention_block_into`].
     #[allow(clippy::too_many_arguments)]
     pub fn attention_block(
         q: &MetalTensor,

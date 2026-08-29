@@ -1,16 +1,7 @@
-// Quantized Muse-Glimmer chat inference with its official DFlash draft. Paths
-// and optional generation/config controls come from
-// MUSE_GLIMMER_* environment variables and invalid configured values fail via
-// Effect Config. Each model module validates its exact GGUF architecture,
-// tensor catalog, and encoded weights on the selected backend. Chat.stream owns
-// the generation session, renders the GGUF template, emits parsed
-// reasoning/content segments incrementally, and closes state on completion,
-// failure, or interruption. The artifact has a
-// 4,096-token full-context pool, so prompt plus decode must fit even when the
-// optional application-side max-new-token limit is omitted. Native sampling
-// defaults to temperature 0.7, top-p 0.95, and top-k 40;
-// MUSE_GLIMMER_TEMPERATURE=0 selects greedy decoding and MUSE_GLIMMER_SEED
-// makes stochastic runs replayable.
+// Runs quantized Muse-Glimmer chat inference with its official DFlash draft.
+// MUSE_GLIMMER_* environment variables configure file paths and generation.
+// The target has a 4,096-token full-context pool, so the prompt and generated
+// tokens must fit even when no maximum generation length is configured.
 
 import * as BackendApple from "@effect-torch/backend-apple-native"
 import { Chat, Model, Tensor } from "@effect-torch/core"
@@ -37,8 +28,7 @@ const timed = <A, E, R>(label: string, effect: Effect.Effect<A, E, R>): Effect.E
   })
 
 const metadataNumber = (metadata: ReadonlyMap<string, unknown>, key: string): number | undefined => {
-  const value = metadata.get(key)
-  return typeof value === "number" && Number.isSafeInteger(value) ? value : undefined
+  return Option.getOrUndefined(Schema.decodeUnknownOption(Schema.Int)(metadata.get(key)))
 }
 
 const program = Effect.gen(function*() {
@@ -101,9 +91,9 @@ const program = Effect.gen(function*() {
     Config.withDefault(7)
   )
 
-  // Compiled prefill chunk widths: the runtime chunks any prompt to the
-  // largest width covering its remaining tokens; the small width only
-  // bounds zero-padding waste on short prompts.
+  // The runtime splits prompts across these compiled prefill widths. It uses
+  // the largest width that covers the remaining tokens. The smaller width
+  // reduces zero padding for short prompts.
   const prefillChunks = [32, 256]
 
   const modelPath = yield* Config.nonEmptyString("MUSE_GLIMMER_MODEL_PATH").pipe(
@@ -127,9 +117,11 @@ const program = Effect.gen(function*() {
   const loaded = yield* timed("Loading model", MuseGlimmer.loadGGUF(modelPath))
   const draft = useDFlash ? yield* timed("Loading DFlash draft", DFlash.loadGGUF(draftPath)) : undefined
 
-  const chatTemplate = loaded.metadata.get("tokenizer.chat_template")
+  const chatTemplate = Option.getOrUndefined(
+    Schema.decodeUnknownOption(Schema.NonEmptyString)(loaded.metadata.get("tokenizer.chat_template"))
+  )
 
-  if (typeof chatTemplate !== "string" || chatTemplate.length === 0) {
+  if (chatTemplate === undefined) {
     return yield* Effect.die(new Error("GGUF tokenizer.chat_template must be a non-empty string"))
   }
 
@@ -178,14 +170,14 @@ const program = Effect.gen(function*() {
       kvDtype: "f16",
       prefillChunks,
       batchSize: 1,
-      ...(draft === undefined
-        ? {}
-        : { speculation: { proposer: draft.artifact, maxDraftTokens: Math.min(draftTokens, draft.maxDraftTokens) } })
+      speculation: draft === undefined
+        ? undefined
+        : { proposer: draft.artifact, maxDraftTokens: Math.min(draftTokens, draft.maxDraftTokens) }
     })
   )
 
-  // Model.inference materializes and retains its own immutable parameter
-  // generation, so the GGUF loader's handles can be released after compilation.
+  // Model.inference creates and retains an immutable parameter generation.
+  // Release the GGUF loader's handles after compilation.
   yield* Tensor.clearAll(loaded.params)
   if (draft !== undefined) yield* Tensor.clearAll(draft.params)
 

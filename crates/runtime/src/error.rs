@@ -1,17 +1,15 @@
 //! Error taxonomy shared by all backends.
 //!
-//! [`BackendError`] classifies failures by *phase* and *cause* rather than
-//! by backend, so callers can react uniformly: `Unavailable` (device or
-//! backend missing), `Unsupported` (operation/dtype/layout the backend
-//! cannot do), `InvalidHandle` (a buffer owned by another runtime — see the
-//! ownership model in the `backend` module), `Compilation`, `Execution`,
-//! `Transfer`, `Cancelled` (cooperative cancellation via
-//! [`CancellationFlag`](crate::CancellationFlag)) and `Closed` (use after
-//! runtime shutdown).
+//! [`BackendError`] classifies failures by phase and cause rather than by
+//! backend. `Unavailable` covers missing devices or backends. `Unsupported`
+//! covers operations, dtypes, layouts, or placements the backend cannot use.
+//! `InvalidHandle` identifies a handle owned by another runtime. The other
+//! variants cover compilation, execution, transfers, cooperative cancellation
+//! through [`CancellationFlag`](crate::CancellationFlag), and use after
+//! runtime shutdown.
 //!
-//! Variants carry structured context fields (dtype, layout, placement, ...)
-//! instead of pre-formatted strings so embedders can both match on the
-//! category and render rich diagnostics.
+//! Variants store dtype, layout, placement, and other context in separate
+//! fields. Embedders can match the category and format their own diagnostics.
 
 use crate::{DType, DeviceId, Layout, Placement, RuntimeId};
 use std::error::Error;
@@ -38,9 +36,8 @@ pub enum BackendError {
         placement: Option<Placement>,
         message: String,
     },
-    /// A buffer or handle belongs to a different runtime than the one it
-    /// was used with. `actual_runtime` is `None` when the offending handle
-    /// carries no runtime id at all.
+    /// A buffer or handle belongs to a runtime other than the one using it.
+    /// `actual_runtime` is `None` when the handle has no runtime id.
     InvalidHandle {
         expected_runtime: RuntimeId,
         actual_runtime: Option<RuntimeId>,

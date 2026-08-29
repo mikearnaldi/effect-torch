@@ -1,18 +1,18 @@
 //! Reductions over one or more dimensions.
 //!
-//! `sum`, `prod`, `max`, `min`, and `mean` keep reduced dimensions at size 1
-//! in the output shape. The generic kernel (`reduce_into_impl`) walks each
-//! output coordinate, reconstructs the base storage offset of the
-//! corresponding input subspace from the strides, then iterates the reduced
-//! dimensions accumulating with an init/reduce/finish triple — so strided
-//! (transposed, sliced) inputs reduce without materialization.
+//! `sum`, `prod`, `max`, `min`, and `mean` keep reduced dimensions at
+//! size 1 in the output shape. `reduce_into_impl` walks each output
+//! coordinate and reconstructs the corresponding input subspace's base offset
+//! from the strides. It then accumulates the reduced dimensions with an
+//! init/reduce/finish sequence. This handles transposed and sliced inputs
+//! without materializing them.
 //!
-//! `argmax`/`argmin` reduce a single dimension to `u32` indexes (first
-//! strict best wins, so ties resolve to the lower index), and `cumsum`
-//! produces a same-shape inclusive prefix scan along one dimension.
+//! `argmax` and `argmin` reduce one dimension to `u32` indexes. The first
+//! strict best wins, so ties use the lower index. `cumsum` produces a
+//! same-shape inclusive prefix scan along one dimension.
 //!
-//! All operations follow the crate contract: exact `*_requirements`
-//! planners, allocation-free `*_into` kernels, and allocating wrappers.
+//! Each operation has an exact `*_requirements` planner, a `*_into` kernel
+//! that does not allocate, and an allocating wrapper.
 
 use super::tensor::{
     CpuBuffer, CpuDestination, CpuOperationRequirements, CpuTensorRequirement, Elem, Tensor,

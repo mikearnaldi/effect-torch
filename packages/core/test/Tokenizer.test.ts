@@ -219,8 +219,8 @@ describe("Tokenizer", () => {
   })
 
   describe("training progress", () => {
-    // No waiting needed: the final (total, total) event is posted when the
-    // feed iterator exhausts — before the merge phase, so all progress
+    // No waiting is needed. The feed iterator posts the final (total, total)
+    // event before the merge phase, so all progress
     // callbacks are queued on the event loop ahead of train's resolution.
     it.effect("reports throttled byte progress ending at (total, total)", () =>
       Effect.gen(function*() {

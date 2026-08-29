@@ -12,6 +12,26 @@ const placement: Runtime.Placement = Object.freeze({
   description: "GGUF test runtime"
 })
 
+type RuntimeDouble = Partial<Omit<Runtime.RuntimeService, "extensions">> & {
+  readonly extensions?: Partial<Runtime.RuntimeService["extensions"]>
+}
+type TestHandle = Pick<Tensor.Any, "_tag" | "shape" | "dtype" | "storage" | "device" | "placement" | "pipe">
+
+const runtimeDouble = (value: RuntimeDouble): Runtime.RuntimeService => {
+  // SAFETY: Each test supplies every runtime member reached by the code under test.
+  return value as Runtime.RuntimeService
+}
+
+const concreteHandle = (value: TestHandle): Tensor.Concrete => {
+  // SAFETY: The tensor factory supplies all public metadata; only Runtime's private brands are absent.
+  return value as Tensor.Concrete
+}
+
+const loaderOnlyIdentity = (value: Tensor.Any): Tensor.Lazy => {
+  // SAFETY: Loader metadata tests never invoke these placeholder model forwards.
+  return value as Tensor.Lazy
+}
+
 // The fake runtime keeps logical model metadata separate from encoded storage
 // geometry. Its object handles are ownership tokens, so release assertions use
 // identity rather than descriptor equality.
@@ -33,26 +53,28 @@ const encodedDescriptor: Runtime.GgufTensorDescriptor = Object.freeze({
   physicalDtype: "u8"
 })
 
-const tensor = (descriptor: Runtime.GgufTensorDescriptor): Tensor.Concrete =>
-  Object.freeze({
+const tensor = (descriptor: Runtime.GgufTensorDescriptor): Tensor.Concrete => {
+  const value = {
     _tag: "Tensor",
     shape: descriptor.logicalShape,
     dtype: "f32",
-    ...(descriptor.format === "F32"
-      ? {}
-      : {
-        storage: Object.freeze({
-          encoding: descriptor.format,
-          physicalShape: descriptor.physicalShape,
-          physicalDtype: "u8" as const
-        })
-      }),
     device: placement.deviceType,
     placement,
     pipe() {
       throw new Error("unused test handle pipe")
     }
-  }) as unknown as Tensor.Concrete
+  } satisfies TestHandle
+  if (descriptor.format !== "F32") {
+    Object.assign(value, {
+      storage: Object.freeze({
+        encoding: descriptor.format,
+        physicalShape: descriptor.physicalShape,
+        physicalDtype: "u8"
+      })
+    })
+  }
+  return concreteHandle(Object.freeze(value))
+}
 
 const inspection: Runtime.GgufInspection = Object.freeze({
   metadata: Object.freeze([
@@ -75,7 +97,7 @@ const definition = (
         { name: "dense", shape: [2], initializer: { _tag: "Normal", scale: 1 } },
         { name: "packed", shape: [2, 256], initializer: { _tag: "Normal", scale: 1 } }
       ],
-      forward: (_, input) => Effect.succeed(input as Tensor.Lazy)
+      forward: (_, input) => Effect.succeed(loaderOnlyIdentity(input))
     })
   }
 })
@@ -132,7 +154,7 @@ it.effect("loads by exact architecture and returns tensors in model parameter or
   const packed = tensor(encodedDescriptor)
   const paths: Array<string> = []
   const released: Array<Tensor.Concrete> = []
-  const runtime = {
+  const runtime = runtimeDouble({
     placement,
     extensions: {
       gguf: {
@@ -154,7 +176,7 @@ it.effect("loads by exact architecture and returns tensors in model parameter or
       }
     },
     release: (value: Tensor.Concrete) => Effect.sync(() => void released.push(value))
-  } as unknown as Runtime.RuntimeService
+  })
   let config: Gguf.ModelConfig | undefined
 
   return Effect.gen(function*() {
@@ -178,7 +200,7 @@ it.effect("loads by exact architecture and returns tensors in model parameter or
 })
 
 it.effect("rejects an architecture mismatch before model creation", () => {
-  const runtime = {
+  const runtime = runtimeDouble({
     placement,
     extensions: {
       gguf: {
@@ -186,7 +208,7 @@ it.effect("rejects an architecture mismatch before model creation", () => {
         load: () => Effect.succeed({ entries: [] })
       }
     }
-  } as unknown as Runtime.RuntimeService
+  })
   return Effect.gen(function*() {
     const error = yield* Effect.flip(Gguf.loadModel("model.gguf", definition(() => {}, "other-model")))
     expect(error._tag).toBe("GgufError")
@@ -204,7 +226,7 @@ it.effect("releases every loaded tensor when load descriptors disagree with insp
     ...encodedDescriptor,
     physicalShape: [2, 145]
   }
-  const runtime = {
+  const runtime = runtimeDouble({
     placement,
     extensions: {
       gguf: {
@@ -233,7 +255,7 @@ it.effect("releases every loaded tensor when load descriptors disagree with insp
           )
           : Effect.void
       })
-  } as unknown as Runtime.RuntimeService
+  })
 
   return Effect.gen(function*() {
     const error = yield* Effect.flip(Gguf.loadModel("model.gguf", definition(() => {})))
@@ -250,7 +272,7 @@ it.effect("releases every loaded tensor when load descriptors disagree with insp
 it.effect("rejects duplicate loaded handle ownership and releases it once", () => {
   const duplicate = tensor(encodedDescriptor)
   const released: Array<Tensor.Concrete> = []
-  const runtime = {
+  const runtime = runtimeDouble({
     placement,
     extensions: {
       gguf: {
@@ -265,7 +287,7 @@ it.effect("rejects duplicate loaded handle ownership and releases it once", () =
       }
     },
     release: (value: Tensor.Concrete) => Effect.sync(() => void released.push(value))
-  } as unknown as Runtime.RuntimeService
+  })
 
   return Effect.gen(function*() {
     const error = yield* Effect.flip(Gguf.loadModel("duplicate.gguf", definition(() => {})))
@@ -289,13 +311,13 @@ it.effect("the runtime cleans up interruption before archive ownership transfers
         { descriptor: denseDescriptor, tensor: dense }
       ]
     }
-    const runtime = {
+    const runtime = runtimeDouble({
       placement,
       extensions: {
         gguf: {
           inspect: () => Effect.succeed(inspection),
-          // The deferred marks the archive's use phase, ensuring interruption
-          // occurs before load returns and transfers ownership to Gguf.load.
+          // The deferred marks the archive's use phase. It pauses load so
+          // interruption occurs before ownership transfers to Gguf.load.
           load: () =>
             Effect.acquireUseRelease(
               Effect.succeed(archive),
@@ -308,7 +330,7 @@ it.effect("the runtime cleans up interruption before archive ownership transfers
         }
       },
       release: (value: Tensor.Concrete) => Effect.sync(() => void released.push(value))
-    } as unknown as Runtime.RuntimeService
+    })
     const layer = provide(runtime)
     const program = Gguf.loadModel("handoff.gguf", definition(() => {})).pipe(Effect.provide(layer))
     const target = yield* program.pipe(Effect.forkChild({ startImmediately: true }))
@@ -334,7 +356,7 @@ onDevices("GGUF", () => (it) => {
               shape: [2, 256],
               initializer: { _tag: "Normal", scale: 1 }
             }],
-            forward: (_, input) => Effect.succeed(input as Tensor.Lazy)
+            forward: (_, input) => Effect.succeed(loaderOnlyIdentity(input))
           })
       })
       const compiled = yield* Tensor.compile(([input]) => Effect.succeed([input]))

@@ -37,10 +37,10 @@ const headsFirst = (hidden: Tensor.Any) =>
     return yield* Tensor.transpose(yield* Tensor.reshape(hidden, [batch!, rows!, 1, EMBED]), [0, 2, 1, 3])
   })
 
-// The synthetic replayable block proposer, parameterized by the exposure it
-// taps: different speculators subscribe to different names on one base model.
-// withProbabilities adds the f32 probability rows that exercise the exact
-// speculative-sampling acceptance path.
+// parallelProposer builds a replayable block proposer for one named exposure
+// on the base model. Different speculators can subscribe to different names.
+// Setting withProbabilities adds the f32 probability rows that exercise the
+// exact speculative-sampling acceptance path.
 const parallelProposer = (tapName: string, withProbabilities = false) => {
   const buildBlock = (
     anchorTokens: Tensor.Any,
@@ -63,14 +63,14 @@ const parallelProposer = (tapName: string, withProbabilities = false) => {
       const logits = yield* Tensor.matmul(merged, lmHead)
       return yield* Tensor.slice(logits, { start: [0, 1, 0], end: [batch, 4, VOCAB] })
     })
-  const base = {
-    params: [] as Model.Params,
+  const base: Omit<Speculation.ParallelBlock, "_tag" | "build" | "buildWithProbabilities"> = {
+    params: [],
     vocabulary: VOCAB,
     maxDraftTokens: 3,
-    hiddenTaps: [{ name: tapName, dtype: "f32" as const, shape: ["Rows", EMBED] as ReadonlyArray<number | "Rows"> }],
-    tokenEmbedding: { name: "token_embd.weight", dtype: "f32" as const, shape: [VOCAB, EMBED] },
-    lmHead: { name: "output.weight", dtype: "f32" as const, shape: [EMBED, VOCAB] },
-    currentBlockAttention: "Bidirectional" as const,
+    hiddenTaps: [{ name: tapName, dtype: "f32", shape: ["Rows", EMBED] }],
+    tokenEmbedding: { name: "token_embd.weight", dtype: "f32", shape: [VOCAB, EMBED] },
+    lmHead: { name: "output.weight", dtype: "f32", shape: [EMBED, VOCAB] },
+    currentBlockAttention: "Bidirectional",
     replay: (_params: Model.Params, [hidden]: ReadonlyArray<Tensor.Any>) =>
       Effect.gen(function*() {
         const heads = yield* headsFirst(hidden!)
@@ -203,8 +203,8 @@ const argmaxOf = (logits: Tensor.Any) =>
     return values.reduce((best, value, index) => (value > values[best] ? index : best), 0)
   })
 
-// The reference: greedy generation through the ordinary forward graph,
-// recomputing the whole context every step.
+// The reference performs greedy generation through the ordinary forward graph
+// and recomputes the whole context at every step.
 const naiveGenerate = (
   model: Model.Model,
   params: Model.Params,
@@ -228,7 +228,7 @@ const naiveGenerate = (
     return context
   })
 
-// The window-relative reference: the pre-cache generation loop — every
+// This window-relative reference uses the pre-cache generation loop. Every
 // step recomputes the last `window` tokens with positions 0..window-1.
 // With RoPE, cached sliding-window attention must match this exactly.
 const naiveWindowedGenerate = (
@@ -255,8 +255,8 @@ const naiveWindowedGenerate = (
     return context
   })
 
-// Greedy generation through the inference artifact: add the prompt once,
-// then one round per token with an argmax chooser.
+// Greedy generation through the inference artifact adds the prompt once, then
+// runs one round per token with an argmax chooser.
 const cachedGenerate = (
   program: Model.InferenceProgram,
   prompt: ReadonlyArray<number>,
@@ -278,8 +278,8 @@ const cachedGenerate = (
     return context
   })
 
-// Greedy generation through the native generation session: one add, then one
-// round per token. Unlike the execution session, this drives the backend's
+// Greedy generation through the native generation session uses one add, then
+// one round per token. Unlike the execution session, this drives the backend's
 // own chunked-prefill scheduler, exercising bucket selection on runtimes that
 // honor prefill shape buckets.
 const nativeGreedyGenerate = (
@@ -326,7 +326,7 @@ onDevices("Inference", () => (it) => {
             blockSize: 2,
             kvDtype: "f32",
             batch: 1,
-            ...(lastTokenRow === undefined ? {} : { lastTokenRow })
+            lastTokenRow
           })
 
         const selected = yield* compile(true)
@@ -1254,7 +1254,7 @@ onDevices("Inference", () => (it) => {
     it.effect("compiles one prefill program per chunk shape with generation parity", () =>
       Effect.gen(function*() {
         const runtime = yield* Runtime.Runtime
-        const observed: { request: Runtime.InferenceCompileRequest | undefined } = { request: undefined }
+        const requests: Array<Runtime.InferenceCompileRequest> = []
         const recording: Runtime.RuntimeService = {
           ...runtime,
           extensions: {
@@ -1262,7 +1262,7 @@ onDevices("Inference", () => (it) => {
             inference: {
               ...runtime.extensions.inference,
               compile: (request) => {
-                observed.request = request
+                requests.push(request)
                 return runtime.extensions.inference.compile(request)
               }
             }
@@ -1277,7 +1277,7 @@ onDevices("Inference", () => (it) => {
           prefillChunks: [4, 2, 2],
           sampling: { temperature: 0, seed: 7 }
         }).pipe(Effect.provideService(Runtime.Runtime, recording))
-        expect(observed.request?.target.prefill).toHaveLength(2)
+        expect(requests.at(-1)?.target.prefill).toHaveLength(2)
         // Multi-chunk greedy generation matches the ordinary forward
         // reference through both the execution and generation sessions.
         const prompt = [1, 5, 3, 8, 2, 11, 4, 7, 6]
@@ -1293,12 +1293,11 @@ onDevices("Inference", () => (it) => {
         const shortGenerated = yield* nativeGreedyGenerate(program, shortPrompt, steps)
         expect(shortGenerated).toEqual(shortNaive)
 
-        observed.request = undefined
+        requests.length = 0
         yield* Model.inference(model, params, { maxTokens: 64, blockSize: 4, prefillChunks: [4] }).pipe(
           Effect.provideService(Runtime.Runtime, recording)
         )
-        const singleChunkRequest = observed.request as Runtime.InferenceCompileRequest | undefined
-        expect(singleChunkRequest?.target.prefill).toHaveLength(1)
+        expect(requests.at(-1)?.target.prefill).toHaveLength(1)
       }))
 
     it.effect("parallel speculation preserves the exact target distribution", () =>
@@ -1383,7 +1382,7 @@ onDevices("Inference", () => (it) => {
     it.effect("compiles one replay prefill per chunk shape for parallel-block speculation", () =>
       Effect.gen(function*() {
         const runtime = yield* Runtime.Runtime
-        const observed: { request: Runtime.InferenceCompileRequest | undefined } = { request: undefined }
+        let observed: Runtime.InferenceCompileRequest | undefined
         const recording: Runtime.RuntimeService = {
           ...runtime,
           extensions: {
@@ -1391,7 +1390,7 @@ onDevices("Inference", () => (it) => {
             inference: {
               ...runtime.extensions.inference,
               compile: (request) => {
-                observed.request = request
+                observed = request
                 return runtime.extensions.inference.compile(request)
               }
             }
@@ -1405,8 +1404,8 @@ onDevices("Inference", () => (it) => {
           sampling: { temperature: 0, seed: 3 },
           speculation: { proposer, maxDraftTokens: 2 }
         }).pipe(Effect.provideService(Runtime.Runtime, recording))
-        expect(observed.request?.target.prefill).toHaveLength(2)
-        expect(observed.request?.generalizedProposer?.replay?.prefill).toHaveLength(2)
+        expect(observed?.target.prefill).toHaveLength(2)
+        expect(observed?.generalizedProposer?.replay?.prefill).toHaveLength(2)
         // Bucketed parallel replay matches ordinary token-for-token.
         const ordinary = yield* (yield* Model.inference(model, params, {
           maxTokens: 64,
@@ -1622,8 +1621,8 @@ onDevices("Inference", () => (it) => {
       Effect.gen(function*() {
         const model = yield* makeGpt()
         const params = yield* Tensor.compute(yield* Model.initialize(model))
-        // 5 blocks: two independent 3-block prompts would need 6 — the
-        // second prefill fits only by sharing its 2 full prefix blocks.
+        // Five blocks are available. Two independent three-block prompts would
+        // need six, so the second prefill fits only by sharing two full blocks.
         const program = yield* Model.inference(model, params, { maxTokens: 20, blockSize: 4, prefillChunks: [4] })
         const prompt = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 0]
         const gen = yield* program.execution()
@@ -1643,7 +1642,7 @@ onDevices("Inference", () => (it) => {
         const gen = yield* program.execution()
         yield* gen.add([yield* ids(promptA)])
         const b = (yield* gen.add([yield* ids(promptB)]))[0]!
-        // The reference: an ordinary forward over B's whole prompt.
+        // The reference runs an ordinary forward pass over B's whole prompt.
         const input = yield* ids(promptB)
         const output = yield* model.forward(params, input)
         const [expected] = yield* Tensor.compute([
@@ -1692,8 +1691,8 @@ onDevices("Inference", () => (it) => {
           prefillChunks: [4],
           attentionWindow: 8
         })
-        // Generate past the window: the prompt's first block leaves the
-        // window, lands in the prefix cache, and the sequence finishes
+        // Generate past the window. The prompt's first block leaves the window,
+        // lands in the prefix cache, and the sequence finishes
         // the rest of the prompt's blocks into the cache as well.
         {
           const gen = yield* program.execution()
@@ -1735,8 +1734,8 @@ onDevices("Inference", () => (it) => {
         const params = yield* Tensor.compute(yield* Model.initialize(model))
         const program = yield* Model.inference(model, params, { maxTokens: 64, blockSize: 4, prefillChunks: [4] })
         const prompt = [1, 2, 3, 4, 5, 6, 7, 8] // 1 matchable block; +6 steps stays within BLOCK
-        // However the two prefills interleave — one takes the other's
-        // blocks mid-flight, or both miss and compute — greedy
+        // The two prefills can interleave. One may take the other's blocks
+        // mid-flight, or both may miss and compute. Greedy
         // generation must match the sequential runs token-for-token.
         const sequentialA = yield* cachedGenerate(program, prompt, 6)
         const sequentialB = yield* cachedGenerate(program, prompt, 6)
@@ -1803,9 +1802,9 @@ onDevices("Inference", () => (it) => {
 
     it.effect("wpe sliding window: inert below the window, self-consistent across eviction", () =>
       Effect.gen(function*() {
-        // Sliding-window attention is not RoPE-specific: it is a pool
-        // memory policy. With learned absolute positions the window
-        // works within the table — positions stay absolute — so (a)
+        // Sliding-window attention is a pool memory policy, not a RoPE-specific
+        // operation. With learned absolute positions, the window
+        // works within the table and positions stay absolute. Thus (a)
         // below the window generation matches the naive loop exactly,
         // and (b) past it a stepped sequence and a fresh prefill of
         // the same context agree (this would FAIL for window-relative
@@ -1856,7 +1855,7 @@ onDevices("Inference", () => (it) => {
           [9, 10],
           [1, 2, 3, 0, 11, 5, 6]
         ]
-        // Sequential reference: one session per prompt, one step each.
+        // The sequential reference uses one session and one step per prompt.
         const reference: Array<Array<number>> = []
         for (const prompt of prompts) {
           const gen = yield* program.execution()
@@ -1864,7 +1863,7 @@ onDevices("Inference", () => (it) => {
           const [logits] = yield* gen.step([{ seq: entry.seq, token: 1 }])
           reference.push(yield* Tensor.toNumberArray(logits))
         }
-        // Batched: one session, all prompts, one round stepping all four.
+        // The batched run uses one session and one round for all four prompts.
         const gen = yield* program.execution()
         const promptTensors: Array<Tensor.Any> = []
         for (const prompt of prompts) promptTensors.push(yield* ids(prompt))
@@ -1981,7 +1980,7 @@ onDevices("Inference", () => (it) => {
         expect(yield* b.seq.cursor()).toBe(12)
       }))
 
-    it.effect("add beyond batchSize fails typed", () =>
+    it.effect("add beyond batchSize fails with InferenceError", () =>
       Effect.gen(function*() {
         const model = yield* makeGpt()
         const params = yield* Tensor.compute(yield* Model.initialize(model))
@@ -2043,7 +2042,7 @@ onDevices("Inference", () => (it) => {
         })
         // A resident prefix is shared in the half-precision pool too:
         // two independent 2-block prompts would need 4 of 8 blocks plus
-        // B's private suffix block — fits either way, so assert exact
+        // B's private suffix block. It fits either way, so assert exact
         // equality of the shared computation instead.
         const gen = yield* program.execution()
         const a = (yield* gen.add([yield* ids(prompt)]))[0]!
@@ -2332,7 +2331,7 @@ onDevices("Inference", () => (it) => {
         expect(cached.length).toBe(prompt.length + steps)
       }))
 
-    it.effect("RoPE: trains — the rotary node differentiates", () =>
+    it.effect("RoPE trains because the rotary node differentiates", () =>
       Effect.gen(function*() {
         const model = yield* makeRopeGpt
         const data = Array.from({ length: 64 }, (_, i) => i % 4)

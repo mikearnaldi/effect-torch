@@ -1,9 +1,9 @@
-//! Fused rotary embedding on Metal: one kernel per tensor instead of
-//! ~15 composed ops (table build, narrows, muls, cat). Angles are
-//! computed in-register (powf per element is cheaper than the table's
-//! launches at these sizes); the backward is the same kernel with
-//! negated angles (Rᵀ = R(−θ) for orthogonal rotations). CPU keeps the
-//! composed reference path in lib.rs.
+//! Fused rotary embedding on Metal uses one kernel per tensor instead of
+//! about 15 composed operations. It computes angles in registers because one
+//! powf per element costs less than the table-building launches at these sizes.
+//! The backward uses the same kernel with negated angles, since
+//! Rᵀ = R(−θ) for orthogonal rotations. CPU uses the composed reference in
+//! `lib.rs`.
 //!
 //! ## Kernel contract
 //!
@@ -21,18 +21,15 @@
 //!
 //! ## Resource contract
 //!
-//! The `*_into` entry points take exactly one f32 staging tensor of
-//! shape `[batch]` (holding the position offsets as f32) and no
-//! status/scratch views. [`requirements`] reports that layout so the
-//! executable planner can pre-allocate the staging view; everything
-//! else (`state_next`, `status`, `scratch`) is zero-sized and exactly
-//! one pipeline is required per (dtype, layout) pair.
+//! The `*_into` functions take one f32 `[batch]` staging tensor for
+//! position offsets and no status or scratch views. [`requirements`] reports
+//! this layout for the executable planner. `state_next`, `status`, and
+//! `scratch` are zero-sized. Each dtype and layout pair needs one pipeline.
 
 use crate::runtime::metal::run::MetalTensor;
 
-/// Static resource requirements of one fused rotary launch, as consumed
-/// by the executable planner to size outputs and staging views before
-/// any dispatch happens.
+/// Resources for one fused rotary launch. The executable planner uses these
+/// values to size outputs and staging views before dispatch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RotaryRequirements {
     /// Storage dtype of input and output (f32, f16, or bf16).
@@ -406,9 +403,8 @@ kernel void et_rotary(
         Ok(())
     }
 
-    /// Allocating convenience wrapper: makes `x` contiguous, warms the
-    /// pipeline, allocates the output and the offsets staging view, and
-    /// dispatches via [`rotary_into`]. Used outside planned executables.
+    /// Makes `x` contiguous, warms the pipeline, allocates output and offset
+    /// staging, and calls [`rotary_into`]. Used outside planned executables.
     pub fn rotary(
         x: &MetalTensor,
         offsets: &[usize],

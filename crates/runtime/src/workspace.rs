@@ -1,54 +1,41 @@
 //! Pooled recycling of transient workspace allocations.
 //!
-//! Executing a compiled program needs scratch buffers whose sizes are known
-//! at compile time but whose contents are dead by the end of the call.
-//! [`WorkspacePool`] recycles those buffers: callers
-//! [`acquire`](WorkspacePool::acquire) a [`WorkspaceLease`] covering a set
-//! of keyed size requests, use the segments, and simply drop the lease —
-//! the segments return to the pool and become available for reuse.
+//! Compiled programs use scratch buffers whose contents expire at the end of
+//! each call. [`WorkspacePool`] recycles them. Callers
+//! [`acquire`](WorkspacePool::acquire) a [`WorkspaceLease`] for a set of
+//! keyed size requests. Dropping the lease returns its segments to the pool.
 //!
-//! # Semantics
+//! Each request has a key `K`, such as a device or memory space. The pool only
+//! reuses a segment for an equal key. Among matching segments with enough
+//! capacity, it chooses the smallest and breaks ties by lowest id.
 //!
-//! - **Keys.** Each request carries a key `K` (e.g. a device or memory
-//!   space); idle segments are only reused for requests with an equal key,
-//!   so incompatible storage never migrates between keys.
-//! - **Best-fit reuse.** Among idle segments matching the key with
-//!   sufficient capacity, the pool picks the smallest capacity, breaking
-//!   ties by lowest id — deterministic and fragmentation-averse.
-//! - **All-or-error multi-segment acquisition.**
-//!   [`WorkspacePool::acquire`] publishes a lease only after every request
-//!   succeeds. On failure, reused pending segments return to the idle list;
-//!   fresh pending allocations are dropped. If the allocator's first attempt
-//!   failed, existing idle segments may also have been evicted before the
-//!   retry, so failure preserves accounting invariants but not the exact idle
-//!   cache contents.
-//! - **Eviction.** Idle memory is capped by `max_idle_bytes`; when the cap
-//!   is exceeded the least-recently-used idle segments are dropped until
-//!   the pool fits. On allocation failure the pool first evicts *all* idle
-//!   segments and retries once before reporting the error.
-//! - **Accounting invariants.** `idle_bytes` always equals the summed
-//!   capacity of the idle list and the leased counters track live leases;
-//!   every mutation uses checked arithmetic, with internal inconsistencies
-//!   panicking (`expect`) and user-triggerable overflow reported as
-//!   [`WorkspacePoolError::ByteSizeOverflow`] without mutating the pool.
-//! - **LRU clock.** `last_used` ticks are monotonic per pool; when the
-//!   `u64` tick counter would wrap, the idle list's ticks are compacted to
-//!   a dense 0..n range preserving order.
+//! [`WorkspacePool::acquire`] returns a lease only after every request
+//! succeeds. On failure, reused pending segments return to the idle list and
+//! the pool drops fresh pending allocations. If idle segments remain when an
+//! allocation fails, the pool evicts them and retries once. Those entries stay
+//! evicted if the retry fails, but accounting remains consistent.
 //!
-//! Thread safety comes from a single `Mutex` around the pool state. Poison is
-//! ignored (`lock` recovers the guard) so a panic does not permanently wedge
-//! the pool; subsequent checked accounting and validation still fail loudly
-//! if state is inconsistent. Leases return their segments from `Drop`, so
-//! scope exit — including unwinding — recycles memory.
+//! `max_idle_bytes` limits idle capacity. The pool evicts least-recently-used
+//! segments until it meets the limit. Its `idle_bytes` count equals the total
+//! idle capacity, and leased counters cover live leases. All counter updates
+//! use checked arithmetic. User-triggered overflow returns
+//! [`WorkspacePoolError::ByteSizeOverflow`] without changing the pool.
+//! Internal accounting errors panic. The per-pool LRU clock increases
+//! monotonically. Before its `u64` value wraps, the pool compacts idle ticks
+//! to `0..n` while preserving their order.
+//!
+//! One `Mutex` protects pool state. The lock helper recovers a poisoned guard,
+//! but later accounting checks still detect inconsistent state. A lease's
+//! `Drop` implementation returns its segments even during unwinding.
 
 use std::error::Error;
 use std::fmt;
 use std::sync::{Arc, Mutex, MutexGuard};
 
-/// Backend hook that produces fresh workspace storage on demand.
+/// Backend hook for allocating workspace storage on demand.
 ///
-/// Called only when no idle segment fits; the returned capacity must be at
-/// least `minimum_bytes` (enforced by the pool).
+/// The pool calls this only when no idle segment fits. It rejects a returned
+/// capacity smaller than `minimum_bytes`.
 pub trait WorkspaceAllocator<K> {
     type Workspace;
     type Error;
@@ -97,8 +84,7 @@ impl<K> WorkspaceRequest<K> {
     }
 }
 
-/// Point-in-time pool counters (see the module documentation for the
-/// invariants they satisfy).
+/// Snapshot of the pool's counters.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WorkspacePoolStats {
     pub idle_segments: usize,
@@ -109,8 +95,8 @@ pub struct WorkspacePoolStats {
 
 /// A cloneable handle to a shared workspace pool.
 ///
-/// All clones share one idle list and one set of counters. The pool outlives
-/// its leases: a [`WorkspaceLease`] holds an `Arc` to the same state.
+/// All clones share one idle list and one set of counters. A
+/// [`WorkspaceLease`] keeps that state alive through an `Arc`.
 pub struct WorkspacePool<K, A>
 where
     A: WorkspaceAllocator<K>,
@@ -155,8 +141,8 @@ where
         lock(&self.inner).max_idle_bytes
     }
 
-    /// Raises or lowers the idle-memory cap, evicting LRU segments
-    /// immediately if the current idle set exceeds the new cap.
+    /// Changes the idle-memory cap and immediately evicts LRU segments if
+    /// needed.
     pub fn set_max_idle_bytes(&self, max_idle_bytes: usize) {
         let mut inner = lock(&self.inner);
         inner.max_idle_bytes = max_idle_bytes;
@@ -175,11 +161,11 @@ where
 
     /// Atomically acquires one segment per request.
     ///
-    /// Reuses the best-fitting idle segment with a matching key when
-    /// possible, otherwise allocates through the allocator (evicting all
-    /// idle segments and retrying once on failure). On error, reused pending
-    /// segments are rolled back and fresh pending allocations are dropped.
-    /// Idle entries evicted for the retry are not restored.
+    /// Reuses the best-fitting idle segment with a matching key, or calls the
+    /// allocator. If allocation fails while idle segments remain, evicts them
+    /// and retries once. On error, returns reused pending segments to the pool
+    /// and drops fresh pending allocations. It does not restore entries evicted
+    /// for the retry.
     pub fn acquire(
         &self,
         requests: &[WorkspaceRequest<K>],
@@ -314,8 +300,7 @@ where
         })
     }
 
-    /// Alias for [`acquire`](Self::acquire); exists to emphasize the
-    /// all-or-nothing semantics at call sites acquiring multiple segments.
+    /// Calls [`acquire`](Self::acquire) for an all-or-nothing set of requests.
     pub fn acquire_set(
         &self,
         requests: &[WorkspaceRequest<K>],
@@ -339,9 +324,8 @@ where
 
 /// RAII guard owning the segments of one acquisition.
 ///
-/// Dropping the lease returns every segment to the pool (stamping it with
-/// a fresh LRU tick) and triggers eviction down to the idle cap. The
-/// segments are inaccessible after the lease is dropped.
+/// Dropping the lease gives each segment a new LRU tick, returns it to the
+/// pool, and evicts idle segments as needed to meet the cap.
 pub struct WorkspaceLease<K, A>
 where
     A: WorkspaceAllocator<K>,
@@ -371,7 +355,7 @@ where
         self.requested_bytes
     }
 
-    /// Total capacity actually acquired (`>= requested_bytes`).
+    /// Total acquired capacity, which is at least `requested_bytes`.
     pub fn actual_bytes(&self) -> usize {
         self.actual_bytes
     }
@@ -423,15 +407,14 @@ where
     }
 }
 
-/// One segment of a [`WorkspaceLease`]: the workspace plus its key,
-/// requested size and actual capacity.
+/// One leased workspace segment with its key, requested size, and capacity.
 pub struct LeasedWorkspace<K, T> {
     entry: IdleEntry<K, T>,
     requested_bytes: usize,
 }
 
 impl<K, T> LeasedWorkspace<K, T> {
-    /// The key this segment was requested (and is reused) under.
+    /// Key used to request and reuse this segment.
     pub fn key(&self) -> &K {
         &self.entry.key
     }
@@ -441,7 +424,7 @@ impl<K, T> LeasedWorkspace<K, T> {
         self.requested_bytes
     }
 
-    /// Actual capacity of the segment (`>= requested_bytes`).
+    /// Segment capacity, which is at least `requested_bytes`.
     pub fn capacity(&self) -> usize {
         self.entry.capacity
     }
@@ -469,8 +452,7 @@ impl<K: fmt::Debug, T: fmt::Debug> fmt::Debug for LeasedWorkspace<K, T> {
 /// Why an acquisition failed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WorkspacePoolError<E> {
-    /// The allocator failed (after one eviction-and-retry attempt, if any
-    /// idle segments existed).
+    /// The allocator failed after at most one eviction and retry.
     Allocation(E),
     /// The allocator returned a segment smaller than the request.
     InsufficientCapacity { requested: usize, actual: usize },
@@ -523,8 +505,7 @@ impl<K, A> WorkspacePoolInner<K, A>
 where
     A: WorkspaceAllocator<K>,
 {
-    // Smallest sufficient capacity, ties broken by lowest id so repeated
-    // acquire/drop cycles are deterministic.
+    // Choose the smallest sufficient segment, then the lowest id.
     fn best_fit(&self, key: &K, bytes: usize) -> Option<usize>
     where
         K: Eq,
@@ -537,9 +518,8 @@ where
             .map(|(index, _)| index)
     }
 
-    // Returns reused segments to the idle list after a failed acquisition.
-    // Freshly allocated segments are dropped instead (they were never idle,
-    // and their `id`/`last_used` placeholders were never published).
+    // Return reused segments after a failed acquisition. Drop fresh segments.
+    // The pool never published their `id` or `last_used` placeholders.
     fn rollback(&mut self, pending: &mut Vec<PendingEntry<K, A::Workspace>>) {
         for entry in pending.drain(..) {
             if entry.reused {
@@ -575,8 +555,8 @@ where
         self.idle_bytes = 0;
     }
 
-    // Monotonic LRU tick; on u64 wrap, idle ticks are compacted to a dense
-    // 0..n range preserving the eviction order, then ticking resumes.
+    // Before the LRU clock wraps, compact idle ticks to `0..n` without
+    // changing eviction order.
     fn next_lru_tick(&mut self) -> u64 {
         if let Some(next) = self.clock.checked_add(1) {
             self.clock = next;
@@ -613,9 +593,8 @@ struct PendingEntry<K, T> {
     reused: bool,
 }
 
-// Recovers the guard from a poisoned mutex so one panic does not wedge every
-// future acquisition. Checked accounting continues to detect inconsistent
-// state rather than silently accepting it.
+// Recover a poisoned guard so later acquisitions can run their accounting
+// checks and detect inconsistent state.
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex
         .lock()

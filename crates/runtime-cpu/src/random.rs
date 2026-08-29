@@ -1,23 +1,23 @@
 //! Tensor factories and pseudo-random generation.
 //!
-//! Deterministic factories (`arange`, `eye`) and random factories (`randn`,
-//! `uniform`) share the requirements/into/wrapper contract of the rest of the
-//! crate. Random values come from a process-global `xoroshiro128+` generator
-//! behind a mutex; [`reseed`] replaces its state. `randn` uses the
-//! Box–Muller transform with `u1` clamped away from zero.
+//! Deterministic factories `arange` and `eye`, and random factories `randn`
+//! and `uniform`, each have a requirements planner, an into function, and an
+//! allocating wrapper. Random values come from a process-global
+//! `xoroshiro128+` generator behind a mutex. [`reseed`] replaces its state.
+//! `randn` uses the Box-Muller transform with `u1` clamped away from zero.
 //!
-//! The executor does not use the global stream: it calls the seeded
-//! `*_seeded_into` variants with a per-invocation, per-node seed so compiled
-//! programs are reproducible regardless of global RNG state.
+//! The executor does not use the global stream. It calls the seeded
+//! `*_seeded_into` variants with a seed for each invocation and node, so
+//! global RNG state does not affect compiled programs.
 
 use super::tensor::{CpuDestination, CpuOperationRequirements, CpuTensorRequirement, Elem, Tensor};
 use effect_torch_runtime::DType;
 use half::{bf16, f16};
 use std::sync::Mutex;
 
-/// xoroshiro128+ PRNG. The two 64-bit state words are seeded from a single
-/// `u64` by running an LCG-style bit mixer (xor-shift steps over a
-/// golden-ratio offset) twice.
+/// xoroshiro128+ PRNG. Seeds the two 64-bit state words from one `u64` by
+/// running an LCG-style bit mixer twice. The mixer applies xor-shift steps over
+/// a golden-ratio offset.
 struct Xoroshiro128Plus {
     s0: u64,
     s1: u64,
@@ -204,7 +204,7 @@ impl Tensor {
     }
 
     /// Writes `start + i * step` into `destination`, whose length must equal
-    /// `ceil((end - start) / step)` (clamped at zero; `step` must be non-zero).
+    /// `ceil((end - start) / step)`, clamped at zero. `step` must be non-zero.
     pub fn arange_into(
         start: f64,
         end: f64,
@@ -278,7 +278,7 @@ impl Tensor {
     }
 
     /// Fills `destination` with standard-normal samples from the global
-    /// stream (Box–Muller on `f64`, narrowed to the destination dtype).
+    /// stream. Uses Box-Muller on `f64` and narrows to the destination dtype.
     pub fn randn_into(destination: &mut CpuDestination<'_>) -> Result<(), String> {
         with_rng(|rng| randn_with_rng_into(destination, rng))
     }

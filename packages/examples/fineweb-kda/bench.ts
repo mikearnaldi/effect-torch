@@ -1,10 +1,10 @@
-// Stateful single-sequence decode microbenchmark with random initialized
-// weights. Model/parameter initialization, inference compilation, prompt
-// prefill, and eight greedy warmup steps are outside the timed region. Every
-// measured iteration includes one recurrent/KV decode, full-vocabulary host
-// readback, JavaScript argmax, and output release; native execute already waits
-// for device completion. This is latency methodology, not batched device-only
-// kernel throughput.
+// Stateful single-sequence decode microbenchmark with randomly initialized
+// weights. Model and parameter initialization, inference compilation, prompt
+// prefill, and eight greedy warmup steps run before timing. Each measured
+// iteration runs one recurrent/KV decode, reads the full vocabulary back to the
+// host, computes argmax in JavaScript, and releases the output. Native execution
+// already waits for the device. This measures per-token latency, not batched
+// device-only kernel throughput.
 
 import * as BackendApple from "@effect-torch/backend-apple-native"
 import { Model, Tensor } from "@effect-torch/core"

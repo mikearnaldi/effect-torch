@@ -4,17 +4,19 @@ import { Console, Effect } from "effect"
 import { createRequire } from "node:module"
 import { performance } from "node:perf_hooks"
 
-// Median end-to-end comparison of dependent f32 matmul chains on Metal. Both
-// sides explicitly complete each BATCH-deep chain (`toTypedArray` versus
-// `mx.eval`) before the next iteration, and report chain wall time divided by
-// BATCH. effect-torch includes eager graph construction, compile/cache lookup,
-// and host readback; MLX includes graph construction and eval, so this is an API
-// path comparison rather than a kernel-only benchmark. Framework trials run in
-// fixed order and have no explicit untimed chain warmup.
+// Compares median end-to-end time for dependent f32 matmul chains on Metal.
+// Both frameworks finish each BATCH-deep chain before starting the next
+// iteration. effect-torch finishes with `toTypedArray`. MLX uses `mx.eval`. The
+// result is the chain wall time divided by BATCH. The effect-torch timer includes
+// eager graph construction, compile/cache lookup, and host readback. The MLX
+// timer includes graph construction and eval. This compares the two API paths,
+// not isolated kernels. Trials run in a fixed order without an explicit untimed
+// chain warmup.
 //
-// @frost-beta/mlx ships TypeScript sources incompatible with this repository's
-// strict type program, so runtime loading stays dynamic and this file declares
-// only the API surface it uses. The optional dependency must be installed.
+// @frost-beta/mlx ships TypeScript sources that this repository's strict type
+// program cannot compile. The benchmark loads the package dynamically and
+// declares the API members it uses. Install the optional dependency before
+// running this benchmark.
 interface MlxArray {
   readonly shape: Array<number>
 }
@@ -23,6 +25,7 @@ interface Mlx {
   matmul(a: MlxArray, b: MlxArray): MlxArray
   eval(...tensors: Array<MlxArray>): void
 }
+// SAFETY: this benchmark uses the documented core export of the optional @frost-beta/mlx package.
 const mx = (createRequire(import.meta.url)("@frost-beta/mlx") as { core: Mlx }).core
 const N = Number(process.env.N ?? 512)
 const TRIALS = 5

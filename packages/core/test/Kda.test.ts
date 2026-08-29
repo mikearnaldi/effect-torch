@@ -58,7 +58,10 @@ const naiveKda = (
       )
       outs.push(yield* Tensor.transpose(o, swap))
     }
-    return yield* Tensor.concat(outs as [Tensor.Any, Tensor.Any, ...Array<Tensor.Any>], { dim: 2 })
+    const [first, second, ...rest] = outs
+    if (first === undefined) throw new Error("KDA reference must produce at least one row")
+    if (second === undefined) return first
+    return yield* Tensor.concat([first, second, ...rest], { dim: 2 })
   })
 
 const inputs = (t: number, dk: number, dv: number, seed: number) =>
@@ -221,7 +224,7 @@ onDevices("Kda", (device) => (it) => {
         }
       }))
 
-    it.effect("trains in mixedBf16 on metal, typed error elsewhere", () =>
+    it.effect("trains in mixedBf16 on Metal and reports a typed error elsewhere", () =>
       Effect.gen(function*() {
         const model = yield* Model.kimiDeltaAttention("kda", 32, 4)
         const raw = yield* Tensor.fromTypedArray(
@@ -321,8 +324,8 @@ onDevices("Kda", (device) => (it) => {
     const EMBED = 8
     const HEADS = 2
 
-    // The K3-style hybrid: a KDA layer plus a causal full-attention
-    // layer with no positional encoding anywhere.
+    // The K3-style hybrid has a KDA layer and a causal full-attention layer,
+    // with no positional encoding in either one.
     const makeHybrid = Effect.gen(function*() {
       const wte = yield* Model.embedding("wte", VOCAB, EMBED)
       const kda = yield* Model.kimiDeltaAttention("kda", EMBED, HEADS)
@@ -361,8 +364,8 @@ onDevices("Kda", (device) => (it) => {
         expect(error.message).toMatch(/KV-only/)
       }))
 
-    // The reference: greedy generation through the ordinary forward
-    // graph, recomputing the whole context every step.
+    // The reference performs greedy generation through the ordinary forward
+    // graph and recomputes the whole context at every step.
     const naiveGenerate = (model: Model.Model, params: Model.Params, prompt: ReadonlyArray<number>, steps: number) =>
       Effect.gen(function*() {
         const context = [...prompt]

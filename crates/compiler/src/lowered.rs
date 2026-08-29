@@ -1,26 +1,23 @@
-//! The backend-neutral lowered IR: dense value and instruction tables that
-//! sit between graph optimization and physical memory planning.
+//! Backend-neutral value and instruction tables between graph optimization and
+//! physical memory planning.
 //!
-//! A [`LoweredProgram`] is the authoritative artifact a backend lowering
-//! produces. Its contract, enforced by the planner's validation:
+//! Planner validation enforces the [`LoweredProgram`] contract:
 //!
-//! - **Dense identity.** `values[i]` must carry `ValueId::from_index(i)` and
-//!   `instructions[i]` must carry `InstructionId::from_index(i)`. IDs are
-//!   table positions, so lookups are O(1) and mismatched tables are
-//!   structural errors, not runtime surprises.
-//! - **Declared effects.** Every value an instruction touches is listed in
-//!   exactly one resource category: logical `inputs`/`outputs`, plus
-//!   `scratch`, `staging`, `status`, and `state` for backend resources.
-//!   Liveness and scheduling see the union; effects that no declared use can
-//!   express live in [`InstructionEffects`].
-//! - **Storage intent.** Each value declares whether its storage is `Fixed`
-//!   (backend-assigned, outside the planner), `Planned` (packed into
-//!   planner-owned segments), or an `Alias` of another value at a byte
-//!   offset.
+//! - `values[i]` carries `ValueId::from_index(i)`, and `instructions[i]`
+//!   carries `InstructionId::from_index(i)`. IDs are table positions. This
+//!   gives O(1) lookup and makes table mismatches structural errors.
+//! - Every value an instruction touches appears in exactly one resource
+//!   category. Logical uses are `inputs` and `outputs`. Backend resources
+//!   use `scratch`, `staging`, `status`, and `state`. Liveness and
+//!   scheduling use all categories. Effects with no declared value use belong
+//!   in [`InstructionEffects`].
+//! - Each value declares `Fixed`, `Planned`, or `Alias` storage. The backend
+//!   assigns fixed storage, the planner packs planned storage, and an alias
+//!   refers to another value at a byte offset.
 //!
-//! The type parameters stay fully backend-defined: `K` is the instruction
-//! kind, `M` the memory-space type, and `V` the value record (which may wrap
-//! the authoritative [`ValueDecl`] with backend-only metadata).
+//! Backends define the type parameters. `K` is the instruction kind, `M` is
+//! the memory-space type, and `V` is the value record. `V` may wrap the
+//! planning [`ValueDecl`] with backend metadata.
 
 use effect_torch_runtime::{InstructionId, Location, SegmentOwnership, StorageClass, ValueId};
 use std::marker::PhantomData;
@@ -73,7 +70,7 @@ impl ValueUse {
     }
 }
 
-/// A defining write: each entry names a value the instruction defines.
+/// Names a value defined by an instruction.
 /// Outputs are the only category treated as definitions for liveness.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct OutputDecl {
@@ -86,7 +83,7 @@ impl OutputDecl {
     }
 }
 
-/// Backend-neutral effects which are not represented by declared value uses.
+/// Backend-neutral effects with no declared value use.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub struct InstructionEffects {
     /// The instruction can report an execution failure.
@@ -95,12 +92,12 @@ pub struct InstructionEffects {
     pub has_side_effects: bool,
 }
 
-/// Storage which is supplied outside the planner or is already assigned.
+/// Storage assigned outside the planner.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum ValueStorage<M> {
-    /// The backend already placed this value (external inputs, persistent
-    /// constants/state, escaping outputs, device status); the planner only
-    /// accounts for its bytes and never moves it.
+    /// The backend placed this value as an external input, persistent constant
+    /// or state, escaping output, or device status. The planner counts its
+    /// bytes but never moves it.
     Fixed {
         class: StorageClass,
         location: Location,
@@ -113,14 +110,13 @@ pub enum ValueStorage<M> {
         memory_space: M,
         ownership: SegmentOwnership,
     },
-    /// A view into another value at `byte_offset`. Aliases receive no
-    /// storage of their own; their uses fold into the root value's live
-    /// interval after alias normalization.
+    /// A view into another value at `byte_offset`. An alias has no storage of
+    /// its own. Alias normalization folds its uses into the root value's live
+    /// interval.
     Alias { source: ValueId, byte_offset: usize },
 }
 
-/// Declaration of one lowered value: its dense identity, a human-readable
-/// name for diagnostics, its byte size, and its storage intent.
+/// Declares a lowered value's dense ID, diagnostic name, byte size, and storage.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ValueDecl<M> {
     pub id: ValueId,
@@ -129,7 +125,7 @@ pub struct ValueDecl<M> {
     pub storage: ValueStorage<M>,
 }
 
-/// A backend value record containing the declaration authoritative for planning.
+/// A backend value record that provides its planning declaration.
 pub trait LoweredValue<M> {
     fn value_decl(&self) -> &ValueDecl<M>;
 }
@@ -164,8 +160,8 @@ impl<M> ValueDecl<M> {
         }
     }
 
-    /// A value declared as a `bytes`-sized view into `source` at
-    /// `byte_offset`. Bounds are checked during alias normalization.
+    /// Declares a `bytes`-sized view into `source` at `byte_offset`. Alias
+    /// normalization checks the bounds.
     pub fn alias(
         id: ValueId,
         name: impl Into<String>,
@@ -184,8 +180,8 @@ impl<M> ValueDecl<M> {
         }
     }
 
-    /// The accounting class of this value's storage, or `None` for aliases
-    /// (whose bytes are accounted through their root).
+    /// The storage accounting class. Aliases return `None` because their root
+    /// accounts for the bytes.
     pub const fn storage_class(&self) -> Option<StorageClass> {
         match &self.storage {
             ValueStorage::Fixed { class, .. } | ValueStorage::Planned { class, .. } => Some(*class),
@@ -196,12 +192,12 @@ impl<M> ValueDecl<M> {
 
 /// A backend-lowered logical instruction. `K` remains backend-defined.
 ///
-/// The resource categories partition every value the instruction touches:
-/// `inputs` are logical reads, `outputs` are defining writes, `scratch` is
-/// transient per-invocation workspace, `staging` is invocation staging,
-/// `status` is device status, and `state` is persistent state. Nothing may
-/// be touched without appearing in one of these lists; undeclared effects
-/// belong to [`InstructionEffects`].
+/// Resource categories partition every value the instruction touches.
+/// `inputs` are logical reads, and `outputs` are defining writes. `scratch`
+/// is transient per-invocation workspace, `staging` is invocation staging,
+/// `status` is device status, and `state` is persistent state. Every touched
+/// value must appear in one list. Other effects belong to
+/// [`InstructionEffects`].
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct LoweredInstruction<K> {
     pub id: InstructionId,
@@ -237,8 +233,7 @@ impl<K> LoweredInstruction<K> {
         }
     }
 
-    /// Attaches the non-logical resource uses (scratch, staging, status,
-    /// state) in declaration order.
+    /// Attaches scratch, staging, status, and state uses in declaration order.
     pub fn with_resources(
         mut self,
         scratch: impl Into<Box<[ValueUse]>>,
@@ -275,12 +270,12 @@ impl<K> LoweredInstruction<K> {
     }
 }
 
-/// Authoritative dense compiler IR consumed by planning and execution.
+/// Dense compiler IR used by planning and execution.
 ///
-/// `values` and `instructions` are index-parallel to their dense IDs;
-/// `outputs` lists the values that must remain materialized through
-/// invocation completion. The `PhantomData<fn() -> M>` marker ties the
-/// memory-space type to the value records without owning one.
+/// `values` and `instructions` are index-parallel to their dense IDs.
+/// `outputs` lists values that remain materialized through invocation.
+/// `PhantomData<fn() -> M>` ties the memory-space type to value records
+/// without owning a value of that type.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct LoweredProgram<K, M, V = ValueDecl<M>> {
     pub values: Box<[V]>,

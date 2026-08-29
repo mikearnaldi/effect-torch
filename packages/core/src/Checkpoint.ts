@@ -9,19 +9,19 @@
  *
  * Optimizer state `S` is opaque. Saving serializes only the tensors returned
  * by `optimizer.stateRoots(state)`, in positional `state:<i>` order. Loading
- * calls the supplied optimizer's `init` to make a structural template, takes
- * the expected root count from that template, and passes the loaded roots to
- * `rebuildState`. Thus every resumable dynamic value must be represented by a
- * tensor root, while all non-root structure must be reproducible by `init`;
- * the root count, meaning, and order must remain stable.
+ * calls the supplied optimizer's `init` to make a state template, takes the
+ * expected root count from that template, and passes the loaded roots to
+ * `rebuildState`. Every changing value needed to resume must therefore be a
+ * tensor root. `init` must reproduce all non-root structure, and the root
+ * count, meaning, and order must remain stable.
  *
  * Archives contain no model or optimizer identity, hyperparameters, state
- * schema, library version, or other provenance (the sampler payload alone is
- * versioned). Compatibility is the caller's responsibility: load with the
- * same model parameter names and semantics, optimizer implementation and
- * configuration, and state-root schema. Obvious missing metadata is rejected,
- * but semantic mismatches may load and fail or diverge only when used. Every
- * restored tensor is imported by the selected runtime without placement
+ * schema, library version, or other identifying metadata. Only the sampler
+ * payload is versioned. Compatibility is the caller's responsibility. Load
+ * with the same model parameter names and behavior, optimizer implementation
+ * and configuration, and state-root schema. The loader rejects missing required
+ * entries, but other mismatches may load and fail or diverge only when used.
+ * The selected runtime imports every restored tensor without placement
  * fallback.
  *
  * Persistence uses the runtime's direct path-based safetensors extension.
@@ -68,9 +68,9 @@ const SAMPLER_VERSION = 1
 const U32_MAX = 0xffff_ffff
 
 /**
- * A restored training position for `trainer.train(params, resume)`. It is
- * reconstructed under the trainer and runtime supplied to {@link load}, not
- * from provenance embedded in the archive.
+ * A restored training position for `trainer.train(params, resume)`.
+ * {@link load} reconstructs it with the supplied trainer and runtime. The
+ * archive contains no identifying metadata for either one.
  *
  * @since 0.1.0
  * @category models
@@ -100,12 +100,12 @@ export interface CheckpointWithSampler<S> extends Checkpoint<S> {
 }
 
 /**
- * Saves parameters by the trainer model's parameter specs, optimizer state roots by stable
- * positional index, and the global step as a u32 scalar. For a faithful round
- * trip, `trained.step` must be an integer in `0..4294967295`; values outside
- * that range fail before serialization. Optimizer values not
+ * Saves parameters by the trainer model's parameter specs, optimizer state
+ * roots by stable positional index, and the global step as a u32 scalar. For a
+ * faithful round trip, `trained.step` must be an integer in `0..4294967295`.
+ * Values outside that range fail before serialization. Optimizer values not
  * exposed by `stateRoots`, the last loss, `Resume.startedAt`, and trainer
- * provenance are not written.
+ * identity and configuration are not written.
  *
  * `trained` must have been produced by this trainer with matching parameter
  * order and optimizer root schema. Parameter arity and the persisted u32 step
@@ -113,11 +113,10 @@ export interface CheckpointWithSampler<S> extends Checkpoint<S> {
  * Saving borrows tensors and does not clear them.
  *
  * `path` is handled by the selected runtime's direct safetensors extension.
- * The write materializes all entries together and then performs
- * {@link Tensor.save}'s ordered best-effort cleanup, independently attempting
- * every temporary release. `trained` remains untouched.
- * Atomic replacement and durability
- * are backend properties, not portable guarantees of this function.
+ * The write materializes all entries together. It then performs
+ * {@link Tensor.save}'s ordered best-effort cleanup and attempts to release
+ * each temporary independently. `trained` remains untouched. Atomic replacement
+ * and durability depend on the backend; this function does not guarantee them.
  * In particular, interruption or failure does not portably imply that the
  * destination was unchanged; bundled runtimes can observe cancellation after
  * their rename completed.
@@ -141,7 +140,7 @@ export const save = <S, EL, RL, ED, RD, EO, RO>(
  * {@link save} plus a snapshot of the sampler's configuration, order, cursor,
  * epoch, and payload version. All sampler metadata is represented as u32;
  * configuration and epoch are positive u32 values, while cursor and order
- * indices may be zero. The same path and backend failures surface as
+ * indices may be zero. The same path and backend failures are reported as
  * {@link Tensor.TensorError}.
  *
  * This preserves the remaining draws in the current permutation. JavaScript
@@ -182,7 +181,7 @@ export const saveWithSampler = <S, EL, RL, ED, RD, EO, RO>(
  * The archive does not prove trainer compatibility. In particular, loaded
  * parameter and state-root shapes or dtypes are not compared with a persisted
  * schema, and optimizer identity and hyperparameters are not stored. Use the
- * same trainer semantics and a stable `stateRoots`/`rebuildState` contract.
+ * same trainer behavior and a stable `stateRoots`/`rebuildState` contract.
  * The returned resume contains the u32 global step but no `startedAt` anchor.
  * Loaded parameters and state roots are caller-owned independent handles;
  * retain them while resuming and release each owned handle with
@@ -194,7 +193,7 @@ export const saveWithSampler = <S, EL, RL, ED, RD, EO, RO>(
  * Missing required checkpoint entries or malformed `meta:step` metadata fail
  * with {@link CheckpointError}. Missing paths, malformed safetensors files,
  * unavailable path I/O, unsupported imports, optimizer initialization, and
- * backend failures surface as {@link Tensor.TensorError}.
+ * backend failures are reported as {@link Tensor.TensorError}.
  *
  * @since 0.1.0
  * @category constructors
@@ -213,7 +212,7 @@ export const load = <S, EL, RL, ED, RD, EO, RO>(
  * {@link saveWithSampler}. Sampler scalars must be rank-0 u32 tensors and
  * `sampler:order` a rank-1 u32 tensor; only payload version 1 is accepted.
  * The decoded state is a detached JavaScript value, not a full sampler
- * validation: pass it with the exact saved configuration to
+ * validation. Pass it with the exact saved configuration to
  * {@link Sampler.restore}, which checks the window count, permutation,
  * batch-aligned cursor, and positive u32 epoch.
  *

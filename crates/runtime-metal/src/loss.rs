@@ -1,12 +1,10 @@
-//! Fused cross-entropy on Metal: the composed path (~30 ops with four
-//! synchronous host readbacks for count/label checks) becomes one
-//! kernel per row-block plus one tiny status read per direction.
-//! Forward: per-row online logsumexp + nll in one pass, a single
-//! status kernel (loss, active count, invalid count), one 12-byte
-//! readback that preserves the exact error semantics. Backward:
-//! device-side active count, then probs − one_hot in one pass — no
-//! host round trip beyond the same zero-count check. CPU keeps the
-//! composed reference path.
+//! Fused cross-entropy on Metal replaces about 30 composed operations and
+//! four synchronous count or label readbacks. Each direction uses one kernel
+//! per row block and one small status read. The forward computes per-row online
+//! logsumexp and nll, then a status kernel writes loss, active count, and invalid
+//! count for a 12-byte readback. The backward counts active rows on the device
+//! and computes probs − one_hot in one pass. Its only host round trip is the
+//! same zero-count check. CPU uses the composed reference.
 //!
 //! ## Kernel contracts
 //!
@@ -22,17 +20,17 @@
 //!   reproduce the composed path's error semantics.
 //! - `et_ce_count` / `et_ce_target_status`: device-side active (and
 //!   invalid) counts so the backward divides without a host round
-//!   trip; the target-only variant serves the chunked LM-head backward,
-//!   which recomputes logits chunk by chunk.
+//!   trip. The chunked LM-head backward uses the target-only variant while
+//!   recomputing logits chunk by chunk.
 //! - `et_ce_bwd`: `grad = (softmax(z) − one_hot(t)) (/ count)` for
 //!   active rows, zeros for ignored rows; re-derives the logsumexp.
 //! - `et_ce_bwd_scaled_f32`: chunked-head variant writing f32
 //!   gradients scaled by a device scalar, rounding through the logits
 //!   dtype first to preserve the composed path's rounding point.
 //!
-//! The `*_into` entry points validate contiguity/shape/dtype, mark
-//! destination buffers written, and allocate nothing; pipelines must
-//! be pre-warmed via the matching `warm_*` functions.
+//! The `*_into` functions validate contiguity, shape, and dtype. They mark
+//! destination buffers written and allocate nothing. The matching `warm_*`
+//! function must precompile each pipeline.
 
 use crate::runtime::dtype::DType;
 use crate::runtime::metal::run::MetalTensor;
@@ -67,8 +65,8 @@ fn test_counts() -> (usize, usize) {
     )
 }
 
-/// Planner-facing description of one device buffer a launch needs
-/// (shape, dtype, and derived element/byte counts, overflow-checked).
+/// Device buffer required by one launch, including overflow-checked shape,
+/// dtype, element count, and byte count.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BufferRequirement {
     /// Logical shape of the buffer.
@@ -108,13 +106,13 @@ pub enum CeForwardTopology {
     RowsThenStatus { threads: usize, dispatches: usize },
 }
 
-/// Planner-facing requirements of a fused cross-entropy forward.
+/// Requirements for a fused cross-entropy forward.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CeForwardRequirements {
     /// Scalar f32 loss output.
     pub loss: BufferRequirement,
-    /// f32 `[3]` status: `[loss, active_count, invalid_count]` — the
-    /// single host readback that preserves composed error semantics.
+    /// f32 `[3]` status containing loss, active count, and invalid count.
+    /// This is the only host readback needed to preserve composed errors.
     pub status: BufferRequirement,
     /// f32 `[rows]` per-row nll scratch shared between the two kernels.
     pub nll_scratch: BufferRequirement,
@@ -144,7 +142,7 @@ pub enum CeBackwardTopology {
     CountThenRows { threads: usize, dispatches: usize },
 }
 
-/// Planner-facing requirements of a fused cross-entropy backward.
+/// Requirements for a fused cross-entropy backward.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CeBackwardRequirements {
     /// Gradient output (same shape/dtype as the logits).
@@ -688,7 +686,7 @@ kernel void et_ce_bwd_scaled_f32(
         Ok(())
     }
 
-    /// Warms exactly the forward pipelines described by `requirements`.
+    /// Warms the forward pipelines described by `requirements`.
     pub fn warm_forward_exact(requirements: &CeForwardRequirements) -> crate::err::Res<()> {
         pipeline(
             requirements.target_dtype,
@@ -704,7 +702,7 @@ kernel void et_ce_bwd_scaled_f32(
     }
 
     /// Warms the backward pipelines for the (target, logits) dtype
-    /// pair; mean reduction additionally warms `et_ce_count`.
+    /// pair. Mean reduction also warms `et_ce_count`.
     pub fn warm_backward(
         logits: DType,
         target: DType,
@@ -718,7 +716,7 @@ kernel void et_ce_bwd_scaled_f32(
         Ok(())
     }
 
-    /// Warms exactly the backward pipelines described by `requirements`.
+    /// Warms the backward pipelines described by `requirements`.
     pub fn warm_backward_exact(requirements: &CeBackwardRequirements) -> crate::err::Res<()> {
         if requirements.reduction == crate::CeReduction::Mean {
             pipeline(
@@ -865,7 +863,7 @@ kernel void et_ce_bwd_scaled_f32(
         Ok(())
     }
 
-    /// Allocating convenience wrapper around [`ce_forward_into`].
+    /// Allocates outputs and calls [`ce_forward_into`].
     /// Returns `(loss scalar, status [3])` without reading status;
     /// validation remains deferred to the evaluator's status gate.
     pub fn ce_forward(
@@ -1110,10 +1108,9 @@ kernel void et_ce_bwd_scaled_f32(
         Ok(())
     }
 
-    /// Allocating convenience wrapper around [`ce_backward_into`];
-    /// returns `(grad, count [1])`. Only mean reduction writes the
-    /// count; the buffer is allocated either way to preserve the
-    /// historical pair return.
+    /// Allocates outputs, calls [`ce_backward_into`], and returns
+    /// `(grad, count [1])`. Only mean reduction writes the count. The buffer
+    /// is always allocated to preserve the historical pair return.
     pub fn ce_backward(
         logits: &MetalTensor,
         target: &MetalTensor,

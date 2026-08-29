@@ -23,14 +23,37 @@ const configEntries = [
 
 const config = (): Gguf.ModelConfig => new Map<string, unknown>(configEntries)
 
-// This shape-only runtime records graph requests and fabricates coherent handles;
-// it deliberately cannot compile or execute. Model validation still observes the
-// declared placement, dtype, and shape, so topology checks exercise the real API.
+// This shape-only runtime records graph requests and fabricates coherent handles.
+// It does not implement compilation or execution. Model validation still
+// observes the declared placement, dtype, and shape, so topology checks exercise
+// the real API.
 const placement: Runtime.Placement = Object.freeze({
   id: "muse-test:0",
   deviceType: "test",
   description: "Muse-Glimmer graph test runtime"
 })
+
+type RuntimeDouble = Partial<Omit<Runtime.RuntimeService, "extensions">> & {
+  readonly extensions?: Partial<Runtime.RuntimeService["extensions"]>
+}
+type TestHandle = Pick<Tensor.Any, "_tag" | "shape" | "dtype" | "storage" | "device" | "placement" | "pipe">
+
+const runtimeDouble = (value: RuntimeDouble): Runtime.RuntimeService => {
+  // SAFETY: Each test supplies every runtime member reached by the code under test.
+  return value as Runtime.RuntimeService
+}
+
+const brandedHandle = (value: TestHandle): Tensor.Any => {
+  // SAFETY: The handle factory supplies all public metadata; only Runtime's private brands are absent.
+  return value as Tensor.Any
+}
+
+const loaderOnlyIdentity = (value: Tensor.Any): Tensor.Lazy => {
+  // SAFETY: Loader metadata tests never invoke these placeholder model forwards.
+  return value as Tensor.Lazy
+}
+
+const isLazyHandle = (value: Tensor.Any): value is Tensor.Lazy => value._tag === "LazyTensor"
 
 const broadcast = (left: ReadonlyArray<number>, right: ReadonlyArray<number>): Array<number> => {
   const rank = Math.max(left.length, right.length)
@@ -41,28 +64,42 @@ const broadcast = (left: ReadonlyArray<number>, right: ReadonlyArray<number>): A
   return shape
 }
 
-const handle = (
+function handle(
+  tag: "LazyTensor",
+  shape: ReadonlyArray<number>,
+  dtype: Tensor.DType,
+  storage?: Runtime.EncodedTensorStorage
+): Tensor.Lazy
+function handle(
+  tag: "Tensor",
+  shape: ReadonlyArray<number>,
+  dtype: Tensor.DType,
+  storage?: Runtime.EncodedTensorStorage
+): Tensor.Concrete
+function handle(
   tag: "LazyTensor" | "Tensor",
   shape: ReadonlyArray<number>,
   dtype: Tensor.DType,
   storage?: Runtime.EncodedTensorStorage
-): Tensor.Any =>
-  Object.freeze({
+): Tensor.Any {
+  const value = {
     _tag: tag,
     shape,
     dtype,
-    ...(storage === undefined ? {} : { storage }),
     device: placement.deviceType,
     placement,
     pipe() {
       throw new Error("unused test handle pipe")
     }
-  }) as unknown as Tensor.Any
+  } satisfies TestHandle
+  if (storage !== undefined) Object.assign(value, { storage })
+  return brandedHandle(Object.freeze(value))
+}
 
 // Topology tests clear this module-local log immediately before building a graph.
 const requests: Array<Runtime.NodeRequest> = []
 
-const runtime = {
+const runtime = runtimeDouble({
   identity: {},
   backend: { name: "muse-test" },
   placement,
@@ -73,42 +110,42 @@ const runtime = {
       requests.push(request)
       switch (request.op) {
         case "constant":
-          return handle("LazyTensor", [], request.attributes.dtype) as Tensor.Lazy
+          return handle("LazyTensor", [], request.attributes.dtype)
         case "quantizedEmbedding":
           return handle(
             "LazyTensor",
             [...request.inputs[0].shape, request.attributes.logicalShape[1]],
             "f32"
-          ) as Tensor.Lazy
+          )
         case "quantizedLinear":
           return handle(
             "LazyTensor",
             [...request.inputs[0].shape.slice(0, -1), request.attributes.logicalShape[0]],
             "f32"
-          ) as Tensor.Lazy
+          )
         case "rmsNorm":
-          return handle("LazyTensor", request.inputs[0].shape, request.inputs[0].dtype) as Tensor.Lazy
+          return handle("LazyTensor", request.inputs[0].shape, request.inputs[0].dtype)
         case "mean": {
           const dims = new Set(request.attributes.dims)
           const shape = request.inputs[0].shape.flatMap((dimension, index) =>
             dims.has(index) ? request.attributes.keepdims ? [1] : [] : [dimension]
           )
-          return handle("LazyTensor", shape, request.inputs[0].dtype) as Tensor.Lazy
+          return handle("LazyTensor", shape, request.inputs[0].dtype)
         }
         case "reshape":
-          return handle("LazyTensor", request.attributes.shape, request.inputs[0].dtype) as Tensor.Lazy
+          return handle("LazyTensor", request.attributes.shape, request.inputs[0].dtype)
         case "permute":
           return handle(
             "LazyTensor",
             request.attributes.dims.map((dimension) => request.inputs[0].shape[dimension]),
             request.inputs[0].dtype
-          ) as Tensor.Lazy
+          )
         case "scaledDotProductAttention":
           return handle(
             "LazyTensor",
             [...request.inputs[0].shape.slice(0, -1), request.inputs[2].shape.at(-1)!],
             request.inputs[0].dtype
-          ) as Tensor.Lazy
+          )
         case "add":
         case "div":
         case "mul":
@@ -116,24 +153,27 @@ const runtime = {
             "LazyTensor",
             broadcast(request.inputs[0].shape, request.inputs[1].shape),
             request.inputs[0].shape.length === 0 ? request.inputs[1].dtype : request.inputs[0].dtype
-          ) as Tensor.Lazy
+          )
         case "pow":
         case "rotaryEmbedding":
         case "tanh":
-          return handle("LazyTensor", request.inputs[0].shape, request.inputs[0].dtype) as Tensor.Lazy
-        case "expose":
-          return request.inputs[0] as Tensor.Lazy
+          return handle("LazyTensor", request.inputs[0].shape, request.inputs[0].dtype)
+        case "expose": {
+          const input = request.inputs[0]
+          if (!isLazyHandle(input)) throw new Error("expose input must be lazy")
+          return input
+        }
         default:
           throw new Error(`unexpected Muse-Glimmer graph operation ${request.op}`)
       }
     })
-} as unknown as Runtime.RuntimeService
+})
 
 const runtimeLayer = Layer.succeed(Runtime.Runtime, runtime)
 
 // Rank-two parameters carry encoded storage so the graph takes quantized
 // embedding/linear paths without allocating the canonical model's huge weights.
-const modelParams = (parameters: ReadonlyArray<{ readonly shape: ReadonlyArray<number> }>): Array<Tensor.Any> =>
+const modelParams = (parameters: ReadonlyArray<{ readonly shape: ReadonlyArray<number> }>): Array<Tensor.Concrete> =>
   parameters.map(({ shape }) =>
     handle(
       "Tensor",
@@ -179,7 +219,7 @@ it.effect("exports the exact Muse-Glimmer GGUF definition and loader", () =>
   }))
 
 it.effect("loadGGUF rejects artifacts for another architecture", () => {
-  const ggufRuntime = {
+  const ggufRuntime = runtimeDouble({
     ...runtime,
     extensions: {
       gguf: {
@@ -191,7 +231,7 @@ it.effect("loadGGUF rejects artifacts for another architecture", () => {
         load: () => Effect.die(new Error("load must not be called"))
       }
     }
-  } as unknown as Runtime.RuntimeService
+  })
   return Effect.gen(function*() {
     const error = yield* Effect.flip(MuseGlimmer.loadGGUF("other.gguf"))
     expect(error._tag).toBe("GgufError")
@@ -313,7 +353,7 @@ it.effect("derives the parameter catalog and graph from configuration", () =>
 
 it.effect("receives vocab_size from generic GGUF tokenizer token translation", () => {
   let vocabSize: unknown
-  const ggufRuntime = {
+  const ggufRuntime = runtimeDouble({
     ...runtime,
     extensions: {
       gguf: {
@@ -328,7 +368,7 @@ it.effect("receives vocab_size from generic GGUF tokenizer token translation", (
         load: () => Effect.succeed({ entries: [] })
       }
     }
-  } as unknown as Runtime.RuntimeService
+  })
   const services = Layer.succeed(Runtime.Runtime, ggufRuntime)
   return Effect.gen(function*() {
     yield* Gguf.loadModel("generic.gguf", {
@@ -337,7 +377,7 @@ it.effect("receives vocab_size from generic GGUF tokenizer token translation", (
         vocabSize = canonical.get("vocab_size")
         return Model.define({
           parameterSpecs: [],
-          forward: (_, input) => Effect.succeed(input as Tensor.Lazy)
+          forward: (_, input) => Effect.succeed(loaderOnlyIdentity(input))
         })
       }
     })
@@ -346,7 +386,7 @@ it.effect("receives vocab_size from generic GGUF tokenizer token translation", (
 })
 
 it.effect("exposes canonical tokenizer metadata from GGUF loading", () => {
-  const ggufRuntime = {
+  const ggufRuntime = runtimeDouble({
     ...runtime,
     extensions: {
       gguf: {
@@ -364,7 +404,7 @@ it.effect("exposes canonical tokenizer metadata from GGUF loading", () => {
         load: () => Effect.succeed({ entries: [] })
       }
     }
-  } as unknown as Runtime.RuntimeService
+  })
   const services = Layer.succeed(Runtime.Runtime, ggufRuntime)
   return Effect.gen(function*() {
     const loaded = yield* Gguf.loadModel("generic.gguf", {
@@ -372,7 +412,7 @@ it.effect("exposes canonical tokenizer metadata from GGUF loading", () => {
       create: () =>
         Model.define({
           parameterSpecs: [],
-          forward: (_, input) => Effect.succeed(input as Tensor.Lazy)
+          forward: (_, input) => Effect.succeed(loaderOnlyIdentity(input))
         })
     })
     expect(loaded.metadata.get("tokenizer.chat_template")).toBe("{{ messages }}")

@@ -1,11 +1,10 @@
-import { describe, expect, it } from "@effect/vitest"
+import { Runtime } from "@effect-torch/core"
+import { expect, layer as testLayer } from "@effect/vitest"
 import { Effect } from "effect"
 import { mkdtemp, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import path from "node:path"
-import { makeRuntime } from "../src/index.ts"
-
-const runtime = makeRuntime()
+import { layer as backendLayer } from "../src/index.ts"
 
 const withTempFile = <A, E, R>(prefix: string, use: (file: string) => Effect.Effect<A, E, R>) =>
   Effect.acquireUseRelease(
@@ -21,11 +20,12 @@ const f32Bytes = (values: ReadonlyArray<number>): Uint8Array => {
   return data
 }
 
-// This suite uses the host native addon and temporary on-disk artifacts. Every
-// concrete handle returned by execution or loading is explicitly released.
-describe("CPU tensor handles and direct safetensors", () => {
+// This suite uses the host native addon and temporary files. Tests release every
+// concrete handle returned by execution or loading.
+testLayer(backendLayer)("CPU tensor handles and direct safetensors", (it) => {
   it.effect("creates frozen metadata-only handles and accepts concrete tensors as node inputs", () =>
     Effect.gen(function*() {
+      const runtime = yield* Runtime.Runtime
       const lazy = yield* runtime.node({
         op: "fromBytes",
         inputs: [],
@@ -50,6 +50,7 @@ describe("CPU tensor handles and direct safetensors", () => {
 
   it.effect("exports logical values from noncontiguous tensors through readback", () =>
     Effect.gen(function*() {
+      const runtime = yield* Runtime.Runtime
       const source = yield* runtime.node({
         op: "fromBytes",
         inputs: [],
@@ -70,6 +71,7 @@ describe("CPU tensor handles and direct safetensors", () => {
   it.effect("round trips direct metadata and escaped names", () =>
     withTempFile("effect-torch-cpu-safetensors-", (file) =>
       Effect.gen(function*() {
+        const runtime = yield* Runtime.Runtime
         const name = "quoted\"\\\nname"
         const lazy = yield* runtime.node({
           op: "fromBytes",
@@ -95,6 +97,7 @@ describe("CPU tensor handles and direct safetensors", () => {
   it.effect("rejects malformed direct input", () =>
     withTempFile("effect-torch-cpu-safetensors-bad-", (file) =>
       Effect.gen(function*() {
+        const runtime = yield* Runtime.Runtime
         yield* Effect.tryPromise(() => writeFile(file, new Uint8Array([1, 2, 3])))
         const error = yield* Effect.flip(runtime.extensions.pathSafetensors.load(file))
         expect(error.reason).toBe("io-failed")

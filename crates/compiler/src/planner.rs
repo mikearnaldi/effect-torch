@@ -1,41 +1,33 @@
-//! Logical memory planning: liveness analysis, alias normalization, and
-//! deterministic segment packing over a lowered program.
+//! Plans logical memory through liveness analysis, alias normalization, and
+//! deterministic segment packing.
 //!
-//! Planning runs in three validated stages, each with its own failure modes
-//! reported through [`PlannerError`]:
+//! Planning has three stages. [`PlannerError`] reports failures from each one:
 //!
-//! 1. **Validation** ([`validate_lowered_program`]): dense table identity
-//!    (`values[i].id == i`, `instructions[i].id == i`) and every value
-//!    reference — including all resource categories and outputs — must
-//!    resolve. Nothing downstream re-checks these invariants.
-//! 2. **Liveness** ([`analyze_liveness`], [`normalize_aliases`]): alias
-//!    chains are flattened to a root value plus one accumulated byte offset
-//!    (cycles and out-of-bounds views are rejected), then every non-alias
-//!    value receives a half-open live interval `[first_def_or_use, last_use)`.
-//!    Alias uses fold into their root's interval, so a view keeps its root
-//!    alive. Planned values must be written before any read, and outputs are
-//!    held live through the final instruction.
-//! 3. **Packing** ([`plan_memory`]): planned values are allocated in
-//!    `(interval start, value id)` order into segments partitioned by
-//!    `(memory space, ownership)`. Placement is deterministic: best-fit over
-//!    retired free ranges first (least waste wins), then tail growth of the
-//!    cheapest segment, then a fresh segment.
+//! 1. [`validate_lowered_program`] checks that each value and instruction ID
+//!    matches its table index. It resolves every value reference in resource
+//!    categories and outputs. Later stages rely on these checks.
+//! 2. [`normalize_aliases`] flattens each alias chain to a root and accumulated
+//!    byte offset. It rejects cycles and out-of-bounds views.
+//!    [`analyze_liveness`] then assigns each non-alias value a half-open
+//!    `[first_def_or_use, last_use)` interval. Alias uses extend the root's
+//!    interval. Planned values require a write before any read, and outputs
+//!    remain live through the final instruction.
+//! 3. [`plan_memory`] allocates planned values in `(interval start, value id)`
+//!    order. The packer partitions segments by `(memory space, ownership)`.
+//!    It tries the retired range with the least waste, then grows the
+//!    cheapest segment tail, then creates a segment.
 //!
-//! Invariants the runtime relies on:
+//! The runtime relies on these rules:
 //!
-//! - **Safety.** Two values whose live intervals overlap never share address
-//!   space; a violation aborts planning with [`PlannerError::PackingConflict`]
-//!   rather than emitting an unsound plan. Same-instruction read-then-write
-//!   does not permit reuse.
-//! - **Determinism.** Identical inputs produce byte-identical plans; all tie
-//!   breaks are by dense ID.
-//! - **Explicit reuse.** When one value's storage is recycled by a later
-//!   value, a [`ReuseEdge`] records the instruction boundary so the runtime
-//!   can order the transition.
-//! - **Right-sized segments.** Segment byte sizes are rounded up to the
-//!   configured granularity and never exceed the configured maximum; segment
-//!   alignment is the maximum of the configured alignment and every member
-//!   value's alignment.
+//! - Values with overlapping live intervals never share address space. A
+//!   conflict returns [`PlannerError::PackingConflict`] instead of an unsound
+//!   plan. A read and write in the same instruction cannot reuse storage.
+//! - Identical inputs produce byte-identical plans. Dense IDs break ties.
+//! - When a later value reuses storage, a [`ReuseEdge`] records the instruction
+//!   boundary so the runtime can order the transition.
+//! - Segment sizes round up to the configured granularity and never exceed the
+//!   configured maximum. Segment alignment is the maximum of the configured
+//!   alignment and every member value's alignment.
 
 use crate::{LoweredProgram, LoweredValue, ValueStorage};
 use effect_torch_runtime::{
@@ -47,18 +39,17 @@ use std::error::Error;
 use std::fmt;
 use std::ops::Range;
 
-/// An alias chain flattened to its storage-owning root: `root` is the
-/// non-alias value that owns the bytes and `byte_offset` is the sum of every
-/// hop's offset.
+/// A normalized alias chain. `root` is the non-alias value that owns the
+/// storage, and `byte_offset` is the sum of all hop offsets.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct NormalizedAlias {
     pub root: ValueId,
     pub byte_offset: usize,
 }
 
-/// Half-open instruction range `[start, end)` during which a value occupies
-/// storage: `start` is the first definition (or first use for non-planned
-/// values), `end` is one past the last access.
+/// Half-open instruction range `[start, end)` for a value's storage.
+/// `start` is the first definition, or the first use of a non-planned value.
+/// `end` is one past the last access.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct LiveInterval {
     pub value: ValueId,
@@ -82,13 +73,12 @@ impl LiveInterval {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Liveness {
     pub aliases: Box<[NormalizedAlias]>,
-    /// Alias entries are `None`; their uses are folded into the root entry.
+    /// Alias entries are `None`. The root entry includes their uses.
     pub intervals: Box<[Option<LiveInterval>]>,
 }
 
-/// Constraints for one memory space: the largest segment the planner may
-/// create, the alignment segments are created with, and the granularity
-/// segment sizes are rounded up to.
+/// Maximum segment size, segment alignment, and size granularity for one
+/// memory space.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct MemorySpaceConfig<M> {
     pub memory_space: M,
@@ -97,8 +87,8 @@ pub struct MemorySpaceConfig<M> {
     pub segment_granularity: usize,
 }
 
-/// Planner configuration: one entry per memory space (duplicates are
-/// rejected) plus the number of largest allocations to retain in the report.
+/// Planner configuration with one entry per memory space and the number of
+/// largest allocations to retain in the report. Duplicate spaces are invalid.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct MemoryPlannerConfig<M> {
     pub memory_spaces: Vec<MemorySpaceConfig<M>>,
@@ -129,9 +119,8 @@ impl<M> MemoryPlannerConfig<M> {
     }
 }
 
-/// Every structural way a lowered program can fail validation, liveness, or
-/// packing. Variants carry the dense identities involved so failures are
-/// attributable to a specific value, instruction, or configuration entry.
+/// Structural failures from validation, liveness, and packing. Each variant
+/// identifies the relevant value, instruction, or configuration entry.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PlannerError {
     TooManyValues,
@@ -349,10 +338,10 @@ where
     }
 }
 
-/// Flattens every alias chain to its storage-owning root and accumulated
-/// byte offset, in a single pass with path-based cycle detection. Rejects
-/// alias cycles, unknown sources, out-of-bounds views, and offset overflow.
-/// The result is index-parallel to `values`.
+/// Flattens alias chains to their storage-owning roots and accumulated byte
+/// offsets in one pass. Path tracking detects cycles. The function rejects
+/// unknown sources, out-of-bounds views, and offset overflow. Results are
+/// index-parallel to `values`.
 pub fn normalize_aliases<M, V>(values: &[V]) -> Result<Box<[NormalizedAlias]>, PlannerError>
 where
     V: LoweredValue<M>,
@@ -449,12 +438,11 @@ where
         .collect())
 }
 
-/// Validates the program, normalizes aliases, and computes the live
-/// interval of every non-alias value. Reads and writes from every resource
-/// category extend liveness; planned values must be defined before any read
-/// and have a power-of-two alignment; output roots stay live through the
-/// last instruction. Alias entries are `None` — their accesses are recorded
-/// against the root.
+/// Validates the program, normalizes aliases, and computes each non-alias live
+/// interval. Reads and writes in every resource category extend liveness.
+/// Planned values require a definition before any read and a power-of-two
+/// alignment. Output roots remain live through the last instruction. Alias
+/// entries are `None`. Their accesses extend the root interval.
 pub fn analyze_liveness<K, M, V>(
     schedule: &LoweredProgram<K, M, V>,
 ) -> Result<Liveness, PlannerError>
@@ -576,10 +564,10 @@ struct ActiveAllocation {
     bytes: usize,
 }
 
-/// One segment under construction: its space and ownership class are fixed
-/// at creation, `used_end` is the high-water mark, `free` holds retired
-/// ranges available for reuse, and `active` holds allocations whose
-/// intervals have not yet ended.
+/// A segment under construction. Its memory space and ownership remain fixed.
+/// `used_end` is the end offset of the highest allocated range. `free`
+/// contains reusable retired ranges. `active` contains allocations with live
+/// intervals.
 #[derive(Debug)]
 struct WorkingSegment<M> {
     memory_space: M,
@@ -593,9 +581,9 @@ struct WorkingSegment<M> {
 }
 
 impl<M> WorkingSegment<M> {
-    /// Moves allocations whose interval ends at or before `before` onto the
-    /// free list, coalescing adjacent ranges so best-fit search sees maximal
-    /// reusable spans.
+    /// Moves allocations ending at or before `before` to the free list. It
+    /// coalesces adjacent ranges so best-fit search sees the largest reusable
+    /// spans.
     fn retire(&mut self, before: usize) {
         let active = std::mem::take(&mut self.active);
         for allocation in active {
@@ -787,9 +775,8 @@ where
     Ok(report)
 }
 
-/// Plans segment storage for a lowered program: liveness analysis followed
-/// by deterministic packing. The returned plan is validated against the
-/// runtime's own structural checks before it leaves the compiler.
+/// Analyzes liveness and packs segment storage for a lowered program. Runtime
+/// structural checks validate the plan before the compiler returns it.
 pub fn plan_memory<K, M, V>(
     schedule: &LoweredProgram<K, M, V>,
     config: &MemoryPlannerConfig<M>,
@@ -802,9 +789,8 @@ where
     plan_memory_with_liveness(schedule, config, &liveness)
 }
 
-/// Packing over a pre-computed liveness. Splitting liveness from packing
-/// lets the driver time validation/analysis separately from planning and
-/// lets callers reuse one analysis.
+/// Packs storage from precomputed liveness. Keeping analysis separate lets the
+/// driver time it independently from packing and lets callers reuse it.
 pub(crate) fn plan_memory_with_liveness<K, M, V>(
     schedule: &LoweredProgram<K, M, V>,
     config: &MemoryPlannerConfig<M>,

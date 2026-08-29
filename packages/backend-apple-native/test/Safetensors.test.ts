@@ -1,9 +1,10 @@
+import { Runtime } from "@effect-torch/core"
 import { describe, expect, it } from "@effect/vitest"
 import { Effect } from "effect"
 import { mkdtemp, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import path from "node:path"
-import { isAvailable, makeRuntime } from "../src/index.ts"
+import { isAvailable, layer as backendLayer } from "../src/index.ts"
 
 const withTempFile = <A, E, R>(prefix: string, use: (file: string) => Effect.Effect<A, E, R>) =>
   Effect.acquireUseRelease(
@@ -26,13 +27,13 @@ const writeF64Archive = (file: string): Promise<void> => {
   return writeFile(file, archive)
 }
 
-// Real artifact coverage runs only with Metal available and never substitutes
-// CPU behavior; concrete execution and loaded handles are explicitly released.
-suite("Apple Metal tensor handles and direct safetensors", () => {
-  it.effect("round trips direct Metal tensors and metadata", () =>
+// These file tests run only when Metal is available and never substitute CPU
+// behavior. They release concrete execution results and loaded handles.
+suite("Metal tensor handles and safetensors file I/O", () => {
+  it.effect("writes and reloads Metal tensors and metadata", () =>
     withTempFile("effect-torch-metal-safetensors-", (file) =>
       Effect.gen(function*() {
-        const runtime = makeRuntime()
+        const runtime = yield* Runtime.Runtime
         const tensor = yield* runtime.node({
           op: "fromBytes",
           inputs: [],
@@ -59,14 +60,14 @@ suite("Apple Metal tensor handles and direct safetensors", () => {
         expect(loaded).toMatchObject({ _tag: "Tensor", shape: [2], dtype: "u8", device: "metal" })
         expect([...new Uint8Array(yield* runtime.readback(loaded))]).toEqual([7, 8])
         yield* runtime.release(loaded)
-      })))
+      }).pipe(Effect.provide(backendLayer))))
 
-  it.effect("rejects f64 direct loading instead of executing on CPU", () =>
+  it.effect("rejects f64 archives instead of falling back to CPU", () =>
     withTempFile("effect-torch-metal-safetensors-f64-", (file) =>
       Effect.gen(function*() {
-        const runtime = makeRuntime()
+        const runtime = yield* Runtime.Runtime
         yield* Effect.tryPromise(() => writeF64Archive(file))
         const error = yield* Effect.flip(runtime.extensions.pathSafetensors.load(file))
         expect(error.reason).toBe("unsupported-placement")
-      })))
+      }).pipe(Effect.provide(backendLayer))))
 })

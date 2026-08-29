@@ -1,22 +1,22 @@
 //! Convolution kernels: `conv1d`/`conv2d`, their transposed forms, and the
 //! weight-gradient backward operators.
 //!
-//! Layouts are NCHW/NCW (`[batch, channels_in, spatial...]`) with
-//! `[channels_out, channels_in / groups, kernel...]` weights. Grouped
-//! convolutions are supported; bias and input-gradient backward ops are
-//! handled by composed graph nodes elsewhere.
+//! Layouts are NCHW or NCW, `[batch, channels_in, spatial...]`, with
+//! `[channels_out, channels_in / groups, kernel...]` weights. The kernels
+//! support grouped convolutions. Composed graph nodes handle bias and
+//! input-gradient backward operations elsewhere.
 //!
-//! All kernels use [`ConvAlgorithm::DirectF64Accumulator`]: a direct
-//! (non-im2col) loop nest that widens every input and weight element to
-//! `f64`, accumulates the full receptive-field dot product in `f64`, and
-//! narrows once when writing the output. Transposed convolutions scatter
-//! each input element's contribution into the output instead of gathering.
+//! All kernels use [`ConvAlgorithm::DirectF64Accumulator`], a direct loop
+//! nest without im2col. It widens each input and weight element to `f64`,
+//! accumulates the receptive-field dot product in `f64`, and narrows once
+//! when writing the output. Transposed convolutions scatter each input
+//! element's contribution into the output instead of gathering.
 //! Forward kernels read through the input layouts, so strided inputs work
 //! without materialization.
 //!
-//! Every operation follows the crate contract: `*_requirements` planners
-//! freeze output shape and algorithm, `*_into` kernels are allocation-free,
-//! and plain wrappers compose the two.
+//! Each `*_requirements` planner records the output shape and algorithm. The
+//! matching `*_into` kernel does not allocate. The allocating wrapper composes
+//! the planner and kernel.
 
 use super::tensor::{CpuBuffer, CpuDestination, CpuTensorRequirement, Elem, Tensor};
 
@@ -405,8 +405,9 @@ fn requirement(shape: &[usize], tensor: &Tensor) -> Result<ConvRequirements, Str
     })
 }
 
-/// Plans a `conv1d`: validates NCW input and `[out, in/groups, kernel]`
-/// weight shapes and geometry, returning the exact output requirement.
+/// Plans a `conv1d`. Validates the NCW input, the
+/// `[out, in/groups, kernel]` weight shape, and the geometry. Returns the
+/// exact output requirement.
 #[allow(clippy::too_many_arguments)]
 pub fn conv1d_requirements(
     x: &Tensor,
@@ -444,8 +445,9 @@ pub fn conv1d_scratch_requirements(
     Ok(conv1d_requirements(x, w, stride, padding, dilation, groups)?.scratch)
 }
 
-/// Plans a `conv2d`: validates NCHW input and `[out, in/groups, kh, kw]`
-/// weight shapes and geometry, returning the exact output requirement.
+/// Plans a `conv2d`. Validates the NCHW input, the
+/// `[out, in/groups, kh, kw]` weight shape, and the geometry. Returns the
+/// exact output requirement.
 #[allow(clippy::too_many_arguments)]
 pub fn conv2d_requirements(
     x: &Tensor,
@@ -579,7 +581,7 @@ pub fn conv_transpose2d_scratch_requirements(
     )
 }
 
-/// Plans the conv1d weight gradient: validates input/gradient geometry and
+/// Plans the conv1d weight gradient. Validates input and gradient geometry and
 /// returns the `[out_channels, in/groups, kernel]` requirement.
 #[allow(clippy::too_many_arguments)]
 pub fn conv1d_backward_w_requirements(
@@ -653,7 +655,7 @@ pub fn conv1d_backward_w_scratch_requirements(
     .scratch)
 }
 
-/// Plans the conv2d weight gradient: validates input/gradient geometry and
+/// Plans the conv2d weight gradient. Validates input and gradient geometry and
 /// returns the `[out_channels, in/groups, kh, kw]` requirement.
 #[allow(clippy::too_many_arguments)]
 pub fn conv2d_backward_w_requirements(
@@ -1140,7 +1142,7 @@ pub fn conv1d_into(
     }
 }
 
-/// Allocating `conv1d` wrapper; panics on invalid geometry.
+/// Allocating `conv1d` wrapper. Panics on invalid geometry.
 #[allow(clippy::too_many_arguments)]
 pub fn conv1d(
     x: &Tensor,
@@ -1198,7 +1200,7 @@ pub fn conv2d_into(
     }
 }
 
-/// Allocating `conv2d` wrapper; panics on invalid geometry.
+/// Allocating `conv2d` wrapper. Panics on invalid geometry.
 #[allow(clippy::too_many_arguments)]
 pub fn conv2d(
     x: &Tensor,
@@ -1215,8 +1217,8 @@ pub fn conv2d(
     })
 }
 
-/// Executes a transposed `conv1d` into `destination` without allocating;
-/// each input element scatters its kernel contribution into the output.
+/// Executes a transposed `conv1d` into `destination` without allocating.
+/// Each input element scatters its kernel contribution into the output.
 #[allow(clippy::too_many_arguments)]
 pub fn conv_transpose1d_into(
     x: &Tensor,
@@ -1257,7 +1259,7 @@ pub fn conv_transpose1d_into(
     }
 }
 
-/// Allocating transposed `conv1d` wrapper; panics on invalid geometry.
+/// Allocating transposed `conv1d` wrapper. Panics on invalid geometry.
 #[allow(clippy::too_many_arguments)]
 pub fn conv_transpose1d(
     x: &Tensor,
@@ -1285,8 +1287,8 @@ pub fn conv_transpose1d(
     })
 }
 
-/// Executes a transposed `conv2d` into `destination` without allocating;
-/// each input element scatters its kernel contribution into the output.
+/// Executes a transposed `conv2d` into `destination` without allocating.
+/// Each input element scatters its kernel contribution into the output.
 #[allow(clippy::too_many_arguments)]
 pub fn conv_transpose2d_into(
     x: &Tensor,
@@ -1327,7 +1329,7 @@ pub fn conv_transpose2d_into(
     }
 }
 
-/// Allocating transposed `conv2d` wrapper; panics on invalid geometry.
+/// Allocating transposed `conv2d` wrapper. Panics on invalid geometry.
 #[allow(clippy::too_many_arguments)]
 pub fn conv_transpose2d(
     x: &Tensor,
@@ -1407,7 +1409,7 @@ pub fn conv1d_backward_w_into(
     }
 }
 
-/// Allocating conv1d weight-gradient wrapper; panics on invalid geometry.
+/// Allocating conv1d weight-gradient wrapper. Panics on invalid geometry.
 #[allow(clippy::too_many_arguments)]
 pub fn conv1d_backward_w(
     x: &Tensor,
@@ -1497,7 +1499,7 @@ pub fn conv2d_backward_w_into(
     }
 }
 
-/// Allocating conv2d weight-gradient wrapper; panics on invalid geometry.
+/// Allocating conv2d weight-gradient wrapper. Panics on invalid geometry.
 #[allow(clippy::too_many_arguments)]
 pub fn conv2d_backward_w(
     x: &Tensor,

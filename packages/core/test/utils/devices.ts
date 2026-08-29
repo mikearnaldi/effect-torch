@@ -2,7 +2,7 @@ import * as BackendApple from "@effect-torch/backend-apple-native"
 import * as BackendCpu from "@effect-torch/backend-cpu"
 import { layer } from "@effect/vitest"
 import * as assert from "@effect/vitest/utils"
-import { Effect } from "effect"
+import { Effect, Predicate } from "effect"
 import type { Runtime } from "../../src/index.ts"
 
 /** Backends included in the shared numerical test matrix. */
@@ -39,13 +39,13 @@ const closeEnough = (a: number, b: number): boolean =>
  * Compares structures exactly except for numeric arrays, which use the shared
  * f32 tolerance.
  */
-export const deep = (actual: unknown, expected: unknown): void => {
-  if (typeof actual === "number" && typeof expected === "number") {
+export const deep = <A>(actual: A, expected: A): void => {
+  if (Predicate.isNumber(actual) && Predicate.isNumber(expected)) {
     assert.assertTrue(closeEnough(actual, expected), `${actual} != ${expected}`)
     return
   }
   if (Array.isArray(actual) && Array.isArray(expected)) {
-    const numeric = (v: ReadonlyArray<unknown>): v is ReadonlyArray<number> => v.every((x) => typeof x === "number")
+    const numeric = (v: ReadonlyArray<unknown>): v is ReadonlyArray<number> => v.every(Predicate.isNumber)
     if (numeric(actual) && numeric(expected)) {
       assert.deepStrictEqual(actual.length, expected.length)
       actual.forEach((v, i) => {
@@ -60,8 +60,8 @@ export const deep = (actual: unknown, expected: unknown): void => {
 type SuiteFn = Parameters<ReturnType<typeof layer<Runtime.Runtime, never>>>[1]
 
 /**
- * Registers the same suite with its real backend layer: always CPU, plus Metal
- * when available. This matrix never emulates unsupported device behavior.
+ * Registers the same suite with its real backend layer. CPU always runs, and
+ * Metal runs when available. This matrix never emulates unsupported devices.
  */
 export const onDevices = (name: string, make: (device: TestDevice) => SuiteFn): void => {
   layer(BackendCpu.layer)(`${name} (cpu)`, make("cpu"))

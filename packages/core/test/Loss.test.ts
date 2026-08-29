@@ -116,7 +116,7 @@ onDevices("Loss", () => (it) => {
 
     it.effect("chunked head crossEntropy matches the unchunked head", () =>
       Effect.gen(function*() {
-        // Force the RFC 0016 phase-2 rewrite on tiny shapes: one row per
+        // Force the RFC 0016 phase-2 rewrite on tiny shapes with one row per
         // chunk. The fused linear + mean-CE node recomputes logits chunkwise in
         // backward; loss and gradients must match the unfused graph.
         // The switches are process-global compiler inputs, so bracket each run
@@ -152,7 +152,7 @@ onDevices("Loss", () => (it) => {
               const loss = yield* Tensor.crossEntropy(logits, { target: targets, ignoreIndex: -100 })
               const [value] = yield* values(loss)
               const grads = yield* Gradient.grad(loss, [x, w, b])
-              return [value, ...(yield* Effect.all(grads.map((g) => values(g))))] as Array<number | Array<number>>
+              return { value, grads: yield* Effect.all(grads.map((g) => values(g))) }
             })
           )
         for (
@@ -163,10 +163,10 @@ onDevices("Loss", () => (it) => {
         ) {
           const plain = yield* run("999999999999", "67108864", targets)
           const chunked = yield* run("0", "1", targets)
-          expect(Math.abs((plain[0] as number) - (chunked[0] as number))).toBeLessThan(1e-5)
+          expect(Math.abs(plain.value - chunked.value)).toBeLessThan(1e-5)
           for (let g = 0; g < 3; g++) {
-            const a = plain[g + 1] as Array<number>
-            const c = chunked[g + 1] as Array<number>
+            const a = plain.grads[g]!
+            const c = chunked.grads[g]!
             expect(a.length).toBe(c.length)
             for (let i = 0; i < a.length; i++) {
               expect(Math.abs(a[i] - c[i])).toBeLessThan(1e-4)

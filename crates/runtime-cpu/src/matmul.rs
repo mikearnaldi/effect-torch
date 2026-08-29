@@ -1,16 +1,15 @@
 //! Matrix multiplication with NumPy-style batch broadcasting.
 //!
-//! Shapes of rank ≥ 2 are treated as `batch..., m, k` × `batch..., k, n`;
-//! batch dimensions broadcast against each other. Both operands may carry
-//! arbitrary strided layouts — the kernel indexes them through their strides
-//! rather than materializing contiguous copies.
+//! Shapes of rank ≥ 2 use `batch..., m, k` × `batch..., k, n`. Batch
+//! dimensions broadcast against each other. Both operands may have arbitrary
+//! strided layouts. The kernel indexes through their strides instead of
+//! materializing contiguous copies.
 //!
-//! The only algorithm currently selected is [`MatmulAlgorithm::Naive`]: a
-//! row-major `m × k × n` loop that accumulates directly into the destination.
-//! Floating-point dtypes accumulate with fused multiply-add; integer dtypes
+//! [`MatmulAlgorithm::Naive`] is the only current algorithm. Its row-major
+//! `m × k × n` loop accumulates directly into the destination.
+//! Floating-point dtypes accumulate with fused multiply-add. Integer dtypes
 //! (`u8`, `u32`, `i64`) use wrapping-free plain `c + a * b` semantics in
-//! their own type. `f16`/`bf16` matmul is deliberately rejected at planning
-//! time.
+//! their own type. Planning rejects `f16` and `bf16` matmul.
 
 use super::tensor::{CpuBuffer, CpuDestination, CpuTensorRequirement, Elem, Tensor};
 use effect_torch_runtime::{DType, Layout};
@@ -231,10 +230,10 @@ where
 }
 
 impl Tensor {
-    /// Plans a matmul: validates dtypes/ranks/broadcasting, freezes the
+    /// Plans a matmul. Validates dtypes, ranks, and broadcasting, records the
     /// operand layouts and algorithm, and computes the exact output
-    /// requirement. The returned plan is immutable; [`Tensor::matmul_into`]
-    /// rejects any operand or destination that deviates from it.
+    /// requirement. The plan is immutable. [`Tensor::matmul_into`] rejects
+    /// any operand or destination that differs from it.
     pub fn matmul_requirements(&self, rhs: &Tensor) -> Result<MatmulRequirements, &'static str> {
         if self.dtype() != rhs.dtype() {
             return Err("mixed dtypes");
@@ -275,7 +274,7 @@ impl Tensor {
     }
 
     /// Executes a previously planned matmul into `destination` without
-    /// allocating. Fails if inputs, destination, scratch, or the frozen plan
+    /// allocating. Fails if inputs, destination, scratch, or the recorded plan
     /// disagree.
     pub fn matmul_into(
         &self,
@@ -335,8 +334,8 @@ impl Tensor {
         }
     }
 
-    /// Allocating wrapper: plan, allocate, execute. Panics on invalid
-    /// operands.
+    /// Allocating wrapper that plans, allocates, and executes. Panics on
+    /// invalid operands.
     pub fn matmul(&self, rhs: &Tensor) -> Tensor {
         self.try_matmul(rhs)
             .unwrap_or_else(|message| panic!("{message}"))

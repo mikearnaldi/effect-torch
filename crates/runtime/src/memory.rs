@@ -1,51 +1,44 @@
 //! Compiler-produced memory plans and their validation.
 //!
-//! A [`MemoryPlan`] is the static result of the compiler's allocation pass:
-//! it declares the flat byte **segments** a backend must reserve, places
-//! every intermediate **value** at a [`Location`] (inside a segment, in an
-//! external/persistent slot, inline as a scalar, or aliasing another
-//! value), fixes the **output slots**, and records **reuse edges** — pairs
-//! of values whose storage may be recycled once the producer's last
-//! consumer has executed. Backends interpret the plan; they never compute
-//! their own addresses.
+//! A [`MemoryPlan`] is the static output of the compiler's allocation pass.
+//! It declares the flat byte segments a backend must reserve. Each
+//! intermediate value has a [`Location`] in a segment, an external or
+//! persistent slot, an inline scalar, or another value's storage. The plan
+//! also fixes output slots. Reuse edges allow storage recycling after a
+//! producer's last consumer executes. Backends follow these addresses rather
+//! than computing their own.
 //!
-//! # Ownership semantics
+//! [`SegmentOwnership`] records who controls a segment's lifetime.
+//! `Workspace` is transient scratch pooled per invocation.
+//! `ProvisionalOutput` becomes visible to the caller on success.
+//! `InvocationStaging` and `StateTransaction` hold per-call staging and
+//! transactional state updates. [`StorageClass`] categorizes allocations in
+//! [`MemoryReport`].
 //!
-//! Each segment carries a [`SegmentOwnership`] tag describing who controls
-//! its lifetime: `Workspace` (transient scratch, pooled per invocation),
-//! `ProvisionalOutput` (becomes caller-visible on success), and
-//! `InvocationStaging` / `StateTransaction` (per-call staging and
-//! transactional state updates). The [`StorageClass`] of each allocation
-//! feeds the accounting in [`MemoryReport`].
+//! [`MemoryPlan::validate`] checks the plan before a backend sees it.
+//! Segment alignments must be non-zero powers of two, and their total byte
+//! count must fit in `usize`. Each `Location::Segment` must refer to an
+//! existing segment and fit within its bounds using checked end arithmetic.
+//! Each output slot must refer to an existing location. Validation returns a
+//! [`MemoryPlanError`] on failure.
 //!
-//! # Validation rules
-//!
-//! [`MemoryPlan::validate`] enforces, before any backend sees the plan:
-//! segment alignments are non-zero powers of two; the summed segment byte
-//! count does not overflow; every `Location::Segment` references an
-//! existing segment and lies within it (with overflow-checked end
-//! arithmetic); and every output slot references an existing location.
-//! Failures are reported as structured [`MemoryPlanError`]s.
-//!
-//! The plan types are generic over the memory-space type `M`
-//! ([`NativeMemorySpace`] by default) so a backend can substitute its own
-//! space enumeration without changing the plan's shape.
+//! Plan types use [`NativeMemorySpace`] by default. A backend can supply its
+//! own memory-space type as `M` without changing the rest of the plan.
 
 use crate::{InstructionId, LocationId, OutputId, SegmentId, ValueId};
 use std::error::Error;
 use std::fmt;
 
-/// Lifecycle category of an allocation, used for accounting in
-/// [`MemoryReport`].
+/// Allocation lifecycle category used by [`MemoryReport`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum StorageClass {
-    /// Caller-provided input storage (not runtime-owned).
+    /// Caller-provided input storage that the runtime does not own.
     ExternalInput,
     /// Constants retained for the lifetime of the executable.
     PersistentConstant,
     /// Mutable state retained across invocations.
     PersistentState,
-    /// Storage that escapes to the caller as an output.
+    /// Storage returned to the caller as an output.
     EscapingOutput,
     /// Transient scratch reused across invocations.
     Workspace,
@@ -53,24 +46,24 @@ pub enum StorageClass {
     DeviceStatus,
 }
 
-/// Memory space a segment lives in, for backends without a richer model.
+/// Segment memory space for backends without a richer model.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum NativeMemorySpace {
     Cpu,
-    /// Metal shared memory (CPU and GPU accessible).
+    /// Metal shared memory, accessible to the CPU and GPU.
     MetalShared,
-    /// Metal private (GPU-only) memory.
+    /// Metal private memory, accessible only to the GPU.
     MetalPrivate,
 }
 
 /// Who controls the lifetime of a segment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SegmentOwnership {
-    /// Transient scratch; may be pooled and recycled between invocations.
+    /// Transient scratch that may be pooled and recycled between invocations.
     Workspace,
-    /// Written during execution and handed to the caller as an output.
+    /// Execution writes this segment, then the runtime returns it as an output.
     ProvisionalOutput,
-    /// Per-invocation staging area (e.g. host/device marshalling).
+    /// Per-invocation staging area, such as host/device marshalling.
     InvocationStaging,
     /// Staging for state updates applied transactionally on success.
     StateTransaction,
@@ -79,7 +72,7 @@ pub enum SegmentOwnership {
 /// Declaration of one flat segment a backend must allocate.
 ///
 /// `alignment` must be a non-zero power of two (checked by
-/// [`MemoryPlan::validate`]); `bytes` is the segment's total capacity.
+/// [`MemoryPlan::validate`]). `bytes` is the segment's total capacity.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct SegmentDecl<M = NativeMemorySpace> {
     pub bytes: usize,
@@ -97,8 +90,8 @@ pub enum Location {
     Persistent { slot: u32 },
     /// A scalar value passed inline, with no backing storage.
     InlineScalar { slot: u32 },
-    /// A byte range inside a declared segment; bounds-checked against the
-    /// segment's capacity by [`MemoryPlan::validate`].
+    /// A byte range inside a declared segment. [`MemoryPlan::validate`]
+    /// checks the range against the segment's capacity.
     Segment {
         segment: SegmentId,
         offset: usize,
@@ -120,16 +113,16 @@ pub enum Location {
     Alias { root: ValueId, byte_offset: usize },
 }
 
-/// Binds an output value to the location its bytes are written to.
+/// Binds an output value to its destination location.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct OutputSlot {
     pub value: ValueId,
     pub location: LocationId,
 }
 
-/// Storage-reuse contract: after instruction `after`, the storage of
-/// `previous_value` may be recycled for `next_value`, which must be
-/// written before instruction `before`.
+/// Contract for reusing storage. After instruction `after`,
+/// `next_value` may reuse `previous_value`'s storage. The runtime must write
+/// `next_value` before instruction `before`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ReuseEdge {
     pub previous_value: ValueId,
@@ -146,7 +139,7 @@ pub struct AllocationReport {
     pub bytes: usize,
 }
 
-/// Per-executable memory accounting, broken down by storage role.
+/// Per-executable memory totals grouped by storage role.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Default)]
 pub struct MemoryReport {
     pub external_bytes: usize,
@@ -160,8 +153,8 @@ pub struct MemoryReport {
     pub largest_allocations: Box<[AllocationReport]>,
 }
 
-/// Per-invocation memory accounting: the static logical plan plus the
-/// workspace actually leased and any opaque headroom the backend reserved.
+/// Per-invocation memory totals for the static plan, leased workspace, and
+/// backend-reserved headroom.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Default)]
 pub struct InvocationMemoryReport {
     pub logical: MemoryReport,
@@ -170,8 +163,8 @@ pub struct InvocationMemoryReport {
 }
 
 impl MemoryReport {
-    /// Total bytes the runtime owns for the executable (everything except
-    /// external inputs), or `None` on overflow.
+    /// Returns the bytes the runtime owns for the executable, excluding
+    /// external inputs, or `None` on overflow.
     pub fn checked_runtime_owned_bytes(&self) -> Option<usize> {
         [
             self.persistent_bytes,
@@ -186,8 +179,8 @@ impl MemoryReport {
 }
 
 impl InvocationMemoryReport {
-    /// Total bytes attributable to one invocation (logical allocations
-    /// plus leased workspace and headroom), or `None` on overflow.
+    /// Returns the bytes used by one invocation, including logical
+    /// allocations, leased workspace, and headroom, or `None` on overflow.
     pub fn checked_accounted_bytes(&self) -> Option<usize> {
         [
             self.logical.external_bytes,
@@ -205,9 +198,9 @@ impl InvocationMemoryReport {
 
 /// Static memory plan of a compiled executable.
 ///
-/// `segments`, `locations` and `outputs` are dense tables indexed by
-/// [`SegmentId`], [`LocationId`] and [`OutputId`] respectively. The
-/// `Default` impl produces an empty but valid plan.
+/// `segments`, `locations`, and `outputs` are dense tables indexed by
+/// [`SegmentId`], [`LocationId`], and [`OutputId`]. The `Default`
+/// implementation returns an empty valid plan.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct MemoryPlan<M = NativeMemorySpace> {
     pub segments: Box<[SegmentDecl<M>]>,
@@ -230,20 +223,20 @@ impl<M> Default for MemoryPlan<M> {
 }
 
 impl<M> MemoryPlan<M> {
-    /// Summed capacity of all segments, or `None` on overflow.
+    /// Total capacity of all segments, or `None` on overflow.
     pub fn checked_segment_bytes(&self) -> Option<usize> {
         self.segments
             .iter()
             .try_fold(0usize, |total, segment| total.checked_add(segment.bytes))
     }
 
-    /// Validates segment alignments, aggregate segment-byte arithmetic,
-    /// segment-backed location bounds, and output location references.
+    /// Checks segment alignments, total segment bytes, segment-backed
+    /// location bounds, and output location references.
     ///
-    /// This is deliberately not a complete planner proof: alias source
-    /// ranges, state/output byte ranges, reuse-edge ordering, and consistency
-    /// of the diagnostic [`MemoryReport`] remain compiler/backend invariants.
-    /// The check is pure and never mutates the plan.
+    /// This does not prove alias source ranges, state or output byte ranges,
+    /// reuse-edge ordering, or consistency of the diagnostic [`MemoryReport`].
+    /// The compiler and backend must enforce those invariants. Validation does
+    /// not mutate the plan.
     pub fn validate(&self) -> Result<(), MemoryPlanError> {
         for (index, segment) in self.segments.iter().enumerate() {
             if segment.alignment == 0 || !segment.alignment.is_power_of_two() {

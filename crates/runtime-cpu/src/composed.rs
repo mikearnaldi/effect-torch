@@ -1,41 +1,42 @@
 //! Composite neural-network kernels built directly on planned destinations.
 //!
-//! Each family in this module follows the crate-wide contract: a
-//! `*_requirements` planner validates geometry and freezes an exact plan
-//! (output/scratch tensor requirements plus a topology enum recording the
-//! loop structure and pass counts), an allocation-free `*_into` kernel writes
-//! caller-provided destinations, and a panicking wrapper composes the two.
+//! Each family has a `*_requirements` planner that validates geometry and
+//! records output and scratch requirements. A topology enum records loop
+//! structure and pass counts. The matching `*_into` kernel writes to caller
+//! destinations without allocating, and a panicking wrapper composes the
+//! planner and kernel.
 //!
 //! Kernel families:
 //!
-//! - **Cross-entropy** ([`CrossEntropyForwardRequirements`],
-//!   [`CrossEntropyBackwardRequirements`]): row-wise softmax NLL with an
-//!   `ignore_index` mask. Forward and backward each produce the status/count
-//!   data required by their own execution path; backward recomputes target
+//! - Cross-entropy ([`CrossEntropyForwardRequirements`],
+//!   [`CrossEntropyBackwardRequirements`]) computes row-wise softmax NLL with an
+//!   `ignore_index` mask. Forward and backward each produce the status and count
+//!   data required by their own execution path. Backward recomputes target
 //!   validity rather than consuming forward status.
-//! - **Chunked head cross-entropy** ([`ChunkedHeadCeForwardRequirements`],
-//!   [`ChunkedHeadCeBackwardRequirements`]): fuses the lm-head projection
+//! - Chunked head cross-entropy ([`ChunkedHeadCeForwardRequirements`],
+//!   [`ChunkedHeadCeBackwardRequirements`]) fuses the lm-head projection
 //!   with cross-entropy, materializing logits only `chunk_size` rows at a
 //!   time so peak memory stays independent of vocabulary size.
-//! - **Scaled dot-product attention** ([`SdpaForwardRequirements`],
-//!   [`SdpaBackwardRequirements`]): online-softmax (flash-attention style)
-//!   forward that also emits per-row log-sum-exp, and a backward that
-//!   recomputes attention probabilities from the saved LSE. Optional causal
-//!   masking and sliding-window banding; accumulation happens in a work
-//!   dtype (`f32`, or `f64` for `f64` inputs).
-//! - **Normalization**: `layer_norm_forward`/`layer_norm_backward` and
+//! - Scaled dot-product attention ([`SdpaForwardRequirements`],
+//!   [`SdpaBackwardRequirements`]) uses an online-softmax forward pass that
+//!   also emits per-row log-sum-exp. The backward pass recomputes attention
+//!   probabilities from the saved LSE. It supports causal masking and
+//!   sliding-window banding. Accumulation uses `f32`, or `f64` for `f64`
+//!   inputs.
+//! - Normalization includes `layer_norm_forward`, `layer_norm_backward`, and
 //!   `rms_norm_forward_into`, row-wise over the trailing dimensions.
-//! - **Optimizers** ([`AdamWRequirements`], [`SgdRequirements`]): in-place
-//!   AdamW and (Nesterov) SGD-with-momentum steps over parameter, gradient,
+//! - Optimizers ([`AdamWRequirements`], [`SgdRequirements`]) implement in-place
+//!   AdamW and Nesterov SGD with momentum over parameter, gradient,
 //!   and moment buffers.
-//! - **KDA** ([`KdaForwardRequirements`], [`KdaBackwardRequirements`],
-//!   [`KdaDecodeRequirements`]): the gated delta-rule linear-attention
-//!   recurrence — chunked parallel scan for training, single-step decode
-//!   against a persistent state, and a chunk-recompute backward.
-//! - **Short causal conv** ([`ShortConvForwardRequirements`] and the
-//!   backward variants): depthwise causal 1-D convolution with an optional
-//!   carried state for streaming decode.
-//! - **Rotary embeddings** ([`RotaryRequirements`]): RoPE forward in
+//! - KDA ([`KdaForwardRequirements`], [`KdaBackwardRequirements`],
+//!   [`KdaDecodeRequirements`]) implements the gated delta-rule
+//!   linear-attention recurrence. It uses a chunked parallel scan for
+//!   training, single-step decode against persistent state, and a backward
+//!   pass that recomputes chunks.
+//! - Short causal convolution ([`ShortConvForwardRequirements`] and the
+//!   backward variants) implements depthwise causal 1-D convolution with an
+//!   optional carried state for streaming decode.
+//! - Rotary embeddings ([`RotaryRequirements`]) implements RoPE forward in
 //!   half-split or interleaved-pair layout, with cursor offsets for decode.
 
 use super::tensor::{source_index, CpuBuffer, CpuDestination, CpuTensorRequirement, Elem, Tensor};
@@ -54,9 +55,9 @@ pub enum CrossEntropyForwardTopology {
     },
 }
 
-/// Frozen plan of one cross-entropy forward invocation. `loss` is the scalar
-/// or per-row loss output; `status` records per-row kept/ignored flags and,
-/// for mean reduction, the kept count for forward status handling.
+/// Plan for one cross-entropy forward invocation. `loss` is the scalar or
+/// per-row output. `status` records which rows were kept or ignored and, for
+/// mean reduction, the kept count.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CrossEntropyForwardRequirements {
     pub loss: CpuTensorRequirement,
@@ -74,17 +75,17 @@ pub struct CrossEntropyForwardRequirements {
 /// Loop structure of the cross-entropy backward kernel.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CrossEntropyBackwardTopology {
-    /// Sum/none reduction: a single pass over rows.
+    /// Sum or none reduction uses one pass over rows.
     Rows { row_passes: usize },
-    /// Mean reduction: one pass counting kept rows, then the row pass.
+    /// Mean reduction counts kept rows, then runs the row pass.
     CountThenRows {
         count_passes: usize,
         row_passes: usize,
     },
 }
 
-/// Frozen plan of one cross-entropy backward invocation; `count_status`
-/// exists only for mean reduction.
+/// Plan for one cross-entropy backward invocation. `count_status` exists only
+/// for mean reduction.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CrossEntropyBackwardRequirements {
     pub grad: CpuTensorRequirement,
@@ -151,8 +152,8 @@ pub struct ChunkedHeadCeBackwardRequirements {
     pub target_dtype: DType,
 }
 
-/// Loop structure of the attention forward kernel: an online-softmax row
-/// sweep (score passes) interleaved with value accumulation passes.
+/// Loop structure of the attention forward kernel. Interleaves an
+/// online-softmax row sweep over scores with value accumulation passes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SdpaForwardTopology {
     OnlineRows {
@@ -175,9 +176,9 @@ pub struct SdpaForwardRequirements {
     pub work_dtype: DType,
 }
 
-/// Loop structure of the attention backward kernel: a row-dot pass computing
-/// `rowsum(dO ∘ O)`, then gradient passes that recompute probabilities from
-/// the saved log-sum-exp.
+/// Loop structure of the attention backward kernel. A row-dot pass computes
+/// `rowsum(dO ∘ O)`, then gradient passes recompute probabilities from the
+/// saved log-sum-exp.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SdpaBackwardTopology {
     RowDotThenRecompute {
@@ -202,7 +203,7 @@ pub struct SdpaBackwardRequirements {
     pub work_dtype: DType,
 }
 
-/// Loop structure of the normalization kernels: one or more sweeps over
+/// Loop structure of the normalization kernels. Runs one or more sweeps over
 /// independent rows of the trailing normalized dimensions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LayerNormTopology {
@@ -230,7 +231,7 @@ pub struct LayerNormBackwardRequirements {
     pub dtype: DType,
 }
 
-/// Loop structure of the optimizer kernels: a single elementwise sweep.
+/// Loop structure of the optimizer kernels. Runs one elementwise sweep.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OptimizerTopology {
     Elementwise { passes: usize },
@@ -310,8 +311,8 @@ pub struct KdaDecodeRequirements {
     pub work_dtype: DType,
 }
 
-/// Loop structure of the short causal convolution kernels: a direct sweep
-/// over (batch, step, channel).
+/// Loop structure of the short causal convolution kernels. Runs a direct sweep
+/// over batch, step, and channel.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ShortConvTopology {
     Direct { passes: usize },
@@ -363,8 +364,8 @@ pub struct ShortConvBackwardWRequirements {
     pub dtype: DType,
 }
 
-/// Loop structure of the rotary embedding kernel: one pass over
-/// (row, step, pair) tuples.
+/// Loop structure of the rotary embedding kernel. Runs one pass over row,
+/// step, and pair tuples.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RotaryTopology {
     Pairs { passes: usize },
@@ -438,9 +439,8 @@ fn cross_entropy_geometry(
     Ok((rows, classes))
 }
 
-/// Plans cross-entropy forward over `[rows, classes]` float logits with
-/// `i64`/`u32` targets, for the given reduction and `ignore_index` handled
-/// at execution time.
+/// Plans cross-entropy forward over `[rows, classes]` float logits with i64
+/// or u32 targets. Execution applies the given reduction and `ignore_index`.
 pub fn cross_entropy_forward_requirements(
     logits: &Tensor,
     target: &Tensor,
@@ -666,8 +666,8 @@ fn layer_norm_geometry(x: &Tensor, weight: &Tensor) -> Result<(usize, usize), St
     Ok((elements / normalized, normalized))
 }
 
-/// Plans layer-norm forward: normalizes the trailing `weight.shape()`
-/// dimensions of `x`.
+/// Plans layer-norm forward over the trailing `weight.shape()` dimensions of
+/// `x`.
 pub fn layer_norm_forward_requirements(
     x: &Tensor,
     weight: &Tensor,
@@ -714,8 +714,8 @@ pub fn rms_norm_forward_requirements(
     })
 }
 
-/// Plans layer-norm backward, producing `dx`, `dweight`, `dbias` and one
-/// normalized-values scratch tensor.
+/// Plans layer-norm backward. Produces `dx`, `dweight`, `dbias`, and one
+/// scratch tensor for normalized values.
 pub fn layer_norm_backward_requirements(
     x: &Tensor,
     weight: &Tensor,
@@ -772,8 +772,8 @@ fn full_like(t: &Tensor, value: f64) -> Tensor {
     Tensor::full(t.shape(), value, t.dtype())
 }
 
-/// Numerically stable row softmax over the last dimension (allocating test
-/// helper and wrapper for fused paths).
+/// Numerically stable row softmax over the last dimension. Used as an
+/// allocating test helper and a wrapper for fused paths.
 pub fn softmax_lastdim(x: &Tensor) -> Tensor {
     let r = rank(x);
     let m = x.max(&[r - 1]);
@@ -966,10 +966,10 @@ fn sdpa_forward_into_impl<T: Elem>(
     })?
 }
 
-/// Executes attention forward allocation-free: for each query row, streams
-/// key blocks maintaining a running max and rescaled accumulator (online
-/// softmax), applies optional causal/window masking, and writes the output
-/// row plus its log-sum-exp.
+/// Executes attention forward without allocating. For each query row, streams
+/// key blocks while maintaining the running maximum and rescaled accumulator
+/// for online softmax. Applies optional causal or window masking and writes the
+/// output row with its log-sum-exp.
 pub fn sdpa_forward_into(
     q: &Tensor,
     k: &Tensor,
@@ -1226,9 +1226,9 @@ fn sdpa_backward_into_impl<T: Elem>(
 }
 
 #[allow(clippy::too_many_arguments)]
-/// Executes attention backward allocation-free: recomputes probabilities
-/// from the saved LSE, subtracts `rowsum(dO ∘ O)` per row (the `d_vec`
-/// scratch), and accumulates `dq`, `dk`, `dv` in the work dtype.
+/// Executes attention backward without allocating. Recomputes probabilities
+/// from the saved LSE, subtracts `rowsum(dO ∘ O)` per row using `d_vec`
+/// scratch, and accumulates `dq`, `dk`, and `dv` in the work dtype.
 pub fn sdpa_backward_into(
     q: &Tensor,
     k: &Tensor,
@@ -1399,9 +1399,9 @@ fn layer_norm_forward_into_impl<T: Elem>(
     })
 }
 
-/// Executes layer-norm forward allocation-free: per row computes the mean,
-/// then variance in a second centered-square pass, and finally
-/// writes `(x - mean) / sqrt(var + eps) * weight + bias`.
+/// Executes layer-norm forward without allocating. For each row, computes the
+/// mean, computes variance in a second centered-square pass, then writes
+/// `(x - mean) / sqrt(var + eps) * weight + bias`.
 pub fn layer_norm_forward_into(
     x: &Tensor,
     weight: &Tensor,
@@ -1486,8 +1486,8 @@ fn rms_norm_forward_into_impl<T: Elem>(
     })
 }
 
-/// Executes RMS-norm forward allocation-free: scales each row by the inverse
-/// root-mean-square (plus `eps`) and the weight vector.
+/// Executes RMS-norm forward without allocating. Scales each row by its
+/// inverse root-mean-square, including `eps`, and the weight vector.
 pub fn rms_norm_forward_into(
     x: &Tensor,
     weight: Option<&Tensor>,
@@ -1611,8 +1611,8 @@ fn layer_norm_backward_into_impl<T: Elem>(
 }
 
 #[allow(clippy::too_many_arguments)]
-/// Executes layer-norm backward allocation-free, writing `dx`, `dweight`,
-/// and `dbias` using the normalized-values scratch to avoid recomputation.
+/// Executes layer-norm backward without allocating. Writes `dx`, `dweight`,
+/// and `dbias` using normalized-values scratch to avoid recomputation.
 pub fn layer_norm_backward_into(
     x: &Tensor,
     weight: &Tensor,
@@ -1878,9 +1878,9 @@ fn cross_entropy_forward_into_impl<T: Elem>(
 }
 
 #[allow(clippy::too_many_arguments)]
-/// Executes cross-entropy forward allocation-free: per row computes the
-/// max-shifted log-sum-exp, the NLL of the target class (zero for ignored
-/// rows), and the status flags; applies the reduction.
+/// Executes cross-entropy forward without allocating. For each row, computes
+/// max-shifted log-sum-exp, the target class NLL, and status flags. Ignored rows
+/// have zero NLL. Applies the reduction afterward.
 pub fn cross_entropy_forward_into(
     logits: &Tensor,
     target: &Tensor,
@@ -2020,9 +2020,9 @@ fn cross_entropy_backward_into_impl<T: Elem>(
     })
 }
 
-/// Executes cross-entropy backward allocation-free: per row writes
-/// `softmax(logits) - one_hot(target)` scaled by the reduction factor,
-/// zeroing ignored rows.
+/// Executes cross-entropy backward without allocating. For each row, writes
+/// `softmax(logits) - one_hot(target)` scaled by the reduction factor. Writes
+/// zero for ignored rows.
 pub fn cross_entropy_backward_into(
     logits: &Tensor,
     target: &Tensor,
@@ -2098,7 +2098,7 @@ pub fn cross_entropy_forward(
     }
     ce_check_labels(target, &ignored, classes)?;
     let lse = logsumexp_lastdim(logits);
-    // ignored positions may hold out-of-range values; gather at 0 and mask
+    // Ignored positions may hold out-of-range values. Gather at 0 and mask.
     let zero_ids = Tensor::zeros(target.shape(), DType::I64);
     let safe_target = zero_ids.where_(&ignored, &target_to_ids(target));
     let picked = logits.gather(r - 1, &unsqueeze_last(&safe_target));
@@ -2134,7 +2134,7 @@ pub fn cross_entropy_backward(
     let safe_target = zero_ids.where_(&ignored, &target_to_ids(target));
     let ids = unsqueeze_last(&safe_target);
     let neg_ones = Tensor::full(ids.shape(), -1.0, logits.dtype());
-    // p[target] -= 1 at every position
+    // Subtract 1 from p[target] at every position.
     let p = p.scatter_add(r - 1, &ids, &neg_ones);
     let keep = ignored.eq(&Tensor::zeros(ignored.shape(), DType::U8));
     let keep = unsqueeze_last(&keep);
@@ -2149,8 +2149,8 @@ pub fn cross_entropy_backward(
 }
 
 #[allow(clippy::too_many_arguments)]
-/// Allocating AdamW step: updates the parameter in place (weight-decayed,
-/// bias-corrected adaptive step) and returns the new parameter and moments.
+/// Allocating AdamW step. Applies a weight-decayed, bias-corrected adaptive
+/// update and returns the new parameter and moments.
 pub fn adamw_step(
     p: &Tensor,
     g: &Tensor,
@@ -2300,8 +2300,8 @@ fn adamw_step_into_impl<T: Elem>(
 }
 
 #[allow(clippy::too_many_arguments)]
-/// Executes one AdamW step allocation-free, writing updated parameter,
-/// first moment, and second moment destinations.
+/// Executes one AdamW step without allocating. Writes updated parameter, first
+/// moment, and second moment destinations.
 pub fn adamw_step_into(
     param: &Tensor,
     gradient: &Tensor,
@@ -2404,8 +2404,8 @@ pub fn adamw_step_into(
 }
 
 #[allow(clippy::too_many_arguments)]
-/// Allocating SGD step (momentum, optional dampening/Nesterov and weight
-/// decay), returning the new parameter and velocity.
+/// Allocating SGD step with momentum, optional dampening or Nesterov, and
+/// weight decay. Returns the new parameter and velocity.
 pub fn sgd_step(
     p: &Tensor,
     g: &Tensor,
@@ -2423,8 +2423,8 @@ pub fn sgd_step(
     } else {
         g.add(&p.mul(&fl(p, weight_decay)))
     };
-    // next_v = first ? g : momentum * v + (1 - dampening) * g, as
-    // arithmetic selection (velocity is zeros on the first step).
+    // Select next_v arithmetically. On the first step, velocity is zero.
+    // next_v = first ? g : momentum * v + (1 - dampening) * g.
     let continued = v
         .mul(&fl(v, momentum))
         .add(&g.mul(&fl(&g, 1.0 - dampening)));
@@ -2509,7 +2509,7 @@ fn sgd_step_into_impl<T: Elem>(
 }
 
 #[allow(clippy::too_many_arguments)]
-/// Executes one SGD step allocation-free, writing updated parameter and
+/// Executes one SGD step without allocating. Writes updated parameter and
 /// velocity destinations.
 pub fn sgd_step_into(
     param: &Tensor,
@@ -2675,7 +2675,7 @@ pub fn rotary_requirements(x: &Tensor) -> Result<RotaryRequirements, String> {
     })
 }
 
-/// Plans rotary forward; identical to [`rotary_requirements`].
+/// Plans rotary forward. Identical to [`rotary_requirements`].
 pub fn rotary_forward_requirements(x: &Tensor) -> Result<RotaryRequirements, String> {
     rotary_requirements(x)
 }
@@ -2728,10 +2728,10 @@ fn rotary_forward_into_impl<T: Elem>(
     })
 }
 
-/// Executes rotary forward allocation-free: rotates each `(pair, pair +
-/// half)` (half-split) or `(2i, 2i + 1)` (interleaved) coordinate pair by the
-/// angle `theta^(-2i/d) * (position + cursor_offset)` using the precomputed
-/// cos/sin tables.
+/// Executes rotary forward without allocating. Rotates each
+/// `(pair, pair + half)` half-split pair or `(2i, 2i + 1)` interleaved pair
+/// by `theta^(-2i/d) * (position + cursor_offset)` using precomputed cosine
+/// and sine tables.
 pub fn rotary_forward_into(
     x: &Tensor,
     offsets: &[usize],
@@ -2774,7 +2774,7 @@ pub fn rotary_forward_into(
     }
 }
 
-// --- Chunked head cross-entropy (RFC 0016 phase 2, semantic form) ---
+// Chunked head cross-entropy from RFC 0016 phase 2.
 
 fn head_ce_chunk_len(rows: usize, vocab: usize, chunk_size: usize) -> usize {
     let elements = rows.saturating_mul(vocab);
@@ -2822,8 +2822,8 @@ fn chunked_head_geometry(
     ))
 }
 
-/// Plans the fused lm-head + cross-entropy forward with the given row chunk
-/// size; logits scratch is only `chunk_len × vocab`.
+/// Plans fused lm-head and cross-entropy forward with the given row chunk
+/// size. Logits scratch is only `chunk_len × vocab`.
 pub fn chunked_head_ce_forward_requirements(
     x: &Tensor,
     weight: &Tensor,
@@ -3040,7 +3040,7 @@ fn chunked_head_ce_forward_into_impl<T: Elem>(
 }
 
 #[allow(clippy::too_many_arguments)]
-/// Executes chunked head cross-entropy forward allocation-free, one row
+/// Executes chunked head cross-entropy forward without allocating, one row
 /// chunk at a time.
 pub fn chunked_head_ce_forward_into(
     x: &Tensor,
@@ -3304,7 +3304,7 @@ fn chunked_head_ce_backward_into_impl<T: Elem>(
 }
 
 #[allow(clippy::too_many_arguments)]
-/// Executes chunked head cross-entropy backward allocation-free.
+/// Executes chunked head cross-entropy backward without allocating.
 pub fn chunked_head_ce_backward_into(
     x: &Tensor,
     weight: &Tensor,
@@ -3372,9 +3372,8 @@ pub fn chunked_head_ce_backward_into(
     }
 }
 
-// Mean cross-entropy of Linear(x, weight, bias) against target,
-// evaluated one row-chunk at a time so the [rows, vocab] logits never
-// materialize whole.
+// Evaluate mean cross-entropy of Linear(x, weight, bias) against target one
+// row chunk at a time. The full [rows, vocab] logits never materialize.
 /// Allocating chunked head cross-entropy forward wrapper.
 pub fn chunked_head_ce_forward(
     x: &Tensor,
@@ -3390,8 +3389,8 @@ pub fn chunked_head_ce_forward(
     let rows: usize = dims[..r - 1].iter().product();
     let x2 = x.contiguous().view(Layout::contiguous(vec![rows, inner]));
     let t1 = target.contiguous().view(Layout::contiguous(vec![rows]));
-    // Match Mean semantics exactly: zero-active error before label
-    // checks, in the plain path's order.
+    // Match Mean semantics exactly. Report zero active targets before checking
+    // labels, in the same order as the plain path.
     let ignored = ce_ignored_mask(&t1, ignore_index);
     let count = ce_active_count(&ignored, rows);
     if count == 0.0 {
@@ -3418,9 +3417,9 @@ pub fn chunked_head_ce_forward(
     })
 }
 
-// Closed-form adjoint: recomputes each chunk's logits and grad-logits
-// in a transient workspace and accumulates (dx, dw, db); grad-logits
-// never outlive their chunk.
+// The closed-form adjoint recomputes each chunk's logits and grad-logits in
+// transient workspace and accumulates (dx, dw, db). Grad-logits do not outlive
+// their chunk.
 /// Allocating chunked head cross-entropy backward wrapper.
 pub fn chunked_head_ce_backward(
     x: &Tensor,
@@ -3470,7 +3469,7 @@ pub fn chunked_head_ce_backward(
     Ok((dx, dw, db))
 }
 
-// --- Kimi Delta Attention (RFC 0018) ---
+// Kimi Delta Attention from RFC 0018.
 
 fn kda_geometry(
     q: &Tensor,
@@ -3745,10 +3744,9 @@ fn kda_forward_into_impl<I: Elem, W: Elem>(
 }
 
 #[allow(clippy::too_many_arguments)]
-/// Executes the KDA chunked forward scan allocation-free: within each chunk,
-/// applies the per-step gated delta-rule update `S = decay * S + β k (v −
-/// kᵀS)` in the work dtype and emits per-step outputs; the chunk-final state
-/// seeds the next chunk.
+/// Executes the KDA chunked forward scan without allocating. Within each
+/// chunk, applies `S = decay * S + β k (v − kᵀS)` in the work dtype and emits
+/// each step's output. The final state of one chunk seeds the next.
 pub fn kda_forward_into<'a>(
     q: &Tensor,
     k: &Tensor,
@@ -3856,7 +3854,7 @@ pub fn kda_forward_into<'a>(
 }
 
 #[allow(clippy::too_many_arguments)]
-/// Executes one KDA forward chunk allocation-free.
+/// Executes one KDA forward chunk without allocating.
 pub fn kda_chunk_forward_into<'a>(
     q: &Tensor,
     k: &Tensor,
@@ -3961,8 +3959,8 @@ fn kda_decode_into_impl<I: Elem, W: Elem>(
 }
 
 #[allow(clippy::too_many_arguments)]
-/// Executes one KDA decode step allocation-free, reading the persistent
-/// state and writing the next state and output.
+/// Executes one KDA decode step without allocating. Reads the persistent state
+/// and writes the next state and output.
 pub fn kda_decode_into(
     q: &Tensor,
     k: &Tensor,
@@ -4025,7 +4023,7 @@ fn eye(n: usize, dtype: DType) -> Tensor {
     Tensor::from_vec(data, vec![n, n]).cast(dtype)
 }
 
-// tril mask (diagonal 0 includes the diagonal, -1 excludes it) as u8.
+// Build a u8 tril mask. Diagonal 0 includes the diagonal. -1 excludes it.
 fn tril_mask(n: usize, diagonal: i64) -> Tensor {
     let mut data = Vec::with_capacity(n * n);
     for i in 0..n as i64 {
@@ -4036,10 +4034,10 @@ fn tril_mask(n: usize, diagonal: i64) -> Tensor {
     Tensor::from_vec(data, vec![n, n])
 }
 
-// Unit lower-triangular inverse: given strictly lower-triangular a
-// [.., n, n], returns (I + a)^-1 via batched row-wise forward
-// substitution x_i = e_i - a_i[:, :i] @ x_{:i} (RFC 0018 numerics
-// contract: sequential substitution, never a series expansion).
+// Given strictly lower-triangular a [.., n, n], compute the unit
+// lower-triangular inverse (I + a)^-1 with batched row-wise forward
+// substitution: x_i = e_i - a_i[:, :i] @ x_{:i}. RFC 0018 requires
+// sequential substitution rather than a series expansion.
 fn unit_lower_inverse(a: &Tensor) -> Tensor {
     let dims = a.shape();
     let r = rank(a);
@@ -4059,19 +4057,19 @@ fn unit_lower_inverse(a: &Tensor) -> Tensor {
     x.view(Layout::contiguous(dims.to_vec()))
 }
 
-// row [1, n] -> [batch, 1, n] via broadcast add against zeros.
+// Broadcast row [1, n] to [batch, 1, n] by adding zeros.
 fn batch_row(row: &Tensor, batch: usize) -> Tensor {
     let n = row.shape()[row.shape().len() - 1];
     Tensor::zeros(&[batch, 1, n], row.dtype()).add(row)
 }
 
-// Chunked gated delta-rule linear attention, reference implementation
-// (RFC 0018; FLA `naive_chunk_kda` equivalent). q/k/log_decay
-// [.., H, T, Dk], v [.., H, T, Dv], beta [.., H, T, 1]; computes in f32
-// (f64 stays f64) from a zero initial state. Chunk 64, sub-chunk 16:
-// intra-chunk blocks use the pivot-factored decay
+// Reference implementation of chunked gated delta-rule linear attention from
+// RFC 0018, equivalent to FLA `naive_chunk_kda`. q/k/log_decay have shape
+// [.., H, T, Dk], v has [.., H, T, Dv], and beta has [.., H, T, 1]. It starts
+// from zero state and computes in f32, while f64 remains f64. Chunks have 64
+// steps and subchunks have 16. Intra-chunk blocks factor decay around a pivot:
 // exp(g_i - g_j) = exp(g_i - g_p) * exp(g_p - g_j) so no reciprocal
-// cumulative decay is ever formed.
+// cumulative decay forms.
 /// Allocating KDA forward-chunk wrapper.
 pub fn kda_chunk_forward(
     q: &Tensor,
@@ -4095,9 +4093,9 @@ pub fn kda_chunk_forward(
     kda_chunk_with_state(q, k, v, log_decay, beta, scale, &initial).0
 }
 
-// Stateful variant: starts from `initial_state` ([BH, Dk, Dv], work
-// dtype) and returns the output alongside the final state. The decode
-// path drives this per sequence slot.
+// The stateful variant starts from `initial_state` with shape [BH, Dk, Dv]
+// in the work dtype. It returns the output and final state. The decode path
+// runs it for each sequence slot.
 /// Allocating KDA forward wrapper that also returns the final state.
 pub fn kda_chunk_with_state(
     q: &Tensor,
@@ -4145,12 +4143,12 @@ pub fn kda_chunk_with_state(
         let kc = narrow(&k3, 1, t0, c);
         let vc = narrow(&v3, 1, t0, c);
         let bc = narrow(&b3, 1, t0, c);
-        // Inclusive chunk-local cumulative log decay, [BH, c, Dk].
+        // Inclusive chunk-local cumulative log decay with shape [BH, c, Dk].
         let gc = narrow(&ld3, 1, t0, c).cumsum(1);
 
-        // Intra-chunk attention matrices, assembled from SUB-sized
-        // blocks: Aqk (lower-triangular, scaled) and Akk (strictly
-        // lower, beta-weighted).
+        // Assemble intra-chunk attention matrices from SUB-sized blocks. Aqk
+        // is lower-triangular and scaled. Akk is strictly lower-triangular and
+        // beta-weighted.
         let blocks = c.div_ceil(SUB);
         let mut aqk_rows: Vec<Tensor> = Vec::new();
         let mut akk_rows: Vec<Tensor> = Vec::new();
@@ -4175,9 +4173,9 @@ pub fn kda_chunk_with_state(
                 let k_c = narrow(&kc, 1, cs, cc);
                 let g_c = narrow(&gc, 1, cs, cc);
                 if cb == rb {
-                    // Diagonal block: full per-channel decay matrix,
-                    // masked by select (exp overflow on the masked
-                    // triangle is discarded, never multiplied).
+                    // The diagonal block uses the full per-channel decay
+                    // matrix. select discards overflow from the masked triangle
+                    // before multiplication.
                     let d = unsqueeze(&g_r, 2).sub(&unsqueeze(&g_c, 1));
                     let e = d.exp();
                     let zeros = Tensor::zeros(e.shape(), work);
@@ -4196,8 +4194,8 @@ pub fn kda_chunk_with_state(
                     aqk_cols.push(aqk);
                     akk_cols.push(akk);
                 } else {
-                    // Off-diagonal block: decay factors at the row
-                    // block's pivot, both directions bounded by 1.
+                    // The off-diagonal block uses decay factors at the row
+                    // block's pivot, bounded by 1 in both directions.
                     let qd = q_r.mul(&g_r.sub(&g_p).exp());
                     let kd = k_c.mul(&g_p.sub(&g_c).exp());
                     let aqk = qd.matmul(&transpose_last2(&kd)).mul(&Tensor::full(
@@ -4217,7 +4215,7 @@ pub fn kda_chunk_with_state(
         let aqk = Tensor::cat(&aqk_rows.iter().collect::<Vec<_>>(), 1);
         let akk = Tensor::cat(&akk_rows.iter().collect::<Vec<_>>(), 1);
 
-        // UT transform: M = (I + Akk)^-1, then the WY representation.
+        // Apply the UT transform M = (I + Akk)^-1, then the WY representation.
         let m = unit_lower_inverse(&akk);
         let w_in = kc.mul(&bc).mul(&gc.exp());
         let w = m.matmul(&w_in);
@@ -4231,8 +4229,8 @@ pub fn kda_chunk_with_state(
         let o_intra = aqk.matmul(&v_new);
         outs.push(o_inter.add(&o_intra));
 
-        // State update: decay to the chunk end, then rank-c update with
-        // the decayed keys kg = k * exp(g_last - g).
+        // Decay state to the chunk end, then apply a rank-c update with
+        // kg = k * exp(g_last - g).
         let g_last = narrow(&gc, 1, c - 1, 1);
         let kg = kc.mul(&g_last.sub(&gc).exp());
         let decay = transpose_last2(&g_last.exp());
@@ -4408,7 +4406,7 @@ fn short_conv1d_forward_into_impl<T: Elem>(
     })
 }
 
-/// Executes the short causal conv forward allocation-free.
+/// Executes the short causal convolution forward without allocating.
 pub fn short_conv1d_forward_into(
     x: &Tensor,
     weight: &Tensor,
@@ -4488,8 +4486,8 @@ fn short_conv1d_with_state_into_impl<T: Elem>(
     Ok(())
 }
 
-/// Executes the short conv forward allocation-free against a carried state,
-/// writing both the output and the next state.
+/// Executes short convolution forward without allocating against a carried
+/// state. Writes both the output and next state.
 pub fn short_conv1d_with_state_into(
     x: &Tensor,
     weight: &Tensor,
@@ -4596,7 +4594,7 @@ fn short_conv1d_backward_into_impl<T: Elem>(
     Ok(())
 }
 
-/// Executes the combined short-conv backward allocation-free.
+/// Executes the combined short-convolution backward without allocating.
 pub fn short_conv1d_backward_into(
     x: &Tensor,
     weight: &Tensor,
@@ -4625,7 +4623,7 @@ pub fn short_conv1d_backward_into(
     }
 }
 
-/// Executes the short-conv input gradient allocation-free.
+/// Executes the short-convolution input gradient without allocating.
 pub fn short_conv1d_backward_x_into(
     x: &Tensor,
     weight: &Tensor,
@@ -4678,7 +4676,7 @@ pub fn short_conv1d_backward_x_into(
     }
 }
 
-/// Executes the short-conv weight gradient allocation-free.
+/// Executes the short-convolution weight gradient without allocating.
 pub fn short_conv1d_backward_w_into(
     x: &Tensor,
     weight: &Tensor,
@@ -4732,8 +4730,8 @@ pub fn short_conv1d_backward_w_into(
     }
 }
 
-// Causal depthwise short convolution over [.., T, C] with weight
-// [C, K] and zero history: y[t] = sum_j w[:, j] * x[t-K+1+j].
+// Causal depthwise short convolution over [.., T, C] with weight [C, K] and
+// zero history. y[t] = sum_j w[:, j] * x[t-K+1+j].
 /// Allocating short causal conv forward wrapper.
 pub fn short_conv1d_forward(x: &Tensor, weight: &Tensor) -> Tensor {
     let dims = x.shape().to_vec();
@@ -4752,11 +4750,11 @@ pub fn short_conv1d_forward(x: &Tensor, weight: &Tensor) -> Tensor {
     acc.contiguous().view(Layout::contiguous(dims))
 }
 
-// Stateful per-slot variant: x [T, C], state [K-1, C]; returns the
-// output and the new window. `advance` is the count of real tokens
-// (chunked prefill right-pads): outputs are computed over the full
-// padded window — causal, so real rows never see padding — but the
-// stored window shifts in only the first `advance` rows.
+// The stateful per-slot variant takes x [T, C] and state [K-1, C], then returns
+// the output and new window. `advance` counts real tokens because chunked
+// prefill pads on the right. Outputs cover the full padded window. Causality
+// prevents real rows from seeing padding, and the stored window shifts in only
+// the first `advance` rows.
 /// Allocating short conv wrapper that also returns the next decode state.
 pub fn short_conv1d_with_state(
     x: &Tensor,
@@ -4777,10 +4775,10 @@ pub fn short_conv1d_with_state(
     (acc, new_state)
 }
 
-// ShortConv1d adjoints (RFC 0018 phase 4). dx[s] = sum_j w[:, K-1-j] *
-// g[s+j] (full correlation over the right-zero-padded cotangent);
-// dw[:, j] = sum_t g[t] * x[t-K+1+j] (per-tap correlation over the
-// causal window). g and x are [.., T, C]; weight is [C, K].
+// ShortConv1d adjoints from RFC 0018 phase 4.
+// dx[s] = sum_j w[:, K-1-j] * g[s+j], a full correlation over the
+// right-zero-padded cotangent. dw[:, j] = sum_t g[t] * x[t-K+1+j], a per-tap
+// correlation over the causal window. g and x are [.., T, C]. weight is [C, K].
 /// Allocating short-conv input-gradient wrapper.
 pub fn short_conv1d_backward_x(x: &Tensor, weight: &Tensor, g: &Tensor) -> Tensor {
     let dims = x.shape().to_vec();
@@ -4810,11 +4808,11 @@ pub fn short_conv1d_backward_w(x: &Tensor, weight: &Tensor, g: &Tensor) -> Tenso
     let window = Tensor::cat(&[&Tensor::zeros(&[batch, kk - 1, c], x3.dtype()), &x3], 1);
     let mut cols: Vec<Tensor> = Vec::with_capacity(kk);
     for j in 0..kk {
-        // [batch, 1, C]: sum over T of g * window[j .. j+T]
+        // [batch, 1, C] is the sum over T of g * window[j .. j+T].
         let tap = g3.mul(&narrow(&window, 1, j, t)).sum(&[1]);
         cols.push(tap);
     }
-    // [batch, K, C] -> sum over batch -> [1, K, C] -> [1, C, K] -> [C, K]
+    // [batch, K, C] -> sum over batch -> [1, K, C] -> [1, C, K] -> [C, K].
     let stacked = Tensor::cat(&cols.iter().collect::<Vec<_>>(), 1);
     let summed = stacked.sum(&[0]);
     transpose_last2(&summed)
@@ -4822,7 +4820,7 @@ pub fn short_conv1d_backward_w(x: &Tensor, weight: &Tensor, g: &Tensor) -> Tenso
         .view(Layout::contiguous(vec![c, kk]))
 }
 
-// Closed-form KDA backward (RFC 0018 phase 4). With S̃_t = Diag(α_t)
+// Closed-form KDA backward from RFC 0018 phase 4. With S̃_t = Diag(α_t)
 // S_{t-1}, δ_t = v_t − S̃_tᵀ k_t, S_t = S̃_t + β_t k_t δ_tᵀ and o_t =
 // scale · S_tᵀ q_t, the adjoint state Λ_t = ∂L/∂S_t runs in reverse:
 //
@@ -4835,9 +4833,9 @@ pub fn short_conv1d_backward_w(x: &Tensor, weight: &Tensor, g: &Tensor) -> Tenso
 //   dg_t   = dα_t ⊙ α_t
 //   Λ_{t-1} = Diag(α_t) M_t
 //
-// Memory stays bounded: pass 1 retains only the 64-token chunk start
-// states; pass 2 walks chunks in reverse and recomputes the per-token
-// states within each chunk (transient, one chunk at a time).
+// Memory stays bounded. Pass 1 retains only the start state of each 64-token
+// chunk. Pass 2 walks chunks in reverse and recomputes transient per-token
+// state for one chunk at a time.
 #[allow(clippy::too_many_arguments)]
 fn kda_backward_into_impl<I: Elem, W: Elem>(
     q: &Tensor,
@@ -4890,7 +4888,7 @@ fn kda_backward_into_impl<I: Elem, W: Elem>(
                                             let deltas = lam + state_elements;
                                             work[lam..lam + state_elements].fill(W::default());
 
-                                            // Pass 1: retain only each chunk's start state.
+                                            // Pass 1 retains only each chunk's start state.
                                             for chunk in 0..chunks {
                                                 let start = starts + chunk * state_elements;
                                                 for index in 0..state_elements {
@@ -4963,7 +4961,7 @@ fn kda_backward_into_impl<I: Elem, W: Elem>(
                                                 }
                                             }
 
-                                            // Pass 2: reverse chunks, recomputing 64 states.
+                                            // Pass 2 reverses chunks and recomputes 64 states.
                                             work[lam..lam + state_elements].fill(W::default());
                                             for chunk in (0..chunks).rev() {
                                                 let t0 = chunk * 64;
@@ -5258,8 +5256,8 @@ fn kda_backward_into_impl<I: Elem, W: Elem>(
 }
 
 #[allow(clippy::too_many_arguments)]
-/// Executes the KDA backward pass allocation-free, recomputing chunk-local
-/// forward states and propagating gradients to `q`/`k`/`v`, the log-decay,
+/// Executes the KDA backward pass without allocating. Recomputes chunk-local
+/// forward states and propagates gradients to `q`, `k`, `v`, log-decay,
 /// and `beta`.
 pub fn kda_backward_into(
     q: &Tensor,
@@ -5433,7 +5431,7 @@ pub fn kda_chunk_backward(
     let tok = |x: &Tensor, t: usize| narrow(x, 1, t, 1); // [BH, 1, D]
     let col = |x: &Tensor, t: usize| transpose_last2(&narrow(x, 1, t, 1)); // [BH, D, 1]
 
-    // Pass 1: chunk start states via the per-token recurrence.
+    // Pass 1 computes chunk start states with the per-token recurrence.
     let mut starts: Vec<Tensor> = Vec::new();
     let mut state = Tensor::zeros(&[bh, dk, dv], work);
     let mut t0 = 0;
@@ -5450,7 +5448,7 @@ pub fn kda_chunk_backward(
         t0 += c;
     }
 
-    // Pass 2: reverse adjoint walk with per-chunk forward recompute.
+    // Pass 2 runs the reverse adjoint and recomputes each chunk's forward pass.
     let mut lam = Tensor::zeros(&[bh, dk, dv], work);
     let mut dq_rows: Vec<Tensor> = Vec::new();
     let mut dk_rows: Vec<Tensor> = Vec::new();
@@ -5460,7 +5458,7 @@ pub fn kda_chunk_backward(
     for ci in (0..starts.len()).rev() {
         let t0 = ci * CHUNK;
         let c = CHUNK.min(t_total - t0);
-        // Recompute this chunk's per-token states.
+        // Recompute this chunk's state for each token.
         let mut sdecs: Vec<Tensor> = Vec::with_capacity(c);
         let mut states_t: Vec<Tensor> = Vec::with_capacity(c);
         let mut deltas: Vec<Tensor> = Vec::with_capacity(c);

@@ -5,23 +5,21 @@
 //!
 //! # Dtype and layout rules
 //!
-//! - The fused emitter computes in f32 and stores f32/bf16, so elementwise
-//!   entry points accept f32/bf16 directly; anything else is promoted:
-//!   cast to f32, run the fused kernel, cast back (`*_promote` family).
-//!   Comparisons always produce u8 via an f32 intermediate.
-//! - Broadcasting follows NumPy rules; lane strides of 0 encode broadcast
-//!   dimensions directly in the emitted kernel.
-//! - Non-contiguous or offset inputs are materialized with
-//!   `kernels::strided_copy` on the allocating paths (`contig`); the
-//!   `*_into` forms take caller layouts as-is where the kernels support
-//!   them.
+//! - The fused emitter computes in f32 and stores f32/bf16. Elementwise entry
+//!   points accept those types directly. The `*_promote` family casts other
+//!   types to f32, runs the fused kernel, and casts back. Comparisons use an f32
+//!   intermediate and produce u8.
+//! - Broadcasting follows NumPy rules. A lane stride of 0 encodes a broadcast
+//!   dimension in the emitted kernel.
+//! - Allocating paths use `kernels::strided_copy` to materialize
+//!   non-contiguous or offset inputs. The `*_into` forms keep caller layouts
+//!   where the kernel supports them.
 //!
 //! # Scratch contract
 //!
-//! `*_scratch_requirements` report the exact intermediate tensors a
-//! promoted operation needs, in consumption order; `*_into` variants
-//! validate caller-provided scratch against them and allocate nothing.
-//! Allocating wrappers derive both and then delegate to the `*_into` form.
+//! `*_scratch_requirements` report intermediate tensors in consumption order.
+//! The `*_into` variants validate caller-owned scratch and allocate nothing.
+//! Allocating wrappers derive the requirements and delegate to `*_into`.
 
 use crate::fusion::{Expr, ReduceOp};
 use crate::runtime::dtype::DType;

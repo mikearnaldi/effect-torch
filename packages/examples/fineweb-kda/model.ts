@@ -2,21 +2,20 @@ import { Model } from "@effect-torch/core"
 import type { Tensor } from "@effect-torch/core"
 import { Effect } from "effect"
 
-// FineWeb KDA pilot: the FineWeb GPT layout with a Kimi Linear/K3-inspired
-// token-mixing pattern (arXiv:2510.26692, arXiv:2607.24653). Layers 1-3 and 5
-// use Kimi Delta Attention (Model.kimiDeltaAttention, RFC 0018); layers 4 and 6
-// use ordinary full causal attention. This is an overall 2:1 recurrent/full
-// split with the final layer forced to global attention, not K3's gated NoPE
-// MLA. KDA's decayed delta-rule transition supplies positional information for
-// recurrent layers, and this small stack uses neither a position table nor RoPE.
-// The cited NoPE result concerns the global attention layers rather than adding
-// RoPE to KDA itself.
+// FineWeb KDA pilot based on the FineWeb GPT layout and token mixing from Kimi
+// Linear and K3 (arXiv:2510.26692, arXiv:2607.24653). Layers 1-3 and 5 use Kimi
+// Delta Attention (Model.kimiDeltaAttention, RFC 0018). Layers 4 and 6 use full
+// causal attention. This gives a 2:1 recurrent-to-full-attention split. The
+// final layer uses global attention rather than K3's gated NoPE MLA. KDA's
+// decayed delta-rule transition carries position information in recurrent
+// layers, so this small stack has neither a position table nor RoPE. The cited
+// NoPE result applies to the global attention layers, not KDA itself.
 //
-// Generation runs through Model.inference, which rewrites the KDA layers
-// into stateful recurrent decode with fixed-size per-sequence state.
-// Training runs the closed-form KDA backward (RFC 0018 phase 4).
+// Model.inference rewrites KDA layers into stateful recurrent decoding with
+// fixed-size state for each sequence. Training uses the closed-form KDA backward
+// pass from RFC 0018 phase 4.
 //
-/** Shared tokenizer, parameter I/O, data-window, and evaluation helpers. */
+/** Re-exports tokenizer, parameter I/O, windowing, and evaluation helpers. */
 export { EOT, heldOutLoss, loadBin, loadParams, loadTokenizer, saveParams, windows } from "../fineweb/model.js"
 
 /** Default path for bare hybrid-KDA model parameters. */

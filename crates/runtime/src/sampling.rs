@@ -1,17 +1,18 @@
 //! Backend-neutral next-token sampling over one dense logits row.
 
-/// Maximum row width accepted by native sampling. This bounds filtered
-/// candidate storage and the non-interruptible portions of native selection.
+/// Maximum logits row width for native sampling. It limits candidate storage
+/// and the work native selection performs between cancellation checks.
 pub const MAX_SAMPLING_VOCABULARY: usize = 1_048_576;
 
-/// Validated controls for one stateless token draw.
+/// Controls for one stateless token draw.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct SamplingOptions {
-    /// Non-negative softmax temperature; zero selects greedy argmax.
+    /// Non-negative softmax temperature. Zero selects greedy argmax.
     pub temperature: f64,
-    /// Candidate count retained before top-p, or `None` to disable top-k.
+    /// Number of candidates kept before top-p, or `None` to disable top-k.
     pub top_k: Option<usize>,
-    /// Smallest descending probability prefix to retain, in `(0, 1]`.
+    /// Top-p threshold in `(0, 1]`. Sampling keeps the smallest descending
+    /// prefix whose cumulative probability reaches this threshold.
     pub top_p: f64,
     /// Stateless random stream key.
     pub seed: u64,
@@ -19,7 +20,7 @@ pub struct SamplingOptions {
     pub counter: u64,
 }
 
-/// Independent deterministic draw domains used by speculative generation.
+/// Independent deterministic draw domains for speculative generation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u64)]
 pub enum SamplingPurpose {
@@ -29,9 +30,8 @@ pub enum SamplingPurpose {
     Target = 0x082e_fa98_ec4e_6c89,
 }
 
-/// Complete logical coordinate for one stateless sampling draw. Every field is
-/// retained at its full width; physical lanes, packed rows, and request order
-/// are deliberately not part of the coordinate.
+/// Logical coordinate for one stateless sampling draw. It stores every field
+/// at full width and excludes physical lanes, packed rows, and request order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SamplingCoordinate {
     pub seed: u64,
@@ -41,7 +41,7 @@ pub struct SamplingCoordinate {
     pub subcounter: u64,
 }
 
-/// Constructs a lossless logical RNG coordinate.
+/// Returns a lossless logical RNG coordinate.
 pub const fn sampling_coordinate(
     seed: u64,
     sequence_id: u64,
@@ -59,8 +59,7 @@ pub const fn sampling_coordinate(
 }
 
 /// Derives a draw counter from an absolute output position and purpose. The
-/// derivation intentionally contains no physical lane, request index, or packed
-/// row coordinate.
+/// counter does not depend on a physical lane, request index, or packed row.
 pub fn purpose_counter(position: u64, purpose: SamplingPurpose, subcounter: u64) -> u64 {
     let mut value = position ^ purpose as u64;
     value = value.wrapping_add(subcounter.wrapping_mul(0x9e37_79b9_7f4a_7c15));
@@ -92,7 +91,7 @@ pub fn random_unit(seed: u64, counter: u64) -> f64 {
     (value >> 11) as f64 * (1.0 / 9_007_199_254_740_992.0)
 }
 
-/// Returns one deterministic uniform draw for a complete logical coordinate.
+/// Returns one deterministic uniform draw for a full logical coordinate.
 pub fn random_unit_at(coordinate: SamplingCoordinate) -> f64 {
     let mut key = coordinate.seed;
     for component in [
@@ -106,9 +105,9 @@ pub fn random_unit_at(coordinate: SamplingCoordinate) -> f64 {
     random_unit(key, 0)
 }
 
-/// Materializes the normalized effective distribution after temperature,
-/// top-k, and top-p. This is used by exact speculative acceptance, where both
-/// target and proposal probabilities must remain available after selection.
+/// Returns the normalized distribution after temperature, top-k, and top-p.
+/// Exact speculative acceptance uses it to keep target and proposal
+/// probabilities available after selection.
 pub fn effective_probabilities(
     length: usize,
     mut value_at: impl FnMut(usize) -> f64,
@@ -177,8 +176,8 @@ pub fn effective_probabilities(
     Ok(probabilities)
 }
 
-/// Samples one token from non-negative unnormalized weights using a stateless
-/// key. Exact speculative residual sampling uses this after `max(0, p - q)`.
+/// Samples a token from non-negative unnormalized weights with a stateless key.
+/// Exact speculative residual sampling calls this after `max(0, p - q)`.
 pub fn sample_probabilities(
     probabilities: &[f64],
     seed: u64,
@@ -228,17 +227,16 @@ fn sample_probabilities_with_draw(
     Ok((probabilities.len() - 1) as u32)
 }
 
-/// Result of drawing from the target distribution and comparing that draw with
-/// one deterministic or non-factorized proposal token.
+/// Comparison of a target-distribution draw with one deterministic or
+/// non-factorized proposal token.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TargetSampleMatchResult {
     Accepted,
     Rejected(u32),
 }
 
-/// Implements exact target-sample matching for one candidate position. The
-/// target draw uses the supplied full-width coordinate and is returned as the
-/// correction when it does not equal `candidate`.
+/// Draws from the target distribution at one candidate position. If the draw
+/// differs from `candidate`, returns the draw as the correction.
 pub fn target_sample_match(
     target: &[f64],
     candidate: u32,
@@ -265,8 +263,9 @@ pub enum RejectionResult {
     Rejected(u32),
 }
 
-/// Applies `min(1, p(x) / q(x))` and, on rejection, samples from
-/// `normalize(max(0, p - q))` using independent purpose domains.
+/// Accepts with probability `min(1, p(x) / q(x))`. On rejection, samples
+/// from `normalize(max(0, p - q))`. Acceptance and residual draws use
+/// independent purpose domains.
 pub fn rejection_sample(
     target: &[f64],
     proposal: &[f64],
@@ -339,8 +338,8 @@ fn validate(length: usize, options: SamplingOptions) -> Result<(), String> {
     Ok(())
 }
 
-/// Samples one token from `length` logical logits without taking ownership of
-/// their storage. `cancelled` is polled during scans and before sorting.
+/// Samples one token from `length` logical logits read through `value_at`.
+/// Polls `cancelled` during scans and before sorting.
 pub fn sample_logits(
     length: usize,
     mut value_at: impl FnMut(usize) -> f64,

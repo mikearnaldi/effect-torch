@@ -1,32 +1,31 @@
-//! Fused KDA recurrent decode on Metal (RFC 0018, phase 3): one kernel
-//! launch per (sequence slot, layer) advances the gated delta-rule state
-//! by one token — S = Diag(alpha) S + beta k (v - (Diag(alpha) S)^T k)^T,
-//! o = scale * S^T q — with the [Dk, Dv] fp32 state distributed across
-//! threadgroup registers (each of 32 lanes holds ceil(Dk/32) rows for one
-//! of 4 value columns), simd_sum reductions for the k^T S and S^T q
-//! contractions, and the state read and written in place. This replaces
-//! the ~45-launch primitive reference for the T=1 decode step. All head dims are supported:
-//! out-of-range lanes/rows are masked off (the project rule is to fail
-//! loud on genuinely unsupported input, never to degrade silently).
+//! Fused KDA recurrent decode on Metal for RFC 0018 phase 3. One launch per
+//! sequence slot and layer advances the gated delta-rule state by one token:
+//! S = Diag(alpha) S + beta k (v - (Diag(alpha) S)^T k)^T and
+//! o = scale * S^T q. The kernel distributes the [Dk, Dv] fp32 state across
+//! threadgroup registers. Each of 32 lanes holds ceil(Dk/32) rows for one of
+//! four value columns. `simd_sum` reduces the k^T S and S^T q contractions.
+//! The kernel reads and writes state in place, replacing about 45 primitive
+//! launches for a T=1 decode step. It supports all head dimensions by masking
+//! out-of-range lanes and rows. Unsupported inputs return an error.
 //!
 //! ## Kernel contracts and state transactions
 //!
-//! - **Decode** (`et_kda_decode`): T=1 step. `q/k/g [H, Dk]`,
-//!   `v [H, Dv]`, `beta [H]`, fp32 state `[H, Dk, Dv]` read from
-//!   `state` and written in place to `state_next` (the same buffer for
-//!   the decode transaction). One threadgroup per (head, 4-column
-//!   value strip): 32 lanes × 4 strips.
-//! - **Forward** (`et_kda_forward`): the sequential gated delta-rule
-//!   scan over `steps` tokens, `q/k/g [BH, T, Dk]`, `v [BH, T, Dv]`,
-//!   `beta [BH, T]`; flag bit0 reads an fp32 initial state
-//!   `[BH, Dk, Dv]`, bit1 writes the final state. Register-resident at
-//!   Dk/Dv ≤ 128 where the scan beats the chunked WY form.
-//! - **Backward** (`et_kda_backward`): closed-form adjoint, one
-//!   threadgroup per batch·head (the dq/dk/dg/db gradients sum over
-//!   the full value dim). Phase A recomputes chunk-start states into
-//!   the f32 workspace; phase B walks 64-token chunks in reverse,
-//!   recomputing per-token states/deltas and stepping the adjoint L
-//!   back: `L += scale·q·doᵀ; dv = β·Lᵀk; dk = β·(Lδ − S̃(Lᵀk));
+//! - `et_kda_decode` handles a T=1 step. It takes `q/k/g [H, Dk]`,
+//!   `v [H, Dv]`, `beta [H]`, and fp32 state `[H, Dk, Dv]`. It reads
+//!   `state` and writes in place to the same `state_next` buffer for the
+//!   decode transaction. Each head and four-column value strip gets one
+//!   threadgroup of 32 lanes.
+//! - `et_kda_forward` scans `steps` tokens sequentially with
+//!   `q/k/g [BH, T, Dk]`, `v [BH, T, Dv]`, and `beta [BH, T]`. Flag bit 0
+//!   reads an fp32 `[BH, Dk, Dv]` initial state; bit 1 writes the final state.
+//!   State stays in registers for Dk/Dv ≤ 128, where this scan is faster than
+//!   the chunked WY form.
+//! - `et_kda_backward` computes the closed-form adjoint with one threadgroup
+//!   per batch·head. The dq/dk/dg/db gradients sum over the full value
+//!   dimension. Phase A recomputes chunk-start states into f32 workspace. Phase
+//!   B walks 64-token chunks in reverse, recomputes per-token states and deltas,
+//!   and steps the adjoint L back:
+//!   `L += scale·q·doᵀ; dv = β·Lᵀk; dk = β·(Lδ − S̃(Lᵀk));
 //!   dβ = kᵀLδ; dg = α ⊙ Σ_dv(S_{t-1} ⊙ M); L ← Diag(α)M`.
 //!
 //! The backward requires exactly one f32 scratch view of
@@ -36,7 +35,7 @@
 
 use crate::runtime::dtype::DType;
 
-/// Planner-facing requirements of the fused forward scan.
+/// Requirements for the fused forward scan.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ForwardRequirements {
     /// Storage dtype of activations (f32 or bf16); state is always f32.
@@ -66,7 +65,7 @@ pub struct ForwardRequirements {
     pub pipeline_count: usize,
 }
 
-/// Planner-facing requirements of the fused closed-form backward.
+/// Requirements for the fused closed-form backward.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BackwardRequirements {
     /// Storage dtype of gradients (f32 or bf16).
@@ -102,7 +101,7 @@ pub struct BackwardRequirements {
     pub pipeline_count: usize,
 }
 
-/// Planner-facing requirements of the T=1 decode step.
+/// Requirements for the T=1 decode step.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DecodeRequirements {
     /// Storage dtype of activations (f32 or bf16); state is always f32.
@@ -138,9 +137,8 @@ fn checked_bytes(elements: &[usize], dtype: DType, operation: &str) -> crate::er
         .ok_or_else(|| format!("{operation}: requirement byte size overflow"))
 }
 
-/// Requirements of the forward scan over `steps` tokens for
-/// `batch_heads` batch·heads; `write_state_next` additionally sizes the
-/// f32 final-state output.
+/// Requirements for a forward scan over `steps` tokens and `batch_heads`
+/// batch·heads. `write_state_next` also includes the f32 final-state output.
 pub fn forward_requirements(
     dtype: DType,
     batch_heads: usize,
@@ -948,8 +946,8 @@ kernel void et_kda_backward(
         Ok(())
     }
 
-    /// Allocating convenience wrapper around [`decode_into`]; updates
-    /// `state` in place and returns the `[H, Dv]` output.
+    /// Allocates output, calls [`decode_into`], updates `state` in place, and
+    /// returns the `[H, Dv]` result.
     pub fn decode(
         q: &MetalTensor,
         k: &MetalTensor,
@@ -1136,8 +1134,8 @@ kernel void et_kda_backward(
         Ok(())
     }
 
-    /// Allocating convenience wrapper around [`forward_into`]; returns
-    /// `(output [BH, T, Dv], final state when requested)`.
+    /// Allocates outputs, calls [`forward_into`], and returns the
+    /// `[BH, T, Dv]` output with the final state when requested.
     #[allow(clippy::too_many_arguments)]
     pub fn forward(
         q: &MetalTensor,
@@ -1285,9 +1283,8 @@ kernel void et_kda_backward(
         Ok(())
     }
 
-    /// Allocating convenience wrapper around [`backward_into`];
-    /// allocates the five gradient tensors and the f32 workspace, then
-    /// returns `(dq, dk, dv, dlog_decay, dbeta)`.
+    /// Allocates five gradient tensors and f32 workspace, calls
+    /// [`backward_into`], and returns `(dq, dk, dv, dlog_decay, dbeta)`.
     #[allow(clippy::too_many_arguments)]
     pub fn backward(
         q: &MetalTensor,

@@ -7,12 +7,13 @@ const packageName = "@effect-torch/backend-apple-native"
 let native: NativeAddon | undefined
 
 /**
- * Lazily selects and memoizes the package-local Darwin addon for the current
- * architecture. Validation and `require` happen only on the first successful
- * call, which keeps the public package import-safe on non-Darwin hosts. A failed
- * selection/load is not cached and there is no download, search path, or CPU
- * fallback. `.node` addons use the CommonJS native-module loader even though
- * this package is ESM.
+ * Selects and caches the package-local Darwin addon for the current architecture.
+ * Until an addon loads, each call validates the platform and architecture. The
+ * first successful call uses `require` and caches the result. Importing the public
+ * package does not call this loader, so imports do not fail on non-Darwin hosts.
+ * Failed selection or loading is not cached. The loader does not download
+ * binaries, search other paths, or fall back to CPU. Although this package is
+ * ESM, `.node` addons use the CommonJS native-module loader.
  *
  * @internal
  */
@@ -31,5 +32,6 @@ export const loadNative = (): NativeAddon => {
     `../../dist/internal/effect-torch-backend-apple-native.darwin-${process.arch}.node`,
     import.meta.url
   )
+  // SAFETY: the selected package binary is generated with the NativeAddon Node-API exports.
   return native = require(fileURLToPath(binary)) as NativeAddon
 }

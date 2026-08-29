@@ -15,21 +15,20 @@ import {
   windows
 } from "./model.js"
 
-// Longer FineWeb training uses `CKPT` as a mutable resumable archive, rewritten
-// after every chunk and preferred when present. Without it, bare `CHECKPOINT`
-// parameters warm-start training with fresh AdamW and sampler state. `OUT`
-// receives final bare parameters; by default `OUT === CHECKPOINT`, so the final
-// save replaces the warm-start artifact while `CKPT` remains resumable state.
+// `CKPT` stores resumable training state. The script rewrites it after every chunk.
+// An existing `CKPT` loads before the bare `CHECKPOINT`. Without it, bare
+// parameters start with fresh AdamW and sampler state. `OUT` receives the final
+// bare parameters. By default, `OUT === CHECKPOINT`, so the final save replaces
+// the warm-start artifact while `CKPT` remains separate.
 //
-// By default `totalSteps` is every complete sampler batch in one permutation;
-// a trailing partial batch is skipped. FINEWEB_STEPS changes both the run and
-// cosine-schedule horizon, so an override is not necessarily one epoch. Resume
-// restores parameters, optimizer roots, step, and the remainder of the saved
-// permutation. Future reshuffles can diverge because Math.random state is not
-// checkpointed, and checkpoint files carry no hyperparameter provenance.
-// FINEWEB_BATCH and FINEWEB_STEPS are Number-parsed without early validation.
-// A completed `CKPT` remains present and wins on the next invocation; select or
-// remove it before intending a fresh warm start.
+// By default, `totalSteps` covers every complete sampler batch in one
+// permutation and skips a trailing partial batch. FINEWEB_STEPS changes both the
+// run length and cosine schedule, so the run may not equal one epoch. Resume
+// restores parameters, optimizer roots, the step, and unused entries in the
+// saved permutation. Checkpoints do not save Math.random state, so future
+// reshuffles may differ. They also do not record hyperparameters. The script
+// parses FINEWEB_BATCH and FINEWEB_STEPS with Number but does not validate them
+// early. Remove `CKPT` or point it to another file before a fresh warm start.
 
 const TRAIN_BIN = new URL("../data/fineweb-train.bin", import.meta.url).pathname
 const VAL_BIN = new URL("../data/fineweb-val.bin", import.meta.url).pathname
@@ -83,10 +82,9 @@ const program = Effect.gen(function*() {
     stop: ({ step }) => step >= chunkTarget,
     precision: PRECISION,
     onStep: ({ step, loss, elapsed }) => {
-      // ETA from the mean step time since the epoch began, excluding
-      // the first step seen (its compile overhead would skew
-      // the average); the clock is continuous across checkpoint chunks
-      // via Resume.startedAt.
+      // Estimate ETA from the mean elapsed time per step. Exclude the first
+      // observed step because it includes compilation. Resume.startedAt keeps
+      // elapsed time continuous across checkpoint chunks in this process.
       const ms = Duration.toMillis(elapsed)
       if (firstStep === undefined) firstStep = { step, ms }
       const done = step - firstStep.step
@@ -100,9 +98,9 @@ const program = Effect.gen(function*() {
     }
   })
 
-  // The resumable archive wins over the pilot artifact. Without it, loading
-  // bare pilot parameters deliberately creates fresh optimizer and sampler
-  // state; random model initialization is only the final fallback.
+  // Use the resumable archive before the bare pilot artifact. Loading bare
+  // parameters starts fresh optimizer and sampler state. If neither file
+  // exists, initialize random model parameters.
   let params: Model.Params
   let step = 0
   let resume: Trainer.Resume<Optimizer.AdamState> | undefined
@@ -129,9 +127,9 @@ const program = Effect.gen(function*() {
   )
 
   let chunkTarget = Math.min(step + CHECKPOINT_EVERY, totalSteps)
-  // One elapsed clock is carried across chunks in this process. Checkpoint
-  // persistence omits `startedAt`, so restarting the process starts a new
-  // elapsed/ETA clock even though the global training step resumes.
+  // Reuse one elapsed-time origin across chunks in this process. Checkpoints
+  // omit `startedAt`, so restarting the process resets the ETA clock while the
+  // global training step still resumes.
   const epochStartedAt = resume?.startedAt ?? Date.now()
   if (resume !== undefined) resume = { ...resume, startedAt: epochStartedAt }
   while (step < totalSteps) {
@@ -144,10 +142,10 @@ const program = Effect.gen(function*() {
     yield* Checkpoint.saveWithSampler(CKPT, trainer, trained, sampler)
     yield* Effect.log(`checkpoint at step ${step}`)
     chunkTarget = Math.min(step + CHECKPOINT_EVERY, totalSteps)
-    // Each chunk passes concrete params/state as caller-owned inputs, so the
-    // trainer does not release that generation after producing replacements.
-    // Clear its concrete roots exactly once rather than leaving GB-scale
-    // generations to native finalizers; lazy initial roots are skipped.
+    // The caller retains ownership of concrete parameters and state passed to a
+    // chunk. Clear stale roots once after the trainer returns replacements
+    // instead of waiting for native finalizers. Skip lazy roots from a cold
+    // initialization.
     const stale = new Set([
       ...previous.filter(Tensor.isTensor),
       ...(previousState !== undefined ? optimizer.stateRoots(previousState).filter(Tensor.isTensor) : [])

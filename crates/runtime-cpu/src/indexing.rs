@@ -1,10 +1,9 @@
 //! Index-space operations: `gather`, `index_select`, `scatter_add`, `cat`.
 //!
-//! Index tensors may be `u8`, `u32`, or `i64`; `i64` indexes are range
-//! checked (negative values are errors) and all indexes are bounds checked
-//! against the addressed extent during execution. All kernels address the
-//! source through its layout, so strided inputs work without a contiguous
-//! copy.
+//! Index tensors may be `u8`, `u32`, or `i64`. The kernels reject negative
+//! `i64` indexes and check every index against the addressed extent during
+//! execution. They address sources through their layouts, so strided inputs do
+//! not need a contiguous copy.
 //!
 //! - `gather` reads `input[coord..., ids[..], coord...]` where the ids
 //!   tensor has the same rank as the input and the output takes the ids
@@ -16,18 +15,17 @@
 //! - `cat` concatenates same-rank, same-dtype tensors along `dim`, copying
 //!   each input in one outer × dim × inner blocked pass.
 //!
-//! [`IndexingRequirements`] freezes the output requirement, input layouts,
-//! and pass count ([`IndexingTopology`]) of one invocation for the executor.
+//! [`IndexingRequirements`] records an invocation's output requirement, input
+//! layouts, and [`IndexingTopology`] pass count for the executor.
 
 use super::tensor::{source_index, CpuBuffer, CpuDestination, CpuTensorRequirement, Elem, Tensor};
 use effect_torch_runtime::{DType, Layout};
 
-/// Execution strategy frozen into an [`IndexingRequirements`] plan.
+/// Execution strategy recorded in an [`IndexingRequirements`] plan.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IndexingTopology {
-    /// Single-pass direct indexing; `passes` counts the sweeps over the
-    /// output (e.g. `scatter_add` uses 2: copy, then accumulate; `cat` uses
-    /// one pass per input).
+    /// Direct indexing. `passes` counts output sweeps. `scatter_add` uses
+    /// two, one to copy and one to accumulate. `cat` uses one per input.
     Direct { passes: usize },
 }
 
@@ -35,7 +33,8 @@ pub enum IndexingTopology {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IndexingRequirements {
     pub output: CpuTensorRequirement,
-    /// Optional converted IDs. Direct CPU indexing consumes IDs indirectly, so this is `None`.
+    /// Optional converted IDs. This is `None` because direct CPU indexing
+    /// consumes IDs indirectly.
     pub ids: Option<CpuTensorRequirement>,
     pub scratch: Vec<CpuTensorRequirement>,
     pub topology: IndexingTopology,

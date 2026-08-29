@@ -1,39 +1,32 @@
 //! Backend-agnostic core types for the effect-torch runtime.
 //!
-//! This crate defines the vocabulary that concrete backends (CPU, Metal,
-//! ...) implement and that the compiler targets; it contains no execution
-//! engine itself. The main pieces are:
+//! This crate defines the types shared by concrete backends and the compiler.
+//! It does not contain an execution engine.
 //!
-//! - `backend`: runtime identity and ownership. Every runtime instance
-//!   mints a unique [`RuntimeId`]; [`Buffer`] handles carry the id of the
-//!   runtime that allocated them, and [`ErasedBuffer::validate_owner`]
-//!   rejects handles from foreign runtimes so buffers can never cross
-//!   runtime boundaries unchecked.
-//! - `dtype` and `layout`: the element-type and shape/stride/offset
-//!   model shared by every backend. Layout arithmetic is available in both
-//!   panicking and checked (overflow-detecting) forms.
-//! - `program`: declared program signatures ([`ProgramSignature`]) and
-//!   per-call arguments ([`Invocation`]) with full validation of counts,
-//!   dtypes, placements, shapes, layout policies, bounded runtime values
-//!   and RNG state before any execution.
-//! - `memory`: the compiler-produced [`MemoryPlan`] — typed segments,
-//!   value locations, output slots and buffer-reuse edges — together with
-//!   its structural validation rules and accounting reports.
-//! - `workspace`: a generic, thread-safe [`WorkspacePool`] that recycles
-//!   transient execution buffers with deterministic best-fit reuse and
-//!   LRU-bounded idle memory.
-//! - `gguf`: a strict, resource-limited, cancellable parser for GGUF v3
-//!   model files (see [`parse_gguf`]).
-//! - `dense`: compact `u32`-based identifiers (e.g. [`ValueId`]) used to
-//!   index the flat tables exchanged between compiler and runtime.
-//! - `cancellation`: the cooperative [`CancellationFlag`] polled by
+//! - `backend` defines runtime identity and ownership. Each runtime gets a
+//!   unique [`RuntimeId`], and its [`Buffer`] handles carry that id.
+//!   [`ErasedBuffer::validate_owner`] rejects handles from other runtimes.
+//! - `dtype` and `layout` define element types and shape, stride, and offset
+//!   geometry. [`Layout`] provides checked and panicking arithmetic methods.
+//! - `program` defines [`ProgramSignature`] and [`Invocation`]. Validation
+//!   checks counts, dtypes, placements, shapes, layout policies, bounded runtime
+//!   values, and RNG state before execution.
+//! - `memory` defines compiler-produced [`MemoryPlan`] values with typed
+//!   segments, value locations, output slots, reuse edges, structural
+//!   validation, and accounting reports.
+//! - `workspace` provides a thread-safe [`WorkspacePool`] with deterministic
+//!   best-fit reuse and an LRU limit on idle memory.
+//! - `gguf` provides the resource-limited, cancellable [`parse_gguf`] parser
+//!   for GGUF v3 files.
+//! - `dense` provides compact `u32` ids such as [`ValueId`] for the flat
+//!   tables shared by the compiler and runtime.
+//! - `cancellation` provides the cooperative [`CancellationFlag`] used by
 //!   long-running operations.
-//! - `error` and `executable`: the backend error taxonomy
-//!   ([`BackendError`]) and the diagnostics emitted by compiled
-//!   executables ([`ExecutableDiagnostics`]).
+//! - `error` and `executable` provide [`BackendError`] and
+//!   [`ExecutableDiagnostics`].
 //!
-//! The crate is intentionally free of `unsafe` code; all invariants are
-//! enforced through types, validation and assertion at the boundaries.
+//! The crate contains no `unsafe` code. Types, validation, and boundary
+//! assertions enforce its invariants.
 
 mod backend;
 mod cancellation;

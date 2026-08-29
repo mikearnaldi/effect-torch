@@ -132,8 +132,8 @@ const reportedAvailable = await Effect.runPromise(
 The Apple package entrypoint is safe to import on every platform. `isAvailable`
 defers loading the native addon and returns `false` on unsupported platforms,
 unsupported architectures, missing artifacts, or when Metal device, command
-queue, or shared-event creation fails. `makeRuntime` loads the addon only when
-the Metal runtime is actually requested.
+queue, or shared-event creation fails. Building `BackendApple.layer` loads the
+addon only when the Metal runtime is requested.
 
 ## Programming Model
 
@@ -166,17 +166,16 @@ Both native backend packages expose:
 import { Runtime } from "@effect-torch/core"
 import { Layer } from "effect"
 
-declare const makeRuntime: () => Runtime.RuntimeService
 declare const layer: Layer.Layer<Runtime.Runtime>
 ```
 
-`makeRuntime()` is a lazy, memoized factory. Importing the public module does
-not create the RuntimeService. The first direct call or first Layer build
-creates it, and later calls return the same service object. `layer` uses
-`Effect.sync(makeRuntime)` so service construction remains deferred.
+The Layer constructs the `RuntimeService` when it is first built and keeps the
+service behind `Runtime.Runtime`. Later builds use the same service object, so
+runtime identity and native caches remain stable without exposing a direct
+constructor.
 
-The native addon itself is selected and loaded by the package loader when the
-backend module is imported.
+The CPU package selects and loads its native addon when imported. The Apple
+package waits until `isAvailable` runs or its Layer is built.
 
 ### Lazy and Concrete Tensors
 
@@ -252,8 +251,8 @@ Consequences:
 - CPU handles cannot be used by Metal and vice versa.
 - Cleared handles fail with a typed `invalid-handle` error.
 - Foreign handles fail with a typed `foreign-handle` error.
-- Equivalent calls to one backend's memoized `makeRuntime()` share handle
-  ownership and stable runtime identity.
+- Builds of one backend's Layer share handle ownership and stable runtime
+  identity.
 - TypeScript signature caches belong to each compiled function, model, or
   trainer. Each runtime also owns a bounded structural executable cache whose
   entries share immutable plans without retaining generated concrete bindings.
@@ -1217,7 +1216,7 @@ artifacts remain Darwin-only.
 CPU and tokenizer loaders select one exact package-local binary from
 `process.platform`, `process.arch`, and, on Linux, the presence of glibc in
 `process.report`. The Apple loader performs the same platform and architecture
-selection lazily when `isAvailable` or `makeRuntime` first requests native code.
+selection lazily when `isAvailable` runs or the backend Layer is built.
 
 There is no postinstall download, fallback search path, or dynamic CPU fallback.
 GNU and musl binaries are shipped together in the Linux-capable packages.

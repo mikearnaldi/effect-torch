@@ -1,20 +1,18 @@
 //! Dense linear algebra: determinant, inverse, and solve.
 //!
-//! All three operations share one algorithm,
-//! [`LinalgAlgorithm::LuPartialPivotF64`]: the (possibly batched) input
-//! matrix is copied into an `f64` scratch buffer, factored in place with
-//! partial pivoting, and the factorization is then read out as a determinant
-//! (product of the diagonal times the pivot sign) or driven through
-//! forward/back substitution against a right-hand-side work buffer (the
-//! identity for `inverse`, the RHS for `solve`). Pivots below `1e-300` are
-//! treated as singular: determinants report 0 while `try_inverse`/`try_solve`
-//! return `"matrix is singular"`.
+//! All three operations use [`LinalgAlgorithm::LuPartialPivotF64`]. The
+//! algorithm copies each input matrix into an `f64` scratch buffer and
+//! factors it in place with partial pivoting. The determinant is the diagonal
+//! product times the pivot sign. `inverse` and `solve` use forward and back
+//! substitution with a right-hand-side work buffer containing the identity or
+//! the RHS. A pivot below `1e-300` marks the matrix as singular. Determinants
+//! return 0. `try_inverse` and `try_solve` return `"matrix is singular"`.
 //!
-//! Computing in `f64` regardless of the input dtype keeps half-precision and
-//! integer inputs stable; results are narrowed back to the input dtype on
-//! write-out. Scratch buffers (`[n, n]` LU, plus an `[n, rhs_columns]` work
-//! matrix for inverse/solve) are part of the frozen requirement structs, so
-//! the executor can plan them like any other workspace.
+//! The kernels compute in `f64` for every input dtype, which keeps
+//! half-precision and integer inputs stable. They narrow results to the input
+//! dtype when writing. The requirement structs include the `[n, n]` LU
+//! scratch and the `[n, rhs_columns]` inverse or solve work matrix, so the
+//! executor can plan them with the other workspace.
 
 use super::tensor::{source_index, CpuBuffer, CpuDestination, CpuTensorRequirement, Elem, Tensor};
 use effect_torch_runtime::{DType, Layout};
@@ -113,10 +111,10 @@ fn square_dimensions(tensor: &Tensor) -> Result<(usize, usize), &'static str> {
     Ok((n, checked_product(&tensor.shape()[..rank - 2])?))
 }
 
-/// In-place LU factorization with partial pivoting. `work` (row width
-/// `work_columns`) is row-swapped alongside `lu` so pivots apply to the
-/// right-hand side too. Returns the pivot sign (±1), or `None` when a pivot
-/// below 1e-300 marks the matrix singular.
+/// In-place LU factorization with partial pivoting. Row-swaps `work`, whose
+/// row width is `work_columns`, alongside `lu` so pivots also apply to the
+/// right-hand side. Returns the pivot sign (±1), or `None` when a pivot below
+/// 1e-300 marks the matrix singular.
 fn lu_decompose_in_place(
     lu: &mut [f64],
     n: usize,
@@ -158,8 +156,8 @@ fn lu_decompose_in_place(
     Some(sign)
 }
 
-/// Solves `LU * X = work` in place: forward substitution with the unit lower
-/// triangle, then back substitution with the upper triangle.
+/// Solves `LU * X = work` in place. Applies forward substitution with the
+/// unit lower triangle, then back substitution with the upper triangle.
 fn lu_solve_in_place(lu: &[f64], work: &mut [f64], n: usize, columns: usize) {
     for row in 1..n {
         for previous in 0..row {
@@ -404,8 +402,8 @@ fn solve_rhs_typed<A: Elem>(
 }
 
 impl Tensor {
-    /// Plans a determinant: validates square rank ≥ 2 shape and freezes the
-    /// matrix layout, batch, and scratch.
+    /// Plans a determinant. Validates a square shape of rank ≥ 2 and records
+    /// the matrix layout, batch, and scratch.
     pub fn det_requirements(&self) -> Result<DeterminantRequirements, &'static str> {
         let (n, batch) = square_dimensions(self)?;
         let rank = self.shape().len();
@@ -432,7 +430,7 @@ impl Tensor {
         Ok(self.det_requirements()?.scratch)
     }
 
-    /// Executes a planned determinant allocation-free.
+    /// Executes a planned determinant without allocating.
     pub fn det_into(
         &self,
         destination: &mut CpuDestination<'_>,
@@ -539,7 +537,7 @@ impl Tensor {
         Ok(self.inverse_requirements()?.scratch)
     }
 
-    /// Executes a planned inverse allocation-free. Fails with
+    /// Executes a planned inverse without allocating. Fails with
     /// `"matrix is singular"` when a batch has no usable pivot.
     pub fn inverse_into(
         &self,
@@ -589,8 +587,8 @@ impl Tensor {
         }
     }
 
-    /// Allocating inverse wrapper. Panics on invalid input or singularity;
-    /// use [`Tensor::try_inverse`] to handle singular matrices.
+    /// Allocating inverse wrapper. Panics on invalid input or singularity.
+    /// Use [`Tensor::try_inverse`] to handle singular matrices.
     pub fn inverse(&self) -> Tensor {
         self.try_inverse()
             .unwrap_or_else(|message| panic!("{message}"))
@@ -629,7 +627,7 @@ impl Tensor {
         }
     }
 
-    /// Plans a solve of `self · x = rhs`; batch dimensions must match.
+    /// Plans a solve of `self · x = rhs`. Batch dimensions must match.
     pub fn solve_requirements(&self, rhs: &Tensor) -> Result<SolveRequirements, &'static str> {
         let (n, batch) = square_dimensions(self)?;
         if rhs.shape().len() < 2 {
@@ -672,8 +670,8 @@ impl Tensor {
         Ok(self.solve_requirements(rhs)?.scratch)
     }
 
-    /// Executes a planned solve allocation-free. The RHS may have any dtype;
-    /// it is widened to `f64` and the result is written in the matrix dtype.
+    /// Executes a planned solve without allocating. Widens any RHS dtype to
+    /// `f64` and writes the result in the matrix dtype.
     pub fn solve_into(
         &self,
         rhs: &Tensor,
@@ -742,7 +740,7 @@ impl Tensor {
         }
     }
 
-    /// Allocating solve wrapper. Panics on invalid input or singularity; use
+    /// Allocating solve wrapper. Panics on invalid input or singularity. Use
     /// [`Tensor::try_solve`] to handle singular matrices.
     pub fn solve(&self, rhs: &Tensor) -> Tensor {
         self.try_solve(rhs)

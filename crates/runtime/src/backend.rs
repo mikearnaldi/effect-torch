@@ -1,29 +1,23 @@
 //! Runtime identity, device placement and buffer ownership.
 //!
-//! # Ownership model
+//! Every live runtime owns a process-unique [`RuntimeId`] from a global
+//! counter ([`RuntimeId::new`]). Its buffers carry that id. Entry points
+//! validate the id before using a buffer. See [`ErasedBuffer::validate_owner`]
+//! and [`ProgramSignature::validate_invocation`](crate::ProgramSignature::validate_invocation).
+//! Using a buffer with the wrong runtime returns
+//! [`BackendError::InvalidHandle`] instead of risking undefined behavior
+//! in the GPU stack.
 //!
-//! Every live runtime instance owns a process-unique [`RuntimeId`] minted
-//! from a global counter (`RuntimeId::new`). All buffers allocated by that
-//! runtime carry its id, and entry points that accept buffers validate the
-//! id before use (see [`ErasedBuffer::validate_owner`] and
-//! [`ProgramSignature::validate_invocation`](crate::ProgramSignature::validate_invocation)).
-//! This turns "buffer used with the wrong runtime" — a common source of
-//! undefined behavior in GPU stacks — into an ordinary, recoverable
-//! [`BackendError::InvalidHandle`].
+//! [`RuntimeIdentity`] contains a [`RuntimeId`] and human-readable backend
+//! name. [`DeviceId`] names one device. [`Placement`] assigns a buffer to a
+//! device and optional memory space. [`Capabilities`] lists the dtypes and
+//! features a backend supports, so compilation can reject programs that could
+//! not run.
 //!
-//! [`RuntimeIdentity`] couples a [`RuntimeId`] with a human-readable backend
-//! name; [`DeviceId`] names one device and [`Placement`] pins a buffer to a
-//! device plus an optional memory space. [`Capabilities`] advertises the
-//! dtypes and features a backend supports so compilation can fail early
-//! instead of producing executables that cannot run.
-//!
-//! # Buffer trait
-//!
-//! [`Buffer`] is the minimal object-safe view every backend buffer must
-//! expose: owner id, placement, dtype and layout, plus an [`Any`] downcast
-//! escape hatch. [`ErasedBuffer`] is the `Arc`-shared, type-erased handle
-//! passed across crate boundaries; it re-delegates the trait methods and
-//! provides checked downcasting via [`ErasedBuffer::downcast_ref`].
+//! [`Buffer`] exposes a backend buffer's owner id, placement, dtype, layout,
+//! and [`Any`] representation. [`ErasedBuffer`] is an `Arc`-shared,
+//! type-erased handle with checked downcasting through
+//! [`ErasedBuffer::downcast_ref`].
 
 use crate::{BackendError, BackendResult, DType, Layout};
 use std::any::Any;
@@ -35,14 +29,14 @@ static NEXT_RUNTIME_ID: AtomicU64 = AtomicU64::new(1);
 
 /// Process-unique identifier of one runtime instance.
 ///
-/// Ids are allocated from a monotonically increasing global counter and
-/// are never reused within a process, so equality of two ids implies the
-/// same owning runtime. Ids start at 1; 0 is never issued.
+/// A monotonically increasing global counter allocates ids. It starts at 1
+/// and never issues 0 or reuses an id within a process. Equal ids therefore
+/// identify the same owning runtime.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct RuntimeId(u64);
 
 impl RuntimeId {
-    /// Mints a fresh, never-before-issued runtime id.
+    /// Returns a runtime id not previously issued in this process.
     pub fn new() -> Self {
         Self(NEXT_RUNTIME_ID.fetch_add(1, Ordering::Relaxed))
     }
@@ -69,8 +63,8 @@ impl fmt::Display for RuntimeId {
 /// Identity of one runtime instance: a unique [`RuntimeId`] plus the name
 /// of the backend that created it (e.g. `"cpu"`, `"metal"`).
 ///
-/// Two identities created with the same backend name are still distinct —
-/// the id, not the name, is the ownership token.
+/// Two identities with the same backend name remain distinct. The id is the
+/// ownership token.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct RuntimeIdentity {
     id: RuntimeId,
@@ -78,7 +72,7 @@ pub struct RuntimeIdentity {
 }
 
 impl RuntimeIdentity {
-    /// Creates a new identity for the named backend, minting a fresh id.
+    /// Creates an identity with a new id for the named backend.
     pub fn new(backend: impl Into<Arc<str>>) -> Self {
         Self {
             id: RuntimeId::new(),
@@ -117,8 +111,8 @@ impl fmt::Display for DeviceId {
     }
 }
 
-/// Where a buffer lives: a device plus an optional named memory space
-/// (e.g. a Metal shared vs. private heap).
+/// A buffer's device and optional named memory space, such as a Metal shared
+/// or private heap.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Placement {
     device: DeviceId,
@@ -169,14 +163,13 @@ pub enum Capability {
     Compilation,
     /// The backend can execute asynchronously (non-blocking launches).
     AsyncExecution,
-    /// Host and device share one address space, making transfers free.
+    /// Host and device share one address space, so transfers require no copy.
     UnifiedMemory,
 }
 
 /// The set of dtypes and [`Capability`] features a backend supports.
 ///
-/// Lists are kept as ordered vectors; duplicates are meaningless but
-/// harmless since all queries are membership tests.
+/// The lists are ordered vectors. Duplicates do not affect membership tests.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Capabilities {
     dtypes: Vec<DType>,
@@ -210,8 +203,8 @@ impl Capabilities {
 /// Implementors must guarantee that [`runtime_id`](Buffer::runtime_id)
 /// returns the id of the runtime that allocated the buffer and that
 /// [`layout`](Buffer::layout) and [`dtype`](Buffer::dtype) describe the
-/// buffer's current contents. `Send + Sync` is required because buffers
-/// cross thread boundaries inside execution pools.
+/// buffer's current contents. Buffers must implement `Send + Sync` because
+/// execution pools move them across thread boundaries.
 pub trait Buffer: Any + fmt::Debug + Send + Sync {
     fn runtime_id(&self) -> RuntimeId;
     fn placement(&self) -> &Placement;
@@ -222,8 +215,8 @@ pub trait Buffer: Any + fmt::Debug + Send + Sync {
 
 /// Reference-counted, type-erased buffer handle.
 ///
-/// Cloning is cheap (an `Arc` bump) and all clones share the same
-/// underlying buffer. The concrete backend type can be recovered with
+/// Cloning only increments an `Arc`, and all clones share the same buffer.
+/// Recover the concrete backend type with
 /// [`downcast_ref`](Self::downcast_ref).
 #[derive(Clone)]
 pub struct ErasedBuffer(Arc<dyn Buffer>);
@@ -256,8 +249,8 @@ impl ErasedBuffer {
         self.0.as_any().downcast_ref()
     }
 
-    /// Fails with [`BackendError::InvalidHandle`] unless the buffer is
-    /// owned by the runtime with id `expected`.
+    /// Returns [`BackendError::InvalidHandle`] if runtime `expected` does
+    /// not own the buffer.
     pub fn validate_owner(&self, expected: RuntimeId) -> BackendResult<()> {
         let actual = self.runtime_id();
         if actual == expected {
