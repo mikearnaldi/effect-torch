@@ -12,7 +12,7 @@ it("imports safely and defers the unsupported-platform error", async () => {
 
     expect(await Effect.runPromise(backend.isAvailable)).toBe(false)
     await expect(
-      Effect.runPromise(Runtime.Runtime.pipe(Effect.provide(backend.layer)))
+      Effect.runPromise(Runtime.Runtime.pipe(Effect.provide(backend.layer())))
     ).rejects.toThrow(/supports only platform "darwin"/)
   } finally {
     Object.defineProperty(process, "platform", platform)

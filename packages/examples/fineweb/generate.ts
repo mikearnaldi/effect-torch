@@ -85,4 +85,4 @@ const program = Effect.scoped(Effect.gen(function*() {
   process.stdout.write("\n")
 }))
 
-NodeRuntime.runMain(program.pipe(Effect.provide(BackendApple.layer)))
+NodeRuntime.runMain(program.pipe(Effect.provide(BackendApple.layer())))

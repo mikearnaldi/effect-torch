@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest"
-import { normalizedStructure, structuralCacheKey } from "../src/internal/adapter.ts"
+import { createRuntimeAdapter, normalizedStructure, structuralCacheKey } from "../src/internal/adapter.ts"
+import type { NativeAddon } from "../src/internal/native-addon.js"
 
 const numberFromBits = (high: number, low: number): number => {
   const view = new DataView(new ArrayBuffer(8))
@@ -11,6 +12,17 @@ const numberFromBits = (high: number, low: number): number => {
 // Cache keys encode exceptional IEEE-754 values and -0 as raw bits. Ordinary
 // finite values remain numbers, so equal attributes share cache entries.
 describe("Metal executable cache keys", () => {
+  it("uses the selected ordinal in placement identity", () => {
+    // SAFETY: Adapter construction does not call the addon; this test only needs its identity.
+    const runtime = createRuntimeAdapter({} as NativeAddon, 2)
+    expect(runtime.placement).toEqual({
+      id: "metal:2",
+      deviceType: "metal",
+      description: "Apple Metal device 2",
+      ordinal: 2
+    })
+  })
+
   it("distinguishes special numbers by their IEEE-754 bits", () => {
     const values = [
       numberFromBits(0x7ff8_0000, 0x0000_0001),

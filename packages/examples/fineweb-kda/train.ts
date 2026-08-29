@@ -114,4 +114,4 @@ const program = Effect.gen(function*() {
   yield* saveParams(model, params, CHECKPOINT)
 })
 
-NodeRuntime.runMain(program.pipe(Effect.provide(BackendApple.layer)))
+NodeRuntime.runMain(program.pipe(Effect.provide(BackendApple.layer())))

@@ -161,8 +161,11 @@ const program = Effect.gen(function*() {
 })
 
 const result = await Effect.runPromise(
-  program.pipe(Effect.provide(BackendApple.layer))
+  program.pipe(Effect.provide(BackendApple.layer()))
 )
+
+// Select another enumerated Metal device. Omitting `device` selects metal:0.
+const secondDevice = BackendApple.layer({ device: 1 })
 
 const reportedAvailable = await Effect.runPromise(
   BackendApple.isAvailable
@@ -172,8 +175,8 @@ const reportedAvailable = await Effect.runPromise(
 The Apple package entrypoint is safe to import on every platform. `isAvailable`
 defers loading the native addon and returns `false` on unsupported platforms,
 unsupported architectures, missing artifacts, or when Metal device, command
-queue, or shared-event creation fails. Building `BackendApple.layer` loads the
-addon only when the Metal runtime is requested.
+queue, or shared-event creation fails. Building `BackendApple.layer()` loads
+the addon only when the Metal runtime is requested.
 
 ## Programming Model
 

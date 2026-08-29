@@ -85,4 +85,4 @@ const program = Effect.gen(function*() {
   yield* Console.log(`node-mlx:     ${median(theirs).toFixed(4)}  (all: ${theirs.map((x) => x.toFixed(3)).join(" ")})`)
 })
 
-Effect.runPromise(Effect.provide(program, BackendApple.layer))
+Effect.runPromise(Effect.provide(program, BackendApple.layer()))

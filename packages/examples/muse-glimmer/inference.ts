@@ -253,5 +253,5 @@ const program = Effect.gen(function*() {
 })
 
 NodeRuntime.runMain(
-  program.pipe(Effect.provide(BackendApple.layer))
+  program.pipe(Effect.provide(BackendApple.layer()))
 )

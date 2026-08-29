@@ -43,4 +43,4 @@ const program = Effect.scoped(Effect.gen(function*() {
   yield* Tensor.clear(logits)
   yield* Effect.log("smoke ok")
 }))
-NodeRuntime.runMain(program.pipe(Effect.provide(BackendApple.layer)))
+NodeRuntime.runMain(program.pipe(Effect.provide(BackendApple.layer())))

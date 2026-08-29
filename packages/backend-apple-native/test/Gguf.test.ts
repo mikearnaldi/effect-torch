@@ -5,9 +5,11 @@ import { mkdtemp, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import path from "node:path"
 import { vi } from "vitest"
-import { isAvailable, layer as backendLayer } from "../src/index.ts"
+import { isAvailable, layer as makeBackendLayer } from "../src/index.ts"
 import { createRuntimeAdapter } from "../src/internal/adapter.ts"
 import type { NativeAddon, NativeGgufTensorDescriptor } from "../src/internal/native-addon.js"
+
+const backendLayer = makeBackendLayer()
 
 const u32 = (value: number): Buffer => {
   const bytes = Buffer.alloc(4)
@@ -96,8 +98,13 @@ const makeNativeAddonDouble = (loadGguf: GgufLoadDouble): NativeAddon => {
       this.cancelled = true
     }
   }
-  const addon = { CancellationToken: Token, loadGguf }
-  // SAFETY: GGUF ownership tests use only the typed loadGguf and CancellationToken fields.
+  const loadGgufForDevice = (
+    path: string,
+    _deviceOrdinal: number,
+    token?: Parameters<NativeAddon["loadGguf"]>[1]
+  ) => loadGguf(path, token)
+  const addon = { CancellationToken: Token, loadGgufForDevice }
+  // SAFETY: GGUF ownership tests use only the typed loadGgufForDevice and CancellationToken fields.
   return addon as NativeAddon
 }
 

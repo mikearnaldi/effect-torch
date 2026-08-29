@@ -20,7 +20,9 @@ layer(BackendCpu.layer)("Runtime", (it) => {
     it.effect("rejects foreign lazy and concrete tensor handles", () =>
       Effect.gen(function*() {
         const cpu = yield* Runtime.Runtime
-        const apple = yield* Effect.provide(Runtime.Runtime, BackendApple.layer)
+        const apple = yield* Effect.provide(Runtime.Runtime, BackendApple.layer())
+        expect(apple.placement).toMatchObject({ id: "metal:0", deviceType: "metal", ordinal: 0 })
+        expect(yield* Effect.provide(Runtime.Runtime, BackendApple.layer())).toBe(apple)
         const graph = yield* cpu.node({
           op: "ones",
           inputs: [],
@@ -38,7 +40,7 @@ layer(BackendCpu.layer)("Runtime", (it) => {
 
     it.effect("rejects foreign tensors during graph construction", () =>
       Effect.gen(function*() {
-        const tensor = yield* Effect.provide(Tensor.ones([1]), BackendApple.layer)
+        const tensor = yield* Effect.provide(Tensor.ones([1]), BackendApple.layer())
         const error = yield* Effect.flip(Tensor.relu(tensor))
         expect(error.backend?.reason).toBe("foreign-handle")
       }))

@@ -30,4 +30,4 @@ const program = Effect.gen(function*() {
   yield* Console.log(`sdpa fwd [8,12,1024,64] bf16 causal: ${((performance.now() - start) / ITERS).toFixed(3)} ms/op`)
 })
 
-Effect.runPromise(Effect.provide(program, BackendApple.layer))
+Effect.runPromise(Effect.provide(program, BackendApple.layer()))

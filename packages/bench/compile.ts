@@ -452,7 +452,7 @@ const main = async (): Promise<void> => {
   if (config.runtimes.includes("metal")) {
     const BackendApple = await import("@effect-torch/backend-apple-native")
     if (await Effect.runPromise(BackendApple.isAvailable)) {
-      await Effect.runPromise(Effect.provide(suite(config), BackendApple.layer))
+      await Effect.runPromise(Effect.provide(suite(config), BackendApple.layer()))
     } else {
       writeJson(JSON.stringify({ kind: "skipped", runtime: "metal", reason: "unavailable" }) ?? "undefined")
     }

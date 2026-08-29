@@ -66,6 +66,6 @@ type SuiteFn = Parameters<ReturnType<typeof layer<Runtime.Runtime, never>>>[1]
 export const onDevices = (name: string, make: (device: TestDevice) => SuiteFn): void => {
   layer(BackendCpu.layer)(`${name} (cpu)`, make("cpu"))
   if (metalAvailable) {
-    layer(BackendApple.layer)(`${name} (metal)`, make("metal"))
+    layer(BackendApple.layer())(`${name} (metal)`, make("metal"))
   }
 }

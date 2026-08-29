@@ -4,7 +4,9 @@ import { Effect } from "effect"
 import { mkdtemp, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import path from "node:path"
-import { isAvailable, layer as backendLayer } from "../src/index.ts"
+import { isAvailable, layer as makeBackendLayer } from "../src/index.ts"
+
+const backendLayer = makeBackendLayer()
 
 const withTempFile = <A, E, R>(prefix: string, use: (file: string) => Effect.Effect<A, E, R>) =>
   Effect.acquireUseRelease(
@@ -30,10 +32,17 @@ const writeF64Archive = (file: string): Promise<void> => {
 // These file tests run only when Metal is available and never substitute CPU
 // behavior. They release concrete execution results and loaded handles.
 suite("Metal tensor handles and safetensors file I/O", () => {
+  it("rejects an unavailable Metal ordinal", async () => {
+    await expect(
+      Effect.runPromise(Runtime.Runtime.pipe(Effect.provide(makeBackendLayer({ device: 0xffff_ffff }))))
+    ).rejects.toThrow(/metal:4294967295 is unavailable/)
+  })
+
   it.effect("writes and reloads Metal tensors and metadata", () =>
     withTempFile("effect-torch-metal-safetensors-", (file) =>
       Effect.gen(function*() {
         const runtime = yield* Runtime.Runtime
+        expect(runtime.placement).toMatchObject({ id: "metal:0", deviceType: "metal", ordinal: 0 })
         const tensor = yield* runtime.node({
           op: "fromBytes",
           inputs: [],
@@ -48,6 +57,7 @@ suite("Metal tensor handles and safetensors file I/O", () => {
           scalars: [],
           runtimeValues: {}
         })
+        expect(yield* runtime.extensions.diagnostics.externalMemoryBytes).toBeGreaterThanOrEqual(4096)
 
         yield* runtime.extensions.pathSafetensors.save(file, {
           entries: [{ name: "values", tensor: concrete }],

@@ -164,4 +164,4 @@ const program = Effect.gen(function*() {
   yield* saveParams(model, params, OUT)
 })
 
-NodeRuntime.runMain(program.pipe(Effect.provide(BackendApple.layer)))
+NodeRuntime.runMain(program.pipe(Effect.provide(BackendApple.layer())))

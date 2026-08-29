@@ -154,6 +154,7 @@ export declare class NativeInferenceSession {
 
 export declare class NativeKvPool {
   constructor(layers: number, kvHeads: number, headDim: number, maxTokens: number, blockSize?: number | undefined | null, dtype?: NativeDType | undefined | null, recurrent?: NativeRecurrentStateSchema | undefined | null)
+  static forDevice(layers: number, kvHeads: number, headDim: number, maxTokens: number, blockSize: number | undefined | null, dtype: NativeDType | undefined | null, recurrent: NativeRecurrentStateSchema | undefined | null, deviceOrdinal: number): NativeKvPool
   get capacity(): number
   get freeBlocks(): number
   get cachedBlocks(): number
@@ -181,7 +182,11 @@ export declare class NativeTensor {
 
 export declare function compile(roots: Array<LazyTensor>, options?: NativeCompileOptions | undefined | null, state?: NativeKvStateSchema | undefined | null, cacheKey?: string | undefined | null): Executable
 
+export declare function compileForDevice(roots: Array<LazyTensor>, options: NativeCompileOptions | undefined | null, state: NativeKvStateSchema | undefined | null, cacheKey: string | undefined | null, deviceOrdinal: number): Executable
+
 export declare function externalMemoryBytes(): number
+
+export declare function externalMemoryBytesForDevice(deviceOrdinal: number): number
 
 export declare function grad(loss: LazyTensor, wrt: Array<LazyTensor>): Array<LazyTensor>
 
@@ -190,10 +195,16 @@ export declare function inspectGguf(path: string, token?: CancellationToken | un
 
 export declare function isAvailable(): boolean
 
+export declare function isDeviceAvailable(deviceOrdinal: number): boolean
+
 /** Parses a GGUF file and loads every supported tensor into Metal storage. */
 export declare function loadGguf(path: string, token?: CancellationToken | undefined | null): Promise<NativeGgufArchive>
 
+export declare function loadGgufForDevice(path: string, deviceOrdinal: number, token?: CancellationToken | undefined | null): Promise<NativeGgufArchive>
+
 export declare function loadTensors(path: string, token?: CancellationToken | undefined | null): Promise<NativeSafetensorsArchive>
+
+export declare function loadTensorsForDevice(path: string, deviceOrdinal: number, token?: CancellationToken | undefined | null): Promise<NativeSafetensorsArchive>
 
 export interface NativeCompileOptions {
   optimize?: boolean | undefined

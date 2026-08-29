@@ -387,17 +387,21 @@ const cancellable = <A>(
   })
 
 /**
- * Constructs a Metal RuntimeService around an already loaded addon namespace.
- * The addon object identifies the runtime and acts as its handle ownership key.
- * Services that use the same namespace can exchange handles. Other backends and
- * other addon instances cannot. Construction allocates only adapter metadata.
- * Native operations initialize the process-wide Metal device when first needed.
+ * Constructs a Metal RuntimeService for one device in an already loaded addon.
+ * The addon and device ordinal identify the handle ownership domain. Services
+ * for different ordinals cannot exchange handles. Construction allocates only
+ * adapter metadata; native operations initialize the selected device when first
+ * needed.
  *
  * @internal
  */
 export const createRuntimeAdapter = (
-  native: NativeAddon
+  native: NativeAddon,
+  deviceOrdinal = 0
 ): Runtime.RuntimeService => {
+  if (!Number.isSafeInteger(deviceOrdinal) || deviceOrdinal < 0 || deviceOrdinal > 0xffff_ffff) {
+    throw new Error(`Metal device ordinal must be an integer in [0, 4294967295]; received ${deviceOrdinal}`)
+  }
   const backendErrorFor = (
     operation: string,
     phase: Runtime.BackendError["phase"],
@@ -410,11 +414,13 @@ export const createRuntimeAdapter = (
     onLateSuccess?: (value: A) => void,
     failureReason?: Runtime.BackendError["reason"]
   ) => cancellable(native, operation, phase, register, onLateSuccess, failureReason)
-  const owner = native
+  const owner = Object.freeze({ native, deviceOrdinal })
+  const placementId = `${device}:${deviceOrdinal}`
   const placement: Runtime.Placement = Object.freeze({
-    id: device,
+    id: placementId,
     deviceType: device,
-    description
+    description: `${description} device ${deviceOrdinal}`,
+    ordinal: deviceOrdinal
   })
   const invalidHandle = (
     operation: string,
@@ -1599,7 +1605,7 @@ export const createRuntimeAdapter = (
       Effect.try({
         try: () =>
           pool(
-            new native.NativeKvPool(
+            native.NativeKvPool.forDevice(
               options.layers,
               options.kvHeads,
               options.headDim,
@@ -1614,7 +1620,8 @@ export const createRuntimeAdapter = (
                 convLayers: options.convLayers,
                 convChannels: options.convChannels,
                 convKernel: options.convKernel
-              }
+              },
+              deviceOrdinal
             ),
             {
               layers: options.layers,
@@ -2284,7 +2291,7 @@ export const createRuntimeAdapter = (
       cancellableFor(
         "load",
         "io",
-        (token) => native.loadTensors(path, token),
+        (token) => native.loadTensorsForDevice(path, deviceOrdinal, token),
         (archive) => clearBuffers(archive.entries.map((entry) => entry.tensor))
       ).pipe(
         Effect.mapError((error) =>
@@ -2423,7 +2430,7 @@ export const createRuntimeAdapter = (
       cancellableFor(
         "loadGguf",
         "io",
-        (token) => native.loadGguf(path, token),
+        (token) => native.loadGgufForDevice(path, deviceOrdinal, token),
         (archive) => clearBuffers(archive.entries.map((entry) => entry.tensor)),
         "io-failed"
       ).pipe(
@@ -2518,7 +2525,13 @@ export const createRuntimeAdapter = (
           const roots = request.roots.map((root) => nativeGraph(root, "compile", "compile"))
           const options = mapCompileOptions(request.options)
           const state = mapStateRequest(request.state)
-          const value = native.compile(roots, options, state?.native, executableCacheKey(request))
+          const value = native.compileForDevice(
+            roots,
+            options,
+            state?.native,
+            executableCacheKey(request),
+            deviceOrdinal
+          )
           const outputs = request.roots.flatMap((root, index) => {
             const base = {
               dtype: root.dtype,
@@ -2621,7 +2634,7 @@ export const createRuntimeAdapter = (
       diagnostics: {
         // This is current native memory attributed to live NativeTensor wrappers.
         // Executable diagnostics instead contain static planned byte totals.
-        externalMemoryBytes: Effect.sync(() => native.externalMemoryBytes())
+        externalMemoryBytes: Effect.sync(() => native.externalMemoryBytesForDevice(deviceOrdinal))
       }
     }
   }

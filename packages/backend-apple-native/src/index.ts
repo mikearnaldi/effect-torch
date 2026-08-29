@@ -32,21 +32,46 @@ export const isAvailable: Effect.Effect<boolean> = Effect.sync(() => {
   }
 })
 
-let runtime: Runtime.RuntimeService | undefined
+const runtimes = new Map<number, Runtime.RuntimeService>()
 
 /**
- * Provides the cached Apple native runtime singleton as a reusable Layer.
+ * Selects the Metal device used by a runtime layer.
  *
- * The Layer waits until it is built to load the addon and construct the runtime.
- * Successful builds share the same service. If loading or construction throws,
- * `Effect.sync` reports the exception as a defect and does not cache the failed
- * construction. A later build can retry. Building the Layer does not run
- * {@link isAvailable}.
+ * @since 0.1.0
+ * @category models
+ */
+export interface LayerOptions {
+  /** Zero-based Metal device ordinal. Defaults to `0`. */
+  readonly device?: number
+}
+
+/**
+ * Provides a cached Apple native runtime for one Metal device.
+ *
+ * The Layer waits until it is built to load the addon, validate the requested
+ * device, and construct the runtime. Successful builds for the same ordinal
+ * share one service. Omitted options select `metal:0`. Failed construction is
+ * not cached, so a later build can retry.
  *
  * @since 0.1.0
  * @category layers
  */
-export const layer: Layer.Layer<Runtime.Runtime> = Layer.effect(
-  Runtime.Runtime,
-  Effect.sync(() => runtime ??= createRuntimeAdapter(loadNative()))
-)
+export const layer = (options: LayerOptions = {}): Layer.Layer<Runtime.Runtime> =>
+  Layer.effect(
+    Runtime.Runtime,
+    Effect.sync(() => {
+      const device = options.device ?? 0
+      if (!Number.isSafeInteger(device) || device < 0 || device > 0xffff_ffff) {
+        throw new Error(`Metal device ordinal must be an integer in [0, 4294967295]; received ${device}`)
+      }
+      const cached = runtimes.get(device)
+      if (cached !== undefined) return cached
+      const native = loadNative()
+      if (!native.isDeviceAvailable(device)) {
+        throw new Error(`Metal device metal:${device} is unavailable`)
+      }
+      const runtime = createRuntimeAdapter(native, device)
+      runtimes.set(device, runtime)
+      return runtime
+    })
+  )

@@ -71,4 +71,4 @@ const program = Effect.gen(function*() {
   yield* gemm(256, rows, 50257, 48, `head  [256,${rows}]x[${rows},50k]  dW x48`)
 })
 
-Effect.runPromise(Effect.provide(program, BackendApple.layer))
+Effect.runPromise(Effect.provide(program, BackendApple.layer()))

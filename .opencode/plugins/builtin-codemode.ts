@@ -9,10 +9,7 @@ const builtinTools = [
   "write",
   "patch",
   "webfetch",
-  "websearch",
-  "question",
-  "skill",
-  "subagent"
+  "websearch"
 ] as const
 
 export default Plugin.define({

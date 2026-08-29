@@ -9,7 +9,7 @@
 //! for cancellation. On failure, the loader drops partially built archives
 //! instead of publishing them.
 
-use super::{run_compute, value, CancellationToken, NativeTensor};
+use super::{run_compute, run_compute_on, value, CancellationToken, NativeTensor};
 use effect_torch_runtime::{
     parse_gguf, read_gguf_tensor_into, DType, GgufMetadataArray, GgufMetadataEntry,
     GgufMetadataValue, GgufParseError, GgufTensorDescriptor,
@@ -180,7 +180,24 @@ pub async fn load_gguf(
     path: String,
     token: Option<&CancellationToken>,
 ) -> Result<NativeGgufArchive> {
-    run_compute(token, move |cancelled, _state| {
+    load_gguf_on(path, token, 0).await
+}
+
+#[napi]
+pub async fn load_gguf_for_device(
+    path: String,
+    device_ordinal: u32,
+    token: Option<&CancellationToken>,
+) -> Result<NativeGgufArchive> {
+    load_gguf_on(path, token, device_ordinal as usize).await
+}
+
+async fn load_gguf_on(
+    path: String,
+    token: Option<&CancellationToken>,
+    device_ordinal: usize,
+) -> Result<NativeGgufArchive> {
+    run_compute_on(device_ordinal, token, move |cancelled, _state| {
         let mut file = open(&path)?;
         let parsed = parse_gguf(&mut file, Some(cancelled)).map_err(gguf_error)?;
         let mut entries = Vec::new();
@@ -208,7 +225,7 @@ pub async fn load_gguf(
             .map_err(gguf_error)?;
             entries.push(NativeGgufLoadedEntry {
                 descriptor: descriptor(&tensor),
-                tensor: NativeTensor::wrap(loaded),
+                tensor: NativeTensor::wrap_on(loaded, device_ordinal),
             });
         }
         Ok(NativeGgufArchive { entries })

@@ -138,7 +138,7 @@ const main = async (): Promise<void> => {
   )
   await Effect.runPromise(Effect.provide(suite, BackendCpu.layer))
   if (await Effect.runPromise(BackendApple.isAvailable)) {
-    await Effect.runPromise(Effect.provide(suite, BackendApple.layer))
+    await Effect.runPromise(Effect.provide(suite, BackendApple.layer()))
   }
 }
 

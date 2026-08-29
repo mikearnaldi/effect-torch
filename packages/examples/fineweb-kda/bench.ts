@@ -46,4 +46,4 @@ const program = Effect.scoped(Effect.gen(function*() {
   const ms = (Date.now() - t0) / N
   yield* Effect.log(`${ms.toFixed(2)} ms/token (${(1000 / ms).toFixed(1)} tok/s)`)
 }))
-NodeRuntime.runMain(program.pipe(Effect.provide(BackendApple.layer)))
+NodeRuntime.runMain(program.pipe(Effect.provide(BackendApple.layer())))

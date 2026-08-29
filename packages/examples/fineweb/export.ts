@@ -36,4 +36,4 @@ const program = Effect.gen(function*() {
   yield* Effect.log(`exported ${checkpoint.params.length} parameters (step ${checkpoint.resume.step}) to ${out}`)
 })
 
-NodeRuntime.runMain(program.pipe(Effect.provide(BackendApple.layer)))
+NodeRuntime.runMain(program.pipe(Effect.provide(BackendApple.layer())))

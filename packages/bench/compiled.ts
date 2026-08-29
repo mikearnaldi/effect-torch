@@ -32,4 +32,4 @@ const program = Effect.gen(function*() {
   )
 })
 
-Effect.runPromise(Effect.provide(program, BackendApple.layer))
+Effect.runPromise(Effect.provide(program, BackendApple.layer()))

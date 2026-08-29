@@ -34,7 +34,7 @@ mod runtime;
 pub(crate) mod safetensors;
 pub(crate) mod value;
 
-pub use gguf::{inspect_gguf, load_gguf};
+pub use gguf::{inspect_gguf, load_gguf, load_gguf_for_device};
 
 use crate::executable;
 use crate::executable::{ConvGeometry, KdaGeometry, KvStateSchema, MetalDecodeContext, SeqState};
@@ -502,10 +502,16 @@ fn get_device() -> Device {
 pub struct NativeTensor {
     pub(crate) slot: std::sync::Arc<LeafSlot>,
     bytes: i64,
+    device_ordinal: usize,
 }
 
 impl NativeTensor {
+    #[cfg(test)]
     fn wrap(inner: value::Value) -> Self {
+        Self::wrap_on(inner, 0)
+    }
+
+    fn wrap_on(inner: value::Value, device_ordinal: usize) -> Self {
         // Buffers cost at least one memory page regardless of logical tensor size.
         // Metal allocates in 4 KB units, and malloc behaves similarly. Without
         // this floor, tiny tensors look free to V8, which delays collection. The
@@ -517,9 +523,15 @@ impl NativeTensor {
         // told the delta at the next main-thread touchpoint (see sync_v8);
         // no JS-side involvement, so no missed sites and no drift.
         EXTERNAL_MEMORY_BYTES.fetch_add(bytes, Ordering::Relaxed);
+        *EXTERNAL_MEMORY_BY_DEVICE
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .entry(device_ordinal)
+            .or_default() += bytes;
         Self {
             slot: std::sync::Arc::new(LeafSlot::new(inner)),
             bytes,
+            device_ordinal,
         }
     }
 
@@ -532,6 +544,15 @@ impl NativeTensor {
     fn release_accounting(&mut self) {
         if self.bytes != 0 {
             EXTERNAL_MEMORY_BYTES.fetch_sub(self.bytes, Ordering::Relaxed);
+            let mut by_device = EXTERNAL_MEMORY_BY_DEVICE
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            if let Some(bytes) = by_device.get_mut(&self.device_ordinal) {
+                *bytes -= self.bytes;
+                if *bytes == 0 {
+                    by_device.remove(&self.device_ordinal);
+                }
+            }
             self.bytes = 0;
         }
     }
@@ -545,6 +566,8 @@ impl Drop for NativeTensor {
 
 // Native bytes currently retained by JS-reachable tensors.
 static EXTERNAL_MEMORY_BYTES: AtomicI64 = AtomicI64::new(0);
+static EXTERNAL_MEMORY_BY_DEVICE: LazyLock<Mutex<HashMap<usize, i64>>> =
+    LazyLock::new(Default::default);
 // What V8 has been told so far (adjust_external_memory is main-thread only).
 static V8_REPORTED: AtomicI64 = AtomicI64::new(0);
 
@@ -607,8 +630,7 @@ impl NativeTensor {
     #[napi]
     pub fn clear(&mut self, env: Env) -> Result<()> {
         if self.slot.clear() {
-            EXTERNAL_MEMORY_BYTES.fetch_sub(self.bytes, Ordering::Relaxed);
-            self.bytes = 0;
+            self.release_accounting();
             sync_v8(&env);
         }
         Ok(())
@@ -637,7 +659,7 @@ impl NativeTensor {
     #[napi(ts_return_type = "Promise<ArrayBuffer>")]
     pub async fn readback(&self, token: Option<&CancellationToken>) -> Result<Readback> {
         let inner = self.val_cloned()?;
-        run_compute(token, move |cancelled, _state| {
+        run_compute_on(self.device_ordinal, token, move |cancelled, _state| {
             if cancelled.load(Ordering::Acquire) {
                 return Err(Error::new(
                     Status::Cancelled,
@@ -675,9 +697,11 @@ impl NativeTensor {
             counter,
         })?;
         let inner = self.val_cloned()?;
-        run_compute(cancellation_token, move |cancelled, _state| {
-            sample_blocking(&inner, options, cancelled)
-        })
+        run_compute_on(
+            self.device_ordinal,
+            cancellation_token,
+            move |cancelled, _state| sample_blocking(&inner, options, cancelled),
+        )
         .await
     }
 }
@@ -1849,6 +1873,18 @@ pub fn is_available() -> bool {
     objc2::rc::autoreleasepool(|_| runtime::metal::device::is_available())
 }
 
+#[napi]
+pub fn is_device_available(device_ordinal: u32) -> bool {
+    objc2::rc::autoreleasepool(|_| {
+        runtime::metal::device::is_ordinal_available(device_ordinal as usize)
+    })
+}
+
+fn with_device<T>(device_ordinal: usize, operation: impl FnOnce() -> Result<T>) -> Result<T> {
+    runtime::metal::device::MetalDevice::with_ordinal(device_ordinal, operation)
+        .map_err(to_napi_err)?
+}
+
 async fn run_compute<T: Send + 'static>(
     token: Option<&CancellationToken>,
     compute: impl FnOnce(&effect_torch_runtime::CancellationFlag, &CancellationState) -> Result<T>
@@ -1864,6 +1900,19 @@ async fn run_compute<T: Send + 'static>(
         objc2::rc::autoreleasepool(|_| compute(flag, state))
     };
     effect_torch_napi::run_compute(state, notify, compute).await
+}
+
+async fn run_compute_on<T: Send + 'static>(
+    device_ordinal: usize,
+    token: Option<&CancellationToken>,
+    compute: impl FnOnce(&effect_torch_runtime::CancellationFlag, &CancellationState) -> Result<T>
+        + Send
+        + 'static,
+) -> Result<T> {
+    run_compute(token, move |cancelled, state| {
+        with_device(device_ordinal, || compute(cancelled, state))
+    })
+    .await
 }
 
 #[cfg(test)]
@@ -2102,6 +2151,7 @@ impl PoolSlab {
 }
 
 struct PoolInner {
+    device_ordinal: usize,
     // Per layer, flat [max_tokens, kv_heads, head_dim] slabs; block b
     // occupies rows b*block_size..(b+1)*block_size. Slab dtype u8 means
     // int8-quantized storage (RFC 0012 storage tier): rows are
@@ -3012,6 +3062,71 @@ impl NativeKvPool {
         dtype: Option<NativeDType>,
         recurrent: Option<NativeRecurrentStateSchema>,
     ) -> Result<Self> {
+        Self::for_ordinal(
+            layers, kv_heads, head_dim, max_tokens, block_size, dtype, recurrent, 0,
+        )
+    }
+
+    #[napi(factory)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn for_device(
+        layers: u32,
+        kv_heads: u32,
+        head_dim: u32,
+        max_tokens: u32,
+        block_size: Option<u32>,
+        dtype: Option<NativeDType>,
+        recurrent: Option<NativeRecurrentStateSchema>,
+        device_ordinal: u32,
+    ) -> Result<Self> {
+        Self::for_ordinal(
+            layers,
+            kv_heads,
+            head_dim,
+            max_tokens,
+            block_size,
+            dtype,
+            recurrent,
+            device_ordinal as usize,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn for_ordinal(
+        layers: u32,
+        kv_heads: u32,
+        head_dim: u32,
+        max_tokens: u32,
+        block_size: Option<u32>,
+        dtype: Option<NativeDType>,
+        recurrent: Option<NativeRecurrentStateSchema>,
+        device_ordinal: usize,
+    ) -> Result<Self> {
+        with_device(device_ordinal, || {
+            Self::create(
+                layers,
+                kv_heads,
+                head_dim,
+                max_tokens,
+                block_size,
+                dtype,
+                recurrent,
+                device_ordinal,
+            )
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn create(
+        layers: u32,
+        kv_heads: u32,
+        head_dim: u32,
+        max_tokens: u32,
+        block_size: Option<u32>,
+        dtype: Option<NativeDType>,
+        recurrent: Option<NativeRecurrentStateSchema>,
+        device_ordinal: usize,
+    ) -> Result<Self> {
         let dtype: DType = dtype.unwrap_or(NativeDType::F32).into();
         // u8 slabs are the int8-quantized storage tier: bytes plus a
         // per-(token, head) f32 scale, not an arithmetic dtype.
@@ -3122,6 +3237,7 @@ impl NativeKvPool {
         prepare_recurrent_states(&mut padding_state, kda, conv).map_err(to_napi_err)?;
         Ok(Self {
             inner: Arc::new(PoolInner {
+                device_ordinal,
                 k,
                 v,
                 scales,
@@ -3159,13 +3275,15 @@ impl NativeKvPool {
 
     #[napi]
     pub fn make_sequence(&self) -> Result<NativeKvSequence> {
-        Ok(NativeKvSequence {
-            pool: self.inner.clone(),
-            state: Arc::new(Mutex::new(
-                sequence_state(&self.inner, false).map_err(to_napi_err)?,
-            )),
-            run_lock: Arc::new(Mutex::new(())),
-            released: Arc::new(AtomicBool::new(false)),
+        with_device(self.inner.device_ordinal, || {
+            Ok(NativeKvSequence {
+                pool: self.inner.clone(),
+                state: Arc::new(Mutex::new(
+                    sequence_state(&self.inner, false).map_err(to_napi_err)?,
+                )),
+                run_lock: Arc::new(Mutex::new(())),
+                released: Arc::new(AtomicBool::new(false)),
+            })
         })
     }
 }
@@ -3575,6 +3693,7 @@ fn validate_stateful_tensor_input(
 pub struct Executable {
     inner: ProgramInner,
     state: Option<StatefulExecutable>,
+    device_ordinal: usize,
 }
 
 #[napi]
@@ -3790,6 +3909,19 @@ impl Executable {
         eos_tokens: Vec<Vec<u32>>,
         cancellation_token: Option<&CancellationToken>,
     ) -> Result<Vec<Vec<u32>>> {
+        if proposer.device_ordinal != self.device_ordinal
+            || target_sequences
+                .iter()
+                .any(|sequence| sequence.pool.device_ordinal != self.device_ordinal)
+            || proposer_sequences
+                .iter()
+                .any(|sequence| sequence.pool.device_ordinal != self.device_ordinal)
+        {
+            return Err(Error::new(
+                Status::InvalidArg,
+                "executeSpeculative: executables and sequences must use the same Metal device",
+            ));
+        }
         let sampling = sampling
             .into_iter()
             .map(sampling_options)
@@ -3836,7 +3968,8 @@ impl Executable {
             .map(|slot| slot as usize)
             .collect::<Vec<_>>();
 
-        run_compute(cancellation_token, move |cancelled, cancellation| {
+        let compute = move |cancelled: &effect_torch_runtime::CancellationFlag,
+                            cancellation: &CancellationState| {
             let _guards = locks
                 .iter()
                 .map(|lock| {
@@ -3901,8 +4034,8 @@ impl Executable {
                 &pages,
             );
             Ok(pages)
-        })
-        .await
+        };
+        run_compute_on(self.device_ordinal, cancellation_token, compute).await
     }
 }
 
@@ -6618,6 +6751,7 @@ fn prefill_bucket(buckets: &[PrefillBucket], remaining: usize) -> &PrefillBucket
 
 #[derive(Clone)]
 struct InferencePrograms {
+    device_ordinal: usize,
     target_prefill: SpeculativeProgram,
     /// Every compiled prefill shape bucket sorted by time ascending; the last
     /// entry always mirrors the primary prefill program and its optional
@@ -7476,6 +7610,48 @@ impl NativeInferenceArtifact {
         prefill_buckets: Option<Vec<&Executable>>,
         replay_prefill_buckets: Option<Vec<&Executable>>,
     ) -> Result<Self> {
+        let device_ordinal = target_prefill.device_ordinal;
+        let executables_match = target_decode.device_ordinal == device_ordinal
+            && target_verify
+                .iter()
+                .all(|executable| executable.device_ordinal == device_ordinal)
+            && proposer_prefill
+                .is_none_or(|executable| executable.device_ordinal == device_ordinal)
+            && proposer_decode.is_none_or(|executable| executable.device_ordinal == device_ordinal)
+            && stage_executables.as_ref().is_none_or(|executables| {
+                executables
+                    .iter()
+                    .all(|executable| executable.device_ordinal == device_ordinal)
+            })
+            && replay_prefill.is_none_or(|executable| executable.device_ordinal == device_ordinal)
+            && replay_decode.is_none_or(|executable| executable.device_ordinal == device_ordinal)
+            && replay_verify
+                .iter()
+                .all(|executable| executable.device_ordinal == device_ordinal)
+            && prefill_buckets.as_ref().is_none_or(|executables| {
+                executables
+                    .iter()
+                    .all(|executable| executable.device_ordinal == device_ordinal)
+            })
+            && replay_prefill_buckets.as_ref().is_none_or(|executables| {
+                executables
+                    .iter()
+                    .all(|executable| executable.device_ordinal == device_ordinal)
+            });
+        let pools_match = target_pool.inner.device_ordinal == device_ordinal
+            && proposer_pool.is_none_or(|pool| pool.inner.device_ordinal == device_ordinal)
+            && replay_pool.is_none_or(|pool| pool.inner.device_ordinal == device_ordinal);
+        let tensors_match = shared_target_tensors.as_ref().is_none_or(|tensors| {
+            tensors
+                .iter()
+                .all(|tensor| tensor.device_ordinal == device_ordinal)
+        });
+        if !executables_match || !pools_match || !tensors_match {
+            return Err(Error::new(
+                Status::InvalidArg,
+                "inference[compile]: all resources must use the same Metal device",
+            ));
+        }
         let generalized = proposer_plan.is_some();
         if generalized
             && (proposer_prefill.is_some()
@@ -7903,6 +8079,7 @@ impl NativeInferenceArtifact {
         };
         Ok(Self {
             programs: Arc::new(InferencePrograms {
+                device_ordinal,
                 target_prefill,
                 prefill_buckets,
                 target_decode,
@@ -8199,6 +8376,15 @@ impl NativeInferenceSession {
                 "inference[admission]: add arrays must be nonempty and equal length with positive maxTokens",
             ));
         }
+        if prompts
+            .iter()
+            .any(|prompt| prompt.device_ordinal != self.programs.device_ordinal)
+        {
+            return Err(Error::new(
+                Status::InvalidArg,
+                "inference[admission]: prompts and artifact must use the same Metal device",
+            ));
+        }
         {
             let state = self.state.lock().map_err(|error| {
                 Error::new(
@@ -8242,7 +8428,9 @@ impl NativeInferenceSession {
         let sequence_counter = self.next_sequence_id.clone();
         let round_counter = self.next_round_id.clone();
         let failure_diagnostics = diagnostics.clone();
-        let result = run_compute(cancellation_token, move |cancelled, cancellation| {
+        let device_ordinal = programs.device_ordinal;
+        let compute = move |cancelled: &effect_torch_runtime::CancellationFlag,
+                            cancellation: &CancellationState| {
             let mut session = state.lock().map_err(|error| {
                 Error::new(
                     Status::GenericFailure,
@@ -8457,8 +8645,8 @@ impl NativeInferenceSession {
             session.receipt = Some(receipt.clone());
             publish_paired_cache_metadata(&target_cache, proposer_cache.as_ref());
             Ok(native_receipt(session.id, &receipt, false))
-        })
-        .await;
+        };
+        let result = run_compute_on(device_ordinal, cancellation_token, compute).await;
         if let Err(error) = &result {
             record_inference_failure(&failure_diagnostics, error, "prefill");
         }
@@ -8487,7 +8675,9 @@ impl NativeInferenceSession {
         let diagnostics = self.diagnostics.clone();
         let round_counter = self.next_round_id.clone();
         let failure_diagnostics = diagnostics.clone();
-        let result = run_compute(cancellation_token, move |cancelled, cancellation| {
+        let device_ordinal = programs.device_ordinal;
+        let compute = move |cancelled: &effect_torch_runtime::CancellationFlag,
+                            cancellation: &CancellationState| {
             let mut session = state.lock().map_err(|error| {
                 Error::new(
                     Status::GenericFailure,
@@ -8908,8 +9098,8 @@ impl NativeInferenceSession {
             diagnostics.has_round.store(true, Ordering::Relaxed);
             session.receipt = Some(receipt.clone());
             Ok(native_receipt(session.id, &receipt, false))
-        })
-        .await;
+        };
+        let result = run_compute_on(device_ordinal, cancellation_token, compute).await;
         if let Err(error) = &result {
             record_inference_failure(&failure_diagnostics, error, "verify");
         }
@@ -9099,6 +9289,18 @@ impl Executable {
         token: Option<&CancellationToken>,
     ) -> Result<StatefulExecutionOutput> {
         let batch = self.state.as_ref().expect("state checked").schema.batch;
+        if inputs
+            .iter()
+            .any(|input| input.device_ordinal != self.device_ordinal)
+            || seqs
+                .iter()
+                .any(|sequence| sequence.pool.device_ordinal != self.device_ordinal)
+        {
+            return Err(Error::new(
+                Status::InvalidArg,
+                "execute: inputs, state, and executable must use the same Metal device",
+            ));
+        }
         if seqs.is_empty() || seqs.len() > batch {
             return Err(Error::new(
                 Status::InvalidArg,
@@ -9235,7 +9437,8 @@ impl Executable {
         let released: Vec<Arc<AtomicBool>> = seqs.iter().map(|seq| seq.released.clone()).collect();
         let slot_states: Vec<Arc<Mutex<SeqState>>> =
             seqs.iter().map(|seq| seq.state.clone()).collect();
-        run_compute(token, move |cancelled, cancellation| {
+        let device_ordinal = self.device_ordinal;
+        run_compute_on(device_ordinal, token, move |cancelled, cancellation| {
             let _run_guards: Vec<_> = run_locks
                 .iter()
                 .map(|lock| {
@@ -9324,7 +9527,10 @@ impl Executable {
                     )
                     .map(|outputs| {
                         StatefulExecutionOutput::Tensors(
-                            outputs.into_iter().map(NativeTensor::wrap).collect(),
+                            outputs
+                                .into_iter()
+                                .map(|output| NativeTensor::wrap_on(output, device_ordinal))
+                                .collect(),
                         )
                     }),
                     StatefulInvocation::Sampled(sampling) => executable::execute_stateful_sampled(
@@ -9452,6 +9658,15 @@ impl Executable {
         token: Option<&CancellationToken>,
     ) -> Result<Vec<NativeTensor>> {
         let inner = &self.inner;
+        if inputs
+            .iter()
+            .any(|input| input.device_ordinal != self.device_ordinal)
+        {
+            return Err(Error::new(
+                Status::InvalidArg,
+                "execute: inputs and executable must use the same Metal device",
+            ));
+        }
         let signature = &inner.executable.signature;
         signature
             .validate_invocation_counts(inputs.len(), scalars.len(), 0, None)
@@ -9497,7 +9712,8 @@ impl Executable {
                 .validate_binding_metadata(index, value.dtype(), tensor.placement(), &tensor.layout)
                 .map_err(|error| Error::new(Status::InvalidArg, error.to_string()))?;
         }
-        run_compute(token, move |cancelled, _state| {
+        let device_ordinal = self.device_ordinal;
+        run_compute_on(device_ordinal, token, move |cancelled, _state| {
             Ok(executable::execute_with_scalars(
                 &executable,
                 &inputs,
@@ -9507,7 +9723,7 @@ impl Executable {
             )
             .map_err(to_napi_err)?
             .into_iter()
-            .map(NativeTensor::wrap)
+            .map(|output| NativeTensor::wrap_on(output, device_ordinal))
             .collect())
         })
         .await
@@ -9537,6 +9753,39 @@ pub fn compile(
     options: Option<NativeCompileOptions>,
     state: Option<NativeKvStateSchema>,
     cache_key: Option<String>,
+) -> Result<Executable> {
+    compile_for_ordinal(roots, options, state, cache_key, 0)
+}
+
+#[napi]
+pub fn compile_for_device(
+    roots: Vec<&LazyTensor>,
+    options: Option<NativeCompileOptions>,
+    state: Option<NativeKvStateSchema>,
+    cache_key: Option<String>,
+    device_ordinal: u32,
+) -> Result<Executable> {
+    compile_for_ordinal(roots, options, state, cache_key, device_ordinal as usize)
+}
+
+fn compile_for_ordinal(
+    roots: Vec<&LazyTensor>,
+    options: Option<NativeCompileOptions>,
+    state: Option<NativeKvStateSchema>,
+    cache_key: Option<String>,
+    device_ordinal: usize,
+) -> Result<Executable> {
+    with_device(device_ordinal, || {
+        compile_inner(roots, options, state, cache_key, device_ordinal)
+    })
+}
+
+fn compile_inner(
+    roots: Vec<&LazyTensor>,
+    options: Option<NativeCompileOptions>,
+    state: Option<NativeKvStateSchema>,
+    cache_key: Option<String>,
+    device_ordinal: usize,
 ) -> Result<Executable> {
     let mut nodes: Vec<Arc<Node>> = roots.iter().map(|tensor| tensor.node.clone()).collect();
     if nodes.is_empty() {
@@ -9661,7 +9910,7 @@ pub fn compile(
                     .as_ref()
                     .is_some_and(|inference| inference.constant_weights)
         })
-        .map(|key| format!("{key}|{:?}", program.options));
+        .map(|key| format!("metal:{device_ordinal}|{key}|{:?}", program.options));
     if let Some(key) = effective_cache_key.as_deref() {
         let cached = program_cache()
             .lock()
@@ -9683,6 +9932,7 @@ pub fn compile(
                             generated_bindings: current,
                         },
                         state: executable_state,
+                        device_ordinal,
                     });
                 }
             }
@@ -9718,6 +9968,7 @@ pub fn compile(
             generated_bindings: compilation.generated_bindings,
         },
         state: executable_state,
+        device_ordinal,
     })
 }
 
@@ -9753,11 +10004,21 @@ pub async fn save_tensors(
             "save_tensors: tensor names must be unique and cannot be __metadata__".to_string(),
         ));
     }
+    let device_ordinal = tensors[0].device_ordinal;
+    if tensors
+        .iter()
+        .any(|tensor| tensor.device_ordinal != device_ordinal)
+    {
+        return Err(Error::new(
+            Status::InvalidArg,
+            "save_tensors: all tensors must use the same Metal device",
+        ));
+    }
     let tensors = tensors
         .iter()
         .map(|tensor| tensor.val_cloned())
         .collect::<Result<Vec<_>>>()?;
-    run_compute(token, move |cancelled, _state| {
+    run_compute_on(device_ordinal, token, move |cancelled, _state| {
         if cancelled.load(Ordering::Acquire) {
             return Err(Error::new(
                 Status::Cancelled,
@@ -9800,7 +10061,24 @@ pub async fn load_tensors(
     path: String,
     token: Option<&CancellationToken>,
 ) -> Result<NativeSafetensorsArchive> {
-    run_compute(token, move |cancelled, _state| {
+    load_tensors_on(path, token, 0).await
+}
+
+#[napi]
+pub async fn load_tensors_for_device(
+    path: String,
+    device_ordinal: u32,
+    token: Option<&CancellationToken>,
+) -> Result<NativeSafetensorsArchive> {
+    load_tensors_on(path, token, device_ordinal as usize).await
+}
+
+async fn load_tensors_on(
+    path: String,
+    token: Option<&CancellationToken>,
+    device_ordinal: usize,
+) -> Result<NativeSafetensorsArchive> {
+    run_compute_on(device_ordinal, token, move |cancelled, _state| {
         if cancelled.load(Ordering::Acquire) {
             return Err(Error::new(
                 Status::Cancelled,
@@ -9820,7 +10098,7 @@ pub async fn load_tensors(
                 .into_iter()
                 .map(|(name, tensor)| NativeSafetensorsEntry {
                     name,
-                    tensor: NativeTensor::wrap(tensor),
+                    tensor: NativeTensor::wrap_on(tensor, device_ordinal),
                 })
                 .collect(),
             metadata: archive.metadata,
@@ -9836,6 +10114,16 @@ pub async fn load_tensors(
 #[napi]
 pub fn external_memory_bytes() -> i64 {
     EXTERNAL_MEMORY_BYTES.load(Ordering::Relaxed)
+}
+
+#[napi]
+pub fn external_memory_bytes_for_device(device_ordinal: u32) -> i64 {
+    EXTERNAL_MEMORY_BY_DEVICE
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .get(&(device_ordinal as usize))
+        .copied()
+        .unwrap_or(0)
 }
 
 #[cfg(test)]
@@ -11062,8 +11350,7 @@ mod epilogue_tests {
         };
 
         assert!(tensor.slot.clear());
-        EXTERNAL_MEMORY_BYTES.fetch_sub(tensor.bytes, Ordering::Relaxed);
-        tensor.bytes = 0;
+        tensor.release_accounting();
         for _ in 0..4 {
             drop(run());
         }

@@ -49,7 +49,7 @@ use objc2_metal::{
     MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder,
     MTLComputePipelineState, MTLDevice, MTLLibrary, MTLResourceOptions, MTLSize,
 };
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::ptr::NonNull;
 use std::sync::{Arc, Mutex, OnceLock, Weak};
@@ -81,6 +81,14 @@ pub static EXECUTABLE_ALLOCATION_ATTEMPTS: std::sync::atomic::AtomicU64 =
 static SUBMISSION_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// Monotonic id for each created `MetalDevice` (multi-device tests).
 static DEVICE_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+thread_local! {
+    /// Device selected for operations that still use `MetalDevice::get`. N-API
+    /// entry points set this for the duration of one synchronous worker job.
+    static CURRENT_DEVICE_ORDINAL: Cell<usize> = const { Cell::new(0) };
+}
+
+static DEVICES: OnceLock<Mutex<HashMap<usize, &'static MetalDevice>>> = OnceLock::new();
 
 #[cfg(test)]
 thread_local! {
@@ -1267,26 +1275,71 @@ pub fn is_available() -> bool {
         .any(|device| device.newCommandQueue().is_some() && device.newSharedEvent().is_some())
 }
 
+/// Returns whether the requested Metal device can create the resources required
+/// by this runtime.
+pub fn is_ordinal_available(ordinal: usize) -> bool {
+    objc2_metal::MTLCopyAllDevices()
+        .iter()
+        .nth(ordinal)
+        .is_some_and(|device| {
+            device.newCommandQueue().is_some() && device.newSharedEvent().is_some()
+        })
+}
+
 impl MetalDevice {
-    /// The process-wide device singleton (ordinal 0).
+    /// The process-wide device selected for the current operation. Ordinal 0 is
+    /// used when no selection is active.
     ///
     /// # Panics
     ///
     /// Panics if no Metal device is available or the queue cannot be
     /// created.
     pub fn get() -> &'static MetalDevice {
-        static DEVICE: OnceLock<MetalDevice> = OnceLock::new();
-        DEVICE.get_or_init(|| MetalDevice::new(0).expect("metal device"))
+        let ordinal = CURRENT_DEVICE_ORDINAL.with(Cell::get);
+        Self::for_ordinal(ordinal).expect("metal device")
     }
 
-    /// Creates a device handle for `ordinal` (clamped to the last device)
-    /// with its own pool, caches, and submission registry.
+    /// Returns the process-cached runtime state for one physical Metal device.
+    pub fn for_ordinal(ordinal: usize) -> Result<&'static MetalDevice, String> {
+        let devices = DEVICES.get_or_init(|| Mutex::new(HashMap::new()));
+        let mut devices = devices.lock().unwrap_or_else(|error| error.into_inner());
+        if let Some(device) = devices.get(&ordinal) {
+            return Ok(*device);
+        }
+        let device = Box::leak(Box::new(Self::new(ordinal)?));
+        devices.insert(ordinal, device);
+        Ok(device)
+    }
+
+    /// Runs `operation` with `MetalDevice::get` bound to `ordinal` on this
+    /// thread. Nested selections restore the previous ordinal on return.
+    pub fn with_ordinal<T>(ordinal: usize, operation: impl FnOnce() -> T) -> Result<T, String> {
+        Self::for_ordinal(ordinal)?;
+        struct RestoreOrdinal(usize);
+        impl Drop for RestoreOrdinal {
+            fn drop(&mut self) {
+                CURRENT_DEVICE_ORDINAL.with(|current| current.set(self.0));
+            }
+        }
+        let previous = CURRENT_DEVICE_ORDINAL.with(|current| current.replace(ordinal));
+        let _restore = RestoreOrdinal(previous);
+        Ok(operation())
+    }
+
+    /// Creates a device handle for `ordinal` with its own pool, caches, and
+    /// submission registry.
     pub fn new(ordinal: usize) -> Result<Self, String> {
         let devices = objc2_metal::MTLCopyAllDevices();
         if devices.is_empty() {
             return Err("no Metal devices available".to_string());
         }
-        let raw = devices.to_vec().swap_remove(ordinal.min(devices.len() - 1));
+        if ordinal >= devices.len() {
+            return Err(format!(
+                "Metal device ordinal {ordinal} is unavailable; found {} device(s)",
+                devices.len()
+            ));
+        }
+        let raw = devices.to_vec().swap_remove(ordinal);
         let queue = raw
             .newCommandQueue()
             .ok_or("failed to create command queue")?;

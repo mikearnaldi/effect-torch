@@ -1101,7 +1101,7 @@ const main = async (): Promise<void> => {
   )
   const records: Array<BenchRecord> = []
   if (config.engine !== "llama") {
-    await Effect.runPromise(Effect.provide(effectSuite(config, records), BackendApple.layer))
+    await Effect.runPromise(Effect.provide(effectSuite(config, records), BackendApple.layer()))
   }
   if (config.engine !== "effect") {
     await llamaSuite(config, records)
