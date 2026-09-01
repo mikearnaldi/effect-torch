@@ -71,6 +71,25 @@ importers:
         specifier: ^4.1.10
         version: 4.1.10(@types/node@22.20.1)(vite@8.1.5(@types/node@22.20.1)(esbuild@0.28.1)(tsx@4.23.1)(yaml@2.9.0))
 
+  packages/backend-cuda:
+    dependencies:
+      '@effect-torch/core':
+        specifier: workspace:^
+        version: link:../core
+      effect:
+        specifier: 4.0.0-beta.101
+        version: 4.0.0-beta.101
+    devDependencies:
+      '@effect/vitest':
+        specifier: 4.0.0-beta.101
+        version: 4.0.0-beta.101(effect@4.0.0-beta.101)(vitest@4.1.10(@types/node@22.20.1)(vite@8.1.5(@types/node@22.20.1)(esbuild@0.28.1)(tsx@4.23.1)(yaml@2.9.0)))
+      '@types/node':
+        specifier: ^22.0.0
+        version: 22.20.1
+      vitest:
+        specifier: ^4.1.10
+        version: 4.1.10(@types/node@22.20.1)(vite@8.1.5(@types/node@22.20.1)(esbuild@0.28.1)(tsx@4.23.1)(yaml@2.9.0))
+
   packages/bench:
     dependencies:
       '@effect-torch/backend-apple-native':
@@ -79,6 +98,9 @@ importers:
       '@effect-torch/backend-cpu':
         specifier: workspace:*
         version: link:../backend-cpu
+      '@effect-torch/backend-cuda':
+        specifier: workspace:*
+        version: link:../backend-cuda
       '@effect-torch/core':
         specifier: workspace:*
         version: link:../core
@@ -111,6 +133,9 @@ importers:
       '@effect-torch/backend-cpu':
         specifier: workspace:*
         version: link:../backend-cpu
+      '@effect-torch/backend-cuda':
+        specifier: workspace:*
+        version: link:../backend-cuda
       '@effect-torch/tokenizers':
         specifier: workspace:*
         version: link:../tokenizers
@@ -132,6 +157,9 @@ importers:
       '@effect-torch/backend-cpu':
         specifier: workspace:*
         version: link:../backend-cpu
+      '@effect-torch/backend-cuda':
+        specifier: workspace:*
+        version: link:../backend-cuda
       '@effect-torch/core':
         specifier: workspace:*
         version: link:../core

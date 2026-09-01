@@ -6,3 +6,6 @@ target/
 bench-results/
 .cuda-devbox.env
 .cuda-devbox-known-hosts
+.cuda-devbox-ssh-key
+.cuda-devbox-ssh-key.pub
+.bench/

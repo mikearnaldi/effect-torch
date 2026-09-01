@@ -227,7 +227,7 @@ mod tests {
         let root = Node::new(NodeKind::Zeros {
             shape: vec![1],
             dtype: DType::F32,
-            device: Device::Cpu,
+            device: Device::Cpu(0),
         })
         .unwrap();
         let prepared = ProgramRequest::from_roots(vec![root], CompileOptions::default())
@@ -287,7 +287,7 @@ mod tests {
         let root = Node::new(NodeKind::Zeros {
             shape: vec![1],
             dtype: DType::F32,
-            device: Device::Cpu,
+            device: Device::Cpu(0),
         })
         .unwrap();
         let mut options = CompileOptions::default();

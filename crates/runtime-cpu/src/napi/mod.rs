@@ -62,7 +62,7 @@ type KdaGeometry = effect_torch_compiler::KdaGeometry;
 type ConvGeometry = effect_torch_compiler::ConvGeometry;
 
 fn cpu_device() -> Device {
-    Device::Cpu
+    Device::Cpu(0)
 }
 
 fn attention_window(value: i64) -> Result<AttentionWindow> {

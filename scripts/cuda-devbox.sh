@@ -10,6 +10,7 @@ usage() {
 Usage: scripts/cuda-devbox.sh <command> [arguments]
 
 Commands:
+  key                  Create and register the repository-local SSH key
   template             Create or update the prebuilt RunPod template
   create               Create a RunPod devbox and save its SSH endpoint
   destroy              Delete the configured RunPod devbox
@@ -42,7 +43,7 @@ enabled() {
 
 command=${1:-}
 case ${command} in
-  template|create|destroy|show|check|sync|bootstrap|ssh|run) ;;
+  key|template|create|destroy|show|check|sync|bootstrap|ssh|run) ;;
   -h|--help|help)
     usage
     exit 0
@@ -68,6 +69,8 @@ port=${CUDA_DEVBOX_PORT:-22}
 remote_directory=${CUDA_DEVBOX_DIRECTORY:-/root/effect-torch}
 known_hosts=${CUDA_DEVBOX_KNOWN_HOSTS_FILE:-"${repository}/.cuda-devbox-known-hosts"}
 identity_file=${CUDA_DEVBOX_IDENTITY_FILE:-}
+managed_identity_file=${CUDA_DEVBOX_MANAGED_IDENTITY_FILE:-"${repository}/.cuda-devbox-ssh-key"}
+managed_public_key=${managed_identity_file}.pub
 
 pod_name=${CUDA_DEVBOX_NAME:-effect-torch-cuda}
 gpu_id=${CUDA_DEVBOX_GPU_ID:-NVIDIA RTX PRO 6000 Blackwell Server Edition}
@@ -91,7 +94,6 @@ write_connection_state() {
   local new_pod_id=$1
   local new_address=$2
   local new_port=$3
-  local new_identity_file=$4
   local config_directory temporary
 
   config_directory=$(dirname -- "${config}")
@@ -106,10 +108,64 @@ write_connection_state() {
     printf 'CUDA_DEVBOX_ADDRESS=%q\n' "${new_address}" >> "${temporary}"
     printf 'CUDA_DEVBOX_PORT=%q\n' "${new_port}" >> "${temporary}"
   fi
-  if [[ -n ${new_identity_file} && -z ${identity_file} ]]; then
-    printf 'CUDA_DEVBOX_IDENTITY_FILE=%q\n' "${new_identity_file}" >> "${temporary}"
-  fi
   mv "${temporary}" "${config}"
+}
+
+write_identity_state() {
+  local new_identity_file=$1
+  local config_directory temporary
+
+  config_directory=$(dirname -- "${config}")
+  [[ -d ${config_directory} ]] || fail "config directory does not exist: ${config_directory}"
+  temporary=$(mktemp "${config}.tmp.XXXXXX")
+  if [[ -f ${config} ]]; then
+    grep -Ev '^CUDA_DEVBOX_IDENTITY_FILE=' "${config}" > "${temporary}" || true
+  fi
+  printf 'CUDA_DEVBOX_IDENTITY_FILE=%q\n' "${new_identity_file}" >> "${temporary}"
+  mv "${temporary}" "${config}"
+}
+
+ensure_managed_key() {
+  local identity_directory key_data key_type public_key temporary
+
+  require_command ssh-keygen
+  identity_directory=$(dirname -- "${managed_identity_file}")
+  mkdir -p "${identity_directory}"
+  if [[ ! -f ${managed_identity_file} ]]; then
+    [[ ! -e ${managed_public_key} ]] ||
+      fail "public key exists without its private key: ${managed_public_key}"
+    umask 077
+    ssh-keygen -q -t ed25519 -N '' -C effect-torch-cuda-devbox -f "${managed_identity_file}"
+    printf 'Generated unencrypted SSH key: %s\n' "${managed_identity_file}"
+  fi
+  chmod 600 "${managed_identity_file}"
+  if ! public_key=$(ssh-keygen -y -P '' -f "${managed_identity_file}" 2>/dev/null); then
+    fail "managed identity must be an unencrypted private key: ${managed_identity_file}"
+  fi
+  read -r key_type key_data _ <<< "${public_key}"
+  [[ -n ${key_type} && -n ${key_data} ]] ||
+    fail "could not read the managed public key: ${managed_identity_file}"
+  temporary=$(mktemp "${managed_public_key}.tmp.XXXXXX")
+  printf '%s %s effect-torch-cuda-devbox\n' "${key_type}" "${key_data}" > "${temporary}"
+  chmod 644 "${temporary}"
+  mv "${temporary}" "${managed_public_key}"
+}
+
+register_managed_key() {
+  local fingerprint response
+
+  require_command runpodctl
+  require_command jq
+  read -r _ fingerprint _ < <(ssh-keygen -lf "${managed_public_key}" -E sha256)
+  response=$(runpodctl ssh list-keys --output json)
+  if printf '%s' "${response}" |
+    jq -e --arg fingerprint "${fingerprint}" \
+      '(.keys // [])[] | select(.fingerprint == $fingerprint)' >/dev/null; then
+    printf 'RunPod already has SSH key %s.\n' "${fingerprint}"
+    return 0
+  fi
+  runpodctl ssh add-key --key-file "${managed_public_key}" --output json
+  printf 'Registered SSH key %s with RunPod.\n' "${fingerprint}"
 }
 
 clear_connection_state() {
@@ -192,7 +248,7 @@ manage_template() {
 }
 
 wait_for_connection() {
-  local response ip resolved_port resolved_identity_file runtime_status runtime_reason
+  local response ip resolved_port runtime_status runtime_reason
   local startup_failure startup_failure_count startup_failure_message
   local deadline=$((SECONDS + wait_seconds))
 
@@ -201,14 +257,10 @@ wait_for_connection() {
     if response=$(runpodctl ssh info "${pod_id}" --output json 2>/dev/null); then
       ip=$(printf '%s' "${response}" | jq -r '.ip // empty')
       resolved_port=$(printf '%s' "${response}" | jq -r '.port // empty')
-      resolved_identity_file=$(printf '%s' "${response}" | jq -r '.ssh_key.path // empty')
       if [[ -n ${ip} && ${resolved_port} =~ ^[0-9]+$ && ${resolved_port} -ge 1 && ${resolved_port} -le 65535 ]]; then
         address="root@${ip}"
         port=${resolved_port}
-        if [[ ! -f ${resolved_identity_file} ]]; then
-          resolved_identity_file=
-        fi
-        write_connection_state "${pod_id}" "${address}" "${port}" "${resolved_identity_file}"
+        write_connection_state "${pod_id}" "${address}" "${port}"
         rm -f "${known_hosts}"
         printf 'Devbox ready: %s:%s (pod %s)\n' "${address}" "${port}" "${pod_id}"
         return 0
@@ -273,6 +325,8 @@ create_devbox() {
     *) fail "CUDA_DEVBOX_CLOUD_TYPE must be SECURE or COMMUNITY" ;;
   esac
 
+  configure_managed_key
+
   if [[ -n ${image} ]]; then
     arguments+=(--image "${image}")
   else
@@ -293,7 +347,7 @@ create_devbox() {
   fi
 
   pod_id=${new_pod_id}
-  write_connection_state "${pod_id}" "" "" ""
+  write_connection_state "${pod_id}" "" ""
   printf 'Created pod %s. Its ID is saved even if SSH setup times out.\n' "${pod_id}"
   wait_for_connection
 }
@@ -331,8 +385,30 @@ prepare_ssh() {
   if [[ -n ${identity_file} ]]; then
     [[ -f ${identity_file} ]] ||
       fail "identity file does not exist: ${identity_file}"
-    ssh_arguments+=(-i "${identity_file}")
+    ssh_arguments+=(-o "IdentitiesOnly=yes" -i "${identity_file}")
   fi
+}
+
+configure_managed_key() {
+  local public_key
+
+  ensure_managed_key
+  register_managed_key
+  if [[ -n ${address} ]]; then
+    prepare_ssh
+    public_key=$(<"${managed_public_key}")
+    printf '%s\n' "${public_key}" |
+      ssh "${ssh_arguments[@]}" "${address}" \
+        'umask 077; mkdir -p "$HOME/.ssh"; chmod 700 "$HOME/.ssh"; touch "$HOME/.ssh/authorized_keys"; chmod 600 "$HOME/.ssh/authorized_keys"; IFS= read -r key; grep -qxF -- "$key" "$HOME/.ssh/authorized_keys" || printf "\n%s\n" "$key" >> "$HOME/.ssh/authorized_keys"'
+  fi
+
+  identity_file=${managed_identity_file}
+  if [[ -n ${address} ]]; then
+    prepare_ssh
+    ssh "${ssh_arguments[@]}" -o "BatchMode=yes" "${address}" true
+  fi
+  write_identity_state "${identity_file}"
+  printf 'CUDA devbox identity: %s\n' "${identity_file}"
 }
 
 run_remote() {
@@ -345,16 +421,37 @@ run_remote() {
 }
 
 sync_worktree() {
+  local deleted_files=() file quoted_deleted_files
+
   printf 'Uploading worktree to %s:%s...\n' "${address}" "${remote_directory}"
+  while IFS= read -r -d '' file; do
+    deleted_files+=("${file}")
+  done < <(git -C "${repository}" ls-files --deleted -z)
+  if [[ ${#deleted_files[@]} -gt 0 ]]; then
+    printf -v quoted_deleted_files '%q ' "${deleted_files[@]}"
+    # Values are quoted before crossing the SSH boundary.
+    # shellcheck disable=SC2029
+    ssh "${ssh_arguments[@]}" "${address}" \
+      "mkdir -p ${quoted_remote_directory} && cd ${quoted_remote_directory} && rm -f -- ${quoted_deleted_files}"
+  fi
   # The repository is quoted before crossing the SSH boundary.
   # shellcheck disable=SC2029
   git -C "${repository}" ls-files --cached --others --exclude-standard -z |
+    while IFS= read -r -d '' file; do
+      if [[ -e ${repository}/${file} || -L ${repository}/${file} ]]; then
+        printf '%s\0' "${file}"
+      fi
+    done |
     tar --null -czf - -C "${repository}" -T - |
     ssh "${ssh_arguments[@]}" "${address}" \
       "mkdir -p ${quoted_remote_directory} && tar -xzf - -C ${quoted_remote_directory}"
 }
 
 case ${command} in
+  key)
+    [[ $# -eq 1 ]] || fail "key does not accept arguments"
+    configure_managed_key
+    ;;
   template)
     [[ $# -eq 1 ]] || fail "template does not accept arguments"
     manage_template
@@ -393,6 +490,6 @@ case ${command} in
     shift
     [[ $# -gt 0 ]] || fail "run requires a command"
     prepare_ssh
-    run_remote "$@"
+    run_remote nix develop .#cuda --command "$@"
     ;;
 esac

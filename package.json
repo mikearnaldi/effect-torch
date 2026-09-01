@@ -4,7 +4,7 @@
   "packageManager": "pnpm@10.13.1",
   "scripts": {
     "build": "pnpm run build:native:matrix && pnpm --filter @effect-torch/core run build",
-    "build:native:matrix": "node scripts/build-native.mjs --matrix && pnpm --filter @effect-torch/backend-cpu --filter @effect-torch/backend-apple-native --filter @effect-torch/tokenizers run build:ts && node scripts/verify-native-packages.mjs --artifacts",
+    "build:native:matrix": "node scripts/build-native.mjs --matrix && pnpm --filter @effect-torch/backend-cpu --filter @effect-torch/backend-apple-native --filter @effect-torch/backend-cuda --filter @effect-torch/tokenizers run build:ts && node scripts/verify-native-packages.mjs --artifacts",
     "test": "pnpm -r test",
     "typecheck": "pnpm -r typecheck",
     "generate:native-types": "node scripts/generate-native-declarations.mjs",
@@ -16,6 +16,8 @@
     "bench:inference": "pnpm --filter @effect-torch/bench bench:inference",
     "bench:mlx": "pnpm --filter @effect-torch/bench bench:mlx",
     "bench:muse-glimmer": "pnpm --filter @effect-torch/bench bench:muse-glimmer",
+    "bench:muse-glimmer-concurrency": "pnpm --filter @effect-torch/bench bench:muse-glimmer-concurrency",
+    "bench:muse-glimmer-sglang": "pnpm --filter @effect-torch/bench bench:muse-glimmer-sglang",
     "verify:native-packages": "node scripts/verify-native-packages.mjs"
   },
   "devDependencies": {

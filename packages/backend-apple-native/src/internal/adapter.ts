@@ -907,19 +907,31 @@ export const createRuntimeAdapter = (
           case "constant": {
             for (const exemplar of request.inputs) nativeGraph(exemplar, operation)
             return graph(
-              native.LazyTensor.constant(request.attributes.value, nativeDtype(request.attributes.dtype))
+              native.LazyTensor.constant(
+                request.attributes.value,
+                nativeDtype(request.attributes.dtype),
+                deviceOrdinal
+              )
             )
           }
           case "zeros": {
             for (const exemplar of request.inputs) nativeGraph(exemplar, operation)
             return graph(
-              native.LazyTensor.zeros([...request.attributes.shape], nativeDtype(request.attributes.dtype))
+              native.LazyTensor.zeros(
+                [...request.attributes.shape],
+                nativeDtype(request.attributes.dtype),
+                deviceOrdinal
+              )
             )
           }
           case "ones": {
             for (const exemplar of request.inputs) nativeGraph(exemplar, operation)
             return graph(
-              native.LazyTensor.ones([...request.attributes.shape], nativeDtype(request.attributes.dtype))
+              native.LazyTensor.ones(
+                [...request.attributes.shape],
+                nativeDtype(request.attributes.dtype),
+                deviceOrdinal
+              )
             )
           }
           case "full": {
@@ -928,13 +940,18 @@ export const createRuntimeAdapter = (
               native.LazyTensor.full(
                 [...request.attributes.shape],
                 request.attributes.value,
-                nativeDtype(request.attributes.dtype)
+                nativeDtype(request.attributes.dtype),
+                deviceOrdinal
               )
             )
           }
           case "randn":
             return graph(
-              native.LazyTensor.randn([...request.attributes.shape], nativeDtype(request.attributes.dtype))
+              native.LazyTensor.randn(
+                [...request.attributes.shape],
+                nativeDtype(request.attributes.dtype),
+                deviceOrdinal
+              )
             )
           case "uniform":
             return graph(
@@ -942,7 +959,8 @@ export const createRuntimeAdapter = (
                 [...request.attributes.shape],
                 request.attributes.lo,
                 request.attributes.hi,
-                nativeDtype(request.attributes.dtype)
+                nativeDtype(request.attributes.dtype),
+                deviceOrdinal
               )
             )
           case "arange":
@@ -951,17 +969,25 @@ export const createRuntimeAdapter = (
                 request.attributes.start,
                 request.attributes.end,
                 request.attributes.step,
-                nativeDtype(request.attributes.dtype)
+                nativeDtype(request.attributes.dtype),
+                deviceOrdinal
               )
             )
           case "eye":
-            return graph(native.LazyTensor.eye(request.attributes.n, nativeDtype(request.attributes.dtype)))
+            return graph(
+              native.LazyTensor.eye(
+                request.attributes.n,
+                nativeDtype(request.attributes.dtype),
+                deviceOrdinal
+              )
+            )
           case "fromBytes":
             return graph(
               native.LazyTensor.fromBytes(
                 request.attributes.data,
                 [...request.attributes.shape],
-                nativeDtype(request.attributes.dtype)
+                nativeDtype(request.attributes.dtype),
+                deviceOrdinal
               )
             )
           case "input": {
@@ -974,7 +1000,8 @@ export const createRuntimeAdapter = (
               native.LazyTensor.input(
                 request.attributes.slot,
                 [...(storage?.physicalShape ?? request.attributes.shape)],
-                nativeDtype(storage?.physicalDtype ?? request.attributes.dtype)
+                nativeDtype(storage?.physicalDtype ?? request.attributes.dtype),
+                deviceOrdinal
               ),
               {
                 shape: request.attributes.shape,
@@ -987,7 +1014,8 @@ export const createRuntimeAdapter = (
             return graph(
               native.LazyTensor.scalarInput(
                 request.attributes.slot,
-                nativeDtype(request.attributes.dtype)
+                nativeDtype(request.attributes.dtype),
+                deviceOrdinal
               )
             )
           case "add":

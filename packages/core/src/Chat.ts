@@ -80,11 +80,11 @@ export interface ChatMessage<Value = unknown> {
  * Chat coordinates these operations but does not define normalization or
  * vocabulary rules. The implementation must use one vocabulary consistently
  * across template special token strings, `encode`, `decode`, `tokenToId`,
- * `idToToken`, and the inference program's logits indices. Chat repeatedly
- * calls `decode` on growing id arrays
- * with `skipSpecialTokens: true`; emitted text assumes each result starts with
- * the previous result. Control strings must map directly to one id rather than
- * requiring `encode` into multiple ids.
+ * `idToToken`, and the inference program's logits indices. Chat uses
+ * `decodeStream` when supplied. Otherwise it repeatedly calls `decode` on
+ * growing id arrays with `skipSpecialTokens: true`; emitted text assumes each
+ * result starts with the previous result. Control strings must map directly to
+ * one id rather than requiring `encode` into multiple ids.
  *
  * @since 0.1.0
  * @category models
@@ -113,6 +113,12 @@ export interface ChatTokenizer<E = never, Value = unknown> {
     ids: ReadonlyArray<number>,
     options?: { readonly skipSpecialTokens?: boolean | undefined }
   ) => Effect.Effect<string, E>
+  /** Creates an independent incremental decoder for generated content. */
+  readonly decodeStream?:
+    | ((options?: { readonly skipSpecialTokens?: boolean | undefined }) => {
+      readonly step: (id: number) => Effect.Effect<string | undefined, E>
+    })
+    | undefined
   /** Resolves an atomic control-token string to its vocabulary id. */
   readonly tokenToId: (token: string) => Option.Option<number>
   /** Resolves `bosTokenId` to the template string injected as `bos_token`. */
@@ -458,9 +464,9 @@ interface Parser<E> {
 }
 
 // The parser works at the token level, so delimiters must be atomic ids. It
-// decodes each complete accumulated id list, allowing byte/BPE fragments to
-// settle before emitting a delta. Append-only events require prefix-stable
-// output and cannot represent a tokenizer that revises old text.
+// prefers a stateful decoder and otherwise decodes each accumulated id list,
+// allowing byte/BPE fragments to settle before emitting a delta. Append-only
+// events require prefix-stable output.
 const makeParser = <E, Value>(
   tokenizer: ChatTokenizer<E, Value>,
   controls: ResolvedControls | undefined,
@@ -476,6 +482,26 @@ const makeParser = <E, Value>(
   let segmentIndex = 0
   let current: ChatSegment | undefined
   const completed: Array<CompletedChatSegment> = []
+  const newContentDecoder = () => tokenizer.decodeStream?.({ skipSpecialTokens: true })
+  let contentDecoder = controls === undefined ? newContentDecoder() : undefined
+
+  const decodeContent = (token: number): Effect.Effect<string, E> => {
+    if (contentDecoder !== undefined) {
+      return Effect.map(contentDecoder.step(token), (delta) => {
+        if (delta === undefined) return ""
+        content += delta
+        return delta
+      })
+    }
+    return Effect.map(
+      tokenizer.decode(contentIds, { skipSpecialTokens: true }),
+      (text) => {
+        const delta = text.slice(content.length)
+        content = text
+        return delta
+      }
+    )
+  }
 
   const begin = (): ChatEvent => {
     current = {
@@ -495,6 +521,7 @@ const makeParser = <E, Value>(
     headerIds = []
     contentIds = []
     content = ""
+    contentDecoder = undefined
     if (finish === "turn" || finish === "limit") state = "done"
     else state = "seekStart"
     return [event]
@@ -507,9 +534,7 @@ const makeParser = <E, Value>(
           const events: Array<ChatEvent> = []
           if (current === undefined) events.push(begin())
           contentIds.push(token)
-          const text = yield* tokenizer.decode(contentIds, { skipSpecialTokens: true })
-          const delta = text.slice(content.length)
-          content = text
+          const delta = yield* decodeContent(token)
           if (delta.length > 0 && current !== undefined) {
             events.push({ _tag: "delta", segment: current, text: delta })
           }
@@ -547,15 +572,14 @@ const makeParser = <E, Value>(
           headerIds = []
           contentIds = []
           content = ""
+          contentDecoder = newContentDecoder()
           return [begin()]
         }
         if (token === controls.endOfMessage || token === controls.endOfTurn) {
           return end(token === controls.endOfMessage ? "message" : "turn")
         }
         contentIds.push(token)
-        const text = yield* tokenizer.decode(contentIds, { skipSpecialTokens: true })
-        const delta = text.slice(content.length)
-        content = text
+        const delta = yield* decodeContent(token)
         return delta.length > 0 && current !== undefined
           ? [{ _tag: "delta", segment: current, text: delta }]
           : []

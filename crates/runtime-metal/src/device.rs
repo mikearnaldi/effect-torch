@@ -43,11 +43,12 @@
 //! once. Later execution uses the captured values.
 
 use crate::runtime::dtype::DType;
+use effect_torch_runtime::{DeviceId, Placement};
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_metal::{
     MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder,
-    MTLComputePipelineState, MTLDevice, MTLLibrary, MTLResourceOptions, MTLSize,
+    MTLComputePipelineState, MTLDevice, MTLLibrary, MTLResource, MTLResourceOptions, MTLSize,
 };
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -86,6 +87,19 @@ thread_local! {
     /// Device selected for operations that still use `MetalDevice::get`. N-API
     /// entry points set this for the duration of one synchronous worker job.
     static CURRENT_DEVICE_ORDINAL: Cell<usize> = const { Cell::new(0) };
+}
+
+fn metal_placement(ordinal: u32) -> Placement {
+    Placement::with_memory_space(DeviceId::new(format!("metal:{ordinal}")), "shared")
+}
+
+fn buffer_device_ordinal(raw: &ProtocolObject<dyn MTLBuffer>) -> u32 {
+    let registry_id = raw.device().registryID();
+    let ordinal = objc2_metal::MTLCopyAllDevices()
+        .iter()
+        .position(|device| device.registryID() == registry_id)
+        .expect("Metal buffer device is not present in the system device list");
+    u32::try_from(ordinal).expect("Metal device ordinal must fit u32")
 }
 
 static DEVICES: OnceLock<Mutex<HashMap<usize, &'static MetalDevice>>> = OnceLock::new();
@@ -173,38 +187,39 @@ fn live_bytes_untrack(size: usize) {
 // environment cap, or half the recommended working set when no cap is set,
 // the runtime retires dead buckets and waits for the oldest in-flight command
 // buffer. Steps below the budget do not wait.
-fn memory_budget() -> usize {
-    static BUDGET: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *BUDGET.get_or_init(|| {
-        let recommended = MetalDevice::get().raw.recommendedMaxWorkingSetSize() as usize;
-        let budget = match std::env::var("EFFECT_TORCH_MEMORY_BUDGET_MB") {
-            Ok(v) => {
-                v.parse::<usize>()
+fn memory_budget(raw: &ProtocolObject<dyn MTLDevice>) -> usize {
+    static OVERRIDE: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    let override_bytes = *OVERRIDE.get_or_init(|| {
+        std::env::var("EFFECT_TORCH_MEMORY_BUDGET_MB")
+            .ok()
+            .map(|value| {
+                value
+                    .parse::<usize>()
                     .expect("EFFECT_TORCH_MEMORY_BUDGET_MB: not a number")
                     * 1024
                     * 1024
-            }
-            Err(_) => match memory_cap() {
-                Some(cap) => cap.min(recommended / 2),
-                None => recommended / 2,
-            },
-        };
-        if std::env::var_os("EFFECT_TORCH_SYNC_TRACE").is_some() {
-            eprintln!(
-                "[sync] memory budget {} MB (recommended working set {} MB)",
-                budget >> 20,
-                recommended >> 20
-            );
-        }
-        budget
-    })
+            })
+    });
+    let recommended = raw.recommendedMaxWorkingSetSize() as usize;
+    let budget = override_bytes.unwrap_or_else(|| match memory_cap() {
+        Some(cap) => cap.min(recommended / 2),
+        None => recommended / 2,
+    });
+    if std::env::var_os("EFFECT_TORCH_SYNC_TRACE").is_some() {
+        eprintln!(
+            "[sync] memory budget {} MB (recommended working set {} MB)",
+            budget >> 20,
+            recommended >> 20
+        );
+    }
+    budget
 }
 
 /// Reads and stores process-global memory policy during compilation. Later
 /// execution uses the stored values.
 pub fn snapshot_global_environment() {
     let _ = memory_cap();
-    let _ = memory_budget();
+    let _ = MetalDevice::get().memory_budget;
 }
 
 /// Resets and returns the (dispatches, syncs, sync-nanos) counters.
@@ -376,6 +391,8 @@ pub struct Buffer {
     // Byte offset of this buffer's start within `raw`; planned slices share
     // one underlying MTLBuffer.
     pub base: usize,
+    device_ordinal: u32,
+    placement: Placement,
     // Shared by every view of one physical allocation.
     usage: Arc<BufferUsage>,
     _owner: Option<Arc<Buffer>>,
@@ -387,10 +404,13 @@ impl Buffer {
     /// bytes, outside the pool and without live-byte accounting.
     pub fn from_raw(raw: Retained<ProtocolObject<dyn MTLBuffer>>, size: usize) -> Self {
         let usage = Arc::new(BufferUsage::new(&raw, None));
+        let device_ordinal = buffer_device_ordinal(&raw);
         Buffer {
             raw,
             size,
             base: 0,
+            device_ordinal,
+            placement: metal_placement(device_ordinal),
             usage,
             _owner: None,
             _retention: None,
@@ -420,10 +440,20 @@ impl Buffer {
             raw: segment.raw.clone(),
             size,
             base: segment.base + base,
+            device_ordinal: segment.device_ordinal,
+            placement: segment.placement.clone(),
             usage: segment.usage.clone(),
             _owner: Some(segment.clone()),
             _retention: retention,
         }
+    }
+
+    pub fn device_ordinal(&self) -> u32 {
+        self.device_ordinal
+    }
+
+    pub fn placement(&self) -> &Placement {
+        &self.placement
     }
 
     /// Host pointer to this view's shared storage. Synchronize first because the
@@ -1138,6 +1168,9 @@ impl Drop for MetalSubmissionGuard<'_> {
 /// registry of live submission contexts (used for global backpressure).
 pub struct MetalDevice {
     id: u64,
+    ordinal: u32,
+    placement: Placement,
+    memory_budget: usize,
     raw: Retained<ProtocolObject<dyn MTLDevice>>,
     queue: Retained<ProtocolObject<dyn MTLCommandQueue>>,
     allocator: Mutex<Allocator>,
@@ -1343,8 +1376,14 @@ impl MetalDevice {
         let queue = raw
             .newCommandQueue()
             .ok_or("failed to create command queue")?;
+        let ordinal = u32::try_from(ordinal)
+            .map_err(|_| "Metal device ordinal exceeds u32::MAX".to_string())?;
+        let memory_budget = memory_budget(&raw);
         Ok(MetalDevice {
             id: DEVICE_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            ordinal,
+            placement: metal_placement(ordinal),
+            memory_budget,
             raw,
             queue,
             allocator: Mutex::new(Allocator::new()),
@@ -1357,6 +1396,10 @@ impl MetalDevice {
     /// The underlying `MTLDevice` handle.
     pub fn raw(&self) -> &ProtocolObject<dyn MTLDevice> {
         &self.raw
+    }
+
+    pub fn ordinal(&self) -> u32 {
+        self.ordinal
     }
 
     fn device_id(&self) -> u64 {
@@ -1462,7 +1505,7 @@ impl MetalDevice {
     // The registry is snapshotted before waiting; no device allocator lock is
     // held while a command buffer completes.
     fn backpressure(&self) {
-        if self.raw.currentAllocatedSize() <= memory_budget() {
+        if self.raw.currentAllocatedSize() <= self.memory_budget {
             return;
         }
         let contexts = self.submission_snapshot();
@@ -1491,10 +1534,10 @@ impl MetalDevice {
             eprintln!(
                 "[sync] backpressure at {} MB driver-allocated (budget {} MB)",
                 self.raw.currentAllocatedSize() >> 20,
-                memory_budget() >> 20
+                self.memory_budget >> 20
             );
         }
-        while self.raw.currentAllocatedSize() > memory_budget() {
+        while self.raw.currentAllocatedSize() > self.memory_budget {
             let Some(context) = contexts
                 .iter()
                 .filter_map(|context| {
@@ -1573,6 +1616,8 @@ impl MetalDevice {
             raw,
             size: bucket_size,
             base: 0,
+            device_ordinal: self.ordinal,
+            placement: self.placement.clone(),
             usage,
             _owner: None,
             _retention: None,
@@ -1611,6 +1656,8 @@ impl MetalDevice {
             raw,
             size: size.max(1),
             base: 0,
+            device_ordinal: self.ordinal,
+            placement: self.placement.clone(),
             usage,
             _owner: None,
             _retention: None,
@@ -1678,6 +1725,8 @@ impl MetalDevice {
             raw,
             size,
             base: 0,
+            device_ordinal: self.ordinal,
+            placement: self.placement.clone(),
             usage,
             _owner: None,
             _retention: None,

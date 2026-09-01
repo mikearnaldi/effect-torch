@@ -4,53 +4,57 @@ effect-torch is a native tensor runtime and machine-learning system for
 TypeScript applications built with [Effect](https://effect.website).
 
 The public API is backend-neutral TypeScript. Rust implements the execution
-engine in this repository, including the graph IR, autodiff, compilation, CPU
-and Metal kernels, memory management, and Node-API bindings.
+engine in this repository, including the graph IR, autodiff, compilation, CPU,
+Metal, and CUDA kernels, memory management, and Node-API bindings.
 
 Implemented features include:
 
 - A lazy semantic tensor graph with strict shape, dtype, and placement checks.
 - Reverse-mode autodiff, VJP, JVP, vmap, and gradient checkpointing.
 - Reusable executable compilation with bounded caches partitioned by runtime.
-- Independent native CPU and Apple Metal backends.
+- Independent native CPU and Apple Metal backends, plus an experimental CUDA
+  backend for x64 Linux.
 - Pure model, optimizer, trainer, checkpoint, and learning-rate APIs.
-- Compiled training and paged KV-cache inference with batched decode.
-- Native safetensors I/O and a standalone tokenizer package.
+- Compiled training and paged KV-cache inference with batched and speculative
+  decode.
+- Native safetensors and GGUF loading, including GGML K-quantized inference
+  weights.
+- Chat-template rendering, streaming chat generation, and a standalone
+  tokenizer package.
 - Structured Effect errors, interruption, cancellation, and explicit resource
   release.
-- A 14-artifact release build that compiles Darwin binaries natively on macOS
-  and cross-compiles Linux binaries in the same run.
+
+Repository setup and contributor workflows are documented in
+[DEVELOPMENT.md](DEVELOPMENT.md).
 
 ## Contents
 
 - [Packages](#packages)
 - [Quick start](#quick-start)
 - [Programming model](#programming-model)
-- [Architecture](#architecture)
 - [Backend capabilities](#backend-capabilities)
 - [Public API](#public-api)
 - [Compilation](#compilation)
 - [Models and training](#models-and-training)
 - [Compiled inference](#compiled-inference)
+- [GGUF models](#gguf-models)
+- [Chat](#chat)
 - [Safetensors](#safetensors)
 - [Tokenizers](#tokenizers)
 - [Errors and cancellation](#errors-and-cancellation)
 - [Native distribution](#native-distribution)
-- [Development](#development)
-- [Repository layout](#repository-layout)
 - [Current constraints](#current-constraints)
-- [Design documents](#design-documents)
+- [Development](DEVELOPMENT.md)
 
 ## Packages
 
-| Package                              | Responsibility                                                                  |
-| ------------------------------------ | ------------------------------------------------------------------------------- |
-| `@effect-torch/core`                 | Backend-neutral tensors, autodiff, compilation, models, training, and inference |
-| `@effect-torch/backend-cpu`          | CPU Runtime Layer and CPU-owned native addon                                    |
-| `@effect-torch/backend-apple-native` | Apple Metal Runtime Layer and Metal-owned native addon                          |
-| `@effect-torch/tokenizers`           | Native tokenizer loading, encoding, decoding, and training                      |
-| `@effect-torch/examples`             | Private runnable examples                                                       |
-| `@effect-torch/bench`                | Private CPU, Metal, and optional MLX benchmarks                                 |
+| Package                              | Responsibility                                                                    |
+| ------------------------------------ | --------------------------------------------------------------------------------- |
+| `@effect-torch/core`                 | Backend-neutral tensors, compilation, models, training, GGUF, chat, and inference |
+| `@effect-torch/backend-cpu`          | CPU Runtime Layer and CPU-owned native addon                                      |
+| `@effect-torch/backend-apple-native` | Apple Metal Runtime Layer and Metal-owned native addon                            |
+| `@effect-torch/backend-cuda`         | Experimental CUDA Runtime Layer and Linux x64 native addon                        |
+| `@effect-torch/tokenizers`           | Native tokenizer loading, encoding, decoding, and training                        |
 
 `@effect-torch/core` has no dependency on a concrete backend. Applications
 select a backend by providing its runtime Layer to the Effect program.
@@ -61,7 +65,7 @@ tensor runtime.
 
 ## Quick start
 
-These scoped packages are available only from this workspace; npm does not
+The packages listed above are available only from this workspace; npm does not
 publish them yet. The examples use the workspace names, which are also the
 intended distribution names.
 
@@ -69,53 +73,8 @@ The repository pins `effect@4.0.0-beta.101`. Projects using these packages must
 use the compatible Effect 4 beta release line. The unqualified `effect` package
 on npm is Effect 3 and is not API-compatible.
 
-From a repository checkout, prepare the environment and a host CPU addon:
-
-```bash
-direnv allow
-pnpm install
-pnpm --filter @effect-torch/backend-cpu build:debug
-```
-
-Manage a disposable Blackwell CUDA devbox from the default Nix shell:
-
-```bash
-nix develop
-cp .cuda-devbox.env.example .cuda-devbox.env
-runpodctl doctor
-./scripts/cuda-devbox.sh template
-./scripts/cuda-devbox.sh create
-./scripts/cuda-devbox.sh bootstrap
-# Work on the pod, then stop billing when finished.
-./scripts/cuda-devbox.sh destroy
-```
-
-The `CUDA devbox image` GitHub workflow publishes
-`ghcr.io/mikearnaldi/effect-torch:cuda-devbox` when its dependency inputs change
-on `main`. The GHCR package must be public before RunPod can pull it. Run
-`template` after the first image build. It resolves the image tag to an immutable
-digest, creates or updates a RunPod template, and saves the template ID in the
-ignored `.cuda-devbox.env`. Later image builds require another `template` run to
-move that RunPod template to the new digest.
-
-The image extends RunPod's pinned Ubuntu base. It contains Determinate Nix, the
-`.#cuda` closure, the Rust toolchain, and warm pnpm and Cargo caches. `bootstrap`
-still reconciles changed lockfiles and runs the CUDA kernel, NVRTC, and cuBLASLt
-checks. If no managed template exists, `create` falls back to the official RunPod
-PyTorch template and `bootstrap` performs the full installation.
-
-`create` requests one RTX PRO 6000 Blackwell and saves the pod ID, SSH address,
-and port. Change the GPU, cloud, disk size, or other creation settings in
-`.cuda-devbox.env`. Community Cloud requires `CUDA_DEVBOX_PUBLIC_IP=1` for
-direct SSH. You can use an existing pod by setting `CUDA_DEVBOX_POD_ID`,
-`CUDA_DEVBOX_ADDRESS`, and `CUDA_DEVBOX_PORT`.
-
-`sync` uploads the non-ignored worktree. The flake pins CUDA 12.9 and compiles
-the check for Blackwell `sm_120`. The default development shell remains
-CUDA-free on macOS. Use `./scripts/cuda-devbox.sh ssh` for an interactive
-connection or `./scripts/cuda-devbox.sh run <command>` to run a command in the
-remote repository. Set `EFFECT_TORCH_CUDA_DEVBOX_CONFIG` to use a config file
-outside the repository.
+To run the examples from a checkout, follow the setup and native build steps in
+[DEVELOPMENT.md](DEVELOPMENT.md).
 
 A minimal CPU application looks like this:
 
@@ -144,11 +103,7 @@ const result = await Effect.runPromise(
 )
 ```
 
-To use Metal on macOS, build and provide the Apple backend:
-
-```bash
-pnpm --filter @effect-torch/backend-apple-native build:debug
-```
+To use Metal on macOS, provide the Apple backend instead:
 
 ```ts
 import * as BackendApple from "@effect-torch/backend-apple-native"
@@ -178,6 +133,20 @@ platform or architecture is unsupported, an artifact is missing, or Metal
 cannot create a device, command queue, or shared event.
 `BackendApple.layer()` returns a Layer without loading the addon. Effect loads
 it when it builds that Layer to provide the Metal runtime.
+
+The experimental CUDA package uses the same lazy interface:
+
+```ts
+import * as BackendCuda from "@effect-torch/backend-cuda"
+import { Effect } from "effect"
+
+const cudaAvailable = await Effect.runPromise(BackendCuda.isAvailable)
+const cudaLayer = BackendCuda.layer({ device: 0 })
+```
+
+Its packaged addon supports x64 Linux with glibc. Importing the entrypoint on
+another platform is safe; `isAvailable` returns `false` without selecting a
+CPU fallback.
 
 ## Programming model
 
@@ -213,15 +182,15 @@ import { Layer } from "effect"
 declare const layer: Layer.Layer<Runtime.Runtime>
 ```
 
-The Apple backend package exposes `layer(options?)`, which returns a Layer for
-`metal:0` by default or for the requested `device`.
+The Apple and CUDA backend packages expose `layer(options?)`. They select
+`metal:0` or `cuda:0` by default and accept a zero-based `device` ordinal.
 
 Each Layer constructs its `RuntimeService` the first time Effect builds it.
 Later builds reuse the same service object, which keeps runtime identity and
 native caches stable without exposing a public constructor.
 
-The CPU package selects and loads its native addon when imported. The Apple
-package waits until `isAvailable` runs or Effect builds its Layer.
+The CPU package selects and loads its native addon when imported. The Apple and
+CUDA packages wait until `isAvailable` runs or Effect builds their Layer.
 
 ### Lazy and concrete tensors
 
@@ -331,7 +300,7 @@ external byte count when available.
 
 ### Dtypes
 
-The tensor dtype vocabulary is:
+Every tensor handle reports one logical dtype:
 
 ```ts
 type DType =
@@ -344,209 +313,54 @@ type DType =
   | "u32"
 ```
 
-Operations require matching dtypes. `Tensor.cast` performs explicit conversion.
-One exception applies when a 0-dimensional floating scalar is combined with a
-non-scalar floating tensor: the runtime coerces the scalar to the tensor's
-dtype. This lets runtime learning-rate scalars participate in BF16 graphs
-without changing tensor storage.
+The host transfer types are fixed by that logical dtype:
 
-JavaScript has no BF16 typed array. Reading an F16 or BF16 tensor returns a
-`Float32Array`. `Tensor.toNumberArray` rejects I64 to avoid silently converting
-bigints to numbers.
+| Dtype  | Meaning                 | `Tensor.fromTypedArray` | `Tensor.toTypedArray` |
+| ------ | ----------------------- | ----------------------- | --------------------- |
+| `f32`  | 32-bit float            | `Float32Array`          | `Float32Array`        |
+| `f64`  | 64-bit float            | `Float64Array`          | `Float64Array`        |
+| `f16`  | IEEE 16-bit float       | `Float16Array`          | `Float32Array`        |
+| `bf16` | Brain floating point    | No direct host type     | `Float32Array`        |
+| `i64`  | Signed 64-bit integer   | `BigInt64Array`         | `BigInt64Array`       |
+| `u8`   | Unsigned 8-bit integer  | `Uint8Array`            | `Uint8Array`          |
+| `u32`  | Unsigned 32-bit integer | `Uint32Array`           | `Uint32Array`         |
 
-## Architecture
+`fromTypedArray` snapshots the supplied view and infers the dtype shown
+above. Construct BF16 values with a dtype option or `Tensor.cast`. Readback
+widens F16 and BF16 values rather than exposing their storage bits.
+`Tensor.toNumberArray` accepts every dtype except I64, whose full range cannot
+be represented by JavaScript numbers.
 
-```text
-Application Effect program
-            |
-            v
-@effect-torch/core
-  backend-neutral TypeScript API
-  Runtime service contract
-  lazy/concrete opaque handles
-            |
-            +-------------------------------+
-            |                               |
-            v                               v
-@effect-torch/backend-cpu          @effect-torch/backend-apple-native
-  CPU adapter                         Metal adapter
-  CPU handle registry                 Metal handle registry
-  CPU N-API surface                   Metal N-API surface
-            |                               |
-            v                               v
-effect-torch-runtime-cpu            effect-torch-runtime-metal
-  CPU buffers and kernels              Metal buffers and kernels
-  typed CPU executable                  typed Metal executable
-            |                               |
-            +---------------+---------------+
-                            |
-                  statically linked crates
-      runtime, graph, compiler, autodiff, and N-API helpers
+Constructors default to F32 unless their contract says otherwise. Random
+constructors accept floating dtypes, `linspace` accepts F32 or F64, and
+`constantLike`, `zerosLike`, `onesLike`, and `fullLike` preserve the source
+tensor's dtype and placement.
 
-@effect-torch/tokenizers is a separate TypeScript + Rust N-API package.
-It does not participate in Runtime.Runtime.
-```
+Most operations do not promote mixed dtypes. Use `Tensor.cast` to request an
+explicit conversion, subject to backend support. One narrow exception applies
+to the binary elementwise and comparison functions: when exactly one operand
+is a 0-dimensional float and the other is a non-scalar float of another
+dtype, the scalar is coerced to the non-scalar dtype. Arithmetic results keep
+that dtype; comparisons return U8. Other operations still enforce their own
+dtype contracts.
 
-### TypeScript boundary
+A runtime's `capabilities.dtypes` array means that it can represent those
+logical dtypes. It does not promise that every operation accepts every listed
+dtype. For example, CPU stores F16 and BF16 but rejects half-precision matmul,
+and Metal rejects F64 when the graph node is constructed.
 
-`@effect-torch/core` defines the public contract:
+#### Encoded and state storage
 
-- `RuntimeService` defines graph construction, compilation, execution,
-  autodiff, readback, release, and the backend extensions required by
-  higher-level APIs.
-- Tensor handles expose only immutable shape, dtype, device, and placement
-  metadata.
-- Higher-level APIs use the Runtime service without importing CPU or Metal
-  code. Applications select a backend through an Effect Layer.
+GGML `Q2_K`, `Q3_K`, `Q4_K`, `Q5_K`, and `Q6_K` are storage encodings, not
+members of `DType`. A quantized GGUF weight remains a logical F32 tensor. Its
+`storage` metadata records the encoding, a packed physical shape, and physical
+dtype U8. Dedicated operations such as `Tensor.embedding` and
+`Tensor.linearRows` can consume supported encoded weights. Ordinary dense
+operations and `Tensor.toTypedArray` may reject the packed layout.
 
-The CPU and Metal adapters translate between the public contract and their own
-native addon. They validate every handle before native code receives it and map
-native failures into structured `Runtime.BackendError` values.
-
-### Rust crates
-
-| Crate                        | Responsibility                                                                                        |
-| ---------------------------- | ----------------------------------------------------------------------------------------------------- |
-| `effect-torch-runtime`       | Dtypes, layouts, dense IDs, signatures, memory/diagnostic contracts, ownership, cancellation          |
-| `effect-torch-graph`         | Nongeneric semantic `Node`/`NodeKind` graph, metadata, leaves, and semantic traversal                 |
-| `effect-torch-compiler`      | Requests, shared graph index, side-table regions, `KernelExpr`, typed lowered tables, memory planning |
-| `effect-torch-autodiff`      | Reverse-mode graph transformation, vmap, JVP/VJP, and checkpoint semantics                            |
-| `effect-torch-napi`          | Backend-neutral cancellation, async execution, and byte-buffer helpers                                |
-| `effect-torch-runtime-cpu`   | CPU values/instructions, lowering, kernels, physical execution, storage, and CPU N-API addon          |
-| `effect-torch-runtime-metal` | Metal values/instructions, lowering, pipelines, physical execution, storage, and Metal N-API addon    |
-| `effect-torch-tokenizers`    | Tokenizer-only N-API addon backed by the Rust `tokenizers` crate                                      |
-
-The direct shared-crate dependencies keep autodiff independent of the compiler:
-
-```text
-effect-torch-graph --------> effect-torch-runtime
-effect-torch-autodiff -----> effect-torch-graph, effect-torch-runtime
-effect-torch-compiler -----> effect-torch-graph, effect-torch-runtime
-
-runtime-cpu and runtime-metal consume graph, compiler, runtime, and, for their
-Node-API graph/autodiff surface, autodiff.
-```
-
-The compiler driver and typed tables use internal static dispatch; they do not
-define a stable plugin ABI. Each Node addon statically links the shared Rust
-crates it needs.
-
-### Independent native backends
-
-CPU and Metal use separate addons rather than selecting features in one shared
-addon.
-Each runtime crate owns:
-
-- Its concrete tensor value type.
-- Its typed lowered values, instructions, algorithms, and physical executor.
-- Its N-API classes and functions.
-- Its safetensors integration.
-- Its native `cdylib` output.
-
-The CPU addon has no Metal branches or imports. The Metal addon has no CPU
-branches or imports. Apple artifacts are Darwin-only and link Metal.framework.
-Release checks verify that CPU artifacts do not link Metal.framework.
-
-`effect-torch-napi` remains an `rlib` with backend-neutral utilities only. No
-Rust object crosses between separately loaded `.node` files.
-
-### Graph and execution engine
-
-The native graph stores nongeneric semantic operations, child relationships,
-shape, dtype, placement, and leaf ownership. Compilation accepts one
-`ProgramRequest` and creates one `PreparedProgram` and stack-safe `GraphIndex`.
-Dense side tables store topology, consumers, roots, slots, generated leaves,
-and random provenance. Shared nodes appear once, and the compiler preserves
-caller root order. It collects generated leaves once for structural-cache
-lookup, insertion, and binding.
-
-Autodiff, vmap, and checkpointing construct semantic graphs before compilation.
-Stateful inference uses the compiler specialization shared by CPU and Metal to
-create its decode graph and state-cursor contract. The compiler indexes that
-specialized graph once.
-
-CPU and Metal lower the prepared graph into backend-typed `LoweredProgram`
-values and instructions. Each instruction declares its inputs, outputs, scratch,
-staging, status, state, and effects. The memory planner consumes those exact
-declarations. Backend physical plans add synchronization by `InstructionId`
-without duplicating tensor definitions. Execution binds the fixed plan to an
-invocation frame and returns independently owned output storage.
-
-Invocation does not traverse a semantic graph, run fusion, discover
-intermediate allocations, compile pipelines, or fall back to another execution
-engine. `optimize: false` uses the same typed lowering, memory planning,
-ownership, and execution path with optional regions disabled.
-
-### Compiler and fusion
-
-The compiler records elementwise, fused-reduction, multi-output, GEMM-epilogue,
-and optimizer choices as regions over `GraphIndex`. These are code-generation
-side tables, not semantic `Fused*` node kinds. Multi-output selection uses a
-region dependency DAG and bounded worklist. Split regions may duplicate a
-prefix expression when required to preserve transitive ancestry.
-
-`KernelExpr` contains the scalar expression evaluated by a fused instruction.
-Backend lowering converts regions and uncovered semantic nodes directly into
-typed CPU or Metal instructions while retaining algorithm and resource plans.
-Executable compilation prepares required Metal pipelines. Compilation records
-phase timings and derives instruction, memory, command, synchronization, and
-region-work metrics from the resulting plans.
-
-The compiler and runtimes implement:
-
-- CPU elementwise and reduction fusion for F32 and F64.
-- Metal elementwise and reduction fusion for F32 and BF16.
-- Multi-output shared-prefix fusion and GEMM residual/GELU epilogues.
-- Typed semantic-kernel instructions for layer normalization, loss, attention,
-  KDA, convolution, rotary operations, and paged KV state where supported.
-- Deterministic liveness-based segmented memory plans and runtime-owned
-  workspace/output pools.
-
-Executable compile options control optimization and inference-only constant
-weights. `ExecutableCompileOptions` no longer contains the unused
-precision option because no lowering policy uses it. Trainer mixed-BF16 uses a
-separate graph and training policy.
-
-### CPU runtime
-
-The CPU runtime owns typed host buffers and implements tensor operations in
-Rust. F32 and F64 GEMM use `matrixmultiply`; other operations use repository
-kernels and composed primitives. It includes convolution, indexing, reduction,
-pooling, random generation, linalg, safetensors, typed executable lowering and
-execution, fusion kernels, KV-cache execution, and the CPU N-API bindings.
-
-The adapter returns structured errors for unsupported operations. The CPU
-runtime stores F16 and BF16 tensors but does not implement half-precision
-matmul.
-
-### Metal runtime
-
-The Metal runtime calls Apple's Metal APIs through `objc2`.
-It owns device buffers, command encoding, pipeline caches, generated Metal
-shader source, GEMM, flash attention, convolutions, indexing, rotary kernels,
-paged KV-cache operations, fusion kernels, typed lowering, physical instruction
-plans, and runtime-owned segmented storage pools.
-
-Each invocation owns its submission context and storage leases. Invocations
-share immutable executable plans and pipeline caches. Metal never compiles or
-falls back to CPU during execution of an unsupported program; unsupported
-lowering or pipeline preparation fails executable compilation.
-
-### Async execution and cancellation
-
-Compiled materialization, reusable execution, decode, readback, and safetensors
-I/O return native promises. Tokio's blocking task pool runs the work. The
-TypeScript adapter connects the Effect fiber's abort signal to a native
-`CancellationToken`. Cancellation and completion race through one atomic
-commit, so only one result is returned. Graph construction, autodiff
-transformation, and program compilation use synchronous native calls and cannot
-be interrupted.
-
-The adapter waits for interrupted native work to finish before discarding late
-results. It cleans up late tensor and archive results when it owns their buffers.
-External ArrayBuffer finalizers reclaim discarded readback buffers. The same
-cleanup applies to transient and reusable programs, decode, readback, and
-safetensors I/O.
+Likewise, `kvDtype: "int8"` selects quantized KV-cache storage for compiled
+inference. `"int8"` is not a tensor dtype. The cache stores U8 payloads with
+per-token, per-head F32 scales and widens values for attention math.
 
 ## Backend capabilities
 
@@ -568,6 +382,13 @@ safetensors I/O.
 | Paged KV cache               | F32, F16, BF16, INT8 storage tiers | F32, F16, BF16, INT8 storage tiers |
 | Safetensors path I/O         | Yes                                | Yes, with Metal dtype validation   |
 
+`@effect-torch/backend-cuda` is an experimental third backend. Its packaged
+addon is Linux x64 GNU only and requires an NVIDIA driver usable through the
+CUDA 12.9 NVRTC path. It exposes the same lazy `isAvailable` and
+`layer({ device? })` interface as Metal and advertises all seven logical
+dtypes. Its current operator coverage is narrower than the CPU and Metal
+table above; the advertised dtype list is not a full operation matrix.
+
 Unsupported placement or dtype requests fail; the runtime never moves the graph
 to another backend.
 
@@ -575,18 +396,28 @@ to another backend.
 
 `@effect-torch/core` exports namespaces rather than one flat symbol list:
 
-| Namespace      | Responsibility                                                   |
-| -------------- | ---------------------------------------------------------------- |
-| `Runtime`      | Backend contract, handles, capabilities, errors, and service tag |
-| `Tensor`       | Tensor graph construction, evaluation, compilation, and I/O      |
-| `Gradient`     | Autodiff transforms                                              |
-| `Loss`         | Regression and classification losses                             |
-| `Model`        | Layers, composition, execution, and compiled inference           |
-| `Optimizer`    | SGD, Adam, AdamW, clipping, and full-step execution              |
-| `LearningRate` | Constant, exponential, stepwise, cosine, and warmup schedules    |
-| `Trainer`      | Compiled and reference training loops                            |
-| `Checkpoint`   | Trainer and sampler checkpoint persistence                       |
-| `Sampler`      | Restorable shuffled token-window sampling                        |
+| Namespace      | Responsibility                                                    |
+| -------------- | ----------------------------------------------------------------- |
+| `Chat`         | Chat-template generation, segmented parsing, and streaming events |
+| `Runtime`      | Backend contract, handles, capabilities, errors, and service tag  |
+| `Tensor`       | Tensor graph construction, evaluation, compilation, and I/O       |
+| `Gradient`     | Autodiff transforms                                               |
+| `Gguf`         | Validated GGUF model and parameter-artifact loading               |
+| `Loss`         | Regression and classification losses                              |
+| `Model`        | Layers, composition, execution, and compiled inference            |
+| `Optimizer`    | SGD, Adam, AdamW, clipping, and full-step execution               |
+| `LearningRate` | Constant, exponential, stepwise, cosine, and warmup schedules     |
+| `Trainer`      | Compiled and reference training loops                             |
+| `Checkpoint`   | Trainer and sampler checkpoint persistence                        |
+| `Sampler`      | Restorable shuffled token-window sampling                         |
+| `Speculation`  | Autoregressive, history-lookup, and parallel-block proposers      |
+
+Built-in architectures live at explicit subpath exports:
+
+| Entry point                    | Export        | Purpose                               |
+| ------------------------------ | ------------- | ------------------------------------- |
+| `@effect-torch/core/models`    | `MuseGlimmer` | Muse-Glimmer model and GGUF loader    |
+| `@effect-torch/core/proposers` | `DFlash`      | DFlash proposer graph and GGUF loader |
 
 ### Tensor constructors
 
@@ -673,7 +504,8 @@ tril               trace
 
 ```text
 matmul                         dot
-linear                         layerNorm
+linear                         linearRows
+layerNorm                      rmsNorm
 positionEmbedding              rotaryEmbedding
 softmax                        logSoftmax
 scaledDotProductAttention      dropout
@@ -681,6 +513,7 @@ crossEntropy
 
 conv1d                         conv2d
 convTranspose1d                convTranspose2d
+shortConv1d                    kdaChunk
 maxPool2d                      avgPool2d
 
 inverse                        det
@@ -688,6 +521,23 @@ solve
 ```
 
 Linalg placement constraints are listed in the backend capability table.
+
+### Evaluation, resources, and I/O
+
+```text
+compute             sample
+toTypedArray        toNumberArray
+clear               clearAll
+clearScoped         clearAllScoped
+save                loadArchive          load
+isLazyTensor        isTensor
+shape               dtype                device
+```
+
+Readback materializes lazy inputs and borrows concrete inputs. `sample` selects
+one token from a concrete rank-one floating logits tensor. The scoped clear
+helpers register caller-owned handles for cleanup when an Effect scope closes;
+library code should still release temporary handles at the operation boundary.
 
 ### Losses
 
@@ -803,7 +653,13 @@ The Tensor namespace also exposes the primitives used by trainers and models:
 ```text
 makeProgramCache       cachedProgram          signatureOf
 makeInput              makeScalarInput        freezeProgram
-runProgram             compileDecodeProgram  runDecodeProgram
+runProgram
+
+makeKvPool             makeKvSequence         kvPrefillMatch
+kvSequenceCursor       releaseKvSequence
+compileDecodeProgram   runDecodeProgram       runDecodeProgramSampled
+runBatchedDecodeProgram
+runBatchedDecodeProgramSampled
 ```
 
 Most applications should use `Tensor.compile`, a model's `execute` method,
@@ -1071,36 +927,32 @@ Generation sessions support:
 - Sliding-window attention.
 - RoPE with bounded active context and unbounded sequence cursors.
 
-Exact autoregressive-chain speculation uses the same token-page API. It accepts
-one KV-only proposer. The proposer must use an identity vocabulary map and
-causal-normalized proposal distributions:
+Speculative decoding uses the same token-page API. `Speculation` constructs
+autoregressive draft-model, deterministic history-lookup, and replayable
+parallel-block proposers. `Model.inference` accepts one proposer and currently
+uses a fixed proposal width:
 
 ```ts
 import { Model, Speculation } from "@effect-torch/core"
 
-const proposer = yield* Speculation.artifact({
-  components: [{ model: draftModel, params: draftParams }],
-  plan: {
-    target: { vocabulary: 32_000 },
-    stages: [{ operation: { _tag: "Autoregressive", component: 0 } }],
-    state: { _tag: "Kv", commit: { _tag: "AutoregressiveChain", stage: 0 } },
-    output: { topology: "Chains", probabilities: "CausalNormalized" },
-    tokenMap: { _tag: "Identity" },
-    trainedMaxRows: 4
-  }
+const proposer = Speculation.autoregressive(draftModel, draftParams, {
+  vocabulary: 32_000,
+  maxDraftTokens: 4
 })
 
 const inference = yield* Model.inference(targetModel, targetParams, {
   maxTokens: 8192,
+  prefillChunks: [32, 64, 128, 256],
   speculation: { proposer, maxDraftTokens: 4 },
   sampling: { temperature: 0.8, topK: 40, topP: 0.95, seed: 7 }
 })
 ```
 
 One native round proposes tokens, verifies them, performs exact rejection and
-residual sampling, and publishes paired target and proposer state. A returned
+residual sampling, and commits target state plus any proposer state. A returned
 page may contain multiple tokens. Consumers must append every token in each
-page.
+page. Speculation does not currently combine with `attentionWindow` or adaptive
+proposal scheduling.
 
 `kvDtype: "int8"` is a KV storage tier, not a normal tensor dtype. Cached rows
 are quantized with per-token, per-head scales and widened for attention math.
@@ -1108,10 +960,90 @@ are quantized with per-token, per-head scales and widened for attention math.
 The low-level `Tensor` namespace also exposes KV pools, sequences, cursor
 queries, prefix matching, decode compilation, and direct decode execution.
 
+## GGUF models
+
+`Gguf.loadModel` inspects a GGUF v3 file, validates its exact architecture and
+tensor catalog against a `Gguf.ModelDefinition`, then loads the parameters on
+the selected runtime. `Gguf.loadParameters` provides the same catalog and
+ownership checks for target-coupled artifacts such as speculative proposers.
+
+The built-in Muse-Glimmer loader wraps the generic model path:
+
+```ts
+import { Model, Tensor } from "@effect-torch/core"
+import { MuseGlimmer } from "@effect-torch/core/models"
+import { Effect } from "effect"
+
+const prepare = Effect.gen(function*() {
+  const loaded = yield* MuseGlimmer.loadGGUF("model.gguf")
+  const program = yield* Model.inference(loaded.model, loaded.params, {
+    maxTokens: 4096,
+    blockSize: 16,
+    prefillChunks: [32, 64, 128, 256],
+    kvDtype: "f16",
+    batchSize: 1
+  })
+
+  // Model.inference retains its own immutable parameter generation.
+  yield* Tensor.clearAll(loaded.params)
+  return { program, metadata: loaded.metadata }
+})
+```
+
+The loader accepts dense F32 and `Q2_K` through `Q6_K` tensor payloads. Loaded
+parameters are caller-owned concrete handles. `Model.inference` retains its
+parameter generation independently, so clear the loader's handles after it
+succeeds. The `DFlash.loadGGUF` export from `@effect-torch/core/proposers`
+similarly returns caller-owned parameters plus a ready `artifact` for
+`Model.inference`.
+
+## Chat
+
+`Chat.stream` joins a compiled inference program with a compatible tokenizer
+and caller-supplied chat template. It renders and encodes the prompt once,
+prefills the model, samples tokens, and emits ordered stream events:
+
+```ts
+import { Chat } from "@effect-torch/core"
+import type { Model } from "@effect-torch/core"
+import * as Tokenizers from "@effect-torch/tokenizers"
+import { Effect, Stream } from "effect"
+
+const chat = (program: Model.InferenceProgram, template: string, eosTokenId: number) =>
+  Effect.gen(function*() {
+    const tokenizer = yield* Tokenizers.fromFile("tokenizer.json", {
+      ...Tokenizers.strictConfig,
+      specialTokens: "Always"
+    })
+
+    yield* Chat.stream({
+      program,
+      tokenizer,
+      template,
+      messages: [{ role: "user", content: "Explain Effect in one sentence." }],
+      maxTokens: 128,
+      sampling: { temperature: 0.7, topP: 0.95, seed: 7 },
+      controls: false,
+      stopTokens: [eosTokenId]
+    }).pipe(
+      Stream.runForEach((event) =>
+        event._tag === "delta" ? Effect.sync(() => process.stdout.write(event.text)) : Effect.void
+      )
+    )
+  })
+```
+
+A successful stream starts with `prefill` and ends with `done`. Between them,
+`start`, `delta`, and `end` events describe parsed response segments. Passing
+`controls: false` produces one unsegmented assistant response; the default
+controls parse models that use Chat's segmented control-token protocol.
+Standard sampling stays in the native generation session. A custom sampler
+function receives each logits row as a host typed array instead.
+
 ## Safetensors
 
-Both tensor backends expose direct path-based safetensors I/O through a Runtime
-extension:
+The bundled runtime backends expose direct path-based safetensors I/O through a
+Runtime extension:
 
 ```ts
 import { Tensor } from "@effect-torch/core"
@@ -1194,7 +1126,9 @@ The package provides:
 
 - Single, batched, and concatenated encoding.
 - Single and batched decoding.
+- Stateful autoregressive decoding.
 - Token-to-ID and ID-to-token lookup.
+- Caller-supplied MiniJinja chat-template rendering.
 - Longest and fixed-length padding policies.
 - Explicit truncation policies.
 - BPE, WordPiece, Unigram, and WordLevel training.
@@ -1211,9 +1145,11 @@ The public error hierarchy includes:
 
 | Error                        | Scope                                                   |
 | ---------------------------- | ------------------------------------------------------- |
+| `Chat.ChatError`             | Chat validation, sampling, and protocol failures        |
 | `Runtime.BackendError`       | Structured backend operation and ownership failures     |
 | `Tensor.TensorError`         | Graph, evaluation, readback, and serialization failures |
 | `Gradient.GradError`         | Autodiff contract failures                              |
+| `Gguf.GgufError`             | GGUF inspection, validation, loading, and ownership     |
 | `Model.ModelError`           | Model construction, arity, and checkpoint failures      |
 | `Model.InferenceError`       | Inference transform and generation-session failures     |
 | `Checkpoint.CheckpointError` | Invalid or incomplete trainer checkpoints               |
@@ -1243,249 +1179,34 @@ failure.
 | ------------------------------------ | ----------- | --------- | --------------- | ---------------- | ------------- | -------------- |
 | `@effect-torch/backend-cpu`          | Yes         | Yes       | Yes             | Yes              | Yes           | Yes            |
 | `@effect-torch/backend-apple-native` | Yes         | Yes       | No              | No               | No            | No             |
+| `@effect-torch/backend-cuda`         | No          | No        | No              | No               | Yes           | No             |
 | `@effect-torch/tokenizers`           | Yes         | Yes       | Yes             | Yes              | Yes           | Yes            |
-
-`pnpm build` produces 14 `.node` artifacts:
-
-- Six CPU binaries.
-- Two Apple Metal binaries.
-- Six tokenizer binaries.
 
 Windows binaries are not packaged.
 
-Applications can install and import the Apple package on any platform to call
-`isAvailable`. The Metal runtime and native binaries remain Darwin-only.
+Applications can install and import the Apple or CUDA package on any platform
+to call `isAvailable`. Metal binaries remain Darwin-only. The CUDA binary
+remains Linux x64 GNU-only.
 
 ### Loader selection
 
 CPU and tokenizer loaders select one package-local binary from
-`process.platform`, `process.arch`, and the presence of glibc in `process.report`
-on Linux. The Apple loader performs platform and architecture selection only
-when `isAvailable` runs or Effect builds the backend Layer.
+`process.platform`, `process.arch`, and the presence of glibc in
+`process.report` on Linux. The Apple and CUDA loaders perform selection only
+when `isAvailable` runs or Effect builds their backend Layer. CUDA accepts only
+Linux x64 with glibc.
 
 Installation does not download binaries. Loaders do not search fallback paths
-or switch to CPU. Linux-capable packages include both GNU and musl binaries.
-
-### Static linkage
-
-Each backend addon is a self-contained `cdylib`. Shared Rust graph, compiler,
-autodiff, runtime, and N-API helper crates are statically linked into the addon.
-
-Addons communicate through Node-API, not a Rust dynamic-plugin ABI. CPU and
-Metal do not pass Rust trait objects or allocations between addons.
-
-### Build matrix
-
-`pnpm build` must run on macOS because Apple Metal artifacts require Xcode, the
-macOS SDK, and Apple's linker tools. The command builds Darwin targets locally
-and cross-compiles Linux targets with Zig:
-
-| Artifact suffix    | Build target                     |
-| ------------------ | -------------------------------- |
-| `darwin-arm64`     | `aarch64-apple-darwin`           |
-| `darwin-x64`       | `x86_64-apple-darwin`            |
-| `linux-arm64-gnu`  | `aarch64-unknown-linux-gnu.2.17` |
-| `linux-arm64-musl` | `aarch64-unknown-linux-musl`     |
-| `linux-x64-gnu`    | `x86_64-unknown-linux-gnu.2.17`  |
-| `linux-x64-musl`   | `x86_64-unknown-linux-musl`      |
-
-Darwin uses Cargo and Apple's system SDK. Linux uses `cargo-zigbuild`. Darwin
-artifacts target macOS 11 or newer. Release verification limits GNU artifacts
-to glibc 2.17 symbols. Musl addons link dynamically against musl libc.
-
-### Package verification
-
-The build verifies:
-
-- Exact package platform policy, `files` whitelist, and binary-name metadata.
-- Exact native artifact sets with no missing or extra binaries.
-- Artifact architecture.
-- macOS deployment target and install ID.
-- Absence of Nix, user-home, and Homebrew paths in Darwin linkage.
-- Presence of Metal.framework in Apple artifacts.
-- Absence of Metal.framework in CPU artifacts.
-- Maximum glibc symbol version for GNU artifacts.
-- Musl libc references and absence of glibc symbols in musl artifacts.
-- Native files included by `npm pack --dry-run`.
-
-`pnpm verify:native-packages` performs metadata and loader checks without
-requiring assembled artifacts. Full artifact verification runs as part of the
-release matrix build.
-
-## Development
-
-### Reproducible environment
-
-A Nix flake and direnv configure the macOS and Linux development shells. The
-shell includes Node.js 22, Corepack, Rustup, Zig, `cargo-zigbuild`, dprint,
-CMake, and pkg-config.
-
-```bash
-direnv allow
-pnpm install
-```
-
-Without direnv:
-
-```bash
-nix develop
-pnpm install
-```
-
-`rust-toolchain.toml` pins Rust, rustfmt, rust-analyzer, and the complete
-standard-library target set.
-
-Outside Nix, install Node, pnpm, the pinned Rust toolchain, Zig, and
-`cargo-zigbuild`. Darwin builds also require Xcode Command Line Tools.
-
-### Native development builds
-
-Workspace TypeScript resolves directly to package source, but native packages
-load addons from their own `dist/internal` directories. Build a host addon
-before running code against a fresh checkout.
-
-```bash
-pnpm --filter @effect-torch/backend-cpu build:debug
-pnpm --filter @effect-torch/backend-apple-native build:debug
-pnpm --filter @effect-torch/tokenizers build:debug
-```
-
-The Apple command is macOS-only. On Linux, build CPU and tokenizers.
-
-Host debug builds preserve any other already-assembled matrix artifacts. A
-host release build is available through `scripts/build-native.mjs --host
---profile release` from a native package directory.
-
-### Quality commands
-
-```bash
-pnpm test
-pnpm typecheck
-pnpm lint
-
-cargo check --workspace --features napi-addon
-cargo test --workspace --features napi-addon
-cargo fmt --all -- --check
-```
-
-`pnpm test` runs core, CPU backend, and Apple backend Vitest suites. Core tests
-cover tensor operations, autodiff, compilation, fusion, models, optimizers,
-training, memory ownership, safetensors, tokenizers, attention, inference, and
-checkpointing. Backend-neutral suites run on CPU and, when available, Metal.
-
-Rust checks need the `napi-addon` feature because each backend gates its
-Node-facing module when compiled as a normal `rlib`. VS Code configuration
-enables this feature for rust-analyzer.
-
-### Release build
-
-```bash
-pnpm build
-```
-
-The root build:
-
-1. Builds the complete native release matrix.
-2. Builds TypeScript for CPU, Apple, and tokenizers.
-3. Verifies native artifacts and npm tarball contents.
-4. Builds `@effect-torch/core`.
-
-The build does not implicitly run tests, typechecking, lint, or Rust tests.
-Run the quality commands separately before a release build.
-
-`pnpm build` assembles the release matrix on macOS because Apple artifacts
-require the macOS SDK. It cross-compiles Linux outputs with Zig. Linux can still
-build and test CPU and tokenizer packages; Metal tests require macOS.
-
-### Examples
-
-```bash
-pnpm --filter @effect-torch/examples xor
-pnpm --filter @effect-torch/examples nano-gpt # macOS
-```
-
-The examples include:
-
-- XOR training on the CPU backend.
-- Nano-GPT with tokenizer training, causal attention, RoPE, compiled training,
-  paged KV-cache inference, and generation.
-- FineWeb preparation from Parquet into flat token bins.
-- FineWeb compiled AdamW training with restorable sampling and checkpoints.
-- Mixed-BF16 full-epoch training.
-- Checkpoint export and streaming generation.
-
-### Benchmarks
-
-```bash
-pnpm bench
-pnpm bench:compile
-pnpm bench:mlx
-pnpm bench:muse-glimmer
-
-cargo bench -p effect-torch-compiler --bench pipeline
-cargo bench -p effect-torch-compiler --bench pipeline -- --workload stress
-```
-
-The benchmark package covers matmul shapes, compiled programs, cold native
-compilation, warm structural caches, attention, and optional MLX comparisons.
-`N`, `ITERS`, and `METAL_ONLY` configure the default matmul benchmark.
-`pnpm bench:compile -- --help` lists backend, workload, size, iteration, and
-optimization controls. `pnpm bench:muse-glimmer` benchmarks the local
-Muse-Glimmer GGUF in standard and DFlash modes at several context depths and
-writes JSONL records under `bench-results/`. Set `LLAMA_CPP_BIN` to a directory
-containing `llama-bench`, `llama-cli`, and `llama-speculative-simple` to include
-matched llama.cpp kernel and end-to-end rows.
-
-The Rust compiler benchmark measures `GraphIndex` plus side-table optimization
-separately from graph construction and reports deterministic structural-work
-counts.
-Its `stress` workload runs 50,000- and 100,000-node graphs on a 256 KiB thread
-stack; it does not include lowering, memory/physical planning, or pipeline
-preparation.
-
-This README omits benchmark numbers because results depend on the hardware and
-software environment. `pnpm bench` runs CPU measurements on Linux and adds
-Metal when available on macOS. The MLX comparison is macOS-only.
-
-## Repository layout
-
-```text
-packages/
-  core/                    Backend-neutral TypeScript API and tests
-  backend-cpu/             CPU package, adapter, loader, and artifacts
-  backend-apple-native/    Apple package, adapter, loader, and artifacts
-  tokenizers/              TypeScript tokenizer API and Rust addon
-  examples/                Runnable applications
-  bench/                   Benchmarks
-
-crates/
-  runtime/                 IDs, signatures, memory, diagnostics, and ownership contracts
-  graph/                   Nongeneric semantic graph and leaf contracts
-  compiler/                Requests, graph index, regions, lowering tables, and memory planning
-  autodiff/                Semantic graph differentiation and transforms
-  napi/                    Backend-neutral Node-API helpers
-  runtime-cpu/             Typed CPU executable runtime and CPU-owned addon
-  runtime-metal/           Typed Metal executable runtime and Metal-owned addon
-
-scripts/
-  build-native.mjs         Host and release-matrix native builder
-  native-packages.mjs      Package and target manifest
-  verify-native-packages.mjs
-                            Metadata, ABI, linkage, and tarball verifier
-  clean-native-declarations.mjs
-                            Publish-output cleanup
-
-docs/rfcs/                 Architecture and feature design records
-```
-
-The pnpm workspace contains six packages. The Cargo workspace contains the
-seven shared/backend crates plus the tokenizer Rust package.
+or switch to CPU. CPU and tokenizers include both GNU and musl Linux binaries;
+CUDA includes one GNU binary.
 
 ## Current constraints
 
-The repository ships two independently packaged runtimes: CPU and Apple Metal.
+CPU and Apple Metal are the stable consumer runtimes. CUDA is experimental.
 
-- The repository implements no CUDA, PJRT, remote, WebGPU, or Windows backend.
+- CUDA currently ships only for x64 Linux with glibc and requires the CUDA 12.9
+  NVRTC path.
+- The repository implements no PJRT, remote, WebGPU, or Windows backend.
 - The runtime does not select a backend or transfer tensors between devices
   implicitly.
 - Apple Metal is macOS-only and never falls back to CPU.
@@ -1493,32 +1214,5 @@ The repository ships two independently packaged runtimes: CPU and Apple Metal.
 - CPU does not implement F16 or BF16 matmul.
 - Mixed-BF16 training is Metal-only.
 - INT8 is a KV-cache storage tier, not a general tensor dtype.
+- GGML K-quants are encoded inference-weight layouts, not general tensor dtypes.
 - Some optimized attention and loss backward paths are first-order only.
-- Release-matrix assembly runs on macOS because Apple artifacts require the
-  macOS SDK; Zig cross-compiles the Linux artifacts.
-- The repository does not automate native release publication, signing,
-  notarization, or registry uploads.
-
-Use the implementation to determine current behavior. RFCs record design intent
-and historical decisions, and older details may no longer match the
-implementation.
-
-## Design documents
-
-The main architecture records are:
-
-- [RFC 0021: Compiler Pipeline Refactor](docs/rfcs/0021-compiler-pipeline-refactor.md)
-- [RFC 0020: Invocation Ownership](docs/rfcs/0020-invocation-ownership.md)
-- [RFC 0019: Executable Compilation](docs/rfcs/0019-executable-compilation.md)
-- [RFC 0017: Multi-Backend Runtime](docs/rfcs/0017-multi-backend-runtime.md)
-- [RFC 0002: Autodiff](docs/rfcs/0002-autodiff.md)
-- [RFC 0003: Memory Management](docs/rfcs/0003-memory-management.md)
-- [RFC 0004: Optimizers](docs/rfcs/0004-optimizers.md)
-- [RFC 0005: Models](docs/rfcs/0005-models.md)
-- [RFC 0007: Kernel Fusion](docs/rfcs/0007-kernel-fusion.md)
-- [RFC 0008: Compilation](docs/rfcs/0008-compilation.md)
-- [RFC 0009: Tokenizers](docs/rfcs/0009-tokenizers.md)
-- [RFC 0010: Inference](docs/rfcs/0010-inference.md)
-- [RFC 0012: Dtype System](docs/rfcs/0012-dtype-system.md)
-- [RFC 0013: Batched Decode](docs/rfcs/0013-batched-decode.md)
-- [RFC 0016: Frozen Program Memory](docs/rfcs/0016-frozen-program-memory.md)

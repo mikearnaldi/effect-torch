@@ -6,6 +6,7 @@ members = [
   "crates/napi",
   "crates/runtime",
   "crates/runtime-cpu",
+  "crates/runtime-cuda",
   "crates/runtime-metal",
   "packages/tokenizers",
 ]

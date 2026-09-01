@@ -89,7 +89,7 @@ pub mod runtime {
 /// Cross-entropy reduction mode, re-exported for the loss kernels.
 pub use effect_torch_graph::CrossEntropyReduction as CeReduction;
 
-use effect_torch_runtime::{DeviceId, Placement, RuntimeIdentity};
+use effect_torch_runtime::{Placement, RuntimeIdentity};
 use std::any::Any;
 use std::sync::OnceLock;
 
@@ -127,14 +127,6 @@ fn identity() -> &'static RuntimeIdentity {
     IDENTITY.get_or_init(|| RuntimeIdentity::new("metal"))
 }
 
-/// Placement singleton: all Metal tensors live on `metal:0` in the
-/// `"shared"` memory space (unified memory; storage mode may still be
-/// private for pure intermediates).
-fn placement() -> &'static Placement {
-    static PLACEMENT: OnceLock<Placement> = OnceLock::new();
-    PLACEMENT.get_or_init(|| Placement::with_memory_space(DeviceId::new("metal:0"), "shared"))
-}
-
 impl std::fmt::Debug for run::MetalTensor {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("MetalTensor")
@@ -150,7 +142,7 @@ impl effect_torch_runtime::Buffer for run::MetalTensor {
     }
 
     fn placement(&self) -> &Placement {
-        placement()
+        self.buffer.placement()
     }
 
     fn dtype(&self) -> effect_torch_runtime::DType {

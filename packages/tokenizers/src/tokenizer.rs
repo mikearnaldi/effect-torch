@@ -87,6 +87,7 @@ use tokenizers::normalizers::bert::BertNormalizer;
 use tokenizers::pre_tokenizers::{
     byte_level::ByteLevel, metaspace::Metaspace, whitespace::Whitespace,
 };
+use tokenizers::tokenizer::step_decode_stream;
 use tokenizers::{AddedToken, Encoding, PostProcessor, Tokenizer};
 
 /// Training corpus selector for [`NativeTokenizer::train`].
@@ -249,6 +250,33 @@ struct TokenizerInner {
     tokenizer: Tokenizer,
     parse_specials: bool,
     specials: Vec<String>,
+}
+
+/// Stateful decoder for autoregressive token streams.
+#[napi]
+pub struct NativeDecodeStream {
+    inner: Arc<TokenizerInner>,
+    ids: Vec<u32>,
+    prefix: String,
+    prefix_index: usize,
+    skip_special_tokens: bool,
+}
+
+#[napi]
+impl NativeDecodeStream {
+    /// Adds one token and returns the next stable text chunk, if available.
+    #[napi]
+    pub fn step(&mut self, id: u32) -> Result<Option<String>> {
+        step_decode_stream(
+            &self.inner.tokenizer,
+            vec![id],
+            self.skip_special_tokens,
+            &mut self.ids,
+            &mut self.prefix,
+            &mut self.prefix_index,
+        )
+        .map_err(to_napi_error)
+    }
 }
 
 impl TokenizerInner {
@@ -460,6 +488,18 @@ impl NativeTokenizer {
             .tokenizer
             .decode(&ids, skip_special_tokens.unwrap_or(false))
             .map_err(to_napi_error)
+    }
+
+    /// Creates a stateful decoder for an autoregressive token stream.
+    #[napi]
+    pub fn decode_stream(&self, skip_special_tokens: Option<bool>) -> NativeDecodeStream {
+        NativeDecodeStream {
+            inner: self.inner().clone(),
+            ids: Vec::new(),
+            prefix: String::new(),
+            prefix_index: 0,
+            skip_special_tokens: skip_special_tokens.unwrap_or(false),
+        }
     }
 
     /// Decodes a batch of id sequences. `skip_special_tokens` behaves as

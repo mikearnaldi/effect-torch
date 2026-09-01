@@ -494,8 +494,8 @@ fn dtype_name(dtype: DType) -> &'static str {
     dtype.name()
 }
 
-fn get_device() -> Device {
-    Device::Metal
+fn get_device(device_ordinal: Option<u32>) -> Device {
+    Device::Metal(device_ordinal.unwrap_or(0))
 }
 
 #[napi(custom_finalize)]
@@ -506,12 +506,8 @@ pub struct NativeTensor {
 }
 
 impl NativeTensor {
-    #[cfg(test)]
     fn wrap(inner: value::Value) -> Self {
-        Self::wrap_on(inner, 0)
-    }
-
-    fn wrap_on(inner: value::Value, device_ordinal: usize) -> Self {
+        let device_ordinal = inner.device().ordinal() as usize;
         // Buffers cost at least one memory page regardless of logical tensor size.
         // Metal allocates in 4 KB units, and malloc behaves similarly. Without
         // this floor, tiny tensors look free to V8, which delays collection. The
@@ -844,8 +840,8 @@ fn readback_blocking(inner: &value::Value) -> Result<Readback> {
 }
 
 struct ConstantCache {
-    map: HashMap<(u64, DType, &'static str), Arc<Node>>,
-    order: std::collections::VecDeque<(u64, DType, &'static str)>,
+    map: HashMap<(u64, DType, u32), Arc<Node>>,
+    order: std::collections::VecDeque<(u64, DType, u32)>,
 }
 
 static CONSTANT_CACHE: LazyLock<Mutex<ConstantCache>> = LazyLock::new(|| {
@@ -857,17 +853,12 @@ static CONSTANT_CACHE: LazyLock<Mutex<ConstantCache>> = LazyLock::new(|| {
 
 const CONSTANT_CACHE_LIMIT: usize = 4096;
 
-fn device_key(device: &Device) -> &'static str {
-    debug_assert!(device.is_metal());
-    "metal"
-}
-
 fn cached_constant(
     value: f64,
     dtype: DType,
     device: Device,
 ) -> std::result::Result<Arc<Node>, String> {
-    let key = (value.to_bits(), dtype, device_key(&device));
+    let key = (value.to_bits(), dtype, device.ordinal());
     let mut cache = CONSTANT_CACHE.lock().unwrap();
     if let Some(node) = cache.map.get(&key) {
         return Ok(node.clone());
@@ -1027,55 +1018,84 @@ impl LazyTensor {
     }
 
     #[napi(factory)]
-    pub fn zeros(shape: Vec<u32>, dtype: Option<NativeDType>) -> Result<Self> {
+    pub fn zeros(
+        shape: Vec<u32>,
+        dtype: Option<NativeDType>,
+        device_ordinal: Option<u32>,
+    ) -> Result<Self> {
         lazy_ctor!(Node::new(NodeKind::Zeros {
             shape: shape.iter().map(|&d| d as usize).collect(),
             dtype: dtype.unwrap_or(NativeDType::F32).into(),
-            device: get_device(),
+            device: get_device(device_ordinal),
         }))
     }
 
     #[napi(factory)]
-    pub fn ones(shape: Vec<u32>, dtype: Option<NativeDType>) -> Result<Self> {
+    pub fn ones(
+        shape: Vec<u32>,
+        dtype: Option<NativeDType>,
+        device_ordinal: Option<u32>,
+    ) -> Result<Self> {
         lazy_ctor!(Node::new(NodeKind::Ones {
             shape: shape.iter().map(|&d| d as usize).collect(),
             dtype: dtype.unwrap_or(NativeDType::F32).into(),
-            device: get_device(),
+            device: get_device(device_ordinal),
         }))
     }
 
     #[napi(factory)]
-    pub fn full(shape: Vec<u32>, value: f64, dtype: Option<NativeDType>) -> Result<Self> {
+    pub fn full(
+        shape: Vec<u32>,
+        value: f64,
+        dtype: Option<NativeDType>,
+        device_ordinal: Option<u32>,
+    ) -> Result<Self> {
         lazy_ctor!(Node::new(NodeKind::Full {
             shape: shape.iter().map(|&d| d as usize).collect(),
             value,
             dtype: dtype.unwrap_or(NativeDType::F32).into(),
-            device: get_device(),
+            device: get_device(device_ordinal),
         }))
     }
 
     #[napi(factory)]
-    pub fn randn(shape: Vec<u32>, dtype: Option<NativeDType>) -> Result<Self> {
+    pub fn randn(
+        shape: Vec<u32>,
+        dtype: Option<NativeDType>,
+        device_ordinal: Option<u32>,
+    ) -> Result<Self> {
         lazy_ctor!(Node::new(NodeKind::Randn {
             shape: shape.iter().map(|&d| d as usize).collect(),
             dtype: dtype.unwrap_or(NativeDType::F32).into(),
-            device: get_device(),
+            device: get_device(device_ordinal),
         }))
     }
 
     #[napi(factory)]
-    pub fn uniform(shape: Vec<u32>, lo: f64, hi: f64, dtype: Option<NativeDType>) -> Result<Self> {
+    pub fn uniform(
+        shape: Vec<u32>,
+        lo: f64,
+        hi: f64,
+        dtype: Option<NativeDType>,
+        device_ordinal: Option<u32>,
+    ) -> Result<Self> {
         lazy_ctor!(Node::new(NodeKind::Uniform {
             lo,
             hi,
             shape: shape.iter().map(|&d| d as usize).collect(),
             dtype: dtype.unwrap_or(NativeDType::F32).into(),
-            device: get_device(),
+            device: get_device(device_ordinal),
         }))
     }
 
     #[napi(factory)]
-    pub fn arange(start: f64, end: f64, step: f64, dtype: Option<NativeDType>) -> Result<Self> {
+    pub fn arange(
+        start: f64,
+        end: f64,
+        step: f64,
+        dtype: Option<NativeDType>,
+        device_ordinal: Option<u32>,
+    ) -> Result<Self> {
         if step == 0.0 {
             return Err(Error::new(
                 Status::InvalidArg,
@@ -1087,16 +1107,16 @@ impl LazyTensor {
             end,
             step,
             dtype: dtype.unwrap_or(NativeDType::F32).into(),
-            device: get_device(),
+            device: get_device(device_ordinal),
         }))
     }
 
     #[napi(factory)]
-    pub fn eye(n: u32, dtype: Option<NativeDType>) -> Result<Self> {
+    pub fn eye(n: u32, dtype: Option<NativeDType>, device_ordinal: Option<u32>) -> Result<Self> {
         lazy_ctor!(Node::new(NodeKind::Eye {
             n: n as usize,
             dtype: dtype.unwrap_or(NativeDType::F32).into(),
-            device: get_device(),
+            device: get_device(device_ordinal),
         }))
     }
 
@@ -1106,8 +1126,12 @@ impl LazyTensor {
     // cold values rotate through. Devices are process singletons, so the
     // device kind is the whole key.
     #[napi(factory)]
-    pub fn constant(value: f64, dtype: Option<NativeDType>) -> Result<Self> {
-        let device = get_device();
+    pub fn constant(
+        value: f64,
+        dtype: Option<NativeDType>,
+        device_ordinal: Option<u32>,
+    ) -> Result<Self> {
+        let device = get_device(device_ordinal);
         let dtype: DType = dtype.unwrap_or(NativeDType::F32).into();
         match cached_constant(value, dtype, device) {
             Ok(node) => Ok(Self { node }),
@@ -1120,12 +1144,13 @@ impl LazyTensor {
         data: Uint8Array,
         shape: Vec<u32>,
         dtype: Option<NativeDType>,
+        device_ordinal: Option<u32>,
     ) -> Result<Self> {
         lazy_ctor!(Node::new(NodeKind::FromBytes {
             data: data.to_vec(),
             shape: shape.iter().map(|&d| d as usize).collect(),
             dtype: dtype.unwrap_or(NativeDType::F32).into(),
-            device: get_device(),
+            device: get_device(device_ordinal),
         }))
     }
 
@@ -1139,21 +1164,30 @@ impl LazyTensor {
     // step counts, ...). Both carry their declared signature so the rest of
     // the graph validates shapes at trace time.
     #[napi(factory)]
-    pub fn input(slot: u32, shape: Vec<u32>, dtype: Option<NativeDType>) -> Result<Self> {
+    pub fn input(
+        slot: u32,
+        shape: Vec<u32>,
+        dtype: Option<NativeDType>,
+        device_ordinal: Option<u32>,
+    ) -> Result<Self> {
         lazy_ctor!(Node::new(NodeKind::Input {
             slot,
             shape: shape.iter().map(|&d| d as usize).collect(),
             dtype: dtype.unwrap_or(NativeDType::F32).into(),
-            device: get_device(),
+            device: get_device(device_ordinal),
         }))
     }
 
     #[napi(factory)]
-    pub fn scalar_input(slot: u32, dtype: Option<NativeDType>) -> Result<Self> {
+    pub fn scalar_input(
+        slot: u32,
+        dtype: Option<NativeDType>,
+        device_ordinal: Option<u32>,
+    ) -> Result<Self> {
         lazy_ctor!(Node::new(NodeKind::ScalarInput {
             slot,
             dtype: dtype.unwrap_or(NativeDType::F64).into(),
-            device: get_device(),
+            device: get_device(device_ordinal),
         }))
     }
 
@@ -3671,9 +3705,10 @@ fn validate_stateful_tensor_input(
 ) -> Result<()> {
     let got = input.val_cloned()?;
     let shape = got.shape();
+    let device = got.device();
     if shape != declared.shape
         || got.dtype() != declared.dtype
-        || device_key(&got.device()) != device_key(&declared.device)
+        || !device.same_device(&declared.device)
     {
         return Err(Error::new(
             Status::InvalidArg,
@@ -3682,7 +3717,7 @@ fn validate_stateful_tensor_input(
                 declared.signature(),
                 shape,
                 got.dtype().name(),
-                device_key(&got.device())
+                device
             ),
         ));
     }
@@ -9529,7 +9564,7 @@ impl Executable {
                         StatefulExecutionOutput::Tensors(
                             outputs
                                 .into_iter()
-                                .map(|output| NativeTensor::wrap_on(output, device_ordinal))
+                                .map(|output| NativeTensor::wrap(output))
                                 .collect(),
                         )
                     }),
@@ -9680,9 +9715,10 @@ impl Executable {
             }
             let input = tensors.next().expect("tensor count checked");
             let got = input.val_cloned()?;
+            let device = got.device();
             if got.shape() != declared.shape.as_slice()
                 || got.dtype() != declared.dtype
-                || device_key(&got.device()) != device_key(&declared.device)
+                || !device.same_device(&declared.device)
             {
                 return Err(Error::new(
                     Status::InvalidArg,
@@ -9695,7 +9731,7 @@ impl Executable {
                             .collect::<Vec<_>>()
                             .join("x"),
                         got.dtype().name(),
-                        device_key(&got.device())
+                        device
                     ),
                 ));
             }
@@ -9723,7 +9759,7 @@ impl Executable {
             )
             .map_err(to_napi_err)?
             .into_iter()
-            .map(|output| NativeTensor::wrap_on(output, device_ordinal))
+            .map(|output| NativeTensor::wrap(output))
             .collect())
         })
         .await
@@ -9794,6 +9830,19 @@ fn compile_inner(
             "compile: expected at least one root".to_string(),
         ));
     }
+    let device_ordinal = u32::try_from(device_ordinal)
+        .map_err(|_| Error::new(Status::InvalidArg, "Metal device ordinal exceeds u32::MAX"))?;
+    let expected_device = Device::Metal(device_ordinal);
+    if nodes
+        .iter()
+        .any(|node| !node.device.same_device(&expected_device))
+    {
+        return Err(Error::new(
+            Status::InvalidArg,
+            format!("compile: every root must use Metal device {device_ordinal}"),
+        ));
+    }
+    let device_ordinal = device_ordinal as usize;
 
     let options = compile_options(options, state.is_some());
     let mut executable_state = None;
@@ -10098,7 +10147,7 @@ async fn load_tensors_on(
                 .into_iter()
                 .map(|(name, tensor)| NativeSafetensorsEntry {
                     name,
-                    tensor: NativeTensor::wrap_on(tensor, device_ordinal),
+                    tensor: NativeTensor::wrap(tensor),
                 })
                 .collect(),
             metadata: archive.metadata,
@@ -11318,7 +11367,7 @@ mod epilogue_tests {
             node: Node::new(NodeKind::Randn {
                 shape: vec![2048],
                 dtype: DType::F32,
-                device: Device::Metal,
+                device: Device::Metal(0),
             })
             .unwrap(),
         };
@@ -11846,7 +11895,7 @@ mod epilogue_tests {
             slot: 0,
             shape: vec![1, 4, 4],
             dtype: DType::F32,
-            device: get_device(),
+            device: get_device(None),
         })
         .unwrap();
         let root = LazyTensor {

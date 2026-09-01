@@ -830,7 +830,7 @@ mod tests {
             6,
             &[2, 3],
             DType::F32,
-            &Device::Cpu,
+            &Device::Cpu(0),
         )
         .unwrap();
         let program = prepare(&exprs);
@@ -858,7 +858,7 @@ mod tests {
                 6,
                 &[2, 3],
                 DType::F32,
-                &Device::Cpu,
+                &Device::Cpu(0),
                 &mut destinations,
                 &mut scratch_destination,
             )
@@ -886,7 +886,7 @@ mod tests {
                 3,
                 &[3],
                 DType::F32,
-                &Device::Cpu,
+                &Device::Cpu(0),
                 &mut output.destination().unwrap(),
                 &mut scratch.destination().unwrap(),
             )
@@ -914,7 +914,7 @@ mod tests {
             false,
             &[2],
             DType::F64,
-            &Device::Cpu,
+            &Device::Cpu(0),
         )
         .unwrap();
         let program = prepare(std::slice::from_ref(&expr));
@@ -941,7 +941,7 @@ mod tests {
                 false,
                 &[2],
                 DType::F64,
-                &Device::Cpu,
+                &Device::Cpu(0),
                 &mut destination,
                 &mut scratch_destination,
             )

@@ -61,14 +61,14 @@ mod tests {
             slot: 0,
             shape: vec![4],
             dtype: DType::F32,
-            device: Device::Cpu,
+            device: Device::Cpu(0),
         })
         .unwrap();
         let y = Node::new(NodeKind::Input {
             slot: 1,
             shape: vec![4],
             dtype: DType::F32,
-            device: Device::Cpu,
+            device: Device::Cpu(0),
         })
         .unwrap();
         let sum = Node::new(NodeKind::Add { a: x, b: y }).unwrap();
@@ -107,7 +107,7 @@ mod tests {
                     slot: 0,
                     shape: vec![1],
                     dtype: DType::F32,
-                    device: Device::Cpu,
+                    device: Device::Cpu(0),
                 })
                 .unwrap();
                 let mut root = leaf;

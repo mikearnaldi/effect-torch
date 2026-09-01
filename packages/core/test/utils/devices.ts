@@ -1,18 +1,22 @@
 import * as BackendApple from "@effect-torch/backend-apple-native"
 import * as BackendCpu from "@effect-torch/backend-cpu"
+import * as BackendCuda from "@effect-torch/backend-cuda"
 import { layer } from "@effect/vitest"
 import * as assert from "@effect/vitest/utils"
 import { Effect, Predicate } from "effect"
 import type { Runtime } from "../../src/index.ts"
 
 /** Backends included in the shared numerical test matrix. */
-export type TestDevice = "cpu" | "metal"
+export type TestDevice = "cpu" | "metal" | "cuda"
 
 /**
  * Whether Metal was available when the test suite was registered. An
  * unavailable backend is omitted rather than silently replaced with CPU.
  */
 export const metalAvailable: boolean = Effect.runSync(BackendApple.isAvailable)
+
+/** Whether CUDA was available when the test suite was registered. */
+export const cudaAvailable: boolean = Effect.runSync(BackendCuda.isAvailable)
 
 /** Encodes numerical fixtures as f32, the shared CPU/Metal dtype. */
 export const floats = (values: ReadonlyArray<number>): Float32Array => new Float32Array(values)
@@ -67,5 +71,8 @@ export const onDevices = (name: string, make: (device: TestDevice) => SuiteFn): 
   layer(BackendCpu.layer)(`${name} (cpu)`, make("cpu"))
   if (metalAvailable) {
     layer(BackendApple.layer())(`${name} (metal)`, make("metal"))
+  }
+  if (cudaAvailable) {
+    layer(BackendCuda.layer())(`${name} (cuda)`, make("cuda"))
   }
 }

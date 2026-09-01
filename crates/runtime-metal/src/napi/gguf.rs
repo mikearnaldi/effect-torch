@@ -225,7 +225,7 @@ async fn load_gguf_on(
             .map_err(gguf_error)?;
             entries.push(NativeGgufLoadedEntry {
                 descriptor: descriptor(&tensor),
-                tensor: NativeTensor::wrap_on(loaded, device_ordinal),
+                tensor: NativeTensor::wrap(loaded),
             });
         }
         Ok(NativeGgufArchive { entries })

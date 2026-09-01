@@ -237,7 +237,7 @@ fn input(next_slot: &mut u32, shape: &[usize]) -> Arc<Node> {
         slot,
         shape: shape.to_vec(),
         dtype: DType::F32,
-        device: Device::Cpu,
+        device: Device::Cpu(0),
     })
 }
 
@@ -246,7 +246,7 @@ fn full(shape: &[usize], value: f64) -> Arc<Node> {
         shape: shape.to_vec(),
         value,
         dtype: DType::F32,
-        device: Device::Cpu,
+        device: Device::Cpu(0),
     })
 }
 

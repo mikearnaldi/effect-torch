@@ -1,6 +1,7 @@
+import { Effect } from "effect"
 import { describe, expect, it } from "vitest"
 import { createRuntimeAdapter, normalizedStructure, structuralCacheKey } from "../src/internal/adapter.ts"
-import type { NativeAddon } from "../src/internal/native-addon.js"
+import type { NativeAddon, NativeDType } from "../src/internal/native-addon.js"
 
 const numberFromBits = (high: number, low: number): number => {
   const view = new DataView(new ArrayBuffer(8))
@@ -21,6 +22,31 @@ describe("Metal executable cache keys", () => {
       description: "Apple Metal device 2",
       ordinal: 2
     })
+  })
+
+  it("passes the selected ordinal into graph leaves", () => {
+    let receivedOrdinal: number | undefined
+    class LazyTensorDouble {
+      static zeros(_shape: Array<number>, _dtype?: NativeDType | null, deviceOrdinal?: number) {
+        receivedOrdinal = deviceOrdinal
+        return new LazyTensorDouble()
+      }
+
+      metadata(): [Array<number>, string] {
+        return [[2], "f32"]
+      }
+    }
+    // SAFETY: This test invokes only LazyTensor.zeros and metadata through the adapter.
+    const native = { LazyTensor: LazyTensorDouble } as NativeAddon
+    const runtime = createRuntimeAdapter(native, 2)
+
+    Effect.runSync(runtime.node({
+      op: "zeros",
+      inputs: [],
+      attributes: { shape: [2], dtype: "f32" }
+    }))
+
+    expect(receivedOrdinal).toBe(2)
   })
 
   it("distinguishes special numbers by their IEEE-754 bits", () => {

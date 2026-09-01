@@ -3,12 +3,12 @@
 // compiling the selected native packages.
 // `--host` must run from one native package directory; it removes non-preserved
 // dist outputs, retains configured non-host matrix binaries, then builds and
-// copies the selected host/profile artifact. `--matrix` runs on macOS from the workspace
+// copies the selected host/profile artifact. `--matrix` runs from the workspace
 // root or one package directory, clears the selected package dist contents,
-// cross-builds configured Darwin/Linux release targets, copies/renames shared
+// cross-builds configured release targets, copies/renames shared
 // libraries to loader-selected .node names, and requires the complete selected
-// matrix at the end. TypeScript build and package verification are separate
-// package-script stages.
+// matrix at the end. Darwin targets require macOS; Linux-only package matrices
+// can run on Linux. TypeScript build and package verification are separate package-script stages.
 
 import fs from "node:fs"
 import path from "node:path"
@@ -151,7 +151,7 @@ const buildHost = (profile) => {
   const directory = fs.realpathSync(process.cwd())
   const nativePackage = nativePackages.find((candidate) => fs.realpathSync(candidate.directory) === directory)
   if (nativePackage === undefined) {
-    fail("--host must be run from packages/backend-cpu, packages/backend-apple-native, or packages/tokenizers")
+    fail("--host must be run from a native package directory")
   }
 
   const target = targetForHost(nativePackage)
@@ -178,11 +178,14 @@ const packagesForWorkingDirectory = () => {
 }
 
 const preflightMatrix = (packages) => {
-  if (process.platform !== "darwin") {
-    fail(`native matrix builds must run on macOS; current platform is "${process.platform}"`)
+  const selectedTargets = targets.filter((target) =>
+    packages.some((nativePackage) => nativePackage.targets.includes(target.suffix))
+  )
+  if (process.platform !== "darwin" && selectedTargets.some((target) => target.platform === "darwin")) {
+    fail(`native matrices containing Darwin targets must run on macOS; current platform is "${process.platform}"`)
   }
 
-  if (!packages.some((nativePackage) => nativePackage.os.includes("linux"))) return
+  if (!selectedTargets.some((target) => target.platform === "linux")) return
 
   const result = spawnSync("cargo", ["zigbuild", "--help"], {
     cwd: rootDirectory,

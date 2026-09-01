@@ -56,7 +56,7 @@ mod tests {
             slot,
             shape,
             dtype: DType::F32,
-            device: Device::Cpu,
+            device: Device::Cpu(0),
         })
         .unwrap()
     }

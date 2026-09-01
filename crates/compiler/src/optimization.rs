@@ -31,7 +31,7 @@
 
 use crate::schedule::{DenseNodeId, GraphIndex};
 use crate::{
-    adamw_exprs, broadcast_compatible, is_supported, lane_strides, pow_expr, sgd_exprs,
+    adamw_exprs, broadcast_compatible, is_fusion_supported, lane_strides, pow_expr, sgd_exprs,
     CompileOptions, KernelExpr, ReduceOp,
 };
 use effect_torch_graph::{Device, Node, NodeKind};
@@ -727,7 +727,7 @@ impl<'a> RegionSelector<'a> {
                         let residual_node = &self.index.order[residual.index()];
                         if residual_node.shape != linear_node.shape
                             || residual_node.dtype != linear_node.dtype
-                            || !matches!(residual_node.device, Device::Metal)
+                            || !residual_node.device.is_metal()
                         {
                             continue;
                         }
@@ -785,8 +785,7 @@ impl<'a> RegionSelector<'a> {
 
     fn absorbable_linear(&self, dense: DenseNodeId) -> Option<[DenseNodeId; 3]> {
         let node = &self.index.order[dense.index()];
-        if !matches!(node.device, Device::Metal) || !matches!(node.dtype, DType::F32 | DType::BF16)
-        {
+        if !node.device.is_metal() || !matches!(node.dtype, DType::F32 | DType::BF16) {
             return None;
         }
         match &node.kind {
@@ -804,7 +803,7 @@ impl<'a> RegionSelector<'a> {
         for (dense_index, node) in self.index.order.iter().enumerate() {
             let dense = DenseNodeId::from_index(dense_index)
                 .expect("GraphIndex validated the semantic node count");
-            if self.reserved[dense_index] || !is_supported(&node.device, node.dtype) {
+            if self.reserved[dense_index] || !is_fusion_supported(&node.device, node.dtype) {
                 continue;
             }
             match &node.kind {
@@ -1286,7 +1285,7 @@ impl<'a> RegionSelector<'a> {
                     let guards_ok = !dims.is_empty()
                         && dims.iter().all(|&dim| dim < rank)
                         && dims.iter().map(|&dim| input_shape[dim]).product::<usize>() > 0
-                        && !(matches!(self.index.order[dense_index].device, Device::Metal)
+                        && !(self.index.order[dense_index].device.is_metal()
                             && (input_shape.iter().product::<usize>() > i32::MAX as usize
                                 || output_shape.iter().product::<usize>() > i32::MAX as usize));
                     if let Some(mut region) = open[input.index()].take() {
@@ -1369,7 +1368,7 @@ impl<'a> RegionSelector<'a> {
             return None;
         }
         let node = &self.index.order[dense.index()];
-        if !is_supported(&node.device, node.dtype) {
+        if !is_fusion_supported(&node.device, node.dtype) {
             return None;
         }
         let input_ok =
@@ -1421,27 +1420,37 @@ impl<'a> RegionSelector<'a> {
             {
                 let comparison = match &cond.kind {
                     NodeKind::Eq { a, b }
-                        if input_ok(a) && input_ok(b) && is_supported(&a.device, a.dtype) =>
+                        if input_ok(a)
+                            && input_ok(b)
+                            && is_fusion_supported(&a.device, a.dtype) =>
                     {
                         Some(ComparisonOperation::Eq)
                     }
                     NodeKind::Gt { a, b }
-                        if input_ok(a) && input_ok(b) && is_supported(&a.device, a.dtype) =>
+                        if input_ok(a)
+                            && input_ok(b)
+                            && is_fusion_supported(&a.device, a.dtype) =>
                     {
                         Some(ComparisonOperation::Gt)
                     }
                     NodeKind::Lt { a, b }
-                        if input_ok(a) && input_ok(b) && is_supported(&a.device, a.dtype) =>
+                        if input_ok(a)
+                            && input_ok(b)
+                            && is_fusion_supported(&a.device, a.dtype) =>
                     {
                         Some(ComparisonOperation::Lt)
                     }
                     NodeKind::Ge { a, b }
-                        if input_ok(a) && input_ok(b) && is_supported(&a.device, a.dtype) =>
+                        if input_ok(a)
+                            && input_ok(b)
+                            && is_fusion_supported(&a.device, a.dtype) =>
                     {
                         Some(ComparisonOperation::Ge)
                     }
                     NodeKind::Le { a, b }
-                        if input_ok(a) && input_ok(b) && is_supported(&a.device, a.dtype) =>
+                        if input_ok(a)
+                            && input_ok(b)
+                            && is_fusion_supported(&a.device, a.dtype) =>
                     {
                         Some(ComparisonOperation::Le)
                     }
@@ -1486,7 +1495,7 @@ impl<'a> RegionSelector<'a> {
             .collect::<Option<Vec<_>>>();
         if region.ops >= 2
             && !region.inputs.is_empty()
-            && !(matches!(node.device, Device::Metal) && element_count > i32::MAX as usize)
+            && !(node.device.is_metal() && element_count > i32::MAX as usize)
         {
             if let Some(strides) = strides {
                 normalize_nodes(&mut region.nodes);
@@ -1788,7 +1797,7 @@ impl<'a> RegionSelector<'a> {
         if inputs.len() + outputs.len() > MAX_BUFFERS || total_ops > MAX_MERGED_OPS {
             return None;
         }
-        if matches!(prefix_region.device, Device::Metal)
+        if prefix_region.device.is_metal()
             && output_shape.iter().product::<usize>() > i32::MAX as usize
         {
             return None;
@@ -2351,9 +2360,9 @@ mod tests {
     fn elementwise_shared_graph(
         materialize_prefix: bool,
     ) -> (Vec<Arc<Node>>, Arc<Node>, Arc<Node>, Arc<Node>) {
-        let x = input(0, &[2, 3], DType::F32, Device::Cpu);
-        let y = input(1, &[2, 3], DType::F32, Device::Cpu);
-        let z = input(2, &[3], DType::F32, Device::Cpu);
+        let x = input(0, &[2, 3], DType::F32, Device::Cpu(0));
+        let y = input(1, &[2, 3], DType::F32, Device::Cpu(0));
+        let z = input(2, &[3], DType::F32, Device::Cpu(0));
         let sum = Node::new(NodeKind::Add { a: x, b: y }).unwrap();
         let prefix = Node::new(NodeKind::Tanh { a: sum.clone() }).unwrap();
         let left = Node::new(NodeKind::Neg { a: prefix.clone() }).unwrap();
@@ -2374,8 +2383,8 @@ mod tests {
 
     #[test]
     fn indexed_selection_preserves_all_semantic_ids_and_arc_identities() {
-        let x = input(0, &[4], DType::F32, Device::Cpu);
-        let y = input(1, &[4], DType::F32, Device::Cpu);
+        let x = input(0, &[4], DType::F32, Device::Cpu(0));
+        let y = input(1, &[4], DType::F32, Device::Cpu(0));
         let sum = Node::new(NodeKind::Add { a: x, b: y }).unwrap();
         let root = Node::new(NodeKind::Tanh { a: sum }).unwrap();
         let index = GraphIndex::new(std::slice::from_ref(&root)).unwrap();
@@ -2408,7 +2417,7 @@ mod tests {
 
     #[test]
     fn optimize_false_is_an_empty_plan_and_duplicate_roots_stay_routed() {
-        let x = input(0, &[4], DType::F32, Device::Cpu);
+        let x = input(0, &[4], DType::F32, Device::Cpu(0));
         let neg = Node::new(NodeKind::Neg { a: x }).unwrap();
         let root = Node::new(NodeKind::Tanh { a: neg }).unwrap();
         let index = GraphIndex::new(&[root.clone(), root.clone()]).unwrap();
@@ -2433,7 +2442,7 @@ mod tests {
 
     #[test]
     fn duplicate_optimized_roots_share_one_region_output() {
-        let x = input(0, &[4], DType::F32, Device::Cpu);
+        let x = input(0, &[4], DType::F32, Device::Cpu(0));
         let neg = Node::new(NodeKind::Neg { a: x }).unwrap();
         let root = Node::new(NodeKind::Tanh { a: neg }).unwrap();
         let index = GraphIndex::new(&[root.clone(), root.clone()]).unwrap();
@@ -2446,8 +2455,8 @@ mod tests {
 
     #[test]
     fn reduction_region_records_normalized_geometry_and_expression_inputs() {
-        let x = input(0, &[2, 3], DType::F64, Device::Cpu);
-        let y = input(1, &[3], DType::F64, Device::Cpu);
+        let x = input(0, &[2, 3], DType::F64, Device::Cpu(0));
+        let y = input(1, &[3], DType::F64, Device::Cpu(0));
         let add = Node::new(NodeKind::Add { a: x, b: y }).unwrap();
         let root = Node::new(NodeKind::Mean {
             a: add.clone(),
@@ -2474,8 +2483,8 @@ mod tests {
 
     #[test]
     fn where_fuses_its_single_use_comparison_as_a_true_select() {
-        let x = input(0, &[4], DType::F32, Device::Cpu);
-        let y = input(1, &[4], DType::F32, Device::Cpu);
+        let x = input(0, &[4], DType::F32, Device::Cpu(0));
+        let y = input(1, &[4], DType::F32, Device::Cpu(0));
         let condition = Node::new(NodeKind::Gt {
             a: x.clone(),
             b: y.clone(),
@@ -2487,10 +2496,10 @@ mod tests {
                 shape: vec![1],
                 value: 2.0,
                 dtype: DType::F32,
-                device: Device::Cpu,
+                device: Device::Cpu(0),
             })
             .unwrap(),
-            b: zeros(&[4], DType::F32, Device::Cpu),
+            b: zeros(&[4], DType::F32, Device::Cpu(0)),
         })
         .unwrap();
         let root = Node::new(NodeKind::Tanh { a: selected }).unwrap();
@@ -2512,10 +2521,10 @@ mod tests {
 
     #[test]
     fn metal_linear_residual_has_exact_coverage_inputs_and_output() {
-        let x = input(0, &[2, 3], DType::BF16, Device::Metal);
-        let weight = input(1, &[3, 4], DType::BF16, Device::Metal);
-        let bias = input(2, &[4], DType::BF16, Device::Metal);
-        let residual = input(3, &[2, 4], DType::BF16, Device::Metal);
+        let x = input(0, &[2, 3], DType::BF16, Device::Metal(0));
+        let weight = input(1, &[3, 4], DType::BF16, Device::Metal(0));
+        let bias = input(2, &[4], DType::BF16, Device::Metal(0));
+        let residual = input(3, &[2, 4], DType::BF16, Device::Metal(0));
         let linear = Node::new(NodeKind::Linear { x, weight, bias }).unwrap();
         let root = Node::new(NodeKind::Add {
             a: linear.clone(),
@@ -2539,9 +2548,9 @@ mod tests {
 
     #[test]
     fn metal_linear_gelu_dual_routes_pre_activation_and_gelu() {
-        let x = input(0, &[2, 3], DType::F32, Device::Metal);
-        let weight = input(1, &[3, 4], DType::F32, Device::Metal);
-        let bias = input(2, &[4], DType::F32, Device::Metal);
+        let x = input(0, &[2, 3], DType::F32, Device::Metal(0));
+        let weight = input(1, &[3, 4], DType::F32, Device::Metal(0));
+        let bias = input(2, &[4], DType::F32, Device::Metal(0));
         let linear = Node::new(NodeKind::Linear { x, weight, bias }).unwrap();
         let gelu = Node::new(NodeKind::Gelu {
             a: linear.clone(),
@@ -2611,8 +2620,8 @@ mod tests {
 
     #[test]
     fn multi_output_incorporates_a_direct_nested_lane_before_its_upstream_merge() {
-        let x = input(0, &[2, 3], DType::F32, Device::Cpu);
-        let y = input(1, &[2, 3], DType::F32, Device::Cpu);
+        let x = input(0, &[2, 3], DType::F32, Device::Cpu(0));
+        let y = input(1, &[2, 3], DType::F32, Device::Cpu(0));
         let sum = Node::new(NodeKind::Add { a: x, b: y }).unwrap();
         let prefix = Node::new(NodeKind::Tanh { a: sum }).unwrap();
         let safe = Node::new(NodeKind::Neg { a: prefix.clone() }).unwrap();
@@ -2665,8 +2674,8 @@ mod tests {
 
     #[test]
     fn multi_output_splits_a_lane_with_transitive_prefix_ancestry() {
-        let x = input(0, &[2, 3], DType::F32, Device::Cpu);
-        let y = input(1, &[2, 3], DType::F32, Device::Cpu);
+        let x = input(0, &[2, 3], DType::F32, Device::Cpu(0));
+        let y = input(1, &[2, 3], DType::F32, Device::Cpu(0));
         let sum = Node::new(NodeKind::Add {
             a: x.clone(),
             b: y.clone(),
@@ -2755,8 +2764,8 @@ mod tests {
     #[test]
     fn multi_output_dependency_work_is_bounded_on_a_wide_graph() {
         let width = 256;
-        let x = input(0, &[8], DType::F32, Device::Cpu);
-        let y = input(1, &[8], DType::F32, Device::Cpu);
+        let x = input(0, &[8], DType::F32, Device::Cpu(0));
+        let y = input(1, &[8], DType::F32, Device::Cpu(0));
         let prefix = Node::new(NodeKind::Tanh {
             a: Node::new(NodeKind::Add { a: x.clone(), b: y }).unwrap(),
         })
@@ -2794,8 +2803,8 @@ mod tests {
 
     #[test]
     fn multi_output_worklist_preserves_nested_shared_prefix_opportunities() {
-        let x = input(0, &[2, 3], DType::F32, Device::Cpu);
-        let y = input(1, &[2, 3], DType::F32, Device::Cpu);
+        let x = input(0, &[2, 3], DType::F32, Device::Cpu(0));
+        let y = input(1, &[2, 3], DType::F32, Device::Cpu(0));
         let sum = Node::new(NodeKind::Add { a: x, b: y }).unwrap();
         let prefix = Node::new(NodeKind::Tanh { a: sum }).unwrap();
         let sibling = Node::new(NodeKind::Neg { a: prefix.clone() }).unwrap();
@@ -2831,8 +2840,8 @@ mod tests {
 
     #[test]
     fn shared_softmax_gradient_reduction_topology_has_an_acyclic_plan() {
-        let x = input(0, &[4, 4], DType::F32, Device::Cpu);
-        let weight = input(1, &[4, 4], DType::F32, Device::Cpu);
+        let x = input(0, &[4, 4], DType::F32, Device::Cpu(0));
+        let weight = input(1, &[4, 4], DType::F32, Device::Cpu(0));
         let row_max = Node::new(NodeKind::Max {
             a: x.clone(),
             dims: vec![1],
@@ -2911,17 +2920,17 @@ mod tests {
     #[test]
     fn grouped_adamw_preserves_bucket_order_and_maps_each_semantic_output() {
         let scalar_inputs = [
-            zeros(&[], DType::F32, Device::Cpu),
-            zeros(&[], DType::F32, Device::Cpu),
-            zeros(&[], DType::F32, Device::Cpu),
+            zeros(&[], DType::F32, Device::Cpu(0)),
+            zeros(&[], DType::F32, Device::Cpu(0)),
+            zeros(&[], DType::F32, Device::Cpu(0)),
         ];
-        let first = adamw_step(DType::F32, Device::Cpu, &scalar_inputs);
+        let first = adamw_step(DType::F32, Device::Cpu(0), &scalar_inputs);
         let first_m = Node::new(NodeKind::AdamWOut {
             step: first.clone(),
             index: 1,
         })
         .unwrap();
-        let second = adamw_step(DType::F32, Device::Cpu, &scalar_inputs);
+        let second = adamw_step(DType::F32, Device::Cpu(0), &scalar_inputs);
         let second_v = Node::new(NodeKind::AdamWOut {
             step: second.clone(),
             index: 2,
@@ -2968,7 +2977,7 @@ mod tests {
 
     #[test]
     fn grouped_adamw_requires_exact_runtime_scalar_ids_on_cpu_and_metal() {
-        for device in [Device::Cpu, Device::Metal] {
+        for device in [Device::Cpu(0), Device::Metal(0)] {
             let shared = [
                 zeros(&[], DType::F32, device.clone()),
                 zeros(&[], DType::F32, device.clone()),
@@ -3033,11 +3042,11 @@ mod tests {
 
     #[test]
     fn sgd_region_records_expression_scalar_order_and_selector_routes() {
-        let param = zeros(&[8], DType::F64, Device::Cpu);
-        let grad = zeros(&[8], DType::F64, Device::Cpu);
-        let velocity = zeros(&[8], DType::F64, Device::Cpu);
-        let first = zeros(&[], DType::F64, Device::Cpu);
-        let lr = zeros(&[], DType::F64, Device::Cpu);
+        let param = zeros(&[8], DType::F64, Device::Cpu(0));
+        let grad = zeros(&[8], DType::F64, Device::Cpu(0));
+        let velocity = zeros(&[8], DType::F64, Device::Cpu(0));
+        let first = zeros(&[], DType::F64, Device::Cpu(0));
+        let lr = zeros(&[], DType::F64, Device::Cpu(0));
         let step = Node::new(NodeKind::SgdStep {
             param,
             grad,
@@ -3077,7 +3086,7 @@ mod tests {
 
     #[test]
     fn validation_rejects_a_corrupt_output_route() {
-        let x = input(0, &[4], DType::F32, Device::Cpu);
+        let x = input(0, &[4], DType::F32, Device::Cpu(0));
         let neg = Node::new(NodeKind::Neg { a: x }).unwrap();
         let root = Node::new(NodeKind::Tanh { a: neg }).unwrap();
         let index = GraphIndex::new(std::slice::from_ref(&root)).unwrap();

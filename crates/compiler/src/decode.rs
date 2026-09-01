@@ -853,7 +853,7 @@ mod tests {
 
     #[test]
     fn specializes_all_stateful_semantics_in_one_new_graph_generation() {
-        for device in [Device::Cpu, Device::Metal] {
+        for device in [Device::Cpu(0), Device::Metal(0)] {
             let shared = tensor(&[1, 1, 2, 4], DType::F32, device.clone());
             let attention = Node::new(NodeKind::Sdpa {
                 q: shared.clone(),
@@ -928,7 +928,7 @@ mod tests {
 
     #[test]
     fn bidirectional_mode_specializes_non_causal_attention_and_rejects_packed_layout() {
-        for device in [Device::Cpu, Device::Metal] {
+        for device in [Device::Cpu(0), Device::Metal(0)] {
             let causal = attention(1, 2, 3, 4, 0.5, true, device.clone());
             let (causal_specialized, _) = specialize_decode_layout_outputs(
                 &[causal],
@@ -988,10 +988,10 @@ mod tests {
     #[test]
     fn learned_positions_build_scalar_and_batched_cursor_graphs() {
         for (device, batch) in [
-            (Device::Cpu, 1usize),
-            (Device::Cpu, 3usize),
-            (Device::Metal, 1usize),
-            (Device::Metal, 3usize),
+            (Device::Cpu(0), 1usize),
+            (Device::Cpu(0), 3usize),
+            (Device::Metal(0), 1usize),
+            (Device::Metal(0), 3usize),
         ] {
             let q = input(0, &[batch, 1, 2, 4], DType::F32, device.clone());
             let k = input(1, &[batch, 1, 2, 4], DType::F32, device.clone());
@@ -1055,8 +1055,8 @@ mod tests {
     #[test]
     fn geometry_and_dtype_validation_preserve_backend_errors() {
         let cpu_attention = [
-            attention(1, 2, 1, 4, 1.0, true, Device::Cpu),
-            attention(1, 3, 1, 4, 1.0, true, Device::Cpu),
+            attention(1, 2, 1, 4, 1.0, true, Device::Cpu(0)),
+            attention(1, 3, 1, 4, 1.0, true, Device::Cpu(0)),
         ];
         assert_eq!(
             specialize_decode(&cpu_attention, None, 1, false)
@@ -1065,8 +1065,8 @@ mod tests {
             "decode: attention layers disagree on head geometry ((3, 4) vs (2, 4))"
         );
         let metal_attention = [
-            attention(1, 2, 1, 4, 1.0, true, Device::Metal),
-            attention(1, 3, 1, 4, 1.0, true, Device::Metal),
+            attention(1, 2, 1, 4, 1.0, true, Device::Metal(0)),
+            attention(1, 3, 1, 4, 1.0, true, Device::Metal(0)),
         ];
         assert_eq!(
             specialize_decode(&metal_attention, None, 1, false)
@@ -1075,24 +1075,24 @@ mod tests {
             "decode: attention layers disagree on head geometry ([3, 4] vs [2, 4])"
         );
         let cpu_kda = [
-            kda(1, 2, 1, 4, 3, DType::F32, 1.0, Device::Cpu),
-            kda(1, 3, 1, 4, 3, DType::F32, 1.0, Device::Cpu),
+            kda(1, 2, 1, 4, 3, DType::F32, 1.0, Device::Cpu(0)),
+            kda(1, 3, 1, 4, 3, DType::F32, 1.0, Device::Cpu(0)),
         ];
         assert_eq!(
             specialize_decode(&cpu_kda, None, 1, false).err().unwrap(),
             "decode: kda layers disagree on head geometry ((3, 4, 3, F32) vs (2, 4, 3, F32))"
         );
         let conv = [
-            short_conv(1, 1, 3, 2, Device::Cpu),
-            short_conv(1, 1, 4, 2, Device::Cpu),
-            attention(1, 1, 1, 2, 1.0, true, Device::Cpu),
+            short_conv(1, 1, 3, 2, Device::Cpu(0)),
+            short_conv(1, 1, 4, 2, Device::Cpu(0)),
+            attention(1, 1, 1, 2, 1.0, true, Device::Cpu(0)),
         ];
         assert_eq!(
             specialize_decode(&conv, None, 1, false).err().unwrap(),
             "decode: short conv layers disagree on geometry ((4, 2) vs (3, 2))"
         );
 
-        let malformed_kda = kda(1, 1, 1, 2, 2, DType::F32, 1.0, Device::Cpu);
+        let malformed_kda = kda(1, 1, 1, 2, 2, DType::F32, 1.0, Device::Cpu(0));
         let NodeKind::KdaChunk {
             q,
             k,
@@ -1140,14 +1140,14 @@ mod tests {
             "decode: kda state caching expects layers of shape [1, H, T, D], got [1, 1, 2]"
         );
         assert_eq!(
-            specialize_decode(&[short_conv(1, 2, 3, 2, Device::Cpu)], None, 2, false)
+            specialize_decode(&[short_conv(1, 2, 3, 2, Device::Cpu(0))], None, 2, false)
                 .err()
                 .unwrap(),
             "decode: conv state caching expects layers of shape [2, T, C], got [1, 2, 3]"
         );
         assert_eq!(
             specialize_decode(
-                &[attention(1, 1, 1, 2, 1.0, false, Device::Cpu)],
+                &[attention(1, 1, 1, 2, 1.0, false, Device::Cpu(0))],
                 None,
                 1,
                 false
@@ -1158,7 +1158,7 @@ mod tests {
         );
         assert_eq!(
             specialize_decode(
-                &[kda(1, 1, 1, 2, 2, DType::BF16, 1.0, Device::Cpu)],
+                &[kda(1, 1, 1, 2, 2, DType::BF16, 1.0, Device::Cpu(0))],
                 None,
                 1,
                 false
@@ -1170,7 +1170,7 @@ mod tests {
         let scalar = Node::new(NodeKind::ScalarInput {
             slot: 0,
             dtype: DType::I64,
-            device: Device::Cpu,
+            device: Device::Cpu(0),
         })
         .unwrap();
         assert_eq!(
@@ -1178,20 +1178,20 @@ mod tests {
             "decode: runtime scalar inputs are not supported in inference graphs"
         );
         let (stateless, stateless_geometry) =
-            specialize_decode(&[tensor(&[1], DType::F32, Device::Cpu)], None, 1, false).unwrap();
+            specialize_decode(&[tensor(&[1], DType::F32, Device::Cpu(0))], None, 1, false).unwrap();
         assert_eq!(stateless.len(), 1);
         assert_eq!(stateless_geometry.layers, 0);
         assert_eq!(stateless_geometry.kda.layers, 0);
         assert_eq!(stateless_geometry.conv.layers, 0);
 
         let (_, conv_geometry) =
-            specialize_decode(&[short_conv(1, 2, 3, 2, Device::Cpu)], None, 1, false).unwrap();
+            specialize_decode(&[short_conv(1, 2, 3, 2, Device::Cpu(0))], None, 1, false).unwrap();
         assert_eq!(conv_geometry.layers, 0);
         assert_eq!(conv_geometry.kda.layers, 0);
         assert_eq!(conv_geometry.conv.layers, 1);
 
         let (_, cpu_geometry) = specialize_decode(
-            &[kda(1, 1, 1, 2, 3, DType::F64, 1.0, Device::Cpu)],
+            &[kda(1, 1, 1, 2, 3, DType::F64, 1.0, Device::Cpu(0))],
             None,
             1,
             false,
@@ -1200,7 +1200,7 @@ mod tests {
         assert_eq!(cpu_geometry.kda.dtype, DType::F64);
         for dtype in [DType::F32, DType::BF16] {
             let (_, metal_geometry) = specialize_decode(
-                &[kda(1, 1, 1, 2, 3, dtype, 1.0, Device::Metal)],
+                &[kda(1, 1, 1, 2, 3, dtype, 1.0, Device::Metal(0))],
                 None,
                 1,
                 false,
@@ -1210,8 +1210,8 @@ mod tests {
         }
         let (_, mixed_metal_geometry) = specialize_decode(
             &[
-                kda(1, 1, 1, 2, 3, DType::F32, 1.0, Device::Metal),
-                kda(1, 1, 1, 2, 3, DType::BF16, 1.0, Device::Metal),
+                kda(1, 1, 1, 2, 3, DType::F32, 1.0, Device::Metal(0)),
+                kda(1, 1, 1, 2, 3, DType::BF16, 1.0, Device::Metal(0)),
             ],
             None,
             1,
@@ -1223,7 +1223,7 @@ mod tests {
         assert!(Node::new(NodeKind::Zeros {
             shape: vec![1, 1, 1, 2],
             dtype: DType::F64,
-            device: Device::Metal,
+            device: Device::Metal(0),
         })
         .is_err());
     }
@@ -1231,12 +1231,12 @@ mod tests {
     #[test]
     fn root_order_and_layer_numbering_are_stable() {
         let roots = vec![
-            attention(1, 2, 1, 4, 1.0, true, Device::Cpu),
-            attention(1, 2, 1, 4, 2.0, true, Device::Cpu),
-            kda(1, 2, 1, 4, 3, DType::F32, 3.0, Device::Cpu),
-            kda(1, 2, 1, 4, 3, DType::F32, 4.0, Device::Cpu),
-            short_conv(1, 1, 3, 2, Device::Cpu),
-            short_conv(1, 1, 3, 2, Device::Cpu),
+            attention(1, 2, 1, 4, 1.0, true, Device::Cpu(0)),
+            attention(1, 2, 1, 4, 2.0, true, Device::Cpu(0)),
+            kda(1, 2, 1, 4, 3, DType::F32, 3.0, Device::Cpu(0)),
+            kda(1, 2, 1, 4, 3, DType::F32, 4.0, Device::Cpu(0)),
+            short_conv(1, 1, 3, 2, Device::Cpu(0)),
+            short_conv(1, 1, 3, 2, Device::Cpu(0)),
         ];
 
         for _ in 0..2 {
@@ -1275,9 +1275,9 @@ mod tests {
     fn resolved_attention_windows_determine_retention_policy() {
         let make = |window| {
             Node::new(NodeKind::Sdpa {
-                q: tensor(&[1, 4, 1, 2], DType::F32, Device::Cpu),
-                k: tensor(&[1, 2, 1, 2], DType::F32, Device::Cpu),
-                v: tensor(&[1, 2, 1, 2], DType::F32, Device::Cpu),
+                q: tensor(&[1, 4, 1, 2], DType::F32, Device::Cpu(0)),
+                k: tensor(&[1, 2, 1, 2], DType::F32, Device::Cpu(0)),
+                v: tensor(&[1, 2, 1, 2], DType::F32, Device::Cpu(0)),
                 scale: 1.0,
                 causal: true,
                 window,
@@ -1328,10 +1328,10 @@ mod tests {
 
     #[test]
     fn last_token_row_moves_through_scalar_head_epilogue_before_linear() {
-        let x = input(0, &[1, 4, 256], DType::F32, Device::Cpu);
-        let weight = tensor(&[256, 4], DType::F32, Device::Cpu);
-        let bias = tensor(&[4], DType::F32, Device::Cpu);
-        let scalar = tensor(&[], DType::F32, Device::Cpu);
+        let x = input(0, &[1, 4, 256], DType::F32, Device::Cpu(0));
+        let weight = tensor(&[256, 4], DType::F32, Device::Cpu(0));
+        let bias = tensor(&[4], DType::F32, Device::Cpu(0));
+        let scalar = tensor(&[], DType::F32, Device::Cpu(0));
         let head = Node::new(NodeKind::Linear { x, weight, bias }).unwrap();
         let scaled = Node::new(NodeKind::Mul {
             a: head,
@@ -1369,7 +1369,7 @@ mod tests {
 
     #[test]
     fn last_token_row_rewrites_roots_into_state_driven_selectors() {
-        for device in [Device::Cpu, Device::Metal] {
+        for device in [Device::Cpu(0), Device::Metal(0)] {
             let single = input(0, &[1, 4, 8], DType::F32, device.clone());
             let (roots, _) = specialize_decode(&[single], None, 1, true).unwrap();
             assert_eq!(roots.len(), 1);
@@ -1424,7 +1424,7 @@ mod tests {
 
     #[test]
     fn per_root_output_selection_keeps_mapping_and_batches_hidden_rows() {
-        for device in [Device::Cpu, Device::Metal] {
+        for device in [Device::Cpu(0), Device::Metal(0)] {
             let logits = input(0, &[2, 4, 8], DType::F32, device.clone());
             let hidden = input(1, &[2, 4, 6], DType::F32, device);
             let (roots, _) = specialize_decode_layout_outputs(
@@ -1447,7 +1447,7 @@ mod tests {
             assert!(matches!(roots[2].kind, NodeKind::Concat { .. }));
         }
 
-        let root = input(0, &[2, 1, 8], DType::F32, Device::Cpu);
+        let root = input(0, &[2, 1, 8], DType::F32, Device::Cpu(0));
         let error = specialize_decode_layout_outputs(
             std::slice::from_ref(&root),
             None,
@@ -1473,7 +1473,7 @@ mod tests {
 
     #[test]
     fn packed_causal_chains_separate_physical_batch_from_graph_rows() {
-        for device in [Device::Cpu, Device::Metal] {
+        for device in [Device::Cpu(0), Device::Metal(0)] {
             let layout = DecodeLayout::packed_causal_chains(2, 3);
             assert_eq!(layout.batch(), 2);
             assert_eq!(layout.graph_rows().unwrap(), 6);
@@ -1509,7 +1509,7 @@ mod tests {
             assert_eq!(cursors, 1);
         }
 
-        let malformed = input(0, &[6, 2, 8], DType::F32, Device::Cpu);
+        let malformed = input(0, &[6, 2, 8], DType::F32, Device::Cpu(0));
         assert_eq!(
             specialize_decode_layout(
                 &[malformed],
@@ -1523,7 +1523,7 @@ mod tests {
         );
         assert_eq!(
             specialize_decode_layout(
-                &[input(0, &[6, 1, 8], DType::F32, Device::Cpu)],
+                &[input(0, &[6, 1, 8], DType::F32, Device::Cpu(0))],
                 None,
                 DecodeLayout::packed_causal_chains(2, 3),
                 true,
@@ -1539,7 +1539,7 @@ mod tests {
         std::thread::Builder::new()
             .stack_size(256 * 1024)
             .spawn(|| {
-                let mut root = attention(1, 1, 1, 2, 1.0, true, Device::Cpu);
+                let mut root = attention(1, 1, 1, 2, 1.0, true, Device::Cpu(0));
                 for _ in 0..50_000 {
                     root = Node::new(NodeKind::Neg { a: root }).unwrap();
                 }

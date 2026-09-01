@@ -517,6 +517,14 @@ onDevices("Tensor", (device) => (it) => {
         deep(normalized.shape, [2, 2, 4])
         deep(yield* values(normalized), expected(false))
         deep(yield* values(yield* Tensor.rmsNorm(input, weight, eps)), expected(true))
+
+        const wide = yield* Tensor.ones([2, 1024], { dtype: floatDtype })
+        const wideValues = yield* values(yield* Tensor.rmsNorm(wide, undefined, eps))
+        const wideExpected = 1 / Math.sqrt(1 + eps)
+        expect(wideValues).toHaveLength(2048)
+        for (const value of wideValues) {
+          expect(Math.abs(value - wideExpected)).toBeLessThan(TOL)
+        }
       }))
 
     it.effect("rmsNorm validates input and weight shapes", () =>
@@ -889,7 +897,7 @@ onDevices("Tensor", (device) => (it) => {
         const m = yield* Tensor.fromTypedArray(floats([1, 2, 3, 4]), [2, 2])
         deep(yield* values(yield* Tensor.trace(m)), [5])
       }))
-    if (device === "cpu") {
+    if (device !== "metal") {
       it.effect("inverse/det/solve", () =>
         Effect.gen(function*() {
           const a = yield* Tensor.fromTypedArray(floats([4, 1, 1, 3]), [2, 2])

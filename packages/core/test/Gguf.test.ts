@@ -149,6 +149,97 @@ const fixture = (): Buffer => {
   return Buffer.concat([header, Buffer.alloc(padding), Buffer.alloc(2 * 144)])
 }
 
+const f16 = (buffer: Buffer, offset: number, bits: number): void => {
+  buffer.writeUInt16LE(bits, offset)
+}
+
+const oneBlock = (format: Runtime.TensorStorageEncoding): Buffer => {
+  switch (format) {
+    case "Q2_K": {
+      const block = Buffer.alloc(84)
+      block.fill(0x01, 0, 16)
+      block.fill(0x55, 16, 80)
+      f16(block, 80, 0x3c00)
+      return block
+    }
+    case "Q3_K": {
+      const block = Buffer.alloc(110)
+      block.fill(0xff, 0, 32)
+      block.fill(0x55, 32, 96)
+      block.fill(0x11, 96, 104)
+      block.fill(0xaa, 104, 108)
+      f16(block, 108, 0x3c00)
+      return block
+    }
+    case "Q4_K":
+    case "Q5_K": {
+      const q5 = format === "Q5_K"
+      const block = Buffer.alloc(q5 ? 176 : 144)
+      f16(block, 0, 0x3c00)
+      block.fill(0x01, 4, 8)
+      block.fill(0x01, 12, 16)
+      block.fill(0x11, q5 ? 48 : 16)
+      return block
+    }
+    case "Q6_K": {
+      const block = Buffer.alloc(210)
+      block.fill(0x11, 0, 128)
+      block.fill(0xaa, 128, 192)
+      block.fill(0x01, 192, 208)
+      f16(block, 208, 0x3c00)
+      return block
+    }
+  }
+}
+
+const kquantFixture = (): Buffer => {
+  const tensors = ([
+    ["q2", "Q2_K", 10],
+    ["q3", "Q3_K", 11],
+    ["q4", "Q4_K", 12],
+    ["q5", "Q5_K", 13],
+    ["q6", "Q6_K", 14]
+  ] as const).map(([name, format, type]) => ({
+    name,
+    format,
+    type,
+    block: Buffer.concat(Array.from({ length: 4 }, () => oneBlock(format)))
+  }))
+  let offset = 0
+  const offsets = tensors.map(({ block }) => {
+    const current = offset
+    offset = Math.ceil((offset + block.length) / 32) * 32
+    return current
+  })
+  const header = Buffer.concat([
+    Buffer.from("GGUF"),
+    u32(3),
+    u64(tensors.length),
+    u64(3),
+    string("general.architecture"),
+    u32(8),
+    string("all-kquants"),
+    string("general.alignment"),
+    u32(4),
+    u32(32),
+    string("general.quantization_version"),
+    u32(4),
+    u32(2),
+    ...tensors.flatMap(({ name, type }, index) => [
+      string(name),
+      u32(2),
+      u64(1024),
+      u64(1),
+      u32(type),
+      u64(offsets[index])
+    ])
+  ])
+  const data = Buffer.alloc(offset)
+  tensors.forEach(({ block }, index) => block.copy(data, offsets[index]))
+  const padding = (32 - header.length % 32) % 32
+  return Buffer.concat([header, Buffer.alloc(padding), data])
+}
+
 it.effect("loads by exact architecture and returns tensors in model parameter order", () => {
   const dense = tensor(denseDescriptor)
   const packed = tensor(encodedDescriptor)
@@ -384,6 +475,47 @@ onDevices("GGUF", () => (it) => {
       expect(yield* Tensor.toNumberArray(result)).toEqual([0, 0])
       yield* Tensor.clear(result)
       yield* Tensor.clear(identity)
+      yield* Tensor.clearAll(loaded.params)
+    }).pipe(
+      Effect.ensuring(Effect.sync(() => fs.rmSync(directory, { recursive: true, force: true })))
+    )
+  })
+
+  it.effect("executes linear and embedding with every K-quant encoding", () => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), "effect-torch-kquants-"))
+    const file = path.join(directory, "all-kquants.gguf")
+    fs.writeFileSync(file, kquantFixture())
+
+    return Effect.gen(function*() {
+      const loaded = yield* Gguf.loadModel(file, {
+        architecture: "all-kquants",
+        create: () =>
+          Model.define({
+            parameterSpecs: ["q2", "q3", "q4", "q5", "q6"].map((name) => ({
+              name,
+              shape: [1, 1024],
+              initializer: { _tag: "Normal" as const, scale: 1 }
+            })),
+            forward: (_, input) => Effect.succeed(loaderOnlyIdentity(input))
+          })
+      })
+      const input = yield* Tensor.ones([16, 1024])
+      const indexes = yield* Tensor.fromTypedArray(new Uint32Array([0]), [1])
+
+      for (const weight of loaded.params) {
+        const projected = yield* Tensor.linearRows(input, weight)
+        const embedded = yield* Tensor.embedding(indexes, { weight })
+        const [projectedValue, embeddedValue] = yield* Tensor.compute([projected, embedded])
+        const projectedValues = yield* Tensor.toNumberArray(projectedValue)
+        expect(projectedValues).toHaveLength(16)
+        for (const value of projectedValues) {
+          expect(Math.abs(value - 1024) / 1024).toBeLessThanOrEqual(1e-4)
+        }
+        expect(yield* Tensor.toNumberArray(embeddedValue)).toEqual(new Array(1024).fill(1))
+        yield* Tensor.clear(projectedValue)
+        yield* Tensor.clear(embeddedValue)
+      }
+
       yield* Tensor.clearAll(loaded.params)
     }).pipe(
       Effect.ensuring(Effect.sync(() => fs.rmSync(directory, { recursive: true, force: true })))

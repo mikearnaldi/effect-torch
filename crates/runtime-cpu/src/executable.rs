@@ -76,7 +76,7 @@ pub type Node = GraphNode;
 static INVOCATION_NONCE: AtomicU64 = AtomicU64::new(0);
 
 fn cpu_device() -> Device {
-    Device::Cpu
+    Device::Cpu(0)
 }
 
 /// Source of a bound input value. It is either a declared program-signature
@@ -3134,8 +3134,8 @@ pub fn load_generated_values(index: &GraphIndex) -> Result<Vec<CpuGeneratedValue
             if node.id != leaf.node_id
                 || node.shape != leaf.shape
                 || node.dtype != leaf.dtype
-                || !node.device.is_cpu()
-                || !leaf.device.is_cpu()
+                || !node.device.same_device(&cpu_device())
+                || !leaf.device.same_device(&cpu_device())
             {
                 return Err(format!(
                     "compile: generated binding {} does not match its graph index metadata",
@@ -3202,8 +3202,8 @@ fn validate_generated_values(
             || slot_identity != leaf.slot_identity
             || node.shape != leaf.shape
             || node.dtype != leaf.dtype
-            || !node.device.is_cpu()
-            || !leaf.device.is_cpu()
+            || !node.device.same_device(&cpu_device())
+            || !leaf.device.same_device(&cpu_device())
         {
             return Err(format!(
                 "compile: prepared generated binding {} has the wrong node identity or metadata",
@@ -3269,6 +3269,13 @@ fn compile_prepared_internal(
     }
     if ce_chunk_size == 0 {
         return Err("compile: CE chunk size must be positive".to_string());
+    }
+    if index
+        .order
+        .iter()
+        .any(|node| node.device.is_cpu() && !node.device.same_device(&cpu_device()))
+    {
+        return Err("compile: CPU runtime only supports device cpu:0".to_string());
     }
     let state_cursor =
         state.map(|state| StateCursorSlot::new(state.cursor_slot, state.cursor_tensor));
@@ -4968,13 +4975,13 @@ mod tests {
             slot: 0,
             shape: vec![2],
             dtype: DType::F32,
-            device: Device::Cpu,
+            device: Device::Cpu(0),
         })
         .unwrap();
         let scalar = Node::new(NodeKind::ScalarInput {
             slot: 1,
             dtype: DType::F32,
-            device: Device::Cpu,
+            device: Device::Cpu(0),
         })
         .unwrap();
         let root = Node::new(NodeKind::Add {
@@ -5172,13 +5179,13 @@ mod tests {
             slot: 0,
             shape: vec![2],
             dtype: DType::F32,
-            device: Device::Cpu,
+            device: Device::Cpu(0),
         })
         .unwrap();
         let scalar = Node::new(NodeKind::ScalarInput {
             slot: 1,
             dtype: DType::F32,
-            device: Device::Cpu,
+            device: Device::Cpu(0),
         })
         .unwrap();
         let root = Node::new(NodeKind::Add {
@@ -5239,7 +5246,7 @@ mod tests {
                     slot,
                     shape: vec![batch, 1, 2, 4],
                     dtype: DType::F32,
-                    device: Device::Cpu,
+                    device: Device::Cpu(0),
                 })
                 .unwrap()
             };
@@ -5256,7 +5263,7 @@ mod tests {
                 weight: Node::new(NodeKind::Zeros {
                     shape: vec![128, 6],
                     dtype: DType::F32,
-                    device: Device::Cpu,
+                    device: Device::Cpu(0),
                 })
                 .unwrap(),
                 seq_len: 2,
@@ -5317,7 +5324,7 @@ mod tests {
         let random = Node::new(NodeKind::Randn {
             shape: vec![32],
             dtype: DType::F32,
-            device: Device::Cpu,
+            device: Device::Cpu(0),
         })
         .unwrap();
         let compilation = compile(&[random], options(false), 1024).unwrap();
@@ -5339,7 +5346,7 @@ mod tests {
             slot: 0,
             shape: vec![2],
             dtype: DType::F32,
-            device: Device::Cpu,
+            device: Device::Cpu(0),
         })
         .unwrap();
         let output = Node::new(NodeKind::Neg { a: input }).unwrap();
@@ -5376,7 +5383,7 @@ mod tests {
             slot: 0,
             shape: vec![2, 2],
             dtype: DType::F32,
-            device: Device::Cpu,
+            device: Device::Cpu(0),
         })
         .unwrap();
         let root = Node::new(NodeKind::Add {
@@ -5508,7 +5515,7 @@ mod tests {
         let random = Node::new(NodeKind::Randn {
             shape: vec![16],
             dtype: DType::F32,
-            device: Device::Cpu,
+            device: Device::Cpu(0),
         })
         .unwrap();
         let compilation = compile(&[random.clone(), random], options(false), 1024).unwrap();
@@ -5533,7 +5540,7 @@ mod tests {
         let random = Node::new(NodeKind::Randn {
             shape: vec![16],
             dtype: DType::F32,
-            device: Device::Cpu,
+            device: Device::Cpu(0),
         })
         .unwrap();
         let executables = [
@@ -5579,7 +5586,7 @@ mod tests {
         let random = Node::new(NodeKind::Randn {
             shape: vec![16],
             dtype: DType::F32,
-            device: Device::Cpu,
+            device: Device::Cpu(0),
         })
         .unwrap();
         let random_id = random.id;
@@ -5789,10 +5796,21 @@ mod tests {
 
     #[test]
     fn unsupported_device_dtype_and_layout_fail_during_compilation() {
+        let other_cpu = Node::new(NodeKind::Zeros {
+            shape: vec![1],
+            dtype: DType::F32,
+            device: Device::Cpu(1),
+        })
+        .unwrap();
+        assert_eq!(
+            compile(&[other_cpu], options(false), 1024).err().unwrap(),
+            "compile: CPU runtime only supports device cpu:0"
+        );
+
         let metal = Node::new(NodeKind::Zeros {
             shape: vec![1],
             dtype: DType::F32,
-            device: Device::Metal,
+            device: Device::Metal(0),
         })
         .unwrap();
         assert!(compile(&[metal], options(false), 1024)
@@ -5819,7 +5837,7 @@ mod tests {
         let overflowing = Node::new(NodeKind::Zeros {
             shape: vec![usize::MAX, 2],
             dtype: DType::F32,
-            device: Device::Cpu,
+            device: Device::Cpu(0),
         })
         .unwrap();
         assert!(compile(&[overflowing], options(false), 1024)

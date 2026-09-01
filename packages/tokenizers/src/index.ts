@@ -293,6 +293,18 @@ export interface DecodeOptions {
 }
 
 /**
+ * Stateful decoder for autoregressive token ids. A step can return no text
+ * while the tokenizer waits for a complete byte sequence.
+ *
+ * @since 0.1.0
+ * @category models
+ */
+export interface DecodeStream {
+  /** Adds one token and returns the next stable text chunk, if available. */
+  readonly step: (id: number) => Effect.Effect<string | undefined, TokenizerError>
+}
+
+/**
  * Shared configuration with no facade padding or truncation and the `"Never"`
  * special-token policy. It does not disable native padding or truncation from
  * a loaded tokenizer. {@link SpecialTokenPolicy} documents the limits of
@@ -611,6 +623,13 @@ export interface Tokenizer extends Pipeable {
     options?: DecodeOptions
   ) => Effect.Effect<string, TokenizerError>
   /**
+   * Creates an independent stateful decoder for autoregressive token ids.
+   *
+   * @since 0.1.0
+   * @category models
+   */
+  readonly decodeStream: (options?: DecodeOptions) => DecodeStream
+  /**
    * Decodes each outer input as an independent sequence in outer order. It
    * ignores inner {@link TokenIds} shapes and does not split a `[B, T]` value
    * into rows. An empty outer array returns an empty array. JavaScript blocks
@@ -766,6 +785,16 @@ const make = (
         try: () => handle.decode(resolved, options?.skipSpecialTokens ?? false),
         catch: toTokenizerError("decode")
       }))
+  self.decodeStream = (options?: DecodeOptions): DecodeStream => {
+    const stream = handle.decodeStream(options?.skipSpecialTokens ?? false)
+    return {
+      step: (id) =>
+        Effect.try({
+          try: () => stream.step(id) ?? undefined,
+          catch: toTokenizerError("decodeStream")
+        })
+    }
+  }
   self.decodeBatch = (
     batch: ReadonlyArray<TokenIdInput>,
     options?: DecodeOptions

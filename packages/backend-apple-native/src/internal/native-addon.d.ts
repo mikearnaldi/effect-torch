@@ -32,18 +32,18 @@ export declare class LazyTensor {
   get shape(): Array<number>
   get dtype(): string
   metadata(): [Array<number>, string]
-  static zeros(shape: Array<number>, dtype?: NativeDType | undefined | null): LazyTensor
-  static ones(shape: Array<number>, dtype?: NativeDType | undefined | null): LazyTensor
-  static full(shape: Array<number>, value: number, dtype?: NativeDType | undefined | null): LazyTensor
-  static randn(shape: Array<number>, dtype?: NativeDType | undefined | null): LazyTensor
-  static uniform(shape: Array<number>, lo: number, hi: number, dtype?: NativeDType | undefined | null): LazyTensor
-  static arange(start: number, end: number, step: number, dtype?: NativeDType | undefined | null): LazyTensor
-  static eye(n: number, dtype?: NativeDType | undefined | null): LazyTensor
-  static constant(value: number, dtype?: NativeDType | undefined | null): LazyTensor
-  static fromBytes(data: Uint8Array, shape: Array<number>, dtype?: NativeDType | undefined | null): LazyTensor
+  static zeros(shape: Array<number>, dtype?: NativeDType | undefined | null, deviceOrdinal?: number | undefined | null): LazyTensor
+  static ones(shape: Array<number>, dtype?: NativeDType | undefined | null, deviceOrdinal?: number | undefined | null): LazyTensor
+  static full(shape: Array<number>, value: number, dtype?: NativeDType | undefined | null, deviceOrdinal?: number | undefined | null): LazyTensor
+  static randn(shape: Array<number>, dtype?: NativeDType | undefined | null, deviceOrdinal?: number | undefined | null): LazyTensor
+  static uniform(shape: Array<number>, lo: number, hi: number, dtype?: NativeDType | undefined | null, deviceOrdinal?: number | undefined | null): LazyTensor
+  static arange(start: number, end: number, step: number, dtype?: NativeDType | undefined | null, deviceOrdinal?: number | undefined | null): LazyTensor
+  static eye(n: number, dtype?: NativeDType | undefined | null, deviceOrdinal?: number | undefined | null): LazyTensor
+  static constant(value: number, dtype?: NativeDType | undefined | null, deviceOrdinal?: number | undefined | null): LazyTensor
+  static fromBytes(data: Uint8Array, shape: Array<number>, dtype?: NativeDType | undefined | null, deviceOrdinal?: number | undefined | null): LazyTensor
   static fromMaterialized(tensor: NativeTensor): LazyTensor
-  static input(slot: number, shape: Array<number>, dtype?: NativeDType | undefined | null): LazyTensor
-  static scalarInput(slot: number, dtype?: NativeDType | undefined | null): LazyTensor
+  static input(slot: number, shape: Array<number>, dtype?: NativeDType | undefined | null, deviceOrdinal?: number | undefined | null): LazyTensor
+  static scalarInput(slot: number, dtype?: NativeDType | undefined | null, deviceOrdinal?: number | undefined | null): LazyTensor
   add(other: LazyTensor): LazyTensor
   sub(other: LazyTensor): LazyTensor
   mul(other: LazyTensor): LazyTensor

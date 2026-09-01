@@ -20,9 +20,9 @@ use std::sync::Arc;
 pub struct Value(pub MetalTensor);
 
 impl Value {
-    /// The device kind this value lives on (always `Device::Metal`).
+    /// The Metal device this value lives on.
     pub fn device(&self) -> Device {
-        Device::Metal
+        Device::Metal(self.0.buffer.device_ordinal())
     }
 
     /// The wrapped tensor (infallible: a `Value` is always Metal-backed).
@@ -54,15 +54,17 @@ impl Value {
     /// the host (tests only).
     #[cfg(test)]
     pub fn to_f32_vec(&self) -> Result<Vec<f32>, String> {
-        let device = MetalDevice::get();
-        let tensor = kernels::strided_copy(device, &self.0)?;
-        let tensor = if tensor.dtype == DType::F32 {
-            tensor
-        } else {
-            kernels::cast(device, &tensor, DType::F32)?
-        };
-        device.synchronize()?;
-        tensor.read_f32()
+        MetalDevice::with_ordinal(self.0.buffer.device_ordinal() as usize, || {
+            let device = MetalDevice::get();
+            let tensor = kernels::strided_copy(device, &self.0)?;
+            let tensor = if tensor.dtype == DType::F32 {
+                tensor
+            } else {
+                kernels::cast(device, &tensor, DType::F32)?
+            };
+            device.synchronize()?;
+            tensor.read_f32()
+        })?
     }
 }
 

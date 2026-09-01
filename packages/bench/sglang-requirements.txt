@@ -1,0 +1,14 @@
+# Python 3.12; install with uv --prerelease=allow.
+sglang==0.5.18
+aiohttp==3.14.3
+cuda-toolkit==13.0.3
+flashinfer-python==0.6.17
+gguf==0.19.0
+ninja==1.13.0
+numpy==2.3.5
+tokenizers==0.23.0rc0
+torch==2.13.0
+triton==3.7.1
+nvidia-cuda-nvcc==13.0.88
+nvidia-cuda-crt==13.0.88
+nvidia-nvvm==13.0.88

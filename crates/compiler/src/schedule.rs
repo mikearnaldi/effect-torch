@@ -93,8 +93,8 @@ pub struct ProgramSlot {
 }
 
 impl ProgramSlot {
-    /// Compact form for conflict diagnostics, such as `2x4:f32@cpu` or
-    /// `scalar:i64@metal`.
+    /// Compact form for conflict diagnostics, such as `2x4:f32@cpu:0` or
+    /// `scalar:i64@metal:1`.
     pub fn signature(&self) -> String {
         let shape = if self.scalar {
             "scalar".to_string()
@@ -105,7 +105,7 @@ impl ProgramSlot {
                 .collect::<Vec<_>>()
                 .join("x")
         };
-        format!("{}:{}@{}", shape, self.dtype.name(), self.device.name())
+        format!("{}:{}@{}", shape, self.dtype.name(), self.device)
     }
 }
 
@@ -522,7 +522,7 @@ mod tests {
         }
 
         fn device(&self) -> Device {
-            Device::Cpu
+            Device::Cpu(0)
         }
 
         fn as_any(&self) -> &dyn Any {
@@ -535,7 +535,7 @@ mod tests {
             slot,
             shape: vec![1],
             dtype: DType::F32,
-            device: Device::Cpu,
+            device: Device::Cpu(0),
         })
         .unwrap()
     }
@@ -550,7 +550,7 @@ mod tests {
         Node::new(NodeKind::Randn {
             shape: vec![1],
             dtype: DType::F32,
-            device: Device::Cpu,
+            device: Device::Cpu(0),
         })
         .unwrap()
     }
@@ -561,7 +561,7 @@ mod tests {
             hi: 1.0,
             shape: vec![1],
             dtype: DType::F32,
-            device: Device::Cpu,
+            device: Device::Cpu(0),
         })
         .unwrap()
     }
@@ -690,7 +690,7 @@ mod tests {
         let scalar_zero = Node::new(NodeKind::ScalarInput {
             slot: 0,
             dtype: DType::F32,
-            device: Device::Cpu,
+            device: Device::Cpu(0),
         })
         .unwrap();
         let random_b = uniform();
@@ -764,7 +764,7 @@ mod tests {
             slot: 0,
             shape: vec![2],
             dtype: DType::F32,
-            device: Device::Cpu,
+            device: Device::Cpu(0),
         })
         .unwrap();
         let root = Node::new(NodeKind::Add {
@@ -774,7 +774,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             GraphIndex::new(&[root]).err().unwrap(),
-            "compile: slot 0 is used with conflicting signatures (1:f32@cpu vs 2:f32@cpu)"
+            "compile: slot 0 is used with conflicting signatures (1:f32@cpu:0 vs 2:f32@cpu:0)"
         );
     }
 

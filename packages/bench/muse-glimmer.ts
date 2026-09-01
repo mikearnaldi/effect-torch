@@ -18,7 +18,8 @@
 // text without BOS because it inserts BOS by default. Prompt construction fails
 // if a round trip changes any token ID.
 //
-// ENGINE=effect|llama|all selects the engine and defaults to all.
+// ENGINE=effect|llama|all selects the engine and defaults to all. BACKEND=apple|cuda
+// selects the effect-torch backend and defaults to apple.
 // MODE=ordinary|dflash|both selects the generation mode and defaults to both.
 // CONTEXTS is CSV and defaults to 64,512,1024,2048,3072. MAX_NEW defaults to
 // 128. RUNS defaults to 2 and controls effect-torch cases and llama-bench
@@ -26,13 +27,14 @@
 // MAX_TOKENS defaults to 4096. COOLDOWN_MS is in milliseconds and defaults to
 // 5000. SEED defaults to 0. TEMPERATURE defaults to 0 for greedy sampling. TOP_K
 // defaults to 0, and TOP_P defaults to 1. PREFILL_CHUNK accepts one chunk size or
-// CSV shape buckets and defaults to 256. DRAFT_TOKENS defaults to 7.
+// CSV shape buckets and defaults to 64,128,256. DRAFT_TOKENS defaults to 7.
 // OUTPUT defaults to <repo>/bench-results/muse-glimmer/<timestamp>.jsonl.
 // MODEL_PATH, DRAFT_PATH, and TOKENIZER_PATH override the bundled paths.
 // LLAMA_CPP_BIN points to the llama.cpp binary directory and enables llama.cpp
 // when ENGINE includes it. LLAMA_E2E_CONTEXTS is CSV and defaults to 3072.
 
 import * as BackendApple from "@effect-torch/backend-apple-native"
+import * as BackendCuda from "@effect-torch/backend-cuda"
 import { Model, type Runtime, Tensor } from "@effect-torch/core"
 import { MuseGlimmer } from "@effect-torch/core/models"
 import { DFlash } from "@effect-torch/core/proposers"
@@ -58,10 +60,12 @@ const defaultTokenizerPath = path.join(directory, "../examples/data/muse-glimmer
 // ---------------------------------------------------------------------------
 
 type Engine = "effect" | "llama" | "all"
+type Backend = "apple" | "cuda"
 type Mode = "ordinary" | "dflash"
 
 interface Config {
   readonly engine: Engine
+  readonly backend: Backend
   readonly modes: ReadonlyArray<Mode>
   readonly contexts: ReadonlyArray<number>
   readonly maxNew: number
@@ -122,6 +126,10 @@ const loadConfig = (): Config => {
   if (engineRaw !== "effect" && engineRaw !== "llama" && engineRaw !== "all") {
     return fail(`ENGINE must be effect|llama|all, got ${engineRaw}`)
   }
+  const backendRaw = process.env.BACKEND ?? "apple"
+  if (backendRaw !== "apple" && backendRaw !== "cuda") {
+    return fail(`BACKEND must be apple|cuda, got ${backendRaw}`)
+  }
   const modeRaw = process.env.MODE ?? "both"
   if (modeRaw !== "ordinary" && modeRaw !== "dflash" && modeRaw !== "both") {
     return fail(`MODE must be ordinary|dflash|both, got ${modeRaw}`)
@@ -131,7 +139,7 @@ const loadConfig = (): Config => {
     return fail(`MAX_TOKENS must be a positive multiple of 16, got ${maxTokens}`)
   }
   const contexts = envIntList("CONTEXTS", [64, 512, 1024, 2048, 3072])
-  const prefillChunks = envIntList("PREFILL_CHUNK", [256])
+  const prefillChunks = envIntList("PREFILL_CHUNK", [64, 128, 256])
   const maxNew = envInt("MAX_NEW", 128)
   for (const context of contexts) {
     if (context + maxNew > maxTokens) {
@@ -140,6 +148,7 @@ const loadConfig = (): Config => {
   }
   return {
     engine: engineRaw,
+    backend: backendRaw,
     modes: modeRaw === "both" ? ["ordinary", "dflash"] : [modeRaw],
     contexts,
     maxNew,
@@ -1095,13 +1104,15 @@ const writeOutput = (config: Config, records: ReadonlyArray<BenchRecord>): void 
 const main = async (): Promise<void> => {
   const config = loadConfig()
   process.stderr.write(
-    `engine=${config.engine} modes=${config.modes.join(",")} contexts=${config.contexts.join(",")} ` +
+    `engine=${config.engine} backend=${config.backend} modes=${config.modes.join(",")} ` +
+      `contexts=${config.contexts.join(",")} ` +
       `maxNew=${config.maxNew} runs=${config.runs} warmup=${config.warmup} seed=${config.seed} ` +
       `temperature=${config.temperature} topK=${config.topK} topP=${config.topP}\n`
   )
   const records: Array<BenchRecord> = []
   if (config.engine !== "llama") {
-    await Effect.runPromise(Effect.provide(effectSuite(config, records), BackendApple.layer()))
+    const layer = config.backend === "cuda" ? BackendCuda.layer() : BackendApple.layer()
+    await Effect.runPromise(Effect.provide(effectSuite(config, records), layer))
   }
   if (config.engine !== "effect") {
     await llamaSuite(config, records)

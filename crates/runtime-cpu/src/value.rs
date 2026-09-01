@@ -26,9 +26,9 @@ impl Value {
         self.0
     }
 
-    /// Always [`Device::Cpu`] because this runtime only produces CPU values.
+    /// Always [`Device::Cpu(0)`] because this runtime only produces CPU values.
     pub fn device(&self) -> Device {
-        Device::Cpu
+        Device::Cpu(0)
     }
 
     /// Element type of the wrapped tensor.

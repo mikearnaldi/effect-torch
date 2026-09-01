@@ -79,7 +79,7 @@ use effect_torch_compiler::{
     PUBLICATION_PHASE,
 };
 use effect_torch_graph::{
-    node_children, CrossEntropyReduction, KvAttentionMode, PositionOffset, RotaryLayout,
+    node_children, CrossEntropyReduction, Device, KvAttentionMode, PositionOffset, RotaryLayout,
 };
 use effect_torch_runtime::{
     Buffer, CancellationFlag, DType, ExecutableDiagnostics, GgmlKQuant, InstructionId,
@@ -5502,10 +5502,19 @@ fn validate_prepared_generated_bindings(
 
 /// Loads one immutable value snapshot for each generated leaf in semantic order.
 pub(super) fn load_generated_bindings(index: &GraphIndex) -> Result<Vec<Value>, String> {
-    if index.order.iter().any(|node| !node.device.is_metal())
-        || index.slots.iter().any(|slot| !slot.device.is_metal())
+    let selected_device = Device::Metal(device::MetalDevice::get().ordinal());
+    if index
+        .order
+        .iter()
+        .any(|node| !node.device.same_device(&selected_device))
+        || index
+            .slots
+            .iter()
+            .any(|slot| !slot.device.same_device(&selected_device))
     {
-        return Err("compile: graph contains an unsupported device".to_string());
+        return Err(format!(
+            "compile: Metal runtime selected {selected_device}, but the graph uses another device"
+        ));
     }
     index
         .leaves
@@ -5629,10 +5638,18 @@ pub(super) fn compile_prepared_with_state(
     validate_prepared_generated_bindings(index, generated_bindings)?;
     let mut driver = CompilerDriver::new(program)?;
     let slots = index.slots.to_vec();
-    if index.order.iter().any(|node| !node.device.is_metal())
-        || slots.iter().any(|slot| !slot.device.is_metal())
+    let selected_device = Device::Metal(device::MetalDevice::get().ordinal());
+    if index
+        .order
+        .iter()
+        .any(|node| !node.device.same_device(&selected_device))
+        || slots
+            .iter()
+            .any(|slot| !slot.device.same_device(&selected_device))
     {
-        return Err("compile: graph contains an unsupported device".to_string());
+        return Err(format!(
+            "compile: Metal runtime selected {selected_device}, but the graph uses another device"
+        ));
     }
     // Constructor constants lowered below dispatch Metal kernels. Their
     // submission is owned and drained before the artifact can be published or
@@ -8931,6 +8948,28 @@ mod tests {
     use effect_torch_graph::{Device, LeafSlot};
 
     #[test]
+    fn compilation_rejects_a_different_metal_ordinal() {
+        let root = Node::new(NodeKind::Zeros {
+            shape: vec![1],
+            dtype: DType::F32,
+            device: Device::Metal(device::MetalDevice::get().ordinal() + 1),
+        })
+        .unwrap();
+        let error = compile(
+            &[root],
+            CompileOptions::default(),
+            1024,
+            MetalEnvironment {
+                private_intermediates: false,
+                mma: false,
+            },
+        )
+        .err()
+        .unwrap();
+        assert!(error.contains("but the graph uses another device"));
+    }
+
+    #[test]
     fn routed_leading_rows_use_view_then_device_copy() {
         let source = Value(crate::run::MetalTensor::from_f32(
             device::MetalDevice::get(),
@@ -9700,7 +9739,7 @@ mod tests {
             shape: vec![2],
             value: 2.0,
             dtype: DType::F32,
-            device: Device::Metal,
+            device: Device::Metal(0),
         })
         .unwrap();
         let root = Node::new(NodeKind::Add {
@@ -9723,13 +9762,13 @@ mod tests {
             slot: 0,
             shape: vec![2],
             dtype: DType::F32,
-            device: Device::Metal,
+            device: Device::Metal(0),
         })
         .unwrap();
         let scalar = Node::new(NodeKind::ScalarInput {
             slot: 1,
             dtype: DType::F32,
-            device: Device::Metal,
+            device: Device::Metal(0),
         })
         .unwrap();
         let root = Node::new(NodeKind::Add {
@@ -9793,7 +9832,7 @@ mod tests {
                     slot,
                     shape: vec![batch, 1, 2, 4],
                     dtype: DType::F32,
-                    device: Device::Metal,
+                    device: Device::Metal(0),
                 })
                 .unwrap()
             };
@@ -9810,7 +9849,7 @@ mod tests {
                 weight: Node::new(NodeKind::Zeros {
                     shape: vec![128, 6],
                     dtype: DType::F32,
-                    device: Device::Metal,
+                    device: Device::Metal(0),
                 })
                 .unwrap(),
                 seq_len: 2,
@@ -9885,7 +9924,7 @@ mod tests {
             slot: 0,
             shape: vec![2, 2],
             dtype: DType::F32,
-            device: Device::Metal,
+            device: Device::Metal(0),
         })
         .unwrap();
         let root = Node::new(NodeKind::Neg { a: input }).unwrap();
@@ -9922,7 +9961,7 @@ mod tests {
             slot: 0,
             shape: vec![2, 2],
             dtype: DType::F32,
-            device: Device::Metal,
+            device: Device::Metal(0),
         })
         .unwrap();
         let root = Node::new(NodeKind::Add {
@@ -10097,7 +10136,7 @@ mod tests {
         let random = Node::new(NodeKind::Randn {
             shape: vec![16],
             dtype: DType::F32,
-            device: Device::Metal,
+            device: Device::Metal(0),
         })
         .unwrap();
         let compilation = compile_graph(&[random.clone(), random], false);
@@ -10479,7 +10518,7 @@ mod tests {
         let random = Node::new(NodeKind::Randn {
             shape: vec![16],
             dtype: DType::F32,
-            device: Device::Metal,
+            device: Device::Metal(0),
         })
         .unwrap();
         let roots = [deterministic, random];
@@ -10975,7 +11014,7 @@ mod tests {
         let cursor = Node::new(NodeKind::ScalarInput {
             slot: 0,
             dtype: DType::I64,
-            device: Device::Metal,
+            device: Device::Metal(0),
         })
         .unwrap();
         let positions = Node::new(NodeKind::Arange {
@@ -10983,7 +11022,7 @@ mod tests {
             end: 4.0,
             step: 1.0,
             dtype: DType::I64,
-            device: Device::Metal,
+            device: Device::Metal(0),
         })
         .unwrap();
         let root = Node::new(NodeKind::Add {
@@ -12138,7 +12177,7 @@ mod tests {
         let random = Node::new(NodeKind::Randn {
             shape: vec![32],
             dtype: DType::F32,
-            device: Device::Metal,
+            device: Device::Metal(0),
         })
         .unwrap();
         let compilation = compile_graph(&[random], false);
@@ -12160,7 +12199,7 @@ mod tests {
             slot: 0,
             shape: vec![2],
             dtype: DType::F32,
-            device: Device::Metal,
+            device: Device::Metal(0),
         })
         .unwrap();
         let output = Node::new(NodeKind::Neg { a: input }).unwrap();

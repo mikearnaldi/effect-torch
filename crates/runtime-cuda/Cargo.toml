@@ -1,0 +1,41 @@
+[package]
+name = "effect-torch-runtime-cuda"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+crate-type = ["rlib", "cdylib"]
+
+[features]
+napi-addon = [
+  "dep:effect-torch-napi",
+  "dep:napi",
+  "dep:napi-derive",
+  "dep:safetensors",
+  "dep:tokio",
+]
+
+[dependencies]
+cudarc = { version = "0.19.9", default-features = false, features = [
+  "cuda-12090",
+  "cublas",
+  "driver",
+  "dynamic-loading",
+  "f16",
+  "nvrtc",
+  "std",
+] }
+effect-torch-compiler = { path = "../compiler" }
+effect-torch-autodiff = { path = "../autodiff" }
+effect-torch-graph = { path = "../graph" }
+effect-torch-napi = { path = "../napi", optional = true }
+effect-torch-runtime = { path = "../runtime" }
+napi = { version = "3", features = ["async", "napi6"], optional = true }
+napi-derive = { version = "3", optional = true }
+tokio = { version = "1", features = ["rt", "sync", "macros"], optional = true }
+half = "2"
+serde_json = "1"
+safetensors = { version = "0.6", optional = true }
+
+[build-dependencies]
+napi-build = "1"

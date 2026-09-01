@@ -4,9 +4,9 @@
 //! dispatch time [`acquire`] leases each segment from a process-wide
 //! [`WorkspacePool`]. Pool invariants:
 //!
-//! - Keys contain memory space, alignment, and the request rounded up to that
-//!   alignment. A lease never comes from a larger capacity class, so a small
-//!   plan cannot pin a large idle buffer.
+//! - Keys contain the device ordinal, memory space, alignment, and the request
+//!   rounded up to that alignment. A lease never crosses devices or comes from
+//!   a larger capacity class, so a small plan cannot pin a large idle buffer.
 //! - The pool keeps at most `EFFECT_TORCH_WORKSPACE_POOL_MB` of idle storage.
 //!   The default is one quarter of the device's recommended working set. It
 //!   uses best-fit LRU within that bound.
@@ -23,6 +23,8 @@ use effect_torch_runtime::{
     WorkspaceLease, WorkspacePool, WorkspaceRequest,
 };
 use objc2_metal::MTLDevice;
+use std::collections::HashMap;
+use std::sync::Mutex;
 use std::sync::{Arc, OnceLock};
 
 #[cfg(test)]
@@ -33,6 +35,7 @@ pub(crate) const DEFAULT_ALIGNMENT: usize = 256;
 /// pinning oversized idle buffers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct MetalWorkspaceKey {
+    pub device_ordinal: u32,
     pub memory_space: NativeMemorySpace,
     pub alignment: usize,
     pub capacity_class: usize,
@@ -41,7 +44,7 @@ pub(crate) struct MetalWorkspaceKey {
 impl MetalWorkspaceKey {
     /// Builds a key for a `bytes` request; alignment must be a non-zero
     /// power of two. Only `MetalShared` space is supported.
-    fn new(bytes: usize, alignment: usize) -> Result<Self, String> {
+    fn new(device_ordinal: u32, bytes: usize, alignment: usize) -> Result<Self, String> {
         if alignment == 0 || !alignment.is_power_of_two() {
             return Err(format!("invalid Metal workspace alignment {alignment}"));
         }
@@ -49,6 +52,7 @@ impl MetalWorkspaceKey {
             .checked_next_multiple_of(alignment)
             .ok_or_else(|| "Metal workspace capacity class overflow".to_string())?;
         Ok(Self {
+            device_ordinal,
             memory_space: NativeMemorySpace::MetalShared,
             alignment,
             capacity_class,
@@ -76,7 +80,8 @@ impl WorkspaceAllocator<MetalWorkspaceKey> for MetalWorkspaceAllocator {
                 key.memory_space
             ));
         }
-        let buffer = MetalDevice::get().alloc_raw_checked(minimum_bytes)?;
+        let buffer = MetalDevice::for_ordinal(key.device_ordinal as usize)?
+            .alloc_raw_checked(minimum_bytes)?;
         let capacity = buffer.size;
         Ok(WorkspaceAllocation::new(buffer, capacity))
     }
@@ -86,27 +91,40 @@ pub(crate) type MetalWorkspacePool = WorkspacePool<MetalWorkspaceKey, MetalWorks
 /// A live set of segment leases; dropping returns them to the pool.
 pub(crate) type MetalWorkspaceLease = WorkspaceLease<MetalWorkspaceKey, MetalWorkspaceAllocator>;
 
-/// The process-wide workspace pool, sized from
-/// `EFFECT_TORCH_WORKSPACE_POOL_MB` or one quarter of the recommended
+/// One process-cached workspace pool per physical device, each sized from
+/// `EFFECT_TORCH_WORKSPACE_POOL_MB` or one quarter of that device's recommended
 /// working set.
-pub(crate) fn workspace_pool() -> &'static MetalWorkspacePool {
-    static POOL: OnceLock<MetalWorkspacePool> = OnceLock::new();
-    POOL.get_or_init(|| {
-        let recommended = MetalDevice::get().raw().recommendedMaxWorkingSetSize() as usize;
-        let default_limit = recommended / 4;
-        let max_idle_bytes = std::env::var("EFFECT_TORCH_WORKSPACE_POOL_MB")
-            .ok()
-            .and_then(|value| value.parse::<usize>().ok())
-            .and_then(|mb| mb.checked_mul(1024 * 1024))
-            .unwrap_or(default_limit);
-        WorkspacePool::new(max_idle_bytes, MetalWorkspaceAllocator)
-    })
+pub(crate) fn workspace_pool(device_ordinal: u32) -> Result<&'static MetalWorkspacePool, String> {
+    static POOLS: OnceLock<Mutex<HashMap<u32, &'static MetalWorkspacePool>>> = OnceLock::new();
+    let device = MetalDevice::for_ordinal(device_ordinal as usize)?;
+    let pools = POOLS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut pools = pools.lock().unwrap_or_else(|error| error.into_inner());
+    if let Some(pool) = pools.get(&device_ordinal) {
+        return Ok(*pool);
+    }
+    let recommended = device.raw().recommendedMaxWorkingSetSize() as usize;
+    let default_limit = recommended / 4;
+    let max_idle_bytes = std::env::var("EFFECT_TORCH_WORKSPACE_POOL_MB")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .and_then(|mb| mb.checked_mul(1024 * 1024))
+        .unwrap_or(default_limit);
+    let pool = Box::leak(Box::new(WorkspacePool::new(
+        max_idle_bytes,
+        MetalWorkspaceAllocator,
+    )));
+    pools.insert(device_ordinal, pool);
+    Ok(pool)
 }
 
-fn request(bytes: usize, alignment: usize) -> Result<WorkspaceRequest<MetalWorkspaceKey>, String> {
+fn request(
+    device_ordinal: u32,
+    bytes: usize,
+    alignment: usize,
+) -> Result<WorkspaceRequest<MetalWorkspaceKey>, String> {
     let bytes = bytes.max(1);
     Ok(WorkspaceRequest::new(
-        MetalWorkspaceKey::new(bytes, alignment)?,
+        MetalWorkspaceKey::new(device_ordinal, bytes, alignment)?,
         bytes,
     ))
 }
@@ -129,6 +147,8 @@ pub(crate) struct InvocationResources {
 pub(crate) fn acquire(
     segments: &[SegmentDecl<NativeMemorySpace>],
 ) -> Result<InvocationResources, String> {
+    let device_ordinal = MetalDevice::get().ordinal();
+    let workspace_pool = workspace_pool(device_ordinal)?;
     let mut workspace_indices = Vec::new();
     let mut workspace_requests = Vec::new();
     for (index, segment) in segments.iter().enumerate() {
@@ -140,10 +160,10 @@ pub(crate) fn acquire(
         }
         if !matches!(segment.ownership, SegmentOwnership::ProvisionalOutput) {
             workspace_indices.push(index);
-            workspace_requests.push(request(segment.bytes, segment.alignment)?);
+            workspace_requests.push(request(device_ordinal, segment.bytes, segment.alignment)?);
         }
     }
-    let workspace = workspace_pool()
+    let workspace = workspace_pool
         .acquire_set(&workspace_requests)
         .map_err(|error| format!("Metal workspace acquisition failed: {error}"))?;
     let mut owners: Vec<Option<Arc<Buffer>>> = std::iter::repeat_with(|| None)
@@ -168,9 +188,9 @@ pub(crate) fn acquire(
         if !matches!(segment.ownership, SegmentOwnership::ProvisionalOutput) {
             continue;
         }
-        let output_request = request(segment.bytes, segment.alignment)?;
+        let output_request = request(device_ordinal, segment.bytes, segment.alignment)?;
         let lease = Arc::new(
-            workspace_pool()
+            workspace_pool
                 .acquire(std::slice::from_ref(&output_request))
                 .map_err(|error| format!("Metal output acquisition failed: {error}"))?,
         );
@@ -202,6 +222,7 @@ mod tests {
     fn whole_segment_pool_is_best_fit_lru_bounded_and_atomic() {
         let pool = MetalWorkspacePool::new(80, MetalWorkspaceAllocator);
         let key = MetalWorkspaceKey {
+            device_ordinal: 0,
             memory_space: NativeMemorySpace::MetalShared,
             alignment: DEFAULT_ALIGNMENT,
             capacity_class: 256,
@@ -228,6 +249,7 @@ mod tests {
     fn small_plan_never_reuses_an_oversized_capacity_class() {
         let pool = MetalWorkspacePool::new(4 << 20, MetalWorkspaceAllocator);
         let large_key = MetalWorkspaceKey {
+            device_ordinal: 0,
             memory_space: NativeMemorySpace::MetalShared,
             alignment: DEFAULT_ALIGNMENT,
             capacity_class: 2 << 20,
@@ -257,6 +279,7 @@ mod tests {
         let pool = MetalWorkspacePool::new(1024, MetalWorkspaceAllocator);
         let request = WorkspaceRequest::new(
             MetalWorkspaceKey {
+                device_ordinal: 0,
                 memory_space: NativeMemorySpace::MetalShared,
                 alignment: DEFAULT_ALIGNMENT,
                 capacity_class: DEFAULT_ALIGNMENT,
@@ -280,5 +303,12 @@ mod tests {
         drop(view);
         assert_eq!(pool.stats().leased_segments, 0);
         assert_eq!(pool.stats().idle_segments, 1);
+    }
+
+    #[test]
+    fn workspace_keys_include_the_device_ordinal() {
+        let first = MetalWorkspaceKey::new(0, 16, DEFAULT_ALIGNMENT).unwrap();
+        let second = MetalWorkspaceKey::new(1, 16, DEFAULT_ALIGNMENT).unwrap();
+        assert_ne!(first, second);
     }
 }

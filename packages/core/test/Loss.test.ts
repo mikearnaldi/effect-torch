@@ -173,6 +173,14 @@ onDevices("Loss", () => (it) => {
             }
           }
         }
+        const emptyError = yield* Effect.flip(
+          run("0", "1", yield* i64([-100n, -100n, -100n, -100n, -100n, -100n], [2, 3]))
+        )
+        expect(emptyError.message).toContain("no active targets")
+        const rangeError = yield* Effect.flip(
+          run("0", "1", yield* i64([0n, 1n, 2n, 3n, 8n, 5n], [2, 3]))
+        )
+        expect(rangeError.message).toContain("out of range")
       }))
   })
 

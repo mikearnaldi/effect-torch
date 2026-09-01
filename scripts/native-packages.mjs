@@ -98,6 +98,24 @@ export const nativePackages = [
     ]
   },
   {
+    directory: path.join(rootDirectory, "packages/backend-cuda"),
+    npmName: "@effect-torch/backend-cuda",
+    cargoName: "effect-torch-runtime-cuda",
+    cargoFeatures: ["napi-addon"],
+    crateName: "effect_torch_runtime_cuda",
+    binaryName: "effect-torch-backend-cuda",
+    installAnywhere: true,
+    os: ["linux"],
+    cpu: ["x64"],
+    targets: ["linux-x64-gnu"],
+    staticFiles: [
+      "dist/index.js",
+      "dist/index.d.ts",
+      "dist/internal/adapter.js",
+      "dist/internal/native.js"
+    ]
+  },
+  {
     directory: path.join(rootDirectory, "packages/tokenizers"),
     npmName: "@effect-torch/tokenizers",
     cargoName: "effect-torch-tokenizers",

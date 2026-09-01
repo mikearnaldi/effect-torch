@@ -262,13 +262,17 @@ pub(crate) fn request_parts(
     )
 }
 
-/// Maps a semantic device to its runtime signature placement. CPU uses
-/// `cpu:0`. Metal uses `metal:0` in the `shared` memory space.
+/// Maps a semantic device and ordinal to its runtime signature placement.
 fn placement(device: &effect_torch_graph::Device) -> Placement {
     match device {
-        effect_torch_graph::Device::Cpu => Placement::new(DeviceId::new("cpu:0")),
-        effect_torch_graph::Device::Metal => {
-            Placement::with_memory_space(DeviceId::new("metal:0"), "shared")
+        effect_torch_graph::Device::Cpu(ordinal) => {
+            Placement::new(DeviceId::new(format!("cpu:{ordinal}")))
+        }
+        effect_torch_graph::Device::Metal(ordinal) => {
+            Placement::with_memory_space(DeviceId::new(format!("metal:{ordinal}")), "shared")
+        }
+        effect_torch_graph::Device::Cuda(ordinal) => {
+            Placement::new(DeviceId::new(format!("cuda:{ordinal}")))
         }
     }
 }
@@ -390,7 +394,7 @@ mod tests {
 
     #[test]
     fn program_request_prepares_one_shared_index_and_retains_its_contract() {
-        let root = constant(Device::Cpu);
+        let root = constant(Device::Cpu(0));
         let invocation = InvocationSignature::default();
         let options = CompileOptions {
             optimize: false,
@@ -416,10 +420,23 @@ mod tests {
     }
 
     #[test]
+    fn placement_preserves_device_ordinals() {
+        for (device, device_id, memory_space) in [
+            (Device::Cpu(2), "cpu:2", None),
+            (Device::Metal(3), "metal:3", Some("shared")),
+            (Device::Cuda(4), "cuda:4", None),
+        ] {
+            let placement = placement(&device);
+            assert_eq!(placement.device().as_str(), device_id);
+            assert_eq!(placement.memory_space(), memory_space);
+        }
+    }
+
+    #[test]
     fn native_signature_derives_declarations_and_preserves_caller_output_order() {
         for (device, device_id, memory_space) in [
-            (Device::Cpu, "cpu:0", None),
-            (Device::Metal, "metal:0", Some("shared")),
+            (Device::Cpu(0), "cpu:0", None),
+            (Device::Metal(0), "metal:0", Some("shared")),
         ] {
             let input = Node::new(NodeKind::Input {
                 slot: 0,
@@ -487,27 +504,27 @@ mod tests {
         let scalar_0 = Node::new(NodeKind::ScalarInput {
             slot: 0,
             dtype: DType::F32,
-            device: Device::Cpu,
+            device: Device::Cpu(0),
         })
         .unwrap();
         let tensor_1 = Node::new(NodeKind::Input {
             slot: 1,
             shape: vec![1],
             dtype: DType::I64,
-            device: Device::Cpu,
+            device: Device::Cpu(0),
         })
         .unwrap();
         let scalar_2 = Node::new(NodeKind::ScalarInput {
             slot: 2,
             dtype: DType::U32,
-            device: Device::Cpu,
+            device: Device::Cpu(0),
         })
         .unwrap();
         let tensor_3 = Node::new(NodeKind::Input {
             slot: 3,
             shape: vec![3],
             dtype: DType::F32,
-            device: Device::Cpu,
+            device: Device::Cpu(0),
         })
         .unwrap();
         let prepared = ProgramRequest::from_roots(
@@ -547,7 +564,7 @@ mod tests {
                 slot: 0,
                 shape: vec![2],
                 dtype: DType::F32,
-                device: Device::Cpu,
+                device: Device::Cpu(0),
             })
             .unwrap();
             let cursor = if tensor {
@@ -555,13 +572,13 @@ mod tests {
                     slot: 1,
                     shape: vec![3],
                     dtype: DType::I64,
-                    device: Device::Cpu,
+                    device: Device::Cpu(0),
                 })
             } else {
                 Node::new(NodeKind::ScalarInput {
                     slot: 1,
                     dtype: DType::I64,
-                    device: Device::Cpu,
+                    device: Device::Cpu(0),
                 })
             }
             .unwrap();
@@ -627,7 +644,7 @@ mod tests {
         );
 
         let mixed = ProgramRequest::new(
-            vec![constant(Device::Cpu), constant(Device::Metal)],
+            vec![constant(Device::Cpu(0)), constant(Device::Metal(0))],
             Vec::new(),
             InvocationSignature::default(),
             CompileOptions::default(),

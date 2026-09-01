@@ -1252,20 +1252,21 @@ fn sgd_exprs_with(
 }
 
 /// Whether fusion supports a device and dtype pair. CPU supports f32 and f64.
-/// Metal supports f32 and bf16.
-pub fn is_supported(
+/// Metal supports f32 and bf16. CUDA fusion is not lowered yet.
+pub fn is_fusion_supported(
     device: &effect_torch_graph::Device,
     dtype: effect_torch_runtime::DType,
 ) -> bool {
     match device {
-        effect_torch_graph::Device::Cpu => matches!(
+        effect_torch_graph::Device::Cpu(_) => matches!(
             dtype,
             effect_torch_runtime::DType::F32 | effect_torch_runtime::DType::F64
         ),
-        effect_torch_graph::Device::Metal => matches!(
+        effect_torch_graph::Device::Metal(_) => matches!(
             dtype,
             effect_torch_runtime::DType::F32 | effect_torch_runtime::DType::BF16
         ),
+        effect_torch_graph::Device::Cuda(_) => false,
     }
 }
 

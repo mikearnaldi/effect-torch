@@ -195,20 +195,17 @@ struct MmaConfig {
 }
 
 fn mma_config(dev: &MetalDevice) -> MmaConfig {
-    static CONFIG: std::sync::OnceLock<MmaConfig> = std::sync::OnceLock::new();
-    *CONFIG.get_or_init(|| {
-        if dev.raw().maxThreadgroupMemoryLength() >= 20 * 1024 {
-            MmaConfig {
-                tile: 64,
-                threads: 256,
-            }
-        } else {
-            MmaConfig {
-                tile: 32,
-                threads: 128,
-            }
+    if dev.raw().maxThreadgroupMemoryLength() >= 20 * 1024 {
+        MmaConfig {
+            tile: 64,
+            threads: 256,
         }
-    })
+    } else {
+        MmaConfig {
+            tile: 32,
+            threads: 128,
+        }
+    }
 }
 
 /// Batched gemm problem size: `batch` independent `m×k · k×n` products.

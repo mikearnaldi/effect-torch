@@ -26,7 +26,7 @@ onDevices("Dtype", (device) => (it) => {
         const probs = yield* Tensor.toNumberArray(soft)
         expect(probs[0] + probs[1] + probs[2]).toBeCloseTo(1, 2)
         const m = yield* as("bf16", [1, 0, 0, 1, 0, 1, 1, 0, 0, 1, 1, 0], [3, 4])
-        if (device === "metal") {
+        if (device !== "cpu") {
           const [product] = yield* Tensor.compute([yield* Tensor.matmul(a, m)])
           expect(product.dtype).toBe("bf16")
         } else {
@@ -55,7 +55,7 @@ onDevices("Dtype", (device) => (it) => {
       Effect.gen(function*() {
         const a = yield* as("f16", [1, 2, 3, 4, 5, 6], [2, 3])
         const m = yield* as("f16", [1, 0, 0, 1, 0, 1, 1, 0, 0, 1, 1, 0], [3, 4])
-        if (device === "metal") {
+        if (device !== "cpu") {
           const [product] = yield* Tensor.compute([yield* Tensor.matmul(a, m)])
           expect(product.dtype).toBe("f16")
           deep(yield* Tensor.toNumberArray(product), [1, 5, 5, 1, 4, 11, 11, 4])
@@ -101,6 +101,42 @@ onDevices("Dtype", (device) => (it) => {
   })
 
   describe("strictness", () => {
+    it.effect("i64 preserves the full signed range through arithmetic and comparison", () =>
+      Effect.gen(function*() {
+        if (device === "metal") return
+        const values = new BigInt64Array([
+          9_007_199_254_740_993n,
+          -9_007_199_254_740_993n,
+          9_223_372_036_854_775_805n,
+          -9_223_372_036_854_775_806n
+        ])
+        const deltas = new BigInt64Array([2n, -2n, 1n, -1n])
+        const expected = new BigInt64Array([
+          9_007_199_254_740_995n,
+          -9_007_199_254_740_995n,
+          9_223_372_036_854_775_806n,
+          -9_223_372_036_854_775_807n
+        ])
+        const input = yield* Tensor.fromTypedArray(values, [4])
+        const delta = yield* Tensor.fromTypedArray(deltas, [4])
+        const expectedTensor = yield* Tensor.fromTypedArray(expected, [4])
+        const sum = yield* Tensor.add(input, delta)
+        const [sumValue, comparison] = yield* Tensor.compute([sum, yield* Tensor.eq(sum, expectedTensor)])
+
+        const inputValues = yield* Tensor.toTypedArray(input)
+        const sumValues = yield* Tensor.toTypedArray(sumValue)
+        const comparisonValues = yield* Tensor.toTypedArray(comparison)
+        if (!(inputValues instanceof BigInt64Array) || !(sumValues instanceof BigInt64Array)) {
+          throw new Error("i64 readback must use BigInt64Array")
+        }
+        if (!(comparisonValues instanceof Uint8Array)) {
+          throw new Error("comparison readback must use Uint8Array")
+        }
+        expect(Array.from(inputValues)).toEqual(Array.from(values))
+        expect(Array.from(sumValues)).toEqual(Array.from(expected))
+        expect(Array.from(comparisonValues)).toEqual([1, 1, 1, 1])
+      }))
+
     it.effect("mixed-dtype binary ops fail with the explicit remedy", () =>
       Effect.gen(function*() {
         const a = yield* Tensor.fromTypedArray(floats([1]), [1])
@@ -132,7 +168,7 @@ onDevices("Dtype", (device) => (it) => {
   describe("device capability matrix", () => {
     it.effect("f64 computes fully on CPU and is rejected at construction on Metal", () =>
       Effect.gen(function*() {
-        if (device === "cpu") {
+        if (device !== "metal") {
           const a = yield* Tensor.fromTypedArray(new Float64Array([1, 2, 3, 4, 5, 6]), [2, 3])
           const m = yield* Tensor.fromTypedArray(new Float64Array([1, 0, 0, 1, 0, 1, 1, 0, 0, 1, 1, 0]), [3, 4])
           const [product] = yield* Tensor.compute([yield* Tensor.matmul(a, m)])

@@ -29,31 +29,52 @@ interface TokenizerCapture {
   rendered?: string
   addSpecialTokens?: boolean
   variables?: Parameters<Chat.ChatTokenizer["applyChatTemplate"]>[2]["variables"]
+  decodeCalls?: number
+  streamSteps?: number
 }
 
-const makeTokenizer = (captured: TokenizerCapture): Chat.ChatTokenizer => ({
-  applyChatTemplate: (_template, messages, options) =>
-    Effect.sync(() => {
-      captured.variables = options.variables ?? {}
-      captured.rendered = messages.map((message) => `${message.role}:${String(message.content)}`).join("\n")
-      return captured.rendered
-    }),
-  encode: (text, options) =>
-    Effect.sync(() => {
-      captured.addSpecialTokens = options?.addSpecialTokens ?? true
-      expect(text).toBe(captured.rendered)
-      return { data: new Uint32Array([1]) }
-    }),
-  decode: (ids, options) =>
-    Effect.succeed(
-      ids
-        .filter((id) => options?.skipSpecialTokens !== true || id < START)
-        .map((id) => tokenTexts.get(id) ?? "")
-        .join("")
-    ),
-  tokenToId: (token) => Option.fromNullishOr(controlIds.get(token)),
-  idToToken: (id) => Option.fromNullishOr([...controlIds.entries()].find(([, tokenId]) => tokenId === id)?.[0])
-})
+const makeTokenizer = (
+  captured: TokenizerCapture,
+  incremental = false
+): Chat.ChatTokenizer => {
+  const tokenizer: Chat.ChatTokenizer = {
+    applyChatTemplate: (_template, messages, options) =>
+      Effect.sync(() => {
+        captured.variables = options.variables ?? {}
+        captured.rendered = messages.map((message) => `${message.role}:${String(message.content)}`).join("\n")
+        return captured.rendered
+      }),
+    encode: (text, options) =>
+      Effect.sync(() => {
+        captured.addSpecialTokens = options?.addSpecialTokens ?? true
+        expect(text).toBe(captured.rendered)
+        return { data: new Uint32Array([1]) }
+      }),
+    decode: (ids, options) =>
+      Effect.sync(() => {
+        captured.decodeCalls = (captured.decodeCalls ?? 0) + 1
+        return ids
+          .filter((id) => options?.skipSpecialTokens !== true || id < START)
+          .map((id) => tokenTexts.get(id) ?? "")
+          .join("")
+      }),
+    tokenToId: (token) => Option.fromNullishOr(controlIds.get(token)),
+    idToToken: (id) => Option.fromNullishOr([...controlIds.entries()].find(([, tokenId]) => tokenId === id)?.[0])
+  }
+  if (!incremental) return tokenizer
+  return {
+    ...tokenizer,
+    decodeStream: (options) => ({
+      step: (id) =>
+        Effect.sync(() => {
+          captured.streamSteps = (captured.streamSteps ?? 0) + 1
+          return options?.skipSpecialTokens === true && id >= START
+            ? undefined
+            : tokenTexts.get(id) ?? ""
+        })
+    })
+  }
+}
 
 interface ProgramState {
   closed: boolean
@@ -228,10 +249,11 @@ onDevices("Chat", () => (it) => {
     it.effect("supports unsegmented responses and reports max-token limits", () =>
       Effect.gen(function*() {
         const programState = { closed: false }
+        const captured: TokenizerCapture = {}
         const events = Array.from(
           yield* Stream.runCollect(Chat.stream({
             program: makeProgram([5, 6], programState),
-            tokenizer: makeTokenizer({}),
+            tokenizer: makeTokenizer(captured),
             template: "{{ messages }}",
             messages: [{ role: "user", content: "hello" }],
             controls: false,
@@ -257,7 +279,34 @@ onDevices("Chat", () => (it) => {
           expect(done.result.segments[0]?.finish).toBe("limit")
           expect(done.result.stats.generatedTokens).toBe(2)
         }
+        expect(captured.decodeCalls).toBe(2)
+        expect(captured.streamSteps).toBeUndefined()
         expect(programState.closed).toBe(true)
+      }))
+
+    it.effect("uses incremental decoding when the tokenizer provides it", () =>
+      Effect.gen(function*() {
+        const programState = { closed: false }
+        const captured: TokenizerCapture = {}
+        const events = Array.from(
+          yield* Stream.runCollect(Chat.stream({
+            program: makeProgram([5, 6], programState),
+            tokenizer: makeTokenizer(captured, true),
+            template: "{{ messages }}",
+            messages: [{ role: "user", content: "hello" }],
+            controls: false,
+            stopTokens: [EOS],
+            maxTokens: 2
+          }))
+        )
+
+        const done = events.at(-1)
+        expect(done?._tag).toBe("done")
+        if (done?._tag === "done") {
+          expect(done.result.content).toBe("plain text")
+        }
+        expect(captured.decodeCalls).toBeUndefined()
+        expect(captured.streamSteps).toBe(2)
       }))
 
     it.effect("consumes every token in a terminal page without another step", () =>

@@ -60,25 +60,41 @@ static NEXT_NODE_ID: AtomicU64 = AtomicU64::new(0);
 /// A tensor's compute device.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Device {
-    Cpu,
-    Metal,
+    Cpu(u32),
+    Metal(u32),
+    Cuda(u32),
 }
 
 impl Device {
     pub fn is_cpu(&self) -> bool {
-        matches!(self, Device::Cpu)
+        matches!(self, Device::Cpu(_))
     }
     pub fn is_metal(&self) -> bool {
-        matches!(self, Device::Metal)
+        matches!(self, Device::Metal(_))
+    }
+    pub fn is_cuda(&self) -> bool {
+        matches!(self, Device::Cuda(_))
     }
     pub fn same_device(&self, other: &Device) -> bool {
         self == other
     }
+    pub fn ordinal(&self) -> u32 {
+        match self {
+            Device::Cpu(ordinal) | Device::Metal(ordinal) | Device::Cuda(ordinal) => *ordinal,
+        }
+    }
     pub fn name(&self) -> &'static str {
         match self {
-            Device::Cpu => "cpu",
-            Device::Metal => "metal",
+            Device::Cpu(_) => "cpu",
+            Device::Metal(_) => "metal",
+            Device::Cuda(_) => "cuda",
         }
+    }
+}
+
+impl fmt::Display for Device {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}:{}", self.name(), self.ordinal())
     }
 }
 
@@ -1323,7 +1339,7 @@ impl Drop for Node {
         let dummy = || NodeKind::Zeros {
             shape: Vec::new(),
             dtype: DType::F32,
-            device: Device::Cpu,
+            device: Device::Cpu(0),
         };
         let mut worklist: Vec<Arc<Node>> = Vec::new();
         let kind = std::mem::replace(&mut self.kind, dummy());
@@ -2501,6 +2517,12 @@ impl NodeKind {
                 (step.shape.clone(), step.dtype, step.device.clone())
             }
         };
+        if node_children(self)
+            .iter()
+            .any(|child| !child.device.same_device(&device))
+        {
+            return Err(format!("node operands must use device {device}"));
+        }
         check_dtype_device(dtype, &device)?;
         Ok(NodeMetadata {
             shape,
@@ -2513,9 +2535,9 @@ impl NodeKind {
 // construction. Every lazy node passes through this check, including
 // from-bytes leaves and nodes rebuilt by compiler or fusion rewrites. Metal's
 // shading language has no f64. This check never downcasts or defers failure to
-// compute time.
+// compute time. CUDA supports the complete logical dtype set.
 fn check_dtype_device(dtype: DType, device: &Device) -> std::result::Result<(), String> {
-    if matches!(dtype, DType::F64) && matches!(device, Device::Metal) {
+    if matches!(dtype, DType::F64) && device.is_metal() {
         return Err(
             "dtype f64 is not supported on device metal (supported: f32, f16, bf16, i64, u32, u8); cast explicitly or use device cpu"
                 .to_string(),
@@ -3428,6 +3450,36 @@ mod tests {
     use super::*;
 
     #[test]
+    fn device_identity_includes_the_ordinal() {
+        assert!(Device::Cpu(2).is_cpu());
+        assert!(Device::Metal(3).is_metal());
+        assert!(Device::Cuda(4).is_cuda());
+        assert_eq!(Device::Metal(3).ordinal(), 3);
+        assert!(!Device::Metal(3).same_device(&Device::Metal(4)));
+        assert_eq!(Device::Cuda(4).to_string(), "cuda:4");
+    }
+
+    #[test]
+    fn node_operands_must_use_the_same_ordinal() {
+        let input = |slot, ordinal| {
+            Node::new(NodeKind::Input {
+                slot,
+                shape: vec![1],
+                dtype: DType::F32,
+                device: Device::Metal(ordinal),
+            })
+            .unwrap()
+        };
+        let error = Node::new(NodeKind::Add {
+            a: input(0, 1),
+            b: input(1, 2),
+        })
+        .err()
+        .unwrap();
+        assert_eq!(error, "node operands must use device metal:1");
+    }
+
+    #[test]
     fn permute_moves_only_unit_axes_predicate() {
         // heads-first on [B, 1, H, W]: only the unit sequence axis moves.
         assert!(permute_moves_only_unit_axes(&[2, 1, 2, 2], &[0, 2, 1, 3]));
@@ -3470,14 +3522,14 @@ mod tests {
             slot: 0,
             shape: vec![2, 1],
             dtype: DType::F32,
-            device: Device::Cpu,
+            device: Device::Cpu(0),
         })
         .unwrap();
         let b = Node::new(NodeKind::Input {
             slot: 1,
             shape: vec![1, 3],
             dtype: DType::F32,
-            device: Device::Cpu,
+            device: Device::Cpu(0),
         })
         .unwrap();
         let add = Node::new(NodeKind::Add {
@@ -3504,7 +3556,7 @@ mod tests {
         let slot = Arc::new(LeafSlot::new(TestLeaf {
             shape: vec![4],
             dtype: DType::F32,
-            device: Device::Cpu,
+            device: Device::Cpu(0),
         }));
         let leaf = Node::new(NodeKind::Leaf(slot.clone())).unwrap();
         assert_eq!(leaf.shape, [4]);
@@ -3518,7 +3570,7 @@ mod tests {
         let error = Node::new(NodeKind::Zeros {
             shape: vec![1],
             dtype: DType::F64,
-            device: Device::Metal,
+            device: Device::Metal(0),
         })
         .err()
         .unwrap();
@@ -3531,7 +3583,7 @@ mod tests {
             slot: 0,
             shape: vec![1, 7, 16],
             dtype: DType::F32,
-            device: Device::Cpu,
+            device: Device::Cpu(0),
         })
         .unwrap();
         let row = Node::new(NodeKind::LastTokenRow { a: input.clone() }).unwrap();
@@ -3552,7 +3604,7 @@ mod tests {
                     slot: 0,
                     shape: shape.clone(),
                     dtype: DType::F32,
-                    device: Device::Cpu,
+                    device: Device::Cpu(0),
                 })
                 .unwrap(),
             })
@@ -3571,14 +3623,14 @@ mod tests {
             slot: 0,
             shape: vec![2, 256],
             dtype: DType::F32,
-            device: Device::Cpu,
+            device: Device::Cpu(0),
         })
         .unwrap();
         let packed = Node::new(NodeKind::Input {
             slot: 1,
             shape: vec![3, 144],
             dtype: DType::U8,
-            device: Device::Cpu,
+            device: Device::Cpu(0),
         })
         .unwrap();
         let linear = Node::new(NodeKind::QuantizedLinear {
@@ -3597,7 +3649,7 @@ mod tests {
             slot: 2,
             shape: vec![2, 4],
             dtype: DType::U32,
-            device: Device::Cpu,
+            device: Device::Cpu(0),
         })
         .unwrap();
         let embedding = Node::new(NodeKind::QuantizedEmbedding {
